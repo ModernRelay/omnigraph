@@ -191,14 +191,16 @@ async fn lance_merge_insert_new_row_stamps_created_at_version() {
     let eve = rows.iter().find(|r| r.0 == "eve").unwrap();
     eprintln!("Eve: created_at_version={}, v1={}, v2={}", eve.2, v1, v2);
 
-    // Lance behavior (as of 3.0.1): merge_insert stamps new rows with
-    // _row_created_at_version = dataset_creation_version (v1), NOT the
-    // merge_insert commit version (v2). This is why Omnigraph's change
-    // detection uses _row_last_updated_at_version + ID set membership
-    // to classify inserts vs updates, not _row_created_at_version alone.
+    // Lance behavior (7.0.0, lance#6774): merge_insert stamps new INSERT
+    // rows with _row_created_at_version = the commit version (v2). Earlier
+    // Lance used a fallback of the dataset creation version; #6774 changed
+    // it so created_at reflects when the row actually entered the dataset.
+    // Omnigraph's change detection keys on _row_last_updated_at_version + ID
+    // set membership (see changes/mod.rs), so this stamping change leaves
+    // insert-vs-update classification unaffected.
     assert_eq!(
-        eve.2, v1,
-        "Lance merge_insert stamps new rows with created_at = dataset creation version, not commit version"
+        eve.2, v2,
+        "Lance merge_insert stamps new rows with created_at = commit version (lance#6774)"
     );
     assert_eq!(
         eve.3, v2,
@@ -258,11 +260,24 @@ async fn lance_merge_insert_update_preserves_created_at_version() {
     assert_eq!(alice.2, v1, "alice created_at should still be v1");
     assert_eq!(alice.3, v1, "alice updated_at should still be v1");
 
-    // Bob: updated via merge_insert
-    // created_at should be preserved (v1), updated_at should be bumped (v2)
+    // Bob: updated via merge_insert.
     eprintln!(
         "Bob: created_at={}, updated_at={}, v1={}, v2={}",
         bob.2, bob.3, v1, v2
     );
     assert_eq!(bob.1, 99, "bob's value should be updated to 99");
+    // created_at is preserved across an UPDATE (lance#6774 only changed the
+    // INSERT-row stamping), which is what this test's name promises.
+    assert_eq!(
+        bob.2, v1,
+        "bob created_at must be preserved across a merge_insert UPDATE"
+    );
+    // updated_at bumps to the commit version on UPDATE — the change-feed
+    // invariant OmniGraph's insert/update classification relies on
+    // (changes/mod.rs keys on _row_last_updated_at_version). If this regresses,
+    // the diff/change feed silently misses updates.
+    assert_eq!(
+        bob.3, v2,
+        "bob updated_at must bump to the commit version on a merge_insert UPDATE"
+    );
 }

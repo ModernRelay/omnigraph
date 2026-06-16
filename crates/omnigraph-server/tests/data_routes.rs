@@ -63,7 +63,7 @@ async fn export_route_returns_jsonl_for_branch_snapshot() {
         .clone()
         .oneshot(
             Request::builder()
-                .uri("/export")
+                .uri(g("/export"))
                 .method(Method::POST)
                 .header("content-type", "application/json")
                 .header("authorization", format!("Bearer {}", token))
@@ -99,7 +99,7 @@ async fn snapshot_route_returns_manifest_dataset_version() {
     let (snapshot_status, snapshot_body) = json_response(
         &app,
         Request::builder()
-            .uri("/snapshot?branch=main")
+            .uri(g("/snapshot?branch=main"))
             .method(Method::GET)
             .body(Body::empty())
             .unwrap(),
@@ -131,7 +131,7 @@ async fn ingest_creates_branch_returns_metadata_and_stamps_actor() {
     let (status, body) = json_response(
         &app,
         Request::builder()
-            .uri("/ingest")
+            .uri(g("/ingest"))
             .method(Method::POST)
             .header("authorization", "Bearer token-one")
             .header("content-type", "application/json")
@@ -195,7 +195,7 @@ async fn ingest_existing_branch_skips_branch_create_policy_check() {
     let (status, body) = json_response(
         &app,
         Request::builder()
-            .uri("/ingest")
+            .uri(g("/ingest"))
             .method(Method::POST)
             .header("authorization", "Bearer team-token")
             .header("content-type", "application/json")
@@ -223,7 +223,7 @@ async fn ingest_without_from_returns_404_for_missing_branch_and_creates_nothing(
     let (status, body) = json_response(
         &app,
         Request::builder()
-            .uri("/ingest")
+            .uri(g("/ingest"))
             .method(Method::POST)
             .header("content-type", "application/json")
             .body(Body::from(serde_json::to_vec(&ingest).unwrap()))
@@ -264,7 +264,7 @@ async fn ingest_without_from_loads_into_existing_branch() {
     let (status, body) = json_response(
         &app,
         Request::builder()
-            .uri("/ingest")
+            .uri(g("/ingest"))
             .method(Method::POST)
             .header("content-type", "application/json")
             .body(Body::from(serde_json::to_vec(&ingest).unwrap()))
@@ -294,7 +294,7 @@ async fn ingest_denies_missing_branch_without_branch_create_permission() {
     let (status, body) = json_response(
         &app,
         Request::builder()
-            .uri("/ingest")
+            .uri(g("/ingest"))
             .method(Method::POST)
             .header("authorization", "Bearer team-token")
             .header("content-type", "application/json")
@@ -327,7 +327,7 @@ async fn ingest_denies_when_actor_lacks_change_permission() {
     let (status, body) = json_response(
         &app,
         Request::builder()
-            .uri("/ingest")
+            .uri(g("/ingest"))
             .method(Method::POST)
             .header("authorization", "Bearer team-token")
             .header("content-type", "application/json")
@@ -357,7 +357,7 @@ async fn ingest_rejects_payloads_over_32_mib() {
         .clone()
         .oneshot(
             Request::builder()
-                .uri("/ingest")
+                .uri(g("/ingest"))
                 .method(Method::POST)
                 .header("content-type", "application/json")
                 .body(Body::from(serde_json::to_vec(&oversize).unwrap()))
@@ -419,7 +419,7 @@ async fn branch_merge_conflict_response_includes_structured_conflicts() {
     let (status, body) = json_response(
         &app,
         Request::builder()
-            .uri("/branches/merge")
+            .uri(g("/branches/merge"))
             .method(Method::POST)
             .header("content-type", "application/json")
             .body(Body::from(serde_json::to_vec(&merge).unwrap()))
@@ -451,7 +451,7 @@ async fn repeated_read_after_change_sees_updated_state_from_same_app() {
     let (change_status, change_body) = json_response(
         &app,
         Request::builder()
-            .uri("/change")
+            .uri(g("/change"))
             .method(Method::POST)
             .header("content-type", "application/json")
             .body(Body::from(serde_json::to_vec(&change).unwrap()))
@@ -471,7 +471,7 @@ async fn repeated_read_after_change_sees_updated_state_from_same_app() {
     let (read_status, read_body) = json_response(
         &app,
         Request::builder()
-            .uri("/read")
+            .uri(g("/read"))
             .method(Method::POST)
             .header("content-type", "application/json")
             .body(Body::from(serde_json::to_vec(&read).unwrap()))
@@ -497,7 +497,7 @@ async fn query_endpoint_runs_inline_read() {
     let (status, body) = json_response(
         &app,
         Request::builder()
-            .uri("/query")
+            .uri(g("/query"))
             .method(Method::POST)
             .header("content-type", "application/json")
             .body(Body::from(serde_json::to_vec(&query).unwrap()))
@@ -524,7 +524,7 @@ async fn query_endpoint_rejects_mutation_with_400() {
     let (status, body) = json_response(
         &app,
         Request::builder()
-            .uri("/query")
+            .uri(g("/query"))
             .method(Method::POST)
             .header("content-type", "application/json")
             .body(Body::from(serde_json::to_vec(&query).unwrap()))
@@ -555,7 +555,7 @@ async fn mutate_endpoint_runs_inline_mutation() {
         .clone()
         .oneshot(
             Request::builder()
-                .uri("/mutate")
+                .uri(g("/mutate"))
                 .method(Method::POST)
                 .header("content-type", "application/json")
                 .body(Body::from(serde_json::to_vec(&request).unwrap()))
@@ -580,7 +580,7 @@ async fn mutate_endpoint_runs_inline_mutation() {
 #[tokio::test(flavor = "multi_thread")]
 async fn change_endpoint_emits_deprecation_headers() {
     // `/change` is kept indefinitely for back-compat but flagged at runtime
-    // per RFC 9745 (`Deprecation: true`) + RFC 8288 (`Link: </mutate>;
+    // per RFC 9745 (`Deprecation: true`) + RFC 8288 (`Link: <mutate>;
     // rel="successor-version"`). The OpenAPI side is covered by
     // `openapi_change_is_deprecated` in tests/openapi.rs.
     let (_temp, app) = app_for_loaded_graph().await;
@@ -595,7 +595,7 @@ async fn change_endpoint_emits_deprecation_headers() {
         .clone()
         .oneshot(
             Request::builder()
-                .uri("/change")
+                .uri(g("/change"))
                 .method(Method::POST)
                 .header("content-type", "application/json")
                 .body(Body::from(serde_json::to_vec(&request).unwrap()))
@@ -615,8 +615,85 @@ async fn change_endpoint_emits_deprecation_headers() {
     );
     assert_eq!(
         response.headers().get("link").and_then(|v| v.to_str().ok()),
-        Some("</mutate>; rel=\"successor-version\""),
+        Some("<mutate>; rel=\"successor-version\""),
         "POST /change must point at /mutate via `Link` rel=successor-version (RFC 8288)"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn load_endpoint_loads_into_existing_branch() {
+    // Canonical bulk-load endpoint (RFC-009 Phase 5). Same wire shape as
+    // /ingest, no deprecation signal.
+    let (_temp, app) = app_for_loaded_graph().await;
+    let request = IngestRequest {
+        branch: Some("main".to_string()),
+        from: None,
+        mode: Some(LoadMode::Merge),
+        data: r#"{"type":"Person","data":{"name":"Loaded","age":7}}"#.to_string(),
+    };
+    let response = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri(g("/load"))
+                .method(Method::POST)
+                .header("content-type", "application/json")
+                .body(Body::from(serde_json::to_vec(&request).unwrap()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::OK);
+    assert!(
+        response.headers().get("deprecation").is_none(),
+        "POST /load must not advertise itself as deprecated"
+    );
+    let body_bytes = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+    let body: Value = serde_json::from_slice(&body_bytes).unwrap();
+    assert_eq!(body["branch"], "main");
+    assert_eq!(body["tables"][0]["table_key"], "node:Person");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn ingest_endpoint_emits_deprecation_headers() {
+    // `/ingest` is the deprecated alias of `/load` (RFC-009 Phase 5): flagged
+    // at runtime per RFC 9745 (`Deprecation: true`) + RFC 8288 (`Link: <load>;
+    // rel="successor-version"`). The OpenAPI side is covered by
+    // `openapi_ingest_is_deprecated` in tests/openapi.rs.
+    let (_temp, app) = app_for_loaded_graph().await;
+    let request = IngestRequest {
+        branch: Some("main".to_string()),
+        from: None,
+        mode: Some(LoadMode::Merge),
+        data: r#"{"type":"Person","data":{"name":"Legacyer","age":33}}"#.to_string(),
+    };
+    let response = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri(g("/ingest"))
+                .method(Method::POST)
+                .header("content-type", "application/json")
+                .body(Body::from(serde_json::to_vec(&request).unwrap()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(
+        response
+            .headers()
+            .get("deprecation")
+            .and_then(|v| v.to_str().ok()),
+        Some("true"),
+        "POST /ingest must advertise `Deprecation: true` (RFC 9745)"
+    );
+    assert_eq!(
+        response.headers().get("link").and_then(|v| v.to_str().ok()),
+        Some("<load>; rel=\"successor-version\""),
+        "POST /ingest must point at /load via `Link` rel=successor-version (RFC 8288)"
     );
 }
 
@@ -637,7 +714,7 @@ async fn read_endpoint_emits_deprecation_headers() {
         .clone()
         .oneshot(
             Request::builder()
-                .uri("/read")
+                .uri(g("/read"))
                 .method(Method::POST)
                 .header("content-type", "application/json")
                 .body(Body::from(serde_json::to_vec(&request).unwrap()))
@@ -657,7 +734,7 @@ async fn read_endpoint_emits_deprecation_headers() {
     );
     assert_eq!(
         response.headers().get("link").and_then(|v| v.to_str().ok()),
-        Some("</query>; rel=\"successor-version\""),
+        Some("<query>; rel=\"successor-version\""),
         "POST /read must point at /query via `Link` rel=successor-version (RFC 8288)"
     );
 }
@@ -680,7 +757,7 @@ async fn query_endpoint_does_not_emit_deprecation_headers() {
         .clone()
         .oneshot(
             Request::builder()
-                .uri("/query")
+                .uri(g("/query"))
                 .method(Method::POST)
                 .header("content-type", "application/json")
                 .body(Body::from(serde_json::to_vec(&request).unwrap()))
@@ -712,7 +789,7 @@ async fn change_endpoint_accepts_legacy_field_names() {
     let (status, body) = json_response(
         &app,
         Request::builder()
-            .uri("/change")
+            .uri(g("/change"))
             .method(Method::POST)
             .header("content-type", "application/json")
             .body(Body::from(serde_json::to_vec(&legacy_body).unwrap()))
@@ -731,7 +808,7 @@ async fn change_endpoint_accepts_legacy_field_names() {
     let (status, body) = json_response(
         &app,
         Request::builder()
-            .uri("/change")
+            .uri(g("/change"))
             .method(Method::POST)
             .header("content-type", "application/json")
             .body(Body::from(serde_json::to_vec(&canonical_body).unwrap()))
@@ -749,7 +826,7 @@ async fn remote_branch_list_create_merge_flow_works() {
     let (list_status, list_body) = json_response(
         &app,
         Request::builder()
-            .uri("/branches")
+            .uri(g("/branches"))
             .method(Method::GET)
             .body(Body::empty())
             .unwrap(),
@@ -765,7 +842,7 @@ async fn remote_branch_list_create_merge_flow_works() {
     let (create_status, create_body) = json_response(
         &app,
         Request::builder()
-            .uri("/branches")
+            .uri(g("/branches"))
             .method(Method::POST)
             .header("content-type", "application/json")
             .body(Body::from(serde_json::to_vec(&create).unwrap()))
@@ -779,7 +856,7 @@ async fn remote_branch_list_create_merge_flow_works() {
     let (list_status, list_body) = json_response(
         &app,
         Request::builder()
-            .uri("/branches")
+            .uri(g("/branches"))
             .method(Method::GET)
             .body(Body::empty())
             .unwrap(),
@@ -797,7 +874,7 @@ async fn remote_branch_list_create_merge_flow_works() {
     let (change_status, change_body) = json_response(
         &app,
         Request::builder()
-            .uri("/change")
+            .uri(g("/change"))
             .method(Method::POST)
             .header("content-type", "application/json")
             .body(Body::from(serde_json::to_vec(&change).unwrap()))
@@ -818,7 +895,7 @@ async fn remote_branch_list_create_merge_flow_works() {
     let (read_status, read_body) = json_response(
         &app,
         Request::builder()
-            .uri("/read")
+            .uri(g("/read"))
             .method(Method::POST)
             .header("content-type", "application/json")
             .body(Body::from(serde_json::to_vec(&read_main_before).unwrap()))
@@ -835,7 +912,7 @@ async fn remote_branch_list_create_merge_flow_works() {
     let (merge_status, merge_body) = json_response(
         &app,
         Request::builder()
-            .uri("/branches/merge")
+            .uri(g("/branches/merge"))
             .method(Method::POST)
             .header("content-type", "application/json")
             .body(Body::from(serde_json::to_vec(&merge).unwrap()))
@@ -857,7 +934,7 @@ async fn remote_branch_list_create_merge_flow_works() {
     let (read_status, read_body) = json_response(
         &app,
         Request::builder()
-            .uri("/read")
+            .uri(g("/read"))
             .method(Method::POST)
             .header("content-type", "application/json")
             .body(Body::from(serde_json::to_vec(&read_main_after).unwrap()))
@@ -880,7 +957,7 @@ async fn remote_branch_delete_flow_works() {
     let (create_status, _) = json_response(
         &app,
         Request::builder()
-            .uri("/branches")
+            .uri(g("/branches"))
             .method(Method::POST)
             .header("content-type", "application/json")
             .body(Body::from(serde_json::to_vec(&create).unwrap()))
@@ -892,7 +969,7 @@ async fn remote_branch_delete_flow_works() {
     let (delete_status, delete_body) = json_response(
         &app,
         Request::builder()
-            .uri("/branches/feature")
+            .uri(g("/branches/feature"))
             .method(Method::DELETE)
             .body(Body::empty())
             .unwrap(),
@@ -904,7 +981,7 @@ async fn remote_branch_delete_flow_works() {
     let (list_status, list_body) = json_response(
         &app,
         Request::builder()
-            .uri("/branches")
+            .uri(g("/branches"))
             .method(Method::GET)
             .body(Body::empty())
             .unwrap(),
@@ -932,7 +1009,7 @@ async fn branch_delete_denies_without_policy_permission() {
     let (status, body) = json_response(
         &app,
         Request::builder()
-            .uri("/branches/feature")
+            .uri(g("/branches/feature"))
             .method(Method::DELETE)
             .header("authorization", "Bearer token-team")
             .body(Body::empty())
@@ -1004,7 +1081,7 @@ query vector_search_string($q: String) {
     let (status, body) = json_response(
         &app,
         Request::builder()
-            .uri("/read")
+            .uri(g("/read"))
             .method(Method::POST)
             .header("content-type", "application/json")
             .body(Body::from(serde_json::to_vec(&read).unwrap()))
@@ -1057,7 +1134,7 @@ async fn change_conflict_returns_manifest_conflict_409() {
     let (status, body) = json_response(
         &app,
         Request::builder()
-            .uri("/change")
+            .uri(g("/change"))
             .method(Method::POST)
             .header("content-type", "application/json")
             .body(Body::from(
@@ -1129,7 +1206,7 @@ async fn change_concurrent_inserts_same_key_serialize_without_409() {
             })
             .unwrap();
             let req = Request::builder()
-                .uri("/change")
+                .uri(g("/change"))
                 .method(Method::POST)
                 .header("content-type", "application/json")
                 .body(Body::from(body))
@@ -1161,7 +1238,7 @@ async fn change_concurrent_inserts_same_key_serialize_without_409() {
     let (snapshot_status, snapshot_body) = json_response(
         &app,
         Request::builder()
-            .uri("/snapshot?branch=main")
+            .uri(g("/snapshot?branch=main"))
             .method(Method::GET)
             .body(Body::empty())
             .unwrap(),
@@ -1242,7 +1319,7 @@ async fn change_concurrent_updates_same_key_serialize_via_publisher_cas() {
             })
             .unwrap();
             let req = Request::builder()
-                .uri("/change")
+                .uri(g("/change"))
                 .method(Method::POST)
                 .header("content-type", "application/json")
                 .body(Body::from(body))
@@ -1351,7 +1428,7 @@ query insert_c($name: String) {
             })
             .unwrap();
             let req = Request::builder()
-                .uri("/change")
+                .uri(g("/change"))
                 .method(Method::POST)
                 .header("content-type", "application/json")
                 .body(Body::from(body))
@@ -1368,7 +1445,7 @@ query insert_c($name: String) {
             })
             .unwrap();
             let req = Request::builder()
-                .uri("/change")
+                .uri(g("/change"))
                 .method(Method::POST)
                 .header("content-type", "application/json")
                 .body(Body::from(body))
@@ -1397,7 +1474,7 @@ query insert_c($name: String) {
     let (status, body) = json_response(
         &app,
         Request::builder()
-            .uri("/snapshot?branch=main")
+            .uri(g("/snapshot?branch=main"))
             .method(Method::GET)
             .body(Body::empty())
             .unwrap(),
@@ -1505,7 +1582,7 @@ async fn ingest_per_actor_admission_cap_returns_429() {
             })
             .unwrap();
             let req = Request::builder()
-                .uri("/ingest")
+                .uri(g("/ingest"))
                 .method(Method::POST)
                 .header("authorization", "Bearer flooder-token")
                 .header("content-type", "application/json")

@@ -15,6 +15,38 @@ Use it this way:
 - Keep implementation ledgers, roadmap detail, and historical MR notes in the
   per-area docs. This file is the filter, not the encyclopedia.
 
+## Governing principle: logical contract over physical state
+
+The hard invariants below are instances of one rule. Keep it in view whenever
+a change touches the boundary between what the graph *means* and how it is
+physically stored.
+
+> **Logical state is the contract. Physical state — index coverage, fragment
+> layout, compaction versions, staged writes — is derived, rebuildable, and may
+> be produced asynchronously. A physical operation must never fail a logical
+> one. Preconditions are checked against logical state; physical reconciliation
+> is idempotent and may lag or retry. Genuine logical conflicts still fail
+> loudly: the licence to lag covers physical convergence, not correctness.**
+
+Invariants that instantiate it: **2** (manifest-atomic visibility) and **5**
+(recovery is part of the commit protocol) — a partially-written physical layer
+never changes what a graph commit means; **7** (indexes are derived state) — a
+query is correct under partial index coverage, and expensive index work
+converges from manifest state instead of gating the write path; **13** (failures
+bounded and observable) — the licence to lag is not a licence to drop, so a
+physical step that cannot make progress is surfaced, not swallowed. Deny-list
+items that enforce it: synchronous inline vector/FTS index rebuilds on the
+commit path; state that drifts from Lance or the manifest when it can be
+derived; job queues for manifest-derivable state where a reconciler fits.
+
+The failure shape it rules out: a legitimate background operation on the
+physical layer (compaction, an index build, an interrupted staged write) is
+allowed to break a logical operation (a query's correctness, a migration's
+success, a branch's writability). The smell to watch for is a logical operation
+whose precondition is a *physical* fact — a cached file version, an index's
+existence, a fragment count. Make the precondition logical and let a reconciler
+converge the physical state.
+
 ## Hard Invariants
 
 1. **Respect the substrate.** Lance owns columnar storage, per-dataset
@@ -58,7 +90,7 @@ Use it this way:
    branch they read even when index coverage is partial. Expensive index work
    should converge from manifest state instead of extending the critical write
    path. Scalar staged index builds and vector inline residuals are documented
-   in [writes.md](writes.md) and [indexes.md](../user/indexes.md).
+   in [writes.md](writes.md) and [indexes.md](../user/search/indexes.md).
 
 8. **Schema identity survives renames.** Accepted schema identity must remain
    stable across type and property renames. Rename support belongs in migration
@@ -100,14 +132,14 @@ Use it this way:
 |---|---|---|
 | Multi-table commit | Manifest CAS plus recovery sidecars; not a single Lance primitive | [writes.md](writes.md), [architecture.md](architecture.md) |
 | Constructive mutations | In-memory `MutationStaging`, one end-of-query table commit per touched table, then one manifest publish | [writes.md](writes.md), [execution.md](execution.md) |
-| Deletes | Inline-commit residual; delete-only queries allowed, mixed insert/update/delete rejected by D2 | [query-language.md](../user/query-language.md), [writes.md](writes.md) |
-| Branch delete | Manifest is the single authority, flipped atomically first; per-table forks + commit-graph branch are derived state, reclaimed best-effort (`force_delete_branch`) with the `cleanup` reconciler as the guaranteed backstop. Reusing a name whose reclaim failed before `cleanup` surfaces an actionable error | [branches-commits.md](../user/branches-commits.md), [maintenance.md](../user/maintenance.md) |
-| Schema validation | Type checks, required fields, defaults, edge endpoint checks, and edge cardinality are enforced on write paths | [schema-language.md](../user/schema-language.md), [execution.md](execution.md) |
-| Unique constraints | Intra-batch and write-path checks exist; intake and branch-merge derive the composite key through one shared function (`loader::composite_unique_key`, a separator-free `Vec<String>` tuple) and fail loudly on an un-keyable column type rather than silently exempting it; full cross-version uniqueness against already-committed rows is still a gap | [schema-language.md](../user/schema-language.md) |
+| Deletes | Inline-commit residual; delete-only queries allowed, mixed insert/update/delete rejected by D2 | [query-language.md](../user/queries/index.md), [writes.md](writes.md) |
+| Branch delete | Manifest is the single authority, flipped atomically first; per-table forks + commit-graph branch are derived state, reclaimed best-effort (`force_delete_branch`) with the `cleanup` reconciler as the guaranteed backstop. Reusing a name whose reclaim failed before `cleanup` surfaces an actionable error | [branches-commits.md](../user/branching/index.md), [maintenance.md](../user/operations/maintenance.md) |
+| Schema validation | Type checks, required fields, defaults, edge endpoint checks, and edge cardinality are enforced on write paths | [schema-language.md](../user/schema/index.md), [execution.md](execution.md) |
+| Unique constraints | Intra-batch and write-path checks exist; intake and branch-merge derive the composite key through one shared function (`loader::composite_unique_key`, a separator-free `Vec<String>` tuple) and fail loudly on an un-keyable column type rather than silently exempting it; full cross-version uniqueness against already-committed rows is still a gap | [schema-language.md](../user/schema/index.md) |
 | Storage trait | `TableStorage` (via `db.storage()`) is staged-only; the inline-commit residuals (`delete_where`, `create_vector_index`) are split onto a separate sealed `InlineCommitResidual` trait reached via `db.storage_inline_residual()` (MR-854), so §1 holds by construction; capability/stat surfaces are roadmap | [writes.md](writes.md), [architecture.md](architecture.md) |
-| Index lifecycle | `ensure_indices` is explicit today; reconciler-based convergence is roadmap | [indexes.md](../user/indexes.md), [maintenance.md](../user/maintenance.md) |
-| Traversal IDs | Runtime still builds `TypeIndex`; Lance stable row-id based graph IDs are roadmap | [architecture.md](architecture.md), [query-language.md](../user/query-language.md) |
-| Auth | Bearer token hashing and server-side actor resolution are implemented at the HTTP boundary | [server.md](../user/server.md), [policy.md](../user/policy.md) |
+| Index lifecycle | `@index`/`@key` declares *intent*; the physical index is derived state and never fails a logical op. `schema apply` builds no indexes (records intent only; index-only changes touch no table data). `load`/`mutate` build inline through one chokepoint (`build_indices_on_dataset_for_catalog`, type-dispatched by `node_prop_index_kind`: enum + orderable scalar → BTREE, free-text String → FTS, Vector → vector) that fault-isolates an untrainable Vector column into a *pending* index instead of aborting. `optimize`/`ensure_indices` is the reconciler: it creates declared-but-missing indexes and folds appended/rewritten fragments into existing ones (`optimize_indices`), reporting still-pending columns. Explicit maintenance call, not yet a background loop | [indexes.md](../user/search/indexes.md), [maintenance.md](../user/operations/maintenance.md) |
+| Traversal IDs | Runtime still builds `TypeIndex`; Lance stable row-id based graph IDs are roadmap | [architecture.md](architecture.md), [query-language.md](../user/queries/index.md) |
+| Auth | Bearer token hashing and server-side actor resolution are implemented at the HTTP boundary | [server.md](../user/operations/server.md), [policy.md](../user/operations/policy.md) |
 | Tests | Tempdir-backed Lance tests are the current substrate; the storage adapter has an in-memory backend for adapter-level contract tests, but Lance datasets bypass it | [testing.md](testing.md) |
 
 The branch-delete reconciler is authority-derived: it reclaims orphaned forks
@@ -132,13 +164,18 @@ them explicit.
   new writer cannot couple a write with a HEAD advance through the default
   surface. The dead legacy methods (`append_batch` on the trait,
   `merge_insert_batch{,es}`, `create_{btree,inverted}_index`) were removed. The
-  remaining residuals are `delete_where` (gated on MR-A — Lance v7.x bump)
-  and `create_vector_index` (gated on Lance #6666); see
-  [lance.md](lance.md) and [writes.md](writes.md). New write paths should use
-  the staged shape unless a documented Lance blocker applies.
+  remaining residuals are `delete_where` and `create_vector_index`. The Lance
+  6.0.1 → 7.0.0 bump landed, so the staged two-phase delete API
+  (`DeleteBuilder::execute_uncommitted`, Lance #6658) is now available and MR-A
+  is unblocked — but the migration itself is still pending, so `delete_where`
+  stays inline for now. `create_vector_index` remains gated on Lance #6666
+  (still open). See [lance.md](lance.md) and [writes.md](writes.md). New write
+  paths should use the staged shape unless a documented Lance blocker applies.
 - **Deletes and vector indexes:** `delete_where` and vector index creation still
-  advance Lance HEAD inline because the required public Lance APIs are missing.
-  Keep D2 and recovery coverage in place until those residuals are removed.
+  advance Lance HEAD inline. The public delete two-phase API now exists (Lance
+  #6658 shipped in 7.0.0), so the delete residual is unblocked pending the MR-A
+  migration; vector index creation is still blocked (Lance #6666 open). Keep D2
+  and recovery coverage in place until those residuals are removed.
 - **Blob-column compaction:** Lance `compact_files` mis-decodes blob-v2 columns
   under its forced `BlobHandling::AllBinary` read ("more fields in the schema
   than provided column indices"), so `optimize` skips any table with a `Blob`
@@ -160,6 +197,22 @@ them explicit.
   one-winner-CAS territory; closing this fully needs a cross-process
   serialization primitive (e.g. lease-based use of the schema-apply lock
   branch) — design it before promoting multi-process write topologies.
+- **Fork reclaim is in-process-safe only:** the first write to a table on a
+  branch forks it (a Lance `create_branch` that advances state before the
+  manifest publish). An interrupted fork (crash, or a cancelled request
+  future) leaves a manifest-unreferenced branch ref. The next write self-heals
+  it — `reclaim_orphaned_fork_and_refork` (`force_delete_branch` + re-fork)
+  — but reclaim is only safe because the writer holds the per-`(table,
+  branch)` write queue from before the fork through the publish AND re-checks
+  the live manifest under it, so no *in-process* writer can be mid-fork. A
+  reclaim cannot serialize against a foreign-*process* in-flight fork: it may
+  force-delete a peer's just-created ref, which makes that peer's commit fail
+  and retry — the same one-winner-CAS exposure as above, not corruption. The
+  reclaim never fires unless in-process-queue + manifest authority both prove
+  the ref is manifest-unreferenced. `cleanup`'s per-table reconciler
+  (`reconcile_orphaned_branches`) is the guaranteed backstop for any fork the
+  write path never revisits. Both degrade to a no-op if Lance ships an atomic
+  multi-dataset branch op.
 - **Local `write_text_if_match` is not a cross-process CAS:** object-store
   backends use a true conditional put (ETag If-Match; the in-memory test
   backend too), but upstream `object_store` leaves `PutMode::Update`

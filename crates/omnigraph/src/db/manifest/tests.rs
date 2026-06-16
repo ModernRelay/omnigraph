@@ -336,40 +336,77 @@ async fn test_directory_namespace_direct_publish_cannot_replace_native_omnigraph
         .await
         .unwrap();
 
-    let versions = namespace
-        .list_table_versions(ListTableVersionsRequest {
-            id: Some(vec!["node:Person".to_string()]),
-            descending: Some(true),
-            ..Default::default()
-        })
-        .await
-        .unwrap();
-    assert_eq!(
-        versions.versions[0].version as u64,
-        person_entry.table_version
+    // Lance 7: the native `DirectoryNamespace` no longer recognizes omnigraph's
+    // manifest-tracked tables, so list / describe / create_table_version all
+    // return `TableNotFound`. The mechanism is *contingent on omnigraph's legacy
+    // boolean PK key*, not an unconditional v7 property: v7's namespace eagerly
+    // rewrites any `__manifest` whose `object_id` lacks the new
+    // `lance-schema:unenforced-primary-key:position` key, omnigraph declares the
+    // PK with the legacy boolean key, and v7 forbids changing a PK once set — so
+    // `ensure_manifest_table_up_to_date` errors, the namespace silently falls
+    // back to directory listing (disabled here), and `check_table_status` reports
+    // the table absent. omnigraph keeps the boolean key deliberately: Lance
+    // honors it permanently (it maps to PK position 0) and one uniform on-disk
+    // format beats a new-vs-old split, since existing graphs can't be re-keyed to
+    // the position key under that same immutability rule. The decoupling is
+    // therefore an accepted, production-irrelevant tradeoff (omnigraph never uses
+    // the native namespace — its publisher writes `__manifest` via merge_insert
+    // and its reads go through its own `LanceNamespace` impls), and it only
+    // strengthens this guard's thesis: native tooling cannot enumerate, inspect,
+    // or publish over omnigraph's tables, let alone replace the write path.
+    let assert_table_not_found = |what: &str, dbg: String| {
+        assert!(
+            dbg.contains("TableNotFound") && dbg.contains("node:Person"),
+            "{what}: expected TableNotFound for node:Person, got: {dbg}"
+        );
+    };
+    assert_table_not_found(
+        "list_table_versions",
+        format!(
+            "{:?}",
+            namespace
+                .list_table_versions(ListTableVersionsRequest {
+                    id: Some(vec!["node:Person".to_string()]),
+                    descending: Some(true),
+                    ..Default::default()
+                })
+                .await
+                .unwrap_err()
+        ),
+    );
+    assert_table_not_found(
+        "describe_table_version",
+        format!(
+            "{:?}",
+            namespace
+                .describe_table_version(DescribeTableVersionRequest {
+                    id: Some(vec!["node:Person".to_string()]),
+                    version: Some(person_version as i64),
+                    ..Default::default()
+                })
+                .await
+                .unwrap_err()
+        ),
+    );
+    assert_table_not_found(
+        "create_table_version",
+        format!(
+            "{:?}",
+            namespace
+                .create_table_version(version_metadata.to_create_table_version_request(
+                    "node:Person",
+                    person_version,
+                    1,
+                    None,
+                ))
+                .await
+                .unwrap_err()
+        ),
     );
 
-    let err = namespace
-        .describe_table_version(DescribeTableVersionRequest {
-            id: Some(vec!["node:Person".to_string()]),
-            version: Some(person_version as i64),
-            ..Default::default()
-        })
-        .await
-        .unwrap_err();
-    assert!(err.to_string().contains("not found"));
-
-    let err = namespace
-        .create_table_version(version_metadata.to_create_table_version_request(
-            "node:Person",
-            person_version,
-            1,
-            None,
-        ))
-        .await
-        .unwrap_err();
-    assert!(err.to_string().contains("already exists"));
-
+    // omnigraph's manifest stays authoritative: refresh ignores the direct
+    // `person_ds.append` above (it was never manifest-published), so the row
+    // count stays 0 and the version is unchanged.
     mc.refresh().await.unwrap();
     assert_eq!(
         mc.snapshot().entry("node:Person").unwrap().table_version,

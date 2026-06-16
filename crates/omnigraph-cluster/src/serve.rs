@@ -8,6 +8,7 @@ use super::*;
 pub struct ServingGraph {
     pub graph_id: String,
     pub root: PathBuf,
+    pub embedding: Option<EmbeddingProviderConfig>,
 }
 
 /// One stored query: its graph binding, registry name, and verified source.
@@ -79,6 +80,112 @@ pub async fn read_serving_snapshot_from_storage(
     read_snapshot_with_store(backend).await
 }
 
+/// Cluster root for a graph **storage URI** of the cluster layout
+/// (`<root>/graphs/<id>.omni`), if `<root>` is actually a cluster (holds
+/// `__cluster/state.json`); otherwise `None`. Used by the CLI to refuse
+/// `init` into a cluster-managed location — graphs there are created by
+/// `cluster apply`, not `init`.
+///
+/// Cheap by construction: a URI that does not match the `<root>/graphs/<id>.omni`
+/// shape returns `None` without any I/O, so ordinary `init` targets
+/// (`./kb.omni`, `s3://bucket/kb.omni`) never probe storage. Works for
+/// `file://` and `s3://` via the storage adapter.
+pub async fn cluster_root_for_graph_uri(graph_uri: &str) -> Option<String> {
+    let root = cluster_root_of_graph_layout(graph_uri)?;
+    let store = ClusterStore::for_storage_root(&root).ok()?;
+    store
+        .has_state()
+        .await
+        .then(|| store.display_root().to_string())
+}
+
+/// Resolve a graph's **storage URI** (`<root>/graphs/<id>.omni`) from a cluster's
+/// applied state ledger — the lightweight path for storage-plane maintenance
+/// (`optimize`/`repair`/`cleanup`).
+///
+/// Unlike [`read_serving_snapshot`], this deliberately does NOT validate catalog
+/// payloads or recovery readiness: maintenance only needs the derivable graph
+/// root, and must not be blocked by an unrelated corrupt policy/query blob or a
+/// pending recovery sweep — a degraded cluster is exactly when an operator
+/// reaches for `repair`. It reads the state ledger, confirms the graph is in the
+/// applied revision, and returns `graph_root(id)`.
+///
+/// `cluster` is a config directory or a storage-root URI (`s3://…`, config-free),
+/// mirroring the server's `--cluster` dispatch.
+pub async fn resolve_graph_storage_uri(cluster: &str, graph_id: &str) -> Result<String, Diagnostic> {
+    let backend = open_cluster_backend(cluster)?;
+    let mut observations = backend.observations();
+    let snapshot = backend.read_state(&mut observations).await?;
+    let state = snapshot.state.ok_or_else(|| missing_state_diagnostic(cluster))?;
+    let address = format!("graph.{graph_id}");
+    if !state.applied_revision.resources.contains_key(&address) {
+        let applied = applied_graph_ids(&state);
+        return Err(Diagnostic::error(
+            "graph_not_applied",
+            address,
+            format!(
+                "graph `{graph_id}` is not applied in cluster `{cluster}` (applied graphs: [{}]); \
+                 declare it in cluster.yaml and run `cluster apply`, or check the id",
+                applied.join(", ")
+            ),
+        ));
+    }
+    Ok(backend.graph_root(graph_id))
+}
+
+/// List the graph ids applied in a cluster's served state (sorted). Reads the
+/// ledger only — no catalog validation — like `resolve_graph_storage_uri`, so
+/// it works on a degraded cluster. Used to enumerate candidates when no
+/// `--graph` is selected (RFC-011 Decision 7).
+pub async fn cluster_graph_ids(cluster: &str) -> Result<Vec<String>, Diagnostic> {
+    let backend = open_cluster_backend(cluster)?;
+    let mut observations = backend.observations();
+    let snapshot = backend.read_state(&mut observations).await?;
+    let state = snapshot.state.ok_or_else(|| missing_state_diagnostic(cluster))?;
+    Ok(applied_graph_ids(&state))
+}
+
+fn open_cluster_backend(cluster: &str) -> Result<ClusterStore, Diagnostic> {
+    if cluster.contains("://") {
+        ClusterStore::for_storage_root(cluster)
+    } else {
+        Ok(ClusterStore::for_config_dir(Path::new(cluster)))
+    }
+}
+
+fn missing_state_diagnostic(cluster: &str) -> Diagnostic {
+    Diagnostic::error(
+        "cluster_state_missing",
+        CLUSTER_STATE_FILE,
+        format!("cluster `{cluster}` has no applied state; run `cluster apply` first"),
+    )
+}
+
+fn applied_graph_ids(state: &crate::types::ClusterState) -> Vec<String> {
+    let mut ids: Vec<String> = state
+        .applied_revision
+        .resources
+        .keys()
+        .filter_map(|a| a.strip_prefix("graph."))
+        .map(str::to_string)
+        .collect();
+    ids.sort();
+    ids
+}
+
+/// Split `<root>/graphs/<id>.omni` → `<root>`, gating on the exact cluster
+/// graph-layout shape (a single `<id>` segment, no nested path). `None` for
+/// anything else — no I/O is done for non-cluster-shaped URIs.
+fn cluster_root_of_graph_layout(graph_uri: &str) -> Option<String> {
+    let trimmed = graph_uri.trim_end_matches('/');
+    let rest = trimmed.strip_suffix(".omni")?;
+    let (root, id) = rest.rsplit_once("/graphs/")?;
+    if root.is_empty() || id.is_empty() || id.contains('/') {
+        return None;
+    }
+    Some(root.to_string())
+}
+
 async fn read_snapshot_with_store(
     backend: ClusterStore,
 ) -> Result<ServingSnapshot, Vec<Diagnostic>> {
@@ -119,15 +226,73 @@ async fn read_snapshot_with_store(
         return Err(diagnostics);
     };
 
+    let mut embedding_profiles: BTreeMap<String, EmbeddingProviderConfig> = BTreeMap::new();
+    for (address, entry) in &state.applied_revision.resources {
+        if !matches!(resource_kind(address), ResourceKind::EmbeddingProvider(_)) {
+            continue;
+        }
+        let Some(profile) = entry.embedding_profile.clone() else {
+            diagnostics.push(Diagnostic::error(
+                "embedding_provider_profile_missing",
+                address.clone(),
+                "no applied embedding provider profile recorded; re-run `cluster apply` to backfill",
+            ));
+            continue;
+        };
+        let actual_digest = embedding_provider_digest(&profile);
+        if actual_digest != entry.digest {
+            diagnostics.push(Diagnostic::error(
+                "embedding_provider_digest_mismatch",
+                address.clone(),
+                format!(
+                    "applied embedding provider profile does not match its recorded digest (actual sha256:{actual_digest}); run `cluster refresh` then `cluster apply`, and restart"
+                ),
+            ));
+            continue;
+        }
+        embedding_profiles.insert(address.clone(), profile);
+    }
+
     let mut graphs = Vec::new();
     let mut queries = Vec::new();
     let mut policies = Vec::new();
     for (address, entry) in &state.applied_revision.resources {
         match resource_kind(address) {
             ResourceKind::Graph(graph_id) => {
+                let embedding = match entry.embedding_provider.as_deref() {
+                    Some(provider_address) => match resource_kind(provider_address) {
+                        ResourceKind::EmbeddingProvider(_) => {
+                            match embedding_profiles.get(provider_address) {
+                                Some(profile) => Some(profile.clone()),
+                                None => {
+                                    diagnostics.push(Diagnostic::error(
+                                        "embedding_provider_missing",
+                                        address.clone(),
+                                        format!(
+                                            "graph references `{provider_address}`, but no applied embedding provider profile is available; re-run `cluster apply`"
+                                        ),
+                                    ));
+                                    None
+                                }
+                            }
+                        }
+                        _ => {
+                            diagnostics.push(Diagnostic::error(
+                                "wrong_kind_reference",
+                                address.clone(),
+                                format!(
+                                    "graph embedding_provider expects `provider.embedding.<name>`, got `{provider_address}`"
+                                ),
+                            ));
+                            None
+                        }
+                    },
+                    None => None,
+                };
                 graphs.push(ServingGraph {
                     root: PathBuf::from(backend.graph_root(&graph_id)),
                     graph_id,
+                    embedding,
                 });
             }
             ResourceKind::Schema(_) => {}
@@ -135,7 +300,10 @@ async fn read_snapshot_with_store(
                 let ResourceKind::Query { graph, name } = &kind else {
                     unreachable!()
                 };
-                match backend.read_verified_payload(&kind, &entry.digest, address).await {
+                match backend
+                    .read_verified_payload(&kind, &entry.digest, address)
+                    .await
+                {
                     Ok(source) => queries.push(ServingQuery {
                         graph_id: graph.clone(),
                         name: name.clone(),
@@ -156,7 +324,10 @@ async fn read_snapshot_with_store(
                     ));
                     continue;
                 };
-                match backend.read_verified_payload(&kind, &entry.digest, address).await {
+                match backend
+                    .read_verified_payload(&kind, &entry.digest, address)
+                    .await
+                {
                     Ok(source) => policies.push(ServingPolicy {
                         name: name.clone(),
                         source,
@@ -165,6 +336,7 @@ async fn read_snapshot_with_store(
                     Err(diagnostic) => diagnostics.push(diagnostic),
                 }
             }
+            ResourceKind::EmbeddingProvider(_) => {}
             ResourceKind::Unknown => {}
         }
     }
@@ -186,3 +358,49 @@ async fn read_snapshot_with_store(
     })
 }
 
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn graph_layout_gating_does_no_io_for_non_cluster_shapes() {
+        // Only `<root>/graphs/<id>.omni` matches; everything else is None.
+        assert_eq!(
+            cluster_root_of_graph_layout("/data/cluster/graphs/kb.omni").as_deref(),
+            Some("/data/cluster")
+        );
+        assert_eq!(
+            cluster_root_of_graph_layout("s3://bucket/prefix/graphs/kb.omni").as_deref(),
+            Some("s3://bucket/prefix")
+        );
+        assert_eq!(cluster_root_of_graph_layout("./kb.omni"), None);
+        assert_eq!(cluster_root_of_graph_layout("s3://bucket/kb.omni"), None);
+        // nested id under graphs/ is not the cluster layout
+        assert_eq!(cluster_root_of_graph_layout("/c/graphs/a/b.omni"), None);
+        // not a .omni graph
+        assert_eq!(cluster_root_of_graph_layout("/c/graphs/kb"), None);
+    }
+
+    #[tokio::test]
+    async fn cluster_root_detected_only_when_state_ledger_present() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path();
+        std::fs::create_dir_all(root.join("graphs")).unwrap();
+        let graph_uri = format!("{}/graphs/kb.omni", root.to_string_lossy());
+
+        // No __cluster/state.json yet → not a cluster.
+        assert_eq!(cluster_root_for_graph_uri(&graph_uri).await, None);
+
+        // Lay down the state ledger → now it's a cluster-managed location.
+        std::fs::create_dir_all(root.join("__cluster")).unwrap();
+        std::fs::write(root.join(CLUSTER_STATE_FILE), "{}").unwrap();
+        let detected = cluster_root_for_graph_uri(&graph_uri).await;
+        assert!(detected.is_some(), "expected cluster root to be detected");
+
+        // A non-cluster-shaped target never probes and is always None.
+        assert_eq!(
+            cluster_root_for_graph_uri(&format!("{}/plain.omni", root.to_string_lossy())).await,
+            None
+        );
+    }
+}

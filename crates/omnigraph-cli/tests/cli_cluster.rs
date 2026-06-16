@@ -683,51 +683,8 @@ fn cluster_apply_locked_exits_nonzero() {
     assert!(!temp.path().join("__cluster/resources").exists());
 }
 
-#[test]
-fn cluster_apply_uses_cli_actor_from_local_config() {
-    let temp = tempdir().unwrap();
-    write_cluster_config_fixture(temp.path());
-    fs::write(
-        temp.path().join("omnigraph.yaml"),
-        "cli:\n  actor: act-local\n",
-    )
-    .unwrap();
-    // Phase 1: import once (setup, not under test).
-    let output = cli()
-        .current_dir(temp.path())
-        .arg("cluster")
-        .arg("import")
-        .arg("--config")
-        .arg(temp.path())
-        .output()
-        .unwrap();
-    assert!(output.status.success(), "{output:?}");
-
-    // Phase 2: apply alone, capturing the echoed actor (idempotent re-runs).
-    let apply = |extra: &[&str]| {
-        let mut command = cli();
-        command.current_dir(temp.path());
-        for arg in extra {
-            command.arg(arg);
-        }
-        let output = command
-            .arg("cluster")
-            .arg("apply")
-            .arg("--config")
-            .arg(temp.path())
-            .arg("--json")
-            .output()
-            .unwrap();
-        let json: serde_json::Value =
-            serde_json::from_str(String::from_utf8_lossy(&output.stdout).trim()).unwrap();
-        json["actor"].clone()
-    };
-    assert_eq!(apply(&[]), "act-local", "cli.actor is the no-flag default");
-    assert_eq!(apply(&["--as", "andrew"]), "andrew", "--as overrides cli.actor");
-}
-
-/// RFC-007 PR 1: the operator layer joins the actor chain —
-/// `--as` > legacy `cli.actor` (RFC-008 window) > `operator.actor` > none.
+/// RFC-011: the actor chain is `--as` > `operator.actor` > none. The CLI no
+/// longer reads omnigraph.yaml `cli.actor`.
 #[test]
 fn cluster_apply_uses_operator_actor_from_omnigraph_home() {
     let temp = tempdir().unwrap();
@@ -771,41 +728,31 @@ fn cluster_apply_uses_operator_actor_from_omnigraph_home() {
         json["actor"].clone()
     };
 
-    // No --as, no omnigraph.yaml: the operator identity applies.
+    // No --as: the operator identity applies.
     assert_eq!(
         apply(&[]),
         "act-operator",
-        "operator.actor is the no-flag, no-legacy-config default"
+        "operator.actor is the no-flag default"
     );
-    // --as still wins over everything.
+    // --as still wins over the operator layer.
     assert_eq!(apply(&["--as", "andrew"]), "andrew");
-
-    // A legacy cli.actor (RFC-008 window) outranks the operator layer.
-    fs::write(
-        temp.path().join("omnigraph.yaml"),
-        "cli:\n  actor: act-legacy\n",
-    )
-    .unwrap();
-    assert_eq!(
-        apply(&[]),
-        "act-legacy",
-        "legacy cli.actor wins over operator.actor during the deprecation window"
-    );
 }
 
 #[test]
-fn cluster_approve_uses_cli_actor_fallback() {
+fn cluster_approve_uses_operator_actor_fallback() {
     let temp = tempdir().unwrap();
     write_cluster_config_fixture(temp.path());
+    let operator_home = tempdir().unwrap();
     fs::write(
-        temp.path().join("omnigraph.yaml"),
-        "cli:\n  actor: act-local\n",
+        operator_home.path().join("config.yaml"),
+        "operator:\n  actor: act-operator\n",
     )
     .unwrap();
     // Converge, then remove the graph so a gated delete is pending.
     for command in ["import", "apply"] {
         let output = cli()
             .current_dir(temp.path())
+            .env("OMNIGRAPH_HOME", operator_home.path())
             .arg("cluster")
             .arg(command)
             .arg("--config")
@@ -818,6 +765,7 @@ fn cluster_approve_uses_cli_actor_fallback() {
 
     let output = cli()
         .current_dir(temp.path())
+        .env("OMNIGRAPH_HOME", operator_home.path())
         .arg("cluster")
         .arg("approve")
         .arg("graph.knowledge")
@@ -829,14 +777,17 @@ fn cluster_approve_uses_cli_actor_fallback() {
     assert!(output.status.success(), "{output:?}");
     let json: serde_json::Value =
         serde_json::from_str(String::from_utf8_lossy(&output.stdout).trim()).unwrap();
-    assert_eq!(json["approved_by"], "act-local");
+    assert_eq!(json["approved_by"], "act-operator");
 
-    // With neither flag nor config: refused with the actionable message.
+    // With neither flag nor operator config: refused with the actionable
+    // message (an approval without an approver is meaningless).
     let bare = tempdir().unwrap();
     write_cluster_config_fixture(bare.path());
+    let bare_home = tempdir().unwrap();
     let output = output_failure(
         cli()
             .current_dir(bare.path())
+            .env("OMNIGRAPH_HOME", bare_home.path())
             .arg("cluster")
             .arg("approve")
             .arg("graph.knowledge")
@@ -845,11 +796,13 @@ fn cluster_approve_uses_cli_actor_fallback() {
     );
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert!(stderr.contains("--as"), "{stderr}");
-    assert!(stderr.contains("cli.actor"), "{stderr}");
 }
 
 #[test]
-fn cluster_commands_ignore_malformed_local_config() {
+fn cluster_commands_ignore_legacy_omnigraph_yaml() {
+    // RFC-011: the CLI never reads omnigraph.yaml for cluster commands — a
+    // present (even malformed) legacy file is inert. The actor falls back to
+    // `operator.actor`, then to none (no loud failure on absence).
     let temp = tempdir().unwrap();
     write_cluster_config_fixture(temp.path());
     fs::write(temp.path().join("omnigraph.yaml"), "{{{{ not yaml").unwrap();
@@ -873,14 +826,11 @@ fn cluster_commands_ignore_malformed_local_config() {
             "cluster {command} touched omnigraph.yaml"
         );
     }
-    // import + apply with an explicit --as: the config is never loaded.
-    for (command, args) in [("import", vec![]), ("apply", vec!["--as", "andrew"])] {
-        let mut invocation = cli();
-        invocation.current_dir(temp.path());
-        for arg in &args {
-            invocation.arg(arg);
-        }
-        let output = invocation
+    // import + apply (no --as, no operator config): the legacy file is never
+    // loaded and the no-actor apply succeeds (actor defaults to none).
+    for command in ["import", "apply"] {
+        let output = cli()
+            .current_dir(temp.path())
             .arg("cluster")
             .arg(command)
             .arg("--config")
@@ -893,20 +843,6 @@ fn cluster_commands_ignore_malformed_local_config() {
             String::from_utf8_lossy(&output.stderr)
         );
     }
-    // Only the no-flag actor lookup is allowed to fail, and loudly.
-    let output = output_failure(
-        cli()
-            .current_dir(temp.path())
-            .arg("cluster")
-            .arg("apply")
-            .arg("--config")
-            .arg(temp.path()),
-    );
-    let stderr = String::from_utf8_lossy(&output.stderr);
-    assert!(
-        stderr.contains("omnigraph.yaml") && stderr.contains("--as"),
-        "the actor-default config read must fail loudly and actionably: {stderr}"
-    );
 }
 
 #[test]
@@ -950,3 +886,240 @@ graphs:
     assert!(!leaked.contains("phantom") && !leaked.contains("9999"), "{leaked}");
 }
 
+
+// ── RFC-010 Slice 3: cluster-managed maintenance addressing + init signpost ──
+
+/// Stand up an applied, served cluster with the `knowledge` graph and return
+/// its directory guard. Mirrors the e2e setup (fixture → init → import → apply).
+fn applied_knowledge_cluster() -> tempfile::TempDir {
+    let temp = tempdir().unwrap();
+    write_cluster_config_fixture(temp.path());
+    init_cluster_derived_graph(temp.path());
+    let import = cluster_json(temp.path(), "import");
+    assert_eq!(import["ok"], true, "{import}");
+    let apply = cluster_json(temp.path(), "apply");
+    assert_eq!(apply["converged"], true, "{apply}");
+    temp
+}
+
+#[test]
+fn optimize_resolves_a_cluster_graph_by_id() {
+    let temp = applied_knowledge_cluster();
+    // No hand-typed storage path: address the graph by cluster dir + id.
+    let out = output_success(
+        cli()
+            .arg("optimize")
+            .arg("--cluster")
+            .arg(temp.path())
+            .arg("--graph")
+            .arg("knowledge")
+            .arg("--json"),
+    );
+    let payload = parse_stdout_json(&out);
+    assert!(
+        payload["tables"].as_array().is_some(),
+        "optimize did not run against the resolved cluster graph: {payload}"
+    );
+}
+
+#[test]
+fn optimize_unknown_cluster_graph_id_errors() {
+    let temp = applied_knowledge_cluster();
+    let out = output_failure(
+        cli()
+            .arg("optimize")
+            .arg("--cluster")
+            .arg(temp.path())
+            .arg("--graph")
+            .arg("does-not-exist")
+            .arg("--json"),
+    );
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.contains("is not applied in cluster") && stderr.contains("cluster apply"),
+        "expected an unapplied-graph error pointing at cluster apply; got: {stderr}"
+    );
+}
+
+#[test]
+fn optimize_auto_uses_the_sole_cluster_graph() {
+    // RFC-011 D7: a cluster with exactly one applied graph needs no --graph —
+    // the resolver enumerates the catalog and uses the only candidate.
+    let temp = applied_knowledge_cluster();
+    let out = output_success(
+        cli()
+            .arg("optimize")
+            .arg("--cluster")
+            .arg(temp.path())
+            .arg("--json"),
+    );
+    assert!(
+        parse_stdout_json(&out)["tables"].as_array().is_some(),
+        "optimize should auto-resolve the sole cluster graph"
+    );
+}
+
+/// Stand up an applied cluster with two graphs (`knowledge`, `archive`).
+fn applied_two_graph_cluster() -> tempfile::TempDir {
+    let temp = tempdir().unwrap();
+    let root = temp.path();
+    fs::write(
+        root.join("people.pg"),
+        "node Person {\n  name: String @key\n  age: I32?\n}\n",
+    )
+    .unwrap();
+    fs::write(root.join("base.policy.yaml"), "rules: []\n").unwrap();
+    fs::write(
+        root.join("cluster.yaml"),
+        r#"
+version: 1
+metadata:
+  name: two-graph
+state:
+  backend: cluster
+  lock: true
+graphs:
+  knowledge:
+    schema: ./people.pg
+  archive:
+    schema: ./people.pg
+policies:
+  base:
+    file: ./base.policy.yaml
+    applies_to: [knowledge, archive]
+"#,
+    )
+    .unwrap();
+    init_named_cluster_graph(root, "knowledge", "people.pg");
+    init_named_cluster_graph(root, "archive", "people.pg");
+    assert_eq!(cluster_json(root, "import")["ok"], true);
+    assert_eq!(cluster_json(root, "apply")["converged"], true);
+    temp
+}
+
+#[test]
+fn optimize_on_multi_graph_cluster_without_graph_lists_candidates() {
+    // RFC-011 D7: >1 graph and no --graph → error naming every candidate,
+    // never an auto-pick.
+    let temp = applied_two_graph_cluster();
+    let out = output_failure(
+        cli()
+            .arg("optimize")
+            .arg("--cluster")
+            .arg(temp.path())
+            .arg("--json"),
+    );
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.contains("2 graphs")
+            && stderr.contains("archive")
+            && stderr.contains("knowledge")
+            && stderr.contains("--graph <id>"),
+        "expected a candidate-listing error; got: {stderr}"
+    );
+}
+
+#[test]
+fn init_refuses_a_cluster_managed_path_and_signposts_cluster_apply() {
+    let temp = applied_knowledge_cluster();
+    // Hand-init a NEW graph into the established cluster's storage layout.
+    let out = output_failure(
+        cli()
+            .arg("init")
+            .arg("--schema")
+            .arg(temp.path().join("people.pg"))
+            .arg(temp.path().join("graphs").join("sneaky.omni")),
+    );
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.contains("cluster apply"),
+        "init into a cluster-managed path should signpost `cluster apply`; got: {stderr}"
+    );
+    // And it did not create the graph.
+    assert!(!temp.path().join("graphs").join("sneaky.omni").exists());
+}
+
+#[test]
+fn schema_apply_refuses_a_cluster_managed_graph_and_signposts_cluster_apply() {
+    // RFC-011 Decision 10: a direct `schema apply` against a cluster-managed
+    // graph's storage root would bypass the ledger/recovery/approvals, so it is
+    // refused and points at `cluster apply` (mirrors `init`'s refusal).
+    let temp = applied_knowledge_cluster();
+    // A schema that WOULD change the graph (adds `bio`) — so the no-mutation
+    // assertion below is meaningful, not a no-op re-apply.
+    fs::write(
+        temp.path().join("people_v2.pg"),
+        "node Person {\n  name: String @key\n  age: I32?\n  bio: String?\n}\n",
+    )
+    .unwrap();
+    let out = output_failure(
+        cli()
+            .arg("schema")
+            .arg("apply")
+            .arg("--schema")
+            .arg(temp.path().join("people_v2.pg"))
+            .arg("--store")
+            .arg(temp.path().join("graphs").join("knowledge.omni")),
+    );
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.contains("cluster apply"),
+        "schema apply against a cluster-managed graph should signpost `cluster apply`; got: {stderr}"
+    );
+    // And it bailed BEFORE mutating: the live schema still lacks `bio`.
+    let show = output_success(
+        cli()
+            .arg("schema")
+            .arg("show")
+            .arg(temp.path().join("graphs").join("knowledge.omni")),
+    );
+    assert!(
+        !stdout_string(&show).contains("bio"),
+        "the refused apply must not have changed the live schema; got: {}",
+        stdout_string(&show)
+    );
+}
+
+#[test]
+fn init_outside_a_cluster_still_works() {
+    // Regression guard: ordinary init (no cluster layout) is unaffected.
+    let temp = tempdir().unwrap();
+    let schema = fixture("test.pg");
+    let out = output_success(
+        cli()
+            .arg("init")
+            .arg("--schema")
+            .arg(&schema)
+            .arg(temp.path().join("plain.omni")),
+    );
+    assert!(stdout_string(&out).contains("initialized"));
+}
+
+#[test]
+fn optimize_by_cluster_works_when_catalog_payloads_are_degraded() {
+    // Robustness (Greptile, #221): maintenance resolves the graph URI from the
+    // state ledger alone, so an unrelated corrupt/missing catalog payload (or a
+    // pending recovery sweep) does NOT block it — unlike the full serving-snapshot
+    // read. This is what keeps `repair --cluster` usable on a degraded cluster.
+    let temp = applied_knowledge_cluster();
+    // Remove the verified catalog payloads (queries/policies) — a serving read
+    // would refuse with a catalog-payload diagnostic; the ledger-only resolve
+    // must not care.
+    let resources = temp.path().join("__cluster").join("resources");
+    if resources.exists() {
+        fs::remove_dir_all(&resources).unwrap();
+    }
+    let out = output_success(
+        cli()
+            .arg("optimize")
+            .arg("--cluster")
+            .arg(temp.path())
+            .arg("--graph")
+            .arg("knowledge")
+            .arg("--json"),
+    );
+    assert!(
+        parse_stdout_json(&out)["tables"].as_array().is_some(),
+        "optimize should resolve via the ledger despite degraded catalog payloads"
+    );
+}

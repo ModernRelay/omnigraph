@@ -68,7 +68,7 @@ anything moves — mirroring the storage collapse, where the pinned contract
 tests gated the swap, and the test-monolith modularization (#192/#193), which
 makes Phase 3 tractable: the CLI dispatch is 1,184 lines today, not 4,200.
 
-### Phase 1 — Parity matrix (the referee; do first, no refactor)
+### Phase 1 — Parity matrix (the referee; do first, no refactor) *(landed)*
 
 A CLI integration test (extend the `system_local.rs` harness, which already
 spawns both binaries): one fixture graph; for every forked verb, run the
@@ -81,7 +81,16 @@ This pins today's behavior so Phase 3 can't silently change it, and catches
 every future fork drift. It also incidentally covers utoipa annotation↔route
 mismatches (a lying `#[utoipa::path]` makes the remote leg 404).
 
-### Phase 2 — One wire-DTO crate
+**Phase 1 outcome (landed):** `crates/omnigraph-cli/tests/parity_matrix.rs`
+— 11 rows green with an **empty divergence ledger**: with matched Cedar
+policy on both arms, embedded and remote agree on every forked verb's
+scrubbed JSON and exit codes. Two findings along the way: like-for-like
+requires the same policy bundle on both arms (a tokens-only server is
+default-deny by design — the harness encodes this), and inline execution's
+unbound-param matches-all vs the invoke path's hard error is a cross-path
+asymmetry, filed as #207 and pinned (not repaired) by the matrix.
+
+### Phase 2 — One wire-DTO crate *(landed)*
 
 Move the HTTP request/response types and the single `engine result → DTO`
 mapping per verb into a shared crate (working name `omnigraph-api-types`),
@@ -113,6 +122,15 @@ neither axum nor the engine's internals. The engine crate does not depend on
 it — the `engine result → DTO` mapping lives in the shared crate (or the CLI/
 server side), taking engine result types as input.
 
+**Phase 2 outcome (landed):** `crates/omnigraph-api-types` holds the wire
+DTOs + their `engine-result → DTO` mappings; `omnigraph-server::api` is a
+`pub use` re-export (so `openapi.json` is byte-identical — the referee
+passed with zero diff), and the CLI consumes the crate directly. One
+deliberate refinement of the original sketch: `LoadOutput` is a rendered
+CLI output type, not a wire DTO, so it stayed CLI-side — both its mappings
+(local `LoadResult`, remote `IngestOutput`) now sit together in
+`output.rs`. The parity matrix passed textually unchanged.
+
 ### Phase 3 — `GraphClient` trait, two implementations
 
 ```text
@@ -143,15 +161,20 @@ and cluster commands must work with the server down) explicit in code.
 "Server" targets include operator-config named servers (RFC-007), not only
 literal `http(s)://` URIs.
 
-### Phase 5 — Route alignment
+### Phase 5 — Route alignment (landed)
 
-Add a canonical `/load` endpoint (the handler already exists behind the
-`/ingest` shim); point `RemoteClient` at it; keep `/ingest` on its existing
-deprecation path. While here, check whether the server uses `utoipa-axum`'s
-router-coupled registration (`OpenApiRouter`/`routes!`); if it hand-mounts
-routes beside `#[utoipa::path]` annotations, prefer migrating registration so
-path annotations and mount points are the same declaration (the modularization
-already hit one orphaned-attribute incident of exactly this class).
+Added a canonical `POST /load` (shared `run_ingest` body; the deprecated
+`/ingest` is now a thin alias carrying `#[deprecated]` + RFC 9745/8288
+`Deprecation`/`Link: </load>` headers, exactly mirroring `/mutate`↔`/change`)
+and pointed the CLI's remote `load` arm at it; `/ingest` stays on its
+deprecation path. `/load` reuses `IngestRequest`/`IngestOutput` (as canonical
+`/mutate` reuses `Change*`); a DTO rename is a separate change.
+
+Registration finding: the server **hand-mounts** routes (`.route(...)`) beside a
+manual `#[openapi(paths(...))]` list, not `utoipa-axum`'s `OpenApiRouter`/
+`routes!`. This PR followed the existing manual pattern (one `.route` + one
+`paths(...)` entry + the `#[utoipa::path]` annotation) rather than migrating
+registration — the migration is a worthwhile but orthogonal cleanup, deferred.
 
 ## Non-goals
 

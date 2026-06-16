@@ -463,12 +463,28 @@ impl StagedMutation {
     /// unreferenced (cleaned by `cleanup_old_versions`'s age sweep)
     /// rather than being committed and creating a Lance-HEAD-ahead
     /// residual.
+    /// `held_guards`: when the caller already holds the per-`(table_key,
+    /// branch)` write queues for every touched table (the fork path acquires
+    /// them up front, before the fork, and holds them through the manifest
+    /// publish), it passes `(acquired_keys, guards)` here so `commit_all`
+    /// reuses them instead of re-acquiring — the queue is a non-re-entrant
+    /// `tokio::Mutex`, so re-acquiring a held key would self-deadlock.
+    /// `None` (the steady-state path) means `commit_all` acquires them
+    /// itself. `acquired_keys` must cover every key `commit_all` would
+    /// acquire (debug-asserted below) — the guards from `acquire_many` don't
+    /// carry their keys, so the caller hands the key set alongside them. The
+    /// fork path guarantees coverage by keying every touched table uniformly
+    /// by the resolved target branch.
     pub(crate) async fn commit_all(
         self,
         db: &crate::db::Omnigraph,
         branch: Option<&str>,
         sidecar_kind: SidecarKind,
         actor_id: Option<&str>,
+        held_guards: Option<(
+            Vec<(String, Option<String>)>,
+            Vec<tokio::sync::OwnedMutexGuard<()>>,
+        )>,
     ) -> Result<(
         Vec<SubTableUpdate>,
         HashMap<String, u64>,
@@ -483,21 +499,18 @@ impl StagedMutation {
             op_kinds,
         } = self;
 
-        // Acquire per-(table_key, branch) queues for every touched
-        // table — both staged and inline-committed. Sorted by
-        // `acquire_many` internally so all multi-table writers
-        // (mutation, branch_merge, schema_apply, future MR-870
-        // recovery) agree on acquisition order — prevents lock-order
-        // inversion deadlock.
+        // Per-(table_key, branch) queues for every touched table — both
+        // staged and inline-committed. Sorted by `acquire_many` internally
+        // so all multi-table writers (mutation, branch_merge, schema_apply,
+        // the fork path, recovery) agree on acquisition order — prevents
+        // lock-order inversion deadlock.
         //
-        // For inline-committed tables (delete-only mutations), Lance
-        // HEAD has already advanced inside `delete_where` before
-        // `commit_all` runs. Holding the queue here doesn't prevent
-        // that interleaving (commit 6 will move queue acquisition into
-        // `delete_where`'s call site); it does prevent another writer
-        // from interleaving between our delete and our publish, which
-        // would otherwise leave a Lance-HEAD-ahead residual the
-        // delete-only sidecar (added below) would have to recover.
+        // For inline-committed tables (delete-only mutations), Lance HEAD
+        // has already advanced inside `delete_where` before `commit_all`
+        // runs. Holding the queue here prevents another writer from
+        // interleaving between our delete and our publish, which would
+        // otherwise leave a Lance-HEAD-ahead residual the delete-only
+        // sidecar (added below) would have to recover.
         let mut queue_keys: Vec<(String, Option<String>)> =
             Vec::with_capacity(staged.len() + inline_committed.len());
         for entry in &staged {
@@ -512,7 +525,30 @@ impl StagedMutation {
             })?;
             queue_keys.push((table_key.clone(), path.table_branch.clone()));
         }
-        let guards = db.write_queue().acquire_many(&queue_keys).await;
+        // Reuse the caller's guards (fork path) when handed in, else acquire
+        // our own. When reusing, every key we would acquire MUST already be
+        // covered — re-acquiring a held non-re-entrant key would deadlock, and
+        // a key we'd need but DON'T hold would commit unserialized. This is a
+        // load-bearing safety invariant, so it is checked in ALL builds (not a
+        // debug_assert) and fails the write loudly+safely rather than silently
+        // proceeding unguarded if a future execution path ever touches a table
+        // outside the caller's pre-computed set.
+        let guards = match held_guards {
+            Some((acquired_keys, guards)) => {
+                let held: std::collections::HashSet<&(String, Option<String>)> =
+                    acquired_keys.iter().collect();
+                if let Some(missing) = queue_keys.iter().find(|k| !held.contains(k)) {
+                    return Err(OmniError::manifest_internal(format!(
+                        "commit_all: pre-held write-queue guards do not cover touched table \
+                         '{}' on branch {:?} — the caller's up-front acquisition set diverged \
+                         from the staged/inline set (a touched-table-set bug)",
+                        missing.0, missing.1
+                    )));
+                }
+                guards
+            }
+            None => db.write_queue().acquire_many(&queue_keys).await,
+        };
 
         // Re-capture manifest pins under the queue (PR 2 / MR-686).
         //

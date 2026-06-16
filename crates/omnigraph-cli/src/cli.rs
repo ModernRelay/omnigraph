@@ -9,28 +9,74 @@ pub(crate) const DEFAULT_BEARER_TOKEN_ENV: &str = "OMNIGRAPH_BEARER_TOKEN";
 #[command(name = "omnigraph")]
 #[command(about = "Omnigraph graph database CLI")]
 #[command(version = env!("CARGO_PKG_VERSION"), disable_version_flag = true)]
+// Subcommands render in declaration order (clap can't print labeled headings
+// between groups), so this legend names the capability each command needs —
+// the user-facing vocabulary (RFC-011). `Plane` stays the internal classifier.
+#[command(after_help = "\
+COMMANDS BY CAPABILITY:\n  \
+any — run against a graph, served (--server / --profile) or embedded (--store / a \
+URI): query, mutate, load, branch, snapshot, export, commit, schema show/apply.\n  \
+served — require a server: graphs.\n  \
+direct — direct storage access; reject --server (init, optimize, repair, cleanup, \
+schema plan, lint).\n  \
+control — manage or inspect a cluster (cluster via --config; policy & queries via \
+--cluster).\n  \
+local — no explicit graph scope; local config & tooling: alias, embed, login, logout, profile, version.\n\
+See the 'Command capabilities' section of the CLI reference for which flags apply where.")]
 pub(crate) struct Cli {
-    /// Actor identity for direct-engine writes (MR-722). Overrides
-    /// `cli.actor` from `omnigraph.yaml`. When the configured policy
-    /// is in effect, Cedar evaluates this actor against the requested
-    /// action and scope; with policy configured but neither this flag
-    /// nor `cli.actor` set, the engine-layer footgun guard fires and
-    /// the write is denied (no silent bypass). Has no effect on remote
-    /// HTTP writes — those resolve their actor server-side from the
-    /// bearer token.
+    /// Actor id for direct-engine writes; overrides `cli.actor`. No effect on
+    /// remote writes (the server resolves the actor from the bearer token).
+    /// With a policy configured but no actor set, the write is denied — see
+    /// docs/user/operations/policy.md.
     #[arg(long = "as", global = true, value_name = "ACTOR")]
     pub(crate) as_actor: Option<String>,
 
-    /// Target an operator-defined server by name (RFC-007): resolves to
-    /// its `url` from `servers:` in ~/.omnigraph/config.yaml. Exclusive
-    /// with a positional URI or `--target`.
-    #[arg(long, global = true, value_name = "NAME")]
+    /// Address a server by name (resolves to its `url` from `servers:` in
+    /// ~/.omnigraph/config.yaml) or by a literal `http(s)://` URL. Exclusive
+    /// with a positional URI.
+    #[arg(long, global = true, value_name = "NAME|URL")]
     pub(crate) server: Option<String>,
 
-    /// Graph id on a multi-graph `--server` (appends `/graphs/<id>` to
-    /// the server url). Requires --server.
-    #[arg(long, global = true, value_name = "GRAPH_ID", requires = "server")]
+    /// Select a graph within a multi-graph scope: on a `--server` it appends
+    /// `/graphs/<id>` to the server url; on a `--cluster` it picks which
+    /// cluster graph to maintain. Rejected on a single-graph address (a
+    /// positional URI / `--store`).
+    #[arg(long, global = true, value_name = "GRAPH_ID")]
     pub(crate) graph: Option<String>,
+
+    /// Select a named scope bundle (RFC-011) from `profiles:` in
+    /// ~/.omnigraph/config.yaml: fills in this command's omitted addressing
+    /// (server/cluster/store + default graph). Falls back to
+    /// $OMNIGRAPH_PROFILE. Config data, not state — every command resolves
+    /// scope fresh.
+    #[arg(long, global = true, value_name = "NAME")]
+    pub(crate) profile: Option<String>,
+
+    /// Address a single graph's storage directly (RFC-011): a `file://` /
+    /// `s3://` store URI. Explicit, ad-hoc direct access — bypasses any
+    /// server. Exclusive with a positional URI / `--server`.
+    #[arg(long, global = true, value_name = "URI")]
+    pub(crate) store: Option<String>,
+
+    /// Address a cluster-managed graph's storage for maintenance (RFC-011):
+    /// a cluster directory or storage-root URI — named via `clusters:` in
+    /// ~/.omnigraph/config.yaml, or a literal `file://`/`s3://` root. Pair
+    /// with `--graph <id>` to select the graph. Used by optimize / repair /
+    /// cleanup; exclusive with a positional URI / `--store` / `--server`.
+    #[arg(long, global = true, value_name = "DIR|URI")]
+    pub(crate) cluster: Option<String>,
+
+    /// Skip the confirmation prompt for a destructive write (`cleanup`,
+    /// overwrite `load`, `branch delete`) against a non-local scope (RFC-011
+    /// Decision 9). Without it, a non-local destructive write prompts on a TTY
+    /// and refuses (errors) when there is no TTY or `--json` is set.
+    #[arg(long, global = true)]
+    pub(crate) yes: bool,
+
+    /// Suppress the one-line resolved-write-target diagnostic that write
+    /// commands echo to stderr (RFC-011 Decision 9).
+    #[arg(long, global = true)]
+    pub(crate) quiet: bool,
 
     #[command(subcommand)]
     pub(crate) command: Command,
@@ -38,60 +84,83 @@ pub(crate) struct Cli {
 
 #[derive(Debug, Subcommand)]
 pub(crate) enum Command {
-    /// Print the CLI version
-    Version,
-    /// Store a bearer token for a named server in ~/.omnigraph/credentials
-    /// (0600). Token from --token or one line on stdin:
-    /// `echo $TOKEN | omnigraph login prod`. The keyed token applies to
-    /// requests whose URL matches the server's `url` in the operator
-    /// config's `servers:` map.
-    Login {
-        /// Server name (keys the credential; declare its url under
-        /// `servers:` in ~/.omnigraph/config.yaml)
-        name: String,
-        /// The token. Prefer piping via stdin over this flag (shell
-        /// history).
+    // ── Data plane ── run against a graph (embedded or via --server).
+    /// Execute a read query against a branch or snapshot.
+    ///
+    /// Canonical read endpoint. The previous name `omnigraph read` is
+    /// kept as a visible alias and prints a one-line deprecation warning
+    /// when used. Pairs with `omnigraph mutate` on the write side.
+    #[command(visible_alias = "read")]
+    Query {
+        /// Query name. With no `--query`/`-e`, the stored query to invoke from
+        /// the catalog (served — addressed via --server/--profile). With
+        /// `--query`/`-e`, selects which query in that ad-hoc source to run.
+        name: Option<String>,
+        /// Ad-hoc query file (a `.gq` you're authoring / break-glass).
+        #[arg(long, conflicts_with = "query_string")]
+        query: Option<PathBuf>,
+        /// Inline ad-hoc GQ source — alternative to `--query <path>`.
+        #[arg(short = 'e', long = "query-string", value_name = "GQ", conflicts_with = "query")]
+        query_string: Option<String>,
+        #[command(flatten)]
+        params: ParamsArgs,
+        #[arg(long, conflicts_with = "snapshot")]
+        branch: Option<String>,
+        #[arg(long, conflicts_with = "branch")]
+        snapshot: Option<String>,
+        #[arg(long, conflicts_with = "json")]
+        format: Option<ReadOutputFormat>,
+        #[arg(long, conflicts_with = "format")]
+        json: bool,
+    },
+    /// Execute a graph mutation query against a branch.
+    ///
+    /// Canonical mutation endpoint. The previous name `omnigraph change`
+    /// is kept as a visible alias and prints a one-line deprecation
+    /// warning when used. Pairs with `omnigraph query` on the read side.
+    #[command(visible_alias = "change")]
+    Mutate {
+        /// Query name. With no `--query`/`-e`, the stored mutation to invoke
+        /// from the catalog (served — addressed via --server/--profile). With
+        /// `--query`/`-e`, selects which query in that ad-hoc source to run.
+        name: Option<String>,
+        /// Ad-hoc mutation file (a `.gq` you're authoring / break-glass).
+        #[arg(long, conflicts_with = "query_string")]
+        query: Option<PathBuf>,
+        /// Inline ad-hoc GQ source — alternative to `--query <path>`.
+        #[arg(short = 'e', long = "query-string", value_name = "GQ", conflicts_with = "query")]
+        query_string: Option<String>,
+        #[command(flatten)]
+        params: ParamsArgs,
         #[arg(long)]
-        token: Option<String>,
+        branch: Option<String>,
         #[arg(long)]
         json: bool,
     },
-    /// Legacy-config tooling (RFC-008): split omnigraph.yaml into its
-    /// two destinations.
-    Config {
-        #[command(subcommand)]
-        command: ConfigCommand,
-    },
-    /// Remove a named server's stored credential. Idempotent.
-    Logout {
+    /// Invoke an operator alias (RFC-011 Decision 4).
+    ///
+    /// An alias is a personal binding under `aliases:` in
+    /// ~/.omnigraph/config.yaml — name → (server, graph, stored-query name,
+    /// default params). `omnigraph alias <name> [args]` invokes the bound
+    /// stored query on its server. Living in its own namespace, an alias can
+    /// never shadow or be shadowed by a built-in verb. Replaces the removed
+    /// `--alias` flag on `query`/`mutate`.
+    Alias {
+        /// Alias name (a key under `aliases:` in ~/.omnigraph/config.yaml).
         name: String,
-        #[arg(long)]
+        /// Positional args bound to the alias's declared `args` params, in order.
+        args: Vec<String>,
+        #[command(flatten)]
+        params: ParamsArgs,
+        #[arg(long, conflicts_with = "json")]
+        format: Option<ReadOutputFormat>,
+        #[arg(long, conflicts_with = "format")]
         json: bool,
-    },
-    /// Generate, clean, or refresh explicit seed embeddings
-    Embed(EmbedArgs),
-    /// Initialize a new graph from a schema
-    Init {
-        #[arg(long)]
-        schema: PathBuf,
-        /// Graph URI (local path or s3://)
-        uri: String,
-        /// Overwrite existing schema artifacts at the URI. Without
-        /// this flag, init refuses to touch a URI that already holds
-        /// `_schema.pg`, `_schema.ir.json`, or `__schema_state.json`
-        /// — closes the re-init footgun (MR-668 follow-up). With the
-        /// flag, the operator opts in to destructive semantics.
-        #[arg(long)]
-        force: bool,
     },
     /// Load data into a graph (local or remote)
     Load {
         /// Graph URI
         uri: Option<String>,
-        #[arg(long)]
-        target: Option<String>,
-        #[arg(long)]
-        config: Option<PathBuf>,
         #[arg(long)]
         data: PathBuf,
         /// Target branch (defaults to main). Without --from it must exist.
@@ -109,13 +178,10 @@ pub(crate) enum Command {
         json: bool,
     },
     /// Deprecated alias of `load --from <base>` (defaults: --mode merge, --from main)
+    #[command(hide = true)]
     Ingest {
         /// Graph URI
         uri: Option<String>,
-        #[arg(long)]
-        target: Option<String>,
-        #[arg(long)]
-        config: Option<PathBuf>,
         #[arg(long)]
         data: PathBuf,
         #[arg(long)]
@@ -132,10 +198,98 @@ pub(crate) enum Command {
         #[command(subcommand)]
         command: BranchCommand,
     },
+    /// Show graph snapshot
+    Snapshot {
+        /// Graph URI
+        uri: Option<String>,
+        #[arg(long)]
+        branch: Option<String>,
+        #[arg(long)]
+        json: bool,
+    },
+    /// Export a full graph snapshot as JSONL
+    Export {
+        /// Graph URI
+        uri: Option<String>,
+        #[arg(long)]
+        branch: Option<String>,
+        #[arg(long, hide = true)]
+        jsonl: bool,
+        #[arg(long = "type")]
+        type_names: Vec<String>,
+        #[arg(long = "table")]
+        table_keys: Vec<String>,
+    },
+    /// Commit history operations
+    Commit {
+        #[command(subcommand)]
+        command: CommitCommand,
+    },
     /// Schema planning operations
     Schema {
         #[command(subcommand)]
         command: SchemaCommand,
+    },
+    /// Manage graphs on a multi-graph server (MR-668)
+    Graphs {
+        #[command(subcommand)]
+        command: GraphsCommand,
+    },
+
+    // ── Storage / local graph ops ── direct storage or local files; reject --server.
+    /// Initialize a new graph from a schema
+    Init {
+        #[arg(long)]
+        schema: PathBuf,
+        /// Graph URI (local path or s3://)
+        uri: String,
+        /// Overwrite existing schema artifacts at the URI. Without
+        /// this flag, init refuses to touch a URI that already holds
+        /// `_schema.pg`, `_schema.ir.json`, or `__schema_state.json`
+        /// — closes the re-init footgun (MR-668 follow-up). With the
+        /// flag, the operator opts in to destructive semantics.
+        #[arg(long)]
+        force: bool,
+    },
+    /// Compact small Lance fragments in every table of the graph
+    Optimize {
+        /// Graph URI
+        uri: Option<String>,
+        #[arg(long)]
+        json: bool,
+    },
+    /// Classify and explicitly repair manifest/head drift
+    Repair {
+        /// Graph URI
+        uri: Option<String>,
+        /// Publish verified maintenance drift. Without this flag, repair only
+        /// previews what it would do.
+        #[arg(long)]
+        confirm: bool,
+        /// Also publish suspicious or unverifiable drift. Requires
+        /// `--confirm`; use only after operator review.
+        #[arg(long, requires = "confirm")]
+        force: bool,
+        #[arg(long)]
+        json: bool,
+    },
+    /// Remove old Lance versions from every table of the graph (destructive)
+    Cleanup {
+        /// Graph URI
+        uri: Option<String>,
+        /// Number of recent versions to keep per table. Either `--keep` or
+        /// `--older-than` (or both) must be set.
+        #[arg(long)]
+        keep: Option<u32>,
+        /// Only remove versions older than this duration. Accepts Go-style
+        /// durations: `7d`, `24h`, `90m`. At least one of --keep / --older-than.
+        #[arg(long)]
+        older_than: Option<String>,
+        /// Required to actually run; without it, prints what would be removed
+        #[arg(long)]
+        confirm: bool,
+        #[arg(long)]
+        json: bool,
     },
     /// Validate queries against a schema (offline) or repo (repo-backed).
     ///
@@ -152,10 +306,6 @@ pub(crate) enum Command {
         /// Graph URI
         uri: Option<String>,
         #[arg(long)]
-        target: Option<String>,
-        #[arg(long)]
-        config: Option<PathBuf>,
-        #[arg(long)]
         query: PathBuf,
         #[arg(long)]
         schema: Option<PathBuf>,
@@ -167,179 +317,63 @@ pub(crate) enum Command {
         #[command(subcommand)]
         command: QueriesCommand,
     },
-    /// Show graph snapshot
-    Snapshot {
-        /// Graph URI
-        uri: Option<String>,
-        #[arg(long)]
-        target: Option<String>,
-        #[arg(long)]
-        config: Option<PathBuf>,
-        #[arg(long)]
-        branch: Option<String>,
-        #[arg(long)]
-        json: bool,
-    },
-    /// Export a full graph snapshot as JSONL
-    Export {
-        /// Graph URI
-        uri: Option<String>,
-        #[arg(long)]
-        target: Option<String>,
-        #[arg(long)]
-        config: Option<PathBuf>,
-        #[arg(long)]
-        branch: Option<String>,
-        #[arg(long, hide = true)]
-        jsonl: bool,
-        #[arg(long = "type")]
-        type_names: Vec<String>,
-        #[arg(long = "table")]
-        table_keys: Vec<String>,
-    },
-    /// Commit history operations
-    Commit {
-        #[command(subcommand)]
-        command: CommitCommand,
-    },
-    /// Execute a read query against a branch or snapshot.
-    ///
-    /// Canonical read endpoint. The previous name `omnigraph read` is
-    /// kept as a visible alias and prints a one-line deprecation warning
-    /// when used. Pairs with `omnigraph mutate` on the write side.
-    #[command(visible_alias = "read")]
-    Query {
-        /// Graph URI
-        #[arg(long)]
-        uri: Option<String>,
-        #[arg(hide = true)]
-        legacy_uri: Option<String>,
-        #[arg(long)]
-        target: Option<String>,
-        #[arg(long)]
-        config: Option<PathBuf>,
-        #[arg(long, conflicts_with_all = ["query", "query_string"])]
-        alias: Option<String>,
-        #[arg(long, conflicts_with_all = ["alias", "query_string"])]
-        query: Option<PathBuf>,
-        /// Inline GQ source — alternative to `--query <path>` and `--alias <name>`.
-        #[arg(short = 'e', long = "query-string", value_name = "GQ", conflicts_with_all = ["query", "alias"])]
-        query_string: Option<String>,
-        #[arg(long)]
-        name: Option<String>,
-        #[command(flatten)]
-        params: ParamsArgs,
-        #[arg(long, conflicts_with = "snapshot")]
-        branch: Option<String>,
-        #[arg(long, conflicts_with = "branch")]
-        snapshot: Option<String>,
-        #[arg(long, conflicts_with = "json")]
-        format: Option<ReadOutputFormat>,
-        #[arg(long, conflicts_with = "format")]
-        json: bool,
-        #[arg()]
-        alias_args: Vec<String>,
-    },
-    /// Execute a graph mutation query against a branch.
-    ///
-    /// Canonical mutation endpoint. The previous name `omnigraph change`
-    /// is kept as a visible alias and prints a one-line deprecation
-    /// warning when used. Pairs with `omnigraph query` on the read side.
-    #[command(visible_alias = "change")]
-    Mutate {
-        /// Graph URI
-        #[arg(long)]
-        uri: Option<String>,
-        #[arg(hide = true)]
-        legacy_uri: Option<String>,
-        #[arg(long)]
-        target: Option<String>,
-        #[arg(long)]
-        config: Option<PathBuf>,
-        #[arg(long, conflicts_with_all = ["query", "query_string"])]
-        alias: Option<String>,
-        #[arg(long, conflicts_with_all = ["alias", "query_string"])]
-        query: Option<PathBuf>,
-        /// Inline GQ source — alternative to `--query <path>` and `--alias <name>`.
-        #[arg(short = 'e', long = "query-string", value_name = "GQ", conflicts_with_all = ["query", "alias"])]
-        query_string: Option<String>,
-        #[arg(long)]
-        name: Option<String>,
-        #[command(flatten)]
-        params: ParamsArgs,
-        #[arg(long)]
-        branch: Option<String>,
-        #[arg(long)]
-        json: bool,
-        #[arg()]
-        alias_args: Vec<String>,
-    },
-    /// Policy administration and diagnostics
-    Policy {
-        #[command(subcommand)]
-        command: PolicyCommand,
-    },
-    /// Compact small Lance fragments in every table of the graph
-    Optimize {
-        /// Graph URI
-        uri: Option<String>,
-        #[arg(long)]
-        target: Option<String>,
-        #[arg(long)]
-        config: Option<PathBuf>,
-        #[arg(long)]
-        json: bool,
-    },
-    /// Classify and explicitly repair manifest/head drift
-    Repair {
-        /// Graph URI
-        uri: Option<String>,
-        #[arg(long)]
-        target: Option<String>,
-        #[arg(long)]
-        config: Option<PathBuf>,
-        /// Publish verified maintenance drift. Without this flag, repair only
-        /// previews what it would do.
-        #[arg(long)]
-        confirm: bool,
-        /// Also publish suspicious or unverifiable drift. Requires
-        /// `--confirm`; use only after operator review.
-        #[arg(long, requires = "confirm")]
-        force: bool,
-        #[arg(long)]
-        json: bool,
-    },
-    /// Remove old Lance versions from every table of the graph (destructive)
-    Cleanup {
-        /// Graph URI
-        uri: Option<String>,
-        #[arg(long)]
-        target: Option<String>,
-        #[arg(long)]
-        config: Option<PathBuf>,
-        /// Number of recent versions to keep per table. Either `--keep` or
-        /// `--older-than` (or both) must be set.
-        #[arg(long)]
-        keep: Option<u32>,
-        /// Only remove versions older than this duration. Accepts Go-style
-        /// durations: `7d`, `24h`, `90m`. At least one of --keep / --older-than.
-        #[arg(long)]
-        older_than: Option<String>,
-        /// Required to actually run; without it, prints what would be removed
-        #[arg(long)]
-        confirm: bool,
-        #[arg(long)]
-        json: bool,
-    },
+
+    // ── Control plane ── manage a cluster directory (--config <dir>).
     /// Validate and plan read-only cluster configuration.
     Cluster {
         #[command(subcommand)]
         command: ClusterCommand,
     },
-    /// Manage graphs on a multi-graph server (MR-668)
-    Graphs {
+
+    /// Policy administration and diagnostics against a cluster's applied bundles
+    Policy {
         #[command(subcommand)]
-        command: GraphsCommand,
+        command: PolicyCommand,
+    },
+    /// Generate, clean, or refresh explicit seed embeddings
+    Embed(EmbedArgs),
+    /// Store a bearer token for a named server (0600 credentials file). Token
+    /// via --token or piped on stdin; see the CLI reference for token resolution.
+    Login {
+        /// Server name (keys the credential; declare its url under
+        /// `servers:` in ~/.omnigraph/config.yaml)
+        name: String,
+        /// The token. Prefer piping via stdin over this flag (shell
+        /// history).
+        #[arg(long)]
+        token: Option<String>,
+        #[arg(long)]
+        json: bool,
+    },
+    /// Remove a named server's stored credential. Idempotent.
+    Logout {
+        name: String,
+        #[arg(long)]
+        json: bool,
+    },
+    /// Inspect the scope profiles in ~/.omnigraph/config.yaml (read-only).
+    Profile {
+        #[command(subcommand)]
+        command: ProfileCommand,
+    },
+    /// Print the CLI version
+    Version,
+}
+
+#[derive(Debug, Subcommand)]
+pub(crate) enum ProfileCommand {
+    /// List the profiles defined in ~/.omnigraph/config.yaml.
+    List {
+        #[arg(long)]
+        json: bool,
+    },
+    /// Show a profile's resolved scope. With no name, shows the active
+    /// (`$OMNIGRAPH_PROFILE`) profile, else the flat operator defaults.
+    Show {
+        /// Profile name (optional).
+        name: Option<String>,
+        #[arg(long)]
+        json: bool,
     },
 }
 
@@ -439,10 +473,6 @@ pub(crate) enum GraphsCommand {
         #[arg(long)]
         uri: Option<String>,
         #[arg(long)]
-        target: Option<String>,
-        #[arg(long)]
-        config: Option<PathBuf>,
-        #[arg(long)]
         json: bool,
     },
 }
@@ -455,10 +485,6 @@ pub(crate) enum BranchCommand {
         #[arg(long)]
         uri: Option<String>,
         #[arg(long)]
-        target: Option<String>,
-        #[arg(long)]
-        config: Option<PathBuf>,
-        #[arg(long)]
         from: Option<String>,
         name: String,
         #[arg(long)]
@@ -470,10 +496,6 @@ pub(crate) enum BranchCommand {
         #[arg(long)]
         uri: Option<String>,
         #[arg(long)]
-        target: Option<String>,
-        #[arg(long)]
-        config: Option<PathBuf>,
-        #[arg(long)]
         json: bool,
     },
     /// Delete a branch
@@ -481,10 +503,6 @@ pub(crate) enum BranchCommand {
         /// Graph URI
         #[arg(long)]
         uri: Option<String>,
-        #[arg(long)]
-        target: Option<String>,
-        #[arg(long)]
-        config: Option<PathBuf>,
         name: String,
         #[arg(long)]
         json: bool,
@@ -494,10 +512,6 @@ pub(crate) enum BranchCommand {
         /// Graph URI
         #[arg(long)]
         uri: Option<String>,
-        #[arg(long)]
-        target: Option<String>,
-        #[arg(long)]
-        config: Option<PathBuf>,
         source: String,
         #[arg(long)]
         into: Option<String>,
@@ -513,10 +527,6 @@ pub(crate) enum SchemaCommand {
         /// Graph URI
         uri: Option<String>,
         #[arg(long)]
-        target: Option<String>,
-        #[arg(long)]
-        config: Option<PathBuf>,
-        #[arg(long)]
         schema: PathBuf,
         #[arg(long)]
         json: bool,
@@ -530,10 +540,6 @@ pub(crate) enum SchemaCommand {
     Apply {
         /// Graph URI
         uri: Option<String>,
-        #[arg(long)]
-        target: Option<String>,
-        #[arg(long)]
-        config: Option<PathBuf>,
         #[arg(long)]
         schema: PathBuf,
         #[arg(long)]
@@ -556,10 +562,6 @@ pub(crate) enum SchemaCommand {
         /// Graph URI
         uri: Option<String>,
         #[arg(long)]
-        target: Option<String>,
-        #[arg(long)]
-        config: Option<PathBuf>,
-        #[arg(long)]
         json: bool,
     },
 }
@@ -572,10 +574,6 @@ pub(crate) enum CommitCommand {
         /// Graph URI
         uri: Option<String>,
         #[arg(long)]
-        target: Option<String>,
-        #[arg(long)]
-        config: Option<PathBuf>,
-        #[arg(long)]
         branch: Option<String>,
         #[arg(long)]
         json: bool,
@@ -585,10 +583,6 @@ pub(crate) enum CommitCommand {
         /// Graph URI
         #[arg(long)]
         uri: Option<String>,
-        #[arg(long)]
-        target: Option<String>,
-        #[arg(long)]
-        config: Option<PathBuf>,
         commit_id: String,
         #[arg(long)]
         json: bool,
@@ -597,20 +591,24 @@ pub(crate) enum CommitCommand {
 
 #[derive(Debug, Subcommand)]
 pub(crate) enum PolicyCommand {
-    /// Validate policy YAML and compiled Cedar policy state
-    Validate {
-        #[arg(long)]
-        config: Option<PathBuf>,
-    },
-    /// Run declarative policy tests from policy.tests.yaml
+    /// Compile and validate the Cedar policy bundle(s) applied in a cluster.
+    ///
+    /// Sources the bundle(s) from the cluster's applied policies
+    /// (`--cluster <dir>`); pass the global `--graph <id>` to pick one
+    /// graph's bundle when several apply.
+    Validate {},
+    /// Run declarative policy tests against a cluster's applied bundle.
+    ///
+    /// The cluster model has no per-bundle tests file, so the cases are
+    /// supplied explicitly with `--tests <file>` and checked against the
+    /// bundle selected by `--cluster` (+ optional `--graph`).
     Test {
+        /// Path to a policy.tests.yaml file.
         #[arg(long)]
-        config: Option<PathBuf>,
+        tests: PathBuf,
     },
-    /// Explain one policy decision locally
+    /// Explain one policy decision against a cluster's applied bundle.
     Explain {
-        #[arg(long)]
-        config: Option<PathBuf>,
         #[arg(long)]
         actor: String,
         #[arg(long)]
@@ -624,28 +622,19 @@ pub(crate) enum PolicyCommand {
 
 #[derive(Debug, Subcommand)]
 pub(crate) enum QueriesCommand {
-    /// Type-check the stored-query registry against the live schema.
+    /// Type-check a cluster's stored-query registry against its schemas.
     ///
-    /// Distinct from `omnigraph lint` (which lints one `.gq` file):
-    /// this validates the whole `queries:` registry — opening the graph
-    /// to read its schema and confirming every stored query still
-    /// type-checks. Exits non-zero on any breakage.
+    /// Distinct from `omnigraph lint` (which lints one `.gq` file): this
+    /// validates the whole `queries:` registry of a cluster (`--cluster
+    /// <dir>`, optional `--graph <id>`) by reading each graph's applied
+    /// schema and confirming every stored query still type-checks. Exits
+    /// non-zero on any breakage.
     Validate {
-        /// Graph URI
-        uri: Option<String>,
-        #[arg(long)]
-        target: Option<String>,
-        #[arg(long)]
-        config: Option<PathBuf>,
         #[arg(long)]
         json: bool,
     },
-    /// List the registered stored queries (name, MCP exposure, params).
+    /// List a cluster's registered stored queries (name, params).
     List {
-        #[arg(long)]
-        target: Option<String>,
-        #[arg(long)]
-        config: Option<PathBuf>,
         #[arg(long)]
         json: bool,
     },
@@ -676,7 +665,6 @@ impl From<CliLoadMode> for LoadMode {
         }
     }
 }
-
 impl CliLoadMode {
     pub(crate) fn as_str(self) -> &'static str {
         match self {
@@ -685,22 +673,4 @@ impl CliLoadMode {
             CliLoadMode::Merge => "merge",
         }
     }
-}
-
-#[derive(Debug, Subcommand)]
-pub(crate) enum ConfigCommand {
-    /// Propose (and with --write, apply) the RFC-008 split of a legacy
-    /// omnigraph.yaml: team half -> a ready-to-review cluster.yaml,
-    /// personal half -> ~/.omnigraph/config.yaml (key-level merge,
-    /// existing entries always win). Touches nothing without --write.
-    Migrate {
-        /// Path to the legacy omnigraph.yaml (default: ./omnigraph.yaml)
-        #[arg(long)]
-        config: Option<PathBuf>,
-        /// Apply the split instead of only printing it
-        #[arg(long)]
-        write: bool,
-        #[arg(long)]
-        json: bool,
-    },
 }

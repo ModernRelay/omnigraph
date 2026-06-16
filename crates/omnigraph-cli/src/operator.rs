@@ -18,10 +18,10 @@ use std::env;
 use std::path::{Path, PathBuf};
 
 use color_eyre::Result;
-use color_eyre::eyre::eyre;
+use color_eyre::eyre::{bail, eyre};
 use serde::Deserialize;
 
-use omnigraph_server::config::ReadOutputFormat;
+use crate::read_format::{ReadOutputFormat, TableCellLayout};
 
 pub(crate) const OPERATOR_HOME_ENV: &str = "OMNIGRAPH_HOME";
 pub(crate) const OPERATOR_DIR: &str = ".omnigraph";
@@ -41,6 +41,17 @@ pub(crate) struct OperatorConfig {
     /// Personal alias bindings (RFC-007 PR 3); see OperatorAlias.
     #[serde(default)]
     pub(crate) aliases: BTreeMap<String, OperatorAlias>,
+    /// Named scope bundles (RFC-011): each binds exactly one of
+    /// {server, cluster, store} plus an optional default graph. Config data,
+    /// not state — selecting one (`--profile`/`OMNIGRAPH_PROFILE`) fills in a
+    /// command's omitted addressing; it never puts you "in" a mode.
+    #[serde(default)]
+    pub(crate) profiles: BTreeMap<String, OperatorProfile>,
+    /// Managed-cluster storage roots (RFC-011): name → root URI. The ONLY
+    /// place a storage root appears in operator config — admin-only and
+    /// opt-in; a normal operator's file has none.
+    #[serde(default)]
+    pub(crate) clusters: BTreeMap<String, OperatorCluster>,
     /// Everything this CLI version doesn't know. Warned once at load,
     /// otherwise ignored (forward compatibility within the operator layer).
     #[serde(flatten)]
@@ -80,8 +91,7 @@ pub(crate) struct OperatorServer {
 #[derive(Debug, Default, Deserialize)]
 pub(crate) struct OperatorIdentity {
     /// Default actor for every `--as` cascade (CLI direct-engine writes and
-    /// cluster commands alike): `--as` > legacy config actor (RFC-008
-    /// window) > this > none.
+    /// cluster commands alike): `--as` > this > none.
     pub(crate) actor: Option<String>,
     #[serde(flatten)]
     unknown: serde_yaml::Mapping,
@@ -91,12 +101,65 @@ pub(crate) struct OperatorIdentity {
 pub(crate) struct OperatorDefaults {
     /// Default read output format, below every more-specific source.
     pub(crate) output: Option<ReadOutputFormat>,
-    /// Table rendering preferences (below the legacy cli.table_* keys
-    /// during the RFC-008 window).
+    /// Table rendering preferences for `--format table`.
     pub(crate) table_max_column_width: Option<usize>,
-    pub(crate) table_cell_layout: Option<omnigraph_server::config::TableCellLayout>,
+    pub(crate) table_cell_layout: Option<TableCellLayout>,
+    /// Default server scope (RFC-011): the everyday addressing when no
+    /// `--profile` / primitive / legacy address is given. Names an entry
+    /// under `servers:`. Mutually exclusive with `store` — a scope binds one
+    /// entity.
+    pub(crate) server: Option<String>,
+    /// Default **store** scope (RFC-011): a `file://` / `s3://` graph storage
+    /// URI used as the zero-flag local default for graph commands when no
+    /// `--profile` / primitive address is given. The local-dev counterpart of
+    /// `server`; mutually exclusive with it.
+    pub(crate) store: Option<String>,
+    /// Default graph selected within a server/cluster scope when no
+    /// `--graph` is passed (RFC-011).
+    pub(crate) default_graph: Option<String>,
     #[serde(flatten)]
     unknown: serde_yaml::Mapping,
+}
+
+/// A named scope bundle (RFC-011): exactly one of {server, cluster, store}
+/// plus an optional default graph. Validated on use (`binding()`), not at
+/// parse time, so an unknown CLI's profile still loads.
+#[derive(Debug, Default, Deserialize)]
+pub(crate) struct OperatorProfile {
+    /// Names an entry under `servers:` — a served scope.
+    pub(crate) server: Option<String>,
+    /// Names an entry under `clusters:` — a privileged direct cluster scope.
+    pub(crate) cluster: Option<String>,
+    /// A single graph's storage URI — a direct store scope.
+    pub(crate) store: Option<String>,
+    /// Default graph within a server/cluster scope (ignored for a store,
+    /// which is already one graph).
+    pub(crate) default_graph: Option<String>,
+    #[serde(flatten)]
+    unknown: serde_yaml::Mapping,
+}
+
+/// A managed-cluster storage root (RFC-011).
+#[derive(Debug, Default, Deserialize)]
+pub(crate) struct OperatorCluster {
+    /// The cluster's storage-root URI (`file://` / `s3://`).
+    pub(crate) root: String,
+    #[serde(flatten)]
+    unknown: serde_yaml::Mapping,
+}
+
+/// The one entity a profile (or flat default) binds. Exactly one variant —
+/// the scope resolver consumes this; "exactly one of server/cluster/store"
+/// is enforced when producing it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum ScopeBinding {
+    /// Served scope: a server name (resolved against `servers:`) or a literal URL.
+    Server(String),
+    /// Direct cluster scope: a cluster name (resolved against `clusters:`) or a
+    /// literal root URI.
+    Cluster(String),
+    /// Direct store scope: a single graph's storage URI.
+    Store(String),
 }
 
 impl OperatorConfig {
@@ -126,6 +189,83 @@ impl OperatorConfig {
             }
         }
         best.map(|(name, _)| name)
+    }
+
+    /// A named profile, if defined (RFC-011).
+    pub(crate) fn profile(&self, name: &str) -> Option<&OperatorProfile> {
+        self.profiles.get(name)
+    }
+
+    /// The storage root of a named cluster, if defined (RFC-011).
+    pub(crate) fn cluster_root(&self, name: &str) -> Option<&str> {
+        self.clusters.get(name).map(|c| c.root.as_str())
+    }
+
+    /// The flat-default server scope name, if set (RFC-011).
+    pub(crate) fn default_server(&self) -> Option<&str> {
+        self.defaults.server.as_deref()
+    }
+
+    /// The flat-default store scope URI, if set (RFC-011) — the zero-flag
+    /// local-dev default.
+    pub(crate) fn default_store(&self) -> Option<&str> {
+        self.defaults.store.as_deref()
+    }
+
+    /// The flat-default graph within a server/cluster scope, if set (RFC-011).
+    pub(crate) fn default_graph(&self) -> Option<&str> {
+        self.defaults.default_graph.as_deref()
+    }
+
+    /// A scope binds one entity (Decision 6): `defaults.server` and
+    /// `defaults.store` are mutually exclusive, and a `store` (already a single
+    /// graph) cannot carry a `default_graph`. Both are refused loudly rather
+    /// than silently dropped.
+    fn validate_defaults(&self) -> Result<()> {
+        if self.defaults.server.is_some() && self.defaults.store.is_some() {
+            bail!(
+                "operator config `defaults` sets both `server` and `store` — a default scope \
+                 binds one entity; keep one (use a `profile` if you need both)"
+            );
+        }
+        if self.defaults.store.is_some() && self.defaults.default_graph.is_some() {
+            bail!(
+                "operator config `defaults` sets both `store` and `default_graph` — a store is \
+                 already a single graph; drop `default_graph` (it applies only to a server/cluster scope)"
+            );
+        }
+        Ok(())
+    }
+}
+
+impl OperatorProfile {
+    /// The single entity this profile binds, or a loud error if it binds zero
+    /// or more than one of {server, cluster, store} (Decision 6: a scope binds
+    /// exactly one entity). Validated here, on use, rather than at parse time.
+    pub(crate) fn binding(&self, profile_name: &str) -> Result<ScopeBinding> {
+        let set: Vec<&str> = [
+            self.server.as_ref().map(|_| "server"),
+            self.cluster.as_ref().map(|_| "cluster"),
+            self.store.as_ref().map(|_| "store"),
+        ]
+        .into_iter()
+        .flatten()
+        .collect();
+        match set.as_slice() {
+            ["server"] => Ok(ScopeBinding::Server(self.server.clone().unwrap())),
+            ["cluster"] => Ok(ScopeBinding::Cluster(self.cluster.clone().unwrap())),
+            ["store"] => Ok(ScopeBinding::Store(self.store.clone().unwrap())),
+            [] => Err(eyre!(
+                "profile '{profile_name}' binds no scope; set exactly one of \
+                 `server`, `cluster`, or `store`"
+            )),
+            many => Err(eyre!(
+                "profile '{profile_name}' binds {} scopes ({}); a profile must \
+                 bind exactly one of `server`, `cluster`, or `store`",
+                many.len(),
+                many.join(", ")
+            )),
+        }
     }
 }
 
@@ -172,6 +312,7 @@ pub(crate) fn load_operator_config_at(path: &Path) -> Result<OperatorConfig> {
     for warning in config.unknown_key_warnings() {
         eprintln!("warning: {warning} in operator config '{}'", path.display());
     }
+    config.validate_defaults()?;
     Ok(config)
 }
 
@@ -195,6 +336,12 @@ impl OperatorConfig {
         }
         for (name, alias) in &self.aliases {
             collect(&alias.unknown, &format!("aliases.{name}."));
+        }
+        for (name, profile) in &self.profiles {
+            collect(&profile.unknown, &format!("profiles.{name}."));
+        }
+        for (name, cluster) in &self.clusters {
+            collect(&cluster.unknown, &format!("clusters.{name}."));
         }
         warnings
     }
@@ -445,6 +592,42 @@ mod tests {
     }
 
     #[test]
+    fn defaults_store_parses_and_is_accessible() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.yaml");
+        fs::write(&path, "defaults:\n  store: file:///tmp/dev.omni\n").unwrap();
+        let config = load_operator_config_at(&path).unwrap();
+        assert_eq!(config.default_store(), Some("file:///tmp/dev.omni"));
+        assert_eq!(config.default_server(), None);
+    }
+
+    #[test]
+    fn defaults_server_and_store_together_is_a_loud_error() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.yaml");
+        fs::write(
+            &path,
+            "defaults:\n  server: prod\n  store: file:///tmp/dev.omni\n",
+        )
+        .unwrap();
+        let err = load_operator_config_at(&path).unwrap_err().to_string();
+        assert!(err.contains("binds one entity"), "{err}");
+    }
+
+    #[test]
+    fn defaults_store_with_default_graph_is_a_loud_error() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.yaml");
+        fs::write(
+            &path,
+            "defaults:\n  store: file:///tmp/dev.omni\n  default_graph: knowledge\n",
+        )
+        .unwrap();
+        let err = load_operator_config_at(&path).unwrap_err().to_string();
+        assert!(err.contains("already a single graph"), "{err}");
+    }
+
+    #[test]
     fn unknown_keys_warn_but_load() {
         // A file written for a later slice (servers/aliases) must load
         // cleanly today — warn-only forward compatibility.
@@ -462,6 +645,82 @@ mod tests {
         assert_eq!(warnings.len(), 1, "{warnings:?}");
         assert!(warnings.iter().any(|w| w.contains("`operator.color`")));
         assert_eq!(config.servers["prod"].url, "https://example.com");
+    }
+
+    #[test]
+    fn parses_profiles_clusters_and_scope_defaults() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.yaml");
+        let yaml = "\
+defaults:
+  server: prod
+  default_graph: knowledge
+servers:
+  prod:
+    url: https://example.com
+clusters:
+  brain:
+    root: s3://acme/clusters/brain
+profiles:
+  staging:
+    server: staging
+    default_graph: knowledge
+  brain-admin:
+    cluster: brain
+    default_graph: knowledge
+";
+        fs::write(&path, yaml).unwrap();
+        let config = load_operator_config_at(&path).unwrap();
+        assert_eq!(config.default_server(), Some("prod"));
+        assert_eq!(config.default_graph(), Some("knowledge"));
+        assert_eq!(config.cluster_root("brain"), Some("s3://acme/clusters/brain"));
+        assert_eq!(
+            config.profile("staging").unwrap().binding("staging").unwrap(),
+            ScopeBinding::Server("staging".into())
+        );
+        assert_eq!(
+            config
+                .profile("brain-admin")
+                .unwrap()
+                .binding("brain-admin")
+                .unwrap(),
+            ScopeBinding::Cluster("brain".into())
+        );
+        // No unknown-key warnings for the new blocks.
+        assert!(config.unknown_key_warnings().is_empty(), "{:?}", config.unknown_key_warnings());
+    }
+
+    #[test]
+    fn profile_binding_rejects_zero_or_multiple_entities() {
+        let none = OperatorProfile::default();
+        let err = none.binding("p").unwrap_err().to_string();
+        assert!(err.contains("binds no scope"), "{err}");
+
+        let two = OperatorProfile {
+            server: Some("prod".into()),
+            store: Some("graph.omni".into()),
+            ..Default::default()
+        };
+        let err = two.binding("p").unwrap_err().to_string();
+        assert!(err.contains("binds 2 scopes"), "{err}");
+        assert!(err.contains("server") && err.contains("store"), "{err}");
+    }
+
+    #[test]
+    fn unknown_keys_in_a_profile_warn() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.yaml");
+        fs::write(
+            &path,
+            "profiles:\n  p:\n    server: prod\n    flavour: spicy\n",
+        )
+        .unwrap();
+        let config = load_operator_config_at(&path).unwrap();
+        let warnings = config.unknown_key_warnings();
+        assert!(
+            warnings.iter().any(|w| w.contains("`profiles.p.flavour`")),
+            "{warnings:?}"
+        );
     }
 
     #[test]

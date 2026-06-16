@@ -19,8 +19,14 @@ publisher's row-level CAS on `__manifest` is the single fence.
   `__run__*` branch on an upgraded graph is swept off `__manifest` by the
   v2→v3 internal-schema migration on first read-write open. (The inert
   `_graph_runs.lance` bytes remain until a `delete_prefix` primitive lands.)
-- Cancelled mutation futures leave **no graph-level state** — only orphaned
-  Lance fragments, which the existing `omnigraph cleanup` pipe reclaims.
+- Cancelled mutation futures leave **no graph-visible state** — the manifest
+  is never advanced. They can leave two kinds of unreferenced residue, both
+  self-healing: orphaned Lance fragments (reclaimed by `omnigraph cleanup`),
+  and — on the *first* write to a table on a branch, which forks it before the
+  publish — a manifest-unreferenced branch ref. The next write to that table
+  reclaims the stale fork and re-forks (`reclaim_orphaned_fork_and_refork`),
+  and `cleanup`'s per-table reconciler is the guaranteed backstop; see the
+  fork-reclaim note in [invariants.md](invariants.md).
 
 ## Read-your-writes within a multi-statement mutation
 
@@ -80,10 +86,17 @@ deferred to a follow-up cycle — tracked).
 Three writers have been migrated onto staged primitives:
 
 * **`ensure_indices`** (`db/omnigraph/table_ops.rs::build_indices_on_dataset_for_catalog`)
-  — scalar indices (BTree, Inverted) now use `stage_create_*_index` +
-  `commit_staged`. Vector indices stay inline (residual — Lance
-  `build_index_metadata_from_segments` is `pub(crate)` in 6.0.1;
-  companion ticket to lance-format/lance#6658 needed).
+  — scalar indices (BTree, Inverted) use `stage_create_*_index` +
+  `commit_staged`. Which index a `@index`/`@key` property gets is dispatched by
+  type via `node_prop_index_kind` (enum + orderable scalar → BTree, free-text
+  String → Inverted/FTS, Vector → vector). Vector indices stay inline (residual
+  — Lance `build_index_metadata_from_segments` is `pub(crate)` in 6.0.1;
+  companion ticket to lance-format/lance#6658 needed). This build is
+  existence-gated (it creates a *missing* index over current fragments); folding
+  fragments appended afterward into an *existing* index is `optimize`'s
+  `optimize_indices` pass — an inline-commit residual, not a staged write (Lance
+  exposes no uncommitted index-optimize), covered by the optimize recovery
+  sidecar (see [maintenance.md](../user/operations/maintenance.md)).
 * **`branch_merge::publish_rewritten_merge_table`**
   (`exec/merge.rs`) — merge_insert now uses `stage_merge_insert` +
   `commit_staged`. Deletes stay inline (Lance #6658 residual).
@@ -305,7 +318,7 @@ success and one failure. The losing writer's error is
 `ManifestConflictDetails::ExpectedVersionMismatch { table_key, expected,
 actual }`. The HTTP server maps this to **409 Conflict** with body
 `{"error": "...", "code": "conflict", "manifest_conflict": { "table_key":
-"...", "expected": N, "actual": M }}` — see [docs/user/server.md](../user/server.md).
+"...", "expected": N, "actual": M }}` — see [docs/user/server.md](../user/operations/server.md).
 
 ## Audit
 

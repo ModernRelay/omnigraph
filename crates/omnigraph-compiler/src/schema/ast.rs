@@ -1,3 +1,5 @@
+use std::collections::BTreeMap;
+
 use crate::types::PropType;
 use serde::{Deserialize, Serialize};
 
@@ -50,6 +52,11 @@ pub struct PropDecl {
 pub struct Annotation {
     pub name: String,
     pub value: Option<String>,
+    /// Keyword arguments, e.g. `model="…"` on `@embed("source", model="…")`.
+    /// Empty is skipped in serialization so existing schemas' IR JSON (and
+    /// hash) stay byte-identical; `BTreeMap` keeps the order deterministic.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub kwargs: BTreeMap<String, String>,
 }
 
 /// A typed constraint declared in a node or edge body.

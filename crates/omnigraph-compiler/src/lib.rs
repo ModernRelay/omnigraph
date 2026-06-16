@@ -1,5 +1,4 @@
 pub mod catalog;
-pub mod embedding;
 pub mod error;
 pub mod ir;
 pub mod json_output;

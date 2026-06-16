@@ -9,8 +9,6 @@ use omnigraph::embedding::EmbeddingClient;
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value, json};
 
-const DEFAULT_EMBED_MODEL: &str = "gemini-embedding-2-preview";
-
 #[derive(Debug, Args, Clone)]
 pub(crate) struct EmbedArgs {
     /// Seed manifest path
@@ -85,8 +83,6 @@ impl EmbedMode {
 
 #[derive(Debug, Clone, Deserialize)]
 struct EmbedSpec {
-    #[serde(default = "default_embed_model")]
-    model: String,
     dimension: usize,
     types: BTreeMap<String, EmbedTypeSpec>,
 }
@@ -179,13 +175,6 @@ pub(crate) fn resolve_embed_job(args: &EmbedArgs) -> Result<EmbedJob> {
         let spec = load_embed_spec(&spec_path)?;
         (input, output, spec)
     };
-
-    if spec.model != DEFAULT_EMBED_MODEL {
-        bail!(
-            "only {} is supported for explicit seed embeddings right now",
-            DEFAULT_EMBED_MODEL
-        );
-    }
 
     Ok(EmbedJob {
         input,
@@ -305,7 +294,14 @@ pub(crate) async fn run_embed_job(job: &EmbedJob) -> Result<EmbedOutput> {
         cleaned_rows,
         mode: job.mode.as_str(!job.selectors.is_empty()),
         dimension: job.spec.dimension,
-        model: job.spec.model.clone(),
+        // The embedding model is resolved solely from the provider config; the
+        // spec carries no model field, so there is no second source of truth to
+        // silently disagree with the API. Report what was actually used (empty
+        // for `--clean`, which builds no client).
+        model: client
+            .as_ref()
+            .map(|c| c.config().model.clone())
+            .unwrap_or_default(),
     })
 }
 
@@ -313,10 +309,6 @@ fn temp_output_path(output: &Path) -> PathBuf {
     let mut temp = output.as_os_str().to_os_string();
     temp.push(".tmp");
     PathBuf::from(temp)
-}
-
-fn default_embed_model() -> String {
-    DEFAULT_EMBED_MODEL.to_string()
 }
 
 fn load_embed_spec(path: &Path) -> Result<EmbedSpec> {

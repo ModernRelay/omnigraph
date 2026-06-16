@@ -248,12 +248,12 @@ async fn diff_table_same_lineage(
     // Inserts + Updates: use _row_last_updated_at_version to find all rows
     // touched since Vf, then classify by checking whether the ID existed at Vf.
     //
-    // Why not _row_created_at_version for inserts: Lance's merge_insert stamps
-    // new rows with _row_created_at_version = dataset_creation_version (v1),
-    // not the merge_insert commit version. This makes _row_created_at_version
-    // unreliable for detecting inserts from merge_insert writes. Using
-    // _row_last_updated_at_version catches all touched rows regardless of
-    // write mode, and ID-set membership distinguishes inserts from updates.
+    // We key on _row_last_updated_at_version because one scan over it catches
+    // every row touched in the window — inserts and updates alike — regardless
+    // of write mode, and ID-set membership at Vf then distinguishes inserts from
+    // updates. (lance#6774 made merge_insert stamp new rows' _row_created_at_version
+    // with the commit version, so created_at became reliable too; last_updated
+    // stays the right key since it also covers updates.)
     if wants_inserts || wants_updates {
         let filter_sql = format!(
             "_row_last_updated_at_version > {} AND _row_last_updated_at_version <= {}",

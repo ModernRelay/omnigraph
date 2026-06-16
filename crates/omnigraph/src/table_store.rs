@@ -26,6 +26,7 @@ use std::sync::Arc;
 use crate::db::manifest::{TableVersionMetadata, open_table_head_for_write};
 use crate::db::{Snapshot, SubTableEntry};
 use crate::error::{OmniError, Result};
+use crate::storage_layer::ForkOutcome;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TableState {
@@ -285,7 +286,7 @@ impl TableStore {
         table_key: &str,
         source_version: u64,
         target_branch: &str,
-    ) -> Result<Dataset> {
+    ) -> Result<ForkOutcome<Dataset>> {
         let mut source_ds = self
             .open_dataset_head(dataset_uri, source_branch)
             .await?
@@ -294,31 +295,49 @@ impl TableStore {
             .map_err(|e| OmniError::Lance(e.to_string()))?;
         self.ensure_expected_version(&source_ds, table_key, source_version)?;
 
-        if source_ds
+        if let Err(create_err) = source_ds
             .create_branch(target_branch, source_version, None)
             .await
-            .is_err()
         {
-            // The target branch ref already exists. The caller
-            // (`open_owned_dataset_for_branch_write`) re-reads the live manifest
-            // before forking and returns a retryable error when a concurrent
-            // writer legitimately holds the fork, so reaching here means the
-            // manifest does NOT reference this fork: it is an orphan from an
-            // incomplete prior `branch_delete`. Surface the actionable cleanup
-            // error rather than guessing from Lance branch versions.
-            return Err(OmniError::manifest_conflict(format!(
-                "branch '{}' has orphaned table state for '{}' from an incomplete \
-                 prior delete; run `omnigraph cleanup` to reclaim it before reusing \
-                 this branch name",
-                target_branch, table_key
-            )));
+            // Disambiguate the failure: only a genuinely pre-existing ref is a
+            // reclaim candidate. Mapping EVERY create_branch failure to
+            // `RefAlreadyExists` would route a transient I/O / version / Lance
+            // internal error into the destructive reclaim path. So check whether
+            // the ref actually exists; if not, the failure is real — propagate
+            // it (preserving error fidelity) rather than force-deleting.
+            //
+            // `list_branches` reads `_refs/branches/` from the store, so it sees
+            // a fully-formed manifest-unreferenced fork (our common case — a
+            // create_branch that completed but whose manifest publish did not).
+            // It does NOT see a phase-1-only Lance "zombie" (tree dir written,
+            // no BranchContents) — but neither does `cleanup`'s reconciler, also
+            // list_branches-based. A zombie only forms if create_branch is
+            // interrupted *between its two internal phases* (a far narrower
+            // window than the manifest-publish gap), and it surfaces here as the
+            // propagated create error requiring manual reclaim. We deliberately
+            // do NOT force-delete on a not-found-ref failure: it is
+            // indistinguishable from a transient error on a fresh create, and
+            // force-deleting there is the destructive overreach this guard
+            // removes. The caller holds the per-(table, branch) write queue, so
+            // no in-process writer races this fork; a cross-process create
+            // between our check and now is the documented one-winner-CAS gap and
+            // propagates as a retryable error.
+            let ref_exists = source_ds
+                .list_branches()
+                .await
+                .map(|b| b.contains_key(target_branch))
+                .unwrap_or(false);
+            if ref_exists {
+                return Ok(ForkOutcome::RefAlreadyExists);
+            }
+            return Err(OmniError::Lance(create_err.to_string()));
         }
 
         let ds = self
             .open_dataset_head(dataset_uri, Some(target_branch))
             .await?;
         self.ensure_expected_version(&ds, table_key, source_version)?;
-        Ok(ds)
+        Ok(ForkOutcome::Created(ds))
     }
 
     pub async fn scan_batches(&self, ds: &Dataset) -> Result<Vec<RecordBatch>> {
@@ -705,6 +724,36 @@ impl TableStore {
         Ok(IndexCoverage::Indexed)
     }
 
+    /// True if any non-system index on `ds` leaves at least one current
+    /// fragment uncovered, i.e. rows that the index does not yet account for
+    /// (appended after the index was built, or rewritten by compaction). Such
+    /// fragments are scanned unindexed until a reindex (`optimize_indices`)
+    /// folds them in. Returns false when every index covers every fragment, or
+    /// when the table has no (non-system) indices to optimize. A `None`
+    /// `fragment_bitmap` means Lance cannot report coverage for that index, so
+    /// we do not treat it as uncovered (mirrors `key_column_index_coverage`).
+    ///
+    /// Used by `optimize` to decide whether an otherwise-already-compacted
+    /// table still has index work to do.
+    pub async fn has_unindexed_fragments(ds: &Dataset) -> Result<bool> {
+        let indices = ds
+            .load_indices()
+            .await
+            .map_err(|e| OmniError::Lance(e.to_string()))?;
+        let frag_ids: Vec<u32> = ds.fragments().iter().map(|f| f.id as u32).collect();
+        for index in indices.iter() {
+            if is_system_index(index) {
+                continue;
+            }
+            if let Some(bitmap) = index.fragment_bitmap.as_ref() {
+                if frag_ids.iter().any(|id| !bitmap.contains(*id)) {
+                    return Ok(true);
+                }
+            }
+        }
+        Ok(false)
+    }
+
     pub async fn count_rows(&self, ds: &Dataset, filter: Option<String>) -> Result<usize> {
         ds.count_rows(filter)
             .await
@@ -745,6 +794,8 @@ impl TableStore {
         let params = WriteParams {
             mode: WriteMode::Append,
             allow_external_blob_outside_bases: true,
+            auto_cleanup: None,
+            skip_auto_cleanup: true,
             ..Default::default()
         };
         ds.append(reader, Some(params))
@@ -764,6 +815,8 @@ impl TableStore {
                 let params = WriteParams {
                     mode: WriteMode::Append,
                     allow_external_blob_outside_bases: true,
+                    auto_cleanup: None,
+                    skip_auto_cleanup: true,
                     ..Default::default()
                 };
                 ds.append(reader, Some(params))
@@ -777,6 +830,8 @@ impl TableStore {
                     enable_stable_row_ids: true,
                     data_storage_version: Some(LanceFileVersion::V2_2),
                     allow_external_blob_outside_bases: true,
+                    auto_cleanup: None,
+                    skip_auto_cleanup: true,
                     ..Default::default()
                 };
                 Dataset::write(reader, dataset_uri, Some(params))
@@ -867,6 +922,8 @@ impl TableStore {
         let params = WriteParams {
             mode: WriteMode::Append,
             allow_external_blob_outside_bases: true,
+            auto_cleanup: None,
+            skip_auto_cleanup: true,
             ..Default::default()
         };
         let transaction = InsertBuilder::new(Arc::new(ds.clone()))
@@ -1040,7 +1097,16 @@ impl TableStore {
         ds: Arc<Dataset>,
         transaction: Transaction,
     ) -> Result<Dataset> {
+        // Skip Lance's auto-cleanup hook on every commit. OmniGraph owns version
+        // GC explicitly (optimize.rs::cleanup_all_tables); Lance's hook fires off
+        // the *dataset's stored* `lance.auto_cleanup.*` config, which graphs
+        // created before the v7 bump (6.0.1 defaulted auto_cleanup ON) still
+        // carry — so `WriteParams::auto_cleanup = None` alone does NOT stop it on
+        // upgraded graphs. Skipping here covers the staged write path (the main
+        // data path) for new and legacy datasets alike, preventing Lance from
+        // GC'ing versions the __manifest still pins for snapshots/time-travel.
         CommitBuilder::new(ds)
+            .with_skip_auto_cleanup(true)
             .execute(transaction)
             .await
             .map_err(|e| OmniError::Lance(e.to_string()))
@@ -1087,6 +1153,8 @@ impl TableStore {
                 mode: WriteMode::Overwrite,
                 enable_stable_row_ids: true,
                 allow_external_blob_outside_bases: true,
+                auto_cleanup: None,
+                skip_auto_cleanup: true,
                 ..Default::default()
             };
             let transaction = InsertBuilder::new(Arc::new(ds.clone()))
@@ -1503,6 +1571,8 @@ impl TableStore {
             enable_stable_row_ids: true,
             data_storage_version: Some(LanceFileVersion::V2_2),
             allow_external_blob_outside_bases: true,
+            auto_cleanup: None,
+            skip_auto_cleanup: true,
             ..Default::default()
         };
         Dataset::write(reader, dataset_uri, Some(params))

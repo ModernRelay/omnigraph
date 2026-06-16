@@ -2,6 +2,8 @@
 //! remote HTTP, env/token handling, scaffolding (moved verbatim from
 //! main.rs in the modularization).
 
+use std::io::IsTerminal;
+
 use super::*;
 use crate::operator;
 
@@ -16,15 +18,94 @@ pub(crate) fn is_remote_uri(uri: &str) -> bool {
     uri.starts_with("http://") || uri.starts_with("https://")
 }
 
-pub(crate) fn remote_url(base: &str, path: &str) -> String {
-    format!("{}{}", base.trim_end_matches('/'), path)
+/// Whether a resolved write target is *local* for the purposes of the RFC-011
+/// Decision 9 destructive-confirm gate: a bare path or a `file://` URI. Anything
+/// else carrying a scheme — `http(s)://` (served), `s3://` / `gs://` / … (object
+/// store) — is non-local and a destructive write against it requires explicit
+/// consent. Generalizes `is_remote_uri` (which only catches http(s)).
+pub(crate) fn uri_is_local(uri: &str) -> bool {
+    !uri.contains("://") || uri.starts_with("file://")
 }
 
-pub(crate) fn remote_branch_url(base: &str, branch: &str) -> Result<String> {
-    let mut url = reqwest::Url::parse(&format!("{}/", base.trim_end_matches('/')))?;
+/// Echo the resolved write target + access path to stderr (RFC-011 Decision 9),
+/// unless `--quiet`. One line, e.g. `omnigraph load → file://g.omni (direct,
+/// local)`. stderr so `--json` consumers reading stdout are unaffected; the line
+/// legitimately differs embedded-vs-served (that visibility is the point).
+pub(crate) fn echo_write_target(quiet: bool, label: &str, uri: &str, served: bool) {
+    if quiet {
+        return;
+    }
+    let access = if served {
+        "served"
+    } else if uri_is_local(uri) {
+        "direct, local"
+    } else {
+        "direct, remote"
+    };
+    eprintln!("omnigraph {label} → {uri} ({access})");
+}
+
+/// Gate a destructive write (`cleanup`, overwrite `load`, `branch delete`)
+/// against a non-local scope (RFC-011 Decision 9). A local target needs no
+/// confirmation; otherwise `--yes` consents, an interactive TTY is prompted, and
+/// a non-TTY / `--json` run refuses rather than silently proceeding.
+pub(crate) fn confirm_destructive(label: &str, uri: &str, yes: bool, json: bool) -> Result<()> {
+    if uri_is_local(uri) || yes {
+        return Ok(());
+    }
+    if json || !std::io::stdin().is_terminal() {
+        bail!(
+            "refusing destructive `{label}` against non-local target {uri} without confirmation; \
+             pass --yes to confirm (an interactive TTY would be prompted instead)"
+        );
+    }
+    eprint!(
+        "About to run a destructive `{label}` against {uri} (not local). Type 'yes' to continue: "
+    );
+    io::stderr().flush()?;
+    let mut answer = String::new();
+    io::stdin().read_line(&mut answer)?;
+    match answer.trim().to_ascii_lowercase().as_str() {
+        "yes" | "y" => Ok(()),
+        _ => bail!("aborted: destructive `{label}` not confirmed"),
+    }
+}
+
+/// THE one way the CLI composes a remote request URL. Every remote call
+/// routes through here so URL assembly has a single mechanism instead of
+/// per-callsite string interpolation.
+///
+/// - `base` is the resolved server root (single-graph) or `…/graphs/{id}`
+///   (multi-graph).
+/// - `segments` are appended as individual percent-encoded path segments, so
+///   a dynamic component (branch name, commit id, query name) is always one
+///   safe segment — e.g. a branch `etl/zendesk/run-1` becomes `%2F`-escaped.
+/// - `query` pairs are percent-encoded values.
+///
+/// Trailing-slash normalization happens exactly once via `pop_if_empty`:
+/// `Url::parse` normalizes a path-less base (`http://host`) to a single empty
+/// trailing segment, and a `…/graphs/{id}/` base keeps its own. `extend`
+/// appends *after* the last segment, so without dropping a trailing empty one
+/// the join emits `…/graphs/{id}//branches/{name}` — the empty `//` segment
+/// misses the route and 404s. Because callers pass structured segments rather
+/// than a pre-joined string, neither a stray `//` nor an un-encoded dynamic
+/// component is representable here.
+pub(crate) fn remote_url(
+    base: &str,
+    segments: &[&str],
+    query: &[(&str, &str)],
+) -> Result<String> {
+    let mut url = reqwest::Url::parse(base.trim_end_matches('/'))?;
     url.path_segments_mut()
         .map_err(|_| color_eyre::eyre::eyre!("invalid remote base url"))?
-        .extend(["branches", branch]);
+        .pop_if_empty()
+        .extend(segments);
+    if !query.is_empty() {
+        let mut pairs = url.query_pairs_mut();
+        for (key, value) in query {
+            pairs.append_pair(key, value);
+        }
+    }
     Ok(url.to_string())
 }
 
@@ -38,148 +119,139 @@ pub(crate) fn bearer_token_from_env(var_name: &str) -> Option<String> {
     normalize_bearer_token(std::env::var(var_name).ok())
 }
 
-pub(crate) fn parse_env_assignment(line: &str) -> Option<(String, String)> {
-    let line = line.trim();
-    if line.is_empty() || line.starts_with('#') {
-        return None;
-    }
-
-    let line = line.strip_prefix("export ").unwrap_or(line).trim();
-    let (name, value) = line.split_once('=')?;
-    let name = name.trim();
-    if name.is_empty() {
-        return None;
-    }
-
-    let value = value.trim();
-    let value = if value.len() >= 2
-        && ((value.starts_with('"') && value.ends_with('"'))
-            || (value.starts_with('\'') && value.ends_with('\'')))
-    {
-        &value[1..value.len() - 1]
-    } else {
-        value
-    };
-
-    Some((name.to_string(), value.to_string()))
-}
-
-pub(crate) fn bearer_token_from_env_file(path: &Path, var_name: &str) -> Result<Option<String>> {
-    if !path.exists() {
-        return Ok(None);
-    }
-
-    for line in fs::read_to_string(path)?.lines() {
-        let Some((name, value)) = parse_env_assignment(line) else {
-            continue;
-        };
-        if name == var_name {
-            return Ok(normalize_bearer_token(Some(value)));
-        }
-    }
-
-    Ok(None)
-}
-
-pub(crate) fn load_env_file_into_process(path: &Path) -> Result<()> {
-    if !path.exists() {
-        return Ok(());
-    }
-
-    for line in fs::read_to_string(path)?.lines() {
-        let Some((name, value)) = parse_env_assignment(line) else {
-            continue;
-        };
-        if std::env::var_os(&name).is_none() {
-            unsafe {
-                std::env::set_var(name, value);
-            }
-        }
-    }
-
-    Ok(())
-}
-
-pub(crate) fn load_cli_config(config_path: Option<&PathBuf>) -> Result<OmnigraphConfig> {
-    let config = load_config(config_path)?;
-    if let Some(path) = config.resolve_auth_env_file() {
-        load_env_file_into_process(&path)?;
-    }
-    Ok(config)
+/// The Cedar resource id for a graph selection: the explicit graph name when one
+/// is given, else the normalized URI (the anonymous fallback). Used by the
+/// `policy` tooling to address a graph's bundle.
+pub(crate) fn graph_resource_id_for_selection(
+    selected_graph: Option<&str>,
+    normalized_uri: &str,
+) -> String {
+    selected_graph.unwrap_or(normalized_uri).to_string()
 }
 
 #[derive(Debug, Clone)]
 pub(crate) struct ResolvedCliGraph {
     pub(crate) uri: String,
-    pub(crate) selected: Option<String>,
-    pub(crate) graph_id: String,
-    pub(crate) policy_file: Option<PathBuf>,
     pub(crate) is_remote: bool,
 }
 
-impl ResolvedCliGraph {
-    pub(crate) fn selected(&self) -> Option<&str> {
-        self.selected.as_deref()
-    }
-}
-
-pub(crate) struct ResolvedPolicyContext {
-    pub(crate) policy_file: PathBuf,
-    pub(crate) graph_id: String,
-}
-
-pub(crate) fn resolve_policy_context(config: &OmnigraphConfig) -> Result<ResolvedPolicyContext> {
-    let selected = config.resolve_policy_tooling_graph_selection()?;
-    let policy_file = config.resolve_policy_file_for(selected).ok_or_else(|| {
-        color_eyre::eyre::eyre!(
-            "policy.file or graphs.<name>.policy.file must be set in omnigraph.yaml"
-        )
-    })?;
-    let graph_id = match selected {
-        Some(name) => graph_resource_id_for_selection(Some(name), ""),
-        None => graph_resource_id_for_selection(None, "default"),
+/// Resolve the cluster for a control-plane tooling command (`policy`,
+/// `queries`) from `--cluster`. A configured name (`clusters:` in operator
+/// config) is rewritten to its root; a literal dir / `s3://`/`file://` root is
+/// passed through. A `--profile`/`OMNIGRAPH_PROFILE` cluster binding also
+/// resolves here when `--cluster` is absent. No omnigraph.yaml.
+pub(crate) fn require_cluster_scope(
+    cluster: Option<&str>,
+    profile: Option<&str>,
+    command: &str,
+) -> Result<String> {
+    let op = operator::load_operator_config()?;
+    let resolve_name = |name: &str| {
+        op.cluster_root(name)
+            .map(str::to_string)
+            .unwrap_or_else(|| name.to_string())
     };
-    Ok(ResolvedPolicyContext {
-        policy_file,
-        graph_id,
-    })
+    if let Some(cluster) = cluster {
+        return Ok(resolve_name(cluster));
+    }
+    // A cluster profile (flag, else OMNIGRAPH_PROFILE) binds the cluster too.
+    let profile_name = profile
+        .map(str::to_string)
+        .or_else(|| std::env::var(scope::PROFILE_ENV).ok().filter(|s| !s.is_empty()));
+    if let Some(name) = profile_name {
+        let profile = op.profile(&name).ok_or_else(|| {
+            color_eyre::eyre::eyre!("unknown profile '{name}' (not defined under `profiles:`)")
+        })?;
+        if let crate::operator::ScopeBinding::Cluster(cluster) = profile.binding(&name)? {
+            return Ok(resolve_name(&cluster));
+        }
+    }
+    bail!(
+        "`{command}` needs a cluster — pass --cluster <dir|uri> (or a name from `clusters:` \
+         in ~/.omnigraph/config.yaml), or select a cluster profile"
+    )
 }
 
-pub(crate) fn resolve_policy_engine(context: &ResolvedPolicyContext) -> Result<PolicyEngine> {
-    PolicyEngine::load_graph(&context.policy_file, &context.graph_id)
+/// Read a cluster's serving snapshot for a control-plane tooling command,
+/// flattening the readiness `Diagnostic` list into one loud error. The single
+/// snapshot entry point for `policy`/`queries` so the not-servable message stays
+/// identical across them.
+async fn read_serving_snapshot_or_report(
+    cluster: &str,
+) -> Result<omnigraph_cluster::ServingSnapshot> {
+    omnigraph_cluster::read_serving_snapshot(cluster)
+        .await
+        .map_err(|diagnostics| {
+            color_eyre::eyre::eyre!(
+                "cluster `{cluster}` is not servable:\n  {}",
+                diagnostics
+                    .iter()
+                    .map(|d| d.message.clone())
+                    .collect::<Vec<_>>()
+                    .join("\n  ")
+            )
+        })
 }
 
-pub(crate) fn resolve_policy_engine_for_graph(graph: &ResolvedCliGraph) -> Result<PolicyEngine> {
-    let policy_file = graph.policy_file.as_ref().ok_or_else(|| {
-        color_eyre::eyre::eyre!(
-            "policy.file or graphs.<name>.policy.file must be set in omnigraph.yaml"
-        )
-    })?;
-    PolicyEngine::load_graph(policy_file, &graph.graph_id)
+/// Resolve the Cedar policy bundle(s) for a `--cluster` policy-tooling command
+/// (RFC-011). Sources the applied policies from the cluster's serving snapshot;
+/// each `ServingPolicy` carries its `source` (digest-verified content) and the
+/// scopes it `applies_to` (`cluster` | `graph.<id>`). The optional `graph`
+/// selects a graph's bundle when several apply.
+pub(crate) async fn read_cluster_policies(
+    cluster: &str,
+) -> Result<Vec<omnigraph_cluster::ServingPolicy>> {
+    Ok(read_serving_snapshot_or_report(cluster).await?.policies)
 }
 
-pub(crate) async fn open_local_db_with_policy(graph: &ResolvedCliGraph) -> Result<Omnigraph> {
-    let db = Omnigraph::open(&graph.uri).await?;
-    if graph.policy_file.is_some() {
-        let engine = Arc::new(resolve_policy_engine_for_graph(graph)?);
-        Ok(db.with_policy(engine as Arc<dyn omnigraph_policy::PolicyChecker>))
-    } else {
-        Ok(db)
+/// Pick the single policy bundle that applies to the selection. With `--graph`,
+/// the bundle bound to `graph.<id>` (or the cluster-wide one); without it, the
+/// sole bundle if there's exactly one. Ambiguity or absence is a loud error.
+pub(crate) fn select_cluster_policy<'p>(
+    cluster: &str,
+    policies: &'p [omnigraph_cluster::ServingPolicy],
+    graph: Option<&str>,
+) -> Result<&'p omnigraph_cluster::ServingPolicy> {
+    if let Some(graph_id) = graph {
+        let graph_ref = format!("graph.{graph_id}");
+        let matching: Vec<&omnigraph_cluster::ServingPolicy> = policies
+            .iter()
+            .filter(|p| {
+                p.applies_to
+                    .iter()
+                    .any(|s| s == &graph_ref || s == "cluster")
+            })
+            .collect();
+        return match matching.as_slice() {
+            [only] => Ok(only),
+            [] => bail!(
+                "cluster `{cluster}` has no policy bundle bound to graph `{graph_id}` \
+                 (or to the cluster scope)"
+            ),
+            many => bail!(
+                "graph `{graph_id}` in cluster `{cluster}` matches {} policy bundles ([{}]); \
+                 the cluster model expects one bundle per graph scope",
+                many.len(),
+                many.iter().map(|p| p.name.as_str()).collect::<Vec<_>>().join(", ")
+            ),
+        };
+    }
+    match policies {
+        [only] => Ok(only),
+        [] => bail!("cluster `{cluster}` has no applied policy bundles"),
+        many => bail!(
+            "cluster `{cluster}` has {} policy bundles ([{}]); pass --graph <id> to select one",
+            many.len(),
+            many.iter().map(|p| p.name.as_str()).collect::<Vec<_>>().join(", ")
+        ),
     }
 }
 
-/// THE actor chain (RFC-007 §D3) — every command that needs an identity
+/// THE actor chain (RFC-011) — every command that needs an identity
 /// resolves through this one function (one path per concern):
-/// `--as` > legacy `cli.actor` in omnigraph.yaml (RFC-008 window) >
-/// `operator.actor` in ~/.omnigraph/config.yaml > none.
-pub(crate) fn resolve_actor(
-    cli_as: Option<&str>,
-    legacy_config_actor: Option<&str>,
-) -> Result<Option<String>> {
+/// `--as` > `operator.actor` in ~/.omnigraph/config.yaml > none.
+pub(crate) fn resolve_actor(cli_as: Option<&str>) -> Result<Option<String>> {
     if let Some(actor) = cli_as {
-        return Ok(Some(actor.to_string()));
-    }
-    if let Some(actor) = legacy_config_actor {
         return Ok(Some(actor.to_string()));
     }
     Ok(operator::load_operator_config()?
@@ -188,80 +260,33 @@ pub(crate) fn resolve_actor(
 }
 
 pub(crate) fn resolve_cluster_actor(cli_as: Option<&str>) -> Result<Option<String>> {
-    if let Some(actor) = cli_as {
-        return Ok(Some(actor.to_string()));
-    }
-    let config = load_config(None).wrap_err(
-        "resolving the default actor from omnigraph.yaml (pass --as <ACTOR> to skip this lookup)",
-    )?;
-    resolve_actor(None, config.cli.actor.as_deref())
+    resolve_actor(cli_as)
 }
 
-pub(crate) fn resolve_cli_actor(
-    cli_as: Option<&str>,
-    config: &OmnigraphConfig,
-) -> Result<Option<String>> {
-    resolve_actor(cli_as, config.cli.actor.as_deref())
+pub(crate) fn resolve_cli_actor(cli_as: Option<&str>) -> Result<Option<String>> {
+    resolve_actor(cli_as)
 }
 
-pub(crate) fn resolve_policy_tests_path(context: &ResolvedPolicyContext) -> PathBuf {
-    context.policy_file.with_file_name("policy.tests.yaml")
-}
-
-pub(crate) fn normalize_policy_graph_uri(uri: &str) -> Result<String> {
-    if is_remote_uri(uri) {
-        Ok(uri.trim_end_matches('/').to_string())
-    } else {
-        Ok(normalize_root_uri(uri)?)
-    }
-}
-
-pub(crate) fn resolve_remote_bearer_token(
-    config: &OmnigraphConfig,
-    explicit_uri: Option<&str>,
-    explicit_target: Option<&str>,
-) -> Result<Option<String>> {
+/// The bearer token for a remote request (RFC-011): the operator keyed chain
+/// for the matching server (`OMNIGRAPH_TOKEN_<NAME>` env → 0600 credentials
+/// file), then the default `OMNIGRAPH_BEARER_TOKEN` env. No omnigraph.yaml
+/// chain.
+pub(crate) fn resolve_remote_bearer_token(explicit_uri: Option<&str>) -> Result<Option<String>> {
     // The keyed hop (RFC-007 §D4, gh-host model): when the effective remote
     // URL belongs to an operator-defined server, that server's keyed chain
     // applies first — OMNIGRAPH_TOKEN_<NAME> env, then the 0600 credentials
-    // file. Ok(None) falls through to the legacy chain unchanged, and the
-    // keyed token is structurally scoped to its own server (§D5 rule 3):
-    // a URL matching no operator server never sees it.
-    if let Some(remote_url) = effective_remote_url(config, explicit_uri, explicit_target) {
+    // file. The keyed token is structurally scoped to its own server: a URL
+    // matching no operator server never sees it.
+    if let Some(remote_url) = explicit_uri.filter(|uri| is_remote_uri(uri)) {
         let operator_config = operator::load_operator_config()?;
-        if let Some(server) = operator_config.find_server_for_url(&remote_url) {
+        if let Some(server) = operator_config.find_server_for_url(remote_url) {
             if let Some(token) = operator::resolve_keyed_token(server)? {
                 return Ok(Some(token));
             }
         }
     }
 
-    let scoped_env =
-        config.graph_bearer_token_env(explicit_uri, explicit_target, config.cli_graph_name());
-    let mut env_names = Vec::new();
-    if let Some(name) = scoped_env {
-        env_names.push(name.to_string());
-    }
-    if env_names
-        .iter()
-        .all(|name| name != DEFAULT_BEARER_TOKEN_ENV)
-    {
-        env_names.push(DEFAULT_BEARER_TOKEN_ENV.to_string());
-    }
-
-    let env_file = config.resolve_auth_env_file();
-    for env_name in env_names {
-        if let Some(token) = bearer_token_from_env(&env_name) {
-            return Ok(Some(token));
-        }
-        if let Some(path) = env_file.as_ref() {
-            if let Some(token) = bearer_token_from_env_file(path, &env_name)? {
-                return Ok(Some(token));
-            }
-        }
-    }
-
-    Ok(None)
+    Ok(bearer_token_from_env(DEFAULT_BEARER_TOKEN_ENV))
 }
 
 /// `--server <name>` (RFC-007 PR 3): resolve an operator-defined server
@@ -277,19 +302,26 @@ pub(crate) fn resolve_server_flag(
     let Some(server) = server else {
         return Ok(None);
     };
-    let operator_config = operator::load_operator_config()?;
-    let Some(entry) = operator_config.servers.get(server) else {
-        let known = operator_config
-            .servers
-            .keys()
-            .map(String::as_str)
-            .collect::<Vec<_>>()
-            .join(", ");
-        color_eyre::eyre::bail!(
-            "unknown server '{server}' — servers defined in the operator config: [{known}] (add it under servers: in ~/.omnigraph/config.yaml)"
-        );
+    // RFC-011 Decision 2: a value containing `://` is a literal base URL
+    // (bypasses the operator-config registry); otherwise it is a config name.
+    let base_url = if server.contains("://") {
+        server.to_string()
+    } else {
+        let operator_config = operator::load_operator_config()?;
+        let Some(entry) = operator_config.servers.get(server) else {
+            let known = operator_config
+                .servers
+                .keys()
+                .map(String::as_str)
+                .collect::<Vec<_>>()
+                .join(", ");
+            color_eyre::eyre::bail!(
+                "unknown server '{server}' — servers defined in the operator config: [{known}] (add it under servers: in ~/.omnigraph/config.yaml)"
+            );
+        };
+        entry.url.clone()
     };
-    let base = entry.url.trim_end_matches('/');
+    let base = base_url.trim_end_matches('/');
     Ok(Some(match graph {
         Some(graph) => format!("{base}/graphs/{graph}"),
         None => base.to_string(),
@@ -302,7 +334,6 @@ pub(crate) fn resolve_server_flag(
 /// params. The keyed token applies via the ordinary URL match.
 pub(crate) async fn execute_operator_alias(
     client: &reqwest::Client,
-    config: &OmnigraphConfig,
     alias_name: &str,
     alias: &crate::operator::OperatorAlias,
     alias_args: &[String],
@@ -310,7 +341,7 @@ pub(crate) async fn execute_operator_alias(
 ) -> Result<ReadOutput> {
     let uri = resolve_server_flag(Some(&alias.server), alias.graph.as_deref())?
         .expect("server name is present");
-    let bearer_token = resolve_remote_bearer_token(config, Some(&uri), None)?;
+    let bearer_token = resolve_remote_bearer_token(Some(&uri))?;
 
     let mut params = serde_json::Map::new();
     for (key, value) in &alias.params {
@@ -336,12 +367,16 @@ pub(crate) async fn execute_operator_alias(
         }
     }
 
-    let body = (!params.is_empty()).then(|| serde_json::json!({ "params": params }));
+    let mut body = serde_json::Map::new();
+    body.insert("expect_mutation".to_string(), Value::Bool(false));
+    if !params.is_empty() {
+        body.insert("params".to_string(), Value::Object(params));
+    }
     remote_json(
         client,
         Method::POST,
-        remote_url(&uri, &format!("/queries/{}", alias.query)),
-        body,
+        remote_url(&uri, &["queries", &alias.query], &[])?,
+        Some(Value::Object(body)),
         bearer_token.as_deref(),
     )
     .await
@@ -353,33 +388,16 @@ pub(crate) fn apply_server_flag(
     server: Option<&str>,
     graph: Option<&str>,
     uri: Option<String>,
-    target: Option<&str>,
 ) -> Result<Option<String>> {
     if server.is_none() {
         return Ok(uri);
     }
-    if uri.is_some() || target.is_some() {
+    if uri.is_some() {
         color_eyre::eyre::bail!(
-            "--server is exclusive with a positional URI and --target — pick one way to address the graph"
+            "--server is exclusive with a positional URI — pick one way to address the graph"
         );
     }
     resolve_server_flag(server, graph)
-}
-
-/// The remote base URL a token resolution is FOR — the same scoping
-/// `graph_bearer_token_env` uses: an explicit http(s) `--uri` wins, else
-/// the config-resolved target's uri (when remote). Local URIs → None.
-fn effective_remote_url(
-    config: &OmnigraphConfig,
-    explicit_uri: Option<&str>,
-    explicit_target: Option<&str>,
-) -> Option<String> {
-    if let Some(uri) = explicit_uri {
-        return is_remote_uri(uri).then(|| uri.to_string());
-    }
-    let target = config.resolve_target_name(explicit_uri, explicit_target, config.cli_graph_name())?;
-    let uri = &config.graphs.get(target)?.uri;
-    is_remote_uri(uri).then(|| uri.clone())
 }
 
 pub(crate) fn build_http_client() -> Result<reqwest::Client> {
@@ -422,50 +440,38 @@ pub(crate) async fn remote_json<T: DeserializeOwned>(
     Ok(serde_json::from_str(&text)?)
 }
 
-pub(crate) fn resolve_uri(
-    config: &OmnigraphConfig,
-    cli_uri: Option<String>,
-    cli_target: Option<&str>,
-) -> Result<String> {
-    config.resolve_target_uri(cli_uri, cli_target, config.cli_graph_name())
+/// The graph URI a command addresses (RFC-011): the scope-resolved URI string
+/// (positional URI / `--store` / `--profile` / `defaults.store`). No
+/// omnigraph.yaml `cli.graph` fallback — an absent address is a loud error.
+pub(crate) fn resolve_uri(cli_uri: Option<String>) -> Result<String> {
+    cli_uri.ok_or_else(|| {
+        color_eyre::eyre::eyre!(
+            "no graph addressed — pass a positional URI, --store <uri>, --server <name>, \
+             --profile <name>, or set a default scope in ~/.omnigraph/config.yaml"
+        )
+    })
 }
 
-pub(crate) fn resolve_cli_graph(
-    config: &OmnigraphConfig,
-    cli_uri: Option<String>,
-    cli_target: Option<&str>,
-) -> Result<ResolvedCliGraph> {
-    let selected = if cli_uri.is_some() {
-        None
-    } else {
-        cli_target
-            .map(str::to_string)
-            .or_else(|| config.cli_graph_name().map(str::to_string))
-    };
-    config.resolve_graph_selection(selected.as_deref())?;
-    let uri = resolve_uri(config, cli_uri, cli_target)?;
-    let normalized_uri = normalize_policy_graph_uri(&uri)?;
-    let graph_id = graph_resource_id_for_selection(selected.as_deref(), &normalized_uri);
+pub(crate) fn resolve_cli_graph(cli_uri: Option<String>) -> Result<ResolvedCliGraph> {
+    let uri = resolve_uri(cli_uri)?;
     Ok(ResolvedCliGraph {
-        graph_id,
         is_remote: is_remote_uri(&uri),
-        policy_file: config.resolve_policy_file_for(selected.as_deref()),
-        selected,
         uri,
     })
 }
 
 pub(crate) fn resolve_local_graph(
-    config: &OmnigraphConfig,
     cli_uri: Option<String>,
-    cli_target: Option<&str>,
     operation: &str,
 ) -> Result<ResolvedCliGraph> {
-    let graph = resolve_cli_graph(config, cli_uri, cli_target)?;
+    let graph = resolve_cli_graph(cli_uri)?;
     if graph.is_remote {
         bail!(
-            "{} is only supported against local graph URIs in this milestone",
-            operation
+            "`{}` is a direct (storage-native) command and needs direct storage \
+             access; the resolved target is a remote server ({}). Pass the \
+             graph's file:// or s3:// URI.",
+            operation,
+            graph.uri
         );
     }
     Ok(graph)
@@ -501,29 +507,112 @@ pub(crate) fn parse_duration_arg(s: &str) -> Result<std::time::Duration> {
     Ok(std::time::Duration::from_secs(secs))
 }
 
-pub(crate) fn resolve_local_uri(
-    config: &OmnigraphConfig,
+pub(crate) fn resolve_local_uri(cli_uri: Option<String>, operation: &str) -> Result<String> {
+    Ok(resolve_local_graph(cli_uri, operation)?.uri)
+}
+
+/// Resolve a direct (storage-native) verb's address to a storage URI through the
+/// one RFC-011 scope path — the maintenance verbs (optimize/repair/cleanup) plus
+/// `schema plan` and `lint`'s graph-target path. Every primitive funnels here: a
+/// positional URI, `--store`, `--cluster <root> --graph <id>`, a `--profile`
+/// cluster binding, or operator defaults — all resolved at the `Direct`
+/// capability (so a server scope is rejected, a cluster scope is allowed when the
+/// verb opts into cluster addressing), then mapped to a storage URI by
+/// `resolve_storage_uri`.
+pub(crate) async fn resolve_maintenance_uri(
+    profile: Option<&str>,
+    store: Option<&str>,
+    cluster: Option<&str>,
+    graph: Option<&str>,
     cli_uri: Option<String>,
-    cli_target: Option<&str>,
     operation: &str,
 ) -> Result<String> {
-    Ok(resolve_local_graph(config, cli_uri, cli_target, operation)?.uri)
+    let scope = scope::resolve_scope(
+        &operator::load_operator_config()?,
+        planes::Capability::Direct,
+        scope::ScopeFlags {
+            profile,
+            store,
+            server: None,
+            cluster,
+            graph,
+            uri: cli_uri,
+        },
+    )?;
+    resolve_storage_uri(
+        scope.uri,
+        scope.cluster.as_deref(),
+        scope.cluster_graph.as_deref(),
+        operation,
+    )
+    .await
+}
+
+/// Map a resolved direct address to a storage URI: a cluster scope
+/// (`--cluster <root> --graph <id>`, or a `--profile` cluster binding) resolves
+/// the graph's storage URI from the **served cluster state**; otherwise the
+/// ordinary positional-URI path. When a cluster scope carries no graph
+/// selection (RFC-011 D7), enumerate the catalog: a sole graph is used
+/// automatically, otherwise error and list the candidates so the operator can
+/// pass `--graph <id>`.
+pub(crate) async fn resolve_storage_uri(
+    cli_uri: Option<String>,
+    cluster: Option<&str>,
+    cluster_graph: Option<&str>,
+    operation: &str,
+) -> Result<String> {
+    match (cluster, cluster_graph) {
+        (Some(cluster), Some(graph_id)) => resolve_cluster_graph_uri(cluster, graph_id).await,
+        (Some(cluster), None) => {
+            let graph_id = resolve_sole_cluster_graph(cluster).await?;
+            resolve_cluster_graph_uri(cluster, &graph_id).await
+        }
+        (None, None) => resolve_local_uri(cli_uri, operation),
+        (None, Some(_)) => {
+            bail!("internal error: a graph was selected without a cluster scope")
+        }
+    }
+}
+
+/// Pick the graph for a cluster scope that has no `--graph`/`default_graph`
+/// (RFC-011 D7): exactly one applied graph → use it; zero → error; more than
+/// one → error and list the candidates. Never auto-picks among several.
+async fn resolve_sole_cluster_graph(cluster: &str) -> Result<String> {
+    let ids = omnigraph_cluster::cluster_graph_ids(cluster)
+        .await
+        .map_err(|diagnostic| color_eyre::eyre::eyre!("{}", diagnostic.message))?;
+    match ids.as_slice() {
+        [only] => Ok(only.clone()),
+        [] => bail!("cluster `{cluster}` has no applied graphs; run `cluster apply` first"),
+        many => bail!(
+            "cluster `{cluster}` has {} graphs: [{}]; pass --graph <id> to select one",
+            many.len(),
+            many.join(", ")
+        ),
+    }
+}
+
+/// Look up a graph's storage URI from a cluster's applied state ledger. Uses
+/// the lightweight `resolve_graph_storage_uri` (NOT the full serving-snapshot
+/// validation), so maintenance — especially `repair` — works even when an
+/// unrelated catalog payload is corrupt or a recovery sweep is pending.
+async fn resolve_cluster_graph_uri(cluster: &str, graph_id: &str) -> Result<String> {
+    omnigraph_cluster::resolve_graph_storage_uri(cluster, graph_id)
+        .await
+        .map_err(|diagnostic| color_eyre::eyre::eyre!("{}", diagnostic.message))
 }
 
 pub(crate) fn resolve_branch(
-    config: &OmnigraphConfig,
     cli_branch: Option<String>,
     alias_branch: Option<String>,
     default_branch: &str,
 ) -> String {
     cli_branch
         .or(alias_branch)
-        .or_else(|| config.cli.branch.clone())
         .unwrap_or_else(|| default_branch.to_string())
 }
 
 pub(crate) fn resolve_read_target(
-    config: &OmnigraphConfig,
     cli_branch: Option<String>,
     cli_snapshot: Option<String>,
     alias_branch: Option<String>,
@@ -531,19 +620,15 @@ pub(crate) fn resolve_read_target(
     if cli_branch.is_some() && cli_snapshot.is_some() {
         bail!("read target may specify branch or snapshot, not both");
     }
-    Ok(read_target_from_cli(
-        cli_branch
-            .or(alias_branch)
-            .or_else(|| config.cli.branch.clone()),
-        cli_snapshot,
-    ))
+    Ok(read_target_from_cli(cli_branch.or(alias_branch), cli_snapshot))
 }
 
 pub(crate) fn resolve_query_path(
-    config: &OmnigraphConfig,
     explicit_query: Option<&PathBuf>,
     alias_query: Option<&str>,
 ) -> Result<PathBuf> {
+    // The `.gq` path is resolved plainly (cwd-relative) — no omnigraph.yaml
+    // `query.roots` search.
     explicit_query
         .map(PathBuf::from)
         .or_else(|| alias_query.map(PathBuf::from))
@@ -552,11 +637,9 @@ pub(crate) fn resolve_query_path(
                 "exactly one of --query, --query-string, or --alias must be provided"
             )
         })
-        .and_then(|query_path| config.resolve_query_path(&query_path))
 }
 
 pub(crate) fn resolve_query_source(
-    config: &OmnigraphConfig,
     explicit_query: Option<&PathBuf>,
     inline_query: Option<&str>,
     alias_query: Option<&str>,
@@ -568,7 +651,6 @@ pub(crate) fn resolve_query_source(
         return Ok(inline.to_string());
     }
     Ok(fs::read_to_string(resolve_query_path(
-        config,
         explicit_query,
         alias_query,
     )?)?)
@@ -578,49 +660,9 @@ pub(crate) fn parse_alias_value(value: &str) -> Value {
     serde_json::from_str(value).unwrap_or_else(|_| Value::String(value.to_string()))
 }
 
-pub(crate) fn merged_params_json(
-    alias_name: Option<&str>,
-    alias_arg_names: &[String],
-    alias_arg_values: &[String],
-    explicit: Option<Value>,
-) -> Result<Option<Value>> {
-    if alias_arg_values.len() > alias_arg_names.len() {
-        let alias = alias_name.unwrap_or("<alias>");
-        bail!(
-            "alias '{}' expects at most {} args but got {}",
-            alias,
-            alias_arg_names.len(),
-            alias_arg_values.len()
-        );
-    }
-
-    let mut merged = serde_json::Map::new();
-    for (arg_name, arg_value) in alias_arg_names.iter().zip(alias_arg_values.iter()) {
-        merged.insert(arg_name.clone(), parse_alias_value(arg_value));
-    }
-
-    match explicit {
-        Some(Value::Object(object)) => {
-            for (key, value) in object {
-                merged.insert(key, value);
-            }
-        }
-        Some(_) => bail!("params JSON must be an object"),
-        None => {}
-    }
-
-    if merged.is_empty() {
-        Ok(None)
-    } else {
-        Ok(Some(Value::Object(merged)))
-    }
-}
-
-/// The format cascade (RFC-007 §D3): `--json` > `--format` > alias format >
-/// legacy `cli.output_format` (RFC-008 window) > operator `defaults.output`
-/// > table.
+/// The format cascade (RFC-011): `--json` > `--format` > alias format >
+/// operator `defaults.output` > table.
 pub(crate) fn resolve_read_format(
-    config: &OmnigraphConfig,
     cli_format: Option<ReadOutputFormat>,
     json: bool,
     alias_format: Option<ReadOutputFormat>,
@@ -630,7 +672,6 @@ pub(crate) fn resolve_read_format(
     }
     cli_format
         .or(alias_format)
-        .or(config.cli.output_format)
         .or_else(|| {
             operator::load_operator_config()
                 .ok()
@@ -639,60 +680,7 @@ pub(crate) fn resolve_read_format(
         .unwrap_or_default()
 }
 
-pub(crate) fn resolve_alias<'a>(
-    config: &'a OmnigraphConfig,
-    alias_name: Option<&'a str>,
-    expected: AliasCommand,
-) -> Result<Option<(&'a str, &'a omnigraph_server::AliasConfig)>> {
-    let Some(alias_name) = alias_name else {
-        return Ok(None);
-    };
-    let alias = config.alias(alias_name)?;
-    if alias.command != expected {
-        bail!(
-            "alias '{}' is a {:?} alias, not a {:?} alias",
-            alias_name,
-            alias.command,
-            expected
-        );
-    }
-    Ok(Some((alias_name, alias)))
-}
 
-pub(crate) fn normalize_legacy_alias_uri(
-    uri: Option<String>,
-    target_available: bool,
-    alias_name: Option<&str>,
-    mut alias_args: Vec<String>,
-) -> (Option<String>, Vec<String>) {
-    let Some(candidate) = uri else {
-        return (None, alias_args);
-    };
-
-    if alias_name.is_some() && target_available {
-        alias_args.insert(0, candidate);
-        return (None, alias_args);
-    }
-
-    (Some(candidate), alias_args)
-}
-
-
-pub(crate) fn inferred_config_path(uri: &str) -> Result<PathBuf> {
-    if uri.contains("://") {
-        return Ok(omnigraph_server::config::default_config_path());
-    }
-
-    let path = Path::new(uri);
-    let base = if path.is_absolute() {
-        path.parent()
-            .map(Path::to_path_buf)
-            .unwrap_or(std::env::current_dir()?)
-    } else {
-        std::env::current_dir()?.join(path.parent().unwrap_or_else(|| Path::new(".")))
-    };
-    Ok(base.join(omnigraph_server::config::DEFAULT_CONFIG_FILE))
-}
 
 pub(crate) fn read_target_from_cli(branch: Option<String>, snapshot: Option<String>) -> ReadTarget {
     if let Some(snapshot) = snapshot {
@@ -740,13 +728,11 @@ pub(crate) fn query_params_from_json(
 }
 
 pub(crate) async fn execute_query_lint(
-    config: &OmnigraphConfig,
     cli_uri: Option<String>,
-    cli_target: Option<&str>,
     schema_path: Option<&PathBuf>,
     query_path: &PathBuf,
 ) -> Result<QueryLintOutput> {
-    let resolved_query_path = resolve_query_path(config, Some(query_path), None)?;
+    let resolved_query_path = resolve_query_path(Some(query_path), None)?;
     let query_source = fs::read_to_string(&resolved_query_path)?;
     let query_path = resolved_query_path.to_string_lossy().into_owned();
 
@@ -764,13 +750,14 @@ pub(crate) async fn execute_query_lint(
         ));
     }
 
-    let has_graph_target =
-        cli_uri.is_some() || cli_target.is_some() || config.cli_graph_name().is_some();
-    if !has_graph_target {
-        bail!("query lint requires --schema <schema.pg> or a resolvable graph target");
+    if cli_uri.is_none() {
+        bail!(
+            "lint requires --schema <schema.pg> (offline) or a graph target \
+             (--store <uri> / --cluster <dir> --graph <id>)"
+        );
     }
 
-    let uri = resolve_local_uri(config, cli_uri, cli_target, "query lint")?;
+    let uri = resolve_local_uri(cli_uri, "lint")?;
     let db = Omnigraph::open(&uri).await?;
     Ok(lint_query_file(
         &db.catalog(),
@@ -780,21 +767,24 @@ pub(crate) async fn execute_query_lint(
     ))
 }
 
-pub(crate) fn resolve_selected_graph(
-    config: &OmnigraphConfig,
-    cli_uri: Option<String>,
-    cli_target: Option<&str>,
-    operation: &str,
-) -> Result<(String, Option<String>)> {
-    let graph = resolve_local_graph(config, cli_uri, cli_target, operation)?;
-    Ok((graph.uri, graph.selected))
-}
-
-pub(crate) fn load_registry_or_report(
-    config: &OmnigraphConfig,
-    selected: Option<&str>,
+/// Build a `QueryRegistry` from a cluster serving snapshot's stored queries,
+/// optionally scoped to one graph. The `ServingQuery.source` is the
+/// digest-verified `.gq` content, so no file I/O or omnigraph.yaml is involved.
+fn registry_from_serving_queries(
+    queries: &[omnigraph_cluster::ServingQuery],
+    graph: Option<&str>,
 ) -> Result<QueryRegistry> {
-    QueryRegistry::load(config, config.query_entries_for(selected)).map_err(|errors| {
+    let specs: Vec<omnigraph_server::queries::RegistrySpec> = queries
+        .iter()
+        .filter(|q| graph.is_none_or(|g| q.graph_id == g))
+        .map(|q| omnigraph_server::queries::RegistrySpec {
+            name: q.name.clone(),
+            source: q.source.clone(),
+            expose: false,
+            tool_name: None,
+        })
+        .collect();
+    QueryRegistry::from_specs(specs).map_err(|errors| {
         color_eyre::eyre::eyre!(
             "stored-query registry failed to load:\n  {}",
             errors
@@ -806,90 +796,58 @@ pub(crate) fn load_registry_or_report(
     })
 }
 
-pub(crate) fn graph_query_registry_names(config: &OmnigraphConfig) -> Vec<&str> {
-    config
-        .graphs
-        .iter()
-        .filter_map(|(name, graph)| (!graph.queries.is_empty()).then_some(name.as_str()))
-        .collect()
-}
 
-pub(crate) fn resolve_registry_selection_for_list(
-    config: &OmnigraphConfig,
-    target: Option<&str>,
-) -> Result<Option<String>> {
-    let selected = target
-        .map(str::to_string)
-        .or_else(|| config.cli_graph_name().map(str::to_string));
-    if let Some(name) = selected.as_deref() {
-        config.resolve_graph_selection(Some(name))?;
-        return Ok(selected);
-    }
-
-    if !config.query_entries().is_empty() {
-        return Ok(None);
-    }
-
-    let graph_names = graph_query_registry_names(config);
-    if graph_names.is_empty() {
-        return Ok(None);
-    }
-
-    bail!(
-        "stored-query registries are configured for graph{} {} but no graph was selected. Pass `--target {}` or set `cli.graph`.",
-        if graph_names.len() == 1 { "" } else { "s" },
-        graph_names.join(", "),
-        graph_names[0],
-    )
-}
-
-pub(crate) fn validate_registry_for_catalog(
-    registry: &QueryRegistry,
-    catalog: &omnigraph_compiler::catalog::Catalog,
-    label: &str,
-) -> omnigraph::error::Result<()> {
-    let report = check(registry, catalog);
-    if report.has_breakages() {
-        return Err(omnigraph::error::OmniError::manifest(
-            format_check_breakages(label, &report),
-        ));
-    }
-    Ok(())
-}
-
+/// `queries validate --cluster <dir>` (RFC-011): type-check every stored query
+/// in the cluster catalog against its graph's applied schema. Both the registry
+/// and the schemas come from the cluster serving snapshot — no omnigraph.yaml.
+/// With `--graph`, scope to a single graph.
 pub(crate) async fn execute_queries_validate(
-    uri: Option<String>,
-    target: Option<String>,
-    config_path: Option<&PathBuf>,
+    cluster: &str,
+    graph: Option<&str>,
     json: bool,
 ) -> Result<()> {
-    let config = load_cli_config(config_path)?;
-    // One selection drives both the schema URI and the registry, so a
-    // positional URI and a `--target` can't validate different graphs.
-    let (uri, selected) =
-        resolve_selected_graph(&config, uri, target.as_deref(), "queries validate")?;
-    let registry = load_registry_or_report(&config, selected.as_deref())?;
-    let db = Omnigraph::open(&uri).await?;
-    let report = check(&registry, &db.catalog());
+    let snapshot = read_serving_snapshot_or_report(cluster).await?;
 
-    let output = QueriesValidateOutput {
-        ok: !report.has_breakages(),
-        breakages: report
-            .breakages
-            .iter()
-            .map(|b| QueriesIssue {
+    // Type-check per graph: each graph's stored queries against its own schema
+    // (read from the graph's applied storage root). A `--graph` filter scopes to
+    // exactly one graph; an unknown id is a loud error.
+    let mut breakages = Vec::new();
+    let mut warnings = Vec::new();
+    let mut total = 0usize;
+    let mut matched_any = false;
+    for serving_graph in &snapshot.graphs {
+        if graph.is_some_and(|g| g != serving_graph.graph_id) {
+            continue;
+        }
+        matched_any = true;
+        let registry = registry_from_serving_queries(&snapshot.queries, Some(&serving_graph.graph_id))?;
+        let db = Omnigraph::open(&serving_graph.root.to_string_lossy()).await?;
+        let report = check(&registry, &db.catalog());
+        total += registry.len();
+        for b in &report.breakages {
+            breakages.push(QueriesIssue {
                 query: b.query.clone(),
                 message: b.message.clone(),
-            })
-            .collect(),
-        warnings: report
-            .warnings
-            .iter()
-            .map(|w| QueriesIssue {
+            });
+        }
+        for w in &report.warnings {
+            warnings.push(QueriesIssue {
                 query: w.query.clone(),
                 message: w.message.clone(),
-            })
-            .collect(),
+            });
+        }
+    }
+    if let Some(graph_id) = graph {
+        if !matched_any {
+            bail!("graph `{graph_id}` is not applied in cluster `{cluster}`");
+        }
+    }
+
+    let has_breakages = !breakages.is_empty();
+    let output = QueriesValidateOutput {
+        ok: !has_breakages,
+        breakages,
+        warnings,
     };
 
     if json {
@@ -898,8 +856,8 @@ pub(crate) async fn execute_queries_validate(
         if output.breakages.is_empty() {
             println!(
                 "OK  {} stored quer{} type-check against the schema",
-                registry.len(),
-                if registry.len() == 1 { "y" } else { "ies" }
+                total,
+                if total == 1 { "y" } else { "ies" }
             );
         }
         for issue in &output.breakages {
@@ -910,21 +868,22 @@ pub(crate) async fn execute_queries_validate(
         }
     }
 
-    if report.has_breakages() {
+    if has_breakages {
         io::stdout().flush()?;
         std::process::exit(1);
     }
     Ok(())
 }
 
-pub(crate) fn execute_queries_list(
-    target: Option<String>,
-    config_path: Option<&PathBuf>,
+/// `queries list --cluster <dir>` (RFC-011): list the catalog's stored queries.
+/// With `--graph`, scope to one graph.
+pub(crate) async fn execute_queries_list(
+    cluster: &str,
+    graph: Option<&str>,
     json: bool,
 ) -> Result<()> {
-    let config = load_cli_config(config_path)?;
-    let selected = resolve_registry_selection_for_list(&config, target.as_deref())?;
-    let registry = load_registry_or_report(&config, selected.as_deref())?;
+    let snapshot = read_serving_snapshot_or_report(cluster).await?;
+    let registry = registry_from_serving_queries(&snapshot.queries, graph)?;
 
     let output = QueriesListOutput {
         queries: registry
@@ -979,77 +938,6 @@ pub(crate) fn execute_queries_list(
     Ok(())
 }
 
-pub(crate) async fn execute_read(
-    uri: &str,
-    query_source: &str,
-    query_name: Option<&str>,
-    target: ReadTarget,
-    params_json: Option<&Value>,
-) -> Result<ReadOutput> {
-    let (selected_name, query_params) = select_named_query(query_source, query_name)?;
-    let params = query_params_from_json(&query_params, params_json)?;
-    let db = Omnigraph::open(uri).await?;
-    let result = db
-        .query(target.clone(), query_source, &selected_name, &params)
-        .await?;
-    Ok(read_output(selected_name, &target, result))
-}
-
-pub(crate) async fn execute_read_remote(
-    client: &reqwest::Client,
-    uri: &str,
-    query_source: &str,
-    query_name: Option<&str>,
-    target: ReadTarget,
-    params_json: Option<&Value>,
-    bearer_token: Option<&str>,
-) -> Result<ReadOutput> {
-    let (branch, snapshot) = match &target {
-        ReadTarget::Branch(branch) => (Some(branch.clone()), None),
-        ReadTarget::Snapshot(snapshot) => (None, Some(snapshot.as_str().to_string())),
-    };
-    remote_json(
-        client,
-        Method::POST,
-        remote_url(uri, "/read"),
-        Some(serde_json::to_value(ReadRequest {
-            query_source: query_source.to_string(),
-            query_name: query_name.map(ToOwned::to_owned),
-            params: params_json.cloned(),
-            branch,
-            snapshot,
-        })?),
-        bearer_token,
-    )
-    .await
-}
-
-pub(crate) async fn execute_change(
-    graph: &ResolvedCliGraph,
-    query_source: &str,
-    query_name: Option<&str>,
-    branch: &str,
-    params_json: Option<&Value>,
-    config: &OmnigraphConfig,
-    cli_as_actor: Option<&str>,
-) -> Result<ChangeOutput> {
-    let (selected_name, query_params) = select_named_query(query_source, query_name)?;
-    let params = query_params_from_json(&query_params, params_json)?;
-    let db = open_local_db_with_policy(graph).await?;
-    let actor = resolve_cli_actor(cli_as_actor, config)?;
-    let actor = actor.as_deref();
-    let result = db
-        .mutate_as(branch, query_source, &selected_name, &params, actor)
-        .await?;
-    Ok(ChangeOutput {
-        branch: branch.to_string(),
-        query_name: selected_name,
-        affected_nodes: result.affected_nodes,
-        affected_edges: result.affected_edges,
-        actor_id: actor.map(String::from),
-    })
-}
-
 pub(crate) fn legacy_change_request_body(
     query_source: &str,
     query_name: Option<&str>,
@@ -1067,79 +955,6 @@ pub(crate) fn legacy_change_request_body(
         body["params"] = params.clone();
     }
     body
-}
-
-pub(crate) async fn execute_change_remote(
-    client: &reqwest::Client,
-    uri: &str,
-    query_source: &str,
-    query_name: Option<&str>,
-    branch: &str,
-    params_json: Option<&Value>,
-    bearer_token: Option<&str>,
-) -> Result<ChangeOutput> {
-    remote_json(
-        client,
-        Method::POST,
-        remote_url(uri, "/change"),
-        Some(legacy_change_request_body(
-            query_source,
-            query_name,
-            branch,
-            params_json,
-        )),
-        bearer_token,
-    )
-    .await
-}
-
-pub(crate) async fn execute_export_to_writer<W: Write>(
-    uri: &str,
-    branch: &str,
-    type_names: &[String],
-    table_keys: &[String],
-    writer: &mut W,
-) -> Result<()> {
-    let db = Omnigraph::open(uri).await?;
-    db.export_jsonl_to_writer(branch, type_names, table_keys, writer)
-        .await?;
-    writer.flush()?;
-    Ok(())
-}
-
-pub(crate) async fn execute_export_remote_to_writer<W: Write>(
-    client: &reqwest::Client,
-    uri: &str,
-    branch: &str,
-    type_names: &[String],
-    table_keys: &[String],
-    bearer_token: Option<&str>,
-    writer: &mut W,
-) -> Result<()> {
-    let request = apply_bearer_token(
-        client.request(Method::POST, remote_url(uri, "/export")),
-        bearer_token,
-    )
-    .json(&ExportRequest {
-        branch: Some(branch.to_string()),
-        type_names: type_names.to_vec(),
-        table_keys: table_keys.to_vec(),
-    });
-    let mut response = request.send().await?;
-    let status = response.status();
-    if !status.is_success() {
-        let text = response.text().await?;
-        if let Ok(error) = serde_json::from_str::<ErrorOutput>(&text) {
-            bail!(error.error);
-        }
-        bail!("server returned {}: {}", status, text);
-    }
-
-    while let Some(chunk) = response.chunk().await? {
-        writer.write_all(&chunk)?;
-    }
-    writer.flush()?;
-    Ok(())
 }
 
 pub(crate) fn rewrite_deprecated_argv(args: Vec<OsString>) -> Vec<OsString> {
@@ -1184,4 +999,134 @@ pub(crate) fn rewrite_deprecated_argv(args: Vec<OsString>) -> Vec<OsString> {
         }
     }
     args
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn graph_resource_id_for_selection_uses_name_or_anonymous_uri() {
+        assert_eq!(
+            graph_resource_id_for_selection(Some("local"), "/tmp/graph.omni"),
+            "local"
+        );
+        assert_eq!(
+            graph_resource_id_for_selection(None, "/tmp/graph.omni"),
+            "/tmp/graph.omni"
+        );
+    }
+
+    // RFC-011 Decision 9: locality classifier for the destructive-confirm gate.
+    #[test]
+    fn uri_is_local_truth_table() {
+        // Local: bare path or file://.
+        assert!(uri_is_local("graph.omni"));
+        assert!(uri_is_local("/abs/path/graph.omni"));
+        assert!(uri_is_local("file:///tmp/graph.omni"));
+        // Non-local: served or object-store schemes.
+        assert!(!uri_is_local("http://host/graphs/g"));
+        assert!(!uri_is_local("https://host/graphs/g"));
+        assert!(!uri_is_local("s3://bucket/graph.omni"));
+        assert!(!uri_is_local("gs://bucket/graph.omni"));
+    }
+
+    // RFC-011 Decision 9: a non-local destructive write with `--json` (the CI
+    // shape — also covers the no-TTY case, since tests run without a terminal)
+    // refuses rather than proceeding; a local one and an explicit `--yes` pass.
+    #[test]
+    fn confirm_destructive_refuses_non_local_without_consent() {
+        let err = confirm_destructive("cleanup", "s3://b/g.omni", false, true)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("--yes"), "{err}");
+    }
+
+    #[test]
+    fn confirm_destructive_allows_local_and_explicit_yes() {
+        // Local needs no confirmation, even with --json.
+        assert!(confirm_destructive("cleanup", "file:///tmp/g.omni", false, true).is_ok());
+        assert!(confirm_destructive("branch delete", "graph.omni", false, true).is_ok());
+        // --yes consents to a non-local target.
+        assert!(confirm_destructive("cleanup", "s3://b/g.omni", true, true).is_ok());
+    }
+
+    // RFC-011 Decision 2: `--server` accepts a literal URL (value with `://`),
+    // bypassing the operator-config registry — so no config / OMNIGRAPH_HOME is
+    // read on this path (hermetic).
+    #[test]
+    fn server_flag_accepts_a_literal_url() {
+        assert_eq!(
+            resolve_server_flag(Some("https://graph.example.com"), None).unwrap(),
+            Some("https://graph.example.com".to_string())
+        );
+        // trailing slash trimmed; `--graph` appends the multi-graph path.
+        assert_eq!(
+            resolve_server_flag(Some("https://graph.example.com/"), Some("knowledge")).unwrap(),
+            Some("https://graph.example.com/graphs/knowledge".to_string())
+        );
+    }
+
+    // `branch delete` interpolates the branch into the URL path. The composed
+    // path must be exactly `<base-path>/branches/<name>` with no empty `//`
+    // segment — an empty segment misses the
+    // `/graphs/{graph_id}/branches/{branch}` route and 404s.
+    #[test]
+    fn remote_url_multi_graph_base_has_no_double_slash() {
+        let url = remote_url("http://host/graphs/p9-os", &["branches", "tmpbranch"], &[]).unwrap();
+        assert_eq!(url, "http://host/graphs/p9-os/branches/tmpbranch");
+        assert!(
+            !url.contains("//branches"),
+            "double slash before branches: {url}"
+        );
+    }
+
+    #[test]
+    fn remote_url_single_graph_base_has_no_double_slash() {
+        let url = remote_url("http://host", &["branches", "tmpbranch"], &[]).unwrap();
+        assert_eq!(url, "http://host/branches/tmpbranch");
+    }
+
+    #[test]
+    fn remote_url_tolerates_trailing_slash_on_base() {
+        let url = remote_url("http://host/graphs/p9-os/", &["branches", "tmpbranch"], &[]).unwrap();
+        assert_eq!(url, "http://host/graphs/p9-os/branches/tmpbranch");
+    }
+
+    #[test]
+    fn remote_url_encodes_slashes_in_path_segment() {
+        let url = remote_url(
+            "http://host/graphs/p9-os",
+            &["branches", "etl/zendesk/run-1"],
+            &[],
+        )
+        .unwrap();
+        assert_eq!(
+            url,
+            "http://host/graphs/p9-os/branches/etl%2Fzendesk%2Frun-1"
+        );
+    }
+
+    // Sibling cases the unified builder closes by construction: a dynamic
+    // commit id in the path, and a branch name carried as a query value, are
+    // both percent-encoded instead of interpolated raw.
+    #[test]
+    fn remote_url_encodes_dynamic_path_segment_for_commits() {
+        let url = remote_url("http://host/graphs/p9-os", &["commits", "a/b c"], &[]).unwrap();
+        assert_eq!(url, "http://host/graphs/p9-os/commits/a%2Fb%20c");
+    }
+
+    #[test]
+    fn remote_url_encodes_query_values() {
+        let url = remote_url(
+            "http://host/graphs/p9-os",
+            &["snapshot"],
+            &[("branch", "feature&x=1")],
+        )
+        .unwrap();
+        assert_eq!(
+            url,
+            "http://host/graphs/p9-os/snapshot?branch=feature%26x%3D1"
+        );
+    }
 }

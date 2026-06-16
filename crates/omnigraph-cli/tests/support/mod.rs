@@ -339,6 +339,63 @@ impl SystemGraph {
     }
 }
 
+/// A converged cluster directory the server can boot from (`--cluster`),
+/// serving one graph seeded with the standard fixture. Holds the temp dir
+/// alive for the test's lifetime.
+pub struct ClusterFixture {
+    _temp: TempDir,
+    dir: PathBuf,
+}
+
+impl ClusterFixture {
+    pub fn path(&self) -> &Path {
+        &self.dir
+    }
+}
+
+/// Build a converged cluster (RFC-011 cluster-only serving) with a single
+/// graph `graph_id`, seeded with the `test.jsonl` fixture so reads return
+/// data. When `policy_yaml` is `Some`, the bundle is bound to the graph
+/// scope. The server boots from the returned path via `--cluster`.
+pub fn converged_loaded_cluster(graph_id: &str, policy_yaml: Option<&str>) -> ClusterFixture {
+    let temp = tempdir().unwrap();
+    let dir = temp.path().to_path_buf();
+    fs::copy(fixture("test.pg"), dir.join("graph.pg")).unwrap();
+
+    let policy_block = match policy_yaml {
+        Some(source) => {
+            fs::write(dir.join("graph.policy.yaml"), source).unwrap();
+            format!(
+                "policies:\n  graph:\n    file: ./graph.policy.yaml\n    applies_to: [{graph_id}]\n"
+            )
+        }
+        None => String::new(),
+    };
+    fs::write(
+        dir.join("cluster.yaml"),
+        format!(
+            "version: 1\nmetadata:\n  name: sys\nstate:\n  backend: cluster\n  lock: true\ngraphs:\n  {graph_id}:\n    schema: ./graph.pg\n{policy_block}"
+        ),
+    )
+    .unwrap();
+
+    output_success(cli().arg("cluster").arg("import").arg("--config").arg(&dir));
+    output_success(cli().arg("cluster").arg("apply").arg("--config").arg(&dir));
+
+    let served_root = dir.join("graphs").join(format!("{graph_id}.omni"));
+    output_success(
+        cli()
+            .arg("load")
+            .arg("--data")
+            .arg(fixture("test.jsonl"))
+            .arg("--mode")
+            .arg("overwrite")
+            .arg(&served_root),
+    );
+
+    ClusterFixture { _temp: temp, dir }
+}
+
 // ---- helpers moved from the monolithic tests/cli.rs ----
 #[allow(unused_imports)]
 use lance::Dataset;
@@ -687,4 +744,240 @@ pub fn queries_test_config(graph_uri: &str, entry: &str, gq_file: &str) -> Strin
          cli:\n  graph: local\npolicy: {{}}\n",
         graph_uri.replace('\'', "''")
     )
+}
+
+// ---- RFC-009 Phase 1: parity-matrix harness ----
+
+/// Twin graphs for embedded-vs-remote comparison: the same loaded fixture
+/// copied to two roots, so write verbs can run once per arm on identical
+/// state. Returns (tempdir-guard, local_graph, remote_graph).
+pub fn twin_graphs() -> (TempDir, PathBuf, PathBuf) {
+    let temp = tempdir().unwrap();
+    let seed = temp.path().join("seed");
+    fs::create_dir_all(&seed).unwrap();
+    let graph = seed.join("server.omni");
+    init_graph(&graph);
+    load_fixture(&graph);
+    let local = temp.path().join("local.omni");
+    let remote = temp.path().join("remote.omni");
+    copy_dir(&graph, &local);
+    copy_dir(&graph, &remote);
+    (temp, local, remote)
+}
+
+pub fn copy_dir(from: &Path, to: &Path) {
+    fs::create_dir_all(to).unwrap();
+    for entry in fs::read_dir(from).unwrap() {
+        let entry = entry.unwrap();
+        let target = to.join(entry.file_name());
+        if entry.file_type().unwrap().is_dir() {
+            copy_dir(&entry.path(), &target);
+        } else {
+            fs::copy(entry.path(), &target).unwrap();
+        }
+    }
+}
+
+/// Scrub declared-volatile fields (RFC-009 Phase 1 allowlist) so the rest
+/// of the JSON must match exactly. Key-based, recursive; both arms get the
+/// same placeholders. Everything NOT listed here is contract.
+pub fn scrub_volatile(value: &mut serde_json::Value) {
+    const VOLATILE_KEYS: &[&str] = &[
+        // identity-bearing per-instance values
+        "commit_id", "id", "parent_id", "merge_parent_id", "snapshot",
+        // wall-clock
+        "committed_at", "created_at", "timestamp",
+        // transport / location
+        "uri", "path",
+    ];
+    match value {
+        serde_json::Value::Object(map) => {
+            for (key, val) in map.iter_mut() {
+                if VOLATILE_KEYS.contains(&key.as_str()) && !val.is_null() {
+                    *val = serde_json::Value::String(format!("<volatile:{key}>"));
+                } else {
+                    scrub_volatile(val);
+                }
+            }
+        }
+        serde_json::Value::Array(items) => {
+            for item in items {
+                scrub_volatile(item);
+            }
+        }
+        _ => {}
+    }
+}
+
+pub const PARITY_ACTOR: &str = "act-parity";
+pub const PARITY_TOKEN: &str = "parity-tok";
+
+/// Identical Cedar bundle for BOTH arms — like-for-like enforcement is part
+/// of the parity contract (a bare local arm is permissive while a
+/// tokens-only server is default-deny; comparing those would measure
+/// configuration, not the fork).
+pub fn parity_policy_yaml() -> String {
+    r#"version: 1
+groups:
+  parity: ["act-parity"]
+protected_branches: []
+rules:
+  - id: reads
+    allow:
+      actors: { group: parity }
+      actions: [read, export, invoke_query]
+  - id: read-scope
+    allow:
+      actors: { group: parity }
+      actions: [read, export]
+      branch_scope: any
+  - id: writes
+    allow:
+      actors: { group: parity }
+      actions: [change]
+      branch_scope: any
+  - id: branching
+    allow:
+      actors: { group: parity }
+      actions: [schema_apply, branch_create, branch_delete, branch_merge]
+      target_branch_scope: any
+"#
+    .to_string()
+}
+
+/// The graph id the parity cluster serves the remote arm under. The
+/// remote arm addresses it with `--graph PARITY_GRAPH_ID` (RFC-011: the
+/// server is cluster-only, so a graph selector is required).
+pub const PARITY_GRAPH_ID: &str = "parity";
+
+/// Build the remote arm's configuration (RFC-011 cluster-only server).
+///
+/// The remote arm is served from a converged cluster directory whose single
+/// graph (id `parity`) carries the parity Cedar bundle (bound to the graph
+/// scope). The cluster's derived graph root (`<dir>/graphs/parity.omni`) is
+/// seeded with the SAME fixture data as the local twin so the two arms compare
+/// like-for-like. The local (`--store`) arm carries no Cedar policy (RFC-011),
+/// which is fine because the parity bundle is permissive for `act-parity`.
+///
+/// `local_graph` is overwritten with a byte-for-byte copy of the cluster's
+/// seeded served graph so identity-bearing values that are NOT scrubbed
+/// (e.g. `graph_commit_id`, edge `id`s in export) match across the arms —
+/// the served graph is the source of truth and the local twin mirrors it.
+///
+/// Returns the `cluster_dir`. The caller spawns the server with `--cluster`.
+pub fn parity_configs(root: &Path, local_graph: &Path, _remote_graph: &Path) -> PathBuf {
+    let policy = root.join("parity.policy.yaml");
+    fs::write(&policy, parity_policy_yaml()).unwrap();
+
+    // Remote arm: a cluster directory the server boots from. One graph
+    // (`parity`), schema = the shared fixture, policy bound to the graph.
+    let cluster_dir = root.join("parity-cluster");
+    fs::create_dir_all(&cluster_dir).unwrap();
+    fs::copy(fixture("test.pg"), cluster_dir.join("parity.pg")).unwrap();
+    fs::copy(&policy, cluster_dir.join("parity.policy.yaml")).unwrap();
+    fs::write(
+        cluster_dir.join("cluster.yaml"),
+        format!(
+            r#"version: 1
+metadata:
+  name: parity
+state:
+  backend: cluster
+  lock: true
+graphs:
+  {PARITY_GRAPH_ID}:
+    schema: ./parity.pg
+policies:
+  parity:
+    file: ./parity.policy.yaml
+    applies_to: [{PARITY_GRAPH_ID}]
+"#
+        ),
+    )
+    .unwrap();
+
+    // Converge the cluster (creates the empty graph at the derived root),
+    // then seed it with the same fixture data the local twin holds.
+    output_success(
+        cli()
+            .arg("cluster")
+            .arg("import")
+            .arg("--config")
+            .arg(&cluster_dir),
+    );
+    output_success(
+        cli()
+            .arg("cluster")
+            .arg("apply")
+            .arg("--config")
+            .arg(&cluster_dir),
+    );
+    let served_root = cluster_dir
+        .join("graphs")
+        .join(format!("{PARITY_GRAPH_ID}.omni"));
+    output_success(
+        cli()
+            .arg("load")
+            .arg("--data")
+            .arg(fixture("test.jsonl"))
+            .arg("--mode")
+            .arg("overwrite")
+            .arg(&served_root),
+    );
+
+    // Mirror the seeded served graph into the local twin so both arms hold
+    // identical ULIDs / commit ids (the served graph is authoritative).
+    if local_graph.exists() {
+        fs::remove_dir_all(local_graph).unwrap();
+    }
+    copy_dir(&served_root, local_graph);
+
+    cluster_dir
+}
+
+/// Run one CLI invocation per arm with identical verb args: locally against
+/// `local_graph` (--as actor) and remotely against a server URL whose token
+/// resolves to the same actor. Returns raw Outputs for exit-code + JSON
+/// comparison by the caller.
+pub fn run_both(
+    local_graph: &Path,
+    server_url: &str,
+    args: &[&str],
+) -> (std::process::Output, std::process::Output) {
+    // Address both arms with GLOBAL flags (`--store` / `--server`) appended after
+    // the verb + its args, so the address is placed correctly regardless of
+    // subcommand nesting (a positional graph only works for top-level verbs;
+    // `schema show <graph>` etc. need the global flag). Local = embedded store,
+    // remote = served. RFC-011: a direct (`--store`) write carries no Cedar
+    // policy — the parity policy is permissive for `act-parity` on the served
+    // arm, so the two arms still agree.
+    let mut local = cli();
+    local
+        .args(args)
+        .arg("--store")
+        .arg(local_graph)
+        .arg("--as")
+        .arg(PARITY_ACTOR);
+    let local_out = local.output().unwrap();
+
+    let mut remote = cli();
+    remote
+        .env("OMNIGRAPH_BEARER_TOKEN", PARITY_TOKEN)
+        .args(args)
+        .arg("--server")
+        .arg(server_url)
+        // RFC-011: the parity server is cluster-only (multi-graph), so the
+        // remote arm must name the graph it addresses.
+        .arg("--graph")
+        .arg(PARITY_GRAPH_ID);
+    let remote_out = remote.output().unwrap();
+    (local_out, remote_out)
+}
+
+/// Parse, scrub, and pretty-print for diffable assertion messages.
+pub fn scrubbed_json(output: &std::process::Output) -> String {
+    let mut value: serde_json::Value = serde_json::from_slice(&output.stdout)
+        .unwrap_or_else(|e| panic!("non-JSON stdout ({e}): {output:?}"));
+    scrub_volatile(&mut value);
+    serde_json::to_string_pretty(&value).unwrap()
 }

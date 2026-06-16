@@ -14,9 +14,11 @@ use omnigraph::db::{
     SkipReason,
 };
 use omnigraph::loader::{LoadMode, load_jsonl};
+use omnigraph::table_store::{IndexCoverage, TableStore};
 
 use helpers::{
     MUTATION_QUERIES, TEST_DATA, TEST_SCHEMA, count_rows, init_and_load, mixed_params, mutate_main,
+    snapshot_main,
 };
 
 /// Filesystem URI of a node sub-table, mirroring the engine's layout
@@ -129,6 +131,72 @@ async fn optimize_after_load_then_again_is_idempotent() {
             s.table_key
         );
     }
+}
+
+// PR3 (Workstream B): an existing scalar index does not cover fragments
+// appended after it was built (build_indices is existence-gated), so those
+// rows are scanned unindexed. `optimize` must fold them back in via Lance's
+// incremental `optimize_indices`, restoring full coverage.
+#[tokio::test]
+async fn optimize_reindexes_fragments_appended_after_index_build() {
+    const SCHEMA: &str = r#"
+node Doc {
+    slug: String @key
+    rank: I32 @index
+}
+"#;
+    let dir = tempfile::tempdir().unwrap();
+    let uri = dir.path().to_str().unwrap();
+    let mut db = Omnigraph::init(uri, SCHEMA).await.unwrap();
+
+    // First load builds the id + rank BTREEs over the initial fragment.
+    load_jsonl(
+        &mut db,
+        "{\"type\":\"Doc\",\"data\":{\"slug\":\"d1\",\"rank\":1}}\n\
+         {\"type\":\"Doc\",\"data\":{\"slug\":\"d2\",\"rank\":2}}",
+        LoadMode::Merge,
+    )
+    .await
+    .unwrap();
+
+    // A second load with NEW keys appends a fragment the existing BTREEs do not
+    // cover (the existence gate skips re-building an index that already exists).
+    load_jsonl(
+        &mut db,
+        "{\"type\":\"Doc\",\"data\":{\"slug\":\"d3\",\"rank\":3}}\n\
+         {\"type\":\"Doc\",\"data\":{\"slug\":\"d4\",\"rank\":4}}",
+        LoadMode::Merge,
+    )
+    .await
+    .unwrap();
+
+    // Precondition: the appended fragment is unindexed.
+    {
+        let snap = snapshot_main(&db).await.unwrap();
+        let ds = snap.open("node:Doc").await.unwrap();
+        assert!(
+            TableStore::has_unindexed_fragments(&ds).await.unwrap(),
+            "appended fragment should be unindexed before optimize"
+        );
+    }
+
+    db.optimize().await.unwrap();
+
+    // Postcondition: optimize_indices folded the appended fragment in, so every
+    // index covers every fragment and `rank` reports fully Indexed.
+    let snap = snapshot_main(&db).await.unwrap();
+    let ds = snap.open("node:Doc").await.unwrap();
+    assert!(
+        !TableStore::has_unindexed_fragments(&ds).await.unwrap(),
+        "optimize must extend index coverage to all fragments"
+    );
+    assert_eq!(
+        TableStore::key_column_index_coverage(&ds, "rank")
+            .await
+            .unwrap(),
+        IndexCoverage::Indexed,
+        "rank BTREE must cover all fragments after optimize"
+    );
 }
 
 // Regression: `optimize` must not crash on a graph that has a `Blob` table.
@@ -774,4 +842,223 @@ async fn cleanup_reconciles_orphaned_branch_forks() {
     })
     .await
     .unwrap();
+}
+
+// cleanup must reclaim a manifest-unreferenced fork even when the BRANCH is
+// still live (origin 2: an interrupted first-write fork), while KEEPING a table
+// that is legitimately forked on that same live branch. Before the per-table
+// authority broadening, the reconciler keyed only on the branch name and so
+// never reclaimed a fork on a live branch — the wedge the handoff hit.
+#[tokio::test]
+async fn cleanup_reconciles_live_branch_orphan_fork_but_keeps_legitimate_fork() {
+    let dir = tempfile::tempdir().unwrap();
+    let uri = dir.path().to_str().unwrap().to_string();
+    let mut db = init_and_load(&dir).await;
+
+    db.branch_create("feature").await.unwrap();
+
+    // Legitimately fork Company onto the live `feature` branch (a real write).
+    db.load_as(
+        "feature",
+        None,
+        r#"{"type":"Company","data":{"name":"Acme"}}"#,
+        LoadMode::Merge,
+        None,
+    )
+    .await
+    .unwrap();
+
+    // Forge a manifest-unreferenced Person fork on the SAME live branch: the
+    // manifest's `feature` snapshot still places Person on main (Person was
+    // never written on feature), so this ref is an origin-2 orphan.
+    let person_uri = node_table_uri(&uri, "Person");
+    {
+        let mut ds = Dataset::open(&person_uri).await.unwrap();
+        let base = ds.version().version;
+        ds.create_branch("feature", base, None).await.unwrap();
+        assert!(
+            ds.list_branches().await.unwrap().contains_key("feature"),
+            "precondition: forged orphan Person fork present on the live branch"
+        );
+    }
+
+    let company_uri = node_table_uri(&uri, "Company");
+    let main_people = count_rows(&db, "node:Person").await;
+    let main_companies = count_rows(&db, "node:Company").await;
+
+    db.cleanup(CleanupPolicyOptions {
+        keep_versions: Some(1),
+        older_than: None,
+    })
+    .await
+    .unwrap();
+
+    // Origin-2 orphan reclaimed...
+    {
+        let ds = Dataset::open(&person_uri).await.unwrap();
+        assert!(
+            !ds.list_branches().await.unwrap().contains_key("feature"),
+            "cleanup must reclaim the manifest-unreferenced Person fork on the live branch"
+        );
+    }
+    // ...but the legitimate Company fork on the same live branch is kept.
+    {
+        let ds = Dataset::open(&company_uri).await.unwrap();
+        assert!(
+            ds.list_branches().await.unwrap().contains_key("feature"),
+            "cleanup must NOT reclaim a legitimately-forked table on a live branch"
+        );
+    }
+    // main is untouched.
+    assert_eq!(count_rows(&db, "node:Person").await, main_people);
+    assert_eq!(count_rows(&db, "node:Company").await, main_companies);
+}
+
+// Regression (iss-848): a table with rows but NULL vectors (the load-before-
+// embed window) must not abort index building. The vector (IVF) index cannot
+// train on 0 vectors, so `create_vector_index` errors with "KMeans cannot
+// train 1 centroids with 0 vectors". `build_indices_on_dataset_for_catalog`
+// is the chokepoint every caller funnels through (load/mutate via
+// prepare_updates_for_commit, ensure_indices, optimize, schema apply, merge),
+// so per-index fault isolation there must defer that one column (pending) and
+// still build the sibling scalar indexes, instead of propagating the error.
+// This exercises both the load path (which builds indices inline) and the
+// ensure_indices reconciler. Pre-fix this fails at the load step.
+#[tokio::test]
+async fn index_build_tolerates_null_vector_rows() {
+    let dir = tempfile::tempdir().unwrap();
+    let uri = dir.path().to_str().unwrap();
+    let schema = "node Doc {\n    \
+        slug: String @key\n    \
+        n: I64 @index\n    \
+        embedding: Vector(8)? @index\n\
+        }\n";
+    let mut db = Omnigraph::init(uri, schema).await.unwrap();
+    // Rows present, embeddings null (loaded but not yet embedded).
+    load_jsonl(
+        &mut db,
+        "{\"type\":\"Doc\",\"data\":{\"slug\":\"d1\",\"n\":1}}\n\
+         {\"type\":\"Doc\",\"data\":{\"slug\":\"d2\",\"n\":2}}",
+        LoadMode::Merge,
+    )
+    .await
+    .expect("load rows with null embeddings");
+
+    // Must not abort: the untrainable vector column is deferred, the sibling
+    // BTREE on `n` still builds.
+    db.ensure_indices()
+        .await
+        .expect("ensure_indices must not abort when a vector column has no trainable vectors yet");
+}
+
+// iss-848: `optimize` converges declared-but-unbuilt indexes. After an @index is
+// added post-data (a metadata-only apply that defers the physical build), the
+// column is unindexed and reads scan. `optimize` — the operator's reconciler,
+// run on a cron — must materialize it, by composing the ensure_indices
+// reconciler after the compaction sweep. Pre-iss-848 optimize only maintained
+// coverage of EXISTING indexes (optimize_indices) and never created missing ones.
+#[tokio::test]
+async fn optimize_materializes_index_declared_but_unbuilt() {
+    let dir = tempfile::tempdir().unwrap();
+    let uri = dir.path().to_str().unwrap();
+    let v1 = "node Doc {\n    slug: String @key\n    rank: I32\n}\n";
+    let mut db = Omnigraph::init(uri, v1).await.unwrap();
+    load_jsonl(
+        &mut db,
+        "{\"type\":\"Doc\",\"data\":{\"slug\":\"d1\",\"rank\":1}}\n\
+         {\"type\":\"Doc\",\"data\":{\"slug\":\"d2\",\"rank\":2}}",
+        LoadMode::Merge,
+    )
+    .await
+    .unwrap();
+
+    // Add @index on `rank` after data exists: a metadata-only apply that defers
+    // the physical build (iss-848), so the column is declared-indexed but unbuilt.
+    let v2 = "node Doc {\n    slug: String @key\n    rank: I32 @index\n}\n";
+    db.apply_schema(v2).await.expect("index-only apply");
+
+    // Precondition: `rank` is declared @index but unbuilt -> reads degrade.
+    {
+        let snap = snapshot_main(&db).await.unwrap();
+        let ds = snap.open("node:Doc").await.unwrap();
+        assert!(
+            matches!(
+                TableStore::key_column_index_coverage(&ds, "rank")
+                    .await
+                    .unwrap(),
+                IndexCoverage::Degraded { .. }
+            ),
+            "rank must be unindexed after the deferred apply"
+        );
+    }
+
+    db.optimize().await.unwrap();
+
+    // Postcondition: optimize's reconciler materialized the declared index.
+    let snap = snapshot_main(&db).await.unwrap();
+    let ds = snap.open("node:Doc").await.unwrap();
+    assert_eq!(
+        TableStore::key_column_index_coverage(&ds, "rank")
+            .await
+            .unwrap(),
+        IndexCoverage::Indexed,
+        "optimize must build the declared-but-unbuilt rank index"
+    );
+}
+
+// iss-848 (PR review): the rename path also defers index building. A RenameType
+// migration writes the renamed table as a new dataset with the existing rows
+// but no indexes (its inline build was removed). optimize must then materialize
+// the declared index on the renamed table.
+#[tokio::test]
+async fn optimize_materializes_index_after_type_rename() {
+    let dir = tempfile::tempdir().unwrap();
+    let uri = dir.path().to_str().unwrap();
+    let v1 = "node Doc {\n    slug: String @key\n    rank: I32 @index\n}\n";
+    let mut db = Omnigraph::init(uri, v1).await.unwrap();
+    load_jsonl(
+        &mut db,
+        "{\"type\":\"Doc\",\"data\":{\"slug\":\"d1\",\"rank\":1}}\n\
+         {\"type\":\"Doc\",\"data\":{\"slug\":\"d2\",\"rank\":2}}",
+        LoadMode::Merge,
+    )
+    .await
+    .unwrap();
+
+    // Rename Doc -> Item; rows are preserved on the new table key.
+    let v2 = "node Item @rename_from(\"Doc\") {\n    slug: String @key\n    rank: I32 @index\n}\n";
+    let result = db.apply_schema(v2).await.expect("rename apply");
+    assert!(result.applied);
+    assert_eq!(
+        count_rows(&db, "node:Item").await,
+        2,
+        "rename must preserve rows"
+    );
+
+    // Post-rename the renamed table's declared rank index is unbuilt (deferred).
+    {
+        let snap = snapshot_main(&db).await.unwrap();
+        let ds = snap.open("node:Item").await.unwrap();
+        assert!(
+            matches!(
+                TableStore::key_column_index_coverage(&ds, "rank")
+                    .await
+                    .unwrap(),
+                IndexCoverage::Degraded { .. }
+            ),
+            "rank must be unindexed immediately after the rename"
+        );
+    }
+
+    db.optimize().await.unwrap();
+
+    let snap = snapshot_main(&db).await.unwrap();
+    let ds = snap.open("node:Item").await.unwrap();
+    assert_eq!(
+        TableStore::key_column_index_coverage(&ds, "rank")
+            .await
+            .unwrap(),
+        IndexCoverage::Indexed,
+        "optimize must build the renamed table's deferred rank index"
+    );
 }

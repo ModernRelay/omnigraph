@@ -20,13 +20,13 @@ constraints. User-facing behavior should still be documented through
 | Area | Read |
 |---|---|
 | System structure, L1/L2 framing, component diagrams | [architecture.md](architecture.md) |
-| On-disk layout, manifest schema, URI behavior | [storage.md](../user/storage.md) |
+| On-disk layout, manifest schema, URI behavior | [storage.md](../user/concepts/storage.md) |
 | Direct-publish writes, D2, staged writes, recovery sidecars | [writes.md](writes.md) |
 | Query execution, mutation execution, loader flow | [execution.md](execution.md) |
-| Index lifecycle and graph topology indexes | [indexes.md](../user/indexes.md) |
-| Branch and commit internals | [branches-commits.md](../user/branches-commits.md) |
+| Index lifecycle and graph topology indexes | [indexes.md](../user/search/indexes.md) |
+| Branch and commit internals | [branches-commits.md](../user/branching/index.md) |
 | Three-way merge implementation and conflicts | [merge.md](merge.md) |
-| Diff/change-feed implementation | [changes.md](../user/changes.md) |
+| Diff/change-feed implementation | [changes.md](../user/branching/changes.md) |
 | Branch protection policy | [branch-protection.md](branch-protection.md) |
 | CODEOWNERS source of truth | [codeowners.md](codeowners.md) |
 
@@ -34,14 +34,14 @@ constraints. User-facing behavior should still be documented through
 
 | Area | Read |
 |---|---|
-| Schema grammar, catalog, migration planner | [schema-language.md](../user/schema-language.md) |
-| Query grammar, IR, lints, mutation restrictions | [query-language.md](../user/query-language.md) |
-| Embedding client and `@embed` integration | [embeddings.md](../user/embeddings.md) |
-| Cedar policy surface and server gating | [policy.md](../user/policy.md) |
-| Server auth, OpenAPI, endpoint handlers | [server.md](../user/server.md) |
-| Error taxonomy and serialization | [errors.md](../user/errors.md) |
-| Constants and tunables | [constants.md](../user/constants.md) |
-| Transaction model public contract | [transactions.md](../user/transactions.md) |
+| Schema grammar, catalog, migration planner | [schema-language.md](../user/schema/index.md) |
+| Query grammar, IR, lints, mutation restrictions | [query-language.md](../user/queries/index.md) |
+| Embedding client and `@embed` integration | [embeddings.md](../user/search/embeddings.md) |
+| Cedar policy surface and server gating | [policy.md](../user/operations/policy.md) |
+| Server auth, OpenAPI, endpoint handlers | [server.md](../user/operations/server.md) |
+| Error taxonomy and serialization | [errors.md](../user/operations/errors.md) |
+| Constants and tunables | [constants.md](../user/reference/constants.md) |
+| Transaction model public contract | [transactions.md](../user/branching/transactions.md) |
 
 ## Project Operations
 
@@ -79,6 +79,9 @@ Working documents for in-flight feature work. Removed when the work lands.
 | Per-operator config — `~/.omnigraph/` identity, keyed credentials, named servers (the operator slice of RFC-002) | [rfc-007-operator-config.md](rfc-007-operator-config.md) |
 | Deprecate `omnigraph.yaml` — one concern per config surface; key-by-key migration map and staged retirement | [rfc-008-deprecate-omnigraph-yaml.md](rfc-008-deprecate-omnigraph-yaml.md) |
 | Unify CLI embedded/remote access paths — parity referee, shared wire-DTO crate, `GraphClient` trait, declared plane capabilities | [rfc-009-unify-access-paths.md](rfc-009-unify-access-paths.md) |
+| Restructure the CLI around explicit planes — one graph-addressing model, declared capability surface, plane-grouped help (expands RFC-009 Phase 4) | [rfc-010-cli-planes-restructure.md](rfc-010-cli-planes-restructure.md) |
+| CLI refactoring — one addressing & config model post-`omnigraph.yaml`: scope + `--graph` + derived access path, served-default / privileged-direct, profiles, named queries, capability classifier (completes RFC-008) | [rfc-011-cli-refactoring.md](rfc-011-cli-refactoring.md) |
+| Provider-independent embedding configuration — one resolved `EmbeddingConfig` + sealed provider enum (Gemini/OpenAI/Mock), identity recorded in the schema IR, query-time same-space validation, NFR floor | [rfc-012-embedding-provider-config.md](rfc-012-embedding-provider-config.md) |
 
 ## Boundary
 

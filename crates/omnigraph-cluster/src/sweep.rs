@@ -19,13 +19,29 @@ pub(crate) async fn sweep_recovery_sidecars(
     for (path, sidecar) in backend.list_recovery_sidecars(diagnostics).await {
         match sidecar.kind {
             RecoverySidecarKind::GraphCreate => {
-                sweep_graph_create_sidecar(backend, path, sidecar, state, diagnostics, &mut outcome).await;
+                sweep_graph_create_sidecar(
+                    backend,
+                    path,
+                    sidecar,
+                    state,
+                    diagnostics,
+                    &mut outcome,
+                )
+                .await;
             }
             RecoverySidecarKind::SchemaApply => {
                 sweep_schema_apply_sidecar(path, sidecar, state, diagnostics, &mut outcome).await;
             }
             RecoverySidecarKind::GraphDelete => {
-                sweep_graph_delete_sidecar(backend, path, sidecar, state, diagnostics, &mut outcome).await;
+                sweep_graph_delete_sidecar(
+                    backend,
+                    path,
+                    sidecar,
+                    state,
+                    diagnostics,
+                    &mut outcome,
+                )
+                .await;
             }
         }
     }
@@ -71,15 +87,30 @@ pub(crate) async fn sweep_graph_create_sidecar(
                     StateResource {
                         digest: live_digest.clone(),
                         applies_to: None,
+                        embedding_provider: None,
+                        embedding_profile: None,
                     },
                 );
                 let query_digests = state_query_digests_for_graph(state, &sidecar.graph_id);
-                let composite =
-                    graph_digest(&sidecar.graph_id, Some(&live_digest), Some(&query_digests));
-                state
-                    .applied_revision
-                    .resources
-                    .insert(graph_address.clone(), StateResource { digest: composite, applies_to: None });
+                let embedding_provider = state_graph_embedding_provider(state, &sidecar.graph_id);
+                let embedding_provider_digest =
+                    state_embedding_provider_digest(state, embedding_provider.as_deref());
+                let composite = graph_digest(
+                    &sidecar.graph_id,
+                    Some(&live_digest),
+                    Some(&query_digests),
+                    embedding_provider.as_deref(),
+                    embedding_provider_digest.as_ref(),
+                );
+                state.applied_revision.resources.insert(
+                    graph_address.clone(),
+                    StateResource {
+                        digest: composite,
+                        applies_to: None,
+                        embedding_provider,
+                        embedding_profile: None,
+                    },
+                );
                 set_resource_status_applied(state, &graph_address);
                 set_resource_status_applied(state, &schema_addr);
                 state.recovery_records.insert(
@@ -200,14 +231,30 @@ pub(crate) async fn sweep_schema_apply_sidecar(
             StateResource {
                 digest: live_digest.clone(),
                 applies_to: None,
+                embedding_provider: None,
+                embedding_profile: None,
             },
         );
         let query_digests = state_query_digests_for_graph(state, &sidecar.graph_id);
-        let composite = graph_digest(&sidecar.graph_id, Some(&live_digest), Some(&query_digests));
-        state
-            .applied_revision
-            .resources
-            .insert(graph_address.clone(), StateResource { digest: composite, applies_to: None });
+        let embedding_provider = state_graph_embedding_provider(state, &sidecar.graph_id);
+        let embedding_provider_digest =
+            state_embedding_provider_digest(state, embedding_provider.as_deref());
+        let composite = graph_digest(
+            &sidecar.graph_id,
+            Some(&live_digest),
+            Some(&query_digests),
+            embedding_provider.as_deref(),
+            embedding_provider_digest.as_ref(),
+        );
+        state.applied_revision.resources.insert(
+            graph_address.clone(),
+            StateResource {
+                digest: composite,
+                applies_to: None,
+                embedding_provider,
+                embedding_profile: None,
+            },
+        );
         set_resource_status_applied(state, &graph_address);
         set_resource_status_applied(state, &schema_addr);
         state.recovery_records.insert(
@@ -274,7 +321,11 @@ pub(crate) async fn sweep_graph_delete_sidecar(
         return;
     }
 
-    if !state.applied_revision.resources.contains_key(&graph_address) {
+    if !state
+        .applied_revision
+        .resources
+        .contains_key(&graph_address)
+    {
         // Row 7: already tombstoned (or never recorded); crash fell between
         // the state CAS and sidecar delete.
         outcome.completed_sidecars.push(path);
@@ -283,7 +334,12 @@ pub(crate) async fn sweep_graph_delete_sidecar(
 
     // Row 7b: the root is gone, the ledger is stale — roll forward the
     // tombstone, consume the approval the sidecar carries, audit.
-    tombstone_graph_subtree(state, &sidecar.graph_id, sidecar.approval_id.as_deref(), sidecar.actor.as_deref());
+    tombstone_graph_subtree(
+        state,
+        &sidecar.graph_id,
+        sidecar.approval_id.as_deref(),
+        sidecar.actor.as_deref(),
+    );
     state.recovery_records.insert(
         sidecar.operation_id.clone(),
         json!({
@@ -342,7 +398,11 @@ pub(crate) fn tombstone_graph_subtree(
 /// Record approval consumption in the state ledger. The artifact FILE is
 /// rewritten with consumed_at only after the state write lands, so a failed
 /// CAS leaves the approval valid for the retry.
-pub(crate) fn record_approval_consumed(state: &mut ClusterState, approval_id: &str, operation_id: &str) {
+pub(crate) fn record_approval_consumed(
+    state: &mut ClusterState,
+    approval_id: &str,
+    operation_id: &str,
+) {
     state.approval_records.insert(
         approval_id.to_string(),
         json!({

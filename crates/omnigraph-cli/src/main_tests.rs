@@ -1,22 +1,16 @@
 //! In-source test suite for the CLI binary (moved verbatim from
 //! main.rs; `use super::*` resolves through the #[path] declaration).
 
-    use std::fs;
-
     use super::{
-        DEFAULT_BEARER_TOKEN_ENV, apply_bearer_token, bearer_token_from_env_file,
-        legacy_change_request_body, load_cli_config, load_env_file_into_process,
-        normalize_bearer_token, parse_env_assignment, resolve_cli_graph, resolve_policy_context,
-        resolve_remote_bearer_token,
+        DEFAULT_BEARER_TOKEN_ENV, apply_bearer_token, legacy_change_request_body,
+        normalize_bearer_token, resolve_remote_bearer_token,
     };
-    use omnigraph_server::load_config;
     use reqwest::header::AUTHORIZATION;
     use serde_json::json;
-    use tempfile::tempdir;
 
     #[test]
     fn legacy_change_request_body_uses_legacy_field_names() {
-        // `execute_change_remote` hits `POST /change`, which old
+        // `mutate`'s remote arm hits `POST /change`, which old
         // `omnigraph-server` builds deserialize as `ChangeRequest` with
         // **required** `query_source` and optional `query_name` keys.
         // Newer servers accept both spellings via serde alias, but a
@@ -96,126 +90,20 @@
     }
 
     #[test]
-    fn parse_env_assignment_supports_plain_and_exported_values() {
-        assert_eq!(
-            parse_env_assignment("DEMO_TOKEN=demo-token"),
-            Some(("DEMO_TOKEN".to_string(), "demo-token".to_string()))
-        );
-        assert_eq!(
-            parse_env_assignment("export DEMO_TOKEN=\"quoted-token\""),
-            Some(("DEMO_TOKEN".to_string(), "quoted-token".to_string()))
-        );
-        assert_eq!(parse_env_assignment("# comment"), None);
-        assert_eq!(parse_env_assignment("   "), None);
-    }
-
-    #[test]
-    fn bearer_token_from_env_file_reads_named_value() {
-        let temp = tempdir().unwrap();
-        let env_file = temp.path().join(".env.omni");
-        fs::write(
-            &env_file,
-            "FIRST=ignore\nexport DEMO_TOKEN=\" demo-token \"\n",
-        )
-        .unwrap();
-
-        assert_eq!(
-            bearer_token_from_env_file(&env_file, "DEMO_TOKEN")
-                .unwrap()
-                .as_deref(),
-            Some("demo-token")
-        );
-        assert_eq!(
-            bearer_token_from_env_file(&env_file, "MISSING").unwrap(),
-            None
-        );
-    }
-
-    #[test]
-    fn load_env_file_into_process_sets_missing_values_without_overriding_existing_ones() {
-        let temp = tempdir().unwrap();
-        let env_file = temp.path().join(".env.omni");
-        fs::write(
-            &env_file,
-            "AUTOLOAD_ONLY=from-file\nAUTOLOAD_PRESET=from-file\n",
-        )
-        .unwrap();
-
-        let missing_key = "AUTOLOAD_ONLY";
-        let preset_key = "AUTOLOAD_PRESET";
-        let previous_missing = std::env::var_os(missing_key);
-        let previous_preset = std::env::var_os(preset_key);
-
-        unsafe {
-            std::env::remove_var(missing_key);
-            std::env::set_var(preset_key, "from-env");
-        }
-
-        load_env_file_into_process(&env_file).unwrap();
-
-        assert_eq!(std::env::var(missing_key).unwrap(), "from-file");
-        assert_eq!(std::env::var(preset_key).unwrap(), "from-env");
-
-        unsafe {
-            if let Some(value) = previous_missing {
-                std::env::set_var(missing_key, value);
-            } else {
-                std::env::remove_var(missing_key);
-            }
-
-            if let Some(value) = previous_preset {
-                std::env::set_var(preset_key, value);
-            } else {
-                std::env::remove_var(preset_key);
-            }
-        }
-    }
-
-    #[test]
-    fn resolve_remote_bearer_token_uses_scoped_env_file_with_global_fallback() {
-        let temp = tempdir().unwrap();
-        fs::write(
-            temp.path().join("omnigraph.yaml"),
-            r#"
-graphs:
-  demo:
-    uri: https://example.com
-    bearer_token_env: DEMO_TOKEN
-auth:
-  env_file: .env.omni
-cli:
-  graph: demo
-"#,
-        )
-        .unwrap();
-        fs::write(
-            temp.path().join(".env.omni"),
-            "DEMO_TOKEN=scoped-token\nOMNIGRAPH_BEARER_TOKEN=global-token\n",
-        )
-        .unwrap();
-
+    fn resolve_remote_bearer_token_falls_back_to_default_env() {
+        // RFC-011: with no operator server matching the URL, the only chain
+        // left is the default `OMNIGRAPH_BEARER_TOKEN` env (no omnigraph.yaml
+        // scoped chain). Hermetic: no operator config is read for a literal URL
+        // that matches no `servers:` entry.
         let previous = std::env::var_os(DEFAULT_BEARER_TOKEN_ENV);
         let previous_home = std::env::var_os("OMNIGRAPH_HOME");
         unsafe {
-            std::env::remove_var(DEFAULT_BEARER_TOKEN_ENV);
-            // Hermetic: the keyed hop (RFC-007 PR 2) must not pick up a real
-            // ~/.omnigraph on the developer's machine — and with no operator
-            // servers defined, the legacy chain below must behave
-            // byte-identically to pre-PR-2 (tested-as-untouched).
-            std::env::set_var("OMNIGRAPH_HOME", temp.path().join("no-operator-config"));
+            std::env::set_var(DEFAULT_BEARER_TOKEN_ENV, "global-token");
+            std::env::set_var("OMNIGRAPH_HOME", "/nonexistent/omnigraph-test-home");
         }
 
-        let config_path = temp.path().join("omnigraph.yaml");
-        let config = load_config(Some(&config_path)).unwrap();
-
         assert_eq!(
-            resolve_remote_bearer_token(&config, None, Some("demo"))
-                .unwrap()
-                .as_deref(),
-            Some("scoped-token")
-        );
-        assert_eq!(
-            resolve_remote_bearer_token(&config, Some("https://override.example.com"), None)
+            resolve_remote_bearer_token(Some("https://override.example.com"))
                 .unwrap()
                 .as_deref(),
             Some("global-token")
@@ -233,195 +121,4 @@ cli:
                 std::env::remove_var("OMNIGRAPH_HOME");
             }
         }
-    }
-
-    #[test]
-    fn load_cli_config_autoloads_env_file_into_process() {
-        let temp = tempdir().unwrap();
-        fs::write(
-            temp.path().join("omnigraph.yaml"),
-            r#"
-auth:
-  env_file: .env.omni
-graphs:
-  demo:
-    uri: s3://bucket/prefix
-"#,
-        )
-        .unwrap();
-        fs::write(
-            temp.path().join(".env.omni"),
-            "AUTOLOAD_FROM_CONFIG=loaded\n",
-        )
-        .unwrap();
-
-        let key = "AUTOLOAD_FROM_CONFIG";
-        let previous = std::env::var_os(key);
-        unsafe {
-            std::env::remove_var(key);
-        }
-
-        let config_path = temp.path().join("omnigraph.yaml");
-        let config = load_cli_config(Some(&config_path)).unwrap();
-
-        assert_eq!(
-            config.resolve_target_uri(None, Some("demo"), None).unwrap(),
-            "s3://bucket/prefix"
-        );
-        assert_eq!(std::env::var(key).unwrap(), "loaded");
-
-        unsafe {
-            if let Some(value) = previous {
-                std::env::set_var(key, value);
-            } else {
-                std::env::remove_var(key);
-            }
-        }
-    }
-
-    #[test]
-    fn graph_identity_resolve_policy_context_named_cli_graph_uses_graph_key_not_project_name_or_uri()
-     {
-        let temp = tempdir().unwrap();
-        let config_path = temp.path().join("omnigraph.yaml");
-        fs::write(
-            &config_path,
-            r#"
-project:
-  name: misleading-project
-graphs:
-  local:
-    uri: /tmp/local-policy-graph.omni
-    policy:
-      file: ./policy.yaml
-cli:
-  graph: local
-"#,
-        )
-        .unwrap();
-
-        let config = load_config(Some(&config_path)).unwrap();
-        let context = resolve_policy_context(&config).unwrap();
-        assert_eq!(context.graph_id, "local");
-    }
-
-    #[test]
-    fn graph_identity_resolve_policy_context_server_graph_uses_graph_key_when_cli_graph_absent() {
-        let temp = tempdir().unwrap();
-        let config_path = temp.path().join("omnigraph.yaml");
-        fs::write(
-            &config_path,
-            r#"
-project:
-  name: misleading-project
-graphs:
-  local:
-    uri: /tmp/local-policy-graph.omni
-    policy:
-      file: ./server-policy.yaml
-server:
-  graph: local
-"#,
-        )
-        .unwrap();
-
-        let config = load_config(Some(&config_path)).unwrap();
-        let context = resolve_policy_context(&config).unwrap();
-        assert_eq!(context.graph_id, "local");
-        assert!(context.policy_file.ends_with("server-policy.yaml"));
-    }
-
-    #[test]
-    fn graph_identity_resolve_policy_context_anonymous_uses_top_level_default_identity() {
-        let temp = tempdir().unwrap();
-        let config_path = temp.path().join("omnigraph.yaml");
-        fs::write(
-            &config_path,
-            r#"
-project:
-  name: misleading-project
-graphs:
-  local:
-    uri: /tmp/local-policy-graph.omni
-policy:
-  file: ./top-policy.yaml
-"#,
-        )
-        .unwrap();
-
-        let config = load_config(Some(&config_path)).unwrap();
-        let context = resolve_policy_context(&config).unwrap();
-        assert_eq!(context.graph_id, "default");
-        assert!(context.policy_file.ends_with("top-policy.yaml"));
-    }
-
-    #[test]
-    fn graph_identity_resolve_cli_graph_named_target_uses_graph_key_not_project_name_or_uri() {
-        let temp = tempdir().unwrap();
-        let config_path = temp.path().join("omnigraph.yaml");
-        fs::write(
-            &config_path,
-            r#"
-project:
-  name: misleading-project
-graphs:
-  prod:
-    uri: s3://bucket/prod-graph/
-    policy:
-      file: ./prod-policy.yaml
-"#,
-        )
-        .unwrap();
-
-        let config = load_config(Some(&config_path)).unwrap();
-        let graph = resolve_cli_graph(&config, None, Some("prod")).unwrap();
-        assert_eq!(graph.selected(), Some("prod"));
-        assert_eq!(graph.graph_id, "prod");
-        assert_eq!(graph.uri, "s3://bucket/prod-graph/");
-    }
-
-    #[test]
-    fn graph_identity_resolve_cli_graph_positional_uri_uses_anonymous_normalized_uri() {
-        let temp = tempdir().unwrap();
-        let config_path = temp.path().join("omnigraph.yaml");
-        fs::write(
-            &config_path,
-            r#"
-project:
-  name: misleading-project
-graphs:
-  local:
-    uri: /tmp/configured-graph.omni
-    policy:
-      file: ./policy.yaml
-cli:
-  graph: local
-"#,
-        )
-        .unwrap();
-
-        let config = load_config(Some(&config_path)).unwrap();
-        let local_graph_path = temp.path().join("explicit-graph.omni");
-        let local_graph = resolve_cli_graph(
-            &config,
-            Some(format!("file://{}", local_graph_path.display())),
-            None,
-        )
-        .unwrap();
-        assert_eq!(local_graph.selected(), None);
-        assert_eq!(
-            local_graph.graph_id,
-            local_graph_path.to_string_lossy().as_ref()
-        );
-        assert_eq!(local_graph.policy_file, None);
-
-        let s3_graph = resolve_cli_graph(
-            &config,
-            Some("s3://bucket/anonymous-graph/".to_string()),
-            None,
-        )
-        .unwrap();
-        assert_eq!(s3_graph.selected(), None);
-        assert_eq!(s3_graph.graph_id, "s3://bucket/anonymous-graph");
-        assert_eq!(s3_graph.policy_file, None);
     }

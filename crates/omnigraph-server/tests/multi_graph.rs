@@ -5,9 +5,12 @@ use std::fs;
 
 use axum::body::{Body, to_bytes};
 use axum::http::{Method, Request, StatusCode};
-use omnigraph_server::api::ErrorOutput;
+use omnigraph::db::Omnigraph;
+use omnigraph::loader::{LoadMode, load_jsonl};
+use omnigraph_server::api::{ErrorOutput, ReadRequest};
 use omnigraph_server::{AppState, build_app};
 use serde_json::Value;
+use serial_test::serial;
 use tower::ServiceExt;
 
 
@@ -245,7 +248,7 @@ async fn concurrent_branch_ops_morphological_matrix() {
             .clone()
             .oneshot(
                 Request::builder()
-                    .uri("/branches")
+                    .uri(g("/branches"))
                     .method(Method::GET)
                     .body(Body::empty())
                     .unwrap(),
@@ -366,7 +369,7 @@ async fn concurrent_branch_ops_morphological_matrix() {
             .clone()
             .oneshot(
                 Request::builder()
-                    .uri("/snapshot?branch=main")
+                    .uri(g("/snapshot?branch=main"))
                     .method(Method::GET)
                     .body(Body::empty())
                     .unwrap(),
@@ -457,6 +460,180 @@ async fn cluster_boot_serves_applied_state() {
     assert_eq!(status, StatusCode::OK, "{body}");
 }
 
+#[tokio::test(flavor = "multi_thread")]
+#[serial]
+async fn cluster_boot_injects_embedding_provider_config() {
+    const EMBED_SCHEMA: &str = r#"
+node Doc {
+    slug: String @key
+    title: String @index
+    embedding: Vector(4) @embed("title", model="cluster-mock") @index
+}
+"#;
+    const EMBED_QUERY: &str = r#"
+query vector_search_string($q: String) {
+    match { $d: Doc }
+    return { $d.slug, $d.title }
+    order { nearest($d.embedding, $q) }
+    limit 3
+}
+"#;
+
+    let alpha = mock_embedding("alpha", 4);
+    let beta = mock_embedding("beta", 4);
+    let gamma = mock_embedding("gamma", 4);
+    let data = format!(
+        concat!(
+            r#"{{"type":"Doc","data":{{"slug":"alpha-doc","title":"alpha guide","embedding":[{}]}}}}"#,
+            "\n",
+            r#"{{"type":"Doc","data":{{"slug":"beta-doc","title":"beta guide","embedding":[{}]}}}}"#,
+            "\n",
+            r#"{{"type":"Doc","data":{{"slug":"gamma-doc","title":"gamma handbook","embedding":[{}]}}}}"#
+        ),
+        format_vector(&alpha),
+        format_vector(&beta),
+        format_vector(&gamma),
+    );
+
+    let temp = tempfile::tempdir().unwrap();
+    fs::write(temp.path().join("docs.pg"), EMBED_SCHEMA).unwrap();
+    fs::write(temp.path().join("search.gq"), EMBED_QUERY).unwrap();
+    fs::write(
+        temp.path().join("cluster.yaml"),
+        r#"
+version: 1
+providers:
+  embedding:
+    default:
+      kind: mock
+      model: cluster-mock
+graphs:
+  knowledge:
+    schema: ./docs.pg
+    embedding_provider: default
+    queries:
+      vector_search_string:
+        file: ./search.gq
+"#,
+    )
+    .unwrap();
+    let import = omnigraph_cluster::import_config_dir(temp.path()).await;
+    assert!(import.ok, "{:?}", import.diagnostics);
+    let apply = omnigraph_cluster::apply_config_dir(temp.path()).await;
+    assert!(apply.ok && apply.converged, "{:?}", apply.diagnostics);
+
+    let graph_uri = temp
+        .path()
+        .join("graphs/knowledge.omni")
+        .to_string_lossy()
+        .to_string();
+    let mut db = Omnigraph::open(&graph_uri).await.unwrap();
+    load_jsonl(&mut db, &data, LoadMode::Overwrite)
+        .await
+        .unwrap();
+
+    let _guard = EnvGuard::set(&[
+        ("OMNIGRAPH_EMBEDDINGS_MOCK", None),
+        ("OMNIGRAPH_EMBED_PROVIDER", None),
+        ("OMNIGRAPH_EMBED_BASE_URL", None),
+        ("OMNIGRAPH_EMBED_MODEL", None),
+        ("OPENROUTER_API_KEY", None),
+        ("OPENAI_API_KEY", None),
+        ("GEMINI_API_KEY", None),
+    ]);
+    let settings = cluster_settings(temp.path()).await.unwrap();
+    let omnigraph_server::ServerConfigMode::Multi {
+        graphs,
+        config_path,
+        server_policy,
+    } = settings.mode
+    else {
+        panic!("cluster boot must select multi-graph routing");
+    };
+    let state = omnigraph_server::open_multi_graph_state(
+        graphs,
+        Vec::new(),
+        server_policy.as_ref(),
+        config_path,
+    )
+    .await
+    .unwrap();
+    let app = build_app(state);
+
+    let read = ReadRequest {
+        query_source: EMBED_QUERY.to_string(),
+        query_name: Some("vector_search_string".to_string()),
+        params: Some(serde_json::json!({ "q": "alpha" })),
+        branch: Some("main".to_string()),
+        snapshot: None,
+    };
+    let (status, body) = json_response(
+        &app,
+        Request::builder()
+            .uri("/graphs/knowledge/read")
+            .method(Method::POST)
+            .header("content-type", "application/json")
+            .body(Body::from(serde_json::to_vec(&read).unwrap()))
+            .unwrap(),
+    )
+    .await;
+
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["row_count"], 3);
+    assert_eq!(body["rows"][0]["d.slug"], "alpha-doc");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+#[serial]
+async fn cluster_boot_refuses_missing_embedding_secret_env() {
+    let temp = tempfile::tempdir().unwrap();
+    fs::write(
+        temp.path().join("people.pg"),
+        "\nnode Person {\n  name: String @key\n}\n",
+    )
+    .unwrap();
+    fs::write(
+        temp.path().join("people.gq"),
+        "\nquery find_person($name: String) {\n  match { $p: Person { name: $name } }\n  return { $p.name }\n}\n",
+    )
+    .unwrap();
+    fs::write(
+        temp.path().join("cluster.yaml"),
+        r#"
+version: 1
+providers:
+  embedding:
+    default:
+      kind: openai-compatible
+      api_key: ${OG_TEST_MISSING_EMBED_KEY}
+graphs:
+  knowledge:
+    schema: ./people.pg
+    embedding_provider: default
+    queries:
+      find_person:
+        file: ./people.gq
+"#,
+    )
+    .unwrap();
+    let import = omnigraph_cluster::import_config_dir(temp.path()).await;
+    assert!(import.ok, "{:?}", import.diagnostics);
+    let apply = omnigraph_cluster::apply_config_dir(temp.path()).await;
+    assert!(apply.ok && apply.converged, "{:?}", apply.diagnostics);
+
+    let _guard = EnvGuard::set(&[
+        ("OG_TEST_MISSING_EMBED_KEY", None),
+        ("OMNIGRAPH_EMBEDDINGS_MOCK", None),
+    ]);
+    let err = cluster_settings(temp.path()).await.unwrap_err();
+    let message = err.to_string();
+    assert!(
+        message.contains("embedding provider for graph 'knowledge'"),
+        "{message}"
+    );
+    assert!(message.contains("OG_TEST_MISSING_EMBED_KEY"), "{message}");
+}
+
 #[tokio::test]
 async fn cluster_boot_wires_policy_bindings_into_cedar_slots() {
     let temp = tempfile::tempdir().unwrap();
@@ -540,31 +717,15 @@ graphs:
 
 #[tokio::test]
 async fn cluster_boot_refusals() {
-    // Mutual exclusion with --config / URI.
+    // RFC-011 cluster-only: with no --cluster, boot refuses with the
+    // cluster-required remedy.
+    let err = omnigraph_server::load_server_settings(None, None, true)
+        .await
+        .unwrap_err();
+    assert!(err.to_string().contains("boots from a cluster"), "{err}");
+
     let temp = converged_cluster_dir("").await;
     let dir = temp.path().to_path_buf();
-    let err = omnigraph_server::load_server_settings(
-        Some(&dir.join("omnigraph.yaml")),
-        Some(&dir),
-        None,
-        None,
-        None,
-        true,
-    )
-    .await
-    .unwrap_err();
-    assert!(err.to_string().contains("exclusive boot source"), "{err}");
-    let err = omnigraph_server::load_server_settings(
-        None,
-        Some(&dir),
-        Some("file:///tmp/x.omni".to_string()),
-        None,
-        None,
-        true,
-    )
-    .await
-    .unwrap_err();
-    assert!(err.to_string().contains("exclusive boot source"), "{err}");
 
     // Tampered catalog blob refuses boot with the remedy.
     let blob_dir = dir.join("__cluster/resources/query/knowledge/find_person");

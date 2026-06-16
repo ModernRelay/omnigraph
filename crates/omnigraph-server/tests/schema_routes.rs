@@ -2,6 +2,7 @@
 //! Moved verbatim from tests/server.rs in the modularization.
 
 use std::fs;
+use std::sync::Arc;
 
 use axum::body::Body;
 use axum::http::{Method, Request, StatusCode};
@@ -11,7 +12,9 @@ use omnigraph::loader::LoadMode;
 use omnigraph_server::api::{
     ChangeRequest, ErrorOutput, ReadRequest, SchemaApplyRequest, SchemaOutput,
 };
-use omnigraph_server::{AppState, build_app};
+use omnigraph_server::{
+    AppState, GraphHandle, GraphId, GraphKey, PolicyEngine, build_app, workload,
+};
 use serde_json::json;
 
 
@@ -30,7 +33,7 @@ async fn schema_apply_route_updates_graph_for_authorized_admin() {
 
     let request = Request::builder()
         .method(Method::POST)
-        .uri("/schema/apply")
+        .uri(g("/schema/apply"))
         .header("content-type", "application/json")
         .header("authorization", "Bearer admin-token")
         .body(Body::from(
@@ -54,6 +57,111 @@ async fn schema_apply_route_updates_graph_for_authorized_admin() {
     );
 }
 
+#[tokio::test]
+async fn schema_apply_route_refuses_cluster_backed_server_mode() {
+    let temp = init_graph_with_schema(&fs::read_to_string(fixture("test.pg")).unwrap()).await;
+    let graph = graph_path(temp.path());
+    let graph_uri = graph.to_string_lossy().to_string();
+    let engine = Omnigraph::open(&graph_uri).await.unwrap();
+    let handle = Arc::new(GraphHandle {
+        key: GraphKey::cluster(GraphId::try_from("default").unwrap()),
+        uri: graph_uri.clone(),
+        engine: Arc::new(engine),
+        policy: None,
+        queries: None,
+    });
+    let state = AppState::new_multi(
+        vec![handle],
+        Vec::new(),
+        None,
+        workload::WorkloadController::from_env(),
+        Some(temp.path().join("cluster.yaml")),
+    )
+    .unwrap();
+    let app = build_app(state);
+
+    let request = Request::builder()
+        .method(Method::POST)
+        .uri(g("/schema/apply"))
+        .header("content-type", "application/json")
+        .body(Body::from(
+            serde_json::to_vec(&SchemaApplyRequest {
+                schema_source: additive_schema_with_nickname(),
+                ..Default::default()
+            })
+            .unwrap(),
+        ))
+        .unwrap();
+    let (status, payload) = json_response(&app, request).await;
+
+    assert_eq!(status, StatusCode::CONFLICT, "body: {payload}");
+    assert!(
+        payload["error"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("cluster apply"),
+        "body: {payload}"
+    );
+    let reopened = Omnigraph::open(&graph_uri).await.unwrap();
+    assert!(
+        !reopened.catalog().node_types["Person"]
+            .properties
+            .contains_key("nickname"),
+        "cluster-backed schema apply must not mutate the graph"
+    );
+}
+
+#[tokio::test]
+async fn schema_apply_route_cluster_backed_denies_unauthorized_actor_before_409() {
+    // The cluster-backed 409 is reported AFTER the Cedar gate, so an actor
+    // without `schema_apply` permission gets a 403 — never a 409 that would
+    // disclose the server is cluster-backed (401 → 403 → 409, no topology leak
+    // before authorization). POLICY_YAML grants read/export but not schema_apply,
+    // so act-ragnor is denied.
+    let temp = init_graph_with_schema(&fs::read_to_string(fixture("test.pg")).unwrap()).await;
+    let graph = graph_path(temp.path());
+    let graph_uri = graph.to_string_lossy().to_string();
+    let engine = Omnigraph::open(&graph_uri).await.unwrap();
+    let policy = PolicyEngine::load_graph_from_source(POLICY_YAML, "default").unwrap();
+    let handle = Arc::new(GraphHandle {
+        key: GraphKey::cluster(GraphId::try_from("default").unwrap()),
+        uri: graph_uri,
+        engine: Arc::new(engine),
+        policy: Some(Arc::new(policy)),
+        queries: None,
+    });
+    let state = AppState::new_multi(
+        vec![handle],
+        vec![("act-ragnor".to_string(), "admin-token".to_string())],
+        None,
+        workload::WorkloadController::from_env(),
+        Some(temp.path().join("cluster.yaml")),
+    )
+    .unwrap();
+    let app = build_app(state);
+
+    let request = Request::builder()
+        .method(Method::POST)
+        .uri(g("/schema/apply"))
+        .header("content-type", "application/json")
+        .header("authorization", "Bearer admin-token")
+        .body(Body::from(
+            serde_json::to_vec(&SchemaApplyRequest {
+                schema_source: additive_schema_with_nickname(),
+                ..Default::default()
+            })
+            .unwrap(),
+        ))
+        .unwrap();
+    let (status, payload) = json_response(&app, request).await;
+
+    assert_eq!(
+        status,
+        StatusCode::FORBIDDEN,
+        "an unauthorized actor must get 403 before the cluster-backed 409: {payload}"
+    );
+}
+
 #[tokio::test(flavor = "multi_thread")]
 async fn schema_apply_route_rejects_stored_query_breakage_before_publish() {
     let (temp, app) = app_with_stored_queries(
@@ -65,7 +173,7 @@ async fn schema_apply_route_rejects_stored_query_breakage_before_publish() {
 
     let request = Request::builder()
         .method(Method::POST)
-        .uri("/schema/apply")
+        .uri(g("/schema/apply"))
         .header("content-type", "application/json")
         .header("authorization", "Bearer admin-token")
         .body(Body::from(
@@ -115,7 +223,7 @@ async fn schema_apply_route_noop_keeps_valid_stored_query_registry() {
 
     let request = Request::builder()
         .method(Method::POST)
-        .uri("/schema/apply")
+        .uri(g("/schema/apply"))
         .header("content-type", "application/json")
         .header("authorization", "Bearer admin-token")
         .body(Body::from(
@@ -142,7 +250,7 @@ async fn schema_apply_route_requires_schema_apply_policy_permission() {
 
     let request = Request::builder()
         .method(Method::POST)
-        .uri("/schema/apply")
+        .uri(g("/schema/apply"))
         .header("content-type", "application/json")
         .header("authorization", "Bearer admin-token")
         .body(Body::from(
@@ -173,7 +281,7 @@ async fn schema_apply_route_requires_bearer_token_when_policy_enabled() {
 
     let request = Request::builder()
         .method(Method::POST)
-        .uri("/schema/apply")
+        .uri(g("/schema/apply"))
         .header("content-type", "application/json")
         .body(Body::from(
             serde_json::to_vec(&SchemaApplyRequest {
@@ -203,7 +311,7 @@ async fn schema_apply_route_can_rename_type() {
 
     let request = Request::builder()
         .method(Method::POST)
-        .uri("/schema/apply")
+        .uri(g("/schema/apply"))
         .header("content-type", "application/json")
         .header("authorization", "Bearer admin-token")
         .body(Body::from(
@@ -239,7 +347,7 @@ async fn schema_apply_route_can_rename_property() {
 
     let request = Request::builder()
         .method(Method::POST)
-        .uri("/schema/apply")
+        .uri(g("/schema/apply"))
         .header("content-type", "application/json")
         .header("authorization", "Bearer admin-token")
         .body(Body::from(
@@ -279,7 +387,7 @@ async fn schema_apply_route_can_add_index() {
 
     let request = Request::builder()
         .method(Method::POST)
-        .uri("/schema/apply")
+        .uri(g("/schema/apply"))
         .header("content-type", "application/json")
         .header("authorization", "Bearer admin-token")
         .body(Body::from(
@@ -294,6 +402,11 @@ async fn schema_apply_route_can_add_index() {
 
     assert_eq!(status, StatusCode::OK);
     assert_eq!(payload["applied"], true);
+    // iss-848: the /schema/apply route accepts the index-add and applies it as a
+    // metadata change — it records the `@index` intent in the catalog/IR but does
+    // NOT build the physical index inline (the build is deferred to
+    // ensure_indices/optimize; on this empty table nothing would build anyway).
+    // So the physical index count is unchanged by the apply.
     let reopened = Omnigraph::open(graph.to_str().unwrap()).await.unwrap();
     let snapshot = reopened
         .snapshot_of(ReadTarget::branch("main"))
@@ -301,7 +414,10 @@ async fn schema_apply_route_can_add_index() {
         .unwrap();
     let dataset = snapshot.open("node:Person").await.unwrap();
     let after_index_count = dataset.load_indices().await.unwrap().len();
-    assert!(after_index_count > before_index_count);
+    assert_eq!(
+        after_index_count, before_index_count,
+        "schema apply records @index intent but defers the physical build (iss-848)"
+    );
 }
 
 #[tokio::test]
@@ -315,7 +431,7 @@ async fn schema_apply_route_rejects_unsupported_plan() {
 
     let request = Request::builder()
         .method(Method::POST)
-        .uri("/schema/apply")
+        .uri(g("/schema/apply"))
         .header("content-type", "application/json")
         .header("authorization", "Bearer admin-token")
         .body(Body::from(
@@ -356,7 +472,7 @@ async fn schema_apply_route_rejects_when_non_main_branch_exists() {
 
     let request = Request::builder()
         .method(Method::POST)
-        .uri("/schema/apply")
+        .uri(g("/schema/apply"))
         .header("content-type", "application/json")
         .header("authorization", "Bearer admin-token")
         .body(Body::from(
@@ -385,7 +501,7 @@ async fn schema_drift_returns_conflict_for_snapshot_read_and_change() {
     let (snapshot_status, snapshot_body) = json_response(
         &app,
         Request::builder()
-            .uri("/snapshot?branch=main")
+            .uri(g("/snapshot?branch=main"))
             .method(Method::GET)
             .body(Body::empty())
             .unwrap(),
@@ -413,7 +529,7 @@ async fn schema_drift_returns_conflict_for_snapshot_read_and_change() {
     let (read_status, read_body) = json_response(
         &app,
         Request::builder()
-            .uri("/read")
+            .uri(g("/read"))
             .method(Method::POST)
             .header("content-type", "application/json")
             .body(Body::from(serde_json::to_vec(&read).unwrap()))
@@ -441,7 +557,7 @@ async fn schema_drift_returns_conflict_for_snapshot_read_and_change() {
     let (change_status, change_body) = json_response(
         &app,
         Request::builder()
-            .uri("/change")
+            .uri(g("/change"))
             .method(Method::POST)
             .header("content-type", "application/json")
             .body(Body::from(serde_json::to_vec(&change).unwrap()))
@@ -467,7 +583,7 @@ async fn schema_route_returns_current_source() {
     let (status, body) = json_response(
         &app,
         Request::builder()
-            .uri("/schema")
+            .uri(g("/schema"))
             .method(Method::GET)
             .body(Body::empty())
             .unwrap(),
@@ -486,7 +602,7 @@ async fn schema_route_requires_bearer_token_when_auth_configured() {
     let (missing_status, missing_body) = json_response(
         &app,
         Request::builder()
-            .uri("/schema")
+            .uri(g("/schema"))
             .method(Method::GET)
             .body(Body::empty())
             .unwrap(),
@@ -502,7 +618,7 @@ async fn schema_route_requires_bearer_token_when_auth_configured() {
     let (ok_status, ok_body) = json_response(
         &app,
         Request::builder()
-            .uri("/schema")
+            .uri(g("/schema"))
             .method(Method::GET)
             .header("authorization", "Bearer demo-token")
             .body(Body::empty())
@@ -533,7 +649,7 @@ async fn schema_route_denied_when_actor_lacks_read_permission() {
     let (status, body) = json_response(
         &app,
         Request::builder()
-            .uri("/schema")
+            .uri(g("/schema"))
             .method(Method::GET)
             .header("authorization", "Bearer team-token")
             .body(Body::empty())
@@ -574,7 +690,7 @@ async fn schema_apply_route_soft_drops_property_via_http() {
         &app,
         Request::builder()
             .method(Method::POST)
-            .uri("/schema/apply")
+            .uri(g("/schema/apply"))
             .header("content-type", "application/json")
             .header("authorization", "Bearer admin-token")
             .body(Body::from(
@@ -631,7 +747,7 @@ async fn schema_apply_route_soft_drops_node_type_via_http() {
         &app,
         Request::builder()
             .method(Method::POST)
-            .uri("/schema/apply")
+            .uri(g("/schema/apply"))
             .header("content-type", "application/json")
             .header("authorization", "Bearer admin-token")
             .body(Body::from(
@@ -683,7 +799,7 @@ async fn schema_apply_route_hard_drops_property_with_allow_data_loss() {
         &app,
         Request::builder()
             .method(Method::POST)
-            .uri("/schema/apply")
+            .uri(g("/schema/apply"))
             .header("content-type", "application/json")
             .header("authorization", "Bearer admin-token")
             .body(Body::from(
@@ -738,7 +854,7 @@ async fn schema_apply_route_keeps_drops_soft_without_flag() {
         &app,
         Request::builder()
             .method(Method::POST)
-            .uri("/schema/apply")
+            .uri(g("/schema/apply"))
             .header("content-type", "application/json")
             .header("authorization", "Bearer admin-token")
             .body(Body::from(
@@ -770,29 +886,27 @@ async fn schema_apply_route_additive_property_preserves_existing_rows() {
     // AddProperty wasn't pinned with a row-count check anywhere.
     // Load N rows, apply schema adding nullable property, verify
     // every row is still readable and the new column is null.
-    let (temp, app) = app_for_graph_with_auth_tokens_and_policy(
-        &fs::read_to_string(fixture("test.pg")).unwrap(),
+    let (temp, app) = app_for_loaded_graph_with_auth_tokens_and_policy(
         &[("act-ragnor", "admin-token")],
         SCHEMA_APPLY_POLICY_YAML,
     )
     .await;
     let graph = graph_path(temp.path());
 
-    // Standard fixture data: 4 Persons + 1 Company. Load it.
+    // Standard fixture data is loaded before the app is built, so the server
+    // handle applies schema from the same manifest it is serving.
     let pre_count = {
         let db = Omnigraph::open(graph.to_str().unwrap()).await.unwrap();
-        db.load(
-            "main",
-            &fs::read_to_string(fixture("test.jsonl")).unwrap(),
-            LoadMode::Append,
-        )
-        .await
-        .unwrap();
         let snap = db
             .snapshot_of(omnigraph::db::ReadTarget::branch("main"))
             .await
             .unwrap();
-        snap.entry("node:Person").expect("Person").row_count
+        snap.open("node:Person")
+            .await
+            .expect("Person")
+            .count_rows(None)
+            .await
+            .unwrap()
     };
     assert!(pre_count > 0, "fixture should have loaded Person rows");
 
@@ -800,7 +914,7 @@ async fn schema_apply_route_additive_property_preserves_existing_rows() {
         &app,
         Request::builder()
             .method(Method::POST)
-            .uri("/schema/apply")
+            .uri(g("/schema/apply"))
             .header("content-type", "application/json")
             .header("authorization", "Bearer admin-token")
             .body(Body::from(
@@ -822,7 +936,13 @@ async fn schema_apply_route_additive_property_preserves_existing_rows() {
         .snapshot_of(omnigraph::db::ReadTarget::branch("main"))
         .await
         .unwrap();
-    let post_count = snap.entry("node:Person").expect("Person").row_count;
+    let post_count = snap
+        .open("node:Person")
+        .await
+        .expect("Person")
+        .count_rows(None)
+        .await
+        .unwrap();
     assert_eq!(
         post_count, pre_count,
         "AddProperty should preserve row count",

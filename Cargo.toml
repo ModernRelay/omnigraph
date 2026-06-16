@@ -4,6 +4,7 @@ members = [
     "crates/omnigraph-compiler",
     "crates/omnigraph",
     "crates/omnigraph-cli",
+    "crates/omnigraph-api-types",
     "crates/omnigraph-cluster",
     "crates/omnigraph-policy",
     "crates/omnigraph-server",
@@ -30,14 +31,14 @@ datafusion-common = "53"
 datafusion-expr = "53"
 datafusion-functions-aggregate = "53"
 
-lance = { version = "6.0.1", default-features = false, features = ["aws"] }
-lance-datafusion = "6.0.1"
-lance-file = "6.0.1"
-lance-index = "6.0.1"
-lance-linalg = "6.0.1"
-lance-namespace = "6.0.1"
-lance-namespace-impls = "6.0.1"
-lance-table = "6.0.1"
+lance = { version = "7.0.0", default-features = false, features = ["aws"] }
+lance-datafusion = "7.0.0"
+lance-file = "7.0.0"
+lance-index = "7.0.0"
+lance-linalg = "7.0.0"
+lance-namespace = "7.0.0"
+lance-namespace-impls = "7.0.0"
+lance-table = "7.0.0"
 
 ulid = "1"
 futures = "0.3"
@@ -47,7 +48,7 @@ pest = "2"
 pest_derive = "2"
 thiserror = "2"
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "time", "net", "signal", "sync"] }
-clap = { version = "4", features = ["derive"] }
+clap = { version = "4.6", features = ["derive"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 serde_yaml = "0.9"
@@ -63,7 +64,7 @@ base64 = "0.22"
 ariadne = "0.4"
 regex = "1"
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
-object_store = { version = "0.12.5", default-features = false, features = ["aws", "fs"] }
+object_store = { version = "0.13.2", default-features = false, features = ["aws", "fs"] }
 fail = "0.5"
 time = { version = "0.3", features = ["formatting"] }
 axum = { version = "0.8", features = ["json", "macros"] }

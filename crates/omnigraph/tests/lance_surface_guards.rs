@@ -32,10 +32,14 @@ use lance::dataset::builder::DatasetBuilder;
 use lance::dataset::optimize::{CompactionOptions, compact_files};
 use lance::dataset::transaction::Operation;
 use lance::dataset::write::delete::DeleteResult;
-use lance::dataset::{MergeInsertBuilder, WhenMatched, WhenNotMatched, WriteMode, WriteParams};
+use lance::dataset::{
+    CommitBuilder, InsertBuilder, MergeInsertBuilder, WhenMatched, WhenNotMatched, WriteMode,
+    WriteParams,
+};
 use lance::index::DatasetIndexExt;
 use lance_file::version::LanceFileVersion;
 use lance_index::IndexType;
+use lance_index::optimize::OptimizeOptions;
 use lance_index::scalar::ScalarIndexParams;
 use lance_namespace::LanceNamespace;
 use lance_table::io::commit::ManifestNamingScheme;
@@ -539,5 +543,451 @@ async fn fragment_deletion_metadata_is_available() {
         "PROBE: deletion_file.num_deleted_rows is not a populated metadata count \
          (got {count:?}); the artifact coverage model cannot cheaply detect \
          per-fragment deletions and would need to read the deletion vector.",
+    );
+}
+
+// --- Guard 14: Dataset::optimize_indices signature ----------------------------
+//
+// `db/omnigraph/optimize.rs::optimize_one_table` calls
+// `ds.optimize_indices(&OptimizeOptions::default())` (via `DatasetIndexExt`) to
+// fold appended/compacted fragments back into existing indexes. If Lance
+// changes the receiver, the options type, or the return shape, this fails to
+// compile. Compile-only.
+
+#[allow(
+    dead_code,
+    unreachable_code,
+    unused_variables,
+    unused_mut,
+    clippy::diverging_sub_expression
+)]
+async fn _compile_optimize_indices_signature() -> lance::Result<()> {
+    let mut ds: Dataset = unimplemented!();
+    let options = OptimizeOptions::default();
+    // `&mut self`, `&OptimizeOptions`, returns `Result<()>` (mutates in place
+    // and commits — there is no uncommitted variant in this Lance, which is why
+    // optimize treats it as an inline-commit residual under a recovery sidecar).
+    let _: () = ds.optimize_indices(&options).await?;
+    Ok(())
+}
+
+// --- Guard 15: optimize_indices extends fragment coverage ----------------------
+//
+// PR3's reindex assumes `optimize_indices` folds fragments appended AFTER an
+// index was built into that index (incremental merge, not retrain). This pins
+// that Lance behavior at the surface layer so a regression turns red here, the
+// first smoke check on a Lance bump, before the slower engine suite.
+
+#[tokio::test]
+async fn optimize_indices_extends_fragment_coverage() {
+    let dir = tempfile::tempdir().unwrap();
+    let uri = dir.path().join("guard_optimize_indices.lance");
+    let uri = uri.to_str().unwrap();
+
+    // Fragment 0: alice, bob. Build a BTREE over `value` covering only it.
+    let mut ds = fresh_dataset(uri).await;
+    ds.create_index_builder(&["value"], IndexType::BTree, &ScalarIndexParams::default())
+        .replace(true)
+        .await
+        .unwrap();
+
+    // Append a second fragment the existing index does not cover.
+    let schema = Arc::new(Schema::new(vec![
+        Field::new("id", DataType::Utf8, false),
+        Field::new("value", DataType::Int32, false),
+    ]));
+    let batch = RecordBatch::try_new(
+        schema.clone(),
+        vec![
+            Arc::new(StringArray::from(vec!["carol"])),
+            Arc::new(Int32Array::from(vec![3])),
+        ],
+    )
+    .unwrap();
+    let reader = RecordBatchIterator::new(vec![Ok(batch)], schema);
+    let params = WriteParams {
+        mode: WriteMode::Append,
+        enable_stable_row_ids: true,
+        data_storage_version: Some(LanceFileVersion::V2_2),
+        ..Default::default()
+    };
+    Dataset::write(reader, uri, Some(params)).await.unwrap();
+
+    let mut ds = Dataset::open(uri).await.unwrap();
+    assert!(
+        value_index_uncovered_count(&ds).await > 0,
+        "appended fragment should be uncovered by the BTREE before optimize_indices"
+    );
+
+    ds.optimize_indices(&OptimizeOptions::default())
+        .await
+        .unwrap();
+
+    assert_eq!(
+        value_index_uncovered_count(&ds).await,
+        0,
+        "optimize_indices must fold the appended fragment into the existing index \
+         (incremental coverage); if this regresses, PR3's reindex no longer keeps \
+         coverage current — revisit db/omnigraph/optimize.rs and docs/dev/lance.md."
+    );
+}
+
+/// Count current fragments not covered by the single-column `value` BTREE —
+/// mirrors `TableStore::has_unindexed_fragments` (load_indices +
+/// `fragment_bitmap.contains`), pinned by Guard 11.
+async fn value_index_uncovered_count(ds: &Dataset) -> usize {
+    let indices = ds.load_indices().await.unwrap();
+    let frag_ids: Vec<u32> = ds.fragments().iter().map(|f| f.id as u32).collect();
+    let value_fid = ds.schema().field("value").unwrap().id;
+    for index in indices.iter() {
+        if index.fields.len() == 1 && index.fields[0] == value_fid {
+            if let Some(bitmap) = index.fragment_bitmap.as_ref() {
+                return frag_ids.iter().filter(|id| !bitmap.contains(**id)).count();
+            }
+        }
+    }
+    // No `value` index found — treat as fully uncovered so a missing index
+    // is never mistaken for full coverage.
+    frag_ids.len()
+}
+
+// --- Guard 16: scalar index use requires a literal matching the column type ---
+//
+// Pins the substrate behavior the pushdown literal-coercion fix relies on
+// (`query.rs::literal_to_typed_expr`): Lance uses the BTREE only when the filter
+// is `column OP literal` with a matching type. A width-mismatched literal makes
+// DataFusion widen and cast the COLUMN (`CAST(n32 AS Int64)`), which drops the
+// scalar index and full-scans. Temporal columns are immune (DataFusion casts the
+// Utf8 LITERAL to the date type, not the column). If a Lance/DataFusion bump
+// changes either coercion direction, this turns red — re-validate the fix.
+#[tokio::test]
+async fn scalar_index_use_requires_matched_literal_type() {
+    use datafusion::physical_plan::displayable;
+    use datafusion::prelude::{col, lit};
+    use datafusion::scalar::ScalarValue;
+
+    let dir = tempfile::tempdir().unwrap();
+    let uri = dir.path().join("probe_literal_type.lance");
+    let uri = uri.to_str().unwrap();
+
+    let schema = Arc::new(Schema::new(vec![
+        Field::new("id", DataType::Utf8, false),
+        Field::new("n32", DataType::Int32, false),
+        Field::new("d32", DataType::Date32, false),
+    ]));
+    let batch = RecordBatch::try_new(
+        schema.clone(),
+        vec![
+            Arc::new(StringArray::from(vec!["a", "b", "c", "d"])),
+            Arc::new(Int32Array::from(vec![1, 5, 9, 13])),
+            Arc::new(arrow_array::Date32Array::from(vec![19000, 19723, 20000, 20500])),
+        ],
+    )
+    .unwrap();
+    let reader = RecordBatchIterator::new(vec![Ok(batch)], schema);
+    let params = WriteParams {
+        mode: WriteMode::Create,
+        enable_stable_row_ids: true,
+        data_storage_version: Some(LanceFileVersion::V2_2),
+        ..Default::default()
+    };
+    let mut ds = Dataset::write(reader, uri, Some(params)).await.unwrap();
+    for c in ["n32", "d32"] {
+        ds.create_index_builder(&[c], IndexType::BTree, &ScalarIndexParams::default())
+            .replace(true)
+            .await
+            .unwrap();
+    }
+
+    async fn plan_str(ds: &Dataset, filter: datafusion::prelude::Expr) -> String {
+        let mut scanner = ds.scan();
+        scanner.filter_expr(filter);
+        let plan = scanner.create_plan().await.unwrap();
+        format!("{}", displayable(plan.as_ref()).indent(true))
+    }
+
+    // (label, filter, expect_index_used)
+    let cases = [
+        ("n32 = 5i32 (matched Int32)", col("n32").eq(lit(5i32)), true),
+        ("n32 = 5i64 (widened Int64)", col("n32").eq(lit(5i64)), false),
+        (
+            "d32 = Date32 (matched)",
+            col("d32").eq(lit(ScalarValue::Date32(Some(19723)))),
+            true,
+        ),
+        (
+            "d32 = '2024-01-01' (Utf8 vs Date32)",
+            col("d32").eq(lit("2024-01-01")),
+            true,
+        ),
+    ];
+
+    for (label, filter, expect_index) in cases {
+        let s = plan_str(&ds, filter).await;
+        let uses_index = s.contains("ScalarIndexQuery");
+        assert_eq!(
+            uses_index, expect_index,
+            "[{label}] expected scalar-index use = {expect_index}, got {uses_index}.\n\
+             A change here means Lance/DataFusion shifted its coercion or index \
+             pushdown; re-validate query.rs::literal_to_typed_expr.\nplan:\n{s}"
+        );
+    }
+
+    // The widened case must show the index-defeating column CAST (the precise
+    // shape the fix avoids by coercing the literal to the column type).
+    let widened = plan_str(&ds, col("n32").eq(lit(5i64))).await;
+    assert!(
+        widened.contains("CAST(n32 AS Int64)"),
+        "expected a column-side cast in the widened plan, got:\n{widened}"
+    );
+}
+
+// --- Guard 17: BTREE scalar-index range-boundary correctness (lance#6796) -----
+//
+// lance#6796 (issue #6792) fixed a BTREE range-query bound-inclusiveness bug:
+// `price <= 10 AND price > 5` returned the wrong boundary row (5.0 instead of
+// 10.0). OmniGraph today builds BTREE only on string `@key` columns and queries
+// them by equality/IN, not range, so its current patterns do not hit this — the
+// guard protects any future BTREE-range path. It reproduces the exact #6792 shape
+// (5 rows + an explicit BTREE drives the index path even on tiny data, per the
+// upstream repro) and pins the corrected inclusive-`<=` / exclusive-`>` semantics.
+#[tokio::test]
+async fn btree_range_query_boundary_is_correct() {
+    use arrow_array::Float64Array;
+    use futures::TryStreamExt;
+
+    let dir = tempfile::tempdir().unwrap();
+    let uri = dir.path().join("guard17.lance");
+    let schema = Arc::new(Schema::new(vec![
+        Field::new("id", DataType::Utf8, false),
+        Field::new("price", DataType::Float64, false),
+    ]));
+    let batch = RecordBatch::try_new(
+        schema.clone(),
+        vec![
+            Arc::new(StringArray::from(vec!["a", "b", "c", "d", "e"])),
+            Arc::new(Float64Array::from(vec![1.0, 5.0, 10.0, 15.0, 20.0])),
+        ],
+    )
+    .unwrap();
+    let reader = RecordBatchIterator::new(vec![Ok(batch)], schema);
+    let params = WriteParams {
+        mode: WriteMode::Create,
+        enable_stable_row_ids: true,
+        data_storage_version: Some(LanceFileVersion::V2_2),
+        ..Default::default()
+    };
+    let mut ds = Dataset::write(reader, uri.to_str().unwrap(), Some(params))
+        .await
+        .unwrap();
+
+    // Build the BTREE on the numeric column so the range filter resolves through
+    // the scalar index (the path lance#6796 fixed).
+    ds.create_index_builder(&["price"], IndexType::BTree, &ScalarIndexParams::default())
+        .replace(true)
+        .await
+        .unwrap();
+
+    let mut scanner = ds.scan();
+    scanner.filter("price <= 10.0 AND price > 5.0").unwrap();
+    let batches: Vec<RecordBatch> = scanner
+        .try_into_stream()
+        .await
+        .unwrap()
+        .try_collect()
+        .await
+        .unwrap();
+    let mut got: Vec<f64> = Vec::new();
+    for b in &batches {
+        let col = b
+            .column_by_name("price")
+            .unwrap()
+            .as_any()
+            .downcast_ref::<Float64Array>()
+            .unwrap();
+        for i in 0..col.len() {
+            got.push(col.value(i));
+        }
+    }
+    got.sort_by(|a, b| a.partial_cmp(b).unwrap());
+    assert_eq!(
+        got,
+        vec![10.0],
+        "BTREE range `price <= 10 AND price > 5` must return exactly [10.0] \
+         (lance#6796 / issue #6792 boundary fix); got {got:?}. If this regressed, \
+         Lance reintroduced the range-bound inclusiveness bug.",
+    );
+}
+
+// --- Guard 18: skip_auto_cleanup suppresses version GC (lance#6755 / PR #229) --
+//
+// After the v7 bump, OmniGraph relies on `CommitBuilder::with_skip_auto_cleanup`
+// (`commit_staged`) and `MergeInsertBuilder::skip_auto_cleanup` (the `__manifest`
+// publisher) to stop Lance's per-commit auto-cleanup hook from GC'ing versions
+// the `__manifest` pins for snapshots/time-travel. This is load-bearing for
+// graphs created BEFORE the bump: 6.0.1 defaulted `WriteParams::auto_cleanup` ON,
+// so those datasets carry `lance.auto_cleanup.*` config that `auto_cleanup = None`
+// on new writes cannot retroactively clear — only the per-commit skip stops it.
+//
+// Pins both halves: WITHOUT the skip the aggressive config GCs v1; WITH the skip
+// (the exact call `commit_staged` makes) v1 survives.
+#[tokio::test]
+async fn skip_auto_cleanup_suppresses_version_gc() {
+    use std::collections::HashMap;
+
+    // The cleanup config 6.0.1 stored by default, made aggressive: fire on every
+    // commit, delete anything older than now.
+    async fn set_legacy_cleanup(ds: &mut Dataset) {
+        let mut cfg = HashMap::new();
+        cfg.insert("lance.auto_cleanup.interval".to_string(), "1".to_string());
+        cfg.insert("lance.auto_cleanup.older_than".to_string(), "0ms".to_string());
+        ds.update_config(cfg).await.unwrap();
+    }
+    fn row(i: i32) -> (Arc<Schema>, RecordBatch) {
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Utf8, false),
+            Field::new("value", DataType::Int32, false),
+        ]));
+        let batch = RecordBatch::try_new(
+            schema.clone(),
+            vec![
+                Arc::new(StringArray::from(vec![format!("k{i}")])),
+                Arc::new(Int32Array::from(vec![i])),
+            ],
+        )
+        .unwrap();
+        (schema, batch)
+    }
+
+    // Negative control: WITHOUT skip, the legacy config GCs the pinned v1.
+    let ctrl = tempfile::tempdir().unwrap();
+    let curi = ctrl.path().join("g18_ctrl.lance");
+    let curi = curi.to_str().unwrap();
+    let mut ds = fresh_dataset(curi).await;
+    let v1 = ds.version().version;
+    set_legacy_cleanup(&mut ds).await;
+    for i in 0..5 {
+        let (schema, batch) = row(i);
+        let reader = RecordBatchIterator::new(vec![Ok(batch)], schema);
+        ds.append(
+            reader,
+            Some(WriteParams {
+                mode: WriteMode::Append,
+                ..Default::default()
+            }),
+        )
+        .await
+        .unwrap();
+    }
+    assert!(
+        ds.checkout_version(v1).await.is_err(),
+        "negative control: without skip_auto_cleanup, the legacy auto_cleanup \
+         config should have GC'd pinned v{v1}; if this fails the config is not \
+         firing and the positive assertion below proves nothing."
+    );
+
+    // The guarantee: WITH the per-commit skip, v1 survives. Mirrors
+    // `TableStore::commit_staged` (InsertBuilder::execute_uncommitted +
+    // CommitBuilder::with_skip_auto_cleanup(true)).
+    let keep = tempfile::tempdir().unwrap();
+    let kuri = keep.path().join("g18.lance");
+    let kuri = kuri.to_str().unwrap();
+    let mut ds = fresh_dataset(kuri).await;
+    let v1 = ds.version().version;
+    set_legacy_cleanup(&mut ds).await;
+    for i in 0..5 {
+        let (_schema, batch) = row(i);
+        let tx = InsertBuilder::new(Arc::new(ds.clone()))
+            .with_params(&WriteParams {
+                mode: WriteMode::Append,
+                ..Default::default()
+            })
+            .execute_uncommitted(vec![batch])
+            .await
+            .unwrap();
+        ds = CommitBuilder::new(Arc::new(ds.clone()))
+            .with_skip_auto_cleanup(true)
+            .execute(tx)
+            .await
+            .unwrap();
+    }
+    assert!(
+        ds.checkout_version(v1).await.is_ok(),
+        "v{v1} was GC'd despite CommitBuilder::with_skip_auto_cleanup(true) — the \
+         commit_staged / publisher skip is the only thing protecting \
+         __manifest-pinned versions on upgraded (pre-bump) graphs."
+    );
+}
+
+// --- Guard 19: unenforced primary key is immutable once set (lance v7) ------
+//
+// Lance 7 (`lance::dataset::transaction`) makes the unenforced PK reserved:
+// once `lance-schema:unenforced-primary-key` is set on a field, any later write
+// that touches that reserved key — even re-applying the SAME value — errors
+// "the unenforced primary key is a reserved key and cannot be changed once set".
+//
+// This is the upstream behavior that broke
+// `db/manifest/migrations.rs::migrate_v1_to_v2`'s crash-idempotency: a
+// pre-v0.4.0 graph that crashed after the field-set but before the stamp bump
+// re-enters the migration with the PK already present, and on Lance 6 the
+// re-apply was a no-op. The migration now guards the set on the manifest's
+// unenforced-PK field (`["object_id"]` → no-op, `[]` → set, anything else →
+// loud refusal). If Lance ever relaxes immutability (a re-set becomes a no-op
+// again), this guard goes red — revisit whether that field-guard is still
+// needed, and re-pin docs/dev/lance.md.
+#[tokio::test]
+async fn unenforced_primary_key_is_immutable_once_set() {
+    use lance::datatypes::LANCE_UNENFORCED_PRIMARY_KEY;
+
+    let dir = tempfile::tempdir().unwrap();
+    let uri = dir.path().join("g19.lance");
+    let mut ds = fresh_dataset(uri.to_str().unwrap()).await;
+
+    // Precondition: no unenforced PK yet (mirrors a genuine pre-v0.4.0 manifest).
+    assert!(
+        ds.schema().unenforced_primary_key().is_empty(),
+        "fresh dataset should carry no unenforced primary key"
+    );
+
+    // First set succeeds — the genuine pre-v0.4.0 migration path. (Discard the
+    // returned &Schema so the &mut borrow ends before the next call.)
+    ds.update_field_metadata()
+        .update(
+            "id",
+            [(LANCE_UNENFORCED_PRIMARY_KEY.to_string(), "true".to_string())],
+        )
+        .unwrap()
+        .await
+        .unwrap();
+    let pk: Vec<String> = ds
+        .schema()
+        .unenforced_primary_key()
+        .iter()
+        .map(|field| field.name.clone())
+        .collect();
+    assert_eq!(
+        pk,
+        ["id"],
+        "first set should install `id` as the unenforced PK"
+    );
+
+    // Re-applying the SAME reserved key must still error. Normalize the sync
+    // validation stage (`.update()`) and the async commit stage (`.await`) into
+    // one Result so the actionable diagnostic below fires whichever stage Lance
+    // enforces immutability at — and even if a future Lance relaxes it to `Ok`.
+    // Bare `.unwrap()` / `.unwrap_err()` would instead panic with a generic
+    // message in those cases, defeating the guard's purpose.
+    let outcome: lance::Result<()> = match ds.update_field_metadata().update(
+        "id",
+        [(LANCE_UNENFORCED_PRIMARY_KEY.to_string(), "true".to_string())],
+    ) {
+        Ok(builder) => builder.await.map(|_| ()),
+        Err(e) => Err(e),
+    };
+    assert!(
+        matches!(&outcome, Err(e) if e.to_string().contains("cannot be changed once set")),
+        "Lance no longer rejects re-setting the unenforced PK as immutable \
+         (got: {outcome:?}); immutability relaxed or moved off the commit path \
+         — revisit migrate_v1_to_v2's field-guard and re-pin docs/dev/lance.md."
     );
 }
