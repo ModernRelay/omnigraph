@@ -12,6 +12,13 @@ MR-971 (per-server credential resolver — landed as RFC-007), MR-974 (`omnigrap
 (one-contract/two-implementations posture).
 **Target release:** v0.8.x.
 
+**Re-validated against main** 2026-06-16 (post RFC-009 `omnigraph-api-types`/`GraphClient`,
+RFC-011 cluster-only server, RFC-009 canonical `POST /load`, RFC-012 embeddings): every
+`file:line` and `Reuses` citation below was re-checked against the merged tree; the
+deltas are folded in (cluster-only routing in [§15](#15-routing--reuses-build_app),
+the DTO crate move in [§9](#9-stored-query-projection), `/ingest`→`/load`, and the
+per-query `expose`/`tool_name` deferral in [§17](#17-decisions--rollout)).
+
 **Validated against** (re-checked 2026-06-13): MCP protocol revision **`2025-11-25`**
 (modelcontextprotocol.io), the official Rust SDK **`rmcp 1.7.0`** (crates.io /
 github.com/modelcontextprotocol/rust-sdk), and current tool/security best practice
@@ -249,7 +256,7 @@ the token was verified. Two values are injected into the request extensions by
 middleware that runs **before** the MCP service:
 
 ```rust
-// Reuses — crates/omnigraph-server/src/identity.rs:187
+// Reuses — crates/omnigraph-server/src/identity.rs:186
 pub struct ResolvedActor { pub actor_id: Arc<str>, pub tenant_id: Option<TenantId>, pub scopes: Vec<Scope>, pub source: AuthSource }
 
 // Reuses — crates/omnigraph-server/src/registry.rs:37
@@ -261,10 +268,11 @@ pub struct GraphHandle {
 }
 ```
 
-The middleware order is fixed in `build_app` (`lib.rs:909`): the **outer** layer
-`require_bearer_auth` injects `Extension<ResolvedActor>` (or `401`); the **inner**
-layer `resolve_graph_handle` injects `Extension<Arc<GraphHandle>>`. Both land in
-`request.extensions()`, which rmcp copies into `RequestContext.extensions`.
+The middleware order is fixed in `build_app` (`lib.rs:876`; the two `route_layer`s at
+`lib.rs:929-936`): the **outer** layer `require_bearer_auth` injects
+`Extension<ResolvedActor>` (or `401`); the **inner** layer `resolve_graph_handle`
+injects `Extension<Arc<GraphHandle>>`. Both land in `request.extensions()`, which rmcp
+copies into `RequestContext.extensions`.
 
 ```rust
 // New — crates/omnigraph-server/src/mcp/mod.rs
@@ -310,13 +318,16 @@ must not forward the client's token.
 ## 9. Stored-query projection
 
 The projection source is the same `query_catalog_entry` the `GET /queries` catalog
-uses. Real types:
+uses (`crates/omnigraph-server/src/api.rs:13`). The param/catalog DTOs moved to the
+shared `omnigraph-api-types` crate (RFC-009 Phase 2) and are re-exported through
+`api.rs` (`pub use omnigraph_api_types::*`), so the `Reuses` types below still resolve
+via `omnigraph_server::api::…`. Real types:
 
 ```rust
-// Reuses — crates/omnigraph-server/src/api.rs:346
+// Reuses — crates/omnigraph-api-types/src/lib.rs:355 (re-exported via omnigraph-server/src/api.rs)
 pub enum ParamKind { String, Bool, Int, BigInt, Float, Date, DateTime, Blob, Vector, List }
 
-// Reuses — crates/omnigraph-server/src/api.rs:362
+// Reuses — crates/omnigraph-api-types/src/lib.rs:373
 pub struct ParamDescriptor {
     pub name: String,
     pub kind: ParamKind,
@@ -325,17 +336,24 @@ pub struct ParamDescriptor {
     pub nullable: bool,
 }
 
-// Reuses — crates/omnigraph-server/src/queries.rs:32
+// Reuses — crates/omnigraph-server/src/queries.rs:29
 pub struct StoredQuery { pub name: String, pub source: Arc<str>, pub decl: QueryDecl, pub expose: bool, pub tool_name: Option<String> }
-impl StoredQuery { pub fn is_mutation(&self) -> bool; pub fn effective_tool_name(&self) -> &str; }   // queries.rs:51,60
-pub struct QueryRegistry { /* by_name: BTreeMap<String, StoredQuery>; .lookup(&name) */ }            // queries.rs:67
+impl StoredQuery { pub fn is_mutation(&self) -> bool; pub fn effective_tool_name(&self) -> &str; }   // queries.rs:45,55
+pub struct QueryRegistry { /* by_name: BTreeMap<String, StoredQuery>; .lookup(&name) */ }            // queries.rs:64
 ```
 
-A query is declared in the graph's stored-query registry — `cluster.yaml
-graphs.<id>.queries` with file discovery for cluster/multi-graph servers, or the
-legacy single-graph `omnigraph.yaml queries:` map. Each entry carries MCP metadata
-(`expose: bool`, default `true`; optional `tool_name`); the projection reads the
-loaded `QueryRegistry` on `handle.queries` and is agnostic to the declaration source.
+A query is declared in the cluster's `cluster.yaml graphs.<id>.queries` (a directory
+to discover, an explicit file list, or a `name: { file: … }` map); `cluster apply`
+publishes it to the content-addressed catalog, and the server loads that graph's
+applied registry into `handle.queries` at boot (`settings.rs:71-111`). The
+`StoredQuery` struct carries `expose: bool` and `tool_name: Option<String>`, **but
+cluster boot currently forces `expose: true, tool_name: None` for every applied
+query** (`settings.rs:83-84`, the §D5 bridge — see [§17](#17-decisions--rollout)). So
+today the projection lists every applied query and names each by its query name; the
+`expose`/`tool_name` plumbing is wired but inert until the cluster catalog grows the
+per-query metadata. The projection reads `handle.queries` and is agnostic to the
+declaration source. (The legacy single-graph `omnigraph.yaml queries:` map is removed
+— RFC-011 made the server cluster-only; there is no other declaration source.)
 
 ### 9.1 `ParamDescriptor → JSON Schema` (`New`)
 
@@ -418,7 +436,7 @@ whose `effective_tool_name()` collides with a built-in is skipped (built-ins win
 Each built-in reuses the **exact `PolicyAction` its REST route enforces**:
 
 ```rust
-// Reuses — crates/omnigraph-policy/src/lib.rs:18
+// Reuses — crates/omnigraph-policy/src/lib.rs:16
 pub enum PolicyAction {
     Read, Export, Change, SchemaApply,
     BranchCreate, BranchDelete, BranchMerge,
@@ -478,10 +496,10 @@ direction; `call_tool` is the authoritative gate.
 `call_tool` adds no business logic. Reuse points (all in `handlers.rs`):
 
 ```rust
-pub(crate) enum Authz { Allowed, Denied(String) }                                  // handlers.rs:336
-pub(crate) fn authorize(actor: Option<&ResolvedActor>, policy: Option<&PolicyEngine>, request: PolicyRequest) -> Result<Authz, ApiError>; // :357 — Err = operational 401/500
-pub(crate) async fn run_query(handle: Arc<GraphHandle>, actor: Option<&ResolvedActor>, query: &str, name: Option<&str>, params_json: Option<&Value>, branch: Option<String>, snapshot: Option<String>, reject_mutations: bool) -> Result<(String, ReadTarget, QueryResult), ApiError>; // :731
-pub(crate) async fn run_mutate(state: AppState, handle: Arc<GraphHandle>, actor: Option<&ResolvedActor>, query: &str, name: Option<&str>, params_json: Option<&Value>, branch: String) -> Result<ChangeOutput, ApiError>; // :665
+pub(crate) enum Authz { Allowed, Denied(String) }                                  // handlers.rs:313
+pub(crate) fn authorize(actor: Option<&ResolvedActor>, policy: Option<&PolicyEngine>, request: PolicyRequest) -> Result<Authz, ApiError>; // :334 — Err = operational 401/500
+pub(crate) async fn run_query(handle: Arc<GraphHandle>, actor: Option<&ResolvedActor>, query: &str, name: Option<&str>, params_json: Option<&Value>, branch: Option<String>, snapshot: Option<String>, reject_mutations: bool) -> Result<(String, ReadTarget, QueryResult), ApiError>; // :711
+pub(crate) async fn run_mutate(state: AppState, handle: Arc<GraphHandle>, actor: Option<&ResolvedActor>, query: &str, name: Option<&str>, params_json: Option<&Value>, branch: String) -> Result<ChangeOutput, ApiError>; // :645
 ```
 
 `PolicyRequest` carries `{ action, branch, target_branch }` only — **no actor
@@ -489,11 +507,11 @@ identity** (server-resolved, supplied separately) and **no query-name dimension*
 (the coarse-`invoke_query` caveat):
 
 ```rust
-// Reuses — crates/omnigraph-policy/src/lib.rs:252
+// Reuses — crates/omnigraph-policy/src/lib.rs:251
 pub struct PolicyRequest { pub action: PolicyAction, pub branch: Option<String>, pub target_branch: Option<String> }
 ```
 
-**The stored-query double-gate + deny-masking pattern** (`handlers.rs:933`,
+**The stored-query double-gate + deny-masking pattern** (`handlers.rs:913`,
 `server_invoke_query`) is the contract `call_tool` mirrors for stored queries:
 
 ```rust
@@ -508,15 +526,19 @@ let stored = handle.queries.as_ref().and_then(|r| r.lookup(&name)).ok_or_else(||
 // inner gate runs in run_mutate (Change) / run_query (Read); a stored mutation is double-gated.
 ```
 
-**`graph_load` (NDJSON)** wraps the unified `load_as` (`server_ingest`,
-`handlers.rs:1210`): a missing branch with **no `from` is a `404`, never an implicit
-fork**; `BranchCreate` is consulted only when `from` is present, then `Change` for the
-load. The tool's `input_schema` is `{ data: string, branch?: string, from?: string,
-mode?: "merge"|"append"|"overwrite" }`, `additionalProperties: false`.
+**`graph_load` (NDJSON)** wraps the unified `load_as` via `run_ingest` (the canonical
+`server_load` handler, `handlers.rs:1320`; `POST /ingest` / `server_ingest`,
+`handlers.rs:1360`, is a `#[deprecated]` alias emitting RFC-9745 headers — RFC-009
+Phase 5): a missing branch with **no `from` is a `404`, never an implicit fork**;
+`BranchCreate` is consulted only when `from` is present, then `Change` for the load.
+The tool's `input_schema` is `{ data: string, branch?: string, from?: string,
+mode?: "merge"|"append"|"overwrite" }`, `additionalProperties: false` (the same
+`IngestRequest` shape, `omnigraph-api-types/src/lib.rs:496`).
 
 **Error classification (`New`, one mapper, SEP-1303-aligned).** `ApiError`'s fields are
-private (`lib.rs:296`), so add `pub(crate) fn status_code(&self)`/`message_str(&self)`
-accessors. Then one `classify` is used at every dispatch site:
+private (`lib.rs:280`, and still carry no public status/message accessors), so add
+`pub(crate) fn status_code(&self)`/`message_str(&self)` accessors. Then one `classify`
+is used at every dispatch site:
 
 ```rust
 // New — the single source of truth
@@ -632,31 +654,34 @@ discovery stays REST-only via `GET /graphs` (§15).
 
 ## 15. Routing — `Reuses` `build_app`
 
-`/mcp` is mounted **inside `per_graph_protected`**, so it is flat in single mode and
-nested under `/graphs/{graph_id}` in multi mode automatically:
+`/mcp` is merged **into `per_graph_protected`**, which `build_app` always nests under
+`/graphs/{graph_id}`. RFC-011 made the server **cluster-only** — there is no flat
+single-graph route group and no `match state.routing()`, so `/mcp` is **always**
+`/graphs/{graph_id}/mcp` (even a single-graph boot builds a one-graph registry keyed
+by `default`; `GraphRouting` is now `{ registry, config_path }`):
 
 ```rust
-// Reuses — crates/omnigraph-server/src/lib.rs:915 (abridged)
+// Reuses — crates/omnigraph-server/src/lib.rs:876 (abridged)
 let per_graph_protected = Router::new()
     .route("/snapshot", get(server_snapshot))
-    // … /query /mutate /queries /queries/{name} /schema /schema/apply /ingest /branches /commits …
+    // … /query /mutate /queries /queries/{name} /schema /schema/apply /load /branches /commits …
     .merge(mcp::mcp_router(state.clone()))                       // ← ADD: brings its own tower-http body-limit layer
-    .route_layer(middleware::from_fn_with_state(state.clone(), resolve_graph_handle))  // inner: injects Arc<GraphHandle>
-    .route_layer(middleware::from_fn_with_state(state.clone(), require_bearer_auth));  // outer: injects ResolvedActor / 401
+    .route_layer(middleware::from_fn_with_state(state.clone(), resolve_graph_handle))  // inner: injects Arc<GraphHandle> (lib.rs:929)
+    .route_layer(middleware::from_fn_with_state(state.clone(), require_bearer_auth));  // outer: injects ResolvedActor / 401 (lib.rs:933)
 
 let management = Router::new()
     .route("/graphs", get(server_graphs_list))                  // GraphList — server-scoped, REST-only
     .route_layer(middleware::from_fn_with_state(state.clone(), require_bearer_auth));
 
-let protected = match state.routing() {
-    GraphRouting::Single { .. } => per_graph_protected.merge(management),                 // → POST /mcp
-    GraphRouting::Multi  { .. } => Router::new()
-        .nest("/graphs/{graph_id}", per_graph_protected).merge(management),               // → POST /graphs/{id}/mcp
-};
+// RFC-011 cluster-only: per-graph routes ALWAYS nest under /graphs/{graph_id};
+// there is no flat mode and no routing match. (lib.rs:953)
+let protected = Router::new()
+    .nest("/graphs/{graph_id}", per_graph_protected)            // → POST /graphs/{id}/mcp
+    .merge(management);
 ```
 
 `mcp::mcp_router(state)` is the server's thin wrapper:
-`omnigraph_mcp::mcp_router(OmnigraphMcpBackend::new(state), INGEST_REQUEST_BODY_LIMIT_BYTES /* lib.rs:137, 32 MiB */, host_policy_from_bind(…))`.
+`omnigraph_mcp::mcp_router(OmnigraphMcpBackend::new(state), INGEST_REQUEST_BODY_LIMIT_BYTES /* lib.rs:148, 32 MiB */, host_policy_from_bind(…))`.
 Merging the router (rather than `.route("/mcp", …)`) keeps the `/mcp`-specific body
 limit from leaking onto the other routes.
 
@@ -669,11 +694,12 @@ would live in the `management` group, but is not built speculatively.
 ### 15.1 Multi-graph model
 
 omnigraph's MCP is **per-graph**: one isolated MCP server per graph, with the graph
-identity in the **URL path**, never in tool arguments or output. In multi-graph mode
-the router nests the whole protected group under `/graphs/{graph_id}` (`lib.rs:978`),
-so each `/graphs/{id}/mcp` endpoint's `initialize` / `tools/list` / `tools/call` /
-`resources/*` operate only on that graph and can never list or touch another graph's
-tools.
+identity in the **URL path**, never in tool arguments or output. The server is
+cluster-only (RFC-011), so the router **always** nests the whole protected group under
+`/graphs/{graph_id}` (`lib.rs:954`) — this per-graph model is now the only model, not a
+multi-mode special case. Each `/graphs/{id}/mcp` endpoint's `initialize` / `tools/list`
+/ `tools/call` / `resources/*` operate only on that graph and can never list or touch
+another graph's tools.
 
 - **Discovery is REST-only, not an MCP tool.** `graphs_list` / `omnigraph://graphs`
   are deliberately absent from MCP. Which graphs exist is answered by `GET /graphs`
@@ -766,9 +792,16 @@ actor, validated per-request, never passed through.
 **Open / deferred:**
 - **OAuth 2.1 + RFC 9728 (MR-956)** — additive Phase 2; PRM advertisement config-gated
   (issue #59467).
+- **Per-query `expose` / `tool_name` (cluster Phase 6, the §D5 bridge)** — the
+  `StoredQuery` fields exist and the projection already reads them, but cluster boot
+  forces `expose: true, tool_name: None` for every applied query (`settings.rs:83-84`),
+  so today every applied query is listed and named by its query name. Per-query
+  exposure/naming controls (`mcp.expose`, `tool_name`) land when the cluster catalog
+  grows the metadata — no projection change is then needed.
 - **Per-query `invoke_query` scope (PR 0b)** — add a query-name dimension to
   `PolicyRequest` + the Cedar schema so an actor can be scoped to *specific* stored
-  queries. Until then curation is graph-level (registry membership + `expose`).
+  queries. Until then curation is graph-level (registry membership; `expose` once
+  Phase 6 lands).
 - **`tools/list_changed`** — only if the registry gains runtime reload.
 - **stdio → proxy collapse** — the local stdio package degrades to a stdio↔HTTP proxy
   over `/mcp` once this surface is GA, leaving one tool set and one Cedar gate, the
