@@ -390,7 +390,7 @@ omnigraph-server --cluster company-brain --bind 0.0.0.0:8080
 ```
 
 `--cluster <dir>` is an **exclusive boot source** (axiom 15): it cannot
-combine with a graph URI, `--target`, or `--config`, and in this mode
+combine with a graph URI or `--config`, and in this mode
 `omnigraph.yaml` is never read — not for graphs, not for queries, not for
 policies. The server serves the **applied revision**: graph roots recorded in
 `state.json`, stored-query and policy content from the content-addressed
