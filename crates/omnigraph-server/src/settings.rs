@@ -578,6 +578,7 @@ mod tests {
                         .to_string_lossy()
                         .into_owned(),
                     policy: None,
+                    embedding: None,
                     queries: crate::queries::QueryRegistry::default(),
                 }],
                 config_path: temp.path().join("cluster"),
