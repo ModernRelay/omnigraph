@@ -640,6 +640,10 @@ fn local_cli_s3_end_to_end_init_load_read_flow() {
             .arg("load")
             .arg("--mode")
             .arg("overwrite")
+            // `--yes` clears the RFC-011 Decision 9 destructive-write
+            // confirmation: `--mode overwrite` against a non-local (s3://)
+            // target is refused without it.
+            .arg("--yes")
             .arg("--data")
             .arg(fixture("test.jsonl"))
             .arg(&graph_uri),
