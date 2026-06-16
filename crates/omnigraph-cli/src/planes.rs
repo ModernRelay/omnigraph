@@ -98,13 +98,11 @@ pub(crate) fn command_capability(cmd: &Command) -> Capability {
 /// The plane a subcommand belongs to. Exhaustive — a new `Command` variant
 /// will not compile until classified. Descends into the nested enums where
 /// the plane differs per subcommand (`schema plan` is storage while `schema
-/// show`/`apply` are data; `queries validate` opens the graph while `queries
-/// list` only reads config).
+/// show`/`apply` are data; `queries`/`policy` read cluster applied state).
 pub(crate) fn command_plane(cmd: &Command) -> Plane {
     match cmd {
         Command::Query { .. }
         | Command::Mutate { .. }
-        | Command::Alias { .. }
         | Command::Load { .. }
         | Command::Ingest { .. }
         | Command::Branch { .. }
@@ -129,7 +127,8 @@ pub(crate) fn command_plane(cmd: &Command) -> Plane {
         | Command::Cleanup { .. }
         | Command::Lint { .. } => Plane::Storage,
         Command::Cluster { .. } => Plane::Control,
-        Command::Embed(_)
+        Command::Alias { .. }
+        | Command::Embed(_)
         | Command::Login { .. }
         | Command::Logout { .. }
         | Command::Profile { .. }
@@ -175,12 +174,13 @@ pub(crate) fn command_label(cmd: &Command) -> &'static str {
     }
 }
 
-/// The verbs that address an existing graph through a cluster scope
-/// (`--cluster <root> --graph <id>`): the storage-maintenance commands.
-/// `init` is storage-plane too but *creates* a graph (cluster graphs are born
-/// from `cluster apply`, not `init`), and `schema plan` / `lint` take a
-/// positional URI — none consume cluster addressing, so the guard rejects
-/// `--cluster`/`--graph` on them rather than silently dropping the flag.
+/// The verbs that consume a cluster scope. Maintenance/lint select a graph with
+/// `--cluster <root> --graph <id>`; policy/queries inspect the cluster's
+/// applied control-plane state and may optionally use `--graph` to select one
+/// bundle/registry. `init` is storage-plane too but *creates* a graph (cluster
+/// graphs are born from `cluster apply`, not `init`), and `schema plan` takes a
+/// positional URI, so the guard rejects `--cluster`/`--graph` there rather than
+/// silently dropping the flag.
 pub(crate) fn accepts_cluster_addressing(cmd: &Command) -> bool {
     matches!(
         cmd,
@@ -201,12 +201,43 @@ pub(crate) fn accepts_cluster_addressing(cmd: &Command) -> bool {
 /// Reject a scope-addressing flag (`--server`/`--cluster`/`--graph`) on a verb
 /// that cannot consume it, rather than silently dropping it (the old behavior:
 /// e.g. `optimize --server prod` dropped `--server` and failed later with an
-/// unrelated message). Each flag has a distinct valid surface:
+/// unrelated message). `alias` gets an extra guard because its binding owns all
+/// addressing and several ignored globals sit outside this three-flag guard.
+/// Each flag has a distinct valid surface:
 /// - `--server` → served-graph scopes (`any`/`served`);
-/// - `--cluster` → the cluster-maintenance verbs (optimize/repair/cleanup);
+/// - `--cluster` → cluster-scoped direct/control verbs;
 /// - `--graph` → any multi-graph scope: a served scope *or* a cluster one.
 /// RFC-010 Slice 1, generalized for RFC-011 cluster addressing.
 pub(crate) fn guard_addressing(cli: &Cli) -> Result<()> {
+    if let Command::Alias { .. } = &cli.command {
+        let mut flags = Vec::new();
+        if cli.server.is_some() {
+            flags.push("--server");
+        }
+        if cli.graph.is_some() {
+            flags.push("--graph");
+        }
+        if cli.store.is_some() {
+            flags.push("--store");
+        }
+        if cli.cluster.is_some() {
+            flags.push("--cluster");
+        }
+        if cli.profile.is_some() {
+            flags.push("--profile");
+        }
+        if cli.as_actor.is_some() {
+            flags.push("--as");
+        }
+        if !flags.is_empty() {
+            bail!(
+                "`alias` uses the server, graph, and stored query declared in \
+                 `aliases.<name>` in ~/.omnigraph/config.yaml; remove global scope \
+                 flag(s): {}",
+                flags.join(", ")
+            );
+        }
+    }
     if cli.server.is_none() && cli.cluster.is_none() && cli.graph.is_none() {
         return Ok(());
     }
@@ -223,8 +254,8 @@ pub(crate) fn guard_addressing(cli: &Cli) -> Result<()> {
     }
     if cli.cluster.is_some() && !cluster_ok {
         bail!(
-            "`{label}` is a {} command; --cluster addresses a cluster-managed graph for \
-             maintenance (optimize/repair/cleanup) and does not apply.{}",
+            "`{label}` is a {} command; --cluster addresses a cluster-scoped command \
+             and does not apply.{}",
             capability.describe(),
             remediation(capability, &cli.command),
         );
@@ -253,7 +284,15 @@ fn remediation(capability: Capability, cmd: &Command) -> &'static str {
             }
             _ => " Pass a storage URI.",
         },
-        Capability::Control => " It operates on a cluster (pass --config <dir>).",
+        Capability::Control => match cmd {
+            Command::Cluster { .. } => {
+                " It operates on a cluster config directory (pass --config <dir>)."
+            }
+            Command::Policy { .. } | Command::Queries { .. } => {
+                " It operates on a cluster (pass --cluster <dir|uri>, or select a cluster profile)."
+            }
+            _ => " It operates on a cluster.",
+        },
         Capability::Local => " It does not address a graph.",
         Capability::Any | Capability::Served => "",
     }
@@ -286,6 +325,7 @@ mod tests {
         // The one Data→Served refinement — if the `graphs` guard were deleted,
         // every other assertion here would still pass.
         assert_eq!(cap(&["omnigraph", "graphs", "list"]), Capability::Served);
+        assert_eq!(cap(&["omnigraph", "alias", "who"]), Capability::Local);
         assert_eq!(cap(&["omnigraph", "optimize", "graph.omni"]), Capability::Direct);
         assert_eq!(cap(&["omnigraph", "schema", "plan", "--schema", "s.pg", "graph.omni"]), Capability::Direct);
         assert_eq!(cap(&["omnigraph", "cluster", "status", "--config", "."]), Capability::Control);

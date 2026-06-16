@@ -8,6 +8,7 @@ use super::*;
 pub struct ServingGraph {
     pub graph_id: String,
     pub root: PathBuf,
+    pub embedding: Option<EmbeddingProviderConfig>,
 }
 
 /// One stored query: its graph binding, registry name, and verified source.
@@ -225,15 +226,73 @@ async fn read_snapshot_with_store(
         return Err(diagnostics);
     };
 
+    let mut embedding_profiles: BTreeMap<String, EmbeddingProviderConfig> = BTreeMap::new();
+    for (address, entry) in &state.applied_revision.resources {
+        if !matches!(resource_kind(address), ResourceKind::EmbeddingProvider(_)) {
+            continue;
+        }
+        let Some(profile) = entry.embedding_profile.clone() else {
+            diagnostics.push(Diagnostic::error(
+                "embedding_provider_profile_missing",
+                address.clone(),
+                "no applied embedding provider profile recorded; re-run `cluster apply` to backfill",
+            ));
+            continue;
+        };
+        let actual_digest = embedding_provider_digest(&profile);
+        if actual_digest != entry.digest {
+            diagnostics.push(Diagnostic::error(
+                "embedding_provider_digest_mismatch",
+                address.clone(),
+                format!(
+                    "applied embedding provider profile does not match its recorded digest (actual sha256:{actual_digest}); run `cluster refresh` then `cluster apply`, and restart"
+                ),
+            ));
+            continue;
+        }
+        embedding_profiles.insert(address.clone(), profile);
+    }
+
     let mut graphs = Vec::new();
     let mut queries = Vec::new();
     let mut policies = Vec::new();
     for (address, entry) in &state.applied_revision.resources {
         match resource_kind(address) {
             ResourceKind::Graph(graph_id) => {
+                let embedding = match entry.embedding_provider.as_deref() {
+                    Some(provider_address) => match resource_kind(provider_address) {
+                        ResourceKind::EmbeddingProvider(_) => {
+                            match embedding_profiles.get(provider_address) {
+                                Some(profile) => Some(profile.clone()),
+                                None => {
+                                    diagnostics.push(Diagnostic::error(
+                                        "embedding_provider_missing",
+                                        address.clone(),
+                                        format!(
+                                            "graph references `{provider_address}`, but no applied embedding provider profile is available; re-run `cluster apply`"
+                                        ),
+                                    ));
+                                    None
+                                }
+                            }
+                        }
+                        _ => {
+                            diagnostics.push(Diagnostic::error(
+                                "wrong_kind_reference",
+                                address.clone(),
+                                format!(
+                                    "graph embedding_provider expects `provider.embedding.<name>`, got `{provider_address}`"
+                                ),
+                            ));
+                            None
+                        }
+                    },
+                    None => None,
+                };
                 graphs.push(ServingGraph {
                     root: PathBuf::from(backend.graph_root(&graph_id)),
                     graph_id,
+                    embedding,
                 });
             }
             ResourceKind::Schema(_) => {}
@@ -241,7 +300,10 @@ async fn read_snapshot_with_store(
                 let ResourceKind::Query { graph, name } = &kind else {
                     unreachable!()
                 };
-                match backend.read_verified_payload(&kind, &entry.digest, address).await {
+                match backend
+                    .read_verified_payload(&kind, &entry.digest, address)
+                    .await
+                {
                     Ok(source) => queries.push(ServingQuery {
                         graph_id: graph.clone(),
                         name: name.clone(),
@@ -262,7 +324,10 @@ async fn read_snapshot_with_store(
                     ));
                     continue;
                 };
-                match backend.read_verified_payload(&kind, &entry.digest, address).await {
+                match backend
+                    .read_verified_payload(&kind, &entry.digest, address)
+                    .await
+                {
                     Ok(source) => policies.push(ServingPolicy {
                         name: name.clone(),
                         source,
@@ -271,6 +336,7 @@ async fn read_snapshot_with_store(
                     Err(diagnostic) => diagnostics.push(diagnostic),
                 }
             }
+            ResourceKind::EmbeddingProvider(_) => {}
             ResourceKind::Unknown => {}
         }
     }
@@ -338,4 +404,3 @@ mod tests {
         );
     }
 }
-

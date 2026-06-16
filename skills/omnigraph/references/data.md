@@ -105,19 +105,19 @@ Branches exist for **data review**, not schema changes. Schema goes straight to 
 REPO=s3://my-bucket/repos/spike-intel
 
 # 1. Create feature branch from main
-omnigraph branch create --from main staging-2026-04-14 $REPO
+omnigraph branch create --from main staging-2026-04-14 --store $REPO
 
 # 2. Load delta onto the branch (merge mode is typical for review)
 omnigraph load --data delta.jsonl --branch staging-2026-04-14 --mode merge $REPO
 
 # 3. Verify on the branch (reads can target --branch or --snapshot)
-omnigraph query recent_signals --query queries/signals.gq --branch staging-2026-04-14
+omnigraph query recent_signals --query queries/signals.gq --branch staging-2026-04-14 --store $REPO
 
 # 4. Merge to main when happy
-omnigraph branch merge staging-2026-04-14 --into main $REPO
+omnigraph branch merge staging-2026-04-14 --into main --store $REPO
 
 # 5. Optionally delete the branch
-omnigraph branch delete staging-2026-04-14 $REPO
+omnigraph branch delete staging-2026-04-14 --store $REPO
 ```
 
 ### Fork a branch in one shot with `--from`
@@ -143,16 +143,16 @@ For any bulk load that could disrupt downstream queries (overwriting a heavily-r
 omnigraph load --data risky.jsonl --branch recovery-2026-04-14 \
   --from main --mode overwrite $REPO
 # inspect, diff, verify reads
-omnigraph branch merge recovery-2026-04-14 --into main $REPO
+omnigraph branch merge recovery-2026-04-14 --into main --store $REPO
 ```
 
 ## Branch Commands (quick reference)
 
 ```bash
-omnigraph branch create --from main <branch-name> $REPO
-omnigraph branch list $REPO
-omnigraph branch merge <branch-name> --into main $REPO
-omnigraph branch delete <branch-name> $REPO
+omnigraph branch create --from main <branch-name> --store $REPO
+omnigraph branch list --store $REPO
+omnigraph branch merge <branch-name> --into main --store $REPO
+omnigraph branch delete <branch-name> --store $REPO
 ```
 
 All support `--json` for automation-friendly output. Address the graph with a

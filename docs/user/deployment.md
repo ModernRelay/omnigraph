@@ -161,7 +161,7 @@ cluster on the bucket and serve it config-free:
 omnigraph cluster validate --config .
 omnigraph cluster import   --config .
 omnigraph cluster apply    --config . --as you
-omnigraph load --data seed.jsonl --mode overwrite \
+omnigraph load --data seed.jsonl --mode merge \
   s3://omnigraph-local/clusters/demo/graphs/demo.omni
 omnigraph-server --cluster s3://omnigraph-local/clusters/demo \
   --bind 127.0.0.1:8080 --unauthenticated

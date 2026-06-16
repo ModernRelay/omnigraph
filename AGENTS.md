@@ -80,7 +80,7 @@ Full diagram and concurrency model: [docs/dev/architecture.md](docs/dev/architec
 | Mutations — insert/update/delete, D2, atomicity | [docs/user/mutations/index.md](docs/user/mutations/index.md) |
 | Search funcs (`nearest`/`bm25`/`rrf`), hybrid ranking | [docs/user/search/index.md](docs/user/search/index.md) |
 | Indexes (BTREE / inverted / vector / graph topology) | [docs/user/search/indexes.md](docs/user/search/indexes.md) |
-| Embeddings (compiler + engine clients, env vars, `@embed`) | [docs/user/search/embeddings.md](docs/user/search/embeddings.md) |
+| Embeddings (engine client, env vars, `@embed`) | [docs/user/search/embeddings.md](docs/user/search/embeddings.md) |
 | Concepts — what OmniGraph is, L1/L2 framing | [docs/user/concepts/index.md](docs/user/concepts/index.md) |
 | Quickstart — init → load → query → branch | [docs/user/quickstart.md](docs/user/quickstart.md) |
 | Branches, commit graph, system branches | [docs/user/branching/index.md](docs/user/branching/index.md) |
@@ -100,7 +100,7 @@ Full diagram and concurrency model: [docs/dev/architecture.md](docs/dev/architec
 | Audit / actor tracking | [docs/user/operations/audit.md](docs/user/operations/audit.md) |
 | Error taxonomy and result serialization | [docs/user/operations/errors.md](docs/user/operations/errors.md) |
 | Install (binary / Homebrew / source / channels) | [docs/user/install.md](docs/user/install.md) |
-| Deployment (binary / container / RustFS bootstrap / auth / build variants) | [docs/user/deployment.md](docs/user/deployment.md) |
+| Deployment (binary / container / S3-local testing / auth / build variants) | [docs/user/deployment.md](docs/user/deployment.md) |
 | CI / release workflows | [docs/dev/ci.md](docs/dev/ci.md) |
 | Code ownership (CODEOWNERS source of truth, roles, regeneration) | [docs/dev/codeowners.md](docs/dev/codeowners.md) |
 | Branch protection policy (declarative, applied via `scripts/apply-branch-protection.sh`) | [docs/dev/branch-protection.md](docs/dev/branch-protection.md) |
@@ -180,7 +180,7 @@ Rust stable workspace (edition 2024). `protoc` is a build dependency (`brew inst
 cargo build --workspace --locked              # build everything
 cargo test  --workspace --locked              # the canonical CI gate (matches CI exactly)
 cargo run -p omnigraph-cli -- <args>          # run the `omnigraph` CLI from source
-cargo run -p omnigraph-server -- <uri> --bind 0.0.0.0:8080   # run the server from source
+cargo run -p omnigraph-server -- --cluster <dir|s3://...> --bind 0.0.0.0:8080   # run the server from source
 
 # Run one crate / one test file / one test fn
 cargo test -p omnigraph-engine --test traversal           # one integration-test file (see docs/dev/testing.md)
@@ -210,9 +210,9 @@ omnigraph load --data ./seed.jsonl --mode overwrite s3://my-bucket/graph.omni
 # Load a review batch onto its own branch (--from forks it if missing)
 omnigraph load --branch review/2026-04-25 --from main --mode merge --data ./batch.jsonl s3://my-bucket/graph.omni
 
-# Run a hybrid (vector + BM25) query
-omnigraph read --query ./queries.gq --name find_similar \
-  --params '{"q":"trends in AI safety"}' --format table s3://my-bucket/graph.omni
+# Run a hybrid (vector + BM25) query — ad-hoc .gq against a store (positional = query name)
+omnigraph query --query ./queries.gq find_similar \
+  --params '{"q":"trends in AI safety"}' --format table --store s3://my-bucket/graph.omni
 
 # Plan + apply schema migration
 omnigraph schema plan  --schema ./next.pg s3://my-bucket/graph.omni
@@ -232,10 +232,10 @@ omnigraph cleanup  --keep 10 --older-than 7d --confirm s3://my-bucket/graph.omni
 
 # Stand up the HTTP server (token from env)
 OMNIGRAPH_SERVER_BEARER_TOKEN=xxxx \
-  omnigraph-server s3://my-bucket/graph.omni --bind 0.0.0.0:8080
+  omnigraph-server --cluster s3://my-bucket/cluster --bind 0.0.0.0:8080
 
 # Cedar policy explain
-omnigraph policy explain --actor act-alice --action change --branch main
+omnigraph policy explain --cluster ./company-brain --graph knowledge --actor act-alice --action change --branch main
 ```
 
 ---

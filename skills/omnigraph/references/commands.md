@@ -42,10 +42,10 @@ omnigraph export $REPO --branch main --type Signal > signals.jsonl
 ## Branches
 
 ```bash
-omnigraph branch create --from main <branch-name> $REPO
-omnigraph branch list $REPO
-omnigraph branch merge <branch-name> --into main $REPO
-omnigraph branch delete <branch-name> $REPO
+omnigraph branch create --from main <branch-name> --store $REPO
+omnigraph branch list --store $REPO
+omnigraph branch merge <branch-name> --into main --store $REPO
+omnigraph branch delete <branch-name> --store $REPO
 ```
 
 All support `--json`.

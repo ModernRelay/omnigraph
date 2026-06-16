@@ -59,10 +59,11 @@ omnigraph commit show --uri graph.omni <commit-id> --json
 
 ## Remote Server Mode
 
-Serve a graph:
+Serve a cluster-applied graph:
 
 ```bash
-omnigraph-server graph.omni --bind 127.0.0.1:8080
+omnigraph cluster apply --config ./company-brain
+omnigraph-server --cluster ./company-brain --bind 127.0.0.1:8080
 ```
 
 Read through the HTTP API — invoke a stored query by name from the catalog:

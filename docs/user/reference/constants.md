@@ -19,11 +19,13 @@
 | Expand mode override | `OMNIGRAPH_TRAVERSAL_MODE` (`indexed`\|`csr`; unset = cost-based auto) | traversal |
 | Default body limit | `1 MB` | HTTP server |
 | Ingest body limit | `32 MB` | HTTP server |
-| Engine embed model | `gemini-embedding-2-preview` | engine embedding |
-| Compiler embed model | `text-embedding-3-small` | compiler embedding |
-| Embed timeout | `30 000 ms` | both clients |
-| Embed retries | `4` | both clients |
-| Embed retry backoff | `200 ms` | both clients |
+| Default embed provider/model | `openai-compatible` / `openai/text-embedding-3-large` | engine embedding |
+| OpenAI-direct embed model | `text-embedding-3-large` | engine embedding |
+| Gemini-direct embed model | `gemini-embedding-2` | engine embedding |
+| Embed deadline | `OMNIGRAPH_EMBED_DEADLINE_MS=60000` | engine embedding |
+| Embed timeout | `OMNIGRAPH_EMBED_TIMEOUT_MS=30000` | engine embedding |
+| Embed retries | `OMNIGRAPH_EMBED_RETRY_ATTEMPTS=4` | engine embedding |
+| Embed retry backoff | `OMNIGRAPH_EMBED_RETRY_BACKOFF_MS=200` | engine embedding |
 | LANCE memory pool default | `1 GB` (raised in v0.3.0) | runtime |
 
 **Expand traversal dispatch.** With `OMNIGRAPH_TRAVERSAL_MODE` unset, the engine

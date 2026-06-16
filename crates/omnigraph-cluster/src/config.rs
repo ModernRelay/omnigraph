@@ -42,7 +42,12 @@ pub(crate) fn resolve_query_decls(
             return (
                 map.iter()
                     .map(|(name, config)| {
-                        (name.clone(), QueryConfig { file: config.file.clone() })
+                        (
+                            name.clone(),
+                            QueryConfig {
+                                file: config.file.clone(),
+                            },
+                        )
                     })
                     .collect(),
                 BTreeMap::new(),
@@ -66,7 +71,10 @@ pub(crate) fn resolve_query_decls(
                     diagnostics.push(Diagnostic::error(
                         "query_dir_unreadable",
                         format!("graphs.{graph_id}.queries"),
-                        format!("could not list query directory '{}': {err}", resolved.display()),
+                        format!(
+                            "could not list query directory '{}': {err}",
+                            resolved.display()
+                        ),
                     ));
                     continue;
                 }
@@ -76,7 +84,10 @@ pub(crate) fn resolve_query_decls(
                 diagnostics.push(Diagnostic::warning(
                     "query_dir_empty",
                     format!("graphs.{graph_id}.queries"),
-                    format!("query directory '{}' contains no .gq files", resolved.display()),
+                    format!(
+                        "query directory '{}' contains no .gq files",
+                        resolved.display()
+                    ),
                 ));
             }
             for path in entries {
@@ -132,7 +143,12 @@ pub(crate) fn resolve_query_decls(
                 continue;
             }
             origin.insert(name.clone(), declared.clone());
-            registry.insert(name, QueryConfig { file: declared.clone() });
+            registry.insert(
+                name,
+                QueryConfig {
+                    file: declared.clone(),
+                },
+            );
         }
         contents.insert(declared, source);
     }
@@ -269,8 +285,6 @@ pub(crate) fn validate_cluster_header(
     }
 }
 
-
-
 pub(crate) fn state_resource_digests(state: &ClusterState) -> BTreeMap<String, String> {
     state
         .applied_revision
@@ -294,7 +308,6 @@ pub(crate) fn initial_import_state(desired: &DesiredCluster) -> ClusterState {
         observations: BTreeMap::new(),
     }
 }
-
 
 pub(crate) async fn observe_declared_graphs(
     desired: &DesiredCluster,
@@ -350,19 +363,28 @@ pub(crate) async fn observe_declared_graphs(
                     StateResource {
                         digest: observation.schema_digest.clone(),
                         applies_to: None,
+                        embedding_provider: None,
+                        embedding_profile: None,
                     },
                 );
                 let query_digests = state_query_digests_for_graph(state, &graph.id);
+                let embedding_provider = state_graph_embedding_provider(state, &graph.id);
+                let embedding_provider_digest =
+                    state_embedding_provider_digest(state, embedding_provider.as_deref());
                 let graph_digest_value = graph_digest(
                     &graph.id,
                     Some(&observation.schema_digest),
                     Some(&query_digests),
+                    embedding_provider.as_deref(),
+                    embedding_provider_digest.as_ref(),
                 );
                 state.applied_revision.resources.insert(
                     graph_address.clone(),
                     StateResource {
                         digest: graph_digest_value,
                         applies_to: None,
+                        embedding_provider,
+                        embedding_profile: None,
                     },
                 );
                 state.observations.insert(
@@ -499,7 +521,6 @@ pub(crate) fn graph_observation_json(observation: GraphObservationJson<'_>) -> s
     })
 }
 
-
 pub(crate) fn load_desired(config_dir: &Path) -> LoadOutcome {
     let parsed = parse_cluster_config(config_dir);
     let config_dir = parsed.config_dir;
@@ -519,6 +540,35 @@ pub(crate) fn load_desired(config_dir: &Path) -> LoadOutcome {
     let mut dependencies = BTreeSet::new();
     let mut graph_query_digests: BTreeMap<String, BTreeMap<String, String>> = BTreeMap::new();
     let mut graph_schema_digests: BTreeMap<String, String> = BTreeMap::new();
+    let mut graph_embedding_providers: BTreeMap<String, String> = BTreeMap::new();
+    let mut embedding_provider_digests: BTreeMap<String, String> = BTreeMap::new();
+    let mut embedding_providers: BTreeMap<String, EmbeddingProviderConfig> = BTreeMap::new();
+
+    for (provider_name, profile) in &raw.providers.embedding {
+        validate_id(
+            "embedding provider name",
+            &format!("providers.embedding.{provider_name}"),
+            provider_name,
+            &mut diagnostics,
+        );
+        let address = embedding_provider_address(provider_name);
+        profile.validate(
+            format!("providers.embedding.{provider_name}"),
+            &mut diagnostics,
+        );
+        let digest = embedding_provider_digest(profile);
+        embedding_provider_digests.insert(address.clone(), digest.clone());
+        embedding_providers.insert(address.clone(), profile.clone());
+        resources.insert(
+            address.clone(),
+            ResourceSummary {
+                address,
+                kind: "embedding_provider".to_string(),
+                digest,
+                path: None,
+            },
+        );
+    }
 
     for (graph_id, graph) in &raw.graphs {
         validate_id(
@@ -533,6 +583,35 @@ pub(crate) fn load_desired(config_dir: &Path) -> LoadOutcome {
             from: schema_address.clone(),
             to: graph_address.clone(),
         });
+        if let Some(provider_ref) = graph.embedding_provider.as_deref() {
+            match normalize_embedding_provider_target(provider_ref) {
+                EmbeddingProviderTarget::Provider(provider_name) => {
+                    let provider_address = embedding_provider_address(&provider_name);
+                    if raw.providers.embedding.contains_key(&provider_name) {
+                        dependencies.insert(Dependency {
+                            from: graph_address.clone(),
+                            to: provider_address.clone(),
+                        });
+                        graph_embedding_providers.insert(graph_id.clone(), provider_address);
+                    } else {
+                        diagnostics.push(Diagnostic::error(
+                            "dangling_embedding_provider_reference",
+                            format!("graphs.{graph_id}.embedding_provider"),
+                            format!(
+                                "graph references embedding provider `{provider_name}`, but no providers.embedding.{provider_name} profile is declared"
+                            ),
+                        ));
+                    }
+                }
+                EmbeddingProviderTarget::WrongKind(kind) => diagnostics.push(Diagnostic::error(
+                    "wrong_kind_reference",
+                    format!("graphs.{graph_id}.embedding_provider"),
+                    format!(
+                        "embedding_provider expects a providers.embedding ref or bare provider name, got `{kind}`"
+                    ),
+                )),
+            }
+        }
 
         let schema_path = resolve_config_path(&config_dir, &graph.schema);
         let schema_source = match fs::read_to_string(&schema_path) {
@@ -646,10 +725,15 @@ pub(crate) fn load_desired(config_dir: &Path) -> LoadOutcome {
     }
 
     for graph_id in raw.graphs.keys() {
+        let embedding_provider = graph_embedding_providers.get(graph_id);
+        let embedding_provider_digest =
+            embedding_provider.and_then(|address| embedding_provider_digests.get(address));
         let digest = graph_digest(
             graph_id,
             graph_schema_digests.get(graph_id),
             graph_query_digests.get(graph_id),
+            embedding_provider.map(String::as_str),
+            embedding_provider_digest,
         );
         resources.insert(
             graph_address(graph_id),
@@ -754,6 +838,7 @@ pub(crate) fn load_desired(config_dir: &Path) -> LoadOutcome {
                 .get(graph_id)
                 .cloned()
                 .unwrap_or_default(),
+            embedding_provider: graph_embedding_providers.get(graph_id).cloned(),
         })
         .collect();
     let config_digest = desired_config_digest(&raw, &resource_digests);
@@ -769,6 +854,7 @@ pub(crate) fn load_desired(config_dir: &Path) -> LoadOutcome {
             resources: resource_list,
             dependencies,
             policy_bindings,
+            embedding_providers,
         }),
         diagnostics,
         config_dir,
@@ -828,7 +914,6 @@ pub(crate) fn future_field_diagnostics(text: &str) -> Vec<Diagnostic> {
     let future_fields = [
         "apply",
         "env_file",
-        "providers",
         "pipelines",
         "embeddings",
         "ui",
@@ -882,6 +967,21 @@ pub(crate) fn normalize_policy_target(value: &str) -> PolicyTarget {
     }
 }
 
+enum EmbeddingProviderTarget {
+    Provider(String),
+    WrongKind(String),
+}
+
+fn normalize_embedding_provider_target(value: &str) -> EmbeddingProviderTarget {
+    if let Some(name) = value.strip_prefix("provider.embedding.") {
+        EmbeddingProviderTarget::Provider(name.to_string())
+    } else if value.contains('.') {
+        EmbeddingProviderTarget::WrongKind(value.to_string())
+    } else {
+        EmbeddingProviderTarget::Provider(value.to_string())
+    }
+}
+
 pub(crate) fn graph_address(graph_id: &str) -> String {
     format!("graph.{graph_id}")
 }
@@ -896,6 +996,10 @@ pub(crate) fn query_address(graph_id: &str, query_name: &str) -> String {
 
 pub(crate) fn policy_address(policy_name: &str) -> String {
     format!("policy.{policy_name}")
+}
+
+pub(crate) fn embedding_provider_address(provider_name: &str) -> String {
+    format!("provider.embedding.{provider_name}")
 }
 
 pub(crate) fn resolve_config_path(config_dir: &Path, path: &Path) -> PathBuf {

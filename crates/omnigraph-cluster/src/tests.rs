@@ -56,6 +56,39 @@ policies:
         dir
     }
 
+    fn write_mock_embedding_cluster(config_dir: &Path, model: &str) {
+        fs::write(
+            config_dir.join(CLUSTER_CONFIG_FILE),
+            format!(
+                r#"
+version: 1
+metadata:
+  name: test
+state:
+  backend: cluster
+  lock: true
+providers:
+  embedding:
+    default:
+      kind: mock
+      model: {model}
+graphs:
+  knowledge:
+    schema: ./people.pg
+    embedding_provider: default
+    queries:
+      find_person:
+        file: ./people.gq
+policies:
+  base:
+    file: ./base.policy.yaml
+    applies_to: [knowledge]
+"#
+            ),
+        )
+        .unwrap();
+    }
+
     async fn init_derived_graph(root: &Path) {
         let graph_dir = root.join(CLUSTER_GRAPHS_DIR);
         fs::create_dir_all(&graph_dir).unwrap();
@@ -192,6 +225,95 @@ policies:
         let codes: BTreeSet<_> = out.diagnostics.iter().map(|d| d.code.as_str()).collect();
         assert!(codes.contains("wrong_kind_reference"));
         assert!(codes.contains("dangling_graph_reference"));
+    }
+
+    #[test]
+    fn embedding_provider_config_accepts_provider_resources_and_graph_refs() {
+        let dir = fixture();
+        write_mock_embedding_cluster(dir.path(), "recorded-x");
+
+        let out = validate_config_dir(dir.path());
+        assert!(out.ok, "{:?}", out.diagnostics);
+        let provider_digest = out
+            .resource_digests
+            .get("provider.embedding.default")
+            .expect("provider resource digest");
+        assert!(
+            out.resources
+                .iter()
+                .any(|resource| resource.address == "provider.embedding.default"
+                    && resource.kind == "embedding_provider"
+                    && resource.path.is_none())
+        );
+        assert!(
+            out.dependencies
+                .iter()
+                .any(|dep| dep.from == "graph.knowledge" && dep.to == "provider.embedding.default"),
+            "{:?}",
+            out.dependencies
+        );
+        let schema_digest = out.resource_digests.get("schema.knowledge").unwrap();
+        let query_digest = out
+            .resource_digests
+            .get("query.knowledge.find_person")
+            .unwrap();
+        let expected_graph_digest = graph_digest(
+            "knowledge",
+            Some(schema_digest),
+            Some(
+                &[("find_person".to_string(), query_digest.clone())]
+                    .into_iter()
+                    .collect(),
+            ),
+            Some("provider.embedding.default"),
+            Some(provider_digest),
+        );
+        assert_eq!(
+            out.resource_digests["graph.knowledge"],
+            expected_graph_digest
+        );
+    }
+
+    #[test]
+    fn embedding_provider_config_rejects_bad_refs_and_inline_secrets() {
+        let dir = fixture();
+        fs::write(
+            dir.path().join(CLUSTER_CONFIG_FILE),
+            r#"
+version: 1
+providers:
+  embedding:
+    default:
+      kind: openai-compatible
+      api_key: sk-inline
+graphs:
+  knowledge:
+    schema: ./people.pg
+    embedding_provider: provider.policy.default
+  missing_provider:
+    schema: ./people.pg
+    embedding_provider: absent
+"#,
+        )
+        .unwrap();
+        let out = validate_config_dir(dir.path());
+        assert!(!out.ok);
+        let codes: BTreeSet<_> = out.diagnostics.iter().map(|d| d.code.as_str()).collect();
+        assert!(
+            codes.contains("embedding_api_key_inline"),
+            "{:?}",
+            out.diagnostics
+        );
+        assert!(
+            codes.contains("wrong_kind_reference"),
+            "{:?}",
+            out.diagnostics
+        );
+        assert!(
+            codes.contains("dangling_embedding_provider_reference"),
+            "{:?}",
+            out.diagnostics
+        );
     }
 
     #[test]
@@ -1012,8 +1134,13 @@ graphs:
         let out = validate_config_dir(config_dir);
         assert!(out.ok, "{:?}", out.diagnostics);
         let schema_digest = out.resource_digests.get("schema.knowledge").unwrap().clone();
-        let graph_composite =
-            graph_digest("knowledge", Some(&schema_digest), Some(&BTreeMap::new()));
+        let graph_composite = graph_digest(
+            "knowledge",
+            Some(&schema_digest),
+            Some(&BTreeMap::new()),
+            None,
+            None,
+        );
         write_state_resources(
             config_dir,
             &[
@@ -1122,6 +1249,8 @@ graphs:
                     .into_iter()
                     .collect(),
             ),
+            None,
+            None,
         );
         assert_eq!(resources["graph.knowledge"]["digest"], expected_composite);
         assert_eq!(
@@ -1134,6 +1263,117 @@ graphs:
         );
         assert_eq!(state["resource_statuses"]["policy.base"]["status"], "applied");
         assert!(!dir.path().join(CLUSTER_LOCK_FILE).exists());
+    }
+
+    #[tokio::test]
+    async fn apply_records_embedding_provider_profile_and_graph_binding() {
+        let dir = fixture();
+        write_mock_embedding_cluster(dir.path(), "recorded-x");
+        write_applyable_state(dir.path());
+        let desired = validate_config_dir(dir.path());
+        let query_digest = desired
+            .resource_digests
+            .get("query.knowledge.find_person")
+            .unwrap()
+            .clone();
+        let schema_digest = desired
+            .resource_digests
+            .get("schema.knowledge")
+            .unwrap()
+            .clone();
+        let provider_digest = desired
+            .resource_digests
+            .get("provider.embedding.default")
+            .unwrap()
+            .clone();
+
+        let out = apply_config_dir(dir.path()).await;
+        assert!(out.ok, "{:?}", out.diagnostics);
+        assert!(out.converged, "{out:?}");
+
+        let state = read_state_json(dir.path());
+        let resources = &state["applied_revision"]["resources"];
+        let provider = resources["provider.embedding.default"]
+            .as_object()
+            .expect("provider resource");
+        assert_eq!(provider["digest"], provider_digest);
+        assert_eq!(provider["embedding_profile"]["kind"], "mock");
+        assert_eq!(provider["embedding_profile"]["model"], "recorded-x");
+        assert!(provider["embedding_profile"].get("api_key").is_none());
+        assert_eq!(
+            resources["graph.knowledge"]["embedding_provider"],
+            "provider.embedding.default"
+        );
+        let expected_graph_digest = graph_digest(
+            "knowledge",
+            Some(&schema_digest),
+            Some(
+                &[("find_person".to_string(), query_digest)]
+                    .into_iter()
+                    .collect(),
+            ),
+            Some("provider.embedding.default"),
+            Some(&provider_digest),
+        );
+        assert_eq!(resources["graph.knowledge"]["digest"], expected_graph_digest);
+    }
+
+    #[tokio::test]
+    async fn embedding_provider_changes_update_provider_and_graph_plan() {
+        let dir = fixture();
+        write_mock_embedding_cluster(dir.path(), "recorded-x");
+        write_applyable_state(dir.path());
+        let first = apply_config_dir(dir.path()).await;
+        assert!(first.ok && first.converged, "{first:?}");
+
+        write_mock_embedding_cluster(dir.path(), "recorded-y");
+        let plan = plan_config_dir(dir.path()).await;
+        assert!(plan.ok, "{:?}", plan.diagnostics);
+        let by_resource: BTreeMap<&str, &PlanChange> = plan
+            .changes
+            .iter()
+            .map(|change| (change.resource.as_str(), change))
+            .collect();
+        assert_eq!(
+            by_resource["provider.embedding.default"].operation,
+            PlanOperation::Update
+        );
+        assert_eq!(
+            by_resource["provider.embedding.default"].disposition,
+            Some(ApplyDisposition::Applied)
+        );
+        assert_eq!(
+            by_resource["graph.knowledge"].operation,
+            PlanOperation::Update
+        );
+        assert_eq!(
+            by_resource["graph.knowledge"].disposition,
+            Some(ApplyDisposition::Derived)
+        );
+    }
+
+    #[tokio::test]
+    async fn embedding_binding_survives_refresh() {
+        let dir = fixture();
+        init_derived_graph(dir.path()).await;
+        write_mock_embedding_cluster(dir.path(), "recorded-x");
+        write_applyable_state(dir.path());
+        let apply = apply_config_dir(dir.path()).await;
+        assert!(apply.ok && apply.converged, "{apply:?}");
+
+        let refresh = refresh_config_dir(dir.path()).await;
+        assert!(refresh.ok, "{:?}", refresh.diagnostics);
+
+        let state = read_state_json(dir.path());
+        let resources = &state["applied_revision"]["resources"];
+        assert_eq!(
+            resources["graph.knowledge"]["embedding_provider"],
+            "provider.embedding.default"
+        );
+        assert_eq!(
+            resources["provider.embedding.default"]["embedding_profile"]["model"],
+            "recorded-x"
+        );
     }
 
     fn desired_revision_digest(out: &ApplyOutput) -> String {
@@ -1150,8 +1390,13 @@ graphs:
             .unwrap()
             .clone();
         let old_digest = "0".repeat(64);
-        let graph_composite =
-            graph_digest("knowledge", Some(&schema_digest), Some(&BTreeMap::new()));
+        let graph_composite = graph_digest(
+            "knowledge",
+            Some(&schema_digest),
+            Some(&BTreeMap::new()),
+            None,
+            None,
+        );
         write_state_resources(
             dir.path(),
             &[
@@ -1190,8 +1435,13 @@ graphs:
             .clone();
         let stale_query_digest = "1".repeat(64);
         let stale_policy_digest = "2".repeat(64);
-        let graph_composite =
-            graph_digest("knowledge", Some(&schema_digest), Some(&BTreeMap::new()));
+        let graph_composite = graph_digest(
+            "knowledge",
+            Some(&schema_digest),
+            Some(&BTreeMap::new()),
+            None,
+            None,
+        );
         write_state_resources(
             dir.path(),
             &[
@@ -1234,6 +1484,8 @@ graphs:
             "knowledge",
             Some(&schema_digest),
             Some(&[("find_person".to_string(), query_digest)].into_iter().collect()),
+            None,
+            None,
         );
         assert_eq!(resources["graph.knowledge"]["digest"], expected_composite);
     }
@@ -1494,8 +1746,13 @@ graphs:
             .get("schema.knowledge")
             .unwrap()
             .clone();
-        let graph_composite =
-            graph_digest("knowledge", Some(&schema_digest), Some(&BTreeMap::new()));
+        let graph_composite = graph_digest(
+            "knowledge",
+            Some(&schema_digest),
+            Some(&BTreeMap::new()),
+            None,
+            None,
+        );
         write_state_resources(
             dir.path(),
             &[
@@ -2862,6 +3119,54 @@ policies:
         // Content, not a path: the catalog may live on object storage.
         // The fixture bundle is `rules: []` — assert the verified text.
         assert!(snapshot.policies[0].source.contains("rules:"));
+    }
+
+    #[tokio::test]
+    async fn serving_snapshot_uses_applied_embedding_provider_profile() {
+        let dir = fixture();
+        init_derived_graph(dir.path()).await;
+        write_mock_embedding_cluster(dir.path(), "recorded-x");
+        write_applyable_state(dir.path());
+        let converge = apply_config_dir(dir.path()).await;
+        assert!(converge.converged, "{converge:?}");
+
+        let snapshot = read_serving_snapshot(dir.path()).await.unwrap();
+        let profile = snapshot.graphs[0].embedding.as_ref().unwrap();
+        assert_eq!(profile.kind.as_deref(), Some("mock"));
+        assert_eq!(profile.model.as_deref(), Some("recorded-x"));
+    }
+
+    #[tokio::test]
+    async fn serving_snapshot_refuses_missing_embedding_provider_metadata() {
+        let dir = fixture();
+        init_derived_graph(dir.path()).await;
+        write_mock_embedding_cluster(dir.path(), "recorded-x");
+        write_applyable_state(dir.path());
+        let converge = apply_config_dir(dir.path()).await;
+        assert!(converge.converged, "{converge:?}");
+
+        let mut state = read_state_json(dir.path());
+        state["applied_revision"]["resources"]["provider.embedding.default"]
+            .as_object_mut()
+            .unwrap()
+            .remove("embedding_profile");
+        fs::write(
+            dir.path().join(CLUSTER_STATE_FILE),
+            serde_json::to_string_pretty(&state).unwrap(),
+        )
+        .unwrap();
+
+        let err = read_serving_snapshot(dir.path()).await.unwrap_err();
+        assert!(
+            err.iter()
+                .any(|diagnostic| diagnostic.code == "embedding_provider_profile_missing"),
+            "{err:?}"
+        );
+        assert!(
+            err.iter()
+                .any(|diagnostic| diagnostic.code == "embedding_provider_missing"),
+            "{err:?}"
+        );
     }
 
     #[tokio::test]
