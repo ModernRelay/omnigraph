@@ -48,10 +48,10 @@ enum EmbedRole {
 }
 
 /// The single source of truth for how embedding text becomes a vector:
-/// provider + model + endpoint + key. Resolved once (from env today; from the
-/// cluster `providers.embedding` profile in a later RFC-012 phase) and shared by
-/// the query path and the offline CLI so stored and query vectors stay
-/// same-space by construction.
+/// provider + model + endpoint + key. Resolved once (from env for direct
+/// engine/CLI callers, or from an applied cluster `providers.embedding` profile
+/// at server boot) and shared by the query path and the offline CLI so stored
+/// and query vectors stay same-space by construction.
 #[derive(Clone, Debug)]
 pub struct EmbeddingConfig {
     pub provider: Provider,
@@ -102,7 +102,7 @@ impl EmbeddingConfig {
         })
     }
 
-    /// Build a config from explicit parts — the cluster `embeddings` profile path
+    /// Build a config from explicit parts — the cluster `providers.embedding` profile path
     /// (RFC-012 Phase 5). `provider`/`base_url`/`model` default exactly as
     /// `from_env` does (shared `provider_profile`); `api_key` is already resolved
     /// (the cluster path resolves a `${NAME}` ref before calling this).
@@ -113,7 +113,7 @@ impl EmbeddingConfig {
         api_key: String,
     ) -> Result<Self> {
         if provider == Some("mock") {
-            // An explicit `model` (e.g. a cluster `embeddings` profile) is
+            // An explicit `model` (e.g. a cluster `providers.embedding` profile) is
             // authoritative — it is what the same-space check compares against —
             // so honor it; fall back to `mock()`'s env-based model only when the
             // caller supplied none. Without this, a profile's `model` is silently
@@ -951,7 +951,7 @@ mod tests {
     #[test]
     #[serial]
     fn from_parts_mock_honors_an_explicit_model() {
-        // A cluster `embeddings` profile that sets `provider: mock, model: X`
+        // A cluster `providers.embedding` profile that sets `kind: mock, model: X`
         // must resolve to model X — it is what the query-time same-space check
         // compares against. Env cleared so the assertion isolates the arg.
         let _guard = cleared_env(&[]);

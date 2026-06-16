@@ -152,7 +152,9 @@ pub(crate) fn approved_resources(
         let candidates: Vec<&ApprovalArtifact> = artifacts
             .iter()
             .map(|(_, artifact)| artifact)
-            .filter(|artifact| artifact.consumed_at.is_none() && artifact.resource == change.resource)
+            .filter(|artifact| {
+                artifact.consumed_at.is_none() && artifact.resource == change.resource
+            })
             .collect();
         if candidates.is_empty() {
             continue;
@@ -181,6 +183,7 @@ pub(crate) enum ResourceKind {
     Schema(String),
     Query { graph: String, name: String },
     Policy(String),
+    EmbeddingProvider(String),
     Unknown,
 }
 
@@ -199,6 +202,8 @@ pub(crate) fn resource_kind(address: &str) -> ResourceKind {
         }
     } else if let Some(name) = address.strip_prefix("policy.") {
         ResourceKind::Policy(name.to_string())
+    } else if let Some(name) = address.strip_prefix("provider.embedding.") {
+        ResourceKind::EmbeddingProvider(name.to_string())
     } else {
         ResourceKind::Unknown
     }
@@ -261,8 +266,7 @@ pub(crate) fn classify_changes(
         let (disposition, reason) = match resource_kind(&change.resource) {
             ResourceKind::Schema(graph) => match change.operation {
                 PlanOperation::Create
-                    if graph_creates.contains(&graph)
-                        && !pending_recovery.contains(&graph) =>
+                    if graph_creates.contains(&graph) && !pending_recovery.contains(&graph) =>
                 {
                     // Applied with the graph create — the init carries it.
                     (ApplyDisposition::Applied, None)
@@ -325,10 +329,7 @@ pub(crate) fn classify_changes(
                     if pending_recovery.contains(&graph) {
                         (ApplyDisposition::Blocked, Some("cluster_recovery_pending"))
                     } else if schema_pending.contains(&graph) {
-                        (
-                            ApplyDisposition::Blocked,
-                            Some("dependency_not_applied"),
-                        )
+                        (ApplyDisposition::Blocked, Some("dependency_not_applied"))
                     } else {
                         // A graph create in the same plan no longer blocks:
                         // creates execute first in the same apply run.
@@ -353,9 +354,8 @@ pub(crate) fn classify_changes(
                     }
                 }
             },
-            ResourceKind::Unknown => {
-                (ApplyDisposition::Deferred, Some("apply_unsupported_kind"))
-            }
+            ResourceKind::EmbeddingProvider(_) => (ApplyDisposition::Applied, None),
+            ResourceKind::Unknown => (ApplyDisposition::Deferred, Some("apply_unsupported_kind")),
         };
         change.disposition = Some(disposition);
         change.reason = reason.map(str::to_string);

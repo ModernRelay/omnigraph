@@ -162,8 +162,8 @@ pub struct Omnigraph {
     /// avoids the per-query `from_env()` rebuild and keeps the provider HTTP
     /// connection pool warm. `OnceCell` guarantees a single initialization.
     embedding: Arc<tokio::sync::OnceCell<crate::embedding::EmbeddingClient>>,
-    /// Optional pre-resolved embedding config (RFC-012 Phase 5), injected from a
-    /// cluster `graphs.<id>.embeddings` profile via [`Omnigraph::with_embedding_config`].
+    /// Optional pre-resolved embedding config (RFC-012 Phase 5), injected from an
+    /// applied cluster `providers.embedding` profile via [`Omnigraph::with_embedding_config`].
     /// When set, the embedding cell builds its client from this instead of
     /// `EmbeddingClient::from_env()`; `None` keeps the env fallback.
     embedding_config: Option<Arc<crate::embedding::EmbeddingConfig>>,
@@ -491,12 +491,9 @@ impl Omnigraph {
 
     /// Install a pre-resolved embedding config (RFC-012 Phase 5). Builder-style,
     /// mirroring [`Omnigraph::with_policy`]: a graph served from a cluster
-    /// `embeddings` profile injects it here; an embedded/CLI caller that doesn't
+    /// embedding provider profile injects it here; an embedded/CLI caller that doesn't
     /// call this keeps the `EmbeddingClient::from_env()` fallback.
-    pub fn with_embedding_config(
-        mut self,
-        config: Arc<crate::embedding::EmbeddingConfig>,
-    ) -> Self {
+    pub fn with_embedding_config(mut self, config: Arc<crate::embedding::EmbeddingConfig>) -> Self {
         self.embedding_config = Some(config);
         self
     }

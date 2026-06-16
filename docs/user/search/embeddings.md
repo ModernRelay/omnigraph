@@ -16,6 +16,36 @@ query vectors and document vectors share one model and one vector space.
 Vectors are stored L2-normalized as `FixedSizeList(Float32, dim)`; the requested output dimension is driven by
 the target column width and sent as Gemini `outputDimensionality` / OpenAI `dimensions`.
 
+## Configuration (cluster)
+
+Cluster-served graphs can pin their query-time embedder in `cluster.yaml`:
+
+```yaml
+providers:
+  embedding:
+    default:
+      kind: openai-compatible
+      base_url: https://openrouter.ai/api/v1
+      model: openai/text-embedding-3-large
+      api_key: ${OPENROUTER_API_KEY}
+
+graphs:
+  knowledge:
+    schema: knowledge.pg
+    embedding_provider: default
+```
+
+`embedding_provider` references `providers.embedding.<name>`; bare names are
+normalized to that typed ref. The server resolves `${ENV_VAR}` only when it
+boots from the applied cluster ledger, so `cluster validate`, `plan`, and
+`apply` do not need provider secrets. Inline API keys are rejected. `mock`
+needs no key. Vector dimensions stay schema-driven by the target `Vector(N)`
+column.
+
+Direct single-graph serving, embedded callers, and the offline
+`omnigraph embed` pipeline use environment configuration unless they inject an
+`EmbeddingConfig` directly.
+
 ## Configuration (environment)
 
 | Variable | Meaning |

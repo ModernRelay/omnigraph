@@ -325,6 +325,7 @@ pub(crate) struct DesiredCluster {
     /// The declared `storage:` root, if any (None ⇒ the config dir itself).
     pub(crate) storage_root: Option<String>,
     pub(crate) state_lock: bool,
+    pub(crate) embedding_providers: BTreeMap<String, EmbeddingProviderConfig>,
     pub(crate) graphs: Vec<DesiredGraph>,
     pub(crate) resource_digests: BTreeMap<String, String>,
     pub(crate) resources: Vec<ResourceSummary>,
@@ -337,6 +338,7 @@ pub(crate) struct DesiredCluster {
 pub(crate) struct DesiredGraph {
     pub(crate) id: String,
     pub(crate) schema_digest: String,
+    pub(crate) embedding_provider: Option<String>,
 }
 
 #[derive(Debug)]
@@ -376,6 +378,8 @@ pub(crate) struct RawClusterConfig {
     #[serde(default)]
     pub(crate) state: StateConfig,
     #[serde(default)]
+    pub(crate) providers: ProvidersConfig,
+    #[serde(default)]
     pub(crate) graphs: BTreeMap<String, GraphConfig>,
     #[serde(default)]
     pub(crate) policies: BTreeMap<String, PolicyConfig>,
@@ -394,41 +398,99 @@ pub(crate) struct StateConfig {
     pub(crate) lock: Option<bool>,
 }
 
+#[derive(Debug, Default, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct ProvidersConfig {
+    #[serde(default)]
+    pub(crate) embedding: BTreeMap<String, EmbeddingProviderConfig>,
+}
+
 #[derive(Debug, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub(crate) struct GraphConfig {
     pub(crate) schema: PathBuf,
     #[serde(default)]
     pub(crate) queries: QueriesDecl,
-    /// Optional per-graph embedding provider profile (RFC-012 Phase 5).
+    /// Optional reference to a top-level `providers.embedding.<name>` profile.
     #[serde(default)]
-    pub(crate) embeddings: Option<EmbeddingProfile>,
+    pub(crate) embedding_provider: Option<String>,
 }
 
-/// A graph's embedding provider profile (RFC-012 Phase 5). `provider`/`base_url`/
-/// `model` default exactly as the engine's `EmbeddingConfig::from_env` does;
-/// `api_key` is a `${NAME}` env reference resolved at serving boot, never an
-/// inline secret.
+/// A named cluster embedding provider profile (RFC-012 Phase 5). `kind`/`base_url`/
+/// `model` default exactly as the engine's `EmbeddingConfig::from_env` does.
+/// `api_key`, when required, must be a `${NAME}` env reference resolved at
+/// serving boot, never an inline secret.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
-pub struct EmbeddingProfile {
-    #[serde(default)]
-    pub provider: Option<String>,
-    #[serde(default)]
+pub struct EmbeddingProviderConfig {
+    #[serde(default, alias = "provider", skip_serializing_if = "Option::is_none")]
+    pub kind: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub base_url: Option<String>,
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub model: Option<String>,
-    pub api_key: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub api_key: Option<String>,
 }
 
-impl EmbeddingProfile {
+impl EmbeddingProviderConfig {
+    pub(crate) fn validate(&self, path: String, diagnostics: &mut Vec<Diagnostic>) {
+        if let Err(error) = omnigraph::embedding::EmbeddingConfig::from_parts(
+            self.kind.as_deref(),
+            self.base_url.clone(),
+            self.model.clone(),
+            "validation-placeholder".to_string(),
+        ) {
+            diagnostics.push(Diagnostic::error(
+                "invalid_embedding_provider",
+                path.clone(),
+                error.to_string(),
+            ));
+        }
+
+        if self.kind.as_deref() == Some("mock") {
+            if let Some(api_key) = self.api_key.as_deref() {
+                if secret_ref_name(api_key).is_err() {
+                    diagnostics.push(Diagnostic::error(
+                        "embedding_api_key_inline",
+                        format!("{path}.api_key"),
+                        "embedding api_key must be a ${NAME} env reference, not an inline secret",
+                    ));
+                }
+            }
+            return;
+        }
+
+        match self.api_key.as_deref() {
+            Some(api_key) if secret_ref_name(api_key).is_err() => diagnostics.push(
+                Diagnostic::error(
+                    "embedding_api_key_inline",
+                    format!("{path}.api_key"),
+                    "embedding api_key must be a ${NAME} env reference, not an inline secret",
+                ),
+            ),
+            Some(_) => {}
+            None => diagnostics.push(Diagnostic::error(
+                "embedding_api_key_required",
+                format!("{path}.api_key"),
+                "non-mock embedding providers must set api_key to a ${NAME} env reference",
+            )),
+        }
+    }
+
     /// Resolve into an engine `EmbeddingConfig`, reading the `${NAME}` api-key
-    /// reference from process env. Errors if `api_key` is not a `${NAME}`
-    /// reference or the named var is unset.
+    /// reference from process env. Mock profiles do not read env and may omit
+    /// `api_key`; real providers error if the reference is missing or unset.
     pub fn resolve(&self) -> Result<omnigraph::embedding::EmbeddingConfig, String> {
-        let api_key = resolve_secret_ref(&self.api_key)?;
+        let api_key = if self.kind.as_deref() == Some("mock") {
+            String::new()
+        } else {
+            resolve_secret_ref(self.api_key.as_deref().ok_or_else(|| {
+                "embedding api_key is required for non-mock providers".to_string()
+            })?)?
+        };
         omnigraph::embedding::EmbeddingConfig::from_parts(
-            self.provider.as_deref(),
+            self.kind.as_deref(),
             self.base_url.clone(),
             self.model.clone(),
             api_key,
@@ -437,16 +499,21 @@ impl EmbeddingProfile {
     }
 }
 
-/// Resolve a `${NAME}` secret reference from process env. Rejects an inline value
-/// (anything not wrapped in `${…}`) so secrets never sit in the cluster config.
-fn resolve_secret_ref(value: &str) -> Result<String, String> {
-    let name = value
+fn secret_ref_name(value: &str) -> Result<&str, String> {
+    value
         .trim()
         .strip_prefix("${")
         .and_then(|s| s.strip_suffix('}'))
+        .filter(|name| !name.trim().is_empty())
         .ok_or_else(|| {
             format!("embedding api_key must be a ${{NAME}} env reference, got '{}'", value.trim())
-        })?;
+        })
+}
+
+/// Resolve a `${NAME}` secret reference from process env. Rejects an inline value
+/// (anything not wrapped in `${…}`) so secrets never sit in the cluster config.
+fn resolve_secret_ref(value: &str) -> Result<String, String> {
+    let name = secret_ref_name(value)?;
     std::env::var(name).map_err(|_| format!("embedding api_key env var '{name}' is not set"))
 }
 
@@ -505,6 +572,16 @@ pub(crate) struct StateResource {
     /// non-policy resources.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) applies_to: Option<Vec<String>>,
+    /// Graph resources only: the applied `provider.embedding.<name>` binding.
+    /// The provider profile itself is stored on the provider resource so
+    /// serving can boot without re-reading mutable desired config.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) embedding_provider: Option<String>,
+    /// Embedding provider resources only: the applied profile with unresolved
+    /// `${ENV}` references. The server resolves the referenced env var exactly
+    /// once at boot and injects the resulting engine config into the graph.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) embedding_profile: Option<EmbeddingProviderConfig>,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -568,18 +645,18 @@ pub(crate) struct SweepOutcome {
 }
 
 #[cfg(test)]
-mod embedding_profile_tests {
-    use super::EmbeddingProfile;
+mod embedding_provider_config_tests {
+    use super::EmbeddingProviderConfig;
 
     #[test]
     fn resolves_secret_from_env_and_applies_defaults() {
         // SAFETY: a unique var name, no concurrent reader.
         unsafe { std::env::set_var("OG_TEST_EMBED_KEY_A", "secret-x") };
-        let profile = EmbeddingProfile {
-            provider: Some("openai-compatible".to_string()),
+        let profile = EmbeddingProviderConfig {
+            kind: Some("openai-compatible".to_string()),
             base_url: None,
             model: Some("m".to_string()),
-            api_key: "${OG_TEST_EMBED_KEY_A}".to_string(),
+            api_key: Some("${OG_TEST_EMBED_KEY_A}".to_string()),
         };
         let config = profile.resolve().unwrap();
         assert_eq!(config.api_key, "secret-x");
@@ -589,11 +666,11 @@ mod embedding_profile_tests {
 
     #[test]
     fn rejects_inline_api_key() {
-        let profile = EmbeddingProfile {
-            provider: None,
+        let profile = EmbeddingProviderConfig {
+            kind: None,
             base_url: None,
             model: None,
-            api_key: "sk-inline".to_string(),
+            api_key: Some("sk-inline".to_string()),
         };
         let err = profile.resolve().unwrap_err();
         assert!(err.contains("${NAME}"), "got: {err}");
@@ -601,11 +678,11 @@ mod embedding_profile_tests {
 
     #[test]
     fn errors_on_unset_secret() {
-        let profile = EmbeddingProfile {
-            provider: None,
+        let profile = EmbeddingProviderConfig {
+            kind: None,
             base_url: None,
             model: None,
-            api_key: "${OG_TEST_DEFINITELY_UNSET_VAR}".to_string(),
+            api_key: Some("${OG_TEST_DEFINITELY_UNSET_VAR}".to_string()),
         };
         let err = profile.resolve().unwrap_err();
         assert!(err.contains("not set"), "got: {err}");
@@ -614,14 +691,26 @@ mod embedding_profile_tests {
     #[test]
     fn rejects_unknown_provider() {
         unsafe { std::env::set_var("OG_TEST_EMBED_KEY_B", "x") };
-        let profile = EmbeddingProfile {
-            provider: Some("cohere".to_string()),
+        let profile = EmbeddingProviderConfig {
+            kind: Some("cohere".to_string()),
             base_url: None,
             model: None,
-            api_key: "${OG_TEST_EMBED_KEY_B}".to_string(),
+            api_key: Some("${OG_TEST_EMBED_KEY_B}".to_string()),
         };
         let err = profile.resolve().unwrap_err();
         assert!(err.contains("unknown embedding provider"), "got: {err}");
         unsafe { std::env::remove_var("OG_TEST_EMBED_KEY_B") };
+    }
+
+    #[test]
+    fn mock_does_not_require_secret_env() {
+        let profile = EmbeddingProviderConfig {
+            kind: Some("mock".to_string()),
+            base_url: None,
+            model: Some("cluster-mock".to_string()),
+            api_key: None,
+        };
+        let config = profile.resolve().unwrap();
+        assert_eq!(config.model, "cluster-mock");
     }
 }

@@ -20,18 +20,34 @@ use ulid::Ulid;
 pub mod failpoints;
 
 mod config;
-mod types;
 mod diff;
 mod serve;
-mod sweep;
 mod store;
+mod sweep;
+mod types;
+use config::{
+    QueriesDecl, future_field_diagnostics, graph_address, initial_import_state, load_desired,
+    normalize_policy_target, observe_declared_graphs, observe_live_graph, parse_cluster_config,
+    policy_address, preview_schema_migration, query_address, resolve_config_path,
+    resolve_query_decls, schema_address, state_resource_digests, validate_cluster_header,
+    validate_id, validate_query_source,
+};
+use diff::{
+    FailedGraphOrigin, ResourceKind, append_policy_binding_changes, approved_resources,
+    classify_changes, compute_approvals, compute_blast_radius, demote_dependents_of_failed_graphs,
+    diff_resources, resource_kind,
+};
+pub use serve::{
+    ServingGraph, ServingPolicy, ServingQuery, ServingSnapshot, cluster_root_for_graph_uri,
+    read_serving_snapshot, read_serving_snapshot_from_storage, resolve_graph_storage_uri,
+};
 use store::{ClusterStore, StateLockGuard, StateSnapshot};
+use sweep::{
+    mark_approvals_consumed, record_approval_consumed, sweep_recovery_sidecars,
+    tombstone_graph_subtree, warn_pending_recovery_sidecars,
+};
 pub use types::*;
 use types::*;
-pub use serve::{ServingGraph, ServingPolicy, ServingQuery, ServingSnapshot, cluster_root_for_graph_uri, read_serving_snapshot, read_serving_snapshot_from_storage, resolve_graph_storage_uri};
-use config::{QueriesDecl, observe_declared_graphs, validate_cluster_header, future_field_diagnostics, initial_import_state, observe_live_graph, preview_schema_migration, state_resource_digests, graph_address, policy_address, query_address, schema_address, load_desired, normalize_policy_target, parse_cluster_config, resolve_config_path, resolve_query_decls, validate_id, validate_query_source};
-use diff::{FailedGraphOrigin, ResourceKind, append_policy_binding_changes, approved_resources, classify_changes, compute_approvals, compute_blast_radius, demote_dependents_of_failed_graphs, diff_resources, resource_kind};
-use sweep::{mark_approvals_consumed, record_approval_consumed, sweep_recovery_sidecars, tombstone_graph_subtree, warn_pending_recovery_sidecars};
 
 pub const CLUSTER_CONFIG_FILE: &str = "cluster.yaml";
 pub const CLUSTER_GRAPHS_DIR: &str = "graphs";
@@ -44,10 +60,7 @@ pub const CLUSTER_APPROVALS_DIR: &str = "__cluster/approvals";
 
 /// The store for a load outcome: the declared `storage:` root when present,
 /// the config directory itself otherwise. A bad root is a loud error.
-fn store_for(
-    config_dir: &Path,
-    storage_root: Option<&str>,
-) -> Result<ClusterStore, Diagnostic> {
+fn store_for(config_dir: &Path, storage_root: Option<&str>) -> Result<ClusterStore, Diagnostic> {
     match storage_root {
         Some(root) => ClusterStore::for_storage_root(root),
         None => Ok(ClusterStore::for_config_dir(config_dir)),
@@ -179,7 +192,12 @@ pub async fn plan_config_dir(config_dir: impl AsRef<Path>) -> PlanOutput {
         &desired.config_digest,
         &mut diagnostics,
     );
-    classify_changes(&mut changes, &desired.dependencies, &BTreeSet::new(), &approved);
+    classify_changes(
+        &mut changes,
+        &desired.dependencies,
+        &BTreeSet::new(),
+        &approved,
+    );
 
     // Embed real migration steps for schema updates so plan is a data-aware
     // preview; failures degrade to the digest diff with a warning.
@@ -282,9 +300,7 @@ pub async fn apply_config_dir_with_options(
             ok: !has_errors(&diagnostics),
             config_dir,
             actor: actor_for_output.clone(),
-            desired_revision: DesiredRevision {
-                config_digest,
-            },
+            desired_revision: DesiredRevision { config_digest },
             state_observations: observations,
             changes,
             applied_count: 0,
@@ -464,8 +480,7 @@ pub async fn apply_config_dir_with_options(
             failed_graphs.insert(graph_id.clone(), FailedGraphOrigin::GraphCreate);
             continue;
         }
-        let Some(desired_graph) = desired.graphs.iter().find(|graph| &graph.id == graph_id)
-        else {
+        let Some(desired_graph) = desired.graphs.iter().find(|graph| &graph.id == graph_id) else {
             continue;
         };
         let graph_uri = backend.graph_root(graph_id);
@@ -604,8 +619,7 @@ pub async fn apply_config_dir_with_options(
             failed_graphs.insert(graph_id.clone(), FailedGraphOrigin::SchemaApply);
             continue;
         }
-        let Some(desired_graph) = desired.graphs.iter().find(|graph| &graph.id == graph_id)
-        else {
+        let Some(desired_graph) = desired.graphs.iter().find(|graph| &graph.id == graph_id) else {
             continue;
         };
         let graph_uri = backend.graph_root(graph_id);
@@ -955,8 +969,10 @@ pub async fn apply_config_dir_with_options(
                                 .expect("create/update always carries an after digest"),
                             // Policies record their applied bindings so the
                             // ledger is serving-sufficient (RFC-005 §D3).
-                            applies_to: desired
-                                .policy_bindings
+                            applies_to: desired.policy_bindings.get(&change.resource).cloned(),
+                            embedding_provider: None,
+                            embedding_profile: desired
+                                .embedding_providers
                                 .get(&change.resource)
                                 .cloned(),
                         },
@@ -964,7 +980,10 @@ pub async fn apply_config_dir_with_options(
                     set_resource_status_applied(&mut new_state, &change.resource);
                 }
                 PlanOperation::Delete => {
-                    new_state.applied_revision.resources.remove(&change.resource);
+                    new_state
+                        .applied_revision
+                        .resources
+                        .remove(&change.resource);
                     new_state.resource_statuses.remove(&change.resource);
                 }
             },
@@ -1219,7 +1238,6 @@ pub async fn approve_config_dir(
     }
 }
 
-
 pub async fn status_config_dir(config_dir: impl AsRef<Path>) -> StatusOutput {
     let parsed = parse_cluster_config(config_dir.as_ref());
     let mut diagnostics = parsed.diagnostics;
@@ -1238,7 +1256,9 @@ pub async fn status_config_dir(config_dir: impl AsRef<Path>) -> StatusOutput {
         }
     };
     let mut observations = backend.observations();
-    backend.observe_lock(&mut observations, &mut diagnostics).await;
+    backend
+        .observe_lock(&mut observations, &mut diagnostics)
+        .await;
     warn_pending_recovery_sidecars(&parsed.config_dir, &mut diagnostics);
 
     let mut resource_digests = BTreeMap::new();
@@ -1254,9 +1274,7 @@ pub async fn status_config_dir(config_dir: impl AsRef<Path>) -> StatusOutput {
                         // Read-only point-in-time catalog check: report the
                         // findings as diagnostics; persisting Drifted statuses
                         // is refresh's job. Status never writes state.
-                        for (address, finding) in
-                            verify_catalog_payloads(&backend, &state).await
-                        {
+                        for (address, finding) in verify_catalog_payloads(&backend, &state).await {
                             diagnostics.push(payload_finding_diagnostic(&address, &finding));
                         }
                         resource_digests = state_resource_digests(&state);
@@ -1312,7 +1330,10 @@ pub async fn force_unlock_config_dir(
     if let Some(raw) = parsed.raw.as_ref() {
         let _settings = validate_cluster_header(raw, &mut diagnostics);
         if !has_errors(&diagnostics) {
-            match backend.force_unlock(lock_id.as_ref(), &mut observations).await {
+            match backend
+                .force_unlock(lock_id.as_ref(), &mut observations)
+                .await
+            {
                 Ok(()) => lock_removed = true,
                 Err(diagnostic) => diagnostics.push(diagnostic),
             }
@@ -1380,7 +1401,10 @@ async fn sync_config_dir(config_dir: &Path, operation: StateSyncOperation) -> St
 
     let operation_label = state_sync_operation_label(operation);
     let _lock_guard = if desired.state_lock {
-        match backend.acquire_lock(operation_label, &mut observations).await {
+        match backend
+            .acquire_lock(operation_label, &mut observations)
+            .await
+        {
             Ok(guard) => Some(guard),
             Err(diagnostic) => {
                 diagnostics.push(diagnostic);
@@ -1542,7 +1566,10 @@ async fn sync_config_dir(config_dir: &Path, operation: StateSyncOperation) -> St
         state.state_revision = state.state_revision.saturating_add(1);
     }
 
-    match backend.write_state(&state, expected_cas.as_deref(), &mut observations).await {
+    match backend
+        .write_state(&state, expected_cas.as_deref(), &mut observations)
+        .await
+    {
         Ok(()) => {
             // Completed sweep sidecars are deleted only after their outcome
             // is durably recorded; on failure they stay and re-sweep.
@@ -1568,9 +1595,6 @@ async fn sync_config_dir(config_dir: &Path, operation: StateSyncOperation) -> St
         diagnostics,
     }
 }
-
-
-
 
 #[derive(Debug, PartialEq, Eq)]
 enum PayloadFinding {
@@ -1650,7 +1674,10 @@ async fn write_resource_payload(
         Diagnostic::error(
             "resource_payload_write_error",
             resource,
-            format!("could not read resource source '{}': {err}", source.display()),
+            format!(
+                "could not read resource source '{}': {err}",
+                source.display()
+            ),
         )
     })?;
     if sha256_hex(&bytes) != expected_digest {
@@ -1692,7 +1719,11 @@ async fn write_resource_payload(
 fn recompute_state_graph_digests(state: &mut ClusterState, desired: &DesiredCluster) {
     for graph in &desired.graphs {
         let graph_address = graph_address(&graph.id);
-        if !state.applied_revision.resources.contains_key(&graph_address) {
+        if !state
+            .applied_revision
+            .resources
+            .contains_key(&graph_address)
+        {
             continue;
         }
         let schema_digest = state
@@ -1701,11 +1732,26 @@ fn recompute_state_graph_digests(state: &mut ClusterState, desired: &DesiredClus
             .get(&schema_address(&graph.id))
             .map(|resource| resource.digest.clone());
         let query_digests = state_query_digests_for_graph(state, &graph.id);
-        let digest = graph_digest(&graph.id, schema_digest.as_ref(), Some(&query_digests));
-        state
-            .applied_revision
-            .resources
-            .insert(graph_address, StateResource { digest, applies_to: None });
+        let embedding_provider = graph.embedding_provider.as_deref();
+        let embedding_provider_digest = embedding_provider
+            .and_then(|address| state.applied_revision.resources.get(address))
+            .map(|resource| resource.digest.clone());
+        let digest = graph_digest(
+            &graph.id,
+            schema_digest.as_ref(),
+            Some(&query_digests),
+            embedding_provider,
+            embedding_provider_digest.as_ref(),
+        );
+        state.applied_revision.resources.insert(
+            graph_address,
+            StateResource {
+                digest,
+                applies_to: None,
+                embedding_provider: graph.embedding_provider.clone(),
+                embedding_profile: None,
+            },
+        );
     }
 }
 
@@ -1773,7 +1819,6 @@ fn duplicate_key_diagnostics(text: &str) -> Vec<Diagnostic> {
     diagnostics
 }
 
-
 fn strip_comment(line: &str) -> String {
     let mut in_single_quote = false;
     let mut in_double_quote = false;
@@ -1796,7 +1841,6 @@ fn strip_comment(line: &str) -> String {
     line.to_string()
 }
 
-
 fn state_query_digests_for_graph(state: &ClusterState, graph_id: &str) -> BTreeMap<String, String> {
     let prefix = format!("query.{graph_id}.");
     state
@@ -1809,6 +1853,23 @@ fn state_query_digests_for_graph(state: &ClusterState, graph_id: &str) -> BTreeM
                 .map(|name| (name.to_string(), resource.digest.clone()))
         })
         .collect()
+}
+
+fn state_graph_embedding_provider(state: &ClusterState, graph_id: &str) -> Option<String> {
+    state
+        .applied_revision
+        .resources
+        .get(&graph_address(graph_id))
+        .and_then(|resource| resource.embedding_provider.clone())
+}
+
+fn state_embedding_provider_digest(
+    state: &ClusterState,
+    embedding_provider: Option<&str>,
+) -> Option<String> {
+    embedding_provider
+        .and_then(|address| state.applied_revision.resources.get(address))
+        .map(|resource| resource.digest.clone())
 }
 
 fn set_resource_status_applied(state: &mut ClusterState, address: &str) {
@@ -1843,6 +1904,8 @@ fn graph_digest(
     graph_id: &str,
     schema_digest: Option<&String>,
     query_digests: Option<&BTreeMap<String, String>>,
+    embedding_provider: Option<&str>,
+    embedding_provider_digest: Option<&String>,
 ) -> String {
     let mut input = format!(
         "graph\0{graph_id}\0schema\0{}\0",
@@ -1857,6 +1920,21 @@ fn graph_digest(
             input.push('\0');
         }
     }
+    if let Some(provider) = embedding_provider {
+        input.push_str("embedding_provider\0");
+        input.push_str(provider);
+        input.push('\0');
+        input.push_str(embedding_provider_digest.map_or("", String::as_str));
+        input.push('\0');
+    }
+    sha256_hex(input.as_bytes())
+}
+
+fn embedding_provider_digest(profile: &EmbeddingProviderConfig) -> String {
+    let mut input = String::from("embedding-provider\0");
+    let config_semantics =
+        serde_json::to_string(profile).expect("embedding provider config must serialize");
+    input.push_str(&config_semantics);
     sha256_hex(input.as_bytes())
 }
 
@@ -1929,7 +2007,6 @@ fn count_errors(diagnostics: &[Diagnostic]) -> usize {
 fn display_path(path: &Path) -> String {
     path.display().to_string()
 }
-
 
 #[cfg(test)]
 #[path = "tests.rs"]

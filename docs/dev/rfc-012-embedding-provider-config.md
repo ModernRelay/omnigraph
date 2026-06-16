@@ -1,9 +1,9 @@
 # RFC: Provider-Independent Embedding Configuration
 
-**Status:** Proposed
+**Status:** Accepted — Phases 1-5 implemented
 **Date:** 2026-06-15
 **Builds on:** the engine embedding client (`crates/omnigraph/src/embedding.rs`), the `@embed` catalog
-annotation (`omnigraph-compiler/src/catalog`), the reserved cluster `embeddings`/`providers` fields
+annotation (`omnigraph-compiler/src/catalog`), the cluster `providers.embedding` surface
 ([cluster-config-specs.md](cluster-config-specs.md), [rfc-007-operator-config.md](rfc-007-operator-config.md)
 for the secret-resolution pattern).
 **Target release:** staged — NFR floor first, then the provider-independent config core; ingest-time `@embed`
@@ -95,14 +95,18 @@ providers:
       kind: openai-compatible           # openai-compatible | gemini | mock
       base_url: https://openrouter.ai/api/v1
       model: google/gemini-embedding-2  # or openai/text-embedding-3-large, mistralai/mistral-embed, …
-      dimension: 3072
       api_key: ${OPENROUTER_API_KEY}
+graphs:
+  knowledge:
+    schema: knowledge.pg
+    embedding_provider: default
 ```
 
 The same `openai-compatible` kind points at OpenAI direct (`base_url: https://api.openai.com/v1`,
 `model: text-embedding-3-large`) or a self-hosted endpoint (vLLM/Ollama/LM Studio) by changing `base_url`. Use
 `kind: gemini` only to reach Google's `generativelanguage` API directly (it keeps the query/document
-task-type asymmetry that the OpenAI-compatible shape does not expose).
+task-type asymmetry that the OpenAI-compatible shape does not expose). Dimensions are schema-driven by the
+target `Vector(N)` column, not duplicated in the provider profile.
 
 The zero-config tier keeps working with env only (`OMNIGRAPH_EMBED_PROVIDER`, `OMNIGRAPH_EMBED_BASE_URL`,
 `OMNIGRAPH_EMBED_MODEL`, and the provider api-key env — `OPENROUTER_API_KEY` / `OPENAI_API_KEY` /
@@ -163,11 +167,12 @@ ingest phase needs for throughput, and which removes the open dependency on Gemi
 
 ### Config resolution (resolved once, shared)
 
-Precedence, highest first: cluster `providers.embedding.<name>` profile → env (`OMNIGRAPH_EMBED_*`, provider
-api-key env) → built-in defaults. The api-key is resolved through the existing operator credential chain
-(`${NAME}` → env / `~/.omnigraph/credentials` / server `TokenSource`); it never lives in the schema or any
-checked-in file. Resolution happens once; the resolved client is shared by `nearest("string")` and the
-offline CLI (replacing the per-query `EmbeddingClient::from_env()` rebuild at `exec/query.rs:238`).
+Precedence, highest first for served cluster graphs: applied cluster `providers.embedding.<name>` profile →
+env (`OMNIGRAPH_EMBED_*`, provider api-key env) → built-in defaults. The cluster `api_key` value is a
+`${NAME}` env reference resolved at server boot; plaintext never lives in the schema, state ledger, or any
+checked-in file. Resolution happens once per graph handle; the resolved client is shared by
+`nearest("string")`. Direct single-graph serving, embedded callers, and the offline CLI keep the env path
+unless they inject an `EmbeddingConfig` directly.
 
 ### Identity recorded in the schema IR (not a new store)
 
@@ -215,12 +220,12 @@ the design constraint; deferred to its own RFC/phase.
 | **2 — Provider-independent config** | `EmbeddingConfig` + `Provider` enum (OpenAiCompatible covering OpenRouter/OpenAI/local, Gemini, Mock); env-first resolution; client reuse | point `base_url` at OpenRouter, run `nearest("string")`, get correct neighbours vs OpenRouter-stored vectors; CLI shares the config |
 | **3 — Record identity in schema IR** | `@embed` args grammar + catalog + IR persistence | `schema show` reflects recorded model/dim |
 | **4 — Query-time validation** | compare resolved vs recorded; typed error; planner refusal on identity change | stored model A vs read model B → loud error, never silent garbage |
-| **5 — Cluster provider wiring** | un-reserve `providers.embedding`; `${NAME}` resolution | provider profile resolved from `cluster.yaml`; legacy `omnigraph.yaml` untouched |
+| **5 — Cluster provider wiring** | `providers.embedding` resources; `graphs.<id>.embedding_provider`; `${NAME}` resolution at server boot | provider profile resolved from applied cluster state; legacy `omnigraph.yaml` untouched |
 | later | ingest-time `@embed` (Shape C) | separate RFC |
 
-**Status:** Phases 1–4 are implemented (`@embed("…", model="…")` is recorded in the schema IR and validated at
-query time with a typed same-space error; an unrecorded `@embed` keeps working with no check). Phase 5 (cluster
-`providers.embedding` wiring) and ingest-time `@embed` remain.
+**Status:** Phases 1–5 are implemented (`@embed("…", model="…")` is recorded in the schema IR and validated at
+query time with a typed same-space error; an unrecorded `@embed` keeps working with no check; cluster-served
+graphs can bind an applied `providers.embedding` profile). Ingest-time `@embed` remains.
 
 ## Invariants & deny-list check
 
