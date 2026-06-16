@@ -265,6 +265,64 @@ requests keep their `Arc`.
 A tenant graduates pooled → dedicated by moving its cell to its own process — **no data
 migration** (the storage root does not move; the cell is already self-contained).
 
+### 5.8 Workload scaling — readers vs writers
+
+The substrate makes read and write scaling **asymmetric**, and the cell model inherits
+and exploits that asymmetry. It is the deployment-shaping fact, so it is part of the
+tenancy design, not an afterthought.
+
+**Reads scale horizontally and statelessly.** The object store is the source of truth;
+a read is snapshot-isolated and holds no shared mutable state, so any number of
+processes can open a snapshot and serve reads with **zero coordination**. Add read
+replicas (even per-region) freely. Per-cell independence means per-tenant read scaling
+is independent. Limits are real but ordinary: object-store request throughput
+(per-prefix S3 limits), index residency + CPU/RAM for *heavy* reads (vector ANN, FTS,
+aggregations), and in-process cache warmth (a cold tenant in a pooled fleet pays a
+cold-open). Freshness is the one catch — a replica's engine handle may lag live HEAD
+([rfc-011](rfc-011-cli-refactoring.md) note), so the read path is eventual within the
+refresh window unless pinned.
+
+**Writes are serialized per `(table, branch)` and scale by partitioning, not by adding
+writers.** A single graph's main-branch write throughput is bounded by commit latency
+(object-store round-trips for stage + manifest CAS) and degrades under concurrency
+(one-winner CAS → retry). You scale writes by *partitioning the write set*:
+
+- more **branches** — different `(table, branch)` queues don't contend; bulk loads fan
+  out onto review branches and **merge** serializes the integration;
+- more **graphs**, more **cells** — fully independent write paths.
+
+Multiple replicas writing the *same* `(cell, graph, branch)` contend on manifest CAS —
+the documented one-winner-CAS territory (invariants.md known gaps: "Local
+`write_text_if_match` is not a cross-process CAS"; "recovery serialized against live
+writers in-process only"). So horizontal write scaling on one branch needs a **single
+active writer/coordinator**, not N racing replicas.
+
+**The deployment shape this implies — split the roles (CQRS at the deployment layer):**
+
+| Role | Scaling | Topology |
+|---|---|---|
+| **Read fleet** | horizontal, stateless, regional | many replicas behind a LB; each opens snapshots from object store |
+| **Write tier** | one active coordinator per `(cell, graph, branch)` | small; consistent-hash or a per-`(graph,branch)` lease routes writes to a single owner to bound CAS thrash |
+| **Maintenance** | single-coordinator, out-of-band | `optimize`/`cleanup`/reindex as async jobs ([rfc-011](rfc-011-cli-refactoring.md) D11), never inline with serving |
+| **Heavy reads** | own pool (optional) | vector/FTS/aggregation isolated so they don't starve point reads |
+
+- **Read-your-write:** the write envelope returns `commit_id` / `snapshot_id`
+  ([rfc-001](rfc-001-queries-envelope-mcp.md)); a client needing RYW pins its next read
+  to that snapshot, or is routed (sticky) to the writer / a freshly-refreshed replica.
+  Otherwise reads are eventual within the handle-refresh window — make that explicit per
+  [rfc-003](rfc-003-mcp-server-surface.md)'s "no silent eventual consistency."
+
+**Cell-model interaction.** Read scaling is per-cell-independent and horizontal; write
+scaling is per-`(cell, graph, branch)`. The cell bounds blast radius and lets a hot
+tenant get a dedicated write coordinator (or its own process — the dedicated tier),
+while the long tail shares a pooled read fleet. The one genuinely hard coordination
+problem is a **pooled write fleet**: two replicas must not own the same `(cell, graph,
+branch)`, so it needs routing affinity or a lease — which ties directly to the
+cross-process-CAS known gap and must be closed before pooled *writes* (pooled *reads*
+are unaffected). Single-writer-per-partition + many-readers is exactly what an
+object-store, log/Git-structured engine wants; the design states it rather than fighting
+it.
+
 ## 6. How the surfaces ride on top
 
 This is a server/topology change; the surfaces are consumers and need little or no
@@ -338,6 +396,11 @@ Today's `omnigraph-server --cluster <one>` is a `MultiCluster` with **one cell**
 - **Scope semantics.** `ResolvedActor.scopes` is currently `[Full]` and read nowhere;
   when OIDC populates real scopes, decide whether/how they feed Cedar context (a
   behavior change to sequence deliberately, not silently).
+- **Pooled-write coordination (§5.8).** A pooled write fleet needs a single active
+  owner per `(cell, graph, branch)` (consistent-hash or lease) and the cross-process
+  CAS gap closed first. Pooled *reads* need none of this; gate pooled *writes* on it.
+  Read-fleet freshness (handle-refresh lag) + read-your-write pinning is the companion
+  decision.
 
 ## 10. Relationship to prior RFCs
 
