@@ -192,7 +192,7 @@ cargo test -p omnigraph-engine --features failpoints --test failpoints   # fault
 cargo build -p omnigraph-server --features aws   # AWS Secrets Manager bearer-token source
 ```
 
-S3-backed tests (`s3_storage`, and the S3 paths in server/CLI system tests) **skip** unless `OMNIGRAPH_S3_TEST_BUCKET` + `AWS_*` (incl. `AWS_ENDPOINT_URL_S3` for non-AWS) are set; CI runs them against containerized RustFS. `scripts/local-rustfs-bootstrap.sh` stands up a local S3 environment.
+S3-backed tests (`s3_storage`, and the S3 paths in server/CLI system tests) **skip** unless `OMNIGRAPH_S3_TEST_BUCKET` + `AWS_*` (incl. `AWS_ENDPOINT_URL_S3` for non-AWS) are set; CI runs them against containerized RustFS. To run RustFS/MinIO yourself, see [docs/user/deployment.md](docs/user/deployment.md) → *Testing against S3 locally*.
 
 CI does **not** run `clippy` or `rustfmt` as gates — but `cargo test --workspace --locked` is the exact gate, so run it before pushing. Two non-test CI checks: `scripts/check-agents-md.sh` (doc cross-link integrity — run it after moving/renaming docs) and OpenAPI drift (`crates/omnigraph-server/tests/openapi.rs` regenerates `openapi.json`; set `OMNIGRAPH_UPDATE_OPENAPI=1` to update the checked-in copy when a server/API change is intentional).
 
@@ -268,7 +268,8 @@ omnigraph policy explain --actor act-alice --action change --branch main
 | HTTP server | — | Axum, OpenAPI via utoipa, bearer auth (SHA-256, AWS Secrets Manager option), `authorize_request` at the HTTP boundary (resolves bearer→actor, applies admission control), NDJSON streaming export, **cluster-only boot (RFC-011): always `--cluster <dir | s3://…>`, serving N graphs (N ≥ 1) under multi-graph routes + read-only `GET /graphs` enumeration + per-graph + server-level Cedar policies. Add/remove graphs via `cluster apply` and restart.** |
 | CLI with config | — | two-surface config (team `cluster.yaml` dir + per-operator `~/.omnigraph/config.yaml`), scope addressing (`--store`/`--server`/`--cluster`/`--profile`/defaults, RFC-011), aliases, multi-format output (json/jsonl/csv/kv/table) |
 | Audit / actor tracking | — | `_as` write APIs + actor map in commit graph |
-| Local RustFS bootstrap | — | `scripts/local-rustfs-bootstrap.sh` one-shot S3-backed dev environment |
+| Local S3 testing | — | run RustFS/MinIO + the `AWS_*` env; see [docs/user/deployment.md](docs/user/deployment.md) → *Testing against S3 locally* |
+| Agent skill | — | `skills/omnigraph` — operational playbook for driving Omnigraph; install with `npx skills add ModernRelay/omnigraph@omnigraph` |
 
 ---
 

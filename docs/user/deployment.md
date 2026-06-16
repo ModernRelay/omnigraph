@@ -129,49 +129,46 @@ shape above) — the simplest AWS architecture.
   unvalidated** — boot is lock-free read-only so it should compose, but it
   is not yet exercised by tests.
 
-## One-Command Local RustFS Bootstrap
+## Testing against S3 locally
 
-The easiest local S3-backed deployment path is:
+To exercise the S3 storage path without a cloud account, run any S3-compatible
+store in Docker and point the standard `AWS_*` environment at it. RustFS is
+shown; MinIO works the same way.
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/ModernRelay/omnigraph/main/scripts/local-rustfs-bootstrap.sh | bash
+docker run -d --name omnigraph-s3 -p 9000:9000 \
+  -e RUSTFS_ACCESS_KEY=omnigraph -e RUSTFS_SECRET_KEY=omnigraph \
+  -e RUSTFS_ALLOW_INSECURE_DEFAULT_CREDENTIALS=true \
+  rustfs/rustfs:latest /data
+
+export AWS_ACCESS_KEY_ID=omnigraph AWS_SECRET_ACCESS_KEY=omnigraph \
+  AWS_REGION=us-east-1 AWS_ENDPOINT_URL_S3=http://127.0.0.1:9000 \
+  AWS_ALLOW_HTTP=true AWS_S3_FORCE_PATH_STYLE=true
+
+# create the bucket once (any S3 client works)
+aws --endpoint-url "$AWS_ENDPOINT_URL_S3" s3 mb s3://omnigraph-local
 ```
 
-The bootstrap:
+Now an `s3://…` URI works anywhere a graph or cluster root is expected. Root a
+cluster on the bucket and serve it config-free:
 
-- starts a local RustFS-backed object store
-- creates a bucket and S3-backed Omnigraph graph
-- loads the checked-in context fixture
-- starts `omnigraph-server` on `127.0.0.1:8080`
+```bash
+# cluster.yaml
+#   version: 1
+#   storage: s3://omnigraph-local/clusters/demo
+#   graphs: { demo: { schema: schema.pg } }
 
-Supported behavior:
+omnigraph cluster validate --config .
+omnigraph cluster import   --config .
+omnigraph cluster apply    --config . --as you
+omnigraph load --data seed.jsonl --mode overwrite \
+  s3://omnigraph-local/clusters/demo/graphs/demo.omni
+omnigraph-server --cluster s3://omnigraph-local/clusters/demo \
+  --bind 127.0.0.1:8080 --unauthenticated
+```
 
-- downloads the rolling `edge` binary when one exists for the current platform
-- otherwise clones `ModernRelay/omnigraph` and builds from source
-- reuses an existing RustFS container if it is already running
-
-Useful overrides:
-
-- `WORKDIR=/path/to/state`
-- `BUCKET=omnigraph-local`
-- `PREFIX=graphs/context`
-- `RESET_REPO=1` to delete an existing partially initialized graph prefix before recreating it
-- `BIND=127.0.0.1:8080`
-- `RUSTFS_CONTAINER_NAME=omnigraph-rustfs-demo`
-
-The bootstrap expects:
-
-- Docker
-- `curl`
-- either a matching release asset or a local Rust toolchain plus `git`
-
-If `aws` is not installed, the script attempts a user-local AWS CLI install via
-`python3 -m pip`. Docker Desktop or another Docker daemon must already be
-running.
-
-If a previous bootstrap left objects behind under the selected `PREFIX` but did
-not finish initializing the graph, rerun with `RESET_REPO=1` or choose a new
-`PREFIX`.
+The same `AWS_*` contract applies to a production object store — swap the
+endpoint and credentials. CI exercises this path against containerized RustFS.
 
 ## Container Deployment
 

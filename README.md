@@ -108,12 +108,44 @@ Graphs are served under `/graphs/{id}/…`. See
 [clusters](docs/user/clusters/index.md) to author one and the
 [server guide](docs/user/operations/server.md) for routes, auth, and policy.
 
-## Starter graphs & agent skills
+## Set it up with an AI agent
 
+Omnigraph is built to be set up by coding agents. Paste this into Claude Code,
+Cursor, or any agent that can read a URL, install a package, and run a shell
+command — it installs the skill, reads the docs, and walks you through setup
+for your use case:
+
+```text
+Help me set up Omnigraph (a lakehouse-native graph engine for agents).
+
+1. Install the Omnigraph skill so you operate it correctly:
+     npx skills add ModernRelay/omnigraph@omnigraph
+2. Read the docs at https://github.com/ModernRelay/omnigraph — start with
+   docs/user/quickstart.md, then docs/user/clusters/index.md.
+3. Skim the starter graphs and seed data in the cookbooks:
+   https://github.com/ModernRelay/omnigraph-cookbooks
+4. Ask me what I want to build (company brain, agent memory, dev graph,
+   research / R&D layer, …). Then install the CLI, stand up a first graph for
+   that use case, load a little data, and run a query so I can see it working.
+```
+
+Works with any agent that can browse a URL, install a package, and run a shell.
+
+## Agent skill & starter graphs
+
+This repo ships the [**`omnigraph` agent skill**](skills/omnigraph) — the
+operational playbook (cluster mode, the two config surfaces, schema evolution,
+query linting, data writes, branches, Cedar policy, and common gotchas) that
+teaches a coding agent to drive Omnigraph correctly. Install it with:
+
+```bash
+npx skills add ModernRelay/omnigraph@omnigraph
+```
+
+For ready-to-run graphs with real seed data (company brain, VC operating
+system, pharma & industry intel),
 [`ModernRelay/omnigraph-cookbooks`](https://github.com/ModernRelay/omnigraph-cookbooks)
-ships ready-to-run graphs (company brain, VC operating system, pharma &
-industry intel) plus agent skills that bootstrap and operate Omnigraph — the
-fastest way to see it shaped to a real domain.
+is the fastest way to see Omnigraph shaped to a real domain.
 
 ## Object storage & production
 
@@ -122,19 +154,11 @@ for shared, multi-host, durable deployments — the manifest and cluster ledger
 use S3 conditional writes, so the lock is genuinely cross-machine. See the
 [deployment guide](docs/user/deployment.md).
 
-To rehearse the S3 path locally without a cloud account, run an S3-compatible
-server such as RustFS or MinIO. The one-command RustFS sandbox (Docker
-required) starts RustFS on `127.0.0.1:9000`, applies an S3-backed cluster,
-loads the checked-in fixture, and serves it on `127.0.0.1:8080`:
-
-```bash
-curl -fsSL https://raw.githubusercontent.com/ModernRelay/omnigraph/main/scripts/local-rustfs-bootstrap.sh | bash
-```
-
-The bootstrap prefers the rolling `edge` binaries and falls back to source
-builds when release assets are unavailable. If a previous run left a
-partially-applied cluster under the same prefix, rerun with `RESET_REPO=1` or
-set `PREFIX` to a new value.
+To rehearse the S3 path locally without a cloud account, run any S3-compatible
+store (RustFS or MinIO) in Docker, point the `AWS_*` env at it, and use an
+`s3://…` URI anywhere a graph or cluster root is expected — the
+[deployment guide](docs/user/deployment.md#testing-against-s3-locally) has the
+exact `docker run` and environment contract.
 
 ## Clients
 
