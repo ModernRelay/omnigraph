@@ -191,10 +191,10 @@ pub enum ServerConfigMode {
     },
 }
 
-/// Where a Cedar policy bundle comes from at startup. File-based for
-/// omnigraph.yaml deployments; inline (digest-verified catalog content)
-/// for cluster-mode boots, where the catalog may live on object storage
-/// and the server must not re-read mutable state after the snapshot.
+/// Where a Cedar policy bundle comes from at startup. Cluster-local files are
+/// used during config application; inline digest-verified catalog content is
+/// used for serving, where the catalog may live on object storage and the
+/// server must not re-read mutable state after the snapshot.
 #[derive(Debug, Clone)]
 pub enum PolicySource {
     File(PathBuf),
@@ -249,12 +249,10 @@ pub struct AppState {
     /// see MR-668 decision Q6.
     workload: Arc<workload::WorkloadController>,
     bearer_tokens: Arc<[(BearerTokenHash, Arc<str>)]>,
-    /// Server-level Cedar policy. Used by management endpoints (`POST
-    /// /graphs`, `GET /graphs`) which act on the registry resource,
-    /// not on a per-graph resource. Loaded from `server.policy.file`
-    /// in `omnigraph.yaml`. `None` outside multi mode and when no
-    /// server policy is configured. Per-graph policies live on each
-    /// `GraphHandle.policy`.
+    /// Server-level Cedar policy. Used by management endpoints (`GET
+    /// /graphs`) which act on the registry resource, not on a per-graph
+    /// resource. Loaded from the cluster-scoped policy binding when
+    /// configured. Per-graph policies live on each `GraphHandle.policy`.
     server_policy: Option<Arc<PolicyEngine>>,
 }
 
@@ -534,12 +532,11 @@ impl AppState {
     }
 
     /// Multi-mode constructor — used by the startup loop. Operators
-    /// reach this by invoking `omnigraph-server --config omnigraph.yaml`
-    /// with a non-empty `graphs:` map.
+    /// reach this by invoking `omnigraph-server --cluster <dir|s3://...>`.
     ///
     /// Caller supplies the already-opened `GraphHandle`s and (optionally)
-    /// the path to the source config file. `server_policy` is loaded
-    /// from `server.policy.file` if configured.
+    /// the path to the source cluster. `server_policy` is loaded from the
+    /// cluster-scoped policy binding if configured.
     pub fn new_multi(
         handles: Vec<Arc<GraphHandle>>,
         bearer_tokens: Vec<(String, String)>,
@@ -993,7 +990,8 @@ pub async fn serve(config: ServerConfig) -> Result<()> {
         ServerRuntimeState::DefaultDeny => warn!(
             "bearer tokens are configured but no policy file is set — running in \
              default-deny mode (only `read` actions are permitted for authenticated \
-             actors). Configure `policy.file` in omnigraph.yaml to enable Cedar rules."
+             actors). Configure a graph or cluster policy bundle in the cluster config, \
+             run `omnigraph cluster apply`, and restart to enable Cedar rules."
         ),
         ServerRuntimeState::PolicyEnabled => {}
     }
@@ -1123,5 +1121,3 @@ async fn shutdown_signal() {
     }
     info!("shutdown signal received");
 }
-
-

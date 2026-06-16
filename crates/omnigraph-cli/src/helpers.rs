@@ -367,12 +367,16 @@ pub(crate) async fn execute_operator_alias(
         }
     }
 
-    let body = (!params.is_empty()).then(|| serde_json::json!({ "params": params }));
+    let mut body = serde_json::Map::new();
+    body.insert("expect_mutation".to_string(), Value::Bool(false));
+    if !params.is_empty() {
+        body.insert("params".to_string(), Value::Object(params));
+    }
     remote_json(
         client,
         Method::POST,
         remote_url(&uri, &["queries", &alias.query], &[])?,
-        body,
+        Some(Value::Object(body)),
         bearer_token.as_deref(),
     )
     .await

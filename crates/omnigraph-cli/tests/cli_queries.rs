@@ -94,6 +94,49 @@ fn alias_unknown_name_errors_listing_defined() {
     );
 }
 
+#[test]
+fn alias_rejects_global_scope_flags_that_the_binding_owns() {
+    for (flag, value) in [
+        ("--server", "dev"),
+        ("--graph", "local"),
+        ("--store", "file:///tmp/graph.omni"),
+        ("--cluster", "."),
+        ("--profile", "prod"),
+        ("--as", "act-op"),
+    ] {
+        let output = output_failure(cli().arg(flag).arg(value).arg("alias").arg("who"));
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(
+            stderr.contains("`alias` uses the server, graph, and stored query")
+                && stderr.contains(flag),
+            "expected {flag} to be rejected by the alias binding guard; got: {stderr}"
+        );
+    }
+}
+
+#[test]
+fn queries_and_policy_wrong_server_scope_points_at_cluster_scope() {
+    let output = output_failure(cli().arg("--server").arg("prod").arg("queries").arg("list"));
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("pass --cluster <dir|uri>") && !stderr.contains("pass --config <dir>"),
+        "queries should point at --cluster, not --config; got: {stderr}"
+    );
+
+    let output = output_failure(
+        cli()
+            .arg("--server")
+            .arg("prod")
+            .arg("policy")
+            .arg("validate"),
+    );
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("pass --cluster <dir|uri>") && !stderr.contains("pass --config <dir>"),
+        "policy should point at --cluster, not --config; got: {stderr}"
+    );
+}
+
 // RFC-011: `queries validate`/`list` source the registry + schemas from a
 // converged cluster's applied state (`--cluster <dir>`), not omnigraph.yaml.
 

@@ -892,6 +892,12 @@ pub(crate) struct ProfileListItem {
     pub(crate) name: String,
     /// `server: <n>` / `cluster: <n>` / `store: <uri>` / `invalid: <reason>`.
     pub(crate) binding: String,
+    /// `server` | `cluster` | `store` | `invalid`.
+    pub(crate) scope_kind: String,
+    /// The bound server/cluster name, or the store URI. `None` when invalid.
+    pub(crate) target: Option<String>,
+    pub(crate) valid: bool,
+    pub(crate) error: Option<String>,
     pub(crate) default_graph: Option<String>,
     pub(crate) active: bool,
 }

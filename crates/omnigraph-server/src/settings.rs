@@ -1,14 +1,13 @@
-//! Server settings: omnigraph.yaml/CLI/env resolution, mode inference
-//! (single vs multi vs cluster), bearer-token sources, and runtime-state
-//! classification (moved verbatim from lib.rs in the modularization).
+//! Server settings: cluster/CLI/env resolution, bearer-token sources, and
+//! runtime-state classification (moved verbatim from lib.rs in the
+//! modularization).
 
 use super::*;
 
 /// Build serving settings from a cluster directory's applied revision
 /// (RFC-005 §D2): graphs at derived roots, stored queries from verified
 /// catalog blob content, policy bundles from blob paths with their applied
-/// bindings. Always multi-graph routing. The unauthenticated/env handling
-/// matches the omnigraph.yaml path.
+/// bindings. Always multi-graph routing.
 pub(crate) async fn load_cluster_settings(
     cluster_dir: &PathBuf,
     cli_bind: Option<String>,
@@ -189,7 +188,8 @@ pub fn classify_server_runtime_state(
             "server has no bearer tokens and no policy file configured. This is a fully \
              open server — pass `--unauthenticated` (or set OMNIGRAPH_UNAUTHENTICATED=1) \
              if you actually want that, otherwise configure bearer tokens (see \
-             docs/user/operations/server.md) and/or `policy.file` in omnigraph.yaml."
+             docs/user/operations/server.md) and a graph or cluster policy bundle in \
+             the cluster config, then run `omnigraph cluster apply` and restart."
         ),
         (false, false, true) => Ok(ServerRuntimeState::Open),
         (true, false, _) => Ok(ServerRuntimeState::DefaultDeny),

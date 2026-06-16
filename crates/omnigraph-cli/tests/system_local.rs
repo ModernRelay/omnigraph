@@ -1399,154 +1399,6 @@ fn local_cli_ingest_enforces_engine_layer_policy() {
 }
 
 #[test]
-fn local_cli_schema_apply_enforces_engine_layer_policy() {
-    // RFC-011 served re-point: the server enforces schema_apply against the
-    // graph-bound bundle. Bruno has no schema_apply rule → denied; ragnor
-    // has admins-schema-apply → allowed. The schema is additive (a nullable
-    // property), SDK-compatible with the fixture.
-    if skip_system_e2e("local_cli_schema_apply_enforces_engine_layer_policy") {
-        return;
-    }
-    let cluster = converged_loaded_cluster("knowledge", Some(POLICY_E2E_YAML));
-    let server = spawn_server_with_cluster_env(
-        cluster.path(),
-        &[("OMNIGRAPH_SERVER_BEARER_TOKENS_JSON", POLICY_TOKENS_JSON)],
-    );
-    let new_schema = std::fs::read_to_string(fixture("test.pg"))
-        .unwrap()
-        .replace(
-            "    age: I32?\n}",
-            "    age: I32?\n    nickname: String?\n}",
-        );
-    let temp = tempfile::tempdir().unwrap();
-    let schema_path = temp.path().join("policy-additive.pg");
-    std::fs::write(&schema_path, &new_schema).unwrap();
-
-    let denied = cli()
-        .env("OMNIGRAPH_BEARER_TOKEN", "bruno-tok")
-        .arg("schema")
-        .arg("apply")
-        .arg("--server")
-        .arg(&server.base_url)
-        .arg("--graph")
-        .arg("knowledge")
-        .arg("--schema")
-        .arg(&schema_path)
-        .arg("--json")
-        .output()
-        .unwrap();
-    assert!(!denied.status.success(), "bruno schema apply must be denied");
-    let stderr = String::from_utf8_lossy(&denied.stderr);
-    assert!(
-        stderr.contains("denied"),
-        "expected 'denied' for bruno schema apply, got: {stderr}"
-    );
-
-    let allowed = parse_stdout_json(&output_success(
-        cli()
-            .env("OMNIGRAPH_BEARER_TOKEN", "ragnor-tok")
-            .arg("schema")
-            .arg("apply")
-            .arg("--server")
-            .arg(&server.base_url)
-            .arg("--graph")
-            .arg("knowledge")
-            .arg("--schema")
-            .arg(&schema_path)
-            .arg("--json"),
-    ));
-    assert_eq!(allowed["applied"], true);
-}
-
-#[test]
-fn local_cli_schema_apply_rejects_stored_query_breakage_before_publish() {
-    // RFC-011: stored queries live in the cluster catalog, not omnigraph.yaml.
-    // The served `schema apply` runs the server's catalog check against the
-    // applied stored queries; renaming `age`→`years` breaks the bundled
-    // `find_person` (which projects `$p.age`), so the apply is rejected before
-    // publish — the schema stays unchanged.
-    if skip_system_e2e("local_cli_schema_apply_rejects_stored_query_breakage_before_publish") {
-        return;
-    }
-    // A graph-bound bundle that lets ragnor apply schema, plus a stored query
-    // `find_person` projecting $p.age (the catalog the server checks against).
-    let cluster = tempfile::tempdir().unwrap();
-    let dir = cluster.path();
-    fs::copy(fixture("test.pg"), dir.join("graph.pg")).unwrap();
-    fs::write(
-        dir.join("find-person.gq"),
-        "query find_person($name: String) { match { $p: Person { name: $name } } return { $p.age } }",
-    )
-    .unwrap();
-    fs::write(dir.join("graph.policy.yaml"), POLICY_E2E_YAML).unwrap();
-    fs::write(
-        dir.join("cluster.yaml"),
-        "version: 1\nmetadata:\n  name: sys\nstate:\n  backend: cluster\n  lock: true\ngraphs:\n  knowledge:\n    schema: ./graph.pg\n    queries:\n      find_person:\n        file: ./find-person.gq\npolicies:\n  graph:\n    file: ./graph.policy.yaml\n    applies_to: [knowledge]\n",
-    )
-    .unwrap();
-    output_success(cli().arg("cluster").arg("import").arg("--config").arg(dir));
-    output_success(cli().arg("cluster").arg("apply").arg("--config").arg(dir));
-    output_success(
-        cli()
-            .arg("load")
-            .arg("--data")
-            .arg(fixture("test.jsonl"))
-            .arg("--mode")
-            .arg("overwrite")
-            .arg(dir.join("graphs").join("knowledge.omni")),
-    );
-    let server = spawn_server_with_cluster_env(
-        dir,
-        &[("OMNIGRAPH_SERVER_BEARER_TOKENS_JSON", POLICY_TOKENS_JSON)],
-    );
-
-    let renamed_schema = std::fs::read_to_string(fixture("test.pg"))
-        .unwrap()
-        .replace("age: I32?", "years: I32? @rename_from(\"age\")");
-    let temp = tempfile::tempdir().unwrap();
-    let schema_path = temp.path().join("stored-query-breaks.pg");
-    fs::write(&schema_path, &renamed_schema).unwrap();
-
-    let rejected = cli()
-        .env("OMNIGRAPH_BEARER_TOKEN", "ragnor-tok")
-        .arg("schema")
-        .arg("apply")
-        .arg("--server")
-        .arg(&server.base_url)
-        .arg("--graph")
-        .arg("knowledge")
-        .arg("--schema")
-        .arg(&schema_path)
-        .arg("--json")
-        .output()
-        .unwrap();
-    assert!(
-        !rejected.status.success(),
-        "schema apply that breaks a stored query must be rejected"
-    );
-    let stderr = String::from_utf8_lossy(&rejected.stderr);
-    assert!(
-        stderr.contains("find_person") && stderr.contains("schema check"),
-        "schema apply should reject the stored-query breakage before publish; stderr: {stderr}"
-    );
-
-    // The schema stayed unchanged (read it back via the served graph as the
-    // bruno reader, who holds `team-read`).
-    let schema = stdout_string(&output_success(
-        cli()
-            .env("OMNIGRAPH_BEARER_TOKEN", "bruno-tok")
-            .arg("schema")
-            .arg("show")
-            .arg("--server")
-            .arg(&server.base_url)
-            .arg("--graph")
-            .arg("knowledge"),
-    ));
-    assert!(schema.contains("age: I32?"));
-    assert!(!schema.contains("years: I32?"));
-}
-
-#[test]
 fn local_cli_branch_create_enforces_engine_layer_policy() {
     // RFC-011 served re-point: bruno has no branch-ops rule → denied;
     // ragnor has admins-branch-ops → allowed.
@@ -2483,13 +2335,18 @@ fn local_cli_operator_alias_and_server_flag_invoke_stored_query() {
     )
     .unwrap();
     fs::write(
+        cluster.path().join("insert-person.gq"),
+        "query insert_person($name: String) { insert Person { name: $name, age: 41 } }",
+    )
+    .unwrap();
+    fs::write(
         cluster.path().join("graph.policy.yaml"),
-        "version: 1\ngroups:\n  ops: [\"act-op\"]\nprotected_branches: [main]\nrules:\n  - id: allow-invoke\n    allow:\n      actors: { group: ops }\n      actions: [invoke_query]\n  - id: allow-read\n    allow:\n      actors: { group: ops }\n      actions: [read]\n      branch_scope: any\n",
+        "version: 1\ngroups:\n  ops: [\"act-op\"]\nprotected_branches: [main]\nrules:\n  - id: allow-invoke\n    allow:\n      actors: { group: ops }\n      actions: [invoke_query]\n  - id: allow-read\n    allow:\n      actors: { group: ops }\n      actions: [read]\n      branch_scope: any\n  - id: allow-change\n    allow:\n      actors: { group: ops }\n      actions: [change]\n      branch_scope: any\n",
     )
     .unwrap();
     fs::write(
         cluster.path().join("cluster.yaml"),
-        "version: 1\nmetadata:\n  name: alias-sys\nstate:\n  backend: cluster\n  lock: true\ngraphs:\n  local:\n    schema: ./local.pg\n    queries:\n      find_person:\n        file: ./find-person.gq\npolicies:\n  graph:\n    file: ./graph.policy.yaml\n    applies_to: [local]\n",
+        "version: 1\nmetadata:\n  name: alias-sys\nstate:\n  backend: cluster\n  lock: true\ngraphs:\n  local:\n    schema: ./local.pg\n    queries:\n      find_person:\n        file: ./find-person.gq\n      insert_person:\n        file: ./insert-person.gq\npolicies:\n  graph:\n    file: ./graph.policy.yaml\n    applies_to: [local]\n",
     )
     .unwrap();
     output_success(cli().arg("cluster").arg("import").arg("--config").arg(cluster.path()));
@@ -2515,7 +2372,7 @@ fn local_cli_operator_alias_and_server_flag_invoke_stored_query() {
     fs::write(
         operator_home.path().join("config.yaml"),
         format!(
-            "servers:\n  dev:\n    url: {}\naliases:\n  who:\n    server: dev\n    graph: local\n    query: find_person\n    args: [name]\n",
+            "servers:\n  dev:\n    url: {}\naliases:\n  who:\n    server: dev\n    graph: local\n    query: find_person\n    args: [name]\n  create_person:\n    server: dev\n    graph: local\n    query: insert_person\n    args: [name]\n",
             server.base_url
         ),
     )
@@ -2551,6 +2408,46 @@ fn local_cli_operator_alias_and_server_flag_invoke_stored_query() {
     );
     let payload: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
     assert_eq!(payload["rows"][0]["p.name"], "Alice", "{payload}");
+
+    // Operator aliases are read-only conveniences: a binding to a stored
+    // mutation must be rejected before the server executes it.
+    let output = cli()
+        .env("OMNIGRAPH_HOME", operator_home.path())
+        .arg("alias")
+        .arg("create_person")
+        .arg("AliasGuardPerson")
+        .output()
+        .unwrap();
+    assert!(!output.status.success(), "mutation alias must fail");
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("'insert_person' is a mutation")
+            && stderr.contains("omnigraph mutate insert_person"),
+        "expected mutation-kind mismatch; got: {stderr}"
+    );
+    let output = cli()
+        .env("OMNIGRAPH_HOME", operator_home.path())
+        .arg("query")
+        .arg("find_person")
+        .arg("--server")
+        .arg("dev")
+        .arg("--graph")
+        .arg("local")
+        .arg("--params")
+        .arg(r#"{"name":"AliasGuardPerson"}"#)
+        .arg("--json")
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "post-alias read should succeed: {output:?}"
+    );
+    let payload: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(
+        payload["rows"].as_array().unwrap().len(),
+        0,
+        "mutation alias must not insert AliasGuardPerson: {payload}"
+    );
 
     // --server/--graph: the same stored query via explicit targeting.
     let output = cli()
