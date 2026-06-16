@@ -21,7 +21,7 @@ pub(super) async fn graph_index_for_resolved(
     db.runtime_cache.graph_index(resolved, &catalog).await
 }
 
-pub(super) async fn ensure_indices(db: &Omnigraph) -> Result<()> {
+pub(super) async fn ensure_indices(db: &Omnigraph) -> Result<Vec<PendingIndex>> {
     let current_branch = db
         .coordinator
         .read()
@@ -31,7 +31,7 @@ pub(super) async fn ensure_indices(db: &Omnigraph) -> Result<()> {
     ensure_indices_for_branch(db, current_branch.as_deref()).await
 }
 
-pub(super) async fn ensure_indices_on(db: &Omnigraph, branch: &str) -> Result<()> {
+pub(super) async fn ensure_indices_on(db: &Omnigraph, branch: &str) -> Result<Vec<PendingIndex>> {
     let branch = normalize_branch_name(branch)?;
     ensure_indices_for_branch(db, branch.as_deref()).await
 }
@@ -73,12 +73,16 @@ pub(super) async fn failpoint_publish_table_head_without_index_rebuild_for_test(
     .await
 }
 
-pub(super) async fn ensure_indices_for_branch(db: &Omnigraph, branch: Option<&str>) -> Result<()> {
+pub(super) async fn ensure_indices_for_branch(
+    db: &Omnigraph,
+    branch: Option<&str>,
+) -> Result<Vec<PendingIndex>> {
     db.ensure_schema_state_valid().await?;
     db.ensure_schema_apply_idle("ensure_indices").await?;
     let resolved = db.resolved_branch_target(branch).await?;
     let snapshot = resolved.snapshot;
     let mut updates = Vec::new();
+    let mut pending = Vec::new();
     let active_branch = resolved.branch;
     let catalog = db.catalog();
 
@@ -160,9 +164,8 @@ pub(super) async fn ensure_indices_for_branch(db: &Omnigraph, branch: Option<&st
     // that needs index work. Held across the per-table commit loop and
     // the manifest publish at the end of this function. Sorted-order
     // acquisition prevents lock-order inversion against concurrent
-    // multi-table writers (mutation finalize, branch_merge, future
-    // MR-870 recovery). Under PR 1b's intermediate state (global server
-    // RwLock still in place), this acquisition is uncontended.
+    // multi-table writers (mutation finalize, branch_merge, the fork
+    // path, recovery).
     let queue_keys: Vec<(String, Option<String>)> = recovery_pins
         .iter()
         .map(|pin| (pin.table_key.clone(), pin.table_branch.clone()))
@@ -217,7 +220,7 @@ pub(super) async fn ensure_indices_for_branch(db: &Omnigraph, branch: Option<&st
         };
         let row_count = db.storage().count_rows(&ds, None).await.unwrap_or(0);
         if row_count > 0 {
-            build_indices_on_dataset(db, &table_key, &mut ds).await?;
+            pending.extend(build_indices_on_dataset(db, &table_key, &mut ds).await?);
         }
 
         let state = db.storage().table_state(&full_path, &ds).await?;
@@ -265,7 +268,7 @@ pub(super) async fn ensure_indices_for_branch(db: &Omnigraph, branch: Option<&st
         };
         let row_count = db.storage().count_rows(&ds, None).await.unwrap_or(0);
         if row_count > 0 {
-            build_indices_on_dataset(db, &table_key, &mut ds).await?;
+            pending.extend(build_indices_on_dataset(db, &table_key, &mut ds).await?);
         }
 
         let state = db.storage().table_state(&full_path, &ds).await?;
@@ -307,7 +310,7 @@ pub(super) async fn ensure_indices_for_branch(db: &Omnigraph, branch: Option<&st
         }
     }
 
-    Ok(())
+    Ok(pending)
 }
 
 /// The single scalar/vector index a node property receives from a one-column
@@ -352,6 +355,26 @@ fn node_prop_index_kind(prop_type: &PropType) -> Option<NodePropIndexKind> {
     }
 }
 
+/// Whether a vector column currently has at least one non-null vector — the
+/// minimum for Lance IVF k-means to train (the `ivf_flat(1)` index we build
+/// needs >=1 vector). Used identically by `needs_index_work_node` (so an
+/// untrainable column is not pinned for recovery — avoiding a zero-commit pin
+/// that would roll back a sibling's index work) and by the vector build arm (so
+/// `create_vector_index` is only attempted when it can succeed, keeping its
+/// genuine errors fatal instead of swallowed as pending). If index params
+/// become size-aware (dev-graph iss-687), this threshold moves with them.
+async fn vector_column_trainable(
+    db: &Omnigraph,
+    ds: &SnapshotHandle,
+    column: &str,
+) -> Result<bool> {
+    Ok(db
+        .storage()
+        .count_rows(ds, Some(format!("{column} IS NOT NULL")))
+        .await?
+        > 0)
+}
+
 /// Returns true if the node table is missing at least one declared
 /// scalar/vector index that `build_indices_on_dataset_for_catalog` would
 /// build AND has at least one row (the ensure_indices loop has
@@ -366,7 +389,7 @@ fn node_prop_index_kind(prop_type: &PropType) -> Option<NodePropIndexKind> {
 /// (DateTime/Date/numeric/Bool), FTS for free-text Strings, or a Vector index.
 /// Edges get BTree only (id, src, dst). This helper and the builder share
 /// `node_prop_index_kind` so they cannot drift — see its doc comment.
-async fn needs_index_work_node(
+pub(super) async fn needs_index_work_node(
     db: &Omnigraph,
     type_name: &str,
     table_key: &str,
@@ -409,7 +432,14 @@ async fn needs_index_work_node(
                 }
             }
             Some(NodePropIndexKind::Vector) => {
-                if !db.storage().has_vector_index(&ds, prop_name).await? {
+                // Only count a missing vector index as buildable *work* when the
+                // column is trainable (>=1 non-null vector). An untrainable
+                // column would defer in the build and commit nothing; pinning it
+                // for recovery would be a zero-commit pin that classifies
+                // NoMovement and rolls back a sibling table's index work.
+                if !db.storage().has_vector_index(&ds, prop_name).await?
+                    && vector_column_trainable(db, &ds, prop_name).await?
+                {
                     return Ok(true);
                 }
             }
@@ -434,7 +464,7 @@ async fn needs_index_work_node(
 ///
 /// Empty edge tables are skipped by the ensure_indices loop the same
 /// way node tables are; see `needs_index_work_node`.
-async fn needs_index_work_edge(
+pub(super) async fn needs_index_work_edge(
     db: &Omnigraph,
     table_key: &str,
     full_path: &str,
@@ -551,8 +581,14 @@ pub(super) async fn open_owned_dataset_for_branch_write(
                     ));
                 }
             }
-            fork_dataset_from_entry_state(
-                db,
+            // The fork advances Lance state before the manifest publish. The
+            // caller holds the per-(table, active_branch) write queue from
+            // before this fork through the publish, so a leftover ref is a
+            // manifest-unreferenced fork (interrupted prior fork, or
+            // delete+recreate), not a live in-process fork. The wrapper
+            // self-heals it (reclaim + re-fork); see
+            // `Omnigraph::fork_dataset_from_entry_state`.
+            db.fork_dataset_from_entry_state(
                 table_key,
                 full_path,
                 source_branch,
@@ -580,7 +616,7 @@ pub(super) async fn fork_dataset_from_entry_state(
     source_branch: Option<&str>,
     source_version: u64,
     active_branch: &str,
-) -> Result<SnapshotHandle> {
+) -> Result<crate::storage_layer::ForkOutcome<SnapshotHandle>> {
     db.storage()
         .fork_branch_from_state(
             full_path,
@@ -590,6 +626,172 @@ pub(super) async fn fork_dataset_from_entry_state(
             active_branch,
         )
         .await
+}
+
+/// Classification of a Lance branch ref `B` on table `T` against FRESH manifest
+/// authority — the single decision both fork-ref reclaim sites share: the
+/// write-path reclaim ([`reclaim_orphaned_fork_and_refork`]) and the cleanup
+/// reconciler (`optimize::reconcile_orphaned_branches`). Having one classifier
+/// keeps the two destructive sites from drifting (the bug history: each was
+/// hardened separately and the other lagged).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ForkRefStatus {
+    /// The manifest places `T` on `B` — a legitimate fork. Never destroy.
+    Legitimate,
+    /// The manifest does not reference this fork (`T` not on `B`, or `B` absent
+    /// from the manifest entirely). Reclaimable.
+    Orphan,
+    /// Fresh authority could not be established (a transient read failure on a
+    /// live branch). Ambiguous — do not destroy; the caller retries / converges.
+    Indeterminate,
+}
+
+/// Classify a fork ref from FRESH manifest authority (bypasses the coordinator
+/// cache). MUST be called with the per-`(table, branch)` write queue held, so
+/// the classification is stable against in-process writers for the caller's
+/// critical section. Both reclaim sites map the result to their own action
+/// (write path: reclaim vs retryable; cleanup: delete vs skip), but the
+/// destroy-only-on-`Orphan` rule is enforced here, once.
+pub(crate) async fn classify_fork_ref(
+    db: &Omnigraph,
+    table_key: &str,
+    branch: &str,
+) -> ForkRefStatus {
+    // `classify.fresh_read` failpoint: simulate a transient failure of the
+    // fresh-authority read (no-op without the `failpoints` feature). Lets a
+    // test exercise the Indeterminate path — a read failure on a live branch
+    // must classify as Indeterminate (skip), never Orphan (destroy).
+    let fresh = match crate::failpoints::maybe_fail("classify.fresh_read") {
+        Ok(()) => db.fresh_snapshot_for_branch(Some(branch)).await,
+        Err(injected) => Err(injected),
+    };
+    match fresh {
+        Ok(snap) => {
+            let placed = snap
+                .entry(table_key)
+                .map(|e| e.table_branch.as_deref() == Some(branch))
+                .unwrap_or(false);
+            if placed {
+                ForkRefStatus::Legitimate
+            } else {
+                // Branch resolves but the manifest does not place this table on
+                // it — a manifest-unreferenced fork.
+                ForkRefStatus::Orphan
+            }
+        }
+        // Branch did not resolve. `all_branches` lists `_refs/branches/` live, so
+        // absent there = genuinely no such manifest branch (origin-1 orphan);
+        // present (or a list error) = transient read — never destroy on that.
+        Err(_) => match db.coordinator.read().await.all_branches().await {
+            Ok(fresh) if !fresh.iter().any(|b| b == branch) => ForkRefStatus::Orphan,
+            _ => ForkRefStatus::Indeterminate,
+        },
+    }
+}
+
+/// Reclaim a manifest-unreferenced fork and re-fork in its place.
+///
+/// Reached when `fork_branch_from_state` reports `RefAlreadyExists`. This is a
+/// destructive op (it force-deletes a Lance branch ref), so it owns its own
+/// safety precondition rather than trusting the caller's: it re-derives, via
+/// [`classify_fork_ref`], that the manifest does not place this table on
+/// `active_branch`. The caller's earlier proof may have come from the
+/// coordinator's *cached* branch snapshot (`resolved_branch_target` returns
+/// the cache when the handle is bound to `active_branch` — an embedded handle
+/// on the branch, or `branch_merge`'s target swap); trusting it could
+/// force-delete a fork a concurrent writer just legitimately published. Only
+/// once fresh authority confirms the ref is unreferenced does it drop the ref
+/// (idempotent `force_delete_branch`) and re-fork, exactly once.
+///
+/// If fresh authority shows the table IS on `active_branch` (a legitimate
+/// concurrent fork), or a second collision occurs after reclaim (a foreign-
+/// process writer recreated the ref — the documented one-winner-CAS gap), it
+/// surfaces a retryable conflict; on retry the winner's fork is visible and
+/// the no-fork path runs.
+pub(super) async fn reclaim_orphaned_fork_and_refork(
+    db: &Omnigraph,
+    table_key: &str,
+    full_path: &str,
+    source_branch: Option<&str>,
+    source_version: u64,
+    active_branch: &str,
+) -> Result<SnapshotHandle> {
+    // Self-validate against FRESH authority before destroying anything. Only an
+    // Orphan is reclaimable; a Legitimate status (a concurrent writer published
+    // a real fork despite the caller's possibly-cached proof) or an
+    // Indeterminate one (transient read) surfaces a retryable conflict rather
+    // than stranding the manifest at a version the recreated ref won't have.
+    match classify_fork_ref(db, table_key, active_branch).await {
+        ForkRefStatus::Orphan => {}
+        ForkRefStatus::Legitimate => {
+            let actual = db
+                .fresh_snapshot_for_branch(Some(active_branch))
+                .await
+                .ok()
+                .and_then(|s| s.entry(table_key).map(|e| e.table_version))
+                .unwrap_or(source_version);
+            return Err(OmniError::manifest_expected_version_mismatch(
+                table_key,
+                source_version,
+                actual,
+            ));
+        }
+        ForkRefStatus::Indeterminate => {
+            return Err(OmniError::manifest_conflict(format!(
+                "could not verify whether branch '{active_branch}' still owns an orphaned \
+                 fork for table '{table_key}' because fresh manifest authority was \
+                 unavailable; refresh and retry"
+            )));
+        }
+    }
+
+    crate::failpoints::maybe_fail("fork.before_reclaim")?;
+    db.storage()
+        .force_delete_branch(full_path, active_branch)
+        .await
+        .map_err(|e| {
+            // Lance refuses to delete a branch with dependent child branches
+            // even under force (RefConflict). Unreachable for a leaf first-write
+            // fork (the cleanup reconciler also drops children before parents),
+            // but surface it actionably if it ever happens. We match loosely on
+            // "referenc" rather than the exact prose, which is not a Lance API
+            // contract; a typed RefConflict variant through `force_delete_branch`
+            // is the durable follow-up.
+            if e.to_string().contains("referenc") {
+                OmniError::manifest_conflict(format!(
+                    "branch '{active_branch}' cannot reclaim the leftover fork for \
+                     table '{table_key}' because it has dependent child branches; \
+                     delete the child branches (or run `omnigraph cleanup`) first"
+                ))
+            } else {
+                e
+            }
+        })?;
+
+    match fork_dataset_from_entry_state(
+        db,
+        table_key,
+        full_path,
+        source_branch,
+        source_version,
+        active_branch,
+    )
+    .await?
+    {
+        crate::storage_layer::ForkOutcome::Created(ds) => Ok(ds),
+        crate::storage_layer::ForkOutcome::RefAlreadyExists => {
+            let live = db.fresh_snapshot_for_branch(Some(active_branch)).await?;
+            let actual = live
+                .entry(table_key)
+                .map(|e| e.table_version)
+                .unwrap_or(source_version);
+            Err(OmniError::manifest_expected_version_mismatch(
+                table_key,
+                source_version,
+                actual,
+            ))
+        }
+    }
 }
 
 pub(super) async fn reopen_for_mutation(
@@ -632,11 +834,25 @@ pub(super) async fn open_dataset_at_state(
         .await
 }
 
+/// A declared index the builder could not materialize on this pass. Today the
+/// only such case is a vector (IVF) column with no trainable vectors yet
+/// (KMeans needs >=1 vector), e.g. the load-before-embed window. Reported, not
+/// fatal: a later `ensure_indices`/`optimize` retries once the column is
+/// buildable, and reads stay correct via brute-force meanwhile. Surfacing
+/// pending index *status* rather than failing the operation is the database
+/// norm (Postgres `indisvalid`, LanceDB `list_indices`).
+#[derive(Debug, Clone)]
+pub struct PendingIndex {
+    pub table_key: String,
+    pub column: String,
+    pub reason: String,
+}
+
 pub(super) async fn build_indices_on_dataset(
     db: &Omnigraph,
     table_key: &str,
     ds: &mut SnapshotHandle,
-) -> Result<()> {
+) -> Result<Vec<PendingIndex>> {
     let catalog = db.catalog();
     build_indices_on_dataset_for_catalog(db, &catalog, table_key, ds).await
 }
@@ -646,8 +862,9 @@ pub(super) async fn build_indices_on_dataset_for_catalog(
     catalog: &Catalog,
     table_key: &str,
     ds: &mut SnapshotHandle,
-) -> Result<()> {
+) -> Result<Vec<PendingIndex>> {
     if let Some(type_name) = table_key.strip_prefix("node:") {
+        let mut pending = Vec::new();
         if !db.storage().has_btree_index(ds, "id").await? {
             stage_and_commit_btree(db, table_key, ds, &["id"]).await?;
         }
@@ -676,22 +893,52 @@ pub(super) async fn build_indices_on_dataset_for_catalog(
                         }
                         Some(NodePropIndexKind::Vector) => {
                             if !db.storage().has_vector_index(ds, prop_name).await? {
-                                // Inline-commit residual: lance-6.0.1 does not
-                                // expose `build_index_metadata_from_segments` as
-                                // `pub`, so vector indices cannot be staged from
-                                // outside the lance crate. Document at the call
-                                // site; companion ticket to lance-format/lance#6658.
-                                let new_snap = db
-                                    .storage_inline_residual()
-                                    .create_vector_index(ds.clone(), prop_name.as_str())
-                                    .await
-                                    .map_err(|e| {
-                                        OmniError::Lance(format!(
-                                            "create Vector index on {}({}): {}",
-                                            table_key, prop_name, e
-                                        ))
-                                    })?;
-                                *ds = new_snap;
+                                // A vector (IVF) index trains k-means over the column,
+                                // so it needs >=1 non-null vector (KMeans errors
+                                // "cannot train N centroids with 0 vectors"). Precheck
+                                // trainability: a column with no vectors yet (e.g. rows
+                                // loaded before `embed`) is recorded as a *pending*
+                                // index and skipped — deferred, not failed. The SAME
+                                // predicate gates `needs_index_work_node`, so an
+                                // untrainable column is never pinned for recovery (no
+                                // zero-commit pin that would roll back a sibling
+                                // table's index work). This function is the chokepoint
+                                // every write path funnels through (load/mutate, schema
+                                // apply, ensure_indices, optimize, merge), realizing
+                                // the governing principle — physical index state never
+                                // fails a logical operation. Only when trainable do we
+                                // attempt the build, and then we PROPAGATE any error: a
+                                // genuine I/O/manifest/Lance failure must stay fatal,
+                                // not be hidden as pending. (Vector creation is an
+                                // inline-commit residual until lance#6666; iss-951.)
+                                if vector_column_trainable(db, ds, prop_name).await? {
+                                    let new_snap = db
+                                        .storage_inline_residual()
+                                        .create_vector_index(ds.clone(), prop_name.as_str())
+                                        .await
+                                        .map_err(|e| {
+                                            OmniError::Lance(format!(
+                                                "create Vector index on {}({}): {}",
+                                                table_key, prop_name, e
+                                            ))
+                                        })?;
+                                    *ds = new_snap;
+                                } else {
+                                    tracing::info!(
+                                        target: "omnigraph::index",
+                                        table = %table_key,
+                                        column = %prop_name,
+                                        "deferring Vector index: column has no \
+                                         trainable vectors yet",
+                                    );
+                                    pending.push(PendingIndex {
+                                        table_key: table_key.to_string(),
+                                        column: prop_name.clone(),
+                                        reason: "column has no non-null vectors to \
+                                                 train on yet"
+                                            .to_string(),
+                                    });
+                                }
                             }
                         }
                         // Enum + orderable scalars (DateTime/Date/numeric/Bool)
@@ -709,7 +956,7 @@ pub(super) async fn build_indices_on_dataset_for_catalog(
                 }
             }
         }
-        return Ok(());
+        return Ok(pending);
     }
 
     if table_key.starts_with("edge:") {
@@ -722,7 +969,9 @@ pub(super) async fn build_indices_on_dataset_for_catalog(
         if !db.storage().has_btree_index(ds, "dst").await? {
             stage_and_commit_btree(db, table_key, ds, &["dst"]).await?;
         }
-        return Ok(());
+        // Edge tables only get BTree (id/src/dst), which build at any
+        // cardinality; no pending state is possible here.
+        return Ok(Vec::new());
     }
 
     Err(OmniError::manifest(format!(
@@ -844,7 +1093,11 @@ async fn prepare_updates_for_commit(
                 crate::db::MutationOpKind::SchemaRewrite,
             )
             .await?;
-            build_indices_on_dataset(db, &prepared_update.table_key, &mut ds).await?;
+            // Any column not yet buildable (e.g. a vector column whose rows
+            // have null embeddings) is deferred and logged inside
+            // build_indices; a later ensure_indices/optimize materializes it.
+            // The load/mutate/merge commit must not fail on it.
+            let _pending = build_indices_on_dataset(db, &prepared_update.table_key, &mut ds).await?;
             let state = db.storage().table_state(&full_path, &ds).await?;
             prepared_update.table_version = state.version;
             prepared_update.row_count = state.row_count;
@@ -1044,4 +1297,81 @@ pub(super) async fn ensure_commit_graph_initialized(db: &Omnigraph) -> Result<()
 
 pub(super) async fn invalidate_graph_index(db: &Omnigraph) {
     db.runtime_cache.invalidate_all().await;
+}
+
+#[cfg(test)]
+mod classify_fork_ref_tests {
+    //! Direct coverage of [`classify_fork_ref`] — the single fresh-authority
+    //! decision both fork-ref reclaim sites (write-path reclaim + cleanup
+    //! reconciler) route through. Pins each deterministic status so reverting
+    //! the fresh-authority logic at either site fails here. (The `Indeterminate`
+    //! arm needs an injected transient read and is covered under the
+    //! `failpoints` suite.)
+    use super::*;
+    use crate::db::Omnigraph;
+    use crate::loader::LoadMode;
+
+    const SCHEMA: &str = "node Person { name: String @key }\nnode Company { name: String @key }\n";
+
+    /// On-disk dataset path for a node table, taken from the manifest entry
+    /// (the same path the engine uses) so the test forges against the real ref.
+    async fn node_path(db: &Omnigraph, branch: &str, table_key: &str) -> String {
+        let snap = db.snapshot_for_branch(Some(branch)).await.unwrap();
+        let entry = snap.entry(table_key).unwrap();
+        format!("{}/{}", db.root_uri, entry.table_path)
+    }
+
+    #[tokio::test]
+    async fn classify_distinguishes_legitimate_unreferenced_and_ghost() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = Omnigraph::init(dir.path().to_str().unwrap(), SCHEMA)
+            .await
+            .unwrap();
+        db.branch_create("feature").await.unwrap();
+
+        // Legitimate: a real write forks Company onto `feature`, and the
+        // manifest places Company on `feature`.
+        db.load_as(
+            "feature",
+            None,
+            r#"{"type":"Company","data":{"name":"Acme"}}"#,
+            LoadMode::Merge,
+            None,
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            classify_fork_ref(&db, "node:Company", "feature").await,
+            ForkRefStatus::Legitimate,
+            "a manifest-placed fork must classify as Legitimate (never destroyed)"
+        );
+
+        // Orphan (manifest-unreferenced): forge a `feature` ref on Person, which
+        // the manifest's `feature` snapshot still places on main.
+        let person = node_path(&db, "feature", "node:Person").await;
+        {
+            // forbidden-api-allow: test synthesizes a branch ref directly on the Lance dataset.
+            let mut ds = lance::Dataset::open(&person).await.unwrap();
+            let v = ds.version().version;
+            ds.create_branch("feature", v, None).await.unwrap();
+        }
+        assert_eq!(
+            classify_fork_ref(&db, "node:Person", "feature").await,
+            ForkRefStatus::Orphan,
+            "a ref the manifest does not place on the branch must classify as Orphan"
+        );
+
+        // Orphan (ghost): a ref for a branch the manifest does not have at all.
+        {
+            // forbidden-api-allow: test synthesizes a branch ref directly on the Lance dataset.
+            let mut ds = lance::Dataset::open(&person).await.unwrap();
+            let v = ds.version().version;
+            ds.create_branch("ghost", v, None).await.unwrap();
+        }
+        assert_eq!(
+            classify_fork_ref(&db, "node:Person", "ghost").await,
+            ForkRefStatus::Orphan,
+            "a ref for a branch absent from the manifest must classify as Orphan"
+        );
+    }
 }

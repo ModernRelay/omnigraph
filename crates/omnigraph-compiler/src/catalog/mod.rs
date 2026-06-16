@@ -26,6 +26,15 @@ pub struct InterfaceType {
     pub properties: HashMap<String, PropType>,
 }
 
+/// The `@embed` binding for a vector property: its source text property and,
+/// optionally, the embedding model recorded by `@embed("source", model="…")`.
+/// The model is what the query-time same-space check validates against.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct EmbedSource {
+    pub source: String,
+    pub model: Option<String>,
+}
+
 #[derive(Debug, Clone)]
 pub struct NodeType {
     pub name: String,
@@ -42,8 +51,8 @@ pub struct NodeType {
     pub range_constraints: Vec<RangeConstraint>,
     /// Regex check constraints
     pub check_constraints: Vec<CheckConstraint>,
-    /// Maps @embed target property -> source text property
-    pub embed_sources: HashMap<String, String>,
+    /// Maps @embed target property -> its source text property + recorded model.
+    pub embed_sources: HashMap<String, EmbedSource>,
     pub blob_properties: HashSet<String>,
     pub arrow_schema: SchemaRef,
 }
@@ -156,14 +165,18 @@ pub fn build_catalog(schema: &SchemaFile) -> Result<Catalog> {
                 if matches!(prop.prop_type.scalar, ScalarType::Blob) {
                     blob_properties.insert(prop.name.clone());
                 }
-                // Extract @embed from property annotations (stays as annotation)
-                if let Some(source_prop) = prop
-                    .annotations
-                    .iter()
-                    .find(|ann| ann.name == "embed")
-                    .and_then(|ann| ann.value.clone())
-                {
-                    embed_sources.insert(prop.name.clone(), source_prop);
+                // Extract @embed: the source text property (positional) and the
+                // optional recorded model (the `model` kwarg).
+                if let Some(ann) = prop.annotations.iter().find(|ann| ann.name == "embed") {
+                    if let Some(source) = ann.value.clone() {
+                        embed_sources.insert(
+                            prop.name.clone(),
+                            EmbedSource {
+                                source,
+                                model: ann.kwargs.get("model").cloned(),
+                            },
+                        );
+                    }
                 }
             }
 

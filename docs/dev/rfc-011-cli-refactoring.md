@@ -1,6 +1,9 @@
 # RFC-011: CLI refactoring — one addressing & config model
 
-**Status:** Proposed
+**Status:** Accepted — implemented (the `omnigraph.yaml` excision landed as
+#250/#251/#252; D1–D4, D6, D7, D9, D10 shipped). Two items remain: **D11**
+(server-side maintenance jobs) is gated on the bulk-data-plane RFC #219; **D5**
+(combined admin scope) stays deferred by design.
 **Date:** 2026-06-14
 **Audience:** CLI/server maintainers
 **Builds on:** [rfc-007-operator-config.md](rfc-007-operator-config.md)
@@ -526,10 +529,9 @@ Non-blocking; settle when convenient.
   server scope and maintain via `--cluster`. A `deployments: { … }` object
   (server + cluster validated coherent, referenced by a profile) is revisited only
   if admin ergonomics demand it — and Decision 11 largely removes the need.
-- **D8 — the `profile` command surface.** `profile list` / `profile show`
-  (read-only inspection) are additive diagnostics, shippable anytime; they don't
-  touch the grammar or resolution. The *no sticky `profile use`* constraint holds
-  regardless — it is a design principle, not a command.
+- **D8 — the `profile` command surface.** *Shipped:* `profile list` / `profile
+  show [<name>]` (read-only inspection). The *no sticky `profile use`* constraint
+  holds — it is a design principle, not a command.
 
 ## Safety
 

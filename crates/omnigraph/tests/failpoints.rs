@@ -5,7 +5,9 @@ mod helpers;
 use fail::FailScenario;
 use futures::FutureExt;
 use omnigraph::db::Omnigraph;
+use omnigraph::error::{ManifestErrorKind, OmniError};
 use omnigraph::failpoints::ScopedFailPoint;
+use omnigraph::loader::LoadMode;
 
 use helpers::recovery::{
     FollowUpMutation, RecoveryExpectation, TableExpectation, assert_post_recovery_invariants,
@@ -127,12 +129,12 @@ async fn branch_delete_partial_failure_converges_via_cleanup() {
 }
 
 // Reusing a branch name whose delete left an orphaned fork (before `cleanup`
-// reconciles it) must fail with a clear, actionable error pointing at
-// `cleanup`, not the opaque `ExpectedVersionMismatch` that leaks from the fork
-// path. The recreate itself succeeds; the first write to the previously-forked
-// table is where the stale orphan collides.
+// reconciles it) must SELF-HEAL on the next write — the write reclaims the
+// manifest-unreferenced fork and re-forks, rather than wedging with "incomplete
+// prior delete; run cleanup". (This test was the inverse before the fork-as-
+// idempotent-reconcile fix; its flip is the signal the bug class is closed.)
 #[tokio::test]
-async fn recreate_over_orphaned_fork_before_cleanup_is_actionable() {
+async fn recreate_over_orphaned_fork_self_heals_without_cleanup() {
     let _scenario = FailScenario::setup();
     let dir = tempfile::tempdir().unwrap();
     let uri = dir.path().to_str().unwrap().to_string();
@@ -158,10 +160,10 @@ async fn recreate_over_orphaned_fork_before_cleanup_is_actionable() {
     }
 
     // Recreate the name and write to the previously-forked table WITHOUT a
-    // cleanup in between.
+    // cleanup in between. The write must self-heal the stale orphan fork.
     main.branch_create("feature").await.unwrap();
     let mut feature2 = Omnigraph::open(&uri).await.unwrap();
-    let err = helpers::mutate_branch(
+    helpers::mutate_branch(
         &mut feature2,
         "feature",
         MUTATION_QUERIES,
@@ -169,18 +171,81 @@ async fn recreate_over_orphaned_fork_before_cleanup_is_actionable() {
         &mixed_params(&[("$name", "Frank")], &[("$age", 41)]),
     )
     .await
-    .expect_err("write should collide with the stale orphaned fork");
+    .expect("recreate-over-orphan write must self-heal, not require cleanup");
 
-    let msg = err.to_string();
-    assert!(
-        msg.contains("cleanup")
-            && (msg.contains("orphan") || msg.contains("incomplete prior delete")),
-        "expected an actionable orphaned-fork error pointing at cleanup, got: {msg}"
+    // The recreated branch forks FRESH from main: the deleted branch's Eve is
+    // gone and only the new Frank is added on top of main's seed. A count of
+    // main + 2 would mean Eve resurrected from the stale fork (the bug).
+    let main_people = helpers::count_rows(&main, "node:Person").await;
+    let feature_people = helpers::count_rows_branch(&feature2, "feature", "node:Person").await;
+    assert_eq!(
+        feature_people,
+        main_people + 1,
+        "self-healed feature must fork fresh from main (+Frank only); \
+         main={main_people}, feature={feature_people} (main+2 ⇒ Eve resurrected)"
     );
-    assert!(
-        !msg.contains("expected manifest table version"),
-        "should not surface the opaque ExpectedVersionMismatch, got: {msg}"
-    );
+}
+
+// The write-path orphan reclaim shares the same fresh-authority classifier as
+// cleanup. If that classifier is Indeterminate (transient read on a live
+// branch), the write must return a clear retryable authority-read conflict and
+// leave the ref in place. It must not squeeze the ambiguity through
+// ExpectedVersionMismatch with expected == actual, which lies about the cause.
+#[tokio::test]
+async fn recreate_over_orphaned_fork_reports_indeterminate_authority_read() {
+    let _scenario = FailScenario::setup();
+    let dir = tempfile::tempdir().unwrap();
+    let uri = dir.path().to_str().unwrap().to_string();
+    let db = helpers::init_and_load(&dir).await;
+    db.branch_create("feature").await.unwrap();
+
+    let person_uri = node_table_uri(&uri, "Person");
+    {
+        let mut ds = lance::Dataset::open(&person_uri).await.unwrap();
+        let base = ds.version().version;
+        ds.create_branch("feature", base, None).await.unwrap();
+    }
+
+    let row = r#"{"type":"Person","data":{"name":"Grace","age":37}}"#;
+    {
+        let _fp = ScopedFailPoint::new("classify.fresh_read", "return");
+        let err = db
+            .load_as("feature", None, row, LoadMode::Merge, None)
+            .await
+            .expect_err("indeterminate authority read must fail retryably");
+
+        match &err {
+            OmniError::Manifest(manifest) => {
+                assert_eq!(manifest.kind, ManifestErrorKind::Conflict);
+                assert!(
+                    manifest.details.is_none(),
+                    "indeterminate authority read is not an expected-version mismatch: {manifest:?}"
+                );
+            }
+            other => panic!("expected manifest conflict, got {other:?}"),
+        }
+        let message = err.to_string();
+        assert!(
+            message.contains("could not verify")
+                && message.contains("fresh manifest authority was unavailable")
+                && message.contains("refresh and retry"),
+            "error should name the unavailable authority read, got: {message}"
+        );
+        assert!(
+            !message.contains("expected manifest table version"),
+            "indeterminate authority must not be reported as a version mismatch: {message}"
+        );
+
+        let ds = lance::Dataset::open(&person_uri).await.unwrap();
+        assert!(
+            ds.list_branches().await.unwrap().contains_key("feature"),
+            "ambiguous orphan status must leave the fork for a later retry"
+        );
+    }
+
+    db.load_as("feature", None, row, LoadMode::Merge, None)
+        .await
+        .expect("when fresh authority is available, the orphan is reclaimed and write converges");
 }
 
 // cleanup is the guaranteed convergence backstop, so one table's transient
@@ -326,6 +391,68 @@ async fn cleanup_reclaims_orphaned_commit_graph_branch() {
         assert!(
             !ds.list_branches().await.unwrap().contains_key("feature"),
             "cleanup should reclaim the orphaned commit-graph branch"
+        );
+    }
+}
+
+// `classify_fork_ref` returns `Indeterminate` when the fresh-authority read
+// fails on a LIVE branch — and a destructive caller must SKIP, never delete, on
+// that ambiguity. Here the reconciler has a genuine origin-2 orphan candidate
+// (a manifest-unreferenced Person fork on the live `feature` branch), but the
+// `classify.fresh_read` failpoint makes the fresh re-check fail: cleanup must
+// leave the ref in place (cannot confirm it is unreferenced), then reclaim it on
+// the next run once the read succeeds. This pins the Indeterminate arm and the
+// don't-destroy-on-ambiguity rule end-to-end through cleanup.
+#[tokio::test]
+async fn reconcile_skips_fork_when_fresh_recheck_is_unavailable_then_converges() {
+    let _scenario = FailScenario::setup();
+    let dir = tempfile::tempdir().unwrap();
+    let uri = dir.path().to_str().unwrap().to_string();
+    let mut db = helpers::init_and_load(&dir).await;
+    db.branch_create("feature").await.unwrap();
+
+    // Forge a manifest-unreferenced Person fork on the live `feature` branch —
+    // a genuine orphan the reconciler would normally reclaim.
+    let person_uri = node_table_uri(&uri, "Person");
+    {
+        let mut ds = lance::Dataset::open(&person_uri).await.unwrap();
+        let base = ds.version().version;
+        ds.create_branch("feature", base, None).await.unwrap();
+        assert!(
+            ds.list_branches().await.unwrap().contains_key("feature"),
+            "precondition: forged orphan fork present"
+        );
+    }
+
+    // With the fresh re-check failing, the fork's status is Indeterminate (the
+    // branch is live but unreadable) → cleanup must SKIP it, not delete.
+    {
+        let _fp = ScopedFailPoint::new("classify.fresh_read", "return");
+        db.cleanup(omnigraph::db::CleanupPolicyOptions {
+            keep_versions: Some(1),
+            older_than: None,
+        })
+        .await
+        .unwrap();
+        let ds = lance::Dataset::open(&person_uri).await.unwrap();
+        assert!(
+            ds.list_branches().await.unwrap().contains_key("feature"),
+            "reconcile must NOT delete a fork whose fresh re-check is inconclusive"
+        );
+    }
+
+    // Read succeeds now → cleanup confirms the orphan and reclaims it (converges).
+    db.cleanup(omnigraph::db::CleanupPolicyOptions {
+        keep_versions: Some(1),
+        older_than: None,
+    })
+    .await
+    .unwrap();
+    {
+        let ds = lance::Dataset::open(&person_uri).await.unwrap();
+        assert!(
+            !ds.list_branches().await.unwrap().contains_key("feature"),
+            "next cleanup (fresh read available) must reclaim the confirmed orphan"
         );
     }
 }
@@ -2619,69 +2746,66 @@ async fn finalize_publisher_residual_does_not_drift_untouched_tables() {
 }
 
 /// Acceptance test: a stage-step failure in the staged-index path
-/// (`stage_create_btree_index` succeeded; `commit_staged` not yet
-/// called) leaves NO Lance-HEAD drift on the existing tables.
-/// Subsequent operations against those tables succeed without
-/// `ExpectedVersionMismatch`.
+/// (`stage_create_btree_index` succeeded; `commit_staged` not yet called)
+/// leaves NO Lance-HEAD drift, so other tables stay writable.
 ///
-/// Path: `apply_schema(v1 → v2)` adds a new node type. The
-/// `added_tables` loop in `schema_apply` creates the empty dataset and
-/// then calls `build_indices_on_dataset_for_catalog` →
-/// `stage_and_commit_btree(..., &["id"])`. The failpoint fires
-/// between `stage_create_btree_index` and `commit_staged`, so the
-/// staged segments are written under `_indices/<uuid>/` but Lance HEAD
-/// on the new dataset is unchanged at v=1. The schema-apply lock
-/// branch is released by `apply_schema`'s outer match. Existing
-/// tables (e.g. `node:Person`) are completely untouched by the new
-/// node's added_tables iteration — they're outside the failed apply
-/// path entirely — and we assert that mutations against them continue
-/// to work.
-///
-/// The orphan empty dataset from the failed apply is acceptable
-/// residual: it's unreferenced by `__manifest` and will be reclaimed
-/// by `cleanup_old_versions` (or removed when a future apply at the
-/// same target path resolves the rename).
+/// Under iss-848 schema apply no longer builds indexes inline — the build
+/// happens in the reconciler (`ensure_indices`/`optimize`) and at load. So this
+/// fires the failpoint where it lives now: an `ensure_indices` build of a BTREE
+/// that a prior apply declared (`@index`) but deferred. The failpoint fires
+/// between `stage_create_btree_index` and `commit_staged`, so the staged
+/// segment is written under `_indices/<uuid>/` but `node:Person`'s Lance HEAD is
+/// unchanged. `ensure_indices` fails and its EnsureIndices sidecar pins only
+/// Person at NoMovement (a clean no-op on the next open). A write to a
+/// different, unpinned table (`node:Company`) is unaffected: mutations/loads run
+/// a roll-forward-only heal and proceed — they do not refuse on a pending
+/// sidecar the way `optimize`/`repair` do — so the write succeeds with no drift.
 #[tokio::test]
 async fn ensure_indices_stage_btree_failure_leaves_existing_tables_writable() {
     let _scenario = FailScenario::setup();
     let dir = tempfile::tempdir().unwrap();
     let uri = dir.path().to_str().unwrap().to_string();
-
-    // Init with TEST_SCHEMA which declares Person + Knows. Indices on
-    // those tables get built during init.
     let mut db = Omnigraph::init(&uri, helpers::TEST_SCHEMA).await.unwrap();
 
-    // Apply a schema that adds a new node type. The added_tables loop
-    // will hit the failpoint between stage and commit on the new
-    // node:Project table's btree-on-id build. (TEST_SCHEMA already
-    // has Person + Company + Knows + WorksAt — pick a name that isn't
-    // already declared.)
-    let extended_schema = format!(
-        "{}\nnode Project {{ name: String @key }}\n",
-        helpers::TEST_SCHEMA
-    );
-
-    {
-        let _failpoint =
-            ScopedFailPoint::new("ensure_indices.post_stage_pre_commit_btree", "return");
-        let err = db.apply_schema(&extended_schema).await.unwrap_err();
-        assert!(
-            err.to_string()
-                .contains("ensure_indices.post_stage_pre_commit_btree"),
-            "schema apply should fail with the synthetic failpoint error, got: {err}"
-        );
-    }
-
-    // Existing tables stayed at their pre-apply versions; subsequent
-    // mutations against them succeed (no Lance-HEAD drift).
+    // Seed a Person row — the load builds Person's id BTREE + name FTS.
     mutate_main(
         &mut db,
         helpers::MUTATION_QUERIES,
         "insert_person",
-        &mixed_params(&[("$name", "Eve")], &[("$age", 22)]),
+        &mixed_params(&[("$name", "Alice")], &[("$age", 30)]),
     )
     .await
-    .expect("Person mutation must succeed after the failed schema apply — existing tables are not drifted");
+    .expect("seed Person");
+
+    // Add `@index` on `age`: schema apply records the intent but defers the
+    // physical build (iss-848), so the BTREE on `age` is unbuilt.
+    let indexed_schema = helpers::TEST_SCHEMA.replace("age: I32?", "age: I32? @index");
+    db.apply_schema(&indexed_schema)
+        .await
+        .expect("adding an @index is metadata-only and succeeds");
+
+    {
+        // ensure_indices builds the deferred `age` BTREE on Person; the failpoint
+        // fires between stage and commit, so Person's Lance HEAD does not move.
+        let _failpoint =
+            ScopedFailPoint::new("ensure_indices.post_stage_pre_commit_btree", "return");
+        let err = db.ensure_indices().await.unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("ensure_indices.post_stage_pre_commit_btree"),
+            "ensure_indices should fail with the synthetic failpoint error, got: {err}"
+        );
+    }
+
+    // A different, unpinned table is untouched by the failed index build.
+    use omnigraph::loader::{LoadMode, load_jsonl};
+    load_jsonl(
+        &mut db,
+        r#"{"type": "Company", "data": {"name": "Acme"}}"#,
+        LoadMode::Append,
+    )
+    .await
+    .expect("Company write on a table untouched by the failed ensure_indices should succeed");
 }
 
 fn assert_no_staging_files(graph: &std::path::Path) {

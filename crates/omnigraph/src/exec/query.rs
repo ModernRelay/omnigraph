@@ -2,6 +2,30 @@ use super::*;
 
 use super::projection::{apply_filter, apply_ordering, project_return};
 
+/// Bundles the per-handle embedding client cell with the optional injected
+/// config (RFC-012 Phase 5) so the lazy init uses the injected config when
+/// present, else `EmbeddingClient::from_env()`. Threaded through the query path
+/// in place of the bare cell, preserving laziness (a graph that never embeds
+/// builds no client and needs no key).
+pub(crate) struct EmbeddingResolver<'a> {
+    cell: &'a tokio::sync::OnceCell<EmbeddingClient>,
+    config: Option<&'a crate::embedding::EmbeddingConfig>,
+}
+
+impl EmbeddingResolver<'_> {
+    async fn resolve(&self) -> Result<&EmbeddingClient> {
+        let config = self.config.cloned();
+        self.cell
+            .get_or_try_init(|| async move {
+                match config {
+                    Some(cfg) => EmbeddingClient::new(cfg),
+                    None => EmbeddingClient::from_env(),
+                }
+            })
+            .await
+    }
+}
+
 impl Omnigraph {
     /// Run a named query against an explicit branch or snapshot target.
     pub async fn query(
@@ -31,7 +55,18 @@ impl Omnigraph {
             GraphIndexHandle::none()
         };
 
-        execute_query(&ir, params, &resolved.snapshot, &graph_index, &catalog).await
+        execute_query(
+            &ir,
+            params,
+            &resolved.snapshot,
+            &graph_index,
+            &catalog,
+            &EmbeddingResolver {
+                cell: self.embedding_cell(),
+                config: self.embedding_config_ref(),
+            },
+        )
+        .await
     }
 
     /// Run a named query against the graph as it existed at a prior manifest version.
@@ -72,7 +107,18 @@ impl Omnigraph {
             GraphIndexHandle::none()
         };
 
-        execute_query(&ir, params, &snapshot, &graph_index, &catalog).await
+        execute_query(
+            &ir,
+            params,
+            &snapshot,
+            &graph_index,
+            &catalog,
+            &EmbeddingResolver {
+                cell: self.embedding_cell(),
+                config: self.embedding_config_ref(),
+            },
+        )
+        .await
     }
 }
 
@@ -102,6 +148,7 @@ async fn extract_search_mode(
     ir: &QueryIR,
     params: &ParamMap,
     catalog: &Catalog,
+    embedding: &EmbeddingResolver<'_>,
 ) -> Result<SearchMode> {
     if ir.order_by.is_empty() {
         return Ok(SearchMode::default());
@@ -114,7 +161,8 @@ async fn extract_search_mode(
             query,
         } => {
             let vec =
-                resolve_nearest_query_vec(ir, catalog, variable, property, query, params).await?;
+                resolve_nearest_query_vec(ir, catalog, variable, property, query, params, embedding)
+                    .await?;
             let k = ir.limit.ok_or_else(|| {
                 OmniError::manifest("nearest() ordering requires a limit clause".to_string())
             })? as usize;
@@ -157,9 +205,10 @@ async fn extract_search_mode(
                 .unwrap_or(60) as u32;
 
             let primary_mode =
-                extract_sub_search_mode(ir, primary, params, catalog, ir.limit).await?;
+                extract_sub_search_mode(ir, primary, params, catalog, ir.limit, embedding).await?;
             let secondary_mode =
-                extract_sub_search_mode(ir, secondary, params, catalog, ir.limit).await?;
+                extract_sub_search_mode(ir, secondary, params, catalog, ir.limit, embedding)
+                    .await?;
 
             Ok(SearchMode {
                 rrf: Some(RrfMode {
@@ -182,6 +231,7 @@ async fn extract_sub_search_mode(
     params: &ParamMap,
     catalog: &Catalog,
     limit: Option<u64>,
+    embedding: &EmbeddingResolver<'_>,
 ) -> Result<SearchMode> {
     match expr {
         IRExpr::Nearest {
@@ -190,7 +240,8 @@ async fn extract_sub_search_mode(
             query,
         } => {
             let vec =
-                resolve_nearest_query_vec(ir, catalog, variable, property, query, params).await?;
+                resolve_nearest_query_vec(ir, catalog, variable, property, query, params, embedding)
+                    .await?;
             let k = limit.unwrap_or(100) as usize;
             Ok(SearchMode {
                 nearest: Some((variable.clone(), property.clone(), vec, k)),
@@ -229,15 +280,34 @@ async fn resolve_nearest_query_vec(
     property: &str,
     expr: &IRExpr,
     params: &ParamMap,
+    embedding: &EmbeddingResolver<'_>,
 ) -> Result<Vec<f32>> {
     let lit = resolve_literal_or_param(expr, params)?;
     match lit {
         Literal::List(_) => literal_to_f32_vec(&lit),
         Literal::String(text) => {
-            let expected_dim = nearest_property_dimension(ir, catalog, variable, property)?;
-            EmbeddingClient::from_env()?
-                .embed_query_text(&text, expected_dim)
-                .await
+            let (expected_dim, recorded_model) =
+                nearest_property_dim_and_model(ir, catalog, variable, property)?;
+            // Lazily resolve the per-handle client once, then reuse it across
+            // queries (keeps the provider connection pool warm); a graph that
+            // never embeds never builds a client and needs no provider key.
+            let client = embedding.resolve().await?;
+            // Same-space guarantee: if the property recorded the model that
+            // produced its stored vectors (`@embed("…", model="…")`), the query
+            // embedder must resolve to that same model — otherwise the comparison
+            // is across vector spaces. Reject loudly instead of ranking garbage.
+            if let Some(recorded) = &recorded_model {
+                let resolved = &client.config().model;
+                if resolved != recorded {
+                    return Err(OmniError::manifest(format!(
+                        "nearest() on '{property}': its stored vectors were embedded with model \
+                         '{recorded}', but the query embedder resolves to '{resolved}'. Set \
+                         OMNIGRAPH_EMBED_MODEL='{recorded}' (and the matching provider) or re-embed \
+                         the stored vectors."
+                    )));
+                }
+            }
+            client.embed_query_text(&text, expected_dim).await
         }
         _ => Err(OmniError::manifest(
             "nearest query must be a string or list of floats".to_string(),
@@ -279,12 +349,14 @@ fn literal_to_f32_vec(lit: &Literal) -> Result<Vec<f32>> {
     }
 }
 
-fn nearest_property_dimension(
+/// Resolve the nearest() target property's vector dimension and the embedding
+/// model recorded for it via `@embed("…", model="…")` (`None` if unrecorded).
+fn nearest_property_dim_and_model(
     ir: &QueryIR,
     catalog: &Catalog,
     variable: &str,
     property: &str,
-) -> Result<usize> {
+) -> Result<(usize, Option<String>)> {
     let type_name = resolve_binding_type_name(&ir.pipeline, variable).ok_or_else(|| {
         OmniError::manifest_internal(format!(
             "nearest() variable '${}' is not bound to a node type in the lowered pipeline",
@@ -303,13 +375,20 @@ fn nearest_property_dimension(
             type_name, property
         ))
     })?;
-    match prop.scalar {
-        ScalarType::Vector(dim) if !prop.list => Ok(dim as usize),
-        _ => Err(OmniError::manifest_internal(format!(
-            "nearest() property '{}.{}' is not a scalar vector",
-            type_name, property
-        ))),
-    }
+    let dim = match prop.scalar {
+        ScalarType::Vector(dim) if !prop.list => dim as usize,
+        _ => {
+            return Err(OmniError::manifest_internal(format!(
+                "nearest() property '{}.{}' is not a scalar vector",
+                type_name, property
+            )));
+        }
+    };
+    let recorded_model = node_type
+        .embed_sources
+        .get(property)
+        .and_then(|embed| embed.model.clone());
+    Ok((dim, recorded_model))
 }
 
 fn resolve_binding_type_name<'a>(pipeline: &'a [IROp], variable: &str) -> Option<&'a str> {
@@ -341,8 +420,9 @@ pub async fn execute_query(
     snapshot: &Snapshot,
     graph_index: &GraphIndexHandle<'_>,
     catalog: &Catalog,
+    embedding: &EmbeddingResolver<'_>,
 ) -> Result<QueryResult> {
-    let search_mode = extract_search_mode(ir, params, catalog).await?;
+    let search_mode = extract_search_mode(ir, params, catalog, embedding).await?;
 
     // RRF requires forked execution
     if let Some(ref rrf) = search_mode.rrf {

@@ -793,10 +793,10 @@ pub(crate) fn schema_apply_serial_queue_key() -> crate::db::write_queue::TableQu
 /// same table append extra Lance restore commits which `omnigraph
 /// cleanup` reclaims.
 ///
-/// Concurrency: today recovery runs synchronously in `Omnigraph::open`
-/// *before* the engine is wrapped in the server's `Arc<RwLock<Omnigraph>>`.
-/// No request handlers can race, so this sweep does NOT acquire write
-/// queues. In-process callers (refresh, write entry points) must use
+/// Concurrency: the open-time sweep runs synchronously in `Omnigraph::open`
+/// before the engine handle is published to any caller, so no request
+/// handler can race it and it does NOT acquire write queues. In-process
+/// callers (refresh, write entry points) must use
 /// [`heal_pending_sidecars_roll_forward`] instead, which serializes
 /// against live writers via per-(table_key, branch) queue acquisition.
 pub(crate) async fn recover_manifest_drift(

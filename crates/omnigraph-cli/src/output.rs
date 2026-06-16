@@ -696,9 +696,24 @@ pub(crate) fn render_constraint(constraint: &omnigraph_compiler::schema::ast::Co
 pub(crate) fn render_annotations(annotations: &[omnigraph_compiler::schema::ast::Annotation]) -> String {
     annotations
         .iter()
-        .map(|annotation| match &annotation.value {
-            Some(value) => format!("@{}({})", annotation.name, value),
-            None => format!("@{}", annotation.name),
+        .map(|annotation| {
+            let mut args: Vec<String> = Vec::new();
+            // Values are parsed via `decode_string_literal` (quotes stripped), so
+            // re-quote them as string literals on render — otherwise a value with
+            // non-ident chars (e.g. `model=openai/text-embedding-3-large`) fails to
+            // round-trip back through the schema parser (`annotation_kwarg` wants a
+            // quoted `literal`, not a bare token).
+            if let Some(value) = &annotation.value {
+                args.push(format!("\"{}\"", value));
+            }
+            for (key, val) in &annotation.kwargs {
+                args.push(format!("{}=\"{}\"", key, val));
+            }
+            if args.is_empty() {
+                format!("@{}", annotation.name)
+            } else {
+                format!("@{}({})", annotation.name, args.join(", "))
+            }
         })
         .collect::<Vec<_>>()
         .join(", ")
@@ -734,15 +749,10 @@ pub(crate) fn print_snapshot_human(branch: &str, manifest_version: u64, entries:
 pub(crate) fn print_read_output(
     output: &ReadOutput,
     format: ReadOutputFormat,
-    config: &OmnigraphConfig,
 ) -> Result<()> {
     println!(
         "{}",
-        render_read(
-            output,
-            format,
-            &resolve_table_render_options(config),
-        )?
+        render_read(output, format, &resolve_table_render_options())?
     );
     Ok(())
 }
@@ -892,20 +902,126 @@ pub(crate) fn finish_logout(
     Ok(())
 }
 
-/// Table prefs cascade (RFC-007/008): legacy cli.table_* (window) >
-/// operator defaults.table_* > built-in.
-pub(crate) fn resolve_table_render_options(config: &OmnigraphConfig) -> ReadRenderOptions {
+#[derive(Debug, Serialize)]
+pub(crate) struct ProfileListItem {
+    pub(crate) name: String,
+    /// `server: <n>` / `cluster: <n>` / `store: <uri>` / `invalid: <reason>`.
+    pub(crate) binding: String,
+    /// `server` | `cluster` | `store` | `invalid`.
+    pub(crate) scope_kind: String,
+    /// The bound server/cluster name, or the store URI. `None` when invalid.
+    pub(crate) target: Option<String>,
+    pub(crate) valid: bool,
+    pub(crate) error: Option<String>,
+    pub(crate) default_graph: Option<String>,
+    pub(crate) active: bool,
+}
+
+#[derive(Debug, Serialize)]
+pub(crate) struct ProfileDetail {
+    /// Profile name, or `(defaults)` for the no-name flat-defaults view.
+    pub(crate) name: String,
+    /// `server` | `cluster` | `store` | `none`.
+    pub(crate) scope_kind: String,
+    /// The bound server/cluster name, or the store URI.
+    pub(crate) target: Option<String>,
+    /// Resolved endpoint: a server's URL / a cluster's root / the store URI;
+    /// `None` if a named server/cluster isn't defined in this config.
+    pub(crate) endpoint: Option<String>,
+    pub(crate) default_graph: Option<String>,
+    pub(crate) output_format: Option<String>,
+}
+
+pub(crate) fn print_profile_list(items: &[ProfileListItem], json: bool) -> Result<()> {
+    if json {
+        return print_json(&items);
+    }
+    if items.is_empty() {
+        println!("no profiles defined in the operator config");
+        return Ok(());
+    }
+    for item in items {
+        let active = if item.active { " (active)" } else { "" };
+        let graph = item
+            .default_graph
+            .as_deref()
+            .map(|g| format!(" · graph: {g}"))
+            .unwrap_or_default();
+        println!("{}{active}  {}{graph}", item.name, item.binding);
+    }
+    Ok(())
+}
+
+pub(crate) fn print_profile_detail(detail: &ProfileDetail, json: bool) -> Result<()> {
+    if json {
+        return print_json(detail);
+    }
+    println!("profile: {}", detail.name);
+    let target = detail
+        .target
+        .as_deref()
+        .map(|t| format!(" {t}"))
+        .unwrap_or_default();
+    println!("  scope:   {}{target}", detail.scope_kind);
+    if let Some(endpoint) = &detail.endpoint {
+        println!("  endpoint: {endpoint}");
+    } else if matches!(detail.scope_kind.as_str(), "server" | "cluster") {
+        println!("  endpoint: (undefined — name not in this config)");
+    }
+    if let Some(graph) = &detail.default_graph {
+        println!("  default graph: {graph}");
+    }
+    if let Some(format) = &detail.output_format {
+        println!("  output: {format}");
+    }
+    Ok(())
+}
+
+/// Table prefs cascade (RFC-011): operator defaults.table_* > built-in.
+pub(crate) fn resolve_table_render_options() -> ReadRenderOptions {
     let operator = crate::operator::load_operator_config().unwrap_or_default();
     ReadRenderOptions {
-        max_column_width: config
-            .cli
-            .table_max_column_width
-            .or(operator.defaults.table_max_column_width)
-            .unwrap_or(80),
-        cell_layout: config
-            .cli
-            .table_cell_layout
-            .or(operator.defaults.table_cell_layout)
-            .unwrap_or_default(),
+        max_column_width: operator.defaults.table_max_column_width.unwrap_or(80),
+        cell_layout: operator.defaults.table_cell_layout.unwrap_or_default(),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use omnigraph_compiler::schema::ast::Annotation;
+    use omnigraph_compiler::schema::parser::parse_schema;
+    use std::collections::BTreeMap;
+
+    use super::render_annotations;
+
+    #[test]
+    fn render_annotations_quotes_values_so_embed_round_trips() {
+        let mut kwargs = BTreeMap::new();
+        kwargs.insert(
+            "model".to_string(),
+            "openai/text-embedding-3-large".to_string(),
+        );
+        let embed = Annotation {
+            name: "embed".to_string(),
+            value: Some("title".to_string()),
+            kwargs,
+        };
+
+        let rendered = render_annotations(std::slice::from_ref(&embed));
+        assert_eq!(
+            rendered,
+            r#"@embed("title", model="openai/text-embedding-3-large")"#
+        );
+
+        // The bug: an unquoted `model=openai/text-embedding-3-large` is not a
+        // valid `annotation_kwarg` literal, so `schema show` output did not
+        // re-parse. The rendered form must round-trip through the grammar.
+        let schema = format!("node Doc {{\ntitle: String\nembedding: Vector(3) {rendered}\n}}\n");
+        let parsed = parse_schema(&schema);
+        assert!(
+            parsed.is_ok(),
+            "rendered @embed must re-parse: {:?}",
+            parsed.err()
+        );
     }
 }

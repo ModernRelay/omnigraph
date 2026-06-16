@@ -1,14 +1,13 @@
-//! Server settings: omnigraph.yaml/CLI/env resolution, mode inference
-//! (single vs multi vs cluster), bearer-token sources, and runtime-state
-//! classification (moved verbatim from lib.rs in the modularization).
+//! Server settings: cluster/CLI/env resolution, bearer-token sources, and
+//! runtime-state classification (moved verbatim from lib.rs in the
+//! modularization).
 
 use super::*;
 
 /// Build serving settings from a cluster directory's applied revision
 /// (RFC-005 §D2): graphs at derived roots, stored queries from verified
 /// catalog blob content, policy bundles from blob paths with their applied
-/// bindings. Always multi-graph routing. The unauthenticated/env handling
-/// matches the omnigraph.yaml path.
+/// bindings. Always multi-graph routing.
 pub(crate) async fn load_cluster_settings(
     cluster_dir: &PathBuf,
     cli_bind: Option<String>,
@@ -99,6 +98,15 @@ pub(crate) async fn load_cluster_settings(
             graph_id: graph.graph_id.clone(),
             uri: graph.root.to_string_lossy().to_string(),
             policy: graph_policies.get(&graph.graph_id).cloned(),
+            embedding: graph
+                .embedding
+                .as_ref()
+                .map(|profile| {
+                    profile.resolve().map_err(|err| {
+                        eyre!("embedding provider for graph '{}': {err}", graph.graph_id)
+                    })
+                })
+                .transpose()?,
             queries: registry,
         });
     }
@@ -122,162 +130,24 @@ pub(crate) async fn load_cluster_settings(
     })
 }
 
+/// RFC-011 cluster-only boot: the server serves exclusively from a
+/// cluster's applied revision (`--cluster <dir | s3://…>`). The legacy
+/// omnigraph.yaml / `--target` / positional-URI single-graph boot paths
+/// were removed — a deployment serves from exactly one source.
 pub async fn load_server_settings(
-    config_path: Option<&PathBuf>,
     cli_cluster: Option<&PathBuf>,
-    cli_uri: Option<String>,
-    cli_target: Option<String>,
     cli_bind: Option<String>,
     cli_allow_unauthenticated: bool,
 ) -> Result<ServerConfig> {
-    // Rule 0 (RFC-005): --cluster is an exclusive boot source. It is checked
-    // before anything reads omnigraph.yaml — in cluster mode that file is
-    // never opened, not even the implicit current-directory search.
-    if let Some(cluster_dir) = cli_cluster {
-        if cli_uri.is_some() || cli_target.is_some() || config_path.is_some() {
-            bail!(
-                "--cluster is an exclusive boot source; it cannot combine with a graph URI, --target, or --config (axiom 15: a deployment serves from one source)"
-            );
-        }
-        return load_cluster_settings(cluster_dir, cli_bind, cli_allow_unauthenticated).await;
-    }
-    let config = load_config(config_path)?;
-    let bind = cli_bind.unwrap_or_else(|| config.server_bind().to_string());
-    // Either `--unauthenticated` or `OMNIGRAPH_UNAUTHENTICATED=1` flips
-    // this. Treat any non-empty, non-"0"/"false" string as truthy —
-    // standard 12-factor "any value is true" reading of the env var.
-    let env_unauth = std::env::var("OMNIGRAPH_UNAUTHENTICATED")
-        .ok()
-        .map(|v| {
-            let trimmed = v.trim();
-            !trimmed.is_empty() && trimmed != "0" && !trimmed.eq_ignore_ascii_case("false")
-        })
-        .unwrap_or(false);
-    let allow_unauthenticated = cli_allow_unauthenticated || env_unauth;
-
-    // MR-668 decision 2 — four-rule mode inference matrix.
-    //
-    //   1. CLI `<URI>` positional        → Single (URI = the value)
-    //   2. CLI `--target <name>`         → Single (URI = graphs.<name>.uri)
-    //   3. `server.graph` in config      → Single (URI = graphs.<server.graph>.uri)
-    //   4. `--config` + non-empty `graphs:` + no single-mode selector
-    //                                    → Multi (every entry in `graphs:`)
-    //   5. otherwise                     → error with migration hint
-    //
-    // Rules 1-3 are mutually compatible (CLI URI wins over `--target`
-    // wins over `server.graph`), reusing the existing
-    // `resolve_target_uri` precedence.
-    let has_cli_uri = cli_uri.is_some();
-    let has_cli_target = cli_target.is_some();
-    let has_server_graph = config.server_graph_name().is_some();
-    let has_graphs_map = !config.graphs.is_empty();
-    let has_explicit_config = config_path.is_some();
-
-    let mode = if has_cli_uri || has_cli_target || has_server_graph {
-        // Rules 1, 2, or 3 → Single mode.
-        let raw_uri = config.resolve_target_uri(
-            cli_uri,
-            cli_target.as_deref(),
-            config.server_graph_name(),
-        )?;
-        let uri = normalize_root_uri(&raw_uri).wrap_err_with(|| {
-            format!("normalize single-graph URI '{raw_uri}' from server settings")
-        })?;
-        // Config follows graph IDENTITY, not mode: a bare URI is anonymous
-        // (top-level config); a graph chosen by name uses its per-graph
-        // `graphs.<name>.{policy,queries}`. `resolve_target_uri` already
-        // errored on an unknown name, so a `Some(name)` here is a known graph.
-        let selected: Option<&str> = if has_cli_uri {
-            None
-        } else {
-            cli_target.as_deref().or_else(|| config.server_graph_name())
-        };
-        // A named selection must not leave a populated top-level block
-        // silently unused — refuse boot and point at the per-graph block. The
-        // same rule the CLI selection gate enforces, shared via one helper so
-        // the boot check and `omnigraph queries validate`/`list` can't drift.
-        config.ensure_top_level_blocks_honored(selected)?;
-        // Load + identity-check now (no engine needed); the schema
-        // type-check happens when the engine opens.
-        let policy_file = config.resolve_policy_file_for(selected);
-        let queries = QueryRegistry::load(&config, config.query_entries_for(selected))
-            .map_err(|errs| color_eyre::eyre::eyre!(format_registry_load_errors(&uri, &errs)))?;
-        let graph_id = graph_resource_id_for_selection(selected, &uri);
-        ServerConfigMode::Single {
-            uri,
-            graph_id,
-            policy_file,
-            queries,
-        }
-    } else if has_explicit_config && has_graphs_map {
-        // Multi mode: every graph uses its per-graph block; top-level
-        // policy/queries are never honored, so a populated one is an error.
-        let unhonored = config.populated_top_level_blocks();
-        if !unhonored.is_empty() {
-            bail!(
-                "multi-graph mode: top-level {} {} not honored — each graph uses its own \
-                 `graphs.<graph_id>.…` block. Move per-graph rules there (and any \
-                 `graph_list` policy to `server.policy.file`).",
-                unhonored.join(" and "),
-                if unhonored.len() == 1 { "is" } else { "are" },
-            );
-        }
-        // Rule 4 → Multi mode. Build a startup config per graph.
-        let mut graphs = Vec::with_capacity(config.graphs.len());
-        for (name, target) in &config.graphs {
-            // Validate the graph id can construct a `GraphId` newtype.
-            // Doing this here (not at registry insert) so a malformed
-            // omnigraph.yaml fails at startup with a clear error.
-            GraphId::try_from(name.clone()).map_err(|err| {
-                color_eyre::eyre::eyre!("invalid graph id '{name}' in omnigraph.yaml: {err}")
-            })?;
-            let raw_uri = config.resolve_uri_value(&target.uri);
-            let uri = normalize_root_uri(&raw_uri).wrap_err_with(|| {
-                format!("normalize URI '{raw_uri}' for graph '{name}' in omnigraph.yaml")
-            })?;
-            // Per-graph `queries:`, selected through the shared
-            // `query_entries_for` so server and CLI resolve identically.
-            // Load + identity-check now; the schema type-check happens
-            // when this graph's engine opens.
-            let queries = QueryRegistry::load(&config, config.query_entries_for(Some(name.as_str())))
-                .map_err(|errs| color_eyre::eyre::eyre!(format_registry_load_errors(name, &errs)))?;
-            graphs.push(GraphStartupConfig {
-                graph_id: name.clone(),
-                uri,
-                policy: config.resolve_target_policy_file(name).map(PolicySource::File),
-                queries,
-            });
-        }
-        let config_path = config_path
-            .cloned()
-            .expect("has_explicit_config implies config_path is Some");
-        let server_policy = config.resolve_server_policy_file().map(PolicySource::File);
-        ServerConfigMode::Multi {
-            graphs,
-            config_path,
-            server_policy,
-        }
-    } else {
-        // Rule 5 → error with migration hint.
+    let Some(cluster_dir) = cli_cluster else {
         bail!(
-            "no graph to serve: pass a URI (`omnigraph-server <URI>`), select a target \
-             (`--target <name> --config omnigraph.yaml`), set `server.graph: <name>` in \
-             omnigraph.yaml, or for multi-graph mode add a `graphs:` map to the config \
-             file referenced by `--config`."
+            "omnigraph-server boots from a cluster: pass --cluster <dir|s3://…> \
+             (the cluster's applied revision is the deployment artifact). The legacy \
+             single-graph boot (positional <URI>, --target, --config omnigraph.yaml) \
+             was removed in RFC-011."
         );
     };
-
-    Ok(ServerConfig {
-        mode,
-        bind,
-        allow_unauthenticated,
-    })
-}
-
-/// Whether the loaded config will run the server in multi-graph mode.
-/// Useful for the test that constructs `ServerConfig` directly.
-pub fn server_config_is_multi(config: &ServerConfig) -> bool {
-    matches!(config.mode, ServerConfigMode::Multi { .. })
+    load_cluster_settings(cluster_dir, cli_bind, cli_allow_unauthenticated).await
 }
 
 /// MR-723 server runtime state, classified from the three-state matrix
@@ -327,7 +197,8 @@ pub fn classify_server_runtime_state(
             "server has no bearer tokens and no policy file configured. This is a fully \
              open server — pass `--unauthenticated` (or set OMNIGRAPH_UNAUTHENTICATED=1) \
              if you actually want that, otherwise configure bearer tokens (see \
-             docs/user/operations/server.md) and/or `policy.file` in omnigraph.yaml."
+             docs/user/operations/server.md) and a graph or cluster policy bundle in \
+             the cluster config, then run `omnigraph cluster apply` and restart."
         ),
         (false, false, true) => Ok(ServerRuntimeState::Open),
         (true, false, _) => Ok(ServerRuntimeState::DefaultDeny),
@@ -417,8 +288,8 @@ pub(crate) fn server_bearer_tokens_from_env() -> Result<Vec<(String, String)>> {
 mod tests {
     use super::{
         GraphStartupConfig, ServerConfig, ServerConfigMode, ServerRuntimeState,
-        classify_server_runtime_state, hash_bearer_token, load_server_settings,
-        normalize_bearer_token, parse_bearer_tokens_json, serve, server_bearer_tokens_from_env,
+        classify_server_runtime_state, hash_bearer_token, normalize_bearer_token,
+        parse_bearer_tokens_json, serve, server_bearer_tokens_from_env,
     };
     use serial_test::serial;
     use std::env;
@@ -577,108 +448,15 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn server_settings_load_from_yaml_config() {
-        let temp = tempdir().unwrap();
-        let config = temp.path().join("omnigraph.yaml");
-        fs::write(
-            &config,
-            r#"
-graphs:
-  local:
-    uri: /tmp/demo.omni
-server:
-  graph: local
-  bind: 0.0.0.0:9090
-"#,
-        )
-        .unwrap();
-
-        let settings = load_server_settings(Some(&config), None, None, None, None, false).await.unwrap();
-        match &settings.mode {
-            ServerConfigMode::Single { uri, graph_id, .. } => {
-                assert_eq!(uri, "/tmp/demo.omni");
-                assert_eq!(graph_id, "local");
-            }
-            ServerConfigMode::Multi { .. } => panic!("expected Single mode, got Multi"),
-        }
-        assert_eq!(settings.bind, "0.0.0.0:9090");
-    }
-
-    #[tokio::test]
-    async fn server_settings_cli_flags_override_yaml_config() {
-        let temp = tempdir().unwrap();
-        let config = temp.path().join("omnigraph.yaml");
-        fs::write(
-            &config,
-            r#"
-graphs:
-  local:
-    uri: /tmp/demo.omni
-server:
-  graph: local
-  bind: 127.0.0.1:8080
-"#,
-        )
-        .unwrap();
-
-        let settings = load_server_settings(
-            Some(&config),
-            None,
-            Some("/tmp/override.omni".to_string()),
-            None,
-            Some("0.0.0.0:9999".to_string()),
-            false,
-        )
-        .await
-        .unwrap();
-        match &settings.mode {
-            ServerConfigMode::Single { uri, graph_id, .. } => {
-                assert_eq!(uri, "/tmp/override.omni");
-                assert_eq!(graph_id, "/tmp/override.omni");
-            }
-            ServerConfigMode::Multi { .. } => panic!("expected Single mode, got Multi"),
-        }
-        assert_eq!(settings.bind, "0.0.0.0:9999");
-    }
-
-    #[tokio::test]
-    async fn server_settings_can_resolve_named_target() {
-        let temp = tempdir().unwrap();
-        let config = temp.path().join("omnigraph.yaml");
-        fs::write(
-            &config,
-            r#"
-graphs:
-  local:
-    uri: ./demo.omni
-  dev:
-    uri: http://127.0.0.1:8080
-server:
-  graph: local
-  bind: 127.0.0.1:8080
-"#,
-        )
-        .unwrap();
-
-        let settings =
-            load_server_settings(Some(&config), None, None, Some("dev".to_string()), None, false)
-                .await
-                .unwrap();
-        match &settings.mode {
-            ServerConfigMode::Single { uri, graph_id, .. } => {
-                assert_eq!(uri, "http://127.0.0.1:8080");
-                assert_eq!(graph_id, "dev");
-            }
-            ServerConfigMode::Multi { .. } => panic!("expected Single mode, got Multi"),
-        }
-    }
-
-    #[tokio::test]
-    async fn server_settings_require_uri_from_cli_or_config() {
-        let error = load_server_settings(None, None, None, None, None, false).await.unwrap_err();
+    async fn server_settings_require_cluster_boot_source() {
+        // RFC-011 cluster-only: with no --cluster the server refuses to
+        // start and names the cluster-required remedy.
+        let error = super::load_server_settings(None, None, false)
+            .await
+            .unwrap_err();
         assert!(
-            error.to_string().contains("no graph to serve"),
-            "expected mode-inference error, got: {error}",
+            error.to_string().contains("boots from a cluster"),
+            "expected cluster-required error, got: {error}",
         );
     }
 
@@ -748,6 +526,7 @@ server:
                         .to_string_lossy()
                         .into_owned(),
                     policy: None,
+                    embedding: None,
                     queries: crate::queries::QueryRegistry::default(),
                 }],
                 config_path: temp.path().join("omnigraph.yaml"),
@@ -788,17 +567,22 @@ server:
         ]);
         let temp = tempdir().unwrap();
         // Graph path doesn't need to exist — classifier fires before
-        // `AppState::open_with_bearer_tokens_and_policy`.
+        // any engine open.
         let config = ServerConfig {
-            mode: ServerConfigMode::Single {
-                uri: temp
-                    .path()
-                    .join("graph.omni")
-                    .to_string_lossy()
-                    .into_owned(),
-                graph_id: "default".to_string(),
-                policy_file: None,
-                queries: crate::queries::QueryRegistry::default(),
+            mode: ServerConfigMode::Multi {
+                graphs: vec![GraphStartupConfig {
+                    graph_id: "default".to_string(),
+                    uri: temp
+                        .path()
+                        .join("graph.omni")
+                        .to_string_lossy()
+                        .into_owned(),
+                    policy: None,
+                    embedding: None,
+                    queries: crate::queries::QueryRegistry::default(),
+                }],
+                config_path: temp.path().join("cluster"),
+                server_policy: None,
             },
             bind: "127.0.0.1:0".to_string(),
             allow_unauthenticated: false,
@@ -810,75 +594,6 @@ server:
         assert!(
             msg.contains("no bearer tokens") || msg.contains("policy file"),
             "expected refusal message naming the misconfiguration, got: {msg}",
-        );
-    }
-
-    #[tokio::test]
-    #[serial]
-    async fn unauthenticated_env_var_classification() {
-        // MR-723 PR A: closes the gap where the env-var read path inside
-        // `load_server_settings` was structurally implemented but not
-        // exercised by any test. Three properties to pin, all in one
-        // sequential test because `cargo test` runs the mod test suite
-        // in parallel and `OMNIGRAPH_UNAUTHENTICATED` is process-global
-        // — interleaving with another test that sets the same env var
-        // (concurrent classifier tests, even the bearer-token suite
-        // sharing `EnvGuard`) corrupts the read. Sequential within one
-        // test fn is the simplest race-free shape.
-        let temp = tempdir().unwrap();
-        let config_path = temp.path().join("omnigraph.yaml");
-        fs::write(
-            &config_path,
-            r#"
-graphs:
-  local:
-    uri: /tmp/demo-unauth.omni
-server:
-  graph: local
-"#,
-        )
-        .unwrap();
-
-        // Truthy values flip Open mode on, even with CLI flag off.
-        for value in ["1", "true", "yes", "TRUE", "anything"] {
-            let _guard = EnvGuard::set(&[("OMNIGRAPH_UNAUTHENTICATED", Some(value))]);
-            let settings = load_server_settings(Some(&config_path), None, None, None, None, false).await
-                .expect("settings load should succeed");
-            assert!(
-                settings.allow_unauthenticated,
-                "OMNIGRAPH_UNAUTHENTICATED={value:?} should enable Open mode",
-            );
-        }
-
-        // Falsy values keep refusal behavior, even with CLI flag off.
-        for value in ["0", "false", "FALSE", ""] {
-            let _guard = EnvGuard::set(&[("OMNIGRAPH_UNAUTHENTICATED", Some(value))]);
-            let settings = load_server_settings(Some(&config_path), None, None, None, None, false).await
-                .expect("settings load should succeed");
-            assert!(
-                !settings.allow_unauthenticated,
-                "OMNIGRAPH_UNAUTHENTICATED={value:?} should NOT enable Open mode",
-            );
-        }
-
-        // Unset env var: also false.
-        let _guard = EnvGuard::set(&[("OMNIGRAPH_UNAUTHENTICATED", None)]);
-        let settings = load_server_settings(Some(&config_path), None, None, None, None, false).await
-            .expect("settings load should succeed");
-        assert!(
-            !settings.allow_unauthenticated,
-            "OMNIGRAPH_UNAUTHENTICATED unset should NOT enable Open mode",
-        );
-        drop(_guard);
-
-        // CLI flag wins even when env is falsy — `serve()` honors the
-        // OR of both inputs.
-        let _guard = EnvGuard::set(&[("OMNIGRAPH_UNAUTHENTICATED", Some("0"))]);
-        let settings = load_server_settings(Some(&config_path), None, None, None, None, true).await
-            .expect("settings load should succeed");
-        assert!(
-            settings.allow_unauthenticated,
-            "--unauthenticated CLI flag should win even when env is falsy",
         );
     }
 

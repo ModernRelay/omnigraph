@@ -50,7 +50,7 @@ async fn protected_routes_require_bearer_token() {
     let (status, body) = json_response(
         &app,
         Request::builder()
-            .uri("/branches")
+            .uri(g("/branches"))
             .method(Method::GET)
             .body(Body::empty())
             .unwrap(),
@@ -85,7 +85,7 @@ async fn protected_routes_accept_valid_bearer_token_while_healthz_stays_open() {
     let (status, body) = json_response(
         &app,
         Request::builder()
-            .uri("/branches")
+            .uri(g("/branches"))
             .method(Method::GET)
             .header("authorization", "Bearer demo-token")
             .body(Body::empty())
@@ -108,7 +108,7 @@ async fn protected_routes_accept_any_configured_team_bearer_token() {
     let (status, body) = json_response(
         &app,
         Request::builder()
-            .uri("/branches")
+            .uri(g("/branches"))
             .method(Method::GET)
             .header("authorization", "Bearer token-two")
             .body(Body::empty())
@@ -158,7 +158,7 @@ rules:
     let (ok_status, _) = json_response(
         &app,
         Request::builder()
-            .uri("/snapshot?branch=main")
+            .uri(g("/snapshot?branch=main"))
             .method(Method::GET)
             .header("authorization", "Bearer token-a")
             .body(Body::empty())
@@ -172,7 +172,7 @@ rules:
     let (denied_status, denied_body) = json_response(
         &app,
         Request::builder()
-            .uri("/snapshot?branch=main")
+            .uri(g("/snapshot?branch=main"))
             .method(Method::GET)
             .header("authorization", "Bearer token-b")
             .body(Body::empty())
@@ -190,7 +190,7 @@ rules:
     let (bad_status, _) = json_response(
         &app,
         Request::builder()
-            .uri("/snapshot?branch=main")
+            .uri(g("/snapshot?branch=main"))
             .method(Method::GET)
             .header("authorization", "Bearer wrong-token")
             .body(Body::empty())
@@ -245,7 +245,7 @@ rules:
     let (spoof_up_status, spoof_up_body) = json_response(
         &app,
         Request::builder()
-            .uri("/snapshot?branch=main")
+            .uri(g("/snapshot?branch=main"))
             .method(Method::GET)
             .header("authorization", "Bearer token-b")
             .header("x-actor-id", "act-a")
@@ -270,7 +270,7 @@ rules:
     let (spoof_down_status, _) = json_response(
         &app,
         Request::builder()
-            .uri("/snapshot?branch=main")
+            .uri(g("/snapshot?branch=main"))
             .method(Method::GET)
             .header("authorization", "Bearer token-a")
             .header("x-actor-id", "act-b")
@@ -290,7 +290,7 @@ rules:
     let (empty_spoof_status, _) = json_response(
         &app,
         Request::builder()
-            .uri("/snapshot?branch=main")
+            .uri(g("/snapshot?branch=main"))
             .method(Method::GET)
             .header("authorization", "Bearer token-b")
             .header("x-actor-id", "")
@@ -316,7 +316,7 @@ async fn policy_allows_read_but_distinguishes_401_from_403() {
     let (missing_status, missing_body) = json_response(
         &app,
         Request::builder()
-            .uri("/snapshot?branch=main")
+            .uri(g("/snapshot?branch=main"))
             .method(Method::GET)
             .body(Body::empty())
             .unwrap(),
@@ -332,7 +332,7 @@ async fn policy_allows_read_but_distinguishes_401_from_403() {
     let (snapshot_status, snapshot_body) = json_response(
         &app,
         Request::builder()
-            .uri("/snapshot?branch=main")
+            .uri(g("/snapshot?branch=main"))
             .method(Method::GET)
             .header("authorization", "Bearer team-token")
             .body(Body::empty())
@@ -350,7 +350,7 @@ async fn policy_allows_read_but_distinguishes_401_from_403() {
     let (forbidden_status, forbidden_body) = json_response(
         &app,
         Request::builder()
-            .uri("/export")
+            .uri(g("/export"))
             .method(Method::POST)
             .header("authorization", "Bearer team-token")
             .header("content-type", "application/json")
@@ -369,7 +369,7 @@ async fn policy_allows_read_but_distinguishes_401_from_403() {
         .clone()
         .oneshot(
             Request::builder()
-                .uri("/export")
+                .uri(g("/export"))
                 .method(Method::POST)
                 .header("authorization", "Bearer admin-token")
                 .header("content-type", "application/json")
@@ -410,7 +410,7 @@ async fn policy_uses_resolved_branch_for_snapshot_reads() {
     let (status, body) = json_response(
         &app,
         Request::builder()
-            .uri("/read")
+            .uri(g("/read"))
             .method(Method::POST)
             .header("authorization", "Bearer team-token")
             .header("content-type", "application/json")
@@ -458,7 +458,7 @@ async fn policy_blocks_change_on_protected_main_but_allows_unprotected_branch() 
     let (main_status, main_body) = json_response(
         &app,
         Request::builder()
-            .uri("/change")
+            .uri(g("/change"))
             .method(Method::POST)
             .header("authorization", "Bearer team-token")
             .header("content-type", "application/json")
@@ -482,7 +482,7 @@ async fn policy_blocks_change_on_protected_main_but_allows_unprotected_branch() 
     let (feature_status, feature_body) = json_response(
         &app,
         Request::builder()
-            .uri("/change")
+            .uri(g("/change"))
             .method(Method::POST)
             .header("authorization", "Bearer team-token")
             .header("content-type", "application/json")
@@ -533,7 +533,7 @@ async fn policy_blocks_non_admin_merge_to_main_and_allows_admin() {
     let (deny_status, deny_body) = json_response(
         &app,
         Request::builder()
-            .uri("/branches/merge")
+            .uri(g("/branches/merge"))
             .method(Method::POST)
             .header("authorization", "Bearer team-token")
             .header("content-type", "application/json")
@@ -551,7 +551,7 @@ async fn policy_blocks_non_admin_merge_to_main_and_allows_admin() {
     let (allow_status, allow_body) = json_response(
         &app,
         Request::builder()
-            .uri("/branches/merge")
+            .uri(g("/branches/merge"))
             .method(Method::POST)
             .header("authorization", "Bearer admin-token")
             .header("content-type", "application/json")
@@ -578,7 +578,7 @@ async fn authenticated_change_stamps_actor_on_commits() {
     let (change_status, change_body) = json_response(
         &app,
         Request::builder()
-            .uri("/change")
+            .uri(g("/change"))
             .method(Method::POST)
             .header("authorization", "Bearer token-one")
             .header("content-type", "application/json")
@@ -592,7 +592,7 @@ async fn authenticated_change_stamps_actor_on_commits() {
     let (commits_status, commits_body) = json_response(
         &app,
         Request::builder()
-            .uri("/commits?branch=main")
+            .uri(g("/commits?branch=main"))
             .method(Method::GET)
             .header("authorization", "Bearer token-one")
             .body(Body::empty())
@@ -623,7 +623,7 @@ async fn authenticated_branch_merge_stamps_merge_actor_on_head_commit() {
     let (create_status, _) = json_response(
         &app,
         Request::builder()
-            .uri("/branches")
+            .uri(g("/branches"))
             .method(Method::POST)
             .header("authorization", "Bearer token-one")
             .header("content-type", "application/json")
@@ -642,7 +642,7 @@ async fn authenticated_branch_merge_stamps_merge_actor_on_head_commit() {
     let (change_status, _) = json_response(
         &app,
         Request::builder()
-            .uri("/change")
+            .uri(g("/change"))
             .method(Method::POST)
             .header("authorization", "Bearer token-one")
             .header("content-type", "application/json")
@@ -659,7 +659,7 @@ async fn authenticated_branch_merge_stamps_merge_actor_on_head_commit() {
     let (merge_status, merge_body) = json_response(
         &app,
         Request::builder()
-            .uri("/branches/merge")
+            .uri(g("/branches/merge"))
             .method(Method::POST)
             .header("authorization", "Bearer token-two")
             .header("content-type", "application/json")
@@ -673,7 +673,7 @@ async fn authenticated_branch_merge_stamps_merge_actor_on_head_commit() {
     let (commit_status, commit_body) = json_response(
         &app,
         Request::builder()
-            .uri("/commits?branch=main")
+            .uri(g("/commits?branch=main"))
             .method(Method::GET)
             .header("authorization", "Bearer token-two")
             .body(Body::empty())
@@ -691,7 +691,6 @@ async fn authenticated_branch_merge_stamps_merge_actor_on_head_commit() {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn engine_layer_policy_fires_via_direct_arc_omnigraph_from_new_single() {
-    use omnigraph_server::GraphRouting;
     let temp = init_loaded_graph().await;
     let graph = graph_path(temp.path());
     let db = Omnigraph::open(graph.to_str().unwrap()).await.unwrap();
@@ -717,9 +716,14 @@ async fn engine_layer_policy_fires_via_direct_arc_omnigraph_from_new_single() {
     // embedded consumer holding `Arc<Omnigraph>` would. If `new_single`
     // failed to apply `with_policy` to the engine, this `mutate_as`
     // would succeed — the HTTP-layer is bypassed entirely.
-    let handle = match state.routing() {
-        GraphRouting::Single { handle } => Arc::clone(handle),
-        GraphRouting::Multi { .. } => panic!("expected single-mode routing"),
+    // RFC-011 cluster-only: the single-graph convenience constructor
+    // registers the graph under the reserved id `default`.
+    let key = omnigraph_server::GraphKey::cluster(
+        omnigraph_server::GraphId::try_from("default").unwrap(),
+    );
+    let handle = match state.routing().registry.get(&key) {
+        omnigraph_server::RegistryLookup::Ready(handle) => handle,
+        omnigraph_server::RegistryLookup::Gone => panic!("default graph must be registered"),
     };
     let engine = Arc::clone(&handle.engine);
 
@@ -758,7 +762,7 @@ async fn oversized_request_body_returns_payload_too_large() {
         .clone()
         .oneshot(
             Request::builder()
-                .uri("/read")
+                .uri(g("/read"))
                 .method(Method::POST)
                 .header("content-type", "application/json")
                 .body(Body::from(oversized))
@@ -781,7 +785,7 @@ async fn default_deny_mode_allows_read_for_authenticated_actor() {
     let (status, _body) = json_response(
         &app,
         Request::builder()
-            .uri("/snapshot")
+            .uri(g("/snapshot"))
             .method(Method::GET)
             .header(AUTHORIZATION, "Bearer demo-token")
             .body(Body::empty())
@@ -808,7 +812,7 @@ async fn default_deny_mode_rejects_change_with_forbidden() {
     let (status, body) = json_response(
         &app,
         Request::builder()
-            .uri("/change")
+            .uri(g("/change"))
             .method(Method::POST)
             .header(AUTHORIZATION, "Bearer demo-token")
             .header("content-type", "application/json")
@@ -840,7 +844,7 @@ async fn default_deny_mode_rejects_schema_apply_with_forbidden() {
     let (status, body) = json_response(
         &app,
         Request::builder()
-            .uri("/schema/apply")
+            .uri(g("/schema/apply"))
             .method(Method::POST)
             .header(AUTHORIZATION, "Bearer demo-token")
             .header("content-type", "application/json")

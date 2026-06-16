@@ -32,6 +32,33 @@ fn test_build_catalog() {
 }
 
 #[test]
+fn test_embed_source_records_model_kwarg() {
+    let schema = parse_schema(
+        r#"
+node Doc {
+title: String
+embedding: Vector(3) @embed("title", model="openai/text-embedding-3-large")
+plain: Vector(3) @embed("title")
+}
+"#,
+    )
+    .unwrap();
+    let catalog = build_catalog(&schema).unwrap();
+    let doc = catalog.node_types.get("Doc").unwrap();
+
+    let embedding = doc.embed_sources.get("embedding").unwrap();
+    assert_eq!(embedding.source, "title");
+    assert_eq!(
+        embedding.model.as_deref(),
+        Some("openai/text-embedding-3-large")
+    );
+
+    let plain = doc.embed_sources.get("plain").unwrap();
+    assert_eq!(plain.source, "title");
+    assert_eq!(plain.model, None);
+}
+
+#[test]
 fn test_edge_lookup() {
     let schema = parse_schema(test_schema()).unwrap();
     let catalog = build_catalog(&schema).unwrap();

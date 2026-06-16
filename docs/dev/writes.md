@@ -19,8 +19,14 @@ publisher's row-level CAS on `__manifest` is the single fence.
   `__run__*` branch on an upgraded graph is swept off `__manifest` by the
   v2→v3 internal-schema migration on first read-write open. (The inert
   `_graph_runs.lance` bytes remain until a `delete_prefix` primitive lands.)
-- Cancelled mutation futures leave **no graph-level state** — only orphaned
-  Lance fragments, which the existing `omnigraph cleanup` pipe reclaims.
+- Cancelled mutation futures leave **no graph-visible state** — the manifest
+  is never advanced. They can leave two kinds of unreferenced residue, both
+  self-healing: orphaned Lance fragments (reclaimed by `omnigraph cleanup`),
+  and — on the *first* write to a table on a branch, which forks it before the
+  publish — a manifest-unreferenced branch ref. The next write to that table
+  reclaims the stale fork and re-forks (`reclaim_orphaned_fork_and_refork`),
+  and `cleanup`'s per-table reconciler is the guaranteed backstop; see the
+  fork-reclaim note in [invariants.md](invariants.md).
 
 ## Read-your-writes within a multi-statement mutation
 

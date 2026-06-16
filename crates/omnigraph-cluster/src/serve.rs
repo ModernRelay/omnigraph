@@ -8,6 +8,7 @@ use super::*;
 pub struct ServingGraph {
     pub graph_id: String,
     pub root: PathBuf,
+    pub embedding: Option<EmbeddingProviderConfig>,
 }
 
 /// One stored query: its graph binding, registry name, and verified source.
@@ -112,28 +113,13 @@ pub async fn cluster_root_for_graph_uri(graph_uri: &str) -> Option<String> {
 /// `cluster` is a config directory or a storage-root URI (`s3://…`, config-free),
 /// mirroring the server's `--cluster` dispatch.
 pub async fn resolve_graph_storage_uri(cluster: &str, graph_id: &str) -> Result<String, Diagnostic> {
-    let backend = if cluster.contains("://") {
-        ClusterStore::for_storage_root(cluster)?
-    } else {
-        ClusterStore::for_config_dir(Path::new(cluster))
-    };
+    let backend = open_cluster_backend(cluster)?;
     let mut observations = backend.observations();
     let snapshot = backend.read_state(&mut observations).await?;
-    let state = snapshot.state.ok_or_else(|| {
-        Diagnostic::error(
-            "cluster_state_missing",
-            CLUSTER_STATE_FILE,
-            format!("cluster `{cluster}` has no applied state; run `cluster apply` first"),
-        )
-    })?;
+    let state = snapshot.state.ok_or_else(|| missing_state_diagnostic(cluster))?;
     let address = format!("graph.{graph_id}");
     if !state.applied_revision.resources.contains_key(&address) {
-        let applied: Vec<&str> = state
-            .applied_revision
-            .resources
-            .keys()
-            .filter_map(|a| a.strip_prefix("graph."))
-            .collect();
+        let applied = applied_graph_ids(&state);
         return Err(Diagnostic::error(
             "graph_not_applied",
             address,
@@ -145,6 +131,46 @@ pub async fn resolve_graph_storage_uri(cluster: &str, graph_id: &str) -> Result<
         ));
     }
     Ok(backend.graph_root(graph_id))
+}
+
+/// List the graph ids applied in a cluster's served state (sorted). Reads the
+/// ledger only — no catalog validation — like `resolve_graph_storage_uri`, so
+/// it works on a degraded cluster. Used to enumerate candidates when no
+/// `--graph` is selected (RFC-011 Decision 7).
+pub async fn cluster_graph_ids(cluster: &str) -> Result<Vec<String>, Diagnostic> {
+    let backend = open_cluster_backend(cluster)?;
+    let mut observations = backend.observations();
+    let snapshot = backend.read_state(&mut observations).await?;
+    let state = snapshot.state.ok_or_else(|| missing_state_diagnostic(cluster))?;
+    Ok(applied_graph_ids(&state))
+}
+
+fn open_cluster_backend(cluster: &str) -> Result<ClusterStore, Diagnostic> {
+    if cluster.contains("://") {
+        ClusterStore::for_storage_root(cluster)
+    } else {
+        Ok(ClusterStore::for_config_dir(Path::new(cluster)))
+    }
+}
+
+fn missing_state_diagnostic(cluster: &str) -> Diagnostic {
+    Diagnostic::error(
+        "cluster_state_missing",
+        CLUSTER_STATE_FILE,
+        format!("cluster `{cluster}` has no applied state; run `cluster apply` first"),
+    )
+}
+
+fn applied_graph_ids(state: &crate::types::ClusterState) -> Vec<String> {
+    let mut ids: Vec<String> = state
+        .applied_revision
+        .resources
+        .keys()
+        .filter_map(|a| a.strip_prefix("graph."))
+        .map(str::to_string)
+        .collect();
+    ids.sort();
+    ids
 }
 
 /// Split `<root>/graphs/<id>.omni` → `<root>`, gating on the exact cluster
@@ -200,15 +226,73 @@ async fn read_snapshot_with_store(
         return Err(diagnostics);
     };
 
+    let mut embedding_profiles: BTreeMap<String, EmbeddingProviderConfig> = BTreeMap::new();
+    for (address, entry) in &state.applied_revision.resources {
+        if !matches!(resource_kind(address), ResourceKind::EmbeddingProvider(_)) {
+            continue;
+        }
+        let Some(profile) = entry.embedding_profile.clone() else {
+            diagnostics.push(Diagnostic::error(
+                "embedding_provider_profile_missing",
+                address.clone(),
+                "no applied embedding provider profile recorded; re-run `cluster apply` to backfill",
+            ));
+            continue;
+        };
+        let actual_digest = embedding_provider_digest(&profile);
+        if actual_digest != entry.digest {
+            diagnostics.push(Diagnostic::error(
+                "embedding_provider_digest_mismatch",
+                address.clone(),
+                format!(
+                    "applied embedding provider profile does not match its recorded digest (actual sha256:{actual_digest}); run `cluster refresh` then `cluster apply`, and restart"
+                ),
+            ));
+            continue;
+        }
+        embedding_profiles.insert(address.clone(), profile);
+    }
+
     let mut graphs = Vec::new();
     let mut queries = Vec::new();
     let mut policies = Vec::new();
     for (address, entry) in &state.applied_revision.resources {
         match resource_kind(address) {
             ResourceKind::Graph(graph_id) => {
+                let embedding = match entry.embedding_provider.as_deref() {
+                    Some(provider_address) => match resource_kind(provider_address) {
+                        ResourceKind::EmbeddingProvider(_) => {
+                            match embedding_profiles.get(provider_address) {
+                                Some(profile) => Some(profile.clone()),
+                                None => {
+                                    diagnostics.push(Diagnostic::error(
+                                        "embedding_provider_missing",
+                                        address.clone(),
+                                        format!(
+                                            "graph references `{provider_address}`, but no applied embedding provider profile is available; re-run `cluster apply`"
+                                        ),
+                                    ));
+                                    None
+                                }
+                            }
+                        }
+                        _ => {
+                            diagnostics.push(Diagnostic::error(
+                                "wrong_kind_reference",
+                                address.clone(),
+                                format!(
+                                    "graph embedding_provider expects `provider.embedding.<name>`, got `{provider_address}`"
+                                ),
+                            ));
+                            None
+                        }
+                    },
+                    None => None,
+                };
                 graphs.push(ServingGraph {
                     root: PathBuf::from(backend.graph_root(&graph_id)),
                     graph_id,
+                    embedding,
                 });
             }
             ResourceKind::Schema(_) => {}
@@ -216,7 +300,10 @@ async fn read_snapshot_with_store(
                 let ResourceKind::Query { graph, name } = &kind else {
                     unreachable!()
                 };
-                match backend.read_verified_payload(&kind, &entry.digest, address).await {
+                match backend
+                    .read_verified_payload(&kind, &entry.digest, address)
+                    .await
+                {
                     Ok(source) => queries.push(ServingQuery {
                         graph_id: graph.clone(),
                         name: name.clone(),
@@ -237,7 +324,10 @@ async fn read_snapshot_with_store(
                     ));
                     continue;
                 };
-                match backend.read_verified_payload(&kind, &entry.digest, address).await {
+                match backend
+                    .read_verified_payload(&kind, &entry.digest, address)
+                    .await
+                {
                     Ok(source) => policies.push(ServingPolicy {
                         name: name.clone(),
                         source,
@@ -246,6 +336,7 @@ async fn read_snapshot_with_store(
                     Err(diagnostic) => diagnostics.push(diagnostic),
                 }
             }
+            ResourceKind::EmbeddingProvider(_) => {}
             ResourceKind::Unknown => {}
         }
     }
@@ -313,4 +404,3 @@ mod tests {
         );
     }
 }
-

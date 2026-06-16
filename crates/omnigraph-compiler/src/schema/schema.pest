@@ -42,8 +42,10 @@ enum_value = @{ (ASCII_ALPHANUMERIC | "_" | "-")+ }
 base_type = { "String" | "Blob" | "Bool" | "I32" | "I64" | "U32" | "U64" | "F32" | "F64" | "DateTime" | "Date" }
 
 // Annotation rule excludes constraint keywords followed by "(" — those are body_constraints
-annotation = { "@" ~ !(constraint_name ~ "(") ~ ident ~ ("(" ~ annotation_arg ~ ")")? }
+annotation = { "@" ~ !(constraint_name ~ "(") ~ ident ~ ("(" ~ annotation_args ~ ")")? }
+annotation_args = { annotation_arg ~ ("," ~ annotation_kwarg)* }
 annotation_arg = { literal | ident }
+annotation_kwarg = { ident ~ "=" ~ literal }
 
 literal = { string_lit | float_lit | integer | bool_lit }
 

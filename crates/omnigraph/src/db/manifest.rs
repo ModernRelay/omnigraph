@@ -33,10 +33,10 @@ pub(crate) use namespace::open_table_head_for_write;
 use namespace::{branch_manifest_namespace, staged_table_namespace};
 use publisher::{GraphNamespacePublisher, ManifestBatchPublisher};
 pub(crate) use recovery::{
-    RecoveryMode, RecoverySidecar, RecoverySidecarHandle, SidecarKind, SidecarTablePin,
-    SidecarTableRegistration, SidecarTombstone, delete_sidecar, has_schema_apply_sidecar,
-    heal_pending_sidecars_roll_forward, list_sidecars, new_sidecar, recover_manifest_drift,
-    schema_apply_serial_queue_key, write_sidecar,
+    RecoveryMode, RecoverySidecarHandle, SidecarKind, SidecarTablePin, SidecarTableRegistration,
+    SidecarTombstone, delete_sidecar, has_schema_apply_sidecar, heal_pending_sidecars_roll_forward,
+    list_sidecars, new_sidecar, recover_manifest_drift, schema_apply_serial_queue_key,
+    write_sidecar,
 };
 pub use state::SubTableEntry;
 #[cfg(test)]

@@ -13,7 +13,8 @@ catalog writes, **graph creation** (a declared graph that does not exist yet
 is initialized by apply at the derived root), **schema updates** (soft drops
 only), and — behind an explicit, digest-bound **approval** — **graph
 deletion**. It does not perform data-loss schema migrations, start servers,
-or serve anything it applies: the server still boots from `omnigraph.yaml`.
+or run data loads. A server can boot from the applied ledger with
+`omnigraph-server --cluster <config-dir | storage-root>`.
 
 ## Commands
 
@@ -31,33 +32,31 @@ omnigraph cluster force-unlock <LOCK_ID> --config company-brain --json
 `--config` points at a directory, not a file. The directory must contain
 `cluster.yaml`. When omitted, it defaults to the current directory.
 
-## Relationship to `omnigraph.yaml`
+## Relationship to `~/.omnigraph/config.yaml`
 
-`cluster.yaml` does not replace `omnigraph.yaml`, and the two never describe
-the same fact. `omnigraph.yaml` is the permanent **per-operator** layer (CLI
-defaults, the operator's identity and credential references, graph targets
-for data-plane commands); `cluster.yaml` is the shared desired state of a
+`cluster.yaml` and the per-operator `~/.omnigraph/config.yaml` never describe
+the same fact. The operator config is the permanent **per-operator** layer
+(the operator's identity and credential references, named servers/clusters,
+profiles, and CLI defaults); `cluster.yaml` is the shared desired state of a
 whole deployment, read only by the `cluster` commands via `--config`.
 
 The exact contract:
 
-- **Cluster commands read `omnigraph.yaml` for exactly one thing**: the
-  `cli.actor` default used by `apply`/`approve` when `--as` is omitted —
-  operator identity is a per-operator fact. With `--as` present, no config
-  is read at all. Nothing else (its graph set, targets, bind, queries,
-  policies) ever influences a cluster command; a malformed `omnigraph.yaml`
-  breaks only the no-flag actor lookup, loudly.
-- **A `--cluster` server reads `omnigraph.yaml` for nothing** — not even the
-  implicit current-directory search runs (mode-inference rule 0). Boot from
-  cluster state XOR `omnigraph.yaml`, never a merge.
-- **The other direction is ergonomics, not coupling**: a per-operator
+- **Cluster commands read the operator config for exactly one thing**: the
+  `operator.actor` default used by `apply`/`approve` when `--as` is omitted —
+  operator identity is a per-operator fact. With `--as` present, the operator
+  config is not needed. Nothing else in it influences a cluster command.
+- **No legacy `omnigraph.yaml`**: the CLI does not read `omnigraph.yaml` at
+  all, and a `--cluster` server reads only the cluster catalog — boot is
+  cluster-only.
+- **The other direction is ergonomics, not coupling**: per-operator
   data-plane commands address a cluster graph by its derived storage root
   (`company-brain/graphs/knowledge.omni`) with `--store <uri>` — an ordinary
   local path, no special handling.
 
 ## Supported `cluster.yaml`
 
-Stage 3A accepts only this resource subset:
+The current config surface accepts this resource subset:
 
 ```yaml
 version: 1
@@ -68,9 +67,18 @@ state:
   backend: cluster
   lock: true
 
+providers:
+  embedding:
+    default:
+      kind: openai-compatible
+      base_url: https://openrouter.ai/api/v1
+      model: openai/text-embedding-3-large
+      api_key: ${OPENROUTER_API_KEY}
+
 graphs:
   knowledge:
     schema: knowledge.pg
+    embedding_provider: default
     queries: queries/          # discover every `query <name>` in queries/*.gq
 
 policies:
@@ -98,6 +106,17 @@ the digest is the containing file's hash, so editing a multi-query file
 updates all of its queries together. Paths are relative to the config
 directory — the cluster is one explicit folder, so no `./` prefixes are
 needed.
+
+`providers.embedding.<name>` defines a query-time embedding provider profile
+for cluster-served graphs. A graph opts in with `embedding_provider: <name>`;
+bare names normalize to `provider.embedding.<name>`. Supported provider
+`kind` values are `openai-compatible` (default/OpenRouter-compatible),
+`openai` (OpenAI's own host), `gemini`, and `mock`. Real providers require
+`api_key: ${ENV_VAR}`; inline secrets are rejected. The env var is resolved
+only when a `--cluster` server boots, so `cluster validate`, `plan`, and
+`apply` do not need deployment secrets. `mock` is deterministic and does not
+require `api_key`. Vector dimensions stay schema-driven by the target
+`Vector(N)` column, not the provider profile.
 
 `storage:` (optional) is the **storage root URI** for everything the cluster
 stores — the state ledger, lock, content-addressed catalog, recovery
@@ -133,10 +152,12 @@ operation is active.
 - stored-query parsing and query-name matching
 - stored-query type-checking against the desired schema
 - policy `applies_to` graph references
+- embedding provider profiles and graph `embedding_provider` references
 
-Fields reserved for later phases, such as `pipelines`, `embeddings`, `ui`,
-`aliases`, and `bindings`, fail with a typed diagnostic instead of being
-silently ignored.
+Fields reserved for later phases, such as `pipelines`, top-level
+`embeddings`, `ui`, `aliases`, and `bindings`, fail with a typed diagnostic
+instead of being silently ignored. Under `providers`, only `embedding` is
+supported today; other provider namespaces fail as unsupported config.
 
 ## Planning
 
@@ -156,9 +177,21 @@ resource is planned as a create. If present, the file must use this shape:
   "applied_revision": {
     "config_digest": "...",
     "resources": {
-      "graph.knowledge": { "digest": "..." },
       "schema.knowledge": { "digest": "..." },
       "query.knowledge.find_experts": { "digest": "..." },
+      "provider.embedding.default": {
+        "digest": "...",
+        "embedding_profile": {
+          "kind": "openai-compatible",
+          "base_url": "https://openrouter.ai/api/v1",
+          "model": "openai/text-embedding-3-large",
+          "api_key": "${OPENROUTER_API_KEY}"
+        }
+      },
+      "graph.knowledge": {
+        "digest": "...",
+        "embedding_provider": "provider.embedding.default"
+      },
       "policy.base": {
         "digest": "...",
         "applies_to": ["cluster", "graph.knowledge"]
@@ -234,12 +267,11 @@ Deletes remove the resource from state; their old payload blobs stay on disk
 (garbage collection is a later stage). Re-running a converged apply is a no-op:
 no state write, no revision change (`state_written: false`).
 
-**Applied means serving — for deployments that opt in.** A server started
-with `--cluster <dir>` boots from the applied revision (see
+**Applied means serving.** A server started with `--cluster <dir>` boots from
+the applied revision (see
 [Serving from the cluster](#serving-from-the-cluster-the-mode-switch)); it
-picks up newly applied state on its next restart. Deployments still booting
-from `omnigraph.yaml` are untouched: for them, applied means recorded in the
-catalog, nothing more.
+picks up newly applied state on its next restart. Until that restart, applied
+means recorded in the catalog, nothing more.
 
 ### Graph creation
 
