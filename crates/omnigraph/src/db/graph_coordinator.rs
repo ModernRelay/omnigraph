@@ -527,6 +527,19 @@ impl GraphCoordinator {
             ));
         };
         failpoints::maybe_fail("graph_publish.before_commit_append")?;
+        // Refresh the commit-graph head from storage before selecting the
+        // parent. `append_commit` parents the new commit on the IN-MEMORY head
+        // (`head_commit_id`, zero storage read), but the manifest was just
+        // committed against a freshly rebased pin (`commit_all` opens a fresh
+        // coordinator) while THIS coordinator's cached head may be stale because
+        // an external writer advanced the branch. Without this refresh a
+        // same-branch write after an external commit appends off the stale head
+        // and FORKS the commit DAG (the new commit and the external commit
+        // sharing a parent). Refreshing makes the parent the true current head;
+        // the just-committed manifest version has no commit-graph row yet, so the
+        // fresh head is exactly the prior commit. (record_merge_commit is
+        // unaffected — it passes explicit parents, never the cached head.)
+        commit_graph.refresh().await?;
         let graph_commit_id = commit_graph
             .append_commit(current_branch.as_deref(), manifest_version, actor_id)
             .await?;
