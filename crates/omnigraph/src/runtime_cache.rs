@@ -1,6 +1,8 @@
 use std::collections::{HashMap, VecDeque};
 use std::sync::Arc;
 
+use lance::Dataset;
+use lance::session::Session;
 use omnigraph_compiler::catalog::Catalog;
 use tokio::sync::Mutex;
 
@@ -111,6 +113,121 @@ fn graph_index_cache_key(resolved: &ResolvedTarget, catalog: &Catalog) -> GraphI
     GraphIndexCacheKey {
         snapshot_id: resolved.snapshot_id.as_str().to_string(),
         edge_tables,
+    }
+}
+
+/// Max held `Dataset` handles. A handle holds only Arcs (object store + manifest),
+/// never table data, so this is cheap; it bounds how many `(table, branch,
+/// version)` cells stay warm. One graph's live table set across a couple of
+/// branches at the current version fits comfortably, with headroom for the
+/// recently-superseded versions left by writes until they age out.
+const TABLE_HANDLE_CACHE_CAP: usize = 64;
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+struct TableHandleKey {
+    table_path: String,
+    table_branch: Option<String>,
+    version: u64,
+}
+
+/// Held open-`Dataset` handles keyed by `(table_path, branch, version)` — the
+/// version-keyed analogue of LanceDB's `DatasetConsistencyWrapper`
+/// (`rust/lancedb/src/table/dataset.rs`). A warm read reuses a held handle with
+/// zero open IO (a cheap `Dataset` clone); a miss opens once at the location with
+/// the shared `Session`. Version is in the key, so a write (which advances the
+/// table version) is simply a new key: the old handle ages out via LRU, no
+/// explicit invalidation needed for correctness. Only read-path Data opens use
+/// this — writes open HEAD directly and never receive a pinned handle.
+#[derive(Default)]
+pub struct TableHandleCache {
+    inner: Mutex<TableHandleCacheInner>,
+}
+
+#[derive(Default)]
+struct TableHandleCacheInner {
+    entries: HashMap<TableHandleKey, Dataset>,
+    lru: VecDeque<TableHandleKey>,
+}
+
+impl TableHandleCache {
+    /// Drop all held handles. Correctness never requires this (version-in-key);
+    /// it is memory hygiene, called from the same hooks that clear the graph
+    /// index cache (branch switch / refresh).
+    pub async fn invalidate_all(&self) {
+        let mut inner = self.inner.lock().await;
+        inner.entries.clear();
+        inner.lru.clear();
+    }
+
+    /// Return the dataset for `(table_path, branch, version)`, reusing a held
+    /// handle (0 open IO) or opening it once at `location` with the shared
+    /// `session` on a miss.
+    pub async fn get_or_open(
+        &self,
+        table_path: &str,
+        table_branch: Option<&str>,
+        version: u64,
+        location: &str,
+        session: Option<&Arc<Session>>,
+    ) -> Result<Dataset> {
+        let key = TableHandleKey {
+            table_path: table_path.to_string(),
+            table_branch: table_branch.map(str::to_string),
+            version,
+        };
+        {
+            let mut inner = self.inner.lock().await;
+            if let Some(ds) = inner.entries.get(&key).cloned() {
+                inner.touch(key);
+                return Ok(ds);
+            }
+        }
+        // Miss: open without holding the lock (the open is async IO). A concurrent
+        // double-miss opens twice and one wins the insert — correct (the dataset
+        // at a version is immutable) and rare.
+        let ds = crate::instrumentation::open_table_dataset(location, version, session).await?;
+        let mut inner = self.inner.lock().await;
+        if let Some(existing) = inner.entries.get(&key).cloned() {
+            inner.touch(key);
+            return Ok(existing);
+        }
+        inner.insert(key, ds.clone());
+        Ok(ds)
+    }
+}
+
+impl TableHandleCacheInner {
+    fn insert(&mut self, key: TableHandleKey, value: Dataset) {
+        self.entries.insert(key.clone(), value);
+        self.touch(key);
+        while self.entries.len() > TABLE_HANDLE_CACHE_CAP {
+            let Some(oldest) = self.lru.pop_front() else {
+                break;
+            };
+            if self.entries.remove(&oldest).is_some() {
+                break;
+            }
+        }
+    }
+
+    fn touch(&mut self, key: TableHandleKey) {
+        self.lru.retain(|existing| existing != &key);
+        self.lru.push_back(key);
+    }
+}
+
+/// Per-graph read caches handed to a resolved `Snapshot` so its table opens reuse
+/// one shared `Session` (LanceDB's one-session-per-connection pattern) and the
+/// held-handle cache. Manual `Debug` because `lance::session::Session` is not
+/// `Debug`; this lets `Snapshot` keep its `#[derive(Debug)]`.
+pub struct ReadCaches {
+    pub session: Arc<Session>,
+    pub handles: Arc<TableHandleCache>,
+}
+
+impl std::fmt::Debug for ReadCaches {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ReadCaches").finish_non_exhaustive()
     }
 }
 

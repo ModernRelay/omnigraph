@@ -37,6 +37,11 @@ use crate::storage::StorageAdapter;
 pub struct QueryIoProbes {
     pub manifest_wrapper: Option<Arc<dyn WrappingObjectStore>>,
     pub commit_graph_wrapper: Option<Arc<dyn WrappingObjectStore>>,
+    /// Attached to the per-table data opens a query performs (the cache-miss
+    /// path in `SubTableEntry::open`). Lets a cost test assert how many tables
+    /// a query actually opened — N on a cold read, 0 on a warm repeat once the
+    /// handle cache (Fix 3) serves them.
+    pub table_wrapper: Option<Arc<dyn WrappingObjectStore>>,
     pub probe_count: Arc<AtomicU64>,
 }
 
@@ -63,6 +68,10 @@ pub(crate) fn manifest_wrapper() -> Option<Arc<dyn WrappingObjectStore>> {
 
 pub(crate) fn commit_graph_wrapper() -> Option<Arc<dyn WrappingObjectStore>> {
     current(|p| p.commit_graph_wrapper.clone()).flatten()
+}
+
+pub(crate) fn table_wrapper() -> Option<Arc<dyn WrappingObjectStore>> {
+    current(|p| p.table_wrapper.clone()).flatten()
 }
 
 /// Record one version-probe invocation against the active per-query probes.
@@ -92,6 +101,33 @@ pub(crate) async fn open_dataset_tracked(
         }
     };
     result.map_err(|e| OmniError::Lance(e.to_string()))
+}
+
+/// Open a data-table dataset at `location` pinned to `version` — the cache-miss
+/// path of the data-read boundary (`SubTableEntry::open`). Attaches the shared
+/// per-graph `Session` (warms metadata/index caches across opens, LanceDB's
+/// one-session-per-connection pattern) and the per-query `table_wrapper` (for IO
+/// counting) when present. With neither, this is exactly the Fix-2
+/// `from_uri(location).with_version(version)` open.
+pub(crate) async fn open_table_dataset(
+    location: &str,
+    version: u64,
+    session: Option<&Arc<lance::session::Session>>,
+) -> Result<Dataset> {
+    let mut builder = DatasetBuilder::from_uri(location).with_version(version);
+    if let Some(session) = session {
+        builder = builder.with_session(session.clone());
+    }
+    if let Some(wrapper) = table_wrapper() {
+        builder = builder.with_store_params(ObjectStoreParams {
+            object_store_wrapper: Some(wrapper),
+            ..Default::default()
+        });
+    }
+    builder
+        .load()
+        .await
+        .map_err(|e| OmniError::Lance(e.to_string()))
 }
 
 /// Per-method read counts for [`CountingStorageAdapter`].

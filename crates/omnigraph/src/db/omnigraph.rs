@@ -105,6 +105,12 @@ pub struct Omnigraph {
     coordinator: Arc<tokio::sync::RwLock<GraphCoordinator>>,
     table_store: TableStore,
     runtime_cache: RuntimeCache,
+    /// Per-graph read caches: one shared Lance `Session` plus the held-`Dataset`
+    /// handle cache, handed to live-Branch-read snapshots (via
+    /// `resolved_target`) so table opens reuse handles (0 IO on a warm repeat)
+    /// and one session. Invalidated alongside `runtime_cache` on branch switch /
+    /// refresh — hygiene only; version-in-key carries correctness.
+    read_caches: Arc<crate::runtime_cache::ReadCaches>,
     /// Read-heavy on every query, written only by `apply_schema`. ArcSwap
     /// gives atomic pointer swap with zero-cost reads (`load()` returns a
     /// `Guard<Arc<Catalog>>`), so concurrent queries on different actors
@@ -314,6 +320,14 @@ impl Omnigraph {
             coordinator: Arc::new(tokio::sync::RwLock::new(coordinator)),
             table_store: TableStore::new(&root),
             runtime_cache: RuntimeCache::default(),
+            // One shared Session per graph (LanceDB's one-session-per-connection
+            // model) plus the held-handle cache, created once and reused across
+            // reads. Session::default() caps are lazy (6 GiB index / 1 GiB
+            // metadata); multi-graph cap/sharing is a deferred follow-up.
+            read_caches: Arc::new(crate::runtime_cache::ReadCaches {
+                session: Arc::new(lance::session::Session::default()),
+                handles: Arc::new(crate::runtime_cache::TableHandleCache::default()),
+            }),
             catalog: Arc::new(ArcSwap::from_pointee(catalog)),
             schema_source: Arc::new(ArcSwap::from_pointee(schema_source.to_string())),
             write_queue: Arc::new(crate::db::write_queue::WriteQueueManager::new()),
@@ -414,6 +428,14 @@ impl Omnigraph {
             coordinator: Arc::new(tokio::sync::RwLock::new(coordinator)),
             table_store: TableStore::new(&root),
             runtime_cache: RuntimeCache::default(),
+            // One shared Session per graph (LanceDB's one-session-per-connection
+            // model) plus the held-handle cache, created once and reused across
+            // reads. Session::default() caps are lazy (6 GiB index / 1 GiB
+            // metadata); multi-graph cap/sharing is a deferred follow-up.
+            read_caches: Arc::new(crate::runtime_cache::ReadCaches {
+                session: Arc::new(lance::session::Session::default()),
+                handles: Arc::new(crate::runtime_cache::TableHandleCache::default()),
+            }),
             catalog: Arc::new(ArcSwap::from_pointee(catalog)),
             schema_source: Arc::new(ArcSwap::from_pointee(schema_source)),
             write_queue: Arc::new(crate::db::write_queue::WriteQueueManager::new()),
@@ -753,6 +775,7 @@ impl Omnigraph {
         let next = self.open_coordinator_for_branch(branch.as_deref()).await?;
         *self.coordinator.write().await = next;
         self.runtime_cache.invalidate_all().await;
+        self.read_caches.handles.invalidate_all().await;
         Ok(())
     }
 
@@ -856,6 +879,7 @@ impl Omnigraph {
         .await?;
         self.reload_schema_if_source_changed().await?;
         self.runtime_cache.invalidate_all().await;
+        self.read_caches.handles.invalidate_all().await;
         Ok(())
     }
 
@@ -888,6 +912,7 @@ impl Omnigraph {
             // schema. Same post-heal step as `refresh`.
             self.reload_schema_if_source_changed().await?;
             self.runtime_cache.invalidate_all().await;
+        self.read_caches.handles.invalidate_all().await;
         }
         Ok(())
     }
@@ -924,6 +949,7 @@ impl Omnigraph {
     pub(crate) async fn refresh_coordinator_only(&self) -> Result<()> {
         self.coordinator.write().await.refresh().await?;
         self.runtime_cache.invalidate_all().await;
+        self.read_caches.handles.invalidate_all().await;
         Ok(())
     }
 
@@ -942,22 +968,36 @@ impl Omnigraph {
     ) -> Result<ResolvedTarget> {
         self.ensure_schema_state_valid().await?;
         let target = target.into();
+        let mut resolved = self.resolve_target_inner(&target).await?;
+        // Attach the read caches (shared Session + held-handle cache) for live
+        // Branch reads so table opens reuse handles (0 IO on a warm repeat).
+        // Snapshot-id reads are deliberately NOT cached: they pin a historical
+        // version `cleanup` may GC, so bypassing the cache sidesteps the
+        // cleanup-vs-cached-handle edge. Writes never reach here (they use
+        // `resolved_branch_target`), so they never receive a pinned handle.
+        if matches!(target, ReadTarget::Branch(_)) {
+            resolved.snapshot.set_read_caches(Arc::clone(&self.read_caches));
+        }
+        Ok(resolved)
+    }
 
-        // Same-branch reads reuse the warm coordinator, gated by a cheap version
-        // probe (invariant 6: strong consistency, never a blind warm read).
-        // Reads do not need the commit graph (the manifest version is the
-        // visibility authority, invariant 2), so the id is synthetic and no
-        // commit-graph scan happens on this path.
-        if let ReadTarget::Branch(branch) = &target {
+    /// Resolve a read target to its snapshot, without attaching read caches.
+    /// Same-branch reads reuse the warm coordinator, gated by a cheap version
+    /// probe (invariant 6: strong consistency, never a blind warm read). Reads do
+    /// not need the commit graph (the manifest version is the visibility
+    /// authority, invariant 2), so the id is synthetic and no commit-graph scan
+    /// happens on this path.
+    async fn resolve_target_inner(&self, target: &ReadTarget) -> Result<ResolvedTarget> {
+        if let ReadTarget::Branch(branch) = target {
             let normalized = normalize_branch_name(branch)?;
             {
                 let coord = self.coordinator.read().await;
                 if normalized.as_deref() != coord.current_branch() {
                     // Different branch: cold resolve (opens that branch).
-                    return coord.resolve_target(&target).await;
+                    return coord.resolve_target(target).await;
                 }
                 if coord.probe_latest_version().await? == coord.version() {
-                    return Ok(warm_resolved_target(&coord, &target));
+                    return Ok(warm_resolved_target(&coord, target));
                 }
                 // Stale: refresh under the write lock below.
             }
@@ -968,14 +1008,14 @@ impl Omnigraph {
                 if coord.probe_latest_version().await? != coord.version() {
                     coord.refresh_manifest_only().await?;
                 }
-                return Ok(warm_resolved_target(&coord, &target));
+                return Ok(warm_resolved_target(&coord, target));
             }
             // Branch changed while waiting for the write lock: cold resolve.
-            return coord.resolve_target(&target).await;
+            return coord.resolve_target(target).await;
         }
 
         // Snapshot target: resolve through the commit graph as before.
-        self.coordinator.read().await.resolve_target(&target).await
+        self.coordinator.read().await.resolve_target(target).await
     }
 
     // ─── Change detection ────────────────────────────────────────────────

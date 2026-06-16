@@ -21,16 +21,21 @@ use helpers::{
 };
 
 /// IO probes plus the tracker handles to read `read_iops` after the query.
-fn probes() -> (QueryIoProbes, IOTracker, IOTracker, Arc<AtomicU64>) {
+/// Returns `(probes, manifest, commit_graph, table, probe_count)` — `table`
+/// counts per-table data opens (the cache-miss path), so a cost test can assert
+/// N opens on a cold read and 0 on a warm repeat (Fix 3).
+fn probes() -> (QueryIoProbes, IOTracker, IOTracker, IOTracker, Arc<AtomicU64>) {
     let manifest = IOTracker::default();
     let commit_graph = IOTracker::default();
+    let table = IOTracker::default();
     let probe_count = Arc::new(AtomicU64::new(0));
     let probes = QueryIoProbes {
         manifest_wrapper: Some(Arc::new(manifest.clone()) as Arc<dyn WrappingObjectStore>),
         commit_graph_wrapper: Some(Arc::new(commit_graph.clone()) as Arc<dyn WrappingObjectStore>),
+        table_wrapper: Some(Arc::new(table.clone()) as Arc<dyn WrappingObjectStore>),
         probe_count: Arc::clone(&probe_count),
     };
-    (probes, manifest, commit_graph, probe_count)
+    (probes, manifest, commit_graph, table, probe_count)
 }
 
 /// A warm same-branch read must not re-open or scan `__manifest`, and must not
@@ -44,7 +49,7 @@ async fn warm_same_branch_read_does_no_resolution_opens() {
     // Deep history: warm-read resolution cost must be flat in commit count.
     commit_many(&mut db, 20).await;
 
-    let (probes_in, manifest, commit_graph, probe_count) = probes();
+    let (probes_in, manifest, commit_graph, _table, probe_count) = probes();
     with_query_io_probes(
         probes_in,
         db.query(
@@ -90,7 +95,7 @@ async fn multi_table_query_does_no_manifest_scans() {
     let dir = tempfile::tempdir().unwrap();
     let db = init_and_load(&dir).await;
 
-    let (probes_in, manifest, _commit_graph, _probe) = probes();
+    let (probes_in, manifest, _commit_graph, _table, _probe) = probes();
     with_query_io_probes(
         probes_in,
         db.query(
@@ -243,7 +248,7 @@ async fn warm_branch_read_does_no_manifest_scans() {
     // Bind the handle's coordinator to the branch so reads of it take the warm path.
     db.sync_branch("feature").await.unwrap();
 
-    let (probes_in, manifest, commit_graph, probe_count) = probes();
+    let (probes_in, manifest, commit_graph, _table, probe_count) = probes();
     with_query_io_probes(
         probes_in,
         db.query(
@@ -304,7 +309,7 @@ async fn stale_read_refreshes_manifest_only() {
     .await
     .unwrap();
 
-    let (probes_in, manifest, commit_graph, _probe) = probes();
+    let (probes_in, manifest, commit_graph, _table, _probe) = probes();
     with_query_io_probes(
         probes_in,
         reader.query(
@@ -325,5 +330,135 @@ async fn stale_read_refreshes_manifest_only() {
         commit_graph.stats().read_iops,
         0,
         "stale refresh must be manifest-only (no commit-graph scan)"
+    );
+}
+
+// ── Fix 3: held-handle cache — warm repeat reads stop re-opening tables ────────
+//
+// After Fix 1+2 a warm same-branch read still re-opened every touched table per
+// query (the "never warms up" residual). Fix 3 holds the open `Dataset` per
+// `(table, branch, version)` (the version-keyed analogue of LanceDB's
+// `DatasetConsistencyWrapper`) and shares one `Session` per graph, so a second
+// identical warm read reuses the handle with zero table opens.
+
+/// Headline: a second identical warm same-branch read does ZERO table opens
+/// (the cold first read opens; the warm repeat serves from the held-handle
+/// cache). Fails before Fix 3, where every read re-opens the table.
+#[tokio::test]
+async fn repeat_warm_read_reuses_table_handles() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut db = init_and_load(&dir).await;
+    // Deep history: the win must hold regardless of commit count.
+    commit_many(&mut db, 10).await;
+
+    // Cold first read: opens the touched table.
+    let (p1, _m1, _c1, table1, _pr1) = probes();
+    with_query_io_probes(
+        p1,
+        db.query(
+            ReadTarget::branch("main"),
+            TEST_QUERIES,
+            "total_people",
+            &params(&[]),
+        ),
+    )
+    .await
+    .unwrap();
+    assert!(
+        table1.stats().read_iops > 0,
+        "the cold first read must open the table"
+    );
+
+    // Warm repeat: the held handle is reused, so no open happens through this
+    // query's table wrapper.
+    let (p2, manifest2, commit_graph2, table2, probe2) = probes();
+    with_query_io_probes(
+        p2,
+        db.query(
+            ReadTarget::branch("main"),
+            TEST_QUERIES,
+            "total_people",
+            &params(&[]),
+        ),
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        table2.stats().read_iops,
+        0,
+        "a warm repeat read must reuse the held handle (0 table opens)"
+    );
+    assert_eq!(
+        manifest2.stats().read_iops,
+        0,
+        "warm repeat read: 0 manifest opens"
+    );
+    assert_eq!(
+        commit_graph2.stats().read_iops,
+        0,
+        "warm repeat read: 0 commit-graph opens"
+    );
+    assert_eq!(
+        probe2.load(Ordering::Relaxed),
+        1,
+        "warm repeat read: exactly one version probe"
+    );
+}
+
+/// A write advances the table's version, so the next read misses the
+/// version-keyed cache and re-opens — never serving a stale handle (invariant 6
+/// for the cached path). Passes with or without the cache; a correctness guard
+/// that the cache cannot serve pre-write data.
+#[tokio::test]
+async fn write_invalidates_table_cache_for_changed_table() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut db = init_and_load(&dir).await;
+
+    let before = count_rows(&db, "node:Person").await;
+
+    // Warm the cache for Person.
+    db.query(
+        ReadTarget::branch("main"),
+        TEST_QUERIES,
+        "total_people",
+        &params(&[]),
+    )
+    .await
+    .unwrap();
+
+    // Write Person: its version advances, so the cached (table, branch, version)
+    // key is now superseded.
+    mutate_main(
+        &mut db,
+        MUTATION_QUERIES,
+        "insert_person",
+        &mixed_params(&[("$name", "cache_miss_one")], &[("$age", 50)]),
+    )
+    .await
+    .unwrap();
+
+    // The next read re-opens Person at the new version (cache miss).
+    let (p, _m, _c, table, _pr) = probes();
+    with_query_io_probes(
+        p,
+        db.query(
+            ReadTarget::branch("main"),
+            TEST_QUERIES,
+            "total_people",
+            &params(&[]),
+        ),
+    )
+    .await
+    .unwrap();
+    assert!(
+        table.stats().read_iops > 0,
+        "a read after a write to the table must re-open it (version-keyed miss)"
+    );
+
+    let after = count_rows(&db, "node:Person").await;
+    assert_eq!(
+        after,
+        before + 1,
+        "the post-write read observes the new row (no stale handle served)"
     );
 }

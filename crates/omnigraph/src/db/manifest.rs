@@ -3,7 +3,6 @@ use std::sync::Arc;
 
 use crate::error::{OmniError, Result};
 use lance::Dataset;
-use lance::dataset::builder::DatasetBuilder;
 use lance_namespace::models::CreateTableVersionRequest;
 use omnigraph_compiler::catalog::Catalog;
 
@@ -74,16 +73,50 @@ pub struct Snapshot {
     root_uri: String,
     version: u64,
     entries: HashMap<String, SubTableEntry>,
+    /// Per-graph read caches (shared `Session` + held-handle cache), injected by
+    /// `Omnigraph::resolved_target` for live Branch reads so table opens reuse
+    /// handles (0 IO on a warm repeat) and one `Session`. `None` for write-prelude
+    /// snapshots, time-travel / Snapshot-id reads, and directly-built test
+    /// snapshots, which fall back to a plain open.
+    read_caches: Option<Arc<crate::runtime_cache::ReadCaches>>,
 }
 
 impl Snapshot {
-    /// Open a sub-table dataset at its pinned version.
+    /// Open a sub-table dataset at its pinned version. With read caches present
+    /// (live Branch reads), reuse a held handle through the cache (0 open IO on a
+    /// warm repeat) and the shared `Session`; otherwise plain-open (Fix 2).
     pub async fn open(&self, table_key: &str) -> Result<Dataset> {
         let entry = self
             .entries
             .get(table_key)
             .ok_or_else(|| OmniError::manifest(format!("no manifest entry for {}", table_key)))?;
-        entry.open(&self.root_uri).await
+        match &self.read_caches {
+            Some(caches) => {
+                let location = table_uri_for_path(
+                    &self.root_uri,
+                    &entry.table_path,
+                    entry.table_branch.as_deref(),
+                );
+                caches
+                    .handles
+                    .get_or_open(
+                        &entry.table_path,
+                        entry.table_branch.as_deref(),
+                        entry.table_version,
+                        &location,
+                        Some(&caches.session),
+                    )
+                    .await
+            }
+            None => entry.open(&self.root_uri).await,
+        }
+    }
+
+    /// Attach per-graph read caches (shared `Session` + handle cache) so this
+    /// snapshot's table opens reuse handles and the session. Set by
+    /// `Omnigraph::resolved_target` for live Branch reads only.
+    pub(crate) fn set_read_caches(&mut self, caches: Arc<crate::runtime_cache::ReadCaches>) {
+        self.read_caches = Some(caches);
     }
 
     /// Manifest version this snapshot was taken from.
@@ -147,11 +180,13 @@ impl SubTableEntry {
         // matches the physical layout the namespace path resolved, without the
         // per-open `__manifest` scan.
         let location = table_uri_for_path(root_uri, &self.table_path, self.table_branch.as_deref());
-        DatasetBuilder::from_uri(&location)
-            .with_version(self.table_version)
-            .load()
-            .await
-            .map_err(|e| OmniError::Lance(e.to_string()))
+        // Route through the instrumented data-table opener (Fix 3). With no
+        // session this is exactly the Fix-2 `from_uri(location).with_version`.
+        // This is the uncached fallback (a snapshot with no read caches); the
+        // cached path (`Snapshot::open` → handle cache) calls the same opener on
+        // a miss with the shared session, so both paths count on the per-query
+        // `table_wrapper`.
+        crate::instrumentation::open_table_dataset(&location, self.table_version, None).await
     }
 }
 
@@ -235,6 +270,7 @@ impl ManifestCoordinator {
                 .into_iter()
                 .map(|entry| (entry.table_key.clone(), entry))
                 .collect(),
+            read_caches: None,
         }
     }
 
