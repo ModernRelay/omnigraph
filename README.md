@@ -1,7 +1,7 @@
 <p align="center">
   <picture>
-    <source media="(prefers-color-scheme: dark)" srcset="assets/omnigraph-hero-dark.svg">
-    <img alt="OMNIGRAPH" src="assets/omnigraph-hero.svg" width="760">
+    <source media="(prefers-color-scheme: dark)" srcset="assets/omnigraph-wordmark-dark.svg">
+    <img alt="OMNIGRAPH" src="assets/omnigraph-wordmark.svg" width="420">
   </picture>
 </p>
 
