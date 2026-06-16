@@ -1133,13 +1133,6 @@ pub(crate) async fn server_schema_apply(
     actor: Option<Extension<ResolvedActor>>,
     Json(request): Json<SchemaApplyRequest>,
 ) -> std::result::Result<Json<SchemaApplyOutput>, ApiError> {
-    if state.routing().config_path.is_some() {
-        return Err(ApiError::conflict(
-            "server-side schema apply is disabled for cluster-backed serving; \
-             update the cluster config, run `omnigraph cluster apply`, and restart \
-             the server.",
-        ));
-    }
     let actor_arc = actor
         .as_ref()
         .map(|Extension(actor)| Arc::clone(&actor.actor_id))
@@ -1156,6 +1149,17 @@ pub(crate) async fn server_schema_apply(
             target_branch: Some("main".to_string()),
         },
     )?;
+    // Disable HTTP schema apply on cluster-backed serving AFTER the Cedar gate,
+    // so an unauthorized actor gets a 403 (not a 409 that would disclose the
+    // server is cluster-backed): 401 → 403 → 409, never leak topology before
+    // authorization. An authorized actor gets the actionable 409 signpost.
+    if state.routing().config_path.is_some() {
+        return Err(ApiError::conflict(
+            "server-side schema apply is disabled for cluster-backed serving; \
+             update the cluster config, run `omnigraph cluster apply`, and restart \
+             the server.",
+        ));
+    }
     let est_bytes = request.schema_source.len() as u64;
     let _admission = state
         .workload

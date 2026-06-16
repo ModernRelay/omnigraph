@@ -12,7 +12,9 @@ use omnigraph::loader::LoadMode;
 use omnigraph_server::api::{
     ChangeRequest, ErrorOutput, ReadRequest, SchemaApplyRequest, SchemaOutput,
 };
-use omnigraph_server::{AppState, GraphHandle, GraphId, GraphKey, build_app, workload};
+use omnigraph_server::{
+    AppState, GraphHandle, GraphId, GraphKey, PolicyEngine, build_app, workload,
+};
 use serde_json::json;
 
 
@@ -106,6 +108,57 @@ async fn schema_apply_route_refuses_cluster_backed_server_mode() {
             .properties
             .contains_key("nickname"),
         "cluster-backed schema apply must not mutate the graph"
+    );
+}
+
+#[tokio::test]
+async fn schema_apply_route_cluster_backed_denies_unauthorized_actor_before_409() {
+    // The cluster-backed 409 is reported AFTER the Cedar gate, so an actor
+    // without `schema_apply` permission gets a 403 — never a 409 that would
+    // disclose the server is cluster-backed (401 → 403 → 409, no topology leak
+    // before authorization). POLICY_YAML grants read/export but not schema_apply,
+    // so act-ragnor is denied.
+    let temp = init_graph_with_schema(&fs::read_to_string(fixture("test.pg")).unwrap()).await;
+    let graph = graph_path(temp.path());
+    let graph_uri = graph.to_string_lossy().to_string();
+    let engine = Omnigraph::open(&graph_uri).await.unwrap();
+    let policy = PolicyEngine::load_graph_from_source(POLICY_YAML, "default").unwrap();
+    let handle = Arc::new(GraphHandle {
+        key: GraphKey::cluster(GraphId::try_from("default").unwrap()),
+        uri: graph_uri,
+        engine: Arc::new(engine),
+        policy: Some(Arc::new(policy)),
+        queries: None,
+    });
+    let state = AppState::new_multi(
+        vec![handle],
+        vec![("act-ragnor".to_string(), "admin-token".to_string())],
+        None,
+        workload::WorkloadController::from_env(),
+        Some(temp.path().join("cluster.yaml")),
+    )
+    .unwrap();
+    let app = build_app(state);
+
+    let request = Request::builder()
+        .method(Method::POST)
+        .uri(g("/schema/apply"))
+        .header("content-type", "application/json")
+        .header("authorization", "Bearer admin-token")
+        .body(Body::from(
+            serde_json::to_vec(&SchemaApplyRequest {
+                schema_source: additive_schema_with_nickname(),
+                ..Default::default()
+            })
+            .unwrap(),
+        ))
+        .unwrap();
+    let (status, payload) = json_response(&app, request).await;
+
+    assert_eq!(
+        status,
+        StatusCode::FORBIDDEN,
+        "an unauthorized actor must get 403 before the cluster-backed 409: {payload}"
     );
 }
 
