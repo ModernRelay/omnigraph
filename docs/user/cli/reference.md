@@ -2,7 +2,7 @@
 
 A reference for the `omnigraph` binary's command surface and the per-operator `~/.omnigraph/config.yaml` schema. For a quick-start guide, see [cli.md](index.md).
 
-Top-level command families and subcommands. Graph-targeting commands accept a positional `file://`/`s3://` URI, `--server <name|url>` (an operator-defined server from `~/.omnigraph/config.yaml` by name, or a literal `http(s)://` URL, optionally with `--graph <id>` for multi-graph servers; exclusive with a positional URI), `--store <uri>` (a single graph's storage directly), or `--profile <name>` / `$OMNIGRAPH_PROFILE` (a named scope bundle; see [Scopes & profiles](#scopes--profiles-rfc-011)); `cluster` commands use `--config <dir>`, while `policy` and `queries` read a cluster's applied state via `--cluster <dir|uri>`. A remote server is addressed only with `--server` — a positional `http(s)://` URI is rejected. **`query`/`mutate` are the exception**: their positional is a stored-query *name* (RFC-011 D3), not a graph URI, so they address the graph only via `--store`/`--server`/`--profile`/defaults.
+Top-level command families and subcommands. Graph-targeting commands accept a positional `file://`/`s3://` URI, `--server <name|url>` (an operator-defined server from `~/.omnigraph/config.yaml` by name, or a literal `http(s)://` URL, optionally with `--graph <id>` for multi-graph servers; exclusive with a positional URI), `--store <uri>` (a single graph's storage directly), or `--profile <name>` / `$OMNIGRAPH_PROFILE` (a named scope bundle; see [Scopes & profiles](#scopes--profiles)); `cluster` commands use `--config <dir>`, while `policy` and `queries` read a cluster's applied state via `--cluster <dir|uri>`. A remote server is addressed only with `--server` — a positional `http(s)://` URI is rejected. **`query`/`mutate` are the exception**: their positional is a stored-query *name*, not a graph URI, so they address the graph only via `--store`/`--server`/`--profile`/defaults.
 
 ## Top-level commands
 
@@ -13,14 +13,14 @@ Top-level command families and subcommands. Graph-targeting commands accept a po
 | `ingest` | deprecated alias of `load --from <base>` (defaults: `--from main --mode merge`); prints a one-line warning to stderr |
 | `query <name>` (alias: `read`) | run a read query. **Catalog lane** (default): `<name>` is a stored query invoked **by name** from the served catalog (served-only — address with `--server`/`--profile`; the verb asserts the query is a read). **Ad-hoc lane**: with `--query <path>` or `-e`/`--query-string <GQ>`, runs that source (the positional `<name>` then selects which query in it). No positional graph URI — address via `--store`/`--server`/`--profile`. `read` is the deprecated previous name (one-line stderr warning) |
 | `mutate <name>` (alias: `change`) | run a mutation query; same catalog (by-name, served-only, verb asserts mutation) / ad-hoc (`--query`/`-e`) lanes as `query`. `change` is the deprecated previous name (one-line stderr warning) |
-| `alias <name> [args]` | invoke an operator alias — a read-only personal binding (under `aliases:` in `~/.omnigraph/config.yaml`) to a stored query on a named server (RFC-011 D4; replaces the removed `--alias` flag; stored mutations are rejected before execution) |
+| `alias <name> [args]` | invoke an operator alias — a read-only personal binding (under `aliases:` in `~/.omnigraph/config.yaml`) to a stored query on a named server (replaces the removed `--alias` flag; stored mutations are rejected before execution) |
 | `snapshot` | print current snapshot (per-table version + row count) |
 | `export` | dump to JSONL on stdout (`--type T`, `--table K` filters) |
 | `branch create \| list \| delete \| merge` | branching ops |
 | `commit list \| show` | inspect commit graph |
 | `schema plan \| apply \| show (alias: get)` | migrations. `apply` refuses a cluster-managed graph (one whose storage is inside a cluster) and points at `cluster apply` — those graphs evolve through the cluster ledger, not a direct apply |
 | `lint` (alias: `check`) | offline / graph-backed query validation. Replaces `query lint` / `query check`, which are kept as deprecated argv-level shims that print a one-line warning and rewrite to `omnigraph lint` |
-| `cluster validate \| plan \| apply \| approve \| status \| refresh \| import \| force-unlock` | declarative cluster control plane. `validate` checks a local `cluster.yaml` folder and referenced schema/query/policy files; `plan` diffs it against local JSON state at `__cluster/state.json`, annotates dispositions, and embeds real schema-migration previews; `apply` converges the cluster — stored-query/policy catalog writes (content-addressed under `__cluster/resources/`), graph creates, schema updates (soft drops only; `--as` records the actor), and graph deletes behind a digest-bound approval from `cluster approve <resource> --as <actor>` (`apply`/`approve` default the actor from `~/.omnigraph/config.yaml`'s `operator.actor` when `--as` is omitted); what apply converges is what an `omnigraph-server --cluster <dir>` deployment serves on its next restart (`--cluster` is the server's only boot source — RFC-011 cluster-only); `status` reads the state ledger; `refresh`/`import` explicitly update local JSON state from read-only graph observations; `force-unlock <LOCK_ID>` manually removes a held local state lock by exact id |
+| `cluster validate \| plan \| apply \| approve \| status \| refresh \| import \| force-unlock` | declarative cluster control plane. `validate` checks a local `cluster.yaml` folder and referenced schema/query/policy files; `plan` diffs it against local JSON state at `__cluster/state.json`, annotates dispositions, and embeds real schema-migration previews; `apply` converges the cluster — stored-query/policy catalog writes (content-addressed under `__cluster/resources/`), graph creates, schema updates (soft drops only; `--as` records the actor), and graph deletes behind a digest-bound approval from `cluster approve <resource> --as <actor>` (`apply`/`approve` default the actor from `~/.omnigraph/config.yaml`'s `operator.actor` when `--as` is omitted); what apply converges is what an `omnigraph-server --cluster <dir>` deployment serves on its next restart (`--cluster` is the server's only boot source — cluster-only); `status` reads the state ledger; `refresh`/`import` explicitly update local JSON state from read-only graph observations; `force-unlock <LOCK_ID>` manually removes a held local state lock by exact id |
 | `optimize` | non-destructive Lance compaction (skips tables with `Blob` columns or uncovered drift; `--json` reports `skipped`) |
 | `repair [--confirm] [--force]` | preview or explicitly publish uncovered manifest/head drift. `--confirm` heals verified maintenance drift and exits non-zero if suspicious/unverifiable drift is refused; `--force --confirm` publishes suspicious/unverifiable drift after operator review |
 | `cleanup --keep N --older-than 7d --confirm` | destructive version GC (`--confirm` to execute; also needs `--yes` against a non-local `s3://` target — see *Write diagnostics & destructive confirmation*) |
@@ -52,7 +52,7 @@ To maintain a server-backed graph, run the `direct` verbs from a host with stora
 
 ## Write diagnostics & destructive confirmation
 
-Two global flags make writes self-documenting and guard the dangerous ones (RFC-011 Decision 9):
+Two global flags make writes self-documenting and guard the dangerous ones:
 
 - **Every write echoes its resolved target to stderr** — `omnigraph load → s3://acme/brain/graphs/knowledge.omni (direct, remote)` — so you catch a scope that resolved somewhere unexpected (e.g. *prod*) before it lands. Applies to `load`, `ingest`, `mutate`, `branch create|delete|merge`, `schema apply`, `optimize`, `repair`, `cleanup`. The line is stderr, so `--json` consumers reading stdout are unaffected; suppress it with **`--quiet`**.
 - **Destructive writes against a non-local scope require confirmation.** `cleanup`, overwrite `load` (`--mode overwrite`), and `branch delete` proceed freely against a local (`file://`) graph, but when the resolved target is **not local** (a served `http(s)://` graph or an `s3://` store/cluster) they require explicit consent: pass **`--yes`** to confirm, an interactive terminal is prompted, and a non-interactive run (no TTY, or `--json`) **refuses with an error** rather than silently destroying. `cleanup` still also requires its existing `--confirm` (preview→execute); `--yes` is the additional non-local consent.
@@ -79,15 +79,15 @@ servers:                # operator-owned endpoints; names key the credentials
     url: https://graph.example.com     # no tokens in this file, ever
 defaults:
   output: table         # read format default, below --json/--format/alias
-  server: prod          # the everyday SERVED scope when no address is given (RFC-011)
+  server: prod          # the everyday SERVED scope when no address is given
   # store: file:///data/dev.omni   # OR a zero-flag LOCAL default (mutually
   #                                #   exclusive with `server`); the local-dev
   #                                #   counterpart of `server`
   default_graph: knowledge   # graph selected in a server/cluster scope
-clusters:               # admin-only: managed-cluster storage roots (RFC-011).
+clusters:               # admin-only: managed-cluster storage roots.
   brain:                #   the ONLY place a storage root lives in this file.
     root: s3://acme/clusters/brain
-profiles:               # named scope bundles (RFC-011); pick with --profile
+profiles:               # named scope bundles; pick with --profile
   staging: { server: staging, default_graph: knowledge }   # a served scope
   brain-admin: { cluster: brain, default_graph: knowledge } # a direct cluster scope
 ```
@@ -96,7 +96,7 @@ Absent file = empty layer. Unknown keys warn and load (a file written for a
 newer CLI works on an older one). Override the config directory with
 `$OMNIGRAPH_HOME`.
 
-#### Scopes & profiles (RFC-011)
+#### Scopes & profiles
 
 A command resolves a **scope** — a server, a cluster, or a store — then selects a
 graph in it; the served-vs-direct access path is derived from the scope, not
@@ -116,7 +116,7 @@ sticky "current" mode. Inspect what is defined with `omnigraph profile list` and
   `--cluster <root> --graph <id>`. A `--graph` flag overrides the profile's default.
 - A `server`-bound scope on a maintenance verb, or a `cluster`-bound scope on a
   data verb, is rejected with a message pointing at the right addressing.
-- **No graph selected (RFC-011 D7).** When a scope has no `--graph` and no
+- **No graph selected.** When a scope has no `--graph` and no
   `default_graph`, the CLI never silently picks:
   - **Cluster scope** — exactly **one** applied graph is used automatically;
     **several** errors and lists the candidates (from the served catalog).
@@ -158,7 +158,7 @@ aliases:
 
 `omnigraph alias triage 2026-06-01` invokes
 `POST <server>/graphs/spike/queries/weekly_triage` with the keyed
-credential. Aliases live in their own `alias` namespace (RFC-011 Decision 4),
+credential. Aliases live in their own `alias` namespace,
 so an alias can never shadow — or be shadowed by — a built-in verb. (The old
 `--alias <name>` flag on `query`/`mutate` was removed.)
 
