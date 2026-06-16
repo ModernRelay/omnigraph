@@ -52,6 +52,45 @@ brew tap ModernRelay/tap
 brew install ModernRelay/tap/omnigraph
 ```
 
+## Quick start
+
+The fastest path is an **embedded, local file-backed graph** — no server, no
+object store, no Docker:
+
+```bash
+# A schema and one row of data
+cat > schema.pg <<'PG'
+node Person {
+  slug: String @key
+  name: String
+  title: String?
+}
+PG
+echo '{"type":"Person","data":{"slug":"alice","name":"Alice","title":"Engineer"}}' > people.jsonl
+
+# Create → load (--mode is required) → query
+omnigraph init  --schema schema.pg ./graph.omni
+omnigraph load  --data people.jsonl --mode overwrite --store ./graph.omni
+omnigraph query find_people --store ./graph.omni --params '{"t":"Engineer"}' \
+  -e 'query find_people($t: String) { match { $p: Person { title: $t } } return { $p.name } }'
+
+# Branch, write in isolation, merge — Git-style across the whole graph
+omnigraph branch create --from main review/new-hires --store ./graph.omni
+omnigraph branch merge  review/new-hires --into main --store ./graph.omni
+```
+
+**Storage backends** — the same flow runs on any backend; only the graph address changes:
+
+| Backend | Use it for | Graph address |
+|---|---|---|
+| **Embedded** (local filesystem) | dev, demos, single machine — the default | `./graph.omni` |
+| **Object storage** (AWS S3, R2, GCS-S3) | shared, multi-host, durable | `s3://bucket/graph.omni` (+ the `AWS_*` env) |
+| **RustFS / MinIO** | rehearse the S3 path locally, no cloud account | `s3://…` against a local endpoint → [deployment guide](docs/user/deployment.md#testing-against-s3-locally) |
+
+`init` takes the address as its positional argument (`omnigraph init --schema schema.pg <address>`); `load`, `query`, and `branch` take it via `--store <address>`.
+
+For a **served, multi-graph deployment** (the cluster model), see [Common Commands](#common-commands) below.
+
 ## Set it up with an AI agent
 
 Omnigraph is built to be set up by coding agents. Paste this into Claude Code,
@@ -143,19 +182,8 @@ profiles, and policy/queries tooling.
 
 For programmatic access to a running `omnigraph-server`:
 
-- **TypeScript SDK** — [`@modernrelay/omnigraph`](https://www.npmjs.com/package/@modernrelay/omnigraph) ([source](https://github.com/ModernRelay/omnigraph-ts/tree/main/packages/sdk)). Instance-per-client, typed errors, camelCase types, async-iterator streaming export.
-
-  ```bash
-  npm install @modernrelay/omnigraph
-  ```
-
-- **Model Context Protocol server** — [`@modernrelay/omnigraph-mcp`](https://www.npmjs.com/package/@modernrelay/omnigraph-mcp) ([source](https://github.com/ModernRelay/omnigraph-ts/tree/main/packages/mcp)). Bridges Omnigraph to LLM hosts (Claude Desktop, Claude Code, …) over stdio. Exposes tools and resources for schema, branches, queries, mutations, ingest, and bundles curated best-practices guidance from the cookbook.
-
-  ```bash
-  npm install -g @modernrelay/omnigraph-mcp
-  ```
-
-Both packages are versioned in lockstep with `omnigraph-server` on major.minor: `@modernrelay/omnigraph@X.Y.*` targets `omnigraph-server@X.Y.*`. See [`ModernRelay/omnigraph-ts`](https://github.com/ModernRelay/omnigraph-ts) for the monorepo.
+- **TypeScript SDK + MCP server** — [`@modernrelay/omnigraph`](https://www.npmjs.com/package/@modernrelay/omnigraph) and [`@modernrelay/omnigraph-mcp`](https://www.npmjs.com/package/@modernrelay/omnigraph-mcp), versioned in lockstep with `omnigraph-server`. Source, docs, and examples: [`ModernRelay/omnigraph-ts`](https://github.com/ModernRelay/omnigraph-ts).
+- **Python SDK** — coming soon.
 
 ## Docs
 
