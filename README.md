@@ -1,8 +1,15 @@
-# Omnigraph
+<p align="center">
+  <picture>
+    <source media="(prefers-color-scheme: dark)" srcset="assets/omnigraph-wordmark-dark.svg">
+    <img alt="OMNIGRAPH" src="assets/omnigraph-wordmark.svg" width="380">
+  </picture>
+</p>
 
-[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
-[![Rust](https://img.shields.io/badge/rust-stable-orange.svg)](rust-toolchain.toml)
-[![Crates.io](https://img.shields.io/crates/v/omnigraph-cli.svg)](https://crates.io/crates/omnigraph-cli)
+<p align="center">
+  <a href="LICENSE"><img alt="License: MIT" src="https://img.shields.io/badge/License-MIT-yellow.svg"></a>
+  <a href="rust-toolchain.toml"><img alt="Rust" src="https://img.shields.io/badge/rust-stable-orange.svg"></a>
+  <a href="https://crates.io/crates/omnigraph-cli"><img alt="Crates.io" src="https://img.shields.io/crates/v/omnigraph-cli.svg"></a>
+</p>
 
 **Lakehouse native graph engine built for context assembly**
 
