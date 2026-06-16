@@ -12,7 +12,7 @@ Hundreds of agents can enrich the graph on parallel isolated branches and change
 
 - Git-style versioning & branching
 - Multimodal retrieval (graph+vector/fts+filters) optimized for context assembly
-- Object storage native (S3, RustFS)
+- Runs on the local filesystem or any S3-compatible object store (AWS S3, R2, MinIO, RustFS)
 - Native blob-as-data support (docs, images, videos, etc)
 - VPC, On-prem, hybrid deployment
 - [`Lance`](https://github.com/lance-format/lance) format as open storage layer
@@ -52,29 +52,45 @@ brew tap ModernRelay/tap
 brew install ModernRelay/tap/omnigraph
 ```
 
-For starter graphs and agent skills to bootstrap and operate Omnigraph, see [`ModernRelay/omnigraph-cookbooks`](https://github.com/ModernRelay/omnigraph-cookbooks).
+## Set it up with an AI agent
 
-## One-Command Local RustFS Bootstrap
+Omnigraph is built to be set up by coding agents. Paste this into Claude Code,
+Cursor, or any agent that can read a URL, install a package, and run a shell
+command — it installs the skill, reads the docs, and walks you through setup for
+your use case:
 
-```bash
-curl -fsSL https://raw.githubusercontent.com/ModernRelay/omnigraph/main/scripts/local-rustfs-bootstrap.sh | bash
+```text
+Help me set up Omnigraph (a lakehouse-native graph engine for agents).
+
+1. Install the Omnigraph skill so you operate it correctly:
+     npx skills add ModernRelay/omnigraph@omnigraph
+2. Read the docs at https://github.com/ModernRelay/omnigraph — start with
+   docs/user/quickstart.md, then docs/user/clusters/index.md.
+3. Skim the starter graphs and seed data in the cookbooks:
+   https://github.com/ModernRelay/omnigraph-cookbooks
+4. Ask me what I want to build (company brain, agent memory, dev graph,
+   research / R&D layer, …). Then install the CLI, stand up a first graph for
+   that use case, load a little data, and run a query so I can see it working.
 ```
 
-That bootstrap:
+Works with any agent that can browse a URL, install a package, and run a shell.
 
-- starts RustFS on `127.0.0.1:9000`
-- creates a bucket and S3-backed graph
-- loads the checked-in context fixture
-- launches `omnigraph-server` on `127.0.0.1:8080`
+## Agent skill & starter graphs
 
-Docker must be installed and running first.
+This repo ships the [**`omnigraph` agent skill**](skills/omnigraph) — the
+operational playbook (cluster mode, the two config surfaces, schema evolution,
+query linting, data writes, branches, Cedar policy, and common gotchas) that
+teaches a coding agent to drive Omnigraph correctly. Install it with:
 
-The RustFS bootstrap prefers the rolling `edge` binaries and only falls back to
-source builds when release assets are unavailable.
+```bash
+npx skills add ModernRelay/omnigraph@omnigraph
+```
 
-If a previous run left objects under the same graph prefix but did not finish
-initializing the graph, rerun with `RESET_REPO=1` or set `PREFIX` to a new
-value.
+For ready-to-run graphs with real seed data (company brain, VC operating system,
+pharma & industry intel),
+[`ModernRelay/omnigraph-cookbooks`](https://github.com/ModernRelay/omnigraph-cookbooks)
+is the fastest way to see Omnigraph shaped to a real domain. To rehearse the S3
+path locally, see [deployment.md → Testing against S3 locally](docs/user/deployment.md#testing-against-s3-locally).
 
 ## Common Commands
 
