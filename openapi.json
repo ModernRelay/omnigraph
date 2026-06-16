@@ -412,7 +412,7 @@
           "mutations"
         ],
         "summary": "**Deprecated** — use [`POST /mutate`](#tag/mutations/operation/mutate) instead.",
-        "description": "Apply a GQ mutation to a branch. Behavior is unchanged; the route is\nkept indefinitely for back-compat. New integrations should target\n`POST /mutate`, which has identical semantics and a name that pairs\ncleanly with `POST /query`. Responses from this route include\n`Deprecation: true` and `Link: </mutate>; rel=\"successor-version\"`\nheaders per RFC 9745 / RFC 8288 so SDKs and proxies can surface the\nsignal.",
+        "description": "Apply a GQ mutation to a branch. Behavior is unchanged; the route is\nkept indefinitely for back-compat. New integrations should target\n`POST /mutate`, which has identical semantics and a name that pairs\ncleanly with `POST /query`. Responses from this route include\n`Deprecation: true` and `Link: <mutate>; rel=\"successor-version\"`\nheaders per RFC 9745 / RFC 8288 so SDKs and proxies can surface the\nsignal.",
         "operationId": "cluster_change",
         "parameters": [
           {
@@ -437,7 +437,7 @@
         },
         "responses": {
           "200": {
-            "description": "Mutation results (response includes `Deprecation: true` + `Link: </mutate>; rel=\"successor-version\"`)",
+            "description": "Mutation results (response includes `Deprecation: true` + `Link: <mutate>; rel=\"successor-version\"`)",
             "content": {
               "application/json": {
                 "schema": {
@@ -731,7 +731,7 @@
           "mutations"
         ],
         "summary": "**Deprecated** — use [`POST /load`](#tag/mutations/operation/load) instead.",
-        "description": "Bulk-load NDJSON data into a branch. Behavior is unchanged; the route is\nkept indefinitely for back-compat. New integrations should target\n`POST /load`, which has identical semantics. Responses from this route\ninclude `Deprecation: true` and `Link: </load>; rel=\"successor-version\"`\nheaders per RFC 9745 / RFC 8288 so SDKs and proxies can surface the signal.",
+        "description": "Bulk-load NDJSON data into a branch. Behavior is unchanged; the route is\nkept indefinitely for back-compat. New integrations should target\n`POST /load`, which has identical semantics. Responses from this route\ninclude `Deprecation: true` and `Link: <load>; rel=\"successor-version\"`\nheaders per RFC 9745 / RFC 8288 so SDKs and proxies can surface the signal.",
         "operationId": "cluster_ingest",
         "parameters": [
           {
@@ -756,7 +756,7 @@
         },
         "responses": {
           "200": {
-            "description": "Load results (response includes `Deprecation: true` + `Link: </load>; rel=\"successor-version\"`)",
+            "description": "Load results (response includes `Deprecation: true` + `Link: <load>; rel=\"successor-version\"`)",
             "content": {
               "application/json": {
                 "schema": {
@@ -1275,7 +1275,7 @@
           "queries"
         ],
         "summary": "**Deprecated** — use [`POST /query`](#tag/queries/operation/query) instead.",
-        "description": "Execute a GQ read query. Behavior is unchanged from prior releases; the\nroute is kept indefinitely for byte-stable back-compat. New integrations\nshould target `POST /query`, which has clean field names (`query` /\n`name`) and a 400-on-mutation guard. Responses from this route include\n`Deprecation: true` and `Link: </query>; rel=\"successor-version\"`\nheaders per RFC 9745 / RFC 8288 so SDKs and proxies can surface the\nsignal.",
+        "description": "Execute a GQ read query. Behavior is unchanged from prior releases; the\nroute is kept indefinitely for byte-stable back-compat. New integrations\nshould target `POST /query`, which has clean field names (`query` /\n`name`) and a 400-on-mutation guard. Responses from this route include\n`Deprecation: true` and `Link: <query>; rel=\"successor-version\"`\nheaders per RFC 9745 / RFC 8288 so SDKs and proxies can surface the\nsignal.",
         "operationId": "cluster_read",
         "parameters": [
           {
@@ -1300,7 +1300,7 @@
         },
         "responses": {
           "200": {
-            "description": "Query results (response includes `Deprecation: true` + `Link: </query>; rel=\"successor-version\"`)",
+            "description": "Query results (response includes `Deprecation: true` + `Link: <query>; rel=\"successor-version\"`)",
             "content": {
               "application/json": {
                 "schema": {
@@ -1412,7 +1412,7 @@
           "mutations"
         ],
         "summary": "Apply a schema migration.",
-        "description": "Diffs `schema_source` against the current schema and applies the resulting\nmigration steps (add/drop type, add/drop column, etc.). **Destructive**:\nsome steps drop data. Returns the list of steps applied; if `applied` is\nfalse the diff was unsupported and no changes were made.",
+        "description": "Cluster-backed servers reject this route with `409 Conflict`; operators\nmust apply schema changes through `omnigraph cluster apply` and restart.\n\nDiffs `schema_source` against the current schema and applies the resulting\nmigration steps (add/drop type, add/drop column, etc.). **Destructive**:\nsome steps drop data. Returns the list of steps applied; if `applied` is\nfalse the diff was unsupported and no changes were made.",
         "operationId": "cluster_applySchema",
         "parameters": [
           {
@@ -1468,6 +1468,16 @@
           },
           "403": {
             "description": "Forbidden",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorOutput"
+                }
+              }
+            }
+          },
+          "409": {
+            "description": "Schema apply is disabled for cluster-backed serving; use `omnigraph cluster apply` and restart",
             "content": {
               "application/json": {
                 "schema": {

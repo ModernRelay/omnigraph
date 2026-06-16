@@ -186,9 +186,9 @@ fn scope_from_binding(
         ScopeBinding::Cluster(cluster) => {
             if capability == Capability::Any {
                 bail!(
-                    "{source} resolves a cluster scope, which is maintenance-only; run \
-                     data commands through a server, or use --store <uri> for ad-hoc \
-                     direct access"
+                    "{source} resolves a cluster scope, which is not valid for graph data \
+                     commands; run data commands through a server, or use --store <uri> \
+                     for ad-hoc direct access"
                 );
             }
             // A cluster value is a config name (resolved against `clusters:`)
@@ -501,7 +501,7 @@ mod tests {
         )
         .unwrap_err()
         .to_string();
-        assert!(err.contains("maintenance-only"), "{err}");
+        assert!(err.contains("not valid for graph data commands"), "{err}");
     }
 
     #[test]

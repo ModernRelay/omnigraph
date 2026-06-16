@@ -81,6 +81,7 @@ Working documents for in-flight feature work. Removed when the work lands.
 | Unify CLI embedded/remote access paths — parity referee, shared wire-DTO crate, `GraphClient` trait, declared plane capabilities | [rfc-009-unify-access-paths.md](rfc-009-unify-access-paths.md) |
 | Restructure the CLI around explicit planes — one graph-addressing model, declared capability surface, plane-grouped help (expands RFC-009 Phase 4) | [rfc-010-cli-planes-restructure.md](rfc-010-cli-planes-restructure.md) |
 | CLI refactoring — one addressing & config model post-`omnigraph.yaml`: scope + `--graph` + derived access path, served-default / privileged-direct, profiles, named queries, capability classifier (completes RFC-008) | [rfc-011-cli-refactoring.md](rfc-011-cli-refactoring.md) |
+| Provider-independent embedding configuration — one resolved `EmbeddingConfig` + sealed provider enum (Gemini/OpenAI/Mock), identity recorded in the schema IR, query-time same-space validation, NFR floor | [rfc-012-embedding-provider-config.md](rfc-012-embedding-provider-config.md) |
 
 ## Boundary
 

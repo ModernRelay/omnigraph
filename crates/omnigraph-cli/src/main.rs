@@ -106,15 +106,44 @@ async fn main() -> Result<()> {
                         .profiles
                         .iter()
                         .map(|(name, profile)| {
-                            let binding = match profile.binding(name) {
-                                Ok(ScopeBinding::Server(s)) => format!("server: {s}"),
-                                Ok(ScopeBinding::Cluster(c)) => format!("cluster: {c}"),
-                                Ok(ScopeBinding::Store(u)) => format!("store: {u}"),
-                                Err(e) => format!("invalid: {e}"),
-                            };
+                            let (binding, scope_kind, target, valid, error) =
+                                match profile.binding(name) {
+                                    Ok(ScopeBinding::Server(s)) => (
+                                        format!("server: {s}"),
+                                        "server".to_string(),
+                                        Some(s),
+                                        true,
+                                        None,
+                                    ),
+                                    Ok(ScopeBinding::Cluster(c)) => (
+                                        format!("cluster: {c}"),
+                                        "cluster".to_string(),
+                                        Some(c),
+                                        true,
+                                        None,
+                                    ),
+                                    Ok(ScopeBinding::Store(u)) => (
+                                        format!("store: {u}"),
+                                        "store".to_string(),
+                                        Some(u),
+                                        true,
+                                        None,
+                                    ),
+                                    Err(e) => (
+                                        format!("invalid: {e}"),
+                                        "invalid".to_string(),
+                                        None,
+                                        false,
+                                        Some(e.to_string()),
+                                    ),
+                                };
                             ProfileListItem {
                                 name: name.clone(),
                                 binding,
+                                scope_kind,
+                                target,
+                                valid,
+                                error,
                                 default_graph: profile.default_graph.clone(),
                                 active: active.as_deref() == Some(name.as_str()),
                             }

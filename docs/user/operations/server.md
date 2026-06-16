@@ -40,16 +40,16 @@ graph id from the cluster's applied revision:
 | GET | `/openapi.json` | none | — (strips security if auth disabled; emits the nested cluster paths with `cluster_` operation-id prefix) |
 | GET | `/graphs/{id}/snapshot?branch=` | bearer + `read` | snapshot of branch |
 | POST | `/graphs/{id}/query` | bearer + `read` | inline read query (canonical; clean field names `query`/`name`; mutations → 400) |
-| POST | `/graphs/{id}/read` | bearer + `read` | **deprecated** alias of `/query` (legacy field names `query_source`/`query_name`, byte-stable response; carries `Deprecation: true` + `Link: </query>; rel="successor-version"`) |
+| POST | `/graphs/{id}/read` | bearer + `read` | **deprecated** alias of `/query` (legacy field names `query_source`/`query_name`, byte-stable response; carries `Deprecation: true` + `Link: <query>; rel="successor-version"`) |
 | POST | `/graphs/{id}/export` | bearer + `export` | NDJSON stream |
 | POST | `/graphs/{id}/mutate` | bearer + `change` | mutation (canonical; `query`/`name`; accepts legacy `query_source`/`query_name` as serde aliases) |
-| POST | `/graphs/{id}/change` | bearer + `change` | **deprecated** alias of `/mutate` (carries `Deprecation: true` + `Link: </mutate>; rel="successor-version"`) |
+| POST | `/graphs/{id}/change` | bearer + `change` | **deprecated** alias of `/mutate` (carries `Deprecation: true` + `Link: <mutate>; rel="successor-version"`) |
 | GET | `/graphs/{id}/queries` | bearer + `read` | list the `mcp.expose` stored queries as a typed tool catalog |
 | POST | `/graphs/{id}/queries/{name}` | bearer + `invoke_query` (+ `change` for a stored mutation) | invoke a named query from the `queries:` registry; deny == 404 |
 | GET | `/graphs/{id}/schema` | bearer + `read` | get current `.pg` source |
-| POST | `/graphs/{id}/schema/apply` | bearer + `schema_apply` (target=`main`) | migrate |
+| POST | `/graphs/{id}/schema/apply` | bearer + `schema_apply` (target=`main`) | disabled for cluster-backed serving; returns 409 and points operators at `omnigraph cluster apply` + restart |
 | POST | `/graphs/{id}/load` | bearer + `branch_create` (only when `from` is set and the branch is created) + `change` | bulk load (canonical); branch creation is opt-in via `from` — without it a missing `branch` is a 404, never an implicit fork (32 MB body limit) |
-| POST | `/graphs/{id}/ingest` | bearer + `branch_create` (only when `from` is set and the branch is created) + `change` | **deprecated** alias of `/load` (carries `Deprecation: true` + `Link: </load>; rel="successor-version"`) (32 MB body limit) |
+| POST | `/graphs/{id}/ingest` | bearer + `branch_create` (only when `from` is set and the branch is created) + `change` | **deprecated** alias of `/load` (carries `Deprecation: true` + `Link: <load>; rel="successor-version"`) (32 MB body limit) |
 | GET | `/graphs/{id}/branches` | bearer + `read` | list branches |
 | POST | `/graphs/{id}/branches` | bearer + `branch_create` | create |
 | DELETE | `/graphs/{id}/branches/{branch}` | bearer + `branch_delete` | delete |
@@ -131,8 +131,8 @@ channels:
 - **Response headers (RFC 9745)**: every response carries `Deprecation: true`.
 - **Response headers (RFC 8288)**: every response carries a `Link` header
   pointing at the canonical successor:
-  `Link: </query>; rel="successor-version"` for `/read`, and
-  `Link: </mutate>; rel="successor-version"` for `/change`. SDKs and HTTP
+  `Link: <query>; rel="successor-version"` for `/read`, and
+  `Link: <mutate>; rel="successor-version"` for `/change`. SDKs and HTTP
   proxies can pick the successor up automatically.
 
 Migration is purely cosmetic on the client side — swap the URL path, leave

@@ -261,13 +261,13 @@ fn typecheck_mutation(catalog: &Catalog, mutation: &Mutation, params: &[Param]) 
                         continue;
                     }
 
-                    if let Some(source_prop) = node_type.embed_sources.get(prop_name) {
-                        if assigned_props.contains(source_prop.as_str()) {
+                    if let Some(embed) = node_type.embed_sources.get(prop_name) {
+                        if assigned_props.contains(embed.source.as_str()) {
                             continue;
                         }
                         return Err(NanoError::Type(format!(
                             "T12: insert for `{}` must provide non-nullable property `{}` or @embed source `{}`",
-                            insert.type_name, prop_name, source_prop
+                            insert.type_name, prop_name, embed.source
                         )));
                     }
 
