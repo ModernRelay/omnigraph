@@ -78,51 +78,50 @@ value.
 
 ## Common Commands
 
-Every command declares the **capability** it needs and how it's addressed.
-Direct storage (`init`, `load`, `branch`, …) takes a positional `file://`/`s3://`
-URI or `--store <uri>`; a served graph is addressed with `--server <name|url>`
-(never a positional `http(s)://` URI). `query`/`mutate` invoke a stored query
-**by name** (the positional is the query name, not a graph URI).
+A deployment is a **cluster**. A `cluster.yaml` declares its graphs, schemas,
+stored queries, and policies; you converge it with `cluster apply` and serve it.
+The server is cluster-first — it boots only from a cluster and serves every graph
+under `/graphs/{id}/…`. Day-to-day work goes through that server: graphs are
+addressed with `--server <name>` (+ `--graph <id>`), and `query`/`mutate` invoke
+a stored query from the catalog **by name**.
 
 ```bash
-# Create a graph and load data (--mode is required; overwrite is destructive)
-omnigraph init --schema ./schema.pg ./graph.omni
-omnigraph load --data ./data.jsonl --mode merge --store ./graph.omni
-
-# Read / write — ad-hoc .gq against a local store (positional selects the query)
-omnigraph query  --query ./queries.gq get_person    --params '{"name":"Alice"}' --store ./graph.omni
-omnigraph mutate --query ./queries.gq insert_person  --params '{"name":"Mina"}'  --store ./graph.omni
-
-# Branch and merge (Git-style, across the whole graph)
-omnigraph branch create --from main feature-x --store ./graph.omni
-omnigraph branch merge  feature-x --into main --store ./graph.omni
-
-# Against a running server: invoke a stored query by name from the catalog
-omnigraph query find_people --server prod --graph knowledge --params '{"q":"AI safety"}'
-```
-
-Operator settings (identity, named servers/clusters, credentials, defaults) live
-in `~/.omnigraph/config.yaml`; with a default scope set, the addressing flags can
-be omitted. See [docs/user/cli/index.md](docs/user/cli/index.md) and the
-[CLI reference](docs/user/cli/reference.md) for schema apply, snapshots, commits,
-profiles, and policy/queries tooling.
-
-## Serving (cluster-first)
-
-A deployment is a **cluster**: a `cluster.yaml` (graphs, schemas, stored queries,
-policies, storage) that you converge with `cluster apply`, then serve. The server
-boots from the cluster only — it has no single-graph mode — and serves every
-graph under `/graphs/{id}/…`.
-
-```bash
-omnigraph cluster apply  --config ./company-brain          # converge the declared state
+# 1. Converge the declared cluster, then serve it
+omnigraph cluster apply --config ./company-brain
 omnigraph-server --cluster ./company-brain --bind 0.0.0.0:8080
-# or config-free from object storage — the bucket IS the deployment:
-omnigraph-server --cluster s3://my-bucket/company-brain --bind 0.0.0.0:8080
+#    or config-free from object storage — the bucket IS the deployment:
+#    omnigraph-server --cluster s3://my-bucket/company-brain --bind 0.0.0.0:8080
+
+# 2. Work against the served graph — stored queries invoked by name
+omnigraph query  find_people --server prod --graph knowledge --params '{"q":"AI safety"}'
+omnigraph mutate add_person  --server prod --graph knowledge --params '{"name":"Mina"}'
+omnigraph load   --data ./data.jsonl --mode merge --server prod --graph knowledge
+
+# 3. Branch and merge, Git-style across the whole graph
+omnigraph branch create --from main review/2026-06 --server prod --graph knowledge
+omnigraph branch merge  review/2026-06 --into main --server prod --graph knowledge
 ```
 
-See the [cluster guide](docs/user/clusters/index.md) and
-[deployment guide](docs/user/deployment.md).
+Set a default scope (or a `--profile`) in `~/.omnigraph/config.yaml` — operator
+identity, named servers/clusters, credentials — and the `--server`/`--graph`
+flags drop away (`omnigraph query find_people --params …`).
+
+**Local / ad-hoc.** For quick iteration on a standalone graph (no cluster, no
+server), address storage directly with `--store` (or a positional `file://` /
+`s3://` URI) and run ad-hoc `.gq` with `--query` (the positional then selects
+which query in the file):
+
+```bash
+omnigraph init  --schema ./schema.pg ./graph.omni
+omnigraph load  --data ./data.jsonl --mode merge --store ./graph.omni
+omnigraph query --query ./queries.gq get_person --params '{"name":"Alice"}' --store ./graph.omni
+```
+
+See [docs/user/cli/index.md](docs/user/cli/index.md), the
+[CLI reference](docs/user/cli/reference.md), the
+[cluster guide](docs/user/clusters/index.md), and the
+[deployment guide](docs/user/deployment.md) for schema apply, snapshots, commits,
+profiles, and policy/queries tooling.
 
 ## Clients
 
