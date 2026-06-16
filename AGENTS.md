@@ -210,9 +210,9 @@ omnigraph load --data ./seed.jsonl --mode overwrite s3://my-bucket/graph.omni
 # Load a review batch onto its own branch (--from forks it if missing)
 omnigraph load --branch review/2026-04-25 --from main --mode merge --data ./batch.jsonl s3://my-bucket/graph.omni
 
-# Run a hybrid (vector + BM25) query
-omnigraph read --query ./queries.gq --name find_similar \
-  --params '{"q":"trends in AI safety"}' --format table s3://my-bucket/graph.omni
+# Run a hybrid (vector + BM25) query — ad-hoc .gq against a store (positional = query name)
+omnigraph query --query ./queries.gq find_similar \
+  --params '{"q":"trends in AI safety"}' --format table --store s3://my-bucket/graph.omni
 
 # Plan + apply schema migration
 omnigraph schema plan  --schema ./next.pg s3://my-bucket/graph.omni
