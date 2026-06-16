@@ -158,6 +158,17 @@ pub struct Omnigraph {
     /// `apply_schema_as` consults this field (PR #2 proof-of-concept);
     /// PR #3 fans the `enforce()` call out to the remaining writers.
     policy: Option<Arc<dyn omnigraph_policy::PolicyChecker>>,
+    /// Lazily-built, reused-across-queries embedding client. Built on the first
+    /// `nearest($v, "string")` that needs server-side embedding (so a graph that
+    /// never embeds needs no provider key), then shared by every later query —
+    /// avoids the per-query `from_env()` rebuild and keeps the provider HTTP
+    /// connection pool warm. `OnceCell` guarantees a single initialization.
+    embedding: Arc<tokio::sync::OnceCell<crate::embedding::EmbeddingClient>>,
+    /// Optional pre-resolved embedding config (RFC-012 Phase 5), injected from an
+    /// applied cluster `providers.embedding` profile via [`Omnigraph::with_embedding_config`].
+    /// When set, the embedding cell builds its client from this instead of
+    /// `EmbeddingClient::from_env()`; `None` keeps the env fallback.
+    embedding_config: Option<Arc<crate::embedding::EmbeddingConfig>>,
 }
 
 /// Whether [`Omnigraph::open`] runs the open-time recovery sweep.
@@ -321,6 +332,8 @@ impl Omnigraph {
             write_queue: Arc::new(crate::db::write_queue::WriteQueueManager::new()),
             merge_exclusive: Arc::new(tokio::sync::Mutex::new(())),
             policy: None,
+            embedding: Arc::new(tokio::sync::OnceCell::new()),
+            embedding_config: None,
         })
     }
 
@@ -420,6 +433,8 @@ impl Omnigraph {
             write_queue: Arc::new(crate::db::write_queue::WriteQueueManager::new()),
             merge_exclusive: Arc::new(tokio::sync::Mutex::new(())),
             policy: None,
+            embedding: Arc::new(tokio::sync::OnceCell::new()),
+            embedding_config: None,
         })
     }
 
@@ -465,6 +480,29 @@ impl Omnigraph {
     pub fn with_policy(mut self, checker: Arc<dyn omnigraph_policy::PolicyChecker>) -> Self {
         self.policy = Some(checker);
         self
+    }
+
+    /// The lazily-initialized, reused-across-queries embedding client cell
+    /// (see the `embedding` field doc). The query executor resolves the client
+    /// through this on the first `nearest($v, "string")` that needs embedding.
+    pub(crate) fn embedding_cell(
+        &self,
+    ) -> &tokio::sync::OnceCell<crate::embedding::EmbeddingClient> {
+        &self.embedding
+    }
+
+    /// Install a pre-resolved embedding config (RFC-012 Phase 5). Builder-style,
+    /// mirroring [`Omnigraph::with_policy`]: a graph served from a cluster
+    /// embedding provider profile injects it here; an embedded/CLI caller that doesn't
+    /// call this keeps the `EmbeddingClient::from_env()` fallback.
+    pub fn with_embedding_config(mut self, config: Arc<crate::embedding::EmbeddingConfig>) -> Self {
+        self.embedding_config = Some(config);
+        self
+    }
+
+    /// The injected embedding config, if any (see the `embedding_config` field).
+    pub(crate) fn embedding_config_ref(&self) -> Option<&crate::embedding::EmbeddingConfig> {
+        self.embedding_config.as_deref()
     }
 
     /// Engine-layer policy enforcement gate (MR-722 chassis core).

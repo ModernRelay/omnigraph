@@ -209,6 +209,9 @@ pub struct GraphStartupConfig {
     pub graph_id: String,
     pub uri: String,
     pub policy: Option<PolicySource>,
+    /// Pre-resolved embedding config from an applied cluster provider profile.
+    /// Legacy config paths leave this unset and continue to use env resolution.
+    pub embedding: Option<omnigraph::embedding::EmbeddingConfig>,
     /// Per-graph stored-query registry, loaded and identity-checked at
     /// settings-build time; type-checked against the schema when this
     /// graph's engine opens.
@@ -1088,6 +1091,11 @@ async fn open_single_graph(cfg: GraphStartupConfig) -> Result<Arc<GraphHandle>> 
     let db = Omnigraph::open(&uri)
         .await
         .map_err(|err| color_eyre::eyre::eyre!("open graph '{}' at {}: {err}", graph_id, uri))?;
+    let db = if let Some(embedding) = cfg.embedding {
+        db.with_embedding_config(Arc::new(embedding))
+    } else {
+        db
+    };
 
     // Validate this graph's stored queries against the live schema and
     // resolve them to an attachable handle (refuse boot on breakage).

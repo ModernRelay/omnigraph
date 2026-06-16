@@ -556,12 +556,32 @@ fn parse_type_ref(pair: pest::iterators::Pair<Rule>) -> Result<PropType> {
 fn parse_annotation(pair: pest::iterators::Pair<Rule>) -> Result<Annotation> {
     let mut inner = pair.into_inner();
     let name = inner.next().unwrap().as_str().to_string();
-    let value = inner
-        .next()
-        .map(|p| decode_string_literal(p.as_str()))
-        .transpose()?;
+    let mut value = None;
+    let mut kwargs = std::collections::BTreeMap::new();
+    if let Some(args) = inner.next() {
+        // `annotation_args`: one positional arg followed by zero or more
+        // `key = literal` kwargs (e.g. `@embed("source", model="…")`).
+        for arg in args.into_inner() {
+            match arg.as_rule() {
+                Rule::annotation_arg => {
+                    value = Some(decode_string_literal(arg.as_str())?);
+                }
+                Rule::annotation_kwarg => {
+                    let mut kw = arg.into_inner();
+                    let key = kw.next().unwrap().as_str().to_string();
+                    let raw = kw.next().unwrap().as_str();
+                    kwargs.insert(key, decode_string_literal(raw)?);
+                }
+                _ => {}
+            }
+        }
+    }
 
-    Ok(Annotation { name, value })
+    Ok(Annotation {
+        name,
+        value,
+        kwargs,
+    })
 }
 
 fn validate_string_annotation(
@@ -822,6 +842,17 @@ fn validate_property_annotations(
                         "@embed source property {}.{} must be String",
                         type_name, source_prop
                     )));
+                }
+
+                // `model` is the only supported kwarg; reject the rest loudly so
+                // a typo can't be silently ignored (it would never validate).
+                for key in ann.kwargs.keys() {
+                    if key != "model" {
+                        return Err(NanoError::Parse(format!(
+                            "@embed on {}.{} has unknown argument '{}=' (only 'model' is supported)",
+                            type_name, prop.name, key
+                        )));
+                    }
                 }
             }
             _ => {}

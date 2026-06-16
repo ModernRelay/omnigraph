@@ -98,6 +98,15 @@ pub(crate) async fn load_cluster_settings(
             graph_id: graph.graph_id.clone(),
             uri: graph.root.to_string_lossy().to_string(),
             policy: graph_policies.get(&graph.graph_id).cloned(),
+            embedding: graph
+                .embedding
+                .as_ref()
+                .map(|profile| {
+                    profile.resolve().map_err(|err| {
+                        eyre!("embedding provider for graph '{}': {err}", graph.graph_id)
+                    })
+                })
+                .transpose()?,
             queries: registry,
         });
     }
@@ -517,6 +526,7 @@ mod tests {
                         .to_string_lossy()
                         .into_owned(),
                     policy: None,
+                    embedding: None,
                     queries: crate::queries::QueryRegistry::default(),
                 }],
                 config_path: temp.path().join("omnigraph.yaml"),
@@ -568,6 +578,7 @@ mod tests {
                         .to_string_lossy()
                         .into_owned(),
                     policy: None,
+                    embedding: None,
                     queries: crate::queries::QueryRegistry::default(),
                 }],
                 config_path: temp.path().join("cluster"),

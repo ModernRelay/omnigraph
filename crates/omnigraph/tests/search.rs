@@ -60,6 +60,15 @@ query hybrid_search_string($vq: String, $tq: String) {
     limit 3
 }
 "#;
+// Same shape as MOCK_SEARCH_SCHEMA but the vector records the model that
+// produced its stored vectors, opting into the query-time same-space check.
+const MODEL_RECORDED_SCHEMA: &str = r#"
+node Doc {
+    slug: String @key
+    title: String @index
+    embedding: Vector(4) @embed("title", model="test-model-a") @index
+}
+"#;
 const SEARCH_MUTATIONS: &str = r#"
 query insert_doc($slug: String, $title: String, $body: String, $embedding: Vector(4)) {
     insert Doc {
@@ -83,6 +92,15 @@ async fn init_search_db(dir: &tempfile::TempDir) -> Omnigraph {
 async fn init_mock_embedding_search_db(dir: &tempfile::TempDir) -> Omnigraph {
     let uri = dir.path().to_str().unwrap();
     let mut db = Omnigraph::init(uri, MOCK_SEARCH_SCHEMA).await.unwrap();
+    load_jsonl(&mut db, &mock_embedding_seed_data(), LoadMode::Overwrite)
+        .await
+        .unwrap();
+    db
+}
+
+async fn init_model_recorded_search_db(dir: &tempfile::TempDir) -> Omnigraph {
+    let uri = dir.path().to_str().unwrap();
+    let mut db = Omnigraph::init(uri, MODEL_RECORDED_SCHEMA).await.unwrap();
     load_jsonl(&mut db, &mock_embedding_seed_data(), LoadMode::Overwrite)
         .await
         .unwrap();
@@ -510,9 +528,14 @@ async fn explicit_vector_nearest_does_not_require_gemini_credentials() {
 
 #[tokio::test]
 #[serial]
-async fn string_nearest_requires_gemini_credentials_when_mock_is_disabled() {
+async fn string_nearest_requires_provider_credentials_when_mock_is_disabled() {
+    // With mock off and no provider key, the default (openai-compatible)
+    // provider fails loudly rather than silently producing garbage vectors.
     let _guard = EnvGuard::set(&[
         ("OMNIGRAPH_EMBEDDINGS_MOCK", None),
+        ("OMNIGRAPH_EMBED_PROVIDER", None),
+        ("OPENROUTER_API_KEY", None),
+        ("OPENAI_API_KEY", None),
         ("GEMINI_API_KEY", None),
     ]);
 
@@ -528,7 +551,105 @@ async fn string_nearest_requires_gemini_credentials_when_mock_is_disabled() {
     .await
     .unwrap_err();
 
-    assert!(err.to_string().contains("GEMINI_API_KEY"));
+    assert!(
+        err.to_string()
+            .contains("OPENROUTER_API_KEY or OPENAI_API_KEY"),
+        "unexpected error: {err}"
+    );
+}
+
+#[tokio::test]
+#[serial]
+async fn nearest_string_passes_when_query_model_matches_recorded_model() {
+    let _guard = EnvGuard::set(&[
+        ("OMNIGRAPH_EMBEDDINGS_MOCK", Some("1")),
+        ("OMNIGRAPH_EMBED_MODEL", Some("test-model-a")),
+        ("OMNIGRAPH_EMBED_PROVIDER", None),
+        ("OPENROUTER_API_KEY", None),
+        ("OPENAI_API_KEY", None),
+        ("GEMINI_API_KEY", None),
+    ]);
+
+    let dir = tempfile::tempdir().unwrap();
+    let mut db = init_model_recorded_search_db(&dir).await;
+
+    let result = query_main(
+        &mut db,
+        MOCK_SEARCH_QUERIES,
+        "vector_search_string",
+        &params(&[("$q", "alpha")]),
+    )
+    .await
+    .unwrap();
+
+    assert_eq!(result_slugs(&result)[0], "alpha-doc");
+}
+
+#[tokio::test]
+#[serial]
+async fn nearest_string_errors_when_query_model_differs_from_recorded_model() {
+    let _guard = EnvGuard::set(&[
+        ("OMNIGRAPH_EMBEDDINGS_MOCK", Some("1")),
+        ("OMNIGRAPH_EMBED_MODEL", Some("test-model-b")),
+        ("OMNIGRAPH_EMBED_PROVIDER", None),
+        ("OPENROUTER_API_KEY", None),
+        ("OPENAI_API_KEY", None),
+        ("GEMINI_API_KEY", None),
+    ]);
+
+    let dir = tempfile::tempdir().unwrap();
+    let mut db = init_model_recorded_search_db(&dir).await;
+
+    let err = query_main(
+        &mut db,
+        MOCK_SEARCH_QUERIES,
+        "vector_search_string",
+        &params(&[("$q", "alpha")]),
+    )
+    .await
+    .unwrap_err();
+
+    // The error must name both the recorded model and the resolved one.
+    let msg = err.to_string();
+    assert!(msg.contains("test-model-a"), "got: {msg}");
+    assert!(msg.contains("test-model-b"), "got: {msg}");
+}
+
+#[tokio::test]
+#[serial]
+async fn injected_embedding_config_is_used_instead_of_env() {
+    // No mock flag and no provider keys in env, so `from_env()` would error.
+    // Injecting a Mock config proves the resolver uses the injected config
+    // (RFC-012 Phase 5), and its model satisfies the recorded same-space check.
+    let _guard = EnvGuard::set(&[
+        ("OMNIGRAPH_EMBEDDINGS_MOCK", None),
+        ("OMNIGRAPH_EMBED_PROVIDER", None),
+        ("OMNIGRAPH_EMBED_MODEL", None),
+        ("OPENROUTER_API_KEY", None),
+        ("OPENAI_API_KEY", None),
+        ("GEMINI_API_KEY", None),
+    ]);
+
+    let dir = tempfile::tempdir().unwrap();
+    let mut db = init_model_recorded_search_db(&dir)
+        .await
+        .with_embedding_config(std::sync::Arc::new(omnigraph::embedding::EmbeddingConfig {
+            provider: omnigraph::embedding::Provider::Mock,
+            model: "test-model-a".to_string(),
+            base_url: String::new(),
+            api_key: String::new(),
+        }));
+
+    let result = query_main(
+        &mut db,
+        MOCK_SEARCH_QUERIES,
+        "vector_search_string",
+        &params(&[("$q", "alpha")]),
+    )
+    .await
+    .unwrap();
+
+    assert_eq!(result_slugs(&result)[0], "alpha-doc");
 }
 
 // ─── BM25 search ────────────────────────────────────────────────────────────
