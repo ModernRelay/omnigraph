@@ -372,6 +372,12 @@ where
         && renamed_tables.is_empty()
         && rewritten_tables.is_empty()
         && dropped_tables.is_empty());
+    // The queue branch is `None` for every key: schema apply runs under
+    // `__schema_apply_lock__`, which `acquire_schema_apply_lock` only grants on
+    // a main-only graph (it refuses if any non-main branch exists), so every
+    // touched table's entry is on `main` (`table_branch == None`). Using `None`
+    // here therefore shares the exact same queue any concurrent writer on these
+    // tables would take.
     let mut schema_apply_queue_keys: Vec<(String, Option<String>)> = Vec::new();
     for table_key in rewritten_tables.iter().chain(dropped_tables.iter()) {
         schema_apply_queue_keys.push((table_key.clone(), None));
@@ -691,8 +697,6 @@ where
             expected_table_versions.insert(source_table_key.clone(), entry.table_version);
         }
     }
-
-    crate::failpoints::maybe_fail("schema_apply.post_snapshot_pre_commit")?;
 
     // Re-read the coordinator's manifest HEAD for coherence before the publish.
     // This is NOT a precondition check: the held queues already prevent any
