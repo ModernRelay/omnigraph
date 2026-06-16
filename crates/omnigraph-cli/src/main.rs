@@ -1,15 +1,11 @@
 use std::ffi::OsString;
 use std::fs;
 use std::io::{self, Write};
-use std::path::Path;
 use std::path::PathBuf;
-use std::sync::Arc;
-
 use clap::{Arg, ArgAction, Args, CommandFactory, FromArgMatches, Parser, Subcommand, ValueEnum};
-use color_eyre::eyre::{Result, WrapErr, bail};
+use color_eyre::eyre::{Result, bail};
 use omnigraph::db::{Omnigraph, ReadTarget, SnapshotId};
 use omnigraph::loader::LoadMode;
-use omnigraph::storage::normalize_root_uri;
 use omnigraph_cluster::{
     ApplyOptions, ApplyOutput, ApproveOutput, DiagnosticSeverity, ForceUnlockOutput, PlanOutput, StateSyncOutput, StatusOutput,
     ValidateOutput, apply_config_dir_with_options, approve_config_dir, force_unlock_config_dir, import_config_dir, plan_config_dir,
@@ -26,10 +22,9 @@ use omnigraph_api_types::{
     ChangeOutput, CommitOutput, ErrorOutput, IngestOutput, ReadOutput, SchemaApplyOutput,
     SnapshotTableOutput,
 };
-use omnigraph_server::queries::{QueryRegistry, check, format_check_breakages};
+use omnigraph_server::queries::{QueryRegistry, check};
 use omnigraph_server::{
-    AliasCommand, OmnigraphConfig, PolicyAction, PolicyDecision, PolicyEngine, PolicyRequest,
-    PolicyTestConfig, ReadOutputFormat, graph_resource_id_for_selection, load_config,
+    PolicyAction, PolicyDecision, PolicyEngine, PolicyRequest, PolicyTestConfig,
 };
 use reqwest::Method;
 use reqwest::header::AUTHORIZATION;
@@ -38,12 +33,11 @@ use serde::de::DeserializeOwned;
 use serde_json::Value;
 
 mod embed;
-mod migrate;
 mod operator;
 mod read_format;
 
 use embed::{EmbedArgs, EmbedOutput, execute_embed};
-use read_format::{ReadRenderOptions, render_read};
+use read_format::{ReadOutputFormat, ReadRenderOptions, render_read};
 
 mod cli;
 mod client;
@@ -77,42 +71,6 @@ async fn main() -> Result<()> {
     // before any per-command dispatch.
     planes::guard_addressing(&cli)?;
     match cli.command {
-        Command::Config { command } => match command {
-            ConfigCommand::Migrate { config, write, json } => {
-                let path = migrate::legacy_config_path(config.as_ref());
-                if !path.exists() {
-                    bail!(
-                        "no legacy config at '{}' — nothing to migrate",
-                        path.display()
-                    );
-                }
-                let legacy = load_config(Some(&path))?;
-                let report = migrate::build_report(&legacy, &path);
-                if write {
-                    let legacy_dir = path
-                        .parent()
-                        .filter(|parent| !parent.as_os_str().is_empty())
-                        .unwrap_or(std::path::Path::new("."))
-                        .to_path_buf();
-                    let written = migrate::apply_report(&report, &legacy_dir)?;
-                    if json {
-                        print_json(&serde_json::json!({
-                            "report": report,
-                            "written": written,
-                        }))?;
-                    } else {
-                        print!("{}", migrate::render_report(&report));
-                        for line in written {
-                            println!("wrote: {line}");
-                        }
-                    }
-                } else if json {
-                    print_json(&report)?;
-                } else {
-                    print!("{}", migrate::render_report(&report));
-                }
-            }
-        },
         Command::Login { name, token, json } => {
             let token = match token {
                 Some(token) => token,
@@ -135,6 +93,124 @@ async fn main() -> Result<()> {
         Command::Logout { name, json } => {
             let path = crate::operator::remove_credential(&name)?;
             finish_logout(&name, &path, json)?;
+        }
+        Command::Profile { command } => {
+            use crate::operator::ScopeBinding;
+            let op = crate::operator::load_operator_config()?;
+            let active = std::env::var(scope::PROFILE_ENV)
+                .ok()
+                .filter(|s| !s.is_empty());
+            match command {
+                ProfileCommand::List { json } => {
+                    let items: Vec<ProfileListItem> = op
+                        .profiles
+                        .iter()
+                        .map(|(name, profile)| {
+                            let (binding, scope_kind, target, valid, error) =
+                                match profile.binding(name) {
+                                    Ok(ScopeBinding::Server(s)) => (
+                                        format!("server: {s}"),
+                                        "server".to_string(),
+                                        Some(s),
+                                        true,
+                                        None,
+                                    ),
+                                    Ok(ScopeBinding::Cluster(c)) => (
+                                        format!("cluster: {c}"),
+                                        "cluster".to_string(),
+                                        Some(c),
+                                        true,
+                                        None,
+                                    ),
+                                    Ok(ScopeBinding::Store(u)) => (
+                                        format!("store: {u}"),
+                                        "store".to_string(),
+                                        Some(u),
+                                        true,
+                                        None,
+                                    ),
+                                    Err(e) => (
+                                        format!("invalid: {e}"),
+                                        "invalid".to_string(),
+                                        None,
+                                        false,
+                                        Some(e.to_string()),
+                                    ),
+                                };
+                            ProfileListItem {
+                                name: name.clone(),
+                                binding,
+                                scope_kind,
+                                target,
+                                valid,
+                                error,
+                                default_graph: profile.default_graph.clone(),
+                                active: active.as_deref() == Some(name.as_str()),
+                            }
+                        })
+                        .collect();
+                    print_profile_list(&items, json)?;
+                }
+                ProfileCommand::Show { name, json } => {
+                    let detail = match name.or(active) {
+                        Some(name) => {
+                            let profile = op.profile(&name).ok_or_else(|| {
+                                color_eyre::eyre::eyre!(
+                                    "unknown profile '{name}' (not defined under `profiles:`)"
+                                )
+                            })?;
+                            let (kind, target, endpoint) = match profile.binding(&name)? {
+                                ScopeBinding::Server(s) => {
+                                    let endpoint = op.servers.get(&s).map(|sv| sv.url.clone());
+                                    ("server", Some(s), endpoint)
+                                }
+                                ScopeBinding::Cluster(c) => {
+                                    let endpoint = op.cluster_root(&c).map(str::to_string);
+                                    ("cluster", Some(c), endpoint)
+                                }
+                                ScopeBinding::Store(u) => ("store", Some(u.clone()), Some(u)),
+                            };
+                            ProfileDetail {
+                                name,
+                                scope_kind: kind.to_string(),
+                                target,
+                                endpoint,
+                                default_graph: profile
+                                    .default_graph
+                                    .clone()
+                                    .or_else(|| op.default_graph().map(str::to_string)),
+                                output_format: op
+                                    .output()
+                                    .and_then(|f| f.to_possible_value())
+                                    .map(|v| v.get_name().to_string()),
+                            }
+                        }
+                        // No name and no active profile: the flat operator defaults.
+                        None => {
+                            let (kind, target, endpoint) = if let Some(s) = op.default_server() {
+                                let endpoint = op.servers.get(s).map(|sv| sv.url.clone());
+                                ("server", Some(s.to_string()), endpoint)
+                            } else if let Some(u) = op.default_store() {
+                                ("store", Some(u.to_string()), Some(u.to_string()))
+                            } else {
+                                ("none", None, None)
+                            };
+                            ProfileDetail {
+                                name: "(defaults)".to_string(),
+                                scope_kind: kind.to_string(),
+                                target,
+                                endpoint,
+                                default_graph: op.default_graph().map(str::to_string),
+                                output_format: op
+                                    .output()
+                                    .and_then(|f| f.to_possible_value())
+                                    .map(|v| v.get_name().to_string()),
+                            }
+                        }
+                    };
+                    print_profile_detail(&detail, json)?;
+                }
+            }
         }
         Command::Version => {
             println!("omnigraph {}", env!("CARGO_PKG_VERSION"));
@@ -170,24 +246,26 @@ async fn main() -> Result<()> {
         }
         Command::Load {
             uri,
-            config,
             data,
             branch,
             from,
             mode,
             json,
         } => {
-            let config = load_cli_config(config.as_ref())?;
             let client = client::GraphClient::resolve_with_policy(
-                &config,
                 cli.server.as_deref(),
                 cli.graph.as_deref(),
                 uri,
                 cli.as_actor.as_deref(),
                 cli.profile.as_deref(),
                 cli.store.as_deref(),
-            )?;
-            let branch = resolve_branch(&config, branch, None, "main");
+            )
+            .await?;
+            let branch = resolve_branch(branch, None, "main");
+            if matches!(mode, CliLoadMode::Overwrite) {
+                confirm_destructive("load --mode overwrite", client.uri(), cli.yes, json)?;
+            }
+            echo_write_target(cli.quiet, "load", client.uri(), client.is_remote());
             let payload = client
                 .load(&branch, from.as_deref(), &data.to_string_lossy(), mode)
                 .await?;
@@ -199,7 +277,6 @@ async fn main() -> Result<()> {
         }
         Command::Ingest {
             uri,
-            config,
             data,
             branch,
             from,
@@ -211,18 +288,18 @@ async fn main() -> Result<()> {
                 "warning: `omnigraph ingest` is deprecated and will be removed in a future release; \
                  use `omnigraph load --from <base> --mode <mode>` (ingest defaults: --from main --mode merge)"
             );
-            let config = load_cli_config(config.as_ref())?;
             let client = client::GraphClient::resolve_with_policy(
-                &config,
                 cli.server.as_deref(),
                 cli.graph.as_deref(),
                 uri,
                 cli.as_actor.as_deref(),
                 cli.profile.as_deref(),
                 cli.store.as_deref(),
-            )?;
-            let branch = resolve_branch(&config, branch, None, "main");
-            let from = resolve_branch(&config, from, None, "main");
+            )
+            .await?;
+            let branch = resolve_branch(branch, None, "main");
+            let from = resolve_branch(from, None, "main");
+            echo_write_target(cli.quiet, "ingest", client.uri(), client.is_remote());
             let payload = client
                 .ingest(&branch, &from, &data.to_string_lossy(), mode)
                 .await?;
@@ -235,22 +312,21 @@ async fn main() -> Result<()> {
         Command::Branch { command } => match command {
             BranchCommand::Create {
                 uri,
-                config,
                 from,
                 name,
                 json,
             } => {
-                let config = load_cli_config(config.as_ref())?;
                 let client = client::GraphClient::resolve_with_policy(
-                    &config,
                     cli.server.as_deref(),
                     cli.graph.as_deref(),
                     uri,
                     cli.as_actor.as_deref(),
                     cli.profile.as_deref(),
                     cli.store.as_deref(),
-                )?;
-                let from = resolve_branch(&config, from, None, "main");
+                )
+                .await?;
+                let from = resolve_branch(from, None, "main");
+                echo_write_target(cli.quiet, "branch create", client.uri(), client.is_remote());
                 let payload = client.branch_create_from(&from, &name).await?;
                 if json {
                     print_json(&payload)?;
@@ -260,18 +336,16 @@ async fn main() -> Result<()> {
             }
             BranchCommand::List {
                 uri,
-                config,
                 json,
             } => {
-                let config = load_cli_config(config.as_ref())?;
                 let client = client::GraphClient::resolve(
-                    &config,
                     cli.server.as_deref(),
                     cli.graph.as_deref(),
                     uri,
                     cli.profile.as_deref(),
                     cli.store.as_deref(),
-                )?;
+                )
+                .await?;
                 let payload = client.branch_list().await?;
                 if json {
                     print_json(&payload)?;
@@ -283,20 +357,20 @@ async fn main() -> Result<()> {
             }
             BranchCommand::Delete {
                 uri,
-                config,
                 name,
                 json,
             } => {
-                let config = load_cli_config(config.as_ref())?;
                 let client = client::GraphClient::resolve_with_policy(
-                    &config,
                     cli.server.as_deref(),
                     cli.graph.as_deref(),
                     uri,
                     cli.as_actor.as_deref(),
                     cli.profile.as_deref(),
                     cli.store.as_deref(),
-                )?;
+                )
+                .await?;
+                confirm_destructive("branch delete", client.uri(), cli.yes, json)?;
+                echo_write_target(cli.quiet, "branch delete", client.uri(), client.is_remote());
                 let payload = client.branch_delete(&name).await?;
                 if json {
                     print_json(&payload)?;
@@ -306,22 +380,21 @@ async fn main() -> Result<()> {
             }
             BranchCommand::Merge {
                 uri,
-                config,
                 source,
                 into,
                 json,
             } => {
-                let config = load_cli_config(config.as_ref())?;
                 let client = client::GraphClient::resolve_with_policy(
-                    &config,
                     cli.server.as_deref(),
                     cli.graph.as_deref(),
                     uri,
                     cli.as_actor.as_deref(),
                     cli.profile.as_deref(),
                     cli.store.as_deref(),
-                )?;
-                let into = resolve_branch(&config, into, None, "main");
+                )
+                .await?;
+                let into = resolve_branch(into, None, "main");
+                echo_write_target(cli.quiet, "branch merge", client.uri(), client.is_remote());
                 let payload = client.branch_merge(&source, &into).await?;
                 if json {
                     print_json(&payload)?;
@@ -338,19 +411,17 @@ async fn main() -> Result<()> {
         Command::Commit { command } => match command {
             CommitCommand::List {
                 uri,
-                config,
                 branch,
                 json,
             } => {
-                let config = load_cli_config(config.as_ref())?;
                 let client = client::GraphClient::resolve(
-                    &config,
                     cli.server.as_deref(),
                     cli.graph.as_deref(),
                     uri,
                     cli.profile.as_deref(),
                     cli.store.as_deref(),
-                )?;
+                )
+                .await?;
                 let payload = client.list_commits(branch.as_deref()).await?;
                 if json {
                     print_json(&payload)?;
@@ -360,19 +431,17 @@ async fn main() -> Result<()> {
             }
             CommitCommand::Show {
                 uri,
-                config,
                 commit_id,
                 json,
             } => {
-                let config = load_cli_config(config.as_ref())?;
                 let client = client::GraphClient::resolve(
-                    &config,
                     cli.server.as_deref(),
                     cli.graph.as_deref(),
                     uri,
                     cli.profile.as_deref(),
                     cli.store.as_deref(),
-                )?;
+                )
+                .await?;
                 let commit = client.get_commit(&commit_id).await?;
                 if json {
                     print_json(&commit)?;
@@ -384,13 +453,19 @@ async fn main() -> Result<()> {
         Command::Schema { command } => match command {
             SchemaCommand::Plan {
                 uri,
-                config,
                 schema,
                 json,
                 allow_data_loss,
             } => {
-                let config = load_cli_config(config.as_ref())?;
-                let uri = resolve_local_uri(&config, uri, "schema plan")?;
+                let uri = resolve_maintenance_uri(
+                    cli.profile.as_deref(),
+                    cli.store.as_deref(),
+                    cli.cluster.as_deref(),
+                    cli.graph.as_deref(),
+                    uri,
+                    "schema plan",
+                )
+                .await?;
                 let schema_source = fs::read_to_string(&schema)?;
                 let db = Omnigraph::open(&uri).await?;
                 let plan = db
@@ -413,40 +488,46 @@ async fn main() -> Result<()> {
             }
             SchemaCommand::Apply {
                 uri,
-                config,
                 schema,
                 json,
                 allow_data_loss,
             } => {
-                let config = load_cli_config(config.as_ref())?;
                 let client = client::GraphClient::resolve_with_policy(
-                    &config,
                     cli.server.as_deref(),
                     cli.graph.as_deref(),
                     uri,
                     cli.as_actor.as_deref(),
                     cli.profile.as_deref(),
                     cli.store.as_deref(),
-                )?;
+                )
+                .await?;
+                // RFC-011 Decision 10: a graph managed by a cluster evolves via
+                // `cluster apply` (ledger/recovery/approvals), not a direct
+                // `schema apply` against its storage root — that would bypass the
+                // ledger. Mirrors `init`'s refusal. Only the embedded path can
+                // address a storage root; a served apply (`--server`) is the
+                // server's concern.
+                if !client.is_remote() {
+                    if let Some(root) =
+                        omnigraph_cluster::cluster_root_for_graph_uri(client.uri()).await
+                    {
+                        bail!(
+                            "`{}` is inside cluster `{root}`. A graph in a cluster evolves via \
+                             `cluster apply` (which records ledger, recovery, and approvals), not \
+                             `schema apply`. Update the schema in cluster.yaml and run `cluster apply`.",
+                            client.uri()
+                        );
+                    }
+                }
                 let schema_source = fs::read_to_string(&schema)?;
-                // The stored-query registry check is an embedded-only concern
-                // (the remote arm ignores the validator — the server runs its
-                // own check); build it only for the local path so the remote
-                // path keeps its no-registry-load behavior.
-                let registry = if client.is_remote() {
-                    None
-                } else {
-                    let registry = load_registry_or_report(&config, client.selected())?;
-                    (!registry.is_empty()).then_some(registry)
-                };
-                let label = client.selected().unwrap_or(client.uri()).to_string();
+                // The embedded (direct-store) arm carries no stored-query
+                // registry — the registry is cluster-owned (RFC-011), so a
+                // direct apply has nothing to validate against. The served arm
+                // runs the server's own catalog check. So the validator is a
+                // no-op here on both arms.
+                echo_write_target(cli.quiet, "schema apply", client.uri(), client.is_remote());
                 let output = client
-                    .apply_schema(&schema_source, allow_data_loss, |catalog| {
-                        if let Some(registry) = registry.as_ref() {
-                            validate_registry_for_catalog(registry, catalog, &label)?;
-                        }
-                        Ok(())
-                    })
+                    .apply_schema(&schema_source, allow_data_loss, |_catalog| Ok(()))
                     .await?;
                 if json {
                     print_json(&output)?;
@@ -456,18 +537,16 @@ async fn main() -> Result<()> {
             }
             SchemaCommand::Show {
                 uri,
-                config,
                 json,
             } => {
-                let config = load_cli_config(config.as_ref())?;
                 let client = client::GraphClient::resolve(
-                    &config,
                     cli.server.as_deref(),
                     cli.graph.as_deref(),
                     uri,
                     cli.profile.as_deref(),
                     cli.store.as_deref(),
-                )?;
+                )
+                .await?;
                 let output = client.schema_source().await?;
                 if json {
                     print_json(&output)?;
@@ -478,48 +557,58 @@ async fn main() -> Result<()> {
         },
         Command::Lint {
             uri,
-            config,
             query,
             schema,
             json,
         } => {
-            let config = load_cli_config(config.as_ref())?;
-            let output =
-                execute_query_lint(&config, uri, schema.as_ref(), &query)
-                    .await?;
+            // A graph target (when `--schema` is absent) resolves through the
+            // direct scope path (positional URI / --store / --profile /
+            // defaults.store). Offline (`--schema`) needs no graph, so leave
+            // the uri unresolved in that case.
+            let graph_uri = if schema.is_some() {
+                uri
+            } else {
+                Some(
+                    resolve_maintenance_uri(
+                        cli.profile.as_deref(),
+                        cli.store.as_deref(),
+                        cli.cluster.as_deref(),
+                        cli.graph.as_deref(),
+                        uri,
+                        "lint",
+                    )
+                    .await?,
+                )
+            };
+            let output = execute_query_lint(graph_uri, schema.as_ref(), &query).await?;
             finish_query_lint(&output, json)?;
         }
-        Command::Queries { command } => match command {
-            QueriesCommand::Validate {
-                uri,
-                config,
-                json,
-            } => {
-                execute_queries_validate(uri, config.as_ref(), json).await?;
+        Command::Queries { command } => {
+            let cluster =
+                require_cluster_scope(cli.cluster.as_deref(), cli.profile.as_deref(), "queries")?;
+            match command {
+                QueriesCommand::Validate { json } => {
+                    execute_queries_validate(&cluster, cli.graph.as_deref(), json).await?;
+                }
+                QueriesCommand::List { json } => {
+                    execute_queries_list(&cluster, cli.graph.as_deref(), json).await?;
+                }
             }
-            QueriesCommand::List {
-                config,
-                json,
-            } => {
-                execute_queries_list(config.as_ref(), json)?;
-            }
-        },
+        }
         Command::Snapshot {
             uri,
-            config,
             branch,
             json,
         } => {
-            let config = load_cli_config(config.as_ref())?;
             let client = client::GraphClient::resolve(
-                &config,
                 cli.server.as_deref(),
                 cli.graph.as_deref(),
                 uri,
                 cli.profile.as_deref(),
                 cli.store.as_deref(),
-            )?;
-            let branch = resolve_branch(&config, branch, None, "main");
+            )
+            .await?;
+            let branch = resolve_branch(branch, None, "main");
             let payload = client.snapshot(&branch).await?;
             if json {
                 print_json(&payload)?;
@@ -529,22 +618,20 @@ async fn main() -> Result<()> {
         }
         Command::Export {
             uri,
-            config,
             branch,
             jsonl,
             type_names,
             table_keys,
         } => {
-            let config = load_cli_config(config.as_ref())?;
             let client = client::GraphClient::resolve(
-                &config,
                 cli.server.as_deref(),
                 cli.graph.as_deref(),
                 uri,
                 cli.profile.as_deref(),
                 cli.store.as_deref(),
-            )?;
-            let branch = resolve_branch(&config, branch, None, "main");
+            )
+            .await?;
+            let branch = resolve_branch(branch, None, "main");
             if jsonl {
                 eprintln!("warning: --jsonl is deprecated; `omnigraph export` always emits JSONL");
             }
@@ -556,280 +643,182 @@ async fn main() -> Result<()> {
                 .await?;
         }
         Command::Query {
-            uri,
-            legacy_uri,
-            config,
-            alias,
+            name,
             query,
             query_string,
-            name,
             params,
             branch,
             snapshot,
             format,
             json,
-            alias_args,
         } => {
-            if alias.is_none() && query.is_none() && query_string.is_none() {
-                bail!("exactly one of --query, --query-string, or --alias must be provided");
-            }
-
-            let config = load_cli_config(config.as_ref())?;
-            // Operator aliases (RFC-007 PR 3): pure bindings to stored
-            // queries. A legacy file-alias with the same name wins during
-            // the RFC-008 window (with a warning); an alias name found
-            // only in the operator layer takes the invoke path here.
-            if let Some(alias_name) = alias.as_deref() {
-                let operator_config = crate::operator::load_operator_config()?;
-                if let Some(operator_alias) = operator_config.aliases.get(alias_name) {
-                    if config.alias(alias_name).is_ok() {
-                        eprintln!(
-                            "warning: alias '{alias_name}' is defined in both omnigraph.yaml (legacy, wins during the deprecation window) and the operator config; the legacy definition applies"
-                        );
-                    } else {
-                        // The hidden legacy-uri positional swallows the first
-                        // bare arg; an operator alias always knows its target,
-                        // so reclaim it as the first positional param.
-                        let (_, alias_args) = normalize_legacy_alias_uri(
-                            legacy_uri.clone(),
-                            true,
-                            Some(alias_name),
-                            alias_args.clone(),
-                        );
-                        let output = execute_operator_alias(
-                            &http_client,
-                            &config,
-                            alias_name,
-                            operator_alias,
-                            &alias_args,
-                            load_params_json(&params)?,
-                        )
-                        .await?;
-                        let format =
-                            resolve_read_format(&config, format, json, operator_alias.format);
-                        print_read_output(&output, format, &config)?;
-                        return Ok(());
-                    }
-                }
-            }
-            let alias = resolve_alias(&config, alias.as_deref(), AliasCommand::Read)?;
-            let alias_name = alias.as_ref().map(|(name, _)| *name);
-            let alias_config = alias.as_ref().map(|(_, alias)| *alias);
-            let alias_graph = alias_config.and_then(|alias| alias.graph.as_deref());
-            let target_available = alias_graph.is_some() || config.cli_graph_name().is_some();
-            let (legacy_uri, alias_args) =
-                normalize_legacy_alias_uri(legacy_uri, target_available, alias_name, alias_args);
-            // `--target` is gone; resolve an alias's legacy `graph` name to its
-            // URI (a positional URI still wins).
-            let uri = match uri.or(legacy_uri) {
-                Some(uri) => Some(uri),
-                None => match alias_graph {
-                    Some(name) => Some(config.resolve_target_uri(None, Some(name), None)?),
-                    None => None,
-                },
-            };
             let client = client::GraphClient::resolve(
-                &config,
                 cli.server.as_deref(),
                 cli.graph.as_deref(),
-                uri,
+                None,
                 cli.profile.as_deref(),
                 cli.store.as_deref(),
-            )?;
-            let query_source = resolve_query_source(
-                &config,
-                query.as_ref(),
-                query_string.as_deref(),
-                alias_config.map(|a| a.query.as_str()),
-            )?;
-            let params_json = merged_params_json(
-                alias_name,
-                alias_config
-                    .map(|alias| alias.args.as_slice())
-                    .unwrap_or(&[]),
-                &alias_args,
-                load_params_json(&params)?,
-            )?;
-            let target = resolve_read_target(
-                &config,
-                branch,
-                snapshot,
-                alias_config.and_then(|alias| alias.branch.clone()),
-            )?;
-            let query_name = name.or_else(|| alias_config.and_then(|alias| alias.name.clone()));
-            let output = client
-                .query(
-                    target,
-                    &query_source,
-                    query_name.as_deref(),
-                    params_json.as_ref(),
-                )
-                .await?;
-            let format = resolve_read_format(
-                &config,
-                format,
-                json,
-                alias_config.and_then(|alias| alias.format),
-            );
-            print_read_output(&output, format, &config)?;
+            )
+            .await?;
+            let params_json = load_params_json(&params)?;
+            let target = resolve_read_target(branch, snapshot, None)?;
+            let output: ReadOutput = if query.is_some() || query_string.is_some() {
+                // Ad-hoc lane: run the source; the positional `name` selects
+                // within it when it holds more than one query.
+                let query_source =
+                    resolve_query_source(query.as_ref(), query_string.as_deref(), None)?;
+                client
+                    .query(target, &query_source, name.as_deref(), params_json.as_ref())
+                    .await?
+            } else {
+                // Catalog lane (served-only): invoke the stored query by name.
+                let Some(name) = name else {
+                    bail!(
+                        "provide a query name to invoke from the catalog, or -e '<gq>' / \
+                         --query <file> for an ad-hoc query"
+                    );
+                };
+                let (branch, snapshot) = match &target {
+                    ReadTarget::Branch(b) => (Some(b.clone()), None),
+                    ReadTarget::Snapshot(s) => (None, Some(s.as_str().to_string())),
+                };
+                client
+                    .invoke_named(&name, false, params_json.as_ref(), branch, snapshot)
+                    .await?
+            };
+            let format = resolve_read_format(format, json, None);
+            print_read_output(&output, format)?;
         }
         Command::Mutate {
-            uri,
-            legacy_uri,
-            config,
-            alias,
+            name,
             query,
             query_string,
-            name,
             params,
             branch,
             json,
-            alias_args,
         } => {
-            if alias.is_none() && query.is_none() && query_string.is_none() {
-                bail!("exactly one of --query, --query-string, or --alias must be provided");
-            }
-
-            let config = load_cli_config(config.as_ref())?;
-            let alias = resolve_alias(&config, alias.as_deref(), AliasCommand::Change)?;
-            let alias_name = alias.as_ref().map(|(name, _)| *name);
-            let alias_config = alias.as_ref().map(|(_, alias)| *alias);
-            let alias_graph = alias_config.and_then(|alias| alias.graph.as_deref());
-            let target_available = alias_graph.is_some() || config.cli_graph_name().is_some();
-            let (legacy_uri, alias_args) =
-                normalize_legacy_alias_uri(legacy_uri, target_available, alias_name, alias_args);
-            // `--target` is gone; resolve an alias's legacy `graph` name to its
-            // URI (a positional URI still wins).
-            let uri = match uri.or(legacy_uri) {
-                Some(uri) => Some(uri),
-                None => match alias_graph {
-                    Some(name) => Some(config.resolve_target_uri(None, Some(name), None)?),
-                    None => None,
-                },
-            };
             let client = client::GraphClient::resolve_with_policy(
-                &config,
                 cli.server.as_deref(),
                 cli.graph.as_deref(),
-                uri,
+                None,
                 cli.as_actor.as_deref(),
                 cli.profile.as_deref(),
                 cli.store.as_deref(),
-            )?;
-            let query_source = resolve_query_source(
-                &config,
-                query.as_ref(),
-                query_string.as_deref(),
-                alias_config.map(|a| a.query.as_str()),
-            )?;
-            let params_json = merged_params_json(
-                alias_name,
-                alias_config
-                    .map(|alias| alias.args.as_slice())
-                    .unwrap_or(&[]),
-                &alias_args,
-                load_params_json(&params)?,
-            )?;
-            let branch = resolve_branch(
-                &config,
-                branch,
-                alias_config.and_then(|alias| alias.branch.clone()),
-                "main",
-            );
-            let query_name = name.or_else(|| alias_config.and_then(|alias| alias.name.clone()));
-            let output = client
-                .mutate(
-                    &branch,
-                    &query_source,
-                    query_name.as_deref(),
-                    params_json.as_ref(),
-                )
-                .await?;
+            )
+            .await?;
+            let params_json = load_params_json(&params)?;
+            let branch = resolve_branch(branch, None, "main");
+            let output: ChangeOutput = if query.is_some() || query_string.is_some() {
+                // Ad-hoc lane: run the source; positional `name` selects within it.
+                let query_source =
+                    resolve_query_source(query.as_ref(), query_string.as_deref(), None)?;
+                client
+                    .mutate(&branch, &query_source, name.as_deref(), params_json.as_ref())
+                    .await?
+            } else {
+                // Catalog lane (served-only): invoke the stored mutation by name.
+                let Some(name) = name else {
+                    bail!(
+                        "provide a mutation name to invoke from the catalog, or -e '<gq>' / \
+                         --query <file> for an ad-hoc mutation"
+                    );
+                };
+                client
+                    .invoke_named(&name, true, params_json.as_ref(), Some(branch), None)
+                    .await?
+            };
             if json {
                 print_json(&output)?;
             } else {
                 print_change_human(&output);
             }
         }
-        Command::Policy { command } => match command {
-            PolicyCommand::Validate { config } => {
-                let config = load_cli_config(config.as_ref())?;
-                let context = resolve_policy_context(&config)?;
-                let engine = resolve_policy_engine(&context)?;
-                println!(
-                    "policy valid: {} [{} actors]",
-                    context.policy_file.display(),
-                    engine.known_actor_count()
+        Command::Alias {
+            name,
+            args,
+            params,
+            format,
+            json,
+        } => {
+            let operator_config = crate::operator::load_operator_config()?;
+            let Some(operator_alias) = operator_config.aliases.get(&name) else {
+                let defined: Vec<&str> =
+                    operator_config.aliases.keys().map(String::as_str).collect();
+                bail!(
+                    "unknown alias '{name}'; defined aliases: [{}] \
+                     (add it under `aliases:` in ~/.omnigraph/config.yaml)",
+                    defined.join(", ")
                 );
-            }
-            PolicyCommand::Test { config } => {
-                let config = load_cli_config(config.as_ref())?;
-                let context = resolve_policy_context(&config)?;
-                let engine = resolve_policy_engine(&context)?;
-                let tests_path = resolve_policy_tests_path(&context);
-                let tests = PolicyTestConfig::load(&tests_path)?;
-                engine.run_tests(&tests)?;
-                println!("policy tests passed: {} cases", tests.cases.len());
-            }
-            PolicyCommand::Explain {
-                config,
-                actor,
-                action,
-                branch,
-                target_branch,
-            } => {
-                let config = load_cli_config(config.as_ref())?;
-                let context = resolve_policy_context(&config)?;
-                let engine = resolve_policy_engine(&context)?;
-                let request = PolicyRequest {
+            };
+            let output = execute_operator_alias(
+                &http_client,
+                &name,
+                operator_alias,
+                &args,
+                load_params_json(&params)?,
+            )
+            .await?;
+            let format = resolve_read_format(format, json, operator_alias.format);
+            print_read_output(&output, format)?;
+        }
+        Command::Policy { command } => {
+            // Policy tooling sources the Cedar bundle(s) from the cluster's
+            // applied policies (RFC-011): --cluster <dir>, + the global --graph
+            // to pick a graph's bundle when several apply.
+            let cluster =
+                require_cluster_scope(cli.cluster.as_deref(), cli.profile.as_deref(), "policy")?;
+            let graph = cli.graph.as_deref();
+            let graph_id = match graph {
+                Some(id) => graph_resource_id_for_selection(Some(id), ""),
+                None => graph_resource_id_for_selection(None, "default"),
+            };
+            let policies = read_cluster_policies(&cluster).await?;
+            match command {
+                PolicyCommand::Validate {} => {
+                    let bundle = select_cluster_policy(&cluster, &policies, graph)?;
+                    let engine = PolicyEngine::load_graph_from_source(&bundle.source, &graph_id)?;
+                    println!(
+                        "policy valid: bundle '{}' [{} actors]",
+                        bundle.name,
+                        engine.known_actor_count()
+                    );
+                }
+                PolicyCommand::Test { tests } => {
+                    let bundle = select_cluster_policy(&cluster, &policies, graph)?;
+                    let engine = PolicyEngine::load_graph_from_source(&bundle.source, &graph_id)?;
+                    let tests = PolicyTestConfig::load(&tests)?;
+                    engine.run_tests(&tests)?;
+                    println!("policy tests passed: {} cases", tests.cases.len());
+                }
+                PolicyCommand::Explain {
+                    actor,
                     action,
                     branch,
                     target_branch,
-                };
-                let decision = engine.authorize(&actor, &request)?;
-                print_policy_explain(&decision, &actor, &request);
+                } => {
+                    let bundle = select_cluster_policy(&cluster, &policies, graph)?;
+                    let engine = PolicyEngine::load_graph_from_source(&bundle.source, &graph_id)?;
+                    let request = PolicyRequest {
+                        action,
+                        branch,
+                        target_branch,
+                    };
+                    let decision = engine.authorize(&actor, &request)?;
+                    print_policy_explain(&decision, &actor, &request);
+                }
             }
-        },
-        Command::Optimize {
-            uri,
-            config,
-            cluster,
-            cluster_graph,
-            json,
-        } => {
-            let config = load_cli_config(config.as_ref())?;
-            let uri = if uri.is_some() || cluster.is_some() {
-                resolve_storage_uri(
-                    &config,
-                    uri,
-                    cluster.as_deref(),
-                    cluster_graph.as_deref(),
-                    "optimize",
-                )
-                .await?
-            } else {
-                // RFC-011: no explicit per-command address — consult the scope
-                // (a --profile cluster binding, --store, or operator defaults).
-                let scope = scope::resolve_scope(
-                    &operator::load_operator_config()?,
-                    planes::Capability::Direct,
-                    scope::ScopeFlags {
-                        profile: cli.profile.as_deref(),
-                        store: cli.store.as_deref(),
-                        server: None,
-                        graph: cli.graph.as_deref(),
-                        uri: None,
-                    },
-                )?;
-                resolve_storage_uri(
-                    &config,
-                    scope.uri,
-                    scope.cluster.as_deref(),
-                    scope.cluster_graph.as_deref(),
-                    "optimize",
-                )
-                .await?
-            };
+        }
+        Command::Optimize { uri, json } => {
+            let uri = resolve_maintenance_uri(
+                cli.profile.as_deref(),
+                cli.store.as_deref(),
+                cli.cluster.as_deref(),
+                cli.graph.as_deref(),
+                uri,
+                "optimize",
+            )
+            .await?;
+            echo_write_target(cli.quiet, "optimize", &uri, false);
             let db = Omnigraph::open(&uri).await?;
             let stats = db.optimize().await?;
             if json {
@@ -843,6 +832,10 @@ async fn main() -> Result<()> {
                         "skipped": s.skipped.map(|r| r.as_str()),
                         "manifest_version": s.manifest_version,
                         "lance_head_version": s.lance_head_version,
+                        "pending_indexes": s.pending_indexes.iter().map(|p| serde_json::json!({
+                            "column": p.column,
+                            "reason": p.reason,
+                        })).collect::<Vec<_>>(),
                     })).collect::<Vec<_>>(),
                 });
                 print_json(&value)?;
@@ -859,50 +852,28 @@ async fn main() -> Result<()> {
                     } else {
                         println!("  {:<40} no-op", s.table_key);
                     }
+                    for p in &s.pending_indexes {
+                        println!("    ↳ index pending on '{}': {}", p.column, p.reason);
+                    }
                 }
             }
         }
         Command::Repair {
             uri,
-            config,
-            cluster,
-            cluster_graph,
             confirm,
             force,
             json,
         } => {
-            let config = load_cli_config(config.as_ref())?;
-            let uri = if uri.is_some() || cluster.is_some() {
-                resolve_storage_uri(
-                    &config,
-                    uri,
-                    cluster.as_deref(),
-                    cluster_graph.as_deref(),
-                    "repair",
-                )
-                .await?
-            } else {
-                // RFC-011: no explicit per-command address — consult the scope.
-                let scope = scope::resolve_scope(
-                    &operator::load_operator_config()?,
-                    planes::Capability::Direct,
-                    scope::ScopeFlags {
-                        profile: cli.profile.as_deref(),
-                        store: cli.store.as_deref(),
-                        server: None,
-                        graph: cli.graph.as_deref(),
-                        uri: None,
-                    },
-                )?;
-                resolve_storage_uri(
-                    &config,
-                    scope.uri,
-                    scope.cluster.as_deref(),
-                    scope.cluster_graph.as_deref(),
-                    "repair",
-                )
-                .await?
-            };
+            let uri = resolve_maintenance_uri(
+                cli.profile.as_deref(),
+                cli.store.as_deref(),
+                cli.cluster.as_deref(),
+                cli.graph.as_deref(),
+                uri,
+                "repair",
+            )
+            .await?;
+            echo_write_target(cli.quiet, "repair", &uri, false);
             let db = Omnigraph::open(&uri).await?;
             let stats = db
                 .repair(omnigraph::db::RepairOptions { confirm, force })
@@ -978,46 +949,20 @@ async fn main() -> Result<()> {
         }
         Command::Cleanup {
             uri,
-            config,
-            cluster,
-            cluster_graph,
             keep,
             older_than,
             confirm,
             json,
         } => {
-            let config = load_cli_config(config.as_ref())?;
-            let uri = if uri.is_some() || cluster.is_some() {
-                resolve_storage_uri(
-                    &config,
-                    uri,
-                    cluster.as_deref(),
-                    cluster_graph.as_deref(),
-                    "cleanup",
-                )
-                .await?
-            } else {
-                // RFC-011: no explicit per-command address — consult the scope.
-                let scope = scope::resolve_scope(
-                    &operator::load_operator_config()?,
-                    planes::Capability::Direct,
-                    scope::ScopeFlags {
-                        profile: cli.profile.as_deref(),
-                        store: cli.store.as_deref(),
-                        server: None,
-                        graph: cli.graph.as_deref(),
-                        uri: None,
-                    },
-                )?;
-                resolve_storage_uri(
-                    &config,
-                    scope.uri,
-                    scope.cluster.as_deref(),
-                    scope.cluster_graph.as_deref(),
-                    "cleanup",
-                )
-                .await?
-            };
+            let uri = resolve_maintenance_uri(
+                cli.profile.as_deref(),
+                cli.store.as_deref(),
+                cli.cluster.as_deref(),
+                cli.graph.as_deref(),
+                uri,
+                "cleanup",
+            )
+            .await?;
 
             let older_than_dur = older_than.as_deref().map(parse_duration_arg).transpose()?;
 
@@ -1041,6 +986,11 @@ async fn main() -> Result<()> {
                 );
                 return Ok(());
             }
+            // Past the preview gate: a real destructive run. Against a non-local
+            // scope this additionally requires --yes (or an interactive yes), so
+            // `cleanup --confirm s3://…` in CI refuses rather than destroying.
+            confirm_destructive("cleanup", &uri, cli.yes, json)?;
+            echo_write_target(cli.quiet, "cleanup", &uri, false);
 
             let options = omnigraph::db::CleanupPolicyOptions {
                 keep_versions: keep,
@@ -1142,18 +1092,16 @@ async fn main() -> Result<()> {
         Command::Graphs { command } => match command {
             GraphsCommand::List {
                 uri,
-                config,
                 json,
             } => {
-                let config = load_cli_config(config.as_ref())?;
                 let client = client::GraphClient::resolve(
-                    &config,
                     cli.server.as_deref(),
                     cli.graph.as_deref(),
                     uri,
                     cli.profile.as_deref(),
                     cli.store.as_deref(),
-                )?;
+                )
+                .await?;
                 let payload = client.list_graphs().await?;
                 if json {
                     print_json(&payload)?;

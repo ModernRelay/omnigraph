@@ -741,14 +741,45 @@ impl Omnigraph {
         // tables. Branch is threaded explicitly — no coordinator swap.
         let mut staging = MutationStaging::default();
 
+        // Lower + validate up front so the touched-table set is known before
+        // execution. A lowering/validation error returns exactly as it did
+        // when this happened inside execute_named_mutation.
+        let ir = self.lower_named_mutation(query_source, query_name)?;
+
+        // Up-front fork-queue acquisition (see the loader for the full
+        // rationale): if this mutation will fork any touched table onto a
+        // non-main branch, acquire the per-(table, branch) write queues for
+        // every touched table before the first fork and hold them through the
+        // publish, so the orphan-fork reclaim can't race a concurrent
+        // in-process fork. The touched set is derived from the lowered IR.
+        let fork_queue_guards: Option<(
+            Vec<(String, Option<String>)>,
+            Vec<tokio::sync::OwnedMutexGuard<()>>,
+        )> = if let Some(active) = requested.as_deref() {
+            let snapshot = self.snapshot_for_branch(Some(active)).await?;
+            let touched: Vec<(String, Option<String>)> = self
+                .touched_table_keys(&ir)
+                .into_iter()
+                .map(|k| (k, Some(active.to_string())))
+                .collect();
+            let needs_fork = touched.iter().any(|(table_key, _)| {
+                snapshot
+                    .entry(table_key)
+                    .map(|e| e.table_branch.as_deref() != Some(active))
+                    .unwrap_or(false)
+            });
+            if needs_fork {
+                let guards = self.write_queue().acquire_many(&touched).await;
+                Some((touched, guards))
+            } else {
+                None
+            }
+        } else {
+            None
+        };
+
         let exec_result = self
-            .execute_named_mutation(
-                query_source,
-                query_name,
-                &resolved_params,
-                requested.as_deref(),
-                &mut staging,
-            )
+            .execute_named_mutation(&ir, &resolved_params, requested.as_deref(), &mut staging)
             .await;
 
         match exec_result {
@@ -768,6 +799,7 @@ impl Omnigraph {
                         requested.as_deref(),
                         crate::db::manifest::SidecarKind::Mutation,
                         actor_id,
+                        fork_queue_guards,
                     )
                     .await?;
                 // Failpoint that wedges the documented finalize→publisher
@@ -817,14 +849,19 @@ impl Omnigraph {
         }
     }
 
-    async fn execute_named_mutation(
+    /// Lower + validate a named mutation query into its IR.
+    ///
+    /// Hoisted out of [`Self::execute_named_mutation`] so the caller can
+    /// inspect the IR before execution — specifically to compute the
+    /// touched-table set (see [`Self::touched_table_keys`]) for up-front
+    /// write-queue acquisition. Performs the same find → typecheck → lower
+    /// → D₂ checks that execution previously did inline, so error behavior
+    /// is unchanged.
+    fn lower_named_mutation(
         &self,
         query_source: &str,
         query_name: &str,
-        params: &ParamMap,
-        branch: Option<&str>,
-        staging: &mut MutationStaging,
-    ) -> Result<MutationResult> {
+    ) -> Result<omnigraph_compiler::ir::MutationIR> {
         let query_decl = omnigraph_compiler::find_named_query(query_source, query_name)
             .map_err(|e| OmniError::manifest(e.to_string()))?;
 
@@ -841,7 +878,61 @@ impl Omnigraph {
         let ir = lower_mutation_query(&query_decl)?;
         // D₂: reject mixed insert/update + delete before any I/O.
         enforce_no_mixed_destructive_constructive(&ir)?;
+        Ok(ir)
+    }
 
+    /// The COMPLETE set of `(node|edge):{type}` table keys a mutation IR can
+    /// touch at execution time, keyed as `MutationStaging`/`commit_all` key
+    /// them. Must be a superset of everything execution forks/commits, since
+    /// it drives the up-front fork-queue acquisition and `commit_all`'s
+    /// held-guard coverage check — a miss means an unserialized fork/commit.
+    ///
+    /// The set is a pure function of (IR ops + catalog). For each op it mirrors
+    /// the execute path's node-vs-edge dispatch (`node_types` first, then
+    /// `edge_types`). A `delete <Node>` additionally **cascades** to every edge
+    /// type whose endpoint is that node (see `execute_delete_node`), forking
+    /// those edge tables during execution — so they are included here, derived
+    /// the same way the executor derives them (`from_type`/`to_type` match).
+    /// Unknown types are skipped (the execute path surfaces the error).
+    /// Sorted + deduped for one-shot `acquire_many`.
+    fn touched_table_keys(&self, ir: &omnigraph_compiler::ir::MutationIR) -> Vec<String> {
+        use omnigraph_compiler::ir::MutationOpIR;
+        let catalog = self.catalog();
+        let mut keys: Vec<String> = Vec::new();
+        for op in &ir.ops {
+            let type_name = match op {
+                MutationOpIR::Insert { type_name, .. }
+                | MutationOpIR::Update { type_name, .. }
+                | MutationOpIR::Delete { type_name, .. } => type_name,
+            };
+            if catalog.node_types.contains_key(type_name) {
+                keys.push(format!("node:{type_name}"));
+                // A node delete cascades to every edge touching this node type,
+                // forking those edge tables. Include them so the up-front
+                // acquisition covers the cascade (mirrors execute_delete_node).
+                if matches!(op, MutationOpIR::Delete { .. }) {
+                    for (edge_name, edge_type) in &catalog.edge_types {
+                        if edge_type.from_type == *type_name || edge_type.to_type == *type_name {
+                            keys.push(format!("edge:{edge_name}"));
+                        }
+                    }
+                }
+            } else if catalog.edge_types.contains_key(type_name) {
+                keys.push(format!("edge:{type_name}"));
+            }
+        }
+        keys.sort();
+        keys.dedup();
+        keys
+    }
+
+    async fn execute_named_mutation(
+        &self,
+        ir: &omnigraph_compiler::ir::MutationIR,
+        params: &ParamMap,
+        branch: Option<&str>,
+        staging: &mut MutationStaging,
+    ) -> Result<MutationResult> {
         let mut total = MutationResult::default();
         for op in &ir.ops {
             let result = match op {

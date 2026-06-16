@@ -25,21 +25,23 @@ const KNOWN_DIVERGENCES: &[&str] = &[
     // populated by the rows below as they are written
 ];
 
-/// One matched setup per row: twin graphs + the SAME Cedar bundle on both
-/// arms (the local arm via --config top-level policy.file; the server via
-/// its config). Returns everything a row needs.
+/// One matched setup per row: twin graphs + the parity Cedar bundle on the
+/// served arm. The local (`--store`) arm carries no policy (RFC-011); the
+/// bundle is permissive for `act-parity`, so the arms still agree.
 struct Parity {
     _temp: TempDir,
     local: std::path::PathBuf,
-    local_cfg: std::path::PathBuf,
     server: TestServer,
 }
 
 fn parity() -> Parity {
     let (temp, local, remote) = twin_graphs();
-    let (local_cfg, server_cfg) = parity_configs(temp.path(), &local, &remote);
-    let server = spawn_server_with_config_env(
-        &server_cfg,
+    // RFC-011 cluster-only: the remote arm is served from a converged
+    // cluster directory (one graph, id `parity`), seeded with the same
+    // fixture data as the local twin.
+    let cluster_dir = parity_configs(temp.path(), &local, &remote);
+    let server = spawn_server_with_cluster_env(
+        &cluster_dir,
         &[(
             "OMNIGRAPH_SERVER_BEARER_TOKENS_JSON",
             r#"{"act-parity":"parity-tok"}"#,
@@ -48,14 +50,13 @@ fn parity() -> Parity {
     Parity {
         _temp: temp,
         local,
-        local_cfg,
         server,
     }
 }
 
 impl Parity {
     fn run(&self, args: &[&str]) -> (std::process::Output, std::process::Output) {
-        run_both_with_config(&self.local, Some(&self.local_cfg), &self.server.base_url, args)
+        run_both(&self.local, &self.server.base_url, args)
     }
 }
 
@@ -83,7 +84,6 @@ fn parity_query() {
             "query",
             "--query",
             query.to_str().unwrap(),
-            "--name",
             "get_person",
             "--params",
             r#"{"name":"Alice"}"#,
@@ -142,7 +142,10 @@ fn parity_branch_create_delete() {
     let (l, r) = p.run(&["branch", "create", "--from", "main", "parity-branch", "--json"],
     );
     assert_parity("branch create", &l, &r);
-    let (l, r) = p.run(&["branch", "delete", "parity-branch", "--json"],
+    // `branch delete` is destructive: the served (remote) arm is non-local and
+    // requires consent (RFC-011 Decision 9), so the row passes `--yes` to test
+    // the operation itself, not the safety gate. The local arm ignores `--yes`.
+    let (l, r) = p.run(&["branch", "delete", "parity-branch", "--yes", "--json"],
     );
     assert_parity("branch delete", &l, &r);
 }
@@ -229,7 +232,6 @@ fn parity_errors_share_exit_codes() {
             "query",
             "--query",
             query.to_str().unwrap(),
-            "--name",
             "no_such_query",
             "--json",
         ],
@@ -249,7 +251,6 @@ fn parity_errors_share_exit_codes() {
             "query",
             "--query",
             query.to_str().unwrap(),
-            "--name",
             "get_person",
             "--json",
         ],

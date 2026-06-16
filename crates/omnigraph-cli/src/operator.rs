@@ -18,10 +18,10 @@ use std::env;
 use std::path::{Path, PathBuf};
 
 use color_eyre::Result;
-use color_eyre::eyre::eyre;
+use color_eyre::eyre::{bail, eyre};
 use serde::Deserialize;
 
-use omnigraph_server::config::ReadOutputFormat;
+use crate::read_format::{ReadOutputFormat, TableCellLayout};
 
 pub(crate) const OPERATOR_HOME_ENV: &str = "OMNIGRAPH_HOME";
 pub(crate) const OPERATOR_DIR: &str = ".omnigraph";
@@ -91,8 +91,7 @@ pub(crate) struct OperatorServer {
 #[derive(Debug, Default, Deserialize)]
 pub(crate) struct OperatorIdentity {
     /// Default actor for every `--as` cascade (CLI direct-engine writes and
-    /// cluster commands alike): `--as` > legacy config actor (RFC-008
-    /// window) > this > none.
+    /// cluster commands alike): `--as` > this > none.
     pub(crate) actor: Option<String>,
     #[serde(flatten)]
     unknown: serde_yaml::Mapping,
@@ -102,14 +101,19 @@ pub(crate) struct OperatorIdentity {
 pub(crate) struct OperatorDefaults {
     /// Default read output format, below every more-specific source.
     pub(crate) output: Option<ReadOutputFormat>,
-    /// Table rendering preferences (below the legacy cli.table_* keys
-    /// during the RFC-008 window).
+    /// Table rendering preferences for `--format table`.
     pub(crate) table_max_column_width: Option<usize>,
-    pub(crate) table_cell_layout: Option<omnigraph_server::config::TableCellLayout>,
+    pub(crate) table_cell_layout: Option<TableCellLayout>,
     /// Default server scope (RFC-011): the everyday addressing when no
     /// `--profile` / primitive / legacy address is given. Names an entry
-    /// under `servers:`.
+    /// under `servers:`. Mutually exclusive with `store` — a scope binds one
+    /// entity.
     pub(crate) server: Option<String>,
+    /// Default **store** scope (RFC-011): a `file://` / `s3://` graph storage
+    /// URI used as the zero-flag local default for graph commands when no
+    /// `--profile` / primitive address is given. The local-dev counterpart of
+    /// `server`; mutually exclusive with it.
+    pub(crate) store: Option<String>,
     /// Default graph selected within a server/cluster scope when no
     /// `--graph` is passed (RFC-011).
     pub(crate) default_graph: Option<String>,
@@ -202,9 +206,35 @@ impl OperatorConfig {
         self.defaults.server.as_deref()
     }
 
+    /// The flat-default store scope URI, if set (RFC-011) — the zero-flag
+    /// local-dev default.
+    pub(crate) fn default_store(&self) -> Option<&str> {
+        self.defaults.store.as_deref()
+    }
+
     /// The flat-default graph within a server/cluster scope, if set (RFC-011).
     pub(crate) fn default_graph(&self) -> Option<&str> {
         self.defaults.default_graph.as_deref()
+    }
+
+    /// A scope binds one entity (Decision 6): `defaults.server` and
+    /// `defaults.store` are mutually exclusive, and a `store` (already a single
+    /// graph) cannot carry a `default_graph`. Both are refused loudly rather
+    /// than silently dropped.
+    fn validate_defaults(&self) -> Result<()> {
+        if self.defaults.server.is_some() && self.defaults.store.is_some() {
+            bail!(
+                "operator config `defaults` sets both `server` and `store` — a default scope \
+                 binds one entity; keep one (use a `profile` if you need both)"
+            );
+        }
+        if self.defaults.store.is_some() && self.defaults.default_graph.is_some() {
+            bail!(
+                "operator config `defaults` sets both `store` and `default_graph` — a store is \
+                 already a single graph; drop `default_graph` (it applies only to a server/cluster scope)"
+            );
+        }
+        Ok(())
     }
 }
 
@@ -282,6 +312,7 @@ pub(crate) fn load_operator_config_at(path: &Path) -> Result<OperatorConfig> {
     for warning in config.unknown_key_warnings() {
         eprintln!("warning: {warning} in operator config '{}'", path.display());
     }
+    config.validate_defaults()?;
     Ok(config)
 }
 
@@ -558,6 +589,42 @@ mod tests {
         let config = load_operator_config_at(&path).unwrap();
         assert_eq!(config.actor(), Some("act-andrew"));
         assert_eq!(config.output(), Some(ReadOutputFormat::Json));
+    }
+
+    #[test]
+    fn defaults_store_parses_and_is_accessible() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.yaml");
+        fs::write(&path, "defaults:\n  store: file:///tmp/dev.omni\n").unwrap();
+        let config = load_operator_config_at(&path).unwrap();
+        assert_eq!(config.default_store(), Some("file:///tmp/dev.omni"));
+        assert_eq!(config.default_server(), None);
+    }
+
+    #[test]
+    fn defaults_server_and_store_together_is_a_loud_error() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.yaml");
+        fs::write(
+            &path,
+            "defaults:\n  server: prod\n  store: file:///tmp/dev.omni\n",
+        )
+        .unwrap();
+        let err = load_operator_config_at(&path).unwrap_err().to_string();
+        assert!(err.contains("binds one entity"), "{err}");
+    }
+
+    #[test]
+    fn defaults_store_with_default_graph_is_a_loud_error() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.yaml");
+        fs::write(
+            &path,
+            "defaults:\n  store: file:///tmp/dev.omni\n  default_graph: knowledge\n",
+        )
+        .unwrap();
+        let err = load_operator_config_at(&path).unwrap_err().to_string();
+        assert!(err.contains("already a single graph"), "{err}");
     }
 
     #[test]

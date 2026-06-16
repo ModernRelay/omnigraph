@@ -1,38 +1,29 @@
 # HTTP Server (`omnigraph-server`)
 
-Axum 0.8 + tokio + utoipa-generated OpenAPI. **Two modes** (v0.6.0+): single-graph and multi-graph, with **two boot sources** for multi mode: `omnigraph.yaml` or — exclusively — a cluster directory (`--cluster`). Mode is inferred from CLI args + config shape.
+Axum 0.8 + tokio + utoipa-generated OpenAPI. **Cluster-only boot** (RFC-011): the server always boots from a cluster (`--cluster <dir | s3://…>`) and serves N graphs (N ≥ 1) under cluster routes. There is no longer a single-graph flat-route mode, no positional `<URI>` boot, no `--target`, and no `omnigraph.yaml`-`graphs:`-map boot. All HTTP is nested under `/graphs/{graph_id}/...`; `/healthz` and the management `/graphs` enumeration stay flat.
 
-## Modes
+## Boot
 
-### Single-graph mode
+### Cluster boot (the only boot)
 
-`omnigraph-server <URI>` or `omnigraph-server --target <name> --config omnigraph.yaml`. Routes are flat — `/snapshot`, `/read`, `/branches`, etc.
+```bash
+omnigraph-server --cluster <dir | s3://…> --bind 0.0.0.0:8080
+```
 
-**Config follows graph identity.** A bare `<URI>` is an *anonymous* graph and uses the **top-level** `policy.file` / `queries:`. A graph chosen by **name** (`--target` / `server.graph`) uses its own `graphs.<name>.{policy.file, queries}` — the same block multi-graph mode uses. ⚠️ *Changed from v0.6.0, which always used top-level config in single mode: a named-graph config that puts `policy`/`queries` at top-level now **refuses boot** and points you at `graphs.<name>.…` (move the block there). Bare-`<URI>` single mode is unchanged.*
-
-### Multi-graph mode (v0.6.0+)
-
-`omnigraph-server --config omnigraph.yaml` with a non-empty `graphs:` map and **no** single-mode selector (no `server.graph`, no `<URI>`, no `--target`). The server opens every configured graph in parallel at startup (bounded concurrency = 4, fail-fast on the first open error). Routes are nested under `/graphs/{graph_id}/...`. Bare flat paths return 404 in multi mode.
-
-### Cluster-booted multi mode
-
-`omnigraph-server --cluster <dir-or-uri>` boots from the cluster catalog's **applied
-revision** instead of
-`omnigraph.yaml` — an exclusive boot source: combining it with `<URI>`,
-`--target`, or `--config` is a startup error, and `omnigraph.yaml` is never
-read in this mode. Always multi-graph routing. See
+`omnigraph-server --cluster <dir-or-uri>` boots from the cluster catalog's
+**applied revision**. The server resolves that revision into per-graph
+startup configs (id, URI, optional per-graph policy, stored-query
+registry) plus an optional server-level policy, then opens every
+configured graph in parallel at startup (bounded concurrency = 4,
+fail-fast on the first open error). Routing is always multi-graph —
+requests to bare flat protected paths (`/read`, `/snapshot`, …) return
+404; the served surface is `/graphs/{graph_id}/...`. See
 [cluster-config.md](../clusters/config.md#serving-from-the-cluster-the-mode-switch)
-for what is read and the fail-fast readiness rules. `--bind`,
-`--unauthenticated`, and the bearer-token env vars work identically.
+for what is read and the fail-fast readiness rules.
 
-Mode inference:
-
-0. CLI `--cluster <dir | s3://…>` → **multi, cluster-booted** (exclusive; a scheme-qualified argument reads the ledger straight from the storage root, no local config)
-1. CLI positional `<URI>` → single
-2. CLI `--target <name>` → single
-3. `server.graph` in config → single
-4. `--config` + non-empty `graphs:` + no single-mode selector → **multi**
-5. otherwise → error with migration hint
+A scheme-qualified argument (`s3://…`) reads the ledger straight from the
+storage root, with no local config directory. `--bind`,
+`--unauthenticated`, and the bearer-token env vars all apply.
 
 ### Stored-query validation at startup
 
@@ -40,36 +31,37 @@ If a graph declares a `queries:` registry (see [cli-reference](../cli/reference.
 
 ## Endpoint inventory
 
-Per-graph endpoints — same body shape across modes; URLs differ:
-
-| Method | Single-mode path | Multi-mode path | Auth | Action |
-|---|---|---|---|---|
-| GET | `/healthz` | `/healthz` | none | — |
-| GET | `/openapi.json` | `/openapi.json` | none | — (strips security if auth disabled; in multi mode emits cluster paths with `cluster_` operation-id prefix) |
-| GET | `/snapshot?branch=` | `/graphs/{id}/snapshot?branch=` | bearer + `read` | snapshot of branch |
-| POST | `/query` | `/graphs/{id}/query` | bearer + `read` | inline read query (canonical; clean field names `query`/`name`; mutations → 400) |
-| POST | `/read` | `/graphs/{id}/read` | bearer + `read` | **deprecated** alias of `/query` (legacy field names `query_source`/`query_name`, byte-stable response; carries `Deprecation: true` + `Link: </query>; rel="successor-version"`) |
-| POST | `/export` | `/graphs/{id}/export` | bearer + `export` | NDJSON stream |
-| POST | `/mutate` | `/graphs/{id}/mutate` | bearer + `change` | mutation (canonical; `query`/`name`; accepts legacy `query_source`/`query_name` as serde aliases) |
-| POST | `/change` | `/graphs/{id}/change` | bearer + `change` | **deprecated** alias of `/mutate` (carries `Deprecation: true` + `Link: </mutate>; rel="successor-version"`) |
-| GET | `/queries` | `/graphs/{id}/queries` | bearer + `read` | list the `mcp.expose` stored queries as a typed tool catalog |
-| POST | `/queries/{name}` | `/graphs/{id}/queries/{name}` | bearer + `invoke_query` (+ `change` for a stored mutation) | invoke a named query from the `queries:` registry; deny == 404 |
-| GET | `/schema` | `/graphs/{id}/schema` | bearer + `read` | get current `.pg` source |
-| POST | `/schema/apply` | `/graphs/{id}/schema/apply` | bearer + `schema_apply` (target=`main`) | migrate |
-| POST | `/load` | `/graphs/{id}/load` | bearer + `branch_create` (only when `from` is set and the branch is created) + `change` | bulk load (canonical); branch creation is opt-in via `from` — without it a missing `branch` is a 404, never an implicit fork (32 MB body limit) |
-| POST | `/ingest` | `/graphs/{id}/ingest` | bearer + `branch_create` (only when `from` is set and the branch is created) + `change` | **deprecated** alias of `/load` (carries `Deprecation: true` + `Link: </load>; rel="successor-version"`) (32 MB body limit) |
-| GET | `/branches` | `/graphs/{id}/branches` | bearer + `read` | list branches |
-| POST | `/branches` | `/graphs/{id}/branches` | bearer + `branch_create` | create |
-| DELETE | `/branches/{branch}` | `/graphs/{id}/branches/{branch}` | bearer + `branch_delete` | delete |
-| POST | `/branches/merge` | `/graphs/{id}/branches/merge` | bearer + `branch_merge` | merge `source → target` |
-| GET | `/commits?branch=` | `/graphs/{id}/commits?branch=` | bearer + `read` | list |
-| GET | `/commits/{commit_id}` | `/graphs/{id}/commits/{commit_id}` | bearer + `read` | show |
-
-Server-level management endpoints (v0.6.0+):
+Per-graph endpoints — all nested under `/graphs/{id}/...`. `{id}` is the
+graph id from the cluster's applied revision:
 
 | Method | Path | Auth | Action |
 |---|---|---|---|
-| GET | `/graphs` | bearer + `graph_list` on `Server::"root"` | list registered graphs (405 in single mode) |
+| GET | `/healthz` | none | — |
+| GET | `/openapi.json` | none | — (strips security if auth disabled; emits the nested cluster paths with `cluster_` operation-id prefix) |
+| GET | `/graphs/{id}/snapshot?branch=` | bearer + `read` | snapshot of branch |
+| POST | `/graphs/{id}/query` | bearer + `read` | inline read query (canonical; clean field names `query`/`name`; mutations → 400) |
+| POST | `/graphs/{id}/read` | bearer + `read` | **deprecated** alias of `/query` (legacy field names `query_source`/`query_name`, byte-stable response; carries `Deprecation: true` + `Link: <query>; rel="successor-version"`) |
+| POST | `/graphs/{id}/export` | bearer + `export` | NDJSON stream |
+| POST | `/graphs/{id}/mutate` | bearer + `change` | mutation (canonical; `query`/`name`; accepts legacy `query_source`/`query_name` as serde aliases) |
+| POST | `/graphs/{id}/change` | bearer + `change` | **deprecated** alias of `/mutate` (carries `Deprecation: true` + `Link: <mutate>; rel="successor-version"`) |
+| GET | `/graphs/{id}/queries` | bearer + `read` | list the `mcp.expose` stored queries as a typed tool catalog |
+| POST | `/graphs/{id}/queries/{name}` | bearer + `invoke_query` (+ `change` for a stored mutation) | invoke a named query from the `queries:` registry; deny == 404 |
+| GET | `/graphs/{id}/schema` | bearer + `read` | get current `.pg` source |
+| POST | `/graphs/{id}/schema/apply` | bearer + `schema_apply` (target=`main`) | disabled for cluster-backed serving; returns 409 and points operators at `omnigraph cluster apply` + restart |
+| POST | `/graphs/{id}/load` | bearer + `branch_create` (only when `from` is set and the branch is created) + `change` | bulk load (canonical); branch creation is opt-in via `from` — without it a missing `branch` is a 404, never an implicit fork (32 MB body limit) |
+| POST | `/graphs/{id}/ingest` | bearer + `branch_create` (only when `from` is set and the branch is created) + `change` | **deprecated** alias of `/load` (carries `Deprecation: true` + `Link: <load>; rel="successor-version"`) (32 MB body limit) |
+| GET | `/graphs/{id}/branches` | bearer + `read` | list branches |
+| POST | `/graphs/{id}/branches` | bearer + `branch_create` | create |
+| DELETE | `/graphs/{id}/branches/{branch}` | bearer + `branch_delete` | delete |
+| POST | `/graphs/{id}/branches/merge` | bearer + `branch_merge` | merge `source → target` |
+| GET | `/graphs/{id}/commits?branch=` | bearer + `read` | list |
+| GET | `/graphs/{id}/commits/{commit_id}` | bearer + `read` | show |
+
+Server-level management endpoints:
+
+| Method | Path | Auth | Action |
+|---|---|---|---|
+| GET | `/graphs` | bearer + `graph_list` on `Server::"root"` | list registered graphs |
 
 ### Stored-query catalog (`GET /queries`)
 
@@ -88,13 +80,14 @@ Invoke a curated, server-side stored query by **name** — the source comes from
 - **Requires an explicit policy grant when auth is on.** In default-deny mode (bearer tokens but no `policy.file`), only `read` is permitted, so *every* `/queries/{name}` call returns `404` until an `invoke_query` rule is configured.
 - A stored mutation cannot target a `snapshot` (`400`); a parameter type error is a structured `400` naming the parameter.
 
-## Adding and removing graphs (multi mode)
+## Adding and removing graphs
 
-Runtime add/remove via API is **not** exposed in v0.6.0 — neither
-`POST /graphs` nor `DELETE /graphs/{id}` is implemented. Operators add
-or remove graphs by stopping the server, editing the `graphs:` map in
-`omnigraph.yaml`, then restarting. The server treats `omnigraph.yaml`
-as operator-owned configuration and never writes it.
+Runtime add/remove via API is **not** exposed — neither `POST /graphs`
+nor `DELETE /graphs/{id}` is implemented. Operators add or remove graphs
+by running `cluster apply` against the cluster (which publishes a new
+applied revision) and restarting the server so it boots from the new
+revision. The server treats the cluster source as operator-owned and
+never writes it.
 
 A future release may introduce a managed registry and re-expose runtime
 mutation on top of it.
@@ -138,8 +131,8 @@ channels:
 - **Response headers (RFC 9745)**: every response carries `Deprecation: true`.
 - **Response headers (RFC 8288)**: every response carries a `Link` header
   pointing at the canonical successor:
-  `Link: </query>; rel="successor-version"` for `/read`, and
-  `Link: </mutate>; rel="successor-version"` for `/change`. SDKs and HTTP
+  `Link: <query>; rel="successor-version"` for `/read`, and
+  `Link: <mutate>; rel="successor-version"` for `/change`. SDKs and HTTP
   proxies can pick the successor up automatically.
 
 Migration is purely cosmetic on the client side — swap the URL path, leave
@@ -226,4 +219,4 @@ See [deployment.md](../deployment.md) for token-source operational details.
   admission control" above). No global rate limiter is configured;
   add `tower_http::limit` if a graph-wide cap is needed.
 - Pagination — none (commits/branches return everything; export streams).
-- Runtime graph add/remove — edit `omnigraph.yaml` and restart.
+- Runtime graph add/remove — run `cluster apply` and restart.

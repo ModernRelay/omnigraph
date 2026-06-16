@@ -165,9 +165,84 @@ fn optimize_with_server_flag_errors_wrong_plane() {
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert!(
         stderr.contains("`optimize` is a direct (storage-native) command")
-            && stderr.contains("--server/--graph address a served graph and do not apply")
-            && stderr.contains("Pass a storage URI, or --cluster <dir> --cluster-graph <id>."),
+            && stderr.contains("--server addresses a served graph and does not apply")
+            && stderr.contains("Pass a storage URI, or --cluster <dir> --graph <id>."),
         "wrong-capability guard message not found; got: {stderr}"
+    );
+}
+
+#[test]
+fn wrong_address_guard_message_has_no_trailing_space() {
+    // The remediation tail is empty for served-addressing capabilities, so a
+    // misplaced --cluster on a data verb must not leave "… does not apply. "
+    // with a dangling space (error text is observable contract). NO_COLOR keeps
+    // the assertion off ANSI styling.
+    let output = output_failure(
+        cli()
+            .env("NO_COLOR", "1")
+            .arg("query")
+            .arg("--cluster")
+            .arg("./brain")
+            .arg("-e")
+            .arg("query q { Person { id } }"),
+    );
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("and does not apply."),
+        "expected the wrong-address message; got: {stderr}"
+    );
+    assert!(
+        !stderr.contains("and does not apply. "),
+        "trailing space after the message; got: {stderr}"
+    );
+}
+
+#[test]
+fn graph_flag_on_a_positional_uri_errors() {
+    // RFC-011: `--graph` selects within a multi-graph scope (a server or
+    // cluster). An explicit `--store <uri>` is already a single graph, so
+    // pairing it with `--graph` is a loud error, not a silently-dropped flag.
+    // (The guard lets `--graph` reach a data verb; the scope resolver rejects
+    // it.)
+    let temp = tempdir().unwrap();
+    let graph = graph_path(temp.path());
+    init_graph(&graph);
+    let output = output_failure(
+        cli()
+            .arg("query")
+            .arg("--store")
+            .arg(&graph)
+            .arg("--graph")
+            .arg("knowledge")
+            .arg("-e")
+            .arg("query q { Person { id } }"),
+    );
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("already a single graph"),
+        "expected --graph-on-explicit-store rejection; got: {stderr}"
+    );
+}
+
+#[test]
+fn query_by_name_against_a_store_needs_a_server() {
+    // RFC-011 D3: by-name (catalog) invocation is served-only — the catalog is
+    // server-owned, so a bare `--store` has nothing to resolve the name
+    // against. The ad-hoc lane (`-e`/`--query`) is the local alternative.
+    let temp = tempdir().unwrap();
+    let graph = graph_path(temp.path());
+    init_graph(&graph);
+    let output = output_failure(
+        cli()
+            .arg("query")
+            .arg("find_people")
+            .arg("--store")
+            .arg(&graph),
+    );
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("needs a server"),
+        "expected a served-only by-name error; got: {stderr}"
     );
 }
 
@@ -454,10 +529,9 @@ query list_people() {
 
 #[test]
 fn deprecated_read_and_change_subcommands_emit_warnings() {
-    // Both subcommands require `--query`/`--query-string`/`--alias`, so
-    // invoking them with no args will exit non-zero. That's fine --
-    // we only care that the deprecation warning is printed before the
-    // argument-required error.
+    // Both subcommands require `--query`/`--query-string`, so invoking them
+    // with no args will exit non-zero. That's fine -- we only care that the
+    // deprecation warning is printed before the argument-required error.
     let output = cli().arg("read").output().unwrap();
     let stderr = String::from_utf8(output.stderr).unwrap();
     assert!(
@@ -525,13 +599,15 @@ query list_people() {
 }
 
 #[test]
-fn query_lint_can_resolve_graph_and_query_from_config() {
+fn query_lint_can_resolve_graph_from_store_scope() {
+    // RFC-011: lint resolves its graph target through `--store` (the direct
+    // scope), not omnigraph.yaml's cli.graph; the .gq path is plain cwd-relative.
     let temp = tempdir().unwrap();
     let graph = graph_path(temp.path());
-    let config_path = temp.path().join("omnigraph.yaml");
     init_graph(&graph);
+    let query_path = temp.path().join("queries.gq");
     write_query_file(
-        &temp.path().join("queries.gq"),
+        &query_path,
         r#"
 query list_people() {
     match { $p: Person }
@@ -539,16 +615,15 @@ query list_people() {
 }
 "#,
     );
-    write_config(&config_path, &local_yaml_config(&graph));
 
     let output = output_success(
         cli()
             .arg("query")
             .arg("lint")
             .arg("--query")
-            .arg("queries.gq")
-            .arg("--config")
-            .arg(&config_path)
+            .arg(&query_path)
+            .arg("--store")
+            .arg(&graph)
             .arg("--json"),
     );
     let payload: Value = serde_json::from_slice(&output.stdout).unwrap();
@@ -616,7 +691,9 @@ query list_people() {
     );
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert!(
-        stderr.contains("lint requires --schema <schema.pg> or a resolvable graph target")
+        stderr.contains("lint requires --schema <schema.pg>")
+            || stderr.contains("no graph addressed"),
+        "expected a schema-or-graph-target requirement; got: {stderr}"
     );
 }
 
@@ -785,10 +862,10 @@ fn read_json_outputs_rows_for_named_query() {
     let output = output_success(
         cli()
             .arg("read")
+            .arg("--store")
             .arg(&graph)
             .arg("--query")
             .arg(&queries)
-            .arg("--name")
             .arg("get_person")
             .arg("--params")
             .arg(r#"{"name":"Alice"}"#)
@@ -817,7 +894,6 @@ fn read_via_store_flag_and_profile_match_positional_uri() {
         let output = output_success(
             cmd.arg("--query")
                 .arg(&queries)
-                .arg("--name")
                 .arg("get_person")
                 .arg("--params")
                 .arg(r#"{"name":"Alice"}"#)
@@ -826,8 +902,8 @@ fn read_via_store_flag_and_profile_match_positional_uri() {
         serde_json::from_slice(&output.stdout).unwrap()
     };
 
-    // Baseline: positional URI.
-    let baseline = read_rows(cli().arg("query").arg(&graph));
+    // Baseline: --store names the graph.
+    let baseline = read_rows(cli().arg("query").arg("--store").arg(&graph));
     assert_eq!(baseline["rows"][0]["p.name"], "Alice");
 
     // --store names the same graph directly.
@@ -914,43 +990,38 @@ fn export_jsonl_outputs_source_rows_for_selected_branch_and_type() {
     );
 }
 
+// RFC-011: `policy validate|test|explain` source the Cedar bundle from a
+// converged cluster's applied policies (`--cluster <dir>` + `--graph <id>`),
+// not omnigraph.yaml's policy.file.
+
 #[test]
-fn policy_validate_accepts_valid_policy_file() {
-    let temp = tempdir().unwrap();
-    let (config, _) = write_policy_config_fixture(temp.path());
+fn policy_validate_accepts_cluster_bundle() {
+    let cluster = converged_loaded_cluster("knowledge", Some(POLICY_YAML));
 
     let output = output_success(
         cli()
             .arg("policy")
             .arg("validate")
-            .arg("--config")
-            .arg(&config),
+            .arg("--cluster")
+            .arg(cluster.path())
+            .arg("--graph")
+            .arg("knowledge"),
     );
     let stdout = stdout_string(&output);
 
     assert!(stdout.contains("policy valid:"));
-    assert!(stdout.contains("policy.yaml"));
     assert!(stdout.contains("[2 actors]"));
 }
 
 #[test]
-fn policy_validate_fails_for_invalid_policy_file() {
-    let temp = tempdir().unwrap();
-    let config = temp.path().join("omnigraph.yaml");
-    let policy = temp.path().join("policy.yaml");
-    fs::write(
-        &config,
-        r#"
-project:
-  name: policy-test-graph
-policy:
-  file: ./policy.yaml
-"#,
-    )
-    .unwrap();
-    fs::write(
-        &policy,
-        r#"
+fn policy_validate_fails_for_invalid_cluster_bundle() {
+    // The cluster does not validate a policy bundle's internal rules, so an
+    // applied-but-malformed bundle reaches `policy validate`, which compiles it
+    // and surfaces the error (here: a duplicate rule id).
+    let cluster = converged_loaded_cluster(
+        "knowledge",
+        Some(
+            r#"
 version: 1
 groups:
   team: [act-andrew]
@@ -966,26 +1037,42 @@ rules:
       actions: [export]
       branch_scope: any
 "#,
-    )
-    .unwrap();
+        ),
+    );
 
     let output = output_failure(
         cli()
             .arg("policy")
             .arg("validate")
-            .arg("--config")
-            .arg(&config),
+            .arg("--cluster")
+            .arg(cluster.path())
+            .arg("--graph")
+            .arg("knowledge"),
     );
     let stderr = String::from_utf8(output.stderr).unwrap();
-    assert!(stderr.contains("duplicate policy rule id"));
+    assert!(
+        stderr.contains("duplicate policy rule id"),
+        "expected a duplicate-rule error; got: {stderr}"
+    );
 }
 
 #[test]
-fn policy_test_runs_declarative_cases() {
-    let temp = tempdir().unwrap();
-    let (config, _) = write_policy_config_fixture(temp.path());
+fn policy_test_runs_declarative_cases_against_cluster_bundle() {
+    let cluster = converged_loaded_cluster("knowledge", Some(POLICY_YAML));
+    let tests = cluster.path().join("policy.tests.yaml");
+    fs::write(&tests, POLICY_TESTS_YAML).unwrap();
 
-    let output = output_success(cli().arg("policy").arg("test").arg("--config").arg(&config));
+    let output = output_success(
+        cli()
+            .arg("policy")
+            .arg("test")
+            .arg("--cluster")
+            .arg(cluster.path())
+            .arg("--graph")
+            .arg("knowledge")
+            .arg("--tests")
+            .arg(&tests),
+    );
     let stdout = stdout_string(&output);
 
     assert!(stdout.contains("policy tests passed: 2 cases"));
@@ -993,15 +1080,16 @@ fn policy_test_runs_declarative_cases() {
 
 #[test]
 fn policy_explain_reports_decision_and_matched_rule() {
-    let temp = tempdir().unwrap();
-    let (config, _) = write_policy_config_fixture(temp.path());
+    let cluster = converged_loaded_cluster("knowledge", Some(POLICY_YAML));
 
     let allow = output_success(
         cli()
             .arg("policy")
             .arg("explain")
-            .arg("--config")
-            .arg(&config)
+            .arg("--cluster")
+            .arg(cluster.path())
+            .arg("--graph")
+            .arg("knowledge")
             .arg("--actor")
             .arg("act-andrew")
             .arg("--action")
@@ -1017,8 +1105,10 @@ fn policy_explain_reports_decision_and_matched_rule() {
         cli()
             .arg("policy")
             .arg("explain")
-            .arg("--config")
-            .arg(&config)
+            .arg("--cluster")
+            .arg(cluster.path())
+            .arg("--graph")
+            .arg("knowledge")
             .arg("--actor")
             .arg("act-bruno")
             .arg("--action")
@@ -1032,22 +1122,26 @@ fn policy_explain_reports_decision_and_matched_rule() {
 }
 
 #[test]
-fn read_can_resolve_uri_from_config() {
+fn read_resolves_uri_from_default_store_scope() {
+    // RFC-011: a zero-flag read resolves its graph from `defaults.store` in the
+    // operator config (the local-dev default scope) — no omnigraph.yaml.
     let temp = tempdir().unwrap();
     let graph = graph_path(temp.path());
-    let config = temp.path().join("omnigraph.yaml");
     init_graph(&graph);
     load_fixture(&graph);
-    write_config(&config, &local_yaml_config(&graph));
+    let home = tempdir().unwrap();
+    std::fs::write(
+        home.path().join("config.yaml"),
+        format!("defaults:\n  store: {}\n", graph.to_string_lossy()),
+    )
+    .unwrap();
 
     let output = output_success(
         cli()
+            .env("OMNIGRAPH_HOME", home.path())
             .arg("read")
-            .arg("--config")
-            .arg(&config)
             .arg("--query")
             .arg(fixture("test.gq"))
-            .arg("--name")
             .arg("get_person")
             .arg("--params")
             .arg(r#"{"name":"Alice"}"#)
@@ -1067,10 +1161,10 @@ fn read_csv_format_outputs_header_and_row_values() {
     let output = output_success(
         cli()
             .arg("read")
+            .arg("--store")
             .arg(&graph)
             .arg("--query")
             .arg(fixture("test.gq"))
-            .arg("--name")
             .arg("get_person")
             .arg("--params")
             .arg(r#"{"name":"Alice"}"#)
@@ -1104,10 +1198,10 @@ fn read_uses_operator_default_output_format() {
         command
             .env("OMNIGRAPH_HOME", operator_home.path())
             .arg("read")
+            .arg("--store")
             .arg(&graph)
             .arg("--query")
             .arg(fixture("test.gq"))
-            .arg("--name")
             .arg("get_person")
             .arg("--params")
             .arg(r#"{"name":"Alice"}"#);
@@ -1139,10 +1233,10 @@ fn read_jsonl_format_outputs_metadata_header_first() {
     let output = output_success(
         cli()
             .arg("read")
+            .arg("--store")
             .arg(&graph)
             .arg("--query")
             .arg(fixture("test.gq"))
-            .arg("--name")
             .arg("get_person")
             .arg("--params")
             .arg(r#"{"name":"Alice"}"#)
@@ -1174,6 +1268,7 @@ query insert_person($name: String, $age: I32) {
     let output = output_success(
         cli()
             .arg("change")
+            .arg("--store")
             .arg(&graph)
             .arg("--query")
             .arg(&mutation_file)
@@ -1190,10 +1285,10 @@ query insert_person($name: String, $age: I32) {
     let verify = output_success(
         cli()
             .arg("read")
+            .arg("--store")
             .arg(&graph)
             .arg("--query")
             .arg(fixture("test.gq"))
-            .arg("--name")
             .arg("get_person")
             .arg("--params")
             .arg(r#"{"name":"Eve"}"#)
@@ -1205,13 +1300,13 @@ query insert_person($name: String, $age: I32) {
 }
 
 #[test]
-fn change_can_resolve_uri_and_branch_from_config() {
+fn change_resolves_uri_and_default_branch_from_store_scope() {
+    // RFC-011: a mutate resolves its graph from `--store` and defaults the
+    // branch to main (no omnigraph.yaml cli.graph / cli.branch).
     let temp = tempdir().unwrap();
     let graph = graph_path(temp.path());
-    let config = temp.path().join("omnigraph.yaml");
     init_graph(&graph);
     load_fixture(&graph);
-    write_config(&config, &local_yaml_config(&graph));
     let mutation_file = temp.path().join("config-mutations.gq");
     write_query_file(
         &mutation_file,
@@ -1225,8 +1320,8 @@ query insert_person($name: String, $age: I32) {
     let output = output_success(
         cli()
             .arg("change")
-            .arg("--config")
-            .arg(&config)
+            .arg("--store")
+            .arg(&graph)
             .arg("--query")
             .arg(&mutation_file)
             .arg("--params")
@@ -1248,6 +1343,7 @@ fn read_requires_name_for_multi_query_files() {
     let output = output_failure(
         cli()
             .arg("read")
+            .arg("--store")
             .arg(&graph)
             .arg("--query")
             .arg(fixture("test.gq")),
@@ -1266,6 +1362,7 @@ fn read_supports_inline_query_string() {
     let output = output_success(
         cli()
             .arg("read")
+            .arg("--store")
             .arg(&repo)
             .arg("-e")
             .arg("query find($name: String) { match { $p: Person { name: $name } } return { $p.name, $p.age } }")
@@ -1281,11 +1378,12 @@ fn read_supports_inline_query_string() {
 
 #[test]
 fn positional_http_uri_on_a_data_verb_is_rejected() {
-    // RFC-011: a positional/`--uri` http(s):// URL no longer dispatches to a
-    // remote server — that requires `--server <url>`.
+    // RFC-011: a `--store` http(s):// URL no longer dispatches to a remote
+    // server — that requires `--server <url>`.
     let output = output_failure(
         cli()
             .arg("query")
+            .arg("--store")
             .arg("http://127.0.0.1:1")
             .arg("-e")
             .arg("query q() { match { $p: Person { } } return { $p } }"),
@@ -1293,7 +1391,7 @@ fn positional_http_uri_on_a_data_verb_is_rejected() {
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert!(
         stderr.contains("must be addressed with `--server <url>`"),
-        "expected positional-remote rejection; got: {stderr}"
+        "expected store-remote rejection; got: {stderr}"
     );
 }
 
@@ -1331,6 +1429,7 @@ fn change_supports_inline_query_string() {
     let output = output_success(
         cli()
             .arg("change")
+            .arg("--store")
             .arg(&repo)
             .arg("--query-string")
             .arg("query add($name: String, $age: I32) { insert Person { name: $name, age: $age } }")
@@ -1345,6 +1444,7 @@ fn change_supports_inline_query_string() {
     let verify = output_success(
         cli()
             .arg("read")
+            .arg("--store")
             .arg(&repo)
             .arg("-e")
             .arg("query find($name: String) { match { $p: Person { name: $name } } return { $p.name } }")
@@ -1366,6 +1466,7 @@ fn read_rejects_query_string_combined_with_query() {
     let output = output_failure(
         cli()
             .arg("read")
+            .arg("--store")
             .arg(&repo)
             .arg("--query")
             .arg(fixture("test.gq"))
@@ -1386,7 +1487,7 @@ fn read_rejects_empty_query_string() {
     init_graph(&repo);
     load_fixture(&repo);
 
-    let output = output_failure(cli().arg("read").arg(&repo).arg("-e").arg(""));
+    let output = output_failure(cli().arg("read").arg("--store").arg(&repo).arg("-e").arg(""));
     let stderr = String::from_utf8(output.stderr).unwrap();
     assert!(
         stderr.contains("must not be empty"),
@@ -1512,6 +1613,160 @@ fn branch_delete_rejects_main() {
     );
     let stderr = String::from_utf8(output.stderr).unwrap();
     assert!(stderr.contains("cannot delete branch 'main'"));
+}
+
+// ── RFC-011 Decision 9: write diagnostics + non-local destructive-confirm ──
+
+#[test]
+fn write_echoes_resolved_target_to_stderr() {
+    // Every write echoes its resolved target + access path to stderr; --json
+    // (stdout) is unaffected. A local load → "(direct, local)".
+    let temp = tempdir().unwrap();
+    let graph = graph_path(temp.path());
+    init_graph(&graph);
+    let data = fixture("test.jsonl");
+    let output = output_success(
+        cli()
+            .arg("load")
+            .arg("--mode")
+            .arg("append")
+            .arg("--data")
+            .arg(&data)
+            .arg(&graph)
+            .arg("--json"),
+    );
+    let stderr = String::from_utf8(output.stderr).unwrap();
+    assert!(
+        stderr.contains("omnigraph load →") && stderr.contains("(direct, local)"),
+        "missing write-target echo; stderr: {stderr}"
+    );
+    // stdout still parses as JSON — the echo went to stderr.
+    let _: Value = serde_json::from_slice(&output.stdout).unwrap();
+}
+
+#[test]
+fn quiet_suppresses_the_write_target_echo() {
+    let temp = tempdir().unwrap();
+    let graph = graph_path(temp.path());
+    init_graph(&graph);
+    let data = fixture("test.jsonl");
+    let output = output_success(
+        cli()
+            .arg("--quiet")
+            .arg("load")
+            .arg("--mode")
+            .arg("append")
+            .arg("--data")
+            .arg(&data)
+            .arg(&graph),
+    );
+    let stderr = String::from_utf8(output.stderr).unwrap();
+    assert!(
+        !stderr.contains("omnigraph load →"),
+        "--quiet should suppress the echo; stderr: {stderr}"
+    );
+}
+
+#[test]
+fn branch_delete_against_non_local_scope_refuses_without_yes() {
+    // No bucket needed: the confirm gate fires before the graph is opened.
+    let output = output_failure(
+        cli()
+            .arg("branch")
+            .arg("delete")
+            .arg("--store")
+            .arg("s3://fake-bucket/g.omni")
+            .arg("feature")
+            .arg("--json"),
+    );
+    let stderr = String::from_utf8(output.stderr).unwrap();
+    assert!(
+        stderr.contains("refusing destructive `branch delete`") && stderr.contains("--yes"),
+        "expected a non-local destructive refusal; stderr: {stderr}"
+    );
+}
+
+#[test]
+fn branch_delete_against_non_local_scope_passes_gate_with_yes() {
+    // With --yes the gate is bypassed; the command then fails for an unrelated
+    // reason (the fake bucket can't be opened), so the refusal must be ABSENT.
+    let output = output_failure(
+        cli()
+            .arg("branch")
+            .arg("delete")
+            .arg("--store")
+            .arg("s3://fake-bucket/g.omni")
+            .arg("feature")
+            .arg("--yes")
+            .arg("--json"),
+    );
+    let stderr = String::from_utf8(output.stderr).unwrap();
+    assert!(
+        !stderr.contains("refusing destructive"),
+        "--yes should bypass the confirm gate; stderr: {stderr}"
+    );
+}
+
+#[test]
+fn overwrite_load_against_non_local_scope_refuses_without_yes() {
+    let output = output_failure(
+        cli()
+            .arg("load")
+            .arg("--mode")
+            .arg("overwrite")
+            .arg("--data")
+            .arg(fixture("test.jsonl"))
+            .arg("--store")
+            .arg("s3://fake-bucket/g.omni")
+            .arg("--json"),
+    );
+    let stderr = String::from_utf8(output.stderr).unwrap();
+    assert!(
+        stderr.contains("refusing destructive `load --mode overwrite`"),
+        "expected a non-local overwrite refusal; stderr: {stderr}"
+    );
+}
+
+#[test]
+fn cleanup_against_non_local_scope_refuses_without_yes() {
+    // Past the --confirm preview gate, a non-local cleanup still needs --yes.
+    let output = output_failure(
+        cli()
+            .arg("cleanup")
+            .arg("--store")
+            .arg("s3://fake-bucket/g.omni")
+            .arg("--keep")
+            .arg("5")
+            .arg("--confirm")
+            .arg("--json"),
+    );
+    let stderr = String::from_utf8(output.stderr).unwrap();
+    assert!(
+        stderr.contains("refusing destructive `cleanup`"),
+        "expected a non-local cleanup refusal; stderr: {stderr}"
+    );
+}
+
+#[test]
+fn cleanup_against_local_scope_executes_with_confirm() {
+    // Local cleanup needs no --yes; --confirm alone executes (and echoes).
+    let temp = tempdir().unwrap();
+    let graph = graph_path(temp.path());
+    init_graph(&graph);
+    load_fixture(&graph);
+    let output = output_success(
+        cli()
+            .arg("cleanup")
+            .arg("--keep")
+            .arg("1")
+            .arg("--confirm")
+            .arg(&graph)
+            .arg("--json"),
+    );
+    let payload: Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert!(payload["tables"].as_array().is_some(), "{payload}");
+    let stderr = String::from_utf8(output.stderr).unwrap();
+    assert!(stderr.contains("omnigraph cleanup →"), "stderr: {stderr}");
 }
 
 #[test]
@@ -1663,19 +1918,17 @@ fn snapshot_json_returns_manifest_version_and_tables() {
 }
 
 #[test]
-fn snapshot_can_resolve_uri_from_config() {
+fn snapshot_resolves_uri_from_store_scope() {
     let temp = tempdir().unwrap();
     let graph = graph_path(temp.path());
-    let config = temp.path().join("omnigraph.yaml");
     init_graph(&graph);
     load_fixture(&graph);
-    write_config(&config, &local_yaml_config(&graph));
 
     let output = output_success(
         cli()
             .arg("snapshot")
-            .arg("--config")
-            .arg(&config)
+            .arg("--store")
+            .arg(&graph)
             .arg("--json"),
     );
     let payload: Value = serde_json::from_slice(&output.stdout).unwrap();
@@ -1815,4 +2068,163 @@ fn cli_fails_for_invalid_merge_requests() {
             .unwrap()
             .contains("distinct source and target")
     );
+}
+
+/// RFC-011 Decision 8: `profile list` / `profile show` inspect the operator
+/// config's profiles read-only. Hermetic via OMNIGRAPH_HOME.
+fn profile_home() -> tempfile::TempDir {
+    let home = tempdir().unwrap();
+    std::fs::write(
+        home.path().join("config.yaml"),
+        "operator:\n  actor: act-andrew\n\
+         defaults:\n  output: json\n  server: prod\n  default_graph: knowledge\n\
+         servers:\n  prod:\n    url: https://graph.example.com\n\
+         clusters:\n  brain:\n    root: s3://acme/clusters/brain\n\
+         profiles:\n\
+         \x20 staging:\n    server: prod\n    default_graph: kb\n\
+         \x20 brain-admin:\n    cluster: brain\n\
+         \x20 localdev:\n    store: file:///data/dev.omni\n\
+         \x20 broken:\n    server: a\n    store: b\n",
+    )
+    .unwrap();
+    home
+}
+
+#[test]
+fn profile_list_names_each_profile_with_its_binding_and_marks_active() {
+    let home = profile_home();
+    let out = output_success(
+        cli()
+            .env("OMNIGRAPH_HOME", home.path())
+            .env("OMNIGRAPH_PROFILE", "staging")
+            .arg("profile")
+            .arg("list"),
+    );
+    let stdout = stdout_string(&out);
+    assert!(stdout.contains("staging (active)"), "{stdout}");
+    assert!(stdout.contains("server: prod"), "{stdout}");
+    assert!(stdout.contains("cluster: brain"), "{stdout}");
+    assert!(stdout.contains("store: file:///data/dev.omni"), "{stdout}");
+    // A malformed (two-scope) profile is reported, not a hard failure.
+    assert!(stdout.contains("broken") && stdout.contains("invalid:"), "{stdout}");
+}
+
+#[test]
+fn profile_list_json_shape() {
+    let home = profile_home();
+    let out = output_success(
+        cli()
+            .env("OMNIGRAPH_HOME", home.path())
+            .arg("profile")
+            .arg("list")
+            .arg("--json"),
+    );
+    let items: Value = serde_json::from_slice(&out.stdout).unwrap();
+    let brain = items
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|p| p["name"] == "brain-admin")
+        .unwrap();
+    assert_eq!(brain["binding"], "cluster: brain");
+    assert_eq!(brain["scope_kind"], "cluster");
+    assert_eq!(brain["target"], "brain");
+    assert_eq!(brain["valid"], true);
+    assert!(brain["error"].is_null());
+    assert_eq!(brain["active"], false);
+    let broken = items
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|p| p["name"] == "broken")
+        .unwrap();
+    assert_eq!(broken["scope_kind"], "invalid");
+    assert_eq!(broken["valid"], false);
+    assert!(broken["target"].is_null());
+    assert!(
+        broken["error"]
+            .as_str()
+            .unwrap()
+            .contains("profile 'broken'")
+    );
+}
+
+#[test]
+fn profile_show_resolves_named_scope_endpoints() {
+    let home = profile_home();
+    // A cluster profile resolves its root.
+    let cluster = output_success(
+        cli()
+            .env("OMNIGRAPH_HOME", home.path())
+            .arg("profile")
+            .arg("show")
+            .arg("brain-admin"),
+    );
+    let cs = stdout_string(&cluster);
+    assert!(cs.contains("scope:   cluster brain"), "{cs}");
+    assert!(cs.contains("endpoint: s3://acme/clusters/brain"), "{cs}");
+
+    // A store profile shows its URI as the endpoint.
+    let store = output_success(
+        cli()
+            .env("OMNIGRAPH_HOME", home.path())
+            .arg("profile")
+            .arg("show")
+            .arg("localdev")
+            .arg("--json"),
+    );
+    let detail: Value = serde_json::from_slice(&store.stdout).unwrap();
+    assert_eq!(detail["scope_kind"], "store");
+    assert_eq!(detail["endpoint"], "file:///data/dev.omni");
+}
+
+#[test]
+fn profile_show_without_name_falls_back_to_flat_defaults() {
+    let home = profile_home();
+    let out = output_success(
+        cli()
+            .env("OMNIGRAPH_HOME", home.path())
+            .arg("profile")
+            .arg("show")
+            .arg("--json"),
+    );
+    let detail: Value = serde_json::from_slice(&out.stdout).unwrap();
+    assert_eq!(detail["name"], "(defaults)");
+    assert_eq!(detail["scope_kind"], "server");
+    assert_eq!(detail["endpoint"], "https://graph.example.com");
+    assert_eq!(detail["default_graph"], "knowledge");
+}
+
+#[test]
+fn profile_show_without_name_uses_active_env_profile() {
+    let home = profile_home();
+    let out = output_success(
+        cli()
+            .env("OMNIGRAPH_HOME", home.path())
+            .env("OMNIGRAPH_PROFILE", "brain-admin")
+            .arg("profile")
+            .arg("show")
+            .arg("--json"),
+    );
+    let detail: Value = serde_json::from_slice(&out.stdout).unwrap();
+    // No name arg, but $OMNIGRAPH_PROFILE selects brain-admin (not the flat defaults).
+    assert_eq!(detail["name"], "brain-admin");
+    assert_eq!(detail["scope_kind"], "cluster");
+    assert_eq!(detail["endpoint"], "s3://acme/clusters/brain");
+    // output_format renders as the canonical lowercase value name.
+    assert_eq!(detail["output_format"], "json");
+}
+
+#[test]
+fn profile_show_unknown_name_errors() {
+    let home = profile_home();
+    let out = output_failure(
+        cli()
+            .env("OMNIGRAPH_HOME", home.path())
+            .arg("profile")
+            .arg("show")
+            .arg("nope"),
+    );
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(stderr.contains("unknown profile 'nope'"), "{stderr}");
 }

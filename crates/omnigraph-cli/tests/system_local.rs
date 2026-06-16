@@ -3,6 +3,7 @@ mod support;
 use std::env;
 use std::fs;
 
+use omnigraph::db::Omnigraph;
 use reqwest::blocking::Client;
 use serde_json::Value;
 
@@ -61,53 +62,6 @@ cases:
     branch: feature
     expect: allow
 "#;
-
-fn yaml_string(value: &str) -> String {
-    format!("'{}'", value.replace('\'', "''"))
-}
-
-fn local_policy_config(graph: &SystemGraph) -> String {
-    format!(
-        "\
-project:
-  name: policy-e2e-local
-graphs:
-  local:
-    uri: {}
-    policy:
-      file: ./policy.yaml
-cli:
-  graph: local
-  branch: main
-query:
-  roots:
-    - .
-",
-        yaml_string(&graph.path().to_string_lossy())
-    )
-}
-
-fn local_policy_server_graph_config(graph: &SystemGraph) -> String {
-    format!(
-        "\
-project:
-  name: policy-e2e-local
-graphs:
-  local:
-    uri: {}
-    policy:
-      file: ./policy.yaml
-server:
-  graph: local
-cli:
-  branch: main
-query:
-  roots:
-    - .
-",
-        yaml_string(&graph.path().to_string_lossy())
-    )
-}
 
 fn insert_person_query(graph: &SystemGraph, name: &str) -> std::path::PathBuf {
     graph.write_query(
@@ -231,10 +185,10 @@ fn local_cli_end_to_end_init_load_read_change_read_flow() {
     let read_before = parse_stdout_json(&output_success(
         cli()
             .arg("read")
+            .arg("--store")
             .arg(graph.path())
             .arg("--query")
             .arg(fixture("test.gq"))
-            .arg("--name")
             .arg("get_person")
             .arg("--params")
             .arg(r#"{"name":"Alice"}"#)
@@ -246,6 +200,7 @@ fn local_cli_end_to_end_init_load_read_change_read_flow() {
     let change_payload = parse_stdout_json(&output_success(
         cli()
             .arg("change")
+            .arg("--store")
             .arg(graph.path())
             .arg("--query")
             .arg(&mutation_file)
@@ -259,10 +214,10 @@ fn local_cli_end_to_end_init_load_read_change_read_flow() {
     let read_after = parse_stdout_json(&output_success(
         cli()
             .arg("read")
+            .arg("--store")
             .arg(graph.path())
             .arg("--query")
             .arg(fixture("test.gq"))
-            .arg("--name")
             .arg("get_person")
             .arg("--params")
             .arg(r#"{"name":"Eve"}"#)
@@ -277,6 +232,7 @@ fn local_cli_end_to_end_init_load_read_change_read_flow() {
     let inline_change = parse_stdout_json(&output_success(
         cli()
             .arg("change")
+            .arg("--store")
             .arg(graph.path())
             .arg("-e")
             .arg("query add($name: String, $age: I32) { insert Person { name: $name, age: $age } }")
@@ -291,6 +247,7 @@ fn local_cli_end_to_end_init_load_read_change_read_flow() {
     let inline_read = parse_stdout_json(&output_success(
         cli()
             .arg("read")
+            .arg("--store")
             .arg(graph.path())
             .arg("--query-string")
             .arg("query find($name: String) { match { $p: Person { name: $name } } return { $p.name, $p.age } }")
@@ -322,6 +279,7 @@ fn local_cli_end_to_end_branch_change_merge_flow() {
     let change_payload = parse_stdout_json(&output_success(
         cli()
             .arg("change")
+            .arg("--store")
             .arg(graph.path())
             .arg("--query")
             .arg(&mutation_file)
@@ -337,10 +295,10 @@ fn local_cli_end_to_end_branch_change_merge_flow() {
     let feature_read = parse_stdout_json(&output_success(
         cli()
             .arg("read")
+            .arg("--store")
             .arg(graph.path())
             .arg("--query")
             .arg(fixture("test.gq"))
-            .arg("--name")
             .arg("get_person")
             .arg("--branch")
             .arg("feature")
@@ -365,10 +323,10 @@ fn local_cli_end_to_end_branch_change_merge_flow() {
     let main_read = parse_stdout_json(&output_success(
         cli()
             .arg("read")
+            .arg("--store")
             .arg(graph.path())
             .arg("--query")
             .arg(fixture("test.gq"))
-            .arg("--name")
             .arg("get_person")
             .arg("--params")
             .arg(r#"{"name":"Zoe"}"#)
@@ -435,10 +393,10 @@ fn local_cli_ingest_creates_review_branch_and_keeps_it_readable() {
     let zoe = parse_stdout_json(&output_success(
         cli()
             .arg("read")
+            .arg("--store")
             .arg(graph.path())
             .arg("--query")
             .arg(fixture("test.gq"))
-            .arg("--name")
             .arg("get_person")
             .arg("--branch")
             .arg("feature-ingest")
@@ -452,10 +410,10 @@ fn local_cli_ingest_creates_review_branch_and_keeps_it_readable() {
     let bob = parse_stdout_json(&output_success(
         cli()
             .arg("read")
+            .arg("--store")
             .arg(graph.path())
             .arg("--query")
             .arg(fixture("test.gq"))
-            .arg("--name")
             .arg("get_person")
             .arg("--branch")
             .arg("feature-ingest")
@@ -629,10 +587,10 @@ fn local_cli_export_round_trips_full_branch_graph() {
     let eve = parse_stdout_json(&output_success(
         cli()
             .arg("read")
+            .arg("--store")
             .arg(&imported_graph)
             .arg("--query")
             .arg(fixture("test.gq"))
-            .arg("--name")
             .arg("get_person")
             .arg("--params")
             .arg(r#"{"name":"Eve"}"#)
@@ -644,10 +602,10 @@ fn local_cli_export_round_trips_full_branch_graph() {
     let friends = parse_stdout_json(&output_success(
         cli()
             .arg("read")
+            .arg("--store")
             .arg(&imported_graph)
             .arg("--query")
             .arg(fixture("test.gq"))
-            .arg("--name")
             .arg("friends_of")
             .arg("--params")
             .arg(r#"{"name":"Alice"}"#)
@@ -665,31 +623,9 @@ fn local_cli_s3_end_to_end_init_load_read_flow() {
 
     let temp = tempfile::tempdir().unwrap();
     let query_root = temp.path();
-    let config = query_root.join("omnigraph.yaml");
     let query = query_root.join("test.gq");
     fs::copy(fixture("test.gq"), &query).unwrap();
-    write_config(
-        &config,
-        &format!(
-            "\
-graphs:
-  rustfs:
-    uri: '{}'
-cli:
-  graph: rustfs
-  branch: main
-query:
-  roots:
-    - .
-policy: {{}}
-",
-            graph_uri
-        ),
-    );
 
-    // current_dir matters: `init` scaffolds an omnigraph.yaml into its cwd,
-    // and without this it pollutes the crate dir, breaking unrelated tests
-    // (anything resolving a graph target from the cwd config).
     output_success(
         cli()
             .current_dir(query_root)
@@ -709,15 +645,16 @@ policy: {{}}
             .arg(&graph_uri),
     );
 
+    // RFC-011: the graph is addressed by `--store <uri>`; the `.gq` path is
+    // resolved cwd-relative (no omnigraph.yaml `query.roots`).
     let read = parse_stdout_json(&output_success(
         cli()
             .current_dir(query_root)
             .arg("read")
-            .arg("--config")
-            .arg(&config)
+            .arg("--store")
+            .arg(&graph_uri)
             .arg("--query")
             .arg("test.gq")
-            .arg("--name")
             .arg("get_person")
             .arg("--params")
             .arg(r#"{"name":"Alice"}"#)
@@ -730,8 +667,8 @@ policy: {{}}
         cli()
             .current_dir(query_root)
             .arg("snapshot")
-            .arg("--config")
-            .arg(&config)
+            .arg("--store")
+            .arg(&graph_uri)
             .arg("--json"),
     ));
     assert!(snapshot["tables"].is_array());
@@ -779,6 +716,7 @@ fn local_cli_failed_change_keeps_target_state_unchanged() {
     let output = output_failure(
         cli()
             .arg("change")
+            .arg("--store")
             .arg(graph.path())
             .arg("--query")
             .arg(&mutation_file)
@@ -791,10 +729,10 @@ fn local_cli_failed_change_keeps_target_state_unchanged() {
     let friends_payload = parse_stdout_json(&output_success(
         cli()
             .arg("read")
+            .arg("--store")
             .arg(graph.path())
             .arg("--query")
             .arg(fixture("test.gq"))
-            .arg("--name")
             .arg("friends_of")
             .arg("--params")
             .arg(r#"{"name":"Alice"}"#)
@@ -806,36 +744,22 @@ fn local_cli_failed_change_keeps_target_state_unchanged() {
 }
 
 #[test]
-fn local_cli_resolves_relative_query_against_config_base_dir() {
+fn local_cli_resolves_relative_query_cwd_relative() {
+    // RFC-011: omnigraph.yaml `query.roots` search is gone — a `--query`
+    // path is resolved plainly relative to the process cwd. This pins that
+    // a bare relative `.gq` filename resolves against `.current_dir`, and
+    // that the file actually read is the cwd-local one (a same-named query
+    // elsewhere with different columns is never picked up).
     let graph = SystemGraph::loaded();
     let root = graph.path().parent().unwrap();
-    let config_dir = root.join("config");
-    let query_dir = config_dir.join("queries");
-    let ambient_dir = root.join("ambient");
-    fs::create_dir_all(&query_dir).unwrap();
-    fs::create_dir_all(&ambient_dir).unwrap();
+    let cwd_dir = root.join("cwd");
+    let other_dir = root.join("other");
+    fs::create_dir_all(&cwd_dir).unwrap();
+    fs::create_dir_all(&other_dir).unwrap();
 
-    let config = config_dir.join("omnigraph.yaml");
-    write_config(
-        &config,
-        &format!(
-            "\
-graphs:
-  local:
-    uri: '{}'
-cli:
-  graph: local
-  branch: main
-query:
-  roots:
-    - queries
-policy: {{}}
-",
-            graph.path().display()
-        ),
-    );
+    // The query in the cwd projects (age, name).
     write_query_file(
-        &query_dir.join("local.gq"),
+        &cwd_dir.join("local.gq"),
         r#"
 query get_person($name: String) {
     match {
@@ -845,8 +769,10 @@ query get_person($name: String) {
 }
 "#,
     );
+    // A same-named query elsewhere projects only (name): if cwd-relative
+    // resolution regressed and picked this up, the columns assert fails.
     write_query_file(
-        &ambient_dir.join("local.gq"),
+        &other_dir.join("local.gq"),
         r#"
 query get_person($name: String) {
     match {
@@ -859,13 +785,12 @@ query get_person($name: String) {
 
     let payload = parse_stdout_json(&output_success(
         cli()
-            .current_dir(&ambient_dir)
+            .current_dir(&cwd_dir)
             .arg("read")
-            .arg("--config")
-            .arg(&config)
+            .arg("--store")
+            .arg(graph.path())
             .arg("--query")
             .arg("local.gq")
-            .arg("--name")
             .arg("get_person")
             .arg("--params")
             .arg(r#"{"name":"Alice"}"#)
@@ -974,10 +899,10 @@ query get_task($slug: String) {
     let filtered = parse_stdout_json(&output_success(
         cli()
             .arg("read")
+            .arg("--store")
             .arg(&graph)
             .arg("--query")
             .arg(&queries)
-            .arg("--name")
             .arg("due_with_tag")
             .arg("--params")
             .arg(r#"{"deadline":"2026-04-02T00:00:00Z","tag":"launch"}"#)
@@ -999,10 +924,10 @@ query get_task($slug: String) {
     let insert_payload = parse_stdout_json(&output_success(
         cli()
             .arg("change")
+            .arg("--store")
             .arg(&graph)
             .arg("--query")
             .arg(&queries)
-            .arg("--name")
             .arg("insert_task")
             .arg("--params")
             .arg(
@@ -1015,10 +940,10 @@ query get_task($slug: String) {
     let update_payload = parse_stdout_json(&output_success(
         cli()
             .arg("change")
+            .arg("--store")
             .arg(&graph)
             .arg("--query")
             .arg(&queries)
-            .arg("--name")
             .arg("update_task")
             .arg("--params")
             .arg(r#"{"slug":"gamma","due_at":"2026-04-04T10:45:00Z","tags":["embed","released"],"scores":[13,21],"active_days":["2026-04-04","2026-04-05"]}"#)
@@ -1029,10 +954,10 @@ query get_task($slug: String) {
     let gamma = parse_stdout_json(&output_success(
         cli()
             .arg("read")
+            .arg("--store")
             .arg(&graph)
             .arg("--query")
             .arg(&queries)
-            .arg("--name")
             .arg("get_task")
             .arg("--params")
             .arg(r#"{"slug":"gamma"}"#)
@@ -1117,10 +1042,10 @@ query vector_search($q: String) {
             .env("OMNIGRAPH_EMBED_PROVIDER", "gemini")
             .env("OMNIGRAPH_EMBED_MODEL", "gemini-embedding-2-preview")
             .arg("read")
+            .arg("--store")
             .arg(&graph)
             .arg("--query")
             .arg(&queries)
-            .arg("--name")
             .arg("vector_search")
             .arg("--params")
             .arg(r#"{"q":"alpha"}"#)
@@ -1141,122 +1066,145 @@ query vector_search($q: String) {
 
 #[test]
 fn local_cli_policy_tooling_is_end_to_end() {
-    // Sanity check for the read-only policy CLI surfaces. These don't
-    // mutate the graph; they parse and evaluate the effective policy for
-    // named graph selections, including per-graph policy files.
-    let graph = SystemGraph::loaded();
-    let config = graph.write_config("omnigraph-policy.yaml", &local_policy_config(&graph));
-    let server_graph_config = graph.write_config(
-        "omnigraph-policy-server.yaml",
-        &local_policy_server_graph_config(&graph),
+    // RFC-011: the read-only policy CLI surfaces source the bundle from a
+    // cluster's applied policies (`--cluster <dir>` + `--graph <id>`), not
+    // from an omnigraph.yaml `graphs:` map. These don't mutate the graph;
+    // they parse and evaluate the effective bundle bound to the graph.
+    let cluster = converged_loaded_cluster("knowledge", Some(POLICY_E2E_YAML));
+    // `policy test` has no per-bundle tests file in the cluster model, so
+    // the cases are supplied explicitly via `--tests`.
+    let tests_file = cluster.path().join("policy.tests.yaml");
+    fs::write(&tests_file, POLICY_E2E_TESTS_YAML).unwrap();
+
+    let validate = output_success(
+        cli()
+            .arg("policy")
+            .arg("validate")
+            .arg("--cluster")
+            .arg(cluster.path())
+            .arg("--graph")
+            .arg("knowledge"),
     );
-    graph.write_config("policy.yaml", POLICY_E2E_YAML);
-    graph.write_config("policy.tests.yaml", POLICY_E2E_TESTS_YAML);
+    assert!(stdout_string(&validate).contains("policy valid:"));
 
-    for config in [&config, &server_graph_config] {
-        let validate = output_success(
-            cli()
-                .arg("policy")
-                .arg("validate")
-                .arg("--config")
-                .arg(config),
-        );
-        assert!(stdout_string(&validate).contains("policy valid:"));
+    let tests = output_success(
+        cli()
+            .arg("policy")
+            .arg("test")
+            .arg("--cluster")
+            .arg(cluster.path())
+            .arg("--graph")
+            .arg("knowledge")
+            .arg("--tests")
+            .arg(&tests_file),
+    );
+    assert!(stdout_string(&tests).contains("policy tests passed: 2 cases"));
 
-        let tests = output_success(cli().arg("policy").arg("test").arg("--config").arg(config));
-        assert!(stdout_string(&tests).contains("policy tests passed: 2 cases"));
-
-        let explain = output_success(
-            cli()
-                .arg("policy")
-                .arg("explain")
-                .arg("--config")
-                .arg(config)
-                .arg("--actor")
-                .arg("act-bruno")
-                .arg("--action")
-                .arg("change")
-                .arg("--branch")
-                .arg("main"),
-        );
-        let explain_stdout = stdout_string(&explain);
-        assert!(explain_stdout.contains("decision: deny"));
-        assert!(explain_stdout.contains("branch: main"));
-    }
+    let explain = output_success(
+        cli()
+            .arg("policy")
+            .arg("explain")
+            .arg("--cluster")
+            .arg(cluster.path())
+            .arg("--graph")
+            .arg("knowledge")
+            .arg("--actor")
+            .arg("act-bruno")
+            .arg("--action")
+            .arg("change")
+            .arg("--branch")
+            .arg("main"),
+    );
+    let explain_stdout = stdout_string(&explain);
+    assert!(explain_stdout.contains("decision: deny"));
+    assert!(explain_stdout.contains("branch: main"));
 }
+
+/// Token→actor map for the served-policy tests: the bearer tokens the
+/// cluster server resolves to `act-bruno` / `act-ragnor`.
+const POLICY_TOKENS_JSON: &str = r#"{"act-bruno":"bruno-tok","act-ragnor":"ragnor-tok"}"#;
 
 #[test]
 fn local_cli_change_enforces_engine_layer_policy() {
-    // Asserts MR-722 PR #4: when the selected graph has a configured
-    // policy file, the CLI loads PolicyEngine into Omnigraph and every
-    // direct-engine write hits `enforce(action, scope, actor)` — identical
-    // to what the HTTP server gets, regardless of transport.
+    // RFC-011: a CLI direct-store write carries NO policy — policy lives in
+    // the cluster/server. So engine-layer policy on a direct write no longer
+    // exists; this test asserts the faithful migration: the SERVER enforces
+    // the bundle bound to the served graph, addressed via `--server --graph`
+    // with a bearer token that resolves to the actor.
     //
     // Three cases, each discriminating:
     //
-    // 1. Policy installed, no actor source (no `cli.actor` in config,
-    //    no `--as` flag) → engine-layer footgun guard fires; CLI exits
-    //    non-zero with a "no actor" message. Silent bypass is the bug
-    //    PR #4 prevents.
-    // 2. Policy installed, `--as act-bruno`, change on main → Cedar
-    //    denies (bruno can change unprotected branches; main is
-    //    protected). CLI exits non-zero with a "denied" message.
-    // 3. Policy installed, `--as act-ragnor`, change on main →
-    //    Cedar permits (admins-write rule). Write succeeds and the
-    //    inserted row is readable.
-    let graph = SystemGraph::loaded();
-    let config = graph.write_config("omnigraph-policy.yaml", &local_policy_config(&graph));
-    graph.write_config("policy.yaml", POLICY_E2E_YAML);
-    let mutation_file = insert_person_query(&graph, "system-local-policy-change.gq");
-
-    // Case 1: policy configured, no actor threaded → footgun guard.
-    let no_actor = output_failure(
-        cli()
-            .arg("change")
-            .arg("--config")
-            .arg(&config)
-            .arg("--query")
-            .arg(&mutation_file)
-            .arg("--params")
-            .arg(r#"{"name":"NoActorPerson","age":1}"#)
-            .arg("--json"),
+    // 1. No token → the server refuses (401, unauthenticated). The old
+    //    embedded "no actor" footgun does not apply to the served path
+    //    (the actor comes from the token), so this replaces it.
+    // 2. bruno token, change on protected main → Cedar denies (bruno can
+    //    change unprotected branches; main is protected). Non-zero exit,
+    //    "denied" surfaced from the server error body.
+    // 3. ragnor token, change on main → Cedar permits (admins-write). Write
+    //    succeeds and the inserted row is readable.
+    if skip_system_e2e("local_cli_change_enforces_engine_layer_policy") {
+        return;
+    }
+    let cluster = converged_loaded_cluster("knowledge", Some(POLICY_E2E_YAML));
+    let server = spawn_server_with_cluster_env(
+        cluster.path(),
+        &[("OMNIGRAPH_SERVER_BEARER_TOKENS_JSON", POLICY_TOKENS_JSON)],
     );
-    let no_actor_stderr = String::from_utf8_lossy(&no_actor.stderr);
+    let insert =
+        "query add($name: String, $age: I32) { insert Person { name: $name, age: $age } }";
+
+    // Case 1: no token → the server refuses before any policy check.
+    let no_token = cli()
+        .arg("change")
+        .arg("--server")
+        .arg(&server.base_url)
+        .arg("--graph")
+        .arg("knowledge")
+        .arg("-e")
+        .arg(insert)
+        .arg("--params")
+        .arg(r#"{"name":"NoTokenPerson","age":1}"#)
+        .arg("--json")
+        .output()
+        .unwrap();
     assert!(
-        no_actor_stderr.contains("no actor"),
-        "expected 'no actor' footgun message, got stderr: {no_actor_stderr}"
+        !no_token.status.success(),
+        "unauthenticated served write must be refused: {no_token:?}"
     );
 
-    // Case 2: `--as act-bruno` against protected main → denied.
-    let denied = output_failure(
-        cli()
-            .arg("--as")
-            .arg("act-bruno")
-            .arg("change")
-            .arg("--config")
-            .arg(&config)
-            .arg("--query")
-            .arg(&mutation_file)
-            .arg("--params")
-            .arg(r#"{"name":"BrunoOnMain","age":2}"#)
-            .arg("--json"),
-    );
+    // Case 2: bruno token against protected main → denied by the server.
+    let denied = cli()
+        .env("OMNIGRAPH_BEARER_TOKEN", "bruno-tok")
+        .arg("change")
+        .arg("--server")
+        .arg(&server.base_url)
+        .arg("--graph")
+        .arg("knowledge")
+        .arg("-e")
+        .arg(insert)
+        .arg("--params")
+        .arg(r#"{"name":"BrunoOnMain","age":2}"#)
+        .arg("--json")
+        .output()
+        .unwrap();
+    assert!(!denied.status.success(), "bruno/main must be denied");
     let denied_stderr = String::from_utf8_lossy(&denied.stderr);
     assert!(
         denied_stderr.contains("denied"),
         "expected 'denied' message for bruno/main, got stderr: {denied_stderr}"
     );
 
-    // Case 3: `--as act-ragnor` against main → permitted by admins-write.
+    // Case 3: ragnor token against main → permitted by admins-write.
     let allowed = parse_stdout_json(&output_success(
         cli()
-            .arg("--as")
-            .arg("act-ragnor")
+            .env("OMNIGRAPH_BEARER_TOKEN", "ragnor-tok")
             .arg("change")
-            .arg("--config")
-            .arg(&config)
-            .arg("--query")
-            .arg(&mutation_file)
+            .arg("--server")
+            .arg(&server.base_url)
+            .arg("--graph")
+            .arg("knowledge")
+            .arg("-e")
+            .arg(insert)
             .arg("--params")
             .arg(r#"{"name":"RagnorOnMain","age":3}"#)
             .arg("--json"),
@@ -1266,14 +1214,19 @@ fn local_cli_change_enforces_engine_layer_policy() {
     assert_eq!(allowed["actor_id"], "act-ragnor");
 
     // Verify the row landed — proves the write actually committed, not
-    // just that enforce returned Ok and silently dropped the work.
+    // just that enforce returned Ok and silently dropped the work. The read
+    // uses the bruno token: POLICY_E2E_YAML grants `read` to the `team`
+    // group (bruno), while admins (ragnor) get write-only rules.
     let verify = parse_stdout_json(&output_success(
         cli()
+            .env("OMNIGRAPH_BEARER_TOKEN", "bruno-tok")
             .arg("read")
-            .arg(graph.path())
+            .arg("--server")
+            .arg(&server.base_url)
+            .arg("--graph")
+            .arg("knowledge")
             .arg("--query")
             .arg(fixture("test.gq"))
-            .arg("--name")
             .arg("get_person")
             .arg("--params")
             .arg(r#"{"name":"RagnorOnMain"}"#)
@@ -1284,27 +1237,30 @@ fn local_cli_change_enforces_engine_layer_policy() {
 }
 
 #[test]
-fn local_cli_positional_uri_does_not_inherit_default_graph_policy() {
+fn local_cli_direct_store_write_is_unpoliced_regardless_of_actor() {
+    // RFC-011: a direct (`--store`) write carries no Cedar policy at all —
+    // policy lives in the cluster/server. So a write that the SERVED path
+    // would deny (bruno changing protected main) succeeds on the direct
+    // path, regardless of the actor. This is the faithful replacement for
+    // the obsolete `..._positional_uri_does_not_inherit_default_graph_policy`
+    // premise: a positional/`--store` address has no policy to inherit.
     let graph = SystemGraph::loaded();
-    let config = graph.write_config("omnigraph-policy.yaml", &local_policy_config(&graph));
-    graph.write_config("policy.yaml", POLICY_E2E_YAML);
-    let mutation_file = insert_person_query(&graph, "system-local-policy-positional.gq");
+    let mutation_file = insert_person_query(&graph, "system-local-policy-direct.gq");
 
     let allowed = parse_stdout_json(&output_success(
         cli()
             .arg("--as")
             .arg("act-bruno")
             .arg("change")
-            .arg("--config")
-            .arg(&config)
-            .arg("--uri")
+            .arg("--store")
             .arg(graph.path())
             .arg("--query")
             .arg(&mutation_file)
             .arg("--params")
-            .arg(r#"{"name":"PositionalUriBruno","age":4}"#)
+            .arg(r#"{"name":"DirectStoreBruno","age":4}"#)
             .arg("--json"),
     ));
+    assert_eq!(allowed["branch"], "main");
     assert_eq!(allowed["affected_nodes"], 1);
     assert_eq!(allowed["actor_id"], "act-bruno");
 }
@@ -1322,28 +1278,44 @@ fn local_cli_positional_uri_does_not_inherit_default_graph_policy() {
 
 #[test]
 fn local_cli_load_enforces_engine_layer_policy() {
-    let graph = SystemGraph::loaded();
-    let config = graph.write_config("omnigraph-policy.yaml", &local_policy_config(&graph));
-    graph.write_config("policy.yaml", POLICY_E2E_YAML);
-    let data = graph.write_jsonl(
-        "system-local-policy-load.jsonl",
-        r#"{"type":"Person","data":{"name":"LoadPolicy","age":11}}"#,
+    // RFC-011 served re-point: the server enforces the graph-bound bundle on
+    // a remote load. A load into protected main is a `change`: bruno
+    // (team-write-unprotected) is denied, ragnor (admins-write) is allowed.
+    if skip_system_e2e("local_cli_load_enforces_engine_layer_policy") {
+        return;
+    }
+    let cluster = converged_loaded_cluster("knowledge", Some(POLICY_E2E_YAML));
+    let server = spawn_server_with_cluster_env(
+        cluster.path(),
+        &[("OMNIGRAPH_SERVER_BEARER_TOKENS_JSON", POLICY_TOKENS_JSON)],
     );
+    let temp = tempfile::tempdir().unwrap();
+    let data = temp.path().join("policy-load.jsonl");
+    fs::write(
+        &data,
+        r#"{"type":"Person","data":{"name":"LoadPolicy","age":11}}"#,
+    )
+    .unwrap();
 
     // act-bruno: change-on-protected is denied (team-write-unprotected only).
-    let denied = output_failure(
-        cli()
-            .arg("--as")
-            .arg("act-bruno")
-            .arg("load")
-            .arg("--mode")
-            .arg("overwrite")
-            .arg("--config")
-            .arg(&config)
-            .arg("--data")
-            .arg(&data)
-            .arg("--json"),
-    );
+    let denied = cli()
+        .env("OMNIGRAPH_BEARER_TOKEN", "bruno-tok")
+        .arg("load")
+        .arg("--mode")
+        .arg("overwrite")
+        // `--yes` clears the RFC-011 Decision 9 destructive-write confirmation
+        // so the policy check (not the confirmation refusal) is what denies.
+        .arg("--yes")
+        .arg("--server")
+        .arg(&server.base_url)
+        .arg("--graph")
+        .arg("knowledge")
+        .arg("--data")
+        .arg(&data)
+        .arg("--json")
+        .output()
+        .unwrap();
+    assert!(!denied.status.success(), "bruno/main load must be denied");
     let stderr = String::from_utf8_lossy(&denied.stderr);
     assert!(
         stderr.contains("denied"),
@@ -1353,13 +1325,15 @@ fn local_cli_load_enforces_engine_layer_policy() {
     // act-ragnor: admins-write rule permits change anywhere.
     let allowed = parse_stdout_json(&output_success(
         cli()
-            .arg("--as")
-            .arg("act-ragnor")
+            .env("OMNIGRAPH_BEARER_TOKEN", "ragnor-tok")
             .arg("load")
             .arg("--mode")
             .arg("overwrite")
-            .arg("--config")
-            .arg(&config)
+            .arg("--yes")
+            .arg("--server")
+            .arg(&server.base_url)
+            .arg("--graph")
+            .arg("knowledge")
             .arg("--data")
             .arg(&data)
             .arg("--json"),
@@ -1370,47 +1344,55 @@ fn local_cli_load_enforces_engine_layer_policy() {
 
 #[test]
 fn local_cli_ingest_enforces_engine_layer_policy() {
-    let graph = SystemGraph::loaded();
-    let config = graph.write_config("omnigraph-policy.yaml", &local_policy_config(&graph));
-    graph.write_config("policy.yaml", POLICY_E2E_YAML);
-    let data = graph.write_jsonl(
-        "system-local-policy-ingest.jsonl",
+    // RFC-011 served re-point: ingest into a new branch requires both
+    // BranchCreate and Change. Bruno has change-unprotected only (no
+    // branch-ops) — either gate denies. Ragnor has admins-write +
+    // admins-branch-ops — both fire as ingest creates the branch + loads.
+    if skip_system_e2e("local_cli_ingest_enforces_engine_layer_policy") {
+        return;
+    }
+    let cluster = converged_loaded_cluster("knowledge", Some(POLICY_E2E_YAML));
+    let server = spawn_server_with_cluster_env(
+        cluster.path(),
+        &[("OMNIGRAPH_SERVER_BEARER_TOKENS_JSON", POLICY_TOKENS_JSON)],
+    );
+    let temp = tempfile::tempdir().unwrap();
+    let data = temp.path().join("policy-ingest.jsonl");
+    fs::write(
+        &data,
         r#"{"type":"Person","data":{"name":"IngestPolicy","age":12}}"#,
-    );
+    )
+    .unwrap();
 
-    // act-bruno: ingest into a new branch requires both BranchCreate and
-    // Change. Bruno has change-unprotected only, and the implicit
-    // branch_create fires first when the target branch doesn't exist.
-    // Either gate is enough to deny — assert denial without pinning
-    // which one fires first.
-    let denied = output_failure(
-        cli()
-            .arg("--as")
-            .arg("act-bruno")
-            .arg("ingest")
-            .arg("--config")
-            .arg(&config)
-            .arg("--data")
-            .arg(&data)
-            .arg("--branch")
-            .arg("policy-ingest-feature")
-            .arg("--json"),
-    );
+    let denied = cli()
+        .env("OMNIGRAPH_BEARER_TOKEN", "bruno-tok")
+        .arg("ingest")
+        .arg("--server")
+        .arg(&server.base_url)
+        .arg("--graph")
+        .arg("knowledge")
+        .arg("--data")
+        .arg(&data)
+        .arg("--branch")
+        .arg("policy-ingest-feature")
+        .arg("--json")
+        .output()
+        .unwrap();
+    assert!(!denied.status.success(), "bruno ingest must be denied");
     let stderr = String::from_utf8_lossy(&denied.stderr);
     assert!(
         stderr.contains("denied"),
         "expected 'denied' for bruno ingest, got: {stderr}"
     );
 
-    // act-ragnor: admins-write covers Change, admins-branch-ops covers
-    // BranchCreate. Both fire as ingest creates the branch + loads.
     let allowed = parse_stdout_json(&output_success(
         cli()
-            .arg("--as")
-            .arg("act-ragnor")
+            .env("OMNIGRAPH_BEARER_TOKEN", "ragnor-tok")
             .arg("ingest")
-            .arg("--config")
-            .arg(&config)
+            .arg("--server")
+            .arg(&server.base_url)
+            .arg("--graph")
+            .arg("knowledge")
             .arg("--data")
             .arg(&data)
             .arg("--branch")
@@ -1422,129 +1404,32 @@ fn local_cli_ingest_enforces_engine_layer_policy() {
 }
 
 #[test]
-fn local_cli_schema_apply_enforces_engine_layer_policy() {
-    let graph = SystemGraph::loaded();
-    let config = graph.write_config("omnigraph-policy.yaml", &local_policy_config(&graph));
-    graph.write_config("policy.yaml", POLICY_E2E_YAML);
-
-    // Additive: add a nullable property; SDK-compatible with the fixture
-    // schema. Uses the schema-apply scope (TargetBranch("main")).
-    let new_schema = std::fs::read_to_string(fixture("test.pg"))
-        .unwrap()
-        .replace(
-            "    age: I32?\n}",
-            "    age: I32?\n    nickname: String?\n}",
-        );
-    let schema_path = graph.path().join("policy-additive.pg");
-    std::fs::write(&schema_path, &new_schema).unwrap();
-
-    let denied = output_failure(
-        cli()
-            .arg("--as")
-            .arg("act-bruno")
-            .arg("schema")
-            .arg("apply")
-            .arg("--config")
-            .arg(&config)
-            .arg("--schema")
-            .arg(&schema_path)
-            .arg("--json"),
-    );
-    let stderr = String::from_utf8_lossy(&denied.stderr);
-    assert!(
-        stderr.contains("denied"),
-        "expected 'denied' for bruno schema apply, got: {stderr}"
-    );
-
-    let allowed = parse_stdout_json(&output_success(
-        cli()
-            .arg("--as")
-            .arg("act-ragnor")
-            .arg("schema")
-            .arg("apply")
-            .arg("--config")
-            .arg(&config)
-            .arg("--schema")
-            .arg(&schema_path)
-            .arg("--json"),
-    ));
-    assert_eq!(allowed["applied"], true);
-}
-
-#[test]
-fn local_cli_schema_apply_rejects_stored_query_breakage_before_publish() {
-    let graph = SystemGraph::loaded();
-    graph.write_query(
-        "stored-find-person.gq",
-        "query find_person($name: String) { match { $p: Person { name: $name } } return { $p.age } }",
-    );
-    let config = graph.write_config(
-        "omnigraph-stored-query-schema.yaml",
-        &format!(
-            "\
-graphs:
-  local:
-    uri: {}
-    queries:
-      find_person:
-        file: ./stored-find-person.gq
-cli:
-  graph: local
-  branch: main
-query:
-  roots:
-    - .
-policy: {{}}
-",
-            yaml_string(&graph.path().to_string_lossy())
-        ),
-    );
-    let renamed_schema = std::fs::read_to_string(fixture("test.pg"))
-        .unwrap()
-        .replace("age: I32?", "years: I32? @rename_from(\"age\")");
-    let schema_path = graph.write_file("stored-query-breaks.pg", &renamed_schema);
-
-    let rejected = output_failure(
-        cli()
-            .arg("schema")
-            .arg("apply")
-            .arg("--config")
-            .arg(&config)
-            .arg("--schema")
-            .arg(&schema_path)
-            .arg("--json"),
-    );
-    let stderr = String::from_utf8_lossy(&rejected.stderr);
-    assert!(
-        stderr.contains("find_person") && stderr.contains("schema check"),
-        "schema apply should reject the stored-query breakage before publish; stderr: {stderr}"
-    );
-
-    let schema = stdout_string(&output_success(
-        cli().arg("schema").arg("show").arg("--config").arg(&config),
-    ));
-    assert!(schema.contains("age: I32?"));
-    assert!(!schema.contains("years: I32?"));
-}
-
-#[test]
 fn local_cli_branch_create_enforces_engine_layer_policy() {
-    let graph = SystemGraph::loaded();
-    let config = graph.write_config("omnigraph-policy.yaml", &local_policy_config(&graph));
-    graph.write_config("policy.yaml", POLICY_E2E_YAML);
-
-    let denied = output_failure(
-        cli()
-            .arg("--as")
-            .arg("act-bruno")
-            .arg("branch")
-            .arg("create")
-            .arg("--config")
-            .arg(&config)
-            .arg("--from")
-            .arg("main")
-            .arg("bruno-feature"),
+    // RFC-011 served re-point: bruno has no branch-ops rule → denied;
+    // ragnor has admins-branch-ops → allowed.
+    if skip_system_e2e("local_cli_branch_create_enforces_engine_layer_policy") {
+        return;
+    }
+    let cluster = converged_loaded_cluster("knowledge", Some(POLICY_E2E_YAML));
+    let server = spawn_server_with_cluster_env(
+        cluster.path(),
+        &[("OMNIGRAPH_SERVER_BEARER_TOKENS_JSON", POLICY_TOKENS_JSON)],
     );
+
+    let denied = cli()
+        .env("OMNIGRAPH_BEARER_TOKEN", "bruno-tok")
+        .arg("branch")
+        .arg("create")
+        .arg("--server")
+        .arg(&server.base_url)
+        .arg("--graph")
+        .arg("knowledge")
+        .arg("--from")
+        .arg("main")
+        .arg("bruno-feature")
+        .output()
+        .unwrap();
+    assert!(!denied.status.success(), "bruno branch create must be denied");
     let stderr = String::from_utf8_lossy(&denied.stderr);
     assert!(
         stderr.contains("denied"),
@@ -1553,12 +1438,13 @@ fn local_cli_branch_create_enforces_engine_layer_policy() {
 
     output_success(
         cli()
-            .arg("--as")
-            .arg("act-ragnor")
+            .env("OMNIGRAPH_BEARER_TOKEN", "ragnor-tok")
             .arg("branch")
             .arg("create")
-            .arg("--config")
-            .arg(&config)
+            .arg("--server")
+            .arg(&server.base_url)
+            .arg("--graph")
+            .arg("knowledge")
             .arg("--from")
             .arg("main")
             .arg("ragnor-feature"),
@@ -1567,34 +1453,47 @@ fn local_cli_branch_create_enforces_engine_layer_policy() {
 
 #[test]
 fn local_cli_branch_delete_enforces_engine_layer_policy() {
-    let graph = SystemGraph::loaded();
-    let config = graph.write_config("omnigraph-policy.yaml", &local_policy_config(&graph));
-    graph.write_config("policy.yaml", POLICY_E2E_YAML);
+    // RFC-011 served re-point: bruno has no branch-ops rule → denied;
+    // ragnor has admins-branch-ops → allowed.
+    if skip_system_e2e("local_cli_branch_delete_enforces_engine_layer_policy") {
+        return;
+    }
+    let cluster = converged_loaded_cluster("knowledge", Some(POLICY_E2E_YAML));
+    let server = spawn_server_with_cluster_env(
+        cluster.path(),
+        &[("OMNIGRAPH_SERVER_BEARER_TOKENS_JSON", POLICY_TOKENS_JSON)],
+    );
 
     // Pre-create the branch as ragnor so there's something to delete.
     output_success(
         cli()
-            .arg("--as")
-            .arg("act-ragnor")
+            .env("OMNIGRAPH_BEARER_TOKEN", "ragnor-tok")
             .arg("branch")
             .arg("create")
-            .arg("--config")
-            .arg(&config)
+            .arg("--server")
+            .arg(&server.base_url)
+            .arg("--graph")
+            .arg("knowledge")
             .arg("--from")
             .arg("main")
             .arg("doomed"),
     );
 
-    let denied = output_failure(
-        cli()
-            .arg("--as")
-            .arg("act-bruno")
-            .arg("branch")
-            .arg("delete")
-            .arg("--config")
-            .arg(&config)
-            .arg("doomed"),
-    );
+    // `--yes` clears the RFC-011 Decision 9 destructive-write confirmation so
+    // the policy check (not the confirmation refusal) is what denies.
+    let denied = cli()
+        .env("OMNIGRAPH_BEARER_TOKEN", "bruno-tok")
+        .arg("branch")
+        .arg("delete")
+        .arg("--yes")
+        .arg("--server")
+        .arg(&server.base_url)
+        .arg("--graph")
+        .arg("knowledge")
+        .arg("doomed")
+        .output()
+        .unwrap();
+    assert!(!denied.status.success(), "bruno branch delete must be denied");
     let stderr = String::from_utf8_lossy(&denied.stderr);
     assert!(
         stderr.contains("denied"),
@@ -1603,48 +1502,61 @@ fn local_cli_branch_delete_enforces_engine_layer_policy() {
 
     output_success(
         cli()
-            .arg("--as")
-            .arg("act-ragnor")
+            .env("OMNIGRAPH_BEARER_TOKEN", "ragnor-tok")
             .arg("branch")
             .arg("delete")
-            .arg("--config")
-            .arg(&config)
+            .arg("--yes")
+            .arg("--server")
+            .arg(&server.base_url)
+            .arg("--graph")
+            .arg("knowledge")
             .arg("doomed"),
     );
 }
 
 #[test]
 fn local_cli_branch_merge_enforces_engine_layer_policy() {
-    let graph = SystemGraph::loaded();
-    let config = graph.write_config("omnigraph-policy.yaml", &local_policy_config(&graph));
-    graph.write_config("policy.yaml", POLICY_E2E_YAML);
+    // RFC-011 served re-point: merging into protected main needs
+    // branch_merge with target_branch_scope protected. bruno has no such
+    // rule → denied; ragnor has admins-promote → allowed.
+    if skip_system_e2e("local_cli_branch_merge_enforces_engine_layer_policy") {
+        return;
+    }
+    let cluster = converged_loaded_cluster("knowledge", Some(POLICY_E2E_YAML));
+    let server = spawn_server_with_cluster_env(
+        cluster.path(),
+        &[("OMNIGRAPH_SERVER_BEARER_TOKENS_JSON", POLICY_TOKENS_JSON)],
+    );
 
     // Pre-create a feature branch as ragnor (admins-branch-ops covers it).
     output_success(
         cli()
-            .arg("--as")
-            .arg("act-ragnor")
+            .env("OMNIGRAPH_BEARER_TOKEN", "ragnor-tok")
             .arg("branch")
             .arg("create")
-            .arg("--config")
-            .arg(&config)
+            .arg("--server")
+            .arg(&server.base_url)
+            .arg("--graph")
+            .arg("knowledge")
             .arg("--from")
             .arg("main")
             .arg("merge-feature"),
     );
 
-    let denied = output_failure(
-        cli()
-            .arg("--as")
-            .arg("act-bruno")
-            .arg("branch")
-            .arg("merge")
-            .arg("--config")
-            .arg(&config)
-            .arg("merge-feature")
-            .arg("--into")
-            .arg("main"),
-    );
+    let denied = cli()
+        .env("OMNIGRAPH_BEARER_TOKEN", "bruno-tok")
+        .arg("branch")
+        .arg("merge")
+        .arg("--server")
+        .arg(&server.base_url)
+        .arg("--graph")
+        .arg("knowledge")
+        .arg("merge-feature")
+        .arg("--into")
+        .arg("main")
+        .output()
+        .unwrap();
+    assert!(!denied.status.success(), "bruno branch merge must be denied");
     let stderr = String::from_utf8_lossy(&denied.stderr);
     assert!(
         stderr.contains("denied"),
@@ -1653,68 +1565,56 @@ fn local_cli_branch_merge_enforces_engine_layer_policy() {
 
     output_success(
         cli()
-            .arg("--as")
-            .arg("act-ragnor")
+            .env("OMNIGRAPH_BEARER_TOKEN", "ragnor-tok")
             .arg("branch")
             .arg("merge")
-            .arg("--config")
-            .arg(&config)
+            .arg("--server")
+            .arg(&server.base_url)
+            .arg("--graph")
+            .arg("knowledge")
             .arg("merge-feature")
             .arg("--into")
             .arg("main"),
     );
 }
 
-// ─── MR-722 PR A: cli.actor config-only precedence ────────────────────────
+// ─── RFC-011: operator.actor cascade ──────────────────────────────────────
 //
-// The change-writer test above uses `--as` directly. These two tests
-// pin the precedence rule that `main.rs::resolve_cli_actor` implements:
-// `--as` flag > `cli.actor` from `omnigraph.yaml` > None.
+// The CLI actor chain is `--as` > `operator.actor` (in the operator config
+// at $OMNIGRAPH_HOME/config.yaml) > none. These two tests pin that order on
+// a direct (`--store`) write. RFC-011 makes direct-store writes unpoliced,
+// so the assertion is on which `actor_id` the write records, not on a Cedar
+// allow/deny — the actor still has to be resolved correctly and stamped onto
+// the commit.
 
-fn local_policy_config_with_actor(graph: &SystemGraph, actor: &str) -> String {
-    // Mirrors `local_policy_config` but adds `cli.actor` so the
-    // config-only precedence path is exercised. The `cli:` block
-    // already has `graph` and `branch`; appending `actor` here.
-    format!(
-        "\
-project:
-  name: policy-e2e-local
-graphs:
-  local:
-    uri: {}
-    policy:
-      file: ./policy.yaml
-cli:
-  graph: local
-  branch: main
-  actor: {}
-query:
-  roots:
-    - .
-",
-        yaml_string(&graph.path().to_string_lossy()),
-        actor,
+/// An operator config (`$OMNIGRAPH_HOME/config.yaml`) carrying just
+/// `operator.actor`. Pointing OMNIGRAPH_HOME at the holding dir makes the
+/// CLI read it as the operator layer.
+fn operator_home_with_actor(actor: &str) -> tempfile::TempDir {
+    let home = tempfile::tempdir().unwrap();
+    fs::write(
+        home.path().join("config.yaml"),
+        format!("operator:\n  actor: {actor}\n"),
     )
+    .unwrap();
+    home
 }
 
 #[test]
 fn local_cli_actor_from_config_used_when_no_flag() {
-    // cli.actor: act-ragnor in omnigraph.yaml, no --as flag → change
-    // permitted via admins-write rule. Proves the config-only path
-    // works; previously the only proof was structural.
+    // operator.actor: act-ragnor in the operator config, no --as flag →
+    // the write records act-ragnor. Proves the operator-layer actor source
+    // is consulted when `--as` is absent.
     let graph = SystemGraph::loaded();
-    let config = graph.write_config(
-        "omnigraph-policy.yaml",
-        &local_policy_config_with_actor(&graph, "act-ragnor"),
-    );
-    graph.write_config("policy.yaml", POLICY_E2E_YAML);
+    let home = operator_home_with_actor("act-ragnor");
     let mutation_file = insert_person_query(&graph, "system-local-cli-actor.gq");
 
     let allowed = parse_stdout_json(&output_success(
         cli()
+            .env("OMNIGRAPH_HOME", home.path())
             .arg("change")
-            .arg("--config")
-            .arg(&config)
+            .arg("--store")
+            .arg(graph.path())
             .arg("--query")
             .arg(&mutation_file)
             .arg("--params")
@@ -1727,35 +1627,30 @@ fn local_cli_actor_from_config_used_when_no_flag() {
 
 #[test]
 fn local_cli_actor_flag_overrides_config_actor() {
-    // cli.actor: act-ragnor in config + --as act-bruno on CLI → change
-    // denied. Flag wins per the precedence rule. Without this test, a
-    // future change that reverses precedence would ride through silently.
+    // operator.actor: act-ragnor in the config + --as act-bruno on the CLI →
+    // the write records act-bruno. The flag wins per the precedence rule.
+    // Without this test, a future change that reverses precedence would ride
+    // through silently.
     let graph = SystemGraph::loaded();
-    let config = graph.write_config(
-        "omnigraph-policy.yaml",
-        &local_policy_config_with_actor(&graph, "act-ragnor"),
-    );
-    graph.write_config("policy.yaml", POLICY_E2E_YAML);
+    let home = operator_home_with_actor("act-ragnor");
     let mutation_file = insert_person_query(&graph, "system-local-cli-actor-override.gq");
 
-    let denied = output_failure(
+    let overridden = parse_stdout_json(&output_success(
         cli()
+            .env("OMNIGRAPH_HOME", home.path())
             .arg("--as")
             .arg("act-bruno")
             .arg("change")
-            .arg("--config")
-            .arg(&config)
+            .arg("--store")
+            .arg(graph.path())
             .arg("--query")
             .arg(&mutation_file)
             .arg("--params")
             .arg(r#"{"name":"OverrideEve","age":19}"#)
             .arg("--json"),
-    );
-    let stderr = String::from_utf8_lossy(&denied.stderr);
-    assert!(
-        stderr.contains("denied"),
-        "expected 'denied' when --as overrides config to bruno, got: {stderr}"
-    );
+    ));
+    assert_eq!(overridden["affected_nodes"], 1);
+    assert_eq!(overridden["actor_id"], "act-bruno");
 }
 
 /// Phase 5 (RFC-005): "applied means serving" — converge a cluster with the
@@ -2053,22 +1948,16 @@ fn local_cluster_full_lifecycle_declare_serve_evolve_delete() {
     }
 
     // Out-of-band drift: the live graph evolves behind the cluster's back;
-    // refresh observes it, apply converges it back to the declared schema.
-    std::fs::write(
-        dir.join("rogue.pg"),
-        "\nnode Person {\n  name: String @key\n  bio: String?\n  rogue: String?\n}\n",
-    )
-    .unwrap();
-    let output = cli()
-        .arg("schema")
-        .arg("apply")
-        .arg(dir.join("graphs/knowledge.omni"))
-        .arg("--schema")
-        .arg(dir.join("rogue.pg"))
-        .arg("--json")
-        .output()
-        .unwrap();
-    assert!(output.status.success(), "out-of-band schema apply failed");
+    // refresh observes it, apply converges it back to the declared schema. RFC-011
+    // D10 makes the CLI `schema apply` refuse a cluster-managed graph, so a true
+    // bypass is a direct engine apply against the storage root.
+    let rogue_pg = "\nnode Person {\n  name: String @key\n  bio: String?\n  rogue: String?\n}\n";
+    tokio::runtime::Runtime::new().unwrap().block_on(async {
+        let db = Omnigraph::open(dir.join("graphs/knowledge.omni").to_string_lossy().as_ref())
+            .await
+            .unwrap();
+        db.apply_schema(rogue_pg).await.unwrap();
+    });
     let refresh = cluster_cli(dir, &["refresh"]);
     assert_eq!(
         refresh["resource_statuses"]["schema.knowledge"]["status"],
@@ -2321,9 +2210,12 @@ fn cluster_server_boot_ignores_local_config_in_cwd() {
 /// 3), and `logout` revokes.
 #[test]
 fn local_cli_keyed_credentials_authenticate_url_matched_server() {
-    let graph = SystemGraph::loaded();
-    let server = spawn_server_with_env(
-        graph.path(),
+    // RFC-011 cluster-only: the server boots from a converged cluster
+    // serving the fixture graph under id `local`; tokens-only boot is
+    // default-deny, which still permits `read`.
+    let cluster = converged_loaded_cluster("local", None);
+    let server = spawn_server_with_cluster_env(
+        cluster.path(),
         &[("OMNIGRAPH_SERVER_BEARER_TOKEN", "secret-tok")],
     );
     let operator_home = tempfile::tempdir().unwrap();
@@ -2346,9 +2238,10 @@ fn local_cli_keyed_credentials_authenticate_url_matched_server() {
             .arg("read")
             .arg("--server")
             .arg(&server.base_url)
+            .arg("--graph")
+            .arg("local")
             .arg("--query")
             .arg(fixture("test.gq"))
-            .arg("--name")
             .arg("get_person")
             .arg("--params")
             .arg(r#"{"name":"Alice"}"#)
@@ -2435,26 +2328,45 @@ fn local_cli_keyed_credentials_authenticate_url_matched_server() {
 /// stored queries) end to end, with the keyed credential from PR 2.
 #[test]
 fn local_cli_operator_alias_and_server_flag_invoke_stored_query() {
-    let graph = SystemGraph::loaded();
-    graph.write_query(
-        "stored-find-person.gq",
+    // RFC-011 cluster-only: build a converged cluster serving graph `local`
+    // with a stored query `find_person` and a per-graph policy granting the
+    // operator invoke_query + read (invoke_query is policy-gated — anti-probing
+    // 404 without the grant).
+    let cluster = tempfile::tempdir().unwrap();
+    fs::copy(fixture("test.pg"), cluster.path().join("local.pg")).unwrap();
+    fs::write(
+        cluster.path().join("find-person.gq"),
         "query find_person($name: String) { match { $p: Person { name: $name } } return { $p.name } }",
+    )
+    .unwrap();
+    fs::write(
+        cluster.path().join("insert-person.gq"),
+        "query insert_person($name: String) { insert Person { name: $name, age: 41 } }",
+    )
+    .unwrap();
+    fs::write(
+        cluster.path().join("graph.policy.yaml"),
+        "version: 1\ngroups:\n  ops: [\"act-op\"]\nprotected_branches: [main]\nrules:\n  - id: allow-invoke\n    allow:\n      actors: { group: ops }\n      actions: [invoke_query]\n  - id: allow-read\n    allow:\n      actors: { group: ops }\n      actions: [read]\n      branch_scope: any\n  - id: allow-change\n    allow:\n      actors: { group: ops }\n      actions: [change]\n      branch_scope: any\n",
+    )
+    .unwrap();
+    fs::write(
+        cluster.path().join("cluster.yaml"),
+        "version: 1\nmetadata:\n  name: alias-sys\nstate:\n  backend: cluster\n  lock: true\ngraphs:\n  local:\n    schema: ./local.pg\n    queries:\n      find_person:\n        file: ./find-person.gq\n      insert_person:\n        file: ./insert-person.gq\npolicies:\n  graph:\n    file: ./graph.policy.yaml\n    applies_to: [local]\n",
+    )
+    .unwrap();
+    output_success(cli().arg("cluster").arg("import").arg("--config").arg(cluster.path()));
+    output_success(cli().arg("cluster").arg("apply").arg("--config").arg(cluster.path()));
+    output_success(
+        cli()
+            .arg("load")
+            .arg("--data")
+            .arg(fixture("test.jsonl"))
+            .arg("--mode")
+            .arg("overwrite")
+            .arg(cluster.path().join("graphs").join("local.omni")),
     );
-    // invoke_query is policy-gated (anti-probing 404 without the grant),
-    // so the server gets a per-graph bundle granting it to the operator.
-    graph.write_file(
-        "graph.policy.yaml",
-        "version: 1\ngroups:\n  ops: [\"act-op\"]\nprotected_branches: [main]\nrules:\n  - id: allow-invoke\n    allow:\n      actors: { group: ops }\n      actions: [invoke_query]\n  - id: allow-read\n    allow:\n      actors: { group: ops }\n      actions: [read]\n      branch_scope: any\n",
-    );
-    let config = graph.write_config(
-        "omnigraph-server.yaml",
-        &format!(
-            "graphs:\n  local:\n    uri: {}\n    policy:\n      file: ./graph.policy.yaml\n    queries:\n      find_person:\n        file: ./stored-find-person.gq\n",
-            yaml_string(&graph.path().to_string_lossy())
-        ),
-    );
-    let server = spawn_server_with_config_env(
-        &config,
+    let server = spawn_server_with_cluster_env(
+        cluster.path(),
         &[(
             "OMNIGRAPH_SERVER_BEARER_TOKENS_JSON",
             r#"{"act-op":"srv-tok"}"#,
@@ -2465,7 +2377,7 @@ fn local_cli_operator_alias_and_server_flag_invoke_stored_query() {
     fs::write(
         operator_home.path().join("config.yaml"),
         format!(
-            "servers:\n  dev:\n    url: {}\naliases:\n  who:\n    server: dev\n    graph: local\n    query: find_person\n    args: [name]\n",
+            "servers:\n  dev:\n    url: {}\naliases:\n  who:\n    server: dev\n    graph: local\n    query: find_person\n    args: [name]\n  create_person:\n    server: dev\n    graph: local\n    query: insert_person\n    args: [name]\n",
             server.base_url
         ),
     )
@@ -2485,12 +2397,11 @@ fn local_cli_operator_alias_and_server_flag_invoke_stored_query() {
         .unwrap();
     }
 
-    // The operator alias: name + positional arg, nothing else — server,
+    // The operator alias (RFC-011 D4): `alias <name> [args]` — server,
     // graph, stored query, and token all resolve from the operator layer.
     let output = cli()
         .env("OMNIGRAPH_HOME", operator_home.path())
-        .arg("query")
-        .arg("--alias")
+        .arg("alias")
         .arg("who")
         .arg("Alice")
         .arg("--json")
@@ -2502,6 +2413,46 @@ fn local_cli_operator_alias_and_server_flag_invoke_stored_query() {
     );
     let payload: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
     assert_eq!(payload["rows"][0]["p.name"], "Alice", "{payload}");
+
+    // Operator aliases are read-only conveniences: a binding to a stored
+    // mutation must be rejected before the server executes it.
+    let output = cli()
+        .env("OMNIGRAPH_HOME", operator_home.path())
+        .arg("alias")
+        .arg("create_person")
+        .arg("AliasGuardPerson")
+        .output()
+        .unwrap();
+    assert!(!output.status.success(), "mutation alias must fail");
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("'insert_person' is a mutation")
+            && stderr.contains("omnigraph mutate insert_person"),
+        "expected mutation-kind mismatch; got: {stderr}"
+    );
+    let output = cli()
+        .env("OMNIGRAPH_HOME", operator_home.path())
+        .arg("query")
+        .arg("find_person")
+        .arg("--server")
+        .arg("dev")
+        .arg("--graph")
+        .arg("local")
+        .arg("--params")
+        .arg(r#"{"name":"AliasGuardPerson"}"#)
+        .arg("--json")
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "post-alias read should succeed: {output:?}"
+    );
+    let payload: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(
+        payload["rows"].as_array().unwrap().len(),
+        0,
+        "mutation alias must not insert AliasGuardPerson: {payload}"
+    );
 
     // --server/--graph: the same stored query via explicit targeting.
     let output = cli()
@@ -2520,6 +2471,45 @@ fn local_cli_operator_alias_and_server_flag_invoke_stored_query() {
         .unwrap();
     assert!(output.status.success(), "{output:?}");
 
+    // RFC-011 D3: invoke the STORED query by name (catalog lane, served-only).
+    // No `-e`/`--query` — the positional `find_person` is the catalog name.
+    let output = cli()
+        .env("OMNIGRAPH_HOME", operator_home.path())
+        .arg("query")
+        .arg("find_person")
+        .arg("--server")
+        .arg("dev")
+        .arg("--graph")
+        .arg("local")
+        .arg("--params")
+        .arg(r#"{"name":"Alice"}"#)
+        .arg("--json")
+        .output()
+        .unwrap();
+    assert!(output.status.success(), "by-name catalog invocation: {output:?}");
+    let payload: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(payload["rows"][0]["p.name"], "Alice", "{payload}");
+
+    // The verb asserts kind: `mutate <a-read>` is rejected by the server.
+    let output = cli()
+        .env("OMNIGRAPH_HOME", operator_home.path())
+        .arg("mutate")
+        .arg("find_person")
+        .arg("--server")
+        .arg("dev")
+        .arg("--graph")
+        .arg("local")
+        .arg("--params")
+        .arg(r#"{"name":"Alice"}"#)
+        .output()
+        .unwrap();
+    assert!(!output.status.success(), "mutate on a read query must fail");
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("'find_person' is a read — use omnigraph query find_person"),
+        "expected a kind-mismatch error; got: {stderr}"
+    );
+
     // Unknown --server errors listing what IS defined.
     let output = cli()
         .env("OMNIGRAPH_HOME", operator_home.path())
@@ -2534,10 +2524,14 @@ fn local_cli_operator_alias_and_server_flag_invoke_stored_query() {
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert!(stderr.contains("unknown server 'nope'") && stderr.contains("dev"), "{stderr}");
 
-    // --server is exclusive with a positional URI.
+    // --server is exclusive with --store (two ways to address the graph).
+    // (RFC-011 D3: there is no positional URI anymore — the positional is a
+    // query name — so the double-addressing contradiction now surfaces between
+    // the two scope primitives.)
     let output = cli()
         .env("OMNIGRAPH_HOME", operator_home.path())
         .arg("query")
+        .arg("--store")
         .arg(&server.base_url)
         .arg("--server")
         .arg("dev")

@@ -13,13 +13,10 @@ Omnigraph supports two broad deployment shapes:
 
 The server binary and container image expose the same HTTP surface.
 
-The server also has two **boot sources**: `omnigraph.yaml` (graph targets
-declared in the per-operator config) or a **cluster directory**
-(`omnigraph-server --cluster <dir>`), which serves the cluster control
+The server has a single **boot source**: a **cluster directory**
+(`omnigraph-server --cluster <dir | s3://…>`), which serves the cluster control
 plane's applied revision — see
 [cluster-config.md](clusters/config.md#serving-from-the-cluster-the-mode-switch).
-The two are exclusive per deployment; switching is a restart with a different
-flag.
 
 ## Binary Deployment
 
@@ -30,20 +27,25 @@ Build or install:
 
 On Windows, the binaries are `omnigraph.exe` and `omnigraph-server.exe`.
 
-Run against a local graph:
+The server boots from a cluster only (RFC-011) — there is no positional
+`<URI>` / single-graph boot. Point it at a local cluster directory:
 
 ```bash
-omnigraph-server graph.omni --bind 0.0.0.0:8080
+omnigraph-server --cluster ./company-brain --bind 0.0.0.0:8080
 ```
 
-Run against an object-store-backed graph:
+Or boot config-free from an object-storage-rooted cluster:
 
 ```bash
 OMNIGRAPH_SERVER_BEARER_TOKEN="change-me" \
 AWS_REGION="us-east-1" \
-omnigraph-server s3://my-bucket/graphs/example/releases/2026-04-10-v0.1.0 \
+omnigraph-server --cluster s3://my-bucket/clusters/company-brain \
   --bind 0.0.0.0:8080
 ```
+
+The server serves every graph in the cluster's applied revision under
+`/graphs/{id}/...`. See [clusters](clusters/index.md) for authoring and
+applying a cluster.
 
 ## Cluster Mode in Containers (AWS, Railway)
 
@@ -80,10 +82,8 @@ docker run -d \
   -p 8080:8080 <image>
 ```
 
-`OMNIGRAPH_CLUSTER` is exclusive: combining it with `OMNIGRAPH_TARGET_URI`,
-`OMNIGRAPH_CONFIG`, or `OMNIGRAPH_TARGET` fails fast (exit 64), the same
-rule the server itself enforces. The image also ships the `omnigraph` CLI,
-so the day-2 loop runs in-container with no `omnigraph.yaml`:
+`OMNIGRAPH_CLUSTER` is the server's only boot source. The image also
+ships the `omnigraph` CLI, so the day-2 loop runs in-container:
 
 ```bash
 docker exec -it <container> sh -c \
@@ -104,10 +104,10 @@ docker exec -it <container> sh -c \
    `omnigraph cluster apply --as <you> --config /var/lib/omnigraph/cluster`
    → force a new deployment (restart).
 
-For a deployment that doesn't need the cluster control plane, the classic
-stateless shape — `OMNIGRAPH_TARGET_URI=s3://bucket/graph.omni`, no volume —
-remains the simplest AWS architecture (see Binary/Container Deployment
-above).
+For a stateless, volume-free deployment, root the cluster on object
+storage and boot config-free with
+`OMNIGRAPH_CLUSTER=s3://bucket/clusters/<name>` (the bucket-no-volume
+shape above) — the simplest AWS architecture.
 
 ### Railway
 
@@ -181,23 +181,24 @@ Build the image:
 docker build -t omnigraph-server:local .
 ```
 
-Run against a local graph:
+The server boots from a cluster only (RFC-011). Run against a cluster
+directory on a mounted volume:
 
 ```bash
 docker run --rm -p 8080:8080 \
-  -v "$PWD/graph.omni:/data/graph.omni" \
+  -v "$PWD/company-brain:/var/lib/omnigraph/cluster" \
   omnigraph-server:local \
-  /data/graph.omni --bind 0.0.0.0:8080
+  --cluster /var/lib/omnigraph/cluster --bind 0.0.0.0:8080
 ```
 
-Run against an S3-backed graph:
+Run config-free against an object-storage-rooted cluster:
 
 ```bash
 docker run --rm -p 8080:8080 \
   -e OMNIGRAPH_SERVER_BEARER_TOKEN="change-me" \
   -e AWS_REGION="us-east-1" \
   omnigraph-server:local \
-  s3://my-bucket/graphs/example/releases/2026-04-10-v0.1.0 \
+  --cluster s3://my-bucket/clusters/company-brain \
   --bind 0.0.0.0:8080
 ```
 
@@ -208,27 +209,14 @@ When no positional args are given, the image entrypoint
 
 | Var | Effect |
 |---|---|
-| `OMNIGRAPH_TARGET_URI` | Graph URI, passed as the positional argument. |
-| `OMNIGRAPH_CONFIG` | Path to an `omnigraph.yaml`, passed as `--config`. Used to supply a `policy.file` (Cedar authorization). The config file and any relative `policy.file` must be mounted into the container. |
-| `OMNIGRAPH_TARGET` | Graph name to select from the config's `graphs:` block (with `OMNIGRAPH_CONFIG`, when no `OMNIGRAPH_TARGET_URI`). |
+| `OMNIGRAPH_CLUSTER` | Cluster boot source — a config directory or a storage-root URI, forwarded as `--cluster`. The only boot source. |
 | `OMNIGRAPH_BIND` | Listen address (default `0.0.0.0:8080`). |
 
-`OMNIGRAPH_TARGET_URI` and `OMNIGRAPH_CONFIG` **compose**: set both to keep the
-graph URI in the env var while loading policy from the config file (the
-positional URI wins over any `graphs:` entry). To enable Cedar policy on a
-container otherwise driven by `OMNIGRAPH_TARGET_URI`, mount the config dir and
-add `OMNIGRAPH_CONFIG`:
-
-```bash
-docker run --rm -p 8080:8080 \
-  -e OMNIGRAPH_SERVER_BEARER_TOKEN="change-me" \
-  -e OMNIGRAPH_TARGET_URI="s3://my-bucket/graphs/example/releases/2026-04-10-v0.1.0" \
-  -e OMNIGRAPH_CONFIG="/etc/omnigraph/omnigraph.yaml" \
-  -v "$PWD/config:/etc/omnigraph:ro" \
-  omnigraph-server:local
-# /etc/omnigraph/omnigraph.yaml contains `policy: { file: policy.yaml }`;
-# policy.yaml (+ optional policy.tests.yaml) sit beside it in the mount.
-```
+Per-graph and server-level Cedar policy come from the cluster's applied
+revision (authored in `cluster.yaml` and published with `cluster apply`),
+not from a separate config file. The cluster docker shapes — volume vs.
+config-free object-storage root — are detailed under
+[Cluster Mode in Containers](#cluster-mode-in-containers-aws-railway) above.
 
 ## Auth
 

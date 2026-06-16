@@ -1540,3 +1540,109 @@ async fn second_sequential_update_on_same_row_succeeds() {
         "Alice's age must reflect the second update"
     );
 }
+
+// An interrupted first-write fork (create_branch succeeded, the manifest
+// publish did not) leaves a fully-formed Lance branch ref on the table that
+// the manifest never references — a "manifest-unreferenced fork". The branch
+// itself stays a valid manifest branch, so `cleanup`'s reconciler (keyed on
+// the manifest branch list) never reclaims it. Today the next write to that
+// table on that branch re-enters the fork path, `create_branch` collides, and
+// the engine wedges with "incomplete prior delete; run `omnigraph cleanup`".
+//
+// We forge that exact residue (a live `feature` branch + a directly-created
+// `feature` ref on the Person table the manifest doesn't reference) and assert
+// the next write — via both `load` and `mutate` — self-heals by reclaiming the
+// orphan fork and re-forking, rather than wedging. No process death / timing
+// needed: the forge is the post-crash state.
+#[tokio::test]
+async fn first_write_self_heals_manifest_unreferenced_fork_on_live_branch() {
+    let dir = tempfile::tempdir().unwrap();
+    let uri = dir.path().to_str().unwrap().to_string();
+    let mut db = init_and_load(&dir).await;
+    db.branch_create("feature").await.unwrap();
+
+    // Forge the manifest-unreferenced fork directly at the Lance layer.
+    let person_uri = node_table_uri(&uri, "Person");
+    {
+        let mut ds = lance::Dataset::open(&person_uri).await.unwrap();
+        let base = ds.version().version;
+        ds.create_branch("feature", base, None).await.unwrap();
+        assert!(
+            ds.list_branches().await.unwrap().contains_key("feature"),
+            "precondition: forged orphan fork present on Person"
+        );
+    }
+
+    // load → must self-heal, not wedge with "incomplete prior delete".
+    let row = r#"{"type":"Person","data":{"name":"Zoe","age":30}}"#;
+    db.load_as("feature", None, row, LoadMode::Merge, None)
+        .await
+        .expect("load onto a manifest-unreferenced fork must self-heal, not wedge");
+
+    // mutate → same path, must also self-heal.
+    mutate_branch(
+        &mut db,
+        "feature",
+        MUTATION_QUERIES,
+        "insert_person",
+        &mixed_params(&[("$name", "Yan")], &[("$age", 41)]),
+    )
+    .await
+    .expect("mutate onto a manifest-unreferenced fork must self-heal");
+
+    // The healed branch holds the new rows; main is untouched (still no Zoe/Yan).
+    let feature_people = count_rows_branch(&db, "feature", "node:Person").await;
+    let main_people = count_rows(&db, "node:Person").await;
+    assert!(
+        feature_people >= main_people + 2,
+        "feature must contain the two new rows on top of the inherited set \
+         (feature={feature_people}, main={main_people})"
+    );
+}
+
+// A node delete cascades to every edge table touching that node, forking those
+// edge tables during execution. The up-front fork-queue acquisition must cover
+// those cascade-forked edges, not just the node table named in the IR — else
+// commit_all's held-guard coverage check fails the write (and, before the
+// coverage check was promoted out of debug-only, edge commits would slip
+// through unserialized). This drives the new code via a DELETE (the only
+// cascading op), on a branch, as the FIRST write (so it actually forks).
+#[tokio::test]
+async fn branch_cascade_delete_forks_node_and_edges_under_held_queues() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut db = init_and_load(&dir).await;
+    db.branch_create("feature").await.unwrap();
+
+    // Baseline inherited from main (Alice has 2 Knows + 1 WorksAt edge).
+    let main_people = count_rows(&db, "node:Person").await;
+    let main_knows = count_rows(&db, "edge:Knows").await;
+
+    // First write to `feature` is `delete Person Alice`, whose cascade forks
+    // node:Person AND edge:Knows + edge:WorksAt. Pre-fix the up-front set held
+    // only node:Person, so commit_all's coverage check rejected the write.
+    mutate_branch(
+        &mut db,
+        "feature",
+        MUTATION_QUERIES,
+        "remove_person",
+        &mixed_params(&[("$name", "Alice")], &[]),
+    )
+    .await
+    .expect("branch cascade-delete must hold queues for cascade-forked edge tables");
+
+    // Alice and her edges are gone on feature; main is untouched.
+    assert_eq!(
+        count_rows_branch(&db, "feature", "node:Person").await,
+        main_people - 1,
+        "feature should have Alice removed from the inherited set"
+    );
+    assert!(
+        count_rows_branch(&db, "feature", "edge:Knows").await < main_knows,
+        "feature should have Alice's cascade-deleted Knows edges removed"
+    );
+    assert_eq!(
+        count_rows(&db, "node:Person").await,
+        main_people,
+        "main must be untouched by the branch delete"
+    );
+}

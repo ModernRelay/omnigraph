@@ -20,7 +20,7 @@ Server-scoped action (v0.6.0+; binds to `Omnigraph::Server::"root"`):
 
 10. `graph_list` — `GET /graphs` registry enumeration (multi-graph mode)
 
-Server-scoped actions cannot use `branch_scope` or `target_branch_scope` — they operate on the registry, not on a graph's branches. A rule cannot mix server-scoped and per-graph actions; split into separate rules. (Runtime `graph_create` / `graph_delete` are reserved but not shipped in v0.6.0; operators add/remove graphs by editing `omnigraph.yaml` and restarting.)
+Server-scoped actions cannot use `branch_scope` or `target_branch_scope` — they operate on the registry, not on a graph's branches. A rule cannot mix server-scoped and per-graph actions; split into separate rules. (Runtime `graph_create` / `graph_delete` over HTTP are reserved but not shipped; operators add/remove graphs by editing the cluster's `cluster.yaml`, running `omnigraph cluster apply`, and restarting the server.)
 
 ## Scope kinds
 
@@ -28,38 +28,34 @@ Server-scoped actions cannot use `branch_scope` or `target_branch_scope` — the
 - `target_branch_scope` — applied to destination (`schema_apply`, branch ops, run ops)
 - `protected_branches` — named list with special rules; rule scopes are `any | protected | unprotected`
 
-## Per-graph vs. server-level policy (multi-graph mode)
+## Per-graph vs. server-level policy
 
-In multi mode (`omnigraph.yaml` with a non-empty `graphs:` map), policy files attach at two levels:
+A server boots from a cluster (`--cluster <dir>`), and the cluster's
+`cluster.yaml` declares its policy bundles in a `policies:` section. Each bundle
+names the scopes it `applies_to`: a graph id (per-graph rules — `read`, `change`,
+`branch_*`, `schema_apply`) or the literal `cluster` (server-level rules —
+`graph_list`).
 
 ```yaml
-server:
-  policy:
-    file: server-policy.yaml          # server-level: graph_list
-
-graphs:
+# cluster.yaml
+policies:
+  base:
+    file: base.policy.yaml
+    applies_to: [cluster, knowledge]   # cluster-level + the `knowledge` graph
   alpha:
-    uri: s3://tenant-bucket/alpha
-    policy:
-      file: policies/alpha.yaml       # per-graph: read, change, branch_*, schema_apply
-  beta:
-    uri: s3://tenant-bucket/beta
-    # no per-graph policy → no engine-layer Cedar enforcement on beta
+    file: policies/alpha.yaml
+    applies_to: [alpha]                # per-graph: alpha only
 ```
 
-**Config follows graph identity, not server mode.** A graph served by **name**
-(`--target <name>` or `server.graph`) uses its own `graphs.<name>.policy.file`,
-exactly as in multi-graph mode. Top-level `policy.file` applies only to an
-**anonymous** graph — one served by a bare `<URI>` with no `graphs:` entry.
-Serving a **named** graph (single- or multi-graph mode) while top-level
-`policy.file` (or `queries:`) is populated **refuses boot**, naming the block,
-since the top-level value would otherwise be silently shadowed by the per-graph
-block. Move per-graph rules to `graphs.<graph_id>.policy.file` and `graph_list`
-rules to `server.policy.file`.
+A graph with no bundle bound to it has no engine-layer Cedar enforcement. Each
+graph's HTTP request flows through its bound bundle; the management endpoint
+(`GET /graphs`) flows through the `cluster`-scoped bundle. When no bundle binds
+`cluster`, `GET /graphs` is denied in every runtime state, including
+`--unauthenticated`; with bearer tokens configured it returns 403 after admission
+control because `graph_list` is not a `read`-equivalent action. The operator must
+bind a `cluster`-scoped bundle granting `graph_list` to expose `/graphs`.
 
-Each graph's HTTP request flows through its own per-graph policy. The management endpoint (`GET /graphs`) flows through the server-level policy. When `server.policy.file` is unset, `GET /graphs` is denied in every runtime state, including `--unauthenticated`; with bearer tokens configured, it returns 403 after admission control because `graph_list` is not a `read`-equivalent action. The operator must explicitly authorize via `server-policy.yaml` to expose `/graphs`.
-
-Example server-level policy:
+Example `cluster`-scoped bundle:
 
 ```yaml
 version: 1
@@ -72,38 +68,26 @@ rules:
       actions: [graph_list]
 ```
 
-## Configuration
+Each per-graph rule may use at most one of `branch_scope` or
+`target_branch_scope`. Server-scoped rules (`graph_list`) take neither — they
+have no branch context.
 
-`omnigraph.yaml`:
+## Actor for direct-engine writes
 
-```yaml
-policy:
-  file: policy.yaml          # Cedar rules + groups
-  tests: policy.tests.yaml   # declarative test cases
-
-cli:
-  actor: act-andrew            # default actor for CLI direct-engine writes
-```
-
-Each per-graph rule may use at most one of `branch_scope` or `target_branch_scope`. Server-scoped rules (`graph_list`) take neither — they have no branch context.
-
-`cli.actor` is the default actor identity for CLI direct-engine writes
-when `policy.file` is configured. Override per-invocation with `--as
-<ACTOR>` (top-level flag) — `--as` wins, otherwise `cli.actor` is used,
-otherwise no actor. With policy configured and neither set, the
-engine-layer footgun guard intentionally denies the write (silent bypass
-via "I forgot the actor" is exactly what the guard prevents). Remote
-HTTP writes ignore both — they resolve their actor server-side from the
-bearer token.
+The default actor identity for CLI direct-engine (`--store`) writes is
+`operator.actor` in `~/.omnigraph/config.yaml`. Override per-invocation with
+`--as <ACTOR>` — `--as` wins, otherwise `operator.actor`, otherwise no actor.
+Remote HTTP writes ignore both — they resolve their actor server-side from the
+bearer token. (Direct-store access carries no Cedar policy under RFC-011; policy
+lives in the cluster/server.)
 
 ## CLI
 
-Policy tooling resolves its graph like server single-mode policy: `cli.graph`
-wins, otherwise `server.graph` is used, otherwise the top-level `policy.file`
-is validated/tested/explained as the anonymous policy.
+Policy tooling reads a cluster's applied policy bundles: pass `--cluster <dir>`,
+and `--graph <id>` to pick a graph's bundle when several apply.
 
 - `omnigraph policy validate` — parse + count actors, exit 1 on parse error.
-- `omnigraph policy test` — run cases in `policy.tests.yaml`, exit 1 on any expectation mismatch.
+- `omnigraph policy test --tests <file>` — run the declarative cases in `<file>` against the selected bundle, exit 1 on any expectation mismatch.
 - `omnigraph policy explain --actor … --action … [--branch …] [--target-branch …]` — show decision and matched rule.
 - `omnigraph --as <ACTOR> <subcommand>` — set the actor for the duration of one invocation. Effective for `change`, `load` (and its deprecated `ingest` alias), `branch create|delete|merge`, and `schema apply` against a direct (`--store`) graph. **Rejected** on a served write (`--server`): the actor is bearer-token-resolved server-side, so `--as` can't set it there.
 
@@ -132,7 +116,7 @@ reaches the authorization gate without a matching policy permit.
 |---|---|---|---|
 | **Open** | no | no | Every request is permitted. Refuses to start unless `--unauthenticated` or `OMNIGRAPH_UNAUTHENTICATED=1` is set — the operator must explicitly opt in. |
 | **DefaultDeny** | yes | no | Every authenticated request for an action other than `read` is rejected with HTTP 403. Closes the "tokens but forgot the policy file" trap — an operator who sets up auth and forgot to point at a policy file used to ship the illusion of protection. |
-| **PolicyEnabled** | yes | yes | Authenticated requests that reach a configured policy engine are evaluated by Cedar. Server-scoped actions still require `server.policy.file`. |
+| **PolicyEnabled** | yes | yes | Authenticated requests that reach a configured policy engine are evaluated by Cedar. Server-scoped actions still require a `cluster`-scoped policy bundle. |
 
 The server refuses to start for the "no tokens, no policy, no flag" cell
 and for "policy file, no tokens" — instead of silently shipping an open

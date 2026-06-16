@@ -117,7 +117,7 @@ omnigraph cluster apply --config company-brain --as andrew
 
 `--as <actor>` attributes the run: it is recorded in recovery sidecars and
 audit entries and threaded into the engine's commit history. Set
-`cli: { actor: <you> }` in your per-operator `omnigraph.yaml` to make it the
+`operator: { actor: <you> }` in your `~/.omnigraph/config.yaml` to make it the
 default when `--as` is omitted (the flag always wins; `approve` requires one
 of the two).
 
@@ -244,12 +244,12 @@ with an in-flight apply.
 - **CI-driven convergence**: `validate` and `plan --json` are read-only and
   safe in pipelines; gate `apply --as ci` on plan review. Approvals are the
   human step by design — keep `cluster approve` out of automation.
-- **`omnigraph.yaml` still has a job**: per-operator settings — your
-  `cli.actor` default for `--as`, CLI defaults, credentials, and data-plane
-  ergonomics (address a cluster graph by its derived root like
-  `company-brain/graphs/knowledge.omni` with `--store` for loads). It just no
-  longer describes the deployment — a server boots from one source or the
-  other, never a merge of both.
+- **`~/.omnigraph/config.yaml` is the per-operator config**: your
+  `operator.actor` default for `--as`, named servers/clusters, credentials,
+  profiles, and data-plane ergonomics (address a cluster graph by its derived
+  root like `company-brain/graphs/knowledge.omni` with `--store` for loads). The
+  cluster directory's `cluster.yaml` is the **sole deployment declaration** — the
+  server boots from the cluster only.
 
 ## 7. Maintaining a cluster graph
 
@@ -258,10 +258,11 @@ operation — it runs out-of-band, with direct storage access, against the graph
 roots. Address a cluster graph by name instead of hand-typing its storage path:
 
 ```bash
-omnigraph optimize --cluster ./company-brain --cluster-graph knowledge
-omnigraph cleanup  --cluster ./company-brain --cluster-graph knowledge --keep 10 --confirm
-# --cluster also takes the storage-root URI directly (config-free):
-omnigraph optimize --cluster s3://bucket/clusters/company-brain --cluster-graph knowledge
+omnigraph optimize --cluster ./company-brain --graph knowledge
+omnigraph cleanup  --cluster ./company-brain --graph knowledge --keep 10 --confirm
+# --cluster also takes the storage-root URI directly (config-free), and a
+# `clusters:` name from ~/.omnigraph/config.yaml:
+omnigraph optimize --cluster s3://bucket/clusters/company-brain --graph knowledge
 ```
 
 The graph's storage URI is resolved from the **served cluster state** (the same
@@ -269,6 +270,16 @@ truth a `--cluster` server boots from); a graph that hasn't been applied yet is
 not resolvable. Run these from a host with storage access — there are no server
 routes for them. Conversely, **`init` refuses** a cluster-managed path: graphs in
 a cluster are created by `cluster apply`, not by hand.
+
+If the cluster has exactly **one** applied graph you can omit `--graph` — it is
+used automatically. With **several**, omitting `--graph` errors and lists the
+candidates (RFC-011 D7); it never picks one for you.
+
+Against an **`s3://`-backed cluster** the resolved graph storage is non-local, so a
+destructive `cleanup` additionally requires **`--yes`** (an interactive prompt
+otherwise, refusal without a TTY) on top of `--confirm` — see [cli-reference.md](../cli/reference.md)'s
+*Write diagnostics & destructive confirmation*. Every maintenance run also echoes
+its resolved target to stderr (suppress with `--quiet`).
 
 ## What the control plane does not do (yet)
 

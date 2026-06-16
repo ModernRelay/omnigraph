@@ -7,7 +7,8 @@
 
 **Lakehouse native graph engine built for context assembly**
 
-Omnigraph acts as operational state & coordination layer for agents
+Omnigraph acts as operational state & coordination layer for agents.
+Hundreds of agents can enrich the graph on parallel isolated branches and changes can be reviewed and merged safely.
 
 - Git-style versioning & branching
 - Multimodal retrieval (graph+vector/fts+filters) optimized for context assembly

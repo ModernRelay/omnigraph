@@ -418,6 +418,45 @@ async fn load_jsonl_reader<R: BufRead>(
         LoadMode::Overwrite => crate::db::MutationOpKind::SchemaRewrite,
     };
 
+    // Up-front fork-queue acquisition. The first write to a table on a
+    // non-main branch forks it (create_branch), which advances Lance state
+    // before the manifest publish; the reclaim of any manifest-unreferenced
+    // leftover (`reclaim_orphaned_fork_and_refork`) must not race a concurrent
+    // in-process fork. So when this load will fork at least one touched table,
+    // acquire the per-(table, branch) write queues for ALL touched tables up
+    // front (one sorted `acquire_many`, keyed uniformly by the target branch
+    // so it covers what `commit_all` recomputes) and hold them through the
+    // publish. Main-branch loads never fork; branch loads where every touched
+    // table is already forked skip this and let `commit_all` acquire at commit.
+    let fork_queue_guards: Option<(
+        Vec<(String, Option<String>)>,
+        Vec<tokio::sync::OwnedMutexGuard<()>>,
+    )> = if let Some(active) = branch {
+        let touched: Vec<(String, Option<String>)> = node_rows
+            .keys()
+            .map(|t| (format!("node:{t}"), Some(active.to_string())))
+            .chain(
+                edge_rows
+                    .keys()
+                    .map(|e| (format!("edge:{e}"), Some(active.to_string()))),
+            )
+            .collect();
+        let needs_fork = touched.iter().any(|(table_key, _)| {
+            snapshot
+                .entry(table_key)
+                .map(|e| e.table_branch.as_deref() != Some(active))
+                .unwrap_or(false)
+        });
+        if needs_fork {
+            let guards = db.write_queue().acquire_many(&touched).await;
+            Some((touched, guards))
+        } else {
+            None
+        }
+    } else {
+        None
+    };
+
     // Phase 2a: build and validate every node batch up front. Cheap and
     // synchronous — surfaces validation errors before any S3 traffic.
     let mut prepared_nodes: Vec<(String, String, RecordBatch, usize)> =
@@ -551,7 +590,13 @@ async fn load_jsonl_reader<R: BufRead>(
     // across the manifest publish below — see exec/mutation.rs for
     // the rationale (interleaving prevention).
     let (updates, expected_versions, sidecar_handle, _queue_guards) = staged
-        .commit_all(db, branch, crate::db::manifest::SidecarKind::Load, actor_id)
+        .commit_all(
+            db,
+            branch,
+            crate::db::manifest::SidecarKind::Load,
+            actor_id,
+            fork_queue_guards,
+        )
         .await?;
     // Same finalize → publisher residual as mutations: per-table
     // staged commits have advanced Lance HEAD, but the manifest

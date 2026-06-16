@@ -33,8 +33,8 @@ OmniGraph is a typed property-graph engine built as a coordination layer over ma
 - **Multi-modal querying**: vector ANN (`nearest`), full-text (`search`/`fuzzy`/`match_text`/`bm25`), Reciprocal Rank Fusion (`rrf`), and graph traversal (`Expand`, anti-join `not { … }`) in one runtime.
 - **Branches and commits across the whole graph**: Git-style — every successful publish appends to a commit DAG; merges are three-way at the row level.
 - **Atomic per-query writes**: `mutate_as` and `load` accumulate insert/update batches into an in-memory `MutationStaging.pending` per touched table; one `stage_*` + `commit_staged` per table runs at end-of-query, then `ManifestBatchPublisher::publish` commits the manifest atomically with per-table `expected_table_versions` CAS. A mid-query failure leaves Lance HEAD untouched on staged tables — no drift, no run state machine, no staging branches. Deletes still inline-commit; D₂ at parse time prevents inserts/updates and deletes from coexisting in one query.
-- **HTTP server**: Axum + utoipa OpenAPI, bearer auth (SHA-256 hashed, optional AWS Secrets Manager). Cedar policy enforcement is engine-wide — every `_as` writer calls `Omnigraph::enforce(action, scope, actor)`, so HTTP, CLI, and embedded SDK consumers all hit the same gate. **Two modes** (v0.6.0+): single-graph (legacy flat routes) and multi-graph (`/graphs/{graph_id}/...` cluster routes + read-only `GET /graphs` enumeration). Per-graph + server-level Cedar policies. Multi-graph mode boots from a cluster directory (`--cluster <dir | s3://…>`, RFC-005) or the legacy `omnigraph.yaml` `graphs:` map. Runtime add/remove (`POST /graphs`, `DELETE /graphs/{id}`) is not exposed — operators run `cluster apply` (or edit the legacy file) and restart.
-- **CLI** with two-surface config (RFC-008): the team-owned cluster directory (`cluster.yaml`) plus the per-operator `~/.omnigraph/config.yaml` (servers, credentials, actor, aliases). The legacy combined `omnigraph.yaml` still loads with per-key deprecation warnings — `config migrate` proposes the split, `OMNIGRAPH_NO_LEGACY_CONFIG=1` enforces strict mode. **Never extend `omnigraph.yaml`.** Multi-format output (json/jsonl/csv/kv/table).
+- **HTTP server**: Axum + utoipa OpenAPI, bearer auth (SHA-256 hashed, optional AWS Secrets Manager). Cedar policy enforcement is engine-wide — every `_as` writer calls `Omnigraph::enforce(action, scope, actor)`, so HTTP, CLI, and embedded SDK consumers all hit the same gate. **Cluster-only boot** (RFC-011): the server always boots from a cluster directory (`--cluster <dir | s3://…>`, RFC-005) and serves N graphs (N ≥ 1) under multi-graph routes (`/graphs/{graph_id}/...` + read-only `GET /graphs` enumeration); there are no single-graph flat routes and no positional-URI boot. Per-graph + server-level Cedar policies. Runtime add/remove (`POST /graphs`, `DELETE /graphs/{id}`) is not exposed — operators run `cluster apply` and restart.
+- **CLI** with two-surface config (RFC-007/008): the team-owned cluster directory (`cluster.yaml`) plus the per-operator `~/.omnigraph/config.yaml` (servers, clusters, credentials, actor, profiles, aliases, defaults). Graphs are addressed via `--store`/`--server`/`--cluster`/`--profile`/operator defaults (RFC-011). Multi-format output (json/jsonl/csv/kv/table).
 
 Throughout the docs, capabilities are split into **L1 — Inherited from Lance** vs **L2 — Added by OmniGraph**.
 
@@ -96,7 +96,7 @@ Full diagram and concurrency model: [docs/dev/architecture.md](docs/dev/architec
 | Cedar policy actions, scopes, CLI | [docs/user/operations/policy.md](docs/user/operations/policy.md) |
 | HTTP server endpoints, auth, error model, body limits | [docs/user/operations/server.md](docs/user/operations/server.md) |
 | CLI quick-start | [docs/user/cli/index.md](docs/user/cli/index.md) |
-| CLI command surface and config schemas (`~/.omnigraph/config.yaml`, legacy `omnigraph.yaml`) | [docs/user/cli/reference.md](docs/user/cli/reference.md) |
+| CLI command surface and config schema (`~/.omnigraph/config.yaml`) | [docs/user/cli/reference.md](docs/user/cli/reference.md) |
 | Audit / actor tracking | [docs/user/operations/audit.md](docs/user/operations/audit.md) |
 | Error taxonomy and result serialization | [docs/user/operations/errors.md](docs/user/operations/errors.md) |
 | Install (binary / Homebrew / source / channels) | [docs/user/install.md](docs/user/install.md) |
@@ -144,6 +144,7 @@ These are architectural rules that need to be in scope on every change. They're 
 4. **Bearer-token plaintext never persists in process memory.** Tokens are hashed at startup; auth uses constant-time comparison; the actor id is server-resolved from the hash match and must not be settable by the client.
 5. **Reads always see the current index state for the branch they're reading.** Indexes track the branch head, not historical snapshots. If you change index lifecycle, preserve this guarantee.
 6. **Stable type IDs survive renames.** Schema migration relies on identity that's stable across rename — don't mint new IDs on rename.
+7. **Logical contract over physical state.** Physical state (index coverage, fragment layout, compaction versions, staged writes) is derived and rebuildable; it must never fail a logical operation. Check preconditions against logical state and let reconciliation converge the physical state idempotently — genuine logical conflicts still fail loudly. This is the rule rules 1–6 instantiate; full statement and applications in [docs/dev/invariants.md](docs/dev/invariants.md).
 
 ### Deny-list (fast-pass review filter — full reasoning in [docs/dev/invariants.md](docs/dev/invariants.md))
 
@@ -179,7 +180,7 @@ Rust stable workspace (edition 2024). `protoc` is a build dependency (`brew inst
 cargo build --workspace --locked              # build everything
 cargo test  --workspace --locked              # the canonical CI gate (matches CI exactly)
 cargo run -p omnigraph-cli -- <args>          # run the `omnigraph` CLI from source
-cargo run -p omnigraph-server -- <uri> --bind 0.0.0.0:8080   # run the server from source
+cargo run -p omnigraph-server -- --cluster <dir|s3://...> --bind 0.0.0.0:8080   # run the server from source
 
 # Run one crate / one test file / one test fn
 cargo test -p omnigraph-engine --test traversal           # one integration-test file (see docs/dev/testing.md)
@@ -231,10 +232,10 @@ omnigraph cleanup  --keep 10 --older-than 7d --confirm s3://my-bucket/graph.omni
 
 # Stand up the HTTP server (token from env)
 OMNIGRAPH_SERVER_BEARER_TOKEN=xxxx \
-  omnigraph-server s3://my-bucket/graph.omni --bind 0.0.0.0:8080
+  omnigraph-server --cluster s3://my-bucket/cluster --bind 0.0.0.0:8080
 
 # Cedar policy explain
-omnigraph policy explain --actor act-alice --action change --branch main
+omnigraph policy explain --cluster ./company-brain --graph knowledge --actor act-alice --action change --branch main
 ```
 
 ---
@@ -250,7 +251,7 @@ omnigraph policy explain --actor act-alice --action change --branch main
 | Compaction (`compact_files`) + reindex (`optimize_indices`) | ✅ | `omnigraph optimize` orchestrates over all node/edge tables, bounded concurrency; per table runs `compact_files` **then Lance `optimize_indices`** (folds appended/rewritten fragments back into existing indexes — incremental merge, not retrain) and **publishes the resulting version to `__manifest`** (so the manifest tracks the Lance HEAD — required for reads to observe the work and for schema apply / strict writes to pass their HEAD-vs-manifest precondition), under the per-`(table, main)` write queue with `SidecarKind::Optimize` recovery coverage spanning both ops; **commits even with no compaction work if index coverage is stale**; **refuses on an unrecovered graph**; **skips uncovered HEAD > manifest drift** with `DriftNeedsRepair`; **skips blob-bearing tables** (reported via `TableOptimizeStats.skipped`, not silent; reindex is skipped for them too today), gated on `LANCE_SUPPORTS_BLOB_COMPACTION` until the upstream blob-v2 compaction-decode bug is fixed (see [docs/dev/invariants.md](docs/dev/invariants.md) Known Gaps) |
 | Repair uncovered drift | — | `omnigraph repair` explicitly classifies uncovered table `HEAD > manifest` drift: verified maintenance drift (`ReserveFragments`/`Rewrite`) can be published with `--confirm`; suspicious or unverifiable drift requires `--force --confirm`. Sidecar-covered crash residuals still recover automatically on open. |
 | Cleanup (`cleanup_old_versions`) | ✅ | `omnigraph cleanup` with `--keep` / `--older-than` policy |
-| BTREE / inverted (FTS) / vector indexes | ✅ | `ensure_indices` builds them per `@index`/`@key` column, dispatched by type via `node_prop_index_kind` (enum + orderable scalar → BTREE, free-text String → FTS, Vector → vector); idempotent; lazy across branches. Coverage of fragments appended after build is restored by `optimize`'s `optimize_indices` pass (see Compaction row). |
+| BTREE / inverted (FTS) / vector indexes | ✅ | `@index`/`@key` declares intent; the physical index is derived state that never fails a logical op. Built per column through one chokepoint (`build_indices_on_dataset_for_catalog`, type-dispatched by `node_prop_index_kind`: enum + orderable scalar → BTREE, free-text String → FTS, Vector → vector); idempotent; lazy across branches. **Schema apply builds nothing** (records intent only); `load`/`mutate` build inline but **defer an untrainable Vector column** (no trainable vectors yet) as *pending* rather than aborting. `ensure_indices`/`optimize` is the reconciler that materializes declared-but-missing indexes and restores coverage of appended/rewritten fragments (`optimize_indices`), reporting still-pending columns (see Compaction row). |
 | `merge_insert` upsert | ✅ | `LoadMode::Merge`, mutation `update`/`insert`/`delete` lowering |
 | Vector search | ✅ | `nearest()` query op; embedding pipeline (Gemini / OpenAI clients); `@embed` in schema |
 | Full-text search | ✅ | `search/fuzzy/match_text/bm25` query ops |
@@ -264,8 +265,8 @@ omnigraph policy explain --actor act-alice --action change --branch main
 | Three-way row-level merge | — | `OrderedTableCursor` + `StagedTableWriter`, structured `MergeConflictKind` |
 | Change feeds | — | `diff_between` / `diff_commits` with manifest fast path + ID streaming |
 | Cedar policy | — | Per-graph actions plus server-scoped actions (see [docs/user/operations/policy.md](docs/user/operations/policy.md) for the current list), branch / target_branch / protected scopes, validate/test/explain CLI. **Engine-wide enforcement** (MR-722): every `_as` writer (`apply_schema_as`, `mutate_as`, `load_as` — the deprecated `ingest_as` shims route through it — `branch_create_as` / `branch_create_from_as`, `branch_delete_as`, `branch_merge_as`) calls `Omnigraph::enforce(action, scope, actor)` — HTTP, CLI, embedded SDK all hit the same gate. |
-| HTTP server | — | Axum, OpenAPI via utoipa, bearer auth (SHA-256, AWS Secrets Manager option), `authorize_request` at the HTTP boundary (resolves bearer→actor, applies admission control), NDJSON streaming export, **multi-graph mode (v0.6.0+) with cluster routes + read-only `GET /graphs` enumeration + per-graph + server-level Cedar policies. Multi-graph boots from a cluster directory (`--cluster`) or the legacy `omnigraph.yaml`; add/remove graphs via `cluster apply` (or by editing the legacy file) and restarting.** |
-| CLI with config | — | two-surface config (team `cluster.yaml` dir + per-operator `~/.omnigraph/config.yaml`; legacy `omnigraph.yaml` deprecated per RFC-008), aliases, multi-format output (json/jsonl/csv/kv/table) |
+| HTTP server | — | Axum, OpenAPI via utoipa, bearer auth (SHA-256, AWS Secrets Manager option), `authorize_request` at the HTTP boundary (resolves bearer→actor, applies admission control), NDJSON streaming export, **cluster-only boot (RFC-011): always `--cluster <dir | s3://…>`, serving N graphs (N ≥ 1) under multi-graph routes + read-only `GET /graphs` enumeration + per-graph + server-level Cedar policies. Add/remove graphs via `cluster apply` and restart.** |
+| CLI with config | — | two-surface config (team `cluster.yaml` dir + per-operator `~/.omnigraph/config.yaml`), scope addressing (`--store`/`--server`/`--cluster`/`--profile`/defaults, RFC-011), aliases, multi-format output (json/jsonl/csv/kv/table) |
 | Audit / actor tracking | — | `_as` write APIs + actor map in commit graph |
 | Local RustFS bootstrap | — | `scripts/local-rustfs-bootstrap.sh` one-shot S3-backed dev environment |
 

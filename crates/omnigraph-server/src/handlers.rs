@@ -51,25 +51,15 @@ pub(crate) async fn server_graphs_list(
     State(state): State<AppState>,
     actor: Option<Extension<ResolvedActor>>,
 ) -> std::result::Result<Json<GraphListResponse>, ApiError> {
-    // 405 in single mode — there's no registry to enumerate, and the
-    // legacy URL surface didn't expose this endpoint.
-    let registry = match state.routing() {
-        GraphRouting::Single { .. } => {
-            return Err(ApiError::method_not_allowed(
-                "GET /graphs is only available in multi-graph mode",
-            ));
-        }
-        GraphRouting::Multi { registry, .. } => registry,
-    };
+    let registry = &state.routing().registry;
 
-    // Server-level Cedar gate. `state.server_policy` is loaded from
-    // `server.policy.file` in `omnigraph.yaml` at startup. When no
-    // server policy is configured, `authorize_request_server` falls
-    // through to the MR-723 default-deny semantics (every non-Read
-    // action denied for an authenticated actor). `GraphList` is not
-    // `Read`, so without a server policy the request gets 403 — which
-    // is the right default (don't leak the registry until the operator
-    // explicitly authorizes it).
+    // Server-level Cedar gate. `state.server_policy` is loaded from the
+    // cluster-scoped policy bundle at startup. When no server policy is
+    // configured, `authorize_request_server` falls through to the MR-723
+    // default-deny semantics (every non-Read action denied for an
+    // authenticated actor). `GraphList` is not `Read`, so without a server
+    // policy the request gets 403 — which is the right default (don't leak
+    // the registry until the operator explicitly authorizes it).
     authorize_request(
         actor.as_ref().map(|Extension(actor)| actor),
         state.server_policy.as_deref(),
@@ -93,16 +83,14 @@ pub(crate) async fn server_graphs_list(
 }
 
 pub(crate) async fn server_openapi(State(state): State<AppState>) -> Json<utoipa::openapi::OpenApi> {
-    let mut doc = ApiDoc::openapi();
+    // `served_openapi` is the single nesting source — the protected
+    // routes always live under `/graphs/{graph_id}/...` (public/management
+    // paths `/healthz`, `/graphs` stay flat). Building from it here means
+    // the runtime spec and the committed `openapi.json` share one nesting
+    // pass and can't drift.
+    let mut doc = crate::served_openapi();
     if !state.requires_bearer_auth() {
         strip_security(&mut doc);
-    }
-    // MR-668: in multi mode, the protected routes live under
-    // `/graphs/{graph_id}/...`. Rewrite the doc so the spec matches
-    // the routes the router actually serves. Public paths (`/healthz`)
-    // stay flat in both modes.
-    if matches!(state.routing(), GraphRouting::Multi { .. }) {
-        nest_paths_under_cluster_prefix(&mut doc);
     }
     Json(doc)
 }
@@ -248,16 +236,11 @@ pub(crate) async fn require_bearer_auth(
     Ok(next.run(request).await)
 }
 
-/// Routing middleware (MR-668). Resolves the active graph for the
-/// request and injects `Arc<GraphHandle>` as an extension so handlers can
-/// extract it via `Extension<Arc<GraphHandle>>`.
+/// Routing middleware (RFC-011 cluster-only). Resolves the active graph
+/// for the request and injects `Arc<GraphHandle>` as an extension so
+/// handlers can extract it via `Extension<Arc<GraphHandle>>`.
 ///
-/// **Single mode**: the routing field holds the single handle directly.
-/// Routes are flat; every request resolves to that handle, regardless
-/// of the URI path. No registry walk, no sentinel key, no
-/// programmer-error guard.
-///
-/// **Multi mode**: routes are nested under `/graphs/{graph_id}/...`. The
+/// Routes are always nested under `/graphs/{graph_id}/...`. The
 /// middleware extracts `{graph_id}` from the URI path and looks it up in
 /// the registry. Returns 404 if the graph is not registered.
 ///
@@ -268,39 +251,33 @@ pub(crate) async fn resolve_graph_handle(
     mut request: Request,
     next: Next,
 ) -> std::result::Result<Response, ApiError> {
-    let handle = match &state.routing {
-        GraphRouting::Single { handle } => Arc::clone(handle),
-        GraphRouting::Multi { registry, .. } => {
-            // `Router::nest("/graphs/{graph_id}", inner)` rewrites
-            // `request.uri().path()` to the inner suffix (e.g. `/snapshot`).
-            // The pre-rewrite URI is preserved in the `OriginalUri`
-            // request extension by axum's router; we read from there to
-            // extract `{graph_id}`. Fall back to the current URI only if
-            // the extension is missing, which shouldn't happen for
-            // nested routes but is safe defensive code.
-            let original_path: String = request
-                .extensions()
-                .get::<OriginalUri>()
-                .map(|OriginalUri(uri)| uri.path().to_string())
-                .unwrap_or_else(|| request.uri().path().to_string());
-            let graph_id_str = original_path
-                .strip_prefix("/graphs/")
-                .and_then(|rest| rest.split('/').next())
-                .filter(|s| !s.is_empty())
-                .ok_or_else(|| {
-                    ApiError::bad_request(
-                        "cluster route missing /graphs/{graph_id} prefix".to_string(),
-                    )
-                })?;
-            let graph_id = GraphId::try_from(graph_id_str.to_string())
-                .map_err(|err| ApiError::bad_request(err.to_string()))?;
-            let key = GraphKey::cluster(graph_id.clone());
-            match registry.get(&key) {
-                RegistryLookup::Ready(handle) => handle,
-                RegistryLookup::Gone => {
-                    return Err(ApiError::not_found(format!("graph '{graph_id}' not found")));
-                }
-            }
+    let registry = &state.routing.registry;
+    // `Router::nest("/graphs/{graph_id}", inner)` rewrites
+    // `request.uri().path()` to the inner suffix (e.g. `/snapshot`).
+    // The pre-rewrite URI is preserved in the `OriginalUri`
+    // request extension by axum's router; we read from there to
+    // extract `{graph_id}`. Fall back to the current URI only if
+    // the extension is missing, which shouldn't happen for
+    // nested routes but is safe defensive code.
+    let original_path: String = request
+        .extensions()
+        .get::<OriginalUri>()
+        .map(|OriginalUri(uri)| uri.path().to_string())
+        .unwrap_or_else(|| request.uri().path().to_string());
+    let graph_id_str = original_path
+        .strip_prefix("/graphs/")
+        .and_then(|rest| rest.split('/').next())
+        .filter(|s| !s.is_empty())
+        .ok_or_else(|| {
+            ApiError::bad_request("cluster route missing /graphs/{graph_id} prefix".to_string())
+        })?;
+    let graph_id = GraphId::try_from(graph_id_str.to_string())
+        .map_err(|err| ApiError::bad_request(err.to_string()))?;
+    let key = GraphKey::cluster(graph_id.clone());
+    let handle = match registry.get(&key) {
+        RegistryLookup::Ready(handle) => handle,
+        RegistryLookup::Gone => {
+            return Err(ApiError::not_found(format!("graph '{graph_id}' not found")));
         }
     };
 
@@ -382,22 +359,25 @@ pub(crate) fn authorize(
         // runtime state means the docstring contract on
         // `server_graphs_list` ("don't leak the registry until the
         // operator explicitly authorizes it") holds uniformly; the
-        // operator's only path to enabling it is configuring an
-        // explicit `server.policy.file` in omnigraph.yaml.
+        // operator's only path to enabling it is configuring a
+        // cluster-scoped policy bundle, applying the cluster, and
+        // restarting the server.
         if request.action.resource_kind() == PolicyResourceKind::Server {
             return Ok(Authz::Denied(
-                "server-scoped actions require an explicit `server.policy.file` \
-                 configured in omnigraph.yaml — the management surface is closed \
-                 by default in every runtime state, including --unauthenticated, \
-                 so that server topology is never exposed without operator opt-in."
+                "server-scoped actions require an explicit cluster policy bundle \
+                 applied with `omnigraph cluster apply` and served after restart — \
+                 the management surface is closed by default in every runtime state, \
+                 including --unauthenticated, so that server topology is never exposed \
+                 without operator opt-in."
                     .to_string(),
             ));
         }
         if actor.is_some() && request.action != PolicyAction::Read {
             return Ok(Authz::Denied(
                 "server runs in default-deny mode (bearer tokens configured but no \
-                 policy file). Only `read` actions are permitted; configure \
-                 `policy.file` in omnigraph.yaml to enable other actions."
+                 applied policy bundle). Only `read` actions are permitted; configure \
+                 a graph or cluster policy bundle in the cluster config, run \
+                 `omnigraph cluster apply`, and restart the server to enable other actions."
                     .to_string(),
             ));
         }
@@ -510,7 +490,7 @@ pub(crate) fn deprecation_headers(successor_link: &'static str) -> [(HeaderName,
     operation_id = "read",
     request_body = ReadRequest,
     responses(
-        (status = 200, description = "Query results (response includes `Deprecation: true` + `Link: </query>; rel=\"successor-version\"`)", body = ReadOutput),
+        (status = 200, description = "Query results (response includes `Deprecation: true` + `Link: <query>; rel=\"successor-version\"`)", body = ReadOutput),
         (status = 400, description = "Bad request", body = ErrorOutput),
         (status = 401, description = "Unauthorized", body = ErrorOutput),
         (status = 403, description = "Forbidden", body = ErrorOutput),
@@ -524,7 +504,7 @@ pub(crate) fn deprecation_headers(successor_link: &'static str) -> [(HeaderName,
 /// route is kept indefinitely for byte-stable back-compat. New integrations
 /// should target `POST /query`, which has clean field names (`query` /
 /// `name`) and a 400-on-mutation guard. Responses from this route include
-/// `Deprecation: true` and `Link: </query>; rel="successor-version"`
+/// `Deprecation: true` and `Link: <query>; rel="successor-version"`
 /// headers per RFC 9745 / RFC 8288 so SDKs and proxies can surface the
 /// signal.
 pub(crate) async fn server_read(
@@ -544,7 +524,7 @@ pub(crate) async fn server_read(
     )
     .await?;
     Ok((
-        deprecation_headers("</query>; rel=\"successor-version\""),
+        deprecation_headers("<query>; rel=\"successor-version\""),
         Json(api::read_output(selected_name, &target, result)),
     ))
 }
@@ -793,7 +773,7 @@ pub(crate) async fn run_query(
     operation_id = "change",
     request_body = ChangeRequest,
     responses(
-        (status = 200, description = "Mutation results (response includes `Deprecation: true` + `Link: </mutate>; rel=\"successor-version\"`)", body = ChangeOutput),
+        (status = 200, description = "Mutation results (response includes `Deprecation: true` + `Link: <mutate>; rel=\"successor-version\"`)", body = ChangeOutput),
         (status = 400, description = "Bad request", body = ErrorOutput),
         (status = 401, description = "Unauthorized", body = ErrorOutput),
         (status = 403, description = "Forbidden", body = ErrorOutput),
@@ -809,7 +789,7 @@ pub(crate) async fn run_query(
 /// kept indefinitely for back-compat. New integrations should target
 /// `POST /mutate`, which has identical semantics and a name that pairs
 /// cleanly with `POST /query`. Responses from this route include
-/// `Deprecation: true` and `Link: </mutate>; rel="successor-version"`
+/// `Deprecation: true` and `Link: <mutate>; rel="successor-version"`
 /// headers per RFC 9745 / RFC 8288 so SDKs and proxies can surface the
 /// signal.
 pub(crate) async fn server_change(
@@ -830,7 +810,7 @@ pub(crate) async fn server_change(
     )
     .await?;
     Ok((
-        deprecation_headers("</mutate>; rel=\"successor-version\""),
+        deprecation_headers("<mutate>; rel=\"successor-version\""),
         Json(output),
     ))
 }
@@ -980,6 +960,22 @@ pub(crate) async fn server_invoke_query(
     let query_name = stored.name.clone();
     let is_mutation = stored.is_mutation();
 
+    // RFC-011 D3: the CLI verb asserts the stored query's kind. `query <name>`
+    // sends `expect_mutation: false`, `mutate <name>` sends `true`; a mismatch
+    // is rejected here so the wrong verb errors instead of silently running.
+    if let Some(expected) = req.expect_mutation {
+        if expected != is_mutation {
+            let (actual, verb) = if is_mutation {
+                ("mutation", "mutate")
+            } else {
+                ("read", "query")
+            };
+            return Err(ApiError::bad_request(format!(
+                "'{query_name}' is a {actual} — use omnigraph {verb} {query_name}"
+            )));
+        }
+    }
+
     info!(
         graph = %handle.uri,
         actor = ?actor_ref.map(|a| a.actor_id.as_ref()),
@@ -1117,11 +1113,15 @@ pub(crate) async fn server_schema_get(
         (status = 400, description = "Bad request", body = ErrorOutput),
         (status = 401, description = "Unauthorized", body = ErrorOutput),
         (status = 403, description = "Forbidden", body = ErrorOutput),
+        (status = 409, description = "Schema apply is disabled for cluster-backed serving; use `omnigraph cluster apply` and restart", body = ErrorOutput),
         (status = 429, description = "Per-actor admission cap exceeded; honor `Retry-After` header", body = ErrorOutput),
     ),
     security(("bearer_token" = [])),
 )]
 /// Apply a schema migration.
+///
+/// Cluster-backed servers reject this route with `409 Conflict`; operators
+/// must apply schema changes through `omnigraph cluster apply` and restart.
 ///
 /// Diffs `schema_source` against the current schema and applies the resulting
 /// migration steps (add/drop type, add/drop column, etc.). **Destructive**:
@@ -1149,6 +1149,17 @@ pub(crate) async fn server_schema_apply(
             target_branch: Some("main".to_string()),
         },
     )?;
+    // Disable HTTP schema apply on cluster-backed serving AFTER the Cedar gate,
+    // so an unauthorized actor gets a 403 (not a 409 that would disclose the
+    // server is cluster-backed): 401 → 403 → 409, never leak topology before
+    // authorization. An authorized actor gets the actionable 409 signpost.
+    if state.routing().config_path.is_some() {
+        return Err(ApiError::conflict(
+            "server-side schema apply is disabled for cluster-backed serving; \
+             update the cluster config, run `omnigraph cluster apply`, and restart \
+             the server.",
+        ));
+    }
     let est_bytes = request.schema_source.len() as u64;
     let _admission = state
         .workload
@@ -1180,6 +1191,25 @@ pub(crate) async fn server_schema_apply(
         .await
         .map_err(ApiError::from_omni)?
     };
+    // Prompt index convergence (iss-848): schema apply records `@index` intent
+    // but defers the physical build. On a long-lived server, materialize it
+    // promptly rather than waiting for the next `optimize` cron — spawned
+    // detached so it never blocks or fails the apply response. Best-effort: a
+    // failure is logged and the index still converges on the next optimize.
+    // The CLI is one-shot, so it has no equivalent; its convergence path is the
+    // operator's optimize cadence.
+    if result.applied {
+        let engine = Arc::clone(&handle.engine);
+        tokio::spawn(async move {
+            if let Err(err) = engine.ensure_indices().await {
+                tracing::warn!(
+                    target: "omnigraph::server",
+                    error = %err,
+                    "post-apply ensure_indices failed; indexes will converge on the next optimize",
+                );
+            }
+        });
+    }
     Ok(Json(schema_apply_output(handle.uri.as_str(), result)))
 }
 
@@ -1311,7 +1341,7 @@ pub(crate) async fn server_load(
     operation_id = "ingest",
     request_body = IngestRequest,
     responses(
-        (status = 200, description = "Load results (response includes `Deprecation: true` + `Link: </load>; rel=\"successor-version\"`)", body = IngestOutput),
+        (status = 200, description = "Load results (response includes `Deprecation: true` + `Link: <load>; rel=\"successor-version\"`)", body = IngestOutput),
         (status = 400, description = "Bad request", body = ErrorOutput),
         (status = 401, description = "Unauthorized", body = ErrorOutput),
         (status = 403, description = "Forbidden", body = ErrorOutput),
@@ -1325,7 +1355,7 @@ pub(crate) async fn server_load(
 /// Bulk-load NDJSON data into a branch. Behavior is unchanged; the route is
 /// kept indefinitely for back-compat. New integrations should target
 /// `POST /load`, which has identical semantics. Responses from this route
-/// include `Deprecation: true` and `Link: </load>; rel="successor-version"`
+/// include `Deprecation: true` and `Link: <load>; rel="successor-version"`
 /// headers per RFC 9745 / RFC 8288 so SDKs and proxies can surface the signal.
 pub(crate) async fn server_ingest(
     State(state): State<AppState>,
@@ -1341,7 +1371,7 @@ pub(crate) async fn server_ingest(
     )
     .await?;
     Ok((
-        deprecation_headers("</load>; rel=\"successor-version\""),
+        deprecation_headers("<load>; rel=\"successor-version\""),
         Json(output),
     ))
 }
@@ -1725,4 +1755,3 @@ pub(crate) fn query_params_from_json(
     json_params_to_param_map(params_json, query_params, JsonParamMode::Standard)
         .map_err(|err| color_eyre::eyre::eyre!(err.to_string()))
 }
-

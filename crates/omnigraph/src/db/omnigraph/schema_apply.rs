@@ -193,7 +193,6 @@ where
     let mut added_tables = BTreeSet::new();
     let mut renamed_tables = HashMap::new();
     let mut rewritten_tables = BTreeSet::new();
-    let mut indexed_tables = BTreeSet::new();
     let mut dropped_tables = BTreeSet::new();
     // Hard-drop cleanup targets: (table_key, full_dataset_uri).
     // Populated for DropProperty { Hard } and DropType { Hard }; the
@@ -252,14 +251,14 @@ where
                     .or_default()
                     .insert(to.clone(), from.clone());
             }
-            SchemaMigrationStep::AddConstraint {
-                type_kind,
-                type_name,
-                ..
-            } => {
-                indexed_tables.insert(schema_table_key(*type_kind, type_name));
-            }
-            SchemaMigrationStep::UpdateTypeMetadata { .. }
+            // AddConstraint is only ever an `@index` addition (every other
+            // added constraint plans as UnsupportedChange). It records intent
+            // in the desired catalog/IR; the physical index is built off the
+            // critical path by ensure_indices/optimize (iss-848), so the apply
+            // does no table work for it — a pure metadata change like the two
+            // metadata steps below.
+            SchemaMigrationStep::AddConstraint { .. }
+            | SchemaMigrationStep::UpdateTypeMetadata { .. }
             | SchemaMigrationStep::UpdatePropertyMetadata { .. } => {}
             SchemaMigrationStep::DropProperty {
                 type_kind,
@@ -347,18 +346,15 @@ where
     let mut table_updates = HashMap::<String, crate::db::SubTableUpdate>::new();
     let mut table_tombstones = HashMap::<String, u64>::new();
 
-    // Recovery sidecar: protect the per-table commit_staged loop in
-    // rewritten_tables + indexed_tables. The post_commit_pin we record
-    // here is a lower bound (expected + 1); the classifier loose-matches
-    // for SidecarKind::SchemaApply because the actual N depends on how
-    // many indices need building. See classify_table's loose-match arm.
+    // Recovery sidecar: protect the per-table `stage_overwrite` +
+    // `commit_staged` in rewritten_tables — the only tables that advance Lance
+    // HEAD inline now that index building is deferred to the reconciler
+    // (iss-848). Each rewritten table is exactly one commit, so
+    // `post_commit_pin = expected + 1` is now exact (it was a loose lower bound
+    // when index builds added extra commits); the classifier's loose-match for
+    // SidecarKind::SchemaApply still accepts it.
     let recovery_pins: Vec<crate::db::manifest::SidecarTablePin> = rewritten_tables
         .iter()
-        .chain(indexed_tables.iter().filter(|t| {
-            !rewritten_tables.contains(*t)
-                && !added_tables.contains(*t)
-                && !renamed_tables.contains_key(*t)
-        }))
         .filter_map(|table_key| {
             let entry = snapshot.entry(table_key)?;
             Some(crate::db::manifest::SidecarTablePin {
@@ -432,10 +428,10 @@ where
     // manifest publish via `commit_changes_with_actor` below.
     //
     // Schema-apply already holds the graph-wide `__schema_apply_lock__`
-    // sentinel branch, so under PR 1b's intermediate state these
-    // per-table acquisitions are uncontended. They exist for symmetry
-    // with future MR-870 recovery, which will need queue acquisition
-    // before any `Dataset::restore` it issues for SchemaApply sidecars.
+    // sentinel branch, so these per-table acquisitions are uncontended in
+    // practice. They exist for symmetry with the recovery reconciler, which
+    // acquires the same queues before any `Dataset::restore` it issues for
+    // SchemaApply sidecars.
     let mut schema_apply_queue_keys: Vec<(String, Option<String>)> = recovery_pins
         .iter()
         .map(|pin| (pin.table_key.clone(), pin.table_branch.clone()))
@@ -490,10 +486,11 @@ where
         let table_path = table_path_for_table_key(table_key)?;
         let dataset_uri = db.storage().dataset_uri(&table_path);
         let schema = schema_for_table_key(&desired_catalog, table_key)?;
-        let mut ds =
+        let ds =
             SnapshotHandle::new(TableStore::create_empty_dataset(&dataset_uri, &schema).await?);
-        db.build_indices_on_dataset_for_catalog(&desired_catalog, table_key, &mut ds)
-            .await?;
+        // Indexes for the new table are materialized off the critical path by
+        // ensure_indices/optimize (iss-848); a 0-row table is never trainable
+        // anyway. The @index intent is recorded in the persisted catalog/IR.
         let state = db.storage().table_state(&dataset_uri, &ds).await?;
         table_registrations.insert(table_key.clone(), table_path);
         table_updates.insert(
@@ -533,10 +530,9 @@ where
         .await?;
         let table_path = table_path_for_table_key(target_table_key)?;
         let dataset_uri = db.storage().dataset_uri(&table_path);
-        let mut target_ds =
+        let target_ds =
             SnapshotHandle::new(TableStore::write_dataset(&dataset_uri, batch).await?);
-        db.build_indices_on_dataset_for_catalog(&desired_catalog, target_table_key, &mut target_ds)
-            .await?;
+        // Indexes on the renamed table are reconciled later (iss-848).
         let state = db.storage().table_state(&dataset_uri, &target_ds).await?;
         table_registrations.insert(target_table_key.clone(), table_path);
         table_updates.insert(
@@ -593,9 +589,10 @@ where
             .open_dataset_head_for_write(table_key, &dataset_uri, entry.table_branch.as_deref())
             .await?;
         let staged = db.storage().stage_overwrite(&existing, batch).await?;
-        let mut target_ds = db.storage().commit_staged(existing, staged).await?;
-        db.build_indices_on_dataset_for_catalog(&desired_catalog, table_key, &mut target_ds)
-            .await?;
+        let target_ds = db.storage().commit_staged(existing, staged).await?;
+        // The rewrite drops the table's existing index coverage; it is
+        // restored off the critical path by optimize's optimize_indices /
+        // ensure_indices (iss-848). Reads scan uncovered fragments meanwhile.
         let state = db.storage().table_state(&dataset_uri, &target_ds).await?;
         table_updates.insert(
             table_key.clone(),
@@ -609,41 +606,12 @@ where
         );
     }
 
-    for table_key in &indexed_tables {
-        if added_tables.contains(table_key)
-            || renamed_tables.contains_key(table_key)
-            || rewritten_tables.contains(table_key)
-        {
-            continue;
-        }
-        let entry = snapshot.entry(table_key).ok_or_else(|| {
-            OmniError::manifest(format!(
-                "missing table '{}' for schema index apply",
-                table_key
-            ))
-        })?;
-        ensure_snapshot_entry_head_matches(db, entry).await?;
-        let dataset_uri = db.storage().dataset_uri(&entry.table_path);
-        let mut ds = db
-            .storage()
-            .open_dataset_head_for_write(table_key, &dataset_uri, entry.table_branch.as_deref())
-            .await?;
-        db.storage()
-            .ensure_expected_version(&ds, table_key, entry.table_version)?;
-        db.build_indices_on_dataset_for_catalog(&desired_catalog, table_key, &mut ds)
-            .await?;
-        let state = db.storage().table_state(&dataset_uri, &ds).await?;
-        table_updates.insert(
-            table_key.clone(),
-            crate::db::SubTableUpdate {
-                table_key: table_key.clone(),
-                table_version: state.version,
-                table_branch: None,
-                row_count: state.row_count,
-                version_metadata: state.version_metadata,
-            },
-        );
-    }
+    // Index-only changes (AddConstraint, i.e. adding an `@index`) are pure
+    // metadata: the new `@index` intent is recorded in the desired catalog/IR
+    // persisted below, and the physical index is materialized off the critical
+    // path by `ensure_indices`/`optimize` (iss-848). Schema apply touches no
+    // table data for them, so there is no per-table loop here and no recovery
+    // pin (no Lance HEAD advances). Reads stay correct meanwhile via a scan.
 
     let mut manifest_changes = Vec::new();
     for (table_key, table_path) in table_registrations {

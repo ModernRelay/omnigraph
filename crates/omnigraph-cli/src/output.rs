@@ -749,15 +749,10 @@ pub(crate) fn print_snapshot_human(branch: &str, manifest_version: u64, entries:
 pub(crate) fn print_read_output(
     output: &ReadOutput,
     format: ReadOutputFormat,
-    config: &OmnigraphConfig,
 ) -> Result<()> {
     println!(
         "{}",
-        render_read(
-            output,
-            format,
-            &resolve_table_render_options(config),
-        )?
+        render_read(output, format, &resolve_table_render_options())?
     );
     Ok(())
 }
@@ -907,21 +902,87 @@ pub(crate) fn finish_logout(
     Ok(())
 }
 
-/// Table prefs cascade (RFC-007/008): legacy cli.table_* (window) >
-/// operator defaults.table_* > built-in.
-pub(crate) fn resolve_table_render_options(config: &OmnigraphConfig) -> ReadRenderOptions {
+#[derive(Debug, Serialize)]
+pub(crate) struct ProfileListItem {
+    pub(crate) name: String,
+    /// `server: <n>` / `cluster: <n>` / `store: <uri>` / `invalid: <reason>`.
+    pub(crate) binding: String,
+    /// `server` | `cluster` | `store` | `invalid`.
+    pub(crate) scope_kind: String,
+    /// The bound server/cluster name, or the store URI. `None` when invalid.
+    pub(crate) target: Option<String>,
+    pub(crate) valid: bool,
+    pub(crate) error: Option<String>,
+    pub(crate) default_graph: Option<String>,
+    pub(crate) active: bool,
+}
+
+#[derive(Debug, Serialize)]
+pub(crate) struct ProfileDetail {
+    /// Profile name, or `(defaults)` for the no-name flat-defaults view.
+    pub(crate) name: String,
+    /// `server` | `cluster` | `store` | `none`.
+    pub(crate) scope_kind: String,
+    /// The bound server/cluster name, or the store URI.
+    pub(crate) target: Option<String>,
+    /// Resolved endpoint: a server's URL / a cluster's root / the store URI;
+    /// `None` if a named server/cluster isn't defined in this config.
+    pub(crate) endpoint: Option<String>,
+    pub(crate) default_graph: Option<String>,
+    pub(crate) output_format: Option<String>,
+}
+
+pub(crate) fn print_profile_list(items: &[ProfileListItem], json: bool) -> Result<()> {
+    if json {
+        return print_json(&items);
+    }
+    if items.is_empty() {
+        println!("no profiles defined in the operator config");
+        return Ok(());
+    }
+    for item in items {
+        let active = if item.active { " (active)" } else { "" };
+        let graph = item
+            .default_graph
+            .as_deref()
+            .map(|g| format!(" · graph: {g}"))
+            .unwrap_or_default();
+        println!("{}{active}  {}{graph}", item.name, item.binding);
+    }
+    Ok(())
+}
+
+pub(crate) fn print_profile_detail(detail: &ProfileDetail, json: bool) -> Result<()> {
+    if json {
+        return print_json(detail);
+    }
+    println!("profile: {}", detail.name);
+    let target = detail
+        .target
+        .as_deref()
+        .map(|t| format!(" {t}"))
+        .unwrap_or_default();
+    println!("  scope:   {}{target}", detail.scope_kind);
+    if let Some(endpoint) = &detail.endpoint {
+        println!("  endpoint: {endpoint}");
+    } else if matches!(detail.scope_kind.as_str(), "server" | "cluster") {
+        println!("  endpoint: (undefined — name not in this config)");
+    }
+    if let Some(graph) = &detail.default_graph {
+        println!("  default graph: {graph}");
+    }
+    if let Some(format) = &detail.output_format {
+        println!("  output: {format}");
+    }
+    Ok(())
+}
+
+/// Table prefs cascade (RFC-011): operator defaults.table_* > built-in.
+pub(crate) fn resolve_table_render_options() -> ReadRenderOptions {
     let operator = crate::operator::load_operator_config().unwrap_or_default();
     ReadRenderOptions {
-        max_column_width: config
-            .cli
-            .table_max_column_width
-            .or(operator.defaults.table_max_column_width)
-            .unwrap_or(80),
-        cell_layout: config
-            .cli
-            .table_cell_layout
-            .or(operator.defaults.table_cell_layout)
-            .unwrap_or_default(),
+        max_column_width: operator.defaults.table_max_column_width.unwrap_or(80),
+        cell_layout: operator.defaults.table_cell_layout.unwrap_or_default(),
     }
 }
 

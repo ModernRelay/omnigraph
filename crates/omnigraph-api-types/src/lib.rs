@@ -325,6 +325,13 @@ pub struct InvokeStoredQueryRequest {
     /// mutation). Mutually exclusive with `branch`.
     #[serde(default)]
     pub snapshot: Option<String>,
+    /// The kind the caller expects (RFC-011 Decision 3): `Some(false)` for
+    /// `omnigraph query <name>`, `Some(true)` for `omnigraph mutate <name>`.
+    /// When set and it disagrees with the stored query's actual kind, the
+    /// server rejects the call (400) so the verb asserts the kind. `None`
+    /// (the default) skips the check — preserving older clients and aliases.
+    #[serde(default)]
+    pub expect_mutation: Option<bool>,
 }
 
 /// Response for `POST /queries/{name}`: the read envelope for a stored

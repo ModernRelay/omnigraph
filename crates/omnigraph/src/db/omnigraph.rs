@@ -40,6 +40,7 @@ pub use repair::{
     RepairAction, RepairClassification, RepairOptions, RepairStats, TableRepairStats,
 };
 pub use schema_apply::SchemaApplyOptions;
+pub use table_ops::PendingIndex;
 
 use super::commit_graph::GraphCommit;
 use super::manifest::{
@@ -113,10 +114,11 @@ pub struct Omnigraph {
     /// Read-heavy on schema introspection paths, written only by
     /// `apply_schema`. Same ArcSwap rationale as `catalog`.
     schema_source: Arc<ArcSwap<String>>,
-    /// Per-`(table_key, branch)` writer queues. Reachable from engine
-    /// internals (mutation finalize, schema_apply, branch_merge,
-    /// ensure_indices, delete_where) and from future MR-870 recovery
-    /// reconciler. PR 1b adds the field; callers acquire in commits 4+.
+    /// Per-`(table_key, branch)` writer queues — the engine's
+    /// write-serialization mechanism (the server holds the engine as a
+    /// lockless `Arc<Omnigraph>`). Reachable from engine internals
+    /// (mutation finalize, schema_apply, branch_merge, ensure_indices,
+    /// delete_where, the fork path, recovery reconciler).
     write_queue: Arc<crate::db::write_queue::WriteQueueManager>,
     /// Process-wide mutex held across the swap → operate → restore window
     /// in `branch_merge_impl`. Two concurrent merges with distinct targets
@@ -1107,11 +1109,15 @@ impl Omnigraph {
     /// unbranched subtables keep inheriting `main`, while subtables inherited
     /// from an ancestor branch are first forked into the active branch before
     /// their index metadata is updated.
-    pub async fn ensure_indices(&self) -> Result<()> {
+    /// Returns the declared indexes that could not be materialized on this
+    /// pass (today: vector columns with no trainable vectors yet). They are
+    /// deferred, not errors; a later `ensure_indices`/`optimize` builds them
+    /// once the column is trainable. Reads stay correct (brute-force) meanwhile.
+    pub async fn ensure_indices(&self) -> Result<Vec<PendingIndex>> {
         table_ops::ensure_indices(self).await
     }
 
-    pub async fn ensure_indices_on(&self, branch: &str) -> Result<()> {
+    pub async fn ensure_indices_on(&self, branch: &str) -> Result<Vec<PendingIndex>> {
         table_ops::ensure_indices_on(self, branch).await
     }
 
@@ -1517,6 +1523,13 @@ impl Omnigraph {
         table_ops::open_for_mutation_on_branch(self, branch, table_key, op_kind).await
     }
 
+    /// Fork `table_key` onto `active_branch` from the given source state,
+    /// self-healing a manifest-unreferenced leftover fork if one is in the
+    /// way. Callers that reach this MUST already hold the per-`(table_key,
+    /// active_branch)` write queue (so the reclaim cannot race an in-process
+    /// fork) and must have confirmed via the live manifest that the table is
+    /// not yet on `active_branch`. Both the first-write fork path
+    /// (`open_owned_dataset_for_branch_write`) and `branch_merge` satisfy this.
     pub(crate) async fn fork_dataset_from_entry_state(
         &self,
         table_key: &str,
@@ -1525,7 +1538,7 @@ impl Omnigraph {
         source_version: u64,
         active_branch: &str,
     ) -> Result<SnapshotHandle> {
-        table_ops::fork_dataset_from_entry_state(
+        match table_ops::fork_dataset_from_entry_state(
             self,
             table_key,
             full_path,
@@ -1533,7 +1546,21 @@ impl Omnigraph {
             source_version,
             active_branch,
         )
-        .await
+        .await?
+        {
+            crate::storage_layer::ForkOutcome::Created(ds) => Ok(ds),
+            crate::storage_layer::ForkOutcome::RefAlreadyExists => {
+                table_ops::reclaim_orphaned_fork_and_refork(
+                    self,
+                    table_key,
+                    full_path,
+                    source_branch,
+                    source_version,
+                    active_branch,
+                )
+                .await
+            }
+        }
     }
 
     pub(crate) async fn reopen_for_mutation(
@@ -1568,17 +1595,8 @@ impl Omnigraph {
         &self,
         table_key: &str,
         ds: &mut SnapshotHandle,
-    ) -> Result<()> {
+    ) -> Result<Vec<PendingIndex>> {
         table_ops::build_indices_on_dataset(self, table_key, ds).await
-    }
-
-    pub(crate) async fn build_indices_on_dataset_for_catalog(
-        &self,
-        catalog: &Catalog,
-        table_key: &str,
-        ds: &mut SnapshotHandle,
-    ) -> Result<()> {
-        table_ops::build_indices_on_dataset_for_catalog(self, catalog, table_key, ds).await
     }
 
     // Used only by in-tree tests (`#[cfg(test)]`); the runtime path now
@@ -2536,25 +2554,49 @@ edge WorksAt: Person -> Company
     }
 
     #[tokio::test]
-    async fn test_apply_schema_adds_index_for_existing_property() {
+    async fn test_apply_schema_defers_index_then_reconciler_builds_it() {
+        // iss-848: schema apply records the @index intent but builds nothing
+        // inline; a later ensure_indices materializes it once the table has
+        // rows. (Use `age`, which is unindexed in TEST_SCHEMA — `name @key` is
+        // already FTS-indexed at seed, so it can't show the deferral.)
         let dir = tempfile::tempdir().unwrap();
         let uri = dir.path().to_str().unwrap();
         let mut db = Omnigraph::init(uri, TEST_SCHEMA).await.unwrap();
+        seed_person_row(&mut db, "Alice", Some(30)).await;
 
-        let desired = TEST_SCHEMA.replace("name: String @key", "name: String @key @index");
+        let desired = TEST_SCHEMA.replace("age: I32?", "age: I32? @index");
         db.apply_schema(&desired).await.unwrap();
 
+        // Apply built nothing — the BTREE on `age` is deferred.
         let snapshot = db.snapshot().await;
         let ds = db
             .storage()
             .open_snapshot_at_table(&snapshot, "node:Person")
             .await
             .unwrap();
-        assert!(db.storage().has_fts_index(&ds, "name").await.unwrap());
+        assert!(
+            !db.storage().has_btree_index(&ds, "age").await.unwrap(),
+            "apply must not build the index inline (deferred to the reconciler)"
+        );
+
+        // The reconciler materializes it (Person has a row).
+        db.ensure_indices().await.unwrap();
+        let snapshot = db.snapshot().await;
+        let ds = db
+            .storage()
+            .open_snapshot_at_table(&snapshot, "node:Person")
+            .await
+            .unwrap();
+        assert!(
+            db.storage().has_btree_index(&ds, "age").await.unwrap(),
+            "ensure_indices must build the deferred index"
+        );
     }
 
     #[tokio::test]
-    async fn test_apply_schema_rewrite_preserves_existing_indices() {
+    async fn test_apply_schema_rewrite_defers_index_then_reconciler_restores() {
+        // iss-848: an AddProperty rewrite writes a new dataset version without
+        // rebuilding indexes inline (deferred); ensure_indices restores them.
         let dir = tempfile::tempdir().unwrap();
         let uri = dir.path().to_str().unwrap();
         let initial_schema = TEST_SCHEMA.replace("name: String @key", "name: String @key @index");
@@ -2567,6 +2609,8 @@ edge WorksAt: Person -> Company
         );
         db.apply_schema(&desired).await.unwrap();
 
+        // After the rewrite the reconciler restores index coverage.
+        db.ensure_indices().await.unwrap();
         let snapshot = db.snapshot().await;
         let ds = db
             .storage()

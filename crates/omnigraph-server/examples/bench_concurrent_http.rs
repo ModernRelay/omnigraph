@@ -1,14 +1,15 @@
 //! Server-level concurrent HTTP benchmark for MR-686 (PR 0 baseline).
 //!
 //! Drives concurrent `/change` requests against an in-process Omnigraph HTTP
-//! server. Measures the global `Arc<RwLock<Omnigraph>>` lock penalty on
-//! current `main` so PR 1 + PR 2 can be evaluated against a real baseline.
+//! server. Originally written to measure the global `Arc<RwLock<Omnigraph>>`
+//! lock penalty as an MR-686 baseline; that lock has since been removed
+//! (engine write APIs are `&self`, the server holds a lockless
+//! `Arc<Omnigraph>`), so this now measures the concurrent write path itself
+//! (per-`(table, branch)` queue contention + Lance I/O).
 //!
-//! Per the MR-686 plan: this is the load-bearing bench. `Omnigraph::mutate_as`
-//! is `&mut self`, so an engine-level concurrent bench either serializes on the
-//! borrow checker (measures nothing) or drives multiple handles (measures Lance
-//! contention, not the server bottleneck). Driving the HTTP server is the only
-//! way to measure the actual `RwLock<Omnigraph>` contention this work removes.
+//! Driving the HTTP server is still the right level: an engine-level bench on
+//! a single handle measures Lance contention, not the server's request-path
+//! concurrency.
 //!
 //! Usage:
 //! ```sh
