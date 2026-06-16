@@ -125,9 +125,8 @@ omnigraph cluster validate   # parse + typecheck everything
 omnigraph cluster plan       # preview what apply would do
 omnigraph cluster apply      # converge
 
-# Boot the server on the cluster — every graph comes online at /graphs/{id}/…
-OMNIGRAPH_SERVER_BEARER_TOKEN=$TOKEN \
-  omnigraph-server --cluster s3://company/clusters/company-brain --bind 0.0.0.0:8080
+# Boot the server — every graph comes online at /graphs/{id}/…
+omnigraph-server --cluster s3://company/clusters/company-brain --bind 0.0.0.0:8080
 ```
 
 See the [cluster guide](docs/user/clusters/index.md) for the day-2 loop
