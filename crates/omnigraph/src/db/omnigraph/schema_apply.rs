@@ -782,6 +782,7 @@ where
 async fn cleanup_dataset_old_versions(db: &Omnigraph, full_uri: &str) -> Result<()> {
     use chrono::Utc;
     use lance::dataset::cleanup::CleanupPolicy;
+    // forbidden-api-allow: maintenance (Hard-drop version GC) opens the dataset to run cleanup_old_versions.
     let ds = lance::Dataset::open(full_uri)
         .await
         .map_err(|e| OmniError::Lance(e.to_string()))?;

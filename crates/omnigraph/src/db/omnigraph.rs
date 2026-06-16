@@ -2557,6 +2557,7 @@ edge WorksAt: Person -> Company
         db.branch_create("__run__legacy").await.unwrap();
         drop(db);
         {
+            // forbidden-api-allow: test synthesizes a legacy graph by editing __manifest directly.
             let mut ds = lance::Dataset::open(&format!("{}/__manifest", uri))
                 .await
                 .unwrap();
