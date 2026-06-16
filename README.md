@@ -78,18 +78,51 @@ value.
 
 ## Common Commands
 
-The same URI works for local paths, `s3://…`, or `http://host:port`.
+Every command declares the **capability** it needs and how it's addressed.
+Direct storage (`init`, `load`, `branch`, …) takes a positional `file://`/`s3://`
+URI or `--store <uri>`; a served graph is addressed with `--server <name|url>`
+(never a positional `http(s)://` URI). `query`/`mutate` invoke a stored query
+**by name** (the positional is the query name, not a graph URI).
 
 ```bash
-omnigraph init   --schema ./schema.pg ./graph.omni
-omnigraph load   --data   ./data.jsonl ./graph.omni
-omnigraph read   --query  ./queries.gq --name get_person --params '{"name":"Alice"}' ./graph.omni
-omnigraph change --query  ./queries.gq --name insert_person --params '{"name":"Mina"}' ./graph.omni
-omnigraph branch create --from main feature-x ./graph.omni
-omnigraph branch merge  feature-x --into main ./graph.omni
+# Create a graph and load data (--mode is required; overwrite is destructive)
+omnigraph init --schema ./schema.pg ./graph.omni
+omnigraph load --data ./data.jsonl --mode merge --store ./graph.omni
+
+# Read / write — ad-hoc .gq against a local store (positional selects the query)
+omnigraph query  --query ./queries.gq get_person    --params '{"name":"Alice"}' --store ./graph.omni
+omnigraph mutate --query ./queries.gq insert_person  --params '{"name":"Mina"}'  --store ./graph.omni
+
+# Branch and merge (Git-style, across the whole graph)
+omnigraph branch create --from main feature-x --store ./graph.omni
+omnigraph branch merge  feature-x --into main --store ./graph.omni
+
+# Against a running server: invoke a stored query by name from the catalog
+omnigraph query find_people --server prod --graph knowledge --params '{"q":"AI safety"}'
 ```
 
-See [docs/user/cli.md](docs/user/cli.md) for schema apply, snapshots, data loading, commits, and policy commands.
+Operator settings (identity, named servers/clusters, credentials, defaults) live
+in `~/.omnigraph/config.yaml`; with a default scope set, the addressing flags can
+be omitted. See [docs/user/cli/index.md](docs/user/cli/index.md) and the
+[CLI reference](docs/user/cli/reference.md) for schema apply, snapshots, commits,
+profiles, and policy/queries tooling.
+
+## Serving (cluster-first)
+
+A deployment is a **cluster**: a `cluster.yaml` (graphs, schemas, stored queries,
+policies, storage) that you converge with `cluster apply`, then serve. The server
+boots from the cluster only — it has no single-graph mode — and serves every
+graph under `/graphs/{id}/…`.
+
+```bash
+omnigraph cluster apply  --config ./company-brain          # converge the declared state
+omnigraph-server --cluster ./company-brain --bind 0.0.0.0:8080
+# or config-free from object storage — the bucket IS the deployment:
+omnigraph-server --cluster s3://my-bucket/company-brain --bind 0.0.0.0:8080
+```
+
+See the [cluster guide](docs/user/clusters/index.md) and
+[deployment guide](docs/user/deployment.md).
 
 ## Clients
 
@@ -131,10 +164,13 @@ Notes:
 
 ## Workspace Crates
 
-- `crates/omnigraph-compiler`: shared schema/query parser, typechecker, catalog, and IR lowering
-- `crates/omnigraph`: storage/runtime, branching, merge, change detection, and query execution
-- `crates/omnigraph-cli`: CLI for graph lifecycle (init/load), query/mutate, branch/commit/merge, schema/lint, snapshot/export, policy, and maintenance (optimize/cleanup)
-- `crates/omnigraph-server`: Axum HTTP server for remote reads, changes, ingest, export, branches, and commits
+- `crates/omnigraph-compiler`: shared schema/query parser, typechecker, catalog, and IR lowering (zero Lance dependency)
+- `crates/omnigraph` (package `omnigraph-engine`): storage/runtime, branching, merge, change detection, query execution, and embeddings
+- `crates/omnigraph-policy`: Cedar policy compilation and enforcement
+- `crates/omnigraph-api-types`: shared HTTP wire DTOs used by both the server and the CLI
+- `crates/omnigraph-cluster`: cluster config validation, planning, and apply (the control plane)
+- `crates/omnigraph-server`: Axum HTTP server — cluster-first, serving N graphs under `/graphs/{id}/…`
+- `crates/omnigraph-cli`: CLI for graph lifecycle (init/load), query/mutate, branch/commit/merge, schema/lint, snapshot/export, cluster control, policy/queries, profiles, and maintenance (optimize/repair/cleanup)
 
 ## Contributing
 
