@@ -82,12 +82,12 @@ A deployment is a **cluster**. A `cluster.yaml` declares its graphs, schemas,
 stored queries, and policies; you converge it with `cluster apply` and serve it.
 The server is cluster-first — it boots only from a cluster and serves every graph
 under `/graphs/{id}/…`. Day-to-day work goes through that server: graphs are
-addressed with `--server <name>` (+ `--graph <id>`), and `query`/`mutate` invoke
-a stored query from the catalog **by name**.
+addressed with `--server <name|url>` (+ `--graph <id>`), and `query`/`mutate`
+invoke a stored query from the catalog **by name**.
 
 ```bash
-# 1. Converge the declared cluster, then serve it
-omnigraph cluster apply --config ./company-brain
+# 1. Converge the declared cluster, then serve it (--as attributes the apply)
+omnigraph cluster apply --config ./company-brain --as you
 omnigraph-server --cluster ./company-brain --bind 0.0.0.0:8080
 #    or config-free from object storage — the bucket IS the deployment:
 #    omnigraph-server --cluster s3://my-bucket/company-brain --bind 0.0.0.0:8080
