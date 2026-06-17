@@ -60,6 +60,52 @@ pub(crate) const BUILTIN_TOOL_NAMES: &[&str] = &[
     "schema_apply",
 ];
 
+/// Max MCP tool-name length. Matches the constraint major MCP clients enforce
+/// (Anthropic/OpenAI cap tool names at 64 chars over `[A-Za-z0-9_-]`).
+const MAX_TOOL_NAME_LEN: usize = 64;
+
+/// Every tool name the MCP surface itself generates and therefore reserves
+/// graph-wide: the built-ins **plus** the `meta`-mode discovery/execute pair.
+/// A stored query whose effective tool name claims one of these is refused at
+/// load (`QueryRegistry::from_specs`) — otherwise it would be silently shadowed
+/// (a built-in always wins at dispatch; the meta pair takes over the name once
+/// the catalog crosses [`STORED_QUERY_AUTO_THRESHOLD`], a silent
+/// threshold-crossing meaning change). Single source of "names the surface
+/// emits", so the reservation can't drift from what's generated.
+pub(crate) fn reserved_tool_names() -> impl Iterator<Item = &'static str> {
+    BUILTIN_TOOL_NAMES
+        .iter()
+        .copied()
+        .chain([STORED_QUERY_LIST_TOOL, STORED_QUERY_RUN_TOOL])
+}
+
+/// The MCP tool-name contract every published name must satisfy: non-empty,
+/// `[A-Za-z0-9_-]`, at most [`MAX_TOOL_NAME_LEN`] — the intersection of what
+/// MCP clients accept. The `.gq` grammar already constrains query *names* to a
+/// subset of this; this guards the free-form `@mcp(tool_name: …)` override so a
+/// malformed name fails loudly at load instead of producing a tool a client
+/// silently rejects at call time. Returns the operator-facing reason on failure.
+pub(crate) fn validate_mcp_tool_name(name: &str) -> Result<(), String> {
+    if name.is_empty() {
+        return Err("MCP tool name must not be empty".to_string());
+    }
+    if name.len() > MAX_TOOL_NAME_LEN {
+        return Err(format!(
+            "MCP tool name '{name}' exceeds {MAX_TOOL_NAME_LEN} characters"
+        ));
+    }
+    if let Some(bad) = name
+        .chars()
+        .find(|c| !(c.is_ascii_alphanumeric() || *c == '_' || *c == '-'))
+    {
+        return Err(format!(
+            "MCP tool name '{name}' contains an unsupported character '{bad}' \
+             (allowed: ASCII letters, digits, '_', '-')"
+        ));
+    }
+    Ok(())
+}
+
 /// The server's thin wrapper over `omnigraph_mcp::mcp_router`: derives the
 /// fail-closed host policy from the bound socket and passes the 32 MiB body
 /// limit (`/load` parity). Merged into `per_graph_protected` in `build_app`.
@@ -119,14 +165,16 @@ impl McpBackend for OmnigraphMcpBackend {
         let (actor, handle) = self.ctx(parts)?;
         let mut tools = Vec::new();
         for builtin in Builtin::ALL {
-            // Visibility is a *relaxation* of the per-call gate: a built-in whose
-            // authorization depends on a caller-chosen branch is shown iff the
-            // actor could invoke it on *some* branch (`authorize_any_branch`),
-            // never hidden because a fabricated branch happened to be denied. The
+            // Visibility is derived from what the tool's `call` authorizes
+            // (`list_gate`): a fixed-scope tool is gated on that exact request
+            // (faithful, and consistent with its resource twin); a
+            // caller-chosen-branch tool is shown iff the actor could invoke it on
+            // *some* branch (a relaxation — never hide a callable tool). The
             // per-call gate inside `call` stays authoritative.
-            let visible = match builtin.list_action() {
-                None => true,
-                Some(action) => {
+            let visible = match builtin.list_gate() {
+                ListGate::Always => true,
+                ListGate::Exact(request) => allowed(actor, handle, request)?,
+                ListGate::AnyBranch(action) => {
                     authorize_any_branch(actor, handle.policy.as_deref(), action).map_err(api_to_mcp)?
                 }
             };
@@ -633,6 +681,20 @@ fn stored_query_list(registry: &QueryRegistry, args: &JsonObject) -> Result<Call
 
 // ===== built-in tools =====
 
+/// How `tools/list` gates a built-in, derived from what its `call` authorizes.
+/// See [`Builtin::list_gate`].
+enum ListGate {
+    /// Ungated — always visible.
+    Always,
+    /// The call authorizes this exact request regardless of arguments; list iff
+    /// it is allowed (faithful, no over-show).
+    Exact(PolicyRequest),
+    /// The call authorizes against a caller-chosen branch; list iff the action
+    /// is permitted on *some* branch (a relaxation that never hides a callable
+    /// tool).
+    AnyBranch(PolicyAction),
+}
+
 /// Built-in operational tools. One variant per tool; `descriptor`/`list_gate`/
 /// `call` are match arms (lower liability than a `dyn` zoo).
 #[derive(Clone, Copy)]
@@ -691,28 +753,41 @@ impl Builtin {
         Builtin::ALL.into_iter().find(|b| b.name() == name)
     }
 
-    /// The action whose grant governs whether this tool is shown in
-    /// `tools/list`. `None` ⇒ always visible (`graph_health` is liveness,
-    /// ungated). The branch dimension is intentionally absent: listing probes
-    /// "can this actor perform `action` on *any* branch?" via
-    /// `authorize_any_branch`, a relaxation of the per-call gate. A read-only
-    /// actor (no write grant on any branch) has writers hidden; an actor who can
-    /// write unprotected branches sees `graph_mutate` even when `main` is
-    /// protected. The authoritative per-call gate runs inside `call`.
-    fn list_action(self) -> Option<PolicyAction> {
+    /// How `tools/list` decides this tool's visibility — **derived from what the
+    /// tool's `call` actually authorizes**, so listing never diverges from
+    /// callability:
+    /// - `Always` — ungated (`graph_health` liveness).
+    /// - `Exact(req)` — the call authorizes a *fixed* request regardless of
+    ///   arguments (`schema_get`/`branch_list`/`commit_get` read branchlessly;
+    ///   `schema_apply` always targets `main`). Listed iff that exact request is
+    ///   allowed — faithful, no over-show, and consistent with the resource
+    ///   twins (`omnigraph://schema` etc.) which use the same branchless read.
+    /// - `AnyBranch(action)` — the call authorizes against a *caller-chosen*
+    ///   branch. Listed iff the actor could perform `action` on *some* branch (a
+    ///   relaxation: never hide a tool the caller could invoke — e.g.
+    ///   `graph_mutate` shows for an unprotected-branch writer even when `main`
+    ///   is protected). The authoritative per-call gate runs inside `call`.
+    fn list_gate(self) -> ListGate {
         match self {
-            Builtin::GraphHealth => None,
-            Builtin::GraphQuery
-            | Builtin::GraphSnapshot
-            | Builtin::SchemaGet
-            | Builtin::BranchList
-            | Builtin::CommitList
-            | Builtin::CommitGet => Some(PolicyAction::Read),
-            Builtin::GraphMutate | Builtin::GraphLoad => Some(PolicyAction::Change),
-            Builtin::BranchCreate => Some(PolicyAction::BranchCreate),
-            Builtin::BranchDelete => Some(PolicyAction::BranchDelete),
-            Builtin::BranchMerge => Some(PolicyAction::BranchMerge),
-            Builtin::SchemaApply => Some(PolicyAction::SchemaApply),
+            Builtin::GraphHealth => ListGate::Always,
+            // Fixed branchless read — same gate as the schema/branches resources.
+            Builtin::SchemaGet | Builtin::BranchList | Builtin::CommitGet => {
+                ListGate::Exact(read_request(None))
+            }
+            // Always targets `main`.
+            Builtin::SchemaApply => ListGate::Exact(PolicyRequest {
+                action: PolicyAction::SchemaApply,
+                branch: None,
+                target_branch: Some("main".to_string()),
+            }),
+            // Caller-chosen branch → relaxation.
+            Builtin::GraphQuery | Builtin::GraphSnapshot | Builtin::CommitList => {
+                ListGate::AnyBranch(PolicyAction::Read)
+            }
+            Builtin::GraphMutate | Builtin::GraphLoad => ListGate::AnyBranch(PolicyAction::Change),
+            Builtin::BranchCreate => ListGate::AnyBranch(PolicyAction::BranchCreate),
+            Builtin::BranchDelete => ListGate::AnyBranch(PolicyAction::BranchDelete),
+            Builtin::BranchMerge => ListGate::AnyBranch(PolicyAction::BranchMerge),
         }
     }
 

@@ -44,7 +44,7 @@ graph id from the cluster's applied revision:
 | POST | `/graphs/{id}/export` | bearer + `export` | NDJSON stream |
 | POST | `/graphs/{id}/mutate` | bearer + `change` | mutation (canonical; `query`/`name`; accepts legacy `query_source`/`query_name` as serde aliases) |
 | POST | `/graphs/{id}/change` | bearer + `change` | **deprecated** alias of `/mutate` (carries `Deprecation: true` + `Link: <mutate>; rel="successor-version"`) |
-| GET | `/graphs/{id}/queries` | bearer + `read` | list the `mcp.expose` stored queries as a typed tool catalog |
+| GET | `/graphs/{id}/queries` | bearer + `invoke_query` | list the exposed (`@mcp(expose)`) stored queries as a typed tool catalog |
 | POST | `/graphs/{id}/queries/{name}` | bearer + `invoke_query` (+ `change` for a stored mutation) | invoke a named query from the `queries:` registry; deny == 404 |
 | POST | `/graphs/{id}/mcp` | bearer + same per-tool Cedar gate | MCP (Model Context Protocol) surface — built-ins + stored queries as tools, schema/branches as resources (see [mcp.md](mcp.md)) |
 | GET | `/graphs/{id}/schema` | bearer + `read` | get current `.pg` source |
@@ -66,11 +66,10 @@ Server-level management endpoints:
 
 ### Stored-query catalog (`GET /queries`)
 
-List the graph's **`mcp.expose`** stored queries as a typed tool catalog — enough for a client to register each as a tool without fetching `.gq` source. (The server also projects these queries as live MCP tools at `POST /graphs/{id}/mcp` — see [mcp.md](mcp.md); this catalog endpoint is the REST view of the same registry.) Each entry: `{ name, tool_name, description, instruction, mutation, params }`, where each param is `{ name, kind, item_kind?, vector_dim?, nullable }`. `kind` is one of `string | bool | int | bigint | float | date | datetime | blob | vector | list` (decomposed so a consumer maps it with a closed `switch`, never re-parsing GQ type spelling). `bigint` (I64/U64), `date`, `datetime`, and `blob` are carried as JSON **strings** — a 64-bit integer loses precision as a JSON number, dates are ISO strings, and a blob is a URI string.
+List the graph's **exposed** (`@mcp(expose: true)`) stored queries as a typed tool catalog — enough for a client to register each as a tool without fetching `.gq` source. (The server also projects these queries as live MCP tools at `POST /graphs/{id}/mcp` — see [mcp.md](mcp.md); this catalog endpoint is the REST view of the same registry.) Each entry: `{ name, tool_name, description, instruction, mutation, params }`, where each param is `{ name, kind, item_kind?, vector_dim?, nullable, description? }`. `kind` is one of `string | bool | int | bigint | float | date | datetime | blob | vector | list` (decomposed so a consumer maps it with a closed `switch`, never re-parsing GQ type spelling). `bigint` (I64/U64), `date`, `datetime`, and `blob` are carried as JSON **strings** — a 64-bit integer loses precision as a JSON number, dates are ISO strings, and a blob is a URI string.
 
-- **Read-gated** (works in default-deny mode). The catalog is **graph-wide** (branch-independent; `read` is authorized against `main`).
-- **`mcp.expose` defaults to `true`** — declaring a query in `queries:` lists it; set `mcp: { expose: false }` to keep it HTTP/service-callable but hidden from the catalog.
-- **Not Cedar-filtered per query (yet).** A caller with `read` but not `invoke_query` can *list* a query they can't *invoke* (which would 404). Closing that gap is future per-query authorization; for now the catalog is a discovery surface and `invoke_query` remains the invocation gate.
+- **`invoke_query`-gated** (graph-scoped) — the same authority as invocation (`POST /queries/{name}`) and the MCP `tools/list` surface, so a caller that can list the catalog can invoke from it. Requires an explicit `invoke_query` grant; in default-deny mode (tokens, no policy) it returns 403.
+- **Exposure is set per-query in the `.gq` source** via `@mcp(expose: false)` (default exposed; see [queries/index.md](../queries/index.md#annotations) and [mcp.md](mcp.md)). An unexposed query stays HTTP/service-callable by name but is absent from this catalog and the MCP tool surface.
 
 ### Stored-query invocation (`POST /queries/{name}`)
 

@@ -152,18 +152,27 @@ impl QueryRegistry {
         // before it is moved into `Self`.
         {
             let mut claimed: BTreeMap<&str, &str> = BTreeMap::new();
-            // Built-in MCP tool names are reserved graph-wide. A stored query
-            // that shadows one would silently never be served (built-ins win at
-            // dispatch) — the deny-list forbids silent drops, so seed them here
-            // and fail loudly at load instead.
-            for builtin in crate::mcp::BUILTIN_TOOL_NAMES {
-                claimed.insert(builtin, BUILTIN_OWNER);
+            // Every name the MCP surface generates is reserved graph-wide: the
+            // built-ins AND the meta-mode pair. A stored query claiming one would
+            // be silently shadowed (a built-in wins at dispatch; the meta pair
+            // takes over the name once the catalog crosses the auto threshold) —
+            // the deny-list forbids silent drops, so seed them all and fail
+            // loudly at load. Single source via `reserved_tool_names()`.
+            for reserved in crate::mcp::reserved_tool_names() {
+                claimed.insert(reserved, BUILTIN_OWNER);
             }
             for query in by_name.values().filter(|q| q.is_exposed()) {
                 let tool = query.effective_tool_name();
+                // Well-formedness: the `@mcp(tool_name: …)` override is free
+                // text; reject a name no MCP client will accept at load rather
+                // than emitting a tool that fails at call time.
+                if let Err(message) = crate::mcp::validate_mcp_tool_name(tool) {
+                    errors.push(LoadError { query: Some(query.name.clone()), message });
+                    continue;
+                }
                 if let Some(winner) = claimed.insert(tool, &query.name) {
                     let message = if winner == BUILTIN_OWNER {
-                        format!("MCP tool name '{tool}' is reserved by a built-in tool")
+                        format!("MCP tool name '{tool}' is reserved by a built-in or meta tool")
                     } else {
                         format!("MCP tool name '{tool}' already claimed by exposed query '{winner}'")
                     };
@@ -445,6 +454,52 @@ mod tests {
         ])
         .unwrap();
         assert_eq!(reg.len(), 2);
+    }
+
+    #[test]
+    fn malformed_tool_name_override_is_a_load_error() {
+        // The `@mcp(tool_name: …)` override is free text; a name no MCP client
+        // accepts must fail loudly at load, not surface at call time.
+        for (bad, hint) in [
+            ("has space", "unsupported character"),
+            ("comma,name", "unsupported character"),
+            ("", "must not be empty"),
+            (
+                // 65 chars > MAX_TOOL_NAME_LEN
+                "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+                "exceeds",
+            ),
+        ] {
+            let errors = QueryRegistry::from_specs(vec![spec_tool(
+                "q",
+                "query q() { match { $u: User } return { $u.name } }",
+                true,
+                bad,
+            )])
+            .unwrap_err();
+            let msg = errors[0].to_string();
+            assert!(msg.contains(hint), "tool_name {bad:?} should fail with {hint:?}: {msg}");
+        }
+    }
+
+    #[test]
+    fn meta_tool_name_is_reserved() {
+        // The generated meta-mode tools are reserved graph-wide, like the
+        // built-ins — a stored query claiming one would be silently shadowed
+        // once the catalog crosses the auto threshold.
+        for reserved in ["stored_query_list", "stored_query_run"] {
+            let errors = QueryRegistry::from_specs(vec![spec(
+                reserved,
+                &format!("query {reserved}() {{ match {{ $u: User }} return {{ $u.name }} }}"),
+                true,
+            )])
+            .unwrap_err();
+            assert!(
+                errors[0].to_string().contains("reserved"),
+                "'{reserved}' must be reserved: {}",
+                errors[0]
+            );
+        }
     }
 
     #[test]

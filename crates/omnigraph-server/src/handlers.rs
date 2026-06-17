@@ -1065,13 +1065,14 @@ pub(crate) async fn server_invoke_query(
 )]
 /// List the graph's exposed stored queries as a typed tool catalog.
 ///
-/// Returns the `mcp.expose == true` subset of the `queries:` registry, each
-/// with its MCP tool name, read/mutate flag, description/instruction, and
+/// Returns the exposed (`@mcp(expose: true)`) subset of the `queries:` registry,
+/// each with its MCP tool name, read/mutate flag, description/instruction, and
 /// typed parameters — enough for a client to register them as tools without
-/// fetching `.gq` source. Read-gated; the catalog is graph-wide (branch
-/// independent — `read` is authorized against `main`). **Not** Cedar-filtered
-/// per query yet, so it can list a query whose `invoke_query` the caller
-/// lacks (a known gap until per-query authorization lands).
+/// fetching `.gq` source. **`invoke_query`-gated** (graph-scoped), so catalog
+/// discovery uses the same authority as invocation and matches the MCP
+/// `tools/list` surface: a caller that can list can invoke (subject to the inner
+/// `read`/`change` gate on the query body). Requires an explicit `invoke_query`
+/// grant — in default-deny mode (tokens, no policy) it returns 403.
 pub(crate) async fn server_list_queries(
     Extension(handle): Extension<Arc<GraphHandle>>,
     actor: Option<Extension<ResolvedActor>>,
@@ -1080,8 +1081,8 @@ pub(crate) async fn server_list_queries(
         actor.as_ref().map(|Extension(actor)| actor),
         handle.policy.as_deref(),
         PolicyRequest {
-            action: PolicyAction::Read,
-            branch: Some("main".to_string()),
+            action: PolicyAction::InvokeQuery,
+            branch: None,
             target_branch: None,
         },
     )?;

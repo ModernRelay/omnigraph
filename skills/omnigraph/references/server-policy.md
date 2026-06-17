@@ -37,7 +37,7 @@ All per-graph routes are nested under `/graphs/{id}/...` (`{id}` = a graph id fr
 | `POST /graphs/{id}/mutate` | mutation (`/change` = deprecated alias) |
 | `POST /graphs/{id}/load` | bulk JSONL load, 32 MB; branch creation opt-in via `from` (`/ingest` = deprecated alias) |
 | `POST /graphs/{id}/export` | NDJSON stream of a branch |
-| `GET /graphs/{id}/queries` · `POST /graphs/{id}/queries/{name}` | stored-query catalog (`read`) + invocation (`invoke_query`, +`change` for a stored mutation; deny == 404) |
+| `GET /graphs/{id}/queries` · `POST /graphs/{id}/queries/{name}` | stored-query catalog + invocation, both `invoke_query`-gated (+`change` for a stored mutation; invocation deny == 404) |
 | `POST /graphs/{id}/mcp` | MCP surface — built-ins + stored queries as tools, schema/branches as resources (same per-tool Cedar gate; see *MCP surface* below) |
 | `GET /graphs/{id}/schema` · `POST /graphs/{id}/schema/apply` | read `.pg` · migrate (`schema_apply`) |
 | `GET/POST /graphs/{id}/branches` · `DELETE …/branches/{b}` · `POST …/branches/merge` | branch ops |
@@ -214,18 +214,9 @@ There is no runtime add/remove of graphs — edit `cluster.yaml`, `cluster apply
 
 ## MCP surface
 
-Since **v0.8.0**, every served graph is also an MCP (Model Context Protocol) server at `POST /graphs/{id}/mcp` — mounted automatically by the `--cluster` server, no extra flag. An MCP agent (Claude, Cursor, OpenAI Responses `mcp` tool) connects with just the URL and the graph's bearer token, and operates the graph through tools:
+Since **v0.8.0**, every served graph is also an MCP server at `POST /graphs/{id}/mcp`, mounted automatically by the `--cluster` server (no extra flag): built-ins + stored queries as tools, schema/branches as resources, same bearer + Cedar gate as the REST routes. Two things to know here: `tools/list` is a *relaxation* of the per-call gate (a tool callable on some branch is never hidden; the per-call gate stays authoritative), and stored-query discovery/invocation share the `invoke_query` gate (a non-holder gets an unknown-tool mask).
 
-- **Built-in tools** — `graph_query`, `graph_mutate`, `graph_load`, `graph_snapshot`, `schema_get`, `branch_list`, `branch_create`/`delete`/`merge`, `commit_list`/`get`, `schema_apply` (returns 409 under cluster serving — evolve via `cluster apply`), and `graph_health`.
-- **Stored-query tools** — the graph's registry, projected per-query below a threshold (default 24 exposed) or as a `stored_query_list` + `stored_query_run` pair above it. Honors `expose`/`tool_name` (see [`stored-queries.md`](stored-queries.md#mcp-exposure)).
-- **Resources** — `omnigraph://schema` and `omnigraph://branches`.
-
-It adds **no new capability**: every tool delegates to the same engine/handler path as the REST routes and passes the **same Cedar gate** (resolved from the same bearer token). Two MCP-specific behaviors to know:
-
-- **`tools/list` is a relaxation of the per-call gate.** A tool is listed if the actor could invoke it on *some* branch, so a callable tool is never hidden — under "protect `main`, write unprotected branches", `graph_mutate` is listed for a branch-writer even though writing `main` is denied. The per-call gate stays authoritative (a denied call returns a tool error). An actor with no write grant at all sees no write tools.
-- **Stored-query denials mask as unknown tools.** Behind the coarse `invoke_query` gate (a stored mutation is additionally `change`-gated), so the catalog can't be probed by a caller lacking the grant.
-
-Host/Origin posture is fail-closed and derived from the bind: a loopback bind accepts the full loopback `Host` set (`127.0.0.1`/`::1`/`localhost`); a remote bind rejects unexpected browser `Origin`s. Full client guide: `docs/user/operations/mcp.md`.
+Full guide — connecting an agent, the tool catalog + projection modes, `@mcp(...)` authoring, the presentation-vs-authorization split, and the Host/Origin + protocol-version contracts — is in [`mcp.md`](mcp.md).
 
 ## Server + Policy Together
 

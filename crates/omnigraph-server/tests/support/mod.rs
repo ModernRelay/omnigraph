@@ -362,6 +362,10 @@ rules:
       actors: {{ group: permitted }}
       actions: [schema_apply, branch_create, branch_delete, branch_merge]
       target_branch_scope: any
+  - id: permit-invoke
+    allow:
+      actors: {{ group: permitted }}
+      actions: [invoke_query]
 "#
     )
 }

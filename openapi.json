@@ -1006,7 +1006,7 @@
           "queries"
         ],
         "summary": "List the graph's exposed stored queries as a typed tool catalog.",
-        "description": "Returns the `mcp.expose == true` subset of the `queries:` registry, each\nwith its MCP tool name, read/mutate flag, description/instruction, and\ntyped parameters — enough for a client to register them as tools without\nfetching `.gq` source. Read-gated; the catalog is graph-wide (branch\nindependent — `read` is authorized against `main`). **Not** Cedar-filtered\nper query yet, so it can list a query whose `invoke_query` the caller\nlacks (a known gap until per-query authorization lands).",
+        "description": "Returns the exposed (`@mcp(expose: true)`) subset of the `queries:` registry,\neach with its MCP tool name, read/mutate flag, description/instruction, and\ntyped parameters — enough for a client to register them as tools without\nfetching `.gq` source. **`invoke_query`-gated** (graph-scoped), so catalog\ndiscovery uses the same authority as invocation and matches the MCP\n`tools/list` surface: a caller that can list can invoke (subject to the inner\n`read`/`change` gate on the query body). Requires an explicit `invoke_query`\ngrant — in default-deny mode (tokens, no policy) it returns 403.",
         "operationId": "cluster_list_queries",
         "parameters": [
           {

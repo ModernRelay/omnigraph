@@ -13,9 +13,9 @@ use omnigraph_server::queries::{QueryRegistry, RegistrySpec};
 use omnigraph_server::{AppState, build_app};
 use serde_json::{Value, json};
 use support::{
-    FIND_PERSON_GQ, INVOKE_POLICY_YAML, app_for_loaded_graph_with_auth_tokens,
-    app_for_loaded_graph_with_auth_tokens_and_policy, app_with_stored_queries, g, graph_path,
-    init_loaded_graph, json_response,
+    FIND_PERSON_GQ, INVOKE_POLICY_YAML, POLICY_PROTECTED_READ_YAML,
+    app_for_loaded_graph_with_auth_tokens, app_for_loaded_graph_with_auth_tokens_and_policy,
+    app_with_stored_queries, g, graph_path, init_loaded_graph, json_response,
 };
 
 /// Build a JSON-RPC POST to `/graphs/default/mcp`. Sets the `Accept` (both
@@ -575,6 +575,40 @@ async fn stored_query_tool_folds_docs_and_honors_mcp_annotation() {
     .await;
     assert_eq!(status, StatusCode::OK);
     assert_ne!(v["result"]["isError"], json!(true), "renamed tool not callable: {v}");
+}
+
+#[tokio::test]
+async fn list_gate_matches_call_for_fixed_branchless_reads() {
+    // A protected-only reader. Branch-arg reads (graph_query) relax and show
+    // (callable on a protected branch). Fixed branchless reads (schema_get) use
+    // the faithful read(None) gate — which a protected-scope rule denies — so
+    // schema_get is hidden, matching the omnigraph://schema resource (same
+    // branchless read). Tool and resource agree by construction.
+    let (_t, app) = app_for_loaded_graph_with_auth_tokens_and_policy(
+        &[("act-bruno", "tok")],
+        POLICY_PROTECTED_READ_YAML,
+    )
+    .await;
+
+    let (_s, list) =
+        json_response(&app, mcp_request(Some("tok"), rpc(1, "tools/list", json!({})))).await;
+    let names = tool_names(&list);
+    assert!(
+        names.contains(&"graph_query".to_string()),
+        "branch-arg read relaxes and shows under protected-only read: {names:?}"
+    );
+    assert!(
+        !names.contains(&"schema_get".to_string()),
+        "fixed branchless read uses read(None), denied under protected-only → hidden: {names:?}"
+    );
+
+    // resources/list uses the same read(None) gate → empty, matching schema_get.
+    let (_s, res) =
+        json_response(&app, mcp_request(Some("tok"), rpc(2, "resources/list", json!({})))).await;
+    assert!(
+        res["result"]["resources"].as_array().unwrap().is_empty(),
+        "resources hidden under protected-only read, consistent with schema_get: {res}"
+    );
 }
 
 #[tokio::test]

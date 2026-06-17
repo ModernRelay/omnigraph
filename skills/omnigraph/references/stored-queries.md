@@ -32,7 +32,7 @@ omnigraph queries list         # print the addressed graph's registry: query nam
 
 | Route | Gate | Purpose |
 |-------|------|---------|
-| `GET /graphs/{id}/queries` | `read` | Typed tool catalog of the served queries. Graph-wide (branch-independent; `read` authorized against `main`). |
+| `GET /graphs/{id}/queries` | `invoke_query` | Typed tool catalog of the exposed queries. Graph-scoped (branch-independent) — same authority as invocation and the MCP `tools/list` surface, so listing and invoking agree. |
 | `POST /graphs/{id}/queries/{name}` | `invoke_query` (+ `change` for a stored mutation) | Invoke a named query. Body carries params only — **never** `.gq` source. A stored mutation cannot target a `snapshot` (`400`); a param type error is a structured `400` naming the param. |
 
 `?branch=` / `?snapshot=` query params apply to `POST /graphs/{id}/queries/{name}` reads; branch/snapshot access stays enforced by the inner `read`/`change` gate (`invoke_query` itself is graph-scoped, not branch-scoped).
@@ -66,5 +66,5 @@ Defaults (no `@mcp`): exposed, tool name = query name. There is no `cluster.yaml
 
 ## Note on per-query authorization
 
-The catalog is **not** Cedar-filtered per query yet: a caller with `read` but not `invoke_query` can *list* a query it cannot *invoke* (invocation would 404). Per-query authorization is future work; for now the catalog is a discovery surface and `invoke_query` is the invocation gate.
+Discovery and invocation share one gate: `invoke_query` lists the catalog *and* governs invocation (so a caller that can list can invoke, subject to the inner `read`/`change` gate on the query body). The gate is still **coarse** — `invoke_query` is graph-wide, not per query, so a holder sees/can-invoke every exposed query. Per-query Cedar scoping (distinguishing individual queries) is future work.
 

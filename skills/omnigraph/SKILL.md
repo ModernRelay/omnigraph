@@ -409,6 +409,7 @@ For anything beyond the basics, load the relevant reference file. Each is self-c
 | [`references/search.md`](references/search.md) | Embeddings, `@embed`, vector/text ranking, scope-then-rank pattern |
 | [`references/aliases.md`](references/aliases.md) | Defining aliases for agents, structured output, JSON args |
 | [`references/stored-queries.md`](references/stored-queries.md) | Server-side stored-query registry: declared in `cluster.yaml`, `omnigraph queries validate/list`, `GET /graphs/{id}/queries` + `POST /graphs/{id}/queries/{name}`, `invoke_query` Cedar gating |
-| [`references/server-policy.md`](references/server-policy.md) | Starting the HTTP server, routes, bearer auth, Cedar policy gating, multi-graph mode, the MCP surface (`POST /graphs/{id}/mcp` — connecting agents, tool catalog, list-vs-call gating) |
+| [`references/server-policy.md`](references/server-policy.md) | Starting the HTTP server, routes, bearer auth, Cedar policy gating, multi-graph mode (MCP surface → `references/mcp.md`) |
+| [`references/mcp.md`](references/mcp.md) | Serving a graph as an MCP server (`POST /graphs/{id}/mcp`): connecting an agent, the tool catalog + projection modes, `@mcp(...)`/`@description`/`@instruction` authoring of stored-query tools, `expose` vs `invoke_query`, Host/Origin + protocol-version contracts |
 | [`references/commands.md`](references/commands.md) | `snapshot`, `export`, `commit list/show`, addressing & resolution |
 | [`references/migrations.md`](references/migrations.md) | Migrating a pre-0.7.0 setup, or you hit an old config/command/flag/route/error and need its current form |
