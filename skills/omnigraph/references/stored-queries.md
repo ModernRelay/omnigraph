@@ -15,7 +15,7 @@ graphs:
     queries: queries/            # discover every `query <name>` in queries/*.gq
 ```
 
-`queries` also accepts an explicit file list (`[a.gq, b.gq]`) or a fine-grained `name: { file: … }` map; an unparseable `.gq` or a duplicate query name across files fails `cluster validate`. `cluster apply` publishes them to the content-addressed catalog, and the `--cluster` server type-checks and serves every applied query. Every applied query is listed (per-query `mcp:`/expose flags are a planned phase).
+`queries` also accepts an explicit file list (`[a.gq, b.gq]`) or a fine-grained `name: { file: … }` map; an unparseable `.gq` or a duplicate query name across files fails `cluster validate`. `cluster apply` publishes them to the content-addressed catalog, and the `--cluster` server type-checks and serves every applied query. Per-query MCP presentation (`expose`, `tool_name`) is set in the `.gq` source via the `@mcp(...)` annotation (see *MCP exposure* below), so it travels content-addressed with the query — no `cluster.yaml` per-query block needed.
 
 ## CLI
 
@@ -46,7 +46,23 @@ omnigraph queries list         # print the addressed graph's registry: query nam
 
 ## MCP exposure
 
-Every applied query is listed in `GET /graphs/{id}/queries` as a typed MCP tool. Per-query exposure controls (`mcp.expose`, `tool_name`) are a planned phase — there is no per-query `mcp:` flag in cluster mode today.
+Stored queries are surfaced two ways: the REST catalog `GET /graphs/{id}/queries` (typed entries for a client to register), and — since v0.8.0 — **live MCP tools** at `POST /graphs/{id}/mcp` (per-query tools below an exposed-count threshold, or a `stored_query_list` + `stored_query_run` pair above it). See [`server-policy.md`](server-policy.md#mcp-surface) and `docs/user/operations/mcp.md`.
+
+Per-query MCP presentation is set in the `.gq` source via `@mcp(...)`:
+
+```gq
+query find_user(@description("the user's slug") $slug: String)
+  @description("Look up a user by slug.")
+  @instruction("Use for exact slugs; for fuzzy names use search_users.")
+  @mcp(tool_name: "lookup_user", expose: true)
+{ match { $u: User { slug: $slug } } return { $u.name } }
+```
+
+- `@mcp(tool_name: "…")` — the MCP tool id (default: the query name). Must be unique across exposed queries and must not shadow a built-in, or the server refuses to boot.
+- `@mcp(expose: false)` — hide from `tools/list`, `stored_query_list`, and `stored_query_run` (by name). Presentation only: the query stays HTTP/service-callable via `POST /queries/{name}` for any caller with `invoke_query` (which is the *authorization* gate — Cedar, not `expose`).
+- The MCP tool description folds `@instruction` after `@description`; per-param `@description` documents each argument in the tool input schema.
+
+Defaults (no `@mcp`): exposed, tool name = query name. There is no `cluster.yaml` per-query block — the source annotation is the single home.
 
 ## Note on per-query authorization
 

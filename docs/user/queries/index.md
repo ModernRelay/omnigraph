@@ -3,8 +3,8 @@
 ## Query declarations
 
 ```
-query <name>($p1: T1, $p2: T2?, …)
-  @description("…") @instruction("…") {
+query <name>(@description("…") $p1: T1, $p2: T2?, …)
+  @description("…") @instruction("…") @mcp(tool_name: "…", expose: true) {
   …
 }
 ```
@@ -18,6 +18,31 @@ Multi-modal search functions (`nearest`, `bm25`, `rrf`, …) used inside `match`
 `return`, and `order` are documented on the [search](../search/index.md) page.
 
 Param types reuse all schema scalars; trailing `?` makes a param optional. The compiler reserves `$__nanograph_now` for `now()`.
+
+### Annotations
+
+Annotations after the param list are optional and order-independent:
+
+- `@description("…")` — human-readable summary of the query (shown in the
+  stored-query catalog and as the MCP tool description).
+- `@instruction("…")` — agent-facing *how/when to use* guidance. It is folded
+  into the [MCP](../operations/mcp.md) tool description (appended after
+  `@description`), so an agent reading `tools/list` sees it.
+- `@mcp(...)` — **MCP-presentation** controls for when the query is served as an
+  agent tool (see [mcp.md](../operations/mcp.md)). Both keys are optional:
+  - `tool_name: "<name>"` — the tool id to expose the query under (default: the
+    query name). Must be unique across exposed queries and must not shadow a
+    built-in tool, or the server refuses to boot.
+  - `expose: <bool>` — whether the query appears on the agent tool surface
+    (default `true`). `expose: false` keeps the query HTTP/service-callable by
+    name but hides it from `tools/list` and the catalog. This is **presentation
+    only** — not an authorization control (Cedar `invoke_query` governs who may
+    call it).
+
+A **per-parameter** `@description("…")` (written before the variable, e.g.
+`@description("the user's slug") $slug: String`) documents that argument; it is
+surfaced into the parameter's JSON-Schema `description` in the catalog and the
+MCP tool input schema.
 
 ## MATCH clauses
 

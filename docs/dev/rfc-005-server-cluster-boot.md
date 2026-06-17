@@ -88,9 +88,24 @@ Boot is fail-fast, matching the server's existing stance (bad policy YAML refuse
 | stored query fails type-check against the live schema | boot error (existing `validate_and_attach` behavior) |
 | state lock held | **not** an error — boot takes no lock; it reads a point-in-time snapshot of an immutable-once-written state file (the CAS discipline means a concurrent apply produces a *new* file atomically; the server reads whichever was current at open) |
 
-### D5. The `mcp.expose` bridge in cluster mode
+### D5. MCP presentation (`@mcp(expose, tool_name)`) in cluster mode
 
-The cluster query registry has no `expose` flag by design (axiom 14: exposure is a policy decision — Phase 6). Until Phase 6 ships, cluster-mode servers list **all** stored queries in `GET /queries`. This is the documented bridge: *cluster mode = everything exposed; omnigraph.yaml mode = `mcp.expose` honored as today*. Its named sunset is Phase 6's policy-filtered catalog (Compatibility Stance #9). Invocation remains gated by the existing coarse `invoke_query` Cedar action in both modes.
+**Superseded (v0.8.0).** The old "bridge" — cluster mode force-lists every stored
+query because the cluster registry had no `expose` flag — is gone. Per-query MCP
+presentation is now carried in the `.gq` **source** via the `@mcp(expose: …,
+tool_name: …)` annotation (re-parsed at boot from the content-addressed query
+blob), so cluster mode honors it the same as any other deployment; the boot path
+no longer hardcodes `expose: true`. Default with no `@mcp`: exposed, tool name =
+query name.
+
+Crucially this splits two axes the original bridge conflated: **`expose` is
+presentation** (does the query appear on the agent tool surface — `tools/list` /
+`GET /queries`), carried in source; **authorization** (who may invoke a query)
+stays the coarse `invoke_query` Cedar action, with a per-query refinement the
+durable future direction. An `expose: false` query is still HTTP/service-callable
+by name for any caller holding `invoke_query`. See
+[../user/queries/index.md](../user/queries/index.md#annotations) and
+[../user/operations/mcp.md](../user/operations/mcp.md).
 
 ### D6. Migration path (exit criterion 7)
 

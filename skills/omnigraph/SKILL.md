@@ -1,11 +1,11 @@
 ---
 name: omnigraph
-description: Store, retrieve, and query knowledge, memory, and relationships in an Omnigraph graph, and operate a local or remote Omnigraph deployment. Use when the user wants to capture or recall facts, notes, or entities, build or query a knowledge graph or agent memory, or run Omnigraph — and whenever you see Omnigraph CLI commands (omnigraph init/query/mutate/load/schema/lint/embed/branch/commit/login/profile/cluster), .pg schema or .gq query files, s3:// graph URIs, bearer-authed graph endpoints, 504 errors, or a cluster.yaml / omnigraph.yaml / ~/.omnigraph/config.yaml. Covers cluster-mode deployments (cluster.yaml plan/apply, omnigraph-server --cluster), the two config surfaces (cluster.yaml + ~/.omnigraph/config.yaml), schema evolution, query linting, data writes (mutate; load needs --mode/--from), branches, embeddings, Cedar policy, and remote ops. Especially important before schema apply (plan first), any load (--mode required), any .gq/.pg edit (lint after), or any remote write (verify via commit list).
+description: Store, retrieve, and query knowledge, memory, and relationships in an Omnigraph graph, and operate a local or remote Omnigraph deployment. Use when the user wants to capture or recall facts, notes, or entities, build or query a knowledge graph or agent memory, or run Omnigraph — and whenever you see Omnigraph CLI commands (omnigraph init/query/mutate/load/schema/lint/embed/branch/commit/login/profile/cluster), .pg schema or .gq query files, s3:// graph URIs, bearer-authed graph endpoints, an MCP endpoint or MCP client config for a graph (POST /graphs/{id}/mcp), 504 errors, or a cluster.yaml / omnigraph.yaml / ~/.omnigraph/config.yaml. Covers cluster-mode deployments (cluster.yaml plan/apply, omnigraph-server --cluster), the MCP surface (graphs as MCP servers), the two config surfaces (cluster.yaml + ~/.omnigraph/config.yaml), schema evolution, query linting, data writes (mutate; load needs --mode/--from), branches, embeddings, Cedar policy, and remote ops. Especially important before schema apply (plan first), any load (--mode required), any .gq/.pg edit (lint after), or any remote write (verify via commit list).
 license: MIT (see LICENSE at repo root)
-compatibility: Requires omnigraph CLI >= 0.7.0 — the unified `load`, the two config surfaces (cluster.yaml + ~/.omnigraph/config.yaml), and cluster apply/serve all require 0.7.0.
+compatibility: Requires omnigraph CLI >= 0.7.0 — the unified `load`, the two config surfaces (cluster.yaml + ~/.omnigraph/config.yaml), and cluster apply/serve all require 0.7.0. The MCP surface (POST /graphs/{id}/mcp) requires omnigraph-server >= 0.8.0.
 metadata:
   author: ModernRelay
-  version: "0.7.0"
+  version: "0.8.0"
   repository: https://github.com/ModernRelay/omnigraph
 ---
 
@@ -409,6 +409,6 @@ For anything beyond the basics, load the relevant reference file. Each is self-c
 | [`references/search.md`](references/search.md) | Embeddings, `@embed`, vector/text ranking, scope-then-rank pattern |
 | [`references/aliases.md`](references/aliases.md) | Defining aliases for agents, structured output, JSON args |
 | [`references/stored-queries.md`](references/stored-queries.md) | Server-side stored-query registry: declared in `cluster.yaml`, `omnigraph queries validate/list`, `GET /graphs/{id}/queries` + `POST /graphs/{id}/queries/{name}`, `invoke_query` Cedar gating |
-| [`references/server-policy.md`](references/server-policy.md) | Starting the HTTP server, routes, bearer auth, Cedar policy gating, multi-graph mode |
+| [`references/server-policy.md`](references/server-policy.md) | Starting the HTTP server, routes, bearer auth, Cedar policy gating, multi-graph mode, the MCP surface (`POST /graphs/{id}/mcp` — connecting agents, tool catalog, list-vs-call gating) |
 | [`references/commands.md`](references/commands.md) | `snapshot`, `export`, `commit list/show`, addressing & resolution |
 | [`references/migrations.md`](references/migrations.md) | Migrating a pre-0.7.0 setup, or you hit an old config/command/flag/route/error and need its current form |
