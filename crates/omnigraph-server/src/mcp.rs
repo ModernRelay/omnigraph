@@ -535,11 +535,19 @@ fn stored_query_input_schema(stored: &StoredQuery) -> Value {
 }
 
 fn stored_query_tool(stored: &StoredQuery) -> Tool {
-    let description = stored
+    // The MCP tool description folds `@description` and `@instruction` (the
+    // agent-facing "how to use" guidance) into the one description slot MCP
+    // tools have. Instruction-only queries still surface their instruction
+    // (appended to the fallback base).
+    let mut description = stored
         .decl
         .description
         .clone()
         .unwrap_or_else(|| format!("Stored query '{}'.", stored.name));
+    if let Some(instruction) = &stored.decl.instruction {
+        description.push_str("\n\n");
+        description.push_str(instruction);
+    }
     let annotations = if stored.is_mutation() {
         write_annotations(true)
     } else {

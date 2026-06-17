@@ -2198,6 +2198,13 @@
           "nullable"
         ],
         "properties": {
+          "description": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "Per-parameter documentation from a leading `@description(\"…\")`, surfaced\ninto the JSON-Schema property `description` (MCP tool input + catalog)."
+          },
           "item_kind": {
             "oneOf": [
               {

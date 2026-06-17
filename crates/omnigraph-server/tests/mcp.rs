@@ -519,6 +519,65 @@ async fn write_tool_listed_when_only_unprotected_writes_allowed() {
 }
 
 #[tokio::test]
+async fn stored_query_tool_folds_docs_and_honors_mcp_annotation() {
+    // A query carrying @description + @instruction + a per-param @description +
+    // @mcp(tool_name: …) projects as ONE tool whose name is the override, whose
+    // description folds the instruction in, and whose input schema documents the
+    // param — and it is callable under the override name (list == call).
+    const SRC: &str = r#"query find_person(@description("the person's exact name") $name: String)
+@description("Find a person by name.")
+@instruction("Use only for an exact name; for fuzzy matches use search.")
+@mcp(tool_name: "lookup_person")
+{ match { $p: Person { name: $name } } return { $p.age } }"#;
+
+    let (_t, app) = app_with_stored_queries(
+        &[("find_person", SRC, true)],
+        &[("act-invoke", "tok")],
+        INVOKE_POLICY_YAML,
+    )
+    .await;
+
+    let (_s, list) =
+        json_response(&app, mcp_request(Some("tok"), rpc(1, "tools/list", json!({})))).await;
+    let tools = list["result"]["tools"].as_array().unwrap();
+    let tool = tools
+        .iter()
+        .find(|t| t["name"] == json!("lookup_person"))
+        .unwrap_or_else(|| panic!("lookup_person not listed: {:?}", tool_names(&list)));
+    // The @mcp tool name replaces the query name on the surface.
+    assert!(
+        !tool_names(&list).contains(&"find_person".to_string()),
+        "query name must not double as a tool: {:?}",
+        tool_names(&list)
+    );
+    // Description folds @description then @instruction.
+    let desc = tool["description"].as_str().unwrap();
+    assert!(desc.contains("Find a person by name."), "description: {desc}");
+    assert!(desc.contains("Use only for an exact name"), "instruction folded in: {desc}");
+    // The parameter carries its @description in the tool input schema.
+    let param_desc =
+        tool["inputSchema"]["properties"]["params"]["properties"]["name"]["description"].as_str();
+    assert_eq!(
+        param_desc,
+        Some("the person's exact name"),
+        "param doc in input schema: {}",
+        tool["inputSchema"]
+    );
+
+    // Callable under the override name (list and call agree).
+    let (status, v) = json_response(
+        &app,
+        mcp_request(
+            Some("tok"),
+            rpc(2, "tools/call", json!({ "name": "lookup_person", "arguments": { "params": { "name": "Nobody" } } })),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_ne!(v["result"]["isError"], json!(true), "renamed tool not callable: {v}");
+}
+
+#[tokio::test]
 async fn per_query_mode_does_not_expose_meta_tools() {
     // Below the auto threshold the projection is per-query, so the discovery +
     // execute meta pair was never advertised. It must not be callable either —
@@ -607,8 +666,6 @@ fn stored_query_shadowing_a_builtin_is_a_load_error() {
     let result = QueryRegistry::from_specs(vec![RegistrySpec {
         name: "graph_query".to_string(),
         source: "query graph_query() { match { $p: Person } return { $p.name } }".to_string(),
-        expose: true,
-        tool_name: None,
     }]);
     let errors = result.expect_err("expected a collision error");
     assert!(

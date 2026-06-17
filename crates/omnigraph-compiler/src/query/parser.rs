@@ -50,6 +50,8 @@ fn parse_query_decl(pair: pest::iterators::Pair<Rule>) -> Result<QueryDecl> {
 
     let mut description = None;
     let mut instruction = None;
+    let mut mcp = McpQueryMeta::default();
+    let mut mcp_seen = false;
     let mut params = Vec::new();
     let mut match_clause = Vec::new();
     let mut return_clause = Vec::new();
@@ -66,33 +68,34 @@ fn parse_query_decl(pair: pest::iterators::Pair<Rule>) -> Result<QueryDecl> {
                     }
                 }
             }
-            Rule::query_annotation => {
-                let (annotation_name, value) = parse_query_annotation(item)?;
-                match annotation_name {
-                    "description" => {
-                        if description.replace(value).is_some() {
-                            return Err(NanoError::Parse(format!(
-                                "query `{}` cannot include duplicate @description annotations",
-                                name
-                            )));
-                        }
-                    }
-                    "instruction" => {
-                        if instruction.replace(value).is_some() {
-                            return Err(NanoError::Parse(format!(
-                                "query `{}` cannot include duplicate @instruction annotations",
-                                name
-                            )));
-                        }
-                    }
-                    other => {
+            Rule::query_annotation => match parse_query_annotation(item)? {
+                ParsedAnnotation::Description(value) => {
+                    if description.replace(value).is_some() {
                         return Err(NanoError::Parse(format!(
-                            "unsupported query annotation: @{}",
-                            other
+                            "query `{}` cannot include duplicate @description annotations",
+                            name
                         )));
                     }
                 }
-            }
+                ParsedAnnotation::Instruction(value) => {
+                    if instruction.replace(value).is_some() {
+                        return Err(NanoError::Parse(format!(
+                            "query `{}` cannot include duplicate @instruction annotations",
+                            name
+                        )));
+                    }
+                }
+                ParsedAnnotation::Mcp(value) => {
+                    if mcp_seen {
+                        return Err(NanoError::Parse(format!(
+                            "query `{}` cannot include duplicate @mcp annotations",
+                            name
+                        )));
+                    }
+                    mcp_seen = true;
+                    mcp = value;
+                }
+            },
             Rule::query_body => {
                 let body = item
                     .into_inner()
@@ -157,6 +160,7 @@ fn parse_query_decl(pair: pest::iterators::Pair<Rule>) -> Result<QueryDecl> {
         name,
         description,
         instruction,
+        mcp,
         params,
         match_clause,
         return_clause,
@@ -166,32 +170,36 @@ fn parse_query_decl(pair: pest::iterators::Pair<Rule>) -> Result<QueryDecl> {
     })
 }
 
-fn parse_query_annotation(pair: pest::iterators::Pair<Rule>) -> Result<(&'static str, String)> {
+enum ParsedAnnotation {
+    Description(String),
+    Instruction(String),
+    Mcp(McpQueryMeta),
+}
+
+/// Extract the single string-literal argument from an `@name("…")`-shaped
+/// annotation pair (`description_annotation` / `instruction_annotation`).
+fn annotation_string(pair: pest::iterators::Pair<Rule>, what: &str) -> Result<String> {
+    pair.into_inner()
+        .next()
+        .ok_or_else(|| NanoError::Parse(format!("{what} requires a string literal")))
+        .map(|value| parse_string_lit(value.as_str()))?
+}
+
+fn parse_query_annotation(pair: pest::iterators::Pair<Rule>) -> Result<ParsedAnnotation> {
     let inner = pair
         .into_inner()
         .next()
         .ok_or_else(|| NanoError::Parse("query annotation cannot be empty".to_string()))?;
     match inner.as_rule() {
-        Rule::description_annotation => {
-            let value = inner
-                .into_inner()
-                .next()
-                .ok_or_else(|| {
-                    NanoError::Parse("@description requires a string literal".to_string())
-                })
-                .map(|value| parse_string_lit(value.as_str()))??;
-            Ok(("description", value))
-        }
-        Rule::instruction_annotation => {
-            let value = inner
-                .into_inner()
-                .next()
-                .ok_or_else(|| {
-                    NanoError::Parse("@instruction requires a string literal".to_string())
-                })
-                .map(|value| parse_string_lit(value.as_str()))??;
-            Ok(("instruction", value))
-        }
+        Rule::description_annotation => Ok(ParsedAnnotation::Description(annotation_string(
+            inner,
+            "@description",
+        )?)),
+        Rule::instruction_annotation => Ok(ParsedAnnotation::Instruction(annotation_string(
+            inner,
+            "@instruction",
+        )?)),
+        Rule::mcp_annotation => Ok(ParsedAnnotation::Mcp(parse_mcp_annotation(inner)?)),
         other => Err(NanoError::Parse(format!(
             "unexpected query annotation rule: {:?}",
             other
@@ -199,9 +207,70 @@ fn parse_query_annotation(pair: pest::iterators::Pair<Rule>) -> Result<(&'static
     }
 }
 
+/// Parse `@mcp(expose: <bool>, tool_name: "<name>")` into [`McpQueryMeta`].
+/// Both keys are optional; a repeated key is a loud error.
+fn parse_mcp_annotation(pair: pest::iterators::Pair<Rule>) -> Result<McpQueryMeta> {
+    let mut meta = McpQueryMeta::default();
+    for arg in pair.into_inner() {
+        let kv = arg
+            .into_inner()
+            .next()
+            .ok_or_else(|| NanoError::Parse("@mcp argument cannot be empty".to_string()))?;
+        match kv.as_rule() {
+            Rule::mcp_expose_arg => {
+                let value = kv
+                    .into_inner()
+                    .next()
+                    .ok_or_else(|| {
+                        NanoError::Parse("@mcp expose requires a boolean".to_string())
+                    })?
+                    .as_str()
+                    == "true";
+                if meta.expose.replace(value).is_some() {
+                    return Err(NanoError::Parse(
+                        "@mcp cannot include duplicate `expose` arguments".to_string(),
+                    ));
+                }
+            }
+            Rule::mcp_tool_name_arg => {
+                let value = kv
+                    .into_inner()
+                    .next()
+                    .ok_or_else(|| {
+                        NanoError::Parse("@mcp tool_name requires a string literal".to_string())
+                    })
+                    .map(|value| parse_string_lit(value.as_str()))??;
+                if meta.tool_name.replace(value).is_some() {
+                    return Err(NanoError::Parse(
+                        "@mcp cannot include duplicate `tool_name` arguments".to_string(),
+                    ));
+                }
+            }
+            other => {
+                return Err(NanoError::Parse(format!(
+                    "unexpected @mcp argument rule: {:?}",
+                    other
+                )));
+            }
+        }
+    }
+    Ok(meta)
+}
+
 fn parse_param(pair: pest::iterators::Pair<Rule>) -> Result<Param> {
     let mut inner = pair.into_inner();
-    let var = inner.next().unwrap().as_str();
+    let mut next = inner
+        .next()
+        .ok_or_else(|| NanoError::Parse("parameter is missing a variable".to_string()))?;
+    // Optional leading `@description("…")` documents the parameter.
+    let mut description = None;
+    if next.as_rule() == Rule::description_annotation {
+        description = Some(annotation_string(next, "@description")?);
+        next = inner
+            .next()
+            .ok_or_else(|| NanoError::Parse("parameter is missing a variable".to_string()))?;
+    }
+    let var = next.as_str();
     let name = var.strip_prefix('$').unwrap_or(var).to_string();
     let type_ref = inner.next().unwrap();
     let nullable = type_ref.as_str().trim_end().ends_with('?');
@@ -237,6 +306,7 @@ fn parse_param(pair: pest::iterators::Pair<Rule>) -> Result<Param> {
         name,
         type_name: base,
         nullable,
+        description,
     })
 }
 

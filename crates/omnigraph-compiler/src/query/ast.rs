@@ -10,6 +10,10 @@ pub struct QueryDecl {
     pub name: String,
     pub description: Option<String>,
     pub instruction: Option<String>,
+    /// MCP-presentation controls from the `@mcp(...)` annotation (tool name +
+    /// visibility on the agent tool surface). Distinct from `description` /
+    /// `instruction`, which are general docs consumed by both REST and MCP.
+    pub mcp: McpQueryMeta,
     pub params: Vec<Param>,
     pub match_clause: Vec<Clause>,
     pub return_clause: Vec<Projection>,
@@ -18,11 +22,23 @@ pub struct QueryDecl {
     pub mutations: Vec<Mutation>,
 }
 
+/// Parsed `@mcp(...)` annotation. Both fields default to `None`: `expose`
+/// absent ⇒ exposed (the historical default); `tool_name` absent ⇒ the query
+/// name. Presentation only — never an authorization control.
+#[derive(Debug, Clone, Default)]
+pub struct McpQueryMeta {
+    pub expose: Option<bool>,
+    pub tool_name: Option<String>,
+}
+
 #[derive(Debug, Clone)]
 pub struct Param {
     pub name: String,
     pub type_name: String,
     pub nullable: bool,
+    /// Optional per-parameter documentation from a leading `@description("…")`,
+    /// surfaced into tool input-schema property descriptions.
+    pub description: Option<String>,
 }
 
 #[derive(Debug, Clone)]

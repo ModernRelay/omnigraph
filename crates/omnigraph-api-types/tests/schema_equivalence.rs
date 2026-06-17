@@ -63,6 +63,7 @@ fn descriptor(type_name: &str, nullable: bool) -> omnigraph_api_types::ParamDesc
         name: "p".to_string(),
         type_name: type_name.to_string(),
         nullable,
+        description: None,
     })
 }
 
@@ -136,6 +137,41 @@ fn nullable_rule_matches_the_parent_coercer() {
             "type {type_name}: non-nullable schema must reject null ({non_nullable})"
         );
     }
+}
+
+#[test]
+fn param_description_lands_on_the_outer_property() {
+    let doc = "the user's slug";
+    let with_doc = |type_name: &str, nullable: bool| {
+        param_json_schema(&param_descriptor(&Param {
+            name: "p".to_string(),
+            type_name: type_name.to_string(),
+            nullable,
+            description: Some(doc.to_string()),
+        }))
+    };
+
+    // Non-nullable: description is a sibling of the type.
+    let scalar = with_doc("String", false);
+    assert_eq!(scalar["description"], json!(doc));
+    assert_eq!(scalar["type"], json!("string"));
+
+    // Nullable: description sits on the OUTER object next to `anyOf`, never
+    // inside it (a consumer reading `anyOf[i].description` must not find it).
+    let nullable = with_doc("I32", true);
+    assert_eq!(nullable["description"], json!(doc));
+    assert!(nullable.get("anyOf").is_some(), "nullable schema keeps anyOf: {nullable}");
+    for branch in nullable["anyOf"].as_array().unwrap() {
+        assert!(branch.get("description").is_none(), "description leaked into anyOf branch: {branch}");
+    }
+    // Carries on a composite (list) too, and the value still validates.
+    let list = with_doc("[String]", false);
+    assert_eq!(list["description"], json!(doc));
+    assert!(schema_accepts(&list, &json!(["a", "b"])));
+
+    // Absent description → no `description` key (wire shape unchanged).
+    assert!(descriptor("String", false).description.is_none());
+    assert!(param_json_schema(&descriptor("String", false)).get("description").is_none());
 }
 
 #[test]

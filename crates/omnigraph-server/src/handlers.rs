@@ -1087,8 +1087,7 @@ pub(crate) async fn server_list_queries(
     )?;
     let queries = match handle.queries.as_ref() {
         Some(registry) => registry
-            .iter()
-            .filter(|q| q.expose)
+            .exposed()
             .map(api::query_catalog_entry)
             .collect(),
         None => Vec::new(),

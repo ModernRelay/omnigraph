@@ -31,15 +31,8 @@ pub struct StoredQuery {
     pub name: String,
     /// Full `.gq` source text the query was selected from.
     pub source: Arc<str>,
-    /// Parsed declaration (params, mutations, description, …).
+    /// Parsed declaration (params, mutations, description, `@mcp(...)`, …).
     pub decl: QueryDecl,
-    /// Whether this query is listed in the MCP tool catalog (`GET /queries`).
-    /// Default `true` (the manifest entry is the opt-in); `expose: false`
-    /// keeps it HTTP/service-callable but hidden from the agent tool list.
-    /// Catalog membership only — not an authorization gate.
-    pub expose: bool,
-    /// Optional MCP tool-name override; defaults to `name`.
-    pub tool_name: Option<String>,
 }
 
 impl StoredQuery {
@@ -49,13 +42,22 @@ impl StoredQuery {
         !self.decl.mutations.is_empty()
     }
 
-    /// The MCP tool name this query is catalogued under: the explicit
-    /// `tool_name` override, else the query `name`. The catalog key —
-    /// enforced unique across exposed queries at load. Server-side
-    /// consumers (the uniqueness check, the future catalog projection) read
-    /// this; the CLI `queries list` resolves the same rule on its own DTO.
+    /// Whether this query is listed on the MCP tool surface (`GET /queries` and
+    /// the `/mcp` tool catalog). From the source `@mcp(expose: …)` annotation;
+    /// absent ⇒ `true`. An unexposed query stays HTTP/service-callable by name —
+    /// this is **presentation only, not an authorization gate** (Cedar
+    /// `invoke_query` is the authority for who may call it).
+    pub fn is_exposed(&self) -> bool {
+        self.decl.mcp.expose.unwrap_or(true)
+    }
+
+    /// The MCP tool name this query is catalogued under: the source
+    /// `@mcp(tool_name: …)` override, else the query `name`. The catalog key —
+    /// enforced unique across exposed queries at load. Server-side consumers
+    /// (the uniqueness check, the catalog/MCP projection) read this; the CLI
+    /// `queries list` resolves the same rule on its own DTO.
     pub fn effective_tool_name(&self) -> &str {
-        self.tool_name.as_deref().unwrap_or(&self.name)
+        self.decl.mcp.tool_name.as_deref().unwrap_or(&self.name)
     }
 }
 
@@ -67,13 +69,13 @@ pub struct QueryRegistry {
 
 /// In-memory registry spec: a query's name + already-read `.gq` source. The
 /// input to [`QueryRegistry::from_specs`] — built by the server's cluster boot
-/// and by the CLI's `queries` tooling from a cluster serving snapshot.
+/// and by the CLI's `queries` tooling from a cluster serving snapshot. MCP
+/// presentation (`expose` / `tool_name`) is carried in the source `@mcp(...)`
+/// annotation, not here — see [`StoredQuery::is_exposed`] / `effective_tool_name`.
 #[derive(Debug, Clone)]
 pub struct RegistrySpec {
     pub name: String,
     pub source: String,
-    pub expose: bool,
-    pub tool_name: Option<String>,
 }
 
 /// A single registry load failure. Collected (not fail-fast) so a bad
@@ -120,8 +122,6 @@ impl QueryRegistry {
                                     name: spec.name,
                                     source: Arc::from(spec.source),
                                     decl,
-                                    expose: spec.expose,
-                                    tool_name: spec.tool_name,
                                 },
                             );
                         }
@@ -159,7 +159,7 @@ impl QueryRegistry {
             for builtin in crate::mcp::BUILTIN_TOOL_NAMES {
                 claimed.insert(builtin, BUILTIN_OWNER);
             }
-            for query in by_name.values().filter(|q| q.expose) {
+            for query in by_name.values().filter(|q| q.is_exposed()) {
                 let tool = query.effective_tool_name();
                 if let Some(winner) = claimed.insert(tool, &query.name) {
                     let message = if winner == BUILTIN_OWNER {
@@ -182,11 +182,11 @@ impl QueryRegistry {
         }
     }
 
-    /// Resolve by symbol name, **ignoring `expose`**. The raw catalog accessor
-    /// for HTTP/service callers (`expose:false` queries are deliberately
-    /// HTTP-callable; see [`StoredQuery::expose`]). The MCP backend must NOT use
-    /// this — it resolves through [`Self::exposed_by_name`] so the agent surface
-    /// can never reach a query hidden from the tool list.
+    /// Resolve by symbol name, **ignoring exposure**. The raw catalog accessor
+    /// for HTTP/service callers (`@mcp(expose: false)` queries are deliberately
+    /// HTTP-callable; see [`StoredQuery::is_exposed`]). The MCP backend must NOT
+    /// use this — it resolves through [`Self::exposed_by_name`] so the agent
+    /// surface can never reach a query hidden from the tool list.
     pub fn lookup(&self, name: &str) -> Option<&StoredQuery> {
         self.by_name.get(name)
     }
@@ -201,14 +201,14 @@ impl QueryRegistry {
     /// `stored_query_list` tool, and per-query tool dispatch all funnel through
     /// it, so they cannot drift on which queries an agent may see or run.
     pub fn exposed(&self) -> impl Iterator<Item = &StoredQuery> {
-        self.by_name.values().filter(|q| q.expose)
+        self.by_name.values().filter(|q| q.is_exposed())
     }
 
     /// Resolve by symbol name, **exposed-only** — the MCP `stored_query_run`
     /// resolver. An unexposed query is unreachable by name through this path
     /// even to a caller that knows the name (the agent surface honors `expose`).
     pub fn exposed_by_name(&self, name: &str) -> Option<&StoredQuery> {
-        self.by_name.get(name).filter(|q| q.expose)
+        self.by_name.get(name).filter(|q| q.is_exposed())
     }
 
     pub fn is_empty(&self) -> bool {
@@ -284,7 +284,7 @@ pub fn check(registry: &QueryRegistry, catalog: &Catalog) -> CheckReport {
                 message: err.to_string(),
             });
         }
-        if query.expose {
+        if query.is_exposed() {
             for param in &query.decl.params {
                 // Resolve to the structured type via the compiler's own
                 // resolver rather than string-matching `Vector(` — one
@@ -332,21 +332,34 @@ pub fn format_check_breakages(label: &str, report: &CheckReport) -> String {
 mod tests {
     use super::*;
 
-    fn spec(name: &str, source: &str, expose: bool) -> RegistrySpec {
-        RegistrySpec {
-            name: name.to_string(),
-            source: source.to_string(),
-            expose,
-            tool_name: None,
+    /// Inject an `@mcp(<args>)` annotation between the param-list `)` and the
+    /// body `{` (the first `{` in a query source is always the body open).
+    /// MCP presentation now lives in the source, so the test helpers express
+    /// expose/tool_name by rewriting the `.gq` rather than via dead spec fields.
+    fn inject_mcp(source: &str, args: &str) -> String {
+        match source.find('{') {
+            Some(i) => format!("{}@mcp({}) {}", &source[..i], args, &source[i..]),
+            None => source.to_string(),
         }
     }
 
+    fn spec(name: &str, source: &str, expose: bool) -> RegistrySpec {
+        let source = if expose {
+            source.to_string()
+        } else {
+            inject_mcp(source, "expose: false")
+        };
+        RegistrySpec { name: name.to_string(), source }
+    }
+
     fn spec_tool(name: &str, source: &str, expose: bool, tool_name: &str) -> RegistrySpec {
+        let mut args = format!("tool_name: {tool_name:?}");
+        if !expose {
+            args.push_str(", expose: false");
+        }
         RegistrySpec {
             name: name.to_string(),
-            source: source.to_string(),
-            expose,
-            tool_name: Some(tool_name.to_string()),
+            source: inject_mcp(source, &args),
         }
     }
 
@@ -360,7 +373,7 @@ mod tests {
         .unwrap();
         let q = reg.lookup("find_user").unwrap();
         assert_eq!(q.name, "find_user");
-        assert!(q.expose);
+        assert!(q.is_exposed());
         assert_eq!(q.decl.params.len(), 1);
         assert!(!q.is_mutation());
         // No override → the effective tool name is the query name.
