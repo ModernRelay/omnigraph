@@ -111,7 +111,6 @@ impl TableVersionMetadata {
         self.manifest_size
     }
 
-    #[cfg(test)]
     pub(crate) fn e_tag(&self) -> Option<&str> {
         self.e_tag.as_deref()
     }

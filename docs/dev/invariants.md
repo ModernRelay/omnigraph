@@ -277,11 +277,17 @@ them explicit.
   and share no Lance `Session`. That was an O(commits) cost that never warmed up.
   Fix 1 (warm coordinator reuse behind a `latest_version_id` probe), Fix 2 (open
   tables by location+version), finding A (validate once), and Fix 3 (a held
-  `Dataset`-handle cache keyed by `(table, branch, version)` plus one shared
-  `Session` per graph) remove that tax: a warm same-branch read does one probe,
-  one schema read, and zero opens on a repeat. Remaining: the internal metadata
-  tables (`__manifest`, `_graph_commits`) are still not compacted, so the probe
-  and refresh cost still grows with fragment count on a long-lived graph (the
+  `Dataset`-handle cache keyed by `(table, branch, version, e_tag when Lance
+  exposes it)` plus one shared `Session` per graph) remove that tax: a warm
+  same-branch read does one probe, one schema read, and zero opens on a repeat.
+  Non-main branch freshness compares the manifest incarnation (`version` plus
+  manifest-location e_tag when available, otherwise Lance manifest timestamp),
+  because Lance branch names can be deleted/recreated at the same version number;
+  the manifest e_tag is carried into synthetic snapshot ids when available, and
+  a detected same-branch manifest refresh clears read caches as the fallback for
+  e_tag-less table locations/topology. Remaining: the internal metadata tables
+  (`__manifest`, `_graph_commits`) are still not compacted, so the probe and
+  refresh cost still grows with fragment count on a long-lived graph (the
   `optimize`-covers-internal-tables follow-up); the commit graph is not yet
   reconcilable from the manifest; and the traversal id-map is still rebuilt.
 - **Commit-graph parent under concurrency:** `record_graph_commit` now refreshes

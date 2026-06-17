@@ -103,6 +103,7 @@ impl Snapshot {
                         &entry.table_path,
                         entry.table_branch.as_deref(),
                         entry.table_version,
+                        entry.version_metadata.e_tag(),
                         &location,
                         Some(&caches.session),
                     )
@@ -131,6 +132,31 @@ impl Snapshot {
 
     pub fn entries(&self) -> impl Iterator<Item = &SubTableEntry> {
         self.entries.values()
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct ManifestIncarnation {
+    pub(crate) version: u64,
+    pub(crate) e_tag: Option<String>,
+    timestamp_nanos: Option<u128>,
+}
+
+impl ManifestIncarnation {
+    pub(crate) fn matches(&self, held: &Self) -> bool {
+        if self.version != held.version {
+            return false;
+        }
+        match (&self.e_tag, &held.e_tag) {
+            (Some(latest), Some(current)) => latest == current,
+            _ => match (self.timestamp_nanos, held.timestamp_nanos) {
+                (Some(latest), Some(current)) => latest == current,
+                // Some object stores can omit both e_tag and manifest timestamp
+                // from the reachable API. In that narrow case the version-number
+                // probe is the strongest available identity.
+                _ => true,
+            },
+        }
     }
 }
 
@@ -415,6 +441,38 @@ impl ManifestCoordinator {
             .latest_version_id()
             .await
             .map_err(|e| OmniError::Lance(e.to_string()))
+    }
+
+    pub(crate) fn incarnation(&self) -> ManifestIncarnation {
+        ManifestIncarnation {
+            version: self.version(),
+            e_tag: self.dataset.manifest_location().e_tag.clone(),
+            timestamp_nanos: Some(self.dataset.manifest().timestamp_nanos),
+        }
+    }
+
+    /// Latest committed manifest identity. Main cannot be deleted/recreated, so
+    /// the cheap version-number probe is sufficient there. Non-main Lance
+    /// branches can be deleted and recreated with the same version number, so
+    /// load the latest manifest location and compare its e_tag / timestamp too.
+    pub(crate) async fn probe_latest_incarnation(&self) -> Result<ManifestIncarnation> {
+        if self.active_branch.is_none() {
+            return Ok(ManifestIncarnation {
+                version: self.probe_latest_version().await?,
+                e_tag: self.dataset.manifest_location().e_tag.clone(),
+                timestamp_nanos: Some(self.dataset.manifest().timestamp_nanos),
+            });
+        }
+        let (manifest, location) = self
+            .dataset
+            .latest_manifest()
+            .await
+            .map_err(|e| OmniError::Lance(e.to_string()))?;
+        Ok(ManifestIncarnation {
+            version: manifest.version,
+            e_tag: location.e_tag,
+            timestamp_nanos: Some(manifest.timestamp_nanos),
+        })
     }
 
     pub fn active_branch(&self) -> Option<&str> {

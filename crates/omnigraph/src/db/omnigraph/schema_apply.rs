@@ -447,8 +447,7 @@ where
         && sidecar_registrations.is_empty()
         && sidecar_tombstones.is_empty());
     if writes_sidecar {
-        schema_apply_queue_keys
-            .push(crate::db::manifest::schema_apply_serial_queue_key());
+        schema_apply_queue_keys.push(crate::db::manifest::schema_apply_serial_queue_key());
     }
     let _schema_apply_queue_guards = db
         .write_queue()
@@ -530,8 +529,7 @@ where
         .await?;
         let table_path = table_path_for_table_key(target_table_key)?;
         let dataset_uri = db.storage().dataset_uri(&table_path);
-        let target_ds =
-            SnapshotHandle::new(TableStore::write_dataset(&dataset_uri, batch).await?);
+        let target_ds = SnapshotHandle::new(TableStore::write_dataset(&dataset_uri, batch).await?);
         // Indexes on the renamed table are reconciled later (iss-848).
         let state = db.storage().table_state(&dataset_uri, &target_ds).await?;
         table_registrations.insert(target_table_key.clone(), table_path);

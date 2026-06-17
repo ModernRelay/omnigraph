@@ -1,4 +1,5 @@
 use std::collections::{HashMap, VecDeque};
+use std::hash::Hash;
 use std::sync::Arc;
 
 use lance::Dataset;
@@ -28,17 +29,15 @@ pub struct RuntimeCache {
     graph_indices: Mutex<GraphIndexCache>,
 }
 
-#[derive(Debug, Default)]
+#[derive(Debug)]
 struct GraphIndexCache {
-    entries: HashMap<GraphIndexCacheKey, Arc<GraphIndex>>,
-    lru: VecDeque<GraphIndexCacheKey>,
+    entries: LruMap<GraphIndexCacheKey, Arc<GraphIndex>>,
 }
 
 impl RuntimeCache {
     pub async fn invalidate_all(&self) {
         let mut cache = self.graph_indices.lock().await;
-        cache.entries.clear();
-        cache.lru.clear();
+        cache.entries.invalidate_all();
     }
 
     pub async fn graph_index(
@@ -50,7 +49,6 @@ impl RuntimeCache {
         {
             let mut cache = self.graph_indices.lock().await;
             if let Some(index) = cache.entries.get(&key).cloned() {
-                cache.touch(key.clone());
                 return Ok(index);
             }
         }
@@ -64,7 +62,6 @@ impl RuntimeCache {
         let index = Arc::new(GraphIndex::build(&resolved.snapshot, &edge_types).await?);
         let mut cache = self.graph_indices.lock().await;
         if let Some(existing) = cache.entries.get(&key).cloned() {
-            cache.touch(key);
             return Ok(existing);
         }
         cache.insert(key, Arc::clone(&index));
@@ -74,21 +71,83 @@ impl RuntimeCache {
 
 impl GraphIndexCache {
     fn insert(&mut self, key: GraphIndexCacheKey, value: Arc<GraphIndex>) {
-        self.entries.insert(key.clone(), value);
-        self.touch(key);
-        while self.entries.len() > 8 {
-            let Some(oldest) = self.lru.pop_front() else {
-                break;
-            };
-            if self.entries.remove(&oldest).is_some() {
-                break;
-            }
+        self.entries.insert(key, value);
+    }
+
+    #[cfg(test)]
+    fn touch(&mut self, key: GraphIndexCacheKey) {
+        self.entries.touch(key);
+    }
+}
+
+#[derive(Debug)]
+struct LruMap<K, V>
+where
+    K: Clone + Eq + Hash,
+{
+    entries: HashMap<K, V>,
+    lru: VecDeque<K>,
+    cap: usize,
+}
+
+impl<K, V> LruMap<K, V>
+where
+    K: Clone + Eq + Hash,
+{
+    fn new(cap: usize) -> Self {
+        Self {
+            entries: HashMap::new(),
+            lru: VecDeque::new(),
+            cap,
         }
     }
 
-    fn touch(&mut self, key: GraphIndexCacheKey) {
+    fn get(&mut self, key: &K) -> Option<&V> {
+        if self.entries.contains_key(key) {
+            self.touch(key.clone());
+            self.entries.get(key)
+        } else {
+            None
+        }
+    }
+
+    fn insert(&mut self, key: K, value: V) {
+        self.entries.insert(key.clone(), value);
+        self.touch(key);
+        while self.entries.len() > self.cap {
+            let Some(oldest) = self.lru.pop_front() else {
+                break;
+            };
+            self.entries.remove(&oldest);
+        }
+    }
+
+    fn invalidate_all(&mut self) {
+        self.entries.clear();
+        self.lru.clear();
+    }
+
+    #[cfg(test)]
+    fn contains_key(&self, key: &K) -> bool {
+        self.entries.contains_key(key)
+    }
+
+    #[cfg(test)]
+    fn len(&self) -> usize {
+        self.entries.len()
+    }
+
+    fn touch(&mut self, key: K) {
         self.lru.retain(|existing| existing != &key);
         self.lru.push_back(key);
+    }
+}
+
+impl Default for GraphIndexCache {
+    fn default() -> Self {
+        Self {
+            entries: LruMap::new(8),
+        }
     }
 }
 
@@ -118,8 +177,8 @@ fn graph_index_cache_key(resolved: &ResolvedTarget, catalog: &Catalog) -> GraphI
 
 /// Max held `Dataset` handles. A handle holds only Arcs (object store + manifest),
 /// never table data, so this is cheap; it bounds how many `(table, branch,
-/// version)` cells stay warm. One graph's live table set across a couple of
-/// branches at the current version fits comfortably, with headroom for the
+/// version, e_tag)` cells stay warm. One graph's live table set across a couple
+/// of branches at the current version fits comfortably, with headroom for the
 /// recently-superseded versions left by writes until they age out.
 const TABLE_HANDLE_CACHE_CAP: usize = 64;
 
@@ -128,25 +187,25 @@ struct TableHandleKey {
     table_path: String,
     table_branch: Option<String>,
     version: u64,
+    e_tag: Option<String>,
 }
 
-/// Held open-`Dataset` handles keyed by `(table_path, branch, version)` — the
+/// Held open-`Dataset` handles keyed by `(table_path, branch, version, e_tag)` — the
 /// version-keyed analogue of LanceDB's `DatasetConsistencyWrapper`
 /// (`rust/lancedb/src/table/dataset.rs`). A warm read reuses a held handle with
 /// zero open IO (a cheap `Dataset` clone); a miss opens once at the location with
-/// the shared `Session`. Version is in the key, so a write (which advances the
-/// table version) is simply a new key: the old handle ages out via LRU, no
-/// explicit invalidation needed for correctness. Only read-path Data opens use
-/// this — writes open HEAD directly and never receive a pinned handle.
+/// the shared `Session`. Version plus e_tag are in the key, so a write (or a
+/// delete/recreate that reuses a version number on object stores with e_tags) is
+/// simply a new key. A same-branch manifest refresh clears this cache as the
+/// fallback for e_tag-less table locations. Only read-path Data opens use this —
+/// writes open HEAD directly and never receive a pinned handle.
 #[derive(Default)]
 pub struct TableHandleCache {
     inner: Mutex<TableHandleCacheInner>,
 }
 
-#[derive(Default)]
 struct TableHandleCacheInner {
-    entries: HashMap<TableHandleKey, Dataset>,
-    lru: VecDeque<TableHandleKey>,
+    entries: LruMap<TableHandleKey, Dataset>,
 }
 
 impl TableHandleCache {
@@ -155,18 +214,18 @@ impl TableHandleCache {
     /// index cache (branch switch / refresh).
     pub async fn invalidate_all(&self) {
         let mut inner = self.inner.lock().await;
-        inner.entries.clear();
-        inner.lru.clear();
+        inner.entries.invalidate_all();
     }
 
-    /// Return the dataset for `(table_path, branch, version)`, reusing a held
-    /// handle (0 open IO) or opening it once at `location` with the shared
+    /// Return the dataset for `(table_path, branch, version, e_tag)`, reusing a
+    /// held handle (0 open IO) or opening it once at `location` with the shared
     /// `session` on a miss.
     pub async fn get_or_open(
         &self,
         table_path: &str,
         table_branch: Option<&str>,
         version: u64,
+        e_tag: Option<&str>,
         location: &str,
         session: Option<&Arc<Session>>,
     ) -> Result<Dataset> {
@@ -174,11 +233,11 @@ impl TableHandleCache {
             table_path: table_path.to_string(),
             table_branch: table_branch.map(str::to_string),
             version,
+            e_tag: e_tag.map(str::to_string),
         };
         {
             let mut inner = self.inner.lock().await;
             if let Some(ds) = inner.entries.get(&key).cloned() {
-                inner.touch(key);
                 return Ok(ds);
             }
         }
@@ -188,7 +247,6 @@ impl TableHandleCache {
         let ds = crate::instrumentation::open_table_dataset(location, version, session).await?;
         let mut inner = self.inner.lock().await;
         if let Some(existing) = inner.entries.get(&key).cloned() {
-            inner.touch(key);
             return Ok(existing);
         }
         inner.insert(key, ds.clone());
@@ -198,21 +256,15 @@ impl TableHandleCache {
 
 impl TableHandleCacheInner {
     fn insert(&mut self, key: TableHandleKey, value: Dataset) {
-        self.entries.insert(key.clone(), value);
-        self.touch(key);
-        while self.entries.len() > TABLE_HANDLE_CACHE_CAP {
-            let Some(oldest) = self.lru.pop_front() else {
-                break;
-            };
-            if self.entries.remove(&oldest).is_some() {
-                break;
-            }
-        }
+        self.entries.insert(key, value);
     }
+}
 
-    fn touch(&mut self, key: TableHandleKey) {
-        self.lru.retain(|existing| existing != &key);
-        self.lru.push_back(key);
+impl Default for TableHandleCacheInner {
+    fn default() -> Self {
+        Self {
+            entries: LruMap::new(TABLE_HANDLE_CACHE_CAP),
+        }
     }
 }
 
@@ -272,5 +324,22 @@ mod tests {
 
         assert!(cache.entries.contains_key(&key(0)));
         assert!(!cache.entries.contains_key(&key(1)));
+    }
+
+    #[test]
+    fn lru_map_evicts_oldest_and_touch_refreshes_order() {
+        let mut map = LruMap::new(2);
+        map.insert("a", 1);
+        map.insert("b", 2);
+
+        assert_eq!(map.get(&"a"), Some(&1));
+        map.insert("c", 3);
+
+        assert!(map.contains_key(&"a"));
+        assert!(!map.contains_key(&"b"));
+        assert!(map.contains_key(&"c"));
+
+        map.invalidate_all();
+        assert_eq!(map.len(), 0);
     }
 }

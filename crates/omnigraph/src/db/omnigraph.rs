@@ -368,10 +368,7 @@ impl Omnigraph {
     /// Open with a caller-supplied [`StorageAdapter`]. Used by init/test paths
     /// and by embedding/test consumers that wrap storage (e.g. a counting
     /// decorator for IO-budget tests). Defaults to `OpenMode::ReadWrite`.
-    pub async fn open_with_storage(
-        uri: &str,
-        storage: Arc<dyn StorageAdapter>,
-    ) -> Result<Self> {
+    pub async fn open_with_storage(uri: &str, storage: Arc<dyn StorageAdapter>) -> Result<Self> {
         Self::open_with_storage_and_mode(uri, storage, OpenMode::ReadWrite).await
     }
 
@@ -748,10 +745,13 @@ impl Omnigraph {
         let normalized = normalize_branch_name(branch.unwrap_or("main"))?;
         let coord = self.coordinator.read().await;
         if normalized.as_deref() == coord.current_branch() {
-            let snapshot_id = coord
-                .head_commit_id()
-                .await?
-                .unwrap_or_else(|| SnapshotId::synthetic(coord.current_branch(), coord.version()));
+            let snapshot_id = coord.head_commit_id().await?.unwrap_or_else(|| {
+                SnapshotId::synthetic(
+                    coord.current_branch(),
+                    coord.version(),
+                    coord.manifest_incarnation().e_tag.as_deref(),
+                )
+            });
             return Ok(ResolvedTarget {
                 requested,
                 branch: coord.current_branch().map(str::to_string),
@@ -814,9 +814,13 @@ impl Omnigraph {
         let branch = normalize_branch_name(branch)?;
         let next = self.open_coordinator_for_branch(branch.as_deref()).await?;
         *self.coordinator.write().await = next;
+        self.invalidate_read_caches().await;
+        Ok(())
+    }
+
+    async fn invalidate_read_caches(&self) {
         self.runtime_cache.invalidate_all().await;
         self.read_caches.handles.invalidate_all().await;
-        Ok(())
     }
 
     /// Re-read the handle-local coordinator state from storage AND run
@@ -918,8 +922,7 @@ impl Omnigraph {
         )
         .await?;
         self.reload_schema_if_source_changed().await?;
-        self.runtime_cache.invalidate_all().await;
-        self.read_caches.handles.invalidate_all().await;
+        self.invalidate_read_caches().await;
         Ok(())
     }
 
@@ -951,8 +954,7 @@ impl Omnigraph {
             // write that triggered the heal validates against the stale
             // schema. Same post-heal step as `refresh`.
             self.reload_schema_if_source_changed().await?;
-            self.runtime_cache.invalidate_all().await;
-        self.read_caches.handles.invalidate_all().await;
+            self.invalidate_read_caches().await;
         }
         Ok(())
     }
@@ -988,8 +990,7 @@ impl Omnigraph {
     /// own publish path.
     pub(crate) async fn refresh_coordinator_only(&self) -> Result<()> {
         self.coordinator.write().await.refresh().await?;
-        self.runtime_cache.invalidate_all().await;
-        self.read_caches.handles.invalidate_all().await;
+        self.invalidate_read_caches().await;
         Ok(())
     }
 
@@ -1016,7 +1017,9 @@ impl Omnigraph {
         // cleanup-vs-cached-handle edge. Writes never reach here (they use
         // `resolved_branch_target`), so they never receive a pinned handle.
         if matches!(target, ReadTarget::Branch(_)) {
-            resolved.snapshot.set_read_caches(Arc::clone(&self.read_caches));
+            resolved
+                .snapshot
+                .set_read_caches(Arc::clone(&self.read_caches));
         }
         Ok(resolved)
     }
@@ -1036,7 +1039,8 @@ impl Omnigraph {
                     // Different branch: cold resolve (opens that branch).
                     return coord.resolve_target(target).await;
                 }
-                if coord.probe_latest_version().await? == coord.version() {
+                let held = coord.manifest_incarnation();
+                if coord.probe_latest_incarnation().await?.matches(&held) {
                     return Ok(warm_resolved_target(&coord, target));
                 }
                 // Stale: refresh under the write lock below.
@@ -1045,10 +1049,18 @@ impl Omnigraph {
             if normalized.as_deref() == coord.current_branch() {
                 // Re-check after taking the write lock; another writer may have
                 // refreshed (tokio RwLock has no read->write upgrade).
-                if coord.probe_latest_version().await? != coord.version() {
+                let held = coord.manifest_incarnation();
+                let mut refreshed = false;
+                if !coord.probe_latest_incarnation().await?.matches(&held) {
                     coord.refresh_manifest_only().await?;
+                    refreshed = true;
                 }
-                return Ok(warm_resolved_target(&coord, target));
+                let resolved = warm_resolved_target(&coord, target);
+                drop(coord);
+                if refreshed {
+                    self.invalidate_read_caches().await;
+                }
+                return Ok(resolved);
             }
             // Branch changed while waiting for the write lock: cold resolve.
             return coord.resolve_target(target).await;
@@ -1751,14 +1763,19 @@ pub(crate) fn normalize_branch_name(branch: &str) -> Result<Option<String>> {
 }
 
 /// Build a `ResolvedTarget` from the warm coordinator without opening the commit
-/// graph. The live branch snapshot is pinned by the manifest version, so the id
-/// is synthetic `(branch, version)`; nothing on the read path needs a real commit
-/// ULID (only `RuntimeCache` keys on the id, where synthetic is consistent).
+/// graph. The live branch snapshot is pinned by the manifest incarnation, so the
+/// id is synthetic `(branch, version, e_tag when available)`; nothing on the read
+/// path needs a real commit ULID (only `RuntimeCache` keys on the id, where
+/// synthetic is consistent).
 fn warm_resolved_target(coord: &GraphCoordinator, requested: &ReadTarget) -> ResolvedTarget {
     ResolvedTarget {
         requested: requested.clone(),
         branch: coord.current_branch().map(str::to_string),
-        snapshot_id: SnapshotId::synthetic(coord.current_branch(), coord.version()),
+        snapshot_id: SnapshotId::synthetic(
+            coord.current_branch(),
+            coord.version(),
+            coord.manifest_incarnation().e_tag.as_deref(),
+        ),
         snapshot: coord.snapshot(),
     }
 }

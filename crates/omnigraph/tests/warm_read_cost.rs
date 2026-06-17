@@ -10,21 +10,29 @@ mod helpers;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 
+use arrow_array::{Array, StringArray};
 use lance::io::WrappingObjectStore;
 use lance_io::utils::tracking_store::IOTracker;
 use omnigraph::db::{Omnigraph, ReadTarget};
 use omnigraph::instrumentation::{QueryIoProbes, with_query_io_probes};
+use omnigraph_compiler::result::QueryResult;
 
 use helpers::{
     MUTATION_QUERIES, TEST_QUERIES, commit_many, count_rows, init_and_load, mixed_params,
-    mutate_main, params,
+    mutate_branch, mutate_main, params,
 };
 
 /// IO probes plus the tracker handles to read `read_iops` after the query.
 /// Returns `(probes, manifest, commit_graph, table, probe_count)` — `table`
 /// counts per-table data opens (the cache-miss path), so a cost test can assert
 /// N opens on a cold read and 0 on a warm repeat (Fix 3).
-fn probes() -> (QueryIoProbes, IOTracker, IOTracker, IOTracker, Arc<AtomicU64>) {
+fn probes() -> (
+    QueryIoProbes,
+    IOTracker,
+    IOTracker,
+    IOTracker,
+    Arc<AtomicU64>,
+) {
     let manifest = IOTracker::default();
     let commit_graph = IOTracker::default();
     let table = IOTracker::default();
@@ -36,6 +44,24 @@ fn probes() -> (QueryIoProbes, IOTracker, IOTracker, IOTracker, Arc<AtomicU64>) 
         probe_count: Arc::clone(&probe_count),
     };
     (probes, manifest, commit_graph, table, probe_count)
+}
+
+fn first_column_strings(result: &QueryResult) -> Vec<String> {
+    if result.num_rows() == 0 {
+        return Vec::new();
+    }
+    let batch = result.concat_batches().unwrap();
+    let values = batch
+        .column(0)
+        .as_any()
+        .downcast_ref::<StringArray>()
+        .unwrap();
+    let mut out = (0..values.len())
+        .filter(|&row| !values.is_null(row))
+        .map(|row| values.value(row).to_string())
+        .collect::<Vec<_>>();
+    out.sort();
+    out
 }
 
 /// A warm same-branch read must not re-open or scan `__manifest`, and must not
@@ -209,7 +235,11 @@ async fn schema_source_drift_is_caught_on_read() {
     let reader = Omnigraph::open(uri).await.unwrap();
 
     // Drift the on-disk schema source behind the reader's back.
-    std::fs::write(dir.path().join("_schema.pg"), "this is not a valid schema {{{").unwrap();
+    std::fs::write(
+        dir.path().join("_schema.pg"),
+        "this is not a valid schema {{{",
+    )
+    .unwrap();
 
     let result = reader
         .query(
@@ -278,6 +308,340 @@ async fn warm_branch_read_does_no_manifest_scans() {
     );
 }
 
+/// A non-main branch can be deleted and recreated at the same Lance version
+/// number. Warm branch freshness therefore needs the manifest incarnation, not
+/// just `version()`, or a reader pinned to the old incarnation can serve stale
+/// rows from the deleted branch. This is the correctness guard for Phase 6A.
+#[tokio::test]
+async fn warm_read_on_recreated_branch_observes_new_incarnation() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut writer = init_and_load(&dir).await;
+    let uri = dir.path().to_str().unwrap();
+    let reader = Omnigraph::open(uri).await.unwrap();
+
+    writer.branch_create("feature").await.unwrap();
+    mutate_branch(
+        &mut writer,
+        "feature",
+        MUTATION_QUERIES,
+        "insert_person",
+        &mixed_params(&[("$name", "Eve")], &[("$age", 22)]),
+    )
+    .await
+    .unwrap();
+
+    reader.sync_branch("feature").await.unwrap();
+    let old_feature = reader
+        .query(
+            ReadTarget::branch("feature"),
+            TEST_QUERIES,
+            "get_person",
+            &params(&[("$name", "Eve")]),
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        old_feature.num_rows(),
+        1,
+        "test setup: old feature branch must contain Eve"
+    );
+    let old_version = reader
+        .version_of(ReadTarget::branch("feature"))
+        .await
+        .unwrap();
+
+    writer.branch_delete("feature").await.unwrap();
+    mutate_main(
+        &mut writer,
+        MUTATION_QUERIES,
+        "insert_person",
+        &mixed_params(&[("$name", "MainOnly")], &[("$age", 44)]),
+    )
+    .await
+    .unwrap();
+    writer.branch_create("feature").await.unwrap();
+    let new_version = writer
+        .version_of(ReadTarget::branch("feature"))
+        .await
+        .unwrap();
+    assert_eq!(
+        new_version, old_version,
+        "test setup must exercise branch incarnation reuse at one Lance version"
+    );
+
+    let (probes_in, manifest, commit_graph, _table, probe_count) = probes();
+    let new_feature = with_query_io_probes(
+        probes_in,
+        reader.query(
+            ReadTarget::branch("feature"),
+            TEST_QUERIES,
+            "get_person",
+            &params(&[("$name", "MainOnly")]),
+        ),
+    )
+    .await
+    .unwrap();
+
+    assert_eq!(
+        new_feature.num_rows(),
+        1,
+        "warm reader must refresh to the recreated branch incarnation"
+    );
+    assert!(
+        manifest.stats().read_iops > 0,
+        "recreated branch must re-read the manifest after the incarnation probe"
+    );
+    assert_eq!(
+        commit_graph.stats().read_iops,
+        0,
+        "same-branch incarnation refresh must be manifest-only"
+    );
+    assert_eq!(
+        probe_count.load(Ordering::Relaxed),
+        2,
+        "stale same-branch read probes once under the read lock and once under the write lock"
+    );
+}
+
+/// Recreated non-main branches can reuse the same branch-owned table version.
+/// This forces the held table-handle cache to distinguish incarnations by the
+/// per-table Lance manifest e_tag, not just `(table_path, branch, version)`.
+#[tokio::test]
+async fn recreated_branch_owned_table_handle_uses_table_etag() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut writer = init_and_load(&dir).await;
+    let uri = dir.path().to_str().unwrap();
+    let reader = Omnigraph::open(uri).await.unwrap();
+
+    writer.branch_create("feature").await.unwrap();
+    mutate_branch(
+        &mut writer,
+        "feature",
+        MUTATION_QUERIES,
+        "insert_person",
+        &mixed_params(&[("$name", "OldOnly")], &[("$age", 31)]),
+    )
+    .await
+    .unwrap();
+
+    reader.sync_branch("feature").await.unwrap();
+    let old_person = reader
+        .query(
+            ReadTarget::branch("feature"),
+            TEST_QUERIES,
+            "get_person",
+            &params(&[("$name", "OldOnly")]),
+        )
+        .await
+        .unwrap();
+    assert_eq!(old_person.num_rows(), 1);
+    let old_entry = reader
+        .snapshot_of(ReadTarget::branch("feature"))
+        .await
+        .unwrap()
+        .entry("node:Person")
+        .unwrap()
+        .clone();
+    assert_eq!(old_entry.table_branch.as_deref(), Some("feature"));
+
+    writer.branch_delete("feature").await.unwrap();
+    writer.branch_create("feature").await.unwrap();
+    mutate_branch(
+        &mut writer,
+        "feature",
+        MUTATION_QUERIES,
+        "insert_person",
+        &mixed_params(&[("$name", "NewOnly")], &[("$age", 32)]),
+    )
+    .await
+    .unwrap();
+    let new_entry = writer
+        .snapshot_of(ReadTarget::branch("feature"))
+        .await
+        .unwrap()
+        .entry("node:Person")
+        .unwrap()
+        .clone();
+    assert_eq!(new_entry.table_path, old_entry.table_path);
+    assert_eq!(new_entry.table_branch, old_entry.table_branch);
+    assert_eq!(
+        new_entry.table_version, old_entry.table_version,
+        "test setup must force table handle identity to differ only by e_tag"
+    );
+
+    let (probes_in, manifest, commit_graph, table, probe_count) = probes();
+    let new_person = with_query_io_probes(
+        probes_in,
+        reader.query(
+            ReadTarget::branch("feature"),
+            TEST_QUERIES,
+            "get_person",
+            &params(&[("$name", "NewOnly")]),
+        ),
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        new_person.num_rows(),
+        1,
+        "warm reader must open the recreated branch-owned table incarnation"
+    );
+    assert!(
+        table.stats().read_iops > 0,
+        "table e_tag must force a held-handle cache miss for the recreated table"
+    );
+    assert!(
+        manifest.stats().read_iops > 0,
+        "recreated branch must refresh the manifest"
+    );
+    assert_eq!(
+        commit_graph.stats().read_iops,
+        0,
+        "same-branch table-incarnation refresh must be manifest-only"
+    );
+    assert_eq!(
+        probe_count.load(Ordering::Relaxed),
+        2,
+        "stale same-branch read probes once under each lock"
+    );
+
+    let stale_old_person = reader
+        .query(
+            ReadTarget::branch("feature"),
+            TEST_QUERIES,
+            "get_person",
+            &params(&[("$name", "OldOnly")]),
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        stale_old_person.num_rows(),
+        0,
+        "old branch-owned table contents must not leak after branch recreation"
+    );
+}
+
+/// The graph-index cache is keyed by synthetic snapshot id plus edge-table
+/// state. A recreated branch can reuse the same edge table `(branch, version)`,
+/// so the synthetic snapshot id must carry the manifest incarnation or traversal
+/// can reuse stale topology.
+#[tokio::test]
+async fn recreated_branch_traversal_uses_graph_index_incarnation() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut writer = init_and_load(&dir).await;
+    let uri = dir.path().to_str().unwrap();
+    let reader = Omnigraph::open(uri).await.unwrap();
+
+    writer.branch_create("feature").await.unwrap();
+    mutate_branch(
+        &mut writer,
+        "feature",
+        MUTATION_QUERIES,
+        "insert_person_and_friend",
+        &mixed_params(
+            &[("$name", "OldWalker"), ("$friend", "Alice")],
+            &[("$age", 41)],
+        ),
+    )
+    .await
+    .unwrap();
+
+    reader.sync_branch("feature").await.unwrap();
+    let old_friends = reader
+        .query(
+            ReadTarget::branch("feature"),
+            TEST_QUERIES,
+            "friends_of",
+            &params(&[("$name", "OldWalker")]),
+        )
+        .await
+        .unwrap();
+    assert_eq!(first_column_strings(&old_friends), vec!["Alice"]);
+    let old_edge_entry = reader
+        .snapshot_of(ReadTarget::branch("feature"))
+        .await
+        .unwrap()
+        .entry("edge:Knows")
+        .unwrap()
+        .clone();
+    assert_eq!(old_edge_entry.table_branch.as_deref(), Some("feature"));
+
+    writer.branch_delete("feature").await.unwrap();
+    writer.branch_create("feature").await.unwrap();
+    mutate_branch(
+        &mut writer,
+        "feature",
+        MUTATION_QUERIES,
+        "insert_person_and_friend",
+        &mixed_params(
+            &[("$name", "NewWalker"), ("$friend", "Bob")],
+            &[("$age", 42)],
+        ),
+    )
+    .await
+    .unwrap();
+    let new_edge_entry = writer
+        .snapshot_of(ReadTarget::branch("feature"))
+        .await
+        .unwrap()
+        .entry("edge:Knows")
+        .unwrap()
+        .clone();
+    assert_eq!(new_edge_entry.table_path, old_edge_entry.table_path);
+    assert_eq!(new_edge_entry.table_branch, old_edge_entry.table_branch);
+    assert_eq!(
+        new_edge_entry.table_version, old_edge_entry.table_version,
+        "test setup must force graph-index identity to differ only by snapshot incarnation"
+    );
+
+    let (probes_in, manifest, commit_graph, _table, probe_count) = probes();
+    let new_friends = with_query_io_probes(
+        probes_in,
+        reader.query(
+            ReadTarget::branch("feature"),
+            TEST_QUERIES,
+            "friends_of",
+            &params(&[("$name", "NewWalker")]),
+        ),
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        first_column_strings(&new_friends),
+        vec!["Bob"],
+        "traversal must use the recreated branch's topology, not stale cached graph index"
+    );
+    assert!(
+        manifest.stats().read_iops > 0,
+        "recreated branch traversal must refresh the manifest"
+    );
+    assert_eq!(
+        commit_graph.stats().read_iops,
+        0,
+        "same-branch traversal incarnation refresh must be manifest-only"
+    );
+    assert_eq!(
+        probe_count.load(Ordering::Relaxed),
+        2,
+        "stale same-branch read probes once under each lock"
+    );
+
+    let stale_old_friends = reader
+        .query(
+            ReadTarget::branch("feature"),
+            TEST_QUERIES,
+            "friends_of",
+            &params(&[("$name", "OldWalker")]),
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        first_column_strings(&stale_old_friends),
+        Vec::<String>::new(),
+        "old branch topology must not leak after branch recreation"
+    );
+}
+
 /// When an external writer advances the manifest, the reader's next query takes
 /// the STALE path: it re-reads the manifest (read_iops > 0) but never scans the
 /// commit graph (`refresh_manifest_only`), unlike a full coordinator refresh.
@@ -309,7 +673,7 @@ async fn stale_read_refreshes_manifest_only() {
     .await
     .unwrap();
 
-    let (probes_in, manifest, commit_graph, _table, _probe) = probes();
+    let (probes_in, manifest, commit_graph, _table, probe_count) = probes();
     with_query_io_probes(
         probes_in,
         reader.query(
@@ -331,13 +695,18 @@ async fn stale_read_refreshes_manifest_only() {
         0,
         "stale refresh must be manifest-only (no commit-graph scan)"
     );
+    assert_eq!(
+        probe_count.load(Ordering::Relaxed),
+        2,
+        "stale same-branch read probes once under the read lock and once under the write lock"
+    );
 }
 
 // ── Fix 3: held-handle cache — warm repeat reads stop re-opening tables ────────
 //
 // After Fix 1+2 a warm same-branch read still re-opened every touched table per
 // query (the "never warms up" residual). Fix 3 holds the open `Dataset` per
-// `(table, branch, version)` (the version-keyed analogue of LanceDB's
+// `(table, branch, version, e_tag)` (the version-keyed analogue of LanceDB's
 // `DatasetConsistencyWrapper`) and shares one `Session` per graph, so a second
 // identical warm read reuses the handle with zero table opens.
 

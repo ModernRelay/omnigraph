@@ -10,7 +10,9 @@ use crate::storage::{StorageAdapter, join_uri, normalize_root_uri};
 
 use super::commit_graph::{CommitGraph, GraphCommit};
 use super::is_internal_system_branch;
-use super::manifest::{ManifestChange, ManifestCoordinator, Snapshot, SubTableUpdate};
+use super::manifest::{
+    ManifestChange, ManifestCoordinator, ManifestIncarnation, Snapshot, SubTableUpdate,
+};
 
 const GRAPH_COMMITS_DIR: &str = "_graph_commits.lance";
 
@@ -26,10 +28,11 @@ impl SnapshotId {
         &self.0
     }
 
-    pub(crate) fn synthetic(branch: Option<&str>, version: u64) -> Self {
-        match branch {
-            Some(branch) => Self(format!("manifest:{}:v{}", branch, version)),
-            None => Self(format!("manifest:main:v{}", version)),
+    pub(crate) fn synthetic(branch: Option<&str>, version: u64, e_tag: Option<&str>) -> Self {
+        let branch = branch.unwrap_or("main");
+        match e_tag {
+            Some(e_tag) => Self(format!("manifest:{}:v{}:etag:{}", branch, version, e_tag)),
+            None => Self(format!("manifest:{}:v{}", branch, version)),
         }
     }
 }
@@ -166,6 +169,10 @@ impl GraphCoordinator {
         self.manifest.version()
     }
 
+    pub(crate) fn manifest_incarnation(&self) -> ManifestIncarnation {
+        self.manifest.incarnation()
+    }
+
     pub fn snapshot(&self) -> Snapshot {
         self.manifest.snapshot()
     }
@@ -182,11 +189,9 @@ impl GraphCoordinator {
         Ok(())
     }
 
-    /// Cheap freshness probe: the latest manifest version on disk. Records the
-    /// probe for cost instrumentation. Reads compare this against `version()`.
-    pub async fn probe_latest_version(&self) -> Result<u64> {
+    pub(crate) async fn probe_latest_incarnation(&self) -> Result<ManifestIncarnation> {
         crate::instrumentation::record_probe();
-        self.manifest.probe_latest_version().await
+        self.manifest.probe_latest_incarnation().await
     }
 
     /// Refresh only the manifest (not the commit graph). The read path uses this
@@ -330,10 +335,13 @@ impl GraphCoordinator {
             None => GraphCoordinator::open(self.root_uri(), Arc::clone(&self.storage)).await?,
         };
 
-        Ok(other
-            .head_commit_id()
-            .await?
-            .unwrap_or_else(|| SnapshotId::synthetic(other.current_branch(), other.version())))
+        Ok(other.head_commit_id().await?.unwrap_or_else(|| {
+            SnapshotId::synthetic(
+                other.current_branch(),
+                other.version(),
+                other.manifest_incarnation().e_tag.as_deref(),
+            )
+        }))
     }
 
     pub async fn resolve_target(&self, target: &ReadTarget) -> Result<ResolvedTarget> {
@@ -354,7 +362,11 @@ impl GraphCoordinator {
                     }
                 };
                 let snapshot_id = other.head_commit_id().await?.unwrap_or_else(|| {
-                    SnapshotId::synthetic(other.current_branch(), other.version())
+                    SnapshotId::synthetic(
+                        other.current_branch(),
+                        other.version(),
+                        other.manifest_incarnation().e_tag.as_deref(),
+                    )
                 });
                 Ok(ResolvedTarget {
                     requested: target.clone(),
@@ -524,6 +536,7 @@ impl GraphCoordinator {
             return Ok(SnapshotId::synthetic(
                 current_branch.as_deref(),
                 manifest_version,
+                self.manifest_incarnation().e_tag.as_deref(),
             ));
         };
         failpoints::maybe_fail("graph_publish.before_commit_append")?;

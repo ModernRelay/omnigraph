@@ -29,6 +29,8 @@ use lance_namespace::models::CreateTableVersionRequest;
 
 use crate::error::{OmniError, Result};
 
+#[cfg(test)]
+use super::SubTableUpdate;
 use super::layout::{open_manifest_dataset, tombstone_object_id, version_object_id};
 use super::metadata::parse_namespace_version_request;
 use super::migrations::migrate_internal_schema;
@@ -40,8 +42,6 @@ use super::{
     ManifestChange, OBJECT_TYPE_TABLE, OBJECT_TYPE_TABLE_TOMBSTONE, OBJECT_TYPE_TABLE_VERSION,
     SubTableEntry, TableRegistration, TableTombstone,
 };
-#[cfg(test)]
-use super::SubTableUpdate;
 
 /// Bound on the publisher-level retry loop that wraps Lance's row-level CAS
 /// (`TooMuchWriteContention`). Lance's own `conflict_retries` is set to 0 in
