@@ -102,7 +102,6 @@ Full diagram and concurrency model: [docs/dev/architecture.md](docs/dev/architec
 | Install (binary / Homebrew / source / channels) | [docs/user/install.md](docs/user/install.md) |
 | Deployment (binary / container / S3-local testing / auth / build variants) | [docs/user/deployment.md](docs/user/deployment.md) |
 | CI / release workflows | [docs/dev/ci.md](docs/dev/ci.md) |
-| Code ownership (CODEOWNERS source of truth, roles, regeneration) | [docs/dev/codeowners.md](docs/dev/codeowners.md) |
 | Branch protection policy (declarative, applied via `scripts/apply-branch-protection.sh`) | [docs/dev/branch-protection.md](docs/dev/branch-protection.md) |
 | Constants & tunables cheat sheet | [docs/user/reference/constants.md](docs/user/reference/constants.md) |
 | Per-version release notes | [docs/releases/](docs/releases/) |
