@@ -3,7 +3,7 @@ use pest::error::InputLocation;
 use pest_derive::Parser;
 
 use crate::error::{
-    NanoError, ParseDiagnostic, Result, SourceSpan, decode_string_literal, render_span,
+    CompilerError, ParseDiagnostic, Result, SourceSpan, decode_string_literal, render_span,
 };
 
 use super::ast::*;
@@ -13,7 +13,7 @@ use super::ast::*;
 struct QueryParser;
 
 pub fn parse_query(input: &str) -> Result<QueryFile> {
-    parse_query_diagnostic(input).map_err(|e| NanoError::Parse(e.to_string()))
+    parse_query_diagnostic(input).map_err(|e| CompilerError::Parse(e.to_string()))
 }
 
 pub fn parse_query_diagnostic(input: &str) -> std::result::Result<QueryFile, ParseDiagnostic> {
@@ -24,7 +24,7 @@ pub fn parse_query_diagnostic(input: &str) -> std::result::Result<QueryFile, Par
         if let Rule::query_file = pair.as_rule() {
             for inner in pair.into_inner() {
                 if let Rule::query_decl = inner.as_rule() {
-                    queries.push(parse_query_decl(inner).map_err(nano_error_to_diagnostic)?);
+                    queries.push(parse_query_decl(inner).map_err(compiler_error_to_diagnostic)?);
                 }
             }
         }
@@ -40,7 +40,7 @@ fn pest_error_to_diagnostic(err: pest::error::Error<Rule>) -> ParseDiagnostic {
     ParseDiagnostic::new(err.to_string(), span)
 }
 
-fn nano_error_to_diagnostic(err: NanoError) -> ParseDiagnostic {
+fn compiler_error_to_diagnostic(err: CompilerError) -> ParseDiagnostic {
     ParseDiagnostic::new(err.to_string(), None)
 }
 
@@ -71,7 +71,7 @@ fn parse_query_decl(pair: pest::iterators::Pair<Rule>) -> Result<QueryDecl> {
                 match annotation_name {
                     "description" => {
                         if description.replace(value).is_some() {
-                            return Err(NanoError::Parse(format!(
+                            return Err(CompilerError::Parse(format!(
                                 "query `{}` cannot include duplicate @description annotations",
                                 name
                             )));
@@ -79,14 +79,14 @@ fn parse_query_decl(pair: pest::iterators::Pair<Rule>) -> Result<QueryDecl> {
                     }
                     "instruction" => {
                         if instruction.replace(value).is_some() {
-                            return Err(NanoError::Parse(format!(
+                            return Err(CompilerError::Parse(format!(
                                 "query `{}` cannot include duplicate @instruction annotations",
                                 name
                             )));
                         }
                     }
                     other => {
-                        return Err(NanoError::Parse(format!(
+                        return Err(CompilerError::Parse(format!(
                             "unsupported query annotation: @{}",
                             other
                         )));
@@ -94,10 +94,9 @@ fn parse_query_decl(pair: pest::iterators::Pair<Rule>) -> Result<QueryDecl> {
                 }
             }
             Rule::query_body => {
-                let body = item
-                    .into_inner()
-                    .next()
-                    .ok_or_else(|| NanoError::Parse("query body cannot be empty".to_string()))?;
+                let body = item.into_inner().next().ok_or_else(|| {
+                    CompilerError::Parse("query body cannot be empty".to_string())
+                })?;
                 match body.as_rule() {
                     Rule::read_query_body => {
                         for section in body.into_inner() {
@@ -127,7 +126,7 @@ fn parse_query_decl(pair: pest::iterators::Pair<Rule>) -> Result<QueryDecl> {
                                     let int_pair = section.into_inner().next().unwrap();
                                     limit =
                                         Some(int_pair.as_str().parse::<u64>().map_err(|e| {
-                                            NanoError::Parse(format!("invalid limit: {}", e))
+                                            CompilerError::Parse(format!("invalid limit: {}", e))
                                         })?);
                                 }
                                 _ => {}
@@ -138,7 +137,7 @@ fn parse_query_decl(pair: pest::iterators::Pair<Rule>) -> Result<QueryDecl> {
                         for mutation_pair in body.into_inner() {
                             if let Rule::mutation_stmt = mutation_pair.as_rule() {
                                 let stmt = mutation_pair.into_inner().next().ok_or_else(|| {
-                                    NanoError::Parse(
+                                    CompilerError::Parse(
                                         "mutation statement cannot be empty".to_string(),
                                     )
                                 })?;
@@ -170,14 +169,14 @@ fn parse_query_annotation(pair: pest::iterators::Pair<Rule>) -> Result<(&'static
     let inner = pair
         .into_inner()
         .next()
-        .ok_or_else(|| NanoError::Parse("query annotation cannot be empty".to_string()))?;
+        .ok_or_else(|| CompilerError::Parse("query annotation cannot be empty".to_string()))?;
     match inner.as_rule() {
         Rule::description_annotation => {
             let value = inner
                 .into_inner()
                 .next()
                 .ok_or_else(|| {
-                    NanoError::Parse("@description requires a string literal".to_string())
+                    CompilerError::Parse("@description requires a string literal".to_string())
                 })
                 .map(|value| parse_string_lit(value.as_str()))??;
             Ok(("description", value))
@@ -187,12 +186,12 @@ fn parse_query_annotation(pair: pest::iterators::Pair<Rule>) -> Result<(&'static
                 .into_inner()
                 .next()
                 .ok_or_else(|| {
-                    NanoError::Parse("@instruction requires a string literal".to_string())
+                    CompilerError::Parse("@instruction requires a string literal".to_string())
                 })
                 .map(|value| parse_string_lit(value.as_str()))??;
             Ok(("instruction", value))
         }
-        other => Err(NanoError::Parse(format!(
+        other => Err(CompilerError::Parse(format!(
             "unexpected query annotation rule: {:?}",
             other
         ))),
@@ -208,30 +207,29 @@ fn parse_param(pair: pest::iterators::Pair<Rule>) -> Result<Param> {
     let mut type_inner = type_ref.into_inner();
     let core = type_inner
         .next()
-        .ok_or_else(|| NanoError::Parse("parameter type is missing".to_string()))?;
-    let base = match core.as_rule() {
-        Rule::base_type => core.as_str().to_string(),
-        Rule::list_type => {
-            let inner = core
-                .into_inner()
-                .next()
-                .ok_or_else(|| NanoError::Parse("list type missing item type".to_string()))?;
-            format!("[{}]", inner.as_str().trim())
-        }
-        Rule::vector_type => {
-            let vector = core
-                .into_inner()
-                .next()
-                .ok_or_else(|| NanoError::Parse("Vector type missing dimension".to_string()))?;
-            format!("Vector({})", vector.as_str().trim())
-        }
-        other => {
-            return Err(NanoError::Parse(format!(
-                "unexpected param type rule: {:?}",
-                other
-            )));
-        }
-    };
+        .ok_or_else(|| CompilerError::Parse("parameter type is missing".to_string()))?;
+    let base =
+        match core.as_rule() {
+            Rule::base_type => core.as_str().to_string(),
+            Rule::list_type => {
+                let inner = core.into_inner().next().ok_or_else(|| {
+                    CompilerError::Parse("list type missing item type".to_string())
+                })?;
+                format!("[{}]", inner.as_str().trim())
+            }
+            Rule::vector_type => {
+                let vector = core.into_inner().next().ok_or_else(|| {
+                    CompilerError::Parse("Vector type missing dimension".to_string())
+                })?;
+                format!("Vector({})", vector.as_str().trim())
+            }
+            other => {
+                return Err(CompilerError::Parse(format!(
+                    "unexpected param type rule: {:?}",
+                    other
+                )));
+            }
+        };
 
     Ok(Param {
         name,
@@ -256,7 +254,7 @@ fn parse_clause(pair: pest::iterators::Pair<Rule>) -> Result<Clause> {
             }
             Ok(Clause::Negation(clauses))
         }
-        _ => Err(NanoError::Parse(format!(
+        _ => Err(CompilerError::Parse(format!(
             "unexpected clause rule: {:?}",
             inner.as_rule()
         ))),
@@ -267,13 +265,13 @@ fn parse_text_search_clause(pair: pest::iterators::Pair<Rule>) -> Result<Clause>
     let inner = pair
         .into_inner()
         .next()
-        .ok_or_else(|| NanoError::Parse("text search clause cannot be empty".to_string()))?;
+        .ok_or_else(|| CompilerError::Parse("text search clause cannot be empty".to_string()))?;
     let expr = match inner.as_rule() {
         Rule::search_call => parse_search_call(inner)?,
         Rule::fuzzy_call => parse_fuzzy_call(inner)?,
         Rule::match_text_call => parse_match_text_call(inner)?,
         other => {
-            return Err(NanoError::Parse(format!(
+            return Err(CompilerError::Parse(format!(
                 "unexpected text search clause rule: {:?}",
                 other
             )));
@@ -325,7 +323,7 @@ fn parse_mutation_stmt(pair: pest::iterators::Pair<Rule>) -> Result<Mutation> {
         Rule::insert_stmt => parse_insert_mutation(pair).map(Mutation::Insert),
         Rule::update_stmt => parse_update_mutation(pair).map(Mutation::Update),
         Rule::delete_stmt => parse_delete_mutation(pair).map(Mutation::Delete),
-        other => Err(NanoError::Parse(format!(
+        other => Err(CompilerError::Parse(format!(
             "unexpected mutation statement rule: {:?}",
             other
         ))),
@@ -363,7 +361,7 @@ fn parse_update_mutation(pair: pest::iterators::Pair<Rule>) -> Result<UpdateMuta
     }
 
     let predicate = predicate.ok_or_else(|| {
-        NanoError::Parse("update mutation requires a where predicate".to_string())
+        CompilerError::Parse("update mutation requires a where predicate".to_string())
     })?;
 
     Ok(UpdateMutation {
@@ -378,7 +376,9 @@ fn parse_delete_mutation(pair: pest::iterators::Pair<Rule>) -> Result<DeleteMuta
     let type_name = inner.next().unwrap().as_str().to_string();
     let predicate = inner
         .next()
-        .ok_or_else(|| NanoError::Parse("delete mutation requires a where predicate".to_string()))
+        .ok_or_else(|| {
+            CompilerError::Parse("delete mutation requires a where predicate".to_string())
+        })
         .and_then(parse_mutation_predicate)?;
     Ok(DeleteMutation {
         type_name,
@@ -416,7 +416,7 @@ fn parse_match_value(pair: pest::iterators::Pair<Rule>) -> Result<MatchValue> {
         }
         Rule::now_call => Ok(MatchValue::Now),
         Rule::literal => Ok(MatchValue::Literal(parse_literal(value_inner)?)),
-        _ => Err(NanoError::Parse(format!(
+        _ => Err(CompilerError::Parse(format!(
             "unexpected match value: {:?}",
             value_inner.as_rule()
         ))),
@@ -436,9 +436,9 @@ fn parse_traversal(pair: pest::iterators::Pair<Rule>) -> Result<Traversal> {
         let (min, max) = parse_traversal_bounds(next)?;
         min_hops = min;
         max_hops = max;
-        inner
-            .next()
-            .ok_or_else(|| NanoError::Parse("traversal missing destination variable".to_string()))?
+        inner.next().ok_or_else(|| {
+            CompilerError::Parse("traversal missing destination variable".to_string())
+        })?
     } else {
         next
     };
@@ -459,16 +459,16 @@ fn parse_traversal_bounds(pair: pest::iterators::Pair<Rule>) -> Result<(u32, Opt
     let mut inner = pair.into_inner();
     let min = inner
         .next()
-        .ok_or_else(|| NanoError::Parse("traversal bound missing min hop".to_string()))?
+        .ok_or_else(|| CompilerError::Parse("traversal bound missing min hop".to_string()))?
         .as_str()
         .parse::<u32>()
-        .map_err(|e| NanoError::Parse(format!("invalid traversal min bound: {}", e)))?;
+        .map_err(|e| CompilerError::Parse(format!("invalid traversal min bound: {}", e)))?;
     let max = inner
         .next()
         .map(|p| {
             p.as_str()
                 .parse::<u32>()
-                .map_err(|e| NanoError::Parse(format!("invalid traversal max bound: {}", e)))
+                .map_err(|e| CompilerError::Parse(format!("invalid traversal max bound: {}", e)))
         })
         .transpose()?;
     Ok((min, max))
@@ -507,7 +507,12 @@ fn parse_expr(pair: pest::iterators::Pair<Rule>) -> Result<Expr> {
                 "avg" => AggFunc::Avg,
                 "min" => AggFunc::Min,
                 "max" => AggFunc::Max,
-                other => return Err(NanoError::Parse(format!("unknown aggregate: {}", other))),
+                other => {
+                    return Err(CompilerError::Parse(format!(
+                        "unknown aggregate: {}",
+                        other
+                    )));
+                }
             };
             let arg = parse_expr(parts.next().unwrap())?;
             Ok(Expr::Aggregate {
@@ -522,7 +527,7 @@ fn parse_expr(pair: pest::iterators::Pair<Rule>) -> Result<Expr> {
         Rule::bm25_call => parse_bm25_call(inner),
         Rule::rrf_call => parse_rrf_call(inner),
         Rule::ident => Ok(Expr::AliasRef(inner.as_str().to_string())),
-        _ => Err(NanoError::Parse(format!(
+        _ => Err(CompilerError::Parse(format!(
             "unexpected expr rule: {:?}",
             inner.as_rule()
         ))),
@@ -533,12 +538,12 @@ fn parse_search_call(pair: pest::iterators::Pair<Rule>) -> Result<Expr> {
     let mut args = pair.into_inner();
     let field = args
         .next()
-        .ok_or_else(|| NanoError::Parse("search() missing field argument".to_string()))?;
+        .ok_or_else(|| CompilerError::Parse("search() missing field argument".to_string()))?;
     let query = args
         .next()
-        .ok_or_else(|| NanoError::Parse("search() missing query argument".to_string()))?;
+        .ok_or_else(|| CompilerError::Parse("search() missing query argument".to_string()))?;
     if args.next().is_some() {
-        return Err(NanoError::Parse(
+        return Err(CompilerError::Parse(
             "search() accepts exactly 2 arguments".to_string(),
         ));
     }
@@ -552,13 +557,13 @@ fn parse_fuzzy_call(pair: pest::iterators::Pair<Rule>) -> Result<Expr> {
     let mut args = pair.into_inner();
     let field = args
         .next()
-        .ok_or_else(|| NanoError::Parse("fuzzy() missing field argument".to_string()))?;
+        .ok_or_else(|| CompilerError::Parse("fuzzy() missing field argument".to_string()))?;
     let query = args
         .next()
-        .ok_or_else(|| NanoError::Parse("fuzzy() missing query argument".to_string()))?;
+        .ok_or_else(|| CompilerError::Parse("fuzzy() missing query argument".to_string()))?;
     let max_edits = args.next().map(parse_expr).transpose()?.map(Box::new);
     if args.next().is_some() {
-        return Err(NanoError::Parse(
+        return Err(CompilerError::Parse(
             "fuzzy() accepts at most 3 arguments".to_string(),
         ));
     }
@@ -573,12 +578,12 @@ fn parse_match_text_call(pair: pest::iterators::Pair<Rule>) -> Result<Expr> {
     let mut args = pair.into_inner();
     let field = args
         .next()
-        .ok_or_else(|| NanoError::Parse("match_text() missing field argument".to_string()))?;
+        .ok_or_else(|| CompilerError::Parse("match_text() missing field argument".to_string()))?;
     let query = args
         .next()
-        .ok_or_else(|| NanoError::Parse("match_text() missing query argument".to_string()))?;
+        .ok_or_else(|| CompilerError::Parse("match_text() missing query argument".to_string()))?;
     if args.next().is_some() {
-        return Err(NanoError::Parse(
+        return Err(CompilerError::Parse(
             "match_text() accepts exactly 2 arguments".to_string(),
         ));
     }
@@ -592,12 +597,12 @@ fn parse_bm25_call(pair: pest::iterators::Pair<Rule>) -> Result<Expr> {
     let mut args = pair.into_inner();
     let field = args
         .next()
-        .ok_or_else(|| NanoError::Parse("bm25() missing field argument".to_string()))?;
+        .ok_or_else(|| CompilerError::Parse("bm25() missing field argument".to_string()))?;
     let query = args
         .next()
-        .ok_or_else(|| NanoError::Parse("bm25() missing query argument".to_string()))?;
+        .ok_or_else(|| CompilerError::Parse("bm25() missing query argument".to_string()))?;
     if args.next().is_some() {
-        return Err(NanoError::Parse(
+        return Err(CompilerError::Parse(
             "bm25() accepts exactly 2 arguments".to_string(),
         ));
     }
@@ -611,14 +616,14 @@ fn parse_rank_expr(pair: pest::iterators::Pair<Rule>) -> Result<Expr> {
     let inner = if pair.as_rule() == Rule::rank_expr {
         pair.into_inner()
             .next()
-            .ok_or_else(|| NanoError::Parse("rank expression cannot be empty".to_string()))?
+            .ok_or_else(|| CompilerError::Parse("rank expression cannot be empty".to_string()))?
     } else {
         pair
     };
     match inner.as_rule() {
         Rule::nearest_ordering => parse_nearest_ordering(inner),
         Rule::bm25_call => parse_bm25_call(inner),
-        other => Err(NanoError::Parse(format!(
+        other => Err(CompilerError::Parse(format!(
             "rrf() rank expression must be nearest(...) or bm25(...), got {:?}",
             other
         ))),
@@ -629,13 +634,13 @@ fn parse_rrf_call(pair: pest::iterators::Pair<Rule>) -> Result<Expr> {
     let mut args = pair.into_inner();
     let primary = args
         .next()
-        .ok_or_else(|| NanoError::Parse("rrf() missing primary rank expression".to_string()))?;
-    let secondary = args
-        .next()
-        .ok_or_else(|| NanoError::Parse("rrf() missing secondary rank expression".to_string()))?;
+        .ok_or_else(|| CompilerError::Parse("rrf() missing primary rank expression".to_string()))?;
+    let secondary = args.next().ok_or_else(|| {
+        CompilerError::Parse("rrf() missing secondary rank expression".to_string())
+    })?;
     let k = args.next().map(parse_expr).transpose()?.map(Box::new);
     if args.next().is_some() {
-        return Err(NanoError::Parse(
+        return Err(CompilerError::Parse(
             "rrf() accepts at most 3 arguments".to_string(),
         ));
     }
@@ -654,7 +659,7 @@ fn parse_comp_op(pair: pest::iterators::Pair<Rule>) -> Result<CompOp> {
         "<" => Ok(CompOp::Lt),
         ">=" => Ok(CompOp::Ge),
         "<=" => Ok(CompOp::Le),
-        other => Err(NanoError::Parse(format!("unknown operator: {}", other))),
+        other => Err(CompilerError::Parse(format!("unknown operator: {}", other))),
     }
 }
 
@@ -673,14 +678,14 @@ fn parse_literal(pair: pest::iterators::Pair<Rule>) -> Result<Literal> {
             let n: i64 = inner
                 .as_str()
                 .parse()
-                .map_err(|e| NanoError::Parse(format!("invalid integer: {}", e)))?;
+                .map_err(|e| CompilerError::Parse(format!("invalid integer: {}", e)))?;
             Ok(Literal::Integer(n))
         }
         Rule::float_lit => {
             let f: f64 = inner
                 .as_str()
                 .parse()
-                .map_err(|e| NanoError::Parse(format!("invalid float: {}", e)))?;
+                .map_err(|e| CompilerError::Parse(format!("invalid float: {}", e)))?;
             Ok(Literal::Float(f))
         }
         Rule::bool_lit => {
@@ -688,7 +693,7 @@ fn parse_literal(pair: pest::iterators::Pair<Rule>) -> Result<Literal> {
                 "true" => true,
                 "false" => false,
                 other => {
-                    return Err(NanoError::Parse(format!(
+                    return Err(CompilerError::Parse(format!(
                         "invalid boolean literal: {}",
                         other
                     )));
@@ -701,7 +706,9 @@ fn parse_literal(pair: pest::iterators::Pair<Rule>) -> Result<Literal> {
                 .into_inner()
                 .next()
                 .map(|s| parse_string_lit(s.as_str()))
-                .ok_or_else(|| NanoError::Parse("date literal requires a string".to_string()))?;
+                .ok_or_else(|| {
+                    CompilerError::Parse("date literal requires a string".to_string())
+                })?;
             Ok(Literal::Date(date_str?))
         }
         Rule::datetime_lit => {
@@ -710,7 +717,7 @@ fn parse_literal(pair: pest::iterators::Pair<Rule>) -> Result<Literal> {
                 .next()
                 .map(|s| parse_string_lit(s.as_str()))
                 .ok_or_else(|| {
-                    NanoError::Parse("datetime literal requires a string".to_string())
+                    CompilerError::Parse("datetime literal requires a string".to_string())
                 })?;
             Ok(Literal::DateTime(dt_str?))
         }
@@ -723,7 +730,7 @@ fn parse_literal(pair: pest::iterators::Pair<Rule>) -> Result<Literal> {
             }
             Ok(Literal::List(items))
         }
-        _ => Err(NanoError::Parse(format!(
+        _ => Err(CompilerError::Parse(format!(
             "unexpected literal: {:?}",
             inner.as_rule()
         ))),
@@ -746,14 +753,14 @@ fn parse_ordering(pair: pest::iterators::Pair<Rule>) -> Result<Ordering> {
     let mut inner = pair.into_inner();
     let first = inner
         .next()
-        .ok_or_else(|| NanoError::Parse("ordering cannot be empty".to_string()))?;
+        .ok_or_else(|| CompilerError::Parse("ordering cannot be empty".to_string()))?;
     let (expr, descending) = match first.as_rule() {
         Rule::nearest_ordering => (parse_nearest_ordering(first)?, false),
         Rule::expr => {
             let expr = parse_expr(first)?;
             let direction = inner.next().map(|p| p.as_str().to_string());
             if matches!(expr, Expr::Nearest { .. }) && direction.is_some() {
-                return Err(NanoError::Parse(
+                return Err(CompilerError::Parse(
                     "nearest() ordering does not accept asc/desc modifiers".to_string(),
                 ));
             }
@@ -761,7 +768,7 @@ fn parse_ordering(pair: pest::iterators::Pair<Rule>) -> Result<Ordering> {
             (expr, descending)
         }
         other => {
-            return Err(NanoError::Parse(format!(
+            return Err(CompilerError::Parse(format!(
                 "unexpected ordering rule: {:?}",
                 other
             )));
@@ -775,22 +782,22 @@ fn parse_nearest_ordering(pair: pest::iterators::Pair<Rule>) -> Result<Expr> {
     let mut inner = pair.into_inner();
     let prop = inner
         .next()
-        .ok_or_else(|| NanoError::Parse("nearest() missing property".to_string()))?;
+        .ok_or_else(|| CompilerError::Parse("nearest() missing property".to_string()))?;
     let mut prop_parts = prop.into_inner();
     let var = prop_parts
         .next()
-        .ok_or_else(|| NanoError::Parse("nearest() missing variable".to_string()))?
+        .ok_or_else(|| CompilerError::Parse("nearest() missing variable".to_string()))?
         .as_str();
     let variable = var.strip_prefix('$').unwrap_or(var).to_string();
     let property = prop_parts
         .next()
-        .ok_or_else(|| NanoError::Parse("nearest() missing property name".to_string()))?
+        .ok_or_else(|| CompilerError::Parse("nearest() missing property name".to_string()))?
         .as_str()
         .to_string();
 
     let query = inner
         .next()
-        .ok_or_else(|| NanoError::Parse("nearest() missing query expression".to_string()))?;
+        .ok_or_else(|| CompilerError::Parse("nearest() missing query expression".to_string()))?;
     Ok(Expr::Nearest {
         variable,
         property,

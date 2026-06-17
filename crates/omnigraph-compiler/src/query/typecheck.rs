@@ -4,7 +4,7 @@ use std::sync::Arc;
 use arrow_schema::{DataType, Field, Schema, SchemaRef};
 
 use crate::catalog::Catalog;
-use crate::error::{NanoError, Result};
+use crate::error::{CompilerError, Result};
 use crate::types::{Direction, PropType, ScalarType};
 
 use super::ast::*;
@@ -82,7 +82,7 @@ pub fn typecheck_query_decl(catalog: &Catalog, query: &QueryDecl) -> Result<Chec
 
 pub fn typecheck_query(catalog: &Catalog, query: &QueryDecl) -> Result<TypeContext> {
     if !query.mutations.is_empty() {
-        return Err(NanoError::Type(
+        return Err(CompilerError::Type(
             "mutation query cannot be typechecked with read-query API".to_string(),
         ));
     }
@@ -115,14 +115,14 @@ fn parse_declared_param_types(params: &[Param]) -> Result<HashMap<String, PropTy
     let mut out = HashMap::with_capacity(params.len());
     for p in params {
         if p.name == NOW_PARAM_NAME {
-            return Err(NanoError::Type(format!(
+            return Err(CompilerError::Type(format!(
                 "parameter name `${}` is reserved for runtime timestamp injection",
                 NOW_PARAM_NAME
             )));
         }
         let prop_type =
             PropType::from_param_type_name(&p.type_name, p.nullable).ok_or_else(|| {
-                NanoError::Type(format!(
+                CompilerError::Type(format!(
                     "unknown parameter type `{}` for `${}`",
                     p.type_name, p.name
                 ))
@@ -168,12 +168,12 @@ fn typecheck_read_query(catalog: &Catalog, query: &QueryDecl) -> Result<TypeCont
         .iter()
         .any(|ord| expr_contains_rrf_with_aliases(&ord.expr, &alias_exprs));
     if has_rrf && query.limit.is_none() {
-        return Err(NanoError::Type(
+        return Err(CompilerError::Type(
             "T21: rrf ordering requires a limit clause".to_string(),
         ));
     }
     if has_standalone_nearest && query.limit.is_none() {
-        return Err(NanoError::Type(
+        return Err(CompilerError::Type(
             "T17: nearest ordering requires a limit clause".to_string(),
         ));
     }
@@ -183,7 +183,7 @@ fn typecheck_read_query(catalog: &Catalog, query: &QueryDecl) -> Result<TypeCont
             .iter()
             .any(|ord| matches!(ord.expr, Expr::AliasRef(_)))
     {
-        return Err(NanoError::Type(
+        return Err(CompilerError::Type(
             "T18: alias-based ordering is not supported together with nearest in phase 1"
                 .to_string(),
         ));
@@ -201,7 +201,7 @@ fn typecheck_read_query(catalog: &Catalog, query: &QueryDecl) -> Result<TypeCont
                 match &proj.expr {
                     Expr::PropAccess { .. } | Expr::Variable(_) => {}
                     _ => {
-                        return Err(NanoError::Type(
+                        return Err(CompilerError::Type(
                             "T9: non-aggregate expressions in an aggregate query must be \
                              property accesses or variables"
                                 .to_string(),
@@ -221,7 +221,7 @@ fn typecheck_mutation(catalog: &Catalog, mutation: &Mutation, params: &[Param]) 
     match mutation {
         Mutation::Insert(insert) => {
             if insert.assignments.is_empty() {
-                return Err(NanoError::Type(
+                return Err(CompilerError::Type(
                     "T10: insert mutation requires at least one assignment".to_string(),
                 ));
             }
@@ -235,7 +235,7 @@ fn typecheck_mutation(catalog: &Catalog, mutation: &Mutation, params: &[Param]) 
                             .properties
                             .get(&assignment.property)
                             .ok_or_else(|| {
-                                NanoError::Type(format!(
+                                CompilerError::Type(format!(
                                     "T11: type `{}` has no property `{}`",
                                     insert.type_name, assignment.property
                                 ))
@@ -265,13 +265,13 @@ fn typecheck_mutation(catalog: &Catalog, mutation: &Mutation, params: &[Param]) 
                         if assigned_props.contains(embed.source.as_str()) {
                             continue;
                         }
-                        return Err(NanoError::Type(format!(
+                        return Err(CompilerError::Type(format!(
                             "T12: insert for `{}` must provide non-nullable property `{}` or @embed source `{}`",
                             insert.type_name, prop_name, embed.source
                         )));
                     }
 
-                    return Err(NanoError::Type(format!(
+                    return Err(CompilerError::Type(format!(
                         "T12: insert for `{}` must provide non-nullable property `{}`",
                         insert.type_name, prop_name
                     )));
@@ -308,7 +308,7 @@ fn typecheck_mutation(catalog: &Catalog, mutation: &Mutation, params: &[Param]) 
                                 .properties
                                 .get(&assignment.property)
                                 .ok_or_else(|| {
-                                    NanoError::Type(format!(
+                                    CompilerError::Type(format!(
                                         "T11: type `{}` has no property `{}`",
                                         insert.type_name, assignment.property
                                     ))
@@ -324,13 +324,13 @@ fn typecheck_mutation(catalog: &Catalog, mutation: &Mutation, params: &[Param]) 
                 }
 
                 if !has_from {
-                    return Err(NanoError::Type(format!(
+                    return Err(CompilerError::Type(format!(
                         "T12: insert for `{}` must provide required endpoint `from`",
                         insert.type_name
                     )));
                 }
                 if !has_to {
-                    return Err(NanoError::Type(format!(
+                    return Err(CompilerError::Type(format!(
                         "T12: insert for `{}` must provide required endpoint `to`",
                         insert.type_name
                     )));
@@ -341,7 +341,7 @@ fn typecheck_mutation(catalog: &Catalog, mutation: &Mutation, params: &[Param]) 
                         continue;
                     }
                     if !insert.assignments.iter().any(|a| &a.property == prop_name) {
-                        return Err(NanoError::Type(format!(
+                        return Err(CompilerError::Type(format!(
                             "T12: insert for `{}` must provide non-nullable property `{}`",
                             insert.type_name, prop_name
                         )));
@@ -350,7 +350,7 @@ fn typecheck_mutation(catalog: &Catalog, mutation: &Mutation, params: &[Param]) 
                 return Ok(insert.type_name.clone());
             }
 
-            Err(NanoError::Type(format!(
+            Err(CompilerError::Type(format!(
                 "T10: unknown node/edge type `{}`",
                 insert.type_name
             )))
@@ -359,19 +359,19 @@ fn typecheck_mutation(catalog: &Catalog, mutation: &Mutation, params: &[Param]) 
             let node_type = if let Some(node_type) = catalog.node_types.get(&update.type_name) {
                 node_type
             } else if catalog.edge_types.contains_key(&update.type_name) {
-                return Err(NanoError::Type(format!(
+                return Err(CompilerError::Type(format!(
                     "T16: update mutation for edge type `{}` is not supported",
                     update.type_name
                 )));
             } else {
-                return Err(NanoError::Type(format!(
+                return Err(CompilerError::Type(format!(
                     "T10: unknown node/edge type `{}`",
                     update.type_name
                 )));
             };
 
             if update.assignments.is_empty() {
-                return Err(NanoError::Type(
+                return Err(CompilerError::Type(
                     "T10: update mutation requires at least one assignment".to_string(),
                 ));
             }
@@ -383,7 +383,7 @@ fn typecheck_mutation(catalog: &Catalog, mutation: &Mutation, params: &[Param]) 
                         .properties
                         .get(&assignment.property)
                         .ok_or_else(|| {
-                            NanoError::Type(format!(
+                            CompilerError::Type(format!(
                                 "T11: type `{}` has no property `{}`",
                                 update.type_name, assignment.property
                             ))
@@ -422,7 +422,7 @@ fn typecheck_mutation(catalog: &Catalog, mutation: &Mutation, params: &[Param]) 
                 )?;
                 Ok(delete.type_name.clone())
             } else {
-                Err(NanoError::Type(format!(
+                Err(CompilerError::Type(format!(
                     "T10: unknown node/edge type `{}`",
                     delete.type_name
                 )))
@@ -435,7 +435,7 @@ fn ensure_no_duplicate_assignment_names(assignments: &[MutationAssignment]) -> R
     let mut seen = std::collections::HashSet::new();
     for assignment in assignments {
         if !seen.insert(&assignment.property) {
-            return Err(NanoError::Type(format!(
+            return Err(CompilerError::Type(format!(
                 "T13: duplicate assignment for property `{}`",
                 assignment.property
             )));
@@ -454,13 +454,13 @@ fn typecheck_mutation_predicate(
         .properties
         .get(&predicate.property)
         .ok_or_else(|| {
-            NanoError::Type(format!(
+            CompilerError::Type(format!(
                 "T11: type `{}` has no property `{}`",
                 type_name, predicate.property
             ))
         })?;
     if matches!(prop_type.scalar, ScalarType::Blob) {
-        return Err(NanoError::Type(format!(
+        return Err(CompilerError::Type(format!(
             "T11: blob property `{}` cannot be used in WHERE predicates",
             predicate.property
         )));
@@ -493,7 +493,7 @@ fn typecheck_edge_mutation_predicate(
         .properties
         .get(&predicate.property)
         .ok_or_else(|| {
-            NanoError::Type(format!(
+            CompilerError::Type(format!(
                 "T11: type `{}` has no property `{}`",
                 type_name, predicate.property
             ))
@@ -517,7 +517,7 @@ fn check_match_value_type(
         MatchValue::Literal(lit) => check_literal_type(lit, expected, property),
         MatchValue::Variable(v) => {
             let Some(actual) = params.get(v) else {
-                return Err(NanoError::Type(format!(
+                return Err(CompilerError::Type(format!(
                     "T14: mutation variable `${}` must be a declared query parameter",
                     v
                 )));
@@ -528,7 +528,7 @@ fn check_match_value_type(
                     && matches!(actual.scalar, ScalarType::String)
                     && !actual.list);
             if !compatible {
-                return Err(NanoError::Type(format!(
+                return Err(CompilerError::Type(format!(
                     "T7: cannot assign/compare {} with {} for property `{}`",
                     actual.display_name(),
                     expected.display_name(),
@@ -543,7 +543,7 @@ fn check_match_value_type(
 
 fn check_now_match_value_type(expected: &PropType, property: &str) -> Result<()> {
     if expected.list || expected.scalar != ScalarType::DateTime {
-        return Err(NanoError::Type(format!(
+        return Err(CompilerError::Type(format!(
             "T7: cannot assign/compare DateTime with {} for property `{}`",
             expected.display_name(),
             property
@@ -597,7 +597,7 @@ fn typecheck_clauses(
                     }
                 }
                 if !has_outer {
-                    return Err(NanoError::Type(
+                    return Err(CompilerError::Type(
                         "T9: negation block must reference at least one outer-bound variable"
                             .to_string(),
                     ));
@@ -616,7 +616,7 @@ fn typecheck_binding(
 ) -> Result<()> {
     // T1: binding type must exist in catalog
     if !catalog.node_types.contains_key(&binding.type_name) {
-        return Err(NanoError::Type(format!(
+        return Err(CompilerError::Type(format!(
             "T1: unknown node type `{}`",
             binding.type_name
         )));
@@ -627,14 +627,14 @@ fn typecheck_binding(
     // T2 + T3: property match fields must exist and have correct types
     for pm in &binding.prop_matches {
         let prop = node_type.properties.get(&pm.prop_name).ok_or_else(|| {
-            NanoError::Type(format!(
+            CompilerError::Type(format!(
                 "T2: type `{}` has no property `{}`",
                 binding.type_name, pm.prop_name
             ))
         })?;
 
         if matches!(prop.scalar, ScalarType::Blob) {
-            return Err(NanoError::Type(format!(
+            return Err(CompilerError::Type(format!(
                 "T3: blob property `{}.{}` cannot be used in match patterns",
                 binding.type_name, pm.prop_name
             )));
@@ -658,7 +658,7 @@ fn typecheck_binding(
     if let Some(existing) = ctx.bindings.get(&binding.variable)
         && existing.type_name != binding.type_name
     {
-        return Err(NanoError::Type(format!(
+        return Err(CompilerError::Type(format!(
             "variable `${}` already bound to type `{}`, cannot rebind to `{}`",
             binding.variable, existing.type_name, binding.type_name
         )));
@@ -680,7 +680,7 @@ fn check_binding_literal_type(lit: &Literal, expected: &PropType, property: &str
     if expected.list {
         let lit_type = literal_type(lit)?;
         if lit_type.list {
-            return Err(NanoError::Type(format!(
+            return Err(CompilerError::Type(format!(
                 "T3: list equality is not supported for property `{}`; use a scalar value to match list membership",
                 property
             )));
@@ -688,7 +688,7 @@ fn check_binding_literal_type(lit: &Literal, expected: &PropType, property: &str
 
         let expected_member = PropType::scalar(expected.scalar, expected.nullable);
         if !types_compatible(&lit_type, &expected_member) {
-            return Err(NanoError::Type(format!(
+            return Err(CompilerError::Type(format!(
                 "T3: property `{}` has type {} but membership match got {}",
                 property,
                 expected.display_name(),
@@ -708,7 +708,7 @@ fn check_binding_variable_type(
 ) -> Result<()> {
     if expected.list {
         if actual.list {
-            return Err(NanoError::Type(format!(
+            return Err(CompilerError::Type(format!(
                 "T7: list equality is not supported for property `{}`; use a scalar parameter for membership matching",
                 property
             )));
@@ -716,7 +716,7 @@ fn check_binding_variable_type(
 
         let expected_member = PropType::scalar(expected.scalar, expected.nullable);
         if !types_compatible(actual, &expected_member) {
-            return Err(NanoError::Type(format!(
+            return Err(CompilerError::Type(format!(
                 "T7: cannot compare {} membership against {} for property `{}`",
                 actual.display_name(),
                 expected.display_name(),
@@ -727,7 +727,7 @@ fn check_binding_variable_type(
     }
 
     if !types_compatible(actual, expected) {
-        return Err(NanoError::Type(format!(
+        return Err(CompilerError::Type(format!(
             "T7: cannot assign/compare {} with {} for property `{}`",
             actual.display_name(),
             expected.display_name(),
@@ -746,23 +746,23 @@ fn typecheck_traversal(
     let edge = catalog
         .lookup_edge_by_name(&traversal.edge_name)
         .ok_or_else(|| {
-            NanoError::Type(format!("T4: unknown edge type `{}`", traversal.edge_name))
+            CompilerError::Type(format!("T4: unknown edge type `{}`", traversal.edge_name))
         })?;
 
     if traversal.min_hops == 0 {
-        return Err(NanoError::Type(
+        return Err(CompilerError::Type(
             "T15: traversal min hop bound must be >= 1".to_string(),
         ));
     }
     if let Some(max_hops) = traversal.max_hops {
         if max_hops < traversal.min_hops {
-            return Err(NanoError::Type(format!(
+            return Err(CompilerError::Type(format!(
                 "T15: invalid traversal bounds {{{},{}}}; max must be >= min",
                 traversal.min_hops, max_hops
             )));
         }
     } else {
-        return Err(NanoError::Type(
+        return Err(CompilerError::Type(
             "T15: unbounded traversal is disabled; use bounded traversal {min,max}".to_string(),
         ));
     }
@@ -784,7 +784,7 @@ fn typecheck_traversal(
             // dst should be edge.from_type
             bind_traversal_endpoint(ctx, &traversal.dst, &edge.from_type, edge)?;
         } else {
-            return Err(NanoError::Type(format!(
+            return Err(CompilerError::Type(format!(
                 "T5: variable `${}` has type `{}`, which is not an endpoint of edge `{}: {} -> {}`",
                 traversal.src, src_bv.type_name, edge.name, edge.from_type, edge.to_type
             )));
@@ -798,7 +798,7 @@ fn typecheck_traversal(
             direction = Direction::In;
             bind_traversal_endpoint(ctx, &traversal.src, &edge.to_type, edge)?;
         } else {
-            return Err(NanoError::Type(format!(
+            return Err(CompilerError::Type(format!(
                 "T5: variable `${}` has type `{}`, which is not an endpoint of edge `{}: {} -> {}`",
                 traversal.dst, dst_bv.type_name, edge.name, edge.from_type, edge.to_type
             )));
@@ -833,7 +833,7 @@ fn bind_traversal_endpoint(
     }
     if let Some(existing) = ctx.bindings.get(var) {
         if existing.type_name != expected_type {
-            return Err(NanoError::Type(format!(
+            return Err(CompilerError::Type(format!(
                 "T5: variable `${}` has type `{}` but edge `{}` expects `{}`",
                 var, existing.type_name, edge.name, expected_type
             )));
@@ -863,27 +863,27 @@ fn typecheck_filter(
     if let (ResolvedType::Scalar(l), ResolvedType::Scalar(r)) = (&left_type, &right_type) {
         if filter.op == CompOp::Contains {
             if !l.list {
-                return Err(NanoError::Type(format!(
+                return Err(CompilerError::Type(format!(
                     "T7: contains requires a list property on the left, got {}",
                     l.display_name()
                 )));
             }
             if r.list {
-                return Err(NanoError::Type(
+                return Err(CompilerError::Type(
                     "T7: contains requires a scalar right operand".to_string(),
                 ));
             }
             if matches!(l.scalar, ScalarType::Vector(_))
                 || matches!(r.scalar, ScalarType::Vector(_))
             {
-                return Err(NanoError::Type(
+                return Err(CompilerError::Type(
                     "T7: vector membership filters are not supported".to_string(),
                 ));
             }
 
             let expected_member = PropType::scalar(l.scalar, l.nullable);
             if !types_compatible(&expected_member, r) {
-                return Err(NanoError::Type(format!(
+                return Err(CompilerError::Type(format!(
                     "T7: cannot test membership of {} in {}",
                     r.display_name(),
                     l.display_name()
@@ -894,29 +894,29 @@ fn typecheck_filter(
 
         // T7: check type compatibility
         if l.list || r.list {
-            return Err(NanoError::Type(
+            return Err(CompilerError::Type(
                 "T7: list comparisons in filters are not supported; use `contains` for list membership".to_string(),
             ));
         }
         if matches!(l.scalar, ScalarType::Vector(_)) || matches!(r.scalar, ScalarType::Vector(_)) {
-            return Err(NanoError::Type(
+            return Err(CompilerError::Type(
                 "T7: vector comparisons in filters are not supported".to_string(),
             ));
         }
         if matches!(l.scalar, ScalarType::Blob) || matches!(r.scalar, ScalarType::Blob) {
-            return Err(NanoError::Type(
+            return Err(CompilerError::Type(
                 "T7: blob comparisons in filters are not supported".to_string(),
             ));
         }
         if !types_compatible(l, r) {
-            return Err(NanoError::Type(format!(
+            return Err(CompilerError::Type(format!(
                 "T7: cannot compare {} with {}",
                 l.display_name(),
                 r.display_name()
             )));
         }
     } else {
-        return Err(NanoError::Type(format!(
+        return Err(CompilerError::Type(format!(
             "T7: filter comparisons require scalar operands, got {} and {}",
             left_type.display_name(),
             right_type.display_name()
@@ -940,15 +940,15 @@ fn resolve_expr_type(
         Expr::PropAccess { variable, property } => {
             // T6: variable must be bound and property must exist
             let bv = ctx.bindings.get(variable).ok_or_else(|| {
-                NanoError::Type(format!("T6: variable `${}` is not bound", variable))
+                CompilerError::Type(format!("T6: variable `${}` is not bound", variable))
             })?;
 
             let node_type = catalog.node_types.get(&bv.type_name).ok_or_else(|| {
-                NanoError::Type(format!("T6: type `{}` not found in catalog", bv.type_name))
+                CompilerError::Type(format!("T6: type `{}` not found in catalog", bv.type_name))
             })?;
 
             let prop = node_type.properties.get(property).ok_or_else(|| {
-                NanoError::Type(format!(
+                CompilerError::Type(format!(
                     "T6: type `{}` has no property `{}`",
                     bv.type_name, property
                 ))
@@ -962,19 +962,19 @@ fn resolve_expr_type(
             query,
         } => {
             let node_binding = ctx.bindings.get(variable).ok_or_else(|| {
-                NanoError::Type(format!("T15: variable `${}` is not bound", variable))
+                CompilerError::Type(format!("T15: variable `${}` is not bound", variable))
             })?;
             let node_type = catalog
                 .node_types
                 .get(&node_binding.type_name)
                 .ok_or_else(|| {
-                    NanoError::Type(format!(
+                    CompilerError::Type(format!(
                         "T15: type `{}` not found in catalog",
                         node_binding.type_name
                     ))
                 })?;
             let prop_type = node_type.properties.get(property).ok_or_else(|| {
-                NanoError::Type(format!(
+                CompilerError::Type(format!(
                     "T15: type `{}` has no property `{}`",
                     node_binding.type_name, property
                 ))
@@ -982,7 +982,7 @@ fn resolve_expr_type(
             let vector_dim = match prop_type.scalar {
                 ScalarType::Vector(dim) => dim,
                 _ => {
-                    return Err(NanoError::Type(format!(
+                    return Err(CompilerError::Type(format!(
                         "T15: nearest requires a Vector property, got {}.{}: {}",
                         node_binding.type_name,
                         property,
@@ -991,7 +991,7 @@ fn resolve_expr_type(
                 }
             };
             if prop_type.list {
-                return Err(NanoError::Type(
+                return Err(CompilerError::Type(
                     "T15: nearest does not support list-wrapped vectors".to_string(),
                 ));
             }
@@ -1000,7 +1000,7 @@ fn resolve_expr_type(
                 && let Some(dim) = numeric_vector_literal_dim(lit)
             {
                 if dim != vector_dim {
-                    return Err(NanoError::Type(format!(
+                    return Err(CompilerError::Type(format!(
                         "T15: nearest vector dimension mismatch: property is Vector({}), query literal has {} elements",
                         vector_dim, dim
                     )));
@@ -1019,7 +1019,7 @@ fn resolve_expr_type(
                         _ => unreachable!(),
                     };
                     if qdim != vector_dim {
-                        return Err(NanoError::Type(format!(
+                        return Err(CompilerError::Type(format!(
                             "T15: nearest vector dimension mismatch: property is Vector({}), query is Vector({})",
                             vector_dim, qdim
                         )));
@@ -1029,14 +1029,14 @@ fn resolve_expr_type(
                     // query-time string embedding is supported by the runtime executor
                 }
                 ResolvedType::Scalar(s) => {
-                    return Err(NanoError::Type(format!(
+                    return Err(CompilerError::Type(format!(
                         "T15: nearest query must be Vector({}) or String, got {}",
                         vector_dim,
                         s.display_name()
                     )));
                 }
                 _ => {
-                    return Err(NanoError::Type(
+                    return Err(CompilerError::Type(
                         "T15: nearest query must be a scalar expression".to_string(),
                     ));
                 }
@@ -1052,13 +1052,13 @@ fn resolve_expr_type(
             match field_type {
                 ResolvedType::Scalar(s) if s.scalar == ScalarType::String && !s.list => {}
                 ResolvedType::Scalar(s) => {
-                    return Err(NanoError::Type(format!(
+                    return Err(CompilerError::Type(format!(
                         "T19: search field must be String, got {}",
                         s.display_name()
                     )));
                 }
                 _ => {
-                    return Err(NanoError::Type(
+                    return Err(CompilerError::Type(
                         "T19: search field must be a scalar String expression".to_string(),
                     ));
                 }
@@ -1068,13 +1068,13 @@ fn resolve_expr_type(
             match query_type {
                 ResolvedType::Scalar(s) if s.scalar == ScalarType::String && !s.list => {}
                 ResolvedType::Scalar(s) => {
-                    return Err(NanoError::Type(format!(
+                    return Err(CompilerError::Type(format!(
                         "T19: search query must be String, got {}",
                         s.display_name()
                     )));
                 }
                 _ => {
-                    return Err(NanoError::Type(
+                    return Err(CompilerError::Type(
                         "T19: search query must be a scalar String expression".to_string(),
                     ));
                 }
@@ -1094,13 +1094,13 @@ fn resolve_expr_type(
             match field_type {
                 ResolvedType::Scalar(s) if s.scalar == ScalarType::String && !s.list => {}
                 ResolvedType::Scalar(s) => {
-                    return Err(NanoError::Type(format!(
+                    return Err(CompilerError::Type(format!(
                         "T19: fuzzy field must be String, got {}",
                         s.display_name()
                     )));
                 }
                 _ => {
-                    return Err(NanoError::Type(
+                    return Err(CompilerError::Type(
                         "T19: fuzzy field must be a scalar String expression".to_string(),
                     ));
                 }
@@ -1110,13 +1110,13 @@ fn resolve_expr_type(
             match query_type {
                 ResolvedType::Scalar(s) if s.scalar == ScalarType::String && !s.list => {}
                 ResolvedType::Scalar(s) => {
-                    return Err(NanoError::Type(format!(
+                    return Err(CompilerError::Type(format!(
                         "T19: fuzzy query must be String, got {}",
                         s.display_name()
                     )));
                 }
                 _ => {
-                    return Err(NanoError::Type(
+                    return Err(CompilerError::Type(
                         "T19: fuzzy query must be a scalar String expression".to_string(),
                     ));
                 }
@@ -1135,13 +1135,13 @@ fn resolve_expr_type(
                                     | ScalarType::U64
                             ) => {}
                     ResolvedType::Scalar(s) => {
-                        return Err(NanoError::Type(format!(
+                        return Err(CompilerError::Type(format!(
                             "T19: fuzzy max_edits must be an integer scalar, got {}",
                             s.display_name()
                         )));
                     }
                     _ => {
-                        return Err(NanoError::Type(
+                        return Err(CompilerError::Type(
                             "T19: fuzzy max_edits must be an integer scalar expression".to_string(),
                         ));
                     }
@@ -1158,13 +1158,13 @@ fn resolve_expr_type(
             match field_type {
                 ResolvedType::Scalar(s) if s.scalar == ScalarType::String && !s.list => {}
                 ResolvedType::Scalar(s) => {
-                    return Err(NanoError::Type(format!(
+                    return Err(CompilerError::Type(format!(
                         "T20: match_text field must be String, got {}",
                         s.display_name()
                     )));
                 }
                 _ => {
-                    return Err(NanoError::Type(
+                    return Err(CompilerError::Type(
                         "T20: match_text field must be a scalar String expression".to_string(),
                     ));
                 }
@@ -1174,13 +1174,13 @@ fn resolve_expr_type(
             match query_type {
                 ResolvedType::Scalar(s) if s.scalar == ScalarType::String && !s.list => {}
                 ResolvedType::Scalar(s) => {
-                    return Err(NanoError::Type(format!(
+                    return Err(CompilerError::Type(format!(
                         "T20: match_text query must be String, got {}",
                         s.display_name()
                     )));
                 }
                 _ => {
-                    return Err(NanoError::Type(
+                    return Err(CompilerError::Type(
                         "T20: match_text query must be a scalar String expression".to_string(),
                     ));
                 }
@@ -1196,13 +1196,13 @@ fn resolve_expr_type(
             match field_type {
                 ResolvedType::Scalar(s) if s.scalar == ScalarType::String && !s.list => {}
                 ResolvedType::Scalar(s) => {
-                    return Err(NanoError::Type(format!(
+                    return Err(CompilerError::Type(format!(
                         "T20: bm25 field must be String, got {}",
                         s.display_name()
                     )));
                 }
                 _ => {
-                    return Err(NanoError::Type(
+                    return Err(CompilerError::Type(
                         "T20: bm25 field must be a scalar String expression".to_string(),
                     ));
                 }
@@ -1212,13 +1212,13 @@ fn resolve_expr_type(
             match query_type {
                 ResolvedType::Scalar(s) if s.scalar == ScalarType::String && !s.list => {}
                 ResolvedType::Scalar(s) => {
-                    return Err(NanoError::Type(format!(
+                    return Err(CompilerError::Type(format!(
                         "T20: bm25 query must be String, got {}",
                         s.display_name()
                     )));
                 }
                 _ => {
-                    return Err(NanoError::Type(
+                    return Err(CompilerError::Type(
                         "T20: bm25 query must be a scalar String expression".to_string(),
                     ));
                 }
@@ -1235,12 +1235,12 @@ fn resolve_expr_type(
             k,
         } => {
             if !matches!(primary.as_ref(), Expr::Nearest { .. } | Expr::Bm25 { .. }) {
-                return Err(NanoError::Type(
+                return Err(CompilerError::Type(
                     "T21: rrf primary expression must be nearest(...) or bm25(...)".to_string(),
                 ));
             }
             if !matches!(secondary.as_ref(), Expr::Nearest { .. } | Expr::Bm25 { .. }) {
-                return Err(NanoError::Type(
+                return Err(CompilerError::Type(
                     "T21: rrf secondary expression must be nearest(...) or bm25(...)".to_string(),
                 ));
             }
@@ -1252,13 +1252,13 @@ fn resolve_expr_type(
                 match ty {
                     ResolvedType::Scalar(s) if s.scalar == ScalarType::F64 && !s.list => {}
                     ResolvedType::Scalar(s) => {
-                        return Err(NanoError::Type(format!(
+                        return Err(CompilerError::Type(format!(
                             "T21: rrf rank expressions must evaluate to F64, got {}",
                             s.display_name()
                         )));
                     }
                     _ => {
-                        return Err(NanoError::Type(
+                        return Err(CompilerError::Type(
                             "T21: rrf rank expressions must be scalar numeric expressions"
                                 .to_string(),
                         ));
@@ -1279,13 +1279,13 @@ fn resolve_expr_type(
                                     | ScalarType::U64
                             ) => {}
                     ResolvedType::Scalar(s) => {
-                        return Err(NanoError::Type(format!(
+                        return Err(CompilerError::Type(format!(
                             "T21: rrf k must be an integer scalar, got {}",
                             s.display_name()
                         )));
                     }
                     _ => {
-                        return Err(NanoError::Type(
+                        return Err(CompilerError::Type(
                             "T21: rrf k must be an integer scalar expression".to_string(),
                         ));
                     }
@@ -1293,7 +1293,7 @@ fn resolve_expr_type(
                 if let Expr::Literal(Literal::Integer(v)) = k_expr.as_ref()
                     && *v <= 0
                 {
-                    return Err(NanoError::Type(
+                    return Err(CompilerError::Type(
                         "T21: rrf k must be greater than 0".to_string(),
                     ));
                 }
@@ -1311,7 +1311,7 @@ fn resolve_expr_type(
             } else if let Some(bv) = ctx.bindings.get(name) {
                 Ok(ResolvedType::Node(bv.type_name.clone()))
             } else {
-                Err(NanoError::Type(format!(
+                Err(CompilerError::Type(format!(
                     "variable `${}` is not bound",
                     name
                 )))
@@ -1327,7 +1327,7 @@ fn resolve_expr_type(
                     if let ResolvedType::Scalar(s) = &arg_type
                         && (s.list || !s.scalar.is_numeric())
                     {
-                        return Err(NanoError::Type(format!(
+                        return Err(CompilerError::Type(format!(
                             "T8: {} requires numeric type, got {}",
                             func,
                             s.display_name()
@@ -1338,7 +1338,7 @@ fn resolve_expr_type(
                     if let ResolvedType::Scalar(s) = &arg_type
                         && (s.list || (!s.scalar.is_numeric() && s.scalar != ScalarType::String))
                     {
-                        return Err(NanoError::Type(format!(
+                        return Err(CompilerError::Type(format!(
                             "T8: {} requires numeric or string type, got {}",
                             func,
                             s.display_name()
@@ -1420,7 +1420,7 @@ fn resolved_type_to_field_shape(
         ResolvedType::Scalar(prop_type) => Ok((prop_type.to_arrow(), prop_type.nullable)),
         ResolvedType::Node(type_name) => {
             let node_type = catalog.node_types.get(type_name).ok_or_else(|| {
-                NanoError::Type(format!("type `{}` not found in catalog", type_name))
+                CompilerError::Type(format!("type `{}` not found in catalog", type_name))
             })?;
             let fields: Vec<Field> = node_type
                 .arrow_schema
@@ -1450,14 +1450,14 @@ fn literal_type(lit: &Literal) -> Result<PropType> {
             }
             let first = literal_type(&items[0])?;
             if first.list {
-                return Err(NanoError::Type(
+                return Err(CompilerError::Type(
                     "nested list literals are not supported".to_string(),
                 ));
             }
             for item in items.iter().skip(1) {
                 let item_type = literal_type(item)?;
                 if item_type.list || !types_compatible(&first, &item_type) {
-                    return Err(NanoError::Type(
+                    return Err(CompilerError::Type(
                         "list literal elements must share a compatible scalar type".to_string(),
                     ));
                 }
@@ -1473,7 +1473,7 @@ fn check_literal_type(lit: &Literal, expected: &PropType, prop_name: &str) -> Re
         return if expected.nullable {
             Ok(())
         } else {
-            Err(NanoError::Type(format!(
+            Err(CompilerError::Type(format!(
                 "T3: property `{}` is non-nullable but got null",
                 prop_name
             )))
@@ -1487,7 +1487,7 @@ fn check_literal_type(lit: &Literal, expected: &PropType, prop_name: &str) -> Re
         if actual_dim == expected_dim {
             return Ok(());
         }
-        return Err(NanoError::Type(format!(
+        return Err(CompilerError::Type(format!(
             "T3: property `{}` has type Vector({}) but got vector literal with {} elements",
             prop_name, expected_dim, actual_dim
         )));
@@ -1495,7 +1495,7 @@ fn check_literal_type(lit: &Literal, expected: &PropType, prop_name: &str) -> Re
 
     let lit_type = literal_type(lit)?;
     if !types_compatible(&lit_type, expected) {
-        return Err(NanoError::Type(format!(
+        return Err(CompilerError::Type(format!(
             "T3: property `{}` has type {} but got {}",
             prop_name,
             expected.display_name(),
@@ -1507,7 +1507,7 @@ fn check_literal_type(lit: &Literal, expected: &PropType, prop_name: &str) -> Re
         match lit {
             Literal::String(v) => {
                 if !allowed.contains(v) {
-                    return Err(NanoError::Type(format!(
+                    return Err(CompilerError::Type(format!(
                         "T3: property `{}` expects one of [{}], got '{}'",
                         prop_name,
                         allowed.join(", "),
@@ -1520,7 +1520,7 @@ fn check_literal_type(lit: &Literal, expected: &PropType, prop_name: &str) -> Re
                     match item {
                         Literal::String(v) if allowed.contains(v) => {}
                         Literal::String(v) => {
-                            return Err(NanoError::Type(format!(
+                            return Err(CompilerError::Type(format!(
                                 "T3: property `{}` expects one of [{}], got '{}'",
                                 prop_name,
                                 allowed.join(", "),

@@ -321,6 +321,32 @@ impl ClusterStore {
 
     // ---- recovery sidecars ----
 
+    pub(crate) async fn list_recovery_sidecar_locations(
+        &self,
+        diagnostics: &mut Vec<Diagnostic>,
+    ) -> Vec<String> {
+        let dir_uri = self.uri(CLUSTER_RECOVERIES_DIR);
+        let mut uris = match self.adapter.list_dir(&dir_uri).await {
+            Ok(uris) => uris,
+            Err(err) => {
+                diagnostics.push(Diagnostic::warning(
+                    "recovery_sidecar_read_error",
+                    CLUSTER_RECOVERIES_DIR,
+                    format!("could not list '{CLUSTER_RECOVERIES_DIR}': {err}"),
+                ));
+                return Vec::new();
+            }
+        };
+        uris.retain(|uri| uri.ends_with(".json"));
+        uris.sort();
+        uris.into_iter()
+            .map(|uri| match uri.rsplit('/').next() {
+                Some(name) => format!("{}/{name}", self.display(CLUSTER_RECOVERIES_DIR)),
+                None => uri,
+            })
+            .collect()
+    }
+
     pub(crate) async fn list_recovery_sidecars(
         &self,
         diagnostics: &mut Vec<Diagnostic>,

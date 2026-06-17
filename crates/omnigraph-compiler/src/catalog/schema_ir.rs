@@ -4,7 +4,7 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
 use crate::catalog::{Catalog, build_catalog};
-use crate::error::{NanoError, Result};
+use crate::error::{CompilerError, Result};
 use crate::schema::ast::{Annotation, Cardinality, Constraint, PropDecl, SchemaDecl, SchemaFile};
 use crate::types::PropType;
 
@@ -119,7 +119,7 @@ pub fn build_schema_ir(schema: &SchemaFile) -> Result<SchemaIR> {
 
 pub fn build_catalog_from_ir(ir: &SchemaIR) -> Result<Catalog> {
     if ir.ir_version != SCHEMA_IR_VERSION {
-        return Err(NanoError::Catalog(format!(
+        return Err(CompilerError::Catalog(format!(
             "unsupported schema ir_version {} (expected {})",
             ir.ir_version, SCHEMA_IR_VERSION
         )));
@@ -167,12 +167,12 @@ pub fn build_catalog_from_ir(ir: &SchemaIR) -> Result<Catalog> {
 
 pub fn schema_ir_json(ir: &SchemaIR) -> Result<String> {
     serde_json::to_string(ir)
-        .map_err(|err| NanoError::Catalog(format!("serialize schema ir error: {}", err)))
+        .map_err(|err| CompilerError::Catalog(format!("serialize schema ir error: {}", err)))
 }
 
 pub fn schema_ir_pretty_json(ir: &SchemaIR) -> Result<String> {
     serde_json::to_string_pretty(ir)
-        .map_err(|err| NanoError::Catalog(format!("serialize schema ir error: {}", err)))
+        .map_err(|err| CompilerError::Catalog(format!("serialize schema ir error: {}", err)))
 }
 
 pub fn schema_ir_hash(ir: &SchemaIR) -> Result<String> {
@@ -228,7 +228,7 @@ fn canonical_properties(
         .map(|property| {
             let prop_id = stable_prop_id(&owner_key, &property.name);
             if let Some(previous) = seen_prop_ids.insert(prop_id, property.name.clone()) {
-                return Err(NanoError::Catalog(format!(
+                return Err(CompilerError::Catalog(format!(
                     "property id collision on {}: '{}' and '{}' both hash to {}",
                     owner_name, previous, property.name, prop_id
                 )));
@@ -308,7 +308,7 @@ fn check_type_id_collision(
     name: &str,
 ) -> Result<()> {
     if let Some(previous) = seen_type_ids.insert(type_id, name.to_string()) {
-        return Err(NanoError::Catalog(format!(
+        return Err(CompilerError::Catalog(format!(
             "type id collision: '{}' and '{}' both hash to {}",
             previous, name, type_id
         )));
