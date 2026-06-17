@@ -10,15 +10,20 @@ pub(super) async fn graph_index(db: &Omnigraph) -> Result<Arc<crate::graph_index
         .await?;
     drop(coord);
     let catalog = db.catalog();
-    db.runtime_cache.graph_index(&resolved, &catalog).await
+    let edge_types = catalog
+        .edge_types
+        .iter()
+        .map(|(name, et)| (name.clone(), (et.from_type.clone(), et.to_type.clone())))
+        .collect::<std::collections::HashMap<_, _>>();
+    db.runtime_cache.graph_index(&resolved, &edge_types).await
 }
 
 pub(super) async fn graph_index_for_resolved(
     db: &Omnigraph,
     resolved: &ResolvedTarget,
+    edge_types: &std::collections::HashMap<String, (String, String)>,
 ) -> Result<Arc<crate::graph_index::GraphIndex>> {
-    let catalog = db.catalog();
-    db.runtime_cache.graph_index(resolved, &catalog).await
+    db.runtime_cache.graph_index(resolved, edge_types).await
 }
 
 pub(super) async fn ensure_indices(db: &Omnigraph) -> Result<Vec<PendingIndex>> {

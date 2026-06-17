@@ -289,7 +289,21 @@ them explicit.
   (`__manifest`, `_graph_commits`) are still not compacted, so the probe and
   refresh cost still grows with fragment count on a long-lived graph (the
   `optimize`-covers-internal-tables follow-up); the commit graph is not yet
-  reconcilable from the manifest; and the traversal id-map is still rebuilt.
+  reconcilable from the manifest; and the traversal id-map (graph topology /
+  CSR index) was rebuilt per branch incarnation. **A1 (post-#268)** closes the
+  cross-branch rebuild: the graph-index cache is now keyed by each edge table's
+  physical identity `(table_key, version, table_branch, e_tag)` instead of the
+  branch-specific synthetic snapshot id, so a lazy-fork branch (edge tables
+  physically `main`'s) reuses `main`'s built index rather than rebuilding it from
+  a cold scan (the ~40s fresh-branch first-read tax). **A2 (post-#268)**
+  additionally builds only the edges a query references (from the IR's
+  `Expand`/`AntiJoin` ops) instead of every catalog edge, shrinking the
+  cold-engine first build (the prior 30s-guard / 428s first traversal) to the
+  referenced edges. One residual remains: on stores without per-table e_tags
+  (local filesystem) a *recreated forked-branch* table at the same version can
+  reuse stale topology — production object stores (S3/R2) carry real e_tags, so
+  this is a local-dev-only residual of the same class as the other e_tag-None
+  notes.
 - **Commit-graph parent under concurrency:** `record_graph_commit` now refreshes
   the commit-graph head from storage before appending, so a same-branch write
   after an external commit no longer forks the commit DAG by parenting off a

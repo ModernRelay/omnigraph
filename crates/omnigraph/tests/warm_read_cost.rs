@@ -16,6 +16,7 @@ use lance_io::utils::tracking_store::IOTracker;
 use omnigraph::db::{Omnigraph, ReadTarget};
 use omnigraph::instrumentation::{QueryIoProbes, with_query_io_probes};
 use omnigraph_compiler::result::QueryResult;
+use serial_test::serial;
 
 use helpers::{
     MUTATION_QUERIES, TEST_QUERIES, commit_many, count_rows, init_and_load, mixed_params,
@@ -42,6 +43,8 @@ fn probes() -> (
         commit_graph_wrapper: Some(Arc::new(commit_graph.clone()) as Arc<dyn WrappingObjectStore>),
         table_wrapper: Some(Arc::new(table.clone()) as Arc<dyn WrappingObjectStore>),
         probe_count: Arc::clone(&probe_count),
+        graph_build_count: Arc::new(AtomicU64::new(0)),
+        graph_edges_built: Arc::new(AtomicU64::new(0)),
     };
     (probes, manifest, commit_graph, table, probe_count)
 }
@@ -521,10 +524,12 @@ async fn recreated_branch_owned_table_handle_uses_table_etag() {
     );
 }
 
-/// The graph-index cache is keyed by synthetic snapshot id plus edge-table
-/// state. A recreated branch can reuse the same edge table `(branch, version)`,
-/// so the synthetic snapshot id must carry the manifest incarnation or traversal
-/// can reuse stale topology.
+/// A recreated branch can reuse the same edge table `(branch, version)`, so a
+/// reader must observe the new incarnation's topology, not the old one. (Post-A1
+/// the graph-index cache is keyed by each edge table's physical identity
+/// `(table_key, version, table_branch, e_tag)`; this test exercises the recreate
+/// path through the default executor, where freshness comes from the manifest
+/// incarnation probe re-resolving the branch.)
 #[tokio::test]
 async fn recreated_branch_traversal_uses_graph_index_incarnation() {
     let dir = tempfile::tempdir().unwrap();
@@ -591,7 +596,7 @@ async fn recreated_branch_traversal_uses_graph_index_incarnation() {
     assert_eq!(new_edge_entry.table_branch, old_edge_entry.table_branch);
     assert_eq!(
         new_edge_entry.table_version, old_edge_entry.table_version,
-        "test setup must force graph-index identity to differ only by snapshot incarnation"
+        "test setup must force graph-index identity to differ only by the edge-table e_tag incarnation"
     );
 
     let (probes_in, manifest, commit_graph, _table, probe_count) = probes();
@@ -829,5 +834,159 @@ async fn write_invalidates_table_cache_for_changed_table() {
         after,
         before + 1,
         "the post-write read observes the new row (no stale handle served)"
+    );
+}
+
+// ── A1: cross-branch topology reuse (the fresh-branch ~40s tax) ────────────────
+//
+// A fresh branch forked from main (no writes) has edge tables that are physically
+// `main`'s (lazy fork: `table_branch=None`, same version + e_tag). The CSR
+// topology index is a pure function of those edge tables, so a traversal on the
+// fresh branch must REUSE main's already-built index. Before A1 the cache is keyed
+// by the branch-specific synthetic snapshot id (`manifest:{branch}:...`), so a
+// fresh branch always misses and rebuilds the whole-graph topology from a cold
+// scan — the ~40s fresh-branch first-read tax. A1 keys the cache by the edge
+// tables' physical identity `(table_key, version, table_branch, e_tag)`, so the
+// fresh branch hits main's cached index.
+//
+// The CSR index is built only on the CSR Expand path; the cost model serves a
+// small frontier from the BTREE index without building it. So this test forces
+// CSR (the production large-frontier join path) via `OMNIGRAPH_TRAVERSAL_MODE` and
+// is `#[serial]` so the env write never races a concurrent reader.
+
+fn set_csr_mode() {
+    // SAFE: `#[serial]` serializes this against other env-touching tests.
+    unsafe { std::env::set_var("OMNIGRAPH_TRAVERSAL_MODE", "csr") };
+}
+
+fn clear_traversal_mode() {
+    unsafe { std::env::remove_var("OMNIGRAPH_TRAVERSAL_MODE") };
+}
+
+/// A1 headline: a fresh (unwritten) branch reuses main's cached CSR topology
+/// index (0 rebuilds), and the reused index returns correct results for the
+/// branch. Fails before A1 (branch-keyed snapshot id forces a rebuild: count 1).
+#[tokio::test]
+#[serial]
+async fn fresh_branch_traversal_reuses_main_graph_index() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut writer = init_and_load(&dir).await;
+    let uri = dir.path().to_str().unwrap();
+    // A Knows edge on main so there is topology to build and then reuse.
+    mutate_main(
+        &mut writer,
+        MUTATION_QUERIES,
+        "insert_person_and_friend",
+        &mixed_params(
+            &[("$name", "Walker"), ("$friend", "Alice")],
+            &[("$age", 41)],
+        ),
+    )
+    .await
+    .unwrap();
+
+    // Separate reader handle. As in production, the reader never creates the
+    // branch, so creating it does not invalidate the reader's warm cache.
+    let reader = Omnigraph::open(uri).await.unwrap();
+
+    set_csr_mode();
+    // Reader warms main on the CSR path: builds and caches the topology index.
+    let warm = reader
+        .query(
+            ReadTarget::branch("main"),
+            TEST_QUERIES,
+            "friends_of",
+            &params(&[("$name", "Walker")]),
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        first_column_strings(&warm),
+        vec!["Alice"],
+        "test setup: main has the Knows edge"
+    );
+
+    // A separate writer creates the branch (lazy fork: feature's edge tables are
+    // physically main's — same version + e_tag, table_branch=None).
+    writer.branch_create("feature").await.unwrap();
+
+    let graph_build = Arc::new(AtomicU64::new(0));
+    let probes_in = QueryIoProbes {
+        graph_build_count: Arc::clone(&graph_build),
+        ..Default::default()
+    };
+    let on_branch = with_query_io_probes(
+        probes_in,
+        reader.query(
+            ReadTarget::branch("feature"),
+            TEST_QUERIES,
+            "friends_of",
+            &params(&[("$name", "Walker")]),
+        ),
+    )
+    .await;
+    clear_traversal_mode();
+    let on_branch = on_branch.unwrap();
+
+    assert_eq!(
+        first_column_strings(&on_branch),
+        vec!["Alice"],
+        "fresh branch sees main's edges (lazy fork) and the reused index is correct"
+    );
+    assert_eq!(
+        graph_build.load(Ordering::Relaxed),
+        0,
+        "a fresh branch with unchanged edges must reuse main's cached CSR index, not rebuild it"
+    );
+}
+
+/// A2: a query that references one edge type builds the topology for only that
+/// edge, not every edge in the catalog. Forces CSR (the build path) and counts
+/// edge tables built. Fails before A2, where the build materializes all catalog
+/// edges (the fixture defines Knows + WorksAt, so a build-all touches >= 2) — the
+/// cold-engine first-build cost.
+#[tokio::test]
+#[serial]
+async fn single_edge_query_builds_only_referenced_edge() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut db = init_and_load(&dir).await;
+    // A Knows edge so the referenced build has topology; the fixture also defines
+    // WorksAt, so a build-all would touch more than one edge.
+    mutate_main(
+        &mut db,
+        MUTATION_QUERIES,
+        "insert_person_and_friend",
+        &mixed_params(
+            &[("$name", "Walker"), ("$friend", "Alice")],
+            &[("$age", 41)],
+        ),
+    )
+    .await
+    .unwrap();
+
+    set_csr_mode();
+    let graph_edges = Arc::new(AtomicU64::new(0));
+    let probes_in = QueryIoProbes {
+        graph_edges_built: Arc::clone(&graph_edges),
+        ..Default::default()
+    };
+    let result = with_query_io_probes(
+        probes_in,
+        db.query(
+            ReadTarget::branch("main"),
+            TEST_QUERIES,
+            "friends_of",
+            &params(&[("$name", "Walker")]),
+        ),
+    )
+    .await;
+    clear_traversal_mode();
+    let result = result.unwrap();
+
+    assert_eq!(first_column_strings(&result), vec!["Alice"]);
+    assert_eq!(
+        graph_edges.load(Ordering::Relaxed),
+        1,
+        "a query referencing only `knows` must build only that edge, not all catalog edges"
     );
 }

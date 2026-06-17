@@ -1182,8 +1182,9 @@ impl Omnigraph {
     pub(crate) async fn graph_index_for_resolved(
         &self,
         resolved: &ResolvedTarget,
+        edge_types: &std::collections::HashMap<String, (String, String)>,
     ) -> Result<Arc<crate::graph_index::GraphIndex>> {
-        table_ops::graph_index_for_resolved(self, resolved).await
+        table_ops::graph_index_for_resolved(self, resolved, edge_types).await
     }
 
     /// Ensure BTree scalar indices exist on key columns.

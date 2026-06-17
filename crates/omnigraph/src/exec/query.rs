@@ -48,9 +48,10 @@ impl Omnigraph {
             .pipeline
             .iter()
             .any(|op| matches!(op, IROp::Expand { .. } | IROp::AntiJoin { .. }));
-        // Lazy: an index-served query with no AntiJoin never builds the CSR.
+        // Lazy: an index-served query with no AntiJoin never builds the CSR. A2:
+        // build only the edges this query references, not all catalog edges.
         let graph_index = if needs_graph {
-            GraphIndexHandle::cached(self, &resolved)
+            GraphIndexHandle::cached(self, &resolved, referenced_edge_types_map(&ir, &catalog))
         } else {
             GraphIndexHandle::none()
         };
@@ -97,12 +98,7 @@ impl Omnigraph {
         // which is keyed to live branch targets); only a CSR-path Expand or an
         // AntiJoin triggers it.
         let graph_index = if needs_graph {
-            let edge_types = catalog
-                .edge_types
-                .iter()
-                .map(|(name, et)| (name.clone(), (et.from_type.clone(), et.to_type.clone())))
-                .collect();
-            GraphIndexHandle::direct(&snapshot, edge_types)
+            GraphIndexHandle::direct(&snapshot, referenced_edge_types_map(&ir, &catalog))
         } else {
             GraphIndexHandle::none()
         };
@@ -762,6 +758,25 @@ fn execute_pipeline<'a>(
     })
 }
 
+/// The edge types a query traverses (and anti-joins through), mapped to
+/// `(from_type, to_type)` from the catalog — the input to the topology builder.
+/// A2 builds only these edges, not all catalog edges, so a one-edge query's cold
+/// build scans one edge table instead of every edge in the schema.
+fn referenced_edge_types_map(
+    ir: &QueryIR,
+    catalog: &Catalog,
+) -> HashMap<String, (String, String)> {
+    ir.referenced_edge_types()
+        .into_iter()
+        .filter_map(|name| {
+            catalog
+                .edge_types
+                .get(&name)
+                .map(|et| (name, (et.from_type.clone(), et.to_type.clone())))
+        })
+        .collect()
+}
+
 /// Lazily provides the in-memory CSR graph index, building it on first use and
 /// memoizing for the rest of the query. Indexed-mode Expand never asks for it,
 /// so a query that is entirely index-served and has no AntiJoin never pays the
@@ -776,7 +791,11 @@ pub struct GraphIndexHandle<'a> {
 
 enum GraphIndexBuilder<'a> {
     None,
-    Cached(&'a Omnigraph, &'a crate::db::ResolvedTarget),
+    Cached(
+        &'a Omnigraph,
+        &'a crate::db::ResolvedTarget,
+        HashMap<String, (String, String)>,
+    ),
     Direct(&'a Snapshot, HashMap<String, (String, String)>),
 }
 
@@ -788,10 +807,14 @@ impl<'a> GraphIndexHandle<'a> {
         }
     }
 
-    fn cached(db: &'a Omnigraph, resolved: &'a crate::db::ResolvedTarget) -> Self {
+    fn cached(
+        db: &'a Omnigraph,
+        resolved: &'a crate::db::ResolvedTarget,
+        edge_types: HashMap<String, (String, String)>,
+    ) -> Self {
         Self {
             cell: tokio::sync::OnceCell::new(),
-            builder: GraphIndexBuilder::Cached(db, resolved),
+            builder: GraphIndexBuilder::Cached(db, resolved, edge_types),
         }
     }
 
@@ -810,8 +833,8 @@ impl<'a> GraphIndexHandle<'a> {
             .get_or_try_init(|| async {
                 match &self.builder {
                     GraphIndexBuilder::None => Ok::<Option<Arc<GraphIndex>>, OmniError>(None),
-                    GraphIndexBuilder::Cached(db, resolved) => {
-                        Ok(Some(db.graph_index_for_resolved(resolved).await?))
+                    GraphIndexBuilder::Cached(db, resolved, edge_types) => {
+                        Ok(Some(db.graph_index_for_resolved(resolved, edge_types).await?))
                     }
                     GraphIndexBuilder::Direct(snapshot, edge_types) => {
                         Ok(Some(Arc::new(GraphIndex::build(snapshot, edge_types).await?)))

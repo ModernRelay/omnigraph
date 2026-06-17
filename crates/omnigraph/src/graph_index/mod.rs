@@ -113,6 +113,12 @@ impl GraphIndex {
         snapshot: &Snapshot,
         edge_types: &HashMap<String, (String, String)>, // edge_name → (from_type, to_type)
     ) -> Result<Self> {
+        // INVARIANT (A1 graph-index cache key): the topology is a pure function of
+        // the edge tables' `src`/`dst` columns and nothing else. `RuntimeCache`
+        // keys `GraphIndexCacheKey` on each edge table's physical identity
+        // `(table_key, version, table_branch, e_tag)` so a lazy-fork branch reuses
+        // main's built index. If you read node tables, schema, or other state here,
+        // add it to that key or the cache will serve a stale index.
         let mut type_indices: HashMap<String, TypeIndex> = HashMap::new();
         let mut csr = HashMap::new();
         let mut csc = HashMap::new();

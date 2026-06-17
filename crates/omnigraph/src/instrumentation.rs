@@ -43,6 +43,14 @@ pub struct QueryIoProbes {
     /// handle cache (Fix 3) serves them.
     pub table_wrapper: Option<Arc<dyn WrappingObjectStore>>,
     pub probe_count: Arc<AtomicU64>,
+    /// Counts topology-index builds (the `RuntimeCache::graph_index` cache-miss
+    /// path). A cost test asserts a fresh branch whose edge tables are unchanged
+    /// from main reuses main's cached index (0 builds) rather than rebuilding it.
+    pub graph_build_count: Arc<AtomicU64>,
+    /// Counts edge tables included in topology builds this query (summed over
+    /// build invocations). A cost test asserts a query referencing one edge builds
+    /// only that edge, not all catalog edges (A2's cold-build shrink).
+    pub graph_edges_built: Arc<AtomicU64>,
 }
 
 tokio::task_local! {
@@ -78,6 +86,16 @@ pub(crate) fn table_wrapper() -> Option<Arc<dyn WrappingObjectStore>> {
 /// No-op when no probes are installed (production).
 pub(crate) fn record_probe() {
     let _ = current(|p| p.probe_count.fetch_add(1, Ordering::Relaxed));
+}
+
+/// Record one topology-index build of `edges` edge tables (the `graph_index`
+/// cache-miss path). No-op when no probes are installed (production).
+pub(crate) fn record_graph_build(edges: usize) {
+    let _ = current(|p| {
+        p.graph_build_count.fetch_add(1, Ordering::Relaxed);
+        p.graph_edges_built
+            .fetch_add(edges as u64, Ordering::Relaxed);
+    });
 }
 
 /// Open a Lance dataset at `uri`, attaching `wrapper` (for IO counting) when
