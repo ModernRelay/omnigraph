@@ -548,6 +548,174 @@ async fn branch_merge_records_single_latest_commit_with_two_parents() {
     );
 }
 
+// ── P1: commit-DAG coherence on same-branch writes after an external commit ──
+//
+// `append_commit` takes a new commit's parent from the coordinator's in-memory
+// head (commit_graph head_commit, zero storage read), but `commit_all` rebases
+// the MANIFEST from a fresh coordinator. So after an external writer advances
+// the branch, a same-branch write on a non-refreshed handle commits a fresh
+// manifest version yet appends off the stale head — forking the commit DAG (the
+// new commit and the external commit share a parent). Data is unaffected (the
+// manifest is the visibility authority); only commit history is malformed.
+// P1 refreshes the commit-graph head before the append, so the parent is the
+// true current head. These two tests are RED before that fix, GREEN after.
+
+/// Non-strict insert: the fork is pre-existing (commit_all rebases the manifest
+/// regardless of the stale head), independent of Fix 1.
+#[tokio::test]
+async fn same_branch_insert_after_external_commit_is_linear() {
+    let dir = tempfile::tempdir().unwrap();
+    let uri = dir.path().to_str().unwrap();
+
+    // Handle A: a long-lived writer whose coordinator head stays pinned at the
+    // load commit (C0) — it never refreshes before its own write below.
+    let mut a = init_and_load(&dir).await;
+    let c0 = CommitGraph::open(uri)
+        .await
+        .unwrap()
+        .head_commit()
+        .await
+        .unwrap()
+        .unwrap();
+
+    // External writer B advances main: commit C1, parent C0.
+    let mut b = Omnigraph::open(uri).await.unwrap();
+    mutate_main(
+        &mut b,
+        MUTATION_QUERIES,
+        "insert_person",
+        &mixed_params(&[("$name", "ext_b")], &[("$age", 30)]),
+    )
+    .await
+    .unwrap();
+    let c1 = CommitGraph::open(uri)
+        .await
+        .unwrap()
+        .head_commit()
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        c1.parent_commit_id.as_deref(),
+        Some(c0.graph_commit_id.as_str()),
+        "sanity: B's commit C1 should descend from C0"
+    );
+
+    // A writes to main WITHOUT refreshing. A's coordinator still thinks the head
+    // is C0, so a pre-fix append parents the new commit on C0 instead of C1.
+    mutate_main(
+        &mut a,
+        MUTATION_QUERIES,
+        "insert_person",
+        &mixed_params(&[("$name", "local_a")], &[("$age", 40)]),
+    )
+    .await
+    .unwrap();
+
+    let commits = CommitGraph::open(uri)
+        .await
+        .unwrap()
+        .load_commits()
+        .await
+        .unwrap();
+    let latest = commits.iter().max_by_key(|c| c.manifest_version).unwrap();
+    assert_eq!(
+        latest.parent_commit_id.as_deref(),
+        Some(c1.graph_commit_id.as_str()),
+        "A's same-branch write after an external commit must append off the true \
+         head C1, not the stale head C0 (commit-DAG fork)"
+    );
+    let c0_children = commits
+        .iter()
+        .filter(|c| c.parent_commit_id.as_deref() == Some(c0.graph_commit_id.as_str()))
+        .count();
+    assert_eq!(c0_children, 1, "C0 must have exactly one child; two is the fork");
+}
+
+/// Strict update after a read: Fix 1's `refresh_manifest_only` makes the read
+/// freshen the read-time pin, defeating the strict 409 that used to force a
+/// coherent refresh — so the same stale-head append forks strict ops too.
+#[tokio::test]
+async fn same_branch_update_after_external_commit_and_read_is_linear() {
+    let dir = tempfile::tempdir().unwrap();
+    let uri = dir.path().to_str().unwrap();
+
+    // A inserts the row it will later update; this is A's own commit (Ca), so
+    // A's coordinator head is Ca.
+    let mut a = init_and_load(&dir).await;
+    mutate_main(
+        &mut a,
+        MUTATION_QUERIES,
+        "insert_person",
+        &mixed_params(&[("$name", "target")], &[("$age", 40)]),
+    )
+    .await
+    .unwrap();
+    let ca = CommitGraph::open(uri)
+        .await
+        .unwrap()
+        .head_commit()
+        .await
+        .unwrap()
+        .unwrap();
+
+    // External writer B advances main: commit Cb, parent Ca.
+    let mut b = Omnigraph::open(uri).await.unwrap();
+    mutate_main(
+        &mut b,
+        MUTATION_QUERIES,
+        "insert_person",
+        &mixed_params(&[("$name", "ext_b")], &[("$age", 30)]),
+    )
+    .await
+    .unwrap();
+    let cb = CommitGraph::open(uri)
+        .await
+        .unwrap()
+        .head_commit()
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(cb.parent_commit_id.as_deref(), Some(ca.graph_commit_id.as_str()));
+
+    // A reads main: the stale-probe path refreshes A's MANIFEST (via
+    // refresh_manifest_only) but not its commit-graph head, freshening the
+    // read-time pin so the strict update below skips its 409.
+    query_main(&mut a, TEST_QUERIES, "total_people", &params(&[]))
+        .await
+        .unwrap();
+
+    // Strict update, no explicit refresh: pre-fix it appends off the stale head
+    // Ca instead of Cb.
+    mutate_main(
+        &mut a,
+        MUTATION_QUERIES,
+        "set_age",
+        &mixed_params(&[("$name", "target")], &[("$age", 99)]),
+    )
+    .await
+    .unwrap();
+
+    let commits = CommitGraph::open(uri)
+        .await
+        .unwrap()
+        .load_commits()
+        .await
+        .unwrap();
+    let latest = commits.iter().max_by_key(|c| c.manifest_version).unwrap();
+    assert_eq!(
+        latest.parent_commit_id.as_deref(),
+        Some(cb.graph_commit_id.as_str()),
+        "a strict update after an external commit and a local read must append \
+         off the true head Cb, not the stale head Ca"
+    );
+    let ca_children = commits
+        .iter()
+        .filter(|c| c.parent_commit_id.as_deref() == Some(ca.graph_commit_id.as_str()))
+        .count();
+    assert_eq!(ca_children, 1, "Ca must have exactly one child; two is the fork");
+}
+
 #[tokio::test]
 async fn branch_merge_records_actor_on_latest_commit() {
     let dir = tempfile::tempdir().unwrap();

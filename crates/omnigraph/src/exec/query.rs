@@ -35,7 +35,7 @@ impl Omnigraph {
         query_name: &str,
         params: &ParamMap,
     ) -> Result<QueryResult> {
-        self.ensure_schema_state_valid().await?;
+        // resolved_target validates the schema contract; no redundant call here.
         let resolved = self.resolved_target(target).await?;
         let catalog = self.catalog();
 
@@ -80,7 +80,7 @@ impl Omnigraph {
         query_name: &str,
         params: &ParamMap,
     ) -> Result<QueryResult> {
-        self.ensure_schema_state_valid().await?;
+        // snapshot_at_version validates the schema contract; no redundant call here.
         let snapshot = self.snapshot_at_version(version).await?;
         let catalog = self.catalog();
 
