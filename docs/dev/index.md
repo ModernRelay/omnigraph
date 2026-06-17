@@ -28,7 +28,6 @@ constraints. User-facing behavior should still be documented through
 | Three-way merge implementation and conflicts | [merge.md](merge.md) |
 | Diff/change-feed implementation | [changes.md](../user/branching/changes.md) |
 | Branch protection policy | [branch-protection.md](branch-protection.md) |
-| CODEOWNERS source of truth | [codeowners.md](codeowners.md) |
 
 ## Language, Runtime, And Boundaries
 
