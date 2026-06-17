@@ -340,9 +340,9 @@ impl ClusterStore {
         uris.retain(|uri| uri.ends_with(".json"));
         uris.sort();
         uris.into_iter()
-            .map(|uri| match uri.rsplit('/').next() {
-                Some(name) => format!("{}/{name}", self.display(CLUSTER_RECOVERIES_DIR)),
-                None => uri,
+            .map(|uri| {
+                let name = uri.rsplit_once('/').map_or(uri.as_str(), |(_, name)| name);
+                format!("{}/{name}", self.display(CLUSTER_RECOVERIES_DIR))
             })
             .collect()
     }

@@ -3376,6 +3376,35 @@ policies:
     }
 
     #[tokio::test]
+    async fn read_only_commands_ignore_missing_recovery_sidecar_dir() {
+        let dir = fixture();
+        write_applyable_state(dir.path());
+        assert!(!dir.path().join(CLUSTER_RECOVERIES_DIR).exists());
+
+        let status = status_config_dir(dir.path()).await;
+        assert!(status.ok, "{:?}", status.diagnostics);
+        assert!(
+            !status.diagnostics.iter().any(|diagnostic| matches!(
+                diagnostic.code.as_str(),
+                "recovery_sidecar_read_error" | "cluster_recovery_pending"
+            )),
+            "{:?}",
+            status.diagnostics
+        );
+
+        let plan = plan_config_dir(dir.path()).await;
+        assert!(plan.ok, "{:?}", plan.diagnostics);
+        assert!(
+            !plan.diagnostics.iter().any(|diagnostic| matches!(
+                diagnostic.code.as_str(),
+                "recovery_sidecar_read_error" | "cluster_recovery_pending"
+            )),
+            "{:?}",
+            plan.diagnostics
+        );
+    }
+
+    #[tokio::test]
     async fn read_only_commands_warn_on_pending_recovery_sidecar_in_storage_root() {
         let dir = fixture();
         let storage = tempfile::tempdir().unwrap();

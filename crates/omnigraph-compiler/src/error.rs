@@ -172,7 +172,7 @@ mod tests {
         let allowed_file = workspace_root.join("crates/omnigraph-compiler/src/error.rs");
         let mut offenders = Vec::new();
 
-        visit_rs_files(&workspace_root.join("crates"), &mut |path| {
+        visit_rs_files(workspace_root, &mut |path| {
             let text = std::fs::read_to_string(path).expect("source file should be readable");
             let count = text.matches(&legacy_name).count();
             if path == allowed_file {
@@ -202,6 +202,12 @@ mod tests {
             let entry = entry.expect("source entry should be readable");
             let path = entry.path();
             if path.is_dir() {
+                if matches!(
+                    path.file_name().and_then(|name| name.to_str()),
+                    Some(".git" | "target")
+                ) {
+                    continue;
+                }
                 visit_rs_files(&path, visit);
             } else if path.extension().and_then(|ext| ext.to_str()) == Some("rs") {
                 visit(&path);
