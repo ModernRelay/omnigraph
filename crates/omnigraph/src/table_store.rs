@@ -2,6 +2,7 @@ use arrow_array::{
     Array, ArrayRef, RecordBatch, StringArray, StructArray, UInt8Array, UInt32Array, UInt64Array,
 };
 use arrow_schema::SchemaRef;
+use datafusion::physical_plan::SendableRecordBatchStream;
 use futures::TryStreamExt;
 use lance::Dataset;
 use lance::blob::BlobArrayBuilder;
@@ -360,6 +361,29 @@ impl TableStore {
             materialized.push(Self::materialize_blob_batch(ds, batch).await?);
         }
         Ok(materialized)
+    }
+
+    /// Streaming, blob-aware sibling of [`Self::scan_batches_for_rewrite`].
+    /// Yields the dataset's rows lazily as a `SendableRecordBatchStream` so a
+    /// downstream writer (`stage_append_stream`) never materializes the whole
+    /// table in memory. Blob columns still need per-row rebuild, so those tables
+    /// fall back to the materialized path and are re-streamed from the `Vec`
+    /// (rare — only tables with a `Blob` property; bounded-memory blob streaming
+    /// is a follow-up). The non-blob path is a true lazy scan.
+    pub async fn scan_stream_for_rewrite(&self, ds: &Dataset) -> Result<SendableRecordBatchStream> {
+        let has_blob_columns = ds.schema().fields_pre_order().any(|field| field.is_blob());
+        if has_blob_columns {
+            let arrow_schema: SchemaRef = Arc::new(ds.schema().into());
+            let batches = self.scan_batches_for_rewrite(ds).await?;
+            let reader = arrow_array::RecordBatchIterator::new(
+                batches.into_iter().map(Ok),
+                arrow_schema,
+            );
+            return Ok(lance_datafusion::utils::reader_to_stream(Box::new(reader)));
+        }
+        // Non-blob: a true lazy scan. `DatasetRecordBatchStream` converts to the
+        // `SendableRecordBatchStream` that `execute_uncommitted_stream` consumes.
+        Ok(Self::scan_stream(ds, None, None, None, false).await?.into())
     }
 
     pub(crate) async fn materialize_blob_batch(
@@ -919,6 +943,7 @@ impl TableStore {
                 "stage_append called with empty batch".to_string(),
             ));
         }
+        crate::instrumentation::record_stage_append(batch.num_rows() as u64);
         let params = WriteParams {
             mode: WriteMode::Append,
             allow_external_blob_outside_bases: true,
@@ -971,6 +996,65 @@ impl TableStore {
         })
     }
 
+    /// Streaming variant of [`Self::stage_append`]: appends the rows of `source`
+    /// into `ds` without materializing them in memory. It scans `source` lazily
+    /// (`scan_stream_for_rewrite`) and hands the stream to Lance's
+    /// `execute_uncommitted_stream`, which rolls fragments at `max_rows_per_file`
+    /// — bounded memory, one Append transaction. This is the substrate-blessed
+    /// bulk-append path (the same one LanceDB's `Table::add` uses). Identical
+    /// fragment-id / stable-row-id staging as `stage_append`.
+    pub async fn stage_append_stream(
+        &self,
+        ds: &Dataset,
+        source: &Dataset,
+        prior_stages: &[StagedWrite],
+    ) -> Result<StagedWrite> {
+        let stream = self.scan_stream_for_rewrite(source).await?;
+        let params = WriteParams {
+            mode: WriteMode::Append,
+            allow_external_blob_outside_bases: true,
+            auto_cleanup: None,
+            skip_auto_cleanup: true,
+            ..Default::default()
+        };
+        let transaction = InsertBuilder::new(Arc::new(ds.clone()))
+            .with_params(&params)
+            .execute_uncommitted_stream(stream)
+            .await
+            .map_err(|e| OmniError::Lance(e.to_string()))?;
+        let mut new_fragments = match &transaction.operation {
+            Operation::Append { fragments } => fragments.clone(),
+            Operation::Overwrite { fragments, .. } => fragments.clone(),
+            other => {
+                return Err(OmniError::manifest_internal(format!(
+                    "stage_append_stream: unexpected Lance operation {:?}",
+                    std::mem::discriminant(other)
+                )));
+            }
+        };
+        let appended_rows: u64 = new_fragments
+            .iter()
+            .filter_map(|f| f.physical_rows)
+            .map(|r| r as u64)
+            .sum();
+        crate::instrumentation::record_stage_append(appended_rows);
+        // Same commit-time fragment-id / row-id renumbering as `stage_append`.
+        let next_id_base = ds.manifest.max_fragment_id.unwrap_or(0) as u64
+            + 1
+            + prior_stages_fragment_count(prior_stages);
+        assign_fragment_ids(&mut new_fragments, next_id_base);
+        if ds.manifest.uses_stable_row_ids() {
+            let prior_rows = prior_stages_row_count(prior_stages)?;
+            let start_row_id = ds.manifest.next_row_id + prior_rows;
+            assign_row_id_meta(&mut new_fragments, start_row_id)?;
+        }
+        Ok(StagedWrite {
+            transaction,
+            new_fragments,
+            removed_fragment_ids: Vec::new(),
+        })
+    }
+
     /// Stage a merge_insert (upsert): write fragment files describing the
     /// merge result, return the uncommitted transaction plus the new
     /// fragments. The transaction's `Operation::Update` carries the
@@ -1012,6 +1096,7 @@ impl TableStore {
                 "stage_merge_insert called with empty batch".to_string(),
             ));
         }
+        crate::instrumentation::record_stage_merge_insert(batch.num_rows() as u64);
 
         // Precondition for the FirstSeen workaround below: every call path that
         // reaches stage_merge_insert (load, MutationStaging::finalize,
@@ -1537,6 +1622,7 @@ impl TableStore {
     }
 
     pub(crate) async fn create_vector_index(&self, ds: &mut Dataset, column: &str) -> Result<()> {
+        crate::instrumentation::record_create_vector_index();
         let params = lance::index::vector::VectorIndexParams::ivf_flat(1, MetricType::L2);
         ds.create_index_builder(&[column], IndexType::Vector, &params)
             .replace(true)

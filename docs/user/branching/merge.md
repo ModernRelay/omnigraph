@@ -22,6 +22,17 @@ A merge resolves to one of three outcomes:
   simply advances to the source.
 - **Merged** — both sides diverged; a new merge commit is created with two parents.
 
+## Indexes after a merge
+
+A merge does not build or rebuild indexes on the rows it brings into the target.
+Newly merged rows (and any index a table does not yet have) are covered the next
+time `optimize` runs — indexes are derived state, and reads stay correct in the
+meantime via brute-force scan over the not-yet-covered rows. This keeps a merge
+fast (it never pays an inline vector/FTS rebuild on the publish path), at the
+cost of brute-force search latency on freshly merged rows until the next
+`optimize`. Run `omnigraph optimize` after a large merge to restore full index
+coverage.
+
 ## Conflicts
 
 When both branches changed the same data incompatibly, the merge fails with a

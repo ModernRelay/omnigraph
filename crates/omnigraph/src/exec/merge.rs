@@ -5,7 +5,14 @@ const MERGE_STAGE_DIR_ENV: &str = "OMNIGRAPH_MERGE_STAGING_DIR";
 
 #[derive(Debug)]
 enum CandidateTableState {
+    /// Adopt the source's table state via a pointer switch or a branch fork —
+    /// no data HEAD advance, so nothing to pin for recovery.
     AdoptSourceState,
+    /// Adopt the source's state by applying a non-empty delta onto the target's
+    /// lineage (append new + upsert changed + delete removed). The delta is
+    /// pre-computed at classification so this candidate can be recovery-pinned:
+    /// its publish advances Lance HEAD before the manifest commit.
+    AdoptWithDelta(AdoptDelta),
     RewriteMerged(StagedMergeResult),
 }
 
@@ -22,6 +29,24 @@ struct StagedMergeResult {
     deleted_ids: Vec<String>,
 }
 
+/// Delta for an adopted-source merge (the fast-forward / target-owns path):
+/// the new + changed rows to apply onto the target's base lineage, plus the ids
+/// removed on source. Distinct from [`StagedMergeResult`] (the three-way path),
+/// which also carries a `full_staged` table for validation — the adopt path
+/// validates against the source snapshot directly (`candidate_dataset`), so it
+/// needs no `full_staged` and never builds it.
+#[derive(Debug)]
+struct AdoptDelta {
+    /// New-on-source rows → `stage_append` (a streaming `Operation::Append`, no
+    /// hash join). The connector's dominant case and the OOM fix: appending new
+    /// rows never buffers the whole delta in a full-outer hash join.
+    appends: Option<StagedTable>,
+    /// Changed-on-source rows → `stage_merge_insert` (a hash join bounded to the
+    /// genuinely-changed set, not the whole delta).
+    upserts: Option<StagedTable>,
+    deleted_ids: Vec<String>,
+}
+
 #[derive(Debug, Clone)]
 struct CursorRow {
     id: String,
@@ -31,24 +56,48 @@ struct CursorRow {
     row_index: usize,
 }
 
+impl CursorRow {
+    /// Compute this row's signature on demand. Used by the lazy adopt cursor,
+    /// where `signature` is left empty; the value is identical to the eager
+    /// `signature` field the three-way cursor populates.
+    fn compute_signature(&self) -> Result<String> {
+        row_signature(&self.batch, self.row_index)
+    }
+}
+
 struct OrderedTableCursor {
     stream: Option<std::pin::Pin<Box<DatasetRecordBatchStream>>>,
     dataset: Option<Dataset>,
     current_batch: Option<RecordBatch>,
     current_row: usize,
     peeked: Option<CursorRow>,
+    /// When false, `next_row` leaves `CursorRow::signature` empty and callers
+    /// compute it on demand via `CursorRow::compute_signature`. The adopt path
+    /// uses this: new/deleted rows never need a signature comparison and would
+    /// otherwise eagerly stringify their embedding for nothing.
+    eager_signatures: bool,
 }
 
 impl OrderedTableCursor {
     async fn from_snapshot(snapshot: &Snapshot, table_key: &str) -> Result<Self> {
+        Self::open(snapshot, table_key, true).await
+    }
+
+    /// Like `from_snapshot` but leaves row signatures uncomputed (callers use
+    /// `CursorRow::compute_signature` on demand). See `eager_signatures`.
+    async fn from_snapshot_lazy(snapshot: &Snapshot, table_key: &str) -> Result<Self> {
+        Self::open(snapshot, table_key, false).await
+    }
+
+    async fn open(snapshot: &Snapshot, table_key: &str, eager_signatures: bool) -> Result<Self> {
         let dataset = match snapshot.entry(table_key) {
             Some(_) => Some(snapshot.open(table_key).await?),
             None => None,
         };
-        Self::from_dataset(dataset).await
+        Self::from_dataset(dataset, eager_signatures).await
     }
 
-    async fn from_dataset(dataset: Option<Dataset>) -> Result<Self> {
+    async fn from_dataset(dataset: Option<Dataset>, eager_signatures: bool) -> Result<Self> {
         let stream = if let Some(ds) = &dataset {
             Some(Box::pin(
                 crate::table_store::TableStore::scan_stream_with(
@@ -71,6 +120,7 @@ impl OrderedTableCursor {
             current_batch: None,
             current_row: 0,
             peeked: None,
+            eager_signatures,
         })
     }
 
@@ -97,9 +147,14 @@ impl OrderedTableCursor {
                     let dataset = self.dataset.clone().ok_or_else(|| {
                         OmniError::manifest("cursor row missing source dataset".to_string())
                     })?;
+                    let signature = if self.eager_signatures {
+                        row_signature(batch, row_index)?
+                    } else {
+                        String::new()
+                    };
                     return Ok(Some(CursorRow {
                         id: row_id_at(batch, row_index)?,
-                        signature: row_signature(batch, row_index)?,
+                        signature,
                         dataset,
                         batch: batch.clone(),
                         row_index,
@@ -258,20 +313,26 @@ fn sanitize_table_key(table_key: &str) -> String {
 }
 
 /// Computes the delta between base and source for an adopted-source merge.
-/// Returns the changed/new rows (for merge_insert) and deleted IDs (for delete).
-async fn compute_source_delta(
+/// Returns the new + changed rows and the ids deleted on source.
+///
+/// Unchanged rows are dropped: the adopt path validates against the source
+/// snapshot directly (`candidate_dataset`), so no `full_staged` table is built
+/// — saving the O(rows) temp write that `compute_source_delta` used to produce
+/// and then discard.
+async fn compute_adopt_delta(
     table_key: &str,
     catalog: &Catalog,
     base_snapshot: &Snapshot,
     source_snapshot: &Snapshot,
-) -> Result<Option<StagedMergeResult>> {
+) -> Result<Option<AdoptDelta>> {
     let schema = schema_for_table_key(catalog, table_key)?;
-    let mut full_writer =
-        StagedTableWriter::new(&format!("{}_adopt_full", table_key), schema.clone())?;
-    let mut delta_writer = StagedTableWriter::new(&format!("{}_adopt_delta", table_key), schema)?;
+    let mut append_writer =
+        StagedTableWriter::new(&format!("{}_adopt_append", table_key), schema.clone())?;
+    let mut upsert_writer =
+        StagedTableWriter::new(&format!("{}_adopt_upsert", table_key), schema)?;
     let mut deleted_ids: Vec<String> = Vec::new();
-    let mut base = OrderedTableCursor::from_snapshot(base_snapshot, table_key).await?;
-    let mut source = OrderedTableCursor::from_snapshot(source_snapshot, table_key).await?;
+    let mut base = OrderedTableCursor::from_snapshot_lazy(base_snapshot, table_key).await?;
+    let mut source = OrderedTableCursor::from_snapshot_lazy(source_snapshot, table_key).await?;
 
     let mut needs_update = false;
 
@@ -297,9 +358,6 @@ async fn compute_source_delta(
             None
         };
 
-        let base_sig = base_row.as_ref().map(|r| r.signature.as_str());
-        let source_sig = source_row.as_ref().map(|r| r.signature.as_str());
-
         match (&base_row, &source_row) {
             (Some(_), None) => {
                 // Deleted on source
@@ -307,20 +365,21 @@ async fn compute_source_delta(
                 needs_update = true;
             }
             (None, Some(src)) => {
-                // New on source
-                full_writer.push_row(src).await?;
-                delta_writer.push_row(src).await?;
+                // New on source → append (streaming, no hash join). No signature
+                // needed — a new id is absent from base by construction.
+                append_writer.push_row(src).await?;
                 needs_update = true;
             }
-            (Some(_), Some(src)) if source_sig != base_sig => {
-                // Changed on source
-                full_writer.push_row(src).await?;
-                delta_writer.push_row(src).await?;
-                needs_update = true;
-            }
-            (Some(base), Some(_)) => {
-                // Unchanged — write to full (for validation), skip delta
-                full_writer.push_row(base).await?;
+            (Some(base), Some(src)) => {
+                // Present on both — compute signatures lazily (the only case
+                // that needs them) to tell a changed row from an unchanged one.
+                // New/deleted rows above skip the embedding stringify entirely.
+                if src.compute_signature()? != base.compute_signature()? {
+                    // Changed on source → upsert.
+                    upsert_writer.push_row(src).await?;
+                    needs_update = true;
+                }
+                // else unchanged — already on the target's base lineage; drop.
             }
             (None, None) => unreachable!(),
         }
@@ -330,15 +389,20 @@ async fn compute_source_delta(
         return Ok(None);
     }
 
-    let delta_staged = if delta_writer.row_count > 0 {
-        Some(delta_writer.finish().await?)
+    let appends = if append_writer.row_count > 0 {
+        Some(append_writer.finish().await?)
+    } else {
+        None
+    };
+    let upserts = if upsert_writer.row_count > 0 {
+        Some(upsert_writer.finish().await?)
     } else {
         None
     };
 
-    Ok(Some(StagedMergeResult {
-        full_staged: full_writer.finish().await?,
-        delta_staged,
+    Ok(Some(AdoptDelta {
+        appends,
+        upserts,
         deleted_ids,
     }))
 }
@@ -651,10 +715,12 @@ async fn candidate_dataset(
 ) -> Result<Option<Dataset>> {
     if let Some(candidate) = candidates.get(table_key) {
         return match candidate {
-            CandidateTableState::AdoptSourceState => match source_snapshot.entry(table_key) {
-                Some(_) => Ok(Some(source_snapshot.open(table_key).await?)),
-                None => Ok(None),
-            },
+            CandidateTableState::AdoptSourceState | CandidateTableState::AdoptWithDelta(_) => {
+                match source_snapshot.entry(table_key) {
+                    Some(_) => Ok(Some(source_snapshot.open(table_key).await?)),
+                    None => Ok(None),
+                }
+            }
             CandidateTableState::RewriteMerged(staged) => {
                 Ok(Some(staged.full_staged.dataset.clone()))
             }
@@ -840,10 +906,59 @@ fn row_id_at(batch: &RecordBatch, row: usize) -> Result<String> {
     Ok(ids.value(row).to_string())
 }
 
-async fn publish_adopted_source_state(
+/// Classify a table whose target state equals base (the adopt / fast-forward
+/// case). Returns [`CandidateTableState::AdoptWithDelta`] — with the delta
+/// pre-computed so it can be recovery-pinned — when the adopt applies a
+/// non-empty delta onto the target's lineage (a HEAD-advancing publish via
+/// [`publish_adopted_delta`]); otherwise [`CandidateTableState::AdoptSourceState`]
+/// (a pointer switch or fork, which does not advance the data HEAD).
+///
+/// The HEAD-advancing subcases mirror [`publish_adopted_source_state`]: source
+/// on a branch with the target either on main or owning the table. Computing the
+/// delta here (rather than inside the publish) is what closes the recovery gap —
+/// the classifier knows whether the publish will move Lance HEAD.
+async fn classify_adopt(
     target_db: &Omnigraph,
     catalog: &Catalog,
     base_snapshot: &Snapshot,
+    source_snapshot: &Snapshot,
+    target_snapshot: &Snapshot,
+    table_key: &str,
+) -> Result<CandidateTableState> {
+    let Some(source_entry) = source_snapshot.entry(table_key) else {
+        return Ok(CandidateTableState::AdoptSourceState);
+    };
+    let target_entry = target_snapshot.entry(table_key);
+    let target_active = target_db.active_branch().await;
+    let advances_head = match (
+        target_active.as_deref(),
+        source_entry.table_branch.as_deref(),
+    ) {
+        // Source on a branch, target on main — delta applied onto main's lineage.
+        (None, Some(_)) => true,
+        // Both on branches, target owns this table — delta applied onto it.
+        (Some(target_branch), Some(_)) => {
+            target_entry.and_then(|e| e.table_branch.as_deref()) == Some(target_branch)
+        }
+        // Source on main (pointer switch) or target doesn't own (fork): no advance.
+        _ => false,
+    };
+    if !advances_head {
+        return Ok(CandidateTableState::AdoptSourceState);
+    }
+    match compute_adopt_delta(table_key, catalog, base_snapshot, source_snapshot).await? {
+        Some(delta) => Ok(CandidateTableState::AdoptWithDelta(delta)),
+        None => Ok(CandidateTableState::AdoptSourceState),
+    }
+}
+
+/// Adopt the source's table state without applying a row delta: a pointer
+/// switch (source/target share lineage) or a branch fork. The HEAD-advancing
+/// delta case is classified [`CandidateTableState::AdoptWithDelta`] and
+/// published by [`publish_adopted_delta`], so reaching the branch-bearing arms
+/// here means the delta was empty.
+async fn publish_adopted_source_state(
+    target_db: &Omnigraph,
     source_snapshot: &Snapshot,
     target_snapshot: &Snapshot,
     table_key: &str,
@@ -875,44 +990,31 @@ async fn publish_adopted_source_state(
             row_count: source_entry.row_count,
             version_metadata: source_entry.version_metadata.clone(),
         }),
-        // Source on branch, target on main — apply delta to preserve version metadata
-        (None, Some(_source_branch)) => {
-            let delta =
-                compute_source_delta(table_key, catalog, base_snapshot, source_snapshot).await?;
-            match delta {
-                Some(staged) => publish_rewritten_merge_table(target_db, table_key, &staged).await,
-                None => Ok(crate::db::SubTableUpdate {
-                    table_key: table_key.to_string(),
-                    table_version: target_entry
-                        .map(|e| e.table_version)
-                        .unwrap_or(source_entry.table_version),
-                    table_branch: None,
-                    row_count: source_entry.row_count,
-                    version_metadata: target_entry
-                        .map(|entry| entry.version_metadata.clone())
-                        .unwrap_or_else(|| source_entry.version_metadata.clone()),
-                }),
-            }
-        }
+        // Source on branch, target on main, empty delta — adopt source's
+        // version by a pointer switch (the non-empty case is `AdoptWithDelta`).
+        (None, Some(_source_branch)) => Ok(crate::db::SubTableUpdate {
+            table_key: table_key.to_string(),
+            table_version: target_entry
+                .map(|e| e.table_version)
+                .unwrap_or(source_entry.table_version),
+            table_branch: None,
+            row_count: source_entry.row_count,
+            version_metadata: target_entry
+                .map(|entry| entry.version_metadata.clone())
+                .unwrap_or_else(|| source_entry.version_metadata.clone()),
+        }),
         // Both on branches
         (Some(target_branch), Some(source_branch)) => {
             if target_entry.and_then(|entry| entry.table_branch.as_deref()) == Some(target_branch) {
-                // Target already owns this table — apply delta onto its lineage
-                let delta =
-                    compute_source_delta(table_key, catalog, base_snapshot, source_snapshot)
-                        .await?;
-                match delta {
-                    Some(staged) => {
-                        publish_rewritten_merge_table(target_db, table_key, &staged).await
-                    }
-                    None => Ok(crate::db::SubTableUpdate {
-                        table_key: table_key.to_string(),
-                        table_version: target_entry.unwrap().table_version,
-                        table_branch: Some(target_branch.to_string()),
-                        row_count: source_entry.row_count,
-                        version_metadata: target_entry.unwrap().version_metadata.clone(),
-                    }),
-                }
+                // Target already owns this table, empty delta — pointer switch
+                // onto its own lineage (the non-empty case is `AdoptWithDelta`).
+                Ok(crate::db::SubTableUpdate {
+                    table_key: table_key.to_string(),
+                    table_version: target_entry.unwrap().table_version,
+                    table_branch: Some(target_branch.to_string()),
+                    row_count: source_entry.row_count,
+                    version_metadata: target_entry.unwrap().version_metadata.clone(),
+                })
             } else {
                 // Target doesn't own this table yet — fork from source state.
                 // This creates the target branch on the sub-table dataset.
@@ -1040,6 +1142,141 @@ async fn publish_rewritten_merge_table(
             .build_indices_on_dataset(table_key, &mut current_ds)
             .await?;
     }
+    let final_state = target_db
+        .storage()
+        .table_state(&full_path, &current_ds)
+        .await?;
+
+    Ok(crate::db::SubTableUpdate {
+        table_key: table_key.to_string(),
+        table_version: final_state.version,
+        table_branch,
+        row_count: final_state.row_count,
+        version_metadata: final_state.version_metadata,
+    })
+}
+
+/// Scan a staged temp table and concat its non-empty batches into the single
+/// batch that `stage_append` / `stage_merge_insert` consume. Returns `None` when
+/// the table has no rows (both staged primitives reject an empty batch).
+async fn scan_staged_combined(
+    target_db: &Omnigraph,
+    table: &StagedTable,
+) -> Result<Option<RecordBatch>> {
+    crate::instrumentation::record_scan_staged_combined();
+    let snapshot = SnapshotHandle::new(table.dataset.clone());
+    let batches: Vec<RecordBatch> = target_db
+        .storage()
+        .scan_batches_for_rewrite(&snapshot)
+        .await?
+        .into_iter()
+        .filter(|batch| batch.num_rows() > 0)
+        .collect();
+    if batches.is_empty() {
+        return Ok(None);
+    }
+    let combined = if batches.len() == 1 {
+        batches.into_iter().next().unwrap()
+    } else {
+        let schema = batches[0].schema();
+        arrow_select::concat::concat_batches(&schema, &batches)
+            .map_err(|e| OmniError::Lance(e.to_string()))?
+    };
+    Ok(Some(combined))
+}
+
+/// Apply an [`AdoptDelta`] onto the target's base lineage (the fast-forward /
+/// target-owns path). Kept separate from `publish_rewritten_merge_table` (the
+/// three-way path) because the two paths diverge: commit 3 splits this Phase 1
+/// into append (new) + merge_insert (changed), and commit 6 makes its index
+/// coverage incremental — neither of which the three-way path takes.
+///
+/// `open_for_mutation(Merge)` opens the target's own table lineage (active
+/// branch is the merge target after the caller's swap), so every write lands on
+/// the target and survives source-branch deletion — GC-safe.
+async fn publish_adopted_delta(
+    target_db: &Omnigraph,
+    table_key: &str,
+    delta: &AdoptDelta,
+) -> Result<crate::db::SubTableUpdate> {
+    let (ds, full_path, table_branch) = target_db
+        .open_for_mutation(table_key, crate::db::MutationOpKind::Merge)
+        .await?;
+    let mut current_ds = ds;
+
+    // Phase 1a: append the NEW rows. `stage_append_stream` is a streaming
+    // `Operation::Append` — no hash join — so it never buffers the delta and
+    // cannot exhaust the DataFusion memory pool (the OOM fix). It streams the
+    // staged rows straight into the target (Lance rolls fragments at
+    // `max_rows_per_file`), so memory is bounded regardless of how many rows the
+    // connector appended — never the whole set in one batch. New ids are absent
+    // from base by construction (the ordered walk only classifies a row
+    // `(None, Some)` when base lacks it), so they never collide on `id`. Routed
+    // through the staged primitive so a failure between writing fragments and
+    // committing leaves no Lance-HEAD drift. `appends` is `Some` only when the
+    // staged table is non-empty (`compute_adopt_delta`).
+    if let Some(append_table) = &delta.appends {
+        let source = SnapshotHandle::new(append_table.dataset.clone());
+        let staged = target_db
+            .storage()
+            .stage_append_stream(&current_ds, &source, &[])
+            .await?;
+        current_ds = target_db
+            .storage()
+            .commit_staged(current_ds, staged)
+            .await?;
+    }
+
+    // Phase 1b: upsert the CHANGED rows. The merge_insert hash join is now
+    // bounded to the genuinely-changed set, not the whole delta. It runs against
+    // the committed view that already includes the appends; the changed ids are
+    // disjoint from the appended ids (each id is classified into exactly one of
+    // new / changed / deleted / unchanged in the single ordered walk), so the
+    // join never collides with an appended row.
+    if let Some(upsert_table) = &delta.upserts {
+        if let Some(combined) = scan_staged_combined(target_db, upsert_table).await? {
+            let staged_merge = target_db
+                .storage()
+                .stage_merge_insert(
+                    current_ds.clone(),
+                    combined,
+                    vec!["id".to_string()],
+                    lance::dataset::WhenMatched::UpdateAll,
+                    lance::dataset::WhenNotMatched::InsertAll,
+                )
+                .await?;
+            current_ds = target_db
+                .storage()
+                .commit_staged(current_ds, staged_merge)
+                .await?;
+        }
+    }
+
+    // Phase 2: delete removed rows via deletion vectors (inline-commit residual,
+    // same as the three-way path until Lance ships a public two-phase delete).
+    if !delta.deleted_ids.is_empty() {
+        let escaped: Vec<String> = delta
+            .deleted_ids
+            .iter()
+            .map(|id| format!("'{}'", id.replace('\'', "''")))
+            .collect();
+        let filter = format!("id IN ({})", escaped.join(", "));
+        let (new_ds, _) = target_db
+            .storage_inline_residual()
+            .delete_where(&full_path, current_ds, &filter)
+            .await?;
+        current_ds = new_ds;
+    }
+
+    // Phase 4: index coverage is reconciler-owned on the adopt path. Unlike the
+    // three-way `RewriteMerged` path, this does NOT build indices inline: the
+    // appended/upserted rows are left uncovered (reads stay correct via
+    // brute-force — indexes are derived state, invariant 7) and
+    // `optimize` / `ensure_indices` folds them in. This keeps even the first
+    // merge into a freshly schema-applied (unindexed) table fast — no inline IVF
+    // retrain on the publish path — and is the row-level approximation of Layer
+    // 2's fragment-adopt, where the source branch's already-built indices carry
+    // over by reference. See docs/user/branching/merge.md.
     let final_state = target_db
         .storage()
         .table_state(&full_path, &current_ds)
@@ -1262,7 +1499,16 @@ impl Omnigraph {
                 continue;
             }
             if same_manifest_state(base_entry, target_entry) {
-                candidates.insert(table_key.clone(), CandidateTableState::AdoptSourceState);
+                let candidate = classify_adopt(
+                    self,
+                    &self.catalog(),
+                    base_snapshot,
+                    source_snapshot,
+                    &target_snapshot,
+                    table_key,
+                )
+                .await?;
+                candidates.insert(table_key.clone(), candidate);
                 continue;
             }
 
@@ -1290,31 +1536,24 @@ impl Omnigraph {
         validate_merge_candidates(self, source_snapshot, &target_snapshot, &candidates).await?;
 
         // Recovery sidecar: protect the per-table commit_staged loop.
-        // Pin only `RewriteMerged` candidates because they always
-        // advance Lance HEAD through `publish_rewritten_merge_table`
-        // (which runs stage_merge_insert + delete_where + index
-        // rebuilds — multiple commit_staged calls per table; loose
-        // classification handles the multi-step drift).
+        // Pin `RewriteMerged` and `AdoptWithDelta` candidates — both advance
+        // Lance HEAD before the manifest publish (RewriteMerged via
+        // publish_rewritten_merge_table; AdoptWithDelta via publish_adopted_delta:
+        // stage_append + stage_merge_insert + delete_where + index — multiple
+        // commit_staged calls per table, which the loose classification handles
+        // as multi-step drift).
         //
         // `AdoptSourceState` candidates are NOT pinned: their publish
-        // path is `publish_adopted_source_state`, whose subcases mostly
-        // don't advance Lance HEAD (pure manifest pointer switch, or
-        // fork via `fork_dataset_from_entry_state` which only adds a
-        // Lance branch ref). If those subcases were pinned, recovery
-        // would classify them as NoMovement and the all-or-nothing
-        // decision would force a rollback that destroys legitimately-
-        // committed work on sibling RewriteMerged tables.
+        // (`publish_adopted_source_state`) is a pure pointer switch or a fork
+        // (`fork_dataset_from_entry_state` only adds a Lance branch ref), neither
+        // of which advances the data HEAD. Pinning them would classify as
+        // NoMovement and force an all-or-nothing rollback that destroys sibling
+        // tables' committed work.
         //
-        // Residual: two `AdoptSourceState` subcases (when source has a
-        // table_branch AND the source delta is non-empty) internally
-        // call `publish_rewritten_merge_table` and DO advance HEAD.
-        // Those are not covered by this sidecar — if they fail mid-
-        // commit, the residual persists until the next ReadWrite open
-        // detects it via a subsequent ExpectedVersionMismatch from a
-        // later writer that touches the same table. Closing this gap
-        // requires pre-computing source deltas during candidate
-        // classification (a structural change to `CandidateTableState`)
-        // and is left as follow-up work.
+        // The former gap — adopt subcases that applied a non-empty delta advanced
+        // HEAD unpinned — is closed: `classify_adopt` pre-computes the delta, so a
+        // HEAD-advancing adopt is `AdoptWithDelta` (pinned here) and an empty-delta
+        // adopt stays `AdoptSourceState`.
         // Acquire per-(table_key, target_branch) queues for every table
         // touched by the merge plan. Sorted-order acquisition prevents
         // lock-order inversion against concurrent multi-table writers.
@@ -1334,6 +1573,7 @@ impl Omnigraph {
                     candidates.get(*table_key),
                     Some(CandidateTableState::RewriteMerged(_))
                         | Some(CandidateTableState::AdoptSourceState)
+                        | Some(CandidateTableState::AdoptWithDelta(_))
                 )
             })
             .map(|table_key| (table_key.clone(), active_branch_for_keys.clone()))
@@ -1347,7 +1587,9 @@ impl Omnigraph {
             };
             if !matches!(
                 candidate,
-                CandidateTableState::RewriteMerged(_) | CandidateTableState::AdoptSourceState
+                CandidateTableState::RewriteMerged(_)
+                    | CandidateTableState::AdoptSourceState
+                    | CandidateTableState::AdoptWithDelta(_)
             ) {
                 continue;
             }
@@ -1368,7 +1610,10 @@ impl Omnigraph {
             .iter()
             .filter_map(|table_key| {
                 let candidate = candidates.get(table_key)?;
-                if !matches!(candidate, CandidateTableState::RewriteMerged(_)) {
+                if !matches!(
+                    candidate,
+                    CandidateTableState::RewriteMerged(_) | CandidateTableState::AdoptWithDelta(_)
+                ) {
                     return None;
                 }
                 let entry = target_snapshot.entry(table_key)?;
@@ -1436,15 +1681,11 @@ impl Omnigraph {
             };
             let update = match candidate_state {
                 CandidateTableState::AdoptSourceState => {
-                    publish_adopted_source_state(
-                        self,
-                        &self.catalog(),
-                        base_snapshot,
-                        source_snapshot,
-                        &target_snapshot,
-                        table_key,
-                    )
-                    .await?
+                    publish_adopted_source_state(self, source_snapshot, &target_snapshot, table_key)
+                        .await?
+                }
+                CandidateTableState::AdoptWithDelta(delta) => {
+                    publish_adopted_delta(self, table_key, delta).await?
                 }
                 CandidateTableState::RewriteMerged(staged) => {
                     publish_rewritten_merge_table(self, table_key, staged).await?
