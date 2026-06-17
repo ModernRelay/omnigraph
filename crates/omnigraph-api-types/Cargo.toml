@@ -14,3 +14,7 @@ omnigraph-compiler = { path = "../omnigraph-compiler", version = "0.7.0" }
 serde = { workspace = true }
 serde_json = { workspace = true }
 utoipa = { workspace = true }
+
+[dev-dependencies]
+# Faithful `pattern` enforcement in the schema/coercer equivalence test.
+regex = { workspace = true }

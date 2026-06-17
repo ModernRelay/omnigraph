@@ -95,6 +95,11 @@ impl std::fmt::Display for LoadError {
     }
 }
 
+/// Sentinel "winner" used to seed the collision check with built-in tool
+/// names. Not a valid query symbol (`<`/`>` are not identifier characters), so
+/// it can never collide with a real query name.
+const BUILTIN_OWNER: &str = "<built-in>";
+
 impl QueryRegistry {
     /// Build a registry from in-memory specs: parse each source, select
     /// the declaration whose symbol equals the manifest key, and assert
@@ -147,14 +152,24 @@ impl QueryRegistry {
         // before it is moved into `Self`.
         {
             let mut claimed: BTreeMap<&str, &str> = BTreeMap::new();
+            // Built-in MCP tool names are reserved graph-wide. A stored query
+            // that shadows one would silently never be served (built-ins win at
+            // dispatch) — the deny-list forbids silent drops, so seed them here
+            // and fail loudly at load instead.
+            for builtin in crate::mcp::BUILTIN_TOOL_NAMES {
+                claimed.insert(builtin, BUILTIN_OWNER);
+            }
             for query in by_name.values().filter(|q| q.expose) {
                 let tool = query.effective_tool_name();
                 if let Some(winner) = claimed.insert(tool, &query.name) {
+                    let message = if winner == BUILTIN_OWNER {
+                        format!("MCP tool name '{tool}' is reserved by a built-in tool")
+                    } else {
+                        format!("MCP tool name '{tool}' already claimed by exposed query '{winner}'")
+                    };
                     errors.push(LoadError {
                         query: Some(query.name.clone()),
-                        message: format!(
-                            "MCP tool name '{tool}' already claimed by exposed query '{winner}'"
-                        ),
+                        message,
                     });
                 }
             }
@@ -167,12 +182,33 @@ impl QueryRegistry {
         }
     }
 
+    /// Resolve by symbol name, **ignoring `expose`**. The raw catalog accessor
+    /// for HTTP/service callers (`expose:false` queries are deliberately
+    /// HTTP-callable; see [`StoredQuery::expose`]). The MCP backend must NOT use
+    /// this — it resolves through [`Self::exposed_by_name`] so the agent surface
+    /// can never reach a query hidden from the tool list.
     pub fn lookup(&self, name: &str) -> Option<&StoredQuery> {
         self.by_name.get(name)
     }
 
+    /// Iterate the full catalog, **ignoring `expose`** (HTTP/service surface).
     pub fn iter(&self) -> impl Iterator<Item = &StoredQuery> {
         self.by_name.values()
+    }
+
+    /// The MCP-reachable catalog: exactly the exposed queries. The single
+    /// `expose` chokepoint for the agent surface — `tools/list`, the
+    /// `stored_query_list` tool, and per-query tool dispatch all funnel through
+    /// it, so they cannot drift on which queries an agent may see or run.
+    pub fn exposed(&self) -> impl Iterator<Item = &StoredQuery> {
+        self.by_name.values().filter(|q| q.expose)
+    }
+
+    /// Resolve by symbol name, **exposed-only** — the MCP `stored_query_run`
+    /// resolver. An unexposed query is unreachable by name through this path
+    /// even to a caller that knows the name (the agent surface honors `expose`).
+    pub fn exposed_by_name(&self, name: &str) -> Option<&StoredQuery> {
+        self.by_name.get(name).filter(|q| q.expose)
     }
 
     pub fn is_empty(&self) -> bool {

@@ -234,7 +234,12 @@ impl McpHostPolicy {
     pub fn from_bind(bind: &SocketAddr, public_hosts: &[String], browser_origins: &[String]) -> Self {
         let loopback = bind.ip().is_loopback();
         Self {
-            allowed_hosts: if loopback { Some(vec!["127.0.0.1".into(), "localhost".into()]) }
+            // Loopback bind ⇒ the full loopback Host set (both stacks + the
+            // hostname alias), matching rmcp's default `["localhost","127.0.0.1","::1"]`.
+            // The Host header is independent of the bound socket (in-process,
+            // proxies, dual-stack localhost), so a 127-bound server must still
+            // accept a `[::1]` Host — deriving the list from `bind.ip()` alone 403'd it.
+            allowed_hosts: if loopback { Some(vec!["127.0.0.1".into(), "::1".into(), "localhost".into()]) }
                            else if public_hosts.is_empty() { None } else { Some(public_hosts.to_vec()) },
             origin: if !browser_origins.is_empty() { OriginPolicy::Allow(browser_origins.to_vec()) }
                     else if loopback { OriginPolicy::Unchecked }     // local dev convenience only
@@ -597,11 +602,22 @@ Represent built-ins as a `Builtin` enum (one variant per tool; `descriptor` / `g
 `call` as match arms) — lower liability than ~13 unit structs + `dyn`. Stored-query
 tools are a sibling populator over `handle.queries`.
 
-**`list_tools` / `list_resources` are Cedar-filtered** by running the *same*
-authorization the call path runs, with **default args (branch `main`)** — not a
-`branch: None` probe (which matches no `branch_scope` rule and would hide tools the
-actor can call on a scoped branch). Over-showing a branch-scoped grant is the safe
-direction; `call_tool` is the authoritative gate.
+**`list_tools` / `list_resources` are Cedar-filtered as a *relaxation* of the
+call-path gate** — listing never hides a tool the caller could invoke on some
+branch (over-showing is the safe direction; `call_tool` is authoritative). A
+built-in whose authorization depends on a caller-chosen branch (`graph_mutate`,
+`graph_load`, `branch_*`) is shown iff `authorize_any_branch` →
+`PolicyEngine::permits_on_any_branch(actor, action)` is true: that probes the
+branch-shape space (omitted / protected / unprotected) through the same Cedar
+authorizer and returns true if *any* shape is allowed. A fixed-branch probe is
+wrong here — both a fabricated `main` (denied under "protect `main`, write
+unprotected branches", the canonical workflow) and a `branch: None` probe
+(matches no `branch_scope` rule) under-show `graph_mutate` to an actor who can
+write feature branches. The stored-query surface gets the same list/call
+agreement structurally: `resolve_stored_tool` is the single membership test, so
+the meta pair is callable only in `meta` mode and `stored_query_run` resolves
+**exposed-only** (an `expose:false` query is unreachable by name on the agent
+surface, though it stays HTTP/service-callable).
 
 ## 11. Dispatch reuse + error classification
 

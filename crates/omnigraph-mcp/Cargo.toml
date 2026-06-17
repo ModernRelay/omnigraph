@@ -1,0 +1,28 @@
+[package]
+name = "omnigraph-mcp"
+version = "0.7.0"
+edition = "2024"
+description = "MCP (Model Context Protocol) Streamable-HTTP transport and backend seam for Omnigraph. Contains the rmcp dependency and defines the McpBackend trait the server implements; names no omnigraph engine/server type, so the dependency edge is server → mcp."
+license = "MIT"
+repository = "https://github.com/ModernRelay/omnigraph"
+homepage = "https://github.com/ModernRelay/omnigraph"
+documentation = "https://docs.rs/omnigraph-mcp"
+
+[dependencies]
+# rmcp is contained to this crate. `server` + `transport-streamable-http-server`
+# give the StreamableHttpService tower wiring. Do NOT enable rmcp's `local`
+# feature — it cfg's the tower wiring out (transport mod is gated on
+# `not(feature = "local")`).
+rmcp = { version = "1.7", default-features = false, features = ["server", "transport-streamable-http-server"] }
+axum = { workspace = true }
+http = "1"
+# `limit` adds RequestBodyLimitLayer; features are additive with the workspace's
+# `trace`. rmcp reads the body directly (no axum extractor), so axum's
+# DefaultBodyLimit does not bound /mcp — this layer is the real bound.
+tower-http = { workspace = true, features = ["limit"] }
+tokio = { workspace = true }
+async-trait = { workspace = true }
+serde_json = { workspace = true }
+
+[dev-dependencies]
+tower = { workspace = true }

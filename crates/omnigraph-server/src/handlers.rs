@@ -426,6 +426,37 @@ pub(crate) fn authorize_request(
     }
 }
 
+/// List-time capability probe: could `action` be permitted on *some* branch?
+/// Mirrors [`authorize`]'s no-policy handling (open mode allows per-graph
+/// actions; default-deny allows only `Read`; server-scoped actions are closed),
+/// and otherwise delegates to [`PolicyEngine::permits_on_any_branch`]. Used to
+/// filter argument-scoped tools in `tools/list` as a relaxation of the per-call
+/// gate — so a tool callable on some branch is never hidden, while one the
+/// actor has no grant for stays hidden.
+pub(crate) fn authorize_any_branch(
+    actor: Option<&ResolvedActor>,
+    policy: Option<&PolicyEngine>,
+    action: PolicyAction,
+) -> std::result::Result<bool, ApiError> {
+    let Some(engine) = policy else {
+        if action.resource_kind() == PolicyResourceKind::Server {
+            return Ok(false);
+        }
+        // Default-deny mode (tokens configured, no policy): only Read; Open mode
+        // (no tokens): all per-graph actions. Matches `authorize` exactly.
+        if actor.is_some() && action != PolicyAction::Read {
+            return Ok(false);
+        }
+        return Ok(true);
+    };
+    let Some(actor) = actor else {
+        return Err(ApiError::unauthorized("missing bearer token"));
+    };
+    engine
+        .permits_on_any_branch(actor.actor_id.as_ref(), action)
+        .map_err(|err| ApiError::internal(format!("policy: {err}")))
+}
+
 #[utoipa::path(
     get,
     path = "/snapshot",
@@ -1216,7 +1247,7 @@ pub(crate) async fn server_schema_apply(
 /// Shared body for `POST /load` (canonical) and `POST /ingest` (deprecated):
 /// branch-exists / fork-if-`from` check, Cedar authorization, admission, the
 /// bulk `load_as`, and the `IngestOutput` mapping.
-async fn run_ingest(
+pub(crate) async fn run_ingest(
     state: AppState,
     handle: Arc<GraphHandle>,
     actor: Option<&ResolvedActor>,

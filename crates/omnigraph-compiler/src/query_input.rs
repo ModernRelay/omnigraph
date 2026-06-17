@@ -322,6 +322,23 @@ pub fn json_params_to_param_map(
     Ok(map)
 }
 
+/// Coerce one JSON value to a typed [`Literal`] by the engine's input
+/// contract — the single authority for what a param accepts. Exposed so the
+/// shared `param_json_schema` projection (in `omnigraph-api-types`) can be
+/// locked to this coercer by an equivalence test: the JSON Schema a client
+/// validates against must accept at least what this accepts, or a strict
+/// client would reject inputs the engine would have taken. Does **not** apply
+/// the nullable rule — explicit `null` is handled by [`json_params_to_param_map`],
+/// not here.
+pub fn coerce_param_typed(
+    key: &str,
+    value: &Value,
+    type_name: &str,
+    mode: JsonParamMode,
+) -> RunInputResult<Literal> {
+    json_value_to_literal_typed(key, value, type_name, mode)
+}
+
 fn json_value_to_literal_typed(
     key: &str,
     value: &Value,

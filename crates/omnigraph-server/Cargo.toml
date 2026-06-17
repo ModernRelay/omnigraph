@@ -24,7 +24,11 @@ omnigraph-compiler = { path = "../omnigraph-compiler", version = "0.7.0" }
 omnigraph-policy = { path = "../omnigraph-policy", version = "0.7.0" }
 omnigraph-api-types = { path = "../omnigraph-api-types", version = "0.7.0" }
 omnigraph-cluster = { path = "../omnigraph-cluster", version = "0.7.0" }
+# The MCP surface. rmcp is contained to omnigraph-mcp — the server carries NO
+# direct rmcp dependency (verify: `cargo tree -p omnigraph-server -e normal | grep rmcp`).
+omnigraph-mcp = { path = "../omnigraph-mcp", version = "0.7.0" }
 axum = { workspace = true }
+http = "1"
 clap = { workspace = true }
 color-eyre = { workspace = true }
 serde = { workspace = true }
