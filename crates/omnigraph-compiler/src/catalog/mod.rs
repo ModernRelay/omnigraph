@@ -6,7 +6,7 @@ use std::sync::Arc;
 
 use arrow_schema::{DataType, Field, Schema, SchemaRef};
 
-use crate::error::{NanoError, Result};
+use crate::error::{CompilerError, Result};
 use crate::schema::ast::{Cardinality, Constraint, ConstraintBound, SchemaDecl, SchemaFile};
 use crate::types::{PropType, ScalarType};
 
@@ -151,7 +151,7 @@ pub fn build_catalog(schema: &SchemaFile) -> Result<Catalog> {
     for decl in &schema.declarations {
         if let SchemaDecl::Node(node) = decl {
             if node_types.contains_key(&node.name) {
-                return Err(NanoError::Catalog(format!(
+                return Err(CompilerError::Catalog(format!(
                     "duplicate node type: {}",
                     node.name
                 )));
@@ -250,19 +250,19 @@ pub fn build_catalog(schema: &SchemaFile) -> Result<Catalog> {
     for decl in &schema.declarations {
         if let SchemaDecl::Edge(edge) = decl {
             if edge_types.contains_key(&edge.name) {
-                return Err(NanoError::Catalog(format!(
+                return Err(CompilerError::Catalog(format!(
                     "duplicate edge type: {}",
                     edge.name
                 )));
             }
             if !node_types.contains_key(&edge.from_type) {
-                return Err(NanoError::Catalog(format!(
+                return Err(CompilerError::Catalog(format!(
                     "edge {} references unknown source type: {}",
                     edge.name, edge.from_type
                 )));
             }
             if !node_types.contains_key(&edge.to_type) {
-                return Err(NanoError::Catalog(format!(
+                return Err(CompilerError::Catalog(format!(
                     "edge {} references unknown target type: {}",
                     edge.name, edge.to_type
                 )));
@@ -302,7 +302,7 @@ pub fn build_catalog(schema: &SchemaFile) -> Result<Catalog> {
             if let Some(existing) = edge_name_index.get(&normalized_name)
                 && existing != &edge.name
             {
-                return Err(NanoError::Catalog(format!(
+                return Err(CompilerError::Catalog(format!(
                     "edge name collision after case folding: '{}' conflicts with '{}'",
                     edge.name, existing
                 )));

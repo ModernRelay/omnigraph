@@ -74,7 +74,7 @@ pub enum MergeConflictKind {
 #[derive(Debug, Error)]
 pub enum OmniError {
     #[error("{0}")]
-    Compiler(#[from] omnigraph_compiler::error::NanoError),
+    Compiler(#[from] omnigraph_compiler::error::CompilerError),
     #[error("storage: {0}")]
     Lance(String),
     #[error("query: {0}")]

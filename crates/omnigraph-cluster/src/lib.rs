@@ -160,7 +160,7 @@ pub async fn plan_config_dir(config_dir: impl AsRef<Path>) -> PlanOutput {
 
     // Plan is read-only: pending sidecars are reported, never acted on
     // (RFC-004 open question 3 keeps read-only commands warn-only).
-    warn_pending_recovery_sidecars(&desired.config_dir, &mut diagnostics);
+    warn_pending_recovery_sidecars(&backend, &mut diagnostics).await;
 
     let mut prior_resources = BTreeMap::new();
     let mut prior_state: Option<ClusterState> = None;
@@ -1260,7 +1260,7 @@ pub async fn status_config_dir(config_dir: impl AsRef<Path>) -> StatusOutput {
     backend
         .observe_lock(&mut observations, &mut diagnostics)
         .await;
-    warn_pending_recovery_sidecars(&parsed.config_dir, &mut diagnostics);
+    warn_pending_recovery_sidecars(&backend, &mut diagnostics).await;
 
     let mut resource_digests = BTreeMap::new();
     let mut resource_statuses = BTreeMap::new();
