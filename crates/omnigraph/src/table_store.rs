@@ -943,7 +943,7 @@ impl TableStore {
                 "stage_append called with empty batch".to_string(),
             ));
         }
-        crate::instrumentation::record_stage_append(batch.num_rows() as u64);
+        let appended_rows = batch.num_rows() as u64;
         let params = WriteParams {
             mode: WriteMode::Append,
             allow_external_blob_outside_bases: true,
@@ -956,6 +956,9 @@ impl TableStore {
             .execute_uncommitted(vec![batch])
             .await
             .map_err(|e| OmniError::Lance(e.to_string()))?;
+        // Record only after the staging write succeeds, so a failed write does
+        // not inflate the probe (matches `stage_append_stream`'s ordering).
+        crate::instrumentation::record_stage_append(appended_rows);
         let mut new_fragments = match &transaction.operation {
             Operation::Append { fragments } => fragments.clone(),
             Operation::Overwrite { fragments, .. } => fragments.clone(),

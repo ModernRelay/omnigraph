@@ -24,14 +24,22 @@ A merge resolves to one of three outcomes:
 
 ## Indexes after a merge
 
-A merge does not build or rebuild indexes on the rows it brings into the target.
-Newly merged rows (and any index a table does not yet have) are covered the next
-time `optimize` runs — indexes are derived state, and reads stay correct in the
-meantime via brute-force scan over the not-yet-covered rows. This keeps a merge
-fast (it never pays an inline vector/FTS rebuild on the publish path), at the
-cost of brute-force search latency on freshly merged rows until the next
-`optimize`. Run `omnigraph optimize` after a large merge to restore full index
-coverage.
+A **fast-forward** merge (the common case — the target had no conflicting
+changes, so the source's rows are adopted) does not build or rebuild indexes on
+the rows it brings into the target. Newly merged rows (and any index a table does
+not yet have) are covered the next time `optimize` runs — indexes are derived
+state, and reads stay correct in the meantime via brute-force scan over the
+not-yet-covered rows. This keeps a fast-forward merge fast (it never pays an
+inline vector/FTS rebuild on the publish path), at the cost of brute-force search
+latency on freshly merged rows until the next `optimize`.
+
+A **three-way** merge (the `Merged` outcome — both branches changed the table and
+the rows were reconciled) still rebuilds the table's indexes inline today, as part
+of the publish. So a Merged-outcome merge of an embedding-bearing table pays the
+index-build cost up front.
+
+Either way, run `omnigraph optimize` after a large merge to restore (or, for the
+fast-forward path, establish) full index coverage.
 
 ## Conflicts
 
