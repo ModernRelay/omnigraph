@@ -373,6 +373,16 @@ pub(crate) async fn write_sidecar(
 /// a torn rewrite is never observed, so recovery reads either the pre-confirm
 /// sidecar (→ roll back, safe) or the confirmed one (→ roll forward). A failure
 /// here leaves the pre-confirm sidecar, so the operation rolls back — correct.
+///
+/// SURVIVES the fragment-adopt work (unlike the row-level merge it currently
+/// serves — see `AdoptDelta` in `exec/merge.rs`). The recovery sidecar is the
+/// cross-table write-ahead log that makes a fast-forward-main commit
+/// all-or-nothing across N tables, which a fragment graft still needs. What
+/// narrows is the *within-table* reason for confirmation: once each table's
+/// merge is a single graft commit, the multi-step partial window shrinks to one
+/// commit, so the `BranchMerge` arm of `classify_table` could fold back into the
+/// strict single-commit path and `IncompletePhaseB` retire. Do NOT delete this
+/// with the row path — keep the sidecar; only simplify the classifier.
 pub(crate) async fn confirm_sidecar_phase_b(
     root_uri: &str,
     storage: &dyn StorageAdapter,

@@ -35,6 +35,20 @@ struct StagedMergeResult {
 /// which also carries a `full_staged` table for validation — the adopt path
 /// validates against the source snapshot directly (`candidate_dataset`), so it
 /// needs no `full_staged` and never builds it.
+///
+/// TRANSITIONAL — fragment-adopt excision point. This whole row-level adopt
+/// (`AdoptDelta`, [`compute_adopt_delta`], [`publish_adopted_delta`], and the
+/// streaming append it drives) re-derives the source branch row-by-row because
+/// today's Lance offers no fragment-level branch merge. When Lance ships
+/// branch-merge/rebase ([#7263]) + UUID branch paths ([#7185]), a fast-forward
+/// merge becomes a *fragment graft* — adopt the source table version's
+/// fragments (and their already-built indexes) by reference, no rows scanned,
+/// re-appended, upserted, or deleted. At that point this struct and its two
+/// functions are removed wholesale; the merge collapses to ~one ref/metadata
+/// op per table. Keep them self-contained so that excision stays a clean delete.
+///
+/// [#7263]: https://github.com/lance-format/lance/issues/7263
+/// [#7185]: https://github.com/lance-format/lance/issues/7185
 #[derive(Debug)]
 struct AdoptDelta {
     /// New-on-source rows → `stage_append` (a streaming `Operation::Append`, no
@@ -319,6 +333,10 @@ fn sanitize_table_key(table_key: &str) -> String {
 /// snapshot directly (`candidate_dataset`), so no `full_staged` table is built
 /// — saving the O(rows) temp write that `compute_source_delta` used to produce
 /// and then discard.
+///
+/// TRANSITIONAL — removed by the fragment-adopt work (see [`AdoptDelta`]): a
+/// fragment graft adopts the source's fragments by reference, so there is no
+/// row-level delta to compute.
 async fn compute_adopt_delta(
     table_key: &str,
     catalog: &Catalog,
@@ -1209,6 +1227,11 @@ async fn scan_staged_combined(
 /// `open_for_mutation(Merge)` opens the target's own table lineage (active
 /// branch is the merge target after the caller's swap), so every write lands on
 /// the target and survives source-branch deletion — GC-safe.
+///
+/// TRANSITIONAL — removed by the fragment-adopt work (see [`AdoptDelta`]): the
+/// multi-commit append → upsert → delete publish here (the source of the
+/// partial-Phase-B recovery window the sidecar confirmation guards) collapses to
+/// a single fragment-graft commit per table, so this whole function goes away.
 async fn publish_adopted_delta(
     target_db: &Omnigraph,
     table_key: &str,

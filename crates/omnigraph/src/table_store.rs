@@ -1006,6 +1006,12 @@ impl TableStore {
     /// — bounded memory, one Append transaction. This is the substrate-blessed
     /// bulk-append path (the same one LanceDB's `Table::add` uses). Identical
     /// fragment-id / stable-row-id staging as `stage_append`.
+    ///
+    /// TRANSITIONAL caller — its only caller is the row-level merge append
+    /// (`publish_adopted_delta`, see `AdoptDelta`), which the fragment-adopt work
+    /// (Lance #7263/#7185) removes: a fragment graft re-appends no rows. This
+    /// primitive and `scan_stream_for_rewrite` are then dead unless re-adopted as
+    /// a general bulk-append path (the `Table::add` shape makes that plausible).
     pub async fn stage_append_stream(
         &self,
         ds: &Dataset,
