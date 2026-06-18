@@ -8,12 +8,15 @@ use omnigraph::db::Omnigraph;
 use omnigraph::error::{ManifestErrorKind, OmniError};
 use omnigraph::failpoints::ScopedFailPoint;
 use omnigraph::loader::LoadMode;
+use serial_test::serial;
 
 use helpers::recovery::{
     FollowUpMutation, RecoveryExpectation, TableExpectation, assert_post_recovery_invariants,
     branch_head_commit_id, single_sidecar_operation_id,
 };
-use helpers::{MUTATION_QUERIES, mixed_params, mutate_main, version_main};
+use helpers::{
+    MUTATION_QUERIES, collect_column_strings, mixed_params, mutate_main, read_table, version_main,
+};
 
 const SCHEMA_V1: &str = "node Person { name: String @key }\n";
 const SCHEMA_V2_ADDED_TYPE: &str =
@@ -3176,6 +3179,7 @@ async fn optimize_phase_b_failure_recovered_on_next_open() {
 }
 
 #[tokio::test]
+#[serial(branch_merge_phase_b)]
 async fn branch_merge_phase_b_failure_recovered_on_next_open() {
     use omnigraph::loader::{LoadMode, load_jsonl};
 
@@ -3337,6 +3341,352 @@ async fn branch_merge_phase_b_failure_recovered_on_next_open() {
     drop(db);
 }
 
+/// AdoptWithDelta recovery (the gap closure): a fast-forward merge — main has
+/// NOT advanced since the branch forked, so the touched table is classified
+/// `AdoptWithDelta`, not `RewriteMerged` — that fails after Phase B must still
+/// recover on the next open. Before the recovery-pin closure this drifted
+/// silently: the adopt path advanced Lance HEAD but was unpinned, so the sweep
+/// found no sidecar and the merge was lost.
+#[tokio::test]
+#[serial(branch_merge_phase_b)]
+async fn branch_merge_adopt_with_delta_phase_b_failure_recovered_on_next_open() {
+    use omnigraph::loader::{LoadMode, load_jsonl};
+
+    let _scenario = FailScenario::setup();
+    let dir = tempfile::tempdir().unwrap();
+    let uri = dir.path().to_str().unwrap().to_string();
+
+    // Seed main, branch off, mutate ONLY the branch. main stays at base, so the
+    // merge is a fast-forward and Person classifies `AdoptWithDelta` (forked
+    // source, target == base, non-empty delta) — NOT `RewriteMerged`.
+    {
+        let mut db = Omnigraph::init(&uri, helpers::TEST_SCHEMA).await.unwrap();
+        load_jsonl(
+            &mut db,
+            r#"{"type":"Person","data":{"name":"alice","age":30}}
+"#,
+            LoadMode::Append,
+        )
+        .await
+        .unwrap();
+        db.branch_create("feature").await.unwrap();
+        db.mutate(
+            "feature",
+            MUTATION_QUERIES,
+            "insert_person",
+            &mixed_params(&[("$name", "Bob")], &[("$age", 40)]),
+        )
+        .await
+        .unwrap();
+        // main intentionally NOT mutated → fast-forward → AdoptWithDelta.
+    }
+
+    let pre_failure_version = {
+        let db = Omnigraph::open(&uri).await.unwrap();
+        version_main(&db).await.unwrap()
+    };
+
+    // Fail after the per-table publish loop, before commit_manifest_updates.
+    {
+        let db = Omnigraph::open(&uri).await.unwrap();
+        let _failpoint =
+            ScopedFailPoint::new("branch_merge.post_phase_b_pre_manifest_commit", "return");
+        let err = db.branch_merge("feature", "main").await.unwrap_err();
+        assert!(
+            err.to_string().contains(
+                "injected failpoint triggered: branch_merge.post_phase_b_pre_manifest_commit"
+            ),
+            "unexpected error: {err}"
+        );
+
+        // The gap closure: an AdoptWithDelta merge must persist a sidecar.
+        let recovery_dir = dir.path().join("__recovery");
+        let sidecars: Vec<_> = std::fs::read_dir(&recovery_dir)
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .collect();
+        assert_eq!(
+            sidecars.len(),
+            1,
+            "AdoptWithDelta merge must persist exactly one recovery sidecar (the closed gap)"
+        );
+    }
+
+    // Reopen → the recovery sweep rolls the AdoptWithDelta merge forward.
+    let db = Omnigraph::open(&uri).await.unwrap();
+    let recovery_dir = dir.path().join("__recovery");
+    if recovery_dir.exists() {
+        let remaining: Vec<_> = std::fs::read_dir(&recovery_dir)
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .collect();
+        assert!(
+            remaining.is_empty(),
+            "sidecar must be deleted post-recovery; remaining: {remaining:?}"
+        );
+    }
+
+    let post_recovery_version = version_main(&db).await.unwrap();
+    assert!(
+        post_recovery_version > pre_failure_version,
+        "manifest must advance post-recovery; pre={pre_failure_version} post={post_recovery_version}"
+    );
+    let names = collect_column_strings(&read_table(&db, "node:Person").await, "name");
+    assert!(
+        names.contains(&"Bob".to_string()),
+        "recovered AdoptWithDelta merge must include Bob; have {names:?}"
+    );
+    drop(db);
+}
+
+/// Which branch-merge publish path a partial-Phase-B test exercises.
+enum MergeScenario {
+    /// main stays at base → the touched table is `AdoptWithDelta`
+    /// (`publish_adopted_delta`: append → upsert → delete).
+    Adopt,
+    /// main advances past base → the touched table is `RewriteMerged`
+    /// (`publish_rewritten_merge_table`: merge_insert → delete → index).
+    Rewrite,
+}
+
+async fn sorted_person_names(db: &Omnigraph) -> Vec<String> {
+    let mut names = collect_column_strings(&read_table(db, "node:Person").await, "name");
+    names.sort();
+    names
+}
+
+/// THE recovery-atomicity regression gate. A branch merge whose per-table publish
+/// is a multi-commit sequence (append → upsert → delete, or merge_insert → delete
+/// → index) advances Lance HEAD step by step before the manifest publish. If the
+/// process dies *mid*-sequence — after some commits but before the achieved-version
+/// intent is recorded — recovery must roll the whole merge **back**, not publish
+/// the partial and record the merge as complete.
+///
+/// The delta is deliberately MIXED — a fresh id (`bob`, append), a modified base id
+/// (`carol`, upsert) and a removed base id (`dave`, delete) — so every partial
+/// window leaves real work undone. Proof of rollback: after recovery the target is
+/// back at its base name-set, and a *re-run* of the merge re-applies the full delta
+/// (the partial was not silently recorded as "already merged").
+///
+/// RED before the fix: the loose `BranchMerge` classification rolls any
+/// `lance_head > manifest_pinned` forward, so the partial is published (e.g. `bob`
+/// present, `dave` kept) and the merge recorded — the first assert (back at base)
+/// fails. GREEN after: `achieved_version == None` → `IncompletePhaseB` → roll back.
+async fn assert_partial_merge_rolls_back(scenario: MergeScenario, failpoint: &str) {
+    use omnigraph::loader::load_jsonl;
+
+    let _scenario = FailScenario::setup();
+    let dir = tempfile::tempdir().unwrap();
+    let uri = dir.path().to_str().unwrap().to_string();
+
+    // Seed main {alice, carol, dave}; on `feature` add bob (append), bump carol
+    // (upsert), remove dave (delete). For Rewrite, also move main past base so the
+    // table classifies RewriteMerged instead of a fast-forward AdoptWithDelta.
+    {
+        let mut db = Omnigraph::init(&uri, helpers::TEST_SCHEMA).await.unwrap();
+        load_jsonl(
+            &mut db,
+            "{\"type\":\"Person\",\"data\":{\"name\":\"alice\",\"age\":30}}\n\
+             {\"type\":\"Person\",\"data\":{\"name\":\"carol\",\"age\":50}}\n\
+             {\"type\":\"Person\",\"data\":{\"name\":\"dave\",\"age\":60}}\n",
+            LoadMode::Append,
+        )
+        .await
+        .unwrap();
+        db.branch_create("feature").await.unwrap();
+        db.mutate(
+            "feature",
+            MUTATION_QUERIES,
+            "insert_person",
+            &mixed_params(&[("$name", "bob")], &[("$age", 40)]),
+        )
+        .await
+        .unwrap();
+        db.mutate(
+            "feature",
+            MUTATION_QUERIES,
+            "set_age",
+            &mixed_params(&[("$name", "carol")], &[("$age", 55)]),
+        )
+        .await
+        .unwrap();
+        db.mutate(
+            "feature",
+            MUTATION_QUERIES,
+            "remove_person",
+            &mixed_params(&[("$name", "dave")], &[]),
+        )
+        .await
+        .unwrap();
+        if matches!(scenario, MergeScenario::Rewrite) {
+            db.mutate(
+                "main",
+                MUTATION_QUERIES,
+                "set_age",
+                &mixed_params(&[("$name", "alice")], &[("$age", 35)]),
+            )
+            .await
+            .unwrap();
+        }
+    }
+
+    // Crash mid-Phase-B at the injected window.
+    {
+        let db = Omnigraph::open(&uri).await.unwrap();
+        let _fp = ScopedFailPoint::new(failpoint, "return");
+        let err = db.branch_merge("feature", "main").await.unwrap_err();
+        assert!(
+            err.to_string().contains(failpoint),
+            "expected the injected failpoint {failpoint}, got: {err}"
+        );
+    }
+
+    // Reopen → the open-time sweep must ROLL BACK to base (the merge never reached
+    // its commit boundary), and a re-run must then apply the FULL delta.
+    {
+        let db = Omnigraph::open(&uri).await.unwrap();
+        assert_eq!(
+            sorted_person_names(&db).await,
+            vec!["alice", "carol", "dave"],
+            "partial Phase B at {failpoint} must roll back to base \
+             (no bob, dave kept, carol's upsert reverted); the merge must NOT be recorded",
+        );
+        db.branch_merge("feature", "main").await.unwrap();
+        assert_eq!(
+            sorted_person_names(&db).await,
+            vec!["alice", "bob", "carol"],
+            "re-merge after rollback must re-apply the full delta \
+             (bob added, dave removed) — proof the partial was not silently recorded",
+        );
+    }
+}
+
+#[tokio::test]
+#[serial(branch_merge_phase_b)]
+async fn branch_merge_adopt_partial_after_append_rolls_back() {
+    assert_partial_merge_rolls_back(
+        MergeScenario::Adopt,
+        "branch_merge.adopt_after_append_pre_upsert",
+    )
+    .await;
+}
+
+#[tokio::test]
+#[serial(branch_merge_phase_b)]
+async fn branch_merge_adopt_partial_after_upsert_rolls_back() {
+    assert_partial_merge_rolls_back(
+        MergeScenario::Adopt,
+        "branch_merge.adopt_after_upsert_pre_delete",
+    )
+    .await;
+}
+
+#[tokio::test]
+#[serial(branch_merge_phase_b)]
+async fn branch_merge_rewrite_partial_after_merge_rolls_back() {
+    assert_partial_merge_rolls_back(
+        MergeScenario::Rewrite,
+        "branch_merge.rewrite_after_merge_pre_delete",
+    )
+    .await;
+}
+
+#[tokio::test]
+#[serial(branch_merge_phase_b)]
+async fn branch_merge_rewrite_partial_after_delete_rolls_back() {
+    assert_partial_merge_rolls_back(
+        MergeScenario::Rewrite,
+        "branch_merge.rewrite_after_delete_pre_index",
+    )
+    .await;
+}
+
+/// Backward-compat: a `BranchMerge` sidecar written by a *pre-confirmation*
+/// binary (schema_version 1, no `confirmed_version`) must NOT be misread as a
+/// partial Phase B and rolled back. A pre-upgrade crash in the Phase-B→C gap can
+/// leave such a sidecar over a *completed* merge; rolling it back would silently
+/// discard a finished merge with no operator signal — the regression greptile /
+/// Cursor flagged.
+///
+/// We synthesize the pre-upgrade sidecar realistically: crash after Phase B (a
+/// real sidecar + advanced Lance HEAD), then downgrade the on-disk JSON to the
+/// v1 shape (`schema_version` = 1, strip every pin's `confirmed_version`) before
+/// reopening — exactly what an old binary would have left.
+///
+/// RED before the versioning fix: a v1 sidecar with no `confirmed_version`
+/// classifies `IncompletePhaseB` → rolls back → `bob` is discarded. GREEN after:
+/// the version-aware classifier reads v1 as the old loose generation → rolls
+/// forward → `bob` preserved.
+#[tokio::test]
+#[serial(branch_merge_phase_b)]
+async fn pre_upgrade_v1_branch_merge_sidecar_rolls_forward_not_back() {
+    use omnigraph::loader::{LoadMode, load_jsonl};
+
+    let _scenario = FailScenario::setup();
+    let dir = tempfile::tempdir().unwrap();
+    let uri = dir.path().to_str().unwrap().to_string();
+
+    // main {alice}; feature adds bob → a fast-forward AdoptWithDelta merge, which
+    // writes a recovery sidecar.
+    {
+        let mut db = Omnigraph::init(&uri, helpers::TEST_SCHEMA).await.unwrap();
+        load_jsonl(
+            &mut db,
+            "{\"type\":\"Person\",\"data\":{\"name\":\"alice\",\"age\":30}}\n",
+            LoadMode::Append,
+        )
+        .await
+        .unwrap();
+        db.branch_create("feature").await.unwrap();
+        db.mutate(
+            "feature",
+            MUTATION_QUERIES,
+            "insert_person",
+            &mixed_params(&[("$name", "bob")], &[("$age", 40)]),
+        )
+        .await
+        .unwrap();
+    }
+
+    // Crash after Phase B (Lance HEAD advanced, manifest not published) → a real
+    // sidecar lands on disk.
+    {
+        let db = Omnigraph::open(&uri).await.unwrap();
+        let _fp = ScopedFailPoint::new("branch_merge.post_phase_b_pre_manifest_commit", "return");
+        db.branch_merge("feature", "main").await.unwrap_err();
+    }
+
+    // Downgrade the sidecar to the pre-confirmation v1 shape an old binary writes.
+    {
+        let recovery_dir = std::path::Path::new(&uri).join("__recovery");
+        let path = std::fs::read_dir(&recovery_dir)
+            .unwrap()
+            .filter_map(Result::ok)
+            .map(|e| e.path())
+            .find(|p| p.extension().is_some_and(|x| x == "json"))
+            .expect("a recovery sidecar must exist after the post-Phase-B crash");
+        let mut v: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+        v["schema_version"] = serde_json::json!(1);
+        for table in v["tables"].as_array_mut().unwrap() {
+            table.as_object_mut().unwrap().remove("confirmed_version");
+        }
+        std::fs::write(&path, serde_json::to_string_pretty(&v).unwrap()).unwrap();
+    }
+
+    // Reopen → the pre-upgrade completed merge must roll FORWARD (bob kept), not
+    // be silently discarded.
+    {
+        let db = Omnigraph::open(&uri).await.unwrap();
+        assert_eq!(
+            sorted_person_names(&db).await,
+            vec!["alice", "bob"],
+            "a pre-confirmation (v1) BranchMerge sidecar over a completed merge must roll \
+             forward, not be misread as a partial and rolled back",
+        );
+    }
+}
+
 /// Branch-axis variant of the branch_merge recovery test: target is a
 /// non-main branch. Catches the branch-specific commit-graph head bug
 /// (D2) — without `CommitGraph::open_at_branch`, the recovery sweep
@@ -3344,6 +3694,7 @@ async fn branch_merge_phase_b_failure_recovered_on_next_open() {
 /// target, and future merges between the same pair would lose
 /// already-up-to-date detection.
 #[tokio::test]
+#[serial(branch_merge_phase_b)]
 async fn branch_merge_phase_b_failure_recovered_on_non_main_target() {
     use omnigraph::loader::{LoadMode, load_jsonl};
 
@@ -3468,6 +3819,7 @@ async fn branch_merge_phase_b_failure_recovered_on_non_main_target() {
 /// keeps RewriteMerged tables on active_branch), the contract assertion
 /// catches a regression that reverts to `entry.table_branch.clone()`.
 #[tokio::test]
+#[serial(branch_merge_phase_b)]
 async fn branch_merge_sidecar_pins_table_branch_to_active_branch() {
     use omnigraph::loader::{LoadMode, load_jsonl};
 
