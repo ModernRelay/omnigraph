@@ -937,6 +937,7 @@ mod tests {
 
         for type_name in ["Person", "Company"] {
             let table_uri = node_table_uri(uri, type_name);
+            // forbidden-api-allow: test synthesizes a branch ref directly on the Lance dataset.
             let mut ds = lance::Dataset::open(&table_uri).await.unwrap();
             let base = ds.version().version;
             ds.create_branch("feature", base, None).await.unwrap();

@@ -78,7 +78,7 @@ The default actor identity for CLI direct-engine (`--store`) writes is
 `operator.actor` in `~/.omnigraph/config.yaml`. Override per-invocation with
 `--as <ACTOR>` — `--as` wins, otherwise `operator.actor`, otherwise no actor.
 Remote HTTP writes ignore both — they resolve their actor server-side from the
-bearer token. (Direct-store access carries no Cedar policy under RFC-011; policy
+bearer token. (Direct-store access carries no Cedar policy; policy
 lives in the cluster/server.)
 
 ## CLI

@@ -830,7 +830,12 @@ pub(crate) async fn recover_manifest_drift(
                 // write-entry heal: a deferred sidecar whose branch was
                 // deleted would otherwise fail every ReadWrite open.
                 coordinator.refresh().await?;
-                if !coordinator.all_branches().await?.iter().any(|name| name == b) {
+                if !coordinator
+                    .all_branches()
+                    .await?
+                    .iter()
+                    .any(|name| name == b)
+                {
                     discard_orphaned_branch_sidecar(
                         root_uri,
                         storage.as_ref(),

@@ -14,7 +14,7 @@ pub fn lower_query(
     type_ctx: &TypeContext,
 ) -> Result<QueryIR> {
     if !query.mutations.is_empty() {
-        return Err(crate::error::NanoError::Plan(
+        return Err(crate::error::CompilerError::Plan(
             "cannot lower mutation query with read-query lowerer".to_string(),
         ));
     }
@@ -62,7 +62,7 @@ pub fn lower_query(
 
 pub fn lower_mutation_query(query: &QueryDecl) -> Result<MutationIR> {
     if query.mutations.is_empty() {
-        return Err(crate::error::NanoError::Plan(
+        return Err(crate::error::CompilerError::Plan(
             "query does not contain a mutation body".to_string(),
         ));
     }
@@ -261,7 +261,7 @@ fn lower_clauses(
             let edge = catalog
                 .lookup_edge_by_name(&traversal.edge_name)
                 .ok_or_else(|| {
-                    crate::error::NanoError::Plan(format!(
+                    crate::error::CompilerError::Plan(format!(
                         "lowering traversal referenced missing edge '{}' after typecheck",
                         traversal.edge_name
                     ))

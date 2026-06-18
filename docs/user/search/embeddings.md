@@ -42,7 +42,7 @@ boots from the applied cluster ledger, so `cluster validate`, `plan`, and
 needs no key. Vector dimensions stay schema-driven by the target `Vector(N)`
 column.
 
-Direct single-graph serving, embedded callers, and the offline
+Direct (`--store`) access, embedded callers, and the offline
 `omnigraph embed` pipeline use environment configuration unless they inject an
 `EmbeddingConfig` directly.
 

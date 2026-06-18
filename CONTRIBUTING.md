@@ -22,8 +22,8 @@ that turns out to be non-trivial will be redirected — that's about process, no
 the merit of the change.
 
 > **Maintainers (ModernRelay team)** follow a separate internal process and are
-> not bound by the intake rules above. Everyone is bound by review, CODEOWNERS,
-> branch protection, and CI.
+> not bound by the intake rules above. Everyone is bound by review, branch
+> protection, and CI.
 
 ## Development
 

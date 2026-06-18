@@ -796,6 +796,10 @@ fn cluster_approve_uses_operator_actor_fallback() {
     );
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert!(stderr.contains("--as"), "{stderr}");
+    assert!(stderr.contains("operator.actor"), "{stderr}");
+    assert!(stderr.contains("config.yaml"), "{stderr}");
+    assert!(!stderr.contains("cli.actor"), "{stderr}");
+    assert!(!stderr.contains("omnigraph.yaml"), "{stderr}");
 }
 
 #[test]

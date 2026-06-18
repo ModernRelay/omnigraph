@@ -24,10 +24,13 @@ use lance::Dataset;
 use lance::Error as LanceError;
 use lance::dataset::{MergeInsertBuilder, WhenMatched, WhenNotMatched};
 use lance_namespace::NamespaceError;
+#[cfg(test)]
 use lance_namespace::models::CreateTableVersionRequest;
 
 use crate::error::{OmniError, Result};
 
+#[cfg(test)]
+use super::SubTableUpdate;
 use super::layout::{open_manifest_dataset, tombstone_object_id, version_object_id};
 use super::metadata::parse_namespace_version_request;
 use super::migrations::migrate_internal_schema;
@@ -37,7 +40,7 @@ use super::state::{
 };
 use super::{
     ManifestChange, OBJECT_TYPE_TABLE, OBJECT_TYPE_TABLE_TOMBSTONE, OBJECT_TYPE_TABLE_VERSION,
-    SubTableEntry, SubTableUpdate, TableRegistration, TableTombstone,
+    SubTableEntry, TableRegistration, TableTombstone,
 };
 
 /// Bound on the publisher-level retry loop that wraps Lance's row-level CAS
@@ -396,6 +399,7 @@ impl GraphNamespacePublisher {
         Ok(Arc::try_unwrap(new_dataset).unwrap_or_else(|arc| (*arc).clone()))
     }
 
+    #[cfg(test)]
     pub(super) async fn publish_requests(
         &self,
         requests: &[CreateTableVersionRequest],

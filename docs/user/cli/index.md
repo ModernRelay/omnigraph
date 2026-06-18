@@ -14,7 +14,7 @@ omnigraph mutate insert_person --params '{"name":"Mina","age":28}'
 `omnigraph query` is the canonical read command (pairs with `POST /query`);
 `omnigraph mutate` is the canonical write command (pairs with `POST /mutate`).
 The positional argument is the **stored-query name**, invoked from the served
-catalog (RFC-011 D3) — the graph is addressed by scope (`--server` / `--profile`
+catalog — the graph is addressed by scope (`--server` / `--profile`
 / defaults), and the verb asserts the query's kind (`query` rejects a stored
 mutation, and vice-versa). The previous names `omnigraph read` and
 `omnigraph change` keep working as visible aliases — invocations emit a one-line

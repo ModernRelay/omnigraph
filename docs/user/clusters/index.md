@@ -91,7 +91,7 @@ only the URI and credentials, no checkout of the config repo. The ledger and
 catalog on the bucket are the deployment artifact.
 
 `--cluster` is an **exclusive boot source**: it cannot be combined with a
-graph URI, `--target`, or `--config`, and `omnigraph.yaml` is never read in
+graph URI or `--config`, and `omnigraph.yaml` is never read in
 this mode. Routing is always multi-graph:
 
 ```bash
@@ -273,7 +273,7 @@ a cluster are created by `cluster apply`, not by hand.
 
 If the cluster has exactly **one** applied graph you can omit `--graph` — it is
 used automatically. With **several**, omitting `--graph` errors and lists the
-candidates (RFC-011 D7); it never picks one for you.
+candidates; it never picks one for you.
 
 Against an **`s3://`-backed cluster** the resolved graph storage is non-local, so a
 destructive `cleanup` additionally requires **`--yes`** (an interactive prompt

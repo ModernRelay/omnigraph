@@ -1097,7 +1097,8 @@ async fn prepare_updates_for_commit(
             // have null embeddings) is deferred and logged inside
             // build_indices; a later ensure_indices/optimize materializes it.
             // The load/mutate/merge commit must not fail on it.
-            let _pending = build_indices_on_dataset(db, &prepared_update.table_key, &mut ds).await?;
+            let _pending =
+                build_indices_on_dataset(db, &prepared_update.table_key, &mut ds).await?;
             let state = db.storage().table_state(&full_path, &ds).await?;
             prepared_update.table_version = state.version;
             prepared_update.row_count = state.row_count;
@@ -1350,6 +1351,7 @@ mod classify_fork_ref_tests {
         // the manifest's `feature` snapshot still places on main.
         let person = node_path(&db, "feature", "node:Person").await;
         {
+            // forbidden-api-allow: test synthesizes a branch ref directly on the Lance dataset.
             let mut ds = lance::Dataset::open(&person).await.unwrap();
             let v = ds.version().version;
             ds.create_branch("feature", v, None).await.unwrap();
@@ -1362,6 +1364,7 @@ mod classify_fork_ref_tests {
 
         // Orphan (ghost): a ref for a branch the manifest does not have at all.
         {
+            // forbidden-api-allow: test synthesizes a branch ref directly on the Lance dataset.
             let mut ds = lance::Dataset::open(&person).await.unwrap();
             let v = ds.version().version;
             ds.create_branch("ghost", v, None).await.unwrap();

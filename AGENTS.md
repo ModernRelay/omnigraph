@@ -102,7 +102,6 @@ Full diagram and concurrency model: [docs/dev/architecture.md](docs/dev/architec
 | Install (binary / Homebrew / source / channels) | [docs/user/install.md](docs/user/install.md) |
 | Deployment (binary / container / S3-local testing / auth / build variants) | [docs/user/deployment.md](docs/user/deployment.md) |
 | CI / release workflows | [docs/dev/ci.md](docs/dev/ci.md) |
-| Code ownership (CODEOWNERS source of truth, roles, regeneration) | [docs/dev/codeowners.md](docs/dev/codeowners.md) |
 | Branch protection policy (declarative, applied via `scripts/apply-branch-protection.sh`) | [docs/dev/branch-protection.md](docs/dev/branch-protection.md) |
 | Constants & tunables cheat sheet | [docs/user/reference/constants.md](docs/user/reference/constants.md) |
 | Per-version release notes | [docs/releases/](docs/releases/) |
@@ -125,6 +124,8 @@ This is a decision lens, not a code-size rule. It cuts both ways. Sometimes the 
 
 When evaluating a design, ask: *"what does this look like after 5 more changes like it?"* If the answer is "this converges to one shape", cost is bounded. If it's "this forks every time", the option is mortgaging the future for present convenience — pick differently.
 
+The same lens has a structural corollary: **one source of truth, cheaply derived.** Lance and the manifest are the source of truth; everything else is a derived view. Maintaining a parallel copy invites drift that compounds over time, and re-deriving a view from the full source on every call makes its cost grow with history. Both are liabilities integrated over time, so both are ruled out the same way: hold a warm derived view and refresh it with a cheap probe, never shadow the source or rebuild from it cold. Invariant 15 in [docs/dev/invariants.md](docs/dev/invariants.md) states this; invariants 1 (respect the substrate) and 7 (indexes are derived state) are instances.
+
 ### Tiebreakers when liability alone is silent
 
 - **Correctness > simplicity > performance.** Lexicographic — give up performance for simpler code; give up simplicity for correct code; never give up correctness. The deny-list ("no silent failures," "no acks before durable persistence," "no reads of partial commits") is this rule's hard floor.
@@ -145,6 +146,7 @@ These are architectural rules that need to be in scope on every change. They're 
 5. **Reads always see the current index state for the branch they're reading.** Indexes track the branch head, not historical snapshots. If you change index lifecycle, preserve this guarantee.
 6. **Stable type IDs survive renames.** Schema migration relies on identity that's stable across rename — don't mint new IDs on rename.
 7. **Logical contract over physical state.** Physical state (index coverage, fragment layout, compaction versions, staged writes) is derived and rebuildable; it must never fail a logical operation. Check preconditions against logical state and let reconciliation converge the physical state idempotently — genuine logical conflicts still fail loudly. This is the rule rules 1–6 instantiate; full statement and applications in [docs/dev/invariants.md](docs/dev/invariants.md).
+8. **One source of truth, cheaply derived.** Lance and the manifest are the source of truth; runtime state is a derived view of them. Don't maintain a parallel copy that can drift, and don't re-derive a view from cold storage on every call (that makes cost grow with history). Hold it warm, refresh with a cheap probe.
 
 ### Deny-list (fast-pass review filter — full reasoning in [docs/dev/invariants.md](docs/dev/invariants.md))
 
@@ -166,6 +168,7 @@ If a proposal fits one of these, the burden is on the proposer to justify why th
 - Cloud-only correctness fixes — correctness is always OSS.
 - Forking the codebase for Cloud — trait-extension only.
 - Hand-rolling something Lance already does — check the spec first.
+- Shadowing the source of truth with a maintained parallel copy, or re-deriving a derived view from cold storage per call (cost then scales with history). Hold it warm and refresh cheaply.
 - Mutating in place state that should be immutable (Lance fragments, index segments) — new segments instead.
 - Silent failures — OOM, timeout, partial result must all be surfaced and bounded.
 - Shipping observable behavior as if it weren't part of the contract — output ordering, error-message text, timestamp precision, default-flag values, latency profile. Per Hyrum's Law, every observable behavior gets depended on once shipped; don't expose what you don't want to commit to.

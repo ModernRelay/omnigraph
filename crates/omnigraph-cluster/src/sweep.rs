@@ -427,21 +427,14 @@ pub(crate) async fn mark_approvals_consumed(backend: &ClusterStore, approval_ids
 }
 
 /// Read-only commands report pending sidecars without acting on them.
-pub(crate) fn warn_pending_recovery_sidecars(config_dir: &Path, diagnostics: &mut Vec<Diagnostic>) {
-    let recoveries_dir = config_dir.join(CLUSTER_RECOVERIES_DIR);
-    let Ok(entries) = fs::read_dir(&recoveries_dir) else {
-        return;
-    };
-    let mut names: Vec<String> = entries
-        .flatten()
-        .filter(|entry| entry.path().extension().is_some_and(|ext| ext == "json"))
-        .map(|entry| entry.file_name().to_string_lossy().into_owned())
-        .collect();
-    names.sort();
-    for name in names {
+pub(crate) async fn warn_pending_recovery_sidecars(
+    backend: &ClusterStore,
+    diagnostics: &mut Vec<Diagnostic>,
+) {
+    for location in backend.list_recovery_sidecar_locations(diagnostics).await {
         diagnostics.push(Diagnostic::warning(
             "cluster_recovery_pending",
-            format!("{CLUSTER_RECOVERIES_DIR}/{name}"),
+            location,
             "a recovery sidecar from an interrupted apply is pending; the next state-mutating command will classify it",
         ));
     }
