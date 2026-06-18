@@ -9,19 +9,18 @@ to happen before code lands?*
 > Discussions, RFCs, and pull requests from people outside the ModernRelay
 > team. **Maintainers operate under a separate internal process** and are not
 > bound by the intake gates below. Everyone, maintainer or not, is still bound
-> by the universal gates: branch protection on `main` and CODEOWNERS review
-> (see [docs/dev/branch-protection.md](docs/dev/branch-protection.md) and
-> [docs/dev/codeowners.md](docs/dev/codeowners.md)).
+> by the universal gates: branch protection on `main` and CI
+> (see [docs/dev/branch-protection.md](docs/dev/branch-protection.md)).
 
 ## Roles
 
 | Role | Who | Authority |
 |---|---|---|
-| **Maintainer** | The code owners in [`.github/CODEOWNERS`](.github/CODEOWNERS) (generated from [`.github/codeowners-roles.yml`](.github/codeowners-roles.yml)) | Validate issues, accept/reject RFCs, review and merge PRs, set direction. Final decision authority. |
+| **Maintainer** | The ModernRelay team (repository admins) | Validate issues, accept/reject RFCs, review and merge PRs, set direction. Final decision authority. |
 | **Contributor** | Anyone else | Report problems (Issues), propose ideas (Discussions), author RFCs, and open pull requests. |
 
-Decision authority rests with the maintainers. CODEOWNERS is the single source
-of truth for who that is; this document does not duplicate the list.
+Decision authority rests with the maintainers (the ModernRelay team holding
+repository-admin access).
 
 ## The three channels
 
@@ -51,7 +50,7 @@ contribution.
      Pull request  ◀──────────┴──────────│──  merged == accepted                     │
    (links the issue or the accepted RFC) ◀───────┘ (implementation PRs reference it) │
             │
-   review + CODEOWNERS + branch protection
+   review + branch protection + CI
             ▼
          merged
 ```
@@ -91,8 +90,8 @@ where it's reviewable.
 
 ## What maintainers do *not* gate
 Maintainers' own changes do not pass through the intake gates above — the team
-runs a separate internal process. The universal gates (review, CODEOWNERS,
-branch protection, CI) apply to everyone. Enforcement of the intake rules is, to
+runs a separate internal process. The universal gates (review, branch
+protection, CI) apply to everyone. Enforcement of the intake rules is, to
 start, **by convention and review** (PR template + labels); an automated check
 keyed to author association may be added later if volume warrants.
 

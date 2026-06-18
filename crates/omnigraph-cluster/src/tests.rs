@@ -3376,6 +3376,96 @@ policies:
     }
 
     #[tokio::test]
+    async fn read_only_commands_ignore_missing_recovery_sidecar_dir() {
+        let dir = fixture();
+        write_applyable_state(dir.path());
+        assert!(!dir.path().join(CLUSTER_RECOVERIES_DIR).exists());
+
+        let status = status_config_dir(dir.path()).await;
+        assert!(status.ok, "{:?}", status.diagnostics);
+        assert!(
+            !status.diagnostics.iter().any(|diagnostic| matches!(
+                diagnostic.code.as_str(),
+                "recovery_sidecar_read_error" | "cluster_recovery_pending"
+            )),
+            "{:?}",
+            status.diagnostics
+        );
+
+        let plan = plan_config_dir(dir.path()).await;
+        assert!(plan.ok, "{:?}", plan.diagnostics);
+        assert!(
+            !plan.diagnostics.iter().any(|diagnostic| matches!(
+                diagnostic.code.as_str(),
+                "recovery_sidecar_read_error" | "cluster_recovery_pending"
+            )),
+            "{:?}",
+            plan.diagnostics
+        );
+    }
+
+    #[tokio::test]
+    async fn read_only_commands_warn_on_pending_recovery_sidecar_in_storage_root() {
+        let dir = fixture();
+        let storage = tempfile::tempdir().unwrap();
+        let storage_path = storage.path().to_string_lossy().to_string();
+        let mut config = fs::read_to_string(dir.path().join(CLUSTER_CONFIG_FILE)).unwrap();
+        config = config.replace(
+            "version: 1\n",
+            &format!("version: 1\nstorage: {storage_path}\n"),
+        );
+        fs::write(dir.path().join(CLUSTER_CONFIG_FILE), config).unwrap();
+
+        let desired = validate_config_dir(dir.path());
+        assert!(desired.ok, "{:?}", desired.diagnostics);
+        let schema_digest = desired
+            .resource_digests
+            .get("schema.knowledge")
+            .unwrap()
+            .clone();
+        let graph_composite = graph_digest(
+            "knowledge",
+            Some(&schema_digest),
+            Some(&BTreeMap::new()),
+            None,
+            None,
+        );
+        write_state_resources(
+            storage.path(),
+            &[
+                ("graph.knowledge", graph_composite.as_str()),
+                ("schema.knowledge", schema_digest.as_str()),
+            ],
+        );
+        write_create_sidecar(storage.path(), "knowledge", "irrelevant", "01STORAGE");
+
+        let status = status_config_dir(dir.path()).await;
+        assert!(status.ok, "{:?}", status.diagnostics);
+        assert!(
+            status
+                .diagnostics
+                .iter()
+                .any(|diagnostic| diagnostic.code == "cluster_recovery_pending"
+                    && diagnostic.path.contains("01STORAGE.json")),
+            "{:?}",
+            status.diagnostics
+        );
+
+        let plan = plan_config_dir(dir.path()).await;
+        assert!(plan.ok, "{:?}", plan.diagnostics);
+        assert!(
+            plan.diagnostics
+                .iter()
+                .any(|diagnostic| diagnostic.code == "cluster_recovery_pending"
+                    && diagnostic.path.contains("01STORAGE.json")),
+            "{:?}",
+            plan.diagnostics
+        );
+
+        assert!(!dir.path().join(CLUSTER_RECOVERIES_DIR).exists());
+    }
+
+    #[tokio::test]
     async fn plan_annotates_apply_dispositions() {
         let dir = fixture();
         let out = plan_config_dir(dir.path()).await;

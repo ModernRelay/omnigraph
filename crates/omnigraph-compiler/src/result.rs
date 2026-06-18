@@ -5,7 +5,7 @@ use arrow_ipc::writer::StreamWriter;
 use arrow_schema::{DataType, Field, Schema, SchemaRef};
 use serde::de::DeserializeOwned;
 
-use crate::error::{NanoError, Result};
+use crate::error::{CompilerError, Result};
 use crate::json_output::{record_batches_to_json_rows, record_batches_to_rust_json_rows};
 
 #[derive(Debug, Clone, Copy, Default)]
@@ -47,7 +47,7 @@ impl QueryResult {
         }
 
         arrow_select::concat::concat_batches(&self.schema, &self.batches)
-            .map_err(|err| NanoError::Execution(err.to_string()))
+            .map_err(|err| CompilerError::Execution(err.to_string()))
     }
 
     pub fn to_sdk_json(&self) -> serde_json::Value {
@@ -60,7 +60,7 @@ impl QueryResult {
 
     pub fn deserialize<T: DeserializeOwned>(&self) -> Result<T> {
         serde_json::from_value(self.to_rust_json()).map_err(|err| {
-            NanoError::Execution(format!("failed to deserialize query result: {}", err))
+            CompilerError::Execution(format!("failed to deserialize query result: {}", err))
         })
     }
 

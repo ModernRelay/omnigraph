@@ -1050,7 +1050,7 @@ async fn main() -> Result<()> {
                 // The actor attributes graph-moving operations (sidecars,
                 // audit entries, engine schema-apply commits). Cluster FACTS
                 // stay unlayered; the operator's identity resolves --as flag
-                // first, then the per-operator omnigraph.yaml `cli.actor`.
+                // first, then per-operator config `operator.actor`.
                 let actor = resolve_cluster_actor(cli.as_actor.as_deref())?;
                 let output = apply_config_dir_with_options(config, ApplyOptions { actor }).await;
                 finish_cluster_apply(&output, json)?;
@@ -1062,7 +1062,7 @@ async fn main() -> Result<()> {
             } => {
                 let Some(approver) = resolve_cluster_actor(cli.as_actor.as_deref())? else {
                     bail!(
-                        "`cluster approve` requires an approver: pass the global --as <ACTOR> flag or set `cli.actor` in your omnigraph.yaml — an approval without an approver is meaningless"
+                        "`cluster approve` requires an approver: pass the global --as <ACTOR> flag or set `operator.actor` in ~/.omnigraph/config.yaml — an approval without an approver is meaningless"
                     );
                 };
                 let output = approve_config_dir(config, &resource, &approver).await;
