@@ -131,6 +131,54 @@ pub(crate) enum SidecarKind {
     Optimize,
 }
 
+/// Which recovery-classification semantics a sidecar's tables use. Resolved once
+/// from `(writer_kind, schema_version)` — see [`SidecarKind::classification_mode`]
+/// — so [`classify_table`] dispatches on the mode instead of re-deriving it from
+/// a kind×version match. Adding a writer kind or a version floor is then one arm
+/// in the resolver, not a guard threaded through `classify_table`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ClassificationMode {
+    /// Exactly one `commit_staged` per table (`Mutation`, `Load`): require
+    /// `lance_head == manifest_pinned + 1` and the pin to match.
+    Strict,
+    /// N ≥ 1 commits per table whose drift is content-preserving / derived
+    /// state (`SchemaApply`, `EnsureIndices`, `Optimize`, and pre-confirmation
+    /// `BranchMerge`): any `lance_head > manifest_pinned` rolls forward.
+    Loose,
+    /// Multi-commit publish of *distinct logical rows* with a recorded
+    /// `confirmed_version` (`BranchMerge` at `schema_version >=
+    /// CONFIRMATION_SCHEMA_VERSION`): roll forward ONLY to the confirmed
+    /// version; an unconfirmed moved HEAD is a partial publish and rolls back.
+    Confirmed,
+}
+
+impl SidecarKind {
+    /// Resolve the classification mode for this writer at a given sidecar
+    /// `schema_version`. Exhaustive over `SidecarKind`, so adding a variant is a
+    /// compile error here until its recovery semantics are declared.
+    pub(crate) fn classification_mode(self, schema_version: u32) -> ClassificationMode {
+        match self {
+            SidecarKind::Mutation | SidecarKind::Load => ClassificationMode::Strict,
+            // BranchMerge gained two-phase confirmation at
+            // `CONFIRMATION_SCHEMA_VERSION`. A sidecar written before that
+            // carries no `confirmed_version` and must keep the prior loose
+            // roll-forward — classifying it strictly would misread a *completed*
+            // pre-upgrade merge as a partial and roll it back. (The read gate
+            // already refused any version newer than this binary.)
+            SidecarKind::BranchMerge => {
+                if schema_version >= CONFIRMATION_SCHEMA_VERSION {
+                    ClassificationMode::Confirmed
+                } else {
+                    ClassificationMode::Loose
+                }
+            }
+            SidecarKind::SchemaApply | SidecarKind::EnsureIndices | SidecarKind::Optimize => {
+                ClassificationMode::Loose
+            }
+        }
+    }
+}
+
 /// One table's contribution to a sidecar's intended commit. The classifier
 /// uses these to decide per-table state at recovery time.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -411,9 +459,20 @@ pub(crate) async fn confirm_sidecar_phase_b(
     // pre-confirm sidecar stays on disk, so recovery rolls the operation back.
     crate::failpoints::maybe_fail("recovery.sidecar_confirm")?;
     for pin in &mut sidecar.tables {
-        if let Some(version) = confirmed_versions.get(&pin.table_key) {
-            pin.confirmed_version = Some(*version);
-        }
+        // Every pinned table MUST have an achieved version. A miss means the
+        // pin set and the publish `updates` diverged — fail loudly at the
+        // producer rather than leave the pin unconfirmed, which recovery would
+        // read as a partial Phase B and silently roll the whole (complete) merge
+        // back. Today the two are kept in lockstep by construction; this guards
+        // the invariant against a future edit to either filter.
+        let version = confirmed_versions.get(&pin.table_key).ok_or_else(|| {
+            OmniError::manifest_internal(format!(
+                "confirm_sidecar_phase_b: no achieved version for pinned table '{}' \
+                 (pins and publish updates diverged)",
+                pin.table_key
+            ))
+        })?;
+        pin.confirmed_version = Some(*version);
     }
     let uri = sidecar_uri(root_uri, &sidecar.operation_id);
     let json = serde_json::to_string_pretty(sidecar).map_err(|err| {
@@ -554,55 +613,49 @@ pub(crate) fn classify_table(
     if lance_head == manifest_pinned {
         return NoMovement;
     }
-    // lance_head > manifest_pinned
-    //
-    // Gate the strict confirmation path on the sidecar's VERSION, not on
-    // `kind == BranchMerge` alone: a BranchMerge sidecar written before
-    // confirmation shipped (`schema_version < CONFIRMATION_SCHEMA_VERSION`)
-    // carries no `confirmed_version` and must keep the prior loose
-    // roll-forward below — reading it as strict would misclassify a *completed*
-    // pre-upgrade merge as a partial and roll it back. The read gate already
-    // refused any version NEWER than us, so here `schema_version` is one we
-    // understand.
-    if matches!(kind, SidecarKind::BranchMerge) && schema_version >= CONFIRMATION_SCHEMA_VERSION {
-        // Two-phase confirmation: roll forward only to the exact version the
-        // writer recorded after its whole multi-commit publish completed. No
-        // confirmation ⇒ the publish crashed mid-sequence ⇒ partial ⇒ roll
-        // back. A confirmation that doesn't match the observed HEAD means a
-        // foreign writer advanced the table — don't roll a surprise forward.
-        return match pin.confirmed_version {
-            Some(confirmed)
-                if lance_head == confirmed && pin.expected_version == manifest_pinned =>
-            {
-                RolledPastExpected
+    // lance_head > manifest_pinned. The "which semantics" decision is resolved
+    // once from (kind, schema_version); dispatch on it.
+    match kind.classification_mode(schema_version) {
+        ClassificationMode::Confirmed => {
+            // Two-phase confirmation: roll forward only to the exact version the
+            // writer recorded after its whole multi-commit publish completed. No
+            // confirmation ⇒ the publish crashed mid-sequence ⇒ partial ⇒ roll
+            // back. A confirmation that doesn't match the observed HEAD means a
+            // foreign writer advanced the table — don't roll a surprise forward.
+            match pin.confirmed_version {
+                Some(confirmed)
+                    if lance_head == confirmed && pin.expected_version == manifest_pinned =>
+                {
+                    RolledPastExpected
+                }
+                Some(_) => UnexpectedMultistep,
+                None => IncompletePhaseB,
             }
-            Some(_) => UnexpectedMultistep,
-            None => IncompletePhaseB,
-        };
-    }
-    let strict = matches!(kind, SidecarKind::Mutation | SidecarKind::Load);
-    if strict {
-        if lance_head == manifest_pinned + 1 {
-            if pin.expected_version == manifest_pinned && pin.post_commit_pin == lance_head {
-                RolledPastExpected
-            } else {
-                UnexpectedAtP1
-            }
-        } else {
-            // lance_head > manifest_pinned + 1
-            UnexpectedMultistep
         }
-    } else {
-        // Loose match for multi-commit writers (SchemaApply, EnsureIndices,
-        // Optimize) — and pre-confirmation (`schema_version <
-        // CONFIRMATION_SCHEMA_VERSION`) BranchMerge sidecars, which fall through
-        // to here to keep their original roll-forward.
-        if pin.expected_version == manifest_pinned {
-            RolledPastExpected
-        } else if lance_head == manifest_pinned + 1 {
-            UnexpectedAtP1
-        } else {
-            UnexpectedMultistep
+        ClassificationMode::Strict => {
+            if lance_head == manifest_pinned + 1 {
+                if pin.expected_version == manifest_pinned && pin.post_commit_pin == lance_head {
+                    RolledPastExpected
+                } else {
+                    UnexpectedAtP1
+                }
+            } else {
+                // lance_head > manifest_pinned + 1
+                UnexpectedMultistep
+            }
+        }
+        ClassificationMode::Loose => {
+            // Multi-commit writers whose drift is content-preserving / derived
+            // state (and pre-confirmation BranchMerge sidecars): any
+            // `lance_head > manifest_pinned` rolls forward when the CAS target
+            // matches what the manifest currently shows.
+            if pin.expected_version == manifest_pinned {
+                RolledPastExpected
+            } else if lance_head == manifest_pinned + 1 {
+                UnexpectedAtP1
+            } else {
+                UnexpectedMultistep
+            }
         }
     }
 }
@@ -1159,7 +1212,7 @@ async fn process_sidecar(
                  Phase C did not land)"
             );
             let (new_manifest_version, published_versions) =
-                roll_forward_all(root_uri, sidecar, snapshot).await?;
+                roll_forward_all(root_uri, sidecar, &states, snapshot).await?;
             // `to_version` records the ACTUAL Lance HEAD published for
             // each table (not pin.post_commit_pin, which is a lower bound
             // for loose-match writers like SchemaApply / EnsureIndices /
@@ -1251,14 +1304,17 @@ async fn roll_back_sidecar(
                 state.manifest_pinned,
             )
             .await?;
-            // Publish the post-restore HEAD, CAS against the current (unmoved)
-            // manifest pin — the same helper roll-forward uses.
-            push_table_update_at_head(
+            // Publish the post-restore HEAD (the restore commit we just made),
+            // CAS against the current (unmoved) manifest pin — the same helper
+            // roll-forward uses. `None` target: there is no prior observation to
+            // pin to; the version to publish is the HEAD the restore produced.
+            push_table_update(
                 root_uri,
                 &pin.table_key,
                 &pin.table_path,
                 pin.table_branch.as_deref(),
                 state.manifest_pinned,
+                None,
                 &mut updates,
                 &mut expected,
             )
@@ -1359,6 +1415,7 @@ async fn record_audit_recovery_rollforward(
 async fn roll_forward_all(
     root_uri: &str,
     sidecar: &RecoverySidecar,
+    states: &[ClassifiedTable],
     snapshot: &Snapshot,
 ) -> Result<(u64, HashMap<String, u64>)> {
     let total_changes =
@@ -1368,22 +1425,25 @@ async fn roll_forward_all(
     let mut published_versions: HashMap<String, u64> =
         HashMap::with_capacity(sidecar.tables.len() + sidecar.additional_registrations.len());
 
-    for pin in &sidecar.tables {
-        // Publish to the table's CURRENT Lance HEAD on the pin's branch (not the
-        // sidecar's `post_commit_pin`, a lower bound for loose-match writers that
-        // run multiple commit_staged calls per table). CAS against the pin's
-        // pre-write `expected_version`.
-        let head_version = push_table_update_at_head(
+    for (pin, state) in sidecar.tables.iter().zip(states.iter()) {
+        // Publish the version classification OBSERVED (`state.lance_head`), not a
+        // fresh HEAD re-read. For a `Confirmed` pin classify already validated
+        // `lance_head == confirmed_version`, so this publishes the recorded WAL
+        // intent by construction; for loose/strict pins it's the multi-commit
+        // HEAD classify saw. Single observation, no classify→publish TOCTOU. CAS
+        // against the pin's pre-write `expected_version`.
+        let published = push_table_update(
             root_uri,
             &pin.table_key,
             &pin.table_path,
             pin.table_branch.as_deref(),
             pin.expected_version,
+            Some(state.lance_head),
             &mut updates,
             &mut expected,
         )
         .await?;
-        published_versions.insert(pin.table_key.clone(), head_version);
+        published_versions.insert(pin.table_key.clone(), published);
     }
 
     // SchemaApply-only: register added tables (and renamed targets) and
@@ -1483,45 +1543,61 @@ async fn roll_forward_all(
 /// version the table was just restored to). The HEAD is read AFTER any restore
 /// in the same single-threaded sweep, so no concurrent writer can have advanced
 /// it.
-async fn push_table_update_at_head(
+/// Stage a manifest `Update` for one table.
+///
+/// `target_version` selects WHICH Lance version's state to publish:
+/// - `Some(v)` — pin the dataset at version `v` and publish it. Roll-FORWARD
+///   passes the version classification observed (and, for a `Confirmed` pin,
+///   validated equals `confirmed_version`), so recovery publishes the version it
+///   *decided* on rather than re-reading a HEAD a concurrent writer may have
+///   advanced since classification — one observation, used for both the decision
+///   and the publish (invariant 15).
+/// - `None` — publish the dataset's current HEAD. Roll-BACK uses this: it just
+///   created the restore commit, so HEAD *is* the version to publish.
+async fn push_table_update(
     root_uri: &str,
     table_key: &str,
     table_path: &str,
     branch: Option<&str>,
     expected_version: u64,
+    target_version: Option<u64>,
     updates: &mut Vec<ManifestChange>,
     expected: &mut HashMap<String, u64>,
 ) -> Result<u64> {
-    let head_ds = Dataset::open(table_path)
+    let ds = Dataset::open(table_path)
         .await
         .map_err(|e| OmniError::Lance(e.to_string()))?;
-    let head_ds = match branch {
-        Some(b) if b != "main" => head_ds
+    let ds = match branch {
+        Some(b) if b != "main" => ds
             .checkout_branch(b)
             .await
             .map_err(|e| OmniError::Lance(e.to_string()))?,
-        _ => head_ds,
+        _ => ds,
     };
-    let head_version = head_ds.version().version;
-    let row_count = head_ds
+    let ds = match target_version {
+        Some(v) => ds
+            .checkout_version(v)
+            .await
+            .map_err(|e| OmniError::Lance(e.to_string()))?,
+        None => ds,
+    };
+    let published_version = ds.version().version;
+    let row_count = ds
         .count_rows(None)
         .await
         .map_err(|e| OmniError::Lance(e.to_string()))? as u64;
     let table_relative_path = super::table_path_for_table_key(table_key)?;
-    let version_metadata = super::metadata::TableVersionMetadata::from_dataset(
-        root_uri,
-        &table_relative_path,
-        &head_ds,
-    )?;
+    let version_metadata =
+        super::metadata::TableVersionMetadata::from_dataset(root_uri, &table_relative_path, &ds)?;
     updates.push(ManifestChange::Update(SubTableUpdate {
         table_key: table_key.to_string(),
-        table_version: head_version,
+        table_version: published_version,
         table_branch: branch.map(str::to_string),
         row_count,
         version_metadata,
     }));
     expected.insert(table_key.to_string(), expected_version);
-    Ok(head_version)
+    Ok(published_version)
 }
 
 /// Append the audit row describing this recovery action.
@@ -2062,6 +2138,37 @@ mod tests {
         delete_sidecar(&handle, &storage).await.unwrap();
         let after = list_sidecars(root, &storage).await.unwrap();
         assert!(after.is_empty());
+    }
+
+    #[tokio::test]
+    async fn confirm_sidecar_phase_b_errors_when_pin_missing_from_updates() {
+        // A pinned table with no achieved version in the publish `updates` must
+        // be a loud producer error, NOT a silent skip that leaves the pin
+        // unconfirmed (which recovery would read as a partial Phase B and roll
+        // the whole complete merge back). Guards the implicit `pins ⊆ updates`
+        // invariant against a future divergence between the two filters.
+        let dir = tempfile::tempdir().unwrap();
+        let storage = ObjectStorageAdapter::local();
+        let mut sidecar = new_sidecar(
+            SidecarKind::BranchMerge,
+            Some("main".to_string()),
+            None,
+            vec![make_pin("node:Person", "file:///tmp/x.lance", 5, 6)],
+        );
+        // The confirmed-versions map does NOT cover the pinned table.
+        let confirmed: HashMap<String, u64> = HashMap::new();
+        let err = confirm_sidecar_phase_b(
+            dir.path().to_str().unwrap(),
+            &storage,
+            &mut sidecar,
+            &confirmed,
+        )
+        .await
+        .expect_err("a pinned table with no achieved version must be a loud error");
+        assert!(
+            err.to_string().contains("pins and publish updates diverged"),
+            "expected a pin/updates divergence error, got: {err}",
+        );
     }
 
     #[tokio::test]
