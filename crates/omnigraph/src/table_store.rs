@@ -1099,7 +1099,7 @@ impl TableStore {
                 "stage_merge_insert called with empty batch".to_string(),
             ));
         }
-        crate::instrumentation::record_stage_merge_insert(batch.num_rows() as u64);
+        let merged_rows = batch.num_rows() as u64;
 
         // Precondition for the FirstSeen workaround below: every call path that
         // reaches stage_merge_insert (load, MutationStaging::finalize,
@@ -1140,6 +1140,9 @@ impl TableStore {
             .execute_uncommitted(stream)
             .await
             .map_err(|e| OmniError::Lance(e.to_string()))?;
+        // Record only after the staging write succeeds, so a failed write does
+        // not inflate the probe (matches `stage_append`/`stage_append_stream`).
+        crate::instrumentation::record_stage_merge_insert(merged_rows);
         // Operation::Update { removed_fragment_ids, updated_fragments, new_fragments, .. } —
         // `new_fragments` are the freshly inserted rows; `updated_fragments`
         // are rewrites of existing fragments that include both retained and
@@ -1625,13 +1628,15 @@ impl TableStore {
     }
 
     pub(crate) async fn create_vector_index(&self, ds: &mut Dataset, column: &str) -> Result<()> {
-        crate::instrumentation::record_create_vector_index();
         let params = lance::index::vector::VectorIndexParams::ivf_flat(1, MetricType::L2);
         ds.create_index_builder(&[column], IndexType::Vector, &params)
             .replace(true)
             .await
-            .map(|_| ())
-            .map_err(|e| OmniError::Lance(e.to_string()))
+            .map_err(|e| OmniError::Lance(e.to_string()))?;
+        // Record only after the index build succeeds, so a failed build does not
+        // inflate the probe (matches the `stage_*` probes).
+        crate::instrumentation::record_create_vector_index();
+        Ok(())
     }
 
     pub async fn create_empty_dataset(dataset_uri: &str, schema: &SchemaRef) -> Result<Dataset> {
