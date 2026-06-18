@@ -12,6 +12,7 @@ pub(crate) async fn load_cluster_settings(
     cluster_dir: &PathBuf,
     cli_bind: Option<String>,
     cli_allow_unauthenticated: bool,
+    cli_require_all_graphs: bool,
 ) -> Result<ServerConfig> {
     // `--cluster` accepts either a config directory (the ledger location is
     // resolved through cluster.yaml's `storage:` key) or a storage-root URI
@@ -28,11 +29,45 @@ pub(crate) async fn load_cluster_settings(
     .map_err(|diagnostics| {
         let details = diagnostics
             .iter()
-            .map(|diagnostic| format!("[{}] {}: {}", diagnostic.code, diagnostic.path, diagnostic.message))
+            .map(|diagnostic| {
+                format!(
+                    "[{}] {}: {}",
+                    diagnostic.code, diagnostic.path, diagnostic.message
+                )
+            })
             .collect::<Vec<_>>()
             .join("\n  ");
-        eyre!("the cluster at '{}' is not ready to serve:\n  {details}", cluster_dir.display())
+        eyre!(
+            "the cluster at '{}' is not ready to serve:\n  {details}",
+            cluster_dir.display()
+        )
     })?;
+    for diagnostic in &snapshot.diagnostics {
+        warn!(
+            code = %diagnostic.code,
+            path = %diagnostic.path,
+            message = %diagnostic.message,
+            "cluster startup diagnostic"
+        );
+    }
+    let env_require_all_graphs = env_flag("OMNIGRAPH_REQUIRE_ALL_GRAPHS");
+    let require_all_graphs = cli_require_all_graphs || env_require_all_graphs;
+    if require_all_graphs && !snapshot.diagnostics.is_empty() {
+        let details = snapshot
+            .diagnostics
+            .iter()
+            .map(|diagnostic| {
+                format!(
+                    "[{}] {}: {}",
+                    diagnostic.code, diagnostic.path, diagnostic.message
+                )
+            })
+            .collect::<Vec<_>>()
+            .join("\n  ");
+        bail!(
+            "strict cluster boot requires every applied graph to be ready; startup diagnostics:\n  {details}"
+        );
+    }
 
     // Bindings -> Cedar slots. The serving pipeline loads one bundle per
     // graph plus one server-level bundle; stacked bundles per scope are a
@@ -69,6 +104,7 @@ pub(crate) async fn load_cluster_settings(
     }
 
     let mut graphs = Vec::new();
+    let mut skipped_graphs = Vec::new();
     for graph in &snapshot.graphs {
         let specs: Vec<queries::RegistrySpec> = snapshot
             .queries
@@ -84,40 +120,75 @@ pub(crate) async fn load_cluster_settings(
                 tool_name: None,
             })
             .collect();
-        let registry = QueryRegistry::from_specs(specs).map_err(|errors| {
-            let details = errors
-                .iter()
-                .map(|error| error.to_string())
-                .collect::<Vec<_>>()
-                .join("\n  ");
-            eyre!(
-                "stored queries in the applied revision failed to parse:\n  {details}\nrun `cluster refresh` then `cluster apply`, and restart"
-            )
-        })?;
+        let registry = match QueryRegistry::from_specs(specs) {
+            Ok(registry) => registry,
+            Err(errors) => {
+                let details = errors
+                    .iter()
+                    .map(|error| error.to_string())
+                    .collect::<Vec<_>>()
+                    .join("\n  ");
+                warn!(
+                    graph_id = %graph.graph_id,
+                    errors = %details,
+                    "graph quarantined because stored queries failed to parse"
+                );
+                skipped_graphs.push(format!(
+                    "{}: stored queries failed to parse: {details}",
+                    graph.graph_id
+                ));
+                continue;
+            }
+        };
+        let embedding = match graph
+            .embedding
+            .as_ref()
+            .map(|profile| {
+                profile.resolve().map_err(|err| {
+                    eyre!("embedding provider for graph '{}': {err}", graph.graph_id)
+                })
+            })
+            .transpose()
+        {
+            Ok(embedding) => embedding,
+            Err(err) => {
+                warn!(
+                    graph_id = %graph.graph_id,
+                    error = %err,
+                    "graph quarantined because embedding provider configuration failed"
+                );
+                skipped_graphs.push(format!("{}: {err}", graph.graph_id));
+                continue;
+            }
+        };
         graphs.push(GraphStartupConfig {
             graph_id: graph.graph_id.clone(),
             uri: graph.root.to_string_lossy().to_string(),
             policy: graph_policies.get(&graph.graph_id).cloned(),
-            embedding: graph
-                .embedding
-                .as_ref()
-                .map(|profile| {
-                    profile.resolve().map_err(|err| {
-                        eyre!("embedding provider for graph '{}': {err}", graph.graph_id)
-                    })
-                })
-                .transpose()?,
+            embedding,
             queries: registry,
         });
     }
+    if graphs.is_empty() {
+        let skipped = skipped_graphs.join(", ");
+        bail!(
+            "the cluster at '{}' has no healthy graphs to serve{}",
+            cluster_dir.display(),
+            if skipped.is_empty() {
+                String::new()
+            } else {
+                format!(" (quarantined: {skipped})")
+            }
+        );
+    }
+    if require_all_graphs && !skipped_graphs.is_empty() {
+        bail!(
+            "strict cluster boot requires every graph to build startup settings (quarantined: {})",
+            skipped_graphs.join(", ")
+        );
+    }
 
-    let env_unauth = std::env::var("OMNIGRAPH_UNAUTHENTICATED")
-        .ok()
-        .map(|v| {
-            let trimmed = v.trim();
-            !trimmed.is_empty() && trimmed != "0" && !trimmed.eq_ignore_ascii_case("false")
-        })
-        .unwrap_or(false);
+    let env_unauth = env_flag("OMNIGRAPH_UNAUTHENTICATED");
 
     Ok(ServerConfig {
         mode: ServerConfigMode::Multi {
@@ -127,6 +198,7 @@ pub(crate) async fn load_cluster_settings(
         },
         bind: cli_bind.unwrap_or_else(|| "127.0.0.1:8080".to_string()),
         allow_unauthenticated: cli_allow_unauthenticated || env_unauth,
+        require_all_graphs,
     })
 }
 
@@ -138,6 +210,7 @@ pub async fn load_server_settings(
     cli_cluster: Option<&PathBuf>,
     cli_bind: Option<String>,
     cli_allow_unauthenticated: bool,
+    cli_require_all_graphs: bool,
 ) -> Result<ServerConfig> {
     let Some(cluster_dir) = cli_cluster else {
         bail!(
@@ -147,7 +220,23 @@ pub async fn load_server_settings(
              was removed in RFC-011."
         );
     };
-    load_cluster_settings(cluster_dir, cli_bind, cli_allow_unauthenticated).await
+    load_cluster_settings(
+        cluster_dir,
+        cli_bind,
+        cli_allow_unauthenticated,
+        cli_require_all_graphs,
+    )
+    .await
+}
+
+fn env_flag(name: &str) -> bool {
+    std::env::var(name)
+        .ok()
+        .map(|v| {
+            let trimmed = v.trim();
+            !trimmed.is_empty() && trimmed != "0" && !trimmed.eq_ignore_ascii_case("false")
+        })
+        .unwrap_or(false)
 }
 
 /// MR-723 server runtime state, classified from the three-state matrix
@@ -240,7 +329,9 @@ pub(crate) fn read_bearer_tokens_file(path: &str) -> Result<Vec<(String, String)
         .wrap_err_with(|| format!("failed to parse bearer tokens file at {path}"))
 }
 
-pub(crate) fn validate_bearer_tokens(entries: Vec<(String, String)>) -> Result<Vec<(String, String)>> {
+pub(crate) fn validate_bearer_tokens(
+    entries: Vec<(String, String)>,
+) -> Result<Vec<(String, String)>> {
     let mut seen_actors = HashSet::new();
     let mut seen_tokens = HashSet::new();
     let mut normalized = Vec::with_capacity(entries.len());
@@ -301,11 +392,18 @@ mod tests {
     /// as 404 without also masking a 401/500. Pins each outcome.
     #[test]
     fn authorize_splits_decision_from_operational_error() {
-        use super::{Authz, PolicyAction, PolicyCompiler, PolicyConfig, PolicyRequest, ResolvedActor, authorize};
+        use super::{
+            Authz, PolicyAction, PolicyCompiler, PolicyConfig, PolicyRequest, ResolvedActor,
+            authorize,
+        };
         use std::sync::Arc;
 
         fn req(action: PolicyAction) -> PolicyRequest {
-            PolicyRequest { action, branch: None, target_branch: None }
+            PolicyRequest {
+                action,
+                branch: None,
+                target_branch: None,
+            }
         }
         let actor = ResolvedActor::cluster_static(Arc::from("act-alice"));
 
@@ -345,7 +443,11 @@ mod tests {
             authorize(
                 Some(&actor),
                 Some(&engine),
-                PolicyRequest { action: PolicyAction::Read, branch: Some("main".to_string()), target_branch: None },
+                PolicyRequest {
+                    action: PolicyAction::Read,
+                    branch: Some("main".to_string()),
+                    target_branch: None
+                },
             )
             .unwrap(),
             Authz::Allowed
@@ -354,11 +456,17 @@ mod tests {
         match authorize(
             Some(&actor),
             Some(&engine),
-            PolicyRequest { action: PolicyAction::Change, branch: Some("main".to_string()), target_branch: None },
+            PolicyRequest {
+                action: PolicyAction::Change,
+                branch: Some("main".to_string()),
+                target_branch: None,
+            },
         )
         .unwrap()
         {
-            Authz::Denied(message) => assert!(!message.is_empty(), "a deny carries its decision message"),
+            Authz::Denied(message) => {
+                assert!(!message.is_empty(), "a deny carries its decision message")
+            }
             Authz::Allowed => panic!("change must be denied: only read is allowed"),
         }
         // Policy installed but no actor → operational failure (`Err`), NOT a
@@ -397,8 +505,7 @@ mod tests {
         };
 
         // Empty registry → nothing attached, no error.
-        let empty =
-            super::validate_and_attach(QueryRegistry::default(), &catalog, "g").unwrap();
+        let empty = super::validate_and_attach(QueryRegistry::default(), &catalog, "g").unwrap();
         assert!(empty.is_none());
 
         // A query that type-checks → attached.
@@ -407,7 +514,11 @@ mod tests {
             "query find_user() { match { $u: User } return { $u.name } }",
         )])
         .unwrap();
-        assert!(super::validate_and_attach(ok, &catalog, "g").unwrap().is_some());
+        assert!(
+            super::validate_and_attach(ok, &catalog, "g")
+                .unwrap()
+                .is_some()
+        );
 
         // A query referencing a type the schema lacks → boot refusal that
         // names both the graph label and the offending query.
@@ -420,7 +531,10 @@ mod tests {
         let msg = err.to_string();
         assert!(msg.contains("graph-x"), "labels the graph: {msg}");
         assert!(msg.contains("ghost"), "names the query: {msg}");
-        assert!(msg.contains("schema check"), "mentions the schema check: {msg}");
+        assert!(
+            msg.contains("schema check"),
+            "mentions the schema check: {msg}"
+        );
     }
 
     #[test]
@@ -451,7 +565,7 @@ mod tests {
     async fn server_settings_require_cluster_boot_source() {
         // RFC-011 cluster-only: with no --cluster the server refuses to
         // start and names the cluster-required remedy.
-        let error = super::load_server_settings(None, None, false)
+        let error = super::load_server_settings(None, None, false, false)
             .await
             .unwrap_err();
         assert!(
@@ -534,6 +648,7 @@ mod tests {
             },
             bind: "127.0.0.1:0".to_string(),
             allow_unauthenticated: false,
+            require_all_graphs: false,
         };
         let result = serve(config).await;
         let err = result
@@ -586,6 +701,7 @@ mod tests {
             },
             bind: "127.0.0.1:0".to_string(),
             allow_unauthenticated: false,
+            require_all_graphs: false,
         };
         let result = serve(config).await;
         let err =

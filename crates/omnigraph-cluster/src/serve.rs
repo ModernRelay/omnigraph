@@ -37,11 +37,14 @@ pub struct ServingSnapshot {
     pub graphs: Vec<ServingGraph>,
     pub queries: Vec<ServingQuery>,
     pub policies: Vec<ServingPolicy>,
+    pub diagnostics: Vec<Diagnostic>,
 }
 
 /// Read the applied revision as a serving snapshot — the read-only loader for
-/// the Phase-5 server boot. All-or-nothing per RFC-005 §D4: every readiness
-/// failure is collected and the whole snapshot refused; no partial serving.
+/// the Phase-5 server boot. Cluster-global readiness failures are still
+/// all-or-nothing, but graph-attributed pending recovery sidecars quarantine
+/// only that graph so healthy graphs can continue serving. This loader never
+/// runs a recovery sweep.
 /// Takes no lock: the state file is replaced atomically, so this reads a
 /// consistent point-in-time ledger.
 pub async fn read_serving_snapshot(
@@ -190,18 +193,38 @@ async fn read_snapshot_with_store(
     backend: ClusterStore,
 ) -> Result<ServingSnapshot, Vec<Diagnostic>> {
     let mut diagnostics: Vec<Diagnostic> = Vec::new();
+    let mut startup_diagnostics: Vec<Diagnostic> = Vec::new();
+    let mut quarantined_graphs: BTreeSet<String> = BTreeSet::new();
 
-    // A ledger a sweep is about to rewrite must not start serving.
+    // Do not sweep at serve time. Valid graph-attributed sidecars quarantine
+    // that graph; malformed/unattributable sidecars remain cluster-fatal
+    // because serving cannot prove their blast radius.
+    let sidecar_diag_start = diagnostics.len();
     let sidecars = backend.list_recovery_sidecars(&mut diagnostics).await;
-    if !sidecars.is_empty() {
-        diagnostics.push(Diagnostic::error(
+    for diagnostic in diagnostics.iter_mut().skip(sidecar_diag_start) {
+        diagnostic.severity = DiagnosticSeverity::Error;
+    }
+    for (path, sidecar) in sidecars {
+        if sidecar.graph_id.trim().is_empty() {
+            diagnostics.push(Diagnostic::error(
+                "cluster_recovery_unattributed",
+                path,
+                "recovery sidecar has no graph id; run a state-mutating cluster command to sweep it before serving",
+            ));
+            continue;
+        }
+        quarantined_graphs.insert(sidecar.graph_id.clone());
+        startup_diagnostics.push(Diagnostic::warning(
             "cluster_recovery_pending",
-            CLUSTER_RECOVERIES_DIR,
+            graph_address(&sidecar.graph_id),
             format!(
-                "{} interrupted operation(s) await recovery; run any state-mutating cluster command (e.g. `cluster apply`) to sweep, then retry",
-                sidecars.len()
+                "graph `{}` is quarantined because interrupted operation `{}` awaits recovery; run any state-mutating cluster command (e.g. `cluster apply`) to sweep",
+                sidecar.graph_id, sidecar.operation_id
             ),
         ));
+    }
+    if has_errors(&diagnostics) {
+        return Err(diagnostics);
     }
 
     let mut observations = backend.observations();
@@ -223,12 +246,27 @@ async fn read_snapshot_with_store(
         }
     };
     let Some(state) = state else {
+        diagnostics.extend(startup_diagnostics);
         return Err(diagnostics);
     };
 
+    let required_embedding_providers: BTreeSet<String> = state
+        .applied_revision
+        .resources
+        .iter()
+        .filter_map(|(address, entry)| match resource_kind(address) {
+            ResourceKind::Graph(graph_id) if !quarantined_graphs.contains(&graph_id) => {
+                entry.embedding_provider.clone()
+            }
+            _ => None,
+        })
+        .collect();
     let mut embedding_profiles: BTreeMap<String, EmbeddingProviderConfig> = BTreeMap::new();
     for (address, entry) in &state.applied_revision.resources {
         if !matches!(resource_kind(address), ResourceKind::EmbeddingProvider(_)) {
+            continue;
+        }
+        if !required_embedding_providers.contains(address) {
             continue;
         }
         let Some(profile) = entry.embedding_profile.clone() else {
@@ -256,9 +294,14 @@ async fn read_snapshot_with_store(
     let mut graphs = Vec::new();
     let mut queries = Vec::new();
     let mut policies = Vec::new();
+    let mut saw_applied_graph = false;
     for (address, entry) in &state.applied_revision.resources {
         match resource_kind(address) {
             ResourceKind::Graph(graph_id) => {
+                saw_applied_graph = true;
+                if quarantined_graphs.contains(&graph_id) {
+                    continue;
+                }
                 let embedding = match entry.embedding_provider.as_deref() {
                     Some(provider_address) => match resource_kind(provider_address) {
                         ResourceKind::EmbeddingProvider(_) => {
@@ -300,6 +343,9 @@ async fn read_snapshot_with_store(
                 let ResourceKind::Query { graph, name } = &kind else {
                     unreachable!()
                 };
+                if quarantined_graphs.contains(graph) {
+                    continue;
+                }
                 match backend
                     .read_verified_payload(&kind, &entry.digest, address)
                     .await
@@ -324,6 +370,17 @@ async fn read_snapshot_with_store(
                     ));
                     continue;
                 };
+                let applies_to: Vec<String> = applies_to
+                    .into_iter()
+                    .filter(|binding| {
+                        binding
+                            .strip_prefix("graph.")
+                            .is_none_or(|graph| !quarantined_graphs.contains(graph))
+                    })
+                    .collect();
+                if applies_to.is_empty() {
+                    continue;
+                }
                 match backend
                     .read_verified_payload(&kind, &entry.digest, address)
                     .await
@@ -342,19 +399,29 @@ async fn read_snapshot_with_store(
     }
 
     if graphs.is_empty() {
-        diagnostics.push(Diagnostic::error(
-            "cluster_empty",
-            CLUSTER_STATE_FILE,
-            "the applied revision records no graphs; apply a cluster with at least one graph before serving from it",
-        ));
+        if saw_applied_graph && !quarantined_graphs.is_empty() {
+            diagnostics.push(Diagnostic::error(
+                "cluster_no_healthy_graphs",
+                CLUSTER_RECOVERIES_DIR,
+                "all applied graphs are quarantined by pending recovery sidecars; run any state-mutating cluster command (e.g. `cluster apply`) to sweep, then retry",
+            ));
+        } else {
+            diagnostics.push(Diagnostic::error(
+                "cluster_empty",
+                CLUSTER_STATE_FILE,
+                "the applied revision records no graphs; apply a cluster with at least one graph before serving from it",
+            ));
+        }
     }
     if has_errors(&diagnostics) {
+        diagnostics.extend(startup_diagnostics);
         return Err(diagnostics);
     }
     Ok(ServingSnapshot {
         graphs,
         queries,
         policies,
+        diagnostics: startup_diagnostics,
     })
 }
 
