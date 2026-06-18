@@ -1102,6 +1102,13 @@ async fn publish_rewritten_merge_table(
         }
     }
 
+    // Failpoint: crash after the Phase 1 merge_insert commit, before the delete.
+    // Models a partial Phase B on the three-way path — the merged constructive
+    // rows are on Lance HEAD but the delete has not committed and the
+    // achieved-version intent has not been recorded, so recovery must roll BACK.
+    // See tests/failpoints.rs::branch_merge_rewrite_partial_after_merge_rolls_back.
+    crate::failpoints::maybe_fail("branch_merge.rewrite_after_merge_pre_delete")?;
+
     // Phase 2: delete removed rows via deletion vectors.
     //
     // INLINE-COMMIT RESIDUAL: lance-6.0.1 does not expose a public
@@ -1124,6 +1131,14 @@ async fn publish_rewritten_merge_table(
             .await?;
         current_ds = new_ds;
     }
+
+    // Failpoint: crash after the Phase 2 delete commit, before the index build.
+    // Models a partial Phase B on the three-way path — constructive rows +
+    // deletes are on Lance HEAD but the achieved-version intent has not been
+    // recorded, so recovery must roll BACK (the index is reconciler-owned derived
+    // state, but the merge itself never reached its commit boundary). See
+    // tests/failpoints.rs::branch_merge_rewrite_partial_after_delete_rolls_back.
+    crate::failpoints::maybe_fail("branch_merge.rewrite_after_delete_pre_index")?;
 
     // Phase 3: rebuild indices.
     //
@@ -1227,6 +1242,13 @@ async fn publish_adopted_delta(
             .await?;
     }
 
+    // Failpoint: crash after the Phase 1a append commit, before the upsert.
+    // Models a partial Phase B — appends are on Lance HEAD but the upserts/deletes
+    // have not committed and the achieved-version intent has not been recorded, so
+    // recovery must roll BACK (not publish the appends-only state). See
+    // tests/failpoints.rs::branch_merge_adopt_partial_after_append_rolls_back.
+    crate::failpoints::maybe_fail("branch_merge.adopt_after_append_pre_upsert")?;
+
     // Phase 1b: upsert the CHANGED rows. The merge_insert hash join is now
     // bounded to the genuinely-changed set, not the whole delta. It runs against
     // the committed view that already includes the appends; the changed ids are
@@ -1251,6 +1273,13 @@ async fn publish_adopted_delta(
                 .await?;
         }
     }
+
+    // Failpoint: crash after the Phase 1b upsert commit, before the delete.
+    // Models a partial Phase B — appends + upserts on Lance HEAD but the delete
+    // has not committed and the achieved-version intent has not been recorded, so
+    // recovery must roll BACK. See
+    // tests/failpoints.rs::branch_merge_adopt_partial_after_upsert_rolls_back.
+    crate::failpoints::maybe_fail("branch_merge.adopt_after_upsert_pre_delete")?;
 
     // Phase 2: delete removed rows via deletion vectors (inline-commit residual,
     // same as the three-way path until Lance ships a public two-phase delete).

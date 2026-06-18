@@ -3439,6 +3439,168 @@ async fn branch_merge_adopt_with_delta_phase_b_failure_recovered_on_next_open() 
     drop(db);
 }
 
+/// Which branch-merge publish path a partial-Phase-B test exercises.
+enum MergeScenario {
+    /// main stays at base → the touched table is `AdoptWithDelta`
+    /// (`publish_adopted_delta`: append → upsert → delete).
+    Adopt,
+    /// main advances past base → the touched table is `RewriteMerged`
+    /// (`publish_rewritten_merge_table`: merge_insert → delete → index).
+    Rewrite,
+}
+
+async fn sorted_person_names(db: &Omnigraph) -> Vec<String> {
+    let mut names = collect_column_strings(&read_table(db, "node:Person").await, "name");
+    names.sort();
+    names
+}
+
+/// THE recovery-atomicity regression gate. A branch merge whose per-table publish
+/// is a multi-commit sequence (append → upsert → delete, or merge_insert → delete
+/// → index) advances Lance HEAD step by step before the manifest publish. If the
+/// process dies *mid*-sequence — after some commits but before the achieved-version
+/// intent is recorded — recovery must roll the whole merge **back**, not publish
+/// the partial and record the merge as complete.
+///
+/// The delta is deliberately MIXED — a fresh id (`bob`, append), a modified base id
+/// (`carol`, upsert) and a removed base id (`dave`, delete) — so every partial
+/// window leaves real work undone. Proof of rollback: after recovery the target is
+/// back at its base name-set, and a *re-run* of the merge re-applies the full delta
+/// (the partial was not silently recorded as "already merged").
+///
+/// RED before the fix: the loose `BranchMerge` classification rolls any
+/// `lance_head > manifest_pinned` forward, so the partial is published (e.g. `bob`
+/// present, `dave` kept) and the merge recorded — the first assert (back at base)
+/// fails. GREEN after: `achieved_version == None` → `IncompletePhaseB` → roll back.
+async fn assert_partial_merge_rolls_back(scenario: MergeScenario, failpoint: &str) {
+    use omnigraph::loader::load_jsonl;
+
+    let _scenario = FailScenario::setup();
+    let dir = tempfile::tempdir().unwrap();
+    let uri = dir.path().to_str().unwrap().to_string();
+
+    // Seed main {alice, carol, dave}; on `feature` add bob (append), bump carol
+    // (upsert), remove dave (delete). For Rewrite, also move main past base so the
+    // table classifies RewriteMerged instead of a fast-forward AdoptWithDelta.
+    {
+        let mut db = Omnigraph::init(&uri, helpers::TEST_SCHEMA).await.unwrap();
+        load_jsonl(
+            &mut db,
+            "{\"type\":\"Person\",\"data\":{\"name\":\"alice\",\"age\":30}}\n\
+             {\"type\":\"Person\",\"data\":{\"name\":\"carol\",\"age\":50}}\n\
+             {\"type\":\"Person\",\"data\":{\"name\":\"dave\",\"age\":60}}\n",
+            LoadMode::Append,
+        )
+        .await
+        .unwrap();
+        db.branch_create("feature").await.unwrap();
+        db.mutate(
+            "feature",
+            MUTATION_QUERIES,
+            "insert_person",
+            &mixed_params(&[("$name", "bob")], &[("$age", 40)]),
+        )
+        .await
+        .unwrap();
+        db.mutate(
+            "feature",
+            MUTATION_QUERIES,
+            "set_age",
+            &mixed_params(&[("$name", "carol")], &[("$age", 55)]),
+        )
+        .await
+        .unwrap();
+        db.mutate(
+            "feature",
+            MUTATION_QUERIES,
+            "remove_person",
+            &mixed_params(&[("$name", "dave")], &[]),
+        )
+        .await
+        .unwrap();
+        if matches!(scenario, MergeScenario::Rewrite) {
+            db.mutate(
+                "main",
+                MUTATION_QUERIES,
+                "set_age",
+                &mixed_params(&[("$name", "alice")], &[("$age", 35)]),
+            )
+            .await
+            .unwrap();
+        }
+    }
+
+    // Crash mid-Phase-B at the injected window.
+    {
+        let db = Omnigraph::open(&uri).await.unwrap();
+        let _fp = ScopedFailPoint::new(failpoint, "return");
+        let err = db.branch_merge("feature", "main").await.unwrap_err();
+        assert!(
+            err.to_string().contains(failpoint),
+            "expected the injected failpoint {failpoint}, got: {err}"
+        );
+    }
+
+    // Reopen → the open-time sweep must ROLL BACK to base (the merge never reached
+    // its commit boundary), and a re-run must then apply the FULL delta.
+    {
+        let db = Omnigraph::open(&uri).await.unwrap();
+        assert_eq!(
+            sorted_person_names(&db).await,
+            vec!["alice", "carol", "dave"],
+            "partial Phase B at {failpoint} must roll back to base \
+             (no bob, dave kept, carol's upsert reverted); the merge must NOT be recorded",
+        );
+        db.branch_merge("feature", "main").await.unwrap();
+        assert_eq!(
+            sorted_person_names(&db).await,
+            vec!["alice", "bob", "carol"],
+            "re-merge after rollback must re-apply the full delta \
+             (bob added, dave removed) — proof the partial was not silently recorded",
+        );
+    }
+}
+
+#[tokio::test]
+#[serial(branch_merge_phase_b)]
+async fn branch_merge_adopt_partial_after_append_rolls_back() {
+    assert_partial_merge_rolls_back(
+        MergeScenario::Adopt,
+        "branch_merge.adopt_after_append_pre_upsert",
+    )
+    .await;
+}
+
+#[tokio::test]
+#[serial(branch_merge_phase_b)]
+async fn branch_merge_adopt_partial_after_upsert_rolls_back() {
+    assert_partial_merge_rolls_back(
+        MergeScenario::Adopt,
+        "branch_merge.adopt_after_upsert_pre_delete",
+    )
+    .await;
+}
+
+#[tokio::test]
+#[serial(branch_merge_phase_b)]
+async fn branch_merge_rewrite_partial_after_merge_rolls_back() {
+    assert_partial_merge_rolls_back(
+        MergeScenario::Rewrite,
+        "branch_merge.rewrite_after_merge_pre_delete",
+    )
+    .await;
+}
+
+#[tokio::test]
+#[serial(branch_merge_phase_b)]
+async fn branch_merge_rewrite_partial_after_delete_rolls_back() {
+    assert_partial_merge_rolls_back(
+        MergeScenario::Rewrite,
+        "branch_merge.rewrite_after_delete_pre_index",
+    )
+    .await;
+}
+
 /// Branch-axis variant of the branch_merge recovery test: target is a
 /// non-main branch. Catches the branch-specific commit-graph head bug
 /// (D2) — without `CommitGraph::open_at_branch`, the recovery sweep
