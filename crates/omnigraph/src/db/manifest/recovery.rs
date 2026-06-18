@@ -62,10 +62,26 @@ pub(crate) const RECOVERY_ACTOR: &str = "omnigraph:recovery";
 /// Subdirectory under the graph root holding sidecar files.
 pub(crate) const RECOVERY_DIR_NAME: &str = "__recovery";
 
-/// Current sidecar JSON shape version. Bumping this is a breaking change:
-/// older binaries will refuse to interpret newer sidecars (intentional —
-/// see [`SidecarSchemaError`]).
-pub(crate) const SIDECAR_SCHEMA_VERSION: u32 = 1;
+/// Max sidecar JSON shape/semantics version this binary writes and understands.
+/// The reader accepts every version `<= ` this and refuses only versions ABOVE
+/// it (an older binary cannot guess semantics a newer writer baked in — see
+/// [`SidecarSchemaError`] and [`parse_sidecar`]). Bump this whenever a change
+/// alters how an existing field is *interpreted* (not merely adds an optional
+/// one), and add a fixed `*_SCHEMA_VERSION` floor like the one below so older
+/// generations keep their original semantics.
+///
+/// v1 → v2: Phase-B confirmation. A `BranchMerge` sidecar at v2 carries
+/// `confirmed_version` and is classified strictly (unconfirmed ⇒ partial ⇒ roll
+/// back); at v1 it predates confirmation and keeps the loose roll-forward. The
+/// reader must distinguish the two, so this is a real version bump, not an
+/// additive field.
+pub(crate) const SIDECAR_SCHEMA_VERSION: u32 = 2;
+
+/// The version at which Phase-B confirmation shipped. A `BranchMerge` sidecar is
+/// confirmation-aware (strict classification) iff `schema_version >=` this.
+/// FIXED at 2 — NOT derived from [`SIDECAR_SCHEMA_VERSION`] — so a future bump to
+/// v3+ still treats v2 sidecars as confirmation-aware.
+pub(crate) const CONFIRMATION_SCHEMA_VERSION: u32 = 2;
 
 /// Selects which recovery actions are allowed in a sweep.
 ///
@@ -232,25 +248,27 @@ pub(crate) struct RecoverySidecarHandle {
     pub(crate) sidecar_uri: String,
 }
 
-/// Error returned when the sidecar's `schema_version` is unknown to this
-/// binary. We refuse-and-error rather than read-and-warn: an old binary
-/// cannot guess what semantics a newer writer baked into a future shape.
-/// Operator action is required (typically: upgrade the binary).
+/// Error returned when the sidecar's `schema_version` is NEWER than this binary
+/// understands. We refuse-and-error rather than read-and-warn: an old binary
+/// cannot guess what semantics a newer writer baked into a future shape. (Older
+/// versions are accepted and interpreted with their original semantics — see
+/// [`parse_sidecar`].) Operator action is required (typically: upgrade the
+/// binary).
 #[derive(Debug)]
 pub(crate) struct SidecarSchemaError {
     pub sidecar_uri: String,
     pub found_version: u32,
-    pub supported_version: u32,
+    pub max_supported_version: u32,
 }
 
 impl std::fmt::Display for SidecarSchemaError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(
             f,
-            "recovery sidecar at '{}' declares schema_version={}, but this \
-             binary supports only schema_version={}; refusing to interpret \
+            "recovery sidecar at '{}' declares schema_version={}, newer than the \
+             maximum this binary supports (schema_version={}); refusing to interpret \
              — upgrade omnigraph or remove the sidecar with operator review",
-            self.sidecar_uri, self.found_version, self.supported_version,
+            self.sidecar_uri, self.found_version, self.max_supported_version,
         )
     }
 }
@@ -471,11 +489,15 @@ pub(crate) fn parse_sidecar(sidecar_uri: &str, body: &str) -> Result<RecoverySid
             sidecar_uri, err
         ))
     })?;
-    if peek.schema_version != SIDECAR_SCHEMA_VERSION {
+    // Accept every version we were built to understand (`<= max`); refuse only
+    // versions NEWER than us. Interpreting older generations with their original
+    // semantics (rather than refusing them) is what avoids billing operators to
+    // drain pre-upgrade sidecars; classification then dispatches by version.
+    if peek.schema_version > SIDECAR_SCHEMA_VERSION {
         return Err(SidecarSchemaError {
             sidecar_uri: sidecar_uri.to_string(),
             found_version: peek.schema_version,
-            supported_version: SIDECAR_SCHEMA_VERSION,
+            max_supported_version: SIDECAR_SCHEMA_VERSION,
         }
         .into());
     }
@@ -521,6 +543,7 @@ pub(crate) fn classify_table(
     lance_head: u64,
     manifest_pinned: u64,
     kind: SidecarKind,
+    schema_version: u32,
 ) -> TableClassification {
     use TableClassification::*;
     if lance_head < manifest_pinned {
@@ -532,7 +555,16 @@ pub(crate) fn classify_table(
         return NoMovement;
     }
     // lance_head > manifest_pinned
-    if matches!(kind, SidecarKind::BranchMerge) {
+    //
+    // Gate the strict confirmation path on the sidecar's VERSION, not on
+    // `kind == BranchMerge` alone: a BranchMerge sidecar written before
+    // confirmation shipped (`schema_version < CONFIRMATION_SCHEMA_VERSION`)
+    // carries no `confirmed_version` and must keep the prior loose
+    // roll-forward below — reading it as strict would misclassify a *completed*
+    // pre-upgrade merge as a partial and roll it back. The read gate already
+    // refused any version NEWER than us, so here `schema_version` is one we
+    // understand.
+    if matches!(kind, SidecarKind::BranchMerge) && schema_version >= CONFIRMATION_SCHEMA_VERSION {
         // Two-phase confirmation: roll forward only to the exact version the
         // writer recorded after its whole multi-commit publish completed. No
         // confirmation ⇒ the publish crashed mid-sequence ⇒ partial ⇒ roll
@@ -561,7 +593,10 @@ pub(crate) fn classify_table(
             UnexpectedMultistep
         }
     } else {
-        // Loose match for multi-commit writers (SchemaApply, EnsureIndices).
+        // Loose match for multi-commit writers (SchemaApply, EnsureIndices,
+        // Optimize) — and pre-confirmation (`schema_version <
+        // CONFIRMATION_SCHEMA_VERSION`) BranchMerge sidecars, which fall through
+        // to here to keep their original roll-forward.
         if pin.expected_version == manifest_pinned {
             RolledPastExpected
         } else if lance_head == manifest_pinned + 1 {
@@ -981,7 +1016,13 @@ async fn process_sidecar(
             .map(|e| e.table_version)
             .unwrap_or(0);
         states.push(ClassifiedTable {
-            classification: classify_table(pin, lance_head, manifest_pinned, sidecar.writer_kind),
+            classification: classify_table(
+                pin,
+                lance_head,
+                manifest_pinned,
+                sidecar.writer_kind,
+                sidecar.schema_version,
+            ),
             manifest_pinned,
             lance_head,
         });
@@ -1689,30 +1730,39 @@ mod tests {
     }
 
     #[test]
-    fn parse_sidecar_refuses_unknown_schema_version() {
-        let body = r#"{
-            "schema_version": 99,
-            "operation_id": "01H000000000000000000000XX",
-            "started_at": "0",
-            "branch": null,
-            "actor_id": null,
-            "writer_kind": "Mutation",
-            "tables": []
-        }"#;
-        let err = parse_sidecar("file:///tmp/__recovery/x.json", body).unwrap_err();
+    fn parse_sidecar_refuses_future_but_accepts_older_schema_version() {
+        let body = |version: u32| {
+            format!(
+                r#"{{
+                "schema_version": {version},
+                "operation_id": "01H000000000000000000000XX",
+                "started_at": "0",
+                "branch": null,
+                "actor_id": null,
+                "writer_kind": "BranchMerge",
+                "tables": []
+            }}"#
+            )
+        };
+        // A version NEWER than this binary's max → refuse (can't guess the future).
+        let err = parse_sidecar("file:///tmp/__recovery/x.json", &body(99)).unwrap_err();
         let msg = err.to_string();
         assert!(
-            msg.contains("schema_version=99") && msg.contains("supports only schema_version=1"),
-            "expected SidecarSchemaError mentioning the version mismatch, got: {}",
-            msg,
+            msg.contains("schema_version=99") && msg.contains("newer than the maximum"),
+            "expected a future-version refusal, got: {msg}",
         );
+        // An OLDER version (pre-confirmation v1) → accept and interpret with its
+        // original semantics; never refuse a version we were built to understand.
+        let parsed = parse_sidecar("file:///tmp/__recovery/x.json", &body(1))
+            .expect("a v1 (older) sidecar must parse, not be refused");
+        assert_eq!(parsed.schema_version, 1);
     }
 
     #[test]
     fn classify_no_movement_when_head_equals_pinned() {
         let pin = make_pin("node:Person", "irrelevant", 5, 6);
         assert_eq!(
-            classify_table(&pin, 5, 5, SidecarKind::Mutation),
+            classify_table(&pin, 5, 5, SidecarKind::Mutation, SIDECAR_SCHEMA_VERSION),
             TableClassification::NoMovement,
         );
     }
@@ -1721,7 +1771,7 @@ mod tests {
     fn classify_rolled_past_expected_when_sidecar_matches_strict() {
         let pin = make_pin("node:Person", "irrelevant", 5, 6);
         assert_eq!(
-            classify_table(&pin, 6, 5, SidecarKind::Mutation),
+            classify_table(&pin, 6, 5, SidecarKind::Mutation, SIDECAR_SCHEMA_VERSION),
             TableClassification::RolledPastExpected,
         );
     }
@@ -1731,7 +1781,7 @@ mod tests {
         // Same +1 drift but post_commit_pin says it should be 7, not 6.
         let pin = make_pin("node:Person", "irrelevant", 5, 7);
         assert_eq!(
-            classify_table(&pin, 6, 5, SidecarKind::Mutation),
+            classify_table(&pin, 6, 5, SidecarKind::Mutation, SIDECAR_SCHEMA_VERSION),
             TableClassification::UnexpectedAtP1,
         );
     }
@@ -1740,7 +1790,7 @@ mod tests {
     fn classify_unexpected_multistep_when_head_jumped_more_than_one_strict() {
         let pin = make_pin("node:Person", "irrelevant", 5, 6);
         assert_eq!(
-            classify_table(&pin, 8, 5, SidecarKind::Mutation),
+            classify_table(&pin, 8, 5, SidecarKind::Mutation, SIDECAR_SCHEMA_VERSION),
             TableClassification::UnexpectedMultistep,
         );
     }
@@ -1749,7 +1799,7 @@ mod tests {
     fn classify_invariant_violation_when_head_below_pinned() {
         let pin = make_pin("node:Person", "irrelevant", 5, 6);
         assert_eq!(
-            classify_table(&pin, 3, 5, SidecarKind::Mutation),
+            classify_table(&pin, 3, 5, SidecarKind::Mutation, SIDECAR_SCHEMA_VERSION),
             TableClassification::InvariantViolation { observed: 3 },
         );
     }
@@ -1765,7 +1815,7 @@ mod tests {
         // built two indices). Strict would say UnexpectedMultistep; loose
         // accepts it as RolledPastExpected.
         assert_eq!(
-            classify_table(&pin, 8, 5, SidecarKind::SchemaApply),
+            classify_table(&pin, 8, 5, SidecarKind::SchemaApply, SIDECAR_SCHEMA_VERSION),
             TableClassification::RolledPastExpected,
         );
     }
@@ -1774,7 +1824,7 @@ mod tests {
     fn classify_loose_match_accepts_multi_commit_drift_for_ensure_indices() {
         let pin = make_pin("node:Person", "irrelevant", 5, 6);
         assert_eq!(
-            classify_table(&pin, 9, 5, SidecarKind::EnsureIndices),
+            classify_table(&pin, 9, 5, SidecarKind::EnsureIndices, SIDECAR_SCHEMA_VERSION),
             TableClassification::RolledPastExpected,
         );
     }
@@ -1783,7 +1833,7 @@ mod tests {
     fn classify_loose_match_no_movement_unchanged() {
         let pin = make_pin("node:Person", "irrelevant", 5, 6);
         assert_eq!(
-            classify_table(&pin, 5, 5, SidecarKind::SchemaApply),
+            classify_table(&pin, 5, 5, SidecarKind::SchemaApply, SIDECAR_SCHEMA_VERSION),
             TableClassification::NoMovement,
         );
     }
@@ -1792,7 +1842,7 @@ mod tests {
     fn classify_loose_match_invariant_violation_unchanged() {
         let pin = make_pin("node:Person", "irrelevant", 5, 6);
         assert_eq!(
-            classify_table(&pin, 3, 5, SidecarKind::SchemaApply),
+            classify_table(&pin, 3, 5, SidecarKind::SchemaApply, SIDECAR_SCHEMA_VERSION),
             TableClassification::InvariantViolation { observed: 3 },
         );
     }
@@ -1800,18 +1850,35 @@ mod tests {
     /// BranchMerge advances each table by several commits per table
     /// (adopt: append + upsert + delete; three-way: merge_insert + delete +
     /// index), so a bare "HEAD moved" is ambiguous between a complete and a
-    /// partial publish. The two-phase confirmation resolves it: roll forward
-    /// ONLY to the recorded `confirmed_version`; an unconfirmed moved HEAD is
-    /// a partial publish (`IncompletePhaseB` ⇒ roll back), and a confirmed
-    /// version that doesn't match the observed HEAD is a foreign advance
-    /// (`UnexpectedMultistep` ⇒ roll back).
+    /// partial publish. At a confirmation-aware version the two-phase
+    /// confirmation resolves it: roll forward ONLY to the recorded
+    /// `confirmed_version`; an unconfirmed moved HEAD is a partial publish
+    /// (`IncompletePhaseB` ⇒ roll back), and a confirmed version that doesn't
+    /// match the observed HEAD is a foreign advance (`UnexpectedMultistep` ⇒
+    /// roll back). A *pre-confirmation* (v1) sidecar carries no confirmation and
+    /// must keep the original loose roll-forward — reading it as strict would
+    /// roll a completed pre-upgrade merge back (silent discard).
     #[test]
     fn classify_branch_merge_requires_phase_b_confirmation() {
-        // Unconfirmed multi-commit drift → partial Phase B → roll back.
+        // Unconfirmed multi-commit drift at a confirmation-aware version →
+        // partial Phase B → roll back.
         let unconfirmed = make_pin("node:Person", "irrelevant", 5, 6);
         assert_eq!(
-            classify_table(&unconfirmed, 8, 5, SidecarKind::BranchMerge),
+            classify_table(&unconfirmed, 8, 5, SidecarKind::BranchMerge, SIDECAR_SCHEMA_VERSION),
             TableClassification::IncompletePhaseB,
+        );
+        // Backward-compat: the SAME unconfirmed pin in a PRE-confirmation (v1)
+        // sidecar → loose roll-forward (the regression fix — a completed
+        // pre-upgrade merge must not be discarded).
+        assert_eq!(
+            classify_table(
+                &unconfirmed,
+                8,
+                5,
+                SidecarKind::BranchMerge,
+                CONFIRMATION_SCHEMA_VERSION - 1,
+            ),
+            TableClassification::RolledPastExpected,
         );
         // Confirmed to the observed HEAD → complete Phase B → roll forward.
         let confirmed = SidecarTablePin {
@@ -1819,12 +1886,12 @@ mod tests {
             ..make_pin("node:Person", "irrelevant", 5, 6)
         };
         assert_eq!(
-            classify_table(&confirmed, 8, 5, SidecarKind::BranchMerge),
+            classify_table(&confirmed, 8, 5, SidecarKind::BranchMerge, SIDECAR_SCHEMA_VERSION),
             TableClassification::RolledPastExpected,
         );
         // Confirmed, but HEAD drifted past it (foreign writer) → roll back.
         assert_eq!(
-            classify_table(&confirmed, 9, 5, SidecarKind::BranchMerge),
+            classify_table(&confirmed, 9, 5, SidecarKind::BranchMerge, SIDECAR_SCHEMA_VERSION),
             TableClassification::UnexpectedMultistep,
         );
     }
@@ -1833,7 +1900,7 @@ mod tests {
     fn classify_loose_match_branch_merge_no_movement_unchanged() {
         let pin = make_pin("node:Person", "irrelevant", 5, 6);
         assert_eq!(
-            classify_table(&pin, 5, 5, SidecarKind::BranchMerge),
+            classify_table(&pin, 5, 5, SidecarKind::BranchMerge, SIDECAR_SCHEMA_VERSION),
             TableClassification::NoMovement,
         );
     }
@@ -1842,7 +1909,7 @@ mod tests {
     fn classify_loose_match_branch_merge_invariant_violation_unchanged() {
         let pin = make_pin("node:Person", "irrelevant", 5, 6);
         assert_eq!(
-            classify_table(&pin, 3, 5, SidecarKind::BranchMerge),
+            classify_table(&pin, 3, 5, SidecarKind::BranchMerge, SIDECAR_SCHEMA_VERSION),
             TableClassification::InvariantViolation { observed: 3 },
         );
     }

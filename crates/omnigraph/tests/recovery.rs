@@ -104,8 +104,10 @@ async fn recovery_refuses_unknown_schema_version_on_open() {
     let _db = Omnigraph::init(uri, TEST_SCHEMA).await.unwrap();
     drop(_db);
 
-    // A sidecar from a hypothetical future writer; the older binary must
-    // refuse to interpret it (resolved-decisions §3 in the design doc).
+    // A sidecar from a hypothetical future writer (version NEWER than this
+    // binary's max); the reader must refuse to interpret it — it cannot guess
+    // semantics a newer writer baked in. (Older versions are accepted and
+    // interpreted with their original semantics; see `parse_sidecar`.)
     let sidecar_json = r#"{
         "schema_version": 99,
         "operation_id": "01H000000000000000000000ZZ",
@@ -120,11 +122,11 @@ async fn recovery_refuses_unknown_schema_version_on_open() {
     let err = Omnigraph::open(uri)
         .await
         .err()
-        .expect("expected open to fail because of unknown sidecar schema_version");
+        .expect("expected open to fail because of a future sidecar schema_version");
     let msg = err.to_string();
     assert!(
-        msg.contains("schema_version=99") && msg.contains("supports only schema_version=1"),
-        "expected SidecarSchemaError mentioning the version mismatch, got: {}",
+        msg.contains("schema_version=99") && msg.contains("newer than the maximum"),
+        "expected a future-version refusal, got: {}",
         msg,
     );
     // Sidecar must still be on disk — we don't auto-delete unparseable files.
