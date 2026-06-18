@@ -208,6 +208,7 @@ When no positional args are given, the image entrypoint
 |---|---|
 | `OMNIGRAPH_CLUSTER` | Cluster boot source — a config directory or a storage-root URI, forwarded as `--cluster`. The only boot source. |
 | `OMNIGRAPH_BIND` | Listen address (default `0.0.0.0:8080`). |
+| `OMNIGRAPH_REQUIRE_ALL_GRAPHS` | When truthy, forwarded as `--require-all-graphs`: any graph-local quarantine or startup failure aborts cluster boot instead of serving the healthy subset. |
 
 Per-graph and server-level Cedar policy come from the cluster's applied
 revision (authored in `cluster.yaml` and published with `cluster apply`),

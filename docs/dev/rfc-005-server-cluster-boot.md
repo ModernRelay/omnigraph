@@ -1,7 +1,7 @@
 # RFC: Server Boots from Cluster State — Phase 5 of the Cluster Control Plane
 
 **Status:** Landed (5A policy bindings #175; 5B/5C the `--cluster` boot mode — one PR)
-**Implementation deviations:** (1) cluster mode reuses `ServerConfigMode::Multi` (a new settings *source*, not a new enum variant; `config_path` carries the cluster dir). (2) Stored queries load via `QueryRegistry::from_specs` from verified blob *content*, not blob paths. (3) More than one policy bundle binding a single scope is a boot error (the serving pipeline holds one bundle per graph + one server-level; stacking is a later slice). (4) `GET /graphs` keeps its closed-by-default contract — without a cluster-bound bundle there is no server-level Cedar engine, so enumeration refuses.
+**Implementation deviations:** (1) cluster mode reuses `ServerConfigMode::Multi` (a new settings *source*, not a new enum variant; `config_path` carries the cluster dir). (2) Stored queries load via `QueryRegistry::from_specs` from verified blob *content*, not blob paths. (3) More than one policy bundle binding a single scope is a boot error (the serving pipeline holds one bundle per graph + one server-level; stacking is a later slice). (4) `GET /graphs` keeps its closed-by-default contract — without a cluster-bound bundle there is no server-level Cedar engine, so enumeration refuses. (5) Graph-attributed startup failures quarantine that graph by default; operators can restore all-or-nothing boot with `--require-all-graphs` / `OMNIGRAPH_REQUIRE_ALL_GRAPHS=1`.
 **Date:** 2026-06-10
 **Builds on:** Phase 4 complete ([rfc-004-cluster-graph-schema-apply.md](rfc-004-cluster-graph-schema-apply.md), Landed): `cluster apply` converges graphs, schemas, stored queries, and policies into the cluster catalog. Normative context: [cluster-config-specs.md](cluster-config-specs.md) (the migration model's "window 2"), [cluster-axioms.md](cluster-axioms.md) (axiom 15), [cluster-config-implementation-spec.md](cluster-config-implementation-spec.md) (Phase 5 rollout, Compatibility Stance #7–#9, exit criterion 7).
 **Target release:** unversioned (phased — see Sequencing).
@@ -46,8 +46,8 @@ Mode inference gains rule 0: `--cluster <dir>` → **Cluster mode**, which is al
 
 `load_server_settings` grows a cluster branch that reads, in order:
 
-1. `__cluster/state.json` — **missing state is a boot error** ("run `cluster import` + `cluster apply` first"). Pending recovery sidecars under `__cluster/recoveries/` are also a boot error (`cluster_recovery_pending`): a server must not start serving a ledger that a sweep is about to rewrite.
-2. **Graph set** = state's `graph.<id>` resources (tombstoned graphs are absent by construction). Each graph's URI is the derived root `<dir>/graphs/<id>.omni`. A recorded graph whose root does not open is a boot error — same fail-fast posture as today's bad URI.
+1. `__cluster/state.json` — **missing state is a boot error** ("run `cluster import` + `cluster apply` first"). Invalid or unattributable recovery sidecars under `__cluster/recoveries/` are also a boot error: a server must not start if it cannot prove the blast radius. Valid graph-attributed sidecars quarantine that graph by default and are logged as `cluster_recovery_pending`; `--require-all-graphs` promotes them back to a boot error.
+2. **Graph set** = state's `graph.<id>` resources (tombstoned graphs are absent by construction). Each graph's URI is the derived root `<dir>/graphs/<id>.omni`. A recorded graph whose root does not open quarantines that graph by default; `--require-all-graphs` restores the original fail-fast posture.
 3. **Stored queries** = state's `query.<graph>.<name>` entries, content loaded from the catalog blob at the recorded digest. Blob-missing or digest-mismatched is a boot error (the catalog verification semantics from Stage 3B, applied at boot). Queries type-check at engine open exactly as today (`validate_and_attach` — unchanged).
 4. **Policies** = state's `policy.<name>` entries, content from catalog blobs, bindings from the applied metadata of D3: bundles bound to `cluster` load as the server-level Cedar engine (`PolicyEngine::load_server`); bundles bound to graphs load per-graph (`PolicyEngine::load_graph`) and install via `with_policy` — the existing two-gate structure, unchanged.
 5. `cluster.yaml` is parsed **only** to validate that the directory is a cluster root (and for nothing else — explicitly not for resource content; a divergence between desired config and applied state is *served as applied*, visible via `cluster plan`).
@@ -76,16 +76,19 @@ State's `StateResource` records only a digest. To make the ledger serving-suffic
 
 ### D4. Readiness and failure posture
 
-Boot is fail-fast, matching the server's existing stance (bad policy YAML refuses boot):
+Cluster-global failures are fail-fast, matching the server's existing stance (bad policy YAML refuses boot). Graph-local failures quarantine the affected graph by default so a single bad graph cannot crash-loop an otherwise healthy cluster. Operators who prefer the original all-or-nothing contract pass `--require-all-graphs` or set `OMNIGRAPH_REQUIRE_ALL_GRAPHS=1`, which promotes every graph-local quarantine/open/settings failure to a boot error.
 
 | Condition | Behavior |
 |---|---|
 | `state.json` missing / unparseable / unsupported version | boot error |
-| pending recovery sidecars | boot error (run any state-mutating cluster command to sweep) |
-| recorded graph root missing or unopenable | boot error |
+| invalid/unreadable/unattributable recovery sidecars | boot error (run any state-mutating cluster command to sweep or inspect) |
+| valid graph-attributed recovery sidecars | quarantine that graph; strict mode boot error |
+| recorded graph root missing or unopenable | quarantine that graph; strict mode boot error |
 | query/policy blob missing or digest-mismatched | boot error (run `cluster refresh` + `apply` to self-heal, then restart) |
 | policy entry without `applies_to` metadata | boot error ("re-run cluster apply", D3) |
-| stored query fails type-check against the live schema | boot error (existing `validate_and_attach` behavior) |
+| stored query fails parse/type-check against the live schema | quarantine that graph; strict mode boot error |
+| embedding provider configuration for one graph cannot resolve | quarantine that graph; strict mode boot error |
+| every applied graph is quarantined or fails startup | boot error (`cluster_no_healthy_graphs`) |
 | state lock held | **not** an error — boot takes no lock; it reads a point-in-time snapshot of an immutable-once-written state file (the CAS discipline means a concurrent apply produces a *new* file atomically; the server reads whichever was current at open) |
 
 ### D5. The `mcp.expose` bridge in cluster mode
@@ -109,7 +112,7 @@ Rollback is the same switch in reverse — nothing in cluster mode mutates `omni
 - *Axiom 5*: the server serves deployed reality (applied digests), never desired intent; D3 keeps the ledger the single serving source.
 - *Axiom 12*: boot reads without the lock but relies on the atomic-replace write discipline; it never writes state.
 - *Axiom 14 / Stance #9*: the expose-all bridge is named, scoped to cluster mode, and carries its Phase 6 sunset.
-- *Loud failures (deny-list)*: every degraded condition is a typed boot error with a remedy; no partial serving, no silent fallback to the yaml.
+- *Loud failures (deny-list)*: every degraded condition is either a typed cluster-global boot error with a remedy or an explicit graph quarantine logged at startup; no silent fallback to the yaml. `--require-all-graphs` is the opt-in all-or-nothing mode for operators who treat any degraded graph as fatal.
 - *Respect the boundaries*: `omnigraph-cluster` stays free of HTTP; the server reads the catalog through a small read-only loader (either a `pub` read surface on `omnigraph-cluster` or a thin module in the server consuming the documented file formats — implementation picks the one that keeps `omnigraph-cluster` dependency-light; the state/blob formats are already a documented contract).
 
 ## Sequencing
@@ -117,7 +120,7 @@ Rollback is the same switch in reverse — nothing in cluster mode mutates `omni
 | Slice | Scope | Gate |
 |---|---|---|
 | **5A: serving metadata in state** | `applies_to` recorded on policy resources at apply + sweep roll-forward; additive state schema; `status`/plan surfacing | In-crate tests: metadata written/rolled-forward; old state parses; re-apply backfills |
-| **5B: `--cluster` boot mode** | Flag + mode inference rule 0; catalog loader (state → `GraphStartupConfig`s + registries + policy engines); readiness table; OpenAPI regen if surface shifts | Server tests: boot from a converged fixture dir, serve `/graphs/{id}/query` + stored queries + Cedar gates; every D4 row refuses boot; e2e: `cluster apply` then serve — "applied means serving" |
+| **5B: `--cluster` boot mode** | Flag + mode inference rule 0; catalog loader (state → `GraphStartupConfig`s + registries + policy engines); readiness table; OpenAPI regen if surface shifts | Server tests: boot from a converged fixture dir, serve `/graphs/{id}/query` + stored queries + Cedar gates; D4 cluster-global rows refuse boot; graph-local rows quarantine by default and refuse under `--require-all-graphs`; e2e: `cluster apply` then serve — "applied means serving" |
 | **5C: docs + caveat retirement** | `cluster-config.md` mode-switch section; `server.md`/`deployment.md`; retire the "not serving" caveats for cluster-mode deployments; migration guide (D6) | `check-agents-md.sh`; doc accuracy review |
 
 ## Exit-criteria coverage
