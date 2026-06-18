@@ -3601,6 +3601,92 @@ async fn branch_merge_rewrite_partial_after_delete_rolls_back() {
     .await;
 }
 
+/// Backward-compat: a `BranchMerge` sidecar written by a *pre-confirmation*
+/// binary (schema_version 1, no `confirmed_version`) must NOT be misread as a
+/// partial Phase B and rolled back. A pre-upgrade crash in the Phase-B→C gap can
+/// leave such a sidecar over a *completed* merge; rolling it back would silently
+/// discard a finished merge with no operator signal — the regression greptile /
+/// Cursor flagged.
+///
+/// We synthesize the pre-upgrade sidecar realistically: crash after Phase B (a
+/// real sidecar + advanced Lance HEAD), then downgrade the on-disk JSON to the
+/// v1 shape (`schema_version` = 1, strip every pin's `confirmed_version`) before
+/// reopening — exactly what an old binary would have left.
+///
+/// RED before the versioning fix: a v1 sidecar with no `confirmed_version`
+/// classifies `IncompletePhaseB` → rolls back → `bob` is discarded. GREEN after:
+/// the version-aware classifier reads v1 as the old loose generation → rolls
+/// forward → `bob` preserved.
+#[tokio::test]
+#[serial(branch_merge_phase_b)]
+async fn pre_upgrade_v1_branch_merge_sidecar_rolls_forward_not_back() {
+    use omnigraph::loader::{LoadMode, load_jsonl};
+
+    let _scenario = FailScenario::setup();
+    let dir = tempfile::tempdir().unwrap();
+    let uri = dir.path().to_str().unwrap().to_string();
+
+    // main {alice}; feature adds bob → a fast-forward AdoptWithDelta merge, which
+    // writes a recovery sidecar.
+    {
+        let mut db = Omnigraph::init(&uri, helpers::TEST_SCHEMA).await.unwrap();
+        load_jsonl(
+            &mut db,
+            "{\"type\":\"Person\",\"data\":{\"name\":\"alice\",\"age\":30}}\n",
+            LoadMode::Append,
+        )
+        .await
+        .unwrap();
+        db.branch_create("feature").await.unwrap();
+        db.mutate(
+            "feature",
+            MUTATION_QUERIES,
+            "insert_person",
+            &mixed_params(&[("$name", "bob")], &[("$age", 40)]),
+        )
+        .await
+        .unwrap();
+    }
+
+    // Crash after Phase B (Lance HEAD advanced, manifest not published) → a real
+    // sidecar lands on disk.
+    {
+        let db = Omnigraph::open(&uri).await.unwrap();
+        let _fp = ScopedFailPoint::new("branch_merge.post_phase_b_pre_manifest_commit", "return");
+        db.branch_merge("feature", "main").await.unwrap_err();
+    }
+
+    // Downgrade the sidecar to the pre-confirmation v1 shape an old binary writes.
+    {
+        let recovery_dir = std::path::Path::new(&uri).join("__recovery");
+        let path = std::fs::read_dir(&recovery_dir)
+            .unwrap()
+            .filter_map(Result::ok)
+            .map(|e| e.path())
+            .find(|p| p.extension().is_some_and(|x| x == "json"))
+            .expect("a recovery sidecar must exist after the post-Phase-B crash");
+        let mut v: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+        v["schema_version"] = serde_json::json!(1);
+        for table in v["tables"].as_array_mut().unwrap() {
+            table.as_object_mut().unwrap().remove("confirmed_version");
+        }
+        std::fs::write(&path, serde_json::to_string_pretty(&v).unwrap()).unwrap();
+    }
+
+    // Reopen → the pre-upgrade completed merge must roll FORWARD (bob kept), not
+    // be silently discarded.
+    {
+        let db = Omnigraph::open(&uri).await.unwrap();
+        assert_eq!(
+            sorted_person_names(&db).await,
+            vec!["alice", "bob"],
+            "a pre-confirmation (v1) BranchMerge sidecar over a completed merge must roll \
+             forward, not be misread as a partial and rolled back",
+        );
+    }
+}
+
 /// Branch-axis variant of the branch_merge recovery test: target is a
 /// non-main branch. Catches the branch-specific commit-graph head bug
 /// (D2) — without `CommitGraph::open_at_branch`, the recovery sweep
