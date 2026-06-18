@@ -420,6 +420,9 @@ async fn optimize_one_table(
             // Lower bound — compaction commits N≥1 versions (reserve + rewrite);
             // the classifier loose-matches SidecarKind::Optimize.
             post_commit_pin: expected_version + 1,
+            // Optimize uses the loose match (drift is derived state), not
+            // BranchMerge's Phase-B confirmation — left None.
+            confirmed_version: None,
             table_branch: None,
         }],
     );

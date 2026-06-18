@@ -1651,6 +1651,11 @@ impl Omnigraph {
                     table_path: self.storage().dataset_uri(&entry.table_path),
                     expected_version: entry.table_version,
                     post_commit_pin: entry.table_version + 1,
+                    // Stamped after the whole per-table publish completes
+                    // (Phase-B confirmation, just before the manifest publish).
+                    // Until then `None` marks an unfinished publish that
+                    // recovery must roll back, not roll forward.
+                    confirmed_version: None,
                     // Use the merge target branch (where commits actually
                     // land), NOT entry.table_branch (where the table
                     // currently lives). publish_rewritten_merge_table calls
@@ -1667,7 +1672,14 @@ impl Omnigraph {
                 })
             })
             .collect();
-        let recovery_handle = if recovery_pins.is_empty() {
+        // Keep the sidecar alongside its handle: after the per-table publish
+        // loop completes (Phase B), we re-write it with each table's confirmed
+        // version before the manifest publish, so recovery can tell a finished
+        // publish (roll forward) from a partial one (roll back).
+        let mut recovery: Option<(
+            crate::db::manifest::RecoverySidecar,
+            crate::db::manifest::RecoverySidecarHandle,
+        )> = if recovery_pins.is_empty() {
             None
         } else {
             // Use the merge target branch directly, NOT a heuristic
@@ -1692,14 +1704,13 @@ impl Omnigraph {
             // this, future merges between the same pair lose
             // already-up-to-date detection and merge-base correctness.
             sidecar.merge_source_commit_id = Some(source_head_commit_id.to_string());
-            Some(
-                crate::db::manifest::write_sidecar(
-                    self.root_uri(),
-                    self.storage_adapter(),
-                    &sidecar,
-                )
-                .await?,
+            let handle = crate::db::manifest::write_sidecar(
+                self.root_uri(),
+                self.storage_adapter(),
+                &sidecar,
             )
+            .await?;
+            Some((sidecar, handle))
         };
 
         let mut updates = Vec::new();
@@ -1726,10 +1737,33 @@ impl Omnigraph {
             updates.push(update);
         }
 
+        // Phase-B confirmation: every table's publish finished, so stamp the
+        // sidecar with each table's exact achieved version before the manifest
+        // publish. This is the commit point of the recovery WAL: a crash from
+        // here on rolls FORWARD to these versions, while a crash anywhere in the
+        // publish loop above left the sidecar unconfirmed and rolls BACK. The
+        // `updates` carry the real per-table final versions (multiple
+        // commit_staged calls per table, so not derivable from `post_commit_pin`
+        // alone). A failure here leaves the unconfirmed sidecar → roll back.
+        if let Some((sidecar, _)) = recovery.as_mut() {
+            let confirmed_versions: std::collections::HashMap<String, u64> = updates
+                .iter()
+                .map(|u| (u.table_key.clone(), u.table_version))
+                .collect();
+            crate::db::manifest::confirm_sidecar_phase_b(
+                self.root_uri(),
+                self.storage_adapter(),
+                sidecar,
+                &confirmed_versions,
+            )
+            .await?;
+        }
+
         // Failpoint: pin the per-writer Phase B → Phase C residual for
         // branch_merge. Lance HEAD has advanced on every touched table
-        // (publish_*) but the manifest publish below hasn't run. Used
-        // by `tests/failpoints.rs::branch_merge_phase_b_failure_recovered_on_next_open`.
+        // (publish_*) AND the sidecar is confirmed, but the manifest publish
+        // below hasn't run — so recovery rolls FORWARD. Used by
+        // `tests/failpoints.rs::branch_merge_phase_b_failure_recovered_on_next_open`.
         crate::failpoints::maybe_fail("branch_merge.post_phase_b_pre_manifest_commit")?;
 
         let manifest_version = if updates.is_empty() {
@@ -1741,7 +1775,7 @@ impl Omnigraph {
         // Recovery sidecar lifecycle: delete after manifest publish.
         // Best-effort cleanup; the merge already landed durably so
         // failing the user here is undesirable.
-        if let Some(handle) = recovery_handle {
+        if let Some((_, handle)) = recovery {
             if let Err(err) =
                 crate::db::manifest::delete_sidecar(&handle, self.storage_adapter()).await
             {

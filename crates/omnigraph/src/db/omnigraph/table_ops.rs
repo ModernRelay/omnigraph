@@ -125,6 +125,9 @@ pub(super) async fn ensure_indices_for_branch(
                 table_path: full_path,
                 expected_version: entry.table_version,
                 post_commit_pin: entry.table_version + 1,
+                // EnsureIndices uses the loose match (index coverage is derived
+                // state), not BranchMerge's Phase-B confirmation — left None.
+                confirmed_version: None,
                 // Use active_branch (where commits actually land), NOT
                 // entry.table_branch (where the table currently lives).
                 // open_owned_dataset_for_branch_write forks a feature
@@ -150,6 +153,9 @@ pub(super) async fn ensure_indices_for_branch(
                 table_path: full_path,
                 expected_version: entry.table_version,
                 post_commit_pin: entry.table_version + 1,
+                // EnsureIndices uses the loose match (index coverage is derived
+                // state), not BranchMerge's Phase-B confirmation — left None.
+                confirmed_version: None,
                 // Use active_branch (where commits actually land), NOT
                 // entry.table_branch (where the table currently lives).
                 // open_owned_dataset_for_branch_write forks a feature

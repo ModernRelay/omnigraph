@@ -126,8 +126,22 @@ pub(crate) struct SidecarTablePin {
     /// Manifest-pinned version at writer start (CAS expectation).
     pub expected_version: u64,
     /// Lance HEAD that the writer's `commit_staged` would produce
-    /// (typically `expected_version + 1`).
+    /// (typically `expected_version + 1`). For multi-commit writers this is
+    /// only a *lower bound* — see `confirmed_version`.
     pub post_commit_pin: u64,
+    /// Phase-B confirmation: the exact Lance HEAD this table reached once the
+    /// writer's *entire* multi-commit publish for it finished, recorded by a
+    /// second sidecar write immediately before the manifest publish (Phase C).
+    /// `None` means Phase B did not complete (the writer crashed mid-publish),
+    /// so the on-disk drift is a *partial* commit and recovery must roll the
+    /// whole operation BACK rather than publish an incomplete state. Only the
+    /// `BranchMerge` writer records this today (its per-table publish is
+    /// append → upsert → delete, several HEAD advances that the manifest
+    /// publish makes atomic); other writers leave it `None` and keep their
+    /// existing loose roll-forward. Backward-compatible: absent on older
+    /// sidecars.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub confirmed_version: Option<u64>,
     /// Lance branch ref this table lives on (mirrors
     /// `SubTableEntry::table_branch`). Required for the recovery sweep
     /// to open the dataset at the correct ref — `Dataset::open(path)`
@@ -271,6 +285,14 @@ pub(crate) enum TableClassification {
     /// previous restore attempt or an external mutation. Roll back to
     /// the manifest pin.
     UnexpectedMultistep,
+    /// A confirmation-using writer (`BranchMerge`) advanced this table's HEAD
+    /// (`lance_head > manifest_pinned`) but the sidecar carries no
+    /// `confirmed_version` — its multi-commit publish crashed mid-flight, so
+    /// the drift is a *partial* commit (e.g. an append without its sibling
+    /// upsert/delete). Roll back to the manifest pin; the whole operation is
+    /// re-run from scratch. Distinct from `UnexpectedMultistep` so the audit
+    /// records a partial Phase B, not a foreign mutation.
+    IncompletePhaseB,
     /// `lance_head < manifest_pinned`. Should be impossible: the manifest
     /// pin can only advance after a successful Lance commit. Surface
     /// loudly and abort recovery.
@@ -339,6 +361,37 @@ pub(crate) async fn write_sidecar(
         operation_id: sidecar.operation_id.clone(),
         sidecar_uri: uri,
     })
+}
+
+/// Phase-B confirmation: stamp each pin with the exact Lance HEAD its publish
+/// reached, then re-write the sidecar in place (same object). Called once, after
+/// the writer's whole multi-commit publish completed and before the manifest
+/// publish (Phase C). Recovery then rolls forward ONLY to these confirmed
+/// versions; a sidecar still missing them is a partial Phase B that rolls back.
+///
+/// Overwriting the same object is atomic (same contract as [`write_sidecar`]):
+/// a torn rewrite is never observed, so recovery reads either the pre-confirm
+/// sidecar (→ roll back, safe) or the confirmed one (→ roll forward). A failure
+/// here leaves the pre-confirm sidecar, so the operation rolls back — correct.
+pub(crate) async fn confirm_sidecar_phase_b(
+    root_uri: &str,
+    storage: &dyn StorageAdapter,
+    sidecar: &mut RecoverySidecar,
+    confirmed_versions: &HashMap<String, u64>,
+) -> Result<()> {
+    // Failpoint: models a storage failure on the confirmation write — the
+    // pre-confirm sidecar stays on disk, so recovery rolls the operation back.
+    crate::failpoints::maybe_fail("recovery.sidecar_confirm")?;
+    for pin in &mut sidecar.tables {
+        if let Some(version) = confirmed_versions.get(&pin.table_key) {
+            pin.confirmed_version = Some(*version);
+        }
+    }
+    let uri = sidecar_uri(root_uri, &sidecar.operation_id);
+    let json = serde_json::to_string_pretty(sidecar).map_err(|err| {
+        OmniError::manifest_internal(format!("failed to serialize recovery sidecar: {}", err))
+    })?;
+    storage.write_text(&uri, &json).await
 }
 
 /// Delete a sidecar after Phase C succeeded. Idempotent (safe to retry).
@@ -427,21 +480,32 @@ pub(crate) fn parse_sidecar(sidecar_uri: &str, body: &str) -> Result<RecoverySid
 /// Classify one table's observed state vs. the sidecar's intent.
 ///
 /// `kind` adjusts the precision of the `RolledPastExpected` predicate:
+/// - **Confirmation** (`BranchMerge`): the writer's per-table publish is
+///   several HEAD advances (append → upsert → delete), so a bare
+///   `lance_head > manifest_pinned` is ambiguous — it may be a *complete*
+///   publish or a *partial* one crashed mid-sequence. The writer resolves
+///   the ambiguity by recording the exact achieved version
+///   (`confirmed_version`) only after the whole publish finished. So roll
+///   forward ONLY to that confirmed version; a missing confirmation is a
+///   partial commit (`IncompletePhaseB`) and rolls back. This is the safe
+///   form of the loose match for writers where a partial would publish an
+///   incomplete delta.
 /// - **Strict** (`Mutation`, `Load`): exactly one `commit_staged` per
 ///   table, so `lance_head == manifest_pinned + 1` AND
 ///   `post_commit_pin == lance_head` is required.
-/// - **Loose** (`SchemaApply`, `EnsureIndices`, `BranchMerge`,
-///   `Optimize`): the writer advances the Lance HEAD by N ≥ 1 commits
-///   per table (one per index built + one for the overwrite, etc.;
-///   merge tables run merge_insert + delete_where + index rebuilds;
-///   `Optimize` runs `compact_files`, which commits reserve-fragments +
-///   rewrite) and the exact N is hard to compute at sidecar-write time.
-///   The loose match accepts
+/// - **Loose** (`SchemaApply`, `EnsureIndices`, `Optimize`): the writer
+///   advances the Lance HEAD by N ≥ 1 commits per table (one per index
+///   built + one for the overwrite, etc.; `Optimize` runs `compact_files`,
+///   which commits reserve-fragments + rewrite) and the exact N is hard to
+///   compute at sidecar-write time. The loose match accepts
 ///   any `lance_head > manifest_pinned` as `RolledPastExpected` when
 ///   `pin.expected_version == manifest_pinned` (the writer's CAS
-///   target matches what the manifest currently shows). The risk this
-///   admits — an external agent advancing HEAD between sidecar write
-///   and recovery — is out of scope for the single-coordinator model.
+///   target matches what the manifest currently shows). This is safe for
+///   these writers because their drift is derived state (index coverage,
+///   compaction) the reconciler reproduces — a partial roll-forward loses
+///   no logical rows. The risk it admits — an external agent advancing HEAD
+///   between sidecar write and recovery — is out of scope for the
+///   single-coordinator model.
 pub(crate) fn classify_table(
     pin: &SidecarTablePin,
     lance_head: u64,
@@ -458,6 +522,22 @@ pub(crate) fn classify_table(
         return NoMovement;
     }
     // lance_head > manifest_pinned
+    if matches!(kind, SidecarKind::BranchMerge) {
+        // Two-phase confirmation: roll forward only to the exact version the
+        // writer recorded after its whole multi-commit publish completed. No
+        // confirmation ⇒ the publish crashed mid-sequence ⇒ partial ⇒ roll
+        // back. A confirmation that doesn't match the observed HEAD means a
+        // foreign writer advanced the table — don't roll a surprise forward.
+        return match pin.confirmed_version {
+            Some(confirmed)
+                if lance_head == confirmed && pin.expected_version == manifest_pinned =>
+            {
+                RolledPastExpected
+            }
+            Some(_) => UnexpectedMultistep,
+            None => IncompletePhaseB,
+        };
+    }
     let strict = matches!(kind, SidecarKind::Mutation | SidecarKind::Load);
     if strict {
         if lance_head == manifest_pinned + 1 {
@@ -496,7 +576,7 @@ pub(crate) fn decide(classifications: &[TableClassification]) -> SidecarDecision
     }
     if classifications
         .iter()
-        .any(|c| matches!(c, NoMovement | UnexpectedAtP1 | UnexpectedMultistep))
+        .any(|c| matches!(c, NoMovement | UnexpectedAtP1 | UnexpectedMultistep | IncompletePhaseB))
     {
         return RollBack;
     }
@@ -1112,6 +1192,7 @@ async fn roll_back_sidecar(
             TableClassification::RolledPastExpected
                 | TableClassification::UnexpectedAtP1
                 | TableClassification::UnexpectedMultistep
+                | TableClassification::IncompletePhaseB
         ) {
             restore_table_to_version(
                 &pin.table_path,
@@ -1573,6 +1654,7 @@ mod tests {
             table_path: table_path.to_string(),
             expected_version: expected,
             post_commit_pin: post,
+            confirmed_version: None,
             table_branch: None,
         }
     }
@@ -1705,18 +1787,35 @@ mod tests {
         );
     }
 
-    /// BranchMerge must be loose-matched, not strict: while the strict
-    /// classifier expects exactly one `commit_staged` per table,
-    /// `publish_rewritten_merge_table` runs multiple per table
-    /// (merge_insert + delete_where + index rebuilds — the comment in
-    /// `merge.rs` explicitly says so). Strict classification would roll
-    /// back valid completed Phase B work as `UnexpectedMultistep`.
+    /// BranchMerge advances each table by several commits per table
+    /// (adopt: append + upsert + delete; three-way: merge_insert + delete +
+    /// index), so a bare "HEAD moved" is ambiguous between a complete and a
+    /// partial publish. The two-phase confirmation resolves it: roll forward
+    /// ONLY to the recorded `confirmed_version`; an unconfirmed moved HEAD is
+    /// a partial publish (`IncompletePhaseB` ⇒ roll back), and a confirmed
+    /// version that doesn't match the observed HEAD is a foreign advance
+    /// (`UnexpectedMultistep` ⇒ roll back).
     #[test]
-    fn classify_loose_match_accepts_multi_commit_drift_for_branch_merge() {
-        let pin = make_pin("node:Person", "irrelevant", 5, 6);
+    fn classify_branch_merge_requires_phase_b_confirmation() {
+        // Unconfirmed multi-commit drift → partial Phase B → roll back.
+        let unconfirmed = make_pin("node:Person", "irrelevant", 5, 6);
         assert_eq!(
-            classify_table(&pin, 8, 5, SidecarKind::BranchMerge),
+            classify_table(&unconfirmed, 8, 5, SidecarKind::BranchMerge),
+            TableClassification::IncompletePhaseB,
+        );
+        // Confirmed to the observed HEAD → complete Phase B → roll forward.
+        let confirmed = SidecarTablePin {
+            confirmed_version: Some(8),
+            ..make_pin("node:Person", "irrelevant", 5, 6)
+        };
+        assert_eq!(
+            classify_table(&confirmed, 8, 5, SidecarKind::BranchMerge),
             TableClassification::RolledPastExpected,
+        );
+        // Confirmed, but HEAD drifted past it (foreign writer) → roll back.
+        assert_eq!(
+            classify_table(&confirmed, 9, 5, SidecarKind::BranchMerge),
+            TableClassification::UnexpectedMultistep,
         );
     }
 
