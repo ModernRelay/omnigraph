@@ -849,6 +849,13 @@ pub(crate) struct QueriesListItem {
     pub(crate) mcp_expose: bool,
     pub(crate) tool_name: Option<String>,
     pub(crate) mutation: bool,
+    /// `@description` from the query declaration — what the query is for.
+    /// Carried so the CLI catalog matches the HTTP `GET /queries` surface.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) description: Option<String>,
+    /// `@instruction` from the query declaration — how/when to invoke it.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) instruction: Option<String>,
     pub(crate) params: Vec<QueriesParam>,
 }
 

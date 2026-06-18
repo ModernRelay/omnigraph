@@ -893,6 +893,8 @@ pub(crate) async fn execute_queries_list(
                 mcp_expose: q.expose,
                 tool_name: q.tool_name.clone(),
                 mutation: q.is_mutation(),
+                description: q.decl.description.clone(),
+                instruction: q.decl.instruction.clone(),
                 params: q
                     .decl
                     .params
@@ -933,6 +935,12 @@ pub(crate) async fn execute_queries_list(
                 String::new()
             };
             println!("{kind}  {}({params}){mcp}", q.name);
+            if let Some(description) = &q.description {
+                println!("    description: {description}");
+            }
+            if let Some(instruction) = &q.instruction {
+                println!("    instruction: {instruction}");
+            }
         }
     }
     Ok(())
