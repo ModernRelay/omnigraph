@@ -362,6 +362,9 @@ where
                 table_path: db.storage().dataset_uri(&entry.table_path),
                 expected_version: entry.table_version,
                 post_commit_pin: entry.table_version + 1,
+                // SchemaApply uses the loose match, not BranchMerge's Phase-B
+                // confirmation — left None.
+                confirmed_version: None,
                 table_branch: entry.table_branch.clone(),
             })
         })
