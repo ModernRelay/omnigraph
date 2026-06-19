@@ -13,7 +13,6 @@ use serde_json::Value;
 use serial_test::serial;
 use tower::ServiceExt;
 
-
 mod support;
 use support::*;
 
@@ -414,7 +413,7 @@ async fn cluster_boot_serves_applied_state() {
     assert!(server_policy.is_none());
 
     let state =
-        omnigraph_server::open_multi_graph_state(graphs, Vec::new(), None, config_path)
+        omnigraph_server::open_multi_graph_state(graphs, Vec::new(), None, config_path, false)
             .await
             .unwrap();
     let app = build_app(state);
@@ -424,7 +423,10 @@ async fn cluster_boot_serves_applied_state() {
     // GET /graphs refuses even in cluster mode.
     let (status, body) = json_response(
         &app,
-        Request::builder().uri("/graphs").body(Body::empty()).unwrap(),
+        Request::builder()
+            .uri("/graphs")
+            .body(Body::empty())
+            .unwrap(),
     )
     .await;
     assert_eq!(status, StatusCode::FORBIDDEN, "{body}");
@@ -458,6 +460,115 @@ async fn cluster_boot_serves_applied_state() {
     )
     .await;
     assert_eq!(status, StatusCode::OK, "{body}");
+}
+
+#[tokio::test]
+async fn cluster_boot_quarantines_graph_open_failures() {
+    let temp = tempfile::tempdir().unwrap();
+    let schema = "\nnode Person {\n  name: String @key\n}\n";
+    let good_uri = temp.path().join("good.omni");
+    Omnigraph::init(good_uri.to_string_lossy().as_ref(), schema)
+        .await
+        .unwrap();
+    let bad_uri = temp.path().join("missing.omni");
+    let server_policy = omnigraph_server::PolicySource::Inline(
+        r#"
+version: 1
+kind: server
+groups:
+  admins: [act-admin]
+rules:
+  - id: admins-list-graphs
+    allow:
+      actors: { group: admins }
+      actions: [graph_list]
+"#
+        .to_string(),
+    );
+    let graphs = vec![
+        omnigraph_server::GraphStartupConfig {
+            graph_id: "broken".to_string(),
+            uri: bad_uri.to_string_lossy().to_string(),
+            policy: None,
+            embedding: None,
+            queries: stored_query_registry(&[]),
+        },
+        omnigraph_server::GraphStartupConfig {
+            graph_id: "good".to_string(),
+            uri: good_uri.to_string_lossy().to_string(),
+            policy: None,
+            embedding: None,
+            queries: stored_query_registry(&[]),
+        },
+    ];
+    let strict_err = match omnigraph_server::open_multi_graph_state(
+        graphs.clone(),
+        vec![("act-admin".to_string(), "admin-token".to_string())],
+        Some(&server_policy),
+        temp.path().join("cluster.yaml"),
+        true,
+    )
+    .await
+    {
+        Ok(_) => panic!("strict startup should reject a failed graph open"),
+        Err(err) => err,
+    };
+    assert!(
+        strict_err
+            .to_string()
+            .contains("strict multi-graph startup requires every graph to open"),
+        "{strict_err}"
+    );
+    let state = omnigraph_server::open_multi_graph_state(
+        graphs,
+        vec![("act-admin".to_string(), "admin-token".to_string())],
+        Some(&server_policy),
+        temp.path().join("cluster.yaml"),
+        false,
+    )
+    .await
+    .unwrap();
+    let mut ready: Vec<_> = state
+        .routing()
+        .registry
+        .list()
+        .iter()
+        .map(|handle| handle.key.graph_id.as_str().to_string())
+        .collect();
+    ready.sort();
+    assert_eq!(ready, vec!["good"]);
+    let app = build_app(state);
+
+    let (status, body) = json_response(
+        &app,
+        Request::builder()
+            .uri("/graphs")
+            .header("authorization", "Bearer admin-token")
+            .body(Body::empty())
+            .unwrap(),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(
+        body["graphs"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|graph| graph["graph_id"].as_str().unwrap())
+            .collect::<Vec<_>>(),
+        vec!["good"]
+    );
+
+    let (status, body) = json_response(
+        &app,
+        Request::builder()
+            .uri("/graphs/broken/queries")
+            .header("authorization", "Bearer admin-token")
+            .body(Body::empty())
+            .unwrap(),
+    )
+    .await;
+    assert_eq!(status, StatusCode::NOT_FOUND, "{body}");
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -555,6 +666,7 @@ graphs:
         Vec::new(),
         server_policy.as_ref(),
         config_path,
+        false,
     )
     .await
     .unwrap();
@@ -665,7 +777,10 @@ async fn cluster_boot_wires_policy_bindings_into_cedar_slots() {
         .unwrap();
         fs::write(
             temp.path().join("cluster.policy.yaml"),
-            permit_all_policy_yaml(&["default"]).replace("protected_branches: [main]\n", "protected_branches: [main]\nkind: server\n"),
+            permit_all_policy_yaml(&["default"]).replace(
+                "protected_branches: [main]\n",
+                "protected_branches: [main]\nkind: server\n",
+            ),
         )
         .unwrap();
         fs::write(
@@ -719,7 +834,7 @@ graphs:
 async fn cluster_boot_refusals() {
     // RFC-011 cluster-only: with no --cluster, boot refuses with the
     // cluster-required remedy.
-    let err = omnigraph_server::load_server_settings(None, None, true)
+    let err = omnigraph_server::load_server_settings(None, None, true, false)
         .await
         .unwrap_err();
     assert!(err.to_string().contains("boots from a cluster"), "{err}");
@@ -729,7 +844,12 @@ async fn cluster_boot_refusals() {
 
     // Tampered catalog blob refuses boot with the remedy.
     let blob_dir = dir.join("__cluster/resources/query/knowledge/find_person");
-    let blob = fs::read_dir(&blob_dir).unwrap().next().unwrap().unwrap().path();
+    let blob = fs::read_dir(&blob_dir)
+        .unwrap()
+        .next()
+        .unwrap()
+        .unwrap()
+        .path();
     fs::write(&blob, "tampered").unwrap();
     let err = cluster_settings(&dir).await.unwrap_err();
     assert!(

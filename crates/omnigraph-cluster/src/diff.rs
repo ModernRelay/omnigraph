@@ -18,6 +18,7 @@ pub(crate) fn diff_resources(
                 disposition: None,
                 reason: None,
                 binding_change: false,
+                metadata_change: None,
                 migration: None,
             }),
             Some(before) if before != after => changes.push(PlanChange {
@@ -28,6 +29,7 @@ pub(crate) fn diff_resources(
                 disposition: None,
                 reason: None,
                 binding_change: false,
+                metadata_change: None,
                 migration: None,
             }),
             Some(_) => {}
@@ -43,6 +45,7 @@ pub(crate) fn diff_resources(
                 disposition: None,
                 reason: None,
                 binding_change: false,
+                metadata_change: None,
                 migration: None,
             });
         }
@@ -82,6 +85,47 @@ pub(crate) fn append_policy_binding_changes(
             disposition: None,
             reason: None,
             binding_change: true,
+            metadata_change: Some(PlanMetadataChange::PolicyBindings),
+            migration: None,
+        });
+    }
+    changes.sort_by(|a, b| a.resource.cmp(&b.resource));
+}
+
+/// Metadata-only embedding provider changes: the provider digest is unchanged
+/// but the applied state predates storing the profile body needed by
+/// config-free serving. This mirrors policy binding backfill instead of
+/// hiding a serving-time failure behind a no-op plan.
+pub(crate) fn append_embedding_profile_changes(
+    changes: &mut Vec<PlanChange>,
+    prior_state: Option<&ClusterState>,
+    desired: &DesiredCluster,
+) {
+    let Some(state) = prior_state else {
+        return; // no state: provider Creates carry profiles already
+    };
+    for (address, desired_profile) in &desired.embedding_providers {
+        if changes
+            .iter()
+            .any(|change| change.resource.as_str() == address.as_str())
+        {
+            continue; // content change already covers it
+        }
+        let Some(entry) = state.applied_revision.resources.get(address) else {
+            continue; // not applied yet: the Create covers it
+        };
+        if entry.embedding_profile.as_ref() == Some(desired_profile) {
+            continue;
+        }
+        changes.push(PlanChange {
+            resource: address.clone(),
+            operation: PlanOperation::Update,
+            before_digest: Some(entry.digest.clone()),
+            after_digest: Some(entry.digest.clone()),
+            disposition: None,
+            reason: None,
+            binding_change: false,
+            metadata_change: Some(PlanMetadataChange::EmbeddingProfile),
             migration: None,
         });
     }

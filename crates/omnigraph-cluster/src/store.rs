@@ -250,7 +250,14 @@ impl ClusterStore {
     /// Best-effort object removal (sidecar retirement after a CAS lands,
     /// lock cleanup) — failures are recoverable by the next sweep.
     pub(crate) async fn delete_object(&self, uri: &str) {
-        let _ = self.adapter.delete(uri).await;
+        let _ = self.try_delete_object(uri).await;
+    }
+
+    /// Like `delete_object` but surfaces the failure, so a caller that depends
+    /// on the deletion (e.g. the pre-movement sidecar cleanup fast-path) can
+    /// report it as a diagnostic instead of silently leaving stale state.
+    pub(crate) async fn try_delete_object(&self, uri: &str) -> Result<(), String> {
+        self.adapter.delete(uri).await.map_err(|err| err.to_string())
     }
 
     /// Recursive prefix delete for graph roots (approved deletes). Idempotent;
