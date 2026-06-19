@@ -1895,7 +1895,15 @@ async fn scan_pending_batches(
     filter: Option<&str>,
 ) -> Result<Vec<RecordBatch>> {
     let schema = pending_schema.unwrap_or_else(|| pending_batches[0].schema());
-    let ctx = datafusion::execution::context::SessionContext::new();
+    // #283: disable SQL identifier normalization so an unquoted camelCase
+    // column in `filter` (e.g. `repoName = 'acme'`, emitted unquoted by
+    // `predicate_to_sql` because the committed Lance scan needs it unquoted)
+    // is matched case-preserving against the case-sensitive MemTable schema.
+    // Without this, DataFusion lowercases `repoName` → `reponame` and fails to
+    // resolve. Quoted identifiers (the projection list below) are unaffected.
+    let mut config = datafusion::execution::context::SessionConfig::new();
+    config.options_mut().sql_parser.enable_ident_normalization = false;
+    let ctx = datafusion::execution::context::SessionContext::new_with_config(config);
     let mem = datafusion::datasource::MemTable::try_new(schema, vec![pending_batches.to_vec()])
         .map_err(|e| OmniError::Lance(e.to_string()))?;
     ctx.register_table("pending", Arc::new(mem))

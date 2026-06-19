@@ -991,3 +991,80 @@ async fn unenforced_primary_key_is_immutable_once_set() {
          — revisit migrate_v1_to_v2's field-guard and re-pin docs/dev/lance.md."
     );
 }
+
+// --- Guard 20: camelCase @index equality routes to the scalar index (#283) ----
+//
+// The #283 read-pushdown fix builds the filter column with datafusion `ident()`
+// (case-preserving) instead of `col()` (SQL identifier normalization, which
+// lowercases an unquoted name). The correctness tests in literal_filters.rs /
+// writes.rs prove the right rows come back, but a result-only assertion also
+// passes on a full-scan fallback — exactly the gap testing.md warns about. This
+// guard pins the *plan*: an equality on a camelCase BTREE column must compile to
+// a `ScalarIndexQuery` under the fix's expr shape, and must NOT under the old
+// `col()` shape (which lowercases `repoName` → a nonexistent `reponame`). A
+// regression that breaks camelCase index routing — or a revert to `col()` —
+// turns this red instead of silently degrading to a full scan.
+#[tokio::test]
+async fn camelcase_index_equality_routes_to_scalar_index() {
+    use datafusion::physical_plan::displayable;
+    use datafusion::prelude::{col, ident, lit};
+
+    let dir = tempfile::tempdir().unwrap();
+    let uri = dir.path().join("camelcase_index.lance");
+    let uri = uri.to_str().unwrap();
+
+    let schema = Arc::new(Schema::new(vec![
+        Field::new("id", DataType::Utf8, false),
+        Field::new("repoName", DataType::Utf8, false),
+    ]));
+    let batch = RecordBatch::try_new(
+        schema.clone(),
+        vec![
+            Arc::new(StringArray::from(vec!["a", "b", "c", "d"])),
+            Arc::new(StringArray::from(vec![
+                "acme", "globex", "initech", "umbrella",
+            ])),
+        ],
+    )
+    .unwrap();
+    let reader = RecordBatchIterator::new(vec![Ok(batch)], schema);
+    let params = WriteParams {
+        mode: WriteMode::Create,
+        enable_stable_row_ids: true,
+        data_storage_version: Some(LanceFileVersion::V2_2),
+        ..Default::default()
+    };
+    let mut ds = Dataset::write(reader, uri, Some(params)).await.unwrap();
+    ds.create_index_builder(&["repoName"], IndexType::BTree, &ScalarIndexParams::default())
+        .replace(true)
+        .await
+        .unwrap();
+
+    async fn plan_str(ds: &Dataset, filter: datafusion::prelude::Expr) -> lance::Result<String> {
+        let mut scanner = ds.scan();
+        scanner.filter_expr(filter);
+        let plan = scanner.create_plan().await?;
+        Ok(format!("{}", displayable(plan.as_ref()).indent(true)))
+    }
+
+    // The fix's shape: ident() preserves case → resolves `repoName` → index.
+    let used = plan_str(&ds, ident("repoName").eq(lit("acme")))
+        .await
+        .expect("ident(\"repoName\") must plan against the case-preserved schema");
+    assert!(
+        used.contains("ScalarIndexQuery"),
+        "camelCase @index equality must route to the scalar index (not full scan), got:\n{used}"
+    );
+
+    // The pre-fix shape: col() normalizes `repoName` → `reponame`, which does not
+    // exist in the case-sensitive schema, so planning fails. This is precisely
+    // why `col()` could never reach the index and surfaced the #283 runtime error
+    // — it could not silently full-scan past the index either.
+    let err = plan_str(&ds, col("repoName").eq(lit("acme"))).await;
+    assert!(
+        err.is_err(),
+        "col() lowercases repoName→reponame against a case-sensitive schema; \
+         planning must fail rather than resolve, confirming ident() is required \
+         for camelCase index routing. got plan:\n{err:?}"
+    );
+}

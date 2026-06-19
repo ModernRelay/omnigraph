@@ -1646,3 +1646,70 @@ async fn branch_cascade_delete_forks_node_and_edges_under_held_queues() {
         "main must be untouched by the branch delete"
     );
 }
+
+// #283: a mutation predicate (`where camelField = ...`) on a camelCase column
+// must execute, not fail at the Lance scan with "No field named ...". Covers
+// both `update` (committed scan via scan_with_pending) and `delete`
+// (delete_where), which share the same emitted SQL filter string.
+const CC_SCHEMA: &str = r#"
+node Doc {
+    slug: String @key
+    repoName: String @index
+    status: String?
+}
+"#;
+const CC_DATA: &str = r#"{"type":"Doc","data":{"slug":"d1","repoName":"acme","status":"open"}}
+{"type":"Doc","data":{"slug":"d2","repoName":"globex","status":"open"}}"#;
+
+#[tokio::test]
+async fn camelcase_mutation_predicate_updates_and_deletes() {
+    let dir = tempfile::tempdir().unwrap();
+    let uri = dir.path().to_str().unwrap();
+    let mut db = Omnigraph::init(uri, CC_SCHEMA).await.unwrap();
+    load_jsonl(&mut db, CC_DATA, LoadMode::Overwrite).await.unwrap();
+
+    let m = r#"
+query set_status($repo: String, $st: String) { update Doc set { status: $st } where repoName = $repo }
+query del($repo: String) { delete Doc where repoName = $repo }
+"#;
+
+    let upd = db
+        .mutate("main", m, "set_status", &params(&[("$repo", "acme"), ("$st", "closed")]))
+        .await
+        .expect("update with a camelCase predicate must execute");
+    assert_eq!(upd.affected_nodes, 1, "exactly the acme Doc should update");
+
+    let del = db
+        .mutate("main", m, "del", &params(&[("$repo", "globex")]))
+        .await
+        .expect("delete with a camelCase predicate must execute");
+    assert_eq!(del.affected_nodes, 1, "exactly the globex Doc should delete");
+
+    assert_eq!(count_rows(&db, "node:Doc").await, 1, "one Doc (acme) should remain");
+}
+
+// #283 (pending side): a chained mutation whose 2nd op filters a camelCase
+// column must read op-1's staged rows through the pending DataFusion `MemTable`
+// (`SELECT … WHERE {filter}` via ctx.sql), which lowercases unquoted idents.
+// This is the path the single update/delete above does NOT exercise.
+#[tokio::test]
+async fn camelcase_chained_mutation_reads_pending_by_camelcase() {
+    let dir = tempfile::tempdir().unwrap();
+    let uri = dir.path().to_str().unwrap();
+    let mut db = Omnigraph::init(uri, CC_SCHEMA).await.unwrap();
+    load_jsonl(&mut db, CC_DATA, LoadMode::Overwrite).await.unwrap();
+
+    // op-1 stages a status change to the acme Doc; op-2 re-filters the same
+    // camelCase column, so it must match op-1's pending row.
+    let m = r#"
+query chain($repo: String) {
+    update Doc set { status: "stage1" } where repoName = $repo
+    update Doc set { status: "stage2" } where repoName = $repo
+}
+"#;
+    let r = db
+        .mutate("main", m, "chain", &params(&[("$repo", "acme")]))
+        .await
+        .expect("chained camelCase mutation must read the pending row, not fail at the MemTable SELECT");
+    assert_eq!(r.affected_nodes, 2, "both ops should touch the acme Doc (read-your-writes)");
+}

@@ -62,6 +62,16 @@ The `docs/rfcs/` track is the **public, externally-authorable** RFC process. The
 maintainer/internal RFCs below (`rfc-00N-*.md`) are a separate, team-owned
 track; don't conflate the two.
 
+## Case Studies
+
+Worked write-ups of specific bugs — root cause, fix, and the reasoning that
+ruled out the tempting-but-wrong alternatives. Read these for the debugging
+pattern, not just the outcome.
+
+| Area | Read |
+|---|---|
+| camelCase property filters lowercased at runtime (#283) — two engine→Lance boundaries, two different fixes | [bug-case-fix.md](bug-case-fix.md) |
+
 ## Active Implementation Plans
 
 Working documents for in-flight feature work. Removed when the work lands.
