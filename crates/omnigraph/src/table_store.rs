@@ -24,7 +24,7 @@ use lance_table::format::{Fragment, IndexMetadata, RowIdMeta};
 use lance_table::rowids::{RowIdSequence, write_row_ids};
 use std::sync::Arc;
 
-use crate::db::manifest::{TableVersionMetadata, open_table_head_for_write};
+use crate::db::manifest::TableVersionMetadata;
 use crate::db::{Snapshot, SubTableEntry};
 use crate::error::{OmniError, Result};
 use crate::storage_layer::ForkOutcome;
@@ -160,9 +160,15 @@ impl TableStore {
         dataset_uri: &str,
         branch: Option<&str>,
     ) -> Result<Dataset> {
-        let ds = Dataset::open(dataset_uri)
-            .await
-            .map_err(|e| OmniError::Lance(e.to_string()))?;
+        // Direct open by URI (O(1) latest-resolution). Routed through the tracked
+        // opener so a cost test counts it via the per-query `table_wrapper`
+        // (no-op in production — the task-local is unset, so this is exactly
+        // `Dataset::open(uri)`).
+        let ds = crate::instrumentation::open_dataset_tracked(
+            dataset_uri,
+            crate::instrumentation::table_wrapper(),
+        )
+        .await?;
         match branch {
             Some(branch) if branch != "main" => ds
                 .checkout_branch(branch)
@@ -178,8 +184,14 @@ impl TableStore {
         dataset_uri: &str,
         branch: Option<&str>,
     ) -> Result<Dataset> {
-        let table_path = self.table_path_from_dataset_uri(dataset_uri)?;
-        open_table_head_for_write(&self.root_uri, table_key, &table_path, branch).await
+        // RFC-013 step 3a: open writes via the direct opener (O(1)) instead of the
+        // lance-namespace builder, which re-resolved the table's version chain
+        // O(depth) per write. The namespace is a catalog/discovery layer, not a
+        // per-open hot-path component (RFC §2.4); the manifest already holds the
+        // location, and `ensure_expected_version` still validates head == pinned
+        // for strict ops. `table_key` retained for signature stability.
+        let _ = table_key;
+        self.open_dataset_head(dataset_uri, branch).await
     }
 
     pub async fn delete_branch(&self, dataset_uri: &str, branch: &str) -> Result<()> {
