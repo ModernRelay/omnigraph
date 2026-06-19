@@ -284,6 +284,29 @@ fn queries_list_surfaces_description_and_instruction() {
 }
 
 #[test]
+fn queries_list_indents_multiline_annotation_continuation() {
+    // GQ string literals admit newlines, so a `@description`/`@instruction`
+    // can be multiline. Human output must indent continuation lines to align
+    // under the first rather than breaking back to the left margin.
+    let cluster = converged_cluster_with_query(
+        "multi.gq",
+        "query multi($name: String) \
+            @description(\"line one\\nline two\") \
+            { match { $p: Person { name: $name } } return { $p.age } }",
+        "      multi:\n        file: ./multi.gq\n",
+    );
+    let output = output_success(
+        cli().arg("queries").arg("list").arg("--cluster").arg(cluster.path()),
+    );
+    let stdout = stdout_string(&output);
+    // "    description: " is 17 chars wide; the continuation aligns under it.
+    assert!(
+        stdout.contains("    description: line one\n                 line two"),
+        "multiline annotation must indent the continuation; stdout:\n{stdout}"
+    );
+}
+
+#[test]
 fn queries_list_omits_annotations_when_absent() {
     // The other half of the contract: a query that declares neither annotation
     // prints no extra lines and omits both JSON fields entirely. This keeps the

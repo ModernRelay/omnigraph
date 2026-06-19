@@ -875,6 +875,25 @@ pub(crate) async fn execute_queries_validate(
     Ok(())
 }
 
+/// Print a stored-query annotation under its `queries list` entry. A
+/// `@description`/`@instruction` value may be multiline (GQ string literals
+/// admit newlines); continuation lines are indented to align under the first
+/// so the catalog stays readable instead of breaking the left margin.
+fn print_query_annotation(label: &str, value: &str) {
+    let prefix = format!("    {label}: ");
+    let continuation = " ".repeat(prefix.len());
+    let mut lines = value.split('\n');
+    match lines.next() {
+        Some(first) => {
+            println!("{prefix}{first}");
+            for line in lines {
+                println!("{continuation}{line}");
+            }
+        }
+        None => println!("{prefix}"),
+    }
+}
+
 /// `queries list --cluster <dir>` (RFC-011): list the catalog's stored queries.
 /// With `--graph`, scope to one graph.
 pub(crate) async fn execute_queries_list(
@@ -936,10 +955,10 @@ pub(crate) async fn execute_queries_list(
             };
             println!("{kind}  {}({params}){mcp}", q.name);
             if let Some(description) = &q.description {
-                println!("    description: {description}");
+                print_query_annotation("description", description);
             }
             if let Some(instruction) = &q.instruction {
-                println!("    instruction: {instruction}");
+                print_query_annotation("instruction", instruction);
             }
         }
     }
