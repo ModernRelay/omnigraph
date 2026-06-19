@@ -17,7 +17,12 @@ if [ -n "${OMNIGRAPH_CLUSTER:-}" ]; then
     echo "OMNIGRAPH_CLUSTER is an exclusive boot source; unset OMNIGRAPH_TARGET_URI/OMNIGRAPH_CONFIG/OMNIGRAPH_TARGET" >&2
     exit 64
   fi
-  exec "$SERVER_BIN" --cluster "${OMNIGRAPH_CLUSTER}" --bind "${bind}"
+  set -- --cluster "${OMNIGRAPH_CLUSTER}" --bind "${bind}"
+  case "${OMNIGRAPH_REQUIRE_ALL_GRAPHS:-}" in
+    ""|0|false|FALSE) ;;
+    *) set -- "$@" --require-all-graphs ;;
+  esac
+  exec "$SERVER_BIN" "$@"
 fi
 
 # URI comes from the env var (the positional arg wins over any config
@@ -46,6 +51,8 @@ omnigraph-server container startup requires one of:
 
 Optional:
   - OMNIGRAPH_BIND (default: 0.0.0.0:8080)
+  - OMNIGRAPH_REQUIRE_ALL_GRAPHS (cluster mode: fail startup unless every
+    applied graph is healthy)
   - OMNIGRAPH_TARGET (used with OMNIGRAPH_CONFIG)
   - OMNIGRAPH_CONFIG (may also accompany OMNIGRAPH_TARGET_URI to add a
     policy file; the URI still comes from OMNIGRAPH_TARGET_URI)

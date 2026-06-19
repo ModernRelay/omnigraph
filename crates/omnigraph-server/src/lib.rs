@@ -1,9 +1,9 @@
 pub mod api;
 mod handlers;
 mod settings;
-pub use settings::{load_server_settings, classify_server_runtime_state, ServerRuntimeState};
-use settings::*;
 use handlers::*;
+use settings::*;
+pub use settings::{ServerRuntimeState, classify_server_runtime_state, load_server_settings};
 pub mod auth;
 pub mod graph_id;
 pub mod identity;
@@ -29,10 +29,10 @@ use api::{
     BranchCreateOutput, BranchCreateRequest, BranchDeleteOutput, BranchListOutput,
     BranchMergeOutput, BranchMergeRequest, ChangeOutput, ChangeRequest, CommitListOutput,
     CommitListQuery, ErrorCode, ErrorOutput, ExportRequest, GraphInfo, GraphListResponse,
-    HealthOutput, IngestOutput, IngestRequest, InvokeStoredQueryRequest,
-    InvokeStoredQueryResponse, QueriesCatalogOutput, QueryRequest, ReadOutput, ReadRequest,
-    SchemaApplyOutput, SchemaApplyRequest, SchemaOutput, SnapshotQuery, ingest_output,
-    schema_apply_output, snapshot_payload,
+    HealthOutput, IngestOutput, IngestRequest, InvokeStoredQueryRequest, InvokeStoredQueryResponse,
+    QueriesCatalogOutput, QueryRequest, ReadOutput, ReadRequest, SchemaApplyOutput,
+    SchemaApplyRequest, SchemaOutput, SnapshotQuery, ingest_output, schema_apply_output,
+    snapshot_payload,
 };
 pub use auth::{AWS_SECRET_ENV, EnvOrFileTokenSource, TokenSource, resolve_token_source};
 use axum::body::{Body, Bytes};
@@ -166,6 +166,10 @@ pub struct ServerConfig {
     /// who set up auth and forgot the policy file would otherwise ship
     /// the illusion of protection.
     pub allow_unauthenticated: bool,
+    /// Operator opt-in for fail-fast cluster boot. By default, graph-local
+    /// startup failures quarantine that graph and healthy graphs still serve.
+    /// When true, any quarantined or failed graph aborts startup.
+    pub require_all_graphs: bool,
 }
 
 /// What `load_server_settings` produces. RFC-011 cluster-only: the
@@ -303,7 +307,14 @@ impl AppState {
     ) -> Self {
         let bearer_tokens = hash_bearer_tokens(bearer_tokens);
         let per_graph_policy = policy_engine.map(Arc::new);
-        Self::build_single_mode(uri, db, bearer_tokens, per_graph_policy, Arc::new(workload), None)
+        Self::build_single_mode(
+            uri,
+            db,
+            bearer_tokens,
+            per_graph_policy,
+            Arc::new(workload),
+            None,
+        )
     }
 
     /// Like `new_single`, but attaches a pre-validated stored-query
@@ -420,13 +431,8 @@ impl AppState {
         bearer_tokens: Vec<(String, String)>,
         policy_file: Option<&PathBuf>,
     ) -> Result<Self> {
-        Self::open_single_with_queries(
-            uri,
-            bearer_tokens,
-            policy_file,
-            QueryRegistry::default(),
-        )
-        .await
+        Self::open_single_with_queries(uri, bearer_tokens, policy_file, QueryRegistry::default())
+            .await
     }
 
     /// Single-mode boot with a stored-query registry: open the engine,
@@ -509,8 +515,7 @@ impl AppState {
         // reserved id `default` — both the registry key and the URL
         // segment (`/graphs/default/...`).
         let uri = normalize_root_uri(&uri).unwrap_or(uri);
-        let graph_id =
-            GraphId::try_from("default").expect("'default' is a valid GraphId");
+        let graph_id = GraphId::try_from("default").expect("'default' is a valid GraphId");
         let key = GraphKey::cluster(graph_id);
         let handle = Arc::new(GraphHandle {
             key,
@@ -889,15 +894,21 @@ pub fn build_app(state: AppState) -> Router {
         // flagged and their responses include RFC 9745 Deprecation +
         // RFC 8288 Link headers. Suppress the call-site warning for the
         // route registration itself.
-        .route("/read", post({
-            #[allow(deprecated)]
-            server_read
-        }))
+        .route(
+            "/read",
+            post({
+                #[allow(deprecated)]
+                server_read
+            }),
+        )
         .route("/query", post(server_query))
-        .route("/change", post({
-            #[allow(deprecated)]
-            server_change
-        }))
+        .route(
+            "/change",
+            post({
+                #[allow(deprecated)]
+                server_change
+            }),
+        )
         .route("/mutate", post(server_mutate))
         .route("/queries", get(server_list_queries))
         .route("/queries/{name}", post(server_invoke_query))
@@ -1013,7 +1024,14 @@ pub async fn serve(config: ServerConfig) -> Result<()> {
                 config = %config_path.display(),
                 "serving omnigraph"
             );
-            open_multi_graph_state(graphs, tokens, server_policy.as_ref(), config_path).await?
+            open_multi_graph_state(
+                graphs,
+                tokens,
+                server_policy.as_ref(),
+                config_path,
+                config.require_all_graphs,
+            )
+            .await?
         }
     };
 
@@ -1033,9 +1051,9 @@ fn load_graph_policy(source: &PolicySource, graph_id: &str) -> Result<PolicyEngi
 }
 
 /// Parallel open of every graph in the startup config, with bounded
-/// concurrency (`buffer_unordered(4)`). Fail-fast — the first open error
-/// aborts startup; other in-flight opens are dropped (their `Omnigraph`
-/// instances close cleanly via Arc drop).
+/// concurrency (`buffer_unordered(4)`). Graph-specific open failures
+/// quarantine that graph; startup succeeds as long as at least one graph
+/// opens.
 ///
 /// The bound 4 is a rule-of-thumb for I/O-bound work. At N ≤ 10 this
 /// trades startup latency for a small amount of concurrent S3 / Lance
@@ -1045,8 +1063,9 @@ pub async fn open_multi_graph_state(
     tokens: Vec<(String, String)>,
     server_policy_source: Option<&PolicySource>,
     config_path: PathBuf,
+    require_all_graphs: bool,
 ) -> Result<AppState> {
-    use futures::{StreamExt, TryStreamExt};
+    use futures::StreamExt;
 
     if graphs.is_empty() {
         bail!("multi-graph mode requires at least one graph in the `graphs:` map");
@@ -1058,21 +1077,48 @@ pub async fn open_multi_graph_state(
     // `Omnigraph::Server::"root"` entity at evaluation time.
     let server_policy = match server_policy_source {
         Some(PolicySource::File(path)) => Some(PolicyEngine::load_server(path)?),
-        Some(PolicySource::Inline(source)) => {
-            Some(PolicyEngine::load_server_from_source(source)?)
-        }
+        Some(PolicySource::Inline(source)) => Some(PolicyEngine::load_server_from_source(source)?),
         None => None,
     };
 
-    // `try_collect` propagates the first error eagerly, dropping every
-    // in-flight open. `buffer_unordered + collect::<Vec<_>>` would drain
-    // the stream before checking errors — incorrect for the docstring's
-    // "fail-fast" claim and wasteful on S3-backed graphs.
-    let handles: Vec<Arc<GraphHandle>> = futures::stream::iter(graphs.into_iter())
-        .map(|cfg| async move { open_single_graph(cfg).await })
+    let configured_graphs = graphs.len();
+    let results = futures::stream::iter(graphs.into_iter())
+        .map(|cfg| async move {
+            let graph_id = cfg.graph_id.clone();
+            open_single_graph(cfg).await.map_err(|err| (graph_id, err))
+        })
         .buffer_unordered(4)
-        .try_collect()
-        .await?;
+        .collect::<Vec<_>>()
+        .await;
+    let mut handles = Vec::new();
+    let mut failed = 0usize;
+    for result in results {
+        match result {
+            Ok(handle) => handles.push(handle),
+            Err((graph_id, err)) => {
+                failed += 1;
+                warn!(
+                    graph_id = %graph_id,
+                    error = %err,
+                    "graph quarantined during startup"
+                );
+            }
+        }
+    }
+    if require_all_graphs && failed > 0 {
+        bail!(
+            "strict multi-graph startup requires every graph to open ({} configured, {} failed)",
+            configured_graphs,
+            failed
+        );
+    }
+    if handles.is_empty() {
+        bail!(
+            "no healthy graphs opened from multi-graph startup config ({} configured, {} failed)",
+            configured_graphs,
+            failed
+        );
+    }
 
     let workload = workload::WorkloadController::from_env();
     let state = AppState::new_multi(handles, tokens, server_policy, workload, Some(config_path))

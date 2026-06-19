@@ -10,8 +10,8 @@ documentation = "https://docs.rs/omnigraph-cluster"
 
 [features]
 # Fault-injection hooks for the apply protocol (crash-mid-apply, CAS-race
-# tests). Deliberately does NOT enable omnigraph/failpoints.
-failpoints = ["dep:fail", "fail/failpoints"]
+# tests), including cluster/engine boundary failures.
+failpoints = ["dep:fail", "fail/failpoints", "omnigraph/failpoints"]
 
 [dependencies]
 omnigraph-compiler = { path = "../omnigraph-compiler", version = "0.7.0" }
