@@ -1,5 +1,6 @@
 #![allow(dead_code)]
 
+pub mod cost;
 pub mod recovery;
 
 use arrow_array::{Array, RecordBatch, StringArray};
