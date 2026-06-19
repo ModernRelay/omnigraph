@@ -764,7 +764,21 @@ pub async fn apply_config_dir_with_options(
                 )
                 .await
                 {
-                    backend.delete_object(&sidecar_path).await;
+                    // Pre-movement rejection: nothing moved, so retire the
+                    // sidecar eagerly. A delete failure leaves it safe (the
+                    // graph is quarantined until the next sweep), but surface
+                    // it so an operator isn't left debugging a silent stick.
+                    if let Err(err) = backend.try_delete_object(&sidecar_path).await {
+                        diagnostics.push(Diagnostic::warning(
+                            "recovery_sidecar_cleanup_failed",
+                            sidecar_path.clone(),
+                            format!(
+                                "could not delete the stale recovery sidecar after a pre-movement \
+                                 schema-apply rejection; graph `{graph_id}` stays quarantined until \
+                                 a state-mutating cluster command sweeps it: {err}"
+                            ),
+                        ));
+                    }
                 }
                 failed_graphs.insert(graph_id.clone(), FailedGraphOrigin::SchemaApply);
                 graph_moving_aborted = true;

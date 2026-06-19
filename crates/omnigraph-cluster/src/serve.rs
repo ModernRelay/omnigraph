@@ -201,6 +201,11 @@ async fn read_snapshot_with_store(
     // because serving cannot prove their blast radius.
     let sidecar_diag_start = diagnostics.len();
     let sidecars = backend.list_recovery_sidecars(&mut diagnostics).await;
+    // Every diagnostic `list_recovery_sidecars` appends is a genuine
+    // read/parse/version failure (emitted as a warning by `store::list_json_dir`)
+    // whose blast radius serving cannot prove — promote each to a cluster-fatal
+    // error. This depends on that listing only ever emitting failure diagnostics;
+    // if it grows a benign/informational one, promote by code instead.
     for diagnostic in diagnostics.iter_mut().skip(sidecar_diag_start) {
         diagnostic.severity = DiagnosticSeverity::Error;
     }
