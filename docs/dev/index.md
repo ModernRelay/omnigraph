@@ -72,6 +72,15 @@ pattern, not just the outcome.
 |---|---|
 | camelCase property filters lowercased at runtime (#283) — two engine→Lance boundaries, two different fixes | [bug-case-fix.md](bug-case-fix.md) |
 
+## Design Reviews
+
+Maintainer review companions for proposed RFCs — the substantive findings kept
+alongside the proposal rather than buried in PR threads.
+
+| Area | Read |
+|---|---|
+| RFC-013 node identity review (PR #287) — surrogate-reuse collision, resolution precedence, composite-key encoding | [rfc-013-review.md](rfc-013-review.md) |
+
 ## Active Implementation Plans
 
 Working documents for in-flight feature work. Removed when the work lands.
