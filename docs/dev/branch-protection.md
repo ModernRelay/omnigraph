@@ -8,10 +8,9 @@ This page explains what the policy says and how to change it.
 
 | Setting | Value | Why |
 |---|---|---|
-| **Required status checks (strict)** | `Classify Changes`, `Check AGENTS.md Links`, `Test omnigraph-server --features aws`, `CODEOWNERS matches source`, `CODEOWNERS not hand-edited` | Every PR must pass the AWS-feature build/test, AGENTS.md link integrity, and the CODEOWNERS hygiene checks. **`Test Workspace` is deliberately NOT required** — it runs only on push to `main` (post-merge), tags, and manual `workflow_dispatch`, to keep PR turnaround fast (it was the ~15min+ slow gate). It is therefore *not* listed here: a required check that never reports on PRs (the `test` job is `if: github.event_name != 'pull_request'`) would leave every PR permanently pending — the same job-never-reports trap the CODEOWNERS contexts call out below. The trade-off (a regression lands on `main` and is caught by the post-merge run, so `main` can briefly go red) and its mitigations are documented in [ci.md](ci.md). The two CODEOWNERS contexts must equal the job `name:` values in `.github/workflows/codeowners.yml` **verbatim** — a context naming a job that never reports (the old `CODEOWNERS / drift` used the job *id*, and the job was path-filtered) leaves every PR permanently pending and forces admin overrides. `strict: true` requires the branch to be up-to-date with `main` before merge. |
-| **Required approving reviews** | `1` | At least one reviewer. With a 2-person team, going higher would block all merges when one person is unavailable. |
-| **Require code-owner reviews** | `true` | The reviewer must be a code owner per `.github/CODEOWNERS`. This is what makes the codeowners chassis enforced. |
-| **Dismiss stale reviews on new commits** | `true` | A push after approval invalidates the prior review. Prevents the "approve, then sneak in unreviewed changes" pattern. |
+| **Required status checks (strict)** | `Classify Changes`, `Check AGENTS.md Links`, `Test omnigraph-server --features aws` | Every PR must pass the AWS-feature build/test and AGENTS.md link integrity. **`Test Workspace` is deliberately NOT required** — it runs only on push to `main` (post-merge), tags, and manual `workflow_dispatch`, to keep PR turnaround fast (it was the ~15min+ slow gate). It is therefore *not* listed here: a required check that never reports on PRs (the `test` job is `if: github.event_name != 'pull_request'`) would leave every PR permanently pending — the job-never-reports trap. The trade-off (a regression lands on `main` and is caught by the post-merge run, so `main` can briefly go red) and its mitigations are documented in [ci.md](ci.md). Each required context must equal a job `name:` that actually reports on PRs **verbatim** — a context naming a job that never reports leaves every PR permanently pending and forces admin overrides. `strict: true` requires the branch to be up-to-date with `main` before merge. |
+| **Required approving reviews** | `0` | No human-review gate. With a 2-person team where both maintainers own everything, requiring an approval meant every PR needed the *other* person (or an admin/bypass override) — friction with no real review value. CI checks are the gate; maintainers merge their own PRs once checks pass. Raise this to `1` if an outside-contributor flow ever needs a review gate. |
+| **Require code-owner reviews** | `false` | CODEOWNERS was removed entirely (see the git history of `.github/`); there is no code-owner review requirement. |
 | **Require linear history** | `true` | No merge commits — squash or rebase only. Matches recent practice. |
 | **Disallow force pushes** | `true` | No history rewrites on `main`. |
 | **Disallow branch deletions** | `true` | `main` cannot be deleted. |
@@ -57,7 +56,7 @@ Outputs the live policy. Compare against `.github/branch-protection.json` to det
 
 - **Audit trail**: `git log .github/branch-protection.json` shows every change with a reviewable diff and a merge commit.
 - **Disaster recovery**: if branch protection is accidentally removed or weakened via the UI, the JSON is the canonical recovery point.
-- **Consistency**: pairs with `.github/codeowners-roles.yml` (the CODEOWNERS source of truth). Repository policy lives in the repository.
+- **Consistency**: repository policy lives in the repository, reviewed like code.
 
 ## What this gates
 
@@ -65,11 +64,11 @@ After branch protection is applied, every PR targeting `main` must:
 
 1. Pass all listed status checks.
 2. Be up-to-date with `main` (rebase or merge-from-main).
-3. Have at least one approving review from a code owner for the touched paths.
-4. Have all review conversations resolved.
-5. Be squash- or rebase-merged (no merge commits).
+3. Have all review conversations resolved.
+4. Be squash- or rebase-merged (no merge commits).
 
-Even repository admins are subject to these rules.
+No human approval is required (`required_approving_review_count: 0`). Repository
+admins can override the gates (`enforce_admins: false`).
 
 ## Subsequent hardening (not in this PR)
 
@@ -77,7 +76,7 @@ The branch-protection policy is the foundation. Future hardening adds:
 
 - **Required signed commits** (`required_signatures: true`) — once maintainers enroll GPG/SSH signing.
 - **Tag protection** for `v*` tags via `repos/.../tags/protection`.
-- **Required reviewers from specific teams** for high-leverage paths (e.g., `docs/dev/invariants.md`) via CODEOWNERS tier expansion + the N-unique-approvers CI workaround.
+- **Required reviewers from specific teams** for high-leverage paths (e.g., `docs/dev/invariants.md`) via a GitHub ruleset's path-scoped required-review rule, if a review gate is ever reintroduced.
 - **More required CI checks**: `cargo deny`, `cargo audit`, `cargo fmt --check`, `cargo clippy -D warnings`, CodeQL, secret scanning, schema-lint (MR-946).
 
 See the hardening playbook for the full plan.

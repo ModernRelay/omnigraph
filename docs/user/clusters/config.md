@@ -231,9 +231,11 @@ Policy entries additionally record their applied `applies_to` bindings as
 normalized typed refs — the state ledger is serving-sufficient for the
 future server-boot stage. A change to `applies_to` alone (the policy file
 digest unchanged) appears in the plan as an Update marked `binding_change`
-(human output: `[bindings]`), applies like any catalog change, and counts
-toward convergence; ledgers written before this field existed are backfilled
-by the next apply.
+(human output: `[bindings]`), and as `metadata_change: policy_bindings` in
+structured output. Embedding provider entries similarly carry their resolved
+profile in the ledger; pre-profile ledgers are backfilled by an Update with
+`metadata_change: embedding_profile`. These metadata-only updates apply like
+catalog changes and count toward convergence.
 
 Each plan change carries a `disposition` field — an honest preview of what
 `cluster apply` will do with it in this stage: `applied` (executes), `derived`
@@ -322,7 +324,9 @@ cluster apply until the approval-artifact stage. Unsupported migrations
 (e.g. changing a property's type), engine lock contention, or graphs with
 user branches fail loudly as `schema_apply_failed` with the engine's message;
 dependent changes are demoted to `blocked` and graph-moving work stops for
-the run.
+the run. These pre-movement failures are checked before the cluster schema
+recovery sidecar is created, so they do not leave stale recovery files behind
+or brick later server boot.
 
 `cluster plan` previews schema updates with the engine's real migration plan:
 each schema change carries a `migration` field (`supported` + typed steps),
@@ -390,7 +394,7 @@ omnigraph-server --cluster company-brain --bind 0.0.0.0:8080
 ```
 
 `--cluster <dir>` is an **exclusive boot source** (axiom 15): it cannot
-combine with a graph URI, `--target`, or `--config`, and in this mode
+combine with a graph URI or `--config`, and in this mode
 `omnigraph.yaml` is never read — not for graphs, not for queries, not for
 policies. The server serves the **applied revision**: graph roots recorded in
 `state.json`, stored-query and policy content from the content-addressed
@@ -402,20 +406,29 @@ drift is visible. Routing is always multi-graph (`/graphs/{id}/...`). Bearer
 tokens and the bind address stay process-level (flags/env) — they are
 per-replica facts, not cluster facts.
 
-Boot is fail-fast: missing or unreadable state, pending recovery sidecars,
-missing/tampered catalog blobs, policy entries without binding metadata
-(pre-binding ledgers — re-run `cluster apply`), an empty graph set, more than
-one policy bundle binding a single scope (split or merge bundles; stacked
-scopes are a later stage), unopenable graph roots, and stored queries that no
-longer type-check all refuse startup with a remedy. A held state lock is
-*not* an error — boot reads the atomically-replaced state file without
+Boot is fail-fast for cluster-global readiness failures: missing or
+unreadable state, invalid/unattributable recovery sidecars,
+missing/tampered shared catalog blobs, policy entries without binding
+metadata (pre-binding ledgers — re-run `cluster apply`), an empty graph set,
+more than one policy bundle binding a single scope (split or merge bundles;
+stacked scopes are a later stage), cluster policy problems, or zero healthy
+graphs. Valid graph-attributed recovery sidecars, unopenable graph roots, and
+stored queries that no longer type-check quarantine that graph instead; the
+server logs startup diagnostics, skips the graph's queries and graph-only
+policy bindings, and serves any remaining healthy graphs. A held state lock
+is *not* an error — boot reads the atomically-replaced state file without
 locking.
 
+Use `omnigraph-server --require-all-graphs` (or
+`OMNIGRAPH_REQUIRE_ALL_GRAPHS=1`) when degraded serving is not acceptable; it
+promotes every graph-local quarantine or startup failure back to a boot error.
+
 Serving is static per process: the server reads the applied revision once at
-startup, so picking up newly applied state means restarting it. Stored
-queries are all listed in `GET /queries` in cluster mode (the cluster
-registry has no expose flag; exposure becomes a policy decision in a later
-phase).
+startup, so picking up newly applied state means restarting it. `GET /graphs`
+lists only ready/served graphs; quarantined graphs are omitted and their
+routes return 404. Stored queries are all listed in `GET /queries` in cluster
+mode (the cluster registry has no expose flag; exposure becomes a policy
+decision in a later phase).
 
 ## Status
 

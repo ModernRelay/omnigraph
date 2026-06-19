@@ -35,7 +35,7 @@ impl Omnigraph {
         query_name: &str,
         params: &ParamMap,
     ) -> Result<QueryResult> {
-        self.ensure_schema_state_valid().await?;
+        // resolved_target validates the schema contract; no redundant call here.
         let resolved = self.resolved_target(target).await?;
         let catalog = self.catalog();
 
@@ -80,7 +80,7 @@ impl Omnigraph {
         query_name: &str,
         params: &ParamMap,
     ) -> Result<QueryResult> {
-        self.ensure_schema_state_valid().await?;
+        // snapshot_at_version validates the schema contract; no redundant call here.
         let snapshot = self.snapshot_at_version(version).await?;
         let catalog = self.catalog();
 
@@ -2149,9 +2149,13 @@ pub(super) fn ir_expr_to_expr(
     params: &ParamMap,
     target: Option<&arrow_schema::DataType>,
 ) -> Option<datafusion::prelude::Expr> {
-    use datafusion::prelude::col;
+    use datafusion::prelude::ident;
     match expr {
-        IRExpr::PropAccess { property, .. } => Some(col(property)),
+        // #283: `ident()` preserves the identifier's case. `col()` would route
+        // through SQL identifier normalization and lowercase an unquoted
+        // camelCase column (`repoName` → `reponame`), which then fails to
+        // resolve against the case-sensitive Lance/Arrow schema.
+        IRExpr::PropAccess { property, .. } => Some(ident(property)),
         IRExpr::Literal(l) => literal_to_expr_coerced(l, target),
         IRExpr::Param(name) => params
             .get(name)
@@ -2654,6 +2658,63 @@ mod literal_lowering_tests {
         assert!(
             binary_has_int32_literal(&expr),
             "reversed-operand literal must coerce to the Int32 column type, got {expr:?}"
+        );
+    }
+
+    // Name of the left operand's column in a binary comparison `col OP lit`.
+    fn binary_left_column_name(e: &Expr) -> Option<String> {
+        match e {
+            Expr::BinaryExpr(b) => match b.left.as_ref() {
+                Expr::Column(c) => Some(c.name.clone()),
+                _ => None,
+            },
+            _ => None,
+        }
+    }
+
+    // #283: a camelCase property must reach the scan as its exact column name,
+    // not a SQL-normalized (lowercased) one. `col()` lowercases unquoted
+    // identifiers; the pushed-down column ref must stay `repoName`.
+    #[test]
+    fn ir_filter_preserves_camelcase_column_name() {
+        use arrow_schema::{DataType, Field};
+        let schema = arrow_schema::Schema::new(vec![Field::new("repoName", DataType::Utf8, true)]);
+        let filter = IRFilter {
+            left: IRExpr::PropAccess {
+                variable: "d".into(),
+                property: "repoName".into(),
+            },
+            op: CompOp::Eq,
+            right: IRExpr::Literal(Literal::String("acme".into())),
+        };
+        let expr = ir_filter_to_expr(&filter, &ParamMap::new(), Some(&schema)).unwrap();
+        assert_eq!(
+            binary_left_column_name(&expr).as_deref(),
+            Some("repoName"),
+            "camelCase column must be preserved (not lowercased to `reponame`), got {expr:?}"
+        );
+    }
+
+    // Index preservation: a camelCase numeric column still coerces its literal
+    // (so the scalar BTREE stays eligible) — the col→ident fix must not disturb
+    // the coercion path (which resolves the column type via field_with_name).
+    #[test]
+    fn ir_filter_coerces_literal_for_camelcase_int_column() {
+        use arrow_schema::{DataType, Field};
+        let schema =
+            arrow_schema::Schema::new(vec![Field::new("itemCount", DataType::Int32, true)]);
+        let filter = IRFilter {
+            left: IRExpr::PropAccess {
+                variable: "m".into(),
+                property: "itemCount".into(),
+            },
+            op: CompOp::Eq,
+            right: IRExpr::Literal(Literal::Integer(2)),
+        };
+        let expr = ir_filter_to_expr(&filter, &ParamMap::new(), Some(&schema)).unwrap();
+        assert!(
+            binary_has_int32_literal(&expr),
+            "camelCase int column must keep its coerced Int32 literal (BTREE-eligible), got {expr:?}"
         );
     }
 }

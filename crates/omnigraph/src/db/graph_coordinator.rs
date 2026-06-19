@@ -10,7 +10,9 @@ use crate::storage::{StorageAdapter, join_uri, normalize_root_uri};
 
 use super::commit_graph::{CommitGraph, GraphCommit};
 use super::is_internal_system_branch;
-use super::manifest::{ManifestChange, ManifestCoordinator, Snapshot, SubTableUpdate};
+use super::manifest::{
+    ManifestChange, ManifestCoordinator, ManifestIncarnation, Snapshot, SubTableUpdate,
+};
 
 const GRAPH_COMMITS_DIR: &str = "_graph_commits.lance";
 
@@ -26,10 +28,11 @@ impl SnapshotId {
         &self.0
     }
 
-    pub(crate) fn synthetic(branch: Option<&str>, version: u64) -> Self {
-        match branch {
-            Some(branch) => Self(format!("manifest:{}:v{}", branch, version)),
-            None => Self(format!("manifest:main:v{}", version)),
+    pub(crate) fn synthetic(branch: Option<&str>, version: u64, e_tag: Option<&str>) -> Self {
+        let branch = branch.unwrap_or("main");
+        match e_tag {
+            Some(e_tag) => Self(format!("manifest:{}:v{}:etag:{}", branch, version, e_tag)),
+            None => Self(format!("manifest:{}:v{}", branch, version)),
         }
     }
 }
@@ -166,6 +169,10 @@ impl GraphCoordinator {
         self.manifest.version()
     }
 
+    pub(crate) fn manifest_incarnation(&self) -> ManifestIncarnation {
+        self.manifest.incarnation()
+    }
+
     pub fn snapshot(&self) -> Snapshot {
         self.manifest.snapshot()
     }
@@ -180,6 +187,19 @@ impl GraphCoordinator {
             commit_graph.refresh().await?;
         }
         Ok(())
+    }
+
+    pub(crate) async fn probe_latest_incarnation(&self) -> Result<ManifestIncarnation> {
+        crate::instrumentation::record_probe();
+        self.manifest.probe_latest_incarnation().await
+    }
+
+    /// Refresh only the manifest (not the commit graph). The read path uses this
+    /// on a stale same-branch probe: a read pins its snapshot by manifest version
+    /// and never needs the commit graph, so a full `refresh` (which also scans
+    /// the commit graph) would be wasted IO.
+    pub async fn refresh_manifest_only(&mut self) -> Result<()> {
+        self.manifest.refresh().await
     }
 
     pub async fn branch_list(&self) -> Result<Vec<String>> {
@@ -315,10 +335,13 @@ impl GraphCoordinator {
             None => GraphCoordinator::open(self.root_uri(), Arc::clone(&self.storage)).await?,
         };
 
-        Ok(other
-            .head_commit_id()
-            .await?
-            .unwrap_or_else(|| SnapshotId::synthetic(other.current_branch(), other.version())))
+        Ok(other.head_commit_id().await?.unwrap_or_else(|| {
+            SnapshotId::synthetic(
+                other.current_branch(),
+                other.version(),
+                other.manifest_incarnation().e_tag.as_deref(),
+            )
+        }))
     }
 
     pub async fn resolve_target(&self, target: &ReadTarget) -> Result<ResolvedTarget> {
@@ -339,7 +362,11 @@ impl GraphCoordinator {
                     }
                 };
                 let snapshot_id = other.head_commit_id().await?.unwrap_or_else(|| {
-                    SnapshotId::synthetic(other.current_branch(), other.version())
+                    SnapshotId::synthetic(
+                        other.current_branch(),
+                        other.version(),
+                        other.manifest_incarnation().e_tag.as_deref(),
+                    )
                 });
                 Ok(ResolvedTarget {
                     requested: target.clone(),
@@ -509,9 +536,23 @@ impl GraphCoordinator {
             return Ok(SnapshotId::synthetic(
                 current_branch.as_deref(),
                 manifest_version,
+                self.manifest_incarnation().e_tag.as_deref(),
             ));
         };
         failpoints::maybe_fail("graph_publish.before_commit_append")?;
+        // Refresh the commit-graph head from storage before selecting the
+        // parent. `append_commit` parents the new commit on the IN-MEMORY head
+        // (`head_commit_id`, zero storage read), but the manifest was just
+        // committed against a freshly rebased pin (`commit_all` opens a fresh
+        // coordinator) while THIS coordinator's cached head may be stale because
+        // an external writer advanced the branch. Without this refresh a
+        // same-branch write after an external commit appends off the stale head
+        // and FORKS the commit DAG (the new commit and the external commit
+        // sharing a parent). Refreshing makes the parent the true current head;
+        // the just-committed manifest version has no commit-graph row yet, so the
+        // fresh head is exactly the prior commit. (record_merge_commit is
+        // unaffected — it passes explicit parents, never the cached head.)
+        commit_graph.refresh().await?;
         let graph_commit_id = commit_graph
             .append_commit(current_branch.as_deref(), manifest_version, actor_id)
             .await?;

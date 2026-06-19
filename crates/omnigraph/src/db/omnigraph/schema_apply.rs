@@ -362,6 +362,9 @@ where
                 table_path: db.storage().dataset_uri(&entry.table_path),
                 expected_version: entry.table_version,
                 post_commit_pin: entry.table_version + 1,
+                // SchemaApply uses the loose match, not BranchMerge's Phase-B
+                // confirmation — left None.
+                confirmed_version: None,
                 table_branch: entry.table_branch.clone(),
             })
         })
@@ -447,8 +450,7 @@ where
         && sidecar_registrations.is_empty()
         && sidecar_tombstones.is_empty());
     if writes_sidecar {
-        schema_apply_queue_keys
-            .push(crate::db::manifest::schema_apply_serial_queue_key());
+        schema_apply_queue_keys.push(crate::db::manifest::schema_apply_serial_queue_key());
     }
     let _schema_apply_queue_guards = db
         .write_queue()
@@ -530,8 +532,7 @@ where
         .await?;
         let table_path = table_path_for_table_key(target_table_key)?;
         let dataset_uri = db.storage().dataset_uri(&table_path);
-        let target_ds =
-            SnapshotHandle::new(TableStore::write_dataset(&dataset_uri, batch).await?);
+        let target_ds = SnapshotHandle::new(TableStore::write_dataset(&dataset_uri, batch).await?);
         // Indexes on the renamed table are reconciled later (iss-848).
         let state = db.storage().table_state(&dataset_uri, &target_ds).await?;
         table_registrations.insert(target_table_key.clone(), table_path);
@@ -750,6 +751,7 @@ where
 async fn cleanup_dataset_old_versions(db: &Omnigraph, full_uri: &str) -> Result<()> {
     use chrono::Utc;
     use lance::dataset::cleanup::CleanupPolicy;
+    // forbidden-api-allow: maintenance (Hard-drop version GC) opens the dataset to run cleanup_old_versions.
     let ds = lance::Dataset::open(full_uri)
         .await
         .map_err(|e| OmniError::Lance(e.to_string()))?;

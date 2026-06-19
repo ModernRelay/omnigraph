@@ -5,7 +5,7 @@ use pest::error::InputLocation;
 use pest_derive::Parser;
 
 use crate::error::{
-    NanoError, ParseDiagnostic, Result, SourceSpan, decode_string_literal, render_span,
+    CompilerError, ParseDiagnostic, Result, SourceSpan, decode_string_literal, render_span,
 };
 use crate::types::{PropType, ScalarType};
 
@@ -16,7 +16,7 @@ use super::ast::*;
 struct SchemaParser;
 
 pub fn parse_schema(input: &str) -> Result<SchemaFile> {
-    parse_schema_diagnostic(input).map_err(|e| NanoError::Parse(e.to_string()))
+    parse_schema_diagnostic(input).map_err(|e| CompilerError::Parse(e.to_string()))
 }
 
 pub fn parse_schema_diagnostic(input: &str) -> std::result::Result<SchemaFile, ParseDiagnostic> {
@@ -27,7 +27,8 @@ pub fn parse_schema_diagnostic(input: &str) -> std::result::Result<SchemaFile, P
         if pair.as_rule() == Rule::schema_file {
             for inner in pair.into_inner() {
                 if let Rule::schema_decl = inner.as_rule() {
-                    declarations.push(parse_schema_decl(inner).map_err(nano_error_to_diagnostic)?);
+                    declarations
+                        .push(parse_schema_decl(inner).map_err(compiler_error_to_diagnostic)?);
                 }
             }
         }
@@ -46,13 +47,13 @@ pub fn parse_schema_diagnostic(input: &str) -> std::result::Result<SchemaFile, P
     let iface_refs: Vec<&InterfaceDecl> = interfaces.iter().collect();
     for decl in &mut declarations {
         if let SchemaDecl::Node(node) = decl {
-            resolve_interfaces(node, &iface_refs).map_err(nano_error_to_diagnostic)?;
+            resolve_interfaces(node, &iface_refs).map_err(compiler_error_to_diagnostic)?;
         }
     }
 
     let schema = SchemaFile { declarations };
-    validate_schema_annotations(&schema).map_err(nano_error_to_diagnostic)?;
-    validate_constraints(&schema).map_err(nano_error_to_diagnostic)?;
+    validate_schema_annotations(&schema).map_err(compiler_error_to_diagnostic)?;
+    validate_constraints(&schema).map_err(compiler_error_to_diagnostic)?;
     Ok(schema)
 }
 
@@ -64,7 +65,7 @@ fn pest_error_to_diagnostic(err: pest::error::Error<Rule>) -> ParseDiagnostic {
     ParseDiagnostic::new(err.to_string(), span)
 }
 
-fn nano_error_to_diagnostic(err: NanoError) -> ParseDiagnostic {
+fn compiler_error_to_diagnostic(err: CompilerError) -> ParseDiagnostic {
     ParseDiagnostic::new(err.to_string(), None)
 }
 
@@ -74,7 +75,7 @@ fn parse_schema_decl(pair: pest::iterators::Pair<Rule>) -> Result<SchemaDecl> {
         Rule::interface_decl => Ok(SchemaDecl::Interface(parse_interface_decl(inner)?)),
         Rule::node_decl => Ok(SchemaDecl::Node(parse_node_decl(inner)?)),
         Rule::edge_decl => Ok(SchemaDecl::Edge(parse_edge_decl(inner)?)),
-        _ => Err(NanoError::Parse(format!(
+        _ => Err(CompilerError::Parse(format!(
             "unexpected rule: {:?}",
             inner.as_rule()
         ))),
@@ -180,21 +181,20 @@ fn parse_cardinality(pair: pest::iterators::Pair<Rule>) -> Result<Cardinality> {
     let min_str = inner.next().unwrap().as_str();
     let min = min_str
         .parse::<u32>()
-        .map_err(|_| NanoError::Parse(format!("invalid cardinality min: {}", min_str)))?;
-    let max = if let Some(max_pair) = inner.next() {
-        let max_str = max_pair.as_str();
-        Some(
-            max_str
-                .parse::<u32>()
-                .map_err(|_| NanoError::Parse(format!("invalid cardinality max: {}", max_str)))?,
-        )
-    } else {
-        None
-    };
+        .map_err(|_| CompilerError::Parse(format!("invalid cardinality min: {}", min_str)))?;
+    let max =
+        if let Some(max_pair) = inner.next() {
+            let max_str = max_pair.as_str();
+            Some(max_str.parse::<u32>().map_err(|_| {
+                CompilerError::Parse(format!("invalid cardinality max: {}", max_str))
+            })?)
+        } else {
+            None
+        };
 
     if let Some(max_val) = max {
         if min > max_val {
-            return Err(NanoError::Parse(format!(
+            return Err(CompilerError::Parse(format!(
                 "cardinality min ({}) exceeds max ({})",
                 min, max_val
             )));
@@ -219,7 +219,7 @@ fn parse_body_constraint(pair: pest::iterators::Pair<Rule>) -> Result<Constraint
                 .map(|a| extract_ident_from_constraint_arg(a))
                 .collect::<Result<Vec<_>>>()?;
             if names.is_empty() {
-                return Err(NanoError::Parse(
+                return Err(CompilerError::Parse(
                     "@key constraint requires at least one property name".to_string(),
                 ));
             }
@@ -228,7 +228,7 @@ fn parse_body_constraint(pair: pest::iterators::Pair<Rule>) -> Result<Constraint
         "unique" => {
             let names = extract_ident_list_from_args(args)?;
             if names.is_empty() {
-                return Err(NanoError::Parse(
+                return Err(CompilerError::Parse(
                     "@unique constraint requires at least one property name".to_string(),
                 ));
             }
@@ -237,7 +237,7 @@ fn parse_body_constraint(pair: pest::iterators::Pair<Rule>) -> Result<Constraint
         "index" => {
             let names = extract_ident_list_from_args(args)?;
             if names.is_empty() {
-                return Err(NanoError::Parse(
+                return Err(CompilerError::Parse(
                     "@index constraint requires at least one property name".to_string(),
                 ));
             }
@@ -246,7 +246,7 @@ fn parse_body_constraint(pair: pest::iterators::Pair<Rule>) -> Result<Constraint
         "range" => {
             // @range(prop, min..max)
             if args.len() < 2 {
-                return Err(NanoError::Parse(
+                return Err(CompilerError::Parse(
                     "@range requires property name and bounds: @range(prop, min..max)".to_string(),
                 ));
             }
@@ -258,7 +258,7 @@ fn parse_body_constraint(pair: pest::iterators::Pair<Rule>) -> Result<Constraint
         "check" => {
             // @check(prop, "regex")
             if args.len() < 2 {
-                return Err(NanoError::Parse(
+                return Err(CompilerError::Parse(
                     "@check requires property name and pattern: @check(prop, \"regex\")"
                         .to_string(),
                 ));
@@ -267,7 +267,10 @@ fn parse_body_constraint(pair: pest::iterators::Pair<Rule>) -> Result<Constraint
             let pattern = extract_string_from_constraint_arg(&args[1])?;
             Ok(Constraint::Check { property, pattern })
         }
-        other => Err(NanoError::Parse(format!("unknown constraint: @{}", other))),
+        other => Err(CompilerError::Parse(format!(
+            "unknown constraint: @{}",
+            other
+        ))),
     }
 }
 
@@ -281,7 +284,7 @@ fn extract_ident_from_constraint_arg(pair: pest::iterators::Pair<Rule>) -> Resul
             return Ok(inner.as_str().to_string());
         }
     }
-    Err(NanoError::Parse(
+    Err(CompilerError::Parse(
         "expected property name in constraint".to_string(),
     ))
 }
@@ -309,7 +312,7 @@ fn extract_string_from_constraint_arg(pair: &pest::iterators::Pair<Rule>) -> Res
     }
 
     find_string(pair)?
-        .ok_or_else(|| NanoError::Parse("expected string argument in constraint".to_string()))
+        .ok_or_else(|| CompilerError::Parse("expected string argument in constraint".to_string()))
 }
 
 fn extract_range_bounds(
@@ -327,7 +330,9 @@ fn extract_range_bounds(
             }
         }
         found.ok_or_else(|| {
-            NanoError::Parse("expected range bounds (min..max) in @range constraint".to_string())
+            CompilerError::Parse(
+                "expected range bounds (min..max) in @range constraint".to_string(),
+            )
         })?
     };
 
@@ -378,7 +383,7 @@ fn parse_constraint_bound(pair: &pest::iterators::Pair<Rule>) -> Result<Constrai
         }
     }
 
-    Err(NanoError::Parse(format!(
+    Err(CompilerError::Parse(format!(
         "invalid constraint bound: {}",
         text
     )))
@@ -411,7 +416,7 @@ fn resolve_interfaces(node: &mut NodeDecl, interfaces: &[&InterfaceDecl]) -> Res
 
     for iface_name in &node.implements {
         let iface = interface_map.get(iface_name.as_str()).ok_or_else(|| {
-            NanoError::Parse(format!(
+            CompilerError::Parse(format!(
                 "node {} implements unknown interface '{}'",
                 node.name, iface_name
             ))
@@ -421,7 +426,7 @@ fn resolve_interfaces(node: &mut NodeDecl, interfaces: &[&InterfaceDecl]) -> Res
             if let Some(existing) = node.properties.iter().find(|p| p.name == iface_prop.name) {
                 // Property exists — verify type compatibility
                 if existing.prop_type != iface_prop.prop_type {
-                    return Err(NanoError::Parse(format!(
+                    return Err(CompilerError::Parse(format!(
                         "node {} property '{}' has type {} but interface {} declares it as {}",
                         node.name,
                         iface_prop.name,
@@ -472,36 +477,35 @@ fn parse_type_ref(pair: pest::iterators::Pair<Rule>) -> Result<PropType> {
     let mut inner = pair
         .into_inner()
         .next()
-        .ok_or_else(|| NanoError::Parse("type reference is missing core type".to_string()))?;
+        .ok_or_else(|| CompilerError::Parse("type reference is missing core type".to_string()))?;
     if inner.as_rule() == Rule::core_type {
-        inner = inner
-            .into_inner()
-            .next()
-            .ok_or_else(|| NanoError::Parse("type reference is missing core type".to_string()))?;
+        inner = inner.into_inner().next().ok_or_else(|| {
+            CompilerError::Parse("type reference is missing core type".to_string())
+        })?;
     }
 
     match inner.as_rule() {
         Rule::base_type => {
             let scalar = ScalarType::from_str_name(inner.as_str())
-                .ok_or_else(|| NanoError::Parse(format!("unknown type: {}", inner.as_str())))?;
+                .ok_or_else(|| CompilerError::Parse(format!("unknown type: {}", inner.as_str())))?;
             Ok(PropType::scalar(scalar, nullable))
         }
         Rule::vector_type => {
             let dim_text = inner
                 .into_inner()
                 .next()
-                .ok_or_else(|| NanoError::Parse("Vector type missing dimension".to_string()))?
+                .ok_or_else(|| CompilerError::Parse("Vector type missing dimension".to_string()))?
                 .as_str();
             let dim = dim_text
                 .parse::<u32>()
-                .map_err(|e| NanoError::Parse(format!("invalid Vector dimension: {}", e)))?;
+                .map_err(|e| CompilerError::Parse(format!("invalid Vector dimension: {}", e)))?;
             if dim == 0 {
-                return Err(NanoError::Parse(
+                return Err(CompilerError::Parse(
                     "Vector dimension must be greater than zero".to_string(),
                 ));
             }
             if dim > i32::MAX as u32 {
-                return Err(NanoError::Parse(format!(
+                return Err(CompilerError::Parse(format!(
                     "Vector dimension {} exceeds maximum supported {}",
                     dim,
                     i32::MAX
@@ -510,15 +514,14 @@ fn parse_type_ref(pair: pest::iterators::Pair<Rule>) -> Result<PropType> {
             Ok(PropType::scalar(ScalarType::Vector(dim), nullable))
         }
         Rule::list_type => {
-            let element = inner
-                .into_inner()
-                .next()
-                .ok_or_else(|| NanoError::Parse("list type missing element type".to_string()))?;
+            let element = inner.into_inner().next().ok_or_else(|| {
+                CompilerError::Parse("list type missing element type".to_string())
+            })?;
             let scalar = ScalarType::from_str_name(element.as_str()).ok_or_else(|| {
-                NanoError::Parse(format!("unknown list element type: {}", element.as_str()))
+                CompilerError::Parse(format!("unknown list element type: {}", element.as_str()))
             })?;
             if matches!(scalar, ScalarType::Blob) {
-                return Err(NanoError::Parse(
+                return Err(CompilerError::Parse(
                     "list of Blob is not supported".to_string(),
                 ));
             }
@@ -532,7 +535,7 @@ fn parse_type_ref(pair: pest::iterators::Pair<Rule>) -> Result<PropType> {
                 }
             }
             if values.is_empty() {
-                return Err(NanoError::Parse(
+                return Err(CompilerError::Parse(
                     "enum type must include at least one value".to_string(),
                 ));
             }
@@ -540,13 +543,13 @@ fn parse_type_ref(pair: pest::iterators::Pair<Rule>) -> Result<PropType> {
             dedup.sort();
             dedup.dedup();
             if dedup.len() != values.len() {
-                return Err(NanoError::Parse(
+                return Err(CompilerError::Parse(
                     "enum type cannot include duplicate values".to_string(),
                 ));
             }
             Ok(PropType::enum_type(values, nullable))
         }
-        other => Err(NanoError::Parse(format!(
+        other => Err(CompilerError::Parse(format!(
             "unexpected type rule: {:?}",
             other
         ))),
@@ -595,19 +598,19 @@ fn validate_string_annotation(
             continue;
         }
         if seen {
-            return Err(NanoError::Parse(format!(
+            return Err(CompilerError::Parse(format!(
                 "{} declares @{} multiple times",
                 target, annotation
             )));
         }
         let value = ann.value.as_deref().ok_or_else(|| {
-            NanoError::Parse(format!(
+            CompilerError::Parse(format!(
                 "@{} on {} requires a non-empty value",
                 annotation, target
             ))
         })?;
         if value.trim().is_empty() {
-            return Err(NanoError::Parse(format!(
+            return Err(CompilerError::Parse(format!(
                 "@{} on {} requires a non-empty value",
                 annotation, target
             )));
@@ -631,7 +634,7 @@ fn validate_schema_annotations(schema: &SchemaFile) -> Result<()> {
                         || ann.name == "index"
                         || ann.name == "embed"
                     {
-                        return Err(NanoError::Parse(format!(
+                        return Err(CompilerError::Parse(format!(
                             "@{} is only supported on node properties or as body constraint (node {})",
                             ann.name, node.name
                         )));
@@ -660,7 +663,7 @@ fn validate_schema_annotations(schema: &SchemaFile) -> Result<()> {
                         || ann.name == "index"
                         || ann.name == "embed"
                     {
-                        return Err(NanoError::Parse(format!(
+                        return Err(CompilerError::Parse(format!(
                             "@{} is not supported on edges (edge {})",
                             ann.name, edge.name
                         )));
@@ -714,13 +717,13 @@ fn validate_property_annotations(
                 || ann.name == "index"
                 || ann.name == "embed")
         {
-            return Err(NanoError::Parse(format!(
+            return Err(CompilerError::Parse(format!(
                 "@{} is not supported on list property {}.{}",
                 ann.name, type_name, prop.name
             )));
         }
         if is_vector && (ann.name == "key" || ann.name == "unique") {
-            return Err(NanoError::Parse(format!(
+            return Err(CompilerError::Parse(format!(
                 "@{} is not supported on vector property {}.{}",
                 ann.name, type_name, prop.name
             )));
@@ -731,13 +734,13 @@ fn validate_property_annotations(
                 || ann.name == "index"
                 || ann.name == "embed")
         {
-            return Err(NanoError::Parse(format!(
+            return Err(CompilerError::Parse(format!(
                 "@{} is not supported on blob property {}.{}",
                 ann.name, type_name, prop.name
             )));
         }
         if ann.name == "instruction" {
-            return Err(NanoError::Parse(format!(
+            return Err(CompilerError::Parse(format!(
                 "@instruction is only supported on node and edge types (property {}.{})",
                 type_name, prop.name
             )));
@@ -745,7 +748,7 @@ fn validate_property_annotations(
 
         // Edge-specific restrictions
         if is_edge && (ann.name == "key" || ann.name == "embed") {
-            return Err(NanoError::Parse(format!(
+            return Err(CompilerError::Parse(format!(
                 "@{} is not supported on edge properties (edge {}.{})",
                 ann.name, type_name, prop.name
             )));
@@ -755,13 +758,13 @@ fn validate_property_annotations(
         match ann.name.as_str() {
             "key" => {
                 if ann.value.is_some() {
-                    return Err(NanoError::Parse(format!(
+                    return Err(CompilerError::Parse(format!(
                         "@key on {}.{} does not accept a value",
                         type_name, prop.name
                     )));
                 }
                 if key_seen {
-                    return Err(NanoError::Parse(format!(
+                    return Err(CompilerError::Parse(format!(
                         "property {}.{} declares @key multiple times",
                         type_name, prop.name
                     )));
@@ -770,13 +773,13 @@ fn validate_property_annotations(
             }
             "unique" => {
                 if ann.value.is_some() {
-                    return Err(NanoError::Parse(format!(
+                    return Err(CompilerError::Parse(format!(
                         "@unique on {}.{} does not accept a value",
                         type_name, prop.name
                     )));
                 }
                 if unique_seen {
-                    return Err(NanoError::Parse(format!(
+                    return Err(CompilerError::Parse(format!(
                         "property {}.{} declares @unique multiple times",
                         type_name, prop.name
                     )));
@@ -785,13 +788,13 @@ fn validate_property_annotations(
             }
             "index" => {
                 if ann.value.is_some() {
-                    return Err(NanoError::Parse(format!(
+                    return Err(CompilerError::Parse(format!(
                         "@index on {}.{} does not accept a value",
                         type_name, prop.name
                     )));
                 }
                 if index_seen {
-                    return Err(NanoError::Parse(format!(
+                    return Err(CompilerError::Parse(format!(
                         "property {}.{} declares @index multiple times",
                         type_name, prop.name
                     )));
@@ -800,7 +803,7 @@ fn validate_property_annotations(
             }
             "embed" => {
                 if embed_seen {
-                    return Err(NanoError::Parse(format!(
+                    return Err(CompilerError::Parse(format!(
                         "property {}.{} declares @embed multiple times",
                         type_name, prop.name
                     )));
@@ -808,20 +811,20 @@ fn validate_property_annotations(
                 embed_seen = true;
 
                 if !is_vector {
-                    return Err(NanoError::Parse(format!(
+                    return Err(CompilerError::Parse(format!(
                         "@embed is only supported on vector properties ({}.{})",
                         type_name, prop.name
                     )));
                 }
 
                 let source_prop = ann.value.as_deref().ok_or_else(|| {
-                    NanoError::Parse(format!(
+                    CompilerError::Parse(format!(
                         "@embed on {}.{} requires a source property name",
                         type_name, prop.name
                     ))
                 })?;
                 if source_prop.trim().is_empty() {
-                    return Err(NanoError::Parse(format!(
+                    return Err(CompilerError::Parse(format!(
                         "@embed on {}.{} requires a non-empty source property name",
                         type_name, prop.name
                     )));
@@ -831,14 +834,14 @@ fn validate_property_annotations(
                     .iter()
                     .find(|p| p.name == source_prop)
                     .ok_or_else(|| {
-                        NanoError::Parse(format!(
+                        CompilerError::Parse(format!(
                             "@embed on {}.{} references unknown source property {}",
                             type_name, prop.name, source_prop
                         ))
                     })?;
                 if source_decl.prop_type.list || source_decl.prop_type.scalar != ScalarType::String
                 {
-                    return Err(NanoError::Parse(format!(
+                    return Err(CompilerError::Parse(format!(
                         "@embed source property {}.{} must be String",
                         type_name, source_prop
                     )));
@@ -848,7 +851,7 @@ fn validate_property_annotations(
                 // a typo can't be silently ignored (it would never validate).
                 for key in ann.kwargs.keys() {
                     if key != "model" {
-                        return Err(NanoError::Parse(format!(
+                        return Err(CompilerError::Parse(format!(
                             "@embed on {}.{} has unknown argument '{}=' (only 'model' is supported)",
                             type_name, prop.name, key
                         )));
@@ -893,45 +896,45 @@ fn validate_type_constraints(
         match constraint {
             Constraint::Key(cols) => {
                 if is_edge {
-                    return Err(NanoError::Parse(format!(
+                    return Err(CompilerError::Parse(format!(
                         "@key constraint is not supported on edges (edge {})",
                         type_name
                     )));
                 }
                 key_count += 1;
                 if key_count > 1 {
-                    return Err(NanoError::Parse(format!(
+                    return Err(CompilerError::Parse(format!(
                         "node type {} has multiple @key constraints; only one is supported",
                         type_name
                     )));
                 }
                 for col in cols {
                     let prop = prop_names.get(col.as_str()).ok_or_else(|| {
-                        NanoError::Parse(format!(
+                        CompilerError::Parse(format!(
                             "@key on {} references unknown property '{}'",
                             type_name, col
                         ))
                     })?;
                     if prop.prop_type.nullable {
-                        return Err(NanoError::Parse(format!(
+                        return Err(CompilerError::Parse(format!(
                             "@key property {}.{} cannot be nullable",
                             type_name, col
                         )));
                     }
                     if prop.prop_type.list {
-                        return Err(NanoError::Parse(format!(
+                        return Err(CompilerError::Parse(format!(
                             "@key is not supported on list property {}.{}",
                             type_name, col
                         )));
                     }
                     if matches!(prop.prop_type.scalar, ScalarType::Vector(_)) {
-                        return Err(NanoError::Parse(format!(
+                        return Err(CompilerError::Parse(format!(
                             "@key is not supported on vector property {}.{}",
                             type_name, col
                         )));
                     }
                     if matches!(prop.prop_type.scalar, ScalarType::Blob) {
-                        return Err(NanoError::Parse(format!(
+                        return Err(CompilerError::Parse(format!(
                             "@key is not supported on blob property {}.{}",
                             type_name, col
                         )));
@@ -945,7 +948,7 @@ fn validate_type_constraints(
                         continue;
                     }
                     if !prop_names.contains_key(col.as_str()) {
-                        return Err(NanoError::Parse(format!(
+                        return Err(CompilerError::Parse(format!(
                             "@unique on {} references unknown property '{}'",
                             type_name, col
                         )));
@@ -958,13 +961,13 @@ fn validate_type_constraints(
                         continue;
                     }
                     let prop = prop_names.get(col.as_str()).ok_or_else(|| {
-                        NanoError::Parse(format!(
+                        CompilerError::Parse(format!(
                             "@index on {} references unknown property '{}'",
                             type_name, col
                         ))
                     })?;
                     if matches!(prop.prop_type.scalar, ScalarType::Blob) {
-                        return Err(NanoError::Parse(format!(
+                        return Err(CompilerError::Parse(format!(
                             "@index is not supported on blob property {}.{}",
                             type_name, col
                         )));
@@ -973,19 +976,19 @@ fn validate_type_constraints(
             }
             Constraint::Range { property, .. } => {
                 if is_edge {
-                    return Err(NanoError::Parse(format!(
+                    return Err(CompilerError::Parse(format!(
                         "@range constraint is not supported on edges (edge {})",
                         type_name
                     )));
                 }
                 let prop = prop_names.get(property.as_str()).ok_or_else(|| {
-                    NanoError::Parse(format!(
+                    CompilerError::Parse(format!(
                         "@range on {} references unknown property '{}'",
                         type_name, property
                     ))
                 })?;
                 if !prop.prop_type.scalar.is_numeric() {
-                    return Err(NanoError::Parse(format!(
+                    return Err(CompilerError::Parse(format!(
                         "@range on {}.{} requires a numeric type, got {}",
                         type_name,
                         property,
@@ -995,19 +998,19 @@ fn validate_type_constraints(
             }
             Constraint::Check { property, .. } => {
                 if is_edge {
-                    return Err(NanoError::Parse(format!(
+                    return Err(CompilerError::Parse(format!(
                         "@check constraint is not supported on edges (edge {})",
                         type_name
                     )));
                 }
                 let prop = prop_names.get(property.as_str()).ok_or_else(|| {
-                    NanoError::Parse(format!(
+                    CompilerError::Parse(format!(
                         "@check on {} references unknown property '{}'",
                         type_name, property
                     ))
                 })?;
                 if prop.prop_type.scalar != ScalarType::String {
-                    return Err(NanoError::Parse(format!(
+                    return Err(CompilerError::Parse(format!(
                         "@check on {}.{} requires String type, got {}",
                         type_name,
                         property,

@@ -22,6 +22,11 @@ struct Cli {
     /// Equivalent to setting `OMNIGRAPH_UNAUTHENTICATED=1`.
     #[arg(long)]
     unauthenticated: bool,
+    /// Fail startup if any applied graph is quarantined or fails to open.
+    /// By default, graph-local failures are logged and healthy graphs still
+    /// serve. Equivalent to setting `OMNIGRAPH_REQUIRE_ALL_GRAPHS=1`.
+    #[arg(long)]
+    require_all_graphs: bool,
 }
 
 #[tokio::main]
@@ -30,7 +35,12 @@ async fn main() -> Result<()> {
     init_tracing();
 
     let cli = Cli::parse();
-    let settings: ServerConfig =
-        load_server_settings(cli.cluster.as_ref(), cli.bind, cli.unauthenticated).await?;
+    let settings: ServerConfig = load_server_settings(
+        cli.cluster.as_ref(),
+        cli.bind,
+        cli.unauthenticated,
+        cli.require_all_graphs,
+    )
+    .await?;
     serve(settings).await
 }

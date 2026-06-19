@@ -1,6 +1,6 @@
 # HTTP Server (`omnigraph-server`)
 
-Axum 0.8 + tokio + utoipa-generated OpenAPI. **Cluster-only boot** (RFC-011): the server always boots from a cluster (`--cluster <dir | s3://…>`) and serves N graphs (N ≥ 1) under cluster routes. There is no longer a single-graph flat-route mode, no positional `<URI>` boot, no `--target`, and no `omnigraph.yaml`-`graphs:`-map boot. All HTTP is nested under `/graphs/{graph_id}/...`; `/healthz` and the management `/graphs` enumeration stay flat.
+Axum 0.8 + tokio + utoipa-generated OpenAPI. **Cluster-only boot**: the server always boots from a cluster (`--cluster <dir | s3://…>`) and serves N graphs (N ≥ 1) under cluster routes. There is no longer a single-graph flat-route mode, no positional `<URI>` boot, no `--target`, and no `omnigraph.yaml`-`graphs:`-map boot. All HTTP is nested under `/graphs/{graph_id}/...`; `/healthz` and the management `/graphs` enumeration stay flat.
 
 ## Boot
 
@@ -15,11 +15,24 @@ omnigraph-server --cluster <dir | s3://…> --bind 0.0.0.0:8080
 startup configs (id, URI, optional per-graph policy, stored-query
 registry) plus an optional server-level policy, then opens every
 configured graph in parallel at startup (bounded concurrency = 4,
-fail-fast on the first open error). Routing is always multi-graph —
+quarantining graph-specific open failures). Routing is always multi-graph —
 requests to bare flat protected paths (`/read`, `/snapshot`, …) return
 404; the served surface is `/graphs/{graph_id}/...`. See
 [cluster-config.md](../clusters/config.md#serving-from-the-cluster-the-mode-switch)
-for what is read and the fail-fast readiness rules.
+for what is read and the readiness rules.
+
+Readiness is fail-fast for cluster-global problems: missing or unreadable
+state, invalid/unattributable recovery sidecars, unreadable shared catalog
+payloads, cluster policy errors, or zero healthy graphs. Graph-attributed
+pending recovery sidecars and graph-specific startup failures quarantine
+that graph instead; the server logs startup diagnostics and serves the
+remaining healthy graphs. `GET /graphs` enumerates ready/served graphs only,
+so quarantined graphs are absent and their routes return 404.
+
+Operators who want the original all-or-nothing boot contract can pass
+`--require-all-graphs` or set `OMNIGRAPH_REQUIRE_ALL_GRAPHS=1`. In that mode,
+any graph quarantine, graph-open failure, stored-query startup failure, or
+embedding-provider resolution failure aborts startup.
 
 A scheme-qualified argument (`s3://…`) reads the ledger straight from the
 storage root, with no local config directory. `--bind`,
@@ -27,7 +40,7 @@ storage root, with no local config directory. `--bind`,
 
 ### Stored-query validation at startup
 
-If a graph declares a `queries:` registry (see [cli-reference](../cli/reference.md)), the server **loads and type-checks every stored query against that graph's live schema at startup** and **refuses to boot** if any query references a type or property the schema lacks — the same fail-loud posture as a malformed policy file, so schema drift surfaces at the deploy boundary rather than at invocation. Two MCP-exposed queries claiming the same tool name is likewise a boot error. Non-blocking advisories (e.g. an MCP-exposed query with a vector parameter an agent cannot supply) are logged. Validate offline before deploying with `omnigraph queries validate`. Discover the exposed queries as a typed tool catalog with `GET /queries`, and invoke one over HTTP with `POST /queries/{name}` (both below).
+If a graph declares a `queries:` registry (see [cli-reference](../cli/reference.md)), the server **loads and type-checks every stored query against that graph's live schema at startup**. Query parse/type failures quarantine that graph; if no graph remains healthy, startup refuses. Two MCP-exposed queries claiming the same tool name are likewise graph-local startup failures. Non-blocking advisories (e.g. an MCP-exposed query with a vector parameter an agent cannot supply) are logged. Validate offline before deploying with `omnigraph queries validate`. Discover the exposed queries as a typed tool catalog with `GET /queries`, and invoke one over HTTP with `POST /queries/{name}` (both below).
 
 ## Endpoint inventory
 
@@ -62,7 +75,7 @@ Server-level management endpoints:
 
 | Method | Path | Auth | Action |
 |---|---|---|---|
-| GET | `/graphs` | bearer + `graph_list` on `Server::"root"` | list registered graphs |
+| GET | `/graphs` | bearer + `graph_list` on `Server::"root"` | list ready/served graphs |
 
 ### Stored-query catalog (`GET /queries`)
 

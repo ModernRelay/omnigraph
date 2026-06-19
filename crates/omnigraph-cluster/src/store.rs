@@ -250,7 +250,14 @@ impl ClusterStore {
     /// Best-effort object removal (sidecar retirement after a CAS lands,
     /// lock cleanup) — failures are recoverable by the next sweep.
     pub(crate) async fn delete_object(&self, uri: &str) {
-        let _ = self.adapter.delete(uri).await;
+        let _ = self.try_delete_object(uri).await;
+    }
+
+    /// Like `delete_object` but surfaces the failure, so a caller that depends
+    /// on the deletion (e.g. the pre-movement sidecar cleanup fast-path) can
+    /// report it as a diagnostic instead of silently leaving stale state.
+    pub(crate) async fn try_delete_object(&self, uri: &str) -> Result<(), String> {
+        self.adapter.delete(uri).await.map_err(|err| err.to_string())
     }
 
     /// Recursive prefix delete for graph roots (approved deletes). Idempotent;
@@ -320,6 +327,32 @@ impl ClusterStore {
     }
 
     // ---- recovery sidecars ----
+
+    pub(crate) async fn list_recovery_sidecar_locations(
+        &self,
+        diagnostics: &mut Vec<Diagnostic>,
+    ) -> Vec<String> {
+        let dir_uri = self.uri(CLUSTER_RECOVERIES_DIR);
+        let mut uris = match self.adapter.list_dir(&dir_uri).await {
+            Ok(uris) => uris,
+            Err(err) => {
+                diagnostics.push(Diagnostic::warning(
+                    "recovery_sidecar_read_error",
+                    CLUSTER_RECOVERIES_DIR,
+                    format!("could not list '{CLUSTER_RECOVERIES_DIR}': {err}"),
+                ));
+                return Vec::new();
+            }
+        };
+        uris.retain(|uri| uri.ends_with(".json"));
+        uris.sort();
+        uris.into_iter()
+            .map(|uri| {
+                let name = uri.rsplit_once('/').map_or(uri.as_str(), |(_, name)| name);
+                format!("{}/{name}", self.display(CLUSTER_RECOVERIES_DIR))
+            })
+            .collect()
+    }
 
     pub(crate) async fn list_recovery_sidecars(
         &self,

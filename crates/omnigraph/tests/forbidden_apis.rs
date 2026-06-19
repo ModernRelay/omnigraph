@@ -71,6 +71,14 @@ const FORBIDDEN_PATTERNS: &[&str] = &[
     "Dataset::drop_columns",
     "Dataset::truncate_table",
     "Dataset::restore",
+    // Raw dataset OPENS — all reads must route through `Snapshot::open` (the
+    // held-handle cache + shared Session, Fix 3). Only the instrumented opener
+    // (`instrumentation.rs`) and the storage/manifest layers (allow-listed below)
+    // open datasets directly; forbidding these in the read/exec layer keeps a
+    // future read from silently bypassing the cache.
+    "Dataset::open",
+    "DatasetBuilder::from_uri",
+    "DatasetBuilder::from_namespace",
     // Lance-specific method names that don't clash with our `TableStore`
     // wrappers (we use `merge_insert_batch{,es}`, `add_columns_to_*`,
     // etc. — never the bare Lance names). Engine code that writes
@@ -106,6 +114,7 @@ const ALLOW_LIST_FILES: &[&str] = &[
     "commit_graph.rs",      // Maintains `_graph_commits.lance` system table.
     "graph_coordinator.rs", // Drives the manifest publisher / branch coordinator.
     "recovery_audit.rs",    // Maintains `_graph_commit_recoveries.lance` (recovery audit trail).
+    "instrumentation.rs",   // The instrumented dataset opener (open_dataset_tracked / open_table_dataset).
 ];
 
 /// Directories exempt from the guard. Files under these paths may use

@@ -15,14 +15,11 @@ use omnigraph::db::{Omnigraph, ReadTarget};
 use omnigraph::error::OmniError;
 use omnigraph::loader::{LoadMode, load_jsonl};
 use omnigraph_policy::{PolicyChecker, PolicyEngine};
-use omnigraph_server::api::{
-    BranchCreateRequest, BranchMergeRequest, ChangeRequest, ReadRequest,
-};
+use omnigraph_server::api::{BranchCreateRequest, BranchMergeRequest, ChangeRequest, ReadRequest};
 use omnigraph_server::queries::{QueryRegistry, RegistrySpec};
 use omnigraph_server::{AppState, build_app};
 use serde_json::{Value, json};
 use tower::ServiceExt;
-
 
 pub const MUTATION_QUERIES: &str = r#"
 query insert_person($name: String, $age: I32) {
@@ -1212,6 +1209,8 @@ graphs:
     temp
 }
 
-pub async fn cluster_settings(dir: &Path) -> color_eyre::eyre::Result<omnigraph_server::ServerConfig> {
-    omnigraph_server::load_server_settings(Some(&dir.to_path_buf()), None, true).await
+pub async fn cluster_settings(
+    dir: &Path,
+) -> color_eyre::eyre::Result<omnigraph_server::ServerConfig> {
+    omnigraph_server::load_server_settings(Some(&dir.to_path_buf()), None, true, false).await
 }

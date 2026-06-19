@@ -24,20 +24,19 @@ mod recovery;
 mod state;
 
 use graph::{init_manifest_graph, open_manifest_graph, snapshot_state_at};
-use layout::{manifest_uri, open_manifest_dataset, type_name_hash};
+use layout::{manifest_uri, open_manifest_dataset, table_uri_for_path, type_name_hash};
 pub(crate) use metadata::TableVersionMetadata;
 #[cfg(test)]
 use metadata::{OMNIGRAPH_ROW_COUNT_KEY, table_version_metadata_for_state};
-use namespace::open_table_at_version_from_manifest;
 pub(crate) use namespace::open_table_head_for_write;
 #[cfg(test)]
 use namespace::{branch_manifest_namespace, staged_table_namespace};
 use publisher::{GraphNamespacePublisher, ManifestBatchPublisher};
 pub(crate) use recovery::{
-    RecoveryMode, RecoverySidecarHandle, SidecarKind, SidecarTablePin, SidecarTableRegistration,
-    SidecarTombstone, delete_sidecar, has_schema_apply_sidecar, heal_pending_sidecars_roll_forward,
-    list_sidecars, new_sidecar, recover_manifest_drift, schema_apply_serial_queue_key,
-    write_sidecar,
+    RecoveryMode, RecoverySidecar, RecoverySidecarHandle, SidecarKind, SidecarTablePin,
+    SidecarTableRegistration, SidecarTombstone, confirm_sidecar_phase_b, delete_sidecar,
+    has_schema_apply_sidecar, heal_pending_sidecars_roll_forward, list_sidecars, new_sidecar,
+    recover_manifest_drift, schema_apply_serial_queue_key, write_sidecar,
 };
 pub use state::SubTableEntry;
 #[cfg(test)]
@@ -74,16 +73,51 @@ pub struct Snapshot {
     root_uri: String,
     version: u64,
     entries: HashMap<String, SubTableEntry>,
+    /// Per-graph read caches (shared `Session` + held-handle cache), injected by
+    /// `Omnigraph::resolved_target` for live Branch reads so table opens reuse
+    /// handles (0 IO on a warm repeat) and one `Session`. `None` for write-prelude
+    /// snapshots, time-travel / Snapshot-id reads, and directly-built test
+    /// snapshots, which fall back to a plain open.
+    read_caches: Option<Arc<crate::runtime_cache::ReadCaches>>,
 }
 
 impl Snapshot {
-    /// Open a sub-table dataset at its pinned version.
+    /// Open a sub-table dataset at its pinned version. With read caches present
+    /// (live Branch reads), reuse a held handle through the cache (0 open IO on a
+    /// warm repeat) and the shared `Session`; otherwise plain-open (Fix 2).
     pub async fn open(&self, table_key: &str) -> Result<Dataset> {
         let entry = self
             .entries
             .get(table_key)
             .ok_or_else(|| OmniError::manifest(format!("no manifest entry for {}", table_key)))?;
-        entry.open(&self.root_uri).await
+        match &self.read_caches {
+            Some(caches) => {
+                let location = table_uri_for_path(
+                    &self.root_uri,
+                    &entry.table_path,
+                    entry.table_branch.as_deref(),
+                );
+                caches
+                    .handles
+                    .get_or_open(
+                        &entry.table_path,
+                        entry.table_branch.as_deref(),
+                        entry.table_version,
+                        entry.version_metadata.e_tag(),
+                        &location,
+                        Some(&caches.session),
+                    )
+                    .await
+            }
+            None => entry.open(&self.root_uri).await,
+        }
+    }
+
+    /// Attach per-graph read caches (shared `Session` + handle cache) so this
+    /// snapshot's table opens reuse handles and the session. Set by
+    /// `Omnigraph::resolved_target` for live Branch reads only.
+    pub(crate) fn set_read_caches(&mut self, caches: Arc<crate::runtime_cache::ReadCaches>) {
+        self.read_caches = Some(caches);
     }
 
     /// Manifest version this snapshot was taken from.
@@ -98,6 +132,31 @@ impl Snapshot {
 
     pub fn entries(&self) -> impl Iterator<Item = &SubTableEntry> {
         self.entries.values()
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct ManifestIncarnation {
+    pub(crate) version: u64,
+    pub(crate) e_tag: Option<String>,
+    timestamp_nanos: Option<u128>,
+}
+
+impl ManifestIncarnation {
+    pub(crate) fn matches(&self, held: &Self) -> bool {
+        if self.version != held.version {
+            return false;
+        }
+        match (&self.e_tag, &held.e_tag) {
+            (Some(latest), Some(current)) => latest == current,
+            _ => match (self.timestamp_nanos, held.timestamp_nanos) {
+                (Some(latest), Some(current)) => latest == current,
+                // Some object stores can omit both e_tag and manifest timestamp
+                // from the reachable API. In that narrow case the version-number
+                // probe is the strongest available identity.
+                _ => true,
+            },
+        }
     }
 }
 
@@ -132,14 +191,28 @@ pub(crate) enum ManifestChange {
 }
 
 impl SubTableEntry {
+    /// Open this sub-table at its pinned version directly by location (Fix 2),
+    /// without the Lance namespace — which would full-scan `__manifest` twice per
+    /// open (`describe_table` + `describe_table_version`). The resolved Snapshot
+    /// already holds the path, version, and branch. Branches are Lance native
+    /// branches, so `with_branch` resolves `{base}/tree/{branch}` from the base
+    /// URI; main uses `with_version`.
     pub(crate) async fn open(&self, root_uri: &str) -> Result<Dataset> {
-        open_table_at_version_from_manifest(
-            root_uri,
-            &self.table_key,
-            self.table_branch.as_deref(),
-            self.table_version,
-        )
-        .await
+        // The branch-qualified location is the dataset that physically holds this
+        // version: main at `{table_path}`, a branch at
+        // `{table_path}/tree/{branch}` (Lance native-branch storage). `with_version`
+        // then resolves the version within THAT dataset's `_versions` — a branch
+        // version lives under `tree/{branch}/_versions`, not the base. This
+        // matches the physical layout the namespace path resolved, without the
+        // per-open `__manifest` scan.
+        let location = table_uri_for_path(root_uri, &self.table_path, self.table_branch.as_deref());
+        // Route through the instrumented data-table opener (Fix 3). With no
+        // session this is exactly the Fix-2 `from_uri(location).with_version`.
+        // This is the uncached fallback (a snapshot with no read caches); the
+        // cached path (`Snapshot::open` → handle cache) calls the same opener on
+        // a miss with the shared session, so both paths count on the per-query
+        // `table_wrapper`.
+        crate::instrumentation::open_table_dataset(&location, self.table_version, None).await
     }
 }
 
@@ -223,6 +296,7 @@ impl ManifestCoordinator {
                 .into_iter()
                 .map(|entry| (entry.table_key.clone(), entry))
                 .collect(),
+            read_caches: None,
         }
     }
 
@@ -357,6 +431,48 @@ impl ManifestCoordinator {
     /// Current manifest version.
     pub fn version(&self) -> u64 {
         self.dataset.version().version
+    }
+
+    /// Latest committed manifest version on disk (one object-store op, no row
+    /// scan). The freshness probe for warm reuse: compare against `version()`
+    /// (the held handle's pinned version) to decide whether to refresh.
+    pub async fn probe_latest_version(&self) -> Result<u64> {
+        self.dataset
+            .latest_version_id()
+            .await
+            .map_err(|e| OmniError::Lance(e.to_string()))
+    }
+
+    pub(crate) fn incarnation(&self) -> ManifestIncarnation {
+        ManifestIncarnation {
+            version: self.version(),
+            e_tag: self.dataset.manifest_location().e_tag.clone(),
+            timestamp_nanos: Some(self.dataset.manifest().timestamp_nanos),
+        }
+    }
+
+    /// Latest committed manifest identity. Main cannot be deleted/recreated, so
+    /// the cheap version-number probe is sufficient there. Non-main Lance
+    /// branches can be deleted and recreated with the same version number, so
+    /// load the latest manifest location and compare its e_tag / timestamp too.
+    pub(crate) async fn probe_latest_incarnation(&self) -> Result<ManifestIncarnation> {
+        if self.active_branch.is_none() {
+            return Ok(ManifestIncarnation {
+                version: self.probe_latest_version().await?,
+                e_tag: self.dataset.manifest_location().e_tag.clone(),
+                timestamp_nanos: Some(self.dataset.manifest().timestamp_nanos),
+            });
+        }
+        let (manifest, location) = self
+            .dataset
+            .latest_manifest()
+            .await
+            .map_err(|e| OmniError::Lance(e.to_string()))?;
+        Ok(ManifestIncarnation {
+            version: manifest.version,
+            e_tag: location.e_tag,
+            timestamp_nanos: Some(manifest.timestamp_nanos),
+        })
     }
 
     pub fn active_branch(&self) -> Option<&str> {

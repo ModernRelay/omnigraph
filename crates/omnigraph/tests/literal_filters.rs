@@ -145,3 +145,29 @@ query seen_eq() { match { $m: Metric { seen: datetime("2024-06-01T12:00:00Z") } 
     assert_eq!(sorted_metric_names(&mut db, q, "born_eq").await, vec!["m1"]);
     assert_eq!(sorted_metric_names(&mut db, q, "seen_eq").await, vec!["m1"]);
 }
+
+// #283: a property-match on a camelCase `@index` field must execute, not fail
+// with "No field named reponame" at the Lance scan. Exercises the pushdown arm
+// (inline binding `Doc { repoName: $r }`) end-to-end.
+const CC_SCHEMA: &str = r#"
+node Doc {
+    slug: String @key
+    repoName: String @index
+}
+"#;
+const CC_DATA: &str = r#"{"type":"Doc","data":{"slug":"d1","repoName":"acme"}}
+{"type":"Doc","data":{"slug":"d2","repoName":"globex"}}"#;
+
+#[tokio::test]
+async fn camelcase_property_filter_executes() {
+    let dir = tempfile::tempdir().unwrap();
+    let uri = dir.path().to_str().unwrap();
+    let mut db = Omnigraph::init(uri, CC_SCHEMA).await.unwrap();
+    load_jsonl(&mut db, CC_DATA, LoadMode::Overwrite).await.unwrap();
+
+    let q = r#"query by_repo($r: String) { match { $d: Doc { repoName: $r } } return { $d.slug } }"#;
+    let r = query_main(&mut db, q, "by_repo", &params(&[("$r", "acme")]))
+        .await
+        .expect("camelCase property filter must execute, not fail at the Lance scan");
+    assert_eq!(r.num_rows(), 1, "expected exactly the d1 row for repoName=acme");
+}

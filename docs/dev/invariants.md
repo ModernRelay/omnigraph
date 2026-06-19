@@ -53,7 +53,13 @@ converge the physical state.
    versioning, fragments, branches, compaction, cleanup, and index primitives.
    DataFusion should own relational execution where it fits. Do not add custom
    WALs, transaction managers, buffer pools, page formats, or local clones of
-   substrate behavior. Read [lance.md](lance.md) before guessing.
+   substrate behavior. Read [lance.md](lance.md) before guessing. Respecting the
+   substrate also means *using* it idiomatically, not only refraining from
+   rebuilding it: reuse long-lived handles instead of re-opening per call,
+   resolve latest state through the substrate's cheap primitive instead of
+   re-scanning, and share its caches/session. Re-deriving per call what the
+   substrate keeps warm is a substrate violation even when no code is
+   reimplemented.
 
 2. **Graph visibility is manifest-atomic.** Lance commits are per dataset.
    OmniGraph's graph-level atomicity comes from publishing one manifest update
@@ -125,6 +131,18 @@ converge the physical state.
     storage changes need storage/recovery coverage, and end-to-end tests are not
     a substitute for missing lower-level assertions. Read [testing.md](testing.md)
     before adding tests.
+
+15. **One source of truth, cheaply derived.** Lance and the manifest are the
+    source of truth. Everything the engine needs at runtime is a derived view of
+    them: read or projected on demand, held warm, refreshed by a cheap probe. Two
+    failure modes are forbidden. A *parallel copy* the engine maintains can drift
+    from the source, and that divergence compounds over time. *Cold
+    re-derivation* rebuilds the view from the full source on every call, so its
+    cost grows with history. Invariants 1 and 7, and the deny-list "state that
+    drifts" and "manifest-derivable reconciler" items, are instances; so is
+    bounding a read's cost to its working set rather than the commit count. This
+    is the structural face of "engineering is programming integrated over time":
+    both failure modes are liabilities that compound as the system grows.
 
 ## Current Truth Matrix
 
@@ -252,6 +270,37 @@ them explicit.
 - **Resource bounds:** some operations still lack enforced per-query memory or
   time budgets. New long-running work should add explicit bounds rather than
   widening the gap.
+- **Read-path re-derivation (largely closed by the query-latency work):**
+  snapshot resolution used to re-open a fresh coordinator per read (a full
+  `__manifest` re-scan plus two commit-graph scans), open each table through the
+  namespace (two more `__manifest` scans per table), validate the schema twice,
+  and share no Lance `Session`. That was an O(commits) cost that never warmed up.
+  Fix 1 (warm coordinator reuse behind a `latest_version_id` probe), Fix 2 (open
+  tables by location+version), finding A (validate once), and Fix 3 (a held
+  `Dataset`-handle cache keyed by `(table, branch, version, e_tag when Lance
+  exposes it)` plus one shared `Session` per graph) remove that tax: a warm
+  same-branch read does one probe, one schema read, and zero opens on a repeat.
+  Non-main branch freshness compares the manifest incarnation (`version` plus
+  manifest-location e_tag when available, otherwise Lance manifest timestamp),
+  because Lance branch names can be deleted/recreated at the same version number;
+  the manifest e_tag is carried into synthetic snapshot ids when available, and
+  a detected same-branch manifest refresh clears read caches as the fallback for
+  e_tag-less table locations/topology. Remaining: the internal metadata tables
+  (`__manifest`, `_graph_commits`) are still not compacted, so the probe and
+  refresh cost still grows with fragment count on a long-lived graph (the
+  `optimize`-covers-internal-tables follow-up); the commit graph is not yet
+  reconcilable from the manifest; and the traversal id-map is still rebuilt.
+- **Commit-graph parent under concurrency:** `record_graph_commit` now refreshes
+  the commit-graph head from storage before appending, so a same-branch write
+  after an external commit no longer forks the commit DAG by parenting off a
+  stale cached head (the single-process fork, pre-existing for non-strict
+  inserts and widened to strict ops by Fix 1's `refresh_manifest_only`, is now
+  closed). Residual: two processes writing disjoint tables can still pass their
+  per-table manifest CAS and append off the same parent (a refresh-then-append
+  TOCTOU). The convergent fix is reconcile-from-manifest (parent = the commit at
+  the manifest version the publisher CAS'd against; `manifest_version` is on
+  every commit row), composing with the manifest-to-commit-graph atomicity gap;
+  it needs commit-graph append ordering or a Lance append-CAS to fully close.
 
 ## Deny-list
 
@@ -277,6 +326,10 @@ case is exceptional.
 - Cost-blind plan choice when statistics are available or required.
 - Hidden statistics for behavior that affects planning or operator choice.
 - Hash-map iteration order in result ordering, plan choice, or migration output.
+- Cold re-derivation on the hot path: rebuilding from the full source what could
+  be held warm and refreshed cheaply, so cost scales with history rather than the
+  working set (the cost face of invariant 15; "state that drifts" above is its
+  shadow-copy face).
 - String-flattened SQL/filter generation when a structured pushdown API is
   available.
 - Eager multi-hop cross-product materialization when factorization fits.
@@ -313,6 +366,8 @@ Use this as yes/no/NA for any non-trivial design or PR:
 - Are stats/capabilities exposed when behavior depends on them?
 - Are existing known gaps left no worse and documented if touched?
 - Does the test live at the same boundary as the change?
+- Is this operation's cost bounded with respect to history and scale, or does it
+  re-derive warm state from cold storage per call?
 - Does the change avoid every deny-list pattern, or justify the exception?
 
 ## Maintenance Policy

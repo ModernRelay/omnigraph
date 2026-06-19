@@ -304,3 +304,108 @@ async fn init_with_force_recovers_from_orphan_schema_files() {
         "force-recovered graph must have full schema state written"
     );
 }
+
+/// E2e for the schema-level `.pg` surface: `@description` (node / edge /
+/// property) and `@instruction` (node / edge only) parse, validate, and
+/// persist verbatim into the on-disk `_schema.ir.json` through `Omnigraph::init`
+/// — the contract that surfaces them in catalog metadata for tooling.
+#[tokio::test]
+async fn schema_annotations_persist_into_ir_json_on_init() {
+    let dir = tempfile::tempdir().unwrap();
+    let uri = dir.path().to_str().unwrap();
+
+    let schema = r#"
+node Task @description("Tracked work item") @instruction("Prefer querying by slug") {
+    slug: String @key @description("Stable external identifier")
+}
+
+edge DependsOn: Task -> Task @description("Hard dependency") @instruction("Use only for blockers")
+"#;
+
+    Omnigraph::init(uri, schema).await.unwrap();
+
+    let ir_json = fs::read_to_string(dir.path().join("_schema.ir.json")).unwrap();
+    let ir: serde_json::Value = serde_json::from_str(&ir_json).unwrap();
+
+    // Helper: collect the {name -> value} map of annotations that carry a
+    // string value. Value-less annotations (e.g. `@key`, which also desugars
+    // to a constraint) are skipped — they aren't what this test asserts.
+    let anns = |v: &serde_json::Value| -> std::collections::BTreeMap<String, String> {
+        v["annotations"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(|a| {
+                Some((
+                    a["name"].as_str()?.to_string(),
+                    a["value"].as_str()?.to_string(),
+                ))
+            })
+            .collect()
+    };
+
+    let node = ir["nodes"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|n| n["name"] == "Task")
+        .unwrap();
+    let node_anns = anns(node);
+    assert_eq!(node_anns.get("description").map(String::as_str), Some("Tracked work item"));
+    assert_eq!(
+        node_anns.get("instruction").map(String::as_str),
+        Some("Prefer querying by slug"),
+        "node @instruction persists into _schema.ir.json"
+    );
+
+    let prop = node["properties"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|p| p["name"] == "slug")
+        .unwrap();
+    assert_eq!(
+        anns(prop).get("description").map(String::as_str),
+        Some("Stable external identifier"),
+        "property @description persists into _schema.ir.json"
+    );
+
+    let edge = ir["edges"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|e| e["name"] == "DependsOn")
+        .unwrap();
+    let edge_anns = anns(edge);
+    assert_eq!(edge_anns.get("description").map(String::as_str), Some("Hard dependency"));
+    assert_eq!(edge_anns.get("instruction").map(String::as_str), Some("Use only for blockers"));
+}
+
+/// `@instruction` is rejected on a property at compile time, so init aborts
+/// before any graph state is written (mirrors the parser-level rejection from
+/// the full engine boundary).
+#[tokio::test]
+async fn init_rejects_instruction_on_property() {
+    let dir = tempfile::tempdir().unwrap();
+    let uri = dir.path().to_str().unwrap();
+
+    let schema = r#"
+node Task {
+    slug: String @key @instruction("bad")
+}
+"#;
+
+    // `Omnigraph` is not `Debug`, so match rather than `unwrap_err`.
+    let err = match Omnigraph::init(uri, schema).await {
+        Ok(_) => panic!("property-level @instruction must abort init"),
+        Err(err) => err,
+    };
+    assert!(
+        err.to_string().contains("@instruction is only supported on node and edge types"),
+        "property-level @instruction must abort init: {err}"
+    );
+    assert!(
+        !dir.path().join("_schema.ir.json").exists(),
+        "rejected init must not persist a schema IR"
+    );
+}

@@ -1174,6 +1174,19 @@ graphs:
             .unwrap()
     }
 
+    fn recovery_sidecars(config_dir: &Path) -> Vec<std::path::PathBuf> {
+        let dir = config_dir.join(CLUSTER_RECOVERIES_DIR);
+        if !dir.exists() {
+            return Vec::new();
+        }
+        let mut sidecars: Vec<_> = fs::read_dir(dir)
+            .unwrap()
+            .map(|entry| entry.unwrap().path())
+            .collect();
+        sidecars.sort();
+        sidecars
+    }
+
     fn query_payload_path(config_dir: &Path, digest: &str) -> std::path::PathBuf {
         config_dir
             .join(CLUSTER_RESOURCES_DIR)
@@ -1586,8 +1599,17 @@ graphs:
             state["applied_revision"]["resources"]["schema.knowledge"]["digest"],
             desired.resource_digests["schema.knowledge"]
         );
-        // Second run: the sweep retires the stale sidecar (ledger consistent)
-        // and the run fails just as loudly — idempotent loudness.
+        let db = Omnigraph::open_read_only(&derived_graph_uri(dir.path(), "knowledge"))
+            .await
+            .unwrap();
+        assert_eq!(db.schema_source().as_str(), SCHEMA);
+        assert!(
+            recovery_sidecars(dir.path()).is_empty(),
+            "{:?}",
+            recovery_sidecars(dir.path())
+        );
+        // Second run fails just as loudly and still leaves no sidecar because
+        // the engine preview rejects before graph state can move.
         let second = apply_config_dir(dir.path()).await;
         assert!(!second.ok);
         assert!(
@@ -1596,6 +1618,45 @@ graphs:
                 .iter()
                 .any(|diagnostic| diagnostic.code == "schema_apply_failed")
         );
+        assert!(
+            recovery_sidecars(dir.path()).is_empty(),
+            "{:?}",
+            recovery_sidecars(dir.path())
+        );
+    }
+
+    #[tokio::test]
+    async fn apply_schema_update_blocked_by_non_main_branch_leaves_no_sidecar() {
+        let dir = fixture();
+        init_derived_graph(dir.path()).await;
+        write_applyable_state(dir.path());
+        let graph_uri = derived_graph_uri(dir.path(), "knowledge");
+        let db = Omnigraph::open(&graph_uri).await.unwrap();
+        db.branch_create("feature").await.unwrap();
+        drop(db);
+        let before_state = read_state_json(dir.path());
+        fs::write(dir.path().join("people.pg"), SCHEMA_V2).unwrap();
+
+        let out = apply_config_dir(dir.path()).await;
+        assert!(!out.ok);
+        assert!(out.diagnostics.iter().any(|diagnostic| {
+            diagnostic.code == "schema_apply_failed"
+                && diagnostic
+                    .message
+                    .contains("schema apply requires a graph with only main")
+        }));
+        assert!(
+            recovery_sidecars(dir.path()).is_empty(),
+            "{:?}",
+            recovery_sidecars(dir.path())
+        );
+        let after_state = read_state_json(dir.path());
+        assert_eq!(
+            after_state["applied_revision"]["resources"],
+            before_state["applied_revision"]["resources"]
+        );
+        let reopened = Omnigraph::open_read_only(&graph_uri).await.unwrap();
+        assert_eq!(reopened.schema_source().as_str(), SCHEMA);
     }
 
     #[tokio::test]
@@ -2964,6 +3025,10 @@ policies:
             .find(|change| change.resource == "policy.base")
             .expect("binding change must be visible in plan");
         assert!(change.binding_change);
+        assert_eq!(
+            change.metadata_change,
+            Some(PlanMetadataChange::PolicyBindings)
+        );
         assert_eq!(change.operation, PlanOperation::Update);
         assert_eq!(change.before_digest, change.after_digest);
 
@@ -3002,9 +3067,9 @@ policies:
 
         let plan = plan_config_dir(dir.path()).await;
         assert!(
-            plan.changes
-                .iter()
-                .any(|change| change.resource == "policy.base" && change.binding_change),
+            plan.changes.iter().any(|change| change.resource == "policy.base"
+                && change.binding_change
+                && change.metadata_change == Some(PlanMetadataChange::PolicyBindings)),
             "{plan:?}"
         );
         let out = apply_config_dir(dir.path()).await;
@@ -3014,6 +3079,52 @@ policies:
             healed["applied_revision"]["resources"]["policy.base"]["applies_to"],
             serde_json::json!(["graph.knowledge"])
         );
+    }
+
+    #[tokio::test]
+    async fn pre_5a_state_backfills_embedding_profile() {
+        let dir = fixture();
+        init_derived_graph(dir.path()).await;
+        write_mock_embedding_cluster(dir.path(), "recorded-x");
+        write_applyable_state(dir.path());
+        let converge = apply_config_dir(dir.path()).await;
+        assert!(converge.converged, "{converge:?}");
+
+        let mut state = read_state_json(dir.path());
+        state["applied_revision"]["resources"]["provider.embedding.default"]
+            .as_object_mut()
+            .unwrap()
+            .remove("embedding_profile");
+        fs::write(
+            dir.path().join(CLUSTER_STATE_FILE),
+            serde_json::to_string_pretty(&state).unwrap(),
+        )
+        .unwrap();
+
+        let plan = plan_config_dir(dir.path()).await;
+        let change = plan
+            .changes
+            .iter()
+            .find(|change| change.resource == "provider.embedding.default")
+            .expect("embedding profile backfill must be visible in plan");
+        assert_eq!(change.operation, PlanOperation::Update);
+        assert_eq!(change.before_digest, change.after_digest);
+        assert_eq!(
+            change.metadata_change,
+            Some(PlanMetadataChange::EmbeddingProfile)
+        );
+
+        let out = apply_config_dir(dir.path()).await;
+        assert!(out.ok && out.converged, "{out:?}");
+        let healed = read_state_json(dir.path());
+        assert_eq!(
+            healed["applied_revision"]["resources"]["provider.embedding.default"]
+                ["embedding_profile"]["model"],
+            serde_json::json!("recorded-x")
+        );
+        let snapshot = read_serving_snapshot(dir.path()).await.unwrap();
+        let profile = snapshot.graphs[0].embedding.as_ref().unwrap();
+        assert_eq!(profile.model.as_deref(), Some("recorded-x"));
     }
 
     #[tokio::test]
@@ -3189,9 +3300,92 @@ policies:
 
         let err = read_serving_snapshot(dir.path()).await.unwrap_err();
         assert!(
-            err.iter().any(|diagnostic| diagnostic.code == "cluster_recovery_pending"),
+            err.iter()
+                .any(|diagnostic| diagnostic.code == "cluster_no_healthy_graphs"),
             "{err:?}"
         );
+        assert!(
+            err.iter().any(|diagnostic| {
+                diagnostic.code == "cluster_recovery_pending"
+                    && diagnostic.path == "graph.knowledge"
+            }),
+            "{err:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn serving_snapshot_quarantines_one_graph_with_pending_recovery() {
+        let dir = fixture();
+        fs::write(
+            dir.path().join(CLUSTER_CONFIG_FILE),
+            r#"
+version: 1
+metadata:
+  name: test
+state:
+  backend: cluster
+  lock: true
+graphs:
+  knowledge:
+    schema: ./people.pg
+  archive:
+    schema: ./people.pg
+"#,
+        )
+        .unwrap();
+        let graph_dir = dir.path().join(CLUSTER_GRAPHS_DIR);
+        fs::create_dir_all(&graph_dir).unwrap();
+        Omnigraph::init(
+            graph_dir.join("knowledge.omni").to_string_lossy().as_ref(),
+            SCHEMA,
+        )
+        .await
+        .unwrap();
+        Omnigraph::init(
+            graph_dir.join("archive.omni").to_string_lossy().as_ref(),
+            SCHEMA,
+        )
+        .await
+        .unwrap();
+        let desired = validate_config_dir(dir.path());
+        assert!(desired.ok, "{:?}", desired.diagnostics);
+        let schema_digest = desired.resource_digests["schema.knowledge"].clone();
+        let empty_queries = BTreeMap::new();
+        let knowledge_digest = graph_digest(
+            "knowledge",
+            Some(&schema_digest),
+            Some(&empty_queries),
+            None,
+            None,
+        );
+        let archive_digest = graph_digest(
+            "archive",
+            Some(&schema_digest),
+            Some(&empty_queries),
+            None,
+            None,
+        );
+        write_state_resources(
+            dir.path(),
+            &[
+                ("graph.knowledge", knowledge_digest.as_str()),
+                ("schema.knowledge", schema_digest.as_str()),
+                ("graph.archive", archive_digest.as_str()),
+                ("schema.archive", schema_digest.as_str()),
+            ],
+        );
+        write_schema_apply_sidecar(dir.path(), "knowledge", "whatever", "01SERVE2");
+
+        let snapshot = read_serving_snapshot(dir.path()).await.unwrap();
+        assert_eq!(snapshot.graphs.len(), 1);
+        assert_eq!(snapshot.graphs[0].graph_id, "archive");
+        assert!(snapshot.queries.is_empty());
+        assert!(snapshot.policies.is_empty());
+        assert!(snapshot.diagnostics.iter().any(|diagnostic| {
+            diagnostic.code == "cluster_recovery_pending"
+                && diagnostic.path == "graph.knowledge"
+                && diagnostic.severity == DiagnosticSeverity::Warning
+        }));
     }
 
     #[tokio::test]
@@ -3373,6 +3567,96 @@ policies:
                 .any(|diagnostic| diagnostic.code == "cluster_recovery_pending"
                     && diagnostic.severity == DiagnosticSeverity::Warning)
         );
+    }
+
+    #[tokio::test]
+    async fn read_only_commands_ignore_missing_recovery_sidecar_dir() {
+        let dir = fixture();
+        write_applyable_state(dir.path());
+        assert!(!dir.path().join(CLUSTER_RECOVERIES_DIR).exists());
+
+        let status = status_config_dir(dir.path()).await;
+        assert!(status.ok, "{:?}", status.diagnostics);
+        assert!(
+            !status.diagnostics.iter().any(|diagnostic| matches!(
+                diagnostic.code.as_str(),
+                "recovery_sidecar_read_error" | "cluster_recovery_pending"
+            )),
+            "{:?}",
+            status.diagnostics
+        );
+
+        let plan = plan_config_dir(dir.path()).await;
+        assert!(plan.ok, "{:?}", plan.diagnostics);
+        assert!(
+            !plan.diagnostics.iter().any(|diagnostic| matches!(
+                diagnostic.code.as_str(),
+                "recovery_sidecar_read_error" | "cluster_recovery_pending"
+            )),
+            "{:?}",
+            plan.diagnostics
+        );
+    }
+
+    #[tokio::test]
+    async fn read_only_commands_warn_on_pending_recovery_sidecar_in_storage_root() {
+        let dir = fixture();
+        let storage = tempfile::tempdir().unwrap();
+        let storage_path = storage.path().to_string_lossy().to_string();
+        let mut config = fs::read_to_string(dir.path().join(CLUSTER_CONFIG_FILE)).unwrap();
+        config = config.replace(
+            "version: 1\n",
+            &format!("version: 1\nstorage: {storage_path}\n"),
+        );
+        fs::write(dir.path().join(CLUSTER_CONFIG_FILE), config).unwrap();
+
+        let desired = validate_config_dir(dir.path());
+        assert!(desired.ok, "{:?}", desired.diagnostics);
+        let schema_digest = desired
+            .resource_digests
+            .get("schema.knowledge")
+            .unwrap()
+            .clone();
+        let graph_composite = graph_digest(
+            "knowledge",
+            Some(&schema_digest),
+            Some(&BTreeMap::new()),
+            None,
+            None,
+        );
+        write_state_resources(
+            storage.path(),
+            &[
+                ("graph.knowledge", graph_composite.as_str()),
+                ("schema.knowledge", schema_digest.as_str()),
+            ],
+        );
+        write_create_sidecar(storage.path(), "knowledge", "irrelevant", "01STORAGE");
+
+        let status = status_config_dir(dir.path()).await;
+        assert!(status.ok, "{:?}", status.diagnostics);
+        assert!(
+            status
+                .diagnostics
+                .iter()
+                .any(|diagnostic| diagnostic.code == "cluster_recovery_pending"
+                    && diagnostic.path.contains("01STORAGE.json")),
+            "{:?}",
+            status.diagnostics
+        );
+
+        let plan = plan_config_dir(dir.path()).await;
+        assert!(plan.ok, "{:?}", plan.diagnostics);
+        assert!(
+            plan.diagnostics
+                .iter()
+                .any(|diagnostic| diagnostic.code == "cluster_recovery_pending"
+                    && diagnostic.path.contains("01STORAGE.json")),
+            "{:?}",
+            plan.diagnostics
+        );
+
+        assert!(!dir.path().join(CLUSTER_RECOVERIES_DIR).exists());
     }
 
     #[tokio::test]

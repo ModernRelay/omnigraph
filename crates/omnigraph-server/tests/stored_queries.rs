@@ -371,6 +371,47 @@ async fn list_queries_requires_invoke_query() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
+async fn list_queries_surfaces_query_description_and_instruction() {
+    // E2e for the query-level `.gq` surface: `@description`/`@instruction` on
+    // a stored query declaration are carried through to clients via the typed
+    // `QueryCatalogEntry` fields over `GET /queries`. A query without them
+    // omits both fields (serde `skip_serializing_if = "Option::is_none"`).
+    let described = "query described($name: String) \
+        @description(\"Find a person by exact name.\") \
+        @instruction(\"Use for exact lookups; prefer search for fuzzy matches.\") \
+        { match { $p: Person { name: $name } } return { $p.age } }";
+    let (_temp, app) = app_with_stored_queries(
+        &[
+            ("described", described, true),
+            ("bare", "query bare() { match { $p: Person } return { $p.name } }", true),
+        ],
+        &[("act-invoke", "t-invoke")],
+        INVOKE_POLICY_YAML,
+    )
+    .await;
+    let (status, body) = json_response(&app, get_request(&g("/queries"), "t-invoke")).await;
+    assert_eq!(status, StatusCode::OK, "body: {body}");
+    let entries = body["queries"].as_array().unwrap();
+
+    let described = entries.iter().find(|q| q["name"] == "described").unwrap();
+    assert_eq!(
+        described["description"], "Find a person by exact name.",
+        "query @description surfaces over GET /queries: {described}"
+    );
+    assert_eq!(
+        described["instruction"],
+        "Use for exact lookups; prefer search for fuzzy matches.",
+        "query @instruction surfaces over GET /queries: {described}"
+    );
+
+    let bare = entries.iter().find(|q| q["name"] == "bare").unwrap();
+    assert!(
+        bare.get("description").is_none() && bare.get("instruction").is_none(),
+        "a query without the annotations omits both fields: {bare}"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
 async fn list_queries_is_empty_when_no_registry() {
     let (_temp, app) = app_for_loaded_graph_with_auth("demo-token").await;
     let (status, body) = json_response(&app, get_request(&g("/queries"), "demo-token")).await;

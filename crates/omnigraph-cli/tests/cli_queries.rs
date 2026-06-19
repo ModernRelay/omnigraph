@@ -232,6 +232,125 @@ fn queries_list_prints_registered_query() {
 }
 
 #[test]
+fn queries_list_surfaces_description_and_instruction() {
+    // `@description`/`@instruction` are the whole point of a stored query in a
+    // catalog — they tell an agent/operator what it does and how to invoke it.
+    // The CLI catalog must surface them in both human and --json output, to
+    // match the HTTP `GET /queries` surface.
+    let cluster = converged_cluster_with_query(
+        "described.gq",
+        "query described($name: String) \
+            @description(\"Find a person by exact name.\") \
+            @instruction(\"Use for exact lookups; prefer search for fuzzy matches.\") \
+            { match { $p: Person { name: $name } } return { $p.age } }",
+        "      described:\n        file: ./described.gq\n",
+    );
+
+    // Human output.
+    let output = output_success(
+        cli().arg("queries").arg("list").arg("--cluster").arg(cluster.path()),
+    );
+    let stdout = stdout_string(&output);
+    assert!(
+        stdout.contains("description: Find a person by exact name."),
+        "human list must show @description; stdout:\n{stdout}"
+    );
+    assert!(
+        stdout.contains("instruction: Use for exact lookups; prefer search for fuzzy matches."),
+        "human list must show @instruction; stdout:\n{stdout}"
+    );
+
+    // --json output.
+    let output = output_success(
+        cli()
+            .arg("queries")
+            .arg("list")
+            .arg("--cluster")
+            .arg(cluster.path())
+            .arg("--json"),
+    );
+    let body: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    let entry = body["queries"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|q| q["name"] == "described")
+        .unwrap();
+    assert_eq!(entry["description"], "Find a person by exact name.");
+    assert_eq!(
+        entry["instruction"],
+        "Use for exact lookups; prefer search for fuzzy matches."
+    );
+}
+
+#[test]
+fn queries_list_indents_multiline_annotation_continuation() {
+    // GQ string literals admit newlines, so a `@description`/`@instruction`
+    // can be multiline. Human output must indent continuation lines to align
+    // under the first rather than breaking back to the left margin.
+    let cluster = converged_cluster_with_query(
+        "multi.gq",
+        "query multi($name: String) \
+            @description(\"line one\\nline two\") \
+            { match { $p: Person { name: $name } } return { $p.age } }",
+        "      multi:\n        file: ./multi.gq\n",
+    );
+    let output = output_success(
+        cli().arg("queries").arg("list").arg("--cluster").arg(cluster.path()),
+    );
+    let stdout = stdout_string(&output);
+    // "    description: " is 17 chars wide; the continuation aligns under it.
+    assert!(
+        stdout.contains("    description: line one\n                 line two"),
+        "multiline annotation must indent the continuation; stdout:\n{stdout}"
+    );
+}
+
+#[test]
+fn queries_list_omits_annotations_when_absent() {
+    // The other half of the contract: a query that declares neither annotation
+    // prints no extra lines and omits both JSON fields entirely. This keeps the
+    // catalog clean rather than echoing empty `description:`/`instruction:`.
+    let cluster = converged_cluster_with_query(
+        "bare.gq",
+        "query bare() { match { $p: Person } return { $p.name } }",
+        "      bare:\n        file: ./bare.gq\n",
+    );
+
+    // Human output: the query is listed, but no annotation lines.
+    let output = output_success(
+        cli().arg("queries").arg("list").arg("--cluster").arg(cluster.path()),
+    );
+    let stdout = stdout_string(&output);
+    assert!(stdout.contains("bare()"), "stdout:\n{stdout}");
+    assert!(
+        !stdout.contains("description:") && !stdout.contains("instruction:"),
+        "a query without annotations prints no annotation lines; stdout:\n{stdout}"
+    );
+
+    // --json output: both fields omitted (not present as null).
+    let output = output_success(
+        cli()
+            .arg("queries")
+            .arg("list")
+            .arg("--cluster")
+            .arg(cluster.path())
+            .arg("--json"),
+    );
+    let body: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    let entry = body["queries"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|q| q["name"] == "bare")
+        .unwrap();
+    assert!(
+        entry.get("description").is_none() && entry.get("instruction").is_none(),
+        "a query without annotations omits both JSON fields: {entry}"
+    );
+}
+
+#[test]
 fn queries_validate_requires_a_cluster() {
     // RFC-011: with no --cluster (and no cluster profile), the command errors
     // loudly rather than reading any omnigraph.yaml.

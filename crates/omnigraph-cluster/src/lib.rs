@@ -33,9 +33,9 @@ use config::{
     validate_id, validate_query_source,
 };
 use diff::{
-    FailedGraphOrigin, ResourceKind, append_policy_binding_changes, approved_resources,
-    classify_changes, compute_approvals, compute_blast_radius, demote_dependents_of_failed_graphs,
-    diff_resources, resource_kind,
+    FailedGraphOrigin, ResourceKind, append_embedding_profile_changes,
+    append_policy_binding_changes, approved_resources, classify_changes, compute_approvals,
+    compute_blast_radius, demote_dependents_of_failed_graphs, diff_resources, resource_kind,
 };
 pub use serve::{
     ServingGraph, ServingPolicy, ServingQuery, ServingSnapshot, cluster_graph_ids,
@@ -160,7 +160,7 @@ pub async fn plan_config_dir(config_dir: impl AsRef<Path>) -> PlanOutput {
 
     // Plan is read-only: pending sidecars are reported, never acted on
     // (RFC-004 open question 3 keeps read-only commands warn-only).
-    warn_pending_recovery_sidecars(&desired.config_dir, &mut diagnostics);
+    warn_pending_recovery_sidecars(&backend, &mut diagnostics).await;
 
     let mut prior_resources = BTreeMap::new();
     let mut prior_state: Option<ClusterState> = None;
@@ -183,6 +183,7 @@ pub async fn plan_config_dir(config_dir: impl AsRef<Path>) -> PlanOutput {
     };
     if !has_errors(&diagnostics) {
         append_policy_binding_changes(&mut changes, prior_state.as_ref(), &desired);
+        append_embedding_profile_changes(&mut changes, prior_state.as_ref(), &desired);
     }
     // Plan previews dispositions without sweeping; a pending recovery is
     // surfaced as the cluster_recovery_pending warning above instead.
@@ -404,6 +405,7 @@ pub async fn apply_config_dir_with_options(
     let prior_resources = state_resource_digests(&state);
     let mut changes = diff_resources(&prior_resources, &desired.resource_digests);
     append_policy_binding_changes(&mut changes, Some(&state), &desired);
+    append_embedding_profile_changes(&mut changes, Some(&state), &desired);
     let approval_artifacts = backend.list_approval_artifacts(&mut diagnostics).await;
     let approved = approved_resources(
         &approval_artifacts,
@@ -639,42 +641,9 @@ pub async fn apply_config_dir_with_options(
                 continue;
             }
         };
-        let observed_manifest_version = match db.snapshot_of(ReadTarget::branch("main")).await {
-            Ok(snapshot) => Some(snapshot.version()),
-            Err(_) => None,
-        };
-        let mut sidecar = RecoverySidecar {
-            schema_version: 1,
-            operation_id: Ulid::new().to_string(),
-            started_at: now_rfc3339(),
-            actor: options.actor.clone(),
-            kind: RecoverySidecarKind::SchemaApply,
-            graph_id: graph_id.clone(),
-            graph_uri: graph_uri.clone(),
-            observed_manifest_version,
-            expected_manifest_version: None,
-            desired_schema_digest: desired_graph.schema_digest.clone(),
-            state_cas_base: expected_cas.clone(),
-            approval_id: None,
-        };
-        let sidecar_path = match backend.write_recovery_sidecar(&sidecar).await {
-            Ok(path) => path,
-            Err(diagnostic) => {
-                diagnostics.push(diagnostic);
-                failed_graphs.insert(graph_id.clone(), FailedGraphOrigin::SchemaApply);
-                graph_moving_aborted = true;
-                continue;
-            }
-        };
-        if let Err(diagnostic) = failpoints::maybe_fail("cluster_apply.before_schema_apply") {
-            // Simulated crash before the engine call: the sidecar stays; the
-            // sweep retires it next run (ledger still consistent with live).
-            diagnostics.push(diagnostic);
-            failed_graphs.insert(graph_id.clone(), FailedGraphOrigin::SchemaApply);
-            graph_moving_aborted = true;
-            continue;
-        }
-        // Re-read + digest-verify the desired schema source under the lock.
+        // Re-read + digest-verify the desired schema source before the
+        // cluster sidecar exists. Parser/planner rejections cannot have
+        // moved graph state, so they must not leave recovery work behind.
         let schema_source = source_paths
             .get(schema_address(graph_id).as_str())
             .ok_or_else(|| {
@@ -708,12 +677,64 @@ pub async fn apply_config_dir_with_options(
             Ok(source) => source,
             Err(diagnostic) => {
                 diagnostics.push(diagnostic);
-                backend.delete_object(&sidecar_path).await; // nothing moved
                 failed_graphs.insert(graph_id.clone(), FailedGraphOrigin::SchemaApply);
                 graph_moving_aborted = true;
                 continue;
             }
         };
+        if let Err(err) = db
+            .preview_schema_apply_with_options(&schema_source, SchemaApplyOptions::default())
+            .await
+        {
+            diagnostics.push(Diagnostic::error(
+                "schema_apply_failed",
+                schema_address(graph_id),
+                format!("schema apply is not supported on '{graph_uri}': {err}"),
+            ));
+            failed_graphs.insert(graph_id.clone(), FailedGraphOrigin::SchemaApply);
+            graph_moving_aborted = true;
+            continue;
+        }
+        let observed_manifest_version = match db.snapshot_of(ReadTarget::branch("main")).await {
+            Ok(snapshot) => Some(snapshot.version()),
+            Err(_) => None,
+        };
+        let recorded_schema_digest = state
+            .applied_revision
+            .resources
+            .get(&schema_address(graph_id))
+            .map(|entry| entry.digest.clone());
+        let mut sidecar = RecoverySidecar {
+            schema_version: 1,
+            operation_id: Ulid::new().to_string(),
+            started_at: now_rfc3339(),
+            actor: options.actor.clone(),
+            kind: RecoverySidecarKind::SchemaApply,
+            graph_id: graph_id.clone(),
+            graph_uri: graph_uri.clone(),
+            observed_manifest_version,
+            expected_manifest_version: None,
+            desired_schema_digest: desired_graph.schema_digest.clone(),
+            state_cas_base: expected_cas.clone(),
+            approval_id: None,
+        };
+        let sidecar_path = match backend.write_recovery_sidecar(&sidecar).await {
+            Ok(path) => path,
+            Err(diagnostic) => {
+                diagnostics.push(diagnostic);
+                failed_graphs.insert(graph_id.clone(), FailedGraphOrigin::SchemaApply);
+                graph_moving_aborted = true;
+                continue;
+            }
+        };
+        if let Err(diagnostic) = failpoints::maybe_fail("cluster_apply.before_schema_apply") {
+            // Simulated crash before the engine call: the sidecar stays; the
+            // sweep retires it next run (ledger still consistent with live).
+            diagnostics.push(diagnostic);
+            failed_graphs.insert(graph_id.clone(), FailedGraphOrigin::SchemaApply);
+            graph_moving_aborted = true;
+            continue;
+        }
         // Soft drops only: allow_data_loss stays false until the approval
         // artifacts of stage 4C exist (RFC-004 §D4).
         match db
@@ -736,8 +757,29 @@ pub async fn apply_config_dir_with_options(
                     schema_address(graph_id),
                     format!("schema apply failed on '{graph_uri}': {err}"),
                 ));
-                // Sidecar stays; the sweep retires it (live digest unchanged
-                // == ledger consistent) or flags real movement.
+                if live_schema_matches_recorded_digest(
+                    &graph_uri,
+                    recorded_schema_digest.as_deref(),
+                    observed_manifest_version,
+                )
+                .await
+                {
+                    // Pre-movement rejection: nothing moved, so retire the
+                    // sidecar eagerly. A delete failure leaves it safe (the
+                    // graph is quarantined until the next sweep), but surface
+                    // it so an operator isn't left debugging a silent stick.
+                    if let Err(err) = backend.try_delete_object(&sidecar_path).await {
+                        diagnostics.push(Diagnostic::warning(
+                            "recovery_sidecar_cleanup_failed",
+                            sidecar_path.clone(),
+                            format!(
+                                "could not delete the stale recovery sidecar after a pre-movement \
+                                 schema-apply rejection; graph `{graph_id}` stays quarantined until \
+                                 a state-mutating cluster command sweeps it: {err}"
+                            ),
+                        ));
+                    }
+                }
                 failed_graphs.insert(graph_id.clone(), FailedGraphOrigin::SchemaApply);
                 graph_moving_aborted = true;
                 continue;
@@ -1022,6 +1064,7 @@ pub async fn apply_config_dir_with_options(
         &desired.resource_digests,
     );
     append_policy_binding_changes(&mut residual, Some(&new_state), &desired);
+    append_embedding_profile_changes(&mut residual, Some(&new_state), &desired);
     let converged = residual.is_empty();
     if converged {
         new_state.applied_revision.config_digest = Some(desired.config_digest.clone());
@@ -1260,7 +1303,7 @@ pub async fn status_config_dir(config_dir: impl AsRef<Path>) -> StatusOutput {
     backend
         .observe_lock(&mut observations, &mut diagnostics)
         .await;
-    warn_pending_recovery_sidecars(&parsed.config_dir, &mut diagnostics);
+    warn_pending_recovery_sidecars(&backend, &mut diagnostics).await;
 
     let mut resource_digests = BTreeMap::new();
     let mut resource_statuses = BTreeMap::new();
@@ -1937,6 +1980,29 @@ fn embedding_provider_digest(profile: &EmbeddingProviderConfig) -> String {
         serde_json::to_string(profile).expect("embedding provider config must serialize");
     input.push_str(&config_semantics);
     sha256_hex(input.as_bytes())
+}
+
+async fn live_schema_matches_recorded_digest(
+    graph_uri: &str,
+    recorded_schema_digest: Option<&str>,
+    observed_manifest_version: Option<u64>,
+) -> bool {
+    let Some(recorded_schema_digest) = recorded_schema_digest else {
+        return false;
+    };
+    let Some(observed_manifest_version) = observed_manifest_version else {
+        return false;
+    };
+    let Ok(db) = Omnigraph::open_read_only(graph_uri).await else {
+        return false;
+    };
+    let Ok(snapshot) = db.snapshot_of(ReadTarget::branch("main")).await else {
+        return false;
+    };
+    if snapshot.version() != observed_manifest_version {
+        return false;
+    }
+    sha256_hex(db.schema_source().as_bytes()) == recorded_schema_digest
 }
 
 fn desired_config_digest(

@@ -420,6 +420,9 @@ async fn optimize_one_table(
             // Lower bound — compaction commits N≥1 versions (reserve + rewrite);
             // the classifier loose-matches SidecarKind::Optimize.
             post_commit_pin: expected_version + 1,
+            // Optimize uses the loose match (drift is derived state), not
+            // BranchMerge's Phase-B confirmation — left None.
+            confirmed_version: None,
             table_branch: None,
         }],
     );
@@ -937,6 +940,7 @@ mod tests {
 
         for type_name in ["Person", "Company"] {
             let table_uri = node_table_uri(uri, type_name);
+            // forbidden-api-allow: test synthesizes a branch ref directly on the Lance dataset.
             let mut ds = lance::Dataset::open(&table_uri).await.unwrap();
             let base = ds.version().version;
             ds.create_branch("feature", base, None).await.unwrap();

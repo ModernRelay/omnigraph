@@ -111,7 +111,6 @@ impl TableVersionMetadata {
         self.manifest_size
     }
 
-    #[cfg(test)]
     pub(crate) fn e_tag(&self) -> Option<&str> {
         self.e_tag.as_deref()
     }
@@ -138,6 +137,7 @@ impl TableVersionMetadata {
         request
     }
 
+    #[cfg(test)]
     pub(super) fn to_namespace_version(&self, version: u64) -> TableVersion {
         self.to_namespace_version_with_details(version, None, None)
     }

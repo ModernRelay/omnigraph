@@ -28,7 +28,6 @@ constraints. User-facing behavior should still be documented through
 | Three-way merge implementation and conflicts | [merge.md](merge.md) |
 | Diff/change-feed implementation | [changes.md](../user/branching/changes.md) |
 | Branch protection policy | [branch-protection.md](branch-protection.md) |
-| CODEOWNERS source of truth | [codeowners.md](codeowners.md) |
 
 ## Language, Runtime, And Boundaries
 
@@ -62,6 +61,16 @@ constraints. User-facing behavior should still be documented through
 The `docs/rfcs/` track is the **public, externally-authorable** RFC process. The
 maintainer/internal RFCs below (`rfc-00N-*.md`) are a separate, team-owned
 track; don't conflate the two.
+
+## Case Studies
+
+Worked write-ups of specific bugs — root cause, fix, and the reasoning that
+ruled out the tempting-but-wrong alternatives. Read these for the debugging
+pattern, not just the outcome.
+
+| Area | Read |
+|---|---|
+| camelCase property filters lowercased at runtime (#283) — two engine→Lance boundaries, two different fixes | [bug-case-fix.md](bug-case-fix.md) |
 
 ## Active Implementation Plans
 

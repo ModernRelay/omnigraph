@@ -712,6 +712,9 @@ impl StagedMutation {
                 table_path: entry.path.full_path.clone(),
                 expected_version: entry.expected_version,
                 post_commit_pin: entry.expected_version + 1,
+                // Mutation/Load use strict single-commit classification, not
+                // BranchMerge's Phase-B confirmation — left None.
+                confirmed_version: None,
                 table_branch: entry.path.table_branch.clone(),
             });
         }
@@ -738,6 +741,7 @@ impl StagedMutation {
                 // can advance HEAD by more than one version (e.g.,
                 // when Lance internally compacts deletion vectors).
                 post_commit_pin: update.table_version,
+                confirmed_version: None,
                 table_branch: path.table_branch.clone(),
             });
         }

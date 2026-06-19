@@ -3,7 +3,7 @@ use std::fmt;
 
 use serde_json::Value;
 
-use crate::error::NanoError;
+use crate::error::CompilerError;
 use crate::ir::ParamMap;
 use crate::json_output::{JS_MAX_SAFE_INTEGER_U64, is_js_safe_integer_i64};
 use crate::query::ast::{Literal, Param, QueryDecl};
@@ -17,7 +17,7 @@ pub enum JsonParamMode {
 
 #[derive(Debug)]
 pub enum RunInputError {
-    Core(NanoError),
+    Core(CompilerError),
     Message(String),
 }
 
@@ -45,8 +45,8 @@ impl Error for RunInputError {
     }
 }
 
-impl From<NanoError> for RunInputError {
-    fn from(value: NanoError) -> Self {
+impl From<CompilerError> for RunInputError {
+    fn from(value: CompilerError) -> Self {
         Self::Core(value)
     }
 }
@@ -120,7 +120,7 @@ impl ToParam for i64 {
 impl ToParam for isize {
     fn to_param(self) -> crate::error::Result<Literal> {
         let value = i64::try_from(self).map_err(|_| {
-            NanoError::Execution(format!(
+            CompilerError::Execution(format!(
                 "param value {} exceeds current engine range for numeric literals (max {})",
                 self,
                 i64::MAX
@@ -151,7 +151,7 @@ impl ToParam for u32 {
 impl ToParam for u64 {
     fn to_param(self) -> crate::error::Result<Literal> {
         let value = i64::try_from(self).map_err(|_| {
-            NanoError::Execution(format!(
+            CompilerError::Execution(format!(
                 "param value {} exceeds current engine range for numeric literals (max {})",
                 self,
                 i64::MAX
@@ -164,7 +164,7 @@ impl ToParam for u64 {
 impl ToParam for usize {
     fn to_param(self) -> crate::error::Result<Literal> {
         let value = i64::try_from(self).map_err(|_| {
-            NanoError::Execution(format!(
+            CompilerError::Execution(format!(
                 "param value {} exceeds current engine range for numeric literals (max {})",
                 self,
                 i64::MAX
@@ -177,7 +177,7 @@ impl ToParam for usize {
 impl ToParam for f32 {
     fn to_param(self) -> crate::error::Result<Literal> {
         if !self.is_finite() {
-            return Err(NanoError::Execution(format!(
+            return Err(CompilerError::Execution(format!(
                 "invalid float parameter {}",
                 self
             )));
@@ -189,7 +189,7 @@ impl ToParam for f32 {
 impl ToParam for f64 {
     fn to_param(self) -> crate::error::Result<Literal> {
         if !self.is_finite() {
-            return Err(NanoError::Execution(format!(
+            return Err(CompilerError::Execution(format!(
                 "invalid float parameter {}",
                 self
             )));

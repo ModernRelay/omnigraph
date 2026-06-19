@@ -178,6 +178,17 @@ are left at `Lance HEAD = manifest_pinned + 1`.
    post_commit_pin)` it intends to commit + the writer kind +
    actor_id.
 2. **Phase B**: writer's per-table `commit_staged` loop runs.
+   - **Phase-B confirmation (`BranchMerge` only)**: a `BranchMerge` writer
+     advances each table's HEAD by *several* commits (append → upsert →
+     delete), so a bare "HEAD moved" is ambiguous — it could be a complete
+     publish or one crashed mid-sequence. After the whole per-table loop
+     finishes, the writer re-writes the sidecar stamping each pin's
+     `confirmed_version` with the exact achieved version, then proceeds to
+     Phase C. This is the commit point of the recovery WAL: a crash *after*
+     confirmation rolls forward to those versions; a crash *during* Phase B
+     (sidecar still unconfirmed) rolls back. Other writers don't confirm —
+     their drift is derived state (index coverage, compaction) that a partial
+     roll-forward never corrupts.
 3. **Phase C**: publisher commits the manifest.
 4. **Phase D**: writer deletes the sidecar.
 
@@ -197,7 +208,10 @@ recovery sweep in `crates/omnigraph/src/db/manifest/recovery.rs`:
 - For each sidecar in `__recovery/`, compare every named table's
   Lance HEAD to the manifest pin. Classify per the all-or-nothing
   decision tree (RolledPastExpected / NoMovement / UnexpectedAtP1 /
-  UnexpectedMultistep / InvariantViolation).
+  UnexpectedMultistep / IncompletePhaseB / InvariantViolation). For a
+  `BranchMerge` sidecar, a moved HEAD with no `confirmed_version` classifies
+  as `IncompletePhaseB` (a partial multi-commit publish) and forces roll-back;
+  with a `confirmed_version`, roll-forward targets exactly that version.
 - If any table is `InvariantViolation` (Lance HEAD < manifest pinned —
   should be impossible), **abort** with a loud error and leave the
   sidecar on disk for operator review.

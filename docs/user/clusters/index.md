@@ -91,7 +91,7 @@ only the URI and credentials, no checkout of the config repo. The ledger and
 catalog on the bucket are the deployment artifact.
 
 `--cluster` is an **exclusive boot source**: it cannot be combined with a
-graph URI, `--target`, or `--config`, and `omnigraph.yaml` is never read in
+graph URI or `--config`, and `omnigraph.yaml` is never read in
 this mode. Routing is always multi-graph:
 
 ```bash
@@ -221,7 +221,8 @@ applied revision is not safely servable. Each refusal names its remedy:
 | Boot error | Meaning | Remedy |
 |---|---|---|
 | `cluster_state_missing` | no ledger | `cluster import`, then `apply` |
-| `cluster_recovery_pending` | interrupted operation awaiting sweep | run `cluster apply` (or any state-mutating command), restart |
+| `cluster_recovery_pending` | graph was quarantined because an interrupted operation awaits sweep | run `cluster apply` (or any state-mutating command), restart |
+| `cluster_no_healthy_graphs` | every applied graph is quarantined or failed startup | sweep/fix the graph-specific failures, then restart |
 | `catalog_payload_missing` / `…_digest_mismatch` | catalog blob lost or tampered | `cluster refresh`, then `apply`, restart |
 | `policy_bindings_missing` | ledger predates binding metadata | re-run `cluster apply` (backfills), restart |
 | `cluster_empty` | applied revision has no graphs | apply a cluster with ≥1 graph |
@@ -230,6 +231,13 @@ applied revision is not safely servable. Each refusal names its remedy:
 A held *state lock* is deliberately **not** a boot error — the server reads
 the atomically-replaced ledger without locking, so serving never contends
 with an in-flight apply.
+
+When at least one graph is healthy, graph-attributed recovery sidecars and
+graph-local startup failures do not block the whole server. The affected
+graph is skipped, its graph-only policy bindings and queries are omitted,
+and `/graphs` lists only the ready graphs. Pass
+`omnigraph-server --require-all-graphs` or set
+`OMNIGRAPH_REQUIRE_ALL_GRAPHS=1` to make any such quarantine fail startup.
 
 ## 6. Deployment patterns
 
@@ -273,7 +281,7 @@ a cluster are created by `cluster apply`, not by hand.
 
 If the cluster has exactly **one** applied graph you can omit `--graph` — it is
 used automatically. With **several**, omitting `--graph` errors and lists the
-candidates (RFC-011 D7); it never picks one for you.
+candidates; it never picks one for you.
 
 Against an **`s3://`-backed cluster** the resolved graph storage is non-local, so a
 destructive `cleanup` additionally requires **`--yes`** (an interactive prompt

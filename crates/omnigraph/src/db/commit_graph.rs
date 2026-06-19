@@ -79,10 +79,14 @@ impl CommitGraph {
 
     pub async fn open(root_uri: &str) -> Result<Self> {
         let root = root_uri.trim_end_matches('/');
-        let dataset = Dataset::open(&graph_commits_uri(root))
-            .await
-            .map_err(|e| OmniError::Lance(e.to_string()))?;
-        let actor_dataset = Dataset::open(&graph_commit_actors_uri(root)).await.ok();
+        let wrapper = crate::instrumentation::commit_graph_wrapper();
+        let dataset =
+            crate::instrumentation::open_dataset_tracked(&graph_commits_uri(root), wrapper.clone())
+                .await?;
+        let actor_dataset =
+            crate::instrumentation::open_dataset_tracked(&graph_commit_actors_uri(root), wrapper)
+                .await
+                .ok();
         let actor_by_commit_id = match &actor_dataset {
             Some(dataset) => load_commit_actor_cache(dataset).await?,
             None => HashMap::new(),
@@ -101,14 +105,18 @@ impl CommitGraph {
 
     pub async fn open_at_branch(root_uri: &str, branch: &str) -> Result<Self> {
         let root = root_uri.trim_end_matches('/');
-        let dataset = Dataset::open(&graph_commits_uri(root))
-            .await
-            .map_err(|e| OmniError::Lance(e.to_string()))?;
+        let wrapper = crate::instrumentation::commit_graph_wrapper();
+        let dataset =
+            crate::instrumentation::open_dataset_tracked(&graph_commits_uri(root), wrapper.clone())
+                .await?;
         let dataset = dataset
             .checkout_branch(branch)
             .await
             .map_err(|e| OmniError::Lance(e.to_string()))?;
-        let actor_dataset = Dataset::open(&graph_commit_actors_uri(root)).await.ok();
+        let actor_dataset =
+            crate::instrumentation::open_dataset_tracked(&graph_commit_actors_uri(root), wrapper)
+                .await
+                .ok();
         let actor_by_commit_id = match &actor_dataset {
             Some(dataset) => load_commit_actor_cache(dataset).await?,
             None => HashMap::new(),
@@ -127,9 +135,12 @@ impl CommitGraph {
 
     pub async fn refresh(&mut self) -> Result<()> {
         let root = self.root_uri.clone();
-        self.dataset = Dataset::open(&graph_commits_uri(&root))
-            .await
-            .map_err(|e| OmniError::Lance(e.to_string()))?;
+        let wrapper = crate::instrumentation::commit_graph_wrapper();
+        self.dataset = crate::instrumentation::open_dataset_tracked(
+            &graph_commits_uri(&root),
+            wrapper.clone(),
+        )
+        .await?;
         if let Some(branch) = &self.active_branch {
             self.dataset = self
                 .dataset
@@ -137,7 +148,10 @@ impl CommitGraph {
                 .await
                 .map_err(|e| OmniError::Lance(e.to_string()))?;
         }
-        self.actor_dataset = Dataset::open(&graph_commit_actors_uri(&root)).await.ok();
+        self.actor_dataset =
+            crate::instrumentation::open_dataset_tracked(&graph_commit_actors_uri(&root), wrapper)
+                .await
+                .ok();
         self.actor_by_commit_id = match &self.actor_dataset {
             Some(dataset) => load_commit_actor_cache(dataset).await?,
             None => HashMap::new(),

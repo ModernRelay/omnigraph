@@ -55,5 +55,6 @@ arc-swap = { workspace = true }
 omnigraph-compiler = { path = "../omnigraph-compiler", version = "0.7.0" }
 tokio = { workspace = true }
 lance-namespace-impls = { workspace = true }
+lance-io = "7.0.0"
 serial_test = "3"
 proptest = "1"

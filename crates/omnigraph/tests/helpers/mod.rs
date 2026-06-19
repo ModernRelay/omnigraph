@@ -166,6 +166,21 @@ pub async fn mutate_branch(
     db.mutate(branch, query_source, query_name, params).await
 }
 
+/// Advance the manifest version `n` times (one commit per insert), building
+/// deep commit history for cost-budget tests (history depth, not row count).
+pub async fn commit_many(db: &mut Omnigraph, n: usize) {
+    for i in 0..n {
+        mutate_main(
+            db,
+            MUTATION_QUERIES,
+            "insert_person",
+            &mixed_params(&[("$name", &format!("commit_many_{i}"))], &[("$age", 30)]),
+        )
+        .await
+        .unwrap();
+    }
+}
+
 pub async fn snapshot_main(db: &Omnigraph) -> Result<Snapshot> {
     db.snapshot_of(ReadTarget::branch("main")).await
 }

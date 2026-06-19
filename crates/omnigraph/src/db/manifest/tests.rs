@@ -1531,7 +1531,11 @@ async fn test_v2_to_v3_sweeps_legacy_run_branches_on_write_open() {
         .await
         .unwrap();
         let post = open_manifest_dataset(uri, None).await.unwrap();
-        assert_eq!(super::migrations::read_stamp(&post), 2, "stamp rewound to v2");
+        assert_eq!(
+            super::migrations::read_stamp(&post),
+            2,
+            "stamp rewound to v2"
+        );
     }
 
     // A no-op publish forces the open-for-write path, which runs the migration.
@@ -1556,7 +1560,10 @@ async fn test_v2_to_v3_sweeps_legacy_run_branches_on_write_open() {
         !after.iter().any(|b| b.starts_with("__run__")),
         "legacy run branch must be swept; got {after:?}",
     );
-    assert!(after.iter().any(|b| b == "feature"), "user branch must survive");
+    assert!(
+        after.iter().any(|b| b == "feature"),
+        "user branch must survive"
+    );
     assert!(after.iter().any(|b| b == "main"), "main must survive");
 
     // Idempotent: a second write-open finds the stamp at current and does not
