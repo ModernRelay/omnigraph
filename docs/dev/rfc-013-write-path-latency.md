@@ -570,11 +570,16 @@ live-writer rollback. **These four must land before `PublishPlan`/epoch merge
    concurrent open must not roll back a live in-flight publish (the grace window).
 4. **Formal model** — a Quint/TLA+ model of `{two writers, interleave commit_staged
    and manifest-CAS}` (`iss-934`); it finds the §6.5 cliff immediately.
-5. **Cross-table write-skew — WRITTEN, red [M].** Failpoint `loader.post_ri_pre_stage`
-   (between RI-validation and staging): writer B validates "Bob exists" and parks;
-   writer A `overwrite`s `node:Person` dropping Bob (non-cascading); B commits
-   `Knows(Bob→Alice)` → committed orphan. The red test for the §7.1 scoped fix
-   (endpoint node-table versions in the edge's publish expected set).
+5. **Cross-table write-skew — WRITTEN, red, and driven red→green in-process [M].**
+   Failpoint `loader.post_ri_pre_stage` (between RI-validation and staging): writer B
+   validates "Bob exists" and parks; writer A `overwrite`s `node:Person` dropping Bob
+   (non-cascading); B commits `Knows(Bob→Alice)` → committed orphan. The red test for
+   the §7.1 fix. **Acceptance is a single-process gate** — unlike the §6.5 HEAD-ahead
+   corruption (which genuinely needs the multi-process harness), this skew reproduces
+   *deterministically in one process*: the parked edge writer's snapshot really does
+   pin `edge:Knows:1` before the overwrite commits, so the overlap is real with two
+   in-process handles. The fix went red→green in-process behind a shared head row
+   (§7.1). Only #1–#4 (HEAD-ahead/epoch corruption) need cross-process scheduling.
 
 Plus one **disambiguating run** owed (§6.5 confound): separate-handles in-process
 on S3 — to confirm the corruption is the process boundary, not the store.
@@ -587,11 +592,23 @@ schedules.
 
 ## 6. What is already right vs. the deltas
 
-**Already correct — do not rewrite.** Manifest-CAS-as-cross-table-atomicity (the
-reference impl of the lance#7264 "Alternative A"), the in-memory `MutationStaging`
-accumulator, the recovery sidecar mechanism, the per-(table,branch) write queue,
-D2, the sealed `TableStorage` trait, and the read-path warm-up (PR #268) all
-stay. This is **not** a substrate rewrite.
+**Already correct — do not rewrite.** The in-memory `MutationStaging` accumulator,
+the recovery sidecar mechanism, the per-(table,branch) write queue, D2, the sealed
+`TableStorage` trait, and the read-path warm-up (PR #268) all stay. This is **not**
+a substrate rewrite.
+
+**One claim to soften — manifest-CAS is atomic *per publish*, not unconditionally
+cross-table-serializing [M].** The manifest CAS (the reference impl of the
+lance#7264 "Alternative A") makes each publish atomic and serializes any two writers
+whose write-sets **share a `__manifest` row** — overlapping or same-table, which is
+exactly why §6.5's same-table cases and the cascading-delete case retry cleanly. But
+two writers touching **disjoint** tables write disjoint per-`object_id` rows, so Lance
+sees no conflict and **both commit** (proven [M], §7.1). The genuinely-atomic
+cross-table commit §13 contrasts with Delta is the **target** (§4.1's single
+merge-insert over a shared head row), **not current state**. So "do not rewrite the
+CAS" holds for the *commit primitive*, but the cross-table-serialization §7.1 needs
+is a real addition (the shared `graph_head` row), not something the current CAS
+already provides.
 
 **The deltas (each a validated, localized gap):**
 
@@ -724,13 +741,53 @@ DB-canon review flags three places not to over-claim:
     over-generalization: cardinality/uniqueness do not share the read-set gap.)*
 
   So the skew is **reachable only for the non-cascading-overwrite × disjoint-edge-insert
-  shape** — operation-specific, not constraint-specific. **Fix (scoped):** the endpoint
-  node-table versions join the edge's publish *expected* set
-  (`check_expected_table_versions`, `publisher.rs:353`, fed only the write-set today)
-  — the read-set-in-CAS generalization restricted to the cross-table-disjoint case;
-  commit-time re-validation is the precise (no-false-positive) alternative if the
-  CAS-map over-serializes. Tracked as `iss-ri-write-skew-dangling-edges` (now
-  reproduced **[M]**); **single-server-live, not deferrable with the epoch track.**
+  shape** — operation-specific, not constraint-specific.
+
+  **The scoped fix alone is a no-op — proven [M], and the reason is mechanical.**
+  Feeding the endpoint node-table versions into the edge's publish *expected* set
+  (`check_expected_table_versions`, `publisher.rs:353`) was prototyped exactly; debug
+  confirmed the pins reach the check, **and both writers still committed — the orphan
+  persisted.** Every publish writes a *unique per-`object_id` row* into `__manifest`
+  (merge key `object_id = version_object_id(table, version)`). Two disjoint-table
+  writers (`node:Person` vs `edge:Knows`) touch **no common row**, so Lance's
+  row-level merge-insert CAS commits both with **no conflict**, the publisher's retry
+  loop **never fires**, and `check_expected_table_versions` — a **non-atomic
+  pre-check, not part of the CAS** — is evaluated exactly once against the stale
+  pre-both manifest and passes for both. The read-set pin only bites if the loser is
+  **forced to retry and re-evaluate against fresh state**, which requires a *shared
+  contention row* every publish touches. Adding a stand-in global head row
+  (`UpdateAll`-touched by every publish) makes the disjoint writers overlap → Lance
+  conflict → publisher retry → the reloaded pin (`edge:Knows:1` vs current `5`)
+  rejects the stale writer → no orphan (red→green, failpoint suite 52/52). **That
+  shared row is exactly Phase-7's `graph_head:<branch>`.**
+
+  **Consequence — §7.1 is NOT a standalone single-server PR** (correct earlier text
+  that called it "single-server-live, not deferrable" — it *is* urgent and
+  epoch-independent, but it cannot ship against today's per-`object_id` manifest
+  without a contention point). Land it one of three ways: **(a)** with Phase 7
+  (step 4), reusing `graph_head:<branch>` as the contention row; **(b)** behind a
+  minimal per-branch head row ahead of Phase 7 (~15 lines, as prototyped); or
+  **(c)** as commit-time re-validation — still must win a serialization point first.
+  **Recommended: (c) behind a per-branch head row.** The CAS-map approach carries the
+  two costs §11 anticipated — *table-granularity false conflicts* (any `Person`
+  overwrite conflicts with any concurrent `edge:Knows` insert, even different rows —
+  needs a row-granularity read-set) and *scope* (a global head serializes the whole
+  graph; per-branch `graph_head` is the right granularity). Commit-time re-validation
+  is precise (no false positives) **and** reuses the same serialization point, so once
+  the head row exists it strictly dominates the CAS-map. Either way the head row
+  imposes an inherent trade — same-branch writers serialize cross-process (throughput
+  ceiling 1/branch, bounded by `PUBLISHER_RETRY_BUDGET`) — **now a correctness
+  requirement, not just a Phase-7 side effect** (§11).
+
+  **Two faces, two fixes — do not bundle them.** The above addresses only the
+  *concurrent* face (overlapping snapshots, `iss-ri-write-skew-dangling-edges`). The
+  *sequential* face (`iss-overwrite-orphans-committed-edges`) — an overwrite drops a
+  node that **already has a committed inbound edge**, with *zero* concurrency —
+  **cannot** be caught by read-set-in-CAS: the later writer's snapshot legitimately
+  post-dates the edge, so its pin matches and it commits. That is a pure
+  **inbound-RI-validation** gap: when an overwrite/delete removes node endpoints,
+  re-check that no live edge references them. A validation concern, not a CAS one;
+  it needs no contention row and ships independently.
   *(Note: `iss-984` is a different bug — remote branch-merge idempotency — not this.)*
 - **Recovery: roll-forward is by-construction; roll-back is not.** "Commit and
   recovery replay the identical plan" holds for the **redo** direction (shared
@@ -778,11 +835,17 @@ Ordered by leverage and dependency. **The dominant depth term is the redundant
 data-table opens (step 3), not the internal tables (step 2)** — §0; both must land
 to flatten the curve.
 
-1. **Measure first (Tier-1 gate).** *Prerequisite (1a):* route ALL opens through
-   the instrumented opener so the gate can count data-table opens (§5.1) — without
-   it the gate is blind to the dominant term and passes a still-broken build. Then
-   land the write/branch cost-budget tests (depth-swept, **merge verb**, red today
-   per §0) + the prod metric (§5.3). Locks the win.
+1. **Measure first (Tier-1 gate). ✅ LANDED (gate + harness).** *Prerequisite (1a):*
+   the write opener (`open_dataset_head`) is routed through the instrumented
+   `open_dataset_tracked` so the gate can count data-table opens (§5.1). The
+   write cost-budget tests live in `crates/omnigraph/tests/write_cost.rs` on a
+   **shared, store-agnostic harness** (`tests/helpers/cost.rs`: `measure`/`IoCounts`/
+   `assert_flat`/`local_graph`/`s3_graph`) that `warm_read_cost.rs` and
+   `write_cost_s3.rs` also consume — one vocabulary, no duplicated `IOTracker`
+   plumbing. The local gate ships green every-PR guards + the RED `#[ignore]`'d
+   internal-table LOCK (step 2's red→green acceptance). *Still owed:* the prod
+   `storage.ops` span metric (§5.3) and the bucket-gated `write_cost_s3.rs` opener
+   LOCK (step 3a's red→green, S3-only per the §9-3a measurement note).
 2. **Bound history — bring the INTERNAL tables into optimize/cleanup (a code
    change, not just scheduling).** Today `optimize`/`cleanup` iterate **node/edge
    keys only** (`optimize.rs:895-904`) — confirmed: the prototype's `cleanup --keep 3`
@@ -801,18 +864,29 @@ to flatten the curve.
    R2/S3), so scheduling cleanup without the watermark trades a latency bug for a
    correctness bug. (`gap-read-path-rederivation` write twin.)
 3. **The opener fix — a shippable lead + the structural follow-on.**
-   - **3a. Opener bypass (standalone PR, THE dominant fix — [M] proven).** Route
-     write opens through the direct `from_uri(location).with_version(N)` opener
-     instead of `from_namespace` (smallest Alternative B). Measured end-to-end: data
-     term `31 + 12·depth → flat 4`, total `+18 → +5/depth`, depth-80 **2.7×** (§2.4),
-     functionally correct on main/branch/node. **Land it first, behind the step-1
-     gate** — it's the single highest-ROI change. **Acceptance so far [M]:** the full
-     `cargo test --features failpoints --lib` suite (158 tests, incl. failpoints-gated
-     recovery) **passes under the opener bypass** — strong evidence it's shippable
-     beyond the prototype's hot paths. **Still owed before "done":** the `tests/`
-     integration + `merge_truth_table` suites (schema-apply, branch merge,
-     fork-on-first-write to a new branch table, overwrite, concurrent — the namespace
-     may do managed-versioning work on those paths).
+   - **3a. Opener bypass (standalone PR, THE dominant fix — [M] proven). ✅ LANDED.**
+     `TableStore::open_dataset_head_for_write` now delegates to the direct
+     `open_dataset_head` opener (`Dataset::open` by URI + `checkout_branch`, routed
+     through `instrumentation::open_dataset_tracked` so the cost gate can count it;
+     no-op in prod) instead of the `from_namespace` builder. Measured end-to-end on
+     the prototype: data term `31 + 12·depth → flat 4`, total `+18 → +5/depth`,
+     depth-80 **2.7×** (§2.4), functionally correct on main/branch/node.
+     **Acceptance:** the full `cargo test --workspace --locked` suite passes under the
+     bypass (the `tests/` integration + `merge_truth_table` + recovery/failpoint
+     suites the prototype's `--lib` run didn't cover — schema-apply, branch merge,
+     fork-on-first-write, overwrite). **Namespace retired to test-only:** with both
+     reads (Fix 2) and now writes bypassing it, *nothing in production routes through
+     the Lance namespace* — confirming §2.4's premise. The dead per-table open chain
+     (`load_table_from_namespace`, `open_table_head_for_write`) was deleted and the
+     `StagedTableNamespace` contract apparatus gated `#[cfg(test)]`, mirroring the
+     already-`#[cfg(test)]` read namespace (`BranchManifestNamespace`). **Measurement
+     note (corrected):** the opener win is **S3-only** — local FS resolves latest with
+     one cheap `read_dir` regardless of opener, so the namespace-vs-direct difference
+     is invisible there (the local data-table read count *does* grow with depth, but
+     that is the merge-insert/RI scan over O(depth) *fragments*, a compaction term,
+     not the opener; depth-100 = 92 ops identically before and after the bypass). The
+     opener LOCK therefore lives in the bucket-gated `write_cost_s3.rs`, not the local
+     `write_cost.rs`.
    - **3b. Full `WriteTxn` (capture-once + intra-txn handle reuse + shared Session).**
      Formalize 3a's open-once into the pinned, threaded `WriteTxn` (re-resolution
      *unrepresentable*, invariant 3) and kill the flat-46 schema-read constant
@@ -823,6 +897,13 @@ to flatten the curve.
    re-runs the O(history) `load_publish_state` scan, so the `graph_head` CAS
    contention Phase 7 introduces is acceptable only once compaction bounds that
    scan. Acceptance includes the Q1 concurrent-same-branch-writer gate.
+   **Carries the §7.1 concurrent write-skew fix.** The `graph_head:<branch>` row is
+   the shared contention point the cross-table read-set-in-CAS needs — proven [M]
+   that the read-set fix is a no-op without it (§7.1). So the concurrent face of the
+   write-skew lands *with* this step (or, if §7.1 must ship earlier, behind a minimal
+   per-branch head row — ~15 lines — or as commit-time re-validation). The
+   *sequential* face (`iss-overwrite-orphans-committed-edges`) is independent:
+   inbound-RI validation on node removal, no head row, ships anytime.
 5. **`PublishPlan` unification + recovery off the hot path + epoch fence — the
    multi-writer safety guard.** Collapse the four writers; move the `__recovery` list
    to open/conflict; add the `writer_epoch` leader-lease. **Motivated by the proven
@@ -861,8 +942,12 @@ performed anyway).
   (index-coverage reconciler, owns `create_vector_index`).
 - Branch/load: `iss-691`, `iss-677`, `iss-895`, `iss-topology-cross-branch-cache`,
   `iss-841`, `iss-982`, `iss-423`, `iss-989`.
-- Concurrency correctness (survives MTT): `iss-ri-write-skew-dangling-edges`
-  (reproduced **[M]**, §7.1) + its single-writer face `iss-overwrite-orphans-committed-edges`.
+- Concurrency correctness (survives MTT) — **two faces, two different fixes [M]**
+  (§7.1): `iss-ri-write-skew-dangling-edges` (the *concurrent* face; fix =
+  read-set-in-CAS **+ a shared `graph_head` contention row**, so it's coupled to
+  step 4 / a minimal head row / commit-time re-validation — NOT a standalone PR) and
+  `iss-overwrite-orphans-committed-edges` (the *sequential* face; fix =
+  **inbound-RI validation on node removal**, ships independently, no contention row).
   *(`iss-984` — remote branch-merge idempotency — is unrelated; not a write-skew.)*
 - Blockers: `blk-lance-6658` (shipped 7.0.0), `blk-lance-6666` (open, vector
   index two-phase), `blk-lance-blob-compaction`.
@@ -883,15 +968,20 @@ performed anyway).
   `__manifest`/`_graph_commits` to `all_table_keys`** for compaction+cleanup (step 2
   — a code change, `optimize.rs:895-904`); `PublishPlan` unification + epoch
   (step 5); branch-delete concurrency (step 6).
-- New **Issue (namespace follow-up — separate from the latency fix):** harden
-  `StagedTableNamespace::list_table_versions` (`namespace.rs:395-427`) — it
-  `checkout_version`s **every** version (O(depth) full opens). Test-only today
-  (production never calls it; `from_namespace().load()` calls `describe_table`, not
-  this), but a latent O(depth) for any future version-list / time-travel feature.
-  Build `TableVersion`s from `versions()` metadata without the per-version checkout.
-  **Keep** the custom namespace impl for legitimate catalog ops
-  (`describe_table`/`table_exists`/`create_table_version`/managed-versioning commit
-  coordination); only per-open *resolution* leaves it (step 3, §2.4).
+- **Per-table namespace retired to test-only (step 3a landed).** With reads (Fix 2)
+  and now writes (step 3a) both opening direct-by-URI, *nothing in production routes
+  through the per-table `StagedTableNamespace`*. The dead open chain
+  (`load_table_from_namespace`, `open_table_head_for_write`) was deleted; the
+  `StagedTableNamespace` struct/impl/factory are now `#[cfg(test)]`, mirroring the
+  already-`#[cfg(test)]` read namespace (`BranchManifestNamespace`). Both are retained
+  only to validate the `LanceNamespace` contract in unit tests. *Production catalog /
+  managed-versioning commit coordination for `__manifest` itself goes through a
+  **separate** namespace (`GraphNamespacePublisher`), unaffected by this change.* The
+  former follow-up to harden `StagedTableNamespace::list_table_versions`
+  (`checkout_version` per version, O(depth)) is now purely a test-hygiene note — no
+  prod caller can hit it; if any future version-list / time-travel feature needs
+  per-table version enumeration, build `TableVersion`s from `versions()` metadata
+  directly rather than resurrecting the namespace open path.
 - New **Decision** `dec-writetxn-manifest-authoritative-publish` — records this
   RFC's design choice and the MTT-seam stance.
 
@@ -932,9 +1022,16 @@ diff the per-write log at depth D vs D+20 by table. Native baseline: pylance 7.0
 **Drawbacks.** Phase 7 makes disjoint-table same-branch writers contend on the
 `graph_head:<branch>` row (they don't today) — bounded by the Lance retry budget,
 inherent to a linear per-branch DAG, gated on a measured concurrency test and on
-step 2 landing first (§12 Q1, resolved). `PublishPlan` is a non-trivial refactor
-of four writers; it must land behind the cost gate and the
-`merge_truth_table`/recovery/failpoint suites.
+step 2 landing first (§12 Q1, resolved). **Reframe [M]: this contention is
+load-bearing for correctness, not merely a throughput tax.** The §7.1 write-skew is
+*unreachable only because* the shared head row forces disjoint cross-table writers to
+overlap, conflict, retry, and re-evaluate their read-set pins against fresh state
+(proven — without it the scoped CAS fix is a no-op). So §7.1 and the head row are
+**coupled**: the "drawback" is exactly what buys the cross-table invariant, and the
+throughput ceiling (1 writer/branch, bounded by `PUBLISHER_RETRY_BUDGET`) is a
+**correctness requirement** the moment §7.1 ships, not an optional Phase-7 side
+effect. `PublishPlan` is a non-trivial refactor of four writers; it must land behind
+the cost gate and the `merge_truth_table`/recovery/failpoint suites.
 
 **Alternatives.** (A) *Caching band-aid only* — memoize schema validation, cache
 opens within a request: ~30–50% fewer round-trips but leaves open-by-latest and
