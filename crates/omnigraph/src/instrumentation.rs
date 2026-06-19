@@ -80,6 +80,95 @@ pub(crate) fn record_probe() {
     let _ = current(|p| p.probe_count.fetch_add(1, Ordering::Relaxed));
 }
 
+/// Per-operation staged-write counts, installed for a task via
+/// [`with_merge_write_probes`]. Lets a cost-budget test assert WHICH staged-write
+/// primitive an operation invokes — e.g. that an append-only fast-forward merge
+/// routes new rows through `stage_append` and does **zero** `stage_merge_insert`
+/// (the full-outer hash join). Counts the publish-path primitives only;
+/// merge-staging temp tables use `append_or_create_batch`, not these.
+#[derive(Clone, Default)]
+pub struct MergeWriteProbes {
+    pub stage_append_calls: Arc<AtomicU64>,
+    pub stage_append_rows: Arc<AtomicU64>,
+    pub stage_merge_insert_calls: Arc<AtomicU64>,
+    pub stage_merge_insert_rows: Arc<AtomicU64>,
+    /// Inline vector-index (IVF) builds. The fast-forward adopt path defers
+    /// index coverage to the reconciler, so an adopt merge must do 0 of these.
+    pub create_vector_index_calls: Arc<AtomicU64>,
+    /// Times the merge materialized a staged delta into one in-memory batch
+    /// (`scan_staged_combined`). The append path streams instead, so an
+    /// append-only fast-forward merge must do 0 of these.
+    pub scan_staged_combined_calls: Arc<AtomicU64>,
+}
+
+impl MergeWriteProbes {
+    pub fn stage_append_calls(&self) -> u64 {
+        self.stage_append_calls.load(Ordering::Relaxed)
+    }
+    pub fn stage_append_rows(&self) -> u64 {
+        self.stage_append_rows.load(Ordering::Relaxed)
+    }
+    pub fn stage_merge_insert_calls(&self) -> u64 {
+        self.stage_merge_insert_calls.load(Ordering::Relaxed)
+    }
+    pub fn stage_merge_insert_rows(&self) -> u64 {
+        self.stage_merge_insert_rows.load(Ordering::Relaxed)
+    }
+    pub fn create_vector_index_calls(&self) -> u64 {
+        self.create_vector_index_calls.load(Ordering::Relaxed)
+    }
+    pub fn scan_staged_combined_calls(&self) -> u64 {
+        self.scan_staged_combined_calls.load(Ordering::Relaxed)
+    }
+}
+
+tokio::task_local! {
+    static MERGE_WRITE_PROBES: MergeWriteProbes;
+}
+
+/// Run `fut` with staged-write probes installed. Test-only entry point; nothing
+/// in production sets the probes, so `record_stage_*` below are no-ops.
+pub async fn with_merge_write_probes<F>(probes: MergeWriteProbes, fut: F) -> F::Output
+where
+    F: std::future::Future,
+{
+    MERGE_WRITE_PROBES.scope(probes, fut).await
+}
+
+/// Record one `stage_append` of `rows` rows against the active probes. No-op in
+/// production (no probes installed).
+pub(crate) fn record_stage_append(rows: u64) {
+    let _ = MERGE_WRITE_PROBES.try_with(|p| {
+        p.stage_append_calls.fetch_add(1, Ordering::Relaxed);
+        p.stage_append_rows.fetch_add(rows, Ordering::Relaxed);
+    });
+}
+
+/// Record one `stage_merge_insert` of `rows` rows against the active probes.
+/// No-op in production (no probes installed).
+pub(crate) fn record_stage_merge_insert(rows: u64) {
+    let _ = MERGE_WRITE_PROBES.try_with(|p| {
+        p.stage_merge_insert_calls.fetch_add(1, Ordering::Relaxed);
+        p.stage_merge_insert_rows.fetch_add(rows, Ordering::Relaxed);
+    });
+}
+
+/// Record one inline vector-index build against the active probes. No-op in
+/// production (no probes installed).
+pub(crate) fn record_create_vector_index() {
+    let _ = MERGE_WRITE_PROBES.try_with(|p| {
+        p.create_vector_index_calls.fetch_add(1, Ordering::Relaxed);
+    });
+}
+
+/// Record one `scan_staged_combined` materialization against the active probes.
+/// No-op in production (no probes installed).
+pub(crate) fn record_scan_staged_combined() {
+    let _ = MERGE_WRITE_PROBES.try_with(|p| {
+        p.scan_staged_combined_calls.fetch_add(1, Ordering::Relaxed);
+    });
+}
+
 /// Open a Lance dataset at `uri`, attaching `wrapper` (for IO counting) when
 /// present. With no wrapper this is exactly `Dataset::open(uri)`. The wrapper is
 /// set via `ObjectStoreParams` on the builder so the open itself is counted

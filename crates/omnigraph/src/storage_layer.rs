@@ -353,6 +353,15 @@ pub trait TableStorage: sealed::Sealed + Send + Sync + Debug {
         prior_stages: &[StagedHandle],
     ) -> Result<StagedHandle>;
 
+    /// Append `source`'s rows into `snapshot`'s table, streaming so the whole
+    /// row set is never materialized in memory (see `TableStore::stage_append_stream`).
+    async fn stage_append_stream(
+        &self,
+        snapshot: &SnapshotHandle,
+        source: &SnapshotHandle,
+        prior_stages: &[StagedHandle],
+    ) -> Result<StagedHandle>;
+
     async fn stage_merge_insert(
         &self,
         snapshot: SnapshotHandle,
@@ -680,6 +689,18 @@ impl TableStorage for TableStore {
     ) -> Result<StagedHandle> {
         let staged_writes = staged_handles_as_writes(prior_stages);
         TableStore::stage_append(self, snapshot.dataset(), batch, &staged_writes)
+            .await
+            .map(StagedHandle::new)
+    }
+
+    async fn stage_append_stream(
+        &self,
+        snapshot: &SnapshotHandle,
+        source: &SnapshotHandle,
+        prior_stages: &[StagedHandle],
+    ) -> Result<StagedHandle> {
+        let staged_writes = staged_handles_as_writes(prior_stages);
+        TableStore::stage_append_stream(self, snapshot.dataset(), source.dataset(), &staged_writes)
             .await
             .map(StagedHandle::new)
     }

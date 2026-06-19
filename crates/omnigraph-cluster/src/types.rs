@@ -176,11 +176,22 @@ pub struct PlanChange {
     /// pre-5A backfill case).
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub binding_change: bool,
+    /// Metadata-only updates whose resource content digest is unchanged but
+    /// whose applied ledger metadata needs to converge.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub metadata_change: Option<PlanMetadataChange>,
     /// For schema updates: the engine's migration plan against the live
     /// graph (RFC-004 §D7's data-aware preview). Absent when the preview is
     /// unavailable (warning `schema_preview_unavailable`).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub migration: Option<SchemaMigrationPlan>,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum PlanMetadataChange {
+    PolicyBindings,
+    EmbeddingProfile,
 }
 
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]

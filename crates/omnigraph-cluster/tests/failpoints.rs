@@ -13,8 +13,9 @@ use std::fs;
 use std::path::{Path, PathBuf};
 
 use fail::FailScenario;
-use omnigraph_cluster::failpoints::ScopedFailPoint;
 use omnigraph::db::Omnigraph;
+use omnigraph::failpoints::ScopedFailPoint as EngineScopedFailPoint;
+use omnigraph_cluster::failpoints::ScopedFailPoint;
 use omnigraph_cluster::{
     ApplyOptions, apply_config_dir, apply_config_dir_with_options, approve_config_dir,
     validate_config_dir,
@@ -178,13 +179,12 @@ async fn apply_cas_race_surfaces_state_cas_mismatch() {
     // after apply read it but before apply writes. RAII-guarded so a panic
     // inside apply cannot leak the callback into the global registry.
     let race_path = state_path(dir.path());
-    let failpoint =
-        ScopedFailPoint::with_callback("cluster_apply.before_state_write", move || {
-            let mut state: serde_json::Value =
-                serde_json::from_str(&fs::read_to_string(&race_path).unwrap()).unwrap();
-            state["state_revision"] = serde_json::json!(99);
-            fs::write(&race_path, serde_json::to_string_pretty(&state).unwrap()).unwrap();
-        });
+    let failpoint = ScopedFailPoint::with_callback("cluster_apply.before_state_write", move || {
+        let mut state: serde_json::Value =
+            serde_json::from_str(&fs::read_to_string(&race_path).unwrap()).unwrap();
+        state["state_revision"] = serde_json::json!(99);
+        fs::write(&race_path, serde_json::to_string_pretty(&state).unwrap()).unwrap();
+    });
 
     let out = apply_config_dir(dir.path()).await;
     drop(failpoint);
@@ -336,10 +336,9 @@ async fn create_crash_after_init_rolls_state_forward() {
     );
     assert!(recovered.converged);
     assert!(recovery_sidecars(dir.path()).is_empty());
-    let state: serde_json::Value = serde_json::from_str(
-        &fs::read_to_string(dir.path().join("__cluster/state.json")).unwrap(),
-    )
-    .unwrap();
+    let state: serde_json::Value =
+        serde_json::from_str(&fs::read_to_string(dir.path().join("__cluster/state.json")).unwrap())
+            .unwrap();
     assert!(
         state["recovery_records"]
             .as_object()
@@ -422,6 +421,105 @@ async fn schema_crash_before_apply_recovers_via_sweep() {
     scenario.teardown();
 }
 
+/// Engine apply fails after cluster preview and sidecar creation, but before
+/// the graph manifest moves. The defensive cleanup proof should remove the
+/// cluster sidecar immediately so a pre-movement error cannot brick boot.
+#[tokio::test]
+async fn schema_apply_error_before_graph_movement_removes_sidecar() {
+    let scenario = FailScenario::setup();
+    let dir = fixture();
+    converge_with_live_graph(dir.path()).await;
+    let pre_digest = live_schema_digest(dir.path()).await;
+    fs::write(dir.path().join("people.pg"), SCHEMA_V2).unwrap();
+
+    {
+        let _failpoint = EngineScopedFailPoint::new("schema_apply.before_staging_write", "return");
+        let out = apply_config_dir(dir.path()).await;
+        assert!(!out.ok);
+        assert!(
+            out.diagnostics
+                .iter()
+                .any(|diagnostic| diagnostic.code == "schema_apply_failed"),
+            "{:?}",
+            out.diagnostics
+        );
+        assert_eq!(live_schema_digest(dir.path()).await, pre_digest);
+        assert!(
+            recovery_sidecars(dir.path()).is_empty(),
+            "{:?}",
+            recovery_sidecars(dir.path())
+        );
+    }
+
+    let recovered = apply_config_dir(dir.path()).await;
+    assert!(recovered.ok && recovered.converged, "{recovered:?}");
+    assert!(recovery_sidecars(dir.path()).is_empty());
+    assert_ne!(live_schema_digest(dir.path()).await, pre_digest);
+    scenario.teardown();
+}
+
+/// Engine apply fails after the graph manifest moved. The cluster cannot
+/// prove this is a pre-movement failure, so the sidecar must survive for
+/// explicit recovery/quarantine instead of being cleaned up defensively.
+#[tokio::test]
+async fn schema_apply_error_after_graph_movement_keeps_sidecar() {
+    let scenario = FailScenario::setup();
+    let dir = fixture();
+    converge_with_live_graph(dir.path()).await;
+    let pre_digest = live_schema_digest(dir.path()).await;
+    fs::write(dir.path().join("people.pg"), SCHEMA_V2).unwrap();
+    let desired = validate_config_dir(dir.path());
+    let v2_digest = desired.resource_digests["schema.knowledge"].clone();
+
+    {
+        let _failpoint = EngineScopedFailPoint::new("schema_apply.after_manifest_commit", "return");
+        let out = apply_config_dir(dir.path()).await;
+        assert!(!out.ok);
+        assert!(
+            out.diagnostics
+                .iter()
+                .any(|diagnostic| diagnostic.code == "schema_apply_failed"),
+            "{:?}",
+            out.diagnostics
+        );
+        // Read-only opens do not run engine schema-state recovery, so the
+        // schema file still reads as the old digest even though the manifest
+        // has moved. The cluster sidecar must remain because movement was
+        // detected by the fallback manifest-version proof.
+        assert_eq!(live_schema_digest(dir.path()).await, pre_digest);
+        let sidecars = recovery_sidecars(dir.path());
+        assert_eq!(sidecars.len(), 1, "{sidecars:?}");
+        let sidecar: serde_json::Value =
+            serde_json::from_str(&fs::read_to_string(&sidecars[0]).unwrap()).unwrap();
+        assert_eq!(sidecar["kind"], "schema_apply");
+        assert!(sidecar["expected_manifest_version"].is_null(), "{sidecar}");
+    }
+
+    let uri = dir.path().join("graphs/knowledge.omni");
+    let db = Omnigraph::open(uri.to_string_lossy().as_ref())
+        .await
+        .unwrap();
+    assert_eq!(
+        db.schema_source().as_str(),
+        SCHEMA_V2,
+        "read-write open should complete engine schema-state recovery"
+    );
+    drop(db);
+    assert_eq!(live_schema_digest(dir.path()).await, v2_digest);
+
+    let recovered = apply_config_dir(dir.path()).await;
+    assert!(recovered.ok, "{:?}", recovered.diagnostics);
+    assert!(
+        recovered
+            .diagnostics
+            .iter()
+            .any(|diagnostic| diagnostic.code == "cluster_recovery_rolled_forward")
+    );
+    assert!(recovered.converged);
+    assert!(recovery_sidecars(dir.path()).is_empty());
+    scenario.teardown();
+}
+
 /// Crash after the engine schema apply, before the state CAS: the manifest
 /// moved, the ledger is stale, nothing acknowledged; the next run's sweep
 /// rolls the ledger forward with an audit entry and the run converges.
@@ -447,7 +545,10 @@ async fn schema_crash_after_apply_rolls_state_forward() {
         assert_eq!(sidecars.len(), 1);
         let sidecar: serde_json::Value =
             serde_json::from_str(&fs::read_to_string(&sidecars[0]).unwrap()).unwrap();
-        assert!(sidecar["expected_manifest_version"].is_number(), "{sidecar}");
+        assert!(
+            sidecar["expected_manifest_version"].is_number(),
+            "{sidecar}"
+        );
     }
 
     let recovered = apply_config_dir(dir.path()).await;

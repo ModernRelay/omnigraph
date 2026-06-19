@@ -11,7 +11,6 @@ use omnigraph_server::api::ReadRequest;
 use omnigraph_server::{AppState, build_app};
 use serde_json::json;
 
-
 mod support;
 use support::*;
 
@@ -137,6 +136,7 @@ async fn server_boots_cluster_from_bare_storage_uri_and_serves_query() {
         Some(&std::path::PathBuf::from(&root)),
         None,
         true,
+        false,
     )
     .await
     .unwrap();
@@ -153,6 +153,7 @@ async fn server_boots_cluster_from_bare_storage_uri_and_serves_query() {
         Vec::new(),
         server_policy.as_ref(),
         config_path,
+        false,
     )
     .await
     .unwrap();
@@ -170,7 +171,9 @@ async fn server_boots_cluster_from_bare_storage_uri_and_serves_query() {
     .await
     .unwrap();
     assert_eq!(response.status(), StatusCode::OK);
-    let bytes = axum::body::to_bytes(response.into_body(), usize::MAX).await.unwrap();
+    let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+        .await
+        .unwrap();
     let value: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
     assert_eq!(value["rows"][0]["p.name"], "Ada", "{value}");
 }
