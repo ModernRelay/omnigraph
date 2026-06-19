@@ -477,6 +477,12 @@ fn predicate_to_sql(
         }
     };
 
+    // #283: emit the column UNQUOTED. Lance's `Scanner::filter(&str)` (the
+    // committed-scan consumer) preserves an unquoted identifier's case but
+    // treats a double-quoted `"col"` as a string literal, so quoting here
+    // would silently match zero committed rows. The pending-batch MemTable
+    // query is instead made case-preserving by disabling DataFusion identifier
+    // normalization on its `SessionContext` (see `scan_pending_batches`).
     Ok(format!("{} {} {}", column, op, value_sql))
 }
 

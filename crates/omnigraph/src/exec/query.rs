@@ -2149,9 +2149,13 @@ pub(super) fn ir_expr_to_expr(
     params: &ParamMap,
     target: Option<&arrow_schema::DataType>,
 ) -> Option<datafusion::prelude::Expr> {
-    use datafusion::prelude::col;
+    use datafusion::prelude::ident;
     match expr {
-        IRExpr::PropAccess { property, .. } => Some(col(property)),
+        // #283: `ident()` preserves the identifier's case. `col()` would route
+        // through SQL identifier normalization and lowercase an unquoted
+        // camelCase column (`repoName` → `reponame`), which then fails to
+        // resolve against the case-sensitive Lance/Arrow schema.
+        IRExpr::PropAccess { property, .. } => Some(ident(property)),
         IRExpr::Literal(l) => literal_to_expr_coerced(l, target),
         IRExpr::Param(name) => params
             .get(name)
