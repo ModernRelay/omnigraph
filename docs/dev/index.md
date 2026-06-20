@@ -81,7 +81,7 @@ Working documents for in-flight feature work. Removed when the work lands.
 | Restructure the CLI around explicit planes — one graph-addressing model, declared capability surface, plane-grouped help (expands RFC-009 Phase 4) | [rfc-010-cli-planes-restructure.md](rfc-010-cli-planes-restructure.md) |
 | CLI refactoring — one addressing & config model post-`omnigraph.yaml`: scope + `--graph` + derived access path, served-default / privileged-direct, profiles, named queries, capability classifier (completes RFC-008) | [rfc-011-cli-refactoring.md](rfc-011-cli-refactoring.md) |
 | Provider-independent embedding configuration — one resolved `EmbeddingConfig` + sealed provider enum (Gemini/OpenAI/Mock), identity recorded in the schema IR, query-time same-space validation, NFR floor | [rfc-012-embedding-provider-config.md](rfc-012-embedding-provider-config.md) |
-| Node identity — surrogate reference key + mutable natural key, resolve-on-write edges, derive-then-freeze surrogate so merge unifies (iss-gq-expose-system-id-column / iss-714 / dec-918) | [rfc-013-node-identity-surrogate-key.md](rfc-013-node-identity-surrogate-key.md) |
+| Node identity — surrogate reference key + mutable natural key, resolve-on-write edges, derive-then-freeze surrogate so merge unifies (iss-gq-expose-system-id-column / iss-714 / dec-918) | [rfc-014-node-identity-surrogate-key.md](rfc-014-node-identity-surrogate-key.md) |
 
 ## Boundary
 
