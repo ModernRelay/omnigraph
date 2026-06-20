@@ -14,6 +14,10 @@ mod layout;
 mod metadata;
 #[path = "manifest/migrations.rs"]
 mod migrations;
+// Entirely test-only since RFC-013 step 3a: with both reads (Fix 2) and writes
+// bypassing the Lance namespace, nothing in production routes through it; the
+// `LanceNamespace` impls are retained only to validate the contract in unit tests.
+#[cfg(test)]
 #[path = "manifest/namespace.rs"]
 mod namespace;
 #[path = "manifest/publisher.rs"]

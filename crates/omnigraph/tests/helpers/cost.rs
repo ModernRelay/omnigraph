@@ -35,7 +35,7 @@ use omnigraph::instrumentation::{
 };
 use omnigraph::loader::{LoadMode, load_jsonl};
 
-use super::{TEST_DATA, TEST_SCHEMA, init_and_load};
+use super::{MUTATION_QUERIES, TEST_DATA, TEST_SCHEMA, init_and_load, mixed_params};
 
 /// Object-store op counts for one measured operation, by table class — the
 /// vocabulary cost tests assert in (vs raw `IOTracker::stats().read_iops`).
@@ -317,6 +317,21 @@ pub fn assert_grows(
         hi >= lo + min_delta,
         "{what} did not grow as expected: depth {d_lo} = {lo} -> depth {d_hi} = {hi} (min delta {min_delta})"
     );
+}
+
+/// Measure one committing `insert_person` to `main` — the canonical write the cost
+/// gates sweep over commit-history depth. Shared by `write_cost.rs` and
+/// `write_cost_s3.rs` so the measured write is defined once.
+pub async fn measure_insert(db: &mut Omnigraph, tag: &str) -> IoCounts {
+    let (res, io) = measure(db.mutate(
+        "main",
+        MUTATION_QUERIES,
+        "insert_person",
+        &mixed_params(&[("$name", tag)], &[("$age", 30)]),
+    ))
+    .await;
+    res.unwrap();
+    io
 }
 
 // ── Backend fixtures — one knob, store-agnostic body ──

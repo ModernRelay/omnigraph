@@ -5,54 +5,39 @@
 // RFC-013 step 3a), so nothing in production routes through the Lance namespace
 // anymore. These impls are retained only to validate the LanceNamespace
 // contract in unit tests.
-#[cfg(test)]
 use std::sync::Arc;
 
-#[cfg(test)]
 use async_trait::async_trait;
-#[cfg(test)]
 use lance::Dataset;
-#[cfg(test)]
 use lance::dataset::builder::DatasetBuilder;
-#[cfg(test)]
 use lance_namespace::models::{
     CreateTableVersionRequest, CreateTableVersionResponse, DescribeTableRequest,
     DescribeTableResponse, DescribeTableVersionRequest, DescribeTableVersionResponse,
     ListTableVersionsRequest, ListTableVersionsResponse, TableExistsRequest, TableVersion,
 };
-#[cfg(test)]
 use lance_namespace::{Error as LanceNamespaceError, LanceNamespace, NamespaceError};
-#[cfg(test)]
 use lance_table::io::commit::ManifestNamingScheme;
-#[cfg(test)]
 use object_store::{
     Error as ObjectStoreError, ObjectStore as _, ObjectStoreExt, PutMode, PutOptions, path::Path,
 };
 
-#[cfg(test)]
 use crate::error::{OmniError, Result};
 
-#[cfg(test)]
 use super::layout::{
     namespace_internal_error, open_manifest_dataset, table_id_to_key, table_uri_for_path,
 };
-#[cfg(test)]
-use super::metadata::TableVersionMetadata;
-#[cfg(test)]
-use super::metadata::{namespace_version_metadata, parse_namespace_version_request};
-#[cfg(test)]
+use super::metadata::{
+    TableVersionMetadata, namespace_version_metadata, parse_namespace_version_request,
+};
 use super::publisher::GraphNamespacePublisher;
-#[cfg(test)]
 use super::state::{ManifestState, SubTableEntry, read_manifest_entries, read_manifest_state};
 
-#[cfg(test)]
 #[derive(Debug, Clone)]
 struct BranchManifestNamespace {
     root_uri: String,
     branch: Option<String>,
 }
 
-#[cfg(test)]
 impl BranchManifestNamespace {
     fn new(root_uri: &str, branch: Option<&str>) -> Self {
         Self {
@@ -78,7 +63,6 @@ impl BranchManifestNamespace {
     }
 }
 
-#[cfg(test)]
 #[derive(Debug, Clone)]
 struct StagedTableNamespace {
     root_uri: String,
@@ -87,7 +71,6 @@ struct StagedTableNamespace {
     branch: Option<String>,
 }
 
-#[cfg(test)]
 impl StagedTableNamespace {
     fn new(root_uri: &str, table_key: &str, table_path: &str, branch: Option<&str>) -> Self {
         Self {
@@ -161,7 +144,6 @@ impl StagedTableNamespace {
     }
 }
 
-#[cfg(test)]
 pub(crate) fn branch_manifest_namespace(
     root_uri: &str,
     branch: Option<&str>,
@@ -169,7 +151,6 @@ pub(crate) fn branch_manifest_namespace(
     Arc::new(BranchManifestNamespace::new(root_uri, branch))
 }
 
-#[cfg(test)]
 pub(crate) fn staged_table_namespace(
     root_uri: &str,
     table_key: &str,
@@ -181,7 +162,6 @@ pub(crate) fn staged_table_namespace(
     ))
 }
 
-#[cfg(test)]
 #[async_trait]
 impl LanceNamespace for BranchManifestNamespace {
     fn namespace_id(&self) -> String {
@@ -344,7 +324,6 @@ impl LanceNamespace for BranchManifestNamespace {
     }
 }
 
-#[cfg(test)]
 #[async_trait]
 impl LanceNamespace for StagedTableNamespace {
     fn namespace_id(&self) -> String {

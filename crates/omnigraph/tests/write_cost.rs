@@ -23,24 +23,10 @@
 
 mod helpers;
 
-use omnigraph::db::Omnigraph;
-
-use helpers::cost::{IoCounts, assert_flat, assert_grows, local_graph, measure, measure_with_staged};
+use helpers::cost::{
+    IoCounts, assert_flat, assert_grows, local_graph, measure_insert, measure_with_staged,
+};
 use helpers::{MUTATION_QUERIES, commit_many, mixed_params};
-
-/// One committing `insert_person` to `main`, measured. `node:Person` is the deep
-/// table `commit_many` builds, so its open + the internal scans carry the depth.
-async fn insert_cost(db: &mut Omnigraph, tag: &str) -> IoCounts {
-    let (res, io) = measure(db.mutate(
-        "main",
-        MUTATION_QUERIES,
-        "insert_person",
-        &mixed_params(&[("$name", tag)], &[("$age", 30)]),
-    ))
-    .await;
-    res.unwrap();
-    io
-}
 
 // ── (A) The internal-table LOCK — RED today, the acceptance test for step 2 ──
 //
@@ -61,7 +47,7 @@ async fn internal_table_scans_are_flat_in_history() {
             commit_many(&mut db, (d - current) as usize).await;
             current = d;
         }
-        let io = insert_cost(&mut db, &format!("lock_{d}")).await;
+        let io = measure_insert(&mut db, &format!("lock_{d}")).await;
         current += 1; // the measured write advanced depth by one
         eprintln!(
             "depth~{d}: data={} __manifest={} _graph_commits={}",
@@ -98,7 +84,7 @@ async fn data_table_reads_split_into_flat_opener_and_growing_scan() {
             commit_many(&mut db, (d - current) as usize).await;
             current = d;
         }
-        let io = insert_cost(&mut db, &format!("split_{d}")).await;
+        let io = measure_insert(&mut db, &format!("split_{d}")).await;
         current += 1;
         eprintln!(
             "depth~{d}: opener={} scan={} data_total={}",
@@ -125,7 +111,7 @@ async fn single_insert_data_write_is_bounded() {
     let dir = tempfile::tempdir().unwrap();
     let mut db = local_graph(&dir).await;
     commit_many(&mut db, 5).await;
-    let io = insert_cost(&mut db, "w").await;
+    let io = measure_insert(&mut db, "w").await;
     eprintln!("single insert: data_writes={}", io.data_writes);
     assert!(io.data_writes <= 4, "data-table write_iops should be a small constant, got {}", io.data_writes);
 }
@@ -138,7 +124,7 @@ async fn write_op_count_ceiling_at_shallow_depth() {
     let dir = tempfile::tempdir().unwrap();
     let mut db = local_graph(&dir).await;
     commit_many(&mut db, 5).await;
-    let io = insert_cost(&mut db, "ceil").await;
+    let io = measure_insert(&mut db, "ceil").await;
     eprintln!(
         "depth~5: data={} __manifest={} _graph_commits={} total_reads={}",
         io.data_reads, io.manifest_reads, io.commit_graph_reads, io.total_reads()

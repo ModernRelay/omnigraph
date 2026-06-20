@@ -28,23 +28,8 @@
 
 mod helpers;
 
-use omnigraph::db::Omnigraph;
-
-use helpers::cost::{IoCounts, assert_flat, measure, s3_graph};
-use helpers::{MUTATION_QUERIES, commit_many, mixed_params};
-
-/// One committing `insert_person` to `main`, measured (identical to the local gate's).
-async fn insert_cost(db: &mut Omnigraph, tag: &str) -> IoCounts {
-    let (res, io) = measure(db.mutate(
-        "main",
-        MUTATION_QUERIES,
-        "insert_person",
-        &mixed_params(&[("$name", tag)], &[("$age", 30)]),
-    ))
-    .await;
-    res.unwrap();
-    io
-}
+use helpers::cost::{IoCounts, assert_flat, measure_insert, s3_graph};
+use helpers::commit_many;
 
 /// After step 3a the data-table opener term is flat across depth on a real object
 /// store (the measured win). RED on the pre-3a namespace-builder opener (O(depth)
@@ -66,7 +51,7 @@ async fn data_table_opener_is_flat_in_history_on_s3() {
             commit_many(&mut db, (d - current) as usize).await;
             current = d;
         }
-        let io = insert_cost(&mut db, &format!("s3_{d}")).await;
+        let io = measure_insert(&mut db, &format!("s3_{d}")).await;
         current += 1;
         eprintln!(
             "depth~{d}: opener={} scan={} data_total={} __manifest={} _graph_commits={}",
