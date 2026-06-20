@@ -27,6 +27,16 @@ pub enum ManifestConflictDetails {
     /// `ExpectedVersionMismatch`: the caller's expectations (if any) still
     /// hold against the new manifest state, so the publisher will retry.
     RowLevelCasContention,
+    /// Lance rejected the publish with a *retryable* fragment-level commit
+    /// conflict (`Error::RetryableCommitConflict`): a concurrent transaction
+    /// preempted ours at the manifest-version level — notably an `optimize`
+    /// compaction `Operation::Rewrite` of `__manifest` landing in the window
+    /// between our state load and our commit, when our merge touched a fragment
+    /// it rewrote. Like `RowLevelCasContention` and unlike
+    /// `ExpectedVersionMismatch`, the caller's expectations still hold against
+    /// fresh state, so the publisher reloads and retries — a maintenance
+    /// compaction must never fail a live write (invariant 7).
+    RetryableCommitConflict,
 }
 
 #[derive(Debug, Clone, Error)]
@@ -144,6 +154,13 @@ impl OmniError {
         Self::Manifest(
             ManifestError::new(ManifestErrorKind::Conflict, message)
                 .with_details(ManifestConflictDetails::RowLevelCasContention),
+        )
+    }
+
+    pub fn manifest_retryable_commit_conflict(message: impl Into<String>) -> Self {
+        Self::Manifest(
+            ManifestError::new(ManifestErrorKind::Conflict, message)
+                .with_details(ManifestConflictDetails::RetryableCommitConflict),
         )
     }
 }
