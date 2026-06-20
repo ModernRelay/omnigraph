@@ -22,7 +22,7 @@ list/`Blob` columns → none.
 
 > **Coverage and cost.** Each indexed column adds index files and build time, and
 > an index only covers the fragments it was built over. Rows appended after the
-> index was built (e.g. by `ingest --mode merge`) are scanned unindexed until a
+> index was built (e.g. by `load --mode merge`) are scanned unindexed until a
 > reindex extends coverage; see [maintenance](../operations/maintenance.md) → `optimize`.
 
 ## L2 — OmniGraph orchestration
