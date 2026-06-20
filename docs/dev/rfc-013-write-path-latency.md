@@ -846,23 +846,34 @@ to flatten the curve.
    internal-table LOCK (step 2's red→green acceptance). *Still owed:* the prod
    `storage.ops` span metric (§5.3) and the bucket-gated `write_cost_s3.rs` opener
    LOCK (step 3a's red→green, S3-only per the §9-3a measurement note).
-2. **Bound history — bring the INTERNAL tables into optimize/cleanup (a code
-   change, not just scheduling).** Today `optimize`/`cleanup` iterate **node/edge
-   keys only** (`optimize.rs:895-904`) — confirmed: the prototype's `cleanup --keep 3`
-   pruned "7 tables" = the node/edge data tables; `__manifest`/`_graph_commits` were
-   untouched **[M]**. So the residual +5/depth internal slope (§0b) is **not** fixed
-   by today's tooling — step 2 is a real `all_table_keys` change to add the internal
-   tables, then schedule compaction+cleanup (pass `--yes`; cleanup aborts on remote
-   otherwise). The pruning mechanism is proven on a data table (1035→63, 16× **[M]**);
-   the internal tables need the same inclusion. **Proven [M]:** compacting the
-   internal tables collapsed their scans `__manifest` 285→32, `_graph_commits`
-   177→11; with step 3 a depth-87 edge drops **~1720 → 198 ops** (§2.4). (Separately,
-   node/edge cleanup **caps** the dominant data-table term as an interim *before*
-   step 3 — after step 3 that term is flat regardless.) **HARD PREREQUISITE:** the
-   Q8 boundary watermark must land **with** this step — Lance's version CAS is
-   confirmed vulnerable to cleanup-resurrection (§12 Q8, a silent lost write on
-   R2/S3), so scheduling cleanup without the watermark trades a latency bug for a
-   correctness bug. (`gap-read-path-rederivation` write twin.)
+2. **Bound history — bring the INTERNAL tables into optimize/cleanup.** Split into
+   a compaction half (the latency win, safe) and a cleanup half (version GC, needs
+   the Q8 watermark). Validated (Lance docs + source): compaction *preserves*
+   versions and is the only term needed to flatten the per-write metadata scan;
+   cleanup is the separate version-deleting op that opens the Q8 hole.
+   - **2a. Internal-table compaction. ✅ LANDED.** `optimize` now compacts
+     `__manifest` and `_graph_commits` (`compact_internal_table`, a separate simpler
+     path than `optimize_one_table`: no manifest publish, no recovery sidecar — a
+     single atomic Lance commit; no app lock — Lance OCC auto-retries the Rewrite,
+     the canonical LanceDB pattern; a coordinator `refresh` after for cache
+     coherence). The `internal_table_scans_are_flat_in_history` LOCK is now green:
+     on a compacted graph a write's `__manifest`/`_graph_commits` scan is flat in
+     history (measured `__manifest` 4→2, `_graph_commits` 7→3 across depth 10→100,
+     vs the pre-2a RED 34→214 / 29→207). Compacts both tables even though Phase 7
+     (`iss-991`) will later fold `_graph_commits` into `__manifest` (one-call
+     throwaway; full interim win until then). **2a is also the hard prerequisite
+     for Phase 7** (its `graph_head` CAS contention is only acceptable once
+     `__manifest` compaction bounds the publisher's `load_publish_state` scan).
+   - **2b. Internal-table cleanup + Q8 watermark — DEFERRED** (debated; not bundled
+     with 2a). Cleanup is the version-deleting op that hits cleanup-resurrection
+     (§12 Q8: Lance's version CAS has no monotonic guard), so it must land **with**
+     a durable monotonic watermark (a Lance boundary tag — durable across cleanup,
+     `cleanup.rs` `is_tagged`). Deferred because it touches the read/open path
+     (a tag-floor clamp on every coordinator open), is the MTT-redundant part (MTT
+     may replace `__manifest`), and only buys the secondary version-count/space term
+     — whereas 2a delivers the dominant per-write scan win with zero resurrection
+     risk. Land it when the version-count cost bites or the Lance MTT timeline
+     clarifies. (`gap-read-path-rederivation` write twin.)
 3. **The opener fix — a shippable lead + the structural follow-on.**
    - **3a. Opener bypass (standalone PR, THE dominant fix — [M] proven). ✅ LANDED.**
      `TableStore::open_dataset_head_for_write` now delegates to the direct
