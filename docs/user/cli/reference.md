@@ -189,22 +189,26 @@ omnigraph cluster import   --config company-brain --json
 omnigraph cluster force-unlock <LOCK_ID> --config company-brain --json
 ```
 
-`--config` is a directory containing `cluster.yaml`; it defaults to `.`.
-Stage 3A accepts graphs, schemas, stored queries, and policy bundle file
+`--config` is a directory containing `cluster.yaml`; it defaults to `.`. The
+config declares graphs, schemas, stored queries, and policy bundle file
 references. `cluster plan` reads local JSON state from
 `<config-dir>/__cluster/state.json`; a missing file means empty state. Plan,
 apply, refresh, and import acquire `__cluster/lock.json` by default and release
-it before returning. `cluster apply` executes only stored-query/policy catalog
-writes (content-addressed under `__cluster/resources/`) and requires an
-existing `state.json`; graph/schema changes are deferred with warnings, and
-applied resources do not serve traffic until an `omnigraph-server --cluster
-<dir>` restart picks them up. `cluster status` reads state only and reports any existing
-lock metadata. `force-unlock` removes a lock only when the supplied id exactly
-matches the lock file. `refresh` requires an existing `state.json`; `import`
-creates one only when it is missing. Both observe declared graphs read-only at
-`<config-dir>/graphs/<graph-id>.omni`. External state backends, graph/schema
-apply, automatic stale-lock breaking, `plan --refresh`, pipelines, UI specs,
-embeddings, aliases, and bindings are reserved for later stages. See
+it before returning. `cluster apply` converges the cluster to its config in one
+ordered run: it creates declared graphs, applies schema updates (soft drops
+only — see [schema](../schema/index.md)), writes stored-query/policy catalog
+resources (content-addressed under `__cluster/resources/`), and executes
+approved graph deletes; it requires an existing `state.json` (run `import`
+first). Applied state does not serve traffic until an `omnigraph-server
+--cluster <dir>` restart picks up the new revision. Standalone schema deletes
+remain unsupported and are reported as `deferred` with a warning. `cluster
+status` reads state only and reports any existing lock metadata. `force-unlock`
+removes a lock only when the supplied id exactly matches the lock file.
+`refresh` requires an existing `state.json`; `import` creates one only when it
+is missing. Both observe declared graphs read-only at
+`<config-dir>/graphs/<graph-id>.omni`. External state backends, automatic
+stale-lock breaking, `plan --refresh`, pipelines, UI specs, embeddings,
+aliases, and bindings are reserved for later stages. See
 [cluster-config.md](../clusters/config.md).
 
 ## Output formats (`query` command, alias: `read`)
