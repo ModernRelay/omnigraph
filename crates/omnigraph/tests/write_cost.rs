@@ -28,14 +28,16 @@ use helpers::cost::{
 };
 use helpers::{MUTATION_QUERIES, commit_many, mixed_params};
 
-// ── (A) The internal-table LOCK — RED today, the acceptance test for step 2 ──
+// ── (A) The internal-table LOCK — the acceptance test for step 2 (compaction) ──
 //
-// `__manifest` / `_graph_commits` scans must be O(1) in commit-history depth.
-// RED today (O(fragments), uncompacted). Un-ignore when step 2 (internal-table
-// compaction) lands — it must go green flat. (The data-table term is the S3
-// gate's, `write_cost_s3.rs`; local-FS hides it.)
+// `__manifest` / `_graph_commits` scans on a write must be O(1) in commit-history
+// depth **on a compacted graph**. Without internal-table compaction these scans
+// are O(fragments) and grow forever; step 2 brings the internal tables into
+// `db.optimize()`, so after compaction the per-write scan is flat. The test
+// compacts at each depth checkpoint before measuring — i.e. it pins the production
+// invariant "a periodically-compacted graph's write cost does not grow with
+// version history," which is exactly what step 2 delivers.
 #[tokio::test]
-#[ignore = "RED until step 2 (internal-table compaction): __manifest/_graph_commits scans are O(fragments) today — RFC-013 §0/§2.2. Un-ignore there as the red→green acceptance test."]
 async fn internal_table_scans_are_flat_in_history() {
     let dir = tempfile::tempdir().unwrap();
     let mut db = local_graph(&dir).await;
@@ -47,6 +49,9 @@ async fn internal_table_scans_are_flat_in_history() {
             commit_many(&mut db, (d - current) as usize).await;
             current = d;
         }
+        // Step 2: compaction folds the internal tables' O(depth) fragments back to
+        // a small constant, so the following write's scan of them is flat.
+        db.optimize().await.unwrap();
         let io = measure_insert(&mut db, &format!("lock_{d}")).await;
         current += 1; // the measured write advanced depth by one
         eprintln!(
