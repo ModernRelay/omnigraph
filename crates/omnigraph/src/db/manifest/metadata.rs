@@ -2,7 +2,9 @@ use std::collections::HashMap;
 
 use lance::Dataset;
 use lance_namespace::Error as LanceNamespaceError;
-use lance_namespace::models::{CreateTableVersionRequest, TableVersion};
+use lance_namespace::models::CreateTableVersionRequest;
+#[cfg(test)]
+use lance_namespace::models::TableVersion;
 use serde::{Deserialize, Serialize};
 
 use crate::error::{OmniError, Result};
@@ -142,6 +144,7 @@ impl TableVersionMetadata {
         self.to_namespace_version_with_details(version, None, None)
     }
 
+    #[cfg(test)]
     pub(super) fn to_namespace_version_with_details(
         &self,
         version: u64,

@@ -14,6 +14,10 @@ mod layout;
 mod metadata;
 #[path = "manifest/migrations.rs"]
 mod migrations;
+// Entirely test-only since RFC-013 step 3a: with both reads (Fix 2) and writes
+// bypassing the Lance namespace, nothing in production routes through it; the
+// `LanceNamespace` impls are retained only to validate the contract in unit tests.
+#[cfg(test)]
 #[path = "manifest/namespace.rs"]
 mod namespace;
 #[path = "manifest/publisher.rs"]
@@ -28,7 +32,6 @@ use layout::{manifest_uri, open_manifest_dataset, table_uri_for_path, type_name_
 pub(crate) use metadata::TableVersionMetadata;
 #[cfg(test)]
 use metadata::{OMNIGRAPH_ROW_COUNT_KEY, table_version_metadata_for_state};
-pub(crate) use namespace::open_table_head_for_write;
 #[cfg(test)]
 use namespace::{branch_manifest_namespace, staged_table_namespace};
 use publisher::{GraphNamespacePublisher, ManifestBatchPublisher};

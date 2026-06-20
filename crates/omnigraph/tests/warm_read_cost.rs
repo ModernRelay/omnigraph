@@ -1,50 +1,21 @@
 //! Cost-budget tests for the warm read path (Fix 1): a warm same-branch read
-//! must perform no manifest or commit-graph opens, measured with Lance's
-//! `IOTracker` at the object-store boundary (the LanceDB IO-counted-test
-//! pattern; see docs/dev/testing.md). Guards invariant 15 (read cost bounded by
-//! work, not history) for snapshot resolution, and invariant 6 (a warm reader
-//! still observes external commits).
+//! must perform no manifest or commit-graph opens, measured via the shared
+//! `helpers::cost` harness at the object-store boundary (the LanceDB
+//! IO-counted-test pattern; see docs/dev/testing.md). Guards invariant 15 (read
+//! cost bounded by work, not history) for snapshot resolution, and invariant 6
+//! (a warm reader still observes external commits).
 
 mod helpers;
 
-use std::sync::Arc;
-use std::sync::atomic::{AtomicU64, Ordering};
-
 use arrow_array::{Array, StringArray};
-use lance::io::WrappingObjectStore;
-use lance_io::utils::tracking_store::IOTracker;
 use omnigraph::db::{Omnigraph, ReadTarget};
-use omnigraph::instrumentation::{QueryIoProbes, with_query_io_probes};
 use omnigraph_compiler::result::QueryResult;
 
+use helpers::cost::measure;
 use helpers::{
     MUTATION_QUERIES, TEST_QUERIES, commit_many, count_rows, init_and_load, mixed_params,
     mutate_branch, mutate_main, params,
 };
-
-/// IO probes plus the tracker handles to read `read_iops` after the query.
-/// Returns `(probes, manifest, commit_graph, table, probe_count)` — `table`
-/// counts per-table data opens (the cache-miss path), so a cost test can assert
-/// N opens on a cold read and 0 on a warm repeat (Fix 3).
-fn probes() -> (
-    QueryIoProbes,
-    IOTracker,
-    IOTracker,
-    IOTracker,
-    Arc<AtomicU64>,
-) {
-    let manifest = IOTracker::default();
-    let commit_graph = IOTracker::default();
-    let table = IOTracker::default();
-    let probe_count = Arc::new(AtomicU64::new(0));
-    let probes = QueryIoProbes {
-        manifest_wrapper: Some(Arc::new(manifest.clone()) as Arc<dyn WrappingObjectStore>),
-        commit_graph_wrapper: Some(Arc::new(commit_graph.clone()) as Arc<dyn WrappingObjectStore>),
-        table_wrapper: Some(Arc::new(table.clone()) as Arc<dyn WrappingObjectStore>),
-        probe_count: Arc::clone(&probe_count),
-    };
-    (probes, manifest, commit_graph, table, probe_count)
-}
 
 fn first_column_strings(result: &QueryResult) -> Vec<String> {
     if result.num_rows() == 0 {
@@ -75,18 +46,14 @@ async fn warm_same_branch_read_does_no_resolution_opens() {
     // Deep history: warm-read resolution cost must be flat in commit count.
     commit_many(&mut db, 20).await;
 
-    let (probes_in, manifest, commit_graph, _table, probe_count) = probes();
-    with_query_io_probes(
-        probes_in,
-        db.query(
-            ReadTarget::branch("main"),
-            TEST_QUERIES,
-            "total_people",
-            &params(&[]),
-        ),
-    )
-    .await
-    .unwrap();
+    let (out, io) = measure(db.query(
+        ReadTarget::branch("main"),
+        TEST_QUERIES,
+        "total_people",
+        &params(&[]),
+    ))
+    .await;
+    out.unwrap();
 
     // A warm same-branch read opens nothing from the internal tables, even at
     // commit-history depth. Fix 1 reuses the coordinator (no re-open: 0
@@ -95,18 +62,15 @@ async fn warm_same_branch_read_does_no_resolution_opens() {
     // per-table __manifest scan is gone too. Pre-fix, each of these is a deep scan
     // of an internal table that grows with commit count.
     assert_eq!(
-        manifest.stats().read_iops,
-        0,
+        io.manifest_reads, 0,
         "warm same-branch read must not scan __manifest (resolution or per-table)"
     );
     assert_eq!(
-        commit_graph.stats().read_iops,
-        0,
+        io.commit_graph_reads, 0,
         "warm same-branch read must not open the commit graph (no coordinator re-open)"
     );
     assert_eq!(
-        probe_count.load(Ordering::Relaxed),
-        1,
+        io.version_probes, 1,
         "warm same-branch read performs exactly one version probe"
     );
 }
@@ -121,22 +85,17 @@ async fn multi_table_query_does_no_manifest_scans() {
     let dir = tempfile::tempdir().unwrap();
     let db = init_and_load(&dir).await;
 
-    let (probes_in, manifest, _commit_graph, _table, _probe) = probes();
-    with_query_io_probes(
-        probes_in,
-        db.query(
-            ReadTarget::branch("main"),
-            TEST_QUERIES,
-            "age_stats",
-            &params(&[]),
-        ),
-    )
-    .await
-    .unwrap();
+    let (out, io) = measure(db.query(
+        ReadTarget::branch("main"),
+        TEST_QUERIES,
+        "age_stats",
+        &params(&[]),
+    ))
+    .await;
+    out.unwrap();
 
     assert_eq!(
-        manifest.stats().read_iops,
-        0,
+        io.manifest_reads, 0,
         "a multi-table read must not scan __manifest once per touched table"
     );
 }
@@ -278,32 +237,25 @@ async fn warm_branch_read_does_no_manifest_scans() {
     // Bind the handle's coordinator to the branch so reads of it take the warm path.
     db.sync_branch("feature").await.unwrap();
 
-    let (probes_in, manifest, commit_graph, _table, probe_count) = probes();
-    with_query_io_probes(
-        probes_in,
-        db.query(
-            ReadTarget::branch("feature"),
-            TEST_QUERIES,
-            "total_people",
-            &params(&[]),
-        ),
-    )
-    .await
-    .unwrap();
+    let (out, io) = measure(db.query(
+        ReadTarget::branch("feature"),
+        TEST_QUERIES,
+        "total_people",
+        &params(&[]),
+    ))
+    .await;
+    out.unwrap();
 
     assert_eq!(
-        manifest.stats().read_iops,
-        0,
+        io.manifest_reads, 0,
         "warm branch read must not scan __manifest (branch-owned table opened by location)"
     );
     assert_eq!(
-        commit_graph.stats().read_iops,
-        0,
+        io.commit_graph_reads, 0,
         "warm branch read must not open the commit graph"
     );
     assert_eq!(
-        probe_count.load(Ordering::Relaxed),
-        1,
+        io.version_probes, 1,
         "warm branch read performs exactly one version probe"
     );
 }
@@ -369,18 +321,14 @@ async fn warm_read_on_recreated_branch_observes_new_incarnation() {
         "test setup must exercise branch incarnation reuse at one Lance version"
     );
 
-    let (probes_in, manifest, commit_graph, _table, probe_count) = probes();
-    let new_feature = with_query_io_probes(
-        probes_in,
-        reader.query(
-            ReadTarget::branch("feature"),
-            TEST_QUERIES,
-            "get_person",
-            &params(&[("$name", "MainOnly")]),
-        ),
-    )
-    .await
-    .unwrap();
+    let (new_feature, io) = measure(reader.query(
+        ReadTarget::branch("feature"),
+        TEST_QUERIES,
+        "get_person",
+        &params(&[("$name", "MainOnly")]),
+    ))
+    .await;
+    let new_feature = new_feature.unwrap();
 
     assert_eq!(
         new_feature.num_rows(),
@@ -388,17 +336,15 @@ async fn warm_read_on_recreated_branch_observes_new_incarnation() {
         "warm reader must refresh to the recreated branch incarnation"
     );
     assert!(
-        manifest.stats().read_iops > 0,
+        io.manifest_reads > 0,
         "recreated branch must re-read the manifest after the incarnation probe"
     );
     assert_eq!(
-        commit_graph.stats().read_iops,
-        0,
+        io.commit_graph_reads, 0,
         "same-branch incarnation refresh must be manifest-only"
     );
     assert_eq!(
-        probe_count.load(Ordering::Relaxed),
-        2,
+        io.version_probes, 2,
         "stale same-branch read probes once under the read lock and once under the write lock"
     );
 }
@@ -469,39 +415,33 @@ async fn recreated_branch_owned_table_handle_uses_table_etag() {
         "test setup must force table handle identity to differ only by e_tag"
     );
 
-    let (probes_in, manifest, commit_graph, table, probe_count) = probes();
-    let new_person = with_query_io_probes(
-        probes_in,
-        reader.query(
-            ReadTarget::branch("feature"),
-            TEST_QUERIES,
-            "get_person",
-            &params(&[("$name", "NewOnly")]),
-        ),
-    )
-    .await
-    .unwrap();
+    let (new_person, io) = measure(reader.query(
+        ReadTarget::branch("feature"),
+        TEST_QUERIES,
+        "get_person",
+        &params(&[("$name", "NewOnly")]),
+    ))
+    .await;
+    let new_person = new_person.unwrap();
     assert_eq!(
         new_person.num_rows(),
         1,
         "warm reader must open the recreated branch-owned table incarnation"
     );
     assert!(
-        table.stats().read_iops > 0,
+        io.data_reads > 0,
         "table e_tag must force a held-handle cache miss for the recreated table"
     );
     assert!(
-        manifest.stats().read_iops > 0,
+        io.manifest_reads > 0,
         "recreated branch must refresh the manifest"
     );
     assert_eq!(
-        commit_graph.stats().read_iops,
-        0,
+        io.commit_graph_reads, 0,
         "same-branch table-incarnation refresh must be manifest-only"
     );
     assert_eq!(
-        probe_count.load(Ordering::Relaxed),
-        2,
+        io.version_probes, 2,
         "stale same-branch read probes once under each lock"
     );
 
@@ -594,35 +534,29 @@ async fn recreated_branch_traversal_uses_graph_index_incarnation() {
         "test setup must force graph-index identity to differ only by snapshot incarnation"
     );
 
-    let (probes_in, manifest, commit_graph, _table, probe_count) = probes();
-    let new_friends = with_query_io_probes(
-        probes_in,
-        reader.query(
-            ReadTarget::branch("feature"),
-            TEST_QUERIES,
-            "friends_of",
-            &params(&[("$name", "NewWalker")]),
-        ),
-    )
-    .await
-    .unwrap();
+    let (new_friends, io) = measure(reader.query(
+        ReadTarget::branch("feature"),
+        TEST_QUERIES,
+        "friends_of",
+        &params(&[("$name", "NewWalker")]),
+    ))
+    .await;
+    let new_friends = new_friends.unwrap();
     assert_eq!(
         first_column_strings(&new_friends),
         vec!["Bob"],
         "traversal must use the recreated branch's topology, not stale cached graph index"
     );
     assert!(
-        manifest.stats().read_iops > 0,
+        io.manifest_reads > 0,
         "recreated branch traversal must refresh the manifest"
     );
     assert_eq!(
-        commit_graph.stats().read_iops,
-        0,
+        io.commit_graph_reads, 0,
         "same-branch traversal incarnation refresh must be manifest-only"
     );
     assert_eq!(
-        probe_count.load(Ordering::Relaxed),
-        2,
+        io.version_probes, 2,
         "stale same-branch read probes once under each lock"
     );
 
@@ -673,31 +607,25 @@ async fn stale_read_refreshes_manifest_only() {
     .await
     .unwrap();
 
-    let (probes_in, manifest, commit_graph, _table, probe_count) = probes();
-    with_query_io_probes(
-        probes_in,
-        reader.query(
-            ReadTarget::branch("main"),
-            TEST_QUERIES,
-            "total_people",
-            &params(&[]),
-        ),
-    )
-    .await
-    .unwrap();
+    let (out, io) = measure(reader.query(
+        ReadTarget::branch("main"),
+        TEST_QUERIES,
+        "total_people",
+        &params(&[]),
+    ))
+    .await;
+    out.unwrap();
 
     assert!(
-        manifest.stats().read_iops > 0,
+        io.manifest_reads > 0,
         "stale read must re-read the manifest"
     );
     assert_eq!(
-        commit_graph.stats().read_iops,
-        0,
+        io.commit_graph_reads, 0,
         "stale refresh must be manifest-only (no commit-graph scan)"
     );
     assert_eq!(
-        probe_count.load(Ordering::Relaxed),
-        2,
+        io.version_probes, 2,
         "stale same-branch read probes once under the read lock and once under the write lock"
     );
 }
@@ -721,55 +649,40 @@ async fn repeat_warm_read_reuses_table_handles() {
     commit_many(&mut db, 10).await;
 
     // Cold first read: opens the touched table.
-    let (p1, _m1, _c1, table1, _pr1) = probes();
-    with_query_io_probes(
-        p1,
-        db.query(
-            ReadTarget::branch("main"),
-            TEST_QUERIES,
-            "total_people",
-            &params(&[]),
-        ),
-    )
-    .await
-    .unwrap();
+    let (cold_out, cold) = measure(db.query(
+        ReadTarget::branch("main"),
+        TEST_QUERIES,
+        "total_people",
+        &params(&[]),
+    ))
+    .await;
+    cold_out.unwrap();
     assert!(
-        table1.stats().read_iops > 0,
+        cold.data_reads > 0,
         "the cold first read must open the table"
     );
 
     // Warm repeat: the held handle is reused, so no open happens through this
-    // query's table wrapper.
-    let (p2, manifest2, commit_graph2, table2, probe2) = probes();
-    with_query_io_probes(
-        p2,
-        db.query(
-            ReadTarget::branch("main"),
-            TEST_QUERIES,
-            "total_people",
-            &params(&[]),
-        ),
-    )
-    .await
-    .unwrap();
+    // query's table wrapper. A fresh `measure()` isolates the warm repeat's cost.
+    let (warm_out, warm) = measure(db.query(
+        ReadTarget::branch("main"),
+        TEST_QUERIES,
+        "total_people",
+        &params(&[]),
+    ))
+    .await;
+    warm_out.unwrap();
     assert_eq!(
-        table2.stats().read_iops,
-        0,
+        warm.data_reads, 0,
         "a warm repeat read must reuse the held handle (0 table opens)"
     );
+    assert_eq!(warm.manifest_reads, 0, "warm repeat read: 0 manifest opens");
     assert_eq!(
-        manifest2.stats().read_iops,
-        0,
-        "warm repeat read: 0 manifest opens"
-    );
-    assert_eq!(
-        commit_graph2.stats().read_iops,
-        0,
+        warm.commit_graph_reads, 0,
         "warm repeat read: 0 commit-graph opens"
     );
     assert_eq!(
-        probe2.load(Ordering::Relaxed),
-        1,
+        warm.version_probes, 1,
         "warm repeat read: exactly one version probe"
     );
 }
@@ -807,20 +720,16 @@ async fn write_invalidates_table_cache_for_changed_table() {
     .unwrap();
 
     // The next read re-opens Person at the new version (cache miss).
-    let (p, _m, _c, table, _pr) = probes();
-    with_query_io_probes(
-        p,
-        db.query(
-            ReadTarget::branch("main"),
-            TEST_QUERIES,
-            "total_people",
-            &params(&[]),
-        ),
-    )
-    .await
-    .unwrap();
+    let (out, io) = measure(db.query(
+        ReadTarget::branch("main"),
+        TEST_QUERIES,
+        "total_people",
+        &params(&[]),
+    ))
+    .await;
+    out.unwrap();
     assert!(
-        table.stats().read_iops > 0,
+        io.data_reads > 0,
         "a read after a write to the table must re-open it (version-keyed miss)"
     );
 
