@@ -76,6 +76,11 @@ Server-level management endpoints:
 |---|---|---|---|
 | GET | `/graphs` | bearer + `graph_list` on `Server::"root"` | list ready/served graphs |
 
+> The per-graph subsections below name routes in shorthand (`GET /queries`,
+> `POST /query`, `POST /mutate`, `POST /queries/{name}`); every one is served
+> under the `/graphs/{id}/…` prefix shown in the table — only `/graphs` and
+> `/healthz` are flat.
+
 ### Stored-query catalog (`GET /queries`)
 
 List the graph's stored queries as a typed tool catalog — enough for a client (e.g. an MCP server) to register each as a tool without fetching `.gq` source. Each entry: `{ name, tool_name, description, instruction, mutation, params }`, where each param is `{ name, kind, item_kind?, vector_dim?, nullable }`. `kind` is one of `string | bool | int | bigint | float | date | datetime | blob | vector | list` (decomposed so a consumer maps it with a closed `switch`, never re-parsing GQ type spelling). `bigint` (I64/U64), `date`, `datetime`, and `blob` are carried as JSON **strings** — a 64-bit integer loses precision as a JSON number, dates are ISO strings, and a blob is a URI string.

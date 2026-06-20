@@ -208,7 +208,7 @@ removes a lock only when the supplied id exactly matches the lock file.
 is missing. Both observe declared graphs read-only at
 `<config-dir>/graphs/<graph-id>.omni`. External state backends, automatic
 stale-lock breaking, `plan --refresh`, pipelines, UI specs, embeddings,
-aliases, and bindings are reserved for later stages. See
+aliases, and bindings are not yet supported. See
 [cluster-config.md](../clusters/config.md).
 
 ## Output formats (`query` command, alias: `read`)
