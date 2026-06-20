@@ -17,6 +17,7 @@ fixed. Branch `docs/user-coherence-0-7-1`.
 |---|---|---|
 | P1 | `cluster apply` documented as catalog-only / "Stage 3A" with graph+schema deferred — in both `cli/reference.md` and the shipped CLI help (`cli.rs`) | Rewrote both to describe the real converge behavior (creates graphs, applies schema with soft drops, writes catalog, executes approved deletes in one ordered run); `deferred` now means the genuinely-unsupported case (standalone schema delete). |
 | P1 | Stored-query exposure had two contracts: `server.md` documented a per-query `mcp:{expose:false}` knob; cluster docs said all queries are listed | Confirmed in code: cluster registry has no expose field (`QueryConfig`), boot bridge hardcodes `expose: true` (`omnigraph-server` settings), no GQ-level annotation. Removed the knob from `server.md`; documented "every applied query is listed; per-query exposure may become a Cedar-policy decision later". |
+| P1 | The same stale "`mcp.expose == true` subset" contract lived in the **OpenAPI surface**: utoipa annotations (`handlers.rs:1029,1037`, `omnigraph-api-types/src/lib.rs:404`) drove `openapi.json` (Greptile catch on #293) | Updated the three Rust doc-comment/annotation strings to "every stored query" and regenerated `openapi.json` (`OMNIGRAPH_UPDATE_OPENAPI=1`); drift test green. Same-change per AGENTS.md rule 4. |
 | P2 | `schema/index.md` claimed `allow_data_loss` honored "uniformly across transports" incl. HTTP `POST /schema/apply` | Scoped to the direct/embedded path; added that cluster-managed graphs evolve via `cluster apply` (soft drops only) and the HTTP route is 409-disabled for cluster serving. |
 | P2 | `/load` missing from admission / body-limit / rate-limit / manifest-conflict prose (named `/ingest` only); constants called it "Ingest body limit" | Documented `/load` as canonical everywhere with `/ingest` as the deprecated alias; renamed the constant to "Load (bulk-write) body limit". |
 | P2 | CLI "Bearer token resolution" section listed removed `omnigraph.yaml` keys (`graphs.<name>.bearer_token_env`, `auth.env_file`) | Replaced with a pointer to the keyed-credential model (`OMNIGRAPH_TOKEN_<NAME>` → `~/.omnigraph/credentials` → `OMNIGRAPH_BEARER_TOKEN`); no plaintext-in-config path. |
@@ -39,6 +40,17 @@ fixed. Branch `docs/user-coherence-0-7-1`.
   `apply_schema_update_and_dependent_query_in_one_run`,
   `apply_blocks_graph_delete_without_approval`). Update these comments in a
   cluster-crate change.
+- **Cross-repo drift from this sweep** (separate repos — track here, fix in a
+  follow-up in each repo):
+  - `omnigraph-ts` SDK ships a stale generated `spec/openapi.json` +
+    `packages/sdk/src/generated/types.gen.ts` still describing the `GET /queries`
+    catalog as the `mcp.expose` subset. Regenerate from this repo's
+    `openapi.json` once the SDK's deferred refresh happens (the SDK is known to
+    lag the API by design).
+  - `omnigraph-cookbooks/docs/best-practices.md` (~line 372) still describes
+    client-side auth as resolving through the removed `bearer_token_env` chain.
+    Update to the keyed-credential model (`OMNIGRAPH_TOKEN_<NAME>` →
+    credentials file → `OMNIGRAPH_BEARER_TOKEN`).
 
 ## Verification checklist (re-run on the next docs audit)
 
