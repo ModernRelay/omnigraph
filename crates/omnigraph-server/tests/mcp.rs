@@ -694,6 +694,58 @@ async fn stored_query_run_cannot_reach_unexposed_query() {
 }
 
 #[test]
+fn mcp_backend_resolves_only_through_the_exposed_chokepoint() {
+    // Construction guard for the stored-query expose class: the MCP backend must
+    // reach stored queries ONLY through exposed()/exposed_by_name(), never the
+    // expose-ignoring QueryRegistry::lookup/iter (those would leak an
+    // `@mcp(expose: false)` query to the agent surface). HTTP/service callers may
+    // use lookup/iter; the agent surface may not. A source-walk so a future edit
+    // that reintroduces the bug fails loudly here.
+    const SRC: &str = include_str!("../src/mcp.rs");
+    assert!(
+        !SRC.contains(".lookup("),
+        "mcp.rs must not call registry.lookup — use exposed_by_name()"
+    );
+    assert!(
+        !SRC.contains("registry.iter("),
+        "mcp.rs must not call registry.iter — use exposed()"
+    );
+}
+
+#[tokio::test]
+async fn permit_all_actor_sees_every_builtin_tool() {
+    // Relaxation lower-bound for `list_gate`: when the policy permits every
+    // action, NO built-in may be hidden from tools/list (a hidden-but-callable
+    // tool is the class the list-gate fix closed). Pairs with
+    // `list_gate_matches_call_for_fixed_branchless_reads`, which pins the
+    // fixed-branchless reads' faithful gate at the other end.
+    let (_t, app) = app_for_loaded_graph_with_auth_tokens(&[("act", "tok")]).await;
+    let (_s, list) =
+        json_response(&app, mcp_request(Some("tok"), rpc(1, "tools/list", json!({})))).await;
+    let names = tool_names(&list);
+    for builtin in [
+        "graph_health",
+        "graph_query",
+        "graph_snapshot",
+        "schema_get",
+        "branch_list",
+        "commit_list",
+        "commit_get",
+        "graph_mutate",
+        "graph_load",
+        "branch_create",
+        "branch_delete",
+        "branch_merge",
+        "schema_apply",
+    ] {
+        assert!(
+            names.contains(&builtin.to_string()),
+            "a permit-all actor must see built-in '{builtin}' (list_gate must not hide a callable tool): {names:?}"
+        );
+    }
+}
+
+#[test]
 fn stored_query_shadowing_a_builtin_is_a_load_error() {
     // A stored query whose tool name collides with a built-in must fail loudly
     // at registry load, never be silently un-served.

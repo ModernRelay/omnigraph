@@ -227,6 +227,27 @@ async fn unsupported_protocol_version_header_is_400_except_on_initialize() {
     assert_eq!(resp.status(), StatusCode::BAD_REQUEST, "non-init bogus version must be 400");
 }
 
+#[test]
+fn loopback_host_set_covers_rmcp_default() {
+    // Construction guard for the `::1` regression: our loopback Host allow-list
+    // must stay a SUPERSET of rmcp's own default loopback set. We keep an
+    // explicit list (rather than deriving) for clarity, but pin it against the
+    // substrate default here — so an rmcp bump that adds a loopback form turns
+    // this red instead of silently 403'ing that client.
+    use rmcp::transport::streamable_http_server::StreamableHttpServerConfig;
+    let rmcp_default = StreamableHttpServerConfig::default().allowed_hosts;
+    assert!(!rmcp_default.is_empty(), "rmcp default should list loopback hosts");
+    let ours = McpHostPolicy::from_bind(&"127.0.0.1:0".parse().unwrap(), &[], &[])
+        .allowed_hosts
+        .expect("a loopback bind sets a Host allow-list");
+    for host in &rmcp_default {
+        assert!(
+            ours.contains(host),
+            "loopback allow-list {ours:?} must cover rmcp default host {host:?}"
+        );
+    }
+}
+
 /// rmcp surface guard — pins the API shapes the transport relies on. Turns red
 /// (compile error) on an rmcp bump that renames/moves any of these. Compile-only.
 #[allow(dead_code)]

@@ -457,6 +457,21 @@ pub(crate) fn authorize_any_branch(
         .map_err(|err| ApiError::internal(format!("policy: {err}")))
 }
 
+/// The single Cedar request that gates the **stored-query surface** — catalog
+/// discovery *and* invocation, on REST *and* MCP. `invoke_query` is graph-scoped
+/// (no branch dimension): the per-branch/snapshot access is enforced by the inner
+/// `read`/`change` gate in the runner. Every gate site (`GET /queries`,
+/// `POST /queries/{name}`, the MCP `tools/list` stored projection, and MCP
+/// `tools/call` stored dispatch) calls this one function, so the REST and MCP
+/// surfaces cannot drift on which action governs the catalog.
+pub(crate) fn invoke_query_request() -> PolicyRequest {
+    PolicyRequest {
+        action: PolicyAction::InvokeQuery,
+        branch: None,
+        target_branch: None,
+    }
+}
+
 #[utoipa::path(
     get,
     path = "/snapshot",
@@ -961,19 +976,7 @@ pub(crate) async fn server_invoke_query(
     // probed without the grant), but operational failures (401 missing bearer,
     // 500 policy-evaluation error) propagate with their true status via `?`
     // rather than being masked as a missing query.
-    match authorize(
-        actor_ref,
-        handle.policy.as_deref(),
-        PolicyRequest {
-            action: PolicyAction::InvokeQuery,
-            // Graph-scoped: no branch dimension. The per-branch/snapshot
-            // access is enforced by the inner read/change gate in the
-            // runner, so the outer gate must not resolve a branch (doing so
-            // was wrong for snapshot reads).
-            branch: None,
-            target_branch: None,
-        },
-    )? {
+    match authorize(actor_ref, handle.policy.as_deref(), invoke_query_request())? {
         Authz::Allowed => {}
         Authz::Denied(_) => return Err(ApiError::not_found(NOT_FOUND)),
     }
@@ -1080,11 +1083,7 @@ pub(crate) async fn server_list_queries(
     authorize_request(
         actor.as_ref().map(|Extension(actor)| actor),
         handle.policy.as_deref(),
-        PolicyRequest {
-            action: PolicyAction::InvokeQuery,
-            branch: None,
-            target_branch: None,
-        },
+        invoke_query_request(),
     )?;
     let queries = match handle.queries.as_ref() {
         Some(registry) => registry

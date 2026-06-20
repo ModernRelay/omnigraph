@@ -21,7 +21,8 @@ use omnigraph_mcp::{
 };
 
 use crate::handlers::{
-    Authz, authorize, authorize_any_branch, authorize_request, run_ingest, run_mutate, run_query,
+    Authz, authorize, authorize_any_branch, authorize_request, invoke_query_request, run_ingest,
+    run_mutate, run_query,
 };
 use crate::queries::{QueryRegistry, StoredQuery};
 use crate::{
@@ -421,11 +422,6 @@ fn allowed(
 
 fn read_request(branch: Option<String>) -> PolicyRequest {
     PolicyRequest { action: PolicyAction::Read, branch, target_branch: None }
-}
-
-fn invoke_query_request() -> PolicyRequest {
-    // Graph-scoped: no branch dimension.
-    PolicyRequest { action: PolicyAction::InvokeQuery, branch: None, target_branch: None }
 }
 
 fn actor_id<'a>(actor: Option<&'a ResolvedActor>) -> Option<&'a str> {
