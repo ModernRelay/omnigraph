@@ -279,7 +279,27 @@ pub async fn optimize_all_tables(db: &Omnigraph) -> Result<Vec<TableOptimizeStat
         }
     }
 
-    stats.into_iter().collect()
+    // Compact the internal system tables too (RFC-013 step 2). They are not
+    // catalog-tracked, so they take a separate, simpler path (`compact_internal_table`):
+    // compact in place, no manifest publish, no sidecar. Appended after the
+    // data-table stats so the data-table cache invalidation above is computed from
+    // data-table stats only; each internal compaction does its own coordinator
+    // refresh for cache coherence.
+    let mut all = stats;
+    all.push(
+        compact_internal_table(db, "__manifest", crate::db::manifest::manifest_uri(db.root_uri()))
+            .await,
+    );
+    all.push(
+        compact_internal_table(
+            db,
+            "_graph_commits",
+            crate::db::commit_graph::graph_commits_uri(db.root_uri()),
+        )
+        .await,
+    );
+
+    all.into_iter().collect()
 }
 
 /// Compact one table and publish the compacted version to the `__manifest`.
@@ -512,6 +532,63 @@ async fn optimize_one_table(
     let mut stat = TableOptimizeStats::compacted(table_key, &metrics, committed);
     stat.pending_indexes = pending_indexes;
     Ok(stat)
+}
+
+/// Compact one INTERNAL system table (`__manifest` / `_graph_commits`) in place.
+///
+/// Unlike catalog data tables, the internal tables are not tracked in the
+/// `__manifest` (they ARE the manifest / the lineage DAG): readers open them at
+/// their latest Lance HEAD, so compaction just advances that HEAD and the next
+/// reader transparently observes the compacted version. That makes this path much
+/// simpler than [`optimize_one_table`] — no manifest publish (nothing to publish
+/// to), and no recovery sidecar (a single atomic Lance `compact_files` commit, with
+/// no HEAD-before-publish gap to recover). Internal tables carry no Lance index
+/// (only `object_id`'s unenforced-PK schema metadata), so no `optimize_indices`.
+///
+/// Concurrency: no application lock. Lance's `compact_files` auto-retries its
+/// `Operation::Rewrite` against any concurrent writer's commit (the canonical
+/// LanceDB pattern; `Rewrite` vs `Append` is compatible, vs `Update`/merge-insert it
+/// is a retryable same-fragment conflict Lance rebases). A follow-up coordinator
+/// `refresh` makes the warm `__manifest`/`_graph_commits` handle observe the
+/// compacted HEAD deterministically (the version probe would also self-heal on the
+/// next read).
+async fn compact_internal_table(
+    db: &Omnigraph,
+    table_key: &str,
+    uri: String,
+) -> Result<TableOptimizeStats> {
+    let handle = db
+        .storage()
+        .open_dataset_head_for_write(table_key, &uri, None)
+        .await?;
+    let mut ds = handle.into_dataset();
+
+    let options = CompactionOptions::default();
+    let plan = plan_compaction(&ds, &options)
+        .await
+        .map_err(|e| OmniError::Lance(e.to_string()))?;
+    if plan.num_tasks() == 0 {
+        return Ok(TableOptimizeStats::compacted(
+            table_key.to_string(),
+            &CompactionMetrics::default(),
+            false,
+        ));
+    }
+
+    let metrics = compact_files(&mut ds, options, None)
+        .await
+        .map_err(|e| OmniError::Lance(e.to_string()))?;
+
+    // Cache coherence: re-open the warm coordinator's `__manifest`/`_graph_commits`
+    // handle at the compacted HEAD (they live in `db.coordinator`, not the
+    // data-table `runtime_cache`).
+    db.coordinator.write().await.refresh().await?;
+
+    Ok(TableOptimizeStats::compacted(
+        table_key.to_string(),
+        &metrics,
+        true,
+    ))
 }
 
 /// Run Lance `cleanup_old_versions` on every node + edge table on `main`,

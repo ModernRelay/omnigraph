@@ -94,12 +94,21 @@ async fn optimize_on_empty_graph_returns_stats_per_table_with_no_changes() {
 
     let stats = db.optimize().await.unwrap();
 
-    // Schema declares 2 nodes + 2 edges = 4 tables. Compaction should run on
-    // each but find nothing to merge.
-    assert_eq!(stats.len(), 4);
+    // Schema declares 2 nodes + 2 edges = 4 data tables, plus the 2 internal
+    // system tables (`__manifest`, `_graph_commits`) optimize also compacts
+    // (RFC-013 step 2) = 6. Compaction should run on each but find nothing to merge.
+    assert_eq!(stats.len(), 6);
     for s in &stats {
         assert_eq!(s.fragments_removed, 0, "{} should not remove", s.table_key);
         assert_eq!(s.fragments_added, 0, "{} should not add", s.table_key);
+    }
+    // The internal tables are present and reported as no-ops on an empty graph.
+    for key in ["__manifest", "_graph_commits"] {
+        let s = stats
+            .iter()
+            .find(|s| s.table_key == key)
+            .unwrap_or_else(|| panic!("optimize stats missing internal table {key}"));
+        assert!(!s.committed, "{key} should be a no-op on an empty graph");
     }
 }
 
@@ -131,6 +140,69 @@ async fn optimize_after_load_then_again_is_idempotent() {
             s.table_key
         );
     }
+}
+
+/// RFC-013 step 2: `optimize` compacts the internal system tables
+/// (`__manifest`, `_graph_commits`), which accumulate one fragment per commit.
+/// After compaction they shed fragments, write no recovery sidecar (a single
+/// atomic Lance commit — no HEAD-before-publish gap), and the graph stays
+/// coherent for subsequent reads + strict writes.
+#[tokio::test]
+async fn optimize_compacts_internal_tables() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut db = init_and_load(&dir).await;
+
+    // Build version-history depth so the internal tables accumulate fragments.
+    for i in 0..20 {
+        mutate_main(
+            &mut db,
+            MUTATION_QUERIES,
+            "insert_person",
+            &mixed_params(&[("$name", &format!("p{i}"))], &[("$age", 30)]),
+        )
+        .await
+        .unwrap();
+    }
+
+    let stats = db.optimize().await.unwrap();
+
+    for key in ["__manifest", "_graph_commits"] {
+        let s = stats
+            .iter()
+            .find(|s| s.table_key == key)
+            .unwrap_or_else(|| panic!("optimize stats missing internal table {key}"));
+        assert!(s.committed, "{key} should compact after 20 commits");
+        assert!(
+            s.fragments_removed > 0,
+            "{key} should shed fragments, removed {}",
+            s.fragments_removed
+        );
+    }
+
+    // Internal compaction leaks no recovery sidecar.
+    let recovery_dir = dir.path().join("__recovery");
+    if recovery_dir.exists() {
+        let leftover: Vec<_> = std::fs::read_dir(&recovery_dir)
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .map(|e| e.file_name())
+            .collect();
+        assert!(
+            leftover.is_empty(),
+            "optimize leaked recovery sidecars: {leftover:?}"
+        );
+    }
+
+    // Coherent after internal compaction: reads + a strict write still work.
+    assert!(count_rows(&db, "node:Person").await > 0);
+    mutate_main(
+        &mut db,
+        MUTATION_QUERIES,
+        "insert_person",
+        &mixed_params(&[("$name", "after_compact")], &[("$age", 40)]),
+    )
+    .await
+    .unwrap();
 }
 
 // PR3 (Workstream B): an existing scalar index does not cover fragments
