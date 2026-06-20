@@ -248,10 +248,8 @@ pub async fn optimize_all_tables(db: &Omnigraph) -> Result<Vec<TableOptimizeStat
         tasks
     };
 
-    if table_tasks.is_empty() {
-        return Ok(Vec::new());
-    }
-
+    // NB: do NOT early-return when `table_tasks` is empty (a schema with no
+    // node/edge types) — the internal system tables below must still be compacted.
     let concurrency = maint_concurrency().min(table_tasks.len()).max(1);
 
     let stats: Vec<Result<TableOptimizeStats>> = futures::stream::iter(table_tasks.into_iter())
@@ -286,18 +284,18 @@ pub async fn optimize_all_tables(db: &Omnigraph) -> Result<Vec<TableOptimizeStat
     // data-table stats only; each internal compaction does its own coordinator
     // refresh for cache coherence.
     let mut all = stats;
+    // `__manifest` always exists (created at init). `_graph_commits` may be absent
+    // (the coordinator opens it as `Option`, gated on existence — graphs predating
+    // the commit graph have none), so guard it with the same existence check rather
+    // than letting `Dataset::open` error and fail the whole optimize.
     all.push(
         compact_internal_table(db, "__manifest", crate::db::manifest::manifest_uri(db.root_uri()))
             .await,
     );
-    all.push(
-        compact_internal_table(
-            db,
-            "_graph_commits",
-            crate::db::commit_graph::graph_commits_uri(db.root_uri()),
-        )
-        .await,
-    );
+    let graph_commits_uri = crate::db::commit_graph::graph_commits_uri(db.root_uri());
+    if db.storage_adapter().exists(&graph_commits_uri).await? {
+        all.push(compact_internal_table(db, "_graph_commits", graph_commits_uri).await);
+    }
 
     all.into_iter().collect()
 }
@@ -575,6 +573,17 @@ async fn compact_internal_table(
         ));
     }
 
+    // `compact_files` commits with a default `CommitConfig` (skip_auto_cleanup =
+    // false) and `CompactionOptions` exposes no override, so on a graph whose
+    // dataset stores an *on* auto_cleanup config the commit would fire Lance's
+    // auto-cleanup (version GC). For the internal tables that GC would be version
+    // deletion on `__manifest`/`_graph_commits` — the cleanup-resurrection surface
+    // this compaction-only step deliberately avoids (RFC-013 step 2b / Q8). Both
+    // internal tables are created with `auto_cleanup: None` (see
+    // `manifest/graph.rs`, `commit_graph.rs`), so a NEW graph stores no config and
+    // nothing fires here. Pre-auto_cleanup-fix upgraded graphs are the only
+    // exposure — identical to the existing data-table `optimize_one_table` path —
+    // and the comprehensive guard is step 2b's watermark.
     let metrics = compact_files(&mut ds, options, None)
         .await
         .map_err(|e| OmniError::Lance(e.to_string()))?;

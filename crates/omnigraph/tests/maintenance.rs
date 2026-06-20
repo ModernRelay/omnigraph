@@ -205,6 +205,38 @@ async fn optimize_compacts_internal_tables() {
     .unwrap();
 }
 
+/// `optimize` must not fail on a graph that has no `_graph_commits.lance` — a valid
+/// state the coordinator opens as `commit_graph = None` (graphs predating the commit
+/// graph). Without the existence guard, `Dataset::open` on the absent table errors
+/// and fails the whole optimize. Regression for the missing-existence-guard.
+///
+/// Uses an EMPTY graph deliberately: a graph with data would publish during
+/// optimize, and a publish records a graph commit that recreates `_graph_commits`
+/// before the guard runs — masking the bug. With no data, nothing recreates it, so
+/// the table stays absent through the guard.
+#[tokio::test]
+async fn optimize_tolerates_absent_graph_commits_table() {
+    let dir = tempfile::tempdir().unwrap();
+    let uri = dir.path().to_str().unwrap();
+    Omnigraph::init(uri, TEST_SCHEMA).await.unwrap();
+
+    // Simulate a graph with no commit-graph dataset.
+    std::fs::remove_dir_all(dir.path().join("_graph_commits.lance")).unwrap();
+
+    // Coordinator tolerates the absence; optimize must succeed (the guard skips the
+    // absent table rather than letting `Dataset::open` error) and omit its stat.
+    let db = Omnigraph::open(uri).await.unwrap();
+    let stats = db.optimize().await.unwrap();
+    assert!(
+        stats.iter().any(|s| s.table_key == "__manifest"),
+        "__manifest must still be compacted"
+    );
+    assert!(
+        !stats.iter().any(|s| s.table_key == "_graph_commits"),
+        "absent _graph_commits must be skipped, not opened (would error)"
+    );
+}
+
 // PR3 (Workstream B): an existing scalar index does not cover fragments
 // appended after it was built (build_indices is existence-gated), so those
 // rows are scanned unindexed. `optimize` must fold them back in via Lance's
