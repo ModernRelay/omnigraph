@@ -28,7 +28,7 @@ Top-level command families and subcommands. Graph-targeting commands accept a po
 | `policy validate \| test \| explain` | Cedar tooling against a cluster's applied policies (`--cluster <dir>`; `--graph <id>` picks a graph's bundle when several apply). `test` takes `--tests <file>`; `explain` takes `--actor`/`--action`/`--branch`/`--target-branch` |
 | `queries list \| validate` | inspect a cluster's applied stored-query registry (`--cluster <dir\|uri>`; `--graph <id>` to scope one graph). `list` prints each query's kind (read/mutation), name, typed params, and `[mcp: …]` exposure; a query's `@description`/`@instruction` are shown as indented `description:` / `instruction:` lines when declared (omitted otherwise). `--json` emits `{name, mcp_expose, tool_name, mutation, params}` plus `description`/`instruction` **only when present** — matching the HTTP `GET /queries` catalog ([server.md](../operations/server.md)). `validate` type-checks the registry and exits non-zero on a broken query |
 | `profile list \| show [<name>]` | read-only inspection of `~/.omnigraph/config.yaml` profiles. `list` shows each profile's binding (server/cluster/store) + default graph and marks the `$OMNIGRAPH_PROFILE`-active one; JSON keeps `binding` and adds `scope_kind`, `target`, `valid`, and `error`; `show` resolves one profile's scope (endpoint + default graph), defaulting to the active profile, else the flat operator defaults |
-| `version` / `-v` | print `omnigraph 0.3.x` |
+| `version` / `-v` | print `omnigraph 0.7.x` |
 
 ## Command capabilities
 
@@ -225,9 +225,12 @@ Precedence (high to low): explicit `--params` / `--params-file`, alias positiona
 
 ## Bearer token resolution (CLI)
 
-1. `graphs.<name>.bearer_token_env`
-2. `OMNIGRAPH_BEARER_TOKEN` global env
-3. `auth.env_file` referenced `.env`
+See **Credentials keyed by server name** above: a remote command resolves its
+token via `OMNIGRAPH_TOKEN_<NAME>` env → the `[<name>]` section in
+`~/.omnigraph/credentials` → the default `OMNIGRAPH_BEARER_TOKEN` env, and a
+keyed token is only ever sent to the server it is keyed to. Plaintext tokens are
+never stored in operator config; the removed `omnigraph.yaml` keys
+(`graphs.<name>.bearer_token_env`, `auth.env_file`) no longer exist.
 
 ## Duration parsing (cleanup)
 
