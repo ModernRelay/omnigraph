@@ -136,13 +136,20 @@ pub async fn local_graph(dir: &tempfile::TempDir) -> Omnigraph {
     init_and_load(dir).await
 }
 
-/// Emulated-S3 graph, bucket-gated. Returns `None` when `OMNIGRAPH_S3_TEST_BUCKET`
-/// is unset (or the store is unreachable) so the caller logs + skips — the
-/// `tests/s3_storage.rs` graceful-skip pattern. `name` disambiguates the prefix.
+/// Emulated-S3 graph, bucket-gated. Returns `None` **only** when
+/// `OMNIGRAPH_S3_TEST_BUCKET` is unset, so the caller logs + skips — the
+/// `tests/s3_storage.rs` graceful-skip pattern. Once the bucket *is* configured
+/// (the rustfs CI job), any `init`/seed failure is a real failure and panics
+/// rather than silently skipping — otherwise a down/misconfigured store would let
+/// a bucket-gated gate pass vacuously. `name` disambiguates the prefix.
 pub async fn s3_graph(name: &str) -> Option<Omnigraph> {
     let bucket = std::env::var("OMNIGRAPH_S3_TEST_BUCKET").ok()?;
     let uri = format!("s3://{bucket}/cost-tests/{name}-{}", std::process::id());
-    let mut db = Omnigraph::init(&uri, TEST_SCHEMA).await.ok()?;
-    load_jsonl(&mut db, TEST_DATA, LoadMode::Overwrite).await.ok()?;
+    let mut db = Omnigraph::init(&uri, TEST_SCHEMA)
+        .await
+        .expect("OMNIGRAPH_S3_TEST_BUCKET is set but S3 graph init failed");
+    load_jsonl(&mut db, TEST_DATA, LoadMode::Overwrite)
+        .await
+        .expect("OMNIGRAPH_S3_TEST_BUCKET is set but S3 seed load failed");
     Some(db)
 }

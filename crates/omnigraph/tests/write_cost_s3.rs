@@ -11,6 +11,17 @@
 //! pre-3a `from_namespace` opener); `write_cost.rs` gates the internal-table term on
 //! local every-PR.
 //!
+//! **Isolating the opener (important):** `data_reads` on the data table is not
+//! opener-only — the same wrapped `Dataset` backs the merge-insert/RI **scan**, which
+//! reads O(fragment-count) and so grows with history for a *different* reason
+//! (compaction's domain, not the opener; this is the term that made the *local*
+//! data-table count grow). To gate the opener cleanly we **compact before each
+//! measurement** so the data table holds ~1 fragment: the scan term is then bounded
+//! and the only remaining history-varying term in `data_reads` is the opener's
+//! latest-version resolution — exactly what step 3a flattened. (Compaction bounds
+//! fragments but preserves version history, so the opener still faces a deep
+//! `_versions/` chain — the thing under test.)
+//!
 //! Skips gracefully without `OMNIGRAPH_S3_TEST_BUCKET` (the `tests/s3_storage.rs`
 //! pattern); runs for real in the rustfs CI job (`.github/workflows/ci.yml`).
 #![recursion_limit = "512"]
@@ -55,6 +66,13 @@ async fn data_table_opener_is_flat_in_history_on_s3() {
             commit_many(&mut db, (d - current) as usize).await;
             current = d;
         }
+        // Compact to ~1 fragment so the merge-insert/RI scan term is bounded and the
+        // only history-varying term left in `data_reads` is the opener (see module
+        // doc). Compaction keeps version history, so the opener still resolves latest
+        // over a deep `_versions/` chain — the thing this gate measures.
+        db.optimize()
+            .await
+            .expect("optimize (fragment compaction) failed");
         let io = insert_cost(&mut db, &format!("s3_{d}")).await;
         current += 1;
         eprintln!(
@@ -64,7 +82,8 @@ async fn data_table_opener_is_flat_in_history_on_s3() {
         curve.push((d, io));
     }
 
-    // The data-table opener is O(1) after step 3a (direct-by-URI). Slack absorbs
-    // object-store variance; the pre-3a builder grew this ~+12/depth (RFC §2.4 [M]).
-    assert_flat(&curve, |c| c.data_reads, 8, "S3 data-table opener");
+    // With the scan bounded by compaction, the data-table opener is O(1) after step
+    // 3a (direct-by-URI). Slack absorbs object-store variance; the pre-3a builder grew
+    // this ~+12/depth (RFC §2.4 [M]).
+    assert_flat(&curve, |c| c.data_reads, 8, "S3 data-table opener (scan bounded by compaction)");
 }
