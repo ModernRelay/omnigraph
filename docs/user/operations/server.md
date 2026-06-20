@@ -163,8 +163,8 @@ Uniform `ErrorOutput { error, code?, merge_conflicts[], manifest_conflict? }` wi
 caller's pre-write view of one table's manifest version was stale.
 `ManifestConflictOutput { table_key, expected, actual }` tells the client
 which table to refresh and retry. This is the conflict shape produced by
-concurrent `/mutate` (or its `/change` alias) or `/ingest` calls landing
-the same `(table, branch)` race.
+concurrent `/mutate` (or its `/change` alias), `/load` (or its deprecated
+`/ingest` alias) calls landing the same `(table, branch)` race.
 
 HTTP status codes used: 200, 400, 401, 403, 404, 409, 429, 500.
 
@@ -191,7 +191,8 @@ Cedar policy authorization runs **before** admission accounting so
 denied requests don't consume admission slots.
 
 Today admission gates every mutating handler: `/mutate` (and its
-deprecated alias `/change`), `/ingest`, `/branches/{create,delete,merge}`,
+deprecated alias `/change`), `/load` (and its deprecated alias `/ingest`),
+`/branches/{create,delete,merge}`,
 and `/schema/apply`. Read-only endpoints (`/snapshot`, `/query`, `/read`,
 `/export`, `/branches` GET, `/commits`, `/schema` GET) are not
 admission-gated.
@@ -199,7 +200,7 @@ admission-gated.
 ## Body limits
 
 - Default: 1 MB
-- `/ingest`: 32 MB
+- `/load` (and its deprecated `/ingest` alias): 32 MB
 
 ## Auth model (`bearer + SHA-256`)
 
@@ -227,7 +228,7 @@ See [deployment.md](../deployment.md) for token-source operational details.
 
 - CORS — not configured; add `tower_http::cors` if needed.
 - Rate limiting — per-actor admission control gates `/mutate` (alias
-  `/change`), `/ingest`, `/branches/{create,delete,merge}`,
+  `/change`), `/load` (alias `/ingest`), `/branches/{create,delete,merge}`,
   `/schema/apply` (see "Per-actor
   admission control" above). No global rate limiter is configured;
   add `tower_http::limit` if a graph-wide cap is needed.
