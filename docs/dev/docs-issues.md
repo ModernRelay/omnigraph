@@ -40,17 +40,19 @@ fixed. Branch `docs/user-coherence-0-7-1`.
   `apply_schema_update_and_dependent_query_in_one_run`,
   `apply_blocks_graph_delete_without_approval`). Update these comments in a
   cluster-crate change.
-- **Cross-repo drift from this sweep** (separate repos — track here, fix in a
-  follow-up in each repo):
-  - `omnigraph-ts` SDK ships a stale generated `spec/openapi.json` +
-    `packages/sdk/src/generated/types.gen.ts` still describing the `GET /queries`
-    catalog as the `mcp.expose` subset. Regenerate from this repo's
-    `openapi.json` once the SDK's deferred refresh happens (the SDK is known to
-    lag the API by design).
-  - `omnigraph-cookbooks/docs/best-practices.md` (~line 372) still describes
-    client-side auth as resolving through the removed `bearer_token_env` chain.
-    Update to the keyed-credential model (`OMNIGRAPH_TOKEN_<NAME>` →
-    credentials file → `OMNIGRAPH_BEARER_TOKEN`).
+- **Cross-repo drift from this sweep** (separate repos):
+  - `omnigraph-ts` SDK — its generated `spec/openapi.json` +
+    `packages/sdk/src/generated/types.gen.ts` still describe the `GET /queries`
+    catalog as the `mcp.expose` subset. **No hand-fix:** the SDK's
+    `scripts/sync-spec.ts` pulls openapi.json from a *tagged* omnigraph release
+    (`/omnigraph/v{version}/openapi.json`), and the catalog fix landed on main
+    *after* the v0.7.1 tag — so it is in no tag yet and a hand-edit would be
+    overwritten on the next sync. It flows in automatically when the SDK bumps
+    to a tag containing the fix (v0.7.2+). Tracked, not actioned.
+  - `omnigraph-cookbooks/docs/best-practices.md` `bearer_token_env` chain —
+    **RESOLVED** by omnigraph-cookbooks PR #26 (2026-06-21), which deleted
+    `docs/best-practices.md` as part of the 0.7 restructure; the stale chain
+    survives nowhere on `main`.
 
 ## Verification checklist (re-run on the next docs audit)
 
