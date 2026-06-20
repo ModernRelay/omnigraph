@@ -4851,7 +4851,7 @@ dependencies = [
 
 [[package]]
 name = "omnigraph-api-types"
-version = "0.7.0"
+version = "0.7.1"
 dependencies = [
  "omnigraph-compiler",
  "omnigraph-engine",
@@ -4862,7 +4862,7 @@ dependencies = [
 
 [[package]]
 name = "omnigraph-cli"
-version = "0.7.0"
+version = "0.7.1"
 dependencies = [
  "assert_cmd",
  "clap",
@@ -4886,7 +4886,7 @@ dependencies = [
 
 [[package]]
 name = "omnigraph-cluster"
-version = "0.7.0"
+version = "0.7.1"
 dependencies = [
  "fail",
  "omnigraph-compiler",
@@ -4904,7 +4904,7 @@ dependencies = [
 
 [[package]]
 name = "omnigraph-compiler"
-version = "0.7.0"
+version = "0.7.1"
 dependencies = [
  "ahash",
  "arrow-array",
@@ -4923,7 +4923,7 @@ dependencies = [
 
 [[package]]
 name = "omnigraph-engine"
-version = "0.7.0"
+version = "0.7.1"
 dependencies = [
  "arc-swap",
  "arrow-array",
@@ -4967,7 +4967,7 @@ dependencies = [
 
 [[package]]
 name = "omnigraph-policy"
-version = "0.7.0"
+version = "0.7.1"
 dependencies = [
  "cedar-policy",
  "clap",
@@ -4980,7 +4980,7 @@ dependencies = [
 
 [[package]]
 name = "omnigraph-server"
-version = "0.7.0"
+version = "0.7.1"
 dependencies = [
  "arc-swap",
  "async-trait",
