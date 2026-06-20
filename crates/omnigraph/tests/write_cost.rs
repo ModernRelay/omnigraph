@@ -25,7 +25,7 @@ mod helpers;
 
 use omnigraph::db::Omnigraph;
 
-use helpers::cost::{IoCounts, assert_flat, local_graph, measure, measure_with_staged};
+use helpers::cost::{IoCounts, assert_flat, assert_grows, local_graph, measure, measure_with_staged};
 use helpers::{MUTATION_QUERIES, commit_many, mixed_params};
 
 /// One committing `insert_person` to `main`, measured. `node:Person` is the deep
@@ -74,8 +74,47 @@ async fn internal_table_scans_are_flat_in_history() {
     assert_flat(&curve, |c| c.commit_graph_reads, 4, "_graph_commits scan");
 }
 
-// (The data-table OPENER LOCK lives in `write_cost_s3.rs` — it is an S3-only
-// phenomenon; see the module doc above for why local FS cannot observe it.)
+// The data-table OPENER history-gate (opener flat across depth) lives in
+// `write_cost_s3.rs` — its history-dependence is an S3-only phenomenon. But the
+// *probe that isolates* the opener (the `PrefixCounter` split) is validated here,
+// every-PR, on local FS:
+
+/// Proves the `PrefixCounter` opener/scan split: a committing write's data-table
+/// reads divide into a **flat opener** term and a **growing scan** term. This pins
+/// (a) the classifier actually attributes reads to the opener bucket (non-zero, so a
+/// flat assertion isn't vacuously flat-at-zero), and (b) the local data-table growth
+/// is the merge-insert/RI fragment scan, not the opener — which is *why* the S3
+/// gate asserts `data_opener_reads`, not total `data_reads`. (On local FS the opener
+/// is O(1) regardless of step 3a; the opener's history-dependence is gated on S3.)
+#[tokio::test]
+async fn data_table_reads_split_into_flat_opener_and_growing_scan() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut db = local_graph(&dir).await;
+
+    let mut curve: Vec<(u64, IoCounts)> = Vec::new();
+    let mut current = 0u64;
+    for d in [10u64, 100] {
+        if d > current {
+            commit_many(&mut db, (d - current) as usize).await;
+            current = d;
+        }
+        let io = insert_cost(&mut db, &format!("split_{d}")).await;
+        current += 1;
+        eprintln!(
+            "depth~{d}: opener={} scan={} data_total={}",
+            io.data_opener_reads, io.data_scan_reads, io.data_reads
+        );
+        curve.push((d, io));
+    }
+
+    assert!(
+        curve[0].1.data_opener_reads > 0,
+        "opener reads must be > 0 — the classifier missed version-resolution reads, \
+         so a flat opener assertion would be vacuous"
+    );
+    assert_flat(&curve, |c| c.data_opener_reads, 4, "local data-table opener");
+    assert_grows(&curve, |c| c.data_scan_reads, 20, "local data-table scan");
+}
 
 // ── (B) Green-today regression guards — run on every PR ──
 

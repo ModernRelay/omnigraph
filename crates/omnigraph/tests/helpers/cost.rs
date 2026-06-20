@@ -3,14 +3,31 @@
 //! assert in one vocabulary instead of duplicating `probes()` + raw `IOTracker`
 //! reads. Three clean abstractions: structured counts, a `measure` primitive, a
 //! named flat-assertion, plus store-agnostic backend fixtures.
+//!
+//! The data-table wrapper is a **path-classifying** counter (`PrefixCounter`), not a
+//! plain `IOTracker`: it splits each read into the **opener** term (latest-version
+//! resolution — reads of `_versions/`/`.manifest` objects) vs the **scan** term
+//! (data-fragment reads, `data/`/`*.lance`). That lets a cost test isolate the
+//! opener (RFC-013 step 3a's target, O(1) after the bypass) from the merge-insert/RI
+//! scan (O(fragment-count), compaction's domain) even though both ride the same
+//! `Dataset` — without controlling the fixture (no compaction needed). `__manifest`
+//! and `_graph_commits` keep the plain `IOTracker` (no sub-prefixes worth splitting).
 #![allow(dead_code)]
 
+use std::fmt;
 use std::future::Future;
-use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Mutex};
 
+use async_trait::async_trait;
+use futures::stream::BoxStream;
 use lance::io::WrappingObjectStore;
 use lance_io::utils::tracking_store::IOTracker;
+use object_store::path::Path;
+use object_store::{
+    CopyOptions, GetOptions, GetResult, ListResult, MultipartUpload, ObjectMeta, ObjectStore,
+    PutMultipartOptions, PutOptions, PutPayload, PutResult, Result as OSResult,
+};
 
 use omnigraph::db::Omnigraph;
 use omnigraph::instrumentation::{
@@ -27,6 +44,14 @@ pub struct IoCounts {
     /// Per-table DATA opens (node/edge tables). The dominant write-path term.
     pub data_reads: u64,
     pub data_writes: u64,
+    /// DATA-table reads attributed to latest-version resolution (`_versions/`,
+    /// `.manifest`). This is the **opener** term step 3a flattened — isolated from
+    /// the scan, so it can be gated directly without compacting the fixture.
+    pub data_opener_reads: u64,
+    /// DATA-table reads attributed to data fragments (`data/`, `*.lance`) — the
+    /// merge-insert/RI **scan**, which grows with fragment count (compaction's
+    /// domain, not the opener).
+    pub data_scan_reads: u64,
     /// `__manifest` registry scans (publish state).
     pub manifest_reads: u64,
     /// `_graph_commits` lineage scans.
@@ -50,11 +75,155 @@ pub struct StagedCounts {
     pub scan_staged_combined: u64,
 }
 
+// ── Path-classifying data-table read counter ──
+
+/// How a data-table object read is attributed.
+enum ReadClass {
+    /// Latest-version resolution: `_versions/`, `.manifest`, `_latest`.
+    Opener,
+    /// Data fragments: `data/`, `*.lance`.
+    Scan,
+    /// Anything else (indices, deletion files, …) — counted in the total only.
+    Other,
+}
+
+/// Classify a Lance object path by its role in a write open. Lance's on-object
+/// layout is identical on local FS and S3, so this split is backend-independent.
+fn classify(path: &Path) -> ReadClass {
+    let p = path.as_ref();
+    if p.contains("_versions") || p.ends_with(".manifest") || p.contains("_latest") {
+        ReadClass::Opener
+    } else if p.contains("/data/") || p.starts_with("data/") || p.ends_with(".lance") {
+        ReadClass::Scan
+    } else {
+        ReadClass::Other
+    }
+}
+
+#[derive(Debug, Default, Clone, Copy)]
+struct PrefixCounts {
+    reads: u64,
+    writes: u64,
+    opener_reads: u64,
+    scan_reads: u64,
+}
+
+/// A `WrappingObjectStore` that counts reads/writes and attributes each read to the
+/// opener vs scan term by object-key prefix. Shares its tally via `Arc<Mutex<…>>` so
+/// the wrapped store (handed to Lance) and the test read the same counters.
+#[derive(Debug, Default, Clone)]
+struct PrefixCounter(Arc<Mutex<PrefixCounts>>);
+
+impl PrefixCounter {
+    fn record_read(&self, location: &Path) {
+        let mut c = self.0.lock().unwrap();
+        c.reads += 1;
+        match classify(location) {
+            ReadClass::Opener => c.opener_reads += 1,
+            ReadClass::Scan => c.scan_reads += 1,
+            ReadClass::Other => {}
+        }
+    }
+
+    fn record_write(&self) {
+        self.0.lock().unwrap().writes += 1;
+    }
+
+    fn snapshot(&self) -> PrefixCounts {
+        *self.0.lock().unwrap()
+    }
+}
+
+impl WrappingObjectStore for PrefixCounter {
+    fn wrap(&self, _store_prefix: &str, target: Arc<dyn ObjectStore>) -> Arc<dyn ObjectStore> {
+        Arc::new(PrefixCountingStore {
+            target,
+            counter: self.clone(),
+        })
+    }
+}
+
+/// The wrapped `ObjectStore` that records each call into a [`PrefixCounter`].
+/// Implements only the required core `ObjectStore` methods (object_store 0.13: the
+/// convenience surface — `get`/`put`/`head`/`get_range`/… — lives on
+/// `ObjectStoreExt` and is provided by a blanket impl that routes through `get_opts`
+/// / `put_opts`, so every read/write is still counted here). Per-read path
+/// classification is the only addition over a plain pass-through.
+#[derive(Debug)]
+struct PrefixCountingStore {
+    target: Arc<dyn ObjectStore>,
+    counter: PrefixCounter,
+}
+
+impl fmt::Display for PrefixCountingStore {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "PrefixCountingStore({})", self.target)
+    }
+}
+
+#[async_trait]
+impl ObjectStore for PrefixCountingStore {
+    async fn put_opts(
+        &self,
+        location: &Path,
+        payload: PutPayload,
+        opts: PutOptions,
+    ) -> OSResult<PutResult> {
+        self.counter.record_write();
+        self.target.put_opts(location, payload, opts).await
+    }
+
+    async fn put_multipart_opts(
+        &self,
+        location: &Path,
+        opts: PutMultipartOptions,
+    ) -> OSResult<Box<dyn MultipartUpload>> {
+        self.counter.record_write();
+        self.target.put_multipart_opts(location, opts).await
+    }
+
+    async fn get_opts(&self, location: &Path, options: GetOptions) -> OSResult<GetResult> {
+        self.counter.record_read(location);
+        self.target.get_opts(location, options).await
+    }
+
+    fn delete_stream(
+        &self,
+        locations: BoxStream<'static, OSResult<Path>>,
+    ) -> BoxStream<'static, OSResult<Path>> {
+        self.target.delete_stream(locations)
+    }
+
+    fn list(&self, prefix: Option<&Path>) -> BoxStream<'static, OSResult<ObjectMeta>> {
+        self.counter.record_read(&prefix.cloned().unwrap_or_default());
+        self.target.list(prefix)
+    }
+
+    fn list_with_offset(
+        &self,
+        prefix: Option<&Path>,
+        offset: &Path,
+    ) -> BoxStream<'static, OSResult<ObjectMeta>> {
+        self.counter.record_read(&prefix.cloned().unwrap_or_default());
+        self.target.list_with_offset(prefix, offset)
+    }
+
+    async fn list_with_delimiter(&self, prefix: Option<&Path>) -> OSResult<ListResult> {
+        self.counter.record_read(&prefix.cloned().unwrap_or_default());
+        self.target.list_with_delimiter(prefix).await
+    }
+
+    async fn copy_opts(&self, from: &Path, to: &Path, options: CopyOptions) -> OSResult<()> {
+        self.counter.record_write();
+        self.target.copy_opts(from, to, options).await
+    }
+}
+
 /// The tracker handles backing one measurement; read once into [`IoCounts`].
 struct ProbeHandles {
     manifest: IOTracker,
     commit_graph: IOTracker,
-    table: IOTracker,
+    table: PrefixCounter,
     probe_count: Arc<AtomicU64>,
 }
 
@@ -63,7 +232,7 @@ impl ProbeHandles {
         let h = ProbeHandles {
             manifest: IOTracker::default(),
             commit_graph: IOTracker::default(),
-            table: IOTracker::default(),
+            table: PrefixCounter::default(),
             probe_count: Arc::new(AtomicU64::new(0)),
         };
         let probes = QueryIoProbes {
@@ -78,9 +247,12 @@ impl ProbeHandles {
     }
 
     fn counts(&self) -> IoCounts {
+        let t = self.table.snapshot();
         IoCounts {
-            data_reads: self.table.stats().read_iops,
-            data_writes: self.table.stats().write_iops,
+            data_reads: t.reads,
+            data_writes: t.writes,
+            data_opener_reads: t.opener_reads,
+            data_scan_reads: t.scan_reads,
             manifest_reads: self.manifest.stats().read_iops,
             commit_graph_reads: self.commit_graph.stats().read_iops,
             version_probes: self.probe_count.load(Ordering::Relaxed),
@@ -89,7 +261,7 @@ impl ProbeHandles {
 }
 
 /// Run `op` under object-store IO counting; return its output + the counts.
-/// The only place the `QueryIoProbes` task-local + `IOTracker` wiring lives.
+/// The only place the `QueryIoProbes` task-local + tracker wiring lives.
 pub async fn measure<F: Future>(op: F) -> (F::Output, IoCounts) {
     let (probes, handles) = ProbeHandles::install();
     let out = with_query_io_probes(probes, op).await;
@@ -126,6 +298,24 @@ pub fn assert_flat(
     assert!(
         hi <= lo + slack,
         "{what} grew with history: depth {d_lo} = {lo} -> depth {d_hi} = {hi} (slack {slack})"
+    );
+}
+
+/// Assert a per-depth metric *does* grow with history by at least `min_delta` — the
+/// dual of [`assert_flat`], used to prove a term is genuinely history-dependent (so a
+/// flat sibling term isn't flat merely because nothing was measured).
+pub fn assert_grows(
+    curve: &[(u64, IoCounts)],
+    select: impl Fn(&IoCounts) -> u64,
+    min_delta: u64,
+    what: &str,
+) {
+    assert!(curve.len() >= 2, "assert_grows needs >= 2 depth points");
+    let (d_lo, lo) = (curve[0].0, select(&curve[0].1));
+    let (d_hi, hi) = (curve[curve.len() - 1].0, select(&curve[curve.len() - 1].1));
+    assert!(
+        hi >= lo + min_delta,
+        "{what} did not grow as expected: depth {d_lo} = {lo} -> depth {d_hi} = {hi} (min delta {min_delta})"
     );
 }
 

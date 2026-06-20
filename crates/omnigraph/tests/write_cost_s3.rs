@@ -11,16 +11,16 @@
 //! pre-3a `from_namespace` opener); `write_cost.rs` gates the internal-table term on
 //! local every-PR.
 //!
-//! **Isolating the opener (important):** `data_reads` on the data table is not
-//! opener-only — the same wrapped `Dataset` backs the merge-insert/RI **scan**, which
-//! reads O(fragment-count) and so grows with history for a *different* reason
-//! (compaction's domain, not the opener; this is the term that made the *local*
-//! data-table count grow). To gate the opener cleanly we **compact before each
-//! measurement** so the data table holds ~1 fragment: the scan term is then bounded
-//! and the only remaining history-varying term in `data_reads` is the opener's
-//! latest-version resolution — exactly what step 3a flattened. (Compaction bounds
-//! fragments but preserves version history, so the opener still faces a deep
-//! `_versions/` chain — the thing under test.)
+//! **Isolating the opener (important):** total `data_reads` is not opener-only — the
+//! same wrapped `Dataset` backs the merge-insert/RI **scan**, which reads
+//! O(fragment-count) and grows with history for a *different* reason (compaction's
+//! domain, not the opener; this is the term that made the *local* data-table count
+//! grow). The shared harness's `PrefixCounter` attributes each read by object-key
+//! prefix, so this gate asserts `data_opener_reads` (reads of `_versions/`/`.manifest`)
+//! **directly** — no compaction or fixture massaging needed. After step 3a the opener
+//! is O(1) regardless of version-history depth; before it grew ~+12/depth (RFC §2.4
+//! [M]). (See `write_cost.rs` for the local test that proves the split itself —
+//! opener flat, scan growing.)
 //!
 //! Skips gracefully without `OMNIGRAPH_S3_TEST_BUCKET` (the `tests/s3_storage.rs`
 //! pattern); runs for real in the rustfs CI job (`.github/workflows/ci.yml`).
@@ -66,24 +66,21 @@ async fn data_table_opener_is_flat_in_history_on_s3() {
             commit_many(&mut db, (d - current) as usize).await;
             current = d;
         }
-        // Compact to ~1 fragment so the merge-insert/RI scan term is bounded and the
-        // only history-varying term left in `data_reads` is the opener (see module
-        // doc). Compaction keeps version history, so the opener still resolves latest
-        // over a deep `_versions/` chain — the thing this gate measures.
-        db.optimize()
-            .await
-            .expect("optimize (fragment compaction) failed");
         let io = insert_cost(&mut db, &format!("s3_{d}")).await;
         current += 1;
         eprintln!(
-            "depth~{d}: data={} __manifest={} _graph_commits={}",
-            io.data_reads, io.manifest_reads, io.commit_graph_reads
+            "depth~{d}: opener={} scan={} data_total={} __manifest={} _graph_commits={}",
+            io.data_opener_reads,
+            io.data_scan_reads,
+            io.data_reads,
+            io.manifest_reads,
+            io.commit_graph_reads
         );
         curve.push((d, io));
     }
 
-    // With the scan bounded by compaction, the data-table opener is O(1) after step
-    // 3a (direct-by-URI). Slack absorbs object-store variance; the pre-3a builder grew
-    // this ~+12/depth (RFC §2.4 [M]).
-    assert_flat(&curve, |c| c.data_reads, 8, "S3 data-table opener (scan bounded by compaction)");
+    // The opener (latest-version resolution) is O(1) after step 3a (direct-by-URI),
+    // isolated from the scan by the PrefixCounter. Slack absorbs object-store variance;
+    // the pre-3a builder grew this ~+12/depth (RFC §2.4 [M]).
+    assert_flat(&curve, |c| c.data_opener_reads, 8, "S3 data-table opener");
 }
