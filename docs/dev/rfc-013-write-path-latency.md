@@ -46,6 +46,21 @@ main/branch/node paths (§2.4). It is shippable as a standalone PR first (§9 st
 3a); the rest of the RFC is the constant-factor + correctness + internal-residual
 work layered on the same seam.
 
+**Correction (2026-06-20) — the latency metric is *serial hops*, not op count
+[M].** A latency-slope measurement on the deployed edge binary (steps 1+3a landed;
+rustfs + per-op latency proxy, depth swept 1→85; §0(c)) shows wall-clock is set by a
+**~110-hop *serial* backbone that is depth-invariant**, not by total op count: the
+depth-driven ops (+~7/depth) *parallelize* (parallelism 1→6 with depth), so they add
+little wall-clock. `wall ≈ serial_hops · RTT + compute`; prod 35s direct-main ≈ 110
+hops × ~280ms RTT. This **vindicates the §3/§4.1 design** (collapse ~110 serial hops →
+"~2–3 hops" via capture-once `WriteTxn` + parallel stage fan-out — that is the
+headline wall-clock lever, **step 3b**) and **reprioritizes step 2**: compaction cuts
+the *already-parallel* internal-scan tail + the compute floor, so it is a
+Phase-7-prerequisite / compute-floor / space item, **not** the wall-clock fix the
+op-count framing (§2.4) implies. Op count is a cost metric; serial-hop count is the
+latency metric — the cost gate (§5.1) is corrected to make the serial-hop / `num_stages`
+assertion the load-bearing latency LOCK.
+
 ---
 
 ## 0. Validation ledger (read this first)
@@ -139,6 +154,44 @@ one unpinned item — see §12. Reads, by contrast, are flat in depth
 (`warm_read_cost.rs`, PR #268). This is the O(history)-per-write →
 O(N²)-cumulative behavior the production incident hit.
 
+**(c) Serial-hop measurement [M] — wall-clock is set by the serial backbone, not
+the op count.** §0(b) counts *total* object-store ops; wall-clock is set by the ops
+on the *critical path*. Measured on the **deployed edge binary `f6d2cc03`** (steps
+1+3a landed) via rustfs + a per-op latency proxy, sweeping injected per-op latency `L`
+and reading the slope of `wall = compute + serial_hops · L` (the slope **is** the
+critical-path hop count; the proxy also reports request overlap → parallelism):
+
+| depth | total ops | parallelism | **serial backbone (slope)** | `L=0` wall (compute floor) |
+|---:|---:|---:|---:|---:|
+| ~1  | 107 | 1.0–1.2 | **~109** | 2.15s |
+| ~33 | 338 | 3.4–4.0 | **~108** | 2.45s |
+| ~85 | 716 | 6.0–7.1 | **~113** | 4.27s |
+
+The serial backbone is **~110 hops and depth-INVARIANT**, while total ops grow
+`+~7/depth` (107→716, the §0(b) term) **and parallelize** (parallelism 1→6,
+`max_inflight` up to 65) — so the depth-driven ops add almost nothing to wall-clock.
+`wall ≈ 110·RTT + compute`; the prod 35s direct-main write ≈ 110 hops × ~280ms
+cross-region RTT. Branch ops measured the same way (4-table graph; prod = 217 tables,
+≈50× worse): **branch-create serial ~77, branch-delete ~87** (op counts scale with
+table count → §9 step 6), and **branch-WRITE is worst — 1777 ops, serial ~258, 21s
+compute floor even at `L=0`** = fork-on-first-write (the path 3a did *not* cover; §9
+step 3b + the fork seam), matching prod's 103–138s.
+
+**The methodological correction this forces.** *Op count is a cost/space/compute-floor
+metric; the serial-hop count (latency slope / `num_stages`) is the wall-clock metric.*
+3a's real 90s→35s win (≈2.6×, matching its measured 2.7× op cut) is genuine **because
+it removed *serial* hops** (the per-table data opens were on the critical path). Step
+2's internal-scan reduction is **mostly parallel**, so it will *not* convert to the
+wall-clock win the §2.4 op-count math (`1720→198 ops → ≈258s→≈30s`) projects — that
+math multiplies *total* ops by RTT as if serial, which §0(c) refutes. The residual 35s
+is the ~110-hop serial backbone; only **step 3b** (capture-once `WriteTxn` + parallel
+stage fan-out → "~2–3 hops", §3/§4.1) flattens it. **Caveats:** measured to depth 85
+on **rustfs**, where parallelism was still *rising* (not capped) — on **R2**,
+throttling / connection limits could push the parallel tail back onto the critical
+path, where step 2's count reduction would then help wall-clock (unmeasured on R2);
+and the compute floor grows with depth (step 2 / 3b reduce it). So step 2 is
+**reprioritized and re-justified, not dropped** (§9 step 2).
+
 ---
 
 ## 1. Problem & measurements
@@ -191,7 +244,11 @@ Branch ops compound it: `branch create` is a per-table sequential fork loop
 (`fork_branch_from_state`, `table_store.rs:282`); `branch delete` opens a
 snapshot per *other* branch (`ensure_branch_delete_safe`, `omnigraph.rs:1317`)
 and force-deletes per forked table sequentially (`cleanup_deleted_branch_tables`,
-`omnigraph.rs:1359`) **[S]**.
+`omnigraph.rs:1359`) **[S]**. Measured serial backbones (§0(c), edge binary): branch
+create **~77 hops**, delete **~87** (op counts scale with table count → §9 step 6);
+**branch *write* is the worst — 1777 ops, ~258-hop serial backbone, a 21s compute
+floor even at zero RTT** = fork-on-first-write (the path step 3a did not cover; §9 step
+3b + the fork seam), which is why prod branch-load (103–138s) ≫ direct-main (35s).
 
 ---
 
@@ -334,9 +391,16 @@ correctness, not drop-in completeness.
 **Step 2 also proven [M].** On the step-3-patched binary at depth ~87, compacting
 the internal tables to 1 fragment each (content-preserving) collapsed their scans:
 `__manifest` 285 → 32 (8.9×), `_graph_commits` 177 → 11 (16×); the step-3 data term
-stayed flat at 4. So **both depth terms are now empirically eliminated** — a depth-87
-single edge drops **~1720 → 198 ops (~8.7×; ≈258 s → ≈30 s at 150 ms/RTT)** with
-both fixes. The internal term is **fragment-scan growth** (`read_manifest_scan` /
+stayed flat at 4. So **both depth *op-count* terms are now empirically eliminated** —
+a depth-87 single edge drops **~1720 → 198 ops (~8.7× in op count)** with both fixes.
+**Wall-clock correction (§0(c)):** do *not* read that op-count cut as an ~8.7×
+wall-clock win — the earlier "≈258 s → ≈30 s at 150 ms/RTT" figure multiplied *total*
+ops by RTT as if every op were serial, which the latency-slope measurement refutes.
+The depth-driven ops *parallelize* (parallelism 1→6), so they are largely off the
+critical path; wall-clock is set by the **~110-hop serial backbone**, which step 2's
+*op-count* reduction does **not** shorten. So step 2 is a cost / compute-floor /
+Phase-7-prerequisite win, not the wall-clock fix; the wall-clock lever is step 3b
+(parallelize the backbone). The internal term is **fragment-scan growth** (`read_manifest_scan` /
 `commit_graph.refresh` read all fragments of the *latest* version), so the fix is
 **compaction** (merge fragments) — distinct from the data table's version-chain term
 that step 3 / version-cleanup handle. `optimize`'s `all_table_keys`
@@ -513,9 +577,19 @@ path and would pass falsely.
 
 The load-bearing rule both Lance and SlateDB mostly miss: **assert the constant is
 flat across N, not just small at one N.** A shallow fixture cannot catch an
-O(history) cost (the §0(b) table is the red baseline). Add a `num_stages`
-(sequential-hop) assertion via a `ThrottledStore` wrapper (Lance's
-`test_commit_iops` setup) so an O(N) listing also blows a wall-time budget.
+O(history) cost (the §0(b) table is the red baseline).
+
+**The serial-hop assertion is the PRIMARY latency LOCK, not an add-on (corrected per
+§0(c)).** Op-*count* flatness alone is the wrong latency gate in both directions: it
+would **fail a correct build** whose internal scans grow `+5/depth` yet *parallelize*
+(no wall-clock cost — §0(c)), and it would **pass a slow build** with a long *serial*
+backbone but low op count. So the load-bearing gate is a **serial-hop / `num_stages`**
+assertion (`serial_hops ≤ K`, flat in depth) via a `ThrottledStore` wrapper that
+injects per-op latency and reads the wall = `compute + serial_hops·L` slope (Lance's
+`test_commit_iops` setup) — this is what catches the ~110-hop backbone §0(c) measured.
+Op-count flatness is **demoted to a cost / compute-floor gate** (it bounds space and
+the per-write compute floor, not wall-clock). Gate both, but the serial-hop LOCK is the
+one that gates step 3b's win.
 
 ### 5.2 Tier 2 — wall-clock trend (post-merge / nightly, never a PR gate)
 
@@ -847,10 +921,18 @@ to flatten the curve.
    `storage.ops` span metric (§5.3) and the bucket-gated `write_cost_s3.rs` opener
    LOCK (step 3a's red→green, S3-only per the §9-3a measurement note).
 2. **Bound history — bring the INTERNAL tables into optimize/cleanup.** Split into
-   a compaction half (the latency win, safe) and a cleanup half (version GC, needs
-   the Q8 watermark). Validated (Lance docs + source): compaction *preserves*
-   versions and is the only term needed to flatten the per-write metadata scan;
-   cleanup is the separate version-deleting op that opens the Q8 hole.
+   a compaction half (safe) and a cleanup half (version GC, needs the Q8 watermark).
+   Validated (Lance docs + source): compaction *preserves* versions and flattens the
+   per-write metadata *op-count* scan; cleanup is the separate version-deleting op that
+   opens the Q8 hole. **Reprioritized as a latency item (§0(c)):** these internal scans
+   *parallelize*, so step 2 cuts op count / space / the compute floor but **not** the
+   ~110-hop serial backbone — it is **not** the wall-clock fix (that is step 3b). Its
+   load-bearing role is as the **hard prerequisite for Phase 7 / step 4** (the
+   `graph_head` CAS retry re-runs `load_publish_state`, only acceptable once
+   `__manifest` is compacted) plus the compute-floor/space win — so it stays, but
+   ahead of step 3b in the latency narrative it is not. (Exception: on a throttling
+   store like R2 the parallel tail may re-serialize, at which point step 2 *does* help
+   wall-clock — unmeasured on R2; §0(c) caveat.)
    - **2a. Internal-table compaction. ✅ LANDED.** `optimize` now compacts
      `__manifest` and `_graph_commits` (`compact_internal_table`, a separate simpler
      path than `optimize_one_table`: no manifest publish, no recovery sidecar — a
@@ -926,6 +1008,12 @@ to flatten the curve.
    `iss-merge-recovery-partial-rollforward`, `iss-recovery-sweep-live-writer-rollback`,
    `iss-934`.)
 6. **Branch ops.** Lance `Clone` for create (`iss-691`); concurrent delete loops.
+   Measured backbones (§0(c)): create ~77, delete ~87 — op counts scale with table
+   count, so `Clone` (O(tables)→O(1)) + `buffer_unordered` delete are the fix.
+   **Note: branch *write* (1777 ops, ~258-hop backbone, 21s compute floor) is NOT a
+   step-6 item** — it is fork-on-first-write stacked on the main backbone, owned by
+   **step 3b + the fork seam** (the path 3a skipped); it is the single worst write
+   shape and should be a named acceptance case for step 3b.
 7. **Freeze** investment in publisher/sidecar/fork internals; pursue the MTT
    seam (`iss-863`/`iss-864`) as the strategic exit.
 
