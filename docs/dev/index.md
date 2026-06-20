@@ -93,6 +93,7 @@ Working documents for in-flight feature work. Removed when the work lands.
 | CLI refactoring — one addressing & config model post-`omnigraph.yaml`: scope + `--graph` + derived access path, served-default / privileged-direct, profiles, named queries, capability classifier (completes RFC-008) | [rfc-011-cli-refactoring.md](rfc-011-cli-refactoring.md) |
 | Provider-independent embedding configuration — one resolved `EmbeddingConfig` + sealed provider enum (Gemini/OpenAI/Mock), identity recorded in the schema IR, query-time same-space validation, NFR floor | [rfc-012-embedding-provider-config.md](rfc-012-embedding-provider-config.md) |
 | Write-path latency — capture-once `WriteTxn`, version-pinned opens, one `GraphPublishAuthority` fed declarative `PublishPlan`s, manifest-authoritative lineage, epoch fence, bounded history (compaction + cleanup), and an IO-counted cost contract (`iss-write-s3-roundtrip-amplification`, `iss-991`) | [rfc-013-write-path-latency.md](rfc-013-write-path-latency.md) |
+| Write-path latency step 3b — implementation spec: the capture-once `WriteTxn` that unifies the write opener onto the read path's pinned-version + shared-`Session` primitive (`iss-write-s3-roundtrip-amplification`) | [rfc-013-step-3b-writetxn.md](rfc-013-step-3b-writetxn.md) |
 
 ## Boundary
 
