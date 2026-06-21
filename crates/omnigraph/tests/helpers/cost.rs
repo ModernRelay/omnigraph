@@ -334,6 +334,23 @@ pub async fn measure_insert(db: &mut Omnigraph, tag: &str) -> IoCounts {
     io
 }
 
+/// Like [`measure_insert`] but carries an actor, so the write appends to and reads
+/// `_graph_commit_actors.lance` — the authenticated (server/CLI) write path. The
+/// commit-graph IO wrapper covers both `_graph_commits` and `_graph_commit_actors`,
+/// so `IoCounts::commit_graph_reads` includes the actor-table scan on this path.
+pub async fn measure_insert_as(db: &mut Omnigraph, tag: &str, actor: &str) -> IoCounts {
+    let (res, io) = measure(db.mutate_as(
+        "main",
+        MUTATION_QUERIES,
+        "insert_person",
+        &mixed_params(&[("$name", tag)], &[("$age", 30)]),
+        Some(actor),
+    ))
+    .await;
+    res.unwrap();
+    io
+}
+
 // ── Backend fixtures — one knob, store-agnostic body ──
 
 /// Local tempdir graph (default; deterministic, every-PR).
