@@ -1026,7 +1026,7 @@ pub(crate) async fn server_invoke_query(
     tag = "queries",
     operation_id = "list_queries",
     responses(
-        (status = 200, description = "Stored-query catalog (the mcp.expose subset, with typed params)", body = QueriesCatalogOutput),
+        (status = 200, description = "Stored-query catalog (every stored query, with typed params)", body = QueriesCatalogOutput),
         (status = 401, description = "Unauthorized", body = ErrorOutput),
         (status = 403, description = "Forbidden", body = ErrorOutput),
     ),
@@ -1034,10 +1034,11 @@ pub(crate) async fn server_invoke_query(
 )]
 /// List the graph's exposed stored queries as a typed tool catalog.
 ///
-/// Returns the `mcp.expose == true` subset of the `queries:` registry, each
+/// Returns every stored query in the `queries:` registry, each
 /// with its MCP tool name, read/mutate flag, description/instruction, and
 /// typed parameters — enough for a client to register them as tools without
-/// fetching `.gq` source. Read-gated; the catalog is graph-wide (branch
+/// fetching `.gq` source. Cluster-served graphs have no per-query expose flag,
+/// so the catalog lists them all. Read-gated; the catalog is graph-wide (branch
 /// independent — `read` is authorized against `main`). **Not** Cedar-filtered
 /// per query yet, so it can list a query whose `invoke_query` the caller
 /// lacks (a known gap until per-query authorization lands).

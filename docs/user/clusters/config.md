@@ -212,7 +212,7 @@ resource is planned as a create. If present, the file must use this shape:
 ```
 
 `state_revision`, `resource_statuses`, `approval_records`, `recovery_records`,
-and `observations` are optional so older Stage 1 state fixtures keep working.
+and `observations` are optional so earlier state fixtures keep working.
 Missing `state_revision` is treated as `0`. Resource status values are
 `pending`, `planned`, `applying`, `applied`, `drifted`, `blocked`, or `error`.
 
@@ -238,9 +238,10 @@ profile in the ledger; pre-profile ledgers are backfilled by an Update with
 catalog changes and count toward convergence.
 
 Each plan change carries a `disposition` field — an honest preview of what
-`cluster apply` will do with it in this stage: `applied` (executes), `derived`
-(a `graph.<id>` composite-digest update that converges automatically once its
-query digests land), `deferred` (graph/schema change, later phase), or
+`cluster apply` will do with it: `applied` (executes — graph creates, schema
+updates, catalog writes, approved deletes), `derived` (a `graph.<id>`
+composite-digest update that converges automatically once its query digests
+land), `deferred` (an unsupported change, e.g. a standalone schema delete), or
 `blocked` (query/policy gated by an unapplied or missing dependency, with the
 condition in `reason`).
 
@@ -496,5 +497,5 @@ matches the argument. A wrong id, missing lock, invalid lock JSON, or unsupporte
 lock version exits non-zero and leaves the file untouched.
 
 This is manual recovery for abandoned local locks. OmniGraph does not perform
-PID-liveness checks, TTL expiry, stale-lock breaking, or automatic unlock in
-Stage 2C.
+PID-liveness checks, TTL expiry, stale-lock breaking, or automatic unlock
+today.

@@ -18,7 +18,7 @@
 | Expand CSR-build cost factor | `CSR_BUILD_FACTOR = 1.5` | traversal |
 | Expand mode override | `OMNIGRAPH_TRAVERSAL_MODE` (`indexed`\|`csr`; unset = cost-based auto) | traversal |
 | Default body limit | `1 MB` | HTTP server |
-| Ingest body limit | `32 MB` | HTTP server |
+| Load (bulk-write) body limit | `32 MB` | HTTP server (`/load`; shared by the deprecated `/ingest` alias) |
 | Default embed provider/model | `openai-compatible` / `openai/text-embedding-3-large` | engine embedding |
 | OpenAI-direct embed model | `text-embedding-3-large` | engine embedding |
 | Gemini-direct embed model | `gemini-embedding-2` | engine embedding |
