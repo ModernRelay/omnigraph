@@ -1006,7 +1006,7 @@
           "queries"
         ],
         "summary": "List the graph's exposed stored queries as a typed tool catalog.",
-        "description": "Returns the `mcp.expose == true` subset of the `queries:` registry, each\nwith its MCP tool name, read/mutate flag, description/instruction, and\ntyped parameters — enough for a client to register them as tools without\nfetching `.gq` source. Read-gated; the catalog is graph-wide (branch\nindependent — `read` is authorized against `main`). **Not** Cedar-filtered\nper query yet, so it can list a query whose `invoke_query` the caller\nlacks (a known gap until per-query authorization lands).",
+        "description": "Returns every stored query in the `queries:` registry, each\nwith its MCP tool name, read/mutate flag, description/instruction, and\ntyped parameters — enough for a client to register them as tools without\nfetching `.gq` source. Cluster-served graphs have no per-query expose flag,\nso the catalog lists them all. Read-gated; the catalog is graph-wide (branch\nindependent — `read` is authorized against `main`). **Not** Cedar-filtered\nper query yet, so it can list a query whose `invoke_query` the caller\nlacks (a known gap until per-query authorization lands).",
         "operationId": "cluster_list_queries",
         "parameters": [
           {
@@ -1021,7 +1021,7 @@
         ],
         "responses": {
           "200": {
-            "description": "Stored-query catalog (the mcp.expose subset, with typed params)",
+            "description": "Stored-query catalog (every stored query, with typed params)",
             "content": {
               "application/json": {
                 "schema": {
@@ -2248,7 +2248,7 @@
       },
       "QueriesCatalogOutput": {
         "type": "object",
-        "description": "Response for `GET /queries`: the `mcp.expose` subset of a graph's\nstored-query registry, each with typed parameters.",
+        "description": "Response for `GET /queries`: every stored query in a graph's\nregistry, each with typed parameters.",
         "required": [
           "queries"
         ],

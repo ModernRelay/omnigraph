@@ -41,6 +41,7 @@ constraints. User-facing behavior should still be documented through
 | Error taxonomy and serialization | [errors.md](../user/operations/errors.md) |
 | Constants and tunables | [constants.md](../user/reference/constants.md) |
 | Transaction model public contract | [transactions.md](../user/branching/transactions.md) |
+| User-doc coherence cleanup ledger | [docs-issues.md](docs-issues.md) |
 
 ## Project Operations
 

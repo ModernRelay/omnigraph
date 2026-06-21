@@ -24,21 +24,26 @@
 mod helpers;
 
 use helpers::cost::{
-    IoCounts, assert_flat, assert_grows, local_graph, measure_insert, measure_with_staged,
+    IoCounts, assert_flat, assert_grows, local_graph, measure_insert, measure_insert_as,
+    measure_with_staged,
 };
-use helpers::{MUTATION_QUERIES, commit_many, mixed_params};
+use helpers::{MUTATION_QUERIES, commit_many, commit_many_as, mixed_params};
 
 // ── (A) The internal-table LOCK — the acceptance test for step 2 (compaction) ──
 //
-// `__manifest` / `_graph_commits` scans on a write must be O(1) in commit-history
-// depth **on a compacted graph**. Without internal-table compaction these scans
-// are O(fragments) and grow forever; step 2 brings the internal tables into
-// `db.optimize()`, so after compaction the per-write scan is flat. The test
-// compacts at each depth checkpoint before measuring — i.e. it pins the production
-// invariant "a periodically-compacted graph's write cost does not grow with
-// version history," which is exactly what step 2 delivers.
+// `__manifest` / `_graph_commits` / `_graph_commit_actors` scans on a write must be
+// O(1) in commit-history depth **on a compacted graph**. Without internal-table
+// compaction these scans are O(fragments) and grow forever; step 2 brings all three
+// internal tables into `db.optimize()`, so after compaction the per-write scan is
+// flat. The test runs the **authenticated (actorful) write path** — every commit
+// carries an actor, so it grows `_graph_commit_actors.lance` too (the production
+// server/CLI path); the commit-graph IO wrapper covers both that and `_graph_commits`,
+// so `commit_graph_reads` includes the actor-table scan. It compacts at each depth
+// checkpoint before measuring — pinning the production invariant "a periodically-
+// compacted graph's write cost does not grow with version history."
 #[tokio::test]
 async fn internal_table_scans_are_flat_in_history() {
+    const ACTOR: &str = "act-cost-gate";
     let dir = tempfile::tempdir().unwrap();
     let mut db = local_graph(&dir).await;
 
@@ -46,23 +51,25 @@ async fn internal_table_scans_are_flat_in_history() {
     let mut current = 0u64;
     for d in [10u64, 100] {
         if d > current {
-            commit_many(&mut db, (d - current) as usize).await;
+            commit_many_as(&mut db, (d - current) as usize, ACTOR).await;
             current = d;
         }
-        // Step 2: compaction folds the internal tables' O(depth) fragments back to
-        // a small constant, so the following write's scan of them is flat.
+        // Step 2: compaction folds all three internal tables' O(depth) fragments back
+        // to a small constant, so the following write's scan of them is flat.
         db.optimize().await.unwrap();
-        let io = measure_insert(&mut db, &format!("lock_{d}")).await;
+        let io = measure_insert_as(&mut db, &format!("lock_{d}"), ACTOR).await;
         current += 1; // the measured write advanced depth by one
         eprintln!(
-            "depth~{d}: data={} __manifest={} _graph_commits={}",
+            "depth~{d}: data={} __manifest={} _graph_commits+actors={}",
             io.data_reads, io.manifest_reads, io.commit_graph_reads
         );
         curve.push((d, io));
     }
 
     assert_flat(&curve, |c| c.manifest_reads, 4, "__manifest scan");
-    assert_flat(&curve, |c| c.commit_graph_reads, 4, "_graph_commits scan");
+    // commit_graph_reads covers BOTH _graph_commits and _graph_commit_actors (shared
+    // wrapper), so this also gates the actor table on the authenticated path.
+    assert_flat(&curve, |c| c.commit_graph_reads, 4, "_graph_commits + _graph_commit_actors scan");
 }
 
 // The data-table OPENER history-gate (opener flat across depth) lives in
