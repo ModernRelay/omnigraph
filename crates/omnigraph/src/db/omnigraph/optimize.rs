@@ -547,24 +547,6 @@ async fn optimize_one_table(
     Ok(stat)
 }
 
-/// Compact one INTERNAL system table (`__manifest` / `_graph_commits`) in place.
-///
-/// Unlike catalog data tables, the internal tables are not tracked in the
-/// `__manifest` (they ARE the manifest / the lineage DAG): readers open them at
-/// their latest Lance HEAD, so compaction just advances that HEAD and the next
-/// reader transparently observes the compacted version. That makes this path much
-/// simpler than [`optimize_one_table`] — no manifest publish (nothing to publish
-/// to), and no recovery sidecar (a single atomic Lance `compact_files` commit, with
-/// no HEAD-before-publish gap to recover). Internal tables carry no Lance index
-/// (only `object_id`'s unenforced-PK schema metadata), so no `optimize_indices`.
-///
-/// Concurrency: no application lock. Lance's `compact_files` auto-retries its
-/// `Operation::Rewrite` against any concurrent writer's commit (the canonical
-/// LanceDB pattern; `Rewrite` vs `Append` is compatible, vs `Update`/merge-insert it
-/// is a retryable same-fragment conflict Lance rebases). A follow-up coordinator
-/// `refresh` makes the warm `__manifest`/`_graph_commits` handle observe the
-/// compacted HEAD deterministically (the version probe would also self-heal on the
-/// next read).
 /// Bound on the app-level retry of an internal-table compaction against a
 /// concurrent live writer (see [`is_retryable_lance_conflict`]).
 const INTERNAL_COMPACTION_RETRY_BUDGET: u32 = 5;
@@ -624,6 +606,26 @@ async fn clear_stale_auto_cleanup_config(
     Ok(true)
 }
 
+/// Compact one INTERNAL system table (`__manifest` / `_graph_commits` /
+/// `_graph_commit_actors`) in place.
+///
+/// Unlike catalog data tables, the internal tables are not tracked in the
+/// `__manifest` (they ARE the manifest / the lineage DAG): readers open them at
+/// their latest Lance HEAD, so compaction just advances that HEAD and the next
+/// reader transparently observes the compacted version. That makes this path much
+/// simpler than [`optimize_one_table`] — no manifest publish (nothing to publish
+/// to), and no recovery sidecar (a single atomic Lance `compact_files` commit, with
+/// no HEAD-before-publish gap to recover). Internal tables carry no Lance index
+/// (only `object_id`'s unenforced-PK schema metadata), so no `optimize_indices`.
+///
+/// Concurrency: no application lock, but `compact_files` does NOT auto-retry a
+/// semantic conflict — its `Operation::Rewrite` commits through `apply_commit`
+/// directly (not the merge-insert `execute_with_retry` path), so a `Rewrite`
+/// vs concurrent `Update`/`Merge`/`Delete` `check_txn` conflict propagates raw.
+/// We own the retry here (see [`is_retryable_lance_conflict`]): on a retryable
+/// conflict, reopen at the new HEAD and rerun. A follow-up coordinator `refresh`
+/// makes the warm internal-table handles observe the compacted HEAD
+/// deterministically (the version probe would also self-heal on the next read).
 async fn compact_internal_table(
     db: &Omnigraph,
     table_key: &str,
