@@ -862,7 +862,7 @@ pub(crate) async fn heal_pending_sidecars_roll_forward(
         };
         if process_sidecar(
             root_uri,
-            storage.as_ref(),
+            &storage,
             &branch_snapshot,
             &sidecar,
             RecoveryMode::RollForwardOnly,
@@ -1036,7 +1036,7 @@ pub(crate) async fn recover_manifest_drift(
         };
         process_sidecar(
             root_uri,
-            storage.as_ref(),
+            &storage,
             &branch_snapshot,
             &sidecar,
             mode,
@@ -1051,7 +1051,7 @@ pub(crate) async fn recover_manifest_drift(
 
 async fn process_sidecar(
     root_uri: &str,
-    storage: &dyn StorageAdapter,
+    storage: &std::sync::Arc<dyn StorageAdapter>,
     snapshot: &Snapshot,
     sidecar: &RecoverySidecar,
     mode: RecoveryMode,
@@ -1154,7 +1154,7 @@ async fn process_sidecar(
                     );
                 }
                 return record_audit_recovery_rollforward(
-                    root_uri, storage, snapshot, sidecar, &states,
+                    root_uri, storage.as_ref(), snapshot, sidecar, &states,
                 )
                 .await
                 .map(|()| true);
@@ -1176,7 +1176,7 @@ async fn process_sidecar(
                 writer_kind = ?sidecar.writer_kind,
                 "recovery: rolling back sidecar (mixed or unexpected state)"
             );
-            roll_back_sidecar(root_uri, storage, snapshot, sidecar, &states)
+            roll_back_sidecar(root_uri, storage.as_ref(), snapshot, sidecar, &states)
                 .await
                 .map(|()| true)
         }
@@ -1191,7 +1191,7 @@ async fn process_sidecar(
                             "recovery: rolling back SchemaApply sidecar because schema staging \
                              files were not promoted in this recovery pass"
                         );
-                        roll_back_sidecar(root_uri, storage, snapshot, sidecar, &states)
+                        roll_back_sidecar(root_uri, storage.as_ref(), snapshot, sidecar, &states)
                             .await
                             .map(|()| true)
                     }
@@ -1219,7 +1219,24 @@ async fn process_sidecar(
                 crate::failpoints::names::RECOVERY_BEFORE_ROLL_FORWARD_PUBLISH,
             )?;
             let (new_manifest_version, published_versions) =
-                roll_forward_all(root_uri, sidecar, &states, snapshot).await?;
+                match roll_forward_all(root_uri, sidecar, &states, snapshot).await {
+                    Ok(published) => published,
+                    // Convergence-idempotent (invariants 7 & 15): a roll-forward's
+                    // postcondition is "the manifest reflects the sidecar's committed
+                    // Lance state", NOT "this sweep personally won the CAS". A
+                    // concurrent writer that advanced the manifest to/past that goal
+                    // during the classify→publish window is convergence, not a logical
+                    // conflict — so re-read and either record the already-achieved
+                    // roll-forward or defer to the next pass; never fail the open.
+                    // Any other error still propagates.
+                    Err(err) if is_expected_version_mismatch(&err) => {
+                        return converge_or_defer_roll_forward(
+                            root_uri, storage, sidecar, &states, err,
+                        )
+                        .await;
+                    }
+                    Err(err) => return Err(err),
+                };
             // `to_version` records the ACTUAL Lance HEAD published for
             // each table (not pin.post_commit_pin, which is a lower bound
             // for loose-match writers like SchemaApply / EnsureIndices /
@@ -1254,10 +1271,146 @@ async fn process_sidecar(
                 outcomes,
             )
             .await?;
-            delete_sidecar_by_operation_id(root_uri, storage, &sidecar.operation_id).await?;
+            delete_sidecar_by_operation_id(root_uri, storage.as_ref(), &sidecar.operation_id)
+                .await?;
             Ok(true)
         }
     }
+}
+
+/// True if `err` is the publisher's per-table CAS precondition failure
+/// (`ExpectedVersionMismatch`) — the signal that a concurrent writer advanced
+/// the manifest past what this caller expected.
+fn is_expected_version_mismatch(err: &OmniError) -> bool {
+    matches!(
+        err,
+        OmniError::Manifest(m)
+            if matches!(
+                m.details,
+                Some(crate::error::ManifestConflictDetails::ExpectedVersionMismatch { .. })
+            )
+    )
+}
+
+/// Whether the live manifest already reflects everything this sidecar intended
+/// to publish.
+///
+/// SOUNDNESS: the per-table test is `current_version >= observed lance_head`, a
+/// *proxy* for "the sidecar's committed Lance commit is an ancestor of the
+/// published HEAD" (so a higher version is a descendant that contains it). The
+/// proxy is sound only because of the heal-first invariant: every writer that
+/// can advance a table's manifest version first heals pending sidecars
+/// (`heal_pending_recovery_sidecars` runs at the head of `load`/`mutate`/
+/// schema-apply/branch-merge) or refuses on an unrecovered graph (`optimize`).
+/// So the only path past `expected_version` is one that first publishes THIS
+/// sidecar's commit at `lance_head` — version ordering then implies lineage
+/// containment. A future writer that advances a pinned table WITHOUT healing
+/// first (e.g. a non-heal-first `Overwrite` that replaces rows) would void this
+/// proxy and must be re-validated by row-id lineage, not version ordering.
+/// Added tables must be registered; tombstoned tables must be gone.
+fn sidecar_intent_satisfied(
+    snapshot: &Snapshot,
+    sidecar: &RecoverySidecar,
+    states: &[ClassifiedTable],
+) -> bool {
+    for (pin, state) in sidecar.tables.iter().zip(states.iter()) {
+        let current = snapshot
+            .entry(&pin.table_key)
+            .map(|e| e.table_version)
+            .unwrap_or(0);
+        if current < state.lance_head {
+            return false;
+        }
+    }
+    for reg in &sidecar.additional_registrations {
+        if snapshot.entry(&reg.table_key).is_none() {
+            return false;
+        }
+    }
+    for tomb in &sidecar.tombstones {
+        if snapshot.entry(&tomb.table_key).is_some() {
+            return false;
+        }
+    }
+    true
+}
+
+/// Re-read the live manifest snapshot for the sidecar's branch.
+async fn fresh_snapshot_for_sidecar(
+    root_uri: &str,
+    storage: &std::sync::Arc<dyn StorageAdapter>,
+    sidecar: &RecoverySidecar,
+) -> Result<Snapshot> {
+    let mut coordinator = match sidecar.branch.as_deref() {
+        Some(branch) if branch != "main" => {
+            GraphCoordinator::open_branch(root_uri, branch, std::sync::Arc::clone(storage)).await?
+        }
+        _ => GraphCoordinator::open(root_uri, std::sync::Arc::clone(storage)).await?,
+    };
+    coordinator.refresh().await?;
+    Ok(coordinator.snapshot())
+}
+
+/// Convergence-idempotent handling of a roll-forward publish CAS that lost to a
+/// concurrent writer (`ExpectedVersionMismatch`). A roll-forward's postcondition
+/// is "the manifest reflects the sidecar's committed Lance state", not "this
+/// sweep won the CAS" (invariants 7 & 15). Re-read the live manifest:
+///
+/// - if it already reached the sidecar's goal, the work is done (just not by us)
+///   — record the `RolledForward` audit and delete the sidecar idempotently;
+/// - otherwise the manifest is progressing but not yet at the goal — leave the
+///   sidecar for the next open / the live writer's own Phase D.
+///
+/// Either way the open does NOT fail. A genuine logical conflict (a table below
+/// `expected_version`, i.e. data lost) is not satisfiable here and re-surfaces
+/// loudly via the classifier's `InvariantViolation` on the next pass.
+/// See iss-schema-apply-reopen-recovery-race.
+async fn converge_or_defer_roll_forward(
+    root_uri: &str,
+    storage: &std::sync::Arc<dyn StorageAdapter>,
+    sidecar: &RecoverySidecar,
+    states: &[ClassifiedTable],
+    conflict: OmniError,
+) -> Result<bool> {
+    let fresh = fresh_snapshot_for_sidecar(root_uri, storage, sidecar).await?;
+    if !sidecar_intent_satisfied(&fresh, sidecar, states) {
+        warn!(
+            operation_id = sidecar.operation_id.as_str(),
+            writer_kind = ?sidecar.writer_kind,
+            "recovery: roll-forward publish lost a CAS and the manifest has not \
+             yet reached the sidecar's goal; deferring to the next pass \
+             (conflict: {conflict})"
+        );
+        return Ok(false);
+    }
+    warn!(
+        operation_id = sidecar.operation_id.as_str(),
+        writer_kind = ?sidecar.writer_kind,
+        "recovery: roll-forward publish lost a CAS to a concurrent writer that \
+         already reached the goal; converging (RolledForward audit + delete)"
+    );
+    let outcomes: Vec<TableOutcome> = sidecar
+        .tables
+        .iter()
+        .map(|pin| TableOutcome {
+            table_key: pin.table_key.clone(),
+            from_version: pin.expected_version,
+            to_version: fresh
+                .entry(&pin.table_key)
+                .map(|e| e.table_version)
+                .unwrap_or(pin.post_commit_pin),
+        })
+        .collect();
+    record_audit(
+        root_uri,
+        sidecar,
+        fresh.version(),
+        RecoveryKind::RolledForward,
+        outcomes,
+    )
+    .await?;
+    delete_sidecar_by_operation_id(root_uri, storage.as_ref(), &sidecar.operation_id).await?;
+    Ok(true)
 }
 
 #[derive(Debug, Clone, Copy)]

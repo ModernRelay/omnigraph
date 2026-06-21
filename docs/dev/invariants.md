@@ -211,10 +211,21 @@ them explicit.
   sweep has the same exposure, and always has): it may roll a live foreign
   writer's sidecar forward, which degrades to publisher-CAS contention for
   data writes but can race the schema-staging promotion for a foreign live
-  schema apply. Multi-process writers on one graph are already documented
-  one-winner-CAS territory; closing this fully needs a cross-process
-  serialization primitive (e.g. lease-based use of the schema-apply lock
-  branch) — design it before promoting multi-process write topologies.
+  schema apply. The roll-**forward** CAS contention is now
+  convergence-idempotent: when the publish loses the CAS to a concurrent
+  writer that already reached the sidecar's goal, the sweep treats it as
+  convergence (record the `RolledForward` audit + delete) rather than a fatal
+  `ExpectedVersionMismatch`, and defers when the manifest is only partway
+  (`converge_or_defer_roll_forward` in `db/manifest/recovery.rs`;
+  iss-schema-apply-reopen-recovery-race). So a concurrent advance no longer
+  fails the open. The schema-staging promotion race and the destructive
+  roll-**back** path (Lance `Restore` "trumps" a concurrent commit, so it
+  cannot be made idempotent — iss-recovery-sweep-live-writer-rollback) still
+  need the cross-process primitive. Multi-process writers on one graph are
+  already documented one-winner-CAS territory; closing this fully needs a
+  cross-process serialization primitive (e.g. lease-based use of the
+  schema-apply lock branch) — design it before promoting multi-process write
+  topologies.
 - **Fork reclaim is in-process-safe only:** the first write to a table on a
   branch forks it (a Lance `create_branch` that advances state before the
   manifest publish). An interrupted fork (crash, or a cancelled request
