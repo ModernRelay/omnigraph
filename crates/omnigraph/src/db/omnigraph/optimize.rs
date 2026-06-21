@@ -642,18 +642,30 @@ async fn compact_internal_table(
         let mut ds = handle.into_dataset();
 
         // Keep optimize non-destructive by construction (see clear_stale_auto_cleanup_config).
-        if let Err(e) = clear_stale_auto_cleanup_config(&mut ds).await {
-            if attempt + 1 < INTERNAL_COMPACTION_RETRY_BUDGET && is_retryable_lance_conflict(&e) {
-                continue;
+        // Returns whether it committed a config-strip (which advances Lance HEAD).
+        let cleared_config = match clear_stale_auto_cleanup_config(&mut ds).await {
+            Ok(cleared) => cleared,
+            Err(e) => {
+                if attempt + 1 < INTERNAL_COMPACTION_RETRY_BUDGET && is_retryable_lance_conflict(&e)
+                {
+                    continue;
+                }
+                return Err(OmniError::Lance(e.to_string()));
             }
-            return Err(OmniError::Lance(e.to_string()));
-        }
+        };
 
         let options = CompactionOptions::default();
         let plan = plan_compaction(&ds, &options)
             .await
             .map_err(|e| OmniError::Lance(e.to_string()))?;
         if plan.num_tasks() == 0 {
+            // No compaction work, but a config-strip still advanced HEAD — refresh
+            // the warm coordinator handles so they observe it deterministically
+            // (same cache-coherence step the successful-compaction path takes
+            // below; otherwise they stay pinned until the next version probe).
+            if cleared_config {
+                db.coordinator.write().await.refresh().await?;
+            }
             return Ok(TableOptimizeStats::compacted(
                 table_key.to_string(),
                 &CompactionMetrics::default(),
