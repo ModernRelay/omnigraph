@@ -818,7 +818,7 @@ impl Omnigraph {
                 // across this failure so the next `Omnigraph::open`'s
                 // recovery sweep can roll forward — see
                 // `tests/failpoints.rs::recovery_rolls_forward_after_finalize_publisher_failure`.
-                crate::failpoints::maybe_fail("mutation.post_finalize_pre_publisher")?;
+                crate::failpoints::maybe_fail(crate::failpoints::names::MUTATION_POST_FINALIZE_PRE_PUBLISHER)?;
                 self.commit_updates_on_branch_with_expected(
                     requested.as_deref(),
                     &updates,
@@ -1305,7 +1305,7 @@ impl Omnigraph {
                 crate::db::MutationOpKind::Delete,
             )
             .await?;
-        crate::failpoints::maybe_fail("mutation.delete_node_pre_primary_delete")?;
+        crate::failpoints::maybe_fail(crate::failpoints::names::MUTATION_DELETE_NODE_PRE_PRIMARY_DELETE)?;
         let (_new_ds, delete_state) = self
             .storage_inline_residual()
             .delete_where(&full_path, ds, &pred_sql)

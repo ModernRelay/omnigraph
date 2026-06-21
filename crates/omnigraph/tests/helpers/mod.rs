@@ -1,6 +1,8 @@
 #![allow(dead_code)]
 
 pub mod cost;
+#[cfg(feature = "failpoints")]
+pub mod failpoint;
 pub mod recovery;
 
 use arrow_array::{Array, RecordBatch, StringArray};

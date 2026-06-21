@@ -257,7 +257,7 @@ impl GraphCoordinator {
     /// fresh, so any existing commit-graph branch with this name is provably
     /// orphaned and is force-dropped before recreating.
     async fn create_commit_graph_branch(&mut self, branch: &str) -> Result<()> {
-        failpoints::maybe_fail("branch_create.after_manifest_branch_create")?;
+        failpoints::maybe_fail(crate::failpoints::names::BRANCH_CREATE_AFTER_MANIFEST_BRANCH_CREATE)?;
         let Some(commit_graph) = &mut self.commit_graph else {
             return Ok(());
         };
@@ -306,7 +306,7 @@ impl GraphCoordinator {
     /// Best-effort, idempotent reclaim of the commit-graph branch `branch`.
     /// Tolerates an absent commit-graph dataset (a graph that never committed).
     async fn reclaim_commit_graph_branch(&mut self, branch: &str) -> Result<()> {
-        failpoints::maybe_fail("branch_delete.before_commit_graph_reclaim")?;
+        failpoints::maybe_fail(crate::failpoints::names::BRANCH_DELETE_BEFORE_COMMIT_GRAPH_RECLAIM)?;
         if let Some(commit_graph) = &mut self.commit_graph {
             commit_graph.force_delete_branch(branch).await
         } else if self
@@ -486,7 +486,7 @@ impl GraphCoordinator {
         updates: &[SubTableUpdate],
     ) -> Result<u64> {
         let manifest_version = self.manifest.commit(updates).await?;
-        failpoints::maybe_fail("graph_publish.after_manifest_commit")?;
+        failpoints::maybe_fail(crate::failpoints::names::GRAPH_PUBLISH_AFTER_MANIFEST_COMMIT)?;
         Ok(manifest_version)
     }
 
@@ -499,7 +499,7 @@ impl GraphCoordinator {
             .manifest
             .commit_with_expected(updates, expected_table_versions)
             .await?;
-        failpoints::maybe_fail("graph_publish.after_manifest_commit")?;
+        failpoints::maybe_fail(crate::failpoints::names::GRAPH_PUBLISH_AFTER_MANIFEST_COMMIT)?;
         Ok(manifest_version)
     }
 
@@ -508,7 +508,7 @@ impl GraphCoordinator {
         changes: &[ManifestChange],
     ) -> Result<u64> {
         let manifest_version = self.manifest.commit_changes(changes).await?;
-        failpoints::maybe_fail("graph_publish.after_manifest_commit")?;
+        failpoints::maybe_fail(crate::failpoints::names::GRAPH_PUBLISH_AFTER_MANIFEST_COMMIT)?;
         Ok(manifest_version)
     }
 
@@ -539,7 +539,7 @@ impl GraphCoordinator {
                 self.manifest_incarnation().e_tag.as_deref(),
             ));
         };
-        failpoints::maybe_fail("graph_publish.before_commit_append")?;
+        failpoints::maybe_fail(crate::failpoints::names::GRAPH_PUBLISH_BEFORE_COMMIT_APPEND)?;
         // Refresh the commit-graph head from storage before selecting the
         // parent. `append_commit` parents the new commit on the IN-MEMORY head
         // (`head_commit_id`, zero storage read), but the manifest was just
@@ -571,7 +571,7 @@ impl GraphCoordinator {
         let commit_graph = self.commit_graph.as_mut().ok_or_else(|| {
             OmniError::manifest("branch merge requires _graph_commits.lance".to_string())
         })?;
-        failpoints::maybe_fail("graph_publish.before_commit_append")?;
+        failpoints::maybe_fail(crate::failpoints::names::GRAPH_PUBLISH_BEFORE_COMMIT_APPEND)?;
         let graph_commit_id = commit_graph
             .append_merge_commit(
                 current_branch.as_deref(),

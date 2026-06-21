@@ -416,7 +416,7 @@ pub(crate) async fn write_sidecar(
 ) -> Result<RecoverySidecarHandle> {
     // Failpoint: models a storage put failure (S3 PutObject / fs write)
     // in Phase A — every writer must abort before any HEAD advance.
-    crate::failpoints::maybe_fail("recovery.sidecar_write")?;
+    crate::failpoints::maybe_fail(crate::failpoints::names::RECOVERY_SIDECAR_WRITE)?;
     debug_assert_eq!(sidecar.schema_version, SIDECAR_SCHEMA_VERSION);
     let uri = sidecar_uri(root_uri, &sidecar.operation_id);
     let json = serde_json::to_string_pretty(sidecar).map_err(|err| {
@@ -457,7 +457,7 @@ pub(crate) async fn confirm_sidecar_phase_b(
 ) -> Result<()> {
     // Failpoint: models a storage failure on the confirmation write — the
     // pre-confirm sidecar stays on disk, so recovery rolls the operation back.
-    crate::failpoints::maybe_fail("recovery.sidecar_confirm")?;
+    crate::failpoints::maybe_fail(crate::failpoints::names::RECOVERY_SIDECAR_CONFIRM)?;
     for pin in &mut sidecar.tables {
         // Every pinned table MUST have an achieved version. A miss means the
         // pin set and the publish `updates` diverged — fail loudly at the
@@ -489,7 +489,7 @@ pub(crate) async fn delete_sidecar(
     // Failpoint: models a storage delete failure (S3 DeleteObject) in
     // Phase D — callers swallow it (the write already published) and the
     // stale sidecar is healed by the next write or open.
-    crate::failpoints::maybe_fail("recovery.sidecar_delete")?;
+    crate::failpoints::maybe_fail(crate::failpoints::names::RECOVERY_SIDECAR_DELETE)?;
     storage.delete(&handle.sidecar_uri).await
 }
 
@@ -507,7 +507,7 @@ pub(crate) async fn list_sidecars(
     // Failpoint: models a storage list failure (S3 ListObjectsV2) — every
     // consumer (open-time sweep, write-entry heal) must fail loudly
     // rather than silently skipping recovery.
-    crate::failpoints::maybe_fail("recovery.sidecar_list")?;
+    crate::failpoints::maybe_fail(crate::failpoints::names::RECOVERY_SIDECAR_LIST)?;
     let dir = recovery_dir_uri(root_uri);
     let mut uris = storage.list_dir(&dir).await?;
     // Sort by URI so the sweep processes sidecars deterministically.
@@ -928,7 +928,7 @@ async fn discard_orphaned_branch_sidecar(
             .await?;
         // Failpoint: the residual window above — commit appended, audit
         // not yet durable.
-        crate::failpoints::maybe_fail("recovery.orphan_discard_audit_append")?;
+        crate::failpoints::maybe_fail(crate::failpoints::names::RECOVERY_ORPHAN_DISCARD_AUDIT_APPEND)?;
         audit
             .append(RecoveryAuditRecord {
                 graph_commit_id,
@@ -1211,6 +1211,13 @@ async fn process_sidecar(
                 "recovery: rolling forward sidecar (Phase B completed; \
                  Phase C did not land)"
             );
+            // TOCTOU window: between `classify_table` (which read the manifest
+            // pin) and the publish CAS below, a concurrent live writer can
+            // advance the manifest past our expected version. The failpoint
+            // lets a test force that interleave deterministically.
+            crate::failpoints::maybe_fail(
+                crate::failpoints::names::RECOVERY_BEFORE_ROLL_FORWARD_PUBLISH,
+            )?;
             let (new_manifest_version, published_versions) =
                 roll_forward_all(root_uri, sidecar, &states, snapshot).await?;
             // `to_version` records the ACTUAL Lance HEAD published for
@@ -1622,7 +1629,7 @@ async fn record_audit(
     // roll-back publish already landed — the sweep aborts, the sidecar
     // stays, and re-entry records the audit row (see the retry note in
     // the doc comment above).
-    crate::failpoints::maybe_fail("recovery.record_audit")?;
+    crate::failpoints::maybe_fail(crate::failpoints::names::RECOVERY_RECORD_AUDIT)?;
     // Non-main recovery commits must be appended on the sidecar branch's
     // commit graph, otherwise parent_commit_id comes from the global
     // main head. BranchMerge additionally records the source branch's

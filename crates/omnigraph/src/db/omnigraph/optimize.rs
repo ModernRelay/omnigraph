@@ -477,7 +477,7 @@ async fn optimize_one_table(
 
     // Pin the per-writer Phase B → Phase C residual for optimize: Lance HEAD has
     // advanced but the manifest publish below hasn't run.
-    crate::failpoints::maybe_fail("optimize.post_phase_b_pre_manifest_commit")?;
+    crate::failpoints::maybe_fail(crate::failpoints::names::OPTIMIZE_POST_PHASE_B_PRE_MANIFEST_COMMIT)?;
 
     // Phase C: publish the compacted version to the manifest (one CAS commit,
     // expected = the version observed under the queue). On failure the sidecar
@@ -579,7 +579,7 @@ pub async fn cleanup_all_tables(
     let results: Vec<TableCleanupStats> = futures::stream::iter(table_tasks.into_iter())
         .map(|(table_key, full_path)| async move {
             let outcome: Result<RemovalStats> = async {
-                crate::failpoints::maybe_fail("cleanup.table_gc")?;
+                crate::failpoints::maybe_fail(crate::failpoints::names::CLEANUP_TABLE_GC)?;
                 // `cleanup_old_versions` is a Lance-only maintenance API not
                 // surfaced through `TableStorage` — see the optimize path
                 // above for the same rationale. Unwrap via `into_dataset()`.
@@ -737,7 +737,7 @@ pub async fn reconcile_orphaned_branches(db: &Omnigraph) -> Result<BranchReconci
                 }
                 if !branch_snapshots.contains_key(&branch) {
                     let branch_snapshot =
-                        match crate::failpoints::maybe_fail("cleanup.resolve_branch_snapshot") {
+                        match crate::failpoints::maybe_fail(crate::failpoints::names::CLEANUP_RESOLVE_BRANCH_SNAPSHOT) {
                             Ok(()) => db.snapshot_for_branch(Some(&branch)).await,
                             Err(injected) => Err(injected),
                         };
@@ -816,7 +816,7 @@ pub async fn reconcile_orphaned_branches(db: &Omnigraph) -> Result<BranchReconci
                     continue;
                 }
             }
-            let outcome = match crate::failpoints::maybe_fail("cleanup.reconcile_fork") {
+            let outcome = match crate::failpoints::maybe_fail(crate::failpoints::names::CLEANUP_RECONCILE_FORK) {
                 Ok(()) => storage.force_delete_branch(&full_path, &branch).await,
                 Err(injected) => Err(injected),
             };
@@ -946,7 +946,10 @@ mod tests {
             ds.create_branch("feature", base, None).await.unwrap();
         }
 
-        let _fp = ScopedFailPoint::new("cleanup.resolve_branch_snapshot", "return");
+        let _fp = ScopedFailPoint::new(
+            crate::failpoints::names::CLEANUP_RESOLVE_BRANCH_SNAPSHOT,
+            "return",
+        );
         let stats = reconcile_orphaned_branches(&db).await.unwrap();
 
         assert_eq!(

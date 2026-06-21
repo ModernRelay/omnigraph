@@ -1,6 +1,13 @@
 //! Fault-injection hooks for the cluster apply protocol, mirroring the
 //! engine's `omnigraph::failpoints` pattern. With the `failpoints` feature
 //! off, every call site compiles to `Ok(())`.
+//!
+//! Only `maybe_fail` lives here — it returns the cluster's [`Diagnostic`]
+//! error type. The test-side configuration guard is shared: use
+//! [`omnigraph::failpoints::ScopedFailPoint`], which is registry-only
+//! (error-type agnostic) and reachable because the cluster's `failpoints`
+//! feature enables `omnigraph/failpoints`. One `ScopedFailPoint`, in the
+//! lowest crate, avoids a drifting duplicate.
 
 use crate::Diagnostic;
 
@@ -19,38 +26,16 @@ pub(crate) fn maybe_fail(_name: &str) -> Result<(), Diagnostic> {
     Ok(())
 }
 
-#[cfg(feature = "failpoints")]
-pub struct ScopedFailPoint {
-    name: String,
-}
-
-#[cfg(feature = "failpoints")]
-impl ScopedFailPoint {
-    pub fn new(name: &str, action: &str) -> Self {
-        fail::cfg(name, action).expect("configure failpoint");
-        Self {
-            name: name.to_string(),
-        }
-    }
-
-    /// Register a callback failpoint with the same Drop-based cleanup as
-    /// `new`. Without the guard, a panic while the point is active would
-    /// leak the callback into the process-global registry and fire it under
-    /// later tests in the same binary.
-    pub fn with_callback<F>(name: &str, callback: F) -> Self
-    where
-        F: Fn() + Send + Sync + 'static,
-    {
-        fail::cfg_callback(name, callback).expect("configure callback failpoint");
-        Self {
-            name: name.to_string(),
-        }
-    }
-}
-
-#[cfg(feature = "failpoints")]
-impl Drop for ScopedFailPoint {
-    fn drop(&mut self) {
-        fail::remove(&self.name);
-    }
+/// Compile-checked catalog of this crate's apply-protocol failpoint names.
+/// Engine-scoped names referenced from cluster tests live in
+/// [`omnigraph::failpoints::names`].
+pub mod names {
+    pub const CLUSTER_APPLY_AFTER_GRAPH_CREATE: &str = "cluster_apply.after_graph_create";
+    pub const CLUSTER_APPLY_AFTER_GRAPH_DELETE: &str = "cluster_apply.after_graph_delete";
+    pub const CLUSTER_APPLY_AFTER_PAYLOAD_PHASE: &str = "cluster_apply.after_payload_phase";
+    pub const CLUSTER_APPLY_AFTER_SCHEMA_APPLY: &str = "cluster_apply.after_schema_apply";
+    pub const CLUSTER_APPLY_BEFORE_GRAPH_CREATE: &str = "cluster_apply.before_graph_create";
+    pub const CLUSTER_APPLY_BEFORE_GRAPH_DELETE: &str = "cluster_apply.before_graph_delete";
+    pub const CLUSTER_APPLY_BEFORE_SCHEMA_APPLY: &str = "cluster_apply.before_schema_apply";
+    pub const CLUSTER_APPLY_BEFORE_STATE_WRITE: &str = "cluster_apply.before_state_write";
 }
