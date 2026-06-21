@@ -94,16 +94,17 @@ async fn optimize_on_empty_graph_returns_stats_per_table_with_no_changes() {
 
     let stats = db.optimize().await.unwrap();
 
-    // Schema declares 2 nodes + 2 edges = 4 data tables, plus the 2 internal
-    // system tables (`__manifest`, `_graph_commits`) optimize also compacts
-    // (RFC-013 step 2) = 6. Compaction should run on each but find nothing to merge.
-    assert_eq!(stats.len(), 6);
+    // Schema declares 2 nodes + 2 edges = 4 data tables, plus the 3 internal
+    // system tables (`__manifest`, `_graph_commits`, `_graph_commit_actors`) optimize
+    // also compacts (RFC-013 step 2) = 7. Compaction should run on each but find
+    // nothing to merge.
+    assert_eq!(stats.len(), 7);
     for s in &stats {
         assert_eq!(s.fragments_removed, 0, "{} should not remove", s.table_key);
         assert_eq!(s.fragments_added, 0, "{} should not add", s.table_key);
     }
     // The internal tables are present and reported as no-ops on an empty graph.
-    for key in ["__manifest", "_graph_commits"] {
+    for key in ["__manifest", "_graph_commits", "_graph_commit_actors"] {
         let s = stats
             .iter()
             .find(|s| s.table_key == key)
@@ -234,6 +235,64 @@ async fn optimize_tolerates_absent_graph_commits_table() {
     assert!(
         !stats.iter().any(|s| s.table_key == "_graph_commits"),
         "absent _graph_commits must be skipped, not opened (would error)"
+    );
+}
+
+/// `optimize` must stay NON-DESTRUCTIVE on a pre-`auto_cleanup`-fix upgraded graph:
+/// `compact_files` would otherwise fire the dataset's stored `lance.auto_cleanup.*`
+/// hook (version GC) during the compaction commit. Internal-table compaction clears
+/// that stale config first, so no versions are deleted. Without the clear, the
+/// aggressive policy below GCs old versions and the count drops.
+#[tokio::test]
+async fn optimize_clears_stale_auto_cleanup_and_preserves_versions() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut db = init_and_load(&dir).await;
+    for i in 0..5 {
+        mutate_main(
+            &mut db,
+            MUTATION_QUERIES,
+            "insert_person",
+            &mixed_params(&[("$name", &format!("v{i}"))], &[("$age", 30)]),
+        )
+        .await
+        .unwrap();
+    }
+    let manifest_uri = format!("{}/__manifest", dir.path().to_str().unwrap());
+
+    // Simulate an upgraded graph: an aggressive stored auto_cleanup config that, if
+    // it fired during compaction, would GC old versions.
+    {
+        let mut ds = Dataset::open(&manifest_uri).await.unwrap();
+        ds.update_config([
+            ("lance.auto_cleanup.interval", Some("1")),
+            ("lance.auto_cleanup.older_than", Some("0s")),
+        ])
+        .await
+        .unwrap();
+    }
+    let versions_before = Dataset::open(&manifest_uri)
+        .await
+        .unwrap()
+        .versions()
+        .await
+        .unwrap()
+        .len();
+
+    db.optimize().await.unwrap();
+
+    let ds = Dataset::open(&manifest_uri).await.unwrap();
+    // (a) the stale auto_cleanup config was cleared (non-destructive by construction).
+    assert!(
+        !ds.config().keys().any(|k| k.starts_with("lance.auto_cleanup.")),
+        "optimize must clear stale auto_cleanup config; config = {:?}",
+        ds.config()
+    );
+    // (b) no version GC: every pre-optimize version survives (compaction + the
+    // config-clear each add versions, so the count only grows).
+    let versions_after = ds.versions().await.unwrap().len();
+    assert!(
+        versions_after >= versions_before,
+        "optimize must not GC __manifest versions: before={versions_before} after={versions_after}"
     );
 }
 
