@@ -471,7 +471,25 @@ async fn optimize_one_table(
     // uses. `optimize_indices` is an inline-commit residual: lance-6.0.1
     // exposes no uncommitted variant, so like `compact_files` it commits
     // directly and relies on the sidecar for recovery.
+    // Capture the baseline BEFORE the auto-cleanup scrub below, so that if the
+    // scrub is the only thing that commits, `committed` is still true and Phase C
+    // publishes the advanced HEAD (no uncovered HEAD>manifest drift).
     let version_before = ds.version().version;
+
+    // Keep optimize non-destructive on upgraded graphs (same guarantee the
+    // internal-table path makes — see `clear_stale_auto_cleanup_config`).
+    // `compact_files` / `optimize_indices` commit with a default `CommitConfig`
+    // (`skip_auto_cleanup = false`) and expose no skip override, so on a graph
+    // created by a pre-v7 binary (auto_cleanup ON) those commits would fire
+    // Lance's version-GC hook and prune `__manifest`-pinned data-table versions.
+    // Strip the stale config first. We hold the per-table queue, so no concurrent
+    // writer can race this (no retry loop needed, unlike the internal-table path);
+    // any commit it makes is content-preserving and covered by the Optimize
+    // sidecar's loose `post_commit_pin` like the other Phase-B commits.
+    clear_stale_auto_cleanup_config(&mut ds)
+        .await
+        .map_err(|e| OmniError::Lance(e.to_string()))?;
+
     let metrics: CompactionMetrics = if will_compact {
         compact_files(&mut ds, options, None)
             .await
@@ -570,25 +588,29 @@ fn is_retryable_lance_conflict(err: &lance::Error) -> bool {
     )
 }
 
-/// Remove any stored `lance.auto_cleanup.*` config from an internal table so
-/// compaction stays **non-destructive by construction**.
+/// Remove any stored `lance.auto_cleanup.*` config from a table so compaction
+/// stays **non-destructive by construction**. Used by both the internal-table
+/// path ([`compact_internal_table`]) and the data-table path
+/// ([`optimize_one_table`]).
 ///
-/// `compact_files` commits with a default `CommitConfig` (`skip_auto_cleanup =
-/// false`) and `CompactionOptions` exposes no override, so on a dataset whose
-/// stored config has `lance.auto_cleanup.interval` set, the compaction commit
-/// would fire Lance's auto-cleanup hook (version GC). For the internal tables that
-/// is deletion of old `__manifest` / `_graph_commits` / `_graph_commit_actors`
-/// versions — the cleanup-resurrection surface (RFC-013 step 2b / Q8) and the
-/// time-travel history this compaction-only step must preserve. New graphs create
-/// these tables with `auto_cleanup: None` (`manifest/graph.rs`, `commit_graph.rs`)
-/// so there is nothing to clear; only pre-`auto_cleanup`-fix *upgraded* graphs
-/// carry the config. OmniGraph owns version cleanup explicitly (`cleanup`), so
-/// Lance's hook is unwanted regardless — clearing it both makes `optimize`
-/// non-destructive and aligns the table with the new-graph posture. The
-/// `delete_config_keys` commit itself does not GC: the resulting manifest no longer
-/// has the `interval` key, so the post-commit hook is a no-op. Returns whether any
-/// config was cleared. No recovery sidecar: a config update is a single atomic Lance
-/// commit with no HEAD-before-manifest-publish gap.
+/// `compact_files` / `optimize_indices` commit with a default `CommitConfig`
+/// (`skip_auto_cleanup = false`) and `CompactionOptions` exposes no override, so on
+/// a dataset whose stored config has `lance.auto_cleanup.interval` set, the
+/// compaction/reindex commit would fire Lance's auto-cleanup hook (version GC) —
+/// deletion of old versions, including ones `__manifest` pins for snapshots /
+/// time-travel (data tables) or that hold lineage/time-travel state (internal
+/// tables). New graphs create tables with `auto_cleanup: None` (`manifest/graph.rs`,
+/// `commit_graph.rs`, and the data-table create path) so there is nothing to clear;
+/// only pre-`auto_cleanup`-fix *upgraded* graphs carry the config. OmniGraph owns
+/// version cleanup explicitly (`cleanup`), so Lance's hook is unwanted regardless —
+/// clearing it both makes `optimize` non-destructive and aligns the table with the
+/// new-graph posture. The `delete_config_keys` commit itself does not GC: the
+/// resulting manifest no longer has the `interval` key, so the post-commit hook is a
+/// no-op. Returns whether any config was cleared (it advances Lance HEAD iff so).
+/// Recovery coverage differs by caller: the data-table path runs this inside the
+/// Optimize sidecar window; the internal-table path needs none (it commits at HEAD
+/// and is read at HEAD — the strip is a content-preserving config commit, so a crash
+/// leaves the table readable and content-identical, see [`compact_internal_table`]).
 async fn clear_stale_auto_cleanup_config(
     ds: &mut lance::Dataset,
 ) -> std::result::Result<bool, lance::Error> {
@@ -601,8 +623,11 @@ async fn clear_stale_auto_cleanup_config(
     if keys.is_empty() {
         return Ok(false);
     }
-    let refs: Vec<&str> = keys.iter().map(String::as_str).collect();
-    ds.delete_config_keys(&refs).await?;
+    // Merge-update with `None` values to delete the keys — the non-deprecated
+    // replacement for `delete_config_keys` (awaiting the builder merges rather
+    // than replacing the whole config map).
+    let entries: Vec<(&str, Option<&str>)> = keys.iter().map(|k| (k.as_str(), None)).collect();
+    ds.update_config(entries).await?;
     Ok(true)
 }
 
@@ -614,9 +639,14 @@ async fn clear_stale_auto_cleanup_config(
 /// their latest Lance HEAD, so compaction just advances that HEAD and the next
 /// reader transparently observes the compacted version. That makes this path much
 /// simpler than [`optimize_one_table`] — no manifest publish (nothing to publish
-/// to), and no recovery sidecar (a single atomic Lance `compact_files` commit, with
-/// no HEAD-before-publish gap to recover). Internal tables carry no Lance index
-/// (only `object_id`'s unenforced-PK schema metadata), so no `optimize_indices`.
+/// to), and no recovery sidecar. The sidecar-free claim does NOT rest on
+/// single-commit atomicity: `compact_files` can emit a `ReserveFragments` commit
+/// before the final `Rewrite` (and the config strip is a separate commit before
+/// both), so this advances HEAD over one or more commits. It needs no sidecar
+/// because every one of those commits is content-preserving and the table is read
+/// at HEAD — a crash at any point leaves the table readable and content-identical,
+/// and the next `optimize` re-plans. Internal tables carry no Lance index (only
+/// `object_id`'s unenforced-PK schema metadata), so no `optimize_indices`.
 ///
 /// Concurrency: no application lock, but `compact_files` does NOT auto-retry a
 /// semantic conflict — its `Operation::Rewrite` commits through `apply_commit`
