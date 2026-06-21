@@ -857,18 +857,29 @@ to flatten the curve.
      authenticated write path, so it carries the same O(depth) scan as the other
      two and is compacted from one source-of-truth list with per-table existence
      guards). `compact_internal_table` is a separate simpler path than
-     `optimize_one_table`: no manifest publish, no recovery sidecar — a single
-     atomic Lance commit. **Non-destructive by construction:** compaction preserves
-     versions, and before compacting it strips any stale `lance.auto_cleanup.*`
+     `optimize_one_table`: no manifest publish, no recovery sidecar. The sidecar-free
+     property does **not** rest on single-commit atomicity (`compact_files` can emit a
+     `ReserveFragments` commit before the `Rewrite`, and the auto-cleanup strip is a
+     further commit) — it holds because each of those commits is content-preserving
+     and the table is read at HEAD, so a crash leaves it readable and content-identical
+     and the next `optimize` re-plans. **Non-destructive by construction:** compaction
+     preserves versions, and before compacting it strips any stale `lance.auto_cleanup.*`
      config off the table, so a graph created by an older binary (on-by-default GC
      hook) cannot have the commit-time hook silently prune `__manifest`-pinned
      versions during an `optimize` (current binaries store no such config; the
-     strip is the upgrade-path safety net). **Concurrency:** no app lock — but
-     `compact_files` does *not* auto-retry a semantic conflict against a concurrent
-     live writer (Lance prescribes app-rerun for `Rewrite` vs `Update`/`Merge`), so
-     `compact_internal_table` runs an explicit bounded retry loop that reopens fresh
-     and replans on a retryable Lance conflict (the canonical Lance-consumer
-     pattern); the live publisher and the operator's `optimize` both succeed. A
+     strip is the upgrade-path safety net). **The same strip now also runs on the
+     data-table path** (`optimize_one_table`), inside the Optimize sidecar window —
+     so `optimize` is non-destructive on node/edge tables too, not just the internal
+     ones (the data-table path was a pre-existing gap, since `compact_files`/
+     `optimize_indices` there also commit with the auto-cleanup hook enabled). **Concurrency:**
+     no app lock on the internal path — and `compact_files` does *not* auto-retry a
+     semantic conflict against a concurrent live writer (Lance prescribes app-rerun for
+     `Rewrite` vs `Update`/`Merge`), so `compact_internal_table` runs a *bounded*
+     retry loop that reopens fresh and replans on a retryable Lance conflict (the
+     canonical Lance-consumer pattern); transient contention does not fail the live
+     publisher or the operator's `optimize`, but sustained contention past the budget
+     surfaces a loud conflict error (bounded + observable, not an infinite loop). The
+     data-table path instead holds the per-table write queue, so it never contends. A
      coordinator `refresh` after the compaction restores cache coherence. The
      `internal_table_scans_are_flat_in_history` LOCK is now green on the
      **authenticated** write path: on a compacted graph a write's
