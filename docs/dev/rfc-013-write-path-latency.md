@@ -46,6 +46,24 @@ main/branch/node paths (§2.4). It is shippable as a standalone PR first (§9 st
 3a); the rest of the RFC is the constant-factor + correctness + internal-residual
 work layered on the same seam.
 
+**Correction (2026-06-20/21) — the latency metric is `(serial_hops + ops /
+effective_concurrency) · RTT + compute`, measured [M].** Two findings, both from the
+deployed edge binary (steps 1+3a landed) on rustfs behind a latency+concurrency proxy:
+**(i)** under *unlimited* concurrency, wall-clock is a **~110-hop serial backbone,
+depth-invariant** — the depth-driven ops parallelize away (§0(c)); but **(ii)** under
+an **R2-realistic concurrency cap (8)**, the internal-table fragment scan can no longer
+fan out, so **op count re-enters wall-clock** and an uncompacted graph *runs away*
+(per-write ops 1273→3505, wall 6→16s and climbing) — while #291's internal-table
+compaction cuts it ~6× and bounds it (§0(d) A/B). So the design is **vindicated and
+unchanged** (§3/§4.1: capture-once `WriteTxn` + parallel stages → "~2–3 hops" is the
+**serial-backbone** lever, step 3b; bounded history is the **op-count** lever, step 2a)
+— what's corrected is the *measurement framing and step sizing*: op count was the wrong
+latency proxy **only because the harness had unlimited concurrency**; on a capped store
+both `serial_hops` (→ step 3b) and `ops` (→ step 2a) are on the critical path, and
+which dominates is set by `effective_concurrency × fragment_count`. The cost gate
+(§5.1) is corrected to inject a **concurrency cap *and* latency**, and to assert serial
+hops *and* op-count-flat-in-history.
+
 ---
 
 ## 0. Validation ledger (read this first)
@@ -139,6 +157,72 @@ one unpinned item — see §12. Reads, by contrast, are flat in depth
 (`warm_read_cost.rs`, PR #268). This is the O(history)-per-write →
 O(N²)-cumulative behavior the production incident hit.
 
+**(c) Serial-hop measurement [M] — wall-clock is set by the serial backbone, not
+the op count.** §0(b) counts *total* object-store ops; wall-clock is set by the ops
+on the *critical path*. Measured on the **deployed edge binary `f6d2cc03`** (steps
+1+3a landed) via rustfs + a per-op latency proxy, sweeping injected per-op latency `L`
+and reading the slope of `wall = compute + serial_hops · L` (the slope **is** the
+critical-path hop count; the proxy also reports request overlap → parallelism):
+
+| depth | total ops | parallelism | **serial backbone (slope)** | `L=0` wall (compute floor) |
+|---:|---:|---:|---:|---:|
+| ~1  | 107 | 1.0–1.2 | **~109** | 2.15s |
+| ~33 | 338 | 3.4–4.0 | **~108** | 2.45s |
+| ~85 | 716 | 6.0–7.1 | **~113** | 4.27s |
+
+The serial backbone is **~110 hops and depth-INVARIANT**, while total ops grow
+`+~7/depth` (107→716, the §0(b) term) **and parallelize** (parallelism 1→6,
+`max_inflight` up to 65) — so the depth-driven ops add almost nothing to wall-clock.
+`wall ≈ 110·RTT + compute`; the prod 35s direct-main write ≈ 110 hops × ~280ms
+cross-region RTT. Branch ops measured the same way (4-table graph; prod = 217 tables,
+≈50× worse): **branch-create serial ~77, branch-delete ~87** (op counts scale with
+table count → §9 step 6), and **branch-WRITE is worst — 1777 ops, serial ~258, 21s
+compute floor even at `L=0`** = fork-on-first-write (the path 3a did *not* cover; §9
+step 3b + the fork seam), matching prod's 103–138s.
+
+**The methodological correction this forces.** *Op count is a cost/space/compute-floor
+metric; the serial-hop count (latency slope / `num_stages`) is the wall-clock metric.*
+3a's real 90s→35s win (≈2.6×, matching its measured 2.7× op cut) is genuine **because
+it removed *serial* hops** (the per-table data opens were on the critical path). But
+the wall-clock predictor is not serial-hops *alone* — it is
+**`(serial_hops + ops / effective_concurrency) · RTT + compute`**: total op count
+re-enters wall-clock whenever the store **caps concurrency**, because the parallel
+tail can no longer fan out.
+
+**(d) The concurrency-cap A/B [M] — proves op count *is* wall-clock on a capped store,
+and that step 2a is a primary latency lever (not a parallel afterthought).** §0(c) was
+measured on **rustfs with unlimited concurrency** (`max_inflight` reached **129**) — a
+poor proxy for R2, which is connection-capped and rate-limited. Re-running the same
+write through a proxy capped at **8 concurrent** (R2-realistic), with internal-table
+**fragment count as the only variable** (edge binary for writes; the unmerged #291
+binary only to run `optimize`), depth ~130, `__manifest`≈137 fragments:
+
+| state | per-write ops | wall (cap=8, L=20) | trend |
+|---|---:|---:|---|
+| **uncompacted** (`__manifest` 137 frags) | 1273 → 1487 → **3505** | 5.9 → 8.4 → **16.4 s** | **runaway** — each write reads all frags **and appends one more** |
+| **after #291 `optimize`** (137→1 frag) | 275 → 250 → **197** | 6.2 → 5.4 → **3.8 s** | **bounded** |
+
+`optimize` collapsed `__manifest` 137→1, `_graph_commits` 140→1 frags → **~6× fewer
+ops/write and the runaway stopped.** Under unlimited concurrency this delta vanishes
+(the frags fan out); under the cap it is the dominant term. **This is the actual
+mechanism of the prod 35s and its degradation over time** (the `O(N²)` of §0/§2.2):
+on a capped store, every uncompacted write scans all `__manifest`/`_graph_commits`
+fragments *and adds one*, so latency climbs with graph age — exactly what prod shows,
+and exactly what step 2a halts. Prod confirms the scale: `__manifest` 1,739 obj /
+59 MiB, `_graph_commits` 1,848 obj / 23.5 MiB, read per write, **uncompacted** (the
+deployed `f6d2cc03` optimize is node/edge-only — §9 step 2 — so an operator `optimize`
+run on prod cannot touch them; only #291 can).
+
+**Corrected conclusion.** The §2.4 op-count math (`1720→198 ⇒ 258s→30s`) is still
+wrong *as stated* (it assumes full serialization), but the opposite over-correction —
+"step 2 is parallel, so irrelevant to latency" — is **also wrong**, and an artifact of
+the unlimited-concurrency harness. The truth is **concurrency-dependent**: on a capped
+store (R2) the internal-scan op count *is* on the critical path and **step 2a is a
+primary latency lever and the anti-runaway fix**; the residual after compaction
+(~4 s here, mostly compute + the serial backbone) is then **step 3b**'s. Both are
+load-bearing; which dominates is set by `effective_concurrency × fragment_count`. So
+the cost gate (§5.1) must inject a **concurrency cap**, not just latency.
+
 ---
 
 ## 1. Problem & measurements
@@ -191,7 +275,11 @@ Branch ops compound it: `branch create` is a per-table sequential fork loop
 (`fork_branch_from_state`, `table_store.rs:282`); `branch delete` opens a
 snapshot per *other* branch (`ensure_branch_delete_safe`, `omnigraph.rs:1317`)
 and force-deletes per forked table sequentially (`cleanup_deleted_branch_tables`,
-`omnigraph.rs:1359`) **[S]**.
+`omnigraph.rs:1359`) **[S]**. Measured serial backbones (§0(c), edge binary): branch
+create **~77 hops**, delete **~87** (op counts scale with table count → §9 step 6);
+**branch *write* is the worst — 1777 ops, ~258-hop serial backbone, a 21s compute
+floor even at zero RTT** = fork-on-first-write (the path step 3a did not cover; §9 step
+3b + the fork seam), which is why prod branch-load (103–138s) ≫ direct-main (35s).
 
 ---
 
@@ -267,6 +355,31 @@ cost. The correct replacement is *scheduled* compaction **and** version cleanup
 (§9 step 2), **not** re-enabling `auto_cleanup`. Without it, version history (and
 per-write cost) grows forever.
 
+**Why Lance/LanceDB don't have this cost — the internal-table scan is self-inflicted
+[U].** Verified in Lance 7.0.0 source (cargo registry): a Lance dataset's metadata is a
+**per-version manifest *file*** — one self-contained protobuf
+(`format/manifest.rs:35`, `struct Manifest { fragments: Arc<Vec<Fragment>>, … }`) —
+and the current version is resolved **O(1)** via `latest_version_hint.json`
+("O(1)/O(k) latest-version lookup via HEAD", `io/commit.rs:75-79`) or the V2 lexical
+name. Reading current state is **one file read, never a scan over accumulated
+metadata**; old manifests + `_transactions` files are reclaimed by **timestamp GC**
+(`dataset/cleanup.rs`, on by default), and manifest *size* is bounded by data
+compaction. **LanceDB** is multi-table but each table is an *independent* Lance
+dataset; its catalog is a directory/namespace lookup (or a cloud catalog service), not
+a mutable dataset read per write — it does **no cross-table atomic commit**, so it
+needs no coordinating meta-table. Omnigraph's `__manifest`/`_graph_commits` are
+therefore **not a Lance pattern** — they exist only because omnigraph layers a
+**mutable catalog *as a Lance dataset*** over 217 independent tables to get a
+cross-table atomic commit (the lance#7264 "Alternative A"). The whole §2.2 internal
+term is the price of that choice: omnigraph reads its catalog as an **O(fragments)
+dataset scan and appends a fragment per write**, where Lance reads its own metadata
+**O(1)** and prunes by default. Step 2a (compact → 1 fragment) ≈ Lance's single-file
+manifest read; step 2b (cleanup) ≈ Lance's `cleanup_old_versions`; the design simply
+re-derives, on a Lance-dataset catalog, the hygiene Lance treats as table stakes — and
+§8/lance#7264 MTT is the path to delete the catalog and inherit Lance's O(1) metadata
+outright. *(This also raises a design question — should the catalog be a Lance dataset
+at all, vs a single flat CAS'd manifest file? — addressed in §8.)*
+
 ### 2.4 Lance namespace: proper use (why the fix is bypass, not patch)
 
 The upstream Lance Namespace is a **catalog / discovery layer** — "table
@@ -334,9 +447,18 @@ correctness, not drop-in completeness.
 **Step 2 also proven [M].** On the step-3-patched binary at depth ~87, compacting
 the internal tables to 1 fragment each (content-preserving) collapsed their scans:
 `__manifest` 285 → 32 (8.9×), `_graph_commits` 177 → 11 (16×); the step-3 data term
-stayed flat at 4. So **both depth terms are now empirically eliminated** — a depth-87
-single edge drops **~1720 → 198 ops (~8.7×; ≈258 s → ≈30 s at 150 ms/RTT)** with
-both fixes. The internal term is **fragment-scan growth** (`read_manifest_scan` /
+stayed flat at 4. So **both depth *op-count* terms are now empirically eliminated** —
+a depth-87 single edge drops **~1720 → 198 ops (~8.7× in op count)** with both fixes.
+**Wall-clock correction (§0(c)/(d)):** the `≈258 s → ≈30 s` figure was wrong (it
+multiplied *total* ops by RTT as if serial); but the win is **concurrency-dependent**,
+not zero. Under *unlimited* concurrency the depth-driven ops parallelize and this
+op-count cut barely moves wall-clock (the backbone is ~110 hops); **under an
+R2-realistic concurrency cap the same op-count cut is a primary latency win** — the
+§0(d) A/B shows the uncompacted internal scan *runs away* (6→16 s) and #291's
+compaction cuts it ~6× and bounds it. So step 2a is a **latency lever on a capped store
+(R2) and the anti-runaway fix**, *and* a compute-floor / Phase-7-prerequisite / space
+win; step 3b is the lever for the residual serial backbone. The internal term is
+**fragment-scan growth** (`read_manifest_scan` /
 `commit_graph.refresh` read all fragments of the *latest* version), so the fix is
 **compaction** (merge fragments) — distinct from the data table's version-chain term
 that step 3 / version-cleanup handle. `optimize`'s `all_table_keys`
@@ -513,9 +635,24 @@ path and would pass falsely.
 
 The load-bearing rule both Lance and SlateDB mostly miss: **assert the constant is
 flat across N, not just small at one N.** A shallow fixture cannot catch an
-O(history) cost (the §0(b) table is the red baseline). Add a `num_stages`
-(sequential-hop) assertion via a `ThrottledStore` wrapper (Lance's
-`test_commit_iops` setup) so an O(N) listing also blows a wall-time budget.
+O(history) cost (the §0(b) table is the red baseline).
+
+**Two latency LOCKs, and the `ThrottledStore` must cap concurrency *and* inject
+latency (corrected per §0(c)/(d)).** The wall-clock model is
+`(serial_hops + ops/effective_concurrency)·RTT + compute`, so the gate needs **both**
+terms, and an unlimited-concurrency harness measures neither honestly:
+(1) **serial-hop LOCK** (`serial_hops ≤ K`, flat in depth) — read off the
+`wall = compute + serial_hops·L` slope (Lance's `test_commit_iops` setup); catches the
+~110-hop backbone (step 3b's target). (2) **op-count-flat-in-history LOCK** under a
+**capped-concurrency** `ThrottledStore` (e.g. `MAXCONC=8`) — catches the internal-scan
+runaway (§0(d)) that step 2a fixes; *without the cap this LOCK is invisible* because
+the ops fan out (the §0(d) trap). Both are load-bearing: a build can pass the serial-hop
+LOCK and still run away on a capped store if its per-write op count grows with history.
+Run the depth sweep through a `ThrottledStore` that **both** throttles per-op latency
+**and** bounds in-flight concurrency to an R2-realistic value; assert `serial_hops` flat
+*and* `ops` flat in history. (A pure op-count gate under unlimited concurrency would
+*fail a correct build* whose parallel scans grow yet cost no wall-clock, and *pass a
+slow one* — which is why the cap is the load-bearing addition.)
 
 ### 5.2 Tier 2 — wall-clock trend (post-merge / nightly, never a PR gate)
 
@@ -821,6 +958,25 @@ not schedule around MTT landing.** When it ships, `publish`'s *body* swaps
 (stage→CAS→sidecar → `catalog.transaction()`) while `WriteTxn`/`PublishPlan` and
 every verb lowering stay. `iss-863`/`iss-864` **[G]** already scope this spike.
 
+**Why keep `__manifest` as a Lance *dataset* (and compact it) rather than a single flat
+CAS'd manifest file?** The Lance-source comparison (§2.3) makes this an explicit choice
+to defend, not assume. Both reference designs the RFC cites store cross-version metadata
+as **one flat file** read O(1): Lance's per-version manifest (`format/manifest.rs`) and
+SlateDB's monotonic-ID manifest (§13). A flat `graph_manifest.json` updated by
+conditional-PUT would give omnigraph O(1) catalog reads and a natural one-writer CAS
+**with no fragment-scan / compaction / cleanup treadmill** — structurally cheaper than
+the Lance-dataset `__manifest` whose hygiene §9 step 2 exists to maintain. The reason to
+keep the Lance-dataset form is the **MTT seam**: `__manifest` is deliberately shaped so
+`publish` swaps to Lance `catalog.transaction()` when lance#7264 lands, at which point
+Lance owns the cross-table manifest and omnigraph **deletes `__manifest` entirely** —
+inheriting Lance's O(1) metadata rather than maintaining its own. A flat-file rewrite
+would be a detour *away* from that seam, replaced again by MTT. So the trade is
+**"Lance-dataset catalog (compacted, MTT-aligned) over flat-file manifest (locally
+cheaper, off the MTT path)"** — defensible, but it means step 2's compaction/cleanup
+work is a *bridge cost*, justified only by the MTT endgame; if MTT slips materially, the
+flat-file manifest becomes the better target and step 2 stops being a bridge and starts
+being permanent overhead. Worth a revisit checkpoint tied to the lance#7264 timeline.
+
 The MemWAL/LSM ingest tier (`iss-681` **[G]**, `dec-adopt-lance-v7-memwal`) is
 **complementary, not competing, and not in flight** (the `memwal-benefit-analysis`
 branch is an empty placeholder; the real analysis is commit `c9a81266`). MemWAL
@@ -847,10 +1003,21 @@ to flatten the curve.
    `storage.ops` span metric (§5.3) and the bucket-gated `write_cost_s3.rs` opener
    LOCK (step 3a's red→green, S3-only per the §9-3a measurement note).
 2. **Bound history — bring the INTERNAL tables into optimize/cleanup.** Split into
-   a compaction half (the latency win, safe) and a cleanup half (version GC, needs
-   the Q8 watermark). Validated (Lance docs + source): compaction *preserves*
-   versions and is the only term needed to flatten the per-write metadata scan;
-   cleanup is the separate version-deleting op that opens the Q8 hole.
+   a compaction half (safe) and a cleanup half (version GC, needs the Q8 watermark).
+   Validated (Lance docs + source): compaction *preserves* versions and flattens the
+   per-write metadata *op-count* scan; cleanup is the separate version-deleting op that
+   opens the Q8 hole. **Latency role — concurrency-dependent, MEASURED (§0(d)):** the
+   internal fragment scan parallelizes only on a store with free concurrency; under an
+   R2-realistic cap (8) it serializes and an uncompacted graph *runs away* (per-write
+   ops 1273→3505, wall 6→16 s), which #291's compaction cuts ~6× and bounds. So on R2
+   step 2a is **both a primary latency lever and the anti-runaway fix**, *and* the
+   **hard prerequisite for Phase 7 / step 4** (the `graph_head` CAS retry re-runs
+   `load_publish_state`, only acceptable once `__manifest` is compacted), *and* a
+   compute-floor/space win. (On an unlimited-concurrency store the latency component
+   alone vanishes — the depth ops fan out — but R2 is not that store.) **#291 is merged
+   to main but undeployed; the deployed `f6d2cc03` optimize is node/edge-only, so an
+   operator `optimize` on prod cannot compact these tables — deploying #291 + running
+   optimize is the immediate prod win.**
    - **2a. Internal-table compaction. ✅ LANDED.** `optimize` now compacts all
      three internal tables — `__manifest`, `_graph_commits`, **and
      `_graph_commit_actors`** (the actor table grows one fragment per commit on the
@@ -952,6 +1119,12 @@ to flatten the curve.
    `iss-merge-recovery-partial-rollforward`, `iss-recovery-sweep-live-writer-rollback`,
    `iss-934`.)
 6. **Branch ops.** Lance `Clone` for create (`iss-691`); concurrent delete loops.
+   Measured backbones (§0(c)): create ~77, delete ~87 — op counts scale with table
+   count, so `Clone` (O(tables)→O(1)) + `buffer_unordered` delete are the fix.
+   **Note: branch *write* (1777 ops, ~258-hop backbone, 21s compute floor) is NOT a
+   step-6 item** — it is fork-on-first-write stacked on the main backbone, owned by
+   **step 3b + the fork seam** (the path 3a skipped); it is the single worst write
+   shape and should be a named acceptance case for step 3b.
 7. **Freeze** investment in publisher/sidecar/fork internals; pursue the MTT
    seam (`iss-863`/`iss-864`) as the strategic exit.
 
