@@ -296,6 +296,71 @@ async fn optimize_clears_stale_auto_cleanup_and_preserves_versions() {
     );
 }
 
+/// The same non-destructive guarantee on a DATA (node/edge) table, not just the
+/// internal tables. `optimize_one_table` runs `compact_files` / `optimize_indices`
+/// with a default `CommitConfig` (`skip_auto_cleanup = false`); on an upgraded
+/// graph whose Person table still carries the pre-v7 `lance.auto_cleanup.*` config,
+/// those commits would fire Lance's version-GC hook and prune `__manifest`-pinned
+/// data-table versions. The path must strip that config first. Without the strip,
+/// the aggressive policy below GCs old versions and the config survives the run.
+#[tokio::test]
+async fn optimize_clears_stale_auto_cleanup_on_data_tables_too() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path().to_str().unwrap().trim_end_matches('/').to_string();
+    let mut db = init_and_load(&dir).await;
+    add_person_fragments(&mut db).await; // multiple fragments → will_compact
+
+    // Simulate an upgraded graph: set an aggressive stored auto_cleanup config on
+    // the Person table. This is an out-of-band Lance commit (an `UpdateConfig` that
+    // advances HEAD past the manifest), so realign the manifest with a forced repair
+    // first — otherwise optimize skips the table as uncovered drift and never
+    // reaches the scrub. (Forced because UpdateConfig is not verified maintenance.)
+    let (_, _, person_full) = person_manifest_and_head(&db, &root).await;
+    {
+        let mut ds = Dataset::open(&person_full).await.unwrap();
+        ds.update_config([
+            ("lance.auto_cleanup.interval", Some("1")),
+            ("lance.auto_cleanup.older_than", Some("0s")),
+        ])
+        .await
+        .unwrap();
+    }
+    db.repair(RepairOptions {
+        confirm: true,
+        force: true,
+    })
+    .await
+    .unwrap();
+
+    let versions_before = Dataset::open(&person_full)
+        .await
+        .unwrap()
+        .versions()
+        .await
+        .unwrap()
+        .len();
+    let rows_before = count_rows(&db, "node:Person").await;
+
+    db.optimize().await.unwrap();
+
+    let ds = Dataset::open(&person_full).await.unwrap();
+    // (a) the stale auto_cleanup config was cleared (non-destructive by construction).
+    assert!(
+        !ds.config().keys().any(|k| k.starts_with("lance.auto_cleanup.")),
+        "optimize must clear stale auto_cleanup config on data tables; config = {:?}",
+        ds.config()
+    );
+    // (b) no version GC: every pre-optimize version survives (compaction + the
+    // config-clear each add versions, so the count only grows).
+    let versions_after = ds.versions().await.unwrap().len();
+    assert!(
+        versions_after >= versions_before,
+        "optimize must not GC Person versions: before={versions_before} after={versions_after}"
+    );
+    // (c) data is intact — the run rewrote fragments, it did not drop rows.
+    assert_eq!(count_rows(&db, "node:Person").await, rows_before);
+}
+
 // PR3 (Workstream B): an existing scalar index does not cover fragments
 // appended after it was built (build_indices is existence-gated), so those
 // rows are scanned unindexed. `optimize` must fold them back in via Lance's
