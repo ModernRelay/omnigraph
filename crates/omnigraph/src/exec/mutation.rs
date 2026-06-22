@@ -607,6 +607,7 @@ async fn open_table_for_mutation(
     branch: Option<&str>,
     table_key: &str,
     op_kind: crate::db::MutationOpKind,
+    txn: Option<&crate::db::WriteTxn>,
 ) -> Result<(SnapshotHandle, String, Option<String>)> {
     if let Some(prior) = staging.inline_committed.get(table_key) {
         let path = staging.paths.get(table_key).ok_or_else(|| {
@@ -615,6 +616,9 @@ async fn open_table_for_mutation(
                 table_key
             ))
         })?;
+        // The inline-committed reopen does NOT validate the schema contract
+        // (it reopens at the post-inline-commit Lance version directly), so it
+        // takes no `txn` — threading it here would change nothing.
         let ds = db
             .reopen_for_mutation(
                 table_key,
@@ -627,7 +631,7 @@ async fn open_table_for_mutation(
         return Ok((ds, path.full_path.clone(), path.table_branch.clone()));
     }
     let (ds, full_path, table_branch) = db
-        .open_for_mutation_on_branch(branch, table_key, op_kind)
+        .open_for_mutation_on_branch(branch, table_key, op_kind, txn)
         .await?;
     let expected_version = ds.version();
     staging.ensure_path(
@@ -720,14 +724,14 @@ impl Omnigraph {
         params: &ParamMap,
         actor_id: Option<&str>,
     ) -> Result<MutationResult> {
-        self.ensure_schema_state_valid().await?;
         // Converge any pending recovery sidecar (a previously failed
         // writer's Phase B → Phase C residual) before executing: the
         // inline delete path advances Lance HEAD during execution and
         // the staged path's commit-time drift guard refuses
         // sidecar-covered drift, so a long-lived handle must heal here
         // — not at restart. One `list_dir` when no sidecars exist (the
-        // steady state).
+        // steady state). MUST run before `open_write_txn` below — the heal
+        // may advance the manifest, so the pinned base must be captured after.
         self.heal_pending_recovery_sidecars().await?;
         let requested = Self::normalize_branch_name(branch)?;
         // Reject internal `__run__*` / system-prefixed branches at the
@@ -737,6 +741,16 @@ impl Omnigraph {
         if let Some(name) = requested.as_deref() {
             crate::db::ensure_public_branch_ref(name, "mutate")?;
         }
+        // Capture-once write transaction (RFC-013 step 3b). `open_write_txn`
+        // validates the schema contract ONCE (it resolves the branch target,
+        // whose first line is `ensure_schema_state_valid`) and pins the base
+        // snapshot for this write. Threaded as `Some(&txn)` through execution,
+        // staging commit, and the manifest publish so the per-table opens and
+        // the commit-time OCC re-read reuse the pinned base instead of
+        // re-validating the contract at every resolve point. Captured AFTER the
+        // recovery heal (which may advance the manifest) and AFTER `requested`
+        // is known so it pins the post-heal snapshot for the correct branch.
+        let txn = self.open_write_txn(requested.as_deref()).await?;
         let resolved_params = enrich_mutation_params(params)?;
 
         // Per-query staging accumulator. Inserts and updates push batches
@@ -785,7 +799,13 @@ impl Omnigraph {
         };
 
         let exec_result = self
-            .execute_named_mutation(&ir, &resolved_params, requested.as_deref(), &mut staging)
+            .execute_named_mutation(
+                &ir,
+                &resolved_params,
+                requested.as_deref(),
+                &mut staging,
+                Some(&txn),
+            )
             .await;
 
         match exec_result {
@@ -806,6 +826,7 @@ impl Omnigraph {
                         crate::db::manifest::SidecarKind::Mutation,
                         actor_id,
                         fork_queue_guards,
+                        Some(&txn),
                     )
                     .await?;
                 // Failpoint that wedges the documented finalize→publisher
@@ -824,6 +845,7 @@ impl Omnigraph {
                     &updates,
                     &expected_versions,
                     actor_id,
+                    Some(&txn),
                 )
                 .await?;
                 // Phase C succeeded — sidecar can be deleted. If this
@@ -938,6 +960,7 @@ impl Omnigraph {
         params: &ParamMap,
         branch: Option<&str>,
         staging: &mut MutationStaging,
+        txn: Option<&crate::db::WriteTxn>,
     ) -> Result<MutationResult> {
         let mut total = MutationResult::default();
         for op in &ir.ops {
@@ -946,7 +969,7 @@ impl Omnigraph {
                     type_name,
                     assignments,
                 } => {
-                    self.execute_insert(type_name, assignments, params, branch, staging)
+                    self.execute_insert(type_name, assignments, params, branch, staging, txn)
                         .await?
                 }
                 MutationOpIR::Update {
@@ -954,14 +977,16 @@ impl Omnigraph {
                     assignments,
                     predicate,
                 } => {
-                    self.execute_update(type_name, assignments, predicate, params, branch, staging)
-                        .await?
+                    self.execute_update(
+                        type_name, assignments, predicate, params, branch, staging, txn,
+                    )
+                    .await?
                 }
                 MutationOpIR::Delete {
                     type_name,
                     predicate,
                 } => {
-                    self.execute_delete(type_name, predicate, params, branch, staging)
+                    self.execute_delete(type_name, predicate, params, branch, staging, txn)
                         .await?
                 }
             };
@@ -978,6 +1003,7 @@ impl Omnigraph {
         params: &ParamMap,
         branch: Option<&str>,
         staging: &mut MutationStaging,
+        txn: Option<&crate::db::WriteTxn>,
     ) -> Result<MutationResult> {
         let mut resolved: HashMap<String, Literal> = HashMap::new();
         for a in assignments {
@@ -1026,7 +1052,7 @@ impl Omnigraph {
                 crate::db::MutationOpKind::Insert
             };
             let (_ds, _full_path, _table_branch) =
-                open_table_for_mutation(self, staging, branch, &table_key, insert_kind).await?;
+                open_table_for_mutation(self, staging, branch, &table_key, insert_kind, txn).await?;
             // Accumulate. @key inserts go into the Merge stream (so a
             // later update on the same id coalesces correctly); no-key
             // inserts go into the Append stream.
@@ -1066,6 +1092,7 @@ impl Omnigraph {
                 branch,
                 &table_key,
                 crate::db::MutationOpKind::Insert,
+                txn,
             )
             .await?;
             // Accumulate the new edge row. Edge IDs are ULID-generated so
@@ -1098,6 +1125,7 @@ impl Omnigraph {
         params: &ParamMap,
         branch: Option<&str>,
         staging: &mut MutationStaging,
+        txn: Option<&crate::db::WriteTxn>,
     ) -> Result<MutationResult> {
         // Defense in depth: ensure this is a node type
         if !self.catalog().node_types.contains_key(type_name) {
@@ -1128,6 +1156,7 @@ impl Omnigraph {
             branch,
             &table_key,
             crate::db::MutationOpKind::Update,
+            txn,
         )
         .await?;
 
@@ -1228,13 +1257,14 @@ impl Omnigraph {
         params: &ParamMap,
         branch: Option<&str>,
         staging: &mut MutationStaging,
+        txn: Option<&crate::db::WriteTxn>,
     ) -> Result<MutationResult> {
         let is_node = self.catalog().node_types.contains_key(type_name);
         if is_node {
-            self.execute_delete_node(type_name, predicate, params, branch, staging)
+            self.execute_delete_node(type_name, predicate, params, branch, staging, txn)
                 .await
         } else {
-            self.execute_delete_edge(type_name, predicate, params, branch, staging)
+            self.execute_delete_edge(type_name, predicate, params, branch, staging, txn)
                 .await
         }
     }
@@ -1246,6 +1276,7 @@ impl Omnigraph {
         params: &ParamMap,
         branch: Option<&str>,
         staging: &mut MutationStaging,
+        txn: Option<&crate::db::WriteTxn>,
     ) -> Result<MutationResult> {
         let pred_sql = predicate_to_sql(predicate, params, false)?;
 
@@ -1256,6 +1287,7 @@ impl Omnigraph {
             branch,
             &table_key,
             crate::db::MutationOpKind::Delete,
+            txn,
         )
         .await?;
         let initial_version = ds.version();
@@ -1353,6 +1385,7 @@ impl Omnigraph {
                 branch,
                 &edge_table_key,
                 crate::db::MutationOpKind::Delete,
+                txn,
             )
             .await?;
 
@@ -1391,6 +1424,7 @@ impl Omnigraph {
         params: &ParamMap,
         branch: Option<&str>,
         staging: &mut MutationStaging,
+        txn: Option<&crate::db::WriteTxn>,
     ) -> Result<MutationResult> {
         let pred_sql = predicate_to_sql(predicate, params, true)?;
 
@@ -1401,6 +1435,7 @@ impl Omnigraph {
             branch,
             &table_key,
             crate::db::MutationOpKind::Delete,
+            txn,
         )
         .await?;
 

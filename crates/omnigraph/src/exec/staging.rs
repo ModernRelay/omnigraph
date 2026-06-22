@@ -485,6 +485,7 @@ impl StagedMutation {
             Vec<(String, Option<String>)>,
             Vec<tokio::sync::OwnedMutexGuard<()>>,
         )>,
+        txn: Option<&crate::db::WriteTxn>,
     ) -> Result<(
         Vec<SubTableUpdate>,
         HashMap<String, u64>,
@@ -585,7 +586,18 @@ impl StagedMutation {
         // Multi-coordinator deployments (§VI.27 aspirational) get
         // genuine cross-process drift detection from this read for
         // free.
-        let snapshot = db.fresh_snapshot_for_branch(branch).await?;
+        //
+        // This MUST be a FRESH per-branch manifest read (never the warm
+        // cache) for the OCC re-capture below — but with a `WriteTxn` the
+        // schema contract was already validated at capture, so use the
+        // `_unchecked` variant, which drops the redundant
+        // `ensure_schema_state_valid` AND the commit-graph load the OCC read
+        // never consults (a fresh manifest read yields the same `Snapshot`).
+        // Without a txn this is byte-identical to the prior checked call.
+        let snapshot = match txn {
+            Some(_) => db.fresh_snapshot_for_branch_unchecked(branch).await?,
+            None => db.fresh_snapshot_for_branch(branch).await?,
+        };
         for entry in staged.iter_mut() {
             let current = snapshot
                 .entry(&entry.table_key)

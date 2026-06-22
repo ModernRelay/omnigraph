@@ -187,7 +187,10 @@ impl Omnigraph {
             &omnigraph_policy::ResourceScope::Branch(branch.to_string()),
             actor_id,
         )?;
-        self.ensure_schema_state_valid().await?;
+        // Schema-contract validation is captured ONCE per write via the
+        // `WriteTxn` opened in `load_jsonl_reader` (after branch resolution).
+        // The redundant `ensure_schema_state_valid` that used to run here is
+        // subsumed by `open_write_txn`'s `resolved_branch_target` call.
         // Converge any pending recovery sidecar (a previously failed
         // writer's Phase B → Phase C residual) before staging anything:
         // without this, sidecar-covered drift wedges every load on the
@@ -397,7 +400,16 @@ async fn load_jsonl_reader<R: BufRead>(
     // inline path.
 
     let mut result = LoadResult::default();
-    let snapshot = db.snapshot_for_branch(branch).await?;
+    // Capture-once write transaction (RFC-013 step 3b). `open_write_txn`
+    // validates the schema contract ONCE and pins the base snapshot. Threaded
+    // as `Some(&txn)` through the per-table opens and the manifest publish so
+    // each resolve point reuses the pinned base instead of re-validating the
+    // contract. The branch already exists here (fork-if-missing ran in
+    // `load_as` before this), so this captures the post-fork snapshot. The
+    // load's own base read (`db.snapshot_for_branch` previously) is the same
+    // per-branch snapshot, so reuse `txn.base` for it — dropping a validation.
+    let txn = db.open_write_txn(branch).await?;
+    let snapshot = txn.base.clone();
     let mut staging = MutationStaging::default();
     let pending_mode = match mode {
         LoadMode::Merge => PendingMode::Merge,
@@ -482,7 +494,7 @@ async fn load_jsonl_reader<R: BufRead>(
     // delayed until after all validation succeeds.
     for (type_name, table_key, batch, loaded_count) in prepared_nodes {
         let (ds, full_path, table_branch) = db
-            .open_for_mutation_on_branch(branch, &table_key, load_op_kind)
+            .open_for_mutation_on_branch(branch, &table_key, load_op_kind, Some(&txn))
             .await?;
         let expected_version = ds.version();
         staging.ensure_path(
@@ -554,7 +566,7 @@ async fn load_jsonl_reader<R: BufRead>(
     // Phase 2e: accumulate every edge type. Same dispatch as Phase 2b.
     for (edge_name, table_key, batch, loaded_count) in prepared_edges {
         let (ds, full_path, table_branch) = db
-            .open_for_mutation_on_branch(branch, &table_key, load_op_kind)
+            .open_for_mutation_on_branch(branch, &table_key, load_op_kind, Some(&txn))
             .await?;
         let expected_version = ds.version();
         staging.ensure_path(
@@ -596,6 +608,7 @@ async fn load_jsonl_reader<R: BufRead>(
             crate::db::manifest::SidecarKind::Load,
             actor_id,
             fork_queue_guards,
+            Some(&txn),
         )
         .await?;
     // Same finalize → publisher residual as mutations: per-table
@@ -603,8 +616,14 @@ async fn load_jsonl_reader<R: BufRead>(
     // publish has not run yet. Reuse the mutation failpoint name so
     // one failpoint pins the shared `MutationStaging` boundary.
     crate::failpoints::maybe_fail("mutation.post_finalize_pre_publisher")?;
-    db.commit_updates_on_branch_with_expected(branch, &updates, &expected_versions, actor_id)
-        .await?;
+    db.commit_updates_on_branch_with_expected(
+        branch,
+        &updates,
+        &expected_versions,
+        actor_id,
+        Some(&txn),
+    )
+    .await?;
     // The recovery sidecar protects the per-table commit_staged →
     // manifest publish window. Phase C succeeded — clean up
     // best-effort: failing the user here would error out a write

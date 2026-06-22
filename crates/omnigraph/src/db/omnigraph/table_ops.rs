@@ -499,7 +499,10 @@ pub(super) async fn open_for_mutation(
         .await
         .current_branch()
         .map(str::to_string);
-    open_for_mutation_on_branch(db, current_branch.as_deref(), table_key, op_kind).await
+    // `open_for_mutation` is the no-txn entry (branch merge). Passing `None`
+    // keeps the exact pre-WriteTxn code path (a fresh `resolved_branch_target`
+    // that re-validates the schema).
+    open_for_mutation_on_branch(db, current_branch.as_deref(), table_key, op_kind, None).await
 }
 
 /// Open a sub-table for mutation. The `op_kind` selects the strict-vs-relaxed
@@ -513,15 +516,27 @@ pub(super) async fn open_for_mutation_on_branch(
     branch: Option<&str>,
     table_key: &str,
     op_kind: crate::db::MutationOpKind,
+    txn: Option<&crate::db::WriteTxn>,
 ) -> Result<(SnapshotHandle, String, Option<String>)> {
     db.ensure_schema_apply_not_locked("write").await?;
-    let resolved = db.resolved_branch_target(branch).await?;
-    let entry = resolved
-        .snapshot
+    // Source the resolved (snapshot, branch). With a `WriteTxn` the contract was
+    // validated once at capture, so use the pinned base + resolved branch instead
+    // of `resolved_branch_target` (which re-runs `ensure_schema_state_valid`). The
+    // base is the same fresh per-branch manifest read the no-txn path would have
+    // resolved — only the redundant schema re-validation is dropped. Without a txn
+    // this is byte-identical to the prior `resolved_branch_target` call.
+    let (snapshot, resolved_branch) = match txn {
+        Some(txn) => (txn.base.clone(), txn.branch.clone()),
+        None => {
+            let resolved = db.resolved_branch_target(branch).await?;
+            (resolved.snapshot, resolved.branch)
+        }
+    };
+    let entry = snapshot
         .entry(table_key)
         .ok_or_else(|| OmniError::manifest(format!("no manifest entry for {}", table_key)))?;
     let full_path = format!("{}/{}", db.root_uri, entry.table_path);
-    match resolved.branch.as_deref() {
+    match resolved_branch.as_deref() {
         None => {
             let ds = db
                 .storage()
@@ -1065,12 +1080,22 @@ async fn prepare_updates_for_commit(
     db: &Omnigraph,
     branch: Option<&str>,
     updates: &[crate::db::SubTableUpdate],
+    txn: Option<&crate::db::WriteTxn>,
 ) -> Result<Vec<crate::db::SubTableUpdate>> {
     if updates.is_empty() {
         return Ok(Vec::new());
     }
 
-    let snapshot = db.snapshot_for_branch(branch).await?;
+    // With a `WriteTxn` the schema contract was validated once at capture, so
+    // reuse the pinned base entries (same per-branch manifest snapshot) instead
+    // of `snapshot_for_branch` (which re-runs `ensure_schema_state_valid`). Only
+    // the `entry(table_key).table_path` is read out of it here, identical to the
+    // no-txn path; the post-`commit_staged` index build below still reopens the
+    // dataset at its just-committed version. Without a txn, byte-identical.
+    let snapshot = match txn {
+        Some(txn) => txn.base.clone(),
+        None => db.snapshot_for_branch(branch).await?,
+    };
     let mut prepared = Vec::with_capacity(updates.len());
 
     for update in updates {
@@ -1237,7 +1262,7 @@ pub(super) async fn commit_updates(
         .await
         .current_branch()
         .map(str::to_string);
-    let prepared = prepare_updates_for_commit(db, current_branch.as_deref(), updates).await?;
+    let prepared = prepare_updates_for_commit(db, current_branch.as_deref(), updates, None).await?;
     commit_prepared_updates(db, &prepared, None).await
 }
 
@@ -1281,9 +1306,10 @@ pub(super) async fn commit_updates_on_branch_with_expected(
     updates: &[crate::db::SubTableUpdate],
     expected_table_versions: &std::collections::HashMap<String, u64>,
     actor_id: Option<&str>,
+    txn: Option<&crate::db::WriteTxn>,
 ) -> Result<u64> {
     db.ensure_schema_apply_not_locked("write commit").await?;
-    let prepared = prepare_updates_for_commit(db, branch, updates).await?;
+    let prepared = prepare_updates_for_commit(db, branch, updates, txn).await?;
     commit_prepared_updates_on_branch_with_expected(
         db,
         branch,

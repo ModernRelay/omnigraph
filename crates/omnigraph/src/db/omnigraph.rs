@@ -86,18 +86,27 @@ pub struct SchemaApplyPreview {
 /// general "no re-resolution" handle — the commit-time OCC re-read, the live-HEAD
 /// drift probe, and the fork-authority reads stay fresh (correctness machinery).
 ///
-/// SCAFFOLDING: the carrier + `open_write_txn` are landed; the next pass threads
-/// `Option<&WriteTxn>` through `open_for_mutation_on_branch` / staging (non-strict
-/// bound-branch path) to open the base once from the pinned entry with the warm
-/// session (a session-aware pinned opener returning a `SnapshotHandle`) and skip the
-/// per-table schema re-validation — turning the two RED cost gates green.
-#[allow(dead_code)]
+/// Threaded as `Option<&WriteTxn>` through the mutate/load write chain
+/// (`open_for_mutation_on_branch`, `commit_all`, `commit_updates_on_branch_with_expected`)
+/// so a single write validates the schema contract EXACTLY ONCE — at capture. When
+/// present, the per-table resolves source the pinned `base` entry instead of calling
+/// `resolved_branch_target` / `snapshot_for_branch` / `fresh_snapshot_for_branch`
+/// (each of which re-runs `ensure_schema_state_valid`). When absent (`None` — every
+/// non-mutate/load caller), every threaded function behaves byte-identically to
+/// before. The carrier never removes a version guard or changes which dataset version
+/// the per-table open targets: strict ops keep `open_dataset_head_for_write` +
+/// `ensure_expected_version`, and the commit-time OCC re-read still opens a fresh
+/// manifest snapshot (via `fresh_snapshot_for_branch_unchecked`) — only the redundant
+/// schema re-validation is dropped.
 pub(crate) struct WriteTxn {
     /// The resolved branch (`None` = main).
     pub(crate) branch: Option<String>,
     /// The pinned base snapshot (per-table location + version + e_tag), captured once.
     pub(crate) base: Snapshot,
-    /// The shared per-graph Session, threaded into the base opens to warm caches.
+    /// The shared per-graph Session, captured here so the follow-up change that
+    /// makes the per-table base opens session-aware can reuse it. Not read yet by
+    /// the schema-once threading (which only uses `base` + `branch`).
+    #[allow(dead_code)]
     pub(crate) session: Arc<lance::session::Session>,
 }
 
@@ -765,7 +774,6 @@ impl Omnigraph {
     /// session — instead of re-resolving (re-validating the schema) and cold-opening
     /// HEAD per table. Strict ops, the fork path, and the commit-time OCC re-read keep
     /// their fresh reads (those are correctness machinery — see the handoff doc).
-    #[allow(dead_code)]
     pub(crate) async fn open_write_txn(&self, branch: Option<&str>) -> Result<WriteTxn> {
         let resolved = self.resolved_branch_target(branch).await?;
         Ok(WriteTxn {
@@ -809,12 +817,39 @@ impl Omnigraph {
 
     pub(crate) async fn fresh_snapshot_for_branch(&self, branch: Option<&str>) -> Result<Snapshot> {
         self.ensure_schema_state_valid().await?;
-        let requested = ReadTarget::Branch(branch.unwrap_or("main").to_string());
-        let coord = self.coordinator.read().await;
-        coord
-            .resolve_target(&requested)
-            .await
-            .map(|resolved| resolved.snapshot)
+        self.fresh_snapshot_for_branch_unchecked(branch).await
+    }
+
+    /// Fresh per-branch manifest snapshot WITHOUT the schema-contract
+    /// re-validation. Identical OCC freshness to [`fresh_snapshot_for_branch`]
+    /// — a fresh manifest re-read from storage, never the warm cache — only the
+    /// redundant `ensure_schema_state_valid` is dropped. Used inside a single
+    /// write once a `WriteTxn` has already validated the contract at capture: the
+    /// commit-time drift re-read needs the live manifest, not a second contract
+    /// read. Callers with no `WriteTxn` MUST use the checked variant.
+    ///
+    /// Reads the manifest directly via `ManifestCoordinator` rather than
+    /// `resolve_target`. The OCC re-read uses only the returned `Snapshot`
+    /// (per-table location + version), which `ManifestCoordinator::open().snapshot()`
+    /// produces identically to `GraphCoordinator::open(...).snapshot()` — but
+    /// `resolve_target` additionally opens the commit graph (an extra
+    /// `_graph_commits.lance` probe) the OCC read never consults. Skipping that
+    /// load is a pure read-cost reduction, not a freshness change. The checked
+    /// `fresh_snapshot_for_branch` delegates here, so its no-`txn` callers
+    /// (commit_all's None arm, optimize, repair, fork reclaim) get the same
+    /// identical `Snapshot` via this lighter manifest-only read; they consume
+    /// only the snapshot and never relied on the commit-graph side load.
+    pub(crate) async fn fresh_snapshot_for_branch_unchecked(
+        &self,
+        branch: Option<&str>,
+    ) -> Result<Snapshot> {
+        let manifest = match branch {
+            Some(branch) => {
+                crate::db::manifest::ManifestCoordinator::open_at_branch(self.uri(), branch).await?
+            }
+            None => crate::db::manifest::ManifestCoordinator::open(self.uri()).await?,
+        };
+        Ok(manifest.snapshot())
     }
 
     pub(crate) async fn version(&self) -> u64 {
@@ -1647,8 +1682,9 @@ impl Omnigraph {
         branch: Option<&str>,
         table_key: &str,
         op_kind: crate::db::MutationOpKind,
+        txn: Option<&crate::db::WriteTxn>,
     ) -> Result<(SnapshotHandle, String, Option<String>)> {
-        table_ops::open_for_mutation_on_branch(self, branch, table_key, op_kind).await
+        table_ops::open_for_mutation_on_branch(self, branch, table_key, op_kind, txn).await
     }
 
     /// Fork `table_key` onto `active_branch` from the given source state,
@@ -1767,6 +1803,7 @@ impl Omnigraph {
         updates: &[crate::db::SubTableUpdate],
         expected_table_versions: &std::collections::HashMap<String, u64>,
         actor_id: Option<&str>,
+        txn: Option<&crate::db::WriteTxn>,
     ) -> Result<u64> {
         table_ops::commit_updates_on_branch_with_expected(
             self,
@@ -1774,6 +1811,7 @@ impl Omnigraph {
             updates,
             expected_table_versions,
             actor_id,
+            txn,
         )
         .await
     }
