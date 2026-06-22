@@ -24,10 +24,10 @@
 mod helpers;
 
 use helpers::cost::{
-    IoCounts, assert_flat, assert_grows, local_graph, measure_insert, measure_insert_as,
+    IoCounts, assert_flat, assert_grows, local_graph, measure, measure_insert, measure_insert_as,
     measure_with_staged,
 };
-use helpers::{MUTATION_QUERIES, commit_many, commit_many_as, mixed_params};
+use helpers::{MUTATION_QUERIES, commit_many, commit_many_as, init_and_load, mixed_params};
 
 // ── (A) The internal-table LOCK — the acceptance test for step 2 (compaction) ──
 //
@@ -168,4 +168,78 @@ async fn keyed_insert_routes_through_merge_insert_only() {
     assert_eq!(staged.stage_merge_insert, 1, "keyed Person insert stages one merge-insert");
     assert_eq!(staged.stage_append, 0, "keyed insert must not stage_append");
     assert_eq!(staged.create_vector_index, 0, "no inline vector-index build on a plain insert");
+}
+
+// ── (D) Step-3b capture-once fitness asserts (RED today → GREEN after WriteTxn) ──
+
+/// A write must validate the schema contract EXACTLY ONCE (3 `read_text` + 2 `exists`).
+/// Today the write path re-validates at every resolve point (entry, per-table
+/// `resolved_branch_target`, commit-time `fresh_snapshot_for_branch`), so the delta is
+/// a multiple of that. Step 3b's `WriteTxn` validates once and threads it. The shape is
+/// the write twin of `warm_read_cost.rs::warm_query_validates_schema_contract_once`,
+/// built with ZERO production change via the counting storage adapter.
+#[tokio::test]
+async fn write_validates_schema_contract_once() {
+    use omnigraph::instrumentation::CountingStorageAdapter;
+    use omnigraph::storage::storage_for_uri;
+
+    let dir = tempfile::tempdir().unwrap();
+    let _ = init_and_load(&dir).await;
+    let uri = dir.path().to_str().unwrap();
+    let (adapter, counts) = CountingStorageAdapter::new(storage_for_uri(uri).unwrap());
+    let db = omnigraph::db::Omnigraph::open_with_storage(uri, adapter)
+        .await
+        .unwrap();
+
+    let before_read_text = counts.read_text();
+    let before_exists = counts.exists();
+    db.mutate(
+        "main",
+        MUTATION_QUERIES,
+        "insert_person",
+        &mixed_params(&[("$name", "schema_once")], &[("$age", 30)]),
+    )
+    .await
+    .unwrap();
+
+    let read_text_delta = counts.read_text() - before_read_text;
+    let exists_delta = counts.exists() - before_exists;
+    eprintln!("schema-contract reads on one write: read_text={read_text_delta} exists={exists_delta}");
+    assert_eq!(
+        read_text_delta, 3,
+        "a write must validate the schema contract once (3 reads), not N times",
+    );
+    assert_eq!(
+        exists_delta, 2,
+        "a write must probe contract-file existence once (2 probes), not N times",
+    );
+}
+
+/// A keyed single-table write must open its table AT MOST ONCE. Today it opens ~4×
+/// (accumulation, staging, commit drift-guard, publish-prepare/index-build), each a
+/// fresh cold `Dataset::open`. Step 3b opens the base once (with the shared Session),
+/// threads the commit-return handle, and replaces the drift-guard open with a cheap
+/// `latest_version_id` probe — collapsing to 1 open. Counted by the exact `open_count`
+/// chokepoint probe (`forbidden_apis` guarantees every write open routes through it).
+#[tokio::test]
+async fn keyed_insert_opens_table_at_most_once() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut db = local_graph(&dir).await;
+    let io = {
+        let (res, io) = measure(db.mutate(
+            "main",
+            MUTATION_QUERIES,
+            "insert_person",
+            &mixed_params(&[("$name", "opens")], &[("$age", 30)]),
+        ))
+        .await;
+        res.unwrap();
+        io
+    };
+    eprintln!("open_count for a single-table keyed insert = {}", io.open_count);
+    assert!(
+        io.open_count <= 1,
+        "a keyed single-table write must open its table at most once, got {}",
+        io.open_count,
+    );
 }

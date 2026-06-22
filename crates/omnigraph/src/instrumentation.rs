@@ -43,6 +43,13 @@ pub struct QueryIoProbes {
     /// handle cache (Fix 3) serves them.
     pub table_wrapper: Option<Arc<dyn WrappingObjectStore>>,
     pub probe_count: Arc<AtomicU64>,
+    /// Counts table-open CALLS through the two instrumented chokepoints
+    /// (`open_dataset_tracked` / `open_table_dataset`). Unlike the opener-read
+    /// term (which mixes with the merge-insert/RI scan on the write path), this is
+    /// an exact open-invocation count — lets a write cost test assert
+    /// `opens <= |touched_tables|` (RFC-013 step 3b). `forbidden_apis` guarantees
+    /// every write-path open routes through these chokepoints, so the count is complete.
+    pub open_count: Arc<AtomicU64>,
 }
 
 tokio::task_local! {
@@ -78,6 +85,12 @@ pub(crate) fn table_wrapper() -> Option<Arc<dyn WrappingObjectStore>> {
 /// No-op when no probes are installed (production).
 pub(crate) fn record_probe() {
     let _ = current(|p| p.probe_count.fetch_add(1, Ordering::Relaxed));
+}
+
+/// Record one table-open call against the active per-query probes. No-op in
+/// production. Called at both open chokepoints so a cost test can count opens.
+pub(crate) fn record_open() {
+    let _ = current(|p| p.open_count.fetch_add(1, Ordering::Relaxed));
 }
 
 /// Per-operation staged-write counts, installed for a task via
@@ -177,6 +190,7 @@ pub(crate) async fn open_dataset_tracked(
     uri: &str,
     wrapper: Option<Arc<dyn WrappingObjectStore>>,
 ) -> Result<Dataset> {
+    record_open();
     let result = match wrapper {
         None => Dataset::open(uri).await,
         Some(wrapper) => {
@@ -203,6 +217,7 @@ pub(crate) async fn open_table_dataset(
     version: u64,
     session: Option<&Arc<lance::session::Session>>,
 ) -> Result<Dataset> {
+    record_open();
     let mut builder = DatasetBuilder::from_uri(location).with_version(version);
     if let Some(session) = session {
         builder = builder.with_session(session.clone());

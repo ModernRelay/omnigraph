@@ -58,6 +58,10 @@ pub struct IoCounts {
     pub commit_graph_reads: u64,
     /// Version-probe invocations (the cheap freshness check).
     pub version_probes: u64,
+    /// Table-open CALL count through the two instrumented chokepoints — an exact
+    /// open-invocation count (not the opener-read term). Step-3b target:
+    /// `open_count <= |touched_tables|` for a write.
+    pub open_count: u64,
 }
 
 impl IoCounts {
@@ -225,6 +229,7 @@ struct ProbeHandles {
     commit_graph: IOTracker,
     table: PrefixCounter,
     probe_count: Arc<AtomicU64>,
+    open_count: Arc<AtomicU64>,
 }
 
 impl ProbeHandles {
@@ -234,6 +239,7 @@ impl ProbeHandles {
             commit_graph: IOTracker::default(),
             table: PrefixCounter::default(),
             probe_count: Arc::new(AtomicU64::new(0)),
+            open_count: Arc::new(AtomicU64::new(0)),
         };
         let probes = QueryIoProbes {
             manifest_wrapper: Some(Arc::new(h.manifest.clone()) as Arc<dyn WrappingObjectStore>),
@@ -242,6 +248,7 @@ impl ProbeHandles {
             ),
             table_wrapper: Some(Arc::new(h.table.clone()) as Arc<dyn WrappingObjectStore>),
             probe_count: Arc::clone(&h.probe_count),
+            open_count: Arc::clone(&h.open_count),
         };
         (probes, h)
     }
@@ -256,6 +263,7 @@ impl ProbeHandles {
             manifest_reads: self.manifest.stats().read_iops,
             commit_graph_reads: self.commit_graph.stats().read_iops,
             version_probes: self.probe_count.load(Ordering::Relaxed),
+            open_count: self.open_count.load(Ordering::Relaxed),
         }
     }
 }
