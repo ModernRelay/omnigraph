@@ -462,6 +462,11 @@ async fn optimize_one_table(
     let handle =
         crate::db::manifest::write_sidecar(db.root_uri(), db.storage_adapter(), &sidecar).await?;
 
+    // Test seam: a concurrent (cross-process) writer can interleave here, before
+    // any of our Phase-B commits land, to exercise the Lance `Rewrite`-vs-`Update`
+    // overlap conflict the reopen+replan loop must survive.
+    crate::failpoints::maybe_fail("optimize.before_compact")?;
+
     // Phase B: compaction (if any) then incremental index optimize — both
     // advance Lance HEAD inside the sidecar window. `compact_files` rewrites
     // fragments and drops them from existing index segments' coverage;
