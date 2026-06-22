@@ -3089,6 +3089,7 @@ edge WorksAt: Person -> Company
 /// forward on next open so the manifest tracks the Lance HEAD — and the healed
 /// table must then accept a schema apply (the original bug's victim).
 #[tokio::test]
+#[serial(optimize)]
 async fn optimize_phase_b_failure_recovered_on_next_open() {
     let _scenario = FailScenario::setup();
     let dir = tempfile::tempdir().unwrap();
@@ -3176,6 +3177,242 @@ async fn optimize_phase_b_failure_recovered_on_next_open() {
     db.apply_schema(&desired)
         .await
         .expect("schema apply after optimize recovery must succeed");
+}
+
+/// Cross-process race (the prod bug): a served write advances the manifest on the
+/// same table while a SEPARATE `optimize` process is paused between its compaction
+/// and its manifest publish. The in-process write queue does NOT serialize across
+/// processes, so optimize's equality-CAS publish (expected = its pre-compaction
+/// version) finds the manifest already advanced. optimize must CONVERGE — the
+/// concurrent write built on top of the compacted HEAD, so the compaction is
+/// already reflected — not fail with "expected X but current Y". RED before the
+/// monotonic-publish fix.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[serial(optimize)]
+async fn optimize_survives_concurrent_insert_advancing_manifest() {
+    let _scenario = FailScenario::setup();
+    let dir = tempfile::tempdir().unwrap();
+    let uri = dir.path().to_str().unwrap().to_string();
+
+    {
+        let db = Omnigraph::init(&uri, helpers::TEST_SCHEMA).await.unwrap();
+        for (name, age) in [("alice", 30), ("bob", 31), ("carol", 32), ("dave", 33)] {
+            db.mutate(
+                "main",
+                MUTATION_QUERIES,
+                "insert_person",
+                &mixed_params(&[("$name", name)], &[("$age", age)]),
+            )
+            .await
+            .unwrap();
+        }
+    }
+
+    // Pause optimize BEFORE it compacts, so the concurrent insert lands while
+    // HEAD == manifest (no in-flight optimize drift for the writer to trip on); the
+    // insert advances the manifest, then optimize compacts on top and must converge
+    // its publish over the advanced manifest rather than fail the equality CAS.
+    let failpoint = ScopedFailPoint::new("optimize.before_compact", "pause");
+
+    let uri_opt = uri.clone();
+    let optimize = tokio::spawn(async move {
+        let db = Omnigraph::open(&uri_opt).await.unwrap();
+        db.optimize().await
+    });
+
+    // Wait until optimize reaches the pause (its Optimize sidecar is on disk).
+    assert!(
+        wait_for_sidecar(dir.path()).await,
+        "optimize never reached the pre-compact pause",
+    );
+
+    // Concurrent insert on the SAME table via a SEPARATE handle (= separate
+    // in-process write queue = a different process) advances the manifest.
+    {
+        let db_b = Omnigraph::open(&uri).await.unwrap();
+        db_b.mutate(
+            "main",
+            MUTATION_QUERIES,
+            "insert_person",
+            &mixed_params(&[("$name", "eve")], &[("$age", 34)]),
+        )
+        .await
+        .unwrap();
+    }
+
+    drop(failpoint); // release optimize
+    let result = tokio::time::timeout(std::time::Duration::from_secs(20), optimize)
+        .await
+        .expect("optimize task hung")
+        .unwrap();
+    result.expect("optimize must survive a concurrent same-table write (cross-process)");
+
+    // No lost write: 4 seed + eve all present; graph remains re-optimizable.
+    let db = Omnigraph::open(&uri).await.unwrap();
+    assert_eq!(
+        helpers::count_rows(&db, "node:Person").await,
+        5,
+        "concurrent insert must not be lost",
+    );
+    db.optimize()
+        .await
+        .expect("graph must remain healthy / re-optimizable");
+}
+
+/// Cross-process race: a served DELETE commits on the same table while a SEPARATE
+/// `optimize` process is parked just before its compaction. Lance rebases the
+/// compaction past the delete cleanly (so this surfaces as a manifest-CAS mismatch
+/// at publish, not a Lance `Rewrite` conflict — the genuine `Rewrite`-vs-`Rewrite`
+/// overlap is the rarer many-fragment/concurrent-compaction case, covered by the
+/// shared `is_retryable_lance_conflict` retry the internal-table path already
+/// exercises). optimize must converge its publish over the advanced manifest and
+/// preserve the delete. RED before the fix.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[serial(optimize)]
+async fn optimize_survives_concurrent_delete_before_compaction() {
+    let _scenario = FailScenario::setup();
+    let dir = tempfile::tempdir().unwrap();
+    let uri = dir.path().to_str().unwrap().to_string();
+
+    {
+        let db = Omnigraph::init(&uri, helpers::TEST_SCHEMA).await.unwrap();
+        for (name, age) in [("alice", 30), ("bob", 31), ("carol", 32), ("dave", 33)] {
+            db.mutate(
+                "main",
+                MUTATION_QUERIES,
+                "insert_person",
+                &mixed_params(&[("$name", name)], &[("$age", age)]),
+            )
+            .await
+            .unwrap();
+        }
+    }
+
+    // Pause optimize BEFORE its compaction commits.
+    let failpoint = ScopedFailPoint::new("optimize.before_compact", "pause");
+
+    let uri_opt = uri.clone();
+    let optimize = tokio::spawn(async move {
+        let db = Omnigraph::open(&uri_opt).await.unwrap();
+        db.optimize().await
+    });
+
+    assert!(
+        wait_for_sidecar(dir.path()).await,
+        "optimize never reached the pre-compact pause",
+    );
+
+    // Concurrent DELETE of an existing row writes a deletion vector onto the
+    // fragment optimize is about to compact → optimize's Rewrite overlap-conflicts
+    // at the Lance level ("Rewrite … preempted by concurrent Delete/Update").
+    {
+        let db_b = Omnigraph::open(&uri).await.unwrap();
+        db_b.mutate(
+            "main",
+            MUTATION_QUERIES,
+            "remove_person",
+            &mixed_params(&[("$name", "alice")], &[]),
+        )
+        .await
+        .unwrap();
+    }
+
+    drop(failpoint); // release optimize
+    let result = tokio::time::timeout(std::time::Duration::from_secs(20), optimize)
+        .await
+        .expect("optimize task hung")
+        .unwrap();
+    result.expect("optimize must reopen+replan past a concurrent overlapping delete");
+
+    // No lost write: alice's delete persisted (3 rows); graph remains re-optimizable.
+    let db = Omnigraph::open(&uri).await.unwrap();
+    assert_eq!(
+        helpers::count_rows(&db, "node:Person").await,
+        3,
+        "the concurrent delete must persist (alice removed)",
+    );
+    db.optimize()
+        .await
+        .expect("graph must remain healthy / re-optimizable");
+}
+
+/// Regression: the outer compaction retry loop must NOT misclassify optimize's OWN
+/// committed Phase-B work as external drift. Attempt 1 compacts (HEAD → V+1); if a
+/// LATER Phase-B op (reindex) then hits a retryable conflict, the reopened attempt
+/// sees Lance HEAD ahead of the manifest — from OUR compaction, not an external
+/// writer. The drift guard must skip it (we hold the sidecar) and converge, not
+/// delete the sidecar and return `skipped_for_drift` (which would strand uncovered
+/// drift). Reproduced by injecting one retryable reindex conflict after the compact.
+#[tokio::test]
+#[serial(optimize)]
+async fn optimize_retry_does_not_misclassify_own_head_drift() {
+    let _scenario = FailScenario::setup();
+    let dir = tempfile::tempdir().unwrap();
+    let uri = dir.path().to_str().unwrap().to_string();
+
+    {
+        let db = Omnigraph::init(&uri, helpers::TEST_SCHEMA).await.unwrap();
+        for (name, age) in [("alice", 30), ("bob", 31), ("carol", 32), ("dave", 33)] {
+            db.mutate(
+                "main",
+                MUTATION_QUERIES,
+                "insert_person",
+                &mixed_params(&[("$name", name)], &[("$age", age)]),
+            )
+            .await
+            .unwrap();
+        }
+    }
+
+    // Inject exactly one retryable reindex conflict: attempt 1 compacts (HEAD+1) then
+    // "conflicts" on reindex → retry; attempt 2 reopens with HEAD ahead of the manifest
+    // from our own compaction — the misclassification trigger.
+    let _failpoint = ScopedFailPoint::new("optimize.inject_reindex_conflict", "1*return");
+
+    let db = Omnigraph::open(&uri).await.unwrap();
+    let stats = db
+        .optimize()
+        .await
+        .expect("optimize must converge, not misclassify its own HEAD drift");
+    let person = stats
+        .iter()
+        .find(|s| s.table_key == "node:Person")
+        .expect("node:Person stat present");
+    assert!(
+        person.skipped.is_none(),
+        "node:Person must converge, not skipped_for_drift: {:?}",
+        person.skipped,
+    );
+
+    // No uncovered drift stranded: a follow-up optimize is clean and all rows read.
+    let stats2 = db.optimize().await.unwrap();
+    let person2 = stats2
+        .iter()
+        .find(|s| s.table_key == "node:Person")
+        .unwrap();
+    assert!(
+        person2.skipped.is_none(),
+        "follow-up optimize must be clean (no stranded drift): {:?}",
+        person2.skipped,
+    );
+    assert_eq!(helpers::count_rows(&db, "node:Person").await, 4);
+}
+
+/// Poll until `optimize` has written its recovery sidecar (i.e. reached Phase B
+/// and is about to / has compacted), signalling it is parked at its failpoint.
+async fn wait_for_sidecar(root: &std::path::Path) -> bool {
+    let recovery_dir = root.join("__recovery");
+    for _ in 0..1000 {
+        if recovery_dir.exists()
+            && std::fs::read_dir(&recovery_dir)
+                .map(|d| d.count() > 0)
+                .unwrap_or(false)
+        {
+            return true;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    }
+    false
 }
 
 #[tokio::test]
