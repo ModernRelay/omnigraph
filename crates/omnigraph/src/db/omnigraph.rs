@@ -1673,7 +1673,7 @@ impl Omnigraph {
         &self,
         table_key: &str,
         op_kind: crate::db::MutationOpKind,
-    ) -> Result<(SnapshotHandle, String, Option<String>)> {
+    ) -> Result<(Option<SnapshotHandle>, u64, String, Option<String>)> {
         table_ops::open_for_mutation(self, table_key, op_kind).await
     }
 
@@ -1683,7 +1683,7 @@ impl Omnigraph {
         table_key: &str,
         op_kind: crate::db::MutationOpKind,
         txn: Option<&crate::db::WriteTxn>,
-    ) -> Result<(SnapshotHandle, String, Option<String>)> {
+    ) -> Result<(Option<SnapshotHandle>, u64, String, Option<String>)> {
         table_ops::open_for_mutation_on_branch(self, branch, table_key, op_kind, txn).await
     }
 
@@ -1804,6 +1804,7 @@ impl Omnigraph {
         expected_table_versions: &std::collections::HashMap<String, u64>,
         actor_id: Option<&str>,
         txn: Option<&crate::db::WriteTxn>,
+        committed_handles: std::collections::HashMap<String, crate::storage_layer::SnapshotHandle>,
     ) -> Result<u64> {
         table_ops::commit_updates_on_branch_with_expected(
             self,
@@ -1812,6 +1813,7 @@ impl Omnigraph {
             expected_table_versions,
             actor_id,
             txn,
+            committed_handles,
         )
         .await
     }
@@ -2543,10 +2545,13 @@ edge WorksAt: Person -> Company
     }
 
     async fn seed_person_row(db: &mut Omnigraph, name: &str, age: Option<i32>) {
-        let (ds, full_path, table_branch) = db
+        // No-txn entry, so the handle is always `Some` (collapse #1's skip is
+        // gated on `txn.is_some()`).
+        let (ds, _expected_version, full_path, table_branch) = db
             .open_for_mutation("node:Person", crate::db::MutationOpKind::Insert)
             .await
             .unwrap();
+        let ds = ds.unwrap();
         let schema: Arc<Schema> = Arc::new(ds.dataset().schema().into());
         let columns: Vec<Arc<dyn Array>> = schema
             .fields()

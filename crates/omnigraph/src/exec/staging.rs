@@ -491,6 +491,12 @@ impl StagedMutation {
         HashMap<String, u64>,
         Option<RecoverySidecarHandle>,
         Vec<tokio::sync::OwnedMutexGuard<()>>,
+        // Post-`commit_staged` handle per STAGED table (table_key → handle at
+        // the just-committed version). Carried out (RFC-013 step 3b, collapse
+        // #4) so the publish-prepare index build reuses it instead of a fresh
+        // `reopen_for_mutation` at the same version. Inline-committed / delete
+        // tables are NOT in the map (they have no staged handle).
+        HashMap<String, SnapshotHandle>,
     )> {
         let StagedMutation {
             inline_committed,
@@ -631,15 +637,20 @@ impl StagedMutation {
             // live Lance HEAD still equals that manifest pin. If an external
             // raw Lance write or a pre-fix maintenance path moved HEAD without
             // publishing `__manifest`, this write must not silently fold it.
-            let head = db
-                .storage()
-                .open_dataset_head_for_write(
-                    &entry.table_key,
-                    &entry.path.full_path,
-                    entry.path.table_branch.as_deref(),
-                )
-                .await?
-                .version();
+            //
+            // `latest_version_id` reads the latest manifest pointer off the
+            // already-open staged handle (the #2 staging open) WITHOUT a fresh
+            // `Dataset::open` — the same cheap live-HEAD probe
+            // `ManifestCoordinator::probe_latest_version` uses. This replaces a
+            // redundant `open_dataset_head_for_write` (RFC-013 step 3b, collapse
+            // #3): the drift comparison below is byte-identical; only how `head`
+            // is obtained changes (probe vs cold open).
+            let head = entry
+                .dataset
+                .dataset()
+                .latest_version_id()
+                .await
+                .map_err(|e| OmniError::Lance(e.to_string()))?;
             if head < current {
                 return Err(OmniError::manifest_internal(format!(
                     "table '{}' Lance HEAD version {} is behind manifest version {}",
@@ -798,6 +809,12 @@ impl StagedMutation {
 
         let mut updates: Vec<SubTableUpdate> = inline_committed.into_values().collect();
 
+        // Carry each staged table's post-`commit_staged` handle out so the
+        // publish-prepare index build reuses it (collapse #4) instead of
+        // re-opening the dataset at the same just-committed version.
+        let mut committed_handles: HashMap<String, SnapshotHandle> =
+            HashMap::with_capacity(staged.len());
+
         for entry in staged {
             let StagedTableEntry {
                 table_key,
@@ -810,15 +827,22 @@ impl StagedMutation {
             let new_ds = db.storage().commit_staged(dataset, staged_write).await?;
             let state = db.storage().table_state(&path.full_path, &new_ds).await?;
             updates.push(SubTableUpdate {
-                table_key,
+                table_key: table_key.clone(),
                 table_version: state.version,
                 table_branch: path.table_branch.clone(),
                 row_count: state.row_count,
                 version_metadata: state.version_metadata,
             });
+            committed_handles.insert(table_key, new_ds);
         }
 
-        Ok((updates, expected_versions, sidecar_handle, guards))
+        Ok((
+            updates,
+            expected_versions,
+            sidecar_handle,
+            guards,
+            committed_handles,
+        ))
     }
 }
 

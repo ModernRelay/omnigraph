@@ -601,6 +601,36 @@ use super::staging::{MutationStaging, PendingMode};
 /// away once Lance exposes a two-phase delete API
 /// ([lance-format/lance#6658](https://github.com/lance-format/lance/issues/6658))
 /// and we can stage deletes on the same path as inserts/updates.
+impl Omnigraph {
+    /// Resolve a pinned READ handle for an edge table's committed-state
+    /// cardinality scan when collapse #1 skipped the accumulation open. The
+    /// edge-insert path no longer opens the edge dataset (non-strict op + txn),
+    /// but `@card` validation needs to scan committed `src` values. The pinned
+    /// `txn.base` entry is the correct committed image: an edge insert never
+    /// advances the table's Lance HEAD before the end-of-query commit, so the
+    /// base version equals live committed HEAD. Falls back to a fresh
+    /// per-branch snapshot only if no txn is in flight (defensive — the `None`
+    /// handle that reaches this is always under a txn today).
+    async fn edge_cardinality_read_handle(
+        &self,
+        txn: Option<&crate::db::WriteTxn>,
+        table_key: &str,
+    ) -> Result<SnapshotHandle> {
+        let entry = match txn {
+            Some(txn) => txn.base.entry(table_key).cloned(),
+            None => None,
+        };
+        match entry {
+            Some(entry) => self.storage().open_snapshot_at_entry(&entry).await,
+            None => {
+                let branch = txn.and_then(|t| t.branch.clone());
+                let snapshot = self.snapshot_for_branch(branch.as_deref()).await?;
+                self.storage().open_snapshot_at_table(&snapshot, table_key).await
+            }
+        }
+    }
+}
+
 async fn open_table_for_mutation(
     db: &Omnigraph,
     staging: &mut MutationStaging,
@@ -608,7 +638,7 @@ async fn open_table_for_mutation(
     table_key: &str,
     op_kind: crate::db::MutationOpKind,
     txn: Option<&crate::db::WriteTxn>,
-) -> Result<(SnapshotHandle, String, Option<String>)> {
+) -> Result<(Option<SnapshotHandle>, String, Option<String>)> {
     if let Some(prior) = staging.inline_committed.get(table_key) {
         let path = staging.paths.get(table_key).ok_or_else(|| {
             OmniError::manifest_internal(format!(
@@ -618,7 +648,8 @@ async fn open_table_for_mutation(
         })?;
         // The inline-committed reopen does NOT validate the schema contract
         // (it reopens at the post-inline-commit Lance version directly), so it
-        // takes no `txn` — threading it here would change nothing.
+        // takes no `txn` — threading it here would change nothing. Deletes are
+        // strict ops, so this always opens (returns `Some`).
         let ds = db
             .reopen_for_mutation(
                 table_key,
@@ -628,12 +659,16 @@ async fn open_table_for_mutation(
                 op_kind,
             )
             .await?;
-        return Ok((ds, path.full_path.clone(), path.table_branch.clone()));
+        return Ok((Some(ds), path.full_path.clone(), path.table_branch.clone()));
     }
-    let (ds, full_path, table_branch) = db
+    // `open_for_mutation_on_branch` returns the expected version even when it
+    // skips the open (collapse #1, the non-strict insert/merge path): the version
+    // is the pinned base's, identical to the opened handle's `.version()`. Use it
+    // directly for `ensure_path` so the no-open path still captures the publisher
+    // CAS fence.
+    let (handle, expected_version, full_path, table_branch) = db
         .open_for_mutation_on_branch(branch, table_key, op_kind, txn)
         .await?;
-    let expected_version = ds.version();
     staging.ensure_path(
         table_key,
         full_path.clone(),
@@ -641,7 +676,7 @@ async fn open_table_for_mutation(
         expected_version,
         op_kind,
     );
-    Ok((ds, full_path, table_branch))
+    Ok((handle, full_path, table_branch))
 }
 
 /// D₂ parse-time check: a single mutation query is either insert/update-only
@@ -819,16 +854,17 @@ impl Omnigraph {
                 // interleave between our commit_staged and our publish
                 // (which would correctly fail our CAS but leave Lance
                 // HEAD advanced — the residual class MR-870 recovers).
-                let (updates, expected_versions, sidecar_handle, _queue_guards) = staged
-                    .commit_all(
-                        self,
-                        requested.as_deref(),
-                        crate::db::manifest::SidecarKind::Mutation,
-                        actor_id,
-                        fork_queue_guards,
-                        Some(&txn),
-                    )
-                    .await?;
+                let (updates, expected_versions, sidecar_handle, _queue_guards, committed_handles) =
+                    staged
+                        .commit_all(
+                            self,
+                            requested.as_deref(),
+                            crate::db::manifest::SidecarKind::Mutation,
+                            actor_id,
+                            fork_queue_guards,
+                            Some(&txn),
+                        )
+                        .await?;
                 // Failpoint that wedges the documented finalize→publisher
                 // residual: per-table `commit_staged` calls already
                 // advanced Lance HEAD on every touched table; a failure
@@ -846,6 +882,7 @@ impl Omnigraph {
                     &expected_versions,
                     actor_id,
                     Some(&txn),
+                    committed_handles,
                 )
                 .await?;
                 // Phase C succeeded — sidecar can be deleted. If this
@@ -1051,6 +1088,10 @@ impl Omnigraph {
             } else {
                 crate::db::MutationOpKind::Insert
             };
+            // Node inserts are non-strict (Insert/Merge), so with a `WriteTxn`
+            // this opens NOTHING (collapse #1) — the handle is discarded anyway;
+            // only `ensure_path`'s captured version (read inside
+            // `open_table_for_mutation`) is used downstream.
             let (_ds, _full_path, _table_branch) =
                 open_table_for_mutation(self, staging, branch, &table_key, insert_kind, txn).await?;
             // Accumulate. @key inserts go into the Merge stream (so a
@@ -1085,8 +1126,10 @@ impl Omnigraph {
                 )?;
             }
             let table_key = format!("edge:{}", type_name);
-            // Capture pre-write metadata on first touch (no Lance write).
-            let (ds, _full_path, _table_branch) = open_table_for_mutation(
+            // Capture pre-write metadata on first touch. Edge inserts are
+            // non-strict, so with a `WriteTxn` this opens NOTHING (collapse #1)
+            // and returns `None`.
+            let (handle, _full_path, _table_branch) = open_table_for_mutation(
                 self,
                 staging,
                 branch,
@@ -1102,9 +1145,26 @@ impl Omnigraph {
             // Edge cardinality validation: scan committed edges via Lance
             // + iterate pending edges in-memory for the `src` column,
             // group-by-src. The pending side already includes the row
-            // we just appended (above).
-            validate_edge_cardinality_with_pending(self, &ds, staging, &table_key, edge_type)
+            // we just appended (above). When the open was skipped (collapse
+            // #1), resolve a pinned read handle for the committed scan from the
+            // txn base — but only when cardinality is non-default, so the common
+            // default-cardinality edge keeps the open-free path. The pinned base
+            // read is the correct committed state (an edge insert never moves the
+            // table's Lance HEAD before the end-of-query commit).
+            if !edge_type.cardinality.is_default() {
+                let committed_ds = match handle {
+                    Some(h) => h,
+                    None => self.edge_cardinality_read_handle(txn, &table_key).await?,
+                };
+                validate_edge_cardinality_with_pending(
+                    self,
+                    &committed_ds,
+                    staging,
+                    &table_key,
+                    edge_type,
+                )
                 .await?;
+            }
 
             self.invalidate_graph_index().await;
 
@@ -1150,7 +1210,7 @@ impl Omnigraph {
         let blob_props = self.catalog().node_types[type_name].blob_properties.clone();
 
         let table_key = format!("node:{}", type_name);
-        let (ds, _full_path, _table_branch) = open_table_for_mutation(
+        let (handle, _full_path, _table_branch) = open_table_for_mutation(
             self,
             staging,
             branch,
@@ -1159,6 +1219,9 @@ impl Omnigraph {
             txn,
         )
         .await?;
+        // Update is a STRICT op, so collapse #1 never skips its open — the
+        // handle is always `Some` (and it's needed for the committed scan below).
+        let ds = handle.expect("strict Update op always opens its dataset");
 
         // Scan committed via Lance + apply the same predicate to pending
         // batches via DataFusion `MemTable` (read-your-writes for prior
@@ -1281,7 +1344,7 @@ impl Omnigraph {
         let pred_sql = predicate_to_sql(predicate, params, false)?;
 
         let table_key = format!("node:{}", type_name);
-        let (ds, full_path, table_branch) = open_table_for_mutation(
+        let (handle, full_path, table_branch) = open_table_for_mutation(
             self,
             staging,
             branch,
@@ -1290,6 +1353,8 @@ impl Omnigraph {
             txn,
         )
         .await?;
+        // Delete is a STRICT op, so collapse #1 never skips its open.
+        let ds = handle.expect("strict Delete op always opens its dataset");
         let initial_version = ds.version();
 
         // Scan matching IDs for cascade. Per D₂ this never overlaps with
@@ -1379,7 +1444,7 @@ impl Omnigraph {
 
             let edge_table_key = format!("edge:{}", edge_name);
             let cascade_filter = cascade_filters.join(" OR ");
-            let (edge_ds, edge_full_path, edge_table_branch) = open_table_for_mutation(
+            let (edge_handle, edge_full_path, edge_table_branch) = open_table_for_mutation(
                 self,
                 staging,
                 branch,
@@ -1388,6 +1453,8 @@ impl Omnigraph {
                 txn,
             )
             .await?;
+            // Delete is a STRICT op, so collapse #1 never skips its open.
+            let edge_ds = edge_handle.expect("strict Delete op always opens its dataset");
 
             let (_new_edge_ds, edge_delete) = self
                 .storage_inline_residual()
@@ -1429,7 +1496,7 @@ impl Omnigraph {
         let pred_sql = predicate_to_sql(predicate, params, true)?;
 
         let table_key = format!("edge:{}", type_name);
-        let (ds, full_path, table_branch) = open_table_for_mutation(
+        let (handle, full_path, table_branch) = open_table_for_mutation(
             self,
             staging,
             branch,
@@ -1438,6 +1505,8 @@ impl Omnigraph {
             txn,
         )
         .await?;
+        // Delete is a STRICT op, so collapse #1 never skips its open.
+        let ds = handle.expect("strict Delete op always opens its dataset");
 
         let (_new_ds, delete_state) = self
             .storage_inline_residual()

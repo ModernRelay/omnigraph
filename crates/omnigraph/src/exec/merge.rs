@@ -1068,10 +1068,13 @@ async fn publish_rewritten_merge_table(
     // source onto target). The inline `delete_where` later in this
     // function operates on rows the rewrite chose to remove, not
     // user-facing predicates, so Merge is the correct policy here.
-    let (ds, full_path, table_branch) = target_db
+    // `open_for_mutation` is the no-txn entry, so collapse #1's non-strict
+    // open-skip (gated on `txn.is_some()`) never fires here — the handle is
+    // always `Some`.
+    let (ds, _expected_version, full_path, table_branch) = target_db
         .open_for_mutation(table_key, crate::db::MutationOpKind::Merge)
         .await?;
-    let mut current_ds = ds;
+    let mut current_ds = ds.expect("no-txn open_for_mutation always opens its dataset");
 
     // Phase 1: merge_insert changed/new rows (preserves _row_created_at_version for
     // existing rows, bumps _row_last_updated_at_version only for actually-changed rows).
@@ -1237,10 +1240,13 @@ async fn publish_adopted_delta(
     table_key: &str,
     delta: &AdoptDelta,
 ) -> Result<crate::db::SubTableUpdate> {
-    let (ds, full_path, table_branch) = target_db
+    // `open_for_mutation` is the no-txn entry, so collapse #1's non-strict
+    // open-skip (gated on `txn.is_some()`) never fires here — the handle is
+    // always `Some`.
+    let (ds, _expected_version, full_path, table_branch) = target_db
         .open_for_mutation(table_key, crate::db::MutationOpKind::Merge)
         .await?;
-    let mut current_ds = ds;
+    let mut current_ds = ds.expect("no-txn open_for_mutation always opens its dataset");
 
     // Phase 1a: append the NEW rows. `stage_append_stream` is a streaming
     // `Operation::Append` — no hash join — so it never buffers the delta and

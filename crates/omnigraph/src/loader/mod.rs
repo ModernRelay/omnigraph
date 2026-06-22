@@ -493,10 +493,13 @@ async fn load_jsonl_reader<R: BufRead>(
     // Phase 2b: accumulate every node type in memory. Fragment writes are
     // delayed until after all validation succeeds.
     for (type_name, table_key, batch, loaded_count) in prepared_nodes {
-        let (ds, full_path, table_branch) = db
+        // The loader only needs the captured expected version (the publisher's
+        // CAS fence) for `ensure_path` — it discards the handle. With a
+        // non-strict load op (Merge/Append) and a `WriteTxn`, collapse #1 skips
+        // the dataset open and returns the pinned base version directly.
+        let (_handle, expected_version, full_path, table_branch) = db
             .open_for_mutation_on_branch(branch, &table_key, load_op_kind, Some(&txn))
             .await?;
-        let expected_version = ds.version();
         staging.ensure_path(
             &table_key,
             full_path,
@@ -565,10 +568,11 @@ async fn load_jsonl_reader<R: BufRead>(
 
     // Phase 2e: accumulate every edge type. Same dispatch as Phase 2b.
     for (edge_name, table_key, batch, loaded_count) in prepared_edges {
-        let (ds, full_path, table_branch) = db
+        // Same as the node phase: only the captured expected version is used;
+        // collapse #1 skips the open for a non-strict load op under a `WriteTxn`.
+        let (_handle, expected_version, full_path, table_branch) = db
             .open_for_mutation_on_branch(branch, &table_key, load_op_kind, Some(&txn))
             .await?;
-        let expected_version = ds.version();
         staging.ensure_path(
             &table_key,
             full_path,
@@ -601,7 +605,7 @@ async fn load_jsonl_reader<R: BufRead>(
     // `_queue_guards` holds per-(table_key, branch) write queues
     // across the manifest publish below — see exec/mutation.rs for
     // the rationale (interleaving prevention).
-    let (updates, expected_versions, sidecar_handle, _queue_guards) = staged
+    let (updates, expected_versions, sidecar_handle, _queue_guards, committed_handles) = staged
         .commit_all(
             db,
             branch,
@@ -622,6 +626,7 @@ async fn load_jsonl_reader<R: BufRead>(
         &expected_versions,
         actor_id,
         Some(&txn),
+        committed_handles,
     )
     .await?;
     // The recovery sidecar protects the per-table commit_staged →

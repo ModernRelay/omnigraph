@@ -492,7 +492,7 @@ pub(super) async fn open_for_mutation(
     db: &Omnigraph,
     table_key: &str,
     op_kind: crate::db::MutationOpKind,
-) -> Result<(SnapshotHandle, String, Option<String>)> {
+) -> Result<(Option<SnapshotHandle>, u64, String, Option<String>)> {
     let current_branch = db
         .coordinator
         .read()
@@ -501,7 +501,9 @@ pub(super) async fn open_for_mutation(
         .map(str::to_string);
     // `open_for_mutation` is the no-txn entry (branch merge). Passing `None`
     // keeps the exact pre-WriteTxn code path (a fresh `resolved_branch_target`
-    // that re-validates the schema).
+    // that re-validates the schema). With `txn = None` the non-strict early-skip
+    // in `open_for_mutation_on_branch` never fires, so this always returns a
+    // `Some(handle)` for its callers.
     open_for_mutation_on_branch(db, current_branch.as_deref(), table_key, op_kind, None).await
 }
 
@@ -517,7 +519,7 @@ pub(super) async fn open_for_mutation_on_branch(
     table_key: &str,
     op_kind: crate::db::MutationOpKind,
     txn: Option<&crate::db::WriteTxn>,
-) -> Result<(SnapshotHandle, String, Option<String>)> {
+) -> Result<(Option<SnapshotHandle>, u64, String, Option<String>)> {
     db.ensure_schema_apply_not_locked("write").await?;
     // Source the resolved (snapshot, branch). With a `WriteTxn` the contract was
     // validated once at capture, so use the pinned base + resolved branch instead
@@ -536,6 +538,43 @@ pub(super) async fn open_for_mutation_on_branch(
         .entry(table_key)
         .ok_or_else(|| OmniError::manifest(format!("no manifest entry for {}", table_key)))?;
     let full_path = format!("{}/{}", db.root_uri, entry.table_path);
+
+    // Collapse #1 (RFC-013 step 3b): a non-strict op (Insert/Merge) on the txn's
+    // own branch needs no dataset open for ACCUMULATION — the only thing the
+    // caller reads from this handle on the non-strict path is `.version()` (the
+    // publisher's CAS fence), which is exactly the pinned base version. The base
+    // already validated the schema contract once, and the staging reopen
+    // (`reopen_for_mutation`) plus the publisher CAS in `commit_all` are the real
+    // drift guards. So skip `open_dataset_head_for_write` entirely and source the
+    // expected version from the pinned entry.
+    //
+    // Gated on `txn.is_some()`: without a txn (branch merge's `open_for_mutation`)
+    // every arm below is byte-identical to before. STRICT ops (Update/Delete/
+    // SchemaRewrite) always open live HEAD + run `ensure_expected_version`
+    // (read-modify-write SI), and any write that must FORK (the table isn't yet on
+    // the resolved branch) opens too (the fork is a real Lance state advance the
+    // manifest snapshot can't substitute for).
+    if txn.is_some() && !op_kind.strict_pre_stage_version_check() {
+        match resolved_branch.as_deref() {
+            // Non-strict, table already on the active branch → no open, no fork.
+            Some(active_branch) if entry.table_branch.as_deref() == Some(active_branch) => {
+                return Ok((
+                    None,
+                    entry.table_version,
+                    full_path,
+                    Some(active_branch.to_string()),
+                ));
+            }
+            // Main branch, non-strict → no open. (Main never forks.)
+            None => {
+                return Ok((None, entry.table_version, full_path, None));
+            }
+            // Non-strict but the table isn't on the active branch yet — falls
+            // through to fork below.
+            Some(_) => {}
+        }
+    }
+
     match resolved_branch.as_deref() {
         None => {
             let ds = db
@@ -546,7 +585,8 @@ pub(super) async fn open_for_mutation_on_branch(
                 db.storage()
                     .ensure_expected_version(&ds, table_key, entry.table_version)?;
             }
-            Ok((ds, full_path, None))
+            let version = ds.version();
+            Ok((Some(ds), version, full_path, None))
         }
         Some(active_branch) => {
             let (ds, table_branch) = open_owned_dataset_for_branch_write(
@@ -559,7 +599,8 @@ pub(super) async fn open_for_mutation_on_branch(
                 op_kind,
             )
             .await?;
-            Ok((ds, full_path, table_branch))
+            let version = ds.version();
+            Ok((Some(ds), version, full_path, table_branch))
         }
     }
 }
@@ -1081,6 +1122,14 @@ async fn prepare_updates_for_commit(
     branch: Option<&str>,
     updates: &[crate::db::SubTableUpdate],
     txn: Option<&crate::db::WriteTxn>,
+    // Post-`commit_staged` handles handed out by `StagedMutation::commit_all`
+    // (RFC-013 step 3b, collapse #4): table_key → the handle already open at
+    // its just-committed version. When a table's handle is present, the index
+    // build below reuses it and SKIPS the `reopen_for_mutation` open. Absent
+    // entries (other writers — schema apply, merge, ensure_indices, tests —
+    // pass `HashMap::new()`; inline-committed/delete tables are never staged)
+    // keep the byte-identical `reopen_for_mutation` path.
+    mut committed_handles: std::collections::HashMap<String, SnapshotHandle>,
 ) -> Result<Vec<crate::db::SubTableUpdate>> {
     if updates.is_empty() {
         return Ok(Vec::new());
@@ -1109,21 +1158,34 @@ async fn prepare_updates_for_commit(
         let mut prepared_update = update.clone();
         if prepared_update.row_count > 0 {
             let full_path = format!("{}/{}", db.root_uri, entry.table_path);
-            // Strict version check is correct here: this runs INSIDE
+            // Reuse the post-`commit_staged` handle when the caller handed one
+            // out (collapse #4): it is already open at exactly
+            // `prepared_update.table_version`, so the defense-in-depth strict
+            // re-check `reopen_for_mutation` would run is trivially satisfied
+            // and the open is redundant. When no handle is present (other
+            // writers, or any non-staged table), fall back to the byte-identical
+            // `reopen_for_mutation` path.
+            //
+            // Strict version check is correct on the fallback: this runs INSIDE
             // the publisher commit path, after `commit_staged` already
             // advanced Lance HEAD to `prepared_update.table_version`.
             // The check is a defense-in-depth assertion that the
             // dataset state matches what we just committed; not the
             // pre-stage race the op-kind policy targets.
-            let mut ds = reopen_for_mutation(
-                db,
-                &prepared_update.table_key,
-                &full_path,
-                prepared_update.table_branch.as_deref(),
-                prepared_update.table_version,
-                crate::db::MutationOpKind::SchemaRewrite,
-            )
-            .await?;
+            let mut ds = match committed_handles.remove(&prepared_update.table_key) {
+                Some(ds) => ds,
+                None => {
+                    reopen_for_mutation(
+                        db,
+                        &prepared_update.table_key,
+                        &full_path,
+                        prepared_update.table_branch.as_deref(),
+                        prepared_update.table_version,
+                        crate::db::MutationOpKind::SchemaRewrite,
+                    )
+                    .await?
+                }
+            };
             // Any column not yet buildable (e.g. a vector column whose rows
             // have null embeddings) is deferred and logged inside
             // build_indices; a later ensure_indices/optimize materializes it.
@@ -1262,7 +1324,14 @@ pub(super) async fn commit_updates(
         .await
         .current_branch()
         .map(str::to_string);
-    let prepared = prepare_updates_for_commit(db, current_branch.as_deref(), updates, None).await?;
+    let prepared = prepare_updates_for_commit(
+        db,
+        current_branch.as_deref(),
+        updates,
+        None,
+        std::collections::HashMap::new(),
+    )
+    .await?;
     commit_prepared_updates(db, &prepared, None).await
 }
 
@@ -1307,9 +1376,11 @@ pub(super) async fn commit_updates_on_branch_with_expected(
     expected_table_versions: &std::collections::HashMap<String, u64>,
     actor_id: Option<&str>,
     txn: Option<&crate::db::WriteTxn>,
+    committed_handles: std::collections::HashMap<String, SnapshotHandle>,
 ) -> Result<u64> {
     db.ensure_schema_apply_not_locked("write commit").await?;
-    let prepared = prepare_updates_for_commit(db, branch, updates, txn).await?;
+    let prepared =
+        prepare_updates_for_commit(db, branch, updates, txn, committed_handles).await?;
     commit_prepared_updates_on_branch_with_expected(
         db,
         branch,
