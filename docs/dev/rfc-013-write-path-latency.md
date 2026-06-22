@@ -523,7 +523,10 @@ struct WriteTxn {
     branch: BranchRef,
     base: PinnedSnapshot,   // {manifest_version, per-table (loc,version,e_tag), schema_hash, writer_epoch}
     session: Arc<Session>,  // shared per-graph; warms metadata/index caches across opens
-    handles: HandleCache,   // open-by-version; each table opened once, reused across stages
+    handles: HandleMap,     // open the base once WITH session; thread the handle each
+                            // commit RETURNS forward (HEAD walks N→N+1→N+2). NOT a
+                            // version-keyed cache — HEAD moves, so a (table,version) key
+                            // misses; reuse = forward the commit-return handle. [3b-validated]
 }
 
 // A typed, declarative publish plan — the COMPLETE "what", built before any HEAD moves.
@@ -546,8 +549,17 @@ impl GraphPublishAuthority {
 
 Properties that make it optimal:
 
-- **Stages take `&WriteTxn`/`&PublishPlan`, never storage** — re-resolution and
-  open-latest are *unrepresentable*. Invariants 2/3/15 hold by construction.
+- **Stages take `&WriteTxn`/`&PublishPlan` for the BASE** — re-resolving the pinned
+  read base / open-latest for the pre-commit phase is unrepresentable; invariants 2/3/15
+  hold for the base by construction. **Caveat [3b-validated]:** this is NOT "no
+  re-resolution anywhere." Three commit-boundary reads are irreducible correctness
+  machinery and MUST stay fresh: the commit-time `fresh_snapshot_for_branch` (cross-process
+  OCC), the live-HEAD drift probe (a concurrent writer may have moved HEAD since staging),
+  and the fork-authority reads (`classify_fork_ref` deliberately bypasses the cached base —
+  a pinned base there re-opens the "force-delete a live fork" bug). Model "pinned base for
+  the pre-commit phase + named fresh re-reads at the commit/fork boundary." The achievable
+  open count is **1 base open (with session) + 1 cheap `latest_version_id` probe + threaded
+  commit handles**, not literally one open.
 - **The recovery sidecar *is* the serialized `PublishPlan`.** Phase C and
   recovery both call `plan.apply()` — a merge that bumps tables A+B can never
   roll A forward and silently drop B. The
