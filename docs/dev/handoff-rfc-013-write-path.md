@@ -22,11 +22,11 @@ for the canonical list. Current reality:
 - **Step 2a** — internal-table compaction: `optimize` now compacts `__manifest` /
   `_graph_commits` / `_graph_commit_actors` (#291). Plus the RFC latency-model
   correction (#292).
+- **Optimize-vs-write race** — optimize survives a cross-process write race on the
+  same table (#297, **LANDED** — origin/main `6d4606a8`; see §6 for why it's not
+  redundant with Design A). Step 3b stacks on top of this.
 
 **Open PRs (land these; relationships in §7):**
-- **#297** `fix-optimize-concurrency-race` — optimize survives a cross-process write
-  race (the work this cycle produced). **Merge it** (see §6 for why it's not redundant
-  with Design A).
 - **#296** `correctness-by-design-fix` — recovery roll-forward converges on a concurrent
   manifest advance (this is the fix for the flaky `iss-schema-apply-reopen-recovery-race`).
 - **#295** `docs/rfc-013-step-3b` — the step-3b RFC doc.
@@ -282,12 +282,13 @@ open; delete #6658 shipped). Track, don't build yet.
 - The prod bug is **live**; Design A is the largest write-path change in the RFC. Don't hold a
   correctness fix hostage to a big refactor, and don't do a big refactor under bug-fix urgency.
 - Genuinely throwaway under Design A: only the loop's *location* + the `head_advanced` proxy
-  (~a dozen lines). Everything else relocates or persists. **Merge #297.**
+  (~a dozen lines). Everything else relocates or persists. **#297 LANDED.**
 
 ---
 
 ## 7. Open PRs and their relationships
-- **#297** (this) — maintenance-class fix (optimize vs write). Merge.
+- **#297** — maintenance-class fix (optimize vs write). **LANDED** (origin/main `6d4606a8`);
+  step 3b stacks on it.
 - **#254** — logical-class fix (schema-apply vs optimize false-fail). Same op-class family;
   both are de-risking inputs for Design A's per-class commit models.
 - **#296** — recovery roll-forward converges on concurrent manifest advance. This is the fix

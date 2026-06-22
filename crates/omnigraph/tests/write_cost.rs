@@ -215,12 +215,15 @@ async fn write_validates_schema_contract_once() {
     );
 }
 
-/// A keyed single-table write must open its table AT MOST ONCE. Today it opens ~4×
-/// (accumulation, staging, commit drift-guard, publish-prepare/index-build), each a
-/// fresh cold `Dataset::open`. Step 3b opens the base once (with the shared Session),
+/// A keyed single-table write must open its DATA table AT MOST ONCE. Today it opens
+/// ~4× (accumulation, staging, commit drift-guard, publish-prepare/index-build), each
+/// a fresh cold `Dataset::open`. Step 3b opens the base once (with the shared Session),
 /// threads the commit-return handle, and replaces the drift-guard open with a cheap
-/// `latest_version_id` probe — collapsing to 1 open. Counted by the exact `open_count`
-/// chokepoint probe (`forbidden_apis` guarantees every write open routes through it).
+/// `latest_version_id` probe — collapsing to 1 open. Counted by `data_open_count`, the
+/// table-class-scoped chokepoint probe: the internal-table opens (publisher CAS +
+/// commit-graph append) are EXCLUDED, since they are unrelated to data-table reuse and
+/// would otherwise keep this count >1 regardless of threading. (`forbidden_apis`
+/// guarantees every write open routes through the instrumented chokepoints.)
 #[tokio::test]
 async fn keyed_insert_opens_table_at_most_once() {
     let dir = tempfile::tempdir().unwrap();
@@ -236,10 +239,13 @@ async fn keyed_insert_opens_table_at_most_once() {
         res.unwrap();
         io
     };
-    eprintln!("open_count for a single-table keyed insert = {}", io.open_count);
+    eprintln!(
+        "data_open_count={} internal_open_count={} for a single-table keyed insert",
+        io.data_open_count, io.internal_open_count
+    );
     assert!(
-        io.open_count <= 1,
-        "a keyed single-table write must open its table at most once, got {}",
-        io.open_count,
+        io.data_open_count <= 1,
+        "a keyed single-table write must open its data table at most once, got {}",
+        io.data_open_count,
     );
 }
