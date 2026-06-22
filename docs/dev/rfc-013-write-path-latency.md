@@ -579,6 +579,7 @@ The cost contract becomes part of `publish`'s documented API:
 | Epoch fence | Monotonic `writer_epoch` in `__manifest`, CAS-claimed at writer init, checked on every publish. Fences a whole zombie *writer* deterministically (no TTL); closes the multi-process exposure and the Lance-MTT TTL-lease gap. | SlateDB `FenceableTransactionalObject` **[U]** |
 | Branch create | Lance `Clone` instead of the per-table fork loop (O(tables)→O(1) sequential). | `iss-691` **[G]** |
 | Branch delete | Run the per-other-branch safety check and the per-table reclaim loops concurrently (`buffer_unordered`); read branch sets from in-memory coordinator state. | **[S]** |
+| Maintenance-class commit (compaction) | Commutative/content-preserving ops do NOT use the logical class's strict OCC: Lance rebases the disjoint case, the app reopens+replans on a real overlap, and the manifest publish is a **monotonic fast-forward** (advance or no-op, never equality CAS) — no `writer_epoch`. The two-op-class rule + the found+fixed optimize-vs-write race: §6.6. | §6.6 **[M]**, **LANDED** |
 
 ---
 
@@ -822,6 +823,59 @@ This is the standard WAL-replay + leader-lease shape (confirmed against SlateDB'
 `FenceableTransactionalObject` and Kleppmann's fencing-token canon, §10). **This
 finding promotes #6/#7 from "nice correctness work" to the load-bearing guard that
 gates multi-writer topologies — and it is the motivating case for them.**
+
+## 6.6 The two op classes — and a found+fixed maintenance race (LANDED)
+
+§6.5 is about the **logical** write class. A prod run surfaced the same
+process-boundary flaw in the **maintenance** class: a direct CLI `optimize` racing
+a served write on the same table **failed** — either the Lance `Rewrite` lost
+("preempted by concurrent Update") or the manifest publish lost the strict equality
+CAS ("expected 14 but current 15"). Same root cause as §6.5 (the in-process write
+queue does not serialize across processes), but the right fix is the **opposite** of
+the logical class, because the two classes commute differently:
+
+| class | examples | commutes? | correct commit model |
+|---|---|---|---|
+| **maintenance** | compaction (`Rewrite`), `optimize_indices` | **yes** (content-preserving) | Lance native rebase + app reopen/replan on real overlap + **monotonic manifest fast-forward** — no epoch, no read-set |
+| **logical mutation** | load / mutate / merge / delete | **no** (lost-update, write-skew) | strict cross-process OCC: read-set + write-set CAS under the `writer_epoch` fence (§6.5, #7) |
+
+Applying strict OCC + equality-CAS uniformly is the mistake: **too strong for
+maintenance** (it manufactures a false conflict against a commutative op — this
+bug) and **too weak for logical writes cross-process** (§6.5). The maintenance fix
+needs **no `writer_epoch`** — that is the tell that it is a different class.
+
+**Validated against Lance 7.0.0 source + reproduced [M].** Lance has no compaction
+re-plan retry (the semantic `RetryableCommitConflict` escapes `commit_transaction`'s
+loop at `io/commit.rs:979`; only the OCC manifest race is retried), so the
+application must reopen + re-plan — exactly what the internal-table path already
+did. Notably, Lance **rebases the common case for free**: a concurrent
+insert/update/delete on *other* fragments is disjoint, so the data-table compaction
+commits cleanly and the conflict surfaces only as the manifest fast-forward
+(the genuine `Rewrite`-vs-`Rewrite` overlap is the rarer many-fragment /
+concurrent-compaction case).
+
+**Fix (LANDED).** Both compaction paths now share one reopen+replan shape with a
+two-level retry: an outer loop reopens+replans on a real Lance overlap conflict; an
+inner Phase-C loop makes the manifest publish a **monotonic fast-forward**
+(advance to the compacted version `N`, or no-op when the manifest already moved to
+`≥ N` — being linear, it descends from and includes the compaction), never the
+equality CAS. The `Optimize` recovery sidecar is written once and reused across
+attempts (every commit is content-preserving). The in-process queue is kept as an
+in-process contention reducer, not the cross-process guard. No `writer_epoch`.
+(`db/omnigraph/optimize.rs`; regression tests in `tests/failpoints.rs`:
+`optimize_survives_concurrent_insert_advancing_manifest`,
+`optimize_survives_concurrent_delete_before_compaction`.)
+
+**Relationship to step 5 (the unification).** This is the first correct *instance* of
+the maintenance-class commit model, not a parallel band-aid: when step 5 collapses the
+writers into the single `publish(txn, plan)` authority, it **relocates** this — a
+`TableAction::Rewrite` carries the monotonic-fast-forward + reopen/replan commit model
+into the unified publisher — rather than reinventing it. What step 5 deletes is the
+*location* (the hand-rolled loop in `optimize_one_table`), not the *semantics*; the two
+regression tests above are the contract that must stay green across that refactor. It
+also makes step 5 easier, not harder: it already unified the two compaction paths onto
+one retry shape and drew the op-class line (logical writers keep equality CAS; only
+compaction is monotonic), so there is one fewer pattern for the unification to absorb.
 
 ---
 
