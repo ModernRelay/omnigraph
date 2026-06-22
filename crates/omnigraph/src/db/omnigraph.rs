@@ -79,6 +79,28 @@ pub struct SchemaApplyPreview {
     pub catalog: Catalog,
 }
 
+/// A capture-once write transaction (RFC-013 step 3b). Pins the operation's read
+/// base + the shared `Session` ONCE so the per-table opens reuse the pinned version
+/// and the warm session instead of re-resolving / re-validating / cold-opening per
+/// table. The schema contract is validated once (when `base` is captured). NOT a
+/// general "no re-resolution" handle — the commit-time OCC re-read, the live-HEAD
+/// drift probe, and the fork-authority reads stay fresh (correctness machinery).
+///
+/// SCAFFOLDING: the carrier + `open_write_txn` are landed; the next pass threads
+/// `Option<&WriteTxn>` through `open_for_mutation_on_branch` / staging (non-strict
+/// bound-branch path) to open the base once from the pinned entry with the warm
+/// session (a session-aware pinned opener returning a `SnapshotHandle`) and skip the
+/// per-table schema re-validation — turning the two RED cost gates green.
+#[allow(dead_code)]
+pub(crate) struct WriteTxn {
+    /// The resolved branch (`None` = main).
+    pub(crate) branch: Option<String>,
+    /// The pinned base snapshot (per-table location + version + e_tag), captured once.
+    pub(crate) base: Snapshot,
+    /// The shared per-graph Session, threaded into the base opens to warm caches.
+    pub(crate) session: Arc<lance::session::Session>,
+}
+
 /// Top-level handle to an Omnigraph database.
 ///
 /// An Omnigraph is a Lance-native graph database with git-style branching.
@@ -734,6 +756,23 @@ impl Omnigraph {
 
     pub(crate) async fn restore_coordinator(&self, coordinator: GraphCoordinator) {
         *self.coordinator.write().await = coordinator;
+    }
+
+    /// Open a capture-once write transaction (RFC-013 step 3b): validate the schema
+    /// contract ONCE and pin the base snapshot + the shared per-graph `Session`. The
+    /// per-table opens take `Option<&WriteTxn>` and, on the bound branch for the
+    /// non-strict (Insert/Merge) path, open from the pinned base entry with the warm
+    /// session — instead of re-resolving (re-validating the schema) and cold-opening
+    /// HEAD per table. Strict ops, the fork path, and the commit-time OCC re-read keep
+    /// their fresh reads (those are correctness machinery — see the handoff doc).
+    #[allow(dead_code)]
+    pub(crate) async fn open_write_txn(&self, branch: Option<&str>) -> Result<WriteTxn> {
+        let resolved = self.resolved_branch_target(branch).await?;
+        Ok(WriteTxn {
+            branch: resolved.branch,
+            base: resolved.snapshot,
+            session: Arc::clone(&self.read_caches.session),
+        })
     }
 
     pub(crate) async fn resolved_branch_target(
