@@ -3208,8 +3208,11 @@ async fn optimize_survives_concurrent_insert_advancing_manifest() {
         }
     }
 
-    // Pause optimize AFTER compact_files advanced the Lance HEAD but BEFORE publish.
-    let failpoint = ScopedFailPoint::new("optimize.post_phase_b_pre_manifest_commit", "pause");
+    // Pause optimize BEFORE it compacts, so the concurrent insert lands while
+    // HEAD == manifest (no in-flight optimize drift for the writer to trip on); the
+    // insert advances the manifest, then optimize compacts on top and must converge
+    // its publish over the advanced manifest rather than fail the equality CAS.
+    let failpoint = ScopedFailPoint::new("optimize.before_compact", "pause");
 
     let uri_opt = uri.clone();
     let optimize = tokio::spawn(async move {
@@ -3220,7 +3223,7 @@ async fn optimize_survives_concurrent_insert_advancing_manifest() {
     // Wait until optimize reaches the pause (its Optimize sidecar is on disk).
     assert!(
         wait_for_sidecar(dir.path()).await,
-        "optimize never reached the paused publish window",
+        "optimize never reached the pre-compact pause",
     );
 
     // Concurrent insert on the SAME table via a SEPARATE handle (= separate
@@ -3331,6 +3334,68 @@ async fn optimize_survives_concurrent_delete_before_compaction() {
     db.optimize()
         .await
         .expect("graph must remain healthy / re-optimizable");
+}
+
+/// Regression: the outer compaction retry loop must NOT misclassify optimize's OWN
+/// committed Phase-B work as external drift. Attempt 1 compacts (HEAD → V+1); if a
+/// LATER Phase-B op (reindex) then hits a retryable conflict, the reopened attempt
+/// sees Lance HEAD ahead of the manifest — from OUR compaction, not an external
+/// writer. The drift guard must skip it (we hold the sidecar) and converge, not
+/// delete the sidecar and return `skipped_for_drift` (which would strand uncovered
+/// drift). Reproduced by injecting one retryable reindex conflict after the compact.
+#[tokio::test]
+#[serial(optimize)]
+async fn optimize_retry_does_not_misclassify_own_head_drift() {
+    let _scenario = FailScenario::setup();
+    let dir = tempfile::tempdir().unwrap();
+    let uri = dir.path().to_str().unwrap().to_string();
+
+    {
+        let db = Omnigraph::init(&uri, helpers::TEST_SCHEMA).await.unwrap();
+        for (name, age) in [("alice", 30), ("bob", 31), ("carol", 32), ("dave", 33)] {
+            db.mutate(
+                "main",
+                MUTATION_QUERIES,
+                "insert_person",
+                &mixed_params(&[("$name", name)], &[("$age", age)]),
+            )
+            .await
+            .unwrap();
+        }
+    }
+
+    // Inject exactly one retryable reindex conflict: attempt 1 compacts (HEAD+1) then
+    // "conflicts" on reindex → retry; attempt 2 reopens with HEAD ahead of the manifest
+    // from our own compaction — the misclassification trigger.
+    let _failpoint = ScopedFailPoint::new("optimize.inject_reindex_conflict", "1*return");
+
+    let db = Omnigraph::open(&uri).await.unwrap();
+    let stats = db
+        .optimize()
+        .await
+        .expect("optimize must converge, not misclassify its own HEAD drift");
+    let person = stats
+        .iter()
+        .find(|s| s.table_key == "node:Person")
+        .expect("node:Person stat present");
+    assert!(
+        person.skipped.is_none(),
+        "node:Person must converge, not skipped_for_drift: {:?}",
+        person.skipped,
+    );
+
+    // No uncovered drift stranded: a follow-up optimize is clean and all rows read.
+    let stats2 = db.optimize().await.unwrap();
+    let person2 = stats2
+        .iter()
+        .find(|s| s.table_key == "node:Person")
+        .unwrap();
+    assert!(
+        person2.skipped.is_none(),
+        "follow-up optimize must be clean (no stranded drift): {:?}",
+        person2.skipped,
+    );
+    assert_eq!(helpers::count_rows(&db, "node:Person").await, 4);
 }
 
 /// Poll until `optimize` has written its recovery sidecar (i.e. reached Phase B

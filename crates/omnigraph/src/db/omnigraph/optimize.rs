@@ -381,6 +381,13 @@ async fn optimize_one_table(
     // forward (pin still matches the manifest) or safely rolls the compaction back.
     let mut sidecar: Option<crate::db::manifest::RecoverySidecarHandle> = None;
 
+    // Tracks whether one of OUR Phase-B ops (auto-cleanup strip / compact / reindex)
+    // already committed and advanced Lance HEAD past the manifest in a prior attempt.
+    // Once true, a reopened `lance_head > manifest` is our own sidecar-covered work,
+    // NOT external drift — so the drift guard and the no-op early-return must not treat
+    // it as such (that would drop our committed work as uncovered drift).
+    let mut head_advanced = false;
+
     // Outer loop: open → plan → Phase B, reopening + re-planning on a retryable
     // Lance conflict. Breaks with the committed snapshot once Phase B succeeds.
     let mut attempt: u32 = 0;
@@ -412,9 +419,12 @@ async fn optimize_one_table(
                 table_key, lance_head_version, expected_version
             )));
         }
-        if lance_head_version > expected_version {
-            // Uncovered drift — go through explicit repair. Drop our own sidecar
-            // first (we have not advanced HEAD; this drift is external).
+        if !head_advanced && lance_head_version > expected_version {
+            // Pre-existing EXTERNAL uncovered drift (we have not advanced HEAD yet) —
+            // go through explicit repair. Once `head_advanced` is set, a reopened
+            // `lance_head > manifest` is our own prior Phase-B commit (sidecar-covered)
+            // that the publish below fast-forwards, NOT external drift, so this guard is
+            // skipped on those retries.
             if let Some(h) = sidecar.take() {
                 let _ = crate::db::manifest::delete_sidecar(&h, db.storage_adapter()).await;
             }
@@ -454,6 +464,18 @@ async fn optimize_one_table(
             super::table_ops::needs_index_work_edge(db, &table_key, &full_path, None).await?
         };
         if !will_compact && !needs_reindex && !needs_index_create {
+            if head_advanced {
+                // Nothing left to compact, but a prior attempt already advanced HEAD
+                // (e.g. the strip committed, then compaction conflicted, and the reopen
+                // is now already compacted). Publish that committed work instead of
+                // dropping it as uncovered drift.
+                break (
+                    crate::storage_layer::SnapshotHandle::new(ds),
+                    CompactionMetrics::default(),
+                    Vec::new(),
+                    true,
+                );
+            }
             if let Some(h) = sidecar.take() {
                 let _ = crate::db::manifest::delete_sidecar(&h, db.storage_adapter()).await;
             }
@@ -502,7 +524,8 @@ async fn optimize_one_table(
         // scrub is the only commit, `committed` still triggers the Phase-C publish.
         let version_before = ds.version().version;
         match clear_stale_auto_cleanup_config(&mut ds).await {
-            Ok(_) => {}
+            // `true` ⇒ the strip committed and advanced HEAD past the manifest.
+            Ok(stripped) => head_advanced |= stripped,
             Err(e) if attempt < COMPACTION_RETRY_BUDGET && is_retryable_lance_conflict(&e) => {
                 continue;
             }
@@ -510,7 +533,10 @@ async fn optimize_one_table(
         }
         let metrics: CompactionMetrics = if will_compact {
             match compact_files(&mut ds, options, None).await {
-                Ok(m) => m,
+                Ok(m) => {
+                    head_advanced = true;
+                    m
+                }
                 Err(e) if attempt < COMPACTION_RETRY_BUDGET && is_retryable_lance_conflict(&e) => {
                     continue;
                 }
@@ -519,6 +545,15 @@ async fn optimize_one_table(
         } else {
             CompactionMetrics::default()
         };
+        // Test seam: inject one retryable reindex conflict AFTER compaction has
+        // committed (so HEAD is already ahead of the manifest from our own work),
+        // exercising the own-HEAD (not external) drift classification on the next
+        // reopened attempt.
+        if crate::failpoints::maybe_fail("optimize.inject_reindex_conflict").is_err()
+            && attempt < COMPACTION_RETRY_BUDGET
+        {
+            continue;
+        }
         match ds.optimize_indices(&OptimizeOptions::default()).await {
             Ok(()) => {}
             Err(e) if attempt < COMPACTION_RETRY_BUDGET && is_retryable_lance_conflict(&e) => {
@@ -539,10 +574,12 @@ async fn optimize_one_table(
                 &mut snapshot,
             )
             .await?;
+        // optimize_indices / index build may also have committed (folded fragments,
+        // built a deferred index). Any HEAD advance this attempt counts too.
         let version_after = snapshot.dataset().version().version;
-        let committed = version_after != version_before;
+        head_advanced |= version_after != version_before;
 
-        break (snapshot, metrics, pending_indexes, committed);
+        break (snapshot, metrics, pending_indexes, head_advanced);
     };
 
     // Pin the per-writer Phase B → Phase C residual: Lance HEAD has advanced but the
