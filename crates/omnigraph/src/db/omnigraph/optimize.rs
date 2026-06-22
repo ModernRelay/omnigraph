@@ -594,16 +594,14 @@ async fn optimize_one_table(
     // (NOT a reopen: the compaction is already committed).
     if committed {
         let state = db.storage().table_state(&full_path, &snapshot).await?;
-        for publish_attempt in 0..COMPACTION_RETRY_BUDGET {
-            let current = db
-                .fresh_snapshot_for_branch(None)
-                .await?
-                .entry(&table_key)
-                .map(|e| e.table_version)
-                .unwrap_or(0);
+        let mut published = false;
+        let mut last_conflict: Option<OmniError> = None;
+        for _ in 0..COMPACTION_RETRY_BUDGET {
+            let current = current_manifest_version(db, &table_key).await?;
             if current >= state.version {
                 // The manifest already points at a version that includes our
                 // compaction (Lance versions are linear). Nothing to publish.
+                published = true;
                 break;
             }
             let update = crate::db::SubTableUpdate {
@@ -622,15 +620,32 @@ async fn optimize_one_table(
                 .commit_updates_with_actor_with_expected(&[update], &expected, None)
                 .await
             {
-                Ok(_) => break,
-                Err(e)
-                    if publish_attempt + 1 < COMPACTION_RETRY_BUDGET
-                        && is_retryable_manifest_conflict(&e) =>
-                {
-                    continue;
+                Ok(_) => {
+                    published = true;
+                    break;
                 }
+                // A retryable manifest conflict means the manifest moved under us —
+                // loop and re-read `current` (the top check converges if it now
+                // already includes our compaction). Record it for the exhaustion path.
+                Err(e) if is_retryable_manifest_conflict(&e) => last_conflict = Some(e),
                 // Leave the sidecar for the open-time recovery sweep to roll forward.
                 Err(e) => return Err(e),
+            }
+        }
+        if !published {
+            // Budget exhausted under sustained contention. The final conflict may
+            // itself mean a concurrent writer published a version that already
+            // includes our (content-preserving) compaction — the postcondition is
+            // "the manifest reflects our compaction," not "we won the CAS" — so
+            // re-check before surfacing an error (§6.6).
+            let current = current_manifest_version(db, &table_key).await?;
+            if current < state.version {
+                return Err(last_conflict.unwrap_or_else(|| {
+                    OmniError::manifest_conflict(format!(
+                        "optimize publish of {table_key} exhausted {COMPACTION_RETRY_BUDGET} \
+                         retries against concurrent writers"
+                    ))
+                }));
             }
         }
     }
@@ -684,6 +699,17 @@ fn is_retryable_manifest_conflict(err: &OmniError) -> bool {
         err,
         OmniError::Manifest(m) if m.kind == crate::error::ManifestErrorKind::Conflict
     )
+}
+
+/// The table's current manifest version on `main` (0 if absent), read fresh. Used by
+/// optimize's monotonic publish loop to decide no-op (`current >= N`) vs fast-forward.
+async fn current_manifest_version(db: &Omnigraph, table_key: &str) -> Result<u64> {
+    Ok(db
+        .fresh_snapshot_for_branch(None)
+        .await?
+        .entry(table_key)
+        .map(|e| e.table_version)
+        .unwrap_or(0))
 }
 
 /// Remove any stored `lance.auto_cleanup.*` config from a table so compaction
