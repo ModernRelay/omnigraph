@@ -1166,11 +1166,12 @@ impl Omnigraph {
             // + iterate pending edges in-memory for the `src` column,
             // group-by-src. The pending side already includes the row
             // we just appended (above). When the open was skipped (collapse
-            // #1), resolve a pinned read handle for the committed scan from the
-            // txn base — but only when cardinality is non-default, so the common
-            // default-cardinality edge keeps the open-free path. The pinned base
-            // read is the correct committed state (an edge insert never moves the
-            // table's Lance HEAD before the end-of-query commit).
+            // #1), resolve a read handle for the committed scan at LIVE HEAD
+            // (`edge_cardinality_read_handle`, #298) — NOT the pinned txn.base,
+            // which would undercount edges a concurrent writer committed since
+            // capture. Only when cardinality is non-default, so the common
+            // default-cardinality edge keeps the open-free path. (The residual
+            // validate→commit race is the §7.1 gap — step 4.)
             if !edge_type.cardinality.is_default() {
                 let committed_ds = match handle {
                     Some(h) => h,

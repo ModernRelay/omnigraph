@@ -217,13 +217,16 @@ async fn write_validates_schema_contract_once() {
 
 /// A keyed single-table write must open its DATA table AT MOST ONCE. Today it opens
 /// ~4× (accumulation, staging, commit drift-guard, publish-prepare/index-build), each
-/// a fresh cold `Dataset::open`. Step 3b opens the base once (with the shared Session),
-/// threads the commit-return handle, and replaces the drift-guard open with a cheap
-/// `latest_version_id` probe — collapsing to 1 open. Counted by `data_open_count`, the
+/// a fresh cold `Dataset::open`. Step 3b opens the base once (a *session-aware* base
+/// open is deferred to step 5), threads the commit-return handle, and replaces the
+/// drift-guard open with a cheap `latest_version_id` probe — collapsing to 1 open.
+/// Counted by `data_open_count`, the
 /// table-class-scoped chokepoint probe: the internal-table opens (publisher CAS +
 /// commit-graph append) are EXCLUDED, since they are unrelated to data-table reuse and
-/// would otherwise keep this count >1 regardless of threading. (`forbidden_apis`
-/// guarantees every write open routes through the instrumented chokepoints.)
+/// would otherwise keep this count >1 regardless of threading. (`forbidden_apis` keeps
+/// engine code outside the storage layer from opening datasets except through the
+/// instrumented chokepoints — `table_store.rs`'s own direct opens are branch-management
+/// ops, not this keyed-write path.)
 #[tokio::test]
 async fn keyed_insert_opens_table_at_most_once() {
     let dir = tempfile::tempdir().unwrap();

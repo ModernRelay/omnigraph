@@ -234,13 +234,23 @@ reopen/replan **semantics** are permanent. (Noted in RFC §6.6.)
 
 ## 4. DONE: Step 3b — capture-once `WriteTxn` (shipped on `rfc-013-step-3b-writetxn-v2`)
 
-**Delivered:** a single `mutate`/`load` now validates the schema contract **once** and opens
-each touched data table **at most once** — a constant-factor/RTT win (not a depth-slope win;
-1a). Two cost gates in `write_cost.rs` lock it: `write_validates_schema_contract_once`
-(3 `read_text` / 2 `exists`, was 12/9) and `keyed_insert_opens_table_at_most_once`
-(`data_open_count <= 1`, was 4). The carrier is the minimal `WriteTxn { branch, base }`,
-threaded as `Option<&WriteTxn>` (`Some` on the hot mutate/load path, `None` byte-identical
-everywhere else); it **converges into** step 5's `PublishPlan`.
+**Delivered:** on the **table-touch hot path**, a single `mutate`/`load` validates the schema
+contract **once** and opens each touched data table **at most once** — a constant-factor/RTT
+win (not a depth-slope win; 1a). Two cost gates in `write_cost.rs` lock it (both on a node
+insert): `write_validates_schema_contract_once` (3 `read_text` / 2 `exists`, was 12/9) and
+`keyed_insert_opens_table_at_most_once` (`data_open_count <= 1`, was 4). The carrier is the
+minimal `WriteTxn { branch, base }`, threaded as `Option<&WriteTxn>` (`Some` on the hot
+mutate/load path, `None` byte-identical everywhere else); it **converges into** step 5's
+`PublishPlan`.
+
+**Not "once" everywhere (scope, not regression):** edge endpoint / cardinality RI validation
+(`ensure_node_id_exists`, the loader's RI + cardinality) still resolves through
+`snapshot_for_branch` and re-validates the schema — and reads **warm**, not live. Threading
+`txn.base` there to make it "once" would re-introduce the stale-read class the #298 cardinality
+fix removed (it now reads live HEAD). Doing schema-once *and* fresh reads for those validations
+needs the unified, re-checked read-set — **step 4 §7.1** (§1d). So #298 **un-regresses
+cardinality only; it does not close write-validation freshness.** No edge-insert/load schema-once
+gate yet (only the node gates above).
 
 Commits (off merged-#297 main):
 - **Stage 0** — scope `open_count` → `data_open_count`/`internal_open_count` by URI class

@@ -50,8 +50,12 @@ pub struct QueryIoProbes {
     /// them would make the `data_open_count <= |touched_tables|` write gate
     /// (RFC-013 step 3b) unreachable by threading alone. Unlike the opener-read
     /// term (which mixes with the merge-insert/RI scan on the write path), this is
-    /// an exact open-invocation count. `forbidden_apis` guarantees every write-path
-    /// open routes through these chokepoints, so the count is complete.
+    /// an exact open-invocation count. `forbidden_apis` keeps engine code OUTSIDE the
+    /// storage layer (`exec/`, `db/omnigraph/`, `loader/`, `changes/`) from opening
+    /// datasets except through these chokepoints, so the count is complete for the
+    /// keyed-write data path the gate measures. (`table_store.rs` is allow-listed and
+    /// does hold direct `Dataset::open`s — but only for branch-management ops
+    /// (`delete_branch`/`list_branches`/`force_delete_branch`), never that hot path.)
     pub data_open_count: Arc<AtomicU64>,
     /// Internal/system-table (`__manifest`, `_graph_commits*`) open CALLS — the
     /// complement of `data_open_count`, kept for symmetry and debugging.

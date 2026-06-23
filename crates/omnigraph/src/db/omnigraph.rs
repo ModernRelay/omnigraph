@@ -767,12 +767,20 @@ impl Omnigraph {
     }
 
     /// Open a capture-once write transaction (RFC-013 step 3b): validate the schema
-    /// contract ONCE and pin the base snapshot + the shared per-graph `Session`. The
-    /// per-table opens take `Option<&WriteTxn>` and, on the bound branch for the
-    /// non-strict (Insert/Merge) path, source the pinned base entry — instead of
-    /// re-resolving (re-validating the schema) per table. Strict ops, the fork path,
-    /// and the commit-time OCC re-read keep their fresh reads (those are correctness
-    /// machinery — see the handoff doc).
+    /// contract ONCE and pin the base snapshot. The per-table opens take
+    /// `Option<&WriteTxn>` and, on the bound branch for the non-strict (Insert/Merge)
+    /// path, source the pinned base entry — instead of re-resolving (re-validating the
+    /// schema) per table. Strict ops, the fork path, and the commit-time OCC re-read
+    /// keep their fresh reads (those are correctness machinery — see the handoff doc).
+    ///
+    /// "Once" covers the table-touch hot path captured here (proven by the node-insert
+    /// gate `write_validates_schema_contract_once`); it does NOT yet cover edge endpoint
+    /// / cardinality RI validation (`ensure_node_id_exists`, the loader's RI/cardinality),
+    /// which still resolve through `snapshot_for_branch` and re-validate. Those reads must
+    /// observe LIVE committed state, so unifying them (validate-once + pinned + re-checked
+    /// read-set) is step 4's §7.1 work — threading `txn.base` there would re-introduce the
+    /// stale-read class the #298 cardinality fix removed. A session-aware base open is
+    /// likewise deferred to step 5 (handoff §1d).
     pub(crate) async fn open_write_txn(&self, branch: Option<&str>) -> Result<WriteTxn> {
         let resolved = self.resolved_branch_target(branch).await?;
         Ok(WriteTxn {
