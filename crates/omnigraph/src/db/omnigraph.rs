@@ -81,11 +81,14 @@ pub struct SchemaApplyPreview {
 }
 
 /// A capture-once write transaction (RFC-013 step 3b). Pins the operation's read
-/// base + the shared `Session` ONCE so the per-table opens reuse the pinned version
-/// and the warm session instead of re-resolving / re-validating / cold-opening per
-/// table. The schema contract is validated once (when `base` is captured). NOT a
-/// general "no re-resolution" handle — the commit-time OCC re-read, the live-HEAD
-/// drift probe, and the fork-authority reads stay fresh (correctness machinery).
+/// base ONCE so the per-table opens reuse the pinned version instead of
+/// re-resolving / re-validating per table. The schema contract is validated once
+/// (when `base` is captured). NOT a general "no re-resolution" handle — the
+/// commit-time OCC re-read, the live-HEAD drift probe, and the fork-authority reads
+/// stay fresh (correctness machinery). Step 5 (PublishPlan unification) makes this
+/// the non-optional publish carrier and adds session-aware base opens there, gated
+/// by an S3 cost test — the warm-session benefit on the single remaining open is an
+/// object-store phenomenon, so it earns its own gate rather than riding this PR.
 ///
 /// Threaded as `Option<&WriteTxn>` through the mutate/load write chain
 /// (`open_for_mutation_on_branch`, `commit_all`, `commit_updates_on_branch_with_expected`)
@@ -104,11 +107,6 @@ pub(crate) struct WriteTxn {
     pub(crate) branch: Option<String>,
     /// The pinned base snapshot (per-table location + version + e_tag), captured once.
     pub(crate) base: Snapshot,
-    /// The shared per-graph Session, captured here so the follow-up change that
-    /// makes the per-table base opens session-aware can reuse it. Not read yet by
-    /// the schema-once threading (which only uses `base` + `branch`).
-    #[allow(dead_code)]
-    pub(crate) session: Arc<lance::session::Session>,
 }
 
 /// Top-level handle to an Omnigraph database.
@@ -771,16 +769,15 @@ impl Omnigraph {
     /// Open a capture-once write transaction (RFC-013 step 3b): validate the schema
     /// contract ONCE and pin the base snapshot + the shared per-graph `Session`. The
     /// per-table opens take `Option<&WriteTxn>` and, on the bound branch for the
-    /// non-strict (Insert/Merge) path, open from the pinned base entry with the warm
-    /// session — instead of re-resolving (re-validating the schema) and cold-opening
-    /// HEAD per table. Strict ops, the fork path, and the commit-time OCC re-read keep
-    /// their fresh reads (those are correctness machinery — see the handoff doc).
+    /// non-strict (Insert/Merge) path, source the pinned base entry — instead of
+    /// re-resolving (re-validating the schema) per table. Strict ops, the fork path,
+    /// and the commit-time OCC re-read keep their fresh reads (those are correctness
+    /// machinery — see the handoff doc).
     pub(crate) async fn open_write_txn(&self, branch: Option<&str>) -> Result<WriteTxn> {
         let resolved = self.resolved_branch_target(branch).await?;
         Ok(WriteTxn {
             branch: resolved.branch,
             base: resolved.snapshot,
-            session: Arc::clone(&self.read_caches.session),
         })
     }
 
