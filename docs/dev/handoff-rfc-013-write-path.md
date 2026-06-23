@@ -33,9 +33,10 @@ for the canonical list. Current reality:
 - **#254** `ragnorc/bug-4-schema-apply-occ` — schema-apply vs optimize false-fail
   (same op-class family as #297, logical side).
 
-**Next step to implement: Step 3b (capture-once `WriteTxn`)** — see §4. After that:
-Phase 7 (step 4), then the big one — **Design A / `PublishPlan` unification (step 5)** —
-see §5, which is the convergent fix for the bug *class* this area keeps generating.
+**Step 3b is DONE** (capture-once `WriteTxn`, schema-once + open-collapse; see §4) on
+`rfc-013-step-3b-writetxn-v2`. **Next: Phase 7 (step 4), then the big one — Design A /
+`PublishPlan` unification (step 5)** — see §5, the convergent fix for the bug *class* this
+area keeps generating, which also absorbs 3b's deferred session-aware write opens.
 
 ---
 
@@ -183,48 +184,51 @@ reopen/replan **semantics** are permanent. (Noted in RFC §6.6.)
 
 ---
 
-## 4. NEXT: Step 3b — capture-once `WriteTxn` (designed + validated this cycle)
+## 4. DONE: Step 3b — capture-once `WriteTxn` (shipped on `rfc-013-step-3b-writetxn-v2`)
 
-**Goal:** collapse the redundant per-write opens (3–4×/table → 1), warm the shared
-`Session` on write opens, and validate the schema contract **once** per write — making
-mid-write re-resolution unrepresentable (invariant 3). **Constant-factor/RTT win, not a
-depth-slope win** (1a).
+**Delivered:** a single `mutate`/`load` now validates the schema contract **once** and opens
+each touched data table **at most once** — a constant-factor/RTT win (not a depth-slope win;
+1a). Two cost gates in `write_cost.rs` lock it: `write_validates_schema_contract_once`
+(3 `read_text` / 2 `exists`, was 12/9) and `keyed_insert_opens_table_at_most_once`
+(`data_open_count <= 1`, was 4). The carrier is the minimal `WriteTxn { branch, base }`,
+threaded as `Option<&WriteTxn>` (`Some` on the hot mutate/load path, `None` byte-identical
+everywhere else); it **converges into** step 5's `PublishPlan`.
 
-**Scope:** the hot writers only — `load_as` + `mutate_as` (they share `MutationStaging`).
-NOT the 4-writer→`PublishPlan` collapse (that's step 5). NOT Phase 7. NOT recovery-off-hot-path.
+Commits (off merged-#297 main):
+- **Stage 0** — scope `open_count` → `data_open_count`/`internal_open_count` by URI class
+  (the review fix: `open_dataset_tracked` also opens `__manifest`/`_graph_commits`, so the
+  raw counter conflated them and the gate was unreachable). Re-baselined RED 4.
+- **Commit A (schema-once)** — capture `txn` once at entry (the single validation); the 4
+  validation sites collapse: S1 (entry `ensure_schema_state_valid`) removed; S3a
+  (`open_for_mutation_on_branch`) + S3b (`prepare_updates_for_commit`) source `txn.base`;
+  S4 (`commit_all`) uses new `fresh_snapshot_for_branch_unchecked` (the OCC manifest re-read
+  minus the schema re-validation). `fresh_snapshot_for_branch{,_unchecked}` now read the
+  manifest directly via `ManifestCoordinator` (drops a spurious commit-graph `exists` probe;
+  same `Snapshot`).
+- **Commit B (open collapse 4→1)** — #1 accumulation open ELIMINATED (the node path discarded
+  the handle; read `txn.base.entry().table_version`); #2 staging open KEPT (the one open);
+  #3 commit drift-guard reads live HEAD via `entry.dataset.dataset().latest_version_id()` (a
+  cheap manifest-pointer probe off the staged handle, not a fresh open); #4 index build reuses
+  the `commit_staged` handle threaded through `CommittedMutation`/`prepare_updates_for_commit`.
+- **Commit B.1 + cleanup** — named the two positional returns (`OpenedForMutation`,
+  `CommittedMutation`) + a `debug_assert` pinning the open-skip contract; **removed the
+  unearned `WriteTxn.session` field** (the collapse uses skip/probe/reuse, not a session).
 
-**Three design corrections to RFC §4.1 (apply these — the old sketch is wrong on them):**
-1. **Thread the evolving handle, not a version-keyed `HandleCache`.** The opens aren't N
-   reads of one immutable version; they're the table at *successive HEADs* (staging
-   commits, index build commits). Carry the handle Lance returns from each commit forward;
-   don't re-open by key. (The read-side version-keyed cache is correctly NOT reused for
-   write handles.)
-2. **Drop "re-resolution unrepresentable" as the invariant.** Three fresh reads are
-   load-bearing correctness machinery, not waste: the commit-time `fresh_snapshot_for_branch`
-   (cross-process OCC), the post-commit HEAD re-derive (HEAD moved between stages), and the
-   fork-authority reads. Model "pinned read **base** for the pre-first-commit phase +
-   named commit-protocol re-reads," not "forbid all re-derivation."
-3. **Ship a minimal carrier**, not the §4.1 bundle: `WriteTxn { branch, base: Snapshot,
-   session, schema_validated_once }`. It **converges into** step 5's `PublishPlan` (step 5
-   grows it), so it's lower-liability than scattering localized fixes.
+**RFC §4.1 corrections — how they resolved:**
+1. *Thread the evolving handle, not a version-keyed cache* → realized as collapse #4 (carry
+   the `commit_staged` handle forward into the index build).
+2. *Don't forbid re-resolution* → honored: the commit-time OCC re-read
+   (`fresh_snapshot_for_branch_unchecked` — fresh manifest, only schema-revalidation dropped)
+   and the fork-authority reads stay fresh.
+3. *Minimal carrier* → `WriteTxn { branch, base }` (even the `session` from the original
+   sketch was dropped as unearned).
 
-**Likely-eliminable open:** the accumulation open (#1) may use its `Dataset` only for
-`ds.version()`, and the version is already in `base.entry(table).table_version` — so it may
-be *deleted*, not cached (verify during impl).
-
-**Implementation sequence (test-first):**
-1. **Cost gate (red).** Add to `write_cost.rs`: `validate_schema_contract_calls == 1`
-   (reuse `CountingStorageAdapter`, zero prod change) and `opens ≤ |touched_tables|` (add
-   `open_count` to `QueryIoProbes`). Red against current code.
-2. **Thread the `Session` into the write opener** (`open_dataset_head_for_write` opens
-   read-style by pinned version with `Some(&session)`).
-3. **Introduce `WriteTxn`**, captured once at entry of `mutate_as`/`load_as`, threaded
-   through staging; serve opens from one forwarded handle; re-probe version at the commit
-   drift-guard.
-4. **Collapse schema validation to once-per-write** (single point:
-   `resolved_branch_target`/`fresh_snapshot_for_branch` both call `ensure_schema_state_valid`
-   first-line).
-5. Gate green; `cargo test --workspace --locked`; S3 round-trip check on `write_cost_s3.rs`.
+**Deferred to step 5 (NOT in this PR):** session-aware write base opens. The one remaining
+open (#2) stays a HEAD open; warming the shared `Session` across writes is an object-store
+(S3) phenomenon invisible on local FS, so it earns its own `write_cost_s3.rs` gate in step 5,
+where `txn` becomes the non-optional publish carrier. No new concurrency test was needed here:
+#2 stays a HEAD open (no pinned+session base introduced), so the publisher CAS + #3 live-HEAD
+probe fences are unchanged (covered by the green `writes.rs`/`consistency.rs`).
 
 **Guardrails (don't regress):** schema validation is deliberately uncached for drift
 detection — collapse to 1 *per write*, never cache across writes on a long-lived handle
