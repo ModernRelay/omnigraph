@@ -602,29 +602,36 @@ use super::staging::{MutationStaging, PendingMode};
 /// ([lance-format/lance#6658](https://github.com/lance-format/lance/issues/6658))
 /// and we can stage deletes on the same path as inserts/updates.
 impl Omnigraph {
-    /// Resolve a pinned READ handle for an edge table's committed-state
-    /// cardinality scan when collapse #1 skipped the accumulation open. The
-    /// edge-insert path no longer opens the edge dataset (non-strict op + txn),
-    /// but `@card` validation needs to scan committed `src` values. The pinned
-    /// `txn.base` entry is the correct committed image: an edge insert never
-    /// advances the table's Lance HEAD before the end-of-query commit, so the
-    /// base version equals live committed HEAD. Falls back to a fresh
-    /// per-branch snapshot only if no txn is in flight (defensive — the `None`
-    /// handle that reaches this is always under a txn today).
+    /// Resolve a LIVE-HEAD read handle for an edge table's committed-state `@card`
+    /// scan when collapse #1 skipped the accumulation open. The edge-insert path no
+    /// longer opens the edge dataset (non-strict op + txn), but cardinality is
+    /// validated ONCE (never rechecked at commit), so the scan must observe the
+    /// freshest committed edges — NOT the pinned `txn.base`. A concurrent writer can
+    /// commit edges to this table after `txn` capture; counting against the stale
+    /// base undercounts and lets a violating insert through (invariant 9). The table
+    /// LOCATION is read from the pinned entry (stable across versions); the dataset is
+    /// opened at live HEAD via `open_dataset_head_for_write` (a read here despite the
+    /// name — no lock/stage), restoring the pre-3b image (the mutation's own open).
+    /// The residual validate→commit race (a writer committing between this scan and
+    /// the end-of-query commit) is the §7.1 gap, closed by RFC-013 step 4.
     async fn edge_cardinality_read_handle(
         &self,
         txn: Option<&crate::db::WriteTxn>,
         table_key: &str,
     ) -> Result<SnapshotHandle> {
-        let entry = match txn {
-            Some(txn) => txn.base.entry(table_key).cloned(),
-            None => None,
-        };
-        match entry {
-            Some(entry) => self.storage().open_snapshot_at_entry(&entry).await,
+        let branch = txn.and_then(|t| t.branch.as_deref());
+        match txn.and_then(|t| t.base.entry(table_key)) {
+            Some(entry) => {
+                let full_path = self.storage().dataset_uri(&entry.table_path);
+                self.storage()
+                    .open_dataset_head_for_write(table_key, &full_path, branch)
+                    .await
+            }
+            // Unreachable today (the `None` handle only reaches here under a txn whose
+            // base contains the table). Defensive: resolve the table fresh (live)
+            // without the schema re-validation `snapshot_for_branch` would re-run.
             None => {
-                let branch = txn.and_then(|t| t.branch.clone());
-                let snapshot = self.snapshot_for_branch(branch.as_deref()).await?;
+                let snapshot = self.fresh_snapshot_for_branch_unchecked(branch).await?;
                 self.storage().open_snapshot_at_table(&snapshot, table_key).await
             }
         }
