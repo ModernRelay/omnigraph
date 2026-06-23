@@ -43,6 +43,23 @@ pub struct QueryIoProbes {
     /// handle cache (Fix 3) serves them.
     pub table_wrapper: Option<Arc<dyn WrappingObjectStore>>,
     pub probe_count: Arc<AtomicU64>,
+    /// Counts DATA-table open CALLS through the two instrumented chokepoints
+    /// (`open_dataset_tracked` / `open_table_dataset`), classified by URI so the
+    /// internal/system tables (`__manifest`, `_graph_commits*`) are EXCLUDED — the
+    /// publisher CAS and commit-graph append open those every write, and counting
+    /// them would make the `data_open_count <= |touched_tables|` write gate
+    /// (RFC-013 step 3b) unreachable by threading alone. Unlike the opener-read
+    /// term (which mixes with the merge-insert/RI scan on the write path), this is
+    /// an exact open-invocation count. `forbidden_apis` keeps engine code OUTSIDE the
+    /// storage layer (`exec/`, `db/omnigraph/`, `loader/`, `changes/`) from opening
+    /// datasets except through these chokepoints, so the count is complete for the
+    /// keyed-write data path the gate measures. (`table_store.rs` is allow-listed and
+    /// does hold direct `Dataset::open`s — but only for branch-management ops
+    /// (`delete_branch`/`list_branches`/`force_delete_branch`), never that hot path.)
+    pub data_open_count: Arc<AtomicU64>,
+    /// Internal/system-table (`__manifest`, `_graph_commits*`) open CALLS — the
+    /// complement of `data_open_count`, kept for symmetry and debugging.
+    pub internal_open_count: Arc<AtomicU64>,
 }
 
 tokio::task_local! {
@@ -78,6 +95,39 @@ pub(crate) fn table_wrapper() -> Option<Arc<dyn WrappingObjectStore>> {
 /// No-op when no probes are installed (production).
 pub(crate) fn record_probe() {
     let _ = current(|p| p.probe_count.fetch_add(1, Ordering::Relaxed));
+}
+
+/// Internal/system table directory names. An open of one of these is a metadata
+/// open (publisher CAS, commit-graph append, recovery audit), NOT a data-table
+/// open. Kept in sync with the dir constants in `db/manifest/layout.rs`,
+/// `db/commit_graph.rs`, and `db/recovery_audit.rs`.
+const INTERNAL_TABLE_DIRS: [&str; 4] = [
+    "__manifest",
+    "_graph_commits.lance",
+    "_graph_commit_actors.lance",
+    "_graph_commit_recoveries.lance",
+];
+
+/// True when `uri`'s last path segment names an internal/system table.
+fn open_is_internal(uri: &str) -> bool {
+    let trimmed = uri.trim_end_matches('/');
+    let last = trimmed.rsplit('/').next().unwrap_or(trimmed);
+    INTERNAL_TABLE_DIRS.contains(&last)
+}
+
+/// Record one table-open call against the active per-query probes, classified by
+/// table class (the URI's last segment) so the write gate counts DATA-table opens
+/// only and ignores the publisher/commit-graph metadata opens. No-op in production
+/// (the classification runs only inside the probe closure, which `current` skips
+/// when no probes are installed). Called at both open chokepoints.
+pub(crate) fn record_open(uri: &str) {
+    let _ = current(|p| {
+        if open_is_internal(uri) {
+            p.internal_open_count.fetch_add(1, Ordering::Relaxed);
+        } else {
+            p.data_open_count.fetch_add(1, Ordering::Relaxed);
+        }
+    });
 }
 
 /// Per-operation staged-write counts, installed for a task via
@@ -177,6 +227,7 @@ pub(crate) async fn open_dataset_tracked(
     uri: &str,
     wrapper: Option<Arc<dyn WrappingObjectStore>>,
 ) -> Result<Dataset> {
+    record_open(uri);
     let result = match wrapper {
         None => Dataset::open(uri).await,
         Some(wrapper) => {
@@ -203,6 +254,7 @@ pub(crate) async fn open_table_dataset(
     version: u64,
     session: Option<&Arc<lance::session::Session>>,
 ) -> Result<Dataset> {
+    record_open(location);
     let mut builder = DatasetBuilder::from_uri(location).with_version(version);
     if let Some(session) = session {
         builder = builder.with_session(session.clone());

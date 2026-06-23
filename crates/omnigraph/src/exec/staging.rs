@@ -440,6 +440,26 @@ struct StagedTableEntry {
     staged_write: StagedHandle,
 }
 
+/// Output of [`StagedMutation::commit_all`] (Phase B): the publisher's input plus
+/// the queue guards the caller must hold across the manifest publish.
+pub(crate) struct CommittedMutation {
+    /// Per-table updates to publish to the manifest.
+    pub(crate) updates: Vec<SubTableUpdate>,
+    /// Per-table manifest pins refreshed under the write queue — the publisher's CAS fence.
+    pub(crate) expected_versions: HashMap<String, u64>,
+    /// Recovery sidecar to delete after Phase C succeeds (`None` when nothing staged).
+    pub(crate) sidecar_handle: Option<RecoverySidecarHandle>,
+    /// Per-`(table, branch)` write-queue guards — the caller MUST hold these across
+    /// the manifest publish (see `commit_all`) so no writer interleaves between
+    /// `commit_staged` and the publish.
+    pub(crate) guards: Vec<tokio::sync::OwnedMutexGuard<()>>,
+    /// Post-`commit_staged` handle per STAGED table (table_key → handle at the
+    /// just-committed version). Carried out (RFC-013 step 3b, collapse #4) so the
+    /// publish-prepare index build reuses it instead of a fresh `reopen_for_mutation`
+    /// at the same version. Inline-committed / delete tables are absent (no staged handle).
+    pub(crate) committed_handles: HashMap<String, SnapshotHandle>,
+}
+
 impl StagedMutation {
     /// **Phase B** of the two-phase commit: acquire per-`(table_key,
     /// branch)` queues, revalidate manifest pins, write the recovery
@@ -485,12 +505,8 @@ impl StagedMutation {
             Vec<(String, Option<String>)>,
             Vec<tokio::sync::OwnedMutexGuard<()>>,
         )>,
-    ) -> Result<(
-        Vec<SubTableUpdate>,
-        HashMap<String, u64>,
-        Option<RecoverySidecarHandle>,
-        Vec<tokio::sync::OwnedMutexGuard<()>>,
-    )> {
+        txn: Option<&crate::db::WriteTxn>,
+    ) -> Result<CommittedMutation> {
         let StagedMutation {
             inline_committed,
             mut staged,
@@ -585,7 +601,18 @@ impl StagedMutation {
         // Multi-coordinator deployments (§VI.27 aspirational) get
         // genuine cross-process drift detection from this read for
         // free.
-        let snapshot = db.fresh_snapshot_for_branch(branch).await?;
+        //
+        // This MUST be a FRESH per-branch manifest read (never the warm
+        // cache) for the OCC re-capture below — but with a `WriteTxn` the
+        // schema contract was already validated at capture, so use the
+        // `_unchecked` variant, which drops the redundant
+        // `ensure_schema_state_valid` AND the commit-graph load the OCC read
+        // never consults (a fresh manifest read yields the same `Snapshot`).
+        // Without a txn this is byte-identical to the prior checked call.
+        let snapshot = match txn {
+            Some(_) => db.fresh_snapshot_for_branch_unchecked(branch).await?,
+            None => db.fresh_snapshot_for_branch(branch).await?,
+        };
         for entry in staged.iter_mut() {
             let current = snapshot
                 .entry(&entry.table_key)
@@ -619,15 +646,20 @@ impl StagedMutation {
             // live Lance HEAD still equals that manifest pin. If an external
             // raw Lance write or a pre-fix maintenance path moved HEAD without
             // publishing `__manifest`, this write must not silently fold it.
-            let head = db
-                .storage()
-                .open_dataset_head_for_write(
-                    &entry.table_key,
-                    &entry.path.full_path,
-                    entry.path.table_branch.as_deref(),
-                )
-                .await?
-                .version();
+            //
+            // `latest_version_id` reads the latest manifest pointer off the
+            // already-open staged handle (the #2 staging open) WITHOUT a fresh
+            // `Dataset::open` — the same cheap live-HEAD probe
+            // `ManifestCoordinator::probe_latest_version` uses. This replaces a
+            // redundant `open_dataset_head_for_write` (RFC-013 step 3b, collapse
+            // #3): the drift comparison below is byte-identical; only how `head`
+            // is obtained changes (probe vs cold open).
+            let head = entry
+                .dataset
+                .dataset()
+                .latest_version_id()
+                .await
+                .map_err(|e| OmniError::Lance(e.to_string()))?;
             if head < current {
                 return Err(OmniError::manifest_internal(format!(
                     "table '{}' Lance HEAD version {} is behind manifest version {}",
@@ -786,6 +818,12 @@ impl StagedMutation {
 
         let mut updates: Vec<SubTableUpdate> = inline_committed.into_values().collect();
 
+        // Carry each staged table's post-`commit_staged` handle out so the
+        // publish-prepare index build reuses it (collapse #4) instead of
+        // re-opening the dataset at the same just-committed version.
+        let mut committed_handles: HashMap<String, SnapshotHandle> =
+            HashMap::with_capacity(staged.len());
+
         for entry in staged {
             let StagedTableEntry {
                 table_key,
@@ -798,15 +836,22 @@ impl StagedMutation {
             let new_ds = db.storage().commit_staged(dataset, staged_write).await?;
             let state = db.storage().table_state(&path.full_path, &new_ds).await?;
             updates.push(SubTableUpdate {
-                table_key,
+                table_key: table_key.clone(),
                 table_version: state.version,
                 table_branch: path.table_branch.clone(),
                 row_count: state.row_count,
                 version_metadata: state.version_metadata,
             });
+            committed_handles.insert(table_key, new_ds);
         }
 
-        Ok((updates, expected_versions, sidecar_handle, guards))
+        Ok(CommittedMutation {
+            updates,
+            expected_versions,
+            sidecar_handle,
+            guards,
+            committed_handles,
+        })
     }
 }
 
