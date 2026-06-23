@@ -88,6 +88,54 @@ drift guard). Each interpreter is a fresh chance to misclassify. That is the bug
 **The convergent fix is Design A (one publish authority — step 5); Lance MTT eventually
 retires the window entirely.** See §5.
 
+### 1d. The second facet: the write base is a stale pin (no probe)
+The READ path resolves its base behind a freshness probe (`resolve_target_inner`
+omnigraph.rs:~1072 → `probe_latest_incarnation` → `refresh_manifest_only`); the WRITE path
+does NOT (`resolved_branch_target` omnigraph.rs:~778 returns the warm `coord.snapshot()` for
+the bound branch, no probe). So a long-lived server's write base lags the live manifest. That
+single staleness feeds **two distinct failure modes**, both surfaced this cycle:
+
+1. **Stale validation *reads* → integrity under-enforced.** Write-path RI checks read
+   committed state off the stale base. 3b's collapse #1 made it worse for edge `@card`:
+   `edge_cardinality_read_handle` (mutation.rs:~614) scans the pinned `txn.base` instead of
+   live HEAD (was live HEAD pre-3b), so a concurrent edge committed after `txn` capture is
+   uncounted → a `@card` max can be exceeded (cursor **High** / codex **P1** on #298,
+   **VALID**). **#298 fix: restore the live-HEAD read for that scan** (un-regress; gate-safe —
+   the `data_open_count` gate is a node insert) + a deterministic regression test (commit A's
+   edge, then B validates → must see A) + correct the wrong "pinned base == live HEAD" doc
+   comment (mutation.rs:~605-613, which assumes a single writer). The *structural* liability
+   underneath: there is **no unified write-validation read-set** — endpoint
+   (`ensure_node_id_exists`, warm `snapshot_for_branch`), cardinality (mutation: pinned
+   `txn.base`; loader: warm `snapshot_for_branch` — the SAME check forks per write path),
+   commit drift guard (live `fresh_snapshot_for_branch`), and uniqueness
+   (`enforce_unique_constraints_intra_batch`, intra-batch only — cross-version uniqueness is a
+   documented gap). Three freshness levels chosen ad hoc, none re-validated at commit → the
+   §7.1 TOCTOU class, and each new constraint forks the pattern again.
+
+2. **Stale OCC *pin* → false-fail on a maintenance advance.** A served strict update/delete
+   pins the stale base version, then false-fails `ExpectedVersionMismatch` after an external
+   `optimize` advanced `__manifest` — even though the advance was content-preserving
+   compaction the logical write should fast-forward past (invariant 7). It's the **write-side
+   mirror of #297/§6.6** (#297 made optimize fast-forward past a logical write; this is a
+   logical write that must fast-forward past optimize). A served read clears it (the read
+   probes the shared coordinator). Validated repro on prod (omnigraph.ragnor.co) +
+   `writes.rs::served_strict_delete_after_external_optimize_advance_auto_refreshes`
+   (`#[ignore]` on branch `fix/write-path-stale-view-probe`). **The naive "just probe" fix is
+   proven wrong** — a blanket probe silently refreshes past *logical* advances too, breaking
+   `consistency::stale_handle_public_mutation_must_refresh_then_retry` (the deliberate
+   cross-process lost-update OCC primitive). The fix must **discriminate by op class**.
+
+**Both fold into Design A (step 5), same as §1c.** `open_txn`'s one warm probe makes the base
+fresh (absorbs maintenance advances cheaply); the **op-class-aware strict precondition** —
+derive from Lance's per-version transaction metadata (all `Rewrite`/`ReserveFragments` =
+maintenance → fast-forward the pin; any `Append`/`Update`/`Delete`/`Merge` = logical → fail
+loudly; NO parallel marker, invariant 1/15) — is the correctness fence for anything that lands
+after. And the §7.1 read-set-in-CAS unifies the validation read-set + re-validates it under the
+`graph_head` contention. So **the stale-view false-fail, the cardinality/validation-read-set
+liability, and #297's mirror are one bug** (the write base is a stale, un-probed, un-classified
+pin) with **one home: the single PublishPlan delta-interpreter** (§1c + §5). Strong corroboration
+of Design A — three symptoms, one fix.
+
 ---
 
 ## 2. Validated facts — do NOT re-derive these
@@ -305,12 +353,27 @@ open; delete #6658 shipped). Track, don't build yet.
 ---
 
 ## 8. Remaining RFC steps after 3b (RFC §9 is canonical)
+- **#298 follow-up (do on the 3b PR, before merge): the edge-`@card` stale-read regression**
+  (§1d.1). Restore the live-HEAD cardinality scan, add the deterministic regression test, fix
+  the wrong doc comment. Small, gate-safe, un-regresses an integrity check (invariant 9). The
+  residual concurrent TOCTOU is the §7.1 gap (step 4) — un-widen here, don't over-reach.
 - **Step 4 / Phase 7** (`iss-991`): lineage into `__manifest` (publish `graph_commit` +
   mutable `graph_head:<branch>` in the same merge-insert; `_graph_commits` becomes a
   projection). Removes the per-write `commit_graph.refresh`; closes the manifest→commit-graph
   atomicity + commit-graph-parent-under-concurrency gaps. **Hard prereq: step 2 (done).**
-  Carries the §7.1 *concurrent* write-skew fix (needs the `graph_head` contention row).
-- **Step 5 / Design A** — §5 above.
+  Carries the §7.1 *concurrent* write-skew fix (needs the `graph_head` contention row) —
+  **frame §7.1 as "unify the entire write-validation read-set" (endpoint + cardinality +
+  cross-version uniqueness), not merely "add `graph_head`"** (§1d.1): the bespoke
+  `edge_cardinality_read_handle` and the mutation-vs-loader freshness fork dissolve into one
+  pinned read-set re-validated under the `graph_head` contention, or the liability survives as
+  a second special-case.
+- **Step 5 / Design A** — §5 above. **Acceptance item: the served-strict-write stale-view
+  false-fail** (§1d.2) — the op-class-aware precondition + `open_txn` probe. The contract is
+  two tests passing *together*: un-ignore
+  `writes.rs::served_strict_delete_after_external_optimize_advance_auto_refreshes` (goes green)
+  *while* `consistency::stale_handle_public_mutation_must_refresh_then_retry` stays green
+  (maintenance fast-forwards; logical fails loudly). Self-contained enough to ship standalone
+  like #297 if prod pain is acute; otherwise fold into the single PublishPlan delta-interpreter.
 - **Step 2b** — internal-table cleanup + the Q8 monotonic watermark (a Lance boundary tag).
   Deferred: only the secondary version-count/space term, touches the read/open path, and is
   MTT-redundant. Land when version-count cost bites.
