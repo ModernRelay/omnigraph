@@ -1,7 +1,8 @@
 # RFC-013 Step 3b: the capture-once `WriteTxn` — unify the write opener
 
-**Status:** Proposed (implementation spec for a sequenced step of
-[rfc-013-write-path-latency.md](rfc-013-write-path-latency.md))
+**Status:** SHIPPED as PR #298 — but the implementation **deliberately diverged to a
+minimal subset** of this spec (see the banner below). This doc is the original design
+intent, not what shipped.
 **Parent:** RFC-013 §4.1 (`WriteTxn` interface), §4.2 (supporting mechanics),
 §9 step 3b
 **Depends on:** nothing un-landed — step 3a (opener bypass, PR #288) and PR #277
@@ -12,6 +13,26 @@ compaction), step 4 (Phase-7 lineage), step 5 (`PublishPlan` + epoch).
 > Evidence tags follow the parent: **[S]** verified in v0.7.1 source
 > (`file:line`), **[U]** verified against upstream Lance 7.0.0, **[M]** measured,
 > **[G]** dev-graph ticket. Unmarked claims are design intent.
+
+> **⚠️ Implementation note (post-#298) — this spec is the original design intent, NOT
+> what shipped.** #298 shipped a **minimal** `WriteTxn { branch, base }` — **schema-once
+> + the open-collapse** (eliminate the accumulation open / replace the commit drift-guard
+> open with a cheap `latest_version_id` probe / thread the `commit_staged` handle into the
+> index build) — and **deferred the rest of this spec to step 5 (`PublishPlan`)**:
+> open-at-pinned-version, the shared `Session` on write opens, the write-local **handle
+> cache** (`WriteHandleCache`), and the **strict-op conflict-timing move** (strict ops still
+> open live HEAD + `ensure_expected_version`; they were NOT moved to commit-time CAS). So
+> **§2.1–§2.4** (handle cache, open-at-pinned-version, the strict-timing move) and the §5
+> differential test describe **step-5 design, not #298** — read them as such. What actually
+> shipped is recorded in [handoff-rfc-013-write-path.md](handoff-rfc-013-write-path.md) §4.
+>
+> The three review comments on this doc are therefore **moot for #298** (it built none of
+> those constructs) but are **load-bearing constraints for step 5**, banked in **handoff
+> §5.1**: (1) the handle cache must be `Send + Sync` (`Mutex`, not `RefCell`); (2) the
+> strict-timing move needs an explicit retry contract — txn discarded after any commit,
+> retry re-opens a fresh base (the SAME contract as the stale-view false-fail, handoff
+> §1d.2); (3) the opener-equivalence test must advance HEAD externally then assert the
+> pinned base, not the trivial `HEAD == base` case.
 
 ## 0. Scope — what 3b is, and is not
 
