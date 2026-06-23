@@ -14,12 +14,12 @@
 //! this change additive.
 //!
 //! Atomicity caveat: append to `_graph_commit_recoveries.lance` is
-//! sequential w.r.t. the `CommitGraph::append_commit` write. A crash
-//! between the two leaves an orphan commit-graph row with no audit row.
-//! Same shape as the existing `_graph_commits` + `_graph_commit_actors`
-//! split; the recovery sweep tolerates it the same way (re-entry sees
-//! `NoMovement` for already-restored / already-published tables; the
-//! audit append is retried).
+//! sequential w.r.t. the recovery commit, which RFC-013 Phase 7 records in
+//! `__manifest` (folded into the recovery publish CAS via `publish_recovery_commit`).
+//! A crash between the publish and this audit append leaves a recovery commit
+//! with no audit row. The recovery sweep tolerates it the same way (re-entry
+//! sees `NoMovement` for already-restored / already-published tables; the audit
+//! append is retried, minting a fresh recovery commit).
 
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};

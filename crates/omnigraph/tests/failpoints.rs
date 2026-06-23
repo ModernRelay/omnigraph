@@ -3528,47 +3528,24 @@ async fn branch_merge_phase_b_failure_recovered_on_next_open() {
     );
 
     // The recovered branch_merge must record a MERGE commit (with
-    // `merged_parent_commit_id` set), not a plain commit. Without
-    // this, future merges between the same pair lose
-    // already-up-to-date detection. We verify by reading
-    // `_graph_commits.lance` and asserting the most recent commit
-    // tagged with the recovery actor has a non-null
-    // `merged_parent_commit_id`.
+    // `merged_parent_commit_id` set), not a plain commit. Without this, future
+    // merges between the same pair lose already-up-to-date detection. RFC-013
+    // Phase 7 records the recovery commit in `__manifest` (folded into the
+    // recovery publish CAS), so we read it through the commit-graph projection
+    // (`CommitGraph::load_commits`) and assert some commit carries a non-null
+    // `merged_parent_commit_id`. Only a recovered branch_merge can produce one
+    // here (we never completed a normal merge in this test).
     {
-        use arrow_array::{Array, StringArray};
-        use futures::TryStreamExt;
-        let commits_dir = dir.path().join("_graph_commits.lance");
-        let ds = lance::Dataset::open(commits_dir.to_str().unwrap())
-            .await
-            .unwrap();
-        let batches: Vec<arrow_array::RecordBatch> = ds
-            .scan()
-            .try_into_stream()
-            .await
-            .unwrap()
-            .try_collect()
-            .await
-            .unwrap();
-        let mut found_recovery_merge = false;
-        for batch in batches {
-            let merged = batch
-                .column_by_name("merged_parent_commit_id")
-                .expect("merged_parent_commit_id column present")
-                .as_any()
-                .downcast_ref::<StringArray>()
-                .expect("merged_parent_commit_id is Utf8");
-            // The actor_id lives in _graph_commit_actors; cross-checking
-            // is heavier than necessary. Detecting any non-null
-            // merged_parent_commit_id in the post-recovery state is
-            // sufficient: only a recovered branch_merge can produce one
-            // here (we never completed a normal merge in this test).
-            for i in 0..merged.len() {
-                if !merged.is_null(i) {
-                    found_recovery_merge = true;
-                    break;
-                }
-            }
-        }
+        let commits =
+            omnigraph::db::commit_graph::CommitGraph::open(dir.path().to_str().unwrap())
+                .await
+                .unwrap()
+                .load_commits()
+                .await
+                .unwrap();
+        let found_recovery_merge = commits
+            .iter()
+            .any(|c| c.merged_parent_commit_id.is_some());
         assert!(
             found_recovery_merge,
             "recovered branch_merge must record `merged_parent_commit_id` so future \

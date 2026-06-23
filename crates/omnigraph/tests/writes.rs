@@ -613,7 +613,10 @@ async fn mixed_insert_and_update_on_same_person_coalesces_to_one_merge() {
         "dedupe must keep the update's age value, not the insert's",
     );
 
-    // One-publish guarantee: manifest version advanced by exactly 1.
+    // One-publish guarantee: manifest version advanced by exactly 1. The graph
+    // commit (`graph_commit` + `graph_head` rows) rides the SAME publish CAS as
+    // the table-version rows (RFC-013 Phase 7), so one graph commit is exactly
+    // one manifest version bump.
     let post_version = version_main(&db).await.unwrap();
     assert_eq!(
         post_version,
@@ -659,7 +662,9 @@ async fn multiple_appends_to_same_edge_coalesce_to_one_append() {
     let edges_after = count_rows(&db, "edge:Knows").await;
     assert_eq!(edges_after, edges_before + 2);
 
-    // One manifest version bump for the two-edge query (atomic publish).
+    // One manifest version bump for the two-edge query (atomic publish): the
+    // graph commit rides the same publish CAS as the table-version rows
+    // (RFC-013 Phase 7).
     let post_version = version_main(&db).await.unwrap();
     assert_eq!(
         post_version,
@@ -690,6 +695,8 @@ async fn multi_statement_inserts_publish_exactly_once() {
     .await
     .unwrap();
 
+    // One manifest version bump: the graph commit rides the same publish CAS
+    // as the table-version rows (RFC-013 Phase 7).
     let post_version = version_main(&db).await.unwrap();
     assert_eq!(
         post_version,
@@ -1005,6 +1012,8 @@ async fn chained_updates_with_overlapping_predicate_respects_intermediate_value(
         "chained-update final value must reflect the second update applied to op-1's pending value"
     );
 
+    // One manifest version bump: the graph commit rides the same publish CAS
+    // as the table-version rows (RFC-013 Phase 7).
     let post_version = version_main(&db).await.unwrap();
     assert_eq!(
         post_version,
@@ -1043,6 +1052,9 @@ async fn multi_statement_delete_on_same_node_table() {
         pre_persons - 2,
         "both deletes must land",
     );
+    // One manifest version bump: the graph commit (delete-only queries record
+    // one too) rides the same publish CAS as the table-version rows
+    // (RFC-013 Phase 7).
     let post_version = version_main(&db).await.unwrap();
     assert_eq!(
         post_version,

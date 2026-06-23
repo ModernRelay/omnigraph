@@ -131,6 +131,11 @@ async fn single_insert_data_write_is_bounded() {
 /// At a fixed shallow depth, the per-write object-store read count is below a
 /// documented ceiling. Fails the moment a change *adds* a round-trip on the write
 /// path — the "no new round-trip" guard (calibrated: ~50 at depth ~5).
+///
+/// RFC-013 Phase 7 folded the graph commit into the table-version publish CAS:
+/// the `graph_commit` + `graph_head` rows ride the same merge-insert, so there
+/// is NO extra `__manifest` write or scan per commit — the ceiling stays where
+/// the pre-lineage write path left it.
 #[tokio::test]
 async fn write_op_count_ceiling_at_shallow_depth() {
     let dir = tempfile::tempdir().unwrap();

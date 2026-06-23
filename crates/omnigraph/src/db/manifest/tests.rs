@@ -12,7 +12,7 @@ use lance_namespace::models::{
 use lance_namespace_impls::DirectoryNamespaceBuilder;
 use tokio::sync::Mutex;
 
-use super::publisher::ManifestBatchPublisher;
+use super::publisher::{LineageIntent, ManifestBatchPublisher, PublishOutcome};
 use super::*;
 use omnigraph_compiler::catalog::build_catalog;
 use omnigraph_compiler::schema::parser::parse_schema;
@@ -988,7 +988,8 @@ impl ManifestBatchPublisher for RecordingPublisher {
         &self,
         changes: &[ManifestChange],
         expected_table_versions: &HashMap<String, u64>,
-    ) -> Result<Dataset> {
+        lineage: Option<&LineageIntent>,
+    ) -> Result<PublishOutcome> {
         let requests: Vec<CreateTableVersionRequest> = changes
             .iter()
             .filter_map(|change| match change {
@@ -997,7 +998,9 @@ impl ManifestBatchPublisher for RecordingPublisher {
             })
             .collect();
         self.requests.lock().await.extend_from_slice(&requests);
-        self.inner.publish(changes, expected_table_versions).await
+        self.inner
+            .publish(changes, expected_table_versions, lineage)
+            .await
     }
 }
 
@@ -1009,7 +1012,8 @@ impl ManifestBatchPublisher for FailingPublisher {
         &self,
         _changes: &[ManifestChange],
         _expected_table_versions: &HashMap<String, u64>,
-    ) -> Result<Dataset> {
+        _lineage: Option<&LineageIntent>,
+    ) -> Result<PublishOutcome> {
         Err(OmniError::manifest(
             "injected batch publisher failure".to_string(),
         ))
@@ -1389,8 +1393,8 @@ async fn test_concurrent_publish_with_overlapping_expected_versions_one_succeeds
     let expected_b = expected;
 
     let (res_a, res_b) = tokio::join!(
-        async { publisher_a.publish(&changes_a, &expected_a).await },
-        async { publisher_b.publish(&changes_b, &expected_b).await }
+        async { publisher_a.publish(&changes_a, &expected_a, None).await },
+        async { publisher_b.publish(&changes_b, &expected_b, None).await }
     );
 
     let (succeeded, err) = match (res_a, res_b) {
@@ -1481,7 +1485,7 @@ async fn test_publish_migrates_pre_stamp_manifest_to_current_version() {
     let mut expected = HashMap::new();
     expected.insert("node:Person".to_string(), 1);
     GraphNamespacePublisher::new(uri, None)
-        .publish(&[], &expected)
+        .publish(&[], &expected, None)
         .await
         .unwrap();
 
@@ -1542,7 +1546,7 @@ async fn test_v2_to_v3_sweeps_legacy_run_branches_on_write_open() {
     let mut expected = HashMap::new();
     expected.insert("node:Person".to_string(), 1);
     GraphNamespacePublisher::new(uri, None)
-        .publish(&[], &expected)
+        .publish(&[], &expected, None)
         .await
         .unwrap();
 
@@ -1569,7 +1573,7 @@ async fn test_v2_to_v3_sweeps_legacy_run_branches_on_write_open() {
     // Idempotent: a second write-open finds the stamp at current and does not
     // re-run the sweep or error.
     GraphNamespacePublisher::new(uri, None)
-        .publish(&[], &expected)
+        .publish(&[], &expected, None)
         .await
         .unwrap();
     let final_ds = open_manifest_dataset(uri, None).await.unwrap();
@@ -1601,7 +1605,7 @@ async fn test_publish_rejects_manifest_stamped_at_future_version() {
     let mut expected = HashMap::new();
     expected.insert("node:Person".to_string(), 1);
     let err = GraphNamespacePublisher::new(uri, None)
-        .publish(&[], &expected)
+        .publish(&[], &expected, None)
         .await
         .expect_err("future-stamped manifest should reject open-for-write");
     let msg = err.to_string();

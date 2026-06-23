@@ -263,7 +263,7 @@ omnigraph policy explain --cluster ./company-brain --graph knowledge --actor act
 | Schema language | — | `.pg` + Pest grammar + catalog + interfaces + constraints + annotations |
 | Query language | — | `.gq` + Pest grammar + IR + lowering + linter |
 | Schema migration planning | — | `plan_schema_migration` + `apply_schema` step types + `__schema_apply_lock__` |
-| Commit graph (DAG) across whole graph | — | `_graph_commits.lance` with linear + merge parents, ULID ids, actor map |
+| Commit graph (DAG) across whole graph | — | Lineage (linear + merge parents, ULID ids, actor) stored as `graph_commit`/`graph_head` rows in `__manifest`, written in the same publish CAS as the table-version rows (RFC-013 Phase 7 — no separate `_graph_commits.lance` write; manifest→commit-graph atomicity gap closed); the in-memory commit graph is a projection of those rows |
 | Per-query atomic writes | — | In-memory `MutationStaging.pending` accumulator + `stage_*` / `commit_staged` per touched table at end-of-query + publisher CAS via `commit_with_expected` (single manifest commit per `mutate_as` / `load`); D₂ parse-time rule keeps inserts/updates and deletes from mixing |
 | Three-way row-level merge | — | `OrderedTableCursor` + `StagedTableWriter`, structured `MergeConflictKind` |
 | Change feeds | — | `diff_between` / `diff_commits` with manifest fast path + ID streaming |

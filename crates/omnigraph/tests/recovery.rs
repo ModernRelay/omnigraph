@@ -685,38 +685,21 @@ async fn list_recovery_audit_kinds(graph_root: &Path) -> Vec<String> {
     out
 }
 
-/// Helper: count `_graph_commits.lance` rows tagged with the recovery actor.
+/// Helper: count graph commits authored by the recovery actor. RFC-013 Phase 7
+/// records the recovery commit in `__manifest` (folded into the recovery publish
+/// CAS), not `_graph_commits.lance`, so this counts through the production
+/// commit-graph projection (`load_commits`), filtering on the inline actor.
 async fn count_recovery_actor_commits(graph_root: &Path) -> usize {
-    let actors_dir = graph_root.join("_graph_commit_actors.lance");
-    if !actors_dir.exists() {
-        return 0;
-    }
-    let ds = Dataset::open(actors_dir.to_str().unwrap()).await.unwrap();
-    use arrow_array::{Array, StringArray};
-    use futures::TryStreamExt;
-    let batches: Vec<arrow_array::RecordBatch> = ds
-        .scan()
-        .try_into_stream()
+    let commits = omnigraph::db::commit_graph::CommitGraph::open(graph_root.to_str().unwrap())
         .await
         .unwrap()
-        .try_collect()
+        .load_commits()
         .await
         .unwrap();
-    let mut count = 0;
-    for batch in &batches {
-        let actors = batch
-            .column_by_name("actor_id")
-            .unwrap()
-            .as_any()
-            .downcast_ref::<StringArray>()
-            .unwrap();
-        for i in 0..actors.len() {
-            if actors.value(i) == "omnigraph:recovery" {
-                count += 1;
-            }
-        }
-    }
-    count
+    commits
+        .iter()
+        .filter(|c| c.actor_id.as_deref() == Some("omnigraph:recovery"))
+        .count()
 }
 
 #[tokio::test]

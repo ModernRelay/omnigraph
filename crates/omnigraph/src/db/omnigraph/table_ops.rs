@@ -1379,33 +1379,16 @@ pub(super) async fn commit_updates(
     commit_prepared_updates(db, &prepared, None).await
 }
 
-pub(super) async fn commit_manifest_updates(
+pub(super) async fn commit_merge_with_actor(
     db: &Omnigraph,
     updates: &[crate::db::SubTableUpdate],
-) -> Result<u64> {
-    db.coordinator
-        .write()
-        .await
-        .commit_manifest_updates(updates)
-        .await
-}
-
-pub(super) async fn record_merge_commit(
-    db: &Omnigraph,
-    manifest_version: u64,
-    parent_commit_id: &str,
     merged_parent_commit_id: &str,
     actor_id: Option<&str>,
 ) -> Result<String> {
     db.coordinator
         .write()
         .await
-        .record_merge_commit(
-            manifest_version,
-            parent_commit_id,
-            merged_parent_commit_id,
-            actor_id,
-        )
+        .commit_merge_with_actor(updates, merged_parent_commit_id, actor_id)
         .await
         .map(|snapshot_id| snapshot_id.as_str().to_string())
 }

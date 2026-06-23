@@ -35,7 +35,8 @@ pub(crate) use metadata::TableVersionMetadata;
 use metadata::{OMNIGRAPH_ROW_COUNT_KEY, table_version_metadata_for_state};
 #[cfg(test)]
 use namespace::{branch_manifest_namespace, staged_table_namespace};
-use publisher::{GraphNamespacePublisher, ManifestBatchPublisher};
+pub(crate) use publisher::LineageIntent;
+use publisher::{GraphNamespacePublisher, ManifestBatchPublisher, PublishOutcome};
 pub(crate) use recovery::{
     RecoveryMode, RecoverySidecar, RecoverySidecarHandle, SidecarKind, SidecarTablePin,
     SidecarTableRegistration, SidecarTombstone, confirm_sidecar_phase_b, delete_sidecar,
@@ -43,6 +44,7 @@ pub(crate) use recovery::{
     recover_manifest_drift, schema_apply_serial_queue_key, write_sidecar,
 };
 pub use state::SubTableEntry;
+pub(crate) use state::{GraphLineageRow, read_graph_lineage};
 #[cfg(test)]
 use state::string_column;
 use state::{ManifestState, read_manifest_state};
@@ -50,7 +52,33 @@ use state::{ManifestState, read_manifest_state};
 const OBJECT_TYPE_TABLE: &str = "table";
 const OBJECT_TYPE_TABLE_VERSION: &str = "table_version";
 const OBJECT_TYPE_TABLE_TOMBSTONE: &str = "table_tombstone";
+/// Immutable per-commit graph-lineage row (RFC-013 Phase 7). One row per graph
+/// commit; the projected form reconstructs a [`GraphCommit`]. `__manifest` is
+/// the single source — written in the same publish CAS as the table-version
+/// rows (no `_graph_commits.lance` row).
+const OBJECT_TYPE_GRAPH_COMMIT: &str = "graph_commit";
+/// Mutable per-branch head pointer for the graph lineage (RFC-013 Phase 7).
+/// `object_id` is `graph_head:<branch>` (`graph_head:main` for the main branch).
+const OBJECT_TYPE_GRAPH_HEAD: &str = "graph_head";
 const TABLE_VERSION_MANAGEMENT_KEY: &str = "table_version_management";
+
+/// Stable head-key segment for the main branch in `graph_head:<branch>` rows.
+/// `table_branch`/`manifest_branch` encode main as null, but `object_id` must be
+/// non-null, so the head row needs a literal — matching the `"main"` sentinel
+/// already used by `SnapshotId::synthetic` and `open_for_branch`.
+pub(crate) const MAIN_BRANCH_HEAD_KEY: &str = "main";
+
+/// The result of a manifest commit that may have folded in a graph commit
+/// (RFC-013 Phase 7).
+#[derive(Debug, Clone)]
+pub(crate) struct CommitOutcome {
+    /// The new `__manifest` version after the publish.
+    pub version: u64,
+    /// The parent the publisher resolved for the recorded commit, or `None` when
+    /// no lineage was recorded or the commit is the genesis. Lets the caller
+    /// update its in-memory commit cache without re-reading the manifest.
+    pub parent_commit_id: Option<String>,
+}
 
 /// Apply pending internal-schema migrations against `__manifest` on the
 /// open-for-write path, independent of a publish.
@@ -313,6 +341,9 @@ impl ManifestCoordinator {
     /// Create a new graph at `root_uri` from a catalog.
     ///
     /// Creates per-type Lance datasets and the namespace `__manifest` table.
+    /// The genesis graph commit is folded into the init write, so `__manifest`
+    /// is the single source of graph lineage from version one — callers read it
+    /// back through the lineage projection rather than via a second write.
     pub async fn init(root_uri: &str, catalog: &Catalog) -> Result<Self> {
         let root = root_uri.trim_end_matches('/');
         let (dataset, known_state) = init_manifest_graph(root, catalog).await?;
@@ -419,17 +450,58 @@ impl ManifestCoordinator {
         changes: &[ManifestChange],
         expected_table_versions: &HashMap<String, u64>,
     ) -> Result<u64> {
-        if changes.is_empty() && expected_table_versions.is_empty() {
-            return Ok(self.version());
+        Ok(self
+            .commit_changes_with_lineage(changes, expected_table_versions, None)
+            .await?
+            .version)
+    }
+
+    /// Publish `changes` and, when `lineage` is present, record the graph commit
+    /// in the SAME merge-insert (RFC-013 Phase 7). `__manifest` is the single
+    /// source of graph lineage: the `graph_commit` + `graph_head:<branch>` rows
+    /// ride the table-version publish so the whole commit lands at one manifest
+    /// version — no separate write, no manifest→commit-graph atomicity gap, no
+    /// per-write commit-graph refresh. Returns the new version and the parent the
+    /// publisher resolved for the commit (so the caller can update its in-memory
+    /// commit cache without a re-read).
+    pub(crate) async fn commit_changes_with_lineage(
+        &mut self,
+        changes: &[ManifestChange],
+        expected_table_versions: &HashMap<String, u64>,
+        lineage: Option<&LineageIntent>,
+    ) -> Result<CommitOutcome> {
+        if changes.is_empty() && expected_table_versions.is_empty() && lineage.is_none() {
+            return Ok(CommitOutcome {
+                version: self.version(),
+                parent_commit_id: None,
+            });
         }
 
-        self.dataset = self
+        let PublishOutcome {
+            dataset,
+            parent_commit_id,
+        } = self
             .publisher
-            .publish(changes, expected_table_versions)
+            .publish(changes, expected_table_versions, lineage)
             .await?;
+        self.dataset = dataset;
 
         self.known_state = read_manifest_state(&self.dataset).await?;
-        Ok(self.version())
+        Ok(CommitOutcome {
+            version: self.version(),
+            parent_commit_id,
+        })
+    }
+
+    /// Project the graph-lineage rows out of `__manifest` at `branch` without an
+    /// open coordinator. Opens the manifest fresh; used by `CommitGraph` to
+    /// source its in-memory cache from the manifest projection.
+    pub(crate) async fn read_graph_lineage_at(
+        root_uri: &str,
+        branch: Option<&str>,
+    ) -> Result<(Vec<GraphLineageRow>, HashMap<String, String>)> {
+        let dataset = open_manifest_dataset(root_uri, branch).await?;
+        read_graph_lineage(&dataset).await
     }
 
     /// Current manifest version.

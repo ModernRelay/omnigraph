@@ -242,20 +242,16 @@ them explicit.
   acknowledged-before-visible bug this branch fixed. Close it (local CAS
   primitive, or a trait-level lock requirement) before admitting any
   lock-free `if_match` caller.
-- **Manifest→commit-graph publish atomicity:** a graph commit advances
-  `__manifest` (the visibility authority) and then appends `_graph_commits` as
-  two separate writes (`commit_updates_with_actor_with_expected`, failpoint
-  `graph_publish.before_commit_append`). A crash between them leaves the manifest
-  at version N with no commit-graph row for N. Live reads and durability are
-  unaffected — the live version resolves via the manifest
-  (`GraphCoordinator::version()`), not the commit-graph head — and the open-time
-  recovery sweep does NOT repair it (`lance_head == manifest_pinned` classifies
-  `NoMovement`; a recovery sidecar would not change this). Impact is bounded to
-  commit history: `commit list` misses N, time-travel by commit id to N fails,
-  and merge-base loses a node (a likely-benign off-by-one re-merge). This affects
-  every publish, not a specific maintenance command. Eventual fix: make the
-  commit graph reconcilable from the manifest (or the two writes atomic) — not a
-  recovery-sidecar concern.
+- **Manifest→commit-graph publish atomicity — CLOSED (RFC-013 Phase 7):** graph
+  lineage now lives ONLY in `__manifest`, as `graph_commit` + `graph_head:<branch>`
+  rows written in the SAME `MergeInsertBuilder` commit as the table-version rows
+  (`commit_changes_with_lineage` → `GraphNamespacePublisher::publish` with a
+  `LineageIntent`). There is no second write to fail between — a graph commit and
+  its lineage land at one manifest version atomically, so a crash after the publish
+  leaves no gap. The commit-graph cache is a derived projection of those manifest
+  rows; nothing writes `_graph_commits.lance` (it persists only to carry branch
+  refs). The prior two-write gap (manifest at N with no `_graph_commits` row for N)
+  is gone by construction.
 - **Planner capability/stat surfaces:** cost-aware planning, complete
   capability advertisement, and explain-with-cost are roadmap. Do not describe
   them as implemented.
@@ -291,19 +287,19 @@ them explicit.
   in history; but they are not yet brought into `cleanup` (version GC), so the
   `_versions/` chain still grows until an explicit cleanup (the cleanup half is
   deferred — it needs the Q8 cleanup-resurrection watermark first). The commit
-  graph is not yet reconcilable from the manifest; and the traversal id-map is
+  graph IS now reconcilable from the manifest (RFC-013 Phase 7 — it is a pure
+  projection of the `graph_commit`/`graph_head` rows); the traversal id-map is
   still rebuilt.
-- **Commit-graph parent under concurrency:** `record_graph_commit` now refreshes
-  the commit-graph head from storage before appending, so a same-branch write
-  after an external commit no longer forks the commit DAG by parenting off a
-  stale cached head (the single-process fork, pre-existing for non-strict
-  inserts and widened to strict ops by Fix 1's `refresh_manifest_only`, is now
-  closed). Residual: two processes writing disjoint tables can still pass their
-  per-table manifest CAS and append off the same parent (a refresh-then-append
-  TOCTOU). The convergent fix is reconcile-from-manifest (parent = the commit at
-  the manifest version the publisher CAS'd against; `manifest_version` is on
-  every commit row), composing with the manifest-to-commit-graph atomicity gap;
-  it needs commit-graph append ordering or a Lance append-CAS to fully close.
+- **Commit-graph parent under concurrency — CLOSED (RFC-013 Phase 7):** the graph
+  commit is now recorded in the manifest publish CAS, and the publisher resolves
+  the new commit's parent INSIDE its retry loop, per attempt, from the just-loaded
+  `__manifest` (the `should_replace_head` winner over the visible `graph_commit`
+  rows). A CAS-conflict retry re-reads the advanced head and parents correctly, so
+  the refresh-then-append TOCTOU is gone. Two processes writing disjoint tables on
+  the same branch now also contend on the shared `graph_head:<branch>` row (one
+  `object_id`, `WhenMatched::UpdateAll`): one wins, the other retries and re-parents
+  — so the cross-process disjoint-table fork is closed too. This is the intended
+  §7.1 contention point.
 
 ## Deny-list
 
