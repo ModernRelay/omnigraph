@@ -72,6 +72,8 @@ Applying a plan reports whether it was supported, the steps applied, and the res
 
 `DropProperty` and `DropType` steps default to `Soft` mode: the catalog tombstones the entry but the prior column / dataset remains time-travel-reachable via `snapshot_at_version(prev)` until `omnigraph cleanup` runs. Soft drops are reversible.
 
-Pass `--allow-data-loss` (CLI) or `allow_data_loss: true` (HTTP `POST /schema/apply` body, SDK `SchemaApplyOptions`) to promote every drop in the plan to `Hard` mode. Hard drops run `cleanup_old_versions` on the affected dataset immediately after the manifest publish, making the prior column / dataset unreachable. **Irreversible.**
+Pass `--allow-data-loss` (CLI `schema apply`) or `allow_data_loss: true` (SDK `SchemaApplyOptions`) to promote every drop in the plan to `Hard` mode. Hard drops run `cleanup_old_versions` on the affected dataset immediately after the manifest publish, making the prior column / dataset unreachable. **Irreversible.**
 
-The flag is honored uniformly across transports — `omnigraph schema apply --allow-data-loss`, `POST /schema/apply { schema_source, allow_data_loss: true }`, and `apply_schema_with_options(.., SchemaApplyOptions { allow_data_loss: true })` produce identical plans and identical effects.
+This is the **direct/embedded** schema-apply path — `omnigraph schema apply --store …` and the embedded SDK `apply_schema_with_options(.., SchemaApplyOptions { allow_data_loss: true })` produce identical plans and identical effects.
+
+**Cluster-managed graphs are different.** A graph served from a cluster evolves only through `omnigraph cluster apply`, which performs **soft drops only** (no `allow_data_loss` path), and the HTTP `POST /schema/apply` route is **disabled (returns 409) for cluster-backed serving** — see [server](../operations/server.md) and [cluster-config](../clusters/config.md). Direct `schema apply` against a cluster-managed storage path is likewise refused.

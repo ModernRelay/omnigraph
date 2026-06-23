@@ -405,8 +405,8 @@ pub struct QueryCatalogEntry {
     pub params: Vec<ParamDescriptor>,
 }
 
-/// Response for `GET /queries`: the `mcp.expose` subset of a graph's
-/// stored-query registry, each with typed parameters.
+/// Response for `GET /queries`: every stored query in a graph's
+/// registry, each with typed parameters.
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
 pub struct QueriesCatalogOutput {
     pub queries: Vec<QueryCatalogEntry>,

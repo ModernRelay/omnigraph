@@ -1,5 +1,6 @@
 #![allow(dead_code)]
 
+pub mod cost;
 pub mod recovery;
 
 use arrow_array::{Array, RecordBatch, StringArray};
@@ -175,6 +176,22 @@ pub async fn commit_many(db: &mut Omnigraph, n: usize) {
             MUTATION_QUERIES,
             "insert_person",
             &mixed_params(&[("$name", &format!("commit_many_{i}"))], &[("$age", 30)]),
+        )
+        .await
+        .unwrap();
+    }
+}
+
+/// Like [`commit_many`] but every commit carries an actor, so it grows
+/// `_graph_commit_actors.lance` too — the authenticated (server/CLI) write path.
+pub async fn commit_many_as(db: &mut Omnigraph, n: usize, actor: &str) {
+    for i in 0..n {
+        db.mutate_as(
+            "main",
+            MUTATION_QUERIES,
+            "insert_person",
+            &mixed_params(&[("$name", &format!("commit_many_as_{i}"))], &[("$age", 30)]),
+            Some(actor),
         )
         .await
         .unwrap();

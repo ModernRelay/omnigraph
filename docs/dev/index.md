@@ -41,6 +41,7 @@ constraints. User-facing behavior should still be documented through
 | Error taxonomy and serialization | [errors.md](../user/operations/errors.md) |
 | Constants and tunables | [constants.md](../user/reference/constants.md) |
 | Transaction model public contract | [transactions.md](../user/branching/transactions.md) |
+| User-doc coherence cleanup ledger | [docs-issues.md](docs-issues.md) |
 
 ## Project Operations
 
@@ -91,7 +92,8 @@ Working documents for in-flight feature work. Removed when the work lands.
 | Restructure the CLI around explicit planes — one graph-addressing model, declared capability surface, plane-grouped help (expands RFC-009 Phase 4) | [rfc-010-cli-planes-restructure.md](rfc-010-cli-planes-restructure.md) |
 | CLI refactoring — one addressing & config model post-`omnigraph.yaml`: scope + `--graph` + derived access path, served-default / privileged-direct, profiles, named queries, capability classifier (completes RFC-008) | [rfc-011-cli-refactoring.md](rfc-011-cli-refactoring.md) |
 | Provider-independent embedding configuration — one resolved `EmbeddingConfig` + sealed provider enum (Gemini/OpenAI/Mock), identity recorded in the schema IR, query-time same-space validation, NFR floor | [rfc-012-embedding-provider-config.md](rfc-012-embedding-provider-config.md) |
-| Tenancy model — cluster-as-tenant cells (silo the data, pool the compute): `CellRuntime` lifts the per-cluster runtime, one server hosts N cells resolved by host before auth, WorkOS org→cell 1:1 with per-cell audience, tiered dedicated/pooled/on-prem on one binary | [rfc-013-tenancy-cells.md](rfc-013-tenancy-cells.md) |
+| Write-path latency — capture-once `WriteTxn`, version-pinned opens, one `GraphPublishAuthority` fed declarative `PublishPlan`s, manifest-authoritative lineage, epoch fence, bounded history (compaction + cleanup), and an IO-counted cost contract (`iss-write-s3-roundtrip-amplification`, `iss-991`) | [rfc-013-write-path-latency.md](rfc-013-write-path-latency.md) |
+| Tenancy model — cluster-as-tenant cells (silo the data, pool the compute): `CellRuntime` lifts the per-cluster runtime, one server hosts N cells resolved by host before auth, WorkOS org→cell 1:1 with per-cell audience, tiered dedicated/pooled/on-prem on one binary | [rfc-014-tenancy-cells.md](rfc-014-tenancy-cells.md) |
 
 ## Boundary
 

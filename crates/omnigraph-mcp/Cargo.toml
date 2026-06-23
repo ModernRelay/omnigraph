@@ -1,6 +1,6 @@
 [package]
 name = "omnigraph-mcp"
-version = "0.7.0"
+version = "0.7.1"
 edition = "2024"
 description = "MCP (Model Context Protocol) Streamable-HTTP transport and backend seam for Omnigraph. Contains the rmcp dependency and defines the McpBackend trait the server implements; names no omnigraph engine/server type, so the dependency edge is server → mcp."
 license = "MIT"

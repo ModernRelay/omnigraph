@@ -1060,7 +1060,7 @@ pub(crate) async fn server_invoke_query(
     tag = "queries",
     operation_id = "list_queries",
     responses(
-        (status = 200, description = "Stored-query catalog (the mcp.expose subset, with typed params)", body = QueriesCatalogOutput),
+        (status = 200, description = "Stored-query catalog (every stored query, with typed params)", body = QueriesCatalogOutput),
         (status = 401, description = "Unauthorized", body = ErrorOutput),
         (status = 403, description = "Forbidden", body = ErrorOutput),
     ),

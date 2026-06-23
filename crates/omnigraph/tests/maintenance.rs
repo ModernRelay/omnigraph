@@ -94,12 +94,22 @@ async fn optimize_on_empty_graph_returns_stats_per_table_with_no_changes() {
 
     let stats = db.optimize().await.unwrap();
 
-    // Schema declares 2 nodes + 2 edges = 4 tables. Compaction should run on
-    // each but find nothing to merge.
-    assert_eq!(stats.len(), 4);
+    // Schema declares 2 nodes + 2 edges = 4 data tables, plus the 3 internal
+    // system tables (`__manifest`, `_graph_commits`, `_graph_commit_actors`) optimize
+    // also compacts (RFC-013 step 2) = 7. Compaction should run on each but find
+    // nothing to merge.
+    assert_eq!(stats.len(), 7);
     for s in &stats {
         assert_eq!(s.fragments_removed, 0, "{} should not remove", s.table_key);
         assert_eq!(s.fragments_added, 0, "{} should not add", s.table_key);
+    }
+    // The internal tables are present and reported as no-ops on an empty graph.
+    for key in ["__manifest", "_graph_commits", "_graph_commit_actors"] {
+        let s = stats
+            .iter()
+            .find(|s| s.table_key == key)
+            .unwrap_or_else(|| panic!("optimize stats missing internal table {key}"));
+        assert!(!s.committed, "{key} should be a no-op on an empty graph");
     }
 }
 
@@ -131,6 +141,224 @@ async fn optimize_after_load_then_again_is_idempotent() {
             s.table_key
         );
     }
+}
+
+/// RFC-013 step 2: `optimize` compacts the internal system tables
+/// (`__manifest`, `_graph_commits`), which accumulate one fragment per commit.
+/// After compaction they shed fragments, write no recovery sidecar (a single
+/// atomic Lance commit — no HEAD-before-publish gap), and the graph stays
+/// coherent for subsequent reads + strict writes.
+#[tokio::test]
+async fn optimize_compacts_internal_tables() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut db = init_and_load(&dir).await;
+
+    // Build version-history depth so the internal tables accumulate fragments.
+    for i in 0..20 {
+        mutate_main(
+            &mut db,
+            MUTATION_QUERIES,
+            "insert_person",
+            &mixed_params(&[("$name", &format!("p{i}"))], &[("$age", 30)]),
+        )
+        .await
+        .unwrap();
+    }
+
+    let stats = db.optimize().await.unwrap();
+
+    for key in ["__manifest", "_graph_commits"] {
+        let s = stats
+            .iter()
+            .find(|s| s.table_key == key)
+            .unwrap_or_else(|| panic!("optimize stats missing internal table {key}"));
+        assert!(s.committed, "{key} should compact after 20 commits");
+        assert!(
+            s.fragments_removed > 0,
+            "{key} should shed fragments, removed {}",
+            s.fragments_removed
+        );
+    }
+
+    // Internal compaction leaks no recovery sidecar.
+    let recovery_dir = dir.path().join("__recovery");
+    if recovery_dir.exists() {
+        let leftover: Vec<_> = std::fs::read_dir(&recovery_dir)
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .map(|e| e.file_name())
+            .collect();
+        assert!(
+            leftover.is_empty(),
+            "optimize leaked recovery sidecars: {leftover:?}"
+        );
+    }
+
+    // Coherent after internal compaction: reads + a strict write still work.
+    assert!(count_rows(&db, "node:Person").await > 0);
+    mutate_main(
+        &mut db,
+        MUTATION_QUERIES,
+        "insert_person",
+        &mixed_params(&[("$name", "after_compact")], &[("$age", 40)]),
+    )
+    .await
+    .unwrap();
+}
+
+/// `optimize` must not fail on a graph that has no `_graph_commits.lance` — a valid
+/// state the coordinator opens as `commit_graph = None` (graphs predating the commit
+/// graph). Without the existence guard, `Dataset::open` on the absent table errors
+/// and fails the whole optimize. Regression for the missing-existence-guard.
+///
+/// Uses an EMPTY graph deliberately: a graph with data would publish during
+/// optimize, and a publish records a graph commit that recreates `_graph_commits`
+/// before the guard runs — masking the bug. With no data, nothing recreates it, so
+/// the table stays absent through the guard.
+#[tokio::test]
+async fn optimize_tolerates_absent_graph_commits_table() {
+    let dir = tempfile::tempdir().unwrap();
+    let uri = dir.path().to_str().unwrap();
+    Omnigraph::init(uri, TEST_SCHEMA).await.unwrap();
+
+    // Simulate a graph with no commit-graph dataset.
+    std::fs::remove_dir_all(dir.path().join("_graph_commits.lance")).unwrap();
+
+    // Coordinator tolerates the absence; optimize must succeed (the guard skips the
+    // absent table rather than letting `Dataset::open` error) and omit its stat.
+    let db = Omnigraph::open(uri).await.unwrap();
+    let stats = db.optimize().await.unwrap();
+    assert!(
+        stats.iter().any(|s| s.table_key == "__manifest"),
+        "__manifest must still be compacted"
+    );
+    assert!(
+        !stats.iter().any(|s| s.table_key == "_graph_commits"),
+        "absent _graph_commits must be skipped, not opened (would error)"
+    );
+}
+
+/// `optimize` must stay NON-DESTRUCTIVE on a pre-`auto_cleanup`-fix upgraded graph:
+/// `compact_files` would otherwise fire the dataset's stored `lance.auto_cleanup.*`
+/// hook (version GC) during the compaction commit. Internal-table compaction clears
+/// that stale config first, so no versions are deleted. Without the clear, the
+/// aggressive policy below GCs old versions and the count drops.
+#[tokio::test]
+async fn optimize_clears_stale_auto_cleanup_and_preserves_versions() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut db = init_and_load(&dir).await;
+    for i in 0..5 {
+        mutate_main(
+            &mut db,
+            MUTATION_QUERIES,
+            "insert_person",
+            &mixed_params(&[("$name", &format!("v{i}"))], &[("$age", 30)]),
+        )
+        .await
+        .unwrap();
+    }
+    let manifest_uri = format!("{}/__manifest", dir.path().to_str().unwrap());
+
+    // Simulate an upgraded graph: an aggressive stored auto_cleanup config that, if
+    // it fired during compaction, would GC old versions.
+    {
+        let mut ds = Dataset::open(&manifest_uri).await.unwrap();
+        ds.update_config([
+            ("lance.auto_cleanup.interval", Some("1")),
+            ("lance.auto_cleanup.older_than", Some("0s")),
+        ])
+        .await
+        .unwrap();
+    }
+    let versions_before = Dataset::open(&manifest_uri)
+        .await
+        .unwrap()
+        .versions()
+        .await
+        .unwrap()
+        .len();
+
+    db.optimize().await.unwrap();
+
+    let ds = Dataset::open(&manifest_uri).await.unwrap();
+    // (a) the stale auto_cleanup config was cleared (non-destructive by construction).
+    assert!(
+        !ds.config().keys().any(|k| k.starts_with("lance.auto_cleanup.")),
+        "optimize must clear stale auto_cleanup config; config = {:?}",
+        ds.config()
+    );
+    // (b) no version GC: every pre-optimize version survives (compaction + the
+    // config-clear each add versions, so the count only grows).
+    let versions_after = ds.versions().await.unwrap().len();
+    assert!(
+        versions_after >= versions_before,
+        "optimize must not GC __manifest versions: before={versions_before} after={versions_after}"
+    );
+}
+
+/// The same non-destructive guarantee on a DATA (node/edge) table, not just the
+/// internal tables. `optimize_one_table` runs `compact_files` / `optimize_indices`
+/// with a default `CommitConfig` (`skip_auto_cleanup = false`); on an upgraded
+/// graph whose Person table still carries the pre-v7 `lance.auto_cleanup.*` config,
+/// those commits would fire Lance's version-GC hook and prune `__manifest`-pinned
+/// data-table versions. The path must strip that config first. Without the strip,
+/// the aggressive policy below GCs old versions and the config survives the run.
+#[tokio::test]
+async fn optimize_clears_stale_auto_cleanup_on_data_tables_too() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path().to_str().unwrap().trim_end_matches('/').to_string();
+    let mut db = init_and_load(&dir).await;
+    add_person_fragments(&mut db).await; // multiple fragments → will_compact
+
+    // Simulate an upgraded graph: set an aggressive stored auto_cleanup config on
+    // the Person table. This is an out-of-band Lance commit (an `UpdateConfig` that
+    // advances HEAD past the manifest), so realign the manifest with a forced repair
+    // first — otherwise optimize skips the table as uncovered drift and never
+    // reaches the scrub. (Forced because UpdateConfig is not verified maintenance.)
+    let (_, _, person_full) = person_manifest_and_head(&db, &root).await;
+    {
+        let mut ds = Dataset::open(&person_full).await.unwrap();
+        ds.update_config([
+            ("lance.auto_cleanup.interval", Some("1")),
+            ("lance.auto_cleanup.older_than", Some("0s")),
+        ])
+        .await
+        .unwrap();
+    }
+    db.repair(RepairOptions {
+        confirm: true,
+        force: true,
+    })
+    .await
+    .unwrap();
+
+    let versions_before = Dataset::open(&person_full)
+        .await
+        .unwrap()
+        .versions()
+        .await
+        .unwrap()
+        .len();
+    let rows_before = count_rows(&db, "node:Person").await;
+
+    db.optimize().await.unwrap();
+
+    let ds = Dataset::open(&person_full).await.unwrap();
+    // (a) the stale auto_cleanup config was cleared (non-destructive by construction).
+    assert!(
+        !ds.config().keys().any(|k| k.starts_with("lance.auto_cleanup.")),
+        "optimize must clear stale auto_cleanup config on data tables; config = {:?}",
+        ds.config()
+    );
+    // (b) no version GC: every pre-optimize version survives (compaction + the
+    // config-clear each add versions, so the count only grows).
+    let versions_after = ds.versions().await.unwrap().len();
+    assert!(
+        versions_after >= versions_before,
+        "optimize must not GC Person versions: before={versions_before} after={versions_after}"
+    );
+    // (c) data is intact — the run rewrote fragments, it did not drop rows.
+    assert_eq!(count_rows(&db, "node:Person").await, rows_before);
 }
 
 // PR3 (Workstream B): an existing scalar index does not cover fragments

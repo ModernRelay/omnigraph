@@ -1,4 +1,4 @@
-# RFC-013: Tenancy model — cluster-as-tenant cells, pooled compute
+# RFC-014: Tenancy model — cluster-as-tenant cells, pooled compute
 
 **Status:** Proposed — general architecture (server topology, identity, deployment).
 **Date:** 2026-06-16

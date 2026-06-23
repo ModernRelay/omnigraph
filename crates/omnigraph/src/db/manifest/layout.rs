@@ -15,7 +15,7 @@ pub(super) fn type_name_hash(name: &str) -> String {
     format!("{:016x}", h)
 }
 
-pub(super) fn manifest_uri(root: &str) -> String {
+pub(crate) fn manifest_uri(root: &str) -> String {
     format!("{}/{}", root.trim_end_matches('/'), MANIFEST_DIR)
 }
 
@@ -76,6 +76,7 @@ pub(super) fn table_uri_for_path(root_uri: &str, table_path: &str, branch: Optio
     }
 }
 
+#[cfg(test)]
 pub(super) fn namespace_internal_error(message: impl Into<String>) -> LanceNamespaceError {
     LanceNamespaceError::namespace_source(Box::new(std::io::Error::other(message.into())))
 }

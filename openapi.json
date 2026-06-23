@@ -7,7 +7,7 @@
       "name": "MIT",
       "identifier": "MIT"
     },
-    "version": "0.7.0"
+    "version": "0.7.1"
   },
   "paths": {
     "/graphs": {
@@ -1021,7 +1021,7 @@
         ],
         "responses": {
           "200": {
-            "description": "Stored-query catalog (the mcp.expose subset, with typed params)",
+            "description": "Stored-query catalog (every stored query, with typed params)",
             "content": {
               "application/json": {
                 "schema": {
@@ -2255,7 +2255,7 @@
       },
       "QueriesCatalogOutput": {
         "type": "object",
-        "description": "Response for `GET /queries`: the `mcp.expose` subset of a graph's\nstored-query registry, each with typed parameters.",
+        "description": "Response for `GET /queries`: every stored query in a graph's\nregistry, each with typed parameters.",
         "required": [
           "queries"
         ],
