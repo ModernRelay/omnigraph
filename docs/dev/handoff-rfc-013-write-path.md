@@ -335,6 +335,32 @@ over the window — strictly higher liability than either Design A or waiting fo
 exposing uncommitted variants for `compact_files` / `optimize_indices` / vector index (#6666
 open; delete #6658 shipped). Track, don't build yet.
 
+### 5.1 Step-5 design constraints inherited from the #295 spec review
+3b shipped a **minimal** `WriteTxn { branch, base }` (schema-once + open-collapse via
+eliminate/probe/thread) and **deferred** the full §4.1 opener-unification — the pinned-base
+opener, the shared-`Session` open, the write-local **handle cache**, and the strict-op
+conflict-timing move — to step 5. So the greptile-bot comments on the #295 *spec* were **moot
+for #298** (which built none of those constructs) but are **load-bearing constraints for step
+5** when it builds them. Bank them:
+1. **Handle cache must be `Send + Sync`** (`Mutex<HashMap<…, Dataset>>`, not `RefCell`) if
+   `WriteTxn::open(&self)` is shared across concurrent stage futures — a `RefCell` compiles
+   but panics when two stages poll. Or make it `&mut self` (no parallel-stage sharing). This
+   is the deny-list "in-process-only `Dataset` impls — `Send + Sync`" item.
+2. **The strict-op timing move needs an explicit retry contract.** If step 5 moves
+   strict-op conflict detection from open-time `ensure_expected_version` to commit-time CAS
+   (the §4.1 pinned-base design), it MUST specify: the txn is **discarded after any commit**
+   (success or conflict — the handle cache is commit-invalidated), and the retry **re-opens a
+   fresh `WriteTxn` at the new HEAD** (never re-stages against the stale pinned base — that
+   reproduces the lost-update). **This is the same retry/refresh contract as the stale-view
+   false-fail (§1d.2)** — the op-class-aware precondition + "fresh base on retry" are one
+   design point. Today (#298) strict ops keep open-at-HEAD + `ensure_expected_version`, so the
+   contract is unchanged; step 5 owns it the moment it pins strict reads to the base.
+3. **The opener-equivalence test must be non-trivial.** A differential test that only passes
+   when `HEAD == base` proves nothing about pinning. To actually prove "`WriteTxn::open`
+   returns the pinned base, not HEAD," the test must **advance the branch HEAD externally
+   (direct Lance write), then assert the txn open still reads the base version** — and that a
+   strict write then fails `ExpectedVersionMismatch` at commit (verifying the timing move).
+
 ---
 
 ## 6. Why #297 is still needed even if you do Design A
