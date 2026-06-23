@@ -488,11 +488,40 @@ pub(super) async fn needs_index_work_edge(
         || !db.storage().has_btree_index(&ds, "dst").await?)
 }
 
+/// Result of opening a sub-table for mutation. `handle` is `None` only when a
+/// non-strict (Insert/Merge) op on the WriteTxn's own branch skipped the
+/// accumulation open (RFC-013 step 3b collapse #1) — there the caller needs just
+/// `expected_version`. It is ALWAYS `Some` for strict ops, the fork path, and
+/// every no-`txn` caller (branch merge), which use [`Self::require_handle`].
+#[derive(Debug)]
+pub(crate) struct OpenedForMutation {
+    /// The opened dataset, or `None` on the non-strict-txn open-skip path.
+    pub(crate) handle: Option<SnapshotHandle>,
+    /// The publisher's CAS fence: the opened handle's version, or — when the open
+    /// was skipped — the pinned base entry's version (equal absent uncovered drift).
+    pub(crate) expected_version: u64,
+    pub(crate) full_path: String,
+    pub(crate) table_branch: Option<String>,
+}
+
+impl OpenedForMutation {
+    /// Destructure for a caller that REQUIRES the handle (strict ops, the fork
+    /// path, every no-`txn` caller). The `None` skip fires solely on the
+    /// non-strict `txn` path, which these callers are not — so a panic here means
+    /// a future change broke that contract, named by `ctx`.
+    pub(crate) fn require_handle(self, ctx: &str) -> (SnapshotHandle, String, Option<String>) {
+        let handle = self.handle.unwrap_or_else(|| {
+            panic!("{ctx}: open_for_mutation returned no handle on a path that requires one")
+        });
+        (handle, self.full_path, self.table_branch)
+    }
+}
+
 pub(super) async fn open_for_mutation(
     db: &Omnigraph,
     table_key: &str,
     op_kind: crate::db::MutationOpKind,
-) -> Result<(Option<SnapshotHandle>, u64, String, Option<String>)> {
+) -> Result<OpenedForMutation> {
     let current_branch = db
         .coordinator
         .read()
@@ -519,7 +548,7 @@ pub(super) async fn open_for_mutation_on_branch(
     table_key: &str,
     op_kind: crate::db::MutationOpKind,
     txn: Option<&crate::db::WriteTxn>,
-) -> Result<(Option<SnapshotHandle>, u64, String, Option<String>)> {
+) -> Result<OpenedForMutation> {
     db.ensure_schema_apply_not_locked("write").await?;
     // Source the resolved (snapshot, branch). With a `WriteTxn` the contract was
     // validated once at capture, so use the pinned base + resolved branch instead
@@ -558,16 +587,21 @@ pub(super) async fn open_for_mutation_on_branch(
         match resolved_branch.as_deref() {
             // Non-strict, table already on the active branch → no open, no fork.
             Some(active_branch) if entry.table_branch.as_deref() == Some(active_branch) => {
-                return Ok((
-                    None,
-                    entry.table_version,
+                return Ok(OpenedForMutation {
+                    handle: None,
+                    expected_version: entry.table_version,
                     full_path,
-                    Some(active_branch.to_string()),
-                ));
+                    table_branch: Some(active_branch.to_string()),
+                });
             }
             // Main branch, non-strict → no open. (Main never forks.)
             None => {
-                return Ok((None, entry.table_version, full_path, None));
+                return Ok(OpenedForMutation {
+                    handle: None,
+                    expected_version: entry.table_version,
+                    full_path,
+                    table_branch: None,
+                });
             }
             // Non-strict but the table isn't on the active branch yet — falls
             // through to fork below.
@@ -586,7 +620,12 @@ pub(super) async fn open_for_mutation_on_branch(
                     .ensure_expected_version(&ds, table_key, entry.table_version)?;
             }
             let version = ds.version();
-            Ok((Some(ds), version, full_path, None))
+            Ok(OpenedForMutation {
+                handle: Some(ds),
+                expected_version: version,
+                full_path,
+                table_branch: None,
+            })
         }
         Some(active_branch) => {
             let (ds, table_branch) = open_owned_dataset_for_branch_write(
@@ -600,7 +639,12 @@ pub(super) async fn open_for_mutation_on_branch(
             )
             .await?;
             let version = ds.version();
-            Ok((Some(ds), version, full_path, table_branch))
+            Ok(OpenedForMutation {
+                handle: Some(ds),
+                expected_version: version,
+                full_path,
+                table_branch,
+            })
         }
     }
 }

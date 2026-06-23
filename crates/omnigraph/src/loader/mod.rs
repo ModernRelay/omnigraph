@@ -497,14 +497,14 @@ async fn load_jsonl_reader<R: BufRead>(
         // CAS fence) for `ensure_path` — it discards the handle. With a
         // non-strict load op (Merge/Append) and a `WriteTxn`, collapse #1 skips
         // the dataset open and returns the pinned base version directly.
-        let (_handle, expected_version, full_path, table_branch) = db
+        let opened = db
             .open_for_mutation_on_branch(branch, &table_key, load_op_kind, Some(&txn))
             .await?;
         staging.ensure_path(
             &table_key,
-            full_path,
-            table_branch,
-            expected_version,
+            opened.full_path,
+            opened.table_branch,
+            opened.expected_version,
             load_op_kind,
         );
         let schema = batch.schema();
@@ -570,14 +570,14 @@ async fn load_jsonl_reader<R: BufRead>(
     for (edge_name, table_key, batch, loaded_count) in prepared_edges {
         // Same as the node phase: only the captured expected version is used;
         // collapse #1 skips the open for a non-strict load op under a `WriteTxn`.
-        let (_handle, expected_version, full_path, table_branch) = db
+        let opened = db
             .open_for_mutation_on_branch(branch, &table_key, load_op_kind, Some(&txn))
             .await?;
         staging.ensure_path(
             &table_key,
-            full_path,
-            table_branch,
-            expected_version,
+            opened.full_path,
+            opened.table_branch,
+            opened.expected_version,
             load_op_kind,
         );
         let schema = batch.schema();
@@ -605,7 +605,13 @@ async fn load_jsonl_reader<R: BufRead>(
     // `_queue_guards` holds per-(table_key, branch) write queues
     // across the manifest publish below — see exec/mutation.rs for
     // the rationale (interleaving prevention).
-    let (updates, expected_versions, sidecar_handle, _queue_guards, committed_handles) = staged
+    let crate::exec::staging::CommittedMutation {
+        updates,
+        expected_versions,
+        sidecar_handle,
+        guards: _queue_guards,
+        committed_handles,
+    } = staged
         .commit_all(
             db,
             branch,

@@ -440,6 +440,26 @@ struct StagedTableEntry {
     staged_write: StagedHandle,
 }
 
+/// Output of [`StagedMutation::commit_all`] (Phase B): the publisher's input plus
+/// the queue guards the caller must hold across the manifest publish.
+pub(crate) struct CommittedMutation {
+    /// Per-table updates to publish to the manifest.
+    pub(crate) updates: Vec<SubTableUpdate>,
+    /// Per-table manifest pins refreshed under the write queue — the publisher's CAS fence.
+    pub(crate) expected_versions: HashMap<String, u64>,
+    /// Recovery sidecar to delete after Phase C succeeds (`None` when nothing staged).
+    pub(crate) sidecar_handle: Option<RecoverySidecarHandle>,
+    /// Per-`(table, branch)` write-queue guards — the caller MUST hold these across
+    /// the manifest publish (see `commit_all`) so no writer interleaves between
+    /// `commit_staged` and the publish.
+    pub(crate) guards: Vec<tokio::sync::OwnedMutexGuard<()>>,
+    /// Post-`commit_staged` handle per STAGED table (table_key → handle at the
+    /// just-committed version). Carried out (RFC-013 step 3b, collapse #4) so the
+    /// publish-prepare index build reuses it instead of a fresh `reopen_for_mutation`
+    /// at the same version. Inline-committed / delete tables are absent (no staged handle).
+    pub(crate) committed_handles: HashMap<String, SnapshotHandle>,
+}
+
 impl StagedMutation {
     /// **Phase B** of the two-phase commit: acquire per-`(table_key,
     /// branch)` queues, revalidate manifest pins, write the recovery
@@ -486,18 +506,7 @@ impl StagedMutation {
             Vec<tokio::sync::OwnedMutexGuard<()>>,
         )>,
         txn: Option<&crate::db::WriteTxn>,
-    ) -> Result<(
-        Vec<SubTableUpdate>,
-        HashMap<String, u64>,
-        Option<RecoverySidecarHandle>,
-        Vec<tokio::sync::OwnedMutexGuard<()>>,
-        // Post-`commit_staged` handle per STAGED table (table_key → handle at
-        // the just-committed version). Carried out (RFC-013 step 3b, collapse
-        // #4) so the publish-prepare index build reuses it instead of a fresh
-        // `reopen_for_mutation` at the same version. Inline-committed / delete
-        // tables are NOT in the map (they have no staged handle).
-        HashMap<String, SnapshotHandle>,
-    )> {
+    ) -> Result<CommittedMutation> {
         let StagedMutation {
             inline_committed,
             mut staged,
@@ -836,13 +845,13 @@ impl StagedMutation {
             committed_handles.insert(table_key, new_ds);
         }
 
-        Ok((
+        Ok(CommittedMutation {
             updates,
             expected_versions,
             sidecar_handle,
             guards,
             committed_handles,
-        ))
+        })
     }
 }
 

@@ -666,17 +666,25 @@ async fn open_table_for_mutation(
     // is the pinned base's, identical to the opened handle's `.version()`. Use it
     // directly for `ensure_path` so the no-open path still captures the publisher
     // CAS fence.
-    let (handle, expected_version, full_path, table_branch) = db
+    let opened = db
         .open_for_mutation_on_branch(branch, table_key, op_kind, txn)
         .await?;
+    // Pin the open-skip contract (collapse #1): a missing handle is legal ONLY on
+    // the non-strict `txn` path. A future change that returns `None` elsewhere
+    // (e.g. a new strict arm) trips this in debug builds rather than silently
+    // handing a `None` to a `require_handle` consumer.
+    debug_assert!(
+        opened.handle.is_some() || (txn.is_some() && !op_kind.strict_pre_stage_version_check()),
+        "open_for_mutation_on_branch returned no handle outside the non-strict txn open-skip path",
+    );
     staging.ensure_path(
         table_key,
-        full_path.clone(),
-        table_branch.clone(),
-        expected_version,
+        opened.full_path.clone(),
+        opened.table_branch.clone(),
+        opened.expected_version,
         op_kind,
     );
-    Ok((handle, full_path, table_branch))
+    Ok((opened.handle, opened.full_path, opened.table_branch))
 }
 
 /// D₂ parse-time check: a single mutation query is either insert/update-only
@@ -854,17 +862,22 @@ impl Omnigraph {
                 // interleave between our commit_staged and our publish
                 // (which would correctly fail our CAS but leave Lance
                 // HEAD advanced — the residual class MR-870 recovers).
-                let (updates, expected_versions, sidecar_handle, _queue_guards, committed_handles) =
-                    staged
-                        .commit_all(
-                            self,
-                            requested.as_deref(),
-                            crate::db::manifest::SidecarKind::Mutation,
-                            actor_id,
-                            fork_queue_guards,
-                            Some(&txn),
-                        )
-                        .await?;
+                let super::staging::CommittedMutation {
+                    updates,
+                    expected_versions,
+                    sidecar_handle,
+                    guards: _queue_guards,
+                    committed_handles,
+                } = staged
+                    .commit_all(
+                        self,
+                        requested.as_deref(),
+                        crate::db::manifest::SidecarKind::Mutation,
+                        actor_id,
+                        fork_queue_guards,
+                        Some(&txn),
+                    )
+                    .await?;
                 // Failpoint that wedges the documented finalize→publisher
                 // residual: per-table `commit_staged` calls already
                 // advanced Lance HEAD on every touched table; a failure

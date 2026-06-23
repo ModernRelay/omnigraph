@@ -41,6 +41,7 @@ pub use repair::{
 };
 pub use schema_apply::SchemaApplyOptions;
 pub use table_ops::PendingIndex;
+pub(crate) use table_ops::OpenedForMutation;
 
 use super::commit_graph::GraphCommit;
 use super::manifest::{
@@ -1673,7 +1674,7 @@ impl Omnigraph {
         &self,
         table_key: &str,
         op_kind: crate::db::MutationOpKind,
-    ) -> Result<(Option<SnapshotHandle>, u64, String, Option<String>)> {
+    ) -> Result<OpenedForMutation> {
         table_ops::open_for_mutation(self, table_key, op_kind).await
     }
 
@@ -1683,7 +1684,7 @@ impl Omnigraph {
         table_key: &str,
         op_kind: crate::db::MutationOpKind,
         txn: Option<&crate::db::WriteTxn>,
-    ) -> Result<(Option<SnapshotHandle>, u64, String, Option<String>)> {
+    ) -> Result<OpenedForMutation> {
         table_ops::open_for_mutation_on_branch(self, branch, table_key, op_kind, txn).await
     }
 
@@ -2547,11 +2548,11 @@ edge WorksAt: Person -> Company
     async fn seed_person_row(db: &mut Omnigraph, name: &str, age: Option<i32>) {
         // No-txn entry, so the handle is always `Some` (collapse #1's skip is
         // gated on `txn.is_some()`).
-        let (ds, _expected_version, full_path, table_branch) = db
+        let (ds, full_path, table_branch) = db
             .open_for_mutation("node:Person", crate::db::MutationOpKind::Insert)
             .await
-            .unwrap();
-        let ds = ds.unwrap();
+            .unwrap()
+            .require_handle("seed_person_row test");
         let schema: Arc<Schema> = Arc::new(ds.dataset().schema().into());
         let columns: Vec<Arc<dyn Array>> = schema
             .fields()
