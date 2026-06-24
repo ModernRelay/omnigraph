@@ -15,6 +15,7 @@
 mod helpers;
 
 use arrow_array::Array;
+use lance::Dataset;
 use omnigraph::db::commit_graph::CommitGraph;
 use omnigraph::db::{Omnigraph, ReadTarget};
 use omnigraph::error::OmniError;
@@ -1724,4 +1725,63 @@ query chain($repo: String) {
         .await
         .expect("chained camelCase mutation must read the pending row, not fail at the MemTable SELECT");
     assert_eq!(r.affected_nodes, 2, "both ops should touch the acme Doc (read-your-writes)");
+}
+
+/// A zero-row cascade delete must not advance an edge table's Lance HEAD past
+/// its manifest version. A `delete <Node>` cascades a `delete_where` into every
+/// incident edge type (`exec/mutation.rs`). The inline `delete_where`
+/// (`Dataset::delete`) advances Lance HEAD **even when zero edges match**, but
+/// the cascade records the new version in the manifest only `if deleted_rows >
+/// 0`. So deleting a node with no incident edges advances `edge:Knows` Lance
+/// HEAD while the manifest stays behind — a `HEAD > manifest` drift that then
+/// trips the next strict write's `ExpectedVersionMismatch`, and `repair`
+/// refuses (delete-class drift), wedging the graph.
+///
+/// This pins the invariant directly: after any node delete, every edge table's
+/// manifest version must equal its on-disk Lance HEAD — no inline write may
+/// advance HEAD past the manifest (invariant 2 / the deny-list). RED today;
+/// GREEN once `delete` migrates to the staged two-phase path (iss-950, unblocked
+/// by Lance 7.0's `DeleteBuilder::execute_uncommitted`), where a 0-row delete
+/// commits no Lance version at all and the existing `deleted_rows > 0` gate
+/// becomes correct by construction.
+#[tokio::test]
+async fn node_delete_with_no_incident_edges_leaves_no_edge_table_drift() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut db = init_and_load(&dir).await;
+    let root = dir.path().to_str().unwrap().to_string();
+
+    // A person with NO Knows edges. Deleting it cascades a 0-row `delete_where`
+    // into `edge:Knows` (the cascade runs for every incident edge type).
+    mutate_main(
+        &mut db,
+        MUTATION_QUERIES,
+        "insert_person",
+        &mixed_params(&[("$name", "Loner")], &[("$age", 30)]),
+    )
+    .await
+    .unwrap();
+    mutate_main(
+        &mut db,
+        MUTATION_QUERIES,
+        "remove_person",
+        &params(&[("$name", "Loner")]),
+    )
+    .await
+    .expect("the first delete itself succeeds — it leaves the drift for the NEXT write");
+
+    // The invariant: edge:Knows manifest version == its on-disk Lance HEAD.
+    let snap = snapshot_main(&db).await.unwrap();
+    let entry = snap
+        .entry("edge:Knows")
+        .expect("edge:Knows must be in the manifest");
+    let full = format!("{}/{}", root.trim_end_matches('/'), entry.table_path);
+    let head = Dataset::open(&full).await.unwrap().version().version;
+    assert_eq!(
+        entry.table_version, head,
+        "a node delete matching no edges advanced edge:Knows Lance HEAD to v{head} but the \
+         manifest still records v{} — HEAD>manifest drift from a 0-row cascade `delete_where` not \
+         committed through the staged path. Fix: migrate delete to the staged two-phase API \
+         (iss-950).",
+        entry.table_version,
+    );
 }
