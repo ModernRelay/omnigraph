@@ -56,7 +56,8 @@ omnigraph-compiler = { path = "../omnigraph-compiler", version = "0.7.1" }
 tokio = { workspace = true }
 lance-namespace-impls = { workspace = true }
 lance-io = "7.0.0"
-lance-table = { workspace = true }
+arrow-array = { workspace = true }
+futures = { workspace = true }
 serde_json = { workspace = true }
 serial_test = "3"
 proptest = "1"

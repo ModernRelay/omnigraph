@@ -3,7 +3,7 @@
 //! `OpKind` (for coverage) and the raw `OmniError` (for structured
 //! classification — never stringified here).
 
-use omnigraph::db::{Omnigraph, ReadTarget};
+use omnigraph::db::{Omnigraph, ReadTarget, RepairOptions};
 use omnigraph::error::OmniError;
 use omnigraph::loader::{LoadMode, load_jsonl};
 use omnigraph_compiler::ir::ParamMap;
@@ -64,11 +64,12 @@ pub enum OpKind {
     UpdateDoc,
     InsertKnows,
     DeleteKnows,
+    Repair,
     Read,
 }
 
 impl OpKind {
-    pub const ALL: [OpKind; 8] = [
+    pub const ALL: [OpKind; 9] = [
         OpKind::InsertPerson,
         OpKind::InsertDoc,
         OpKind::Optimize,
@@ -76,13 +77,14 @@ impl OpKind {
         OpKind::UpdateDoc,
         OpKind::InsertKnows,
         OpKind::DeleteKnows,
+        OpKind::Repair,
         OpKind::Read,
     ];
 }
 
 /// Pick and run one op. The model is updated only on success.
 pub async fn step(db: &Omnigraph, rng: &mut Rng, model: &mut Model) -> (OpKind, Result<(), OmniError>) {
-    match rng.below(8) {
+    match rng.below(9) {
         0 => {
             let mut ids = Vec::new();
             let mut data = String::new();
@@ -202,6 +204,17 @@ pub async fn step(db: &Omnigraph, rng: &mut Rng, model: &mut Model) -> (OpKind, 
                 };
                 (OpKind::DeleteKnows, res)
             }
+        }
+        7 => {
+            // Repair in confirm (not force) mode — heals VERIFIED maintenance
+            // drift but leaves suspicious/semantic drift (e.g. RC-1's) for
+            // head_eq_manifest to still catch. A no-op on a clean graph; must
+            // never change logical data, so the model is untouched.
+            let opts = RepairOptions {
+                confirm: true,
+                force: false,
+            };
+            (OpKind::Repair, db.repair(opts).await.map(|_| ()))
         }
         _ => (
             OpKind::Read,

@@ -11,8 +11,10 @@
 //!     always a real finding (the named regressions cover the known concurrency
 //!     cases separately).
 
-use lance_table::format::RowIdMeta;
-use lance_table::rowids::read_row_ids;
+use std::collections::HashSet;
+
+use arrow_array::{RecordBatch, UInt64Array};
+use futures::TryStreamExt;
 use omnigraph::db::{Omnigraph, ReadTarget};
 use omnigraph::error::OmniError;
 use omnigraph_compiler::ir::ParamMap;
@@ -39,10 +41,15 @@ pub fn classify(f: &Finding) -> Option<&'static str> {
     match f {
         Finding::Engine(e) => {
             let s = e.to_string();
-            // RC-1: stale-view manifest CAS — gated on the Manifest variant so a
-            // coincidental substring in another subsystem cannot mask it.
+            // RC-1: edge-table HEAD/manifest drift from the node-delete cascade.
+            // Gated on the Manifest variant so a coincidental substring elsewhere
+            // can't mask it. Two surfaces of the same root: the write-time CAS
+            // "stale view", and a LATER write's precondition refusing the
+            // uncovered drift ("ahead of manifest ... run omnigraph repair").
             if matches!(e, OmniError::Manifest(_))
-                && (s.contains("stale view") || (s.contains("expected") && s.contains("current")))
+                && (s.contains("stale view")
+                    || (s.contains("expected") && s.contains("current"))
+                    || s.contains("ahead of manifest version"))
             {
                 return Some("RC-1 stale-view");
             }
@@ -56,6 +63,36 @@ pub fn classify(f: &Finding) -> Option<&'static str> {
         // Structural divergences are never allow-listed.
         Finding::Logical(_) => None,
     }
+}
+
+/// Extract a readable message from a caught panic payload.
+pub fn panic_message(p: &(dyn std::any::Any + Send)) -> String {
+    if let Some(s) = p.downcast_ref::<&str>() {
+        (*s).to_string()
+    } else if let Some(s) = p.downcast_ref::<String>() {
+        s.clone()
+    } else {
+        "<non-string panic payload>".to_string()
+    }
+}
+
+/// Classify a caught panic (a Lance-internal `unwrap`/index crash that unwinds
+/// through the engine) the same KNOWN-vs-NOVEL way as `classify`. Under fault
+/// injection and at walk depth the substrate WILL crash, so the harness must
+/// treat a panic as a finding, not let it abort the suite. NONE → re-raise.
+///
+/// Note on `index out of bounds`: in THIS harness the only source of that panic
+/// is Lance's inverted (FTS) index builder — the harness's own code uses checked
+/// loops and returns `Logical` findings, never an OOB panic — so the broad match
+/// is safe here and would not mask a harness bug.
+pub fn classify_panic(msg: &str) -> Option<&'static str> {
+    if msg.contains("from_sorted_iter") || msg.contains("non-sorted input") {
+        return Some("RC-X/#7230 scalar-BTREE");
+    }
+    if msg.contains("index out of bounds") {
+        return Some("Lance FTS inverted-builder OOB");
+    }
+    None
 }
 
 // ── INVARIANT #1: Lance HEAD == manifest table version, per table ──
@@ -94,48 +131,49 @@ pub async fn dataset_validate(db: &Omnigraph) -> Result<(), Finding> {
     Ok(())
 }
 
-// ── INVARIANT #3a: no overlapping stable row-id ranges across fragments ──
-// A structural integrity check decoded from each fragment's `row_id_meta`
-// (`RowIdMeta::Inline` → `read_row_ids` → `row_id_range`): in a stable-row-id
-// dataset every fragment owns a DISJOINT range of stable row ids, so any two
-// fragments whose `[start..=end]` ranges intersect is corruption — a double-
-// allocated / re-used row-id range. Unlike `index_probe` (which only surfaces a
-// bad scalar-BTREE page when a filtered READ loads it), this fires the moment
-// the bad fragment metadata is committed, before any read. Reaches Lance only
-// through public surfaces: `Snapshot::open → Dataset::fragments()` +
-// `lance_table::rowids::read_row_ids`. `RowIdMeta::External` and `None` (legacy
-// assign-by-position) fragments carry no inline range and are skipped.
-pub async fn no_overlapping_row_ids(db: &Omnigraph) -> Result<(), Finding> {
+// ── INVARIANT #3a: no duplicate LIVE stable row-id within a table ──
+// A stable row id uniquely identifies one live row for the dataset's lifetime;
+// the same id appearing on two live rows is exactly the duplicate-row-address
+// corruption class behind RC-X / Lance #7230. We read the truth deletion-vector-
+// correctly by scanning each table with `with_row_id()` (Lance's `_rowid`
+// projection returns only LIVE rows, so a tombstoned id masked by an UPDATE or
+// compaction never counts) and asserting the live `_rowid`s are unique. Unlike
+// `index_probe` (which only surfaces a bad scalar-BTREE page when a filtered
+// READ loads it), this is a direct structural check on every committed row.
+//
+// (An earlier version compared raw `row_id_meta` fragment ranges, but those
+// ranges include tombstoned ids — after an UPDATE+compaction an old fragment's
+// range legitimately overlaps the new fragment's, so that check false-positived.
+// Scanning live `_rowid`s is the deletion-vector-aware form.)
+pub async fn no_duplicate_live_row_ids(db: &Omnigraph) -> Result<(), Finding> {
     let snap = db
         .snapshot_of(ReadTarget::branch("main"))
         .await
         .map_err(Finding::Engine)?;
     for entry in snap.entries() {
         let ds = snap.open(&entry.table_key).await.map_err(Finding::Engine)?;
-        // (frag_id, start, end) for every fragment carrying an inline row-id range.
-        let mut ranges: Vec<(u64, u64, u64)> = Vec::new();
-        for frag in ds.fragments().iter() {
-            if let Some(RowIdMeta::Inline(bytes)) = &frag.row_id_meta {
-                let seq = read_row_ids(bytes).map_err(|e| {
-                    Finding::Logical(format!(
-                        "row_id_meta decode failed on {} frag {}: {e}",
-                        entry.table_key, frag.id
-                    ))
-                })?;
-                if let Some(r) = seq.row_id_range() {
-                    ranges.push((frag.id, *r.start(), *r.end()));
-                }
-            }
-        }
-        // Fragment counts per table are small; an O(n²) pairwise scan is fine and
-        // reports the exact colliding pair.
-        for i in 0..ranges.len() {
-            for j in (i + 1)..ranges.len() {
-                let (ai, a0, a1) = ranges[i];
-                let (bj, b0, b1) = ranges[j];
-                if a0 <= b1 && b0 <= a1 {
+        let mut scanner = ds.scan();
+        scanner.with_row_id();
+        let batches: Vec<RecordBatch> = scanner
+            .try_into_stream()
+            .await
+            .map_err(|e| Finding::Logical(format!("scan {}: {e}", entry.table_key)))?
+            .try_collect()
+            .await
+            .map_err(|e| Finding::Logical(format!("scan collect {}: {e}", entry.table_key)))?;
+        let mut seen: HashSet<u64> = HashSet::new();
+        for batch in &batches {
+            let col = batch
+                .column_by_name("_rowid")
+                .ok_or_else(|| Finding::Logical(format!("no _rowid column on {}", entry.table_key)))?
+                .as_any()
+                .downcast_ref::<UInt64Array>()
+                .ok_or_else(|| Finding::Logical(format!("_rowid not u64 on {}", entry.table_key)))?;
+            for i in 0..col.len() {
+                let id = col.value(i);
+                if !seen.insert(id) {
                     return Err(Finding::Logical(format!(
-                        "overlapping stable row-id ranges on {}: frag {ai} [{a0}..={a1}] ∩ frag {bj} [{b0}..={b1}]",
+                        "duplicate live stable row-id {id} in {} (RC-X-class duplicate row address)",
                         entry.table_key
                     )));
                 }
@@ -163,7 +201,7 @@ pub async fn run_battery(db: &Omnigraph, model: &crate::model::Model) -> Vec<(&'
     vec![
         ("head==manifest", head_eq_manifest(db).await),
         ("dataset.validate", dataset_validate(db).await),
-        ("row-id-disjoint", no_overlapping_row_ids(db).await),
+        ("row-id-unique", no_duplicate_live_row_ids(db).await),
         ("index-probe", index_probe(db).await),
         ("count==model", crate::model::check_counts(db, model).await),
         ("content==model", crate::model::check_content(db, model).await),

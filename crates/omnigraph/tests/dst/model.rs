@@ -100,10 +100,6 @@ impl Model {
     pub fn edges(&self) -> usize {
         self.knows.len()
     }
-    /// Debug-only: the live edges as (from,to) pairs.
-    pub fn knows_pairs(&self) -> Vec<(usize, usize)> {
-        self.knows.iter().map(|(&f, &t)| (f, t)).collect()
-    }
 }
 
 async fn count(db: &Omnigraph, ty: &str) -> Result<usize, Finding> {

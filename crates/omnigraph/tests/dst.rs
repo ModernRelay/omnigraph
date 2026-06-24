@@ -18,8 +18,10 @@
 //! bug is fixed: RC-X → Lance #7230 (Lance v8.0.0); RC-1 → stale-view manifest
 //! CAS on delete op-class combos; dup-@key → MR-714.
 
+use std::panic::AssertUnwindSafe;
 use std::sync::Arc;
 
+use futures::FutureExt;
 use omnigraph::db::ReadTarget;
 use omnigraph::loader::{LoadMode, load_jsonl};
 use omnigraph_compiler::ir::ParamMap;
@@ -247,7 +249,7 @@ async fn seeded_op_loop_with_cas_faults() {
 async fn run_walk(faults: bool) {
     let mut cov = Coverage::new();
     let mut reproduced: Vec<String> = Vec::new();
-    for seed in 0..2u64 {
+    for seed in 0..4u64 {
         let dir = tempfile::tempdir().unwrap();
         let uri = dir.path().to_str().unwrap();
         let db = if faults {
@@ -258,8 +260,29 @@ async fn run_walk(faults: bool) {
         let mut rng = Rng::new(seed);
         let mut model = Model::new();
 
-        'walk: for step_i in 0..15 {
-            let (kind, res) = op::step(&db, &mut rng, &mut model).await;
+        'walk: for step_i in 0..25 {
+            // A fault-injection / depth DST harness must treat a substrate PANIC
+            // (a Lance `unwrap`/index crash unwinding through the engine) as a
+            // finding, not a suite abort — so the op and the battery run under
+            // catch_unwind, and a known crash signature is classified like any
+            // other known bug (record + break); a novel panic re-raises.
+            let stepped = AssertUnwindSafe(op::step(&db, &mut rng, &mut model))
+                .catch_unwind()
+                .await;
+            let (kind, res) = match stepped {
+                Ok(kr) => kr,
+                Err(p) => {
+                    let msg = invariants::panic_message(&*p);
+                    match invariants::classify_panic(&msg) {
+                        Some(bug) => {
+                            cov.finding(bug);
+                            reproduced.push(format!("seed={seed} step={step_i} PANIC -> {bug}"));
+                            break 'walk;
+                        }
+                        None => panic!("seed={seed} step={step_i}: NOVEL panic: {msg}"),
+                    }
+                }
+            };
             cov.op(kind);
             if let Err(e) = res {
                 let f = Finding::Engine(e);
@@ -275,7 +298,21 @@ async fn run_walk(faults: bool) {
                     None => panic!("seed={seed} step={step_i}: NOVEL op error: {}", f.message()),
                 }
             }
-            for (name, res) in run_battery(&db, &model).await {
+            let battery = match AssertUnwindSafe(run_battery(&db, &model)).catch_unwind().await {
+                Ok(b) => b,
+                Err(p) => {
+                    let msg = invariants::panic_message(&*p);
+                    match invariants::classify_panic(&msg) {
+                        Some(bug) => {
+                            cov.finding(bug);
+                            reproduced.push(format!("seed={seed} step={step_i} battery PANIC -> {bug}"));
+                            break 'walk;
+                        }
+                        None => panic!("seed={seed} step={step_i}: NOVEL battery panic: {msg}"),
+                    }
+                }
+            };
+            for (name, res) in battery {
                 cov.invariant(name);
                 if let Err(f) = res {
                     match classify(&f) {
@@ -325,3 +362,4 @@ async fn run_walk(faults: bool) {
         eprintln!("  - {r}");
     }
 }
+
