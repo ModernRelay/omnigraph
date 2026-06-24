@@ -354,10 +354,9 @@ open; delete #6658 shipped). Track, don't build yet.
 - **#254** — logical-class fix (schema-apply vs optimize false-fail). Same op-class family;
   both are de-risking inputs for Design A's per-class commit models.
 - **#296** — recovery roll-forward converges on concurrent manifest advance. This is the fix
-  for the flaky `iss-schema-apply-reopen-recovery-race` (the handoff in
-  `handoff-schema-apply-recovery-flake.md`). It touches `recovery.rs` and is *aligned* with
-  #297's "postcondition is the state, not winning the CAS" principle — reconcile the monotonic
-  publish with #296's converge helper if #296 lands first.
+  for the flaky `iss-schema-apply-reopen-recovery-race`. It touches `recovery.rs` and is
+  *aligned* with #297's "postcondition is the state, not winning the CAS" principle — reconcile
+  the monotonic publish with #296's converge helper if #296 lands first.
 - **#295** — the step-3b RFC doc (apply §4's three corrections to it).
 
 ---
