@@ -61,4 +61,5 @@ futures = { workspace = true }
 serde_json = { workspace = true }
 serial_test = "3"
 proptest = "1"
+proptest-state-machine = "0.8"
 async-trait = { workspace = true }

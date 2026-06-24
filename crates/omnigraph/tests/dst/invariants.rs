@@ -19,6 +19,7 @@ use omnigraph::db::{Omnigraph, ReadTarget};
 use omnigraph::error::OmniError;
 use omnigraph_compiler::ir::ParamMap;
 
+#[derive(Debug)]
 pub enum Finding {
     /// An engine-returned error (variant preserved for structured classification).
     Engine(OmniError),

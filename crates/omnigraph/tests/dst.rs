@@ -40,6 +40,8 @@ mod coverage;
 mod backend;
 #[path = "dst/readshape.rs"]
 mod readshape;
+#[path = "dst/statemachine.rs"]
+mod statemachine;
 
 use coverage::Coverage;
 use invariants::{Finding, classify, run_battery};
