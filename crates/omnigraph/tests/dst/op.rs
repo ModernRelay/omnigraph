@@ -62,23 +62,27 @@ pub enum OpKind {
     Optimize,
     DeletePerson,
     UpdateDoc,
+    InsertKnows,
+    DeleteKnows,
     Read,
 }
 
 impl OpKind {
-    pub const ALL: [OpKind; 6] = [
+    pub const ALL: [OpKind; 8] = [
         OpKind::InsertPerson,
         OpKind::InsertDoc,
         OpKind::Optimize,
         OpKind::DeletePerson,
         OpKind::UpdateDoc,
+        OpKind::InsertKnows,
+        OpKind::DeleteKnows,
         OpKind::Read,
     ];
 }
 
 /// Pick and run one op. The model is updated only on success.
 pub async fn step(db: &Omnigraph, rng: &mut Rng, model: &mut Model) -> (OpKind, Result<(), OmniError>) {
-    match rng.below(6) {
+    match rng.below(8) {
         0 => {
             let mut ids = Vec::new();
             let mut data = String::new();
@@ -147,6 +151,57 @@ pub async fn step(db: &Omnigraph, rng: &mut Rng, model: &mut Model) -> (OpKind, 
                 Err(e) => Err(e),
             };
             (OpKind::UpdateDoc, res)
+        }
+        5 => {
+            // InsertKnows — pick a `from` with no outgoing edge (so the @card(0..1)
+            // insert is always legal) and any live `to`; both endpoints exist, so
+            // the engine producing an orphan/dup is a finding, not a generated one.
+            let froms = model.free_froms();
+            let persons = model.persons_vec();
+            if froms.is_empty() || persons.is_empty() {
+                // No legal edge to add yet — a no-op (still counts for coverage).
+                (OpKind::InsertKnows, Ok(()))
+            } else {
+                let from = froms[rng.below(froms.len())];
+                // Exclude self-loops: a Knows self-loop is committed to the edge
+                // table but is NOT returned by `$a knows $b` traversal (durable
+                // across optimize+reopen; the CSR build keeps it, so the drop is
+                // in Expand). That stored-but-not-traversable divergence is a real
+                // finding the harness surfaced — kept out of the generic generator
+                // so the edges==model oracle stays unambiguous; see B3 notes.
+                let others: Vec<usize> = persons.iter().copied().filter(|p| *p != from).collect();
+                if others.is_empty() {
+                    return (OpKind::InsertKnows, Ok(()));
+                }
+                let to = others[rng.below(others.len())];
+                let data = knows(&format!("g{from}"), &format!("g{to}"));
+                let res = match load_jsonl(db, &data, LoadMode::Merge).await {
+                    Ok(_) => {
+                        model.add_edge(from, to);
+                        Ok(())
+                    }
+                    Err(e) => Err(e),
+                };
+                (OpKind::InsertKnows, res)
+            }
+        }
+        6 => {
+            // DeleteKnows — remove an existing edge by its `from`.
+            let froms = model.knows_froms();
+            if froms.is_empty() {
+                (OpKind::DeleteKnows, Ok(()))
+            } else {
+                let from = froms[rng.below(froms.len())];
+                let q = format!("query dk() {{ delete Knows where from = \"g{from}\" }}");
+                let res = match db.mutate("main", &q, "dk", &ParamMap::new()).await {
+                    Ok(_) => {
+                        model.del_edge(from);
+                        Ok(())
+                    }
+                    Err(e) => Err(e),
+                };
+                (OpKind::DeleteKnows, res)
+            }
         }
         _ => (
             OpKind::Read,

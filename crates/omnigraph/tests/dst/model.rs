@@ -20,6 +20,11 @@ pub struct Model {
     /// Expected `body` value per live Doc id — the source of truth for the
     /// content==model oracle (a lost UPDATE shows up here even when counts match).
     doc_body: HashMap<usize, String>,
+    /// Live `Knows` edges as `from -> to` (the map enforces the schema's
+    /// `@card(0..1)`: a `from` has at most one outgoing edge). Every endpoint is
+    /// a live Person by construction — `del_person` cascades both directions, so
+    /// the model never holds an orphan and the engine producing one is a finding.
+    knows: HashMap<usize, usize>,
     next: usize,
 }
 
@@ -53,6 +58,10 @@ impl Model {
     }
     pub fn del_person(&mut self, id: usize) {
         self.persons.remove(&id);
+        // Node delete cascades to incident edges, BOTH directions — mirror it so
+        // the model never references a deleted Person (this is the RC-1 surface).
+        self.knows.remove(&id);
+        self.knows.retain(|_, &mut to| to != id);
     }
     pub fn persons(&self) -> usize {
         self.persons.len()
@@ -62,6 +71,38 @@ impl Model {
     }
     pub fn doc_bodies(&self) -> &HashMap<usize, String> {
         &self.doc_body
+    }
+
+    // ── edges ──
+    /// Live person ids (for picking an edge endpoint).
+    pub fn persons_vec(&self) -> Vec<usize> {
+        self.persons.iter().copied().collect()
+    }
+    /// Persons with no outgoing `Knows` — the only legal `from` for a new edge
+    /// under `@card(0..1)`, so every generated InsertKnows is a valid op.
+    pub fn free_froms(&self) -> Vec<usize> {
+        self.persons
+            .iter()
+            .copied()
+            .filter(|p| !self.knows.contains_key(p))
+            .collect()
+    }
+    /// Persons that currently have an outgoing edge (legal DeleteKnows targets).
+    pub fn knows_froms(&self) -> Vec<usize> {
+        self.knows.keys().copied().collect()
+    }
+    pub fn add_edge(&mut self, from: usize, to: usize) {
+        self.knows.insert(from, to);
+    }
+    pub fn del_edge(&mut self, from: usize) {
+        self.knows.remove(&from);
+    }
+    pub fn edges(&self) -> usize {
+        self.knows.len()
+    }
+    /// Debug-only: the live edges as (from,to) pairs.
+    pub fn knows_pairs(&self) -> Vec<(usize, usize)> {
+        self.knows.iter().map(|(&f, &t)| (f, t)).collect()
     }
 }
 
@@ -147,6 +188,52 @@ pub async fn check_content(db: &Omnigraph, model: &Model) -> Result<(), Finding>
             }
             _ => {}
         }
+    }
+    Ok(())
+}
+
+/// edges==model (referential integrity): two complementary counts must both
+/// equal the model's live-edge count. The RAW `edge:Knows` row count (read
+/// white-box via the snapshot, so it sees orphans too) catches a lost
+/// node-delete cascade that strands an edge pointing at a deleted Person; the
+/// TRAVERSAL count (`$a knows $b`, which only matches live endpoints) catches a
+/// lost edge write. Raw > traversal means an orphan exists.
+pub async fn check_edges(db: &Omnigraph, model: &Model) -> Result<(), Finding> {
+    let snap = db
+        .snapshot_of(ReadTarget::branch("main"))
+        .await
+        .map_err(Finding::Engine)?;
+    let mut raw: usize = 0;
+    for entry in snap.entries() {
+        if entry.table_key == "edge:Knows" {
+            let ds = snap.open(&entry.table_key).await.map_err(Finding::Engine)?;
+            raw = ds
+                .count_rows(None)
+                .await
+                .map_err(|e| Finding::Logical(format!("edge:Knows count_rows: {e}")))?;
+        }
+    }
+    if raw != model.edges() {
+        return Err(Finding::Logical(format!(
+            "raw edge:Knows rows={raw} != model={} (orphan edge / lost cascade / dup edge)",
+            model.edges()
+        )));
+    }
+    let res = db
+        .query(
+            ReadTarget::branch("main"),
+            "query e() { match { $a: Person $a knows $b } return { $a.slug, $b.slug } }",
+            "e",
+            &ParamMap::new(),
+        )
+        .await
+        .map_err(Finding::Engine)?;
+    if res.num_rows() != model.edges() {
+        return Err(Finding::Logical(format!(
+            "traversable Knows edges={} != model={} (orphan endpoint / lost edge)",
+            res.num_rows(),
+            model.edges()
+        )));
     }
     Ok(())
 }

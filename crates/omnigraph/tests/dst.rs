@@ -181,6 +181,54 @@ async fn regression_dup_key_under_concurrency() {
     );
 }
 
+/// FINDING (harness-surfaced, distinct from the 3 above): a `Knows` SELF-LOOP is
+/// committed to the edge table but is NOT returned by `$a knows $b` traversal —
+/// durable across optimize and reopen, and the CSR build keeps it (so the drop
+/// is in Expand). `proptest_equivalence` can't catch it: it only asserts
+/// CSR-vs-indexed MODE equivalence, and both modes drop the self-loop alike. The
+/// model-based edges==model oracle caught it; self-loops are kept out of the
+/// generic generator so that oracle stays unambiguous. This characterization
+/// guard breaks (forcing review) when self-loops become traversable.
+#[tokio::test]
+async fn regression_self_loop_not_traversable() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = backend::open_clean(dir.path().to_str().unwrap()).await;
+    load_jsonl(&db, &person("s0"), LoadMode::Merge).await.unwrap();
+    load_jsonl(&db, &knows("s0", "s0"), LoadMode::Merge).await.unwrap();
+
+    // The self-loop row is durably committed to the edge table.
+    let snap = db.snapshot_of(ReadTarget::branch("main")).await.unwrap();
+    let mut raw = 0;
+    for entry in snap.entries() {
+        if entry.table_key == "edge:Knows" {
+            raw = snap
+                .open(&entry.table_key)
+                .await
+                .unwrap()
+                .count_rows(None)
+                .await
+                .unwrap();
+        }
+    }
+    assert_eq!(raw, 1, "self-loop edge row should be committed");
+
+    // ...but traversal does not return it (the finding).
+    let trav = db
+        .query(
+            ReadTarget::branch("main"),
+            "query e() { match { $a: Person $a knows $b } return { $a.slug, $b.slug } }",
+            "e",
+            &ParamMap::new(),
+        )
+        .await
+        .unwrap()
+        .num_rows();
+    assert_eq!(
+        trav, 0,
+        "self-loop appears FIXED (traversable={trav}) — flip this regression to expect 1"
+    );
+}
+
 // ═══════════════════════════ generative walk ══════════════════════════════
 
 /// Clean walk: full white-box battery after every op; novel violations fail.
