@@ -21,6 +21,12 @@ use omnigraph::db::{Omnigraph, ReadTarget};
 use omnigraph::loader::{LoadMode, load_jsonl};
 use omnigraph_compiler::ir::ParamMap;
 
+#[path = "dst/fault.rs"]
+mod fault;
+#[path = "dst/model.rs"]
+mod model;
+use model::{Model, check_counts};
+
 // One schema exercising both bug surfaces: Person+Knows(@card) for the
 // delete-cascade / stale-view path, and Doc.source (low-cardinality enum
 // @index → scalar BTREE) for the index-corruption path.
@@ -301,43 +307,64 @@ async fn regression_dup_key_under_concurrency() {
 // Runs random ops; after EACH, asserts the white-box invariant battery holds.
 // RC-1 (stale-view) is classified as retryable so the walk explores past it.
 
-async fn run_op(db: &Omnigraph, rng: &mut Rng, next_id: &mut usize) -> Result<(), String> {
+async fn run_op(db: &Omnigraph, rng: &mut Rng, model: &mut Model) -> Result<(), String> {
     match rng.below(6) {
         0 => {
-            // insert persons
+            // insert persons — model updated only on success.
+            let mut ids = Vec::new();
             let mut data = String::new();
-            for _ in 0..(1 + rng.below(20)) {
-                data.push_str(&person(&format!("g{}", *next_id)));
-                *next_id += 1;
+            for _ in 0..(1 + rng.below(10)) {
+                let id = model.fresh_id();
+                ids.push(id);
+                data.push_str(&person(&format!("g{id}")));
             }
-            load_jsonl(db, &data, LoadMode::Merge).await.map(|_| ()).map_err(|e| e.to_string())
+            let r = load_jsonl(db, &data, LoadMode::Merge).await;
+            if r.is_ok() {
+                for id in ids {
+                    model.add_person(id);
+                }
+            }
+            r.map(|_| ()).map_err(|e| e.to_string())
         }
         1 => {
-            // insert docs (indexed scalar)
+            // insert docs (indexed scalar source).
+            let mut ids = Vec::new();
             let mut data = String::new();
-            for _ in 0..(1 + rng.below(20)) {
+            for _ in 0..(1 + rng.below(10)) {
+                let id = model.fresh_id();
+                ids.push(id);
                 let s = if rng.below(100) < 85 { "whatsapp" } else { "email" };
-                data.push_str(&doc(&format!("g{}", *next_id), s));
-                *next_id += 1;
+                data.push_str(&doc(&format!("g{id}"), s));
             }
-            load_jsonl(db, &data, LoadMode::Merge).await.map(|_| ()).map_err(|e| e.to_string())
+            let r = load_jsonl(db, &data, LoadMode::Merge).await;
+            if r.is_ok() {
+                for id in ids {
+                    model.add_doc(id);
+                }
+            }
+            r.map(|_| ()).map_err(|e| e.to_string())
         }
         2 => db.optimize().await.map(|_| ()).map_err(|e| e.to_string()),
         3 => {
-            // delete a person (may not exist — fine)
-            let id = rng.below((*next_id).max(1));
+            // delete a person (slug may be a doc or absent — no-op then).
+            let id = rng.below(model.id_high());
             let q = format!("query d() {{ delete Person where slug = \"g{id}\" }}");
-            db.mutate("main", &q, "d", &ParamMap::new()).await.map(|_| ()).map_err(|e| e.to_string())
+            let r = db.mutate("main", &q, "d", &ParamMap::new()).await;
+            if r.is_ok() {
+                model.del_person(id);
+            }
+            r.map(|_| ()).map_err(|e| e.to_string())
         }
         4 => {
             // UPDATE a doc body — moves the whole row → scalar-index remap (the
             // morphology that, combined with optimize, mints RC-X corruption).
-            let id = rng.below((*next_id).max(1));
+            // No count change → model untouched.
+            let id = rng.below(model.id_high());
             let q = format!("query u() {{ update Doc set {{ body: \"u{id} needle\" }} where slug = \"g{id}\" }}");
             db.mutate("main", &q, "u", &ParamMap::new()).await.map(|_| ()).map_err(|e| e.to_string())
         }
         _ => {
-            // read (indexed filter)
+            // read (indexed filter).
             db.query(
                 ReadTarget::branch("main"),
                 "query w() { match { $d: Doc { source: \"whatsapp\" } } return { $d.slug } }",
@@ -351,24 +378,58 @@ async fn run_op(db: &Omnigraph, rng: &mut Rng, next_id: &mut usize) -> Result<()
     }
 }
 
+/// Open a graph whose storage injects seeded manifest-layer faults (CAS-lost).
+async fn open_faulted(uri: &str, seed: u64, cas_pct: u8) -> Omnigraph {
+    Omnigraph::init(uri, SCHEMA).await.expect("init"); // create graph + schema cleanly
+    let base = omnigraph::storage::storage_for_uri(uri).expect("storage_for_uri");
+    let faulted = fault::FaultAdapter::new(base, seed, cas_pct);
+    Omnigraph::open_with_storage(uri, faulted)
+        .await
+        .expect("open_with_storage")
+}
+
+/// Clean generative walk: white-box battery (incl. count==model) after every op.
 #[tokio::test]
 async fn seeded_op_loop_invariants_hold() {
+    run_walk(false).await;
+}
+
+/// Phase 2: same walk, but storage injects spurious manifest CAS-lost faults.
+/// The engine must surface/retry them (never silently lose a write) — count==
+/// model catches any loss as a NOVEL violation.
+#[tokio::test]
+async fn seeded_op_loop_with_cas_faults() {
+    run_walk(true).await;
+}
+
+async fn run_walk(faults: bool) {
     let mut reproduced: Vec<String> = Vec::new();
     for seed in 0..2u64 {
         let dir = tempfile::tempdir().unwrap();
-        let db = init(dir.path().to_str().unwrap()).await;
+        let uri = dir.path().to_str().unwrap();
+        let db = if faults {
+            open_faulted(uri, seed, 8).await
+        } else {
+            init(uri).await
+        };
         let mut rng = Rng::new(seed);
-        let mut next_id = 0usize;
+        let mut model = Model::new();
 
         'walk: for step in 0..15 {
-            // Op error: a KNOWN bug stops this seed (explored to the bug); a
-            // NOVEL error fails the run.
-            if let Err(e) = run_op(&db, &mut rng, &mut next_id).await {
+            // Op error: KNOWN bug stops this seed; an expected fault-induced
+            // retryable error is tolerated (model not updated → still consistent);
+            // anything else is NOVEL → fail.
+            if let Err(e) = run_op(&db, &mut rng, &mut model).await {
                 match known_bug(&e) {
                     Some(bug) => {
                         reproduced.push(format!("seed={seed} step={step} op -> {bug}"));
                         break 'walk;
                     }
+                    // Fault injection legitimately fails writes in varied ways;
+                    // tolerate non-known op errors under faults (the INVARIANT
+                    // checks below stay strict — that's where a lost write or
+                    // novel corruption is caught).
+                    None if faults => {}
                     None => panic!("seed={seed} step={step}: NOVEL op error: {e}"),
                 }
             }
@@ -377,12 +438,13 @@ async fn seeded_op_loop_invariants_hold() {
                 ("head==manifest", invariant_head_eq_manifest(&db).await),
                 ("dataset.validate", invariant_dataset_validate(&db).await),
                 ("index-probe", invariant_index_probe(&db).await),
+                ("count==model", check_counts(&db, &model).await),
             ];
             for (name, res) in checks {
                 if let Err(v) = res {
                     match known_bug(&v) {
-                        // Known corruption is terminal for this seed (e.g. a
-                        // corrupt BTREE page does not self-heal) — record & move on.
+                        // Known corruption is terminal for this seed (a corrupt
+                        // BTREE page does not self-heal) — record & move on.
                         Some(bug) => {
                             reproduced.push(format!("seed={seed} step={step} [{name}] -> {bug}"));
                             break 'walk;
@@ -395,11 +457,11 @@ async fn seeded_op_loop_invariants_hold() {
             }
         }
     }
-    // The generative walk is EXPECTED to (sometimes) reproduce known bugs on the
-    // current build; it must NEVER surface a NOVEL invariant violation (those
-    // panic above). This is the regression guard for new corruption classes.
+    // The walk is EXPECTED to (sometimes) reproduce known bugs; it must NEVER
+    // surface a NOVEL invariant violation (those panic above) — the regression
+    // guard for new corruption / lost-write classes.
     eprintln!(
-        "[dst] generative walk: {} known-bug instance(s) reproduced, 0 novel violations",
+        "[dst] walk (faults={faults}): {} known-bug instance(s), 0 novel violations",
         reproduced.len()
     );
     for r in &reproduced {

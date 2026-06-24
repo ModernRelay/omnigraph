@@ -58,3 +58,4 @@ lance-namespace-impls = { workspace = true }
 lance-io = "7.0.0"
 serial_test = "3"
 proptest = "1"
+async-trait = { workspace = true }
