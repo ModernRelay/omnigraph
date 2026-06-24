@@ -109,8 +109,9 @@ pub async fn step(db: &Omnigraph, rng: &mut Rng, model: &mut Model) -> (OpKind, 
             }
             let res = match load_jsonl(db, &data, LoadMode::Merge).await {
                 Ok(_) => {
+                    // `doc()` writes body "needle filler" — track it for content==model.
                     for id in ids {
-                        model.add_doc(id);
+                        model.add_doc(id, "needle filler".to_string());
                     }
                     Ok(())
                 }
@@ -134,8 +135,18 @@ pub async fn step(db: &Omnigraph, rng: &mut Rng, model: &mut Model) -> (OpKind, 
         4 => {
             // UPDATE moves the whole row → scalar-index remap (RC-X morphology).
             let id = rng.below(model.id_high());
-            let q = format!("query u() {{ update Doc set {{ body: \"u{id} needle\" }} where slug = \"g{id}\" }}");
-            (OpKind::UpdateDoc, db.mutate("main", &q, "u", &ParamMap::new()).await.map(|_| ()))
+            let body = format!("u{id} needle");
+            let q = format!("query u() {{ update Doc set {{ body: \"{body}\" }} where slug = \"g{id}\" }}");
+            let res = match db.mutate("main", &q, "u", &ParamMap::new()).await {
+                Ok(_) => {
+                    // Only mutates the model for a Doc it believes exists, so a
+                    // no-op update (0 rows matched) can't desync content==model.
+                    model.update_doc_body(id, body);
+                    Ok(())
+                }
+                Err(e) => Err(e),
+            };
+            (OpKind::UpdateDoc, res)
         }
         _ => (
             OpKind::Read,

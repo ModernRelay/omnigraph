@@ -244,9 +244,32 @@ async fn run_walk(faults: bool) {
                 }
             }
         }
+
+        // ── reopen==pre_state: durability oracle ──
+        // A fresh handle on the same bytes (clean adapter; the open-time recovery
+        // sweep runs) must agree with the model the walk built. count==model /
+        // content==model prove the data survived; head==manifest / row-id-disjoint
+        // prove the sweep left no residual drift. Reuses the same battery at
+        // durability time, so no separate coverage cell.
+        drop(db);
+        let reopened = backend::reopen(uri).await;
+        for (name, res) in run_battery(&reopened, &model).await {
+            if let Err(f) = res {
+                match classify(&f) {
+                    Some(bug) => {
+                        cov.finding(bug);
+                        reproduced.push(format!("seed={seed} [reopen/{name}] -> {bug}"));
+                    }
+                    None => panic!(
+                        "seed={seed}: NOVEL post-reopen violation [{name}]: {}",
+                        f.message()
+                    ),
+                }
+            }
+        }
     }
     eprintln!(
-        "[dst] walk(faults={faults}): coverage [{}]; {} known-bug instance(s), 0 novel violations",
+        "[dst] walk(faults={faults}): coverage [{}]; {} known-bug instance(s), 0 novel violations (+reopen durability gate)",
         cov.report(),
         reproduced.len()
     );

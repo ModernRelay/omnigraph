@@ -166,5 +166,6 @@ pub async fn run_battery(db: &Omnigraph, model: &crate::model::Model) -> Vec<(&'
         ("row-id-disjoint", no_overlapping_row_ids(db).await),
         ("index-probe", index_probe(db).await),
         ("count==model", crate::model::check_counts(db, model).await),
+        ("content==model", crate::model::check_content(db, model).await),
     ]
 }
