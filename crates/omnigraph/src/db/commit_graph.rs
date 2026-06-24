@@ -587,7 +587,12 @@ pub(crate) async fn read_legacy_commit_cache(
 ) -> Result<(HashMap<String, GraphCommit>, Option<GraphCommit>)> {
     let root = root_uri.trim_end_matches('/');
     let commits_uri = graph_commits_uri(root);
-    let mut dataset = match Dataset::open(&commits_uri).await {
+    let commits_open = match crate::failpoints::maybe_fail_lance_open("migration.v3_to_v4.legacy_open")
+    {
+        Ok(()) => Dataset::open(&commits_uri).await,
+        Err(injected) => Err(injected),
+    };
+    let mut dataset = match commits_open {
         Ok(dataset) => dataset,
         // No legacy commit dataset at all ⇒ nothing to read.
         Err(_) => return Ok((HashMap::new(), None)),
@@ -607,7 +612,12 @@ pub(crate) async fn read_legacy_commit_cache(
     // This matches the live `CommitGraph::open_at_branch`, which also opens the
     // actor dataset on main while checking out the branch only on the commits
     // dataset.
-    let actor_by_commit_id = match Dataset::open(&graph_commit_actors_uri(root)).await {
+    let actors_open =
+        match crate::failpoints::maybe_fail_lance_open("migration.v3_to_v4.legacy_open") {
+            Ok(()) => Dataset::open(&graph_commit_actors_uri(root)).await,
+            Err(injected) => Err(injected),
+        };
+    let actor_by_commit_id = match actors_open {
         Ok(actor_dataset) => load_commit_actor_cache(&actor_dataset).await?,
         Err(_) => HashMap::new(),
     };
@@ -828,7 +838,13 @@ fn now_micros() -> Result<i64> {
 
 /// Identities of the commits written into a synthetic pre-Phase-7 (v3) graph by
 /// [`seed_legacy_v3_lineage`], for assertions after migration.
-#[cfg(test)]
+//
+// Gated on `test` OR the `failpoints` feature: the v3→v4 migration fault-injection
+// test lives in the `failpoints` integration binary (the fail registry is
+// process-global, so failpoint tests must not run in-source), and that binary
+// compiles the crate without `cfg(test)` — so it needs this fixture under the
+// feature too. Still excluded from release builds.
+#[cfg(any(test, feature = "failpoints"))]
 #[derive(Debug, Clone)]
 pub struct V3LineageFixture {
     /// The genesis (parentless) commit id.
@@ -856,7 +872,7 @@ pub struct V3LineageFixture {
 /// with authored actors on the non-genesis commits. Reaches the dead-on-the-
 /// write-path `append_commit_with_parents`/`append_actor` (still present for
 /// exactly this transitional purpose) to write the legacy rows.
-#[cfg(test)]
+#[cfg(any(test, feature = "failpoints"))]
 pub async fn seed_legacy_v3_lineage(root_uri: &str) -> Result<V3LineageFixture> {
     let root = root_uri.trim_end_matches('/');
 

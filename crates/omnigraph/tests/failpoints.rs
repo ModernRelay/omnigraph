@@ -4356,3 +4356,85 @@ async fn init_failpoint_returns_original_error_not_cleanup_error() {
         "init error must surface the failpoint cause, got: {msg}"
     );
 }
+
+// ── RFC-013 Phase 7 / FIX A: a transient legacy-open failure must abort the ──
+// v3→v4 migration loudly, not silently swallow the lineage and stamp v4.
+//
+// `migrate_v3_to_v4` backfills graph lineage from `_graph_commits.lance` into
+// `__manifest`, then stamps internal-schema v4. The migration runs exactly once
+// per graph (`migrate_internal_schema` is `while stamp < CURRENT`). If a
+// transient or corrupt `Dataset::open` of the legacy commit dataset is treated
+// as "no legacy data" (the pre-fix `Err(_) => empty` arm), the migration backfills
+// NOTHING and stamps v4 — orphaning the real lineage permanently, since the v3
+// fallback is then disabled. The fix matches the not-found variants (benign:
+// genuinely no legacy data) and propagates anything else.
+//
+// This test injects a non-not-found Lance error at the legacy open via the
+// `migration.v3_to_v4.legacy_open` failpoint. The load-bearing assertion is the
+// last one: a once-transient failure leaves the graph RETRYABLE (stamp still v3,
+// no lineage), so a later open with the fault cleared completes the migration —
+// it was not a poison pill.
+#[tokio::test]
+async fn transient_legacy_open_failure_aborts_migration_without_stamping_v4() {
+    let _scenario = FailScenario::setup();
+    let dir = tempfile::tempdir().unwrap();
+    let uri = dir.path().to_str().unwrap().to_string();
+
+    // A real pre-Phase-7 (v3) graph: lineage only in `_graph_commits.lance`,
+    // `__manifest` stamped v3 with no `graph_commit` rows.
+    let fixture = omnigraph::db::commit_graph::seed_legacy_v3_lineage(&uri)
+        .await
+        .unwrap();
+    let (rows_before, stamp_before) =
+        omnigraph::db::manifest::lineage_row_count_and_stamp_for_test(&uri, None)
+            .await
+            .unwrap();
+    assert_eq!(stamp_before, 3, "fixture is stamped v3");
+    assert_eq!(rows_before, 0, "fixture has no lineage in __manifest");
+
+    // Arm the legacy-open fault and run the read-write migration entry point.
+    {
+        let _fp = ScopedFailPoint::new("migration.v3_to_v4.legacy_open", "return");
+        let err = match omnigraph::db::manifest::migrate_on_open_for_test(&uri).await {
+            Ok(()) => panic!("migration must abort when the legacy open fails transiently"),
+            Err(e) => e,
+        };
+        // The injected (non-not-found) Lance error must surface, not be masked.
+        let msg = err.to_string();
+        assert!(
+            msg.contains("injected failpoint triggered: migration.v3_to_v4.legacy_open"),
+            "expected the injected legacy-open error to propagate, got: {msg}"
+        );
+    }
+
+    // The migration left NO drift: stamp still v3, still no lineage. (Pre-fix,
+    // the swallow would have stamped v4 with an empty backfill — permanent loss.)
+    let (rows_after_fault, stamp_after_fault) =
+        omnigraph::db::manifest::lineage_row_count_and_stamp_for_test(&uri, None)
+            .await
+            .unwrap();
+    assert_eq!(
+        stamp_after_fault, 3,
+        "a transient legacy-open failure must NOT stamp the manifest to v4",
+    );
+    assert_eq!(
+        rows_after_fault, 0,
+        "a transient legacy-open failure must NOT partially backfill lineage",
+    );
+
+    // The whole correctness claim: a once-transient failure is retryable. With the
+    // fault cleared, the next migration pass reads the legacy lineage and completes.
+    omnigraph::db::manifest::migrate_on_open_for_test(&uri)
+        .await
+        .unwrap();
+    let (rows_done, stamp_done) =
+        omnigraph::db::manifest::lineage_row_count_and_stamp_for_test(&uri, None)
+            .await
+            .unwrap();
+    assert_eq!(stamp_done, 4, "the retried migration stamps v4");
+    assert_eq!(
+        rows_done,
+        fixture.all_ids.len(),
+        "the retried migration backfills every legacy commit",
+    );
+}

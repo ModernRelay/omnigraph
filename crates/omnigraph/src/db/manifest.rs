@@ -125,7 +125,7 @@ pub(crate) const INTERNAL_MANIFEST_SCHEMA_VERSION: u32 =
 /// synthetic pre-Phase-7 (v3) graph (see `commit_graph::seed_legacy_v3_lineage`).
 /// A small two-type schema is enough — the v3→v4 migration touches only the
 /// lineage rows, never the table-version rows.
-#[cfg(test)]
+#[cfg(any(test, feature = "failpoints"))]
 pub(crate) async fn seed_manifest_for_v3_fixture(root_uri: &str) -> Result<()> {
     let schema = omnigraph_compiler::schema::parser::parse_schema(
         "node Person { name: String }\nedge Knows: Person -> Person { }\n",
@@ -140,7 +140,7 @@ pub(crate) async fn seed_manifest_for_v3_fixture(root_uri: &str) -> Result<()> {
 /// Test-only: strip the `graph_commit`/`graph_head` rows that Phase-7 init folds
 /// into `__manifest`, then rewind the internal-schema stamp to v3 — completing a
 /// synthetic pre-Phase-7 graph whose lineage lives only in `_graph_commits.lance`.
-#[cfg(test)]
+#[cfg(any(test, feature = "failpoints"))]
 pub(crate) async fn strip_lineage_and_set_v3_stamp_for_fixture(root_uri: &str) -> Result<()> {
     let mut dataset = open_manifest_dataset(root_uri, None).await?;
     dataset
@@ -150,6 +150,29 @@ pub(crate) async fn strip_lineage_and_set_v3_stamp_for_fixture(root_uri: &str) -
     // Re-open so the stamp write lands on the post-delete HEAD.
     let mut dataset = open_manifest_dataset(root_uri, None).await?;
     migrations::set_stamp_for_test(&mut dataset, 3).await
+}
+
+/// Test-support re-export of the read-write migration entry point for the
+/// `failpoints` integration binary (which can't reach `pub(crate)` items). Gated
+/// on `test` OR `failpoints`; never in a release build.
+#[cfg(any(test, feature = "failpoints"))]
+pub async fn migrate_on_open_for_test(root_uri: &str) -> Result<()> {
+    migrate_on_open(root_uri).await
+}
+
+/// Test-support: the number of `graph_commit` lineage rows in `__manifest` at
+/// `branch` (main when `None`), plus the on-disk internal-schema stamp. Lets the
+/// `failpoints` integration binary assert the migration neither stamped nor
+/// backfilled when a legacy-open fault fired. Gated on `test` OR `failpoints`.
+#[cfg(any(test, feature = "failpoints"))]
+pub async fn lineage_row_count_and_stamp_for_test(
+    root_uri: &str,
+    branch: Option<&str>,
+) -> Result<(usize, u32)> {
+    let dataset = open_manifest_dataset(root_uri, branch).await?;
+    let stamp = migrations::read_stamp(&dataset);
+    let (rows, _heads) = read_graph_lineage(&dataset).await?;
+    Ok((rows.len(), stamp))
 }
 
 /// Immutable point-in-time view of the database.

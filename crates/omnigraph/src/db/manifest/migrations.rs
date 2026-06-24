@@ -326,8 +326,10 @@ async fn set_stamp(dataset: &mut Dataset, version: u32) -> Result<()> {
 
 /// Test-only: force the on-disk internal-schema stamp to `version`. Used to
 /// synthesize a pre-migration graph (rewinding to v3) and to simulate a crash
-/// that lost the final stamp bump.
-#[cfg(test)]
+/// that lost the final stamp bump. Gated on `test` OR `failpoints` so the
+/// fault-injection migration test (in the `failpoints` integration binary,
+/// compiled without `cfg(test)`) can reach it too.
+#[cfg(any(test, feature = "failpoints"))]
 pub(crate) async fn set_stamp_for_test(dataset: &mut Dataset, version: u32) -> Result<()> {
     set_stamp(dataset, version).await
 }
