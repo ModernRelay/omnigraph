@@ -947,6 +947,85 @@ pub async fn seed_legacy_v3_lineage(root_uri: &str) -> Result<V3LineageFixture> 
     })
 }
 
+/// Identities of a synthetic pre-Phase-7 (v3) graph that carries a REAL Lance
+/// branch (built by [`seed_legacy_v3_lineage_with_branch`]).
+#[cfg(test)]
+#[derive(Debug, Clone)]
+pub struct V3BranchedLineageFixture {
+    /// The genesis (parentless) commit on main.
+    pub genesis: String,
+    /// A direct authored commit on main (actor `act-a`). The head of main.
+    pub commit_a: String,
+    /// A commit on the real `feature` Lance branch (actor `act-branch`),
+    /// parented off `commit_a`. The head of `feature`.
+    pub branch_commit: String,
+    /// The branch name forked on both `_graph_commits.lance` and `__manifest`.
+    pub branch: String,
+}
+
+/// Build a synthetic pre-Phase-7 (internal-schema v3) graph at `root_uri` that
+/// carries a REAL Lance branch `feature` on BOTH `_graph_commits.lance` and
+/// `__manifest`, reproducing exactly the on-disk shape of a branched graph
+/// created by a pre-RFC-013-Phase-7 binary:
+///
+/// - `_graph_commits.lance`: main has `genesis → A`; the `feature` Lance branch
+///   adds `branch_commit` (parent `A`). Authored actors land in the FLAT actor
+///   sidecar (the pre-Phase-7 commit graph never forked the actor table).
+/// - `__manifest`: main is stamped v3 with NO lineage rows; the `feature` branch
+///   is forked from main's v3 state, so it too is v3 with NO lineage of its own.
+///
+/// This is the fixture the per-branch v3→v4 migration runs against: it lets a
+/// test prove that migrating the `feature` branch reads the branch's legacy
+/// lineage, writes it into the BRANCH's `__manifest`, and leaves main untouched —
+/// the case the main-only [`seed_legacy_v3_lineage`] cannot exercise.
+#[cfg(test)]
+pub async fn seed_legacy_v3_lineage_with_branch(root_uri: &str) -> Result<V3BranchedLineageFixture> {
+    let root = root_uri.trim_end_matches('/');
+
+    // 1. `__manifest` (genesis folded by Phase-7 init) + an empty legacy
+    //    `_graph_commits.lance`. Clear the init-seeded cache so the rows we
+    //    append below are the whole story.
+    crate::db::manifest::seed_manifest_for_v3_fixture(root).await?;
+    let mut cg = CommitGraph::init(root).await?;
+    cg.commit_by_id.clear();
+    cg.head_commit = None;
+
+    // 2. Main lineage on `_graph_commits.lance`: genesis → A (authored).
+    let genesis = cg
+        .append_commit_with_parents(None, 1, None, None, None)
+        .await?;
+    let commit_a = cg
+        .append_commit_with_parents(None, 2, Some(&genesis), None, Some("act-a"))
+        .await?;
+
+    // 3. Fork a real `feature` Lance branch on `_graph_commits.lance`, switch the
+    //    handle to it, and append an authored branch commit (its actor lands in
+    //    the flat main actor table — exactly the pre-Phase-7 shape).
+    cg.create_branch("feature").await?;
+    cg.dataset = cg
+        .dataset
+        .checkout_branch("feature")
+        .await
+        .map_err(|e| OmniError::Lance(e.to_string()))?;
+    cg.active_branch = Some("feature".to_string());
+    let branch_commit = cg
+        .append_commit_with_parents(Some("feature"), 3, Some(&commit_a), None, Some("act-branch"))
+        .await?;
+
+    // 4. Rewind main's `__manifest` to the v3 shape (strip the folded genesis
+    //    lineage, set stamp 3) BEFORE forking — so the `feature` manifest branch
+    //    inherits the stripped v3 state (no lineage, stamp 3).
+    crate::db::manifest::strip_lineage_and_set_v3_stamp_for_fixture(root).await?;
+    crate::db::manifest::fork_manifest_branch_for_v3_fixture(root, "feature").await?;
+
+    Ok(V3BranchedLineageFixture {
+        genesis,
+        commit_a,
+        branch_commit,
+        branch: "feature".to_string(),
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use std::sync::Arc;

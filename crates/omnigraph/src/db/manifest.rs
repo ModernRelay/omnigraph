@@ -152,6 +152,23 @@ pub(crate) async fn strip_lineage_and_set_v3_stamp_for_fixture(root_uri: &str) -
     migrations::set_stamp_for_test(&mut dataset, 3).await
 }
 
+/// Test-only: fork a real Lance branch `name` on `__manifest` from main's CURRENT
+/// state. Call AFTER `strip_lineage_and_set_v3_stamp_for_fixture` so the forked
+/// branch inherits the v3 stamp with no lineage rows — i.e. a faithful
+/// pre-Phase-7 branch whose `__manifest` carries no lineage of its own. The
+/// branch's commits live only on the `_graph_commits.lance` branch until the
+/// per-branch v3→v4 migration runs against this branch's `__manifest`.
+#[cfg(test)]
+pub(crate) async fn fork_manifest_branch_for_v3_fixture(root_uri: &str, name: &str) -> Result<()> {
+    let mut dataset = open_manifest_dataset(root_uri, None).await?;
+    let version = dataset.version().version;
+    dataset
+        .create_branch(name, version, None)
+        .await
+        .map_err(|e| OmniError::Lance(e.to_string()))?;
+    Ok(())
+}
+
 /// Test-support re-export of the read-write migration entry point for the
 /// `failpoints` integration binary (which can't reach `pub(crate)` items). Gated
 /// on `test` OR `failpoints`; never in a release build.

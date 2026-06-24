@@ -1860,6 +1860,128 @@ async fn crash_after_merge_before_stamp_completes_on_next_open() {
     );
 }
 
+/// Migrate the `__manifest` at `branch` (the per-branch v3→v4 entry shape:
+/// `migrate_on_open` runs it for main; the publisher runs it for each branch's
+/// first write). Returns the migrated branch lineage `(commit_by_id, heads)`.
+async fn migrate_branch_and_read_lineage(
+    uri: &str,
+    branch: &str,
+) -> (
+    std::collections::HashMap<String, GraphLineageRow>,
+    std::collections::HashMap<String, String>,
+) {
+    let mut ds = open_manifest_dataset(uri, Some(branch)).await.unwrap();
+    super::migrations::migrate_internal_schema(&mut ds, uri, Some(branch))
+        .await
+        .unwrap();
+    // Re-open at the branch so the read sees the migration's committed HEAD.
+    let ds = open_manifest_dataset(uri, Some(branch)).await.unwrap();
+    let (rows, heads) = read_graph_lineage(&ds).await.unwrap();
+    let by_id = rows
+        .into_iter()
+        .map(|r| (r.graph_commit_id.clone(), r))
+        .collect();
+    (by_id, heads)
+}
+
+// FIX C — the per-branch v3→v4 migration against a REAL Lance branch.
+//
+// `seed_legacy_v3_lineage` writes every commit (incl. the "feature"-tagged one)
+// to MAIN's `_graph_commits.lance` with `manifest_branch` as a mere field — it
+// never exercises the production per-branch path (`read_legacy_commit_cache` →
+// `checkout_branch`, and a branch-scoped `__manifest`). This test builds a graph
+// with a REAL Lance branch on both `_graph_commits.lance` and `__manifest`, then
+// migrates the BRANCH and asserts the branch's lineage lands in the BRANCH's
+// `__manifest` with main untouched.
+//
+// It also EMPIRICALLY decides the open question behind FIX B: the fast-path
+// `read_graph_lineage(dataset)` has no `manifest_branch` filter in its query, but
+// `dataset` is branch-scoped (`__manifest` is Lance-branched per graph-branch),
+// so a branch should read only its OWN lineage. If migrating the branch were to
+// leak main's backfill (or vice versa), that would be a 5th bug needing a branch
+// filter. The assertions below pin that it does not.
+#[tokio::test]
+async fn v3_branch_migration_backfills_branch_manifest_and_leaves_main_untouched() {
+    use crate::db::commit_graph::seed_legacy_v3_lineage_with_branch;
+
+    let dir = tempfile::tempdir().unwrap();
+    let uri = dir.path().to_str().unwrap();
+    let fx = seed_legacy_v3_lineage_with_branch(uri).await.unwrap();
+
+    // Precondition: both main and the branch are v3 with no lineage in __manifest.
+    for branch in [None, Some(fx.branch.as_str())] {
+        let ds = open_manifest_dataset(uri, branch).await.unwrap();
+        assert_eq!(
+            super::migrations::read_stamp(&ds),
+            3,
+            "{branch:?}: fixture branch is stamped v3",
+        );
+        let (rows, _heads) = read_graph_lineage(&ds).await.unwrap();
+        assert!(
+            rows.is_empty(),
+            "{branch:?}: fixture branch has no lineage in __manifest",
+        );
+    }
+
+    // Migrate ONLY the branch.
+    let (branch_by_id, branch_heads) = migrate_branch_and_read_lineage(uri, &fx.branch).await;
+
+    // The branch's __manifest now carries the branch's full DAG: genesis, A, and
+    // the branch commit (3 rows), with the branch commit as `graph_head:feature`.
+    assert_eq!(
+        branch_by_id.len(),
+        3,
+        "the branch backfill carries genesis + A + the branch commit",
+    );
+    for id in [&fx.genesis, &fx.commit_a, &fx.branch_commit] {
+        assert!(
+            branch_by_id.contains_key(id),
+            "branch commit {id} must be backfilled into the branch __manifest",
+        );
+    }
+    assert_eq!(
+        branch_heads.get(&fx.branch).map(String::as_str),
+        Some(fx.branch_commit.as_str()),
+        "graph_head:feature points at the branch commit",
+    );
+
+    // Parents + actors survived the backfill.
+    let branch_commit = &branch_by_id[&fx.branch_commit];
+    assert_eq!(
+        branch_commit.parent_commit_id.as_deref(),
+        Some(fx.commit_a.as_str()),
+        "the branch commit keeps its parent",
+    );
+    assert_eq!(
+        branch_commit.actor_id.as_deref(),
+        Some("act-branch"),
+        "the branch commit's authored actor survives",
+    );
+    assert_eq!(
+        branch_by_id[&fx.commit_a].actor_id.as_deref(),
+        Some("act-a"),
+        "the inherited main commit's actor survives on the branch",
+    );
+
+    // Contingency check: migrating the branch left MAIN's __manifest untouched —
+    // still v3, still no lineage. The unfiltered fast-path read is branch-correct
+    // because `__manifest` is Lance-branched; no `manifest_branch` filter is
+    // needed (no 5th bug).
+    {
+        let main_ds = open_manifest_dataset(uri, None).await.unwrap();
+        assert_eq!(
+            super::migrations::read_stamp(&main_ds),
+            3,
+            "migrating the branch must not advance main's stamp",
+        );
+        let (main_rows, _heads) = read_graph_lineage(&main_ds).await.unwrap();
+        assert!(
+            main_rows.is_empty(),
+            "migrating the branch must not backfill main's __manifest",
+        );
+    }
+}
+
 // ── RFC-013 Phase 7 / step 5: the `graph_head` concurrency gate ──────────────
 //
 // Two (or N) writers committing DISJOINT tables on the same branch still share
