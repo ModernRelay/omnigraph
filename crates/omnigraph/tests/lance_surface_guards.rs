@@ -108,6 +108,27 @@ async fn lance_error_incompatible_transaction_variant_exists() {
     );
 }
 
+// --- Guard 1c: LanceError::DatasetAlreadyExists variant exists --------------
+//
+// `db/commit_graph.rs` and `db/recovery_audit.rs` create internal Lance tables
+// with a create-or-open idempotency fallback: a concurrent/prior create races,
+// and the `DatasetAlreadyExists` arm falls back to `Dataset::open`. They match
+// the typed variant, NOT the display string ("Dataset already exists: ..."),
+// which is not a Lance API contract. If Lance renames the variant the match
+// silently stops catching the race and a re-create errors instead of opening —
+// this guard turns red to force an update.
+
+#[tokio::test]
+async fn lance_error_dataset_already_exists_variant_exists() {
+    let err = lance::Error::dataset_already_exists("guard");
+    assert!(
+        matches!(err, lance::Error::DatasetAlreadyExists { .. }),
+        "Lance::Error::DatasetAlreadyExists variant missing or renamed; update the \
+         db/commit_graph.rs + db/recovery_audit.rs create-or-open fallbacks and \
+         this guard, then re-pin docs/dev/lance.md."
+    );
+}
+
 // --- Guard 1b: Dataset::open on a missing path returns a not-found variant --
 //
 // `db/commit_graph.rs::read_legacy_commit_cache` (the v3→v4 lineage migration

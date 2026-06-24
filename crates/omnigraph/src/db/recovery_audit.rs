@@ -195,7 +195,11 @@ async fn create_recoveries_dataset(root_uri: &str) -> Result<Dataset> {
     };
     match Dataset::write(reader, &uri as &str, Some(params)).await {
         Ok(dataset) => Ok(dataset),
-        Err(err) if err.to_string().contains("Dataset already exists") => Dataset::open(&uri)
+        // Create-or-open idempotency — match the typed `DatasetAlreadyExists`
+        // variant, not the display string (not a Lance API contract). Same
+        // discipline as `commit_graph.rs`'s create-or-open; pinned by
+        // `lance_surface_guards.rs::lance_error_dataset_already_exists_variant_exists`.
+        Err(lance::Error::DatasetAlreadyExists { .. }) => Dataset::open(&uri)
             .await
             .map_err(|open_err| OmniError::Lance(open_err.to_string())),
         Err(err) => Err(OmniError::Lance(err.to_string())),
