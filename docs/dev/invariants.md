@@ -258,7 +258,18 @@ them explicit.
   and a read-only open of an un-migrated v3 graph sources the DAG from
   `_graph_commits.lance` via a stamp-gated transitional fallback so reads stay
   correct until the first write migrates it. An old binary refuses a v4-stamped
-  graph (read-write and read-only) with the standard upgrade error.
+  graph (read-write and read-only) with the standard upgrade error. The migration
+  is **loud on failure and concurrent-runner idempotent**: the legacy-open read
+  (`read_legacy_commit_cache`) treats only a genuine not-found as "no legacy data"
+  and propagates any other open error (so a transient/corrupt open can never stamp
+  v4 over an empty backfill — orphaning lineage permanently), and the backfill
+  converges all-or-nothing when two runners open the same legacy graph at once — a
+  bounded re-open retry on the `graph_head:<branch>` row-level CAS plus an
+  idempotent terminal stamp bump (both runners write the same value, so a concurrent
+  `UpdateConfig`/`IncompatibleTransaction` loss re-opens and no-ops if the stamp
+  already landed). The branch read path (`load_commit_cache_for_branch`) also
+  refuses a `> CURRENT` branch stamp (defense-in-depth; not a live hole because
+  migrations run main-first, so main refuses first).
 - **Planner capability/stat surfaces:** cost-aware planning, complete
   capability advertisement, and explain-with-cost are roadmap. Do not describe
   them as implemented.
