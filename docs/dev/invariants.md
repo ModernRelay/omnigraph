@@ -296,11 +296,14 @@ them explicit.
   because Lance branch names can be deleted/recreated at the same version number;
   the manifest e_tag is carried into synthetic snapshot ids when available, and
   a detected same-branch manifest refresh clears read caches as the fallback for
-  e_tag-less table locations/topology. Remaining: the internal metadata tables
-  (`__manifest`, `_graph_commits`) are still not compacted, so the probe and
-  refresh cost still grows with fragment count on a long-lived graph (the
-  `optimize`-covers-internal-tables follow-up); the commit graph is not yet
-  reconcilable from the manifest; and the traversal id-map is still rebuilt.
+  e_tag-less table locations/topology. Remaining: `optimize` now compacts the
+  internal metadata tables (`__manifest`, `_graph_commits`) too (RFC-013 step 2),
+  so a *periodically-optimized* graph keeps the probe/refresh/per-write scan flat
+  in history; but they are not yet brought into `cleanup` (version GC), so the
+  `_versions/` chain still grows until an explicit cleanup (the cleanup half is
+  deferred — it needs the Q8 cleanup-resurrection watermark first). The commit
+  graph is not yet reconcilable from the manifest; and the traversal id-map is
+  still rebuilt.
 - **Commit-graph parent under concurrency:** `record_graph_commit` now refreshes
   the commit-graph head from storage before appending, so a same-branch write
   after an external commit no longer forks the commit DAG by parenting off a

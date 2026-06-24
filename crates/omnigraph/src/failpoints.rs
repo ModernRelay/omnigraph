@@ -42,6 +42,8 @@ pub mod names {
     pub const INIT_AFTER_SCHEMA_PG_WRITTEN: &str = "init.after_schema_pg_written";
     pub const MUTATION_DELETE_NODE_PRE_PRIMARY_DELETE: &str = "mutation.delete_node_pre_primary_delete";
     pub const MUTATION_POST_FINALIZE_PRE_PUBLISHER: &str = "mutation.post_finalize_pre_publisher";
+    pub const OPTIMIZE_BEFORE_COMPACT: &str = "optimize.before_compact";
+    pub const OPTIMIZE_INJECT_REINDEX_CONFLICT: &str = "optimize.inject_reindex_conflict";
     pub const OPTIMIZE_POST_PHASE_B_PRE_MANIFEST_COMMIT: &str = "optimize.post_phase_b_pre_manifest_commit";
     pub const RECOVERY_BEFORE_ROLL_FORWARD_PUBLISH: &str = "recovery.before_roll_forward_publish";
     pub const RECOVERY_ORPHAN_DISCARD_AUDIT_APPEND: &str = "recovery.orphan_discard_audit_append";

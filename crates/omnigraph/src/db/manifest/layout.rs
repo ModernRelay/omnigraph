@@ -15,7 +15,7 @@ pub(super) fn type_name_hash(name: &str) -> String {
     format!("{:016x}", h)
 }
 
-pub(super) fn manifest_uri(root: &str) -> String {
+pub(crate) fn manifest_uri(root: &str) -> String {
     format!("{}/{}", root.trim_end_matches('/'), MANIFEST_DIR)
 }
 

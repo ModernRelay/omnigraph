@@ -237,6 +237,58 @@ async fn cardinality_rejected_on_mutation_insert_edge() {
     );
 }
 
+/// RFC-013 step 3b regression guard (cursor High / codex P1 on #298): edge `@card`
+/// validation must scan LIVE committed HEAD, not the pinned `txn.base`. Collapse #1
+/// skips the edge accumulation open, so a non-strict edge insert under a `WriteTxn`
+/// reopens for the cardinality scan — and that scan must observe edges a concurrent
+/// writer committed after this mutation captured its base, or a `@card` max is
+/// silently exceeded (invariant 9). The residual validate→commit TOCTOU is the §7.1
+/// gap (step 4); this only un-widens what 3b widened (live HEAD vs mutation-start base).
+///
+/// Deterministic — no failpoint: handle B's coordinator is stale by construction
+/// (the write path does not probe the manifest version, unlike the read path). B MUST
+/// NOT read between A's commit and B's insert — a read refreshes B's coordinator and
+/// masks the bug (the same caveat as the served stale-view repro in `writes.rs`).
+#[tokio::test]
+async fn cardinality_rejected_for_stale_handle_after_concurrent_edge_commit() {
+    let (dir, mut db_a) = init_with(CARDINALITY_SCHEMA, CARDINALITY_SEED).await;
+    let uri = dir.path().to_str().unwrap();
+
+    // Handle B opens the same graph at the seed version (no edges yet); it then
+    // never reads again, so its in-memory coordinator stays pinned at the seed.
+    let mut db_b = Omnigraph::open(uri).await.unwrap();
+
+    // Handle A commits WorksAt(Alice -> Acme): Alice is now at the @card(0..1) max.
+    // This advances the on-disk manifest; B's coordinator is now stale.
+    mutate_main(
+        &mut db_a,
+        CARDINALITY_MUTATIONS,
+        "add_employment",
+        &params(&[("$person", "Alice"), ("$company", "Acme")]),
+    )
+    .await
+    .unwrap();
+
+    // Handle B (stale, never read since A committed) inserts a second WorksAt for
+    // Alice. B is non-strict + under a WriteTxn, so collapse #1 skips the open and the
+    // cardinality scan reopens: it MUST read live HEAD (Alice has 1) → reject (1+1 > 1),
+    // not the stale base (Alice has 0) → which would wrongly pass and commit a 2nd edge.
+    let err = mutate_main(
+        &mut db_b,
+        CARDINALITY_MUTATIONS,
+        "add_employment",
+        &params(&[("$person", "Alice"), ("$company", "Beta")]),
+    )
+    .await
+    .unwrap_err();
+    assert!(
+        err.to_string().to_lowercase().contains("cardinality")
+            || err.to_string().to_lowercase().contains("@card"),
+        "a stale-handle edge insert must be rejected by @card against live HEAD, got: {}",
+        err
+    );
+}
+
 #[tokio::test]
 async fn cardinality_rejected_on_jsonl_load() {
     // Already covered by existing loader Phase 3 logic but assert the

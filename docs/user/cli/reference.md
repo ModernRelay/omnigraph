@@ -28,7 +28,7 @@ Top-level command families and subcommands. Graph-targeting commands accept a po
 | `policy validate \| test \| explain` | Cedar tooling against a cluster's applied policies (`--cluster <dir>`; `--graph <id>` picks a graph's bundle when several apply). `test` takes `--tests <file>`; `explain` takes `--actor`/`--action`/`--branch`/`--target-branch` |
 | `queries list \| validate` | inspect a cluster's applied stored-query registry (`--cluster <dir\|uri>`; `--graph <id>` to scope one graph). `list` prints each query's kind (read/mutation), name, typed params, and `[mcp: …]` exposure; a query's `@description`/`@instruction` are shown as indented `description:` / `instruction:` lines when declared (omitted otherwise). `--json` emits `{name, mcp_expose, tool_name, mutation, params}` plus `description`/`instruction` **only when present** — matching the HTTP `GET /queries` catalog ([server.md](../operations/server.md)). `validate` type-checks the registry and exits non-zero on a broken query |
 | `profile list \| show [<name>]` | read-only inspection of `~/.omnigraph/config.yaml` profiles. `list` shows each profile's binding (server/cluster/store) + default graph and marks the `$OMNIGRAPH_PROFILE`-active one; JSON keeps `binding` and adds `scope_kind`, `target`, `valid`, and `error`; `show` resolves one profile's scope (endpoint + default graph), defaulting to the active profile, else the flat operator defaults |
-| `version` / `-v` | print `omnigraph 0.3.x` |
+| `version` / `-v` | print `omnigraph 0.7.x` |
 
 ## Command capabilities
 
@@ -189,22 +189,26 @@ omnigraph cluster import   --config company-brain --json
 omnigraph cluster force-unlock <LOCK_ID> --config company-brain --json
 ```
 
-`--config` is a directory containing `cluster.yaml`; it defaults to `.`.
-Stage 3A accepts graphs, schemas, stored queries, and policy bundle file
+`--config` is a directory containing `cluster.yaml`; it defaults to `.`. The
+config declares graphs, schemas, stored queries, and policy bundle file
 references. `cluster plan` reads local JSON state from
 `<config-dir>/__cluster/state.json`; a missing file means empty state. Plan,
 apply, refresh, and import acquire `__cluster/lock.json` by default and release
-it before returning. `cluster apply` executes only stored-query/policy catalog
-writes (content-addressed under `__cluster/resources/`) and requires an
-existing `state.json`; graph/schema changes are deferred with warnings, and
-applied resources do not serve traffic until an `omnigraph-server --cluster
-<dir>` restart picks them up. `cluster status` reads state only and reports any existing
-lock metadata. `force-unlock` removes a lock only when the supplied id exactly
-matches the lock file. `refresh` requires an existing `state.json`; `import`
-creates one only when it is missing. Both observe declared graphs read-only at
-`<config-dir>/graphs/<graph-id>.omni`. External state backends, graph/schema
-apply, automatic stale-lock breaking, `plan --refresh`, pipelines, UI specs,
-embeddings, aliases, and bindings are reserved for later stages. See
+it before returning. `cluster apply` converges the cluster to its config in one
+ordered run: it creates declared graphs, applies schema updates (soft drops
+only — see [schema](../schema/index.md)), writes stored-query/policy catalog
+resources (content-addressed under `__cluster/resources/`), and executes
+approved graph deletes; it requires an existing `state.json` (run `import`
+first). Applied state does not serve traffic until an `omnigraph-server
+--cluster <dir>` restart picks up the new revision. Standalone schema deletes
+remain unsupported and are reported as `deferred` with a warning. `cluster
+status` reads state only and reports any existing lock metadata. `force-unlock`
+removes a lock only when the supplied id exactly matches the lock file.
+`refresh` requires an existing `state.json`; `import` creates one only when it
+is missing. Both observe declared graphs read-only at
+`<config-dir>/graphs/<graph-id>.omni`. External state backends, automatic
+stale-lock breaking, `plan --refresh`, pipelines, UI specs, embeddings,
+aliases, and bindings are not yet supported. See
 [cluster-config.md](../clusters/config.md).
 
 ## Output formats (`query` command, alias: `read`)
@@ -221,9 +225,12 @@ Precedence (high to low): explicit `--params` / `--params-file`, alias positiona
 
 ## Bearer token resolution (CLI)
 
-1. `graphs.<name>.bearer_token_env`
-2. `OMNIGRAPH_BEARER_TOKEN` global env
-3. `auth.env_file` referenced `.env`
+See **Credentials keyed by server name** above: a remote command resolves its
+token via `OMNIGRAPH_TOKEN_<NAME>` env → the `[<name>]` section in
+`~/.omnigraph/credentials` → the default `OMNIGRAPH_BEARER_TOKEN` env, and a
+keyed token is only ever sent to the server it is keyed to. Plaintext tokens are
+never stored in operator config; the removed `omnigraph.yaml` keys
+(`graphs.<name>.bearer_token_env`, `auth.env_file`) no longer exist.
 
 ## Duration parsing (cleanup)
 

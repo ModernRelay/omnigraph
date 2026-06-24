@@ -397,8 +397,10 @@ pub(crate) enum ClusterCommand {
         #[arg(long)]
         json: bool,
     },
-    /// Apply the config-only (query/policy) subset of the plan to the local
-    /// cluster catalog. Graph/schema changes are deferred to a later stage.
+    /// Converge the cluster to its config: create graphs, apply schema updates
+    /// (soft drops), write stored-query/policy catalog resources, and execute
+    /// approved graph deletes, in one ordered run. Serving picks up the applied
+    /// revision after an `omnigraph-server --cluster` restart.
     Apply {
         /// Cluster config directory containing cluster.yaml.
         #[arg(long, default_value = ".")]

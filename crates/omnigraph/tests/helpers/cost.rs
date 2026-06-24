@@ -58,6 +58,14 @@ pub struct IoCounts {
     pub commit_graph_reads: u64,
     /// Version-probe invocations (the cheap freshness check).
     pub version_probes: u64,
+    /// DATA-table open CALL count through the two instrumented chokepoints — an
+    /// exact open-invocation count (not the opener-read term), classified by URI so
+    /// internal/system-table opens are excluded. Step-3b target:
+    /// `data_open_count <= |touched_tables|` for a write.
+    pub data_open_count: u64,
+    /// Internal/system-table (`__manifest`, `_graph_commits*`) open CALL count —
+    /// the complement of `data_open_count` (publisher CAS + commit-graph append).
+    pub internal_open_count: u64,
 }
 
 impl IoCounts {
@@ -225,6 +233,8 @@ struct ProbeHandles {
     commit_graph: IOTracker,
     table: PrefixCounter,
     probe_count: Arc<AtomicU64>,
+    data_open_count: Arc<AtomicU64>,
+    internal_open_count: Arc<AtomicU64>,
 }
 
 impl ProbeHandles {
@@ -234,6 +244,8 @@ impl ProbeHandles {
             commit_graph: IOTracker::default(),
             table: PrefixCounter::default(),
             probe_count: Arc::new(AtomicU64::new(0)),
+            data_open_count: Arc::new(AtomicU64::new(0)),
+            internal_open_count: Arc::new(AtomicU64::new(0)),
         };
         let probes = QueryIoProbes {
             manifest_wrapper: Some(Arc::new(h.manifest.clone()) as Arc<dyn WrappingObjectStore>),
@@ -242,6 +254,8 @@ impl ProbeHandles {
             ),
             table_wrapper: Some(Arc::new(h.table.clone()) as Arc<dyn WrappingObjectStore>),
             probe_count: Arc::clone(&h.probe_count),
+            data_open_count: Arc::clone(&h.data_open_count),
+            internal_open_count: Arc::clone(&h.internal_open_count),
         };
         (probes, h)
     }
@@ -256,6 +270,8 @@ impl ProbeHandles {
             manifest_reads: self.manifest.stats().read_iops,
             commit_graph_reads: self.commit_graph.stats().read_iops,
             version_probes: self.probe_count.load(Ordering::Relaxed),
+            data_open_count: self.data_open_count.load(Ordering::Relaxed),
+            internal_open_count: self.internal_open_count.load(Ordering::Relaxed),
         }
     }
 }
@@ -328,6 +344,23 @@ pub async fn measure_insert(db: &mut Omnigraph, tag: &str) -> IoCounts {
         MUTATION_QUERIES,
         "insert_person",
         &mixed_params(&[("$name", tag)], &[("$age", 30)]),
+    ))
+    .await;
+    res.unwrap();
+    io
+}
+
+/// Like [`measure_insert`] but carries an actor, so the write appends to and reads
+/// `_graph_commit_actors.lance` — the authenticated (server/CLI) write path. The
+/// commit-graph IO wrapper covers both `_graph_commits` and `_graph_commit_actors`,
+/// so `IoCounts::commit_graph_reads` includes the actor-table scan on this path.
+pub async fn measure_insert_as(db: &mut Omnigraph, tag: &str, actor: &str) -> IoCounts {
+    let (res, io) = measure(db.mutate_as(
+        "main",
+        MUTATION_QUERIES,
+        "insert_person",
+        &mixed_params(&[("$name", tag)], &[("$age", 30)]),
+        Some(actor),
     ))
     .await;
     res.unwrap();

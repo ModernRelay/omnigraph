@@ -184,6 +184,22 @@ pub async fn commit_many(db: &mut Omnigraph, n: usize) {
     }
 }
 
+/// Like [`commit_many`] but every commit carries an actor, so it grows
+/// `_graph_commit_actors.lance` too — the authenticated (server/CLI) write path.
+pub async fn commit_many_as(db: &mut Omnigraph, n: usize, actor: &str) {
+    for i in 0..n {
+        db.mutate_as(
+            "main",
+            MUTATION_QUERIES,
+            "insert_person",
+            &mixed_params(&[("$name", &format!("commit_many_as_{i}"))], &[("$age", 30)]),
+            Some(actor),
+        )
+        .await
+        .unwrap();
+    }
+}
+
 pub async fn snapshot_main(db: &Omnigraph) -> Result<Snapshot> {
     db.snapshot_of(ReadTarget::branch("main")).await
 }
