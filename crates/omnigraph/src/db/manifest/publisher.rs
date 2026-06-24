@@ -36,8 +36,7 @@ use super::metadata::parse_namespace_version_request;
 use super::migrations::migrate_internal_schema;
 use super::state::{
     GraphLineageRow, GraphLineageRowPart, graph_lineage_row_parts, head_lineage_row,
-    manifest_rows_batch, manifest_schema, read_graph_lineage, read_manifest_entries,
-    read_registered_table_locations, read_tombstone_versions,
+    manifest_rows_batch, manifest_schema, read_publish_scan,
 };
 use super::{
     ManifestChange, OBJECT_TYPE_TABLE, OBJECT_TYPE_TABLE_TOMBSTONE, OBJECT_TYPE_TABLE_VERSION,
@@ -112,6 +111,19 @@ struct PendingVersionRow {
     row_count: Option<u64>,
 }
 
+/// Everything one CAS attempt needs out of a single `__manifest` scan
+/// (RFC-013 P2): the open dataset, table state for the pre-check + pending-row
+/// build, and the `graph_commit` lineage rows for parent resolution. Folding the
+/// lineage into this struct is what lets `resolve_lineage_rows` skip its own
+/// `read_graph_lineage` scan.
+struct LoadedPublishState {
+    dataset: Dataset,
+    registered_tables: HashMap<String, String>,
+    existing_versions: HashMap<(String, u64), SubTableEntry>,
+    existing_tombstones: HashMap<(String, u64), ()>,
+    lineage_rows: Vec<GraphLineageRow>,
+}
+
 impl GraphNamespacePublisher {
     pub(super) fn new(root_uri: &str, branch: Option<&str>) -> Self {
         Self {
@@ -126,14 +138,7 @@ impl GraphNamespacePublisher {
         open_manifest_dataset(&self.root_uri, self.branch.as_deref()).await
     }
 
-    async fn load_publish_state(
-        &self,
-    ) -> Result<(
-        Dataset,
-        HashMap<String, String>,
-        HashMap<(String, u64), SubTableEntry>,
-        HashMap<(String, u64), ()>,
-    )> {
+    async fn load_publish_state(&self) -> Result<LoadedPublishState> {
         let mut dataset = self.dataset().await?;
         // Run pending internal-schema migrations exactly once per publish on
         // the open-for-write path; idempotent when the on-disk stamp already
@@ -142,9 +147,16 @@ impl GraphNamespacePublisher {
         // publishing to (each branch backfills on its first write). See
         // `db/manifest/migrations.rs`.
         migrate_internal_schema(&mut dataset, &self.root_uri, self.branch.as_deref()).await?;
-        let registered_tables = read_registered_table_locations(&dataset).await?;
-        let existing_entries = read_manifest_entries(&dataset).await?;
-        let existing_versions = existing_entries
+        // ONE `__manifest` scan for everything the publish needs: table
+        // locations, version entries, tombstones, AND the `graph_commit` lineage
+        // rows for parent resolution (RFC-013 P2). The lineage extraction rides
+        // this pass instead of a second `read_graph_lineage` scan in
+        // `resolve_lineage_rows`; the per-attempt re-read is preserved because
+        // `load_publish_state` runs once per CAS attempt, so a retry sees the
+        // advanced head and re-parents correctly.
+        let scan = read_publish_scan(&dataset).await?;
+        let existing_versions = scan
+            .version_entries
             .iter()
             .map(|entry| {
                 (
@@ -153,13 +165,14 @@ impl GraphNamespacePublisher {
                 )
             })
             .collect();
-        let existing_tombstones = read_tombstone_versions(&dataset).await?;
-        Ok((
+        let existing_tombstones = scan.tombstones.into_iter().collect();
+        Ok(LoadedPublishState {
             dataset,
-            registered_tables,
+            registered_tables: scan.table_locations,
             existing_versions,
             existing_tombstones,
-        ))
+            lineage_rows: scan.lineage_rows,
+        })
     }
 
     fn build_pending_rows(
@@ -320,13 +333,18 @@ impl GraphNamespacePublisher {
     /// parent source here: a branch freshly forked from main inherits main's
     /// commits but not yet a `graph_head:<its-name>` row, and the head-over-rows
     /// computation gives the correct fork-point parent in that case.)
-    async fn resolve_lineage_rows(
-        dataset: &Dataset,
+    ///
+    /// `lineage_rows` is the `graph_commit` set this attempt already parsed in
+    /// `load_publish_state`'s single scan (RFC-013 P2) — NOT a fresh
+    /// `read_graph_lineage` scan. The per-attempt re-read is still preserved: the
+    /// retry loop re-runs `load_publish_state`, so each attempt's `lineage_rows`
+    /// reflects the head as it stands for that attempt.
+    fn resolve_lineage_rows(
+        lineage_rows: &[GraphLineageRow],
         intent: &LineageIntent,
         new_manifest_version: u64,
     ) -> Result<(Vec<PendingVersionRow>, Option<String>)> {
-        let (rows, _heads) = read_graph_lineage(dataset).await?;
-        let parent_commit_id = head_lineage_row(&rows).map(|h| h.graph_commit_id.clone());
+        let parent_commit_id = head_lineage_row(lineage_rows).map(|h| h.graph_commit_id.clone());
 
         let commit = GraphLineageRow {
             graph_commit_id: intent.graph_commit_id.clone(),
@@ -551,8 +569,13 @@ impl ManifestBatchPublisher for GraphNamespacePublisher {
         }
 
         for attempt in 0..=PUBLISHER_RETRY_BUDGET {
-            let (dataset, known_tables, existing_versions, existing_tombstones) =
-                self.load_publish_state().await?;
+            let LoadedPublishState {
+                dataset,
+                registered_tables: known_tables,
+                existing_versions,
+                existing_tombstones,
+                lineage_rows,
+            } = self.load_publish_state().await?;
 
             let latest_per_table =
                 Self::latest_visible_per_table(&existing_versions, &existing_tombstones);
@@ -573,14 +596,15 @@ impl ManifestBatchPublisher for GraphNamespacePublisher {
             // manifest version) — no separate write, no manifest→commit-graph
             // atomicity gap. The merge-insert advances exactly one version on
             // top of the loaded dataset, so the commit pins
-            // `current + 1`. The parent is resolved here, per attempt, against
-            // this just-loaded state (TOCTOU closed on a CAS retry).
+            // `current + 1`. The parent is resolved here, per attempt, from the
+            // lineage rows THIS attempt's scan loaded (TOCTOU closed on a CAS
+            // retry — a retry re-runs `load_publish_state` → fresh lineage).
             let parent_commit_id = match lineage {
                 Some(intent) => {
                     let new_manifest_version = dataset.version().version + 1;
-                    let (lineage_rows, parent) =
-                        Self::resolve_lineage_rows(&dataset, intent, new_manifest_version).await?;
-                    rows.extend(lineage_rows);
+                    let (commit_rows, parent) =
+                        Self::resolve_lineage_rows(&lineage_rows, intent, new_manifest_version)?;
+                    rows.extend(commit_rows);
                     parent
                 }
                 None => None,
