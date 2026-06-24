@@ -231,6 +231,92 @@ async fn regression_self_loop_not_traversable() {
     );
 }
 
+// ═══════════════════════ branch isolation + merge ═════════════════════════
+
+async fn count_persons(db: &omnigraph::db::Omnigraph, branch: &str) -> usize {
+    db.query(
+        ReadTarget::branch(branch),
+        "query q() { match { $x: Person } return { $x.slug } }",
+        "q",
+        &ParamMap::new(),
+    )
+    .await
+    .unwrap()
+    .num_rows()
+}
+
+async fn person_exists(db: &omnigraph::db::Omnigraph, branch: &str, slug: &str) -> usize {
+    let q =
+        format!("query p() {{ match {{ $x: Person {{ slug: \"{slug}\" }} }} return {{ $x.slug }} }}");
+    db.query(ReadTarget::branch(branch), &q, "p", &ParamMap::new())
+        .await
+        .unwrap()
+        .num_rows()
+}
+
+/// D4 oracles for the branch subsystem (the deferred B2 branch_isolation +
+/// merge_correctness): a branch must not observe `main` writes made after it
+/// forked, `main` must not observe branch-only writes, and a merge must produce
+/// the row-level union. Kept as a focused scenario (not the generic per-op walk)
+/// so the reference model stays single-branch and unambiguous.
+#[tokio::test]
+async fn branch_isolation_and_merge() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = backend::open_clean(dir.path().to_str().unwrap()).await;
+    let mut seed = String::new();
+    for i in 0..5 {
+        seed.push_str(&person(&format!("p{i}")));
+    }
+    load_jsonl(&db, &seed, LoadMode::Merge).await.unwrap();
+
+    db.branch_create("feature").await.unwrap();
+
+    // Diverge: a post-fork write on each side.
+    db.mutate(
+        "main",
+        "query i() { insert Person { slug: \"m-only\", name: \"n\" } }",
+        "i",
+        &ParamMap::new(),
+    )
+    .await
+    .unwrap();
+    db.mutate(
+        "feature",
+        "query i() { insert Person { slug: \"f-only\", name: \"n\" } }",
+        "i",
+        &ParamMap::new(),
+    )
+    .await
+    .unwrap();
+
+    // branch_isolation: neither side sees the other's post-fork write.
+    assert_eq!(
+        person_exists(&db, "feature", "m-only").await,
+        0,
+        "isolation: feature observed a post-fork main write"
+    );
+    assert_eq!(
+        person_exists(&db, "main", "f-only").await,
+        0,
+        "isolation: main observed a feature-only write"
+    );
+    assert_eq!(person_exists(&db, "feature", "f-only").await, 1);
+    assert_eq!(person_exists(&db, "main", "m-only").await, 1);
+
+    // merge_correctness: main converges to the row-level union (p0..p4 + both).
+    let outcome = db.branch_merge("feature", "main").await.unwrap();
+    let total = count_persons(&db, "main").await;
+    assert_eq!(
+        total, 7,
+        "merge: expected the 7-person union, got {total} (outcome {outcome:?})"
+    );
+    assert_eq!(
+        person_exists(&db, "main", "f-only").await,
+        1,
+        "merge: feature's row was not merged into main"
+    );
+}
+
 // ═══════════════════════════ generative walk ══════════════════════════════
 
 /// Clean walk: full white-box battery after every op; novel violations fail.
