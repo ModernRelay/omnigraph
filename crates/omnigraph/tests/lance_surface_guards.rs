@@ -86,6 +86,40 @@ async fn lance_error_too_much_write_contention_variant_exists() {
     );
 }
 
+// --- Guard 1b: Dataset::open on a missing path returns a not-found variant --
+//
+// `db/commit_graph.rs::read_legacy_commit_cache` (the v3→v4 lineage migration
+// source) classifies a legacy-open error: a genuine not-found is the benign
+// "no legacy data" signal (empty cache), and ANY OTHER error propagates loudly
+// rather than being read as "empty" — a swallow there would let the migration
+// stamp v4 over an empty backfill, orphaning real lineage permanently. That
+// classification relies on Lance mapping an object-store NotFound to
+// `DatasetNotFound` (or, for some paths, `NotFound`). If a Lance bump emits a
+// different variant for a missing dataset, the migration would propagate a
+// genuine "no legacy data" as a hard error — this guard turns red to force the
+// classifier (and this guard) to be updated together.
+
+#[tokio::test]
+async fn dataset_open_missing_returns_not_found_variant() {
+    let dir = tempfile::tempdir().unwrap();
+    // A path that was never written — nothing to open.
+    let missing = dir.path().join("does-not-exist.lance");
+    let err = match Dataset::open(missing.to_str().unwrap()).await {
+        Ok(_) => panic!("opening a never-written dataset path must error"),
+        Err(e) => e,
+    };
+    assert!(
+        matches!(
+            err,
+            lance::Error::DatasetNotFound { .. } | lance::Error::NotFound { .. }
+        ),
+        "Dataset::open on a missing path no longer returns DatasetNotFound/NotFound \
+         (got: {err:?}); update db/commit_graph.rs::read_legacy_commit_cache's \
+         legacy-open classification and this guard together, then re-pin \
+         docs/dev/lance.md."
+    );
+}
+
 // --- Guard 2: ManifestLocation field shape ---------------------------------
 //
 // `db/manifest/metadata.rs:84-88` reads `.path`, `.size`, `.e_tag`,

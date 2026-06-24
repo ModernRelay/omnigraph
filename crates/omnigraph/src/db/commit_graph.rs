@@ -578,9 +578,13 @@ async fn load_commit_cache_from_manifest(
 /// transitional: the v3→v4 migration backfill (which copies these rows into
 /// `__manifest`) and the read-only v3 fallback in `CommitGraph::open*`. Returns
 /// `(commit_by_id, head)`, with the head picked by `should_replace_head` —
-/// identical to the manifest projection. An absent / empty commit dataset
-/// yields an empty cache (no head). This keeps the legacy readers alive while
-/// any v3 graph survives; once no graph is below v4 it can retire.
+/// identical to the manifest projection. A genuinely ABSENT (not-found) commit
+/// dataset or actor sidecar yields an empty cache (no head); any OTHER open error
+/// (transient IO / corrupt file) propagates loudly rather than being read as
+/// "empty" — a swallow here would let the v3→v4 migration backfill nothing and
+/// still stamp v4, orphaning the real lineage permanently. This keeps the legacy
+/// readers alive while any v3 graph survives; once no graph is below v4 it can
+/// retire.
 pub(crate) async fn read_legacy_commit_cache(
     root_uri: &str,
     branch: Option<&str>,
@@ -594,8 +598,21 @@ pub(crate) async fn read_legacy_commit_cache(
     };
     let mut dataset = match commits_open {
         Ok(dataset) => dataset,
-        // No legacy commit dataset at all ⇒ nothing to read.
-        Err(_) => return Ok((HashMap::new(), None)),
+        // An ABSENT commits dataset is the legitimate "no legacy data" signal —
+        // a graph with no `_graph_commits.lance` (or none on this branch) yields
+        // an empty cache. But ONLY a genuine not-found gets that treatment: a
+        // transient/corrupt open (IO / CorruptFile / …) must propagate, never be
+        // read as "empty". The v3→v4 migration calls this once before stamping
+        // v4; swallowing a non-not-found error here would backfill nothing and
+        // stamp v4 anyway, orphaning the real lineage permanently (the migration
+        // never re-runs, and the v3 fallback is then disabled). Lance maps an
+        // object-store NotFound to `DatasetNotFound`; the variant match (vs an
+        // existence probe) is exactly right and not over-strict — pinned by
+        // `lance_surface_guards.rs::dataset_open_missing_returns_not_found_variant`.
+        Err(lance::Error::DatasetNotFound { .. }) | Err(lance::Error::NotFound { .. }) => {
+            return Ok((HashMap::new(), None));
+        }
+        Err(e) => return Err(OmniError::Lance(e.to_string())),
     };
     if let Some(branch) = branch.filter(|b| *b != "main") {
         dataset = dataset
@@ -619,7 +636,17 @@ pub(crate) async fn read_legacy_commit_cache(
         };
     let actor_by_commit_id = match actors_open {
         Ok(actor_dataset) => load_commit_actor_cache(&actor_dataset).await?,
-        Err(_) => HashMap::new(),
+        // An ABSENT actor sidecar is benign (older graphs without authored
+        // commits) — every commit's actor stays `None`. A not-found is therefore
+        // the empty-map signal. But a CORRUPT/transient actor open must NOT be
+        // read as "no authors": silently wiping all authorship and then stamping
+        // v4 is the same permanent-loss hole as the commits arm, so anything
+        // other than not-found propagates. (Same variant contract, different
+        // rationale — absence is normal here, error is not.)
+        Err(lance::Error::DatasetNotFound { .. }) | Err(lance::Error::NotFound { .. }) => {
+            HashMap::new()
+        }
+        Err(e) => return Err(OmniError::Lance(e.to_string())),
     };
 
     load_commit_cache(&dataset, &actor_by_commit_id).await
