@@ -60,8 +60,16 @@ pub fn classify(f: &Finding) -> Option<&'static str> {
             }
             None
         }
-        // Structural divergences are never allow-listed.
-        Finding::Logical(_) => None,
+        // Structural divergences are novel by default, with ONE narrow
+        // exception: dup-`@key` (MR-714) is a known open bug, so a finding whose
+        // message carries the `dup-@key` marker is allow-listed like the engine
+        // known-bugs above. Every other structural divergence stays novel.
+        Finding::Logical(s) => {
+            if s.contains("dup-@key") {
+                return Some("dup-@key MR-714");
+            }
+            None
+        }
     }
 }
 
@@ -191,6 +199,36 @@ pub async fn index_probe(db: &Omnigraph) -> Result<(), Finding> {
         db.query(ReadTarget::branch("main"), &q, "w", &ParamMap::new())
             .await
             .map_err(Finding::Engine)?;
+    }
+    Ok(())
+}
+
+// ── @key uniqueness (no sequential model — for the concurrent oracle) ──
+// Every `@key` value may appear on at most one live row. Concurrent same-key
+// upserts that produce duplicates are MR-714 (dup-`@key`); `classify` allow-
+// lists the `dup-@key` marker as that known bug.
+pub async fn no_duplicate_keys(db: &Omnigraph, ty: &str, branch: &str) -> Result<(), Finding> {
+    let q = format!("query q() {{ match {{ $x: {ty} }} return {{ $x.slug }} }}");
+    let res = db
+        .query(ReadTarget::branch(branch), &q, "q", &ParamMap::new())
+        .await
+        .map_err(Finding::Engine)?;
+    let json = res.to_rust_json();
+    let rows = json
+        .as_array()
+        .ok_or_else(|| Finding::Logical(format!("{ty} key scan not an array")))?;
+    let total = rows.len();
+    let mut seen: HashSet<String> = HashSet::new();
+    for row in rows {
+        let slug = row["x.slug"]
+            .as_str()
+            .ok_or_else(|| Finding::Logical(format!("missing x.slug in {ty}")))?;
+        if !seen.insert(slug.to_string()) {
+            return Err(Finding::Logical(format!(
+                "duplicate @key {slug:?} in {ty} ({total} rows, {} distinct) — dup-@key",
+                seen.len()
+            )));
+        }
     }
     Ok(())
 }

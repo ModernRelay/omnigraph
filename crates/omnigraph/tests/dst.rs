@@ -233,6 +233,82 @@ async fn regression_self_loop_not_traversable() {
     );
 }
 
+// ═══════════════════════ concurrency (multi-actor) ════════════════════════
+
+/// Seeded N-actor concurrent walk over a SHARED graph, with an OVERLAPPING key
+/// space so same-key upserts race. Under concurrency the sequential reference
+/// model doesn't apply, so the oracle is the interleaving-INVARIANT subset:
+/// unique live row-ids, `Dataset::validate`, HEAD==manifest, and `@key`
+/// uniqueness. dup-`@key` (MR-714) and RC-1 drift are allow-listed knowns; any
+/// other divergence is a novel concurrency bug and fails. A Lance panic inside
+/// an actor is contained by `tokio::spawn` (surfaces as a JoinError we ignore),
+/// so the harness stays up — the post-join battery is the judge.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn concurrent_walk_structural_invariants() {
+    let mut reproduced: Vec<String> = Vec::new();
+    for seed in 0..3u64 {
+        let dir = tempfile::tempdir().unwrap();
+        let db = Arc::new(backend::open_clean(dir.path().to_str().unwrap()).await);
+        let actors = 4usize;
+        let mut handles = Vec::new();
+        for a in 0..actors {
+            let db = db.clone();
+            handles.push(tokio::spawn(async move {
+                let mut rng = Rng::new(seed.wrapping_mul(131) + a as u64);
+                for _ in 0..20 {
+                    let k = rng.below(30); // shared 0..30 key space → races
+                    match rng.below(5) {
+                        0 | 1 => {
+                            let _ = load_jsonl(&db, &person(&format!("h{k}")), LoadMode::Merge).await;
+                        }
+                        2 => {
+                            let q = format!(
+                                "query u() {{ update Person set {{ name: \"x{k}\" }} where slug = \"h{k}\" }}"
+                            );
+                            let _ = db.mutate("main", &q, "u", &ParamMap::new()).await;
+                        }
+                        3 => {
+                            let q = format!("query d() {{ delete Person where slug = \"h{k}\" }}");
+                            let _ = db.mutate("main", &q, "d", &ParamMap::new()).await;
+                        }
+                        _ => {
+                            let _ = db.optimize().await;
+                        }
+                    }
+                }
+            }));
+        }
+        for h in handles {
+            let _ = h.await; // ignore JoinError: a contained actor panic is judged by the battery
+        }
+
+        let checks: Vec<(&str, Result<(), Finding>)> = vec![
+            ("row-id-unique", invariants::no_duplicate_live_row_ids(&db).await),
+            ("dataset.validate", invariants::dataset_validate(&db).await),
+            ("head==manifest", invariants::head_eq_manifest(&db).await),
+            ("no-dup-@key", invariants::no_duplicate_keys(&db, "Person", "main").await),
+        ];
+        for (name, res) in checks {
+            if let Err(f) = res {
+                match classify(&f) {
+                    Some(bug) => reproduced.push(format!("seed={seed} [{name}] -> {bug}")),
+                    None => panic!(
+                        "seed={seed}: NOVEL concurrent violation [{name}]: {}",
+                        f.message()
+                    ),
+                }
+            }
+        }
+    }
+    eprintln!(
+        "[dst] concurrent walk: {} known-bug instance(s), 0 novel violations",
+        reproduced.len()
+    );
+    for r in &reproduced {
+        eprintln!("  - {r}");
+    }
+}
+
 // ═══════════════════════ branch isolation + merge ═════════════════════════
 
 async fn count_persons(db: &omnigraph::db::Omnigraph, branch: &str) -> usize {
