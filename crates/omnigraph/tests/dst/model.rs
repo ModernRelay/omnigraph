@@ -11,6 +11,8 @@ use std::collections::HashSet;
 use omnigraph::db::{Omnigraph, ReadTarget};
 use omnigraph_compiler::ir::ParamMap;
 
+use crate::invariants::Finding;
+
 #[derive(Default)]
 pub struct Model {
     persons: HashSet<usize>,
@@ -49,28 +51,31 @@ impl Model {
     }
 }
 
-async fn count(db: &Omnigraph, ty: &str) -> Result<usize, String> {
+async fn count(db: &Omnigraph, ty: &str) -> Result<usize, Finding> {
     let q = format!("query q() {{ match {{ $x: {ty} }} return {{ $x.slug }} }}");
     db.query(ReadTarget::branch("main"), &q, "q", &ParamMap::new())
         .await
         .map(|r| r.num_rows())
-        .map_err(|e| e.to_string())
+        .map_err(Finding::Engine)
 }
 
-/// count==model: live row counts must equal the model. Catches lost-write
-/// (count<model — e.g. a swallowed CAS conflict) and duplicate-key
-/// (count>model — MR-714 under concurrency).
-pub async fn check_counts(db: &Omnigraph, model: &Model) -> Result<(), String> {
+/// count==model: live row counts must equal the model. A divergence is a
+/// structural (Logical) finding — lost-write (count<model — e.g. a swallowed
+/// CAS conflict) or duplicate-key (count>model — MR-714).
+pub async fn check_counts(db: &Omnigraph, model: &Model) -> Result<(), Finding> {
     let p = count(db, "Person").await?;
     if p != model.persons() {
-        return Err(format!(
+        return Err(Finding::Logical(format!(
             "count Person={p} != model={} (lost-write or dup-@key)",
             model.persons()
-        ));
+        )));
     }
     let d = count(db, "Doc").await?;
     if d != model.docs() {
-        return Err(format!("count Doc={d} != model={}", model.docs()));
+        return Err(Finding::Logical(format!(
+            "count Doc={d} != model={}",
+            model.docs()
+        )));
     }
     Ok(())
 }
