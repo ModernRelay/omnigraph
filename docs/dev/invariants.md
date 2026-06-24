@@ -306,7 +306,11 @@ them explicit.
   the same branch now also contend on the shared `graph_head:<branch>` row (one
   `object_id`, `WhenMatched::UpdateAll`): one wins, the other retries and re-parents
   — so the cross-process disjoint-table fork is closed too. This is the intended
-  §7.1 contention point.
+  §7.1 contention point, pinned by
+  `manifest::tests::concurrent_disjoint_writes_share_head_and_form_linear_chain`
+  (two disjoint writers → both commit, single linear chain) and
+  `manifest::tests::n_concurrent_disjoint_writers_converge_to_one_linear_chain`
+  (N=8 disjoint writers with app-level retry → one linear chain of 8, no fork).
 
 ## Deny-list
 

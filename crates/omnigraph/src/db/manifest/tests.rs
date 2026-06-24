@@ -1859,3 +1859,364 @@ async fn crash_after_merge_before_stamp_completes_on_next_open() {
         "re-running over an already-merged manifest adds no duplicate rows",
     );
 }
+
+// ── RFC-013 Phase 7 / step 5: the `graph_head` concurrency gate ──────────────
+//
+// Two (or N) writers committing DISJOINT tables on the same branch still share
+// one mutable `graph_head:main` row (one `object_id`, `WhenMatched::UpdateAll`).
+// Their table-version rows never collide (distinct `object_id`s), so the *only*
+// row-level CAS contention is on `graph_head:main`. The contract under test:
+// exactly one writer wins each CAS round; the loser retries, re-resolves its
+// parent off the freshly-advanced head (inside the publisher's retry loop), and
+// re-commits — so every writer commits and the resulting graph_commit DAG is a
+// single LINEAR chain (no fork), not a tree. This is the cross-process
+// disjoint-table fork closed by the shared head row (invariants.md §7.1).
+
+/// A microsecond UNIX timestamp for a `LineageIntent`, matching the genesis /
+/// commit-graph `created_at` unit.
+fn lineage_now_micros() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_micros() as i64
+}
+
+/// Append one row to a two-column NODE table (`id`, `name`) and return the
+/// resulting `SubTableUpdate` at the new on-disk version. Generalizes
+/// `append_person_and_make_update` to any node table whose schema is `(id:
+/// String, name: String[, ...])`; the extra `Person.age` column is filled null
+/// when present so the same helper drives both `node:Person` and `node:Company`.
+async fn append_node_row_and_make_update(
+    uri: &str,
+    entry: &SubTableEntry,
+    id: &str,
+    name: &str,
+) -> SubTableUpdate {
+    let mut ds = Dataset::open(&format!("{}/{}", uri, entry.table_path))
+        .await
+        .unwrap();
+    let schema = Arc::new(ds.schema().into());
+    let arrow_schema: &Schema = &schema;
+    // Columns 0/1 are (id, name); a third column (Person.age) is filled null.
+    let mut columns: Vec<Arc<dyn arrow_array::Array>> = vec![
+        Arc::new(StringArray::from(vec![id.to_string()])),
+        Arc::new(StringArray::from(vec![name.to_string()])),
+    ];
+    for field in arrow_schema.fields().iter().skip(2) {
+        columns.push(arrow_array::new_null_array(field.data_type(), 1));
+    }
+    let row = RecordBatch::try_new(Arc::clone(&schema), columns).unwrap();
+    let reader = RecordBatchIterator::new(vec![Ok(row)], schema);
+    ds.append(reader, None).await.unwrap();
+    let new_version = ds.version().version;
+    let version_metadata =
+        table_version_metadata_for_state(uri, &entry.table_path, None, new_version)
+            .await
+            .unwrap();
+    SubTableUpdate {
+        table_key: entry.table_key.clone(),
+        table_version: new_version,
+        table_branch: None,
+        row_count: 1,
+        version_metadata,
+    }
+}
+
+/// Read the `graph_commit` lineage rows from `__manifest` at main and assert
+/// they form a single LINEAR chain of `expected_total` commits (one genesis +
+/// the rest), with no fork. Returns the head commit id.
+///
+/// "Linear, not a fork" is proven structurally: (1) exactly one parentless
+/// genesis; (2) no two commits share a `parent_commit_id` (a fork would have two
+/// children off one parent); (3) every commit except the unique head is the
+/// parent of exactly one other commit — so the parent pointers form one path
+/// that visits all commits. (1)+(2)+(3) over a connected set is a single chain.
+async fn assert_linear_chain(uri: &str, expected_total: usize) -> String {
+    let ds = open_manifest_dataset(uri, None).await.unwrap();
+    let (rows, _heads) = read_graph_lineage(&ds).await.unwrap();
+    assert_eq!(
+        rows.len(),
+        expected_total,
+        "expected {expected_total} graph_commit rows (genesis + the concurrent commits), got {}",
+        rows.len(),
+    );
+
+    // (1) exactly one genesis.
+    let genesis: Vec<&GraphLineageRow> =
+        rows.iter().filter(|r| r.parent_commit_id.is_none()).collect();
+    assert_eq!(
+        genesis.len(),
+        1,
+        "exactly one parentless genesis commit in a linear chain, got {}",
+        genesis.len(),
+    );
+
+    // (2) no two commits parent off the same commit (no fork).
+    let mut parents: Vec<&str> = rows
+        .iter()
+        .filter_map(|r| r.parent_commit_id.as_deref())
+        .collect();
+    let parent_count = parents.len();
+    parents.sort_unstable();
+    parents.dedup();
+    assert_eq!(
+        parents.len(),
+        parent_count,
+        "two commits share a parent_commit_id — the DAG forked instead of forming a linear chain",
+    );
+
+    // (3) the head (the `should_replace_head` winner) plus the parent set covers
+    // every commit exactly once: each non-head commit is some commit's parent.
+    let head = super::state::head_lineage_row(&rows).expect("a non-empty lineage has a head");
+    let ids: std::collections::HashSet<&str> =
+        rows.iter().map(|r| r.graph_commit_id.as_str()).collect();
+    let parent_set: std::collections::HashSet<&str> = parents.iter().copied().collect();
+    // The head is the only commit that is not a parent of anything.
+    let non_parents: Vec<&str> = ids
+        .iter()
+        .copied()
+        .filter(|id| !parent_set.contains(id))
+        .collect();
+    assert_eq!(
+        non_parents,
+        vec![head.graph_commit_id.as_str()],
+        "the only commit that is no one's parent must be the head — a fork or break leaves others",
+    );
+    // Every parent points at a real commit (connectedness).
+    for parent in &parent_set {
+        assert!(
+            ids.contains(parent),
+            "parent {parent} must be a known commit in the chain",
+        );
+    }
+
+    head.graph_commit_id.clone()
+}
+
+/// Test A (deterministic, the must-have): two writers, two DISJOINT table
+/// updates, two distinct `LineageIntent`s, `tokio::join!`. BOTH commit (the loser
+/// retries on the `graph_head:main` CAS conflict and re-parents off the winner),
+/// and the on-disk graph_commit DAG is a single linear chain genesis → c → c'.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn concurrent_disjoint_writes_share_head_and_form_linear_chain() {
+    let dir = tempfile::tempdir().unwrap();
+    let uri = dir.path().to_str().unwrap();
+    let catalog = build_test_catalog();
+    let mc = ManifestCoordinator::init(uri, &catalog).await.unwrap();
+    let snap = mc.snapshot();
+    let person_entry = snap.entry("node:Person").unwrap().clone();
+    let company_entry = snap.entry("node:Company").unwrap().clone();
+
+    // Two DISJOINT table-version rows (`node:Person@v=2`, `node:Company@v=2`):
+    // distinct `object_id`s, so neither hits the table-version CAS. The ONLY
+    // shared row both writers merge is `graph_head:main`.
+    let update_a = append_node_row_and_make_update(uri, &person_entry, "p1", "Alice").await;
+    let update_b = append_node_row_and_make_update(uri, &company_entry, "c1", "Acme").await;
+
+    let publisher_a = GraphNamespacePublisher::new(uri, None);
+    let publisher_b = GraphNamespacePublisher::new(uri, None);
+    let changes_a = vec![ManifestChange::Update(update_a)];
+    let changes_b = vec![ManifestChange::Update(update_b)];
+    // Each writer mints its own stable commit id; the parent re-resolves per
+    // attempt inside the publisher.
+    let intent_a = LineageIntent {
+        graph_commit_id: ulid::Ulid::new().to_string(),
+        branch: None,
+        actor_id: Some("act-a".to_string()),
+        merged_parent_commit_id: None,
+        created_at: lineage_now_micros(),
+    };
+    let intent_b = LineageIntent {
+        graph_commit_id: ulid::Ulid::new().to_string(),
+        branch: None,
+        actor_id: Some("act-b".to_string()),
+        merged_parent_commit_id: None,
+        created_at: lineage_now_micros(),
+    };
+    // Empty expected-versions: the two writers are disjoint, so neither asserts a
+    // version on the other's table; contention is purely the shared head row.
+    let empty = HashMap::new();
+    let (res_a, res_b) = tokio::join!(
+        async { publisher_a.publish(&changes_a, &empty, Some(&intent_a)).await },
+        async { publisher_b.publish(&changes_b, &empty, Some(&intent_b)).await }
+    );
+
+    // BOTH commit: disjoint tables → the head-row CAS loser retries within
+    // PUBLISHER_RETRY_BUDGET, re-resolves its parent off the winner, and lands.
+    res_a.expect("writer A must commit");
+    res_b.expect("writer B must commit");
+
+    // End-state assertion (the on-disk DAG is fixed once both committed): a single
+    // linear chain genesis → first → second, no fork. The two minted ids both
+    // appear; their parents form a chain (one off genesis, the other off the
+    // first), so no two commits share a parent.
+    let head = assert_linear_chain(uri, 3).await;
+    assert!(
+        head == intent_a.graph_commit_id || head == intent_b.graph_commit_id,
+        "the head must be one of the two concurrent commits",
+    );
+    // Both committed table writes are visible (Person and Company advanced).
+    let reopened = ManifestCoordinator::open(uri).await.unwrap();
+    let after = reopened.snapshot();
+    assert_eq!(after.entry("node:Person").unwrap().table_version, 2);
+    assert_eq!(after.entry("node:Company").unwrap().table_version, 2);
+}
+
+/// Test C (S3 variant, bucket-gated): the same two-disjoint-writers +
+/// `LineageIntent` race as Test A, but on a real object store so the one-winner
+/// behaviour exercises the genuine conditional-put CAS on `__manifest` rather
+/// than the local content-token emulation. Skips with a log when
+/// `OMNIGRAPH_S3_TEST_BUCKET` is unset (the `tests/s3_storage.rs` gate); the
+/// rustfs CI job sets it. Asserts the same end-state: both commit, single linear
+/// chain.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn concurrent_disjoint_writes_form_linear_chain_on_s3() {
+    let Ok(bucket) = std::env::var("OMNIGRAPH_S3_TEST_BUCKET") else {
+        eprintln!(
+            "SKIP concurrent_disjoint_writes_form_linear_chain_on_s3: \
+             OMNIGRAPH_S3_TEST_BUCKET unset — the S3 lineage-CAS gate needs an object store"
+        );
+        return;
+    };
+    let uri = format!(
+        "s3://{bucket}/lineage-concurrency/{}-{}",
+        std::process::id(),
+        ulid::Ulid::new()
+    );
+
+    let catalog = build_test_catalog();
+    let mc = ManifestCoordinator::init(&uri, &catalog).await.unwrap();
+    let snap = mc.snapshot();
+    let person_entry = snap.entry("node:Person").unwrap().clone();
+    let company_entry = snap.entry("node:Company").unwrap().clone();
+
+    let update_a = append_node_row_and_make_update(&uri, &person_entry, "p1", "Alice").await;
+    let update_b = append_node_row_and_make_update(&uri, &company_entry, "c1", "Acme").await;
+
+    let publisher_a = GraphNamespacePublisher::new(&uri, None);
+    let publisher_b = GraphNamespacePublisher::new(&uri, None);
+    let changes_a = vec![ManifestChange::Update(update_a)];
+    let changes_b = vec![ManifestChange::Update(update_b)];
+    let intent_a = LineageIntent {
+        graph_commit_id: ulid::Ulid::new().to_string(),
+        branch: None,
+        actor_id: Some("act-a".to_string()),
+        merged_parent_commit_id: None,
+        created_at: lineage_now_micros(),
+    };
+    let intent_b = LineageIntent {
+        graph_commit_id: ulid::Ulid::new().to_string(),
+        branch: None,
+        actor_id: Some("act-b".to_string()),
+        merged_parent_commit_id: None,
+        created_at: lineage_now_micros(),
+    };
+    let empty = HashMap::new();
+    let (res_a, res_b) = tokio::join!(
+        async { publisher_a.publish(&changes_a, &empty, Some(&intent_a)).await },
+        async { publisher_b.publish(&changes_b, &empty, Some(&intent_b)).await }
+    );
+    res_a.expect("writer A must commit on S3");
+    res_b.expect("writer B must commit on S3");
+
+    let head = assert_linear_chain(&uri, 3).await;
+    assert!(
+        head == intent_a.graph_commit_id || head == intent_b.graph_commit_id,
+        "the head must be one of the two concurrent commits",
+    );
+}
+
+/// Test B (bounded-retry convergence, scaled): N=8 same-branch writers, each
+/// touching a DISJOINT table-version row + its own `LineageIntent`, each wrapped
+/// in an APP-LEVEL retry loop. `PUBLISHER_RETRY_BUDGET=5` means the later writers
+/// can exhaust the internal budget under contention, so the app loop re-submits
+/// on a typed `Conflict` / row-level-CAS-contention error. All 8 eventually
+/// commit and the final DAG is a single linear chain of 8 (+genesis), no fork,
+/// no lost commit.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn n_concurrent_disjoint_writers_converge_to_one_linear_chain() {
+    use crate::error::ManifestConflictDetails;
+    use crate::error::ManifestErrorKind;
+
+    const N: usize = 8;
+
+    let dir = tempfile::tempdir().unwrap();
+    let uri = dir.path().to_str().unwrap();
+    let catalog = build_test_catalog();
+    let mc = ManifestCoordinator::init(uri, &catalog).await.unwrap();
+    let snap = mc.snapshot();
+    let person_entry = snap.entry("node:Person").unwrap().clone();
+    let company_entry = snap.entry("node:Company").unwrap().clone();
+
+    // Synthesize N=8 DISJOINT table-version updates by sequentially advancing the
+    // two node tables four versions each (Person@v2..v5, Company@v2..v5). Each
+    // update is a distinct `object_id`, so the writers never collide on a
+    // table-version row — only on the shared `graph_head:main`. Built serially
+    // here (before the concurrent phase) so the on-disk versions exist.
+    let mut updates: Vec<SubTableUpdate> = Vec::with_capacity(N);
+    for i in 0..(N / 2) {
+        updates.push(
+            append_node_row_and_make_update(uri, &person_entry, &format!("p{i}"), &format!("P{i}"))
+                .await,
+        );
+        updates.push(
+            append_node_row_and_make_update(uri, &company_entry, &format!("c{i}"), &format!("C{i}"))
+                .await,
+        );
+    }
+    assert_eq!(updates.len(), N);
+
+    // Each writer: its own publisher + its own commit id + an app-level retry loop
+    // re-submitting on a typed Conflict (the publisher's internal budget can be
+    // exhausted by the later contenders, so convergence relies on the app retry).
+    let uri_owned = uri.to_string();
+    let mut handles = Vec::with_capacity(N);
+    for update in updates {
+        let uri = uri_owned.clone();
+        handles.push(tokio::spawn(async move {
+            let commit_id = ulid::Ulid::new().to_string();
+            let changes = vec![ManifestChange::Update(update)];
+            let empty = HashMap::new();
+            // Bounded app-level retry: re-submit on a Conflict-kind manifest error
+            // (the only retryable outcome here is losing the shared-head CAS).
+            for _attempt in 0..64 {
+                let intent = LineageIntent {
+                    graph_commit_id: commit_id.clone(),
+                    branch: None,
+                    actor_id: None,
+                    merged_parent_commit_id: None,
+                    created_at: lineage_now_micros(),
+                };
+                let publisher = GraphNamespacePublisher::new(&uri, None);
+                match publisher.publish(&changes, &empty, Some(&intent)).await {
+                    Ok(_) => return commit_id,
+                    Err(OmniError::Manifest(m))
+                        if matches!(m.kind, ManifestErrorKind::Conflict)
+                            && matches!(
+                                m.details,
+                                Some(ManifestConflictDetails::RowLevelCasContention)
+                            ) =>
+                    {
+                        // lost the shared-head CAS after exhausting the internal
+                        // budget — re-resolve parent + re-submit.
+                        continue;
+                    }
+                    Err(other) => panic!("non-retryable publish error: {other:?}"),
+                }
+            }
+            panic!("writer for commit {commit_id} did not converge within the app-retry budget");
+        }));
+    }
+
+    let mut committed_ids = Vec::with_capacity(N);
+    for handle in handles {
+        committed_ids.push(handle.await.unwrap());
+    }
+    // All 8 distinct writer ids committed (no lost commit, no duplicate id).
+    committed_ids.sort();
+    committed_ids.dedup();
+    assert_eq!(committed_ids.len(), N, "every writer must commit exactly once");
+
+    // The final DAG is a single linear chain of genesis + 8 = 9, no fork.
+    assert_linear_chain(uri, N + 1).await;
+}
