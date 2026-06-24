@@ -2022,6 +2022,105 @@ async fn branch_read_refuses_future_internal_schema_stamp() {
     );
 }
 
+// A v4 branch whose AUTHORITATIVE lineage lives in `__manifest` must stay
+// readable even when its DERIVED `_graph_commits.lance` branch ref is gone.
+//
+// `_graph_commits.lance` is no longer the source of graph lineage on a v4 graph
+// (RFC-013 Phase 7) — `__manifest`'s `graph_commit`/`graph_head:<branch>` rows
+// are. The Lance branch ref on `_graph_commits.lance` is a derived artifact, kept
+// only so `create_branch`/`cleanup` have something to operate on. An interrupted
+// fork-reclaim or a `cleanup` race can leave that ref missing while the manifest
+// lineage is fully intact. Per invariants 7 + 15 a missing DERIVED ref must not
+// fail a LOGICAL read of the lineage.
+//
+// The wedge: take a real v4 `feature` branch (its `graph_head:feature` row in
+// `__manifest`), then `force_delete` ONLY the `_graph_commits.lance` `feature`
+// ref — manifest lineage is left authoritative. The contract:
+//   - reads at the wedged branch (`open_at_branch` / list-commits / `merge_base`)
+//     SUCCEED, sourcing the DAG from `__manifest`; and
+//   - a WRITE that needs the derived ref (`create_branch`) fails LOUDLY with the
+//     typed actionable error, deferring repair to `cleanup`'s orphan reconciler.
+//
+// RED before the fix: `open_at_branch` does a hard `checkout_branch(branch)?` on
+// the now-missing `_graph_commits.lance` ref and errors `OmniError::Lance`,
+// wedging the logical read.
+#[tokio::test]
+async fn open_at_branch_reads_manifest_lineage_when_commit_graph_ref_is_missing() {
+    use crate::db::commit_graph::{CommitGraph, seed_legacy_v3_lineage_with_branch};
+
+    let dir = tempfile::tempdir().unwrap();
+    let uri = dir.path().to_str().unwrap();
+
+    // 1. A graph with a REAL `feature` Lance branch on both `_graph_commits.lance`
+    //    and `__manifest`, then migrate BOTH main and the branch to v4 so the
+    //    branch's lineage is authoritative in `__manifest` (not the legacy
+    //    fallback). After this, `graph_head:feature` resolves the branch commit
+    //    from `__manifest` and the `_graph_commits.lance` `feature` ref still
+    //    exists (the v3→v4 migration leaves it in place).
+    let fx = seed_legacy_v3_lineage_with_branch(uri).await.unwrap();
+    super::migrate_on_open(uri).await.unwrap();
+    let (_branch_by_id, branch_heads) = migrate_branch_and_read_lineage(uri, &fx.branch).await;
+    assert_eq!(
+        branch_heads.get(&fx.branch).map(String::as_str),
+        Some(fx.branch_commit.as_str()),
+        "precondition: __manifest carries graph_head:feature (lineage is authoritative)",
+    );
+
+    // 2. Force-delete ONLY the derived `_graph_commits.lance` `feature` ref,
+    //    leaving the `__manifest` `feature` branch (and its lineage) untouched —
+    //    the exact shape an interrupted fork-reclaim / cleanup race produces.
+    {
+        let mut cg = CommitGraph::open(uri).await.unwrap();
+        cg.force_delete_branch(&fx.branch).await.unwrap();
+    }
+    // Sanity: the derived ref is genuinely gone from `_graph_commits.lance`.
+    {
+        let cg = CommitGraph::open(uri).await.unwrap();
+        let branches = cg.list_branches().await.unwrap();
+        assert!(
+            !branches.iter().any(|b| b == &fx.branch),
+            "the _graph_commits.lance feature ref must be deleted to build the wedge, got: {branches:?}",
+        );
+    }
+
+    // 3a. The logical READS at the branch succeed from `__manifest` despite the
+    //     missing derived ref. `open_at_branch` is the one that errors pre-fix.
+    let mut cg = CommitGraph::open_at_branch(uri, &fx.branch)
+        .await
+        .expect("open_at_branch must read manifest lineage when the commit-graph ref is missing");
+    let commits = cg.load_commits().await.unwrap();
+    assert_eq!(
+        commits.len(),
+        3,
+        "the branch DAG (genesis + A + branch commit) is read from __manifest",
+    );
+    assert_eq!(
+        cg.head_commit_id().await.unwrap().as_deref(),
+        Some(fx.branch_commit.as_str()),
+        "the branch head resolves from __manifest's graph_head:feature",
+    );
+    let base = CommitGraph::merge_base(uri, Some(&fx.branch), Some(&fx.branch))
+        .await
+        .expect("merge_base must resolve over the manifest-sourced DAG");
+    assert_eq!(
+        base.map(|c| c.graph_commit_id),
+        Some(fx.branch_commit.clone()),
+        "merge_base(feature, feature) is reflexively the branch head",
+    );
+
+    // 3b. A WRITE that needs the derived ref fails loudly + actionably — the repair
+    //     is deferred to `cleanup`'s orphan reconciler, not inlined on a read.
+    let err = match cg.create_branch("derived").await {
+        Ok(()) => panic!("create_branch must fail when the commit-graph branch ref is missing"),
+        Err(e) => e,
+    };
+    let msg = err.to_string();
+    assert!(
+        msg.contains("commit-graph branch ref") && msg.contains("is missing"),
+        "expected the typed missing-ref error, got: {msg}",
+    );
+}
+
 // FIX B — the v3→v4 lineage backfill must be concurrent-runner idempotent.
 //
 // `migrate_v2_to_v3` is explicitly safe under two processes opening the same
