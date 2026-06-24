@@ -543,7 +543,17 @@ fn lineage_part_to_pending(part: GraphLineageRowPart) -> PendingVersionRow {
 /// merge-insert join key, annotated as an unenforced primary key on
 /// `__manifest`). Translate it to a typed manifest conflict so callers can
 /// match without parsing strings; everything else is opaque storage.
-fn map_lance_publish_error(err: LanceError) -> OmniError {
+///
+/// Shared (`pub(crate)`) with the v3→v4 lineage backfill
+/// (`state::merge_lineage_rows`), which issues its own `__manifest` merge-insert
+/// outside the publisher and must surface the SAME typed
+/// `RowLevelCasContention` so the migration's re-open retry loop can recognize a
+/// CAS loss. This is the merge-insert (`execute_reader`) conflict vocabulary
+/// only. It is deliberately NOT `optimize::is_retryable_lance_conflict`: that one
+/// also matches `CommitConflict`/`RetryableCommitConflict` from the COMPACTION
+/// commit path (`compact_files` -> `apply_commit`), which a row-level merge-insert
+/// never emits — folding it in here would match impossible variants.
+pub(crate) fn map_lance_publish_error(err: LanceError) -> OmniError {
     if matches!(err, LanceError::TooMuchWriteContention { .. }) {
         return OmniError::manifest_row_level_cas_contention(format!(
             "manifest publish lost a row-level CAS race: {}",

@@ -638,8 +638,13 @@ pub(crate) async fn merge_lineage_rows(
         .try_build()
         .map_err(|e| OmniError::Lance(e.to_string()))?
         .execute_reader(Box::new(reader))
+        // Route through the publisher's classifier (not a stringify) so a
+        // concurrent first-open's CAS loss on `__manifest` surfaces as the SAME
+        // typed `RowLevelCasContention` the publisher's retry consumes. The
+        // migration's re-open retry loop matches on that to converge instead of
+        // erroring out (FIX B).
         .await
-        .map_err(|e| OmniError::Lance(e.to_string()))?;
+        .map_err(super::publisher::map_lance_publish_error)?;
     Ok(Arc::try_unwrap(new_dataset).unwrap_or_else(|arc| (*arc).clone()))
 }
 
