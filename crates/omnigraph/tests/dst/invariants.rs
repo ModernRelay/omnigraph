@@ -11,6 +11,8 @@
 //!     always a real finding (the named regressions cover the known concurrency
 //!     cases separately).
 
+use lance_table::format::RowIdMeta;
+use lance_table::rowids::read_row_ids;
 use omnigraph::db::{Omnigraph, ReadTarget};
 use omnigraph::error::OmniError;
 use omnigraph_compiler::ir::ParamMap;
@@ -92,6 +94,57 @@ pub async fn dataset_validate(db: &Omnigraph) -> Result<(), Finding> {
     Ok(())
 }
 
+// ── INVARIANT #3a: no overlapping stable row-id ranges across fragments ──
+// A structural integrity check decoded from each fragment's `row_id_meta`
+// (`RowIdMeta::Inline` → `read_row_ids` → `row_id_range`): in a stable-row-id
+// dataset every fragment owns a DISJOINT range of stable row ids, so any two
+// fragments whose `[start..=end]` ranges intersect is corruption — a double-
+// allocated / re-used row-id range. Unlike `index_probe` (which only surfaces a
+// bad scalar-BTREE page when a filtered READ loads it), this fires the moment
+// the bad fragment metadata is committed, before any read. Reaches Lance only
+// through public surfaces: `Snapshot::open → Dataset::fragments()` +
+// `lance_table::rowids::read_row_ids`. `RowIdMeta::External` and `None` (legacy
+// assign-by-position) fragments carry no inline range and are skipped.
+pub async fn no_overlapping_row_ids(db: &Omnigraph) -> Result<(), Finding> {
+    let snap = db
+        .snapshot_of(ReadTarget::branch("main"))
+        .await
+        .map_err(Finding::Engine)?;
+    for entry in snap.entries() {
+        let ds = snap.open(&entry.table_key).await.map_err(Finding::Engine)?;
+        // (frag_id, start, end) for every fragment carrying an inline row-id range.
+        let mut ranges: Vec<(u64, u64, u64)> = Vec::new();
+        for frag in ds.fragments().iter() {
+            if let Some(RowIdMeta::Inline(bytes)) = &frag.row_id_meta {
+                let seq = read_row_ids(bytes).map_err(|e| {
+                    Finding::Logical(format!(
+                        "row_id_meta decode failed on {} frag {}: {e}",
+                        entry.table_key, frag.id
+                    ))
+                })?;
+                if let Some(r) = seq.row_id_range() {
+                    ranges.push((frag.id, *r.start(), *r.end()));
+                }
+            }
+        }
+        // Fragment counts per table are small; an O(n²) pairwise scan is fine and
+        // reports the exact colliding pair.
+        for i in 0..ranges.len() {
+            for j in (i + 1)..ranges.len() {
+                let (ai, a0, a1) = ranges[i];
+                let (bj, b0, b1) = ranges[j];
+                if a0 <= b1 && b0 <= a1 {
+                    return Err(Finding::Logical(format!(
+                        "overlapping stable row-id ranges on {}: frag {ai} [{a0}..={a1}] ∩ frag {bj} [{b0}..={b1}]",
+                        entry.table_key
+                    )));
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
 // ── INVARIANT #3: scalar-index probe (catches RC-X at creation) ──
 // Force-loads the Doc.source BTREE flat pages by filtering each enum value.
 pub async fn index_probe(db: &Omnigraph) -> Result<(), Finding> {
@@ -110,6 +163,7 @@ pub async fn run_battery(db: &Omnigraph, model: &crate::model::Model) -> Vec<(&'
     vec![
         ("head==manifest", head_eq_manifest(db).await),
         ("dataset.validate", dataset_validate(db).await),
+        ("row-id-disjoint", no_overlapping_row_ids(db).await),
         ("index-probe", index_probe(db).await),
         ("count==model", crate::model::check_counts(db, model).await),
     ]

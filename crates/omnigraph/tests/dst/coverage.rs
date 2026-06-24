@@ -28,7 +28,7 @@ impl Coverage {
     }
     pub fn report(&self) -> String {
         format!(
-            "ops {}/{}, invariants {}/4, known-bugs exercised {}",
+            "ops {}/{}, invariants {}/5, known-bugs exercised {}",
             self.ops.len(),
             OpKind::ALL.len(),
             self.invariants.len(),
