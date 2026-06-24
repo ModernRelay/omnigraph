@@ -1206,7 +1206,7 @@ async fn process_sidecar(
                 writer_kind = ?sidecar.writer_kind,
                 "recovery: rolling back sidecar (mixed or unexpected state)"
             );
-            roll_back_sidecar(root_uri, storage, snapshot, sidecar, &states)
+            roll_back_sidecar(root_uri, storage, sidecar, &states)
                 .await
                 .map(|()| true)
         }
@@ -1221,7 +1221,7 @@ async fn process_sidecar(
                             "recovery: rolling back SchemaApply sidecar because schema staging \
                              files were not promoted in this recovery pass"
                         );
-                        roll_back_sidecar(root_uri, storage, snapshot, sidecar, &states)
+                        roll_back_sidecar(root_uri, storage, sidecar, &states)
                             .await
                             .map(|()| true)
                     }
@@ -1299,7 +1299,6 @@ struct ClassifiedTable {
 async fn roll_back_sidecar(
     root_uri: &str,
     storage: &dyn StorageAdapter,
-    snapshot: &Snapshot,
     sidecar: &RecoverySidecar,
     states: &[ClassifiedTable],
 ) -> Result<()> {
@@ -1363,9 +1362,7 @@ async fn roll_back_sidecar(
     // commit in the same CAS (RFC-013 Phase 7). A degenerate all-NoMovement
     // roll-back restores no table — `updates` is empty — but the recovery commit
     // lineage still publishes (a lineage-only merge), so the rollback is recorded
-    // in the commit history just like a roll-forward. `snapshot` is no longer
-    // read for a "no publish" version because there is always a publish now.
-    let _ = snapshot;
+    // in the commit history just like a roll-forward.
     let (_manifest_version, graph_commit_id) =
         publish_recovery_commit(root_uri, sidecar, RecoveryKind::RolledBack, &updates, &expected)
             .await?;
