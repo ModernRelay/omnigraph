@@ -300,7 +300,15 @@ jobs:
       - test
     if: needs.classify_changes.outputs.run_rustfs_ci == 'true'
     runs-on: ubuntu-latest
-    timeout-minutes: 75
+    # 120, not 75: a COLD run (no warm cache) cold-compiles each of the 5
+    # sequential s3 suites and was hitting the 75-min limit on the last suite
+    # (recovery-sidecar), cancelling the job BEFORE the Post-Cache step — so the
+    # cache was never saved and the next run started cold again (a timeout loop
+    # that never converged to a green run). 120 gives a cold run room to finish
+    # all 5 suites and persist the cache; warm runs then complete in ~15 min,
+    # far under the limit. Splitting the suites into parallel jobs is the
+    # longer-term fix (see dev-graph iss-rustfs-s3-cold-timeout-loop).
+    timeout-minutes: 120
     permissions:
       contents: read
     env:

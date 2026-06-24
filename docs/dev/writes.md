@@ -83,6 +83,64 @@ The trait is the canonical surface for new engine code; existing call
 sites still use the inherent `TableStore` methods (mechanical migration
 deferred to a follow-up cycle — tracked).
 
+### Schema apply concurrency: queue-before-snapshot, per-table CAS, no global lease
+
+`apply_schema_with_lock` (`db/omnigraph/schema_apply.rs`) follows the same
+queue-before-read order `optimize` uses, so a concurrent compaction no longer
+false-fails a migration (bug 4 / iss-schema-apply-optimize-occ):
+
+1. **Classify the plan snapshot-free.** `classify_plan_steps` derives the
+   touched-table sets (added / renamed / rewritten / dropped, plus property
+   renames and the edge-touch flag) purely from the plan via `schema_table_key`
+   — no manifest snapshot.
+2. **Acquire the touched-existing-table write queues *before* the snapshot.**
+   The set is `rewritten ∪ rename-source ∪ dropped` — the existing tables the
+   apply rewrites in place or tombstones. New tables (added types, rename
+   targets) have no existing dataset to race against, so they aren't acquired.
+   The schema-apply serial key (`__schema_apply__`) is added whenever a sidecar
+   will be written. `acquire_many` sorts + dedupes, so lock order is identical
+   for every caller (the serial key sorts before any `node:`/`edge:` key;
+   optimize's single-key acquire is a subset) — no inversion.
+3. **Snapshot under the held queues.** A `refresh_coordinator_only` re-reads
+   HEAD first so the pinned versions are exactly current. While the queues are
+   held, no concurrent writer can move a touched table (a *new* writer refuses
+   at the schema-apply lock — see below; an *in-flight* writer that started
+   before the lock is serialized on the queue), so the per-table preconditions
+   (`ensure_snapshot_entry_head_matches` in the rewrite/rename loops) pass by
+   construction.
+4. **Publish with a per-table expected-version CAS.**
+   `commit_changes_with_expected_with_actor` fences the publish with the
+   snapshot versions of every touched-existing table. The held queues make this
+   pass in-process; the CAS is the loud cross-process backstop (the
+   acknowledged in-process-only recovery-serialization gap) — a foreign mover
+   surfaces as a typed `ExpectedVersionMismatch` rather than a publish onto
+   moved state.
+
+The old graph-global **"write lease"** check — comparing the whole manifest
+version against the pre-apply version right before the publish — is **gone**.
+It false-failed an apply whenever the global manifest version advanced for a
+table the apply does not touch, even though that commit is a disjoint manifest
+row the publisher rebases onto cleanly. "Operations that don't conflict
+semantically no longer conflict mechanically."
+
+**Concurrency reachability (and why there is no in-process race test).** While
+an apply holds `__schema_apply_lock__`, every *new* writer refuses to start —
+optimize / cleanup / ensure_indices / repair via `ensure_schema_apply_idle`,
+and mutate / load via `ensure_schema_apply_not_locked`. So the only writer that
+can move a table during an apply's snapshot→publish window is one already **in
+flight before the apply took the lock** (e.g. an optimize that already
+committed an untouched table and is mid-compact elsewhere). For touched tables,
+`apply_schema`'s `heal_pending_recovery_sidecars` pass plus the per-table write
+queues serialize the apply behind such a writer; for untouched tables, the
+lease removal is what stops the false-fail; the per-table CAS is the loud
+cross-process backstop. A deterministic in-process *failpoint* test of this
+race is not feasible — the lock excludes every spawnable concurrent writer, so
+such a test could only assert the unreachable case. The change is therefore
+covered by the existing single-threaded `schema_apply.rs` tests (which exercise
+the reordered classify → queue → snapshot → rewrite → per-table-CAS-publish
+path) plus this reasoning; the residual cross-process gap is tracked in
+[invariants.md](invariants.md).
+
 Three writers have been migrated onto staged primitives:
 
 * **`ensure_indices`** (`db/omnigraph/table_ops.rs::build_indices_on_dataset_for_catalog`)

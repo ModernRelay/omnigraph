@@ -163,6 +163,157 @@ where
     }
 }
 
+/// Snapshot-independent classification of a migration plan's steps into the
+/// table-key sets the apply path needs. Pure — it derives everything from the
+/// plan via `schema_table_key`, with no manifest snapshot. That is the point:
+/// the apply can run this BEFORE capturing its snapshot, which lets it acquire
+/// the touched-table write queues first (the same queue-before-snapshot order
+/// `optimize` uses), closing the stale-snapshot window a concurrent optimize
+/// could otherwise open under the apply (bug 4 / iss-schema-apply-optimize-occ).
+struct ClassifiedSteps {
+    /// New types — no existing dataset to race against (node + edge).
+    added_tables: BTreeSet<String>,
+    /// Rename targets → sources. The target is a new dataset; the source is an
+    /// existing table that gets tombstoned.
+    renamed_tables: HashMap<String, String>,
+    /// Existing tables rewritten in place (AddProperty / RenameProperty /
+    /// DropProperty) — these advance Lance HEAD via `stage_overwrite`.
+    rewritten_tables: BTreeSet<String>,
+    /// Existing tables dropped (DropType) — tombstoned in the manifest, no
+    /// per-table write.
+    dropped_tables: BTreeSet<String>,
+    /// table_key → { new_property_name → old_property_name } for RenameProperty.
+    property_renames: HashMap<String, HashMap<String, String>>,
+    /// Whether any step touches an edge table (drives graph-index invalidation).
+    changed_edge_tables: bool,
+    /// Existing tables carrying a Hard drop (DropProperty{Hard}/DropType{Hard}).
+    /// They need post-publish `cleanup_old_versions` so time-travel back to the
+    /// pre-drop state becomes unreachable; the dataset URI is resolved from the
+    /// snapshot once it's captured. Soft drops omit this and stay reachable
+    /// until `cleanup` runs.
+    hard_cleanup_table_keys: BTreeSet<String>,
+}
+
+fn classify_plan_steps(steps: &[SchemaMigrationStep]) -> Result<ClassifiedSteps> {
+    let mut c = ClassifiedSteps {
+        added_tables: BTreeSet::new(),
+        renamed_tables: HashMap::new(),
+        rewritten_tables: BTreeSet::new(),
+        dropped_tables: BTreeSet::new(),
+        property_renames: HashMap::new(),
+        changed_edge_tables: false,
+        hard_cleanup_table_keys: BTreeSet::new(),
+    };
+    for step in steps {
+        match step {
+            SchemaMigrationStep::AddType { type_kind, name } => {
+                let table_key = schema_table_key(*type_kind, name);
+                if table_key.starts_with("edge:") {
+                    c.changed_edge_tables = true;
+                }
+                c.added_tables.insert(table_key);
+            }
+            SchemaMigrationStep::RenameType {
+                type_kind,
+                from,
+                to,
+            } => {
+                let source_key = schema_table_key(*type_kind, from);
+                let target_key = schema_table_key(*type_kind, to);
+                if source_key.starts_with("edge:") {
+                    c.changed_edge_tables = true;
+                }
+                c.renamed_tables.insert(target_key, source_key);
+            }
+            SchemaMigrationStep::AddProperty {
+                type_kind,
+                type_name,
+                ..
+            } => {
+                let table_key = schema_table_key(*type_kind, type_name);
+                if table_key.starts_with("edge:") {
+                    c.changed_edge_tables = true;
+                }
+                c.rewritten_tables.insert(table_key);
+            }
+            SchemaMigrationStep::RenameProperty {
+                type_kind,
+                type_name,
+                from,
+                to,
+            } => {
+                let table_key = schema_table_key(*type_kind, type_name);
+                if table_key.starts_with("edge:") {
+                    c.changed_edge_tables = true;
+                }
+                c.rewritten_tables.insert(table_key.clone());
+                c.property_renames
+                    .entry(table_key)
+                    .or_default()
+                    .insert(to.clone(), from.clone());
+            }
+            // AddConstraint is only ever an `@index` addition (every other
+            // added constraint plans as UnsupportedChange). It records intent
+            // in the desired catalog/IR; the physical index is built off the
+            // critical path by ensure_indices/optimize (iss-848), so the apply
+            // does no table work for it — a pure metadata change like the two
+            // metadata steps below.
+            SchemaMigrationStep::AddConstraint { .. }
+            | SchemaMigrationStep::UpdateTypeMetadata { .. }
+            | SchemaMigrationStep::UpdatePropertyMetadata { .. } => {}
+            SchemaMigrationStep::DropProperty {
+                type_kind,
+                type_name,
+                mode,
+                ..
+            } => {
+                // Both Soft and Hard route through the same stage_overwrite
+                // rewrite path (batch_for_schema_apply_rewrite iterates the
+                // target schema, so a dropped property is naturally projected
+                // away). The Soft/Hard difference is post-publish only: Hard
+                // adds the table to hard_cleanup_table_keys, so the snapshot
+                // resolves its URI and `cleanup_old_versions` runs after the
+                // publish; Soft leaves the prior version readable via
+                // time-travel until `cleanup`.
+                let table_key = schema_table_key(*type_kind, type_name);
+                if table_key.starts_with("edge:") {
+                    c.changed_edge_tables = true;
+                }
+                if matches!(mode, DropMode::Hard) {
+                    c.hard_cleanup_table_keys.insert(table_key.clone());
+                }
+                c.rewritten_tables.insert(table_key);
+            }
+            SchemaMigrationStep::DropType {
+                type_kind,
+                name,
+                mode,
+            } => {
+                // Both Soft and Hard tombstone the table's manifest entry (no
+                // per-table write). Hard additionally schedules
+                // `cleanup_old_versions` on the orphaned dataset post-publish
+                // (the dataset directory persists until a future orphan-cleanup
+                // pass); Soft leaves prior versions time-travel-reachable.
+                let table_key = schema_table_key(*type_kind, name);
+                if table_key.starts_with("edge:") {
+                    c.changed_edge_tables = true;
+                }
+                if matches!(mode, DropMode::Hard) {
+                    c.hard_cleanup_table_keys.insert(table_key.clone());
+                }
+                c.dropped_tables.insert(table_key);
+            }
+            step @ SchemaMigrationStep::UnsupportedChange { .. } => {
+                return Err(OmniError::manifest(
+                    step.unsupported_error_message()
+                        .unwrap_or_else(|| "unsupported schema migration step".to_string()),
+                ));
+            }
+        }
+    }
+    Ok(c)
+}
+
 pub(super) async fn apply_schema_with_lock<F>(
     db: &Omnigraph,
     desired_schema_source: &str,
@@ -188,158 +339,86 @@ where
         });
     }
 
-    let snapshot = db.snapshot().await;
-    let base_manifest_version = snapshot.version();
-    let mut added_tables = BTreeSet::new();
-    let mut renamed_tables = HashMap::new();
-    let mut rewritten_tables = BTreeSet::new();
-    let mut dropped_tables = BTreeSet::new();
-    // Hard-drop cleanup targets: (table_key, full_dataset_uri).
-    // Populated for DropProperty { Hard } and DropType { Hard }; the
-    // post-publish cleanup runs `cleanup_old_versions` on each
-    // dataset to reclaim prior versions, making time-travel back
-    // to pre-drop state unreachable.
-    let mut hard_cleanup_targets: Vec<(String, String)> = Vec::new();
-    let mut property_renames = HashMap::<String, HashMap<String, String>>::new();
-    let mut changed_edge_tables = false;
+    let ClassifiedSteps {
+        added_tables,
+        renamed_tables,
+        rewritten_tables,
+        dropped_tables,
+        property_renames,
+        changed_edge_tables,
+        hard_cleanup_table_keys,
+    } = classify_plan_steps(&plan.steps)?;
 
-    for step in &plan.steps {
-        match step {
-            SchemaMigrationStep::AddType { type_kind, name } => {
-                let table_key = schema_table_key(*type_kind, name);
-                if table_key.starts_with("edge:") {
-                    changed_edge_tables = true;
-                }
-                added_tables.insert(table_key);
-            }
-            SchemaMigrationStep::RenameType {
-                type_kind,
-                from,
-                to,
-            } => {
-                let source_key = schema_table_key(*type_kind, from);
-                let target_key = schema_table_key(*type_kind, to);
-                if source_key.starts_with("edge:") {
-                    changed_edge_tables = true;
-                }
-                renamed_tables.insert(target_key, source_key);
-            }
-            SchemaMigrationStep::AddProperty {
-                type_kind,
-                type_name,
-                ..
-            } => {
-                let table_key = schema_table_key(*type_kind, type_name);
-                if table_key.starts_with("edge:") {
-                    changed_edge_tables = true;
-                }
-                rewritten_tables.insert(table_key);
-            }
-            SchemaMigrationStep::RenameProperty {
-                type_kind,
-                type_name,
-                from,
-                to,
-            } => {
-                let table_key = schema_table_key(*type_kind, type_name);
-                if table_key.starts_with("edge:") {
-                    changed_edge_tables = true;
-                }
-                rewritten_tables.insert(table_key.clone());
-                property_renames
-                    .entry(table_key)
-                    .or_default()
-                    .insert(to.clone(), from.clone());
-            }
-            // AddConstraint is only ever an `@index` addition (every other
-            // added constraint plans as UnsupportedChange). It records intent
-            // in the desired catalog/IR; the physical index is built off the
-            // critical path by ensure_indices/optimize (iss-848), so the apply
-            // does no table work for it — a pure metadata change like the two
-            // metadata steps below.
-            SchemaMigrationStep::AddConstraint { .. }
-            | SchemaMigrationStep::UpdateTypeMetadata { .. }
-            | SchemaMigrationStep::UpdatePropertyMetadata { .. } => {}
-            SchemaMigrationStep::DropProperty {
-                type_kind,
-                type_name,
-                mode,
-                ..
-            } => {
-                // Both Soft and Hard route through the existing
-                // stage_overwrite rewrite path. batch_for_schema_apply_rewrite
-                // iterates the *target* schema fields, so a property
-                // absent from desired_catalog is naturally projected
-                // away in the rebuilt batch.
-                //
-                // The difference between Soft and Hard is what
-                // happens AFTER the manifest publish:
-                //   * Soft: nothing — the prior dataset version
-                //     retains the dropped column; reads at
-                //     snapshot_at_version(pre_drop) still see it.
-                //   * Hard: run cleanup_old_versions on the dataset
-                //     post-publish, removing the prior version (and
-                //     reclaiming any fragments unique to it). After
-                //     cleanup, time-travel back fails.
-                let table_key = schema_table_key(*type_kind, type_name);
-                if table_key.starts_with("edge:") {
-                    changed_edge_tables = true;
-                }
-                if matches!(mode, DropMode::Hard) {
-                    let entry = snapshot.entry(&table_key).ok_or_else(|| {
-                        OmniError::manifest(format!(
-                            "missing table '{}' for hard property drop",
-                            table_key
-                        ))
-                    })?;
-                    let full_uri = format!("{}/{}", db.root_uri, entry.table_path);
-                    hard_cleanup_targets.push((table_key.clone(), full_uri));
-                }
-                rewritten_tables.insert(table_key);
-            }
-            SchemaMigrationStep::DropType {
-                type_kind,
-                name,
-                mode,
-            } => {
-                // Both Soft and Hard tombstone the table's entry in
-                // the current __manifest version (no per-table write).
-                //
-                // The difference is what happens after publish:
-                //   * Soft: dataset files retained; prior __manifest
-                //     versions still reference them; Lance time
-                //     travel + branch-from-snapshot can read the
-                //     dropped table.
-                //   * Hard: run cleanup_old_versions on the orphan
-                //     dataset post-publish. Prior dataset versions
-                //     (and their fragments) are reclaimed. The dataset
-                //     directory itself persists until a future
-                //     orphan-cleanup pass — operators who need the
-                //     directory gone too should run `omnigraph cleanup`
-                //     and (for now) remove the directory out-of-band.
-                let table_key = schema_table_key(*type_kind, name);
-                if table_key.starts_with("edge:") {
-                    changed_edge_tables = true;
-                }
-                if matches!(mode, DropMode::Hard) {
-                    let entry = snapshot.entry(&table_key).ok_or_else(|| {
-                        OmniError::manifest(format!(
-                            "missing table '{}' for hard type drop",
-                            table_key
-                        ))
-                    })?;
-                    let full_uri = format!("{}/{}", db.root_uri, entry.table_path);
-                    hard_cleanup_targets.push((table_key.clone(), full_uri));
-                }
-                dropped_tables.insert(table_key);
-            }
-            step @ SchemaMigrationStep::UnsupportedChange { .. } => {
-                return Err(OmniError::manifest(
-                    step.unsupported_error_message()
-                        .unwrap_or_else(|| "unsupported schema migration step".to_string()),
-                ));
-            }
-        }
+    // Acquire the per-(table, main) write queues for every EXISTING table this
+    // apply touches BEFORE capturing the snapshot — the same queue-before-read
+    // order `optimize` uses (optimize.rs). The touched-existing set is
+    // rewritten ∪ rename-source ∪ dropped: tables that either advance Lance
+    // HEAD (rewrites) or get tombstoned at their snapshot version. Holding the
+    // queues across the snapshot, the per-table commits, and the manifest
+    // publish means no concurrent optimize/mutate can move one of these tables'
+    // versions underneath us, so the per-table preconditions pass by
+    // construction. New tables (added types, rename targets) have no existing
+    // dataset to race against, so they aren't acquired. This is what lets us
+    // drop the old graph-global "write lease" check below: a compaction of an
+    // UNTOUCHED table advances the global manifest version but no longer fails
+    // this apply (bug 4 / iss-schema-apply-optimize-occ).
+    //
+    // A sidecar is written whenever any touched set is non-empty (a pure
+    // index-only / metadata apply touches no table and writes none); the serial
+    // key serializes against a concurrent write's in-process recovery heal,
+    // which can otherwise promote this apply's staging files / publish its
+    // registrations out from under it.
+    let writes_sidecar = !(added_tables.is_empty()
+        && renamed_tables.is_empty()
+        && rewritten_tables.is_empty()
+        && dropped_tables.is_empty());
+    // The queue branch is `None` for every key: schema apply runs under
+    // `__schema_apply_lock__`, which `acquire_schema_apply_lock` only grants on
+    // a main-only graph (it refuses if any non-main branch exists), so every
+    // touched table's entry is on `main` (`table_branch == None`). Using `None`
+    // here therefore shares the exact same queue any concurrent writer on these
+    // tables would take.
+    let mut schema_apply_queue_keys: Vec<(String, Option<String>)> = Vec::new();
+    for table_key in rewritten_tables.iter().chain(dropped_tables.iter()) {
+        schema_apply_queue_keys.push((table_key.clone(), None));
+    }
+    for source_table_key in renamed_tables.values() {
+        schema_apply_queue_keys.push((source_table_key.clone(), None));
+    }
+    if writes_sidecar {
+        schema_apply_queue_keys.push(crate::db::manifest::schema_apply_serial_queue_key());
+    }
+    // acquire_many sorts + dedupes, so lock-acquisition order is identical for
+    // every caller (the serial key '__schema_apply__' sorts before any 'node:'
+    // / 'edge:' key; optimize acquires a single table key, a subset) — no
+    // lock-order inversion.
+    let _schema_apply_queue_guards = db
+        .write_queue()
+        .acquire_many(&schema_apply_queue_keys)
+        .await;
+
+    // Snapshot under the held queues. refresh_coordinator_only re-reads the
+    // manifest HEAD first (acquire_many may have waited on a prior writer that
+    // advanced a touched table), so the pinned versions are exactly current;
+    // db.snapshot() itself does no I/O.
+    db.refresh_coordinator_only().await?;
+    let snapshot = db.snapshot().await;
+
+    // Resolve the (table_key, full_dataset_uri) cleanup targets for every Hard
+    // drop. The Soft/Hard split is decided in classify_plan_steps (snapshot-
+    // free); only the dataset URI needs the snapshot. The post-publish cleanup
+    // (below) runs `cleanup_old_versions` on each, making time-travel back to
+    // the pre-drop state unreachable.
+    let mut hard_cleanup_targets: Vec<(String, String)> = Vec::new();
+    for table_key in &hard_cleanup_table_keys {
+        let entry = snapshot.entry(table_key).ok_or_else(|| {
+            OmniError::manifest(format!(
+                "missing table '{}' for hard drop cleanup",
+                table_key
+            ))
+        })?;
+        let full_uri = format!("{}/{}", db.root_uri, entry.table_path);
+        hard_cleanup_targets.push((table_key.clone(), full_uri));
     }
 
     let mut table_registrations = HashMap::<String, String>::new();
@@ -424,49 +503,18 @@ where
         table_tombstones.insert(dropped_table_key.clone(), tombstone_version);
     }
 
-    // Acquire per-(table_key, branch) queues for every existing table
-    // that schema_apply will rewrite or re-index. New tables (added or
-    // renamed targets) aren't acquired — they have no existing dataset
-    // to race against. Held across the per-table commit loop and the
-    // manifest publish via `commit_changes_with_actor` below.
-    //
-    // Schema-apply already holds the graph-wide `__schema_apply_lock__`
-    // sentinel branch, so these per-table acquisitions are uncontended in
-    // practice. They exist for symmetry with the recovery reconciler, which
-    // acquires the same queues before any `Dataset::restore` it issues for
-    // SchemaApply sidecars.
-    let mut schema_apply_queue_keys: Vec<(String, Option<String>)> = recovery_pins
-        .iter()
-        .map(|pin| (pin.table_key.clone(), pin.table_branch.clone()))
-        .collect();
-    // The serialization key the write-entry heal acquires before touching
-    // schema staging or a SchemaApply sidecar. Per-table keys alone don't
-    // cover a registration-only migration (no pins, but a sidecar and
-    // staging files on disk) — without this, a concurrent write's heal can
-    // promote this apply's staging files and publish its registrations out
-    // from under it. Acquired whenever a sidecar will be written, held
-    // through Phase D (the guards live to the end of this function).
-    let writes_sidecar = !(recovery_pins.is_empty()
-        && sidecar_registrations.is_empty()
-        && sidecar_tombstones.is_empty());
-    if writes_sidecar {
-        schema_apply_queue_keys.push(crate::db::manifest::schema_apply_serial_queue_key());
-    }
-    let _schema_apply_queue_guards = db
-        .write_queue()
-        .acquire_many(&schema_apply_queue_keys)
-        .await;
-
+    // (The touched-table write queues + the schema-apply serial key were
+    // acquired before the snapshot above; `writes_sidecar` was computed there.)
     let recovery_handle = if !writes_sidecar {
         None
     } else {
         // `branch=None` because schema_apply publishes against main —
         // the `__schema_apply_lock__` branch is purely a serialization
         // sentinel (acquire_schema_apply_lock creates it; the manifest
-        // publish via coordinator.commit_changes_with_actor below targets
-        // the coordinator's active branch, which is the pre-lock branch).
-        // If the lock release fires before recovery, the lock branch is
-        // gone — the sidecar must not reference it.
+        // publish via coordinator.commit_changes_with_expected_with_actor
+        // below targets the coordinator's active branch, which is the
+        // pre-lock branch). If the lock release fires before recovery, the
+        // lock branch is gone — the sidecar must not reference it.
         let mut sidecar = crate::db::manifest::new_sidecar(
             crate::db::manifest::SidecarKind::SchemaApply,
             None,
@@ -631,14 +679,38 @@ where
         }));
     }
 
-    db.refresh_coordinator_only().await?;
-    let current_manifest_version = db.version().await;
-    if current_manifest_version != base_manifest_version {
-        return Err(OmniError::manifest_conflict(format!(
-            "schema apply lost its write lease: main advanced from v{} to v{} while schema apply was in progress",
-            base_manifest_version, current_manifest_version,
-        )));
+    // Publisher-level OCC fence (cross-process backstop). For every EXISTING
+    // table this apply touches — rewritten ∪ rename-source ∪ dropped — assert
+    // the manifest's recorded version still equals the snapshot version we
+    // planned against. The held write queues already make this true for any
+    // in-process optimize/mutate; the CAS is the loud backstop for a foreign
+    // process (the acknowledged in-process-only recovery-serialization gap):
+    // it fails with a typed ExpectedVersionMismatch rather than publishing onto
+    // moved state. Added types / rename targets are new datasets with no
+    // manifest entry yet, so they are excluded.
+    let mut expected_table_versions: HashMap<String, u64> = HashMap::new();
+    for table_key in rewritten_tables.iter().chain(dropped_tables.iter()) {
+        if let Some(entry) = snapshot.entry(table_key) {
+            expected_table_versions.insert(table_key.clone(), entry.table_version);
+        }
     }
+    for source_table_key in renamed_tables.values() {
+        if let Some(entry) = snapshot.entry(source_table_key) {
+            expected_table_versions.insert(source_table_key.clone(), entry.table_version);
+        }
+    }
+
+    // Re-read the coordinator's manifest HEAD for coherence before the publish.
+    // This is NOT a precondition check: the held queues already prevent any
+    // touched table from moving, and the per-table head checks in the
+    // rewrite/rename loops (`ensure_snapshot_entry_head_matches`) plus the
+    // publish-time expected-version CAS are what guard correctness. The old
+    // graph-global "write lease" check that lived here — comparing the whole
+    // manifest version against the pre-apply version — is gone: it false-failed
+    // an apply whenever a concurrent compaction of an UNTOUCHED table advanced
+    // the global manifest version, even though that commit is a disjoint
+    // manifest row the publisher rebases onto cleanly (bug 4).
+    db.refresh_coordinator_only().await?;
 
     // Atomic schema apply.
     //
@@ -666,7 +738,11 @@ where
         .coordinator
         .write()
         .await
-        .commit_changes_with_actor(&manifest_changes, None)
+        .commit_changes_with_expected_with_actor(
+            &manifest_changes,
+            &expected_table_versions,
+            None,
+        )
         .await?;
 
     crate::failpoints::maybe_fail("schema_apply.after_manifest_commit")?;
