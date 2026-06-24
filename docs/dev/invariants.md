@@ -251,7 +251,14 @@ them explicit.
   leaves no gap. The commit-graph cache is a derived projection of those manifest
   rows; nothing writes `_graph_commits.lance` (it persists only to carry branch
   refs). The prior two-write gap (manifest at N with no `_graph_commits` row for N)
-  is gone by construction.
+  is gone by construction. A graph created before Phase 7 (internal schema v3)
+  carries its lineage only in `_graph_commits.lance`; the `migrate_v3_to_v4`
+  internal-schema step (`db/manifest/migrations.rs`) backfills it into `__manifest`
+  per-branch on the first read-write open (idempotent, crash-safe, data-preserving),
+  and a read-only open of an un-migrated v3 graph sources the DAG from
+  `_graph_commits.lance` via a stamp-gated transitional fallback so reads stay
+  correct until the first write migrates it. An old binary refuses a v4-stamped
+  graph (read-write and read-only) with the standard upgrade error.
 - **Planner capability/stat surfaces:** cost-aware planning, complete
   capability advertisement, and explain-with-cost are roadmap. Do not describe
   them as implemented.

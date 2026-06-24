@@ -521,6 +521,67 @@ pub(super) fn entries_to_batch(
     )
 }
 
+/// Merge-insert a set of graph-lineage rows (`graph_commit` + `graph_head`)
+/// straight into `__manifest`, keyed on `object_id`. Used only by the v3→v4
+/// internal-schema backfill (RFC-013 step 4): the normal write path folds
+/// lineage into the publisher's batch, but the migration writes lineage with
+/// no accompanying table-version change, so it issues its own merge.
+///
+/// Mirrors the publisher's merge knobs (`use_index(false)`, `skip_auto_cleanup`,
+/// `conflict_retries(0)`) so it has identical CAS / cleanup semantics. The
+/// migration runs under the open-for-write path and is idempotent (re-inserting
+/// the same `object_id` rows updates them in place), so it does not need the
+/// publisher's retry loop. Returns the advanced dataset (its version is the
+/// commit the lineage landed in).
+pub(crate) async fn merge_lineage_rows(
+    dataset: Dataset,
+    parts: &[GraphLineageRowPart],
+) -> Result<Dataset> {
+    let len = parts.len();
+    let mut object_ids = Vec::with_capacity(len);
+    let mut object_types = Vec::with_capacity(len);
+    let mut metadata = Vec::with_capacity(len);
+    let mut table_versions = Vec::with_capacity(len);
+    let mut table_branches = Vec::with_capacity(len);
+    for part in parts {
+        object_ids.push(part.object_id.clone());
+        object_types.push(part.object_type.to_string());
+        metadata.push(Some(part.metadata.clone()));
+        table_versions.push(part.table_version);
+        table_branches.push(part.table_branch.clone());
+    }
+    // Lineage rows carry no table identity: empty `table_key`, null location /
+    // row_count (matching `lineage_part_to_pending` in the publisher).
+    let batch = manifest_rows_batch(
+        object_ids,
+        object_types,
+        vec![None; len],
+        metadata,
+        vec![String::new(); len],
+        table_versions,
+        table_branches,
+        vec![None; len],
+    )?;
+    let reader =
+        arrow_array::RecordBatchIterator::new(vec![Ok(batch)], manifest_schema());
+    let dataset = Arc::new(dataset);
+    let mut merge_builder =
+        lance::dataset::MergeInsertBuilder::try_new(dataset, vec!["object_id".to_string()])
+            .map_err(|e| OmniError::Lance(e.to_string()))?;
+    merge_builder.when_matched(lance::dataset::WhenMatched::UpdateAll);
+    merge_builder.when_not_matched(lance::dataset::WhenNotMatched::InsertAll);
+    merge_builder.conflict_retries(0);
+    merge_builder.use_index(false);
+    merge_builder.skip_auto_cleanup(true);
+    let (new_dataset, _stats) = merge_builder
+        .try_build()
+        .map_err(|e| OmniError::Lance(e.to_string()))?
+        .execute_reader(Box::new(reader))
+        .await
+        .map_err(|e| OmniError::Lance(e.to_string()))?;
+    Ok(Arc::try_unwrap(new_dataset).unwrap_or_else(|arc| (*arc).clone()))
+}
+
 pub(super) fn manifest_rows_batch(
     object_ids: Vec<String>,
     object_types: Vec<String>,

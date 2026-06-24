@@ -37,6 +37,9 @@ use lance::Dataset;
 
 use crate::error::{OmniError, Result};
 
+use crate::db::commit_graph::GraphCommit;
+use super::state::{GraphLineageRow, graph_lineage_row_parts, merge_lineage_rows, read_graph_lineage};
+
 /// Current internal schema version this binary expects to find on disk.
 ///
 /// History:
@@ -50,14 +53,21 @@ use crate::error::{OmniError, Result};
 ///   `__manifest` dataset by the pre-v0.4.0 Run state machine (removed in
 ///   MR-771). Once swept, the `is_internal_run_branch` defense-in-depth guard
 ///   is no longer needed (MR-770).
-pub(super) const INTERNAL_MANIFEST_SCHEMA_VERSION: u32 = 3;
+/// - v4 — RFC-013 Phase 7 folds graph lineage into `__manifest` as
+///   `graph_commit`/`graph_head` rows written in the publish CAS. A pre-Phase-7
+///   (v3) graph has its lineage only in `_graph_commits.lance`, so the new
+///   binary would read an empty commit DAG. This one-time per-branch backfill
+///   copies the lineage from `_graph_commits.lance` into `__manifest`
+///   (`migrate_v3_to_v4`). `_graph_commits.lance` is left in place as the
+///   branch-ref carrier; no commit rows are ever written to it again.
+pub(crate) const INTERNAL_MANIFEST_SCHEMA_VERSION: u32 = 4;
 
 const INTERNAL_SCHEMA_VERSION_KEY: &str = "omnigraph:internal_schema_version";
 const OBJECT_ID_PK_KEY: &str = "lance-schema:unenforced-primary-key";
 
 /// Read the on-disk stamp from `__manifest`'s schema-level metadata.
 /// Absent ⇒ v1 (pre-stamp world).
-pub(super) fn read_stamp(dataset: &Dataset) -> u32 {
+pub(crate) fn read_stamp(dataset: &Dataset) -> u32 {
     dataset
         .schema()
         .metadata
@@ -72,20 +82,39 @@ pub(super) async fn stamp_current_version(dataset: &mut Dataset) -> Result<()> {
     set_stamp(dataset, INTERNAL_MANIFEST_SCHEMA_VERSION).await
 }
 
+/// Refuse to open a manifest stamped at a version this binary does not know,
+/// with a clear "upgrade omnigraph first" error. Shared by the write-path
+/// migration dispatcher and the read-only open guard (a read-only open of a
+/// future-stamped graph must still refuse, even though it never writes).
+pub(crate) fn refuse_if_stamp_too_new(stamp: u32) -> Result<()> {
+    if stamp > INTERNAL_MANIFEST_SCHEMA_VERSION {
+        return Err(OmniError::manifest(format!(
+            "__manifest is stamped at internal schema v{} but this binary expects v{} \
+             — upgrade omnigraph before opening this graph",
+            stamp, INTERNAL_MANIFEST_SCHEMA_VERSION,
+        )));
+    }
+    Ok(())
+}
+
 /// Apply any pending internal-schema migrations to the manifest dataset.
 ///
 /// Idempotent: when the on-disk stamp matches the binary, this is a single
 /// metadata read with no writes.
-pub(super) async fn migrate_internal_schema(dataset: &mut Dataset) -> Result<()> {
+///
+/// `root_uri` + `branch` identify which graph + branch this `dataset` is a
+/// manifest for. The v3→v4 lineage backfill needs them to read that branch's
+/// `_graph_commits.lance`. `migrate_on_open` passes the main branch
+/// (`branch = None`); the publisher's `load_publish_state` passes its own
+/// branch, so each branch backfills on its first write.
+pub(super) async fn migrate_internal_schema(
+    dataset: &mut Dataset,
+    root_uri: &str,
+    branch: Option<&str>,
+) -> Result<()> {
     let mut current = read_stamp(dataset);
 
-    if current > INTERNAL_MANIFEST_SCHEMA_VERSION {
-        return Err(OmniError::manifest(format!(
-            "__manifest is stamped at internal schema v{} but this binary expects v{} \
-             — upgrade omnigraph before opening this graph for writes",
-            current, INTERNAL_MANIFEST_SCHEMA_VERSION,
-        )));
-    }
+    refuse_if_stamp_too_new(current)?;
 
     while current < INTERNAL_MANIFEST_SCHEMA_VERSION {
         match current {
@@ -96,6 +125,10 @@ pub(super) async fn migrate_internal_schema(dataset: &mut Dataset) -> Result<()>
             2 => {
                 migrate_v2_to_v3(dataset).await?;
                 current = 3;
+            }
+            3 => {
+                migrate_v3_to_v4(dataset, root_uri, branch).await?;
+                current = 4;
             }
             other => {
                 return Err(OmniError::manifest_internal(format!(
@@ -202,10 +235,99 @@ async fn migrate_v2_to_v3(dataset: &mut Dataset) -> Result<()> {
     set_stamp(dataset, 3).await
 }
 
+/// v3 → v4: backfill the graph lineage from `_graph_commits.lance` into
+/// `__manifest`, then bump the stamp.
+///
+/// RFC-013 Phase 7 made `__manifest` the single source of graph lineage
+/// (`graph_commit` / `graph_head:<branch>` rows, written in the publish CAS).
+/// A pre-Phase-7 (v3) graph has its lineage only in `_graph_commits.lance` and
+/// none in `__manifest`, so the new binary would read an EMPTY commit DAG. This
+/// one-time per-branch migration copies that branch's commits + the single head
+/// into `__manifest` so reads see the real history. `_graph_commits.lance`
+/// itself is left untouched as the branch-ref carrier (no commit row is ever
+/// written to it again).
+///
+/// `dataset` is the `__manifest` for `branch` (main when `branch` is `None`);
+/// the migration runs per-branch on that branch's first write, so it reads
+/// `_graph_commits.lance` at the SAME branch.
+///
+/// Idempotency + crash recovery: the stamp bump is the LAST step, and the
+/// lineage merge is keyed on `object_id` (re-inserting the same commit rows is a
+/// no-op update). A crash after the merge but before the stamp bump re-enters
+/// here at v3 and re-runs harmlessly. As a fast path, if `__manifest` already
+/// carries `graph_commit` rows (a previous run completed the merge), we skip
+/// straight to the stamp bump.
+async fn migrate_v3_to_v4(
+    dataset: &mut Dataset,
+    root_uri: &str,
+    branch: Option<&str>,
+) -> Result<()> {
+    // Fast path / idempotency guard: if the backfill already landed (commit rows
+    // present in `__manifest`), don't re-read or re-merge — just (re)stamp.
+    let (existing_lineage, _heads) = read_graph_lineage(dataset).await?;
+    if !existing_lineage.is_empty() {
+        return set_stamp(dataset, 4).await;
+    }
+
+    // Read this branch's legacy commit cache (commits + the head). An absent or
+    // empty `_graph_commits.lance` yields no commits — nothing to backfill.
+    let (commit_by_id, head) =
+        crate::db::commit_graph::read_legacy_commit_cache(root_uri, branch).await?;
+    if commit_by_id.is_empty() {
+        return set_stamp(dataset, 4).await;
+    }
+
+    // Build the manifest rows: one immutable `graph_commit` row per commit, plus
+    // EXACTLY ONE `graph_head:<branch>` row for the actual head. Each commit
+    // encodes to a [graph_commit, graph_head] pair, but only the head commit's
+    // head row is kept — the others would be redundant updates of the same
+    // `graph_head:<branch>` object_id (the head is per-branch, not per-commit).
+    let head_id = head.as_ref().map(|h| h.graph_commit_id.as_str());
+    // Deterministic iteration order (the source is a HashMap): merge-insert is
+    // keyed on `object_id` so the final manifest content is order-independent,
+    // but a stable order keeps the produced batch reproducible regardless.
+    let mut commits: Vec<&GraphCommit> = commit_by_id.values().collect();
+    commits.sort_by(|a, b| a.graph_commit_id.cmp(&b.graph_commit_id));
+    let mut parts = Vec::with_capacity(commits.len() + 1);
+    for commit in commits {
+        let row = GraphLineageRow {
+            graph_commit_id: commit.graph_commit_id.clone(),
+            manifest_branch: commit.manifest_branch.clone(),
+            manifest_version: commit.manifest_version,
+            parent_commit_id: commit.parent_commit_id.clone(),
+            merged_parent_commit_id: commit.merged_parent_commit_id.clone(),
+            actor_id: commit.actor_id.clone(),
+            created_at: commit.created_at,
+        };
+        let [commit_part, head_part] = graph_lineage_row_parts(&row, branch)?;
+        parts.push(commit_part);
+        if Some(commit.graph_commit_id.as_str()) == head_id {
+            parts.push(head_part);
+        }
+    }
+
+    *dataset = merge_lineage_rows(dataset.clone(), &parts).await?;
+    // Stamp LAST. Crash window: a failure between the merge above and this stamp
+    // bump leaves stamp v3 + lineage present in `__manifest`. The next open
+    // re-enters at v3, the idempotency guard at the top of this fn sees the
+    // lineage and skips straight to the stamp bump — completing the migration
+    // with no duplicate rows (the merge is keyed on `object_id`). Pinned by
+    // `crash_after_merge_before_stamp_completes_on_next_open`.
+    set_stamp(dataset, 4).await
+}
+
 async fn set_stamp(dataset: &mut Dataset, version: u32) -> Result<()> {
     dataset
         .update_schema_metadata([(INTERNAL_SCHEMA_VERSION_KEY.to_string(), version.to_string())])
         .await
         .map_err(|e| OmniError::Lance(e.to_string()))?;
     Ok(())
+}
+
+/// Test-only: force the on-disk internal-schema stamp to `version`. Used to
+/// synthesize a pre-migration graph (rewinding to v3) and to simulate a crash
+/// that lost the final stamp bump.
+#[cfg(test)]
+pub(crate) async fn set_stamp_for_test(dataset: &mut Dataset, version: u32) -> Result<()> {
+    set_stamp(dataset, version).await
 }

@@ -137,8 +137,11 @@ impl GraphNamespacePublisher {
         let mut dataset = self.dataset().await?;
         // Run pending internal-schema migrations exactly once per publish on
         // the open-for-write path; idempotent when the on-disk stamp already
-        // matches this binary. See `db/manifest/migrations.rs`.
-        migrate_internal_schema(&mut dataset).await?;
+        // matches this binary. Pass this publisher's branch so the v3→v4 lineage
+        // backfill reads `_graph_commits.lance` at the SAME branch it is
+        // publishing to (each branch backfills on its first write). See
+        // `db/manifest/migrations.rs`.
+        migrate_internal_schema(&mut dataset, &self.root_uri, self.branch.as_deref()).await?;
         let registered_tables = read_registered_table_locations(&dataset).await?;
         let existing_entries = read_manifest_entries(&dataset).await?;
         let existing_versions = existing_entries

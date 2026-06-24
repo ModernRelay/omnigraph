@@ -93,7 +93,63 @@ pub(crate) struct CommitOutcome {
 /// Idempotent: a no-op stamp read when the on-disk version already matches.
 pub(crate) async fn migrate_on_open(root_uri: &str) -> Result<()> {
     let mut dataset = open_manifest_dataset(root_uri, None).await?;
-    migrations::migrate_internal_schema(&mut dataset).await
+    // Main branch: the v3→v4 lineage backfill reads `_graph_commits.lance` at
+    // main. Named branches migrate on their own first write via the publisher.
+    migrations::migrate_internal_schema(&mut dataset, root_uri, None).await
+}
+
+/// The on-disk internal-schema stamp of `__manifest` at `branch` (main when
+/// `None`). The transitional v3-read fallback in `CommitGraph` uses this to
+/// decide whether to source lineage from `__manifest` (stamp ≥ v4, post-Phase-7)
+/// or from the legacy `_graph_commits.lance` (stamp < v4, not yet migrated).
+pub(crate) async fn internal_schema_stamp_at(root_uri: &str, branch: Option<&str>) -> Result<u32> {
+    let dataset = open_manifest_dataset(root_uri, branch).await?;
+    Ok(migrations::read_stamp(&dataset))
+}
+
+/// Refuse to open a graph whose `__manifest` is stamped past this binary's known
+/// internal-schema version. The read-only open path calls this (it skips the
+/// write-path migration, which is where the refusal otherwise lives) so an old
+/// binary still refuses a newer graph instead of silently misreading it.
+pub(crate) async fn refuse_if_internal_schema_too_new(root_uri: &str) -> Result<()> {
+    let stamp = internal_schema_stamp_at(root_uri, None).await?;
+    migrations::refuse_if_stamp_too_new(stamp)
+}
+
+/// The internal-schema version this binary writes. Exposed so the v3-read
+/// fallback can compare a branch's on-disk stamp against it.
+pub(crate) const INTERNAL_MANIFEST_SCHEMA_VERSION: u32 =
+    migrations::INTERNAL_MANIFEST_SCHEMA_VERSION;
+
+/// Test-only: create a `__manifest` for a minimal catalog, the first half of a
+/// synthetic pre-Phase-7 (v3) graph (see `commit_graph::seed_legacy_v3_lineage`).
+/// A small two-type schema is enough — the v3→v4 migration touches only the
+/// lineage rows, never the table-version rows.
+#[cfg(test)]
+pub(crate) async fn seed_manifest_for_v3_fixture(root_uri: &str) -> Result<()> {
+    let schema = omnigraph_compiler::schema::parser::parse_schema(
+        "node Person { name: String }\nedge Knows: Person -> Person { }\n",
+    )
+    .map_err(|e| OmniError::manifest(e.to_string()))?;
+    let catalog =
+        omnigraph_compiler::catalog::build_catalog(&schema).map_err(|e| OmniError::manifest(e.to_string()))?;
+    ManifestCoordinator::init(root_uri, &catalog).await?;
+    Ok(())
+}
+
+/// Test-only: strip the `graph_commit`/`graph_head` rows that Phase-7 init folds
+/// into `__manifest`, then rewind the internal-schema stamp to v3 — completing a
+/// synthetic pre-Phase-7 graph whose lineage lives only in `_graph_commits.lance`.
+#[cfg(test)]
+pub(crate) async fn strip_lineage_and_set_v3_stamp_for_fixture(root_uri: &str) -> Result<()> {
+    let mut dataset = open_manifest_dataset(root_uri, None).await?;
+    dataset
+        .delete("object_type = 'graph_commit' OR object_type = 'graph_head'")
+        .await
+        .map_err(|e| OmniError::Lance(e.to_string()))?;
+    // Re-open so the stamp write lands on the post-delete HEAD.
+    let mut dataset = open_manifest_dataset(root_uri, None).await?;
+    migrations::set_stamp_for_test(&mut dataset, 3).await
 }
 
 /// Immutable point-in-time view of the database.

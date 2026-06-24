@@ -105,8 +105,10 @@ impl CommitGraph {
         // branch-management ops (create/delete/list/version) that still target
         // the commit-graph dataset; the actor dataset is only kept for the
         // dual-write append path. The projection-equivalence gate proves this
-        // cache equals the prior `_graph_commits.lance` read.
-        let (commit_by_id, head_commit) = load_commit_cache_from_manifest(root, None).await?;
+        // cache equals the prior `_graph_commits.lance` read. A pre-Phase-7 (v3)
+        // graph not yet migrated falls back to the legacy read — see
+        // `load_commit_cache_for_branch`.
+        let (commit_by_id, head_commit) = load_commit_cache_for_branch(root, None).await?;
         Ok(Self {
             root_uri: root.to_string(),
             dataset,
@@ -132,8 +134,7 @@ impl CommitGraph {
             crate::instrumentation::open_dataset_tracked(&graph_commit_actors_uri(root), wrapper)
                 .await
                 .ok();
-        let (commit_by_id, head_commit) =
-            load_commit_cache_from_manifest(root, Some(branch)).await?;
+        let (commit_by_id, head_commit) = load_commit_cache_for_branch(root, Some(branch)).await?;
         Ok(Self {
             root_uri: root.to_string(),
             dataset,
@@ -165,7 +166,7 @@ impl CommitGraph {
                 .await
                 .ok();
         let (commit_by_id, head_commit) =
-            load_commit_cache_from_manifest(&root, self.active_branch.as_deref()).await?;
+            load_commit_cache_for_branch(&root, self.active_branch.as_deref()).await?;
         self.commit_by_id = commit_by_id;
         self.head_commit = head_commit;
         Ok(())
@@ -511,6 +512,35 @@ fn commits_to_batch(commits: &[GraphCommit]) -> Result<RecordBatch> {
     .map_err(|e| OmniError::Lance(e.to_string()))
 }
 
+/// Build the in-memory commit cache for `branch`, choosing the source by the
+/// branch manifest's internal-schema stamp (RFC-013 step 4 forward/back-compat):
+///
+/// - stamp ≥ v4 (post-Phase-7, the normal case): the `__manifest` lineage
+///   projection — `graph_commit`/`graph_head` rows folded into the publish CAS.
+/// - stamp < v4 (a pre-Phase-7 graph not yet migrated): the legacy
+///   `_graph_commits.lance` read. This is the **transitional v3 fallback** that
+///   lets a READ-ONLY open of an un-migrated graph still see correct history —
+///   a read-only open never runs the v3→v4 backfill (it must not write), so
+///   without this gate it would read an empty DAG from `__manifest`. A
+///   read-write open backfills `__manifest` on its first write and thereafter
+///   takes the projection branch.
+///
+/// Both sources pick the head with `should_replace_head`, so the cache is
+/// identical regardless of which branch is taken. Remove the fallback once no
+/// graph below internal-schema v4 remains.
+async fn load_commit_cache_for_branch(
+    root_uri: &str,
+    branch: Option<&str>,
+) -> Result<(HashMap<String, GraphCommit>, Option<GraphCommit>)> {
+    let stamp = crate::db::manifest::internal_schema_stamp_at(root_uri, branch).await?;
+    if stamp < crate::db::manifest::INTERNAL_MANIFEST_SCHEMA_VERSION {
+        // Transitional: un-migrated v3 graph — read lineage from the legacy
+        // `_graph_commits.lance` so reads (incl. read-only opens) see history.
+        return read_legacy_commit_cache(root_uri, branch).await;
+    }
+    load_commit_cache_from_manifest(root_uri, branch).await
+}
+
 /// Build the in-memory commit cache from the `__manifest` graph-lineage
 /// projection (RFC-013 step 4) rather than `_graph_commits.lance`. The lineage
 /// rows carry the actor inline, so no separate actor-table read is needed. Head
@@ -542,7 +572,49 @@ async fn load_commit_cache_from_manifest(
     Ok((commit_by_id, head_commit))
 }
 
-#[allow(dead_code)]
+/// Read the legacy `_graph_commits.lance` (+ its actor sidecar) for `branch`
+/// into an in-memory cache — the transitional source for graphs not yet
+/// migrated to internal-schema v4 (RFC-013 step 4). Two callers, both
+/// transitional: the v3→v4 migration backfill (which copies these rows into
+/// `__manifest`) and the read-only v3 fallback in `CommitGraph::open*`. Returns
+/// `(commit_by_id, head)`, with the head picked by `should_replace_head` —
+/// identical to the manifest projection. An absent / empty commit dataset
+/// yields an empty cache (no head). This keeps the legacy readers alive while
+/// any v3 graph survives; once no graph is below v4 it can retire.
+pub(crate) async fn read_legacy_commit_cache(
+    root_uri: &str,
+    branch: Option<&str>,
+) -> Result<(HashMap<String, GraphCommit>, Option<GraphCommit>)> {
+    let root = root_uri.trim_end_matches('/');
+    let commits_uri = graph_commits_uri(root);
+    let mut dataset = match Dataset::open(&commits_uri).await {
+        Ok(dataset) => dataset,
+        // No legacy commit dataset at all ⇒ nothing to read.
+        Err(_) => return Ok((HashMap::new(), None)),
+    };
+    if let Some(branch) = branch.filter(|b| *b != "main") {
+        dataset = dataset
+            .checkout_branch(branch)
+            .await
+            .map_err(|e| OmniError::Lance(e.to_string()))?;
+    }
+
+    // The actor sidecar may be absent (older graphs without authored commits);
+    // an empty actor map then leaves every commit's actor `None`. It is read
+    // FLAT (no branch checkout): the pre-Phase-7 commit graph never forked the
+    // actor dataset — actors are keyed by `graph_commit_id` globally — so a
+    // branch's commits resolve their actor from the same single actor table.
+    // This matches the live `CommitGraph::open_at_branch`, which also opens the
+    // actor dataset on main while checking out the branch only on the commits
+    // dataset.
+    let actor_by_commit_id = match Dataset::open(&graph_commit_actors_uri(root)).await {
+        Ok(actor_dataset) => load_commit_actor_cache(&actor_dataset).await?,
+        Err(_) => HashMap::new(),
+    };
+
+    load_commit_cache(&dataset, &actor_by_commit_id).await
+}
+
 async fn load_commit_cache(
     dataset: &Dataset,
     actor_by_commit_id: &HashMap<String, String>,
@@ -573,7 +645,6 @@ async fn load_commit_cache(
     Ok((commit_by_id, head_commit))
 }
 
-#[allow(dead_code)]
 async fn load_commit_actor_cache(dataset: &Dataset) -> Result<HashMap<String, String>> {
     let batches: Vec<RecordBatch> = dataset
         .scan()
@@ -755,6 +826,84 @@ fn now_micros() -> Result<i64> {
     Ok(duration.as_micros() as i64)
 }
 
+/// Identities of the commits written into a synthetic pre-Phase-7 (v3) graph by
+/// [`seed_legacy_v3_lineage`], for assertions after migration.
+#[cfg(test)]
+#[derive(Debug, Clone)]
+pub struct V3LineageFixture {
+    /// The genesis (parentless) commit id.
+    pub genesis: String,
+    /// A direct, authored commit on main (actor `act-a`).
+    pub commit_a: String,
+    /// A commit tagged to the `feature` branch (actor `act-feature`).
+    pub feature_commit: String,
+    /// The merge commit on main: parent = `commit_a`, merged_parent =
+    /// `feature_commit`, actor `act-merger`. This is the head of main.
+    pub merge_commit: String,
+    /// Every commit id written, in append order (for count assertions).
+    pub all_ids: Vec<String>,
+}
+
+/// Build a synthetic pre-Phase-7 (internal-schema v3) graph at `root_uri`: graph
+/// lineage lives ONLY in `_graph_commits.lance` (+ its actor sidecar), `__manifest`
+/// carries NO `graph_commit`/`graph_head` rows, and the stamp is set to v3. This
+/// reproduces exactly the on-disk shape a graph created by a pre-RFC-013-Phase-7
+/// binary would have, so the v3→v4 migration and the v3-read fallback can be
+/// tested against it.
+///
+/// The lineage is a realistic DAG with a branch + a real merge: genesis → A →
+/// (feature commit, off to the side) → merge(A, feature) at the head of main,
+/// with authored actors on the non-genesis commits. Reaches the dead-on-the-
+/// write-path `append_commit_with_parents`/`append_actor` (still present for
+/// exactly this transitional purpose) to write the legacy rows.
+#[cfg(test)]
+pub async fn seed_legacy_v3_lineage(root_uri: &str) -> Result<V3LineageFixture> {
+    let root = root_uri.trim_end_matches('/');
+
+    // 1. Create `__manifest` (Phase-7 folds genesis lineage into it) and the
+    //    EMPTY legacy `_graph_commits.lance`. We then append the v3-style commit
+    //    rows below — a real v3 graph carried its genesis in `_graph_commits`.
+    crate::db::manifest::seed_manifest_for_v3_fixture(root).await?;
+    let mut cg = CommitGraph::init(root).await?;
+    // Clear the cache that init seeded from the (genesis-bearing) manifest, so
+    // the appended rows below are the whole story and parents come out right.
+    cg.commit_by_id.clear();
+    cg.head_commit = None;
+
+    // 2. Append the legacy lineage to `_graph_commits.lance` on main.
+    let genesis = cg
+        .append_commit_with_parents(None, 1, None, None, None)
+        .await?;
+    let commit_a = cg
+        .append_commit_with_parents(None, 2, Some(&genesis), None, Some("act-a"))
+        .await?;
+    let feature_commit = cg
+        .append_commit_with_parents(Some("feature"), 3, Some(&commit_a), None, Some("act-feature"))
+        .await?;
+    let merge_commit = cg
+        .append_commit_with_parents(
+            None,
+            4,
+            Some(&commit_a),
+            Some(&feature_commit),
+            Some("act-merger"),
+        )
+        .await?;
+
+    // 3. Strip the genesis lineage rows the Phase-7 init folded into `__manifest`
+    //    and rewind the stamp to v3, so the manifest matches a true pre-Phase-7
+    //    graph (no lineage in `__manifest`, stamp v3).
+    crate::db::manifest::strip_lineage_and_set_v3_stamp_for_fixture(root).await?;
+
+    Ok(V3LineageFixture {
+        genesis: genesis.clone(),
+        commit_a: commit_a.clone(),
+        feature_commit: feature_commit.clone(),
+        merge_commit: merge_commit.clone(),
+        all_ids: vec![genesis, commit_a, feature_commit, merge_commit],
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use std::sync::Arc;
@@ -762,6 +911,76 @@ mod tests {
     use arrow_schema::{DataType, Field, Schema};
 
     use super::*;
+
+    // RFC-013 step 4: the v3-read fallback / migration source reads a NAMED
+    // branch's lineage from a real Lance branch on `_graph_commits.lance`, while
+    // resolving actors from the FLAT actor table (the pre-Phase-7 commit graph
+    // forked only the commits dataset, never the actor sidecar). This guards
+    // both that branch-checkout path and the flat-actor resolution — the case
+    // the main-branch fixture (commits on main only) does not exercise.
+    #[tokio::test]
+    async fn read_legacy_commit_cache_resolves_branch_commits_with_flat_actors() {
+        let dir = tempfile::tempdir().unwrap();
+        let uri = dir.path().to_str().unwrap();
+
+        // A v3 graph needs `__manifest` to exist for `CommitGraph::init`'s
+        // genesis-cache seed; we clear that cache and write our own legacy rows.
+        crate::db::manifest::seed_manifest_for_v3_fixture(uri)
+            .await
+            .unwrap();
+        let mut cg = CommitGraph::init(uri).await.unwrap();
+        cg.commit_by_id.clear();
+        cg.head_commit = None;
+
+        // Main lineage: genesis → A (authored). The actor lands in the FLAT
+        // `_graph_commit_actors.lance` (never branched).
+        let genesis = cg
+            .append_commit_with_parents(None, 1, None, None, None)
+            .await
+            .unwrap();
+        let commit_a = cg
+            .append_commit_with_parents(None, 2, Some(&genesis), None, Some("act-a"))
+            .await
+            .unwrap();
+
+        // Fork a real Lance branch on `_graph_commits.lance`, switch the handle
+        // to it, and append an authored branch commit (its actor also goes to
+        // the flat main actor table — exactly the pre-Phase-7 shape).
+        cg.create_branch("feature").await.unwrap();
+        cg.dataset = cg.dataset.checkout_branch("feature").await.unwrap();
+        cg.active_branch = Some("feature".to_string());
+        let branch_commit = cg
+            .append_commit_with_parents(
+                Some("feature"),
+                3,
+                Some(&commit_a),
+                None,
+                Some("act-branch"),
+            )
+            .await
+            .unwrap();
+
+        // The legacy read at the branch sees the inherited main commits + the
+        // branch commit, the head is the branch commit, and the authored actors
+        // resolve from the flat table (no branch checkout on the actor dataset).
+        let (commits, head) = read_legacy_commit_cache(uri, Some("feature")).await.unwrap();
+        assert_eq!(commits.len(), 3, "branch inherits genesis + A + its own commit");
+        assert_eq!(
+            head.as_ref().unwrap().graph_commit_id,
+            branch_commit,
+            "the branch commit is the head"
+        );
+        assert_eq!(
+            commits.get(&commit_a).unwrap().actor_id.as_deref(),
+            Some("act-a"),
+            "main commit's actor resolves from the flat actor table",
+        );
+        assert_eq!(
+            commits.get(&branch_commit).unwrap().actor_id.as_deref(),
+            Some("act-branch"),
+            "branch commit's actor resolves from the flat actor table",
+        );
+    }
 
     #[test]
     fn load_commits_from_batches_returns_error_for_bad_schema() {

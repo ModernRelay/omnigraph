@@ -1631,3 +1631,231 @@ fn manifest_column_helpers_return_error_for_bad_schema() {
     let err = string_column(&batch, "table_key").unwrap_err();
     assert!(err.to_string().contains("table_key"));
 }
+
+// ── RFC-013 Phase 7 stage 4: existing-graph (v3 → v4) lineage migration ──────
+//
+// A graph created by a pre-Phase-7 binary (internal schema v3) keeps its
+// lineage in `_graph_commits.lance`, with NONE in `__manifest`. The new binary
+// reads lineage from the `__manifest` projection, so without a migration it
+// would see an EMPTY commit DAG. These tests pin the backfill (`migrate_v3_to_v4`),
+// its idempotency, the transitional v3-read fallback, the read-only refusal, and
+// the crash-mid-migration recovery.
+
+use crate::db::commit_graph::{CommitGraph, seed_legacy_v3_lineage};
+
+/// Number of `graph_commit` rows in `__manifest` at main.
+async fn manifest_commit_row_count(uri: &str) -> usize {
+    let ds = open_manifest_dataset(uri, None).await.unwrap();
+    let (rows, _heads) = read_graph_lineage(&ds).await.unwrap();
+    rows.len()
+}
+
+#[tokio::test]
+async fn v3_graph_backfills_lineage_into_manifest_on_read_write_open() {
+    let dir = tempfile::tempdir().unwrap();
+    let uri = dir.path().to_str().unwrap();
+
+    let fixture = seed_legacy_v3_lineage(uri).await.unwrap();
+
+    // Precondition: a true v3 graph — stamp 3, NO lineage rows in `__manifest`,
+    // and a NEW-binary projection therefore reads an empty DAG.
+    {
+        let ds = open_manifest_dataset(uri, None).await.unwrap();
+        assert_eq!(super::migrations::read_stamp(&ds), 3, "fixture is stamped v3");
+    }
+    assert_eq!(
+        manifest_commit_row_count(uri).await,
+        0,
+        "precondition: __manifest carries no graph_commit rows in a v3 graph",
+    );
+
+    // Run the production read-write migration entry point (main branch).
+    super::migrate_on_open(uri).await.unwrap();
+
+    // The manifest now carries the lineage and is stamped at the current version.
+    {
+        let ds = open_manifest_dataset(uri, None).await.unwrap();
+        assert_eq!(
+            super::migrations::read_stamp(&ds),
+            super::migrations::INTERNAL_MANIFEST_SCHEMA_VERSION,
+            "migration stamps the manifest at the current internal schema version",
+        );
+    }
+    // 4 commits (genesis, A, feature, merge) → 4 `graph_commit` rows.
+    assert_eq!(
+        manifest_commit_row_count(uri).await,
+        fixture.all_ids.len(),
+        "every legacy commit is backfilled into __manifest",
+    );
+
+    // The commit-graph projection (now sourced from __manifest) reconstructs the
+    // full DAG: every old id resolves, parents/merge parents are connected, the
+    // merge commit's actor + two parents survive, and the head is the merge.
+    let cg = CommitGraph::open(uri).await.unwrap();
+    let commits = cg.load_commits().await.unwrap();
+    assert_eq!(commits.len(), fixture.all_ids.len());
+    for id in &fixture.all_ids {
+        assert!(
+            cg.get_commit(id).is_some(),
+            "old commit id {id} must still resolve after migration",
+        );
+    }
+
+    let genesis = cg.get_commit(&fixture.genesis).unwrap();
+    assert!(genesis.parent_commit_id.is_none(), "genesis is parentless");
+    assert!(genesis.actor_id.is_none(), "genesis is actorless");
+
+    let commit_a = cg.get_commit(&fixture.commit_a).unwrap();
+    assert_eq!(commit_a.parent_commit_id.as_deref(), Some(fixture.genesis.as_str()));
+    assert_eq!(commit_a.actor_id.as_deref(), Some("act-a"), "actor backfilled inline");
+
+    let merge = cg.get_commit(&fixture.merge_commit).unwrap();
+    assert_eq!(merge.parent_commit_id.as_deref(), Some(fixture.commit_a.as_str()));
+    assert_eq!(
+        merge.merged_parent_commit_id.as_deref(),
+        Some(fixture.feature_commit.as_str()),
+        "the merge commit keeps both parents",
+    );
+    assert_eq!(merge.actor_id.as_deref(), Some("act-merger"));
+
+    assert_eq!(
+        cg.head_commit_id().await.unwrap().as_deref(),
+        Some(fixture.merge_commit.as_str()),
+        "the merge commit is the head of main after migration",
+    );
+
+    // merge_base of main vs main is reflexively the head — a smoke check that the
+    // ancestor walk works over the backfilled DAG.
+    let base = CommitGraph::merge_base(uri, None, None).await.unwrap();
+    assert!(base.is_some(), "merge_base resolves over the backfilled DAG");
+}
+
+#[tokio::test]
+async fn v3_to_v4_migration_is_idempotent() {
+    let dir = tempfile::tempdir().unwrap();
+    let uri = dir.path().to_str().unwrap();
+    let fixture = seed_legacy_v3_lineage(uri).await.unwrap();
+
+    super::migrate_on_open(uri).await.unwrap();
+    let after_first = manifest_commit_row_count(uri).await;
+    // Re-running the migration must not duplicate any rows.
+    super::migrate_on_open(uri).await.unwrap();
+    let after_second = manifest_commit_row_count(uri).await;
+
+    assert_eq!(after_first, fixture.all_ids.len());
+    assert_eq!(
+        after_first, after_second,
+        "a second migration pass adds no duplicate graph_commit rows",
+    );
+}
+
+#[tokio::test]
+async fn v3_graph_reads_history_via_fallback_without_migrating() {
+    let dir = tempfile::tempdir().unwrap();
+    let uri = dir.path().to_str().unwrap();
+    let fixture = seed_legacy_v3_lineage(uri).await.unwrap();
+
+    // Open the commit-graph projection WITHOUT running the migration (this is the
+    // read-only path: `CommitGraph::open` reads, never writes). The stamp-gated
+    // fallback sources lineage from `_graph_commits.lance`, so history is correct.
+    let cg = CommitGraph::open(uri).await.unwrap();
+    let commits = cg.load_commits().await.unwrap();
+    assert_eq!(
+        commits.len(),
+        fixture.all_ids.len(),
+        "the v3 fallback reads the full legacy DAG with no migration",
+    );
+    assert_eq!(
+        cg.head_commit_id().await.unwrap().as_deref(),
+        Some(fixture.merge_commit.as_str()),
+    );
+
+    // The fallback is read-only: stamp stays v3, __manifest still has no lineage.
+    {
+        let ds = open_manifest_dataset(uri, None).await.unwrap();
+        assert_eq!(super::migrations::read_stamp(&ds), 3, "fallback did not write");
+    }
+    assert_eq!(
+        manifest_commit_row_count(uri).await,
+        0,
+        "the read-only fallback writes nothing to __manifest",
+    );
+}
+
+#[tokio::test]
+async fn future_stamp_is_refused_in_both_open_modes() {
+    use crate::db::{Omnigraph, OpenMode};
+    use crate::storage::storage_for_uri;
+
+    let dir = tempfile::tempdir().unwrap();
+    let uri = dir.path().to_str().unwrap();
+    // A full graph (schema artifacts present) so `Omnigraph::open*` gets past its
+    // schema read to the stamp check.
+    Omnigraph::init(uri, "node Person { name: String }\n")
+        .await
+        .unwrap();
+
+    // Stamp past this binary's known version.
+    {
+        let mut ds = open_manifest_dataset(uri, None).await.unwrap();
+        ds.update_schema_metadata([(
+            "omnigraph:internal_schema_version".to_string(),
+            Some("5".to_string()),
+        )])
+        .await
+        .unwrap();
+    }
+
+    let storage = storage_for_uri(uri).unwrap();
+    for mode in [OpenMode::ReadWrite, OpenMode::ReadOnly] {
+        // `Omnigraph` is not `Debug`, so match instead of `expect_err`.
+        let err = match Omnigraph::open_with_storage_and_mode(uri, Arc::clone(&storage), mode).await
+        {
+            Ok(_) => panic!("{mode:?}: a future-stamped graph must be refused"),
+            Err(err) => err,
+        };
+        assert!(
+            err.to_string().contains("upgrade omnigraph"),
+            "{mode:?}: expected an upgrade-omnigraph refusal, got: {err}",
+        );
+    }
+}
+
+#[tokio::test]
+async fn crash_after_merge_before_stamp_completes_on_next_open() {
+    let dir = tempfile::tempdir().unwrap();
+    let uri = dir.path().to_str().unwrap();
+    let fixture = seed_legacy_v3_lineage(uri).await.unwrap();
+
+    // Simulate a crash that landed the lineage merge but lost the stamp bump:
+    // run the full migration (lineage now in __manifest), then rewind the stamp
+    // to v3. This is exactly the on-disk state after a crash at the
+    // `migration.v3_to_v4.after_merge_before_stamp` window.
+    super::migrate_on_open(uri).await.unwrap();
+    {
+        let mut ds = open_manifest_dataset(uri, None).await.unwrap();
+        super::migrations::set_stamp_for_test(&mut ds, 3).await.unwrap();
+    }
+    assert_eq!(
+        manifest_commit_row_count(uri).await,
+        fixture.all_ids.len(),
+        "crash state: lineage present, stamp rewound to v3",
+    );
+
+    // The next open re-enters at v3; the idempotency guard sees the lineage and
+    // skips straight to the stamp bump — no duplicate rows, migration completes.
+    super::migrate_on_open(uri).await.unwrap();
+    {
+        let ds = open_manifest_dataset(uri, None).await.unwrap();
+        assert_eq!(
+            super::migrations::read_stamp(&ds),
+            super::migrations::INTERNAL_MANIFEST_SCHEMA_VERSION,
+            "the re-entered migration completes the stamp bump",
+        );
+    }
+    assert_eq!(
+        manifest_commit_row_count(uri).await,
+        fixture.all_ids.len(),
+        "re-running over an already-merged manifest adds no duplicate rows",
+    );
+}
