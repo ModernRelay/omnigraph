@@ -30,5 +30,6 @@ tokio = { workspace = true }
 ulid = { workspace = true }
 
 [dev-dependencies]
+serial_test = "3"
 tempfile = { workspace = true }
 tokio = { workspace = true }

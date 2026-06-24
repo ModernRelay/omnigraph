@@ -625,7 +625,7 @@ async fn load_jsonl_reader<R: BufRead>(
     // staged commits have advanced Lance HEAD, but the manifest
     // publish has not run yet. Reuse the mutation failpoint name so
     // one failpoint pins the shared `MutationStaging` boundary.
-    crate::failpoints::maybe_fail("mutation.post_finalize_pre_publisher")?;
+    crate::failpoints::maybe_fail(crate::failpoints::names::MUTATION_POST_FINALIZE_PRE_PUBLISHER)?;
     db.commit_updates_on_branch_with_expected(
         branch,
         &updates,

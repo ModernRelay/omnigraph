@@ -512,7 +512,7 @@ async fn optimize_one_table(
 
         // Test seam: a concurrent (cross-process) writer can interleave here, before
         // any Phase-B commit lands, to exercise the reopen+replan path.
-        crate::failpoints::maybe_fail("optimize.before_compact")?;
+        crate::failpoints::maybe_fail(crate::failpoints::names::OPTIMIZE_BEFORE_COMPACT)?;
 
         // Phase B: scrub stale auto_cleanup (keeps optimize non-destructive on a
         // graph upgraded from a pre-v7 binary whose `compact_files`/`optimize_indices`
@@ -549,7 +549,7 @@ async fn optimize_one_table(
         // committed (so HEAD is already ahead of the manifest from our own work),
         // exercising the own-HEAD (not external) drift classification on the next
         // reopened attempt.
-        if crate::failpoints::maybe_fail("optimize.inject_reindex_conflict").is_err()
+        if crate::failpoints::maybe_fail(crate::failpoints::names::OPTIMIZE_INJECT_REINDEX_CONFLICT).is_err()
             && attempt < COMPACTION_RETRY_BUDGET
         {
             continue;
@@ -584,7 +584,7 @@ async fn optimize_one_table(
 
     // Pin the per-writer Phase B → Phase C residual: Lance HEAD has advanced but the
     // manifest publish below hasn't run.
-    crate::failpoints::maybe_fail("optimize.post_phase_b_pre_manifest_commit")?;
+    crate::failpoints::maybe_fail(crate::failpoints::names::OPTIMIZE_POST_PHASE_B_PRE_MANIFEST_COMMIT)?;
 
     // Phase C: monotonic fast-forward publish. The compaction is committed at Lance
     // HEAD `N`; publish a manifest pointer that includes it. If a concurrent writer
@@ -921,7 +921,7 @@ pub async fn cleanup_all_tables(
     let results: Vec<TableCleanupStats> = futures::stream::iter(table_tasks.into_iter())
         .map(|(table_key, full_path)| async move {
             let outcome: Result<RemovalStats> = async {
-                crate::failpoints::maybe_fail("cleanup.table_gc")?;
+                crate::failpoints::maybe_fail(crate::failpoints::names::CLEANUP_TABLE_GC)?;
                 // `cleanup_old_versions` is a Lance-only maintenance API not
                 // surfaced through `TableStorage` — see the optimize path
                 // above for the same rationale. Unwrap via `into_dataset()`.
@@ -1079,7 +1079,7 @@ pub async fn reconcile_orphaned_branches(db: &Omnigraph) -> Result<BranchReconci
                 }
                 if !branch_snapshots.contains_key(&branch) {
                     let branch_snapshot =
-                        match crate::failpoints::maybe_fail("cleanup.resolve_branch_snapshot") {
+                        match crate::failpoints::maybe_fail(crate::failpoints::names::CLEANUP_RESOLVE_BRANCH_SNAPSHOT) {
                             Ok(()) => db.snapshot_for_branch(Some(&branch)).await,
                             Err(injected) => Err(injected),
                         };
@@ -1158,7 +1158,7 @@ pub async fn reconcile_orphaned_branches(db: &Omnigraph) -> Result<BranchReconci
                     continue;
                 }
             }
-            let outcome = match crate::failpoints::maybe_fail("cleanup.reconcile_fork") {
+            let outcome = match crate::failpoints::maybe_fail(crate::failpoints::names::CLEANUP_RECONCILE_FORK) {
                 Ok(()) => storage.force_delete_branch(&full_path, &branch).await,
                 Err(injected) => Err(injected),
             };
@@ -1308,7 +1308,10 @@ mod tests {
             ds.create_branch("feature", base, None).await.unwrap();
         }
 
-        let _fp = ScopedFailPoint::new("cleanup.resolve_branch_snapshot", "return");
+        let _fp = ScopedFailPoint::new(
+            crate::failpoints::names::CLEANUP_RESOLVE_BRANCH_SNAPSHOT,
+            "return",
+        );
         let stats = reconcile_orphaned_branches(&db).await.unwrap();
 
         assert_eq!(

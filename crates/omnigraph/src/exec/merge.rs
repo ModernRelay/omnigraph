@@ -1128,7 +1128,7 @@ async fn publish_rewritten_merge_table(
     // rows are on Lance HEAD but the delete has not committed and the
     // achieved-version intent has not been recorded, so recovery must roll BACK.
     // See tests/failpoints.rs::branch_merge_rewrite_partial_after_merge_rolls_back.
-    crate::failpoints::maybe_fail("branch_merge.rewrite_after_merge_pre_delete")?;
+    crate::failpoints::maybe_fail(crate::failpoints::names::BRANCH_MERGE_REWRITE_AFTER_MERGE_PRE_DELETE)?;
 
     // Phase 2: delete removed rows via deletion vectors.
     //
@@ -1159,7 +1159,7 @@ async fn publish_rewritten_merge_table(
     // recorded, so recovery must roll BACK (the index is reconciler-owned derived
     // state, but the merge itself never reached its commit boundary). See
     // tests/failpoints.rs::branch_merge_rewrite_partial_after_delete_rolls_back.
-    crate::failpoints::maybe_fail("branch_merge.rewrite_after_delete_pre_index")?;
+    crate::failpoints::maybe_fail(crate::failpoints::names::BRANCH_MERGE_REWRITE_AFTER_DELETE_PRE_INDEX)?;
 
     // Phase 3: rebuild indices.
     //
@@ -1276,7 +1276,7 @@ async fn publish_adopted_delta(
     // have not committed and the achieved-version intent has not been recorded, so
     // recovery must roll BACK (not publish the appends-only state). See
     // tests/failpoints.rs::branch_merge_adopt_partial_after_append_rolls_back.
-    crate::failpoints::maybe_fail("branch_merge.adopt_after_append_pre_upsert")?;
+    crate::failpoints::maybe_fail(crate::failpoints::names::BRANCH_MERGE_ADOPT_AFTER_APPEND_PRE_UPSERT)?;
 
     // Phase 1b: upsert the CHANGED rows. The merge_insert hash join is now
     // bounded to the genuinely-changed set, not the whole delta. It runs against
@@ -1308,7 +1308,7 @@ async fn publish_adopted_delta(
     // has not committed and the achieved-version intent has not been recorded, so
     // recovery must roll BACK. See
     // tests/failpoints.rs::branch_merge_adopt_partial_after_upsert_rolls_back.
-    crate::failpoints::maybe_fail("branch_merge.adopt_after_upsert_pre_delete")?;
+    crate::failpoints::maybe_fail(crate::failpoints::names::BRANCH_MERGE_ADOPT_AFTER_UPSERT_PRE_DELETE)?;
 
     // Phase 2: delete removed rows via deletion vectors (inline-commit residual,
     // same as the three-way path until Lance ships a public two-phase delete).
@@ -1793,7 +1793,7 @@ impl Omnigraph {
         // (publish_*) AND the sidecar is confirmed, but the manifest publish
         // below hasn't run — so recovery rolls FORWARD. Used by
         // `tests/failpoints.rs::branch_merge_phase_b_failure_recovered_on_next_open`.
-        crate::failpoints::maybe_fail("branch_merge.post_phase_b_pre_manifest_commit")?;
+        crate::failpoints::maybe_fail(crate::failpoints::names::BRANCH_MERGE_POST_PHASE_B_PRE_MANIFEST_COMMIT)?;
 
         let manifest_version = if updates.is_empty() {
             self.version().await

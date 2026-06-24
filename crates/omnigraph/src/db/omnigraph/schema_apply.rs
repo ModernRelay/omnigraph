@@ -648,7 +648,7 @@ where
     // `recover_schema_state_files`:
     //   - crash before commit  → manifest unchanged; staging deleted on open
     //   - crash after commit   → manifest advanced; staging renamed on open
-    crate::failpoints::maybe_fail("schema_apply.before_staging_write")?;
+    crate::failpoints::maybe_fail(crate::failpoints::names::SCHEMA_APPLY_BEFORE_STAGING_WRITE)?;
 
     let staging_pg_uri = schema_source_staging_uri(&db.root_uri);
     db.storage
@@ -656,7 +656,7 @@ where
         .await?;
     write_schema_contract_staging(&db.root_uri, db.storage.as_ref(), &desired_ir).await?;
 
-    crate::failpoints::maybe_fail("schema_apply.after_staging_write")?;
+    crate::failpoints::maybe_fail(crate::failpoints::names::SCHEMA_APPLY_AFTER_STAGING_WRITE)?;
 
     // `apply_schema` doesn't currently take an actor; system-attributed.
     let PublishedSnapshot {
@@ -669,7 +669,7 @@ where
         .commit_changes_with_actor(&manifest_changes, None)
         .await?;
 
-    crate::failpoints::maybe_fail("schema_apply.after_manifest_commit")?;
+    crate::failpoints::maybe_fail(crate::failpoints::names::SCHEMA_APPLY_AFTER_MANIFEST_COMMIT)?;
 
     db.storage
         .rename_text(&staging_pg_uri, &schema_source_uri(&db.root_uri))
