@@ -86,6 +86,28 @@ async fn lance_error_too_much_write_contention_variant_exists() {
     );
 }
 
+// --- Guard 1a: LanceError::IncompatibleTransaction variant exists ----------
+//
+// `db/manifest/migrations.rs::commit_v4_stamp_idempotently` pattern-matches on
+// this variant: two concurrent v3→v4 runners both bump the internal-schema stamp
+// (an `UpdateConfig` commit on the same metadata key), and the loser gets
+// `IncompatibleTransaction`. Since both write the same value the conflict is
+// benign and is retried idempotently. If Lance renames the variant or removes the
+// builder, the match silently stops catching the conflict — this guard fails to
+// force an update.
+
+#[tokio::test]
+async fn lance_error_incompatible_transaction_variant_exists() {
+    let err =
+        lance::Error::incompatible_transaction_source("concurrent UpdateConfig at version N".into());
+    assert!(
+        matches!(err, lance::Error::IncompatibleTransaction { .. }),
+        "Lance::Error::IncompatibleTransaction variant missing or renamed; \
+         update db/manifest/migrations.rs::commit_v4_stamp_idempotently and \
+         this guard, then re-pin docs/dev/lance.md."
+    );
+}
+
 // --- Guard 1b: Dataset::open on a missing path returns a not-found variant --
 //
 // `db/commit_graph.rs::read_legacy_commit_cache` (the v3→v4 lineage migration

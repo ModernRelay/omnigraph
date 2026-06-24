@@ -257,32 +257,146 @@ async fn migrate_v2_to_v3(dataset: &mut Dataset) -> Result<()> {
 /// here at v3 and re-runs harmlessly. As a fast path, if `__manifest` already
 /// carries `graph_commit` rows (a previous run completed the merge), we skip
 /// straight to the stamp bump.
+///
+/// Concurrent runners: two processes (or two open-for-write handles) can open the
+/// same legacy graph at once and both reach the backfill merge. `merge_lineage_rows`
+/// uses `conflict_retries(0)`, so the row-level CAS loser on `graph_head:<branch>`
+/// must be re-driven here rather than failing the open — `migrate_v2_to_v3` is
+/// concurrent-runner idempotent and this step must be too. The bounded loop
+/// re-reads the fast path (a concurrent winner's merge is one atomic Lance commit,
+/// so a re-read sees either zero or all of its rows, never partial), re-opens the
+/// stale handle past the winner's commit, and retries. On budget exhaustion it
+/// returns a `RowLevelCasContention`-typed error so the publisher's OUTER retry
+/// loop (which only re-runs `is_retryable_publish_conflict` conflicts) completes
+/// it on the next attempt — the same converge-on-next-attempt contract the
+/// recovery sweep uses.
 async fn migrate_v3_to_v4(
     dataset: &mut Dataset,
     root_uri: &str,
     branch: Option<&str>,
 ) -> Result<()> {
-    // Fast path / idempotency guard: if the backfill already landed (commit rows
-    // present in `__manifest`), don't re-read or re-merge — just (re)stamp.
-    let (existing_lineage, _heads) = read_graph_lineage(dataset).await?;
-    if !existing_lineage.is_empty() {
-        return set_stamp(dataset, 4).await;
+    // Mirror the publisher's budget (`publisher::PUBLISHER_RETRY_BUDGET = 5`); kept
+    // as a local const rather than re-exporting that private one — the two are the
+    // same shape (bounded row-level-CAS retries) but independent knobs.
+    const MIGRATION_MERGE_RETRY_BUDGET: u32 = 5;
+
+    for attempt in 0..=MIGRATION_MERGE_RETRY_BUDGET {
+        // Fast path / idempotency + concurrent-winner guard: if the backfill
+        // already landed (a previous run, OR a concurrent runner that won the CAS
+        // — its merge is atomic, so this is all-or-nothing), don't re-merge — just
+        // (re)stamp. `dataset` is re-opened past any winner's commit below, so this
+        // re-read sees the winner's rows on a retry.
+        let (existing_lineage, _heads) = read_graph_lineage(dataset).await?;
+        if !existing_lineage.is_empty() {
+            return commit_v4_stamp_idempotently(dataset, root_uri, branch).await;
+        }
+
+        // Read this branch's legacy commit cache (commits + the head). An absent or
+        // empty `_graph_commits.lance` yields no commits — nothing to backfill.
+        let (commit_by_id, head) =
+            crate::db::commit_graph::read_legacy_commit_cache(root_uri, branch).await?;
+        if commit_by_id.is_empty() {
+            return commit_v4_stamp_idempotently(dataset, root_uri, branch).await;
+        }
+
+        let parts = build_lineage_backfill_parts(&commit_by_id, head.as_ref(), branch)?;
+
+        match merge_lineage_rows(dataset.clone(), &parts).await {
+            Ok(new_dataset) => {
+                *dataset = new_dataset;
+                // Stamp LAST. Crash window: a failure between the merge above and
+                // this stamp bump leaves stamp v3 + lineage present in `__manifest`.
+                // The next open re-enters at v3, the fast path at the top sees the
+                // lineage and skips straight to the stamp bump — completing the
+                // migration with no duplicate rows (the merge is keyed on
+                // `object_id`). Pinned by
+                // `crash_after_merge_before_stamp_completes_on_next_open`.
+                return commit_v4_stamp_idempotently(dataset, root_uri, branch).await;
+            }
+            // A concurrent runner won the `graph_head:<branch>` CAS. Our in-hand
+            // handle is stale at the pre-contention HEAD, so a re-open is required
+            // to see the winner's commit; then re-loop (the fast path will see the
+            // winner's lineage and stamp). Bounded by the budget.
+            Err(err)
+                if attempt < MIGRATION_MERGE_RETRY_BUDGET
+                    && super::publisher::is_retryable_publish_conflict(&err) =>
+            {
+                *dataset = super::layout::open_manifest_dataset(root_uri, branch).await?;
+                continue;
+            }
+            Err(err) => return Err(err),
+        }
     }
 
-    // Read this branch's legacy commit cache (commits + the head). An absent or
-    // empty `_graph_commits.lance` yields no commits — nothing to backfill.
-    let (commit_by_id, head) =
-        crate::db::commit_graph::read_legacy_commit_cache(root_uri, branch).await?;
-    if commit_by_id.is_empty() {
-        return set_stamp(dataset, 4).await;
+    // Budget exhausted under sustained contention. Return a CAS-typed error (not a
+    // plain conflict) so the publisher's outer retry loop — which only re-runs
+    // `is_retryable_publish_conflict` — re-runs `load_publish_state` and completes
+    // the migration, rather than giving up.
+    Err(OmniError::manifest_row_level_cas_contention(format!(
+        "v3→v4 lineage backfill exhausted {} retries against concurrent runners",
+        MIGRATION_MERGE_RETRY_BUDGET
+    )))
+}
+
+/// Stamp the v3→v4 migration's terminal version idempotently under concurrent
+/// runners. `set_stamp` issues an `UpdateConfig` Lance commit; once the merge CAS
+/// loser is made to converge (above), BOTH runners reach this stamp bump and race
+/// it — the loser gets `lance::Error::IncompatibleTransaction` (two `UpdateConfig`
+/// commits touching the same metadata key), which is NOT a row-level CAS
+/// contention and so is not caught by the merge loop. But both write the SAME
+/// value, so the conflict is benign: re-open and, if the stamp already reached the
+/// target (the concurrent runner finished it), succeed; otherwise re-apply.
+/// Bounded; on exhaustion surface a CAS-typed error for the publisher's outer
+/// retry, same as the merge loop.
+async fn commit_v4_stamp_idempotently(
+    dataset: &mut Dataset,
+    root_uri: &str,
+    branch: Option<&str>,
+) -> Result<()> {
+    const STAMP_RETRY_BUDGET: u32 = 5;
+    for attempt in 0..=STAMP_RETRY_BUDGET {
+        // Inline the `update_schema_metadata` write (rather than `set_stamp`) so the
+        // raw Lance error variant is in hand — `set_stamp` pre-stringifies it.
+        match dataset
+            .update_schema_metadata([(
+                INTERNAL_SCHEMA_VERSION_KEY.to_string(),
+                INTERNAL_MANIFEST_SCHEMA_VERSION.to_string(),
+            )])
+            .await
+        {
+            Ok(_) => return Ok(()),
+            Err(lance::Error::IncompatibleTransaction { .. }) if attempt < STAMP_RETRY_BUDGET => {
+                // A concurrent runner's `UpdateConfig` preempted ours. Re-open past
+                // its commit; if it already stamped to the target, we're done (the
+                // value is identical), else re-apply on the advanced handle.
+                *dataset = super::layout::open_manifest_dataset(root_uri, branch).await?;
+                if read_stamp(dataset) >= INTERNAL_MANIFEST_SCHEMA_VERSION {
+                    return Ok(());
+                }
+                continue;
+            }
+            Err(e) => return Err(OmniError::Lance(e.to_string())),
+        }
     }
 
-    // Build the manifest rows: one immutable `graph_commit` row per commit, plus
-    // EXACTLY ONE `graph_head:<branch>` row for the actual head. Each commit
-    // encodes to a [graph_commit, graph_head] pair, but only the head commit's
-    // head row is kept — the others would be redundant updates of the same
-    // `graph_head:<branch>` object_id (the head is per-branch, not per-commit).
-    let head_id = head.as_ref().map(|h| h.graph_commit_id.as_str());
+    Err(OmniError::manifest_row_level_cas_contention(format!(
+        "v3→v4 stamp bump exhausted {} retries against concurrent runners",
+        STAMP_RETRY_BUDGET
+    )))
+}
+
+/// Build the `__manifest` rows for the v3→v4 backfill: one immutable
+/// `graph_commit` row per commit, plus EXACTLY ONE `graph_head:<branch>` row for
+/// the actual head. Each commit encodes to a `[graph_commit, graph_head]` pair,
+/// but only the head commit's head row is kept — the others would be redundant
+/// updates of the same `graph_head:<branch>` object_id (the head is per-branch,
+/// not per-commit).
+fn build_lineage_backfill_parts(
+    commit_by_id: &std::collections::HashMap<String, GraphCommit>,
+    head: Option<&GraphCommit>,
+    branch: Option<&str>,
+) -> Result<Vec<super::state::GraphLineageRowPart>> {
+    let head_id = head.map(|h| h.graph_commit_id.as_str());
     // Deterministic iteration order (the source is a HashMap): merge-insert is
     // keyed on `object_id` so the final manifest content is order-independent,
     // but a stable order keeps the produced batch reproducible regardless.
@@ -305,15 +419,7 @@ async fn migrate_v3_to_v4(
             parts.push(head_part);
         }
     }
-
-    *dataset = merge_lineage_rows(dataset.clone(), &parts).await?;
-    // Stamp LAST. Crash window: a failure between the merge above and this stamp
-    // bump leaves stamp v3 + lineage present in `__manifest`. The next open
-    // re-enters at v3, the idempotency guard at the top of this fn sees the
-    // lineage and skips straight to the stamp bump — completing the migration
-    // with no duplicate rows (the merge is keyed on `object_id`). Pinned by
-    // `crash_after_merge_before_stamp_completes_on_next_open`.
-    set_stamp(dataset, 4).await
+    Ok(parts)
 }
 
 async fn set_stamp(dataset: &mut Dataset, version: u32) -> Result<()> {
