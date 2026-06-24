@@ -4438,3 +4438,46 @@ async fn transient_legacy_open_failure_aborts_migration_without_stamping_v4() {
         "the retried migration backfills every legacy commit",
     );
 }
+
+// ── RFC-013 Phase 7 / FIX B follow-up: the v3→v4 stamp-bump retry loop must ──
+// surface a RETRYABLE contention error on exhaustion, not a stringified Lance error.
+//
+// `commit_v4_stamp_idempotently` bumps the internal-schema stamp under concurrent
+// runners: the `UpdateConfig` CAS loser gets `IncompatibleTransaction`, re-opens,
+// confirms the winner stamped the same value, and is done. Genuine exhaustion (every
+// attempt loses) must return a `RowLevelCasContention` so the publisher's OUTER retry
+// completes the one-time open — an `OmniError::Lance` would be treated as fatal. The
+// `migration.v4_stamp.force_incompatible` failpoint forces every stamp attempt to lose,
+// driving the otherwise-near-unreachable exhaustion path deterministically. (Pre-fix —
+// `0..=BUDGET` + an `attempt < BUDGET` guard — the last iteration fell through to the
+// stringifying `Err(e)` arm and returned a non-retryable `OmniError::Lance`.)
+#[tokio::test]
+async fn v4_stamp_exhaustion_returns_retryable_contention() {
+    let _scenario = FailScenario::setup();
+    let dir = tempfile::tempdir().unwrap();
+    let uri = dir.path().to_str().unwrap().to_string();
+
+    // A real v3 graph: the backfill merge succeeds; only the terminal stamp loop
+    // is forced to exhaust.
+    let _fixture = omnigraph::db::commit_graph::seed_legacy_v3_lineage(&uri)
+        .await
+        .unwrap();
+
+    let _fp = ScopedFailPoint::new("migration.v4_stamp.force_incompatible", "return");
+    let err = match omnigraph::db::manifest::migrate_on_open_for_test(&uri).await {
+        Ok(()) => panic!("migration must error when the stamp bump exhausts its retries"),
+        Err(e) => e,
+    };
+    assert!(
+        matches!(
+            &err,
+            omnigraph::error::OmniError::Manifest(m)
+                if matches!(
+                    m.details,
+                    Some(omnigraph::error::ManifestConflictDetails::RowLevelCasContention)
+                )
+        ),
+        "stamp-bump exhaustion must surface a RETRYABLE RowLevelCasContention so the \
+         publisher's outer retry completes the open, got: {err:?}",
+    );
+}

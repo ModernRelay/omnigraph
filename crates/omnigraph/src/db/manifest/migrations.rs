@@ -280,7 +280,12 @@ async fn migrate_v3_to_v4(
     // same shape (bounded row-level-CAS retries) but independent knobs.
     const MIGRATION_MERGE_RETRY_BUDGET: u32 = 5;
 
-    for attempt in 0..=MIGRATION_MERGE_RETRY_BUDGET {
+    // Exclusive range + an unguarded retryable arm (see `commit_v4_stamp_idempotently`
+    // for the rationale): every retryable conflict re-opens and retries inside the
+    // loop, and the SINGLE reachable exhaustion path is the typed contention return
+    // below — so the retryable variant can never fall through to the `Err(err)`
+    // propagate arm on the last iteration.
+    for _ in 0..MIGRATION_MERGE_RETRY_BUDGET {
         // Fast path / idempotency + concurrent-winner guard: if the backfill
         // already landed (a previous run, OR a concurrent runner that won the CAS
         // — its merge is atomic, so this is all-or-nothing), don't re-merge — just
@@ -317,10 +322,7 @@ async fn migrate_v3_to_v4(
             // handle is stale at the pre-contention HEAD, so a re-open is required
             // to see the winner's commit; then re-loop (the fast path will see the
             // winner's lineage and stamp). Bounded by the budget.
-            Err(err)
-                if attempt < MIGRATION_MERGE_RETRY_BUDGET
-                    && super::publisher::is_retryable_publish_conflict(&err) =>
-            {
+            Err(err) if super::publisher::is_retryable_publish_conflict(&err) => {
                 *dataset = super::layout::open_manifest_dataset(root_uri, branch).await?;
                 continue;
             }
@@ -354,35 +356,58 @@ async fn commit_v4_stamp_idempotently(
     branch: Option<&str>,
 ) -> Result<()> {
     const STAMP_RETRY_BUDGET: u32 = 5;
-    for attempt in 0..=STAMP_RETRY_BUDGET {
+    // Exclusive range + an UNGUARDED `IncompatibleTransaction` arm: the retryable
+    // variant is always handled inside the loop (re-open + same-value check + retry),
+    // so it can never fall through to the stringifying `Err(e)` catch-all, and the
+    // SINGLE reachable exhaustion path is the typed contention return below. (A
+    // `0..=BUDGET` range with an `attempt < BUDGET` guard let the last iteration's
+    // retryable conflict reach the catch-all and return a non-retryable
+    // `OmniError::Lance` — the publisher's outer retry would then give up.)
+    for _ in 0..STAMP_RETRY_BUDGET {
         // Inline the `update_schema_metadata` write (rather than `set_stamp`) so the
         // raw Lance error variant is in hand — `set_stamp` pre-stringifies it.
-        match dataset
-            .update_schema_metadata([(
-                INTERNAL_SCHEMA_VERSION_KEY.to_string(),
-                INTERNAL_MANIFEST_SCHEMA_VERSION.to_string(),
-            )])
-            .await
-        {
+        let stamp_result = stamp_internal_schema(dataset).await;
+        match stamp_result {
             Ok(_) => return Ok(()),
-            Err(lance::Error::IncompatibleTransaction { .. }) if attempt < STAMP_RETRY_BUDGET => {
-                // A concurrent runner's `UpdateConfig` preempted ours. Re-open past
-                // its commit; if it already stamped to the target, we're done (the
-                // value is identical), else re-apply on the advanced handle.
+            Err(lance::Error::IncompatibleTransaction { .. }) => {
+                // A concurrent runner's `UpdateConfig` preempted ours — the
+                // retryable case. Re-open past its commit; if it already stamped to
+                // the target we're done (the value is identical), else fall through
+                // to retry on the advanced handle.
                 *dataset = super::layout::open_manifest_dataset(root_uri, branch).await?;
                 if read_stamp(dataset) >= INTERNAL_MANIFEST_SCHEMA_VERSION {
                     return Ok(());
                 }
-                continue;
             }
             Err(e) => return Err(OmniError::Lance(e.to_string())),
         }
     }
 
+    // Exhausted the budget against sustained concurrent stampers. Return a
+    // CAS-typed (retryable) error so the publisher's OUTER retry — which only
+    // re-runs `is_retryable_publish_conflict` — completes it, rather than the
+    // stringified `OmniError::Lance` it would treat as fatal.
     Err(OmniError::manifest_row_level_cas_contention(format!(
         "v3→v4 stamp bump exhausted {} retries against concurrent runners",
         STAMP_RETRY_BUDGET
     )))
+}
+
+/// The single `update_schema_metadata` write that bumps the on-disk internal-schema
+/// stamp to the current version. Extracted from `commit_v4_stamp_idempotently`'s
+/// retry loop so a `failpoints` test can inject a concurrent-stamper
+/// `IncompatibleTransaction` deterministically (the loop's exhaustion path is
+/// otherwise near-unreachable). Returns the RAW `lance::Error` so the loop can match
+/// the `IncompatibleTransaction` variant — `set_stamp` pre-stringifies it.
+async fn stamp_internal_schema(dataset: &mut Dataset) -> std::result::Result<(), lance::Error> {
+    crate::failpoints::maybe_fail_lance_incompatible("migration.v4_stamp.force_incompatible")?;
+    dataset
+        .update_schema_metadata([(
+            INTERNAL_SCHEMA_VERSION_KEY.to_string(),
+            INTERNAL_MANIFEST_SCHEMA_VERSION.to_string(),
+        )])
+        .await
+        .map(|_| ())
 }
 
 /// Build the `__manifest` rows for the v3→v4 backfill: one immutable
