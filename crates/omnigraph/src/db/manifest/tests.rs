@@ -1982,6 +1982,46 @@ async fn v3_branch_migration_backfills_branch_manifest_and_leaves_main_untouched
     }
 }
 
+// FIX D — the branch read path refuses a `> CURRENT` branch stamp.
+//
+// `load_commit_cache_for_branch` handled `< CURRENT` (the v3 fallback) and
+// `>= CURRENT` (the manifest projection), but never a `> CURRENT` branch stamp —
+// it would misread a future shape with the projection. The main read path already
+// refuses (`refuse_if_internal_schema_too_new`), and migrations run main-first so
+// main's stamp ≥ every branch's — so this is not a live hole today. The guard is
+// defense-in-depth against that ordering invariant ever weakening. Here we
+// synthesize the unreachable state directly (force-stamp a branch past CURRENT)
+// and assert the branch read refuses loudly instead of misreading.
+#[tokio::test]
+async fn branch_read_refuses_future_internal_schema_stamp() {
+    use crate::db::commit_graph::{CommitGraph, seed_legacy_v3_lineage_with_branch};
+
+    let dir = tempfile::tempdir().unwrap();
+    let uri = dir.path().to_str().unwrap();
+    // A graph with a real `feature` Lance branch on both `_graph_commits.lance`
+    // and `__manifest` (so `open_at_branch` can check it out).
+    let fx = seed_legacy_v3_lineage_with_branch(uri).await.unwrap();
+
+    // Force the BRANCH's `__manifest` stamp past this binary's known version.
+    let future = super::migrations::INTERNAL_MANIFEST_SCHEMA_VERSION + 1;
+    {
+        let mut branch_ds = open_manifest_dataset(uri, Some(&fx.branch)).await.unwrap();
+        super::migrations::set_stamp_for_test(&mut branch_ds, future)
+            .await
+            .unwrap();
+    }
+
+    // Reading the commit graph at that branch must refuse, not misread.
+    let err = match CommitGraph::open_at_branch(uri, &fx.branch).await {
+        Ok(_) => panic!("a branch stamped past CURRENT must be refused on read"),
+        Err(e) => e,
+    };
+    assert!(
+        err.to_string().contains("upgrade omnigraph"),
+        "expected an upgrade-omnigraph refusal at the branch read, got: {err}",
+    );
+}
+
 // FIX B — the v3→v4 lineage backfill must be concurrent-runner idempotent.
 //
 // `migrate_v2_to_v3` is explicitly safe under two processes opening the same

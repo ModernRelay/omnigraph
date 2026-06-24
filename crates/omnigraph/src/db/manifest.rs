@@ -35,6 +35,7 @@ pub(crate) use metadata::TableVersionMetadata;
 use metadata::{OMNIGRAPH_ROW_COUNT_KEY, table_version_metadata_for_state};
 #[cfg(test)]
 use namespace::{branch_manifest_namespace, staged_table_namespace};
+pub(crate) use migrations::refuse_if_stamp_too_new;
 pub(crate) use publisher::LineageIntent;
 use publisher::{GraphNamespacePublisher, ManifestBatchPublisher, PublishOutcome};
 pub(crate) use recovery::{
