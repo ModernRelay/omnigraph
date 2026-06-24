@@ -1409,7 +1409,7 @@ async fn converge_or_defer_roll_forward(
         "recovery: roll-forward publish lost a CAS to a concurrent writer that \
          already reached the goal; converging (RolledForward audit + delete)"
     );
-    let outcomes: Vec<TableOutcome> = sidecar
+    let mut outcomes: Vec<TableOutcome> = sidecar
         .tables
         .iter()
         .map(|pin| TableOutcome {
@@ -1421,6 +1421,20 @@ async fn converge_or_defer_roll_forward(
                 .unwrap_or(pin.post_commit_pin),
         })
         .collect();
+    // Mirror the normal roll-forward audit shape: SchemaApply sidecars also
+    // register added tables, so the audit must list them too (else a converge
+    // audit row is incomplete vs the `roll_forward_all` path for the same
+    // recovery kind).
+    for reg in &sidecar.additional_registrations {
+        outcomes.push(TableOutcome {
+            table_key: reg.table_key.clone(),
+            from_version: 0,
+            to_version: fresh
+                .entry(&reg.table_key)
+                .map(|e| e.table_version)
+                .unwrap_or(0),
+        });
+    }
     record_audit(
         root_uri,
         sidecar,
