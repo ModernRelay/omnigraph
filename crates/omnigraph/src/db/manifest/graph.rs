@@ -42,7 +42,7 @@ pub(super) async fn init_manifest_graph(
         parent_commit_id: None,
         merged_parent_commit_id: None,
         actor_id: None,
-        created_at: now_micros()?,
+        created_at: crate::db::now_micros()?,
     };
     let genesis_lineage = graph_lineage_row_parts(&genesis, None)?;
 
@@ -141,15 +141,6 @@ async fn build_initial_entries(
     }
 
     Ok((entries, version_metadata))
-}
-
-/// Microseconds since the UNIX epoch — the `created_at` stamp for the genesis
-/// commit, matching `commit_graph::now_micros`'s unit.
-fn now_micros() -> Result<i64> {
-    let duration = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map_err(|e| OmniError::manifest(format!("system clock before UNIX_EPOCH: {}", e)))?;
-    Ok(duration.as_micros() as i64)
 }
 
 async fn create_empty_dataset(uri: &str, schema: &SchemaRef) -> Result<Dataset> {

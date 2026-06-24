@@ -557,7 +557,7 @@ impl GraphCoordinator {
             branch: self.current_branch().map(str::to_string),
             actor_id: actor_id.map(str::to_string),
             merged_parent_commit_id,
-            created_at: now_micros()?,
+            created_at: crate::db::now_micros()?,
         })
     }
 
@@ -640,15 +640,6 @@ fn updates_to_changes(updates: &[SubTableUpdate]) -> Vec<ManifestChange> {
         .cloned()
         .map(ManifestChange::Update)
         .collect()
-}
-
-/// Microseconds since the UNIX epoch — the commit `created_at` stamp, matching
-/// `commit_graph::now_micros`'s unit.
-fn now_micros() -> Result<i64> {
-    let duration = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map_err(|e| OmniError::manifest(format!("system clock before UNIX_EPOCH: {}", e)))?;
-    Ok(duration.as_micros() as i64)
 }
 
 fn normalize_branch_name(branch: &str) -> Result<Option<String>> {

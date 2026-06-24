@@ -41,9 +41,7 @@ use serde::{Deserialize, Serialize};
 use tracing::warn;
 
 use crate::db::graph_coordinator::GraphCoordinator;
-use crate::db::recovery_audit::{
-    RecoveryAudit, RecoveryAuditRecord, RecoveryKind, TableOutcome, now_micros,
-};
+use crate::db::recovery_audit::{RecoveryAudit, RecoveryAuditRecord, RecoveryKind, TableOutcome};
 use crate::db::schema_state::SchemaStateRecovery;
 use crate::error::{OmniError, Result};
 use crate::storage::StorageAdapter;
@@ -89,7 +87,7 @@ async fn publish_recovery_commit(
         branch: sidecar.branch.clone(),
         actor_id: Some(RECOVERY_ACTOR.to_string()),
         merged_parent_commit_id,
-        created_at: now_micros()?,
+        created_at: crate::db::now_micros()?,
     };
     let publisher = GraphNamespacePublisher::new(root_uri, sidecar.branch.as_deref());
     let outcome = publisher.publish(updates, expected, Some(&intent)).await?;
@@ -960,7 +958,7 @@ async fn discard_orphaned_branch_sidecar(
             branch: None,
             actor_id: Some(RECOVERY_ACTOR.to_string()),
             merged_parent_commit_id: None,
-            created_at: now_micros()?,
+            created_at: crate::db::now_micros()?,
         };
         let publisher = GraphNamespacePublisher::new(root_uri, None);
         publisher.publish(&[], &HashMap::new(), Some(&intent)).await?;
@@ -975,7 +973,7 @@ async fn discard_orphaned_branch_sidecar(
                 operation_id: sidecar.operation_id.clone(),
                 sidecar_writer_kind: format!("{:?}", sidecar.writer_kind),
                 per_table_outcomes: Vec::new(),
-                created_at: now_micros()?,
+                created_at: crate::db::now_micros()?,
             })
             .await?;
     }
@@ -1676,7 +1674,7 @@ async fn record_audit(
             operation_id: sidecar.operation_id.clone(),
             sidecar_writer_kind: format!("{:?}", sidecar.writer_kind),
             per_table_outcomes: outcomes,
-            created_at: now_micros()?,
+            created_at: crate::db::now_micros()?,
         })
         .await?;
     Ok(())

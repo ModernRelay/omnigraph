@@ -1,6 +1,5 @@
 use std::collections::{HashMap, VecDeque};
 use std::sync::Arc;
-use std::time::{SystemTime, UNIX_EPOCH};
 
 use arrow_array::{
     Array, RecordBatch, RecordBatchIterator, StringArray, TimestampMicrosecondArray, UInt64Array,
@@ -288,7 +287,7 @@ impl CommitGraph {
             parent_commit_id: parent_commit_id.map(|s| s.to_string()),
             merged_parent_commit_id: merged_parent_commit_id.map(|s| s.to_string()),
             actor_id: actor_id.map(str::to_string),
-            created_at: now_micros()?,
+            created_at: crate::db::now_micros()?,
         };
 
         let batch = commits_to_batch(&[commit.clone()])?;
@@ -323,7 +322,7 @@ impl CommitGraph {
         let record = CommitActorRecord {
             graph_commit_id: graph_commit_id.to_string(),
             actor_id: actor_id.to_string(),
-            created_at: now_micros()?,
+            created_at: crate::db::now_micros()?,
         };
         let batch = commit_actors_to_batch(&[record])?;
         let reader = RecordBatchIterator::new(vec![Ok(batch)], commit_actor_schema());
@@ -868,13 +867,6 @@ async fn open_for_branch(root_uri: &str, branch: Option<&str>) -> Result<CommitG
         Some(branch) if branch != "main" => CommitGraph::open_at_branch(root_uri, branch).await,
         _ => CommitGraph::open(root_uri).await,
     }
-}
-
-fn now_micros() -> Result<i64> {
-    let duration = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map_err(|e| OmniError::manifest(format!("system clock before UNIX_EPOCH: {}", e)))?;
-    Ok(duration.as_micros() as i64)
 }
 
 /// Identities of the commits written into a synthetic pre-Phase-7 (v3) graph by

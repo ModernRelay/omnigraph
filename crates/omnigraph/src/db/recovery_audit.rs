@@ -22,7 +22,6 @@
 //! append is retried, minting a fresh recovery commit).
 
 use std::sync::Arc;
-use std::time::{SystemTime, UNIX_EPOCH};
 
 use arrow_array::{
     Array, RecordBatch, RecordBatchIterator, StringArray, TimestampMicrosecondArray,
@@ -278,13 +277,6 @@ fn decode_row(batch: &RecordBatch, row: usize) -> Result<RecoveryAuditRecord> {
         per_table_outcomes: outcomes,
         created_at: ts_col.value(row),
     })
-}
-
-pub(crate) fn now_micros() -> Result<i64> {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|d| d.as_micros() as i64)
-        .map_err(|e| OmniError::manifest_internal(format!("system clock before unix epoch: {}", e)))
 }
 
 #[cfg(test)]
