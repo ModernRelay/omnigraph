@@ -28,7 +28,16 @@ pub struct GraphCommit {
 
 pub struct CommitGraph {
     root_uri: String,
-    dataset: Dataset,
+    /// Handle on `_graph_commits.lance` at the active branch, held only for the
+    /// branch-management WRITES (`create_branch`, formerly `version`) and
+    /// `refresh`. It is a DERIVED artifact (RFC-013 Phase 7): graph lineage lives
+    /// in `__manifest`, and reads (`head_commit`/`load_commits`/`get_commit`/
+    /// `merge_base`) never touch it. `None` means the branch's
+    /// `_graph_commits.lance` ref is missing (an interrupted fork-reclaim or a
+    /// `cleanup` race) while the manifest lineage is still authoritative — so the
+    /// READS stay correct and only a subsequent `create_branch` surfaces the loud
+    /// actionable error. Mirrors `actor_dataset`'s best-effort `Option`.
+    dataset: Option<Dataset>,
     actor_dataset: Option<Dataset>,
     active_branch: Option<String>,
     actor_by_commit_id: HashMap<String, String>,
@@ -67,7 +76,7 @@ impl CommitGraph {
         let (commit_by_id, head_commit) = load_commit_cache_from_manifest(root, None).await?;
         Ok(Self {
             root_uri: root.to_string(),
-            dataset,
+            dataset: Some(dataset),
             actor_dataset: Some(actor_dataset),
             active_branch: None,
             actor_by_commit_id: HashMap::new(),
@@ -110,7 +119,9 @@ impl CommitGraph {
         let (commit_by_id, head_commit) = load_commit_cache_for_branch(root, None).await?;
         Ok(Self {
             root_uri: root.to_string(),
-            dataset,
+            // `open` targets main and never checks out a branch (main cannot be
+            // deleted/recreated), so the handle is always present here.
+            dataset: Some(dataset),
             actor_dataset,
             active_branch: None,
             actor_by_commit_id: HashMap::new(),
@@ -125,14 +136,26 @@ impl CommitGraph {
         let dataset =
             crate::instrumentation::open_dataset_tracked(&graph_commits_uri(root), wrapper.clone())
                 .await?;
-        let dataset = dataset
-            .checkout_branch(branch)
-            .await
-            .map_err(|e| OmniError::Lance(e.to_string()))?;
+        // Best-effort checkout of the DERIVED `_graph_commits.lance` branch ref.
+        // It is held only for `create_branch` (a write); the lineage READ below
+        // comes from `__manifest`. A missing ref (interrupted fork-reclaim /
+        // `cleanup` race) must not wedge the read, so a typed not-found yields a
+        // `None` handle — a subsequent `create_branch` then surfaces the loud
+        // error. Any OTHER open error (transient IO / corrupt) still propagates,
+        // matching the `force_delete_branch` / `read_legacy_commit_cache` idiom.
+        let dataset = match dataset.checkout_branch(branch).await {
+            Ok(ds) => Some(ds),
+            Err(lance::Error::RefNotFound { .. }) | Err(lance::Error::NotFound { .. }) => None,
+            Err(e) => return Err(OmniError::Lance(e.to_string())),
+        };
         let actor_dataset =
             crate::instrumentation::open_dataset_tracked(&graph_commit_actors_uri(root), wrapper)
                 .await
                 .ok();
+        // Hard `?`: the manifest existence gate. `load_commit_cache_for_branch`
+        // opens the branch's `__manifest` (its own `checkout_branch` on the
+        // authoritative table), so a TRULY absent branch still fails loudly here —
+        // only the derived `_graph_commits.lance` ref is allowed to be missing.
         let (commit_by_id, head_commit) = load_commit_cache_for_branch(root, Some(branch)).await?;
         Ok(Self {
             root_uri: root.to_string(),
@@ -148,18 +171,22 @@ impl CommitGraph {
     pub async fn refresh(&mut self) -> Result<()> {
         let root = self.root_uri.clone();
         let wrapper = crate::instrumentation::commit_graph_wrapper();
-        self.dataset = crate::instrumentation::open_dataset_tracked(
+        let dataset = crate::instrumentation::open_dataset_tracked(
             &graph_commits_uri(&root),
             wrapper.clone(),
         )
         .await?;
-        if let Some(branch) = &self.active_branch {
-            self.dataset = self
-                .dataset
-                .checkout_branch(branch)
-                .await
-                .map_err(|e| OmniError::Lance(e.to_string()))?;
-        }
+        // Same best-effort checkout as `open_at_branch`: a missing DERIVED branch
+        // ref leaves the handle `None` (only `create_branch` then errors), while
+        // the in-memory cache re-syncs from the authoritative manifest below.
+        self.dataset = match &self.active_branch {
+            Some(branch) => match dataset.checkout_branch(branch).await {
+                Ok(ds) => Some(ds),
+                Err(lance::Error::RefNotFound { .. }) | Err(lance::Error::NotFound { .. }) => None,
+                Err(e) => return Err(OmniError::Lance(e.to_string())),
+            },
+            None => Some(dataset),
+        };
         self.actor_dataset =
             crate::instrumentation::open_dataset_tracked(&graph_commit_actors_uri(&root), wrapper)
                 .await
@@ -171,13 +198,22 @@ impl CommitGraph {
         Ok(())
     }
 
-    pub fn version(&self) -> u64 {
-        self.dataset.version().version
-    }
-
     pub async fn create_branch(&mut self, name: &str) -> Result<()> {
-        let mut ds = self.dataset.clone();
-        ds.create_branch(name, self.version(), None)
+        // The held `_graph_commits.lance` handle is the only thing that can fork a
+        // branch ref. If it is missing (an interrupted fork-reclaim or a `cleanup`
+        // race dropped the derived ref while manifest lineage stayed authoritative),
+        // fail loudly + actionably rather than silently. Repair is the existing
+        // `cleanup` orphan reconciler (`reconcile_commit_graph_orphans`), not an
+        // inline write on this path.
+        let Some(dataset) = &self.dataset else {
+            let branch = self.active_branch.as_deref().unwrap_or("main");
+            return Err(OmniError::manifest_internal(format!(
+                "commit-graph branch ref for '{branch}' is missing; run `omnigraph cleanup` then retry"
+            )));
+        };
+        let version = dataset.version().version;
+        let mut ds = dataset.clone();
+        ds.create_branch(name, version, None)
             .await
             .map_err(|e| OmniError::Lance(e.to_string()))?;
         Ok(())
@@ -292,11 +328,17 @@ impl CommitGraph {
 
         let batch = commits_to_batch(&[commit.clone()])?;
         let reader = RecordBatchIterator::new(vec![Ok(batch)], commit_graph_schema());
-        let mut ds = self.dataset.clone();
+        // This helper is dead on every write path (RFC-013 Phase 7) — reached only
+        // by the transitional v3 fixtures, which always hold the commits dataset.
+        // A `None` here would be a fixture bug, so fail loudly rather than silently.
+        let mut ds = self
+            .dataset
+            .clone()
+            .ok_or_else(|| OmniError::manifest_internal("commit-graph dataset is missing"))?;
         ds.append(reader, None)
             .await
             .map_err(|e| OmniError::Lance(e.to_string()))?;
-        self.dataset = ds;
+        self.dataset = Some(ds);
         if let Some(actor_id) = actor_id {
             self.append_actor(&graph_commit_id, actor_id).await?;
         }
@@ -1008,11 +1050,14 @@ pub async fn seed_legacy_v3_lineage_with_branch(root_uri: &str) -> Result<V3Bran
     //    handle to it, and append an authored branch commit (its actor lands in
     //    the flat main actor table — exactly the pre-Phase-7 shape).
     cg.create_branch("feature").await?;
-    cg.dataset = cg
+    let commits_ds = cg
         .dataset
+        .take()
+        .expect("commits dataset present after create_branch")
         .checkout_branch("feature")
         .await
         .map_err(|e| OmniError::Lance(e.to_string()))?;
+    cg.dataset = Some(commits_ds);
     cg.active_branch = Some("feature".to_string());
     let branch_commit = cg
         .append_commit_with_parents(Some("feature"), 3, Some(&commit_a), None, Some("act-branch"))
@@ -1075,7 +1120,14 @@ mod tests {
         // to it, and append an authored branch commit (its actor also goes to
         // the flat main actor table — exactly the pre-Phase-7 shape).
         cg.create_branch("feature").await.unwrap();
-        cg.dataset = cg.dataset.checkout_branch("feature").await.unwrap();
+        cg.dataset = Some(
+            cg.dataset
+                .take()
+                .unwrap()
+                .checkout_branch("feature")
+                .await
+                .unwrap(),
+        );
         cg.active_branch = Some("feature".to_string());
         let branch_commit = cg
             .append_commit_with_parents(
