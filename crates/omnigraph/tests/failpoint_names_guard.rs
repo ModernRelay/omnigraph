@@ -11,14 +11,22 @@
 
 use std::path::{Path, PathBuf};
 
-/// Call-site prefixes whose first argument must be a `names::` constant. A
-/// literal first argument makes the prefix immediately precede a `"`.
-const LITERAL_CALL_PATTERNS: &[&str] = &[
-    "maybe_fail(\"",
-    "ScopedFailPoint::new(\"",
-    "ScopedFailPoint::with_callback(\"",
-    "park_first(\"",
+/// Call-site prefixes whose first argument must be a `names::` constant. The
+/// check is whitespace/newline-tolerant (it skips past the open paren to the
+/// first non-whitespace token), so wrapping the call across lines cannot hide
+/// a literal — a per-line `contains` scan would miss
+/// `park_first(\n    "name",\n)`.
+const CALL_PREFIXES: &[&str] = &[
+    "maybe_fail(",
+    "ScopedFailPoint::new(",
+    "ScopedFailPoint::with_callback(",
+    "park_first(",
 ];
+
+/// 1-based line number of `byte_off` within `contents`.
+fn line_of(contents: &str, byte_off: usize) -> usize {
+    contents[..byte_off].bytes().filter(|&b| b == b'\n').count() + 1
+}
 
 fn manifest_dir() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR"))
@@ -59,11 +67,22 @@ fn failpoint_names_use_the_compile_checked_catalog() {
         let Ok(contents) = std::fs::read_to_string(&file) else {
             continue;
         };
-        for (idx, line) in contents.lines().enumerate() {
-            for pattern in LITERAL_CALL_PATTERNS {
-                if line.contains(pattern) {
-                    violations.push(format!("{}:{}: {}", file.display(), idx + 1, line.trim()));
+        for prefix in CALL_PREFIXES {
+            let mut from = 0;
+            while let Some(rel) = contents[from..].find(prefix) {
+                let after_open = from + rel + prefix.len();
+                // Skip whitespace (incl. newlines) after the open paren. If the
+                // first argument token is a `"`, it's a literal failpoint name
+                // — across a line break or not.
+                if contents[after_open..].trim_start().starts_with('"') {
+                    violations.push(format!(
+                        "{}:{}: literal failpoint name at `{}` — use a `names::` const",
+                        file.display(),
+                        line_of(&contents, from + rel),
+                        prefix.trim_end_matches('('),
+                    ));
                 }
+                from = after_open;
             }
         }
     }

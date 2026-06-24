@@ -1383,6 +1383,26 @@ async fn converge_or_defer_roll_forward(
         );
         return Ok(false);
     }
+    // The manifest already reached the sidecar's goal — some other actor
+    // advanced it. Under the heal-first invariant, whoever advanced past
+    // `expected_version` first healed THIS sidecar (recorded its RolledForward
+    // audit and deleted it). So the audit row already exists; recording another
+    // here would put two RolledForward rows in `_graph_commit_recoveries` for
+    // one recovery event (visible in `commit list --filter actor=…recovery`).
+    // Only finish the bookkeeping if the sidecar is still on disk (the winner
+    // crashed between audit and delete); if it is already gone, the winner
+    // completed it — return success WITHOUT a duplicate audit, keeping the
+    // audit append-idempotent per operation_id across concurrent sweeps.
+    let sidecar_path = sidecar_uri(root_uri, &sidecar.operation_id);
+    if !storage.exists(&sidecar_path).await? {
+        warn!(
+            operation_id = sidecar.operation_id.as_str(),
+            writer_kind = ?sidecar.writer_kind,
+            "recovery: roll-forward publish lost a CAS; the winner already \
+             converged and cleaned up this sidecar — nothing to do"
+        );
+        return Ok(true);
+    }
     warn!(
         operation_id = sidecar.operation_id.as_str(),
         writer_kind = ?sidecar.writer_kind,

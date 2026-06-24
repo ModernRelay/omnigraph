@@ -934,6 +934,17 @@ async fn open_sweep_roll_forward_converges_when_manifest_advances_concurrently()
     }
     let db = Omnigraph::open(&uri).await.unwrap();
     assert_eq!(helpers::count_rows(&db, "node:Person").await, 1);
+
+    // Exactly one RolledForward audit row for this recovery event: the loser's
+    // convergence path must NOT append a duplicate once the winner already
+    // recorded the audit and deleted the sidecar (append-idempotent per
+    // operation_id). Two rows here would be the duplicate-audit regression.
+    let kinds = helpers::recovery::recovery_audit_kinds(dir.path()).await;
+    assert_eq!(
+        kinds.len(),
+        1,
+        "exactly one recovery audit row expected after concurrent convergence, got {kinds:?}"
+    );
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -958,7 +969,7 @@ async fn inline_delete_conflict_writes_sidecar_before_rejecting() {
         // then lands deterministically before the delete resumes, so the
         // delete's manifest CAS is guaranteed stale — no retry loop, no sleep.
         let rv = helpers::failpoint::Rendezvous::park_first(
-            "mutation.delete_node_pre_primary_delete",
+            names::MUTATION_DELETE_NODE_PRE_PRIMARY_DELETE,
         );
 
         let del_db = Arc::clone(&db);
