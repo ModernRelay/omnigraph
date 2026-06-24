@@ -1982,6 +1982,67 @@ async fn v3_branch_migration_backfills_branch_manifest_and_leaves_main_untouched
     }
 }
 
+// FIX B — the v3→v4 lineage backfill must be concurrent-runner idempotent.
+//
+// `migrate_v2_to_v3` is explicitly safe under two processes opening the same
+// legacy graph at once (each re-enumerates branches; `force_delete_branch`
+// tolerates an already-gone branch). v3→v4 regressed that: `merge_lineage_rows`
+// uses `conflict_retries(0)` and the migration had no app-level retry, so a
+// concurrent first-open's CAS loser errored the whole open instead of converging.
+//
+// This test reproduces exactly two concurrent first-opens: two `__manifest`
+// handles opened at the SAME pre-migration (v3, empty-lineage) HEAD, then their
+// `migrate_internal_schema` calls run under `tokio::join!`. Both pass the
+// fast-path empty-lineage check and both attempt the backfill merge, so the
+// row-level CAS on `graph_head:main` is guaranteed to fire — deterministically
+// red against the pre-fix code (the loser errors). The contract: BOTH converge
+// to `Ok`, the manifest carries exactly the fixture's commit rows (merge keyed on
+// `object_id`, so a double-merge stays exact), and the stamp is v4.
+//
+// (Driving pre-opened handles rather than `migrate_on_open(uri)` twice is a
+// deliberate choice: `migrate_on_open` opens fresh each call, so two of them can
+// luckily serialize — one finishes before the other reads the fast path — which
+// would not exercise the CAS path and would pass even pre-fix. Pre-opening both
+// at the empty-lineage HEAD forces the contention every run, so the RED is real.)
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn concurrent_v3_to_v4_migrations_both_converge() {
+    let dir = tempfile::tempdir().unwrap();
+    let uri = dir.path().to_str().unwrap();
+    let fixture = seed_legacy_v3_lineage(uri).await.unwrap();
+
+    // Two handles opened at the same pre-migration HEAD: both see stamp v3 and an
+    // empty lineage, so both will run the full backfill and collide on the merge.
+    let mut ds_a = open_manifest_dataset(uri, None).await.unwrap();
+    let mut ds_b = open_manifest_dataset(uri, None).await.unwrap();
+
+    let (res_a, res_b) = tokio::join!(
+        super::migrations::migrate_internal_schema(&mut ds_a, uri, None),
+        super::migrations::migrate_internal_schema(&mut ds_b, uri, None),
+    );
+
+    // The whole contract: a concurrent first-open's CAS loser converges instead of
+    // erroring. BOTH must succeed.
+    res_a.expect("migration runner A must converge");
+    res_b.expect("migration runner B must converge");
+
+    // Exactly the fixture's commits, no duplicates (the merge is keyed on
+    // `object_id`, so even a double-merge under read-after-write lag stays exact).
+    assert_eq!(
+        manifest_commit_row_count(uri).await,
+        fixture.all_ids.len(),
+        "concurrent backfills converge to exactly the fixture's commit rows",
+    );
+    // And the stamp landed at v4.
+    {
+        let ds = open_manifest_dataset(uri, None).await.unwrap();
+        assert_eq!(
+            super::migrations::read_stamp(&ds),
+            super::migrations::INTERNAL_MANIFEST_SCHEMA_VERSION,
+            "both runners leave the manifest stamped at the current version",
+        );
+    }
+}
+
 // ── RFC-013 Phase 7 / step 5: the `graph_head` concurrency gate ──────────────
 //
 // Two (or N) writers committing DISJOINT tables on the same branch still share
