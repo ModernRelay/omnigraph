@@ -38,6 +38,8 @@ mod invariants;
 mod coverage;
 #[path = "dst/backend.rs"]
 mod backend;
+#[path = "dst/readshape.rs"]
+mod readshape;
 
 use coverage::Coverage;
 use invariants::{Finding, classify, run_battery};
@@ -315,6 +317,44 @@ async fn branch_isolation_and_merge() {
         1,
         "merge: feature's row was not merged into main"
     );
+}
+
+// ═══════════════════════ D3 read shapes × D2 morphology ═══════════════════
+
+/// Every read shape must execute (no engine error / panic) against every table
+/// morphology — the D2×D3 cell sweep — plus the morphology-invariant counts
+/// (full-scan == live persons, zero-match == 0) must hold, and the shapes must
+/// run against a forked branch too.
+#[tokio::test]
+async fn read_shape_battery_across_morphologies() {
+    for morph in readshape::Morph::ALL {
+        let dir = tempfile::tempdir().unwrap();
+        let db = omnigraph::db::Omnigraph::init(dir.path().to_str().unwrap(), readshape::SCHEMA)
+            .await
+            .unwrap();
+        let expected_persons = readshape::build(&db, morph).await;
+        for (name, res) in readshape::run(&db, "main").await {
+            let rows =
+                res.unwrap_or_else(|e| panic!("morph {morph:?} shape [{name}] errored: {e}"));
+            if name == "full-scan" {
+                assert_eq!(rows, expected_persons, "morph {morph:?} full-scan count");
+            }
+            if name == "zero-match" {
+                assert_eq!(rows, 0, "morph {morph:?} zero-match must be empty");
+            }
+        }
+    }
+
+    // on-branch morphology: every shape must execute against a forked branch.
+    let dir = tempfile::tempdir().unwrap();
+    let db = omnigraph::db::Omnigraph::init(dir.path().to_str().unwrap(), readshape::SCHEMA)
+        .await
+        .unwrap();
+    readshape::build(&db, readshape::Morph::MultiFragment).await;
+    db.branch_create("feature").await.unwrap();
+    for (name, res) in readshape::run(&db, "feature").await {
+        res.unwrap_or_else(|e| panic!("on-branch shape [{name}] errored: {e}"));
+    }
 }
 
 // ═══════════════════════════ generative walk ══════════════════════════════
