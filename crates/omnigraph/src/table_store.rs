@@ -813,9 +813,11 @@ impl TableStore {
     /// call, advancing Lance HEAD as a side effect. Not on the
     /// `TableStorage` trait surface — the staged primitive `stage_append`
     /// + `commit_staged` is the engine write path. This inherent
-    /// `pub(crate)` method survives only for recovery test setup. Do not
-    /// add new engine call sites — they re-introduce the multi-phase
-    /// commit drift the trait surface was designed to eliminate.
+    /// `pub(crate)` method survives only for recovery test setup, so it is
+    /// `#[cfg(test)]`-gated — there is no non-test engine call site, and a
+    /// new one would re-introduce the multi-phase commit drift the trait
+    /// surface was designed to eliminate.
+    #[cfg(test)]
     pub(crate) async fn append_batch(
         &self,
         dataset_uri: &str,

@@ -1578,80 +1578,14 @@ fn literal_value_to_f64(v: &omnigraph_compiler::catalog::LiteralValue) -> f64 {
 
 // ─── Edge cardinality validation ─────────────────────────────────────────────
 
-pub(crate) async fn validate_edge_cardinality(
-    db: &crate::db::Omnigraph,
-    branch: Option<&str>,
-    edge_name: &str,
-    written_version: u64,
-    written_branch: Option<&str>,
-) -> Result<()> {
-    use arrow_array::Array;
-    let catalog = db.catalog();
-    let edge_type = &catalog.edge_types[edge_name];
-    if edge_type.cardinality.is_default() {
-        return Ok(());
-    }
-
-    // Open edge sub-table at the just-written version, not the snapshot's
-    // (the snapshot still pins to the pre-write version).
-    let snapshot = db.snapshot_for_branch(branch).await?;
-    let table_key = format!("edge:{}", edge_name);
-    let entry = snapshot
-        .entry(&table_key)
-        .ok_or_else(|| OmniError::manifest(format!("no manifest entry for {}", table_key)))?;
-    let ds = db
-        .open_dataset_at_state(
-            &entry.table_path,
-            written_branch.or(entry.table_branch.as_deref()),
-            written_version,
-        )
-        .await?;
-
-    // Scan src column, count per source
-    let batches = db.storage().scan(&ds, Some(&["src"]), None, None).await?;
-
-    let mut counts: HashMap<String, u32> = HashMap::new();
-    for batch in &batches {
-        let srcs = batch
-            .column_by_name("src")
-            .unwrap()
-            .as_any()
-            .downcast_ref::<StringArray>()
-            .unwrap();
-        for i in 0..srcs.len() {
-            *counts.entry(srcs.value(i).to_string()).or_insert(0) += 1;
-        }
-    }
-
-    let card = &edge_type.cardinality;
-    for (src, count) in &counts {
-        if let Some(max) = card.max {
-            if *count > max {
-                return Err(OmniError::manifest(format!(
-                    "@card violation on edge {}: source '{}' has {} edges (max {})",
-                    edge_name, src, count, max
-                )));
-            }
-        }
-        if *count < card.min {
-            return Err(OmniError::manifest(format!(
-                "@card violation on edge {}: source '{}' has {} edges (min {})",
-                edge_name, src, count, card.min
-            )));
-        }
-    }
-
-    Ok(())
-}
-
 /// Validate edge `@card` cardinality with in-memory pending edges visible.
 ///
 /// Loader-level analog to `exec::mutation::validate_edge_cardinality_with_pending`:
 /// opens the committed dataset at the pre-load snapshot version, then
 /// delegates to the shared `count_src_per_edge` + `enforce_cardinality_bounds`
-/// helpers in `exec::staging`. Used by Append/Merge loads (the Overwrite
-/// path uses `validate_edge_cardinality` which opens the just-written
-/// Lance version).
+/// helpers in `exec::staging`. Used by every load mode; for `LoadMode::Overwrite`
+/// it treats the pending edge batches as the replacement table image (the
+/// committed rows are being replaced, so only the pending set is counted).
 ///
 /// `mode` controls dedup behavior. `LoadMode::Merge` passes `Some("id")`
 /// so committed edges that the load is *updating* (same edge id,
