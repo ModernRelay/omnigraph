@@ -75,8 +75,9 @@ Legend: ✅ sampled · 🟡 partial · ❌ unsampled · ⏸️ deferred-by-plan 
 ### D5 — context  *(the dimension with the biggest blind spots)*
 | context | status | note |
 |---------|--------|------|
-| embedded backend | ✅ | the only backend |
-| **CLI / long-lived server backend** | ❌ deferred | crate-boundary friction: harness is in `omnigraph-engine` tests, the `omnigraph` binary is in `omnigraph-cli` (`CARGO_BIN_EXE_omnigraph` is cross-package, unavailable), and the natural home — `omnigraph-cli` tests — can't reach the harness modules. Plus subprocess-per-op is slow/flaky. Needs the harness op/model extracted to a shared crate first. |
+| embedded backend | ✅ | drives `Embedded` (the in-process `Backend` impl) + the white-box battery |
+| **CLI backend (subprocess)** | ✅ (PR-E) | `cli_cross_backend_walk` (in `omnigraph-cli` tests) — the SAME seeded walk drives `Embedded` AND `Cli` (`omnigraph-dst::Cli`, binary via `CARGO_BIN_EXE_omnigraph`), asserting per-step black-box agreement (slug sets + edge count). Unblocked by extracting op/model/invariants/fault behind the `Backend` trait into the shared `omnigraph-dst` crate. White-box battery stays embedded-only by construction; the CLI arm runs the black-box oracles. One known contract difference allow-listed: `repair --confirm` (no `--force`) exits non-zero refusing suspicious drift where embedded `repair(force=false)` returns Ok. |
+| **long-lived server backend** | ❌ deferred | `parity_matrix.rs` covers single-op CLI-vs-server; a server-arm generative walk is the remaining D5 gap. |
 | local FS | ✅ | |
 | **S3 (RustFS/MinIO)** | ✅ (PR-D) | `s3_battery_holds` — full battery on `s3://`, env-gated (`OMNIGRAPH_S3_TEST_BUCKET`) |
 | **parser/loader fuzz** | ✅ (PR-D) | `fuzz::*` — proptest dup/malformed-injecting; `cargo-fuzz`/libFuzzer deferred (needs nightly) |
@@ -131,10 +132,14 @@ seam cannot induce a `RolledPastExpected` sidecar.
    the walk *discovers* sidecar/CAS bugs instead of the cells being scripted. ❌
 6. **determinism/replay-equality** (PR-C) — ✅ DONE (`--features dst` seam +
    `replay_equality_same_seed`). **S3 context + parser/loader fuzz** (PR-D) — ✅ DONE
-   (`s3_battery_holds`, `fuzz::*`). **Still ⏸️/❌:** CLI/server backends (deferred,
-   crate-boundary — see D5 table), `cargo-fuzz`/libFuzzer (needs nightly),
-   `porcupine` linearizability, vector/FTS/rrf read shapes, wrapping the main
-   walks in `with_seed`.
+   (`s3_battery_holds`, `fuzz::*`). **CLI cross-backend walk** (PR-E) — ✅ DONE: the
+   harness op/model/invariants/fault extracted behind a `Backend` trait into the
+   shared `omnigraph-dst` crate, so the same seeded walk runs embedded AND via the
+   CLI subprocess (`cli_cross_backend_walk`, see D5 table). **Still ⏸️/❌:**
+   long-lived *server* backend walk (deferred — `parity_matrix` covers single-op
+   CLI-vs-server), `cargo-fuzz`/libFuzzer (needs nightly), `porcupine`
+   linearizability, vector/FTS/rrf read shapes, wrapping the main walks in
+   `with_seed`.
 
 ## The standing rule
 When a bug is found *outside* this harness, before closing it: add its row to the
