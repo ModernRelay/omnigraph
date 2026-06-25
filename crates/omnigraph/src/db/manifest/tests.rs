@@ -909,6 +909,143 @@ async fn test_batch_create_table_versions_allows_owner_branch_handoff_at_same_ve
     assert_eq!(experiment_entry.table_branch.as_deref(), Some("experiment"));
 }
 
+/// Regression (PR #307 review — Cursor Bugbot High + Codex P2): the post-publish
+/// fold (`#1b`) must reflect an owner-branch handoff. A handoff UPDATEs a
+/// `table_version` row IN PLACE at the SAME Lance version with a new
+/// `table_branch` — merge-insert `UpdateAll` on the deterministic
+/// `version_object_id(table_key, version)`, so `__manifest` ends with one row
+/// carrying the new branch. The buggy fold appended the pending row after
+/// `existing_versions`, and `assemble_manifest_state` keeps the FIRST entry at
+/// equal `table_version`, so the WARM coordinator retained the stale
+/// `table_branch` ("feature") while a fresh `read_manifest_state` reopen reflected
+/// the handoff ("experiment"). Unlike the namespace-publisher handoff test above,
+/// this commits through the coordinator's `commit` path to exercise the fold, then
+/// reads the warm `snapshot()` WITHOUT reopening.
+#[tokio::test]
+async fn test_post_publish_fold_reflects_owner_branch_handoff() {
+    let dir = tempfile::tempdir().unwrap();
+    let uri = dir.path().to_str().unwrap();
+    let catalog = build_test_catalog();
+
+    let mut main_mc = ManifestCoordinator::init(uri, &catalog).await.unwrap();
+    main_mc.create_branch("feature").await.unwrap();
+
+    // Fork Person onto `feature` at version Vf (owner = feature).
+    let snap = main_mc.snapshot();
+    let person_entry = snap.entry("node:Person").unwrap().clone();
+    let mut person_ds = Dataset::open(&format!("{}/{}", uri, person_entry.table_path))
+        .await
+        .unwrap();
+    person_ds
+        .create_branch("feature", person_entry.table_version, None)
+        .await
+        .unwrap();
+    let mut feature_ds = person_ds.checkout_branch("feature").await.unwrap();
+    let person_schema = Arc::new(feature_ds.schema().into());
+    let person_batch = RecordBatch::try_new(
+        Arc::clone(&person_schema),
+        vec![
+            Arc::new(StringArray::from(vec!["person-1"])),
+            Arc::new(StringArray::from(vec!["Alice"])),
+            Arc::new(Int32Array::from(vec![Some(30)])),
+        ],
+    )
+    .unwrap();
+    let reader = RecordBatchIterator::new(vec![Ok(person_batch)], person_schema);
+    feature_ds.append(reader, None).await.unwrap();
+    let feature_version = feature_ds.version().version;
+    let feature_metadata = table_version_metadata_for_state(
+        uri,
+        &person_entry.table_path,
+        Some("feature"),
+        feature_version,
+    )
+    .await
+    .unwrap();
+    branch_manifest_namespace(uri, Some("feature"))
+        .create_table_version(feature_metadata.to_create_table_version_request(
+            "node:Person",
+            feature_version,
+            1,
+            Some("feature"),
+        ))
+        .await
+        .unwrap();
+
+    // Create `experiment` from feature and fork Person at the SAME version Vf.
+    let mut feature_mc = ManifestCoordinator::open_at_branch(uri, "feature")
+        .await
+        .unwrap();
+    feature_mc.create_branch("experiment").await.unwrap();
+    feature_ds
+        .create_branch("experiment", feature_version, None)
+        .await
+        .unwrap();
+    let experiment_metadata = table_version_metadata_for_state(
+        uri,
+        &person_entry.table_path,
+        Some("experiment"),
+        feature_version,
+    )
+    .await
+    .unwrap();
+
+    // Publish the handoff through a WARM coordinator's `commit` (exercises the
+    // post-publish fold), NOT GraphNamespacePublisher (which reopens fresh).
+    let mut experiment_mc = ManifestCoordinator::open_at_branch(uri, "experiment")
+        .await
+        .unwrap();
+    // Pre-publish: experiment inherits feature's ownership of Person@Vf.
+    assert_eq!(
+        experiment_mc
+            .snapshot()
+            .entry("node:Person")
+            .unwrap()
+            .table_branch
+            .as_deref(),
+        Some("feature"),
+    );
+    experiment_mc
+        .commit(&[SubTableUpdate {
+            table_key: "node:Person".to_string(),
+            table_version: feature_version,
+            table_branch: Some("experiment".to_string()),
+            row_count: 1,
+            version_metadata: experiment_metadata,
+        }])
+        .await
+        .unwrap();
+
+    // Warm side: the folded known_state the commit adopted.
+    let folded_branch = experiment_mc
+        .snapshot()
+        .entry("node:Person")
+        .unwrap()
+        .table_branch
+        .clone();
+    // Oracle: a fresh reopen rebuilds known_state via `read_manifest_state`.
+    let reopened = ManifestCoordinator::open_at_branch(uri, "experiment")
+        .await
+        .unwrap();
+    let scanned_branch = reopened
+        .snapshot()
+        .entry("node:Person")
+        .unwrap()
+        .table_branch
+        .clone();
+
+    assert_eq!(
+        scanned_branch.as_deref(),
+        Some("experiment"),
+        "fresh reopen should reflect the owner-branch handoff",
+    );
+    assert_eq!(
+        folded_branch, scanned_branch,
+        "warm coordinator's folded known_state diverged from a fresh re-scan after an \
+         owner-branch handoff (folded {folded_branch:?} vs scanned {scanned_branch:?})",
+    );
+}
+
 #[tokio::test]
 async fn test_staged_namespace_lists_native_table_versions_before_publish() {
     let dir = tempfile::tempdir().unwrap();
