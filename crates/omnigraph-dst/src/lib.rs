@@ -7,5 +7,23 @@
 //! (white-box walks + regressions) and `omnigraph-cli` (cross-backend walk).
 //!
 //! Not a default-member; never built in the normal `cargo build`.
+//!
+//! Consumers:
+//!   * `omnigraph-engine` `tests/dst.rs` drives `Embedded` + the white-box
+//!     battery (the harness's core value — embedded-only by construction).
+//!   * `omnigraph-cli` `tests/cli_cross_backend_walk.rs` drives the SAME seeded
+//!     walk against `Embedded` AND `Cli`, asserting per-step black-box agreement.
 
-// (skeleton — modules land in the extraction commits)
+pub mod backend;
+pub mod fault;
+pub mod invariants;
+pub mod model;
+pub mod op;
+
+pub use backend::{Backend, BackendError, Cli, Embedded};
+pub use fault::FaultAdapter;
+pub use invariants::{
+    classify, classify_backend, classify_panic, panic_message, run_battery, Finding,
+};
+pub use model::Model;
+pub use op::{step, OpKind, Rng};
