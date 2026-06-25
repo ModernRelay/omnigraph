@@ -1725,3 +1725,57 @@ query chain($repo: String) {
         .expect("chained camelCase mutation must read the pending row, not fail at the MemTable SELECT");
     assert_eq!(r.affected_nodes, 2, "both ops should touch the acme Doc (read-your-writes)");
 }
+
+/// RFC-013 PR2 #1b: the publisher folds the new `known_state` in-memory after a
+/// publish instead of re-scanning `__manifest`. That fold MUST be byte-identical
+/// to a fresh re-scan, or the warm coordinator silently desyncs. After a sequence
+/// of writes (insert, a second insert to the same table, then a delete that
+/// advances the table version), the in-memory coordinator holds the folded state;
+/// a freshly reopened graph rebuilds it via a real `read_manifest_state` scan.
+/// Counting `node:Person` off each resolves the table at the version each side
+/// recorded — a fold that set the wrong version (or path → open failure) makes the
+/// in-memory count diverge from the reopened one. Reopen is the scan side; the live
+/// `db` is the fold side.
+#[tokio::test]
+async fn post_publish_fold_matches_fresh_reopen() {
+    let dir = tempfile::tempdir().unwrap();
+    let uri = dir.path().to_str().unwrap();
+    let mut db = init_and_load(&dir).await;
+
+    db.mutate(
+        "main",
+        MUTATION_QUERIES,
+        "insert_person",
+        &mixed_params(&[("$name", "fold_a")], &[("$age", 30)]),
+    )
+    .await
+    .unwrap();
+    db.mutate(
+        "main",
+        MUTATION_QUERIES,
+        "insert_person",
+        &mixed_params(&[("$name", "fold_b")], &[("$age", 31)]),
+    )
+    .await
+    .unwrap();
+    db.mutate(
+        "main",
+        MUTATION_QUERIES,
+        "remove_person",
+        &mixed_params(&[("$name", "fold_a")], &[]),
+    )
+    .await
+    .unwrap();
+
+    // Fold side: count resolves the snapshot from the in-memory folded known_state.
+    let folded = count_rows(&db, "node:Person").await;
+
+    // Scan side: a fresh open rebuilds known_state via `read_manifest_state`.
+    let reopened = Omnigraph::open(uri).await.unwrap();
+    let scanned = count_rows(&reopened, "node:Person").await;
+
+    assert_eq!(
+        folded, scanned,
+        "post-publish fold diverged from a fresh re-scan (folded {folded} vs scanned {scanned})"
+    );
+}
