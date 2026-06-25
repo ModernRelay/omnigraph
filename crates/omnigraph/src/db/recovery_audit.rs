@@ -14,15 +14,14 @@
 //! this change additive.
 //!
 //! Atomicity caveat: append to `_graph_commit_recoveries.lance` is
-//! sequential w.r.t. the `CommitGraph::append_commit` write. A crash
-//! between the two leaves an orphan commit-graph row with no audit row.
-//! Same shape as the existing `_graph_commits` + `_graph_commit_actors`
-//! split; the recovery sweep tolerates it the same way (re-entry sees
-//! `NoMovement` for already-restored / already-published tables; the
-//! audit append is retried).
+//! sequential w.r.t. the recovery commit, which RFC-013 Phase 7 records in
+//! `__manifest` (folded into the recovery publish CAS via `publish_recovery_commit`).
+//! A crash between the publish and this audit append leaves a recovery commit
+//! with no audit row. The recovery sweep tolerates it the same way (re-entry
+//! sees `NoMovement` for already-restored / already-published tables; the audit
+//! append is retried, minting a fresh recovery commit).
 
 use std::sync::Arc;
-use std::time::{SystemTime, UNIX_EPOCH};
 
 use arrow_array::{
     Array, RecordBatch, RecordBatchIterator, StringArray, TimestampMicrosecondArray,
@@ -195,7 +194,11 @@ async fn create_recoveries_dataset(root_uri: &str) -> Result<Dataset> {
     };
     match Dataset::write(reader, &uri as &str, Some(params)).await {
         Ok(dataset) => Ok(dataset),
-        Err(err) if err.to_string().contains("Dataset already exists") => Dataset::open(&uri)
+        // Create-or-open idempotency — match the typed `DatasetAlreadyExists`
+        // variant, not the display string (not a Lance API contract). Same
+        // discipline as `commit_graph.rs`'s create-or-open; pinned by
+        // `lance_surface_guards.rs::lance_error_dataset_already_exists_variant_exists`.
+        Err(lance::Error::DatasetAlreadyExists { .. }) => Dataset::open(&uri)
             .await
             .map_err(|open_err| OmniError::Lance(open_err.to_string())),
         Err(err) => Err(OmniError::Lance(err.to_string())),
@@ -274,13 +277,6 @@ fn decode_row(batch: &RecordBatch, row: usize) -> Result<RecoveryAuditRecord> {
         per_table_outcomes: outcomes,
         created_at: ts_col.value(row),
     })
-}
-
-pub(crate) fn now_micros() -> Result<i64> {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|d| d.as_micros() as i64)
-        .map_err(|e| OmniError::manifest_internal(format!("system clock before unix epoch: {}", e)))
 }
 
 #[cfg(test)]

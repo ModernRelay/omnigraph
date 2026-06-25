@@ -230,8 +230,9 @@ recovery sweep in `crates/omnigraph/src/db/manifest/recovery.rs`:
   rolled-back-to version (`manifest_pinned`); the manifest is published at the
   restore commit (`manifest_pinned + 1`, same content).
 - After a successful roll-forward or roll-back, an audit row is
-  recorded — `_graph_commits.lance` carries
-  a commit tagged `actor_id = "omnigraph:recovery"`, and a sibling
+  recorded — the graph commit lineage (the `graph_commit` rows in `__manifest`
+  since RFC-013 Phase 7) carries a commit tagged
+  `actor_id = "omnigraph:recovery"`, and a sibling
   `_graph_commit_recoveries.lance` row carries `recovery_kind`,
   `recovery_for_actor` (the original sidecar's actor), `operation_id`,
   per-table outcomes. Operators run `omnigraph commit list --filter
@@ -336,20 +337,40 @@ actual }`. The HTTP server maps this to **409 Conflict** with body
 
 ## Audit
 
-`actor_id` lands in `_graph_commits.lance` via `record_graph_commit` (no
-intermediate run record). Audit history is queried via `omnigraph commit
-list`.
+`actor_id` lands in the graph commit lineage — the `graph_commit` rows in
+`__manifest`, written in the publish CAS (RFC-013 Phase 7; previously
+`_graph_commits.lance`). Audit history is queried via `omnigraph commit list`.
 
 ## Migration code
 
-`db/manifest/migrations.rs` carries the v2→v3 internal-schema step (MR-770):
-a one-time sweep that deletes legacy `__run__*` staging branches off
-`__manifest`. It runs in `Omnigraph::open(ReadWrite)` (via
-`manifest::migrate_on_open`, before the coordinator reads branch state) and
-again on the publisher's write path; both are idempotent once the stamp is at
-v3. Deleting the inert `_graph_runs.lance` / `_graph_run_actors.lance` dataset
-*bytes* is still deferred — it needs a `StorageAdapter::delete_prefix`
-primitive — but those bytes are invisible to graph-level state.
+`db/manifest/migrations.rs` is the single place on-disk `__manifest` shape is
+reconciled with what the binary expects, stepping the
+`omnigraph:internal_schema_version` stamp forward one `match`-arm at a time. It
+runs in `Omnigraph::open(ReadWrite)` (via `manifest::migrate_on_open`, before the
+coordinator reads branch state) and again on the publisher's write path, so each
+branch migrates on its first write; every step is idempotent under crash-retry
+(work first, stamp bump last).
+
+- **v2→v3** (MR-770): a one-time sweep that deletes legacy `__run__*` staging
+  branches off `__manifest`. Deleting the inert `_graph_runs.lance` /
+  `_graph_run_actors.lance` dataset *bytes* is still deferred — it needs a
+  `StorageAdapter::delete_prefix` primitive — but those bytes are invisible to
+  graph-level state.
+- **v3→v4** (RFC-013 Phase 7, `migrate_v3_to_v4`): backfills the graph lineage
+  from `_graph_commits.lance` into `__manifest` as `graph_commit` / `graph_head`
+  rows. A graph created before Phase 7 has its lineage only in
+  `_graph_commits.lance`; the new binary reads lineage from the `__manifest`
+  projection, so without this backfill it would see an empty commit DAG. The
+  backfill is per-branch (each branch migrates on its first write), idempotent
+  (keyed on `object_id`; a fast-path guard skips when `__manifest` already
+  carries `graph_commit` rows), and writes exactly one `graph_head:<branch>` row
+  for the actual head. `_graph_commits.lance` is left in place as the branch-ref
+  carrier — no commit row is written to it again. While a graph is below v4, a
+  **read-only** open (which never writes, so never migrates) sources the commit
+  DAG from `_graph_commits.lance` via the stamp-gated transitional fallback in
+  `CommitGraph::open*`, so reads see correct history before the first write
+  migrates the graph. An old binary opening a v4-stamped graph is refused with an
+  "upgrade omnigraph" error in both read-write and read-only modes.
 
 ## Mid-query partial failure: closed by MR-794
 

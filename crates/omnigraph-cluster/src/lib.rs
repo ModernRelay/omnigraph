@@ -1,8 +1,6 @@
 use std::collections::{BTreeMap, BTreeSet};
-use std::fs::{self, OpenOptions};
-use std::io::{ErrorKind, Write};
+use std::fs::{self};
 use std::path::{Path, PathBuf};
-use std::process;
 
 use omnigraph::db::{Omnigraph, ReadTarget, SchemaApplyOptions};
 use omnigraph_compiler::SchemaMigrationPlan;
@@ -26,11 +24,7 @@ mod store;
 mod sweep;
 mod types;
 use config::{
-    QueriesDecl, future_field_diagnostics, graph_address, initial_import_state, load_desired,
-    normalize_policy_target, observe_declared_graphs, observe_live_graph, parse_cluster_config,
-    policy_address, preview_schema_migration, query_address, resolve_config_path,
-    resolve_query_decls, schema_address, state_resource_digests, validate_cluster_header,
-    validate_id, validate_query_source,
+    QueriesDecl, graph_address, initial_import_state, load_desired, observe_declared_graphs, parse_cluster_config, preview_schema_migration, schema_address, state_resource_digests, validate_cluster_header,
 };
 use diff::{
     FailedGraphOrigin, ResourceKind, append_embedding_profile_changes,
@@ -42,13 +36,12 @@ pub use serve::{
     cluster_root_for_graph_uri, read_serving_snapshot, read_serving_snapshot_from_storage,
     resolve_graph_storage_uri,
 };
-use store::{ClusterStore, StateLockGuard, StateSnapshot};
+use store::ClusterStore;
 use sweep::{
     mark_approvals_consumed, record_approval_consumed, sweep_recovery_sidecars,
     tombstone_graph_subtree, warn_pending_recovery_sidecars,
 };
 pub use types::*;
-use types::*;
 
 pub const CLUSTER_CONFIG_FILE: &str = "cluster.yaml";
 pub const CLUSTER_GRAPHS_DIR: &str = "graphs";

@@ -3,12 +3,12 @@
 | Name | Value | Area |
 |---|---|---|
 | `MANIFEST_DIR` | `__manifest` | manifest layout |
-| Commit graph dir | `_graph_commits.lance` | commit graph |
+| Commit graph dir | `_graph_commits.lance` | branch-ref carrier + pre-v4 lineage source (lineage lives in `__manifest` since RFC-013 Phase 7) |
 | Run registry dir (legacy, removed) | `_graph_runs.lance` | inert post-v0.4.0; bytes remain until a prefix-delete primitive lands |
 | Run branch prefix (legacy, removed) | `__run__` | swept off `__manifest` by the internal schema migration; no longer a reserved name |
 | Schema apply lock | `__schema_apply_lock__` | schema apply |
 | Manifest publisher retry budget | `PUBLISHER_RETRY_BUDGET = 5` | manifest publish |
-| Internal manifest schema version | `INTERNAL_MANIFEST_SCHEMA_VERSION = 3` | manifest migrations |
+| Internal manifest schema version | `INTERNAL_MANIFEST_SCHEMA_VERSION = 4` | manifest migrations (v4 = graph lineage in `__manifest`, RFC-013 Phase 7) |
 | Merge stage batch | `MERGE_STAGE_BATCH_ROWS = 8192` | merge execution |
 | Maintenance concurrency | `OMNIGRAPH_MAINTENANCE_CONCURRENCY=8` | optimize/cleanup |
 | Lance blob compaction support | `LANCE_SUPPORTS_BLOB_COMPACTION = false` | optimize |

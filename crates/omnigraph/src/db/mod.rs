@@ -17,6 +17,8 @@ pub use omnigraph::{
     SchemaApplyResult, SkipReason, TableCleanupStats, TableOptimizeStats, TableRepairStats,
 };
 
+use crate::error::{OmniError, Result};
+
 pub(crate) const SCHEMA_APPLY_LOCK_BRANCH: &str = "__schema_apply_lock__";
 
 /// Mutation kind, threaded through the version-check call sites so the
@@ -73,4 +75,15 @@ pub(crate) fn is_internal_system_branch(name: &str) -> bool {
     // are swept off `__manifest` by the v2→v3 internal-schema migration, so the
     // only internal branch the engine still creates is the schema-apply lock.
     is_schema_apply_lock_branch(name)
+}
+
+/// Microseconds since the UNIX epoch — the `created_at` stamp threaded through
+/// every graph-lineage / recovery-audit / commit-graph row. One canonical
+/// helper so the clock-error mapping (variant + message) cannot drift across
+/// the call sites that record those timestamps.
+pub(crate) fn now_micros() -> Result<i64> {
+    let duration = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_err(|e| OmniError::manifest(format!("system clock before UNIX_EPOCH: {e}")))?;
+    Ok(duration.as_micros() as i64)
 }

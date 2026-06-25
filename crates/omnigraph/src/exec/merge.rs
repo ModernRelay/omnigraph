@@ -1795,15 +1795,20 @@ impl Omnigraph {
         // `tests/failpoints.rs::branch_merge_phase_b_failure_recovered_on_next_open`.
         crate::failpoints::maybe_fail(crate::failpoints::names::BRANCH_MERGE_POST_PHASE_B_PRE_MANIFEST_COMMIT)?;
 
-        let manifest_version = if updates.is_empty() {
-            self.version().await
-        } else {
-            self.commit_manifest_updates(&updates).await?
-        };
+        // Publish the merged table versions AND the merge commit in one manifest
+        // CAS (RFC-013 Phase 7): `graph_commit` + `graph_head` rows ride the same
+        // merge-insert as the table-version rows. The merge commit's first parent
+        // is resolved by the publisher as the live target-branch head (the
+        // post-merge correct parent even if the target advanced); its merged-in
+        // parent is the source head. `target_head_commit_id` is no longer passed
+        // — it was the pre-merge target head, which the publisher reads live.
+        let _ = target_head_commit_id;
+        self.commit_merge_with_actor(&updates, source_head_commit_id, actor_id)
+            .await?;
 
-        // Recovery sidecar lifecycle: delete after manifest publish.
-        // Best-effort cleanup; the merge already landed durably so
-        // failing the user here is undesirable.
+        // Recovery sidecar lifecycle: delete after the manifest publish (Phase C).
+        // Best-effort cleanup; the merge already landed durably so failing the
+        // user here is undesirable.
         if let Some((_, handle)) = recovery {
             if let Err(err) =
                 crate::db::manifest::delete_sidecar(&handle, self.storage_adapter()).await
@@ -1815,13 +1820,6 @@ impl Omnigraph {
                 );
             }
         }
-        self.record_merge_commit(
-            manifest_version,
-            target_head_commit_id,
-            source_head_commit_id,
-            actor_id,
-        )
-        .await?;
 
         if changed_edge_tables {
             self.invalidate_graph_index().await;

@@ -97,7 +97,9 @@ async fn optimize_on_empty_graph_returns_stats_per_table_with_no_changes() {
     // Schema declares 2 nodes + 2 edges = 4 data tables, plus the 3 internal
     // system tables (`__manifest`, `_graph_commits`, `_graph_commit_actors`) optimize
     // also compacts (RFC-013 step 2) = 7. Compaction should run on each but find
-    // nothing to merge.
+    // nothing to merge. The genesis graph commit rides the SINGLE init
+    // `__manifest` write (RFC-013 Phase 7), so a fresh graph has one fragment per
+    // table — nothing to compact anywhere.
     assert_eq!(stats.len(), 7);
     for s in &stats {
         assert_eq!(s.fragments_removed, 0, "{} should not remove", s.table_key);
@@ -143,17 +145,20 @@ async fn optimize_after_load_then_again_is_idempotent() {
     }
 }
 
-/// RFC-013 step 2: `optimize` compacts the internal system tables
-/// (`__manifest`, `_graph_commits`), which accumulate one fragment per commit.
-/// After compaction they shed fragments, write no recovery sidecar (a single
-/// atomic Lance commit — no HEAD-before-publish gap), and the graph stays
-/// coherent for subsequent reads + strict writes.
+/// RFC-013 step 2 + Phase 7: `optimize` compacts `__manifest`, which now
+/// accumulates one fragment per commit for BOTH the table-version rows and the
+/// folded-in graph-lineage rows (`graph_commit` + `graph_head`). The
+/// commit-graph datasets (`_graph_commits`, `_graph_commit_actors`) no longer
+/// take a per-commit row (lineage lives in `__manifest`), so they stay flat —
+/// nothing to compact. After compaction `__manifest` sheds fragments, writes no
+/// recovery sidecar (a single atomic Lance commit — no HEAD-before-publish gap),
+/// and the graph stays coherent for subsequent reads + strict writes.
 #[tokio::test]
 async fn optimize_compacts_internal_tables() {
     let dir = tempfile::tempdir().unwrap();
     let mut db = init_and_load(&dir).await;
 
-    // Build version-history depth so the internal tables accumulate fragments.
+    // Build version-history depth so `__manifest` accumulates fragments.
     for i in 0..20 {
         mutate_main(
             &mut db,
@@ -167,16 +172,32 @@ async fn optimize_compacts_internal_tables() {
 
     let stats = db.optimize().await.unwrap();
 
-    for key in ["__manifest", "_graph_commits"] {
+    // `__manifest` carries every per-commit fragment (table versions + lineage)
+    // and compacts.
+    let manifest_stats = stats
+        .iter()
+        .find(|s| s.table_key == "__manifest")
+        .expect("optimize stats missing internal table __manifest");
+    assert!(
+        manifest_stats.committed,
+        "__manifest should compact after 20 commits"
+    );
+    assert!(
+        manifest_stats.fragments_removed > 0,
+        "__manifest should shed fragments, removed {}",
+        manifest_stats.fragments_removed
+    );
+
+    // The commit-graph datasets take no per-commit row anymore (RFC-013 Phase 7
+    // folds lineage into `__manifest`), so they stay at one fragment — no-ops.
+    for key in ["_graph_commits", "_graph_commit_actors"] {
         let s = stats
             .iter()
             .find(|s| s.table_key == key)
             .unwrap_or_else(|| panic!("optimize stats missing internal table {key}"));
-        assert!(s.committed, "{key} should compact after 20 commits");
         assert!(
-            s.fragments_removed > 0,
-            "{key} should shed fragments, removed {}",
-            s.fragments_removed
+            !s.committed,
+            "{key} carries no per-commit rows after Phase 7 — nothing to compact"
         );
     }
 
