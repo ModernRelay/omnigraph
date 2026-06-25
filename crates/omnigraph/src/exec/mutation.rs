@@ -670,6 +670,16 @@ async fn open_table_for_mutation(
 /// the prior predicates here makes each statement contribute `|pₙ \ (p₁ ∪ …)|`,
 /// whose sum is exactly that distinct count. `base` (the original predicate) is
 /// still what gets recorded — only the count uses this exclusion.
+///
+/// The exclusion uses `IS NOT TRUE`, not `NOT`, because of SQL three-valued
+/// logic: a prior predicate referencing a column that is NULL for some row
+/// (e.g. `age > 30` on a row with NULL `age`) evaluates to UNKNOWN, and
+/// `NOT UNKNOWN` is still UNKNOWN — which a `WHERE` treats as not-matched, so
+/// the row would be wrongly dropped from this statement's scan even though the
+/// prior delete never matched it (dropping it from `deleted_ids` skips its
+/// cascade, or — if it is the only match — leaves the node undeleted). Only
+/// rows a prior predicate matched as definitely TRUE should be excluded:
+/// `(prior) IS NOT TRUE` keeps both FALSE and UNKNOWN rows.
 fn dedup_delete_filter(base: &str, prior: &[String]) -> String {
     if prior.is_empty() {
         base.to_string()
@@ -679,7 +689,7 @@ fn dedup_delete_filter(base: &str, prior: &[String]) -> String {
             .map(|p| format!("({p})"))
             .collect::<Vec<_>>()
             .join(" OR ");
-        format!("({base}) AND NOT ({excluded})")
+        format!("({base}) AND (({excluded}) IS NOT TRUE)")
     }
 }
 
