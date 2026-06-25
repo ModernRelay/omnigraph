@@ -76,9 +76,10 @@ Legend: ✅ sampled · 🟡 partial · ❌ unsampled · ⏸️ deferred-by-plan 
 | context | status | note |
 |---------|--------|------|
 | embedded backend | ✅ | the only backend |
-| **CLI / long-lived server backend** | ⏸️ | PR-D |
+| **CLI / long-lived server backend** | ❌ deferred | crate-boundary friction: harness is in `omnigraph-engine` tests, the `omnigraph` binary is in `omnigraph-cli` (`CARGO_BIN_EXE_omnigraph` is cross-package, unavailable), and the natural home — `omnigraph-cli` tests — can't reach the harness modules. Plus subprocess-per-op is slow/flaky. Needs the harness op/model extracted to a shared crate first. |
 | local FS | ✅ | |
-| **S3 (RustFS/MinIO)** | ⏸️ | PR-D |
+| **S3 (RustFS/MinIO)** | ✅ (PR-D) | `s3_battery_holds` — full battery on `s3://`, env-gated (`OMNIGRAPH_S3_TEST_BUCKET`) |
+| **parser/loader fuzz** | ✅ (PR-D) | `fuzz::*` — proptest dup/malformed-injecting; `cargo-fuzz`/libFuzzer deferred (needs nightly) |
 | single writer | ✅ | |
 | concurrent writers (one handle) | ✅ | `concurrent_walk_structural_invariants` |
 | **concurrent *opens* / ≥2 recovery sweeps** | ❌ | **the `#296` cell — see below** |
@@ -128,7 +129,12 @@ seam cannot induce a `RolledPastExpected` sidecar.
    one-winner-CAS territory. ❌ remaining.
 5. **generative** (not hand-armed) recovery faults — wrap Lance's `object_store` so
    the walk *discovers* sidecar/CAS bugs instead of the cells being scripted. ❌
-6. **vector/FTS/rrf read shapes** + **determinism/replay-equality** (PR-C) + **CLI/server/S3 backends** (PR-D). ⏸️
+6. **determinism/replay-equality** (PR-C) — ✅ DONE (`--features dst` seam +
+   `replay_equality_same_seed`). **S3 context + parser/loader fuzz** (PR-D) — ✅ DONE
+   (`s3_battery_holds`, `fuzz::*`). **Still ⏸️/❌:** CLI/server backends (deferred,
+   crate-boundary — see D5 table), `cargo-fuzz`/libFuzzer (needs nightly),
+   `porcupine` linearizability, vector/FTS/rrf read shapes, wrapping the main
+   walks in `with_seed`.
 
 ## The standing rule
 When a bug is found *outside* this harness, before closing it: add its row to the
