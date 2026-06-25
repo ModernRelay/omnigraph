@@ -10,8 +10,8 @@ use lance::dataset::scanner::{ColumnOrdering, DatasetRecordBatchStream, Scanner}
 use lance::dataset::transaction::{Operation, Transaction, TransactionBuilder};
 use lance::dataset::write::merge_insert::SourceDedupeBehavior;
 use lance::dataset::{
-    CommitBuilder, InsertBuilder, MergeInsertBuilder, WhenMatched, WhenNotMatched, WriteMode,
-    WriteParams,
+    CommitBuilder, DeleteBuilder, InsertBuilder, MergeInsertBuilder, WhenMatched, WhenNotMatched,
+    WriteMode, WriteParams,
 };
 use lance::datatypes::{BlobKind, Schema as LanceSchema};
 use lance::index::DatasetIndexExt;
@@ -885,17 +885,50 @@ impl TableStore {
         ds: &mut Dataset,
         filter: &str,
     ) -> Result<DeleteState> {
-        let delete_result = ds
-            .delete(filter)
+        // Two-phase delete so a zero-row delete is a TRUE no-op. Lance's
+        // `Dataset::delete` commits a new version even when the predicate matches
+        // nothing (`build_transaction` always emits `Operation::Delete`), which
+        // advances Lance HEAD past the manifest — the cascade then skips
+        // `record_inline` for 0 deleted rows, leaving HEAD>manifest drift that
+        // wedges the next strict write and that `repair` refuses as suspicious.
+        // `execute_uncommitted` exposes `num_deleted_rows` before any commit, so a
+        // no-match delete advances nothing (no version, no drift). Part of the
+        // staged-delete migration (iss-950 / Lance #6658 `execute_uncommitted`).
+        let staged = DeleteBuilder::new(Arc::new(ds.clone()), filter)
+            .execute_uncommitted()
             .await
             .map_err(|e| OmniError::Lance(e.to_string()))?;
-        Ok(DeleteState {
-            version: delete_result.new_dataset.version().version,
-            row_count: self.count_rows(&delete_result.new_dataset, None).await? as u64,
-            deleted_rows: delete_result.num_deleted_rows as usize,
-            version_metadata: self
-                .dataset_version_metadata(dataset_uri, &delete_result.new_dataset)?,
-        })
+
+        if staged.num_deleted_rows == 0 {
+            // Nothing matched — commit no transaction, advance no HEAD.
+            return Ok(DeleteState {
+                version: ds.version().version,
+                row_count: self.count_rows(ds, None).await? as u64,
+                deleted_rows: 0,
+                version_metadata: self.dataset_version_metadata(dataset_uri, ds)?,
+            });
+        }
+
+        // Rows matched — commit the staged delete. Mirror `commit_staged`'s
+        // `with_skip_auto_cleanup(true)` (so an upgraded graph's auto-cleanup hook
+        // cannot GC `__manifest`-pinned versions) and pass `affected_rows` for
+        // Lance's delete conflict detection.
+        let mut builder = CommitBuilder::new(Arc::new(ds.clone())).with_skip_auto_cleanup(true);
+        if let Some(affected_rows) = staged.affected_rows {
+            builder = builder.with_affected_rows(affected_rows);
+        }
+        let new_dataset = builder
+            .execute(staged.transaction)
+            .await
+            .map_err(|e| OmniError::Lance(e.to_string()))?;
+        let state = DeleteState {
+            version: new_dataset.version().version,
+            row_count: self.count_rows(&new_dataset, None).await? as u64,
+            deleted_rows: staged.num_deleted_rows as usize,
+            version_metadata: self.dataset_version_metadata(dataset_uri, &new_dataset)?,
+        };
+        *ds = new_dataset;
+        Ok(state)
     }
 
     // ─── Staged-write API ────────────────────────────────────────────────────
