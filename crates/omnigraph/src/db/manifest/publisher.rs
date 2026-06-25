@@ -482,8 +482,16 @@ impl GraphNamespacePublisher {
             }
         }
 
-        let mut version_entries: Vec<SubTableEntry> =
-            existing_versions.values().cloned().collect();
+        // Key version entries by `(table_key, table_version)` so a pending row at
+        // the SAME version REPLACES the pre-publish entry — modelling merge-insert
+        // `UpdateAll` on the shared, deterministic `version_object_id(table_key,
+        // version)`. Load-bearing for the owner-branch handoff
+        // (`is_owner_branch_handoff`): a handoff updates a `table_version` row in
+        // place at the same version with a new `table_branch`, so `__manifest` ends
+        // with ONE row carrying the new branch and a re-scan reflects it; appending
+        // the pending row instead (and letting `assemble_manifest_state` keep the
+        // first equal-version entry) would leave `known_state` on the stale fork.
+        let mut version_map: HashMap<(String, u64), SubTableEntry> = existing_versions.clone();
         let mut tombstones: Vec<(String, u64)> = existing_tombstones
             .keys()
             .map(|(key, version)| (key.clone(), *version))
@@ -492,6 +500,12 @@ impl GraphNamespacePublisher {
         for row in rows {
             match row.object_type.as_str() {
                 OBJECT_TYPE_TABLE_VERSION => {
+                    let table_version = row.table_version.ok_or_else(|| {
+                        OmniError::manifest_internal(format!(
+                            "post-publish fold: table_version row missing version for {}",
+                            row.table_key
+                        ))
+                    })?;
                     let table_path =
                         table_locations.get(&row.table_key).cloned().ok_or_else(|| {
                             OmniError::manifest_internal(format!(
@@ -505,24 +519,22 @@ impl GraphNamespacePublisher {
                             row.table_key
                         ))
                     })?;
-                    version_entries.push(SubTableEntry {
-                        table_key: row.table_key.clone(),
-                        table_path,
-                        table_version: row.table_version.ok_or_else(|| {
-                            OmniError::manifest_internal(format!(
-                                "post-publish fold: table_version row missing version for {}",
-                                row.table_key
-                            ))
-                        })?,
-                        table_branch: row.table_branch.clone(),
-                        row_count: row.row_count.ok_or_else(|| {
-                            OmniError::manifest_internal(format!(
-                                "post-publish fold: table_version row missing row_count for {}",
-                                row.table_key
-                            ))
-                        })?,
-                        version_metadata: TableVersionMetadata::from_json_str(metadata_json)?,
-                    });
+                    version_map.insert(
+                        (row.table_key.clone(), table_version),
+                        SubTableEntry {
+                            table_key: row.table_key.clone(),
+                            table_path,
+                            table_version,
+                            table_branch: row.table_branch.clone(),
+                            row_count: row.row_count.ok_or_else(|| {
+                                OmniError::manifest_internal(format!(
+                                    "post-publish fold: table_version row missing row_count for {}",
+                                    row.table_key
+                                ))
+                            })?,
+                            version_metadata: TableVersionMetadata::from_json_str(metadata_json)?,
+                        },
+                    );
                 }
                 OBJECT_TYPE_TABLE_TOMBSTONE => {
                     let tombstone_version = row.table_version.ok_or_else(|| {
@@ -537,7 +549,7 @@ impl GraphNamespacePublisher {
             }
         }
 
-        Ok((version_entries, tombstones))
+        Ok((version_map.into_values().collect(), tombstones))
     }
 
     /// Compare each caller-supplied expectation against the manifest's current
