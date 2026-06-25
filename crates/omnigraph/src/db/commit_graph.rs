@@ -579,15 +579,16 @@ async fn load_commit_cache_for_branch(
     branch: Option<&str>,
 ) -> Result<(HashMap<String, GraphCommit>, Option<GraphCommit>)> {
     let stamp = crate::db::manifest::internal_schema_stamp_at(root_uri, branch).await?;
-    // Defense-in-depth: refuse a branch stamped PAST this binary's known version,
-    // for the same reason the main read path does (`refuse_if_internal_schema_too_new`)
-    // — a `> CURRENT` stamp means a newer binary wrote a shape we can't read, so
-    // the projection below would misread it. This is not a live hole today:
-    // migrations run main-first (`migrate_on_open` migrates main; each branch
-    // migrates on its own first write), so main's stamp is always ≥ every branch's,
-    // and the main read path already refuses before any branch read is reached. The
-    // guard closes the gap if that ordering invariant is ever weakened.
-    crate::db::manifest::refuse_if_stamp_too_new(stamp)?;
+    // Defense-in-depth: refuse a branch whose stamp this binary cannot serve —
+    // newer than CURRENT, or below MIN_SUPPORTED — for the same reason the main
+    // read path does (`refuse_if_internal_schema_unsupported`). A `> CURRENT` stamp
+    // means a newer binary wrote a shape we can't read, so the projection below
+    // would misread it; a `< MIN` stamp predates the legacy readers this binary
+    // still carries. Not a live hole today: migrations run main-first
+    // (`migrate_on_open` migrates main; each branch migrates on its own first
+    // write), so main's stamp bounds every branch's and the main read path already
+    // refuses first. The guard closes the gap if that ordering is ever weakened.
+    crate::db::manifest::refuse_if_stamp_unsupported(stamp)?;
     if stamp < crate::db::manifest::INTERNAL_MANIFEST_SCHEMA_VERSION {
         // Transitional: un-migrated v3 graph — read lineage from the legacy
         // `_graph_commits.lance` so reads (incl. read-only opens) see history.

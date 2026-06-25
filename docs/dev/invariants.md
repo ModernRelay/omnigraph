@@ -279,8 +279,17 @@ them explicit.
   idempotent terminal stamp bump (both runners write the same value, so a concurrent
   `UpdateConfig`/`IncompatibleTransaction` loss re-opens and no-ops if the stamp
   already landed). The branch read path (`load_commit_cache_for_branch`) also
-  refuses a `> CURRENT` branch stamp (defense-in-depth; not a live hole because
-  migrations run main-first, so main refuses first).
+  refuses an out-of-range branch stamp (`> CURRENT` or `< MIN_SUPPORTED`;
+  defense-in-depth; not a live hole because migrations run main-first, so main
+  refuses first). The migration chain is **floor-bounded**:
+  `MIN_SUPPORTED_INTERNAL_SCHEMA_VERSION` (migrations.rs; 1 today, a pure no-op) is
+  the oldest stamp this binary opens, enforced symmetrically with the ceiling by the
+  single `refuse_if_stamp_unsupported` guard at all three stamp-read sites
+  (write-path migrate, read-only open, branch lineage-read). Raising MIN sheds the
+  now-dead `migrate_vN_…` arms and (at MIN ≥ 4) the `commit_graph_legacy_v3` legacy
+  readers; a compile-time tripwire (`LOWEST_REGISTERED_MIGRATION_SOURCE`) fails the
+  build if the floor and the lowest registered arm drift. Retirement runbook lives on
+  the `MIN_SUPPORTED_INTERNAL_SCHEMA_VERSION` doc-comment.
 - **Planner capability/stat surfaces:** cost-aware planning, complete
   capability advertisement, and explain-with-cost are roadmap. Do not describe
   them as implemented.

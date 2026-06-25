@@ -1822,6 +1822,49 @@ async fn future_stamp_is_refused_in_both_open_modes() {
 }
 
 #[tokio::test]
+async fn sub_floor_stamp_is_refused_in_both_open_modes() {
+    use crate::db::{Omnigraph, OpenMode};
+    use crate::storage::storage_for_uri;
+
+    let dir = tempfile::tempdir().unwrap();
+    let uri = dir.path().to_str().unwrap();
+    Omnigraph::init(uri, "node Person { name: String }\n")
+        .await
+        .unwrap();
+
+    // Stamp below MIN_SUPPORTED (1 today). No real graph carries 0 — `read_stamp`
+    // floors an absent stamp at 1 — so this is the symmetric twin of
+    // `future_stamp_is_refused_in_both_open_modes`, exercising the floor the
+    // combined `refuse_if_stamp_unsupported` guard adds at every open mode
+    // (write-path migrate, read-only open, and the branch lineage-read path). The
+    // upper side — a graph at exactly MIN migrating to CURRENT — is covered by
+    // `test_publish_migrates_pre_stamp_manifest_to_current_version`, where an
+    // absent stamp reads as 1 = MIN.
+    {
+        let mut ds = open_manifest_dataset(uri, None).await.unwrap();
+        ds.update_schema_metadata([(
+            "omnigraph:internal_schema_version".to_string(),
+            Some("0".to_string()),
+        )])
+        .await
+        .unwrap();
+    }
+
+    let storage = storage_for_uri(uri).unwrap();
+    for mode in [OpenMode::ReadWrite, OpenMode::ReadOnly] {
+        let err = match Omnigraph::open_with_storage_and_mode(uri, Arc::clone(&storage), mode).await
+        {
+            Ok(_) => panic!("{mode:?}: a sub-floor graph must be refused"),
+            Err(err) => err,
+        };
+        assert!(
+            err.to_string().contains("migrate it forward"),
+            "{mode:?}: expected a migrate-forward floor refusal, got: {err}",
+        );
+    }
+}
+
+#[tokio::test]
 async fn crash_after_merge_before_stamp_completes_on_next_open() {
     let dir = tempfile::tempdir().unwrap();
     let uri = dir.path().to_str().unwrap();
@@ -1987,7 +2030,7 @@ async fn v3_branch_migration_backfills_branch_manifest_and_leaves_main_untouched
 // `load_commit_cache_for_branch` handled `< CURRENT` (the v3 fallback) and
 // `>= CURRENT` (the manifest projection), but never a `> CURRENT` branch stamp —
 // it would misread a future shape with the projection. The main read path already
-// refuses (`refuse_if_internal_schema_too_new`), and migrations run main-first so
+// refuses (`refuse_if_internal_schema_unsupported`), and migrations run main-first so
 // main's stamp ≥ every branch's — so this is not a live hole today. The guard is
 // defense-in-depth against that ordering invariant ever weakening. Here we
 // synthesize the unreachable state directly (force-stamp a branch past CURRENT)

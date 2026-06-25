@@ -35,7 +35,7 @@ pub(crate) use metadata::TableVersionMetadata;
 use metadata::{OMNIGRAPH_ROW_COUNT_KEY, table_version_metadata_for_state};
 #[cfg(test)]
 use namespace::{branch_manifest_namespace, staged_table_namespace};
-pub(crate) use migrations::refuse_if_stamp_too_new;
+pub(crate) use migrations::refuse_if_stamp_unsupported;
 pub(crate) use publisher::LineageIntent;
 use publisher::{GraphNamespacePublisher, ManifestBatchPublisher, PublishOutcome};
 pub(crate) use recovery::{
@@ -108,13 +108,15 @@ pub(crate) async fn internal_schema_stamp_at(root_uri: &str, branch: Option<&str
     Ok(migrations::read_stamp(&dataset))
 }
 
-/// Refuse to open a graph whose `__manifest` is stamped past this binary's known
-/// internal-schema version. The read-only open path calls this (it skips the
-/// write-path migration, which is where the refusal otherwise lives) so an old
-/// binary still refuses a newer graph instead of silently misreading it.
-pub(crate) async fn refuse_if_internal_schema_too_new(root_uri: &str) -> Result<()> {
+/// Refuse to open a graph whose `__manifest` is stamped outside this binary's
+/// supported internal-schema range (newer than CURRENT, or older than
+/// MIN_SUPPORTED). The read-only open path calls this — it skips the write-path
+/// migration where the refusal otherwise lives — so an old binary still refuses a
+/// newer graph instead of silently misreading it, and a too-new binary refuses a
+/// below-floor graph instead of opening an unmigrated one.
+pub(crate) async fn refuse_if_internal_schema_unsupported(root_uri: &str) -> Result<()> {
     let stamp = internal_schema_stamp_at(root_uri, None).await?;
-    migrations::refuse_if_stamp_too_new(stamp)
+    migrations::refuse_if_stamp_unsupported(stamp)
 }
 
 /// The internal-schema version this binary writes. Exposed so the v3-read

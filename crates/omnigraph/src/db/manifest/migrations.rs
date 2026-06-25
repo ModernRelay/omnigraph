@@ -62,6 +62,47 @@ use super::state::{GraphLineageRow, graph_lineage_row_parts, merge_lineage_rows,
 ///   branch-ref carrier; no commit rows are ever written to it again.
 pub(crate) const INTERNAL_MANIFEST_SCHEMA_VERSION: u32 = 4;
 
+/// The oldest on-disk internal-schema stamp this binary will open. A graph below
+/// this floor is refused (`refuse_if_stamp_unsupported`) with a "migrate it
+/// forward with an older release first" error, instead of obliging this binary to
+/// carry that version's `migrate_vN_…` arm and the legacy readers it needs
+/// forever. Raising the floor is how the migration chain sheds old code.
+///
+/// **Retirement runbook** — turning "accumulates forever" into a sliding window:
+/// 1. *Shed version N* once no graph below `N+1` remains in the fleet: bump this
+///    floor AND `LOWEST_REGISTERED_MIGRATION_SOURCE` to `N+1`, then delete the
+///    `N =>` arm in `migrate_internal_schema`, `migrate_vN_to_vN+1`, and its
+///    helpers + tests. The tripwire test keeps the two consts in lockstep, so a
+///    half-done shed fails CI.
+/// 2. *Retire the v3 legacy readers entirely* once MIN ≥ 4: `git rm` the
+///    `commit_graph/commit_graph_legacy_v3.rs` seam file and flip the single
+///    `stamp < CURRENT` gate in `load_commit_cache_for_branch` to read the
+///    manifest projection unconditionally.
+///
+/// MIN = 1 today is a pure no-op: `read_stamp` floors an absent stamp at 1 and no
+/// real graph carries 0, so nothing is refused.
+pub(crate) const MIN_SUPPORTED_INTERNAL_SCHEMA_VERSION: u32 = 1;
+
+/// The lowest `current` value the `migrate_internal_schema` dispatcher still has a
+/// `match` arm for. Mirrors the lowest registered migration source so a floor bump
+/// that forgets to delete the now-dead arm (or vice versa) is caught by the
+/// compile-time tripwire below. Migration arms aren't an enumerable registry, so
+/// this hand-mirrored const is the minimal enforced coupling — cheaper than
+/// reshaping the dispatcher into a data-driven table.
+const LOWEST_REGISTERED_MIGRATION_SOURCE: u32 = 1;
+
+/// Retirement tripwire (compile-time): the refusal floor and the lowest migration
+/// arm must move together. Raising `MIN_SUPPORTED` without deleting the now-dead
+/// below-floor arm — or vice versa — fails the build with this message, which is
+/// stronger than a runtime test and impossible to skip. Migration arms can't be
+/// enumerated, so this const-mirror is the check.
+const _: () = assert!(
+    LOWEST_REGISTERED_MIGRATION_SOURCE == MIN_SUPPORTED_INTERNAL_SCHEMA_VERSION,
+    "internal-schema floor drifted from the lowest registered migration arm: when raising \
+     MIN_SUPPORTED_INTERNAL_SCHEMA_VERSION, delete every below-floor `N =>` arm + migrate_vN_… \
+     + its helpers/tests and bump LOWEST_REGISTERED_MIGRATION_SOURCE to match (or vice versa)",
+);
+
 const INTERNAL_SCHEMA_VERSION_KEY: &str = "omnigraph:internal_schema_version";
 const OBJECT_ID_PK_KEY: &str = "lance-schema:unenforced-primary-key";
 
@@ -82,16 +123,29 @@ pub(super) async fn stamp_current_version(dataset: &mut Dataset) -> Result<()> {
     set_stamp(dataset, INTERNAL_MANIFEST_SCHEMA_VERSION).await
 }
 
-/// Refuse to open a manifest stamped at a version this binary does not know,
-/// with a clear "upgrade omnigraph first" error. Shared by the write-path
-/// migration dispatcher and the read-only open guard (a read-only open of a
-/// future-stamped graph must still refuse, even though it never writes).
-pub(crate) fn refuse_if_stamp_too_new(stamp: u32) -> Result<()> {
+/// Refuse to open a manifest whose stamp this binary cannot serve — in either
+/// direction — with a clear upgrade path. Shared by every place a stamp is read
+/// and enforced: the write-path migration dispatcher, the read-only open guard,
+/// and the branch lineage-read path. Checking both bounds in one function means a
+/// new stamp-reading caller gets the floor and the ceiling together and cannot
+/// half-enforce.
+///
+/// - `stamp > CURRENT`: the graph was written by a newer binary — upgrade omnigraph.
+/// - `stamp < MIN_SUPPORTED`: the graph predates the oldest migration this binary
+///   still carries — migrate it forward with an older release first, then reopen.
+pub(crate) fn refuse_if_stamp_unsupported(stamp: u32) -> Result<()> {
     if stamp > INTERNAL_MANIFEST_SCHEMA_VERSION {
         return Err(OmniError::manifest(format!(
             "__manifest is stamped at internal schema v{} but this binary expects v{} \
              — upgrade omnigraph before opening this graph",
             stamp, INTERNAL_MANIFEST_SCHEMA_VERSION,
+        )));
+    }
+    if stamp < MIN_SUPPORTED_INTERNAL_SCHEMA_VERSION {
+        return Err(OmniError::manifest(format!(
+            "__manifest is stamped at internal schema v{} but this binary supports v{} or later \
+             — open it with an older omnigraph release to migrate it forward first, then reopen",
+            stamp, MIN_SUPPORTED_INTERNAL_SCHEMA_VERSION,
         )));
     }
     Ok(())
@@ -114,7 +168,7 @@ pub(super) async fn migrate_internal_schema(
 ) -> Result<()> {
     let mut current = read_stamp(dataset);
 
-    refuse_if_stamp_too_new(current)?;
+    refuse_if_stamp_unsupported(current)?;
 
     while current < INTERNAL_MANIFEST_SCHEMA_VERSION {
         match current {
@@ -463,4 +517,33 @@ async fn set_stamp(dataset: &mut Dataset, version: u32) -> Result<()> {
 #[cfg(any(test, feature = "failpoints"))]
 pub(crate) async fn set_stamp_for_test(dataset: &mut Dataset, version: u32) -> Result<()> {
     set_stamp(dataset, version).await
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The floor never refuses any stamp the binary can actually serve — a graph
+    /// at MIN through CURRENT passes, only sub-MIN / super-CURRENT are rejected.
+    /// With MIN = 1 and CURRENT = 4 this proves the live range is exactly [1, 4]
+    /// and that the floor is a no-op for every real graph (lowest real stamp is 1).
+    #[test]
+    fn unsupported_guard_accepts_exactly_the_supported_range() {
+        for stamp in MIN_SUPPORTED_INTERNAL_SCHEMA_VERSION..=INTERNAL_MANIFEST_SCHEMA_VERSION {
+            assert!(
+                refuse_if_stamp_unsupported(stamp).is_ok(),
+                "stamp v{stamp} is within [MIN, CURRENT] and must be accepted"
+            );
+        }
+        if MIN_SUPPORTED_INTERNAL_SCHEMA_VERSION > 0 {
+            assert!(
+                refuse_if_stamp_unsupported(MIN_SUPPORTED_INTERNAL_SCHEMA_VERSION - 1).is_err(),
+                "a sub-floor stamp must be refused"
+            );
+        }
+        assert!(
+            refuse_if_stamp_unsupported(INTERNAL_MANIFEST_SCHEMA_VERSION + 1).is_err(),
+            "a future stamp must be refused"
+        );
+    }
 }

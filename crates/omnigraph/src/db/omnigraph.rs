@@ -419,12 +419,12 @@ impl Omnigraph {
             crate::db::manifest::migrate_on_open(&root).await?;
         } else {
             // A read-only open skips `migrate_on_open` (no object-store writes),
-            // which is where the forward-version refusal otherwise lives. Still
-            // refuse a `__manifest` stamped past this binary's known internal
-            // schema, so an old binary cannot silently misread a newer graph
-            // (e.g. one folded to internal-schema v4 lineage). Read-only, no
-            // write.
-            crate::db::manifest::refuse_if_internal_schema_too_new(&root).await?;
+            // which is where the version refusal otherwise lives. Still refuse a
+            // `__manifest` stamped outside this binary's supported range — newer
+            // than CURRENT (an old binary cannot silently misread a newer graph,
+            // e.g. one folded to internal-schema v4 lineage), or below
+            // MIN_SUPPORTED (predates the readers we carry). Read-only, no write.
+            crate::db::manifest::refuse_if_internal_schema_unsupported(&root).await?;
         }
         // Open the coordinator first so the schema-staging recovery sweep can
         // compare its snapshot against any leftover staging files.
