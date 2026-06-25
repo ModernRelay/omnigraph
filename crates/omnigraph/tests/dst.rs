@@ -22,36 +22,45 @@ use std::panic::AssertUnwindSafe;
 use std::sync::Arc;
 
 use futures::FutureExt;
-use omnigraph::db::ReadTarget;
+use omnigraph::db::{Omnigraph, ReadTarget};
 use omnigraph::loader::{LoadMode, load_jsonl};
 use omnigraph_compiler::ir::ParamMap;
 
-#[path = "dst/op.rs"]
-mod op;
-#[path = "dst/model.rs"]
-mod model;
-#[path = "dst/fault.rs"]
-mod fault;
-#[path = "dst/invariants.rs"]
-mod invariants;
+// The reusable harness primitives (op alphabet, reference model, white-box
+// battery, fault adapter, the `Backend` trait + `Embedded`/`Cli`) live in the
+// shared `omnigraph-dst` crate so the SAME walk can also run cross-backend (see
+// `omnigraph-cli/tests/cli_cross_backend_walk.rs`). This binary is the embedded
+// consumer: it adds the named regressions + the white-box generative walk.
+use omnigraph_dst::backend::Embedded;
+use omnigraph_dst::invariants::{self, Finding, classify, classify_backend, run_battery};
+use omnigraph_dst::model::Model;
+use omnigraph_dst::op::{self, Rng, doc, knows, person};
+
+// Engine-local modules that stay in-tree (they drive the `Omnigraph` handle /
+// compiler / loader directly, with no Backend abstraction): the coverage ledger,
+// the D2×D3 read-shape battery, the proptest-state-machine shrinking campaign,
+// and the parser/loader fuzz.
+//
+// NOTE: the failpoint-gated recovery cells live in their OWN binary
+// (`tests/dst_recovery.rs`), not here — the process-global `fail` registry would
+// otherwise leak armed failpoints into these (non-serial, parallel) walks.
 #[path = "dst/coverage.rs"]
 mod coverage;
-#[path = "dst/backend.rs"]
-mod backend;
 #[path = "dst/readshape.rs"]
 mod readshape;
 #[path = "dst/statemachine.rs"]
 mod statemachine;
 #[path = "dst/fuzz.rs"]
 mod fuzz;
-// NOTE: the failpoint-gated recovery cells live in their OWN binary
-// (`tests/dst_recovery.rs`), not here — the process-global `fail` registry would
-// otherwise leak armed failpoints into these (non-serial, parallel) walks.
 
 use coverage::Coverage;
-use invariants::{Finding, classify, run_battery};
-use model::Model;
-use op::{Rng, doc, knows, person};
+
+/// A raw embedded graph for the white-box regressions/scenarios — they drive the
+/// `Omnigraph` handle directly. The generative walk uses `Embedded` (the Backend
+/// impl) instead so the same code can run cross-backend.
+async fn open_clean(uri: &str) -> Omnigraph {
+    Omnigraph::init(uri, op::SCHEMA).await.expect("init")
+}
 
 // ═══════════════════════════ named regressions ════════════════════════════
 
@@ -61,7 +70,7 @@ use op::{Rng, doc, knows, person};
 #[tokio::test]
 async fn regression_rc1_stale_view_on_delete_combo() {
     let dir = tempfile::tempdir().unwrap();
-    let db = backend::open_clean(dir.path().to_str().unwrap()).await;
+    let db = open_clean(dir.path().to_str().unwrap()).await;
     let mut seed = String::new();
     for i in 0..50 {
         seed.push_str(&person(&format!("p{i}")));
@@ -87,7 +96,7 @@ async fn regression_rc1_stale_view_on_delete_combo() {
 #[tokio::test]
 async fn regression_rc_x_btree_from_sorted_iter() {
     let dir = tempfile::tempdir().unwrap();
-    let db = Arc::new(backend::open_clean(dir.path().to_str().unwrap()).await);
+    let db = Arc::new(open_clean(dir.path().to_str().unwrap()).await);
     const FRAGS: usize = 3;
     const PER: usize = 600;
     for frag in 0..FRAGS {
@@ -155,7 +164,7 @@ async fn regression_rc_x_btree_from_sorted_iter() {
 #[tokio::test]
 async fn regression_dup_key_under_concurrency() {
     let dir = tempfile::tempdir().unwrap();
-    let db = Arc::new(backend::open_clean(dir.path().to_str().unwrap()).await);
+    let db = Arc::new(open_clean(dir.path().to_str().unwrap()).await);
     let workers = 4usize;
     let keys = 500usize;
     let mut handles = Vec::new();
@@ -203,7 +212,7 @@ async fn regression_dup_key_under_concurrency() {
 #[tokio::test]
 async fn regression_self_loop_not_traversable() {
     let dir = tempfile::tempdir().unwrap();
-    let db = backend::open_clean(dir.path().to_str().unwrap()).await;
+    let db = open_clean(dir.path().to_str().unwrap()).await;
     load_jsonl(&db, &person("s0"), LoadMode::Merge).await.unwrap();
     load_jsonl(&db, &knows("s0", "s0"), LoadMode::Merge).await.unwrap();
 
@@ -255,7 +264,7 @@ async fn concurrent_walk_structural_invariants() {
     let mut reproduced: Vec<String> = Vec::new();
     for seed in 0..3u64 {
         let dir = tempfile::tempdir().unwrap();
-        let db = Arc::new(backend::open_clean(dir.path().to_str().unwrap()).await);
+        let db = Arc::new(open_clean(dir.path().to_str().unwrap()).await);
         let actors = 4usize;
         let mut handles = Vec::new();
         for a in 0..actors {
@@ -347,7 +356,7 @@ async fn person_exists(db: &omnigraph::db::Omnigraph, branch: &str, slug: &str) 
 #[tokio::test]
 async fn branch_isolation_and_merge() {
     let dir = tempfile::tempdir().unwrap();
-    let db = backend::open_clean(dir.path().to_str().unwrap()).await;
+    let db = open_clean(dir.path().to_str().unwrap()).await;
     let mut seed = String::new();
     for i in 0..5 {
         seed.push_str(&person(&format!("p{i}")));
@@ -462,9 +471,9 @@ async fn run_walk(faults: bool) {
         let dir = tempfile::tempdir().unwrap();
         let uri = dir.path().to_str().unwrap();
         let mut db = if faults {
-            backend::open_faulted(uri, seed, 8).await
+            Embedded::open_faulted(uri, seed, 8).await
         } else {
-            backend::open_clean(uri).await
+            Embedded::open_clean(uri).await
         };
         let mut rng = Rng::new(seed);
         let mut model = Model::new();
@@ -477,7 +486,7 @@ async fn run_walk(faults: bool) {
             // faulted walk continues fault-free after it — acceptable.)
             if step_i > 0 && rng.below(100) < 15 {
                 drop(db);
-                db = backend::reopen(uri).await;
+                db = Embedded::reopen(uri).await;
                 cov.op(op::OpKind::Reopen);
             }
             // A fault-injection / depth DST harness must treat a substrate PANIC
@@ -504,8 +513,7 @@ async fn run_walk(faults: bool) {
             };
             cov.op(kind);
             if let Err(e) = res {
-                let f = Finding::Engine(e);
-                match classify(&f) {
+                match classify_backend(&e) {
                     Some(bug) => {
                         cov.finding(bug);
                         reproduced.push(format!("seed={seed} step={step_i} op[{kind:?}] -> {bug}"));
@@ -514,7 +522,7 @@ async fn run_walk(faults: bool) {
                     // Fault injection legitimately fails writes in varied ways;
                     // the INVARIANT checks below stay strict.
                     None if faults => {}
-                    None => panic!("seed={seed} step={step_i}: NOVEL op error: {}", f.message()),
+                    None => panic!("seed={seed} step={step_i}: NOVEL op error: {}", e.message()),
                 }
             }
             let battery = match AssertUnwindSafe(run_battery(&db, &model)).catch_unwind().await {
@@ -556,7 +564,7 @@ async fn run_walk(faults: bool) {
         // prove the sweep left no residual drift. Reuses the same battery at
         // durability time, so no separate coverage cell.
         drop(db);
-        let reopened = backend::reopen(uri).await;
+        let reopened = Embedded::reopen(uri).await;
         for (name, res) in run_battery(&reopened, &model).await {
             if let Err(f) = res {
                 match classify(&f) {
@@ -616,7 +624,7 @@ async fn s3_battery_holds() {
         eprintln!("skipping s3 dst battery: OMNIGRAPH_S3_TEST_BUCKET unset");
         return;
     };
-    let db = backend::open_clean(&uri).await;
+    let db = Embedded::open_clean(&uri).await;
     let mut rng = Rng::new(1);
     let mut model = Model::new();
     for _ in 0..8 {

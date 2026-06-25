@@ -3,7 +3,7 @@
 
 use std::collections::HashSet;
 
-use crate::op::OpKind;
+use omnigraph_dst::op::OpKind;
 
 #[derive(Default)]
 pub struct Coverage {

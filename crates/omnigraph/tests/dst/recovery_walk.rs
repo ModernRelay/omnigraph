@@ -24,8 +24,7 @@ use omnigraph::failpoints::{ScopedFailPoint, names};
 use omnigraph_compiler::ir::ParamMap;
 use serial_test::serial;
 
-use crate::backend;
-use crate::invariants::{self, Finding, classify};
+use omnigraph_dst::invariants::{self, Finding, classify};
 
 /// The structural (model-free) battery — valid even after a roll-forward
 /// changes the visible state, unlike count==model.
@@ -53,7 +52,7 @@ fn judge(findings: Vec<(&'static str, Result<(), Finding>)>, ctx: &str) {
 /// Phase B, and confirm exactly one sidecar persists. Returns having left the
 /// graph at `uri` with a pending `RolledPastExpected` sidecar.
 async fn induce_pending_sidecar(uri: &str, slug: &str) {
-    let db = backend::reopen(uri).await;
+    let db = crate::reopen(uri).await;
     let _fp = ScopedFailPoint::new(names::MUTATION_POST_FINALIZE_PRE_PUBLISHER, "return");
     let q = format!("query i() {{ insert Person {{ slug: \"{slug}\", name: \"n\" }} }}");
     let err = db.mutate("main", &q, "i", &ParamMap::new()).await.unwrap_err();
@@ -79,13 +78,13 @@ async fn recovery_rolls_forward_under_finalize_failure() {
     let _scenario = FailScenario::setup();
     let dir = tempfile::tempdir().unwrap();
     let uri = dir.path().to_str().unwrap().to_string();
-    drop(backend::open_clean(&uri).await); // init the graph
+    drop(crate::open_clean(&uri).await); // init the graph
 
     induce_pending_sidecar(&uri, "eve").await;
     assert_eq!(sidecar_count(&uri), 1, "a sidecar must persist for recovery");
 
     // Reopen runs the sweep → rolls forward → converges.
-    let db = backend::reopen(&uri).await;
+    let db = crate::reopen(&uri).await;
     assert_eq!(sidecar_count(&uri), 0, "sweep must delete the sidecar");
     let n = db
         .query(
@@ -154,7 +153,7 @@ async fn concurrent_opens_converge_on_pending_sidecar() {
     let _scenario = FailScenario::setup();
     let dir = tempfile::tempdir().unwrap();
     let uri = dir.path().to_str().unwrap().to_string();
-    drop(backend::open_clean(&uri).await);
+    drop(crate::open_clean(&uri).await);
 
     induce_pending_sidecar(&uri, "race").await;
     assert_eq!(sidecar_count(&uri), 1);
@@ -180,6 +179,6 @@ async fn concurrent_opens_converge_on_pending_sidecar() {
         .expect("the parked sweep must CONVERGE on CAS-loss, not ExpectedVersionMismatch (#296)");
 
     assert_eq!(sidecar_count(&uri), 0, "sidecar gone after both converge");
-    let db = backend::reopen(&uri).await;
+    let db = crate::reopen(&uri).await;
     judge(structural_battery(&db).await, "post-concurrent-converge");
 }

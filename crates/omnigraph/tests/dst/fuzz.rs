@@ -17,8 +17,6 @@ use omnigraph::loader::{LoadMode, load_jsonl};
 use omnigraph_compiler::find_named_query;
 use omnigraph_compiler::schema::parser::parse_schema;
 
-use crate::backend;
-
 /// Random GQ-token sequences — far likelier to reach deep parser states (and
 /// their panics) than purely random bytes.
 fn arb_gq() -> impl Strategy<Value = String> {
@@ -116,7 +114,7 @@ proptest! {
 #[tokio::test]
 async fn loader_survives_adversarial_jsonl() {
     let dir = tempfile::tempdir().unwrap();
-    let db = backend::open_clean(dir.path().to_str().unwrap()).await;
+    let db = crate::open_clean(dir.path().to_str().unwrap()).await;
 
     let adversarial: &[&str] = &[
         // duplicate @key within one batch

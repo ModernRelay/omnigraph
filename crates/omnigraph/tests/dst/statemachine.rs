@@ -27,8 +27,7 @@ use omnigraph::db::{Omnigraph, ReadTarget};
 use omnigraph::loader::{LoadMode, load_jsonl};
 use omnigraph_compiler::ir::ParamMap;
 
-use crate::backend;
-use crate::op::{doc, person};
+use omnigraph_dst::op::{doc, person};
 
 /// The reference model (also the state-machine `State`): the keys that must
 /// exist and each Doc's expected body. `BTreeMap`/`u32` keep `Debug` output
@@ -157,7 +156,7 @@ impl StateMachineTest for DstMachine {
         let rt = Runtime::new().unwrap();
         let dir = tempfile::tempdir().unwrap();
         let uri = dir.path().to_str().unwrap().to_string();
-        let db = rt.block_on(backend::open_clean(&uri));
+        let db = rt.block_on(crate::open_clean(&uri));
         Sut {
             rt,
             db,
@@ -214,7 +213,7 @@ impl StateMachineTest for DstMachine {
             "Doc id→body diverged from reference (lost/dup/stale write)"
         );
         sut.rt
-            .block_on(crate::invariants::no_duplicate_live_row_ids(&sut.db))
+            .block_on(omnigraph_dst::invariants::no_duplicate_live_row_ids(&sut.db))
             .expect("duplicate live stable row-id");
     }
 }
