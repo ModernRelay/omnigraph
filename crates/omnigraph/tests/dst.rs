@@ -42,6 +42,8 @@ mod backend;
 mod readshape;
 #[path = "dst/statemachine.rs"]
 mod statemachine;
+#[path = "dst/fuzz.rs"]
+mod fuzz;
 // NOTE: the failpoint-gated recovery cells live in their OWN binary
 // (`tests/dst_recovery.rs`), not here — the process-global `fail` registry would
 // otherwise leak armed failpoints into these (non-serial, parallel) walks.
