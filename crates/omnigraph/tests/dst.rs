@@ -295,7 +295,20 @@ async fn concurrent_walk_structural_invariants() {
             }));
         }
         for h in handles {
-            let _ = h.await; // ignore JoinError: a contained actor panic is judged by the battery
+            // A contained actor panic surfaces as a JoinError. Don't swallow it:
+            // a known substrate crash (FTS-OOB / RC-X) is recorded, but a NOVEL
+            // actor panic — one that may not leave durable corruption the battery
+            // would see — must still fail the test, exactly as the sequential
+            // walk classifies its panics.
+            if let Err(join_err) = h.await {
+                if join_err.is_panic() {
+                    let msg = invariants::panic_message(&*join_err.into_panic());
+                    match invariants::classify_panic(&msg) {
+                        Some(bug) => reproduced.push(format!("seed={seed} actor PANIC -> {bug}")),
+                        None => panic!("seed={seed}: NOVEL actor panic: {msg}"),
+                    }
+                }
+            }
         }
 
         let checks: Vec<(&str, Result<(), Finding>)> = vec![
@@ -628,7 +641,17 @@ async fn s3_battery_holds() {
     let mut rng = Rng::new(1);
     let mut model = Model::new();
     for _ in 0..8 {
-        let _ = op::step(&db, &mut rng, &mut model).await;
+        // Don't discard op errors: `step` only advances the model on success, so
+        // a swallowed S3-specific failure would leave db+model in step and let
+        // the battery pass over a real backend fault. Classify like `run_walk` —
+        // known open bugs allow-listed, any novel S3 op error fails.
+        let (_kind, res) = op::step(&db, &mut rng, &mut model).await;
+        if let Err(e) = res {
+            match classify_backend(&e) {
+                Some(_bug) => {} // known open bug — allow-listed
+                None => panic!("s3: NOVEL op error: {}", e.message()),
+            }
+        }
     }
     for (name, res) in run_battery(&db, &model).await {
         if let Err(f) = res {

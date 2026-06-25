@@ -142,8 +142,14 @@ async fn count<B: Backend>(b: &B, ty: &str) -> Result<usize, Finding> {
 pub async fn check_counts<B: Backend>(b: &B, model: &Model) -> Result<(), Finding> {
     let p = count(b, "Person").await?;
     if p != model.persons() {
+        // NB: deliberately NOT carrying the `dup-@key` marker. `classify()`
+        // allow-lists any Logical finding containing it as the known MR-714 bug,
+        // which would mask a genuine LOST WRITE (count < model) — the exact case
+        // this oracle exists to catch. Real duplicate-`@key` detection lives in
+        // `check_content` (value-level) and `invariants::no_duplicate_keys`,
+        // both of which emit the marker only when a duplicate is actually found.
         return Err(Finding::Logical(format!(
-            "count Person={p} != model={} (lost-write or dup-@key)",
+            "count Person={p} != model={} (lost-write or unexpected duplicate row)",
             model.persons()
         )));
     }
