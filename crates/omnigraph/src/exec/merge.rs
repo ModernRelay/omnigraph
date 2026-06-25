@@ -1146,11 +1146,12 @@ async fn publish_rewritten_merge_table(
             .map(|id| format!("'{}'", id.replace('\'', "''")))
             .collect();
         let filter = format!("id IN ({})", escaped.join(", "));
-        let (new_ds, _) = target_db
-            .storage_inline_residual()
-            .delete_where(&full_path, current_ds, &filter)
-            .await?;
-        current_ds = new_ds;
+        if let Some(staged_delete) = target_db.storage().stage_delete(&current_ds, &filter).await? {
+            current_ds = target_db
+                .storage()
+                .commit_staged(current_ds, staged_delete)
+                .await?;
+        }
     }
 
     // Failpoint: crash after the Phase 2 delete commit, before the index build.
@@ -1319,11 +1320,12 @@ async fn publish_adopted_delta(
             .map(|id| format!("'{}'", id.replace('\'', "''")))
             .collect();
         let filter = format!("id IN ({})", escaped.join(", "));
-        let (new_ds, _) = target_db
-            .storage_inline_residual()
-            .delete_where(&full_path, current_ds, &filter)
-            .await?;
-        current_ds = new_ds;
+        if let Some(staged_delete) = target_db.storage().stage_delete(&current_ds, &filter).await? {
+            current_ds = target_db
+                .storage()
+                .commit_staged(current_ds, staged_delete)
+                .await?;
+        }
     }
 
     // Phase 4: index coverage is reconciler-owned on the adopt path. Unlike the

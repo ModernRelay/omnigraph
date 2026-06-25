@@ -384,6 +384,15 @@ pub trait TableStorage: sealed::Sealed + Send + Sync + Debug {
         batch: RecordBatch,
     ) -> Result<StagedHandle>;
 
+    /// Stage a delete (two-phase, no HEAD advance). `None` when 0 rows match —
+    /// the table is not touched (no transaction, no version). See
+    /// `TableStore::stage_delete`.
+    async fn stage_delete(
+        &self,
+        snapshot: &SnapshotHandle,
+        filter: &str,
+    ) -> Result<Option<StagedHandle>>;
+
     /// Stage a BTREE scalar index build. MR-793 Phase 2.
     async fn stage_create_btree_index(
         &self,
@@ -739,6 +748,16 @@ impl TableStorage for TableStore {
         TableStore::stage_overwrite(self, snapshot.dataset(), batch)
             .await
             .map(StagedHandle::new)
+    }
+
+    async fn stage_delete(
+        &self,
+        snapshot: &SnapshotHandle,
+        filter: &str,
+    ) -> Result<Option<StagedHandle>> {
+        Ok(TableStore::stage_delete(self, snapshot.dataset(), filter)
+            .await?
+            .map(StagedHandle::new))
     }
 
     async fn stage_create_btree_index(
