@@ -108,22 +108,27 @@ failpoints). This is the prerequisite for the `#296` cell — the StorageAdapter
 seam cannot induce a `RolledPastExpected` sidecar.
 
 ## Prioritized gap-closure backlog
-1. **Widen the fault seam (prerequisite for everything below).** The StorageAdapter
-   wrapper misses the manifest publish (see the critic finding above). Add a
-   `--features failpoints` harness variant using `recovery.before_roll_forward_publish`
-   + the per-writer Phase-B publisher failpoints, and/or wrap Lance's `object_store`
-   at dataset open. Until this lands, manifest-CAS / sidecar faults are not reachable.
-2. **`#296` cell — concurrent `open` under a fault-induced pending sidecar** (needs #1):
-   induce a `RolledPastExpected` sidecar (failpoint at Phase-B publish), then spawn N
-   concurrent `Omnigraph::open` + a rendezvous so two sweeps race one sidecar; assert
-   every open converges (none returns `ExpectedVersionMismatch`). Caught `#296` on
-   0.7.1; guards 0.7.2.
-3. **`open`/recovery as a generated op** — ✅ DONE (the `Reopen` op): the walk now
-   drops + reopens mid-sequence, sampling the recovery sweep across walk states (not
-   only at the end). Concurrent/cross-process variants remain (needs #1/#4).
+1. **Widen the fault seam** — ✅ DONE via the `--features failpoints` variant
+   (`tests/dst_recovery.rs`, own binary so the process-global `fail` registry can't
+   leak into the main walks). `mutation.post_finalize_pre_publisher` now induces a
+   real `RolledPastExpected` sidecar — the thing the StorageAdapter wrapper could
+   not. *(The StorageAdapter seam is still off the manifest publish; failpoints are
+   the reach. A Lance `object_store` wrapper remains the option for generative —
+   not hand-armed — manifest-CAS faults.)*
+2. **`#296` cell — concurrent `open` under a pending sidecar** — ✅ DONE
+   (`concurrent_opens_converge_on_pending_sidecar`): an inline park-first rendezvous
+   at `recovery.before_roll_forward_publish` forces two sweeps to race one sidecar;
+   the CAS-loser must converge (not `ExpectedVersionMismatch`). Non-vacuous (the
+   rendezvous panics if the race never fires) + the white-box battery as oracle.
+   Guards 0.7.2 (the failpoint instrumentation was added *with* the #296 fix, so it
+   can't run against true 0.7.1).
+3. **`open`/recovery as a generated op** — ✅ DONE (the `Reopen` op): the walk drops
+   + reopens mid-sequence, sampling the sweep across walk states.
 4. **cross-process** writer/open scenarios (subprocess backend) — the documented
-   one-winner-CAS territory.
-5. **vector/FTS/rrf read shapes** + **determinism/replay-equality** (PR-C) + **CLI/server/S3 backends** (PR-D).
+   one-winner-CAS territory. ❌ remaining.
+5. **generative** (not hand-armed) recovery faults — wrap Lance's `object_store` so
+   the walk *discovers* sidecar/CAS bugs instead of the cells being scripted. ❌
+6. **vector/FTS/rrf read shapes** + **determinism/replay-equality** (PR-C) + **CLI/server/S3 backends** (PR-D). ⏸️
 
 ## The standing rule
 When a bug is found *outside* this harness, before closing it: add its row to the
