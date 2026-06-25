@@ -196,8 +196,10 @@ mutation proceeds normally with no drift to reconcile. Concrete
 contracts:
 
 - `D₂` parse-time rule: a query is either insert/update-only or
-  delete-only. Mixed → reject. Deletes still inline-commit (Lance
-  4.0.0 has no public two-phase delete); D₂ keeps the inline path safe.
+  delete-only. Mixed → reject. Deletes now stage like inserts/updates
+  (MR-A: `stage_delete` via Lance 7.0 `DeleteBuilder::execute_uncommitted`),
+  so they no longer advance HEAD inline; D₂ stays only because staged-delete
+  read-your-writes is not yet wired into the in-query pending accumulator.
 - `LoadMode::Overwrite` uses Lance `Operation::Overwrite` through the
   same staged path. Loader validation runs against the replacement
   in-memory batches before any `commit_staged`, and the publish window is
