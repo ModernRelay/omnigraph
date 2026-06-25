@@ -931,6 +931,59 @@ impl TableStore {
         Ok(state)
     }
 
+    /// Stage a delete without advancing Lance HEAD — the two-phase analogue of
+    /// `stage_merge_insert`. `DeleteBuilder::execute_uncommitted` writes the
+    /// per-fragment deletion files to object storage (Phase A) and returns an
+    /// uncommitted `Operation::Delete` transaction; HEAD does NOT advance until
+    /// `commit_staged`. A 0-row delete is a TRUE no-op: `None` (no transaction,
+    /// no fragments, no version). For a non-empty delete the returned
+    /// `StagedWrite` carries the deletion-vector-bearing `updated_fragments` as
+    /// `new_fragments` and the superseded originals (+ any fully-removed
+    /// fragments) as `removed_fragment_ids`, so `combine_committed_with_staged`
+    /// (`committed - removed + new`) makes an in-query read see the deletion.
+    /// Like `stage_merge_insert`, the commit relies on OmniGraph's per-table
+    /// write queue + manifest CAS for conflict detection, not Lance's
+    /// `affected_rows` resolver (the generic `commit_staged` does a single
+    /// attempt), so no `affected_rows` is threaded. (Staged-delete migration —
+    /// iss-950 / Lance #6658 `execute_uncommitted`.)
+    pub async fn stage_delete(&self, ds: &Dataset, filter: &str) -> Result<Option<StagedWrite>> {
+        let uncommitted = DeleteBuilder::new(Arc::new(ds.clone()), filter)
+            .execute_uncommitted()
+            .await
+            .map_err(|e| OmniError::Lance(e.to_string()))?;
+
+        if uncommitted.num_deleted_rows == 0 {
+            return Ok(None);
+        }
+
+        let (new_fragments, removed_fragment_ids) = match &uncommitted.transaction.operation {
+            Operation::Delete {
+                updated_fragments,
+                deleted_fragment_ids,
+                ..
+            } => {
+                // The originals superseded by their deletion-vector rewrites must
+                // be filtered out of the read view; `deleted_fragment_ids` are
+                // whole-fragment removals.
+                let mut removed = deleted_fragment_ids.clone();
+                removed.extend(updated_fragments.iter().map(|f| f.id));
+                (updated_fragments.clone(), removed)
+            }
+            other => {
+                return Err(OmniError::manifest_internal(format!(
+                    "stage_delete: expected Operation::Delete, got {:?}",
+                    std::mem::discriminant(other)
+                )));
+            }
+        };
+
+        Ok(Some(StagedWrite {
+            transaction: uncommitted.transaction,
+            new_fragments,
+            removed_fragment_ids,
+        }))
+    }
+
     // ─── Staged-write API ────────────────────────────────────────────────────
     //
     // These primitives wrap Lance's distributed-write API: each call writes

@@ -334,12 +334,15 @@ async fn _compile_transaction_history_for_repair_signature() -> lance::Result<()
     Ok(())
 }
 
-// --- Guard 8: Dataset::delete returns DeleteResult { new_dataset, num_deleted_rows } ---
+// --- Guard 8: DeleteBuilder::execute_uncommitted returns
+//     UncommittedDelete { transaction, affected_rows, num_deleted_rows } ---
 //
-// `table_store.rs::delete_where` consumes both fields. When MR-A migrates
-// `delete_where` to two-phase via `DeleteBuilder::execute_uncommitted`, this
-// guard updates to pin the staged path. Compile-only.
-
+// `table_store.rs::stage_delete` uses the two-phase delete (lance#6658, Lance
+// 7.0): it reads `num_deleted_rows` (0 ⇒ no-op `None`) and stages `transaction`
+// WITHOUT committing, instead of the inline `Dataset::delete`. Commit relies on
+// OmniGraph's per-table queue + manifest CAS, so `affected_rows` is never
+// threaded (pinned here only for presence — naming `RowAddrTreeMap` would pull
+// in `lance-core`). Compile-only.
 #[allow(
     dead_code,
     unreachable_code,
@@ -347,11 +350,13 @@ async fn _compile_transaction_history_for_repair_signature() -> lance::Result<()
     unused_mut,
     clippy::diverging_sub_expression
 )]
-async fn _compile_delete_result_field_shape() -> lance::Result<()> {
-    let mut ds: Dataset = unimplemented!();
-    let result: DeleteResult = ds.delete("x = 1").await?;
-    let _new_dataset: Arc<Dataset> = result.new_dataset;
-    let _num_deleted: u64 = result.num_deleted_rows;
+async fn _compile_uncommitted_delete_field_shape() -> lance::Result<()> {
+    use lance::dataset::DeleteBuilder;
+    let ds: Arc<Dataset> = unimplemented!();
+    let staged = DeleteBuilder::new(ds, "x = 1").execute_uncommitted().await?;
+    let _txn: lance::dataset::transaction::Transaction = staged.transaction;
+    let _num_deleted: u64 = staged.num_deleted_rows;
+    let _has_affected: bool = staged.affected_rows.is_some();
     Ok(())
 }
 

@@ -770,23 +770,21 @@ async fn stage_create_inverted_index_does_not_advance_head_until_commit() {
     );
 }
 
-/// Pin the inline-commit behavior of `delete_where`. Lance 6.0.1 does
-/// NOT expose a public `DeleteJob::execute_uncommitted`
-/// (`pub(crate)` — see lance-format/lance#6658). The trait deliberately
-/// does NOT introduce a `stage_delete` wrapper that would secretly
-/// inline-commit (a side-channel between the staged and inline write
-/// paths). Instead, the trait keeps `delete_where` as the only delete
-/// entry point, named honestly.
-///
-/// **When Lance #6658 lands**: this test will need to flip — replace
-/// the assertion with a `stage_delete` + `commit_staged` round-trip
-/// and remove the residual line in `docs/dev/writes.md`.
+/// Staged delete (Lance 7.0 `DeleteBuilder::execute_uncommitted`, lance#6658):
+/// `stage_delete` does NOT advance Lance HEAD (two-phase); an in-query
+/// `scan_with_staged` sees the deletion via the staged deletion-vector
+/// fragments (read-your-writes — proves `Scanner::with_fragments` applies the
+/// staged deletion files); `commit_staged` then advances HEAD and persists it;
+/// and a 0-row delete is a true no-op (`None`, no version, no fragments).
+/// Flipped from the old `delete_where_advances_head_inline_documents_residual`
+/// once the two-phase delete landed.
 #[tokio::test]
-async fn delete_where_advances_head_inline_documents_residual() {
+async fn stage_delete_does_not_advance_head_and_reads_through_staged() {
     let dir = tempfile::tempdir().unwrap();
     let uri = format!("{}/people.lance", dir.path().to_str().unwrap());
+    let store = TableStore::new(dir.path().to_str().unwrap());
 
-    let mut ds = TableStore::write_dataset(
+    let ds = TableStore::write_dataset(
         &uri,
         person_batch(&[("alice", Some(30)), ("bob", Some(25))]),
     )
@@ -794,16 +792,42 @@ async fn delete_where_advances_head_inline_documents_residual() {
     .unwrap();
     let pre_version = ds.version().version;
 
-    let result = ds.delete("id = 'alice'").await.unwrap();
-    ds = (*result.new_dataset).clone();
-    assert_eq!(result.num_deleted_rows, 1);
-    assert!(
-        ds.version().version > pre_version,
-        "delete_where ADVANCES Lance HEAD inline (the residual). When \
-         lance-format/lance#6658 ships and we migrate to stage_delete + \
-         commit_staged, flip this assertion to assert that staging does \
-         NOT advance HEAD."
+    // Stage a delete of alice — writes the deletion file (Phase A) but does
+    // NOT advance HEAD.
+    let staged = store
+        .stage_delete(&ds, "id = 'alice'")
+        .await
+        .unwrap()
+        .expect("alice matches → Some(StagedWrite)");
+    assert_eq!(
+        ds.version().version,
+        pre_version,
+        "stage_delete must NOT advance Lance HEAD (two-phase)"
     );
+
+    // Read-your-writes: a scan over the staged delete sees the deletion vector
+    // — alice is gone, bob remains.
+    let batches = store
+        .scan_with_staged(&ds, std::slice::from_ref(&staged), None, None)
+        .await
+        .unwrap();
+    assert_eq!(
+        collect_ids(&batches),
+        vec!["bob"],
+        "the staged deletion must be visible to an in-query read (deletion-vector RYW)"
+    );
+
+    // Commit advances HEAD and persists the deletion.
+    let committed = store
+        .commit_staged(std::sync::Arc::new(ds.clone()), staged.transaction)
+        .await
+        .unwrap();
+    assert!(committed.version().version > pre_version);
+    assert_eq!(committed.count_rows(None).await.unwrap(), 1);
+
+    // A 0-row delete is a true no-op: None, no version, no fragments.
+    let none = store.stage_delete(&committed, "id = 'nobody'").await.unwrap();
+    assert!(none.is_none(), "a 0-row delete must stage nothing");
 }
 
 /// Companion to `delete_where_*`: pin the inline-commit behavior of
