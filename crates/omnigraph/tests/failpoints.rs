@@ -4598,3 +4598,28 @@ async fn v4_stamp_exhaustion_returns_retryable_contention() {
          publisher's outer retry completes the open, got: {err:?}",
     );
 }
+
+// The publisher's outer retry must re-run `load_publish_state` on a RETRYABLE error,
+// not propagate it fatally. `load_publish_state` runs `migrate_internal_schema`, whose
+// bounded merge/stamp loops surface a `RowLevelCasContention` on exhaustion EXPECTING
+// this re-run (a clean second scan, by which point a concurrent winner has finished the
+// migration). Before the fix, `load_publish_state().await?` short-circuited the loop —
+// only `merge_rows` conflicts hit the retry — so the typed contention aborted the
+// publish. Inject a ONE-SHOT retryable contention into `load_publish_state`: the write
+// must still commit, because the publisher retries and the cleared second attempt wins.
+#[tokio::test]
+#[serial]
+async fn publisher_retries_retryable_load_publish_state_error() {
+    let _scenario = FailScenario::setup();
+    let dir = tempfile::tempdir().unwrap();
+    let db = helpers::init_and_load(&dir).await;
+
+    // `1*return`: fail only the FIRST `load_publish_state` of the next publish, so the
+    // retry's second call is clean. Set after `init_and_load` so its publishes are
+    // unaffected.
+    let _fp = ScopedFailPoint::new(names::PUBLISH_LOAD_STATE_RETRYABLE_CONTENTION, "1*return");
+    let row = r#"{"type":"Person","data":{"name":"Grace","age":37}}"#;
+    db.load_as("main", None, row, LoadMode::Merge, None)
+        .await
+        .expect("publisher must retry the one-shot retryable load_publish_state error and commit");
+}

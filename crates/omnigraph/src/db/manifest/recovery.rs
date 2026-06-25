@@ -1184,7 +1184,7 @@ async fn process_sidecar(
                     );
                 }
                 return record_audit_recovery_rollforward(
-                    root_uri, storage.as_ref(), snapshot, sidecar, &states,
+                    root_uri, storage.as_ref(), sidecar, &states,
                 )
                 .await
                 .map(|()| true);
@@ -1470,19 +1470,32 @@ async fn converge_or_defer_roll_forward(
         });
     }
     // RFC-013 Phase 7: the winning writer folded its recovery commit into the
-    // manifest CAS, so the converge audit references THAT commit — the branch's
-    // current `graph_head` — not a freshly minted one. (We only reach here with
-    // the sidecar still on disk: the winner advanced the manifest but crashed
-    // before its own audit+delete, so we finish its bookkeeping.)
-    let converged_commit_id = match sidecar.branch.as_deref() {
+    // manifest CAS, so the converge audit references THAT commit. We lost the CAS
+    // and never minted it, but a recovery commit is distinguishable by its
+    // `RECOVERY_ACTOR` authorship (`publish_recovery_commit`), so the latest
+    // recovery-actored commit on this branch IS it. Do NOT use the branch head:
+    // a concurrent USER write can advance `graph_head` past the recovery commit
+    // between the winner's publish and this read, which would attribute the audit
+    // row to the wrong (later, user) commit. (We only reach here with the sidecar
+    // still on disk: the winner advanced the manifest but crashed before its own
+    // audit+delete, so we finish its bookkeeping.)
+    let cache = match sidecar.branch.as_deref() {
         Some(branch) => {
             crate::db::commit_graph::CommitGraph::open_at_branch(root_uri, branch).await?
         }
         None => crate::db::commit_graph::CommitGraph::open(root_uri).await?,
-    }
-    .head_commit_id()
-    .await?
-    .unwrap_or_default();
+    };
+    let converged_commit_id = match cache
+        .load_commits()
+        .await?
+        .into_iter()
+        .rfind(|c| c.actor_id.as_deref() == Some(RECOVERY_ACTOR))
+    {
+        Some(recovery_commit) => recovery_commit.graph_commit_id,
+        // No recovery commit visible — unexpected on this path (the winner just
+        // published one); fall back to the head rather than an empty id.
+        None => cache.head_commit_id().await?.unwrap_or_default(),
+    };
     record_audit(
         root_uri,
         sidecar,
@@ -1606,11 +1619,9 @@ async fn roll_back_sidecar(
 async fn record_audit_recovery_rollforward(
     root_uri: &str,
     storage: &dyn StorageAdapter,
-    snapshot: &Snapshot,
     sidecar: &RecoverySidecar,
     states: &[ClassifiedTable],
 ) -> Result<()> {
-    let _ = snapshot;
     let outcomes: Vec<TableOutcome> = sidecar
         .tables
         .iter()

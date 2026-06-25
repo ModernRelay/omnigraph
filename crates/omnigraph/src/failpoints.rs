@@ -52,6 +52,26 @@ pub(crate) fn maybe_fail_lance_incompatible(name: &str) -> std::result::Result<(
     Ok(())
 }
 
+/// Failpoint that injects a *retryable* `RowLevelCasContention` `OmniError` — the
+/// typed conflict the manifest publisher's outer retry treats as retryable
+/// (`is_retryable_publish_conflict`). Used to drive the publisher's
+/// retry-on-`load_publish_state`-error path deterministically: the v3→v4 migration
+/// surfaces this same type on exhaustion EXPECTING the publisher to re-run the
+/// load, a path otherwise reachable only under sustained multi-writer contention.
+/// A no-op without the `failpoints` feature.
+#[allow(unused_variables)]
+pub(crate) fn maybe_fail_retryable_contention(name: &str) -> Result<()> {
+    #[cfg(feature = "failpoints")]
+    {
+        fail::fail_point!(name, |_| {
+            return Err(crate::error::OmniError::manifest_row_level_cas_contention(
+                format!("injected retryable contention failpoint: {name}"),
+            ));
+        });
+    }
+    Ok(())
+}
+
 /// Compile-checked catalog of every failpoint name in this crate. Call sites
 /// (`maybe_fail`) and tests (`ScopedFailPoint` / the test rendezvous helper)
 /// reference these constants instead of bare string literals, so a typo is a
@@ -96,6 +116,11 @@ pub mod names {
     // RFC-013 Phase 7 migration failpoints (this branch).
     pub const MIGRATION_V3_TO_V4_LEGACY_OPEN: &str = "migration.v3_to_v4.legacy_open";
     pub const MIGRATION_V4_STAMP_FORCE_INCOMPATIBLE: &str = "migration.v4_stamp.force_incompatible";
+    /// Injects a retryable `RowLevelCasContention` from `load_publish_state` so a
+    /// test can prove the publisher's outer retry re-runs the load (the migration
+    /// surfaces this same typed error on exhaustion).
+    pub const PUBLISH_LOAD_STATE_RETRYABLE_CONTENTION: &str =
+        "publish.load_state_retryable_contention";
 }
 
 #[cfg(feature = "failpoints")]

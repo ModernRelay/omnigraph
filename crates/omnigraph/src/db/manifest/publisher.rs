@@ -139,6 +139,12 @@ impl GraphNamespacePublisher {
     }
 
     async fn load_publish_state(&self) -> Result<LoadedPublishState> {
+        // Test seam: inject a retryable contention here to exercise the outer
+        // retry loop's re-run-on-retryable-load-error path (no-op without the
+        // `failpoints` feature). The migration surfaces the same typed error.
+        crate::failpoints::maybe_fail_retryable_contention(
+            crate::failpoints::names::PUBLISH_LOAD_STATE_RETRYABLE_CONTENTION,
+        )?;
         let mut dataset = self.dataset().await?;
         // Run pending internal-schema migrations exactly once per publish on
         // the open-for-write path; idempotent when the on-disk stamp already
@@ -579,13 +585,30 @@ impl ManifestBatchPublisher for GraphNamespacePublisher {
         }
 
         for attempt in 0..=PUBLISHER_RETRY_BUDGET {
+            // `load_publish_state` runs the v3→v4 migration (`migrate_internal_schema`)
+            // on its first scan. The migration's bounded merge/stamp retries surface a
+            // retryable `RowLevelCasContention` on exhaustion EXPECTING this outer loop
+            // to re-run them — a re-run re-reads the manifest, by which point a
+            // concurrent winner has usually completed the migration (next scan is a
+            // no-op). Route a retryable load error through the SAME retry path as a
+            // retryable `merge_rows` conflict below, so that typed contention actually
+            // composes with the publisher retry instead of aborting the publish.
+            let loaded = match self.load_publish_state().await {
+                Ok(loaded) => loaded,
+                Err(err)
+                    if attempt < PUBLISHER_RETRY_BUDGET && is_retryable_publish_conflict(&err) =>
+                {
+                    continue;
+                }
+                Err(err) => return Err(err),
+            };
             let LoadedPublishState {
                 dataset,
                 registered_tables: known_tables,
                 existing_versions,
                 existing_tombstones,
                 lineage_rows,
-            } = self.load_publish_state().await?;
+            } = loaded;
 
             let latest_per_table =
                 Self::latest_visible_per_table(&existing_versions, &existing_tombstones);
