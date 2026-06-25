@@ -3,10 +3,10 @@
 mod helpers;
 
 use fail::FailScenario;
-use futures::FutureExt;
 use omnigraph::db::Omnigraph;
 use omnigraph::error::{ManifestErrorKind, OmniError};
 use omnigraph::failpoints::ScopedFailPoint;
+use omnigraph::failpoints::names;
 use omnigraph::loader::LoadMode;
 use serial_test::serial;
 
@@ -32,12 +32,13 @@ fn node_table_uri(root: &str, type_name: &str) -> String {
 }
 
 #[tokio::test]
+#[serial]
 async fn branch_create_failpoint_triggers() {
     let _scenario = FailScenario::setup();
     let dir = tempfile::tempdir().unwrap();
     let uri = dir.path().to_str().unwrap();
     let db = Omnigraph::init(uri, helpers::TEST_SCHEMA).await.unwrap();
-    let _failpoint = ScopedFailPoint::new("branch_create.after_manifest_branch_create", "return");
+    let _failpoint = ScopedFailPoint::new(names::BRANCH_CREATE_AFTER_MANIFEST_BRANCH_CREATE, "return");
 
     let err = db.branch_create("feature").await.unwrap_err();
     assert!(
@@ -52,6 +53,7 @@ async fn branch_create_failpoint_triggers() {
 // object-store error) must NOT fail the call: the branch is already gone, and
 // `cleanup` reconciles the stranded fork. The branch name is reusable after.
 #[tokio::test]
+#[serial]
 async fn branch_delete_partial_failure_converges_via_cleanup() {
     let _scenario = FailScenario::setup();
     let dir = tempfile::tempdir().unwrap();
@@ -83,7 +85,7 @@ async fn branch_delete_partial_failure_converges_via_cleanup() {
     // Inject a failure during per-table cleanup, AFTER the manifest authority
     // flip. branch_delete must still succeed (best-effort reclaim).
     {
-        let _fp = ScopedFailPoint::new("branch_delete.before_table_cleanup", "return");
+        let _fp = ScopedFailPoint::new(names::BRANCH_DELETE_BEFORE_TABLE_CLEANUP, "return");
         main.branch_delete("feature").await.expect(
             "branch_delete is best-effort after the manifest flip: a cleanup-step \
              failure must not fail the call",
@@ -137,11 +139,12 @@ async fn branch_delete_partial_failure_converges_via_cleanup() {
 // prior delete; run cleanup". (This test was the inverse before the fork-as-
 // idempotent-reconcile fix; its flip is the signal the bug class is closed.)
 #[tokio::test]
+#[serial]
 async fn recreate_over_orphaned_fork_self_heals_without_cleanup() {
     let _scenario = FailScenario::setup();
     let dir = tempfile::tempdir().unwrap();
     let uri = dir.path().to_str().unwrap().to_string();
-    let mut main = helpers::init_and_load(&dir).await;
+    let main = helpers::init_and_load(&dir).await;
 
     main.branch_create("feature").await.unwrap();
     let mut feature = Omnigraph::open(&uri).await.unwrap();
@@ -158,7 +161,7 @@ async fn recreate_over_orphaned_fork_self_heals_without_cleanup() {
 
     // Partial delete: leaves the Person fork orphaned (cleanup not yet run).
     {
-        let _fp = ScopedFailPoint::new("branch_delete.before_table_cleanup", "return");
+        let _fp = ScopedFailPoint::new(names::BRANCH_DELETE_BEFORE_TABLE_CLEANUP, "return");
         main.branch_delete("feature").await.unwrap();
     }
 
@@ -195,6 +198,7 @@ async fn recreate_over_orphaned_fork_self_heals_without_cleanup() {
 // leave the ref in place. It must not squeeze the ambiguity through
 // ExpectedVersionMismatch with expected == actual, which lies about the cause.
 #[tokio::test]
+#[serial]
 async fn recreate_over_orphaned_fork_reports_indeterminate_authority_read() {
     let _scenario = FailScenario::setup();
     let dir = tempfile::tempdir().unwrap();
@@ -211,7 +215,7 @@ async fn recreate_over_orphaned_fork_reports_indeterminate_authority_read() {
 
     let row = r#"{"type":"Person","data":{"name":"Grace","age":37}}"#;
     {
-        let _fp = ScopedFailPoint::new("classify.fresh_read", "return");
+        let _fp = ScopedFailPoint::new(names::CLASSIFY_FRESH_READ, "return");
         let err = db
             .load_as("feature", None, row, LoadMode::Merge, None)
             .await
@@ -257,6 +261,7 @@ async fn recreate_over_orphaned_fork_reports_indeterminate_authority_read() {
 // surfaced per-table in the returned stats, and the independent reconcile pass
 // still reclaimed an orphan.
 #[tokio::test]
+#[serial]
 async fn cleanup_isolates_single_table_failure() {
     let _scenario = FailScenario::setup();
     let dir = tempfile::tempdir().unwrap();
@@ -272,7 +277,7 @@ async fn cleanup_isolates_single_table_failure() {
     }
 
     // One table's version GC fails once; the sweep must isolate it.
-    let _fp = ScopedFailPoint::new("cleanup.table_gc", "1*return");
+    let _fp = ScopedFailPoint::new(names::CLEANUP_TABLE_GC, "1*return");
     let stats = db
         .cleanup(omnigraph::db::CleanupPolicyOptions {
             keep_versions: Some(1),
@@ -306,6 +311,7 @@ async fn cleanup_isolates_single_table_failure() {
 // isolated (logged, not propagated) so the sweep continues, and a later
 // cleanup converges. This is the loop the Devin finding was about.
 #[tokio::test]
+#[serial]
 async fn cleanup_isolates_reconcile_failure() {
     let _scenario = FailScenario::setup();
     let dir = tempfile::tempdir().unwrap();
@@ -323,7 +329,7 @@ async fn cleanup_isolates_reconcile_failure() {
     // Inject a one-shot failure into the reconcile force-delete. The sweep must
     // not abort.
     {
-        let _fp = ScopedFailPoint::new("cleanup.reconcile_fork", "1*return");
+        let _fp = ScopedFailPoint::new(names::CLEANUP_RECONCILE_FORK, "1*return");
         db.cleanup(omnigraph::db::CleanupPolicyOptions {
             keep_versions: Some(1),
             older_than: None,
@@ -359,6 +365,7 @@ async fn cleanup_isolates_reconcile_failure() {
 // per-table forks. A delete whose best-effort commit-graph reclaim fails leaves
 // a commit-graph orphan; the next cleanup must drop it.
 #[tokio::test]
+#[serial]
 async fn cleanup_reclaims_orphaned_commit_graph_branch() {
     let _scenario = FailScenario::setup();
     let dir = tempfile::tempdir().unwrap();
@@ -369,7 +376,7 @@ async fn cleanup_reclaims_orphaned_commit_graph_branch() {
     // Delete, failing the commit-graph reclaim → commit-graph "feature" orphan
     // (manifest branch gone, commit-graph branch left behind).
     {
-        let _fp = ScopedFailPoint::new("branch_delete.before_commit_graph_reclaim", "return");
+        let _fp = ScopedFailPoint::new(names::BRANCH_DELETE_BEFORE_COMMIT_GRAPH_RECLAIM, "return");
         db.branch_delete("feature").await.unwrap();
     }
 
@@ -407,6 +414,7 @@ async fn cleanup_reclaims_orphaned_commit_graph_branch() {
 // the next run once the read succeeds. This pins the Indeterminate arm and the
 // don't-destroy-on-ambiguity rule end-to-end through cleanup.
 #[tokio::test]
+#[serial]
 async fn reconcile_skips_fork_when_fresh_recheck_is_unavailable_then_converges() {
     let _scenario = FailScenario::setup();
     let dir = tempfile::tempdir().unwrap();
@@ -430,7 +438,7 @@ async fn reconcile_skips_fork_when_fresh_recheck_is_unavailable_then_converges()
     // With the fresh re-check failing, the fork's status is Indeterminate (the
     // branch is live but unreadable) → cleanup must SKIP it, not delete.
     {
-        let _fp = ScopedFailPoint::new("classify.fresh_read", "return");
+        let _fp = ScopedFailPoint::new(names::CLASSIFY_FRESH_READ, "return");
         db.cleanup(omnigraph::db::CleanupPolicyOptions {
             keep_versions: Some(1),
             older_than: None,
@@ -465,6 +473,7 @@ async fn reconcile_skips_fork_when_fresh_recheck_is_unavailable_then_converges()
 // succeed (branch_create force-deletes a stale commit-graph ref since the
 // manifest branch is created fresh), instead of dying on the leftover ref.
 #[tokio::test]
+#[serial]
 async fn branch_create_recreates_over_commit_graph_zombie() {
     let _scenario = FailScenario::setup();
     let dir = tempfile::tempdir().unwrap();
@@ -476,7 +485,7 @@ async fn branch_create_recreates_over_commit_graph_zombie() {
     {
         // Fail the best-effort commit-graph reclaim → commit-graph "feature"
         // zombie survives the delete (manifest authority still flips).
-        let _fp = ScopedFailPoint::new("branch_delete.before_commit_graph_reclaim", "return");
+        let _fp = ScopedFailPoint::new(names::BRANCH_DELETE_BEFORE_COMMIT_GRAPH_RECLAIM, "return");
         db.branch_delete("feature").await.unwrap();
     }
     assert_eq!(db.branch_list().await.unwrap(), vec!["main".to_string()]);
@@ -497,6 +506,7 @@ async fn branch_create_recreates_over_commit_graph_zombie() {
 // the branch does not half-exist. The existing failpoint fires right after the
 // manifest create, standing in for any post-authority failure.
 #[tokio::test]
+#[serial]
 async fn branch_create_rolls_back_manifest_on_commit_graph_failure() {
     let _scenario = FailScenario::setup();
     let dir = tempfile::tempdir().unwrap();
@@ -505,7 +515,7 @@ async fn branch_create_rolls_back_manifest_on_commit_graph_failure() {
         .unwrap();
 
     let err = {
-        let _fp = ScopedFailPoint::new("branch_create.after_manifest_branch_create", "return");
+        let _fp = ScopedFailPoint::new(names::BRANCH_CREATE_AFTER_MANIFEST_BRANCH_CREATE, "return");
         db.branch_create("feature").await.unwrap_err()
     };
     assert!(
@@ -524,42 +534,21 @@ async fn branch_create_rolls_back_manifest_on_commit_graph_failure() {
 // an orphan, so it must be a retryable "refresh and retry", never a misleading
 // "run cleanup".
 //
-// Ordering is made deterministic (no sleeps) via a callback at the fork point:
-// `compare_exchange` lets only the FIRST arrival (writer A) record readiness and
-// block until released; later arrivals (writer B) fall through. The test waits
-// on the readiness flag, lets B win and commit the fork, then releases A.
-static FORK_A_AT_POINT: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
-static FORK_RELEASE_A: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
-
+// Ordering is made deterministic (no fixed sleeps) via the shared rendezvous:
+// it parks the first arrival (writer A) at the fork point until released; later
+// arrivals (writer B) fall through. The test waits on the reached condition,
+// lets B win and commit the fork, then releases A.
 #[tokio::test(flavor = "multi_thread")]
+#[serial]
 async fn fork_collision_with_live_concurrent_fork_is_retryable() {
-    use std::sync::atomic::Ordering::SeqCst;
-
     let _scenario = FailScenario::setup();
-    FORK_A_AT_POINT.store(false, SeqCst);
-    FORK_RELEASE_A.store(false, SeqCst);
 
     let dir = tempfile::tempdir().unwrap();
     let uri = dir.path().to_str().unwrap().to_string();
     let main = helpers::init_and_load(&dir).await;
     main.branch_create("feature").await.unwrap();
 
-    // First arrival (A) records readiness and blocks until released; the rest
-    // (B) fall through immediately. Bounded spin so a mistake can't hang forever.
-    fail::cfg_callback("fork.before_classify", || {
-        if FORK_A_AT_POINT
-            .compare_exchange(false, true, SeqCst, SeqCst)
-            .is_ok()
-        {
-            for _ in 0..2000 {
-                if FORK_RELEASE_A.load(SeqCst) {
-                    break;
-                }
-                std::thread::sleep(std::time::Duration::from_millis(5));
-            }
-        }
-    })
-    .unwrap();
+    let rv = helpers::failpoint::Rendezvous::park_first(names::FORK_BEFORE_CLASSIFY);
 
     let uri_a = uri.clone();
     let writer_a = tokio::spawn(async move {
@@ -574,17 +563,8 @@ async fn fork_collision_with_live_concurrent_fork_is_retryable() {
         .await
     });
 
-    // Wait (bounded) until A is parked at the fork point.
-    for _ in 0..600 {
-        if FORK_A_AT_POINT.load(SeqCst) {
-            break;
-        }
-        tokio::time::sleep(std::time::Duration::from_millis(5)).await;
-    }
-    assert!(
-        FORK_A_AT_POINT.load(SeqCst),
-        "writer A never reached the fork point"
-    );
+    // Wait until A is parked at the fork point.
+    rv.wait_until_reached().await;
 
     // B wins the fork and commits it.
     let mut b = Omnigraph::open(&uri).await.unwrap();
@@ -599,12 +579,11 @@ async fn fork_collision_with_live_concurrent_fork_is_retryable() {
     .unwrap();
 
     // Release A; it resumes, re-reads the manifest, and sees the fork is live.
-    FORK_RELEASE_A.store(true, SeqCst);
+    rv.release();
     let err = writer_a
         .await
         .unwrap()
         .expect_err("A's stale-snapshot fork should be a retryable conflict");
-    fail::remove("fork.before_classify");
 
     let msg = err.to_string();
     assert!(
@@ -618,13 +597,14 @@ async fn fork_collision_with_live_concurrent_fork_is_retryable() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
+#[serial]
 async fn graph_publish_failpoint_triggers_before_commit_append() {
     let _scenario = FailScenario::setup();
     let dir = tempfile::tempdir().unwrap();
     let mut db = Omnigraph::init(dir.path().to_str().unwrap(), helpers::TEST_SCHEMA)
         .await
         .unwrap();
-    let _failpoint = ScopedFailPoint::new("graph_publish.before_commit_append", "return");
+    let _failpoint = ScopedFailPoint::new(names::GRAPH_PUBLISH_BEFORE_COMMIT_APPEND, "return");
 
     let err = mutate_main(
         &mut db,
@@ -646,6 +626,7 @@ async fn graph_publish_failpoint_triggers_before_commit_append() {
 // state.
 
 #[tokio::test]
+#[serial]
 async fn schema_apply_pre_commit_crash_rolls_forward_via_sidecar() {
     let _scenario = FailScenario::setup();
     let dir = tempfile::tempdir().unwrap();
@@ -653,7 +634,7 @@ async fn schema_apply_pre_commit_crash_rolls_forward_via_sidecar() {
 
     {
         let db = Omnigraph::init(&uri, SCHEMA_V1).await.unwrap();
-        let _failpoint = ScopedFailPoint::new("schema_apply.after_staging_write", "return");
+        let _failpoint = ScopedFailPoint::new(names::SCHEMA_APPLY_AFTER_STAGING_WRITE, "return");
         let err = db.apply_schema(SCHEMA_V2_ADDED_TYPE).await.unwrap_err();
         assert!(
             err.to_string()
@@ -689,6 +670,7 @@ async fn schema_apply_pre_commit_crash_rolls_forward_via_sidecar() {
 }
 
 #[tokio::test]
+#[serial]
 async fn schema_apply_recovers_post_commit_crash() {
     let _scenario = FailScenario::setup();
     let dir = tempfile::tempdir().unwrap();
@@ -696,7 +678,7 @@ async fn schema_apply_recovers_post_commit_crash() {
 
     {
         let db = Omnigraph::init(&uri, SCHEMA_V1).await.unwrap();
-        let _failpoint = ScopedFailPoint::new("schema_apply.after_manifest_commit", "return");
+        let _failpoint = ScopedFailPoint::new(names::SCHEMA_APPLY_AFTER_MANIFEST_COMMIT, "return");
         let err = db.apply_schema(SCHEMA_V2_ADDED_TYPE).await.unwrap_err();
         assert!(
             err.to_string()
@@ -714,6 +696,7 @@ async fn schema_apply_recovers_post_commit_crash() {
 }
 
 #[tokio::test]
+#[serial]
 async fn schema_apply_recovers_partial_rename() {
     // Construct a partial-rename state: _schema.pg has been renamed in
     // (matching v2), but _schema.ir.json.staging and __schema_state.json.staging
@@ -778,6 +761,7 @@ async fn schema_apply_recovers_partial_rename() {
 /// Continuous in-process recovery (no restart needed between failure
 /// and recovery) is the goal of a future background reconciler.
 #[tokio::test]
+#[serial]
 async fn recovery_rolls_forward_after_finalize_publisher_failure() {
     let _scenario = FailScenario::setup();
     let dir = tempfile::tempdir().unwrap();
@@ -787,7 +771,7 @@ async fn recovery_rolls_forward_after_finalize_publisher_failure() {
     // Setup: trigger the residual.
     {
         let mut db = Omnigraph::init(&uri, helpers::TEST_SCHEMA).await.unwrap();
-        let _failpoint = ScopedFailPoint::new("mutation.post_finalize_pre_publisher", "return");
+        let _failpoint = ScopedFailPoint::new(names::MUTATION_POST_FINALIZE_PRE_PUBLISHER, "return");
 
         // The mutation's finalize completes (commit_staged advances Lance
         // HEAD on node:Person AND writes a `__recovery/{ulid}.json`
@@ -864,12 +848,114 @@ async fn recovery_rolls_forward_after_finalize_publisher_failure() {
     );
 }
 
-#[tokio::test]
-async fn inline_delete_conflict_writes_sidecar_before_rejecting() {
+/// Regression for iss-schema-apply-reopen-recovery-race: the open-time
+/// recovery sweep's roll-forward must CONVERGE (not fatally error the open)
+/// when a concurrent writer advances the manifest past the sidecar's pin
+/// during the classify→publish window.
+///
+/// Two concurrent `Omnigraph::open` sweeps race the same pending sidecar.
+/// One is parked at `recovery.before_roll_forward_publish` (after it has
+/// classified `RolledPastExpected`, before its publish CAS); the other falls
+/// through, rolls the sidecar forward (manifest v → v+1), and deletes it. The
+/// parked sweep then loses its publish CAS at the now-stale `expected = v`.
+/// The manifest already reached the sidecar's goal, so this is convergence,
+/// not a logical conflict — the open must succeed, not panic with
+/// `ExpectedVersionMismatch`.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[serial]
+async fn open_sweep_roll_forward_converges_when_manifest_advances_concurrently() {
     let _scenario = FailScenario::setup();
     let dir = tempfile::tempdir().unwrap();
     let uri = dir.path().to_str().unwrap().to_string();
-    let db = helpers::init_and_load(&dir).await;
+
+    // Setup: leave one pending sidecar (node:Person at Lance v+1, manifest v).
+    {
+        let mut db = Omnigraph::init(&uri, helpers::TEST_SCHEMA).await.unwrap();
+        let _failpoint =
+            ScopedFailPoint::new(names::MUTATION_POST_FINALIZE_PRE_PUBLISHER, "return");
+        mutate_main(
+            &mut db,
+            MUTATION_QUERIES,
+            "insert_person",
+            &mixed_params(&[("$name", "Eve")], &[("$age", 22)]),
+        )
+        .await
+        .unwrap_err();
+    }
+    assert_eq!(
+        std::fs::read_dir(dir.path().join("__recovery"))
+            .unwrap()
+            .count(),
+        1,
+        "exactly one pending sidecar must persist for the sweep to roll forward"
+    );
+
+    // Park the FIRST sweep to reach the publish window; later arrivals fall
+    // through. wait_until_reached gates the second open so it is guaranteed
+    // to be the one that converges the sidecar.
+    let rv = helpers::failpoint::Rendezvous::park_first(
+        names::RECOVERY_BEFORE_ROLL_FORWARD_PUBLISH,
+    );
+
+    let uri_parked = uri.clone();
+    let parked_open = tokio::spawn(async move { Omnigraph::open(&uri_parked).await });
+    rv.wait_until_reached().await;
+
+    // A concurrent open rolls the sidecar forward (manifest v → v+1) and
+    // deletes it, advancing the manifest past the parked sweep's pin.
+    let converging_open = Omnigraph::open(&uri)
+        .await
+        .expect("the second open's sweep should roll the sidecar forward and succeed");
+    assert_eq!(
+        helpers::count_rows(&converging_open, "node:Person").await,
+        1,
+        "the converging open must publish the rolled-forward Person row"
+    );
+
+    // Release the parked sweep: its publish CAS finds the manifest already at
+    // the goal. It must converge, not fail the open.
+    rv.release();
+    parked_open
+        .await
+        .expect("the parked open task must not panic")
+        .expect(
+            "the open-time sweep must converge when the manifest already reached \
+             the sidecar's goal, not fail the open with ExpectedVersionMismatch",
+        );
+
+    // The sidecar is gone and the graph is readable and consistent.
+    let recovery_dir = dir.path().join("__recovery");
+    if recovery_dir.exists() {
+        assert_eq!(
+            std::fs::read_dir(&recovery_dir).unwrap().count(),
+            0,
+            "the sidecar must be gone after both sweeps converge"
+        );
+    }
+    let db = Omnigraph::open(&uri).await.unwrap();
+    assert_eq!(helpers::count_rows(&db, "node:Person").await, 1);
+
+    // Exactly one RolledForward audit row for this recovery event: the loser's
+    // convergence path must NOT append a duplicate once the winner already
+    // recorded the audit and deleted the sidecar (append-idempotent per
+    // operation_id). Two rows here would be the duplicate-audit regression.
+    let kinds = helpers::recovery::recovery_audit_kinds(dir.path()).await;
+    assert_eq!(
+        kinds.len(),
+        1,
+        "exactly one recovery audit row expected after concurrent convergence, got {kinds:?}"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+#[serial]
+async fn inline_delete_conflict_writes_sidecar_before_rejecting() {
+    use std::sync::Arc;
+
+    let _scenario = FailScenario::setup();
+    let dir = tempfile::tempdir().unwrap();
+    let uri = dir.path().to_str().unwrap().to_string();
+    let db = Arc::new(helpers::init_and_load(&dir).await);
 
     let pre_snapshot = db
         .snapshot_of(omnigraph::db::ReadTarget::branch("main"))
@@ -879,39 +965,37 @@ async fn inline_delete_conflict_writes_sidecar_before_rejecting() {
     let person_uri = node_table_uri(&uri, "Person");
 
     {
-        let _pause_delete =
-            ScopedFailPoint::new("mutation.delete_node_pre_primary_delete", "pause");
-        let delete_params = helpers::params(&[("$name", "Alice")]);
-        let delete = db.mutate("main", MUTATION_QUERIES, "remove_person", &delete_params);
-        tokio::pin!(delete);
-
-        let mut concurrent_update_succeeded = false;
-        for _ in 0..50 {
-            if delete.as_mut().now_or_never().is_some() {
-                panic!("delete mutation completed before primary-delete failpoint was released");
-            }
-            let mut concurrent = Omnigraph::open_read_only(&uri).await.unwrap();
-            if mutate_main(
-                &mut concurrent,
-                MUTATION_QUERIES,
-                "set_age",
-                &mixed_params(&[("$name", "Bob")], &[("$age", 26)]),
-            )
-            .await
-            .is_ok()
-            {
-                concurrent_update_succeeded = true;
-                break;
-            }
-            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
-        }
-        assert!(
-            concurrent_update_succeeded,
-            "concurrent update must land while delete is paused"
+        // Park the delete at the primary-delete point. The concurrent update
+        // then lands deterministically before the delete resumes, so the
+        // delete's manifest CAS is guaranteed stale — no retry loop, no sleep.
+        let rv = helpers::failpoint::Rendezvous::park_first(
+            names::MUTATION_DELETE_NODE_PRE_PRIMARY_DELETE,
         );
-        fail::remove("mutation.delete_node_pre_primary_delete");
 
-        let err = delete.await.unwrap_err();
+        let del_db = Arc::clone(&db);
+        let delete = tokio::spawn(async move {
+            let delete_params = helpers::params(&[("$name", "Alice")]);
+            del_db
+                .mutate("main", MUTATION_QUERIES, "remove_person", &delete_params)
+                .await
+        });
+
+        rv.wait_until_reached().await;
+
+        // Concurrent update lands while the delete is parked.
+        let mut concurrent = Omnigraph::open_read_only(&uri).await.unwrap();
+        mutate_main(
+            &mut concurrent,
+            MUTATION_QUERIES,
+            "set_age",
+            &mixed_params(&[("$name", "Bob")], &[("$age", 26)]),
+        )
+        .await
+        .expect("concurrent update must land while delete is paused");
+
+        rv.release();
+
+        let err = delete.await.unwrap().unwrap_err();
         assert!(
             err.to_string().contains("stale view of 'node:Person'")
                 || err.to_string().contains("ExpectedVersionMismatch")
@@ -943,6 +1027,7 @@ async fn inline_delete_conflict_writes_sidecar_before_rejecting() {
 }
 
 #[tokio::test]
+#[serial]
 async fn recovery_rolls_forward_load_on_feature_branch() {
     use omnigraph::loader::LoadMode;
 
@@ -973,7 +1058,7 @@ async fn recovery_rolls_forward_load_on_feature_branch() {
             .table_version;
         feature_parent_commit_id = branch_head_commit_id(dir.path(), "feature").await.unwrap();
 
-        let _failpoint = ScopedFailPoint::new("mutation.post_finalize_pre_publisher", "return");
+        let _failpoint = ScopedFailPoint::new(names::MUTATION_POST_FINALIZE_PRE_PUBLISHER, "return");
         let err = db
             .load(
                 "feature",
@@ -1038,6 +1123,7 @@ async fn recovery_rolls_forward_load_on_feature_branch() {
 }
 
 #[tokio::test]
+#[serial]
 async fn recovery_rolls_forward_load_overwrite() {
     use omnigraph::loader::{LoadMode, load_jsonl};
 
@@ -1054,7 +1140,7 @@ async fn recovery_rolls_forward_load_overwrite() {
             .unwrap();
         parent_commit_id = branch_head_commit_id(dir.path(), "main").await.unwrap();
 
-        let _failpoint = ScopedFailPoint::new("mutation.post_finalize_pre_publisher", "return");
+        let _failpoint = ScopedFailPoint::new(names::MUTATION_POST_FINALIZE_PRE_PUBLISHER, "return");
         let err = db
             .load(
                 "main",
@@ -1108,6 +1194,7 @@ async fn recovery_rolls_forward_load_overwrite() {
 }
 
 #[tokio::test]
+#[serial]
 async fn recovery_rolls_forward_ensure_indices_on_feature_branch() {
     use lance::index::DatasetIndexExt;
     use omnigraph::loader::{LoadMode, load_jsonl};
@@ -1182,7 +1269,7 @@ async fn recovery_rolls_forward_ensure_indices_on_feature_branch() {
 
     {
         let _failpoint =
-            ScopedFailPoint::new("ensure_indices.post_phase_b_pre_manifest_commit", "return");
+            ScopedFailPoint::new(names::ENSURE_INDICES_POST_PHASE_B_PRE_MANIFEST_COMMIT, "return");
         let err = db.ensure_indices_on("feature").await.unwrap_err();
         assert!(
             err.to_string().contains(
@@ -1250,6 +1337,7 @@ async fn recovery_rolls_forward_ensure_indices_on_feature_branch() {
 /// on the same handle succeeds without restart and without
 /// ExpectedVersionMismatch.
 #[tokio::test]
+#[serial]
 async fn refresh_runs_roll_forward_recovery_in_process() {
     let _scenario = FailScenario::setup();
     let dir = tempfile::tempdir().unwrap();
@@ -1259,7 +1347,7 @@ async fn refresh_runs_roll_forward_recovery_in_process() {
 
     // Setup: trigger the residual (sidecar persists; manifest unchanged).
     {
-        let _failpoint = ScopedFailPoint::new("mutation.post_finalize_pre_publisher", "return");
+        let _failpoint = ScopedFailPoint::new(names::MUTATION_POST_FINALIZE_PRE_PUBLISHER, "return");
         let err = mutate_main(
             &mut db,
             MUTATION_QUERIES,
@@ -1329,6 +1417,7 @@ async fn refresh_runs_roll_forward_recovery_in_process() {
 /// drift in-process: no restart, no explicit `refresh()`, no
 /// `omnigraph repair`.
 #[tokio::test]
+#[serial]
 async fn load_after_finalize_publisher_failure_heals_without_reopen() {
     use omnigraph::loader::{LoadMode, load_jsonl};
 
@@ -1342,7 +1431,7 @@ async fn load_after_finalize_publisher_failure_heals_without_reopen() {
     // commit_staged (Lance HEAD advances on three tables), then the
     // publisher is wedged before the manifest commit.
     {
-        let _failpoint = ScopedFailPoint::new("mutation.post_finalize_pre_publisher", "return");
+        let _failpoint = ScopedFailPoint::new(names::MUTATION_POST_FINALIZE_PRE_PUBLISHER, "return");
         let err = load_jsonl(
             &mut db,
             r#"{"type":"Person","data":{"name":"Alice","age":30}}
@@ -1405,6 +1494,7 @@ async fn load_after_finalize_publisher_failure_heals_without_reopen() {
 /// recover — and the same handle must write normally once the fault
 /// clears (a transient storage error never wedges the graph).
 #[tokio::test]
+#[serial]
 async fn sidecar_write_failure_aborts_load_with_no_head_advance() {
     use omnigraph::loader::{LoadMode, load_jsonl};
 
@@ -1422,7 +1512,7 @@ async fn sidecar_write_failure_aborts_load_with_no_head_advance() {
         .version;
 
     {
-        let _failpoint = ScopedFailPoint::new("recovery.sidecar_write", "return");
+        let _failpoint = ScopedFailPoint::new(names::RECOVERY_SIDECAR_WRITE, "return");
         let err = load_jsonl(
             &mut db,
             r#"{"type":"Person","data":{"name":"Alice","age":30}}
@@ -1490,6 +1580,7 @@ async fn sidecar_write_failure_aborts_load_with_no_head_advance() {
 /// local filesystem backend. Skips unless `OMNIGRAPH_S3_TEST_BUCKET` is set
 /// (same gate as `s3_storage.rs`); CI runs it against RustFS.
 #[tokio::test]
+#[serial]
 async fn s3_load_recovers_after_publisher_failure_without_reopen() {
     use omnigraph::loader::{LoadMode, load_jsonl};
 
@@ -1507,7 +1598,7 @@ async fn s3_load_recovers_after_publisher_failure_without_reopen() {
     // Failed load: commit_staged lands on S3, manifest publish does not;
     // the sidecar PUT went through the S3 adapter.
     {
-        let _failpoint = ScopedFailPoint::new("mutation.post_finalize_pre_publisher", "return");
+        let _failpoint = ScopedFailPoint::new(names::MUTATION_POST_FINALIZE_PRE_PUBLISHER, "return");
         let err = load_jsonl(
             &mut db,
             r#"{"type":"Person","data":{"name":"Alice","age":30}}
@@ -1554,6 +1645,7 @@ async fn s3_load_recovers_after_publisher_failure_without_reopen() {
 /// documented retry tolerance in `record_audit`'s contract, exercised
 /// end-to-end through a real injected failure.
 #[tokio::test]
+#[serial]
 async fn record_audit_failure_after_roll_forward_converges_on_next_write() {
     use omnigraph::loader::{LoadMode, load_jsonl};
 
@@ -1565,7 +1657,7 @@ async fn record_audit_failure_after_roll_forward_converges_on_next_write() {
 
     // Pending sidecar with real drift.
     {
-        let _failpoint = ScopedFailPoint::new("mutation.post_finalize_pre_publisher", "return");
+        let _failpoint = ScopedFailPoint::new(names::MUTATION_POST_FINALIZE_PRE_PUBLISHER, "return");
         load_jsonl(
             &mut db,
             r#"{"type":"Person","data":{"name":"Alice","age":30}}
@@ -1581,7 +1673,7 @@ async fn record_audit_failure_after_roll_forward_converges_on_next_write() {
     // the audit write fails — the write must fail loudly and the sidecar
     // must survive for the retry.
     {
-        let _failpoint = ScopedFailPoint::new("recovery.record_audit", "return");
+        let _failpoint = ScopedFailPoint::new(names::RECOVERY_RECORD_AUDIT, "return");
         let err = load_jsonl(
             &mut db,
             r#"{"type":"Person","data":{"name":"Bob","age":25}}
@@ -1645,6 +1737,7 @@ async fn record_audit_failure_after_roll_forward_converges_on_next_write() {
 /// (which would be consumer tolerance of drift). Once the fault clears,
 /// open recovers normally.
 #[tokio::test]
+#[serial]
 async fn sidecar_list_failure_fails_write_and_open_loudly_then_clears() {
     use omnigraph::loader::{LoadMode, load_jsonl};
 
@@ -1656,7 +1749,7 @@ async fn sidecar_list_failure_fails_write_and_open_loudly_then_clears() {
 
     // Pending sidecar via the usual finalize → publisher failure.
     {
-        let _failpoint = ScopedFailPoint::new("mutation.post_finalize_pre_publisher", "return");
+        let _failpoint = ScopedFailPoint::new(names::MUTATION_POST_FINALIZE_PRE_PUBLISHER, "return");
         let err = load_jsonl(
             &mut db,
             r#"{"type":"Person","data":{"name":"Alice","age":30}}
@@ -1674,7 +1767,7 @@ async fn sidecar_list_failure_fails_write_and_open_loudly_then_clears() {
         assert_eq!(std::fs::read_dir(&recovery_dir).unwrap().count(), 1);
     }
 
-    let _failpoint = ScopedFailPoint::new("recovery.sidecar_list", "return");
+    let _failpoint = ScopedFailPoint::new(names::RECOVERY_SIDECAR_LIST, "return");
 
     // Write-entry heal: the list failure surfaces as the write's error —
     // no silent skip that would proceed over the pending sidecar.
@@ -1725,6 +1818,7 @@ async fn sidecar_list_failure_fails_write_and_open_loudly_then_clears() {
 /// consumed by the next write's entry heal (attributed `RolledForward`
 /// audit row), not by an operator.
 #[tokio::test]
+#[serial]
 async fn sidecar_delete_failure_keeps_write_success_and_next_write_heals() {
     use omnigraph::loader::{LoadMode, load_jsonl};
 
@@ -1735,7 +1829,7 @@ async fn sidecar_delete_failure_keeps_write_success_and_next_write_heals() {
     let mut db = Omnigraph::init(&uri, helpers::TEST_SCHEMA).await.unwrap();
 
     {
-        let _failpoint = ScopedFailPoint::new("recovery.sidecar_delete", "return");
+        let _failpoint = ScopedFailPoint::new(names::RECOVERY_SIDECAR_DELETE, "return");
         // The load itself must succeed: commit_staged + manifest publish
         // landed; only the Phase D cleanup failed (swallowed + logged).
         load_jsonl(
@@ -1783,6 +1877,7 @@ async fn sidecar_delete_failure_keeps_write_success_and_next_write_heals() {
 /// PUT failure must abort the merge before any target-table HEAD moves;
 /// retrying after the fault clears merges cleanly.
 #[tokio::test]
+#[serial]
 async fn sidecar_write_failure_aborts_branch_merge_with_no_head_advance() {
     use omnigraph::loader::{LoadMode, load_jsonl};
 
@@ -1830,7 +1925,7 @@ async fn sidecar_write_failure_aborts_branch_merge_with_no_head_advance() {
         .version;
 
     {
-        let _failpoint = ScopedFailPoint::new("recovery.sidecar_write", "return");
+        let _failpoint = ScopedFailPoint::new(names::RECOVERY_SIDECAR_WRITE, "return");
         let err = db.branch_merge("feature", "main").await.unwrap_err();
         assert!(
             err.to_string()
@@ -1873,6 +1968,7 @@ async fn sidecar_write_failure_aborts_branch_merge_with_no_head_advance() {
 /// `refresh()` (which `refresh_runs_roll_forward_recovery_in_process`
 /// covers), no reopen.
 #[tokio::test]
+#[serial]
 async fn mutation_after_finalize_publisher_failure_heals_without_reopen() {
     let _scenario = FailScenario::setup();
     let dir = tempfile::tempdir().unwrap();
@@ -1881,7 +1977,7 @@ async fn mutation_after_finalize_publisher_failure_heals_without_reopen() {
     let mut db = Omnigraph::init(&uri, helpers::TEST_SCHEMA).await.unwrap();
 
     {
-        let _failpoint = ScopedFailPoint::new("mutation.post_finalize_pre_publisher", "return");
+        let _failpoint = ScopedFailPoint::new(names::MUTATION_POST_FINALIZE_PRE_PUBLISHER, "return");
         let err = mutate_main(
             &mut db,
             MUTATION_QUERIES,
@@ -1936,6 +2032,7 @@ async fn mutation_after_finalize_publisher_failure_heals_without_reopen() {
 /// runs, so a long-lived handle can evolve the schema without a
 /// restart after a Phase B → Phase C failure.
 #[tokio::test]
+#[serial]
 async fn schema_apply_after_finalize_publisher_failure_heals_without_reopen() {
     use omnigraph::loader::{LoadMode, load_jsonl};
 
@@ -1946,7 +2043,7 @@ async fn schema_apply_after_finalize_publisher_failure_heals_without_reopen() {
     let mut db = Omnigraph::init(&uri, helpers::TEST_SCHEMA).await.unwrap();
 
     {
-        let _failpoint = ScopedFailPoint::new("mutation.post_finalize_pre_publisher", "return");
+        let _failpoint = ScopedFailPoint::new(names::MUTATION_POST_FINALIZE_PRE_PUBLISHER, "return");
         let err = load_jsonl(
             &mut db,
             r#"{"type":"Person","data":{"name":"Alice","age":30}}
@@ -1995,6 +2092,7 @@ async fn schema_apply_after_finalize_publisher_failure_heals_without_reopen() {
 /// (with its recovery audit row) before the merge reads its target
 /// snapshot — not silently folded into the merge's publish.
 #[tokio::test]
+#[serial]
 async fn branch_merge_after_finalize_publisher_failure_heals_without_reopen() {
     use omnigraph::loader::{LoadMode, load_jsonl};
 
@@ -2027,7 +2125,7 @@ async fn branch_merge_after_finalize_publisher_failure_heals_without_reopen() {
     // Failed load on MAIN: Person drifts ahead of the manifest with a
     // sidecar covering it.
     {
-        let _failpoint = ScopedFailPoint::new("mutation.post_finalize_pre_publisher", "return");
+        let _failpoint = ScopedFailPoint::new(names::MUTATION_POST_FINALIZE_PRE_PUBLISHER, "return");
         let err = load_jsonl(
             &mut db,
             r#"{"type":"Person","data":{"name":"Bob","age":25}}
@@ -2079,6 +2177,7 @@ async fn branch_merge_after_finalize_publisher_failure_heals_without_reopen() {
 /// the audit already written — the retry must NOT append a second
 /// audit row for the same operation, only finish the delete.
 #[tokio::test]
+#[serial]
 async fn orphaned_branch_discard_is_idempotent_across_delete_failure() {
     use omnigraph::loader::{LoadMode, load_jsonl};
 
@@ -2141,7 +2240,7 @@ async fn orphaned_branch_discard_is_idempotent_across_delete_failure() {
     // First write: the discard path writes its audit row, then the
     // sidecar delete fails (injected). The write fails loudly.
     {
-        let _failpoint = ScopedFailPoint::new("recovery.sidecar_delete", "return");
+        let _failpoint = ScopedFailPoint::new(names::RECOVERY_SIDECAR_DELETE, "return");
         let err = load_jsonl(
             &mut db,
             "{\"type\":\"Person\",\"data\":{\"name\":\"Bob\",\"age\":25}}\n",
@@ -2185,6 +2284,7 @@ async fn orphaned_branch_discard_is_idempotent_across_delete_failure() {
 /// while a sidecar is pending. Sequenced failpoint: first list (entry
 /// heal) passes, second list (the guard) fails.
 #[tokio::test]
+#[serial]
 async fn drift_guard_names_both_paths_when_sidecar_list_fails() {
     use omnigraph::loader::{LoadMode, load_jsonl};
 
@@ -2244,7 +2344,7 @@ async fn drift_guard_names_both_paths_when_sidecar_list_fails() {
 
     // First list (entry heal) passes and defers the sidecar; second
     // list (the guard's classification) fails.
-    let _failpoint = ScopedFailPoint::new("recovery.sidecar_list", "1*off->1*return");
+    let _failpoint = ScopedFailPoint::new(names::RECOVERY_SIDECAR_LIST, "1*off->1*return");
     let err = load_jsonl(
         &mut db,
         "{\"type\":\"Person\",\"data\":{\"name\":\"bob\",\"age\":25}}\n",
@@ -2272,6 +2372,7 @@ async fn drift_guard_names_both_paths_when_sidecar_list_fails() {
 /// Gap): bounded commit-graph noise, never a lost or duplicated audit
 /// record under clean failures.
 #[tokio::test]
+#[serial]
 async fn orphaned_branch_discard_converges_across_audit_append_failure() {
     use omnigraph::loader::{LoadMode, load_jsonl};
 
@@ -2332,7 +2433,7 @@ async fn orphaned_branch_discard_converges_across_audit_append_failure() {
     // fails (injected). The write fails loudly; the sidecar survives so
     // the discard is retried with the audit still owed.
     {
-        let _failpoint = ScopedFailPoint::new("recovery.orphan_discard_audit_append", "return");
+        let _failpoint = ScopedFailPoint::new(names::RECOVERY_ORPHAN_DISCARD_AUDIT_APPEND, "return");
         let err = load_jsonl(
             &mut db,
             "{\"type\":\"Person\",\"data\":{\"name\":\"Bob\",\"age\":25}}\n",
@@ -2386,6 +2487,7 @@ async fn orphaned_branch_discard_converges_across_audit_append_failure() {
 /// writes against the stale catalog rejects rows of types the graph
 /// already has.
 #[tokio::test]
+#[serial]
 async fn load_after_schema_apply_phase_b_failure_uses_recovered_catalog() {
     use omnigraph::loader::{LoadMode, load_jsonl};
 
@@ -2425,7 +2527,7 @@ edge Knows: Person -> Person {
 edge WorksAt: Person -> Company
 "#;
     {
-        let _failpoint = ScopedFailPoint::new("schema_apply.after_staging_write", "return");
+        let _failpoint = ScopedFailPoint::new(names::SCHEMA_APPLY_AFTER_STAGING_WRITE, "return");
         let err = db.apply_schema(v2_schema).await.unwrap_err();
         assert!(
             err.to_string()
@@ -2467,6 +2569,7 @@ edge WorksAt: Person -> Company
 /// the resumed apply's own renames then fail on the missing sources:
 /// an error (and a corrupted catalog) for an otherwise-healthy apply.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[serial]
 async fn heal_does_not_promote_live_schema_apply_staging() {
     use omnigraph::loader::LoadMode;
     use std::sync::Arc;
@@ -2477,22 +2580,17 @@ async fn heal_does_not_promote_live_schema_apply_staging() {
 
     let db = Arc::new(Omnigraph::init(&uri, helpers::TEST_SCHEMA).await.unwrap());
 
-    // Pause the apply right after its staging files land (its sidecar is
+    // Park the apply right after its staging files land (its sidecar is
     // already on disk from Phase A; the manifest commit has not run).
-    let failpoint = ScopedFailPoint::new("schema_apply.after_staging_write", "pause");
+    let rv = helpers::failpoint::Rendezvous::park_first(names::SCHEMA_APPLY_AFTER_STAGING_WRITE);
 
     let apply_db = Arc::clone(&db);
     let desired = format!("{}\nnode Tag {{ name: String @key }}\n", helpers::TEST_SCHEMA);
     let apply = tokio::spawn(async move { apply_db.apply_schema(&desired).await });
 
-    // Wait until the apply is parked in the window: staging on disk.
+    // Wait until the apply is parked in the window (staging files written).
+    rv.wait_until_reached().await;
     let staging_pg = dir.path().join("_schema.pg.staging");
-    for _ in 0..500 {
-        if staging_pg.exists() {
-            break;
-        }
-        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
-    }
     assert!(staging_pg.exists(), "schema apply never reached the paused window");
 
     // Concurrent load on the same handle: its entry heal runs while the
@@ -2516,7 +2614,7 @@ async fn heal_does_not_promote_live_schema_apply_staging() {
     // stole the apply's commit); fixed code leaves the load blocked on
     // the schema-apply serialization key until the apply finishes.
     tokio::time::sleep(std::time::Duration::from_millis(500)).await;
-    drop(failpoint);
+    rv.release();
 
     let apply_result = apply.await.unwrap();
     let _ = tokio::time::timeout(std::time::Duration::from_secs(30), load)
@@ -2546,6 +2644,7 @@ async fn heal_does_not_promote_live_schema_apply_staging() {
 /// sidecar still on disk, Lance HEAD unchanged (no restore commit).
 /// Then drop + open: full sweep handles it.
 #[tokio::test]
+#[serial]
 async fn refresh_defers_rollback_eligible_sidecar_to_next_open() {
     use omnigraph::loader::{LoadMode, load_jsonl};
 
@@ -2718,6 +2817,7 @@ async fn refresh_defers_rollback_eligible_sidecar_to_next_open() {
 /// on one table leaves OTHER tables untouched. Subsequent writes to
 /// non-drifted tables proceed normally; the drift is contained.
 #[tokio::test]
+#[serial]
 async fn finalize_publisher_residual_does_not_drift_untouched_tables() {
     let _scenario = FailScenario::setup();
     let dir = tempfile::tempdir().unwrap();
@@ -2726,7 +2826,7 @@ async fn finalize_publisher_residual_does_not_drift_untouched_tables() {
         .unwrap();
 
     {
-        let _failpoint = ScopedFailPoint::new("mutation.post_finalize_pre_publisher", "return");
+        let _failpoint = ScopedFailPoint::new(names::MUTATION_POST_FINALIZE_PRE_PUBLISHER, "return");
         let _ = mutate_main(
             &mut db,
             MUTATION_QUERIES,
@@ -2764,6 +2864,7 @@ async fn finalize_publisher_residual_does_not_drift_untouched_tables() {
 /// a roll-forward-only heal and proceed — they do not refuse on a pending
 /// sidecar the way `optimize`/`repair` do — so the write succeeds with no drift.
 #[tokio::test]
+#[serial]
 async fn ensure_indices_stage_btree_failure_leaves_existing_tables_writable() {
     let _scenario = FailScenario::setup();
     let dir = tempfile::tempdir().unwrap();
@@ -2791,7 +2892,7 @@ async fn ensure_indices_stage_btree_failure_leaves_existing_tables_writable() {
         // ensure_indices builds the deferred `age` BTREE on Person; the failpoint
         // fires between stage and commit, so Person's Lance HEAD does not move.
         let _failpoint =
-            ScopedFailPoint::new("ensure_indices.post_stage_pre_commit_btree", "return");
+            ScopedFailPoint::new(names::ENSURE_INDICES_POST_STAGE_PRE_COMMIT_BTREE, "return");
         let err = db.ensure_indices().await.unwrap_err();
         assert!(
             err.to_string()
@@ -2844,6 +2945,7 @@ fn assert_no_staging_files(graph: &std::path::Path) {
 // ExpectedVersionMismatch.
 
 #[tokio::test]
+#[serial]
 async fn schema_apply_without_schema_staging_rolls_back_on_next_open() {
     use omnigraph::loader::{LoadMode, load_jsonl};
 
@@ -2871,7 +2973,7 @@ async fn schema_apply_without_schema_staging_rolls_back_on_next_open() {
 
     {
         let db = Omnigraph::open(&uri).await.unwrap();
-        let _failpoint = ScopedFailPoint::new("schema_apply.before_staging_write", "return");
+        let _failpoint = ScopedFailPoint::new(names::SCHEMA_APPLY_BEFORE_STAGING_WRITE, "return");
         let v2_schema = r#"node Person {
     name: String @key
     age: I32?
@@ -2941,6 +3043,7 @@ edge WorksAt: Person -> Company
 }
 
 #[tokio::test]
+#[serial]
 async fn schema_apply_phase_b_failure_recovered_on_next_open() {
     use omnigraph::loader::{LoadMode, load_jsonl};
 
@@ -2976,7 +3079,7 @@ async fn schema_apply_phase_b_failure_recovered_on_next_open() {
     // written, but BEFORE the manifest publish. The recovery sidecar persists.
     {
         let db = Omnigraph::open(&uri).await.unwrap();
-        let _failpoint = ScopedFailPoint::new("schema_apply.after_staging_write", "return");
+        let _failpoint = ScopedFailPoint::new(names::SCHEMA_APPLY_AFTER_STAGING_WRITE, "return");
         // v2 schema: add a `city` property to Person AND add a new
         // `Tag` node type. The new property triggers the rewritten_tables
         // path (Phase B sidecar coverage). The new type changes the
@@ -3123,7 +3226,7 @@ async fn optimize_phase_b_failure_recovered_on_next_open() {
     {
         let db = Omnigraph::open(&uri).await.unwrap();
         let _failpoint =
-            ScopedFailPoint::new("optimize.post_phase_b_pre_manifest_commit", "return");
+            ScopedFailPoint::new(names::OPTIMIZE_POST_PHASE_B_PRE_MANIFEST_COMMIT, "return");
         let err = db.optimize().await.unwrap_err();
         assert!(
             err.to_string().contains(
@@ -3212,7 +3315,7 @@ async fn optimize_survives_concurrent_insert_advancing_manifest() {
     // HEAD == manifest (no in-flight optimize drift for the writer to trip on); the
     // insert advances the manifest, then optimize compacts on top and must converge
     // its publish over the advanced manifest rather than fail the equality CAS.
-    let failpoint = ScopedFailPoint::new("optimize.before_compact", "pause");
+    let failpoint = ScopedFailPoint::new(names::OPTIMIZE_BEFORE_COMPACT, "pause");
 
     let uri_opt = uri.clone();
     let optimize = tokio::spawn(async move {
@@ -3289,7 +3392,7 @@ async fn optimize_survives_concurrent_delete_before_compaction() {
     }
 
     // Pause optimize BEFORE its compaction commits.
-    let failpoint = ScopedFailPoint::new("optimize.before_compact", "pause");
+    let failpoint = ScopedFailPoint::new(names::OPTIMIZE_BEFORE_COMPACT, "pause");
 
     let uri_opt = uri.clone();
     let optimize = tokio::spawn(async move {
@@ -3367,7 +3470,7 @@ async fn optimize_retry_does_not_misclassify_own_head_drift() {
     // Inject exactly one retryable reindex conflict: attempt 1 compacts (HEAD+1) then
     // "conflicts" on reindex → retry; attempt 2 reopens with HEAD ahead of the manifest
     // from our own compaction — the misclassification trigger.
-    let _failpoint = ScopedFailPoint::new("optimize.inject_reindex_conflict", "1*return");
+    let _failpoint = ScopedFailPoint::new(names::OPTIMIZE_INJECT_REINDEX_CONFLICT, "1*return");
 
     let db = Omnigraph::open(&uri).await.unwrap();
     let stats = db
@@ -3416,6 +3519,7 @@ async fn wait_for_sidecar(root: &std::path::Path) -> bool {
 }
 
 #[tokio::test]
+#[serial]
 #[serial(branch_merge_phase_b)]
 async fn branch_merge_phase_b_failure_recovered_on_next_open() {
     use omnigraph::loader::{LoadMode, load_jsonl};
@@ -3472,7 +3576,7 @@ async fn branch_merge_phase_b_failure_recovered_on_next_open() {
     {
         let db = Omnigraph::open(&uri).await.unwrap();
         let _failpoint =
-            ScopedFailPoint::new("branch_merge.post_phase_b_pre_manifest_commit", "return");
+            ScopedFailPoint::new(names::BRANCH_MERGE_POST_PHASE_B_PRE_MANIFEST_COMMIT, "return");
         let err = db.branch_merge("feature", "main").await.unwrap_err();
         assert!(
             err.to_string().contains(
@@ -3528,47 +3632,24 @@ async fn branch_merge_phase_b_failure_recovered_on_next_open() {
     );
 
     // The recovered branch_merge must record a MERGE commit (with
-    // `merged_parent_commit_id` set), not a plain commit. Without
-    // this, future merges between the same pair lose
-    // already-up-to-date detection. We verify by reading
-    // `_graph_commits.lance` and asserting the most recent commit
-    // tagged with the recovery actor has a non-null
-    // `merged_parent_commit_id`.
+    // `merged_parent_commit_id` set), not a plain commit. Without this, future
+    // merges between the same pair lose already-up-to-date detection. RFC-013
+    // Phase 7 records the recovery commit in `__manifest` (folded into the
+    // recovery publish CAS), so we read it through the commit-graph projection
+    // (`CommitGraph::load_commits`) and assert some commit carries a non-null
+    // `merged_parent_commit_id`. Only a recovered branch_merge can produce one
+    // here (we never completed a normal merge in this test).
     {
-        use arrow_array::{Array, StringArray};
-        use futures::TryStreamExt;
-        let commits_dir = dir.path().join("_graph_commits.lance");
-        let ds = lance::Dataset::open(commits_dir.to_str().unwrap())
-            .await
-            .unwrap();
-        let batches: Vec<arrow_array::RecordBatch> = ds
-            .scan()
-            .try_into_stream()
-            .await
-            .unwrap()
-            .try_collect()
-            .await
-            .unwrap();
-        let mut found_recovery_merge = false;
-        for batch in batches {
-            let merged = batch
-                .column_by_name("merged_parent_commit_id")
-                .expect("merged_parent_commit_id column present")
-                .as_any()
-                .downcast_ref::<StringArray>()
-                .expect("merged_parent_commit_id is Utf8");
-            // The actor_id lives in _graph_commit_actors; cross-checking
-            // is heavier than necessary. Detecting any non-null
-            // merged_parent_commit_id in the post-recovery state is
-            // sufficient: only a recovered branch_merge can produce one
-            // here (we never completed a normal merge in this test).
-            for i in 0..merged.len() {
-                if !merged.is_null(i) {
-                    found_recovery_merge = true;
-                    break;
-                }
-            }
-        }
+        let commits =
+            omnigraph::db::commit_graph::CommitGraph::open(dir.path().to_str().unwrap())
+                .await
+                .unwrap()
+                .load_commits()
+                .await
+                .unwrap();
+        let found_recovery_merge = commits
+            .iter()
+            .any(|c| c.merged_parent_commit_id.is_some());
         assert!(
             found_recovery_merge,
             "recovered branch_merge must record `merged_parent_commit_id` so future \
@@ -3585,6 +3666,7 @@ async fn branch_merge_phase_b_failure_recovered_on_next_open() {
 /// silently: the adopt path advanced Lance HEAD but was unpinned, so the sweep
 /// found no sidecar and the merge was lost.
 #[tokio::test]
+#[serial]
 #[serial(branch_merge_phase_b)]
 async fn branch_merge_adopt_with_delta_phase_b_failure_recovered_on_next_open() {
     use omnigraph::loader::{LoadMode, load_jsonl};
@@ -3627,7 +3709,7 @@ async fn branch_merge_adopt_with_delta_phase_b_failure_recovered_on_next_open() 
     {
         let db = Omnigraph::open(&uri).await.unwrap();
         let _failpoint =
-            ScopedFailPoint::new("branch_merge.post_phase_b_pre_manifest_commit", "return");
+            ScopedFailPoint::new(names::BRANCH_MERGE_POST_PHASE_B_PRE_MANIFEST_COMMIT, "return");
         let err = db.branch_merge("feature", "main").await.unwrap_err();
         assert!(
             err.to_string().contains(
@@ -3799,6 +3881,7 @@ async fn assert_partial_merge_rolls_back(scenario: MergeScenario, failpoint: &st
 }
 
 #[tokio::test]
+#[serial]
 #[serial(branch_merge_phase_b)]
 async fn branch_merge_adopt_partial_after_append_rolls_back() {
     assert_partial_merge_rolls_back(
@@ -3809,6 +3892,7 @@ async fn branch_merge_adopt_partial_after_append_rolls_back() {
 }
 
 #[tokio::test]
+#[serial]
 #[serial(branch_merge_phase_b)]
 async fn branch_merge_adopt_partial_after_upsert_rolls_back() {
     assert_partial_merge_rolls_back(
@@ -3819,6 +3903,7 @@ async fn branch_merge_adopt_partial_after_upsert_rolls_back() {
 }
 
 #[tokio::test]
+#[serial]
 #[serial(branch_merge_phase_b)]
 async fn branch_merge_rewrite_partial_after_merge_rolls_back() {
     assert_partial_merge_rolls_back(
@@ -3829,6 +3914,7 @@ async fn branch_merge_rewrite_partial_after_merge_rolls_back() {
 }
 
 #[tokio::test]
+#[serial]
 #[serial(branch_merge_phase_b)]
 async fn branch_merge_rewrite_partial_after_delete_rolls_back() {
     assert_partial_merge_rolls_back(
@@ -3855,6 +3941,7 @@ async fn branch_merge_rewrite_partial_after_delete_rolls_back() {
 /// the version-aware classifier reads v1 as the old loose generation → rolls
 /// forward → `bob` preserved.
 #[tokio::test]
+#[serial]
 #[serial(branch_merge_phase_b)]
 async fn pre_upgrade_v1_branch_merge_sidecar_rolls_forward_not_back() {
     use omnigraph::loader::{LoadMode, load_jsonl};
@@ -3889,7 +3976,7 @@ async fn pre_upgrade_v1_branch_merge_sidecar_rolls_forward_not_back() {
     // sidecar lands on disk.
     {
         let db = Omnigraph::open(&uri).await.unwrap();
-        let _fp = ScopedFailPoint::new("branch_merge.post_phase_b_pre_manifest_commit", "return");
+        let _fp = ScopedFailPoint::new(names::BRANCH_MERGE_POST_PHASE_B_PRE_MANIFEST_COMMIT, "return");
         db.branch_merge("feature", "main").await.unwrap_err();
     }
 
@@ -3931,6 +4018,7 @@ async fn pre_upgrade_v1_branch_merge_sidecar_rolls_forward_not_back() {
 /// target, and future merges between the same pair would lose
 /// already-up-to-date detection.
 #[tokio::test]
+#[serial]
 #[serial(branch_merge_phase_b)]
 async fn branch_merge_phase_b_failure_recovered_on_non_main_target() {
     use omnigraph::loader::{LoadMode, load_jsonl};
@@ -3995,7 +4083,7 @@ async fn branch_merge_phase_b_failure_recovered_on_non_main_target() {
     {
         let db = Omnigraph::open(&uri).await.unwrap();
         let _failpoint =
-            ScopedFailPoint::new("branch_merge.post_phase_b_pre_manifest_commit", "return");
+            ScopedFailPoint::new(names::BRANCH_MERGE_POST_PHASE_B_PRE_MANIFEST_COMMIT, "return");
         let err = db
             .branch_merge("source_branch", "target_branch")
             .await
@@ -4056,6 +4144,7 @@ async fn branch_merge_phase_b_failure_recovered_on_non_main_target() {
 /// keeps RewriteMerged tables on active_branch), the contract assertion
 /// catches a regression that reverts to `entry.table_branch.clone()`.
 #[tokio::test]
+#[serial]
 #[serial(branch_merge_phase_b)]
 async fn branch_merge_sidecar_pins_table_branch_to_active_branch() {
     use omnigraph::loader::{LoadMode, load_jsonl};
@@ -4097,7 +4186,7 @@ async fn branch_merge_sidecar_pins_table_branch_to_active_branch() {
     {
         let db = Omnigraph::open(&uri).await.unwrap();
         let _failpoint =
-            ScopedFailPoint::new("branch_merge.post_phase_b_pre_manifest_commit", "return");
+            ScopedFailPoint::new(names::BRANCH_MERGE_POST_PHASE_B_PRE_MANIFEST_COMMIT, "return");
         let _ = db
             .branch_merge("source_branch", "target_branch")
             .await
@@ -4158,6 +4247,7 @@ async fn branch_merge_sidecar_pins_table_branch_to_active_branch() {
 /// `needs_index_work_*` code path and the
 /// `recovery_ensure_indices_handles_empty_tables` integration test.
 #[tokio::test]
+#[serial]
 async fn ensure_indices_phase_b_failure_does_not_leak_sidecar_when_no_work_needed() {
     use omnigraph::loader::{LoadMode, load_jsonl};
 
@@ -4188,7 +4278,7 @@ async fn ensure_indices_phase_b_failure_does_not_leak_sidecar_when_no_work_neede
     {
         let db = Omnigraph::open(&uri).await.unwrap();
         let _failpoint =
-            ScopedFailPoint::new("ensure_indices.post_phase_b_pre_manifest_commit", "return");
+            ScopedFailPoint::new(names::ENSURE_INDICES_POST_PHASE_B_PRE_MANIFEST_COMMIT, "return");
         let err = db.ensure_indices().await.unwrap_err();
         assert!(
             err.to_string().contains(
@@ -4258,11 +4348,12 @@ async fn ensure_indices_phase_b_failure_does_not_leak_sidecar_when_no_work_neede
 // limitation.
 
 #[tokio::test]
+#[serial]
 async fn init_failpoint_after_schema_pg_written_cleans_up_schema_file() {
     let _scenario = FailScenario::setup();
     let dir = tempfile::tempdir().unwrap();
     let uri = dir.path().to_str().unwrap();
-    let _failpoint = ScopedFailPoint::new("init.after_schema_pg_written", "return");
+    let _failpoint = ScopedFailPoint::new(names::INIT_AFTER_SCHEMA_PG_WRITTEN, "return");
 
     let err = match Omnigraph::init(uri, helpers::TEST_SCHEMA).await {
         Ok(_) => panic!("expected Omnigraph::init to fail at the configured failpoint"),
@@ -4284,11 +4375,12 @@ async fn init_failpoint_after_schema_pg_written_cleans_up_schema_file() {
 }
 
 #[tokio::test]
+#[serial]
 async fn init_failpoint_after_schema_contract_written_cleans_up_all_schema_files() {
     let _scenario = FailScenario::setup();
     let dir = tempfile::tempdir().unwrap();
     let uri = dir.path().to_str().unwrap();
-    let _failpoint = ScopedFailPoint::new("init.after_schema_contract_written", "return");
+    let _failpoint = ScopedFailPoint::new(names::INIT_AFTER_SCHEMA_CONTRACT_WRITTEN, "return");
 
     let err = match Omnigraph::init(uri, helpers::TEST_SCHEMA).await {
         Ok(_) => panic!("expected Omnigraph::init to fail at the configured failpoint"),
@@ -4315,11 +4407,12 @@ async fn init_failpoint_after_schema_contract_written_cleans_up_all_schema_files
 }
 
 #[tokio::test]
+#[serial]
 async fn init_failpoint_after_coordinator_init_cleans_up_schema_files() {
     let _scenario = FailScenario::setup();
     let dir = tempfile::tempdir().unwrap();
     let uri = dir.path().to_str().unwrap();
-    let _failpoint = ScopedFailPoint::new("init.after_coordinator_init", "return");
+    let _failpoint = ScopedFailPoint::new(names::INIT_AFTER_COORDINATOR_INIT, "return");
 
     let err = match Omnigraph::init(uri, helpers::TEST_SCHEMA).await {
         Ok(_) => panic!("expected Omnigraph::init to fail at the configured failpoint"),
@@ -4355,6 +4448,7 @@ async fn init_failpoint_after_coordinator_init_cleans_up_schema_files() {
 }
 
 #[tokio::test]
+#[serial]
 async fn init_failpoint_returns_original_error_not_cleanup_error() {
     // The cleanup is best-effort. If `storage.delete` fails (e.g. transient
     // network blip on S3), the original init failpoint error must still
@@ -4366,7 +4460,7 @@ async fn init_failpoint_returns_original_error_not_cleanup_error() {
     let _scenario = FailScenario::setup();
     let dir = tempfile::tempdir().unwrap();
     let uri = dir.path().to_str().unwrap();
-    let _failpoint = ScopedFailPoint::new("init.after_schema_pg_written", "return");
+    let _failpoint = ScopedFailPoint::new(names::INIT_AFTER_SCHEMA_PG_WRITTEN, "return");
 
     let err = match Omnigraph::init(uri, helpers::TEST_SCHEMA).await {
         Ok(_) => panic!("expected Omnigraph::init to fail at the configured failpoint"),
@@ -4378,4 +4472,154 @@ async fn init_failpoint_returns_original_error_not_cleanup_error() {
         msg.contains("init.after_schema_pg_written"),
         "init error must surface the failpoint cause, got: {msg}"
     );
+}
+
+// ── RFC-013 Phase 7 / FIX A: a transient legacy-open failure must abort the ──
+// v3→v4 migration loudly, not silently swallow the lineage and stamp v4.
+//
+// `migrate_v3_to_v4` backfills graph lineage from `_graph_commits.lance` into
+// `__manifest`, then stamps internal-schema v4. The migration runs exactly once
+// per graph (`migrate_internal_schema` is `while stamp < CURRENT`). If a
+// transient or corrupt `Dataset::open` of the legacy commit dataset is treated
+// as "no legacy data" (the pre-fix `Err(_) => empty` arm), the migration backfills
+// NOTHING and stamps v4 — orphaning the real lineage permanently, since the v3
+// fallback is then disabled. The fix matches the not-found variants (benign:
+// genuinely no legacy data) and propagates anything else.
+//
+// This test injects a non-not-found Lance error at the legacy open via the
+// `migration.v3_to_v4.legacy_open` failpoint. The load-bearing assertion is the
+// last one: a once-transient failure leaves the graph RETRYABLE (stamp still v3,
+// no lineage), so a later open with the fault cleared completes the migration —
+// it was not a poison pill.
+#[tokio::test]
+async fn transient_legacy_open_failure_aborts_migration_without_stamping_v4() {
+    let _scenario = FailScenario::setup();
+    let dir = tempfile::tempdir().unwrap();
+    let uri = dir.path().to_str().unwrap().to_string();
+
+    // A real pre-Phase-7 (v3) graph: lineage only in `_graph_commits.lance`,
+    // `__manifest` stamped v3 with no `graph_commit` rows.
+    let fixture = omnigraph::db::commit_graph::seed_legacy_v3_lineage(&uri)
+        .await
+        .unwrap();
+    let (rows_before, stamp_before) =
+        omnigraph::db::manifest::lineage_row_count_and_stamp_for_test(&uri, None)
+            .await
+            .unwrap();
+    assert_eq!(stamp_before, 3, "fixture is stamped v3");
+    assert_eq!(rows_before, 0, "fixture has no lineage in __manifest");
+
+    // Arm the legacy-open fault and run the read-write migration entry point.
+    {
+        let _fp = ScopedFailPoint::new(names::MIGRATION_V3_TO_V4_LEGACY_OPEN, "return");
+        let err = match omnigraph::db::manifest::migrate_on_open_for_test(&uri).await {
+            Ok(()) => panic!("migration must abort when the legacy open fails transiently"),
+            Err(e) => e,
+        };
+        // The injected (non-not-found) Lance error must surface, not be masked.
+        let msg = err.to_string();
+        assert!(
+            msg.contains("injected failpoint triggered: migration.v3_to_v4.legacy_open"),
+            "expected the injected legacy-open error to propagate, got: {msg}"
+        );
+    }
+
+    // The migration left NO drift: stamp still v3, still no lineage. (Pre-fix,
+    // the swallow would have stamped v4 with an empty backfill — permanent loss.)
+    let (rows_after_fault, stamp_after_fault) =
+        omnigraph::db::manifest::lineage_row_count_and_stamp_for_test(&uri, None)
+            .await
+            .unwrap();
+    assert_eq!(
+        stamp_after_fault, 3,
+        "a transient legacy-open failure must NOT stamp the manifest to v4",
+    );
+    assert_eq!(
+        rows_after_fault, 0,
+        "a transient legacy-open failure must NOT partially backfill lineage",
+    );
+
+    // The whole correctness claim: a once-transient failure is retryable. With the
+    // fault cleared, the next migration pass reads the legacy lineage and completes.
+    omnigraph::db::manifest::migrate_on_open_for_test(&uri)
+        .await
+        .unwrap();
+    let (rows_done, stamp_done) =
+        omnigraph::db::manifest::lineage_row_count_and_stamp_for_test(&uri, None)
+            .await
+            .unwrap();
+    assert_eq!(stamp_done, 4, "the retried migration stamps v4");
+    assert_eq!(
+        rows_done,
+        fixture.all_ids.len(),
+        "the retried migration backfills every legacy commit",
+    );
+}
+
+// ── RFC-013 Phase 7 / FIX B follow-up: the v3→v4 stamp-bump retry loop must ──
+// surface a RETRYABLE contention error on exhaustion, not a stringified Lance error.
+//
+// `commit_v4_stamp_idempotently` bumps the internal-schema stamp under concurrent
+// runners: the `UpdateConfig` CAS loser gets `IncompatibleTransaction`, re-opens,
+// confirms the winner stamped the same value, and is done. Genuine exhaustion (every
+// attempt loses) must return a `RowLevelCasContention` so the publisher's OUTER retry
+// completes the one-time open — an `OmniError::Lance` would be treated as fatal. The
+// `migration.v4_stamp.force_incompatible` failpoint forces every stamp attempt to lose,
+// driving the otherwise-near-unreachable exhaustion path deterministically. (Pre-fix —
+// `0..=BUDGET` + an `attempt < BUDGET` guard — the last iteration fell through to the
+// stringifying `Err(e)` arm and returned a non-retryable `OmniError::Lance`.)
+#[tokio::test]
+async fn v4_stamp_exhaustion_returns_retryable_contention() {
+    let _scenario = FailScenario::setup();
+    let dir = tempfile::tempdir().unwrap();
+    let uri = dir.path().to_str().unwrap().to_string();
+
+    // A real v3 graph: the backfill merge succeeds; only the terminal stamp loop
+    // is forced to exhaust.
+    let _fixture = omnigraph::db::commit_graph::seed_legacy_v3_lineage(&uri)
+        .await
+        .unwrap();
+
+    let _fp = ScopedFailPoint::new(names::MIGRATION_V4_STAMP_FORCE_INCOMPATIBLE, "return");
+    let err = match omnigraph::db::manifest::migrate_on_open_for_test(&uri).await {
+        Ok(()) => panic!("migration must error when the stamp bump exhausts its retries"),
+        Err(e) => e,
+    };
+    assert!(
+        matches!(
+            &err,
+            omnigraph::error::OmniError::Manifest(m)
+                if matches!(
+                    m.details,
+                    Some(omnigraph::error::ManifestConflictDetails::RowLevelCasContention)
+                )
+        ),
+        "stamp-bump exhaustion must surface a RETRYABLE RowLevelCasContention so the \
+         publisher's outer retry completes the open, got: {err:?}",
+    );
+}
+
+// The publisher's outer retry must re-run `load_publish_state` on a RETRYABLE error,
+// not propagate it fatally. `load_publish_state` runs `migrate_internal_schema`, whose
+// bounded merge/stamp loops surface a `RowLevelCasContention` on exhaustion EXPECTING
+// this re-run (a clean second scan, by which point a concurrent winner has finished the
+// migration). Before the fix, `load_publish_state().await?` short-circuited the loop —
+// only `merge_rows` conflicts hit the retry — so the typed contention aborted the
+// publish. Inject a ONE-SHOT retryable contention into `load_publish_state`: the write
+// must still commit, because the publisher retries and the cleared second attempt wins.
+#[tokio::test]
+#[serial]
+async fn publisher_retries_retryable_load_publish_state_error() {
+    let _scenario = FailScenario::setup();
+    let dir = tempfile::tempdir().unwrap();
+    let db = helpers::init_and_load(&dir).await;
+
+    // `1*return`: fail only the FIRST `load_publish_state` of the next publish, so the
+    // retry's second call is clean. Set after `init_and_load` so its publishes are
+    // unaffected.
+    let _fp = ScopedFailPoint::new(names::PUBLISH_LOAD_STATE_RETRYABLE_CONTENTION, "1*return");
+    let row = r#"{"type":"Person","data":{"name":"Grace","age":37}}"#;
+    db.load_as("main", None, row, LoadMode::Merge, None)
+        .await
+        .expect("publisher must retry the one-shot retryable load_publish_state error and commit");
 }

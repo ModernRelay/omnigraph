@@ -187,7 +187,10 @@ impl Omnigraph {
             &omnigraph_policy::ResourceScope::Branch(branch.to_string()),
             actor_id,
         )?;
-        self.ensure_schema_state_valid().await?;
+        // Schema-contract validation is captured ONCE per write via the
+        // `WriteTxn` opened in `load_jsonl_reader` (after branch resolution).
+        // The redundant `ensure_schema_state_valid` that used to run here is
+        // subsumed by `open_write_txn`'s `resolved_branch_target` call.
         // Converge any pending recovery sidecar (a previously failed
         // writer's Phase B → Phase C residual) before staging anything:
         // without this, sidecar-covered drift wedges every load on the
@@ -397,7 +400,16 @@ async fn load_jsonl_reader<R: BufRead>(
     // inline path.
 
     let mut result = LoadResult::default();
-    let snapshot = db.snapshot_for_branch(branch).await?;
+    // Capture-once write transaction (RFC-013 step 3b). `open_write_txn`
+    // validates the schema contract ONCE and pins the base snapshot. Threaded
+    // as `Some(&txn)` through the per-table opens and the manifest publish so
+    // each resolve point reuses the pinned base instead of re-validating the
+    // contract. The branch already exists here (fork-if-missing ran in
+    // `load_as` before this), so this captures the post-fork snapshot. The
+    // load's own base read (`db.snapshot_for_branch` previously) is the same
+    // per-branch snapshot, so reuse `txn.base` for it — dropping a validation.
+    let txn = db.open_write_txn(branch).await?;
+    let snapshot = txn.base.clone();
     let mut staging = MutationStaging::default();
     let pending_mode = match mode {
         LoadMode::Merge => PendingMode::Merge,
@@ -481,15 +493,18 @@ async fn load_jsonl_reader<R: BufRead>(
     // Phase 2b: accumulate every node type in memory. Fragment writes are
     // delayed until after all validation succeeds.
     for (type_name, table_key, batch, loaded_count) in prepared_nodes {
-        let (ds, full_path, table_branch) = db
-            .open_for_mutation_on_branch(branch, &table_key, load_op_kind)
+        // The loader only needs the captured expected version (the publisher's
+        // CAS fence) for `ensure_path` — it discards the handle. With a
+        // non-strict load op (Merge/Append) and a `WriteTxn`, collapse #1 skips
+        // the dataset open and returns the pinned base version directly.
+        let opened = db
+            .open_for_mutation_on_branch(branch, &table_key, load_op_kind, Some(&txn))
             .await?;
-        let expected_version = ds.version();
         staging.ensure_path(
             &table_key,
-            full_path,
-            table_branch,
-            expected_version,
+            opened.full_path,
+            opened.table_branch,
+            opened.expected_version,
             load_op_kind,
         );
         let schema = batch.schema();
@@ -553,15 +568,16 @@ async fn load_jsonl_reader<R: BufRead>(
 
     // Phase 2e: accumulate every edge type. Same dispatch as Phase 2b.
     for (edge_name, table_key, batch, loaded_count) in prepared_edges {
-        let (ds, full_path, table_branch) = db
-            .open_for_mutation_on_branch(branch, &table_key, load_op_kind)
+        // Same as the node phase: only the captured expected version is used;
+        // collapse #1 skips the open for a non-strict load op under a `WriteTxn`.
+        let opened = db
+            .open_for_mutation_on_branch(branch, &table_key, load_op_kind, Some(&txn))
             .await?;
-        let expected_version = ds.version();
         staging.ensure_path(
             &table_key,
-            full_path,
-            table_branch,
-            expected_version,
+            opened.full_path,
+            opened.table_branch,
+            opened.expected_version,
             load_op_kind,
         );
         let schema = batch.schema();
@@ -589,22 +605,36 @@ async fn load_jsonl_reader<R: BufRead>(
     // `_queue_guards` holds per-(table_key, branch) write queues
     // across the manifest publish below — see exec/mutation.rs for
     // the rationale (interleaving prevention).
-    let (updates, expected_versions, sidecar_handle, _queue_guards) = staged
+    let crate::exec::staging::CommittedMutation {
+        updates,
+        expected_versions,
+        sidecar_handle,
+        guards: _queue_guards,
+        committed_handles,
+    } = staged
         .commit_all(
             db,
             branch,
             crate::db::manifest::SidecarKind::Load,
             actor_id,
             fork_queue_guards,
+            Some(&txn),
         )
         .await?;
     // Same finalize → publisher residual as mutations: per-table
     // staged commits have advanced Lance HEAD, but the manifest
     // publish has not run yet. Reuse the mutation failpoint name so
     // one failpoint pins the shared `MutationStaging` boundary.
-    crate::failpoints::maybe_fail("mutation.post_finalize_pre_publisher")?;
-    db.commit_updates_on_branch_with_expected(branch, &updates, &expected_versions, actor_id)
-        .await?;
+    crate::failpoints::maybe_fail(crate::failpoints::names::MUTATION_POST_FINALIZE_PRE_PUBLISHER)?;
+    db.commit_updates_on_branch_with_expected(
+        branch,
+        &updates,
+        &expected_versions,
+        actor_id,
+        Some(&txn),
+        committed_handles,
+    )
+    .await?;
     // The recovery sidecar protects the per-table commit_staged →
     // manifest publish window. Phase C succeeded — clean up
     // best-effort: failing the user here would error out a write
@@ -1548,80 +1578,14 @@ fn literal_value_to_f64(v: &omnigraph_compiler::catalog::LiteralValue) -> f64 {
 
 // ─── Edge cardinality validation ─────────────────────────────────────────────
 
-pub(crate) async fn validate_edge_cardinality(
-    db: &crate::db::Omnigraph,
-    branch: Option<&str>,
-    edge_name: &str,
-    written_version: u64,
-    written_branch: Option<&str>,
-) -> Result<()> {
-    use arrow_array::Array;
-    let catalog = db.catalog();
-    let edge_type = &catalog.edge_types[edge_name];
-    if edge_type.cardinality.is_default() {
-        return Ok(());
-    }
-
-    // Open edge sub-table at the just-written version, not the snapshot's
-    // (the snapshot still pins to the pre-write version).
-    let snapshot = db.snapshot_for_branch(branch).await?;
-    let table_key = format!("edge:{}", edge_name);
-    let entry = snapshot
-        .entry(&table_key)
-        .ok_or_else(|| OmniError::manifest(format!("no manifest entry for {}", table_key)))?;
-    let ds = db
-        .open_dataset_at_state(
-            &entry.table_path,
-            written_branch.or(entry.table_branch.as_deref()),
-            written_version,
-        )
-        .await?;
-
-    // Scan src column, count per source
-    let batches = db.storage().scan(&ds, Some(&["src"]), None, None).await?;
-
-    let mut counts: HashMap<String, u32> = HashMap::new();
-    for batch in &batches {
-        let srcs = batch
-            .column_by_name("src")
-            .unwrap()
-            .as_any()
-            .downcast_ref::<StringArray>()
-            .unwrap();
-        for i in 0..srcs.len() {
-            *counts.entry(srcs.value(i).to_string()).or_insert(0) += 1;
-        }
-    }
-
-    let card = &edge_type.cardinality;
-    for (src, count) in &counts {
-        if let Some(max) = card.max {
-            if *count > max {
-                return Err(OmniError::manifest(format!(
-                    "@card violation on edge {}: source '{}' has {} edges (max {})",
-                    edge_name, src, count, max
-                )));
-            }
-        }
-        if *count < card.min {
-            return Err(OmniError::manifest(format!(
-                "@card violation on edge {}: source '{}' has {} edges (min {})",
-                edge_name, src, count, card.min
-            )));
-        }
-    }
-
-    Ok(())
-}
-
 /// Validate edge `@card` cardinality with in-memory pending edges visible.
 ///
 /// Loader-level analog to `exec::mutation::validate_edge_cardinality_with_pending`:
 /// opens the committed dataset at the pre-load snapshot version, then
 /// delegates to the shared `count_src_per_edge` + `enforce_cardinality_bounds`
-/// helpers in `exec::staging`. Used by Append/Merge loads (the Overwrite
-/// path uses `validate_edge_cardinality` which opens the just-written
-/// Lance version).
+/// helpers in `exec::staging`. Used by every load mode; for `LoadMode::Overwrite`
+/// it treats the pending edge batches as the replacement table image (the
+/// committed rows are being replaced, so only the pending set is counted).
 ///
 /// `mode` controls dedup behavior. `LoadMode::Merge` passes `Some("id")`
 /// so committed edges that the load is *updating* (same edge id,

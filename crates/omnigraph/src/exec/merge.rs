@@ -1068,10 +1068,13 @@ async fn publish_rewritten_merge_table(
     // source onto target). The inline `delete_where` later in this
     // function operates on rows the rewrite chose to remove, not
     // user-facing predicates, so Merge is the correct policy here.
-    let (ds, full_path, table_branch) = target_db
+    // `open_for_mutation` is the no-txn entry, so collapse #1's non-strict
+    // open-skip (gated on `txn.is_some()`) never fires here — the handle is
+    // always `Some`.
+    let (mut current_ds, full_path, table_branch) = target_db
         .open_for_mutation(table_key, crate::db::MutationOpKind::Merge)
-        .await?;
-    let mut current_ds = ds;
+        .await?
+        .require_handle("branch merge");
 
     // Phase 1: merge_insert changed/new rows (preserves _row_created_at_version for
     // existing rows, bumps _row_last_updated_at_version only for actually-changed rows).
@@ -1125,7 +1128,7 @@ async fn publish_rewritten_merge_table(
     // rows are on Lance HEAD but the delete has not committed and the
     // achieved-version intent has not been recorded, so recovery must roll BACK.
     // See tests/failpoints.rs::branch_merge_rewrite_partial_after_merge_rolls_back.
-    crate::failpoints::maybe_fail("branch_merge.rewrite_after_merge_pre_delete")?;
+    crate::failpoints::maybe_fail(crate::failpoints::names::BRANCH_MERGE_REWRITE_AFTER_MERGE_PRE_DELETE)?;
 
     // Phase 2: delete removed rows via deletion vectors.
     //
@@ -1156,7 +1159,7 @@ async fn publish_rewritten_merge_table(
     // recorded, so recovery must roll BACK (the index is reconciler-owned derived
     // state, but the merge itself never reached its commit boundary). See
     // tests/failpoints.rs::branch_merge_rewrite_partial_after_delete_rolls_back.
-    crate::failpoints::maybe_fail("branch_merge.rewrite_after_delete_pre_index")?;
+    crate::failpoints::maybe_fail(crate::failpoints::names::BRANCH_MERGE_REWRITE_AFTER_DELETE_PRE_INDEX)?;
 
     // Phase 3: rebuild indices.
     //
@@ -1237,10 +1240,13 @@ async fn publish_adopted_delta(
     table_key: &str,
     delta: &AdoptDelta,
 ) -> Result<crate::db::SubTableUpdate> {
-    let (ds, full_path, table_branch) = target_db
+    // `open_for_mutation` is the no-txn entry, so collapse #1's non-strict
+    // open-skip (gated on `txn.is_some()`) never fires here — the handle is
+    // always `Some`.
+    let (mut current_ds, full_path, table_branch) = target_db
         .open_for_mutation(table_key, crate::db::MutationOpKind::Merge)
-        .await?;
-    let mut current_ds = ds;
+        .await?
+        .require_handle("branch merge");
 
     // Phase 1a: append the NEW rows. `stage_append_stream` is a streaming
     // `Operation::Append` — no hash join — so it never buffers the delta and
@@ -1270,7 +1276,7 @@ async fn publish_adopted_delta(
     // have not committed and the achieved-version intent has not been recorded, so
     // recovery must roll BACK (not publish the appends-only state). See
     // tests/failpoints.rs::branch_merge_adopt_partial_after_append_rolls_back.
-    crate::failpoints::maybe_fail("branch_merge.adopt_after_append_pre_upsert")?;
+    crate::failpoints::maybe_fail(crate::failpoints::names::BRANCH_MERGE_ADOPT_AFTER_APPEND_PRE_UPSERT)?;
 
     // Phase 1b: upsert the CHANGED rows. The merge_insert hash join is now
     // bounded to the genuinely-changed set, not the whole delta. It runs against
@@ -1302,7 +1308,7 @@ async fn publish_adopted_delta(
     // has not committed and the achieved-version intent has not been recorded, so
     // recovery must roll BACK. See
     // tests/failpoints.rs::branch_merge_adopt_partial_after_upsert_rolls_back.
-    crate::failpoints::maybe_fail("branch_merge.adopt_after_upsert_pre_delete")?;
+    crate::failpoints::maybe_fail(crate::failpoints::names::BRANCH_MERGE_ADOPT_AFTER_UPSERT_PRE_DELETE)?;
 
     // Phase 2: delete removed rows via deletion vectors (inline-commit residual,
     // same as the three-way path until Lance ships a public two-phase delete).
@@ -1787,17 +1793,22 @@ impl Omnigraph {
         // (publish_*) AND the sidecar is confirmed, but the manifest publish
         // below hasn't run — so recovery rolls FORWARD. Used by
         // `tests/failpoints.rs::branch_merge_phase_b_failure_recovered_on_next_open`.
-        crate::failpoints::maybe_fail("branch_merge.post_phase_b_pre_manifest_commit")?;
+        crate::failpoints::maybe_fail(crate::failpoints::names::BRANCH_MERGE_POST_PHASE_B_PRE_MANIFEST_COMMIT)?;
 
-        let manifest_version = if updates.is_empty() {
-            self.version().await
-        } else {
-            self.commit_manifest_updates(&updates).await?
-        };
+        // Publish the merged table versions AND the merge commit in one manifest
+        // CAS (RFC-013 Phase 7): `graph_commit` + `graph_head` rows ride the same
+        // merge-insert as the table-version rows. The merge commit's first parent
+        // is resolved by the publisher as the live target-branch head (the
+        // post-merge correct parent even if the target advanced); its merged-in
+        // parent is the source head. `target_head_commit_id` is no longer passed
+        // — it was the pre-merge target head, which the publisher reads live.
+        let _ = target_head_commit_id;
+        self.commit_merge_with_actor(&updates, source_head_commit_id, actor_id)
+            .await?;
 
-        // Recovery sidecar lifecycle: delete after manifest publish.
-        // Best-effort cleanup; the merge already landed durably so
-        // failing the user here is undesirable.
+        // Recovery sidecar lifecycle: delete after the manifest publish (Phase C).
+        // Best-effort cleanup; the merge already landed durably so failing the
+        // user here is undesirable.
         if let Some((_, handle)) = recovery {
             if let Err(err) =
                 crate::db::manifest::delete_sidecar(&handle, self.storage_adapter()).await
@@ -1809,13 +1820,6 @@ impl Omnigraph {
                 );
             }
         }
-        self.record_merge_commit(
-            manifest_version,
-            target_head_commit_id,
-            source_head_commit_id,
-            actor_id,
-        )
-        .await?;
 
         if changed_edge_tables {
             self.invalidate_graph_index().await;

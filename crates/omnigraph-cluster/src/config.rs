@@ -474,7 +474,7 @@ pub(crate) async fn preview_schema_migration(
     Ok(preview.plan)
 }
 
-struct LiveGraphObservation {
+pub(crate) struct LiveGraphObservation {
     manifest_version: u64,
     schema_digest: String,
 }
@@ -494,7 +494,7 @@ pub(crate) async fn observe_live_graph(graph_uri: &str) -> Result<LiveGraphObser
     })
 }
 
-struct GraphObservationJson<'a> {
+pub(crate) struct GraphObservationJson<'a> {
     address: &'a str,
     graph_uri: &'a str,
     observed_at: &'a str,
@@ -949,7 +949,7 @@ pub(crate) fn validate_id(kind: &str, path: &str, value: &str, diagnostics: &mut
     }
 }
 
-enum PolicyTarget {
+pub(crate) enum PolicyTarget {
     Cluster,
     Graph(String),
     WrongKind(String),

@@ -13,9 +13,11 @@ use std::fs;
 use std::path::{Path, PathBuf};
 
 use fail::FailScenario;
+use serial_test::serial;
 use omnigraph::db::Omnigraph;
-use omnigraph::failpoints::ScopedFailPoint as EngineScopedFailPoint;
-use omnigraph_cluster::failpoints::ScopedFailPoint;
+// One ScopedFailPoint for both engine- and cluster-scoped failpoint names:
+// it is registry-only (error-type agnostic) and lives in the lowest crate.
+use omnigraph::failpoints::ScopedFailPoint;
 use omnigraph_cluster::{
     ApplyOptions, apply_config_dir, apply_config_dir_with_options, approve_config_dir,
     validate_config_dir,
@@ -105,12 +107,13 @@ fn query_blob(config_dir: &Path, digests: &BTreeMap<String, String>) -> PathBuf 
 }
 
 #[tokio::test]
+#[serial]
 async fn failpoint_wiring_returns_injected_diagnostic() {
     let scenario = FailScenario::setup();
     let dir = fixture();
     seed_applyable_state(dir.path());
 
-    let _failpoint = ScopedFailPoint::new("cluster_apply.after_payload_phase", "return");
+    let _failpoint = ScopedFailPoint::new(omnigraph_cluster::failpoints::names::CLUSTER_APPLY_AFTER_PAYLOAD_PHASE, "return");
     let out = apply_config_dir(dir.path()).await;
     assert!(!out.ok);
     assert!(out.diagnostics.iter().any(|diagnostic| {
@@ -127,6 +130,7 @@ async fn failpoint_wiring_returns_injected_diagnostic() {
 /// state.json is byte-identical, nothing is acknowledged — and a plain re-run
 /// repairs by trusting the existing content-addressed blobs.
 #[tokio::test]
+#[serial]
 async fn apply_crash_after_payload_phase_leaves_state_unmoved_then_recovers() {
     let scenario = FailScenario::setup();
     let dir = fixture();
@@ -134,7 +138,7 @@ async fn apply_crash_after_payload_phase_leaves_state_unmoved_then_recovers() {
     let state_before = fs::read(state_path(dir.path())).unwrap();
 
     {
-        let _failpoint = ScopedFailPoint::new("cluster_apply.after_payload_phase", "return");
+        let _failpoint = ScopedFailPoint::new(omnigraph_cluster::failpoints::names::CLUSTER_APPLY_AFTER_PAYLOAD_PHASE, "return");
         let out = apply_config_dir(dir.path()).await;
         assert!(!out.ok);
         assert!(!out.state_written);
@@ -169,6 +173,7 @@ async fn apply_crash_after_payload_phase_leaves_state_unmoved_then_recovers() {
 /// (possible under `state.lock: false`) must surface `state_cas_mismatch`,
 /// acknowledge nothing, and leave the concurrent writer's state on disk.
 #[tokio::test]
+#[serial]
 async fn apply_cas_race_surfaces_state_cas_mismatch() {
     let scenario = FailScenario::setup();
     let dir = fixture();
@@ -179,7 +184,7 @@ async fn apply_cas_race_surfaces_state_cas_mismatch() {
     // after apply read it but before apply writes. RAII-guarded so a panic
     // inside apply cannot leak the callback into the global registry.
     let race_path = state_path(dir.path());
-    let failpoint = ScopedFailPoint::with_callback("cluster_apply.before_state_write", move || {
+    let failpoint = ScopedFailPoint::with_callback(omnigraph_cluster::failpoints::names::CLUSTER_APPLY_BEFORE_STATE_WRITE, move || {
         let mut state: serde_json::Value =
             serde_json::from_str(&fs::read_to_string(&race_path).unwrap()).unwrap();
         state["state_revision"] = serde_json::json!(99);
@@ -256,13 +261,14 @@ fn recovery_sidecars(config_dir: &Path) -> Vec<PathBuf> {
 /// The next run's sweep removes the intent (row 1) and the same run creates
 /// the graph and converges.
 #[tokio::test]
+#[serial]
 async fn create_crash_before_init_recovers_via_sweep() {
     let scenario = FailScenario::setup();
     let dir = fixture();
     seed_empty_state(dir.path());
 
     {
-        let _failpoint = ScopedFailPoint::new("cluster_apply.before_graph_create", "return");
+        let _failpoint = ScopedFailPoint::new(omnigraph_cluster::failpoints::names::CLUSTER_APPLY_BEFORE_GRAPH_CREATE, "return");
         let out = apply_config_dir(dir.path()).await;
         assert!(!out.ok);
         assert!(out.diagnostics.iter().any(|diagnostic| {
@@ -298,6 +304,7 @@ async fn create_crash_before_init_recovers_via_sweep() {
 /// ledger is stale, nothing was acknowledged. The next run's sweep rolls the
 /// ledger forward (row 4) with an audit entry, and the run converges.
 #[tokio::test]
+#[serial]
 async fn create_crash_after_init_rolls_state_forward() {
     let scenario = FailScenario::setup();
     let dir = fixture();
@@ -305,7 +312,7 @@ async fn create_crash_after_init_rolls_state_forward() {
     let state_before = fs::read(dir.path().join("__cluster/state.json")).unwrap();
 
     {
-        let _failpoint = ScopedFailPoint::new("cluster_apply.after_graph_create", "return");
+        let _failpoint = ScopedFailPoint::new(omnigraph_cluster::failpoints::names::CLUSTER_APPLY_AFTER_GRAPH_CREATE, "return");
         let out = apply_config_dir(dir.path()).await;
         assert!(!out.ok);
         assert!(!out.state_written);
@@ -385,6 +392,7 @@ async fn live_schema_digest(dir: &Path) -> String {
 /// live schema and ledger are untouched; the next run's sweep retires the
 /// stale intent and the same run applies and converges.
 #[tokio::test]
+#[serial]
 async fn schema_crash_before_apply_recovers_via_sweep() {
     let scenario = FailScenario::setup();
     let dir = fixture();
@@ -393,7 +401,7 @@ async fn schema_crash_before_apply_recovers_via_sweep() {
     fs::write(dir.path().join("people.pg"), SCHEMA_V2).unwrap();
 
     {
-        let _failpoint = ScopedFailPoint::new("cluster_apply.before_schema_apply", "return");
+        let _failpoint = ScopedFailPoint::new(omnigraph_cluster::failpoints::names::CLUSTER_APPLY_BEFORE_SCHEMA_APPLY, "return");
         let out = apply_config_dir_with_options(
             dir.path(),
             ApplyOptions {
@@ -425,6 +433,7 @@ async fn schema_crash_before_apply_recovers_via_sweep() {
 /// the graph manifest moves. The defensive cleanup proof should remove the
 /// cluster sidecar immediately so a pre-movement error cannot brick boot.
 #[tokio::test]
+#[serial]
 async fn schema_apply_error_before_graph_movement_removes_sidecar() {
     let scenario = FailScenario::setup();
     let dir = fixture();
@@ -433,7 +442,7 @@ async fn schema_apply_error_before_graph_movement_removes_sidecar() {
     fs::write(dir.path().join("people.pg"), SCHEMA_V2).unwrap();
 
     {
-        let _failpoint = EngineScopedFailPoint::new("schema_apply.before_staging_write", "return");
+        let _failpoint = ScopedFailPoint::new(omnigraph::failpoints::names::SCHEMA_APPLY_BEFORE_STAGING_WRITE, "return");
         let out = apply_config_dir(dir.path()).await;
         assert!(!out.ok);
         assert!(
@@ -462,6 +471,7 @@ async fn schema_apply_error_before_graph_movement_removes_sidecar() {
 /// prove this is a pre-movement failure, so the sidecar must survive for
 /// explicit recovery/quarantine instead of being cleaned up defensively.
 #[tokio::test]
+#[serial]
 async fn schema_apply_error_after_graph_movement_keeps_sidecar() {
     let scenario = FailScenario::setup();
     let dir = fixture();
@@ -472,7 +482,7 @@ async fn schema_apply_error_after_graph_movement_keeps_sidecar() {
     let v2_digest = desired.resource_digests["schema.knowledge"].clone();
 
     {
-        let _failpoint = EngineScopedFailPoint::new("schema_apply.after_manifest_commit", "return");
+        let _failpoint = ScopedFailPoint::new(omnigraph::failpoints::names::SCHEMA_APPLY_AFTER_MANIFEST_COMMIT, "return");
         let out = apply_config_dir(dir.path()).await;
         assert!(!out.ok);
         assert!(
@@ -524,6 +534,7 @@ async fn schema_apply_error_after_graph_movement_keeps_sidecar() {
 /// moved, the ledger is stale, nothing acknowledged; the next run's sweep
 /// rolls the ledger forward with an audit entry and the run converges.
 #[tokio::test]
+#[serial]
 async fn schema_crash_after_apply_rolls_state_forward() {
     let scenario = FailScenario::setup();
     let dir = fixture();
@@ -534,7 +545,7 @@ async fn schema_crash_after_apply_rolls_state_forward() {
     let v2_digest = desired.resource_digests["schema.knowledge"].clone();
 
     {
-        let _failpoint = ScopedFailPoint::new("cluster_apply.after_schema_apply", "return");
+        let _failpoint = ScopedFailPoint::new(omnigraph_cluster::failpoints::names::CLUSTER_APPLY_AFTER_SCHEMA_APPLY, "return");
         let out = apply_config_dir(dir.path()).await;
         assert!(!out.ok);
         assert!(!out.state_written);
@@ -608,13 +619,14 @@ async fn seed_approved_delete(dir: &Path) -> String {
 /// next run retires the stale intent (row 8) and the still-approved delete
 /// completes in the same run.
 #[tokio::test]
+#[serial]
 async fn delete_crash_before_removal_reproposes() {
     let scenario = FailScenario::setup();
     let dir = fixture();
     let approval_id = seed_approved_delete(dir.path()).await;
 
     {
-        let _failpoint = ScopedFailPoint::new("cluster_apply.before_graph_delete", "return");
+        let _failpoint = ScopedFailPoint::new(omnigraph_cluster::failpoints::names::CLUSTER_APPLY_BEFORE_GRAPH_DELETE, "return");
         let out = apply_config_dir(dir.path()).await;
         assert!(!out.ok);
         assert!(dir.path().join("graphs/old.omni").exists());
@@ -650,6 +662,7 @@ async fn delete_crash_before_removal_reproposes() {
 /// nothing acknowledged; the next run's sweep rolls the tombstone forward,
 /// consumes the approval the sidecar carries, and audits the recovery.
 #[tokio::test]
+#[serial]
 async fn delete_crash_after_removal_rolls_forward() {
     let scenario = FailScenario::setup();
     let dir = fixture();
@@ -657,7 +670,7 @@ async fn delete_crash_after_removal_rolls_forward() {
     let state_before = fs::read(state_path(dir.path())).unwrap();
 
     {
-        let _failpoint = ScopedFailPoint::new("cluster_apply.after_graph_delete", "return");
+        let _failpoint = ScopedFailPoint::new(omnigraph_cluster::failpoints::names::CLUSTER_APPLY_AFTER_GRAPH_DELETE, "return");
         let out = apply_config_dir(dir.path()).await;
         assert!(!out.ok);
         assert!(!out.state_written);

@@ -41,6 +41,7 @@ pub use repair::{
 };
 pub use schema_apply::SchemaApplyOptions;
 pub use table_ops::PendingIndex;
+pub(crate) use table_ops::OpenedForMutation;
 
 use super::commit_graph::GraphCommit;
 use super::manifest::{
@@ -79,6 +80,35 @@ pub struct SchemaApplyPreview {
     pub catalog: Catalog,
 }
 
+/// A capture-once write transaction (RFC-013 step 3b). Pins the operation's read
+/// base ONCE so the per-table opens reuse the pinned version instead of
+/// re-resolving / re-validating per table. The schema contract is validated once
+/// (when `base` is captured). NOT a general "no re-resolution" handle — the
+/// commit-time OCC re-read, the live-HEAD drift probe, and the fork-authority reads
+/// stay fresh (correctness machinery). Step 5 (PublishPlan unification) makes this
+/// the non-optional publish carrier and adds session-aware base opens there, gated
+/// by an S3 cost test — the warm-session benefit on the single remaining open is an
+/// object-store phenomenon, so it earns its own gate rather than riding this PR.
+///
+/// Threaded as `Option<&WriteTxn>` through the mutate/load write chain
+/// (`open_for_mutation_on_branch`, `commit_all`, `commit_updates_on_branch_with_expected`)
+/// so a single write validates the schema contract EXACTLY ONCE — at capture. When
+/// present, the per-table resolves source the pinned `base` entry instead of calling
+/// `resolved_branch_target` / `snapshot_for_branch` / `fresh_snapshot_for_branch`
+/// (each of which re-runs `ensure_schema_state_valid`). When absent (`None` — every
+/// non-mutate/load caller), every threaded function behaves byte-identically to
+/// before. The carrier never removes a version guard or changes which dataset version
+/// the per-table open targets: strict ops keep `open_dataset_head_for_write` +
+/// `ensure_expected_version`, and the commit-time OCC re-read still opens a fresh
+/// manifest snapshot (via `fresh_snapshot_for_branch_unchecked`) — only the redundant
+/// schema re-validation is dropped.
+pub(crate) struct WriteTxn {
+    /// The resolved branch (`None` = main).
+    pub(crate) branch: Option<String>,
+    /// The pinned base snapshot (per-table location + version + e_tag), captured once.
+    pub(crate) base: Snapshot,
+}
+
 /// Top-level handle to an Omnigraph database.
 ///
 /// An Omnigraph is a Lance-native graph database with git-style branching.
@@ -93,12 +123,12 @@ pub struct Omnigraph {
     /// calls without a global write lock). Reads (`snapshot`, `version`,
     /// `current_branch`, `branch_list`, `resolve_*`, `head_commit_id`,
     /// `list_commits`, …) acquire `.read().await` and parallelize.
-    /// Writes (`refresh`, `branch_create`, `branch_delete`, `commit_*`,
-    /// `record_*`) acquire `.write().await` and serialize. The atomic
-    /// commit invariant — `commit_manifest_updates` followed by
-    /// `record_graph_commit` must be atomic — is preserved by the
-    /// single `.write()` covering both calls inside
-    /// `commit_updates_with_actor_with_expected`. PR 2 Phase 2
+    /// Writes (`refresh`, `branch_create`, `branch_delete`, `commit_*`)
+    /// acquire `.write().await` and serialize. The atomic commit invariant —
+    /// table-version rows and the graph commit are one unit — holds by
+    /// construction since RFC-013 Phase 7: both ride a SINGLE manifest publish
+    /// CAS (`commit_changes_with_lineage`), so there is no two-write window to
+    /// keep atomic. PR 2 Phase 2
     /// converted from `Mutex` to `RwLock` because the bench showed
     /// the Mutex was the dominant serializer for disjoint-table
     /// workloads. Lock acquisition order: always before `runtime_cache`
@@ -287,7 +317,7 @@ impl Omnigraph {
             {
                 return Err(OmniError::AlreadyInitialized { uri: root.clone() });
             }
-            if let Err(err) = crate::failpoints::maybe_fail("init.after_schema_pg_written") {
+            if let Err(err) = crate::failpoints::maybe_fail(crate::failpoints::names::INIT_AFTER_SCHEMA_PG_WRITTEN) {
                 best_effort_cleanup_init_artifacts(&root, storage.as_ref()).await;
                 return Err(err);
             }
@@ -387,6 +417,14 @@ impl Omnigraph {
         // first read-write open (an accepted, documented limitation).
         if matches!(mode, OpenMode::ReadWrite) {
             crate::db::manifest::migrate_on_open(&root).await?;
+        } else {
+            // A read-only open skips `migrate_on_open` (no object-store writes),
+            // which is where the version refusal otherwise lives. Still refuse a
+            // `__manifest` stamped outside this binary's supported range — newer
+            // than CURRENT (an old binary cannot silently misread a newer graph,
+            // e.g. one folded to internal-schema v4 lineage), or below
+            // MIN_SUPPORTED (predates the readers we carry). Read-only, no write.
+            crate::db::manifest::refuse_if_internal_schema_unsupported(&root).await?;
         }
         // Open the coordinator first so the schema-staging recovery sweep can
         // compare its snapshot against any leftover staging files.
@@ -736,6 +774,29 @@ impl Omnigraph {
         *self.coordinator.write().await = coordinator;
     }
 
+    /// Open a capture-once write transaction (RFC-013 step 3b): validate the schema
+    /// contract ONCE and pin the base snapshot. The per-table opens take
+    /// `Option<&WriteTxn>` and, on the bound branch for the non-strict (Insert/Merge)
+    /// path, source the pinned base entry — instead of re-resolving (re-validating the
+    /// schema) per table. Strict ops, the fork path, and the commit-time OCC re-read
+    /// keep their fresh reads (those are correctness machinery — see the handoff doc).
+    ///
+    /// "Once" covers the table-touch hot path captured here (proven by the node-insert
+    /// gate `write_validates_schema_contract_once`); it does NOT yet cover edge endpoint
+    /// / cardinality RI validation (`ensure_node_id_exists`, the loader's RI/cardinality),
+    /// which still resolve through `snapshot_for_branch` and re-validate. Those reads must
+    /// observe LIVE committed state, so unifying them (validate-once + pinned + re-checked
+    /// read-set) is step 4's §7.1 work — threading `txn.base` there would re-introduce the
+    /// stale-read class the #298 cardinality fix removed. A session-aware base open is
+    /// likewise deferred to step 5 (handoff §1d).
+    pub(crate) async fn open_write_txn(&self, branch: Option<&str>) -> Result<WriteTxn> {
+        let resolved = self.resolved_branch_target(branch).await?;
+        Ok(WriteTxn {
+            branch: resolved.branch,
+            base: resolved.snapshot,
+        })
+    }
+
     pub(crate) async fn resolved_branch_target(
         &self,
         branch: Option<&str>,
@@ -770,12 +831,39 @@ impl Omnigraph {
 
     pub(crate) async fn fresh_snapshot_for_branch(&self, branch: Option<&str>) -> Result<Snapshot> {
         self.ensure_schema_state_valid().await?;
-        let requested = ReadTarget::Branch(branch.unwrap_or("main").to_string());
-        let coord = self.coordinator.read().await;
-        coord
-            .resolve_target(&requested)
-            .await
-            .map(|resolved| resolved.snapshot)
+        self.fresh_snapshot_for_branch_unchecked(branch).await
+    }
+
+    /// Fresh per-branch manifest snapshot WITHOUT the schema-contract
+    /// re-validation. Identical OCC freshness to [`fresh_snapshot_for_branch`]
+    /// — a fresh manifest re-read from storage, never the warm cache — only the
+    /// redundant `ensure_schema_state_valid` is dropped. Used inside a single
+    /// write once a `WriteTxn` has already validated the contract at capture: the
+    /// commit-time drift re-read needs the live manifest, not a second contract
+    /// read. Callers with no `WriteTxn` MUST use the checked variant.
+    ///
+    /// Reads the manifest directly via `ManifestCoordinator` rather than
+    /// `resolve_target`. The OCC re-read uses only the returned `Snapshot`
+    /// (per-table location + version), which `ManifestCoordinator::open().snapshot()`
+    /// produces identically to `GraphCoordinator::open(...).snapshot()` — but
+    /// `resolve_target` additionally opens the commit graph (an extra
+    /// `_graph_commits.lance` probe) the OCC read never consults. Skipping that
+    /// load is a pure read-cost reduction, not a freshness change. The checked
+    /// `fresh_snapshot_for_branch` delegates here, so its no-`txn` callers
+    /// (commit_all's None arm, optimize, repair, fork reclaim) get the same
+    /// identical `Snapshot` via this lighter manifest-only read; they consume
+    /// only the snapshot and never relied on the commit-graph side load.
+    pub(crate) async fn fresh_snapshot_for_branch_unchecked(
+        &self,
+        branch: Option<&str>,
+    ) -> Result<Snapshot> {
+        let manifest = match branch {
+            Some(branch) => {
+                crate::db::manifest::ManifestCoordinator::open_at_branch(self.uri(), branch).await?
+            }
+            None => crate::db::manifest::ManifestCoordinator::open(self.uri()).await?,
+        };
+        Ok(manifest.snapshot())
     }
 
     pub(crate) async fn version(&self) -> u64 {
@@ -1367,7 +1455,7 @@ impl Omnigraph {
 
         for (table_key, table_path) in cleanup_targets {
             let dataset_uri = self.storage().dataset_uri(&table_path);
-            let outcome = match crate::failpoints::maybe_fail("branch_delete.before_table_cleanup")
+            let outcome = match crate::failpoints::maybe_fail(crate::failpoints::names::BRANCH_DELETE_BEFORE_TABLE_CLEANUP)
             {
                 Ok(()) => {
                     self.storage()
@@ -1599,7 +1687,7 @@ impl Omnigraph {
         &self,
         table_key: &str,
         op_kind: crate::db::MutationOpKind,
-    ) -> Result<(SnapshotHandle, String, Option<String>)> {
+    ) -> Result<OpenedForMutation> {
         table_ops::open_for_mutation(self, table_key, op_kind).await
     }
 
@@ -1608,8 +1696,9 @@ impl Omnigraph {
         branch: Option<&str>,
         table_key: &str,
         op_kind: crate::db::MutationOpKind,
-    ) -> Result<(SnapshotHandle, String, Option<String>)> {
-        table_ops::open_for_mutation_on_branch(self, branch, table_key, op_kind).await
+        txn: Option<&crate::db::WriteTxn>,
+    ) -> Result<OpenedForMutation> {
+        table_ops::open_for_mutation_on_branch(self, branch, table_key, op_kind, txn).await
     }
 
     /// Fork `table_key` onto `active_branch` from the given source state,
@@ -1698,28 +1787,17 @@ impl Omnigraph {
         table_ops::commit_updates(self, updates).await
     }
 
-    pub(crate) async fn commit_manifest_updates(
+    /// Publish a branch merge: the merged table `updates` and the merge commit
+    /// in one manifest CAS (RFC-013 Phase 7). The merge commit's merged-in parent
+    /// is `merged_parent_commit_id` (the source head); its first parent is the
+    /// live target-branch head, resolved by the publisher.
+    pub(crate) async fn commit_merge_with_actor(
         &self,
         updates: &[crate::db::SubTableUpdate],
-    ) -> Result<u64> {
-        table_ops::commit_manifest_updates(self, updates).await
-    }
-
-    pub(crate) async fn record_merge_commit(
-        &self,
-        manifest_version: u64,
-        parent_commit_id: &str,
         merged_parent_commit_id: &str,
         actor_id: Option<&str>,
     ) -> Result<String> {
-        table_ops::record_merge_commit(
-            self,
-            manifest_version,
-            parent_commit_id,
-            merged_parent_commit_id,
-            actor_id,
-        )
-        .await
+        table_ops::commit_merge_with_actor(self, updates, merged_parent_commit_id, actor_id).await
     }
 
     pub(crate) async fn commit_updates_on_branch_with_expected(
@@ -1728,6 +1806,8 @@ impl Omnigraph {
         updates: &[crate::db::SubTableUpdate],
         expected_table_versions: &std::collections::HashMap<String, u64>,
         actor_id: Option<&str>,
+        txn: Option<&crate::db::WriteTxn>,
+        committed_handles: std::collections::HashMap<String, crate::storage_layer::SnapshotHandle>,
     ) -> Result<u64> {
         table_ops::commit_updates_on_branch_with_expected(
             self,
@@ -1735,6 +1815,8 @@ impl Omnigraph {
             updates,
             expected_table_versions,
             actor_id,
+            txn,
+            committed_handles,
         )
         .await
     }
@@ -1939,14 +2021,14 @@ async fn init_storage_phase(
     if write_schema_pg {
         let schema_path = join_uri(root, SCHEMA_SOURCE_FILENAME);
         storage.write_text(&schema_path, schema_source).await?;
-        crate::failpoints::maybe_fail("init.after_schema_pg_written")?;
+        crate::failpoints::maybe_fail(crate::failpoints::names::INIT_AFTER_SCHEMA_PG_WRITTEN)?;
     }
 
     write_schema_contract(root, storage.as_ref(), schema_ir).await?;
-    crate::failpoints::maybe_fail("init.after_schema_contract_written")?;
+    crate::failpoints::maybe_fail(crate::failpoints::names::INIT_AFTER_SCHEMA_CONTRACT_WRITTEN)?;
 
     let coordinator = GraphCoordinator::init(root, catalog, Arc::clone(storage)).await?;
-    crate::failpoints::maybe_fail("init.after_coordinator_init")?;
+    crate::failpoints::maybe_fail(crate::failpoints::names::INIT_AFTER_COORDINATOR_INIT)?;
 
     Ok(coordinator)
 }
@@ -2466,10 +2548,13 @@ edge WorksAt: Person -> Company
     }
 
     async fn seed_person_row(db: &mut Omnigraph, name: &str, age: Option<i32>) {
+        // No-txn entry, so the handle is always `Some` (collapse #1's skip is
+        // gated on `txn.is_some()`).
         let (ds, full_path, table_branch) = db
             .open_for_mutation("node:Person", crate::db::MutationOpKind::Insert)
             .await
-            .unwrap();
+            .unwrap()
+            .require_handle("seed_person_row test");
         let schema: Arc<Schema> = Arc::new(ds.dataset().schema().into());
         let columns: Vec<Arc<dyn Array>> = schema
             .fields()

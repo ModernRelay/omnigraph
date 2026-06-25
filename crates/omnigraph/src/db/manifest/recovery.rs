@@ -40,17 +40,14 @@ use lance::Dataset;
 use serde::{Deserialize, Serialize};
 use tracing::warn;
 
-use crate::db::commit_graph::CommitGraph;
 use crate::db::graph_coordinator::GraphCoordinator;
-use crate::db::recovery_audit::{
-    RecoveryAudit, RecoveryAuditRecord, RecoveryKind, TableOutcome, now_micros,
-};
+use crate::db::recovery_audit::{RecoveryAudit, RecoveryAuditRecord, RecoveryKind, TableOutcome};
 use crate::db::schema_state::SchemaStateRecovery;
 use crate::error::{OmniError, Result};
 use crate::storage::StorageAdapter;
 
 use super::Snapshot;
-use super::publisher::{GraphNamespacePublisher, ManifestBatchPublisher};
+use super::publisher::{GraphNamespacePublisher, LineageIntent, ManifestBatchPublisher};
 use super::{ManifestChange, SubTableUpdate, TableRegistration, TableTombstone};
 
 /// System actor identifier recorded on every recovery commit. Operators
@@ -58,6 +55,44 @@ use super::{ManifestChange, SubTableUpdate, TableRegistration, TableTombstone};
 /// by filtering on this actor; the original sidecar's actor (if any) flows
 /// into the audit row's `recovery_for_actor` field.
 pub(crate) const RECOVERY_ACTOR: &str = "omnigraph:recovery";
+
+/// Publish a recovery action's manifest `updates` AND its recovery commit in one
+/// CAS (RFC-013 Phase 7). The recovery commit's lineage (`graph_commit` +
+/// `graph_head`) rides the same merge-insert as the table-version re-pin — there
+/// is no separate `_graph_commits.lance` write and no manifest→commit-graph gap.
+/// `updates` is empty for the no-table-change recovery paths (all-NoMovement
+/// roll-back, stale-sidecar cleanup, orphaned-branch discard); the lineage rows
+/// still publish, so the recovery commit is always durable.
+///
+/// The commit's first parent is resolved by the publisher (the live head of the
+/// recovery's branch); its merged-in parent is the sidecar's recorded source
+/// head for a rolled-forward branch merge, matching the pre-Phase-7 merge-commit
+/// shape. Returns the new manifest version and the minted recovery commit id
+/// (which the audit row references).
+async fn publish_recovery_commit(
+    root_uri: &str,
+    sidecar: &RecoverySidecar,
+    kind: RecoveryKind,
+    updates: &[ManifestChange],
+    expected: &HashMap<String, u64>,
+) -> Result<(u64, String)> {
+    let merged_parent_commit_id = match (sidecar.writer_kind, kind) {
+        (SidecarKind::BranchMerge, RecoveryKind::RolledForward) => {
+            sidecar.merge_source_commit_id.clone()
+        }
+        _ => None,
+    };
+    let intent = LineageIntent {
+        graph_commit_id: ulid::Ulid::new().to_string(),
+        branch: sidecar.branch.clone(),
+        actor_id: Some(RECOVERY_ACTOR.to_string()),
+        merged_parent_commit_id,
+        created_at: crate::db::now_micros()?,
+    };
+    let publisher = GraphNamespacePublisher::new(root_uri, sidecar.branch.as_deref());
+    let outcome = publisher.publish(updates, expected, Some(&intent)).await?;
+    Ok((outcome.dataset.version().version, intent.graph_commit_id))
+}
 
 /// Subdirectory under the graph root holding sidecar files.
 pub(crate) const RECOVERY_DIR_NAME: &str = "__recovery";
@@ -416,7 +451,7 @@ pub(crate) async fn write_sidecar(
 ) -> Result<RecoverySidecarHandle> {
     // Failpoint: models a storage put failure (S3 PutObject / fs write)
     // in Phase A — every writer must abort before any HEAD advance.
-    crate::failpoints::maybe_fail("recovery.sidecar_write")?;
+    crate::failpoints::maybe_fail(crate::failpoints::names::RECOVERY_SIDECAR_WRITE)?;
     debug_assert_eq!(sidecar.schema_version, SIDECAR_SCHEMA_VERSION);
     let uri = sidecar_uri(root_uri, &sidecar.operation_id);
     let json = serde_json::to_string_pretty(sidecar).map_err(|err| {
@@ -457,7 +492,7 @@ pub(crate) async fn confirm_sidecar_phase_b(
 ) -> Result<()> {
     // Failpoint: models a storage failure on the confirmation write — the
     // pre-confirm sidecar stays on disk, so recovery rolls the operation back.
-    crate::failpoints::maybe_fail("recovery.sidecar_confirm")?;
+    crate::failpoints::maybe_fail(crate::failpoints::names::RECOVERY_SIDECAR_CONFIRM)?;
     for pin in &mut sidecar.tables {
         // Every pinned table MUST have an achieved version. A miss means the
         // pin set and the publish `updates` diverged — fail loudly at the
@@ -489,7 +524,7 @@ pub(crate) async fn delete_sidecar(
     // Failpoint: models a storage delete failure (S3 DeleteObject) in
     // Phase D — callers swallow it (the write already published) and the
     // stale sidecar is healed by the next write or open.
-    crate::failpoints::maybe_fail("recovery.sidecar_delete")?;
+    crate::failpoints::maybe_fail(crate::failpoints::names::RECOVERY_SIDECAR_DELETE)?;
     storage.delete(&handle.sidecar_uri).await
 }
 
@@ -507,7 +542,7 @@ pub(crate) async fn list_sidecars(
     // Failpoint: models a storage list failure (S3 ListObjectsV2) — every
     // consumer (open-time sweep, write-entry heal) must fail loudly
     // rather than silently skipping recovery.
-    crate::failpoints::maybe_fail("recovery.sidecar_list")?;
+    crate::failpoints::maybe_fail(crate::failpoints::names::RECOVERY_SIDECAR_LIST)?;
     let dir = recovery_dir_uri(root_uri);
     let mut uris = storage.list_dir(&dir).await?;
     // Sort by URI so the sweep processes sidecars deterministically.
@@ -831,20 +866,13 @@ pub(crate) async fn heal_pending_sidecars_roll_forward(
                 // authority) BEFORE opening: a deferred sidecar whose
                 // branch was deleted would otherwise wedge every write
                 // on the dead-branch open.
-                let (branch_exists, main_version) = {
+                let branch_exists = {
                     let mut coord = coordinator.write().await;
                     coord.refresh().await?;
-                    let exists = coord.all_branches().await?.iter().any(|name| name == b);
-                    (exists, coord.snapshot().version())
+                    coord.all_branches().await?.iter().any(|name| name == b)
                 };
                 if !branch_exists {
-                    discard_orphaned_branch_sidecar(
-                        root_uri,
-                        storage.as_ref(),
-                        &sidecar,
-                        main_version,
-                    )
-                    .await?;
+                    discard_orphaned_branch_sidecar(root_uri, storage.as_ref(), &sidecar).await?;
                     processed_any = true;
                     continue;
                 }
@@ -862,7 +890,7 @@ pub(crate) async fn heal_pending_sidecars_roll_forward(
         };
         if process_sidecar(
             root_uri,
-            storage.as_ref(),
+            &storage,
             &branch_snapshot,
             &sidecar,
             RecoveryMode::RollForwardOnly,
@@ -893,7 +921,6 @@ async fn discard_orphaned_branch_sidecar(
     root_uri: &str,
     storage: &dyn StorageAdapter,
     sidecar: &RecoverySidecar,
-    manifest_version: u64,
 ) -> Result<()> {
     warn!(
         operation_id = sidecar.operation_id.as_str(),
@@ -922,22 +949,31 @@ async fn discard_orphaned_branch_sidecar(
             && record.recovery_kind == RecoveryKind::OrphanedBranchDiscarded
     });
     if !already_recorded {
-        let mut graph = CommitGraph::open(root_uri).await?;
-        let graph_commit_id = graph
-            .append_commit(None, manifest_version, Some(RECOVERY_ACTOR))
-            .await?;
-        // Failpoint: the residual window above — commit appended, audit
+        // The orphan-discard commit is recorded on MAIN (the sidecar's own
+        // branch is gone), via a lineage-only publish into `__manifest` (RFC-013
+        // Phase 7) — no `_graph_commits.lance` row. The publisher stamps the
+        // commit at the version it produces.
+        let intent = LineageIntent {
+            graph_commit_id: ulid::Ulid::new().to_string(),
+            branch: None,
+            actor_id: Some(RECOVERY_ACTOR.to_string()),
+            merged_parent_commit_id: None,
+            created_at: crate::db::now_micros()?,
+        };
+        let publisher = GraphNamespacePublisher::new(root_uri, None);
+        publisher.publish(&[], &HashMap::new(), Some(&intent)).await?;
+        // Failpoint: the residual window above — commit published, audit
         // not yet durable.
-        crate::failpoints::maybe_fail("recovery.orphan_discard_audit_append")?;
+        crate::failpoints::maybe_fail(crate::failpoints::names::RECOVERY_ORPHAN_DISCARD_AUDIT_APPEND)?;
         audit
             .append(RecoveryAuditRecord {
-                graph_commit_id,
+                graph_commit_id: intent.graph_commit_id,
                 recovery_kind: RecoveryKind::OrphanedBranchDiscarded,
                 recovery_for_actor: sidecar.actor_id.clone(),
                 operation_id: sidecar.operation_id.clone(),
                 sidecar_writer_kind: format!("{:?}", sidecar.writer_kind),
                 per_table_outcomes: Vec::new(),
-                created_at: now_micros()?,
+                created_at: crate::db::now_micros()?,
             })
             .await?;
     }
@@ -1014,13 +1050,7 @@ pub(crate) async fn recover_manifest_drift(
                     .iter()
                     .any(|name| name == b)
                 {
-                    discard_orphaned_branch_sidecar(
-                        root_uri,
-                        storage.as_ref(),
-                        &sidecar,
-                        coordinator.snapshot().version(),
-                    )
-                    .await?;
+                    discard_orphaned_branch_sidecar(root_uri, storage.as_ref(), &sidecar).await?;
                     continue;
                 }
                 let mut branch_coord =
@@ -1036,7 +1066,7 @@ pub(crate) async fn recover_manifest_drift(
         };
         process_sidecar(
             root_uri,
-            storage.as_ref(),
+            &storage,
             &branch_snapshot,
             &sidecar,
             mode,
@@ -1051,7 +1081,7 @@ pub(crate) async fn recover_manifest_drift(
 
 async fn process_sidecar(
     root_uri: &str,
-    storage: &dyn StorageAdapter,
+    storage: &std::sync::Arc<dyn StorageAdapter>,
     snapshot: &Snapshot,
     sidecar: &RecoverySidecar,
     mode: RecoveryMode,
@@ -1154,7 +1184,7 @@ async fn process_sidecar(
                     );
                 }
                 return record_audit_recovery_rollforward(
-                    root_uri, storage, snapshot, sidecar, &states,
+                    root_uri, storage.as_ref(), sidecar, &states,
                 )
                 .await
                 .map(|()| true);
@@ -1176,7 +1206,7 @@ async fn process_sidecar(
                 writer_kind = ?sidecar.writer_kind,
                 "recovery: rolling back sidecar (mixed or unexpected state)"
             );
-            roll_back_sidecar(root_uri, storage, snapshot, sidecar, &states)
+            roll_back_sidecar(root_uri, storage.as_ref(), sidecar, &states)
                 .await
                 .map(|()| true)
         }
@@ -1191,7 +1221,7 @@ async fn process_sidecar(
                             "recovery: rolling back SchemaApply sidecar because schema staging \
                              files were not promoted in this recovery pass"
                         );
-                        roll_back_sidecar(root_uri, storage, snapshot, sidecar, &states)
+                        roll_back_sidecar(root_uri, storage.as_ref(), sidecar, &states)
                             .await
                             .map(|()| true)
                     }
@@ -1211,8 +1241,36 @@ async fn process_sidecar(
                 "recovery: rolling forward sidecar (Phase B completed; \
                  Phase C did not land)"
             );
-            let (new_manifest_version, published_versions) =
-                roll_forward_all(root_uri, sidecar, &states, snapshot).await?;
+            // TOCTOU window: between `classify_table` (which read the manifest
+            // pin) and the publish CAS below, a concurrent live writer can
+            // advance the manifest past our expected version. The failpoint
+            // lets a test force that interleave deterministically.
+            crate::failpoints::maybe_fail(
+                crate::failpoints::names::RECOVERY_BEFORE_ROLL_FORWARD_PUBLISH,
+            )?;
+            // RFC-013 Phase 7: `roll_forward_all` folds the recovery commit into the
+            // manifest publish CAS, so it also returns the minted `graph_commit_id`
+            // for the audit row below.
+            let (new_manifest_version, published_versions, graph_commit_id) =
+                match roll_forward_all(root_uri, sidecar, &states, snapshot).await {
+                    Ok(published) => published,
+                    // Convergence-idempotent (invariants 7 & 15): a roll-forward's
+                    // postcondition is "the manifest reflects the sidecar's committed
+                    // Lance state", NOT "this sweep personally won the CAS". A
+                    // concurrent writer that advanced the manifest to/past that goal
+                    // during the classify→publish window is convergence, not a logical
+                    // conflict — so re-read and either record the already-achieved
+                    // roll-forward or defer to the next pass; never fail the open.
+                    // Any other error still propagates.
+                    Err(err) if is_expected_version_mismatch(&err) => {
+                        return converge_or_defer_roll_forward(
+                            root_uri, storage, sidecar, &states, err,
+                        )
+                        .await;
+                    }
+                    Err(err) => return Err(err),
+                };
+            let _ = new_manifest_version;
             // `to_version` records the ACTUAL Lance HEAD published for
             // each table (not pin.post_commit_pin, which is a lower bound
             // for loose-match writers like SchemaApply / EnsureIndices /
@@ -1242,15 +1300,212 @@ async fn process_sidecar(
             record_audit(
                 root_uri,
                 sidecar,
-                new_manifest_version,
+                graph_commit_id,
                 RecoveryKind::RolledForward,
                 outcomes,
             )
             .await?;
-            delete_sidecar_by_operation_id(root_uri, storage, &sidecar.operation_id).await?;
+            delete_sidecar_by_operation_id(root_uri, storage.as_ref(), &sidecar.operation_id)
+                .await?;
             Ok(true)
         }
     }
+}
+
+/// True if `err` is the publisher's per-table CAS precondition failure
+/// (`ExpectedVersionMismatch`) — the signal that a concurrent writer advanced
+/// the manifest past what this caller expected.
+fn is_expected_version_mismatch(err: &OmniError) -> bool {
+    matches!(
+        err,
+        OmniError::Manifest(m)
+            if matches!(
+                m.details,
+                Some(crate::error::ManifestConflictDetails::ExpectedVersionMismatch { .. })
+            )
+    )
+}
+
+/// Whether the live manifest already reflects everything this sidecar intended
+/// to publish.
+///
+/// SOUNDNESS: the per-table test is `current_version >= observed lance_head`, a
+/// *proxy* for "the sidecar's committed Lance commit is an ancestor of the
+/// published HEAD" (so a higher version is a descendant that contains it). The
+/// proxy is sound only because of the heal-first invariant: every writer that
+/// can advance a table's manifest version first heals pending sidecars
+/// (`heal_pending_recovery_sidecars` runs at the head of `load`/`mutate`/
+/// schema-apply/branch-merge) or refuses on an unrecovered graph (`optimize`).
+/// So the only path past `expected_version` is one that first publishes THIS
+/// sidecar's commit at `lance_head` — version ordering then implies lineage
+/// containment. A future writer that advances a pinned table WITHOUT healing
+/// first (e.g. a non-heal-first `Overwrite` that replaces rows) would void this
+/// proxy and must be re-validated by row-id lineage, not version ordering.
+/// Added tables must be registered; tombstoned tables must be gone.
+fn sidecar_intent_satisfied(
+    snapshot: &Snapshot,
+    sidecar: &RecoverySidecar,
+    states: &[ClassifiedTable],
+) -> bool {
+    for (pin, state) in sidecar.tables.iter().zip(states.iter()) {
+        let current = snapshot
+            .entry(&pin.table_key)
+            .map(|e| e.table_version)
+            .unwrap_or(0);
+        if current < state.lance_head {
+            return false;
+        }
+    }
+    for reg in &sidecar.additional_registrations {
+        if snapshot.entry(&reg.table_key).is_none() {
+            return false;
+        }
+    }
+    for tomb in &sidecar.tombstones {
+        if snapshot.entry(&tomb.table_key).is_some() {
+            return false;
+        }
+    }
+    true
+}
+
+/// Re-read the live manifest snapshot for the sidecar's branch.
+async fn fresh_snapshot_for_sidecar(
+    root_uri: &str,
+    storage: &std::sync::Arc<dyn StorageAdapter>,
+    sidecar: &RecoverySidecar,
+) -> Result<Snapshot> {
+    let mut coordinator = match sidecar.branch.as_deref() {
+        Some(branch) if branch != "main" => {
+            GraphCoordinator::open_branch(root_uri, branch, std::sync::Arc::clone(storage)).await?
+        }
+        _ => GraphCoordinator::open(root_uri, std::sync::Arc::clone(storage)).await?,
+    };
+    coordinator.refresh().await?;
+    Ok(coordinator.snapshot())
+}
+
+/// Convergence-idempotent handling of a roll-forward publish CAS that lost to a
+/// concurrent writer (`ExpectedVersionMismatch`). A roll-forward's postcondition
+/// is "the manifest reflects the sidecar's committed Lance state", not "this
+/// sweep won the CAS" (invariants 7 & 15). Re-read the live manifest:
+///
+/// - if it already reached the sidecar's goal, the work is done (just not by us)
+///   — record the `RolledForward` audit and delete the sidecar idempotently;
+/// - otherwise the manifest is progressing but not yet at the goal — leave the
+///   sidecar for the next open / the live writer's own Phase D.
+///
+/// Either way the open does NOT fail. A genuine logical conflict (a table below
+/// `expected_version`, i.e. data lost) is not satisfiable here and re-surfaces
+/// loudly via the classifier's `InvariantViolation` on the next pass.
+/// See iss-schema-apply-reopen-recovery-race.
+async fn converge_or_defer_roll_forward(
+    root_uri: &str,
+    storage: &std::sync::Arc<dyn StorageAdapter>,
+    sidecar: &RecoverySidecar,
+    states: &[ClassifiedTable],
+    conflict: OmniError,
+) -> Result<bool> {
+    let fresh = fresh_snapshot_for_sidecar(root_uri, storage, sidecar).await?;
+    if !sidecar_intent_satisfied(&fresh, sidecar, states) {
+        warn!(
+            operation_id = sidecar.operation_id.as_str(),
+            writer_kind = ?sidecar.writer_kind,
+            "recovery: roll-forward publish lost a CAS and the manifest has not \
+             yet reached the sidecar's goal; deferring to the next pass \
+             (conflict: {conflict})"
+        );
+        return Ok(false);
+    }
+    // The manifest already reached the sidecar's goal — some other actor
+    // advanced it. Under the heal-first invariant, whoever advanced past
+    // `expected_version` first healed THIS sidecar (recorded its RolledForward
+    // audit and deleted it). So the audit row already exists; recording another
+    // here would put two RolledForward rows in `_graph_commit_recoveries` for
+    // one recovery event (visible in `commit list --filter actor=…recovery`).
+    // Only finish the bookkeeping if the sidecar is still on disk (the winner
+    // crashed between audit and delete); if it is already gone, the winner
+    // completed it — return success WITHOUT a duplicate audit, keeping the
+    // audit append-idempotent per operation_id across concurrent sweeps.
+    let sidecar_path = sidecar_uri(root_uri, &sidecar.operation_id);
+    if !storage.exists(&sidecar_path).await? {
+        warn!(
+            operation_id = sidecar.operation_id.as_str(),
+            writer_kind = ?sidecar.writer_kind,
+            "recovery: roll-forward publish lost a CAS; the winner already \
+             converged and cleaned up this sidecar — nothing to do"
+        );
+        return Ok(true);
+    }
+    warn!(
+        operation_id = sidecar.operation_id.as_str(),
+        writer_kind = ?sidecar.writer_kind,
+        "recovery: roll-forward publish lost a CAS to a concurrent writer that \
+         already reached the goal; converging (RolledForward audit + delete)"
+    );
+    let mut outcomes: Vec<TableOutcome> = sidecar
+        .tables
+        .iter()
+        .map(|pin| TableOutcome {
+            table_key: pin.table_key.clone(),
+            from_version: pin.expected_version,
+            to_version: fresh
+                .entry(&pin.table_key)
+                .map(|e| e.table_version)
+                .unwrap_or(pin.post_commit_pin),
+        })
+        .collect();
+    // Mirror the normal roll-forward audit shape: SchemaApply sidecars also
+    // register added tables, so the audit must list them too (else a converge
+    // audit row is incomplete vs the `roll_forward_all` path for the same
+    // recovery kind).
+    for reg in &sidecar.additional_registrations {
+        outcomes.push(TableOutcome {
+            table_key: reg.table_key.clone(),
+            from_version: 0,
+            to_version: fresh
+                .entry(&reg.table_key)
+                .map(|e| e.table_version)
+                .unwrap_or(0),
+        });
+    }
+    // RFC-013 Phase 7: the winning writer folded its recovery commit into the
+    // manifest CAS, so the converge audit references THAT commit. We lost the CAS
+    // and never minted it, but a recovery commit is distinguishable by its
+    // `RECOVERY_ACTOR` authorship (`publish_recovery_commit`), so the latest
+    // recovery-actored commit on this branch IS it. Do NOT use the branch head:
+    // a concurrent USER write can advance `graph_head` past the recovery commit
+    // between the winner's publish and this read, which would attribute the audit
+    // row to the wrong (later, user) commit. (We only reach here with the sidecar
+    // still on disk: the winner advanced the manifest but crashed before its own
+    // audit+delete, so we finish its bookkeeping.)
+    let cache = match sidecar.branch.as_deref() {
+        Some(branch) => {
+            crate::db::commit_graph::CommitGraph::open_at_branch(root_uri, branch).await?
+        }
+        None => crate::db::commit_graph::CommitGraph::open(root_uri).await?,
+    };
+    let converged_commit_id = match cache
+        .load_commits()
+        .await?
+        .into_iter()
+        .rfind(|c| c.actor_id.as_deref() == Some(RECOVERY_ACTOR))
+    {
+        Some(recovery_commit) => recovery_commit.graph_commit_id,
+        // No recovery commit visible — unexpected on this path (the winner just
+        // published one); fall back to the head rather than an empty id.
+        None => cache.head_commit_id().await?.unwrap_or_default(),
+    };
+    record_audit(
+        root_uri,
+        sidecar,
+        converged_commit_id,
+        RecoveryKind::RolledForward,
+        outcomes,
+    )
+    .await?;
+    delete_sidecar_by_operation_id(root_uri, storage.as_ref(), &sidecar.operation_id).await?;
+    Ok(true)
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -1268,7 +1523,6 @@ struct ClassifiedTable {
 async fn roll_back_sidecar(
     root_uri: &str,
     storage: &dyn StorageAdapter,
-    snapshot: &Snapshot,
     sidecar: &RecoverySidecar,
     states: &[ClassifiedTable],
 ) -> Result<()> {
@@ -1328,23 +1582,18 @@ async fn roll_back_sidecar(
             });
         }
     }
-    // Publish the restored HEADs so manifest == HEAD. A degenerate all-NoMovement
-    // roll-back restores nothing — there's nothing to publish, and the audit
-    // records the unchanged snapshot version.
-    let manifest_version = if updates.is_empty() {
-        snapshot.version()
-    } else {
-        let publisher = GraphNamespacePublisher::new(root_uri, sidecar.branch.as_deref());
-        publisher
-            .publish(&updates, &expected)
-            .await?
-            .version()
-            .version
-    };
+    // Publish the restored HEADs so manifest == HEAD AND record the recovery
+    // commit in the same CAS (RFC-013 Phase 7). A degenerate all-NoMovement
+    // roll-back restores no table — `updates` is empty — but the recovery commit
+    // lineage still publishes (a lineage-only merge), so the rollback is recorded
+    // in the commit history just like a roll-forward.
+    let (_manifest_version, graph_commit_id) =
+        publish_recovery_commit(root_uri, sidecar, RecoveryKind::RolledBack, &updates, &expected)
+            .await?;
     record_audit(
         root_uri,
         sidecar,
-        manifest_version,
+        graph_commit_id,
         RecoveryKind::RolledBack,
         outcomes,
     )
@@ -1370,7 +1619,6 @@ async fn roll_back_sidecar(
 async fn record_audit_recovery_rollforward(
     root_uri: &str,
     storage: &dyn StorageAdapter,
-    snapshot: &Snapshot,
     sidecar: &RecoverySidecar,
     states: &[ClassifiedTable],
 ) -> Result<()> {
@@ -1384,10 +1632,22 @@ async fn record_audit_recovery_rollforward(
             to_version: state.manifest_pinned,
         })
         .collect();
+    // The substrate is already in the post-roll-forward state (the prior pass's
+    // table re-pin landed), so there are no table `updates` — but a recovery
+    // commit is still recorded for this cleanup pass via a lineage-only publish
+    // (RFC-013 Phase 7), which the audit row references.
+    let (_manifest_version, graph_commit_id) = publish_recovery_commit(
+        root_uri,
+        sidecar,
+        RecoveryKind::RolledForward,
+        &[],
+        &HashMap::new(),
+    )
+    .await?;
     record_audit(
         root_uri,
         sidecar,
-        snapshot.version(),
+        graph_commit_id,
         RecoveryKind::RolledForward,
         outcomes,
     )
@@ -1407,17 +1667,19 @@ async fn record_audit_recovery_rollforward(
 /// contention; persistent contention surfaces the typed conflict error to
 /// the recovery sweep, which leaves the sidecar in place for the next
 /// open's retry.
-/// Returns `(new_manifest_version, per_table_published_versions)`. The
-/// per-table map is what the audit row's `to_version` should record —
-/// for loose-match writers the actual Lance HEAD can be higher than the
-/// sidecar's `post_commit_pin` (which is a lower bound), so the pin is
-/// the wrong source of truth for an operator-facing audit field.
+/// Returns `(new_manifest_version, per_table_published_versions,
+/// recovery_commit_id)`. The per-table map is what the audit row's `to_version`
+/// should record — for loose-match writers the actual Lance HEAD can be higher
+/// than the sidecar's `post_commit_pin` (which is a lower bound), so the pin is
+/// the wrong source of truth for an operator-facing audit field. The recovery
+/// commit id is the `graph_commit` folded into the publish CAS (RFC-013
+/// Phase 7), which the audit row references.
 async fn roll_forward_all(
     root_uri: &str,
     sidecar: &RecoverySidecar,
     states: &[ClassifiedTable],
     snapshot: &Snapshot,
-) -> Result<(u64, HashMap<String, u64>)> {
+) -> Result<(u64, HashMap<String, u64>, String)> {
     let total_changes =
         sidecar.tables.len() + sidecar.additional_registrations.len() + sidecar.tombstones.len();
     let mut updates: Vec<ManifestChange> = Vec::with_capacity(total_changes);
@@ -1528,9 +1790,10 @@ async fn roll_forward_all(
         );
     }
 
-    let publisher = GraphNamespacePublisher::new(root_uri, sidecar.branch.as_deref());
-    let new_dataset = publisher.publish(&updates, &expected).await?;
-    Ok((new_dataset.version().version, published_versions))
+    let (new_manifest_version, graph_commit_id) =
+        publish_recovery_commit(root_uri, sidecar, RecoveryKind::RolledForward, &updates, &expected)
+            .await?;
+    Ok((new_manifest_version, published_versions, graph_commit_id))
 }
 
 /// Open `table_path` at its branch HEAD, read the current Lance HEAD version,
@@ -1600,62 +1863,27 @@ async fn push_table_update(
     Ok(published_version)
 }
 
-/// Append the audit row describing this recovery action.
+/// Append the audit row describing this recovery action (RFC-013 Phase 7).
 ///
-/// Two-part write: (a) `_graph_commits.lance` row anchored on the recovery
-/// actor (`omnigraph:recovery`); (b) `_graph_commit_recoveries.lance` row
-/// linking back to (a) and naming the original actor + per-table outcomes.
-/// Same not-atomic-pair-write shape as the existing `_graph_commits`
-/// + `_graph_commit_actors` split — a crash between the two leaves an
-/// orphan commit row with no audit row. The recovery sweep tolerates this:
-/// on re-entry the classifier surfaces `NoMovement` for already-restored /
-/// already-published tables, the action is a no-op, and the audit append
-/// is retried.
+/// The recovery COMMIT (`graph_commit` + `graph_head`) was already recorded
+/// durably in `__manifest` by `publish_recovery_commit` (folded into the same
+/// CAS as the table re-pin), so this only writes the `_graph_commit_recoveries`
+/// row, referencing that commit by `graph_commit_id`. A crash between the
+/// recovery publish and this audit append leaves a recovery commit with no audit
+/// row — the same not-atomic-pair-write shape as before; the sweep tolerates it
+/// (on re-entry the classifier surfaces `NoMovement`, the action is a no-op, and
+/// the audit append is retried, minting a fresh recovery commit).
 async fn record_audit(
     root_uri: &str,
     sidecar: &RecoverySidecar,
-    manifest_version: u64,
+    graph_commit_id: String,
     kind: RecoveryKind,
     outcomes: Vec<TableOutcome>,
 ) -> Result<()> {
     // Failpoint: models an audit write failure after the roll-forward /
-    // roll-back publish already landed — the sweep aborts, the sidecar
-    // stays, and re-entry records the audit row (see the retry note in
-    // the doc comment above).
-    crate::failpoints::maybe_fail("recovery.record_audit")?;
-    // Non-main recovery commits must be appended on the sidecar branch's
-    // commit graph, otherwise parent_commit_id comes from the global
-    // main head. BranchMerge additionally records the source branch's
-    // HEAD as merged_parent_commit_id so future merges between the same
-    // pair recognize "already up-to-date".
-    let target_branch = sidecar.branch.as_deref();
-    let mut graph = match target_branch {
-        Some(branch) => CommitGraph::open_at_branch(root_uri, branch).await?,
-        None => CommitGraph::open(root_uri).await?,
-    };
-    let graph_commit_id = match (
-        sidecar.writer_kind,
-        sidecar.merge_source_commit_id.as_deref(),
-        kind,
-    ) {
-        (SidecarKind::BranchMerge, Some(source_id), RecoveryKind::RolledForward) => {
-            let parent_commit_id = graph.head_commit_id().await?.unwrap_or_default();
-            graph
-                .append_merge_commit(
-                    target_branch,
-                    manifest_version,
-                    &parent_commit_id,
-                    source_id,
-                    Some(RECOVERY_ACTOR),
-                )
-                .await?
-        }
-        _ => {
-            graph
-                .append_commit(target_branch, manifest_version, Some(RECOVERY_ACTOR))
-                .await?
-        }
-    };
+    // roll-back publish (with its folded-in recovery commit) already landed —
+    // the sweep aborts, the sidecar stays, and re-entry records the audit row.
+    crate::failpoints::maybe_fail(crate::failpoints::names::RECOVERY_RECORD_AUDIT)?;
     let mut audit = RecoveryAudit::open(root_uri).await?;
     audit
         .append(RecoveryAuditRecord {
@@ -1665,7 +1893,7 @@ async fn record_audit(
             operation_id: sidecar.operation_id.clone(),
             sidecar_writer_kind: format!("{:?}", sidecar.writer_kind),
             per_table_outcomes: outcomes,
-            created_at: now_micros()?,
+            created_at: crate::db::now_micros()?,
         })
         .await?;
     Ok(())

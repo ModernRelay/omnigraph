@@ -133,7 +133,7 @@ flowchart TB
     subgraph state[graph state]
         coord[GraphCoordinator]:::l2
         mr[ManifestCoordinator<br/>db/manifest.rs]:::l2
-        cg[CommitGraph<br/>_graph_commits.lance]:::l2
+        cg[CommitGraph<br/>projection of __manifest graph_commit/graph_head rows]:::l2
         stg[MutationStaging<br/>per-query in-memory accumulator<br/>exec/staging.rs]:::l2
     end
 

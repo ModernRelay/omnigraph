@@ -37,6 +37,9 @@ use lance::Dataset;
 
 use crate::error::{OmniError, Result};
 
+use crate::db::commit_graph::GraphCommit;
+use super::state::{GraphLineageRow, graph_lineage_row_parts, merge_lineage_rows, read_graph_lineage};
+
 /// Current internal schema version this binary expects to find on disk.
 ///
 /// History:
@@ -50,14 +53,62 @@ use crate::error::{OmniError, Result};
 ///   `__manifest` dataset by the pre-v0.4.0 Run state machine (removed in
 ///   MR-771). Once swept, the `is_internal_run_branch` defense-in-depth guard
 ///   is no longer needed (MR-770).
-pub(super) const INTERNAL_MANIFEST_SCHEMA_VERSION: u32 = 3;
+/// - v4 — RFC-013 Phase 7 folds graph lineage into `__manifest` as
+///   `graph_commit`/`graph_head` rows written in the publish CAS. A pre-Phase-7
+///   (v3) graph has its lineage only in `_graph_commits.lance`, so the new
+///   binary would read an empty commit DAG. This one-time per-branch backfill
+///   copies the lineage from `_graph_commits.lance` into `__manifest`
+///   (`migrate_v3_to_v4`). `_graph_commits.lance` is left in place as the
+///   branch-ref carrier; no commit rows are ever written to it again.
+pub(crate) const INTERNAL_MANIFEST_SCHEMA_VERSION: u32 = 4;
+
+/// The oldest on-disk internal-schema stamp this binary will open. A graph below
+/// this floor is refused (`refuse_if_stamp_unsupported`) with a "migrate it
+/// forward with an older release first" error, instead of obliging this binary to
+/// carry that version's `migrate_vN_…` arm and the legacy readers it needs
+/// forever. Raising the floor is how the migration chain sheds old code.
+///
+/// **Retirement runbook** — turning "accumulates forever" into a sliding window:
+/// 1. *Shed version N* once no graph below `N+1` remains in the fleet: bump this
+///    floor AND `LOWEST_REGISTERED_MIGRATION_SOURCE` to `N+1`, then delete the
+///    `N =>` arm in `migrate_internal_schema`, `migrate_vN_to_vN+1`, and its
+///    helpers + tests. The tripwire test keeps the two consts in lockstep, so a
+///    half-done shed fails CI.
+/// 2. *Retire the v3 legacy readers entirely* once MIN ≥ 4: `git rm` the
+///    `commit_graph/commit_graph_legacy_v3.rs` seam file and flip the single
+///    `stamp < CURRENT` gate in `load_commit_cache_for_branch` to read the
+///    manifest projection unconditionally.
+///
+/// MIN = 1 today is a pure no-op: `read_stamp` floors an absent stamp at 1 and no
+/// real graph carries 0, so nothing is refused.
+pub(crate) const MIN_SUPPORTED_INTERNAL_SCHEMA_VERSION: u32 = 1;
+
+/// The lowest `current` value the `migrate_internal_schema` dispatcher still has a
+/// `match` arm for. Mirrors the lowest registered migration source so a floor bump
+/// that forgets to delete the now-dead arm (or vice versa) is caught by the
+/// compile-time tripwire below. Migration arms aren't an enumerable registry, so
+/// this hand-mirrored const is the minimal enforced coupling — cheaper than
+/// reshaping the dispatcher into a data-driven table.
+const LOWEST_REGISTERED_MIGRATION_SOURCE: u32 = 1;
+
+/// Retirement tripwire (compile-time): the refusal floor and the lowest migration
+/// arm must move together. Raising `MIN_SUPPORTED` without deleting the now-dead
+/// below-floor arm — or vice versa — fails the build with this message, which is
+/// stronger than a runtime test and impossible to skip. Migration arms can't be
+/// enumerated, so this const-mirror is the check.
+const _: () = assert!(
+    LOWEST_REGISTERED_MIGRATION_SOURCE == MIN_SUPPORTED_INTERNAL_SCHEMA_VERSION,
+    "internal-schema floor drifted from the lowest registered migration arm: when raising \
+     MIN_SUPPORTED_INTERNAL_SCHEMA_VERSION, delete every below-floor `N =>` arm + migrate_vN_… \
+     + its helpers/tests and bump LOWEST_REGISTERED_MIGRATION_SOURCE to match (or vice versa)",
+);
 
 const INTERNAL_SCHEMA_VERSION_KEY: &str = "omnigraph:internal_schema_version";
 const OBJECT_ID_PK_KEY: &str = "lance-schema:unenforced-primary-key";
 
 /// Read the on-disk stamp from `__manifest`'s schema-level metadata.
 /// Absent ⇒ v1 (pre-stamp world).
-pub(super) fn read_stamp(dataset: &Dataset) -> u32 {
+pub(crate) fn read_stamp(dataset: &Dataset) -> u32 {
     dataset
         .schema()
         .metadata
@@ -72,20 +123,52 @@ pub(super) async fn stamp_current_version(dataset: &mut Dataset) -> Result<()> {
     set_stamp(dataset, INTERNAL_MANIFEST_SCHEMA_VERSION).await
 }
 
+/// Refuse to open a manifest whose stamp this binary cannot serve — in either
+/// direction — with a clear upgrade path. Shared by every place a stamp is read
+/// and enforced: the write-path migration dispatcher, the read-only open guard,
+/// and the branch lineage-read path. Checking both bounds in one function means a
+/// new stamp-reading caller gets the floor and the ceiling together and cannot
+/// half-enforce.
+///
+/// - `stamp > CURRENT`: the graph was written by a newer binary — upgrade omnigraph.
+/// - `stamp < MIN_SUPPORTED`: the graph predates the oldest migration this binary
+///   still carries — migrate it forward with an older release first, then reopen.
+pub(crate) fn refuse_if_stamp_unsupported(stamp: u32) -> Result<()> {
+    if stamp > INTERNAL_MANIFEST_SCHEMA_VERSION {
+        return Err(OmniError::manifest(format!(
+            "__manifest is stamped at internal schema v{} but this binary expects v{} \
+             — upgrade omnigraph before opening this graph",
+            stamp, INTERNAL_MANIFEST_SCHEMA_VERSION,
+        )));
+    }
+    if stamp < MIN_SUPPORTED_INTERNAL_SCHEMA_VERSION {
+        return Err(OmniError::manifest(format!(
+            "__manifest is stamped at internal schema v{} but this binary supports v{} or later \
+             — open it with an older omnigraph release to migrate it forward first, then reopen",
+            stamp, MIN_SUPPORTED_INTERNAL_SCHEMA_VERSION,
+        )));
+    }
+    Ok(())
+}
+
 /// Apply any pending internal-schema migrations to the manifest dataset.
 ///
 /// Idempotent: when the on-disk stamp matches the binary, this is a single
 /// metadata read with no writes.
-pub(super) async fn migrate_internal_schema(dataset: &mut Dataset) -> Result<()> {
+///
+/// `root_uri` + `branch` identify which graph + branch this `dataset` is a
+/// manifest for. The v3→v4 lineage backfill needs them to read that branch's
+/// `_graph_commits.lance`. `migrate_on_open` passes the main branch
+/// (`branch = None`); the publisher's `load_publish_state` passes its own
+/// branch, so each branch backfills on its first write.
+pub(super) async fn migrate_internal_schema(
+    dataset: &mut Dataset,
+    root_uri: &str,
+    branch: Option<&str>,
+) -> Result<()> {
     let mut current = read_stamp(dataset);
 
-    if current > INTERNAL_MANIFEST_SCHEMA_VERSION {
-        return Err(OmniError::manifest(format!(
-            "__manifest is stamped at internal schema v{} but this binary expects v{} \
-             — upgrade omnigraph before opening this graph for writes",
-            current, INTERNAL_MANIFEST_SCHEMA_VERSION,
-        )));
-    }
+    refuse_if_stamp_unsupported(current)?;
 
     while current < INTERNAL_MANIFEST_SCHEMA_VERSION {
         match current {
@@ -96,6 +179,10 @@ pub(super) async fn migrate_internal_schema(dataset: &mut Dataset) -> Result<()>
             2 => {
                 migrate_v2_to_v3(dataset).await?;
                 current = 3;
+            }
+            3 => {
+                migrate_v3_to_v4(dataset, root_uri, branch).await?;
+                current = 4;
             }
             other => {
                 return Err(OmniError::manifest_internal(format!(
@@ -202,10 +289,261 @@ async fn migrate_v2_to_v3(dataset: &mut Dataset) -> Result<()> {
     set_stamp(dataset, 3).await
 }
 
+/// v3 → v4: backfill the graph lineage from `_graph_commits.lance` into
+/// `__manifest`, then bump the stamp.
+///
+/// RFC-013 Phase 7 made `__manifest` the single source of graph lineage
+/// (`graph_commit` / `graph_head:<branch>` rows, written in the publish CAS).
+/// A pre-Phase-7 (v3) graph has its lineage only in `_graph_commits.lance` and
+/// none in `__manifest`, so the new binary would read an EMPTY commit DAG. This
+/// one-time per-branch migration copies that branch's commits + the single head
+/// into `__manifest` so reads see the real history. `_graph_commits.lance`
+/// itself is left untouched as the branch-ref carrier (no commit row is ever
+/// written to it again).
+///
+/// `dataset` is the `__manifest` for `branch` (main when `branch` is `None`);
+/// the migration runs per-branch on that branch's first write, so it reads
+/// `_graph_commits.lance` at the SAME branch.
+///
+/// Idempotency + crash recovery: the stamp bump is the LAST step, and the
+/// lineage merge is keyed on `object_id` (re-inserting the same commit rows is a
+/// no-op update). A crash after the merge but before the stamp bump re-enters
+/// here at v3 and re-runs harmlessly. As a fast path, if `__manifest` already
+/// carries `graph_commit` rows (a previous run completed the merge), we skip
+/// straight to the stamp bump.
+///
+/// Concurrent runners: two processes (or two open-for-write handles) can open the
+/// same legacy graph at once and both reach the backfill merge. `merge_lineage_rows`
+/// uses `conflict_retries(0)`, so the row-level CAS loser on `graph_head:<branch>`
+/// must be re-driven here rather than failing the open — `migrate_v2_to_v3` is
+/// concurrent-runner idempotent and this step must be too. The bounded loop
+/// re-reads the fast path (a concurrent winner's merge is one atomic Lance commit,
+/// so a re-read sees either zero or all of its rows, never partial), re-opens the
+/// stale handle past the winner's commit, and retries. On budget exhaustion it
+/// returns a `RowLevelCasContention`-typed error so the publisher's OUTER retry
+/// loop (which only re-runs `is_retryable_publish_conflict` conflicts) completes
+/// it on the next attempt — the same converge-on-next-attempt contract the
+/// recovery sweep uses.
+async fn migrate_v3_to_v4(
+    dataset: &mut Dataset,
+    root_uri: &str,
+    branch: Option<&str>,
+) -> Result<()> {
+    // Mirror the publisher's budget (`publisher::PUBLISHER_RETRY_BUDGET = 5`); kept
+    // as a local const rather than re-exporting that private one — the two are the
+    // same shape (bounded row-level-CAS retries) but independent knobs.
+    const MIGRATION_MERGE_RETRY_BUDGET: u32 = 5;
+
+    // Exclusive range + an unguarded retryable arm (see `commit_v4_stamp_idempotently`
+    // for the rationale): every retryable conflict re-opens and retries inside the
+    // loop, and the SINGLE reachable exhaustion path is the typed contention return
+    // below — so the retryable variant can never fall through to the `Err(err)`
+    // propagate arm on the last iteration.
+    for _ in 0..MIGRATION_MERGE_RETRY_BUDGET {
+        // Fast path / idempotency + concurrent-winner guard: if the backfill
+        // already landed (a previous run, OR a concurrent runner that won the CAS
+        // — its merge is atomic, so this is all-or-nothing), don't re-merge — just
+        // (re)stamp. `dataset` is re-opened past any winner's commit below, so this
+        // re-read sees the winner's rows on a retry.
+        let (existing_lineage, _heads) = read_graph_lineage(dataset).await?;
+        if !existing_lineage.is_empty() {
+            return commit_v4_stamp_idempotently(dataset, root_uri, branch).await;
+        }
+
+        // Read this branch's legacy commit cache (commits + the head). An absent or
+        // empty `_graph_commits.lance` yields no commits — nothing to backfill.
+        let (commit_by_id, head) =
+            crate::db::commit_graph::read_legacy_commit_cache(root_uri, branch).await?;
+        if commit_by_id.is_empty() {
+            return commit_v4_stamp_idempotently(dataset, root_uri, branch).await;
+        }
+
+        let parts = build_lineage_backfill_parts(&commit_by_id, head.as_ref(), branch)?;
+
+        match merge_lineage_rows(dataset.clone(), &parts).await {
+            Ok(new_dataset) => {
+                *dataset = new_dataset;
+                // Stamp LAST. Crash window: a failure between the merge above and
+                // this stamp bump leaves stamp v3 + lineage present in `__manifest`.
+                // The next open re-enters at v3, the fast path at the top sees the
+                // lineage and skips straight to the stamp bump — completing the
+                // migration with no duplicate rows (the merge is keyed on
+                // `object_id`). Pinned by
+                // `crash_after_merge_before_stamp_completes_on_next_open`.
+                return commit_v4_stamp_idempotently(dataset, root_uri, branch).await;
+            }
+            // A concurrent runner won the `graph_head:<branch>` CAS. Our in-hand
+            // handle is stale at the pre-contention HEAD, so a re-open is required
+            // to see the winner's commit; then re-loop (the fast path will see the
+            // winner's lineage and stamp). Bounded by the budget.
+            Err(err) if super::publisher::is_retryable_publish_conflict(&err) => {
+                *dataset = super::layout::open_manifest_dataset(root_uri, branch).await?;
+                continue;
+            }
+            Err(err) => return Err(err),
+        }
+    }
+
+    // Budget exhausted under sustained contention. Return a CAS-typed error (not a
+    // plain conflict) so the publisher's outer retry loop — which only re-runs
+    // `is_retryable_publish_conflict` — re-runs `load_publish_state` and completes
+    // the migration, rather than giving up.
+    Err(OmniError::manifest_row_level_cas_contention(format!(
+        "v3→v4 lineage backfill exhausted {} retries against concurrent runners",
+        MIGRATION_MERGE_RETRY_BUDGET
+    )))
+}
+
+/// Stamp the v3→v4 migration's terminal version idempotently under concurrent
+/// runners. `set_stamp` issues an `UpdateConfig` Lance commit; once the merge CAS
+/// loser is made to converge (above), BOTH runners reach this stamp bump and race
+/// it — the loser gets `lance::Error::IncompatibleTransaction` (two `UpdateConfig`
+/// commits touching the same metadata key), which is NOT a row-level CAS
+/// contention and so is not caught by the merge loop. But both write the SAME
+/// value, so the conflict is benign: re-open and, if the stamp already reached the
+/// target (the concurrent runner finished it), succeed; otherwise re-apply.
+/// Bounded; on exhaustion surface a CAS-typed error for the publisher's outer
+/// retry, same as the merge loop.
+async fn commit_v4_stamp_idempotently(
+    dataset: &mut Dataset,
+    root_uri: &str,
+    branch: Option<&str>,
+) -> Result<()> {
+    const STAMP_RETRY_BUDGET: u32 = 5;
+    // Exclusive range + an UNGUARDED `IncompatibleTransaction` arm: the retryable
+    // variant is always handled inside the loop (re-open + same-value check + retry),
+    // so it can never fall through to the stringifying `Err(e)` catch-all, and the
+    // SINGLE reachable exhaustion path is the typed contention return below. (A
+    // `0..=BUDGET` range with an `attempt < BUDGET` guard let the last iteration's
+    // retryable conflict reach the catch-all and return a non-retryable
+    // `OmniError::Lance` — the publisher's outer retry would then give up.)
+    for _ in 0..STAMP_RETRY_BUDGET {
+        // Inline the `update_schema_metadata` write (rather than `set_stamp`) so the
+        // raw Lance error variant is in hand — `set_stamp` pre-stringifies it.
+        let stamp_result = stamp_internal_schema(dataset).await;
+        match stamp_result {
+            Ok(_) => return Ok(()),
+            Err(lance::Error::IncompatibleTransaction { .. }) => {
+                // A concurrent runner's `UpdateConfig` preempted ours — the
+                // retryable case. Re-open past its commit; if it already stamped to
+                // the target we're done (the value is identical), else fall through
+                // to retry on the advanced handle.
+                *dataset = super::layout::open_manifest_dataset(root_uri, branch).await?;
+                if read_stamp(dataset) >= INTERNAL_MANIFEST_SCHEMA_VERSION {
+                    return Ok(());
+                }
+            }
+            Err(e) => return Err(OmniError::Lance(e.to_string())),
+        }
+    }
+
+    // Exhausted the budget against sustained concurrent stampers. Return a
+    // CAS-typed (retryable) error so the publisher's OUTER retry — which only
+    // re-runs `is_retryable_publish_conflict` — completes it, rather than the
+    // stringified `OmniError::Lance` it would treat as fatal.
+    Err(OmniError::manifest_row_level_cas_contention(format!(
+        "v3→v4 stamp bump exhausted {} retries against concurrent runners",
+        STAMP_RETRY_BUDGET
+    )))
+}
+
+/// The single `update_schema_metadata` write that bumps the on-disk internal-schema
+/// stamp to the current version. Extracted from `commit_v4_stamp_idempotently`'s
+/// retry loop so a `failpoints` test can inject a concurrent-stamper
+/// `IncompatibleTransaction` deterministically (the loop's exhaustion path is
+/// otherwise near-unreachable). Returns the RAW `lance::Error` so the loop can match
+/// the `IncompatibleTransaction` variant — `set_stamp` pre-stringifies it.
+async fn stamp_internal_schema(dataset: &mut Dataset) -> std::result::Result<(), lance::Error> {
+    crate::failpoints::maybe_fail_lance_incompatible("migration.v4_stamp.force_incompatible")?;
+    dataset
+        .update_schema_metadata([(
+            INTERNAL_SCHEMA_VERSION_KEY.to_string(),
+            INTERNAL_MANIFEST_SCHEMA_VERSION.to_string(),
+        )])
+        .await
+        .map(|_| ())
+}
+
+/// Build the `__manifest` rows for the v3→v4 backfill: one immutable
+/// `graph_commit` row per commit, plus EXACTLY ONE `graph_head:<branch>` row for
+/// the actual head. Each commit encodes to a `[graph_commit, graph_head]` pair,
+/// but only the head commit's head row is kept — the others would be redundant
+/// updates of the same `graph_head:<branch>` object_id (the head is per-branch,
+/// not per-commit).
+fn build_lineage_backfill_parts(
+    commit_by_id: &std::collections::HashMap<String, GraphCommit>,
+    head: Option<&GraphCommit>,
+    branch: Option<&str>,
+) -> Result<Vec<super::state::GraphLineageRowPart>> {
+    let head_id = head.map(|h| h.graph_commit_id.as_str());
+    // Deterministic iteration order (the source is a HashMap): merge-insert is
+    // keyed on `object_id` so the final manifest content is order-independent,
+    // but a stable order keeps the produced batch reproducible regardless.
+    let mut commits: Vec<&GraphCommit> = commit_by_id.values().collect();
+    commits.sort_by(|a, b| a.graph_commit_id.cmp(&b.graph_commit_id));
+    let mut parts = Vec::with_capacity(commits.len() + 1);
+    for commit in commits {
+        let row = GraphLineageRow {
+            graph_commit_id: commit.graph_commit_id.clone(),
+            manifest_branch: commit.manifest_branch.clone(),
+            manifest_version: commit.manifest_version,
+            parent_commit_id: commit.parent_commit_id.clone(),
+            merged_parent_commit_id: commit.merged_parent_commit_id.clone(),
+            actor_id: commit.actor_id.clone(),
+            created_at: commit.created_at,
+        };
+        let [commit_part, head_part] = graph_lineage_row_parts(&row, branch)?;
+        parts.push(commit_part);
+        if Some(commit.graph_commit_id.as_str()) == head_id {
+            parts.push(head_part);
+        }
+    }
+    Ok(parts)
+}
+
 async fn set_stamp(dataset: &mut Dataset, version: u32) -> Result<()> {
     dataset
         .update_schema_metadata([(INTERNAL_SCHEMA_VERSION_KEY.to_string(), version.to_string())])
         .await
         .map_err(|e| OmniError::Lance(e.to_string()))?;
     Ok(())
+}
+
+/// Test-only: force the on-disk internal-schema stamp to `version`. Used to
+/// synthesize a pre-migration graph (rewinding to v3) and to simulate a crash
+/// that lost the final stamp bump. Gated on `test` OR `failpoints` so the
+/// fault-injection migration test (in the `failpoints` integration binary,
+/// compiled without `cfg(test)`) can reach it too.
+#[cfg(any(test, feature = "failpoints"))]
+pub(crate) async fn set_stamp_for_test(dataset: &mut Dataset, version: u32) -> Result<()> {
+    set_stamp(dataset, version).await
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The floor never refuses any stamp the binary can actually serve — a graph
+    /// at MIN through CURRENT passes, only sub-MIN / super-CURRENT are rejected.
+    /// With MIN = 1 and CURRENT = 4 this proves the live range is exactly [1, 4]
+    /// and that the floor is a no-op for every real graph (lowest real stamp is 1).
+    #[test]
+    fn unsupported_guard_accepts_exactly_the_supported_range() {
+        for stamp in MIN_SUPPORTED_INTERNAL_SCHEMA_VERSION..=INTERNAL_MANIFEST_SCHEMA_VERSION {
+            assert!(
+                refuse_if_stamp_unsupported(stamp).is_ok(),
+                "stamp v{stamp} is within [MIN, CURRENT] and must be accepted"
+            );
+        }
+        if MIN_SUPPORTED_INTERNAL_SCHEMA_VERSION > 0 {
+            assert!(
+                refuse_if_stamp_unsupported(MIN_SUPPORTED_INTERNAL_SCHEMA_VERSION - 1).is_err(),
+                "a sub-floor stamp must be refused"
+            );
+        }
+        assert!(
+            refuse_if_stamp_unsupported(INTERNAL_MANIFEST_SCHEMA_VERSION + 1).is_err(),
+            "a future stamp must be refused"
+        );
+    }
 }

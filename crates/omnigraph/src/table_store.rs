@@ -812,10 +812,12 @@ impl TableStore {
     /// Legacy inline-commit append: writes fragments AND commits in one
     /// call, advancing Lance HEAD as a side effect. Not on the
     /// `TableStorage` trait surface — the staged primitive `stage_append`
-    /// + `commit_staged` is the engine write path. This inherent
-    /// `pub(crate)` method survives only for recovery test setup. Do not
-    /// add new engine call sites — they re-introduce the multi-phase
-    /// commit drift the trait surface was designed to eliminate.
+    /// + `commit_staged` is the engine write path. This inherent method
+    /// survives only for in-source recovery test setup, so it is
+    /// `#[cfg(test)]`-gated: engine code physically cannot call it (which
+    /// enforces "no new call sites" by construction and silences the
+    /// dead-code warning the non-test lib build would otherwise emit).
+    #[cfg(test)]
     pub(crate) async fn append_batch(
         &self,
         dataset_uri: &str,

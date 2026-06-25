@@ -1,6 +1,5 @@
 use std::collections::{HashMap, VecDeque};
 use std::sync::Arc;
-use std::time::{SystemTime, UNIX_EPOCH};
 
 use arrow_array::{
     Array, RecordBatch, RecordBatchIterator, StringArray, TimestampMicrosecondArray, UInt64Array,
@@ -29,7 +28,16 @@ pub struct GraphCommit {
 
 pub struct CommitGraph {
     root_uri: String,
-    dataset: Dataset,
+    /// Handle on `_graph_commits.lance` at the active branch, held only for the
+    /// branch-management WRITES (`create_branch`, formerly `version`) and
+    /// `refresh`. It is a DERIVED artifact (RFC-013 Phase 7): graph lineage lives
+    /// in `__manifest`, and reads (`head_commit`/`load_commits`/`get_commit`/
+    /// `merge_base`) never touch it. `None` means the branch's
+    /// `_graph_commits.lance` ref is missing (an interrupted fork-reclaim or a
+    /// `cleanup` race) while the manifest lineage is still authoritative — so the
+    /// READS stay correct and only a subsequent `create_branch` surfaces the loud
+    /// actionable error. Mirrors `actor_dataset`'s best-effort `Option`.
+    dataset: Option<Dataset>,
     actor_dataset: Option<Dataset>,
     active_branch: Option<String>,
     actor_by_commit_id: HashMap<String, String>,
@@ -38,20 +46,19 @@ pub struct CommitGraph {
 }
 
 impl CommitGraph {
-    pub async fn init(root_uri: &str, manifest_version: u64) -> Result<Self> {
+    /// Create the commit-graph datasets for a fresh graph. The genesis
+    /// `graph_commit` + `graph_head` rows live in `__manifest` (folded into the
+    /// init write — RFC-013 Phase 7), so `_graph_commits.lance` is created EMPTY
+    /// here: it exists only to carry the Lance branch refs that `create_branch` /
+    /// `list_branches` / the `cleanup` orphan reconciler operate on. No commit
+    /// rows are ever written to it. The in-memory cache is sourced from the
+    /// manifest projection — the same path as [`open`], so genesis is seen
+    /// identically whether the graph was just initialized or reopened.
+    pub async fn init(root_uri: &str) -> Result<Self> {
         let root = root_uri.trim_end_matches('/');
         let uri = graph_commits_uri(root);
-        let genesis = GraphCommit {
-            graph_commit_id: ulid::Ulid::new().to_string(),
-            manifest_branch: None,
-            manifest_version,
-            parent_commit_id: None,
-            merged_parent_commit_id: None,
-            actor_id: None,
-            created_at: now_micros()?,
-        };
 
-        let batch = commits_to_batch(&[genesis.clone()])?;
+        let batch = RecordBatch::new_empty(commit_graph_schema());
         let reader = RecordBatchIterator::new(vec![Ok(batch)], commit_graph_schema());
         let params = WriteParams {
             mode: WriteMode::Create,
@@ -66,15 +73,28 @@ impl CommitGraph {
             .map_err(|e| OmniError::Lance(e.to_string()))?;
         let actor_dataset = create_commit_actor_dataset(root).await?;
 
+        let (commit_by_id, head_commit) = load_commit_cache_from_manifest(root, None).await?;
         Ok(Self {
             root_uri: root.to_string(),
-            dataset,
+            dataset: Some(dataset),
             actor_dataset: Some(actor_dataset),
             active_branch: None,
             actor_by_commit_id: HashMap::new(),
-            commit_by_id: HashMap::from([(genesis.graph_commit_id.clone(), genesis.clone())]),
-            head_commit: Some(genesis),
+            commit_by_id,
+            head_commit,
         })
+    }
+
+    /// Insert a just-published commit into the in-memory cache (RFC-013 Phase 7).
+    /// The durable write already happened in the manifest publish CAS; this only
+    /// keeps the cache consistent for same-handle reads, with no storage I/O.
+    /// Head selection matches the manifest-sourced load (`should_replace_head`).
+    pub fn insert_committed(&mut self, commit: GraphCommit) {
+        if should_replace_head(self.head_commit.as_ref(), &commit) {
+            self.head_commit = Some(commit.clone());
+        }
+        self.commit_by_id
+            .insert(commit.graph_commit_id.clone(), commit);
     }
 
     pub async fn open(root_uri: &str) -> Result<Self> {
@@ -87,17 +107,24 @@ impl CommitGraph {
             crate::instrumentation::open_dataset_tracked(&graph_commit_actors_uri(root), wrapper)
                 .await
                 .ok();
-        let actor_by_commit_id = match &actor_dataset {
-            Some(dataset) => load_commit_actor_cache(dataset).await?,
-            None => HashMap::new(),
-        };
-        let (commit_by_id, head_commit) = load_commit_cache(&dataset, &actor_by_commit_id).await?;
+        // RFC-013 step 4: source the in-memory cache from the `__manifest`
+        // lineage projection (which carries the actor inline), not from
+        // `_graph_commits.lance`. The dataset handles above are retained for the
+        // branch-management ops (create/delete/list/version) that still target
+        // the commit-graph dataset; the actor dataset is only kept for the
+        // dual-write append path. The projection-equivalence gate proves this
+        // cache equals the prior `_graph_commits.lance` read. A pre-Phase-7 (v3)
+        // graph not yet migrated falls back to the legacy read — see
+        // `load_commit_cache_for_branch`.
+        let (commit_by_id, head_commit) = load_commit_cache_for_branch(root, None).await?;
         Ok(Self {
             root_uri: root.to_string(),
-            dataset,
+            // `open` targets main and never checks out a branch (main cannot be
+            // deleted/recreated), so the handle is always present here.
+            dataset: Some(dataset),
             actor_dataset,
             active_branch: None,
-            actor_by_commit_id,
+            actor_by_commit_id: HashMap::new(),
             commit_by_id,
             head_commit,
         })
@@ -109,25 +136,33 @@ impl CommitGraph {
         let dataset =
             crate::instrumentation::open_dataset_tracked(&graph_commits_uri(root), wrapper.clone())
                 .await?;
-        let dataset = dataset
-            .checkout_branch(branch)
-            .await
-            .map_err(|e| OmniError::Lance(e.to_string()))?;
+        // Best-effort checkout of the DERIVED `_graph_commits.lance` branch ref.
+        // It is held only for `create_branch` (a write); the lineage READ below
+        // comes from `__manifest`. A missing ref (interrupted fork-reclaim /
+        // `cleanup` race) must not wedge the read, so a typed not-found yields a
+        // `None` handle — a subsequent `create_branch` then surfaces the loud
+        // error. Any OTHER open error (transient IO / corrupt) still propagates,
+        // matching the `force_delete_branch` / `read_legacy_commit_cache` idiom.
+        let dataset = match dataset.checkout_branch(branch).await {
+            Ok(ds) => Some(ds),
+            Err(lance::Error::RefNotFound { .. }) | Err(lance::Error::NotFound { .. }) => None,
+            Err(e) => return Err(OmniError::Lance(e.to_string())),
+        };
         let actor_dataset =
             crate::instrumentation::open_dataset_tracked(&graph_commit_actors_uri(root), wrapper)
                 .await
                 .ok();
-        let actor_by_commit_id = match &actor_dataset {
-            Some(dataset) => load_commit_actor_cache(dataset).await?,
-            None => HashMap::new(),
-        };
-        let (commit_by_id, head_commit) = load_commit_cache(&dataset, &actor_by_commit_id).await?;
+        // Hard `?`: the manifest existence gate. `load_commit_cache_for_branch`
+        // opens the branch's `__manifest` (its own `checkout_branch` on the
+        // authoritative table), so a TRULY absent branch still fails loudly here —
+        // only the derived `_graph_commits.lance` ref is allowed to be missing.
+        let (commit_by_id, head_commit) = load_commit_cache_for_branch(root, Some(branch)).await?;
         Ok(Self {
             root_uri: root.to_string(),
             dataset,
             actor_dataset,
             active_branch: Some(branch.to_string()),
-            actor_by_commit_id,
+            actor_by_commit_id: HashMap::new(),
             commit_by_id,
             head_commit,
         })
@@ -136,40 +171,49 @@ impl CommitGraph {
     pub async fn refresh(&mut self) -> Result<()> {
         let root = self.root_uri.clone();
         let wrapper = crate::instrumentation::commit_graph_wrapper();
-        self.dataset = crate::instrumentation::open_dataset_tracked(
+        let dataset = crate::instrumentation::open_dataset_tracked(
             &graph_commits_uri(&root),
             wrapper.clone(),
         )
         .await?;
-        if let Some(branch) = &self.active_branch {
-            self.dataset = self
-                .dataset
-                .checkout_branch(branch)
-                .await
-                .map_err(|e| OmniError::Lance(e.to_string()))?;
-        }
+        // Same best-effort checkout as `open_at_branch`: a missing DERIVED branch
+        // ref leaves the handle `None` (only `create_branch` then errors), while
+        // the in-memory cache re-syncs from the authoritative manifest below.
+        self.dataset = match &self.active_branch {
+            Some(branch) => match dataset.checkout_branch(branch).await {
+                Ok(ds) => Some(ds),
+                Err(lance::Error::RefNotFound { .. }) | Err(lance::Error::NotFound { .. }) => None,
+                Err(e) => return Err(OmniError::Lance(e.to_string())),
+            },
+            None => Some(dataset),
+        };
         self.actor_dataset =
             crate::instrumentation::open_dataset_tracked(&graph_commit_actors_uri(&root), wrapper)
                 .await
                 .ok();
-        self.actor_by_commit_id = match &self.actor_dataset {
-            Some(dataset) => load_commit_actor_cache(dataset).await?,
-            None => HashMap::new(),
-        };
         let (commit_by_id, head_commit) =
-            load_commit_cache(&self.dataset, &self.actor_by_commit_id).await?;
+            load_commit_cache_for_branch(&root, self.active_branch.as_deref()).await?;
         self.commit_by_id = commit_by_id;
         self.head_commit = head_commit;
         Ok(())
     }
 
-    pub fn version(&self) -> u64 {
-        self.dataset.version().version
-    }
-
     pub async fn create_branch(&mut self, name: &str) -> Result<()> {
-        let mut ds = self.dataset.clone();
-        ds.create_branch(name, self.version(), None)
+        // The held `_graph_commits.lance` handle is the only thing that can fork a
+        // branch ref. If it is missing (an interrupted fork-reclaim or a `cleanup`
+        // race dropped the derived ref while manifest lineage stayed authoritative),
+        // fail loudly + actionably rather than silently. Repair is the existing
+        // `cleanup` orphan reconciler (`reconcile_commit_graph_orphans`), not an
+        // inline write on this path.
+        let Some(dataset) = &self.dataset else {
+            let branch = self.active_branch.as_deref().unwrap_or("main");
+            return Err(OmniError::manifest_internal(format!(
+                "commit-graph branch ref for '{branch}' is missing; run `omnigraph cleanup` then retry"
+            )));
+        };
+        let version = dataset.version().version;
+        let mut ds = dataset.clone();
+        ds.create_branch(name, version, None)
             .await
             .map_err(|e| OmniError::Lance(e.to_string()))?;
         Ok(())
@@ -216,7 +260,17 @@ impl CommitGraph {
         Ok(branches.into_keys().collect())
     }
 
-    pub async fn append_commit(
+    // DEAD as of RFC-013 Phase 7: graph commits are recorded in `__manifest`
+    // (folded into the publish CAS), never appended to `_graph_commits.lance`.
+    // These append helpers are retained only because the actor sidecar table they
+    // touch is still enumerated by `optimize` (internal-table compaction); they
+    // have no caller on any write path. The single-source invariant is guarded by
+    // `tests/lineage_projection.rs`, which fails if `_graph_commits.lance` ever
+    // gains a commit row. Do NOT call these to record a commit — use the
+    // coordinator's `commit_*_with_actor` / `commit_merge_with_actor`, which carry
+    // the lineage intent into the manifest publish.
+    #[allow(dead_code)]
+    async fn append_commit(
         &mut self,
         manifest_branch: Option<&str>,
         manifest_version: u64,
@@ -233,7 +287,8 @@ impl CommitGraph {
         .await
     }
 
-    pub async fn append_merge_commit(
+    #[allow(dead_code)]
+    async fn append_merge_commit(
         &mut self,
         manifest_branch: Option<&str>,
         manifest_version: u64,
@@ -251,6 +306,7 @@ impl CommitGraph {
         .await
     }
 
+    #[allow(dead_code)]
     async fn append_commit_with_parents(
         &mut self,
         manifest_branch: Option<&str>,
@@ -267,16 +323,22 @@ impl CommitGraph {
             parent_commit_id: parent_commit_id.map(|s| s.to_string()),
             merged_parent_commit_id: merged_parent_commit_id.map(|s| s.to_string()),
             actor_id: actor_id.map(str::to_string),
-            created_at: now_micros()?,
+            created_at: crate::db::now_micros()?,
         };
 
         let batch = commits_to_batch(&[commit.clone()])?;
         let reader = RecordBatchIterator::new(vec![Ok(batch)], commit_graph_schema());
-        let mut ds = self.dataset.clone();
+        // This helper is dead on every write path (RFC-013 Phase 7) — reached only
+        // by the transitional v3 fixtures, which always hold the commits dataset.
+        // A `None` here would be a fixture bug, so fail loudly rather than silently.
+        let mut ds = self
+            .dataset
+            .clone()
+            .ok_or_else(|| OmniError::manifest_internal("commit-graph dataset is missing"))?;
         ds.append(reader, None)
             .await
             .map_err(|e| OmniError::Lance(e.to_string()))?;
-        self.dataset = ds;
+        self.dataset = Some(ds);
         if let Some(actor_id) = actor_id {
             self.append_actor(&graph_commit_id, actor_id).await?;
         }
@@ -289,6 +351,7 @@ impl CommitGraph {
         Ok(graph_commit_id)
     }
 
+    #[allow(dead_code)] // RFC-013 Phase 7: dead — see `append_commit`.
     async fn append_actor(&mut self, graph_commit_id: &str, actor_id: &str) -> Result<()> {
         if self
             .actor_by_commit_id
@@ -301,7 +364,7 @@ impl CommitGraph {
         let record = CommitActorRecord {
             graph_commit_id: graph_commit_id.to_string(),
             actor_id: actor_id.to_string(),
-            created_at: now_micros()?,
+            created_at: crate::db::now_micros()?,
         };
         let batch = commit_actors_to_batch(&[record])?;
         let reader = RecordBatchIterator::new(vec![Ok(batch)], commit_actor_schema());
@@ -452,7 +515,12 @@ async fn create_commit_actor_dataset(root_uri: &str) -> Result<Dataset> {
     };
     match Dataset::write(reader, &uri as &str, Some(params)).await {
         Ok(dataset) => Ok(dataset),
-        Err(err) if err.to_string().contains("Dataset already exists") => Dataset::open(&uri)
+        // Create-or-open idempotency: a concurrent/prior create raced us. Match
+        // the typed `DatasetAlreadyExists` variant, not the display string — the
+        // message is not a Lance API contract (a wording change would silently
+        // break this fallback). Pinned by
+        // `lance_surface_guards.rs::lance_error_dataset_already_exists_variant_exists`.
+        Err(lance::Error::DatasetAlreadyExists { .. }) => Dataset::open(&uri)
             .await
             .map_err(|open_err| OmniError::Lance(open_err.to_string())),
         Err(err) => Err(OmniError::Lance(err.to_string())),
@@ -488,6 +556,156 @@ fn commits_to_batch(commits: &[GraphCommit]) -> Result<RecordBatch> {
         ],
     )
     .map_err(|e| OmniError::Lance(e.to_string()))
+}
+
+/// Build the in-memory commit cache for `branch`, choosing the source by the
+/// branch manifest's internal-schema stamp (RFC-013 step 4 forward/back-compat):
+///
+/// - stamp ≥ v4 (post-Phase-7, the normal case): the `__manifest` lineage
+///   projection — `graph_commit`/`graph_head` rows folded into the publish CAS.
+/// - stamp < v4 (a pre-Phase-7 graph not yet migrated): the legacy
+///   `_graph_commits.lance` read. This is the **transitional v3 fallback** that
+///   lets a READ-ONLY open of an un-migrated graph still see correct history —
+///   a read-only open never runs the v3→v4 backfill (it must not write), so
+///   without this gate it would read an empty DAG from `__manifest`. A
+///   read-write open backfills `__manifest` on its first write and thereafter
+///   takes the projection branch.
+///
+/// Both sources pick the head with `should_replace_head`, so the cache is
+/// identical regardless of which branch is taken. Remove the fallback once no
+/// graph below internal-schema v4 remains.
+async fn load_commit_cache_for_branch(
+    root_uri: &str,
+    branch: Option<&str>,
+) -> Result<(HashMap<String, GraphCommit>, Option<GraphCommit>)> {
+    let stamp = crate::db::manifest::internal_schema_stamp_at(root_uri, branch).await?;
+    // Defense-in-depth: refuse a branch whose stamp this binary cannot serve —
+    // newer than CURRENT, or below MIN_SUPPORTED — for the same reason the main
+    // read path does (`refuse_if_internal_schema_unsupported`). A `> CURRENT` stamp
+    // means a newer binary wrote a shape we can't read, so the projection below
+    // would misread it; a `< MIN` stamp predates the legacy readers this binary
+    // still carries. Not a live hole today: migrations run main-first
+    // (`migrate_on_open` migrates main; each branch migrates on its own first
+    // write), so main's stamp bounds every branch's and the main read path already
+    // refuses first. The guard closes the gap if that ordering is ever weakened.
+    crate::db::manifest::refuse_if_stamp_unsupported(stamp)?;
+    if stamp < crate::db::manifest::INTERNAL_MANIFEST_SCHEMA_VERSION {
+        // Transitional: un-migrated v3 graph — read lineage from the legacy
+        // `_graph_commits.lance` so reads (incl. read-only opens) see history.
+        return read_legacy_commit_cache(root_uri, branch).await;
+    }
+    load_commit_cache_from_manifest(root_uri, branch).await
+}
+
+/// Build the in-memory commit cache from the `__manifest` graph-lineage
+/// projection (RFC-013 step 4) rather than `_graph_commits.lance`. The lineage
+/// rows carry the actor inline, so no separate actor-table read is needed. Head
+/// selection is identical to [`load_commit_cache`] (`should_replace_head`), so
+/// the resulting cache is equivalent to the prior `_graph_commits.lance` read.
+async fn load_commit_cache_from_manifest(
+    root_uri: &str,
+    branch: Option<&str>,
+) -> Result<(HashMap<String, GraphCommit>, Option<GraphCommit>)> {
+    let (rows, _heads) =
+        crate::db::manifest::ManifestCoordinator::read_graph_lineage_at(root_uri, branch).await?;
+    let mut commit_by_id = HashMap::with_capacity(rows.len());
+    let mut head_commit = None;
+    for row in rows {
+        let commit = GraphCommit {
+            graph_commit_id: row.graph_commit_id,
+            manifest_branch: row.manifest_branch,
+            manifest_version: row.manifest_version,
+            parent_commit_id: row.parent_commit_id,
+            merged_parent_commit_id: row.merged_parent_commit_id,
+            actor_id: row.actor_id,
+            created_at: row.created_at,
+        };
+        if should_replace_head(head_commit.as_ref(), &commit) {
+            head_commit = Some(commit.clone());
+        }
+        commit_by_id.insert(commit.graph_commit_id.clone(), commit);
+    }
+    Ok((commit_by_id, head_commit))
+}
+
+/// Read the legacy `_graph_commits.lance` (+ its actor sidecar) for `branch`
+/// into an in-memory cache — the transitional source for graphs not yet
+/// migrated to internal-schema v4 (RFC-013 step 4). Two callers, both
+/// transitional: the v3→v4 migration backfill (which copies these rows into
+/// `__manifest`) and the read-only v3 fallback in `CommitGraph::open*`. Returns
+/// `(commit_by_id, head)`, with the head picked by `should_replace_head` —
+/// identical to the manifest projection. A genuinely ABSENT (not-found) commit
+/// dataset or actor sidecar yields an empty cache (no head); any OTHER open error
+/// (transient IO / corrupt file) propagates loudly rather than being read as
+/// "empty" — a swallow here would let the v3→v4 migration backfill nothing and
+/// still stamp v4, orphaning the real lineage permanently. This keeps the legacy
+/// readers alive while any v3 graph survives; once no graph is below v4 it can
+/// retire.
+pub(crate) async fn read_legacy_commit_cache(
+    root_uri: &str,
+    branch: Option<&str>,
+) -> Result<(HashMap<String, GraphCommit>, Option<GraphCommit>)> {
+    let root = root_uri.trim_end_matches('/');
+    let commits_uri = graph_commits_uri(root);
+    let commits_open = match crate::failpoints::maybe_fail_lance_open("migration.v3_to_v4.legacy_open")
+    {
+        Ok(()) => Dataset::open(&commits_uri).await,
+        Err(injected) => Err(injected),
+    };
+    let mut dataset = match commits_open {
+        Ok(dataset) => dataset,
+        // An ABSENT commits dataset is the legitimate "no legacy data" signal —
+        // a graph with no `_graph_commits.lance` (or none on this branch) yields
+        // an empty cache. But ONLY a genuine not-found gets that treatment: a
+        // transient/corrupt open (IO / CorruptFile / …) must propagate, never be
+        // read as "empty". The v3→v4 migration calls this once before stamping
+        // v4; swallowing a non-not-found error here would backfill nothing and
+        // stamp v4 anyway, orphaning the real lineage permanently (the migration
+        // never re-runs, and the v3 fallback is then disabled). Lance maps an
+        // object-store NotFound to `DatasetNotFound`; the variant match (vs an
+        // existence probe) is exactly right and not over-strict — pinned by
+        // `lance_surface_guards.rs::dataset_open_missing_returns_not_found_variant`.
+        Err(lance::Error::DatasetNotFound { .. }) | Err(lance::Error::NotFound { .. }) => {
+            return Ok((HashMap::new(), None));
+        }
+        Err(e) => return Err(OmniError::Lance(e.to_string())),
+    };
+    if let Some(branch) = branch.filter(|b| *b != "main") {
+        dataset = dataset
+            .checkout_branch(branch)
+            .await
+            .map_err(|e| OmniError::Lance(e.to_string()))?;
+    }
+
+    // The actor sidecar may be absent (older graphs without authored commits);
+    // an empty actor map then leaves every commit's actor `None`. It is read
+    // FLAT (no branch checkout): the pre-Phase-7 commit graph never forked the
+    // actor dataset — actors are keyed by `graph_commit_id` globally — so a
+    // branch's commits resolve their actor from the same single actor table.
+    // This matches the live `CommitGraph::open_at_branch`, which also opens the
+    // actor dataset on main while checking out the branch only on the commits
+    // dataset.
+    let actors_open =
+        match crate::failpoints::maybe_fail_lance_open("migration.v3_to_v4.legacy_open") {
+            Ok(()) => Dataset::open(&graph_commit_actors_uri(root)).await,
+            Err(injected) => Err(injected),
+        };
+    let actor_by_commit_id = match actors_open {
+        Ok(actor_dataset) => load_commit_actor_cache(&actor_dataset).await?,
+        // An ABSENT actor sidecar is benign (older graphs without authored
+        // commits) — every commit's actor stays `None`. A not-found is therefore
+        // the empty-map signal. But a CORRUPT/transient actor open must NOT be
+        // read as "no authors": silently wiping all authorship and then stamping
+        // v4 is the same permanent-loss hole as the commits arm, so anything
+        // other than not-found propagates. (Same variant contract, different
+        // rationale — absence is normal here, error is not.)
+        Err(lance::Error::DatasetNotFound { .. }) | Err(lance::Error::NotFound { .. }) => {
+            HashMap::new()
+        }
+        Err(e) => return Err(OmniError::Lance(e.to_string())),
+    };
+
+    load_commit_cache(&dataset, &actor_by_commit_id).await
 }
 
 async fn load_commit_cache(
@@ -694,11 +912,170 @@ async fn open_for_branch(root_uri: &str, branch: Option<&str>) -> Result<CommitG
     }
 }
 
-fn now_micros() -> Result<i64> {
-    let duration = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map_err(|e| OmniError::manifest(format!("system clock before UNIX_EPOCH: {}", e)))?;
-    Ok(duration.as_micros() as i64)
+/// Identities of the commits written into a synthetic pre-Phase-7 (v3) graph by
+/// [`seed_legacy_v3_lineage`], for assertions after migration.
+//
+// Gated on `test` OR the `failpoints` feature: the v3→v4 migration fault-injection
+// test lives in the `failpoints` integration binary (the fail registry is
+// process-global, so failpoint tests must not run in-source), and that binary
+// compiles the crate without `cfg(test)` — so it needs this fixture under the
+// feature too. Still excluded from release builds.
+#[cfg(any(test, feature = "failpoints"))]
+#[derive(Debug, Clone)]
+pub struct V3LineageFixture {
+    /// The genesis (parentless) commit id.
+    pub genesis: String,
+    /// A direct, authored commit on main (actor `act-a`).
+    pub commit_a: String,
+    /// A commit tagged to the `feature` branch (actor `act-feature`).
+    pub feature_commit: String,
+    /// The merge commit on main: parent = `commit_a`, merged_parent =
+    /// `feature_commit`, actor `act-merger`. This is the head of main.
+    pub merge_commit: String,
+    /// Every commit id written, in append order (for count assertions).
+    pub all_ids: Vec<String>,
+}
+
+/// Build a synthetic pre-Phase-7 (internal-schema v3) graph at `root_uri`: graph
+/// lineage lives ONLY in `_graph_commits.lance` (+ its actor sidecar), `__manifest`
+/// carries NO `graph_commit`/`graph_head` rows, and the stamp is set to v3. This
+/// reproduces exactly the on-disk shape a graph created by a pre-RFC-013-Phase-7
+/// binary would have, so the v3→v4 migration and the v3-read fallback can be
+/// tested against it.
+///
+/// The lineage is a realistic DAG with a branch + a real merge: genesis → A →
+/// (feature commit, off to the side) → merge(A, feature) at the head of main,
+/// with authored actors on the non-genesis commits. Reaches the dead-on-the-
+/// write-path `append_commit_with_parents`/`append_actor` (still present for
+/// exactly this transitional purpose) to write the legacy rows.
+#[cfg(any(test, feature = "failpoints"))]
+pub async fn seed_legacy_v3_lineage(root_uri: &str) -> Result<V3LineageFixture> {
+    let root = root_uri.trim_end_matches('/');
+
+    // 1. Create `__manifest` (Phase-7 folds genesis lineage into it) and the
+    //    EMPTY legacy `_graph_commits.lance`. We then append the v3-style commit
+    //    rows below — a real v3 graph carried its genesis in `_graph_commits`.
+    crate::db::manifest::seed_manifest_for_v3_fixture(root).await?;
+    let mut cg = CommitGraph::init(root).await?;
+    // Clear the cache that init seeded from the (genesis-bearing) manifest, so
+    // the appended rows below are the whole story and parents come out right.
+    cg.commit_by_id.clear();
+    cg.head_commit = None;
+
+    // 2. Append the legacy lineage to `_graph_commits.lance` on main.
+    let genesis = cg
+        .append_commit_with_parents(None, 1, None, None, None)
+        .await?;
+    let commit_a = cg
+        .append_commit_with_parents(None, 2, Some(&genesis), None, Some("act-a"))
+        .await?;
+    let feature_commit = cg
+        .append_commit_with_parents(Some("feature"), 3, Some(&commit_a), None, Some("act-feature"))
+        .await?;
+    let merge_commit = cg
+        .append_commit_with_parents(
+            None,
+            4,
+            Some(&commit_a),
+            Some(&feature_commit),
+            Some("act-merger"),
+        )
+        .await?;
+
+    // 3. Strip the genesis lineage rows the Phase-7 init folded into `__manifest`
+    //    and rewind the stamp to v3, so the manifest matches a true pre-Phase-7
+    //    graph (no lineage in `__manifest`, stamp v3).
+    crate::db::manifest::strip_lineage_and_set_v3_stamp_for_fixture(root).await?;
+
+    Ok(V3LineageFixture {
+        genesis: genesis.clone(),
+        commit_a: commit_a.clone(),
+        feature_commit: feature_commit.clone(),
+        merge_commit: merge_commit.clone(),
+        all_ids: vec![genesis, commit_a, feature_commit, merge_commit],
+    })
+}
+
+/// Identities of a synthetic pre-Phase-7 (v3) graph that carries a REAL Lance
+/// branch (built by [`seed_legacy_v3_lineage_with_branch`]).
+#[cfg(test)]
+#[derive(Debug, Clone)]
+pub struct V3BranchedLineageFixture {
+    /// The genesis (parentless) commit on main.
+    pub genesis: String,
+    /// A direct authored commit on main (actor `act-a`). The head of main.
+    pub commit_a: String,
+    /// A commit on the real `feature` Lance branch (actor `act-branch`),
+    /// parented off `commit_a`. The head of `feature`.
+    pub branch_commit: String,
+    /// The branch name forked on both `_graph_commits.lance` and `__manifest`.
+    pub branch: String,
+}
+
+/// Build a synthetic pre-Phase-7 (internal-schema v3) graph at `root_uri` that
+/// carries a REAL Lance branch `feature` on BOTH `_graph_commits.lance` and
+/// `__manifest`, reproducing exactly the on-disk shape of a branched graph
+/// created by a pre-RFC-013-Phase-7 binary:
+///
+/// - `_graph_commits.lance`: main has `genesis → A`; the `feature` Lance branch
+///   adds `branch_commit` (parent `A`). Authored actors land in the FLAT actor
+///   sidecar (the pre-Phase-7 commit graph never forked the actor table).
+/// - `__manifest`: main is stamped v3 with NO lineage rows; the `feature` branch
+///   is forked from main's v3 state, so it too is v3 with NO lineage of its own.
+///
+/// This is the fixture the per-branch v3→v4 migration runs against: it lets a
+/// test prove that migrating the `feature` branch reads the branch's legacy
+/// lineage, writes it into the BRANCH's `__manifest`, and leaves main untouched —
+/// the case the main-only [`seed_legacy_v3_lineage`] cannot exercise.
+#[cfg(test)]
+pub async fn seed_legacy_v3_lineage_with_branch(root_uri: &str) -> Result<V3BranchedLineageFixture> {
+    let root = root_uri.trim_end_matches('/');
+
+    // 1. `__manifest` (genesis folded by Phase-7 init) + an empty legacy
+    //    `_graph_commits.lance`. Clear the init-seeded cache so the rows we
+    //    append below are the whole story.
+    crate::db::manifest::seed_manifest_for_v3_fixture(root).await?;
+    let mut cg = CommitGraph::init(root).await?;
+    cg.commit_by_id.clear();
+    cg.head_commit = None;
+
+    // 2. Main lineage on `_graph_commits.lance`: genesis → A (authored).
+    let genesis = cg
+        .append_commit_with_parents(None, 1, None, None, None)
+        .await?;
+    let commit_a = cg
+        .append_commit_with_parents(None, 2, Some(&genesis), None, Some("act-a"))
+        .await?;
+
+    // 3. Fork a real `feature` Lance branch on `_graph_commits.lance`, switch the
+    //    handle to it, and append an authored branch commit (its actor lands in
+    //    the flat main actor table — exactly the pre-Phase-7 shape).
+    cg.create_branch("feature").await?;
+    let commits_ds = cg
+        .dataset
+        .take()
+        .expect("commits dataset present after create_branch")
+        .checkout_branch("feature")
+        .await
+        .map_err(|e| OmniError::Lance(e.to_string()))?;
+    cg.dataset = Some(commits_ds);
+    cg.active_branch = Some("feature".to_string());
+    let branch_commit = cg
+        .append_commit_with_parents(Some("feature"), 3, Some(&commit_a), None, Some("act-branch"))
+        .await?;
+
+    // 4. Rewind main's `__manifest` to the v3 shape (strip the folded genesis
+    //    lineage, set stamp 3) BEFORE forking — so the `feature` manifest branch
+    //    inherits the stripped v3 state (no lineage, stamp 3).
+    crate::db::manifest::strip_lineage_and_set_v3_stamp_for_fixture(root).await?;
+    crate::db::manifest::fork_manifest_branch_for_v3_fixture(root, "feature").await?;
+
+    Ok(V3BranchedLineageFixture {
+        genesis,
+        commit_a,
+        branch_commit,
+        branch: "feature".to_string(),
+    })
 }
 
 #[cfg(test)]
@@ -708,6 +1085,83 @@ mod tests {
     use arrow_schema::{DataType, Field, Schema};
 
     use super::*;
+
+    // RFC-013 step 4: the v3-read fallback / migration source reads a NAMED
+    // branch's lineage from a real Lance branch on `_graph_commits.lance`, while
+    // resolving actors from the FLAT actor table (the pre-Phase-7 commit graph
+    // forked only the commits dataset, never the actor sidecar). This guards
+    // both that branch-checkout path and the flat-actor resolution — the case
+    // the main-branch fixture (commits on main only) does not exercise.
+    #[tokio::test]
+    async fn read_legacy_commit_cache_resolves_branch_commits_with_flat_actors() {
+        let dir = tempfile::tempdir().unwrap();
+        let uri = dir.path().to_str().unwrap();
+
+        // A v3 graph needs `__manifest` to exist for `CommitGraph::init`'s
+        // genesis-cache seed; we clear that cache and write our own legacy rows.
+        crate::db::manifest::seed_manifest_for_v3_fixture(uri)
+            .await
+            .unwrap();
+        let mut cg = CommitGraph::init(uri).await.unwrap();
+        cg.commit_by_id.clear();
+        cg.head_commit = None;
+
+        // Main lineage: genesis → A (authored). The actor lands in the FLAT
+        // `_graph_commit_actors.lance` (never branched).
+        let genesis = cg
+            .append_commit_with_parents(None, 1, None, None, None)
+            .await
+            .unwrap();
+        let commit_a = cg
+            .append_commit_with_parents(None, 2, Some(&genesis), None, Some("act-a"))
+            .await
+            .unwrap();
+
+        // Fork a real Lance branch on `_graph_commits.lance`, switch the handle
+        // to it, and append an authored branch commit (its actor also goes to
+        // the flat main actor table — exactly the pre-Phase-7 shape).
+        cg.create_branch("feature").await.unwrap();
+        cg.dataset = Some(
+            cg.dataset
+                .take()
+                .unwrap()
+                .checkout_branch("feature")
+                .await
+                .unwrap(),
+        );
+        cg.active_branch = Some("feature".to_string());
+        let branch_commit = cg
+            .append_commit_with_parents(
+                Some("feature"),
+                3,
+                Some(&commit_a),
+                None,
+                Some("act-branch"),
+            )
+            .await
+            .unwrap();
+
+        // The legacy read at the branch sees the inherited main commits + the
+        // branch commit, the head is the branch commit, and the authored actors
+        // resolve from the flat table (no branch checkout on the actor dataset).
+        let (commits, head) = read_legacy_commit_cache(uri, Some("feature")).await.unwrap();
+        assert_eq!(commits.len(), 3, "branch inherits genesis + A + its own commit");
+        assert_eq!(
+            head.as_ref().unwrap().graph_commit_id,
+            branch_commit,
+            "the branch commit is the head"
+        );
+        assert_eq!(
+            commits.get(&commit_a).unwrap().actor_id.as_deref(),
+            Some("act-a"),
+            "main commit's actor resolves from the flat actor table",
+        );
+        assert_eq!(
+            commits.get(&branch_commit).unwrap().actor_id.as_deref(),
+            Some("act-branch"),
+            "branch commit's actor resolves from the flat actor table",
+        );
+    }
 
     #[test]
     fn load_commits_from_batches_returns_error_for_bad_schema() {
