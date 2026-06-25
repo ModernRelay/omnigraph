@@ -505,6 +505,11 @@ query delete_two_persons($first: String, $second: String) {
     delete Person where name = $second
 }
 
+query delete_overlapping_persons($name: String, $threshold: I32) {
+    delete Person where name = $name
+    delete Person where age > $threshold
+}
+
 query update_age_by_name($name: String, $age: I32) {
     update Person set { age: $age } where name = $name
 }
@@ -553,6 +558,53 @@ async fn mutation_rejects_mixed_insert_and_delete_at_parse_time() {
         "D₂ rejection must fire before any write",
     );
     assert_eq!(db.branch_list().await.unwrap(), vec!["main".to_string()]);
+}
+
+/// Overlapping delete predicates within one query must NOT double-count
+/// `affected_*`. Deletes stage (they no longer inline-commit), so both
+/// statements scan the same unchanged committed snapshot; counting each
+/// predicate independently over-reports when they overlap. The contract —
+/// matching the old inline path, where each delete committed before the next
+/// ran — is the DISTINCT count of rows removed (= what the combined
+/// `(p1) OR (p2)` staged delete actually removes).
+///
+/// Fixture: Alice(30), Bob(25), Charlie(35), Diana(28); Knows Alice→Bob,
+/// Alice→Charlie, Bob→Diana; WorksAt Alice→Acme, Bob→Globex. `name = "Alice"`
+/// ∪ `age > 29` = {Alice, Charlie} (2 distinct nodes); the combined cascade
+/// removes {Alice→Bob, Alice→Charlie, Alice→Acme} (3 distinct edges — Charlie
+/// adds none new). Buggy per-statement counting reports 3 nodes / 6 edges.
+#[tokio::test]
+async fn overlapping_delete_predicates_do_not_double_count_affected() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut db = init_and_load(&dir).await;
+
+    let r = db
+        .mutate(
+            "main",
+            STAGED_QUERIES,
+            "delete_overlapping_persons",
+            &mixed_params(&[("$name", "Alice")], &[("$threshold", 29)]),
+        )
+        .await
+        .expect("delete-only mutation must succeed");
+
+    assert_eq!(
+        r.affected_nodes, 2,
+        "distinct nodes removed are {{Alice, Charlie}}; overlapping predicates must not double-count",
+    );
+    assert_eq!(
+        r.affected_edges, 3,
+        "distinct edges removed are {{Alice→Bob, Alice→Charlie, Alice→Acme}}; cascade must not double-count",
+    );
+
+    // The data is correct regardless of the count: Bob + Diana remain.
+    assert_eq!(count_rows(&db, "node:Person").await, 2, "Bob and Diana remain");
+    assert_eq!(count_rows(&db, "edge:Knows").await, 1, "only Bob→Diana remains");
+    assert_eq!(
+        count_rows(&db, "edge:WorksAt").await,
+        1,
+        "only Bob→Globex remains",
+    );
 }
 
 /// `insert Person 'X'; update Person where name='X' set age=...` — both
