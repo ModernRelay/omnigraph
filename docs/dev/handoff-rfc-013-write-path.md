@@ -28,7 +28,9 @@ for the canonical list. Current reality:
 
 **Open PRs (land these; relationships in §7):**
 - **#296** `correctness-by-design-fix` — recovery roll-forward converges on a concurrent
-  manifest advance (this is the fix for the flaky `iss-schema-apply-reopen-recovery-race`).
+  manifest advance (the fix for the flaky `iss-schema-apply-reopen-recovery-race`).
+  **MERGED to main and integrated into this branch** — the converge helper now threads
+  Phase-7's manifest-CAS recovery `graph_commit_id` (see `converge_or_defer_roll_forward`).
 - **#295** `docs/rfc-013-step-3b` — the step-3b RFC doc.
 - **#254** `ragnorc/bug-4-schema-apply-occ` — schema-apply vs optimize false-fail
   (same op-class family as #297, logical side).
@@ -379,11 +381,13 @@ for #298** (which built none of those constructs) but are **load-bearing constra
   step 3b stacks on it.
 - **#254** — logical-class fix (schema-apply vs optimize false-fail). Same op-class family;
   both are de-risking inputs for Design A's per-class commit models.
-- **#296** — recovery roll-forward converges on concurrent manifest advance. This is the fix
-  for the flaky `iss-schema-apply-reopen-recovery-race` (the handoff in
-  `handoff-schema-apply-recovery-flake.md`). It touches `recovery.rs` and is *aligned* with
-  #297's "postcondition is the state, not winning the CAS" principle — reconcile the monotonic
-  publish with #296's converge helper if #296 lands first.
+- **#296** — recovery roll-forward converges on concurrent manifest advance. The fix
+  for the flaky `iss-schema-apply-reopen-recovery-race`. It touches `recovery.rs` and is
+  *aligned* with #297's "postcondition is the state, not winning the CAS" principle. **#296
+  landed on main first and is merged into this branch:** the converge helper
+  (`converge_or_defer_roll_forward`) was reconciled with Phase-7's manifest-CAS roll-forward —
+  on convergence the audit references the winner's folded `graph_commit_id` (the current
+  `graph_head`), not a freshly minted one.
 - **#295** — the step-3b RFC doc (apply §4's three corrections to it).
 
 ---

@@ -317,7 +317,7 @@ impl Omnigraph {
             {
                 return Err(OmniError::AlreadyInitialized { uri: root.clone() });
             }
-            if let Err(err) = crate::failpoints::maybe_fail("init.after_schema_pg_written") {
+            if let Err(err) = crate::failpoints::maybe_fail(crate::failpoints::names::INIT_AFTER_SCHEMA_PG_WRITTEN) {
                 best_effort_cleanup_init_artifacts(&root, storage.as_ref()).await;
                 return Err(err);
             }
@@ -1455,7 +1455,7 @@ impl Omnigraph {
 
         for (table_key, table_path) in cleanup_targets {
             let dataset_uri = self.storage().dataset_uri(&table_path);
-            let outcome = match crate::failpoints::maybe_fail("branch_delete.before_table_cleanup")
+            let outcome = match crate::failpoints::maybe_fail(crate::failpoints::names::BRANCH_DELETE_BEFORE_TABLE_CLEANUP)
             {
                 Ok(()) => {
                     self.storage()
@@ -2021,14 +2021,14 @@ async fn init_storage_phase(
     if write_schema_pg {
         let schema_path = join_uri(root, SCHEMA_SOURCE_FILENAME);
         storage.write_text(&schema_path, schema_source).await?;
-        crate::failpoints::maybe_fail("init.after_schema_pg_written")?;
+        crate::failpoints::maybe_fail(crate::failpoints::names::INIT_AFTER_SCHEMA_PG_WRITTEN)?;
     }
 
     write_schema_contract(root, storage.as_ref(), schema_ir).await?;
-    crate::failpoints::maybe_fail("init.after_schema_contract_written")?;
+    crate::failpoints::maybe_fail(crate::failpoints::names::INIT_AFTER_SCHEMA_CONTRACT_WRITTEN)?;
 
     let coordinator = GraphCoordinator::init(root, catalog, Arc::clone(storage)).await?;
-    crate::failpoints::maybe_fail("init.after_coordinator_init")?;
+    crate::failpoints::maybe_fail(crate::failpoints::names::INIT_AFTER_COORDINATOR_INIT)?;
 
     Ok(coordinator)
 }

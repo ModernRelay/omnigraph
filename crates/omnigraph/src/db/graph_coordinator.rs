@@ -261,7 +261,7 @@ impl GraphCoordinator {
     /// fresh, so any existing commit-graph branch with this name is provably
     /// orphaned and is force-dropped before recreating.
     async fn create_commit_graph_branch(&mut self, branch: &str) -> Result<()> {
-        failpoints::maybe_fail("branch_create.after_manifest_branch_create")?;
+        failpoints::maybe_fail(crate::failpoints::names::BRANCH_CREATE_AFTER_MANIFEST_BRANCH_CREATE)?;
         let Some(commit_graph) = &mut self.commit_graph else {
             return Ok(());
         };
@@ -310,7 +310,7 @@ impl GraphCoordinator {
     /// Best-effort, idempotent reclaim of the commit-graph branch `branch`.
     /// Tolerates an absent commit-graph dataset (a graph that never committed).
     async fn reclaim_commit_graph_branch(&mut self, branch: &str) -> Result<()> {
-        failpoints::maybe_fail("branch_delete.before_commit_graph_reclaim")?;
+        failpoints::maybe_fail(crate::failpoints::names::BRANCH_DELETE_BEFORE_COMMIT_GRAPH_RECLAIM)?;
         if let Some(commit_graph) = &mut self.commit_graph {
             commit_graph.force_delete_branch(branch).await
         } else if self
@@ -505,12 +505,12 @@ impl GraphCoordinator {
     ) -> Result<PublishedSnapshot> {
         self.ensure_commit_graph_initialized().await?;
         let intent = self.new_lineage_intent(actor_id, None)?;
-        failpoints::maybe_fail("graph_publish.before_commit_append")?;
+        failpoints::maybe_fail(crate::failpoints::names::GRAPH_PUBLISH_BEFORE_COMMIT_APPEND)?;
         let outcome = self
             .manifest
             .commit_changes_with_lineage(changes, expected_table_versions, Some(&intent))
             .await?;
-        failpoints::maybe_fail("graph_publish.after_manifest_commit")?;
+        failpoints::maybe_fail(crate::failpoints::names::GRAPH_PUBLISH_AFTER_MANIFEST_COMMIT)?;
         let snapshot_id = self.apply_lineage_to_cache(intent, &outcome);
         Ok(PublishedSnapshot {
             manifest_version: outcome.version,
@@ -533,13 +533,13 @@ impl GraphCoordinator {
         self.ensure_commit_graph_initialized().await?;
         let intent =
             self.new_lineage_intent(actor_id, Some(merged_parent_commit_id.to_string()))?;
-        failpoints::maybe_fail("graph_publish.before_commit_append")?;
+        failpoints::maybe_fail(crate::failpoints::names::GRAPH_PUBLISH_BEFORE_COMMIT_APPEND)?;
         let changes = updates_to_changes(updates);
         let outcome = self
             .manifest
             .commit_changes_with_lineage(&changes, &HashMap::new(), Some(&intent))
             .await?;
-        failpoints::maybe_fail("graph_publish.after_manifest_commit")?;
+        failpoints::maybe_fail(crate::failpoints::names::GRAPH_PUBLISH_AFTER_MANIFEST_COMMIT)?;
         Ok(self.apply_lineage_to_cache(intent, &outcome))
     }
 

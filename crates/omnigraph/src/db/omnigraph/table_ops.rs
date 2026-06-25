@@ -296,7 +296,7 @@ pub(super) async fn ensure_indices_for_branch(
     // (one commit_staged per index built) but the manifest publish below
     // hasn't run. Used by
     // `tests/failpoints.rs::ensure_indices_phase_b_failure_recovered_on_next_open`.
-    crate::failpoints::maybe_fail("ensure_indices.post_phase_b_pre_manifest_commit")?;
+    crate::failpoints::maybe_fail(crate::failpoints::names::ENSURE_INDICES_POST_PHASE_B_PRE_MANIFEST_COMMIT)?;
 
     if !updates.is_empty() {
         commit_prepared_updates_on_branch(db, branch, &updates, None).await?;
@@ -671,7 +671,7 @@ pub(super) async fn open_owned_dataset_for_branch_write(
             Ok((ds, Some(active_branch.to_string())))
         }
         source_branch => {
-            crate::failpoints::maybe_fail("fork.before_classify")?;
+            crate::failpoints::maybe_fail(crate::failpoints::names::FORK_BEFORE_CLASSIFY)?;
             // Authority check before forking: re-read the live manifest. If this
             // table is already forked on active_branch, a concurrent first-write
             // won the race and our snapshot is stale — that is a retryable
@@ -767,7 +767,7 @@ pub(crate) async fn classify_fork_ref(
     // fresh-authority read (no-op without the `failpoints` feature). Lets a
     // test exercise the Indeterminate path — a read failure on a live branch
     // must classify as Indeterminate (skip), never Orphan (destroy).
-    let fresh = match crate::failpoints::maybe_fail("classify.fresh_read") {
+    let fresh = match crate::failpoints::maybe_fail(crate::failpoints::names::CLASSIFY_FRESH_READ) {
         Ok(()) => db.fresh_snapshot_for_branch(Some(branch)).await,
         Err(injected) => Err(injected),
     };
@@ -851,7 +851,7 @@ pub(super) async fn reclaim_orphaned_fork_and_refork(
         }
     }
 
-    crate::failpoints::maybe_fail("fork.before_reclaim")?;
+    crate::failpoints::maybe_fail(crate::failpoints::names::FORK_BEFORE_RECLAIM)?;
     db.storage()
         .force_delete_branch(full_path, active_branch)
         .await
@@ -1114,7 +1114,7 @@ async fn stage_and_commit_btree(
     // to demonstrate that a stage-step failure in the staged-index
     // path (`stage_create_btree_index` succeeded; `commit_staged` not
     // yet called) leaves no Lance-HEAD drift on the touched table.
-    crate::failpoints::maybe_fail("ensure_indices.post_stage_pre_commit_btree")?;
+    crate::failpoints::maybe_fail(crate::failpoints::names::ENSURE_INDICES_POST_STAGE_PRE_COMMIT_BTREE)?;
     let new_ds = db
         .storage()
         .commit_staged(ds.clone(), staged)
