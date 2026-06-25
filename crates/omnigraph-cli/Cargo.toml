@@ -34,3 +34,5 @@ serde_json = { workspace = true }
 tempfile = { workspace = true }
 lance = { workspace = true }
 lance-index = { workspace = true }
+omnigraph-dst = { path = "../omnigraph-dst" }
+futures = { workspace = true }
