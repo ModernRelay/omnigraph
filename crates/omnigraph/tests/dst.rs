@@ -583,3 +583,51 @@ async fn run_walk(faults: bool) {
 }
 
 
+
+// ═══════════════════════════ D5 context: S3 (PR-D) ════════════════════════
+
+/// Build a unique `s3://` DST graph URI, or `None` when the bucket env is unset
+/// (skip locally; runs in CI's `rustfs_integration` job).
+fn s3_dst_uri() -> Option<String> {
+    let bucket = std::env::var("OMNIGRAPH_S3_TEST_BUCKET").ok()?;
+    let base = if bucket.starts_with("s3://") {
+        bucket
+    } else {
+        format!("s3://{bucket}")
+    };
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_nanos();
+    Some(format!(
+        "{}/dst-harness/{}-{}",
+        base.trim_end_matches('/'),
+        std::process::id(),
+        nanos
+    ))
+}
+
+/// D5 S3 context: the FULL white-box battery must hold on a real object-store
+/// backend, not just local FS. A short seeded op sequence builds state on
+/// `s3://`, then the battery runs (known bugs allow-listed, novel → fail).
+#[tokio::test(flavor = "multi_thread")]
+async fn s3_battery_holds() {
+    let Some(uri) = s3_dst_uri() else {
+        eprintln!("skipping s3 dst battery: OMNIGRAPH_S3_TEST_BUCKET unset");
+        return;
+    };
+    let db = backend::open_clean(&uri).await;
+    let mut rng = Rng::new(1);
+    let mut model = Model::new();
+    for _ in 0..8 {
+        let _ = op::step(&db, &mut rng, &mut model).await;
+    }
+    for (name, res) in run_battery(&db, &model).await {
+        if let Err(f) = res {
+            match classify(&f) {
+                Some(_bug) => {} // known open bug — allow-listed
+                None => panic!("s3: NOVEL battery violation [{name}]: {}", f.message()),
+            }
+        }
+    }
+}
