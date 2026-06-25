@@ -9,6 +9,7 @@
 
 pub mod changes;
 pub mod db;
+pub mod dst;
 pub mod embedding;
 pub mod error;
 mod exec;

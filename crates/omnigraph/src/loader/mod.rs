@@ -1177,7 +1177,7 @@ fn load_write_concurrency() -> usize {
 }
 
 fn generate_id() -> String {
-    ulid::Ulid::new().to_string()
+    crate::dst::next_ulid().to_string()
 }
 
 pub(crate) fn parse_date32_literal(value: &str) -> Result<i32> {

@@ -1,6 +1,5 @@
 use std::collections::{HashMap, VecDeque};
 use std::sync::Arc;
-use std::time::{SystemTime, UNIX_EPOCH};
 
 use arrow_array::{
     Array, RecordBatch, RecordBatchIterator, StringArray, TimestampMicrosecondArray, UInt64Array,
@@ -42,7 +41,7 @@ impl CommitGraph {
         let root = root_uri.trim_end_matches('/');
         let uri = graph_commits_uri(root);
         let genesis = GraphCommit {
-            graph_commit_id: ulid::Ulid::new().to_string(),
+            graph_commit_id: crate::dst::next_ulid().to_string(),
             manifest_branch: None,
             manifest_version,
             parent_commit_id: None,
@@ -259,7 +258,7 @@ impl CommitGraph {
         merged_parent_commit_id: Option<&str>,
         actor_id: Option<&str>,
     ) -> Result<String> {
-        let graph_commit_id = ulid::Ulid::new().to_string();
+        let graph_commit_id = crate::dst::next_ulid().to_string();
         let commit = GraphCommit {
             graph_commit_id: graph_commit_id.clone(),
             manifest_branch: manifest_branch.map(|s| s.to_string()),
@@ -695,10 +694,9 @@ async fn open_for_branch(root_uri: &str, branch: Option<&str>) -> Result<CommitG
 }
 
 fn now_micros() -> Result<i64> {
-    let duration = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map_err(|e| OmniError::manifest(format!("system clock before UNIX_EPOCH: {}", e)))?;
-    Ok(duration.as_micros() as i64)
+    // Routed through the DST seam (deterministic under the `dst` feature; the
+    // real clock otherwise). Covers all commit-graph timestamp callers.
+    Ok(crate::dst::now_micros())
 }
 
 #[cfg(test)]

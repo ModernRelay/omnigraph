@@ -581,3 +581,59 @@ async fn run_walk(faults: bool) {
 }
 
 
+
+// ═══════════════════════════ determinism (PR-C) ═══════════════════════════
+
+/// Replay-equality oracle (feature `dst`): the same seeded clean op sequence,
+/// run twice under the same DST seed, must mint the IDENTICAL engine id/clock
+/// fingerprint AND produce the identical outcome — a determinism tripwire (green
+/// while the engine is reproducible, red the moment non-determinism leaks into
+/// the id/timestamp seam). Uses insert/read only (no optimize/delete), so
+/// neither the Lance FTS-builder non-determinism nor RC-1 perturbs the
+/// comparison; the engine still mints a commit id + timestamp per load, so the
+/// seam IS exercised. A different seed must diverge (proves seed-sensitivity).
+#[cfg(feature = "dst")]
+#[tokio::test]
+async fn replay_equality_same_seed() {
+    async fn run(seed: u64) -> (usize, usize) {
+        let dir = tempfile::tempdir().unwrap();
+        let db = backend::open_clean(dir.path().to_str().unwrap()).await;
+        let mut rng = Rng::new(seed);
+        let (mut np, mut nd) = (0usize, 0usize);
+        for i in 0..15 {
+            match rng.below(3) {
+                0 => {
+                    load_jsonl(&db, &person(&format!("p{i}")), LoadMode::Merge)
+                        .await
+                        .unwrap();
+                    np += 1;
+                }
+                1 => {
+                    load_jsonl(&db, &doc(&format!("d{i}"), "whatsapp"), LoadMode::Merge)
+                        .await
+                        .unwrap();
+                    nd += 1;
+                }
+                _ => {
+                    let _ = db
+                        .query(
+                            ReadTarget::branch("main"),
+                            "query q() { match { $x: Person } return { $x.slug } }",
+                            "q",
+                            &ParamMap::new(),
+                        )
+                        .await;
+                }
+            }
+        }
+        (np, nd)
+    }
+
+    let (out1, fp1) = omnigraph::dst::with_seed(7, run(7)).await;
+    let (out2, fp2) = omnigraph::dst::with_seed(7, run(7)).await;
+    assert_eq!(fp1, fp2, "engine id/clock fingerprint must match for the same seed");
+    assert_eq!(out1, out2, "harness outcome must match for the same seed");
+
+    let (_out3, fp3) = omnigraph::dst::with_seed(99, run(99)).await;
+    assert_ne!(fp1, fp3, "different seeds should yield different fingerprints");
+}

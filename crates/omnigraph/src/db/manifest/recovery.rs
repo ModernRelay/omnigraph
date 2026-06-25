@@ -1920,12 +1920,9 @@ pub(crate) fn new_sidecar(
     actor_id: Option<String>,
     tables: Vec<SidecarTablePin>,
 ) -> RecoverySidecar {
-    use std::time::{SystemTime, UNIX_EPOCH};
-    let operation_id = ulid::Ulid::new().to_string();
-    let started_at = match SystemTime::now().duration_since(UNIX_EPOCH) {
-        Ok(d) => format!("{}", d.as_micros()),
-        Err(_) => "0".to_string(),
-    };
+    let operation_id = crate::dst::next_ulid().to_string();
+    // Routed through the DST seam (deterministic under the `dst` feature).
+    let started_at = format!("{}", crate::dst::now_micros());
     RecoverySidecar {
         schema_version: SIDECAR_SCHEMA_VERSION,
         operation_id,

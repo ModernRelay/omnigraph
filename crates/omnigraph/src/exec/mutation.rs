@@ -1086,7 +1086,7 @@ impl Omnigraph {
                     }
                 }
             } else {
-                ulid::Ulid::new().to_string()
+                crate::dst::next_ulid().to_string()
             };
 
             let batch = build_insert_batch(&schema, &id, &resolved, &blob_props)?;
@@ -1132,7 +1132,7 @@ impl Omnigraph {
             let edge_type = &self.catalog().edge_types[type_name];
             let schema = edge_type.arrow_schema.clone();
             let blob_props = edge_type.blob_properties.clone();
-            let id = ulid::Ulid::new().to_string();
+            let id = crate::dst::next_ulid().to_string();
 
             let batch = build_insert_batch(&schema, &id, &resolved, &blob_props)?;
             validate_edge_insert_endpoints(self, staging, branch, type_name, &resolved).await?;
