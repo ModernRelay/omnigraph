@@ -57,8 +57,9 @@ graph id from the cluster's applied revision:
 | POST | `/graphs/{id}/export` | bearer + `export` | NDJSON stream |
 | POST | `/graphs/{id}/mutate` | bearer + `change` | mutation (canonical; `query`/`name`; accepts legacy `query_source`/`query_name` as serde aliases) |
 | POST | `/graphs/{id}/change` | bearer + `change` | **deprecated** alias of `/mutate` (carries `Deprecation: true` + `Link: <mutate>; rel="successor-version"`) |
-| GET | `/graphs/{id}/queries` | bearer + `read` | list the graph's stored queries as a typed tool catalog |
+| GET | `/graphs/{id}/queries` | bearer + `invoke_query` | list the exposed (`@mcp(expose)`) stored queries as a typed tool catalog |
 | POST | `/graphs/{id}/queries/{name}` | bearer + `invoke_query` (+ `change` for a stored mutation) | invoke a named query from the `queries:` registry; deny == 404 |
+| POST | `/graphs/{id}/mcp` | bearer + same per-tool Cedar gate | MCP (Model Context Protocol) surface — built-ins + stored queries as tools, schema/branches as resources (see [mcp.md](mcp.md)) |
 | GET | `/graphs/{id}/schema` | bearer + `read` | get current `.pg` source |
 | POST | `/graphs/{id}/schema/apply` | bearer + `schema_apply` (target=`main`) | disabled for cluster-backed serving; returns 409 and points operators at `omnigraph cluster apply` + restart |
 | POST | `/graphs/{id}/load` | bearer + `branch_create` (only when `from` is set and the branch is created) + `change` | bulk load (canonical); branch creation is opt-in via `from` — without it a missing `branch` is a 404, never an implicit fork (32 MB body limit) |
@@ -83,11 +84,10 @@ Server-level management endpoints:
 
 ### Stored-query catalog (`GET /queries`)
 
-List the graph's stored queries as a typed tool catalog — enough for a client (e.g. an MCP server) to register each as a tool without fetching `.gq` source. Each entry: `{ name, tool_name, description, instruction, mutation, params }`, where each param is `{ name, kind, item_kind?, vector_dim?, nullable }`. `kind` is one of `string | bool | int | bigint | float | date | datetime | blob | vector | list` (decomposed so a consumer maps it with a closed `switch`, never re-parsing GQ type spelling). `bigint` (I64/U64), `date`, `datetime`, and `blob` are carried as JSON **strings** — a 64-bit integer loses precision as a JSON number, dates are ISO strings, and a blob is a URI string.
+List the graph's **exposed** (`@mcp(expose: true)`) stored queries as a typed tool catalog — enough for a client to register each as a tool without fetching `.gq` source. (The server also projects these queries as live MCP tools at `POST /graphs/{id}/mcp` — see [mcp.md](mcp.md); this catalog endpoint is the REST view of the same registry.) Each entry: `{ name, tool_name, description, instruction, mutation, params }`, where each param is `{ name, kind, item_kind?, vector_dim?, nullable, description? }`. `kind` is one of `string | bool | int | bigint | float | date | datetime | blob | vector | list` (decomposed so a consumer maps it with a closed `switch`, never re-parsing GQ type spelling). `bigint` (I64/U64), `date`, `datetime`, and `blob` are carried as JSON **strings** — a 64-bit integer loses precision as a JSON number, dates are ISO strings, and a blob is a URI string.
 
-- **Read-gated** (works in default-deny mode). The catalog is **graph-wide** (branch-independent; `read` is authorized against `main`).
-- **Every stored query in the applied registry is listed.** Cluster-served graphs have no per-query expose flag today — every query in the cluster `queries:` registry appears in the catalog. (Per-query exposure may become a Cedar-policy decision in a later release; see [cluster-config](../clusters/config.md).)
-- **Not Cedar-filtered per query (yet).** A caller with `read` but not `invoke_query` can *list* a query they can't *invoke* (which would 404). Closing that gap is future per-query authorization; for now the catalog is a discovery surface and `invoke_query` remains the invocation gate.
+- **`invoke_query`-gated** (graph-scoped) — the same authority as invocation (`POST /queries/{name}`) and the MCP `tools/list` surface, so a caller that can list the catalog can invoke from it. Requires an explicit `invoke_query` grant; in default-deny mode (tokens, no policy) it returns 403.
+- **Exposure is set per-query in the `.gq` source** via `@mcp(expose: false)` (default exposed; see [queries/index.md](../queries/index.md#annotations) and [mcp.md](mcp.md)). An unexposed query stays HTTP/service-callable by name but is absent from this catalog and the MCP tool surface.
 
 ### Stored-query invocation (`POST /queries/{name}`)
 
@@ -97,6 +97,22 @@ Invoke a curated, server-side stored query by **name** — the source comes from
 - **Deny == unknown, for callers without `invoke_query`:** for a caller lacking the grant, an `invoke_query` denial and an unknown query name return the **same `404`** (identical body), so the catalog can't be probed. A caller that *holds* `invoke_query` may still get the inner gate's `403` for an existing query it can't `read`/`change` (the double-gate, above) — so existence is visible to grant-holders by design.
 - **Requires an explicit policy grant when auth is on.** In default-deny mode (bearer tokens but no `policy.file`), only `read` is permitted, so *every* `/queries/{name}` call returns `404` until an `invoke_query` rule is configured.
 - A stored mutation cannot target a `snapshot` (`400`); a parameter type error is a structured `400` naming the parameter.
+
+## MCP surface (`POST /graphs/{id}/mcp`)
+
+Each served graph is also an MCP (Model Context Protocol) server at
+`POST /graphs/{id}/mcp` — a stateless Streamable-HTTP transport that projects the
+built-in operations and the graph's stored-query registry as MCP **tools**, and
+the schema / branch list as MCP **resources**. It adds no new capability: every
+tool delegates to the same engine/handler path the REST routes use and is gated
+by the same Cedar policy (resolved from the same bearer token). `tools/list` is a
+*relaxation* of the per-call gate — a tool callable on some branch is never
+hidden, while the per-call gate stays authoritative. Served automatically by the
+cluster server; no separate flag.
+
+Full client guide — connecting, the tool catalog, projection modes, structured
+output, Host/Origin policy, and the protocol-version contract — is in
+[mcp.md](mcp.md).
 
 ## Adding and removing graphs
 

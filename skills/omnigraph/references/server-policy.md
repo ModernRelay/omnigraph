@@ -7,6 +7,7 @@
 - Setup operations bypass the server
 - Cedar policy
 - Multi-graph mode
+- MCP surface
 - Server + policy together
 - Cluster-booted servers
 
@@ -36,7 +37,8 @@ All per-graph routes are nested under `/graphs/{id}/...` (`{id}` = a graph id fr
 | `POST /graphs/{id}/mutate` | mutation (`/change` = deprecated alias) |
 | `POST /graphs/{id}/load` | bulk JSONL load, 32 MB; branch creation opt-in via `from` (`/ingest` = deprecated alias) |
 | `POST /graphs/{id}/export` | NDJSON stream of a branch |
-| `GET /graphs/{id}/queries` · `POST /graphs/{id}/queries/{name}` | stored-query catalog (`read`) + invocation (`invoke_query`, +`change` for a stored mutation; deny == 404) |
+| `GET /graphs/{id}/queries` · `POST /graphs/{id}/queries/{name}` | stored-query catalog + invocation, both `invoke_query`-gated (+`change` for a stored mutation; invocation deny == 404) |
+| `POST /graphs/{id}/mcp` | MCP surface — built-ins + stored queries as tools, schema/branches as resources (same per-tool Cedar gate; see *MCP surface* below) |
 | `GET /graphs/{id}/schema` · `POST /graphs/{id}/schema/apply` | read `.pg` · migrate (`schema_apply`) |
 | `GET/POST /graphs/{id}/branches` · `DELETE …/branches/{b}` · `POST …/branches/merge` | branch ops |
 | `GET /graphs/{id}/commits?branch=` · `…/commits/{commit_id}` | history |
@@ -209,6 +211,12 @@ Policy attaches at two levels via `cluster.yaml` `applies_to`:
 - `[cluster]` — server-level rules (`graph_list`).
 
 There is no runtime add/remove of graphs — edit `cluster.yaml`, `cluster apply`, restart.
+
+## MCP surface
+
+Since **v0.8.0**, every served graph is also an MCP server at `POST /graphs/{id}/mcp`, mounted automatically by the `--cluster` server (no extra flag): built-ins + stored queries as tools, schema/branches as resources, same bearer + Cedar gate as the REST routes. Two things to know here: `tools/list` is a *relaxation* of the per-call gate (a tool callable on some branch is never hidden; the per-call gate stays authoritative), and stored-query discovery/invocation share the `invoke_query` gate (a non-holder gets an unknown-tool mask).
+
+Full guide — connecting an agent, the tool catalog + projection modes, `@mcp(...)` authoring, the presentation-vs-authorization split, and the Host/Origin + protocol-version contracts — is in [`mcp.md`](mcp.md).
 
 ## Server + Policy Together
 

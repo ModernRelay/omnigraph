@@ -63,6 +63,64 @@ return { $p.name }
 }
 
 #[test]
+fn test_parse_param_description() {
+    let input = r#"
+query find(@description("the user's slug") $slug: String, $limit: I32?) {
+match {
+    $u: User { slug: $slug }
+}
+return { $u.name }
+}
+"#;
+    let qf = parse_query(input).unwrap();
+    let q = &qf.queries[0];
+    assert_eq!(q.params.len(), 2);
+    // Annotated param keeps its name/type and gains the doc.
+    assert_eq!(q.params[0].name, "slug");
+    assert_eq!(q.params[0].type_name, "String");
+    assert!(!q.params[0].nullable);
+    assert_eq!(q.params[0].description.as_deref(), Some("the user's slug"));
+    // Un-annotated param: no description, nullable preserved (annotation slot
+    // sits before the variable, so it composes with the trailing `?`).
+    assert_eq!(q.params[1].name, "limit");
+    assert!(q.params[1].nullable);
+    assert_eq!(q.params[1].description, None);
+}
+
+#[test]
+fn test_parse_mcp_annotation() {
+    // Either argument order parses; expose + tool_name both captured.
+    for input in [
+        r#"query q() @mcp(tool_name: "lookup", expose: false) { match { $p: Person } return { $p.name } }"#,
+        r#"query q() @mcp(expose: false, tool_name: "lookup") { match { $p: Person } return { $p.name } }"#,
+    ] {
+        let qf = parse_query(input).unwrap();
+        let q = &qf.queries[0];
+        assert_eq!(q.mcp.tool_name.as_deref(), Some("lookup"), "input: {input}");
+        assert_eq!(q.mcp.expose, Some(false), "input: {input}");
+    }
+
+    // Absent @mcp ⇒ both None (exposed-by-default, name as tool name).
+    let bare = parse_query(r#"query q() { match { $p: Person } return { $p.name } }"#).unwrap();
+    assert_eq!(bare.queries[0].mcp.tool_name, None);
+    assert_eq!(bare.queries[0].mcp.expose, None);
+}
+
+#[test]
+fn test_duplicate_mcp_annotation_is_rejected() {
+    let dup_block = r#"query q() @mcp(expose: true) @mcp(expose: false) { match { $p: Person } return { $p.name } }"#;
+    assert!(
+        parse_query(dup_block).unwrap_err().to_string().contains("duplicate @mcp"),
+        "two @mcp annotations must be rejected"
+    );
+    let dup_key = r#"query q() @mcp(expose: true, expose: false) { match { $p: Person } return { $p.name } }"#;
+    assert!(
+        parse_query(dup_key).unwrap_err().to_string().contains("duplicate `expose`"),
+        "a repeated @mcp key must be rejected"
+    );
+}
+
+#[test]
 fn test_parse_no_params() {
     let input = r#"
 query adults() {

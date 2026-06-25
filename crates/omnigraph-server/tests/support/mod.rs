@@ -142,14 +142,24 @@ pub fn graph_path(root: &Path) -> PathBuf {
 }
 
 pub fn stored_query_registry(specs: &[(&str, &str, bool)]) -> QueryRegistry {
+    // MCP `expose` now lives in the `.gq` source `@mcp(...)` annotation. The
+    // `(name, source, expose)` tuple stays for ergonomics: when `expose` is
+    // false, inject `@mcp(expose: false)` between the param-list `)` and the
+    // body `{` (the first `{` in a query source is always the body open), so
+    // the real parse path is exercised.
     QueryRegistry::from_specs(
         specs
             .iter()
-            .map(|(name, source, expose)| RegistrySpec {
-                name: name.to_string(),
-                source: source.to_string(),
-                expose: *expose,
-                tool_name: None,
+            .map(|(name, source, expose)| {
+                let source = if *expose {
+                    source.to_string()
+                } else {
+                    match source.find('{') {
+                        Some(i) => format!("{}@mcp(expose: false) {}", &source[..i], &source[i..]),
+                        None => source.to_string(),
+                    }
+                };
+                RegistrySpec { name: name.to_string(), source }
             })
             .collect(),
     )
@@ -349,6 +359,10 @@ rules:
       actors: {{ group: permitted }}
       actions: [schema_apply, branch_create, branch_delete, branch_merge]
       target_branch_scope: any
+  - id: permit-invoke
+    allow:
+      actors: {{ group: permitted }}
+      actions: [invoke_query]
 "#
     )
 }

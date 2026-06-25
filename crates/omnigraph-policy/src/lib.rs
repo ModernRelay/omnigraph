@@ -6,7 +6,7 @@ use std::str::FromStr;
 
 use cedar_policy::{
     Authorizer, Context, Decision, Entities, Entity, EntityId, EntityTypeName, EntityUid, Policy,
-    PolicyId, PolicySet, Request, Schema, ValidationMode, Validator,
+    PolicyId, PolicySet, Request, Response, Schema, ValidationMode, Validator,
 };
 use clap::ValueEnum;
 use color_eyre::eyre::{Result, bail, eyre};
@@ -506,6 +506,80 @@ impl PolicyEngine {
     /// the "server-authoritative actor identity" invariant — clients
     /// supplying a `PolicyRequest` cannot smuggle identity through the
     /// same struct that carries the requested action.
+    /// Evaluate one Cedar request for `actor_id` performing `action` in the
+    /// given branch `context`, returning the raw decision response. The single
+    /// Cedar entry point shared by [`Self::authorize`] (per-call gate) and
+    /// [`Self::permits_on_any_branch`] (list-time capability probe) — there is
+    /// no second matching implementation that could drift from the policy set.
+    fn evaluate(&self, actor_id: &str, action: PolicyAction, context: serde_json::Value) -> Result<Response> {
+        let principal = entity_uid("Actor", actor_id)?;
+        let action_uid = entity_uid("Action", action.as_str())?;
+        // Pick the resource entity based on the action's `resource_kind`.
+        // Server-scoped actions (`graph_list`) bind to
+        // `Omnigraph::Server::"root"`; per-graph actions bind to
+        // `Omnigraph::Graph::"<graph_label>"`.
+        let resource = match action.resource_kind() {
+            PolicyResourceKind::Server => entity_uid("Server", SERVER_RESOURCE_ID)?,
+            PolicyResourceKind::Graph => entity_uid("Graph", &self.graph_id)?,
+        };
+        let context = Context::from_json_value(context, Some((&self.schema, &action_uid)))?;
+        let cedar_request = Request::new(principal, action_uid, resource, context, Some(&self.schema))?;
+        let response =
+            Authorizer::new().is_authorized(&cedar_request, &self.policies, &self.entities);
+        let errors = response
+            .diagnostics()
+            .errors()
+            .map(|err| err.to_string())
+            .collect::<Vec<_>>();
+        if !errors.is_empty() {
+            bail!("policy evaluation failed:\n{}", errors.join("\n"));
+        }
+        Ok(response)
+    }
+
+    /// List-time capability probe: could `action` be permitted for `actor_id` on
+    /// **any** branch the per-call gate might be invoked with? Enumerates the
+    /// branch-shape space (omitted / protected / unprotected, on whichever of
+    /// `branch`/`target_branch` the action scopes on) through [`Self::evaluate`]
+    /// and returns true if any is allowed.
+    ///
+    /// This makes `tools/list` a faithful *relaxation* of the per-call gate: it
+    /// never hides a tool the caller could invoke on some branch (over-showing
+    /// is safe — the per-call gate is authoritative), while still hiding a tool
+    /// the actor has no grant for. It deliberately does not fabricate a single
+    /// branch name (which under a "write unprotected branches" policy answers
+    /// the wrong question — a `change` request with no branch, or on protected
+    /// `main`, is denied, yet the actor can write feature branches).
+    pub fn permits_on_any_branch(&self, actor_id: &str, action: PolicyAction) -> Result<bool> {
+        if !self.known_actors.contains(actor_id) {
+            return Ok(false);
+        }
+        // The compiled branch/target scope conditions depend only on
+        // (`has_*`, `*_is_protected`), so these shapes span every distinguishable
+        // request. `branch`/`target_branch` string values are unread by any rule.
+        let shapes: Vec<serde_json::Value> = if action.uses_branch_scope() {
+            vec![
+                branch_context(false, "", false, false, "", false),
+                branch_context(true, "p", true, false, "", false),
+                branch_context(true, "u", false, false, "", false),
+            ]
+        } else if action.uses_target_branch_scope() {
+            vec![
+                branch_context(false, "", false, true, "p", true),
+                branch_context(false, "", false, true, "u", false),
+            ]
+        } else {
+            // Graph-scoped action (no branch dimension): one evaluation suffices.
+            vec![branch_context(false, "", false, false, "", false)]
+        };
+        for context in shapes {
+            if matches!(self.evaluate(actor_id, action, context)?.decision(), Decision::Allow) {
+                return Ok(true);
+            }
+        }
+        Ok(false)
+    }
+
     pub fn authorize(&self, actor_id: &str, request: &PolicyRequest) -> Result<PolicyDecision> {
         if !self.known_actors.contains(actor_id) {
             return Ok(self.deny(
@@ -517,36 +591,15 @@ impl PolicyEngine {
             ));
         }
 
-        let principal = entity_uid("Actor", actor_id)?;
-        let action = entity_uid("Action", request.action.as_str())?;
-        // Pick the resource entity based on the action's `resource_kind`.
-        // Server-scoped actions (`graph_list`) bind to
-        // `Omnigraph::Server::"root"`; per-graph actions bind to
-        // `Omnigraph::Graph::"<graph_label>"`.
-        let resource = match request.action.resource_kind() {
-            PolicyResourceKind::Server => entity_uid("Server", SERVER_RESOURCE_ID)?,
-            PolicyResourceKind::Graph => entity_uid("Graph", &self.graph_id)?,
-        };
-        let context_value = json!({
-            "has_branch": request.branch.is_some(),
-            "branch": request.branch.clone().unwrap_or_default(),
-            "has_target_branch": request.target_branch.is_some(),
-            "target_branch": request.target_branch.clone().unwrap_or_default(),
-            "branch_is_protected": request.branch.as_ref().is_some_and(|branch| self.protected_branches.contains(branch)),
-            "target_branch_is_protected": request.target_branch.as_ref().is_some_and(|branch| self.protected_branches.contains(branch)),
-        });
-        let context = Context::from_json_value(context_value, Some((&self.schema, &action)))?;
-        let cedar_request = Request::new(principal, action, resource, context, Some(&self.schema))?;
-        let response =
-            Authorizer::new().is_authorized(&cedar_request, &self.policies, &self.entities);
-        let errors = response
-            .diagnostics()
-            .errors()
-            .map(|err| err.to_string())
-            .collect::<Vec<_>>();
-        if !errors.is_empty() {
-            bail!("policy evaluation failed:\n{}", errors.join("\n"));
-        }
+        let context = branch_context(
+            request.branch.is_some(),
+            request.branch.as_deref().unwrap_or_default(),
+            request.branch.as_ref().is_some_and(|branch| self.protected_branches.contains(branch)),
+            request.target_branch.is_some(),
+            request.target_branch.as_deref().unwrap_or_default(),
+            request.target_branch.as_ref().is_some_and(|branch| self.protected_branches.contains(branch)),
+        );
+        let response = self.evaluate(actor_id, request.action, context)?;
 
         let matched_rule_id = response
             .diagnostics()
@@ -788,6 +841,28 @@ fn compile_policy_source(rule: &PolicyRule, action: &PolicyAction, graph_id: &st
         when = when,
         resource_literal = resource_literal,
     )
+}
+
+/// Build the Cedar request context from the branch/target dimensions. The
+/// single shape used by both the per-call gate ([`PolicyEngine::authorize`])
+/// and the list-time capability probe ([`PolicyEngine::permits_on_any_branch`]),
+/// so both feed the policy set an identically-structured context.
+fn branch_context(
+    has_branch: bool,
+    branch: &str,
+    branch_is_protected: bool,
+    has_target_branch: bool,
+    target_branch: &str,
+    target_branch_is_protected: bool,
+) -> serde_json::Value {
+    json!({
+        "has_branch": has_branch,
+        "branch": branch,
+        "has_target_branch": has_target_branch,
+        "target_branch": target_branch,
+        "branch_is_protected": branch_is_protected,
+        "target_branch_is_protected": target_branch_is_protected,
+    })
 }
 
 fn branch_scope_condition(scope: PolicyBranchScope) -> String {
@@ -1198,6 +1273,65 @@ rules:
             .unwrap();
         assert!(admin.allowed);
         assert_eq!(admin.matched_rule_id.as_deref(), Some("admins-promote"));
+    }
+
+    #[test]
+    fn permits_on_any_branch_reports_capability_not_a_fabricated_branch() {
+        // The canonical "protected main, write unprotected branches" policy.
+        let policy: PolicyConfig = serde_yaml::from_str(
+            r#"
+version: 1
+groups:
+  writers: [act-writer]
+  readers: [act-reader]
+protected_branches: [main]
+rules:
+  - id: writers-change-unprotected
+    allow:
+      actors: { group: writers }
+      actions: [change]
+      branch_scope: unprotected
+  - id: readers-read
+    allow:
+      actors: { group: readers }
+      actions: [read]
+      branch_scope: any
+"#,
+        )
+        .unwrap();
+        let engine = PolicyCompiler::compile(&policy, "graph").unwrap();
+
+        // The writer can `change` *some* branch (unprotected), so the list-time
+        // capability probe is true — even though the per-call gate denies on
+        // protected `main` and on a branchless request. This is exactly the
+        // divergence a fabricated-`main` probe got wrong.
+        assert!(engine.permits_on_any_branch("act-writer", PolicyAction::Change).unwrap());
+        assert!(
+            !engine
+                .authorize(
+                    "act-writer",
+                    &PolicyRequest { action: PolicyAction::Change, branch: Some("main".to_string()), target_branch: None },
+                )
+                .unwrap()
+                .allowed
+        );
+        assert!(
+            engine
+                .authorize(
+                    "act-writer",
+                    &PolicyRequest { action: PolicyAction::Change, branch: Some("feature".to_string()), target_branch: None },
+                )
+                .unwrap()
+                .allowed
+        );
+
+        // A reader has no `change` grant on any branch → capability is false,
+        // so the relaxation still hides write tools from read-only actors.
+        assert!(!engine.permits_on_any_branch("act-reader", PolicyAction::Change).unwrap());
+        assert!(engine.permits_on_any_branch("act-reader", PolicyAction::Read).unwrap());
+
+        // Unknown actor → false (never panics, never allows).
+        assert!(!engine.permits_on_any_branch("act-ghost", PolicyAction::Read).unwrap());
     }
 
     #[test]

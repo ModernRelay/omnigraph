@@ -345,28 +345,29 @@ async fn list_queries_returns_only_exposed_with_typed_params() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
-async fn list_queries_is_read_gated_so_a_non_invoker_can_list() {
-    // The catalog is read-gated (not invoke_query-gated), so a reader who
-    // lacks invoke_query still enumerates the exposed queries — the
-    // documented probe-oracle gap until per-query Cedar filtering lands.
+async fn list_queries_requires_invoke_query() {
+    // The catalog is invoke_query-gated (same authority as invocation and the
+    // MCP `tools/list` surface): a reader who lacks invoke_query is denied
+    // listing, while an invoke_query holder lists it.
     let (_temp, app) = app_with_stored_queries(
         &[("find_person", FIND_PERSON_GQ, true)],
-        &[("act-noinvoke", "t-noinvoke")],
+        &[("act-noinvoke", "t-noinvoke"), ("act-invoke", "t-invoke")],
         INVOKE_POLICY_YAML,
     )
     .await;
-    let (status, body) = json_response(&app, get_request(&g("/queries"), "t-noinvoke")).await;
-    assert_eq!(status, StatusCode::OK, "read-gated catalog; body: {body}");
+    // read-only, no invoke_query → 403.
+    let (status, _body) = json_response(&app, get_request(&g("/queries"), "t-noinvoke")).await;
+    assert_eq!(status, StatusCode::FORBIDDEN, "catalog listing requires invoke_query");
+    // invoke_query holder → 200 with the exposed query.
+    let (status, body) = json_response(&app, get_request(&g("/queries"), "t-invoke")).await;
+    assert_eq!(status, StatusCode::OK, "invoker lists the catalog; body: {body}");
     let names: Vec<&str> = body["queries"]
         .as_array()
         .unwrap()
         .iter()
         .map(|q| q["name"].as_str().unwrap())
         .collect();
-    assert!(
-        names.contains(&"find_person"),
-        "a reader lists the catalog despite lacking invoke_query: {names:?}"
-    );
+    assert!(names.contains(&"find_person"), "invoker sees the exposed query: {names:?}");
 }
 
 #[tokio::test(flavor = "multi_thread")]

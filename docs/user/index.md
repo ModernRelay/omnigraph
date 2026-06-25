@@ -45,6 +45,7 @@ start with install, then follow the section that matches your task.
 |---|---|
 | Deploy the binary or container | [deployment.md](deployment.md) |
 | Use HTTP endpoints | [operations/server.md](operations/server.md) |
+| Connect an MCP agent (Claude, Cursor, …) | [operations/mcp.md](operations/mcp.md) |
 | Compact, repair, and clean old versions | [operations/maintenance.md](operations/maintenance.md) |
 | Configure Cedar authorization | [operations/policy.md](operations/policy.md) |
 | Track actors and audit behavior | [operations/audit.md](operations/audit.md) |

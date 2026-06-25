@@ -426,6 +426,52 @@ pub(crate) fn authorize_request(
     }
 }
 
+/// List-time capability probe: could `action` be permitted on *some* branch?
+/// Mirrors [`authorize`]'s no-policy handling (open mode allows per-graph
+/// actions; default-deny allows only `Read`; server-scoped actions are closed),
+/// and otherwise delegates to [`PolicyEngine::permits_on_any_branch`]. Used to
+/// filter argument-scoped tools in `tools/list` as a relaxation of the per-call
+/// gate — so a tool callable on some branch is never hidden, while one the
+/// actor has no grant for stays hidden.
+pub(crate) fn authorize_any_branch(
+    actor: Option<&ResolvedActor>,
+    policy: Option<&PolicyEngine>,
+    action: PolicyAction,
+) -> std::result::Result<bool, ApiError> {
+    let Some(engine) = policy else {
+        if action.resource_kind() == PolicyResourceKind::Server {
+            return Ok(false);
+        }
+        // Default-deny mode (tokens configured, no policy): only Read; Open mode
+        // (no tokens): all per-graph actions. Matches `authorize` exactly.
+        if actor.is_some() && action != PolicyAction::Read {
+            return Ok(false);
+        }
+        return Ok(true);
+    };
+    let Some(actor) = actor else {
+        return Err(ApiError::unauthorized("missing bearer token"));
+    };
+    engine
+        .permits_on_any_branch(actor.actor_id.as_ref(), action)
+        .map_err(|err| ApiError::internal(format!("policy: {err}")))
+}
+
+/// The single Cedar request that gates the **stored-query surface** — catalog
+/// discovery *and* invocation, on REST *and* MCP. `invoke_query` is graph-scoped
+/// (no branch dimension): the per-branch/snapshot access is enforced by the inner
+/// `read`/`change` gate in the runner. Every gate site (`GET /queries`,
+/// `POST /queries/{name}`, the MCP `tools/list` stored projection, and MCP
+/// `tools/call` stored dispatch) calls this one function, so the REST and MCP
+/// surfaces cannot drift on which action governs the catalog.
+pub(crate) fn invoke_query_request() -> PolicyRequest {
+    PolicyRequest {
+        action: PolicyAction::InvokeQuery,
+        branch: None,
+        target_branch: None,
+    }
+}
+
 #[utoipa::path(
     get,
     path = "/snapshot",
@@ -930,19 +976,7 @@ pub(crate) async fn server_invoke_query(
     // probed without the grant), but operational failures (401 missing bearer,
     // 500 policy-evaluation error) propagate with their true status via `?`
     // rather than being masked as a missing query.
-    match authorize(
-        actor_ref,
-        handle.policy.as_deref(),
-        PolicyRequest {
-            action: PolicyAction::InvokeQuery,
-            // Graph-scoped: no branch dimension. The per-branch/snapshot
-            // access is enforced by the inner read/change gate in the
-            // runner, so the outer gate must not resolve a branch (doing so
-            // was wrong for snapshot reads).
-            branch: None,
-            target_branch: None,
-        },
-    )? {
+    match authorize(actor_ref, handle.policy.as_deref(), invoke_query_request())? {
         Authz::Allowed => {}
         Authz::Denied(_) => return Err(ApiError::not_found(NOT_FOUND)),
     }
@@ -1034,14 +1068,14 @@ pub(crate) async fn server_invoke_query(
 )]
 /// List the graph's exposed stored queries as a typed tool catalog.
 ///
-/// Returns every stored query in the `queries:` registry, each
-/// with its MCP tool name, read/mutate flag, description/instruction, and
+/// Returns the exposed (`@mcp(expose: true)`) subset of the `queries:` registry,
+/// each with its MCP tool name, read/mutate flag, description/instruction, and
 /// typed parameters — enough for a client to register them as tools without
-/// fetching `.gq` source. Cluster-served graphs have no per-query expose flag,
-/// so the catalog lists them all. Read-gated; the catalog is graph-wide (branch
-/// independent — `read` is authorized against `main`). **Not** Cedar-filtered
-/// per query yet, so it can list a query whose `invoke_query` the caller
-/// lacks (a known gap until per-query authorization lands).
+/// fetching `.gq` source. **`invoke_query`-gated** (graph-scoped), so catalog
+/// discovery uses the same authority as invocation and matches the MCP
+/// `tools/list` surface: a caller that can list can invoke (subject to the inner
+/// `read`/`change` gate on the query body). Requires an explicit `invoke_query`
+/// grant — in default-deny mode (tokens, no policy) it returns 403.
 pub(crate) async fn server_list_queries(
     Extension(handle): Extension<Arc<GraphHandle>>,
     actor: Option<Extension<ResolvedActor>>,
@@ -1049,16 +1083,11 @@ pub(crate) async fn server_list_queries(
     authorize_request(
         actor.as_ref().map(|Extension(actor)| actor),
         handle.policy.as_deref(),
-        PolicyRequest {
-            action: PolicyAction::Read,
-            branch: Some("main".to_string()),
-            target_branch: None,
-        },
+        invoke_query_request(),
     )?;
     let queries = match handle.queries.as_ref() {
         Some(registry) => registry
-            .iter()
-            .filter(|q| q.expose)
+            .exposed()
             .map(api::query_catalog_entry)
             .collect(),
         None => Vec::new(),
@@ -1217,7 +1246,7 @@ pub(crate) async fn server_schema_apply(
 /// Shared body for `POST /load` (canonical) and `POST /ingest` (deprecated):
 /// branch-exists / fork-if-`from` check, Cedar authorization, admission, the
 /// bulk `load_as`, and the `IngestOutput` mapping.
-async fn run_ingest(
+pub(crate) async fn run_ingest(
     state: AppState,
     handle: Arc<GraphHandle>,
     actor: Option<&ResolvedActor>,

@@ -113,11 +113,9 @@ pub(crate) async fn load_cluster_settings(
             .map(|query| queries::RegistrySpec {
                 name: query.name.clone(),
                 source: query.source.clone(),
-                // The §D5 bridge: the cluster registry has no expose flag
-                // (exposure becomes a policy decision in Phase 6) — cluster
-                // mode lists every stored query.
-                expose: true,
-                tool_name: None,
+                // MCP presentation (expose / tool_name) rides in the `.gq`
+                // source `@mcp(...)` annotation, re-parsed here; the registry
+                // spec carries only identity + source.
             })
             .collect();
         let registry = match QueryRegistry::from_specs(specs) {
@@ -500,8 +498,6 @@ mod tests {
         let spec = |name: &str, source: &str| RegistrySpec {
             name: name.to_string(),
             source: source.to_string(),
-            expose: false,
-            tool_name: None,
         };
 
         // Empty registry → nothing attached, no error.

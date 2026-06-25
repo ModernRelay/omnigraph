@@ -12,9 +12,14 @@ query_decl = {
         ~ query_body
     ~ "}"
 }
-query_annotation = { description_annotation | instruction_annotation }
+query_annotation = { description_annotation | instruction_annotation | mcp_annotation }
 description_annotation = { "@description" ~ "(" ~ string_lit ~ ")" }
 instruction_annotation = { "@instruction" ~ "(" ~ string_lit ~ ")" }
+// MCP-presentation controls (the agent tool surface only): tool name + visibility.
+mcp_annotation = { "@mcp" ~ "(" ~ mcp_arg ~ ("," ~ mcp_arg)* ~ ","? ~ ")" }
+mcp_arg = { mcp_expose_arg | mcp_tool_name_arg }
+mcp_expose_arg = { "expose" ~ ":" ~ bool_lit }
+mcp_tool_name_arg = { "tool_name" ~ ":" ~ string_lit }
 
 query_body = { read_query_body | mutation_body }
 mutation_body = { mutation_stmt+ }
@@ -33,7 +38,10 @@ mutation_assignment = { ident ~ ":" ~ match_value ~ ","? }
 mutation_predicate = { ident ~ comp_op ~ match_value }
 
 param_list = { param ~ ("," ~ param)* }
-param = { variable ~ ":" ~ type_ref }
+// A leading `@description("…")` documents the parameter (surfaced in tool input
+// schemas). Leading position avoids PEG ambiguity with `type_ref`'s trailing `?`
+// and the `,` separator.
+param = { description_annotation? ~ variable ~ ":" ~ type_ref }
 
 type_ref = { (list_type | base_type | vector_type) ~ "?"? }
 list_type = { "[" ~ base_type ~ "]" }

@@ -11,7 +11,7 @@ use omnigraph_compiler::query::ast::Param;
 use omnigraph_compiler::result::QueryResult;
 use omnigraph_compiler::types::{PropType, ScalarType};
 use serde::{Deserialize, Serialize};
-use serde_json::Value;
+use serde_json::{Value, json};
 use utoipa::{IntoParams, ToSchema};
 
 /// Shadow enum for documenting [`LoadMode`] in the OpenAPI schema.
@@ -383,6 +383,10 @@ pub struct ParamDescriptor {
     pub vector_dim: Option<u32>,
     /// `false` → the caller must supply it; `true` → optional.
     pub nullable: bool,
+    /// Per-parameter documentation from a leading `@description("…")`, surfaced
+    /// into the JSON-Schema property `description` (MCP tool input + catalog).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub description: Option<String>,
 }
 
 /// One entry in the stored-query catalog (`GET /queries`).
@@ -432,6 +436,7 @@ pub fn param_descriptor(param: &Param) -> ParamDescriptor {
             item_kind: Some(scalar_kind(pt.scalar)),
             vector_dim: None,
             nullable: param.nullable,
+            description: param.description.clone(),
         },
         Some(pt) => {
             let (kind, vector_dim) = match pt.scalar {
@@ -444,6 +449,7 @@ pub fn param_descriptor(param: &Param) -> ParamDescriptor {
                 item_kind: None,
                 vector_dim,
                 nullable: param.nullable,
+                description: param.description.clone(),
             }
         }
         // Unreachable for a parsed query (every declared param type is
@@ -455,8 +461,77 @@ pub fn param_descriptor(param: &Param) -> ParamDescriptor {
             item_kind: None,
             vector_dim: None,
             nullable: param.nullable,
+            description: param.description.clone(),
         },
     }
+}
+
+/// JSON Schema (2020-12) for a scalar param kind. **Superset of the engine
+/// coercer** (`omnigraph_compiler::coerce_param_typed`, Standard mode): a
+/// too-narrow schema would make a strict client reject inputs the engine
+/// accepts; a too-wide one reaches the coercer and surfaces as an `isError`
+/// tool result for model self-correction (SEP-1303). Locked to the coercer by
+/// `tests/schema_equivalence.rs`. Exhaustive + wildcard-free: adding a
+/// `ParamKind` is a compile error until its arm (and corpus row) exist.
+fn scalar_schema(kind: ParamKind) -> Value {
+    match kind {
+        ParamKind::String => json!({ "type": "string" }),
+        ParamKind::Bool => json!({ "type": "boolean" }),
+        // Standard-mode integer coercion accepts a JSON number OR a numeric
+        // string (i64/u64 lose precision past 2^53 as a JSON number), so the
+        // schema accepts both; range/sign are the coercer's to enforce.
+        ParamKind::Int | ParamKind::BigInt => json!({
+            "anyOf": [ { "type": "integer" }, { "type": "string", "pattern": r"^-?\d+$" } ]
+        }),
+        ParamKind::Float => json!({ "type": "number" }),
+        // Date/DateTime/Blob coerce from any string; `format` is an advisory
+        // annotation (non-asserting in 2020-12), so the schema accepts exactly
+        // what the coercer does while still hinting the shape to clients.
+        ParamKind::Date => json!({ "type": "string", "format": "date" }),
+        ParamKind::DateTime => json!({ "type": "string", "format": "date-time" }),
+        ParamKind::Blob => json!({ "type": "string", "format": "uri" }),
+        ParamKind::Vector | ParamKind::List => {
+            unreachable!("composite kinds are handled in param_json_schema")
+        }
+    }
+}
+
+/// The JSON Schema (2020-12) for a stored-query parameter — the single mapping
+/// both the OpenAPI catalog and the MCP tool projection consume, applying the
+/// nullable rule uniformly. See [`scalar_schema`] for the superset contract.
+pub fn param_json_schema(p: &ParamDescriptor) -> Value {
+    let base = match p.kind {
+        ParamKind::Vector => {
+            let mut schema = json!({ "type": "array", "items": { "type": "number" } });
+            if let Some(dim) = p.vector_dim {
+                schema["minItems"] = json!(dim);
+                schema["maxItems"] = json!(dim);
+            }
+            schema
+        }
+        ParamKind::List => {
+            let item = p
+                .item_kind
+                .map(scalar_schema)
+                .unwrap_or_else(|| json!({ "type": "string" }));
+            json!({ "type": "array", "items": item })
+        }
+        scalar => scalar_schema(scalar),
+    };
+    // The coercer accepts explicit `null` for a nullable param (and its
+    // omission); a strict client would reject `null` against the bare scalar.
+    // Allow null at the schema level for nullable params.
+    let mut schema = if p.nullable {
+        json!({ "anyOf": [ base, { "type": "null" } ] })
+    } else {
+        base
+    };
+    // Put the description on the OUTER property object (a sibling of `anyOf`
+    // for nullable params, never nested inside it), so clients read it directly.
+    if let Some(description) = &p.description {
+        schema["description"] = json!(description);
+    }
+    schema
 }
 
 

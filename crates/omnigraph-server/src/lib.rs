@@ -1,5 +1,6 @@
 pub mod api;
 mod handlers;
+mod mcp;
 mod settings;
 use handlers::*;
 use settings::*;
@@ -261,6 +262,18 @@ pub struct AppState {
     /// resource. Loaded from the cluster-scoped policy binding when
     /// configured. Per-graph policies live on each `GraphHandle.policy`.
     server_policy: Option<Arc<PolicyEngine>>,
+    /// MCP host/Origin policy inputs. Default (`None` bind + empty lists)
+    /// yields a loopback-safe `Unchecked` policy — correct for in-process
+    /// tests that never bind a socket. `serve()` overrides `mcp_bind` from
+    /// `listener.local_addr()` so a public bind is fail-closed
+    /// (`DenyBrowsers`), not silently `Unchecked` (the silent-fail-open
+    /// guard — see `omnigraph_mcp::McpHostPolicy::from_bind`). `public_hosts`
+    /// / `browser_origins` are reserved for future cluster/CLI config (empty
+    /// today: a public bind disables Host-allowlisting and rejects browser
+    /// Origins until configured).
+    mcp_bind: Option<std::net::SocketAddr>,
+    mcp_public_hosts: Vec<String>,
+    mcp_browser_origins: Vec<String>,
 }
 
 struct ExportStreamWriter {
@@ -536,6 +549,9 @@ impl AppState {
             workload,
             bearer_tokens,
             server_policy: None,
+            mcp_bind: None,
+            mcp_public_hosts: Vec::new(),
+            mcp_browser_origins: Vec::new(),
         }
     }
 
@@ -562,6 +578,9 @@ impl AppState {
             workload: Arc::new(workload),
             bearer_tokens,
             server_policy: server_policy.map(Arc::new),
+            mcp_bind: None,
+            mcp_public_hosts: Vec::new(),
+            mcp_browser_origins: Vec::new(),
         })
     }
 
@@ -570,6 +589,34 @@ impl AppState {
     /// `server_graphs_list` reads the registry through it.
     pub fn routing(&self) -> &GraphRouting {
         &self.routing
+    }
+
+    /// Install the MCP host/Origin policy inputs from the bound socket.
+    /// `serve()` calls this after `TcpListener::bind` (reading
+    /// `local_addr()` — the authoritative bound address, which resolves
+    /// `0.0.0.0`/hostname binds) and before `build_app`, so the derived
+    /// policy is fail-closed on a public bind. Tests that build an app
+    /// without a socket skip this and get the loopback-safe default.
+    pub fn with_mcp_host_inputs(
+        mut self,
+        bind: std::net::SocketAddr,
+        public_hosts: Vec<String>,
+        browser_origins: Vec<String>,
+    ) -> Self {
+        self.mcp_bind = Some(bind);
+        self.mcp_public_hosts = public_hosts;
+        self.mcp_browser_origins = browser_origins;
+        self
+    }
+
+    /// Derive the MCP host/Origin policy from the stored inputs through the
+    /// single fail-closed constructor. A `None` bind defaults to loopback
+    /// (`Unchecked`), correct for in-process tests.
+    pub(crate) fn mcp_host_policy(&self) -> omnigraph_mcp::McpHostPolicy {
+        let bind = self
+            .mcp_bind
+            .unwrap_or_else(|| std::net::SocketAddr::from(([127, 0, 0, 1], 0)));
+        omnigraph_mcp::McpHostPolicy::from_bind(&bind, &self.mcp_public_hosts, &self.mcp_browser_origins)
     }
 
     fn requires_bearer_auth(&self) -> bool {
@@ -610,6 +657,20 @@ fn hash_bearer_tokens(bearer_tokens: Vec<(String, String)>) -> Arc<[(BearerToken
 }
 
 impl ApiError {
+    /// HTTP status this error maps to — identical to what `IntoResponse`
+    /// emits (`self.status`). Used by the MCP `classify` mapper to split
+    /// semantic 4xx (→ `isError` tool result) from operational 5xx
+    /// (→ JSON-RPC protocol error).
+    pub(crate) fn status_code(&self) -> StatusCode {
+        self.status
+    }
+
+    /// The human-readable message — identical to the `error` field
+    /// `IntoResponse` puts in the body (`self.message`).
+    pub(crate) fn message_str(&self) -> &str {
+        &self.message
+    }
+
     pub fn unauthorized(message: impl Into<String>) -> Self {
         Self {
             status: StatusCode::UNAUTHORIZED,
@@ -937,6 +998,12 @@ pub fn build_app(state: AppState) -> Router {
         .route("/branches/merge", post(server_branch_merge))
         .route("/commits", get(server_commit_list))
         .route("/commits/{commit_id}", get(server_commit_show))
+        // The MCP surface → POST /graphs/{graph_id}/mcp. Merged (not `.route`)
+        // so its own tower-http body-limit + Origin-guard layers stay scoped to
+        // /mcp and don't leak onto the REST routes. The two route_layers below
+        // (bearer + handle) wrap it, so rmcp sees a request whose extensions
+        // already carry ResolvedActor + Arc<GraphHandle>.
+        .merge(mcp::mcp_router(state.clone()))
         .route_layer(middleware::from_fn_with_state(
             state.clone(),
             resolve_graph_handle,
@@ -1036,6 +1103,15 @@ pub async fn serve(config: ServerConfig) -> Result<()> {
     };
 
     let listener = TcpListener::bind(&bind).await?;
+    // Derive the MCP host/Origin policy from the ACTUAL bound address (not the
+    // configured `bind` string — `0.0.0.0`/hostname binds resolve only after
+    // bind). A public bind ⇒ fail-closed `DenyBrowsers`; loopback ⇒ `Unchecked`.
+    // `public_hosts`/`browser_origins` are empty until cluster/CLI config wires
+    // them (a public bind then disables Host-allowlisting, with bearer the
+    // control). Missing this reorder would silently leave a public bind on the
+    // loopback default — the fail-open class `McpHostPolicy` exists to close.
+    let local_addr = listener.local_addr()?;
+    let state = state.with_mcp_host_inputs(local_addr, Vec::new(), Vec::new());
     axum::serve(listener, build_app(state))
         .with_graceful_shutdown(shutdown_signal())
         .await?;

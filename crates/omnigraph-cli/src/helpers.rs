@@ -780,8 +780,6 @@ fn registry_from_serving_queries(
         .map(|q| omnigraph_server::queries::RegistrySpec {
             name: q.name.clone(),
             source: q.source.clone(),
-            expose: false,
-            tool_name: None,
         })
         .collect();
     QueryRegistry::from_specs(specs).map_err(|errors| {
@@ -909,8 +907,8 @@ pub(crate) async fn execute_queries_list(
             .iter()
             .map(|q| QueriesListItem {
                 name: q.name.clone(),
-                mcp_expose: q.expose,
-                tool_name: q.tool_name.clone(),
+                mcp_expose: q.is_exposed(),
+                tool_name: q.decl.mcp.tool_name.clone(),
                 mutation: q.is_mutation(),
                 description: q.decl.description.clone(),
                 instruction: q.decl.instruction.clone(),

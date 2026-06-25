@@ -27,7 +27,7 @@ pub use query::lint::{
     lint_query_file,
 };
 pub use query_input::{
-    JsonParamMode, RunInputError, RunInputResult, ToParam, find_named_query,
+    JsonParamMode, RunInputError, RunInputResult, ToParam, coerce_param_typed, find_named_query,
     json_params_to_param_map,
 };
 pub use result::{MutationExecResult, MutationResult, QueryResult, RunResult};
