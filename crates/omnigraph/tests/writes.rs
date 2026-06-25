@@ -607,6 +607,64 @@ async fn overlapping_delete_predicates_do_not_double_count_affected() {
     );
 }
 
+/// The overlap-exclusion filter must use SQL `IS NOT TRUE`, not `NOT`: a prior
+/// delete predicate referencing a NULLable column must NOT drop a later
+/// statement's matching row just because that column is NULL (SQL UNKNOWN).
+/// With `NOT (age > 30)`, a row with NULL `age` makes the clause UNKNOWN and the
+/// row is filtered out of `deleted_ids` — skipping its cascade (orphaned edges),
+/// or, if it is the only match, leaving the node undeleted. This is a data bug,
+/// not just a miscount.
+///
+/// Data: Charlie (age 35), Zoe (age NULL); Knows Zoe→Charlie. The query deletes
+/// `age > 30` (Charlie) then `name = "Zoe"`. Zoe must still be deleted and her
+/// edge cascaded despite the prior `age > 30` evaluating to UNKNOWN for her.
+#[tokio::test]
+async fn delete_dedup_filter_does_not_drop_null_column_rows() {
+    let dir = tempfile::tempdir().unwrap();
+    let uri = dir.path().to_str().unwrap();
+    let schema = r#"
+node Person {
+    name: String @key
+    age: I32?
+}
+edge Knows: Person -> Person
+"#;
+    let data = r#"{"type":"Person","data":{"name":"Charlie","age":35}}
+{"type":"Person","data":{"name":"Zoe"}}
+{"edge":"Knows","from":"Zoe","to":"Charlie"}"#;
+    let mut db = Omnigraph::init(uri, schema).await.unwrap();
+    load_jsonl(&mut db, data, LoadMode::Overwrite).await.unwrap();
+
+    let q = r#"
+query del_age_then_name($threshold: I32, $name: String) {
+    delete Person where age > $threshold
+    delete Person where name = $name
+}
+"#;
+    let r = db
+        .mutate(
+            "main",
+            q,
+            "del_age_then_name",
+            &mixed_params(&[("$name", "Zoe")], &[("$threshold", 30)]),
+        )
+        .await
+        .expect("delete-only mutation must succeed");
+
+    assert_eq!(
+        count_rows(&db, "node:Person").await,
+        0,
+        "both Charlie (age>30) and Zoe (name=Zoe, NULL age) must be deleted",
+    );
+    assert_eq!(
+        count_rows(&db, "edge:Knows").await,
+        0,
+        "Zoe→Charlie must cascade — Zoe's NULL age must not skip her cascade",
+    );
+    assert_eq!(r.affected_nodes, 2, "Charlie + Zoe");
+    assert_eq!(r.affected_edges, 1, "Zoe→Charlie, counted once");
+}
+
 /// `insert Person 'X'; update Person where name='X' set age=...` — both
 /// ops produce content on `node:Person` and coalesce into one
 /// `stage_merge_insert` at end-of-query. The accumulator's last-write-wins
