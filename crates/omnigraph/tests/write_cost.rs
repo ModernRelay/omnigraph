@@ -72,6 +72,61 @@ async fn internal_table_scans_are_flat_in_history() {
     assert_flat(&curve, |c| c.commit_graph_reads, 4, "_graph_commits + _graph_commit_actors scan");
 }
 
+/// **Served-regime twin of `internal_table_scans_are_flat_in_history` — the gate
+/// that was missing.** The flat gate above calls `db.optimize()` before EVERY
+/// measured write, so it only ever proves the *compacted* invariant and stays green
+/// even if a served graph's per-write `__manifest` scan amplifies without bound. A
+/// real served graph does NOT optimize between writes: every publish appends a
+/// fragment to `__manifest`, and the publish-path scan (`read_manifest_scan`, a bare
+/// `dataset.scan()` with no filter/projection) reads ALL of them, so the per-write
+/// `__manifest` read count is O(fragments-since-compaction) and climbs with history.
+/// That is the live amplification behind the reported single-row write latency
+/// (~16s on 0.7.2; still growing post-#299) — physical fragment read cost, not
+/// logical row count (output rows stay ~flat while requests grow).
+///
+/// **This is a TRIPWIRE, not the final gate.** It asserts the scan *grows*, i.e. it
+/// pins the CURRENT served-regime cost (green today) — exactly the `assert_grows`
+/// idiom its sibling `data_table_reads_split_into_flat_opener_and_growing_scan` uses,
+/// and the "turns red when the fix lands" shape of the Lance surface guards. It flips
+/// RED the moment the amplification is fixed (write-path probe-gated warm reuse, and
+/// bringing `__manifest` into `cleanup` version-GC so F stays bounded in history).
+/// **When it goes red, that is the signal to invert it to**
+/// `assert_flat(&curve, |c| c.manifest_reads, <slack>, "__manifest scan (served)")` —
+/// promoting it to the permanent served-regime gate. Only `manifest_reads` is
+/// asserted: #299 moved lineage into `__manifest` and made the per-write commit-graph
+/// update in-memory, so `commit_graph_reads` no longer grows per write on this branch.
+#[tokio::test]
+async fn internal_table_scans_grow_without_compaction() {
+    const ACTOR: &str = "act-cost-gate-served";
+    let dir = tempfile::tempdir().unwrap();
+    let mut db = local_graph(&dir).await;
+
+    let mut curve: Vec<(u64, IoCounts)> = Vec::new();
+    let mut current = 0u64;
+    for d in [10u64, 100] {
+        if d > current {
+            commit_many_as(&mut db, (d - current) as usize, ACTOR).await;
+            current = d;
+        }
+        // NO `db.optimize()` here — that omission is the whole point. The flat gate
+        // above compacts before measuring and so never exercises this served regime.
+        let io = measure_insert_as(&mut db, &format!("served_{d}"), ACTOR).await;
+        current += 1; // the measured write advanced depth by one
+        eprintln!(
+            "depth~{d} (uncompacted): data={} __manifest={} _graph_commits+actors={}",
+            io.data_reads, io.manifest_reads, io.commit_graph_reads
+        );
+        curve.push((d, io));
+    }
+
+    // Green TODAY (the bug): the per-write `__manifest` scan is O(fragments) and grows
+    // by far more than the flat gate's slack of 4 across a 10→100 depth sweep. The `20`
+    // floor mirrors the proven-safe `assert_grows` sibling (data-table scan) and sits
+    // comfortably below the real growth (~+3 `__manifest` reads/depth × ~90 depth × the
+    // 3–4 publish-path scans) while unambiguously distinguishing "grows" from "flat".
+    assert_grows(&curve, |c| c.manifest_reads, 20, "__manifest scan (uncompacted/served)");
+}
+
 // The data-table OPENER history-gate (opener flat across depth) lives in
 // `write_cost_s3.rs` — its history-dependence is an S3-only phenomenon. But the
 // *probe that isolates* the opener (the `PrefixCounter` split) is validated here,
