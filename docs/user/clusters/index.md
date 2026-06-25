@@ -133,7 +133,7 @@ cluster), not a runtime mutation API on the serving process — intent lives in
 the config files, outside the running system (the reasoning is
 [cluster-axioms.md](../../dev/cluster-axioms.md) §3 and §4). The server only ever
 *reads* the converged ledger, which is why a held apply lock never blocks
-serving (§5).
+serving (see §5 below, in this guide).
 
 What each change kind does:
 
