@@ -661,16 +661,17 @@ async fn open_table_for_mutation(
 /// D₂ parse-time check: a single mutation query is either insert/update-only
 /// or delete-only. Mixed → reject before any I/O.
 ///
-/// Reason: inserts and updates accumulate as pending in-memory batches and
-/// deletes accumulate as predicates; both stage and commit at end-of-query.
-/// They are correct in isolation, but read-your-writes does NOT yet compose
-/// across them within one query — a staged delete's predicate is not applied
-/// to the same table's pending insert batches, and a pending insert is not
-/// visible to a delete's committed-row scan. So mixing still creates ordering
-/// hazards (same-row insert→delete would not cancel; a cascade over
-/// just-inserted edges would miss them). The parse-time rejection keeps each
-/// path atomic and correct. Retiring this rule (MR-A Step 2) requires wiring
-/// staged-delete read-your-writes into the pending accumulator.
+/// This is a deliberate semantic boundary, not temporary scaffolding. Inserts
+/// and updates accumulate as pending in-memory batches and deletes accumulate
+/// as predicates; both stage and commit at end-of-query. Keeping a single query
+/// to one kind means read-your-writes stays unambiguous (a read never has to
+/// reconcile pending inserts against same-query delete predicates) and each
+/// touched table commits at most one version per query. Compose mixed
+/// operations by issuing separate atomic mutations (writes, then deletes), or a
+/// branch + merge when one atomic commit is required. Allowing mixing would
+/// instead demand an in-query delete view, pending pruning, and per-table
+/// two-commit ordering in the hot mutation path — complexity this boundary
+/// deliberately avoids.
 fn enforce_no_mixed_destructive_constructive(
     ir: &omnigraph_compiler::ir::MutationIR,
 ) -> Result<()> {
@@ -690,8 +691,9 @@ fn enforce_no_mixed_destructive_constructive(
         return Err(OmniError::manifest(format!(
             "mutation '{}' on the same query mixes inserts/updates and deletes; \
              split into separate mutations: (1) inserts and updates, then (2) deletes. \
-             This restriction lifts when Lance exposes a two-phase delete API \
-             (tracked: lance-format/lance#6658).",
+             A query is deliberately constructive or destructive, not both, so its \
+             read-your-writes stays unambiguous; run the two on a branch and merge \
+             if you need them in one atomic commit.",
             ir.name
         )));
     }

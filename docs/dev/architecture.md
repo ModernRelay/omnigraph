@@ -198,8 +198,9 @@ contracts:
 - `D₂` parse-time rule: a query is either insert/update-only or
   delete-only. Mixed → reject. Deletes now stage like inserts/updates
   (MR-A: `stage_delete` via Lance 7.0 `DeleteBuilder::execute_uncommitted`),
-  so they no longer advance HEAD inline; D₂ stays only because staged-delete
-  read-your-writes is not yet wired into the in-query pending accumulator.
+  so they no longer advance HEAD inline; D₂ is a deliberate boundary
+  (constructive XOR destructive per query) that keeps in-query read-your-writes
+  unambiguous — compose mixed operations via separate mutations or a branch.
 - `LoadMode::Overwrite` uses Lance `Operation::Overwrite` through the
   same staged path. Loader validation runs against the replacement
   in-memory batches before any `commit_staged`, and the publish window is

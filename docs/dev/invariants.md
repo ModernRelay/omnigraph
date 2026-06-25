@@ -75,9 +75,11 @@ converge the physical state.
    accumulates writes — inserts/updates as pending batches, deletes as
    predicates — stages each touched table at the end (deletes via
    `stage_delete`, no inline HEAD advance), then publishes one manifest update.
-   Do not commit per statement. The parse-time D2 rule still prevents mixing
-   deletes with insert/update in one query, because staged-delete
-   read-your-writes does not yet compose into the pending accumulator.
+   Do not commit per statement. The parse-time D2 rule is a deliberate
+   boundary: one mutation query is constructive (insert/update) or destructive
+   (delete), not both — so read-your-writes within a query stays unambiguous
+   and each table commits at most one version. Compose mixed operations via
+   separate mutations, or a branch for single-commit atomicity.
    Read [writes.md](writes.md) and [execution.md](execution.md).
 
 5. **Recovery is part of the commit protocol.** Writers that can advance Lance
@@ -152,7 +154,7 @@ converge the physical state.
 |---|---|---|
 | Multi-table commit | Manifest CAS plus recovery sidecars; not a single Lance primitive | [writes.md](writes.md), [architecture.md](architecture.md) |
 | Constructive mutations | In-memory `MutationStaging`, one end-of-query table commit per touched table, then one manifest publish | [writes.md](writes.md), [execution.md](execution.md) |
-| Deletes | Staged like inserts/updates (`stage_delete` via Lance 7.0 `DeleteBuilder::execute_uncommitted`, MR-A) — no inline HEAD advance; delete-only queries allowed, mixed insert/update/delete still rejected by D2 (staged-delete read-your-writes not yet wired into the pending accumulator) | [query-language.md](../user/queries/index.md), [writes.md](writes.md) |
+| Deletes | Staged like inserts/updates (`stage_delete` via Lance 7.0 `DeleteBuilder::execute_uncommitted`, MR-A) — no inline HEAD advance; mixed insert/update/delete in one query rejected by D2 as a deliberate boundary (constructive XOR destructive per query; compose via separate mutations or a branch) | [query-language.md](../user/queries/index.md), [writes.md](writes.md) |
 | Branch delete | Manifest is the single authority, flipped atomically first; per-table forks + commit-graph branch are derived state, reclaimed best-effort (`force_delete_branch`) with the `cleanup` reconciler as the guaranteed backstop. Reusing a name whose reclaim failed before `cleanup` surfaces an actionable error | [branches-commits.md](../user/branching/index.md), [maintenance.md](../user/operations/maintenance.md) |
 | Schema validation | Type checks, required fields, defaults, edge endpoint checks, and edge cardinality are enforced on write paths | [schema-language.md](../user/schema/index.md), [execution.md](execution.md) |
 | Unique constraints | Intra-batch and write-path checks exist; intake and branch-merge derive the composite key through one shared function (`loader::composite_unique_key`, a separator-free `Vec<String>` tuple) and fail loudly on an un-keyable column type rather than silently exempting it; full cross-version uniqueness against already-committed rows is still a gap | [schema-language.md](../user/schema/index.md) |
@@ -193,10 +195,9 @@ them explicit.
 - **Vector indexes:** `create_vector_index` still advances Lance HEAD inline —
   segment-commit needs `build_index_metadata_from_segments`, `pub(crate)` in Lance
   7.0.0 (#6666 open). Keep recovery coverage in place until that residual is
-  removed. (`delete` is no longer a residual — staged in MR-A.) D2 also stays for
-  now, but for a different reason: staged-delete read-your-writes does not yet
-  compose into the in-query pending accumulator, so mixed insert/update/delete in
-  one query is still rejected at parse time. Wiring that RYW is MR-A step 2.
+  removed. (`delete` is no longer a residual — staged in MR-A. D2 is not a gap:
+  it is a deliberate constructive-XOR-destructive boundary, documented in
+  Invariant 4 and the truth matrix.)
 - **Blob-column compaction:** Lance `compact_files` mis-decodes blob-v2 columns
   under its forced `BlobHandling::AllBinary` read ("more fields in the schema
   than provided column indices"), so `optimize` skips any table with a `Blob`

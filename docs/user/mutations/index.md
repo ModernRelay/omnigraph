@@ -38,11 +38,12 @@ Mixing the two is rejected at parse time, before any I/O:
 > into separate mutations: (1) inserts and updates, then (2) deletes.`
 
 Run two separate queries instead — the inserts/updates first, then the deletes.
-The restriction exists because inserts/updates and deletes commit through
-different paths today, and mixing them in one query creates ordering hazards
-(e.g. a same-row insert-then-delete, or a cascading delete of a just-inserted
-edge). Keeping the two kinds in separate queries keeps each one atomic and
-correct.
+Each query is still atomic on its own. This is a deliberate rule: inserts,
+updates, and deletes all stage and commit through the same path, but keeping a
+single query to one kind means its read-your-writes stays unambiguous (a read
+within the query never has to reconcile rows you inserted against rows you
+deleted in the same query). If you need the inserts/updates and deletes to land
+as **one** atomic commit, run them on a branch and merge it.
 
 ## Bulk loading
 

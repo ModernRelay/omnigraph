@@ -3599,7 +3599,7 @@ async fn branch_merge_phase_b_failure_recovered_on_next_open() {
 
     // Recovery: reopen runs the sweep. BranchMerge uses LOOSE
     // classification — `publish_rewritten_merge_table` runs multiple
-    // commit_staged calls per table (stage_merge_insert + delete_where +
+    // commit_staged calls per table (stage_merge_insert + stage_delete +
     // index rebuilds), so post_commit_pin in the sidecar is a lower
     // bound; the loose-match classifier accepts any HEAD > expected_version
     // when expected_version == manifest_pinned.

@@ -71,16 +71,16 @@ tracked in [docs/dev/invariants.md](invariants.md).
 
 A single mutation query is either insert/update-only or delete-only.
 Mixed → rejected at parse time with a clear error directing the user to
-split the query. Reason: inserts/updates accumulate as pending batches and
-deletes as predicates, and both stage correctly in isolation, but
-read-your-writes does not yet compose across them within one query — a staged
-delete's predicate is not applied to the same table's pending insert batches,
-and a pending insert is not visible to a delete's committed-row scan. So
-mixing would create ordering hazards (insert→delete on the same row would not
-cancel; cascading deletes of just-inserted edges would miss them). The
-parse-time rejection keeps each path atomic and correct. Retiring D₂ (MR-A
-step 2) requires wiring staged-delete read-your-writes into the pending
-accumulator.
+split the query. This is a deliberate boundary, not a temporary limitation.
+Inserts/updates accumulate as pending batches and deletes as predicates, and
+both stage correctly; keeping a single query to one kind means read-your-writes
+within that query stays unambiguous (a read never reconciles pending inserts
+against same-query delete predicates) and each touched table commits at most one
+version. Compose mixed operations by issuing separate atomic mutations (writes,
+then deletes), or a branch + merge for one atomic commit. Allowing mixing would
+instead require an in-query delete view, pending pruning, and per-table
+two-commit ordering in the hot mutation path — complexity this boundary
+deliberately avoids.
 
 ### MR-793 status (storage trait two-phase invariant) — partial
 
@@ -139,8 +139,8 @@ One method remains on `InlineCommitResidual`, named honestly at its call site:
 `DeleteBuilder::execute_uncommitted` ([#6658](https://github.com/lance-format/lance/issues/6658))
 made delete a staged write, so MR-A migrated it to `TableStorage::stage_delete`
 and removed `InlineCommitResidual::delete_where`. The parse-time D₂ rule is
-retained for now (staged-delete read-your-writes is not yet wired into the
-pending accumulator — MR-A step 2).
+retained as a deliberate boundary (constructive XOR destructive per query) — see
+the D₂ section above.
 
 The `tests/forbidden_apis.rs` guard still catches direct `lance::*` inline-commit misuse outside the storage layer; the trait split makes the staged-only default a type-system guarantee on top of it.
 
@@ -410,5 +410,6 @@ accumulate as predicates and stage via `stage_delete` at end-of-query, so a
 delete cascade that fails mid-way advances no Lance HEAD — the same
 "untouched on failure" property as inserts/updates. The old narrow inline
 window (and the retry/`cleanup` workaround it required) is gone. The
-parse-time D₂ rule still keeps inserts/updates from coexisting with deletes in
-one query, pending the staged-delete read-your-writes work (MR-A step 2).
+parse-time D₂ rule keeps inserts/updates from coexisting with deletes in one
+query as a deliberate boundary (see the D₂ section above), so a mutation is
+always purely constructive or purely destructive.

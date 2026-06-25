@@ -409,7 +409,8 @@ async fn recovery_rolls_back_synthetic_drift_on_open() {
     // leave (with no sidecar — the writer never wrote one because we're
     // simulating the residual class directly).
     //
-    // Use `delete_where` with a never-matching predicate: it inline-commits
+    // Use `lance_delete_inline` (a test helper that calls Lance directly) with
+    // a never-matching predicate: it inline-commits
     // a Lance transaction (advancing HEAD by one) without removing data
     // and without depending on the dataset's exact column set. The actual
     // residual the sweep recovers from is the manifest-vs-Lance-HEAD gap;
@@ -456,7 +457,7 @@ async fn recovery_rolls_back_synthetic_drift_on_open() {
     // sidecar.post_commit_pin != observed head), decide RollBack, and call
     // restore_table_to_version(person_uri, head_before_drift). The
     // fragment-set short-circuit may make this a no-op if the synthetic
-    // drift produced no fragment changes (delete_where with a never-matching
+    // drift produced no fragment changes (lance_delete_inline with a never-matching
     // predicate is one such case — Lance bumps version but fragments are
     // unchanged). Either way the sweep must complete without error and
     // delete the sidecar; the actual rollback HEAD-advance behavior is
@@ -725,7 +726,7 @@ async fn recovery_rolls_forward_after_phase_b_completes() {
     let head_before = ds.version().version;
 
     // Synthesize a successful Phase B: advance Lance HEAD by one
-    // (delete_where with no-match — no fragment changes, but version bumps).
+    // (lance_delete_inline with no-match — no fragment changes, but version bumps).
     let _ = helpers::lance_delete_inline(&mut ds, "1 = 2").await;
     let head_after = ds.version().version;
     assert_eq!(head_after, head_before + 1);

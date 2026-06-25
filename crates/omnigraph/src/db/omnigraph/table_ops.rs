@@ -1171,8 +1171,9 @@ async fn prepare_updates_for_commit(
     // its just-committed version. When a table's handle is present, the index
     // build below reuses it and SKIPS the `reopen_for_mutation` open. Absent
     // entries (other writers — schema apply, merge, ensure_indices, tests —
-    // pass `HashMap::new()`; inline-committed/delete tables are never staged)
-    // keep the byte-identical `reopen_for_mutation` path.
+    // pass `HashMap::new()`) keep the byte-identical `reopen_for_mutation`
+    // path. Delete tables ARE staged now (MR-A), so their handle is present
+    // like any other staged write.
     mut committed_handles: std::collections::HashMap<String, SnapshotHandle>,
 ) -> Result<Vec<crate::db::SubTableUpdate>> {
     if updates.is_empty() {

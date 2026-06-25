@@ -830,14 +830,14 @@ async fn stage_delete_does_not_advance_head_and_reads_through_staged() {
     assert!(none.is_none(), "a 0-row delete must stage nothing");
 }
 
-/// Companion to `delete_where_*`: pin the inline-commit behavior of
-/// `create_vector_index`. Lance 6.0.1 vector indices take the
-/// "segment commit path" which calls `build_index_metadata_from_segments`
-/// (`pub(crate)` in lance-6.0.1 `src/index.rs:111`). Until upstream
-/// exposes that helper (companion ticket to lance-format/lance#6658),
-/// the trait surface deliberately does NOT include
-/// `stage_create_vector_index` — same rationale as `stage_delete`'s
-/// absence (no side-channel between staged and inline write paths).
+/// Pin the inline-commit behavior of `create_vector_index` — the SOLE
+/// remaining inline residual now that `delete` has migrated to `stage_delete`
+/// (MR-A). Vector indices take Lance's "segment commit path" which calls
+/// `build_index_metadata_from_segments` (`pub(crate)` in Lance 7.0.0). Until
+/// upstream exposes that helper (lance-format/lance#6666), the trait surface
+/// deliberately does NOT include `stage_create_vector_index` — keeping the
+/// inline coupling off `TableStorage` so no side-channel exists between the
+/// staged and inline write paths.
 #[tokio::test]
 async fn create_vector_index_advances_head_inline_documents_residual() {
     use arrow_array::FixedSizeListArray;

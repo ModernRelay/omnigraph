@@ -1663,7 +1663,7 @@ async fn branch_cascade_delete_forks_node_and_edges_under_held_queues() {
 // #283: a mutation predicate (`where camelField = ...`) on a camelCase column
 // must execute, not fail at the Lance scan with "No field named ...". Covers
 // both `update` (committed scan via scan_with_pending) and `delete`
-// (delete_where), which share the same emitted SQL filter string.
+// (stage_delete), which share the same emitted SQL filter string.
 const CC_SCHEMA: &str = r#"
 node Doc {
     slug: String @key
@@ -1728,29 +1728,27 @@ query chain($repo: String) {
 }
 
 /// A zero-row cascade delete must not advance an edge table's Lance HEAD past
-/// its manifest version. A `delete <Node>` cascades a `delete_where` into every
-/// incident edge type (`exec/mutation.rs`). The inline `delete_where`
-/// (`Dataset::delete`) advances Lance HEAD **even when zero edges match**, but
-/// the cascade records the new version in the manifest only `if deleted_rows >
-/// 0`. So deleting a node with no incident edges advances `edge:Knows` Lance
-/// HEAD while the manifest stays behind — a `HEAD > manifest` drift that then
-/// trips the next strict write's `ExpectedVersionMismatch`, and `repair`
-/// refuses (delete-class drift), wedging the graph.
+/// its manifest version. A `delete <Node>` cascades a delete into every incident
+/// edge type (`exec/mutation.rs`). The original bug this guards against: the old
+/// inline `delete_where` (`Dataset::delete`) advanced Lance HEAD **even when zero
+/// edges matched**, while the cascade recorded the new version in the manifest
+/// only `if deleted_rows > 0`. So deleting a node with no incident edges advanced
+/// `edge:Knows` Lance HEAD while the manifest stayed behind — a `HEAD > manifest`
+/// drift that then tripped the next strict write's `ExpectedVersionMismatch`, and
+/// `repair` refused (delete-class drift), wedging the graph.
 ///
 /// This pins the invariant directly: after any node delete, every edge table's
-/// manifest version must equal its on-disk Lance HEAD — no inline write may
-/// advance HEAD past the manifest (invariant 2 / the deny-list). RED today;
-/// GREEN once `delete` migrates to the staged two-phase path (iss-950, unblocked
-/// by Lance 7.0's `DeleteBuilder::execute_uncommitted`), where a 0-row delete
-/// commits no Lance version at all and the existing `deleted_rows > 0` gate
-/// becomes correct by construction.
+/// manifest version must equal its on-disk Lance HEAD — no write may advance HEAD
+/// past the manifest (invariant 2 / the deny-list). Now GREEN: `delete` is staged
+/// (MR-A / iss-950, via Lance 7.0's `DeleteBuilder::execute_uncommitted`), so a
+/// 0-row delete commits no Lance version at all — correct by construction.
 #[tokio::test]
 async fn node_delete_with_no_incident_edges_leaves_no_edge_table_drift() {
     let dir = tempfile::tempdir().unwrap();
     let mut db = init_and_load(&dir).await;
     let root = dir.path().to_str().unwrap().to_string();
 
-    // A person with NO Knows edges. Deleting it cascades a 0-row `delete_where`
+    // A person with NO Knows edges. Deleting it cascades a 0-row delete
     // into `edge:Knows` (the cascade runs for every incident edge type).
     mutate_main(
         &mut db,
@@ -1779,9 +1777,9 @@ async fn node_delete_with_no_incident_edges_leaves_no_edge_table_drift() {
     assert_eq!(
         entry.table_version, head,
         "a node delete matching no edges advanced edge:Knows Lance HEAD to v{head} but the \
-         manifest still records v{} — HEAD>manifest drift from a 0-row cascade `delete_where` not \
-         committed through the staged path. Fix: migrate delete to the staged two-phase API \
-         (iss-950).",
+         manifest still records v{} — HEAD>manifest drift from a 0-row cascade delete. A staged \
+         0-row delete must commit no Lance version at all (MR-A); this drift means that \
+         regressed.",
         entry.table_version,
     );
 }
