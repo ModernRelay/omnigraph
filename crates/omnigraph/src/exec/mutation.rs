@@ -658,6 +658,31 @@ async fn open_table_for_mutation(
     Ok((opened.handle, opened.full_path, opened.table_branch))
 }
 
+/// Build the committed-snapshot filter used to COUNT a delete statement's
+/// `affected_*`, excluding rows a prior delete statement on the same table
+/// already scheduled for removal in this query.
+///
+/// Deletes stage — they no longer inline-commit — so every statement in a
+/// delete-only query scans the same unchanged committed snapshot. Counting each
+/// predicate independently would double-count overlapping statements (the old
+/// inline path did not, because each delete committed before the next ran). The
+/// combined staged delete actually removes the UNION `p₁ ∪ p₂ ∪ …`; excluding
+/// the prior predicates here makes each statement contribute `|pₙ \ (p₁ ∪ …)|`,
+/// whose sum is exactly that distinct count. `base` (the original predicate) is
+/// still what gets recorded — only the count uses this exclusion.
+fn dedup_delete_filter(base: &str, prior: &[String]) -> String {
+    if prior.is_empty() {
+        base.to_string()
+    } else {
+        let excluded = prior
+            .iter()
+            .map(|p| format!("({p})"))
+            .collect::<Vec<_>>()
+            .join(" OR ");
+        format!("({base}) AND NOT ({excluded})")
+    }
+}
+
 /// D₂ parse-time check: a single mutation query is either insert/update-only
 /// or delete-only. Mixed → reject before any I/O.
 ///
@@ -1347,10 +1372,17 @@ impl Omnigraph {
 
         // Scan matching IDs for cascade. Per D₂ this never overlaps with
         // staged inserts (mixed insert/delete in one query is rejected at
-        // parse time), so we scan committed only.
+        // parse time), so we scan committed only. Exclude IDs a prior delete
+        // statement on this table already scheduled (deletes stage, so the
+        // committed snapshot is unchanged across statements): without this,
+        // overlapping predicates would double-count `affected_nodes` AND
+        // re-cascade already-deleted nodes' edges. The combined staged delete
+        // still removes the union, so we record the original `pred_sql` below.
+        let scan_filter =
+            dedup_delete_filter(&pred_sql, staging.recorded_delete_predicates(&table_key));
         let batches = self
             .storage()
-            .scan(&ds, Some(&["id"]), Some(&pred_sql), None)
+            .scan(&ds, Some(&["id"]), Some(&scan_filter), None)
             .await?;
 
         let deleted_ids: Vec<String> = batches
@@ -1430,12 +1462,17 @@ impl Omnigraph {
             // staged deletes the rows aren't removed until end-of-query, so
             // count the matching committed edges now. Exact under D₂ (no staged
             // inserts can add matches mid-query), and bounded by the cascade
-            // working set. Only record the predicate when it matches at least
-            // one row — a zero-match cascade stages nothing (the staged
-            // equivalent of the old "skip record_inline on 0 deleted rows").
+            // working set. Exclude edges a prior delete statement (a prior
+            // cascade, or an explicit edge delete) on this table already
+            // scheduled, so an edge incident to two deleted nodes — or matched
+            // by both a cascade and an explicit `delete <Edge>` — is counted
+            // once. Record the ORIGINAL cascade filter (the combined staged
+            // delete removes the union); skip only when nothing NEW matches.
+            let count_filter =
+                dedup_delete_filter(&cascade_filter, staging.recorded_delete_predicates(&edge_table_key));
             let matched = self
                 .storage()
-                .count_rows(&edge_ds, Some(cascade_filter.clone()))
+                .count_rows(&edge_ds, Some(count_filter))
                 .await?;
             affected_edges += matched;
 
@@ -1479,11 +1516,16 @@ impl Omnigraph {
         let ds = handle.expect("strict Delete op always opens its dataset");
 
         // Count matching committed edges now (the staged delete won't remove
-        // them until end-of-query). Exact under D₂; only record the predicate
-        // when it matches at least one row, so a no-op delete stages nothing.
+        // them until end-of-query). Exact under D₂; exclude edges a prior delete
+        // statement on this table (an earlier cascade or edge delete) already
+        // scheduled, so overlapping statements don't double-count. Record the
+        // ORIGINAL predicate below (the combined staged delete removes the
+        // union); only record when something NEW matches.
+        let count_filter =
+            dedup_delete_filter(&pred_sql, staging.recorded_delete_predicates(&table_key));
         let affected = self
             .storage()
-            .count_rows(&ds, Some(pred_sql.clone()))
+            .count_rows(&ds, Some(count_filter))
             .await?;
 
         if affected > 0 {
