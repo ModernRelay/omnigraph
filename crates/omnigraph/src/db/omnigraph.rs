@@ -154,7 +154,7 @@ pub struct Omnigraph {
     /// write-serialization mechanism (the server holds the engine as a
     /// lockless `Arc<Omnigraph>`). Reachable from engine internals
     /// (mutation finalize, schema_apply, branch_merge, ensure_indices,
-    /// delete_where, the fork path, recovery reconciler).
+    /// the fork path, recovery reconciler).
     write_queue: Arc<crate::db::write_queue::WriteQueueManager>,
     /// Process-wide mutex held across the swap → operate → restore window
     /// in `branch_merge_impl`. Two concurrent merges with distinct targets
@@ -702,13 +702,14 @@ impl Omnigraph {
         &self.table_store
     }
 
-    /// Inline-commit residual surface (`delete_where`,
-    /// `create_vector_index`) — the writes Lance cannot yet express as a
-    /// stage-then-commit pair. Deliberately separate from [`Self::storage`] so
-    /// the default storage surface is staged-only and a new writer cannot couple
-    /// "write bytes" with "advance HEAD" by reaching for `db.storage()`. Only
-    /// the handful of documented residual call sites (mutation/merge deletes,
-    /// vector-index build) use this accessor. See
+    /// Inline-commit residual surface (`create_vector_index`) — the sole
+    /// write Lance cannot yet express as a stage-then-commit pair (segment
+    /// commit needs `build_index_metadata_from_segments`, Lance #6666).
+    /// Deliberately separate from [`Self::storage`] so the default storage
+    /// surface is staged-only and a new writer cannot couple "write bytes" with
+    /// "advance HEAD" by reaching for `db.storage()`. Only the vector-index
+    /// build uses this accessor — delete migrated to the staged path
+    /// (`stage_delete`) in MR-A. See
     /// `crate::storage_layer::InlineCommitResidual` for the per-method blocker.
     pub(crate) fn storage_inline_residual(
         &self,
@@ -726,7 +727,7 @@ impl Omnigraph {
     /// Per-`(table_key, branch)` writer queues.
     ///
     /// Engine-internal writers (mutation finalize, schema_apply,
-    /// branch_merge, ensure_indices, delete_where) and the future MR-870
+    /// branch_merge, ensure_indices) and the future MR-870
     /// recovery reconciler reach the queue manager via this accessor.
     /// Returns an `Arc` clone so callers can hold the manager across
     /// `&mut self` engine API boundaries.

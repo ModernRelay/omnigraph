@@ -1065,9 +1065,10 @@ async fn publish_rewritten_merge_table(
     staged: &StagedMergeResult,
 ) -> Result<crate::db::SubTableUpdate> {
     // Branch merge's source-rewrite path is Merge-shaped (upsert from
-    // source onto target). The inline `delete_where` later in this
-    // function operates on rows the rewrite chose to remove, not
-    // user-facing predicates, so Merge is the correct policy here.
+    // source onto target). The staged delete later in this function
+    // (`stage_delete` + `commit_staged`) operates on rows the rewrite chose
+    // to remove, not user-facing predicates, so Merge is the correct policy
+    // here.
     // `open_for_mutation` is the no-txn entry, so collapse #1's non-strict
     // open-skip (gated on `txn.is_some()`) never fires here — the handle is
     // always `Some`.
@@ -1599,7 +1600,7 @@ impl Omnigraph {
         // Pin `RewriteMerged` and `AdoptWithDelta` candidates — both advance
         // Lance HEAD before the manifest publish (RewriteMerged via
         // publish_rewritten_merge_table; AdoptWithDelta via publish_adopted_delta:
-        // stage_append + stage_merge_insert + delete_where + index — multiple
+        // stage_append + stage_merge_insert + stage_delete + index — multiple
         // commit_staged calls per table, which the loose classification handles
         // as multi-step drift).
         //
