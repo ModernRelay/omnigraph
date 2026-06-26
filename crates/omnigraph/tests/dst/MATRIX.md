@@ -42,7 +42,7 @@ Legend: ✅ sampled · 🟡 partial · ❌ unsampled · ⏸️ deferred-by-plan 
 | repair | ✅ | walk (`Repair`) |
 | read | ✅ | walk, readshape |
 | branch create/write/merge | 🟡 | `branch_isolation_and_merge` (scenario, not generic walk) |
-| **`open` / recovery sweep** | ❌ | **only a fixture step (`reopen`), never a generated op — the `#296` gap** |
+| **`open` / recovery sweep** | ✅ | walk (`Reopen` op, walk-driven mid-sequence) + failpoint recovery cells (`dst_recovery`: roll-forward under finalize failure + the `#296` concurrent-opens-converge cell) |
 | cleanup (version GC) | ❌ | needs `&mut self`; deferred |
 | apply-schema mid-sequence | ❌ | forks the single-branch model; deferred |
 | overwrite (`LoadMode::Overwrite`) | ❌ | deferred |

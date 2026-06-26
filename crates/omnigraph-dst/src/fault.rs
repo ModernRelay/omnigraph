@@ -1,11 +1,17 @@
 //! A fault-injecting `StorageAdapter` wrapper (SlateDB-style). Wrap the base
-//! adapter and inject seeded faults on the manifest/commit/CAS layer, then open
-//! the graph via `Omnigraph::open_with_storage`.
+//! adapter and inject seeded faults on the storage-adapter conditional-write
+//! seam, then open the graph via `Omnigraph::open_with_storage`.
 //!
-//! The high-value fault is a spurious CAS-lost on `write_text_if_match` (the
-//! conditional manifest write): the engine MUST surface it (retry / fence),
-//! never silently lose the write. If a write is lost, `check_counts` (count==
-//! model) catches it as a NOVEL violation. Optional latency exercises timing.
+//! The fault is a spurious CAS-lost on `write_text_if_match` — the
+//! StorageAdapter conditional TEXT-OBJECT write (recovery sidecars, schema
+//! staging, cluster state). SCOPE NOTE: this is **not** the Lance
+//! manifest-publish CAS — graph data commits publish `__manifest` through Lance
+//! `MergeInsertBuilder`/`ManifestBatchPublisher`, which bypasses this adapter,
+//! so a pure-data op walk exercises few/no `write_text_if_match` calls and the
+//! manifest-publish fault path is covered SEPARATELY by the failpoint recovery
+//! cells (`dst_recovery`), not here. Where a conditional write IS lost, the
+//! engine must surface/retry it (never silently drop it); `check_counts`
+//! (count==model) catches a swallowed loss as a NOVEL violation.
 
 use std::sync::{Arc, Mutex};
 

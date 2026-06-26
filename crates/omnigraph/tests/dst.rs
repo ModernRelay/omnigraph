@@ -470,8 +470,12 @@ async fn seeded_op_loop_invariants_hold() {
     run_walk(false).await;
 }
 
-/// Phase 2: same walk under injected manifest CAS-lost faults. The engine must
-/// surface/retry them (never silently lose a write) — count==model catches loss.
+/// Phase 2: same walk under injected `StorageAdapter` conditional-write CAS-lost
+/// faults (`FaultAdapter`). The engine must surface/retry them (never silently
+/// lose a write) — count==model catches loss. SCOPE: this seam is the text-object
+/// conditional write (sidecars/schema-staging/cluster-state), NOT the Lance
+/// manifest-publish CAS — that path is covered by the failpoint cells in
+/// `dst_recovery`, so this walk's value here is the recovery/sidecar CAS layer.
 #[tokio::test]
 async fn seeded_op_loop_with_cas_faults() {
     run_walk(true).await;
