@@ -671,6 +671,13 @@ async fn open_table_for_mutation(
 /// whose sum is exactly that distinct count. `base` (the original predicate) is
 /// still what gets recorded — only the count uses this exclusion.
 ///
+/// LOAD-BEARING on D₂: this exclusion assumes the committed snapshot is
+/// invariant across the query's statements, which holds only because D₂
+/// (`enforce_no_mixed_destructive_constructive`) forbids mixing inserts/updates
+/// with deletes — so a delete-touched table never has pending writes that would
+/// shift what a later statement sees. If D₂ is ever relaxed, this dedup must be
+/// revisited (a later delete would then need to see prior in-query writes).
+///
 /// The exclusion uses `IS NOT TRUE`, not `NOT`, because of SQL three-valued
 /// logic: a prior predicate referencing a column that is NULL for some row
 /// (e.g. `age > 30` on a row with NULL `age`) evaluates to UNKNOWN, and
