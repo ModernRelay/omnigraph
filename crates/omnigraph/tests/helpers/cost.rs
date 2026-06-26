@@ -268,8 +268,11 @@ pub async fn cost_harness<F: Future>(body: F) -> F::Output {
         manifest_wrapper: Some(Arc::new(meter.manifest.clone()) as Arc<dyn WrappingObjectStore>),
         ..Default::default()
     };
+    // Box the body so the (large) per-test future lives on the heap. Wrapping a whole
+    // test body in another async layer otherwise overflows the test thread's stack —
+    // these cost tests already raise `recursion_limit` for the same reason.
     COST_METER
-        .scope(meter, with_query_io_probes(probes, body))
+        .scope(meter, with_query_io_probes(probes, Box::pin(body)))
         .await
 }
 
