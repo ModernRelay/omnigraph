@@ -35,7 +35,9 @@ pub(crate) use metadata::TableVersionMetadata;
 use metadata::{OMNIGRAPH_ROW_COUNT_KEY, table_version_metadata_for_state};
 #[cfg(test)]
 use namespace::{branch_manifest_namespace, staged_table_namespace};
-use publisher::{GraphNamespacePublisher, ManifestBatchPublisher};
+pub(crate) use migrations::refuse_if_stamp_unsupported;
+pub(crate) use publisher::LineageIntent;
+use publisher::{GraphNamespacePublisher, ManifestBatchPublisher, PublishOutcome};
 pub(crate) use recovery::{
     RecoveryMode, RecoverySidecar, RecoverySidecarHandle, SidecarKind, SidecarTablePin,
     SidecarTableRegistration, SidecarTombstone, confirm_sidecar_phase_b, delete_sidecar,
@@ -43,6 +45,7 @@ pub(crate) use recovery::{
     recover_manifest_drift, schema_apply_serial_queue_key, write_sidecar,
 };
 pub use state::SubTableEntry;
+pub(crate) use state::{GraphLineageRow, read_graph_lineage};
 #[cfg(test)]
 use state::string_column;
 use state::{ManifestState, read_manifest_state};
@@ -50,7 +53,33 @@ use state::{ManifestState, read_manifest_state};
 const OBJECT_TYPE_TABLE: &str = "table";
 const OBJECT_TYPE_TABLE_VERSION: &str = "table_version";
 const OBJECT_TYPE_TABLE_TOMBSTONE: &str = "table_tombstone";
+/// Immutable per-commit graph-lineage row (RFC-013 Phase 7). One row per graph
+/// commit; the projected form reconstructs a [`GraphCommit`]. `__manifest` is
+/// the single source — written in the same publish CAS as the table-version
+/// rows (no `_graph_commits.lance` row).
+const OBJECT_TYPE_GRAPH_COMMIT: &str = "graph_commit";
+/// Mutable per-branch head pointer for the graph lineage (RFC-013 Phase 7).
+/// `object_id` is `graph_head:<branch>` (`graph_head:main` for the main branch).
+const OBJECT_TYPE_GRAPH_HEAD: &str = "graph_head";
 const TABLE_VERSION_MANAGEMENT_KEY: &str = "table_version_management";
+
+/// Stable head-key segment for the main branch in `graph_head:<branch>` rows.
+/// `table_branch`/`manifest_branch` encode main as null, but `object_id` must be
+/// non-null, so the head row needs a literal — matching the `"main"` sentinel
+/// already used by `SnapshotId::synthetic` and `open_for_branch`.
+pub(crate) const MAIN_BRANCH_HEAD_KEY: &str = "main";
+
+/// The result of a manifest commit that may have folded in a graph commit
+/// (RFC-013 Phase 7).
+#[derive(Debug, Clone)]
+pub(crate) struct CommitOutcome {
+    /// The new `__manifest` version after the publish.
+    pub version: u64,
+    /// The parent the publisher resolved for the recorded commit, or `None` when
+    /// no lineage was recorded or the commit is the genesis. Lets the caller
+    /// update its in-memory commit cache without re-reading the manifest.
+    pub parent_commit_id: Option<String>,
+}
 
 /// Apply pending internal-schema migrations against `__manifest` on the
 /// open-for-write path, independent of a publish.
@@ -65,7 +94,105 @@ const TABLE_VERSION_MANAGEMENT_KEY: &str = "table_version_management";
 /// Idempotent: a no-op stamp read when the on-disk version already matches.
 pub(crate) async fn migrate_on_open(root_uri: &str) -> Result<()> {
     let mut dataset = open_manifest_dataset(root_uri, None).await?;
-    migrations::migrate_internal_schema(&mut dataset).await
+    // Main branch: the v3→v4 lineage backfill reads `_graph_commits.lance` at
+    // main. Named branches migrate on their own first write via the publisher.
+    migrations::migrate_internal_schema(&mut dataset, root_uri, None).await
+}
+
+/// The on-disk internal-schema stamp of `__manifest` at `branch` (main when
+/// `None`). The transitional v3-read fallback in `CommitGraph` uses this to
+/// decide whether to source lineage from `__manifest` (stamp ≥ v4, post-Phase-7)
+/// or from the legacy `_graph_commits.lance` (stamp < v4, not yet migrated).
+pub(crate) async fn internal_schema_stamp_at(root_uri: &str, branch: Option<&str>) -> Result<u32> {
+    let dataset = open_manifest_dataset(root_uri, branch).await?;
+    Ok(migrations::read_stamp(&dataset))
+}
+
+/// Refuse to open a graph whose `__manifest` is stamped outside this binary's
+/// supported internal-schema range (newer than CURRENT, or older than
+/// MIN_SUPPORTED). The read-only open path calls this — it skips the write-path
+/// migration where the refusal otherwise lives — so an old binary still refuses a
+/// newer graph instead of silently misreading it, and a too-new binary refuses a
+/// below-floor graph instead of opening an unmigrated one.
+pub(crate) async fn refuse_if_internal_schema_unsupported(root_uri: &str) -> Result<()> {
+    let stamp = internal_schema_stamp_at(root_uri, None).await?;
+    migrations::refuse_if_stamp_unsupported(stamp)
+}
+
+/// The internal-schema version this binary writes. Exposed so the v3-read
+/// fallback can compare a branch's on-disk stamp against it.
+pub(crate) const INTERNAL_MANIFEST_SCHEMA_VERSION: u32 =
+    migrations::INTERNAL_MANIFEST_SCHEMA_VERSION;
+
+/// Test-only: create a `__manifest` for a minimal catalog, the first half of a
+/// synthetic pre-Phase-7 (v3) graph (see `commit_graph::seed_legacy_v3_lineage`).
+/// A small two-type schema is enough — the v3→v4 migration touches only the
+/// lineage rows, never the table-version rows.
+#[cfg(any(test, feature = "failpoints"))]
+pub(crate) async fn seed_manifest_for_v3_fixture(root_uri: &str) -> Result<()> {
+    let schema = omnigraph_compiler::schema::parser::parse_schema(
+        "node Person { name: String }\nedge Knows: Person -> Person { }\n",
+    )
+    .map_err(|e| OmniError::manifest(e.to_string()))?;
+    let catalog =
+        omnigraph_compiler::catalog::build_catalog(&schema).map_err(|e| OmniError::manifest(e.to_string()))?;
+    ManifestCoordinator::init(root_uri, &catalog).await?;
+    Ok(())
+}
+
+/// Test-only: strip the `graph_commit`/`graph_head` rows that Phase-7 init folds
+/// into `__manifest`, then rewind the internal-schema stamp to v3 — completing a
+/// synthetic pre-Phase-7 graph whose lineage lives only in `_graph_commits.lance`.
+#[cfg(any(test, feature = "failpoints"))]
+pub(crate) async fn strip_lineage_and_set_v3_stamp_for_fixture(root_uri: &str) -> Result<()> {
+    let mut dataset = open_manifest_dataset(root_uri, None).await?;
+    dataset
+        .delete("object_type = 'graph_commit' OR object_type = 'graph_head'")
+        .await
+        .map_err(|e| OmniError::Lance(e.to_string()))?;
+    // Re-open so the stamp write lands on the post-delete HEAD.
+    let mut dataset = open_manifest_dataset(root_uri, None).await?;
+    migrations::set_stamp_for_test(&mut dataset, 3).await
+}
+
+/// Test-only: fork a real Lance branch `name` on `__manifest` from main's CURRENT
+/// state. Call AFTER `strip_lineage_and_set_v3_stamp_for_fixture` so the forked
+/// branch inherits the v3 stamp with no lineage rows — i.e. a faithful
+/// pre-Phase-7 branch whose `__manifest` carries no lineage of its own. The
+/// branch's commits live only on the `_graph_commits.lance` branch until the
+/// per-branch v3→v4 migration runs against this branch's `__manifest`.
+#[cfg(test)]
+pub(crate) async fn fork_manifest_branch_for_v3_fixture(root_uri: &str, name: &str) -> Result<()> {
+    let mut dataset = open_manifest_dataset(root_uri, None).await?;
+    let version = dataset.version().version;
+    dataset
+        .create_branch(name, version, None)
+        .await
+        .map_err(|e| OmniError::Lance(e.to_string()))?;
+    Ok(())
+}
+
+/// Test-support re-export of the read-write migration entry point for the
+/// `failpoints` integration binary (which can't reach `pub(crate)` items). Gated
+/// on `test` OR `failpoints`; never in a release build.
+#[cfg(any(test, feature = "failpoints"))]
+pub async fn migrate_on_open_for_test(root_uri: &str) -> Result<()> {
+    migrate_on_open(root_uri).await
+}
+
+/// Test-support: the number of `graph_commit` lineage rows in `__manifest` at
+/// `branch` (main when `None`), plus the on-disk internal-schema stamp. Lets the
+/// `failpoints` integration binary assert the migration neither stamped nor
+/// backfilled when a legacy-open fault fired. Gated on `test` OR `failpoints`.
+#[cfg(any(test, feature = "failpoints"))]
+pub async fn lineage_row_count_and_stamp_for_test(
+    root_uri: &str,
+    branch: Option<&str>,
+) -> Result<(usize, u32)> {
+    let dataset = open_manifest_dataset(root_uri, branch).await?;
+    let stamp = migrations::read_stamp(&dataset);
+    let (rows, _heads) = read_graph_lineage(&dataset).await?;
+    Ok((rows.len(), stamp))
 }
 
 /// Immutable point-in-time view of the database.
@@ -313,6 +440,9 @@ impl ManifestCoordinator {
     /// Create a new graph at `root_uri` from a catalog.
     ///
     /// Creates per-type Lance datasets and the namespace `__manifest` table.
+    /// The genesis graph commit is folded into the init write, so `__manifest`
+    /// is the single source of graph lineage from version one — callers read it
+    /// back through the lineage projection rather than via a second write.
     pub async fn init(root_uri: &str, catalog: &Catalog) -> Result<Self> {
         let root = root_uri.trim_end_matches('/');
         let (dataset, known_state) = init_manifest_graph(root, catalog).await?;
@@ -419,17 +549,58 @@ impl ManifestCoordinator {
         changes: &[ManifestChange],
         expected_table_versions: &HashMap<String, u64>,
     ) -> Result<u64> {
-        if changes.is_empty() && expected_table_versions.is_empty() {
-            return Ok(self.version());
+        Ok(self
+            .commit_changes_with_lineage(changes, expected_table_versions, None)
+            .await?
+            .version)
+    }
+
+    /// Publish `changes` and, when `lineage` is present, record the graph commit
+    /// in the SAME merge-insert (RFC-013 Phase 7). `__manifest` is the single
+    /// source of graph lineage: the `graph_commit` + `graph_head:<branch>` rows
+    /// ride the table-version publish so the whole commit lands at one manifest
+    /// version — no separate write, no manifest→commit-graph atomicity gap, no
+    /// per-write commit-graph refresh. Returns the new version and the parent the
+    /// publisher resolved for the commit (so the caller can update its in-memory
+    /// commit cache without a re-read).
+    pub(crate) async fn commit_changes_with_lineage(
+        &mut self,
+        changes: &[ManifestChange],
+        expected_table_versions: &HashMap<String, u64>,
+        lineage: Option<&LineageIntent>,
+    ) -> Result<CommitOutcome> {
+        if changes.is_empty() && expected_table_versions.is_empty() && lineage.is_none() {
+            return Ok(CommitOutcome {
+                version: self.version(),
+                parent_commit_id: None,
+            });
         }
 
-        self.dataset = self
+        let PublishOutcome {
+            dataset,
+            parent_commit_id,
+        } = self
             .publisher
-            .publish(changes, expected_table_versions)
+            .publish(changes, expected_table_versions, lineage)
             .await?;
+        self.dataset = dataset;
 
         self.known_state = read_manifest_state(&self.dataset).await?;
-        Ok(self.version())
+        Ok(CommitOutcome {
+            version: self.version(),
+            parent_commit_id,
+        })
+    }
+
+    /// Project the graph-lineage rows out of `__manifest` at `branch` without an
+    /// open coordinator. Opens the manifest fresh; used by `CommitGraph` to
+    /// source its in-memory cache from the manifest projection.
+    pub(crate) async fn read_graph_lineage_at(
+        root_uri: &str,
+        branch: Option<&str>,
+    ) -> Result<(Vec<GraphLineageRow>, HashMap<String, String>)> {
+        let dataset = open_manifest_dataset(root_uri, branch).await?;
+        read_graph_lineage(&dataset).await
     }
 
     /// Current manifest version.

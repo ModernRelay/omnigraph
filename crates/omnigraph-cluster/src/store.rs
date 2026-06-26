@@ -408,10 +408,6 @@ impl ClusterStore {
         }
     }
 
-    pub(crate) fn payload_display(&self, kind: &ResourceKind, digest: &str) -> Option<String> {
-        Self::payload_relative(kind, digest).map(|relative| self.display(&relative))
-    }
-
     pub(crate) async fn payload_exists(&self, kind: &ResourceKind, digest: &str) -> bool {
         let Some(relative) = Self::payload_relative(kind, digest) else {
             return false;

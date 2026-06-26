@@ -14,8 +14,16 @@ use super::layout::{manifest_uri, open_manifest_dataset, type_name_hash};
 use super::metadata::TableVersionMetadata;
 use super::migrations::stamp_current_version;
 use super::state::{
-    ManifestState, SubTableEntry, entries_to_batch, manifest_schema, read_manifest_state,
+    GraphLineageRow, ManifestState, SubTableEntry, entries_to_batch, graph_lineage_row_parts,
+    manifest_schema, read_manifest_state,
 };
+
+/// The manifest version the init `Dataset::write` produces (Lance datasets start
+/// at version one). The genesis graph commit pins this version — a snapshot at
+/// it is the empty, freshly-initialized graph. The two config-only commits that
+/// follow (`update_config`, `stamp_current_version`) advance the live manifest
+/// version but add no table data, so genesis correctly stays pinned at one.
+const GENESIS_MANIFEST_VERSION: u64 = 1;
 
 pub(super) async fn init_manifest_graph(
     root_uri: &str,
@@ -24,7 +32,21 @@ pub(super) async fn init_manifest_graph(
     let root = root_uri.trim_end_matches('/');
     let (entries, version_metadata) = build_initial_entries(root, catalog).await?;
 
-    let manifest_batch = entries_to_batch(&entries, &version_metadata)?;
+    // Genesis graph commit: parentless, actorless, minted once and folded into
+    // the init write so `__manifest` is the single source of graph lineage from
+    // version one (no `_graph_commits.lance` row, no separate publish).
+    let genesis = GraphLineageRow {
+        graph_commit_id: ulid::Ulid::new().to_string(),
+        manifest_branch: None,
+        manifest_version: GENESIS_MANIFEST_VERSION,
+        parent_commit_id: None,
+        merged_parent_commit_id: None,
+        actor_id: None,
+        created_at: crate::db::now_micros()?,
+    };
+    let genesis_lineage = graph_lineage_row_parts(&genesis, None)?;
+
+    let manifest_batch = entries_to_batch(&entries, &version_metadata, &genesis_lineage)?;
     let schema = manifest_schema();
     let reader = RecordBatchIterator::new(vec![Ok(manifest_batch)], schema);
     let params = WriteParams {

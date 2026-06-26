@@ -86,6 +86,83 @@ async fn lance_error_too_much_write_contention_variant_exists() {
     );
 }
 
+// --- Guard 1a: LanceError::IncompatibleTransaction variant exists ----------
+//
+// `db/manifest/migrations.rs::commit_v4_stamp_idempotently` pattern-matches on
+// this variant: two concurrent v3→v4 runners both bump the internal-schema stamp
+// (an `UpdateConfig` commit on the same metadata key), and the loser gets
+// `IncompatibleTransaction`. Since both write the same value the conflict is
+// benign and is retried idempotently. If Lance renames the variant or removes the
+// builder, the match silently stops catching the conflict — this guard fails to
+// force an update.
+
+#[tokio::test]
+async fn lance_error_incompatible_transaction_variant_exists() {
+    let err =
+        lance::Error::incompatible_transaction_source("concurrent UpdateConfig at version N".into());
+    assert!(
+        matches!(err, lance::Error::IncompatibleTransaction { .. }),
+        "Lance::Error::IncompatibleTransaction variant missing or renamed; \
+         update db/manifest/migrations.rs::commit_v4_stamp_idempotently and \
+         this guard, then re-pin docs/dev/lance.md."
+    );
+}
+
+// --- Guard 1c: LanceError::DatasetAlreadyExists variant exists --------------
+//
+// `db/commit_graph.rs` and `db/recovery_audit.rs` create internal Lance tables
+// with a create-or-open idempotency fallback: a concurrent/prior create races,
+// and the `DatasetAlreadyExists` arm falls back to `Dataset::open`. They match
+// the typed variant, NOT the display string ("Dataset already exists: ..."),
+// which is not a Lance API contract. If Lance renames the variant the match
+// silently stops catching the race and a re-create errors instead of opening —
+// this guard turns red to force an update.
+
+#[tokio::test]
+async fn lance_error_dataset_already_exists_variant_exists() {
+    let err = lance::Error::dataset_already_exists("guard");
+    assert!(
+        matches!(err, lance::Error::DatasetAlreadyExists { .. }),
+        "Lance::Error::DatasetAlreadyExists variant missing or renamed; update the \
+         db/commit_graph.rs + db/recovery_audit.rs create-or-open fallbacks and \
+         this guard, then re-pin docs/dev/lance.md."
+    );
+}
+
+// --- Guard 1b: Dataset::open on a missing path returns a not-found variant --
+//
+// `db/commit_graph.rs::read_legacy_commit_cache` (the v3→v4 lineage migration
+// source) classifies a legacy-open error: a genuine not-found is the benign
+// "no legacy data" signal (empty cache), and ANY OTHER error propagates loudly
+// rather than being read as "empty" — a swallow there would let the migration
+// stamp v4 over an empty backfill, orphaning real lineage permanently. That
+// classification relies on Lance mapping an object-store NotFound to
+// `DatasetNotFound` (or, for some paths, `NotFound`). If a Lance bump emits a
+// different variant for a missing dataset, the migration would propagate a
+// genuine "no legacy data" as a hard error — this guard turns red to force the
+// classifier (and this guard) to be updated together.
+
+#[tokio::test]
+async fn dataset_open_missing_returns_not_found_variant() {
+    let dir = tempfile::tempdir().unwrap();
+    // A path that was never written — nothing to open.
+    let missing = dir.path().join("does-not-exist.lance");
+    let err = match Dataset::open(missing.to_str().unwrap()).await {
+        Ok(_) => panic!("opening a never-written dataset path must error"),
+        Err(e) => e,
+    };
+    assert!(
+        matches!(
+            err,
+            lance::Error::DatasetNotFound { .. } | lance::Error::NotFound { .. }
+        ),
+        "Dataset::open on a missing path no longer returns DatasetNotFound/NotFound \
+         (got: {err:?}); update db/commit_graph.rs::read_legacy_commit_cache's \
+         legacy-open classification and this guard together, then re-pin \
+         docs/dev/lance.md."
+    );
+}
+
 // --- Guard 2: ManifestLocation field shape ---------------------------------
 //
 // `db/manifest/metadata.rs:84-88` reads `.path`, `.size`, `.e_tag`,

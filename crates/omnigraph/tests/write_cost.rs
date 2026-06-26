@@ -130,7 +130,16 @@ async fn single_insert_data_write_is_bounded() {
 
 /// At a fixed shallow depth, the per-write object-store read count is below a
 /// documented ceiling. Fails the moment a change *adds* a round-trip on the write
-/// path — the "no new round-trip" guard (calibrated: ~50 at depth ~5).
+/// path — the "no new round-trip" guard.
+///
+/// Two folds keep the count low: RFC-013 Phase 7 put the `graph_commit` +
+/// `graph_head` rows in the same publish merge-insert (no extra `__manifest`
+/// write/scan per commit), and RFC-013 P2 collapsed the publish path's FOUR
+/// `__manifest` scans (table locations + version entries + tombstones + a
+/// separate `read_graph_lineage` for the parent) into ONE — the
+/// `manifest_reads` sub-ceiling below would trip if any of those scans crept
+/// back. Calibrated at depth ~5: ~26 `__manifest` reads / ~36 total after the
+/// P2 fold (was ~44 / ~54 with the four separate scans).
 #[tokio::test]
 async fn write_op_count_ceiling_at_shallow_depth() {
     let dir = tempfile::tempdir().unwrap();
@@ -140,6 +149,16 @@ async fn write_op_count_ceiling_at_shallow_depth() {
     eprintln!(
         "depth~5: data={} __manifest={} _graph_commits={} total_reads={}",
         io.data_reads, io.manifest_reads, io.commit_graph_reads, io.total_reads()
+    );
+    // Sub-ceiling on `__manifest` reads specifically: the publish path does one
+    // scan, not four. ~26 measured at this depth; a re-added scan would push it
+    // well past this. (Deterministic on local FS.)
+    const MANIFEST_CEILING: u64 = 34;
+    assert!(
+        io.manifest_reads <= MANIFEST_CEILING,
+        "per-write __manifest reads {} exceeded ceiling {MANIFEST_CEILING} — a publish-path \
+         scan was re-added (RFC-013 P2 folds them into one)",
+        io.manifest_reads,
     );
     const CEILING: u64 = 80;
     assert!(

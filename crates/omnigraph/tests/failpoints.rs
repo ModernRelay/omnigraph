@@ -3632,47 +3632,24 @@ async fn branch_merge_phase_b_failure_recovered_on_next_open() {
     );
 
     // The recovered branch_merge must record a MERGE commit (with
-    // `merged_parent_commit_id` set), not a plain commit. Without
-    // this, future merges between the same pair lose
-    // already-up-to-date detection. We verify by reading
-    // `_graph_commits.lance` and asserting the most recent commit
-    // tagged with the recovery actor has a non-null
-    // `merged_parent_commit_id`.
+    // `merged_parent_commit_id` set), not a plain commit. Without this, future
+    // merges between the same pair lose already-up-to-date detection. RFC-013
+    // Phase 7 records the recovery commit in `__manifest` (folded into the
+    // recovery publish CAS), so we read it through the commit-graph projection
+    // (`CommitGraph::load_commits`) and assert some commit carries a non-null
+    // `merged_parent_commit_id`. Only a recovered branch_merge can produce one
+    // here (we never completed a normal merge in this test).
     {
-        use arrow_array::{Array, StringArray};
-        use futures::TryStreamExt;
-        let commits_dir = dir.path().join("_graph_commits.lance");
-        let ds = lance::Dataset::open(commits_dir.to_str().unwrap())
-            .await
-            .unwrap();
-        let batches: Vec<arrow_array::RecordBatch> = ds
-            .scan()
-            .try_into_stream()
-            .await
-            .unwrap()
-            .try_collect()
-            .await
-            .unwrap();
-        let mut found_recovery_merge = false;
-        for batch in batches {
-            let merged = batch
-                .column_by_name("merged_parent_commit_id")
-                .expect("merged_parent_commit_id column present")
-                .as_any()
-                .downcast_ref::<StringArray>()
-                .expect("merged_parent_commit_id is Utf8");
-            // The actor_id lives in _graph_commit_actors; cross-checking
-            // is heavier than necessary. Detecting any non-null
-            // merged_parent_commit_id in the post-recovery state is
-            // sufficient: only a recovered branch_merge can produce one
-            // here (we never completed a normal merge in this test).
-            for i in 0..merged.len() {
-                if !merged.is_null(i) {
-                    found_recovery_merge = true;
-                    break;
-                }
-            }
-        }
+        let commits =
+            omnigraph::db::commit_graph::CommitGraph::open(dir.path().to_str().unwrap())
+                .await
+                .unwrap()
+                .load_commits()
+                .await
+                .unwrap();
+        let found_recovery_merge = commits
+            .iter()
+            .any(|c| c.merged_parent_commit_id.is_some());
         assert!(
             found_recovery_merge,
             "recovered branch_merge must record `merged_parent_commit_id` so future \
@@ -4495,4 +4472,154 @@ async fn init_failpoint_returns_original_error_not_cleanup_error() {
         msg.contains("init.after_schema_pg_written"),
         "init error must surface the failpoint cause, got: {msg}"
     );
+}
+
+// ── RFC-013 Phase 7 / FIX A: a transient legacy-open failure must abort the ──
+// v3→v4 migration loudly, not silently swallow the lineage and stamp v4.
+//
+// `migrate_v3_to_v4` backfills graph lineage from `_graph_commits.lance` into
+// `__manifest`, then stamps internal-schema v4. The migration runs exactly once
+// per graph (`migrate_internal_schema` is `while stamp < CURRENT`). If a
+// transient or corrupt `Dataset::open` of the legacy commit dataset is treated
+// as "no legacy data" (the pre-fix `Err(_) => empty` arm), the migration backfills
+// NOTHING and stamps v4 — orphaning the real lineage permanently, since the v3
+// fallback is then disabled. The fix matches the not-found variants (benign:
+// genuinely no legacy data) and propagates anything else.
+//
+// This test injects a non-not-found Lance error at the legacy open via the
+// `migration.v3_to_v4.legacy_open` failpoint. The load-bearing assertion is the
+// last one: a once-transient failure leaves the graph RETRYABLE (stamp still v3,
+// no lineage), so a later open with the fault cleared completes the migration —
+// it was not a poison pill.
+#[tokio::test]
+async fn transient_legacy_open_failure_aborts_migration_without_stamping_v4() {
+    let _scenario = FailScenario::setup();
+    let dir = tempfile::tempdir().unwrap();
+    let uri = dir.path().to_str().unwrap().to_string();
+
+    // A real pre-Phase-7 (v3) graph: lineage only in `_graph_commits.lance`,
+    // `__manifest` stamped v3 with no `graph_commit` rows.
+    let fixture = omnigraph::db::commit_graph::seed_legacy_v3_lineage(&uri)
+        .await
+        .unwrap();
+    let (rows_before, stamp_before) =
+        omnigraph::db::manifest::lineage_row_count_and_stamp_for_test(&uri, None)
+            .await
+            .unwrap();
+    assert_eq!(stamp_before, 3, "fixture is stamped v3");
+    assert_eq!(rows_before, 0, "fixture has no lineage in __manifest");
+
+    // Arm the legacy-open fault and run the read-write migration entry point.
+    {
+        let _fp = ScopedFailPoint::new(names::MIGRATION_V3_TO_V4_LEGACY_OPEN, "return");
+        let err = match omnigraph::db::manifest::migrate_on_open_for_test(&uri).await {
+            Ok(()) => panic!("migration must abort when the legacy open fails transiently"),
+            Err(e) => e,
+        };
+        // The injected (non-not-found) Lance error must surface, not be masked.
+        let msg = err.to_string();
+        assert!(
+            msg.contains("injected failpoint triggered: migration.v3_to_v4.legacy_open"),
+            "expected the injected legacy-open error to propagate, got: {msg}"
+        );
+    }
+
+    // The migration left NO drift: stamp still v3, still no lineage. (Pre-fix,
+    // the swallow would have stamped v4 with an empty backfill — permanent loss.)
+    let (rows_after_fault, stamp_after_fault) =
+        omnigraph::db::manifest::lineage_row_count_and_stamp_for_test(&uri, None)
+            .await
+            .unwrap();
+    assert_eq!(
+        stamp_after_fault, 3,
+        "a transient legacy-open failure must NOT stamp the manifest to v4",
+    );
+    assert_eq!(
+        rows_after_fault, 0,
+        "a transient legacy-open failure must NOT partially backfill lineage",
+    );
+
+    // The whole correctness claim: a once-transient failure is retryable. With the
+    // fault cleared, the next migration pass reads the legacy lineage and completes.
+    omnigraph::db::manifest::migrate_on_open_for_test(&uri)
+        .await
+        .unwrap();
+    let (rows_done, stamp_done) =
+        omnigraph::db::manifest::lineage_row_count_and_stamp_for_test(&uri, None)
+            .await
+            .unwrap();
+    assert_eq!(stamp_done, 4, "the retried migration stamps v4");
+    assert_eq!(
+        rows_done,
+        fixture.all_ids.len(),
+        "the retried migration backfills every legacy commit",
+    );
+}
+
+// ── RFC-013 Phase 7 / FIX B follow-up: the v3→v4 stamp-bump retry loop must ──
+// surface a RETRYABLE contention error on exhaustion, not a stringified Lance error.
+//
+// `commit_v4_stamp_idempotently` bumps the internal-schema stamp under concurrent
+// runners: the `UpdateConfig` CAS loser gets `IncompatibleTransaction`, re-opens,
+// confirms the winner stamped the same value, and is done. Genuine exhaustion (every
+// attempt loses) must return a `RowLevelCasContention` so the publisher's OUTER retry
+// completes the one-time open — an `OmniError::Lance` would be treated as fatal. The
+// `migration.v4_stamp.force_incompatible` failpoint forces every stamp attempt to lose,
+// driving the otherwise-near-unreachable exhaustion path deterministically. (Pre-fix —
+// `0..=BUDGET` + an `attempt < BUDGET` guard — the last iteration fell through to the
+// stringifying `Err(e)` arm and returned a non-retryable `OmniError::Lance`.)
+#[tokio::test]
+async fn v4_stamp_exhaustion_returns_retryable_contention() {
+    let _scenario = FailScenario::setup();
+    let dir = tempfile::tempdir().unwrap();
+    let uri = dir.path().to_str().unwrap().to_string();
+
+    // A real v3 graph: the backfill merge succeeds; only the terminal stamp loop
+    // is forced to exhaust.
+    let _fixture = omnigraph::db::commit_graph::seed_legacy_v3_lineage(&uri)
+        .await
+        .unwrap();
+
+    let _fp = ScopedFailPoint::new(names::MIGRATION_V4_STAMP_FORCE_INCOMPATIBLE, "return");
+    let err = match omnigraph::db::manifest::migrate_on_open_for_test(&uri).await {
+        Ok(()) => panic!("migration must error when the stamp bump exhausts its retries"),
+        Err(e) => e,
+    };
+    assert!(
+        matches!(
+            &err,
+            omnigraph::error::OmniError::Manifest(m)
+                if matches!(
+                    m.details,
+                    Some(omnigraph::error::ManifestConflictDetails::RowLevelCasContention)
+                )
+        ),
+        "stamp-bump exhaustion must surface a RETRYABLE RowLevelCasContention so the \
+         publisher's outer retry completes the open, got: {err:?}",
+    );
+}
+
+// The publisher's outer retry must re-run `load_publish_state` on a RETRYABLE error,
+// not propagate it fatally. `load_publish_state` runs `migrate_internal_schema`, whose
+// bounded merge/stamp loops surface a `RowLevelCasContention` on exhaustion EXPECTING
+// this re-run (a clean second scan, by which point a concurrent winner has finished the
+// migration). Before the fix, `load_publish_state().await?` short-circuited the loop —
+// only `merge_rows` conflicts hit the retry — so the typed contention aborted the
+// publish. Inject a ONE-SHOT retryable contention into `load_publish_state`: the write
+// must still commit, because the publisher retries and the cleared second attempt wins.
+#[tokio::test]
+#[serial]
+async fn publisher_retries_retryable_load_publish_state_error() {
+    let _scenario = FailScenario::setup();
+    let dir = tempfile::tempdir().unwrap();
+    let db = helpers::init_and_load(&dir).await;
+
+    // `1*return`: fail only the FIRST `load_publish_state` of the next publish, so the
+    // retry's second call is clean. Set after `init_and_load` so its publishes are
+    // unaffected.
+    let _fp = ScopedFailPoint::new(names::PUBLISH_LOAD_STATE_RETRYABLE_CONTENTION, "1*return");
+    let row = r#"{"type":"Person","data":{"name":"Grace","age":37}}"#;
+    db.load_as("main", None, row, LoadMode::Merge, None)
+        .await
+        .expect("publisher must retry the one-shot retryable load_publish_state error and commit");
 }

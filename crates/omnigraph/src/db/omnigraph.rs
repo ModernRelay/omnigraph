@@ -123,12 +123,12 @@ pub struct Omnigraph {
     /// calls without a global write lock). Reads (`snapshot`, `version`,
     /// `current_branch`, `branch_list`, `resolve_*`, `head_commit_id`,
     /// `list_commits`, …) acquire `.read().await` and parallelize.
-    /// Writes (`refresh`, `branch_create`, `branch_delete`, `commit_*`,
-    /// `record_*`) acquire `.write().await` and serialize. The atomic
-    /// commit invariant — `commit_manifest_updates` followed by
-    /// `record_graph_commit` must be atomic — is preserved by the
-    /// single `.write()` covering both calls inside
-    /// `commit_updates_with_actor_with_expected`. PR 2 Phase 2
+    /// Writes (`refresh`, `branch_create`, `branch_delete`, `commit_*`)
+    /// acquire `.write().await` and serialize. The atomic commit invariant —
+    /// table-version rows and the graph commit are one unit — holds by
+    /// construction since RFC-013 Phase 7: both ride a SINGLE manifest publish
+    /// CAS (`commit_changes_with_lineage`), so there is no two-write window to
+    /// keep atomic. PR 2 Phase 2
     /// converted from `Mutex` to `RwLock` because the bench showed
     /// the Mutex was the dominant serializer for disjoint-table
     /// workloads. Lock acquisition order: always before `runtime_cache`
@@ -417,6 +417,14 @@ impl Omnigraph {
         // first read-write open (an accepted, documented limitation).
         if matches!(mode, OpenMode::ReadWrite) {
             crate::db::manifest::migrate_on_open(&root).await?;
+        } else {
+            // A read-only open skips `migrate_on_open` (no object-store writes),
+            // which is where the version refusal otherwise lives. Still refuse a
+            // `__manifest` stamped outside this binary's supported range — newer
+            // than CURRENT (an old binary cannot silently misread a newer graph,
+            // e.g. one folded to internal-schema v4 lineage), or below
+            // MIN_SUPPORTED (predates the readers we carry). Read-only, no write.
+            crate::db::manifest::refuse_if_internal_schema_unsupported(&root).await?;
         }
         // Open the coordinator first so the schema-staging recovery sweep can
         // compare its snapshot against any leftover staging files.
@@ -1779,28 +1787,17 @@ impl Omnigraph {
         table_ops::commit_updates(self, updates).await
     }
 
-    pub(crate) async fn commit_manifest_updates(
+    /// Publish a branch merge: the merged table `updates` and the merge commit
+    /// in one manifest CAS (RFC-013 Phase 7). The merge commit's merged-in parent
+    /// is `merged_parent_commit_id` (the source head); its first parent is the
+    /// live target-branch head, resolved by the publisher.
+    pub(crate) async fn commit_merge_with_actor(
         &self,
         updates: &[crate::db::SubTableUpdate],
-    ) -> Result<u64> {
-        table_ops::commit_manifest_updates(self, updates).await
-    }
-
-    pub(crate) async fn record_merge_commit(
-        &self,
-        manifest_version: u64,
-        parent_commit_id: &str,
         merged_parent_commit_id: &str,
         actor_id: Option<&str>,
     ) -> Result<String> {
-        table_ops::record_merge_commit(
-            self,
-            manifest_version,
-            parent_commit_id,
-            merged_parent_commit_id,
-            actor_id,
-        )
-        .await
+        table_ops::commit_merge_with_actor(self, updates, merged_parent_commit_id, actor_id).await
     }
 
     pub(crate) async fn commit_updates_on_branch_with_expected(
