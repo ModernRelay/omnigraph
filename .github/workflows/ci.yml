@@ -94,6 +94,8 @@ jobs:
               crates/omnigraph-cluster/tests/s3_cluster.rs) run_rustfs_ci=true ;;
               crates/omnigraph-server/tests/s3.rs|crates/omnigraph-server/tests/support/*) run_rustfs_ci=true ;;
               crates/omnigraph-cli/tests/system_local.rs) run_rustfs_ci=true ;;
+              crates/omnigraph/tests/dst.rs|crates/omnigraph/tests/dst/*) run_rustfs_ci=true ;;
+              crates/omnigraph-dst/*) run_rustfs_ci=true ;;
             esac
           done
 
@@ -402,6 +404,19 @@ jobs:
           [ "$status" -eq 0 ] || exit "$status"
           echo "$output" | grep -Eq "test result: ok\. [1-9][0-9]* passed" \
             || { echo "::error::filter 's3_' matched no tests — vacuous pass"; exit 1; }
+
+      - name: Run RustFS DST white-box battery
+        # The DST harness's S3-context battery (`s3_battery_holds`) is bucket-
+        # gated and lives in the `dst` target, which no other job runs — without
+        # this step the battery skips everywhere and MATRIX/testing.md overstate
+        # the S3 coverage. Same grep-guard as above: the name filter must match a
+        # real test (here the bucket IS set, so it runs rather than skips).
+        run: |
+          output=$(cargo test --locked -p omnigraph-engine --test dst s3_battery_holds -- --nocapture 2>&1); status=$?
+          echo "$output"
+          [ "$status" -eq 0 ] || exit "$status"
+          echo "$output" | grep -Eq "test result: ok\. [1-9][0-9]* passed" \
+            || { echo "::error::filter 's3_battery_holds' matched no tests — vacuous pass"; exit 1; }
 
       - name: Dump RustFS logs on failure
         if: failure()
