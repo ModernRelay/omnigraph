@@ -867,6 +867,33 @@ impl Omnigraph {
         Ok(manifest.snapshot())
     }
 
+    /// Probe-gated OCC re-capture snapshot (RFC-013 PR2 #1a). The commit-time OCC
+    /// re-read MUST be as fresh as a cold re-scan (see `commit_all`), but a cold
+    /// `__manifest` full scan per write is O(fragments) and a dominant write-path
+    /// cost. When the warm coordinator is already bound to `branch` AND a cheap
+    /// incarnation probe (one object-store op, no row scan) proves it is current,
+    /// the warm snapshot IS byte-identical to a fresh re-read, so reuse it with
+    /// zero scans. On ANY mismatch — a concurrent in- or cross-process advance, or
+    /// a different bound branch — fall through to the cold
+    /// `fresh_snapshot_for_branch_unchecked` read, preserving the "must be fresh"
+    /// contract and cross-process drift detection. Mirrors the read path's
+    /// `resolve_target_inner` probe-and-reuse idiom; same-branch sequential writes
+    /// keep `coordinator` current (each commit refreshes its `known_state`), so the
+    /// common case reuses and skips the scan. The publish CAS
+    /// (`expected_table_versions`) remains the final arbiter.
+    pub(crate) async fn occ_snapshot_for_branch(&self, branch: Option<&str>) -> Result<Snapshot> {
+        {
+            let coord = self.coordinator.read().await;
+            if branch == coord.current_branch() {
+                let held = coord.manifest_incarnation();
+                if coord.probe_latest_incarnation().await?.matches(&held) {
+                    return Ok(coord.snapshot());
+                }
+            }
+        }
+        self.fresh_snapshot_for_branch_unchecked(branch).await
+    }
+
     pub(crate) async fn version(&self) -> u64 {
         self.coordinator.read().await.version()
     }

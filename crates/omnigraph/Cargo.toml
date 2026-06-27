@@ -56,6 +56,8 @@ arc-swap = { workspace = true }
 omnigraph-compiler = { path = "../omnigraph-compiler", version = "0.7.2" }
 tokio = { workspace = true }
 lance-namespace-impls = { workspace = true }
-lance-io = "7.0.0"
+# test-util gates IoStats.requests + assert_io_eq! (failure diagnostics only); dev-dep,
+# so production builds (which exclude dev-deps) never see it.
+lance-io = { version = "7.0.0", features = ["test-util"] }
 serial_test = "3"
 proptest = "1"
