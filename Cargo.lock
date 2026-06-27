@@ -4939,6 +4939,7 @@ dependencies = [
  "fail",
  "futures",
  "lance",
+ "lance-core",
  "lance-datafusion",
  "lance-file",
  "lance-index",

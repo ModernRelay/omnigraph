@@ -98,8 +98,9 @@ async fn lance_error_too_much_write_contention_variant_exists() {
 
 #[tokio::test]
 async fn lance_error_incompatible_transaction_variant_exists() {
-    let err =
-        lance::Error::incompatible_transaction_source("concurrent UpdateConfig at version N".into());
+    let err = lance::Error::incompatible_transaction_source(
+        "concurrent UpdateConfig at version N".into(),
+    );
     assert!(
         matches!(err, lance::Error::IncompatibleTransaction { .. }),
         "Lance::Error::IncompatibleTransaction variant missing or renamed; \
@@ -339,10 +340,10 @@ async fn _compile_transaction_history_for_repair_signature() -> lance::Result<()
 //
 // `table_store.rs::stage_delete` uses the two-phase delete (lance#6658, Lance
 // 7.0): it reads `num_deleted_rows` (0 ⇒ no-op `None`) and stages `transaction`
-// WITHOUT committing, instead of the inline `Dataset::delete`. Commit relies on
-// OmniGraph's per-table queue + manifest CAS, so `affected_rows` is never
-// threaded (pinned here only for presence — naming `RowAddrTreeMap` would pull
-// in `lance-core`). Compile-only.
+// WITHOUT committing, instead of the inline `Dataset::delete`. It must also
+// preserve `affected_rows` and pass it to `CommitBuilder::with_affected_rows`
+// through `StagedWrite`; dropping it disables Lance's row-level rebase metadata.
+// Compile-only.
 #[allow(
     dead_code,
     unreachable_code,
@@ -352,11 +353,40 @@ async fn _compile_transaction_history_for_repair_signature() -> lance::Result<()
 )]
 async fn _compile_uncommitted_delete_field_shape() -> lance::Result<()> {
     use lance::dataset::DeleteBuilder;
+    use lance_core::utils::mask::RowAddrTreeMap;
     let ds: Arc<Dataset> = unimplemented!();
-    let staged = DeleteBuilder::new(ds, "x = 1").execute_uncommitted().await?;
+    let staged = DeleteBuilder::new(ds, "x = 1")
+        .execute_uncommitted()
+        .await?;
     let _txn: lance::dataset::transaction::Transaction = staged.transaction;
     let _num_deleted: u64 = staged.num_deleted_rows;
-    let _has_affected: bool = staged.affected_rows.is_some();
+    let _affected: Option<RowAddrTreeMap> = staged.affected_rows;
+    Ok(())
+}
+
+// --- Guard 8b: MergeInsertJob::execute_uncommitted returns
+//     UncommittedMergeInsert { transaction, affected_rows, stats, inserted_rows_filter } ---
+//
+// `TableStore::stage_merge_insert` has the same staged commit contract as
+// delete: the Lance transaction and `affected_rows` metadata must travel
+// together into `commit_staged`.
+#[allow(
+    dead_code,
+    unreachable_code,
+    unused_variables,
+    unused_mut,
+    clippy::diverging_sub_expression
+)]
+async fn _compile_uncommitted_merge_insert_field_shape() -> lance::Result<()> {
+    use lance_core::utils::mask::RowAddrTreeMap;
+    let ds: Arc<Dataset> = unimplemented!();
+    let source: Box<dyn arrow_array::RecordBatchReader + Send> = unimplemented!();
+    let job = MergeInsertBuilder::try_new(ds, vec!["x".to_string()])?.try_build()?;
+    let staged = job.execute_uncommitted(source).await?;
+    let _txn: lance::dataset::transaction::Transaction = staged.transaction;
+    let _affected: Option<RowAddrTreeMap> = staged.affected_rows;
+    let _stats = staged.stats;
+    let _inserted_rows_filter = staged.inserted_rows_filter;
     Ok(())
 }
 
@@ -762,7 +792,9 @@ async fn scalar_index_use_requires_matched_literal_type() {
         vec![
             Arc::new(StringArray::from(vec!["a", "b", "c", "d"])),
             Arc::new(Int32Array::from(vec![1, 5, 9, 13])),
-            Arc::new(arrow_array::Date32Array::from(vec![19000, 19723, 20000, 20500])),
+            Arc::new(arrow_array::Date32Array::from(vec![
+                19000, 19723, 20000, 20500,
+            ])),
         ],
     )
     .unwrap();
@@ -791,7 +823,11 @@ async fn scalar_index_use_requires_matched_literal_type() {
     // (label, filter, expect_index_used)
     let cases = [
         ("n32 = 5i32 (matched Int32)", col("n32").eq(lit(5i32)), true),
-        ("n32 = 5i64 (widened Int64)", col("n32").eq(lit(5i64)), false),
+        (
+            "n32 = 5i64 (widened Int64)",
+            col("n32").eq(lit(5i64)),
+            false,
+        ),
         (
             "d32 = Date32 (matched)",
             col("d32").eq(lit(ScalarValue::Date32(Some(19723)))),
@@ -922,7 +958,10 @@ async fn skip_auto_cleanup_suppresses_version_gc() {
     async fn set_legacy_cleanup(ds: &mut Dataset) {
         let mut cfg = HashMap::new();
         cfg.insert("lance.auto_cleanup.interval".to_string(), "1".to_string());
-        cfg.insert("lance.auto_cleanup.older_than".to_string(), "0ms".to_string());
+        cfg.insert(
+            "lance.auto_cleanup.older_than".to_string(),
+            "0ms".to_string(),
+        );
         ds.update_config(cfg).await.unwrap();
     }
     fn row(i: i32) -> (Arc<Schema>, RecordBatch) {
@@ -1117,10 +1156,14 @@ async fn camelcase_index_equality_routes_to_scalar_index() {
         ..Default::default()
     };
     let mut ds = Dataset::write(reader, uri, Some(params)).await.unwrap();
-    ds.create_index_builder(&["repoName"], IndexType::BTree, &ScalarIndexParams::default())
-        .replace(true)
-        .await
-        .unwrap();
+    ds.create_index_builder(
+        &["repoName"],
+        IndexType::BTree,
+        &ScalarIndexParams::default(),
+    )
+    .replace(true)
+    .await
+    .unwrap();
 
     async fn plan_str(ds: &Dataset, filter: datafusion::prelude::Expr) -> lance::Result<String> {
         let mut scanner = ds.scan();

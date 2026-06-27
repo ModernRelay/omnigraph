@@ -22,7 +22,7 @@ use arrow_array::{Array, Int32Array, RecordBatch, StringArray, UInt64Array};
 use arrow_schema::{DataType, Field, Schema};
 use futures::TryStreamExt;
 use lance::Dataset;
-use lance::dataset::{WhenMatched, WhenNotMatched};
+use lance::dataset::{DeleteBuilder, WhenMatched, WhenNotMatched};
 use lance::index::DatasetIndexExt;
 use lance_index::IndexType;
 use lance_linalg::distance::MetricType;
@@ -66,6 +66,19 @@ fn person_batch(rows: &[(&str, Option<i32>)]) -> RecordBatch {
     .unwrap()
 }
 
+fn numbered_person_batch(range: std::ops::Range<i32>) -> RecordBatch {
+    let ids: Vec<String> = range.clone().map(|i| format!("p{i}")).collect();
+    let ages: Vec<Option<i32>> = range.map(Some).collect();
+    RecordBatch::try_new(
+        person_schema(),
+        vec![
+            Arc::new(StringArray::from(ids)),
+            Arc::new(Int32Array::from(ages)),
+        ],
+    )
+    .unwrap()
+}
+
 fn collect_ids(batches: &[RecordBatch]) -> Vec<String> {
     let mut out = Vec::new();
     for b in batches {
@@ -81,6 +94,29 @@ fn collect_ids(batches: &[RecordBatch]) -> Vec<String> {
     }
     out.sort();
     out
+}
+
+fn collect_age_for_id(batches: &[RecordBatch], needle: &str) -> Option<i32> {
+    for batch in batches {
+        let ids = batch
+            .column_by_name("id")
+            .unwrap()
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .unwrap();
+        let ages = batch
+            .column_by_name("age")
+            .unwrap()
+            .as_any()
+            .downcast_ref::<Int32Array>()
+            .unwrap();
+        for row in 0..batch.num_rows() {
+            if ids.value(row) == needle && !ages.is_null(row) {
+                return Some(ages.value(row));
+            }
+        }
+    }
+    None
 }
 
 #[tokio::test]
@@ -138,7 +174,7 @@ async fn stage_merge_insert_dedupes_superseded_committed_fragment() {
         .await
         .unwrap();
     assert!(
-        !staged.removed_fragment_ids.is_empty(),
+        !staged.removed_fragment_ids().is_empty(),
         "merge_insert that rewrites a committed row must set removed_fragment_ids \
          so the scan-with-staged composer can shadow the superseded committed \
          fragment — without it, the committed row and its rewrite both appear, \
@@ -277,7 +313,7 @@ async fn chained_stage_appends_have_distinct_row_ids() {
 fn combine_for_scan(ds: &Dataset, staged: &[StagedWrite]) -> Vec<Fragment> {
     let removed: std::collections::HashSet<u64> = staged
         .iter()
-        .flat_map(|w| w.removed_fragment_ids.iter().copied())
+        .flat_map(|w| w.removed_fragment_ids().iter().copied())
         .collect();
     let mut combined: Vec<_> = ds
         .manifest
@@ -287,7 +323,7 @@ fn combine_for_scan(ds: &Dataset, staged: &[StagedWrite]) -> Vec<Fragment> {
         .cloned()
         .collect();
     for s in staged {
-        combined.extend(s.new_fragments.iter().cloned());
+        combined.extend(s.new_fragments().iter().cloned());
     }
     combined
 }
@@ -313,7 +349,7 @@ async fn stage_append_then_commit_persists_data() {
         .unwrap();
 
     let new_ds = store
-        .commit_staged(Arc::new(ds.clone()), staged.transaction)
+        .commit_staged(Arc::new(ds.clone()), staged)
         .await
         .unwrap();
     assert!(
@@ -350,10 +386,7 @@ async fn stage_merge_insert_then_commit_persists_merged_view() {
         .await
         .unwrap();
 
-    store
-        .commit_staged(Arc::new(ds), staged.transaction)
-        .await
-        .unwrap();
+    store.commit_staged(Arc::new(ds), staged).await.unwrap();
 
     let reopened = Dataset::open(&uri).await.unwrap();
     let batches = store.scan_batches(&reopened).await.unwrap();
@@ -362,6 +395,53 @@ async fn stage_merge_insert_then_commit_persists_merged_view() {
     // Confirm alice was updated to age=31, not duplicated.
     let total: usize = batches.iter().map(|b| b.num_rows()).sum();
     assert_eq!(total, 2, "merge_insert must not duplicate the matched row");
+}
+
+#[tokio::test]
+async fn stage_merge_insert_commit_rebases_over_disjoint_committed_delete() {
+    let dir = tempfile::tempdir().unwrap();
+    let uri = format!("{}/people.lance", dir.path().to_str().unwrap());
+    let store = TableStore::new(dir.path().to_str().unwrap());
+
+    let ds = TableStore::write_dataset(&uri, numbered_person_batch(0..100))
+        .await
+        .unwrap();
+    let update_ids: Vec<String> = (0..10).map(|i| format!("p{i}")).collect();
+    let update_ages: Vec<Option<i32>> = (0..10).map(|i| Some(1000 + i)).collect();
+    let update_batch = RecordBatch::try_new(
+        person_schema(),
+        vec![
+            Arc::new(StringArray::from(update_ids)),
+            Arc::new(Int32Array::from(update_ages)),
+        ],
+    )
+    .unwrap();
+
+    let staged = store
+        .stage_merge_insert(
+            ds.clone(),
+            update_batch,
+            vec!["id".to_string()],
+            WhenMatched::UpdateAll,
+            WhenNotMatched::DoNothing,
+        )
+        .await
+        .unwrap();
+
+    DeleteBuilder::new(Arc::new(ds.clone()), "age >= 10 AND age < 20")
+        .execute()
+        .await
+        .unwrap();
+
+    let committed = store
+        .commit_staged(Arc::new(ds.clone()), staged)
+        .await
+        .unwrap();
+    assert_eq!(committed.count_rows(None).await.unwrap(), 90);
+
+    let batches = store.scan_batches(&committed).await.unwrap();
+    assert_eq!(collect_age_for_id(&batches, "p0"), Some(1000));
+    assert_eq!(collect_age_for_id(&batches, "p10"), None);
 }
 
 /// **Documented limitation** (see `scan_with_staged` doc): when a filter
@@ -537,7 +617,7 @@ async fn stage_overwrite_does_not_advance_head_until_commit() {
     // After commit_staged, HEAD advances and the dataset shows the
     // overwrite result (zoe alone — alice replaced).
     let new_ds = store
-        .commit_staged(Arc::new(ds.clone()), staged.transaction)
+        .commit_staged(Arc::new(ds.clone()), staged)
         .await
         .unwrap();
     assert!(new_ds.version().version > pre_version);
@@ -578,7 +658,7 @@ async fn stage_overwrite_preserves_stable_row_ids() {
         .await
         .unwrap();
     let new_ds = store
-        .commit_staged(Arc::new(ds.clone()), staged.transaction)
+        .commit_staged(Arc::new(ds.clone()), staged)
         .await
         .unwrap();
 
@@ -616,7 +696,7 @@ async fn stage_overwrite_replaces_all_fragments() {
         .await
         .unwrap();
     let removed: std::collections::HashSet<u64> =
-        staged.removed_fragment_ids.iter().copied().collect();
+        staged.removed_fragment_ids().iter().copied().collect();
     assert_eq!(
         removed, committed_fragment_ids,
         "stage_overwrite must list every committed fragment as removed so \
@@ -659,11 +739,11 @@ async fn stage_overwrite_empty_batch_replaces_all_rows() {
         .await
         .unwrap();
     assert!(
-        staged.new_fragments.is_empty(),
+        staged.new_fragments().is_empty(),
         "empty overwrite should produce a zero-fragment Lance Overwrite transaction"
     );
     assert_eq!(
-        staged.removed_fragment_ids.len(),
+        staged.removed_fragment_ids().len(),
         ds.manifest.fragments.len(),
         "empty overwrite still removes every committed fragment"
     );
@@ -674,7 +754,7 @@ async fn stage_overwrite_empty_batch_replaces_all_rows() {
     );
 
     let new_ds = store
-        .commit_staged(Arc::new(ds.clone()), staged.transaction)
+        .commit_staged(Arc::new(ds.clone()), staged)
         .await
         .unwrap();
     assert_eq!(new_ds.version().version, pre_version + 1);
@@ -726,7 +806,7 @@ async fn stage_create_btree_index_does_not_advance_head_until_commit() {
     );
 
     let new_ds = store
-        .commit_staged(Arc::new(ds.clone()), staged.transaction)
+        .commit_staged(Arc::new(ds.clone()), staged)
         .await
         .unwrap();
     assert!(new_ds.version().version > pre_version);
@@ -760,7 +840,7 @@ async fn stage_create_inverted_index_does_not_advance_head_until_commit() {
     assert!(!store.has_fts_index(&ds, "id").await.unwrap());
 
     let new_ds = store
-        .commit_staged(Arc::new(ds.clone()), staged.transaction)
+        .commit_staged(Arc::new(ds.clone()), staged)
         .await
         .unwrap();
     assert!(new_ds.version().version > pre_version);
@@ -819,15 +899,45 @@ async fn stage_delete_does_not_advance_head_and_reads_through_staged() {
 
     // Commit advances HEAD and persists the deletion.
     let committed = store
-        .commit_staged(std::sync::Arc::new(ds.clone()), staged.transaction)
+        .commit_staged(std::sync::Arc::new(ds.clone()), staged)
         .await
         .unwrap();
     assert!(committed.version().version > pre_version);
     assert_eq!(committed.count_rows(None).await.unwrap(), 1);
 
     // A 0-row delete is a true no-op: None, no version, no fragments.
-    let none = store.stage_delete(&committed, "id = 'nobody'").await.unwrap();
+    let none = store
+        .stage_delete(&committed, "id = 'nobody'")
+        .await
+        .unwrap();
     assert!(none.is_none(), "a 0-row delete must stage nothing");
+}
+
+#[tokio::test]
+async fn stage_delete_commit_rebases_over_disjoint_committed_delete() {
+    let dir = tempfile::tempdir().unwrap();
+    let uri = format!("{}/people.lance", dir.path().to_str().unwrap());
+    let store = TableStore::new(dir.path().to_str().unwrap());
+
+    let ds = TableStore::write_dataset(&uri, numbered_person_batch(0..100))
+        .await
+        .unwrap();
+    let staged = store
+        .stage_delete(&ds, "age < 10")
+        .await
+        .unwrap()
+        .expect("delete should match rows");
+
+    DeleteBuilder::new(Arc::new(ds.clone()), "age >= 10 AND age < 20")
+        .execute()
+        .await
+        .unwrap();
+
+    let committed = store
+        .commit_staged(Arc::new(ds.clone()), staged)
+        .await
+        .unwrap();
+    assert_eq!(committed.count_rows(None).await.unwrap(), 80);
 }
 
 /// Pin the inline-commit behavior of `create_vector_index` — the SOLE
@@ -1097,7 +1207,10 @@ async fn commit_staged_skips_auto_cleanup_so_pinned_versions_survive() {
     // every commit, delete anything older than now).
     let mut cfg = HashMap::new();
     cfg.insert("lance.auto_cleanup.interval".to_string(), "1".to_string());
-    cfg.insert("lance.auto_cleanup.older_than".to_string(), "0ms".to_string());
+    cfg.insert(
+        "lance.auto_cleanup.older_than".to_string(),
+        "0ms".to_string(),
+    );
     ds.update_config(cfg).await.unwrap();
 
     // Several writes through the engine's staged commit path.
@@ -1108,7 +1221,7 @@ async fn commit_staged_skips_auto_cleanup_so_pinned_versions_survive() {
             .await
             .unwrap();
         ds = store
-            .commit_staged(Arc::new(ds.clone()), staged.transaction)
+            .commit_staged(Arc::new(ds.clone()), staged)
             .await
             .unwrap();
     }

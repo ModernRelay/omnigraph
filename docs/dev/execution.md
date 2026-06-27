@@ -124,7 +124,7 @@ sequenceDiagram
     og->>stg: finalize(db, branch)
     loop per pending table
         stg->>ts: stage_append OR stage_merge_insert (one per table)
-        ts-->>stg: StagedWrite (transaction + fragments)
+        ts-->>stg: StagedWrite (transaction + commit metadata + fragments)
         stg->>ts: commit_staged (advances Lance HEAD)
         ts-->>stg: new Dataset
     end

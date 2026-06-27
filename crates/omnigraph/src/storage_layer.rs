@@ -158,7 +158,8 @@ impl SnapshotHandle {
 ///
 /// Produced by `TableStorage::stage_*`, consumed by
 /// `TableStorage::commit_staged`. Carries the underlying `StagedWrite`
-/// (transaction + read-your-writes deltas) behind `pub(crate)`.
+/// (transaction + commit metadata + read-your-writes deltas) behind
+/// `pub(crate)`.
 #[derive(Debug, Clone)]
 pub struct StagedHandle {
     pub(crate) inner: StagedWrite,
@@ -169,8 +170,7 @@ impl StagedHandle {
         Self { inner: staged }
     }
 
-    /// Take ownership of the inner `StagedWrite`. Used by
-    /// `commit_staged`.
+    /// Take ownership of the inner `StagedWrite`. Used by `commit_staged`.
     pub(crate) fn into_staged(self) -> StagedWrite {
         self.inner
     }
@@ -181,7 +181,8 @@ impl StagedHandle {
 /// `TableStore::stage_append`'s `prior_stages` parameter. The result is
 /// owned (not borrowed) — callers that already had a `&[StagedHandle]`
 /// pay a clone cost per element. `StagedWrite::clone` is cheap because
-/// `Transaction` and `Vec<Fragment>` are shallow-clone friendly.
+/// `Transaction`, commit metadata, and `Vec<Fragment>` are shallow-clone
+/// friendly.
 pub(crate) fn staged_handles_as_writes(handles: &[StagedHandle]) -> Vec<StagedWrite> {
     handles.iter().map(|h| h.inner.clone()).collect()
 }
@@ -731,8 +732,7 @@ impl TableStorage for TableStore {
         staged: StagedHandle,
     ) -> Result<SnapshotHandle> {
         let ds_arc = snapshot.into_arc();
-        let transaction = staged.into_staged().transaction;
-        TableStore::commit_staged(self, ds_arc, transaction)
+        TableStore::commit_staged(self, ds_arc, staged.into_staged())
             .await
             .map(SnapshotHandle::new)
     }

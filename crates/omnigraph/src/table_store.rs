@@ -16,6 +16,7 @@ use lance::dataset::{
 use lance::datatypes::{BlobKind, Schema as LanceSchema};
 use lance::index::DatasetIndexExt;
 use lance::index::scalar::IndexDetails;
+use lance_core::utils::mask::RowAddrTreeMap;
 use lance_file::version::LanceFileVersion;
 use lance_index::scalar::{InvertedIndexParams, ScalarIndexParams};
 use lance_index::{IndexType, is_system_index};
@@ -58,9 +59,9 @@ pub enum IndexCoverage {
 /// drifting ahead. See `docs/dev/writes.md` for the publisher-CAS contract
 /// this builds on.
 ///
-/// `transaction` is opaque from our side — Lance owns its semantics. We
-/// commit it via `CommitBuilder::execute(transaction)` (see
-/// `TableStore::commit_staged`).
+/// `transaction` and `commit_metadata` are opaque from our side — Lance owns
+/// their semantics. They must travel together so `commit_staged` can preserve
+/// Lance's row-level conflict resolution metadata for staged deletes/updates.
 ///
 /// For read-your-writes within the same query, `new_fragments` and
 /// `removed_fragment_ids` together describe the post-stage view delta:
@@ -72,21 +73,70 @@ pub enum IndexCoverage {
 /// stays in the committed manifest while its rewrite shows up in `new_fragments`).
 #[derive(Debug, Clone)]
 pub struct StagedWrite {
-    pub transaction: Transaction,
+    transaction: Transaction,
+    commit_metadata: StagedCommitMetadata,
     /// Fragments to surface alongside the committed manifest in
     /// `Scanner::with_fragments(committed - removed + new)`. For
     /// `Operation::Append` these are the freshly-appended fragments. For
     /// `Operation::Update` (merge_insert) these are
     /// `updated_fragments + new_fragments` (rewrites + freshly-inserted
     /// rows).
-    pub new_fragments: Vec<Fragment>,
+    new_fragments: Vec<Fragment>,
     /// Fragment IDs that this staged write supersedes. The committed
     /// manifest must filter these out before being combined with
     /// `new_fragments` for read-your-writes scans, otherwise rewrites
     /// yield duplicate rows. Empty for `stage_append` (`Operation::Append`
     /// adds without removing anything); populated from
     /// `Operation::Update.removed_fragment_ids` for `stage_merge_insert`.
-    pub removed_fragment_ids: Vec<u64>,
+    removed_fragment_ids: Vec<u64>,
+}
+
+#[derive(Debug, Clone, Default)]
+struct StagedCommitMetadata {
+    affected_rows: Option<RowAddrTreeMap>,
+}
+
+impl StagedCommitMetadata {
+    fn affected_rows(affected_rows: Option<RowAddrTreeMap>) -> Self {
+        Self { affected_rows }
+    }
+}
+
+impl StagedWrite {
+    fn new(
+        transaction: Transaction,
+        new_fragments: Vec<Fragment>,
+        removed_fragment_ids: Vec<u64>,
+    ) -> Self {
+        Self {
+            transaction,
+            commit_metadata: StagedCommitMetadata::default(),
+            new_fragments,
+            removed_fragment_ids,
+        }
+    }
+
+    fn with_commit_metadata(
+        transaction: Transaction,
+        commit_metadata: StagedCommitMetadata,
+        new_fragments: Vec<Fragment>,
+        removed_fragment_ids: Vec<u64>,
+    ) -> Self {
+        Self {
+            transaction,
+            commit_metadata,
+            new_fragments,
+            removed_fragment_ids,
+        }
+    }
+
+    pub fn new_fragments(&self) -> &[Fragment] {
+        &self.new_fragments
+    }
+
+    pub fn removed_fragment_ids(&self) -> &[u64] {
+        &self.removed_fragment_ids
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -379,10 +429,8 @@ impl TableStore {
         if has_blob_columns {
             let arrow_schema: SchemaRef = Arc::new(ds.schema().into());
             let batches = self.scan_batches_for_rewrite(ds).await?;
-            let reader = arrow_array::RecordBatchIterator::new(
-                batches.into_iter().map(Ok),
-                arrow_schema,
-            );
+            let reader =
+                arrow_array::RecordBatchIterator::new(batches.into_iter().map(Ok), arrow_schema);
             return Ok(lance_datafusion::utils::reader_to_stream(Box::new(reader)));
         }
         // Non-blob: a true lazy scan. `DatasetRecordBatchStream` converts to the
@@ -881,11 +929,9 @@ impl TableStore {
     /// `new_fragments` and the superseded originals (+ any fully-removed
     /// fragments) as `removed_fragment_ids`, so `combine_committed_with_staged`
     /// (`committed - removed + new`) makes an in-query read see the deletion.
-    /// Like `stage_merge_insert`, the commit relies on OmniGraph's per-table
-    /// write queue + manifest CAS for conflict detection, not Lance's
-    /// `affected_rows` resolver (the generic `commit_staged` does a single
-    /// attempt), so no `affected_rows` is threaded. (Staged-delete migration —
-    /// iss-950 / Lance #6658 `execute_uncommitted`.)
+    /// Like `stage_merge_insert`, this must carry Lance's `affected_rows`
+    /// metadata through to `commit_staged`; otherwise a staged transaction loses
+    /// the row-level conflict information Lance's rebase path needs.
     pub async fn stage_delete(&self, ds: &Dataset, filter: &str) -> Result<Option<StagedWrite>> {
         let uncommitted = DeleteBuilder::new(Arc::new(ds.clone()), filter)
             .execute_uncommitted()
@@ -917,11 +963,12 @@ impl TableStore {
             }
         };
 
-        Ok(Some(StagedWrite {
-            transaction: uncommitted.transaction,
+        Ok(Some(StagedWrite::with_commit_metadata(
+            uncommitted.transaction,
+            StagedCommitMetadata::affected_rows(uncommitted.affected_rows),
             new_fragments,
             removed_fragment_ids,
-        }))
+        )))
     }
 
     // ─── Staged-write API ────────────────────────────────────────────────────
@@ -1031,12 +1078,12 @@ impl TableStore {
             let start_row_id = ds.manifest.next_row_id + prior_rows;
             assign_row_id_meta(&mut new_fragments, start_row_id)?;
         }
-        Ok(StagedWrite {
+        Ok(StagedWrite::new(
             transaction,
             new_fragments,
             // Append never supersedes existing fragments.
-            removed_fragment_ids: Vec::new(),
-        })
+            Vec::new(),
+        ))
     }
 
     /// Streaming variant of [`Self::stage_append`]: appends the rows of `source`
@@ -1097,11 +1144,7 @@ impl TableStore {
             let start_row_id = ds.manifest.next_row_id + prior_rows;
             assign_row_id_meta(&mut new_fragments, start_row_id)?;
         }
-        Ok(StagedWrite {
-            transaction,
-            new_fragments,
-            removed_fragment_ids: Vec::new(),
-        })
+        Ok(StagedWrite::new(transaction, new_fragments, Vec::new()))
     }
 
     /// Stage a merge_insert (upsert): write fragment files describing the
@@ -1218,22 +1261,20 @@ impl TableStore {
                 )));
             }
         };
-        Ok(StagedWrite {
-            transaction: uncommitted.transaction,
+        Ok(StagedWrite::with_commit_metadata(
+            uncommitted.transaction,
+            StagedCommitMetadata::affected_rows(uncommitted.affected_rows),
             new_fragments,
             removed_fragment_ids,
-        })
+        ))
     }
 
-    /// Commit a previously-staged transaction onto `ds`, returning the new
-    /// dataset (with HEAD advanced). Wraps `CommitBuilder::execute`. Used by
+    /// Commit a previously-staged write onto `ds`, returning the new dataset
+    /// (with HEAD advanced). The staged packet owns the Lance transaction plus
+    /// any commit metadata (`affected_rows` for delete/merge rebase). Used by
     /// the publisher at end-of-query to materialize all staged writes before
     /// the meta-manifest commit.
-    pub async fn commit_staged(
-        &self,
-        ds: Arc<Dataset>,
-        transaction: Transaction,
-    ) -> Result<Dataset> {
+    pub async fn commit_staged(&self, ds: Arc<Dataset>, staged: StagedWrite) -> Result<Dataset> {
         // Skip Lance's auto-cleanup hook on every commit. OmniGraph owns version
         // GC explicitly (optimize.rs::cleanup_all_tables); Lance's hook fires off
         // the *dataset's stored* `lance.auto_cleanup.*` config, which graphs
@@ -1242,9 +1283,12 @@ impl TableStore {
         // upgraded graphs. Skipping here covers the staged write path (the main
         // data path) for new and legacy datasets alike, preventing Lance from
         // GC'ing versions the __manifest still pins for snapshots/time-travel.
-        CommitBuilder::new(ds)
-            .with_skip_auto_cleanup(true)
-            .execute(transaction)
+        let mut builder = CommitBuilder::new(ds).with_skip_auto_cleanup(true);
+        if let Some(affected_rows) = staged.commit_metadata.affected_rows {
+            builder = builder.with_affected_rows(affected_rows);
+        }
+        builder
+            .execute(staged.transaction)
             .await
             .map_err(|e| OmniError::Lance(e.to_string()))
     }
@@ -1331,11 +1375,11 @@ impl TableStore {
         // fragment in removed_fragment_ids so the post-stage view shows
         // ONLY the staged fragments.
         let removed_fragment_ids: Vec<u64> = ds.manifest.fragments.iter().map(|f| f.id).collect();
-        Ok(StagedWrite {
+        Ok(StagedWrite::new(
             transaction,
             new_fragments,
             removed_fragment_ids,
-        })
+        ))
     }
 
     /// Stage a BTREE scalar index build. Returns a StagedWrite whose
@@ -1384,11 +1428,7 @@ impl TableStore {
             },
         )
         .build();
-        Ok(StagedWrite {
-            transaction,
-            new_fragments: Vec::new(),
-            removed_fragment_ids: Vec::new(),
-        })
+        Ok(StagedWrite::new(transaction, Vec::new(), Vec::new()))
     }
 
     /// Stage an INVERTED (FTS) scalar index build. Same shape as
@@ -1423,11 +1463,7 @@ impl TableStore {
             },
         )
         .build();
-        Ok(StagedWrite {
-            transaction,
-            new_fragments: Vec::new(),
-            removed_fragment_ids: Vec::new(),
-        })
+        Ok(StagedWrite::new(transaction, Vec::new(), Vec::new()))
     }
 
     /// Run a scan with optional uncommitted staged writes visible
