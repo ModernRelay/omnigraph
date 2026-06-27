@@ -579,13 +579,16 @@ impl ManifestCoordinator {
         let PublishOutcome {
             dataset,
             parent_commit_id,
+            known_state,
         } = self
             .publisher
             .publish(changes, expected_table_versions, lineage)
             .await?;
+        // RFC-013 PR2 #1b: the publisher folded the new visible state in-memory
+        // (byte-identical to a re-scan via the shared `assemble_manifest_state`),
+        // so adopt it directly instead of an O(fragments) `read_manifest_state`.
         self.dataset = dataset;
-
-        self.known_state = read_manifest_state(&self.dataset).await?;
+        self.known_state = known_state;
         Ok(CommitOutcome {
             version: self.version(),
             parent_commit_id,

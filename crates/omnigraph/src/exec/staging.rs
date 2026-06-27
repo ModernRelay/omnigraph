@@ -602,15 +602,17 @@ impl StagedMutation {
         // genuine cross-process drift detection from this read for
         // free.
         //
-        // This MUST be a FRESH per-branch manifest read (never the warm
-        // cache) for the OCC re-capture below — but with a `WriteTxn` the
-        // schema contract was already validated at capture, so use the
-        // `_unchecked` variant, which drops the redundant
-        // `ensure_schema_state_valid` AND the commit-graph load the OCC read
-        // never consults (a fresh manifest read yields the same `Snapshot`).
-        // Without a txn this is byte-identical to the prior checked call.
+        // This MUST be as fresh as a FRESH per-branch manifest read for the OCC
+        // re-capture below. With a `WriteTxn` the schema contract was already
+        // validated at capture, so the txn arm uses `occ_snapshot_for_branch`
+        // (RFC-013 PR2 #1a): a cheap incarnation probe reuses the warm
+        // coordinator when it is already current (probe-match ⟺ warm == fresh)
+        // and falls through to the cold `_unchecked` read on any mismatch — so
+        // freshness AND cross-process drift detection are preserved while the
+        // common same-branch sequential write skips the O(fragments) scan.
+        // Without a txn, keep the checked cold read (legacy path).
         let snapshot = match txn {
-            Some(_) => db.fresh_snapshot_for_branch_unchecked(branch).await?,
+            Some(_) => db.occ_snapshot_for_branch(branch).await?,
             None => db.fresh_snapshot_for_branch(branch).await?,
         };
         for entry in staged.iter_mut() {
