@@ -15,6 +15,7 @@
 mod helpers;
 
 use arrow_array::Array;
+use lance::Dataset;
 use omnigraph::db::commit_graph::CommitGraph;
 use omnigraph::db::{Omnigraph, ReadTarget};
 use omnigraph::error::OmniError;
@@ -504,6 +505,11 @@ query delete_two_persons($first: String, $second: String) {
     delete Person where name = $second
 }
 
+query delete_overlapping_persons($name: String, $threshold: I32) {
+    delete Person where name = $name
+    delete Person where age > $threshold
+}
+
 query update_age_by_name($name: String, $age: I32) {
     update Person set { age: $age } where name = $name
 }
@@ -552,6 +558,111 @@ async fn mutation_rejects_mixed_insert_and_delete_at_parse_time() {
         "D₂ rejection must fire before any write",
     );
     assert_eq!(db.branch_list().await.unwrap(), vec!["main".to_string()]);
+}
+
+/// Overlapping delete predicates within one query must NOT double-count
+/// `affected_*`. Deletes stage (they no longer inline-commit), so both
+/// statements scan the same unchanged committed snapshot; counting each
+/// predicate independently over-reports when they overlap. The contract —
+/// matching the old inline path, where each delete committed before the next
+/// ran — is the DISTINCT count of rows removed (= what the combined
+/// `(p1) OR (p2)` staged delete actually removes).
+///
+/// Fixture: Alice(30), Bob(25), Charlie(35), Diana(28); Knows Alice→Bob,
+/// Alice→Charlie, Bob→Diana; WorksAt Alice→Acme, Bob→Globex. `name = "Alice"`
+/// ∪ `age > 29` = {Alice, Charlie} (2 distinct nodes); the combined cascade
+/// removes {Alice→Bob, Alice→Charlie, Alice→Acme} (3 distinct edges — Charlie
+/// adds none new). Buggy per-statement counting reports 3 nodes / 6 edges.
+#[tokio::test]
+async fn overlapping_delete_predicates_do_not_double_count_affected() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut db = init_and_load(&dir).await;
+
+    let r = db
+        .mutate(
+            "main",
+            STAGED_QUERIES,
+            "delete_overlapping_persons",
+            &mixed_params(&[("$name", "Alice")], &[("$threshold", 29)]),
+        )
+        .await
+        .expect("delete-only mutation must succeed");
+
+    assert_eq!(
+        r.affected_nodes, 2,
+        "distinct nodes removed are {{Alice, Charlie}}; overlapping predicates must not double-count",
+    );
+    assert_eq!(
+        r.affected_edges, 3,
+        "distinct edges removed are {{Alice→Bob, Alice→Charlie, Alice→Acme}}; cascade must not double-count",
+    );
+
+    // The data is correct regardless of the count: Bob + Diana remain.
+    assert_eq!(count_rows(&db, "node:Person").await, 2, "Bob and Diana remain");
+    assert_eq!(count_rows(&db, "edge:Knows").await, 1, "only Bob→Diana remains");
+    assert_eq!(
+        count_rows(&db, "edge:WorksAt").await,
+        1,
+        "only Bob→Globex remains",
+    );
+}
+
+/// The overlap-exclusion filter must use SQL `IS NOT TRUE`, not `NOT`: a prior
+/// delete predicate referencing a NULLable column must NOT drop a later
+/// statement's matching row just because that column is NULL (SQL UNKNOWN).
+/// With `NOT (age > 30)`, a row with NULL `age` makes the clause UNKNOWN and the
+/// row is filtered out of `deleted_ids` — skipping its cascade (orphaned edges),
+/// or, if it is the only match, leaving the node undeleted. This is a data bug,
+/// not just a miscount.
+///
+/// Data: Charlie (age 35), Zoe (age NULL); Knows Zoe→Charlie. The query deletes
+/// `age > 30` (Charlie) then `name = "Zoe"`. Zoe must still be deleted and her
+/// edge cascaded despite the prior `age > 30` evaluating to UNKNOWN for her.
+#[tokio::test]
+async fn delete_dedup_filter_does_not_drop_null_column_rows() {
+    let dir = tempfile::tempdir().unwrap();
+    let uri = dir.path().to_str().unwrap();
+    let schema = r#"
+node Person {
+    name: String @key
+    age: I32?
+}
+edge Knows: Person -> Person
+"#;
+    let data = r#"{"type":"Person","data":{"name":"Charlie","age":35}}
+{"type":"Person","data":{"name":"Zoe"}}
+{"edge":"Knows","from":"Zoe","to":"Charlie"}"#;
+    let mut db = Omnigraph::init(uri, schema).await.unwrap();
+    load_jsonl(&mut db, data, LoadMode::Overwrite).await.unwrap();
+
+    let q = r#"
+query del_age_then_name($threshold: I32, $name: String) {
+    delete Person where age > $threshold
+    delete Person where name = $name
+}
+"#;
+    let r = db
+        .mutate(
+            "main",
+            q,
+            "del_age_then_name",
+            &mixed_params(&[("$name", "Zoe")], &[("$threshold", 30)]),
+        )
+        .await
+        .expect("delete-only mutation must succeed");
+
+    assert_eq!(
+        count_rows(&db, "node:Person").await,
+        0,
+        "both Charlie (age>30) and Zoe (name=Zoe, NULL age) must be deleted",
+    );
+    assert_eq!(
+        count_rows(&db, "edge:Knows").await,
+        0,
+        "Zoe→Charlie must cascade — Zoe's NULL age must not skip her cascade",
+    );
+    assert_eq!(r.affected_nodes, 2, "Charlie + Zoe");
+    assert_eq!(r.affected_edges, 1, "Zoe→Charlie, counted once");
 }
 
 /// `insert Person 'X'; update Person where name='X' set age=...` — both
@@ -1662,7 +1773,7 @@ async fn branch_cascade_delete_forks_node_and_edges_under_held_queues() {
 // #283: a mutation predicate (`where camelField = ...`) on a camelCase column
 // must execute, not fail at the Lance scan with "No field named ...". Covers
 // both `update` (committed scan via scan_with_pending) and `delete`
-// (delete_where), which share the same emitted SQL filter string.
+// (stage_delete), which share the same emitted SQL filter string.
 const CC_SCHEMA: &str = r#"
 node Doc {
     slug: String @key
@@ -1724,6 +1835,63 @@ query chain($repo: String) {
         .await
         .expect("chained camelCase mutation must read the pending row, not fail at the MemTable SELECT");
     assert_eq!(r.affected_nodes, 2, "both ops should touch the acme Doc (read-your-writes)");
+}
+
+/// A zero-row cascade delete must not advance an edge table's Lance HEAD past
+/// its manifest version. A `delete <Node>` cascades a delete into every incident
+/// edge type (`exec/mutation.rs`). The original bug this guards against: the old
+/// inline `delete_where` (`Dataset::delete`) advanced Lance HEAD **even when zero
+/// edges matched**, while the cascade recorded the new version in the manifest
+/// only `if deleted_rows > 0`. So deleting a node with no incident edges advanced
+/// `edge:Knows` Lance HEAD while the manifest stayed behind — a `HEAD > manifest`
+/// drift that then tripped the next strict write's `ExpectedVersionMismatch`, and
+/// `repair` refused (delete-class drift), wedging the graph.
+///
+/// This pins the invariant directly: after any node delete, every edge table's
+/// manifest version must equal its on-disk Lance HEAD — no write may advance HEAD
+/// past the manifest (invariant 2 / the deny-list). Now GREEN: `delete` is staged
+/// (MR-A / iss-950, via Lance 7.0's `DeleteBuilder::execute_uncommitted`), so a
+/// 0-row delete commits no Lance version at all — correct by construction.
+#[tokio::test]
+async fn node_delete_with_no_incident_edges_leaves_no_edge_table_drift() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut db = init_and_load(&dir).await;
+    let root = dir.path().to_str().unwrap().to_string();
+
+    // A person with NO Knows edges. Deleting it cascades a 0-row delete
+    // into `edge:Knows` (the cascade runs for every incident edge type).
+    mutate_main(
+        &mut db,
+        MUTATION_QUERIES,
+        "insert_person",
+        &mixed_params(&[("$name", "Loner")], &[("$age", 30)]),
+    )
+    .await
+    .unwrap();
+    mutate_main(
+        &mut db,
+        MUTATION_QUERIES,
+        "remove_person",
+        &params(&[("$name", "Loner")]),
+    )
+    .await
+    .expect("the first delete itself succeeds — it leaves the drift for the NEXT write");
+
+    // The invariant: edge:Knows manifest version == its on-disk Lance HEAD.
+    let snap = snapshot_main(&db).await.unwrap();
+    let entry = snap
+        .entry("edge:Knows")
+        .expect("edge:Knows must be in the manifest");
+    let full = format!("{}/{}", root.trim_end_matches('/'), entry.table_path);
+    let head = Dataset::open(&full).await.unwrap().version().version;
+    assert_eq!(
+        entry.table_version, head,
+        "a node delete matching no edges advanced edge:Knows Lance HEAD to v{head} but the \
+         manifest still records v{} — HEAD>manifest drift from a 0-row cascade delete. A staged \
+         0-row delete must commit no Lance version at all (MR-A); this drift means that \
+         regressed.",
+        entry.table_version,
+    );
 }
 
 /// RFC-013 PR2 #1b: the publisher folds the new `known_state` in-memory after a

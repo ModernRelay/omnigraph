@@ -5,10 +5,10 @@
 //! disjoint-key writes proceed concurrently and only writes to the same
 //! `(table_key, branch_ref)` serialize here. This module owns the queue
 //! data structure; callers in `MutationStaging::commit_all`, `branch_merge`,
-//! `schema_apply`, `ensure_indices`, `delete_where`, the fork path (first
-//! write to a table on a branch — acquired before the fork, held through the
-//! manifest publish), and the recovery reconciler acquire guards before any
-//! per-table Lance commit. Serialization is in-process only; cross-process
+//! `schema_apply`, `ensure_indices`, the fork path (first write to a table on
+//! a branch — acquired before the fork, held through the manifest publish),
+//! and the recovery reconciler acquire guards before any per-table Lance
+//! commit. Serialization is in-process only; cross-process
 //! writers on one graph remain one-winner-CAS at the manifest publish.
 //!
 //! ## Why exclusive `tokio::sync::Mutex<()>` per key

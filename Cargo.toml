@@ -32,6 +32,7 @@ datafusion-expr = "53"
 datafusion-functions-aggregate = "53"
 
 lance = { version = "7.0.0", default-features = false, features = ["aws"] }
+lance-core = "7.0.0"
 lance-datafusion = "7.0.0"
 lance-file = "7.0.0"
 lance-index = "7.0.0"

@@ -37,8 +37,9 @@
 //! `Omnigraph::storage_inline_residual()`, so the default storage surface
 //! cannot couple "write bytes" with "advance HEAD" — engine code that
 //! wants an inline residual must name the residual accessor explicitly.
-//! The only residuals are `delete_where` (Lance #6658 / v7.x) and
-//! `create_vector_index` (Lance #6666). The dead legacy methods
+//! The sole residual is `create_vector_index` (Lance #6666); `delete`
+//! migrated to the staged `stage_delete` path in MR-A (Lance 7.0 #6658).
+//! The dead legacy methods
 //! (trait `append_batch` / `merge_insert_batches`, inherent
 //! `merge_insert_batch{,es}`, `create_{btree,inverted}_index`) were
 //! removed entirely. This guard's scope is unchanged: it catches direct

@@ -565,42 +565,28 @@ fn apply_assignments(
 
 use super::staging::{MutationStaging, PendingMode};
 
-/// Open a sub-table dataset for read or inline-commit-write within the
-/// current mutation query, capturing pre-write metadata in `staging` on
-/// first touch. The captured version is the publisher's CAS fence at
-/// end-of-query (per-table OCC).
+/// Open a sub-table dataset for read or staged write within the current
+/// mutation query, capturing pre-write metadata in `staging` on first touch.
+/// The captured version is the publisher's CAS fence at end-of-query
+/// (per-table OCC).
 ///
 /// On first touch, opens the dataset at HEAD on the requested branch
 /// via `open_for_mutation_on_branch`, which compares Lance HEAD against
 /// the manifest's pinned version — that fence is the engine's
 /// publisher-style OCC catching cross-writer drift before we make any
 /// changes. For delete-only queries, this strict open is also the uncovered
-/// drift guard that runs before `delete_where` can inline-commit.
+/// drift guard.
 ///
-/// On subsequent touches *within the same query*, behavior depends on
-/// whether the table has already been inline-committed by a delete op:
-///
-/// - **Insert / update path (no inline commit between touches).** Lance
-///   HEAD has not moved since first touch, so a fresh
-///   `open_for_mutation_on_branch` would still match the manifest
-///   pinned version. We just go through it again; `ensure_path` is a
-///   no-op (idempotent on the captured `expected_version`).
-/// - **Delete cascade or multi-delete on the same table.** A prior
-///   `delete_where` on this table has already advanced Lance HEAD past
-///   the manifest's pinned version (the manifest doesn't move until
-///   end-of-query). Going through `open_for_mutation_on_branch` again
-///   would trip its `ensure_expected_version` equality check
-///   (`actual = pinned + 1` vs `expected = pinned`). Instead we route
-///   through `reopen_for_mutation` at the post-inline-commit Lance
-///   version captured in `staging.inline_committed[table_key]`, which
-///   is the source of truth for "where is Lance HEAD right now on
-///   this table within this query."
-///
-/// The `inline_committed` reopen branch closes the multi-delete-on-same-table
-/// failure path that pre-staged-write engines inherited. The branch goes
-/// away once Lance exposes a two-phase delete API
-/// ([lance-format/lance#6658](https://github.com/lance-format/lance/issues/6658))
-/// and we can stage deletes on the same path as inserts/updates.
+/// On subsequent touches *within the same query*, Lance HEAD has not moved
+/// since first touch — inserts, updates AND deletes all stage their work and
+/// defer every HEAD advance to the end-of-query commit, so no op inline-commits
+/// between touches. A fresh `open_for_mutation_on_branch` therefore still
+/// matches the manifest pinned version; we go through it again and `ensure_path`
+/// is a no-op (idempotent on the captured `expected_version`). This holds for a
+/// delete cascade or multiple delete statements hitting the same table: each
+/// touch records another predicate (`record_delete`), and `stage_all` combines
+/// them into one staged delete — there is no post-inline-commit reopen to
+/// special-case anymore.
 impl Omnigraph {
     /// Resolve a LIVE-HEAD read handle for an edge table's committed-state `@card`
     /// scan when collapse #1 skipped the accumulation open. The edge-insert path no
@@ -646,28 +632,6 @@ async fn open_table_for_mutation(
     op_kind: crate::db::MutationOpKind,
     txn: Option<&crate::db::WriteTxn>,
 ) -> Result<(Option<SnapshotHandle>, String, Option<String>)> {
-    if let Some(prior) = staging.inline_committed.get(table_key) {
-        let path = staging.paths.get(table_key).ok_or_else(|| {
-            OmniError::manifest_internal(format!(
-                "open_table_for_mutation: inline_committed[{}] without paths entry",
-                table_key
-            ))
-        })?;
-        // The inline-committed reopen does NOT validate the schema contract
-        // (it reopens at the post-inline-commit Lance version directly), so it
-        // takes no `txn` — threading it here would change nothing. Deletes are
-        // strict ops, so this always opens (returns `Some`).
-        let ds = db
-            .reopen_for_mutation(
-                table_key,
-                &path.full_path,
-                path.table_branch.as_deref(),
-                prior.table_version,
-                op_kind,
-            )
-            .await?;
-        return Ok((Some(ds), path.full_path.clone(), path.table_branch.clone()));
-    }
     // `open_for_mutation_on_branch` returns the expected version even when it
     // skips the open (collapse #1, the non-strict insert/merge path): the version
     // is the pinned base's, identical to the opened handle's `.version()`. Use it
@@ -694,17 +658,62 @@ async fn open_table_for_mutation(
     Ok((opened.handle, opened.full_path, opened.table_branch))
 }
 
+/// Build the committed-snapshot filter used to COUNT a delete statement's
+/// `affected_*`, excluding rows a prior delete statement on the same table
+/// already scheduled for removal in this query.
+///
+/// Deletes stage — they no longer inline-commit — so every statement in a
+/// delete-only query scans the same unchanged committed snapshot. Counting each
+/// predicate independently would double-count overlapping statements (the old
+/// inline path did not, because each delete committed before the next ran). The
+/// combined staged delete actually removes the UNION `p₁ ∪ p₂ ∪ …`; excluding
+/// the prior predicates here makes each statement contribute `|pₙ \ (p₁ ∪ …)|`,
+/// whose sum is exactly that distinct count. `base` (the original predicate) is
+/// still what gets recorded — only the count uses this exclusion.
+///
+/// LOAD-BEARING on D₂: this exclusion assumes the committed snapshot is
+/// invariant across the query's statements, which holds only because D₂
+/// (`enforce_no_mixed_destructive_constructive`) forbids mixing inserts/updates
+/// with deletes — so a delete-touched table never has pending writes that would
+/// shift what a later statement sees. If D₂ is ever relaxed, this dedup must be
+/// revisited (a later delete would then need to see prior in-query writes).
+///
+/// The exclusion uses `IS NOT TRUE`, not `NOT`, because of SQL three-valued
+/// logic: a prior predicate referencing a column that is NULL for some row
+/// (e.g. `age > 30` on a row with NULL `age`) evaluates to UNKNOWN, and
+/// `NOT UNKNOWN` is still UNKNOWN — which a `WHERE` treats as not-matched, so
+/// the row would be wrongly dropped from this statement's scan even though the
+/// prior delete never matched it (dropping it from `deleted_ids` skips its
+/// cascade, or — if it is the only match — leaves the node undeleted). Only
+/// rows a prior predicate matched as definitely TRUE should be excluded:
+/// `(prior) IS NOT TRUE` keeps both FALSE and UNKNOWN rows.
+fn dedup_delete_filter(base: &str, prior: &[String]) -> String {
+    if prior.is_empty() {
+        base.to_string()
+    } else {
+        let excluded = prior
+            .iter()
+            .map(|p| format!("({p})"))
+            .collect::<Vec<_>>()
+            .join(" OR ");
+        format!("({base}) AND (({excluded}) IS NOT TRUE)")
+    }
+}
+
 /// D₂ parse-time check: a single mutation query is either insert/update-only
 /// or delete-only. Mixed → reject before any I/O.
 ///
-/// Reason: under the staged-write writer, inserts and updates
-/// accumulate in memory and commit at end-of-query, while deletes still
-/// inline-commit (Lance lacks a public two-phase delete in 6.0.1).
-/// Mixing creates ordering hazards (same-row insert→delete becomes a no-op
-/// because the staged insert isn't visible to delete; cascading deletes
-/// of just-inserted edges break referential integrity by silent design).
-/// Until Lance exposes `DeleteJob::execute_uncommitted`, the parse-time
-/// rejection keeps both paths atomic and correct.
+/// This is a deliberate semantic boundary, not temporary scaffolding. Inserts
+/// and updates accumulate as pending in-memory batches and deletes accumulate
+/// as predicates; both stage and commit at end-of-query. Keeping a single query
+/// to one kind means read-your-writes stays unambiguous (a read never has to
+/// reconcile pending inserts against same-query delete predicates) and each
+/// touched table commits at most one version per query. Compose mixed
+/// operations by issuing separate atomic mutations (writes, then deletes), or a
+/// branch + merge when one atomic commit is required. Allowing mixing would
+/// instead demand an in-query delete view, pending pruning, and per-table
+/// two-commit ordering in the hot mutation path — complexity this boundary
+/// deliberately avoids.
 fn enforce_no_mixed_destructive_constructive(
     ir: &omnigraph_compiler::ir::MutationIR,
 ) -> Result<()> {
@@ -724,8 +733,9 @@ fn enforce_no_mixed_destructive_constructive(
         return Err(OmniError::manifest(format!(
             "mutation '{}' on the same query mixes inserts/updates and deletes; \
              split into separate mutations: (1) inserts and updates, then (2) deletes. \
-             This restriction lifts when Lance exposes a two-phase delete API \
-             (tracked: lance-format/lance#6658).",
+             A query is deliberately constructive or destructive, not both, so its \
+             read-your-writes stays unambiguous; run the two on a branch and merge \
+             if you need them in one atomic commit.",
             ir.name
         )));
     }
@@ -804,11 +814,11 @@ impl Omnigraph {
         let resolved_params = enrich_mutation_params(params)?;
 
         // Per-query staging accumulator. Inserts and updates push batches
-        // into `pending`; deletes still inline-commit and record into
-        // `inline_committed`. At end-of-query, `finalize` issues one
-        // `stage_*` + `commit_staged` per pending table, then the
-        // publisher commits the manifest atomically across all touched
-        // tables. Branch is threaded explicitly — no coordinator swap.
+        // into `pending`; deletes push predicates into `delete_predicates`. At
+        // end-of-query, `finalize` issues one `stage_*` + `commit_staged` per
+        // touched table (inserts/updates/deletes alike), then the publisher
+        // commits the manifest atomically across all touched tables. Branch is
+        // threaded explicitly — no coordinator swap.
         let mut staging = MutationStaging::default();
 
         // Lower + validate up front so the touched-table set is known before
@@ -1365,7 +1375,7 @@ impl Omnigraph {
         let pred_sql = predicate_to_sql(predicate, params, false)?;
 
         let table_key = format!("node:{}", type_name);
-        let (handle, full_path, table_branch) = open_table_for_mutation(
+        let (handle, _full_path, _table_branch) = open_table_for_mutation(
             self,
             staging,
             branch,
@@ -1376,14 +1386,20 @@ impl Omnigraph {
         .await?;
         // Delete is a STRICT op, so collapse #1 never skips its open.
         let ds = handle.expect("strict Delete op always opens its dataset");
-        let initial_version = ds.version();
 
         // Scan matching IDs for cascade. Per D₂ this never overlaps with
         // staged inserts (mixed insert/delete in one query is rejected at
-        // parse time), so we scan committed only.
+        // parse time), so we scan committed only. Exclude IDs a prior delete
+        // statement on this table already scheduled (deletes stage, so the
+        // committed snapshot is unchanged across statements): without this,
+        // overlapping predicates would double-count `affected_nodes` AND
+        // re-cascade already-deleted nodes' edges. The combined staged delete
+        // still removes the union, so we record the original `pred_sql` below.
+        let scan_filter =
+            dedup_delete_filter(&pred_sql, staging.recorded_delete_predicates(&table_key));
         let batches = self
             .storage()
-            .scan(&ds, Some(&["id"]), Some(&pred_sql), None)
+            .scan(&ds, Some(&["id"]), Some(&scan_filter), None)
             .await?;
 
         let deleted_ids: Vec<String> = batches
@@ -1409,33 +1425,15 @@ impl Omnigraph {
 
         let affected_nodes = deleted_ids.len();
 
-        // Delete nodes — still inline-commit (Lance's `Dataset::delete` is
-        // not exposed as a two-phase op in 6.0.1). D₂ keeps inserts and
-        // deletes from coexisting in one query, so this advance of Lance
-        // HEAD is the only HEAD movement during the query and the
-        // publisher's CAS captures it intact.
-        let ds = self
-            .reopen_for_mutation(
-                &table_key,
-                &full_path,
-                table_branch.as_deref(),
-                initial_version,
-                crate::db::MutationOpKind::Delete,
-            )
-            .await?;
+        // Record the node delete as a staged predicate. D₂ keeps inserts and
+        // deletes from coexisting in one query, so this table carries no
+        // pending write batches; `stage_all` turns the predicate into one
+        // `stage_delete` (a deletion-vector transaction) that advances Lance
+        // HEAD only at the unified end-of-query commit — no inline residual.
+        // `open_table_for_mutation` above already captured the table's
+        // path/version/op-kind via `ensure_path`.
         crate::failpoints::maybe_fail(crate::failpoints::names::MUTATION_DELETE_NODE_PRE_PRIMARY_DELETE)?;
-        let (_new_ds, delete_state) = self
-            .storage_inline_residual()
-            .delete_where(&full_path, ds, &pred_sql)
-            .await?;
-
-        staging.record_inline(crate::db::SubTableUpdate {
-            table_key: table_key.clone(),
-            table_version: delete_state.version,
-            table_branch: table_branch.clone(),
-            row_count: delete_state.row_count,
-            version_metadata: delete_state.version_metadata,
-        });
+        staging.record_delete(&table_key, pred_sql.clone());
 
         let mut affected_edges = 0usize;
         let escaped: Vec<String> = deleted_ids
@@ -1465,7 +1463,7 @@ impl Omnigraph {
 
             let edge_table_key = format!("edge:{}", edge_name);
             let cascade_filter = cascade_filters.join(" OR ");
-            let (edge_handle, edge_full_path, edge_table_branch) = open_table_for_mutation(
+            let (edge_handle, _edge_full_path, _edge_table_branch) = open_table_for_mutation(
                 self,
                 staging,
                 branch,
@@ -1477,21 +1475,26 @@ impl Omnigraph {
             // Delete is a STRICT op, so collapse #1 never skips its open.
             let edge_ds = edge_handle.expect("strict Delete op always opens its dataset");
 
-            let (_new_edge_ds, edge_delete) = self
-                .storage_inline_residual()
-                .delete_where(&edge_full_path, edge_ds, &cascade_filter)
+            // `affected_edges` was the post-inline-commit `deleted_rows`; with
+            // staged deletes the rows aren't removed until end-of-query, so
+            // count the matching committed edges now. Exact under D₂ (no staged
+            // inserts can add matches mid-query), and bounded by the cascade
+            // working set. Exclude edges a prior delete statement (a prior
+            // cascade, or an explicit edge delete) on this table already
+            // scheduled, so an edge incident to two deleted nodes — or matched
+            // by both a cascade and an explicit `delete <Edge>` — is counted
+            // once. Record the ORIGINAL cascade filter (the combined staged
+            // delete removes the union); skip only when nothing NEW matches.
+            let count_filter =
+                dedup_delete_filter(&cascade_filter, staging.recorded_delete_predicates(&edge_table_key));
+            let matched = self
+                .storage()
+                .count_rows(&edge_ds, Some(count_filter))
                 .await?;
+            affected_edges += matched;
 
-            affected_edges += edge_delete.deleted_rows;
-
-            if edge_delete.deleted_rows > 0 {
-                staging.record_inline(crate::db::SubTableUpdate {
-                    table_key: edge_table_key,
-                    table_version: edge_delete.version,
-                    table_branch: edge_table_branch,
-                    row_count: edge_delete.row_count,
-                    version_metadata: edge_delete.version_metadata,
-                });
+            if matched > 0 {
+                staging.record_delete(&edge_table_key, cascade_filter);
             }
         }
 
@@ -1517,7 +1520,7 @@ impl Omnigraph {
         let pred_sql = predicate_to_sql(predicate, params, true)?;
 
         let table_key = format!("edge:{}", type_name);
-        let (handle, full_path, table_branch) = open_table_for_mutation(
+        let (handle, _full_path, _table_branch) = open_table_for_mutation(
             self,
             staging,
             branch,
@@ -1529,20 +1532,21 @@ impl Omnigraph {
         // Delete is a STRICT op, so collapse #1 never skips its open.
         let ds = handle.expect("strict Delete op always opens its dataset");
 
-        let (_new_ds, delete_state) = self
-            .storage_inline_residual()
-            .delete_where(&full_path, ds, &pred_sql)
+        // Count matching committed edges now (the staged delete won't remove
+        // them until end-of-query). Exact under D₂; exclude edges a prior delete
+        // statement on this table (an earlier cascade or edge delete) already
+        // scheduled, so overlapping statements don't double-count. Record the
+        // ORIGINAL predicate below (the combined staged delete removes the
+        // union); only record when something NEW matches.
+        let count_filter =
+            dedup_delete_filter(&pred_sql, staging.recorded_delete_predicates(&table_key));
+        let affected = self
+            .storage()
+            .count_rows(&ds, Some(count_filter))
             .await?;
-        let affected = delete_state.deleted_rows;
 
         if affected > 0 {
-            staging.record_inline(crate::db::SubTableUpdate {
-                table_key,
-                table_version: delete_state.version,
-                table_branch,
-                row_count: delete_state.row_count,
-                version_metadata: delete_state.version_metadata,
-            });
+            staging.record_delete(&table_key, pred_sql.clone());
             self.invalidate_graph_index().await;
         }
 

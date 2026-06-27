@@ -72,10 +72,14 @@ converge the physical state.
    table versions.
 
 4. **Mutations publish at one boundary.** A `mutate_as` or `load` operation
-   accumulates constructive writes, commits each touched table at the end, then
-   publishes one manifest update. Do not commit per statement. Delete-only
-   queries are the documented inline residual; the parse-time D2 rule prevents
-   mixing deletes with insert/update until Lance exposes two-phase delete.
+   accumulates writes — inserts/updates as pending batches, deletes as
+   predicates — stages each touched table at the end (deletes via
+   `stage_delete`, no inline HEAD advance), then publishes one manifest update.
+   Do not commit per statement. The parse-time D2 rule is a deliberate
+   boundary: one mutation query is constructive (insert/update) or destructive
+   (delete), not both — so read-your-writes within a query stays unambiguous
+   and each table commits at most one version. Compose mixed operations via
+   separate mutations, or a branch for single-commit atomicity.
    Read [writes.md](writes.md) and [execution.md](execution.md).
 
 5. **Recovery is part of the commit protocol.** Writers that can advance Lance
@@ -150,11 +154,11 @@ converge the physical state.
 |---|---|---|
 | Multi-table commit | Manifest CAS plus recovery sidecars; not a single Lance primitive | [writes.md](writes.md), [architecture.md](architecture.md) |
 | Constructive mutations | In-memory `MutationStaging`, one end-of-query table commit per touched table, then one manifest publish | [writes.md](writes.md), [execution.md](execution.md) |
-| Deletes | Inline-commit residual; delete-only queries allowed, mixed insert/update/delete rejected by D2 | [query-language.md](../user/queries/index.md), [writes.md](writes.md) |
+| Deletes | Staged like inserts/updates (`stage_delete` via Lance 7.0 `DeleteBuilder::execute_uncommitted`, MR-A) — no inline HEAD advance; mixed insert/update/delete in one query rejected by D2 as a deliberate boundary (constructive XOR destructive per query; compose via separate mutations or a branch) | [query-language.md](../user/queries/index.md), [writes.md](writes.md) |
 | Branch delete | Manifest is the single authority, flipped atomically first; per-table forks + commit-graph branch are derived state, reclaimed best-effort (`force_delete_branch`) with the `cleanup` reconciler as the guaranteed backstop. Reusing a name whose reclaim failed before `cleanup` surfaces an actionable error | [branches-commits.md](../user/branching/index.md), [maintenance.md](../user/operations/maintenance.md) |
 | Schema validation | Type checks, required fields, defaults, edge endpoint checks, and edge cardinality are enforced on write paths | [schema-language.md](../user/schema/index.md), [execution.md](execution.md) |
 | Unique constraints | Intra-batch and write-path checks exist; intake and branch-merge derive the composite key through one shared function (`loader::composite_unique_key`, a separator-free `Vec<String>` tuple) and fail loudly on an un-keyable column type rather than silently exempting it; full cross-version uniqueness against already-committed rows is still a gap | [schema-language.md](../user/schema/index.md) |
-| Storage trait | `TableStorage` (via `db.storage()`) is staged-only; the inline-commit residuals (`delete_where`, `create_vector_index`) are split onto a separate sealed `InlineCommitResidual` trait reached via `db.storage_inline_residual()` (MR-854), so §1 holds by construction; capability/stat surfaces are roadmap | [writes.md](writes.md), [architecture.md](architecture.md) |
+| Storage trait | `TableStorage` (via `db.storage()`) is staged-only; the sole inline-commit residual (`create_vector_index`) is split onto a separate sealed `InlineCommitResidual` trait reached via `db.storage_inline_residual()` (MR-854), so §1 holds by construction; capability/stat surfaces are roadmap | [writes.md](writes.md), [architecture.md](architecture.md) |
 | Index lifecycle | `@index`/`@key` declares *intent*; the physical index is derived state and never fails a logical op. `schema apply` builds no indexes (records intent only; index-only changes touch no table data). `load`/`mutate` build inline through one chokepoint (`build_indices_on_dataset_for_catalog`, type-dispatched by `node_prop_index_kind`: enum + orderable scalar → BTREE, free-text String → FTS, Vector → vector) that fault-isolates an untrainable Vector column into a *pending* index instead of aborting. `optimize`/`ensure_indices` is the reconciler: it creates declared-but-missing indexes and folds appended/rewritten fragments into existing ones (`optimize_indices`), reporting still-pending columns. Explicit maintenance call, not yet a background loop | [indexes.md](../user/search/indexes.md), [maintenance.md](../user/operations/maintenance.md) |
 | Traversal IDs | Runtime still builds `TypeIndex`; Lance stable row-id based graph IDs are roadmap | [architecture.md](architecture.md), [query-language.md](../user/queries/index.md) |
 | Auth | Bearer token hashing and server-side actor resolution are implemented at the HTTP boundary | [server.md](../user/operations/server.md), [policy.md](../user/operations/policy.md) |
@@ -181,19 +185,19 @@ them explicit.
   `InlineCommitResidual` trait reached via `db.storage_inline_residual()`, so a
   new writer cannot couple a write with a HEAD advance through the default
   surface. The dead legacy methods (`append_batch` on the trait,
-  `merge_insert_batch{,es}`, `create_{btree,inverted}_index`) were removed. The
-  remaining residuals are `delete_where` and `create_vector_index`. The Lance
-  6.0.1 → 7.0.0 bump landed, so the staged two-phase delete API
-  (`DeleteBuilder::execute_uncommitted`, Lance #6658) is now available and MR-A
-  is unblocked — but the migration itself is still pending, so `delete_where`
-  stays inline for now. `create_vector_index` remains gated on Lance #6666
-  (still open). See [lance.md](lance.md) and [writes.md](writes.md). New write
-  paths should use the staged shape unless a documented Lance blocker applies.
-- **Deletes and vector indexes:** `delete_where` and vector index creation still
-  advance Lance HEAD inline. The public delete two-phase API now exists (Lance
-  #6658 shipped in 7.0.0), so the delete residual is unblocked pending the MR-A
-  migration; vector index creation is still blocked (Lance #6666 open). Keep D2
-  and recovery coverage in place until those residuals are removed.
+  `merge_insert_batch{,es}`, `create_{btree,inverted}_index`) were removed. MR-A
+  migrated `delete` onto the staged surface (`TableStorage::stage_delete` via
+  Lance 7.0 `DeleteBuilder::execute_uncommitted`, #6658) and retired
+  `InlineCommitResidual::delete_where`, so the sole remaining residual is
+  `create_vector_index`, gated on Lance #6666 (still open). See [lance.md](lance.md)
+  and [writes.md](writes.md). New write paths should use the staged shape unless a
+  documented Lance blocker applies.
+- **Vector indexes:** `create_vector_index` still advances Lance HEAD inline —
+  segment-commit needs `build_index_metadata_from_segments`, `pub(crate)` in Lance
+  7.0.0 (#6666 open). Keep recovery coverage in place until that residual is
+  removed. (`delete` is no longer a residual — staged in MR-A. D2 is not a gap:
+  it is a deliberate constructive-XOR-destructive boundary, documented in
+  Invariant 4 and the truth matrix.)
 - **Blob-column compaction:** Lance `compact_files` mis-decodes blob-v2 columns
   under its forced `BlobHandling::AllBinary` read ("more fields in the schema
   than provided column indices"), so `optimize` skips any table with a `Blob`

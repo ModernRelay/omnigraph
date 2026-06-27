@@ -869,7 +869,7 @@ async fn delete_only_mutation_refuses_uncovered_drift_before_inline_commit() {
         &mixed_params(&[("$name", "Alice")], &[]),
     )
     .await
-    .expect_err("strict delete must reject uncovered drift before delete_where");
+    .expect_err("strict delete must reject uncovered drift before staging the delete");
     assert!(
         err.to_string().contains("expected"),
         "delete should fail as a strict stale-version write; got: {err}"
@@ -879,7 +879,7 @@ async fn delete_only_mutation_refuses_uncovered_drift_before_inline_commit() {
     assert_eq!(manifest_after, manifest_before);
     assert_eq!(
         head_after, head_before,
-        "delete_where must not run after the strict drift guard fails"
+        "the staged delete must not commit after the strict drift guard fails"
     );
     assert_eq!(
         count_rows(&db, "node:Person").await,

@@ -1065,9 +1065,10 @@ async fn publish_rewritten_merge_table(
     staged: &StagedMergeResult,
 ) -> Result<crate::db::SubTableUpdate> {
     // Branch merge's source-rewrite path is Merge-shaped (upsert from
-    // source onto target). The inline `delete_where` later in this
-    // function operates on rows the rewrite chose to remove, not
-    // user-facing predicates, so Merge is the correct policy here.
+    // source onto target). The staged delete later in this function
+    // (`stage_delete` + `commit_staged`) operates on rows the rewrite chose
+    // to remove, not user-facing predicates, so Merge is the correct policy
+    // here.
     // `open_for_mutation` is the no-txn entry, so collapse #1's non-strict
     // open-skip (gated on `txn.is_some()`) never fires here — the handle is
     // always `Some`.
@@ -1130,15 +1131,10 @@ async fn publish_rewritten_merge_table(
     // See tests/failpoints.rs::branch_merge_rewrite_partial_after_merge_rolls_back.
     crate::failpoints::maybe_fail(crate::failpoints::names::BRANCH_MERGE_REWRITE_AFTER_MERGE_PRE_DELETE)?;
 
-    // Phase 2: delete removed rows via deletion vectors.
-    //
-    // INLINE-COMMIT RESIDUAL: lance-6.0.1 does not expose a public
-    // two-phase delete API (DeleteJob is `pub(crate)` —
-    // lance-format/lance#6658 is open with no PRs). We deliberately do
-    // NOT introduce a `stage_delete` wrapper that would secretly
-    // inline-commit (it would create a side-channel between the staged
-    // and inline write paths). When the upstream API ships, swap this
-    // `delete_where` call for `stage_delete` + `commit_staged`.
+    // Phase 2: delete removed rows via deletion vectors, staged through
+    // `stage_delete` + `commit_staged` (MR-A — Lance 7.0's
+    // `DeleteBuilder::execute_uncommitted`, #6658, made delete a two-phase
+    // staged write, so this no longer inline-commits).
     if !staged.deleted_ids.is_empty() {
         let escaped: Vec<String> = staged
             .deleted_ids
@@ -1146,11 +1142,12 @@ async fn publish_rewritten_merge_table(
             .map(|id| format!("'{}'", id.replace('\'', "''")))
             .collect();
         let filter = format!("id IN ({})", escaped.join(", "));
-        let (new_ds, _) = target_db
-            .storage_inline_residual()
-            .delete_where(&full_path, current_ds, &filter)
-            .await?;
-        current_ds = new_ds;
+        if let Some(staged_delete) = target_db.storage().stage_delete(&current_ds, &filter).await? {
+            current_ds = target_db
+                .storage()
+                .commit_staged(current_ds, staged_delete)
+                .await?;
+        }
     }
 
     // Failpoint: crash after the Phase 2 delete commit, before the index build.
@@ -1310,8 +1307,8 @@ async fn publish_adopted_delta(
     // tests/failpoints.rs::branch_merge_adopt_partial_after_upsert_rolls_back.
     crate::failpoints::maybe_fail(crate::failpoints::names::BRANCH_MERGE_ADOPT_AFTER_UPSERT_PRE_DELETE)?;
 
-    // Phase 2: delete removed rows via deletion vectors (inline-commit residual,
-    // same as the three-way path until Lance ships a public two-phase delete).
+    // Phase 2: delete removed rows via deletion vectors, staged through
+    // `stage_delete` + `commit_staged` (same as the three-way path; MR-A).
     if !delta.deleted_ids.is_empty() {
         let escaped: Vec<String> = delta
             .deleted_ids
@@ -1319,11 +1316,12 @@ async fn publish_adopted_delta(
             .map(|id| format!("'{}'", id.replace('\'', "''")))
             .collect();
         let filter = format!("id IN ({})", escaped.join(", "));
-        let (new_ds, _) = target_db
-            .storage_inline_residual()
-            .delete_where(&full_path, current_ds, &filter)
-            .await?;
-        current_ds = new_ds;
+        if let Some(staged_delete) = target_db.storage().stage_delete(&current_ds, &filter).await? {
+            current_ds = target_db
+                .storage()
+                .commit_staged(current_ds, staged_delete)
+                .await?;
+        }
     }
 
     // Phase 4: index coverage is reconciler-owned on the adopt path. Unlike the
@@ -1597,7 +1595,7 @@ impl Omnigraph {
         // Pin `RewriteMerged` and `AdoptWithDelta` candidates — both advance
         // Lance HEAD before the manifest publish (RewriteMerged via
         // publish_rewritten_merge_table; AdoptWithDelta via publish_adopted_delta:
-        // stage_append + stage_merge_insert + delete_where + index — multiple
+        // stage_append + stage_merge_insert + stage_delete + index — multiple
         // commit_staged calls per table, which the loose classification handles
         // as multi-step drift).
         //
