@@ -307,6 +307,11 @@ async fn concurrent_walk_structural_invariants() {
                         Some(bug) => reproduced.push(format!("seed={seed} actor PANIC -> {bug}")),
                         None => panic!("seed={seed}: NOVEL actor panic: {msg}"),
                     }
+                } else {
+                    // Not a panic (e.g. a cancelled/aborted task) — the actors are
+                    // never cancelled here, so this is unexpected; surface it
+                    // rather than letting it fall through silently.
+                    panic!("seed={seed}: unexpected non-panic actor JoinError: {join_err}");
                 }
             }
         }

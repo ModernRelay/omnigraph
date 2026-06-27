@@ -90,8 +90,21 @@ pub fn classify_backend(e: &BackendError) -> Option<&'static str> {
         BackendError::Engine(oe) => {
             classify_engine_signal(matches!(oe, OmniError::Manifest(_)), &oe.to_string())
         }
-        BackendError::Cli { stderr, .. } => classify_engine_signal(true, stderr)
-            .or_else(|| if stderr.contains("dup-@key") { Some("dup-@key MR-714") } else { None }),
+        BackendError::Cli { stderr, .. } => {
+            // Out-of-process there's no OmniError variant to gate on, so gate RC-1
+            // on its DISTINCTIVE strings only — NOT the generic "expected"+"current"
+            // that `classify_engine_signal` allows under is_manifest, which could
+            // appear in unrelated CLI errors and mask a novel finding.
+            if stderr.contains("stale view") || stderr.contains("ahead of manifest version") {
+                Some("RC-1 stale-view")
+            } else if stderr.contains("from_sorted_iter") || stderr.contains("non-sorted input") {
+                Some("RC-X/#7230 scalar-BTREE")
+            } else if stderr.contains("dup-@key") {
+                Some("dup-@key MR-714")
+            } else {
+                None
+            }
+        }
     }
 }
 

@@ -219,14 +219,19 @@ impl Backend for Cli {
         ])
         .map(|_| ())
     }
-    async fn mutate(&self, _branch: &str, gq: &str) -> Result<(), BackendError> {
-        // Local store is always `main`; the CLI infers the single query from -e.
-        self.run_ok(&["mutate", "-e", gq, "--store", &self.store_uri, "--as", &self.actor])
-            .map(|_| ())
+    async fn mutate(&self, branch: &str, gq: &str) -> Result<(), BackendError> {
+        // Honor `branch` (the CLI infers the single query from -e), so this
+        // backend matches the Embedded contract instead of silently pinning main.
+        self.run_ok(&[
+            "mutate", "-e", gq, "--branch", branch, "--store", &self.store_uri, "--as",
+            &self.actor,
+        ])
+        .map(|_| ())
     }
-    async fn query(&self, _branch: &str, gq: &str) -> Result<Vec<Value>, BackendError> {
+    async fn query(&self, branch: &str, gq: &str) -> Result<Vec<Value>, BackendError> {
         let out = self.run_ok(&[
-            "query", "-e", gq, "--json", "--store", &self.store_uri, "--as", &self.actor,
+            "query", "-e", gq, "--json", "--branch", branch, "--store", &self.store_uri, "--as",
+            &self.actor,
         ])?;
         let stdout = String::from_utf8_lossy(&out.stdout);
         let trimmed = stdout.trim();

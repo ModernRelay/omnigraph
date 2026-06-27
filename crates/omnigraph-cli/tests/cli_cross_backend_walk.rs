@@ -73,15 +73,21 @@ async fn embedded_and_cli_agree_on_seeded_walk() {
             let (ck, cres) = step(&cli, &mut cli_rng, &mut cli_model).await;
 
             assert_eq!(ek, ck, "seed={seed} step={i}: op-kind diverged");
-            // Repair's success FLAG legitimately differs across backends and is
-            // NOT asserted: embedded `repair(force=false)` returns Ok and simply
-            // leaves suspicious/unverifiable drift in place (e.g. the drift RC-1
-            // strands), whereas the CLI `repair --confirm` (no --force) EXITS
-            // NON-ZERO when it refuses to publish such drift. A known contract
-            // difference, not a transport bug — repair is a no-op on logical
-            // data either way, so the STATE assertions below must still match.
-            // Every other op's success/failure must agree exactly (same engine).
-            if ek != OpKind::Repair {
+            // Repair's success FLAG legitimately differs in ONE known case:
+            // embedded `repair(force=false)` returns Ok and leaves suspicious/
+            // unverifiable drift in place (e.g. the drift RC-1 strands), whereas
+            // the CLI `repair --confirm` (no --force) EXITS NON-ZERO refusing to
+            // publish it. Allow-list exactly that (emb Ok + CLI "refused
+            // suspicious" error); a no-op on logical data either way, so the STATE
+            // assertions below still match. Any OTHER divergence — including a
+            // broken repair invocation, or any non-Repair op — must still fail.
+            let known_repair_divergence = ek == OpKind::Repair
+                && eres.is_ok()
+                && cres.as_ref().err().is_some_and(|e| {
+                    let m = e.message();
+                    m.contains("repair refused") || m.contains("suspicious")
+                });
+            if !known_repair_divergence {
                 assert_eq!(
                     eres.is_ok(),
                     cres.is_ok(),
