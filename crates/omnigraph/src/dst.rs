@@ -14,13 +14,22 @@
 
 use ulid::Ulid;
 
-/// Production fallback: real micros since the Unix epoch.
-fn real_now_micros() -> i64 {
+/// Production fallback: real micros since the Unix epoch, propagating a
+/// clock-before-epoch failure (mirrors the pre-seam helper's `OmniError`).
+fn real_now_micros_result() -> crate::error::Result<i64> {
     use std::time::{SystemTime, UNIX_EPOCH};
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map(|d| d.as_micros() as i64)
-        .unwrap_or(0)
+        .map_err(|e| crate::error::OmniError::manifest(format!("system clock before UNIX_EPOCH: {e}")))
+}
+
+/// Infallible variant: a clock-before-epoch failure collapses to `0`. Only for
+/// callers that aren't fallible (the sidecar `started_at` diagnostic string and
+/// the seeded ULID clock); the fallible timestamp helpers use
+/// [`now_micros_result`] so a bad clock still surfaces, never persists as `0`.
+fn real_now_micros() -> i64 {
+    real_now_micros_result().unwrap_or(0)
 }
 
 /// A ULID for an observable id. Deterministic under [`with_seed`]; otherwise a
@@ -45,6 +54,21 @@ pub(crate) fn now_micros() -> i64 {
         }
     }
     real_now_micros()
+}
+
+/// Fallible timestamp for the production write path: deterministic + monotonic
+/// under [`with_seed`]; otherwise the real clock, PROPAGATING a clock-before-
+/// epoch error (the pre-seam contract). Use this — not [`now_micros`] — wherever
+/// the caller is `Result`-returning, so a broken clock fails loudly (deny-list:
+/// no silent failures) instead of persisting a `0` timestamp.
+pub(crate) fn now_micros_result() -> crate::error::Result<i64> {
+    #[cfg(feature = "dst")]
+    {
+        if let Ok(t) = imp::DST.try_with(|s| s.now_micros()) {
+            return Ok(t);
+        }
+    }
+    real_now_micros_result()
 }
 
 #[cfg(feature = "dst")]
@@ -76,8 +100,14 @@ mod imp {
                 seed,
                 ids: AtomicU64::new(0),
                 // Fixed seed-derived epoch (~2023 in micros), advanced
-                // monotonically so ULID timestamps stay sortable.
-                clock_micros: AtomicI64::new(1_700_000_000_000_000 + (seed as i64) * 1_000_000),
+                // monotonically so ULID timestamps stay sortable. The seed-
+                // derived offset is bounded to < 1 day (86_400_000_000 micros)
+                // via splitmix64 so an arbitrary u64 seed (e.g. a fuzzer seed)
+                // can't overflow i64 — `(seed as i64) * 1_000_000` would panic in
+                // debug / wrap in release for large seeds and mint bogus times.
+                clock_micros: AtomicI64::new(
+                    1_700_000_000_000_000 + (splitmix64(seed) % 86_400_000_000) as i64,
+                ),
                 fingerprint: AtomicU64::new(splitmix64(seed)),
             })
         }

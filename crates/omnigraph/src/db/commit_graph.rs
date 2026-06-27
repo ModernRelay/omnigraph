@@ -695,8 +695,10 @@ async fn open_for_branch(root_uri: &str, branch: Option<&str>) -> Result<CommitG
 
 fn now_micros() -> Result<i64> {
     // Routed through the DST seam (deterministic under the `dst` feature; the
-    // real clock otherwise). Covers all commit-graph timestamp callers.
-    Ok(crate::dst::now_micros())
+    // real clock otherwise). The `_result` variant PROPAGATES a clock-before-
+    // epoch error (the pre-seam contract) instead of persisting a 0 timestamp.
+    // Covers all commit-graph timestamp callers.
+    crate::dst::now_micros_result()
 }
 
 #[cfg(test)]

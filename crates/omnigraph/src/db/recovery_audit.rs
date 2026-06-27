@@ -276,8 +276,10 @@ fn decode_row(batch: &RecordBatch, row: usize) -> Result<RecoveryAuditRecord> {
 }
 
 pub(crate) fn now_micros() -> Result<i64> {
-    // Routed through the DST seam (deterministic under the `dst` feature).
-    Ok(crate::dst::now_micros())
+    // Routed through the DST seam (deterministic under the `dst` feature). The
+    // `_result` variant PROPAGATES a clock-before-epoch error (the pre-seam
+    // contract) instead of persisting a 0 timestamp.
+    crate::dst::now_micros_result()
 }
 
 #[cfg(test)]
