@@ -65,8 +65,8 @@ amplification = PR2's target.)
 
 ### A.3 What is IN FLIGHT — branch `ragnorc/read-lance-table-docs` = **PR #307** (OPEN, base `main`)
 
-Nine commits ahead of `origin/main`. **The PR2.1 + fold-fix commits are committed locally but
-NOT yet pushed** — PR #307 currently shows only up to the scan-halving. `git push` updates it.
+Ten commits ahead of `origin/main`. PR #307 includes the scan-halving work, the fold
+correctness fix, and PR2.1's ground-truth cost harness.
 
 1. **PR2 — halve per-write `__manifest` scans** (`4ac3cde4` + tripwire `52a7e0cd`). Three moves:
    - **#1a probe-gate the OCC re-capture** (`occ_snapshot_for_branch`, mirrors the read path's
@@ -177,9 +177,8 @@ a 0-IO cache hit). So, apples-to-apples (both ground truth), per-write `__manife
 
 ### A.8 Immediate next action
 
-`git push` to update PR #307 with the fold fix + PR2.1 (committed locally, unpushed). Then the natural
-next PR is **PR1a** (no design gate, fixes the RustFS open failures). The `cargo test --workspace --locked`
-gate was running at handoff time — confirm green before pushing.
+The natural next PR is **PR1a** (no design gate, fixes the RustFS open failures). Run and confirm
+the relevant test gate before starting or stacking that follow-up.
 
 ---
 
@@ -218,8 +217,7 @@ for the canonical list. Current reality:
 — lineage now lives in `__manifest` (see §A.2). **Next for Thread A: the big one — Design A /
 `PublishPlan` unification (step 5)** — see §5, the convergent fix for the bug *class* this area
 keeps generating, which also absorbs 3b's deferred session-aware write opens. **Next for Thread B
-(the live branch, §A): `git push` PR #307, then PR1a** (manual `__manifest` cleanup — fixes the
-RustFS open failures).
+(the live branch, §A): PR1a** (manual `__manifest` cleanup — fixes the RustFS open failures).
 
 ---
 
