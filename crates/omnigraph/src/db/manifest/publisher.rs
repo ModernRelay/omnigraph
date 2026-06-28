@@ -804,11 +804,6 @@ impl ManifestBatchPublisher for GraphNamespacePublisher {
 /// contention; if the caller's `expected_table_versions` still holds against
 /// the new manifest state, we re-attempt. Other conflict variants (notably
 /// `ExpectedVersionMismatch`) propagate so the caller learns immediately.
-///
-/// Shared (`pub(crate)`) with the v3→v4 lineage backfill's re-open retry loop
-/// (`migrations::migrate_v3_to_v4`), so the migration's retry decision matches the
-/// publisher's by construction — both retry exactly `RowLevelCasContention` and
-/// propagate everything else.
 pub(crate) fn is_retryable_publish_conflict(err: &OmniError) -> bool {
     matches!(
         err,

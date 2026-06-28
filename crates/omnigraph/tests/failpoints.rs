@@ -31,22 +31,6 @@ fn node_table_uri(root: &str, type_name: &str) -> String {
     format!("{}/nodes/{hash:016x}", root.trim_end_matches('/'))
 }
 
-#[tokio::test]
-#[serial]
-async fn branch_create_failpoint_triggers() {
-    let _scenario = FailScenario::setup();
-    let dir = tempfile::tempdir().unwrap();
-    let uri = dir.path().to_str().unwrap();
-    let db = Omnigraph::init(uri, helpers::TEST_SCHEMA).await.unwrap();
-    let _failpoint = ScopedFailPoint::new(names::BRANCH_CREATE_AFTER_MANIFEST_BRANCH_CREATE, "return");
-
-    let err = db.branch_create("feature").await.unwrap_err();
-    assert!(
-        err.to_string()
-            .contains("injected failpoint triggered: branch_create.after_manifest_branch_create")
-    );
-}
-
 // Branch delete flips the manifest authority first, then reclaims the per-table
 // forks best-effort. A failure during that reclaim (here, the
 // `branch_delete.before_table_cleanup` failpoint, standing in for a transient
@@ -361,50 +345,6 @@ async fn cleanup_isolates_reconcile_failure() {
     }
 }
 
-// The cleanup reconciler must reclaim orphaned commit-graph branches, not just
-// per-table forks. A delete whose best-effort commit-graph reclaim fails leaves
-// a commit-graph orphan; the next cleanup must drop it.
-#[tokio::test]
-#[serial]
-async fn cleanup_reclaims_orphaned_commit_graph_branch() {
-    let _scenario = FailScenario::setup();
-    let dir = tempfile::tempdir().unwrap();
-    let uri = dir.path().to_str().unwrap().to_string();
-    let mut db = helpers::init_and_load(&dir).await;
-
-    db.branch_create("feature").await.unwrap();
-    // Delete, failing the commit-graph reclaim → commit-graph "feature" orphan
-    // (manifest branch gone, commit-graph branch left behind).
-    {
-        let _fp = ScopedFailPoint::new(names::BRANCH_DELETE_BEFORE_COMMIT_GRAPH_RECLAIM, "return");
-        db.branch_delete("feature").await.unwrap();
-    }
-
-    let commits_uri = format!("{}/_graph_commits.lance", uri.trim_end_matches('/'));
-    {
-        let ds = lance::Dataset::open(&commits_uri).await.unwrap();
-        assert!(
-            ds.list_branches().await.unwrap().contains_key("feature"),
-            "precondition: the commit-graph branch should be orphaned after the failed reclaim"
-        );
-    }
-
-    db.cleanup(omnigraph::db::CleanupPolicyOptions {
-        keep_versions: Some(1),
-        older_than: None,
-    })
-    .await
-    .unwrap();
-
-    {
-        let ds = lance::Dataset::open(&commits_uri).await.unwrap();
-        assert!(
-            !ds.list_branches().await.unwrap().contains_key("feature"),
-            "cleanup should reclaim the orphaned commit-graph branch"
-        );
-    }
-}
-
 // `classify_fork_ref` returns `Indeterminate` when the fresh-authority read
 // fails on a LIVE branch — and a destructive caller must SKIP, never delete, on
 // that ambiguity. Here the reconciler has a genuine origin-2 orphan candidate
@@ -468,65 +408,6 @@ async fn reconcile_skips_fork_when_fresh_recheck_is_unavailable_then_converges()
     }
 }
 
-// A branch_delete whose best-effort commit-graph reclaim fails leaves a
-// commit-graph "zombie" branch. Recreating that name must heal the zombie and
-// succeed (branch_create force-deletes a stale commit-graph ref since the
-// manifest branch is created fresh), instead of dying on the leftover ref.
-#[tokio::test]
-#[serial]
-async fn branch_create_recreates_over_commit_graph_zombie() {
-    let _scenario = FailScenario::setup();
-    let dir = tempfile::tempdir().unwrap();
-    let db = Omnigraph::init(dir.path().to_str().unwrap(), helpers::TEST_SCHEMA)
-        .await
-        .unwrap();
-
-    db.branch_create("feature").await.unwrap();
-    {
-        // Fail the best-effort commit-graph reclaim → commit-graph "feature"
-        // zombie survives the delete (manifest authority still flips).
-        let _fp = ScopedFailPoint::new(names::BRANCH_DELETE_BEFORE_COMMIT_GRAPH_RECLAIM, "return");
-        db.branch_delete("feature").await.unwrap();
-    }
-    assert_eq!(db.branch_list().await.unwrap(), vec!["main".to_string()]);
-
-    db.branch_create("feature")
-        .await
-        .expect("branch_create should heal the zombie commit-graph branch and succeed");
-    assert!(
-        db.branch_list()
-            .await
-            .unwrap()
-            .contains(&"feature".to_string())
-    );
-}
-
-// branch_create is authority-then-derived: if the derived commit-graph branch
-// cannot be created, the manifest branch (the authority) must be rolled back so
-// the branch does not half-exist. The existing failpoint fires right after the
-// manifest create, standing in for any post-authority failure.
-#[tokio::test]
-#[serial]
-async fn branch_create_rolls_back_manifest_on_commit_graph_failure() {
-    let _scenario = FailScenario::setup();
-    let dir = tempfile::tempdir().unwrap();
-    let db = Omnigraph::init(dir.path().to_str().unwrap(), helpers::TEST_SCHEMA)
-        .await
-        .unwrap();
-
-    let err = {
-        let _fp = ScopedFailPoint::new(names::BRANCH_CREATE_AFTER_MANIFEST_BRANCH_CREATE, "return");
-        db.branch_create("feature").await.unwrap_err()
-    };
-    assert!(
-        !db.branch_list()
-            .await
-            .unwrap()
-            .contains(&"feature".to_string()),
-        "branch_create must roll back the manifest branch when the derived \
-         commit-graph branch fails, got error: {err}"
-    );
-}
 
 // A fork collision must be classified by the manifest authority, not by Lance
 // branch versions. When a concurrent first-write legitimately wins the fork

@@ -1524,7 +1524,6 @@ impl Omnigraph {
         is_fast_forward: bool,
         actor_id: Option<&str>,
     ) -> Result<MergeOutcome> {
-        self.ensure_commit_graph_initialized().await?;
         let target_snapshot = self.snapshot().await;
 
         let mut table_keys = HashSet::new();

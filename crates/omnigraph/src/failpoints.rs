@@ -38,8 +38,6 @@ pub(crate) fn maybe_fail_retryable_contention(name: &str) -> Result<()> {
 /// reference these constants instead of bare string literals, so a typo is a
 /// compile error rather than a silently-never-firing failpoint.
 pub mod names {
-    pub const BRANCH_CREATE_AFTER_MANIFEST_BRANCH_CREATE: &str = "branch_create.after_manifest_branch_create";
-    pub const BRANCH_DELETE_BEFORE_COMMIT_GRAPH_RECLAIM: &str = "branch_delete.before_commit_graph_reclaim";
     pub const BRANCH_DELETE_BEFORE_TABLE_CLEANUP: &str = "branch_delete.before_table_cleanup";
     pub const BRANCH_MERGE_ADOPT_AFTER_APPEND_PRE_UPSERT: &str = "branch_merge.adopt_after_append_pre_upsert";
     pub const BRANCH_MERGE_ADOPT_AFTER_UPSERT_PRE_DELETE: &str = "branch_merge.adopt_after_upsert_pre_delete";

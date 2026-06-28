@@ -296,13 +296,12 @@ pub(crate) struct RecoverySidecar {
     pub writer_kind: SidecarKind,
     pub tables: Vec<SidecarTablePin>,
     /// For `SidecarKind::BranchMerge` only: the source branch's HEAD
-    /// commit id at the time the sidecar was written. Used by the
-    /// recovery sweep's audit step to call `append_merge_commit`
-    /// (recording `merged_parent_commit_id`) instead of `append_commit`,
-    /// so future merges between the same pair recognize "already up-to-
-    /// date" and merge-base computations stay correct. Optional for
-    /// backward compatibility — older sidecars (or non-BranchMerge
-    /// kinds) carry `None` and recovery falls back to `append_commit`.
+    /// commit id at the time the sidecar was written. Recovery replays the
+    /// merge commit recording this as its `merged_parent_commit_id` (folded
+    /// into the manifest publish, RFC-013 Phase 7), so future merges between
+    /// the same pair recognize "already up-to-date" and merge-base
+    /// computations stay correct. Optional — older sidecars (or
+    /// non-BranchMerge kinds) carry `None`, recording a plain commit.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub merge_source_commit_id: Option<String>,
     /// SchemaApply-only: tables the writer was about to register

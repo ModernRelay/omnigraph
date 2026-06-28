@@ -1,18 +1,6 @@
 use std::collections::{HashMap, VecDeque};
-use std::sync::Arc;
 
-use arrow_array::{
-    RecordBatch, RecordBatchIterator, StringArray, TimestampMicrosecondArray, UInt64Array,
-};
-use arrow_schema::{DataType, Field, Schema, SchemaRef, TimeUnit};
-use lance::Dataset;
-use lance::dataset::{WriteMode, WriteParams};
-use lance_file::version::LanceFileVersion;
-
-use crate::error::{OmniError, Result};
-
-const GRAPH_COMMITS_DIR: &str = "_graph_commits.lance";
-const GRAPH_COMMIT_ACTORS_DIR: &str = "_graph_commit_actors.lance";
+use crate::error::Result;
 
 #[derive(Debug, Clone)]
 pub struct GraphCommit {
@@ -25,60 +13,32 @@ pub struct GraphCommit {
     pub created_at: i64,
 }
 
+/// A pure projection of the graph lineage that lives in `__manifest`
+/// (`graph_commit` + `graph_head` rows, RFC-013 Phase 7). It opens NO Lance
+/// dataset (Phase B retired `_graph_commits.lance` / `_graph_commit_actors.lance`):
+/// the in-memory cache is built from `ManifestCoordinator::read_graph_lineage_at`,
+/// and branch authority lives entirely in `__manifest`. Reads
+/// (`head_commit`/`load_commits`/`get_commit`/`merge_base`) and writes
+/// (`insert_committed`, fed by the coordinator's manifest publish CAS) both work
+/// off this projection.
 pub struct CommitGraph {
     root_uri: String,
-    /// Handle on `_graph_commits.lance` at the active branch, held only for the
-    /// branch-management WRITES (`create_branch`, formerly `version`) and
-    /// `refresh`. It is a DERIVED artifact (RFC-013 Phase 7): graph lineage lives
-    /// in `__manifest`, and reads (`head_commit`/`load_commits`/`get_commit`/
-    /// `merge_base`) never touch it. `None` means the branch's
-    /// `_graph_commits.lance` ref is missing (an interrupted fork-reclaim or a
-    /// `cleanup` race) while the manifest lineage is still authoritative — so the
-    /// READS stay correct and only a subsequent `create_branch` surfaces the loud
-    /// actionable error. Mirrors `actor_dataset`'s best-effort `Option`.
-    dataset: Option<Dataset>,
-    actor_dataset: Option<Dataset>,
     active_branch: Option<String>,
-    actor_by_commit_id: HashMap<String, String>,
     commit_by_id: HashMap<String, GraphCommit>,
     head_commit: Option<GraphCommit>,
 }
 
 impl CommitGraph {
-    /// Create the commit-graph datasets for a fresh graph. The genesis
-    /// `graph_commit` + `graph_head` rows live in `__manifest` (folded into the
-    /// init write — RFC-013 Phase 7), so `_graph_commits.lance` is created EMPTY
-    /// here: it exists only to carry the Lance branch refs that `create_branch` /
-    /// `list_branches` / the `cleanup` orphan reconciler operate on. No commit
-    /// rows are ever written to it. The in-memory cache is sourced from the
-    /// manifest projection — the same path as [`open`], so genesis is seen
-    /// identically whether the graph was just initialized or reopened.
+    /// Seed the in-memory cache for a fresh graph from the `__manifest` genesis
+    /// lineage (folded into the manifest init write — RFC-013 Phase 7). No Lance
+    /// dataset is created or opened — the projection sees genesis identically to
+    /// [`open`].
     pub async fn init(root_uri: &str) -> Result<Self> {
         let root = root_uri.trim_end_matches('/');
-        let uri = graph_commits_uri(root);
-
-        let batch = RecordBatch::new_empty(commit_graph_schema());
-        let reader = RecordBatchIterator::new(vec![Ok(batch)], commit_graph_schema());
-        let params = WriteParams {
-            mode: WriteMode::Create,
-            enable_stable_row_ids: true,
-            data_storage_version: Some(LanceFileVersion::V2_2),
-            auto_cleanup: None,
-            skip_auto_cleanup: true,
-            ..Default::default()
-        };
-        let dataset = Dataset::write(reader, &uri as &str, Some(params))
-            .await
-            .map_err(|e| OmniError::Lance(e.to_string()))?;
-        let actor_dataset = create_commit_actor_dataset(root).await?;
-
         let (commit_by_id, head_commit) = load_commit_cache_from_manifest(root, None).await?;
         Ok(Self {
             root_uri: root.to_string(),
-            dataset: Some(dataset),
-            actor_dataset: Some(actor_dataset),
             active_branch: None,
-            actor_by_commit_id: HashMap::new(),
             commit_by_id,
             head_commit,
         })
@@ -98,32 +58,10 @@ impl CommitGraph {
 
     pub async fn open(root_uri: &str) -> Result<Self> {
         let root = root_uri.trim_end_matches('/');
-        let wrapper = crate::instrumentation::commit_graph_wrapper();
-        let dataset =
-            crate::instrumentation::open_dataset_tracked(&graph_commits_uri(root), wrapper.clone())
-                .await?;
-        let actor_dataset =
-            crate::instrumentation::open_dataset_tracked(&graph_commit_actors_uri(root), wrapper)
-                .await
-                .ok();
-        // RFC-013 step 4: source the in-memory cache from the `__manifest`
-        // lineage projection (which carries the actor inline), not from
-        // `_graph_commits.lance`. The dataset handles above are retained for the
-        // branch-management ops (create/delete/list/version) that still target
-        // the commit-graph dataset; the actor dataset is only kept for the
-        // dual-write append path. The projection-equivalence gate proves this
-        // cache equals the prior `_graph_commits.lance` read. A pre-Phase-7 (v3)
-        // graph not yet migrated falls back to the legacy read — see
-        // `load_commit_cache_for_branch`.
         let (commit_by_id, head_commit) = load_commit_cache_for_branch(root, None).await?;
         Ok(Self {
             root_uri: root.to_string(),
-            // `open` targets main and never checks out a branch (main cannot be
-            // deleted/recreated), so the handle is always present here.
-            dataset: Some(dataset),
-            actor_dataset,
             active_branch: None,
-            actor_by_commit_id: HashMap::new(),
             commit_by_id,
             head_commit,
         })
@@ -131,253 +69,22 @@ impl CommitGraph {
 
     pub async fn open_at_branch(root_uri: &str, branch: &str) -> Result<Self> {
         let root = root_uri.trim_end_matches('/');
-        let wrapper = crate::instrumentation::commit_graph_wrapper();
-        let dataset =
-            crate::instrumentation::open_dataset_tracked(&graph_commits_uri(root), wrapper.clone())
-                .await?;
-        // Best-effort checkout of the DERIVED `_graph_commits.lance` branch ref.
-        // It is held only for `create_branch` (a write); the lineage READ below
-        // comes from `__manifest`. A missing ref (interrupted fork-reclaim /
-        // `cleanup` race) must not wedge the read, so a typed not-found yields a
-        // `None` handle — a subsequent `create_branch` then surfaces the loud
-        // error. Any OTHER open error (transient IO / corrupt) still propagates,
-        // matching the `force_delete_branch` not-found idiom.
-        let dataset = match dataset.checkout_branch(branch).await {
-            Ok(ds) => Some(ds),
-            Err(lance::Error::RefNotFound { .. }) | Err(lance::Error::NotFound { .. }) => None,
-            Err(e) => return Err(OmniError::Lance(e.to_string())),
-        };
-        let actor_dataset =
-            crate::instrumentation::open_dataset_tracked(&graph_commit_actors_uri(root), wrapper)
-                .await
-                .ok();
-        // Hard `?`: the manifest existence gate. `load_commit_cache_for_branch`
-        // opens the branch's `__manifest` (its own `checkout_branch` on the
-        // authoritative table), so a TRULY absent branch still fails loudly here —
-        // only the derived `_graph_commits.lance` ref is allowed to be missing.
+        // `load_commit_cache_for_branch` opens the branch's `__manifest` (the
+        // authoritative table), so a truly absent branch fails loudly here.
         let (commit_by_id, head_commit) = load_commit_cache_for_branch(root, Some(branch)).await?;
         Ok(Self {
             root_uri: root.to_string(),
-            dataset,
-            actor_dataset,
             active_branch: Some(branch.to_string()),
-            actor_by_commit_id: HashMap::new(),
             commit_by_id,
             head_commit,
         })
     }
 
     pub async fn refresh(&mut self) -> Result<()> {
-        let root = self.root_uri.clone();
-        let wrapper = crate::instrumentation::commit_graph_wrapper();
-        let dataset = crate::instrumentation::open_dataset_tracked(
-            &graph_commits_uri(&root),
-            wrapper.clone(),
-        )
-        .await?;
-        // Same best-effort checkout as `open_at_branch`: a missing DERIVED branch
-        // ref leaves the handle `None` (only `create_branch` then errors), while
-        // the in-memory cache re-syncs from the authoritative manifest below.
-        self.dataset = match &self.active_branch {
-            Some(branch) => match dataset.checkout_branch(branch).await {
-                Ok(ds) => Some(ds),
-                Err(lance::Error::RefNotFound { .. }) | Err(lance::Error::NotFound { .. }) => None,
-                Err(e) => return Err(OmniError::Lance(e.to_string())),
-            },
-            None => Some(dataset),
-        };
-        self.actor_dataset =
-            crate::instrumentation::open_dataset_tracked(&graph_commit_actors_uri(&root), wrapper)
-                .await
-                .ok();
         let (commit_by_id, head_commit) =
-            load_commit_cache_for_branch(&root, self.active_branch.as_deref()).await?;
+            load_commit_cache_for_branch(&self.root_uri, self.active_branch.as_deref()).await?;
         self.commit_by_id = commit_by_id;
         self.head_commit = head_commit;
-        Ok(())
-    }
-
-    pub async fn create_branch(&mut self, name: &str) -> Result<()> {
-        // The held `_graph_commits.lance` handle is the only thing that can fork a
-        // branch ref. If it is missing (an interrupted fork-reclaim or a `cleanup`
-        // race dropped the derived ref while manifest lineage stayed authoritative),
-        // fail loudly + actionably rather than silently. Repair is the existing
-        // `cleanup` orphan reconciler (`reconcile_commit_graph_orphans`), not an
-        // inline write on this path.
-        let Some(dataset) = &self.dataset else {
-            let branch = self.active_branch.as_deref().unwrap_or("main");
-            return Err(OmniError::manifest_internal(format!(
-                "commit-graph branch ref for '{branch}' is missing; run `omnigraph cleanup` then retry"
-            )));
-        };
-        let version = dataset.version().version;
-        let mut ds = dataset.clone();
-        ds.create_branch(name, version, None)
-            .await
-            .map_err(|e| OmniError::Lance(e.to_string()))?;
-        Ok(())
-    }
-
-    pub async fn delete_branch(&mut self, name: &str) -> Result<()> {
-        let mut ds = Dataset::open(&graph_commits_uri(&self.root_uri))
-            .await
-            .map_err(|e| OmniError::Lance(e.to_string()))?;
-        ds.delete_branch(name)
-            .await
-            .map_err(|e| OmniError::Lance(e.to_string()))?;
-        self.refresh().await
-    }
-
-    /// Idempotently drop the commit-graph branch `name`, tolerating an
-    /// already-absent branch (see [`TableStore::force_delete_branch`] for the
-    /// same semantics). Used by the best-effort reclaim in `branch_delete` and
-    /// the `cleanup` orphan reconciler. `RefConflict` (referencing descendants)
-    /// is still surfaced.
-    pub async fn force_delete_branch(&mut self, name: &str) -> Result<()> {
-        let mut ds = Dataset::open(&graph_commits_uri(&self.root_uri))
-            .await
-            .map_err(|e| OmniError::Lance(e.to_string()))?;
-        match ds.force_delete_branch(name).await {
-            Ok(()) => {}
-            Err(lance::Error::RefNotFound { .. }) | Err(lance::Error::NotFound { .. }) => {}
-            Err(e) => return Err(OmniError::Lance(e.to_string())),
-        }
-        self.refresh().await
-    }
-
-    /// List the named branches present on the commit-graph dataset. The
-    /// `cleanup` reconciler diffs this against the manifest branch set to find
-    /// orphaned commit-graph branches to reclaim.
-    pub async fn list_branches(&self) -> Result<Vec<String>> {
-        let ds = Dataset::open(&graph_commits_uri(&self.root_uri))
-            .await
-            .map_err(|e| OmniError::Lance(e.to_string()))?;
-        let branches = ds
-            .list_branches()
-            .await
-            .map_err(|e| OmniError::Lance(e.to_string()))?;
-        Ok(branches.into_keys().collect())
-    }
-
-    // DEAD as of RFC-013 Phase 7: graph commits are recorded in `__manifest`
-    // (folded into the publish CAS), never appended to `_graph_commits.lance`.
-    // These append helpers are retained only because the actor sidecar table they
-    // touch is still enumerated by `optimize` (internal-table compaction); they
-    // have no caller on any write path. The single-source invariant is guarded by
-    // `tests/lineage_projection.rs`, which fails if `_graph_commits.lance` ever
-    // gains a commit row. Do NOT call these to record a commit — use the
-    // coordinator's `commit_*_with_actor` / `commit_merge_with_actor`, which carry
-    // the lineage intent into the manifest publish.
-    #[allow(dead_code)]
-    async fn append_commit(
-        &mut self,
-        manifest_branch: Option<&str>,
-        manifest_version: u64,
-        actor_id: Option<&str>,
-    ) -> Result<String> {
-        let parent_commit_id = self.head_commit_id().await?;
-        self.append_commit_with_parents(
-            manifest_branch,
-            manifest_version,
-            parent_commit_id.as_deref(),
-            None,
-            actor_id,
-        )
-        .await
-    }
-
-    #[allow(dead_code)]
-    async fn append_merge_commit(
-        &mut self,
-        manifest_branch: Option<&str>,
-        manifest_version: u64,
-        parent_commit_id: &str,
-        merged_parent_commit_id: &str,
-        actor_id: Option<&str>,
-    ) -> Result<String> {
-        self.append_commit_with_parents(
-            manifest_branch,
-            manifest_version,
-            Some(parent_commit_id),
-            Some(merged_parent_commit_id),
-            actor_id,
-        )
-        .await
-    }
-
-    #[allow(dead_code)]
-    async fn append_commit_with_parents(
-        &mut self,
-        manifest_branch: Option<&str>,
-        manifest_version: u64,
-        parent_commit_id: Option<&str>,
-        merged_parent_commit_id: Option<&str>,
-        actor_id: Option<&str>,
-    ) -> Result<String> {
-        let graph_commit_id = ulid::Ulid::new().to_string();
-        let commit = GraphCommit {
-            graph_commit_id: graph_commit_id.clone(),
-            manifest_branch: manifest_branch.map(|s| s.to_string()),
-            manifest_version,
-            parent_commit_id: parent_commit_id.map(|s| s.to_string()),
-            merged_parent_commit_id: merged_parent_commit_id.map(|s| s.to_string()),
-            actor_id: actor_id.map(str::to_string),
-            created_at: crate::db::now_micros()?,
-        };
-
-        let batch = commits_to_batch(&[commit.clone()])?;
-        let reader = RecordBatchIterator::new(vec![Ok(batch)], commit_graph_schema());
-        // This helper is dead on every write path (RFC-013 Phase 7) — reached only
-        // by the transitional v3 fixtures, which always hold the commits dataset.
-        // A `None` here would be a fixture bug, so fail loudly rather than silently.
-        let mut ds = self
-            .dataset
-            .clone()
-            .ok_or_else(|| OmniError::manifest_internal("commit-graph dataset is missing"))?;
-        ds.append(reader, None)
-            .await
-            .map_err(|e| OmniError::Lance(e.to_string()))?;
-        self.dataset = Some(ds);
-        if let Some(actor_id) = actor_id {
-            self.append_actor(&graph_commit_id, actor_id).await?;
-        }
-        self.commit_by_id
-            .insert(graph_commit_id.clone(), commit.clone());
-        if should_replace_head(self.head_commit.as_ref(), &commit) {
-            self.head_commit = Some(commit);
-        }
-
-        Ok(graph_commit_id)
-    }
-
-    #[allow(dead_code)] // RFC-013 Phase 7: dead — see `append_commit`.
-    async fn append_actor(&mut self, graph_commit_id: &str, actor_id: &str) -> Result<()> {
-        if self
-            .actor_by_commit_id
-            .get(graph_commit_id)
-            .is_some_and(|existing| existing == actor_id)
-        {
-            return Ok(());
-        }
-
-        let record = CommitActorRecord {
-            graph_commit_id: graph_commit_id.to_string(),
-            actor_id: actor_id.to_string(),
-            created_at: crate::db::now_micros()?,
-        };
-        let batch = commit_actors_to_batch(&[record])?;
-        let reader = RecordBatchIterator::new(vec![Ok(batch)], commit_actor_schema());
-        let mut dataset = match self.actor_dataset.take() {
-            Some(dataset) => dataset,
-            None => create_commit_actor_dataset(&self.root_uri).await?,
-        };
-        dataset
-            .append(reader, None)
-            .await
-            .map_err(|e| OmniError::Lance(e.to_string()))?;
-        self.actor_by_commit_id
-            .insert(graph_commit_id.to_string(), actor_id.to_string());
-        self.actor_dataset = Some(dataset);
         Ok(())
     }
 
@@ -454,109 +161,6 @@ impl CommitGraph {
     }
 }
 
-pub(crate) fn graph_commits_uri(root_uri: &str) -> String {
-    format!("{}/{}", root_uri.trim_end_matches('/'), GRAPH_COMMITS_DIR)
-}
-
-pub(crate) fn graph_commit_actors_uri(root_uri: &str) -> String {
-    format!(
-        "{}/{}",
-        root_uri.trim_end_matches('/'),
-        GRAPH_COMMIT_ACTORS_DIR
-    )
-}
-
-fn commit_graph_schema() -> SchemaRef {
-    Arc::new(Schema::new(vec![
-        Field::new("graph_commit_id", DataType::Utf8, false),
-        Field::new("manifest_branch", DataType::Utf8, true),
-        Field::new("manifest_version", DataType::UInt64, false),
-        Field::new("parent_commit_id", DataType::Utf8, true),
-        Field::new("merged_parent_commit_id", DataType::Utf8, true),
-        Field::new(
-            "created_at",
-            DataType::Timestamp(TimeUnit::Microsecond, None),
-            false,
-        ),
-    ]))
-}
-
-fn commit_actor_schema() -> SchemaRef {
-    Arc::new(Schema::new(vec![
-        Field::new("graph_commit_id", DataType::Utf8, false),
-        Field::new("actor_id", DataType::Utf8, false),
-        Field::new(
-            "created_at",
-            DataType::Timestamp(TimeUnit::Microsecond, None),
-            false,
-        ),
-    ]))
-}
-
-#[derive(Debug, Clone)]
-struct CommitActorRecord {
-    graph_commit_id: String,
-    actor_id: String,
-    created_at: i64,
-}
-
-async fn create_commit_actor_dataset(root_uri: &str) -> Result<Dataset> {
-    let uri = graph_commit_actors_uri(root_uri);
-    let batch = RecordBatch::new_empty(commit_actor_schema());
-    let reader = RecordBatchIterator::new(vec![Ok(batch)], commit_actor_schema());
-    let params = WriteParams {
-        mode: WriteMode::Create,
-        enable_stable_row_ids: true,
-        data_storage_version: Some(LanceFileVersion::V2_2),
-        auto_cleanup: None,
-        skip_auto_cleanup: true,
-        ..Default::default()
-    };
-    match Dataset::write(reader, &uri as &str, Some(params)).await {
-        Ok(dataset) => Ok(dataset),
-        // Create-or-open idempotency: a concurrent/prior create raced us. Match
-        // the typed `DatasetAlreadyExists` variant, not the display string — the
-        // message is not a Lance API contract (a wording change would silently
-        // break this fallback). Pinned by
-        // `lance_surface_guards.rs::lance_error_dataset_already_exists_variant_exists`.
-        Err(lance::Error::DatasetAlreadyExists { .. }) => Dataset::open(&uri)
-            .await
-            .map_err(|open_err| OmniError::Lance(open_err.to_string())),
-        Err(err) => Err(OmniError::Lance(err.to_string())),
-    }
-}
-
-fn commits_to_batch(commits: &[GraphCommit]) -> Result<RecordBatch> {
-    let ids: Vec<&str> = commits.iter().map(|c| c.graph_commit_id.as_str()).collect();
-    let branches: Vec<Option<&str>> = commits
-        .iter()
-        .map(|c| c.manifest_branch.as_deref())
-        .collect();
-    let versions: Vec<u64> = commits.iter().map(|c| c.manifest_version).collect();
-    let parents: Vec<Option<&str>> = commits
-        .iter()
-        .map(|c| c.parent_commit_id.as_deref())
-        .collect();
-    let merged_parents: Vec<Option<&str>> = commits
-        .iter()
-        .map(|c| c.merged_parent_commit_id.as_deref())
-        .collect();
-    let created_at: Vec<i64> = commits.iter().map(|c| c.created_at).collect();
-
-    RecordBatch::try_new(
-        commit_graph_schema(),
-        vec![
-            Arc::new(StringArray::from(ids)),
-            Arc::new(StringArray::from(branches)),
-            Arc::new(UInt64Array::from(versions)),
-            Arc::new(StringArray::from(parents)),
-            Arc::new(StringArray::from(merged_parents)),
-            Arc::new(TimestampMicrosecondArray::from(created_at)),
-        ],
-    )
-    .map_err(|e| OmniError::Lance(e.to_string()))
-}
-
 /// Build the in-memory commit cache for `branch` from the `__manifest`
 /// graph-lineage projection (RFC-013 Phase 7) — the single source of lineage on a
 /// v4 graph. Sub-v4 graphs are refused at open (`refuse_if_stamp_unsupported`),
@@ -569,10 +173,9 @@ async fn load_commit_cache_for_branch(
 }
 
 /// Build the in-memory commit cache from the `__manifest` graph-lineage
-/// projection (RFC-013 step 4) rather than `_graph_commits.lance`. The lineage
-/// rows carry the actor inline, so no separate actor-table read is needed. Head
-/// selection is identical to [`load_commit_cache`] (`should_replace_head`), so
-/// the resulting cache is equivalent to the prior `_graph_commits.lance` read.
+/// projection (RFC-013 step 4). The lineage rows carry the actor inline, so no
+/// separate actor-table read is needed. Head selection (`should_replace_head`)
+/// matches the order `load_commits` reports.
 async fn load_commit_cache_from_manifest(
     root_uri: &str,
     branch: Option<&str>,
@@ -597,28 +200,6 @@ async fn load_commit_cache_from_manifest(
         commit_by_id.insert(commit.graph_commit_id.clone(), commit);
     }
     Ok((commit_by_id, head_commit))
-}
-
-fn commit_actors_to_batch(records: &[CommitActorRecord]) -> Result<RecordBatch> {
-    let commit_ids: Vec<&str> = records
-        .iter()
-        .map(|record| record.graph_commit_id.as_str())
-        .collect();
-    let actor_ids: Vec<&str> = records
-        .iter()
-        .map(|record| record.actor_id.as_str())
-        .collect();
-    let created_at: Vec<i64> = records.iter().map(|record| record.created_at).collect();
-
-    RecordBatch::try_new(
-        commit_actor_schema(),
-        vec![
-            Arc::new(StringArray::from(commit_ids)),
-            Arc::new(StringArray::from(actor_ids)),
-            Arc::new(TimestampMicrosecondArray::from(created_at)),
-        ],
-    )
-    .map_err(|e| OmniError::Lance(e.to_string()))
 }
 
 fn should_replace_head(current: Option<&GraphCommit>, candidate: &GraphCommit) -> bool {
@@ -666,4 +247,3 @@ async fn open_for_branch(root_uri: &str, branch: Option<&str>) -> Result<CommitG
         _ => CommitGraph::open(root_uri).await,
     }
 }
-

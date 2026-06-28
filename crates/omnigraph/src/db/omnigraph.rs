@@ -175,8 +175,7 @@ pub struct Omnigraph {
     /// an explicit target coord parameter so `self.coordinator` is never
     /// used as scratch space — is the round-1 shape applied to
     /// `branch_create_from_impl`. Deferred because it requires unwinding
-    /// every `self.snapshot()` and `self.ensure_commit_graph_initialized()`
-    /// call inside the merge body.
+    /// every `self.snapshot()` call inside the merge body.
     merge_exclusive: Arc<tokio::sync::Mutex<()>>,
     /// Optional policy checker for engine-layer enforcement (MR-722).
     /// `None` = no enforcement; mutating methods are unconditionally
@@ -1530,8 +1529,7 @@ impl Omnigraph {
         &self,
         branch: Option<&str>,
     ) -> Result<Option<String>> {
-        let mut coordinator = self.open_coordinator_for_branch(branch).await?;
-        coordinator.ensure_commit_graph_initialized().await?;
+        let coordinator = self.open_coordinator_for_branch(branch).await?;
         coordinator
             .head_commit_id()
             .await
@@ -1836,10 +1834,6 @@ impl Omnigraph {
             committed_handles,
         )
         .await
-    }
-
-    pub(crate) async fn ensure_commit_graph_initialized(&self) -> Result<()> {
-        table_ops::ensure_commit_graph_initialized(self).await
     }
 
     /// Invalidate the cached graph index. Called after edge mutations.
@@ -2539,11 +2533,7 @@ edge WorksAt: Person -> Company
                 .exists_checks()
                 .contains(&join_uri(uri, "__schema_state.json"))
         );
-        assert!(
-            adapter
-                .exists_checks()
-                .contains(&join_uri(uri, "_graph_commits.lance"))
-        );
+        // (Phase B retired `_graph_commits.lance`: open no longer probes for it.)
     }
 
     async fn table_rows_json(db: &Omnigraph, table_key: &str) -> Vec<Value> {
@@ -2704,57 +2694,6 @@ edge WorksAt: Person -> Company
             all_branches
         );
 
-        let desired = TEST_SCHEMA.replace(
-            "    age: I32?\n}",
-            "    age: I32?\n    nickname: String?\n}",
-        );
-        let result = db.apply_schema(&desired).await.unwrap();
-        assert!(result.applied, "schema apply should have applied");
-    }
-
-    /// Regression (MR-770): a pre-v0.4.0 graph that still carries a stale
-    /// `__run__*` branch on `__manifest` must not block schema apply. The
-    /// v2→v3 sweep runs in `Omnigraph::open(ReadWrite)` — before the
-    /// schema-apply blocking-branch check — so apply succeeds with no
-    /// intervening publish.
-    ///
-    /// Confirmed to fail before the open-time migration landed: the reopened
-    /// graph still listed `__run__legacy`, and `apply_schema` returned
-    /// "found non-main branches: __run__legacy".
-    #[tokio::test]
-    async fn legacy_run_branch_is_swept_on_open_and_does_not_block_schema_apply() {
-        let dir = tempfile::tempdir().unwrap();
-        let uri = dir.path().to_str().unwrap();
-        let mut db = Omnigraph::init(uri, TEST_SCHEMA).await.unwrap();
-
-        // Synthesize a legacy graph: a stale `__run__` branch on `__manifest`
-        // plus the manifest stamp rewound to v2 (pre-sweep).
-        db.branch_create("__run__legacy").await.unwrap();
-        drop(db);
-        {
-            // forbidden-api-allow: test synthesizes a legacy graph by editing __manifest directly.
-            let mut ds = lance::Dataset::open(&format!("{}/__manifest", uri))
-                .await
-                .unwrap();
-            ds.update_schema_metadata([(
-                "omnigraph:internal_schema_version".to_string(),
-                Some("2".to_string()),
-            )])
-            .await
-            .unwrap();
-        }
-
-        // Reopen (ReadWrite): the open-time migration must sweep `__run__legacy`
-        // before any branch-observing code runs.
-        let db = Omnigraph::open(uri).await.unwrap();
-        let branches = db.branch_list().await.unwrap();
-        assert!(
-            !branches.iter().any(|b| b.starts_with("__run__")),
-            "open-time migration must sweep legacy __run__ branches; got {branches:?}",
-        );
-
-        // Schema apply must proceed with no intervening publish — the
-        // blocking-branch check no longer sees `__run__legacy`.
         let desired = TEST_SCHEMA.replace(
             "    age: I32?\n}",
             "    age: I32?\n    nickname: String?\n}",

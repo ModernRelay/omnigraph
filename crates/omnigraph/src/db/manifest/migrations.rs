@@ -128,9 +128,8 @@ async fn set_stamp(dataset: &mut Dataset, version: u32) -> Result<()> {
 
 /// Test-only: force the on-disk internal-schema stamp to `version`. The minimal
 /// seam used to synthesize a sub-CURRENT graph and assert the open path refuses
-/// it. Gated on `test` OR `failpoints` so the integration binaries (compiled
-/// without `cfg(test)`) can reach it too.
-#[cfg(any(test, feature = "failpoints"))]
+/// it. Its only caller is the in-source refusal test, so it is `cfg(test)`-only.
+#[cfg(test)]
 pub(crate) async fn set_stamp_for_test(dataset: &mut Dataset, version: u32) -> Result<()> {
     set_stamp(dataset, version).await
 }
