@@ -31,7 +31,7 @@
 
 mod helpers;
 
-use helpers::cost::{IoCounts, assert_flat, cost_harness, measure_insert, s3_graph};
+use helpers::cost::{IoCounts, assert_flat, assert_grows, cost_harness, measure_insert, s3_graph};
 use helpers::commit_many;
 
 /// After step 3a the data-table opener term is flat across depth on a real object
@@ -154,6 +154,65 @@ async fn warm_write_cost_flat_and_bounded_in_history_on_s3() {
             shallow.manifest_num_stages <= 14,
             "warm-write __manifest round-trip ceiling exceeded: {} (baseline 13)",
             shallow.manifest_num_stages,
+        );
+    })
+    .await;
+}
+
+/// NEGATIVE CONTROL for `warm_write_cost_flat_and_bounded_in_history_on_s3` —
+/// gives the flat gate teeth. The SAME warm-write depth sweep with NO
+/// `optimize()` between depths asserts `manifest_reads` GROWS with
+/// commit-history depth, proving the flat term is flat BECAUSE of compaction
+/// (RFC-013 step 2 brought `__manifest` into `optimize`), not because the
+/// harness measures nothing. The local twin
+/// (`write_cost.rs::internal_table_scans_grow_without_compaction`) proves the
+/// same every-PR on local FS; this is the S3 warm-write mirror, run under RustFS
+/// in CI's `rustfs_integration` job.
+#[tokio::test]
+async fn warm_write_cost_grows_without_compaction_on_s3() {
+    let Some(mut db) = s3_graph("write-cost-grows").await else {
+        eprintln!(
+            "SKIP warm_write_cost_grows_without_compaction_on_s3: \
+             OMNIGRAPH_S3_TEST_BUCKET unset (or store unreachable)"
+        );
+        return;
+    };
+
+    cost_harness(async move {
+        let mut curve: Vec<(u64, IoCounts)> = Vec::new();
+        let mut current = 0u64;
+        // Same 10→50 sweep as the flat gate (depth 100 trips the unrelated Lance
+        // FTS-builder panic). The omission of `db.optimize()` is the whole point.
+        for d in [10u64, 50] {
+            if d > current {
+                commit_many(&mut db, (d - current) as usize).await;
+                current = d;
+            }
+            // NO `db.optimize()` here — so the `__manifest` fragments/rows
+            // accumulate O(commits) and the publish-path scan reads grow with depth.
+            let io = measure_insert(&mut db, &format!("grows_{d}")).await;
+            current += 1; // the measured write advanced depth by one
+            eprintln!(
+                "depth~{d} (uncompacted): manifest_reads={} manifest_list={} total={}",
+                io.manifest_reads,
+                io.manifest_list_requests,
+                io.total_reads(),
+            );
+            curve.push((d, io));
+        }
+
+        // GREEN today: the per-write `__manifest` publish scan is O(fragments) and
+        // grows across the 10→50 sweep by far more than the flat gate's slack of 2.
+        // The `8` floor is seeded conservatively (the local twin floors at 20 over a
+        // 90-depth sweep; scaled to this 40-depth sweep that is ~9), comfortably
+        // above the flat slack and unambiguously distinguishing "grows" from "flat".
+        // CI's rustfs_integration job calibrates the true S3 growth — raise the floor
+        // toward it once measured.
+        assert_grows(
+            &curve,
+            |c| c.manifest_reads,
+            8,
+            "S3 warm-write __manifest scan (uncompacted)",
         );
     })
     .await;
