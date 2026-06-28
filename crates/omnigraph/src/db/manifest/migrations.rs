@@ -109,8 +109,8 @@ pub(crate) fn refuse_if_stamp_unsupported(stamp: u32) -> Result<()> {
     if stamp < MIN_SUPPORTED_INTERNAL_SCHEMA_VERSION {
         return Err(OmniError::manifest(format!(
             "__manifest is stamped at internal schema v{stamp}, but this omnigraph reads only v{current}. \
-             This graph was created by an older release; rebuild it: run `omnigraph export` with that \
-             older release, then `omnigraph init` + `omnigraph load` with this one. \
+             This graph was created by an older omnigraph release; rebuild it: run `omnigraph export` with \
+             the older omnigraph binary that created it, then `omnigraph init` + `omnigraph load` with this one. \
              (Data, vectors, and blobs are preserved; commit history and branches are not.)",
             current = INTERNAL_MANIFEST_SCHEMA_VERSION,
         )));

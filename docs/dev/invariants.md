@@ -257,6 +257,25 @@ them explicit.
   acknowledged-before-visible bug this branch fixed. Close it (local CAS
   primitive, or a trait-level lock requirement) before admitting any
   lock-free `if_match` caller.
+- **Internal-schema stamp is validated at the graph (main) level only:**
+  `Omnigraph::open` reads the `omnigraph:internal_schema_version` stamp on
+  **main** and refuses an out-of-range graph (newer than CURRENT → "upgrade
+  omnigraph"; below MIN_SUPPORTED → "rebuild via export/import"). Branch reads
+  then trust that one check. This is correct by the storage-format contract: the
+  stamp is a graph-wide property (the upgrade path is a whole-graph
+  export/import), so with one binary version every branch is always CURRENT —
+  init stamps main, `create_branch` forks the stamp, the publisher writes rows
+  without re-stamping. A branch stamped out of range while main stays in range is
+  only reachable with concurrent **multi-version writers**, an unsupported
+  topology already in one-winner-CAS territory: writes to such a branch are
+  refused per-branch by the publisher (it reads its target's stamp), and a newer
+  binary advancing main is refused at open. The residual hole is read-only —
+  reading or merging a branch a newer binary advanced while main stayed old would
+  decode it with this binary's logic instead of refusing. Close it (a per-branch
+  read gate folded into the branch-manifest open the read already does, zero
+  extra I/O) only when multi-version write topologies are promoted to supported;
+  a separate stamp round-trip per branch read is the wrong shape (it regresses the
+  warm-read cost budget to defend an unsupported state).
 - **Manifest→commit-graph publish atomicity — CLOSED (RFC-013 Phase 7):** graph
   lineage now lives ONLY in `__manifest`, as `graph_commit` + `graph_head:<branch>`
   rows written in the SAME `MergeInsertBuilder` commit as the table-version rows

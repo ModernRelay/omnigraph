@@ -94,12 +94,21 @@ pub(crate) async fn internal_schema_stamp_at(root_uri: &str, branch: Option<&str
     Ok(migrations::read_stamp(&dataset))
 }
 
-/// Refuse to open a graph whose `__manifest` is stamped outside this binary's
-/// supported internal-schema range (newer than CURRENT, or older than
+/// Refuse to open a graph whose `__manifest` (main) is stamped outside this
+/// binary's supported internal-schema range (newer than CURRENT, or older than
 /// MIN_SUPPORTED). Both open paths (read-write and read-only) call this before
 /// reading any data, so an old binary refuses a newer graph instead of silently
 /// misreading it, and this binary refuses a below-floor graph with a
 /// rebuild-via-export/import message instead of opening a format it can't read.
+///
+/// The stamp is gated at the GRAPH level (main only). It is a graph-wide
+/// storage-format property — the upgrade path is a whole-graph export/import, so
+/// with one binary version every branch is always CURRENT (init stamps main,
+/// `create_branch` forks the stamp, the publisher writes rows without
+/// re-stamping). A branch stamped out of range while main stays in range is only
+/// reachable with concurrent multi-version writers, an unsupported topology
+/// (writes are refused per-branch by the publisher; a newer binary advancing
+/// main is refused here). See the matching known gap in `docs/dev/invariants.md`.
 pub(crate) async fn refuse_if_internal_schema_unsupported(root_uri: &str) -> Result<()> {
     let stamp = internal_schema_stamp_at(root_uri, None).await?;
     migrations::refuse_if_stamp_unsupported(stamp)
