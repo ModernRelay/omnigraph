@@ -240,6 +240,19 @@ pub(crate) enum ManifestChange {
     Tombstone(TableTombstone),
 }
 
+/// The declarative input to one graph publish — the "what" a writer hands the
+/// publish authority (the `ManifestCoordinator`, which owns the warm `__manifest`
+/// state), built once before the CAS loop (RFC-013 §4.1's `PublishPlan`). Borrows
+/// its three parts so bundling allocates nothing; the publisher destructures it.
+/// Today it carries exactly the three publish inputs; the richer verb-facing
+/// `TableAction`/`base` form is earned as the writers migrate (Phase 3+).
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct PublishPlan<'a> {
+    pub(crate) changes: &'a [ManifestChange],
+    pub(crate) expected_table_versions: &'a HashMap<String, u64>,
+    pub(crate) lineage: Option<&'a LineageIntent>,
+}
+
 impl SubTableEntry {
     /// Open this sub-table at its pinned version directly by location (Fix 2),
     /// without the Lance namespace — which would full-scan `__manifest` twice per
@@ -495,14 +508,16 @@ impl ManifestCoordinator {
             });
         }
 
+        let plan = PublishPlan {
+            changes,
+            expected_table_versions,
+            lineage,
+        };
         let PublishOutcome {
             dataset,
             parent_commit_id,
             known_state,
-        } = self
-            .publisher
-            .publish(changes, expected_table_versions, lineage)
-            .await?;
+        } = self.publisher.publish(&plan).await?;
         // RFC-013 PR2 #1b: the publisher folded the new visible state in-memory
         // (byte-identical to a re-scan via the shared `assemble_manifest_state`),
         // so adopt it directly instead of an O(fragments) `read_manifest_state`.
