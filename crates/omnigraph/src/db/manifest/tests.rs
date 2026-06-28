@@ -1121,13 +1121,9 @@ impl RecordingPublisher {
 
 #[async_trait]
 impl ManifestBatchPublisher for RecordingPublisher {
-    async fn publish(
-        &self,
-        changes: &[ManifestChange],
-        expected_table_versions: &HashMap<String, u64>,
-        lineage: Option<&LineageIntent>,
-    ) -> Result<PublishOutcome> {
-        let requests: Vec<CreateTableVersionRequest> = changes
+    async fn publish(&self, plan: &PublishPlan<'_>) -> Result<PublishOutcome> {
+        let requests: Vec<CreateTableVersionRequest> = plan
+            .changes
             .iter()
             .filter_map(|change| match change {
                 ManifestChange::Update(update) => Some(update.to_create_table_version_request()),
@@ -1135,9 +1131,7 @@ impl ManifestBatchPublisher for RecordingPublisher {
             })
             .collect();
         self.requests.lock().await.extend_from_slice(&requests);
-        self.inner
-            .publish(changes, expected_table_versions, lineage)
-            .await
+        self.inner.publish(plan).await
     }
 }
 
@@ -1145,12 +1139,7 @@ struct FailingPublisher;
 
 #[async_trait]
 impl ManifestBatchPublisher for FailingPublisher {
-    async fn publish(
-        &self,
-        _changes: &[ManifestChange],
-        _expected_table_versions: &HashMap<String, u64>,
-        _lineage: Option<&LineageIntent>,
-    ) -> Result<PublishOutcome> {
+    async fn publish(&self, _plan: &PublishPlan<'_>) -> Result<PublishOutcome> {
         Err(OmniError::manifest(
             "injected batch publisher failure".to_string(),
         ))
@@ -1530,8 +1519,24 @@ async fn test_concurrent_publish_with_overlapping_expected_versions_one_succeeds
     let expected_b = expected;
 
     let (res_a, res_b) = tokio::join!(
-        async { publisher_a.publish(&changes_a, &expected_a, None).await },
-        async { publisher_b.publish(&changes_b, &expected_b, None).await }
+        async {
+            publisher_a
+                .publish(&PublishPlan {
+                    changes: &changes_a,
+                    expected_table_versions: &expected_a,
+                    lineage: None,
+                })
+                .await
+        },
+        async {
+            publisher_b
+                .publish(&PublishPlan {
+                    changes: &changes_b,
+                    expected_table_versions: &expected_b,
+                    lineage: None,
+                })
+                .await
+        }
     );
 
     let (succeeded, err) = match (res_a, res_b) {
@@ -1644,7 +1649,11 @@ async fn test_publish_rejects_manifest_stamped_at_future_version() {
     let mut expected = HashMap::new();
     expected.insert("node:Person".to_string(), 1);
     let err = GraphNamespacePublisher::new(uri, None)
-        .publish(&[], &expected, None)
+        .publish(&PublishPlan {
+            changes: &[],
+            expected_table_versions: &expected,
+            lineage: None,
+        })
         .await
         .expect_err("future-stamped manifest should reject open-for-write");
     let msg = err.to_string();
@@ -2005,8 +2014,24 @@ async fn concurrent_disjoint_writes_share_head_and_form_linear_chain() {
     // version on the other's table; contention is purely the shared head row.
     let empty = HashMap::new();
     let (res_a, res_b) = tokio::join!(
-        async { publisher_a.publish(&changes_a, &empty, Some(&intent_a)).await },
-        async { publisher_b.publish(&changes_b, &empty, Some(&intent_b)).await }
+        async {
+            publisher_a
+                .publish(&PublishPlan {
+                    changes: &changes_a,
+                    expected_table_versions: &empty,
+                    lineage: Some(&intent_a),
+                })
+                .await
+        },
+        async {
+            publisher_b
+                .publish(&PublishPlan {
+                    changes: &changes_b,
+                    expected_table_versions: &empty,
+                    lineage: Some(&intent_b),
+                })
+                .await
+        }
     );
 
     // BOTH commit: disjoint tables → the head-row CAS loser retries within
@@ -2081,8 +2106,24 @@ async fn concurrent_disjoint_writes_form_linear_chain_on_s3() {
     };
     let empty = HashMap::new();
     let (res_a, res_b) = tokio::join!(
-        async { publisher_a.publish(&changes_a, &empty, Some(&intent_a)).await },
-        async { publisher_b.publish(&changes_b, &empty, Some(&intent_b)).await }
+        async {
+            publisher_a
+                .publish(&PublishPlan {
+                    changes: &changes_a,
+                    expected_table_versions: &empty,
+                    lineage: Some(&intent_a),
+                })
+                .await
+        },
+        async {
+            publisher_b
+                .publish(&PublishPlan {
+                    changes: &changes_b,
+                    expected_table_versions: &empty,
+                    lineage: Some(&intent_b),
+                })
+                .await
+        }
     );
     res_a.expect("writer A must commit on S3");
     res_b.expect("writer B must commit on S3");
@@ -2156,7 +2197,14 @@ async fn n_concurrent_disjoint_writers_converge_to_one_linear_chain() {
                     created_at: lineage_now_micros(),
                 };
                 let publisher = GraphNamespacePublisher::new(&uri, None);
-                match publisher.publish(&changes, &empty, Some(&intent)).await {
+                match publisher
+                    .publish(&PublishPlan {
+                        changes: &changes,
+                        expected_table_versions: &empty,
+                        lineage: Some(&intent),
+                    })
+                    .await
+                {
                     Ok(_) => return commit_id,
                     Err(OmniError::Manifest(m))
                         if matches!(m.kind, ManifestErrorKind::Conflict)

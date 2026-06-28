@@ -41,7 +41,7 @@ use super::state::{
 };
 use super::{
     ManifestChange, OBJECT_TYPE_TABLE, OBJECT_TYPE_TABLE_TOMBSTONE, OBJECT_TYPE_TABLE_VERSION,
-    SubTableEntry, TableRegistration, TableTombstone,
+    PublishPlan, SubTableEntry, TableRegistration, TableTombstone,
 };
 
 /// Bound on the publisher-level retry loop that wraps Lance's row-level CAS
@@ -92,12 +92,7 @@ pub(super) struct PublishOutcome {
 
 #[async_trait]
 pub(super) trait ManifestBatchPublisher: Send + Sync {
-    async fn publish(
-        &self,
-        changes: &[ManifestChange],
-        expected_table_versions: &HashMap<String, u64>,
-        lineage: Option<&LineageIntent>,
-    ) -> Result<PublishOutcome>;
+    async fn publish(&self, plan: &PublishPlan<'_>) -> Result<PublishOutcome>;
 }
 
 pub(super) struct GraphNamespacePublisher {
@@ -622,7 +617,14 @@ impl GraphNamespacePublisher {
                 }))
             })
             .collect::<Result<Vec<_>>>()?;
-        Ok(self.publish(&changes, &HashMap::new(), None).await?.dataset)
+        Ok(self
+            .publish(&PublishPlan {
+                changes: &changes,
+                expected_table_versions: &HashMap::new(),
+                lineage: None,
+            })
+            .await?
+            .dataset)
     }
 }
 
@@ -671,12 +673,12 @@ pub(crate) fn map_lance_publish_error(err: LanceError) -> OmniError {
 
 #[async_trait]
 impl ManifestBatchPublisher for GraphNamespacePublisher {
-    async fn publish(
-        &self,
-        changes: &[ManifestChange],
-        expected_table_versions: &HashMap<String, u64>,
-        lineage: Option<&LineageIntent>,
-    ) -> Result<PublishOutcome> {
+    async fn publish(&self, plan: &PublishPlan<'_>) -> Result<PublishOutcome> {
+        let PublishPlan {
+            changes,
+            expected_table_versions,
+            lineage,
+        } = *plan;
         if changes.is_empty() && expected_table_versions.is_empty() && lineage.is_none() {
             // Defensive no-op (never reached from `commit_changes_with_lineage`,
             // which short-circuits the all-empty case): state is unchanged, so a

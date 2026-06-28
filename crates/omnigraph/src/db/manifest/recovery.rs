@@ -48,7 +48,7 @@ use crate::storage::StorageAdapter;
 
 use super::Snapshot;
 use super::publisher::{GraphNamespacePublisher, LineageIntent, ManifestBatchPublisher};
-use super::{ManifestChange, SubTableUpdate, TableRegistration, TableTombstone};
+use super::{ManifestChange, PublishPlan, SubTableUpdate, TableRegistration, TableTombstone};
 
 /// System actor identifier recorded on every recovery commit. Operators
 /// distinguish recovery commits from user commits in `omnigraph commit list`
@@ -90,7 +90,13 @@ async fn publish_recovery_commit(
         created_at: crate::db::now_micros()?,
     };
     let publisher = GraphNamespacePublisher::new(root_uri, sidecar.branch.as_deref());
-    let outcome = publisher.publish(updates, expected, Some(&intent)).await?;
+    let outcome = publisher
+        .publish(&PublishPlan {
+            changes: updates,
+            expected_table_versions: expected,
+            lineage: Some(&intent),
+        })
+        .await?;
     Ok((outcome.dataset.version().version, intent.graph_commit_id))
 }
 
@@ -960,7 +966,13 @@ async fn discard_orphaned_branch_sidecar(
             created_at: crate::db::now_micros()?,
         };
         let publisher = GraphNamespacePublisher::new(root_uri, None);
-        publisher.publish(&[], &HashMap::new(), Some(&intent)).await?;
+        publisher
+            .publish(&PublishPlan {
+                changes: &[],
+                expected_table_versions: &HashMap::new(),
+                lineage: Some(&intent),
+            })
+            .await?;
         // Failpoint: the residual window above — commit published, audit
         // not yet durable.
         crate::failpoints::maybe_fail(crate::failpoints::names::RECOVERY_ORPHAN_DISCARD_AUDIT_APPEND)?;
