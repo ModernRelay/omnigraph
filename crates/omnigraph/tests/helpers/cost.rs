@@ -55,6 +55,17 @@ pub struct IoCounts {
     /// `__manifest` registry scans (publish state; includes the graph-lineage rows
     /// folded into `__manifest` by RFC-013 Phase 7).
     pub manifest_reads: u64,
+    /// `__manifest` LIST requests this op issued (`ListObjectsV2` on `_versions/` —
+    /// the latest-version resolves). Counted from Lance's `IoStats::requests` by
+    /// method (`list*`). The unlimited-history target (latency.md / the
+    /// unlimited-history plan) drives this toward ~1 (the lone freshness check) as
+    /// pinned opens + warm publish remove the rest; gated flat across commit depth.
+    pub manifest_list_requests: u64,
+    /// `__manifest` round-trip count for this op — Lance's `IoStats::num_stages`
+    /// (disjoint in-flight IO periods). The most faithful proxy to the reports'
+    /// "wall ≈ round-trip-count × RTT". (Per-tracker today; a whole-store spanning
+    /// tracker for the global write hop count is a follow-up.)
+    pub manifest_num_stages: u64,
     /// Version-probe invocations (the cheap freshness check).
     pub version_probes: u64,
     /// DATA-table open CALL count through the two instrumented chokepoints — an
@@ -336,6 +347,12 @@ impl OpProbes {
             data_opener_reads: t.opener_reads,
             data_scan_reads: t.scan_reads,
             manifest_reads: manifest.read_iops,
+            manifest_list_requests: manifest
+                .requests
+                .iter()
+                .filter(|r| r.method.starts_with("list"))
+                .count() as u64,
+            manifest_num_stages: manifest.num_stages,
             version_probes: self.probe_count.load(Ordering::Relaxed),
             data_open_count: self.data_open_count.load(Ordering::Relaxed),
             internal_open_count: self.internal_open_count.load(Ordering::Relaxed),
