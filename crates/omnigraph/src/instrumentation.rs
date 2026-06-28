@@ -60,6 +60,14 @@ pub struct QueryIoProbes {
     /// Internal/system-table (`__manifest`, `_graph_commits*`) open CALLS — the
     /// complement of `data_open_count`, kept for symmetry and debugging.
     pub internal_open_count: Arc<AtomicU64>,
+    /// Counts topology-index builds (the `RuntimeCache::graph_index` cache-miss
+    /// path). A cost test asserts a fresh branch whose edge tables are unchanged
+    /// from main reuses main's cached index (0 builds) rather than rebuilding it.
+    pub graph_build_count: Arc<AtomicU64>,
+    /// Edge tables included in topology builds this query (summed over build
+    /// invocations). A cost test asserts a query referencing one edge builds only
+    /// that edge, not every catalog edge (the cold-build shrink A2 ships).
+    pub graph_edges_built: Arc<AtomicU64>,
 }
 
 tokio::task_local! {
@@ -127,6 +135,16 @@ pub(crate) fn record_open(uri: &str) {
         } else {
             p.data_open_count.fetch_add(1, Ordering::Relaxed);
         }
+    });
+}
+
+/// Record one topology-index build over `edges` edge tables (the
+/// `RuntimeCache::graph_index` cache-miss path). No-op when no probes are
+/// installed (production).
+pub(crate) fn record_graph_build(edges: usize) {
+    let _ = current(|p| {
+        p.graph_build_count.fetch_add(1, Ordering::Relaxed);
+        p.graph_edges_built.fetch_add(edges as u64, Ordering::Relaxed);
     });
 }
 

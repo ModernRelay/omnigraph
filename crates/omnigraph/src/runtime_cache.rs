@@ -4,16 +4,20 @@ use std::sync::Arc;
 
 use lance::Dataset;
 use lance::session::Session;
-use omnigraph_compiler::catalog::Catalog;
 use tokio::sync::Mutex;
 
 use crate::db::ResolvedTarget;
 use crate::error::Result;
 use crate::graph_index::GraphIndex;
 
+/// Cache key for a built `GraphIndex`. Keyed (A1) by the physical identity of the
+/// edge tables the topology is derived from, NOT by the resolved snapshot id. The
+/// topology is a pure function of the edge tables' `src`/`dst`, so two snapshots
+/// (e.g. main and a lazy-fork branch whose edge tables physically *are* main's)
+/// with identical edge tables share one built index: a fresh branch reuses main's
+/// instead of rebuilding it from a cold scan.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 struct GraphIndexCacheKey {
-    snapshot_id: String,
     edge_tables: Vec<GraphIndexTableState>,
 }
 
@@ -22,6 +26,13 @@ struct GraphIndexTableState {
     table_key: String,
     table_version: u64,
     table_branch: Option<String>,
+    /// Lance manifest incarnation token for this edge table version. Preserves the
+    /// incarnation distinction the dropped synthetic snapshot id used to carry: a
+    /// branch deleted and recreated at the same version number gets a new e_tag, so
+    /// the cache rebuilds instead of serving stale topology. `None` only on stores
+    /// without e_tags (local FS); there a same-branch manifest refresh clears the
+    /// cache as the fallback (the read-path gap in docs/dev/invariants.md).
+    e_tag: Option<String>,
 }
 
 #[derive(Debug, Default)]
@@ -40,12 +51,18 @@ impl RuntimeCache {
         cache.entries.invalidate_all();
     }
 
+    /// Build (or fetch) the CSR/CSC graph index scoped to exactly `edge_types` —
+    /// the edge types the query actually traverses, not every edge type in the
+    /// catalog. Scoping is what keeps a single-edge join (`$x identifiesPerson
+    /// $p`) from scanning the whole graph's edge data; the cache key carries the
+    /// scoped set, so a `{Knows}` index and a `{Knows, WorksAt}` index are
+    /// distinct entries and never serve each other.
     pub async fn graph_index(
         &self,
         resolved: &ResolvedTarget,
-        catalog: &Catalog,
+        edge_types: &HashMap<String, (String, String)>,
     ) -> Result<Arc<GraphIndex>> {
-        let key = graph_index_cache_key(resolved, catalog);
+        let key = graph_index_cache_key(resolved, edge_types);
         {
             let mut cache = self.graph_indices.lock().await;
             if let Some(index) = cache.entries.get(&key).cloned() {
@@ -53,13 +70,8 @@ impl RuntimeCache {
             }
         }
 
-        let edge_types = catalog
-            .edge_types
-            .iter()
-            .map(|(name, et)| (name.clone(), (et.from_type.clone(), et.to_type.clone())))
-            .collect();
-
-        let index = Arc::new(GraphIndex::build(&resolved.snapshot, &edge_types).await?);
+        crate::instrumentation::record_graph_build(edge_types.len());
+        let index = Arc::new(GraphIndex::build(&resolved.snapshot, edge_types).await?);
         let mut cache = self.graph_indices.lock().await;
         if let Some(existing) = cache.entries.get(&key).cloned() {
             return Ok(existing);
@@ -151,9 +163,11 @@ impl Default for GraphIndexCache {
     }
 }
 
-fn graph_index_cache_key(resolved: &ResolvedTarget, catalog: &Catalog) -> GraphIndexCacheKey {
-    let mut edge_tables: Vec<GraphIndexTableState> = catalog
-        .edge_types
+fn graph_index_cache_key(
+    resolved: &ResolvedTarget,
+    edge_types: &HashMap<String, (String, String)>,
+) -> GraphIndexCacheKey {
+    let mut edge_tables: Vec<GraphIndexTableState> = edge_types
         .keys()
         .filter_map(|edge_name| {
             let table_key = format!("edge:{}", edge_name);
@@ -164,15 +178,13 @@ fn graph_index_cache_key(resolved: &ResolvedTarget, catalog: &Catalog) -> GraphI
                     table_key,
                     table_version: entry.table_version,
                     table_branch: entry.table_branch.clone(),
+                    e_tag: entry.version_metadata.e_tag().map(str::to_string),
                 })
         })
         .collect();
     edge_tables.sort_by(|a, b| a.table_key.cmp(&b.table_key));
 
-    GraphIndexCacheKey {
-        snapshot_id: resolved.snapshot_id.as_str().to_string(),
-        edge_tables,
-    }
+    GraphIndexCacheKey { edge_tables }
 }
 
 /// Max held `Dataset` handles. A handle holds only Arcs (object store + manifest),
@@ -290,9 +302,15 @@ mod tests {
     use super::*;
 
     fn key(id: usize) -> GraphIndexCacheKey {
+        // Distinct keys via a distinct edge table per id (the key no longer carries
+        // a snapshot id — it is the physical edge-table identity set, A1).
         GraphIndexCacheKey {
-            snapshot_id: format!("snap-{id}"),
-            edge_tables: Vec::new(),
+            edge_tables: vec![GraphIndexTableState {
+                table_key: format!("edge:t{id}"),
+                table_version: 1,
+                table_branch: None,
+                e_tag: None,
+            }],
         }
     }
 
