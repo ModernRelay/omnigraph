@@ -22,10 +22,13 @@
 >    rows) and the forward-probe latest-resolve are in [latency.md](latency.md) §6, not here.
 >
 > The deep design content unique to this RFC remains valid: the `WriteTxn` / `PublishPlan`
-> / `GraphPublishAuthority` interface (§4.1), the multi-writer cross-process cliff (§6.5),
-> the maintenance-vs-logical op-class distinction (§6.6, LANDED), the write-skew analysis
-> (§7.1), the epoch fence, the MTT seam (§8), and the literature validation (§13). See
-> [invariants.md](invariants.md) and [versioning.md](versioning.md).
+> / `GraphPublishAuthority` interface (§4.1) — **now being implemented on the
+> `unlimited-history-latency` branch (the full step-5 unification of all writers); see
+> [unlimited-history-latency-plan.md](unlimited-history-latency-plan.md) §6b for the phased
+> landing** — the multi-writer cross-process cliff (§6.5), the maintenance-vs-logical
+> op-class distinction (§6.6, LANDED), the write-skew analysis (§7.1), the epoch fence, the
+> MTT seam (§8), and the literature validation (§13). See [invariants.md](invariants.md)
+> and [versioning.md](versioning.md).
 
 **Status:** Proposed
 **Author(s):** write-path latency investigation (handoff + multi-agent validation)

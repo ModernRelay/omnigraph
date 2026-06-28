@@ -100,6 +100,8 @@ Ordered roughly by impact-per-risk. Layers 1/3/4 are independently shippable and
 - **Layer 2 — Q8 durable monotonic watermark** (makes Layer 1 safe under live writers). A Lance boundary tag that `cleanup_old_versions` protects; writers/opens reject `version ≤ boundary`. Heaviest, invariant-touching; correctly deferred.
 - **Layer 3 — open data tables at the pinned manifest version** (attacks Root cause B; unlimited-history-compatible). Route the non-strict `reopen_for_mutation` through `open_table_dataset(location, pinned_version, session)` instead of `Dataset::open` at HEAD. List-free; the publish CAS + drift guard remain the fences.
 - **Layer 4 — optimistic warm publish** (attacks Root cause B; unlimited-history-compatible). Thread the warm coordinator's open `__manifest` handle + in-memory `known_state` into publish attempt 0; fall back to cold `load_publish_state` only on real CAS contention. A warm single-writer commits with zero manifest open/scan.
+
+> **Layers 3/4 are landing now via the full publish-authority refactor** (RFC-013 step 5 — `GraphPublishAuthority` fed declarative `PublishPlan`s across all writers, the correct-by-design vehicle, not a bolt-on). The phased landing, validated against source and measured by the S3 cost gate, is the live plan in [unlimited-history-latency-plan.md](unlimited-history-latency-plan.md) §6b. The U0 gate baseline a warm write must beat: 6 `__manifest` LISTs, 13 round-trips, flat across depth.
 - **Branch-op workstream (the reporter's "step 6", not yet in the roadmap):**
   - Parallelize the per-table fork reclaim on delete (`buffer_unordered` over `owned_tables`).
   - Open those tables version-pinned, not at HEAD.
