@@ -34,3 +34,6 @@ serde_json = { workspace = true }
 tempfile = { workspace = true }
 lance = { workspace = true }
 lance-index = { workspace = true }
+# Shared DST harness — the cross-process tier drives Cohort<Cli> (N subprocess
+# writers) and asserts convergence via a post-hoc Embedded reader.
+omnigraph-dst = { path = "../omnigraph-dst" }

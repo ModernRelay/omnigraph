@@ -13,9 +13,10 @@
 //! two hand-rolled files. Phase 3 / Phase 5 / U2 / the epoch fence each reuse
 //! this with one new schedule or one convergence-battery line.
 
+use std::path::PathBuf;
 use std::sync::Arc;
 
-use crate::backend::{Backend, Embedded};
+use crate::backend::{Backend, Cli, Embedded};
 
 /// A set of independent writers sharing one store URI. Generic over `Backend`
 /// so the same driver runs the embedded (separate coordinators) and CLI
@@ -65,6 +66,42 @@ impl Cohort<Embedded> {
         for _ in 1..n {
             writers.push(Arc::new(Embedded::reopen(uri).await)); // independent coordinator
         }
+        Cohort {
+            writers,
+            store_uri: uri.to_string(),
+        }
+    }
+
+    /// Open `n` independent handles on an EXISTING (already-initialized) graph —
+    /// no init. Used for a post-hoc white-box convergence assertion after a
+    /// CLI-tier (cross-process) write, where the writes happened out-of-process
+    /// but the battery needs a real `Omnigraph` handle.
+    pub async fn reopen_embedded(uri: &str, n: usize) -> Self {
+        assert!(n >= 1, "a cohort needs at least one writer");
+        let mut writers = Vec::with_capacity(n);
+        for _ in 0..n {
+            writers.push(Arc::new(Embedded::reopen(uri).await));
+        }
+        Cohort {
+            writers,
+            store_uri: uri.to_string(),
+        }
+    }
+}
+
+impl Cohort<Cli> {
+    /// Init the graph (writer 0) then return `n` CLI subprocess configs on the
+    /// same store. This is the cross-ADDRESS-SPACE tier: each op spawns a fresh
+    /// `omnigraph` process, so the writers share no `Session`, no in-process
+    /// write queue, and no `known_state` — the only tier that can race two real
+    /// OS processes. `bin` is the built binary path (e.g.
+    /// `env!("CARGO_BIN_EXE_omnigraph")`). `uri` must be a fresh store.
+    pub async fn open_cli(bin: PathBuf, uri: &str, n: usize) -> Self {
+        assert!(n >= 1, "a cohort needs at least one writer");
+        let writers: Vec<Arc<Cli>> = (0..n)
+            .map(|_| Arc::new(Cli::new(bin.clone(), uri.to_string())))
+            .collect();
+        writers[0].init().await.expect("cli init the graph");
         Cohort {
             writers,
             store_uri: uri.to_string(),
