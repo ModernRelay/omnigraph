@@ -408,24 +408,13 @@ impl Omnigraph {
         mode: OpenMode,
     ) -> Result<Self> {
         let root = normalize_root_uri(uri)?;
-        // Apply pending internal-schema migrations before the coordinator reads
-        // branch state, so `branch_list` and the schema-apply blocking-branch
-        // checks observe the post-migration graph — notably the v2→v3 sweep of
-        // legacy `__run__*` staging branches (MR-770). ReadWrite only: a
-        // read-only open must not trigger object-store writes, so a read-only
-        // open of an unmigrated legacy graph still lists `__run__*` until its
-        // first read-write open (an accepted, documented limitation).
-        if matches!(mode, OpenMode::ReadWrite) {
-            crate::db::manifest::migrate_on_open(&root).await?;
-        } else {
-            // A read-only open skips `migrate_on_open` (no object-store writes),
-            // which is where the version refusal otherwise lives. Still refuse a
-            // `__manifest` stamped outside this binary's supported range — newer
-            // than CURRENT (an old binary cannot silently misread a newer graph,
-            // e.g. one folded to internal-schema v4 lineage), or below
-            // MIN_SUPPORTED (predates the readers we carry). Read-only, no write.
-            crate::db::manifest::refuse_if_internal_schema_unsupported(&root).await?;
-        }
+        // Refuse a `__manifest` this binary cannot serve before the coordinator
+        // reads any branch state — newer than CURRENT (an old binary must not
+        // silently misread a newer graph) or below MIN_SUPPORTED (an older
+        // storage format this binary does not read — rebuild via export/import).
+        // Both open modes refuse: there is no in-place migration, and the check is
+        // a stamp read with no object-store writes, so it is safe under ReadOnly.
+        crate::db::manifest::refuse_if_internal_schema_unsupported(&root).await?;
         // Open the coordinator first so the schema-staging recovery sweep can
         // compare its snapshot against any leftover staging files.
         let mut coordinator = GraphCoordinator::open(&root, Arc::clone(&storage)).await?;

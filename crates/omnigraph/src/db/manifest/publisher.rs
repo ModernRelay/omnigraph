@@ -33,7 +33,7 @@ use crate::error::{OmniError, Result};
 use super::SubTableUpdate;
 use super::layout::{open_manifest_dataset, tombstone_object_id, version_object_id};
 use super::metadata::{TableVersionMetadata, parse_namespace_version_request};
-use super::migrations::migrate_internal_schema;
+use super::migrations::{read_stamp, refuse_if_stamp_unsupported};
 use super::state::{
     GraphLineageRow, GraphLineageRowPart, ManifestState, assemble_manifest_state,
     graph_lineage_row_parts, head_lineage_row, manifest_rows_batch, manifest_schema,
@@ -151,14 +151,13 @@ impl GraphNamespacePublisher {
         crate::failpoints::maybe_fail_retryable_contention(
             crate::failpoints::names::PUBLISH_LOAD_STATE_RETRYABLE_CONTENTION,
         )?;
-        let mut dataset = self.dataset().await?;
-        // Run pending internal-schema migrations exactly once per publish on
-        // the open-for-write path; idempotent when the on-disk stamp already
-        // matches this binary. Pass this publisher's branch so the v3→v4 lineage
-        // backfill reads `_graph_commits.lance` at the SAME branch it is
-        // publishing to (each branch backfills on its first write). See
+        let dataset = self.dataset().await?;
+        // Refuse a graph this binary cannot serve before publishing. Fresh and
+        // already-current graphs pass; a sub-CURRENT stamp (an older storage
+        // format) is refused with the rebuild-via-export/import message. There is
+        // no in-place migration — storage-format changes are a cutover. See
         // `db/manifest/migrations.rs`.
-        migrate_internal_schema(&mut dataset, &self.root_uri, self.branch.as_deref()).await?;
+        refuse_if_stamp_unsupported(read_stamp(&dataset))?;
         // ONE `__manifest` scan for everything the publish needs: table
         // locations, version entries, tombstones, AND the `graph_commit` lineage
         // rows for parent resolution (RFC-013 P2). The lineage extraction rides
@@ -692,13 +691,8 @@ impl ManifestBatchPublisher for GraphNamespacePublisher {
         }
 
         for attempt in 0..=PUBLISHER_RETRY_BUDGET {
-            // `load_publish_state` runs the v3→v4 migration (`migrate_internal_schema`)
-            // on its first scan. The migration's bounded merge/stamp retries surface a
-            // retryable `RowLevelCasContention` on exhaustion EXPECTING this outer loop
-            // to re-run them — a re-run re-reads the manifest, by which point a
-            // concurrent winner has usually completed the migration (next scan is a
-            // no-op). Route a retryable load error through the SAME retry path as a
-            // retryable `merge_rows` conflict below, so that typed contention actually
+            // Route a retryable `load_publish_state` error through the SAME retry
+            // path as a retryable `merge_rows` conflict below, so typed contention
             // composes with the publisher retry instead of aborting the publish.
             let loaded = match self.load_publish_state().await {
                 Ok(loaded) => loaded,
