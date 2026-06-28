@@ -121,6 +121,20 @@ audit entries and threaded into the engine's commit history. Set
 default when `--as` is omitted (the flag always wins; `approve` requires one
 of the two).
 
+**`apply` runs out-of-band, with direct storage access — there are no server
+routes for it.** Like `init`/`load` and the maintenance verbs (§7),
+`cluster apply` reaches the object store directly: it reads and writes the
+cluster ledger under `__cluster/` *and* opens each graph's Lance datasets to
+create, migrate, or delete them. It never goes through a running
+`omnigraph-server`, so the host that runs it (an operator or CI) needs storage
+access — the `AWS_*` credential contract for an `s3://` cluster. This is by
+design, not a missing feature: the control plane is **declarative** (config →
+cluster), not a runtime mutation API on the serving process — intent lives in
+the config files, outside the running system (the reasoning is
+[cluster-axioms.md](../../dev/cluster-axioms.md) §3 and §4). The server only ever
+*reads* the converged ledger, which is why a held apply lock never blocks
+serving (see §5 below, in this guide).
+
 What each change kind does:
 
 | You edit | Plan shows | Apply does |

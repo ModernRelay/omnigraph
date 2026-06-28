@@ -295,7 +295,7 @@ A graph's bytes live in one of two backends:
 set -a && source .env.omni && set +a
 ```
 
-`init` and `load` write storage directly (bypassing the server); the server reads from it. Validate with `curl http://127.0.0.1:8080/healthz`, then `omnigraph snapshot <graph-uri> --json`.
+`init`, `load`, and **`cluster apply`** write storage directly (bypassing the server). `cluster apply` is a storage-direct control-plane command — it reaches the object store directly (the `__cluster/` ledger *and* each graph's Lance datasets, to create/migrate/delete them), never through a running server, so the host that runs it needs storage access (the `AWS_*` contract for an `s3://` cluster). That is by design: the control plane is declarative (config → cluster), not a runtime mutation API on the serving process. The server reads **cluster** state read-only at boot, but it is not read-only against storage overall — data-plane HTTP writes (`mutate`/`load`/`branch`) still go through the server to the graph datasets, so it needs read-write storage access. Validate with `curl http://127.0.0.1:8080/healthz`, then `omnigraph snapshot <graph-uri> --json`.
 
 ## Project Layout
 
