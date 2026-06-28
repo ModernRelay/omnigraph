@@ -1592,6 +1592,36 @@ async fn test_init_stamps_internal_schema_version() {
     );
 }
 
+// The internal-schema stamp is gated at the graph (main) level. That is sufficient
+// for supported inputs precisely because a branch cannot diverge from main's stamp
+// under single-binary operation: a fresh graph stamps main at CURRENT, `create_branch`
+// forks main's `__manifest` (carrying its schema metadata, stamp included), and the
+// publisher writes rows without re-stamping. So every branch is always at main's
+// stamp. (A divergent branch stamp needs concurrent *multi-version* writers — an
+// unsupported topology, recorded as a known gap in docs/dev/invariants.md.) This is
+// the "if mixed branch stamps are impossible for supported inputs, prove it" test.
+#[tokio::test]
+async fn branch_inherits_main_internal_schema_stamp() {
+    let dir = tempfile::tempdir().unwrap();
+    let uri = dir.path().to_str().unwrap();
+    let catalog = build_test_catalog();
+    let mut mc = ManifestCoordinator::init(uri, &catalog).await.unwrap();
+    mc.create_branch("feature").await.unwrap();
+
+    let main_ds = open_manifest_dataset(uri, None).await.unwrap();
+    let feature_ds = open_manifest_dataset(uri, Some("feature")).await.unwrap();
+    assert_eq!(
+        super::migrations::read_stamp(&main_ds),
+        super::migrations::INTERNAL_MANIFEST_SCHEMA_VERSION,
+        "fresh graph stamps main at CURRENT",
+    );
+    assert_eq!(
+        super::migrations::read_stamp(&feature_ds),
+        super::migrations::read_stamp(&main_ds),
+        "create_branch forks main's stamp — a branch never diverges under single-binary operation",
+    );
+}
+
 #[tokio::test]
 async fn test_publish_rejects_manifest_stamped_at_future_version() {
     let dir = tempfile::tempdir().unwrap();
@@ -1725,6 +1755,77 @@ async fn sub_current_graph_is_refused_on_open_with_rebuild_hint() {
         ro_err.to_string().contains("export"),
         "read-only refusal must point at `omnigraph export`, got: {ro_err}",
     );
+}
+
+// The full operator upgrade narrative in one flow: load data → export → a graph from
+// an older release (simulated by rewinding the stamp below CURRENT) is refused with
+// the export/import nudge → rebuild via fresh `init` + `load` → the data is present
+// and the rebuilt graph opens. The refusal is **stamp-only** (read before any data),
+// so a stamp-rewound graph is a faithful stand-in for a real older-release graph
+// without needing a second binary — the on-disk layout is never reached. Data
+// fidelity for vector / blob columns is covered by the export round-trip tests in
+// `tests/export.rs`; this test composes the refusal with the rebuild so the operator
+// path proven in the docs (`docs/user/operations/upgrade.md`) is exercised end to end.
+#[tokio::test]
+async fn sub_current_graph_is_refused_then_rebuilt_via_export_import() {
+    use crate::db::Omnigraph;
+    use crate::loader::{LoadMode, load_jsonl};
+
+    let schema = "node Person {\n    name: String @key\n    age: I32?\n}\n";
+    let seed = "{\"type\":\"Person\",\"data\":{\"name\":\"alice\",\"age\":30}}\n\
+                {\"type\":\"Person\",\"data\":{\"name\":\"bob\",\"age\":41}}\n";
+
+    // The operator's existing graph; export it with the (here, current) binary
+    // before upgrading.
+    let dir_old = tempfile::tempdir().unwrap();
+    let uri_old = dir_old.path().to_str().unwrap();
+    let mut db_old = Omnigraph::init(uri_old, schema).await.unwrap();
+    load_jsonl(&mut db_old, seed, LoadMode::Overwrite)
+        .await
+        .unwrap();
+    let exported = db_old.export_jsonl("main", &[], &[]).await.unwrap();
+    assert!(
+        exported.contains("alice") && exported.contains("bob"),
+        "export must carry the loaded rows",
+    );
+    drop(db_old);
+
+    // Make it look like a graph from an older release: rewind the stamp below CURRENT.
+    {
+        let mut ds = open_manifest_dataset(uri_old, None).await.unwrap();
+        super::migrations::set_stamp_for_test(&mut ds, 3).await.unwrap();
+    }
+    let err = match Omnigraph::open(uri_old).await {
+        Ok(_) => panic!("a sub-CURRENT graph must be refused on open"),
+        Err(err) => err,
+    };
+    assert!(
+        err.to_string().contains("export"),
+        "the refusal must nudge the operator to `omnigraph export`, got: {err}",
+    );
+
+    // Rebuild with this binary: fresh init + load the export.
+    let dir_new = tempfile::tempdir().unwrap();
+    let uri_new = dir_new.path().to_str().unwrap();
+    let mut db_new = Omnigraph::init(uri_new, schema).await.unwrap();
+    load_jsonl(&mut db_new, &exported, LoadMode::Overwrite)
+        .await
+        .unwrap();
+
+    // The rebuilt graph preserves the data and is at CURRENT (opens without refusal).
+    let rebuilt = db_new.export_jsonl("main", &[], &[]).await.unwrap();
+    assert!(
+        rebuilt.contains("alice") && rebuilt.contains("bob"),
+        "the rebuilt graph must preserve every node",
+    );
+    assert_eq!(
+        rebuilt.lines().count(),
+        exported.lines().count(),
+        "export → init → load round-trips every row",
+    );
+    Omnigraph::open(uri_new)
+        .await
+        .expect("the rebuilt graph is at CURRENT and opens");
 }
 
 // ── RFC-013 Phase 7 / step 5: the `graph_head` concurrency gate ──────────────
