@@ -9,36 +9,22 @@
 //!    reads `__manifest`) reconstructs the full lineage correctly — commit set,
 //!    parents, the merge commit's two parents + merge actor, per-branch heads,
 //!    and the inline actors.
-//! 2. `_graph_commits.lance` (and its actor sidecar) hold ZERO commit rows: the
-//!    dual-write is gone and nothing appends to them. This is the load-bearing
-//!    "single source" assertion.
+//! 2. `_graph_commits.lance` and `_graph_commit_actors.lance` are NEVER CREATED
+//!    (Phase B retired them — the commit graph opens no Lance dataset). This is
+//!    the load-bearing "single source" assertion.
 
 mod helpers;
-
-use futures::TryStreamExt;
-use lance::Dataset;
 
 use omnigraph::db::commit_graph::CommitGraph;
 use omnigraph::db::{GraphCommit, Omnigraph};
 
 use helpers::*;
 
-/// Count rows in a Lance dataset directory under the graph root, or `0` if it
-/// does not exist.
-async fn row_count(root: &str, dir: &str) -> usize {
-    let uri = format!("{}/{}", root.trim_end_matches('/'), dir);
-    let Ok(dataset) = Dataset::open(&uri).await else {
-        return 0;
-    };
-    let batches: Vec<arrow_array::RecordBatch> = dataset
-        .scan()
-        .try_into_stream()
-        .await
-        .unwrap()
-        .try_collect()
-        .await
-        .unwrap();
-    batches.iter().map(|b| b.num_rows()).sum()
+/// True when a Lance dataset directory exists under the graph root.
+fn table_dir_exists(root: &str, dir: &str) -> bool {
+    std::path::Path::new(root.trim_end_matches('/'))
+        .join(dir)
+        .exists()
 }
 
 /// The production commit-graph projection at `branch`, sourced from `__manifest`.
@@ -145,19 +131,19 @@ async fn graph_lineage_lives_only_in_manifest() {
         "expected a real merge, not fast-forward/up-to-date"
     );
 
-    // ── single source: nothing writes `_graph_commits.lance` ─────────────────
-    // RFC-013 Phase 7 folds lineage into `__manifest`; the commit-graph dataset
-    // exists only to carry branch refs, so it (and its actor sidecar) hold ZERO
-    // commit rows. If a stray `append_commit` reappears, this turns red.
-    assert_eq!(
-        row_count(&uri, "_graph_commits.lance").await,
-        0,
-        "_graph_commits.lance must carry no commit rows — lineage lives in __manifest"
+    // ── single source: the commit-graph tables are never created ─────────────
+    // RFC-013 Phase 7 folds lineage into `__manifest`; Phase B then retired the
+    // two commit-graph datasets entirely (the projection opens no Lance dataset).
+    // A full realistic history — commits on main, a branch, a merge, all with
+    // actors — must not bring either directory into existence. If a stray
+    // dataset write reappears, this turns red.
+    assert!(
+        !table_dir_exists(&uri, "_graph_commits.lance"),
+        "_graph_commits.lance must never be created — lineage lives in __manifest"
     );
-    assert_eq!(
-        row_count(&uri, "_graph_commit_actors.lance").await,
-        0,
-        "_graph_commit_actors.lance must carry no rows — actors live inline in __manifest"
+    assert!(
+        !table_dir_exists(&uri, "_graph_commit_actors.lance"),
+        "_graph_commit_actors.lance must never be created — actors live inline in __manifest"
     );
 
     // ── main lineage projected from `__manifest` ─────────────────────────────

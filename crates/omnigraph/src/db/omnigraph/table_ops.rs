@@ -1419,14 +1419,6 @@ pub(super) async fn commit_updates_on_branch_with_expected(
     .await
 }
 
-pub(super) async fn ensure_commit_graph_initialized(db: &Omnigraph) -> Result<()> {
-    db.coordinator
-        .write()
-        .await
-        .ensure_commit_graph_initialized()
-        .await
-}
-
 pub(super) async fn invalidate_graph_index(db: &Omnigraph) {
     db.runtime_cache.invalidate_all().await;
 }

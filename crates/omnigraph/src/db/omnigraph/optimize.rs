@@ -284,32 +284,18 @@ pub async fn optimize_all_tables(db: &Omnigraph) -> Result<Vec<TableOptimizeStat
     // data-table stats only; each internal compaction does its own coordinator
     // refresh for cache coherence.
     let mut all = stats;
-    // One source of truth for the internal system tables optimize compacts. The
-    // commit graph is THREE tables, not one: the DAG (`_graph_commits`), the actor
-    // map (`_graph_commit_actors`, appended by every *authenticated* write — the
-    // production server/CLI path always carries an actor), and the manifest. Missing
-    // any leaves an O(history) scan on a live write path. `__manifest` is always
-    // present (created at init); the two commit-graph tables may be absent (the
-    // coordinator opens them as `Option`, gated on existence — graphs predating the
-    // commit graph, and the actor table is itself optional), so guard each with the
-    // same existence check rather than letting `Dataset::open` error and fail the
-    // whole optimize.
+    // The only internal system table optimize compacts is `__manifest`: it
+    // accumulates one fragment per commit (both the table-version rows and the
+    // folded-in graph-lineage rows — RFC-013 Phase 7), so a long history leaves
+    // an O(history) scan on every read/write probe until it is compacted. Graph
+    // lineage no longer has its own datasets (`_graph_commits` /
+    // `_graph_commit_actors` are retired), so there is nothing else to compact.
+    // `__manifest` is always present (created at init).
     let root = db.root_uri();
-    let internal_tables: [(&str, String); 3] = [
-        ("__manifest", crate::db::manifest::manifest_uri(root)),
-        (
-            "_graph_commits",
-            crate::db::commit_graph::graph_commits_uri(root),
-        ),
-        (
-            "_graph_commit_actors",
-            crate::db::commit_graph::graph_commit_actors_uri(root),
-        ),
-    ];
+    let internal_tables: [(&str, String); 1] =
+        [("__manifest", crate::db::manifest::manifest_uri(root))];
     for (table_key, uri) in internal_tables {
-        if table_key == "__manifest" || db.storage_adapter().exists(&uri).await? {
-            all.push(compact_internal_table(db, table_key, uri).await);
-        }
+        all.push(compact_internal_table(db, table_key, uri).await);
     }
 
     all.into_iter().collect()
@@ -755,8 +741,7 @@ async fn clear_stale_auto_cleanup_config(
     Ok(true)
 }
 
-/// Compact one INTERNAL system table (`__manifest` / `_graph_commits` /
-/// `_graph_commit_actors`) in place.
+/// Compact the INTERNAL system table (`__manifest`) in place.
 ///
 /// Unlike catalog data tables, the internal tables are not tracked in the
 /// `__manifest` (they ARE the manifest / the lineage DAG): readers open them at
@@ -977,8 +962,8 @@ pub async fn cleanup_all_tables(
 
 /// Outcome of [`reconcile_orphaned_branches`]: the `(owner, branch)` pairs
 /// reclaimed and the `(owner, error)` pairs that failed, where `owner` is a
-/// table key (e.g. `node:Person`) or `"_graph_commits"`. Per-owner failures are
-/// isolated and recorded here, not propagated — the next reconcile converges.
+/// table key (e.g. `node:Person`). Per-owner failures are isolated and
+/// recorded here, not propagated — the next reconcile converges.
 #[derive(Debug, Clone, Default)]
 pub struct BranchReconcileStats {
     pub reclaimed: Vec<(String, String)>,
@@ -1178,63 +1163,7 @@ pub async fn reconcile_orphaned_branches(db: &Omnigraph) -> Result<BranchReconci
         }
     }
 
-    // Commit-graph orphans are whole-branch (not per-table), so the simple
-    // "branch name not in the live set" test still applies there.
-    if let Err(err) = reconcile_commit_graph_orphans(db, &live_branches, &mut stats).await {
-        tracing::warn!(
-            target: "omnigraph::cleanup",
-            error = %err,
-            "commit-graph orphan reconcile failed; will retry next cleanup",
-        );
-        stats
-            .failures
-            .push(("_graph_commits".to_string(), err.to_string()));
-    }
-
     Ok(stats)
-}
-
-/// Commit-graph half of [`reconcile_orphaned_branches`], split out so its
-/// errors can be isolated. Returns `Ok` when the commit-graph dataset is absent.
-async fn reconcile_commit_graph_orphans(
-    db: &Omnigraph,
-    keep: &std::collections::HashSet<String>,
-    stats: &mut BranchReconcileStats,
-) -> Result<()> {
-    let commits_uri = crate::db::commit_graph::graph_commits_uri(db.root_uri());
-    if !db.storage_adapter().exists(&commits_uri).await? {
-        return Ok(());
-    }
-    let mut commit_graph = crate::db::commit_graph::CommitGraph::open(db.root_uri()).await?;
-    for branch in orphan_branches(commit_graph.list_branches().await?, keep) {
-        match commit_graph.force_delete_branch(&branch).await {
-            Ok(()) => stats.reclaimed.push(("_graph_commits".to_string(), branch)),
-            Err(err) => {
-                tracing::warn!(
-                    target: "omnigraph::cleanup",
-                    branch = %branch,
-                    error = %err,
-                    "reclaiming orphaned commit-graph branch failed; will retry next cleanup",
-                );
-                stats
-                    .failures
-                    .push(("_graph_commits".to_string(), err.to_string()));
-            }
-        }
-    }
-    Ok(())
-}
-
-/// Filter `present` Lance branches down to those absent from the manifest
-/// `keep` set, ordered children-before-parents (longest name first) so Lance's
-/// referenced-parent `RefConflict` cannot block reclamation.
-fn orphan_branches(present: Vec<String>, keep: &std::collections::HashSet<String>) -> Vec<String> {
-    let mut orphans: Vec<String> = present
-        .into_iter()
-        .filter(|branch| !keep.contains(branch))
-        .collect();
-    orphans.sort_by(|a, b| b.len().cmp(&a.len()).then_with(|| a.cmp(b)));
-    orphans
 }
 
 pub(super) fn all_table_keys(catalog: &omnigraph_compiler::catalog::Catalog) -> Vec<String> {

@@ -112,6 +112,10 @@ async fn snapshot_route_returns_manifest_dataset_version() {
         snapshot_body["manifest_version"].as_u64().unwrap(),
         expected_manifest_version
     );
+    assert_eq!(
+        snapshot_body["internal_schema_version"].as_u64().unwrap(),
+        u64::from(omnigraph::db::manifest::INTERNAL_MANIFEST_SCHEMA_VERSION)
+    );
     assert!(snapshot_body["tables"].is_array());
 }
 

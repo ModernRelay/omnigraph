@@ -18,9 +18,16 @@ fn version_command_prints_current_cli_version() {
     let output = output_success(cli().arg("version"));
     let stdout = stdout_string(&output);
 
-    assert_eq!(
-        stdout.trim(),
-        format!("omnigraph {}", env!("CARGO_PKG_VERSION"))
+    assert!(
+        stdout.contains(&format!("omnigraph {}", env!("CARGO_PKG_VERSION"))),
+        "version output must include the CLI version line, got: {stdout}"
+    );
+    assert!(
+        stdout.contains(&format!(
+            "internal-schema {}",
+            omnigraph::db::manifest::INTERNAL_MANIFEST_SCHEMA_VERSION
+        )),
+        "version output must include the internal-schema line, got: {stdout}"
     );
 }
 

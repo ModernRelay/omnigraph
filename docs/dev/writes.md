@@ -355,36 +355,32 @@ actual }`. The HTTP server maps this to **409 Conflict** with body
 `__manifest`, written in the publish CAS (RFC-013 Phase 7; previously
 `_graph_commits.lance`). Audit history is queried via `omnigraph commit list`.
 
-## Migration code
+## Storage versioning (no in-place migration)
 
-`db/manifest/migrations.rs` is the single place on-disk `__manifest` shape is
-reconciled with what the binary expects, stepping the
-`omnigraph:internal_schema_version` stamp forward one `match`-arm at a time. It
-runs in `Omnigraph::open(ReadWrite)` (via `manifest::migrate_on_open`, before the
-coordinator reads branch state) and again on the publisher's write path, so each
-branch migrates on its first write; every step is idempotent under crash-retry
-(work first, stamp bump last).
+`db/manifest/migrations.rs` is the single place the on-disk `__manifest` shape is
+reconciled with what the binary expects. Storage is **strict-single-version** (the
+strand model): this binary reads exactly ONE internal-schema version
+(`MIN_SUPPORTED == CURRENT == 4`), so there is no in-place migration.
 
-- **v2→v3** (MR-770): a one-time sweep that deletes legacy `__run__*` staging
-  branches off `__manifest`. Deleting the inert `_graph_runs.lance` /
-  `_graph_run_actors.lance` dataset *bytes* is still deferred — it needs a
-  `StorageAdapter::delete_prefix` primitive — but those bytes are invisible to
-  graph-level state.
-- **v3→v4** (RFC-013 Phase 7, `migrate_v3_to_v4`): backfills the graph lineage
-  from `_graph_commits.lance` into `__manifest` as `graph_commit` / `graph_head`
-  rows. A graph created before Phase 7 has its lineage only in
-  `_graph_commits.lance`; the new binary reads lineage from the `__manifest`
-  projection, so without this backfill it would see an empty commit DAG. The
-  backfill is per-branch (each branch migrates on its first write), idempotent
-  (keyed on `object_id`; a fast-path guard skips when `__manifest` already
-  carries `graph_commit` rows), and writes exactly one `graph_head:<branch>` row
-  for the actual head. `_graph_commits.lance` is left in place as the branch-ref
-  carrier — no commit row is written to it again. While a graph is below v4, a
-  **read-only** open (which never writes, so never migrates) sources the commit
-  DAG from `_graph_commits.lance` via the stamp-gated transitional fallback in
-  `CommitGraph::open*`, so reads see correct history before the first write
-  migrates the graph. An old binary opening a v4-stamped graph is refused with an
-  "upgrade omnigraph" error in both read-write and read-only modes.
+- **Graph creation** stamps `omnigraph:internal_schema_version` at CURRENT, so a
+  fresh graph always opens.
+- **`Omnigraph::open`** (both read-write and read-only) reads main's stamp before
+  the coordinator reads any branch state and calls `refuse_if_stamp_unsupported`:
+  a stamp *below* CURRENT is refused with a rebuild-via-export/import message; a
+  stamp *above* CURRENT is refused with "upgrade omnigraph". The publisher
+  re-checks the stamp on its write path against the branch it targets, with no
+  object-store writes, so the check is safe under a read-only open.
+- The stamp + `refuse_if_stamp_unsupported` floor is the only seam a future
+  in-place migration would re-introduce (re-add a dispatcher and lower
+  `MIN_SUPPORTED`). Until a concrete graph demands it, that machinery is
+  deliberately absent — see [versioning.md](versioning.md) (the compatibility
+  policy) and [the upgrade guide](../user/operations/upgrade.md) (the rebuild
+  recipe).
+
+The stamp history (v1 PK-less, v2 unenforced-PK, v3 `__run__*` sweep, v4 lineage
+in `__manifest` with the commit-graph tables retired) is recorded on the
+`INTERNAL_MANIFEST_SCHEMA_VERSION` doc-comment; only v4 is served. An earlier-stamped
+graph is rebuilt via export/import, not migrated in place.
 
 ## Mid-query partial failure: closed by MR-794
 

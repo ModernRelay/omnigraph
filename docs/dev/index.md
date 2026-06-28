@@ -12,6 +12,7 @@ constraints. User-facing behavior should still be documented through
 | Need | Read |
 |---|---|
 | Architectural rules, known gaps, deny-list | [invariants.md](invariants.md) |
+| Versioning & compatibility policy (release / wire / storage / Lance) | [versioning.md](versioning.md) |
 | Upstream Lance source-of-truth index | [lance.md](lance.md) |
 | Existing test coverage and test placement | [testing.md](testing.md) |
 
@@ -94,6 +95,7 @@ Working documents for in-flight feature work. Removed when the work lands.
 | Provider-independent embedding configuration — one resolved `EmbeddingConfig` + sealed provider enum (Gemini/OpenAI/Mock), identity recorded in the schema IR, query-time same-space validation, NFR floor | [rfc-012-embedding-provider-config.md](rfc-012-embedding-provider-config.md) |
 | Write-path latency — capture-once `WriteTxn`, version-pinned opens, one `GraphPublishAuthority` fed declarative `PublishPlan`s, manifest-authoritative lineage, epoch fence, bounded history (compaction + cleanup), and an IO-counted cost contract (`iss-write-s3-roundtrip-amplification`, `iss-991`) | [rfc-013-write-path-latency.md](rfc-013-write-path-latency.md) |
 | RFC-013 handoff — current-state map, latest validation, and concrete next actions for finishing write-path latency and correctness work | [handoff-rfc-013-write-path.md](handoff-rfc-013-write-path.md) |
+| Write-latency roadmap — validated cost model (the 6-LIST warm-write trace), the two root causes (un-GC'd `_versions/`; re-resolving latest by listing), and the layered fix (GC + capture-once reuse); how commit-graph-table retirement feeds in | [write-latency-roadmap.md](write-latency-roadmap.md) |
 
 ## Boundary
 

@@ -278,7 +278,10 @@ impl GraphClient {
             GraphClient::Embedded { uri, .. } => {
                 let db = Omnigraph::open(uri).await?;
                 let snapshot = db.snapshot_of(ReadTarget::branch(branch)).await?;
-                Ok(snapshot_payload(branch, &snapshot))
+                let internal_schema_version = db
+                    .internal_schema_version_of(ReadTarget::branch(branch))
+                    .await?;
+                Ok(snapshot_payload(branch, &snapshot, internal_schema_version))
             }
         }
     }

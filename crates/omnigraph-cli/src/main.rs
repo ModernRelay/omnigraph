@@ -214,6 +214,10 @@ async fn main() -> Result<()> {
         }
         Command::Version => {
             println!("omnigraph {}", env!("CARGO_PKG_VERSION"));
+            println!(
+                "internal-schema {}",
+                omnigraph::db::manifest::INTERNAL_MANIFEST_SCHEMA_VERSION
+            );
         }
         Command::Embed(args) => {
             let output = execute_embed(&args).await?;
@@ -613,7 +617,12 @@ async fn main() -> Result<()> {
             if json {
                 print_json(&payload)?;
             } else {
-                print_snapshot_human(&payload.branch, payload.manifest_version, &payload.tables);
+                print_snapshot_human(
+                    &payload.branch,
+                    payload.manifest_version,
+                    payload.internal_schema_version,
+                    &payload.tables,
+                );
             }
         }
         Command::Export {

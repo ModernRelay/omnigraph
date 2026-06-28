@@ -43,6 +43,9 @@ pub struct SnapshotTableOutput {
 pub struct SnapshotOutput {
     pub branch: String,
     pub manifest_version: u64,
+    /// The on-disk internal-schema (storage-format) version this graph's branch
+    /// is stamped at.
+    pub internal_schema_version: u32,
     pub tables: Vec<SnapshotTableOutput>,
 }
 
@@ -538,6 +541,8 @@ pub struct CommitListQuery {
 pub struct HealthOutput {
     pub status: String,
     pub version: String,
+    /// The internal-schema (storage-format) version this binary writes and reads.
+    pub internal_schema_version: u32,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub source_version: Option<String>,
 }
@@ -587,7 +592,11 @@ pub struct ErrorOutput {
     pub manifest_conflict: Option<ManifestConflictOutput>,
 }
 
-pub fn snapshot_payload(branch: &str, snapshot: &Snapshot) -> SnapshotOutput {
+pub fn snapshot_payload(
+    branch: &str,
+    snapshot: &Snapshot,
+    internal_schema_version: u32,
+) -> SnapshotOutput {
     let mut entries: Vec<_> = snapshot.entries().cloned().collect();
     entries.sort_by(|a, b| a.table_key.cmp(&b.table_key));
     let tables = entries
@@ -603,6 +612,7 @@ pub fn snapshot_payload(branch: &str, snapshot: &Snapshot) -> SnapshotOutput {
     SnapshotOutput {
         branch: branch.to_string(),
         manifest_version: snapshot.version(),
+        internal_schema_version,
         tables,
     }
 }
