@@ -309,6 +309,8 @@ impl OpProbes {
             probe_count: Arc::clone(&h.probe_count),
             data_open_count: Arc::clone(&h.data_open_count),
             internal_open_count: Arc::clone(&h.internal_open_count),
+            // graph_build_count / graph_edges_built unused by this harness.
+            ..Default::default()
         };
         (probes, h)
     }

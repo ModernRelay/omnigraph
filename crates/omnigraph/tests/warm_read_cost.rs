@@ -7,33 +7,17 @@
 
 mod helpers;
 
-use arrow_array::{Array, StringArray};
+use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
+
 use omnigraph::db::{Omnigraph, ReadTarget};
-use omnigraph_compiler::result::QueryResult;
+use omnigraph::instrumentation::{QueryIoProbes, with_query_io_probes, with_traversal_mode};
 
 use helpers::cost::{cost_harness, measure};
 use helpers::{
-    MUTATION_QUERIES, TEST_QUERIES, commit_many, count_rows, init_and_load, mixed_params,
-    mutate_branch, mutate_main, params,
+    MUTATION_QUERIES, TEST_QUERIES, commit_many, count_rows, first_column_sorted, init_and_load,
+    mixed_params, mutate_branch, mutate_main, params,
 };
-
-fn first_column_strings(result: &QueryResult) -> Vec<String> {
-    if result.num_rows() == 0 {
-        return Vec::new();
-    }
-    let batch = result.concat_batches().unwrap();
-    let values = batch
-        .column(0)
-        .as_any()
-        .downcast_ref::<StringArray>()
-        .unwrap();
-    let mut out = (0..values.len())
-        .filter(|&row| !values.is_null(row))
-        .map(|row| values.value(row).to_string())
-        .collect::<Vec<_>>();
-    out.sort();
-    out
-}
 
 /// A warm same-branch read must do ZERO `__manifest` object-store reads and must
 /// not open the commit graph, even at commit-history depth. Wrapped in
@@ -458,10 +442,15 @@ async fn recreated_branch_owned_table_handle_uses_table_etag() {
     );
 }
 
-/// The graph-index cache is keyed by synthetic snapshot id plus edge-table
-/// state. A recreated branch can reuse the same edge table `(branch, version)`,
-/// so the synthetic snapshot id must carry the manifest incarnation or traversal
-/// can reuse stale topology.
+/// A recreated branch can reuse the same edge table `(branch, version)`. The
+/// graph-index cache is keyed (A1) by each edge table's physical identity
+/// `(table_key, version, table_branch, e_tag)`; on local FS the e_tag is `None`,
+/// so a recreated branch at the same version has the same key — the stale topology
+/// is instead evicted by the same-branch manifest refresh (`invalidate_all` on the
+/// `version_probes == 2` stale path), the documented e_tag-less fallback. This
+/// traversal takes the indexed path (single-source frontier), so it also exercises
+/// the table-handle cache incarnation; the assertion is that recreated-branch
+/// topology is never stale regardless of path.
 #[tokio::test]
 async fn recreated_branch_traversal_uses_graph_index_incarnation() {
     let dir = tempfile::tempdir().unwrap();
@@ -493,7 +482,7 @@ async fn recreated_branch_traversal_uses_graph_index_incarnation() {
         )
         .await
         .unwrap();
-    assert_eq!(first_column_strings(&old_friends), vec!["Alice"]);
+    assert_eq!(first_column_sorted(&old_friends), vec!["Alice"]);
     let old_edge_entry = reader
         .snapshot_of(ReadTarget::branch("feature"))
         .await
@@ -540,7 +529,7 @@ async fn recreated_branch_traversal_uses_graph_index_incarnation() {
     .await;
     let new_friends = new_friends.unwrap();
     assert_eq!(
-        first_column_strings(&new_friends),
+        first_column_sorted(&new_friends),
         vec!["Bob"],
         "traversal must use the recreated branch's topology, not stale cached graph index"
     );
@@ -563,7 +552,7 @@ async fn recreated_branch_traversal_uses_graph_index_incarnation() {
         .await
         .unwrap();
     assert_eq!(
-        first_column_strings(&stale_old_friends),
+        first_column_sorted(&stale_old_friends),
         Vec::<String>::new(),
         "old branch topology must not leak after branch recreation"
     );
@@ -726,5 +715,136 @@ async fn write_invalidates_table_cache_for_changed_table() {
         after,
         before + 1,
         "the post-write read observes the new row (no stale handle served)"
+    );
+}
+
+// ─── Topology-index build cost (A1 cross-branch reuse + A2 scoped build) ─────
+//
+// These force the CSR build path (the indexed path builds no topology) via the
+// scoped `with_traversal_mode` seam — no process-global env, so they are safe in
+// this mixed serial/non-serial binary and need no `#[serial]`. They read the
+// `graph_build_count` / `graph_edges_built` probes off a directly-constructed
+// `QueryIoProbes`.
+
+/// A1: a fresh (unwritten) branch reuses main's cached CSR topology index
+/// (`graph_build_count == 0`), and the reused index returns correct results for
+/// the branch. Before A1 the branch-keyed snapshot id forced a rebuild (count 1).
+#[tokio::test]
+async fn fresh_branch_traversal_reuses_main_graph_index() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut writer = init_and_load(&dir).await;
+    let uri = dir.path().to_str().unwrap();
+    // A Knows edge on main so there is topology to build and then reuse.
+    mutate_main(
+        &mut writer,
+        MUTATION_QUERIES,
+        "insert_person_and_friend",
+        &mixed_params(&[("$name", "Walker"), ("$friend", "Alice")], &[("$age", 41)]),
+    )
+    .await
+    .unwrap();
+
+    // Separate reader handle. As in production, the reader never creates the
+    // branch, so creating it does not invalidate the reader's warm cache.
+    let reader = Omnigraph::open(uri).await.unwrap();
+
+    // Reader warms main on the CSR path: builds and caches the topology index.
+    let warm = with_traversal_mode(
+        "csr",
+        reader.query(
+            ReadTarget::branch("main"),
+            TEST_QUERIES,
+            "friends_of",
+            &params(&[("$name", "Walker")]),
+        ),
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        first_column_sorted(&warm),
+        vec!["Alice"],
+        "test setup: main has the Knows edge"
+    );
+
+    // A separate writer creates the branch (lazy fork: feature's edge tables are
+    // physically main's — same version + e_tag, table_branch=None).
+    writer.branch_create("feature").await.unwrap();
+
+    let graph_build = Arc::new(AtomicU64::new(0));
+    let probes = QueryIoProbes {
+        graph_build_count: Arc::clone(&graph_build),
+        ..Default::default()
+    };
+    let on_branch = with_traversal_mode(
+        "csr",
+        with_query_io_probes(
+            probes,
+            reader.query(
+                ReadTarget::branch("feature"),
+                TEST_QUERIES,
+                "friends_of",
+                &params(&[("$name", "Walker")]),
+            ),
+        ),
+    )
+    .await
+    .unwrap();
+
+    assert_eq!(
+        first_column_sorted(&on_branch),
+        vec!["Alice"],
+        "fresh branch sees main's edges (lazy fork) and the reused index is correct"
+    );
+    assert_eq!(
+        graph_build.load(Ordering::Relaxed),
+        0,
+        "a fresh branch with unchanged edges must reuse main's cached CSR index, not rebuild it"
+    );
+}
+
+/// A2: a query referencing one edge type builds the topology for only that edge,
+/// not every edge in the catalog. Forces CSR (the build path) and counts edge
+/// tables built. Before A2 the build materialized all catalog edges (the fixture
+/// defines Knows + WorksAt, so a build-all touches >= 2) — the cold-build cost.
+#[tokio::test]
+async fn single_edge_query_builds_only_referenced_edge() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut db = init_and_load(&dir).await;
+    // A Knows edge so the referenced build has topology; the fixture also defines
+    // WorksAt, so a build-all would touch more than one edge.
+    mutate_main(
+        &mut db,
+        MUTATION_QUERIES,
+        "insert_person_and_friend",
+        &mixed_params(&[("$name", "Walker"), ("$friend", "Alice")], &[("$age", 41)]),
+    )
+    .await
+    .unwrap();
+
+    let graph_edges = Arc::new(AtomicU64::new(0));
+    let probes = QueryIoProbes {
+        graph_edges_built: Arc::clone(&graph_edges),
+        ..Default::default()
+    };
+    let result = with_traversal_mode(
+        "csr",
+        with_query_io_probes(
+            probes,
+            db.query(
+                ReadTarget::branch("main"),
+                TEST_QUERIES,
+                "friends_of",
+                &params(&[("$name", "Walker")]),
+            ),
+        ),
+    )
+    .await
+    .unwrap();
+
+    assert_eq!(first_column_sorted(&result), vec!["Alice"]);
+    assert_eq!(
+        graph_edges.load(Ordering::Relaxed),
+        1,
+        "a query referencing only `knows` must build only that edge, not all catalog edges"
     );
 }

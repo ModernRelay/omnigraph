@@ -1,63 +1,43 @@
 //! BTREE-indexed Expand path (`execute_expand_indexed`) coverage.
 //!
-//! These tests force the Expand execution mode via `OMNIGRAPH_TRAVERSAL_MODE`
-//! and assert the indexed path matches the CSR path (both are semantically
-//! identical — the indexed path just serves neighbor lookups from the persisted
-//! src/dst BTREE instead of an in-memory CSR). They live in their own test
-//! binary and are all `#[serial]`, so the env writes never race a concurrent
-//! reader: within this process serial execution serializes every env read, and
-//! other test binaries (e.g. `traversal.rs`) are separate processes whose env
-//! stays unset (→ CSR), validating the shared hydrate/align tail on the CSR path.
+//! These tests force the Expand execution mode via the scoped `with_traversal_mode`
+//! test seam — NOT the process-global `OMNIGRAPH_TRAVERSAL_MODE` env var — and
+//! assert the indexed path matches the CSR path (both are semantically identical:
+//! the indexed path serves neighbor lookups from the persisted src/dst BTREE
+//! instead of an in-memory CSR). The seam is scope-bound and process-safe, so
+//! these tests need no `#[serial]` and no dedicated binary.
 
 mod helpers;
 
-use arrow_array::{Array, StringArray};
-
 use omnigraph::db::Omnigraph;
+use omnigraph::instrumentation::with_traversal_mode;
 use omnigraph::loader::{LoadMode, load_jsonl};
 use omnigraph::table_store::{IndexCoverage, TableStore};
 use omnigraph_compiler::ir::ParamMap;
-use serial_test::serial;
 
 use helpers::*;
 
-fn set_mode(mode: &str) {
-    // SAFE: every test here is #[serial] and this binary has no non-serial
-    // env reader, so no thread reads the environment during this write.
-    unsafe { std::env::set_var("OMNIGRAPH_TRAVERSAL_MODE", mode) };
-}
-
-fn clear_mode() {
-    unsafe { std::env::remove_var("OMNIGRAPH_TRAVERSAL_MODE") };
-}
-
-/// Run a name-returning query and return its first column, sorted.
+/// Run `name` on main under the cost-chooser (auto) Expand mode; first column sorted.
 async fn sorted_names(db: &mut Omnigraph, queries: &str, name: &str, params: &ParamMap) -> Vec<String> {
-    let result = query_main(db, queries, name, params).await.unwrap();
-    if result.num_rows() == 0 {
-        return Vec::new();
-    }
-    let batch = result.concat_batches().unwrap();
-    let col = batch
-        .column(0)
-        .as_any()
-        .downcast_ref::<StringArray>()
-        .unwrap();
-    let mut v: Vec<String> = (0..col.len()).map(|i| col.value(i).to_string()).collect();
-    v.sort();
-    v
+    first_column_sorted(&query_main(db, queries, name, params).await.unwrap())
 }
 
 /// Run the same query under CSR, indexed, and auto (cost-chooser) modes; assert
-/// all three produce identical results and return them. The auto pass exercises
-/// `choose_expand_mode` end to end: whichever path it selects, the rows must
-/// match the forced paths (the chooser changes which path runs, never the result).
+/// all three produce identical results and return them. The forced modes use the
+/// scoped `with_traversal_mode` seam; the auto pass exercises `choose_expand_mode`
+/// end to end (whichever path it selects, the rows must match the forced paths —
+/// the chooser changes which path runs, never the result).
 async fn both_modes(db: &mut Omnigraph, queries: &str, name: &str, params: &ParamMap) -> Vec<String> {
-    set_mode("csr");
-    let csr = sorted_names(db, queries, name, params).await;
-    set_mode("indexed");
-    let indexed = sorted_names(db, queries, name, params).await;
-    clear_mode();
+    let csr = first_column_sorted(
+        &with_traversal_mode("csr", query_main(db, queries, name, params))
+            .await
+            .unwrap(),
+    );
+    let indexed = first_column_sorted(
+        &with_traversal_mode("indexed", query_main(db, queries, name, params))
+            .await
+            .unwrap(),
+    );
     let auto = sorted_names(db, queries, name, params).await;
     assert_eq!(
         indexed, csr,
@@ -72,7 +52,6 @@ async fn both_modes(db: &mut Omnigraph, queries: &str, name: &str, params: &Para
 
 // The C6 index-coverage guard: `key_column_index_coverage` must report whether
 // a `key_col IN (...)` scan will use the persisted BTREE or silently full-scan.
-// Not #[serial] — it calls the helper directly and reads no env.
 #[tokio::test]
 async fn key_column_index_coverage_detects_btree_presence() {
     let dir = tempfile::tempdir().unwrap();
@@ -136,7 +115,6 @@ async fn coverage_degrades_for_appended_unindexed_fragment() {
 }
 
 #[tokio::test]
-#[serial]
 async fn indexed_matches_csr_one_hop_same_type() {
     let dir = tempfile::tempdir().unwrap();
     let mut db = init_and_load(&dir).await;
@@ -146,7 +124,6 @@ async fn indexed_matches_csr_one_hop_same_type() {
 }
 
 #[tokio::test]
-#[serial]
 async fn indexed_matches_csr_multi_hop_same_type() {
     let dir = tempfile::tempdir().unwrap();
     let mut db = init_and_load(&dir).await;
@@ -165,7 +142,6 @@ query reach($name: String) {
 }
 
 #[tokio::test]
-#[serial]
 async fn indexed_matches_csr_cross_type() {
     let dir = tempfile::tempdir().unwrap();
     let mut db = init_and_load(&dir).await;
@@ -183,7 +159,6 @@ query employer($name: String) {
 }
 
 #[tokio::test]
-#[serial]
 async fn indexed_matches_csr_no_match() {
     let dir = tempfile::tempdir().unwrap();
     let mut db = init_and_load(&dir).await;
@@ -193,7 +168,6 @@ async fn indexed_matches_csr_no_match() {
 }
 
 #[tokio::test]
-#[serial]
 async fn indexed_finds_unindexed_appended_edge() {
     let dir = tempfile::tempdir().unwrap();
     let mut db = init_and_load(&dir).await;
@@ -212,9 +186,14 @@ async fn indexed_finds_unindexed_appended_edge() {
     .await
     .unwrap();
 
-    set_mode("indexed");
-    let got = sorted_names(&mut db, TEST_QUERIES, "friends_of", &params(&[("$name", "Alice")])).await;
-    clear_mode();
+    let got = first_column_sorted(
+        &with_traversal_mode(
+            "indexed",
+            query_main(&mut db, TEST_QUERIES, "friends_of", &params(&[("$name", "Alice")])),
+        )
+        .await
+        .unwrap(),
+    );
 
     assert_eq!(
         got,
@@ -234,7 +213,6 @@ async fn indexed_finds_unindexed_appended_edge() {
 // CSR path never produces. `both_modes` (csr == indexed == auto) plus the
 // golden assert catch both the divergence and an over-emitting shared bug.
 #[tokio::test]
-#[serial]
 async fn cross_type_id_collision_does_not_bleed_into_second_hop() {
     const SCHEMA: &str = r#"
 node Person { name: String @key }
@@ -288,7 +266,6 @@ query reach($name: String) {
 // bounded range deliberately: an unbounded `{1,}` is a typecheck error, not a
 // runtime path. `both_modes` also confirms indexed == csr on the cycle.
 #[tokio::test]
-#[serial]
 async fn variable_hops_terminate_and_dedup_on_cycle() {
     let dir = tempfile::tempdir().unwrap();
     let uri = dir.path().to_str().unwrap();
@@ -310,7 +287,6 @@ async fn variable_hops_terminate_and_dedup_on_cycle() {
 // A self-loop a->a plus a->b. Variable-length traversal must not loop forever and
 // must not re-emit the seeded source.
 #[tokio::test]
-#[serial]
 async fn variable_hops_handle_self_loop() {
     let dir = tempfile::tempdir().unwrap();
     let uri = dir.path().to_str().unwrap();

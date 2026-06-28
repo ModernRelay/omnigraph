@@ -1,7 +1,11 @@
 mod helpers;
 
+use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
+
 use omnigraph::db::MergeOutcome;
-use omnigraph::db::Omnigraph;
+use omnigraph::db::{Omnigraph, ReadTarget};
+use omnigraph::instrumentation::{QueryIoProbes, with_query_io_probes, with_traversal_mode};
 use omnigraph::loader::{LoadMode, load_jsonl};
 
 use helpers::*;
@@ -242,5 +246,84 @@ async fn s3_schema_apply_migrates_live_graph() {
     assert!(
         reopened.schema_source().contains("Note"),
         "live S3 schema must carry the migration"
+    );
+}
+
+/// Graph-index (CSR topology) cross-branch reuse on a real object store, where the
+/// cache key's per-table `e_tag` is a genuine non-`None` token (Lance e_tag is
+/// `None` on local FS, so the local twin in `warm_read_cost.rs` keys on `None` —
+/// this exercises the e_tag-present path production runs). With e_tags present, a
+/// fresh lazy-fork branch reuses main's cached index (`graph_build_count == 0`).
+/// Forces CSR via the scoped `with_traversal_mode` seam (no env mutation, so no
+/// interference with the other tests in this binary).
+#[tokio::test(flavor = "multi_thread")]
+async fn s3_fresh_branch_traversal_reuses_main_graph_index_with_etags() {
+    let Some(uri) = s3_test_graph_uri("graph-index-etag") else {
+        eprintln!("skipping s3 graph-index test: OMNIGRAPH_S3_TEST_BUCKET is not set");
+        return;
+    };
+
+    let mut writer = Omnigraph::init(&uri, TEST_SCHEMA).await.unwrap();
+    // TEST_DATA seeds Alice->Bob and Alice->Charlie Knows edges.
+    load_jsonl(&mut writer, TEST_DATA, LoadMode::Overwrite)
+        .await
+        .unwrap();
+
+    // Separate reader: it never creates the branch, so branch_create below does
+    // not invalidate the reader's warm cache.
+    let reader = Omnigraph::open(&uri).await.unwrap();
+
+    // Warm main on the CSR path: builds + caches the topology index keyed by the
+    // edge table's physical identity incl. its real e_tag.
+    let warm = with_traversal_mode(
+        "csr",
+        reader.query(
+            ReadTarget::branch("main"),
+            TEST_QUERIES,
+            "friends_of",
+            &params(&[("$name", "Alice")]),
+        ),
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        first_column_sorted(&warm),
+        vec!["Bob", "Charlie"],
+        "test setup: Alice knows Bob and Charlie"
+    );
+
+    // Lazy fork: feature's edge tables are physically main's (same version +
+    // e_tag, table_branch = None).
+    writer.branch_create("feature").await.unwrap();
+
+    let graph_build = Arc::new(AtomicU64::new(0));
+    let probes = QueryIoProbes {
+        graph_build_count: Arc::clone(&graph_build),
+        ..Default::default()
+    };
+    let on_branch = with_traversal_mode(
+        "csr",
+        with_query_io_probes(
+            probes,
+            reader.query(
+                ReadTarget::branch("feature"),
+                TEST_QUERIES,
+                "friends_of",
+                &params(&[("$name", "Alice")]),
+            ),
+        ),
+    )
+    .await
+    .unwrap();
+
+    assert_eq!(
+        first_column_sorted(&on_branch),
+        vec!["Bob", "Charlie"],
+        "fresh branch sees main's edges (lazy fork) and the reused index is correct"
+    );
+    assert_eq!(
+        graph_build.load(Ordering::Relaxed),
+        0,
+        "with real e_tags, a fresh lazy-fork branch must reuse main's cached CSR index, not rebuild"
     );
 }

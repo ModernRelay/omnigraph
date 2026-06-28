@@ -10,15 +10,22 @@ pub(super) async fn graph_index(db: &Omnigraph) -> Result<Arc<crate::graph_index
         .await?;
     drop(coord);
     let catalog = db.catalog();
-    db.runtime_cache.graph_index(&resolved, &catalog).await
+    // Whole-graph entry point: cover every edge type. Query execution scopes to
+    // the edges it actually traverses (see `referenced_edge_types`).
+    let edge_types: std::collections::HashMap<String, (String, String)> = catalog
+        .edge_types
+        .iter()
+        .map(|(name, et)| (name.clone(), (et.from_type.clone(), et.to_type.clone())))
+        .collect();
+    db.runtime_cache.graph_index(&resolved, &edge_types).await
 }
 
 pub(super) async fn graph_index_for_resolved(
     db: &Omnigraph,
     resolved: &ResolvedTarget,
+    edge_types: &std::collections::HashMap<String, (String, String)>,
 ) -> Result<Arc<crate::graph_index::GraphIndex>> {
-    let catalog = db.catalog();
-    db.runtime_cache.graph_index(resolved, &catalog).await
+    db.runtime_cache.graph_index(resolved, edge_types).await
 }
 
 pub(super) async fn ensure_indices(db: &Omnigraph) -> Result<Vec<PendingIndex>> {

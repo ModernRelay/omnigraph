@@ -59,6 +59,14 @@ pub struct QueryIoProbes {
     /// Internal/system-table (`__manifest`) open CALLS — the complement of
     /// `data_open_count`, kept for symmetry and debugging.
     pub internal_open_count: Arc<AtomicU64>,
+    /// Counts topology-index builds (the `RuntimeCache::graph_index` cache-miss
+    /// path). A cost test asserts a fresh branch whose edge tables are unchanged
+    /// from main reuses main's cached index (0 builds) rather than rebuilding it.
+    pub graph_build_count: Arc<AtomicU64>,
+    /// Edge tables included in topology builds this query (summed over build
+    /// invocations). A cost test asserts a query referencing one edge builds only
+    /// that edge, not every catalog edge (the cold-build shrink A2 ships).
+    pub graph_edges_built: Arc<AtomicU64>,
 }
 
 tokio::task_local! {
@@ -76,6 +84,32 @@ where
 
 fn current<R>(f: impl FnOnce(&QueryIoProbes) -> R) -> Option<R> {
     QUERY_IO_PROBES.try_with(f).ok()
+}
+
+tokio::task_local! {
+    static TRAVERSAL_MODE_OVERRIDE: Option<&'static str>;
+}
+
+/// Force the Expand execution mode (`"indexed"` | `"csr"`) for the scope of `fut`
+/// WITHOUT mutating the process-global `OMNIGRAPH_TRAVERSAL_MODE` env var. This is
+/// the general traversal-mode test seam: scope-bound (so it cannot leak — the
+/// override is gone when `fut` resolves or unwinds) and process-safe (it never
+/// touches shared state, so a forced-mode test never affects a concurrent test in
+/// the same binary, removing the need for `#[serial]` + a dedicated all-serial
+/// binary). Mirrors [`with_query_io_probes`]. The env var stays the production/ops
+/// escape hatch; this scoped override takes precedence over it
+/// (`exec::query::traversal_indexed_override`).
+pub async fn with_traversal_mode<F>(mode: &'static str, fut: F) -> F::Output
+where
+    F: std::future::Future,
+{
+    TRAVERSAL_MODE_OVERRIDE.scope(Some(mode), fut).await
+}
+
+/// The scoped traversal-mode override active for this task, if any. `None` in
+/// production (no scope installed), so the env var is consulted instead.
+pub(crate) fn traversal_mode_override() -> Option<&'static str> {
+    TRAVERSAL_MODE_OVERRIDE.try_with(|m| *m).ok().flatten()
 }
 
 pub(crate) fn manifest_wrapper() -> Option<Arc<dyn WrappingObjectStore>> {
@@ -116,6 +150,16 @@ pub(crate) fn record_open(uri: &str) {
         } else {
             p.data_open_count.fetch_add(1, Ordering::Relaxed);
         }
+    });
+}
+
+/// Record one topology-index build over `edges` edge tables (the
+/// `RuntimeCache::graph_index` cache-miss path). No-op when no probes are
+/// installed (production).
+pub(crate) fn record_graph_build(edges: usize) {
+    let _ = current(|p| {
+        p.graph_build_count.fetch_add(1, Ordering::Relaxed);
+        p.graph_edges_built.fetch_add(edges as u64, Ordering::Relaxed);
     });
 }
 

@@ -50,7 +50,11 @@ impl Omnigraph {
             .any(|op| matches!(op, IROp::Expand { .. } | IROp::AntiJoin { .. }));
         // Lazy: an index-served query with no AntiJoin never builds the CSR.
         let graph_index = if needs_graph {
-            GraphIndexHandle::cached(self, &resolved)
+            GraphIndexHandle::cached(
+                self,
+                &resolved,
+                referenced_edge_types(&ir.pipeline, &catalog),
+            )
         } else {
             GraphIndexHandle::none()
         };
@@ -95,14 +99,9 @@ impl Omnigraph {
             .any(|op| matches!(op, IROp::Expand { .. } | IROp::AntiJoin { .. }));
         // Lazy build against this historical snapshot (not the RuntimeCache,
         // which is keyed to live branch targets); only a CSR-path Expand or an
-        // AntiJoin triggers it.
+        // AntiJoin triggers it. Scoped to the edges this query traverses.
         let graph_index = if needs_graph {
-            let edge_types = catalog
-                .edge_types
-                .iter()
-                .map(|(name, et)| (name.clone(), (et.from_type.clone(), et.to_type.clone())))
-                .collect();
-            GraphIndexHandle::direct(&snapshot, edge_types)
+            GraphIndexHandle::direct(&snapshot, referenced_edge_types(&ir.pipeline, &catalog))
         } else {
             GraphIndexHandle::none()
         };
@@ -762,6 +761,51 @@ fn execute_pipeline<'a>(
     })
 }
 
+/// The edge types a query's pipeline actually traverses, mapped to their
+/// `(from_type, to_type)` endpoints. Recurses through `AntiJoin` inner pipelines
+/// (whose bulk fast path consumes the CSR for the inner `Expand`'s edge). The
+/// CSR build is scoped to exactly this set instead of every edge type in the
+/// catalog — otherwise a single-edge join (`$x identifiesPerson $p`) that lands
+/// on the CSR path would scan the whole graph's edge data (every message,
+/// relationship, … table), the cause of the cross-edge-join hang. Empty when the
+/// only traversal is an `AntiJoin` with no inner `Expand` — that shape never asks
+/// the handle for an index, so an empty build is never realized.
+fn referenced_edge_types(
+    pipeline: &[IROp],
+    catalog: &Catalog,
+) -> HashMap<String, (String, String)> {
+    let mut names = std::collections::BTreeSet::new();
+    collect_referenced_edge_names(pipeline, &mut names);
+    names
+        .into_iter()
+        .filter_map(|name| {
+            catalog
+                .edge_types
+                .get(&name)
+                .map(|et| (name, (et.from_type.clone(), et.to_type.clone())))
+        })
+        .collect()
+}
+
+fn collect_referenced_edge_names(
+    pipeline: &[IROp],
+    out: &mut std::collections::BTreeSet<String>,
+) {
+    for op in pipeline {
+        match op {
+            IROp::Expand { edge_type, .. } => {
+                out.insert(edge_type.clone());
+            }
+            IROp::AntiJoin { inner, .. } => collect_referenced_edge_names(inner, out),
+            // Exhaustive on purpose (no `_` arm): a new edge-referencing IROp must
+            // force a compile error here rather than silently under-scope the CSR
+            // build — an omitted edge would fail at runtime with "no adjacency
+            // index for edge". The non-traversal ops reference no edges.
+            IROp::NodeScan { .. } | IROp::Filter(_) => {}
+        }
+    }
+}
+
 /// Lazily provides the in-memory CSR graph index, building it on first use and
 /// memoizing for the rest of the query. Indexed-mode Expand never asks for it,
 /// so a query that is entirely index-served and has no AntiJoin never pays the
@@ -776,7 +820,11 @@ pub struct GraphIndexHandle<'a> {
 
 enum GraphIndexBuilder<'a> {
     None,
-    Cached(&'a Omnigraph, &'a crate::db::ResolvedTarget),
+    Cached(
+        &'a Omnigraph,
+        &'a crate::db::ResolvedTarget,
+        HashMap<String, (String, String)>,
+    ),
     Direct(&'a Snapshot, HashMap<String, (String, String)>),
 }
 
@@ -788,10 +836,14 @@ impl<'a> GraphIndexHandle<'a> {
         }
     }
 
-    fn cached(db: &'a Omnigraph, resolved: &'a crate::db::ResolvedTarget) -> Self {
+    fn cached(
+        db: &'a Omnigraph,
+        resolved: &'a crate::db::ResolvedTarget,
+        edge_types: HashMap<String, (String, String)>,
+    ) -> Self {
         Self {
             cell: tokio::sync::OnceCell::new(),
-            builder: GraphIndexBuilder::Cached(db, resolved),
+            builder: GraphIndexBuilder::Cached(db, resolved, edge_types),
         }
     }
 
@@ -810,8 +862,8 @@ impl<'a> GraphIndexHandle<'a> {
             .get_or_try_init(|| async {
                 match &self.builder {
                     GraphIndexBuilder::None => Ok::<Option<Arc<GraphIndex>>, OmniError>(None),
-                    GraphIndexBuilder::Cached(db, resolved) => {
-                        Ok(Some(db.graph_index_for_resolved(resolved).await?))
+                    GraphIndexBuilder::Cached(db, resolved, edge_types) => {
+                        Ok(Some(db.graph_index_for_resolved(resolved, edge_types).await?))
                     }
                     GraphIndexBuilder::Direct(snapshot, edge_types) => {
                         Ok(Some(Arc::new(GraphIndex::build(snapshot, edge_types).await?)))
@@ -834,7 +886,12 @@ impl<'a> GraphIndexHandle<'a> {
 /// forces the path (ops escape hatch + test hook). Both modes are semantically
 /// identical, so the override only changes which path runs, never the result.
 fn traversal_indexed_override() -> Option<bool> {
-    match std::env::var("OMNIGRAPH_TRAVERSAL_MODE").ok().as_deref() {
+    // The scoped test seam (`with_traversal_mode`) takes precedence over the
+    // process-global `OMNIGRAPH_TRAVERSAL_MODE` ops escape hatch.
+    let mode = crate::instrumentation::traversal_mode_override()
+        .map(str::to_string)
+        .or_else(|| std::env::var("OMNIGRAPH_TRAVERSAL_MODE").ok());
+    match mode.as_deref() {
         Some("indexed") => Some(true),
         Some("csr") => Some(false),
         _ => None,
@@ -2457,6 +2514,107 @@ mod expand_chooser_tests {
         assert_eq!(choose_expand_mode(&i), ExpandMode::IndexedScan);
         i.effective_max_hops = 5; // as if the cross-type cap were not applied
         assert_eq!(choose_expand_mode(&i), ExpandMode::Csr);
+    }
+}
+
+#[cfg(test)]
+mod referenced_edge_types_tests {
+    use super::*;
+
+    fn node_scan(var: &str, ty: &str) -> IROp {
+        IROp::NodeScan {
+            variable: var.to_string(),
+            type_name: ty.to_string(),
+            filters: Vec::new(),
+        }
+    }
+
+    fn expand(edge: &str) -> IROp {
+        IROp::Expand {
+            src_var: "a".into(),
+            dst_var: "b".into(),
+            edge_type: edge.to_string(),
+            direction: Direction::Out,
+            dst_type: "X".into(),
+            min_hops: 1,
+            max_hops: Some(1),
+            dst_filters: Vec::new(),
+        }
+    }
+
+    fn names(pipeline: &[IROp]) -> Vec<String> {
+        let mut set = std::collections::BTreeSet::new();
+        collect_referenced_edge_names(pipeline, &mut set);
+        set.into_iter().collect()
+    }
+
+    #[test]
+    fn collects_a_single_expand_edge() {
+        assert_eq!(
+            names(&[node_scan("x", "ExternalID"), expand("identifiesPerson")]),
+            vec!["identifiesPerson".to_string()]
+        );
+    }
+
+    #[test]
+    fn ignores_non_traversal_ops_and_dedups() {
+        // A pipeline that touches one edge twice references exactly that one edge —
+        // never the whole catalog (the cross-edge-join hang this scoping fixes).
+        let pipeline = vec![
+            node_scan("x", "ExternalID"),
+            expand("identifiesPerson"),
+            IROp::Filter(IRFilter {
+                left: IRExpr::PropAccess {
+                    variable: "p".into(),
+                    property: "name".into(),
+                },
+                op: omnigraph_compiler::query::ast::CompOp::Eq,
+                right: IRExpr::Literal(Literal::String("a".into())),
+            }),
+            expand("identifiesPerson"),
+        ];
+        assert_eq!(names(&pipeline), vec!["identifiesPerson".to_string()]);
+    }
+
+    #[test]
+    fn recurses_through_anti_join_inner_pipeline() {
+        // The bulk anti-join fast path consumes the CSR for the inner Expand's
+        // edge, so its edge type must be in scope even though it is nested.
+        let pipeline = vec![
+            node_scan("p", "Person"),
+            expand("knows"),
+            IROp::AntiJoin {
+                outer_var: "p".into(),
+                inner: vec![expand("worksAt")],
+            },
+        ];
+        assert_eq!(
+            names(&pipeline),
+            vec!["knows".to_string(), "worksAt".to_string()]
+        );
+    }
+
+    #[test]
+    fn recurses_through_nested_anti_joins() {
+        let pipeline = vec![IROp::AntiJoin {
+            outer_var: "p".into(),
+            inner: vec![IROp::AntiJoin {
+                outer_var: "c".into(),
+                inner: vec![expand("deepEdge")],
+            }],
+        }];
+        assert_eq!(names(&pipeline), vec!["deepEdge".to_string()]);
+    }
+
+    #[test]
+    fn anti_join_with_no_inner_expand_references_no_edges() {
+        // A predicate-only anti-join never asks the handle for an index, so the
+        // empty set is correct — no whole-graph build is realized.
+        let pipeline = vec![IROp::AntiJoin {
+            outer_var: "p".into(),
+            inner: vec![node_scan("c", "Company")],
+        }];
+        assert!(names(&pipeline).is_empty());
     }
 }
 

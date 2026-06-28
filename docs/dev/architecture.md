@@ -138,8 +138,8 @@ flowchart TB
     end
 
     subgraph idx[graph index]
-        gi[GraphIndex<br/>CSR/CSC built per query]:::l2
-        rc[RuntimeCache LRU=8]:::l2
+        gi[GraphIndex<br/>CSR/CSC built per query<br/>scoped to traversed edges]:::l2
+        rc[RuntimeCache LRU=8<br/>keyed by edge-table identity]:::l2
     end
 
     subgraph io[Lance I/O]
