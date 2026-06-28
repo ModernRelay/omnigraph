@@ -1,11 +1,30 @@
 # RFC-013: Write-path latency — capture-once `WriteTxn`, manifest-authoritative publish, bounded history, and a measured cost contract
 
-> **Status update (storage-versioning strand-and-retire work):** the
-> `_graph_commits.lance` / `_graph_commit_actors.lance` datasets are now **retired**
-> (Phase B — lineage lives in `__manifest` as `graph_commit` / `graph_head` rows;
-> the `CommitGraph` is a pure `__manifest` projection). References to those tables
-> below are historical: the remaining `optimize` / `cleanup` internal-table scope is
-> **`__manifest`-only**, and the per-write `_graph_commits` scan term is gone. See
+> **Historical design record. For current state and the live roadmap, read
+> [latency.md](latency.md) first.** This RFC's design thesis is sound and has
+> largely **shipped** (capture-once `WriteTxn` / opener bypass = step 3a, internal-table
+> compaction = step 2a, Phase 7 lineage-in-manifest, Phase B table retirement, the
+> IO-counted cost-gate harness). Three parts of the body are now superseded and are
+> kept only for provenance:
+> 1. **The `_graph_commits.lance` / `_graph_commit_actors.lance` tables are retired**
+>    (Phase B — lineage lives in `__manifest`; `CommitGraph` is a pure projection).
+>    Every reference to them below — root-cause term 3, §2.2, §4.2, §9 step 2a, the §0
+>    op-count tables — is a measurement of a now-deleted table; the `optimize`/`cleanup`
+>    internal-table scope is **`__manifest`-only**.
+> 2. **"Bounded history (compaction + cleanup)" is no longer *the* goal.** [latency.md](latency.md)
+>    §7 makes an explicit fork: Layer 1 (GC) is the bounded-history path and *conflicts*
+>    with unlimited history, which the production `personal` graph (a memory graph)
+>    wants. The unlimited-history path is Layers 3/4 + head-pointer rows + forward-probe,
+>    with **no GC**.
+> 3. **The row-accumulation wall is unaddressed here.** `table_version` + `graph_commit`
+>    rows accumulate O(commits) in `__manifest`; compaction bounds the scan's I/O but
+>    not its row decode, and Phase 7 made it heavier. The fix (head-pointer `table_head:<table>`
+>    rows) and the forward-probe latest-resolve are in [latency.md](latency.md) §6, not here.
+>
+> The deep design content unique to this RFC remains valid: the `WriteTxn` / `PublishPlan`
+> / `GraphPublishAuthority` interface (§4.1), the multi-writer cross-process cliff (§6.5),
+> the maintenance-vs-logical op-class distinction (§6.6, LANDED), the write-skew analysis
+> (§7.1), the epoch fence, the MTT seam (§8), and the literature validation (§13). See
 > [invariants.md](invariants.md) and [versioning.md](versioning.md).
 
 **Status:** Proposed
@@ -270,10 +289,12 @@ The cost decomposes into terms; the dominant one scales with history (§0):
    `read_manifest_scan`, `state.rs:133-141`) **[S]**; the internal tables are
    never compacted/cleaned (`optimize` iterates node/edge only,
    `optimize.rs:895-904`) **[S]**. +3.1 reads/depth **[M]**.
-3. **Per-write `_graph_commits` refresh (O(history), secondary).**
-   `record_graph_commit` reloads the entire commit cache before each append
-   (`commit_graph.rs:136-164`) **[S]**; never compacted/cleaned. +2.1 reads/depth
-   **[M]**. The "read-path anti-pattern, now on writes" (`iss-991` handoff **[G]**).
+3. ~~**Per-write `_graph_commits` refresh (O(history), secondary).**~~ **RETIRED —
+   this term is gone.** Phase 7 folded lineage into `__manifest` and Phase B deleted
+   `_graph_commits.lance`; `CommitGraph` is now a pure `__manifest` projection that
+   opens no Lance dataset and reloads no commit cache before append. The
+   `commit_graph.rs:136-164` `record_graph_commit` reload it described no longer
+   exists. (Historical: it was "the read-path anti-pattern, now on writes," `iss-991`.)
 
 Terms 2+3 are the secondary ~30%; term 1 dominates. Plus per-write fixed taxes: a `list_dir("__recovery/")` (`loader/mod.rs:197`,
 `exec/mutation.rs:725`, `exec/merge.rs:1090`) **[S]**, and the publisher CAS
