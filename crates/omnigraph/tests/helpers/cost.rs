@@ -11,7 +11,7 @@
 //! opener (RFC-013 step 3a's target, O(1) after the bypass) from the merge-insert/RI
 //! scan (O(fragment-count), compaction's domain) even though both ride the same
 //! `Dataset` — without controlling the fixture (no compaction needed). `__manifest`
-//! and `_graph_commits` keep the plain `IOTracker` (no sub-prefixes worth splitting).
+//! keeps the plain `IOTracker` (no sub-prefixes worth splitting).
 #![allow(dead_code)]
 
 use std::fmt;
@@ -52,10 +52,9 @@ pub struct IoCounts {
     /// merge-insert/RI **scan**, which grows with fragment count (compaction's
     /// domain, not the opener).
     pub data_scan_reads: u64,
-    /// `__manifest` registry scans (publish state).
+    /// `__manifest` registry scans (publish state; includes the graph-lineage rows
+    /// folded into `__manifest` by RFC-013 Phase 7).
     pub manifest_reads: u64,
-    /// `_graph_commits` lineage scans.
-    pub commit_graph_reads: u64,
     /// Version-probe invocations (the cheap freshness check).
     pub version_probes: u64,
     /// DATA-table open CALL count through the two instrumented chokepoints — an
@@ -63,14 +62,14 @@ pub struct IoCounts {
     /// internal/system-table opens are excluded. Step-3b target:
     /// `data_open_count <= |touched_tables|` for a write.
     pub data_open_count: u64,
-    /// Internal/system-table (`__manifest`, `_graph_commits*`) open CALL count —
-    /// the complement of `data_open_count` (publisher CAS + commit-graph append).
+    /// Internal/system-table (`__manifest`) open CALL count — the complement of
+    /// `data_open_count` (publisher CAS).
     pub internal_open_count: u64,
 }
 
 impl IoCounts {
     pub fn total_reads(&self) -> u64 {
-        self.data_reads + self.manifest_reads + self.commit_graph_reads
+        self.data_reads + self.manifest_reads
     }
 }
 
@@ -227,21 +226,78 @@ impl ObjectStore for PrefixCountingStore {
     }
 }
 
-/// The tracker handles backing one measurement; read once into [`IoCounts`].
-struct ProbeHandles {
+// ── Ground-truth `__manifest` meter (lance's per-request tracking idiom) ──
+//
+// Lance counts IO on a warm/cached dataset by attaching one `IOTracker` to the open
+// handle (`Dataset::with_object_store_wrappers`, shared session) and reading
+// `incremental_stats()` per request (`rust/lance/src/dataset/tests/dataset_io.rs`).
+// We do the same for `__manifest`: `cost_harness` installs ONE persistent tracker for
+// a whole test body, so the graph opens UNDER it and every coordinator handle — the
+// init handle and each post-publish/refresh reassignment (`db/manifest.rs` keeps
+// `self.dataset = …`) — carries the same tracker. `manifest_reads` is then ground
+// truth (warm probe + cold scans), handle-age-irrelevant, instead of only the reads
+// on handles a single measured op happened to open. Data/commit-graph/probe/open
+// counters stay fresh per op (their warm-handle exposure is out of scope here).
+
+/// Persistent per-test meter: owns the ground-truth `__manifest` tracker reused
+/// across every `measure` in a `cost_harness` body.
+#[derive(Clone, Default)]
+pub struct GraphIoMeter {
     manifest: IOTracker,
-    commit_graph: IOTracker,
+    /// The most recent measured op's `__manifest` request log (method + path),
+    /// stashed for `assert_io_eq!`-style failure diagnostics. Populated in
+    /// ground-truth mode only (the standalone fallback has no ambient meter).
+    last_manifest_log: Arc<Mutex<Vec<String>>>,
+}
+
+tokio::task_local! {
+    static COST_METER: GraphIoMeter;
+}
+
+/// Run `body` with a persistent ground-truth `__manifest` tracker installed for its
+/// whole lifetime. The graph MUST be opened inside `body` (e.g. via `local_graph`)
+/// so its coordinator's `__manifest` handle is wrapped from birth. `measure` calls
+/// inside reuse that tracker, so `manifest_reads` counts every `__manifest` read
+/// regardless of which handle performed it (the warm probe included). Outside
+/// `cost_harness`, `measure` falls back to a fresh per-op tracker — today's
+/// fresh-open-only behavior, used by `write_cost_s3.rs`.
+pub async fn cost_harness<F: Future>(body: F) -> F::Output {
+    let meter = GraphIoMeter::default();
+    let probes = QueryIoProbes {
+        manifest_wrapper: Some(Arc::new(meter.manifest.clone()) as Arc<dyn WrappingObjectStore>),
+        ..Default::default()
+    };
+    // Box the body so the (large) per-test future lives on the heap. Wrapping a whole
+    // test body in another async layer otherwise overflows the test thread's stack —
+    // these cost tests already raise `recursion_limit` for the same reason.
+    COST_METER
+        .scope(meter, with_query_io_probes(probes, Box::pin(body)))
+        .await
+}
+
+/// The tracker handles backing one measurement; read once into [`IoCounts`]. Data,
+/// probe, and open counters are fresh per op; the `__manifest` tracker is the ambient
+/// ground-truth one when inside `cost_harness`, else fresh.
+struct OpProbes {
+    manifest: IOTracker,
     table: PrefixCounter,
     probe_count: Arc<AtomicU64>,
     data_open_count: Arc<AtomicU64>,
     internal_open_count: Arc<AtomicU64>,
 }
 
-impl ProbeHandles {
+impl OpProbes {
     fn install() -> (QueryIoProbes, Self) {
-        let h = ProbeHandles {
-            manifest: IOTracker::default(),
-            commit_graph: IOTracker::default(),
+        // Reuse the ambient ground-truth `__manifest` tracker so reads on the warm
+        // coordinator handle (the freshness probe) land in it; fall back to a fresh
+        // tracker when standalone. Reset it (get-and-reset) so this op's delta
+        // excludes reads from init / `commit_many` between measures.
+        let manifest = COST_METER
+            .try_with(|m| m.manifest.clone())
+            .unwrap_or_default();
+        let _ = manifest.incremental_stats();
+        let h = OpProbes {
+            manifest,
             table: PrefixCounter::default(),
             probe_count: Arc::new(AtomicU64::new(0)),
             data_open_count: Arc::new(AtomicU64::new(0)),
@@ -249,9 +305,6 @@ impl ProbeHandles {
         };
         let probes = QueryIoProbes {
             manifest_wrapper: Some(Arc::new(h.manifest.clone()) as Arc<dyn WrappingObjectStore>),
-            commit_graph_wrapper: Some(
-                Arc::new(h.commit_graph.clone()) as Arc<dyn WrappingObjectStore>
-            ),
             table_wrapper: Some(Arc::new(h.table.clone()) as Arc<dyn WrappingObjectStore>),
             probe_count: Arc::clone(&h.probe_count),
             data_open_count: Arc::clone(&h.data_open_count),
@@ -262,13 +315,25 @@ impl ProbeHandles {
 
     fn counts(&self) -> IoCounts {
         let t = self.table.snapshot();
+        // `incremental_stats()` (get-and-reset) yields this op's reads: in
+        // ground-truth mode the tracker spans the whole test and was reset in
+        // `install`; standalone it is fresh so the delta is the whole count.
+        let manifest = self.manifest.incremental_stats();
+        // Stash the manifest read log (method + path) on the ambient meter for
+        // `assert_io_eq!`-style failure diagnostics; no-op when standalone.
+        let _ = COST_METER.try_with(|meter| {
+            *meter.last_manifest_log.lock().unwrap() = manifest
+                .requests
+                .iter()
+                .map(|r| format!("{} {}", r.method, r.path))
+                .collect();
+        });
         IoCounts {
             data_reads: t.reads,
             data_writes: t.writes,
             data_opener_reads: t.opener_reads,
             data_scan_reads: t.scan_reads,
-            manifest_reads: self.manifest.stats().read_iops,
-            commit_graph_reads: self.commit_graph.stats().read_iops,
+            manifest_reads: manifest.read_iops,
             version_probes: self.probe_count.load(Ordering::Relaxed),
             data_open_count: self.data_open_count.load(Ordering::Relaxed),
             internal_open_count: self.internal_open_count.load(Ordering::Relaxed),
@@ -276,10 +341,19 @@ impl ProbeHandles {
     }
 }
 
+/// The most recent measured op's `__manifest` reads (`method path`) for failure
+/// diagnostics — the `assert_io_eq!` read-log, scoped to `__manifest`. Empty
+/// outside `cost_harness` (the standalone fallback records no ambient log).
+pub fn last_manifest_reads() -> Vec<String> {
+    COST_METER
+        .try_with(|m| m.last_manifest_log.lock().unwrap().clone())
+        .unwrap_or_default()
+}
+
 /// Run `op` under object-store IO counting; return its output + the counts.
 /// The only place the `QueryIoProbes` task-local + tracker wiring lives.
 pub async fn measure<F: Future>(op: F) -> (F::Output, IoCounts) {
-    let (probes, handles) = ProbeHandles::install();
+    let (probes, handles) = OpProbes::install();
     let out = with_query_io_probes(probes, op).await;
     (out, handles.counts())
 }
@@ -287,7 +361,7 @@ pub async fn measure<F: Future>(op: F) -> (F::Output, IoCounts) {
 /// Like [`measure`], but also capture which staged-write primitives ran
 /// (composes the two task-locals cleanly).
 pub async fn measure_with_staged<F: Future>(op: F) -> (F::Output, IoCounts, StagedCounts) {
-    let (probes, handles) = ProbeHandles::install();
+    let (probes, handles) = OpProbes::install();
     let merge = MergeWriteProbes::default();
     let out = with_merge_write_probes(merge.clone(), with_query_io_probes(probes, op)).await;
     let staged = StagedCounts {
@@ -350,10 +424,9 @@ pub async fn measure_insert(db: &mut Omnigraph, tag: &str) -> IoCounts {
     io
 }
 
-/// Like [`measure_insert`] but carries an actor, so the write appends to and reads
-/// `_graph_commit_actors.lance` — the authenticated (server/CLI) write path. The
-/// commit-graph IO wrapper covers both `_graph_commits` and `_graph_commit_actors`,
-/// so `IoCounts::commit_graph_reads` includes the actor-table scan on this path.
+/// Like [`measure_insert`] but carries an actor — the authenticated (server/CLI)
+/// write path. The actor is written inline with the graph-lineage rows in
+/// `__manifest` (RFC-013 Phase 7), so its scan is part of `IoCounts::manifest_reads`.
 pub async fn measure_insert_as(db: &mut Omnigraph, tag: &str, actor: &str) -> IoCounts {
     let (res, io) = measure(db.mutate_as(
         "main",

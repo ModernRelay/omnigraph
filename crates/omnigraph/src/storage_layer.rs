@@ -14,16 +14,18 @@
 //! [`InlineCommitResidual`], reachable only via
 //! `Omnigraph::storage_inline_residual()`, so the default `db.storage()`
 //! surface is staged-only and cannot couple "write bytes" with "advance
-//! HEAD" — MR-793 acceptance §1 closes by construction. The residuals:
+//! HEAD" — MR-793 acceptance §1 closes by construction. The sole remaining
+//! residual:
 //!
-//! * `delete_where` — Lance #6658 (`DeleteBuilder::execute_uncommitted`)
-//!   did not backport to the 6.x line; it first ships in `v7.0.0-beta.10`.
-//!   Migration to staged two-phase delete is tracked as MR-A, gated on the
-//!   Lance v7.x bump.
 //! * `create_vector_index` — segment-commit-path needs
 //!   `build_index_metadata_from_segments`, still `pub(crate)` in Lance
-//!   6.0.1 ([#6666](https://github.com/lance-format/lance/issues/6666),
+//!   7.0.0 ([#6666](https://github.com/lance-format/lance/issues/6666),
 //!   open). Scalar indices already stage.
+//!
+//! `delete_where` was the other residual until MR-A: Lance 7.0's
+//! `DeleteBuilder::execute_uncommitted` (#6658) made delete a staged write
+//! (`TableStorage::stage_delete` → `commit_staged`), so delete no longer
+//! advances Lance HEAD inline and the residual is gone.
 //!
 //! Each is named honestly at its call site; the forbidden-API guard test
 //! catches direct lance::* misuse outside the storage layer.
@@ -64,7 +66,7 @@ use lance::dataset::{WhenMatched, WhenNotMatched};
 
 use crate::db::{Snapshot, SubTableEntry};
 use crate::error::Result;
-use crate::table_store::{DeleteState, StagedWrite, TableState, TableStore};
+use crate::table_store::{StagedWrite, TableState, TableStore};
 
 // ─── sealed module ──────────────────────────────────────────────────────────
 
@@ -156,7 +158,8 @@ impl SnapshotHandle {
 ///
 /// Produced by `TableStorage::stage_*`, consumed by
 /// `TableStorage::commit_staged`. Carries the underlying `StagedWrite`
-/// (transaction + read-your-writes deltas) behind `pub(crate)`.
+/// (transaction + commit metadata + read-your-writes deltas) behind
+/// `pub(crate)`.
 #[derive(Debug, Clone)]
 pub struct StagedHandle {
     pub(crate) inner: StagedWrite,
@@ -167,8 +170,7 @@ impl StagedHandle {
         Self { inner: staged }
     }
 
-    /// Take ownership of the inner `StagedWrite`. Used by
-    /// `commit_staged`.
+    /// Take ownership of the inner `StagedWrite`. Used by `commit_staged`.
     pub(crate) fn into_staged(self) -> StagedWrite {
         self.inner
     }
@@ -179,7 +181,8 @@ impl StagedHandle {
 /// `TableStore::stage_append`'s `prior_stages` parameter. The result is
 /// owned (not borrowed) — callers that already had a `&[StagedHandle]`
 /// pay a clone cost per element. `StagedWrite::clone` is cheap because
-/// `Transaction` and `Vec<Fragment>` are shallow-clone friendly.
+/// `Transaction`, commit metadata, and `Vec<Fragment>` are shallow-clone
+/// friendly.
 pub(crate) fn staged_handles_as_writes(handles: &[StagedHandle]) -> Vec<StagedWrite> {
     handles.iter().map(|h| h.inner.clone()).collect()
 }
@@ -384,6 +387,15 @@ pub trait TableStorage: sealed::Sealed + Send + Sync + Debug {
         batch: RecordBatch,
     ) -> Result<StagedHandle>;
 
+    /// Stage a delete (two-phase, no HEAD advance). `None` when 0 rows match —
+    /// the table is not touched (no transaction, no version). See
+    /// `TableStore::stage_delete`.
+    async fn stage_delete(
+        &self,
+        snapshot: &SnapshotHandle,
+        filter: &str,
+    ) -> Result<Option<StagedHandle>>;
+
     /// Stage a BTREE scalar index build. MR-793 Phase 2.
     async fn stage_create_btree_index(
         &self,
@@ -400,8 +412,8 @@ pub trait TableStorage: sealed::Sealed + Send + Sync + Debug {
 
     // ── Index presence (reads, no HEAD advance) ──────────────────────
     //
-    // The inline-commit writes (`delete_where`, `create_vector_index`) are
-    // deliberately NOT on this trait. They live on
+    // The inline-commit residual (`create_vector_index`) is deliberately NOT
+    // on this trait. It lives on
     // the separate `InlineCommitResidual` trait, reachable only through
     // `Omnigraph::storage_inline_residual()`. As a result the default
     // `db.storage()` surface cannot couple "write bytes" with "advance HEAD"
@@ -447,21 +459,16 @@ pub trait TableStorage: sealed::Sealed + Send + Sync + Debug {
 /// by accident (MR-793 acceptance §1, by construction).
 ///
 /// Residual reasons (each is named honestly at its call site):
-/// * `delete_where` — Lance has no public two-phase delete on the 6.x line
-///   (`DeleteBuilder::execute_uncommitted` first ships in v7.x; MR-A / Lance
-///   #6658). The D2 parse-time rule + recovery sidecars cover the gap meanwhile.
 /// * `create_vector_index` — vector-index segment-commit needs
-///   `build_index_metadata_from_segments`, still `pub(crate)` in Lance 6.0.1
+///   `build_index_metadata_from_segments`, still `pub(crate)` in Lance 7.0.0
 ///   (Lance #6666). Scalar indices already stage.
+///
+/// `delete_where` used to live here, but Lance 7.0's
+/// `DeleteBuilder::execute_uncommitted` (#6658) made delete a staged write
+/// (`TableStorage::stage_delete` → `commit_staged`); it was retired in MR-A so
+/// delete no longer advances Lance HEAD inline.
 #[async_trait]
 pub(crate) trait InlineCommitResidual: sealed::Sealed + Send + Sync + Debug {
-    async fn delete_where(
-        &self,
-        dataset_uri: &str,
-        snapshot: SnapshotHandle,
-        filter: &str,
-    ) -> Result<(SnapshotHandle, DeleteState)>;
-
     async fn create_vector_index(
         &self,
         snapshot: SnapshotHandle,
@@ -725,8 +732,7 @@ impl TableStorage for TableStore {
         staged: StagedHandle,
     ) -> Result<SnapshotHandle> {
         let ds_arc = snapshot.into_arc();
-        let transaction = staged.into_staged().transaction;
-        TableStore::commit_staged(self, ds_arc, transaction)
+        TableStore::commit_staged(self, ds_arc, staged.into_staged())
             .await
             .map(SnapshotHandle::new)
     }
@@ -739,6 +745,16 @@ impl TableStorage for TableStore {
         TableStore::stage_overwrite(self, snapshot.dataset(), batch)
             .await
             .map(StagedHandle::new)
+    }
+
+    async fn stage_delete(
+        &self,
+        snapshot: &SnapshotHandle,
+        filter: &str,
+    ) -> Result<Option<StagedHandle>> {
+        Ok(TableStore::stage_delete(self, snapshot.dataset(), filter)
+            .await?
+            .map(StagedHandle::new))
     }
 
     async fn stage_create_btree_index(
@@ -805,17 +821,6 @@ impl TableStorage for TableStore {
 
 #[async_trait]
 impl InlineCommitResidual for TableStore {
-    async fn delete_where(
-        &self,
-        dataset_uri: &str,
-        snapshot: SnapshotHandle,
-        filter: &str,
-    ) -> Result<(SnapshotHandle, DeleteState)> {
-        let mut ds = Arc::try_unwrap(snapshot.into_arc()).unwrap_or_else(|arc| (*arc).clone());
-        let state = TableStore::delete_where(self, dataset_uri, &mut ds, filter).await?;
-        Ok((SnapshotHandle::new(ds), state))
-    }
-
     async fn create_vector_index(
         &self,
         snapshot: SnapshotHandle,

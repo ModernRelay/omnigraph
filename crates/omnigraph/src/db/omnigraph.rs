@@ -154,7 +154,7 @@ pub struct Omnigraph {
     /// write-serialization mechanism (the server holds the engine as a
     /// lockless `Arc<Omnigraph>`). Reachable from engine internals
     /// (mutation finalize, schema_apply, branch_merge, ensure_indices,
-    /// delete_where, the fork path, recovery reconciler).
+    /// the fork path, recovery reconciler).
     write_queue: Arc<crate::db::write_queue::WriteQueueManager>,
     /// Process-wide mutex held across the swap → operate → restore window
     /// in `branch_merge_impl`. Two concurrent merges with distinct targets
@@ -175,8 +175,7 @@ pub struct Omnigraph {
     /// an explicit target coord parameter so `self.coordinator` is never
     /// used as scratch space — is the round-1 shape applied to
     /// `branch_create_from_impl`. Deferred because it requires unwinding
-    /// every `self.snapshot()` and `self.ensure_commit_graph_initialized()`
-    /// call inside the merge body.
+    /// every `self.snapshot()` call inside the merge body.
     merge_exclusive: Arc<tokio::sync::Mutex<()>>,
     /// Optional policy checker for engine-layer enforcement (MR-722).
     /// `None` = no enforcement; mutating methods are unconditionally
@@ -408,24 +407,13 @@ impl Omnigraph {
         mode: OpenMode,
     ) -> Result<Self> {
         let root = normalize_root_uri(uri)?;
-        // Apply pending internal-schema migrations before the coordinator reads
-        // branch state, so `branch_list` and the schema-apply blocking-branch
-        // checks observe the post-migration graph — notably the v2→v3 sweep of
-        // legacy `__run__*` staging branches (MR-770). ReadWrite only: a
-        // read-only open must not trigger object-store writes, so a read-only
-        // open of an unmigrated legacy graph still lists `__run__*` until its
-        // first read-write open (an accepted, documented limitation).
-        if matches!(mode, OpenMode::ReadWrite) {
-            crate::db::manifest::migrate_on_open(&root).await?;
-        } else {
-            // A read-only open skips `migrate_on_open` (no object-store writes),
-            // which is where the version refusal otherwise lives. Still refuse a
-            // `__manifest` stamped outside this binary's supported range — newer
-            // than CURRENT (an old binary cannot silently misread a newer graph,
-            // e.g. one folded to internal-schema v4 lineage), or below
-            // MIN_SUPPORTED (predates the readers we carry). Read-only, no write.
-            crate::db::manifest::refuse_if_internal_schema_unsupported(&root).await?;
-        }
+        // Refuse a `__manifest` this binary cannot serve before the coordinator
+        // reads any branch state — newer than CURRENT (an old binary must not
+        // silently misread a newer graph) or below MIN_SUPPORTED (an older
+        // storage format this binary does not read — rebuild via export/import).
+        // Both open modes refuse: there is no in-place migration, and the check is
+        // a stamp read with no object-store writes, so it is safe under ReadOnly.
+        crate::db::manifest::refuse_if_internal_schema_unsupported(&root).await?;
         // Open the coordinator first so the schema-staging recovery sweep can
         // compare its snapshot against any leftover staging files.
         let mut coordinator = GraphCoordinator::open(&root, Arc::clone(&storage)).await?;
@@ -702,13 +690,14 @@ impl Omnigraph {
         &self.table_store
     }
 
-    /// Inline-commit residual surface (`delete_where`,
-    /// `create_vector_index`) — the writes Lance cannot yet express as a
-    /// stage-then-commit pair. Deliberately separate from [`Self::storage`] so
-    /// the default storage surface is staged-only and a new writer cannot couple
-    /// "write bytes" with "advance HEAD" by reaching for `db.storage()`. Only
-    /// the handful of documented residual call sites (mutation/merge deletes,
-    /// vector-index build) use this accessor. See
+    /// Inline-commit residual surface (`create_vector_index`) — the sole
+    /// write Lance cannot yet express as a stage-then-commit pair (segment
+    /// commit needs `build_index_metadata_from_segments`, Lance #6666).
+    /// Deliberately separate from [`Self::storage`] so the default storage
+    /// surface is staged-only and a new writer cannot couple "write bytes" with
+    /// "advance HEAD" by reaching for `db.storage()`. Only the vector-index
+    /// build uses this accessor — delete migrated to the staged path
+    /// (`stage_delete`) in MR-A. See
     /// `crate::storage_layer::InlineCommitResidual` for the per-method blocker.
     pub(crate) fn storage_inline_residual(
         &self,
@@ -726,7 +715,7 @@ impl Omnigraph {
     /// Per-`(table_key, branch)` writer queues.
     ///
     /// Engine-internal writers (mutation finalize, schema_apply,
-    /// branch_merge, ensure_indices, delete_where) and the future MR-870
+    /// branch_merge, ensure_indices) and the future MR-870
     /// recovery reconciler reach the queue manager via this accessor.
     /// Returns an `Arc` clone so callers can hold the manager across
     /// `&mut self` engine API boundaries.
@@ -866,6 +855,33 @@ impl Omnigraph {
         Ok(manifest.snapshot())
     }
 
+    /// Probe-gated OCC re-capture snapshot (RFC-013 PR2 #1a). The commit-time OCC
+    /// re-read MUST be as fresh as a cold re-scan (see `commit_all`), but a cold
+    /// `__manifest` full scan per write is O(fragments) and a dominant write-path
+    /// cost. When the warm coordinator is already bound to `branch` AND a cheap
+    /// incarnation probe (one object-store op, no row scan) proves it is current,
+    /// the warm snapshot IS byte-identical to a fresh re-read, so reuse it with
+    /// zero scans. On ANY mismatch — a concurrent in- or cross-process advance, or
+    /// a different bound branch — fall through to the cold
+    /// `fresh_snapshot_for_branch_unchecked` read, preserving the "must be fresh"
+    /// contract and cross-process drift detection. Mirrors the read path's
+    /// `resolve_target_inner` probe-and-reuse idiom; same-branch sequential writes
+    /// keep `coordinator` current (each commit refreshes its `known_state`), so the
+    /// common case reuses and skips the scan. The publish CAS
+    /// (`expected_table_versions`) remains the final arbiter.
+    pub(crate) async fn occ_snapshot_for_branch(&self, branch: Option<&str>) -> Result<Snapshot> {
+        {
+            let coord = self.coordinator.read().await;
+            if branch == coord.current_branch() {
+                let held = coord.manifest_incarnation();
+                if coord.probe_latest_incarnation().await?.matches(&held) {
+                    return Ok(coord.snapshot());
+                }
+            }
+        }
+        self.fresh_snapshot_for_branch_unchecked(branch).await
+    }
+
     pub(crate) async fn version(&self) -> u64 {
         self.coordinator.read().await.version()
     }
@@ -885,6 +901,16 @@ impl Omnigraph {
         self.snapshot_of(target)
             .await
             .map(|snapshot| snapshot.version())
+    }
+
+    /// The on-disk internal-schema version of `target`'s branch (the storage-format
+    /// version this graph is stamped at). Surfaced via `omnigraph snapshot`.
+    pub async fn internal_schema_version_of(
+        &self,
+        target: impl Into<ReadTarget>,
+    ) -> Result<u32> {
+        let branch = self.resolved_branch_of(target).await?;
+        crate::db::manifest::internal_schema_stamp_at(self.uri(), branch.as_deref()).await
     }
 
     pub async fn resolved_branch_of(
@@ -1513,8 +1539,7 @@ impl Omnigraph {
         &self,
         branch: Option<&str>,
     ) -> Result<Option<String>> {
-        let mut coordinator = self.open_coordinator_for_branch(branch).await?;
-        coordinator.ensure_commit_graph_initialized().await?;
+        let coordinator = self.open_coordinator_for_branch(branch).await?;
         coordinator
             .head_commit_id()
             .await
@@ -1819,10 +1844,6 @@ impl Omnigraph {
             committed_handles,
         )
         .await
-    }
-
-    pub(crate) async fn ensure_commit_graph_initialized(&self) -> Result<()> {
-        table_ops::ensure_commit_graph_initialized(self).await
     }
 
     /// Invalidate the cached graph index. Called after edge mutations.
@@ -2522,11 +2543,7 @@ edge WorksAt: Person -> Company
                 .exists_checks()
                 .contains(&join_uri(uri, "__schema_state.json"))
         );
-        assert!(
-            adapter
-                .exists_checks()
-                .contains(&join_uri(uri, "_graph_commits.lance"))
-        );
+        // (Phase B retired `_graph_commits.lance`: open no longer probes for it.)
     }
 
     async fn table_rows_json(db: &Omnigraph, table_key: &str) -> Vec<Value> {
@@ -2687,57 +2704,6 @@ edge WorksAt: Person -> Company
             all_branches
         );
 
-        let desired = TEST_SCHEMA.replace(
-            "    age: I32?\n}",
-            "    age: I32?\n    nickname: String?\n}",
-        );
-        let result = db.apply_schema(&desired).await.unwrap();
-        assert!(result.applied, "schema apply should have applied");
-    }
-
-    /// Regression (MR-770): a pre-v0.4.0 graph that still carries a stale
-    /// `__run__*` branch on `__manifest` must not block schema apply. The
-    /// v2→v3 sweep runs in `Omnigraph::open(ReadWrite)` — before the
-    /// schema-apply blocking-branch check — so apply succeeds with no
-    /// intervening publish.
-    ///
-    /// Confirmed to fail before the open-time migration landed: the reopened
-    /// graph still listed `__run__legacy`, and `apply_schema` returned
-    /// "found non-main branches: __run__legacy".
-    #[tokio::test]
-    async fn legacy_run_branch_is_swept_on_open_and_does_not_block_schema_apply() {
-        let dir = tempfile::tempdir().unwrap();
-        let uri = dir.path().to_str().unwrap();
-        let mut db = Omnigraph::init(uri, TEST_SCHEMA).await.unwrap();
-
-        // Synthesize a legacy graph: a stale `__run__` branch on `__manifest`
-        // plus the manifest stamp rewound to v2 (pre-sweep).
-        db.branch_create("__run__legacy").await.unwrap();
-        drop(db);
-        {
-            // forbidden-api-allow: test synthesizes a legacy graph by editing __manifest directly.
-            let mut ds = lance::Dataset::open(&format!("{}/__manifest", uri))
-                .await
-                .unwrap();
-            ds.update_schema_metadata([(
-                "omnigraph:internal_schema_version".to_string(),
-                Some("2".to_string()),
-            )])
-            .await
-            .unwrap();
-        }
-
-        // Reopen (ReadWrite): the open-time migration must sweep `__run__legacy`
-        // before any branch-observing code runs.
-        let db = Omnigraph::open(uri).await.unwrap();
-        let branches = db.branch_list().await.unwrap();
-        assert!(
-            !branches.iter().any(|b| b.starts_with("__run__")),
-            "open-time migration must sweep legacy __run__ branches; got {branches:?}",
-        );
-
-        // Schema apply must proceed with no intervening publish — the
-        // blocking-branch check no longer sees `__run__legacy`.
         let desired = TEST_SCHEMA.replace(
             "    age: I32?\n}",
             "    age: I32?\n    nickname: String?\n}",

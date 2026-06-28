@@ -22,6 +22,7 @@ pub(crate) async fn server_health() -> Json<HealthOutput> {
     Json(HealthOutput {
         status: "ok".to_string(),
         version: SERVER_VERSION.to_string(),
+        internal_schema_version: SERVER_INTERNAL_SCHEMA_VERSION,
         source_version: SERVER_SOURCE_VERSION.map(str::to_string),
     })
 }
@@ -459,13 +460,23 @@ pub(crate) async fn server_snapshot(
             target_branch: None,
         },
     )?;
-    let snapshot = {
+    let (snapshot, internal_schema_version) = {
         let db = &handle.engine;
-        db.snapshot_of(ReadTarget::branch(branch.as_str()))
+        let snapshot = db
+            .snapshot_of(ReadTarget::branch(branch.as_str()))
             .await
-            .map_err(ApiError::from_omni)?
+            .map_err(ApiError::from_omni)?;
+        let internal_schema_version = db
+            .internal_schema_version_of(ReadTarget::branch(branch.as_str()))
+            .await
+            .map_err(ApiError::from_omni)?;
+        (snapshot, internal_schema_version)
     };
-    Ok(Json(snapshot_payload(&branch, &snapshot)))
+    Ok(Json(snapshot_payload(
+        &branch,
+        &snapshot,
+        internal_schema_version,
+    )))
 }
 
 /// Header values that flag a response as coming from a deprecated route

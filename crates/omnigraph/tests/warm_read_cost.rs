@@ -11,7 +11,7 @@ use arrow_array::{Array, StringArray};
 use omnigraph::db::{Omnigraph, ReadTarget};
 use omnigraph_compiler::result::QueryResult;
 
-use helpers::cost::measure;
+use helpers::cost::{cost_harness, measure};
 use helpers::{
     MUTATION_QUERIES, TEST_QUERIES, commit_many, count_rows, init_and_load, mixed_params,
     mutate_branch, mutate_main, params,
@@ -35,12 +35,17 @@ fn first_column_strings(result: &QueryResult) -> Vec<String> {
     out
 }
 
-/// A warm same-branch read must not re-open or scan `__manifest`, and must not
-/// open the commit graph, even at commit-history depth. The only manifest IO is
-/// the version probe (counted by invocation). Fails before Fix 1, where the read
-/// path re-opens a fresh coordinator and scans both internal tables.
+/// A warm same-branch read must do ZERO `__manifest` object-store reads and must
+/// not open the commit graph, even at commit-history depth. Wrapped in
+/// `cost_harness`, so `manifest_reads` is ground truth: the warm-coordinator
+/// freshness probe rides the long-lived handle (which now carries the tracker) and
+/// is served from Lance's cached manifest at 0 store reads, so this `== 0` also
+/// catches any future warm-handle scan a per-op tracker would miss. Fails before
+/// Fix 1, where the read path re-opens a fresh coordinator and scans both internal
+/// tables.
 #[tokio::test]
 async fn warm_same_branch_read_does_no_resolution_opens() {
+    cost_harness(async {
     let dir = tempfile::tempdir().unwrap();
     let mut db = init_and_load(&dir).await;
     // Deep history: warm-read resolution cost must be flat in commit count.
@@ -66,13 +71,11 @@ async fn warm_same_branch_read_does_no_resolution_opens() {
         "warm same-branch read must not scan __manifest (resolution or per-table)"
     );
     assert_eq!(
-        io.commit_graph_reads, 0,
-        "warm same-branch read must not open the commit graph (no coordinator re-open)"
-    );
-    assert_eq!(
         io.version_probes, 1,
         "warm same-branch read performs exactly one version probe"
     );
+    })
+    .await;
 }
 
 /// A multi-table query (a traversal touching Person, WorksAt, and Company) scans
@@ -82,6 +85,7 @@ async fn warm_same_branch_read_does_no_resolution_opens() {
 /// `describe_table_version`), which is the "2 tables = 2×" multi-table tax.
 #[tokio::test]
 async fn multi_table_query_does_no_manifest_scans() {
+    cost_harness(async {
     let dir = tempfile::tempdir().unwrap();
     let db = init_and_load(&dir).await;
 
@@ -98,6 +102,8 @@ async fn multi_table_query_does_no_manifest_scans() {
         io.manifest_reads, 0,
         "a multi-table read must not scan __manifest once per touched table"
     );
+    })
+    .await;
 }
 
 /// A warm reader must observe a commit made through another handle (invariant 6,
@@ -222,6 +228,7 @@ async fn schema_source_drift_is_caught_on_read() {
 /// that regressed when the open used `with_branch` against the base.
 #[tokio::test]
 async fn warm_branch_read_does_no_manifest_scans() {
+    cost_harness(async {
     let dir = tempfile::tempdir().unwrap();
     let db = init_and_load(&dir).await;
     db.branch_create("feature").await.unwrap();
@@ -251,13 +258,11 @@ async fn warm_branch_read_does_no_manifest_scans() {
         "warm branch read must not scan __manifest (branch-owned table opened by location)"
     );
     assert_eq!(
-        io.commit_graph_reads, 0,
-        "warm branch read must not open the commit graph"
-    );
-    assert_eq!(
         io.version_probes, 1,
         "warm branch read performs exactly one version probe"
     );
+    })
+    .await;
 }
 
 /// A non-main branch can be deleted and recreated at the same Lance version
@@ -338,10 +343,6 @@ async fn warm_read_on_recreated_branch_observes_new_incarnation() {
     assert!(
         io.manifest_reads > 0,
         "recreated branch must re-read the manifest after the incarnation probe"
-    );
-    assert_eq!(
-        io.commit_graph_reads, 0,
-        "same-branch incarnation refresh must be manifest-only"
     );
     assert_eq!(
         io.version_probes, 2,
@@ -435,10 +436,6 @@ async fn recreated_branch_owned_table_handle_uses_table_etag() {
     assert!(
         io.manifest_reads > 0,
         "recreated branch must refresh the manifest"
-    );
-    assert_eq!(
-        io.commit_graph_reads, 0,
-        "same-branch table-incarnation refresh must be manifest-only"
     );
     assert_eq!(
         io.version_probes, 2,
@@ -552,10 +549,6 @@ async fn recreated_branch_traversal_uses_graph_index_incarnation() {
         "recreated branch traversal must refresh the manifest"
     );
     assert_eq!(
-        io.commit_graph_reads, 0,
-        "same-branch traversal incarnation refresh must be manifest-only"
-    );
-    assert_eq!(
         io.version_probes, 2,
         "stale same-branch read probes once under each lock"
     );
@@ -621,10 +614,6 @@ async fn stale_read_refreshes_manifest_only() {
         "stale read must re-read the manifest"
     );
     assert_eq!(
-        io.commit_graph_reads, 0,
-        "stale refresh must be manifest-only (no commit-graph scan)"
-    );
-    assert_eq!(
         io.version_probes, 2,
         "stale same-branch read probes once under the read lock and once under the write lock"
     );
@@ -643,6 +632,7 @@ async fn stale_read_refreshes_manifest_only() {
 /// cache). Fails before Fix 3, where every read re-opens the table.
 #[tokio::test]
 async fn repeat_warm_read_reuses_table_handles() {
+    cost_harness(async {
     let dir = tempfile::tempdir().unwrap();
     let mut db = init_and_load(&dir).await;
     // Deep history: the win must hold regardless of commit count.
@@ -678,13 +668,11 @@ async fn repeat_warm_read_reuses_table_handles() {
     );
     assert_eq!(warm.manifest_reads, 0, "warm repeat read: 0 manifest opens");
     assert_eq!(
-        warm.commit_graph_reads, 0,
-        "warm repeat read: 0 commit-graph opens"
-    );
-    assert_eq!(
         warm.version_probes, 1,
         "warm repeat read: exactly one version probe"
     );
+    })
+    .await;
 }
 
 /// A write advances the table's version, so the next read misses the

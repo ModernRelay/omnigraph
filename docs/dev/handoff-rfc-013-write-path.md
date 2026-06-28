@@ -1,10 +1,193 @@
 # Handoff: finishing RFC-013 (write-path latency + correctness)
 
+> **Status update (strand-and-retire work):** the `_graph_commits.lance` /
+> `_graph_commit_actors.lance` datasets are **retired** (Phase B — lineage lives in
+> `__manifest`; the `CommitGraph` is a pure projection). References to those tables
+> below are historical: `optimize` now compacts **`__manifest` only** among the
+> internal tables, and the per-write `_graph_commits` scan term is gone. See
+> [versioning.md](versioning.md) and [invariants.md](invariants.md).
+
 **Status:** living handoff. **Source of truth is [`rfc-013-write-path-latency.md`](rfc-013-write-path-latency.md)** —
 this doc is the *current-state map + the decisions/validation from the latest work cycle
 + the concrete next actions*. When they disagree, the RFC wins (and fix this doc).
 
 **Audience:** the engineer/agent who picks up RFC-013 next.
+
+> **Two threads, one RFC.** RFC-013 has been worked in two overlapping lines by different
+> cycles, with different sub-numbering. Don't let the numbering confuse you:
+> - **Thread A — per-write call-count / RTT collapse + concurrency correctness** (steps 3b /
+>   4 / 5, Design A / `PublishPlan`, #297 / #254 / #296 / #298). This is **§1–§10 below** (the
+>   original body of this doc). Read it for the concurrency model and the convergent fix.
+> - **Thread B — `__manifest` scan amplification + the unbounded `_versions/` chain** (the
+>   investigation framed as **PR1 / PR2 / PR3 / PR4**). This is **§A below (read it first)** —
+>   it is the most recent cycle (2026-06-26) and where the live branch sits.
+>
+> They meet at the internal-table maintenance area (Thread A's "step 2a/2b" == Thread B's
+> "compaction is done / PR1 = bound the chain"). §A maps the two framings.
+
+---
+
+## §A. Current state — the `__manifest` scan + version-chain thread (2026-06-26) — READ FIRST
+
+The latest cycle attacked **write latency that grows with graph age on object storage** and a
+**hard open failure on a large `_versions/` chain**. The working plan (survives context resets,
+**not in the repo**) is `~/.claude/plans/in-the-mean-time-humble-reef.md` — pull it for the full
+PR1/PR2/PR3/PR4 decomposition, the assumptions-validated-against-code list, and the critical-files
+map. This section is the durable summary.
+
+### A.1 The problem (root cause)
+
+Two interacting terms, both centered on the internal `__manifest` Lance dataset (the cross-table
+catalog; one dataset, 217 tables on a real graph):
+
+- **Term 1 — repeated full `__manifest` scans per write.** Each read of `__manifest` was a bare
+  `dataset.scan()` (no filter/projection/index), cost **O(fragments F)**. A publish did **4** such
+  scans (OCC re-capture + `load_publish_state` + the `use_index(false)` merge-insert join +
+  post-publish read-back). `F` grows **+1 per write**, so per-write cost climbs with history.
+- **Term 2 — unbounded `_versions/` chain.** `cleanup` version-GC **excludes** the internal tables
+  (`all_table_keys` is node/edge-only, `db/omnigraph/optimize.rs`), so `__manifest/_versions/`
+  grows without bound (768 objects measured). Lance **lists** that prefix on every open; once large,
+  a store like RustFS times out serving the list page → branch ops take minutes or **fail outright**.
+  Unfixable via the public CLI today (`cleanup --keep` can't target `__manifest`).
+
+Validated three ways: a multi-agent workflow (readers + adversarial refutation), Lance 7.0.0 source,
+and live branch-op probes on a RustFS mirror. **Key Lance fact (closed the open-path investigation):**
+on standard S3-class stores (R2/RustFS, not S3 Express) Lance sets `list_is_lexically_ordered = true`,
+so it **never** uses `latest_version_hint.json` — it always lists `_versions/`. So the version hint is
+**not** a lever; only **bounding the chain (PR1)** fixes the open path. (Corollary: on production R2 the
+open is one cheap list page regardless of chain length, so the chain barely affects R2 open latency —
+the RustFS *failure* is a RustFS list-page limit; the R2 ~16s write latency is Term-1 fragment
+amplification = PR2's target.)
+
+### A.2 What is LANDED on `main`
+
+- **Step 2a** — `optimize` compacts the internal tables too (`__manifest` / `_graph_commits` /
+  `_graph_commit_actors`), so a *periodically-compacted* graph keeps Term-1 flat. (Cleanup/version-GC
+  of them is the still-open PR1.)
+- **Phase 7 / #299** (`1c5cb874`) — graph lineage lives in `__manifest` (`graph_commit` +
+  `graph_head:<branch>` rows in the same publish merge-insert; `_graph_commits` is now a projection;
+  v3→v4 internal-schema migration; schema-version floor). This removed the per-write commit-graph
+  scan and closed the manifest→commit-graph atomicity + commit-graph-parent-under-concurrency gaps.
+  **This is the base everything below builds on.**
+
+### A.3 What is IN FLIGHT — branch `ragnorc/read-lance-table-docs` = **PR #307** (OPEN, base `main`)
+
+Ten commits ahead of `origin/main`. PR #307 includes the scan-halving work, the fold
+correctness fix, and PR2.1's ground-truth cost harness.
+
+1. **PR2 — halve per-write `__manifest` scans** (`4ac3cde4` + tripwire `52a7e0cd`). Three moves:
+   - **#1a probe-gate the OCC re-capture** (`occ_snapshot_for_branch`, mirrors the read path's
+     `resolve_target_inner`): replace the cold re-scan with a cheap incarnation **probe**; reuse the
+     warm coordinator on match, cold-scan only on mismatch.
+   - **#1b in-memory post-publish fold** (`fold_inputs` in `publisher.rs`; `PublishOutcome.known_state`):
+     build the new `ManifestState` from `existing_versions ∪ pending rows` instead of re-scanning.
+   - **#1c projection** on `read_manifest_scan` (drop `base_objects` always, `object_id` off the
+     table-state path).
+   - Net: per-write `__manifest` scans **4 → 2**; the two inherent publisher scans
+     (`load_publish_state` + the `use_index(false)` merge-join) remain O(F).
+2. **Fold correctness fix** (`5537cd95` test, `245cb26d` fix) — a reviewer (Cursor Bugbot High +
+   Codex P2) caught that `#1b`'s fold dropped a **same-version owner-branch handoff**: a `table_version`
+   row UPDATEd in place at the same Lance version with a new `table_branch` (merge-insert `UpdateAll`
+   on the deterministic `version_object_id`) was appended after `existing_versions`, and
+   `assemble_manifest_state` kept the stale first entry, so the warm coordinator held the wrong fork
+   until refresh. Fix: key the fold's version entries by `(table_key, table_version)` so a pending row
+   **replaces** the existing one (mirroring `UpdateAll`). Test-first repro in
+   `db/manifest/tests.rs::test_post_publish_fold_reflects_owner_branch_handoff` (red→green).
+3. **PR2.1 — ground-truth cost harness** (`fd73f01b`, `59d9ff39`, `3cd2b2c1`, `383022e8`, `9f1e5b6e`).
+   Rebuilt `tests/helpers/cost.rs` on lance's IO-counted idiom (`incremental_stats()` deltas; one
+   `IOTracker` per class). Added `cost_harness(body)` / `GraphIoMeter`: it installs one `__manifest`
+   tracker **before the coordinator opens**, so the tracker rides every handle (init + each
+   post-publish reassignment at `db/manifest.rs:590`). `manifest_reads` is now **ground truth**
+   (handle-age-irrelevant), closing the blind spot where a per-op tracker installed at measure time
+   could not see reads on the long-lived warm handle. `last_manifest_reads()` dumps the read log for
+   `assert_io_eq!`-style failure diagnostics. Outside `cost_harness`, `measure` falls back to
+   fresh-per-op, so `write_cost_s3.rs` is untouched. (Kept the bespoke `PrefixCounter` for the
+   opener/scan split — lance does the same with `throttle_store`/`failing_store`, and the
+   request-log alternative would couple to unstable debug method-strings.)
+
+### A.4 The accurate measurement (PR2.1's payoff — what it told us)
+
+The old (fresh-only) harness **undercounted writes**: `#1a`'s probe rides the warm handle, and its
+reads escaped the per-op tracker (they showed only as `version_probes=1`). Ground truth counts them
+and reveals **a write's freshness probe does ~3 `__manifest` object-store RPCs** (a *read*'s probe is
+a 0-IO cache hit). So, apples-to-apples (both ground truth), per-write `__manifest` ops:
+
+| | depth 10 | depth 100 | slope |
+|---|---|---|---|
+| Pre-PR2 (4 cold scans) | 50 | 410 | +4/write |
+| Post-PR2 (ground truth) | 28 | 208 | +2/write |
+
+- PR2 roughly **halved** the per-write manifest work **and its growth slope** (+4 → +2/write).
+- The **compacted/maintained floor is ~5 RPCs/write, flat in history** — the 3-RPC probe now dominates
+  it (it is O(1), not O(F)). So `#1a` made the OCC re-capture O(1), it did not make it free.
+- For latency: a periodically-compacted graph has bounded, history-independent per-write manifest
+  cost; an unmaintained graph still grows at half the rate (PR1 flattens the residual). The probe and
+  RFC #7264 are the levers for the compacted floor. (The harness measures op *count*, the latency proxy
+  on object stores; the ~16s R2 figure is the open-path chain = PR1, separate.)
+- Regression guard: `write_cost.rs::manifest_reads_capture_warm_probe` (fresh=11 vs ground-truth=14)
+  goes red if the ground-truth wiring reverts.
+
+### A.5 What is LEFT (priority order) — Thread B
+
+1. **PR1a — manual `__manifest`-only cleanup** *(available now, no new invariant; HIGHEST priority —
+   it is the only thing that fixes the hard open **failures**)*. Add `all_table_keys_internal()` +
+   `cleanup_internal_tables()` reusing the generic `cleanup_all_tables` loop (`optimize.rs`); refuse on
+   a pending recovery sidecar. Safe **only on a quiesced graph** (no concurrent writers → no Q8
+   resurrection race). Shrinks `_versions/` (768 → keep-N). This is RFC **step 2b's available half**.
+   Pair with a **V2-naming surface guard** (protects the one-page open fast-path).
+2. **PR3 (the available half) — branch-op de-amplification.** Branch **merge** candidate-scoping
+   (avoid 3 full cross-branch snapshots + union-all-keys upfront, `exec/merge.rs`); **parallelize** the
+   branch-delete loop (`ensure_branch_delete_safe` snapshots every other branch — O(branches)). Each
+   per-branch scan is already cheaper post-PR2 (#1c projection).
+3. **Design-gated / deferred:**
+   - **PR1b — the Q8 durable boundary watermark** for SAFE automated/cadenced GC under live writers
+     (Lance version create is a bare `PutMode::Create` with no monotonic guard → a stalled writer can
+     resurrect a GC'd version = silent lost write on R2/S3). Invariant-level, partially MTT-redundant.
+     **This is the same design point as Thread A's "step 2b / Q8 watermark" in §8.** Design deliberately
+     or wait for RFC #7264.
+   - **PR3 branch-delete O(1)** — needs a cross-branch dependency index (the `table_branch` dependency
+     is genuinely cross-branch with no index today).
+   - **PR4 / RFC #7264** — Lance native branch-aware `BatchCreateTableVersions`; manifest read → O(1),
+     per-write fragment append gone; retires most of PR1/PR2. Upstream-blocked.
+4. **Low-leverage:** ~~retire the vestigial `_graph_commits`/`_graph_commit_actors` datasets~~ **DONE**
+   (Phase B of the strand-and-retire work — the tables are gone, branch authority is `__manifest`, the
+   `CommitGraph` is a pure `__manifest` projection). Still open: a bitmap index on `__manifest` (no builder
+   exists; `use_index(false)` means it can't serve the CAS join anyway — a `graph_head:<branch>` point-lookup
+   is the better variant).
+
+### A.6 Critical files (Thread B)
+
+- `db/manifest/state.rs` — `read_manifest_state` / `read_manifest_scan` / `assemble_manifest_state` (the
+  shared reduction both the fold and the scan feed).
+- `db/manifest/publisher.rs` — `fold_inputs` / `PublishOutcome` / `is_owner_branch_handoff` (publisher.rs:267,
+  the same-version handoff the fold must honor) / the merge-insert CAS.
+- `db/manifest.rs` — `commit_changes_with_lineage` (adopts the fold; `self.dataset = dataset` reassignment
+  at :590, the reason the cost tracker must be installed before open) + the probes.
+- `db/omnigraph.rs` — `occ_snapshot_for_branch` (#1a), `resolved_branch_target`, `ensure_branch_delete_safe` (PR3).
+- `exec/staging.rs` `commit_all`; `exec/merge.rs` (PR3); `db/omnigraph/optimize.rs` (`all_table_keys`,
+  `cleanup_all_tables` — PR1).
+- `tests/helpers/cost.rs` (the harness), `tests/write_cost.rs` / `warm_read_cost.rs` / `write_cost_s3.rs`,
+  `tests/writes.rs` / `consistency.rs` / `composite_flow.rs` (must stay green).
+
+### A.7 Gotchas (Thread B, learned this cycle)
+
+- **A per-op object-store wrapper cannot see a long-lived handle's reads.** That was the measurement
+  blind spot. The fix is to install the tracker before the handle opens (`cost_harness`), not at measure
+  time. A write's warm-handle probe is **3 RPCs** that hid behind `version_probes=1`.
+- **`cost_harness` must wrap the WHOLE test body** (the graph must open inside it), and the body future
+  must be **`Box::pin`-ed** — wrapping a whole test body in another async layer overflows the test
+  thread's stack (these cost tests already raise `recursion_limit`).
+- **The fold must mirror merge-insert identity.** `version_object_id(table_key, version)` is
+  deterministic, so a same-version handoff is an in-place `UpdateAll`; the in-memory fold must key by
+  `(table_key, version)` and replace, or the warm coordinator desyncs from a fresh re-scan. The
+  byte-identity guard is `writes.rs::post_publish_fold_matches_fresh_reopen`.
+- **`lance-io` `test-util`** is enabled in dev-deps (gives `IoStats.requests` + `assert_io_eq!`,
+  diagnostics only); production builds exclude dev-deps so they never see it.
+
+### A.8 Immediate next action
+
+The natural next PR is **PR1a** (no design gate, fixes the RustFS open failures). Run and confirm
+the relevant test gate before starting or stacking that follow-up.
 
 ---
 
@@ -22,6 +205,9 @@ for the canonical list. Current reality:
 - **Step 2a** — internal-table compaction: `optimize` now compacts `__manifest` /
   `_graph_commits` / `_graph_commit_actors` (#291). Plus the RFC latency-model
   correction (#292).
+- **Step 4 / Phase 7** — graph lineage moved into `__manifest` (#299 `1c5cb874`):
+  `graph_commit` + mutable `graph_head:<branch>` in the publish merge-insert,
+  `_graph_commits` now a projection. **The base for the live branch (§A).**
 - **Optimize-vs-write race** — optimize survives a cross-process write race on the
   same table (#297, **LANDED** — origin/main `6d4606a8`; see §6 for why it's not
   redundant with Design A). Step 3b stacks on top of this.
@@ -36,9 +222,11 @@ for the canonical list. Current reality:
   (same op-class family as #297, logical side).
 
 **Step 3b is DONE** (capture-once `WriteTxn`, schema-once + open-collapse; see §4) on
-`rfc-013-step-3b-writetxn-v2`. **Next: Phase 7 (step 4), then the big one — Design A /
-`PublishPlan` unification (step 5)** — see §5, the convergent fix for the bug *class* this
-area keeps generating, which also absorbs 3b's deferred session-aware write opens.
+`rfc-013-step-3b-writetxn-v2`. **Phase 7 (step 4) has since LANDED on `main` (#299 `1c5cb874`)**
+— lineage now lives in `__manifest` (see §A.2). **Next for Thread A: the big one — Design A /
+`PublishPlan` unification (step 5)** — see §5, the convergent fix for the bug *class* this area
+keeps generating, which also absorbs 3b's deferred session-aware write opens. **Next for Thread B
+(the live branch, §A): PR1a** (manual `__manifest` cleanup — fixes the RustFS open failures).
 
 ---
 
@@ -397,11 +585,12 @@ for #298** (which built none of those constructs) but are **load-bearing constra
   (§1d.1). Restore the live-HEAD cardinality scan, add the deterministic regression test, fix
   the wrong doc comment. Small, gate-safe, un-regresses an integrity check (invariant 9). The
   residual concurrent TOCTOU is the §7.1 gap (step 4) — un-widen here, don't over-reach.
-- **Step 4 / Phase 7** (`iss-991`): lineage into `__manifest` (publish `graph_commit` +
-  mutable `graph_head:<branch>` in the same merge-insert; `_graph_commits` becomes a
-  projection). Removes the per-write `commit_graph.refresh`; closes the manifest→commit-graph
-  atomicity + commit-graph-parent-under-concurrency gaps. **Hard prereq: step 2 (done).**
-  Carries the §7.1 *concurrent* write-skew fix (needs the `graph_head` contention row) —
+- **Step 4 / Phase 7** (`iss-991`): **LANDED on `main` as #299 (`1c5cb874`).** Lineage now lives
+  in `__manifest` (`graph_commit` + mutable `graph_head:<branch>` in the same merge-insert;
+  `_graph_commits` is a projection). Removed the per-write `commit_graph.refresh`; closed the
+  manifest→commit-graph atomicity + commit-graph-parent-under-concurrency gaps. *(Historical note,
+  kept for the §7.1 framing it carried:)* it
+  carries the §7.1 *concurrent* write-skew fix (needs the `graph_head` contention row) —
   **frame §7.1 as "unify the entire write-validation read-set" (endpoint + cardinality +
   cross-version uniqueness), not merely "add `graph_head`"** (§1d.1): the bespoke
   `edge_cardinality_read_handle` and the mutation-vs-loader freshness fork dissolve into one

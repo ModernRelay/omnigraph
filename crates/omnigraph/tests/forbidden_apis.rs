@@ -37,8 +37,9 @@
 //! `Omnigraph::storage_inline_residual()`, so the default storage surface
 //! cannot couple "write bytes" with "advance HEAD" — engine code that
 //! wants an inline residual must name the residual accessor explicitly.
-//! The only residuals are `delete_where` (Lance #6658 / v7.x) and
-//! `create_vector_index` (Lance #6666). The dead legacy methods
+//! The sole residual is `create_vector_index` (Lance #6666); `delete`
+//! migrated to the staged `stage_delete` path in MR-A (Lance 7.0 #6658).
+//! The dead legacy methods
 //! (trait `append_batch` / `merge_insert_batches`, inherent
 //! `merge_insert_batch{,es}`, `create_{btree,inverted}_index`) were
 //! removed entirely. This guard's scope is unchanged: it catches direct
@@ -107,11 +108,10 @@ const FORBIDDEN_PATTERNS: &[&str] = &[
 /// Files exempt from the guard. These are the legitimate storage-layer
 /// or manifest-layer implementations that USE the forbidden APIs to
 /// provide the staged primitives or to maintain the system tables
-/// (commit graph, manifest).
+/// (manifest, recovery audit).
 const ALLOW_LIST_FILES: &[&str] = &[
     "table_store.rs",       // The storage layer itself.
     "storage_layer.rs",     // The trait module.
-    "commit_graph.rs",      // Maintains `_graph_commits.lance` system table.
     "graph_coordinator.rs", // Drives the manifest publisher / branch coordinator.
     "recovery_audit.rs",    // Maintains `_graph_commit_recoveries.lance` (recovery audit trail).
     "instrumentation.rs",   // The instrumented dataset opener (open_dataset_tracked / open_table_dataset).

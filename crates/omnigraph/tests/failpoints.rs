@@ -31,22 +31,6 @@ fn node_table_uri(root: &str, type_name: &str) -> String {
     format!("{}/nodes/{hash:016x}", root.trim_end_matches('/'))
 }
 
-#[tokio::test]
-#[serial]
-async fn branch_create_failpoint_triggers() {
-    let _scenario = FailScenario::setup();
-    let dir = tempfile::tempdir().unwrap();
-    let uri = dir.path().to_str().unwrap();
-    let db = Omnigraph::init(uri, helpers::TEST_SCHEMA).await.unwrap();
-    let _failpoint = ScopedFailPoint::new(names::BRANCH_CREATE_AFTER_MANIFEST_BRANCH_CREATE, "return");
-
-    let err = db.branch_create("feature").await.unwrap_err();
-    assert!(
-        err.to_string()
-            .contains("injected failpoint triggered: branch_create.after_manifest_branch_create")
-    );
-}
-
 // Branch delete flips the manifest authority first, then reclaims the per-table
 // forks best-effort. A failure during that reclaim (here, the
 // `branch_delete.before_table_cleanup` failpoint, standing in for a transient
@@ -361,50 +345,6 @@ async fn cleanup_isolates_reconcile_failure() {
     }
 }
 
-// The cleanup reconciler must reclaim orphaned commit-graph branches, not just
-// per-table forks. A delete whose best-effort commit-graph reclaim fails leaves
-// a commit-graph orphan; the next cleanup must drop it.
-#[tokio::test]
-#[serial]
-async fn cleanup_reclaims_orphaned_commit_graph_branch() {
-    let _scenario = FailScenario::setup();
-    let dir = tempfile::tempdir().unwrap();
-    let uri = dir.path().to_str().unwrap().to_string();
-    let mut db = helpers::init_and_load(&dir).await;
-
-    db.branch_create("feature").await.unwrap();
-    // Delete, failing the commit-graph reclaim → commit-graph "feature" orphan
-    // (manifest branch gone, commit-graph branch left behind).
-    {
-        let _fp = ScopedFailPoint::new(names::BRANCH_DELETE_BEFORE_COMMIT_GRAPH_RECLAIM, "return");
-        db.branch_delete("feature").await.unwrap();
-    }
-
-    let commits_uri = format!("{}/_graph_commits.lance", uri.trim_end_matches('/'));
-    {
-        let ds = lance::Dataset::open(&commits_uri).await.unwrap();
-        assert!(
-            ds.list_branches().await.unwrap().contains_key("feature"),
-            "precondition: the commit-graph branch should be orphaned after the failed reclaim"
-        );
-    }
-
-    db.cleanup(omnigraph::db::CleanupPolicyOptions {
-        keep_versions: Some(1),
-        older_than: None,
-    })
-    .await
-    .unwrap();
-
-    {
-        let ds = lance::Dataset::open(&commits_uri).await.unwrap();
-        assert!(
-            !ds.list_branches().await.unwrap().contains_key("feature"),
-            "cleanup should reclaim the orphaned commit-graph branch"
-        );
-    }
-}
-
 // `classify_fork_ref` returns `Indeterminate` when the fresh-authority read
 // fails on a LIVE branch — and a destructive caller must SKIP, never delete, on
 // that ambiguity. Here the reconciler has a genuine origin-2 orphan candidate
@@ -468,65 +408,6 @@ async fn reconcile_skips_fork_when_fresh_recheck_is_unavailable_then_converges()
     }
 }
 
-// A branch_delete whose best-effort commit-graph reclaim fails leaves a
-// commit-graph "zombie" branch. Recreating that name must heal the zombie and
-// succeed (branch_create force-deletes a stale commit-graph ref since the
-// manifest branch is created fresh), instead of dying on the leftover ref.
-#[tokio::test]
-#[serial]
-async fn branch_create_recreates_over_commit_graph_zombie() {
-    let _scenario = FailScenario::setup();
-    let dir = tempfile::tempdir().unwrap();
-    let db = Omnigraph::init(dir.path().to_str().unwrap(), helpers::TEST_SCHEMA)
-        .await
-        .unwrap();
-
-    db.branch_create("feature").await.unwrap();
-    {
-        // Fail the best-effort commit-graph reclaim → commit-graph "feature"
-        // zombie survives the delete (manifest authority still flips).
-        let _fp = ScopedFailPoint::new(names::BRANCH_DELETE_BEFORE_COMMIT_GRAPH_RECLAIM, "return");
-        db.branch_delete("feature").await.unwrap();
-    }
-    assert_eq!(db.branch_list().await.unwrap(), vec!["main".to_string()]);
-
-    db.branch_create("feature")
-        .await
-        .expect("branch_create should heal the zombie commit-graph branch and succeed");
-    assert!(
-        db.branch_list()
-            .await
-            .unwrap()
-            .contains(&"feature".to_string())
-    );
-}
-
-// branch_create is authority-then-derived: if the derived commit-graph branch
-// cannot be created, the manifest branch (the authority) must be rolled back so
-// the branch does not half-exist. The existing failpoint fires right after the
-// manifest create, standing in for any post-authority failure.
-#[tokio::test]
-#[serial]
-async fn branch_create_rolls_back_manifest_on_commit_graph_failure() {
-    let _scenario = FailScenario::setup();
-    let dir = tempfile::tempdir().unwrap();
-    let db = Omnigraph::init(dir.path().to_str().unwrap(), helpers::TEST_SCHEMA)
-        .await
-        .unwrap();
-
-    let err = {
-        let _fp = ScopedFailPoint::new(names::BRANCH_CREATE_AFTER_MANIFEST_BRANCH_CREATE, "return");
-        db.branch_create("feature").await.unwrap_err()
-    };
-    assert!(
-        !db.branch_list()
-            .await
-            .unwrap()
-            .contains(&"feature".to_string()),
-        "branch_create must roll back the manifest branch when the derived \
-         commit-graph branch fails, got error: {err}"
-    );
-}
 
 // A fork collision must be classified by the manifest authority, not by Lance
 // branch versions. When a concurrent first-write legitimately wins the fork
@@ -3599,7 +3480,7 @@ async fn branch_merge_phase_b_failure_recovered_on_next_open() {
 
     // Recovery: reopen runs the sweep. BranchMerge uses LOOSE
     // classification — `publish_rewritten_merge_table` runs multiple
-    // commit_staged calls per table (stage_merge_insert + delete_where +
+    // commit_staged calls per table (stage_merge_insert + stage_delete +
     // index rebuilds), so post_commit_pin in the sidecar is a lower
     // bound; the loose-match classifier accepts any HEAD > expected_version
     // when expected_version == manifest_pinned.
@@ -4474,138 +4355,12 @@ async fn init_failpoint_returns_original_error_not_cleanup_error() {
     );
 }
 
-// ── RFC-013 Phase 7 / FIX A: a transient legacy-open failure must abort the ──
-// v3→v4 migration loudly, not silently swallow the lineage and stamp v4.
-//
-// `migrate_v3_to_v4` backfills graph lineage from `_graph_commits.lance` into
-// `__manifest`, then stamps internal-schema v4. The migration runs exactly once
-// per graph (`migrate_internal_schema` is `while stamp < CURRENT`). If a
-// transient or corrupt `Dataset::open` of the legacy commit dataset is treated
-// as "no legacy data" (the pre-fix `Err(_) => empty` arm), the migration backfills
-// NOTHING and stamps v4 — orphaning the real lineage permanently, since the v3
-// fallback is then disabled. The fix matches the not-found variants (benign:
-// genuinely no legacy data) and propagates anything else.
-//
-// This test injects a non-not-found Lance error at the legacy open via the
-// `migration.v3_to_v4.legacy_open` failpoint. The load-bearing assertion is the
-// last one: a once-transient failure leaves the graph RETRYABLE (stamp still v3,
-// no lineage), so a later open with the fault cleared completes the migration —
-// it was not a poison pill.
-#[tokio::test]
-async fn transient_legacy_open_failure_aborts_migration_without_stamping_v4() {
-    let _scenario = FailScenario::setup();
-    let dir = tempfile::tempdir().unwrap();
-    let uri = dir.path().to_str().unwrap().to_string();
-
-    // A real pre-Phase-7 (v3) graph: lineage only in `_graph_commits.lance`,
-    // `__manifest` stamped v3 with no `graph_commit` rows.
-    let fixture = omnigraph::db::commit_graph::seed_legacy_v3_lineage(&uri)
-        .await
-        .unwrap();
-    let (rows_before, stamp_before) =
-        omnigraph::db::manifest::lineage_row_count_and_stamp_for_test(&uri, None)
-            .await
-            .unwrap();
-    assert_eq!(stamp_before, 3, "fixture is stamped v3");
-    assert_eq!(rows_before, 0, "fixture has no lineage in __manifest");
-
-    // Arm the legacy-open fault and run the read-write migration entry point.
-    {
-        let _fp = ScopedFailPoint::new(names::MIGRATION_V3_TO_V4_LEGACY_OPEN, "return");
-        let err = match omnigraph::db::manifest::migrate_on_open_for_test(&uri).await {
-            Ok(()) => panic!("migration must abort when the legacy open fails transiently"),
-            Err(e) => e,
-        };
-        // The injected (non-not-found) Lance error must surface, not be masked.
-        let msg = err.to_string();
-        assert!(
-            msg.contains("injected failpoint triggered: migration.v3_to_v4.legacy_open"),
-            "expected the injected legacy-open error to propagate, got: {msg}"
-        );
-    }
-
-    // The migration left NO drift: stamp still v3, still no lineage. (Pre-fix,
-    // the swallow would have stamped v4 with an empty backfill — permanent loss.)
-    let (rows_after_fault, stamp_after_fault) =
-        omnigraph::db::manifest::lineage_row_count_and_stamp_for_test(&uri, None)
-            .await
-            .unwrap();
-    assert_eq!(
-        stamp_after_fault, 3,
-        "a transient legacy-open failure must NOT stamp the manifest to v4",
-    );
-    assert_eq!(
-        rows_after_fault, 0,
-        "a transient legacy-open failure must NOT partially backfill lineage",
-    );
-
-    // The whole correctness claim: a once-transient failure is retryable. With the
-    // fault cleared, the next migration pass reads the legacy lineage and completes.
-    omnigraph::db::manifest::migrate_on_open_for_test(&uri)
-        .await
-        .unwrap();
-    let (rows_done, stamp_done) =
-        omnigraph::db::manifest::lineage_row_count_and_stamp_for_test(&uri, None)
-            .await
-            .unwrap();
-    assert_eq!(stamp_done, 4, "the retried migration stamps v4");
-    assert_eq!(
-        rows_done,
-        fixture.all_ids.len(),
-        "the retried migration backfills every legacy commit",
-    );
-}
-
-// ── RFC-013 Phase 7 / FIX B follow-up: the v3→v4 stamp-bump retry loop must ──
-// surface a RETRYABLE contention error on exhaustion, not a stringified Lance error.
-//
-// `commit_v4_stamp_idempotently` bumps the internal-schema stamp under concurrent
-// runners: the `UpdateConfig` CAS loser gets `IncompatibleTransaction`, re-opens,
-// confirms the winner stamped the same value, and is done. Genuine exhaustion (every
-// attempt loses) must return a `RowLevelCasContention` so the publisher's OUTER retry
-// completes the one-time open — an `OmniError::Lance` would be treated as fatal. The
-// `migration.v4_stamp.force_incompatible` failpoint forces every stamp attempt to lose,
-// driving the otherwise-near-unreachable exhaustion path deterministically. (Pre-fix —
-// `0..=BUDGET` + an `attempt < BUDGET` guard — the last iteration fell through to the
-// stringifying `Err(e)` arm and returned a non-retryable `OmniError::Lance`.)
-#[tokio::test]
-async fn v4_stamp_exhaustion_returns_retryable_contention() {
-    let _scenario = FailScenario::setup();
-    let dir = tempfile::tempdir().unwrap();
-    let uri = dir.path().to_str().unwrap().to_string();
-
-    // A real v3 graph: the backfill merge succeeds; only the terminal stamp loop
-    // is forced to exhaust.
-    let _fixture = omnigraph::db::commit_graph::seed_legacy_v3_lineage(&uri)
-        .await
-        .unwrap();
-
-    let _fp = ScopedFailPoint::new(names::MIGRATION_V4_STAMP_FORCE_INCOMPATIBLE, "return");
-    let err = match omnigraph::db::manifest::migrate_on_open_for_test(&uri).await {
-        Ok(()) => panic!("migration must error when the stamp bump exhausts its retries"),
-        Err(e) => e,
-    };
-    assert!(
-        matches!(
-            &err,
-            omnigraph::error::OmniError::Manifest(m)
-                if matches!(
-                    m.details,
-                    Some(omnigraph::error::ManifestConflictDetails::RowLevelCasContention)
-                )
-        ),
-        "stamp-bump exhaustion must surface a RETRYABLE RowLevelCasContention so the \
-         publisher's outer retry completes the open, got: {err:?}",
-    );
-}
-
 // The publisher's outer retry must re-run `load_publish_state` on a RETRYABLE error,
-// not propagate it fatally. `load_publish_state` runs `migrate_internal_schema`, whose
-// bounded merge/stamp loops surface a `RowLevelCasContention` on exhaustion EXPECTING
-// this re-run (a clean second scan, by which point a concurrent winner has finished the
-// migration). Before the fix, `load_publish_state().await?` short-circuited the loop —
-// only `merge_rows` conflicts hit the retry — so the typed contention aborted the
-// publish. Inject a ONE-SHOT retryable contention into `load_publish_state`: the write
+// not propagate it fatally. A bounded internal loop can surface a `RowLevelCasContention`
+// on exhaustion EXPECTING this re-run (a clean second scan, by which point a concurrent
+// winner has finished). Before the fix, `load_publish_state().await?` short-circuited the
+// outer loop — only `merge_rows` conflicts hit the retry — so the typed contention aborted
+// the publish. Inject a ONE-SHOT retryable contention into `load_publish_state`: the write
 // must still commit, because the publisher retries and the cleared second attempt wins.
 #[tokio::test]
 #[serial]

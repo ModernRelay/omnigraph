@@ -32,11 +32,12 @@ use crate::error::{OmniError, Result};
 #[cfg(test)]
 use super::SubTableUpdate;
 use super::layout::{open_manifest_dataset, tombstone_object_id, version_object_id};
-use super::metadata::parse_namespace_version_request;
-use super::migrations::migrate_internal_schema;
+use super::metadata::{TableVersionMetadata, parse_namespace_version_request};
+use super::migrations::{read_stamp, refuse_if_stamp_unsupported};
 use super::state::{
-    GraphLineageRow, GraphLineageRowPart, graph_lineage_row_parts, head_lineage_row,
-    manifest_rows_batch, manifest_schema, read_publish_scan,
+    GraphLineageRow, GraphLineageRowPart, ManifestState, assemble_manifest_state,
+    graph_lineage_row_parts, head_lineage_row, manifest_rows_batch, manifest_schema,
+    read_manifest_state, read_publish_scan,
 };
 use super::{
     ManifestChange, OBJECT_TYPE_TABLE, OBJECT_TYPE_TABLE_TOMBSTONE, OBJECT_TYPE_TABLE_VERSION,
@@ -82,6 +83,11 @@ pub(super) struct PublishOutcome {
     /// in-memory commit cache without a re-read. `None` when no lineage was
     /// recorded, or when the commit is the genesis (no parent).
     pub parent_commit_id: Option<String>,
+    /// The new visible per-table state, folded in-memory from the pre-publish
+    /// state ∪ the committed rows (RFC-013 PR2 #1b). Returned so the caller skips
+    /// the O(fragments) post-publish `read_manifest_state` re-scan. Byte-identical
+    /// to that re-scan: built through the same `assemble_manifest_state` reduction.
+    pub known_state: ManifestState,
 }
 
 #[async_trait]
@@ -145,14 +151,13 @@ impl GraphNamespacePublisher {
         crate::failpoints::maybe_fail_retryable_contention(
             crate::failpoints::names::PUBLISH_LOAD_STATE_RETRYABLE_CONTENTION,
         )?;
-        let mut dataset = self.dataset().await?;
-        // Run pending internal-schema migrations exactly once per publish on
-        // the open-for-write path; idempotent when the on-disk stamp already
-        // matches this binary. Pass this publisher's branch so the v3→v4 lineage
-        // backfill reads `_graph_commits.lance` at the SAME branch it is
-        // publishing to (each branch backfills on its first write). See
+        let dataset = self.dataset().await?;
+        // Refuse a graph this binary cannot serve before publishing. Fresh and
+        // already-current graphs pass; a sub-CURRENT stamp (an older storage
+        // format) is refused with the rebuild-via-export/import message. There is
+        // no in-place migration — storage-format changes are a cutover. See
         // `db/manifest/migrations.rs`.
-        migrate_internal_schema(&mut dataset, &self.root_uri, self.branch.as_deref()).await?;
+        refuse_if_stamp_unsupported(read_stamp(&dataset))?;
         // ONE `__manifest` scan for everything the publish needs: table
         // locations, version entries, tombstones, AND the `graph_commit` lineage
         // rows for parent resolution (RFC-013 P2). The lineage extraction rides
@@ -451,6 +456,101 @@ impl GraphNamespacePublisher {
         latest
     }
 
+    /// Build the inputs for [`assemble_manifest_state`] from the pre-publish state
+    /// unioned with the pending rows about to be committed — the in-memory basis
+    /// for the post-publish `known_state` fold (RFC-013 PR2 #1b), so the caller
+    /// skips the O(fragments) re-scan. Mirrors `read_manifest_scan`'s row handling
+    /// exactly so the result is byte-identical: `table_path` resolves through
+    /// `table_locations` = `registered_tables` UNION the pending `OBJECT_TYPE_TABLE`
+    /// rows (a freshly-registered table is not yet in `registered_tables`);
+    /// `version_metadata` parses the SAME JSON string a re-scan would read. Pending
+    /// `OBJECT_TYPE_TABLE` rows feed only `table_locations`; lineage rows
+    /// (`graph_commit`/`graph_head`) are not manifest-state entries.
+    fn fold_inputs(
+        existing_versions: &HashMap<(String, u64), SubTableEntry>,
+        existing_tombstones: &HashMap<(String, u64), ()>,
+        rows: &[PendingVersionRow],
+        registered_tables: &HashMap<String, String>,
+    ) -> Result<(Vec<SubTableEntry>, Vec<(String, u64)>)> {
+        let mut table_locations: HashMap<String, String> = registered_tables.clone();
+        for row in rows {
+            if row.object_type == OBJECT_TYPE_TABLE {
+                if let Some(location) = &row.location {
+                    table_locations.insert(row.table_key.clone(), location.clone());
+                }
+            }
+        }
+
+        // Key version entries by `(table_key, table_version)` so a pending row at
+        // the SAME version REPLACES the pre-publish entry — modelling merge-insert
+        // `UpdateAll` on the shared, deterministic `version_object_id(table_key,
+        // version)`. Load-bearing for the owner-branch handoff
+        // (`is_owner_branch_handoff`): a handoff updates a `table_version` row in
+        // place at the same version with a new `table_branch`, so `__manifest` ends
+        // with ONE row carrying the new branch and a re-scan reflects it; appending
+        // the pending row instead (and letting `assemble_manifest_state` keep the
+        // first equal-version entry) would leave `known_state` on the stale fork.
+        let mut version_map: HashMap<(String, u64), SubTableEntry> = existing_versions.clone();
+        let mut tombstones: Vec<(String, u64)> = existing_tombstones
+            .keys()
+            .map(|(key, version)| (key.clone(), *version))
+            .collect();
+
+        for row in rows {
+            match row.object_type.as_str() {
+                OBJECT_TYPE_TABLE_VERSION => {
+                    let table_version = row.table_version.ok_or_else(|| {
+                        OmniError::manifest_internal(format!(
+                            "post-publish fold: table_version row missing version for {}",
+                            row.table_key
+                        ))
+                    })?;
+                    let table_path =
+                        table_locations.get(&row.table_key).cloned().ok_or_else(|| {
+                            OmniError::manifest_internal(format!(
+                                "post-publish fold: missing table row for {}",
+                                row.table_key
+                            ))
+                        })?;
+                    let metadata_json = row.metadata.as_deref().ok_or_else(|| {
+                        OmniError::manifest_internal(format!(
+                            "post-publish fold: table_version row missing metadata for {}",
+                            row.table_key
+                        ))
+                    })?;
+                    version_map.insert(
+                        (row.table_key.clone(), table_version),
+                        SubTableEntry {
+                            table_key: row.table_key.clone(),
+                            table_path,
+                            table_version,
+                            table_branch: row.table_branch.clone(),
+                            row_count: row.row_count.ok_or_else(|| {
+                                OmniError::manifest_internal(format!(
+                                    "post-publish fold: table_version row missing row_count for {}",
+                                    row.table_key
+                                ))
+                            })?,
+                            version_metadata: TableVersionMetadata::from_json_str(metadata_json)?,
+                        },
+                    );
+                }
+                OBJECT_TYPE_TABLE_TOMBSTONE => {
+                    let tombstone_version = row.table_version.ok_or_else(|| {
+                        OmniError::manifest_internal(format!(
+                            "post-publish fold: tombstone row missing version for {}",
+                            row.table_key
+                        ))
+                    })?;
+                    tombstones.push((row.table_key.clone(), tombstone_version));
+                }
+                _ => {}
+            }
+        }
+
+        Ok((version_map.into_values().collect(), tombstones))
+    }
+
     /// Compare each caller-supplied expectation against the manifest's current
     /// latest visible version per table. The first mismatch is returned as a
     /// typed `ExpectedVersionMismatch` (`actual = 0` if the table isn't in the
@@ -578,20 +678,21 @@ impl ManifestBatchPublisher for GraphNamespacePublisher {
         lineage: Option<&LineageIntent>,
     ) -> Result<PublishOutcome> {
         if changes.is_empty() && expected_table_versions.is_empty() && lineage.is_none() {
+            // Defensive no-op (never reached from `commit_changes_with_lineage`,
+            // which short-circuits the all-empty case): state is unchanged, so a
+            // re-scan here is acceptable.
+            let dataset = self.dataset().await?;
+            let known_state = read_manifest_state(&dataset).await?;
             return Ok(PublishOutcome {
-                dataset: self.dataset().await?,
+                dataset,
                 parent_commit_id: None,
+                known_state,
             });
         }
 
         for attempt in 0..=PUBLISHER_RETRY_BUDGET {
-            // `load_publish_state` runs the v3→v4 migration (`migrate_internal_schema`)
-            // on its first scan. The migration's bounded merge/stamp retries surface a
-            // retryable `RowLevelCasContention` on exhaustion EXPECTING this outer loop
-            // to re-run them — a re-run re-reads the manifest, by which point a
-            // concurrent winner has usually completed the migration (next scan is a
-            // no-op). Route a retryable load error through the SAME retry path as a
-            // retryable `merge_rows` conflict below, so that typed contention actually
+            // Route a retryable `load_publish_state` error through the SAME retry
+            // path as a retryable `merge_rows` conflict below, so typed contention
             // composes with the publisher retry instead of aborting the publish.
             let loaded = match self.load_publish_state().await {
                 Ok(loaded) => loaded,
@@ -645,18 +746,39 @@ impl ManifestBatchPublisher for GraphNamespacePublisher {
 
             if rows.is_empty() {
                 // Expected-version-only publish with no changes and no lineage:
-                // the precondition held, nothing to write.
+                // the precondition held, nothing to write. Fold the unchanged state
+                // from the loaded maps — no re-scan (RFC-013 PR2 #1b).
+                let known_state = assemble_manifest_state(
+                    dataset.version().version,
+                    existing_versions.values().cloned().collect(),
+                    existing_tombstones
+                        .keys()
+                        .map(|(key, version)| (key.clone(), *version)),
+                );
                 return Ok(PublishOutcome {
                     dataset,
                     parent_commit_id,
+                    known_state,
                 });
             }
 
+            // Build the post-publish fold inputs from the pre-publish state ∪ the
+            // rows we are about to commit, BEFORE `rows` is moved into merge_rows
+            // (RFC-013 PR2 #1b). Recomputed per attempt from freshly-loaded state.
+            let (fold_entries, fold_tombstones) =
+                Self::fold_inputs(&existing_versions, &existing_tombstones, &rows, &known_tables)?;
+
             match self.merge_rows(dataset, rows).await {
                 Ok(new_dataset) => {
+                    let known_state = assemble_manifest_state(
+                        new_dataset.version().version,
+                        fold_entries,
+                        fold_tombstones,
+                    );
                     return Ok(PublishOutcome {
                         dataset: new_dataset,
                         parent_commit_id,
+                        known_state,
                     });
                 }
                 Err(err) => {
@@ -682,11 +804,6 @@ impl ManifestBatchPublisher for GraphNamespacePublisher {
 /// contention; if the caller's `expected_table_versions` still holds against
 /// the new manifest state, we re-attempt. Other conflict variants (notably
 /// `ExpectedVersionMismatch`) propagate so the caller learns immediately.
-///
-/// Shared (`pub(crate)`) with the v3→v4 lineage backfill's re-open retry loop
-/// (`migrations::migrate_v3_to_v4`), so the migration's retry decision matches the
-/// publisher's by construction — both retry exactly `RowLevelCasContention` and
-/// propagate everything else.
 pub(crate) fn is_retryable_publish_conflict(err: &OmniError) -> bool {
     matches!(
         err,

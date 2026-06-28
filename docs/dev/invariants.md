@@ -72,10 +72,14 @@ converge the physical state.
    table versions.
 
 4. **Mutations publish at one boundary.** A `mutate_as` or `load` operation
-   accumulates constructive writes, commits each touched table at the end, then
-   publishes one manifest update. Do not commit per statement. Delete-only
-   queries are the documented inline residual; the parse-time D2 rule prevents
-   mixing deletes with insert/update until Lance exposes two-phase delete.
+   accumulates writes — inserts/updates as pending batches, deletes as
+   predicates — stages each touched table at the end (deletes via
+   `stage_delete`, no inline HEAD advance), then publishes one manifest update.
+   Do not commit per statement. The parse-time D2 rule is a deliberate
+   boundary: one mutation query is constructive (insert/update) or destructive
+   (delete), not both — so read-your-writes within a query stays unambiguous
+   and each table commits at most one version. Compose mixed operations via
+   separate mutations, or a branch for single-commit atomicity.
    Read [writes.md](writes.md) and [execution.md](execution.md).
 
 5. **Recovery is part of the commit protocol.** Writers that can advance Lance
@@ -150,11 +154,11 @@ converge the physical state.
 |---|---|---|
 | Multi-table commit | Manifest CAS plus recovery sidecars; not a single Lance primitive | [writes.md](writes.md), [architecture.md](architecture.md) |
 | Constructive mutations | In-memory `MutationStaging`, one end-of-query table commit per touched table, then one manifest publish | [writes.md](writes.md), [execution.md](execution.md) |
-| Deletes | Inline-commit residual; delete-only queries allowed, mixed insert/update/delete rejected by D2 | [query-language.md](../user/queries/index.md), [writes.md](writes.md) |
-| Branch delete | Manifest is the single authority, flipped atomically first; per-table forks + commit-graph branch are derived state, reclaimed best-effort (`force_delete_branch`) with the `cleanup` reconciler as the guaranteed backstop. Reusing a name whose reclaim failed before `cleanup` surfaces an actionable error | [branches-commits.md](../user/branching/index.md), [maintenance.md](../user/operations/maintenance.md) |
+| Deletes | Staged like inserts/updates (`stage_delete` via Lance 7.0 `DeleteBuilder::execute_uncommitted`, MR-A) — no inline HEAD advance; mixed insert/update/delete in one query rejected by D2 as a deliberate boundary (constructive XOR destructive per query; compose via separate mutations or a branch) | [query-language.md](../user/queries/index.md), [writes.md](writes.md) |
+| Branch delete | Manifest is the single authority, flipped atomically first; per-table forks are derived state, reclaimed best-effort (`force_delete_branch`) with the `cleanup` reconciler as the guaranteed backstop. Reusing a name whose reclaim failed before `cleanup` surfaces an actionable error | [branches-commits.md](../user/branching/index.md), [maintenance.md](../user/operations/maintenance.md) |
 | Schema validation | Type checks, required fields, defaults, edge endpoint checks, and edge cardinality are enforced on write paths | [schema-language.md](../user/schema/index.md), [execution.md](execution.md) |
 | Unique constraints | Intra-batch and write-path checks exist; intake and branch-merge derive the composite key through one shared function (`loader::composite_unique_key`, a separator-free `Vec<String>` tuple) and fail loudly on an un-keyable column type rather than silently exempting it; full cross-version uniqueness against already-committed rows is still a gap | [schema-language.md](../user/schema/index.md) |
-| Storage trait | `TableStorage` (via `db.storage()`) is staged-only; the inline-commit residuals (`delete_where`, `create_vector_index`) are split onto a separate sealed `InlineCommitResidual` trait reached via `db.storage_inline_residual()` (MR-854), so §1 holds by construction; capability/stat surfaces are roadmap | [writes.md](writes.md), [architecture.md](architecture.md) |
+| Storage trait | `TableStorage` (via `db.storage()`) is staged-only; the sole inline-commit residual (`create_vector_index`) is split onto a separate sealed `InlineCommitResidual` trait reached via `db.storage_inline_residual()` (MR-854), so §1 holds by construction; capability/stat surfaces are roadmap | [writes.md](writes.md), [architecture.md](architecture.md) |
 | Index lifecycle | `@index`/`@key` declares *intent*; the physical index is derived state and never fails a logical op. `schema apply` builds no indexes (records intent only; index-only changes touch no table data). `load`/`mutate` build inline through one chokepoint (`build_indices_on_dataset_for_catalog`, type-dispatched by `node_prop_index_kind`: enum + orderable scalar → BTREE, free-text String → FTS, Vector → vector) that fault-isolates an untrainable Vector column into a *pending* index instead of aborting. `optimize`/`ensure_indices` is the reconciler: it creates declared-but-missing indexes and folds appended/rewritten fragments into existing ones (`optimize_indices`), reporting still-pending columns. Explicit maintenance call, not yet a background loop | [indexes.md](../user/search/indexes.md), [maintenance.md](../user/operations/maintenance.md) |
 | Traversal IDs | Runtime still builds `TypeIndex`; Lance stable row-id based graph IDs are roadmap | [architecture.md](architecture.md), [query-language.md](../user/queries/index.md) |
 | Auth | Bearer token hashing and server-side actor resolution are implemented at the HTTP boundary | [server.md](../user/operations/server.md), [policy.md](../user/operations/policy.md) |
@@ -181,19 +185,19 @@ them explicit.
   `InlineCommitResidual` trait reached via `db.storage_inline_residual()`, so a
   new writer cannot couple a write with a HEAD advance through the default
   surface. The dead legacy methods (`append_batch` on the trait,
-  `merge_insert_batch{,es}`, `create_{btree,inverted}_index`) were removed. The
-  remaining residuals are `delete_where` and `create_vector_index`. The Lance
-  6.0.1 → 7.0.0 bump landed, so the staged two-phase delete API
-  (`DeleteBuilder::execute_uncommitted`, Lance #6658) is now available and MR-A
-  is unblocked — but the migration itself is still pending, so `delete_where`
-  stays inline for now. `create_vector_index` remains gated on Lance #6666
-  (still open). See [lance.md](lance.md) and [writes.md](writes.md). New write
-  paths should use the staged shape unless a documented Lance blocker applies.
-- **Deletes and vector indexes:** `delete_where` and vector index creation still
-  advance Lance HEAD inline. The public delete two-phase API now exists (Lance
-  #6658 shipped in 7.0.0), so the delete residual is unblocked pending the MR-A
-  migration; vector index creation is still blocked (Lance #6666 open). Keep D2
-  and recovery coverage in place until those residuals are removed.
+  `merge_insert_batch{,es}`, `create_{btree,inverted}_index`) were removed. MR-A
+  migrated `delete` onto the staged surface (`TableStorage::stage_delete` via
+  Lance 7.0 `DeleteBuilder::execute_uncommitted`, #6658) and retired
+  `InlineCommitResidual::delete_where`, so the sole remaining residual is
+  `create_vector_index`, gated on Lance #6666 (still open). See [lance.md](lance.md)
+  and [writes.md](writes.md). New write paths should use the staged shape unless a
+  documented Lance blocker applies.
+- **Vector indexes:** `create_vector_index` still advances Lance HEAD inline —
+  segment-commit needs `build_index_metadata_from_segments`, `pub(crate)` in Lance
+  7.0.0 (#6666 open). Keep recovery coverage in place until that residual is
+  removed. (`delete` is no longer a residual — staged in MR-A. D2 is not a gap:
+  it is a deliberate constructive-XOR-destructive boundary, documented in
+  Invariant 4 and the truth matrix.)
 - **Blob-column compaction:** Lance `compact_files` mis-decodes blob-v2 columns
   under its forced `BlobHandling::AllBinary` read ("more fields in the schema
   than provided column indices"), so `optimize` skips any table with a `Blob`
@@ -253,43 +257,46 @@ them explicit.
   acknowledged-before-visible bug this branch fixed. Close it (local CAS
   primitive, or a trait-level lock requirement) before admitting any
   lock-free `if_match` caller.
+- **Internal-schema stamp is validated at the graph (main) level only:**
+  `Omnigraph::open` reads the `omnigraph:internal_schema_version` stamp on
+  **main** and refuses an out-of-range graph (newer than CURRENT → "upgrade
+  omnigraph"; below MIN_SUPPORTED → "rebuild via export/import"). Branch reads
+  then trust that one check. This is correct by the storage-format contract: the
+  stamp is a graph-wide property (the upgrade path is a whole-graph
+  export/import), so with one binary version every branch is always CURRENT —
+  init stamps main, `create_branch` forks the stamp, the publisher writes rows
+  without re-stamping. A branch stamped out of range while main stays in range is
+  only reachable with concurrent **multi-version writers**, an unsupported
+  topology already in one-winner-CAS territory: writes to such a branch are
+  refused per-branch by the publisher (it reads its target's stamp), and a newer
+  binary advancing main is refused at open. The residual hole is read-only —
+  reading or merging a branch a newer binary advanced while main stayed old would
+  decode it with this binary's logic instead of refusing. Close it (a per-branch
+  read gate folded into the branch-manifest open the read already does, zero
+  extra I/O) only when multi-version write topologies are promoted to supported;
+  a separate stamp round-trip per branch read is the wrong shape (it regresses the
+  warm-read cost budget to defend an unsupported state).
 - **Manifest→commit-graph publish atomicity — CLOSED (RFC-013 Phase 7):** graph
-  lineage now lives ONLY in `__manifest`, as `graph_commit` + `graph_head:<branch>`
+  lineage lives ONLY in `__manifest`, as `graph_commit` + `graph_head:<branch>`
   rows written in the SAME `MergeInsertBuilder` commit as the table-version rows
   (`commit_changes_with_lineage` → `GraphNamespacePublisher::publish` with a
   `LineageIntent`). There is no second write to fail between — a graph commit and
   its lineage land at one manifest version atomically, so a crash after the publish
-  leaves no gap. The commit-graph cache is a derived projection of those manifest
-  rows; nothing writes `_graph_commits.lance` (it persists only to carry branch
-  refs). The prior two-write gap (manifest at N with no `_graph_commits` row for N)
-  is gone by construction. A graph created before Phase 7 (internal schema v3)
-  carries its lineage only in `_graph_commits.lance`; the `migrate_v3_to_v4`
-  internal-schema step (`db/manifest/migrations.rs`) backfills it into `__manifest`
-  per-branch on the first read-write open (idempotent, crash-safe, data-preserving),
-  and a read-only open of an un-migrated v3 graph sources the DAG from
-  `_graph_commits.lance` via a stamp-gated transitional fallback so reads stay
-  correct until the first write migrates it. An old binary refuses a v4-stamped
-  graph (read-write and read-only) with the standard upgrade error. The migration
-  is **loud on failure and concurrent-runner idempotent**: the legacy-open read
-  (`read_legacy_commit_cache`) treats only a genuine not-found as "no legacy data"
-  and propagates any other open error (so a transient/corrupt open can never stamp
-  v4 over an empty backfill — orphaning lineage permanently), and the backfill
-  converges all-or-nothing when two runners open the same legacy graph at once — a
-  bounded re-open retry on the `graph_head:<branch>` row-level CAS plus an
-  idempotent terminal stamp bump (both runners write the same value, so a concurrent
-  `UpdateConfig`/`IncompatibleTransaction` loss re-opens and no-ops if the stamp
-  already landed). The branch read path (`load_commit_cache_for_branch`) also
-  refuses an out-of-range branch stamp (`> CURRENT` or `< MIN_SUPPORTED`;
-  defense-in-depth; not a live hole because migrations run main-first, so main
-  refuses first). The migration chain is **floor-bounded**:
-  `MIN_SUPPORTED_INTERNAL_SCHEMA_VERSION` (migrations.rs; 1 today, a pure no-op) is
-  the oldest stamp this binary opens, enforced symmetrically with the ceiling by the
-  single `refuse_if_stamp_unsupported` guard at all three stamp-read sites
-  (write-path migrate, read-only open, branch lineage-read). Raising MIN sheds the
-  now-dead `migrate_vN_…` arms and (at MIN ≥ 4) the `commit_graph_legacy_v3` legacy
-  readers; a compile-time tripwire (`LOWEST_REGISTERED_MIGRATION_SOURCE`) fails the
-  build if the floor and the lowest registered arm drift. Retirement runbook lives on
-  the `MIN_SUPPORTED_INTERNAL_SCHEMA_VERSION` doc-comment.
+  leaves no gap. The in-memory commit graph is a pure projection of those rows. The
+  `_graph_commits.lance` / `_graph_commit_actors.lance` tables are **retired**: a
+  fresh graph creates neither, branch authority is `__manifest` only, and nothing
+  reads or writes them. The prior two-write gap (manifest at N with no
+  `_graph_commits` row for N) is gone by construction.
+- **Storage is strict-single-version (the strand model):** this binary reads
+  exactly ONE internal-schema version (`MIN_SUPPORTED == CURRENT`), so there is no
+  in-place migration. A graph stamped below CURRENT is refused on open with a
+  rebuild-via-export/import message (`refuse_if_stamp_unsupported`), not silently
+  upgraded; a graph stamped above CURRENT is refused with an "upgrade omnigraph"
+  message. The `migrate_v*` dispatcher, the `_graph_commits.lance` legacy-read
+  fallback, and the migration floor-bounding machinery were all deleted with the
+  retirement — the stamp + `refuse_if_stamp_unsupported` floor is the only seam a
+  future migration would re-introduce. See `docs/dev/versioning.md` (the
+  compatibility policy) and `docs/user/operations/upgrade.md` (the rebuild recipe).
 - **Planner capability/stat surfaces:** cost-aware planning, complete
   capability advertisement, and explain-with-cost are roadmap. Do not describe
   them as implemented.
@@ -306,7 +313,8 @@ them explicit.
   widening the gap.
 - **Read-path re-derivation (largely closed by the query-latency work):**
   snapshot resolution used to re-open a fresh coordinator per read (a full
-  `__manifest` re-scan plus two commit-graph scans), open each table through the
+  `__manifest` re-scan plus the then-separate commit-graph-table scans, since
+  retired), open each table through the
   namespace (two more `__manifest` scans per table), validate the schema twice,
   and share no Lance `Session`. That was an O(commits) cost that never warmed up.
   Fix 1 (warm coordinator reuse behind a `latest_version_id` probe), Fix 2 (open
@@ -320,10 +328,11 @@ them explicit.
   the manifest e_tag is carried into synthetic snapshot ids when available, and
   a detected same-branch manifest refresh clears read caches as the fallback for
   e_tag-less table locations/topology. Remaining: `optimize` now compacts the
-  internal metadata tables (`__manifest`, `_graph_commits`) too (RFC-013 step 2),
-  so a *periodically-optimized* graph keeps the probe/refresh/per-write scan flat
-  in history; but they are not yet brought into `cleanup` (version GC), so the
-  `_versions/` chain still grows until an explicit cleanup (the cleanup half is
+  internal metadata table (`__manifest`, which carries the lineage rows) too
+  (RFC-013 step 2), so a *periodically-optimized* graph keeps the
+  probe/refresh/per-write scan flat in history; but it is not yet brought into
+  `cleanup` (version GC), so the `_versions/` chain still grows until an explicit
+  cleanup (the cleanup half is
   deferred — it needs the Q8 cleanup-resurrection watermark first). The commit
   graph IS now reconcilable from the manifest (RFC-013 Phase 7 — it is a pure
   projection of the `graph_commit`/`graph_head` rows); the traversal id-map is

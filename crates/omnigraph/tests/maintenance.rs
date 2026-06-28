@@ -94,25 +94,24 @@ async fn optimize_on_empty_graph_returns_stats_per_table_with_no_changes() {
 
     let stats = db.optimize().await.unwrap();
 
-    // Schema declares 2 nodes + 2 edges = 4 data tables, plus the 3 internal
-    // system tables (`__manifest`, `_graph_commits`, `_graph_commit_actors`) optimize
-    // also compacts (RFC-013 step 2) = 7. Compaction should run on each but find
-    // nothing to merge. The genesis graph commit rides the SINGLE init
+    // Schema declares 2 nodes + 2 edges = 4 data tables, plus the one internal
+    // system table optimize compacts (`__manifest`, RFC-013 step 2) = 5. Graph
+    // lineage lives in `__manifest` (Phase B retired the commit-graph datasets),
+    // so there is no separate lineage table to compact. Compaction runs on each
+    // but finds nothing to merge: the genesis graph commit rides the SINGLE init
     // `__manifest` write (RFC-013 Phase 7), so a fresh graph has one fragment per
     // table — nothing to compact anywhere.
-    assert_eq!(stats.len(), 7);
+    assert_eq!(stats.len(), 5);
     for s in &stats {
         assert_eq!(s.fragments_removed, 0, "{} should not remove", s.table_key);
         assert_eq!(s.fragments_added, 0, "{} should not add", s.table_key);
     }
-    // The internal tables are present and reported as no-ops on an empty graph.
-    for key in ["__manifest", "_graph_commits", "_graph_commit_actors"] {
-        let s = stats
-            .iter()
-            .find(|s| s.table_key == key)
-            .unwrap_or_else(|| panic!("optimize stats missing internal table {key}"));
-        assert!(!s.committed, "{key} should be a no-op on an empty graph");
-    }
+    // `__manifest` is present and reported as a no-op on an empty graph.
+    let s = stats
+        .iter()
+        .find(|s| s.table_key == "__manifest")
+        .expect("optimize stats missing internal table __manifest");
+    assert!(!s.committed, "__manifest should be a no-op on an empty graph");
 }
 
 #[tokio::test]
@@ -145,14 +144,14 @@ async fn optimize_after_load_then_again_is_idempotent() {
     }
 }
 
-/// RFC-013 step 2 + Phase 7: `optimize` compacts `__manifest`, which now
-/// accumulates one fragment per commit for BOTH the table-version rows and the
-/// folded-in graph-lineage rows (`graph_commit` + `graph_head`). The
-/// commit-graph datasets (`_graph_commits`, `_graph_commit_actors`) no longer
-/// take a per-commit row (lineage lives in `__manifest`), so they stay flat —
-/// nothing to compact. After compaction `__manifest` sheds fragments, writes no
-/// recovery sidecar (a single atomic Lance commit — no HEAD-before-publish gap),
-/// and the graph stays coherent for subsequent reads + strict writes.
+/// RFC-013 step 2 + Phase 7 + Phase B: `optimize` compacts `__manifest`, which
+/// now accumulates one fragment per commit for BOTH the table-version rows and the
+/// folded-in graph-lineage rows (`graph_commit` + `graph_head`). Graph lineage
+/// lives entirely in `__manifest` (Phase B retired the commit-graph datasets), so
+/// `__manifest` is the only internal table optimize compacts. After compaction
+/// `__manifest` sheds fragments, writes no recovery sidecar (a single atomic Lance
+/// commit — no HEAD-before-publish gap), and the graph stays coherent for
+/// subsequent reads + strict writes.
 #[tokio::test]
 async fn optimize_compacts_internal_tables() {
     let dir = tempfile::tempdir().unwrap();
@@ -188,18 +187,14 @@ async fn optimize_compacts_internal_tables() {
         manifest_stats.fragments_removed
     );
 
-    // The commit-graph datasets take no per-commit row anymore (RFC-013 Phase 7
-    // folds lineage into `__manifest`), so they stay at one fragment — no-ops.
-    for key in ["_graph_commits", "_graph_commit_actors"] {
-        let s = stats
+    // `__manifest` is the only internal table optimize touches (Phase B retired
+    // the commit-graph datasets), so no `_graph_commits*` stat is emitted.
+    assert!(
+        !stats
             .iter()
-            .find(|s| s.table_key == key)
-            .unwrap_or_else(|| panic!("optimize stats missing internal table {key}"));
-        assert!(
-            !s.committed,
-            "{key} carries no per-commit rows after Phase 7 — nothing to compact"
-        );
-    }
+            .any(|s| s.table_key == "_graph_commits" || s.table_key == "_graph_commit_actors"),
+        "no commit-graph datasets exist after Phase B — optimize must not report them"
+    );
 
     // Internal compaction leaks no recovery sidecar.
     let recovery_dir = dir.path().join("__recovery");
@@ -225,38 +220,6 @@ async fn optimize_compacts_internal_tables() {
     )
     .await
     .unwrap();
-}
-
-/// `optimize` must not fail on a graph that has no `_graph_commits.lance` — a valid
-/// state the coordinator opens as `commit_graph = None` (graphs predating the commit
-/// graph). Without the existence guard, `Dataset::open` on the absent table errors
-/// and fails the whole optimize. Regression for the missing-existence-guard.
-///
-/// Uses an EMPTY graph deliberately: a graph with data would publish during
-/// optimize, and a publish records a graph commit that recreates `_graph_commits`
-/// before the guard runs — masking the bug. With no data, nothing recreates it, so
-/// the table stays absent through the guard.
-#[tokio::test]
-async fn optimize_tolerates_absent_graph_commits_table() {
-    let dir = tempfile::tempdir().unwrap();
-    let uri = dir.path().to_str().unwrap();
-    Omnigraph::init(uri, TEST_SCHEMA).await.unwrap();
-
-    // Simulate a graph with no commit-graph dataset.
-    std::fs::remove_dir_all(dir.path().join("_graph_commits.lance")).unwrap();
-
-    // Coordinator tolerates the absence; optimize must succeed (the guard skips the
-    // absent table rather than letting `Dataset::open` error) and omit its stat.
-    let db = Omnigraph::open(uri).await.unwrap();
-    let stats = db.optimize().await.unwrap();
-    assert!(
-        stats.iter().any(|s| s.table_key == "__manifest"),
-        "__manifest must still be compacted"
-    );
-    assert!(
-        !stats.iter().any(|s| s.table_key == "_graph_commits"),
-        "absent _graph_commits must be skipped, not opened (would error)"
-    );
 }
 
 /// `optimize` must stay NON-DESTRUCTIVE on a pre-`auto_cleanup`-fix upgraded graph:
@@ -869,7 +832,7 @@ async fn delete_only_mutation_refuses_uncovered_drift_before_inline_commit() {
         &mixed_params(&[("$name", "Alice")], &[]),
     )
     .await
-    .expect_err("strict delete must reject uncovered drift before delete_where");
+    .expect_err("strict delete must reject uncovered drift before staging the delete");
     assert!(
         err.to_string().contains("expected"),
         "delete should fail as a strict stale-version write; got: {err}"
@@ -879,7 +842,7 @@ async fn delete_only_mutation_refuses_uncovered_drift_before_inline_commit() {
     assert_eq!(manifest_after, manifest_before);
     assert_eq!(
         head_after, head_before,
-        "delete_where must not run after the strict drift guard fails"
+        "the staged delete must not commit after the strict drift guard fails"
     );
     assert_eq!(
         count_rows(&db, "node:Person").await,

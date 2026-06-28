@@ -24,25 +24,29 @@
 mod helpers;
 
 use helpers::cost::{
-    IoCounts, assert_flat, assert_grows, local_graph, measure, measure_insert, measure_insert_as,
-    measure_with_staged,
+    IoCounts, assert_flat, assert_grows, cost_harness, last_manifest_reads, local_graph, measure,
+    measure_insert, measure_insert_as, measure_with_staged,
 };
 use helpers::{MUTATION_QUERIES, commit_many, commit_many_as, init_and_load, mixed_params};
 
 // ── (A) The internal-table LOCK — the acceptance test for step 2 (compaction) ──
 //
-// `__manifest` / `_graph_commits` / `_graph_commit_actors` scans on a write must be
-// O(1) in commit-history depth **on a compacted graph**. Without internal-table
-// compaction these scans are O(fragments) and grow forever; step 2 brings all three
-// internal tables into `db.optimize()`, so after compaction the per-write scan is
-// flat. The test runs the **authenticated (actorful) write path** — every commit
-// carries an actor, so it grows `_graph_commit_actors.lance` too (the production
-// server/CLI path); the commit-graph IO wrapper covers both that and `_graph_commits`,
-// so `commit_graph_reads` includes the actor-table scan. It compacts at each depth
-// checkpoint before measuring — pinning the production invariant "a periodically-
-// compacted graph's write cost does not grow with version history."
+// The `__manifest` scan on a write must be O(1) in commit-history depth **on a
+// compacted graph**. Graph lineage lives in `__manifest` (RFC-013 Phase 7 — the
+// `_graph_commits`/`_graph_commit_actors` tables are retired), so the manifest scan
+// also covers the lineage and actor rows the authenticated write path appends.
+// Without internal-table compaction these scans are O(fragments) and grow forever;
+// step 2 brings the internal tables into `db.optimize()`, so after compaction the
+// per-write scan is flat. The test runs the **authenticated (actorful) write path**
+// — every commit carries an actor — and compacts at each depth checkpoint before
+// measuring, pinning the production invariant "a periodically-compacted graph's
+// write cost does not grow with version history."
 #[tokio::test]
 async fn internal_table_scans_are_flat_in_history() {
+    // `cost_harness` installs the ground-truth __manifest tracker for the whole body,
+    // so `manifest_reads` includes the warm-coordinator probe (a constant per write
+    // that cancels in this depth-difference assertion).
+    cost_harness(async {
     const ACTOR: &str = "act-cost-gate";
     let dir = tempfile::tempdir().unwrap();
     let mut db = local_graph(&dir).await;
@@ -60,16 +64,76 @@ async fn internal_table_scans_are_flat_in_history() {
         let io = measure_insert_as(&mut db, &format!("lock_{d}"), ACTOR).await;
         current += 1; // the measured write advanced depth by one
         eprintln!(
-            "depth~{d}: data={} __manifest={} _graph_commits+actors={}",
-            io.data_reads, io.manifest_reads, io.commit_graph_reads
+            "depth~{d}: data={} __manifest={}",
+            io.data_reads, io.manifest_reads
         );
         curve.push((d, io));
     }
 
+    // Lineage + actor rows live in `__manifest` now, so this single flat-assertion
+    // gates the whole internal-table scan (including the authenticated path's actor
+    // rows) across history.
     assert_flat(&curve, |c| c.manifest_reads, 4, "__manifest scan");
-    // commit_graph_reads covers BOTH _graph_commits and _graph_commit_actors (shared
-    // wrapper), so this also gates the actor table on the authenticated path.
-    assert_flat(&curve, |c| c.commit_graph_reads, 4, "_graph_commits + _graph_commit_actors scan");
+    })
+    .await;
+}
+
+/// **Served-regime twin of `internal_table_scans_are_flat_in_history` — the gate
+/// that was missing.** The flat gate above calls `db.optimize()` before EVERY
+/// measured write, so it only ever proves the *compacted* invariant and stays green
+/// even if a served graph's per-write `__manifest` scan amplifies without bound. A
+/// real served graph does NOT optimize between writes: every publish appends a
+/// fragment to `__manifest`, and the publish-path scan (`read_manifest_scan`, a bare
+/// `dataset.scan()` with no filter/projection) reads ALL of them, so the per-write
+/// `__manifest` read count is O(fragments-since-compaction) and climbs with history.
+/// That is the live amplification behind the reported single-row write latency
+/// (~16s on 0.7.2; still growing post-#299) — physical fragment read cost, not
+/// logical row count (output rows stay ~flat while requests grow).
+///
+/// **This is a TRIPWIRE, not the final gate.** It asserts the scan *grows*, i.e. it
+/// pins the CURRENT served-regime cost (green today) — exactly the `assert_grows`
+/// idiom its sibling `data_table_reads_split_into_flat_opener_and_growing_scan` uses,
+/// and the "turns red when the fix lands" shape of the Lance surface guards. It flips
+/// RED the moment the amplification is fixed (write-path probe-gated warm reuse, and
+/// bringing `__manifest` into `cleanup` version-GC so F stays bounded in history).
+/// **When it goes red, that is the signal to invert it to**
+/// `assert_flat(&curve, |c| c.manifest_reads, <slack>, "__manifest scan (served)")` —
+/// promoting it to the permanent served-regime gate. Only `manifest_reads` is
+/// asserted: lineage lives in `__manifest` (RFC-013 Phase 7) and the per-write
+/// commit-graph update is in-memory, so there is no separate commit-graph scan.
+#[tokio::test]
+async fn internal_table_scans_grow_without_compaction() {
+    cost_harness(async {
+    const ACTOR: &str = "act-cost-gate-served";
+    let dir = tempfile::tempdir().unwrap();
+    let mut db = local_graph(&dir).await;
+
+    let mut curve: Vec<(u64, IoCounts)> = Vec::new();
+    let mut current = 0u64;
+    for d in [10u64, 100] {
+        if d > current {
+            commit_many_as(&mut db, (d - current) as usize, ACTOR).await;
+            current = d;
+        }
+        // NO `db.optimize()` here — that omission is the whole point. The flat gate
+        // above compacts before measuring and so never exercises this served regime.
+        let io = measure_insert_as(&mut db, &format!("served_{d}"), ACTOR).await;
+        current += 1; // the measured write advanced depth by one
+        eprintln!(
+            "depth~{d} (uncompacted): data={} __manifest={}",
+            io.data_reads, io.manifest_reads
+        );
+        curve.push((d, io));
+    }
+
+    // Green TODAY (the bug): the per-write `__manifest` scan is O(fragments) and grows
+    // by far more than the flat gate's slack of 4 across a 10→100 depth sweep. The `20`
+    // floor mirrors the proven-safe `assert_grows` sibling (data-table scan) and sits
+    // comfortably below the real growth (~+3 `__manifest` reads/depth × ~90 depth × the
+    // 3–4 publish-path scans) while unambiguously distinguishing "grows" from "flat".
+    assert_grows(&curve, |c| c.manifest_reads, 20, "__manifest scan (uncompacted/served)");
+    })
+    .await;
 }
 
 // The data-table OPENER history-gate (opener flat across depth) lives in
@@ -142,23 +206,28 @@ async fn single_insert_data_write_is_bounded() {
 /// P2 fold (was ~44 / ~54 with the four separate scans).
 #[tokio::test]
 async fn write_op_count_ceiling_at_shallow_depth() {
+    cost_harness(async {
     let dir = tempfile::tempdir().unwrap();
     let mut db = local_graph(&dir).await;
     commit_many(&mut db, 5).await;
     let io = measure_insert(&mut db, "ceil").await;
     eprintln!(
-        "depth~5: data={} __manifest={} _graph_commits={} total_reads={}",
-        io.data_reads, io.manifest_reads, io.commit_graph_reads, io.total_reads()
+        "depth~5: data={} __manifest={} total_reads={}",
+        io.data_reads, io.manifest_reads, io.total_reads()
     );
-    // Sub-ceiling on `__manifest` reads specifically: the publish path does one
-    // scan, not four. ~26 measured at this depth; a re-added scan would push it
-    // well past this. (Deterministic on local FS.)
-    const MANIFEST_CEILING: u64 = 34;
+    // Sub-ceiling on ground-truth `__manifest` reads. ~18 measured at this depth =
+    // ~15 publish-path scans (one fold, not four — RFC-013 P2) + ~3 from the
+    // warm-coordinator freshness probe, which ground truth now counts (the
+    // `version_probes=1` call is 3 object-store RPCs). A re-added publish scan trips
+    // this; `last_manifest_reads()` dumps the read log (method + path) so a breach
+    // names the offending objects. (Deterministic on local FS.)
+    const MANIFEST_CEILING: u64 = 24;
     assert!(
         io.manifest_reads <= MANIFEST_CEILING,
         "per-write __manifest reads {} exceeded ceiling {MANIFEST_CEILING} — a publish-path \
-         scan was re-added (RFC-013 P2 folds them into one)",
+         scan was re-added (RFC-013 P2 folds them into one). Reads: {:#?}",
         io.manifest_reads,
+        last_manifest_reads(),
     );
     const CEILING: u64 = 80;
     assert!(
@@ -166,6 +235,8 @@ async fn write_op_count_ceiling_at_shallow_depth() {
         "per-write read ops {} exceeded ceiling {CEILING} — a new round-trip was added",
         io.total_reads()
     );
+    })
+    .await;
 }
 
 // ── (C) Fitness assert via the staged-write probes ──
@@ -270,4 +341,45 @@ async fn keyed_insert_opens_table_at_most_once() {
         "a keyed single-table write must open its data table at most once, got {}",
         io.data_open_count,
     );
+}
+
+// ── (E) Ground-truth __manifest counting (PR2.1) — the blind-spot guard ──
+
+/// The warm-coordinator freshness probe rides a long-lived handle, so a per-op
+/// (fresh) tracker installed at measure time CANNOT see its reads — that was the
+/// blind spot. `cost_harness` attaches the tracker BEFORE the coordinator opens, so
+/// the probe's reads ARE counted (`manifest_reads` is ground truth, not just fresh
+/// opens). Proven by measuring the same warm write both ways: ground truth strictly
+/// exceeds fresh-only, by the probe's object-store RPCs. Reverting the ground-truth
+/// wiring (so `manifest_reads` reverts to fresh-per-op) makes the two equal → RED.
+#[tokio::test]
+async fn manifest_reads_capture_warm_probe() {
+    // Fresh-only (no `cost_harness`): the warm coordinator handle was opened outside
+    // any meter, so the freshness probe's reads escape `manifest_reads`.
+    let fresh = {
+        let dir = tempfile::tempdir().unwrap();
+        let mut db = local_graph(&dir).await;
+        commit_many(&mut db, 3).await; // warm the coordinator
+        let io = measure_insert(&mut db, "fresh").await;
+        eprintln!("fresh-only warm write: __manifest={}", io.manifest_reads);
+        io.manifest_reads
+    };
+
+    // Ground truth (`cost_harness`): the same warm probe is now counted.
+    cost_harness(async move {
+        let dir = tempfile::tempdir().unwrap();
+        let mut db = local_graph(&dir).await;
+        commit_many(&mut db, 3).await;
+        let io = measure_insert(&mut db, "ground_truth").await;
+        eprintln!("ground-truth warm write: __manifest={}", io.manifest_reads);
+        assert!(
+            io.manifest_reads > fresh,
+            "ground-truth __manifest reads {} must exceed fresh-only {fresh} by the \
+             warm-coordinator probe's RPCs — else the warm-handle probe is escaping the \
+             tracker (the blind spot this guards). Reads: {:#?}",
+            io.manifest_reads,
+            last_manifest_reads(),
+        );
+    })
+    .await;
 }

@@ -86,28 +86,6 @@ async fn lance_error_too_much_write_contention_variant_exists() {
     );
 }
 
-// --- Guard 1a: LanceError::IncompatibleTransaction variant exists ----------
-//
-// `db/manifest/migrations.rs::commit_v4_stamp_idempotently` pattern-matches on
-// this variant: two concurrent v3→v4 runners both bump the internal-schema stamp
-// (an `UpdateConfig` commit on the same metadata key), and the loser gets
-// `IncompatibleTransaction`. Since both write the same value the conflict is
-// benign and is retried idempotently. If Lance renames the variant or removes the
-// builder, the match silently stops catching the conflict — this guard fails to
-// force an update.
-
-#[tokio::test]
-async fn lance_error_incompatible_transaction_variant_exists() {
-    let err =
-        lance::Error::incompatible_transaction_source("concurrent UpdateConfig at version N".into());
-    assert!(
-        matches!(err, lance::Error::IncompatibleTransaction { .. }),
-        "Lance::Error::IncompatibleTransaction variant missing or renamed; \
-         update db/manifest/migrations.rs::commit_v4_stamp_idempotently and \
-         this guard, then re-pin docs/dev/lance.md."
-    );
-}
-
 // --- Guard 1c: LanceError::DatasetAlreadyExists variant exists --------------
 //
 // `db/commit_graph.rs` and `db/recovery_audit.rs` create internal Lance tables
@@ -126,40 +104,6 @@ async fn lance_error_dataset_already_exists_variant_exists() {
         "Lance::Error::DatasetAlreadyExists variant missing or renamed; update the \
          db/commit_graph.rs + db/recovery_audit.rs create-or-open fallbacks and \
          this guard, then re-pin docs/dev/lance.md."
-    );
-}
-
-// --- Guard 1b: Dataset::open on a missing path returns a not-found variant --
-//
-// `db/commit_graph.rs::read_legacy_commit_cache` (the v3→v4 lineage migration
-// source) classifies a legacy-open error: a genuine not-found is the benign
-// "no legacy data" signal (empty cache), and ANY OTHER error propagates loudly
-// rather than being read as "empty" — a swallow there would let the migration
-// stamp v4 over an empty backfill, orphaning real lineage permanently. That
-// classification relies on Lance mapping an object-store NotFound to
-// `DatasetNotFound` (or, for some paths, `NotFound`). If a Lance bump emits a
-// different variant for a missing dataset, the migration would propagate a
-// genuine "no legacy data" as a hard error — this guard turns red to force the
-// classifier (and this guard) to be updated together.
-
-#[tokio::test]
-async fn dataset_open_missing_returns_not_found_variant() {
-    let dir = tempfile::tempdir().unwrap();
-    // A path that was never written — nothing to open.
-    let missing = dir.path().join("does-not-exist.lance");
-    let err = match Dataset::open(missing.to_str().unwrap()).await {
-        Ok(_) => panic!("opening a never-written dataset path must error"),
-        Err(e) => e,
-    };
-    assert!(
-        matches!(
-            err,
-            lance::Error::DatasetNotFound { .. } | lance::Error::NotFound { .. }
-        ),
-        "Dataset::open on a missing path no longer returns DatasetNotFound/NotFound \
-         (got: {err:?}); update db/commit_graph.rs::read_legacy_commit_cache's \
-         legacy-open classification and this guard together, then re-pin \
-         docs/dev/lance.md."
     );
 }
 
@@ -334,12 +278,15 @@ async fn _compile_transaction_history_for_repair_signature() -> lance::Result<()
     Ok(())
 }
 
-// --- Guard 8: Dataset::delete returns DeleteResult { new_dataset, num_deleted_rows } ---
+// --- Guard 8: DeleteBuilder::execute_uncommitted returns
+//     UncommittedDelete { transaction, affected_rows, num_deleted_rows } ---
 //
-// `table_store.rs::delete_where` consumes both fields. When MR-A migrates
-// `delete_where` to two-phase via `DeleteBuilder::execute_uncommitted`, this
-// guard updates to pin the staged path. Compile-only.
-
+// `table_store.rs::stage_delete` uses the two-phase delete (lance#6658, Lance
+// 7.0): it reads `num_deleted_rows` (0 ⇒ no-op `None`) and stages `transaction`
+// WITHOUT committing, instead of the inline `Dataset::delete`. It must also
+// preserve `affected_rows` and pass it to `CommitBuilder::with_affected_rows`
+// through `StagedWrite`; dropping it disables Lance's row-level rebase metadata.
+// Compile-only.
 #[allow(
     dead_code,
     unreachable_code,
@@ -347,11 +294,42 @@ async fn _compile_transaction_history_for_repair_signature() -> lance::Result<()
     unused_mut,
     clippy::diverging_sub_expression
 )]
-async fn _compile_delete_result_field_shape() -> lance::Result<()> {
-    let mut ds: Dataset = unimplemented!();
-    let result: DeleteResult = ds.delete("x = 1").await?;
-    let _new_dataset: Arc<Dataset> = result.new_dataset;
-    let _num_deleted: u64 = result.num_deleted_rows;
+async fn _compile_uncommitted_delete_field_shape() -> lance::Result<()> {
+    use lance::dataset::DeleteBuilder;
+    use lance_core::utils::mask::RowAddrTreeMap;
+    let ds: Arc<Dataset> = unimplemented!();
+    let staged = DeleteBuilder::new(ds, "x = 1")
+        .execute_uncommitted()
+        .await?;
+    let _txn: lance::dataset::transaction::Transaction = staged.transaction;
+    let _num_deleted: u64 = staged.num_deleted_rows;
+    let _affected: Option<RowAddrTreeMap> = staged.affected_rows;
+    Ok(())
+}
+
+// --- Guard 8b: MergeInsertJob::execute_uncommitted returns
+//     UncommittedMergeInsert { transaction, affected_rows, stats, inserted_rows_filter } ---
+//
+// `TableStore::stage_merge_insert` has the same staged commit contract as
+// delete: the Lance transaction and `affected_rows` metadata must travel
+// together into `commit_staged`.
+#[allow(
+    dead_code,
+    unreachable_code,
+    unused_variables,
+    unused_mut,
+    clippy::diverging_sub_expression
+)]
+async fn _compile_uncommitted_merge_insert_field_shape() -> lance::Result<()> {
+    use lance_core::utils::mask::RowAddrTreeMap;
+    let ds: Arc<Dataset> = unimplemented!();
+    let source: Box<dyn arrow_array::RecordBatchReader + Send> = unimplemented!();
+    let job = MergeInsertBuilder::try_new(ds, vec!["x".to_string()])?.try_build()?;
+    let staged = job.execute_uncommitted(source).await?;
+    let _txn: lance::dataset::transaction::Transaction = staged.transaction;
+    let _affected: Option<RowAddrTreeMap> = staged.affected_rows;
+    let _stats = staged.stats;
+    let _inserted_rows_filter = staged.inserted_rows_filter;
     Ok(())
 }
 
@@ -757,7 +735,9 @@ async fn scalar_index_use_requires_matched_literal_type() {
         vec![
             Arc::new(StringArray::from(vec!["a", "b", "c", "d"])),
             Arc::new(Int32Array::from(vec![1, 5, 9, 13])),
-            Arc::new(arrow_array::Date32Array::from(vec![19000, 19723, 20000, 20500])),
+            Arc::new(arrow_array::Date32Array::from(vec![
+                19000, 19723, 20000, 20500,
+            ])),
         ],
     )
     .unwrap();
@@ -786,7 +766,11 @@ async fn scalar_index_use_requires_matched_literal_type() {
     // (label, filter, expect_index_used)
     let cases = [
         ("n32 = 5i32 (matched Int32)", col("n32").eq(lit(5i32)), true),
-        ("n32 = 5i64 (widened Int64)", col("n32").eq(lit(5i64)), false),
+        (
+            "n32 = 5i64 (widened Int64)",
+            col("n32").eq(lit(5i64)),
+            false,
+        ),
         (
             "d32 = Date32 (matched)",
             col("d32").eq(lit(ScalarValue::Date32(Some(19723)))),
@@ -917,7 +901,10 @@ async fn skip_auto_cleanup_suppresses_version_gc() {
     async fn set_legacy_cleanup(ds: &mut Dataset) {
         let mut cfg = HashMap::new();
         cfg.insert("lance.auto_cleanup.interval".to_string(), "1".to_string());
-        cfg.insert("lance.auto_cleanup.older_than".to_string(), "0ms".to_string());
+        cfg.insert(
+            "lance.auto_cleanup.older_than".to_string(),
+            "0ms".to_string(),
+        );
         ds.update_config(cfg).await.unwrap();
     }
     fn row(i: i32) -> (Arc<Schema>, RecordBatch) {
@@ -1112,10 +1099,14 @@ async fn camelcase_index_equality_routes_to_scalar_index() {
         ..Default::default()
     };
     let mut ds = Dataset::write(reader, uri, Some(params)).await.unwrap();
-    ds.create_index_builder(&["repoName"], IndexType::BTree, &ScalarIndexParams::default())
-        .replace(true)
-        .await
-        .unwrap();
+    ds.create_index_builder(
+        &["repoName"],
+        IndexType::BTree,
+        &ScalarIndexParams::default(),
+    )
+    .replace(true)
+    .await
+    .unwrap();
 
     async fn plan_str(ds: &Dataset, filter: datafusion::prelude::Expr) -> lance::Result<String> {
         let mut scanner = ds.scan();

@@ -131,9 +131,30 @@ pub(super) async fn read_manifest_state(dataset: &Dataset) -> Result<ManifestSta
     let version = dataset.version().version;
     // The table-state hot path never needs lineage, so don't pay its JSON decode.
     let scan = read_manifest_scan(dataset, false).await?;
-    let mut latest_versions = HashMap::<String, SubTableEntry>::new();
+    Ok(assemble_manifest_state(
+        version,
+        scan.version_entries,
+        scan.tombstones
+            .into_iter()
+            .map(|t| (t.table_key, t.tombstone_version)),
+    ))
+}
 
-    for entry in scan.version_entries {
+/// Reduce raw manifest rows to the visible per-table state: keep the latest
+/// `table_version` per `table_key`, drop any whose latest version is sealed by a
+/// tombstone (`tombstone_version >= table_version`), then sort by `table_key` for
+/// deterministic output. Shared by the scan path (`read_manifest_state`) and the
+/// in-memory post-publish fold in the publisher (RFC-013 PR2 #1b), so the two
+/// CANNOT diverge in the dedup/filter/sort — the byte-identity the fold relies on.
+/// Tombstones are passed as `(table_key, tombstone_version)` tuples so callers
+/// outside this module need not name the private `TableTombstoneEntry`.
+pub(super) fn assemble_manifest_state(
+    version: u64,
+    version_entries: Vec<SubTableEntry>,
+    tombstones: impl IntoIterator<Item = (String, u64)>,
+) -> ManifestState {
+    let mut latest_versions = HashMap::<String, SubTableEntry>::new();
+    for entry in version_entries {
         match latest_versions.get(&entry.table_key) {
             Some(existing) if existing.table_version >= entry.table_version => {}
             _ => {
@@ -142,12 +163,12 @@ pub(super) async fn read_manifest_state(dataset: &Dataset) -> Result<ManifestSta
         }
     }
 
-    let mut tombstones = HashMap::<String, u64>::new();
-    for tombstone in scan.tombstones {
-        match tombstones.get(&tombstone.table_key) {
-            Some(existing) if *existing >= tombstone.tombstone_version => {}
+    let mut tombstone_map = HashMap::<String, u64>::new();
+    for (table_key, tombstone_version) in tombstones {
+        match tombstone_map.get(&table_key) {
+            Some(existing) if *existing >= tombstone_version => {}
             _ => {
-                tombstones.insert(tombstone.table_key, tombstone.tombstone_version);
+                tombstone_map.insert(table_key, tombstone_version);
             }
         }
     }
@@ -155,15 +176,14 @@ pub(super) async fn read_manifest_state(dataset: &Dataset) -> Result<ManifestSta
     let mut entries: Vec<SubTableEntry> = latest_versions
         .into_values()
         .filter(|entry| {
-            tombstones
+            tombstone_map
                 .get(&entry.table_key)
                 .map(|tombstone_version| *tombstone_version < entry.table_version)
                 .unwrap_or(true)
         })
         .collect();
     entries.sort_by(|a, b| a.table_key.cmp(&b.table_key));
-
-    Ok(ManifestState { version, entries })
+    ManifestState { version, entries }
 }
 
 // After RFC-013 P2 folded the publish path off this accessor (it now projects
@@ -245,8 +265,29 @@ fn decode_graph_commit_row(
 }
 
 async fn read_manifest_scan(dataset: &Dataset, collect_lineage: bool) -> Result<ManifestScan> {
-    let batches: Vec<RecordBatch> = dataset
-        .scan()
+    // Project only the columns the assembly below reads (RFC-013 PR2 #1c). The
+    // table-state hot path never touches `object_id` (lineage decode only) or
+    // `base_objects` (reserved/unused — never read on any path), so reading them
+    // is wasted bytes on every `__manifest` scan — write publish AND every
+    // branch-op open. Mirrors Lance's own directory-catalog `__manifest` reads,
+    // which project to the needed columns rather than scanning all of them.
+    let mut projection: Vec<&str> = vec![
+        "object_type",
+        "location",
+        "metadata",
+        "table_key",
+        "table_version",
+        "table_branch",
+        "row_count",
+    ];
+    if collect_lineage {
+        projection.push("object_id");
+    }
+    let mut scanner = dataset.scan();
+    scanner
+        .project(&projection)
+        .map_err(|e| OmniError::Lance(e.to_string()))?;
+    let batches: Vec<RecordBatch> = scanner
         .try_into_stream()
         .await
         .map_err(|e| OmniError::Lance(e.to_string()))?
@@ -582,71 +623,6 @@ pub(super) fn entries_to_batch(
     )
 }
 
-/// Merge-insert a set of graph-lineage rows (`graph_commit` + `graph_head`)
-/// straight into `__manifest`, keyed on `object_id`. Used only by the v3→v4
-/// internal-schema backfill (RFC-013 step 4): the normal write path folds
-/// lineage into the publisher's batch, but the migration writes lineage with
-/// no accompanying table-version change, so it issues its own merge.
-///
-/// Mirrors the publisher's merge knobs (`use_index(false)`, `skip_auto_cleanup`,
-/// `conflict_retries(0)`) so it has identical CAS / cleanup semantics. The
-/// migration runs under the open-for-write path and is idempotent (re-inserting
-/// the same `object_id` rows updates them in place), so it does not need the
-/// publisher's retry loop. Returns the advanced dataset (its version is the
-/// commit the lineage landed in).
-pub(crate) async fn merge_lineage_rows(
-    dataset: Dataset,
-    parts: &[GraphLineageRowPart],
-) -> Result<Dataset> {
-    let len = parts.len();
-    let mut object_ids = Vec::with_capacity(len);
-    let mut object_types = Vec::with_capacity(len);
-    let mut metadata = Vec::with_capacity(len);
-    let mut table_versions = Vec::with_capacity(len);
-    let mut table_branches = Vec::with_capacity(len);
-    for part in parts {
-        object_ids.push(part.object_id.clone());
-        object_types.push(part.object_type.to_string());
-        metadata.push(Some(part.metadata.clone()));
-        table_versions.push(part.table_version);
-        table_branches.push(part.table_branch.clone());
-    }
-    // Lineage rows carry no table identity: empty `table_key`, null location /
-    // row_count (matching `lineage_part_to_pending` in the publisher).
-    let batch = manifest_rows_batch(
-        object_ids,
-        object_types,
-        vec![None; len],
-        metadata,
-        vec![String::new(); len],
-        table_versions,
-        table_branches,
-        vec![None; len],
-    )?;
-    let reader =
-        arrow_array::RecordBatchIterator::new(vec![Ok(batch)], manifest_schema());
-    let dataset = Arc::new(dataset);
-    let mut merge_builder =
-        lance::dataset::MergeInsertBuilder::try_new(dataset, vec!["object_id".to_string()])
-            .map_err(|e| OmniError::Lance(e.to_string()))?;
-    merge_builder.when_matched(lance::dataset::WhenMatched::UpdateAll);
-    merge_builder.when_not_matched(lance::dataset::WhenNotMatched::InsertAll);
-    merge_builder.conflict_retries(0);
-    merge_builder.use_index(false);
-    merge_builder.skip_auto_cleanup(true);
-    let (new_dataset, _stats) = merge_builder
-        .try_build()
-        .map_err(|e| OmniError::Lance(e.to_string()))?
-        .execute_reader(Box::new(reader))
-        // Route through the publisher's classifier (not a stringify) so a
-        // concurrent first-open's CAS loss on `__manifest` surfaces as the SAME
-        // typed `RowLevelCasContention` the publisher's retry consumes. The
-        // migration's re-open retry loop matches on that to converge instead of
-        // erroring out (FIX B).
-        .await
-        .map_err(super::publisher::map_lance_publish_error)?;
-    Ok(Arc::try_unwrap(new_dataset).unwrap_or_else(|arc| (*arc).clone()))
-}
 
 pub(super) fn manifest_rows_batch(
     object_ids: Vec<String>,

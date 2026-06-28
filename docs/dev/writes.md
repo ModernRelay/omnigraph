@@ -53,12 +53,16 @@ shared by both `mutate_as` and the bulk loader:
   and the publisher publishes the manifest atomically across all
   touched sub-tables. Cross-table conflicts surface as
   `ManifestConflictDetails::ExpectedVersionMismatch`.
-- **Deletes still inline-commit.** Lance's `Dataset::delete` is not
-  exposed as a two-phase op in 6.0.1; deletes go through `delete_where`
-  immediately and record their post-write state in
-  `MutationStaging.inline_committed`. The parse-time D₂ rule (below)
-  prevents inserts/updates from coexisting with deletes in one query,
-  so the inline path is safe for delete-only mutations.
+- **Deletes stage too (MR-A).** Lance 7.0's
+  `DeleteBuilder::execute_uncommitted` (#6658) makes delete a two-phase op,
+  so deletes no longer inline-commit. Each delete records a predicate in
+  `MutationStaging.delete_predicates`; at end-of-query `stage_all` combines a
+  table's predicates into one `stage_delete` (a deletion-vector transaction,
+  no HEAD advance) committed through the same `commit_staged` path as writes.
+  A predicate matching zero rows stages nothing — no inline residual, and the
+  zero-row drift class is closed by construction. The parse-time D₂ rule
+  (below) still prevents inserts/updates from coexisting with deletes in one
+  query.
 
 This upholds the manifest-atomic mutation and read-your-writes invariants
 tracked in [docs/dev/invariants.md](invariants.md).
@@ -67,12 +71,16 @@ tracked in [docs/dev/invariants.md](invariants.md).
 
 A single mutation query is either insert/update-only or delete-only.
 Mixed → rejected at parse time with a clear error directing the user to
-split the query. Reason: mixing creates ordering hazards
-(insert→delete on the same row would silently no-op because the staged
-insert isn't visible to delete; cascading deletes of just-inserted
-edges break referential integrity). Until Lance exposes a two-phase
-delete API, the parse-time rejection keeps both paths atomic and
-correct. Tracked: MR-793, plus a Lance-upstream ticket.
+split the query. This is a deliberate boundary, not a temporary limitation.
+Inserts/updates accumulate as pending batches and deletes as predicates, and
+both stage correctly; keeping a single query to one kind means read-your-writes
+within that query stays unambiguous (a read never reconciles pending inserts
+against same-query delete predicates) and each touched table commits at most one
+version. Compose mixed operations by issuing separate atomic mutations (writes,
+then deletes), or a branch + merge for one atomic commit. Allowing mixing would
+instead require an in-query delete view, pending pruning, and per-table
+two-commit ordering in the hot mutation path — complexity this boundary
+deliberately avoids.
 
 ### MR-793 status (storage trait two-phase invariant) — partial
 
@@ -99,7 +107,7 @@ Three writers have been migrated onto staged primitives:
   sidecar (see [maintenance.md](../user/operations/maintenance.md)).
 * **`branch_merge::publish_rewritten_merge_table`**
   (`exec/merge.rs`) — merge_insert now uses `stage_merge_insert` +
-  `commit_staged`. Deletes stay inline (Lance #6658 residual).
+  `commit_staged`; its deletes use `stage_delete` + `commit_staged` (MR-A).
 * **`schema_apply` rewritten_tables** (`db/omnigraph/schema_apply.rs`)
   — rewrites use `stage_overwrite` + `commit_staged`, including empty-table
   rewrites via a zero-fragment Lance `Operation::Overwrite`.
@@ -121,12 +129,18 @@ described in `.context/mr-793-design.md` §15 (deferred to MR-795).
 
 MR-793's acceptance criterion §1 ("`TableStore` (or successor) public API has no method that performs a manifest commit as a side effect of writing") holds **by construction** after MR-854. `db.storage()` (`&dyn TableStorage`) exposes only staged primitives + reads; the inline-commit writes Lance cannot yet stage live on a separate `InlineCommitResidual` trait reached via `Omnigraph::storage_inline_residual()`. A new engine writer cannot couple a write with a Lance HEAD advance through the default surface — it would have to name the residual accessor explicitly. The dead legacy methods (trait `append_batch` / `merge_insert_batches`, inherent `merge_insert_batch{,es}`, `create_{btree,inverted}_index`) were removed; appends/merges and scalar index builds all use the `stage_*` primitives.
 
-Two methods remain on `InlineCommitResidual`, each named honestly at its call site:
+One method remains on `InlineCommitResidual`, named honestly at its call site:
 
 | Residual method | Inline-commit reason | Closes when |
 |---|---|---|
-| `delete_where` | `DeleteBuilder::execute_uncommitted` is not in Lance v6.0.1 (closed upstream as [#6658](https://github.com/lance-format/lance/issues/6658) but first ships in `v7.0.0-beta.10`); see [docs/dev/lance.md](lance.md) | MR-A: Lance v7.x bump migrates `delete_where` to staged, retires the parse-time D₂ mutation rule, and extends recovery sidecar coverage |
 | `create_vector_index` | Vector indices take Lance's "segment commit path"; `build_index_metadata_from_segments` is `pub(crate)` (Lance [#6666](https://github.com/lance-format/lance/issues/6666) still open) | Lance #6666 lands and `stage_create_vector_index` joins the staged surface |
+
+`delete_where` used to be the second residual. Lance 7.0's
+`DeleteBuilder::execute_uncommitted` ([#6658](https://github.com/lance-format/lance/issues/6658))
+made delete a staged write, so MR-A migrated it to `TableStorage::stage_delete`
+and removed `InlineCommitResidual::delete_where`. The parse-time D₂ rule is
+retained as a deliberate boundary (constructive XOR destructive per query) — see
+the D₂ section above.
 
 The `tests/forbidden_apis.rs` guard still catches direct `lance::*` inline-commit misuse outside the storage layer; the trait split makes the staged-only default a type-system guarantee on top of it.
 
@@ -341,36 +355,32 @@ actual }`. The HTTP server maps this to **409 Conflict** with body
 `__manifest`, written in the publish CAS (RFC-013 Phase 7; previously
 `_graph_commits.lance`). Audit history is queried via `omnigraph commit list`.
 
-## Migration code
+## Storage versioning (no in-place migration)
 
-`db/manifest/migrations.rs` is the single place on-disk `__manifest` shape is
-reconciled with what the binary expects, stepping the
-`omnigraph:internal_schema_version` stamp forward one `match`-arm at a time. It
-runs in `Omnigraph::open(ReadWrite)` (via `manifest::migrate_on_open`, before the
-coordinator reads branch state) and again on the publisher's write path, so each
-branch migrates on its first write; every step is idempotent under crash-retry
-(work first, stamp bump last).
+`db/manifest/migrations.rs` is the single place the on-disk `__manifest` shape is
+reconciled with what the binary expects. Storage is **strict-single-version** (the
+strand model): this binary reads exactly ONE internal-schema version
+(`MIN_SUPPORTED == CURRENT == 4`), so there is no in-place migration.
 
-- **v2→v3** (MR-770): a one-time sweep that deletes legacy `__run__*` staging
-  branches off `__manifest`. Deleting the inert `_graph_runs.lance` /
-  `_graph_run_actors.lance` dataset *bytes* is still deferred — it needs a
-  `StorageAdapter::delete_prefix` primitive — but those bytes are invisible to
-  graph-level state.
-- **v3→v4** (RFC-013 Phase 7, `migrate_v3_to_v4`): backfills the graph lineage
-  from `_graph_commits.lance` into `__manifest` as `graph_commit` / `graph_head`
-  rows. A graph created before Phase 7 has its lineage only in
-  `_graph_commits.lance`; the new binary reads lineage from the `__manifest`
-  projection, so without this backfill it would see an empty commit DAG. The
-  backfill is per-branch (each branch migrates on its first write), idempotent
-  (keyed on `object_id`; a fast-path guard skips when `__manifest` already
-  carries `graph_commit` rows), and writes exactly one `graph_head:<branch>` row
-  for the actual head. `_graph_commits.lance` is left in place as the branch-ref
-  carrier — no commit row is written to it again. While a graph is below v4, a
-  **read-only** open (which never writes, so never migrates) sources the commit
-  DAG from `_graph_commits.lance` via the stamp-gated transitional fallback in
-  `CommitGraph::open*`, so reads see correct history before the first write
-  migrates the graph. An old binary opening a v4-stamped graph is refused with an
-  "upgrade omnigraph" error in both read-write and read-only modes.
+- **Graph creation** stamps `omnigraph:internal_schema_version` at CURRENT, so a
+  fresh graph always opens.
+- **`Omnigraph::open`** (both read-write and read-only) reads main's stamp before
+  the coordinator reads any branch state and calls `refuse_if_stamp_unsupported`:
+  a stamp *below* CURRENT is refused with a rebuild-via-export/import message; a
+  stamp *above* CURRENT is refused with "upgrade omnigraph". The publisher
+  re-checks the stamp on its write path against the branch it targets, with no
+  object-store writes, so the check is safe under a read-only open.
+- The stamp + `refuse_if_stamp_unsupported` floor is the only seam a future
+  in-place migration would re-introduce (re-add a dispatcher and lower
+  `MIN_SUPPORTED`). Until a concrete graph demands it, that machinery is
+  deliberately absent — see [versioning.md](versioning.md) (the compatibility
+  policy) and [the upgrade guide](../user/operations/upgrade.md) (the rebuild
+  recipe).
+
+The stamp history (v1 PK-less, v2 unenforced-PK, v3 `__run__*` sweep, v4 lineage
+in `__manifest` with the commit-graph tables retired) is recorded on the
+`INTERNAL_MANIFEST_SCHEMA_VERSION` doc-comment; only v4 is served. An earlier-stamped
+graph is rebuilt via export/import, not migrated in place.
 
 ## Mid-query partial failure: closed by MR-794
 
@@ -391,13 +401,11 @@ The cancellation case (future drop mid-mutation) inherits the same
 guarantee — the in-memory accumulator evaporates with the dropped task
 and no Lance write was ever issued.
 
-For delete-touching mutations the legacy inline-commit shape is
-preserved (Lance has no public two-phase delete in 6.0.1) — the same
-narrow window remains. The parse-time D₂ rule prevents inserts/updates
-from coexisting with deletes in one query, so a pure-delete failure
-cannot drift any staged-table state. If a delete-only multi-table
-mutation fails mid-cascade, the same workaround as before applies
-(retry; rely on `omnigraph cleanup` once a later successful commit
-moves HEAD past the orphan version). Closing this requires Lance to
-expose `DeleteJob::execute_uncommitted`; tracked in MR-793 and a
-Lance-upstream ticket.
+Delete-touching mutations now inherit the same guarantee (MR-A). Deletes
+accumulate as predicates and stage via `stage_delete` at end-of-query, so a
+delete cascade that fails mid-way advances no Lance HEAD — the same
+"untouched on failure" property as inserts/updates. The old narrow inline
+window (and the retry/`cleanup` workaround it required) is gone. The
+parse-time D₂ rule keeps inserts/updates from coexisting with deletes in one
+query as a deliberate boundary (see the D₂ section above), so a mutation is
+always purely constructive or purely destructive.
