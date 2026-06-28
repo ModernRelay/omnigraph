@@ -11,12 +11,17 @@
 
 mod helpers;
 
+use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
+
 use arrow_array::{Array, StringArray};
 
-use omnigraph::db::Omnigraph;
+use omnigraph::db::{Omnigraph, ReadTarget};
+use omnigraph::instrumentation::{QueryIoProbes, with_query_io_probes};
 use omnigraph::loader::{LoadMode, load_jsonl};
 use omnigraph::table_store::{IndexCoverage, TableStore};
 use omnigraph_compiler::ir::ParamMap;
+use omnigraph_compiler::result::QueryResult;
 use serial_test::serial;
 
 use helpers::*;
@@ -29,6 +34,40 @@ fn set_mode(mode: &str) {
 
 fn clear_mode() {
     unsafe { std::env::remove_var("OMNIGRAPH_TRAVERSAL_MODE") };
+}
+
+/// RAII guard that sets `OMNIGRAPH_TRAVERSAL_MODE` and clears it on drop, so a
+/// panic mid-test (e.g. a query `unwrap`) cannot leak the forced mode into a
+/// later test in this binary. SAFE: every test here is `#[serial]` and this
+/// binary has no non-serial env reader, so no thread reads the env during the
+/// write. (Mirrors `proptest_equivalence.rs::ModeGuard`.)
+struct ModeGuard;
+impl ModeGuard {
+    fn set(mode: &str) -> Self {
+        set_mode(mode);
+        ModeGuard
+    }
+}
+impl Drop for ModeGuard {
+    fn drop(&mut self) {
+        clear_mode();
+    }
+}
+
+/// First result column, sorted — for the probe-based topology-build tests below.
+fn column0(result: &QueryResult) -> Vec<String> {
+    if result.num_rows() == 0 {
+        return Vec::new();
+    }
+    let batch = result.concat_batches().unwrap();
+    let col = batch
+        .column(0)
+        .as_any()
+        .downcast_ref::<StringArray>()
+        .unwrap();
+    let mut v: Vec<String> = (0..col.len()).map(|i| col.value(i).to_string()).collect();
+    v.sort();
+    v
 }
 
 /// Run a name-returning query and return its first column, sorted.
@@ -324,4 +363,128 @@ async fn variable_hops_handle_self_loop() {
     let got = both_modes(&mut db, REACH_5, "reach", &params(&[("$name", "a")])).await;
     // a->a hits the seeded source (pruned); only b is reached.
     assert_eq!(got, vec!["b"]);
+}
+
+// ─── Topology-index build cost (A1 cross-branch reuse + A2 scoped build) ─────
+//
+// These force the CSR build path (the indexed path builds no topology) and read
+// the `graph_build_count` / `graph_edges_built` probes. They live HERE — the
+// all-serial binary with no non-serial env reader — because they mutate the
+// process-global `OMNIGRAPH_TRAVERSAL_MODE`, which `query.rs` reads; in a mixed
+// serial/non-serial binary a concurrent non-serial traversal would race the env
+// write. The `ModeGuard` clears the override even on a panic.
+
+/// A1: a fresh (unwritten) branch reuses main's cached CSR topology index
+/// (`graph_build_count == 0`), and the reused index returns correct results for
+/// the branch. Before A1 the branch-keyed snapshot id forced a rebuild (count 1).
+#[tokio::test]
+#[serial]
+async fn fresh_branch_traversal_reuses_main_graph_index() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut writer = init_and_load(&dir).await;
+    let uri = dir.path().to_str().unwrap();
+    // A Knows edge on main so there is topology to build and then reuse.
+    mutate_main(
+        &mut writer,
+        MUTATION_QUERIES,
+        "insert_person_and_friend",
+        &mixed_params(&[("$name", "Walker"), ("$friend", "Alice")], &[("$age", 41)]),
+    )
+    .await
+    .unwrap();
+
+    // Separate reader handle. As in production, the reader never creates the
+    // branch, so creating it does not invalidate the reader's warm cache.
+    let reader = Omnigraph::open(uri).await.unwrap();
+
+    let _mode = ModeGuard::set("csr");
+    // Reader warms main on the CSR path: builds and caches the topology index.
+    let warm = reader
+        .query(
+            ReadTarget::branch("main"),
+            TEST_QUERIES,
+            "friends_of",
+            &params(&[("$name", "Walker")]),
+        )
+        .await
+        .unwrap();
+    assert_eq!(column0(&warm), vec!["Alice"], "test setup: main has the Knows edge");
+
+    // A separate writer creates the branch (lazy fork: feature's edge tables are
+    // physically main's — same version + e_tag, table_branch=None).
+    writer.branch_create("feature").await.unwrap();
+
+    let graph_build = Arc::new(AtomicU64::new(0));
+    let probes_in = QueryIoProbes {
+        graph_build_count: Arc::clone(&graph_build),
+        ..Default::default()
+    };
+    let on_branch = with_query_io_probes(
+        probes_in,
+        reader.query(
+            ReadTarget::branch("feature"),
+            TEST_QUERIES,
+            "friends_of",
+            &params(&[("$name", "Walker")]),
+        ),
+    )
+    .await
+    .unwrap();
+
+    assert_eq!(
+        column0(&on_branch),
+        vec!["Alice"],
+        "fresh branch sees main's edges (lazy fork) and the reused index is correct"
+    );
+    assert_eq!(
+        graph_build.load(Ordering::Relaxed),
+        0,
+        "a fresh branch with unchanged edges must reuse main's cached CSR index, not rebuild it"
+    );
+}
+
+/// A2: a query referencing one edge type builds the topology for only that edge,
+/// not every edge in the catalog. Forces CSR (the build path) and counts edge
+/// tables built. Before A2 the build materialized all catalog edges (the fixture
+/// defines Knows + WorksAt, so a build-all touches >= 2) — the cold-build cost.
+#[tokio::test]
+#[serial]
+async fn single_edge_query_builds_only_referenced_edge() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut db = init_and_load(&dir).await;
+    // A Knows edge so the referenced build has topology; the fixture also defines
+    // WorksAt, so a build-all would touch more than one edge.
+    mutate_main(
+        &mut db,
+        MUTATION_QUERIES,
+        "insert_person_and_friend",
+        &mixed_params(&[("$name", "Walker"), ("$friend", "Alice")], &[("$age", 41)]),
+    )
+    .await
+    .unwrap();
+
+    let _mode = ModeGuard::set("csr");
+    let graph_edges = Arc::new(AtomicU64::new(0));
+    let probes_in = QueryIoProbes {
+        graph_edges_built: Arc::clone(&graph_edges),
+        ..Default::default()
+    };
+    let result = with_query_io_probes(
+        probes_in,
+        db.query(
+            ReadTarget::branch("main"),
+            TEST_QUERIES,
+            "friends_of",
+            &params(&[("$name", "Walker")]),
+        ),
+    )
+    .await
+    .unwrap();
+
+    assert_eq!(column0(&result), vec!["Alice"]);
+    assert_eq!(
+        graph_edges.load(Ordering::Relaxed),
+        1,
+        "a query referencing only `knows` must build only that edge, not all catalog edges"
+    );
 }
