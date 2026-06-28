@@ -216,39 +216,44 @@ pub(crate) async fn open_dataset_tracked(
     uri: &str,
     wrapper: Option<Arc<dyn WrappingObjectStore>>,
 ) -> Result<Dataset> {
-    record_open(uri);
-    let result = match wrapper {
-        None => Dataset::open(uri).await,
-        Some(wrapper) => {
-            DatasetBuilder::from_uri(uri)
-                .with_store_params(ObjectStoreParams {
-                    object_store_wrapper: Some(wrapper),
-                    ..Default::default()
-                })
-                .load()
-                .await
-        }
-    };
-    result.map_err(|e| OmniError::Lance(e.to_string()))
+    open_dataset_internal(uri, VersionResolution::Latest, None, wrapper).await
 }
 
-/// Open a data-table dataset at `location` pinned to `version` — the cache-miss
-/// path of the data-read boundary (`SubTableEntry::open`). Attaches the shared
-/// per-graph `Session` (warms metadata/index caches across opens, LanceDB's
-/// one-session-per-connection pattern) and the per-query `table_wrapper` (for IO
-/// counting) when present. With neither, this is exactly the Fix-2
-/// `from_uri(location).with_version(version)` open.
-pub(crate) async fn open_table_dataset(
+/// How a [`open_dataset_internal`] open resolves the dataset version.
+///
+/// `Latest` resolves the head (one `_versions/` LIST on object stores — the
+/// `__manifest` open, which is the source of the per-table pins). `At(version)`
+/// reconstructs the exact manifest filename and does a list-free GET — the
+/// data-table opens, pinned to the version the `__manifest` row already records.
+#[derive(Debug, Clone, Copy)]
+pub(crate) enum VersionResolution {
+    Latest,
+    At(u64),
+}
+
+/// The single dataset-open chokepoint. Attaches the shared per-graph `Session`
+/// (warms Lance metadata/index caches across opens — LanceDB's
+/// one-session-per-connection pattern) and an IO-counting `wrapper` when present,
+/// and resolves the version per [`VersionResolution`]. `open_dataset_tracked`
+/// (manifest/branch, latest) and `open_table_dataset` (data, pinned) are thin
+/// shims over this so there is one place that opens a `Dataset` — the session is
+/// never silently dropped on one path. Counted via `record_open` so the cost gate
+/// sees every open.
+pub(crate) async fn open_dataset_internal(
     location: &str,
-    version: u64,
+    version: VersionResolution,
     session: Option<&Arc<lance::session::Session>>,
+    wrapper: Option<Arc<dyn WrappingObjectStore>>,
 ) -> Result<Dataset> {
     record_open(location);
-    let mut builder = DatasetBuilder::from_uri(location).with_version(version);
+    let mut builder = DatasetBuilder::from_uri(location);
+    if let VersionResolution::At(v) = version {
+        builder = builder.with_version(v);
+    }
     if let Some(session) = session {
         builder = builder.with_session(session.clone());
     }
-    if let Some(wrapper) = table_wrapper() {
+    if let Some(wrapper) = wrapper {
         builder = builder.with_store_params(ObjectStoreParams {
             object_store_wrapper: Some(wrapper),
             ..Default::default()
@@ -258,6 +263,18 @@ pub(crate) async fn open_table_dataset(
         .load()
         .await
         .map_err(|e| OmniError::Lance(e.to_string()))
+}
+
+/// Open a data-table dataset at `location` pinned to `version` — the cache-miss
+/// path of the data-read boundary (`SubTableEntry::open`). Attaches the shared
+/// per-graph `Session` and the per-query `table_wrapper` (for IO counting) when
+/// present. Thin shim over [`open_dataset_internal`].
+pub(crate) async fn open_table_dataset(
+    location: &str,
+    version: u64,
+    session: Option<&Arc<lance::session::Session>>,
+) -> Result<Dataset> {
+    open_dataset_internal(location, VersionResolution::At(version), session, table_wrapper()).await
 }
 
 /// Per-method read counts for [`CountingStorageAdapter`].
