@@ -13,25 +13,33 @@
 //! two hand-rolled files. Phase 3 / Phase 5 / U2 / the epoch fence each reuse
 //! this with one new schedule or one convergence-battery line.
 
+use std::sync::Arc;
+
 use crate::backend::{Backend, Embedded};
 
 /// A set of independent writers sharing one store URI. Generic over `Backend`
 /// so the same driver runs the embedded (separate coordinators) and CLI
-/// (separate processes) tiers.
+/// (separate processes) tiers. Writers are held as `Arc<B>` so a concurrent
+/// test can move one into a `tokio::spawn`ed task (a rendezvous parks a writer
+/// by blocking its thread, so each racing writer needs its own task).
 pub struct Cohort<B: Backend> {
-    writers: Vec<B>,
+    writers: Vec<Arc<B>>,
     store_uri: String,
 }
 
 impl<B: Backend> Cohort<B> {
     /// All writers, in open order (writer 0 is the one that initialized the
     /// graph in the embedded tier).
-    pub fn writers(&self) -> &[B] {
+    pub fn writers(&self) -> &[Arc<B>] {
         &self.writers
     }
-    /// The `i`th independent writer.
+    /// The `i`th independent writer (borrowed).
     pub fn writer(&self, i: usize) -> &B {
-        &self.writers[i]
+        self.writers[i].as_ref()
+    }
+    /// A shareable handle to the `i`th writer, for moving into a spawned task.
+    pub fn writer_arc(&self, i: usize) -> Arc<B> {
+        Arc::clone(&self.writers[i])
     }
     pub fn len(&self) -> usize {
         self.writers.len()
@@ -53,9 +61,9 @@ impl Cohort<Embedded> {
     pub async fn open_embedded(uri: &str, n: usize) -> Self {
         assert!(n >= 1, "a cohort needs at least one writer");
         let mut writers = Vec::with_capacity(n);
-        writers.push(Embedded::open_clean(uri).await); // writer 0 inits the graph
+        writers.push(Arc::new(Embedded::open_clean(uri).await)); // writer 0 inits the graph
         for _ in 1..n {
-            writers.push(Embedded::reopen(uri).await); // independent coordinator
+            writers.push(Arc::new(Embedded::reopen(uri).await)); // independent coordinator
         }
         Cohort {
             writers,

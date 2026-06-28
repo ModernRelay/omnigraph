@@ -17,6 +17,8 @@ use helpers::recovery::{
 use helpers::{
     MUTATION_QUERIES, collect_column_strings, mixed_params, mutate_main, read_table, version_main,
 };
+use omnigraph_dst::op::{doc, person};
+use omnigraph_dst::{Backend, Cohort, run_convergence_battery};
 
 const SCHEMA_V1: &str = "node Person { name: String @key }\n";
 const SCHEMA_V2_ADDED_TYPE: &str =
@@ -475,6 +477,77 @@ async fn fork_collision_with_live_concurrent_fork_is_retryable() {
         msg.contains("refresh and retry") || msg.contains("expected manifest table version"),
         "expected a retryable stale-view error, got: {msg}"
     );
+}
+
+// Phase 0.1b — the deterministic stale-warm publish interleave (the safety net
+// Phase 3's warm-attempt-0 publish is built against). Two INDEPENDENT
+// coordinators (omnigraph_dst::Cohort, separate known_state) write DISJOINT
+// tables on main. Writer A is parked at the publish CAS boundary
+// (GRAPH_PUBLISH_BEFORE_COMMIT_APPEND) with its pre-check built against the
+// pre-B view; writer B then commits, advancing the manifest + the
+// graph_head:main §7.1 row. When A is released its commit append loses the CAS,
+// so the publisher retries INTERNALLY (cold reload + re-parent off B's commit)
+// and A still succeeds. The outcome is a single LINEAR chain with both
+// coordinators converged — exactly the property Phase 3 must preserve: the warm
+// pre-check is advisory, the CAS arbitrates, and on loss the next attempt is
+// cold. The cell holds today (publish always cold-reloads) and pins the
+// invariant before the warm path makes the stale pre-check reachable.
+//
+// Ordering is deterministic via the shared rendezvous: A parks first; B and A's
+// own retry fall through (reached already armed).
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[serial]
+async fn stale_warm_publish_precheck_loses_cas_then_converges() {
+    let _scenario = FailScenario::setup();
+
+    let dir = tempfile::tempdir().unwrap();
+    let uri = dir.path().to_str().unwrap().to_string();
+
+    let cohort = Cohort::open_embedded(&uri, 2).await;
+    let base = cohort
+        .writer(0)
+        .db()
+        .list_commits(Some("main"))
+        .await
+        .unwrap()
+        .len();
+
+    let rv = helpers::failpoint::Rendezvous::park_first(names::GRAPH_PUBLISH_BEFORE_COMMIT_APPEND);
+
+    // Writer A starts a Person write and parks at the publish CAS boundary; its
+    // pre-check is now built against the soon-to-be-stale pre-B view.
+    let a = cohort.writer_arc(0);
+    let writer_a = tokio::spawn(async move {
+        let p = person("a");
+        a.load(&p).await
+    });
+
+    // Wait until A is parked at the boundary.
+    rv.wait_until_reached().await;
+
+    // Writer B commits a DISJOINT (Doc) write — it falls through the parked
+    // failpoint and advances the manifest + graph_head:main.
+    let d = doc("b", "whatsapp");
+    cohort
+        .writer(1)
+        .load(&d)
+        .await
+        .expect("writer B (Doc) commits while A parks");
+
+    // Release A: its append loses the CAS, the publisher retries (cold reload +
+    // re-parent off B), and A still succeeds — no lost write, no user error.
+    rv.release();
+    writer_a
+        .await
+        .expect("A task join")
+        .expect("writer A's stale-warm publish must retry internally and succeed");
+
+    // Single linear chain (base+2), both coordinators converged on the same head.
+    for (name, res) in run_convergence_battery(&cohort, "main", base + 2).await {
+        if let Err(f) = res {
+            panic!("convergence violation [{name}]: {}", f.message());
+        }
+    }
 }
 
 #[tokio::test(flavor = "multi_thread")]
