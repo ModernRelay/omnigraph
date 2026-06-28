@@ -8,6 +8,7 @@ members = [
     "crates/omnigraph-cluster",
     "crates/omnigraph-policy",
     "crates/omnigraph-server",
+    "crates/omnigraph-dst",
 ]
 default-members = [
     "crates/omnigraph",
