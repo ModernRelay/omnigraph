@@ -87,6 +87,28 @@ Target after U1 (LanceDB-anchored): `read_iops ≈ 1`, `num_stages ≈ 3`, LIST 
 
 **Reuse map:** `helpers/cost.rs` (`IoCounts`, `assert_flat`, `measure_insert`, `cost_harness`, `last_manifest_reads`, `s3_graph`, `PrefixCounter`); `helpers/mod.rs` (`commit_many`, `commit_many_as`); `write_cost.rs` (`internal_table_scans_are_flat_in_history`, `internal_table_scans_grow_without_compaction`, `write_op_count_ceiling_at_shallow_depth` — the patterns to mirror on S3). Gotchas: `#![recursion_limit = "512"]`, `cost_harness` mandatory for ground-truth counting.
 
+**LANDED (U0).** `warm_write_cost_flat_and_bounded_in_history_on_s3` (`write_cost_s3.rs`), measured on RustFS. **Baseline a warm single-row write must beat:** `manifest_list=6`, `num_stages=13`, `manifest_reads=9`, `data_opener=4`, `total=14` — **identical at depth 10 and 50** (perfectly flat with compaction, no GC). Depth capped at 50 (depth 100 trips an unrelated Lance FTS-index-builder panic during `optimize_indices` on S3; tracked separately). Each U1 layer ratchets the ceiling down toward `manifest_list ≈ 1`, `num_stages ≈ 3`.
+
+---
+
+## 6b. U1 execution plan (assumptions validated against source)
+
+Two Explore passes validated the U1 surface (file:line in `crates/omnigraph/src/`). Findings and the resulting plan:
+
+- **Layer 4 — warm publish.** `GraphNamespacePublisher::publish` runs a cold `load_publish_state` (open + `read_publish_scan`) on EVERY attempt (`db/manifest/publisher.rs:693`). The warm `known_state` exists in `ManifestCoordinator` (`db/manifest.rs:298`) and is folded O(touched-tables) after each commit, but the publisher is trait-boxed (`Arc<dyn ManifestBatchPublisher>`) with no access. **Design choice:** thread `known_state_hint: Option<&ManifestState>` into the `ManifestBatchPublisher::publish` signature (attempt 0 uses it, attempts 1+ reload after a CAS conflict; cold path unchanged when `None`) — vs guarding the attempt-0 load inside `ManifestCoordinator::commit`. **Recommend the `Option` hint param** (~50 lines, the `None` default keeps the contract). **Non-strict ops only**; keep one cheap pre-commit freshness check (the forward-probe), per Lance's "don't go fully optimistic" lesson.
+- **Layer 3 — pinned opens.** Non-strict (Insert/Merge) opens at HEAD via `open_dataset_head_for_write` (`db/omnigraph/table_ops.rs:917`); the pinned version IS captured (`MutationStaging::expected_versions` / the `table_version` row) but not threaded. Route non-strict opens through the existing `open_table_dataset(location, pinned_version, session)` (`src/instrumentation.rs:241`). Strict ops (Update/Delete/SchemaRewrite — `MutationOpKind::strict_pre_stage_version_check`, `db/mod.rs:49`) keep the cold drift check.
+- **Forward-probe.** The OCC path (`occ_snapshot_for_branch`, `exec/staging.rs:684`) already reuses the warm coordinator on probe-match, but the probe itself is a `latest_version_id()` LIST (`db/manifest.rs:536`). Add a `manifest_path_for_version(version)` constructor (V2 naming) and HEAD `V+1` instead of LISTing.
+- **Shared `Session` (A).** Lives in `ReadCaches { session }` owned by `Omnigraph` (`src/runtime_cache.rs:275`, created `db/omnigraph.rs:369/473`); data reads use it via `TableHandleCache`, but manifest opens (`open_manifest_dataset` → `open_dataset_tracked`) don't. Thread `session` through `open_manifest_dataset` → `open_manifest_graph` → `ManifestCoordinator::open`/`open_at_branch`, passing `self.read_caches.session`. `DatasetBuilder::with_session` is already used by the data path. NOTE: this cuts cold-TLS wall latency but is **invisible to the request-count gate** (it removes handshakes, not requests) — verify via the connection/`num_stages` angle, not `read_iops`.
+- **Branch parallelize (B).** `cleanup_deleted_branch_tables` (`db/omnigraph.rs:1482`) is a serial loop of independent `force_delete_branch` calls on the `Send + Sync` `TableStorage`. Swap to `buffer_unordered(8)`; adapt the `BRANCH_DELETE_BEFORE_TABLE_CLEANUP` failpoint test (drop the deterministic log-order assertion). Branch CREATE forks only `__manifest` (confirmed) — only delete is the serial-O(tables) cost.
+
+**Internal sequencing** (impact-per-risk; each lands with a gate ratchet):
+1. **Shared Session (A) + Branch parallelize (B)** — cheap, orthogonal, low-risk; land first. (A helps wall latency, B helps branch delete; neither moves the write request-count gate.)
+2. **Layer 3** (pinned non-strict opens) — mechanical; gate: `data_opener` → ~0.
+3. **Layer 4** (warm publish, `known_state_hint`) — biggest gate win; `manifest_reads` + `manifest_list` drop on the no-contention path.
+4. **Forward-probe** — last (only matters after 3+4 remove the other LISTs); `manifest_list` → ~1.
+
+**Invariant:** Layers 3/4 apply to non-strict (Insert/Merge) only; strict ops keep the cold drift check, so the publish CAS stays the sole concurrency authority.
+
 ---
 
 ## 7. RFC-013 mapping — interleave or not
