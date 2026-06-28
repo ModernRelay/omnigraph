@@ -914,17 +914,22 @@ pub(super) async fn reopen_for_mutation(
             .reopen_for_mutation(full_path, table_branch, table_key, expected_version)
             .await
     } else {
-        // Insert / Merge: skip the strict version check. Open at HEAD —
-        // Lance's natural conflict resolver at commit_staged time
-        // (rebase append, dedupe merge_insert) handles concurrent
-        // writers correctly; the publisher CAS in
-        // `MutationStaging::commit_all` (refreshed under the
-        // per-(table, branch) queue via `snapshot_for_branch`) catches
-        // genuine cross-process drift as 409. See
-        // [`crate::db::MutationOpKind`] for the policy rationale.
-        let _ = expected_version;
+        // Insert / Merge: skip the strict version check and pin the staging open
+        // at the manifest-resolved base `expected_version` (list-free `At(v)` GET,
+        // no `_versions/` LIST). Lance's natural conflict resolver at commit_staged
+        // time (rebase append, dedupe merge_insert), the `commit_all` drift guard
+        // (`latest_version_id`), and the publisher CAS (refreshed under the
+        // per-(table, branch) queue via `snapshot_for_branch`) remain the drift
+        // fences and catch genuine cross-process drift as 409 — exactly as the
+        // prior HEAD open, which bought nothing the pin does not while costing a
+        // per-write LIST. The strict arm above keeps live HEAD for read-modify-
+        // write SI. See [`crate::db::MutationOpKind`] for the policy rationale.
+        debug_assert!(
+            !op_kind.strict_pre_stage_version_check(),
+            "pinned staging open must never be reached for a strict op",
+        );
         db.storage()
-            .open_dataset_head_for_write(table_key, full_path, table_branch)
+            .open_table_pinned(full_path, table_branch, expected_version)
             .await
     }
 }

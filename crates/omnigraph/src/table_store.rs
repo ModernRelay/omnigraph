@@ -236,6 +236,24 @@ impl TableStore {
         self.open_dataset_head(dataset_uri, branch).await
     }
 
+    /// List-free pinned open of a table at a known `version`: `with_version`
+    /// resolves the manifest filename directly (no `_versions/` LIST), unlike
+    /// `open_dataset_head` (latest-resolution) or `open_dataset_at_state`
+    /// (which opens HEAD then `checkout_version`). For a non-main branch the
+    /// `tree/{branch}`-encoded location resolves the branch's own version chain
+    /// without a `checkout_branch`. Used by the non-strict (Insert/Merge)
+    /// staging open, which pins to the manifest-resolved base version (the
+    /// publisher CAS + `commit_all` drift guard remain the fences).
+    pub async fn open_table_pinned(
+        &self,
+        full_path: &str,
+        branch: Option<&str>,
+        version: u64,
+    ) -> Result<Dataset> {
+        let location = crate::db::manifest::table_uri_for_location(full_path, branch);
+        crate::instrumentation::open_table_dataset(&location, version, None).await
+    }
+
     pub async fn delete_branch(&self, dataset_uri: &str, branch: &str) -> Result<()> {
         let mut ds = Dataset::open(dataset_uri)
             .await
