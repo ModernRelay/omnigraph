@@ -46,6 +46,7 @@ start with install, then follow the section that matches your task.
 | Deploy the binary or container | [deployment.md](deployment.md) |
 | Use HTTP endpoints | [operations/server.md](operations/server.md) |
 | Compact, repair, and clean old versions | [operations/maintenance.md](operations/maintenance.md) |
+| Upgrade across a storage-format change (export/import) | [operations/upgrade.md](operations/upgrade.md) |
 | Configure Cedar authorization | [operations/policy.md](operations/policy.md) |
 | Track actors and audit behavior | [operations/audit.md](operations/audit.md) |
 | Interpret errors and output formats | [operations/errors.md](operations/errors.md) |

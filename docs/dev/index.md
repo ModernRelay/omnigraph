@@ -12,6 +12,7 @@ constraints. User-facing behavior should still be documented through
 | Need | Read |
 |---|---|
 | Architectural rules, known gaps, deny-list | [invariants.md](invariants.md) |
+| Versioning & compatibility policy (release / wire / storage / Lance) | [versioning.md](versioning.md) |
 | Upstream Lance source-of-truth index | [lance.md](lance.md) |
 | Existing test coverage and test placement | [testing.md](testing.md) |
 

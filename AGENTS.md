@@ -92,6 +92,8 @@ Full diagram and concurrency model: [docs/dev/architecture.md](docs/dev/architec
 | Diff / change feed (`diff_between`, `diff_commits`) | [docs/user/branching/changes.md](docs/user/branching/changes.md) |
 | Query execution, mutation execution, bulk loader, `load` vs `ingest` | [docs/dev/execution.md](docs/dev/execution.md) |
 | `optimize` (compaction) and `cleanup` (version GC) | [docs/user/operations/maintenance.md](docs/user/operations/maintenance.md) |
+| Upgrade across a storage-format change (export/import rebuild) | [docs/user/operations/upgrade.md](docs/user/operations/upgrade.md) |
+| Versioning & compatibility policy (release / wire / storage strict-single-version / Lance) | [docs/dev/versioning.md](docs/dev/versioning.md) |
 | Cluster operator guide (deploy/manage clusters, approvals, recovery, serving) | [docs/user/clusters/index.md](docs/user/clusters/index.md) |
 | Cedar policy actions, scopes, CLI | [docs/user/operations/policy.md](docs/user/operations/policy.md) |
 | HTTP server endpoints, auth, error model, body limits | [docs/user/operations/server.md](docs/user/operations/server.md) |
@@ -263,7 +265,7 @@ omnigraph policy explain --cluster ./company-brain --graph knowledge --actor act
 | Schema language | — | `.pg` + Pest grammar + catalog + interfaces + constraints + annotations |
 | Query language | — | `.gq` + Pest grammar + IR + lowering + linter |
 | Schema migration planning | — | `plan_schema_migration` + `apply_schema` step types + `__schema_apply_lock__` |
-| Commit graph (DAG) across whole graph | — | Lineage (linear + merge parents, ULID ids, actor) stored as `graph_commit`/`graph_head` rows in `__manifest`, written in the same publish CAS as the table-version rows (RFC-013 Phase 7 — no separate `_graph_commits.lance` write; manifest→commit-graph atomicity gap closed); the in-memory commit graph is a projection of those rows |
+| Commit graph (DAG) across whole graph | — | Lineage (linear + merge parents, ULID ids, actor) stored as `graph_commit`/`graph_head` rows in `__manifest`, written in the same publish CAS as the table-version rows (RFC-013 Phase 7 — atomic with the graph commit). The in-memory commit graph is a pure projection of those rows; the legacy `_graph_commits.lance` / `_graph_commit_actors.lance` tables are **retired** (a fresh graph creates neither) |
 | Per-query atomic writes | — | In-memory `MutationStaging.pending` accumulator + `stage_*` / `commit_staged` per touched table at end-of-query + publisher CAS via `commit_with_expected` (single manifest commit per `mutate_as` / `load`); D₂ parse-time rule keeps inserts/updates and deletes from mixing |
 | Three-way row-level merge | — | `OrderedTableCursor` + `StagedTableWriter`, structured `MergeConflictKind` |
 | Change feeds | — | `diff_between` / `diff_commits` with manifest fast path + ID streaming |

@@ -1,5 +1,12 @@
 # Handoff: finishing RFC-013 (write-path latency + correctness)
 
+> **Status update (strand-and-retire work):** the `_graph_commits.lance` /
+> `_graph_commit_actors.lance` datasets are **retired** (Phase B — lineage lives in
+> `__manifest`; the `CommitGraph` is a pure projection). References to those tables
+> below are historical: `optimize` now compacts **`__manifest` only** among the
+> internal tables, and the per-write `_graph_commits` scan term is gone. See
+> [versioning.md](versioning.md) and [invariants.md](invariants.md).
+
 **Status:** living handoff. **Source of truth is [`rfc-013-write-path-latency.md`](rfc-013-write-path-latency.md)** —
 this doc is the *current-state map + the decisions/validation from the latest work cycle
 + the concrete next actions*. When they disagree, the RFC wins (and fix this doc).
@@ -142,9 +149,11 @@ a 0-IO cache hit). So, apples-to-apples (both ground truth), per-write `__manife
      is genuinely cross-branch with no index today).
    - **PR4 / RFC #7264** — Lance native branch-aware `BatchCreateTableVersions`; manifest read → O(1),
      per-write fragment append gone; retires most of PR1/PR2. Upstream-blocked.
-4. **Low-leverage:** retire the vestigial `_graph_commits`/`_graph_commit_actors` datasets (zero rows
-   post-#299, only branch-ref carriers); a bitmap index on `__manifest` (no builder exists; `use_index(false)`
-   means it can't serve the CAS join anyway — a `graph_head:<branch>` point-lookup is the better variant).
+4. **Low-leverage:** ~~retire the vestigial `_graph_commits`/`_graph_commit_actors` datasets~~ **DONE**
+   (Phase B of the strand-and-retire work — the tables are gone, branch authority is `__manifest`, the
+   `CommitGraph` is a pure `__manifest` projection). Still open: a bitmap index on `__manifest` (no builder
+   exists; `use_index(false)` means it can't serve the CAS join anyway — a `graph_head:<branch>` point-lookup
+   is the better variant).
 
 ### A.6 Critical files (Thread B)
 

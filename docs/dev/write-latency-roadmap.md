@@ -70,7 +70,7 @@ The publisher loop runs cold `load_publish_state` (open + full scan) on every at
 
 ## Sequencing
 
-0. **Prereq (separate plan): retire `_graph_commits.lance` + `_graph_commit_actors.lance`.** Simplifies Layer 1 to `__manifest`-only and removes 2 cold-open LISTs. (Strand-and-rebuild storage-versioning plan.)
+0. **Prereq (separate plan): retire `_graph_commits.lance` + `_graph_commit_actors.lance`. — DONE.** Phase B of the strand-and-retire storage-versioning work landed this: the tables are gone, Layer 1's GC scope is `__manifest`-only, and the 2 cold-open LISTs are removed.
 1. **Operational now:** one-shot quiesced `__manifest` cleanup on the production graph (~7s → ~1s, no code).
 2. **Layer 1:** wire `__manifest` into the `cleanup` command (manual/quiesced + sidecar-refuse) — the 80/20.
 3. **Layers 3 + 4:** open-at-pinned-version + optimistic warm publish — remove the redundant round-trips; bring a warm write to ~2 cheap Lance-commit lists + writes.

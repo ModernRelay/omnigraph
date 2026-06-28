@@ -1,5 +1,13 @@
 # RFC-013: Write-path latency — capture-once `WriteTxn`, manifest-authoritative publish, bounded history, and a measured cost contract
 
+> **Status update (storage-versioning strand-and-retire work):** the
+> `_graph_commits.lance` / `_graph_commit_actors.lance` datasets are now **retired**
+> (Phase B — lineage lives in `__manifest` as `graph_commit` / `graph_head` rows;
+> the `CommitGraph` is a pure `__manifest` projection). References to those tables
+> below are historical: the remaining `optimize` / `cleanup` internal-table scope is
+> **`__manifest`-only**, and the per-write `_graph_commits` scan term is gone. See
+> [invariants.md](invariants.md) and [versioning.md](versioning.md).
+
 **Status:** Proposed
 **Author(s):** write-path latency investigation (handoff + multi-agent validation)
 **Date:** 2026-06-19
