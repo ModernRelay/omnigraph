@@ -732,9 +732,15 @@ pub(crate) fn print_embed_human(output: &EmbedOutput) {
     );
 }
 
-pub(crate) fn print_snapshot_human(branch: &str, manifest_version: u64, entries: &[SnapshotTableOutput]) {
+pub(crate) fn print_snapshot_human(
+    branch: &str,
+    manifest_version: u64,
+    internal_schema_version: u32,
+    entries: &[SnapshotTableOutput],
+) {
     println!("branch: {}", branch);
     println!("manifest_version: {}", manifest_version);
+    println!("internal_schema_version: {}", internal_schema_version);
     for entry in entries {
         println!(
             "{} v{} branch={} rows={}",

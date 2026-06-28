@@ -108,11 +108,10 @@ const FORBIDDEN_PATTERNS: &[&str] = &[
 /// Files exempt from the guard. These are the legitimate storage-layer
 /// or manifest-layer implementations that USE the forbidden APIs to
 /// provide the staged primitives or to maintain the system tables
-/// (commit graph, manifest).
+/// (manifest, recovery audit).
 const ALLOW_LIST_FILES: &[&str] = &[
     "table_store.rs",       // The storage layer itself.
     "storage_layer.rs",     // The trait module.
-    "commit_graph.rs",      // Maintains `_graph_commits.lance` system table.
     "graph_coordinator.rs", // Drives the manifest publisher / branch coordinator.
     "recovery_audit.rs",    // Maintains `_graph_commit_recoveries.lance` (recovery audit trail).
     "instrumentation.rs",   // The instrumented dataset opener (open_dataset_tracked / open_table_dataset).

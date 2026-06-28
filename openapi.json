@@ -1964,9 +1964,16 @@
         "type": "object",
         "required": [
           "status",
-          "version"
+          "version",
+          "internal_schema_version"
         ],
         "properties": {
+          "internal_schema_version": {
+            "type": "integer",
+            "format": "int32",
+            "description": "The internal-schema (storage-format) version this binary writes and reads.",
+            "minimum": 0
+          },
           "source_version": {
             "type": [
               "string",
@@ -2491,11 +2498,18 @@
         "required": [
           "branch",
           "manifest_version",
+          "internal_schema_version",
           "tables"
         ],
         "properties": {
           "branch": {
             "type": "string"
+          },
+          "internal_schema_version": {
+            "type": "integer",
+            "format": "int32",
+            "description": "The on-disk internal-schema (storage-format) version this graph's branch\nis stamped at.",
+            "minimum": 0
           },
           "manifest_version": {
             "type": "integer",

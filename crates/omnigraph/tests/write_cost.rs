@@ -31,16 +31,16 @@ use helpers::{MUTATION_QUERIES, commit_many, commit_many_as, init_and_load, mixe
 
 // ── (A) The internal-table LOCK — the acceptance test for step 2 (compaction) ──
 //
-// `__manifest` / `_graph_commits` / `_graph_commit_actors` scans on a write must be
-// O(1) in commit-history depth **on a compacted graph**. Without internal-table
-// compaction these scans are O(fragments) and grow forever; step 2 brings all three
-// internal tables into `db.optimize()`, so after compaction the per-write scan is
-// flat. The test runs the **authenticated (actorful) write path** — every commit
-// carries an actor, so it grows `_graph_commit_actors.lance` too (the production
-// server/CLI path); the commit-graph IO wrapper covers both that and `_graph_commits`,
-// so `commit_graph_reads` includes the actor-table scan. It compacts at each depth
-// checkpoint before measuring — pinning the production invariant "a periodically-
-// compacted graph's write cost does not grow with version history."
+// The `__manifest` scan on a write must be O(1) in commit-history depth **on a
+// compacted graph**. Graph lineage lives in `__manifest` (RFC-013 Phase 7 — the
+// `_graph_commits`/`_graph_commit_actors` tables are retired), so the manifest scan
+// also covers the lineage and actor rows the authenticated write path appends.
+// Without internal-table compaction these scans are O(fragments) and grow forever;
+// step 2 brings the internal tables into `db.optimize()`, so after compaction the
+// per-write scan is flat. The test runs the **authenticated (actorful) write path**
+// — every commit carries an actor — and compacts at each depth checkpoint before
+// measuring, pinning the production invariant "a periodically-compacted graph's
+// write cost does not grow with version history."
 #[tokio::test]
 async fn internal_table_scans_are_flat_in_history() {
     // `cost_harness` installs the ground-truth __manifest tracker for the whole body,
@@ -64,16 +64,16 @@ async fn internal_table_scans_are_flat_in_history() {
         let io = measure_insert_as(&mut db, &format!("lock_{d}"), ACTOR).await;
         current += 1; // the measured write advanced depth by one
         eprintln!(
-            "depth~{d}: data={} __manifest={} _graph_commits+actors={}",
-            io.data_reads, io.manifest_reads, io.commit_graph_reads
+            "depth~{d}: data={} __manifest={}",
+            io.data_reads, io.manifest_reads
         );
         curve.push((d, io));
     }
 
+    // Lineage + actor rows live in `__manifest` now, so this single flat-assertion
+    // gates the whole internal-table scan (including the authenticated path's actor
+    // rows) across history.
     assert_flat(&curve, |c| c.manifest_reads, 4, "__manifest scan");
-    // commit_graph_reads covers BOTH _graph_commits and _graph_commit_actors (shared
-    // wrapper), so this also gates the actor table on the authenticated path.
-    assert_flat(&curve, |c| c.commit_graph_reads, 4, "_graph_commits + _graph_commit_actors scan");
     })
     .await;
 }
@@ -99,8 +99,8 @@ async fn internal_table_scans_are_flat_in_history() {
 /// **When it goes red, that is the signal to invert it to**
 /// `assert_flat(&curve, |c| c.manifest_reads, <slack>, "__manifest scan (served)")` —
 /// promoting it to the permanent served-regime gate. Only `manifest_reads` is
-/// asserted: #299 moved lineage into `__manifest` and made the per-write commit-graph
-/// update in-memory, so `commit_graph_reads` no longer grows per write on this branch.
+/// asserted: lineage lives in `__manifest` (RFC-013 Phase 7) and the per-write
+/// commit-graph update is in-memory, so there is no separate commit-graph scan.
 #[tokio::test]
 async fn internal_table_scans_grow_without_compaction() {
     cost_harness(async {
@@ -120,8 +120,8 @@ async fn internal_table_scans_grow_without_compaction() {
         let io = measure_insert_as(&mut db, &format!("served_{d}"), ACTOR).await;
         current += 1; // the measured write advanced depth by one
         eprintln!(
-            "depth~{d} (uncompacted): data={} __manifest={} _graph_commits+actors={}",
-            io.data_reads, io.manifest_reads, io.commit_graph_reads
+            "depth~{d} (uncompacted): data={} __manifest={}",
+            io.data_reads, io.manifest_reads
         );
         curve.push((d, io));
     }
@@ -212,8 +212,8 @@ async fn write_op_count_ceiling_at_shallow_depth() {
     commit_many(&mut db, 5).await;
     let io = measure_insert(&mut db, "ceil").await;
     eprintln!(
-        "depth~5: data={} __manifest={} _graph_commits={} total_reads={}",
-        io.data_reads, io.manifest_reads, io.commit_graph_reads, io.total_reads()
+        "depth~5: data={} __manifest={} total_reads={}",
+        io.data_reads, io.manifest_reads, io.total_reads()
     );
     // Sub-ceiling on ground-truth `__manifest` reads. ~18 measured at this depth =
     // ~15 publish-path scans (one fold, not four — RFC-013 P2) + ~3 from the

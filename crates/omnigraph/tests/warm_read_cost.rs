@@ -76,10 +76,6 @@ async fn warm_same_branch_read_does_no_resolution_opens() {
         "warm same-branch read must not scan __manifest (resolution or per-table)"
     );
     assert_eq!(
-        io.commit_graph_reads, 0,
-        "warm same-branch read must not open the commit graph (no coordinator re-open)"
-    );
-    assert_eq!(
         io.version_probes, 1,
         "warm same-branch read performs exactly one version probe"
     );
@@ -267,10 +263,6 @@ async fn warm_branch_read_does_no_manifest_scans() {
         "warm branch read must not scan __manifest (branch-owned table opened by location)"
     );
     assert_eq!(
-        io.commit_graph_reads, 0,
-        "warm branch read must not open the commit graph"
-    );
-    assert_eq!(
         io.version_probes, 1,
         "warm branch read performs exactly one version probe"
     );
@@ -356,10 +348,6 @@ async fn warm_read_on_recreated_branch_observes_new_incarnation() {
     assert!(
         io.manifest_reads > 0,
         "recreated branch must re-read the manifest after the incarnation probe"
-    );
-    assert_eq!(
-        io.commit_graph_reads, 0,
-        "same-branch incarnation refresh must be manifest-only"
     );
     assert_eq!(
         io.version_probes, 2,
@@ -453,10 +441,6 @@ async fn recreated_branch_owned_table_handle_uses_table_etag() {
     assert!(
         io.manifest_reads > 0,
         "recreated branch must refresh the manifest"
-    );
-    assert_eq!(
-        io.commit_graph_reads, 0,
-        "same-branch table-incarnation refresh must be manifest-only"
     );
     assert_eq!(
         io.version_probes, 2,
@@ -575,10 +559,6 @@ async fn recreated_branch_traversal_uses_graph_index_incarnation() {
         "recreated branch traversal must refresh the manifest"
     );
     assert_eq!(
-        io.commit_graph_reads, 0,
-        "same-branch traversal incarnation refresh must be manifest-only"
-    );
-    assert_eq!(
         io.version_probes, 2,
         "stale same-branch read probes once under each lock"
     );
@@ -644,10 +624,6 @@ async fn stale_read_refreshes_manifest_only() {
         "stale read must re-read the manifest"
     );
     assert_eq!(
-        io.commit_graph_reads, 0,
-        "stale refresh must be manifest-only (no commit-graph scan)"
-    );
-    assert_eq!(
         io.version_probes, 2,
         "stale same-branch read probes once under the read lock and once under the write lock"
     );
@@ -701,10 +677,6 @@ async fn repeat_warm_read_reuses_table_handles() {
         "a warm repeat read must reuse the held handle (0 table opens)"
     );
     assert_eq!(warm.manifest_reads, 0, "warm repeat read: 0 manifest opens");
-    assert_eq!(
-        warm.commit_graph_reads, 0,
-        "warm repeat read: 0 commit-graph opens"
-    );
     assert_eq!(
         warm.version_probes, 1,
         "warm repeat read: exactly one version probe"

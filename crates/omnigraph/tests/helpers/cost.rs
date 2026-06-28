@@ -11,7 +11,7 @@
 //! opener (RFC-013 step 3a's target, O(1) after the bypass) from the merge-insert/RI
 //! scan (O(fragment-count), compaction's domain) even though both ride the same
 //! `Dataset` — without controlling the fixture (no compaction needed). `__manifest`
-//! and `_graph_commits` keep the plain `IOTracker` (no sub-prefixes worth splitting).
+//! keeps the plain `IOTracker` (no sub-prefixes worth splitting).
 #![allow(dead_code)]
 
 use std::fmt;
@@ -52,10 +52,9 @@ pub struct IoCounts {
     /// merge-insert/RI **scan**, which grows with fragment count (compaction's
     /// domain, not the opener).
     pub data_scan_reads: u64,
-    /// `__manifest` registry scans (publish state).
+    /// `__manifest` registry scans (publish state; includes the graph-lineage rows
+    /// folded into `__manifest` by RFC-013 Phase 7).
     pub manifest_reads: u64,
-    /// `_graph_commits` lineage scans.
-    pub commit_graph_reads: u64,
     /// Version-probe invocations (the cheap freshness check).
     pub version_probes: u64,
     /// DATA-table open CALL count through the two instrumented chokepoints — an
@@ -63,14 +62,14 @@ pub struct IoCounts {
     /// internal/system-table opens are excluded. Step-3b target:
     /// `data_open_count <= |touched_tables|` for a write.
     pub data_open_count: u64,
-    /// Internal/system-table (`__manifest`, `_graph_commits*`) open CALL count —
-    /// the complement of `data_open_count` (publisher CAS + commit-graph append).
+    /// Internal/system-table (`__manifest`) open CALL count — the complement of
+    /// `data_open_count` (publisher CAS).
     pub internal_open_count: u64,
 }
 
 impl IoCounts {
     pub fn total_reads(&self) -> u64 {
-        self.data_reads + self.manifest_reads + self.commit_graph_reads
+        self.data_reads + self.manifest_reads
     }
 }
 
@@ -277,11 +276,10 @@ pub async fn cost_harness<F: Future>(body: F) -> F::Output {
 }
 
 /// The tracker handles backing one measurement; read once into [`IoCounts`]. Data,
-/// commit-graph, probe, and open counters are fresh per op; the `__manifest` tracker
-/// is the ambient ground-truth one when inside `cost_harness`, else fresh.
+/// probe, and open counters are fresh per op; the `__manifest` tracker is the ambient
+/// ground-truth one when inside `cost_harness`, else fresh.
 struct OpProbes {
     manifest: IOTracker,
-    commit_graph: IOTracker,
     table: PrefixCounter,
     probe_count: Arc<AtomicU64>,
     data_open_count: Arc<AtomicU64>,
@@ -300,7 +298,6 @@ impl OpProbes {
         let _ = manifest.incremental_stats();
         let h = OpProbes {
             manifest,
-            commit_graph: IOTracker::default(),
             table: PrefixCounter::default(),
             probe_count: Arc::new(AtomicU64::new(0)),
             data_open_count: Arc::new(AtomicU64::new(0)),
@@ -308,9 +305,6 @@ impl OpProbes {
         };
         let probes = QueryIoProbes {
             manifest_wrapper: Some(Arc::new(h.manifest.clone()) as Arc<dyn WrappingObjectStore>),
-            commit_graph_wrapper: Some(
-                Arc::new(h.commit_graph.clone()) as Arc<dyn WrappingObjectStore>
-            ),
             table_wrapper: Some(Arc::new(h.table.clone()) as Arc<dyn WrappingObjectStore>),
             probe_count: Arc::clone(&h.probe_count),
             data_open_count: Arc::clone(&h.data_open_count),
@@ -342,7 +336,6 @@ impl OpProbes {
             data_opener_reads: t.opener_reads,
             data_scan_reads: t.scan_reads,
             manifest_reads: manifest.read_iops,
-            commit_graph_reads: self.commit_graph.incremental_stats().read_iops,
             version_probes: self.probe_count.load(Ordering::Relaxed),
             data_open_count: self.data_open_count.load(Ordering::Relaxed),
             internal_open_count: self.internal_open_count.load(Ordering::Relaxed),
@@ -433,10 +426,9 @@ pub async fn measure_insert(db: &mut Omnigraph, tag: &str) -> IoCounts {
     io
 }
 
-/// Like [`measure_insert`] but carries an actor, so the write appends to and reads
-/// `_graph_commit_actors.lance` — the authenticated (server/CLI) write path. The
-/// commit-graph IO wrapper covers both `_graph_commits` and `_graph_commit_actors`,
-/// so `IoCounts::commit_graph_reads` includes the actor-table scan on this path.
+/// Like [`measure_insert`] but carries an actor — the authenticated (server/CLI)
+/// write path. The actor is written inline with the graph-lineage rows in
+/// `__manifest` (RFC-013 Phase 7), so its scan is part of `IoCounts::manifest_reads`.
 pub async fn measure_insert_as(db: &mut Omnigraph, tag: &str, actor: &str) -> IoCounts {
     let (res, io) = measure(db.mutate_as(
         "main",

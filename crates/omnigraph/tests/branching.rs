@@ -1429,27 +1429,6 @@ async fn branch_merge_reports_cardinality_violation_conflict() {
 }
 
 #[tokio::test]
-async fn branch_create_bootstraps_missing_commit_graph() {
-    let dir = tempfile::tempdir().unwrap();
-    let uri = dir.path().to_str().unwrap();
-    let db = init_and_load(&dir).await;
-    drop(db);
-
-    fs::remove_dir_all(dir.path().join("_graph_commits.lance")).unwrap();
-
-    let mut reopened = Omnigraph::open(uri).await.unwrap();
-    reopened.branch_create("feature").await.unwrap();
-
-    assert!(dir.path().join("_graph_commits.lance").exists());
-
-    let feature = Omnigraph::open(uri).await.unwrap();
-    assert_eq!(
-        count_rows_branch(&feature, "feature", "node:Person").await,
-        4
-    );
-}
-
-#[tokio::test]
 async fn branch_api_rejects_reserved_main_and_same_source_target_merge() {
     let dir = tempfile::tempdir().unwrap();
     let mut db = init_and_load(&dir).await;

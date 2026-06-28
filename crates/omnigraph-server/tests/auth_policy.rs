@@ -38,6 +38,10 @@ async fn healthz_succeeds_after_startup() {
     assert_eq!(status, StatusCode::OK);
     assert_eq!(body["status"], "ok");
     assert_eq!(body["version"], env!("CARGO_PKG_VERSION"));
+    assert_eq!(
+        body["internal_schema_version"].as_u64().unwrap(),
+        u64::from(omnigraph::db::manifest::INTERNAL_MANIFEST_SCHEMA_VERSION)
+    );
     match option_env!("OMNIGRAPH_SOURCE_VERSION") {
         Some(source_version) => assert_eq!(body["source_version"], source_version),
         None => assert!(body.get("source_version").is_none()),

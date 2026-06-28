@@ -1,17 +1,15 @@
 //! Recovery audit row storage in `_graph_commit_recoveries.lance`.
 //!
-//! Sibling to `_graph_commits.lance` (`commit_graph.rs`). Each successful
+//! A standalone internal table (not catalog-tracked). Each successful
 //! recovery sweep — roll-forward or roll-back — records one row here so
 //! operators investigating a sidecar-attributed mutation can correlate
 //! `omnigraph commit list --filter actor=omnigraph:recovery` with the
 //! original actor whose mutation was rolled forward / back.
 //!
-//! Sibling-table is additive: it doesn't bump
-//! `INTERNAL_MANIFEST_SCHEMA_VERSION`, and can be removed in favor of a
-//! schema migration later if the join cost matters. The schema-migration
-//! alternative (adding `recovery_for_actor` and `recovery_kind` columns
-//! to `_graph_commits.lance` itself) was considered and rejected to keep
-//! this change additive.
+//! This standalone table is additive: it doesn't bump
+//! `INTERNAL_MANIFEST_SCHEMA_VERSION`. Folding `recovery_for_actor` and
+//! `recovery_kind` into the `__manifest` `graph_commit` rows instead was
+//! considered and rejected to keep this change additive.
 //!
 //! Atomicity caveat: append to `_graph_commit_recoveries.lance` is
 //! sequential w.r.t. the recovery commit, which RFC-013 Phase 7 records in
@@ -100,8 +98,7 @@ pub(crate) struct RecoveryAudit {
 
 impl RecoveryAudit {
     /// Open the recovery-audit dataset for the graph, or return a handle
-    /// with no dataset yet (created on first append). Mirrors the
-    /// optional-dataset pattern from `_graph_commit_actors.lance`.
+    /// with no dataset yet (it is created lazily on the first append).
     pub(crate) async fn open(root_uri: &str) -> Result<Self> {
         let root = root_uri.trim_end_matches('/').to_string();
         let dataset = Dataset::open(&recoveries_uri(&root)).await.ok();
@@ -112,8 +109,8 @@ impl RecoveryAudit {
     }
 
     /// Append one recovery audit record. Lazily initializes the dataset
-    /// on first call (idempotent under racy creation via the same
-    /// `Dataset already exists` rebound as `_graph_commit_actors.lance`).
+    /// on first call (idempotent under racy creation: a `Dataset already
+    /// exists` error is rebound to an open of the just-created dataset).
     pub(crate) async fn append(&mut self, record: RecoveryAuditRecord) -> Result<()> {
         let batch = recovery_record_to_batch(&record)?;
         let reader = RecordBatchIterator::new(vec![Ok(batch)], recoveries_schema());

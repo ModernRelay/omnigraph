@@ -36,7 +36,6 @@ use crate::storage::StorageAdapter;
 #[derive(Clone, Default)]
 pub struct QueryIoProbes {
     pub manifest_wrapper: Option<Arc<dyn WrappingObjectStore>>,
-    pub commit_graph_wrapper: Option<Arc<dyn WrappingObjectStore>>,
     /// Attached to the per-table data opens a query performs (the cache-miss
     /// path in `SubTableEntry::open`). Lets a cost test assert how many tables
     /// a query actually opened — N on a cold read, 0 on a warm repeat once the
@@ -45,9 +44,9 @@ pub struct QueryIoProbes {
     pub probe_count: Arc<AtomicU64>,
     /// Counts DATA-table open CALLS through the two instrumented chokepoints
     /// (`open_dataset_tracked` / `open_table_dataset`), classified by URI so the
-    /// internal/system tables (`__manifest`, `_graph_commits*`) are EXCLUDED — the
-    /// publisher CAS and commit-graph append open those every write, and counting
-    /// them would make the `data_open_count <= |touched_tables|` write gate
+    /// internal/system tables (`__manifest`) are EXCLUDED — the publisher CAS
+    /// opens those every write, and counting them would make the
+    /// `data_open_count <= |touched_tables|` write gate
     /// (RFC-013 step 3b) unreachable by threading alone. Unlike the opener-read
     /// term (which mixes with the merge-insert/RI scan on the write path), this is
     /// an exact open-invocation count. `forbidden_apis` keeps engine code OUTSIDE the
@@ -57,8 +56,8 @@ pub struct QueryIoProbes {
     /// does hold direct `Dataset::open`s — but only for branch-management ops
     /// (`delete_branch`/`list_branches`/`force_delete_branch`), never that hot path.)
     pub data_open_count: Arc<AtomicU64>,
-    /// Internal/system-table (`__manifest`, `_graph_commits*`) open CALLS — the
-    /// complement of `data_open_count`, kept for symmetry and debugging.
+    /// Internal/system-table (`__manifest`) open CALLS — the complement of
+    /// `data_open_count`, kept for symmetry and debugging.
     pub internal_open_count: Arc<AtomicU64>,
     /// Counts topology-index builds (the `RuntimeCache::graph_index` cache-miss
     /// path). A cost test asserts a fresh branch whose edge tables are unchanged
@@ -91,10 +90,6 @@ pub(crate) fn manifest_wrapper() -> Option<Arc<dyn WrappingObjectStore>> {
     current(|p| p.manifest_wrapper.clone()).flatten()
 }
 
-pub(crate) fn commit_graph_wrapper() -> Option<Arc<dyn WrappingObjectStore>> {
-    current(|p| p.commit_graph_wrapper.clone()).flatten()
-}
-
 pub(crate) fn table_wrapper() -> Option<Arc<dyn WrappingObjectStore>> {
     current(|p| p.table_wrapper.clone()).flatten()
 }
@@ -106,15 +101,9 @@ pub(crate) fn record_probe() {
 }
 
 /// Internal/system table directory names. An open of one of these is a metadata
-/// open (publisher CAS, commit-graph append, recovery audit), NOT a data-table
-/// open. Kept in sync with the dir constants in `db/manifest/layout.rs`,
-/// `db/commit_graph.rs`, and `db/recovery_audit.rs`.
-const INTERNAL_TABLE_DIRS: [&str; 4] = [
-    "__manifest",
-    "_graph_commits.lance",
-    "_graph_commit_actors.lance",
-    "_graph_commit_recoveries.lance",
-];
+/// open (publisher CAS, recovery audit), NOT a data-table open. Kept in sync with
+/// the dir constants in `db/manifest/layout.rs` and `db/recovery_audit.rs`.
+const INTERNAL_TABLE_DIRS: [&str; 2] = ["__manifest", "_graph_commit_recoveries.lance"];
 
 /// True when `uri`'s last path segment names an internal/system table.
 fn open_is_internal(uri: &str) -> bool {
@@ -125,7 +114,7 @@ fn open_is_internal(uri: &str) -> bool {
 
 /// Record one table-open call against the active per-query probes, classified by
 /// table class (the URI's last segment) so the write gate counts DATA-table opens
-/// only and ignores the publisher/commit-graph metadata opens. No-op in production
+/// only and ignores the publisher metadata opens. No-op in production
 /// (the classification runs only inside the probe closure, which `current` skips
 /// when no probes are installed). Called at both open chokepoints.
 pub(crate) fn record_open(uri: &str) {
