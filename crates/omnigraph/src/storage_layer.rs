@@ -240,6 +240,16 @@ pub trait TableStorage: sealed::Sealed + Send + Sync + Debug {
         branch: Option<&str>,
     ) -> Result<SnapshotHandle>;
 
+    /// List-free pinned open of a table at `version` from its joined base
+    /// `full_path` (`with_version`, no `_versions/` LIST). The non-strict
+    /// staging open uses this to pin to the manifest-resolved base version.
+    async fn open_table_pinned(
+        &self,
+        full_path: &str,
+        branch: Option<&str>,
+        version: u64,
+    ) -> Result<SnapshotHandle>;
+
     async fn fork_branch_from_state(
         &self,
         dataset_uri: &str,
@@ -504,6 +514,17 @@ impl TableStorage for TableStore {
         branch: Option<&str>,
     ) -> Result<SnapshotHandle> {
         TableStore::open_dataset_head_for_write(self, table_key, dataset_uri, branch)
+            .await
+            .map(SnapshotHandle::new)
+    }
+
+    async fn open_table_pinned(
+        &self,
+        full_path: &str,
+        branch: Option<&str>,
+        version: u64,
+    ) -> Result<SnapshotHandle> {
+        TableStore::open_table_pinned(self, full_path, branch, version)
             .await
             .map(SnapshotHandle::new)
     }

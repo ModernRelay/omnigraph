@@ -61,14 +61,24 @@ pub(super) fn table_id_to_key(request_id: Option<&Vec<String>>) -> lance_namespa
 }
 
 pub(super) fn table_uri_for_path(root_uri: &str, table_path: &str, branch: Option<&str>) -> String {
-    let mut dataset_location = join_uri(root_uri, table_path);
+    table_uri_for_location(&join_uri(root_uri, table_path), branch)
+}
+
+/// Branch-encode + scheme-normalize a table's BASE location (the `root/table_path`
+/// join) into the URI Lance opens. Factored from `table_uri_for_path` so a caller
+/// that already holds the joined `full_path` (the write staging path) builds the
+/// identical pinned-open location without re-deriving `table_path`. For a non-main
+/// branch this appends `tree/{branch}` so the branch's own version chain resolves
+/// without a `checkout_branch`; local locations are converted to `file://`.
+pub(crate) fn table_uri_for_location(location: &str, branch: Option<&str>) -> String {
+    let mut dataset_location = location.to_string();
     if let Some(branch) = branch.filter(|branch| *branch != "main") {
         dataset_location = join_uri(&dataset_location, "tree");
         for segment in branch.split('/') {
             dataset_location = join_uri(&dataset_location, segment);
         }
     }
-    match storage_kind_for_uri(root_uri) {
+    match storage_kind_for_uri(location) {
         StorageKind::Local => url::Url::from_file_path(&dataset_location)
             .map(|uri| uri.to_string())
             .unwrap_or(dataset_location),

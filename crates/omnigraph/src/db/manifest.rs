@@ -29,7 +29,7 @@ mod state;
 
 use graph::{init_manifest_graph, open_manifest_graph, snapshot_state_at};
 use layout::{open_manifest_dataset, table_uri_for_path, type_name_hash};
-pub(crate) use layout::manifest_uri;
+pub(crate) use layout::{manifest_uri, table_uri_for_location};
 pub(crate) use metadata::TableVersionMetadata;
 #[cfg(test)]
 use metadata::{OMNIGRAPH_ROW_COUNT_KEY, table_version_metadata_for_state};
