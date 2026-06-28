@@ -122,7 +122,58 @@ struct LoadedPublishState {
     registered_tables: HashMap<String, String>,
     existing_versions: HashMap<(String, u64), SubTableEntry>,
     existing_tombstones: HashMap<(String, u64), ()>,
-    lineage_rows: Vec<GraphLineageRow>,
+    lineage: LineageSource,
+}
+
+/// How a publish attempt resolves the new commit's PARENT. The COLD path carries
+/// the `graph_commit` rows from this attempt's `__manifest` scan and picks the
+/// head over them; the WARM path (Layer 4) carries the coordinator's in-memory
+/// commit-graph head directly (the head_hint), skipping the scan. Both feed the
+/// same `build_lineage_commit`.
+enum LineageSource {
+    Cold(Vec<GraphLineageRow>),
+    Warm(Option<String>),
+}
+
+/// The coordinator's warm state handed to publish ATTEMPT 0 so it can skip the
+/// cold `load_publish_state` `__manifest` scan (Layer 4). Borrows the warm
+/// `__manifest` handle and carries the maps derived from the folded `known_state`
+/// plus the in-memory head_hint. The caller freshness-probes BEFORE building this
+/// (so a stale warm state is never passed); the publisher CAS still arbitrates,
+/// and attempts 1+ fall back to cold `load_publish_state`. Constructed in
+/// `commit_changes_with_lineage` (Phase 3.3).
+#[allow(dead_code)] // constructed in Phase 3.3 (warm activation); consumed by `from_warm`
+pub(crate) struct WarmAttempt<'a> {
+    pub(crate) dataset: &'a Dataset,
+    pub(crate) registered_tables: HashMap<String, String>,
+    pub(crate) existing_versions: HashMap<(String, u64), SubTableEntry>,
+    pub(crate) head_hint: Option<&'a str>,
+}
+
+impl std::fmt::Debug for WarmAttempt<'_> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("WarmAttempt")
+            .field("head_hint", &self.head_hint)
+            .field("tables", &self.registered_tables.len())
+            .finish_non_exhaustive()
+    }
+}
+
+impl LoadedPublishState {
+    /// Build a publish attempt's loaded state from the coordinator's WARM state
+    /// (Layer 4), with NO `__manifest` scan. The assembled `known_state` already
+    /// dropped tombstoned tables, so `existing_tombstones` is empty by
+    /// construction (a non-strict insert never references a tombstoned table);
+    /// the parent comes from the head_hint, not scanned lineage rows.
+    fn from_warm(w: &WarmAttempt<'_>) -> Self {
+        LoadedPublishState {
+            dataset: w.dataset.clone(),
+            registered_tables: w.registered_tables.clone(),
+            existing_versions: w.existing_versions.clone(),
+            existing_tombstones: HashMap::new(),
+            lineage: LineageSource::Warm(w.head_hint.map(str::to_string)),
+        }
+    }
 }
 
 impl GraphNamespacePublisher {
@@ -177,8 +228,26 @@ impl GraphNamespacePublisher {
             registered_tables: scan.table_locations,
             existing_versions,
             existing_tombstones,
-            lineage_rows: scan.lineage_rows,
+            lineage: LineageSource::Cold(scan.lineage_rows),
         })
+    }
+
+    /// The per-attempt load. ATTEMPT 0 reuses the caller's WARM state (Layer 4,
+    /// no `__manifest` scan) when one was supplied; every other attempt — and
+    /// attempt 0 with no warm state — does the cold `load_publish_state` scan. So
+    /// a CAS loss always reloads cold on the next attempt: the warm pre-check is
+    /// advisory, the merge CAS arbitrates.
+    async fn load_for_attempt(
+        &self,
+        attempt: u32,
+        warm: Option<&WarmAttempt<'_>>,
+    ) -> Result<LoadedPublishState> {
+        if attempt == 0 {
+            if let Some(w) = warm {
+                return Ok(LoadedPublishState::from_warm(w));
+            }
+        }
+        self.load_publish_state().await
     }
 
     fn build_pending_rows(
@@ -351,7 +420,29 @@ impl GraphNamespacePublisher {
         new_manifest_version: u64,
     ) -> Result<(Vec<PendingVersionRow>, Option<String>)> {
         let parent_commit_id = head_lineage_row(lineage_rows).map(|h| h.graph_commit_id.clone());
+        Self::build_lineage_commit(parent_commit_id, intent, new_manifest_version)
+    }
 
+    /// The WARM-path lineage resolution (Layer 4): the parent is the supplied
+    /// in-memory commit-graph `head` — the same `should_replace_head` winner
+    /// `head_lineage_row` computes over a fresh scan WHEN the warm state is fresh,
+    /// which the caller's freshness probe guarantees. A CAS loss reloads cold and
+    /// re-resolves via `resolve_lineage_rows`, so a stale head is never committed.
+    fn resolve_lineage_rows_from_head(
+        head: Option<&str>,
+        intent: &LineageIntent,
+        new_manifest_version: u64,
+    ) -> Result<(Vec<PendingVersionRow>, Option<String>)> {
+        Self::build_lineage_commit(head.map(ToOwned::to_owned), intent, new_manifest_version)
+    }
+
+    /// Shared body: build the new commit's two lineage rows (`graph_commit` +
+    /// `graph_head`) from its resolved `parent_commit_id`.
+    fn build_lineage_commit(
+        parent_commit_id: Option<String>,
+        intent: &LineageIntent,
+        new_manifest_version: u64,
+    ) -> Result<(Vec<PendingVersionRow>, Option<String>)> {
         let commit = GraphLineageRow {
             graph_commit_id: intent.graph_commit_id.clone(),
             manifest_branch: intent.branch.clone(),
@@ -622,6 +713,7 @@ impl GraphNamespacePublisher {
                 changes: &changes,
                 expected_table_versions: &HashMap::new(),
                 lineage: None,
+                warm: None,
             })
             .await?
             .dataset)
@@ -678,6 +770,7 @@ impl ManifestBatchPublisher for GraphNamespacePublisher {
             changes,
             expected_table_versions,
             lineage,
+            warm,
         } = *plan;
         if changes.is_empty() && expected_table_versions.is_empty() && lineage.is_none() {
             // Defensive no-op (never reached from `commit_changes_with_lineage`,
@@ -696,7 +789,7 @@ impl ManifestBatchPublisher for GraphNamespacePublisher {
             // Route a retryable `load_publish_state` error through the SAME retry
             // path as a retryable `merge_rows` conflict below, so typed contention
             // composes with the publisher retry instead of aborting the publish.
-            let loaded = match self.load_publish_state().await {
+            let loaded = match self.load_for_attempt(attempt, warm).await {
                 Ok(loaded) => loaded,
                 Err(err)
                     if attempt < PUBLISHER_RETRY_BUDGET && is_retryable_publish_conflict(&err) =>
@@ -710,7 +803,7 @@ impl ManifestBatchPublisher for GraphNamespacePublisher {
                 registered_tables: known_tables,
                 existing_versions,
                 existing_tombstones,
-                lineage_rows,
+                lineage: attempt_lineage,
             } = loaded;
 
             let latest_per_table =
@@ -738,8 +831,16 @@ impl ManifestBatchPublisher for GraphNamespacePublisher {
             let parent_commit_id = match lineage {
                 Some(intent) => {
                     let new_manifest_version = dataset.version().version + 1;
-                    let (commit_rows, parent) =
-                        Self::resolve_lineage_rows(&lineage_rows, intent, new_manifest_version)?;
+                    let (commit_rows, parent) = match &attempt_lineage {
+                        LineageSource::Cold(rows) => {
+                            Self::resolve_lineage_rows(rows, intent, new_manifest_version)?
+                        }
+                        LineageSource::Warm(head) => Self::resolve_lineage_rows_from_head(
+                            head.as_deref(),
+                            intent,
+                            new_manifest_version,
+                        )?,
+                    };
                     rows.extend(commit_rows);
                     parent
                 }

@@ -95,6 +95,7 @@ async fn publish_recovery_commit(
             changes: updates,
             expected_table_versions: expected,
             lineage: Some(&intent),
+            warm: None,
         })
         .await?;
     Ok((outcome.dataset.version().version, intent.graph_commit_id))
@@ -971,6 +972,7 @@ async fn discard_orphaned_branch_sidecar(
                 changes: &[],
                 expected_table_versions: &HashMap::new(),
                 lineage: Some(&intent),
+                warm: None,
             })
             .await?;
         // Failpoint: the residual window above — commit published, audit
