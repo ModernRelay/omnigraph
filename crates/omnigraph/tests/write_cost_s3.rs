@@ -99,7 +99,12 @@ async fn warm_write_cost_flat_and_bounded_in_history_on_s3() {
     cost_harness(async move {
         let mut curve: Vec<(u64, IoCounts)> = Vec::new();
         let mut current = 0u64;
-        for d in [10u64, 50, 100] {
+        // Depth capped at 50 (matches the opener test). Going to 100 trips a Lance
+        // FTS-index-builder panic during `optimize`'s `optimize_indices` merge on S3
+        // (`lance-index/src/scalar/inverted/builder.rs`: `token_id_map[token_id] ==
+        // u32::MAX`) over the fixture's `@index String` field — unrelated to this gate
+        // and tracked separately. The 10→50 slope already catches O(history) growth.
+        for d in [10u64, 50] {
             if d > current {
                 commit_many(&mut db, (d - current) as usize).await;
                 current = d;
@@ -125,19 +130,30 @@ async fn warm_write_cost_flat_and_bounded_in_history_on_s3() {
         // O(history) round-trip survives. The LIST count is the headline (drives
         // toward ~1 as pinned opens + warm publish land); `num_stages` is the
         // round-trip proxy closest to the reports' "wall ≈ round-trips × RTT".
+        // Measured baseline on RustFS (identical at depth 10 and 50, so perfectly
+        // flat with compaction): list=6, num_stages=13, manifest_reads=9, opener=4,
+        // total=14. Slacks are tight (the term is flat; the slack only absorbs minor
+        // object-store variance). A real O(history) term would add several per 40
+        // commits and trip these.
         assert_flat(&curve, |c| c.manifest_list_requests, 1, "S3 warm-write __manifest LIST count");
         assert_flat(&curve, |c| c.manifest_num_stages, 2, "S3 warm-write __manifest round-trips");
-        assert_flat(&curve, |c| c.manifest_reads, 6, "S3 warm-write __manifest reads");
-        assert_flat(&curve, |c| c.data_opener_reads, 4, "S3 warm-write data-table opener");
-        assert_flat(&curve, |c| c.total_reads(), 8, "S3 warm-write total reads");
+        assert_flat(&curve, |c| c.manifest_reads, 2, "S3 warm-write __manifest reads");
+        assert_flat(&curve, |c| c.data_opener_reads, 1, "S3 warm-write data-table opener");
+        assert_flat(&curve, |c| c.total_reads(), 2, "S3 warm-write total reads");
 
-        // Absolute ceiling at shallow depth — the layer-progress tracker. Ratchet
-        // DOWN as U1 lands (target list ~1, num_stages ~3). Seeded generously.
+        // Absolute ceiling at shallow depth — the layer-progress tracker, seeded at
+        // the measured baseline + 1. **Ratchet DOWN as each U1 layer removes a LIST**
+        // (target: list ~1, num_stages ~3 — LanceDB's measured warm commit).
         let shallow = &curve[0].1;
         assert!(
-            shallow.manifest_list_requests <= 8,
-            "warm-write __manifest LIST ceiling exceeded: {} (tighten/ratchet per the plan)",
+            shallow.manifest_list_requests <= 7,
+            "warm-write __manifest LIST ceiling exceeded: {} (baseline 6; a layer regressed?)",
             shallow.manifest_list_requests,
+        );
+        assert!(
+            shallow.manifest_num_stages <= 14,
+            "warm-write __manifest round-trip ceiling exceeded: {} (baseline 13)",
+            shallow.manifest_num_stages,
         );
     })
     .await;
