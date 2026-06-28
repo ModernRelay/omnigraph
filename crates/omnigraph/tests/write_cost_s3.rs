@@ -54,12 +54,11 @@ async fn data_table_opener_is_flat_in_history_on_s3() {
         let io = measure_insert(&mut db, &format!("s3_{d}")).await;
         current += 1;
         eprintln!(
-            "depth~{d}: opener={} scan={} data_total={} __manifest={} _graph_commits={}",
+            "depth~{d}: opener={} scan={} data_total={} __manifest={}",
             io.data_opener_reads,
             io.data_scan_reads,
             io.data_reads,
-            io.manifest_reads,
-            io.commit_graph_reads
+            io.manifest_reads
         );
         curve.push((d, io));
     }
