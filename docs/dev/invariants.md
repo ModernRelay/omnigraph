@@ -331,7 +331,18 @@ them explicit.
   deferred — it needs the Q8 cleanup-resurrection watermark first). The commit
   graph IS now reconcilable from the manifest (RFC-013 Phase 7 — it is a pure
   projection of the `graph_commit`/`graph_head` rows); the traversal id-map is
-  still rebuilt.
+  still rebuilt. The CSR/CSC topology index is now **scoped and cross-branch
+  reused** (the two cuts that closed the cross-edge-join hang): the build covers
+  only the edge types a query traverses (`referenced_edge_types` over
+  `Expand`/`AntiJoin`, not every catalog edge — a single-edge join no longer
+  scans the whole graph's edge data), and the `RuntimeCache` cache key is each
+  edge table's physical identity `(table_key, version, table_branch, e_tag)`
+  rather than the resolved snapshot id, so a lazy-fork branch reuses main's built
+  index instead of cold-scanning it. Residual: on stores without per-table
+  e_tags (local FS) a branch deleted and recreated at the same version has the
+  same key, so the topology distinction falls back to the same-branch manifest
+  refresh clearing read caches (`invalidate_all`); production object stores carry
+  real e_tags, so the key alone distinguishes incarnations there.
 - **Commit-graph parent under concurrency — CLOSED (RFC-013 Phase 7):** the graph
   commit is now recorded in the manifest publish CAS, and the publisher resolves
   the new commit's parent INSIDE its retry loop, per attempt, from the just-loaded
