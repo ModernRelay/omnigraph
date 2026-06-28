@@ -61,3 +61,8 @@ lance-namespace-impls = { workspace = true }
 lance-io = { version = "7.0.0", features = ["test-util"] }
 serial_test = "3"
 proptest = "1"
+# Shared DST harness (Backend/Embedded, Cohort, the invariant + convergence
+# batteries). The engine dev-dep -> omnigraph-dst -> engine cycle is supported
+# by cargo (the lib builds without dev-deps); dev-only, so production builds
+# never see it.
+omnigraph-dst = { path = "../omnigraph-dst" }
