@@ -251,6 +251,10 @@ pub(crate) struct PublishPlan<'a> {
     pub(crate) changes: &'a [ManifestChange],
     pub(crate) expected_table_versions: &'a HashMap<String, u64>,
     pub(crate) lineage: Option<&'a LineageIntent>,
+    /// Layer 4: the coordinator's warm state for publish attempt 0 (skips the
+    /// cold `__manifest` scan). `None` = always cold (the pre-Layer-4 behavior,
+    /// and the fallback when the freshness probe says the warm state is stale).
+    pub(crate) warm: Option<&'a publisher::WarmAttempt<'a>>,
 }
 
 impl SubTableEntry {
@@ -512,6 +516,9 @@ impl ManifestCoordinator {
             changes,
             expected_table_versions,
             lineage,
+            // Phase 3.2 scaffolding: always cold (byte-identical). Phase 3.3
+            // freshness-probes and sets this to `Some(&WarmAttempt { .. })`.
+            warm: None,
         };
         let PublishOutcome {
             dataset,

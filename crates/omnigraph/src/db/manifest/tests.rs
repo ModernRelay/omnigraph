@@ -1525,6 +1525,7 @@ async fn test_concurrent_publish_with_overlapping_expected_versions_one_succeeds
                     changes: &changes_a,
                     expected_table_versions: &expected_a,
                     lineage: None,
+                    warm: None,
                 })
                 .await
         },
@@ -1534,6 +1535,7 @@ async fn test_concurrent_publish_with_overlapping_expected_versions_one_succeeds
                     changes: &changes_b,
                     expected_table_versions: &expected_b,
                     lineage: None,
+                    warm: None,
                 })
                 .await
         }
@@ -1653,6 +1655,7 @@ async fn test_publish_rejects_manifest_stamped_at_future_version() {
             changes: &[],
             expected_table_versions: &expected,
             lineage: None,
+            warm: None,
         })
         .await
         .expect_err("future-stamped manifest should reject open-for-write");
@@ -2020,6 +2023,7 @@ async fn concurrent_disjoint_writes_share_head_and_form_linear_chain() {
                     changes: &changes_a,
                     expected_table_versions: &empty,
                     lineage: Some(&intent_a),
+                    warm: None,
                 })
                 .await
         },
@@ -2029,6 +2033,7 @@ async fn concurrent_disjoint_writes_share_head_and_form_linear_chain() {
                     changes: &changes_b,
                     expected_table_versions: &empty,
                     lineage: Some(&intent_b),
+                    warm: None,
                 })
                 .await
         }
@@ -2112,6 +2117,7 @@ async fn concurrent_disjoint_writes_form_linear_chain_on_s3() {
                     changes: &changes_a,
                     expected_table_versions: &empty,
                     lineage: Some(&intent_a),
+                    warm: None,
                 })
                 .await
         },
@@ -2121,6 +2127,7 @@ async fn concurrent_disjoint_writes_form_linear_chain_on_s3() {
                     changes: &changes_b,
                     expected_table_versions: &empty,
                     lineage: Some(&intent_b),
+                    warm: None,
                 })
                 .await
         }
@@ -2202,6 +2209,7 @@ async fn n_concurrent_disjoint_writers_converge_to_one_linear_chain() {
                         changes: &changes,
                         expected_table_versions: &empty,
                         lineage: Some(&intent),
+                        warm: None,
                     })
                     .await
                 {
