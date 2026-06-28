@@ -4921,6 +4921,20 @@ dependencies = [
 ]
 
 [[package]]
+name = "omnigraph-dst"
+version = "0.7.2"
+dependencies = [
+ "arrow-array",
+ "async-trait",
+ "futures",
+ "omnigraph-compiler",
+ "omnigraph-engine",
+ "serde_json",
+ "tempfile",
+ "tokio",
+]
+
+[[package]]
 name = "omnigraph-engine"
 version = "0.8.0"
 dependencies = [
