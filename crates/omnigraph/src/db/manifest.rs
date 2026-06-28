@@ -49,6 +49,12 @@ pub(crate) use state::{GraphLineageRow, read_graph_lineage};
 use state::string_column;
 use state::{ManifestState, read_manifest_state};
 
+/// The internal-schema (storage-format) version this binary writes and reads.
+/// A graph's on-disk per-branch stamp is read via [`internal_schema_stamp_at`];
+/// this const is the binary's CURRENT. Surfaced to operators via `omnigraph
+/// snapshot` and `omnigraph --version`.
+pub const INTERNAL_MANIFEST_SCHEMA_VERSION: u32 = migrations::INTERNAL_MANIFEST_SCHEMA_VERSION;
+
 const OBJECT_TYPE_TABLE: &str = "table";
 const OBJECT_TYPE_TABLE_VERSION: &str = "table_version";
 const OBJECT_TYPE_TABLE_TOMBSTONE: &str = "table_tombstone";

@@ -903,6 +903,16 @@ impl Omnigraph {
             .map(|snapshot| snapshot.version())
     }
 
+    /// The on-disk internal-schema version of `target`'s branch (the storage-format
+    /// version this graph is stamped at). Surfaced via `omnigraph snapshot`.
+    pub async fn internal_schema_version_of(
+        &self,
+        target: impl Into<ReadTarget>,
+    ) -> Result<u32> {
+        let branch = self.resolved_branch_of(target).await?;
+        crate::db::manifest::internal_schema_stamp_at(self.uri(), branch.as_deref()).await
+    }
+
     pub async fn resolved_branch_of(
         &self,
         target: impl Into<ReadTarget>,

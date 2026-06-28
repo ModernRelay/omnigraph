@@ -1914,6 +1914,10 @@ fn snapshot_json_returns_manifest_version_and_tables() {
         payload["manifest_version"].as_u64().unwrap(),
         manifest_dataset_version(&graph)
     );
+    assert_eq!(
+        payload["internal_schema_version"].as_u64().unwrap(),
+        u64::from(omnigraph::db::manifest::INTERNAL_MANIFEST_SCHEMA_VERSION)
+    );
     assert!(payload["tables"].as_array().unwrap().len() >= 4);
 }
 
@@ -1947,6 +1951,10 @@ fn snapshot_human_output_includes_branch_and_table_summaries() {
 
     assert!(stdout.contains("branch: main"));
     assert!(stdout.contains("manifest_version:"));
+    assert!(stdout.contains(&format!(
+        "internal_schema_version: {}",
+        omnigraph::db::manifest::INTERNAL_MANIFEST_SCHEMA_VERSION
+    )));
     assert!(stdout.contains("node:Person v"));
     assert!(stdout.contains("edge:Knows v"));
 }

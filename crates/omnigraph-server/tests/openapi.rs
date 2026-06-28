@@ -426,6 +426,7 @@ fn health_output_schema_has_expected_fields() {
     let props = schema["properties"].as_object().unwrap();
     assert!(props.contains_key("status"));
     assert!(props.contains_key("version"));
+    assert!(props.contains_key("internal_schema_version"));
     assert!(props.contains_key("source_version"));
 }
 
@@ -644,6 +645,7 @@ fn snapshot_output_schema_has_expected_fields() {
     let props = schema["properties"].as_object().unwrap();
     assert!(props.contains_key("branch"));
     assert!(props.contains_key("manifest_version"));
+    assert!(props.contains_key("internal_schema_version"));
     assert!(props.contains_key("tables"));
 }
 
