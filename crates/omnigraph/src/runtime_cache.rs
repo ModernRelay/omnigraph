@@ -33,6 +33,13 @@ struct GraphIndexTableState {
     /// without e_tags (local FS); there a same-branch manifest refresh clears the
     /// cache as the fallback (the read-path gap in docs/dev/invariants.md).
     e_tag: Option<String>,
+    /// The edge's `(from_type, to_type)` endpoint names at build time. `GraphIndex`
+    /// keys its `TypeIndex`es by these, and `execute_expand_csr` looks them up by
+    /// the *current* catalog's endpoint names — so a schema change that repoints an
+    /// edge type while leaving the edge table's physical identity unchanged must
+    /// invalidate the entry (else the reused index has the old type-index namespace
+    /// and the new traversal fails with "no type index for <new type>").
+    endpoints: (String, String),
 }
 
 #[derive(Debug, Default)]
@@ -168,8 +175,8 @@ fn graph_index_cache_key(
     edge_types: &HashMap<String, (String, String)>,
 ) -> GraphIndexCacheKey {
     let mut edge_tables: Vec<GraphIndexTableState> = edge_types
-        .keys()
-        .filter_map(|edge_name| {
+        .iter()
+        .filter_map(|(edge_name, endpoints)| {
             let table_key = format!("edge:{}", edge_name);
             resolved
                 .snapshot
@@ -179,6 +186,7 @@ fn graph_index_cache_key(
                     table_version: entry.table_version,
                     table_branch: entry.table_branch.clone(),
                     e_tag: entry.version_metadata.e_tag().map(str::to_string),
+                    endpoints: endpoints.clone(),
                 })
         })
         .collect();
@@ -310,12 +318,41 @@ mod tests {
                 table_version: 1,
                 table_branch: None,
                 e_tag: None,
+                endpoints: ("A".to_string(), "B".to_string()),
             }],
         }
     }
 
     fn empty_index() -> Arc<GraphIndex> {
         Arc::new(GraphIndex::empty_for_test())
+    }
+
+    /// An edge table at the same physical identity but a different `(from_type,
+    /// to_type)` endpoint mapping (a schema repoint) must NOT share a cache entry
+    /// — the built index's `TypeIndex` namespace is keyed by those endpoints.
+    #[test]
+    fn endpoint_remap_at_same_physical_identity_splits_cache_key() {
+        let base = GraphIndexTableState {
+            table_key: "edge:Knows".to_string(),
+            table_version: 7,
+            table_branch: None,
+            e_tag: Some("etag".to_string()),
+            endpoints: ("Person".to_string(), "Person".to_string()),
+        };
+        let repointed = GraphIndexTableState {
+            endpoints: ("Person".to_string(), "Account".to_string()),
+            ..base.clone()
+        };
+        let k_old = GraphIndexCacheKey {
+            edge_tables: vec![base],
+        };
+        let k_new = GraphIndexCacheKey {
+            edge_tables: vec![repointed],
+        };
+        assert_ne!(
+            k_old, k_new,
+            "a schema endpoint remap must produce a distinct graph-index cache key"
+        );
     }
 
     #[test]

@@ -342,12 +342,20 @@ them explicit.
   `Expand`/`AntiJoin`, not every catalog edge — a single-edge join no longer
   scans the whole graph's edge data), and the `RuntimeCache` cache key is each
   edge table's physical identity `(table_key, version, table_branch, e_tag)`
-  rather than the resolved snapshot id, so a lazy-fork branch reuses main's built
-  index instead of cold-scanning it. Residual: on stores without per-table
-  e_tags (local FS) a branch deleted and recreated at the same version has the
-  same key, so the topology distinction falls back to the same-branch manifest
-  refresh clearing read caches (`invalidate_all`); production object stores carry
-  real e_tags, so the key alone distinguishes incarnations there.
+  plus the edge's `(from_type, to_type)` endpoint mapping — rather than the
+  resolved snapshot id — so a lazy-fork branch reuses main's built index instead
+  of cold-scanning it, while a schema repoint of an edge type (which changes the
+  built `TypeIndex` namespace) still rebuilds even if the edge table's physical
+  identity is unchanged. Residual: on stores without per-table e_tags (local FS)
+  a branch deleted and recreated at the same version with the same endpoints has
+  the same key, so the incarnation distinction falls back to the same-branch
+  manifest refresh clearing read caches (`invalidate_all`); production object
+  stores carry real e_tags, so the key alone distinguishes incarnations there.
+  Known narrow gap (local FS only): a cold *cross-branch* resolve of a
+  recreated branch (a long-lived reader bound to another branch) does not trigger
+  that same-branch refresh, so an e_tag-less recreated branch can still reuse a
+  stale entry until a same-branch read refreshes — acceptable because local FS is
+  a dev/test substrate and production carries e_tags.
 - **Commit-graph parent under concurrency — CLOSED (RFC-013 Phase 7):** the graph
   commit is now recorded in the manifest publish CAS, and the publisher resolves
   the new commit's parent INSIDE its retry loop, per attempt, from the just-loaded
