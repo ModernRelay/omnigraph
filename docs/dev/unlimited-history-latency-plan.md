@@ -91,23 +91,29 @@ Target after U1 (LanceDB-anchored): `read_iops ≈ 1`, `num_stages ≈ 3`, LIST 
 
 ---
 
-## 6b. U1 execution plan (assumptions validated against source)
+## 6b. U1 execution plan — the full correct-by-design publish refactor (RFC-013 step 5, ALL writers)
 
-Two Explore passes validated the U1 surface (file:line in `crates/omnigraph/src/`). Findings and the resulting plan:
+Decision: do the **full** refactor, not a minimal bolt-on. Implement RFC-013 §4.1's `GraphPublishAuthority` fed declarative `PublishPlan`s across all five writers, a unified open path, and a `ConsistencyMode` freshness policy. Correctness-and-efficiency-by-design over preserving legacy code (pre-release; no backwards-compat). The legacy shape removed: the **split** where `ManifestCoordinator` owns the warm state but a stateless publisher re-opens + re-scans cold every call, and four writers hand-roll their publish. The full design lives in [rfc-013-write-path-latency.md](rfc-013-write-path-latency.md) §4.1 (the type spec) — now being built on this branch.
 
-- **Layer 4 — warm publish.** `GraphNamespacePublisher::publish` runs a cold `load_publish_state` (open + `read_publish_scan`) on EVERY attempt (`db/manifest/publisher.rs:693`). The warm `known_state` exists in `ManifestCoordinator` (`db/manifest.rs:298`) and is folded O(touched-tables) after each commit, but the publisher is trait-boxed (`Arc<dyn ManifestBatchPublisher>`) with no access. **Design choice:** thread `known_state_hint: Option<&ManifestState>` into the `ManifestBatchPublisher::publish` signature (attempt 0 uses it, attempts 1+ reload after a CAS conflict; cold path unchanged when `None`) — vs guarding the attempt-0 load inside `ManifestCoordinator::commit`. **Recommend the `Option` hint param** (~50 lines, the `None` default keeps the contract). **Non-strict ops only**; keep one cheap pre-commit freshness check (the forward-probe), per Lance's "don't go fully optimistic" lesson.
-- **Layer 3 — pinned opens.** Non-strict (Insert/Merge) opens at HEAD via `open_dataset_head_for_write` (`db/omnigraph/table_ops.rs:917`); the pinned version IS captured (`MutationStaging::expected_versions` / the `table_version` row) but not threaded. Route non-strict opens through the existing `open_table_dataset(location, pinned_version, session)` (`src/instrumentation.rs:241`). Strict ops (Update/Delete/SchemaRewrite — `MutationOpKind::strict_pre_stage_version_check`, `db/mod.rs:49`) keep the cold drift check.
-- **Forward-probe.** The OCC path (`occ_snapshot_for_branch`, `exec/staging.rs:684`) already reuses the warm coordinator on probe-match, but the probe itself is a `latest_version_id()` LIST (`db/manifest.rs:536`). Add a `manifest_path_for_version(version)` constructor (V2 naming) and HEAD `V+1` instead of LISTing.
-- **Shared `Session` (A).** Lives in `ReadCaches { session }` owned by `Omnigraph` (`src/runtime_cache.rs:275`, created `db/omnigraph.rs:369/473`); data reads use it via `TableHandleCache`, but manifest opens (`open_manifest_dataset` → `open_dataset_tracked`) don't. Thread `session` through `open_manifest_dataset` → `open_manifest_graph` → `ManifestCoordinator::open`/`open_at_branch`, passing `self.read_caches.session`. `DatasetBuilder::with_session` is already used by the data path. NOTE: this cuts cold-TLS wall latency but is **invisible to the request-count gate** (it removes handshakes, not requests) — verify via the connection/`num_stages` angle, not `read_iops`.
-- **Branch parallelize (B).** `cleanup_deleted_branch_tables` (`db/omnigraph.rs:1482`) is a serial loop of independent `force_delete_branch` calls on the `Send + Sync` `TableStorage`. Swap to `buffer_unordered(8)`; adapt the `BRANCH_DELETE_BEFORE_TABLE_CLEANUP` failpoint test (drop the deterministic log-order assertion). Branch CREATE forks only `__manifest` (confirmed) — only delete is the serial-O(tables) cost.
+**Type decision — EVOLVE, do not fork** (invariant 15): bundle `publish(changes, expected, lineage)` + the pinned base into `PublishPlan { base, actions, lineage, expected }`; keep `ManifestChange` as the lowered manifest-row vocabulary + a thin `TableAction → ManifestChange` lowering; grow `WriteTxn { base }` with `session`+`handles`. `TableAction` starts thin (`Append/Upsert/Overwrite/Delete`), variants phased in per writer.
 
-**Internal sequencing** (impact-per-risk; each lands with a gate ratchet):
-1. **Shared Session (A) + Branch parallelize (B)** — cheap, orthogonal, low-risk; land first. (A helps wall latency, B helps branch delete; neither moves the write request-count gate.)
-2. **Layer 3** (pinned non-strict opens) — mechanical; gate: `data_opener` → ~0.
-3. **Layer 4** (warm publish, `known_state_hint`) — biggest gate win; `manifest_reads` + `manifest_list` drop on the no-contention path.
-4. **Forward-probe** — last (only matters after 3+4 remove the other LISTs); `manifest_list` → ~1.
+**Correctness spine every phase preserves:** CAS sole-authority (the `__manifest` merge-insert; the pre-check is non-atomic); §7.1 `graph_head:<branch>` serialization (already in place — disjoint same-branch writers overlap so the loser retries); recovery all-or-nothing (redo `plan.apply()` is live-and-recovery identical; roll-BACK `Dataset::restore` stays open-time-only); snapshot isolation; strict-vs-non-strict (Update/Delete/SchemaRewrite keep cold drift guards; only Insert/Merge get the warm path).
 
-**Invariant:** Layers 3/4 apply to non-strict (Insert/Merge) only; strict ops keep the cold drift check, so the publish CAS stays the sole concurrency authority.
+**Phased landing** (each independently shippable, gate-measured):
+
+| Phase | Change | Gate | Status |
+|---|---|---|---|
+| **1a. Unified open chokepoint** | `open_dataset_internal(location, VersionResolution::{Latest\|At(u64)}, session, wrapper)`; the two openers become thin shims | neutral | **DONE** (`instrumentation.rs`) |
+| **1b. Session on manifest opens** | thread `ReadCaches.session` to `open_manifest_dataset` | neutral (wall only) | **DEFERRED into Phase 3** — `open_manifest_dataset` has ~15 callers and the coordinator doesn't hold the session; the per-write beneficiary (the publisher's per-attempt open) is *subsumed* by Phase 3's warm-handle reuse, so fold it there rather than thread it invasively now |
+| **0. Safety net** (prereq for P3) | cross-process multi-writer harness (in-process failpoints can't reproduce the corruption); land §5.5 interleave + write-skew guards; `assert_grows`-no-compaction gate companion | neutral | TODO |
+| **2. Authority skeleton** | `GraphPublishAuthority` thin facade over today's publisher; `publish(txn, plan)` lowers `PublishPlan`→ the existing args. Byte-identical | neutral | TODO |
+| **3. Mutation writer → PublishPlan (FIRST)** | the gate-moving writer; **Layer 4 warm publish** (attempt 0 uses the folded `known_state`, reload cold only on CAS conflict) + **Layer 3 pinned non-strict opens** (`open_dataset_internal(At(pinned))`); fold the Phase-1b session here | **biggest ratchet:** `manifest_reads`+`manifest_list`↓↓, `data_opener`→~0 | TODO |
+| **4. Forward-probe + ConsistencyMode** | `manifest_path_for_version` + HEAD `V+1` replaces the `latest_version_id()` LIST; `ConsistencyMode { Strong, Lazy, Eventual }` + `read_consistency_interval`, default Strong; preserve `ManifestIncarnation` | `manifest_list`→~1 | TODO |
+| **5. Remaining writers** | schema_apply → branch_merge → optimize, one PR each, behind their oracles; `compact_internal_table` stays special-cased; `ensure_indices` deferred | neutral | TODO |
+| **6. Recovery sidecar == serialized PublishPlan** | Phase C + recovery both call one `plan.apply()` (redo); the roll-BACK classifier stays untouched | small ↓ | TODO |
+| **7. `writer_epoch` fence** | DEFER unless a multi-writer topology ships in 0.8.0; behind a linearizable conditional-put store only | neutral | DEFER |
+
+**Hardest traps:** (A) warm attempt-0 is a *pre-check optimization only* — the CAS still arbitrates; on CAS loss attempts 1+ cold-reload + re-resolve lineage; (B) `plan.apply()` is redo only, roll-back stays open-time; (C) `ConsistencyMode::Lazy` must keep read-your-writes (the coordinator's own `known_state` is authoritative for its own commits; the mode only gates probing for *foreign* advances); (E) a strict op must never route through the warm/pinned path. **0.8.0 scope:** Phases 1–6 + U2 (the head-pointer format change); defer Phase 7 + Layer 1/2 GC (mutually exclusive with unlimited history).
 
 ---
 
