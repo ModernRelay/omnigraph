@@ -110,6 +110,26 @@ pub async fn count_rows_branch(db: &Omnigraph, branch: &str, table_key: &str) ->
     ds.count_rows(None).await.unwrap()
 }
 
+/// First result column as sorted strings — the shared shape the traversal /
+/// cost tests use to compare a query's returned names. Empty for a 0-row result.
+pub fn first_column_sorted(result: &QueryResult) -> Vec<String> {
+    if result.num_rows() == 0 {
+        return Vec::new();
+    }
+    let batch = result.concat_batches().unwrap();
+    let col = batch
+        .column(0)
+        .as_any()
+        .downcast_ref::<StringArray>()
+        .unwrap();
+    let mut v: Vec<String> = (0..col.len())
+        .filter(|&i| !col.is_null(i))
+        .map(|i| col.value(i).to_string())
+        .collect();
+    v.sort();
+    v
+}
+
 /// Collect all string values from a named column across batches.
 pub fn collect_column_strings(batches: &[RecordBatch], col: &str) -> Vec<String> {
     let mut out = Vec::new();

@@ -1,102 +1,43 @@
 //! BTREE-indexed Expand path (`execute_expand_indexed`) coverage.
 //!
-//! These tests force the Expand execution mode via `OMNIGRAPH_TRAVERSAL_MODE`
-//! and assert the indexed path matches the CSR path (both are semantically
-//! identical — the indexed path just serves neighbor lookups from the persisted
-//! src/dst BTREE instead of an in-memory CSR). They live in their own test
-//! binary and are all `#[serial]`, so the env writes never race a concurrent
-//! reader: within this process serial execution serializes every env read, and
-//! other test binaries (e.g. `traversal.rs`) are separate processes whose env
-//! stays unset (→ CSR), validating the shared hydrate/align tail on the CSR path.
+//! These tests force the Expand execution mode via the scoped `with_traversal_mode`
+//! test seam — NOT the process-global `OMNIGRAPH_TRAVERSAL_MODE` env var — and
+//! assert the indexed path matches the CSR path (both are semantically identical:
+//! the indexed path serves neighbor lookups from the persisted src/dst BTREE
+//! instead of an in-memory CSR). The seam is scope-bound and process-safe, so
+//! these tests need no `#[serial]` and no dedicated binary.
 
 mod helpers;
 
-use std::sync::Arc;
-use std::sync::atomic::{AtomicU64, Ordering};
-
-use arrow_array::{Array, StringArray};
-
-use omnigraph::db::{Omnigraph, ReadTarget};
-use omnigraph::instrumentation::{QueryIoProbes, with_query_io_probes};
+use omnigraph::db::Omnigraph;
+use omnigraph::instrumentation::with_traversal_mode;
 use omnigraph::loader::{LoadMode, load_jsonl};
 use omnigraph::table_store::{IndexCoverage, TableStore};
 use omnigraph_compiler::ir::ParamMap;
-use omnigraph_compiler::result::QueryResult;
-use serial_test::serial;
 
 use helpers::*;
 
-fn set_mode(mode: &str) {
-    // SAFE: every test here is #[serial] and this binary has no non-serial
-    // env reader, so no thread reads the environment during this write.
-    unsafe { std::env::set_var("OMNIGRAPH_TRAVERSAL_MODE", mode) };
-}
-
-fn clear_mode() {
-    unsafe { std::env::remove_var("OMNIGRAPH_TRAVERSAL_MODE") };
-}
-
-/// RAII guard that sets `OMNIGRAPH_TRAVERSAL_MODE` and clears it on drop, so a
-/// panic mid-test (e.g. a query `unwrap`) cannot leak the forced mode into a
-/// later test in this binary. SAFE: every test here is `#[serial]` and this
-/// binary has no non-serial env reader, so no thread reads the env during the
-/// write. (Mirrors `proptest_equivalence.rs::ModeGuard`.)
-struct ModeGuard;
-impl ModeGuard {
-    fn set(mode: &str) -> Self {
-        set_mode(mode);
-        ModeGuard
-    }
-}
-impl Drop for ModeGuard {
-    fn drop(&mut self) {
-        clear_mode();
-    }
-}
-
-/// First result column, sorted — for the probe-based topology-build tests below.
-fn column0(result: &QueryResult) -> Vec<String> {
-    if result.num_rows() == 0 {
-        return Vec::new();
-    }
-    let batch = result.concat_batches().unwrap();
-    let col = batch
-        .column(0)
-        .as_any()
-        .downcast_ref::<StringArray>()
-        .unwrap();
-    let mut v: Vec<String> = (0..col.len()).map(|i| col.value(i).to_string()).collect();
-    v.sort();
-    v
-}
-
-/// Run a name-returning query and return its first column, sorted.
+/// Run `name` on main under the cost-chooser (auto) Expand mode; first column sorted.
 async fn sorted_names(db: &mut Omnigraph, queries: &str, name: &str, params: &ParamMap) -> Vec<String> {
-    let result = query_main(db, queries, name, params).await.unwrap();
-    if result.num_rows() == 0 {
-        return Vec::new();
-    }
-    let batch = result.concat_batches().unwrap();
-    let col = batch
-        .column(0)
-        .as_any()
-        .downcast_ref::<StringArray>()
-        .unwrap();
-    let mut v: Vec<String> = (0..col.len()).map(|i| col.value(i).to_string()).collect();
-    v.sort();
-    v
+    first_column_sorted(&query_main(db, queries, name, params).await.unwrap())
 }
 
 /// Run the same query under CSR, indexed, and auto (cost-chooser) modes; assert
-/// all three produce identical results and return them. The auto pass exercises
-/// `choose_expand_mode` end to end: whichever path it selects, the rows must
-/// match the forced paths (the chooser changes which path runs, never the result).
+/// all three produce identical results and return them. The forced modes use the
+/// scoped `with_traversal_mode` seam; the auto pass exercises `choose_expand_mode`
+/// end to end (whichever path it selects, the rows must match the forced paths —
+/// the chooser changes which path runs, never the result).
 async fn both_modes(db: &mut Omnigraph, queries: &str, name: &str, params: &ParamMap) -> Vec<String> {
-    set_mode("csr");
-    let csr = sorted_names(db, queries, name, params).await;
-    set_mode("indexed");
-    let indexed = sorted_names(db, queries, name, params).await;
-    clear_mode();
+    let csr = first_column_sorted(
+        &with_traversal_mode("csr", query_main(db, queries, name, params))
+            .await
+            .unwrap(),
+    );
+    let indexed = first_column_sorted(
+        &with_traversal_mode("indexed", query_main(db, queries, name, params))
+            .await
+            .unwrap(),
+    );
     let auto = sorted_names(db, queries, name, params).await;
     assert_eq!(
         indexed, csr,
@@ -111,7 +52,6 @@ async fn both_modes(db: &mut Omnigraph, queries: &str, name: &str, params: &Para
 
 // The C6 index-coverage guard: `key_column_index_coverage` must report whether
 // a `key_col IN (...)` scan will use the persisted BTREE or silently full-scan.
-// Not #[serial] — it calls the helper directly and reads no env.
 #[tokio::test]
 async fn key_column_index_coverage_detects_btree_presence() {
     let dir = tempfile::tempdir().unwrap();
@@ -175,7 +115,6 @@ async fn coverage_degrades_for_appended_unindexed_fragment() {
 }
 
 #[tokio::test]
-#[serial]
 async fn indexed_matches_csr_one_hop_same_type() {
     let dir = tempfile::tempdir().unwrap();
     let mut db = init_and_load(&dir).await;
@@ -185,7 +124,6 @@ async fn indexed_matches_csr_one_hop_same_type() {
 }
 
 #[tokio::test]
-#[serial]
 async fn indexed_matches_csr_multi_hop_same_type() {
     let dir = tempfile::tempdir().unwrap();
     let mut db = init_and_load(&dir).await;
@@ -204,7 +142,6 @@ query reach($name: String) {
 }
 
 #[tokio::test]
-#[serial]
 async fn indexed_matches_csr_cross_type() {
     let dir = tempfile::tempdir().unwrap();
     let mut db = init_and_load(&dir).await;
@@ -222,7 +159,6 @@ query employer($name: String) {
 }
 
 #[tokio::test]
-#[serial]
 async fn indexed_matches_csr_no_match() {
     let dir = tempfile::tempdir().unwrap();
     let mut db = init_and_load(&dir).await;
@@ -232,7 +168,6 @@ async fn indexed_matches_csr_no_match() {
 }
 
 #[tokio::test]
-#[serial]
 async fn indexed_finds_unindexed_appended_edge() {
     let dir = tempfile::tempdir().unwrap();
     let mut db = init_and_load(&dir).await;
@@ -251,9 +186,14 @@ async fn indexed_finds_unindexed_appended_edge() {
     .await
     .unwrap();
 
-    set_mode("indexed");
-    let got = sorted_names(&mut db, TEST_QUERIES, "friends_of", &params(&[("$name", "Alice")])).await;
-    clear_mode();
+    let got = first_column_sorted(
+        &with_traversal_mode(
+            "indexed",
+            query_main(&mut db, TEST_QUERIES, "friends_of", &params(&[("$name", "Alice")])),
+        )
+        .await
+        .unwrap(),
+    );
 
     assert_eq!(
         got,
@@ -273,7 +213,6 @@ async fn indexed_finds_unindexed_appended_edge() {
 // CSR path never produces. `both_modes` (csr == indexed == auto) plus the
 // golden assert catch both the divergence and an over-emitting shared bug.
 #[tokio::test]
-#[serial]
 async fn cross_type_id_collision_does_not_bleed_into_second_hop() {
     const SCHEMA: &str = r#"
 node Person { name: String @key }
@@ -327,7 +266,6 @@ query reach($name: String) {
 // bounded range deliberately: an unbounded `{1,}` is a typecheck error, not a
 // runtime path. `both_modes` also confirms indexed == csr on the cycle.
 #[tokio::test]
-#[serial]
 async fn variable_hops_terminate_and_dedup_on_cycle() {
     let dir = tempfile::tempdir().unwrap();
     let uri = dir.path().to_str().unwrap();
@@ -349,7 +287,6 @@ async fn variable_hops_terminate_and_dedup_on_cycle() {
 // A self-loop a->a plus a->b. Variable-length traversal must not loop forever and
 // must not re-emit the seeded source.
 #[tokio::test]
-#[serial]
 async fn variable_hops_handle_self_loop() {
     let dir = tempfile::tempdir().unwrap();
     let uri = dir.path().to_str().unwrap();
@@ -363,128 +300,4 @@ async fn variable_hops_handle_self_loop() {
     let got = both_modes(&mut db, REACH_5, "reach", &params(&[("$name", "a")])).await;
     // a->a hits the seeded source (pruned); only b is reached.
     assert_eq!(got, vec!["b"]);
-}
-
-// ─── Topology-index build cost (A1 cross-branch reuse + A2 scoped build) ─────
-//
-// These force the CSR build path (the indexed path builds no topology) and read
-// the `graph_build_count` / `graph_edges_built` probes. They live HERE — the
-// all-serial binary with no non-serial env reader — because they mutate the
-// process-global `OMNIGRAPH_TRAVERSAL_MODE`, which `query.rs` reads; in a mixed
-// serial/non-serial binary a concurrent non-serial traversal would race the env
-// write. The `ModeGuard` clears the override even on a panic.
-
-/// A1: a fresh (unwritten) branch reuses main's cached CSR topology index
-/// (`graph_build_count == 0`), and the reused index returns correct results for
-/// the branch. Before A1 the branch-keyed snapshot id forced a rebuild (count 1).
-#[tokio::test]
-#[serial]
-async fn fresh_branch_traversal_reuses_main_graph_index() {
-    let dir = tempfile::tempdir().unwrap();
-    let mut writer = init_and_load(&dir).await;
-    let uri = dir.path().to_str().unwrap();
-    // A Knows edge on main so there is topology to build and then reuse.
-    mutate_main(
-        &mut writer,
-        MUTATION_QUERIES,
-        "insert_person_and_friend",
-        &mixed_params(&[("$name", "Walker"), ("$friend", "Alice")], &[("$age", 41)]),
-    )
-    .await
-    .unwrap();
-
-    // Separate reader handle. As in production, the reader never creates the
-    // branch, so creating it does not invalidate the reader's warm cache.
-    let reader = Omnigraph::open(uri).await.unwrap();
-
-    let _mode = ModeGuard::set("csr");
-    // Reader warms main on the CSR path: builds and caches the topology index.
-    let warm = reader
-        .query(
-            ReadTarget::branch("main"),
-            TEST_QUERIES,
-            "friends_of",
-            &params(&[("$name", "Walker")]),
-        )
-        .await
-        .unwrap();
-    assert_eq!(column0(&warm), vec!["Alice"], "test setup: main has the Knows edge");
-
-    // A separate writer creates the branch (lazy fork: feature's edge tables are
-    // physically main's — same version + e_tag, table_branch=None).
-    writer.branch_create("feature").await.unwrap();
-
-    let graph_build = Arc::new(AtomicU64::new(0));
-    let probes_in = QueryIoProbes {
-        graph_build_count: Arc::clone(&graph_build),
-        ..Default::default()
-    };
-    let on_branch = with_query_io_probes(
-        probes_in,
-        reader.query(
-            ReadTarget::branch("feature"),
-            TEST_QUERIES,
-            "friends_of",
-            &params(&[("$name", "Walker")]),
-        ),
-    )
-    .await
-    .unwrap();
-
-    assert_eq!(
-        column0(&on_branch),
-        vec!["Alice"],
-        "fresh branch sees main's edges (lazy fork) and the reused index is correct"
-    );
-    assert_eq!(
-        graph_build.load(Ordering::Relaxed),
-        0,
-        "a fresh branch with unchanged edges must reuse main's cached CSR index, not rebuild it"
-    );
-}
-
-/// A2: a query referencing one edge type builds the topology for only that edge,
-/// not every edge in the catalog. Forces CSR (the build path) and counts edge
-/// tables built. Before A2 the build materialized all catalog edges (the fixture
-/// defines Knows + WorksAt, so a build-all touches >= 2) — the cold-build cost.
-#[tokio::test]
-#[serial]
-async fn single_edge_query_builds_only_referenced_edge() {
-    let dir = tempfile::tempdir().unwrap();
-    let mut db = init_and_load(&dir).await;
-    // A Knows edge so the referenced build has topology; the fixture also defines
-    // WorksAt, so a build-all would touch more than one edge.
-    mutate_main(
-        &mut db,
-        MUTATION_QUERIES,
-        "insert_person_and_friend",
-        &mixed_params(&[("$name", "Walker"), ("$friend", "Alice")], &[("$age", 41)]),
-    )
-    .await
-    .unwrap();
-
-    let _mode = ModeGuard::set("csr");
-    let graph_edges = Arc::new(AtomicU64::new(0));
-    let probes_in = QueryIoProbes {
-        graph_edges_built: Arc::clone(&graph_edges),
-        ..Default::default()
-    };
-    let result = with_query_io_probes(
-        probes_in,
-        db.query(
-            ReadTarget::branch("main"),
-            TEST_QUERIES,
-            "friends_of",
-            &params(&[("$name", "Walker")]),
-        ),
-    )
-    .await
-    .unwrap();
-
-    assert_eq!(column0(&result), vec!["Alice"]);
-    assert_eq!(
-        graph_edges.load(Ordering::Relaxed),
-        1,
-        "a query referencing only `knows` must build only that edge, not all catalog edges"
-    );
 }

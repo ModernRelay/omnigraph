@@ -886,7 +886,12 @@ impl<'a> GraphIndexHandle<'a> {
 /// forces the path (ops escape hatch + test hook). Both modes are semantically
 /// identical, so the override only changes which path runs, never the result.
 fn traversal_indexed_override() -> Option<bool> {
-    match std::env::var("OMNIGRAPH_TRAVERSAL_MODE").ok().as_deref() {
+    // The scoped test seam (`with_traversal_mode`) takes precedence over the
+    // process-global `OMNIGRAPH_TRAVERSAL_MODE` ops escape hatch.
+    let mode = crate::instrumentation::traversal_mode_override()
+        .map(str::to_string)
+        .or_else(|| std::env::var("OMNIGRAPH_TRAVERSAL_MODE").ok());
+    match mode.as_deref() {
         Some("indexed") => Some(true),
         Some("csr") => Some(false),
         _ => None,

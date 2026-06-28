@@ -350,7 +350,10 @@ them explicit.
   a branch deleted and recreated at the same version with the same endpoints has
   the same key, so the incarnation distinction falls back to the same-branch
   manifest refresh clearing read caches (`invalidate_all`); production object
-  stores carry real e_tags, so the key alone distinguishes incarnations there.
+  stores carry real e_tags, so the key alone distinguishes incarnations there
+  (the e_tag-present cross-branch-reuse path is exercised in CI by
+  `s3_storage.rs::s3_fresh_branch_traversal_reuses_main_graph_index_with_etags`
+  against RustFS, which surfaces real ETags — local-FS tests cannot reach it).
   Known narrow gap (local FS only): a cold *cross-branch* resolve of a
   recreated branch (a long-lived reader bound to another branch) does not trigger
   that same-branch refresh, so an e_tag-less recreated branch can still reuse a

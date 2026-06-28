@@ -86,6 +86,32 @@ fn current<R>(f: impl FnOnce(&QueryIoProbes) -> R) -> Option<R> {
     QUERY_IO_PROBES.try_with(f).ok()
 }
 
+tokio::task_local! {
+    static TRAVERSAL_MODE_OVERRIDE: Option<&'static str>;
+}
+
+/// Force the Expand execution mode (`"indexed"` | `"csr"`) for the scope of `fut`
+/// WITHOUT mutating the process-global `OMNIGRAPH_TRAVERSAL_MODE` env var. This is
+/// the general traversal-mode test seam: scope-bound (so it cannot leak — the
+/// override is gone when `fut` resolves or unwinds) and process-safe (it never
+/// touches shared state, so a forced-mode test never affects a concurrent test in
+/// the same binary, removing the need for `#[serial]` + a dedicated all-serial
+/// binary). Mirrors [`with_query_io_probes`]. The env var stays the production/ops
+/// escape hatch; this scoped override takes precedence over it
+/// (`exec::query::traversal_indexed_override`).
+pub async fn with_traversal_mode<F>(mode: &'static str, fut: F) -> F::Output
+where
+    F: std::future::Future,
+{
+    TRAVERSAL_MODE_OVERRIDE.scope(Some(mode), fut).await
+}
+
+/// The scoped traversal-mode override active for this task, if any. `None` in
+/// production (no scope installed), so the env var is consulted instead.
+pub(crate) fn traversal_mode_override() -> Option<&'static str> {
+    TRAVERSAL_MODE_OVERRIDE.try_with(|m| *m).ok().flatten()
+}
+
 pub(crate) fn manifest_wrapper() -> Option<Arc<dyn WrappingObjectStore>> {
     current(|p| p.manifest_wrapper.clone()).flatten()
 }
