@@ -4964,6 +4964,7 @@ dependencies = [
  "lance-table",
  "object_store",
  "omnigraph-compiler",
+ "omnigraph-dst",
  "omnigraph-policy",
  "proptest",
  "regex",
