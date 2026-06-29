@@ -6,8 +6,17 @@ const MERGE_STAGE_DIR_ENV: &str = "OMNIGRAPH_MERGE_STAGING_DIR";
 #[derive(Debug)]
 enum CandidateTableState {
     /// Adopt the source's table state via a pointer switch or a branch fork —
-    /// no data HEAD advance, so nothing to pin for recovery.
-    AdoptSourceState,
+    /// no data HEAD advance, so nothing to pin for recovery. `validation_delta`
+    /// carries the source-vs-target row delta (added/changed/deleted) for the
+    /// evaluator ONLY — the publish is still a pointer/fork — so a pointer-adopt
+    /// whose source diverged is still validated (RI/uniqueness/cardinality)
+    /// against the merged state instead of being silently published. `None` when
+    /// the source matched the target (nothing to validate). Decoupling the
+    /// validation delta from the publish mechanism keeps the publish O(1) while
+    /// closing the unvalidated-adopt gap.
+    AdoptSourceState {
+        validation_delta: Option<AdoptDelta>,
+    },
     /// Adopt the source's state by applying a non-empty delta onto the target's
     /// lineage (append new + upsert changed + delete removed). The delta is
     /// pre-computed at classification so this candidate can be recovery-pinned:
@@ -621,7 +630,9 @@ fn row_signature(batch: &RecordBatch, row: usize) -> Result<String> {
 /// Build the per-table [`ChangeSet`](crate::validate::ChangeSet) for a merge from
 /// the classified candidates — the new/changed rows (from the staged deltas) and
 /// removed ids the validator evaluates, instead of re-scanning whole tables.
-/// `AdoptSourceState` carries no row delta (pointer/fork), so it is skipped.
+/// `AdoptSourceState` is published as a pointer/fork but still carries a
+/// `validation_delta` (the source-vs-target rows) when its source diverged, so
+/// it is validated like `AdoptWithDelta`; only an empty-delta adopt is skipped.
 async fn build_merge_changeset(
     db: &Omnigraph,
     candidates: &HashMap<String, CandidateTableState>,
@@ -637,8 +648,17 @@ async fn build_merge_changeset(
         let projection: Vec<&str> = projection.iter().map(String::as_str).collect();
         let mut change = crate::validate::TableChange::default();
         match candidate {
-            CandidateTableState::AdoptSourceState => continue,
-            CandidateTableState::AdoptWithDelta(delta) => {
+            // Pointer/fork adopt whose source matched the target: nothing to
+            // validate. A pointer/fork adopt whose source diverged carries a
+            // `validation_delta` and is validated exactly like `AdoptWithDelta`
+            // (only the publish differs — pointer vs HEAD-advancing).
+            CandidateTableState::AdoptSourceState {
+                validation_delta: None,
+            } => continue,
+            CandidateTableState::AdoptSourceState {
+                validation_delta: Some(delta),
+            }
+            | CandidateTableState::AdoptWithDelta(delta) => {
                 if let Some(table) = &delta.appends {
                     change
                         .added
@@ -771,7 +791,10 @@ async fn classify_adopt(
     table_key: &str,
 ) -> Result<CandidateTableState> {
     let Some(source_entry) = source_snapshot.entry(table_key) else {
-        return Ok(CandidateTableState::AdoptSourceState);
+        // Source has no such table — nothing to adopt or validate.
+        return Ok(CandidateTableState::AdoptSourceState {
+            validation_delta: None,
+        });
     };
     let target_entry = target_snapshot.entry(table_key);
     let target_active = target_db.active_branch().await;
@@ -788,12 +811,21 @@ async fn classify_adopt(
         // Source on main (pointer switch) or target doesn't own (fork): no advance.
         _ => false,
     };
-    if !advances_head {
-        return Ok(CandidateTableState::AdoptSourceState);
-    }
-    match compute_adopt_delta(table_key, catalog, base_snapshot, source_snapshot).await? {
-        Some(delta) => Ok(CandidateTableState::AdoptWithDelta(delta)),
-        None => Ok(CandidateTableState::AdoptSourceState),
+    // Compute the source-vs-target delta UNCONDITIONALLY — it is the validation
+    // input the evaluator needs, independent of how the table is published.
+    // (`classify_adopt` is only reached when base == target, so the
+    // base-vs-source delta equals the target-vs-source delta.) A HEAD-advancing
+    // publish consumes it as the write payload (`AdoptWithDelta`); a pointer/fork
+    // publish ignores it and only validates it (`AdoptSourceState`), so a
+    // pointer-adopt whose source diverged is still checked for
+    // RI/uniqueness/cardinality against the merged state.
+    let validation_delta =
+        compute_adopt_delta(table_key, catalog, base_snapshot, source_snapshot).await?;
+    match (advances_head, validation_delta) {
+        (true, Some(delta)) => Ok(CandidateTableState::AdoptWithDelta(delta)),
+        (_, validation_delta) => {
+            Ok(CandidateTableState::AdoptSourceState { validation_delta })
+        }
     }
 }
 
@@ -1455,7 +1487,7 @@ impl Omnigraph {
                 matches!(
                     candidates.get(*table_key),
                     Some(CandidateTableState::RewriteMerged(_))
-                        | Some(CandidateTableState::AdoptSourceState)
+                        | Some(CandidateTableState::AdoptSourceState { .. })
                         | Some(CandidateTableState::AdoptWithDelta(_))
                 )
             })
@@ -1471,7 +1503,7 @@ impl Omnigraph {
             if !matches!(
                 candidate,
                 CandidateTableState::RewriteMerged(_)
-                    | CandidateTableState::AdoptSourceState
+                    | CandidateTableState::AdoptSourceState { .. }
                     | CandidateTableState::AdoptWithDelta(_)
             ) {
                 continue;
@@ -1574,7 +1606,7 @@ impl Omnigraph {
                 continue;
             };
             let update = match candidate_state {
-                CandidateTableState::AdoptSourceState => {
+                CandidateTableState::AdoptSourceState { .. } => {
                     publish_adopted_source_state(self, source_snapshot, &target_snapshot, table_key)
                         .await?
                 }
