@@ -70,6 +70,23 @@ pub(crate) const INTERNAL_MANIFEST_SCHEMA_VERSION: u32 = 4;
 /// module doc).
 pub(crate) const MIN_SUPPORTED_INTERNAL_SCHEMA_VERSION: u32 = INTERNAL_MANIFEST_SCHEMA_VERSION;
 
+/// The omnigraph release line that wrote a given internal-schema stamp. The
+/// open-refusal uses it to tell an operator exactly which binary to use to
+/// export a sub-CURRENT graph (the export side of the strand-model upgrade —
+/// see `docs/user/operations/upgrade.md`). Ranges are the release tags that
+/// stamped each version (verify with
+/// `git show vX.Y.Z:crates/omnigraph/src/db/manifest/migrations.rs`):
+/// v1 ≤ 0.3.1, v2 0.4.1–0.6.1, v3 0.6.2–0.7.2, v4 0.8.x.
+pub(crate) fn release_for_internal_schema_version(stamp: u32) -> &'static str {
+    match stamp {
+        1 => "0.3.1 or earlier",
+        2 => "0.4.1 to 0.6.1",
+        3 => "0.6.2 to 0.7.2",
+        4 => "0.8.x",
+        _ => "an earlier release",
+    }
+}
+
 const INTERNAL_SCHEMA_VERSION_KEY: &str = "omnigraph:internal_schema_version";
 
 /// Read the on-disk stamp from `__manifest`'s schema-level metadata.
@@ -109,10 +126,14 @@ pub(crate) fn refuse_if_stamp_unsupported(stamp: u32) -> Result<()> {
     if stamp < MIN_SUPPORTED_INTERNAL_SCHEMA_VERSION {
         return Err(OmniError::manifest(format!(
             "__manifest is stamped at internal schema v{stamp}, but this omnigraph reads only v{current}. \
-             This graph was created by an older omnigraph release; rebuild it: run `omnigraph export` with \
-             the older omnigraph binary that created it, then `omnigraph init` + `omnigraph load` with this one. \
-             (Data, vectors, and blobs are preserved; commit history and branches are not.)",
+             This graph was created by omnigraph {release}. Rebuild it: with an omnigraph {release} binary run \
+             `omnigraph export <graph> > graph.jsonl`, then with this binary run \
+             `omnigraph init --schema <schema.pg> <new-graph>` and \
+             `omnigraph load --mode overwrite --data graph.jsonl <new-graph>`. \
+             (Data, vectors, and blobs are preserved; commit history and branches are not.) \
+             See docs/user/operations/upgrade.md.",
             current = INTERNAL_MANIFEST_SCHEMA_VERSION,
+            release = release_for_internal_schema_version(stamp),
         )));
     }
     Ok(())
@@ -159,5 +180,19 @@ mod tests {
             refuse_if_stamp_unsupported(INTERNAL_MANIFEST_SCHEMA_VERSION + 1).is_err(),
             "a future stamp must be refused"
         );
+    }
+
+    /// The refusal names the release line that wrote each stamp so an operator
+    /// knows which binary to use for the export step; unknown stamps fall back
+    /// without panicking.
+    #[test]
+    fn release_names_the_writing_line_for_each_stamp() {
+        assert_eq!(release_for_internal_schema_version(3), "0.6.2 to 0.7.2");
+        assert_eq!(release_for_internal_schema_version(4), "0.8.x");
+        assert_eq!(release_for_internal_schema_version(99), "an earlier release");
+        // The sub-CURRENT refusal embeds the named release.
+        let err = refuse_if_stamp_unsupported(3).unwrap_err().to_string();
+        assert!(err.contains("0.6.2 to 0.7.2"), "got: {err}");
+        assert!(err.contains("omnigraph export"), "got: {err}");
     }
 }
