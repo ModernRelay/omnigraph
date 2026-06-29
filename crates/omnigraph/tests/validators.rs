@@ -87,6 +87,13 @@ query add_employment($person: String, $company: String) {
 }
 "#;
 
+// A non-zero @card min so a move that vacates a src can drop it below the floor.
+const CARD_MIN_SCHEMA: &str = r#"
+node Person { name: String @key }
+node Company { name: String @key }
+edge WorksAt: Person -> Company @card(1..)
+"#;
+
 async fn init_with(schema: &str, data: &str) -> (tempfile::TempDir, Omnigraph) {
     let dir = tempfile::tempdir().unwrap();
     let uri = dir.path().to_str().unwrap();
@@ -358,6 +365,56 @@ async fn noncolliding_write_to_date_unique_column_succeeds() {
     .await
     .expect("a distinct Date value must not collide and must not raise a coercion error");
     assert_eq!(count_rows(&db, "node:Task").await, 2);
+}
+
+/// Fix B: a Merge-load that MOVES an edge to a new src must recount the OLD
+/// src. Moving Alice's only WorksAt to Bob drops Alice to zero, below
+/// @card(1..). Before the fix only the new src (Bob) was in the affected set,
+/// so Alice's underflow was missed and the load silently succeeded.
+#[tokio::test]
+async fn merge_load_edge_src_move_rechecks_vacated_src_cardinality() {
+    let seed = r#"{"type":"Person","data":{"name":"Alice"}}
+{"type":"Person","data":{"name":"Bob"}}
+{"type":"Company","data":{"name":"Acme"}}
+{"edge":"WorksAt","from":"Alice","to":"Acme","data":{"id":"E1"}}"#;
+    let (_dir, mut db) = init_with(CARD_MIN_SCHEMA, seed).await;
+
+    let err = load_jsonl(
+        &mut db,
+        r#"{"edge":"WorksAt","from":"Bob","to":"Acme","data":{"id":"E1"}}"#,
+        LoadMode::Merge,
+    )
+    .await
+    .expect_err("moving Alice's only edge to Bob drops Alice below @card(1..)");
+    assert!(
+        err.to_string().contains("@card violation") && err.to_string().contains("Alice"),
+        "got: {}",
+        err
+    );
+}
+
+/// Fix A: a Merge-load batch listing the same edge id twice with different srcs
+/// must be counted ONCE (commit dedupes by id, last-wins). Alice keeps her one
+/// committed edge and Bob gets the (deduped) E1, both within @card(0..1), so the
+/// load must succeed. Before the fix E1 was counted under both srcs, giving
+/// Alice a phantom second edge and a spurious max violation.
+#[tokio::test]
+async fn merge_load_duplicate_edge_id_counts_once_per_card() {
+    let seed = r#"{"type":"Person","data":{"name":"Alice"}}
+{"type":"Person","data":{"name":"Bob"}}
+{"type":"Company","data":{"name":"Acme"}}
+{"type":"Company","data":{"name":"Beta"}}
+{"edge":"WorksAt","from":"Alice","to":"Acme","data":{"id":"E0"}}"#;
+    let (_dir, mut db) = init_with(CARDINALITY_SCHEMA, seed).await;
+
+    // Same edge id E1 under two srcs in one batch: commit keeps the last
+    // (Bob->Beta). Alice stays at her one committed edge (E0).
+    let batch = r#"{"edge":"WorksAt","from":"Alice","to":"Beta","data":{"id":"E1"}}
+{"edge":"WorksAt","from":"Bob","to":"Beta","data":{"id":"E1"}}"#;
+    load_jsonl(&mut db, batch, LoadMode::Merge)
+        .await
+        .expect("a deduped edge id must not double-count Alice into a @card(0..1) violation");
+    assert_eq!(count_rows(&db, "edge:WorksAt").await, 2);
 }
 
 /// A Merge load re-upserting an existing `@key` with its own `@unique` value is
