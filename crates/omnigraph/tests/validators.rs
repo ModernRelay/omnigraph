@@ -8,7 +8,7 @@ mod helpers;
 use omnigraph::db::Omnigraph;
 use omnigraph::loader::{LoadMode, load_jsonl};
 
-use helpers::{mutate_main, params};
+use helpers::{count_rows, mutate_main, params};
 
 const ENUM_SCHEMA: &str = r#"
 node Person {
@@ -58,6 +58,16 @@ node User {
 const UNIQUE_MUTATIONS: &str = r#"
 query insert_user($name: String, $email: String) {
     insert User { name: $name, email: $email }
+}
+"#;
+
+// A non-String `@unique` column: the committed cross-version probe must build a
+// typed literal, not a stringified key, or it compares a Date32 column to a Utf8
+// value (a DataFusion coercion error that breaks every write to the table).
+const DATE_UNIQUE_SCHEMA: &str = r#"
+node Task {
+    name: String @key
+    due: Date @unique
 }
 "#;
 
@@ -296,6 +306,58 @@ async fn cross_version_unique_rejected_on_append_load() {
         "got: {}",
         err
     );
+}
+
+/// Fix D: the cross-version `@unique` probe must use a typed literal on a
+/// non-String column. A second-version row colliding with a committed `Date`
+/// value must surface a proper `@unique` violation — not a Date32-vs-Utf8
+/// coercion error (the red symptom before the fix).
+#[tokio::test]
+async fn cross_version_unique_rejected_on_date_column() {
+    let (_dir, mut db) = init_with(DATE_UNIQUE_SCHEMA, "").await;
+    load_jsonl(
+        &mut db,
+        r#"{"type":"Task","data":{"name":"T1","due":"2026-06-29"}}"#,
+        LoadMode::Append,
+    )
+    .await
+    .unwrap();
+    let err = load_jsonl(
+        &mut db,
+        r#"{"type":"Task","data":{"name":"T2","due":"2026-06-29"}}"#,
+        LoadMode::Append,
+    )
+    .await
+    .unwrap_err();
+    assert!(
+        err.to_string().contains("@unique violation on Task.due"),
+        "got: {}",
+        err
+    );
+}
+
+/// Fix D companion: a non-colliding write to a `Date @unique` table must
+/// succeed. Before the fix the committed probe raised a coercion error for
+/// ANY second write (it compared Date32 to a Utf8 literal regardless of a
+/// match), so this happy path failed too.
+#[tokio::test]
+async fn noncolliding_write_to_date_unique_column_succeeds() {
+    let (_dir, mut db) = init_with(DATE_UNIQUE_SCHEMA, "").await;
+    load_jsonl(
+        &mut db,
+        r#"{"type":"Task","data":{"name":"T1","due":"2026-06-29"}}"#,
+        LoadMode::Append,
+    )
+    .await
+    .unwrap();
+    load_jsonl(
+        &mut db,
+        r#"{"type":"Task","data":{"name":"T2","due":"2026-07-01"}}"#,
+        LoadMode::Append,
+    )
+    .await
+    .expect("a distinct Date value must not collide and must not raise a coercion error");
+    assert_eq!(count_rows(&db, "node:Task").await, 2);
 }
 
 /// A Merge load re-upserting an existing `@key` with its own `@unique` value is
