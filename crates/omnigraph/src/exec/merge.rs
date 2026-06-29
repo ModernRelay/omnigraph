@@ -24,7 +24,6 @@ struct StagedTable {
 
 #[derive(Debug)]
 struct StagedMergeResult {
-    full_staged: StagedTable,
     delta_staged: Option<StagedTable>,
     deleted_ids: Vec<String>,
 }
@@ -446,7 +445,6 @@ async fn stage_streaming_table_merge(
     conflicts: &mut Vec<MergeConflict>,
 ) -> Result<Option<StagedMergeResult>> {
     let schema = schema_for_table_key(catalog, table_key)?;
-    let mut full_writer = StagedTableWriter::new(&format!("{}_full", table_key), schema.clone())?;
     let mut delta_writer = StagedTableWriter::new(&format!("{}_delta", table_key), schema)?;
     let mut deleted_ids: Vec<String> = Vec::new();
     let mut base = OrderedTableCursor::from_snapshot(base_snapshot, table_key).await?;
@@ -514,9 +512,9 @@ async fn stage_streaming_table_merge(
         }
 
         if let Some(selection) = selection {
-            // Always write to full (for validation)
-            full_writer.push_row(selection).await?;
-            // Only write changed rows to delta (for publish)
+            // Only changed rows go to the delta (for publish). The full merged
+            // table is no longer staged — validation works off this delta plus
+            // the committed target via index lookups, not a full re-scan.
             if selection.signature.as_str() != target_sig.unwrap_or("") {
                 delta_writer.push_row(selection).await?;
                 needs_update = true;
@@ -538,7 +536,6 @@ async fn stage_streaming_table_merge(
     };
 
     Ok(Some(StagedMergeResult {
-        full_staged: full_writer.finish().await?,
         delta_staged,
         deleted_ids,
     }))
@@ -621,297 +618,127 @@ fn row_signature(batch: &RecordBatch, row: usize) -> Result<String> {
     Ok(values.join("\u{1f}"))
 }
 
-async fn scan_validation_stream(ds: &Dataset) -> Result<DatasetRecordBatchStream> {
-    crate::table_store::TableStore::scan_stream_with(ds, None, None, None, false, |_| Ok(())).await
+/// Build the per-table [`ChangeSet`](crate::validate::ChangeSet) for a merge from
+/// the classified candidates — the new/changed rows (from the staged deltas) and
+/// removed ids the validator evaluates, instead of re-scanning whole tables.
+/// `AdoptSourceState` carries no row delta (pointer/fork), so it is skipped.
+async fn build_merge_changeset(
+    db: &Omnigraph,
+    candidates: &HashMap<String, CandidateTableState>,
+) -> Result<crate::validate::ChangeSet> {
+    let catalog = db.catalog();
+    let mut changeset = crate::validate::ChangeSet::new();
+    for (table_key, candidate) in candidates {
+        // Validation reads only id/src/dst + scalar constraint columns; project
+        // out Vector/Blob so the change-set never holds embeddings (holding the
+        // delta with embeddings would re-introduce the memory pressure the
+        // streaming append exists to avoid).
+        let projection = validation_projection(&catalog, table_key);
+        let projection: Vec<&str> = projection.iter().map(String::as_str).collect();
+        let mut change = crate::validate::TableChange::default();
+        match candidate {
+            CandidateTableState::AdoptSourceState => continue,
+            CandidateTableState::AdoptWithDelta(delta) => {
+                if let Some(table) = &delta.appends {
+                    change
+                        .added
+                        .extend(scan_staged_for_validation(db, table, &projection).await?);
+                }
+                if let Some(table) = &delta.upserts {
+                    change
+                        .changed
+                        .extend(scan_staged_for_validation(db, table, &projection).await?);
+                }
+                change.deleted_ids = delta.deleted_ids.clone();
+            }
+            CandidateTableState::RewriteMerged(staged) => {
+                if let Some(table) = &staged.delta_staged {
+                    change
+                        .changed
+                        .extend(scan_staged_for_validation(db, table, &projection).await?);
+                }
+                change.deleted_ids = staged.deleted_ids.clone();
+            }
+        }
+        changeset.insert(table_key.clone(), change);
+    }
+    Ok(changeset)
+}
+
+/// Columns validation needs from a staged delta: `id` (+ `src`/`dst` for edges)
+/// plus scalar/enum property columns. Vector and Blob columns are excluded — no
+/// constraint reads them, and keeping them out of the change-set keeps validation
+/// memory bounded regardless of embedding width.
+fn validation_projection(catalog: &Catalog, table_key: &str) -> Vec<String> {
+    use omnigraph_compiler::types::{PropType, ScalarType};
+    let is_heavy = |ty: &PropType| matches!(ty.scalar, ScalarType::Vector(_) | ScalarType::Blob);
+    let mut cols = vec!["id".to_string()];
+    if let Some(name) = table_key.strip_prefix("node:") {
+        if let Some(node_type) = catalog.node_types.get(name) {
+            for (prop, ty) in &node_type.properties {
+                if !is_heavy(ty) {
+                    cols.push(prop.clone());
+                }
+            }
+        }
+    } else if let Some(name) = table_key.strip_prefix("edge:") {
+        cols.push("src".to_string());
+        cols.push("dst".to_string());
+        if let Some(edge_type) = catalog.edge_types.get(name) {
+            for (prop, ty) in &edge_type.properties {
+                if !is_heavy(ty) {
+                    cols.push(prop.clone());
+                }
+            }
+        }
+    }
+    cols
+}
+
+/// Scan a staged delta table for validation, projected to the constraint columns
+/// (no embeddings) and kept batch-shaped — never concatenated into one batch, so
+/// it does not reintroduce the whole-delta materialization the streaming append
+/// avoids. Empty batches are dropped.
+async fn scan_staged_for_validation(
+    db: &Omnigraph,
+    table: &StagedTable,
+    projection: &[&str],
+) -> Result<Vec<RecordBatch>> {
+    let snapshot = SnapshotHandle::new(table.dataset.clone());
+    let batches = db
+        .storage()
+        .scan(&snapshot, Some(projection), None, None)
+        .await?;
+    Ok(batches
+        .into_iter()
+        .filter(|batch| batch.num_rows() > 0)
+        .collect())
 }
 
 async fn validate_merge_candidates(
     db: &Omnigraph,
-    source_snapshot: &Snapshot,
     target_snapshot: &Snapshot,
-    candidates: &HashMap<String, CandidateTableState>,
+    changeset: &crate::validate::ChangeSet,
 ) -> Result<()> {
-    let mut conflicts = Vec::new();
-    let mut node_ids: HashMap<String, HashSet<String>> = HashMap::new();
-
-    for (type_name, node_type) in &db.catalog().node_types {
-        let table_key = format!("node:{}", type_name);
-        let mut values = HashSet::new();
-        let mut unique_seen = vec![HashMap::new(); node_type.unique_constraints.len()];
-
-        if let Some(ds) =
-            candidate_dataset(source_snapshot, target_snapshot, candidates, &table_key).await?
-        {
-            let mut stream = scan_validation_stream(&ds).await?;
-            while let Some(batch) = stream
-                .try_next()
-                .await
-                .map_err(|e| OmniError::Lance(e.to_string()))?
-            {
-                if let Err(err) = crate::loader::validate_value_constraints(&batch, node_type) {
-                    conflicts.push(MergeConflict {
-                        table_key: table_key.clone(),
-                        row_id: None,
-                        kind: MergeConflictKind::ValueConstraintViolation,
-                        message: err.to_string(),
-                    });
-                }
-                update_unique_constraints(
-                    &table_key,
-                    &batch,
-                    &node_type.unique_constraints,
-                    &mut unique_seen,
-                    &mut conflicts,
-                )?;
-                let ids = batch
-                    .column_by_name("id")
-                    .ok_or_else(|| {
-                        OmniError::manifest(format!("table {} missing id column", table_key))
-                    })?
-                    .as_any()
-                    .downcast_ref::<StringArray>()
-                    .ok_or_else(|| {
-                        OmniError::manifest(format!("table {} id column is not Utf8", table_key))
-                    })?;
-                for row in 0..ids.len() {
-                    values.insert(ids.value(row).to_string());
-                }
-            }
-        }
-        node_ids.insert(type_name.clone(), values);
-    }
-
-    for (edge_name, edge_type) in &db.catalog().edge_types {
-        let table_key = format!("edge:{}", edge_name);
-        let mut unique_seen = vec![HashMap::new(); edge_type.unique_constraints.len()];
-        let mut src_counts = HashMap::new();
-
-        if let Some(ds) =
-            candidate_dataset(source_snapshot, target_snapshot, candidates, &table_key).await?
-        {
-            let mut stream = scan_validation_stream(&ds).await?;
-            while let Some(batch) = stream
-                .try_next()
-                .await
-                .map_err(|e| OmniError::Lance(e.to_string()))?
-            {
-                update_unique_constraints(
-                    &table_key,
-                    &batch,
-                    &edge_type.unique_constraints,
-                    &mut unique_seen,
-                    &mut conflicts,
-                )?;
-                accumulate_edge_cardinality(&batch, &mut src_counts, &table_key)?;
-                conflicts.extend(validate_orphan_edges_batch(
-                    &table_key, edge_type, &batch, &node_ids,
-                )?);
-            }
-        }
-
-        conflicts.extend(finalize_edge_cardinality_conflicts(
-            &table_key,
-            edge_name,
-            edge_type.cardinality.min,
-            edge_type.cardinality.max,
-            src_counts,
-        ));
-    }
-
-    if conflicts.is_empty() {
+    // Δ-scoped, index-backed validation: the declared constraints are evaluated
+    // over the merge delta against the committed target (queried through its
+    // BTREE indexes), not by re-scanning every catalog table. Value/enum,
+    // uniqueness, edge-RI, and cardinality all route through one evaluator shared
+    // with (eventually) the write path — closing the merge-vs-write drift.
+    let committed = crate::validate::CommittedState::merge(target_snapshot);
+    let constraints = crate::validate::constraints_for(&db.catalog());
+    let violations =
+        crate::validate::evaluate(&constraints, changeset, &committed, &db.catalog()).await?;
+    if violations.is_empty() {
         Ok(())
     } else {
-        Err(OmniError::MergeConflicts(conflicts))
-    }
-}
-
-async fn candidate_dataset(
-    source_snapshot: &Snapshot,
-    target_snapshot: &Snapshot,
-    candidates: &HashMap<String, CandidateTableState>,
-    table_key: &str,
-) -> Result<Option<Dataset>> {
-    if let Some(candidate) = candidates.get(table_key) {
-        return match candidate {
-            CandidateTableState::AdoptSourceState | CandidateTableState::AdoptWithDelta(_) => {
-                match source_snapshot.entry(table_key) {
-                    Some(_) => Ok(Some(source_snapshot.open(table_key).await?)),
-                    None => Ok(None),
-                }
-            }
-            CandidateTableState::RewriteMerged(staged) => {
-                Ok(Some(staged.full_staged.dataset.clone()))
-            }
-        };
-    }
-    match target_snapshot.entry(table_key) {
-        Some(_) => Ok(Some(target_snapshot.open(table_key).await?)),
-        None => Ok(None),
-    }
-}
-
-fn update_unique_constraints(
-    table_key: &str,
-    batch: &RecordBatch,
-    constraints: &[Vec<String>],
-    seen: &mut [HashMap<Vec<String>, String>],
-    conflicts: &mut Vec<MergeConflict>,
-) -> Result<()> {
-    for (constraint_idx, columns) in constraints.iter().enumerate() {
-        let seen = &mut seen[constraint_idx];
-        // Resolve the group's columns once. The candidate dataset always
-        // carries the full table schema, so a missing column is an internal
-        // error rather than a skip.
-        let group_columns = columns
-            .iter()
-            .map(|column_name| {
-                batch.column_by_name(column_name).cloned().ok_or_else(|| {
-                    OmniError::manifest(format!(
-                        "table {} missing unique column '{}'",
-                        table_key, column_name
-                    ))
-                })
-            })
-            .collect::<Result<Vec<_>>>()?;
-        for row in 0..batch.num_rows() {
-            // Same tuple key as the intake path — one shared derivation in
-            // `crate::loader::composite_unique_key`, so the two cannot drift on
-            // separator or scalar conversion. Null rows are exempt.
-            let Some(key) = crate::loader::composite_unique_key(&group_columns, row)? else {
-                continue;
-            };
-            let row_id = row_id_at(batch, row)?;
-            if let Some(first_row_id) = seen.insert(key, row_id.clone()) {
-                conflicts.push(MergeConflict {
-                    table_key: table_key.to_string(),
-                    row_id: Some(row_id.clone()),
-                    kind: MergeConflictKind::UniqueViolation,
-                    message: format!(
-                        "unique constraint {:?} violated by '{}' and '{}'",
-                        columns, first_row_id, row_id
-                    ),
-                });
-            }
-        }
-    }
-    Ok(())
-}
-
-fn accumulate_edge_cardinality(
-    batch: &RecordBatch,
-    counts: &mut HashMap<String, u32>,
-    table_key: &str,
-) -> Result<()> {
-    let srcs = batch
-        .column_by_name("src")
-        .ok_or_else(|| OmniError::manifest(format!("table {} missing src column", table_key)))?
-        .as_any()
-        .downcast_ref::<StringArray>()
-        .ok_or_else(|| {
-            OmniError::manifest(format!("table {} src column is not Utf8", table_key))
-        })?;
-    for row in 0..srcs.len() {
-        *counts.entry(srcs.value(row).to_string()).or_insert(0_u32) += 1;
-    }
-    Ok(())
-}
-
-fn finalize_edge_cardinality_conflicts(
-    table_key: &str,
-    edge_name: &str,
-    min: u32,
-    max: Option<u32>,
-    counts: HashMap<String, u32>,
-) -> Vec<MergeConflict> {
-    let mut conflicts = Vec::new();
-    for (src, count) in counts {
-        if let Some(max) = max {
-            if count > max {
-                conflicts.push(MergeConflict {
-                    table_key: table_key.to_string(),
-                    row_id: None,
-                    kind: MergeConflictKind::CardinalityViolation,
-                    message: format!(
-                        "@card violation on edge {}: source '{}' has {} edges (max {})",
-                        edge_name, src, count, max
-                    ),
-                });
-            }
-        }
-        if count < min {
-            conflicts.push(MergeConflict {
-                table_key: table_key.to_string(),
-                row_id: None,
-                kind: MergeConflictKind::CardinalityViolation,
-                message: format!(
-                    "@card violation on edge {}: source '{}' has {} edges (min {})",
-                    edge_name, src, count, min
-                ),
-            });
-        }
-    }
-    conflicts
-}
-
-fn validate_orphan_edges_batch(
-    table_key: &str,
-    edge_type: &omnigraph_compiler::catalog::EdgeType,
-    batch: &RecordBatch,
-    node_ids: &HashMap<String, HashSet<String>>,
-) -> Result<Vec<MergeConflict>> {
-    let srcs = batch
-        .column_by_name("src")
-        .ok_or_else(|| OmniError::manifest(format!("table {} missing src column", table_key)))?
-        .as_any()
-        .downcast_ref::<StringArray>()
-        .ok_or_else(|| {
-            OmniError::manifest(format!("table {} src column is not Utf8", table_key))
-        })?;
-    let dsts = batch
-        .column_by_name("dst")
-        .ok_or_else(|| OmniError::manifest(format!("table {} missing dst column", table_key)))?
-        .as_any()
-        .downcast_ref::<StringArray>()
-        .ok_or_else(|| {
-            OmniError::manifest(format!("table {} dst column is not Utf8", table_key))
-        })?;
-
-    let from_ids = node_ids.get(&edge_type.from_type).ok_or_else(|| {
-        OmniError::manifest(format!(
-            "missing candidate node ids for {}",
-            edge_type.from_type
+        Err(OmniError::MergeConflicts(
+            violations
+                .into_iter()
+                .map(crate::validate::Violation::into_merge_conflict)
+                .collect(),
         ))
-    })?;
-    let to_ids = node_ids.get(&edge_type.to_type).ok_or_else(|| {
-        OmniError::manifest(format!(
-            "missing candidate node ids for {}",
-            edge_type.to_type
-        ))
-    })?;
-
-    let mut conflicts = Vec::new();
-    for row in 0..batch.num_rows() {
-        let row_id = row_id_at(batch, row)?;
-        let src = srcs.value(row);
-        let dst = dsts.value(row);
-        if !from_ids.contains(src) {
-            conflicts.push(MergeConflict {
-                table_key: table_key.to_string(),
-                row_id: Some(row_id.clone()),
-                kind: MergeConflictKind::OrphanEdge,
-                message: format!("src '{}' not found in {}", src, edge_type.from_type),
-            });
-        }
-        if !to_ids.contains(dst) {
-            conflicts.push(MergeConflict {
-                table_key: table_key.to_string(),
-                row_id: Some(row_id),
-                kind: MergeConflictKind::OrphanEdge,
-                message: format!("dst '{}' not found in {}", dst, edge_type.to_type),
-            });
-        }
     }
-    Ok(conflicts)
 }
 
 fn row_id_at(batch: &RecordBatch, row: usize) -> Result<String> {
@@ -1588,7 +1415,8 @@ impl Omnigraph {
             return Err(OmniError::MergeConflicts(conflicts));
         }
 
-        validate_merge_candidates(self, source_snapshot, &target_snapshot, &candidates).await?;
+        let changeset = build_merge_changeset(self, &candidates).await?;
+        validate_merge_candidates(self, &target_snapshot, &changeset).await?;
 
         // Recovery sidecar: protect the per-table commit_staged loop.
         // Pin `RewriteMerged` and `AdoptWithDelta` candidates — both advance

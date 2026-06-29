@@ -55,6 +55,12 @@ node User {
 }
 "#;
 
+const UNIQUE_MUTATIONS: &str = r#"
+query insert_user($name: String, $email: String) {
+    insert User { name: $name, email: $email }
+}
+"#;
+
 const CARDINALITY_SCHEMA: &str = r#"
 node Person { name: String @key }
 node Company { name: String @key }
@@ -200,9 +206,141 @@ async fn intra_batch_unique_rejected_on_jsonl_load() {
     );
 }
 
-// Note: single-row mutation insert can't violate intra-batch uniqueness
-// (only one row in the batch). Cross-batch uniqueness against committed rows
-// is out of scope for this wire-up — see the unified write-validator effort.
+// Single-row mutation insert can't violate INTRA-BATCH uniqueness (one row).
+// CROSS-VERSION uniqueness against already-committed rows IS now enforced on the
+// mutation path via the unified evaluator (#1/#2); the loader path's
+// cross-version check lands with the loader migration.
+
+/// Cross-version uniqueness, closed by the write-path evaluator migration:
+/// two SEPARATE mutations inserting distinct rows with the same `@unique` value —
+/// the second is rejected against the committed first (previously a gap).
+#[tokio::test]
+async fn cross_version_unique_rejected_on_mutation_insert() {
+    let (_dir, mut db) = init_with(UNIQUE_SCHEMA, "").await;
+    mutate_main(
+        &mut db,
+        UNIQUE_MUTATIONS,
+        "insert_user",
+        &params(&[("$name", "Bob"), ("$email", "dup@example.com")]),
+    )
+    .await
+    .unwrap();
+    let err = mutate_main(
+        &mut db,
+        UNIQUE_MUTATIONS,
+        "insert_user",
+        &params(&[("$name", "Carol"), ("$email", "dup@example.com")]),
+    )
+    .await
+    .unwrap_err();
+    assert!(
+        err.to_string().contains("@unique violation on User.email"),
+        "got: {}",
+        err
+    );
+}
+
+/// The cross-version unique check must NOT flag a row updating itself: an upsert
+/// of an existing `@key` (same id) is an update, not a duplicate. Re-inserting
+/// the same key with its own `@unique` value must succeed (the evaluator excludes
+/// the committed same-id holder).
+#[tokio::test]
+async fn reinsert_existing_key_is_upsert_not_unique_violation() {
+    let (_dir, mut db) = init_with(UNIQUE_SCHEMA, "").await;
+    mutate_main(
+        &mut db,
+        UNIQUE_MUTATIONS,
+        "insert_user",
+        &params(&[("$name", "Alice"), ("$email", "alice@example.com")]),
+    )
+    .await
+    .unwrap();
+    mutate_main(
+        &mut db,
+        UNIQUE_MUTATIONS,
+        "insert_user",
+        &params(&[("$name", "Alice"), ("$email", "alice@example.com")]),
+    )
+    .await
+    .expect("re-inserting an existing @key upserts; it is not a unique violation");
+}
+
+// ─── Cross-version uniqueness + RI on the LOADER path (Slice 3) ───────────────
+
+const RI_SCHEMA: &str = r#"
+node Person { name: String @key }
+edge Knows: Person -> Person
+"#;
+
+/// Cross-version uniqueness is now enforced on the bulk-load path too: a second
+/// Append load duplicating a committed `@unique` value is rejected.
+#[tokio::test]
+async fn cross_version_unique_rejected_on_append_load() {
+    let (_dir, mut db) = init_with(UNIQUE_SCHEMA, "").await;
+    load_jsonl(
+        &mut db,
+        r#"{"type":"User","data":{"name":"Bob","email":"dup@example.com"}}"#,
+        LoadMode::Append,
+    )
+    .await
+    .unwrap();
+    let err = load_jsonl(
+        &mut db,
+        r#"{"type":"User","data":{"name":"Carol","email":"dup@example.com"}}"#,
+        LoadMode::Append,
+    )
+    .await
+    .unwrap_err();
+    assert!(
+        err.to_string().contains("@unique violation on User.email"),
+        "got: {}",
+        err
+    );
+}
+
+/// A Merge load re-upserting an existing `@key` with its own `@unique` value is
+/// an update, not a duplicate — it must NOT false-trigger the cross-version check.
+#[tokio::test]
+async fn merge_load_reupsert_existing_key_is_not_unique_violation() {
+    let (_dir, mut db) = init_with(UNIQUE_SCHEMA, "").await;
+    let row = r#"{"type":"User","data":{"name":"Alice","email":"alice@example.com"}}"#;
+    load_jsonl(&mut db, row, LoadMode::Merge).await.unwrap();
+    load_jsonl(&mut db, row, LoadMode::Merge)
+        .await
+        .expect("merge-load re-upserting an existing @key is not a unique violation");
+}
+
+/// `Overwrite` replaces the touched tables, so edge RI must validate against the
+/// NEW batch image, not the replaced committed one. An edge to a node that exists
+/// only in the new batch loads cleanly (regression against using the old image).
+#[tokio::test]
+async fn overwrite_load_validates_ri_against_new_image() {
+    let (_dir, mut db) = init_with(RI_SCHEMA, r#"{"type":"Person","data":{"name":"Alice"}}"#).await;
+    let batch = r#"{"type":"Person","data":{"name":"Carol"}}
+{"edge":"Knows","from":"Carol","to":"Carol"}"#;
+    load_jsonl(&mut db, batch, LoadMode::Overwrite)
+        .await
+        .expect("Overwrite RI validates against the new batch image, not the replaced committed");
+}
+
+/// And an Append load whose edge references a non-existent node is still rejected
+/// (edge-RI enforced via the evaluator).
+#[tokio::test]
+async fn append_load_rejects_orphan_edge() {
+    let (_dir, mut db) = init_with(RI_SCHEMA, r#"{"type":"Person","data":{"name":"Alice"}}"#).await;
+    let err = load_jsonl(
+        &mut db,
+        r#"{"edge":"Knows","from":"Alice","to":"Ghost"}"#,
+        LoadMode::Append,
+    )
+    .await
+    .unwrap_err();
+    assert!(
+        err.to_string().contains("not found"),
+        "orphan edge must be rejected, got: {}",
+        err
+    );
+}
 
 // ─── Edge cardinality ────────────────────────────────────────────────────────
 
