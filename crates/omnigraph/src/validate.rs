@@ -801,10 +801,13 @@ async fn merged_node_existence(
     Ok(exist)
 }
 
-/// `@card` for an edge type, scoped to the srcs the delta affects. The merged
-/// edge set per src = (committed edges with that src, minus those removed) ∪
-/// (delta edges with that src), deduped by edge id (a changed edge keeps its id
-/// and is counted once). A src that is itself a deleted node is skipped.
+/// `@card` for an edge type, scoped to the srcs the delta affects. The delta is
+/// coalesced by edge id (last-wins, as commit does); the merged edge set per src
+/// = (committed edges with that src, minus those deleted or re-placed by the
+/// delta) ∪ (coalesced delta edges with that src). The affected set includes the
+/// new src of each delta edge AND the old committed src of each changed/deleted
+/// edge id, so moving an edge off a src recounts the vacated src. A src that is
+/// itself a deleted node is skipped.
 async fn evaluate_cardinality(
     edge_table: &str,
     edge_type: &EdgeType,
@@ -820,9 +823,25 @@ async fn evaluate_cardinality(
     let delta_edges = delta_edge_src(change)?;
     let removed_ids: Vec<String> = change.deleted_ids.clone();
     let removed_id_set: HashSet<&String> = removed_ids.iter().collect();
-    // srcs of committed edges removed by this merge (direct edge deletes; a
-    // node-delete cascade already lands those edge ids in `deleted_ids`).
+
+    // Coalesce the delta by edge id, last-wins — matching commit's
+    // `dedupe_merge_batches_by_id`. A Merge load can list the same edge id twice
+    // with different srcs; commit keeps the last, so counting raw delta rows
+    // would place one id under multiple srcs and over-count.
+    let mut delta_by_id: HashMap<String, String> = HashMap::new();
+    for (id, src) in &delta_edges {
+        delta_by_id.insert(id.clone(), src.clone());
+    }
+    let changed_ids: Vec<String> = delta_by_id.keys().cloned().collect();
+    let delta_id_set: HashSet<&String> = changed_ids.iter().collect();
+
+    // Committed srcs of the edges this delta touches. `removed_edges` are the
+    // deleted ids (direct deletes; a node-delete cascade already lands those ids
+    // in `deleted_ids`). `moved_from` are the changed ids' OLD committed srcs: an
+    // upsert that moves an edge's src vacates its old src, which must be
+    // recounted or a drop below @card min is missed.
     let removed_edges = committed.committed_edges(edge_table, "id", &removed_ids).await?;
+    let moved_from = committed.committed_edges(edge_table, "id", &changed_ids).await?;
 
     let deleted_src_nodes: HashSet<String> = changeset
         .get(&format!("node:{}", edge_type.from_type))
@@ -830,10 +849,10 @@ async fn evaluate_cardinality(
         .unwrap_or_default();
 
     let mut affected: HashSet<String> = HashSet::new();
-    for (_, src) in &delta_edges {
+    for src in delta_by_id.values() {
         affected.insert(src.clone());
     }
-    for (_, src) in &removed_edges {
+    for (_, src) in removed_edges.iter().chain(moved_from.iter()) {
         affected.insert(src.clone());
     }
     affected.retain(|src| !deleted_src_nodes.contains(src));
@@ -846,14 +865,19 @@ async fn evaluate_cardinality(
         .committed_edges(edge_table, "src", &affected_vec)
         .await?;
 
-    // Merged edge-id set per src, deduped by id.
+    // Merged edge-id set per src. A committed edge is dropped from its src when
+    // the delta deletes it (`removed_id_set`) OR re-places it (`delta_id_set` — a
+    // changed edge is recounted at its new src below, so its old src must not
+    // keep counting it). Then add the coalesced delta edges at their last-wins
+    // src. Counting by id keeps the validated set equal to what commit persists.
     let mut per_src: HashMap<String, HashSet<String>> = HashMap::new();
     for (id, src) in &committed_for_affected {
-        if !removed_id_set.contains(id) {
-            per_src.entry(src.clone()).or_default().insert(id.clone());
+        if removed_id_set.contains(id) || delta_id_set.contains(id) {
+            continue;
         }
+        per_src.entry(src.clone()).or_default().insert(id.clone());
     }
-    for (id, src) in &delta_edges {
+    for (id, src) in &delta_by_id {
         per_src.entry(src.clone()).or_default().insert(id.clone());
     }
 
