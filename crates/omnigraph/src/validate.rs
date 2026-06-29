@@ -25,6 +25,7 @@ use std::collections::{HashMap, HashSet};
 
 use arrow_array::{Array, RecordBatch, StringArray};
 use datafusion::prelude::{Expr, col, lit};
+use datafusion::scalar::ScalarValue;
 use futures::TryStreamExt;
 use lance::Dataset;
 use omnigraph_compiler::catalog::{Catalog, EdgeType};
@@ -350,15 +351,19 @@ impl<'a> CommittedState<'a> {
         &self,
         table_key: &str,
         columns: &[String],
-        key: &[String],
+        key_values: &[ScalarValue],
     ) -> Result<Vec<String>> {
         let Some(ds) = self.open(table_key).await? else {
             return Ok(Vec::new());
         };
         // AND of per-column equality so each indexed column is served by its
-        // BTREE (a non-indexed `@unique` column falls back to a scan).
+        // BTREE (a non-indexed `@unique` column falls back to a scan). The
+        // literal is TYPED (built from the row's Arrow column), so the
+        // pushed-down filter compares like-typed. A stringified key would push a
+        // Utf8 literal against a typed column — a coercion error on Date/Bool
+        // (breaking every write) or a silent miss on Float.
         let mut expr: Option<Expr> = None;
-        for (column, value) in columns.iter().zip(key.iter()) {
+        for (column, value) in columns.iter().zip(key_values.iter()) {
             let eq = col(column.as_str()).eq(lit(value.clone()));
             expr = Some(match expr {
                 Some(acc) => acc.and(eq),
@@ -654,7 +659,17 @@ async fn evaluate_unique(
             if is_key {
                 continue;
             }
-            for holder in committed.unique_holders(table_key, columns, &key).await? {
+            // Build typed literals from the row's Arrow columns for the committed
+            // probe — the stringified `key` above is fine for the in-memory
+            // intra-delta dedup (type-agnostic equality) but must NOT be pushed
+            // down against a typed column. `key` is `Some` here, so every column
+            // is non-null and `try_from_array` yields a concrete scalar.
+            let key_values = group_columns
+                .iter()
+                .map(|arr| ScalarValue::try_from_array(arr, row))
+                .collect::<std::result::Result<Vec<_>, _>>()
+                .map_err(|e| OmniError::manifest(e.to_string()))?;
+            for holder in committed.unique_holders(table_key, columns, &key_values).await? {
                 if !delta_ids.contains(&holder) && !deleted.contains(&holder) {
                     violations.push(unique_violation(table_key, columns, &key, &id, &holder));
                     break;
