@@ -35,6 +35,9 @@ platform_asset_name() {
     Linux/x86_64)
       printf 'omnigraph-linux-x86_64.tar.gz\n'
       ;;
+    Linux/aarch64)
+      printf 'omnigraph-linux-arm64.tar.gz\n'
+      ;;
     Darwin/arm64)
       printf 'omnigraph-macos-arm64.tar.gz\n'
       ;;

@@ -9,6 +9,6 @@
 - **AWS feature build job**: `cargo build/test -p omnigraph-server --features aws` on ubuntu-latest.
 - **Windows binary build job**: `cargo build --release --locked -p omnigraph-cli -p omnigraph-server` on windows-latest with smoke checks for `omnigraph.exe version`, `omnigraph-server.exe --help`, and PowerShell installer syntax.
 - **RustFS S3 integration**: spins up RustFS in Docker, runs `s3_storage`, `server_opens_s3_graph_directly_and_serves_snapshot_and_read`, and `local_cli_s3_end_to_end_init_load_read_flow`.
-- **release-edge.yml**: on every push to main, retags `edge`, builds Linux x86_64 / macOS arm64 archives and Windows x86_64 zip + sha256, publishes a rolling prerelease, then smoke-tests the Windows PowerShell installer against `edge`.
-- **release.yml**: on `v*` tags, builds the Linux x86_64 / macOS arm64 archives and Windows x86_64 zip release matrix, updates the Homebrew tap (`scripts/update-homebrew-formula.sh`) by pushing the regenerated formula to `ModernRelay/homebrew-tap`, and smoke-tests the Windows PowerShell installer against the tag.
+- **release-edge.yml**: on every push to main, retags `edge`, builds Linux x86_64 / Linux arm64 / macOS arm64 archives and Windows x86_64 zip + sha256, publishes a rolling prerelease, then smoke-tests the Windows PowerShell installer against `edge`.
+- **release.yml**: on `v*` tags, builds the Linux x86_64 / Linux arm64 / macOS arm64 archives and Windows x86_64 zip release matrix, updates the Homebrew tap (`scripts/update-homebrew-formula.sh`) by pushing the regenerated formula to `ModernRelay/homebrew-tap`, and smoke-tests the Windows PowerShell installer against the tag.
 - **package.yml**: manual ECR image build; emits two image tags per commit (`<sha>`, `<sha>-aws`) via CodeBuild.

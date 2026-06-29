@@ -121,6 +121,7 @@ Copy-Item target\release\omnigraph-server.exe "$env:USERPROFILE\.local\bin\omnig
 Tagged releases are expected to publish:
 
 - `omnigraph-linux-x86_64.tar.gz`
+- `omnigraph-linux-arm64.tar.gz`
 - `omnigraph-macos-arm64.tar.gz`
 - `omnigraph-windows-x86_64.zip`
 
