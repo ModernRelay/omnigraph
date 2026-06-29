@@ -1799,9 +1799,15 @@ async fn sub_current_graph_is_refused_then_rebuilt_via_export_import() {
         Ok(_) => panic!("a sub-CURRENT graph must be refused on open"),
         Err(err) => err,
     };
+    let msg = err.to_string();
     assert!(
-        err.to_string().contains("export"),
+        msg.contains("export"),
         "the refusal must nudge the operator to `omnigraph export`, got: {err}",
+    );
+    assert!(
+        msg.contains("0.7.2"),
+        "the refusal must name the release that wrote this stamp (v3 → 0.6.2 to 0.7.2) so the \
+         operator knows which binary to use, got: {err}",
     );
 
     // Rebuild with this binary: fresh init + load the export.
