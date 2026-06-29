@@ -1428,6 +1428,72 @@ async fn branch_merge_reports_cardinality_violation_conflict() {
     }
 }
 
+/// Fix C regression: a table adopted by pointer switch (`AdoptSourceState`)
+/// must still be validated. Merging `main` -> `feature` where `feature` deleted
+/// a node and `main` added an edge referencing it classifies the edge table as
+/// `AdoptSourceState` (source on main, target on a branch). The unified
+/// evaluator must see the adopted edge and reject the orphan; before the fix it
+/// skipped the table entirely and silently published the dangling edge.
+#[tokio::test]
+async fn merge_main_into_branch_validates_adopted_edge_against_branch_node_delete() {
+    const MUTATIONS: &str = r#"
+query add_knows($from: String, $to: String) {
+    insert Knows { from: $from, to: $to }
+}
+
+query delete_person($name: String) {
+    delete Person where name = $name
+}
+"#;
+
+    let dir = tempfile::tempdir().unwrap();
+    let uri = dir.path().to_str().unwrap();
+    let mut main = init_db_from_schema_and_data(&dir, EDGE_UNIQUE_SCHEMA, EDGE_UNIQUE_DATA).await;
+    main.branch_create("feature").await.unwrap();
+    let mut feature = Omnigraph::open(uri).await.unwrap();
+
+    // main (merge source): add an edge referencing Bob.
+    mutate_main(
+        &mut main,
+        MUTATIONS,
+        "add_knows",
+        &params(&[("$from", "Alice"), ("$to", "Bob")]),
+    )
+    .await
+    .unwrap();
+
+    // feature (merge target): delete Bob.
+    mutate_branch(
+        &mut feature,
+        "feature",
+        MUTATIONS,
+        "delete_person",
+        &params(&[("$name", "Bob")]),
+    )
+    .await
+    .unwrap();
+
+    // Merge main -> feature: edge:Knows is adopted by pointer switch
+    // (AdoptSourceState). The adopted edge Alice->Bob references Bob, which the
+    // target branch deleted, so the merge must reject with OrphanEdge.
+    let err = feature
+        .branch_merge("main", "feature")
+        .await
+        .expect_err("adopting main's edge into a branch that deleted its endpoint must conflict");
+    match err {
+        OmniError::MergeConflicts(conflicts) => {
+            assert!(
+                conflicts
+                    .iter()
+                    .any(|c| c.table_key == "edge:Knows"
+                        && c.kind == MergeConflictKind::OrphanEdge),
+                "expected OrphanEdge on edge:Knows, got {conflicts:?}"
+            );
+        }
+        other => panic!("expected merge conflicts, got {other:?}"),
+    }
+}
+
 #[tokio::test]
 async fn branch_api_rejects_reserved_main_and_same_source_target_merge() {
     let dir = tempfile::tempdir().unwrap();
