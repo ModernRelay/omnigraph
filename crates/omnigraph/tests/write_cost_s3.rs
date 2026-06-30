@@ -28,7 +28,7 @@
 
 mod helpers;
 
-use helpers::cost::{IoCounts, assert_flat, assert_grows, cost_harness, measure_insert, s3_graph};
+use helpers::cost::{IoCounts, assert_flat, cost_harness, measure_insert, s3_graph};
 use helpers::commit_many;
 
 /// After step 3a the data-table opener term is flat across depth on a real object
@@ -156,22 +156,20 @@ async fn warm_write_cost_flat_and_bounded_in_history_on_s3() {
     .await;
 }
 
-/// *(stale — needs inversion in Phase 3.4 after the warm-publish activation and a
-/// RustFS measurement, exactly as the local twin was: Layer 4 drove the warm
-/// write's `__manifest` scan to 0, so this `assert_grows` no longer holds — warm
-/// removed the growth on S3 too. Flip to `assert_flat` and re-baseline against the
-/// real RustFS numbers.)*
-///
-/// NEGATIVE CONTROL for `warm_write_cost_flat_and_bounded_in_history_on_s3`. The
-/// SAME warm-write depth sweep with NO `optimize()` between depths. Pre-warm this
-/// asserted `manifest_reads` GROWS, giving the flat gate teeth; the local twin is
-/// now `write_cost.rs::served_regime_manifest_scan_is_flat_with_warm_publish`.
-/// Run under RustFS in CI's `rustfs_integration` job.
+/// The S3 served-regime gate: the SAME warm-write depth sweep as
+/// `warm_write_cost_flat_and_bounded_in_history_on_s3` but with NO `optimize()`
+/// between depths. Pre-warm this was an `assert_grows` negative control (the cold
+/// O(fragments) `read_manifest_scan` grew with history); Layer 4 (warm publish)
+/// drove that scan to 0, so it is now `assert_flat` — the warm write's `__manifest`
+/// scan stays flat across depth EVEN WITHOUT compaction, the load-bearing
+/// unlimited-history property on the served path. The S3 mirror of the local twin
+/// `write_cost.rs::served_regime_manifest_scan_is_flat_with_warm_publish`. Run under
+/// RustFS in CI's `rustfs_integration` job.
 #[tokio::test]
-async fn warm_write_cost_grows_without_compaction_on_s3() {
+async fn served_regime_manifest_scan_is_flat_with_warm_publish_on_s3() {
     let Some(mut db) = s3_graph("write-cost-grows").await else {
         eprintln!(
-            "SKIP warm_write_cost_grows_without_compaction_on_s3: \
+            "SKIP served_regime_manifest_scan_is_flat_with_warm_publish_on_s3: \
              OMNIGRAPH_S3_TEST_BUCKET unset (or store unreachable)"
         );
         return;
@@ -200,18 +198,21 @@ async fn warm_write_cost_grows_without_compaction_on_s3() {
             curve.push((d, io));
         }
 
-        // GREEN today: the per-write `__manifest` publish scan is O(fragments) and
-        // grows across the 10→50 sweep by far more than the flat gate's slack of 2.
-        // The `8` floor is seeded conservatively (the local twin floors at 20 over a
-        // 90-depth sweep; scaled to this 40-depth sweep that is ~9), comfortably
-        // above the flat slack and unambiguously distinguishing "grows" from "flat".
-        // CI's rustfs_integration job calibrates the true S3 growth — raise the floor
-        // toward it once measured.
-        assert_grows(
+        // INVERTED to the permanent served-regime gate now that Layer 4 (warm
+        // publish) is active — exactly as the local twin
+        // (`write_cost.rs::served_regime_manifest_scan_is_flat_with_warm_publish`).
+        // The warm attempt-0 publish reuses the folded `known_state` and does ZERO
+        // `__manifest` scan, so the per-write scan is flat across the 10→50 sweep
+        // even WITHOUT compaction — the load-bearing unlimited-history property on
+        // the served path (the freshness probe is a `_versions/` LIST, counted in
+        // `manifest_list_requests`, not this scan term). If warm regresses to the
+        // cold O(fragments) `read_manifest_scan`, this grows again and trips the
+        // small slack. CI's rustfs_integration job is the running measurement.
+        assert_flat(
             &curve,
             |c| c.manifest_reads,
-            8,
-            "S3 warm-write __manifest scan (uncompacted)",
+            2,
+            "S3 warm-write __manifest scan (served, warm-published)",
         );
     })
     .await;
