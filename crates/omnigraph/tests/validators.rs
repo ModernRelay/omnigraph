@@ -94,6 +94,12 @@ node Company { name: String @key }
 edge WorksAt: Person -> Company @card(1..)
 "#;
 
+const CARD_MIN_DELETE_MUTATIONS: &str = r#"
+query drop_employment($person: String) {
+    delete WorksAt where from = $person
+}
+"#;
+
 async fn init_with(schema: &str, data: &str) -> (tempfile::TempDir, Omnigraph) {
     let dir = tempfile::tempdir().unwrap();
     let uri = dir.path().to_str().unwrap();
@@ -415,6 +421,38 @@ async fn merge_load_duplicate_edge_id_counts_once_per_card() {
         .await
         .expect("a deduped edge id must not double-count Alice into a @card(0..1) violation");
     assert_eq!(count_rows(&db, "edge:WorksAt").await, 2);
+}
+
+/// A direct edge DELETE must recount the source it empties. Deleting Alice's
+/// only WorksAt drops her to zero, below @card(1..), and must be rejected.
+/// Deletes stage as predicates (absent from the constructive change-set), so
+/// before the fix the mutation committed without any cardinality check — while
+/// the merge path, which carries deleted_ids, would have caught it.
+#[tokio::test]
+async fn mutation_delete_edge_below_card_min_rejected() {
+    let seed = r#"{"type":"Person","data":{"name":"Alice"}}
+{"type":"Company","data":{"name":"Acme"}}
+{"edge":"WorksAt","from":"Alice","to":"Acme","data":{"id":"E1"}}"#;
+    let (_dir, mut db) = init_with(CARD_MIN_SCHEMA, seed).await;
+
+    let err = mutate_main(
+        &mut db,
+        CARD_MIN_DELETE_MUTATIONS,
+        "drop_employment",
+        &params(&[("$person", "Alice")]),
+    )
+    .await
+    .expect_err("deleting Alice's only WorksAt drops her below @card(1..)");
+    assert!(
+        err.to_string().contains("@card violation") && err.to_string().contains("Alice"),
+        "got: {}",
+        err
+    );
+    assert_eq!(
+        count_rows(&db, "edge:WorksAt").await,
+        1,
+        "the rejected delete must not have removed the edge"
+    );
 }
 
 /// A Merge load re-upserting an existing `@key` with its own `@unique` value is
