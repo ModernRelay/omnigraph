@@ -47,7 +47,7 @@ pub use state::SubTableEntry;
 pub(crate) use state::{GraphLineageRow, read_graph_lineage};
 #[cfg(test)]
 use state::string_column;
-use state::{ManifestState, read_manifest_state};
+use state::{ManifestState, read_manifest_state, warm_publish_inputs};
 
 /// The internal-schema (storage-format) version this binary writes and reads.
 /// A graph's on-disk per-branch stamp is read via [`internal_schema_stamp_at`];
@@ -486,7 +486,7 @@ impl ManifestCoordinator {
         expected_table_versions: &HashMap<String, u64>,
     ) -> Result<u64> {
         Ok(self
-            .commit_changes_with_lineage(changes, expected_table_versions, None)
+            .commit_changes_with_lineage(changes, expected_table_versions, None, None)
             .await?
             .version)
     }
@@ -504,6 +504,7 @@ impl ManifestCoordinator {
         changes: &[ManifestChange],
         expected_table_versions: &HashMap<String, u64>,
         lineage: Option<&LineageIntent>,
+        head_hint: Option<&str>,
     ) -> Result<CommitOutcome> {
         if changes.is_empty() && expected_table_versions.is_empty() && lineage.is_none() {
             return Ok(CommitOutcome {
@@ -512,19 +513,43 @@ impl ManifestCoordinator {
             });
         }
 
-        let plan = PublishPlan {
-            changes,
-            expected_table_versions,
-            lineage,
-            // Phase 3.2 scaffolding: always cold (byte-identical). Phase 3.3
-            // freshness-probes and sets this to `Some(&WarmAttempt { .. })`.
-            warm: None,
+        // Layer 4: try the warm fast path. ONE cheap freshness probe — if the warm
+        // `__manifest` handle is still the live head, publish attempt 0 reuses the
+        // folded `known_state` with NO scan. A foreign advance falls through to cold
+        // (and since the graph lineage rides the manifest, any foreign LINEAGE
+        // advance bumps the version too, so a fresh probe means `head_hint` matches
+        // the manifest head). The CAS still arbitrates and attempts 1+ are cold, so
+        // the probe is an optimization, not the correctness fence.
+        let warm_fresh = self
+            .probe_latest_incarnation()
+            .await?
+            .matches(&self.incarnation());
+        let warm_inputs = warm_fresh.then(|| warm_publish_inputs(&self.known_state));
+
+        let outcome = {
+            let warm = warm_inputs.as_ref().map(|(registered_tables, existing_versions)| {
+                publisher::WarmAttempt {
+                    dataset: &self.dataset,
+                    registered_tables,
+                    existing_versions,
+                    head_hint,
+                }
+            });
+            let plan = PublishPlan {
+                changes,
+                expected_table_versions,
+                lineage,
+                warm: warm.as_ref(),
+            };
+            self.publisher.publish(&plan).await?
+            // `warm` + `plan` (and the `&self.dataset` borrow) drop here, before the adopt.
         };
+
         let PublishOutcome {
             dataset,
             parent_commit_id,
             known_state,
-        } = self.publisher.publish(&plan).await?;
+        } = outcome;
         // RFC-013 PR2 #1b: the publisher folded the new visible state in-memory
         // (byte-identical to a re-scan via the shared `assemble_manifest_state`),
         // so adopt it directly instead of an O(fragments) `read_manifest_state`.

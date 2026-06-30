@@ -156,15 +156,17 @@ async fn warm_write_cost_flat_and_bounded_in_history_on_s3() {
     .await;
 }
 
-/// NEGATIVE CONTROL for `warm_write_cost_flat_and_bounded_in_history_on_s3` —
-/// gives the flat gate teeth. The SAME warm-write depth sweep with NO
-/// `optimize()` between depths asserts `manifest_reads` GROWS with
-/// commit-history depth, proving the flat term is flat BECAUSE of compaction
-/// (RFC-013 step 2 brought `__manifest` into `optimize`), not because the
-/// harness measures nothing. The local twin
-/// (`write_cost.rs::internal_table_scans_grow_without_compaction`) proves the
-/// same every-PR on local FS; this is the S3 warm-write mirror, run under RustFS
-/// in CI's `rustfs_integration` job.
+/// *(stale — needs inversion in Phase 3.4 after the warm-publish activation and a
+/// RustFS measurement, exactly as the local twin was: Layer 4 drove the warm
+/// write's `__manifest` scan to 0, so this `assert_grows` no longer holds — warm
+/// removed the growth on S3 too. Flip to `assert_flat` and re-baseline against the
+/// real RustFS numbers.)*
+///
+/// NEGATIVE CONTROL for `warm_write_cost_flat_and_bounded_in_history_on_s3`. The
+/// SAME warm-write depth sweep with NO `optimize()` between depths. Pre-warm this
+/// asserted `manifest_reads` GROWS, giving the flat gate teeth; the local twin is
+/// now `write_cost.rs::served_regime_manifest_scan_is_flat_with_warm_publish`.
+/// Run under RustFS in CI's `rustfs_integration` job.
 #[tokio::test]
 async fn warm_write_cost_grows_without_compaction_on_s3() {
     let Some(mut db) = s3_graph("write-cost-grows").await else {
