@@ -97,6 +97,13 @@ pub(crate) struct MutationStaging {
     /// `pending`. Staged as one combined `stage_delete` per table at
     /// end-of-query (no inline HEAD advance) — see `stage_delete_table`.
     pub(crate) delete_predicates: HashMap<String, Vec<String>>,
+    /// Ids removed per table, captured by the delete ops as they scan their
+    /// matched rows (so validation recounts the srcs a delete empties without
+    /// re-resolving the predicates). Disjoint from `pending` by D₂; flows into
+    /// the validation [`ChangeSet`](crate::validate::ChangeSet) via
+    /// [`to_changeset`](Self::to_changeset). The combined `stage_delete` at
+    /// commit still removes by predicate — these ids are validation-only.
+    pub(crate) deleted_ids: HashMap<String, Vec<String>>,
     /// Strictest [`MutationOpKind`] seen per table within this query. Drives
     /// the op-kind-aware drift check in [`StagedMutation::commit_all`]: for
     /// tables whose first or any subsequent touch was a strict op
@@ -226,6 +233,20 @@ impl MutationStaging {
             .push(predicate);
     }
 
+    /// Record ids removed by a delete op on `table_key`, captured from the op's
+    /// own scan, for validation (so cardinality recounts an emptied src). The
+    /// caller scans with a dedup filter that excludes prior-scheduled matches, so
+    /// no id is recorded twice across statements.
+    pub(crate) fn record_deleted_ids(&mut self, table_key: &str, ids: &[String]) {
+        if ids.is_empty() {
+            return;
+        }
+        self.deleted_ids
+            .entry(table_key.to_string())
+            .or_default()
+            .extend(ids.iter().cloned());
+    }
+
     /// Delete predicates already recorded for `table_key` by earlier delete
     /// statements in this query. Read before recording the current statement's
     /// predicate so its `affected_*` count can exclude rows a prior statement
@@ -262,6 +283,15 @@ impl MutationStaging {
             let mut change = crate::validate::TableChange::default();
             change.changed.extend(batches.iter().cloned());
             changeset.insert(table_key.clone(), change);
+        }
+        // Deletes (disjoint from `pending` by D₂) carry their removed ids so the
+        // evaluator recounts the srcs a delete empties (`@card`) and sees removed
+        // rows for RI — the faithful change-set the merge path also builds.
+        for (table_key, ids) in &self.deleted_ids {
+            if ids.is_empty() {
+                continue;
+            }
+            changeset.entry(table_key.clone()).or_default().deleted_ids = ids.clone();
         }
         changeset
     }
@@ -319,6 +349,8 @@ impl MutationStaging {
             paths,
             pending,
             delete_predicates,
+            // Validation-only; consumed before staging, nothing to commit here.
+            deleted_ids: _,
             op_kinds,
         } = self;
 

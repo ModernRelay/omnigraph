@@ -654,22 +654,12 @@ impl Omnigraph {
         // the live opener in `CommittedState::write`.
         let committed =
             crate::validate::CommittedState::write(&txn.base, self, txn.branch.as_deref());
-        let mut changeset = staging.to_changeset();
-        // Deletes stage as predicates, not constructive batches, so they are
-        // absent from `to_changeset`. Resolve each predicate to the ids it
-        // removes and fold them into the change-set's `deleted_ids`, so the
-        // evaluator recounts the srcs a delete empties (`@card` min) and sees
-        // removed rows for RI — matching the merge path, which carries
-        // `deleted_ids`. Without this a `delete Edge` dropping a src below
-        // `@card` min commits silently. D₂ keeps a query constructive XOR
-        // destructive, so these never overlap a pending batch on the same table.
-        for (table_key, predicates) in &staging.delete_predicates {
-            let ids = committed.deleted_ids_matching(table_key, predicates).await?;
-            if !ids.is_empty() {
-                changeset.entry(table_key.clone()).or_default().deleted_ids = ids;
-            }
-        }
-        crate::validate::validate_changeset(&changeset, &committed, &self.catalog()).await
+        // `to_changeset` carries both constructive batches and the ids the delete
+        // ops captured from their own scans (`deleted_ids`), so the evaluator
+        // recounts the srcs a delete empties (`@card`) and sees removed rows for
+        // RI — the faithful change-set the merge path also builds.
+        crate::validate::validate_changeset(&staging.to_changeset(), &committed, &self.catalog())
+            .await
     }
 
     async fn mutate_with_current_actor(
@@ -1248,19 +1238,7 @@ impl Omnigraph {
             .scan(&ds, Some(&["id"]), Some(&scan_filter), None)
             .await?;
 
-        let deleted_ids: Vec<String> = batches
-            .iter()
-            .flat_map(|batch| {
-                let ids = batch
-                    .column(0)
-                    .as_any()
-                    .downcast_ref::<StringArray>()
-                    .unwrap();
-                (0..ids.len())
-                    .map(|i| ids.value(i).to_string())
-                    .collect::<Vec<_>>()
-            })
-            .collect();
+        let deleted_ids: Vec<String> = ids_from_batches(&batches);
 
         if deleted_ids.is_empty() {
             return Ok(MutationResult {
@@ -1279,6 +1257,7 @@ impl Omnigraph {
         // `open_table_for_mutation` above already captured the table's
         // path/version/op-kind via `ensure_path`.
         crate::failpoints::maybe_fail(crate::failpoints::names::MUTATION_DELETE_NODE_PRE_PRIMARY_DELETE)?;
+        staging.record_deleted_ids(&table_key, &deleted_ids);
         staging.record_delete(&table_key, pred_sql.clone());
 
         let mut affected_edges = 0usize;
@@ -1333,13 +1312,20 @@ impl Omnigraph {
             // delete removes the union); skip only when nothing NEW matches.
             let count_filter =
                 dedup_delete_filter(&cascade_filter, staging.recorded_delete_predicates(&edge_table_key));
-            let matched = self
-                .storage()
-                .count_rows(&edge_ds, Some(count_filter))
-                .await?;
+            // Scan (not count) the cascade-removed edge ids so validation
+            // recounts the OTHER endpoint's @card after the cascade; `len()` is
+            // the affected count.
+            let matched_ids = ids_from_batches(
+                &self
+                    .storage()
+                    .scan(&edge_ds, Some(&["id"]), Some(&count_filter), None)
+                    .await?,
+            );
+            let matched = matched_ids.len();
             affected_edges += matched;
 
             if matched > 0 {
+                staging.record_deleted_ids(&edge_table_key, &matched_ids);
                 staging.record_delete(&edge_table_key, cascade_filter);
             }
         }
@@ -1386,12 +1372,20 @@ impl Omnigraph {
         // union); only record when something NEW matches.
         let count_filter =
             dedup_delete_filter(&pred_sql, staging.recorded_delete_predicates(&table_key));
-        let affected = self
-            .storage()
-            .count_rows(&ds, Some(count_filter))
-            .await?;
+        // Scan the matched edge ids (not just count): the ids feed validation so
+        // a delete emptying a src below @card min is rejected; `len()` is the
+        // affected count. One scan replaces the former count-here + resolve-at-
+        // validation re-scan.
+        let deleted_ids = ids_from_batches(
+            &self
+                .storage()
+                .scan(&ds, Some(&["id"]), Some(&count_filter), None)
+                .await?,
+        );
+        let affected = deleted_ids.len();
 
         if affected > 0 {
+            staging.record_deleted_ids(&table_key, &deleted_ids);
             staging.record_delete(&table_key, pred_sql.clone());
             self.invalidate_graph_index().await;
         }
@@ -1401,6 +1395,25 @@ impl Omnigraph {
             affected_edges: affected,
         })
     }
+}
+
+/// Extract the `id` column (projection index 0) from scanned batches. Used by
+/// the delete paths to capture the rows they remove, so validation recounts a
+/// src a delete empties without re-resolving the predicate.
+fn ids_from_batches(batches: &[RecordBatch]) -> Vec<String> {
+    batches
+        .iter()
+        .flat_map(|batch| {
+            let ids = batch
+                .column(0)
+                .as_any()
+                .downcast_ref::<StringArray>()
+                .unwrap();
+            (0..ids.len())
+                .map(|i| ids.value(i).to_string())
+                .collect::<Vec<_>>()
+        })
+        .collect()
 }
 
 /// Concat the matched batches from `scan_with_pending` into a single batch.
