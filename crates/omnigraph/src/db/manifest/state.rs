@@ -148,6 +148,30 @@ pub(super) async fn read_manifest_state(dataset: &Dataset) -> Result<ManifestSta
 /// CANNOT diverge in the dedup/filter/sort — the byte-identity the fold relies on.
 /// Tombstones are passed as `(table_key, tombstone_version)` tuples so callers
 /// outside this module need not name the private `TableTombstoneEntry`.
+/// Derive the publisher's raw `(registered_tables, existing_versions)` maps from
+/// the assembled `known_state`, for a WARM publish attempt 0 (Layer 4). This is
+/// the inverse of [`assemble_manifest_state`] for the un-tombstoned happy path:
+/// the assembled state is latest-per-table, which is exactly what the publish
+/// logic reduces to (`latest_visible_per_table` / `check_expected_table_versions`
+/// / `fold_inputs` → `assemble_manifest_state`), so a warm attempt built from
+/// these maps is byte-equivalent to a cold `__manifest` scan for a non-strict
+/// insert. Tombstones were already dropped by `assemble_manifest_state`, so the
+/// warm path's `existing_tombstones` is empty by construction.
+pub(super) fn warm_publish_inputs(
+    state: &ManifestState,
+) -> (
+    HashMap<String, String>,
+    HashMap<(String, u64), SubTableEntry>,
+) {
+    let mut registered_tables = HashMap::with_capacity(state.entries.len());
+    let mut existing_versions = HashMap::with_capacity(state.entries.len());
+    for entry in &state.entries {
+        registered_tables.insert(entry.table_key.clone(), entry.table_path.clone());
+        existing_versions.insert((entry.table_key.clone(), entry.table_version), entry.clone());
+    }
+    (registered_tables, existing_versions)
+}
+
 pub(super) fn assemble_manifest_state(
     version: u64,
     version_entries: Vec<SubTableEntry>,

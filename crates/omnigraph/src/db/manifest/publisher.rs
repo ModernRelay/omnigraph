@@ -142,11 +142,10 @@ enum LineageSource {
 /// (so a stale warm state is never passed); the publisher CAS still arbitrates,
 /// and attempts 1+ fall back to cold `load_publish_state`. Constructed in
 /// `commit_changes_with_lineage` (Phase 3.3).
-#[allow(dead_code)] // constructed in Phase 3.3 (warm activation); consumed by `from_warm`
 pub(crate) struct WarmAttempt<'a> {
     pub(crate) dataset: &'a Dataset,
-    pub(crate) registered_tables: HashMap<String, String>,
-    pub(crate) existing_versions: HashMap<(String, u64), SubTableEntry>,
+    pub(crate) registered_tables: &'a HashMap<String, String>,
+    pub(crate) existing_versions: &'a HashMap<(String, u64), SubTableEntry>,
     pub(crate) head_hint: Option<&'a str>,
 }
 

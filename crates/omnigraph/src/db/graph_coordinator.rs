@@ -394,9 +394,18 @@ impl GraphCoordinator {
     ) -> Result<PublishedSnapshot> {
         let intent = self.new_lineage_intent(actor_id, None)?;
         failpoints::maybe_fail(crate::failpoints::names::GRAPH_PUBLISH_BEFORE_COMMIT_APPEND)?;
+        // Layer 4: the warm publish's parent (the current branch head) is the
+        // in-memory commit-graph head, made consistent with the manifest first
+        // (a read can refresh the manifest only and leave the cache behind).
+        let head_hint = self.warm_head_hint().await?;
         let outcome = self
             .manifest
-            .commit_changes_with_lineage(changes, expected_table_versions, Some(&intent))
+            .commit_changes_with_lineage(
+                changes,
+                expected_table_versions,
+                Some(&intent),
+                head_hint.as_deref(),
+            )
             .await?;
         failpoints::maybe_fail(crate::failpoints::names::GRAPH_PUBLISH_AFTER_MANIFEST_COMMIT)?;
         let snapshot_id = self.apply_lineage_to_cache(intent, &outcome);
@@ -422,9 +431,17 @@ impl GraphCoordinator {
             self.new_lineage_intent(actor_id, Some(merged_parent_commit_id.to_string()))?;
         failpoints::maybe_fail(crate::failpoints::names::GRAPH_PUBLISH_BEFORE_COMMIT_APPEND)?;
         let changes = updates_to_changes(updates);
+        // The merge's first parent is the current target-branch head (the
+        // in-memory commit-graph head), made consistent with the manifest first.
+        let head_hint = self.warm_head_hint().await?;
         let outcome = self
             .manifest
-            .commit_changes_with_lineage(&changes, &HashMap::new(), Some(&intent))
+            .commit_changes_with_lineage(
+                &changes,
+                &HashMap::new(),
+                Some(&intent),
+                head_hint.as_deref(),
+            )
             .await?;
         failpoints::maybe_fail(crate::failpoints::names::GRAPH_PUBLISH_AFTER_MANIFEST_COMMIT)?;
         Ok(self.apply_lineage_to_cache(intent, &outcome))
@@ -446,6 +463,35 @@ impl GraphCoordinator {
             merged_parent_commit_id,
             created_at: crate::db::now_micros()?,
         })
+    }
+
+    /// The current branch head as the Layer-4 warm-publish parent hint, made
+    /// consistent with the manifest first.
+    ///
+    /// The in-memory commit-graph cache is kept current by `apply_lineage_to_cache`
+    /// after each write, but a READ can refresh the manifest ALONE
+    /// (`refresh_manifest_only`) and leave the cache behind — its head would then
+    /// sit at an OLDER manifest version than the coordinator now holds. The warm
+    /// publish must never parent off such a stale head (it would fork the lineage,
+    /// where the cold path would have read the true head from the fresh scan), so
+    /// refresh the cache when that decoupling is detected. On the common path
+    /// (sequential writes) the cache stays in sync and this never refreshes; only
+    /// a read that picked up a foreign commit triggers the one-time refresh.
+    ///
+    /// (Every `GraphCoordinator` manifest advance is a graph commit, so an
+    /// in-sync head sits at exactly the manifest version. If a `lineage: None`
+    /// publish path is ever added here, this degrades to a harmless extra refresh,
+    /// never a wrong parent — the refresh re-reads the same lineage head.)
+    async fn warm_head_hint(&mut self) -> Result<Option<String>> {
+        let cache_behind_manifest = self
+            .commit_graph
+            .head_commit()
+            .await?
+            .is_some_and(|head| head.manifest_version != self.manifest.version());
+        if cache_behind_manifest {
+            self.commit_graph.refresh().await?;
+        }
+        self.commit_graph.head_commit_id().await
     }
 
     /// Insert the just-published commit into the in-memory commit cache from the

@@ -90,19 +90,18 @@ async fn internal_table_scans_are_flat_in_history() {
 /// (~16s on 0.7.2; still growing post-#299) — physical fragment read cost, not
 /// logical row count (output rows stay ~flat while requests grow).
 ///
-/// **This is a TRIPWIRE, not the final gate.** It asserts the scan *grows*, i.e. it
-/// pins the CURRENT served-regime cost (green today) — exactly the `assert_grows`
-/// idiom its sibling `data_table_reads_split_into_flat_opener_and_growing_scan` uses,
-/// and the "turns red when the fix lands" shape of the Lance surface guards. It flips
-/// RED the moment the amplification is fixed (write-path probe-gated warm reuse, and
-/// bringing `__manifest` into `cleanup` version-GC so F stays bounded in history).
-/// **When it goes red, that is the signal to invert it to**
-/// `assert_flat(&curve, |c| c.manifest_reads, <slack>, "__manifest scan (served)")` —
-/// promoting it to the permanent served-regime gate. Only `manifest_reads` is
-/// asserted: lineage lives in `__manifest` (RFC-013 Phase 7) and the per-write
-/// commit-graph update is in-memory, so there is no separate commit-graph scan.
+/// **INVERTED to the permanent served-regime gate (Layer 4 warm publish landed).**
+/// This was an `assert_grows` TRIPWIRE pinning the CURRENT (pre-fix) served-regime
+/// cost — the O(fragments) per-write `read_manifest_scan` that grew with history. The
+/// fix (warm attempt-0 publish reusing the folded `known_state`, no scan) drove that
+/// term to 0, flipping this red exactly as its doc predicted, so it is now
+/// `assert_flat`: the per-write `__manifest` scan stays flat (0) across a 10→100 depth
+/// sweep EVEN WITHOUT compaction. Only `manifest_reads` is asserted: lineage lives in
+/// `__manifest` (RFC-013 Phase 7) and the per-write commit-graph update is in-memory,
+/// so there is no separate commit-graph scan. The freshness probe is a `_versions/`
+/// LIST (`manifest_list_requests`), not this scan term.
 #[tokio::test]
-async fn internal_table_scans_grow_without_compaction() {
+async fn served_regime_manifest_scan_is_flat_with_warm_publish() {
     cost_harness(async {
     const ACTOR: &str = "act-cost-gate-served";
     let dir = tempfile::tempdir().unwrap();
@@ -126,12 +125,16 @@ async fn internal_table_scans_grow_without_compaction() {
         curve.push((d, io));
     }
 
-    // Green TODAY (the bug): the per-write `__manifest` scan is O(fragments) and grows
-    // by far more than the flat gate's slack of 4 across a 10→100 depth sweep. The `20`
-    // floor mirrors the proven-safe `assert_grows` sibling (data-table scan) and sits
-    // comfortably below the real growth (~+3 `__manifest` reads/depth × ~90 depth × the
-    // 3–4 publish-path scans) while unambiguously distinguishing "grows" from "flat".
-    assert_grows(&curve, |c| c.manifest_reads, 20, "__manifest scan (uncompacted/served)");
+    // INVERTED to the permanent served-regime gate now that Layer 4 (warm publish)
+    // landed: a warm attempt-0 publish reuses the coordinator's folded `known_state`
+    // and does ZERO `__manifest` scan, so the per-write scan is flat (0) across the
+    // 10→100 depth sweep even WITHOUT compaction. This is the load-bearing
+    // unlimited-history property: the per-write read cost is O(1) in history on the
+    // served (uncompacted) path, not just the compacted one. If warm regresses
+    // (stops firing, falls back to the cold O(fragments) `read_manifest_scan`), this
+    // grows again and trips the small slack. (The freshness probe is a `_versions/`
+    // LIST, counted in `manifest_list_requests`, not this scan term.)
+    assert_flat(&curve, |c| c.manifest_reads, 2, "__manifest scan (served, warm-published)");
     })
     .await;
 }
@@ -344,42 +347,16 @@ async fn keyed_insert_opens_table_at_most_once() {
 }
 
 // ── (E) Ground-truth __manifest counting (PR2.1) — the blind-spot guard ──
-
-/// The warm-coordinator freshness probe rides a long-lived handle, so a per-op
-/// (fresh) tracker installed at measure time CANNOT see its reads — that was the
-/// blind spot. `cost_harness` attaches the tracker BEFORE the coordinator opens, so
-/// the probe's reads ARE counted (`manifest_reads` is ground truth, not just fresh
-/// opens). Proven by measuring the same warm write both ways: ground truth strictly
-/// exceeds fresh-only, by the probe's object-store RPCs. Reverting the ground-truth
-/// wiring (so `manifest_reads` reverts to fresh-per-op) makes the two equal → RED.
-#[tokio::test]
-async fn manifest_reads_capture_warm_probe() {
-    // Fresh-only (no `cost_harness`): the warm coordinator handle was opened outside
-    // any meter, so the freshness probe's reads escape `manifest_reads`.
-    let fresh = {
-        let dir = tempfile::tempdir().unwrap();
-        let mut db = local_graph(&dir).await;
-        commit_many(&mut db, 3).await; // warm the coordinator
-        let io = measure_insert(&mut db, "fresh").await;
-        eprintln!("fresh-only warm write: __manifest={}", io.manifest_reads);
-        io.manifest_reads
-    };
-
-    // Ground truth (`cost_harness`): the same warm probe is now counted.
-    cost_harness(async move {
-        let dir = tempfile::tempdir().unwrap();
-        let mut db = local_graph(&dir).await;
-        commit_many(&mut db, 3).await;
-        let io = measure_insert(&mut db, "ground_truth").await;
-        eprintln!("ground-truth warm write: __manifest={}", io.manifest_reads);
-        assert!(
-            io.manifest_reads > fresh,
-            "ground-truth __manifest reads {} must exceed fresh-only {fresh} by the \
-             warm-coordinator probe's RPCs — else the warm-handle probe is escaping the \
-             tracker (the blind spot this guards). Reads: {:#?}",
-            io.manifest_reads,
-            last_manifest_reads(),
-        );
-    })
-    .await;
-}
+//
+// A former local guard here (`manifest_reads_capture_warm_probe`) measured a warm
+// write both ways and asserted ground-truth `manifest_reads` strictly exceeds
+// fresh-per-op by the warm-coordinator probe's RPCs — demonstrating that
+// `cost_harness` captures reads on a long-lived handle that a per-op tracker misses.
+// Layer 4 (warm publish) made that demonstrator vanish on LOCAL FS: the warm write
+// does ZERO `__manifest` scan reads (it reuses the folded `known_state`), and the
+// freshness probe (`latest_version_id`) is a local 0-IO cache hit — so ground-truth
+// and fresh-only both read 0. The blind-spot it guarded is now an S3 phenomenon (a
+// write's probe does real `_versions/` RPCs only on object storage), exercised under
+// `cost_harness` ground-truth by `write_cost_s3.rs`; the local warm-write footprint
+// is pinned at 0 by `served_regime_manifest_scan_is_flat_with_warm_publish` above.
+// Removed rather than left asserting an undemonstrable inequality on local FS.
