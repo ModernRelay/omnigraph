@@ -499,6 +499,55 @@ async fn append_load_rejects_orphan_edge() {
     );
 }
 
+/// Finding 1: overwriting a NODE table can strand a retained edge in a
+/// non-overwritten table. Seed Alice, Bob + Knows(Alice->Bob); Overwrite-load
+/// node:Person with only Alice (Bob removed), leaving edge:Knows untouched ->
+/// Knows(Alice->Bob) is now an orphan and must be rejected. The overwrite-removed
+/// Bob is not expressed as a deleted_id, so edge-RI path-b never runs.
+#[tokio::test]
+async fn overwrite_node_removal_rejects_retained_orphan_edge() {
+    let seed = r#"{"type":"Person","data":{"name":"Alice"}}
+{"type":"Person","data":{"name":"Bob"}}
+{"edge":"Knows","from":"Alice","to":"Bob"}"#;
+    let (_dir, mut db) = init_with(RI_SCHEMA, seed).await;
+
+    let err = load_jsonl(
+        &mut db,
+        r#"{"type":"Person","data":{"name":"Alice"}}"#,
+        LoadMode::Overwrite,
+    )
+    .await
+    .expect_err("removing Bob via overwrite while Knows(Alice->Bob) is retained orphans the edge");
+    assert!(
+        err.to_string().contains("not found"),
+        "retained edge to an overwrite-removed node must be rejected, got: {}",
+        err
+    );
+}
+
+/// Finding 2: uniqueness must evaluate the final coalesced image per id, not
+/// accumulate superseded keys. One mutation updates Alice.email temp -> final,
+/// then inserts Carol.email = temp. The final state (Alice=final, Carol=temp) is
+/// valid, but the validator retains the stale Alice->temp and false-rejects Carol.
+#[tokio::test]
+async fn chained_unique_update_then_reuse_freed_value_is_not_a_violation() {
+    let (_dir, mut db) = init_with(
+        UNIQUE_SCHEMA,
+        r#"{"type":"User","data":{"name":"Alice","email":"orig"}}"#,
+    )
+    .await;
+    const Q: &str = r#"
+query reassign() {
+    update User set { email: "temp" } where name = "Alice"
+    update User set { email: "final" } where name = "Alice"
+    insert User { name: "Carol", email: "temp" }
+}
+"#;
+    mutate_main(&mut db, Q, "reassign", &params(&[]))
+        .await
+        .expect("Alice ends at 'final' and Carol takes the freed 'temp' — final image has no collision");
+}
+
 // ─── Edge cardinality ────────────────────────────────────────────────────────
 
 #[tokio::test]
