@@ -83,7 +83,10 @@ pub(crate) fn release_for_internal_schema_version(stamp: u32) -> &'static str {
         2 => "0.4.1 to 0.6.1",
         3 => "0.6.2 to 0.7.2",
         4 => "0.8.x",
-        _ => "an earlier release",
+        // Unreachable today (1–3 are mapped; ≥ CURRENT is caught by the ceiling
+        // guard before this is consulted). Worded to read naturally after
+        // "created by omnigraph " if a future bump ever leaves a gap.
+        _ => "an unrecognized older release",
     }
 }
 
@@ -189,7 +192,10 @@ mod tests {
     fn release_names_the_writing_line_for_each_stamp() {
         assert_eq!(release_for_internal_schema_version(3), "0.6.2 to 0.7.2");
         assert_eq!(release_for_internal_schema_version(4), "0.8.x");
-        assert_eq!(release_for_internal_schema_version(99), "an earlier release");
+        assert_eq!(
+            release_for_internal_schema_version(99),
+            "an unrecognized older release"
+        );
         // The sub-CURRENT refusal embeds the named release.
         let err = refuse_if_stamp_unsupported(3).unwrap_err().to_string();
         assert!(err.contains("0.6.2 to 0.7.2"), "got: {err}");

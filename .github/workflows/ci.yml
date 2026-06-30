@@ -105,6 +105,7 @@ jobs:
 
             case "$path" in
               crates/omnigraph/src/db/manifest/migrations.rs) run_upgrade_ci=true ;;
+              crates/omnigraph/src/db/manifest/tests.rs) run_upgrade_ci=true ;;
               crates/omnigraph-cli/tests/crossversion_upgrade.rs) run_upgrade_ci=true ;;
               crates/omnigraph/src/db/omnigraph/export.rs|crates/omnigraph/src/loader/*) run_upgrade_ci=true ;;
               docs/user/operations/upgrade.md) run_upgrade_ci=true ;;

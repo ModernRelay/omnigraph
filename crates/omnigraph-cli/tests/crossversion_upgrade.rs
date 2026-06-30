@@ -23,9 +23,20 @@ use std::process::Command;
 use support::{HERMETIC_OPERATOR_HOME, cli, fixture, output_failure, output_success};
 use tempfile::tempdir;
 
+/// Resolve the old (0.7.2) binary. `None` ONLY when `OMNIGRAPH_OLD_BIN` is
+/// unset — the legitimate skip. A var that is SET but points at a missing path
+/// is a misconfiguration (wrong install path / renamed binary) and must fail
+/// loudly, never skip vacuously: in CI the var is deliberately set so the test
+/// is expected to run.
 fn old_bin() -> Option<PathBuf> {
     let path = PathBuf::from(std::env::var_os("OMNIGRAPH_OLD_BIN")?);
-    path.exists().then_some(path)
+    assert!(
+        path.exists(),
+        "OMNIGRAPH_OLD_BIN is set but does not exist: {} \
+         (unset it to skip, or point it at a real 0.7.2 omnigraph binary)",
+        path.display(),
+    );
+    Some(path)
 }
 
 /// Run the OLD (0.7.2) binary hermetically (no developer `~/.omnigraph`).
@@ -107,8 +118,9 @@ fn current_binary_refuses_and_rebuilds_a_genuine_v3_graph() {
         "refusal must nudge the operator to export, got: {stderr}",
     );
     assert!(
-        stderr.contains("0.7"),
-        "refusal must name the release that wrote this stamp (v3 → 0.6.2 to 0.7.2), got: {stderr}",
+        stderr.contains("0.6.2 to 0.7.2"),
+        "refusal must name the full release range that wrote this stamp (v3 → 0.6.2 to 0.7.2), \
+         got: {stderr}",
     );
 
     // 4. The CURRENT binary rebuilds: fresh init + load the v3 export.
