@@ -1786,15 +1786,6 @@ impl Omnigraph {
         .await
     }
 
-    pub(crate) async fn open_dataset_at_state(
-        &self,
-        table_path: &str,
-        table_branch: Option<&str>,
-        table_version: u64,
-    ) -> Result<SnapshotHandle> {
-        table_ops::open_dataset_at_state(self, table_path, table_branch, table_version).await
-    }
-
     pub(crate) async fn build_indices_on_dataset(
         &self,
         table_key: &str,

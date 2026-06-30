@@ -240,13 +240,6 @@ pub trait TableStorage: sealed::Sealed + Send + Sync + Debug {
         branch: Option<&str>,
     ) -> Result<SnapshotHandle>;
 
-    async fn open_dataset_at_state(
-        &self,
-        table_path: &str,
-        branch: Option<&str>,
-        version: u64,
-    ) -> Result<SnapshotHandle>;
-
     async fn fork_branch_from_state(
         &self,
         dataset_uri: &str,
@@ -511,17 +504,6 @@ impl TableStorage for TableStore {
         branch: Option<&str>,
     ) -> Result<SnapshotHandle> {
         TableStore::open_dataset_head_for_write(self, table_key, dataset_uri, branch)
-            .await
-            .map(SnapshotHandle::new)
-    }
-
-    async fn open_dataset_at_state(
-        &self,
-        table_path: &str,
-        branch: Option<&str>,
-        version: u64,
-    ) -> Result<SnapshotHandle> {
-        TableStore::open_dataset_at_state(self, table_path, branch, version)
             .await
             .map(SnapshotHandle::new)
     }

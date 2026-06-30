@@ -1,4 +1,4 @@
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 
 use std::io::{BufRead, BufReader, Cursor};
 use std::sync::Arc;
@@ -476,12 +476,7 @@ async fn load_jsonl_reader<R: BufRead>(
     for (type_name, rows) in &node_rows {
         let node_type = &catalog.node_types[type_name];
         let batch = build_node_batch(node_type, rows)?;
-        validate_value_constraints(&batch, node_type)?;
-        validate_enum_constraints(&batch, &node_type.properties, type_name)?;
-        let unique_groups = unique_constraint_groups_for_node(node_type);
-        if !unique_groups.is_empty() {
-            enforce_unique_constraints_intra_batch(&batch, type_name, &unique_groups)?;
-        }
+        // Validation (value/enum/unique) runs end-of-load via the evaluator.
         let loaded_count = batch.num_rows();
         let table_key = format!("node:{}", type_name);
         let _entry = snapshot
@@ -512,52 +507,14 @@ async fn load_jsonl_reader<R: BufRead>(
         result.nodes_loaded.insert(type_name, loaded_count);
     }
 
-    // Phase 2c: Validate edge referential integrity — every src/dst must
-    // reference an existing node ID in the appropriate type. For
-    // Append/Merge the lookup unions snapshot-committed IDs with the
-    // in-memory pending batches. For Overwrite, a touched node table's
-    // pending batch is the replacement image, so committed rows are not
-    // included for that table.
-    for (edge_name, rows) in &edge_rows {
-        let edge_type = &catalog.edge_types[edge_name];
-        let from_ids =
-            collect_node_ids_with_pending(db, branch, &edge_type.from_type, &staging).await?;
-        let to_ids =
-            collect_node_ids_with_pending(db, branch, &edge_type.to_type, &staging).await?;
-
-        for (i, (src, dst, _)) in rows.iter().enumerate() {
-            if !from_ids.contains(src.as_str()) {
-                return Err(OmniError::manifest(format!(
-                    "edge {} row {}: src '{}' not found in {}",
-                    edge_name,
-                    i + 1,
-                    src,
-                    edge_type.from_type
-                )));
-            }
-            if !to_ids.contains(dst.as_str()) {
-                return Err(OmniError::manifest(format!(
-                    "edge {} row {}: dst '{}' not found in {}",
-                    edge_name,
-                    i + 1,
-                    dst,
-                    edge_type.to_type
-                )));
-            }
-        }
-    }
-
-    // Phase 2d: build edge batches.
+    // Phase 2d: build edge batches. Edge referential integrity (and the rest)
+    // runs end-of-load via the unified evaluator, below.
     let mut prepared_edges: Vec<(String, String, RecordBatch, usize)> =
         Vec::with_capacity(edge_rows.len());
     for (edge_name, rows) in &edge_rows {
         let edge_type = &catalog.edge_types[edge_name];
         let batch = build_edge_batch(edge_type, rows)?;
-        validate_enum_constraints(&batch, &edge_type.properties, edge_name)?;
-        let unique_groups = unique_constraint_groups_for_edge(edge_type);
-        if !unique_groups.is_empty() {
-            enforce_unique_constraints_intra_batch(&batch, edge_name, &unique_groups)?;
-        }
+        // Validation (enum/unique, edge-RI, @card) runs end-of-load via the evaluator.
         let loaded_count = batch.num_rows();
         let table_key = format!("edge:{}", edge_name);
         let _entry = snapshot
@@ -585,18 +542,40 @@ async fn load_jsonl_reader<R: BufRead>(
         result.edges_loaded.insert(edge_name, loaded_count);
     }
 
-    // Phase 3: Validate edge cardinality constraints (before commit —
-    // invalid data must not be committed). The helper scans committed
-    // edges via Lance + iterates pending edges in-memory; for Overwrite it
-    // treats the pending edge batches as the replacement table image.
-    for (edge_name, _) in &edge_rows {
-        let edge_type = &catalog.edge_types[edge_name];
-        let table_key = format!("edge:{}", edge_name);
-        validate_edge_cardinality_with_pending_loader(
-            db, branch, edge_type, &table_key, &staging, mode,
-        )
-        .await?;
+    // Phase 3: end-of-load validation — one unified evaluator pass over the
+    // accumulated staging (value/enum, uniqueness incl. cross-version, edge-RI,
+    // cardinality) against the pinned pre-load base. `Overwrite` validates each
+    // touched table as its whole new image (that table's committed view empty),
+    // but is PER-TABLE — a table absent from the batch keeps `base`, so an
+    // edges-only overwrite still resolves RI against committed nodes;
+    // `Append`/`Merge` keep `base` everywhere. This shares the evaluator with the
+    // mutation + merge paths, so the surfaces cannot drift.
+    let mut changeset = staging.to_changeset();
+    // Overwrite replaces each touched table; a committed row absent from the new
+    // batch is REMOVED but is not in `to_changeset` (which only records the new
+    // batch). Express those removals as `deleted_ids` so edge-RI (path-b) and
+    // cardinality recompute against them — e.g. overwriting `node:Person` to drop
+    // Bob while a retained `edge:Knows(Alice->Bob)` would otherwise publish an
+    // orphan. (Per-table, like the rest of Overwrite handling.)
+    if mode == LoadMode::Overwrite {
+        let keys: Vec<String> = changeset.keys().cloned().collect();
+        for table_key in keys {
+            let removed = crate::validate::overwrite_removed_ids(
+                &snapshot,
+                &table_key,
+                changeset.get(&table_key).expect("key from this changeset"),
+            )
+            .await?;
+            if !removed.is_empty() {
+                changeset
+                    .get_mut(&table_key)
+                    .expect("key from this changeset")
+                    .deleted_ids = removed;
+            }
+        }
     }
+    let committed = crate::validate::CommittedState::load(&snapshot, mode, &changeset);
+    crate::validate::validate_changeset(&changeset, &committed, &catalog).await?;
 
     // Phase 4: Atomic manifest commit with publisher-level OCC.
     let staged = staging
@@ -1361,61 +1340,6 @@ pub(crate) fn validate_enum_constraints(
     Ok(())
 }
 
-/// Detect duplicate values within a single `RecordBatch` for any of the
-/// `unique_constraints` groups. Each group is a list of one or more columns
-/// that together form a uniqueness key: a violation occurs when two rows share
-/// the same tuple of values across *all* columns in a group, so a composite
-/// `@unique(a, b)` only conflicts when both `a` and `b` match. Returns an
-/// error on the first duplicate found.
-///
-/// Rows where any column in a group is null are exempt (standard SQL semantics
-/// for uniqueness over nullable columns), as is any group whose columns are
-/// not all present in the batch (e.g. a partial-schema load).
-///
-/// Note: this only catches duplicates *within* the batch. Cross-batch
-/// uniqueness against already-committed rows is not enforced here — that
-/// requires a dataset scan and is tracked separately.
-pub(crate) fn enforce_unique_constraints_intra_batch(
-    batch: &RecordBatch,
-    type_name: &str,
-    unique_constraints: &[Vec<String>],
-) -> Result<()> {
-    for columns in unique_constraints {
-        // Resolve the group's columns once. A group whose columns aren't all
-        // present in this batch is skipped (e.g. a partial-schema load).
-        let Some(group_columns) = columns
-            .iter()
-            .map(|name| {
-                batch
-                    .schema()
-                    .index_of(name)
-                    .ok()
-                    .map(|i| batch.column(i).clone())
-            })
-            .collect::<Option<Vec<ArrayRef>>>()
-        else {
-            continue;
-        };
-        let mut seen: HashMap<Vec<String>, usize> = HashMap::new();
-        for row in 0..batch.num_rows() {
-            let Some(key) = composite_unique_key(&group_columns, row)? else {
-                continue;
-            };
-            if let Some(prev_row) = seen.insert(key.clone(), row) {
-                return Err(OmniError::manifest(format!(
-                    "@unique violation on {}.{}: value '{}' appears in rows {} and {}",
-                    type_name,
-                    format_tuple(columns),
-                    format_tuple(&key),
-                    prev_row,
-                    row
-                )));
-            }
-        }
-    }
-    Ok(())
-}
-
 /// Build the composite uniqueness key for `row` over a constraint group's
 /// already-resolved columns (in declaration order).
 ///
@@ -1429,9 +1353,10 @@ pub(crate) fn enforce_unique_constraints_intra_batch(
 /// - `Ok(Some(tuple))` otherwise.
 /// - `Err(..)` propagated from [`unique_key_scalar`] on an un-keyable value.
 ///
-/// Shared by the intake path (`enforce_unique_constraints_intra_batch`) and the
-/// branch-merge path (`exec/merge.rs::update_unique_constraints`) so the two
-/// derive identical keys and cannot drift on separator or scalar conversion.
+/// Shared by every write surface through the unified validation evaluator
+/// (`crate::validate::evaluate_unique`, used by the loader, mutation, and
+/// branch-merge paths) so they derive identical keys and cannot drift on
+/// separator or scalar conversion.
 pub(crate) fn composite_unique_key(
     group_columns: &[ArrayRef],
     row: usize,
@@ -1449,7 +1374,7 @@ pub(crate) fn composite_unique_key(
 /// Render a constraint's column tuple for error messages: a single item as
 /// `col`, a composite as `(a, b)`. Used for both the column list and the
 /// offending value tuple, which share the same shape.
-fn format_tuple(items: &[String]) -> String {
+pub(crate) fn format_tuple(items: &[String]) -> String {
     match items {
         [single] => single.clone(),
         _ => format!("({})", items.join(", ")),
@@ -1517,32 +1442,6 @@ fn unique_key_scalar(array: &ArrayRef, row: usize) -> Result<Option<String>> {
     )))
 }
 
-/// Build the list of uniqueness constraint groups to enforce on a node type.
-/// Each group is the column tuple of one constraint. Includes every
-/// `@unique(...)` constraint (from `NodeType.unique_constraints`) and the
-/// `@key` (which implies uniqueness over its column tuple). Grouping is
-/// preserved so a composite `@unique(a, b)` is enforced as a composite key
-/// rather than degraded into independent single-field checks.
-pub(crate) fn unique_constraint_groups_for_node(
-    node_type: &omnigraph_compiler::catalog::NodeType,
-) -> Vec<Vec<String>> {
-    let mut groups: Vec<Vec<String>> = node_type.unique_constraints.clone();
-    if let Some(key) = &node_type.key
-        && !groups.contains(key)
-    {
-        groups.push(key.clone());
-    }
-    groups
-}
-
-/// Same as [`unique_constraint_groups_for_node`] but for an edge type (edges
-/// have no `@key`).
-pub(crate) fn unique_constraint_groups_for_edge(
-    edge_type: &omnigraph_compiler::catalog::EdgeType,
-) -> Vec<Vec<String>> {
-    edge_type.unique_constraints.clone()
-}
-
 fn extract_numeric_value(col: &ArrayRef, row: usize) -> Option<f64> {
     use arrow_array::{
         Array, Float32Array, Float64Array, Int32Array, Int64Array, UInt32Array, UInt64Array,
@@ -1574,130 +1473,6 @@ fn literal_value_to_f64(v: &omnigraph_compiler::catalog::LiteralValue) -> f64 {
         LiteralValue::Integer(n) => *n as f64,
         LiteralValue::Float(f) => *f,
     }
-}
-
-// ─── Edge cardinality validation ─────────────────────────────────────────────
-
-/// Validate edge `@card` cardinality with in-memory pending edges visible.
-///
-/// Loader-level analog to `exec::mutation::validate_edge_cardinality_with_pending`:
-/// opens the committed dataset at the pre-load snapshot version, then
-/// delegates to the shared `count_src_per_edge` + `enforce_cardinality_bounds`
-/// helpers in `exec::staging`. Used by every load mode; for `LoadMode::Overwrite`
-/// it treats the pending edge batches as the replacement table image (the
-/// committed rows are being replaced, so only the pending set is counted).
-///
-/// `mode` controls dedup behavior. `LoadMode::Merge` passes `Some("id")`
-/// so committed edges that the load is *updating* (same edge id,
-/// possibly changed `src`) are not double-counted. `LoadMode::Append`
-/// passes `None` because each line generates a fresh ULID id that
-/// never collides with committed.
-async fn validate_edge_cardinality_with_pending_loader(
-    db: &Omnigraph,
-    branch: Option<&str>,
-    edge_type: &omnigraph_compiler::catalog::EdgeType,
-    table_key: &str,
-    staging: &MutationStaging,
-    mode: LoadMode,
-) -> Result<()> {
-    if edge_type.cardinality.is_default() {
-        return Ok(());
-    }
-    let snapshot = db.snapshot_for_branch(branch).await?;
-    let Some(entry) = snapshot.entry(table_key) else {
-        // No manifest entry — table doesn't exist yet. Pending-only is
-        // fine; the helper handles empty committed scans.
-        return Ok(());
-    };
-    let ds = db
-        .open_dataset_at_state(
-            &entry.table_path,
-            entry.table_branch.as_deref(),
-            entry.table_version,
-        )
-        .await?;
-    let dedupe_key = match mode {
-        LoadMode::Merge => Some("id"),
-        LoadMode::Append | LoadMode::Overwrite => None,
-    };
-    let counts =
-        crate::exec::staging::count_src_per_edge(db, &ds, table_key, staging, dedupe_key).await?;
-    crate::exec::staging::enforce_cardinality_bounds(edge_type, &counts)
-}
-
-/// Collect all valid node IDs for a given type, with in-memory pending
-/// node inserts visible. Used by the staged loader's Phase 2c
-/// referential-integrity validation.
-///
-/// Union of:
-/// - IDs from the staged loader's pending batches (in-memory; just-staged
-///   inserts of this type)
-/// - IDs from the committed sub-table at the pre-load snapshot version
-///
-/// For `LoadMode::Overwrite`, if the node table is touched then the pending
-/// batches are the replacement image. In that case committed IDs are not
-/// included, so edge RI is validated against exactly what the overwrite will
-/// publish.
-async fn collect_node_ids_with_pending(
-    db: &Omnigraph,
-    branch: Option<&str>,
-    type_name: &str,
-    staging: &MutationStaging,
-) -> Result<HashSet<String>> {
-    let mut ids = HashSet::new();
-    let table_key = format!("node:{}", type_name);
-
-    // From staging.pending: walk the in-memory accumulator's id column.
-    for batch in staging.pending_batches(&table_key) {
-        if let Some(col) = batch.column_by_name("id") {
-            if let Some(arr) = col.as_any().downcast_ref::<StringArray>() {
-                for i in 0..arr.len() {
-                    if arr.is_valid(i) {
-                        ids.insert(arr.value(i).to_string());
-                    }
-                }
-            }
-        }
-    }
-
-    if staging.pending_mode(&table_key) == Some(PendingMode::Overwrite) {
-        return Ok(ids);
-    }
-
-    // From the committed Lance sub-table at the pre-load snapshot version.
-    let snapshot = db.snapshot_for_branch(branch).await?;
-    let Some(entry) = snapshot.entry(&table_key) else {
-        return Ok(ids);
-    };
-    let ds = db
-        .open_dataset_at_state(
-            &entry.table_path,
-            entry.table_branch.as_deref(),
-            entry.table_version,
-        )
-        .await?;
-
-    let batches = db.storage().scan(&ds, Some(&["id"]), None, None).await?;
-
-    for batch in &batches {
-        let id_col = batch
-            .column_by_name("id")
-            .ok_or_else(|| OmniError::Lance("missing 'id' column".into()))?
-            .as_any()
-            .downcast_ref::<StringArray>()
-            .ok_or_else(|| OmniError::Lance("'id' column is not Utf8".into()))?;
-        for i in 0..batch.num_rows() {
-            // Defensive: `id` is the @key column on every node type and
-            // is non-nullable by schema, but a committed-row corruption
-            // (or future schema change) could surface a NULL. Skip
-            // rather than insert "" — pending-side does the same.
-            if id_col.is_valid(i) {
-                ids.insert(id_col.value(i).to_string());
-            }
-        }
-    }
-
-    Ok(ids)
 }
 
 #[cfg(test)]

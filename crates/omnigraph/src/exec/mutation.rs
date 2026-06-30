@@ -338,112 +338,6 @@ fn build_insert_batch(
     RecordBatch::try_new(schema.clone(), columns).map_err(|e| OmniError::Lance(e.to_string()))
 }
 
-async fn validate_edge_insert_endpoints(
-    db: &Omnigraph,
-    staging: &MutationStaging,
-    branch: Option<&str>,
-    edge_name: &str,
-    assignments: &HashMap<String, Literal>,
-) -> Result<()> {
-    let catalog = db.catalog();
-    let edge_type = catalog
-        .edge_types
-        .get(edge_name)
-        .ok_or_else(|| OmniError::manifest(format!("unknown edge type '{}'", edge_name)))?;
-    let from = match assignments.get("from") {
-        Some(Literal::String(value)) => value.as_str(),
-        Some(other) => {
-            return Err(OmniError::manifest(format!(
-                "edge {} from endpoint must be a string id, got {}",
-                edge_name,
-                literal_to_sql(other)
-            )));
-        }
-        None => {
-            return Err(OmniError::manifest(format!(
-                "edge {} missing 'from' endpoint",
-                edge_name
-            )));
-        }
-    };
-    let to = match assignments.get("to") {
-        Some(Literal::String(value)) => value.as_str(),
-        Some(other) => {
-            return Err(OmniError::manifest(format!(
-                "edge {} to endpoint must be a string id, got {}",
-                edge_name,
-                literal_to_sql(other)
-            )));
-        }
-        None => {
-            return Err(OmniError::manifest(format!(
-                "edge {} missing 'to' endpoint",
-                edge_name
-            )));
-        }
-    };
-
-    ensure_node_id_exists(db, staging, branch, &edge_type.from_type, from, "src").await?;
-    ensure_node_id_exists(db, staging, branch, &edge_type.to_type, to, "dst").await?;
-    Ok(())
-}
-
-/// Quick scan of pending batches for an `id` value match. Used by the
-/// mutation path's edge endpoint validation to satisfy read-your-writes
-/// for same-query inserts before they're committed to Lance.
-fn pending_batches_contain_id(batches: &[RecordBatch], id: &str) -> bool {
-    for batch in batches {
-        let Some(col) = batch.column_by_name("id") else {
-            continue;
-        };
-        let Some(arr) = col.as_any().downcast_ref::<StringArray>() else {
-            continue;
-        };
-        for i in 0..arr.len() {
-            if arr.is_valid(i) && arr.value(i) == id {
-                return true;
-            }
-        }
-    }
-    false
-}
-
-async fn ensure_node_id_exists(
-    db: &Omnigraph,
-    staging: &MutationStaging,
-    branch: Option<&str>,
-    node_type: &str,
-    id: &str,
-    label: &str,
-) -> Result<()> {
-    let table_key = format!("node:{}", node_type);
-
-    // Prefer the in-query pending accumulator so a same-query insert of
-    // the referenced node is visible to this validation. Fall back to
-    // the pre-mutation manifest snapshot when nothing pending matches.
-    let pending = staging.pending_batches(&table_key);
-    if pending_batches_contain_id(pending, id) {
-        return Ok(());
-    }
-
-    let filter = format!("id = '{}'", id.replace('\'', "''"));
-    let snapshot = db.snapshot_for_branch(branch).await?;
-    let ds = db
-        .storage()
-        .open_snapshot_at_table(&snapshot, &table_key)
-        .await?;
-    let exists = db.storage().count_rows(&ds, Some(filter)).await? > 0;
-
-    if exists {
-        Ok(())
-    } else {
-        Err(OmniError::manifest(format!(
-            "{} '{}' not found in {}",
-            label, id, node_type
-        )))
-    }
-}
-
 /// Convert an IRMutationPredicate to a Lance SQL filter string.
 fn predicate_to_sql(
     predicate: &IRMutationPredicate,
@@ -588,40 +482,6 @@ use super::staging::{MutationStaging, PendingMode};
 /// them into one staged delete — there is no post-inline-commit reopen to
 /// special-case anymore.
 impl Omnigraph {
-    /// Resolve a LIVE-HEAD read handle for an edge table's committed-state `@card`
-    /// scan when collapse #1 skipped the accumulation open. The edge-insert path no
-    /// longer opens the edge dataset (non-strict op + txn), but cardinality is
-    /// validated ONCE (never rechecked at commit), so the scan must observe the
-    /// freshest committed edges — NOT the pinned `txn.base`. A concurrent writer can
-    /// commit edges to this table after `txn` capture; counting against the stale
-    /// base undercounts and lets a violating insert through (invariant 9). The table
-    /// LOCATION is read from the pinned entry (stable across versions); the dataset is
-    /// opened at live HEAD via `open_dataset_head_for_write` (a read here despite the
-    /// name — no lock/stage), restoring the pre-3b image (the mutation's own open).
-    /// The residual validate→commit race (a writer committing between this scan and
-    /// the end-of-query commit) is the §7.1 gap, closed by RFC-013 step 4.
-    async fn edge_cardinality_read_handle(
-        &self,
-        txn: Option<&crate::db::WriteTxn>,
-        table_key: &str,
-    ) -> Result<SnapshotHandle> {
-        let branch = txn.and_then(|t| t.branch.as_deref());
-        match txn.and_then(|t| t.base.entry(table_key)) {
-            Some(entry) => {
-                let full_path = self.storage().dataset_uri(&entry.table_path);
-                self.storage()
-                    .open_dataset_head_for_write(table_key, &full_path, branch)
-                    .await
-            }
-            // Unreachable today (the `None` handle only reaches here under a txn whose
-            // base contains the table). Defensive: resolve the table fresh (live)
-            // without the schema re-validation `snapshot_for_branch` would re-run.
-            None => {
-                let snapshot = self.fresh_snapshot_for_branch_unchecked(branch).await?;
-                self.storage().open_snapshot_at_table(&snapshot, table_key).await
-            }
-        }
-    }
 }
 
 async fn open_table_for_mutation(
@@ -776,6 +636,32 @@ impl Omnigraph {
             .await
     }
 
+    /// End-of-query validation for a constructive mutation: build the change-set
+    /// from the accumulated staging and run the unified evaluator (value/enum,
+    /// uniqueness incl. cross-version, edge-RI, cardinality) against committed
+    /// state. Read-your-writes is inherent — every same-query insert is already
+    /// in the change-set. Destructive queries (D2) stage no constructive batches,
+    /// so the change-set is empty and this is a no-op (deletes cascade).
+    async fn validate_staged_mutation(
+        &self,
+        staging: &MutationStaging,
+        txn: &crate::db::WriteTxn,
+    ) -> Result<()> {
+        // RI/uniqueness read the write's already-validated pinned base (`txn.base`),
+        // NOT a fresh `snapshot_for_branch` — which would re-run the schema-contract
+        // validation the WriteTxn already did once (RFC-013 step 3b capture-once).
+        // Cardinality reads LIVE HEAD per edge table (the #298 stale-handle fix) via
+        // the live opener in `CommittedState::write`.
+        let committed =
+            crate::validate::CommittedState::write(&txn.base, self, txn.branch.as_deref());
+        // `to_changeset` carries both constructive batches and the ids the delete
+        // ops captured from their own scans (`deleted_ids`), so the evaluator
+        // recounts the srcs a delete empties (`@card`) and sees removed rows for
+        // RI — the faithful change-set the merge path also builds.
+        crate::validate::validate_changeset(&staging.to_changeset(), &committed, &self.catalog())
+            .await
+    }
+
     async fn mutate_with_current_actor(
         &self,
         branch: &str,
@@ -872,6 +758,7 @@ impl Omnigraph {
             Err(e) => Err(e),
             Ok(total) if staging.is_empty() => Ok(total),
             Ok(total) => {
+                self.validate_staged_mutation(&staging, &txn).await?;
                 let staged = staging.stage_all(self, requested.as_deref()).await?;
                 // `_queue_guards` holds per-(table_key, branch) write
                 // queues acquired inside `commit_all`. Held across the
@@ -1100,16 +987,7 @@ impl Omnigraph {
             };
 
             let batch = build_insert_batch(&schema, &id, &resolved, &blob_props)?;
-            crate::loader::validate_value_constraints(&batch, node_type)?;
-            crate::loader::validate_enum_constraints(&batch, &node_type.properties, type_name)?;
-            let unique_groups = crate::loader::unique_constraint_groups_for_node(node_type);
-            if !unique_groups.is_empty() {
-                crate::loader::enforce_unique_constraints_intra_batch(
-                    &batch,
-                    type_name,
-                    &unique_groups,
-                )?;
-            }
+            // Validation (value/enum/unique) runs end-of-query via the evaluator.
             let has_key = node_type.key_property().is_some();
             let table_key = format!("node:{}", type_name);
             // Capture pre-write metadata on first touch (no Lance write).
@@ -1145,21 +1023,14 @@ impl Omnigraph {
             let id = ulid::Ulid::new().to_string();
 
             let batch = build_insert_batch(&schema, &id, &resolved, &blob_props)?;
-            validate_edge_insert_endpoints(self, staging, branch, type_name, &resolved).await?;
-            crate::loader::validate_enum_constraints(&batch, &edge_type.properties, type_name)?;
-            let unique_groups = crate::loader::unique_constraint_groups_for_edge(edge_type);
-            if !unique_groups.is_empty() {
-                crate::loader::enforce_unique_constraints_intra_batch(
-                    &batch,
-                    type_name,
-                    &unique_groups,
-                )?;
-            }
+            // Validation (edge-RI, enum, unique, @card against LIVE HEAD) runs
+            // end-of-query via the evaluator.
             let table_key = format!("edge:{}", type_name);
-            // Capture pre-write metadata on first touch. Edge inserts are
-            // non-strict, so with a `WriteTxn` this opens NOTHING (collapse #1)
-            // and returns `None`.
-            let (handle, _full_path, _table_branch) = open_table_for_mutation(
+            // Capture pre-write metadata on first touch (ensure_path). Edge
+            // inserts are non-strict, so with a `WriteTxn` this opens NOTHING
+            // (collapse #1) and the handle is discarded — validation, including
+            // `@card` against LIVE HEAD, runs end-of-query via the evaluator.
+            let (_handle, _full_path, _table_branch) = open_table_for_mutation(
                 self,
                 staging,
                 branch,
@@ -1170,32 +1041,7 @@ impl Omnigraph {
             .await?;
             // Accumulate the new edge row. Edge IDs are ULID-generated so
             // Append mode is correct (no key-based dedup needed).
-            staging.append_batch(&table_key, schema, PendingMode::Append, batch.clone())?;
-
-            // Edge cardinality validation: scan committed edges via Lance
-            // + iterate pending edges in-memory for the `src` column,
-            // group-by-src. The pending side already includes the row
-            // we just appended (above). When the open was skipped (collapse
-            // #1), resolve a read handle for the committed scan at LIVE HEAD
-            // (`edge_cardinality_read_handle`, #298) — NOT the pinned txn.base,
-            // which would undercount edges a concurrent writer committed since
-            // capture. Only when cardinality is non-default, so the common
-            // default-cardinality edge keeps the open-free path. (The residual
-            // validate→commit race is the §7.1 gap — step 4.)
-            if !edge_type.cardinality.is_default() {
-                let committed_ds = match handle {
-                    Some(h) => h,
-                    None => self.edge_cardinality_read_handle(txn, &table_key).await?,
-                };
-                validate_edge_cardinality_with_pending(
-                    self,
-                    &committed_ds,
-                    staging,
-                    &table_key,
-                    edge_type,
-                )
-                .await?;
-            }
+            staging.append_batch(&table_key, schema, PendingMode::Append, batch)?;
 
             self.invalidate_graph_index().await;
 
@@ -1318,17 +1164,7 @@ impl Omnigraph {
             resolved.insert(a.property.clone(), resolve_expr_value(&a.value, params)?);
         }
         let updated = apply_assignments(&schema, &matched, &resolved, &blob_props)?;
-        let node_type = &self.catalog().node_types[type_name];
-        crate::loader::validate_value_constraints(&updated, node_type)?;
-        crate::loader::validate_enum_constraints(&updated, &node_type.properties, type_name)?;
-        let unique_groups = crate::loader::unique_constraint_groups_for_node(node_type);
-        if !unique_groups.is_empty() {
-            crate::loader::enforce_unique_constraints_intra_batch(
-                &updated,
-                type_name,
-                &unique_groups,
-            )?;
-        }
+        // Validation (value/enum/unique) runs end-of-query via the evaluator.
 
         // Accumulate the updated batch into the Merge-mode pending stream.
         // The accumulator may now contain entries with the same id as a
@@ -1402,19 +1238,7 @@ impl Omnigraph {
             .scan(&ds, Some(&["id"]), Some(&scan_filter), None)
             .await?;
 
-        let deleted_ids: Vec<String> = batches
-            .iter()
-            .flat_map(|batch| {
-                let ids = batch
-                    .column(0)
-                    .as_any()
-                    .downcast_ref::<StringArray>()
-                    .unwrap();
-                (0..ids.len())
-                    .map(|i| ids.value(i).to_string())
-                    .collect::<Vec<_>>()
-            })
-            .collect();
+        let deleted_ids: Vec<String> = ids_from_batches(&batches);
 
         if deleted_ids.is_empty() {
             return Ok(MutationResult {
@@ -1433,6 +1257,7 @@ impl Omnigraph {
         // `open_table_for_mutation` above already captured the table's
         // path/version/op-kind via `ensure_path`.
         crate::failpoints::maybe_fail(crate::failpoints::names::MUTATION_DELETE_NODE_PRE_PRIMARY_DELETE)?;
+        staging.record_deleted_ids(&table_key, &deleted_ids);
         staging.record_delete(&table_key, pred_sql.clone());
 
         let mut affected_edges = 0usize;
@@ -1487,13 +1312,20 @@ impl Omnigraph {
             // delete removes the union); skip only when nothing NEW matches.
             let count_filter =
                 dedup_delete_filter(&cascade_filter, staging.recorded_delete_predicates(&edge_table_key));
-            let matched = self
-                .storage()
-                .count_rows(&edge_ds, Some(count_filter))
-                .await?;
+            // Scan (not count) the cascade-removed edge ids so validation
+            // recounts the OTHER endpoint's @card after the cascade; `len()` is
+            // the affected count.
+            let matched_ids = ids_from_batches(
+                &self
+                    .storage()
+                    .scan(&edge_ds, Some(&["id"]), Some(&count_filter), None)
+                    .await?,
+            );
+            let matched = matched_ids.len();
             affected_edges += matched;
 
             if matched > 0 {
+                staging.record_deleted_ids(&edge_table_key, &matched_ids);
                 staging.record_delete(&edge_table_key, cascade_filter);
             }
         }
@@ -1540,12 +1372,20 @@ impl Omnigraph {
         // union); only record when something NEW matches.
         let count_filter =
             dedup_delete_filter(&pred_sql, staging.recorded_delete_predicates(&table_key));
-        let affected = self
-            .storage()
-            .count_rows(&ds, Some(count_filter))
-            .await?;
+        // Scan the matched edge ids (not just count): the ids feed validation so
+        // a delete emptying a src below @card min is rejected; `len()` is the
+        // affected count. One scan replaces the former count-here + resolve-at-
+        // validation re-scan.
+        let deleted_ids = ids_from_batches(
+            &self
+                .storage()
+                .scan(&ds, Some(&["id"]), Some(&count_filter), None)
+                .await?,
+        );
+        let affected = deleted_ids.len();
 
         if affected > 0 {
+            staging.record_deleted_ids(&table_key, &deleted_ids);
             staging.record_delete(&table_key, pred_sql.clone());
             self.invalidate_graph_index().await;
         }
@@ -1555,6 +1395,25 @@ impl Omnigraph {
             affected_edges: affected,
         })
     }
+}
+
+/// Extract the `id` column (projection index 0) from scanned batches. Used by
+/// the delete paths to capture the rows they remove, so validation recounts a
+/// src a delete empties without re-resolving the predicate.
+fn ids_from_batches(batches: &[RecordBatch]) -> Vec<String> {
+    batches
+        .iter()
+        .flat_map(|batch| {
+            let ids = batch
+                .column(0)
+                .as_any()
+                .downcast_ref::<StringArray>()
+                .unwrap();
+            (0..ids.len())
+                .map(|i| ids.value(i).to_string())
+                .collect::<Vec<_>>()
+        })
+        .collect()
 }
 
 /// Concat the matched batches from `scan_with_pending` into a single batch.
@@ -1581,25 +1440,6 @@ fn concat_match_batches_to_schema(
             e
         ))
     })
-}
-
-/// Validate `@card` bounds against committed (Lance) + pending (in-memory)
-/// edges for one edge table. Engine path: each insert produces a fresh
-/// ULID id, so committed and pending cannot share a primary key — no
-/// dedup needed (`dedupe_key_column = None`).
-async fn validate_edge_cardinality_with_pending(
-    db: &Omnigraph,
-    committed_ds: &SnapshotHandle,
-    staging: &MutationStaging,
-    table_key: &str,
-    edge_type: &omnigraph_compiler::catalog::EdgeType,
-) -> Result<()> {
-    if edge_type.cardinality.is_default() {
-        return Ok(());
-    }
-    let counts =
-        super::staging::count_src_per_edge(db, committed_ds, table_key, staging, None).await?;
-    super::staging::enforce_cardinality_bounds(edge_type, &counts)
 }
 
 fn enrich_mutation_params(params: &ParamMap) -> Result<ParamMap> {
