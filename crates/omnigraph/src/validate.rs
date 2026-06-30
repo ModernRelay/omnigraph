@@ -11,15 +11,17 @@
 //! The evaluator does NOT reimplement the leaf checks — it orchestrates the
 //! existing ones (`loader::validate_value_constraints`,
 //! `loader::validate_enum_constraints`, ...) over a per-table [`ChangeSet`], so
-//! the surfaces that adopt it cannot diverge. Today the merge path is the only
-//! consumer; the write path is a later, mechanical migration onto the same
-//! evaluator (it already shares the leaves).
+//! the surfaces that adopt it cannot diverge. All three write surfaces —
+//! branch-merge (`exec/merge.rs`), mutation (`exec/mutation.rs`), and bulk load
+//! (`loader`) — now route their integrity checks through this one evaluator, so
+//! the drift class above is unrepresentable.
 //!
 //! Δ-scoping: checks run over the *changed* rows (the merge/write delta), not the
 //! whole table. Row-local checks (value/enum) need only the changed rows because
 //! unchanged rows were validated when written. Cross-row/cross-table checks
-//! (uniqueness, RI, cardinality — a later increment) evaluate the delta against
-//! an index-backed view of committed state.
+//! (uniqueness, RI, cardinality) evaluate the delta against an index-backed view
+//! of committed state (the merge target snapshot, or the write's pinned base /
+//! live HEAD depending on the surface).
 
 use std::collections::{HashMap, HashSet};
 
