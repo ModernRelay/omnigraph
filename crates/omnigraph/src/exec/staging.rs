@@ -1027,4 +1027,3 @@ fn dedupe_merge_batches_by_id(
     arrow_select::concat::concat_batches(schema, &sliced)
         .map_err(|e| OmniError::Lance(e.to_string()))
 }
-
