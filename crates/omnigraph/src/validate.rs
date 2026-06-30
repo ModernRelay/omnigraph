@@ -639,23 +639,20 @@ pub(crate) async fn evaluate(
     Ok(violations)
 }
 
-/// Uniqueness for one `@unique`/`@key` group on `table_key`: intra-delta
-/// duplicates, plus a delta key colliding with a SURVIVING committed row (a
-/// committed holder that is not itself a delta row and not deleted). Self and
-/// other delta rows are excluded — their merged keys are covered by the
-/// intra-delta pass.
-///
-/// The intra-delta pass distinguishes two shapes of "same key twice", because
-/// the write surfaces feed it batches with different semantics:
-/// - **within ONE batch** — two distinct input records (a bulk load that lists
-///   the same `@key`/`@unique` value twice). This is always a violation, even
-///   when both produced the same id: a load has no ordering, so a repeated key
-///   is ambiguous, not a supersession.
-/// - **across batches** — ordered ops on one table (a mutation's `insert X`
-///   then `update X`, or chained updates, each statement its own batch). The
-///   same id reappearing is read-your-writes supersession (last-wins), one
-///   logical row — so only a DIFFERENT id sharing the key collides. A mutation
-///   batch never repeats an id within itself, so this split is unambiguous.
+/// Uniqueness for one `@unique`/`@key` group on `table_key`, evaluated against
+/// the delta's FINAL coalesced image (last-wins per id) — the same image commit
+/// persists. Three checks:
+/// 1. **within ONE batch** — two distinct input records sharing a key (a bulk
+///    load listing the same `@key`/`@unique` value twice). Always a violation,
+///    even with the same id (a load has no ordering), and coalescing would hide
+///    it — so it is checked per-batch first.
+/// 2. **across the coalesced image** — two DISTINCT ids holding the same final
+///    key. Coalescing by id means a read-your-writes update that changes a row's
+///    key (`temp -> final`) releases the old key, so a later row may reuse it.
+/// 3. **committed cross-version** (non-`@key`) — a final key colliding with a
+///    SURVIVING committed row (not itself in the delta, not deleted). `@key` is
+///    id-backed, so a committed holder of a key value is the same row (an
+///    upsert) — self-excluded — so the probe is skipped.
 async fn evaluate_unique(
     table_key: &str,
     columns: &[String],
@@ -666,7 +663,11 @@ async fn evaluate_unique(
     let mut violations = Vec::new();
     let delta_ids = delta_id_set(change)?;
     let deleted: HashSet<&String> = change.deleted_ids.iter().collect();
-    let mut seen: HashMap<Vec<String>, String> = HashMap::new();
+
+    // Pass 1: per-batch within-batch dup detection AND coalesce the delta by id
+    // (last-wins) into each id's final (key, typed values). A row whose key
+    // became null removes the id (it no longer holds a unique key).
+    let mut final_by_id: HashMap<String, (Vec<String>, Vec<ScalarValue>)> = HashMap::new();
     for batch in change.value_batches() {
         let group_columns = columns
             .iter()
@@ -679,45 +680,52 @@ async fn evaluate_unique(
         let ids = string_col(batch, "id")?;
         let mut seen_in_batch: HashMap<Vec<String>, String> = HashMap::new();
         for row in 0..batch.num_rows() {
+            let id = ids.value(row).to_string();
             let Some(key) = composite_unique_key(&group_columns, row)? else {
+                final_by_id.remove(&id);
                 continue;
             };
-            let id = ids.value(row).to_string();
-            // Within ONE batch, a repeated key is two distinct input records —
-            // a duplicate even if they share an id (a bulk load listing the
-            // same @key twice). Reject regardless of id.
             if let Some(prior) = seen_in_batch.insert(key.clone(), id.clone()) {
                 violations.push(unique_violation(table_key, columns, &key, &id, &prior));
-                continue;
             }
-            if let Some(other) = seen.insert(key.clone(), id.clone()) {
-                // Across batches: the same id is ordered supersession (one
-                // logical row); only a DIFFERENT id sharing the key collides.
-                if other != id {
-                    violations.push(unique_violation(table_key, columns, &key, &id, &other));
-                }
-                continue;
-            }
-            // `@key` is id-backed: any committed holder of this key value is the
-            // same row (an upsert), always self-excluded below — so the lookup is
-            // pure waste. The intra-delta dedup above is the whole @key check, and
-            // skipping the lookup avoids an O(Δ) index probe per keyed bulk-load row.
-            if is_key {
-                continue;
-            }
-            // Build typed literals from the row's Arrow columns for the committed
-            // probe — the stringified `key` above is fine for the in-memory
-            // intra-delta dedup (type-agnostic equality) but must NOT be pushed
-            // down against a typed column. `key` is `Some` here, so every column
-            // is non-null and `try_from_array` yields a concrete scalar.
-            let key_values = group_columns
+            // Typed literals from the row's Arrow columns for the committed probe
+            // (a stringified key would compare a typed column to Utf8). `key` is
+            // `Some`, so every column is non-null and `try_from_array` is concrete.
+            let values = group_columns
                 .iter()
                 .map(|arr| ScalarValue::try_from_array(arr, row))
                 .collect::<std::result::Result<Vec<_>, _>>()
                 .map_err(|e| OmniError::manifest(e.to_string()))?;
-            for holder in committed.unique_holders(table_key, columns, &key_values).await? {
+            final_by_id.insert(id, (key, values));
+        }
+    }
+    // A within-batch duplicate is an unambiguous bulk-input error; report it
+    // without the coalesced cross-row pass (which would re-report the same pair).
+    if !violations.is_empty() {
+        return Ok(violations);
+    }
+
+    // Deterministic order — no HashMap iteration in violation ordering.
+    let mut entries: Vec<(String, (Vec<String>, Vec<ScalarValue>))> =
+        final_by_id.into_iter().collect();
+    entries.sort_by(|a, b| a.0.cmp(&b.0));
+
+    // Pass 2: two DISTINCT ids holding the same final key.
+    let mut holder_by_key: HashMap<&Vec<String>, &String> = HashMap::new();
+    for (id, (key, _)) in &entries {
+        if let Some(other) = holder_by_key.insert(key, id) {
+            if other != id {
+                violations.push(unique_violation(table_key, columns, key, id, other));
+            }
+        }
+    }
+
+    // Pass 3: committed cross-version (non-`@key` only).
+    if !is_key {
+        for (id, (key, values)) in &entries {
+            for holder in committed.unique_holders(table_key, columns, values).await? {
                 if !delta_ids.contains(&holder) && !deleted.contains(&holder) {
-                    violations.push(unique_violation(table_key, columns, &key, &id, &holder));
+                    violations.push(unique_violation(table_key, columns, key, id, &holder));
                     break;
                 }
             }
