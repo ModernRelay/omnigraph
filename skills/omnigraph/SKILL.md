@@ -102,10 +102,10 @@ The non-obvious facts that bite, then the full grammar:
 - **Stored-query metadata**: `@description("…")` / `@instruction("…")` may follow the param list.
 - **Casing**: type names uppercase-initial (`Signal`); idents/edges lowercase-initial (`formsPattern`); variables `$`-prefixed. `//` and `/* */` comments only.
 
-Authoritative PEG grammar (pest) for `.gq` files ("NanoGraph" is the legacy engine name):
+Authoritative PEG grammar (pest) for `.gq` files:
 
 ```pest
-// NanoGraph Query Grammar (.gq files)
+//  Query Grammar (.gq files)
 
 WHITESPACE = _{ " " | "\t" | "\r" | "\n" }
 COMMENT = _{ LINE_COMMENT | BLOCK_COMMENT }
