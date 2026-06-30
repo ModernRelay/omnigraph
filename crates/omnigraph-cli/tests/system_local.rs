@@ -1295,9 +1295,17 @@ fn local_cli_load_enforces_engine_layer_policy() {
     );
     let temp = tempfile::tempdir().unwrap();
     let data = temp.path().join("policy-load.jsonl");
+    // The seeded graph (test.jsonl) has Knows/WorksAt edges over its Persons, so a
+    // per-table overwrite must be self-consistent: replacing node:Person also
+    // replaces the edge tables that referenced the old Persons, or the retained
+    // edges would strand against the new node image (a loud OrphanEdge). The data
+    // is incidental to this policy test; it just has to commit cleanly for the
+    // allowed actor. WorksAt points at Acme, a Company the overwrite retains.
     fs::write(
         &data,
-        r#"{"type":"Person","data":{"name":"LoadPolicy","age":11}}"#,
+        "{\"type\":\"Person\",\"data\":{\"name\":\"LoadPolicy\",\"age\":11}}\n\
+         {\"edge\":\"Knows\",\"from\":\"LoadPolicy\",\"to\":\"LoadPolicy\"}\n\
+         {\"edge\":\"WorksAt\",\"from\":\"LoadPolicy\",\"to\":\"Acme\"}\n",
     )
     .unwrap();
 
