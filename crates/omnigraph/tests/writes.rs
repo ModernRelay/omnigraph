@@ -926,9 +926,14 @@ async fn load_overwrite_with_bad_edge_reference_unblocks_next_load() {
     assert_eq!(count_rows(&db, "node:Person").await, pre_persons);
     assert_eq!(count_rows(&db, "edge:Knows").await, pre_edges);
 
+    // The good overwrite must be self-consistent: it replaces Person, so it also
+    // replaces every edge table that referenced the old Persons. WorksAt is in the
+    // batch (pointing the surviving Company at a new Person) so the retained
+    // WorksAt rows that named Alice/Bob don't strand against the new node image.
     let good = r#"{"type": "Person", "data": {"name": "Pat", "age": 55}}
 {"type": "Person", "data": {"name": "Quinn", "age": 56}}
 {"edge": "Knows", "from": "Pat", "to": "Quinn"}
+{"edge": "WorksAt", "from": "Pat", "to": "Acme"}
 "#;
     load_jsonl(&mut db, good, LoadMode::Overwrite)
         .await

@@ -233,8 +233,15 @@ async fn overwrite_replaces_data() {
         .await
         .unwrap();
 
-    // Overwrite with just one person
-    let small = r#"{"type": "Person", "data": {"name": "Zara", "age": 40}}"#;
+    // Overwrite to a small SELF-CONSISTENT image. Overwrite is per-table, so a
+    // Person-only overwrite would drop Alice/Bob while the retained Knows/WorksAt
+    // edges still reference them — a now-rejected orphan (see
+    // `validators::overwrite_node_removal_rejects_retained_orphan_edge`). To
+    // replace the graph, overwrite the edge tables too; Company stays retained
+    // and Zara->Acme references it.
+    let small = r#"{"type": "Person", "data": {"name": "Zara", "age": 40}}
+{"edge": "Knows", "from": "Zara", "to": "Zara"}
+{"edge": "WorksAt", "from": "Zara", "to": "Acme"}"#;
     load_jsonl(&mut db, small, LoadMode::Overwrite)
         .await
         .unwrap();

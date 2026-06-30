@@ -472,6 +472,52 @@ async fn scan_filtered(ds: &Dataset, projection: &[&str], expr: Expr) -> Result<
     .map_err(|e| OmniError::Lance(e.to_string()))
 }
 
+/// Scan `projection` from every row (no filter). Used to enumerate a table's
+/// committed ids when computing what an `Overwrite` removes.
+async fn scan_all(ds: &Dataset, projection: &[&str]) -> Result<Vec<RecordBatch>> {
+    TableStore::scan_stream_with(ds, Some(projection), None, None, false, |_| Ok(()))
+        .await?
+        .try_collect()
+        .await
+        .map_err(|e| OmniError::Lance(e.to_string()))
+}
+
+/// Ids an `Overwrite` of `table_key` removes: committed ids in `base` that are
+/// NOT in `change`'s replacement image (`added ∪ changed`). The loader folds
+/// these into the change-set's `deleted_ids` so edge-RI (path-b) and cardinality
+/// recompute against a node/edge the overwrite drops — e.g. a retained edge to a
+/// removed node, or a src an overwrite empties. Reads the RAW base (NOT the
+/// overwrite-emptied [`CommittedState`] view). Empty if the table is new in `base`.
+pub(crate) async fn overwrite_removed_ids(
+    base: &Snapshot,
+    table_key: &str,
+    change: &TableChange,
+) -> Result<Vec<String>> {
+    if base.entry(table_key).is_none() {
+        return Ok(Vec::new());
+    }
+    let mut new_ids: HashSet<String> = HashSet::new();
+    for batch in change.value_batches() {
+        let column = string_col(batch, "id")?;
+        for i in 0..column.len() {
+            if !column.is_null(i) {
+                new_ids.insert(column.value(i).to_string());
+            }
+        }
+    }
+    let ds = base.open(table_key).await?;
+    let mut removed = Vec::new();
+    for batch in &scan_all(&ds, &["id"]).await? {
+        let column = string_col(batch, "id")?;
+        for i in 0..column.len() {
+            if !column.is_null(i) && !new_ids.contains(column.value(i)) {
+                removed.push(column.value(i).to_string());
+            }
+        }
+    }
+    Ok(removed)
+}
+
 fn string_col<'b>(batch: &'b RecordBatch, name: &str) -> Result<&'b StringArray> {
     batch
         .column_by_name(name)

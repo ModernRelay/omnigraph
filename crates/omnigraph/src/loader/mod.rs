@@ -550,7 +550,30 @@ async fn load_jsonl_reader<R: BufRead>(
     // edges-only overwrite still resolves RI against committed nodes;
     // `Append`/`Merge` keep `base` everywhere. This shares the evaluator with the
     // mutation + merge paths, so the surfaces cannot drift.
-    let changeset = staging.to_changeset();
+    let mut changeset = staging.to_changeset();
+    // Overwrite replaces each touched table; a committed row absent from the new
+    // batch is REMOVED but is not in `to_changeset` (which only records the new
+    // batch). Express those removals as `deleted_ids` so edge-RI (path-b) and
+    // cardinality recompute against them — e.g. overwriting `node:Person` to drop
+    // Bob while a retained `edge:Knows(Alice->Bob)` would otherwise publish an
+    // orphan. (Per-table, like the rest of Overwrite handling.)
+    if mode == LoadMode::Overwrite {
+        let keys: Vec<String> = changeset.keys().cloned().collect();
+        for table_key in keys {
+            let removed = crate::validate::overwrite_removed_ids(
+                &snapshot,
+                &table_key,
+                changeset.get(&table_key).expect("key from this changeset"),
+            )
+            .await?;
+            if !removed.is_empty() {
+                changeset
+                    .get_mut(&table_key)
+                    .expect("key from this changeset")
+                    .deleted_ids = removed;
+            }
+        }
+    }
     let committed = crate::validate::CommittedState::load(&snapshot, mode, &changeset);
     crate::validate::validate_changeset(&changeset, &committed, &catalog).await?;
 
