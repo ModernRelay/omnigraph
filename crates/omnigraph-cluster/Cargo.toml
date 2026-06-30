@@ -1,6 +1,6 @@
 [package]
 name = "omnigraph-cluster"
-version = "0.7.2"
+version = "0.8.0"
 edition = "2024"
 description = "Cluster configuration validation, planning, and config-only apply for Omnigraph."
 license = "MIT"
@@ -14,8 +14,8 @@ documentation = "https://docs.rs/omnigraph-cluster"
 failpoints = ["dep:fail", "fail/failpoints", "omnigraph/failpoints"]
 
 [dependencies]
-omnigraph-compiler = { path = "../omnigraph-compiler", version = "0.7.2" }
-omnigraph = { package = "omnigraph-engine", path = "../omnigraph", version = "0.7.2" }
+omnigraph-compiler = { path = "../omnigraph-compiler", version = "0.8.0" }
+omnigraph = { package = "omnigraph-engine", path = "../omnigraph", version = "0.8.0" }
 fail = { workspace = true, optional = true }
 serde = { workspace = true }
 serde_json = { workspace = true }

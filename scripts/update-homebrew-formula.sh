@@ -47,11 +47,13 @@ RELEASE_JSON="$(gh release view "$TAG" --repo "$REPO_SLUG" --json assets)"
 
 MACOS_ARM_URL="https://github.com/${REPO_SLUG}/releases/download/${TAG}/omnigraph-macos-arm64.tar.gz"
 LINUX_X86_URL="https://github.com/${REPO_SLUG}/releases/download/${TAG}/omnigraph-linux-x86_64.tar.gz"
+LINUX_ARM_URL="https://github.com/${REPO_SLUG}/releases/download/${TAG}/omnigraph-linux-arm64.tar.gz"
 
 MACOS_ARM_SHA="$(asset_digest "$RELEASE_JSON" "omnigraph-macos-arm64.tar.gz")"
 LINUX_X86_SHA="$(asset_digest "$RELEASE_JSON" "omnigraph-linux-x86_64.tar.gz")"
+LINUX_ARM_SHA="$(asset_digest "$RELEASE_JSON" "omnigraph-linux-arm64.tar.gz")"
 
-for value in "$MACOS_ARM_SHA" "$LINUX_X86_SHA"; do
+for value in "$MACOS_ARM_SHA" "$LINUX_X86_SHA" "$LINUX_ARM_SHA"; do
   if [[ -z "$value" ]]; then
     printf 'error: failed to resolve one or more release asset digests for %s\n' "$TAG" >&2
     exit 1
@@ -85,6 +87,10 @@ class Omnigraph < Formula
     on_intel do
       url "${LINUX_X86_URL}"
       sha256 "${LINUX_X86_SHA}"
+    end
+    on_arm do
+      url "${LINUX_ARM_URL}"
+      sha256 "${LINUX_ARM_SHA}"
     end
   end
 
