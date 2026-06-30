@@ -654,8 +654,22 @@ impl Omnigraph {
         // the live opener in `CommittedState::write`.
         let committed =
             crate::validate::CommittedState::write(&txn.base, self, txn.branch.as_deref());
-        crate::validate::validate_changeset(&staging.to_changeset(), &committed, &self.catalog())
-            .await
+        let mut changeset = staging.to_changeset();
+        // Deletes stage as predicates, not constructive batches, so they are
+        // absent from `to_changeset`. Resolve each predicate to the ids it
+        // removes and fold them into the change-set's `deleted_ids`, so the
+        // evaluator recounts the srcs a delete empties (`@card` min) and sees
+        // removed rows for RI — matching the merge path, which carries
+        // `deleted_ids`. Without this a `delete Edge` dropping a src below
+        // `@card` min commits silently. D₂ keeps a query constructive XOR
+        // destructive, so these never overlap a pending batch on the same table.
+        for (table_key, predicates) in &staging.delete_predicates {
+            let ids = committed.deleted_ids_matching(table_key, predicates).await?;
+            if !ids.is_empty() {
+                changeset.entry(table_key.clone()).or_default().deleted_ids = ids;
+            }
+        }
+        crate::validate::validate_changeset(&changeset, &committed, &self.catalog()).await
     }
 
     async fn mutate_with_current_actor(

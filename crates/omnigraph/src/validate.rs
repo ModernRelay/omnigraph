@@ -413,6 +413,36 @@ impl<'a> CommittedState<'a> {
         Ok(out)
     }
 
+    /// Resolve staged delete predicates for `table_key` to the ids they remove,
+    /// so the delete's effect (emptying a src below `@card` min, stranding an
+    /// edge) is validated like the merge path's `deleted_ids`. Reads LIVE HEAD on
+    /// the write path (via `open_cardinality`), matching the strict-open count the
+    /// delete itself took. Empty if the table has no committed view.
+    pub(crate) async fn deleted_ids_matching(
+        &self,
+        table_key: &str,
+        predicates: &[String],
+    ) -> Result<Vec<String>> {
+        if predicates.is_empty() {
+            return Ok(Vec::new());
+        }
+        let Some(ds) = self.open_cardinality(table_key).await? else {
+            return Ok(Vec::new());
+        };
+        let mut ids: HashSet<String> = HashSet::new();
+        for predicate in predicates {
+            for batch in &scan_filtered_sql(&ds, &["id"], predicate).await? {
+                let column = string_col(batch, "id")?;
+                for i in 0..column.len() {
+                    if !column.is_null(i) {
+                        ids.insert(column.value(i).to_string());
+                    }
+                }
+            }
+        }
+        Ok(ids.into_iter().collect())
+    }
+
     /// Committed edges `(id, src, dst)` in `edge_table` whose src is in
     /// `src_nodes` OR dst is in `dst_nodes` — the edges a node deletion would
     /// strand. Index-backed (BTREE on src/dst).
@@ -470,6 +500,21 @@ async fn scan_filtered(ds: &Dataset, projection: &[&str], expr: Expr) -> Result<
     .try_collect()
     .await
     .map_err(|e| OmniError::Lance(e.to_string()))
+}
+
+/// Like [`scan_filtered`] but with a SQL string predicate. Used to resolve a
+/// staged delete predicate (already SQL over the table's columns) to the rows it
+/// removes; Lance parses it against the table schema.
+async fn scan_filtered_sql(
+    ds: &Dataset,
+    projection: &[&str],
+    filter: &str,
+) -> Result<Vec<RecordBatch>> {
+    TableStore::scan_stream_with(ds, Some(projection), Some(filter), None, false, |_| Ok(()))
+        .await?
+        .try_collect()
+        .await
+        .map_err(|e| OmniError::Lance(e.to_string()))
 }
 
 fn string_col<'b>(batch: &'b RecordBatch, name: &str) -> Result<&'b StringArray> {
