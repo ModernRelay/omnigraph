@@ -284,20 +284,6 @@ impl TableStore {
         }
     }
 
-    pub async fn open_dataset_at_state(
-        &self,
-        table_path: &str,
-        branch: Option<&str>,
-        version: u64,
-    ) -> Result<Dataset> {
-        let ds = self
-            .open_dataset_head(&self.dataset_uri(table_path), branch)
-            .await?;
-        ds.checkout_version(version)
-            .await
-            .map_err(|e| OmniError::Lance(e.to_string()))
-    }
-
     pub fn ensure_expected_version(
         &self,
         ds: &Dataset,

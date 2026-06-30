@@ -8,7 +8,7 @@ mod helpers;
 use omnigraph::db::Omnigraph;
 use omnigraph::loader::{LoadMode, load_jsonl};
 
-use helpers::{mutate_main, params};
+use helpers::{count_rows, mutate_main, params};
 
 const ENUM_SCHEMA: &str = r#"
 node Person {
@@ -55,6 +55,22 @@ node User {
 }
 "#;
 
+const UNIQUE_MUTATIONS: &str = r#"
+query insert_user($name: String, $email: String) {
+    insert User { name: $name, email: $email }
+}
+"#;
+
+// A non-String `@unique` column: the committed cross-version probe must build a
+// typed literal, not a stringified key, or it compares a Date32 column to a Utf8
+// value (a DataFusion coercion error that breaks every write to the table).
+const DATE_UNIQUE_SCHEMA: &str = r#"
+node Task {
+    name: String @key
+    due: Date @unique
+}
+"#;
+
 const CARDINALITY_SCHEMA: &str = r#"
 node Person { name: String @key }
 node Company { name: String @key }
@@ -68,6 +84,19 @@ const CARDINALITY_SEED: &str = r#"{"type":"Person","data":{"name":"Alice"}}
 const CARDINALITY_MUTATIONS: &str = r#"
 query add_employment($person: String, $company: String) {
     insert WorksAt { from: $person, to: $company }
+}
+"#;
+
+// A non-zero @card min so a move that vacates a src can drop it below the floor.
+const CARD_MIN_SCHEMA: &str = r#"
+node Person { name: String @key }
+node Company { name: String @key }
+edge WorksAt: Person -> Company @card(1..)
+"#;
+
+const CARD_MIN_DELETE_MUTATIONS: &str = r#"
+query drop_employment($person: String) {
+    delete WorksAt where from = $person
 }
 "#;
 
@@ -200,9 +229,324 @@ async fn intra_batch_unique_rejected_on_jsonl_load() {
     );
 }
 
-// Note: single-row mutation insert can't violate intra-batch uniqueness
-// (only one row in the batch). Cross-batch uniqueness against committed rows
-// is out of scope for this wire-up — see the unified write-validator effort.
+// Single-row mutation insert can't violate INTRA-BATCH uniqueness (one row).
+// CROSS-VERSION uniqueness against already-committed rows IS now enforced on the
+// mutation path via the unified evaluator (#1/#2); the loader path's
+// cross-version check lands with the loader migration.
+
+/// Cross-version uniqueness, closed by the write-path evaluator migration:
+/// two SEPARATE mutations inserting distinct rows with the same `@unique` value —
+/// the second is rejected against the committed first (previously a gap).
+#[tokio::test]
+async fn cross_version_unique_rejected_on_mutation_insert() {
+    let (_dir, mut db) = init_with(UNIQUE_SCHEMA, "").await;
+    mutate_main(
+        &mut db,
+        UNIQUE_MUTATIONS,
+        "insert_user",
+        &params(&[("$name", "Bob"), ("$email", "dup@example.com")]),
+    )
+    .await
+    .unwrap();
+    let err = mutate_main(
+        &mut db,
+        UNIQUE_MUTATIONS,
+        "insert_user",
+        &params(&[("$name", "Carol"), ("$email", "dup@example.com")]),
+    )
+    .await
+    .unwrap_err();
+    assert!(
+        err.to_string().contains("@unique violation on User.email"),
+        "got: {}",
+        err
+    );
+}
+
+/// The cross-version unique check must NOT flag a row updating itself: an upsert
+/// of an existing `@key` (same id) is an update, not a duplicate. Re-inserting
+/// the same key with its own `@unique` value must succeed (the evaluator excludes
+/// the committed same-id holder).
+#[tokio::test]
+async fn reinsert_existing_key_is_upsert_not_unique_violation() {
+    let (_dir, mut db) = init_with(UNIQUE_SCHEMA, "").await;
+    mutate_main(
+        &mut db,
+        UNIQUE_MUTATIONS,
+        "insert_user",
+        &params(&[("$name", "Alice"), ("$email", "alice@example.com")]),
+    )
+    .await
+    .unwrap();
+    mutate_main(
+        &mut db,
+        UNIQUE_MUTATIONS,
+        "insert_user",
+        &params(&[("$name", "Alice"), ("$email", "alice@example.com")]),
+    )
+    .await
+    .expect("re-inserting an existing @key upserts; it is not a unique violation");
+}
+
+// ─── Cross-version uniqueness + RI on the LOADER path (Slice 3) ───────────────
+
+const RI_SCHEMA: &str = r#"
+node Person { name: String @key }
+edge Knows: Person -> Person
+"#;
+
+/// Cross-version uniqueness is now enforced on the bulk-load path too: a second
+/// Append load duplicating a committed `@unique` value is rejected.
+#[tokio::test]
+async fn cross_version_unique_rejected_on_append_load() {
+    let (_dir, mut db) = init_with(UNIQUE_SCHEMA, "").await;
+    load_jsonl(
+        &mut db,
+        r#"{"type":"User","data":{"name":"Bob","email":"dup@example.com"}}"#,
+        LoadMode::Append,
+    )
+    .await
+    .unwrap();
+    let err = load_jsonl(
+        &mut db,
+        r#"{"type":"User","data":{"name":"Carol","email":"dup@example.com"}}"#,
+        LoadMode::Append,
+    )
+    .await
+    .unwrap_err();
+    assert!(
+        err.to_string().contains("@unique violation on User.email"),
+        "got: {}",
+        err
+    );
+}
+
+/// Fix D: the cross-version `@unique` probe must use a typed literal on a
+/// non-String column. A second-version row colliding with a committed `Date`
+/// value must surface a proper `@unique` violation — not a Date32-vs-Utf8
+/// coercion error (the red symptom before the fix).
+#[tokio::test]
+async fn cross_version_unique_rejected_on_date_column() {
+    let (_dir, mut db) = init_with(DATE_UNIQUE_SCHEMA, "").await;
+    load_jsonl(
+        &mut db,
+        r#"{"type":"Task","data":{"name":"T1","due":"2026-06-29"}}"#,
+        LoadMode::Append,
+    )
+    .await
+    .unwrap();
+    let err = load_jsonl(
+        &mut db,
+        r#"{"type":"Task","data":{"name":"T2","due":"2026-06-29"}}"#,
+        LoadMode::Append,
+    )
+    .await
+    .unwrap_err();
+    assert!(
+        err.to_string().contains("@unique violation on Task.due"),
+        "got: {}",
+        err
+    );
+}
+
+/// Fix D companion: a non-colliding write to a `Date @unique` table must
+/// succeed. Before the fix the committed probe raised a coercion error for
+/// ANY second write (it compared Date32 to a Utf8 literal regardless of a
+/// match), so this happy path failed too.
+#[tokio::test]
+async fn noncolliding_write_to_date_unique_column_succeeds() {
+    let (_dir, mut db) = init_with(DATE_UNIQUE_SCHEMA, "").await;
+    load_jsonl(
+        &mut db,
+        r#"{"type":"Task","data":{"name":"T1","due":"2026-06-29"}}"#,
+        LoadMode::Append,
+    )
+    .await
+    .unwrap();
+    load_jsonl(
+        &mut db,
+        r#"{"type":"Task","data":{"name":"T2","due":"2026-07-01"}}"#,
+        LoadMode::Append,
+    )
+    .await
+    .expect("a distinct Date value must not collide and must not raise a coercion error");
+    assert_eq!(count_rows(&db, "node:Task").await, 2);
+}
+
+/// Fix B: a Merge-load that MOVES an edge to a new src must recount the OLD
+/// src. Moving Alice's only WorksAt to Bob drops Alice to zero, below
+/// @card(1..). Before the fix only the new src (Bob) was in the affected set,
+/// so Alice's underflow was missed and the load silently succeeded.
+#[tokio::test]
+async fn merge_load_edge_src_move_rechecks_vacated_src_cardinality() {
+    let seed = r#"{"type":"Person","data":{"name":"Alice"}}
+{"type":"Person","data":{"name":"Bob"}}
+{"type":"Company","data":{"name":"Acme"}}
+{"edge":"WorksAt","from":"Alice","to":"Acme","data":{"id":"E1"}}"#;
+    let (_dir, mut db) = init_with(CARD_MIN_SCHEMA, seed).await;
+
+    let err = load_jsonl(
+        &mut db,
+        r#"{"edge":"WorksAt","from":"Bob","to":"Acme","data":{"id":"E1"}}"#,
+        LoadMode::Merge,
+    )
+    .await
+    .expect_err("moving Alice's only edge to Bob drops Alice below @card(1..)");
+    assert!(
+        err.to_string().contains("@card violation") && err.to_string().contains("Alice"),
+        "got: {}",
+        err
+    );
+}
+
+/// Fix A: a Merge-load batch listing the same edge id twice with different srcs
+/// must be counted ONCE (commit dedupes by id, last-wins). Alice keeps her one
+/// committed edge and Bob gets the (deduped) E1, both within @card(0..1), so the
+/// load must succeed. Before the fix E1 was counted under both srcs, giving
+/// Alice a phantom second edge and a spurious max violation.
+#[tokio::test]
+async fn merge_load_duplicate_edge_id_counts_once_per_card() {
+    let seed = r#"{"type":"Person","data":{"name":"Alice"}}
+{"type":"Person","data":{"name":"Bob"}}
+{"type":"Company","data":{"name":"Acme"}}
+{"type":"Company","data":{"name":"Beta"}}
+{"edge":"WorksAt","from":"Alice","to":"Acme","data":{"id":"E0"}}"#;
+    let (_dir, mut db) = init_with(CARDINALITY_SCHEMA, seed).await;
+
+    // Same edge id E1 under two srcs in one batch: commit keeps the last
+    // (Bob->Beta). Alice stays at her one committed edge (E0).
+    let batch = r#"{"edge":"WorksAt","from":"Alice","to":"Beta","data":{"id":"E1"}}
+{"edge":"WorksAt","from":"Bob","to":"Beta","data":{"id":"E1"}}"#;
+    load_jsonl(&mut db, batch, LoadMode::Merge)
+        .await
+        .expect("a deduped edge id must not double-count Alice into a @card(0..1) violation");
+    assert_eq!(count_rows(&db, "edge:WorksAt").await, 2);
+}
+
+/// A direct edge DELETE must recount the source it empties. Deleting Alice's
+/// only WorksAt drops her to zero, below @card(1..), and must be rejected.
+/// Deletes stage as predicates (absent from the constructive change-set), so
+/// before the fix the mutation committed without any cardinality check — while
+/// the merge path, which carries deleted_ids, would have caught it.
+#[tokio::test]
+async fn mutation_delete_edge_below_card_min_rejected() {
+    let seed = r#"{"type":"Person","data":{"name":"Alice"}}
+{"type":"Company","data":{"name":"Acme"}}
+{"edge":"WorksAt","from":"Alice","to":"Acme","data":{"id":"E1"}}"#;
+    let (_dir, mut db) = init_with(CARD_MIN_SCHEMA, seed).await;
+
+    let err = mutate_main(
+        &mut db,
+        CARD_MIN_DELETE_MUTATIONS,
+        "drop_employment",
+        &params(&[("$person", "Alice")]),
+    )
+    .await
+    .expect_err("deleting Alice's only WorksAt drops her below @card(1..)");
+    assert!(
+        err.to_string().contains("@card violation") && err.to_string().contains("Alice"),
+        "got: {}",
+        err
+    );
+    assert_eq!(
+        count_rows(&db, "edge:WorksAt").await,
+        1,
+        "the rejected delete must not have removed the edge"
+    );
+}
+
+/// A Merge load re-upserting an existing `@key` with its own `@unique` value is
+/// an update, not a duplicate — it must NOT false-trigger the cross-version check.
+#[tokio::test]
+async fn merge_load_reupsert_existing_key_is_not_unique_violation() {
+    let (_dir, mut db) = init_with(UNIQUE_SCHEMA, "").await;
+    let row = r#"{"type":"User","data":{"name":"Alice","email":"alice@example.com"}}"#;
+    load_jsonl(&mut db, row, LoadMode::Merge).await.unwrap();
+    load_jsonl(&mut db, row, LoadMode::Merge)
+        .await
+        .expect("merge-load re-upserting an existing @key is not a unique violation");
+}
+
+/// `Overwrite` replaces the touched tables, so edge RI must validate against the
+/// NEW batch image, not the replaced committed one. An edge to a node that exists
+/// only in the new batch loads cleanly (regression against using the old image).
+#[tokio::test]
+async fn overwrite_load_validates_ri_against_new_image() {
+    let (_dir, mut db) = init_with(RI_SCHEMA, r#"{"type":"Person","data":{"name":"Alice"}}"#).await;
+    let batch = r#"{"type":"Person","data":{"name":"Carol"}}
+{"edge":"Knows","from":"Carol","to":"Carol"}"#;
+    load_jsonl(&mut db, batch, LoadMode::Overwrite)
+        .await
+        .expect("Overwrite RI validates against the new batch image, not the replaced committed");
+}
+
+/// And an Append load whose edge references a non-existent node is still rejected
+/// (edge-RI enforced via the evaluator).
+#[tokio::test]
+async fn append_load_rejects_orphan_edge() {
+    let (_dir, mut db) = init_with(RI_SCHEMA, r#"{"type":"Person","data":{"name":"Alice"}}"#).await;
+    let err = load_jsonl(
+        &mut db,
+        r#"{"edge":"Knows","from":"Alice","to":"Ghost"}"#,
+        LoadMode::Append,
+    )
+    .await
+    .unwrap_err();
+    assert!(
+        err.to_string().contains("not found"),
+        "orphan edge must be rejected, got: {}",
+        err
+    );
+}
+
+/// Finding 1: overwriting a NODE table can strand a retained edge in a
+/// non-overwritten table. Seed Alice, Bob + Knows(Alice->Bob); Overwrite-load
+/// node:Person with only Alice (Bob removed), leaving edge:Knows untouched ->
+/// Knows(Alice->Bob) is now an orphan and must be rejected. The overwrite-removed
+/// Bob is not expressed as a deleted_id, so edge-RI path-b never runs.
+#[tokio::test]
+async fn overwrite_node_removal_rejects_retained_orphan_edge() {
+    let seed = r#"{"type":"Person","data":{"name":"Alice"}}
+{"type":"Person","data":{"name":"Bob"}}
+{"edge":"Knows","from":"Alice","to":"Bob"}"#;
+    let (_dir, mut db) = init_with(RI_SCHEMA, seed).await;
+
+    let err = load_jsonl(
+        &mut db,
+        r#"{"type":"Person","data":{"name":"Alice"}}"#,
+        LoadMode::Overwrite,
+    )
+    .await
+    .expect_err("removing Bob via overwrite while Knows(Alice->Bob) is retained orphans the edge");
+    assert!(
+        err.to_string().contains("not found"),
+        "retained edge to an overwrite-removed node must be rejected, got: {}",
+        err
+    );
+}
+
+/// Finding 2: uniqueness must evaluate the final coalesced image per id, not
+/// accumulate superseded keys. One mutation updates Alice.email temp -> final,
+/// then inserts Carol.email = temp. The final state (Alice=final, Carol=temp) is
+/// valid, but the validator retains the stale Alice->temp and false-rejects Carol.
+#[tokio::test]
+async fn chained_unique_update_then_reuse_freed_value_is_not_a_violation() {
+    let (_dir, mut db) = init_with(
+        UNIQUE_SCHEMA,
+        r#"{"type":"User","data":{"name":"Alice","email":"orig"}}"#,
+    )
+    .await;
+    const Q: &str = r#"
+query reassign() {
+    update User set { email: "temp" } where name = "Alice"
+    update User set { email: "final" } where name = "Alice"
+    insert User { name: "Carol", email: "temp" }
+}
+"#;
+    mutate_main(&mut db, Q, "reassign", &params(&[]))
+        .await
+        .expect("Alice ends at 'final' and Carol takes the freed 'temp' — final image has no collision");
+}
 
 // ─── Edge cardinality ────────────────────────────────────────────────────────
 

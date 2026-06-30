@@ -936,17 +936,6 @@ pub(super) async fn reopen_for_mutation(
     }
 }
 
-pub(super) async fn open_dataset_at_state(
-    db: &Omnigraph,
-    table_path: &str,
-    table_branch: Option<&str>,
-    table_version: u64,
-) -> Result<SnapshotHandle> {
-    db.storage()
-        .open_dataset_at_state(table_path, table_branch, table_version)
-        .await
-}
-
 /// A declared index the builder could not materialize on this pass. Today the
 /// only such case is a vector (IVF) column with no trainable vectors yet
 /// (KMeans needs >=1 vector), e.g. the load-before-embed window. Reported, not

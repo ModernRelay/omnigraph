@@ -28,7 +28,6 @@ use crate::storage_layer::{SnapshotHandle, StagedHandle};
 use arrow_array::{Array, RecordBatch, StringArray, UInt32Array};
 use arrow_schema::SchemaRef;
 use futures::stream::StreamExt;
-use omnigraph_compiler::catalog::EdgeType;
 
 use crate::db::manifest::{
     RecoverySidecarHandle, SidecarKind, SidecarTablePin, new_sidecar, write_sidecar,
@@ -98,6 +97,13 @@ pub(crate) struct MutationStaging {
     /// `pending`. Staged as one combined `stage_delete` per table at
     /// end-of-query (no inline HEAD advance) — see `stage_delete_table`.
     pub(crate) delete_predicates: HashMap<String, Vec<String>>,
+    /// Ids removed per table, captured by the delete ops as they scan their
+    /// matched rows (so validation recounts the srcs a delete empties without
+    /// re-resolving the predicates). Disjoint from `pending` by D₂; flows into
+    /// the validation [`ChangeSet`](crate::validate::ChangeSet) via
+    /// [`to_changeset`](Self::to_changeset). The combined `stage_delete` at
+    /// commit still removes by predicate — these ids are validation-only.
+    pub(crate) deleted_ids: HashMap<String, Vec<String>>,
     /// Strictest [`MutationOpKind`] seen per table within this query. Drives
     /// the op-kind-aware drift check in [`StagedMutation::commit_all`]: for
     /// tables whose first or any subsequent touch was a strict op
@@ -227,6 +233,20 @@ impl MutationStaging {
             .push(predicate);
     }
 
+    /// Record ids removed by a delete op on `table_key`, captured from the op's
+    /// own scan, for validation (so cardinality recounts an emptied src). The
+    /// caller scans with a dedup filter that excludes prior-scheduled matches, so
+    /// no id is recorded twice across statements.
+    pub(crate) fn record_deleted_ids(&mut self, table_key: &str, ids: &[String]) {
+        if ids.is_empty() {
+            return;
+        }
+        self.deleted_ids
+            .entry(table_key.to_string())
+            .or_default()
+            .extend(ids.iter().cloned());
+    }
+
     /// Delete predicates already recorded for `table_key` by earlier delete
     /// statements in this query. Read before recording the current statement's
     /// predicate so its `affected_*` count can exclude rows a prior statement
@@ -249,9 +269,31 @@ impl MutationStaging {
             .unwrap_or(&[])
     }
 
-    /// Accumulator mode for `table_key`, if this query has touched it.
-    pub(crate) fn pending_mode(&self, table_key: &str) -> Option<PendingMode> {
-        self.pending.get(table_key).map(|p| p.mode)
+    /// Build the validation [`ChangeSet`](crate::validate::ChangeSet) for this
+    /// staging: every touched table's accumulated rows as the `changed` delta
+    /// (record-batch clone is Arc-cheap — no data copy). Shared by the mutation
+    /// and loader write paths so their validation input cannot drift.
+    pub(crate) fn to_changeset(&self) -> crate::validate::ChangeSet {
+        let mut changeset = crate::validate::ChangeSet::new();
+        for table_key in self.pending.keys() {
+            let batches = self.pending_batches(table_key);
+            if batches.is_empty() {
+                continue;
+            }
+            let mut change = crate::validate::TableChange::default();
+            change.changed.extend(batches.iter().cloned());
+            changeset.insert(table_key.clone(), change);
+        }
+        // Deletes (disjoint from `pending` by D₂) carry their removed ids so the
+        // evaluator recounts the srcs a delete empties (`@card`) and sees removed
+        // rows for RI — the faithful change-set the merge path also builds.
+        for (table_key, ids) in &self.deleted_ids {
+            if ids.is_empty() {
+                continue;
+            }
+            changeset.entry(table_key.clone()).or_default().deleted_ids = ids.clone();
+        }
+        changeset
     }
 
     /// Schema of the accumulated batches for `table_key`, or `None` if no
@@ -307,6 +349,8 @@ impl MutationStaging {
             paths,
             pending,
             delete_predicates,
+            // Validation-only; consumed before staging, nothing to commit here.
+            deleted_ids: _,
             op_kinds,
         } = self;
 
@@ -982,233 +1026,4 @@ fn dedupe_merge_batches_by_id(
     }
     arrow_select::concat::concat_batches(schema, &sliced)
         .map_err(|e| OmniError::Lance(e.to_string()))
-}
-
-// ─── Cardinality helpers (shared by mutation + loader paths) ────────────────
-
-/// Count edges per `src` value across committed (Lance scan) + pending
-/// (in-memory). Caller supplies an opened committed dataset so the
-/// mutation path (which already has one) and the loader path (which
-/// opens via snapshot) share the same body. For overwrite staging, the
-/// pending batches are the replacement table image, so committed rows are
-/// intentionally skipped.
-///
-/// `dedupe_key_column` controls whether committed rows are shadowed by
-/// pending:
-/// - `None` — every committed row counts, every pending row counts.
-///   Correct when committed and pending cannot share a primary key
-///   (engine inserts always use fresh ULID edge ids; loader Append
-///   mode uses fresh ids too).
-/// - `Some(col)` — committed rows whose `col` value also appears in any
-///   pending batch are EXCLUDED from the committed count, so a Merge-mode
-///   load that *updates* an existing edge (potentially changing its
-///   `src`) counts the post-update row exactly once. Without this,
-///   `LoadMode::Merge` double-counts.
-pub(crate) async fn count_src_per_edge(
-    db: &crate::db::Omnigraph,
-    committed_ds: &SnapshotHandle,
-    table_key: &str,
-    staging: &MutationStaging,
-    dedupe_key_column: Option<&str>,
-) -> Result<HashMap<String, u32>> {
-    let mut counts: HashMap<String, u32> = HashMap::new();
-
-    let pending_batches = staging.pending_batches(table_key);
-
-    // Collect pending key values (for shadow-on-merge dedupe). Only when
-    // dedupe is requested AND there's anything pending.
-    let pending_keys: Option<HashSet<String>> = match dedupe_key_column {
-        Some(col) if !pending_batches.is_empty() => {
-            let mut set = HashSet::new();
-            for batch in pending_batches {
-                if let Some(arr) = batch
-                    .column_by_name(col)
-                    .and_then(|c| c.as_any().downcast_ref::<StringArray>())
-                {
-                    for i in 0..arr.len() {
-                        if arr.is_valid(i) {
-                            set.insert(arr.value(i).to_string());
-                        }
-                    }
-                }
-            }
-            Some(set)
-        }
-        _ => None,
-    };
-
-    let replace_committed = staging.pending_mode(table_key) == Some(PendingMode::Overwrite);
-    if !replace_committed {
-        // Committed side: scan `src` plus the dedupe key column when set, so
-        // we can both count and shadow in one pass.
-        let projection: Vec<&str> = match dedupe_key_column {
-            Some(col) if pending_keys.as_ref().is_some_and(|s| !s.is_empty()) => vec!["src", col],
-            _ => vec!["src"],
-        };
-        let committed = db
-            .storage()
-            .scan(committed_ds, Some(&projection), None, None)
-            .await?;
-        for batch in &committed {
-            let srcs = batch
-                .column_by_name("src")
-                .ok_or_else(|| OmniError::Lance("missing 'src' column on edge table".into()))?
-                .as_any()
-                .downcast_ref::<StringArray>()
-                .ok_or_else(|| OmniError::Lance("'src' column is not Utf8".into()))?;
-            // Optional shadow-key column (only present when dedupe is on).
-            let key_arr = match (&pending_keys, dedupe_key_column) {
-                (Some(set), Some(col)) if !set.is_empty() => batch
-                    .column_by_name(col)
-                    .and_then(|c| c.as_any().downcast_ref::<StringArray>()),
-                _ => None,
-            };
-            for i in 0..srcs.len() {
-                if !srcs.is_valid(i) {
-                    continue;
-                }
-                // Shadow this committed row if its key is in pending.
-                if let (Some(arr), Some(set)) = (key_arr, pending_keys.as_ref()) {
-                    if arr.is_valid(i) && set.contains(arr.value(i)) {
-                        continue;
-                    }
-                }
-                *counts.entry(srcs.value(i).to_string()).or_insert(0) += 1;
-            }
-        }
-    }
-
-    // Pending side: walk in-memory batches for `src`. When dedupe is on,
-    // collapse rows that share `dedupe_key_column` to their last occurrence
-    // — mirrors `dedupe_merge_batches_by_id`'s last-write-wins applied at
-    // finalize time, so cardinality counts what `commit_staged` will
-    // actually publish, not raw input duplicates.
-    //
-    // Without this, a Merge-mode load whose input JSONL has two rows with
-    // the same edge id would be double-counted here, even though the
-    // finalize-time dedupe would collapse them to one. The result: spurious
-    // `@card` violations on perfectly valid Merge inputs.
-    match dedupe_key_column {
-        Some(key_col) => count_pending_src_with_dedupe(pending_batches, key_col, &mut counts)?,
-        None => count_pending_src_naive(pending_batches, &mut counts),
-    }
-
-    Ok(counts)
-}
-
-/// Count pending edges per `src` with NO dedup. Correct when caller
-/// guarantees pending rows have unique primary keys (engine inserts via
-/// fresh ULID; loader Append mode).
-fn count_pending_src_naive(pending_batches: &[RecordBatch], counts: &mut HashMap<String, u32>) {
-    for batch in pending_batches {
-        let Some(col) = batch.column_by_name("src") else {
-            continue;
-        };
-        let Some(srcs) = col.as_any().downcast_ref::<StringArray>() else {
-            continue;
-        };
-        for i in 0..srcs.len() {
-            if srcs.is_valid(i) {
-                *counts.entry(srcs.value(i).to_string()).or_insert(0) += 1;
-            }
-        }
-    }
-}
-
-/// Count pending edges per `src` after deduping rows that share
-/// `dedupe_key_column`. Last occurrence wins (mirrors
-/// `dedupe_merge_batches_by_id`'s walk-in-reverse contract). Required for
-/// `LoadMode::Merge` where the same edge id may appear multiple times in
-/// one load and finalize will collapse them to the last value.
-fn count_pending_src_with_dedupe(
-    pending_batches: &[RecordBatch],
-    dedupe_key_column: &str,
-    counts: &mut HashMap<String, u32>,
-) -> Result<()> {
-    // Walk in reverse, track seen keys, keep one (key, src) pair per key.
-    let mut seen: HashSet<String> = HashSet::new();
-    let mut kept_srcs: Vec<String> = Vec::new();
-    for batch in pending_batches.iter().rev() {
-        let Some(key_col) = batch.column_by_name(dedupe_key_column) else {
-            // Pending batch is missing the key column. By construction
-            // this is unreachable: callers in dedupe mode always push
-            // batches whose schema contains the key (loader Merge mode
-            // builds via build_edge_batch which always emits `id`; the
-            // append_batch schema-compatibility check at the call site
-            // would also reject a heterogeneous mix). If it ever fires
-            // it's a programmer error — fail loudly rather than skip
-            // counting (which would let `@card` violations slip).
-            return Err(OmniError::manifest_internal(format!(
-                "count_pending_src_with_dedupe: pending batch missing dedup key column '{}' \
-                 (schema-compat check at append_batch should have rejected this)",
-                dedupe_key_column
-            )));
-        };
-        let key_arr = key_col
-            .as_any()
-            .downcast_ref::<StringArray>()
-            .ok_or_else(|| {
-                OmniError::Lance(format!(
-                    "count_src_per_edge: pending '{}' column is not Utf8",
-                    dedupe_key_column
-                ))
-            })?;
-        let src_arr = batch
-            .column_by_name("src")
-            .and_then(|c| c.as_any().downcast_ref::<StringArray>());
-        let Some(srcs) = src_arr else {
-            continue;
-        };
-        for i in (0..batch.num_rows()).rev() {
-            if !srcs.is_valid(i) {
-                continue;
-            }
-            // NULL key: keep (NULL != NULL semantics — every NULL counts).
-            if !key_arr.is_valid(i) {
-                kept_srcs.push(srcs.value(i).to_string());
-                continue;
-            }
-            let key = key_arr.value(i);
-            if seen.insert(key.to_string()) {
-                kept_srcs.push(srcs.value(i).to_string());
-            }
-        }
-    }
-    for src in kept_srcs {
-        *counts.entry(src).or_insert(0) += 1;
-    }
-    Ok(())
-}
-
-/// Apply `@card(min..max)` bounds to a per-source count map.
-///
-/// Both bounds are checked. The `min` check produces a misleading error
-/// during a per-op insert mid-query (a bound of `2..` requires both
-/// edges to be inserted before validation passes), but the historical
-/// behavior was to enforce min per-op anyway — keeping users from
-/// accidentally publishing a graph that violates the schema. Consumers
-/// that need end-of-query semantics call this from after all edge ops
-/// are accumulated (the loader does, via Phase 3).
-pub(crate) fn enforce_cardinality_bounds(
-    edge_type: &EdgeType,
-    counts: &HashMap<String, u32>,
-) -> Result<()> {
-    let card = &edge_type.cardinality;
-    for (src, count) in counts {
-        if let Some(max) = card.max {
-            if *count > max {
-                return Err(OmniError::manifest(format!(
-                    "@card violation on edge {}: source '{}' has {} edges (max {})",
-                    edge_type.name, src, count, max
-                )));
-            }
-        }
-        if *count < card.min {
-            return Err(OmniError::manifest(format!(
-                "@card violation on edge {}: source '{}' has {} edges (min {})",
-                edge_type.name, src, count, card.min
-            )));
-        }
-    }
-    Ok(())
 }
