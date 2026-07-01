@@ -1952,3 +1952,116 @@ async fn post_publish_fold_matches_fresh_reopen() {
         "post-publish fold diverged from a fresh re-scan (folded {folded} vs scanned {scanned})"
     );
 }
+
+const FIND_PERSON_QUERY: &str = r#"
+query find_person($name: String) {
+    match { $p: Person { name: $name } }
+    return { $p.name }
+}
+"#;
+
+/// Regression: iss-merge-rowid-overlap-corrupts-filtered-reads / lance#7444.
+///
+/// An update-style merge (same-key merge load) reuses the updated rows'
+/// stable row ids in the rewritten fragments while the superseded fragment
+/// keeps its full row-id sequence plus a deletion vector — overlapping
+/// cross-fragment id ranges, legal per the Lance row-id-lineage spec. A
+/// later delete punches a hole in that overlapping range; on unpatched
+/// Lance 7.0.0 `RowIdIndex::new` then fails any filtered scan that needs
+/// the id→address map ("all columns in a record batch must have the same
+/// length" in release, a "Wrong range" debug assert). Fixed upstream by
+/// lance#7480; consumed here via the vendored `lance-table` patch.
+#[tokio::test]
+async fn filtered_read_after_merge_update_and_delete_keeps_row_ids_consistent() {
+    let dir = tempfile::tempdir().unwrap();
+    let uri = dir.path().to_str().unwrap();
+    let mut db = Omnigraph::init(uri, TEST_SCHEMA).await.unwrap();
+
+    let seed: String = (1..=40)
+        .map(|i| format!("{{\"type\":\"Person\",\"data\":{{\"name\":\"p{i}\",\"age\":{i}}}}}\n"))
+        .collect();
+    load_jsonl(&mut db, &seed, LoadMode::Merge).await.unwrap();
+
+    // Same-key updates: Lance Operation::Update rewrites these 15 rows into
+    // new fragments that keep their original stable row ids (the overlap).
+    let updates: String = (1..=15)
+        .map(|i| {
+            format!(
+                "{{\"type\":\"Person\",\"data\":{{\"name\":\"p{i}\",\"age\":{}}}}}\n",
+                100 + i
+            )
+        })
+        .collect();
+    load_jsonl(&mut db, &updates, LoadMode::Merge).await.unwrap();
+
+    // The delete adds a deletion vector, so the overlapping region no longer
+    // densely tiles its id range — the shape lance#7444 choked on.
+    mutate_main(
+        &mut db,
+        MUTATION_QUERIES,
+        "remove_person",
+        &mixed_params(&[("$name", "p20")], &[]),
+    )
+    .await
+    .unwrap();
+
+    // Filtered point lookups must still resolve: an updated row, an
+    // untouched row, and the deleted row (absent), each via the key filter.
+    for (name, expected) in [("p3", vec!["p3"]), ("p30", vec!["p30"]), ("p20", vec![])] {
+        let result = query_main(
+            &mut db,
+            FIND_PERSON_QUERY,
+            "find_person",
+            &mixed_params(&[("$name", name)], &[]),
+        )
+        .await
+        .unwrap_or_else(|e| panic!("filtered read for {name} failed: {e}"));
+        let got = first_column_sorted(&result);
+        assert_eq!(got, expected, "filtered read for {name}");
+    }
+}
+
+/// Isolation control for the regression above: the same load/delete/filtered
+/// read walk WITHOUT same-key updates (append-only merges, disjoint keys)
+/// never produces overlapping row-id ranges and passes on unpatched Lance.
+/// If this one fails alongside the merge-update case, the defect is not the
+/// lance#7444 overlap shape.
+#[tokio::test]
+async fn filtered_read_after_append_and_delete_is_consistent() {
+    let dir = tempfile::tempdir().unwrap();
+    let uri = dir.path().to_str().unwrap();
+    let mut db = Omnigraph::init(uri, TEST_SCHEMA).await.unwrap();
+
+    let seed: String = (1..=40)
+        .map(|i| format!("{{\"type\":\"Person\",\"data\":{{\"name\":\"p{i}\",\"age\":{i}}}}}\n"))
+        .collect();
+    load_jsonl(&mut db, &seed, LoadMode::Merge).await.unwrap();
+
+    // Disjoint keys: plain inserts, no fragment rewrite, no id reuse.
+    let more: String = (41..=55)
+        .map(|i| format!("{{\"type\":\"Person\",\"data\":{{\"name\":\"p{i}\",\"age\":{i}}}}}\n"))
+        .collect();
+    load_jsonl(&mut db, &more, LoadMode::Merge).await.unwrap();
+
+    mutate_main(
+        &mut db,
+        MUTATION_QUERIES,
+        "remove_person",
+        &mixed_params(&[("$name", "p20")], &[]),
+    )
+    .await
+    .unwrap();
+
+    for (name, expected) in [("p3", vec!["p3"]), ("p50", vec!["p50"]), ("p20", vec![])] {
+        let result = query_main(
+            &mut db,
+            FIND_PERSON_QUERY,
+            "find_person",
+            &mixed_params(&[("$name", name)], &[]),
+        )
+        .await
+        .unwrap_or_else(|e| panic!("filtered read for {name} failed: {e}"));
+        let got = first_column_sorted(&result);
+        assert_eq!(got, expected, "filtered read for {name}");
+    }
+}
