@@ -22,6 +22,7 @@ jobs:
     outputs:
       run_full_ci: ${{ steps.filter.outputs.run_full_ci }}
       run_rustfs_ci: ${{ steps.filter.outputs.run_rustfs_ci }}
+      run_upgrade_ci: ${{ steps.filter.outputs.run_upgrade_ci }}
     steps:
       - name: Checkout source
         uses: actions/checkout@v5.0.1
@@ -42,6 +43,7 @@ jobs:
           if [[ "$EVENT_NAME" == "workflow_dispatch" || "$REF_TYPE" == "tag" ]]; then
             echo "run_full_ci=true" >> "$GITHUB_OUTPUT"
             echo "run_rustfs_ci=true" >> "$GITHUB_OUTPUT"
+            echo "run_upgrade_ci=true" >> "$GITHUB_OUTPUT"
             exit 0
           fi
 
@@ -59,6 +61,7 @@ jobs:
           if [[ -z "${base:-}" ]]; then
             echo "run_full_ci=true" >> "$GITHUB_OUTPUT"
             echo "run_rustfs_ci=true" >> "$GITHUB_OUTPUT"
+            echo "run_upgrade_ci=true" >> "$GITHUB_OUTPUT"
             exit 0
           fi
 
@@ -66,11 +69,13 @@ jobs:
           if [[ "${#changed[@]}" -eq 0 ]]; then
             echo "run_full_ci=true" >> "$GITHUB_OUTPUT"
             echo "run_rustfs_ci=true" >> "$GITHUB_OUTPUT"
+            echo "run_upgrade_ci=true" >> "$GITHUB_OUTPUT"
             exit 0
           fi
 
           run_full_ci=false
           run_rustfs_ci=false
+          run_upgrade_ci=false
           for path in "${changed[@]}"; do
             case "$path" in
               *.md|*.mdx|*.txt|*.rst|*.adoc) ;;
@@ -81,6 +86,7 @@ jobs:
 
             if [[ "$EVENT_NAME" != "pull_request" ]]; then
               run_rustfs_ci=true
+              run_upgrade_ci=true
               continue
             fi
 
@@ -96,12 +102,21 @@ jobs:
               crates/omnigraph-server/tests/s3.rs|crates/omnigraph-server/tests/support/*) run_rustfs_ci=true ;;
               crates/omnigraph-cli/tests/system_local.rs) run_rustfs_ci=true ;;
             esac
+
+            case "$path" in
+              crates/omnigraph/src/db/manifest/migrations.rs) run_upgrade_ci=true ;;
+              crates/omnigraph/src/db/manifest/tests.rs) run_upgrade_ci=true ;;
+              crates/omnigraph-cli/tests/crossversion_upgrade.rs) run_upgrade_ci=true ;;
+              crates/omnigraph/src/db/omnigraph/export.rs|crates/omnigraph/src/loader/*) run_upgrade_ci=true ;;
+              docs/user/operations/upgrade.md) run_upgrade_ci=true ;;
+            esac
           done
 
           printf 'Changed files:\n'
           printf '  %s\n' "${changed[@]}"
           echo "run_full_ci=$run_full_ci" >> "$GITHUB_OUTPUT"
           echo "run_rustfs_ci=$run_rustfs_ci" >> "$GITHUB_OUTPUT"
+          echo "run_upgrade_ci=$run_upgrade_ci" >> "$GITHUB_OUTPUT"
 
   check_agents_md:
     name: Check AGENTS.md Links
@@ -407,3 +422,53 @@ jobs:
       - name: Dump RustFS logs on failure
         if: failure()
         run: docker logs rustfs
+
+  crossversion_upgrade:
+    name: Cross-Version Upgrade (v3 → current)
+    # Empirical proof that the strict-single-version refusal works on a GENUINE
+    # old-format graph (not the stamp-rewind stand-in): mint a real internal
+    # schema v3 graph with omnigraph 0.7.2, then assert the current binary
+    # refuses it with the release-named message and that export → init → load
+    # round-trips. `needs: classify_changes` only (not `test`), so it can run on
+    # the PR that touches the upgrade surface. Gated on `run_upgrade_ci`.
+    needs: classify_changes
+    if: needs.classify_changes.outputs.run_upgrade_ci == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    permissions:
+      contents: read
+    env:
+      CARGO_TERM_COLOR: always
+      # The release line that stamped internal schema v3 (any 0.6.2–0.7.2 binary
+      # writes the genuine v3 shape; 0.7.2 is the latest).
+      OLD_OMNIGRAPH_VERSION: "0.7.2"
+    steps:
+      - name: Checkout source
+        uses: actions/checkout@v5.0.1
+
+      - name: Install system dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y protobuf-compiler libprotobuf-dev
+
+      - name: Install Rust stable
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: stable
+
+      - name: Cache Rust build data
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: |
+            . -> target
+
+      - name: Install the old omnigraph binary (the v3 writer)
+        # crates.io has omnigraph-cli@0.7.2 (same Lance 7.0.0 / edition 2024 as
+        # current, so it builds today). Fallback if install ever breaks:
+        # `gh release download v${OLD_OMNIGRAPH_VERSION}` for the prebuilt tarball.
+        run: |
+          cargo install omnigraph-cli --version "${OLD_OMNIGRAPH_VERSION}" --locked --root /tmp/og-old
+          echo "OMNIGRAPH_OLD_BIN=/tmp/og-old/bin/omnigraph" >> "$GITHUB_ENV"
+
+      - name: Run cross-version upgrade test
+        run: cargo test --locked -p omnigraph-cli --test crossversion_upgrade -- --nocapture
