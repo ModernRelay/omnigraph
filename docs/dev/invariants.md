@@ -198,6 +198,17 @@ them explicit.
   removed. (`delete` is no longer a residual — staged in MR-A. D2 is not a gap:
   it is a deliberate constructive-XOR-destructive boundary, documented in
   Invariant 4 and the truth matrix.)
+- **Vendored lance-table pin (lance#7480):** `lance-table` 7.0.0 resolves to
+  `vendor/lance-table` via `[patch.crates-io]` — the pristine published source
+  plus ONLY the lance#7480 `rowids/index.rs` hunk, without which any filtered
+  read on a table that was merge-updated and then delete-touched fails
+  (lance#7444; `iss-merge-rowid-overlap-corrupts-filtered-reads`). The fix
+  ships in no Lance release ≤ 8.0.0. Remove the vendor dir + patch entry at
+  the first bump whose `lance-table` carries the fix (9.0.0, or a backported
+  8.0.1); `lance_surface_guards.rs::filtered_scan_tolerates_merge_update_row_id_overlap`
+  turns red if the pin is dropped early or a bump regresses it. See the
+  2026-07-02 stanza in [lance.md](lance.md) and
+  `vendor/lance-table/README.omnigraph.md`.
 - **Blob-column compaction:** Lance `compact_files` mis-decodes blob-v2 columns
   under its forced `BlobHandling::AllBinary` read ("more fields in the schema
   than provided column indices"), so `optimize` skips any table with a `Blob`
