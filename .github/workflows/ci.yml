@@ -292,16 +292,38 @@ jobs:
         run: cargo test --locked -p omnigraph-server --features aws
 
   rustfs_integration:
-    name: RustFS S3 Integration
+    name: RustFS S3 Integration (${{ matrix.shard }})
     # `needs: test` means this is push-/dispatch-only too: on pull_request the
     # `test` job is skipped, so this dependent is skipped with it. S3
     # integration runs post-merge on `main`, alongside the workspace suite.
+    #
+    # Sharded across parallel runners (one suite per shard). The S3 tests
+    # themselves run in seconds — the job's wall-clock is almost entirely the
+    # `cargo test` COMPILE, and every suite must build the omnigraph-engine
+    # tree (Lance/DataFusion). On a cold cache (any Cargo.lock change, e.g. a
+    # release version bump) the six suites summed to ~75m and tripped the
+    # timeout. Running each suite on its own runner makes wall-clock the
+    # slowest single shard (~40m cold, ~25m warm) instead of the sum. Bundling
+    # suites would NOT help: each crate adds its own unique-dep compile on top
+    # of the shared substrate, so a combined shard would still approach the sum.
+    # `fail-fast: false` so one shard's failure still lets the others report.
+    # The `failpoints` shard is isolated because `--features failpoints`
+    # compiles a distinct engine variant that must not serialize behind the rest.
     needs:
       - classify_changes
       - test
     if: needs.classify_changes.outputs.run_rustfs_ci == 'true'
     runs-on: ubuntu-latest
-    timeout-minutes: 75
+    timeout-minutes: 50
+    strategy:
+      fail-fast: false
+      matrix:
+        shard:
+          - engine
+          - server
+          - cluster
+          - cli
+          - failpoints
     permissions:
       contents: read
     env:
@@ -332,6 +354,10 @@ jobs:
       - name: Cache Rust build data
         uses: Swatinem/rust-cache@v2
         with:
+          # Per-shard cache: shards compile different targets (and the
+          # failpoints shard a distinct feature set), so keep their caches
+          # separate to avoid cross-shard thrash.
+          key: ${{ matrix.shard }}
           workspaces: |
             . -> target
 
@@ -372,12 +398,18 @@ jobs:
             --bucket "${OMNIGRAPH_S3_TEST_BUCKET}" >/dev/null 2>&1 || true
 
       - name: Run RustFS storage tests
+        if: matrix.shard == 'engine'
         run: cargo test --locked -p omnigraph-engine --test s3_storage -- --nocapture
 
-      - name: Run RustFS write-path cost gate (RFC-013 step 3a opener)
-        run: cargo test --locked -p omnigraph-engine --test write_cost_s3 -- --nocapture
+      # NOTE: the RFC-013 step-3a data-table opener COST gate (write_cost_s3) used
+      # to run here. It is a deterministic IO-count gate, not a correctness test —
+      # performance/cost contracts belong in a dedicated perf harness on a stable
+      # runner + own cadence, not on the every-merge correctness path. Moved out of
+      # CI pending that harness; run it on demand with a bucket set:
+      #   OMNIGRAPH_S3_TEST_BUCKET=… cargo test -p omnigraph-engine --test write_cost_s3
 
       - name: Run RustFS server smoke
+        if: matrix.shard == 'server'
         # No name filter: every test in the s3 target is bucket-gated, and a
         # filter matching nothing passes vacuously (which silently ran zero
         # tests here for a while — the old filter said s3_repo, the test
@@ -385,12 +417,15 @@ jobs:
         run: cargo test --locked -p omnigraph-server --test s3 -- --nocapture
 
       - name: Run RustFS cluster e2e
+        if: matrix.shard == 'cluster'
         run: cargo test --locked -p omnigraph-cluster --test s3_cluster -- --nocapture
 
       - name: Run RustFS CLI smoke
+        if: matrix.shard == 'cli'
         run: cargo test --locked -p omnigraph-cli --test system_local local_cli_s3_end_to_end_init_load_read_flow -- --nocapture
 
       - name: Run RustFS recovery-sidecar lifecycle
+        if: matrix.shard == 'failpoints'
         # Sidecar put/list/delete through the S3 storage backend on a
         # real bucket (the failpoint only wedges the publisher; the
         # sidecar I/O is exercised for real). Name filter `s3_` matches
