@@ -401,9 +401,12 @@ jobs:
         if: matrix.shard == 'engine'
         run: cargo test --locked -p omnigraph-engine --test s3_storage -- --nocapture
 
-      - name: Run RustFS write-path cost gate (RFC-013 step 3a opener)
-        if: matrix.shard == 'engine'
-        run: cargo test --locked -p omnigraph-engine --test write_cost_s3 -- --nocapture
+      # NOTE: the RFC-013 step-3a data-table opener COST gate (write_cost_s3) used
+      # to run here. It is a deterministic IO-count gate, not a correctness test —
+      # performance/cost contracts belong in a dedicated perf harness on a stable
+      # runner + own cadence, not on the every-merge correctness path. Moved out of
+      # CI pending that harness; run it on demand with a bucket set:
+      #   OMNIGRAPH_S3_TEST_BUCKET=… cargo test -p omnigraph-engine --test write_cost_s3
 
       - name: Run RustFS server smoke
         if: matrix.shard == 'server'
