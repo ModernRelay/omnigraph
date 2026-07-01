@@ -1016,9 +1016,20 @@ async fn recovery_rolls_forward_load_overwrite() {
 
     {
         let mut db = Omnigraph::init(&uri, helpers::TEST_SCHEMA).await.unwrap();
-        load_jsonl(&mut db, helpers::TEST_DATA, LoadMode::Overwrite)
-            .await
-            .unwrap();
+        // Seed Persons only (no edges): the fault-injected step below overwrites
+        // node:Person down to a single row, and a per-table overwrite that drops
+        // Persons referenced by seeded Knows/WorksAt edges is now rejected as an
+        // orphan during validation — before it ever reaches the post-finalize
+        // failpoint this test drives. Keeping the seed edge-free makes the
+        // overwrite a clean single-table roll-forward, which is what's under test.
+        load_jsonl(
+            &mut db,
+            "{\"type\":\"Person\",\"data\":{\"name\":\"Alice\",\"age\":30}}\n\
+             {\"type\":\"Person\",\"data\":{\"name\":\"Bob\",\"age\":31}}\n",
+            LoadMode::Overwrite,
+        )
+        .await
+        .unwrap();
         parent_commit_id = branch_head_commit_id(dir.path(), "main").await.unwrap();
 
         let _failpoint = ScopedFailPoint::new(names::MUTATION_POST_FINALIZE_PRE_PUBLISHER, "return");
