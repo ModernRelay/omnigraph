@@ -1136,3 +1136,109 @@ async fn camelcase_index_equality_routes_to_scalar_index() {
          for camelCase index routing. got plan:\n{err:?}"
     );
 }
+
+// --- Guard: filtered scans tolerate merge_insert's overlapping row-id ranges
+//     (lance#7444, fixed by lance#7480; consumed via the vendored lance-table
+//     patch) -------------------------------------------------------------
+//
+// An update-style merge_insert over a fragment that was itself merge-written
+// reuses the updated rows' stable row ids in its rewritten fragments (row-id
+// lineage spec: updates preserve `_rowid`) while the superseded fragment keeps
+// its full id sequence plus a deletion vector — legal, overlapping
+// cross-fragment id ranges. A later delete leaves the overlap sparsely tiled;
+// unpatched lance-table 7.0.0's `RowIdIndex::new` asserted dense tiling and
+// failed any filtered read that builds the id→address map: "Wrong range"
+// debug assert, "all columns in a record batch must have the same length" (or
+// a silently-wrong batch) in release. Faithful transcription of lance#7444's
+// minimal repro: merge-seed → merge-update → delete → filter + with_row_id.
+// This guard turns red if a Lance bump regresses the fix, or if the vendored
+// patch is dropped before the pinned lance-table ships lance#7480.
+#[tokio::test]
+async fn filtered_scan_tolerates_merge_update_row_id_overlap() {
+    use futures::TryStreamExt;
+
+    let dir = tempfile::tempdir().unwrap();
+    let uri = dir.path().to_str().unwrap();
+
+    let schema = Arc::new(Schema::new(vec![
+        Field::new("slug", DataType::Utf8, false),
+        Field::new("title", DataType::Utf8, false),
+    ]));
+    let mk_batch = |slugs: Vec<String>, titles: Vec<String>| {
+        RecordBatch::try_new(
+            schema.clone(),
+            vec![
+                Arc::new(StringArray::from(slugs)) as arrow_array::ArrayRef,
+                Arc::new(StringArray::from(titles)) as arrow_array::ArrayRef,
+            ],
+        )
+        .unwrap()
+    };
+
+    // Empty dataset WITH stable row ids; both data writes are merge_inserts
+    // (merge-on-merge is lance#7444's trigger qualifier — a plain
+    // Dataset::write seed does not reproduce).
+    let empty = mk_batch(Vec::new(), Vec::new());
+    let reader = RecordBatchIterator::new(vec![Ok(empty)], schema.clone());
+    let params = WriteParams {
+        mode: WriteMode::Create,
+        enable_stable_row_ids: true,
+        data_storage_version: Some(LanceFileVersion::V2_2),
+        ..Default::default()
+    };
+    let ds = Dataset::write(reader, uri, Some(params)).await.unwrap();
+
+    let merge = |ds: Dataset, batch: RecordBatch, schema: Arc<Schema>| async move {
+        let job = MergeInsertBuilder::try_new(Arc::new(ds), vec!["slug".to_string()])
+            .unwrap()
+            .when_matched(WhenMatched::UpdateAll)
+            .when_not_matched(WhenNotMatched::InsertAll)
+            .try_build()
+            .unwrap();
+        let source = RecordBatchIterator::new(vec![Ok(batch)], schema);
+        let (ds, _stats) = job.execute_reader(source).await.unwrap();
+        (*ds).clone()
+    };
+
+    // Merge #1 seeds 40 rows; merge #2 rewrites 15 of them (keeping their
+    // stable ids — the overlap with the merge-written seed fragment).
+    let seed = mk_batch(
+        (1..=40).map(|i| format!("t{i}")).collect(),
+        (1..=40).map(|i| format!("r{i}")).collect(),
+    );
+    let ds = merge(ds, seed, schema.clone()).await;
+    let updates = mk_batch(
+        (1..=15).map(|i| format!("t{i}")).collect(),
+        (1..=15).map(|i| format!("e{i}")).collect(),
+    );
+    let ds = Arc::new(merge(ds, updates, schema.clone()).await);
+
+    // The delete's deletion vector makes the overlapping id region sparse.
+    let staged = lance::dataset::DeleteBuilder::new(ds.clone(), "slug = 't20'")
+        .execute_uncommitted()
+        .await
+        .unwrap();
+    assert_eq!(staged.num_deleted_rows, 1, "expected exactly t20 deleted");
+    let ds = CommitBuilder::new(ds)
+        .execute(staged.transaction)
+        .await
+        .unwrap();
+
+    // filter + with_row_id forces the RowIdIndex build (a full scan does
+    // not). On the broken index this errors/panics; on the fixed one every
+    // live id resolves.
+    for (slug, expected) in [("t3", 1usize), ("t20", 0usize)] {
+        let mut scan = ds.scan();
+        scan.with_row_id();
+        scan.filter(&format!("slug = '{slug}'")).unwrap();
+        let batches: Vec<RecordBatch> = scan
+            .try_into_stream()
+            .await
+            .unwrap()
+            .try_collect()
+            .await
+            .unwrap();
+        let rows: usize = batches.iter().map(|b| b.num_rows()).sum();
+        assert_eq!(rows, expected, "filtered read for {slug}");
+    }
+}
