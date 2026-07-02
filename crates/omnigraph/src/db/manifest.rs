@@ -47,7 +47,7 @@ pub use state::SubTableEntry;
 pub(crate) use state::{GraphLineageRow, read_graph_lineage};
 #[cfg(test)]
 use state::string_column;
-use state::{ManifestState, read_manifest_state, warm_publish_inputs};
+use state::{ManifestState, read_manifest_state};
 
 /// The internal-schema (storage-format) version this binary writes and reads.
 /// A graph's on-disk per-branch stamp is read via [`internal_schema_stamp_at`];
@@ -524,17 +524,20 @@ impl ManifestCoordinator {
             .probe_latest_incarnation()
             .await?
             .matches(&self.incarnation());
-        let warm_inputs = warm_fresh.then(|| warm_publish_inputs(&self.known_state));
+        let warm_inputs = warm_fresh.then(|| self.known_state.publish_inputs());
 
         let outcome = {
-            let warm = warm_inputs.as_ref().map(|(registered_tables, existing_versions)| {
-                publisher::WarmAttempt {
-                    dataset: &self.dataset,
-                    registered_tables,
-                    existing_versions,
-                    head_hint,
-                }
-            });
+            let warm = warm_inputs.as_ref().map(
+                |(registered_tables, existing_versions, existing_tombstones)| {
+                    publisher::WarmAttempt {
+                        dataset: &self.dataset,
+                        registered_tables,
+                        existing_versions,
+                        existing_tombstones,
+                        head_hint,
+                    }
+                },
+            );
             let plan = PublishPlan {
                 changes,
                 expected_table_versions,

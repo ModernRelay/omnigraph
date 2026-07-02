@@ -146,6 +146,7 @@ pub(crate) struct WarmAttempt<'a> {
     pub(crate) dataset: &'a Dataset,
     pub(crate) registered_tables: &'a HashMap<String, String>,
     pub(crate) existing_versions: &'a HashMap<(String, u64), SubTableEntry>,
+    pub(crate) existing_tombstones: &'a HashMap<(String, u64), ()>,
     pub(crate) head_hint: Option<&'a str>,
 }
 
@@ -163,25 +164,20 @@ impl LoadedPublishState {
     /// (Layer 4), with NO `__manifest` scan; the parent comes from the
     /// head_hint, not scanned lineage rows.
     ///
-    /// CAVEAT — the warm state is the assembled (visible) reduction, so it is
-    /// LOSSIER than a cold scan in two ways the publisher's guards notice: (a)
-    /// `existing_tombstones` is empty (the assembled `known_state` dropped
-    /// tombstoned tables), so the duplicate-tombstone guard in
-    /// `build_pending_rows` is inert on warm attempts — safe today only because
-    /// the sole tombstone-emitting writer (schema apply) is serialized by the
-    /// graph-wide schema-apply lock; (b) `registered_tables` is derived from
-    /// visible entries, so registration-only and tombstoned tables are absent —
-    /// safe today because registrations always ride with their first version
-    /// row and table paths are deterministic. The warm path applies to EVERY
-    /// lineage publish (not only non-strict inserts). Making warm ≡ cold by
-    /// construction (one assembly funnel over a ManifestState that retains
-    /// registrations + tombstones) is the Phase-3.5/A2 follow-up.
+    /// The three maps come from `ManifestState::publish_inputs` — the retained
+    /// registrations + full tombstone pair set reproduce the cold scan's
+    /// `registered_tables`/`existing_tombstones` exactly (same scan columns,
+    /// folded forward per publish), so the publisher's registration and
+    /// duplicate-tombstone guards behave identically on warm and cold
+    /// attempts. The one reduction is `existing_versions` (visible latest per
+    /// table vs cold's full per-version history) — safe because Lance dataset
+    /// versions are strictly monotonic per table; see `publish_inputs`.
     fn from_warm(w: &WarmAttempt<'_>) -> Self {
         LoadedPublishState {
             dataset: w.dataset.clone(),
             registered_tables: w.registered_tables.clone(),
             existing_versions: w.existing_versions.clone(),
-            existing_tombstones: HashMap::new(),
+            existing_tombstones: w.existing_tombstones.clone(),
             lineage: LineageSource::Warm(w.head_hint.map(str::to_string)),
         }
     }
@@ -568,7 +564,7 @@ impl GraphNamespacePublisher {
         existing_tombstones: &HashMap<(String, u64), ()>,
         rows: &[PendingVersionRow],
         registered_tables: &HashMap<String, String>,
-    ) -> Result<(Vec<SubTableEntry>, Vec<(String, u64)>)> {
+    ) -> Result<(Vec<SubTableEntry>, Vec<(String, u64)>, HashMap<String, String>)> {
         let mut table_locations: HashMap<String, String> = registered_tables.clone();
         for row in rows {
             if row.object_type == OBJECT_TYPE_TABLE {
@@ -645,7 +641,7 @@ impl GraphNamespacePublisher {
             }
         }
 
-        Ok((version_map.into_values().collect(), tombstones))
+        Ok((version_map.into_values().collect(), tombstones, table_locations))
     }
 
     /// Compare each caller-supplied expectation against the manifest's current
@@ -871,10 +867,12 @@ impl ManifestBatchPublisher for GraphNamespacePublisher {
             if rows.is_empty() {
                 // Expected-version-only publish with no changes and no lineage:
                 // the precondition held, nothing to write. Fold the unchanged state
-                // from the loaded maps — no re-scan (RFC-013 PR2 #1b).
+                // from the loaded maps — no re-scan (RFC-013 PR2 #1b). No commit
+                // happened, so the dataset's own version is the coupled one.
                 let known_state = assemble_manifest_state(
                     dataset.version().version,
                     existing_versions.values().cloned().collect(),
+                    known_tables,
                     existing_tombstones
                         .keys()
                         .map(|(key, version)| (key.clone(), *version)),
@@ -889,7 +887,7 @@ impl ManifestBatchPublisher for GraphNamespacePublisher {
             // Build the post-publish fold inputs from the pre-publish state ∪ the
             // rows we are about to commit, BEFORE `rows` is moved into merge_rows
             // (RFC-013 PR2 #1b). Recomputed per attempt from freshly-loaded state.
-            let (fold_entries, fold_tombstones) =
+            let (fold_entries, fold_tombstones, fold_registrations) =
                 Self::fold_inputs(&existing_versions, &existing_tombstones, &rows, &known_tables)?;
 
             // Test seam: the load→commit window. A concurrent `__manifest`
@@ -909,6 +907,7 @@ impl ManifestBatchPublisher for GraphNamespacePublisher {
                         base_version,
                         &new_dataset,
                         fold_entries,
+                        fold_registrations,
                         fold_tombstones,
                     )
                     .await?;

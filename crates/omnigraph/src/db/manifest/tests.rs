@@ -1044,6 +1044,68 @@ async fn test_post_publish_fold_reflects_owner_branch_handoff() {
         "warm coordinator's folded known_state diverged from a fresh re-scan after an \
          owner-branch handoff (folded {folded_branch:?} vs scanned {scanned_branch:?})",
     );
+
+    // Funnel parity: the folded state's RETAINED registrations + tombstone
+    // pairs (the warm publish-input sources) must equal a fresh re-scan's, so
+    // a warm attempt's `registered_tables`/`existing_tombstones` are
+    // byte-identical to a cold load's.
+    assert_eq!(
+        experiment_mc.known_state.registrations, reopened.known_state.registrations,
+        "folded registrations diverged from a fresh re-scan",
+    );
+    assert_eq!(
+        experiment_mc.known_state.tombstones, reopened.known_state.tombstones,
+        "folded tombstone pairs diverged from a fresh re-scan",
+    );
+}
+
+/// The duplicate-tombstone guard must behave IDENTICALLY on a warm attempt-0
+/// publish (maps from `ManifestState::publish_inputs`) and a cold one (maps
+/// from the `load_publish_state` scan). Before the state retained tombstones,
+/// the warm attempt saw an empty tombstone map, silently skipped the guard,
+/// and re-published the duplicate row where cold errors.
+#[tokio::test]
+async fn warm_publish_rejects_duplicate_tombstone_like_cold() {
+    let dir = tempfile::tempdir().unwrap();
+    let uri = dir.path().to_str().unwrap();
+    let catalog = build_test_catalog();
+
+    let mut mc = ManifestCoordinator::init(uri, &catalog).await.unwrap();
+    let person_version = mc.snapshot().entry("node:Person").unwrap().table_version;
+    let tombstone = ManifestChange::Tombstone(TableTombstone {
+        table_key: "node:Person".to_string(),
+        tombstone_version: person_version + 1,
+    });
+
+    // First tombstone lands (warm coordinator; the fold retains the pair).
+    mc.commit_changes(std::slice::from_ref(&tombstone))
+        .await
+        .unwrap();
+    assert!(mc.snapshot().entry("node:Person").is_none());
+
+    // WARM duplicate: the same coordinator is fresh (its own commit is the
+    // head), so attempt 0 runs on `publish_inputs`-derived maps — the guard
+    // must fire there, not only on a cold scan.
+    let warm_err = mc
+        .commit_changes(std::slice::from_ref(&tombstone))
+        .await
+        .expect_err("warm duplicate tombstone must be rejected");
+
+    // COLD duplicate: a fresh coordinator's publish loads via the scan.
+    let mut cold_mc = ManifestCoordinator::open(uri).await.unwrap();
+    let cold_err = cold_mc
+        .commit_changes(std::slice::from_ref(&tombstone))
+        .await
+        .expect_err("cold duplicate tombstone must be rejected");
+
+    for (arm, err) in [("warm", &warm_err), ("cold", &cold_err)] {
+        assert!(
+            err.to_string().contains("table tombstone")
+                && err.to_string().contains("already exists"),
+            "{arm} duplicate-tombstone error should be the ConcurrentModification \
+             guard, got: {err}",
+        );
+    }
 }
 
 #[tokio::test]

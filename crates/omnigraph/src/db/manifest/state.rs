@@ -29,6 +29,16 @@ pub struct SubTableEntry {
 pub(super) struct ManifestState {
     pub(super) version: u64,
     pub(super) entries: Vec<SubTableEntry>,
+    /// EVERY registered table's location (the `table` rows) — including
+    /// registration-only and tombstoned tables that the visible `entries`
+    /// exclude. O(tables). Retained so a warm publish attempt reproduces the
+    /// cold scan's `registered_tables` exactly (see
+    /// [`ManifestState::publish_inputs`]).
+    pub(super) registrations: HashMap<String, String>,
+    /// The full `(table_key, tombstone_version)` pair set (the
+    /// `table_tombstone` rows). O(dropped tables). Retained so a warm publish
+    /// attempt reproduces the cold scan's duplicate-tombstone guard exactly.
+    pub(super) tombstones: HashMap<(String, u64), ()>,
 }
 
 #[derive(Debug, Clone)]
@@ -134,6 +144,7 @@ pub(super) async fn read_manifest_state(dataset: &Dataset) -> Result<ManifestSta
     Ok(assemble_manifest_state(
         version,
         scan.version_entries,
+        scan.table_locations,
         scan.tombstones
             .into_iter()
             .map(|t| (t.table_key, t.tombstone_version)),
@@ -163,6 +174,7 @@ pub(super) async fn fold_published_state(
     base_version: u64,
     committed: &Dataset,
     fold_entries: Vec<SubTableEntry>,
+    fold_registrations: HashMap<String, String>,
     fold_tombstones: impl IntoIterator<Item = (String, u64)>,
 ) -> Result<ManifestState> {
     let committed_version = committed.version().version;
@@ -170,10 +182,51 @@ pub(super) async fn fold_published_state(
         return Ok(assemble_manifest_state(
             committed_version,
             fold_entries,
+            fold_registrations,
             fold_tombstones,
         ));
     }
     read_manifest_state(committed).await
+}
+
+impl ManifestState {
+    /// Derive the publisher's per-attempt input maps
+    /// `(registered_tables, existing_versions, existing_tombstones)` from this
+    /// state — the ONE derivation warm publish attempts use (Layer 4), and the
+    /// warm≡cold contract in one place:
+    ///
+    /// - `registered_tables` and `existing_tombstones` come from the retained
+    ///   [`registrations`](Self::registrations)/[`tombstones`](Self::tombstones)
+    ///   fields, which carry the SAME scan columns the cold
+    ///   `load_publish_state` reads (`table_locations` / tombstone rows) — so
+    ///   the publisher's registration and duplicate-tombstone guards behave
+    ///   identically on warm and cold attempts by construction.
+    /// - `existing_versions` is the visible latest-per-table reduction, where
+    ///   a cold scan carries the FULL per-version history. This is the one
+    ///   irreducible difference (retaining every historical pair is
+    ///   O(commits) — the row-accumulation wall the warm path exists to
+    ///   avoid), and it is safe because Lance dataset versions are strictly
+    ///   monotonic per table: a staged commit can never re-mint an old
+    ///   version, so the duplicate-version guard only ever needs the latest
+    ///   pair (which this carries — the owner-branch handoff updates at the
+    ///   current version).
+    pub(super) fn publish_inputs(
+        &self,
+    ) -> (
+        HashMap<String, String>,
+        HashMap<(String, u64), SubTableEntry>,
+        HashMap<(String, u64), ()>,
+    ) {
+        let mut existing_versions = HashMap::with_capacity(self.entries.len());
+        for entry in &self.entries {
+            existing_versions.insert((entry.table_key.clone(), entry.table_version), entry.clone());
+        }
+        (
+            self.registrations.clone(),
+            existing_versions,
+            self.tombstones.clone(),
+        )
+    }
 }
 
 /// Reduce raw manifest rows to the visible per-table state: keep the latest
@@ -184,33 +237,15 @@ pub(super) async fn fold_published_state(
 /// CANNOT diverge in the dedup/filter/sort — the byte-identity the fold relies on.
 /// Tombstones are passed as `(table_key, tombstone_version)` tuples so callers
 /// outside this module need not name the private `TableTombstoneEntry`.
-/// Derive the publisher's raw `(registered_tables, existing_versions)` maps from
-/// the assembled `known_state`, for a WARM publish attempt 0 (Layer 4). This is
-/// the inverse of [`assemble_manifest_state`] for the un-tombstoned happy path:
-/// the assembled state is latest-per-table, which is exactly what the publish
-/// logic reduces to (`latest_visible_per_table` / `check_expected_table_versions`
-/// / `fold_inputs` → `assemble_manifest_state`), so a warm attempt built from
-/// these maps is byte-equivalent to a cold `__manifest` scan for a non-strict
-/// insert. Tombstones were already dropped by `assemble_manifest_state`, so the
-/// warm path's `existing_tombstones` is empty by construction.
-pub(super) fn warm_publish_inputs(
-    state: &ManifestState,
-) -> (
-    HashMap<String, String>,
-    HashMap<(String, u64), SubTableEntry>,
-) {
-    let mut registered_tables = HashMap::with_capacity(state.entries.len());
-    let mut existing_versions = HashMap::with_capacity(state.entries.len());
-    for entry in &state.entries {
-        registered_tables.insert(entry.table_key.clone(), entry.table_path.clone());
-        existing_versions.insert((entry.table_key.clone(), entry.table_version), entry.clone());
-    }
-    (registered_tables, existing_versions)
-}
-
+///
+/// `registrations` (every `table` row's location) and the full tombstone pair
+/// set are RETAINED on the state — not consumed and dropped — so a warm publish
+/// attempt derived from it ([`ManifestState::publish_inputs`]) reproduces the
+/// cold scan's `registered_tables`/`existing_tombstones` exactly.
 pub(super) fn assemble_manifest_state(
     version: u64,
     version_entries: Vec<SubTableEntry>,
+    registrations: HashMap<String, String>,
     tombstones: impl IntoIterator<Item = (String, u64)>,
 ) -> ManifestState {
     let mut latest_versions = HashMap::<String, SubTableEntry>::new();
@@ -223,8 +258,10 @@ pub(super) fn assemble_manifest_state(
         }
     }
 
+    let mut tombstone_pairs = HashMap::<(String, u64), ()>::new();
     let mut tombstone_map = HashMap::<String, u64>::new();
     for (table_key, tombstone_version) in tombstones {
+        tombstone_pairs.insert((table_key.clone(), tombstone_version), ());
         match tombstone_map.get(&table_key) {
             Some(existing) if *existing >= tombstone_version => {}
             _ => {
@@ -243,7 +280,12 @@ pub(super) fn assemble_manifest_state(
         })
         .collect();
     entries.sort_by(|a, b| a.table_key.cmp(&b.table_key));
-    ManifestState { version, entries }
+    ManifestState {
+        version,
+        entries,
+        registrations,
+        tombstones: tombstone_pairs,
+    }
 }
 
 // After RFC-013 P2 folded the publish path off this accessor (it now projects
