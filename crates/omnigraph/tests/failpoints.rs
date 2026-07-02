@@ -772,6 +772,36 @@ async fn publish_fold_rederives_after_disjoint_manifest_rebase() {
          `__manifest` commit and folded stale inputs instead of re-deriving",
         stale_snap.version(),
     );
+
+    // The DURABLE lineage row must also carry the landed version. The victim's
+    // commit is the branch tip; its recorded manifest_version must equal the
+    // committed manifest version — a lineage row recording the pre-rebase
+    // prediction would make `snapshot_at`/time-travel for this commit resolve a
+    // version that EXCLUDES the commit's own writes.
+    let commits = fresh
+        .writer(0)
+        .db()
+        .list_commits(Some("main"))
+        .await
+        .unwrap();
+    let tip = commits
+        .iter()
+        .max_by(|a, b| {
+            (a.manifest_version, a.created_at, &a.graph_commit_id).cmp(&(
+                b.manifest_version,
+                b.created_at,
+                &b.graph_commit_id,
+            ))
+        })
+        .expect("lineage has commits");
+    assert_eq!(
+        tip.manifest_version,
+        fresh_snap.version(),
+        "the victim commit's durable lineage row records manifest_version {} but the \
+         commit landed at {} — the pre-commit prediction survived a disjoint rebase",
+        tip.manifest_version,
+        fresh_snap.version(),
+    );
 }
 
 #[tokio::test(flavor = "multi_thread")]
