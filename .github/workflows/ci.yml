@@ -8,6 +8,13 @@ on:
     tags:
       - "v*"
   workflow_dispatch:
+  schedule:
+    # Nightly backstop (07:00 UTC): re-runs the full suite + every RustFS shard
+    # (including the S3 cost gates) so a regression that slipped through a CI
+    # outage or a post-merge-only path still surfaces within a day. A schedule
+    # event has no `before` SHA, so `classify_changes` short-circuits to
+    # run_full_ci=true + run_rustfs_ci=true — no classifier changes needed.
+    - cron: "0 7 * * *"
 
 concurrency:
   group: ci-${{ github.workflow }}-${{ github.ref }}
@@ -324,6 +331,7 @@ jobs:
           - cluster
           - cli
           - failpoints
+          - cost
     permissions:
       contents: read
     env:
@@ -401,12 +409,21 @@ jobs:
         if: matrix.shard == 'engine'
         run: cargo test --locked -p omnigraph-engine --test s3_storage -- --nocapture
 
-      # NOTE: the RFC-013 step-3a data-table opener COST gate (write_cost_s3) used
-      # to run here. It is a deterministic IO-count gate, not a correctness test —
-      # performance/cost contracts belong in a dedicated perf harness on a stable
-      # runner + own cadence, not on the every-merge correctness path. Moved out of
-      # CI pending that harness; run it on demand with a bucket set:
-      #   OMNIGRAPH_S3_TEST_BUCKET=… cargo test -p omnigraph-engine --test write_cost_s3
+      - name: Run RustFS write-cost gates
+        if: matrix.shard == 'cost'
+        # The S3 cost gates (write_cost_s3): deterministic IO-COUNT assertions
+        # (LIST counts, round-trips, opener reads — flat across commit depth,
+        # under measured ceilings, above non-vacuity floors), NOT wall-clock.
+        # Deterministic counts are tests, not telemetry, so this shard FAILS on
+        # regression — the same discipline as Lance, which hard-fails its
+        # S3-against-localstack `assert_io_eq!` commit-IOPS tests in ordinary
+        # CI; only wall-clock benches belong on nightly-trend infrastructure
+        # (bencher/github-action-benchmark), which exists to manage timing
+        # noise that exact counts don't have. Runs post-merge on main +
+        # workflow_dispatch + the nightly cron (like every shard here — the
+        # cost is the ~25-40m engine compile, not the seconds of tests), so a
+        # regressing commit is identified at one-commit granularity on main.
+        run: cargo test --locked -p omnigraph-engine --test write_cost_s3 -- --nocapture
 
       - name: Run RustFS server smoke
         if: matrix.shard == 'server'
