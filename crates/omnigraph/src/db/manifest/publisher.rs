@@ -36,8 +36,8 @@ use super::metadata::{TableVersionMetadata, parse_namespace_version_request};
 use super::migrations::{read_stamp, refuse_if_stamp_unsupported};
 use super::state::{
     GraphLineageRow, GraphLineageRowPart, ManifestState, assemble_manifest_state,
-    graph_lineage_row_parts, head_lineage_row, manifest_rows_batch, manifest_schema,
-    read_manifest_state, read_publish_scan,
+    fold_published_state, graph_lineage_row_parts, head_lineage_row, manifest_rows_batch,
+    manifest_schema, read_manifest_state, read_publish_scan,
 };
 use super::{
     ManifestChange, OBJECT_TYPE_TABLE, OBJECT_TYPE_TABLE_TOMBSTONE, OBJECT_TYPE_TABLE_VERSION,
@@ -876,13 +876,20 @@ impl ManifestBatchPublisher for GraphNamespacePublisher {
             // committed version (no-op without the `failpoints` feature).
             crate::failpoints::maybe_fail(crate::failpoints::names::PUBLISH_BEFORE_MERGE_ROWS)?;
 
+            let base_version = dataset.version().version;
             match self.merge_rows(dataset, rows).await {
                 Ok(new_dataset) => {
-                    let known_state = assemble_manifest_state(
-                        new_dataset.version().version,
+                    // Version-coupled fold: folds when the commit landed at
+                    // exactly base+1, re-scans the committed handle when Lance
+                    // rebased past a concurrent disjoint commit (whose rows the
+                    // fold inputs cannot contain). See `fold_published_state`.
+                    let known_state = fold_published_state(
+                        base_version,
+                        &new_dataset,
                         fold_entries,
                         fold_tombstones,
-                    );
+                    )
+                    .await?;
                     return Ok(PublishOutcome {
                         dataset: new_dataset,
                         parent_commit_id,

@@ -140,6 +140,42 @@ pub(super) async fn read_manifest_state(dataset: &Dataset) -> Result<ManifestSta
     ))
 }
 
+/// Fold a publish's outcome onto its base — the ONLY constructor for a
+/// `ManifestState` derived from pre-commit fold inputs (Lance's
+/// `Transaction { read_version, operation }` shape: the version is COUPLED to
+/// the content it was derived from, never a free parameter).
+///
+/// A publish's merge-insert advances exactly one version on top of its loaded
+/// base. If the committed dataset landed anywhere else, Lance internally
+/// REBASED the merge-insert past one or more concurrent *disjoint* `__manifest`
+/// commits (same-`object_id` writers collide on the unenforced-PK bloom and
+/// surface as retryable conflicts instead; see `merge_rows`) — so the
+/// pre-computed fold inputs are stale for the committed version: they cannot
+/// contain the interleaved commits' rows. Fail closed to a re-scan of the
+/// committed handle, which reads exactly the rows the commit made visible.
+/// Every logical writer today rides the lineage rows and collides rather than
+/// rebases, and the one production disjoint racer (internal-table compaction)
+/// is content-preserving — but head-pointer-style manifest rows (the
+/// unlimited-history plan's U2) make the rebase logical, and this constructor
+/// is what keeps `known_state` correct by construction when they land. Pinned
+/// by `failpoints.rs::publish_fold_rederives_after_disjoint_manifest_rebase`.
+pub(super) async fn fold_published_state(
+    base_version: u64,
+    committed: &Dataset,
+    fold_entries: Vec<SubTableEntry>,
+    fold_tombstones: impl IntoIterator<Item = (String, u64)>,
+) -> Result<ManifestState> {
+    let committed_version = committed.version().version;
+    if committed_version == base_version + 1 {
+        return Ok(assemble_manifest_state(
+            committed_version,
+            fold_entries,
+            fold_tombstones,
+        ));
+    }
+    read_manifest_state(committed).await
+}
+
 /// Reduce raw manifest rows to the visible per-table state: keep the latest
 /// `table_version` per `table_key`, drop any whose latest version is sealed by a
 /// tombstone (`tombstone_version >= table_version`), then sort by `table_key` for
