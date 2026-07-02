@@ -19,6 +19,7 @@ demo/*.omni/
 /docs/internal
 
 # Local-only working files (not for the public repo)
+/archived/
 .claude/
 .worktrees/
 /CLAUDE.md
