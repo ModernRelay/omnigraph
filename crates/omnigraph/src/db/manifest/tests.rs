@@ -2306,3 +2306,136 @@ async fn n_concurrent_disjoint_writers_converge_to_one_linear_chain() {
     // The final DAG is a single linear chain of genesis + 8 = 9, no fork.
     assert_linear_chain(uri, N + 1).await;
 }
+
+/// After a publish that resolved its parent COLD (the freshness probe detected
+/// a foreign advance, so attempt 0 scanned `__manifest`), the coordinator's
+/// in-memory commit cache must contain the FOREIGN commit it reparented onto —
+/// not just its own commit with a dangling parent id. The publisher's cold scan
+/// already materialized every lineage row; feeding them back through the
+/// publish outcome is what keeps a warm handle's cache chain-complete with
+/// zero extra IO (`GraphCoordinator::list_commits` serves the cache).
+#[tokio::test]
+async fn cold_reparent_feeds_foreign_commit_into_warm_cache() {
+    use crate::db::graph_coordinator::GraphCoordinator;
+    use crate::storage::storage_for_uri;
+
+    let dir = tempfile::tempdir().unwrap();
+    let uri = dir.path().to_str().unwrap();
+    let catalog = build_test_catalog();
+    let storage = storage_for_uri(uri).unwrap();
+
+    // Two INDEPENDENT coordinators (separate manifest handles + commit caches).
+    let mut a = GraphCoordinator::init(uri, &catalog, storage.clone())
+        .await
+        .unwrap();
+
+    // A real Person version bump a coordinator can publish: append a row to the
+    // Person dataset and describe the resulting version.
+    let person_path = {
+        let mc = ManifestCoordinator::open(uri).await.unwrap();
+        mc.snapshot().entry("node:Person").unwrap().table_path.clone()
+    };
+    let person_uri = format!("{}/{}", uri, person_path);
+    let bump_person = |name: &'static str| {
+        let person_uri = person_uri.clone();
+        let person_path = person_path.clone();
+        let root = uri.to_string();
+        async move {
+            let mut ds = Dataset::open(&person_uri).await.unwrap();
+            let schema = Arc::new(ds.schema().into());
+            let batch = RecordBatch::try_new(
+                Arc::clone(&schema),
+                vec![
+                    Arc::new(StringArray::from(vec![name])),
+                    Arc::new(StringArray::from(vec![name])),
+                    Arc::new(Int32Array::from(vec![Some(30)])),
+                ],
+            )
+            .unwrap();
+            let reader = RecordBatchIterator::new(vec![Ok(batch)], schema);
+            ds.append(reader, None).await.unwrap();
+            let version = ds.version().version;
+            let metadata =
+                table_version_metadata_for_state(&root, &person_path, None, version)
+                    .await
+                    .unwrap();
+            (version, metadata)
+        }
+    };
+
+    // Warm A up with a commit of its own FIRST: its cache head then sits at
+    // exactly its manifest handle's version, so `warm_head_hint` has no reason
+    // to refresh the cache on the next publish — isolating the publish-path
+    // feedback under test from the hint's catch-up refresh (which fires when
+    // the cache head's version and the handle's version disagree, e.g. right
+    // after init, where the genesis commit predates the config-stamp commits).
+    let (v_a1, meta_a1) = bump_person("a-warmup").await;
+    a.commit_updates_with_actor(
+        &[SubTableUpdate {
+            table_key: "node:Person".to_string(),
+            table_version: v_a1,
+            table_branch: None,
+            row_count: 1,
+            version_metadata: meta_a1,
+        }],
+        Some("act-a"),
+    )
+    .await
+    .unwrap();
+
+    // B (opened fresh, sees A's warm-up) commits: A's warm state — manifest
+    // handle AND commit cache, mutually consistent — is now behind the disk head.
+    let mut b = GraphCoordinator::open(uri, storage.clone()).await.unwrap();
+    let (v_b, meta_b) = bump_person("b-row").await;
+    b.commit_updates_with_actor(
+        &[SubTableUpdate {
+            table_key: "node:Person".to_string(),
+            table_version: v_b,
+            table_branch: None,
+            row_count: 1,
+            version_metadata: meta_b,
+        }],
+        Some("act-b"),
+    )
+    .await
+    .unwrap();
+    let b_commits = b.list_commits().await.unwrap();
+    let b_tip = b_commits
+        .last()
+        .expect("B has commits")
+        .graph_commit_id
+        .clone();
+
+    // A commits next: its freshness probe detects B's advance, so attempt 0
+    // loads COLD — the scan reads B's commit row and A reparents onto it.
+    let (v_a, meta_a) = bump_person("a-row").await;
+    a.commit_updates_with_actor(
+        &[SubTableUpdate {
+            table_key: "node:Person".to_string(),
+            table_version: v_a,
+            table_branch: None,
+            row_count: 2,
+            version_metadata: meta_a,
+        }],
+        Some("act-a"),
+    )
+    .await
+    .unwrap();
+
+    // A's WARM cache (list_commits serves it — no re-read) must be
+    // chain-complete: its own tip parents off B's commit, AND B's commit row
+    // itself is present.
+    let a_commits = a.list_commits().await.unwrap();
+    let a_tip = a_commits.last().expect("A has commits");
+    assert_eq!(
+        a_tip.parent_commit_id.as_deref(),
+        Some(b_tip.as_str()),
+        "A's commit must parent off B's (the cold-resolved head)",
+    );
+    assert!(
+        a_commits.iter().any(|c| c.graph_commit_id == b_tip),
+        "A's warm commit cache is missing the foreign parent {b_tip} it \
+         reparented onto — the publisher's cold scan read that row and must \
+         feed it back to the cache (dangling-parent chain otherwise)",
+    );
+}
