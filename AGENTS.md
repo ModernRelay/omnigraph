@@ -103,6 +103,7 @@ Full diagram and concurrency model: [docs/dev/architecture.md](docs/dev/architec
 | Error taxonomy and result serialization | [docs/user/operations/errors.md](docs/user/operations/errors.md) |
 | Install (binary / Homebrew / source / channels) | [docs/user/install.md](docs/user/install.md) |
 | Deployment (binary / container / S3-local testing / auth / build variants) | [docs/user/deployment.md](docs/user/deployment.md) |
+| Task guides (hybrid search, cluster on S3, review workflow) | [docs/user/guides/index.md](docs/user/guides/index.md) |
 | CI / release workflows | [docs/dev/ci.md](docs/dev/ci.md) |
 | Branch protection policy (declarative, applied via `scripts/apply-branch-protection.sh`) | [docs/dev/branch-protection.md](docs/dev/branch-protection.md) |
 | Constants & tunables cheat sheet | [docs/user/reference/constants.md](docs/user/reference/constants.md) |
