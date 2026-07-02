@@ -4928,6 +4928,7 @@ dependencies = [
  "arrow-array",
  "async-trait",
  "futures",
+ "lance",
  "omnigraph-compiler",
  "omnigraph-engine",
  "serde_json",

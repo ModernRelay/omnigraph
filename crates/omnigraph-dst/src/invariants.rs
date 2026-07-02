@@ -42,22 +42,26 @@ impl Finding {
     }
 }
 
-/// Shared engine-error classifier core: known-bug match on a (variant, message)
-/// pair. `is_manifest` gates RC-1 to the `OmniError::Manifest` variant when the
-/// variant is known (embedded); the CLI path passes the message only.
-fn classify_engine_signal(is_manifest: bool, s: &str) -> Option<&'static str> {
-    // RC-1: edge-table HEAD/manifest drift from the node-delete cascade. Two
-    // surfaces of the same root: the write-time CAS "stale view", and a LATER
-    // write's precondition refusing the uncovered drift ("ahead of manifest …").
-    if is_manifest
-        && (s.contains("stale view")
-            || (s.contains("expected") && s.contains("current"))
-            || s.contains("ahead of manifest version"))
-    {
-        return Some("RC-1 stale-view");
+/// Classify an EMBEDDED engine error on its TYPED shape — never generic
+/// substrings. RC-1's write-time surface is a manifest conflict carrying
+/// structured `ExpectedVersionMismatch` details; its read-your-drift surface
+/// (a later write's precondition refusing uncovered drift) has no structured
+/// details yet, so it keeps its one distinctive message. A generic
+/// `"expected" + "current"` substring pair would also match novel stale-cache
+/// and publisher-CAS bugs and let the harness walk past a real regression.
+fn classify_engine_error(e: &OmniError) -> Option<&'static str> {
+    if let OmniError::Manifest(m) = e {
+        if matches!(
+            m.details,
+            Some(omnigraph::error::ManifestConflictDetails::ExpectedVersionMismatch { .. })
+        ) || m.message.contains("ahead of manifest version")
+        {
+            return Some("RC-1 stale-view");
+        }
     }
     // RC-X / Lance #7230: scalar-BTREE duplicate row addresses. The Lance
     // internal panic string is highly specific (near-zero false positive).
+    let s = e.to_string();
     if s.contains("from_sorted_iter") || s.contains("non-sorted input") {
         return Some("RC-X/#7230 scalar-BTREE");
     }
@@ -68,7 +72,7 @@ fn classify_engine_signal(is_manifest: bool, s: &str) -> Option<&'static str> {
 /// allow-list (so the walk explores past it), else `None` (= NOVEL → fail).
 pub fn classify(f: &Finding) -> Option<&'static str> {
     match f {
-        Finding::Engine(e) => classify_engine_signal(matches!(e, OmniError::Manifest(_)), &e.to_string()),
+        Finding::Engine(e) => classify_engine_error(e),
         // Structural divergences are novel by default, with ONE narrow
         // exception: dup-`@key` (MR-714) is a known open bug.
         Finding::Logical(s) => {
@@ -82,14 +86,12 @@ pub fn classify(f: &Finding) -> Option<&'static str> {
 }
 
 /// Classify a backend op error the same KNOWN-vs-NOVEL way as `classify`. The
-/// embedded arm keeps the `OmniError::Manifest` variant gate; the CLI arm has
-/// only stderr text, so it matches the (distinctive) RC-1/RC-X/dup-@key strings
-/// directly — acceptable given how specific those messages are.
+/// embedded arm matches the TYPED error; the CLI arm has only stderr text, so
+/// it matches the (distinctive) RC-1/RC-X/dup-@key strings directly —
+/// acceptable given how specific those messages are.
 pub fn classify_backend(e: &BackendError) -> Option<&'static str> {
     match e {
-        BackendError::Engine(oe) => {
-            classify_engine_signal(matches!(oe, OmniError::Manifest(_)), &oe.to_string())
-        }
+        BackendError::Engine(oe) => classify_engine_error(oe),
         BackendError::Cli { stderr, .. } => {
             // Out-of-process there's no OmniError variant to gate on, so gate RC-1
             // on its DISTINCTIVE strings only — NOT the generic "expected"+"current"
@@ -139,17 +141,40 @@ pub fn classify_panic(msg: &str) -> Option<&'static str> {
 }
 
 // ── INVARIANT #1: Lance HEAD == manifest table version, per table ──
+//
+// The HEAD must be resolved with a RAW latest-open of the table's location —
+// NOT `Snapshot::open`, which opens at the manifest-PINNED version and would
+// make this check compare the pin to itself (a tautology blind to exactly the
+// HEAD>manifest uncovered-drift class it exists to catch).
 pub async fn head_eq_manifest(db: &Omnigraph) -> Result<(), Finding> {
     let snap = db
         .snapshot_of(ReadTarget::branch("main"))
         .await
         .map_err(Finding::Engine)?;
+    let root = db.uri().trim_end_matches('/');
     for entry in snap.entries() {
-        let ds = snap.open(&entry.table_key).await.map_err(Finding::Engine)?;
+        // Branch-owned tables live under `tree/<branch>`; mirror the engine's
+        // location join for the raw open.
+        let mut location = format!("{root}/{}", entry.table_path);
+        if let Some(branch) = entry.table_branch.as_deref() {
+            if branch != "main" {
+                location = format!("{location}/tree/{branch}");
+            }
+        }
+        let ds = lance::Dataset::open(&location)
+            .await
+            .map_err(|e| Finding::Logical(format!("open {} at HEAD: {e}", entry.table_key)))?;
         let lance_head = ds.version().version;
-        if lance_head != entry.table_version {
+        if lance_head > entry.table_version {
             return Err(Finding::Logical(format!(
-                "HEAD!=manifest on {}: lance_head={lance_head} manifest_pin={}",
+                "uncovered drift on {}: lance HEAD {lance_head} ahead of manifest pin {}",
+                entry.table_key, entry.table_version
+            )));
+        }
+        if lance_head < entry.table_version {
+            return Err(Finding::Logical(format!(
+                "corruption on {}: lance HEAD {lance_head} BEHIND manifest pin {} \
+                 (the manifest references a version that does not exist)",
                 entry.table_key, entry.table_version
             )));
         }
