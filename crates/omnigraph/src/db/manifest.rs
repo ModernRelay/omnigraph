@@ -84,6 +84,12 @@ pub(crate) struct CommitOutcome {
     /// no lineage was recorded or the commit is the genesis. Lets the caller
     /// update its in-memory commit cache without re-reading the manifest.
     pub parent_commit_id: Option<String>,
+    /// The `graph_commit` rows a COLD publish attempt scanned (`None` when the
+    /// warm attempt published — it scanned nothing, and its parent came from
+    /// the caller's own cache). Lets the caller bring its in-memory commit
+    /// cache chain-complete for free: a cold reparent onto a foreign head
+    /// would otherwise leave the cache holding a dangling parent id.
+    pub lineage_rows: Option<Vec<GraphLineageRow>>,
 }
 
 /// The on-disk internal-schema stamp of `__manifest` at `branch` (main when
@@ -510,6 +516,7 @@ impl ManifestCoordinator {
             return Ok(CommitOutcome {
                 version: self.version(),
                 parent_commit_id: None,
+                lineage_rows: None,
             });
         }
 
@@ -552,6 +559,7 @@ impl ManifestCoordinator {
             dataset,
             parent_commit_id,
             known_state,
+            lineage_rows,
         } = outcome;
         // RFC-013 PR2 #1b: the publisher folded the new visible state in-memory
         // (byte-identical to a re-scan via the shared `assemble_manifest_state`),
@@ -561,6 +569,7 @@ impl ManifestCoordinator {
         Ok(CommitOutcome {
             version: self.version(),
             parent_commit_id,
+            lineage_rows,
         })
     }
 

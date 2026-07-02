@@ -398,7 +398,7 @@ impl GraphCoordinator {
         // in-memory commit-graph head, made consistent with the manifest first
         // (a read can refresh the manifest only and leave the cache behind).
         let head_hint = self.warm_head_hint().await?;
-        let outcome = self
+        let mut outcome = self
             .manifest
             .commit_changes_with_lineage(
                 changes,
@@ -408,7 +408,7 @@ impl GraphCoordinator {
             )
             .await?;
         failpoints::maybe_fail(crate::failpoints::names::GRAPH_PUBLISH_AFTER_MANIFEST_COMMIT)?;
-        let snapshot_id = self.apply_lineage_to_cache(intent, &outcome);
+        let snapshot_id = self.apply_lineage_to_cache(intent, &mut outcome);
         Ok(PublishedSnapshot {
             manifest_version: outcome.version,
             _snapshot_id: snapshot_id,
@@ -434,7 +434,7 @@ impl GraphCoordinator {
         // The merge's first parent is the current target-branch head (the
         // in-memory commit-graph head), made consistent with the manifest first.
         let head_hint = self.warm_head_hint().await?;
-        let outcome = self
+        let mut outcome = self
             .manifest
             .commit_changes_with_lineage(
                 &changes,
@@ -444,7 +444,7 @@ impl GraphCoordinator {
             )
             .await?;
         failpoints::maybe_fail(crate::failpoints::names::GRAPH_PUBLISH_AFTER_MANIFEST_COMMIT)?;
-        Ok(self.apply_lineage_to_cache(intent, &outcome))
+        Ok(self.apply_lineage_to_cache(intent, &mut outcome))
     }
 
     /// Mint a [`LineageIntent`] for the next commit on the current branch: a
@@ -499,11 +499,20 @@ impl GraphCoordinator {
     /// storage I/O: the durable write already happened in the publish CAS, and
     /// this keeps a same-handle read's `head_commit_id` consistent with the
     /// snapshot it just advanced.
+    ///
+    /// A COLD publish attempt also hands back the full `graph_commit` row set
+    /// its scan read (`outcome.lineage_rows`); ingest it first so a reparent
+    /// onto a foreign head leaves the cache chain-complete rather than holding
+    /// a dangling parent id — the warm handle's `list_commits` serves this
+    /// cache. Zero extra I/O: the rows were already materialized by the scan.
     fn apply_lineage_to_cache(
         &mut self,
         intent: crate::db::manifest::LineageIntent,
-        outcome: &crate::db::manifest::CommitOutcome,
+        outcome: &mut crate::db::manifest::CommitOutcome,
     ) -> SnapshotId {
+        if let Some(rows) = outcome.lineage_rows.take() {
+            self.commit_graph.ingest_lineage_rows(rows);
+        }
         let commit = GraphCommit {
             graph_commit_id: intent.graph_commit_id.clone(),
             manifest_branch: intent.branch,

@@ -88,6 +88,15 @@ pub(super) struct PublishOutcome {
     /// the O(fragments) post-publish `read_manifest_state` re-scan. Byte-identical
     /// to that re-scan: built through the same `assemble_manifest_state` reduction.
     pub known_state: ManifestState,
+    /// The full `graph_commit` row set the winning attempt's COLD
+    /// `load_publish_state` scan read, or `None` when attempt 0 published warm
+    /// (no scan — and nothing to feed: a warm attempt's parent came from the
+    /// caller's own cache). Returned so the caller can bring its in-memory
+    /// commit cache chain-complete for free — a cold reparent onto a foreign
+    /// head otherwise leaves the cache holding a dangling parent id (SlateDB's
+    /// refresh-on-conflict shape: replace the register from what the conflict
+    /// path already read, never patch one field).
+    pub lineage_rows: Option<Vec<GraphLineageRow>>,
 }
 
 #[async_trait]
@@ -796,6 +805,7 @@ impl ManifestBatchPublisher for GraphNamespacePublisher {
                 dataset,
                 parent_commit_id: None,
                 known_state,
+                lineage_rows: None,
             });
         }
 
@@ -855,6 +865,13 @@ impl ManifestBatchPublisher for GraphNamespacePublisher {
                 }
                 None => None,
             };
+            // A cold attempt's scan rows flow out through the outcome so the
+            // caller's commit cache stays chain-complete for free (see
+            // `PublishOutcome::lineage_rows`); a warm attempt scanned nothing.
+            let scanned_lineage = match attempt_lineage {
+                LineageSource::Cold(lineage_rows) => Some(lineage_rows),
+                LineageSource::Warm(_) => None,
+            };
 
             if rows.is_empty() {
                 // Expected-version-only publish with no changes and no lineage:
@@ -873,6 +890,7 @@ impl ManifestBatchPublisher for GraphNamespacePublisher {
                     dataset,
                     parent_commit_id,
                     known_state,
+                    lineage_rows: scanned_lineage,
                 });
             }
 
@@ -907,6 +925,7 @@ impl ManifestBatchPublisher for GraphNamespacePublisher {
                         dataset: new_dataset,
                         parent_commit_id,
                         known_state,
+                        lineage_rows: scanned_lineage,
                     });
                 }
                 Err(err) => {

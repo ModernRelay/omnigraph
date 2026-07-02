@@ -56,6 +56,27 @@ impl CommitGraph {
             .insert(commit.graph_commit_id.clone(), commit);
     }
 
+    /// Ingest the `graph_commit` rows a COLD publish attempt scanned, keeping
+    /// the cache chain-complete after a reparent onto a foreign head — with no
+    /// storage I/O (the publish already read these rows). Same conversion and
+    /// head selection as the manifest-sourced load, so the two cannot drift.
+    pub fn ingest_lineage_rows(
+        &mut self,
+        rows: Vec<crate::db::manifest::GraphLineageRow>,
+    ) {
+        for row in rows {
+            self.insert_committed(GraphCommit {
+                graph_commit_id: row.graph_commit_id,
+                manifest_branch: row.manifest_branch,
+                manifest_version: row.manifest_version,
+                parent_commit_id: row.parent_commit_id,
+                merged_parent_commit_id: row.merged_parent_commit_id,
+                actor_id: row.actor_id,
+                created_at: row.created_at,
+            });
+        }
+    }
+
     pub async fn open(root_uri: &str) -> Result<Self> {
         let root = root_uri.trim_end_matches('/');
         let (commit_by_id, head_commit) = load_commit_cache_for_branch(root, None).await?;
