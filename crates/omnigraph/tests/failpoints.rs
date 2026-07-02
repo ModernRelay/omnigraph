@@ -550,6 +550,230 @@ async fn stale_warm_publish_precheck_loses_cas_then_converges() {
     }
 }
 
+/// Copy the Person registration + latest version rows out of `__manifest`,
+/// rename them to a synthetic "Ghost" table, and MERGE-INSERT them — a
+/// disjoint, non-lineage `__manifest` advance in the exact shape a future
+/// head-pointer-style manifest writer would produce (the publisher's own
+/// merge-insert on `object_id`). The merge-insert carries the unenforced-PK
+/// bloom filter over its inserted keys, so a concurrent publish with DISJOINT
+/// keys sees no bloom intersection and Lance REBASES it (a raw append carries
+/// no bloom and is conservatively treated as a conflict instead — which would
+/// route the concurrent publish through its cold retry and mask the fold bug
+/// this exists to pin). Copying real rows keeps every column (metadata JSON
+/// included) parseable by `read_manifest_state`.
+async fn inject_ghost_table_rows(root: &str) {
+    use arrow_array::builder::{ListBuilder, StringBuilder};
+    use arrow_array::{Array, RecordBatch, RecordBatchIterator, StringArray, UInt64Array};
+    use futures::TryStreamExt;
+    use lance::Dataset;
+    use lance::dataset::{MergeInsertBuilder, WhenMatched, WhenNotMatched};
+
+    let manifest_uri = format!("{}/__manifest", root.trim_end_matches('/'));
+    let ds = Dataset::open(&manifest_uri).await.expect("open __manifest");
+    let batches: Vec<RecordBatch> = ds
+        .scan()
+        .try_into_stream()
+        .await
+        .expect("scan __manifest")
+        .try_collect()
+        .await
+        .expect("collect __manifest rows");
+
+    // Source rows to clone: the Person "table" registration row and its
+    // highest "table_version" row. (row values: object_id, location, metadata,
+    // table_key, table_version, table_branch, row_count)
+    let mut reg: Option<(String, Option<String>, Option<String>, String, Option<String>, Option<u64>)> =
+        None;
+    let mut ver: Option<(String, Option<String>, Option<String>, String, u64, Option<String>, Option<u64>)> =
+        None;
+    for batch in &batches {
+        let get_str = |name: &str| {
+            batch
+                .column_by_name(name)
+                .unwrap()
+                .as_any()
+                .downcast_ref::<StringArray>()
+                .unwrap()
+        };
+        let (object_id, object_type, location, metadata, table_key, table_branch) = (
+            get_str("object_id"),
+            get_str("object_type"),
+            get_str("location"),
+            get_str("metadata"),
+            get_str("table_key"),
+            get_str("table_branch"),
+        );
+        let table_version = batch
+            .column_by_name("table_version")
+            .unwrap()
+            .as_any()
+            .downcast_ref::<UInt64Array>()
+            .unwrap();
+        let row_count = batch
+            .column_by_name("row_count")
+            .unwrap()
+            .as_any()
+            .downcast_ref::<UInt64Array>()
+            .unwrap();
+        let opt = |arr: &StringArray, i: usize| {
+            arr.is_valid(i).then(|| arr.value(i).to_string())
+        };
+        for i in 0..batch.num_rows() {
+            if !table_key.value(i).ends_with("Person") {
+                continue;
+            }
+            match object_type.value(i) {
+                "table" => {
+                    reg = Some((
+                        object_id.value(i).to_string(),
+                        opt(location, i),
+                        opt(metadata, i),
+                        table_key.value(i).to_string(),
+                        opt(table_branch, i),
+                        row_count.is_valid(i).then(|| row_count.value(i)),
+                    ));
+                }
+                "table_version" if table_version.is_valid(i) => {
+                    let v = table_version.value(i);
+                    if ver.as_ref().is_none_or(|existing| v > existing.4) {
+                        ver = Some((
+                            object_id.value(i).to_string(),
+                            opt(location, i),
+                            opt(metadata, i),
+                            table_key.value(i).to_string(),
+                            v,
+                            opt(table_branch, i),
+                            row_count.is_valid(i).then(|| row_count.value(i)),
+                        ));
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+    let reg = reg.expect("a Person `table` registration row exists in __manifest");
+    let ver = ver.expect("a Person `table_version` row exists in __manifest");
+    let rename = |s: &str| s.replace("Person", "Ghost");
+
+    let schema = batches[0].schema();
+    let mut base_objects = ListBuilder::new(StringBuilder::new());
+    base_objects.append_null();
+    base_objects.append_null();
+    let batch = RecordBatch::try_new(
+        schema.clone(),
+        vec![
+            std::sync::Arc::new(StringArray::from(vec![rename(&reg.0), rename(&ver.0)])),
+            std::sync::Arc::new(StringArray::from(vec!["table", "table_version"])),
+            std::sync::Arc::new(StringArray::from(vec![
+                reg.1.as_deref().map(rename),
+                ver.1.as_deref().map(rename),
+            ])),
+            std::sync::Arc::new(StringArray::from(vec![reg.2.clone(), ver.2.clone()])),
+            std::sync::Arc::new(base_objects.finish()),
+            std::sync::Arc::new(StringArray::from(vec![rename(&reg.3), rename(&ver.3)])),
+            std::sync::Arc::new(UInt64Array::from(vec![None, Some(ver.4)])),
+            std::sync::Arc::new(StringArray::from(vec![reg.4.clone(), ver.5.clone()])),
+            std::sync::Arc::new(UInt64Array::from(vec![reg.5, ver.6])),
+        ],
+    )
+    .expect("build Ghost rows batch");
+    let reader = RecordBatchIterator::new(vec![Ok(batch)], schema);
+    // The production publisher's exact merge-insert shape (join on the
+    // unenforced-PK `object_id`), so the commit carries the inserted-keys bloom
+    // and a disjoint concurrent publish rebases over it instead of conflicting.
+    let mut builder = MergeInsertBuilder::try_new(std::sync::Arc::new(ds), vec![
+        "object_id".to_string(),
+    ])
+    .expect("merge-insert builder on __manifest");
+    builder.when_matched(WhenMatched::UpdateAll);
+    builder.when_not_matched(WhenNotMatched::InsertAll);
+    builder.use_index(false);
+    builder.skip_auto_cleanup(true);
+    builder
+        .try_build()
+        .expect("build Ghost merge-insert")
+        .execute_reader(Box::new(reader))
+        .await
+        .expect("merge-insert Ghost rows into __manifest");
+}
+
+// F1 (fold vs disjoint rebase): a publish whose merge-insert Lance-internally
+// REBASES past a concurrent disjoint `__manifest` commit lands at base+2, but
+// its pre-computed fold inputs reflect base — so the folded `known_state`
+// silently misses the foreign rows while carrying the committed version, and
+// the next freshness probe cannot catch it (the coordinator IS at the latest
+// version/e_tag). Today's only production disjoint racer is content-preserving
+// `__manifest` compaction, which masks the class; this cell simulates the
+// FUTURE non-lineage logical `__manifest` writer (head-pointer-style rows)
+// with a raw disjoint Lance append, and pins the fix: the publisher must
+// re-derive `known_state` from the committed dataset whenever the commit did
+// not land at exactly base+1.
+//
+// Deterministic via the `publish.before_merge_rows` rendezvous: the writer
+// parks AFTER its state load + fold-input computation, the test lands the
+// disjoint append, and the released merge-insert rebases over it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[serial]
+async fn publish_fold_rederives_after_disjoint_manifest_rebase() {
+    let _scenario = FailScenario::setup();
+
+    let dir = tempfile::tempdir().unwrap();
+    let uri = dir.path().to_str().unwrap().to_string();
+
+    // One writer, warmed: init + a first load leave the coordinator's
+    // known_state folded and the Person table registered in `__manifest`.
+    let cohort = Cohort::open_embedded(&uri, 1).await;
+    cohort
+        .writer(0)
+        .load(&person("warm"))
+        .await
+        .expect("warm-up load");
+
+    let rv = helpers::failpoint::Rendezvous::park_first(names::PUBLISH_BEFORE_MERGE_ROWS);
+
+    // The victim write parks between its state load and the merge-insert.
+    let a = cohort.writer_arc(0);
+    let victim = tokio::spawn(async move { a.load(&person("victim")).await });
+    rv.wait_until_reached().await;
+
+    // The disjoint logical advance lands while the victim holds its fold inputs.
+    inject_ghost_table_rows(&uri).await;
+
+    // Release: the merge-insert rebases over the appended commit (disjoint
+    // object_ids/fragments — no conflict) and commits at base+2.
+    rv.release();
+    victim
+        .await
+        .expect("victim task join")
+        .expect("victim load must commit (rebase, not conflict)");
+
+    // Oracle: a FRESH handle re-reads the manifest rows from storage.
+    let fresh = Cohort::reopen_embedded(&uri, 1).await;
+    let fresh_snap = fresh.writer(0).db().snapshot_of("main").await.unwrap();
+    let ghost_key = fresh_snap
+        .entries()
+        .map(|e| e.table_key.clone())
+        .find(|k| k.contains("Ghost"))
+        .expect("precondition: the injected Ghost rows must be assemble-visible to a fresh open");
+
+    // THE pin: the victim's coordinator sits at the SAME manifest version as
+    // the fresh handle, so its view must be content-identical — including the
+    // foreign Ghost entry its pre-rebase fold inputs could not contain.
+    let stale_snap = cohort.writer(0).db().snapshot_of("main").await.unwrap();
+    assert_eq!(
+        stale_snap.version(),
+        fresh_snap.version(),
+        "both handles must sit at the committed (rebased) manifest version",
+    );
+    assert!(
+        stale_snap.entry(&ghost_key).is_some(),
+        "folded known_state at manifest version {} is missing the concurrently-committed \
+         `{ghost_key}` entry a fresh open sees — the publish rebased past a disjoint \
+         `__manifest` commit and folded stale inputs instead of re-deriving",
+        stale_snap.version(),
+    );
+}
+
 #[tokio::test(flavor = "multi_thread")]
 #[serial]
 async fn graph_publish_failpoint_triggers_before_commit_append() {

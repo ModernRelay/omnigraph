@@ -870,6 +870,12 @@ impl ManifestBatchPublisher for GraphNamespacePublisher {
             let (fold_entries, fold_tombstones) =
                 Self::fold_inputs(&existing_versions, &existing_tombstones, &rows, &known_tables)?;
 
+            // Test seam: the load→commit window. A concurrent `__manifest`
+            // advance parked here forces Lance's internal rebase inside
+            // `merge_rows`, making the just-computed fold inputs stale for the
+            // committed version (no-op without the `failpoints` feature).
+            crate::failpoints::maybe_fail(crate::failpoints::names::PUBLISH_BEFORE_MERGE_ROWS)?;
+
             match self.merge_rows(dataset, rows).await {
                 Ok(new_dataset) => {
                     let known_state = assemble_manifest_state(

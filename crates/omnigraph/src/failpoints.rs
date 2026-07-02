@@ -72,6 +72,11 @@ pub mod names {
     pub const SCHEMA_APPLY_AFTER_MANIFEST_COMMIT: &str = "schema_apply.after_manifest_commit";
     pub const SCHEMA_APPLY_AFTER_STAGING_WRITE: &str = "schema_apply.after_staging_write";
     pub const SCHEMA_APPLY_BEFORE_STAGING_WRITE: &str = "schema_apply.before_staging_write";
+    /// Parks a publish attempt between its state load (warm or cold; fold
+    /// inputs already computed) and the `merge_rows` commit — the window where
+    /// a concurrent `__manifest` advance forces Lance's internal rebase and the
+    /// pre-computed fold inputs go stale for the committed version.
+    pub const PUBLISH_BEFORE_MERGE_ROWS: &str = "publish.before_merge_rows";
     /// Injects a retryable `RowLevelCasContention` from `load_publish_state` so a
     /// test can prove the publisher's outer retry re-runs the load.
     pub const PUBLISH_LOAD_STATE_RETRYABLE_CONTENTION: &str =
