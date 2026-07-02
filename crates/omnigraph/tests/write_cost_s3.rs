@@ -155,6 +155,21 @@ async fn warm_write_cost_flat_and_bounded_in_history_on_s3() {
             "warm-write __manifest round-trip ceiling exceeded: {} (baseline 13)",
             shallow.manifest_num_stages,
         );
+
+        // Non-vacuity floors (LanceDB's exact-count idiom): a real warm write on
+        // S3 DOES list and DOES round-trip today, so zero means the tracker or
+        // the method classification broke — the flat asserts above would then
+        // pass vacuously at 0. Revisit the list floor when the Phase-4
+        // forward-probe drives the target to ~0.
+        assert!(
+            shallow.manifest_list_requests >= 1,
+            "warm-write __manifest LIST count is 0 — request classification or the \
+             ground-truth tracker is broken (flat-at-zero would be vacuous)",
+        );
+        assert!(
+            shallow.manifest_num_stages >= 1,
+            "warm-write __manifest round-trip count is 0 — IoStats wiring is broken",
+        );
     })
     .await;
 }
@@ -166,8 +181,10 @@ async fn warm_write_cost_flat_and_bounded_in_history_on_s3() {
 /// drove that scan to 0, so it is now `assert_flat` — the warm write's `__manifest`
 /// scan stays flat across depth EVEN WITHOUT compaction, the load-bearing
 /// unlimited-history property on the served path. The S3 mirror of the local twin
-/// `write_cost.rs::served_regime_manifest_scan_is_flat_with_warm_publish`. Run under
-/// RustFS in CI's `rustfs_integration` job.
+/// `write_cost.rs::served_regime_manifest_scan_is_flat_with_warm_publish`. NOT in
+/// CI: cost gates were moved out of `rustfs_integration` (see the ci.yml NOTE) —
+/// run on demand with `OMNIGRAPH_S3_TEST_BUCKET` set, pending a dedicated perf
+/// harness; the local twin runs every-PR.
 #[tokio::test]
 async fn served_regime_manifest_scan_is_flat_with_warm_publish_on_s3() {
     let Some(mut db) = s3_graph("write-cost-grows").await else {
@@ -210,7 +227,7 @@ async fn served_regime_manifest_scan_is_flat_with_warm_publish_on_s3() {
         // the served path (the freshness probe is a `_versions/` LIST, counted in
         // `manifest_list_requests`, not this scan term). If warm regresses to the
         // cold O(fragments) `read_manifest_scan`, this grows again and trips the
-        // small slack. CI's rustfs_integration job is the running measurement.
+        // small slack. Run on demand (not in CI — see the header note).
         assert_flat(
             &curve,
             |c| c.manifest_reads,
