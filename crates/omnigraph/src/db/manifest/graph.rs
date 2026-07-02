@@ -14,16 +14,9 @@ use super::layout::{manifest_uri, open_manifest_dataset, type_name_hash};
 use super::metadata::TableVersionMetadata;
 use super::migrations::stamp_current_version;
 use super::state::{
-    GraphLineageRow, ManifestState, SubTableEntry, entries_to_batch, graph_lineage_row_parts,
+    LineageWrite, ManifestState, SubTableEntry, entries_to_batch, graph_lineage_row_parts,
     manifest_schema, read_manifest_state,
 };
-
-/// The manifest version the init `Dataset::write` produces (Lance datasets start
-/// at version one). The genesis graph commit pins this version — a snapshot at
-/// it is the empty, freshly-initialized graph. The two config-only commits that
-/// follow (`update_config`, `stamp_current_version`) advance the live manifest
-/// version but add no table data, so genesis correctly stays pinned at one.
-const GENESIS_MANIFEST_VERSION: u64 = 1;
 
 pub(super) async fn init_manifest_graph(
     root_uri: &str,
@@ -34,17 +27,22 @@ pub(super) async fn init_manifest_graph(
 
     // Genesis graph commit: parentless, actorless, minted once and folded into
     // the init write so `__manifest` is the single source of graph lineage from
-    // version one (no `_graph_commits.lance` row, no separate publish).
-    let genesis = GraphLineageRow {
-        graph_commit_id: ulid::Ulid::new().to_string(),
-        manifest_branch: None,
-        manifest_version: GENESIS_MANIFEST_VERSION,
+    // version one (no `_graph_commits.lance` row, no separate publish). Like
+    // every commit, its manifest version is derived at read from
+    // `_row_created_at_version`: the init `Dataset::write` creates the dataset
+    // at version one, so genesis derives to one — a snapshot at it is the
+    // empty, freshly-initialized graph. (The config-only commits that follow —
+    // `update_config`, `stamp_current_version` — advance the live manifest
+    // version but insert no rows, so genesis correctly stays at one.)
+    let genesis_id = ulid::Ulid::new().to_string();
+    let genesis_lineage = graph_lineage_row_parts(&LineageWrite {
+        graph_commit_id: &genesis_id,
+        branch: None,
         parent_commit_id: None,
         merged_parent_commit_id: None,
         actor_id: None,
         created_at: crate::db::now_micros()?,
-    };
-    let genesis_lineage = graph_lineage_row_parts(&genesis, None)?;
+    })?;
 
     let manifest_batch = entries_to_batch(&entries, &version_metadata, &genesis_lineage)?;
     let schema = manifest_schema();

@@ -1241,4 +1241,151 @@ async fn filtered_scan_tolerates_merge_update_row_id_overlap() {
         let rows: usize = batches.iter().map(|b| b.num_rows()).sum();
         assert_eq!(rows, expected, "filtered read for {slug}");
     }
+
+// --- Guard: row-lineage stamping survives an in-attempt rebase ---------------
+//
+// `db/manifest/state.rs::decode_graph_commit_row` DERIVES each graph commit's
+// manifest version from `_row_created_at_version` instead of a payload literal.
+// That is correct only because Lance assigns the lineage stamp inside
+// `Transaction::build_manifest`, per commit attempt, from the just-reloaded
+// manifest (`lance/src/io/commit.rs` target_version; `transaction.rs` Update
+// arm) — so a commit that internally REBASES past a concurrent disjoint commit
+// stamps the FINAL landed version, never the version implied by the base the
+// transaction was built against. Nothing upstream pins lineage-under-rebase;
+// if a future Lance moves the stamping to write time, this goes red before the
+// derivation silently breaks.
+#[tokio::test]
+async fn merge_insert_rebase_stamps_row_lineage_at_landed_version() {
+    use futures::TryStreamExt;
+    use lance::datatypes::LANCE_UNENFORCED_PRIMARY_KEY;
+    use arrow_array::UInt64Array;
+
+    let dir = tempfile::tempdir().unwrap();
+    let uri = dir.path().join("g_lineage_rebase.lance");
+    let uri = uri.to_str().unwrap();
+    let mut ds = fresh_dataset(uri).await; // stable row IDs on (fresh_dataset)
+
+    // Mirror `__manifest`: `id` is the unenforced PK, so concurrent disjoint
+    // merge-inserts carry non-intersecting inserted-key blooms and REBASE
+    // rather than conflict (the exact publisher shape).
+    ds.update_field_metadata()
+        .update(
+            "id",
+            [(LANCE_UNENFORCED_PRIMARY_KEY.to_string(), "true".to_string())],
+        )
+        .unwrap()
+        .await
+        .unwrap();
+    let base_version = ds.version().version;
+
+    let schema = Arc::new(Schema::new(vec![
+        Field::new("id", DataType::Utf8, false),
+        Field::new("value", DataType::Int32, false),
+    ]));
+    let merge_insert_batch = |id: &str, value: i32| {
+        RecordBatch::try_new(
+            schema.clone(),
+            vec![
+                Arc::new(StringArray::from(vec![id.to_string()])),
+                Arc::new(Int32Array::from(vec![value])),
+            ],
+        )
+        .unwrap()
+    };
+    let uncommitted_insert = |ds: Arc<Dataset>, batch: RecordBatch| async move {
+        let mut builder = MergeInsertBuilder::try_new(ds, vec!["id".to_string()]).unwrap();
+        builder.when_matched(WhenMatched::UpdateAll);
+        builder.when_not_matched(WhenNotMatched::InsertAll);
+        builder.use_index(false);
+        builder.skip_auto_cleanup(true);
+        let job = builder.try_build().unwrap();
+        let reader = RecordBatchIterator::new(vec![Ok(batch)], schema_of_batch());
+        let stream = lance_datafusion::utils::reader_to_stream(Box::new(reader));
+        job.execute_uncommitted(stream).await.unwrap()
+    };
+    fn schema_of_batch() -> Arc<Schema> {
+        Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Utf8, false),
+            Field::new("value", DataType::Int32, false),
+        ]))
+    }
+
+    // Two-phase merge-insert built against `base_version`, inserting `carol`.
+    let pending = uncommitted_insert(Arc::new(ds.clone()), merge_insert_batch("carol", 3)).await;
+
+    // Interleave: a DISJOINT commit (`dave`) lands before `carol`'s commit.
+    let ds_fresh = Dataset::open(uri).await.unwrap();
+    let interleaved =
+        uncommitted_insert(Arc::new(ds_fresh.clone()), merge_insert_batch("dave", 4)).await;
+    let interleaved_committed = CommitBuilder::new(Arc::new(ds_fresh))
+        .with_skip_auto_cleanup(true)
+        .execute(interleaved.transaction)
+        .await
+        .unwrap();
+    let interleaved_version = interleaved_committed.version().version;
+
+    // Commit `carol` against the STALE base handle: Lance reconciles against
+    // live storage and rebases past `dave`'s commit.
+    let committed = CommitBuilder::new(Arc::new(ds))
+        .with_skip_auto_cleanup(true)
+        .execute(pending.transaction)
+        .await
+        .unwrap();
+    let landed_version = committed.version().version;
+    // Non-vacuity: the rebase must actually have happened, else this guard
+    // pins nothing.
+    assert!(
+        landed_version >= base_version + 2 && landed_version > interleaved_version,
+        "expected a rebased commit (base {base_version}, interleaved \
+         {interleaved_version}, landed {landed_version})"
+    );
+
+    // The load-bearing pin: the rebased commit's inserted row is stamped at the
+    // LANDED version, not base+1.
+    let mut scanner = committed.scan();
+    scanner
+        .project(&["id", "_row_created_at_version"])
+        .unwrap();
+    let batches: Vec<RecordBatch> = scanner
+        .try_into_stream()
+        .await
+        .unwrap()
+        .try_collect()
+        .await
+        .unwrap();
+    let mut carol = None;
+    let mut dave = None;
+    for batch in &batches {
+        let ids = batch
+            .column_by_name("id")
+            .unwrap()
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .unwrap();
+        let created = batch
+            .column_by_name("_row_created_at_version")
+            .unwrap()
+            .as_any()
+            .downcast_ref::<UInt64Array>()
+            .unwrap();
+        for row in 0..batch.num_rows() {
+            match ids.value(row) {
+                "carol" => carol = Some(created.value(row)),
+                "dave" => dave = Some(created.value(row)),
+                _ => {}
+            }
+        }
+    }
+    assert_eq!(
+        carol,
+        Some(landed_version),
+        "the REBASED commit's inserted row must be stamped at the landed \
+         version {landed_version} — a write-time stamp would break \
+         decode_graph_commit_row's derivation"
+    );
+    assert_eq!(
+        dave,
+        Some(interleaved_version),
+        "the interleaved commit's row keeps its own landed version"
+    );
 }

@@ -334,10 +334,18 @@ pub(super) async fn read_publish_scan(dataset: &Dataset) -> Result<PublishScan> 
 /// dedicated `read_graph_lineage` scan and the folded `collect_lineage` branch of
 /// `read_manifest_scan` — so the two cannot drift. The caller has already matched
 /// the object type; `row` indexes into the per-batch columns.
+///
+/// `manifest_version` is DERIVED from Lance's `_row_created_at_version` lineage
+/// column — the manifest version the row's commit actually LANDED at, stamped by
+/// Lance inside the commit machinery per attempt (so it is correct even when the
+/// commit was internally rebased past a concurrent disjoint commit). The row
+/// payload carries no version: a pre-commit prediction cannot know its landed
+/// version (see `graph_lineage_row_parts`). Commit rows are immutable
+/// (insert-only), so created-at IS the commit's version.
 fn decode_graph_commit_row(
     object_ids: &StringArray,
     metadata: &StringArray,
-    versions: &UInt64Array,
+    created_at_versions: &UInt64Array,
     branches: &StringArray,
     row: usize,
 ) -> Result<GraphLineageRow> {
@@ -358,13 +366,20 @@ fn decode_graph_commit_row(
         } else {
             Some(branches.value(row).to_string())
         },
-        manifest_version: required_u64(versions, row, "table_version")?,
+        manifest_version: required_u64(created_at_versions, row, ROW_CREATED_AT_VERSION_COLUMN)?,
         parent_commit_id: commit_meta.parent_commit_id,
         merged_parent_commit_id: commit_meta.merged_parent_commit_id,
         actor_id: commit_meta.actor_id,
         created_at: commit_meta.created_at,
     })
 }
+
+/// Lance's reserved per-row lineage column: the dataset version at which the row
+/// was inserted, synthesized at scan time from fragment metadata that Lance's
+/// commit machinery stamps per commit attempt (correct under internal rebase;
+/// preserved by compaction). Requires stable row IDs — enabled on every
+/// omnigraph dataset including `__manifest`.
+const ROW_CREATED_AT_VERSION_COLUMN: &str = "_row_created_at_version";
 
 async fn read_manifest_scan(dataset: &Dataset, collect_lineage: bool) -> Result<ManifestScan> {
     // Project only the columns the assembly below reads (RFC-013 PR2 #1c). The
@@ -384,6 +399,9 @@ async fn read_manifest_scan(dataset: &Dataset, collect_lineage: bool) -> Result<
     ];
     if collect_lineage {
         projection.push("object_id");
+        // The lineage decode derives each commit's manifest version from the
+        // row's Lance-stamped creation version (see `decode_graph_commit_row`).
+        projection.push(ROW_CREATED_AT_VERSION_COLUMN);
     }
     let mut scanner = dataset.scan();
     scanner
@@ -410,8 +428,14 @@ async fn read_manifest_scan(dataset: &Dataset, collect_lineage: bool) -> Result<
         let versions = u64_column(batch, "table_version")?;
         let branches = string_column(batch, "table_branch")?;
         let row_counts = u64_column(batch, "row_count")?;
-        // `object_id` is only needed for lineage decoding; skip the lookup
-        // entirely on the table-state hot path (`collect_lineage == false`).
+        // `object_id` + the row-creation version are only needed for lineage
+        // decoding; skip the lookups entirely on the table-state hot path
+        // (`collect_lineage == false`).
+        let created_at_versions = if collect_lineage {
+            Some(u64_column(batch, ROW_CREATED_AT_VERSION_COLUMN)?)
+        } else {
+            None
+        };
         let object_ids = if collect_lineage {
             Some(string_column(batch, "object_id")?)
         } else {
@@ -469,8 +493,14 @@ async fn read_manifest_scan(dataset: &Dataset, collect_lineage: bool) -> Result<
                 // forward-compat skip as the `_` arm.
                 OBJECT_TYPE_GRAPH_COMMIT if collect_lineage => {
                     let object_ids = object_ids.expect("object_ids read when collect_lineage");
+                    let created_at_versions = created_at_versions
+                        .expect("created_at_versions read when collect_lineage");
                     lineage_rows.push(decode_graph_commit_row(
-                        object_ids, metadata, versions, branches, row,
+                        object_ids,
+                        metadata,
+                        created_at_versions,
+                        branches,
+                        row,
                     )?);
                 }
                 // Skipped on the table-state path (and for `graph_head` / unknown
@@ -522,8 +552,20 @@ async fn read_manifest_scan(dataset: &Dataset, collect_lineage: bool) -> Result<
 pub(crate) async fn read_graph_lineage(
     dataset: &Dataset,
 ) -> Result<(Vec<GraphLineageRow>, HashMap<String, String>)> {
-    let batches: Vec<RecordBatch> = dataset
-        .scan()
+    // Explicit projection: the lineage decode needs the Lance row-creation
+    // version (a reserved column a default scan does NOT include), and the
+    // lineage rows never use `location`/`table_key`/`row_count`.
+    let mut scanner = dataset.scan();
+    scanner
+        .project(&[
+            "object_id",
+            "object_type",
+            "metadata",
+            "table_branch",
+            ROW_CREATED_AT_VERSION_COLUMN,
+        ])
+        .map_err(|e| OmniError::Lance(e.to_string()))?;
+    let batches: Vec<RecordBatch> = scanner
         .try_into_stream()
         .await
         .map_err(|e| OmniError::Lance(e.to_string()))?
@@ -538,14 +580,18 @@ pub(crate) async fn read_graph_lineage(
         let object_ids = string_column(batch, "object_id")?;
         let object_types = string_column(batch, "object_type")?;
         let metadata = string_column(batch, "metadata")?;
-        let versions = u64_column(batch, "table_version")?;
+        let created_at_versions = u64_column(batch, ROW_CREATED_AT_VERSION_COLUMN)?;
         let branches = string_column(batch, "table_branch")?;
 
         for row in 0..batch.num_rows() {
             match object_types.value(row) {
                 OBJECT_TYPE_GRAPH_COMMIT => {
                     graph_commits.push(decode_graph_commit_row(
-                        object_ids, metadata, versions, branches, row,
+                        object_ids,
+                        metadata,
+                        created_at_versions,
+                        branches,
+                        row,
                     )?);
                 }
                 OBJECT_TYPE_GRAPH_HEAD => {
@@ -605,45 +651,61 @@ pub(crate) struct GraphLineageRowPart {
     pub(crate) table_branch: Option<String>,
 }
 
+/// The write-side input for one graph commit's lineage rows: the intent fields
+/// plus the publisher-resolved parent. Deliberately carries NO manifest
+/// version — the landed version is the commit mechanism's to assign, never the
+/// payload's (a pre-commit prediction is wrong whenever Lance internally
+/// rebases past a concurrent disjoint commit; readers derive the true value
+/// from `_row_created_at_version`, see `decode_graph_commit_row`).
+pub(crate) struct LineageWrite<'a> {
+    pub(crate) graph_commit_id: &'a str,
+    /// The branch the commit lands on (`None` = main): selects the
+    /// `graph_head:<branch>` pointer row and is recorded on the commit row.
+    pub(crate) branch: Option<&'a str>,
+    pub(crate) parent_commit_id: Option<&'a str>,
+    pub(crate) merged_parent_commit_id: Option<&'a str>,
+    pub(crate) actor_id: Option<&'a str>,
+    pub(crate) created_at: i64,
+}
+
 /// Encode one graph commit into its two `__manifest` rows: the immutable
 /// `graph_commit` row plus the mutable `graph_head:<branch>` pointer (a
-/// merge-insert on `object_id` updates the head in place). `branch` is `None`
-/// for main. The immutable commit fields with no dedicated column live in the
-/// `graph_commit` row's `metadata` JSON; the mutable head pointer payload lives
-/// in the `graph_head` row's `metadata`.
+/// merge-insert on `object_id` updates the head in place). The immutable
+/// commit fields with no dedicated column live in the `graph_commit` row's
+/// `metadata` JSON; the mutable head pointer payload lives in the `graph_head`
+/// row's `metadata`. Neither row carries a version (see [`LineageWrite`]).
 pub(crate) fn graph_lineage_row_parts(
-    commit: &GraphLineageRow,
-    branch: Option<&str>,
+    write: &LineageWrite<'_>,
 ) -> Result<[GraphLineageRowPart; 2]> {
     let commit_metadata = serde_json::to_string(&GraphCommitMetadata {
-        parent_commit_id: commit.parent_commit_id.clone(),
-        merged_parent_commit_id: commit.merged_parent_commit_id.clone(),
-        actor_id: commit.actor_id.clone(),
-        created_at: commit.created_at,
+        parent_commit_id: write.parent_commit_id.map(str::to_string),
+        merged_parent_commit_id: write.merged_parent_commit_id.map(str::to_string),
+        actor_id: write.actor_id.map(str::to_string),
+        created_at: write.created_at,
     })
     .map_err(|e| {
         OmniError::manifest_internal(format!("failed to encode graph_commit metadata: {e}"))
     })?;
     let head_metadata = serde_json::to_string(&GraphHeadMetadata {
-        head_commit_id: commit.graph_commit_id.clone(),
-        parent_commit_id: commit.parent_commit_id.clone(),
+        head_commit_id: write.graph_commit_id.to_string(),
+        parent_commit_id: write.parent_commit_id.map(str::to_string),
     })
     .map_err(|e| {
         OmniError::manifest_internal(format!("failed to encode graph_head metadata: {e}"))
     })?;
 
     Ok([
-        // Only the immutable commit row carries the manifest version + branch.
+        // The immutable commit row: branch recorded, version DERIVED at read.
         GraphLineageRowPart {
-            object_id: commit.graph_commit_id.clone(),
+            object_id: write.graph_commit_id.to_string(),
             object_type: OBJECT_TYPE_GRAPH_COMMIT,
             metadata: commit_metadata,
-            table_version: Some(commit.manifest_version),
-            table_branch: commit.manifest_branch.clone(),
+            table_version: None,
+            table_branch: write.branch.map(str::to_string),
         },
         // The head row reuses `metadata` for its pointer payload.
         GraphLineageRowPart {
-            object_id: graph_head_object_id(branch),
+            object_id: graph_head_object_id(write.branch),
             object_type: OBJECT_TYPE_GRAPH_HEAD,
             metadata: head_metadata,
             table_version: None,

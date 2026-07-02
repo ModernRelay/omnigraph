@@ -405,8 +405,10 @@ impl GraphNamespacePublisher {
     /// fold into the publish batch. Runs INSIDE the CAS retry loop, so the
     /// parent is read from the manifest state this attempt will commit against —
     /// a retry after a concurrent commit re-reads the advanced head and parents
-    /// correctly (TOCTOU closed). `new_manifest_version` is the version this
-    /// publish produces (the recorded commit pins it).
+    /// correctly (TOCTOU closed). The rows carry NO manifest version: the landed
+    /// version is Lance's to assign at commit time and is derived from
+    /// `_row_created_at_version` at read (see `LineageWrite`), so an internal
+    /// rebase can never leave the durable lineage recording a stale prediction.
     ///
     /// The parent is the current head of the branch's lineage — the
     /// `should_replace_head` winner over the visible `graph_commit` rows, the
@@ -424,10 +426,9 @@ impl GraphNamespacePublisher {
     fn resolve_lineage_rows(
         lineage_rows: &[GraphLineageRow],
         intent: &LineageIntent,
-        new_manifest_version: u64,
     ) -> Result<(Vec<PendingVersionRow>, Option<String>)> {
         let parent_commit_id = head_lineage_row(lineage_rows).map(|h| h.graph_commit_id.clone());
-        Self::build_lineage_commit(parent_commit_id, intent, new_manifest_version)
+        Self::build_lineage_commit(parent_commit_id, intent)
     }
 
     /// The WARM-path lineage resolution (Layer 4): the parent is the supplied
@@ -438,9 +439,8 @@ impl GraphNamespacePublisher {
     fn resolve_lineage_rows_from_head(
         head: Option<&str>,
         intent: &LineageIntent,
-        new_manifest_version: u64,
     ) -> Result<(Vec<PendingVersionRow>, Option<String>)> {
-        Self::build_lineage_commit(head.map(ToOwned::to_owned), intent, new_manifest_version)
+        Self::build_lineage_commit(head.map(ToOwned::to_owned), intent)
     }
 
     /// Shared body: build the new commit's two lineage rows (`graph_commit` +
@@ -448,18 +448,15 @@ impl GraphNamespacePublisher {
     fn build_lineage_commit(
         parent_commit_id: Option<String>,
         intent: &LineageIntent,
-        new_manifest_version: u64,
     ) -> Result<(Vec<PendingVersionRow>, Option<String>)> {
-        let commit = GraphLineageRow {
-            graph_commit_id: intent.graph_commit_id.clone(),
-            manifest_branch: intent.branch.clone(),
-            manifest_version: new_manifest_version,
-            parent_commit_id: parent_commit_id.clone(),
-            merged_parent_commit_id: intent.merged_parent_commit_id.clone(),
-            actor_id: intent.actor_id.clone(),
+        let parts = graph_lineage_row_parts(&super::state::LineageWrite {
+            graph_commit_id: &intent.graph_commit_id,
+            branch: intent.branch.as_deref(),
+            parent_commit_id: parent_commit_id.as_deref(),
+            merged_parent_commit_id: intent.merged_parent_commit_id.as_deref(),
+            actor_id: intent.actor_id.as_deref(),
             created_at: intent.created_at,
-        };
-        let parts = graph_lineage_row_parts(&commit, intent.branch.as_deref())?;
+        })?;
         Ok((
             parts.into_iter().map(lineage_part_to_pending).collect(),
             parent_commit_id,
@@ -847,16 +844,11 @@ impl ManifestBatchPublisher for GraphNamespacePublisher {
             // retry — a retry re-runs `load_publish_state` → fresh lineage).
             let parent_commit_id = match lineage {
                 Some(intent) => {
-                    let new_manifest_version = dataset.version().version + 1;
                     let (commit_rows, parent) = match &attempt_lineage {
-                        LineageSource::Cold(rows) => {
-                            Self::resolve_lineage_rows(rows, intent, new_manifest_version)?
+                        LineageSource::Cold(rows) => Self::resolve_lineage_rows(rows, intent)?,
+                        LineageSource::Warm(head) => {
+                            Self::resolve_lineage_rows_from_head(head.as_deref(), intent)?
                         }
-                        LineageSource::Warm(head) => Self::resolve_lineage_rows_from_head(
-                            head.as_deref(),
-                            intent,
-                            new_manifest_version,
-                        )?,
                     };
                     rows.extend(commit_rows);
                     parent
