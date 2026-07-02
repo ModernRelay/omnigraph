@@ -160,10 +160,22 @@ impl std::fmt::Debug for WarmAttempt<'_> {
 
 impl LoadedPublishState {
     /// Build a publish attempt's loaded state from the coordinator's WARM state
-    /// (Layer 4), with NO `__manifest` scan. The assembled `known_state` already
-    /// dropped tombstoned tables, so `existing_tombstones` is empty by
-    /// construction (a non-strict insert never references a tombstoned table);
-    /// the parent comes from the head_hint, not scanned lineage rows.
+    /// (Layer 4), with NO `__manifest` scan; the parent comes from the
+    /// head_hint, not scanned lineage rows.
+    ///
+    /// CAVEAT — the warm state is the assembled (visible) reduction, so it is
+    /// LOSSIER than a cold scan in two ways the publisher's guards notice: (a)
+    /// `existing_tombstones` is empty (the assembled `known_state` dropped
+    /// tombstoned tables), so the duplicate-tombstone guard in
+    /// `build_pending_rows` is inert on warm attempts — safe today only because
+    /// the sole tombstone-emitting writer (schema apply) is serialized by the
+    /// graph-wide schema-apply lock; (b) `registered_tables` is derived from
+    /// visible entries, so registration-only and tombstoned tables are absent —
+    /// safe today because registrations always ride with their first version
+    /// row and table paths are deterministic. The warm path applies to EVERY
+    /// lineage publish (not only non-strict inserts). Making warm ≡ cold by
+    /// construction (one assembly funnel over a ManifestState that retains
+    /// registrations + tombstones) is the Phase-3.5/A2 follow-up.
     fn from_warm(w: &WarmAttempt<'_>) -> Self {
         LoadedPublishState {
             dataset: w.dataset.clone(),
@@ -665,10 +677,20 @@ impl GraphNamespacePublisher {
             .map_err(|e| OmniError::Lance(e.to_string()))?;
         merge_builder.when_matched(WhenMatched::UpdateAll);
         merge_builder.when_not_matched(WhenNotMatched::InsertAll);
-        // 0 here is intentional: Lance's built-in retry uses transparent rebase,
-        // which would let a concurrent writer's row land alongside ours and
-        // silently break the OCC contract on `__manifest`. Retries are owned by
-        // the publisher loop above, where each attempt re-runs the pre-check.
+        // 0 here zeros Lance's OUTER retry loop (`execute_with_retry`) so that a
+        // retryable conflict surfaces to the publisher loop above, where each
+        // attempt re-runs the pre-check against freshly loaded state. It does
+        // NOT disable Lance's in-commit reconciliation: `commit_transaction`
+        // re-lists storage on every attempt and either (a) REJECTS a concurrent
+        // commit that touched the same `object_id` rows — the unenforced-PK
+        // bloom intersection — as a retryable conflict (the OCC contract on
+        // `__manifest`), or (b) silently REBASES past a *disjoint* concurrent
+        // commit and lands at base+2 (its inner CommitBuilder default budget,
+        // not `conflict_retries`, governs those attempts). Every logical writer
+        // carries the shared `graph_head:<branch>` row, so logical writers take
+        // path (a); path (b) is reachable only by non-lineage disjoint commits
+        // and is why the post-commit fold is version-coupled
+        // (`fold_published_state` re-scans when the commit landed != base+1).
         merge_builder.conflict_retries(0);
         merge_builder.use_index(false);
         // Skip Lance's auto-cleanup hook: `__manifest` versions are the snapshot
