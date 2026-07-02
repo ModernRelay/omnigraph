@@ -82,3 +82,73 @@ new graph verifies.
   re-embed after loading.
 - **Server deployments**: take the graph out of the serving set, rebuild it offline
   with the CLI, then point the cluster at the rebuilt graph (`cluster apply`).
+
+## Migrating to v0.8.0
+
+v0.8.0 is the first release with a storage-format change since v0.4.0. Any graph
+created by an earlier release must be rebuilt with the recipe above. Beyond the
+rebuild, v0.8.0 changes two things to plan for: the on-disk layout, and
+write-time validation strictness.
+
+### What changed on disk (internal schema v4)
+
+- **Graph commit lineage now lives in the `__manifest` table.** Commits, parents,
+  merge parents, per-branch heads, and the authoring actor are stored as
+  `graph_commit` / `graph_head` rows, written in the **same atomic commit** as the
+  table-version rows of a graph publish. Previously a crash in a narrow window
+  could leave a published version with no matching history entry; that window no
+  longer exists.
+- **Two internal datasets are retired.** `_graph_commits.lance` and
+  `_graph_commit_actors.lance` are no longer created, read, or written — a graph
+  created by v0.8.0 has neither. If backup scripts, disk-usage tooling, or
+  monitoring reference those paths inside a graph directory, update them.
+- **The version gate is enforced in both directions, including read-only opens.**
+  A v0.8.0 binary refuses a pre-v0.8.0 graph with the rebuild message above; a
+  pre-v0.8.0 binary refuses a v0.8.0 graph with an
+  `upgrade omnigraph before opening this graph` error. There is no mixed-version
+  window: upgrade every binary that touches a graph together, then rebuild.
+
+If you have tooling that inspects `__manifest` directly, note that it now holds
+three kinds of rows (table versions, commits, branch heads) rather than one —
+filter by row kind instead of assuming every row is a table version.
+
+### Stricter validation — pre-flight your pipelines
+
+Independently of the storage change, v0.8.0 unifies constraint validation across
+all three write surfaces (load, mutation, branch merge). Every change is stricter;
+none relaxes an existing check. A pipeline that unknowingly relied on one of these
+gaps will now fail loudly at write time:
+
+- **Enum constraints are enforced on branch merge** (previously only on load and
+  mutation).
+- **Cross-version uniqueness**: inserting a `@unique` value that collides with a
+  different, already-committed row is rejected on load and mutation (previously
+  only merges caught it). Re-upserting the *same* row — same key — is still an
+  update, not a violation.
+- **Duplicate keys within one input batch are rejected**: the same `@key` value
+  twice in one load file is an error. The same id across *separate* batches or
+  statements still coalesces (last write wins).
+- **Overwrite loads validate the new image per table**: an edges-only overwrite
+  resolves referential integrity against the retained node tables, and orphan
+  edges are rejected.
+
+Pre-flight recipe: before upgrading a production writer, run your ingest with a
+v0.8.0 binary against a **branch** of a rebuilt copy, using the **same `--mode`
+your pipeline uses in production** (`--mode` is always required; `overwrite` is
+the mode whose validation changed most):
+
+```bash
+omnigraph load --data batch.jsonl --mode merge \
+  --branch preflight --from main s3://bucket/graph-v2.omni
+```
+
+Rows violating the stricter checks fail the load with a typed error naming the
+constraint; fix the data (or the constraint) and re-run. Nothing is partially
+applied — a failed load publishes no commit.
+
+### Verifying versions
+
+The two CLI checks are listed in
+[How you know you need this](#how-you-know-you-need-this) (`omnigraph version`,
+`omnigraph snapshot`). New in v0.8.0, the server's `GET /healthz` response also
+reports `internal_schema_version`.
