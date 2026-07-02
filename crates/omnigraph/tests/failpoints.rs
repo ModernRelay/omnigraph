@@ -479,19 +479,17 @@ async fn fork_collision_with_live_concurrent_fork_is_retryable() {
     );
 }
 
-// Phase 0.1b — the deterministic stale-warm publish interleave (the safety net
-// Phase 3's warm-attempt-0 publish is built against). Two INDEPENDENT
+// Phase 0.1b — the probe-catches-foreign-advance interleave. Two INDEPENDENT
 // coordinators (omnigraph_dst::Cohort, separate known_state) write DISJOINT
-// tables on main. Writer A is parked at the publish CAS boundary
-// (GRAPH_PUBLISH_BEFORE_COMMIT_APPEND) with its pre-check built against the
-// pre-B view; writer B then commits, advancing the manifest + the
-// graph_head:main §7.1 row. When A is released its commit append loses the CAS,
-// so the publisher retries INTERNALLY (cold reload + re-parent off B's commit)
-// and A still succeeds. The outcome is a single LINEAR chain with both
-// coordinators converged — exactly the property Phase 3 must preserve: the warm
-// pre-check is advisory, the CAS arbitrates, and on loss the next attempt is
-// cold. The cell holds today (publish always cold-reloads) and pins the
-// invariant before the warm path makes the stale pre-check reachable.
+// tables on main. Writer A parks at GRAPH_PUBLISH_BEFORE_COMMIT_APPEND — which
+// fires BEFORE the warm freshness probe — so when writer B commits during the
+// park and A is released, A's probe detects the foreign advance and attempt 0
+// loads COLD, re-parenting off B's commit. This pins the probe→cold fallback
+// (a foreign advance between op-start and publish never publishes against
+// stale warm state); the complementary cell where a genuinely STALE WARM
+// attempt reaches the CAS and loses is
+// `stale_warm_attempt_loses_graph_head_cas_then_cold_retry_converges` below
+// (parked AFTER the probe, at `publish.before_merge_rows`).
 //
 // Ordering is deterministic via the shared rendezvous: A parks first; B and A's
 // own retry fall through (reached already armed).
@@ -543,6 +541,86 @@ async fn stale_warm_publish_precheck_loses_cas_then_converges() {
         .expect("writer A's stale-warm publish must retry internally and succeed");
 
     // Single linear chain (base+2), both coordinators converged on the same head.
+    for (name, res) in run_convergence_battery(&cohort, "main", base + 2).await {
+        if let Err(f) = res {
+            panic!("convergence violation [{name}]: {}", f.message());
+        }
+    }
+}
+
+// The TRUE stale-warm CAS-loss cell: writer A parks at
+// `publish.before_merge_rows` — AFTER its freshness probe passed and its warm
+// attempt-0 state (folded known_state + head_hint) was built — then writer B,
+// a real lineage writer on a DISJOINT table, commits. When A is released, its
+// genuinely STALE warm merge-insert reaches the CAS and collides with B on the
+// shared `graph_head:main` §7.1 row (both are lineage writers), so Lance
+// rejects it as a retryable conflict; the publisher's outer retry reloads COLD
+// and re-parents off B. This is the exact schedule Layer 4's safety argument
+// rests on — "the warm pre-check is advisory, the CAS arbitrates, on loss the
+// next attempt is cold" — driven deterministically rather than argued.
+//
+// Two rendezvous keep the schedule PURE: B parks at `recovery.sidecar_write`
+// BEFORE its sidecar exists, so B's write-entry heal ran while A had no
+// pending sidecar and A's heal runs while B has none. Without that, the
+// parked victim's pending sidecar is visible to the other coordinator's
+// entry heal (two handles = separate write queues — the documented
+// in-process-only recovery serialization gap), which rolls the victim
+// forward as an `omnigraph:recovery` commit and turns the schedule into the
+// known one-winner heal race instead of the warm-CAS loss under test.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[serial]
+async fn stale_warm_attempt_loses_graph_head_cas_then_cold_retry_converges() {
+    let _scenario = FailScenario::setup();
+
+    let dir = tempfile::tempdir().unwrap();
+    let uri = dir.path().to_str().unwrap().to_string();
+
+    let cohort = Cohort::open_embedded(&uri, 2).await;
+    // Warm both coordinators (each commits once) so A's next publish runs the
+    // warm attempt-0 path rather than a cold first load.
+    cohort.writer(0).load(&person("warm-a")).await.unwrap();
+    cohort.writer(1).load(&doc("warm-b", "whatsapp")).await.unwrap();
+    let base = cohort
+        .writer(0)
+        .db()
+        .list_commits(Some("main"))
+        .await
+        .unwrap()
+        .len();
+
+    // B first: its entry heal runs (nothing pending), then it parks BEFORE
+    // writing its recovery sidecar.
+    let rv_b = helpers::failpoint::Rendezvous::park_first(names::RECOVERY_SIDECAR_WRITE);
+    let b = cohort.writer_arc(1);
+    let writer_b = tokio::spawn(async move { b.load(&doc("b-advance", "whatsapp")).await });
+    rv_b.wait_until_reached().await;
+
+    // A next: its entry heal sees no pending sidecar (B is parked pre-write),
+    // it probes (fresh — B hasn't committed), builds its WARM attempt, writes
+    // its own sidecar (falls through the reached rv_b), and parks just before
+    // the merge-insert.
+    let rv_a = helpers::failpoint::Rendezvous::park_first(names::PUBLISH_BEFORE_MERGE_ROWS);
+    let a = cohort.writer_arc(0);
+    let victim = tokio::spawn(async move { a.load(&person("a-stale")).await });
+    rv_a.wait_until_reached().await;
+
+    // Release B: it commits its lineage write (falling through the reached
+    // rv_a), advancing the manifest + graph_head:main past A's warm state.
+    rv_b.release();
+    writer_b
+        .await
+        .expect("B task join")
+        .expect("writer B commits while A parks");
+
+    // Release A: its stale warm merge-insert loses the graph_head CAS, the
+    // publisher retries cold, re-parents off B, and the write still succeeds.
+    rv_a.release();
+    victim
+        .await
+        .expect("victim task join")
+        .expect("stale warm attempt must fall back cold and commit");
+
+    // Both commits landed as one linear chain; both coordinators converge.
     for (name, res) in run_convergence_battery(&cohort, "main", base + 2).await {
         if let Err(f) = res {
             panic!("convergence violation [{name}]: {}", f.message());
