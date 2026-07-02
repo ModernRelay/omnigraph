@@ -392,9 +392,28 @@ pub async fn measure_with_staged<F: Future>(op: F) -> (F::Output, IoCounts, Stag
     (out, handles.counts(), staged)
 }
 
+/// Render the last measured op's `__manifest` request log for a failing cost
+/// assert — Lance's `assert_io_eq!` discipline (its macros dump `IoStats.requests`
+/// into the panic), so a failed count identifies WHICH RPCs happened without a
+/// diagnostic rerun. Empty outside `cost_harness`, where a note says so.
+fn request_log_for_failure() -> String {
+    let reads = last_manifest_reads();
+    if reads.is_empty() {
+        "\n(no __manifest request log — run inside `cost_harness` for one)".to_string()
+    } else {
+        format!(
+            "\n__manifest requests of the last measured op ({}):\n  {}",
+            reads.len(),
+            reads.join("\n  ")
+        )
+    }
+}
+
 /// Assert a per-depth metric is flat: the deepest sample must not exceed the
 /// shallowest by more than `slack`. `select` picks the field; `what` names it in
-/// the failure message. The shape every depth-swept cost gate uses.
+/// the failure message. The shape every depth-swept cost gate uses. On failure,
+/// the last measured op's `__manifest` request log is included (the
+/// `assert_io_eq!` shape) so the offending RPCs are visible without a rerun.
 pub fn assert_flat(
     curve: &[(u64, IoCounts)],
     select: impl Fn(&IoCounts) -> u64,
@@ -406,7 +425,8 @@ pub fn assert_flat(
     let (d_hi, hi) = (curve[curve.len() - 1].0, select(&curve[curve.len() - 1].1));
     assert!(
         hi <= lo + slack,
-        "{what} grew with history: depth {d_lo} = {lo} -> depth {d_hi} = {hi} (slack {slack})"
+        "{what} grew with history: depth {d_lo} = {lo} -> depth {d_hi} = {hi} (slack {slack}){}",
+        request_log_for_failure(),
     );
 }
 
@@ -424,7 +444,8 @@ pub fn assert_grows(
     let (d_hi, hi) = (curve[curve.len() - 1].0, select(&curve[curve.len() - 1].1));
     assert!(
         hi >= lo + min_delta,
-        "{what} did not grow as expected: depth {d_lo} = {lo} -> depth {d_hi} = {hi} (min delta {min_delta})"
+        "{what} did not grow as expected: depth {d_lo} = {lo} -> depth {d_hi} = {hi} (min delta {min_delta}){}",
+        request_log_for_failure(),
     );
 }
 
