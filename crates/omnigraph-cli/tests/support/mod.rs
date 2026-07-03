@@ -1,6 +1,7 @@
 #![allow(dead_code)]
 
 use std::fs;
+use std::io::{Read, Seek, SeekFrom};
 use std::net::TcpListener;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command as StdCommand, Output, Stdio};
@@ -219,7 +220,9 @@ fn spawn_server_process(command: StdCommand) -> TestServer {
     // "address in use" — retry on a fresh port. Stderr goes to a temp file
     // (not a pipe: a chatty healthy server would fill a pipe's buffer and
     // block; not null: a genuine startup failure must panic with the server's
-    // own error, not a bare exit status).
+    // own error, not a bare exit status). The retry is a stop-gap: the design
+    // fix is the server binding :0 itself and reporting the bound address
+    // (#327), which removes the race window entirely.
     const SPAWN_ATTEMPTS: usize = 5;
     for attempt in 1..=SPAWN_ATTEMPTS {
         let port = free_port();
@@ -250,15 +253,22 @@ fn spawn_server_process(command: StdCommand) -> TestServer {
             }
             sleep(Duration::from_millis(100));
         }
+        let read_stderr = |log: &mut std::fs::File| {
+            let mut stderr = String::new();
+            let _ = log.seek(SeekFrom::Start(0));
+            let _ = log.read_to_string(&mut stderr);
+            stderr
+        };
         let Some(status) = early_exit else {
+            // Stalled (alive but never healthy) — the server's own output is
+            // the most useful diagnostic here too, not just on early exit.
+            // Kill + wait first so the final stderr flush is captured.
             let _ = child.kill();
             let _ = child.wait();
-            panic!("server did not become healthy on {bind}");
+            let stderr = read_stderr(&mut stderr_log);
+            panic!("server did not become healthy on {bind}; stderr:\n{stderr}");
         };
-        use std::io::{Read, Seek, SeekFrom};
-        let mut stderr = String::new();
-        let _ = stderr_log.seek(SeekFrom::Start(0));
-        let _ = stderr_log.read_to_string(&mut stderr);
+        let stderr = read_stderr(&mut stderr_log);
         if attempt == SPAWN_ATTEMPTS {
             panic!(
                 "server exited before becoming healthy on every port \
