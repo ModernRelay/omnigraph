@@ -11,9 +11,10 @@ on:
   schedule:
     # Nightly backstop (07:00 UTC): re-runs the full suite + every RustFS shard
     # (including the S3 cost gates) so a regression that slipped through a CI
-    # outage or a post-merge-only path still surfaces within a day. A schedule
-    # event has no `before` SHA, so `classify_changes` short-circuits to
-    # run_full_ci=true + run_rustfs_ci=true — no classifier changes needed.
+    # outage or a post-merge-only path still surfaces within a day.
+    # `classify_changes` short-circuits `schedule` to run_full_ci=true +
+    # run_rustfs_ci=true EXPLICITLY (same arm as workflow_dispatch/tag), so the
+    # backstop never diffs a single commit and skips itself on a docs-only day.
     - cron: "0 7 * * *"
 
 concurrency:
@@ -46,7 +47,14 @@ jobs:
         run: |
           set -euo pipefail
 
-          if [[ "$EVENT_NAME" == "workflow_dispatch" || "$REF_TYPE" == "tag" ]]; then
+          # `schedule` (nightly backstop) and manual/tag runs always run the
+          # WHOLE suite: no base commit to diff against, and the intent is a
+          # full re-run regardless of what the tip commit touched. (A `schedule`
+          # event carries no `github.event.before`, so without this arm it would
+          # fall to the empty-base path below — correct today, but relying on
+          # that implicit fallthrough for a backstop is fragile; make it
+          # explicit.)
+          if [[ "$EVENT_NAME" == "workflow_dispatch" || "$EVENT_NAME" == "schedule" || "$REF_TYPE" == "tag" ]]; then
             echo "run_full_ci=true" >> "$GITHUB_OUTPUT"
             echo "run_rustfs_ci=true" >> "$GITHUB_OUTPUT"
             exit 0
