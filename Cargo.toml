@@ -1,5 +1,8 @@
 [workspace]
 resolver = "2"
+# The vendored patched crate is a [patch.crates-io] path source, not a
+# workspace member (see the patch section at the bottom of this file).
+exclude = ["vendor/lance-table"]
 members = [
     "crates/omnigraph-compiler",
     "crates/omnigraph",
@@ -86,3 +89,14 @@ opt-level = 2
 lto = "thin"
 codegen-units = 16
 strip = true
+
+# Vendored lance-table 7.0.0 carrying ONLY the lance#7480 hunk (rowids/index.rs):
+# tolerate sparse overlapping stable-row-id chunks so filtered reads survive an
+# update-style merge_insert followed by a delete (lance#7444;
+# iss-merge-rowid-overlap-corrupts-filtered-reads). Pinned by
+# lance_surface_guards.rs::filtered_scan_tolerates_merge_update_row_id_overlap.
+# REMOVE vendor/lance-table + this patch at the first Lance bump whose
+# lance-table ships lance#7480 (9.0.0, or a backported 8.0.1). Details:
+# vendor/lance-table/README.omnigraph.md and docs/dev/lance.md.
+[patch.crates-io]
+lance-table = { path = "vendor/lance-table" }
