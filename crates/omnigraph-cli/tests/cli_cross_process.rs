@@ -38,21 +38,26 @@ enum Outcome {
 }
 
 /// Drive one CLI write with the contractually-required app-level retry on
-/// contention. A *classified* known bug (RC-1 cross-process uncovered drift) is
-/// returned as `KnownBug` and tolerated, exactly as the DST walk allow-lists it.
-/// A NOVEL (unclassified, non-retryable) error fails loudly.
+/// contention. RETRY-FIRST, then classify: a retryable contention signal (the
+/// transient "stale view … refresh and retry" CAS loss) is always retried —
+/// classifying it before retrying would record a routine race as the known bug
+/// and mask the convergence the retry exists to prove. Only a NON-retryable
+/// error is checked against the classifier, whose CLI arm accepts solely the
+/// full RC-1 durable-drift signature ("ahead of manifest version" + "omnigraph
+/// repair"). Everything else — including a stale view that survives all
+/// retries — fails the run loudly as NOVEL (default-deny).
 async fn load_classified(w: Arc<Cli>, jsonl: String, who: &'static str) -> Outcome {
     for attempt in 0..16u32 {
         match w.load(&jsonl).await {
             Ok(()) => return Outcome::Committed,
             Err(e) => {
-                if let Some(bug) = classify_backend(&e) {
-                    eprintln!("[cross-process] {who} hit known bug ({bug}); tolerated");
-                    return Outcome::KnownBug(bug);
-                }
                 if attempt < 15 && is_retryable(&e) {
                     tokio::time::sleep(Duration::from_millis(25 * u64::from(attempt + 1))).await;
                     continue;
+                }
+                if let Some(bug) = classify_backend(&e) {
+                    eprintln!("[cross-process] {who} hit known bug ({bug}); tolerated");
+                    return Outcome::KnownBug(bug);
                 }
                 panic!("{who} NOVEL load failure: {}", e.message());
             }

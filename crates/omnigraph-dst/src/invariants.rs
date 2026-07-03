@@ -94,10 +94,16 @@ pub fn classify_backend(e: &BackendError) -> Option<&'static str> {
         BackendError::Engine(oe) => classify_engine_error(oe),
         BackendError::Cli { stderr, .. } => {
             // Out-of-process there's no OmniError variant to gate on, so gate RC-1
-            // on its DISTINCTIVE strings only — NOT the generic "expected"+"current"
-            // that `classify_engine_signal` allows under is_manifest, which could
-            // appear in unrelated CLI errors and mask a novel finding.
-            if stderr.contains("stale view") || stderr.contains("ahead of manifest version") {
+            // on its full DURABLE-drift signature only: the precondition refusal
+            // names both the drift ("ahead of manifest version") and the remedy
+            // ("omnigraph repair") in one message. The write-time "stale view"
+            // surface is deliberately NOT accepted here: it is a transient CAS
+            // loss the caller's retry loop must clear (a refresh either succeeds
+            // or escalates to this drift refusal), so a stale view that survives
+            // the retries is a NOVEL finding, not the classified bug.
+            // Default-deny: anything else falls through to None and fails loudly.
+            if stderr.contains("ahead of manifest version") && stderr.contains("omnigraph repair")
+            {
                 Some("RC-1 stale-view")
             } else if stderr.contains("from_sorted_iter") || stderr.contains("non-sorted input") {
                 Some("RC-X/#7230 scalar-BTREE")

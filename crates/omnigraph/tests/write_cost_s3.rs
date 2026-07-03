@@ -88,15 +88,20 @@ async fn data_table_opener_is_flat_in_history_on_s3() {
 /// ratchet the ceiling down as each U1 layer removes a LIST/round-trip.
 #[tokio::test]
 async fn warm_write_cost_flat_and_bounded_in_history_on_s3() {
-    let Some(mut db) = s3_graph("write-cost-warm").await else {
-        eprintln!(
-            "SKIP warm_write_cost_flat_and_bounded_in_history_on_s3: \
-             OMNIGRAPH_S3_TEST_BUCKET unset (or store unreachable)"
-        );
-        return;
-    };
-
     cost_harness(async move {
+        // Open INSIDE `cost_harness` so the long-lived coordinator handle (the
+        // one the warm freshness probe reads through) is created UNDER the
+        // ground-truth `__manifest` tracker. Opened outside, the probe's reads
+        // escape the counters and a probe regression passes as flat — the exact
+        // blind spot `cost_harness` exists to close.
+        let Some(mut db) = s3_graph("write-cost-warm").await else {
+            eprintln!(
+                "SKIP warm_write_cost_flat_and_bounded_in_history_on_s3: \
+                 OMNIGRAPH_S3_TEST_BUCKET unset (or store unreachable)"
+            );
+            return;
+        };
+
         let mut curve: Vec<(u64, IoCounts)> = Vec::new();
         let mut current = 0u64;
         // Depth capped at 50 (matches the opener test). Going to 100 trips a Lance
@@ -145,14 +150,21 @@ async fn warm_write_cost_flat_and_bounded_in_history_on_s3() {
         // the measured baseline + 1. **Ratchet DOWN as each U1 layer removes a LIST**
         // (target: list ~1, num_stages ~3 — LanceDB's measured warm commit).
         let shallow = &curve[0].1;
+        // Ceiling provenance: baseline 6 LISTs / 13 stages was measured with the
+        // coordinator handle opened OUTSIDE the harness (the warm probe's reads
+        // untracked). Ground-truth counting adds the probe's S3 RPCs (~1 LIST +
+        // 1-2 stages), so the ceilings carry that headroom until the first cost-
+        // shard run re-baselines them — tighten to measured then.
         assert!(
-            shallow.manifest_list_requests <= 7,
-            "warm-write __manifest LIST ceiling exceeded: {} (baseline 6; a layer regressed?)",
+            shallow.manifest_list_requests <= 8,
+            "warm-write __manifest LIST ceiling exceeded: {} (untracked-probe baseline 6 \
+             + probe headroom; a layer regressed?)",
             shallow.manifest_list_requests,
         );
         assert!(
-            shallow.manifest_num_stages <= 14,
-            "warm-write __manifest round-trip ceiling exceeded: {} (baseline 13)",
+            shallow.manifest_num_stages <= 16,
+            "warm-write __manifest round-trip ceiling exceeded: {} (untracked-probe \
+             baseline 13 + probe headroom)",
             shallow.manifest_num_stages,
         );
 
@@ -188,15 +200,18 @@ async fn warm_write_cost_flat_and_bounded_in_history_on_s3() {
 /// `OMNIGRAPH_S3_TEST_BUCKET` set.
 #[tokio::test]
 async fn served_regime_manifest_scan_is_flat_with_warm_publish_on_s3() {
-    let Some(mut db) = s3_graph("write-cost-grows").await else {
-        eprintln!(
-            "SKIP served_regime_manifest_scan_is_flat_with_warm_publish_on_s3: \
-             OMNIGRAPH_S3_TEST_BUCKET unset (or store unreachable)"
-        );
-        return;
-    };
-
     cost_harness(async move {
+        // Open INSIDE `cost_harness` (see the flat gate above): the coordinator
+        // handle must be created under the ground-truth tracker or the warm
+        // probe's reads escape the counts.
+        let Some(mut db) = s3_graph("write-cost-grows").await else {
+            eprintln!(
+                "SKIP served_regime_manifest_scan_is_flat_with_warm_publish_on_s3: \
+                 OMNIGRAPH_S3_TEST_BUCKET unset (or store unreachable)"
+            );
+            return;
+        };
+
         let mut curve: Vec<(u64, IoCounts)> = Vec::new();
         let mut current = 0u64;
         // Same 10→50 sweep as the flat gate (depth 100 trips the unrelated Lance
