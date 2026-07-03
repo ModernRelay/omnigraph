@@ -23,7 +23,10 @@
 //! opener flat, scan growing.)
 //!
 //! Skips gracefully without `OMNIGRAPH_S3_TEST_BUCKET` (the `tests/s3_storage.rs`
-//! pattern); runs for real in the rustfs CI job (`.github/workflows/ci.yml`).
+//! pattern). A cost (IO-count) gate, not a correctness test — run on demand
+//! against RustFS/S3, NOT in the every-merge `rustfs_integration` CI job
+//! (pulled out pending a dedicated cost/perf harness; see the backend-split
+//! note in docs/dev/testing.md § Cost-budget tests).
 #![recursion_limit = "512"]
 
 mod helpers;
