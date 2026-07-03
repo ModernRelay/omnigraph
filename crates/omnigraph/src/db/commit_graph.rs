@@ -60,7 +60,7 @@ impl CommitGraph {
     /// the cache chain-complete after a reparent onto a foreign head — with no
     /// storage I/O (the publish already read these rows). Same conversion and
     /// head selection as the manifest-sourced load, so the two cannot drift.
-    pub fn ingest_lineage_rows(
+    pub(crate) fn ingest_lineage_rows(
         &mut self,
         rows: Vec<crate::db::manifest::GraphLineageRow>,
     ) {

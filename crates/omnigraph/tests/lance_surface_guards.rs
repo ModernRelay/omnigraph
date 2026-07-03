@@ -1241,6 +1241,7 @@ async fn filtered_scan_tolerates_merge_update_row_id_overlap() {
         let rows: usize = batches.iter().map(|b| b.num_rows()).sum();
         assert_eq!(rows, expected, "filtered read for {slug}");
     }
+}
 
 // --- Guard: row-lineage stamping survives an in-attempt rebase ---------------
 //
