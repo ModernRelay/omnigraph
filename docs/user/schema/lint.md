@@ -32,7 +32,7 @@ The chassis defines ten families. Today only DS and MF have emitted codes. The r
 | `OG-DS-105` | Destructive | destructive | error | drop populated vector column (reserved) |
 | `OG-MF-103` | Maybe-fail | validated | error | add required property without `@default` to populated type |
 | `OG-MF-104` | Maybe-fail | validated | error | tighten nullable to non-nullable (reserved) |
-| `OG-MF-106` | Maybe-fail | destructive | error | narrowing scalar type |
+| `OG-MF-106` | Maybe-fail | destructive | error | property type change (incl. enum narrowing / variant rename / enum↔String; pure enum *widening* plans as a supported `ExtendEnum` step instead) |
 
 ## Families
 
