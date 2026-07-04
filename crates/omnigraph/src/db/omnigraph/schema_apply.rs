@@ -257,7 +257,12 @@ where
             // critical path by ensure_indices/optimize (iss-848), so the apply
             // does no table work for it — a pure metadata change like the two
             // metadata steps below.
+            // ExtendEnum is a pure widening (planner-verified superset): every
+            // committed row is valid under the wider set, so no table data is
+            // touched — the accepted catalog update alone makes the unified
+            // validator accept the new variants on all three write surfaces.
             SchemaMigrationStep::AddConstraint { .. }
+            | SchemaMigrationStep::ExtendEnum { .. }
             | SchemaMigrationStep::UpdateTypeMetadata { .. }
             | SchemaMigrationStep::UpdatePropertyMetadata { .. } => {}
             SchemaMigrationStep::DropProperty {
