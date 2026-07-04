@@ -36,7 +36,6 @@
 
 use std::collections::HashMap;
 
-use lance::Dataset;
 use serde::{Deserialize, Serialize};
 use tracing::warn;
 
@@ -737,9 +736,13 @@ pub(crate) async fn restore_table_to_version(
     branch: Option<&str>,
     target_version: u64,
 ) -> Result<()> {
-    let head = Dataset::open(table_path)
-        .await
-        .map_err(|e| OmniError::Lance(e.to_string()))?;
+    let head = crate::instrumentation::open_dataset(
+        table_path,
+        crate::instrumentation::VersionResolution::Latest,
+        None,
+        crate::instrumentation::table_wrapper(),
+    )
+    .await?;
     let head = match branch {
         Some(b) if b != "main" => head
             .checkout_branch(b)
@@ -1729,9 +1732,13 @@ async fn roll_forward_all(
             continue;
         }
         let dataset_uri = format!("{}/{}", root_uri.trim_end_matches('/'), reg.table_path);
-        let head_ds = Dataset::open(&dataset_uri)
-            .await
-            .map_err(|e| OmniError::Lance(e.to_string()))?;
+        let head_ds = crate::instrumentation::open_dataset(
+            &dataset_uri,
+            crate::instrumentation::VersionResolution::Latest,
+            None,
+            crate::instrumentation::table_wrapper(),
+        )
+        .await?;
         let head_ds = match reg.table_branch.as_deref() {
             Some(b) if b != "main" => head_ds
                 .checkout_branch(b)
@@ -1826,9 +1833,13 @@ async fn push_table_update(
     updates: &mut Vec<ManifestChange>,
     expected: &mut HashMap<String, u64>,
 ) -> Result<u64> {
-    let ds = Dataset::open(table_path)
-        .await
-        .map_err(|e| OmniError::Lance(e.to_string()))?;
+    let ds = crate::instrumentation::open_dataset(
+        table_path,
+        crate::instrumentation::VersionResolution::Latest,
+        None,
+        crate::instrumentation::table_wrapper(),
+    )
+    .await?;
     let ds = match branch {
         Some(b) if b != "main" => ds
             .checkout_branch(b)
@@ -1924,9 +1935,13 @@ pub(crate) async fn has_schema_apply_sidecar(
 /// HEAD version. Recovery uses this so feature-branch sidecars classify
 /// against the feature-branch's Lance HEAD, not main's.
 async fn open_lance_head(table_path: &str, branch: Option<&str>) -> Result<u64> {
-    let ds = Dataset::open(table_path)
-        .await
-        .map_err(|e| OmniError::Lance(e.to_string()))?;
+    let ds = crate::instrumentation::open_dataset(
+        table_path,
+        crate::instrumentation::VersionResolution::Latest,
+        None,
+        crate::instrumentation::table_wrapper(),
+    )
+    .await?;
     let ds = match branch {
         Some(b) if b != "main" => ds
             .checkout_branch(b)
@@ -1977,6 +1992,7 @@ pub(crate) fn new_sidecar(
 mod tests {
     use super::*;
     use crate::storage::ObjectStorageAdapter;
+    use lance::Dataset;
     use crate::table_store::TableStore;
     use arrow_array::{Int32Array, RecordBatch, StringArray};
     use arrow_schema::{DataType, Field, Schema};

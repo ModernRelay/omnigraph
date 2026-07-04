@@ -21,8 +21,10 @@ pub(crate) fn manifest_uri(root: &str) -> String {
 
 pub(super) async fn open_manifest_dataset(root_uri: &str, branch: Option<&str>) -> Result<Dataset> {
     let uri = manifest_uri(root_uri.trim_end_matches('/'));
-    let dataset = crate::instrumentation::open_dataset_tracked(
+    let dataset = crate::instrumentation::open_dataset(
         &uri,
+        crate::instrumentation::VersionResolution::Latest,
+        None,
         crate::instrumentation::manifest_wrapper(),
     )
     .await?;

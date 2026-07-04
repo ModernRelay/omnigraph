@@ -264,7 +264,13 @@ impl TableHandleCache {
         // Miss: open without holding the lock (the open is async IO). A concurrent
         // double-miss opens twice and one wins the insert — correct (the dataset
         // at a version is immutable) and rare.
-        let ds = crate::instrumentation::open_table_dataset(location, version, session).await?;
+        let ds = crate::instrumentation::open_dataset(
+            location,
+            crate::instrumentation::VersionResolution::At(version),
+            session,
+            crate::instrumentation::table_wrapper(),
+        )
+        .await?;
         let mut inner = self.inner.lock().await;
         if let Some(existing) = inner.entries.get(&key).cloned() {
             return Ok(existing);

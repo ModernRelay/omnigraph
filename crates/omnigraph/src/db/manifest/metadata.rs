@@ -229,9 +229,13 @@ pub(super) async fn table_version_metadata_for_state(
     version: u64,
 ) -> Result<TableVersionMetadata> {
     let full_path = format!("{}/{}", root_uri.trim_end_matches('/'), table_path);
-    let ds = Dataset::open(&full_path)
-        .await
-        .map_err(|e| OmniError::Lance(e.to_string()))?;
+    let ds = crate::instrumentation::open_dataset(
+        &full_path,
+        crate::instrumentation::VersionResolution::Latest,
+        None,
+        crate::instrumentation::table_wrapper(),
+    )
+    .await?;
     let ds = match branch {
         Some(branch) => ds
             .checkout_branch(branch)
