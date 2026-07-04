@@ -63,6 +63,7 @@ A migration plan compares the accepted schema against the desired one and report
 - Add a property
 - Rename a property
 - Add a constraint
+- Extend an enum (pure widening: add variants to an existing `enum(...)` property — same base type and nullability, every existing value retained; metadata-only at apply time, no table data touched, and the new variants are accepted immediately on every write surface. Narrowing, renaming a variant, or converting between an enum and a free `String` still plan as unsupported, `OG-MF-106`. Value *order* is not significant — the schema IR normalizes enum values, so a reorder is not a change at all.)
 - Update type or property metadata (annotations)
 - Unsupported change (reports the entity and reason; forces the plan to unsupported)
 
