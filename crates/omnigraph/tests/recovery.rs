@@ -1441,7 +1441,7 @@ async fn recovery_classifies_feature_branch_sidecar_against_feature_branch() {
     // Bypass the manifest: append directly to Person's Lance HEAD on the
     // feature branch ref to advance HEAD past v_pin.
     let person_uri = node_table_uri(uri, "Person");
-    let store = TableStore::new(uri);
+    let store = TableStore::new(uri, std::sync::Arc::new(lance::session::Session::default()));
     let mut ds = store
         .open_dataset_head(&person_uri, feature_branch_name.as_deref())
         .await
@@ -1556,7 +1556,7 @@ async fn recovery_rolls_back_feature_branch_sidecar_against_feature_branch() {
     // Bypass the manifest: append on the feature ref to advance HEAD past
     // the manifest pin.
     let person_uri = node_table_uri(uri, "Person");
-    let store = TableStore::new(uri);
+    let store = TableStore::new(uri, std::sync::Arc::new(lance::session::Session::default()));
     let mut ds = store
         .open_dataset_head(&person_uri, feature_branch_name.as_deref())
         .await

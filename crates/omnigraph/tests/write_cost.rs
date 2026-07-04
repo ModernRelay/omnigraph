@@ -92,7 +92,7 @@ async fn internal_table_scans_are_flat_in_history() {
 ///
 /// **This is a TRIPWIRE, not the final gate.** It asserts the scan *grows*, i.e. it
 /// pins the CURRENT served-regime cost (green today) — exactly the `assert_grows`
-/// idiom its sibling `data_table_reads_split_into_flat_opener_and_growing_scan` uses,
+/// idiom its sibling `data_table_reads_split_into_flat_opener_and_scan_flat_with_session` uses,
 /// and the "turns red when the fix lands" shape of the Lance surface guards. It flips
 /// RED the moment the amplification is fixed (write-path probe-gated warm reuse, and
 /// bringing `__manifest` into `cleanup` version-GC so F stays bounded in history).
@@ -141,15 +141,20 @@ async fn internal_table_scans_grow_without_compaction() {
 // *probe that isolates* the opener (the `PrefixCounter` split) is validated here,
 // every-PR, on local FS:
 
-/// Proves the `PrefixCounter` opener/scan split: a committing write's data-table
-/// reads divide into a **flat opener** term and a **growing scan** term. This pins
-/// (a) the classifier actually attributes reads to the opener bucket (non-zero, so a
-/// flat assertion isn't vacuously flat-at-zero), and (b) the local data-table growth
-/// is the merge-insert/RI fragment scan, not the opener — which is *why* the S3
-/// gate asserts `data_opener_reads`, not total `data_reads`. (On local FS the opener
-/// is O(1) regardless of step 3a; the opener's history-dependence is gated on S3.)
+/// Proves the `PrefixCounter` opener/scan split — and that BOTH terms are now
+/// flat in history on local FS. The opener was always O(1) locally (step 3a);
+/// the merge-insert/RI fragment-scan term used to grow with fragment count and
+/// was flattened by the dataset-opener unification attaching the shared
+/// per-graph `Session` to write-side opens: fragment/manifest metadata is
+/// immutable per version, so repeat writes serve it from the session cache
+/// instead of re-reading O(depth) objects. This pins (a) the classifier
+/// actually attributes reads to the opener bucket (non-zero, so a flat
+/// assertion isn't vacuously flat-at-zero), and (b) the session-flattened scan
+/// term stays flat — a regression red here means a write-side open dropped the
+/// session. (The opener's history-dependence on a real object store stays
+/// gated by `write_cost_s3.rs`.)
 #[tokio::test]
-async fn data_table_reads_split_into_flat_opener_and_growing_scan() {
+async fn data_table_reads_split_into_flat_opener_and_scan_flat_with_session() {
     let dir = tempfile::tempdir().unwrap();
     let mut db = local_graph(&dir).await;
 
@@ -175,7 +180,10 @@ async fn data_table_reads_split_into_flat_opener_and_growing_scan() {
          so a flat opener assertion would be vacuous"
     );
     assert_flat(&curve, |c| c.data_opener_reads, 4, "local data-table opener");
-    assert_grows(&curve, |c| c.data_scan_reads, 20, "local data-table scan");
+    // Pre-session this term GREW with fragment count (the merge-insert/RI scan
+    // re-reading O(depth) fragment metadata per write); the shared session
+    // makes repeat reads of immutable metadata cache hits, so it is now flat.
+    assert_flat(&curve, |c| c.data_scan_reads, 4, "local data-table scan (session-cached)");
 }
 
 // ── (B) Green-today regression guards — run on every PR ──
