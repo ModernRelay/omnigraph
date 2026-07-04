@@ -1411,7 +1411,7 @@ async fn scan_with_pending_rejects_key_column_missing_from_projection() {
 
     let dir = tempfile::tempdir().unwrap();
     let uri = format!("{}/people.lance", dir.path().to_str().unwrap());
-    let store = TableStore::new(dir.path().to_str().unwrap(), std::sync::Arc::new(lance::session::Session::default()));
+    let store = TableStore::new(dir.path().to_str().unwrap(), test_session());
 
     let schema = Arc::new(Schema::new(vec![
         Field::new("id", DataType::Utf8, false),

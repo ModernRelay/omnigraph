@@ -15,7 +15,8 @@ use helpers::recovery::{
     branch_head_commit_id, single_sidecar_operation_id,
 };
 use helpers::{
-    MUTATION_QUERIES, collect_column_strings, mixed_params, mutate_main, read_table, version_main,
+    MUTATION_QUERIES, collect_column_strings, mixed_params, mutate_main, read_table, test_session,
+    version_main,
 };
 
 const SCHEMA_V1: &str = "node Person { name: String @key }\n";
@@ -1131,7 +1132,7 @@ async fn recovery_rolls_forward_ensure_indices_on_feature_branch() {
     // publisher deliberately skips the normal index-rebuild preparation;
     // the failed writer below is still the real `ensure_indices_on`.
     let person_uri = node_table_uri(&uri, "Person");
-    let store = TableStore::new(&uri, std::sync::Arc::new(lance::session::Session::default()));
+    let store = TableStore::new(&uri, test_session());
     let mut ds = store
         .open_dataset_head(&person_uri, Some("feature"))
         .await
