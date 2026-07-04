@@ -98,7 +98,7 @@ pub struct SchemaApplyPreview {
 /// (each of which re-runs `ensure_schema_state_valid`). When absent (`None` — every
 /// non-mutate/load caller), every threaded function behaves byte-identically to
 /// before. The carrier never removes a version guard or changes which dataset version
-/// the per-table open targets: strict ops keep `open_dataset_head_for_write` +
+/// the per-table open targets: strict ops keep `open_dataset_head` +
 /// `ensure_expected_version`, and the commit-time OCC re-read still opens a fresh
 /// manifest snapshot (via `fresh_snapshot_for_branch_unchecked`) — only the redundant
 /// schema re-validation is dropped.
