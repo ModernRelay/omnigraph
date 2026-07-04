@@ -107,11 +107,14 @@ impl StagedTableNamespace {
     }
 
     async fn open_head(&self) -> Result<Dataset> {
+        // A staged-table namespace opens a DATA table (its `table_uri` is the
+        // per-table physical path), so its opens count in the data-table
+        // bucket, not the internal/manifest one.
         crate::instrumentation::open_dataset(
             &self.table_uri(),
             crate::instrumentation::VersionResolution::Latest,
             None,
-            crate::instrumentation::manifest_wrapper(),
+            crate::instrumentation::table_wrapper(),
         )
         .await
     }
