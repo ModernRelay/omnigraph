@@ -75,6 +75,11 @@ pub enum SchemaMigrationStep {
         constraint: Constraint,
     },
     /// Widen an enum property's value set. Emitted only for a PURE widening —
+    /// and `property_name` is the DESIRED (post-rename) name: when a property
+    /// is renamed and widened in one migration, the plan emits
+    /// `RenameProperty` first and this step names the new property, so a
+    /// sequential step consumer resolves it after the rename.
+    ///
     /// same scalar/list shape, same nullability, and the desired value set is
     /// a superset of the accepted one (order-insensitive; enum semantics are
     /// set membership, not position). Metadata-only at apply time: every
@@ -967,6 +972,41 @@ node Ticket {
             plan.steps.is_empty(),
             "reorder must be a no-op plan: {:?}",
             plan.steps
+        );
+    }
+
+    #[test]
+    fn plan_orders_rename_before_widening_and_names_the_new_property() {
+        // A property renamed AND widened in one migration emits both steps:
+        // RenameProperty first, then ExtendEnum carrying the post-rename name
+        // (the sequential-consumer contract pinned on the variant's doc).
+        let accepted = ir(ENUM_ACCEPTED);
+        let desired = ir(
+            r#"
+node Ticket {
+    slug: String @key
+    state: enum(todo, doing, done, blocked) @rename_from("status")
+}
+"#,
+        );
+        let plan = plan_schema_migration(&accepted, &desired).unwrap();
+        assert!(plan.supported, "rename+widen must be supported: {plan:?}");
+        let rename_pos = plan.steps.iter().position(|s| {
+            matches!(s, RenameProperty { from, to, .. } if from == "status" && to == "state")
+        });
+        let widen_pos = plan.steps.iter().position(|s| {
+            matches!(
+                s,
+                SchemaMigrationStep::ExtendEnum { property_name, added_values, .. }
+                    if property_name == "state" && added_values == &vec!["blocked".to_string()]
+            )
+        });
+        let (Some(rename_pos), Some(widen_pos)) = (rename_pos, widen_pos) else {
+            panic!("expected RenameProperty + ExtendEnum, got: {:?}", plan.steps);
+        };
+        assert!(
+            rename_pos < widen_pos,
+            "rename must precede the widening for sequential consumers"
         );
     }
 
