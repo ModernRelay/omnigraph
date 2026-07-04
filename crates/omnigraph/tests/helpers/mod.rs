@@ -47,6 +47,13 @@ query insert_person_and_friend($name: String, $age: I32, $friend: String) {
 }
 "#;
 
+/// A standalone Lance `Session` for tests that construct a `TableStore`
+/// directly (production stores share the graph's per-connection session;
+/// tests get a fresh one — the cache scope is the test).
+pub fn test_session() -> std::sync::Arc<lance::session::Session> {
+    std::sync::Arc::new(lance::session::Session::default())
+}
+
 /// Init a graph and load the standard test data.
 pub async fn init_and_load(dir: &tempfile::TempDir) -> Omnigraph {
     let uri = dir.path().to_str().unwrap();
