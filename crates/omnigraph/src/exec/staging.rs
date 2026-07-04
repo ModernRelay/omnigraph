@@ -773,7 +773,7 @@ impl StagedMutation {
             // already-open staged handle (the #2 staging open) WITHOUT a fresh
             // `Dataset::open` — the same cheap live-HEAD probe
             // `ManifestCoordinator::probe_latest_version` uses. This replaces a
-            // redundant `open_dataset_head_for_write` (RFC-013 step 3b, collapse
+            // redundant `open_dataset_head` (RFC-013 step 3b, collapse
             // #3): the drift comparison below is byte-identical; only how `head`
             // is obtained changes (probe vs cold open).
             let head = entry

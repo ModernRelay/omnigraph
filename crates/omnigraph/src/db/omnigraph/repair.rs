@@ -171,7 +171,7 @@ pub async fn repair_all_tables(db: &Omnigraph, options: RepairOptions) -> Result
         // unwrap the opaque handle (mirrors optimize / cleanup).
         let ds = db
             .storage()
-            .open_dataset_head_for_write(&table_key, &full_path, None)
+            .open_dataset_head(&full_path, None)
             .await?
             .into_dataset();
         let manifest_version = snapshot

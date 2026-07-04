@@ -58,7 +58,7 @@ pub(super) async fn failpoint_publish_table_head_without_index_rebuild_for_test(
     let full_path = format!("{}/{}", db.root_uri, entry.table_path);
     let ds = db
         .storage()
-        .open_dataset_head_for_write(table_key, &full_path, table_branch)
+        .open_dataset_head(&full_path, table_branch)
         .await?;
     let state = db.storage().table_state(&full_path, &ds).await?;
     let update = crate::db::SubTableUpdate {
@@ -118,14 +118,7 @@ pub(super) async fn ensure_indices_for_branch(
             continue;
         }
         let full_path = format!("{}/{}", db.root_uri, entry.table_path);
-        if needs_index_work_node(
-            db,
-            type_name,
-            &table_key,
-            &full_path,
-            entry.table_branch.as_deref(),
-        )
-        .await?
+        if needs_index_work_node(db, type_name, &full_path, entry.table_branch.as_deref()).await?
         {
             recovery_pins.push(crate::db::manifest::SidecarTablePin {
                 table_key,
@@ -154,7 +147,7 @@ pub(super) async fn ensure_indices_for_branch(
             continue;
         }
         let full_path = format!("{}/{}", db.root_uri, entry.table_path);
-        if needs_index_work_edge(db, &table_key, &full_path, entry.table_branch.as_deref()).await? {
+        if needs_index_work_edge(db, &full_path, entry.table_branch.as_deref()).await? {
             recovery_pins.push(crate::db::manifest::SidecarTablePin {
                 table_key,
                 table_path: full_path,
@@ -226,7 +219,7 @@ pub(super) async fn ensure_indices_for_branch(
             },
             None => (
                 db.storage()
-                    .open_dataset_head_for_write(&table_key, &full_path, None)
+                    .open_dataset_head(&full_path, None)
                     .await?,
                 None,
             ),
@@ -274,7 +267,7 @@ pub(super) async fn ensure_indices_for_branch(
             },
             None => (
                 db.storage()
-                    .open_dataset_head_for_write(&table_key, &full_path, None)
+                    .open_dataset_head(&full_path, None)
                     .await?,
                 None,
             ),
@@ -405,13 +398,12 @@ async fn vector_column_trainable(
 pub(super) async fn needs_index_work_node(
     db: &Omnigraph,
     type_name: &str,
-    table_key: &str,
     full_path: &str,
     table_branch: Option<&str>,
 ) -> Result<bool> {
     let ds = db
         .storage()
-        .open_dataset_head_for_write(table_key, full_path, table_branch)
+        .open_dataset_head(full_path, table_branch)
         .await?;
     // Empty tables are skipped by the ensure_indices loop, so they must
     // not be pinned in the sidecar — pinning a table that produces zero
@@ -479,13 +471,12 @@ pub(super) async fn needs_index_work_node(
 /// way node tables are; see `needs_index_work_node`.
 pub(super) async fn needs_index_work_edge(
     db: &Omnigraph,
-    table_key: &str,
     full_path: &str,
     table_branch: Option<&str>,
 ) -> Result<bool> {
     let ds = db
         .storage()
-        .open_dataset_head_for_write(table_key, full_path, table_branch)
+        .open_dataset_head(full_path, table_branch)
         .await?;
     if db.storage().count_rows(&ds, None).await? == 0 {
         return Ok(false);
@@ -581,7 +572,7 @@ pub(super) async fn open_for_mutation_on_branch(
     // publisher's CAS fence), which is exactly the pinned base version. The base
     // already validated the schema contract once, and the staging reopen
     // (`reopen_for_mutation`) plus the publisher CAS in `commit_all` are the real
-    // drift guards. So skip `open_dataset_head_for_write` entirely and source the
+    // drift guards. So skip `open_dataset_head` entirely and source the
     // expected version from the pinned entry.
     //
     // Gated on `txn.is_some()`: without a txn (branch merge's `open_for_mutation`)
@@ -620,7 +611,7 @@ pub(super) async fn open_for_mutation_on_branch(
         None => {
             let ds = db
                 .storage()
-                .open_dataset_head_for_write(table_key, &full_path, None)
+                .open_dataset_head(&full_path, None)
                 .await?;
             if op_kind.strict_pre_stage_version_check() {
                 db.storage()
@@ -669,7 +660,7 @@ pub(super) async fn open_owned_dataset_for_branch_write(
         Some(branch) if branch == active_branch => {
             let ds = db
                 .storage()
-                .open_dataset_head_for_write(table_key, full_path, Some(active_branch))
+                .open_dataset_head(full_path, Some(active_branch))
                 .await?;
             if op_kind.strict_pre_stage_version_check() {
                 db.storage()
@@ -711,7 +702,7 @@ pub(super) async fn open_owned_dataset_for_branch_write(
             .await?;
             let ds = db
                 .storage()
-                .open_dataset_head_for_write(table_key, full_path, Some(active_branch))
+                .open_dataset_head(full_path, Some(active_branch))
                 .await?;
             if op_kind.strict_pre_stage_version_check() {
                 db.storage()
@@ -931,7 +922,7 @@ pub(super) async fn reopen_for_mutation(
         // [`crate::db::MutationOpKind`] for the policy rationale.
         let _ = expected_version;
         db.storage()
-            .open_dataset_head_for_write(table_key, full_path, table_branch)
+            .open_dataset_head(full_path, table_branch)
             .await
     }
 }

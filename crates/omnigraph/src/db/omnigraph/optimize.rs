@@ -385,7 +385,7 @@ async fn optimize_one_table(
         // opaque `SnapshotHandle` via `into_dataset()` (gated to the maintenance path).
         let mut ds = db
             .storage()
-            .open_dataset_head_for_write(&table_key, &full_path, None)
+            .open_dataset_head(&full_path, None)
             .await?
             .into_dataset();
 
@@ -444,10 +444,10 @@ async fn optimize_one_table(
         // recovery and rolls back siblings).
         let needs_reindex = TableStore::has_unindexed_fragments(&ds).await?;
         let needs_index_create = if let Some(type_name) = table_key.strip_prefix("node:") {
-            super::table_ops::needs_index_work_node(db, type_name, &table_key, &full_path, None)
+            super::table_ops::needs_index_work_node(db, type_name, &full_path, None)
                 .await?
         } else {
-            super::table_ops::needs_index_work_edge(db, &table_key, &full_path, None).await?
+            super::table_ops::needs_index_work_edge(db, &full_path, None).await?
         };
         if !will_compact && !needs_reindex && !needs_index_create {
             if head_advanced {
@@ -778,7 +778,7 @@ async fn compact_internal_table(
     for attempt in 0..COMPACTION_RETRY_BUDGET {
         let handle = db
             .storage()
-            .open_dataset_head_for_write(table_key, &uri, None)
+            .open_dataset_head(&uri, None)
             .await?;
         let mut ds = handle.into_dataset();
 
@@ -911,7 +911,7 @@ pub async fn cleanup_all_tables(
                 // surfaced through `TableStorage` — see the optimize path
                 // above for the same rationale. Unwrap via `into_dataset()`.
                 let handle = storage
-                    .open_dataset_head_for_write(&table_key, &full_path, None)
+                    .open_dataset_head(&full_path, None)
                     .await?;
                 let ds = handle.into_dataset();
                 let before_version = keep_versions

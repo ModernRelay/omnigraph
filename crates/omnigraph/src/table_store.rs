@@ -222,22 +222,6 @@ impl TableStore {
         }
     }
 
-    pub async fn open_dataset_head_for_write(
-        &self,
-        table_key: &str,
-        dataset_uri: &str,
-        branch: Option<&str>,
-    ) -> Result<Dataset> {
-        // RFC-013 step 3a: open writes via the direct opener (O(1)) instead of the
-        // lance-namespace builder, which re-resolved the table's version chain
-        // O(depth) per write. The namespace is a catalog/discovery layer, not a
-        // per-open hot-path component (RFC §2.4); the manifest already holds the
-        // location, and `ensure_expected_version` still validates head == pinned
-        // for strict ops. `table_key` retained for signature stability.
-        let _ = table_key;
-        self.open_dataset_head(dataset_uri, branch).await
-    }
-
     pub async fn delete_branch(&self, dataset_uri: &str, branch: &str) -> Result<()> {
         let mut ds = crate::instrumentation::open_dataset(
             dataset_uri,
@@ -327,9 +311,7 @@ impl TableStore {
         table_key: &str,
         expected_version: u64,
     ) -> Result<Dataset> {
-        let ds = self
-            .open_dataset_head_for_write(table_key, dataset_uri, branch)
-            .await?;
+        let ds = self.open_dataset_head(dataset_uri, branch).await?;
         self.ensure_expected_version(&ds, table_key, expected_version)?;
         Ok(ds)
     }

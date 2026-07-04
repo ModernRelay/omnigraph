@@ -587,7 +587,7 @@ where
         // of the lock-check can't quietly open the wrong HEAD here.
         let existing = db
             .storage()
-            .open_dataset_head_for_write(table_key, &dataset_uri, entry.table_branch.as_deref())
+            .open_dataset_head(&dataset_uri, entry.table_branch.as_deref())
             .await?;
         let staged = db.storage().stage_overwrite(&existing, batch).await?;
         let target_ds = db.storage().commit_staged(existing, staged).await?;
@@ -857,8 +857,7 @@ pub(super) async fn ensure_snapshot_entry_head_matches(
     let dataset_uri = db.storage().dataset_uri(&entry.table_path);
     let ds = db
         .storage()
-        .open_dataset_head_for_write(
-            &entry.table_key,
+        .open_dataset_head(
             &dataset_uri,
             entry.table_branch.as_deref(),
         )
