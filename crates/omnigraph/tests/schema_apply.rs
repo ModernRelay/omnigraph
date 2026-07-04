@@ -841,3 +841,100 @@ async fn index_only_constraint_apply_touches_no_table_data() {
         "adding an @index must not bump the table version (no inline index build)"
     );
 }
+
+// Enum widening (iss-enum-widening-migration): adding variants to an enum is
+// a PURE metadata change — the accepted catalog updates, no table data is
+// touched, and the widened set is enforced immediately on writes. Narrowing
+// stays OG-MF-106-refused.
+#[tokio::test]
+async fn enum_widening_apply_is_metadata_only_and_accepts_new_variant() {
+    let dir = tempfile::tempdir().unwrap();
+    let uri = dir.path().to_str().unwrap();
+    let v1 = "node Ticket {\n    slug: String @key\n    status: enum(todo, doing, done)\n}\n";
+    let mut db = Omnigraph::init(uri, v1).await.unwrap();
+    load_jsonl(
+        &mut db,
+        r#"{"type":"Ticket","data":{"slug":"t1","status":"todo"}}"#,
+        LoadMode::Merge,
+    )
+    .await
+    .expect("load a Ticket with an original variant");
+
+    let before = db
+        .snapshot_of(ReadTarget::branch("main"))
+        .await
+        .unwrap()
+        .entry("node:Ticket")
+        .unwrap()
+        .table_version;
+
+    let v2 =
+        "node Ticket {\n    slug: String @key\n    status: enum(todo, doing, done, blocked)\n}\n";
+    let result = db.apply_schema(v2).await.expect("enum widening must apply");
+    assert!(result.supported, "widening must be a supported plan");
+    assert!(result.applied, "widening must apply");
+
+    let after = db
+        .snapshot_of(ReadTarget::branch("main"))
+        .await
+        .unwrap()
+        .entry("node:Ticket")
+        .unwrap()
+        .table_version;
+    assert_eq!(
+        before, after,
+        "enum widening must not bump the table version (metadata-only)"
+    );
+
+    // The NEW variant is accepted on the write path...
+    load_jsonl(
+        &mut db,
+        r#"{"type":"Ticket","data":{"slug":"t2","status":"blocked"}}"#,
+        LoadMode::Merge,
+    )
+    .await
+    .expect("new variant must be accepted after widening");
+    // ...an original variant still is...
+    load_jsonl(
+        &mut db,
+        r#"{"type":"Ticket","data":{"slug":"t3","status":"done"}}"#,
+        LoadMode::Merge,
+    )
+    .await
+    .expect("original variant must remain accepted");
+    // ...and an out-of-set value is still rejected (the fence didn't widen to
+    // free text).
+    let err = load_jsonl(
+        &mut db,
+        r#"{"type":"Ticket","data":{"slug":"t4","status":"bogus"}}"#,
+        LoadMode::Merge,
+    )
+    .await;
+    assert!(err.is_err(), "out-of-set enum value must still be rejected");
+}
+
+#[tokio::test]
+async fn enum_narrowing_apply_is_refused() {
+    let dir = tempfile::tempdir().unwrap();
+    let uri = dir.path().to_str().unwrap();
+    let v1 = "node Ticket {\n    slug: String @key\n    status: enum(todo, doing, done)\n}\n";
+    let mut db = Omnigraph::init(uri, v1).await.unwrap();
+
+    let narrowed = "node Ticket {\n    slug: String @key\n    status: enum(todo, done)\n}\n";
+    let err = db.apply_schema(narrowed).await;
+    assert!(err.is_err(), "narrowing must refuse at apply");
+    let msg = format!("{}", err.unwrap_err());
+    assert!(
+        msg.contains("OG-MF-106"),
+        "refusal must carry the stable lint code, got: {msg}"
+    );
+
+    // The graph stays healthy and writable on the original schema.
+    load_jsonl(
+        &mut db,
+        r#"{"type":"Ticket","data":{"slug":"t1","status":"doing"}}"#,
+        LoadMode::Merge,
+    )
+    .await
+    .expect("graph must remain writable after a refused narrowing");
+}
