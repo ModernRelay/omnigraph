@@ -107,9 +107,13 @@ impl StagedTableNamespace {
     }
 
     async fn open_head(&self) -> Result<Dataset> {
-        Dataset::open(&self.table_uri())
-            .await
-            .map_err(|e| OmniError::Lance(e.to_string()))
+        crate::instrumentation::open_dataset(
+            &self.table_uri(),
+            crate::instrumentation::VersionResolution::Latest,
+            None,
+            crate::instrumentation::manifest_wrapper(),
+        )
+        .await
     }
 
     async fn open_version(&self, version: u64) -> Result<Dataset> {

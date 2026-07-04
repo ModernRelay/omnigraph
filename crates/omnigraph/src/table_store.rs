@@ -202,12 +202,14 @@ impl TableStore {
         dataset_uri: &str,
         branch: Option<&str>,
     ) -> Result<Dataset> {
-        // Direct open by URI (O(1) latest-resolution). Routed through the tracked
+        // Direct open by URI (O(1) latest-resolution). Routed through the one
         // opener so a cost test counts it via the per-query `table_wrapper`
         // (no-op in production — the task-local is unset, so this is exactly
         // `Dataset::open(uri)`).
-        let ds = crate::instrumentation::open_dataset_tracked(
+        let ds = crate::instrumentation::open_dataset(
             dataset_uri,
+            crate::instrumentation::VersionResolution::Latest,
+            None,
             crate::instrumentation::table_wrapper(),
         )
         .await?;
@@ -237,9 +239,13 @@ impl TableStore {
     }
 
     pub async fn delete_branch(&self, dataset_uri: &str, branch: &str) -> Result<()> {
-        let mut ds = Dataset::open(dataset_uri)
-            .await
-            .map_err(|e| OmniError::Lance(e.to_string()))?;
+        let mut ds = crate::instrumentation::open_dataset(
+            dataset_uri,
+            crate::instrumentation::VersionResolution::Latest,
+            None,
+            crate::instrumentation::table_wrapper(),
+        )
+        .await?;
         ds.delete_branch(branch)
             .await
             .map_err(|e| OmniError::Lance(e.to_string()))
@@ -250,9 +256,13 @@ impl TableStore {
     /// set to find orphaned per-table forks. `main`/default is not a named
     /// branch and never appears here.
     pub async fn list_branches(&self, dataset_uri: &str) -> Result<Vec<String>> {
-        let ds = Dataset::open(dataset_uri)
-            .await
-            .map_err(|e| OmniError::Lance(e.to_string()))?;
+        let ds = crate::instrumentation::open_dataset(
+            dataset_uri,
+            crate::instrumentation::VersionResolution::Latest,
+            None,
+            crate::instrumentation::table_wrapper(),
+        )
+        .await?;
         let branches = ds
             .list_branches()
             .await
@@ -274,9 +284,13 @@ impl TableStore {
     /// Used by the eager best-effort reclaim in `cleanup_deleted_branch_tables`
     /// and the `cleanup` orphan reconciler.
     pub async fn force_delete_branch(&self, dataset_uri: &str, branch: &str) -> Result<()> {
-        let mut ds = Dataset::open(dataset_uri)
-            .await
-            .map_err(|e| OmniError::Lance(e.to_string()))?;
+        let mut ds = crate::instrumentation::open_dataset(
+            dataset_uri,
+            crate::instrumentation::VersionResolution::Latest,
+            None,
+            crate::instrumentation::table_wrapper(),
+        )
+        .await?;
         match ds.force_delete_branch(branch).await {
             Ok(()) => Ok(()),
             Err(lance::Error::RefNotFound { .. }) | Err(lance::Error::NotFound { .. }) => Ok(()),

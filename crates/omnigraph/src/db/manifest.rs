@@ -256,13 +256,19 @@ impl SubTableEntry {
         // matches the physical layout the namespace path resolved, without the
         // per-open `__manifest` scan.
         let location = table_uri_for_path(root_uri, &self.table_path, self.table_branch.as_deref());
-        // Route through the instrumented data-table opener (Fix 3). With no
-        // session this is exactly the Fix-2 `from_uri(location).with_version`.
-        // This is the uncached fallback (a snapshot with no read caches); the
+        // Route through the one opener (Fix 3). With no session this is exactly
+        // the Fix-2 `from_uri(location).with_version`. This is the uncached
+        // fallback (a snapshot detached from its graph's read caches); the
         // cached path (`Snapshot::open` → handle cache) calls the same opener on
         // a miss with the shared session, so both paths count on the per-query
         // `table_wrapper`.
-        crate::instrumentation::open_table_dataset(&location, self.table_version, None).await
+        crate::instrumentation::open_dataset(
+            &location,
+            crate::instrumentation::VersionResolution::At(self.table_version),
+            None,
+            crate::instrumentation::table_wrapper(),
+        )
+        .await
     }
 }
 
@@ -586,9 +592,13 @@ impl ManifestCoordinator {
 
     pub async fn delete_branch(&mut self, name: &str) -> Result<()> {
         let uri = manifest_uri(&self.root_uri);
-        let mut ds = Dataset::open(&uri)
-            .await
-            .map_err(|e| OmniError::Lance(e.to_string()))?;
+        let mut ds = crate::instrumentation::open_dataset(
+            &uri,
+            crate::instrumentation::VersionResolution::Latest,
+            None,
+            crate::instrumentation::manifest_wrapper(),
+        )
+        .await?;
         ds.delete_branch(name)
             .await
             .map_err(|e| OmniError::Lance(e.to_string()))?;

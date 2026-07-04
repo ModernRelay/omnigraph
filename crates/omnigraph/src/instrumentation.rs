@@ -252,47 +252,49 @@ pub(crate) fn record_scan_staged_combined() {
     });
 }
 
-/// Open a Lance dataset at `uri`, attaching `wrapper` (for IO counting) when
-/// present. With no wrapper this is exactly `Dataset::open(uri)`. The wrapper is
-/// set via `ObjectStoreParams` on the builder so the open itself is counted
-/// (`Dataset::with_object_store_wrappers` only wraps an already-open store).
-pub(crate) async fn open_dataset_tracked(
+/// Which version [`open_dataset`] resolves.
+///
+/// `Latest` re-resolves the dataset's current head (the substrate's cheap
+/// latest-location probe); `At(v)` is a list-free pinned open. The choice is
+/// a correctness decision — strict read-modify-write ops need `Latest`,
+/// snapshot reads need `At(v)` — so it is an explicit parameter of the one
+/// opener rather than a property of which helper a caller happened to reach.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum VersionResolution {
+    Latest,
+    At(u64),
+}
+
+/// THE dataset-open chokepoint. Every engine `Dataset` open routes through
+/// here so three things hold uniformly, on every path:
+///
+/// 1. `record_open` feeds the per-query cost probes — an open that bypasses
+///    this function is invisible to the cost gates.
+/// 2. The per-query IO `wrapper` (manifest- or table-class) is set via
+///    `ObjectStoreParams` on the builder, so the open itself is counted
+///    (`Dataset::with_object_store_wrappers` only wraps an already-open
+///    store). No wrapper (production) adds nothing.
+/// 3. The shared per-graph `Session` (LanceDB's one-session-per-connection
+///    pattern; warms Lance's metadata/index caches across opens) is attached
+///    whenever the caller has one. `None` is for genuinely session-less
+///    contexts (a `Snapshot` detached from its graph's read caches) — owners
+///    that hold a session (`TableStore`, the handle cache) pass it
+///    unconditionally, so it cannot be silently dropped on one path.
+pub(crate) async fn open_dataset(
     uri: &str,
+    version: VersionResolution,
+    session: Option<&Arc<lance::session::Session>>,
     wrapper: Option<Arc<dyn WrappingObjectStore>>,
 ) -> Result<Dataset> {
     record_open(uri);
-    let result = match wrapper {
-        None => Dataset::open(uri).await,
-        Some(wrapper) => {
-            DatasetBuilder::from_uri(uri)
-                .with_store_params(ObjectStoreParams {
-                    object_store_wrapper: Some(wrapper),
-                    ..Default::default()
-                })
-                .load()
-                .await
-        }
-    };
-    result.map_err(|e| OmniError::Lance(e.to_string()))
-}
-
-/// Open a data-table dataset at `location` pinned to `version` — the cache-miss
-/// path of the data-read boundary (`SubTableEntry::open`). Attaches the shared
-/// per-graph `Session` (warms metadata/index caches across opens, LanceDB's
-/// one-session-per-connection pattern) and the per-query `table_wrapper` (for IO
-/// counting) when present. With neither, this is exactly the Fix-2
-/// `from_uri(location).with_version(version)` open.
-pub(crate) async fn open_table_dataset(
-    location: &str,
-    version: u64,
-    session: Option<&Arc<lance::session::Session>>,
-) -> Result<Dataset> {
-    record_open(location);
-    let mut builder = DatasetBuilder::from_uri(location).with_version(version);
+    let mut builder = DatasetBuilder::from_uri(uri);
+    if let VersionResolution::At(version) = version {
+        builder = builder.with_version(version);
+    }
     if let Some(session) = session {
         builder = builder.with_session(session.clone());
     }
-    if let Some(wrapper) = table_wrapper() {
+    if let Some(wrapper) = wrapper {
         builder = builder.with_store_params(ObjectStoreParams {
             object_store_wrapper: Some(wrapper),
             ..Default::default()

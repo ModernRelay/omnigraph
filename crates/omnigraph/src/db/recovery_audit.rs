@@ -101,7 +101,14 @@ impl RecoveryAudit {
     /// with no dataset yet (it is created lazily on the first append).
     pub(crate) async fn open(root_uri: &str) -> Result<Self> {
         let root = root_uri.trim_end_matches('/').to_string();
-        let dataset = Dataset::open(&recoveries_uri(&root)).await.ok();
+        let dataset = crate::instrumentation::open_dataset(
+            &recoveries_uri(&root),
+            crate::instrumentation::VersionResolution::Latest,
+            None,
+            crate::instrumentation::manifest_wrapper(),
+        )
+        .await
+        .ok();
         Ok(Self {
             root_uri: root,
             dataset,
@@ -195,9 +202,15 @@ async fn create_recoveries_dataset(root_uri: &str) -> Result<Dataset> {
         // variant, not the display string (not a Lance API contract). Same
         // discipline as `commit_graph.rs`'s create-or-open; pinned by
         // `lance_surface_guards.rs::lance_error_dataset_already_exists_variant_exists`.
-        Err(lance::Error::DatasetAlreadyExists { .. }) => Dataset::open(&uri)
+        Err(lance::Error::DatasetAlreadyExists { .. }) => {
+            crate::instrumentation::open_dataset(
+                &uri,
+                crate::instrumentation::VersionResolution::Latest,
+                None,
+                crate::instrumentation::manifest_wrapper(),
+            )
             .await
-            .map_err(|open_err| OmniError::Lance(open_err.to_string())),
+        }
         Err(err) => Err(OmniError::Lance(err.to_string())),
     }
 }
