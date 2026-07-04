@@ -86,9 +86,9 @@ pub struct SchemaApplyPreview {
 /// (when `base` is captured). NOT a general "no re-resolution" handle — the
 /// commit-time OCC re-read, the live-HEAD drift probe, and the fork-authority reads
 /// stay fresh (correctness machinery). Step 5 (PublishPlan unification) makes this
-/// the non-optional publish carrier and adds session-aware base opens there, gated
-/// by an S3 cost test — the warm-session benefit on the single remaining open is an
-/// object-store phenomenon, so it earns its own gate rather than riding this PR.
+/// the non-optional publish carrier. (Write/maintenance opens attach the shared
+/// per-graph `Session` via the `TableStore`-held handle — the dataset-opener
+/// unification; the S3 cost gate for that term is still owed.)
 ///
 /// Threaded as `Option<&WriteTxn>` through the mutate/load write chain
 /// (`open_for_mutation_on_branch`, `commit_all`, `commit_updates_on_branch_with_expected`)
@@ -356,18 +356,21 @@ impl Omnigraph {
             }
         };
 
+        let session = Arc::new(lance::session::Session::default());
         Ok(Self {
             root_uri: root.clone(),
             storage,
             coordinator: Arc::new(tokio::sync::RwLock::new(coordinator)),
-            table_store: TableStore::new(&root),
-            runtime_cache: RuntimeCache::default(),
             // One shared Session per graph (LanceDB's one-session-per-connection
-            // model) plus the held-handle cache, created once and reused across
-            // reads. Session::default() caps are lazy (6 GiB index / 1 GiB
-            // metadata); multi-graph cap/sharing is a deferred follow-up.
+            // model), created once and shared by the read path (handle cache)
+            // AND the TableStore's write/maintenance opens, so both sides warm
+            // the same Lance metadata/index caches. Session::default() caps are
+            // lazy (6 GiB index / 1 GiB metadata); multi-graph cap/sharing is a
+            // deferred follow-up.
+            table_store: TableStore::new(&root, session.clone()),
+            runtime_cache: RuntimeCache::default(),
             read_caches: Arc::new(crate::runtime_cache::ReadCaches {
-                session: Arc::new(lance::session::Session::default()),
+                session,
                 handles: Arc::new(crate::runtime_cache::TableHandleCache::default()),
             }),
             catalog: Arc::new(ArcSwap::from_pointee(catalog)),
@@ -460,18 +463,21 @@ impl Omnigraph {
         let mut catalog = build_catalog_from_ir(&accepted_ir)?;
         fixup_blob_schemas(&mut catalog);
 
+        let session = Arc::new(lance::session::Session::default());
         Ok(Self {
             root_uri: root.clone(),
             storage,
             coordinator: Arc::new(tokio::sync::RwLock::new(coordinator)),
-            table_store: TableStore::new(&root),
-            runtime_cache: RuntimeCache::default(),
             // One shared Session per graph (LanceDB's one-session-per-connection
-            // model) plus the held-handle cache, created once and reused across
-            // reads. Session::default() caps are lazy (6 GiB index / 1 GiB
-            // metadata); multi-graph cap/sharing is a deferred follow-up.
+            // model), created once and shared by the read path (handle cache)
+            // AND the TableStore's write/maintenance opens, so both sides warm
+            // the same Lance metadata/index caches. Session::default() caps are
+            // lazy (6 GiB index / 1 GiB metadata); multi-graph cap/sharing is a
+            // deferred follow-up.
+            table_store: TableStore::new(&root, session.clone()),
+            runtime_cache: RuntimeCache::default(),
             read_caches: Arc::new(crate::runtime_cache::ReadCaches {
-                session: Arc::new(lance::session::Session::default()),
+                session,
                 handles: Arc::new(crate::runtime_cache::TableHandleCache::default()),
             }),
             catalog: Arc::new(ArcSwap::from_pointee(catalog)),
@@ -776,8 +782,9 @@ impl Omnigraph {
     /// which still resolve through `snapshot_for_branch` and re-validate. Those reads must
     /// observe LIVE committed state, so unifying them (validate-once + pinned + re-checked
     /// read-set) is step 4's §7.1 work — threading `txn.base` there would re-introduce the
-    /// stale-read class the #298 cardinality fix removed. A session-aware base open is
-    /// likewise deferred to step 5 (handoff §1d).
+    /// stale-read class the #298 cardinality fix removed. Write-side opens now attach the shared
+    /// per-graph `Session` (the dataset-opener unification); the S3 cost gate
+    /// for that term is still owed (handoff §1d).
     pub(crate) async fn open_write_txn(&self, branch: Option<&str>) -> Result<WriteTxn> {
         let resolved = self.resolved_branch_target(branch).await?;
         Ok(WriteTxn {
@@ -1195,7 +1202,7 @@ impl Omnigraph {
         let from_resolved = self.resolved_target(from).await?;
         let to_resolved = self.resolved_target(to).await?;
         crate::changes::diff_snapshots(
-            self.uri(),
+            &self.table_store,
             &from_resolved.snapshot,
             &to_resolved.snapshot,
             filter,
@@ -1229,7 +1236,7 @@ impl Omnigraph {
             .await?;
         drop(coord);
         crate::changes::diff_snapshots(
-            self.uri(),
+            &self.table_store,
             &from_snap.snapshot,
             &to_snap.snapshot,
             filter,

@@ -111,13 +111,12 @@ impl ChangeFilter {
 /// 2. Lineage check — same branch → version-column diff; different → ID-based diff
 /// 3. Row-level diff
 pub async fn diff_snapshots(
-    root_uri: &str,
+    table_store: &TableStore,
     from: &Snapshot,
     to: &Snapshot,
     filter: &ChangeFilter,
     branch: Option<String>,
 ) -> Result<ChangeSet> {
-    let table_store = TableStore::new(root_uri);
     let mut all_keys: HashSet<String> = HashSet::new();
     for entry in from.entries() {
         all_keys.insert(entry.table_key.clone());
@@ -146,14 +145,14 @@ pub async fn diff_snapshots(
 
         let table_changes = if from_entry.is_none() {
             // Table added — all rows are inserts
-            diff_table_added(&table_store, to, table_key, is_edge, filter).await?
+            diff_table_added(table_store, to, table_key, is_edge, filter).await?
         } else if to_entry.is_none() {
             // Table removed — all rows are deletes
-            diff_table_removed(&table_store, from, table_key, is_edge, filter).await?
+            diff_table_removed(table_store, from, table_key, is_edge, filter).await?
         } else if same_lineage(from_entry, to_entry) {
             // Fast path: version-column diff
             diff_table_same_lineage(
-                &table_store,
+                table_store,
                 from_entry.unwrap(),
                 to_entry.unwrap(),
                 is_edge,
@@ -162,7 +161,7 @@ pub async fn diff_snapshots(
             .await?
         } else {
             // Cross-branch path: streaming ID-based diff
-            diff_table_cross_branch(&table_store, from, to, table_key, is_edge, filter).await?
+            diff_table_cross_branch(table_store, from, to, table_key, is_edge, filter).await?
         };
 
         for mut c in table_changes {

@@ -42,8 +42,8 @@ pub struct QueryIoProbes {
     /// handle cache (Fix 3) serves them.
     pub table_wrapper: Option<Arc<dyn WrappingObjectStore>>,
     pub probe_count: Arc<AtomicU64>,
-    /// Counts DATA-table open CALLS through the two instrumented chokepoints
-    /// (`open_dataset_tracked` / `open_table_dataset`), classified by URI so the
+    /// Counts DATA-table open CALLS through the one instrumented chokepoint
+    /// (`open_dataset`), classified by URI so the
     /// internal/system tables (`__manifest`) are EXCLUDED — the publisher CAS
     /// opens those every write, and counting them would make the
     /// `data_open_count <= |touched_tables|` write gate
@@ -52,9 +52,9 @@ pub struct QueryIoProbes {
     /// an exact open-invocation count. `forbidden_apis` keeps engine code OUTSIDE the
     /// storage layer (`exec/`, `db/omnigraph/`, `loader/`, `changes/`) from opening
     /// datasets except through these chokepoints, so the count is complete for the
-    /// keyed-write data path the gate measures. (`table_store.rs` is allow-listed and
-    /// does hold direct `Dataset::open`s — but only for branch-management ops
-    /// (`delete_branch`/`list_branches`/`force_delete_branch`), never that hot path.)
+    /// keyed-write data path the gate measures. (Since the dataset-opener
+    /// unification, `table_store.rs`'s branch-management ops also route through
+    /// the one chokepoint, so the count covers them too.)
     pub data_open_count: Arc<AtomicU64>,
     /// Internal/system-table (`__manifest`) open CALLS — the complement of
     /// `data_open_count`, kept for symmetry and debugging.
@@ -142,7 +142,7 @@ fn open_is_internal(uri: &str) -> bool {
 /// table class (the URI's last segment) so the write gate counts DATA-table opens
 /// only and ignores the publisher metadata opens. No-op in production
 /// (the classification runs only inside the probe closure, which `current` skips
-/// when no probes are installed). Called at both open chokepoints.
+/// when no probes are installed). Called at the open chokepoint.
 pub(crate) fn record_open(uri: &str) {
     let _ = current(|p| {
         if open_is_internal(uri) {

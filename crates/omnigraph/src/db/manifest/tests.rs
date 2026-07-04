@@ -154,7 +154,7 @@ async fn test_commit_changes_can_register_new_table_and_tombstone_old_one() {
     let ds = crate::table_store::TableStore::create_empty_dataset(&dataset_uri, &schema)
         .await
         .unwrap();
-    let state = crate::table_store::TableStore::new(uri)
+    let state = crate::table_store::TableStore::new(uri, Arc::new(lance::session::Session::default()))
         .table_state(&dataset_uri, &ds)
         .await
         .unwrap();

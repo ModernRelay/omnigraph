@@ -1131,7 +1131,7 @@ async fn recovery_rolls_forward_ensure_indices_on_feature_branch() {
     // publisher deliberately skips the normal index-rebuild preparation;
     // the failed writer below is still the real `ensure_indices_on`.
     let person_uri = node_table_uri(&uri, "Person");
-    let store = TableStore::new(&uri);
+    let store = TableStore::new(&uri, std::sync::Arc::new(lance::session::Session::default()));
     let mut ds = store
         .open_dataset_head(&person_uri, Some("feature"))
         .await

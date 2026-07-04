@@ -142,12 +142,18 @@ impl StagedWrite {
 #[derive(Debug, Clone)]
 pub struct TableStore {
     root_uri: String,
+    /// The graph's shared Lance `Session` (one per graph — LanceDB's
+    /// one-session-per-connection pattern). Held non-optionally so every open
+    /// this store performs attaches it; the read path's handle cache shares
+    /// the same instance via `ReadCaches`.
+    session: Arc<lance::session::Session>,
 }
 
 impl TableStore {
-    pub fn new(root_uri: &str) -> Self {
+    pub fn new(root_uri: &str, session: Arc<lance::session::Session>) -> Self {
         Self {
             root_uri: root_uri.trim_end_matches('/').to_string(),
+            session,
         }
     }
 
@@ -194,7 +200,7 @@ impl TableStore {
     }
 
     pub async fn open_at_entry(&self, entry: &SubTableEntry) -> Result<Dataset> {
-        entry.open(&self.root_uri).await
+        entry.open(&self.root_uri, Some(&self.session)).await
     }
 
     pub async fn open_dataset_head(
@@ -209,7 +215,7 @@ impl TableStore {
         let ds = crate::instrumentation::open_dataset(
             dataset_uri,
             crate::instrumentation::VersionResolution::Latest,
-            None,
+            Some(&self.session),
             crate::instrumentation::table_wrapper(),
         )
         .await?;
@@ -226,7 +232,7 @@ impl TableStore {
         let mut ds = crate::instrumentation::open_dataset(
             dataset_uri,
             crate::instrumentation::VersionResolution::Latest,
-            None,
+            Some(&self.session),
             crate::instrumentation::table_wrapper(),
         )
         .await?;
@@ -243,7 +249,7 @@ impl TableStore {
         let ds = crate::instrumentation::open_dataset(
             dataset_uri,
             crate::instrumentation::VersionResolution::Latest,
-            None,
+            Some(&self.session),
             crate::instrumentation::table_wrapper(),
         )
         .await?;
@@ -271,7 +277,7 @@ impl TableStore {
         let mut ds = crate::instrumentation::open_dataset(
             dataset_uri,
             crate::instrumentation::VersionResolution::Latest,
-            None,
+            Some(&self.session),
             crate::instrumentation::table_wrapper(),
         )
         .await?;

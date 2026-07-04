@@ -2282,7 +2282,10 @@ mod tests {
     async fn restore_table_to_version_appends_one_commit() {
         let dir = tempfile::tempdir().unwrap();
         let uri = format!("{}/people.lance", dir.path().to_str().unwrap());
-        let store = TableStore::new(dir.path().to_str().unwrap());
+        let store = TableStore::new(
+            dir.path().to_str().unwrap(),
+            Arc::new(lance::session::Session::default()),
+        );
 
         let mut ds = TableStore::write_dataset(&uri, person_batch(&[("alice", Some(30))]))
             .await
@@ -2320,7 +2323,10 @@ mod tests {
         // Repeated restore calls each produce a new HEAD+1 commit.
         let dir = tempfile::tempdir().unwrap();
         let uri = format!("{}/people.lance", dir.path().to_str().unwrap());
-        let store = TableStore::new(dir.path().to_str().unwrap());
+        let store = TableStore::new(
+            dir.path().to_str().unwrap(),
+            Arc::new(lance::session::Session::default()),
+        );
 
         let mut ds = TableStore::write_dataset(&uri, person_batch(&[("alice", Some(30))]))
             .await

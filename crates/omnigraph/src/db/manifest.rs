@@ -159,7 +159,7 @@ impl Snapshot {
                     )
                     .await
             }
-            None => entry.open(&self.root_uri).await,
+            None => entry.open(&self.root_uri, None).await,
         }
     }
 
@@ -247,7 +247,11 @@ impl SubTableEntry {
     /// already holds the path, version, and branch. Branches are Lance native
     /// branches, so `with_branch` resolves `{base}/tree/{branch}` from the base
     /// URI; main uses `with_version`.
-    pub(crate) async fn open(&self, root_uri: &str) -> Result<Dataset> {
+    pub(crate) async fn open(
+        &self,
+        root_uri: &str,
+        session: Option<&Arc<lance::session::Session>>,
+    ) -> Result<Dataset> {
         // The branch-qualified location is the dataset that physically holds this
         // version: main at `{table_path}`, a branch at
         // `{table_path}/tree/{branch}` (Lance native-branch storage). `with_version`
@@ -265,7 +269,7 @@ impl SubTableEntry {
         crate::instrumentation::open_dataset(
             &location,
             crate::instrumentation::VersionResolution::At(self.table_version),
-            None,
+            session,
             crate::instrumentation::table_wrapper(),
         )
         .await

@@ -123,7 +123,7 @@ fn collect_age_for_id(batches: &[RecordBatch], needle: &str) -> Option<i32> {
 async fn stage_append_is_visible_via_scan_with_staged() {
     let dir = tempfile::tempdir().unwrap();
     let uri = format!("{}/people.lance", dir.path().to_str().unwrap());
-    let store = TableStore::new(dir.path().to_str().unwrap());
+    let store = TableStore::new(dir.path().to_str().unwrap(), std::sync::Arc::new(lance::session::Session::default()));
 
     // Seed: one committed row.
     let ds = TableStore::write_dataset(&uri, person_batch(&[("alice", Some(30))]))
@@ -153,7 +153,7 @@ async fn stage_append_is_visible_via_scan_with_staged() {
 async fn stage_merge_insert_dedupes_superseded_committed_fragment() {
     let dir = tempfile::tempdir().unwrap();
     let uri = format!("{}/people.lance", dir.path().to_str().unwrap());
-    let store = TableStore::new(dir.path().to_str().unwrap());
+    let store = TableStore::new(dir.path().to_str().unwrap(), std::sync::Arc::new(lance::session::Session::default()));
 
     // Seed: alice age 30 in one committed fragment.
     let ds = TableStore::write_dataset(&uri, person_batch(&[("alice", Some(30))]))
@@ -215,7 +215,7 @@ async fn stage_merge_insert_dedupes_superseded_committed_fragment() {
 async fn count_rows_with_staged_matches_scan() {
     let dir = tempfile::tempdir().unwrap();
     let uri = format!("{}/people.lance", dir.path().to_str().unwrap());
-    let store = TableStore::new(dir.path().to_str().unwrap());
+    let store = TableStore::new(dir.path().to_str().unwrap(), std::sync::Arc::new(lance::session::Session::default()));
 
     let ds = TableStore::write_dataset(&uri, person_batch(&[("alice", Some(30))]))
         .await
@@ -250,7 +250,7 @@ async fn count_rows_with_staged_matches_scan() {
 async fn chained_stage_appends_have_distinct_row_ids() {
     let dir = tempfile::tempdir().unwrap();
     let uri = format!("{}/people.lance", dir.path().to_str().unwrap());
-    let store = TableStore::new(dir.path().to_str().unwrap());
+    let store = TableStore::new(dir.path().to_str().unwrap(), std::sync::Arc::new(lance::session::Session::default()));
 
     let ds = TableStore::write_dataset(&uri, person_batch(&[("seed", Some(0))]))
         .await
@@ -336,7 +336,7 @@ fn combine_for_scan(ds: &Dataset, staged: &[StagedWrite]) -> Vec<Fragment> {
 async fn stage_append_then_commit_persists_data() {
     let dir = tempfile::tempdir().unwrap();
     let uri = format!("{}/people.lance", dir.path().to_str().unwrap());
-    let store = TableStore::new(dir.path().to_str().unwrap());
+    let store = TableStore::new(dir.path().to_str().unwrap(), std::sync::Arc::new(lance::session::Session::default()));
 
     let ds = TableStore::write_dataset(&uri, person_batch(&[("alice", Some(30))]))
         .await
@@ -369,7 +369,7 @@ async fn stage_append_then_commit_persists_data() {
 async fn stage_merge_insert_then_commit_persists_merged_view() {
     let dir = tempfile::tempdir().unwrap();
     let uri = format!("{}/people.lance", dir.path().to_str().unwrap());
-    let store = TableStore::new(dir.path().to_str().unwrap());
+    let store = TableStore::new(dir.path().to_str().unwrap(), std::sync::Arc::new(lance::session::Session::default()));
 
     let ds = TableStore::write_dataset(&uri, person_batch(&[("alice", Some(30))]))
         .await
@@ -401,7 +401,7 @@ async fn stage_merge_insert_then_commit_persists_merged_view() {
 async fn stage_merge_insert_commit_rebases_over_disjoint_committed_delete() {
     let dir = tempfile::tempdir().unwrap();
     let uri = format!("{}/people.lance", dir.path().to_str().unwrap());
-    let store = TableStore::new(dir.path().to_str().unwrap());
+    let store = TableStore::new(dir.path().to_str().unwrap(), std::sync::Arc::new(lance::session::Session::default()));
 
     let ds = TableStore::write_dataset(&uri, numbered_person_batch(0..100))
         .await
@@ -461,7 +461,7 @@ async fn stage_merge_insert_commit_rebases_over_disjoint_committed_delete() {
 async fn scan_with_staged_with_filter_silently_drops_staged_rows() {
     let dir = tempfile::tempdir().unwrap();
     let uri = format!("{}/people.lance", dir.path().to_str().unwrap());
-    let store = TableStore::new(dir.path().to_str().unwrap());
+    let store = TableStore::new(dir.path().to_str().unwrap(), std::sync::Arc::new(lance::session::Session::default()));
 
     // Committed: alice=30, carol=40
     let ds = TableStore::write_dataset(
@@ -528,7 +528,7 @@ async fn scan_with_staged_with_filter_silently_drops_staged_rows() {
 async fn chained_stage_merge_insert_with_shared_key_documents_duplicate_behavior() {
     let dir = tempfile::tempdir().unwrap();
     let uri = format!("{}/people.lance", dir.path().to_str().unwrap());
-    let store = TableStore::new(dir.path().to_str().unwrap());
+    let store = TableStore::new(dir.path().to_str().unwrap(), std::sync::Arc::new(lance::session::Session::default()));
 
     // Seed empty (an unrelated row keeps the schema unambiguous).
     let ds = TableStore::write_dataset(&uri, person_batch(&[("seed", Some(0))]))
@@ -594,7 +594,7 @@ async fn chained_stage_merge_insert_with_shared_key_documents_duplicate_behavior
 async fn stage_overwrite_does_not_advance_head_until_commit() {
     let dir = tempfile::tempdir().unwrap();
     let uri = format!("{}/people.lance", dir.path().to_str().unwrap());
-    let store = TableStore::new(dir.path().to_str().unwrap());
+    let store = TableStore::new(dir.path().to_str().unwrap(), std::sync::Arc::new(lance::session::Session::default()));
 
     let ds = TableStore::write_dataset(&uri, person_batch(&[("alice", Some(30))]))
         .await
@@ -638,7 +638,7 @@ async fn stage_overwrite_does_not_advance_head_until_commit() {
 async fn stage_overwrite_preserves_stable_row_ids() {
     let dir = tempfile::tempdir().unwrap();
     let uri = format!("{}/people.lance", dir.path().to_str().unwrap());
-    let store = TableStore::new(dir.path().to_str().unwrap());
+    let store = TableStore::new(dir.path().to_str().unwrap(), std::sync::Arc::new(lance::session::Session::default()));
 
     // `write_dataset` creates with `enable_stable_row_ids: true` — see
     // ADR 0001. We verify that as a precondition so a future change to
@@ -680,7 +680,7 @@ async fn stage_overwrite_preserves_stable_row_ids() {
 async fn stage_overwrite_replaces_all_fragments() {
     let dir = tempfile::tempdir().unwrap();
     let uri = format!("{}/people.lance", dir.path().to_str().unwrap());
-    let store = TableStore::new(dir.path().to_str().unwrap());
+    let store = TableStore::new(dir.path().to_str().unwrap(), std::sync::Arc::new(lance::session::Session::default()));
 
     let ds = TableStore::write_dataset(
         &uri,
@@ -719,7 +719,7 @@ async fn stage_overwrite_replaces_all_fragments() {
 async fn stage_overwrite_empty_batch_replaces_all_rows() {
     let dir = tempfile::tempdir().unwrap();
     let uri = format!("{}/people.lance", dir.path().to_str().unwrap());
-    let store = TableStore::new(dir.path().to_str().unwrap());
+    let store = TableStore::new(dir.path().to_str().unwrap(), std::sync::Arc::new(lance::session::Session::default()));
 
     let ds = TableStore::write_dataset(
         &uri,
@@ -774,7 +774,7 @@ async fn stage_overwrite_empty_batch_replaces_all_rows() {
 async fn stage_create_btree_index_does_not_advance_head_until_commit() {
     let dir = tempfile::tempdir().unwrap();
     let uri = format!("{}/people.lance", dir.path().to_str().unwrap());
-    let store = TableStore::new(dir.path().to_str().unwrap());
+    let store = TableStore::new(dir.path().to_str().unwrap(), std::sync::Arc::new(lance::session::Session::default()));
 
     let ds = TableStore::write_dataset(
         &uri,
@@ -821,7 +821,7 @@ async fn stage_create_btree_index_does_not_advance_head_until_commit() {
 async fn stage_create_inverted_index_does_not_advance_head_until_commit() {
     let dir = tempfile::tempdir().unwrap();
     let uri = format!("{}/people.lance", dir.path().to_str().unwrap());
-    let store = TableStore::new(dir.path().to_str().unwrap());
+    let store = TableStore::new(dir.path().to_str().unwrap(), std::sync::Arc::new(lance::session::Session::default()));
 
     let ds = TableStore::write_dataset(
         &uri,
@@ -862,7 +862,7 @@ async fn stage_create_inverted_index_does_not_advance_head_until_commit() {
 async fn stage_delete_does_not_advance_head_and_reads_through_staged() {
     let dir = tempfile::tempdir().unwrap();
     let uri = format!("{}/people.lance", dir.path().to_str().unwrap());
-    let store = TableStore::new(dir.path().to_str().unwrap());
+    let store = TableStore::new(dir.path().to_str().unwrap(), std::sync::Arc::new(lance::session::Session::default()));
 
     let ds = TableStore::write_dataset(
         &uri,
@@ -917,7 +917,7 @@ async fn stage_delete_does_not_advance_head_and_reads_through_staged() {
 async fn stage_delete_commit_rebases_over_disjoint_committed_delete() {
     let dir = tempfile::tempdir().unwrap();
     let uri = format!("{}/people.lance", dir.path().to_str().unwrap());
-    let store = TableStore::new(dir.path().to_str().unwrap());
+    let store = TableStore::new(dir.path().to_str().unwrap(), std::sync::Arc::new(lance::session::Session::default()));
 
     let ds = TableStore::write_dataset(&uri, numbered_person_batch(0..100))
         .await
@@ -955,7 +955,7 @@ async fn create_vector_index_advances_head_inline_documents_residual() {
 
     let dir = tempfile::tempdir().unwrap();
     let uri = format!("{}/vec.lance", dir.path().to_str().unwrap());
-    let store = TableStore::new(dir.path().to_str().unwrap());
+    let store = TableStore::new(dir.path().to_str().unwrap(), std::sync::Arc::new(lance::session::Session::default()));
 
     // Build a small dataset with a fixed-size vector column. Vector index
     // training requires multiple rows; provide enough.
@@ -1196,7 +1196,7 @@ async fn commit_staged_skips_auto_cleanup_so_pinned_versions_survive() {
 
     let dir = tempfile::tempdir().unwrap();
     let uri = format!("{}/people.lance", dir.path().to_str().unwrap());
-    let store = TableStore::new(dir.path().to_str().unwrap());
+    let store = TableStore::new(dir.path().to_str().unwrap(), std::sync::Arc::new(lance::session::Session::default()));
 
     let mut ds = TableStore::write_dataset(&uri, person_batch(&[("seed", Some(0))]))
         .await
