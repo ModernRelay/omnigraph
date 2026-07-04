@@ -566,6 +566,19 @@ pub(crate) fn render_schema_plan_step(step: &SchemaMigrationStep) -> String {
             schema_type_kind_label(*type_kind),
             type_name
         ),
+        SchemaMigrationStep::ExtendEnum {
+            type_kind,
+            type_name,
+            property_name,
+            added_values,
+        } => format!(
+            "extend enum '{}.{}' (+{}) on {} '{}'",
+            type_name,
+            property_name,
+            added_values.join(", +"),
+            schema_type_kind_label(*type_kind),
+            type_name
+        ),
         SchemaMigrationStep::UpdateTypeMetadata {
             type_kind,
             name,

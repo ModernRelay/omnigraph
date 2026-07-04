@@ -74,6 +74,23 @@ pub enum SchemaMigrationStep {
         type_name: String,
         constraint: Constraint,
     },
+    /// Widen an enum property's value set. Emitted only for a PURE widening —
+    /// same scalar/list shape, same nullability, and the desired value set is
+    /// a superset of the accepted one (order-insensitive; enum semantics are
+    /// set membership, not position). Metadata-only at apply time: every
+    /// committed row is valid under a superset, so no table data is touched
+    /// and the unified validator accepts the new variants on all three write
+    /// surfaces the moment the accepted catalog updates. Narrowing, renames,
+    /// and enum<->free-String conversions still plan as `UnsupportedChange`
+    /// (OG-MF-106).
+    ExtendEnum {
+        type_kind: SchemaTypeKind,
+        type_name: String,
+        property_name: String,
+        /// The variants the desired schema adds (accepted-set order preserved
+        /// for the untouched prefix; display/debug aid).
+        added_values: Vec<String>,
+    },
     UpdateTypeMetadata {
         type_kind: SchemaTypeKind,
         name: String,
@@ -537,7 +554,14 @@ fn plan_properties(
             });
         }
 
-        if existing.prop_type != property.prop_type {
+        if let Some(added_values) = enum_widening(&existing.prop_type, &property.prop_type) {
+            steps.push(SchemaMigrationStep::ExtendEnum {
+                type_kind,
+                type_name: type_name.to_string(),
+                property_name: property.name.clone(),
+                added_values,
+            });
+        } else if existing.prop_type != property.prop_type {
             steps.push(SchemaMigrationStep::UnsupportedChange {
                 entity: format!(
                     "{}:{}.{}",
@@ -709,6 +733,46 @@ fn plan_property_metadata(
     }
 }
 
+/// `Some(added)` when `desired` is a PURE enum widening of `accepted`: both
+/// are enums of the same scalar/list shape and nullability, every accepted
+/// value is retained, and at least one value is new. Enum values arrive
+/// sorted + deduped from the schema IR (`normalize` in schema_ir.rs), so a
+/// bare reorder is already type equality (no step), and a returned `added`
+/// is never empty. Everything else (narrowing, renamed values, enum<->plain
+/// conversions, shape changes) returns `None` and falls through to
+/// OG-MF-106.
+fn enum_widening(accepted: &PropType, desired: &PropType) -> Option<Vec<String>> {
+    let accepted_values = accepted.enum_values.as_ref()?;
+    let desired_values = desired.enum_values.as_ref()?;
+    if accepted.scalar != desired.scalar
+        || accepted.nullable != desired.nullable
+        || accepted.list != desired.list
+    {
+        return None;
+    }
+    if accepted_values == desired_values {
+        // Identical type — not a change at all; let the equality check pass.
+        return None;
+    }
+    let desired_set: std::collections::HashSet<&str> =
+        desired_values.iter().map(String::as_str).collect();
+    if !accepted_values
+        .iter()
+        .all(|v| desired_set.contains(v.as_str()))
+    {
+        return None; // narrowing or rename
+    }
+    let accepted_set: std::collections::HashSet<&str> =
+        accepted_values.iter().map(String::as_str).collect();
+    Some(
+        desired_values
+            .iter()
+            .filter(|v| !accepted_set.contains(v.as_str()))
+            .cloned()
+            .collect(),
+    )
+}
+
 enum AnnotationChangeKind {
     None,
     MetadataOnly(Vec<Annotation>),
@@ -851,6 +915,107 @@ mod tests {
         UpdateTypeMetadata,
     };
     use super::*;
+
+    fn ir(source: &str) -> crate::catalog::schema_ir::SchemaIR {
+        build_schema_ir(&parse_schema(source).unwrap()).unwrap()
+    }
+
+    const ENUM_ACCEPTED: &str = r#"
+node Ticket {
+    slug: String @key
+    status: enum(todo, doing, done)
+}
+"#;
+
+    #[test]
+    fn plan_supports_pure_enum_widening() {
+        let accepted = ir(ENUM_ACCEPTED);
+        let desired = ir(
+            r#"
+node Ticket {
+    slug: String @key
+    status: enum(todo, doing, done, blocked, canceled)
+}
+"#,
+        );
+        let plan = plan_schema_migration(&accepted, &desired).unwrap();
+        assert!(plan.supported, "widening must be a supported plan: {plan:?}");
+        assert!(plan.steps.contains(&SchemaMigrationStep::ExtendEnum {
+            type_kind: SchemaTypeKind::Node,
+            type_name: "Ticket".to_string(),
+            property_name: "status".to_string(),
+            added_values: vec!["blocked".to_string(), "canceled".to_string()],
+        }));
+    }
+
+    #[test]
+    fn plan_treats_pure_reorder_as_no_change() {
+        // Enum values are sorted + deduped by the schema IR, so a reorder is
+        // type-identical — no step at all, not even a widening.
+        let accepted = ir(ENUM_ACCEPTED);
+        let desired = ir(
+            r#"
+node Ticket {
+    slug: String @key
+    status: enum(done, todo, doing)
+}
+"#,
+        );
+        let plan = plan_schema_migration(&accepted, &desired).unwrap();
+        assert!(plan.supported);
+        assert!(
+            plan.steps.is_empty(),
+            "reorder must be a no-op plan: {:?}",
+            plan.steps
+        );
+    }
+
+    #[test]
+    fn plan_rejects_enum_narrowing_and_rename() {
+        let accepted = ir(ENUM_ACCEPTED);
+        for desired_src in [
+            // narrowing
+            "node Ticket {\n    slug: String @key\n    status: enum(todo, done)\n}\n",
+            // rename of a variant (doing -> in_progress) = remove + add
+            "node Ticket {\n    slug: String @key\n    status: enum(todo, in_progress, done)\n}\n",
+        ] {
+            let desired = ir(desired_src);
+            let plan = plan_schema_migration(&accepted, &desired).unwrap();
+            assert!(!plan.supported, "must be unsupported: {desired_src}");
+            assert!(
+                plan.steps.iter().any(|s| matches!(
+                    s,
+                    UnsupportedChange { code: Some(c), .. } if c == crate::lint::codes::OG_MF_106.code
+                )),
+                "expected OG-MF-106: {plan:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn plan_rejects_widening_combined_with_nullability_change() {
+        let accepted = ir(ENUM_ACCEPTED);
+        let desired = ir(
+            r#"
+node Ticket {
+    slug: String @key
+    status: enum(todo, doing, done, blocked)?
+}
+"#,
+        );
+        let plan = plan_schema_migration(&accepted, &desired).unwrap();
+        assert!(!plan.supported, "widen+nullable-flip must stay unsupported");
+    }
+
+    #[test]
+    fn plan_rejects_enum_to_free_string_and_back() {
+        let accepted = ir(ENUM_ACCEPTED);
+        let free = ir("node Ticket {\n    slug: String @key\n    status: String\n}\n");
+        let plan = plan_schema_migration(&accepted, &free).unwrap();
+        assert!(!plan.supported, "enum->String must stay unsupported");
+        let plan_back = plan_schema_migration(&free, &accepted).unwrap();
+        assert!(!plan_back.supported, "String->enum must stay unsupported");
+    }
 
     #[test]
     fn plan_supports_additive_nullable_property_and_index() {
