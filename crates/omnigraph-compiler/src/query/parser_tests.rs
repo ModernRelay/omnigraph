@@ -84,6 +84,46 @@ order { $p.age desc }
 }
 
 #[test]
+fn test_parse_undirected_traversal() {
+    // `$a <edge> $b`, bare + bounded + inside not{}.
+    let input = r#"
+query related($name: String) {
+match {
+    $p: Person { name: $name }
+    $p <knows> $f
+    $p <knows>{1,3} $g
+    not { $f <knows> $g }
+}
+return { $f.name }
+}
+"#;
+    let qf = parse_query(input).unwrap();
+    let q = &qf.queries[0];
+    match &q.match_clause[1] {
+        Clause::Traversal(t) => {
+            assert_eq!(t.edge_name, "knows");
+            assert!(t.undirected, "bare undirected form");
+            assert_eq!((t.min_hops, t.max_hops), (1, Some(1)));
+        }
+        c => panic!("expected Traversal, got {c:?}"),
+    }
+    match &q.match_clause[2] {
+        Clause::Traversal(t) => {
+            assert!(t.undirected, "bounded undirected form");
+            assert_eq!((t.min_hops, t.max_hops), (1, Some(3)));
+        }
+        c => panic!("expected Traversal, got {c:?}"),
+    }
+    match &q.match_clause[3] {
+        Clause::Negation(inner) => match &inner[0] {
+            Clause::Traversal(t) => assert!(t.undirected, "undirected inside not{{}}"),
+            c => panic!("expected Traversal in not, got {c:?}"),
+        },
+        c => panic!("expected Negation, got {c:?}"),
+    }
+}
+
+#[test]
 fn test_parse_traversal() {
     let input = r#"
 query friends_of($name: String) {

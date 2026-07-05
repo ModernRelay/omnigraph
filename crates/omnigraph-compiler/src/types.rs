@@ -186,6 +186,9 @@ impl PropType {
 pub enum Direction {
     Out,
     In,
+    /// Undirected: traverse the edge both ways, deduplicated per source
+    /// (`$a <edge> $b`). Only valid on same-endpoint-type edges.
+    Both,
 }
 
 #[cfg(test)]

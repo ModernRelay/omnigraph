@@ -52,8 +52,10 @@ prop_match_list = { prop_match ~ ("," ~ prop_match)* ~ ","? }
 prop_match = { ident ~ ":" ~ match_value }
 match_value = { literal | variable | now_call }
 
-// Traversal: $p knows $f
-traversal = { variable ~ edge_ident ~ traversal_bounds? ~ variable }
+// Traversal: $p knows $f (directional) or $p <knows> $f (undirected —
+// matches the edge in either direction; same-endpoint-type edges only).
+traversal = { variable ~ (undirected_edge | edge_ident) ~ traversal_bounds? ~ variable }
+undirected_edge = { "<" ~ edge_ident ~ ">" }
 traversal_bounds = { "{" ~ integer ~ "," ~ integer? ~ "}" }
 
 // Filter: $f.age > 25

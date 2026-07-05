@@ -279,6 +279,9 @@ fn lower_clauses(
             let dst_type = match direction {
                 Direction::Out => edge.to_type.clone(),
                 Direction::In => edge.from_type.clone(),
+                // Undirected requires from_type == to_type (typecheck rule),
+                // so either endpoint type is correct.
+                Direction::Both => edge.to_type.clone(),
             };
 
             if src_bound && dst_bound {
@@ -310,10 +313,13 @@ fn lower_clauses(
                 let reverse_dir = match direction {
                     Direction::Out => Direction::In,
                     Direction::In => Direction::Out,
+                    // Symmetric: reversing an undirected expand is a no-op.
+                    Direction::Both => Direction::Both,
                 };
                 let src_type = match direction {
                     Direction::Out => edge.from_type.clone(),
                     Direction::In => edge.to_type.clone(),
+                    Direction::Both => edge.from_type.clone(),
                 };
                 let introduced_filters =
                     deferred_filters.remove(&traversal.src).unwrap_or_default();

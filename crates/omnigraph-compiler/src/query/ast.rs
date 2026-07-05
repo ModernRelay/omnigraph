@@ -60,6 +60,9 @@ pub struct Traversal {
     pub dst: String,
     pub min_hops: u32,
     pub max_hops: Option<u32>,
+    /// `$a <edge> $b` — match the edge in either direction (set semantics;
+    /// same-endpoint-type edges only, enforced at typecheck).
+    pub undirected: bool,
 }
 
 #[derive(Debug, Clone)]
