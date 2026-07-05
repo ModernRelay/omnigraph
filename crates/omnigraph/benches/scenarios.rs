@@ -55,6 +55,8 @@ struct Args {
     /// ANN k (the query's `limit`) for nearest-prefilter.
     k: usize,
     memory_cap_mb: Option<u64>,
+    /// Results-log override; see `results_path`.
+    out: Option<String>,
     /// Run the identical workload but SKIP the measured operation; the
     /// peak-RSS delta between a normal run and a baseline run isolates the
     /// measured op's own memory contribution (ru_maxrss spans the whole
@@ -75,6 +77,7 @@ impl Args {
             selectivity: 0.05,
             k: 10,
             memory_cap_mb: None,
+            out: None,
             baseline: false,
             child: false,
         };
@@ -94,6 +97,7 @@ impl Args {
                     args.selectivity = take("--selectivity").parse().expect("--selectivity")
                 }
                 "--k" => args.k = take("--k").parse().expect("--k"),
+                "--out" => args.out = Some(take("--out")),
                 "--memory-cap-mb" => {
                     args.memory_cap_mb = Some(take("--memory-cap-mb").parse().expect("cap"))
                 }
@@ -162,10 +166,53 @@ fn main() {
     for run in 0..args.runs {
         let record = run_once(&args, run);
         println!("{record}");
+        append_result(&args, &record);
     }
 }
 
 #[cfg(unix)]
+/// Where run records accumulate: `--out <path>`, else `OMNIGRAPH_BENCH_RESULTS`,
+/// else `benches/results.jsonl` next to this crate (gitignored — results are
+/// host-specific; each record is self-describing via `host` + `params` +
+/// `git_sha`). Append-only JSON lines, the harness's system of record.
+fn results_path(args: &Args) -> std::path::PathBuf {
+    if let Some(ref out) = args.out {
+        return out.into();
+    }
+    if let Ok(env_path) = std::env::var("OMNIGRAPH_BENCH_RESULTS") {
+        if !env_path.trim().is_empty() {
+            return env_path.trim().into();
+        }
+    }
+    std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("benches/results.jsonl")
+}
+
+fn append_result(args: &Args, record: &serde_json::Value) {
+    let path = results_path(args);
+    let appended = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&path)
+        .and_then(|mut f| {
+            use std::io::Write as _;
+            writeln!(f, "{record}")
+        });
+    if let Err(e) = appended {
+        eprintln!("WARNING: could not append to {}: {e}", path.display());
+    }
+}
+
+fn git_sha() -> Option<String> {
+    let out = std::process::Command::new("git")
+        .args(["rev-parse", "--short", "HEAD"])
+        .current_dir(env!("CARGO_MANIFEST_DIR"))
+        .output()
+        .ok()?;
+    out.status
+        .success()
+        .then(|| String::from_utf8_lossy(&out.stdout).trim().to_string())
+}
+
 fn run_once(args: &Args, run: usize) -> serde_json::Value {
     let exe = std::env::current_exe().expect("current_exe");
     let mut child = std::process::Command::new(exe)
@@ -200,6 +247,11 @@ fn run_once(args: &Args, run: usize) -> serde_json::Value {
     serde_json::json!({
         "scenario": args.scenario,
         "run": run,
+        "ts": std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0),
+        "git_sha": git_sha(),
         "params": {
             "rows": args.rows,
             "dims": args.dims,
