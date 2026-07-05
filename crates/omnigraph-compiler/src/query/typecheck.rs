@@ -767,11 +767,22 @@ fn typecheck_traversal(
         ));
     }
 
+    // Undirected (`$a <edge> $b`): only meaningful when both orientations
+    // carry the same endpoint types — for an asymmetric edge the pattern is
+    // well-typed in at most one direction, so the undirected form is either
+    // pointless or a type error; require the directional form instead.
+    if traversal.undirected && edge.from_type != edge.to_type {
+        return Err(CompilerError::Type(format!(
+            "T22: undirected traversal `<{}>` requires a same-endpoint-type edge, but `{}: {} -> {}` is asymmetric; use the directional form",
+            edge.name, edge.name, edge.from_type, edge.to_type
+        )));
+    }
+
     // Determine direction based on bound variables and edge endpoints
     let src_bound = ctx.bindings.get(&traversal.src);
     let dst_bound = ctx.bindings.get(&traversal.dst);
 
-    let direction;
+    let mut direction;
 
     if let Some(src_bv) = src_bound {
         // T5: src type must match one endpoint of the edge
@@ -808,6 +819,12 @@ fn typecheck_traversal(
         direction = Direction::Out;
         bind_traversal_endpoint(ctx, &traversal.src, &edge.from_type, edge)?;
         bind_traversal_endpoint(ctx, &traversal.dst, &edge.to_type, edge)?;
+    }
+
+    if traversal.undirected {
+        // The orientation inference above is a no-op for a same-type edge
+        // (both arms resolve identically); the user asked for both ways.
+        direction = Direction::Both;
     }
 
     ctx.traversals.push(ResolvedTraversal {

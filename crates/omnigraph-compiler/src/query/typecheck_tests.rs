@@ -726,6 +726,47 @@ return { sum($p.name) as s }
 }
 
 #[test]
+fn test_undirected_traversal_resolves_both_on_same_type_edge() {
+    let catalog = setup();
+    let qf = parse_query(
+        r#"
+query q() {
+match {
+    $p: Person { name: "Alice" }
+    $p <knows> $f
+}
+return { $f.name }
+}
+"#,
+    )
+    .unwrap();
+    let ctx = typecheck_query(&catalog, &qf.queries[0]).unwrap();
+    assert_eq!(ctx.traversals[0].direction, Direction::Both);
+    assert_eq!(ctx.bindings["f"].type_name, "Person");
+}
+
+#[test]
+fn test_undirected_traversal_rejected_on_asymmetric_edge() {
+    let catalog = setup();
+    let qf = parse_query(
+        r#"
+query q() {
+match {
+    $p: Person { name: "Alice" }
+    $p <worksAt> $c
+}
+return { $c.name }
+}
+"#,
+    )
+    .unwrap();
+    let err = typecheck_query(&catalog, &qf.queries[0]).unwrap_err();
+    let msg = err.to_string();
+    assert!(msg.contains("T22"), "expected T22, got: {msg}");
+    assert!(msg.contains("WorksAt"), "names the edge type: {msg}");
+}
+
+#[test]
 fn test_traversal_direction_out() {
     let catalog = setup();
     let qf = parse_query(
