@@ -23,7 +23,12 @@
 //! ignores RLIMIT_AS — the cap variant is primarily a Linux tool, while
 //! peak-RSS reporting works everywhere).
 
+// The harness is Unix-only (wait4/rusage/setrlimit); a Windows host gets an
+// inert stub so `cargo bench`/`cargo build --benches` still compile there.
+#![cfg_attr(not(unix), allow(dead_code, unused_imports))]
+
 #[path = "../tests/helpers/mod.rs"]
+#[cfg(unix)]
 mod helpers;
 
 use std::fmt::Write as _;
@@ -131,6 +136,12 @@ impl Args {
 // Parent: spawn child, reap with wait4, merge rusage into the JSON record
 // ---------------------------------------------------------------------------
 
+#[cfg(not(unix))]
+fn main() {
+    eprintln!("the scenario harness requires a Unix platform (wait4/rusage/setrlimit)");
+}
+
+#[cfg(unix)]
 fn main() {
     let args = Args::parse();
     if args.scenario.is_empty() {
@@ -211,7 +222,14 @@ fn run_once(args: &Args, run: usize) -> serde_json::Value {
 fn wait4_rusage(pid: i32) -> (i64, u64) {
     let mut status: libc::c_int = 0;
     let mut rusage: libc::rusage = unsafe { std::mem::zeroed() };
-    let reaped = unsafe { libc::wait4(pid, &mut status, 0, &mut rusage) };
+    // Retry on EINTR: a delivered signal (SIGTERM from the shell, SIGCHLD
+    // from an unrelated child) interrupts the blocking wait with -1.
+    let reaped = loop {
+        let r = unsafe { libc::wait4(pid, &mut status, 0, &mut rusage) };
+        if r != -1 || std::io::Error::last_os_error().raw_os_error() != Some(libc::EINTR) {
+            break r;
+        }
+    };
     assert_eq!(reaped, pid, "wait4 reaped unexpected pid");
     let exit: i64 = if libc::WIFEXITED(status) {
         libc::WEXITSTATUS(status) as i64
@@ -238,8 +256,16 @@ fn run_child(args: &Args) {
             rlim_max: cap_mb * 1024 * 1024,
         };
         // RLIMIT_AS is enforced on Linux; macOS frequently ignores it. Applied
-        // best-effort everywhere so the same command line works on both.
-        unsafe { libc::setrlimit(libc::RLIMIT_AS, &cap) };
+        // best-effort everywhere so the same command line works on both — but
+        // a FAILED setrlimit must be loud (stderr is inherited): the parent's
+        // JSON records the requested cap, and silently running uncapped would
+        // misrepresent the test conditions.
+        if unsafe { libc::setrlimit(libc::RLIMIT_AS, &cap) } != 0 {
+            eprintln!(
+                "WARNING: setrlimit(RLIMIT_AS, {cap_mb} MiB) failed ({}); child runs UNCAPPED",
+                std::io::Error::last_os_error()
+            );
+        }
     }
     let runtime = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
