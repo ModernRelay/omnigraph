@@ -20,6 +20,10 @@ rank).
 - `nearest()` requires a `limit`. The query vector is resolved from the param map,
   or embedded from a text input at runtime via the configured
   [embedding client](embeddings.md).
+- Match filters apply **before** the search: combining a `match` predicate with
+  `nearest()` (or `bm25()`) returns the top-`limit` of the *matching* rows —
+  never a post-filtered remainder of the global top-k. A selective filter
+  narrows the candidate set; it cannot starve the result count.
 - Scores and ranks propagate as ordinary columns, so you can `return` a score and
   `order` by it.
 

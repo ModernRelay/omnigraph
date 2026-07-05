@@ -1923,6 +1923,18 @@ async fn execute_node_scan(
             // Apply the structured IR filter via Lance's Expr pushdown.
             if let Some(ref expr) = filter_expr {
                 scanner.filter_expr(expr.clone());
+                // The filter must run BEFORE any ANN/FTS search on this
+                // scanner. Lance defaults to prefilter=false, which applies
+                // the filter to the search's top-k results — "you may get
+                // back fewer results than you ask for (or none at all)"
+                // (lance scanner.rs) — i.e. `limit k` would mean top-k of
+                // the whole table, silently starved by a selective filter.
+                // One flag governs both the vector and FTS sources, and it
+                // is unused by plain scans, so setting it whenever a filter
+                // is present is safe. Prefiltering also re-enables scalar-
+                // index acceleration for the predicate (Lance gates
+                // use_scalar_index on prefilter when a nearest is present).
+                scanner.prefilter(true);
             }
 
             // Apply FTS queries from hoisted search filters (search/fuzzy/match_text in match clause)
