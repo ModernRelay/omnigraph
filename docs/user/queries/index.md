@@ -23,6 +23,7 @@ Param types reuse all schema scalars; trailing `?` makes a param optional. The c
 
 - **Binding**: `$x: NodeType { prop: <literal | $param | now()>, … }`
 - **Traversal**: `$src EDGE_NAME { min, max? } $dst` — variable-length paths via hop bounds; default 1..1 if bounds omitted.
+- **Undirected traversal**: `$src <EDGE_NAME> $dst` — matches the edge in *either* direction with set semantics (a pair connected both ways, or a self-loop, appears once). Only valid on same-endpoint-type edges (e.g. `Related: Issue -> Issue`); an asymmetric edge is rejected at typecheck (`T22`) since it is well-typed in at most one orientation — use the directional form there. Composes with hop bounds (`$a <knows>{1,3} $b`) and `not { }` ("no edge in either direction").
 - **Filter**: `<expr> <op> <expr>` with operators `>=`, `<=`, `!=`, `>`, `<`, `=`, and string `contains`.
 - **Negation**: `not { clause+ }` — desugars to anti-join over the inner pipeline.
 
@@ -49,7 +50,7 @@ Write statements (`insert` / `update` / `delete`) are documented on the
 
 ## Traversal execution
 
-Variable-length traversals (`Expand`) are executed one of two ways, chosen per-expand by a cost model over cheap manifest counts (frontier size, edge count, source-vertex count, hops) plus index coverage: selective traversals (small frontier relative to the source set) resolve neighbors from the persisted `src`/`dst` BTREE (one indexed scan per hop); dense / deep / large-frontier traversals — or those whose BTREE coverage is degraded so a full scan would be paid per hop — use an in-memory CSR adjacency index. Both produce identical results. The `OMNIGRAPH_EXPAND_INDEXED_MAX_FRONTIER` / `OMNIGRAPH_EXPAND_INDEXED_MAX_HOPS` ceilings bound the *initial dispatch* frontier/hops (beyond them CSR is always used); the cost model estimates total indexed work as ~`hops × frontier × fanout` and prices dense fan-out toward CSR — they are not a hard per-hop bound. `OMNIGRAPH_TRAVERSAL_MODE=indexed|csr` forces a mode (see [constants](../reference/constants.md)).
+Variable-length traversals (`Expand`) are executed one of two ways, chosen per-expand by a cost model over cheap manifest counts (frontier size, edge count, source-vertex count, hops) plus index coverage: selective traversals (small frontier relative to the source set) resolve neighbors from the persisted `src`/`dst` BTREE (one indexed scan per hop); dense / deep / large-frontier traversals — or those whose BTREE coverage is degraded so a full scan would be paid per hop — use an in-memory CSR adjacency index. Both produce identical results. An undirected traversal reads both adjacency directions — the CSR arm walks the outgoing and incoming index (both are always built), the indexed arm probes both the `src` and `dst` BTREE per hop — under the same per-source dedup, so its cost is roughly twice the directional equivalent. The `OMNIGRAPH_EXPAND_INDEXED_MAX_FRONTIER` / `OMNIGRAPH_EXPAND_INDEXED_MAX_HOPS` ceilings bound the *initial dispatch* frontier/hops (beyond them CSR is always used); the cost model estimates total indexed work as ~`hops × frontier × fanout` and prices dense fan-out toward CSR — they are not a hard per-hop bound. `OMNIGRAPH_TRAVERSAL_MODE=indexed|csr` forces a mode (see [constants](../reference/constants.md)).
 
 ## Linting & validation
 
