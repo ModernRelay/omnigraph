@@ -156,7 +156,85 @@ If a future need pulls one of these into scope, add a row to the matching domain
 
 When Lance ships a major release that changes any of the above (file format bump, new index type, transaction semantics change, new branching primitive), refresh this index in the same change as the omnigraph upgrade. Stale Lance pointers are worse than no pointers.
 
-### Patch pin: 2026-07-02 (vendored lance-table 7.0.0 + lance#7480; omnigraph still pinned at 7.0.0)
+### Last alignment audit: 2026-07-05 (Lance 9.0.0-beta.15 upstream; omnigraph pinned at 9.0.0-beta.15 via git rev)
+
+Migration from Lance 7.0.0 → 9.0.0-beta.15 landed in this cycle. The 9.x betas
+are **git tags only** (crates.io carries ≤ 8.0.0), so every lance crate is a git
+dependency rev-pinned to the `v9.0.0-beta.15` tag commit (`f24e42c1`); switch to
+the crates.io release at 9.0.0 stable. 382 upstream commits reviewed across two
+audit legs (243 in 7→8, 139 in 8→9-beta.15). **Arrow stayed 58, DataFusion
+stayed 53, object_store stayed 0.13.2** — zero ecosystem churn. **No table/file
+format or minimum-reader-version movement in either leg**: data written by this
+binary under our settings (explicit V2_2 pins) round-trips to a 7.0.0 reader;
+the one soft door is FTS v2 index files (default for NEW inverted indexes since
+9.0.0-beta.11 — readable by 7.0.0+, rebuildable derived state). Behavior-affecting
+findings:
+
+- **lance#7480 shipped (9.0.0-beta.11)** → the `vendor/lance-table` pin and its
+  `[patch.crates-io]` entry are **retired** per their documented removal
+  condition; `filtered_scan_tolerates_merge_update_row_id_overlap` now passes on
+  stock lance-table and stays as the regression tripwire.
+- **lance#7320 shipped (9.0.0-beta.1)** → the sequential BTREE segment-merge
+  corruption (lance#7230: update-preserved row ids duplicated by
+  `build_stable_row_id_filter` when compaction skips the superseded fragment;
+  empirically reproduced on 7.0.0 via load → keyed update → optimize → broken
+  filtered reads AND broken keyed writes) is fixed upstream. No engine-side
+  mitigation needed.
+- **Blob-v2 compaction fixed** (8.0.0 PR #7017, hardened by #7618 in beta.15
+  after a beta.13 regression) → executed the documented removal plan:
+  `LANCE_SUPPORTS_BLOB_COMPACTION`, the optimize skip branch, and
+  `SkipReason::BlobColumnsUnsupportedByLance` deleted; the guard inverted to a
+  positive pin (`compact_files_succeeds_on_blob_columns`) and
+  `maintenance.rs::optimize_compacts_blob_table_alongside_plain_table` asserts
+  blob tables compact, publish, and keep every row.
+- **Filter-literal coercion improved** (v8 #6935 et al.): a width-mismatched
+  literal (`n32 = 5i64`) is now coerced to the column type BEFORE pushdown and
+  USES the BTREE (7.0.0 planned an index-defeating column cast).
+  `scalar_index_use_requires_matched_literal_type` re-pinned to the new truth;
+  `query.rs::literal_to_typed_expr` stays load-bearing.
+- **Branch-consistency enforcement on open** (9.x): `DatasetBuilder` now errors
+  loudly when the resolved manifest belongs to a different branch than
+  requested ("open of branch X resolved a manifest belonging to branch Y") —
+  the substrate enforcing what omnigraph's entry-owner resolution always did.
+  Production opens by owner-resolved location (unaffected); the lazy-fork
+  namespace test pins both the error and the owner-branch open.
+- **Native DirectoryNamespace churn** (#7222 removed
+  `table_version_storage_enabled` + the `__manifest` version-storage
+  experiment; #7176/#7191/#7234 rewrote manifest handling): the decoupling
+  guard's thesis holds at v9 (manifest-tracked tables still `TableNotFound` to
+  native tooling with dir-listing disabled) and was realigned.
+- **merge_insert substantially rewritten** (+1321 lines across #6878 composite
+  indexed join keys, #7484 WhenNotMatchedBySource::Delete/Fail fixed on the
+  indexed-scan path, #7410/#7359 stale scalar-index entries after
+  stable-row-id update): every edge-table merge (src+dst BTREE keys) now takes
+  the AND-folded index-probe path. Full suite green; the surfaces omnigraph
+  pins (`execute_reader` return shape, WhenMatched/WhenNotMatched,
+  `SourceDedupeBehavior`) are unchanged. **#6877 was fixed in 8.0.0 (#6965)**
+  — re-evaluate retiring `SourceDedupeBehavior::FirstSeen` +
+  `check_batch_unique_by_keys` in a follow-up.
+- **optimize_indices steady-state is a true no-op** (v8 #6905: no version bump
+  when there is no index work) and **FTS AND queries enforce required terms**
+  (#7385 — `match_text`/`bm25` result sets can legitimately change). Both
+  absorbed by the existing suites (68/68 green, incl. cost gates within slack).
+- **New failure surfaces**: every commit path has a default 30-minute timeout
+  (v8 #6773); `alter_columns` with a cast on an indexed column now hard-errors
+  (v8 #7158 — omnigraph's planner never emits casts today, OG-MF-106 refuses
+  type changes first).
+- **Still NOT fixed at 9.0.0-beta.15:** vector-index two-phase (lance#6666 —
+  `build_index_metadata_from_segments` still `pub(crate)`; the
+  `create_vector_index` inline residual and its recovery coverage are
+  retained), #6914 per-row version-metadata refresh (unshipped), and upstream
+  **#7508 is open** (FTS "record batch length" errors after frequent
+  `optimize_indices` — omnigraph's reconciler call pattern; watch it).
+- **RowAddrTreeMap moved** from `lance_core::utils::mask` to the new
+  `lance-select` crate — the single compile break in the whole migration.
+- Beta-line caveat: the blob read path regressed inside the line (beta.13,
+  fixed beta.15 by #7618) — pre-release churn is real; re-audit before any
+  beta→stable or beta→beta advance.
+
+Bump this date stanza on the next alignment pass.
+
+### Patch pin: 2026-07-02 (vendored lance-table 7.0.0 + lance#7480) — RETIRED at the 9.0.0-beta.15 bump (fix upstream since 9.0.0-beta.11)
 
 Not a version bump — a single-fix vendored pin. `[patch.crates-io] lance-table = { path = "vendor/lance-table" }` points at the pristine published 7.0.0 source carrying ONLY the lance#7480 `rowids/index.rs` hunk (merged upstream 2026-07-01, a few hours AFTER v8.0.0 was cut, so it ships in no release ≤ 8.0.0):
 
