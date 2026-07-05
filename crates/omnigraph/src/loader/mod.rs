@@ -907,9 +907,18 @@ fn build_column_from_json(
                         )));
                     }
                     for val in arr {
-                        builder
-                            .values()
-                            .append_value(val.as_f64().unwrap_or(0.0) as f32);
+                        // Parity with the mutation path: non-numeric elements
+                        // (null — what json! emits for a non-finite float —
+                        // strings, bools) are rejected loudly, never coerced
+                        // to 0.0, which would silently corrupt the vector's
+                        // direction while passing every dimension check.
+                        let Some(v) = val.as_f64() else {
+                            return Err(OmniError::manifest(format!(
+                                "vector property '{}' elements must be numeric, got {}",
+                                name, val
+                            )));
+                        };
+                        builder.values().append_value(v as f32);
                     }
                     builder.append(true);
                 } else if nullable {
