@@ -330,12 +330,19 @@ async fn test_directory_namespace_direct_publish_cannot_replace_native_omnigraph
         .manifest_enabled(true)
         .dir_listing_enabled(false)
         .table_version_tracking_enabled(true)
-        .table_version_storage_enabled(true)
         .inline_optimization_enabled(false)
         .build()
         .await
         .unwrap();
 
+    // Lance 9.0.0-beta.15 realignment: `table_version_storage_enabled` was
+    // removed upstream (the `__manifest` version-storage experiment was
+    // retired, PR #7222) and dir.rs no longer eagerly rewrites PK annotations —
+    // yet the guard's thesis holds unchanged: with dir-listing disabled the
+    // native namespace still reports omnigraph's manifest-tracked tables as
+    // TableNotFound and cannot publish over the manifest. The v7 mechanism
+    // notes below are retained as history.
+    //
     // Lance 7: the native `DirectoryNamespace` no longer recognizes omnigraph's
     // manifest-tracked tables, so list / describe / create_table_version all
     // return `TableNotFound`. The mechanism is *contingent on omnigraph's legacy
@@ -588,13 +595,33 @@ async fn test_branch_manifest_namespace_uses_entry_owner_branch_for_latest_table
         "branch-owned table should resolve to feature branch, got {branch_owned_person_uri}"
     );
 
-    let inherited_company_ds = DatasetBuilder::from_namespace(
+    // Lance 9 validates that the resolved manifest belongs to the requested
+    // branch (builder.rs "open of branch X resolved a manifest belonging to
+    // branch Y"), so `with_branch("feature")` on a main-owned inherited table
+    // is now a LOUD error — the substrate enforcing exactly the invariant the
+    // entry-owner resolution exists for. Pin both halves: the mismatched open
+    // errors, and the owner-branch open (no with_branch — how production
+    // opens entries, by owner-resolved location) reads the inherited table.
+    let mismatched = DatasetBuilder::from_namespace(
         Arc::clone(&feature_namespace),
         vec!["node:Company".to_string()],
     )
     .await
     .unwrap()
     .with_branch("feature", None)
+    .load()
+    .await;
+    let err = format!("{:?}", mismatched.expect_err("branch-mismatched open must fail on v9"));
+    assert!(
+        err.contains("belonging to branch"),
+        "expected the v9 branch-consistency error, got: {err}"
+    );
+    let inherited_company_ds = DatasetBuilder::from_namespace(
+        Arc::clone(&feature_namespace),
+        vec!["node:Company".to_string()],
+    )
+    .await
+    .unwrap()
     .load()
     .await
     .unwrap();
