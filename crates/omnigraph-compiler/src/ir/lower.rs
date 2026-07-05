@@ -267,14 +267,24 @@ fn lower_clauses(
                     ))
                 })?;
 
-            let direction = type_ctx
-                .traversals
-                .iter()
-                .find(|rt| {
-                    rt.src == traversal.src && rt.dst == traversal.dst && rt.edge_type == edge.name
-                })
-                .map(|rt| rt.direction)
-                .unwrap_or(Direction::Out);
+            // Undirected is carried on the AST node itself — negation inners
+            // are typechecked into a discarded context clone, so the
+            // ResolvedTraversal lookup below cannot see their direction; the
+            // syntax is the source of truth for Both.
+            let direction = if traversal.undirected {
+                Direction::Both
+            } else {
+                type_ctx
+                    .traversals
+                    .iter()
+                    .find(|rt| {
+                        rt.src == traversal.src
+                            && rt.dst == traversal.dst
+                            && rt.edge_type == edge.name
+                    })
+                    .map(|rt| rt.direction)
+                    .unwrap_or(Direction::Out)
+            };
 
             let dst_type = match direction {
                 Direction::Out => edge.to_type.clone(),

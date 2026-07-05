@@ -124,6 +124,24 @@ async fn indexed_matches_csr_one_hop_same_type() {
 }
 
 #[tokio::test]
+async fn indexed_matches_csr_undirected_one_hop() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut db = init_and_load(&dir).await;
+    let queries = r#"
+query connected($name: String) {
+    match {
+        $p: Person { name: $name }
+        $p <knows> $f
+    }
+    return { $f.name }
+}
+"#;
+    // Bob: outgoing Bob->Diana, incoming Alice->Bob — undirected sees both.
+    let got = both_modes(&mut db, queries, "connected", &params(&[("$name", "Bob")])).await;
+    assert_eq!(got, vec!["Alice", "Diana"], "out ∪ in neighbors of Bob");
+}
+
+#[tokio::test]
 async fn indexed_matches_csr_multi_hop_same_type() {
     let dir = tempfile::tempdir().unwrap();
     let mut db = init_and_load(&dir).await;
