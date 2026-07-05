@@ -296,7 +296,7 @@ async fn _compile_transaction_history_for_repair_signature() -> lance::Result<()
 )]
 async fn _compile_uncommitted_delete_field_shape() -> lance::Result<()> {
     use lance::dataset::DeleteBuilder;
-    use lance_core::utils::mask::RowAddrTreeMap;
+    use lance_select::mask::RowAddrTreeMap;
     let ds: Arc<Dataset> = unimplemented!();
     let staged = DeleteBuilder::new(ds, "x = 1")
         .execute_uncommitted()
@@ -321,7 +321,7 @@ async fn _compile_uncommitted_delete_field_shape() -> lance::Result<()> {
     clippy::diverging_sub_expression
 )]
 async fn _compile_uncommitted_merge_insert_field_shape() -> lance::Result<()> {
-    use lance_core::utils::mask::RowAddrTreeMap;
+    use lance_select::mask::RowAddrTreeMap;
     let ds: Arc<Dataset> = unimplemented!();
     let source: Box<dyn arrow_array::RecordBatchReader + Send> = unimplemented!();
     let job = MergeInsertBuilder::try_new(ds, vec!["x".to_string()])?.try_build()?;
@@ -381,22 +381,22 @@ async fn force_delete_branch_semantics() {
     );
 }
 
-// --- Guard 10: blob-column compaction is still broken in this Lance --------
+// --- Guard 10: blob-column compaction works in this Lance ------------------
 //
-// `db/omnigraph/optimize.rs` skips tables with blob columns while
-// `LANCE_SUPPORTS_BLOB_COMPACTION = false`: Lance `compact_files` forces
-// `BlobHandling::AllBinary`, and the blob-v2 struct decoder mis-counts columns
-// ("more fields in the schema than provided column indices"), failing even a
-// pristine uniform-V2_2 multi-fragment blob table. Reads are unaffected (they
-// use descriptor handling).
-//
-// WHEN THIS TEST TURNS RED (compact_files no longer errors), the Lance bug is
-// fixed: flip `LANCE_SUPPORTS_BLOB_COMPACTION` to true in optimize.rs, drop the
-// blob-skip branch + the `optimize_skips_blob_table_and_reports_skip`
-// skip assertions in maintenance.rs, and re-pin docs/dev/lance.md.
+// Historical: through Lance 7.0.0, `compact_files` forced
+// `BlobHandling::AllBinary` and the blob-v2 struct decoder mis-counted columns,
+// failing even a pristine uniform-V2_2 multi-fragment blob table; `optimize`
+// skipped blob-bearing tables behind `LANCE_SUPPORTS_BLOB_COMPACTION = false`.
+// Lance 8.0.0 shipped full blob-v2 compaction (upstream PR #7017; hardened by
+// #7618 in 9.0.0-beta.15 after a beta.13 regression), so the gate, the skip
+// branch, and the `BlobColumnsUnsupportedByLance` skip reason were removed at
+// the 9.0.0-beta.15 bump. This guard pins the POSITIVE behavior `optimize` now
+// relies on: a multi-fragment blob table compacts, preserving every row. If it
+// turns red on a future bump, blob compaction regressed — restore the skip
+// machinery from git history.
 
 #[tokio::test]
-async fn compact_files_still_fails_on_blob_columns() {
+async fn compact_files_succeeds_on_blob_columns() {
     use arrow_array::{LargeBinaryArray, StructArray};
 
     fn blob_batch(start: i32, n: i32) -> RecordBatch {
@@ -455,17 +455,24 @@ async fn compact_files_still_fails_on_blob_columns() {
         "guard needs a multi-fragment table to trigger a real compaction rewrite"
     );
 
-    let result = compact_files(&mut ds, CompactionOptions::default(), None).await;
-    let err = result.expect_err(
-        "compact_files unexpectedly SUCCEEDED on a blob table — the Lance blob-v2 \
-         compaction bug is fixed. Flip LANCE_SUPPORTS_BLOB_COMPACTION to true in \
-         db/omnigraph/optimize.rs, remove the blob-skip branch, and re-pin docs/dev/lance.md.",
-    );
+    let rows_before = ds.count_rows(None).await.unwrap();
+    let metrics = compact_files(&mut ds, CompactionOptions::default(), None)
+        .await
+        .expect(
+            "compact_files FAILED on a blob table — the Lance blob-v2 compaction \
+             fix (present since 8.0.0, hardened by lance#7618) regressed. If this \
+             is a Lance downgrade, restore the pre-9 blob-skip branch in \
+             db/omnigraph/optimize.rs (see git history + docs/dev/lance.md).",
+        );
     assert!(
-        err.to_string()
-            .contains("more fields in the schema than provided column indices"),
-        "blob compaction failed with an unexpected error (Lance internals may have \
-         shifted): {err}"
+        metrics.fragments_removed >= 2 && metrics.fragments_added >= 1,
+        "expected a real rewrite of the multi-fragment blob table, got {metrics:?}"
+    );
+    let ds = Dataset::open(uri).await.unwrap();
+    assert_eq!(
+        ds.count_rows(None).await.unwrap(),
+        rows_before,
+        "compaction must preserve every blob row"
     );
 }
 
@@ -769,7 +776,13 @@ async fn scalar_index_use_requires_matched_literal_type() {
         (
             "n32 = 5i64 (widened Int64)",
             col("n32").eq(lit(5i64)),
-            false,
+            // 7.0.0: a width-mismatched literal blocked index pushdown (this
+            // pinned `false`). The v8 coercion fixes (lance#6935 et al.) now
+            // coerce Int64(5) -> Int32(5) BEFORE pushdown, so the BTREE is
+            // used. query.rs::literal_to_typed_expr remains load-bearing for
+            // producing exactly-typed literals; Lance now also rescues the
+            // widened case.
+            true,
         ),
         (
             "d32 = Date32 (matched)",
@@ -794,12 +807,14 @@ async fn scalar_index_use_requires_matched_literal_type() {
         );
     }
 
-    // The widened case must show the index-defeating column CAST (the precise
-    // shape the fix avoids by coercing the literal to the column type).
+    // 7.0.0 planned the widened case as an index-defeating column-side CAST
+    // (`CAST(n32 AS Int64) = 5`); since the v8 coercion fixes the literal is
+    // coerced to the column type instead — pin the new mechanism: no column
+    // cast, literal narrowed to Int32.
     let widened = plan_str(&ds, col("n32").eq(lit(5i64))).await;
     assert!(
-        widened.contains("CAST(n32 AS Int64)"),
-        "expected a column-side cast in the widened plan, got:\n{widened}"
+        !widened.contains("CAST(n32") && widened.contains("Int32(5)"),
+        "expected a literal coerced to Int32 with no column-side cast, got:\n{widened}"
     );
 }
 
