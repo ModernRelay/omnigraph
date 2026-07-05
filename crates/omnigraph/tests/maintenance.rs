@@ -419,14 +419,16 @@ node Doc {
 // must skip blob-bearing tables (and report the skip) rather than aborting the
 // whole sweep.
 //
-// Before the skip fix, `optimize()` returned that Lance error here and aborted
-// the whole sweep; it now skips the blob table (`doc.skipped == Some(..)`)
-// while the sibling non-blob `Tag` table still compacts. The skip is gated by
-// `LANCE_SUPPORTS_BLOB_COMPACTION`; the surface guard
-// `compact_files_still_fails_on_blob_columns` flags when the upstream Lance fix
-// makes the skip (and this test's blob arm) removable.
+// History: through Lance 7.0.0 `compact_files` mis-decoded blob-v2 columns, so
+// `optimize` skipped blob tables (`SkipReason::BlobColumnsUnsupportedByLance`)
+// behind `LANCE_SUPPORTS_BLOB_COMPACTION`. Lance 8.0.0+ compacts blob-v2
+// correctly (upstream #7017/#7618), the gate and skip were removed at the
+// 9.0.0-beta.15 bump, and this test now pins the POSITIVE contract: a
+// multi-fragment blob table compacts in the same sweep as its non-blob
+// sibling, is published, and its rows survive. The surface-guard twin is
+// `lance_surface_guards.rs::compact_files_succeeds_on_blob_columns`.
 #[tokio::test]
-async fn optimize_skips_blob_table_and_reports_skip() {
+async fn optimize_compacts_blob_table_alongside_plain_table() {
     let dir = tempfile::tempdir().unwrap();
     let uri = dir.path().to_str().unwrap();
     // One Blob node type (`Doc`) + one plain node type (`Tag`): proves the blob
@@ -489,17 +491,21 @@ node Tag {\n    slug: String @key\n}\n";
         .iter()
         .find(|s| s.table_key == "node:Tag")
         .expect("Tag stat present");
-    // The blob table is skipped (and reported), not compacted.
-    assert_eq!(
-        doc.skipped,
-        Some(SkipReason::BlobColumnsUnsupportedByLance),
-        "blob table must be reported as skipped",
+    // The blob table compacts like any other (Lance 8+ blob-v2 compaction).
+    assert_eq!(doc.skipped, None, "blob table must no longer be skipped");
+    assert!(doc.committed, "blob table compaction must be published");
+    assert!(
+        doc.fragments_removed >= 2 && doc.fragments_added >= 1,
+        "expected a real rewrite of the multi-fragment blob table, got \
+         removed={} added={}",
+        doc.fragments_removed,
+        doc.fragments_added
     );
-    assert!(!doc.committed, "skipped blob table is not compacted");
-    assert_eq!(doc.fragments_removed, 0);
-    assert_eq!(doc.fragments_added, 0);
-    // The plain (non-blob) table is unaffected by the skip.
     assert_eq!(tag.skipped, None, "non-blob table must not be skipped");
+
+    // Every blob row survives the rewrite and stays readable.
+    let count = count_rows(&db, "node:Doc").await;
+    assert_eq!(count, 4, "all blob rows must survive compaction");
 }
 
 // Regression: `optimize` must publish its compaction to the `__manifest` so the
