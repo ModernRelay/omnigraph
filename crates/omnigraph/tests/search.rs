@@ -387,6 +387,75 @@ async fn phrase_search_is_documented_fts_fallback() {
 
 // ─── Vector search (nearest) ────────────────────────────────────────────────
 
+/// iss-nearest-postfilter-starves-results: a scalar `match` predicate combined
+/// with `nearest` must return the top-k of the MATCHING rows. Lance's default
+/// is post-filtering (filter applied AFTER the ANN top-k), under which this
+/// fixture — where every filter-matching doc sits far from the query vector,
+/// so the global top-k is entirely non-matching — returns 0 rows despite 3
+/// matches existing. The engine must set prefilter(true) whenever a filter
+/// rides the same scanner as a search.
+#[tokio::test]
+#[serial]
+async fn filtered_nearest_returns_matching_rows_not_postfiltered_topk() {
+    const SCHEMA: &str = r#"
+node Doc {
+    slug: String @key
+    status: String
+    embedding: Vector(4)
+}
+"#;
+    // Query vector is +e1. The three status="miss" docs cluster around +e1
+    // (global top-3); the three status="hit" docs cluster around -e1.
+    const DATA: &str = r#"{"type":"Doc","data":{"slug":"miss-1","status":"miss","embedding":[1.0,0.01,0.0,0.0]}}
+{"type":"Doc","data":{"slug":"miss-2","status":"miss","embedding":[1.0,0.0,0.02,0.0]}}
+{"type":"Doc","data":{"slug":"miss-3","status":"miss","embedding":[1.0,0.0,0.0,0.03]}}
+{"type":"Doc","data":{"slug":"hit-1","status":"hit","embedding":[-1.0,0.01,0.0,0.0]}}
+{"type":"Doc","data":{"slug":"hit-2","status":"hit","embedding":[-1.0,0.0,0.02,0.0]}}
+{"type":"Doc","data":{"slug":"hit-3","status":"hit","embedding":[-1.0,0.0,0.0,0.03]}}
+"#;
+    const QUERIES: &str = r#"
+query filtered_nearest($q: Vector(4)) {
+    match { $d: Doc { status: "hit" } }
+    return { $d.slug }
+    order { nearest($d.embedding, $q) }
+    limit 3
+}
+"#;
+    let dir = tempfile::tempdir().unwrap();
+    let uri = dir.path().to_str().unwrap();
+    let mut db = Omnigraph::init(uri, SCHEMA).await.unwrap();
+    load_jsonl(&mut db, DATA, LoadMode::Overwrite).await.unwrap();
+
+    let result = query_main(
+        &mut db,
+        QUERIES,
+        "filtered_nearest",
+        &vector_param("$q", &[1.0, 0.0, 0.0, 0.0]),
+    )
+    .await
+    .unwrap();
+
+    assert_eq!(
+        result.num_rows(),
+        3,
+        "filtered nearest must return the top-k of MATCHING rows (3 hits exist), \
+         not the post-filtered remainder of the global top-k"
+    );
+    let batch = result.concat_batches().unwrap();
+    let slugs = batch
+        .column(0)
+        .as_any()
+        .downcast_ref::<StringArray>()
+        .unwrap();
+    for i in 0..slugs.len() {
+        assert!(
+            slugs.value(i).starts_with("hit-"),
+            "only matching docs may appear, got {}",
+            slugs.value(i)
+        );
+    }
+}
+
 #[tokio::test]
 #[serial]
 async fn nearest_returns_k_closest() {
