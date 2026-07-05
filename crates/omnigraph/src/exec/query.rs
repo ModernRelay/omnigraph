@@ -1118,6 +1118,21 @@ fn endpoint_columns(direction: Direction) -> (&'static str, &'static str) {
     }
 }
 
+/// The pessimistic combination of two coverage probes: Degraded dominates
+/// (an undirected traversal pays whichever of its two columns is worse).
+fn worse_coverage(
+    a: crate::table_store::IndexCoverage,
+    b: crate::table_store::IndexCoverage,
+) -> crate::table_store::IndexCoverage {
+    use crate::table_store::IndexCoverage;
+    match (a, b) {
+        (IndexCoverage::Indexed, IndexCoverage::Indexed) => IndexCoverage::Indexed,
+        (IndexCoverage::Degraded { reason }, _) | (_, IndexCoverage::Degraded { reason }) => {
+            IndexCoverage::Degraded { reason }
+        }
+    }
+}
+
 /// All (key, opposite) probes a direction requires: one for Out/In, both
 /// orientations for an undirected traversal.
 fn endpoint_probes(direction: Direction) -> &'static [(&'static str, &'static str)] {
@@ -1203,8 +1218,19 @@ async fn execute_expand(
     // (unless forced) re-decide with it. The opened dataset is threaded into the
     // indexed path so it is never opened twice.
     let edge_ds = snapshot.open(&edge_table_key).await?;
-    let coverage =
+    // An undirected traversal scans BOTH endpoint columns; price it by the
+    // worst coverage of the columns it will actually probe (a degraded dst
+    // index must not be masked by a healthy src index).
+    let mut coverage =
         crate::table_store::TableStore::key_column_index_coverage(&edge_ds, key_col).await;
+    for &(extra_key, _) in endpoint_probes(direction).iter().skip(1) {
+        let extra =
+            crate::table_store::TableStore::key_column_index_coverage(&edge_ds, extra_key).await;
+        coverage = match (coverage, extra) {
+            (Ok(a), Ok(b)) => Ok(worse_coverage(a, b)),
+            (Err(e), _) | (_, Err(e)) => Err(e),
+        };
+    }
 
     if forced.is_none() {
         if let Some(inputs) = gather_cost_inputs(
@@ -1770,8 +1796,12 @@ fn try_bulk_anti_join_mask(
     let edge_def = catalog.edge_types.get(edge_type.as_str())?;
 
     let src_type_name = match direction {
-        Direction::Out => &edge_def.from_type,
-        Direction::In | Direction::Both => &edge_def.to_type,
+        // Both grouped with Out: the primary adjacency below is `csr`, keyed
+        // in from_type's dense namespace (equal to to_type under T22, but the
+        // grouping must match `adj` so a future T22 relaxation cannot split
+        // them silently).
+        Direction::Out | Direction::Both => &edge_def.from_type,
+        Direction::In => &edge_def.to_type,
     };
     let adj = match direction {
         Direction::Out | Direction::Both => gi.csr(edge_type),
