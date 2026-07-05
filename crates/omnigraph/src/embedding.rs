@@ -70,6 +70,24 @@ impl EmbeddingConfig {
     /// 5. provider api-key env (`OPENROUTER_API_KEY`/`OPENAI_API_KEY`, or `GEMINI_API_KEY`).
     pub fn from_env() -> Result<Self> {
         if env_flag("OMNIGRAPH_EMBEDDINGS_MOCK") {
+            // The mock flag deliberately wins (pinned by
+            // from_env_mock_flag_wins) — but overriding an EXPLICITLY
+            // configured real provider must be loud: mock vectors are
+            // indistinguishable from real ones (correct dimension, unit
+            // norm), so a leaked test env var would otherwise silently
+            // poison persisted embeds and query-time nearest().
+            if let Some(provider) = env_string("OMNIGRAPH_EMBED_PROVIDER")
+                && provider != "mock"
+            {
+                tracing::warn!(
+                    target: "omnigraph::embedding",
+                    overridden_provider = %provider,
+                    "OMNIGRAPH_EMBEDDINGS_MOCK is set and overrides the \
+                     explicitly configured OMNIGRAPH_EMBED_PROVIDER — all \
+                     embeddings in this process are deterministic mock \
+                     vectors, not real ones"
+                );
+            }
             return Ok(Self::mock());
         }
 
