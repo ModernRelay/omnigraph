@@ -40,6 +40,63 @@ return { $f.name, $f.age }
 }
 
 #[test]
+fn test_lower_undirected_traversal_to_direction_both() {
+    let catalog = setup();
+    let qf = parse_query(
+        r#"
+query q($name: String) {
+match {
+    $p: Person { name: $name }
+    $p <knows> $f
+}
+return { $f.name }
+}
+"#,
+    )
+    .unwrap();
+    let tc = typecheck_query(&catalog, &qf.queries[0]).unwrap();
+    let ir = lower_query(&catalog, &qf.queries[0], &tc).unwrap();
+    match &ir.pipeline[1] {
+        IROp::Expand { direction, .. } => assert_eq!(*direction, Direction::Both),
+        op => panic!("expected Expand, got {op:?}"),
+    }
+}
+
+// The discarded-context-clone regression: negation inners are typechecked into
+// a clone that never reaches lowering's ResolvedTraversal lookup, so direction
+// used to silently fall back to Out inside not{}. Undirectedness now travels
+// on the AST node; this pins Both surviving into the AntiJoin's inner Expand.
+#[test]
+fn test_lower_undirected_inside_negation_keeps_direction_both() {
+    let catalog = setup();
+    let qf = parse_query(
+        r#"
+query q() {
+match {
+    $p: Person
+    not { $p <knows> $_ }
+}
+return { $p.name }
+}
+"#,
+    )
+    .unwrap();
+    let tc = typecheck_query(&catalog, &qf.queries[0]).unwrap();
+    let ir = lower_query(&catalog, &qf.queries[0], &tc).unwrap();
+    let IROp::AntiJoin { inner, .. } = &ir.pipeline[1] else {
+        panic!("expected AntiJoin, got {:?}", ir.pipeline[1]);
+    };
+    match &inner[0] {
+        IROp::Expand { direction, .. } => assert_eq!(
+            *direction,
+            Direction::Both,
+            "negation inner must not fall back to Out"
+        ),
+        op => panic!("expected inner Expand, got {op:?}"),
+    }
+}
+
+#[test]
 fn test_lower_negation() {
     let catalog = setup();
     let qf = parse_query(
