@@ -487,6 +487,17 @@ async fn nearest_prefilter(args: &Args) -> serde_json::Value {
     db.optimize().await.expect("optimize");
     let optimize_ms = optimize_start.elapsed().as_millis() as u64;
 
+    if args.baseline {
+        // Identical workload minus the measured query loop — see
+        // Args::baseline (the peak-RSS delta isolates the queries' cost).
+        return serde_json::json!({
+            "seed_ms": seed_ms,
+            "optimize_ms": optimize_ms,
+            "hit_rows": hit_rows,
+            "baseline": true,
+        });
+    }
+
     // Query vector = +e1 (the "miss" cluster's pole): the global ANN top-k is
     // dominated by non-matching rows by construction.
     let mut query_vec = vec![0.0f32; args.dims];
