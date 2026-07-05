@@ -13,7 +13,10 @@ query vectors and document vectors share one model and one vector space.
 | `gemini` | `POST {base}/models/{model}:embedContent`, `x-goog-api-key`, with `RETRIEVAL_QUERY` / `RETRIEVAL_DOCUMENT` task types | Reaching Google's `generativelanguage` API directly |
 | `mock` | none — deterministic offline vectors | Tests and local dev without a key |
 
-Vectors are stored L2-normalized as `FixedSizeList(Float32, dim)`; the requested output dimension is driven by
+Vectors are stored L2-normalized as `FixedSizeList(Float32, dim)`. Embedding
+values must be finite — a vector containing NaN/Inf, or an all-zero vector
+(no direction under cosine distance), is rejected at the client boundary
+rather than persisted; the requested output dimension is driven by
 the target column width and sent as Gemini `outputDimensionality` / OpenAI `dimensions`.
 
 ## Configuration (cluster)

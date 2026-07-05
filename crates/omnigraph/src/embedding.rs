@@ -542,6 +542,25 @@ fn validate_and_normalize_embedding(
             values.len()
         ));
     }
+    // Reject poisoned vectors BEFORE normalizing: a NaN component makes the
+    // norm NaN (whose `> EPSILON` comparison is false, silently skipping
+    // normalization), an Inf component normalizes the rest to 0s and itself
+    // to NaN, and a zero vector has no direction — all three would persist
+    // as "successful" embeddings and degrade ANN/IVF for unrelated rows.
+    if let Some(idx) = values.iter().position(|v| !v.is_finite()) {
+        return Err(format!(
+            "embedding component {} is not finite ({})",
+            idx, values[idx]
+        ));
+    }
+    let norm = values
+        .iter()
+        .map(|v| (*v as f64) * (*v as f64))
+        .sum::<f64>()
+        .sqrt() as f32;
+    if norm <= f32::EPSILON {
+        return Err("embedding has zero norm (no direction)".to_string());
+    }
     Ok(normalize_vector(values))
 }
 
