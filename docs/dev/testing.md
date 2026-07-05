@@ -114,8 +114,12 @@ The CLI system tests (`system_local.rs`) spawn the workspace-built `omnigraph` a
   merge-all-changed --rows 20000 --dims 256` (also `nearest-prefilter`;
   `--baseline` re-runs the identical workload minus the measured op so the
   peak-RSS delta isolates it; `--memory-cap-mb` applies `RLIMIT_AS` — enforced
-  on Linux, best-effort on macOS). Add new scenarios here rather than new
-  bench targets; keep the JSON-lines/no-assertions contract.
+  on Linux, best-effort on macOS). Every run appends its record (with `ts` +
+  `git_sha`) to a results log — `--out <path>`, else `OMNIGRAPH_BENCH_RESULTS`,
+  else `crates/omnigraph/benches/results.jsonl` (gitignored; host-specific) —
+  so baselines survive across sessions and substrate bumps. Add new scenarios
+  here rather than new bench targets; keep the JSON-lines/no-assertions
+  contract.
 - Add `benches/` per crate when you ship a perf-driven change, and include the motivating workload with the optimization.
 
 ## Coverage tooling — what's missing
