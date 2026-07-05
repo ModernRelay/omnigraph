@@ -579,7 +579,14 @@ fn validate_and_normalize_embedding(
     if norm <= f32::EPSILON {
         return Err("embedding has zero norm (no direction)".to_string());
     }
-    Ok(normalize_vector(values))
+    // Normalize in place with the norm just computed — `normalize_vector`
+    // would recompute it (and its zero guard is unreachable here, since a
+    // zero norm already returned Err above).
+    let mut values = values;
+    for value in &mut values {
+        *value /= norm;
+    }
+    Ok(values)
 }
 
 fn normalize_vector(mut values: Vec<f32>) -> Vec<f32> {
