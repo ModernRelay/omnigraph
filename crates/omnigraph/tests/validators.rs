@@ -112,6 +112,63 @@ async fn init_with(schema: &str, data: &str) -> (tempfile::TempDir, Omnigraph) {
     (dir, db)
 }
 
+// ─── Vector element validation (loader surface) ─────────────────────────────
+
+const VECTOR_SCHEMA: &str = r#"
+node Doc {
+    slug: String @key
+    embedding: Vector(3)
+}
+"#;
+
+/// iss-loader-vector-element-coercion: the loader must reject non-numeric
+/// vector elements loudly (parity with the mutation path's "vector elements
+/// must be numeric"), never coerce them to 0.0 — a NaN serialized as JSON
+/// null (JSON has no NaN) or a string element silently zeroed the vector's
+/// direction while passing every dimension check.
+#[tokio::test]
+async fn non_numeric_vector_element_rejected_on_jsonl_load() {
+    let (_dir, mut db) = init_with(VECTOR_SCHEMA, "").await;
+
+    // A null element (what json! produces for a non-finite float).
+    let bad_null = r#"{"type":"Doc","data":{"slug":"d1","embedding":[0.1,null,0.3]}}"#;
+    let err = load_jsonl(&mut db, bad_null, LoadMode::Overwrite)
+        .await
+        .unwrap_err();
+    assert!(
+        err.to_string().contains("elements must be numeric"),
+        "null element must be rejected, got: {}",
+        err
+    );
+
+    // A string element.
+    let bad_str = r#"{"type":"Doc","data":{"slug":"d2","embedding":[0.1,"0.2",0.3]}}"#;
+    let err = load_jsonl(&mut db, bad_str, LoadMode::Overwrite)
+        .await
+        .unwrap_err();
+    assert!(
+        err.to_string().contains("elements must be numeric"),
+        "string element must be rejected, got: {}",
+        err
+    );
+
+    // Pin the adjacent (existing) dimension check while we are here — no
+    // loader vector validation had any coverage before this test.
+    let bad_dim = r#"{"type":"Doc","data":{"slug":"d3","embedding":[0.1,0.2]}}"#;
+    let err = load_jsonl(&mut db, bad_dim, LoadMode::Overwrite)
+        .await
+        .unwrap_err();
+    assert!(
+        err.to_string().contains("expects 3 dimensions, got 2"),
+        "dimension mismatch must be rejected, got: {}",
+        err
+    );
+
+    // A valid row still loads.
+    let good = r#"{"type":"Doc","data":{"slug":"d4","embedding":[0.1,0.2,0.3]}}"#;
+    load_jsonl(&mut db, good, LoadMode::Overwrite).await.unwrap();
+}
+
 // ─── Enum validation ─────────────────────────────────────────────────────────
 
 #[tokio::test]
