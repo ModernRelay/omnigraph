@@ -781,6 +781,24 @@ mod tests {
     }
 
     #[test]
+    fn validate_and_normalize_embedding_rejects_non_finite_and_zero() {
+        // iss-embedding-nan-validation: a NaN component must be rejected —
+        // not silently returned un-normalized (NaN > EPSILON is false, so the
+        // normalize guard inverts and the raw NaN vector came back Ok).
+        let err = validate_and_normalize_embedding(vec![f32::NAN, 1.0], 2).unwrap_err();
+        assert!(err.contains("finite"), "NaN must be rejected, got: {err}");
+        // An Inf component must be rejected — not normalized into 0s + NaN.
+        let err = validate_and_normalize_embedding(vec![f32::INFINITY, 1.0], 2).unwrap_err();
+        assert!(err.contains("finite"), "Inf must be rejected, got: {err}");
+        let err =
+            validate_and_normalize_embedding(vec![1.0, f32::NEG_INFINITY], 2).unwrap_err();
+        assert!(err.contains("finite"), "-Inf must be rejected, got: {err}");
+        // An all-zero vector has no direction — undefined under cosine/ANN.
+        let err = validate_and_normalize_embedding(vec![0.0, 0.0], 2).unwrap_err();
+        assert!(err.contains("zero"), "zero vector must be rejected, got: {err}");
+    }
+
+    #[test]
     fn validate_and_normalize_embedding_enforces_dimension() {
         let normalized = validate_and_normalize_embedding(vec![3.0, 4.0], 2).unwrap();
         assert!((normalized[0] - 0.6).abs() < 1e-6);
