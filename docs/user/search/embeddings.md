@@ -61,7 +61,7 @@ Direct (`--store`) access, embedded callers, and the offline
 | `OMNIGRAPH_EMBED_DEADLINE_MS` | total wall-clock budget for one embed call across all retries (default `60000`; `0` = unbounded) |
 | `OMNIGRAPH_EMBED_TIMEOUT_MS` | per-request HTTP timeout (default `30000`) |
 | `OMNIGRAPH_EMBED_RETRY_ATTEMPTS` / `OMNIGRAPH_EMBED_RETRY_BACKOFF_MS` | retry policy (defaults `4` / `200`) |
-| `OMNIGRAPH_EMBEDDINGS_MOCK` | set truthy to force the deterministic mock provider |
+| `OMNIGRAPH_EMBEDDINGS_MOCK` | set truthy to force the deterministic mock provider. Takes precedence over an explicitly configured `OMNIGRAPH_EMBED_PROVIDER` — the override is logged as a warning (`omnigraph::embedding` target), since mock vectors are indistinguishable from real ones (correct dimension, unit norm) |
 
 The default zero-config path is OpenRouter: set `OPENROUTER_API_KEY` and run. Reaching Gemini takes
 `OMNIGRAPH_EMBED_PROVIDER=gemini` plus `GEMINI_API_KEY`.
