@@ -101,7 +101,22 @@ The CLI system tests (`system_local.rs`) spawn the workspace-built `omnigraph` a
 ## Examples & benches
 
 - `crates/omnigraph/examples/bench_expand.rs` — runnable example (not part of CI).
-- No `benches/` directories. Add `benches/` per crate when you ship a perf-driven change, and include the motivating workload with the optimization.
+- `crates/omnigraph/benches/scenarios.rs` — the **scenario benchmark harness**: a
+  decision instrument, never a CI gate. Each scenario is ONE cold, stateful
+  macro-run (a branch merge, a filtered vector search) executed in a fresh
+  subprocess and instrumented for wall-clock + peak RSS (`libc::wait4` /
+  `ru_maxrss` — kernel-exact, no sampling) + scenario metrics, emitted as JSON
+  lines. No assertions; not part of `cargo test --workspace`. Criterion is
+  deliberately not used (statistics over warm in-process iterations is the wrong
+  model for multi-second stateful scenarios; no memory measurement; no crash
+  isolation — an OOM under `--memory-cap-mb` is a *data point*). Run:
+  `cargo bench -p omnigraph-engine --bench scenarios -- --scenario
+  merge-all-changed --rows 20000 --dims 256` (also `nearest-prefilter`;
+  `--baseline` re-runs the identical workload minus the measured op so the
+  peak-RSS delta isolates it; `--memory-cap-mb` applies `RLIMIT_AS` — enforced
+  on Linux, best-effort on macOS). Add new scenarios here rather than new
+  bench targets; keep the JSON-lines/no-assertions contract.
+- Add `benches/` per crate when you ship a perf-driven change, and include the motivating workload with the optimization.
 
 ## Coverage tooling — what's missing
 
