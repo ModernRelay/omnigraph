@@ -1050,6 +1050,8 @@ fn gather_cost_inputs(
     let src_type = match direction {
         Direction::Out => &edge_def.from_type,
         Direction::In => &edge_def.to_type,
+        // Both requires from_type == to_type (typecheck T22).
+        Direction::Both => &edge_def.from_type,
     };
     let src_entry = snapshot.entry(&format!("node:{}", src_type))?;
     Some(ExpandCostInputs {
@@ -1109,7 +1111,20 @@ fn warn_on_degraded_coverage(
 fn endpoint_columns(direction: Direction) -> (&'static str, &'static str) {
     match direction {
         Direction::Out => ("src", "dst"),
+        // Both: the primary orientation (used by the cost probe; the indexed
+        // execution loop adds the reverse probe itself via endpoint_probes).
         Direction::In => ("dst", "src"),
+        Direction::Both => ("src", "dst"),
+    }
+}
+
+/// All (key, opposite) probes a direction requires: one for Out/In, both
+/// orientations for an undirected traversal.
+fn endpoint_probes(direction: Direction) -> &'static [(&'static str, &'static str)] {
+    match direction {
+        Direction::Out => &[("src", "dst")],
+        Direction::In => &[("dst", "src")],
+        Direction::Both => &[("src", "dst"), ("dst", "src")],
     }
 }
 
@@ -1281,7 +1296,7 @@ async fn execute_expand_indexed(
     // The keyed/opposite endpoint columns for this direction. The edge dataset
     // and the C6 coverage warn are owned by the caller (`execute_expand`), which
     // opens the dataset once and threads it in.
-    let (key_col, opp_col) = endpoint_columns(direction);
+    let probes = endpoint_probes(direction);
 
     let max = max_hops.unwrap_or(min_hops.max(1));
     // Cross-type edges cannot chain (a Company is not a `WorksAt` source), so a
@@ -1344,30 +1359,38 @@ async fn execute_expand_indexed(
             })
             .collect();
 
-        let batches = crate::table_store::TableStore::scan_edges_by_endpoint(
-            &edge_ds, key_col, opp_col, &union_keys,
-        )
-        .await?;
-
-        // dense key -> dense neighbors (scan order; duplicates preserved, like CSR multi-edges).
+        // dense key -> dense neighbors (scan order; duplicates preserved, like
+        // CSR multi-edges). One probe per orientation: Out/In do one pass;
+        // Both merges the src-keyed and dst-keyed scans into one map (the
+        // per-source `seen_dst` gate below dedups pairs present both ways).
         let mut neighbor_map: HashMap<u32, Vec<u32>> = HashMap::new();
-        for batch in &batches {
-            let keys = batch
-                .column_by_name(key_col)
-                .ok_or_else(|| OmniError::manifest(format!("edge batch missing '{}'", key_col)))?
-                .as_any()
-                .downcast_ref::<StringArray>()
-                .ok_or_else(|| OmniError::manifest(format!("edge '{}' is not Utf8", key_col)))?;
-            let opps = batch
-                .column_by_name(opp_col)
-                .ok_or_else(|| OmniError::manifest(format!("edge batch missing '{}'", opp_col)))?
-                .as_any()
-                .downcast_ref::<StringArray>()
-                .ok_or_else(|| OmniError::manifest(format!("edge '{}' is not Utf8", opp_col)))?;
-            for r in 0..batch.num_rows() {
-                let k = interner.get_or_insert(keys.value(r));
-                let o = interner.get_or_insert(opps.value(r));
-                neighbor_map.entry(k).or_default().push(o);
+        for &(key_col, opp_col) in probes {
+            let batches = crate::table_store::TableStore::scan_edges_by_endpoint(
+                &edge_ds, key_col, opp_col, &union_keys,
+            )
+            .await?;
+            for batch in &batches {
+                let keys = batch
+                    .column_by_name(key_col)
+                    .ok_or_else(|| {
+                        OmniError::manifest(format!("edge batch missing '{}'", key_col))
+                    })?
+                    .as_any()
+                    .downcast_ref::<StringArray>()
+                    .ok_or_else(|| OmniError::manifest(format!("edge '{}' is not Utf8", key_col)))?;
+                let opps = batch
+                    .column_by_name(opp_col)
+                    .ok_or_else(|| {
+                        OmniError::manifest(format!("edge batch missing '{}'", opp_col))
+                    })?
+                    .as_any()
+                    .downcast_ref::<StringArray>()
+                    .ok_or_else(|| OmniError::manifest(format!("edge '{}' is not Utf8", opp_col)))?;
+                for r in 0..batch.num_rows() {
+                    let k = interner.get_or_insert(keys.value(r));
+                    let o = interner.get_or_insert(opps.value(r));
+                    neighbor_map.entry(k).or_default().push(o);
+                }
             }
         }
 
@@ -1520,6 +1543,8 @@ async fn execute_expand_csr(
     let (src_type_name, dst_type_name) = match direction {
         Direction::Out => (&edge_def.from_type, &edge_def.to_type),
         Direction::In => (&edge_def.to_type, &edge_def.from_type),
+        // Both requires from_type == to_type (typecheck T22).
+        Direction::Both => (&edge_def.from_type, &edge_def.from_type),
     };
 
     let src_type_idx = graph_index
@@ -1530,10 +1555,20 @@ async fn execute_expand_csr(
         .ok_or_else(|| OmniError::manifest(format!("no type index for '{}'", dst_type_name)))?;
 
     let adj = match direction {
-        Direction::Out => graph_index.csr(edge_type),
+        Direction::Out | Direction::Both => graph_index.csr(edge_type),
         Direction::In => graph_index.csc(edge_type),
     }
     .ok_or_else(|| OmniError::manifest(format!("no adjacency index for edge '{}'", edge_type)))?;
+    // Undirected: additionally walk incoming edges (CSC); the BFS gates below
+    // dedup pairs that exist in both directions and self-loops.
+    let adj_rev = match direction {
+        Direction::Both => Some(
+            graph_index
+                .csc(edge_type)
+                .ok_or_else(|| OmniError::manifest(format!("no adjacency index for edge '{}'", edge_type)))?,
+        ),
+        _ => None,
+    };
 
     let max = max_hops.unwrap_or(min_hops.max(1));
 
@@ -1567,7 +1602,8 @@ async fn execute_expand_csr(
         for hop in 1..=max {
             let mut next_frontier = Vec::new();
             for &node in &frontier {
-                for &neighbor in adj.neighbors(node) {
+                let rev: &[u32] = adj_rev.map(|a| a.neighbors(node)).unwrap_or(&[]);
+                for &neighbor in adj.neighbors(node).iter().chain(rev) {
                     if !same_type || visited.insert(neighbor) {
                         next_frontier.push(neighbor);
                         if hop >= min_hops && seen_dst_dense.insert(neighbor) {
@@ -1735,12 +1771,17 @@ fn try_bulk_anti_join_mask(
 
     let src_type_name = match direction {
         Direction::Out => &edge_def.from_type,
-        Direction::In => &edge_def.to_type,
+        Direction::In | Direction::Both => &edge_def.to_type,
     };
     let adj = match direction {
-        Direction::Out => gi.csr(edge_type),
+        Direction::Out | Direction::Both => gi.csr(edge_type),
         Direction::In => gi.csc(edge_type),
     }?;
+    // Undirected anti-join: "no edge in EITHER direction".
+    let adj_rev = match direction {
+        Direction::Both => Some(gi.csc(edge_type)?),
+        _ => None,
+    };
     let type_idx = gi.type_index(src_type_name)?;
 
     let id_col_name = format!("{}.id", outer_var);
@@ -1753,7 +1794,10 @@ fn try_bulk_anti_join_mask(
         .map(|i| {
             let id = outer_ids.value(i);
             match type_idx.to_dense(id) {
-                Some(dense) => !adj.has_neighbors(dense),
+                Some(dense) => {
+                    !adj.has_neighbors(dense)
+                        && !adj_rev.map(|a| a.has_neighbors(dense)).unwrap_or(false)
+                }
                 None => true, // not in graph index = no edges = keep
             }
         })

@@ -42,6 +42,13 @@ query friends($name: String) {
     }
     return { $f.name }
 }
+query related($name: String) {
+    match {
+        $p: Person { name: $name }
+        $p <knows>{1,3} $f
+    }
+    return { $f.name }
+}
 query employers($name: String) {
     match {
         $p: Person { name: $name }
@@ -178,8 +185,9 @@ async fn col0_set(db: &mut Omnigraph, name: &str, params: &ParamMap) -> HashSet<
 
 // INVARIANT 1: mode equivalence. For any generated graph and start key, the
 // CSR, indexed, and auto paths return identical result multisets — over both a
-// same-type traversal (knows{1,3}, exercises cycles/self-loops) and a cross-type
-// one (worksAt{1,2}, collision-prone). This is the search-over-the-class version
+// same-type traversal (knows{1,3}, exercises cycles/self-loops), its undirected
+// form (<knows>{1,3} — Direction::Both must agree across arms, incl. dedup of
+// pairs present both ways), and a cross-type one (worksAt{1,2}, collision-prone). This is the search-over-the-class version
 // of the hand-built cross-type-collision fixture.
 #[test]
 fn prop_expand_indexed_eq_csr() {
@@ -191,7 +199,7 @@ fn prop_expand_indexed_eq_csr() {
                 let (_dir, mut db) = load_graph(&graph).await;
                 for start in graph.persons.clone() {
                     let p = one_param(&start);
-                    for q in ["friends", "employers"] {
+                    for q in ["friends", "related", "employers"] {
                         // The seam is scope-bound: the forced mode is gone when the
                         // wrapped future resolves, so it never leaks across runs.
                         let csr = with_traversal_mode("csr", col0_sorted(&mut db, q, &p)).await;

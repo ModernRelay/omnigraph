@@ -8,6 +8,140 @@ use omnigraph_compiler::ir::ParamMap;
 
 use helpers::*;
 
+// ─── Undirected traversal (`$a <edge> $b`, Direction::Both) ─────────────────
+//
+// iss-gq-undirected-traversal: the CSR arm unions csr+csc under the existing
+// per-source dedup gates; pairs present in both directions and self-loops
+// appear once. Fixture Knows edges: Alice->Bob, Alice->Charlie, Bob->Diana.
+
+#[tokio::test]
+async fn undirected_one_hop_unions_out_and_in_neighbors() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut db = init_and_load(&dir).await;
+
+    let queries = r#"
+query connected($name: String) {
+    match {
+        $p: Person { name: $name }
+        $p <knows> $f
+    }
+    return { $f.name }
+}
+query connected_directional($name: String) {
+    match {
+        $p: Person { name: $name }
+        $p knows $f
+    }
+    return { $f.name }
+}
+"#;
+    // Directional from Bob misses the incoming Alice->Bob edge — the
+    // motivating dashboard bug.
+    let directional = query_main(
+        &mut db,
+        queries,
+        "connected_directional",
+        &params(&[("$name", "Bob")]),
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        first_column_sorted(&directional),
+        vec!["Diana"],
+        "directional sees only outgoing"
+    );
+
+    let undirected = query_main(&mut db, queries, "connected", &params(&[("$name", "Bob")]))
+        .await
+        .unwrap();
+    assert_eq!(
+        first_column_sorted(&undirected),
+        vec!["Alice", "Diana"],
+        "undirected sees out ∪ in"
+    );
+
+    // Dedup: add the reverse edge Diana->Bob so (Bob, Diana) exists both
+    // ways; Diana must still appear exactly once.
+    load_jsonl(
+        &mut db,
+        r#"{"edge": "Knows", "from": "Diana", "to": "Bob"}"#,
+        LoadMode::Merge,
+    )
+    .await
+    .unwrap();
+    let deduped = query_main(&mut db, queries, "connected", &params(&[("$name", "Bob")]))
+        .await
+        .unwrap();
+    assert_eq!(
+        first_column_sorted(&deduped),
+        vec!["Alice", "Diana"],
+        "a pair connected in both directions appears once (set semantics)"
+    );
+}
+
+#[tokio::test]
+async fn undirected_variable_hops() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut db = init_and_load(&dir).await;
+
+    let queries = r#"
+query reach_both($name: String) {
+    match {
+        $p: Person { name: $name }
+        $p <knows>{1,2} $f
+    }
+    return { $f.name }
+}
+"#;
+    // Charlie's only edge is INCOMING (Alice->Charlie). Undirected: hop 1
+    // reaches Alice; hop 2 from Alice reaches Bob (out) — Charlie itself is
+    // the visited source, never re-emitted.
+    let result = query_main(&mut db, queries, "reach_both", &params(&[("$name", "Charlie")]))
+        .await
+        .unwrap();
+    assert_eq!(
+        first_column_sorted(&result),
+        vec!["Alice", "Bob"],
+        "undirected 2-hop frontier from a node with only incoming edges"
+    );
+}
+
+#[tokio::test]
+async fn undirected_anti_join_excludes_both_directions() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut db = init_and_load(&dir).await;
+
+    let queries = r#"
+query isolated() {
+    match {
+        $p: Person
+        not { $p <knows> $x }
+    }
+    return { $p.name }
+}
+query no_outgoing() {
+    match {
+        $p: Person
+        not { $p knows $x }
+    }
+    return { $p.name }
+}
+"#;
+    // Directional `not`: keeps people with no OUTGOING edge — Charlie and
+    // Diana (both have only incoming).
+    let directional = query_main(&mut db, queries, "no_outgoing", &ParamMap::new())
+        .await
+        .unwrap();
+    assert_eq!(first_column_sorted(&directional), vec!["Charlie", "Diana"]);
+
+    // Undirected `not`: no edge in EITHER direction — every fixture person
+    // has at least one, so the result is empty.
+    let undirected = query_main(&mut db, queries, "isolated", &ParamMap::new())
+        .await
+        .unwrap();
+    assert_eq!(undirected.num_rows(), 0, "everyone touches a Knows edge");
+}
+
 // ─── Anti-join slow path (predicated negation) ──────────────────────────────
 
 #[tokio::test]
