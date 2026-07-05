@@ -61,3 +61,12 @@ lance-namespace-impls = { workspace = true }
 lance-io = { version = "7.0.0", features = ["test-util"] }
 serial_test = "3"
 proptest = "1"
+# benches/scenarios.rs only: wait4/rusage peak-RSS + setrlimit memory caps.
+libc = "0.2"
+
+[[bench]]
+# Scenario benchmark harness — a decision instrument, not a CI gate. One cold
+# instrumented subprocess per scenario, JSON lines out. See docs/dev/testing.md
+# "Examples & benches". `harness = false`: the file provides its own main.
+name = "scenarios"
+harness = false
