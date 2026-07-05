@@ -20,6 +20,7 @@ omnigraph-compiler = { path = "../omnigraph-compiler", version = "0.8.0" }
 omnigraph-policy = { path = "../omnigraph-policy", version = "0.8.0" }
 lance = { workspace = true }
 lance-core = { workspace = true }
+lance-select = { workspace = true }
 lance-datafusion = { workspace = true }
 datafusion = { workspace = true }
 lance-file = { workspace = true }
@@ -58,7 +59,7 @@ tokio = { workspace = true }
 lance-namespace-impls = { workspace = true }
 # test-util gates IoStats.requests + assert_io_eq! (failure diagnostics only); dev-dep,
 # so production builds (which exclude dev-deps) never see it.
-lance-io = { version = "7.0.0", features = ["test-util"] }
+lance-io = { git = "https://github.com/lance-format/lance", rev = "f24e42c11a742581365e1cbe17c906ea2dac1bc6", features = ["test-util"] }
 serial_test = "3"
 proptest = "1"
 # benches/scenarios.rs only: wait4/rusage peak-RSS + setrlimit memory caps.

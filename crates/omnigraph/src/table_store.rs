@@ -16,7 +16,7 @@ use lance::dataset::{
 use lance::datatypes::{BlobKind, Schema as LanceSchema};
 use lance::index::DatasetIndexExt;
 use lance::index::scalar::IndexDetails;
-use lance_core::utils::mask::RowAddrTreeMap;
+use lance_select::mask::RowAddrTreeMap;
 use lance_file::version::LanceFileVersion;
 use lance_index::scalar::{InvertedIndexParams, ScalarIndexParams};
 use lance_index::{IndexType, is_system_index};
