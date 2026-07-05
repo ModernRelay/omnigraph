@@ -193,31 +193,28 @@ them explicit.
   and [writes.md](writes.md). New write paths should use the staged shape unless a
   documented Lance blocker applies.
 - **Vector indexes:** `create_vector_index` still advances Lance HEAD inline —
-  segment-commit needs `build_index_metadata_from_segments`, `pub(crate)` in Lance
-  7.0.0 (#6666 open). Keep recovery coverage in place until that residual is
+  segment-commit needs `build_index_metadata_from_segments`, still `pub(crate)` at Lance
+  9.0.0-beta.15 (#6666 open). Keep recovery coverage in place until that residual is
   removed. (`delete` is no longer a residual — staged in MR-A. D2 is not a gap:
   it is a deliberate constructive-XOR-destructive boundary, documented in
   Invariant 4 and the truth matrix.)
-- **Vendored lance-table pin (lance#7480):** `lance-table` 7.0.0 resolves to
-  `vendor/lance-table` via `[patch.crates-io]` — the pristine published source
-  plus ONLY the lance#7480 `rowids/index.rs` hunk, without which any filtered
-  read on a table that was merge-updated and then delete-touched fails
-  (lance#7444; `iss-merge-rowid-overlap-corrupts-filtered-reads`). The fix
-  ships in no Lance release ≤ 8.0.0. Remove the vendor dir + patch entry at
-  the first bump whose `lance-table` carries the fix (9.0.0, or a backported
-  8.0.1); `lance_surface_guards.rs::filtered_scan_tolerates_merge_update_row_id_overlap`
-  turns red if the pin is dropped early or a bump regresses it. See the
-  2026-07-02 stanza in [lance.md](lance.md) and
-  `vendor/lance-table/README.omnigraph.md`.
-- **Blob-column compaction:** Lance `compact_files` mis-decodes blob-v2 columns
-  under its forced `BlobHandling::AllBinary` read ("more fields in the schema
-  than provided column indices"), so `optimize` skips any table with a `Blob`
-  property — reporting `SkipReason::BlobColumnsUnsupportedByLance` (loud, not a
-  silent drop) behind the `LANCE_SUPPORTS_BLOB_COMPACTION` gate. Reads and writes
-  are unaffected; only space/fragment reclamation on blob tables is deferred.
-  Remove the skip when the upstream Lance fix lands — the
-  `lance_surface_guards.rs::compact_files_still_fails_on_blob_columns` guard
-  turns red on that bump to force it.
+- **Vendored lance-table pin — CLOSED (9.0.0-beta.15 bump):** lance#7480
+  shipped upstream in 9.0.0-beta.11, so the `vendor/lance-table` pin and its
+  `[patch.crates-io]` entry were removed per their documented removal
+  condition.
+  `lance_surface_guards.rs::filtered_scan_tolerates_merge_update_row_id_overlap`
+  passes on stock lance-table and remains the regression tripwire. Note the
+  release exposure: binaries ≤ v0.8.0 predate even the pin — the rebuild-free
+  remedy for fleets is upgrading the binary (see the 2026-07-05 stanza in
+  [lance.md](lance.md)).
+- **Blob-column compaction — CLOSED (9.0.0-beta.15 bump):** Lance 8.0.0+
+  compacts blob-v2 correctly (upstream #7017, hardened by #7618). The
+  `LANCE_SUPPORTS_BLOB_COMPACTION` gate, the optimize skip branch, and
+  `SkipReason::BlobColumnsUnsupportedByLance` were removed;
+  `lance_surface_guards.rs::compact_files_succeeds_on_blob_columns` and
+  `maintenance.rs::optimize_compacts_blob_table_alongside_plain_table` pin the
+  positive behavior (a red there means blob compaction regressed — restore the
+  skip machinery from git history).
 - **Recovery is serialized against live writers in-process only:** the
   write-entry heal (and `refresh`) serialize against a live writer's sidecar
   lifetime via the per-`(table, branch)` write queues plus the schema-apply
