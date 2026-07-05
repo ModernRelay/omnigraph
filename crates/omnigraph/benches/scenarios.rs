@@ -42,6 +42,7 @@ use omnigraph::loader::LoadMode;
 // Args
 // ---------------------------------------------------------------------------
 
+#[cfg(unix)]
 #[derive(Debug, Clone)]
 struct Args {
     scenario: String,
@@ -62,6 +63,7 @@ struct Args {
     child: bool,
 }
 
+#[cfg(unix)]
 impl Args {
     fn parse() -> Self {
         let mut args = Args {
@@ -163,6 +165,7 @@ fn main() {
     }
 }
 
+#[cfg(unix)]
 fn run_once(args: &Args, run: usize) -> serde_json::Value {
     let exe = std::env::current_exe().expect("current_exe");
     let mut child = std::process::Command::new(exe)
@@ -217,6 +220,7 @@ fn run_once(args: &Args, run: usize) -> serde_json::Value {
     })
 }
 
+#[cfg(unix)]
 /// Reap `pid` with `wait4` and return (exit code or -signal, peak RSS bytes).
 /// `ru_maxrss` is bytes on macOS and KiB on Linux.
 fn wait4_rusage(pid: i32) -> (i64, u64) {
@@ -249,6 +253,7 @@ fn wait4_rusage(pid: i32) -> (i64, u64) {
 // Child: apply the cap, build a runtime, run the scenario, print metrics JSON
 // ---------------------------------------------------------------------------
 
+#[cfg(unix)]
 fn run_child(args: &Args) {
     if let Some(cap_mb) = args.memory_cap_mb {
         let cap = libc::rlimit {
@@ -286,6 +291,7 @@ fn run_child(args: &Args) {
 // copy — those fns are private to that test binary)
 // ---------------------------------------------------------------------------
 
+#[cfg(unix)]
 fn fnv1a64(input: &str) -> u64 {
     let mut hash: u64 = 0xcbf29ce484222325;
     for byte in input.as_bytes() {
@@ -295,6 +301,7 @@ fn fnv1a64(input: &str) -> u64 {
     hash
 }
 
+#[cfg(unix)]
 fn xorshift64(state: &mut u64) -> u64 {
     let mut x = *state;
     x ^= x << 13;
@@ -304,6 +311,7 @@ fn xorshift64(state: &mut u64) -> u64 {
     x
 }
 
+#[cfg(unix)]
 /// Unit-norm D-dim vector seeded by (seed, slug). `pole` biases the first
 /// component: +1.0 clusters vectors near e1, -1.0 near -e1, 0.0 uniform-ish —
 /// the lever the prefilter scenario uses to place matching rows far from the
@@ -329,6 +337,7 @@ fn seeded_vector(seed: u64, slug: &str, dims: usize, pole: f32) -> Vec<f32> {
     v
 }
 
+#[cfg(unix)]
 fn push_vector_json(out: &mut String, v: &[f32]) {
     out.push('[');
     for (i, x) in v.iter().enumerate() {
@@ -344,6 +353,7 @@ fn push_vector_json(out: &mut String, v: &[f32]) {
 // Scenario: merge-all-changed
 // ---------------------------------------------------------------------------
 
+#[cfg(unix)]
 /// The merge-memory scenario: an embedding-bearing table where a branch
 /// changed EVERY row's vector (the re-embed-the-corpus workflow), merged back
 /// into main. Measures the changed-delta materialization cost of
@@ -409,6 +419,7 @@ async fn merge_all_changed(args: &Args) -> serde_json::Value {
     })
 }
 
+#[cfg(unix)]
 async fn load_vector_rows(
     db: &Omnigraph,
     branch: &str,
@@ -436,6 +447,7 @@ async fn load_vector_rows(
 // Scenario: nearest-prefilter
 // ---------------------------------------------------------------------------
 
+#[cfg(unix)]
 /// The filtered-ANN scenario: `selectivity` fraction of rows match
 /// `status = "hit"` but sit FAR from the query vector, while all non-matching
 /// rows cluster AROUND it — so a post-filtered ANN top-k (the current Lance
