@@ -187,6 +187,7 @@ fn results_path(args: &Args) -> std::path::PathBuf {
     std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("benches/results.jsonl")
 }
 
+#[cfg(unix)]
 fn append_result(args: &Args, record: &serde_json::Value) {
     let path = results_path(args);
     let appended = std::fs::OpenOptions::new()
@@ -202,6 +203,7 @@ fn append_result(args: &Args, record: &serde_json::Value) {
     }
 }
 
+#[cfg(unix)]
 fn git_sha() -> Option<String> {
     let out = std::process::Command::new("git")
         .args(["rev-parse", "--short", "HEAD"])
@@ -213,6 +215,7 @@ fn git_sha() -> Option<String> {
         .then(|| String::from_utf8_lossy(&out.stdout).trim().to_string())
 }
 
+#[cfg(unix)]
 fn run_once(args: &Args, run: usize) -> serde_json::Value {
     let exe = std::env::current_exe().expect("current_exe");
     let mut child = std::process::Command::new(exe)
