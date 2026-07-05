@@ -141,6 +141,42 @@ query connected($name: String) {
     assert_eq!(got, vec!["Alice", "Diana"], "out ∪ in neighbors of Bob");
 }
 
+/// The undirected cost fix (review follow-up): coverage is priced by the
+/// WORST of the two probed columns. This test degrades coverage via a
+/// mutation-appended unindexed fragment and asserts undirected results stay
+/// correct and mode-equivalent regardless of which path the cost model picks.
+#[tokio::test]
+async fn indexed_matches_csr_undirected_under_degraded_coverage() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut db = init_and_load(&dir).await;
+
+    // Append an edge through the mutation path — an unindexed fragment that
+    // degrades BTREE coverage on the Knows table (pinned by the coverage test
+    // above). Diana->Alice also gives Alice a NEW incoming edge that only the
+    // undirected form can see from Alice's side.
+    mutate_main(
+        &mut db,
+        MUTATION_QUERIES,
+        "add_friend",
+        &params(&[("$from", "Diana"), ("$to", "Alice")]),
+    )
+    .await
+    .unwrap();
+
+    let queries = r#"
+query connected($name: String) {
+    match {
+        $p: Person { name: $name }
+        $p <knows> $f
+    }
+    return { $f.name }
+}
+"#;
+    // Alice: outgoing Bob, Charlie; incoming Diana (the fresh unindexed edge).
+    let got = both_modes(&mut db, queries, "connected", &params(&[("$name", "Alice")])).await;
+    assert_eq!(got, vec!["Bob", "Charlie", "Diana"]);
+}
+
 #[tokio::test]
 async fn indexed_matches_csr_multi_hop_same_type() {
     let dir = tempfile::tempdir().unwrap();
