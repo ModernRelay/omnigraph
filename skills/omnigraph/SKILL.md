@@ -2,10 +2,10 @@
 name: omnigraph
 description: Store, retrieve, and query knowledge, memory, and relationships in an Omnigraph graph, and operate a local or remote Omnigraph deployment. Use when the user wants to capture or recall facts, notes, or entities, build or query a knowledge graph or agent memory, or run Omnigraph — and whenever you see Omnigraph CLI commands (omnigraph init/query/mutate/load/schema/lint/embed/branch/commit/login/profile/cluster), .pg schema or .gq query files, s3:// graph URIs, bearer-authed graph endpoints, 504 errors, or a cluster.yaml / omnigraph.yaml / ~/.omnigraph/config.yaml. Covers cluster-mode deployments (cluster.yaml plan/apply, omnigraph-server --cluster), the two config surfaces (cluster.yaml + ~/.omnigraph/config.yaml), schema evolution, query linting, data writes (mutate; load needs --mode/--from), branches, embeddings, Cedar policy, and remote ops. Especially important before schema apply (plan first), any load (--mode required), any .gq/.pg edit (lint after), or any remote write (verify via commit list).
 license: MIT (see LICENSE at repo root)
-compatibility: Requires omnigraph CLI >= 0.7.0 — the unified `load`, the two config surfaces (cluster.yaml + ~/.omnigraph/config.yaml), and cluster apply/serve all require 0.7.0.
+compatibility: Requires omnigraph CLI >= 0.7.0 — the unified `load`, the two config surfaces (cluster.yaml + ~/.omnigraph/config.yaml), and cluster apply/serve all require 0.7.0. Version-gated features are marked inline (undirected traversal `<edge>` and enum widening in `schema apply` require >= 0.8.1).
 metadata:
   author: ModernRelay
-  version: "0.7.0"
+  version: "0.8.1"
   repository: https://github.com/ModernRelay/omnigraph
 ---
 
@@ -96,7 +96,8 @@ The non-obvious facts that bite, then the full grammar:
 - **Scalar param types**: `String Bool I32 I64 U32 U64 F32 F64 DateTime Date Blob`. Modifiers: `T?` (optional), `[T]` (list), `Vector(N)`. There is **no `Int`** — use `I64`.
 - **A read query needs `match` *and* `return`** (`order`/`limit` optional); a mutation has neither — only `insert`/`update`/`delete`.
 - **`limit` takes an integer literal, not a param** — `limit 50`, never `limit $n`.
-- **Variable-hop traversal**: `$p knows{1,3} $f` (`{1,}` = unbounded).
+- **Variable-hop traversal**: `$p knows{1,3} $f` — bounds are **required to be finite** (`{1,}` is rejected: "unbounded traversal is disabled").
+- **Undirected traversal** (omnigraph >= 0.8.1): `$p <knows> $f` matches the edge in either direction, deduplicated (a pair connected both ways appears once). Same-endpoint-type edges only (e.g. `Related: Issue -> Issue`) — asymmetric edges are rejected (T22). Composes with bounds (`$p <knows>{1,3} $f`) and `not { }`. Replaces the query-both-directions-and-merge workaround for symmetric relations.
 - **Literals & calls**: `now()`, `date("2026-04-29")`, `datetime("…T00:00:00Z")`, list `[…]`.
 - **Filters** `= != > < >= <= contains`; **aggregates** `count/sum/avg/min/max` (`count($f) as n`).
 - **Stored-query metadata**: `@description("…")` / `@instruction("…")` may follow the param list.
@@ -159,8 +160,9 @@ prop_match_list = { prop_match ~ ("," ~ prop_match)* ~ ","? }
 prop_match = { ident ~ ":" ~ match_value }
 match_value = { literal | variable | now_call }
 
-// Traversal: $p knows $f
-traversal = { variable ~ edge_ident ~ traversal_bounds? ~ variable }
+// Traversal: $p knows $f (directional) or $p <knows> $f (undirected, >= 0.8.1)
+traversal = { variable ~ (undirected_edge | edge_ident) ~ traversal_bounds? ~ variable }
+undirected_edge = { "<" ~ edge_ident ~ ">" }
 traversal_bounds = { "{" ~ integer ~ "," ~ integer? ~ "}" }
 
 // Filter: $f.age > 25
