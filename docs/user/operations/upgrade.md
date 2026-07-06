@@ -12,15 +12,30 @@ changing) is in [docs/dev/versioning.md](../../dev/versioning.md).
 
 ## How you know you need this
 
-Opening a graph whose stamp is below the binary's version fails with:
+Opening a graph whose stamp is below the binary's version fails with a
+message that **names the release line that wrote it** and the exact commands —
+so you can fetch the right old binary without guessing:
 
 ```
-__manifest is stamped at internal schema vN, but this omnigraph reads only vM.
-This graph was created by an older omnigraph release; rebuild it: run `omnigraph
-export` with the older omnigraph binary that created it, then `omnigraph init` +
-`omnigraph load` with this one. (Data, vectors, and blobs are preserved; commit
-history and branches are not.)
+__manifest is stamped at internal schema v3, but this omnigraph reads only v4.
+This graph was created by omnigraph 0.6.2 to 0.7.2. Rebuild it: with an omnigraph
+0.6.2 to 0.7.2 binary run `omnigraph export <graph> > graph.jsonl`, then with this
+binary run `omnigraph init --schema <schema.pg> <new-graph>` and `omnigraph load
+--mode overwrite --data graph.jsonl <new-graph>`. (Data, vectors, and blobs are
+preserved; commit history and branches are not.) See docs/user/operations/upgrade.md.
 ```
+
+### Which old binary do I need?
+
+The on-disk stamp maps to the release line that wrote it. Export with any binary
+from that line (the latest is safest):
+
+| On-disk stamp | Written by | Export with |
+|---|---|---|
+| internal schema v1 | omnigraph ≤ 0.3.1 | any 0.3.1-or-earlier binary |
+| internal schema v2 | omnigraph 0.4.1–0.6.1 | the latest 0.6.x (e.g. 0.6.1) |
+| internal schema v3 | omnigraph 0.6.2–0.7.2 | the latest 0.7.x (e.g. 0.7.2) |
+| internal schema v4 | omnigraph 0.8.x and later | — current format; no rebuild needed |
 
 You can also check versions before you hit a refusal:
 
