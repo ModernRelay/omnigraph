@@ -106,7 +106,17 @@ Adding a non-nullable property to an existing node is rejected as unsupported. P
 1. Add as optional: `new_prop: String?`
 2. Apply
 3. Backfill via a `mutate` or `load --mode merge`
-4. Tighten to required in a follow-up apply: `new_prop: String`
+4. Keep it optional: tightening `T?` -> `T` is currently refused by the planner
+   (a property-type change, OG-MF-106). Enforce presence at write time by
+   convention until required-tightening ships as a migration step.
+
+### Enum widening is a supported apply (omnigraph >= 0.8.1)
+
+Adding variants to an `enum(...)` property is a metadata-only migration step:
+`schema plan` shows `extend enum ...`, `apply` touches no table data, and new
+variants are accepted immediately on every write surface. Narrowing, renaming
+a variant, or converting enum <-> `String` still refuse (OG-MF-106) — those
+remain rebuild territory. Value *order* never matters (values are normalized).
 
 ### Keep `@key` stable
 

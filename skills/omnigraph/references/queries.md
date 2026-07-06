@@ -115,6 +115,26 @@ query employees_of($company: String) {
 }
 ```
 
+### Undirected traversal (omnigraph >= 0.8.1)
+
+For symmetric relations (same-endpoint-type edges like `Related: Issue -> Issue`),
+angle brackets match the edge in **either direction**, deduplicated — one
+pattern replaces querying both directions and merging:
+
+```gq
+query related_to($slug: String) {
+    match {
+        $i: Issue { slug: $slug }
+        $i <issueRelated> $r
+    }
+    return { $r.slug }
+}
+```
+
+Composes with hop bounds (`$a <knows>{1,3} $b`) and `not { }` ("no edge in
+either direction"). Asymmetric edges (e.g. `Comment -> Issue`) are rejected at
+typecheck (T22) — use the directional form there.
+
 ### Negation
 
 ```gq
