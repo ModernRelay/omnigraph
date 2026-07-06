@@ -377,7 +377,7 @@ These are the traps most likely to bite. Scan this table before debugging any pa
 | `load --mode merge` after `@embed` source change | stale embeddings | `omnigraph embed --reembed_all` or `load --mode overwrite` |
 | `schema apply` with feature branches open | rejected | Merge or delete branches first |
 | `nearest(...)` / `bm25(...)` / `rrf(...)` without `limit` | compile error | Add `limit N` |
-| Adding non-nullable property without backfill | unsupported migration | Make optional → backfill → tighten in follow-up apply |
+| Adding non-nullable property without backfill | unsupported migration | Make optional → backfill; keep it optional (tightening `T?` → `T` is refused, OG-MF-106) |
 | `omnigraph init --json` | `unexpected argument --json` | `init` doesn't support `--json`; drop the flag |
 | `omnigraph init` on an already-initialized URI | `AlreadyInitialized` error (v0.6.0+) | `--force` to re-init (skips the schema preflight; does **not** purge data) |
 | `schema apply` dropping a property/type | soft-dropped or rejected (no data loss) | add `--allow-data-loss` to actually drop the column |
