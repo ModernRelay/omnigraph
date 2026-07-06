@@ -16,7 +16,7 @@ Tools that support `@`-imports (Claude Code) auto-include all three files via th
 
 `CLAUDE.md` is a symlink to this file — there is exactly one source of truth. Edit `AGENTS.md`.
 
-**Version surveyed:** 0.8.0
+**Version surveyed:** 0.8.1
 **Workspace crates:** `omnigraph-compiler`, `omnigraph` (engine), `omnigraph-policy`, `omnigraph-api-types` (shared HTTP wire DTOs), `omnigraph-cluster`, `omnigraph-cli`, `omnigraph-server`
 **Storage substrate:** Lance 9.x (columnar, versioned, branchable; 9.0.0-beta.15 git-rev pin until 9.0.0 stable)
 **License:** MIT
@@ -106,6 +106,7 @@ Full diagram and concurrency model: [docs/dev/architecture.md](docs/dev/architec
 | CI / release workflows | [docs/dev/ci.md](docs/dev/ci.md) |
 | Branch protection policy (declarative, applied via `scripts/apply-branch-protection.sh`) | [docs/dev/branch-protection.md](docs/dev/branch-protection.md) |
 | Constants & tunables cheat sheet | [docs/user/reference/constants.md](docs/user/reference/constants.md) |
+| RFC process — public contribution track (substantial / irreversible changes) | [docs/rfcs/README.md](docs/rfcs/README.md) |
 | Per-version release notes | [docs/releases/](docs/releases/) |
 
 ---

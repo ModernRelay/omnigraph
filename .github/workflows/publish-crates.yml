@@ -36,6 +36,7 @@ jobs:
           echo "CARGO_REGISTRY_TOKEN is not set; skipping crates.io publish."
           echo "CARGO_PUBLISH_SKIP=1" >> "$GITHUB_ENV"
 
+
       - name: Resolve ref
         if: env.CARGO_PUBLISH_SKIP != '1'
         id: ref
@@ -49,6 +50,20 @@ jobs:
         uses: actions/checkout@v5.0.1
         with:
           ref: ${{ steps.ref.outputs.ref }}
+
+      # crates.io rejects git dependencies, so while the storage substrate is
+      # rev-pinned to a Lance pre-release (git dep in the workspace manifest)
+      # registry publication is deliberately deferred — binaries/Homebrew still
+      # ship from release.yml. This self-heals: the step stops matching the
+      # moment the dependency returns to a crates.io version (Lance 9 stable),
+      # and a workflow_dispatch catch-up run can then publish the skipped tag.
+      - name: Skip while the storage substrate is git-pinned
+        if: env.CARGO_PUBLISH_SKIP != '1'
+        run: |
+          if grep -qE '^lance = \{ git' Cargo.toml; then
+            echo "lance is git-pinned (pre-release substrate); deferring crates.io publish for this tag."
+            echo "CARGO_PUBLISH_SKIP=1" >> "$GITHUB_ENV"
+          fi
 
       - name: Install Linux dependencies
         if: env.CARGO_PUBLISH_SKIP != '1'
