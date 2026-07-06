@@ -27,6 +27,11 @@ it cannot serve:
 - a stamp **above** CURRENT → refused with "upgrade omnigraph", so an old binary
   cannot silently misread a newer format.
 
+The below-CURRENT refusal names the release line that wrote the stamp
+(`release_for_internal_schema_version` in `db/manifest/migrations.rs`) and prints
+the exact `export` / `init` / `load` commands, so the upgrade is fail-closed **and**
+self-service — the operator can fetch the right old binary without guessing.
+
 There is no in-place migration dispatcher. The single source file
 `db/manifest/migrations.rs` holds only the version constant, the stamp read/write,
 and `refuse_if_stamp_unsupported`.
