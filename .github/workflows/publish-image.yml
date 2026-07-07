@@ -38,10 +38,24 @@ jobs:
     env:
       RELEASE_TAG: ${{ inputs.tag || github.ref_name }}
     steps:
+      # The dispatch `tag` input is free-form; without this guard a dispatcher
+      # could pass a branch name or SHA and publish non-release code under a
+      # release-looking image tag. Require an existing v* tag ref.
+      - name: Validate dispatch tag
+        if: github.event_name == 'workflow_dispatch'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          [[ "${RELEASE_TAG}" == v* ]] \
+            || { echo "tag must be a v* release tag, got: ${RELEASE_TAG}" >&2; exit 1; }
+          gh api "repos/${GITHUB_REPOSITORY}/git/ref/tags/${RELEASE_TAG}" >/dev/null \
+            || { echo "no such tag: ${RELEASE_TAG}" >&2; exit 1; }
+
       - name: Checkout source
         uses: actions/checkout@v5.0.1
         with:
-          ref: ${{ env.RELEASE_TAG }}
+          # Fully qualified so a branch of the same name can never shadow the tag.
+          ref: refs/tags/${{ env.RELEASE_TAG }}
 
       - name: Build release binaries (bookworm builder)
         run: |
