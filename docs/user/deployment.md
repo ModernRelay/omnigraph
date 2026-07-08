@@ -172,11 +172,12 @@ endpoint and credentials. CI exercises this path against containerized RustFS.
 
 ## Container Deployment
 
-Pull the prebuilt public image (published to GHCR for every `v*` release by
+Pull the prebuilt public image (published for every `v*` release by
 `publish-image.yml`; built with the `aws` feature, linux/amd64):
 
 ```bash
-docker pull ghcr.io/modernrelay/omnigraph-server:v0.8.1
+docker pull modernrelay/omnigraph-server:v0.8.1          # Docker Hub
+# or: docker pull ghcr.io/modernrelay/omnigraph-server:v0.8.1
 ```
 
 Or build it yourself:

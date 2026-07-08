@@ -86,17 +86,51 @@ jobs:
             docker push "${image}:latest"
           fi
 
-      - name: Report pinned digest
+      # Docker Hub is the primary public distribution channel (anonymous pulls
+      # for deployments). Skipped when the DOCKERHUB_* secrets are not
+      # configured, so forks and the GHCR-only path keep working. With an org
+      # access token, DOCKERHUB_USERNAME is the ORG name — which is also the
+      # image namespace.
+      - name: Push to Docker Hub
+        env:
+          DOCKERHUB_USERNAME: ${{ secrets.DOCKERHUB_USERNAME }}
+          DOCKERHUB_TOKEN: ${{ secrets.DOCKERHUB_TOKEN }}
+        run: |
+          if [[ -z "${DOCKERHUB_USERNAME}" || -z "${DOCKERHUB_TOKEN}" ]]; then
+            echo "DOCKERHUB_* secrets not configured; skipping Docker Hub publish."
+            exit 0
+          fi
+          owner="${GITHUB_REPOSITORY_OWNER,,}"
+          ghcr_image="ghcr.io/${owner}/omnigraph-server"
+          hub_image="docker.io/${DOCKERHUB_USERNAME}/omnigraph-server"
+
+          echo "${DOCKERHUB_TOKEN}" \
+            | docker login docker.io --username "${DOCKERHUB_USERNAME}" --password-stdin
+
+          docker tag "${ghcr_image}:${RELEASE_TAG}" "${hub_image}:${RELEASE_TAG}"
+          docker push "${hub_image}:${RELEASE_TAG}"
+
+          # Same `latest` policy as GHCR: real tag pushes only, never backfills.
+          if [[ "${GITHUB_EVENT_NAME}" == "push" ]]; then
+            docker tag "${ghcr_image}:${RELEASE_TAG}" "${hub_image}:latest"
+            docker push "${hub_image}:latest"
+          fi
+
+      - name: Report pinned digests
+        env:
+          DOCKERHUB_USERNAME: ${{ secrets.DOCKERHUB_USERNAME }}
         run: |
           owner="${GITHUB_REPOSITORY_OWNER,,}"
-          image="ghcr.io/${owner}/omnigraph-server"
-          digest=$(docker inspect --format='{{index .RepoDigests 0}}' "${image}:${RELEASE_TAG}")
           {
             echo "## Container image published"
             echo
             echo '```'
-            echo "${image}:${RELEASE_TAG}"
-            echo "${digest}"
+            for image in "ghcr.io/${owner}/omnigraph-server" \
+                         ${DOCKERHUB_USERNAME:+"docker.io/${DOCKERHUB_USERNAME}/omnigraph-server"}; do
+              echo "${image}:${RELEASE_TAG}"
+              docker inspect --format='{{range .RepoDigests}}{{.}}{{"\n"}}{{end}}' \
+                "${image}:${RELEASE_TAG}" | grep "^${image}@" || true
+            done
             echo '```'
             echo
             echo "Pin deployments to the digest form."
