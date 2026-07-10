@@ -1177,6 +1177,13 @@ impl TableStore {
             ));
         }
         let merged_rows = batch.num_rows() as u64;
+        let inserts_unmatched = matches!(when_not_matched, WhenNotMatched::InsertAll);
+        let source_columns: Vec<String> = batch
+            .schema()
+            .fields()
+            .iter()
+            .map(|f| f.name().clone())
+            .collect();
 
         // Precondition for the FirstSeen workaround below: every call path that
         // reaches stage_merge_insert (load, MutationStaging::finalize,
@@ -1219,7 +1226,11 @@ impl TableStore {
             .map_err(|e| OmniError::Lance(e.to_string()))?;
         // Record only after the staging write succeeds, so a failed write does
         // not inflate the probe (matches `stage_append`/`stage_append_stream`).
-        crate::instrumentation::record_stage_merge_insert(merged_rows);
+        crate::instrumentation::record_stage_merge_insert(
+            merged_rows,
+            source_columns,
+            inserts_unmatched,
+        );
         // Operation::Update { removed_fragment_ids, updated_fragments, new_fragments, .. } —
         // `new_fragments` are the freshly inserted rows; `updated_fragments`
         // are rewrites of existing fragments that include both retained and

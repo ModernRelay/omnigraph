@@ -175,6 +175,12 @@ pub struct MergeWriteProbes {
     pub stage_append_rows: Arc<AtomicU64>,
     pub stage_merge_insert_calls: Arc<AtomicU64>,
     pub stage_merge_insert_rows: Arc<AtomicU64>,
+    /// Per-call shape of each `stage_merge_insert`: the source batch's column
+    /// names (schema order) and whether unmatched source rows insert
+    /// (`WhenNotMatched::InsertAll`) or drop (`DoNothing`). Lets a fitness test
+    /// assert a partial-schema matched-only update stages exactly
+    /// (key + assigned + completion) columns — the RFC-022 staging shape.
+    pub merge_shapes: Arc<std::sync::Mutex<Vec<MergeShape>>>,
     /// Inline vector-index (IVF) builds. The fast-forward adopt path defers
     /// index coverage to the reconciler, so an adopt merge must do 0 of these.
     pub create_vector_index_calls: Arc<AtomicU64>,
@@ -184,9 +190,21 @@ pub struct MergeWriteProbes {
     pub scan_staged_combined_calls: Arc<AtomicU64>,
 }
 
+/// One `stage_merge_insert` call's observable shape (see
+/// [`MergeWriteProbes::merge_shapes`]).
+#[derive(Clone, Debug)]
+pub struct MergeShape {
+    pub source_columns: Vec<String>,
+    pub inserts_unmatched: bool,
+}
+
 impl MergeWriteProbes {
     pub fn stage_append_calls(&self) -> u64 {
         self.stage_append_calls.load(Ordering::Relaxed)
+    }
+    /// Snapshot of the recorded per-call merge shapes, in call order.
+    pub fn merge_shapes(&self) -> Vec<MergeShape> {
+        self.merge_shapes.lock().unwrap().clone()
     }
     pub fn stage_append_rows(&self) -> u64 {
         self.stage_append_rows.load(Ordering::Relaxed)
@@ -227,12 +245,21 @@ pub(crate) fn record_stage_append(rows: u64) {
     });
 }
 
-/// Record one `stage_merge_insert` of `rows` rows against the active probes.
+/// Record one `stage_merge_insert` of `rows` rows against the active probes,
+/// with its observable shape (source columns + unmatched-row disposition).
 /// No-op in production (no probes installed).
-pub(crate) fn record_stage_merge_insert(rows: u64) {
+pub(crate) fn record_stage_merge_insert(
+    rows: u64,
+    source_columns: Vec<String>,
+    inserts_unmatched: bool,
+) {
     let _ = MERGE_WRITE_PROBES.try_with(|p| {
         p.stage_merge_insert_calls.fetch_add(1, Ordering::Relaxed);
         p.stage_merge_insert_rows.fetch_add(rows, Ordering::Relaxed);
+        p.merge_shapes.lock().unwrap().push(MergeShape {
+            source_columns,
+            inserts_unmatched,
+        });
     });
 }
 

@@ -8,7 +8,7 @@ mod helpers;
 use omnigraph::db::Omnigraph;
 use omnigraph::loader::{LoadMode, load_jsonl};
 
-use helpers::{count_rows, mutate_main, params};
+use helpers::{count_rows, mixed_params, mutate_main, params};
 
 const ENUM_SCHEMA: &str = r#"
 node Person {
@@ -707,4 +707,74 @@ async fn cardinality_rejected_on_jsonl_load() {
         "got: {}",
         err
     );
+}
+
+// ─── RFC-022: composite-unique completion under partial updates ─────────────
+
+const COMPOSITE_UNIQUE_SCHEMA: &str = r#"
+node Slot {
+    name: String @key
+    room: String?
+    hour: I32?
+    @unique(room, hour)
+}
+"#;
+
+const COMPOSITE_MUTATIONS: &str = r#"
+query insert_slot($name: String, $room: String, $hour: I32) {
+    insert Slot { name: $name, room: $room, hour: $hour }
+}
+query move_slot($name: String, $room: String) {
+    update Slot set { room: $room } where name = $name
+}
+"#;
+
+/// An update assigning only PART of a composite `@unique` group must still
+/// validate the whole group — the unassigned member's committed value completes
+/// the tuple. Guards RFC-022's completion-column projection rule: a partial
+/// update that assigns `room` must also carry `hour` (old value) into the
+/// change-set, or the (room, hour) collision below would go undetected.
+#[tokio::test]
+async fn partial_update_completes_composite_unique_group() {
+    let dir = tempfile::tempdir().unwrap();
+    let uri = dir.path().to_str().unwrap();
+    let db = omnigraph::db::Omnigraph::init(uri, COMPOSITE_UNIQUE_SCHEMA)
+        .await
+        .unwrap();
+
+    for (name, room, hour) in [("s1", "roomA", 9i64), ("s2", "roomB", 9)] {
+        db.mutate(
+            "main",
+            COMPOSITE_MUTATIONS,
+            "insert_slot",
+            &mixed_params(&[("$name", name), ("$room", room)], &[("$hour", hour)]),
+        )
+        .await
+        .unwrap();
+    }
+
+    // Moving s2 into roomA collides with s1's (roomA, 9).
+    let err = db
+        .mutate(
+            "main",
+            COMPOSITE_MUTATIONS,
+            "move_slot",
+            &params(&[("$name", "s2"), ("$room", "roomA")]),
+        )
+        .await
+        .unwrap_err();
+    assert!(
+        err.to_string().contains("@unique"),
+        "moving s2 to (roomA, 9) must be a composite-unique violation, got: {err}"
+    );
+
+    // A non-colliding move succeeds.
+    db.mutate(
+        "main",
+        COMPOSITE_MUTATIONS,
+        "move_slot",
+        &params(&[("$name", "s2"), ("$room", "roomC")]),
+    )
+    .await
+    .unwrap();
 }

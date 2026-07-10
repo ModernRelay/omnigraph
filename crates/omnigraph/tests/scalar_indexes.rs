@@ -72,3 +72,46 @@ async fn node_scalar_and_enum_index_columns_get_btree() {
         "un-annotated column should have no scalar index, got {note_cov:?}"
     );
 }
+
+const TOUCH_NOTE: &str = r#"
+query touch_note($slug: String, $note: String) {
+    update Item set { note: $note } where slug = $slug
+}
+"#;
+
+// RFC-022 acceptance cell (red → green): updating an UN-indexed property must
+// not degrade index coverage on any OTHER column. The whole-row update merge
+// marks every column modified, so Lance prunes the touched fragments from every
+// index (`prune_updated_fields_from_indices`) and the rewritten rows land
+// outside coverage; the partial-schema update (fields_modified = assigned
+// columns only, in-place column patch on the same fragment) leaves the id/enum/
+// scalar BTREEs intact. This is the erosion class measured in the field-level-
+// updates investigation: keyed operations degrade ~+1 read/fragment after
+// whole-row updates until an optimize.
+#[tokio::test]
+async fn update_of_unindexed_property_preserves_other_index_coverage() {
+    let dir = tempfile::tempdir().unwrap();
+    let uri = dir.path().to_str().unwrap();
+    let mut db = Omnigraph::init(uri, SCHEMA).await.unwrap();
+    load_jsonl(&mut db, DATA, LoadMode::Overwrite).await.unwrap();
+
+    db.mutate(
+        "main",
+        TOUCH_NOTE,
+        "touch_note",
+        &params(&[("$slug", "a"), ("$note", "touched")]),
+    )
+    .await
+    .unwrap();
+
+    let snap = snapshot_main(&db).await.unwrap();
+    let ds = snap.open("node:Item").await.unwrap();
+    for col in ["id", "status", "published", "rank"] {
+        let cov = TableStore::key_column_index_coverage(&ds, col).await.unwrap();
+        assert_eq!(
+            cov,
+            IndexCoverage::Indexed,
+            "updating un-indexed 'note' must not degrade the index on '{col}', got {cov:?}"
+        );
+    }
+}
