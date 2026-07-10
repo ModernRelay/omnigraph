@@ -64,6 +64,27 @@ shared by both `mutate_as` and the bulk loader:
   (below) still prevents inserts/updates from coexisting with deletes in one
   query.
 
+- **Field-level updates (partial-schema staging).** A node table whose ONLY op
+  in the query is a single `update` stages a PARTIAL merge source — (id +
+  assigned + constraint-completion columns, where completion = every member of
+  a `@unique` group intersecting the assigned set) — as a **matched-only**
+  merge (`WhenNotMatched::DoNothing`). Lance's partial-schema path patches the
+  provided columns in place on the same fragment (`update_mode:
+  RewriteColumns`), so unassigned columns are never read or rewritten and
+  indexes over them keep fragment coverage (Lance prunes only
+  `fields_modified`). Every other shape (insert+update on one table, multiple
+  updates, etc.) falls back to whole-row staging: partial and full batches
+  cannot share one uniform-schema merge source (a present column's null cell
+  means "set NULL", so widening would null-overwrite), a later same-table op's
+  read-your-writes scan needs full rows, and one table commits at most one
+  version per query. The unique evaluator skips a `@unique` group with no
+  column present in a batch (untouched by the write) and stays loud on a
+  partially-present group. Known residual (pinned by
+  `lance_surface_guards::partial_schema_merge_patches_in_place_and_prunes_only_modified_fields`
+  and the `scalar_indexes` coverage cell): the join key rides the source, so
+  the **id BTREE** alone still loses patched fragments (parity with the
+  whole-row path) until upstream excludes ON columns from column patches.
+
 This upholds the manifest-atomic mutation and read-your-writes invariants
 tracked in [docs/dev/invariants.md](invariants.md).
 

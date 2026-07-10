@@ -1257,3 +1257,149 @@ async fn filtered_scan_tolerates_merge_update_row_id_overlap() {
         assert_eq!(rows, expected, "filtered read for {slug}");
     }
 }
+
+// --- Guard: partial-schema merge patches columns in place, pruning only
+// --- fields_modified (the RFC-022 substrate contract) -----------------------
+//
+// A merge-insert whose source carries a SUBSET of the target schema must:
+//   (a) patch the provided columns for matched rows IN PLACE — same fragment
+//       id, no new fragments (`update_mode: RewriteColumns`);
+//   (b) leave missing columns' values untouched;
+//   (c) prune ONLY indexes covering a source column from the touched
+//       fragment's bitmap (`prune_updated_fields_from_indices` keyed on
+//       `fields_modified`) — an index on an untouched column keeps coverage.
+// Current residual pinned here: the join key rides the source, so the KEY
+// column's index is pruned too even though matched keys are equal by
+// definition. If (d) below goes red, upstream started excluding ON columns
+// from column patches — tighten omnigraph's coverage test in
+// scalar_indexes.rs and drop this arm.
+#[tokio::test]
+async fn partial_schema_merge_patches_in_place_and_prunes_only_modified_fields() {
+    use arrow_array::Int64Array;
+    use futures::TryStreamExt;
+
+    let dir = tempfile::tempdir().unwrap();
+    let uri = dir.path().join("guard_partial_merge.lance");
+    let schema = Arc::new(Schema::new(vec![
+        Field::new("id", DataType::Utf8, false),
+        Field::new("a", DataType::Int64, false),
+        Field::new("b", DataType::Int64, false),
+    ]));
+    let batch = RecordBatch::try_new(
+        schema.clone(),
+        vec![
+            Arc::new(StringArray::from(vec!["x", "y", "z"])),
+            Arc::new(Int64Array::from(vec![1, 2, 3])),
+            Arc::new(Int64Array::from(vec![10, 20, 30])),
+        ],
+    )
+    .unwrap();
+    let reader = RecordBatchIterator::new(vec![Ok(batch)], schema.clone());
+    let params = WriteParams {
+        mode: WriteMode::Create,
+        enable_stable_row_ids: true,
+        data_storage_version: Some(LanceFileVersion::V2_2),
+        ..Default::default()
+    };
+    let mut ds = Dataset::write(reader, uri.to_str().unwrap(), Some(params))
+        .await
+        .unwrap();
+    ds.create_index_builder(&["id"], IndexType::BTree, &ScalarIndexParams::default())
+        .await
+        .unwrap();
+    ds.create_index_builder(&["b"], IndexType::BTree, &ScalarIndexParams::default())
+        .await
+        .unwrap();
+    ds.checkout_latest().await.unwrap();
+    let frags_before: Vec<u64> = ds.fragments().iter().map(|f| f.id).collect();
+
+    // Partial source: (id, a) — patch a=200 for id="y". No `b` column.
+    let partial_schema = Arc::new(Schema::new(vec![
+        Field::new("id", DataType::Utf8, false),
+        Field::new("a", DataType::Int64, false),
+    ]));
+    let patch = RecordBatch::try_new(
+        partial_schema.clone(),
+        vec![
+            Arc::new(StringArray::from(vec!["y"])),
+            Arc::new(Int64Array::from(vec![200i64])),
+        ],
+    )
+    .unwrap();
+    let job = MergeInsertBuilder::try_new(Arc::new(ds), vec!["id".to_string()])
+        .unwrap()
+        .when_matched(WhenMatched::UpdateAll)
+        .when_not_matched(WhenNotMatched::DoNothing)
+        .try_build()
+        .unwrap();
+    let source = RecordBatchIterator::new(vec![Ok(patch)], partial_schema);
+    let (ds, _stats) = job.execute_reader(source).await.unwrap();
+
+    // (a) in place: same fragment set.
+    let frags_after: Vec<u64> = ds.fragments().iter().map(|f| f.id).collect();
+    assert_eq!(frags_before, frags_after, "partial merge must patch in place");
+
+    // (b) patched + retained values.
+    let rows = ds
+        .scan()
+        .try_into_stream()
+        .await
+        .unwrap()
+        .try_collect::<Vec<_>>()
+        .await
+        .unwrap();
+    let all = arrow_select::concat::concat_batches(&rows[0].schema(), &rows).unwrap();
+    let ids = all
+        .column_by_name("id")
+        .unwrap()
+        .as_any()
+        .downcast_ref::<StringArray>()
+        .unwrap();
+    let a = all
+        .column_by_name("a")
+        .unwrap()
+        .as_any()
+        .downcast_ref::<Int64Array>()
+        .unwrap();
+    let b = all
+        .column_by_name("b")
+        .unwrap()
+        .as_any()
+        .downcast_ref::<Int64Array>()
+        .unwrap();
+    for i in 0..all.num_rows() {
+        match ids.value(i) {
+            "y" => {
+                assert_eq!(a.value(i), 200, "assigned column patched");
+                assert_eq!(b.value(i), 20, "missing column retained");
+            }
+            "x" => assert_eq!((a.value(i), b.value(i)), (1, 10)),
+            "z" => assert_eq!((a.value(i), b.value(i)), (3, 30)),
+            other => panic!("unexpected id {other}"),
+        }
+    }
+
+    // (c) index on untouched column `b` keeps its fragment coverage.
+    let indices = ds.load_indices().await.unwrap();
+    let bitmap_of = |col_field: &str| {
+        let field_id = ds.schema().field(col_field).unwrap().id;
+        indices
+            .iter()
+            .find(|i| i.fields == vec![field_id])
+            .and_then(|i| i.fragment_bitmap.as_ref())
+            .map(|bm| bm.iter().collect::<Vec<_>>())
+    };
+    assert_eq!(
+        bitmap_of("b"),
+        Some(frags_before.iter().map(|f| *f as u32).collect::<Vec<_>>()),
+        "index on an untouched column must keep the patched fragment"
+    );
+    // (d) residual: the join key's index IS pruned (source carries `id`).
+    assert_eq!(
+        bitmap_of("id"),
+        Some(vec![]),
+        "join-key index currently loses the patched fragment; if this went red \
+         with a non-empty bitmap, upstream now excludes ON columns from patches \
+         — tighten scalar_indexes.rs and update RFC-022's residual note"
+    );
+}

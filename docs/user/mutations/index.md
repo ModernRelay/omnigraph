@@ -29,6 +29,21 @@ failure leaves the graph untouched. See [transactions](../branching/transactions
 for the per-query atomicity contract and [branches](../branching/index.md) for
 multi-query workflows.
 
+## Updates write only the columns they assign
+
+When an `update` is the only statement touching its type in a query, the engine
+stages just the assigned columns (plus the row key and any columns needed to
+complete a `@unique` group the assignment touches) and patches them in place.
+Unassigned columns — including large `Vector` embedding columns — are neither
+read nor rewritten, and indexes over them keep their coverage. Semantics are
+identical to a whole-row update; the difference is cost: update latency and
+write volume scale with what you assign, not with row width.
+
+Queries that combine an update with other statements on the same type fall back
+to whole-row staging (same semantics, previous cost). Note that updating a
+property that feeds an `@embed` column does **not** recompute the embedding —
+re-run the embedding pass after changing embed-source text.
+
 ## Inserts/updates and deletes cannot mix in one query
 
 A single change query must be **either insert/update-only or delete-only**.
