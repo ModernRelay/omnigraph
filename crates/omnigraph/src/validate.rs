@@ -671,6 +671,18 @@ async fn evaluate_unique(
     // became null removes the id (it no longer holds a unique key).
     let mut final_by_id: HashMap<String, (Vec<String>, Vec<ScalarValue>)> = HashMap::new();
     for batch in change.value_batches() {
+        // RFC-022 partial-update batches carry only (id + assigned +
+        // completion) columns. A group with NO column in the batch is
+        // untouched by the write — its committed values still satisfy the
+        // constraint — so skip it. A PARTIALLY present group would mean the
+        // completion-column projection failed; keep that loud (the error
+        // below fires on the first missing member).
+        if columns
+            .iter()
+            .all(|name| batch.column_by_name(name).is_none())
+        {
+            continue;
+        }
         let group_columns = columns
             .iter()
             .map(|name| {

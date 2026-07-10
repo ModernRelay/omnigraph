@@ -397,6 +397,64 @@ fn predicate_to_sql(
 ///   want to be split into separate queries.
 /// - If a blob column has a string-URI assignment, build the blob array
 ///   inline.
+/// RFC-022: the column plan for a partial-schema update.
+struct PartialUpdatePlan {
+    /// Staged-batch schema: (id + assigned + completion), in catalog order.
+    output_schema: SchemaRef,
+    /// Scan schema: (id + completion-minus-assigned), in catalog order —
+    /// the only columns whose OLD values the update needs.
+    scan_schema: SchemaRef,
+    /// `scan_schema`'s column names (the scan projection).
+    scan_cols: Vec<String>,
+}
+
+/// Compute the partial-update column plan: the staged source carries the merge
+/// key (`id`), the assigned columns (values from literals), and the
+/// constraint-completion columns — every member of a `@unique` group that
+/// intersects the assigned set, so the end-of-query evaluator can validate the
+/// whole tuple (an update assigning only `room` of `@unique(room, hour)` must
+/// still detect a (room, hour) collision). Columns outside the plan are left
+/// physically untouched by the matched-only merge, and every index over them
+/// keeps its coverage (Lance prunes only `fields_modified`).
+fn partial_update_plan(
+    node_type: &omnigraph_compiler::catalog::NodeType,
+    full_schema: &SchemaRef,
+    assignments: &[IRAssignment],
+) -> PartialUpdatePlan {
+    let assigned: HashSet<&str> = assignments.iter().map(|a| a.property.as_str()).collect();
+    let mut completion: HashSet<&str> = HashSet::new();
+    for group in &node_type.unique_constraints {
+        if group.iter().any(|col| assigned.contains(col.as_str())) {
+            for col in group {
+                completion.insert(col.as_str());
+            }
+        }
+    }
+
+    let mut output_fields = Vec::new();
+    let mut scan_fields = Vec::new();
+    for field in full_schema.fields() {
+        let name = field.name().as_str();
+        let is_assigned = assigned.contains(name);
+        let in_completion = completion.contains(name);
+        if name == "id" || is_assigned || in_completion {
+            output_fields.push(field.clone());
+        }
+        if name == "id" || (in_completion && !is_assigned) {
+            scan_fields.push(field.clone());
+        }
+    }
+    let scan_cols = scan_fields
+        .iter()
+        .map(|f| f.name().clone())
+        .collect::<Vec<_>>();
+    PartialUpdatePlan {
+        output_schema: Arc::new(Schema::new(output_fields)),
+        scan_schema: Arc::new(Schema::new(scan_fields)),
+        scan_cols,
+    }
+}
+
 fn apply_assignments(
     full_schema: &SchemaRef,
     batch: &RecordBatch,
@@ -916,6 +974,29 @@ impl Omnigraph {
         staging: &mut MutationStaging,
         txn: Option<&crate::db::WriteTxn>,
     ) -> Result<MutationResult> {
+        // RFC-022 eligibility: a node table whose ONLY op in this query is a
+        // single `update` stages a partial-schema matched-only merge (key +
+        // assigned + constraint-completion columns). Every other combination
+        // falls back to whole-row staging: partial and full batches cannot
+        // share one uniform-schema merge source (a present column's null cell
+        // means "set NULL", so widening a partial batch would null-overwrite),
+        // a second same-table op's read-your-writes scan must see full rows,
+        // and one table commits at most one version per query (invariant 4).
+        let mut update_op_census: std::collections::HashMap<&str, (usize, usize)> =
+            std::collections::HashMap::new();
+        for op in &ir.ops {
+            let (type_name, is_update) = match op {
+                MutationOpIR::Update { type_name, .. } => (type_name.as_str(), true),
+                MutationOpIR::Insert { type_name, .. }
+                | MutationOpIR::Delete { type_name, .. } => (type_name.as_str(), false),
+            };
+            let entry = update_op_census.entry(type_name).or_insert((0, 0));
+            entry.0 += 1;
+            if is_update {
+                entry.1 += 1;
+            }
+        }
+
         let mut total = MutationResult::default();
         for op in &ir.ops {
             let result = match op {
@@ -931,8 +1012,12 @@ impl Omnigraph {
                     assignments,
                     predicate,
                 } => {
+                    let partial_ok = update_op_census
+                        .get(type_name.as_str())
+                        .is_some_and(|&(ops, updates)| ops == 1 && updates == 1);
                     self.execute_update(
                         type_name, assignments, predicate, params, branch, staging, txn,
+                        partial_ok,
                     )
                     .await?
                 }
@@ -1063,6 +1148,7 @@ impl Omnigraph {
         branch: Option<&str>,
         staging: &mut MutationStaging,
         txn: Option<&crate::db::WriteTxn>,
+        partial_ok: bool,
     ) -> Result<MutationResult> {
         // Defense in depth: ensure this is a node type
         if !self.catalog().node_types.contains_key(type_name) {
@@ -1085,6 +1171,20 @@ impl Omnigraph {
         let pred_sql = predicate_to_sql(predicate, params, false)?;
         let schema = self.catalog().node_types[type_name].arrow_schema.clone();
         let blob_props = self.catalog().node_types[type_name].blob_properties.clone();
+
+        // RFC-022: when this update is the table's only op in the query,
+        // stage a PARTIAL source — (id + assigned + constraint-completion)
+        // columns — instead of whole rows. `partial_plan` is `None` on the
+        // whole-row fallback path.
+        let partial_plan = if partial_ok {
+            Some(partial_update_plan(
+                &self.catalog().node_types[type_name],
+                &schema,
+                assignments,
+            ))
+        } else {
+            None
+        };
 
         let table_key = format!("node:{}", type_name);
         let (handle, _full_path, _table_branch) = open_table_for_mutation(
@@ -1118,8 +1218,19 @@ impl Omnigraph {
             .filter(|f| !blob_props.contains(f.name()))
             .map(|f| f.name().as_str())
             .collect();
-        let projection: Option<&[&str]> =
-            (!blob_props.is_empty()).then_some(non_blob_cols.as_slice());
+        // Partial path: scan only (id + completion-minus-assigned) — assigned
+        // columns' old values are never needed (`.gq` assignments are literal
+        // values), and the WHERE predicate evaluates by pushdown without being
+        // projected. Whole-row path: unchanged (full schema minus blobs).
+        let partial_scan_cols: Vec<&str> = partial_plan
+            .as_ref()
+            .map(|plan| plan.scan_cols.iter().map(|c| c.as_str()).collect())
+            .unwrap_or_default();
+        let projection: Option<&[&str]> = if partial_plan.is_some() {
+            Some(partial_scan_cols.as_slice())
+        } else {
+            (!blob_props.is_empty()).then_some(non_blob_cols.as_slice())
+        };
         let pending_batches = staging.pending_batches(&table_key);
         let pending_schema = staging.pending_schema(&table_key);
         // Use merge semantics on the union: a committed row whose `id`
@@ -1155,7 +1266,15 @@ impl Omnigraph {
         // diverge (typically a blob-table mid-schema-shift), the helper
         // surfaces a clear error directing the caller to split the
         // mutation.
-        let matched = concat_match_batches_to_schema(&schema, &blob_props, batches)?;
+        // Partial path: normalize/concat against the SCAN schema (id +
+        // completion), then apply assignments over the OUTPUT schema (id +
+        // assigned + completion) — assigned columns come from literals, so
+        // they need no scanned values. Whole-row path: unchanged.
+        let (concat_schema, output_schema) = match partial_plan.as_ref() {
+            Some(plan) => (plan.scan_schema.clone(), plan.output_schema.clone()),
+            None => (schema.clone(), schema.clone()),
+        };
+        let matched = concat_match_batches_to_schema(&concat_schema, &blob_props, batches)?;
 
         let affected_count = matched.num_rows();
 
@@ -1163,16 +1282,19 @@ impl Omnigraph {
         for a in assignments {
             resolved.insert(a.property.clone(), resolve_expr_value(&a.value, params)?);
         }
-        let updated = apply_assignments(&schema, &matched, &resolved, &blob_props)?;
+        let updated = apply_assignments(&output_schema, &matched, &resolved, &blob_props)?;
         // Validation (value/enum/unique) runs end-of-query via the evaluator.
 
-        // Accumulate the updated batch into the Merge-mode pending stream.
-        // The accumulator may now contain entries with the same id as a
-        // prior insert or update on this table; `MutationStaging::finalize`
-        // dedupes by id (last-occurrence wins) before issuing the single
-        // `stage_merge_insert` call at end-of-query.
+        // Accumulate the updated batch. Whole-row: the Merge-mode pending
+        // stream (may coalesce with prior same-table ops; finalize dedupes by
+        // id, last wins). Partial (RFC-022): a dedicated partial-update entry
+        // that stages as a matched-only merge.
         let updated_schema = updated.schema();
-        staging.append_batch(&table_key, updated_schema, PendingMode::Merge, updated)?;
+        if partial_plan.is_some() {
+            staging.append_partial_update_batch(&table_key, updated_schema, updated)?;
+        } else {
+            staging.append_batch(&table_key, updated_schema, PendingMode::Merge, updated)?;
+        }
 
         Ok(MutationResult {
             affected_nodes: affected_count,

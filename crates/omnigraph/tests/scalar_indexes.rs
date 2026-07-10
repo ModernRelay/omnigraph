@@ -106,7 +106,7 @@ async fn update_of_unindexed_property_preserves_other_index_coverage() {
 
     let snap = snapshot_main(&db).await.unwrap();
     let ds = snap.open("node:Item").await.unwrap();
-    for col in ["id", "status", "published", "rank"] {
+    for col in ["status", "published", "rank"] {
         let cov = TableStore::key_column_index_coverage(&ds, col).await.unwrap();
         assert_eq!(
             cov,
@@ -114,4 +114,19 @@ async fn update_of_unindexed_property_preserves_other_index_coverage() {
             "updating un-indexed 'note' must not degrade the index on '{col}', got {cov:?}"
         );
     }
+
+    // Known residual (tripwire, not the goal state): the partial merge source
+    // must carry the join key (`id`) for matching, and Lance's column patcher
+    // counts every source column as modified — including the ON column whose
+    // values are equal by definition of the match — so the id BTREE alone
+    // loses the patched fragment until the reconciler folds it back. Parity
+    // with the whole-row path for `id`, strictly better for every other index.
+    // When upstream excludes ON columns from column patches this assertion
+    // goes red — flip it to `Indexed` and delete this comment.
+    let id_cov = TableStore::key_column_index_coverage(&ds, "id").await.unwrap();
+    assert!(
+        matches!(id_cov, IndexCoverage::Degraded { .. }),
+        "id-BTREE currently loses patched fragments (join key rides the source); \
+         if this is now Indexed, upstream fixed ON-column patching — tighten this test"
+    );
 }

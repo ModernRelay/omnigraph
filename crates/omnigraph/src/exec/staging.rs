@@ -52,6 +52,15 @@ pub(crate) struct PendingTable {
     pub(crate) schema: SchemaRef,
     pub(crate) mode: PendingMode,
     pub(crate) batches: Vec<RecordBatch>,
+    /// RFC-022 field-level update: the accumulated batches carry a PARTIAL
+    /// schema — (merge key + assigned + constraint-completion) columns only —
+    /// and stage as a matched-only merge (`WhenNotMatched::DoNothing`), so
+    /// Lance patches the assigned columns in place and leaves every other
+    /// column (and every index over them) untouched. Set only by
+    /// [`MutationStaging::append_partial_update_batch`], whose eligibility
+    /// rule (the table's ONLY op in this query is a single `update`)
+    /// guarantees no full-schema batch ever lands on the same table.
+    pub(crate) partial_update: bool,
 }
 
 impl PendingTable {
@@ -60,6 +69,7 @@ impl PendingTable {
             schema,
             mode,
             batches: Vec::new(),
+            partial_update: false,
         }
     }
 
@@ -184,6 +194,13 @@ impl MutationStaging {
         // caller a clearer point of failure attached to the specific
         // op that introduced the drift.
         if let Some(existing) = self.pending.get(table_key) {
+            if existing.partial_update {
+                return Err(OmniError::manifest_internal(format!(
+                    "append_batch: table '{}' holds a partial-update batch — the \
+                     eligibility rule should have prevented a second op on this table",
+                    table_key
+                )));
+            }
             if existing.mode == PendingMode::Overwrite || mode == PendingMode::Overwrite {
                 if existing.mode != mode {
                     return Err(OmniError::manifest_internal(format!(
@@ -218,6 +235,37 @@ impl MutationStaging {
             entry.mode = PendingMode::Merge;
         }
         entry.batches.push(batch);
+        Ok(())
+    }
+
+    /// RFC-022: stage a PARTIAL-schema update batch — (key + assigned +
+    /// completion) columns — for a table whose only op in this query is one
+    /// `update`. The caller (`execute_update`) enforces that eligibility rule
+    /// from the lowered IR, so an existing accumulator entry here is an
+    /// internal invariant breach, not a user error: partial and full batches
+    /// cannot share one uniform-schema merge source, and silently widening
+    /// (or narrowing) would corrupt the staged shape.
+    pub(crate) fn append_partial_update_batch(
+        &mut self,
+        table_key: &str,
+        schema: SchemaRef,
+        batch: RecordBatch,
+    ) -> Result<()> {
+        if batch.num_rows() == 0 {
+            return Ok(());
+        }
+        if self.pending.contains_key(table_key) {
+            return Err(OmniError::manifest_internal(format!(
+                "append_partial_update_batch: table '{}' already has pending batches — \
+                 partial-update staging requires the update to be the table's only op \
+                 (the eligibility rule in execute_named_mutation)",
+                table_key
+            )));
+        }
+        let mut entry = PendingTable::new(schema, PendingMode::Merge);
+        entry.partial_update = true;
+        entry.batches.push(batch);
+        self.pending.insert(table_key.to_string(), entry);
         Ok(())
     }
 
@@ -481,13 +529,24 @@ async fn stage_pending_table(
     let staged = match table.mode {
         PendingMode::Append => db.storage().stage_append(&ds, combined, &[]).await?,
         PendingMode::Merge => {
+            // RFC-022: a partial-update table stages matched-only. Its source
+            // carries a subset schema (key + assigned + completion), so Lance
+            // patches the provided columns in place and never inserts — the
+            // subset schema could not satisfy non-null target columns anyway
+            // (Lance rejects partial-source inserts), and the update executor
+            // only stages rows it matched against the committed table.
+            let when_not_matched = if table.partial_update {
+                lance::dataset::WhenNotMatched::DoNothing
+            } else {
+                lance::dataset::WhenNotMatched::InsertAll
+            };
             db.storage()
                 .stage_merge_insert(
                     ds.clone(),
                     combined,
                     vec!["id".to_string()],
                     lance::dataset::WhenMatched::UpdateAll,
-                    lance::dataset::WhenNotMatched::InsertAll,
+                    when_not_matched,
                 )
                 .await?
         }
