@@ -130,3 +130,53 @@ async fn update_of_unindexed_property_preserves_other_index_coverage() {
          if this is now Indexed, upstream fixed ON-column patching — tighten this test"
     );
 }
+
+const COMPOSITE_SCHEMA: &str = r#"
+node Slot {
+    name: String @key
+    room: String?
+    hour: I32 @index
+    @unique(room, hour)
+}
+"#;
+
+const COMPOSITE_DATA: &str = r#"{"type":"Slot","data":{"name":"s1","room":"roomA","hour":9}}
+{"type":"Slot","data":{"name":"s2","room":"roomB","hour":9}}"#;
+
+const MOVE_SLOT: &str = r#"
+query move_slot($name: String, $room: String) {
+    update Slot set { room: $room } where name = $name
+}
+"#;
+
+// A `@unique`-group completion column is a VALIDATION input, not a merge
+// input: an update assigning only `room` must not patch `hour` (its value is
+// unchanged), so `hour`'s index keeps the fragment. The staged merge source is
+// (id + assigned); the completion column rides only the validation change-set.
+#[tokio::test]
+async fn completion_column_index_survives_partial_update() {
+    let dir = tempfile::tempdir().unwrap();
+    let uri = dir.path().to_str().unwrap();
+    let mut db = Omnigraph::init(uri, COMPOSITE_SCHEMA).await.unwrap();
+    load_jsonl(&mut db, COMPOSITE_DATA, LoadMode::Overwrite)
+        .await
+        .unwrap();
+
+    db.mutate(
+        "main",
+        MOVE_SLOT,
+        "move_slot",
+        &params(&[("$name", "s2"), ("$room", "roomC")]),
+    )
+    .await
+    .unwrap();
+
+    let snap = snapshot_main(&db).await.unwrap();
+    let ds = snap.open("node:Slot").await.unwrap();
+    let cov = TableStore::key_column_index_coverage(&ds, "hour").await.unwrap();
+    assert_eq!(
+        cov,
+        IndexCoverage::Indexed,
+        "completion column 'hour' was not assigned — its index must keep coverage, got {cov:?}"
+    );
+}

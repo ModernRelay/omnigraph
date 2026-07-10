@@ -65,10 +65,15 @@ shared by both `mutate_as` and the bulk loader:
   query.
 
 - **Field-level updates (partial-schema staging).** A node table whose ONLY op
-  in the query is a single `update` stages a PARTIAL merge source — (id +
-  assigned + constraint-completion columns, where completion = every member of
-  a `@unique` group intersecting the assigned set) — as a **matched-only**
-  merge (`WhenNotMatched::DoNothing`). Lance's partial-schema path patches the
+  in the query is a single `update` stages a PARTIAL merge source — exactly
+  (id + assigned) columns — as a **matched-only** merge
+  (`WhenNotMatched::DoNothing`). The accumulated (pending) batch additionally
+  carries the constraint-completion columns (every member of a `@unique` group
+  intersecting the assigned set) so the end-of-query evaluator can validate the
+  whole tuple — but those are **validation inputs only** and are projected out
+  before staging: Lance counts every source column as modified, so staging an
+  unassigned group member would patch it and prune its index for no semantic
+  reason. Lance's partial-schema path patches the
   provided columns in place on the same fragment (`update_mode:
   RewriteColumns`), so unassigned columns are never read or rewritten and
   indexes over them keep fragment coverage (Lance prunes only

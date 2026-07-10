@@ -399,8 +399,13 @@ fn predicate_to_sql(
 ///   inline.
 /// RFC-022: the column plan for a partial-schema update.
 struct PartialUpdatePlan {
-    /// Staged-batch schema: (id + assigned + completion), in catalog order.
+    /// Accumulated-batch schema: (id + assigned + completion), in catalog
+    /// order — the validation change-set's view.
     output_schema: SchemaRef,
+    /// Columns actually STAGED to the merge: (id + assigned), in catalog
+    /// order. Completion columns are validation-only — staging them would
+    /// patch unassigned columns and prune their indexes.
+    stage_cols: Vec<String>,
     /// Scan schema: (id + completion-minus-assigned), in catalog order —
     /// the only columns whose OLD values the update needs.
     scan_schema: SchemaRef,
@@ -433,12 +438,16 @@ fn partial_update_plan(
 
     let mut output_fields = Vec::new();
     let mut scan_fields = Vec::new();
+    let mut stage_cols = Vec::new();
     for field in full_schema.fields() {
         let name = field.name().as_str();
         let is_assigned = assigned.contains(name);
         let in_completion = completion.contains(name);
         if name == "id" || is_assigned || in_completion {
             output_fields.push(field.clone());
+        }
+        if name == "id" || is_assigned {
+            stage_cols.push(name.to_string());
         }
         if name == "id" || (in_completion && !is_assigned) {
             scan_fields.push(field.clone());
@@ -450,6 +459,7 @@ fn partial_update_plan(
         .collect::<Vec<_>>();
     PartialUpdatePlan {
         output_schema: Arc::new(Schema::new(output_fields)),
+        stage_cols,
         scan_schema: Arc::new(Schema::new(scan_fields)),
         scan_cols,
     }
@@ -1290,8 +1300,13 @@ impl Omnigraph {
         // id, last wins). Partial (RFC-022): a dedicated partial-update entry
         // that stages as a matched-only merge.
         let updated_schema = updated.schema();
-        if partial_plan.is_some() {
-            staging.append_partial_update_batch(&table_key, updated_schema, updated)?;
+        if let Some(plan) = partial_plan.as_ref() {
+            staging.append_partial_update_batch(
+                &table_key,
+                updated_schema,
+                updated,
+                plan.stage_cols.clone(),
+            )?;
         } else {
             staging.append_batch(&table_key, updated_schema, PendingMode::Merge, updated)?;
         }
