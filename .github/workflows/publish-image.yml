@@ -1,0 +1,152 @@
+name: Publish container image
+
+# Build and publish the omnigraph-server container image to GHCR so
+# downstream deployments can pull it without building from source.
+#
+# Kept separate from release.yml on purpose: an image-publish failure must
+# not block the binary release / Homebrew chain, and a manual backfill of an
+# old tag must not re-run the four-platform release matrix.
+#
+# Triggers (same dual pattern as release.yml):
+#   - push of a v* tag (normal release)
+#   - workflow_dispatch with an explicit `tag` (publish an image for a past
+#     tag; resolves the same `${{ inputs.tag || github.ref_name }}`)
+#
+# The binaries are compiled inside a rust:1-bookworm container, NOT on the
+# runner host: the Dockerfile's runtime base is debian bookworm-slim
+# (glibc 2.36), and binaries built on ubuntu-latest (glibc 2.39) do not run
+# there. Builder and runtime must share the same distro release.
+
+on:
+  push:
+    tags:
+      - "v*"
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Tag to publish an image for (e.g. v0.8.1). Required for manual dispatches."
+        required: true
+        type: string
+
+jobs:
+  publish_image:
+    name: Build and push image
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+    env:
+      RELEASE_TAG: ${{ inputs.tag || github.ref_name }}
+    steps:
+      # The dispatch `tag` input is free-form; without this guard a dispatcher
+      # could pass a branch name or SHA and publish non-release code under a
+      # release-looking image tag. Require an existing v* tag ref.
+      - name: Validate dispatch tag
+        if: github.event_name == 'workflow_dispatch'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          [[ "${RELEASE_TAG}" == v* ]] \
+            || { echo "tag must be a v* release tag, got: ${RELEASE_TAG}" >&2; exit 1; }
+          gh api "repos/${GITHUB_REPOSITORY}/git/ref/tags/${RELEASE_TAG}" >/dev/null \
+            || { echo "no such tag: ${RELEASE_TAG}" >&2; exit 1; }
+
+      - name: Checkout source
+        uses: actions/checkout@v5.0.1
+        with:
+          # Fully qualified so a branch of the same name can never shadow the tag.
+          ref: refs/tags/${{ env.RELEASE_TAG }}
+
+      - name: Build release binaries (bookworm builder)
+        run: |
+          docker run --rm -v "$PWD:/work" -w /work rust:1-bookworm bash -euxc '
+            apt-get update
+            apt-get install -y --no-install-recommends protobuf-compiler libprotobuf-dev
+            # --features omnigraph-server/aws: include the AWS Secrets Manager
+            # bearer-token source so one public image serves both token modes.
+            cargo build --release --locked -p omnigraph-cli -p omnigraph-server --features omnigraph-server/aws
+          '
+
+      - name: Log in to GHCR
+        run: |
+          echo "${{ secrets.GITHUB_TOKEN }}" \
+            | docker login ghcr.io --username "${{ github.actor }}" --password-stdin
+
+      - name: Build and push image
+        run: |
+          owner="${GITHUB_REPOSITORY_OWNER,,}"
+          image="ghcr.io/${owner}/omnigraph-server"
+          docker build -t "${image}:${RELEASE_TAG}" .
+          docker push "${image}:${RELEASE_TAG}"
+
+          # Move `latest` only on real tag pushes — a dispatch backfill of an
+          # old tag must not repoint `latest` at it.
+          if [[ "${GITHUB_EVENT_NAME}" == "push" ]]; then
+            docker tag "${image}:${RELEASE_TAG}" "${image}:latest"
+            docker push "${image}:latest"
+          fi
+
+      # Docker Hub is the primary public distribution channel (anonymous pulls
+      # for deployments). Skipped when the DOCKERHUB_* secrets are not
+      # configured, so forks and the GHCR-only path keep working. With an org
+      # access token, DOCKERHUB_USERNAME is the ORG name — which is also the
+      # image namespace.
+      # continue-on-error so a Hub failure can't suppress the digest summary
+      # for the already-pushed GHCR image; the fail-gate step below still
+      # fails the run afterwards.
+      - name: Push to Docker Hub
+        id: dockerhub
+        continue-on-error: true
+        env:
+          DOCKERHUB_USERNAME: ${{ secrets.DOCKERHUB_USERNAME }}
+          DOCKERHUB_TOKEN: ${{ secrets.DOCKERHUB_TOKEN }}
+        run: |
+          if [[ -z "${DOCKERHUB_USERNAME}" || -z "${DOCKERHUB_TOKEN}" ]]; then
+            echo "DOCKERHUB_* secrets not configured; skipping Docker Hub publish."
+            exit 0
+          fi
+          owner="${GITHUB_REPOSITORY_OWNER,,}"
+          ghcr_image="ghcr.io/${owner}/omnigraph-server"
+          hub_image="docker.io/${DOCKERHUB_USERNAME}/omnigraph-server"
+
+          echo "${DOCKERHUB_TOKEN}" \
+            | docker login docker.io --username "${DOCKERHUB_USERNAME}" --password-stdin
+
+          docker tag "${ghcr_image}:${RELEASE_TAG}" "${hub_image}:${RELEASE_TAG}"
+          docker push "${hub_image}:${RELEASE_TAG}"
+
+          # Same `latest` policy as GHCR: real tag pushes only, never backfills.
+          if [[ "${GITHUB_EVENT_NAME}" == "push" ]]; then
+            docker tag "${ghcr_image}:${RELEASE_TAG}" "${hub_image}:latest"
+            docker push "${hub_image}:latest"
+          fi
+
+      - name: Report pinned digests
+        env:
+          DOCKERHUB_USERNAME: ${{ secrets.DOCKERHUB_USERNAME }}
+        run: |
+          owner="${GITHUB_REPOSITORY_OWNER,,}"
+          {
+            echo "## Container image published"
+            echo
+            echo '```'
+            for image in "ghcr.io/${owner}/omnigraph-server" \
+                         ${DOCKERHUB_USERNAME:+"docker.io/${DOCKERHUB_USERNAME}/omnigraph-server"}; do
+              echo "${image}:${RELEASE_TAG}"
+              # RepoDigests may store Hub images with or without the
+              # docker.io/ prefix depending on the Docker version.
+              docker inspect --format='{{range .RepoDigests}}{{.}}{{"\n"}}{{end}}' \
+                "${image}:${RELEASE_TAG}" | grep -E "^(docker\.io/)?${image#docker.io/}@" || true
+            done
+            echo '```'
+            echo
+            echo "Pin deployments to the digest form."
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      # The summary above always runs; a Docker Hub failure still fails the
+      # run here so operators notice.
+      - name: Fail if Docker Hub push failed
+        if: steps.dockerhub.outcome == 'failure'
+        run: |
+          echo "Docker Hub push failed (GHCR image was pushed; see summary)." >&2
+          exit 1
