@@ -104,6 +104,28 @@ query insert_project($name: String) {
         )
         .await
         .expect("source write must use the token-bound post-apply catalog");
+    let project_before_indices = stale_handle
+        .snapshot_of(ReadTarget::branch("source"))
+        .await
+        .unwrap()
+        .entry("node:Project")
+        .unwrap()
+        .table_version;
+    stale_handle
+        .ensure_indices_on("source")
+        .await
+        .expect("index planning must use the same token-bound post-apply catalog");
+    let project_after_indices = stale_handle
+        .snapshot_of(ReadTarget::branch("source"))
+        .await
+        .unwrap()
+        .entry("node:Project")
+        .unwrap()
+        .table_version;
+    assert!(
+        project_after_indices > project_before_indices,
+        "the stale handle must discover and build Project's declared key index"
+    );
     assert_eq!(
         stale_handle
             .branch_merge("source", "target")
@@ -151,13 +173,12 @@ async fn stale_handle_branch_delete_gates_tables_added_by_schema_apply() {
     delete_rv.wait_until_reached().await;
 
     let index_handle = Arc::clone(&index_reconciler);
-    let mut index_task = tokio::spawn(async move { index_handle.ensure_indices_on("target").await });
-    let index_blocked = tokio::time::timeout(
-        std::time::Duration::from_millis(250),
-        &mut index_task,
-    )
-    .await
-    .is_err();
+    let mut index_task =
+        tokio::spawn(async move { index_handle.ensure_indices_on("target").await });
+    let index_blocked =
+        tokio::time::timeout(std::time::Duration::from_millis(250), &mut index_task)
+            .await
+            .is_err();
     delete_rv.release();
     assert!(
         index_blocked,
@@ -1099,9 +1120,10 @@ async fn apply_schema_defers_vector_index_on_empty_table() {
         body: String? @index\n    \
         embedding: Vector(8) @index\n\
         }\n";
-    let result = db.apply_schema(v2).await.expect(
-        "schema apply must succeed: an empty-table vector @index is deferred, not fatal",
-    );
+    let result = db
+        .apply_schema(v2)
+        .await
+        .expect("schema apply must succeed: an empty-table vector @index is deferred, not fatal");
     assert!(result.applied, "the scalar @index change must apply");
 
     // The deferred declarations are not dropped: after data arrives, the
@@ -1150,7 +1172,10 @@ async fn index_only_constraint_apply_touches_no_table_data() {
 
     // Add an @index on the existing `n` column.
     let v2 = "node Doc {\n    slug: String @key\n    n: I64 @index\n}\n";
-    let result = db.apply_schema(v2).await.expect("index-only apply must succeed");
+    let result = db
+        .apply_schema(v2)
+        .await
+        .expect("index-only apply must succeed");
     assert!(result.applied, "the @index addition must apply");
 
     let after = db

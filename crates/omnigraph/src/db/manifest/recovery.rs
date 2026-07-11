@@ -40,7 +40,7 @@ use tracing::warn;
 
 use crate::db::graph_coordinator::GraphCoordinator;
 use crate::db::recovery_audit::{RecoveryAudit, RecoveryAuditRecord, RecoveryKind, TableOutcome};
-use crate::db::schema_state::SchemaStateRecovery;
+use crate::db::schema_state::{SchemaStateRecovery, read_schema_state_identity};
 use crate::error::{OmniError, Result};
 use crate::storage::StorageAdapter;
 use crate::table_store::StagedTransactionIdentity;
@@ -55,7 +55,8 @@ use super::{
 };
 
 /// System actor identifier for recovery-owned lineage: legacy recovery,
-/// exact-protocol rollback, and orphan discard. A v3/v4 roll-forward
+/// exact-protocol rollback, schema-v6 EnsureIndices rollback, and orphan
+/// discard. A v3/v4 roll-forward
 /// deliberately publishes the original writer's fixed lineage and actor
 /// instead. The recovery audit row is the authoritative attribution surface in
 /// both cases; the original sidecar actor flows into its `recovery_for_actor`
@@ -63,9 +64,10 @@ use super::{
 pub(crate) const RECOVERY_ACTOR: &str = "omnigraph:recovery";
 
 /// Publish a recovery action's manifest `updates` AND its lineage in one CAS
-/// (RFC-013 Phase 7). Legacy recovery and v3/v4 rollback publish a recovery
-/// commit; v3/v4 roll-forward publishes the original writer's fixed lineage
-/// intent. The lineage (`graph_commit` + `graph_head`) rides the same
+/// (RFC-013 Phase 7). Legacy recovery and rollback publish a recovery commit;
+/// v3/v4 and v6 rollback reuse a pre-minted id, while v3/v4 roll-forward
+/// publishes the original writer's fixed lineage intent. The lineage
+/// (`graph_commit` + `graph_head`) rides the same
 /// merge-insert as the table-version re-pin — there is no separate
 /// `_graph_commits.lance` write and no manifest→commit-graph gap.
 /// `updates` is empty for the no-table-change recovery paths (all-NoMovement
@@ -102,6 +104,16 @@ async fn publish_recovery_commit(
                 .protocol_v4
                 .as_ref()
                 .map(|protocol| protocol.rollback_graph_commit_id.as_str())
+        })
+        .or_else(|| {
+            matches!(kind, RecoveryKind::RolledBack)
+                .then(|| {
+                    sidecar
+                        .ensure_indices_rollback_v6
+                        .as_ref()
+                        .map(|protocol| protocol.rollback_graph_commit_id.as_str())
+                })
+                .flatten()
         });
     let intent = match (exact_lineage, exact_rollback_id, kind) {
         (Some(lineage), _, RecoveryKind::RolledForward) => LineageIntent::from(lineage),
@@ -199,7 +211,16 @@ pub(crate) const RECOVERY_DIR_NAME: &str = "__recovery";
 /// effect or an explicit ref-only first-touch fork. Mutation/Load remain fixed
 /// at v3: raising the reader maximum must not silently enroll an existing writer
 /// in new semantics.
-pub(crate) const SIDECAR_SCHEMA_VERSION: u32 = 4;
+///
+/// v4 → v5: SchemaApply Phase-C confirmation. A v5 SchemaApply sidecar carries
+/// the target schema identity and a durable manifest-published marker so an
+/// empty table-pin set can distinguish pre-staging rollback from Phase-D delete
+/// residue. This is a narrow bridge, not the future exact table-effect adapter.
+///
+/// v5 → v6: EnsureIndices fixed rollback identity. Its physical effects still
+/// use the legacy loose classifier, but a pre-minted rollback commit id and a
+/// durably prepared audit payload make rollback re-entry outcome-exact.
+pub(crate) const SIDECAR_SCHEMA_VERSION: u32 = 6;
 
 /// Schema version emitted by the legacy constructor. Fixed at v2 so merely
 /// teaching this binary to understand v3 does not silently enroll every writer
@@ -223,6 +244,15 @@ pub(crate) const MUTATION_LOAD_SIDECAR_SCHEMA_VERSION: u32 = 3;
 
 /// Exact schema generation emitted by [`new_branch_merge_sidecar`].
 pub(crate) const BRANCH_MERGE_SIDECAR_SCHEMA_VERSION: u32 = 4;
+
+/// SchemaApply recovery generation with target identity + durable Phase-C
+/// confirmation. Its table classification remains legacy loose-match.
+pub(crate) const SCHEMA_APPLY_CONFIRMATION_SCHEMA_VERSION: u32 = 5;
+
+/// EnsureIndices generation with a fixed rollback outcome. This is narrower
+/// than an exact effect adapter: it makes compensation idempotent without
+/// claiming transaction-level ownership of the derived index commits.
+pub(crate) const ENSURE_INDICES_ROLLBACK_SCHEMA_VERSION: u32 = 6;
 
 /// Bound the cold-path transaction-history probes used by the v3/v4 exact
 /// recovery protocols. Normal v3 recovery reads one version and a v4 logical
@@ -598,6 +628,19 @@ pub(crate) struct RecoveryProtocolV4 {
     pub intended_delta: RecoveryManifestDelta,
 }
 
+/// Schema-v6 EnsureIndices rollback identity. EnsureIndices remains a
+/// loose-effect writer until its full RFC-022 adapter lands, but recovery must
+/// still be able to prove that a previously published compensation was a
+/// rollback rather than infer the outcome from aligned numeric table pins.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub(crate) struct RecoveryEnsureIndicesRollbackV6 {
+    pub rollback_graph_commit_id: String,
+    /// Bound before the first restore or rollback publish so a retry can replay
+    /// the original pre-compensation observations exactly.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub rollback_audit_outcomes: Option<Vec<TableOutcome>>,
+}
+
 /// In-memory representation of the on-disk JSON sidecar.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub(crate) struct RecoverySidecar {
@@ -632,12 +675,32 @@ pub(crate) struct RecoverySidecar {
     /// non-SchemaApply writers.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub tombstones: Vec<SidecarTombstone>,
+    /// SchemaApply-only Phase-C confirmation. A metadata/table-set-only apply
+    /// may have zero table pins, so table classification alone cannot
+    /// distinguish a pre-staging crash from a completed apply whose Phase-D
+    /// sidecar delete failed. The writer flips this marker durably immediately
+    /// after its manifest commit and before final schema-file promotion.
+    ///
+    /// Optional/default-false for backward compatibility. The full exact
+    /// SchemaApply adapter will replace this narrow confirmation with its
+    /// complete authority and intended-delta protocol.
+    #[serde(default)]
+    pub schema_apply_manifest_published: bool,
+    /// Hash of the schema contract this SchemaApply intends to promote. Paired
+    /// with `schema_apply_manifest_published` so recovery can distinguish a
+    /// completed final rename from missing/corrupt staging after Phase C.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub schema_apply_target_schema_ir_hash: Option<String>,
     /// RFC-022 exact-effect protocol. Absent for every v1/v2 sidecar.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub protocol_v3: Option<RecoveryProtocolV3>,
     /// RFC-022 BranchMerge protocol. Present only on schema-v4 sidecars.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub protocol_v4: Option<RecoveryProtocolV4>,
+    /// EnsureIndices-only fixed rollback identity. It does not make the
+    /// physical index effects exact; it only makes compensation retry-safe.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ensure_indices_rollback_v6: Option<RecoveryEnsureIndicesRollbackV6>,
 }
 
 /// Opaque handle returned by [`write_sidecar`] so the caller can delete
@@ -787,6 +850,45 @@ pub(crate) async fn write_sidecar(
         operation_id: sidecar.operation_id.clone(),
         sidecar_uri: uri,
     })
+}
+
+/// Durably confirm that a legacy SchemaApply sidecar's Phase-C manifest commit
+/// returned successfully. This marker is intentionally narrower than the exact
+/// v3/v4 protocols: it resolves the zero-table Phase-D ambiguity while the full
+/// SchemaApply adapter remains future work.
+pub(crate) async fn confirm_schema_apply_manifest_published(
+    root_uri: &str,
+    storage: &dyn StorageAdapter,
+    sidecar: &mut RecoverySidecar,
+) -> Result<()> {
+    if !matches!(sidecar.writer_kind, SidecarKind::SchemaApply) {
+        return Err(OmniError::manifest_internal(format!(
+            "schema publish confirmation requires SchemaApply sidecar, found {:?}",
+            sidecar.writer_kind,
+        )));
+    }
+    if sidecar.schema_version != SCHEMA_APPLY_CONFIRMATION_SCHEMA_VERSION {
+        return Err(OmniError::manifest_internal(format!(
+            "SchemaApply sidecar '{}' uses schema-v{}, expected schema-v{} confirmation",
+            sidecar.operation_id, sidecar.schema_version, SCHEMA_APPLY_CONFIRMATION_SCHEMA_VERSION,
+        )));
+    }
+    if sidecar.schema_apply_target_schema_ir_hash.is_none() {
+        return Err(OmniError::manifest_internal(format!(
+            "SchemaApply sidecar '{}' has no target schema identity to confirm",
+            sidecar.operation_id,
+        )));
+    }
+    crate::failpoints::maybe_fail(crate::failpoints::names::RECOVERY_SIDECAR_CONFIRM)?;
+    sidecar.schema_apply_manifest_published = true;
+    let uri = sidecar_uri(root_uri, &sidecar.operation_id);
+    validate_sidecar_shape(&uri, sidecar)?;
+    let json = serde_json::to_string_pretty(sidecar).map_err(|error| {
+        OmniError::manifest_internal(format!(
+            "failed to serialize SchemaApply recovery confirmation: {error}"
+        ))
+    })?;
+    storage.write_text(&uri, &json).await
 }
 
 /// Phase-B confirmation: stamp each pin with the exact Lance HEAD its publish
@@ -986,6 +1088,38 @@ fn validate_sidecar_shape(sidecar_uri: &str, sidecar: &RecoverySidecar) -> Resul
         ))
     };
 
+    let carries_schema_apply_confirmation = sidecar.schema_apply_manifest_published
+        || sidecar.schema_apply_target_schema_ir_hash.is_some();
+    if carries_schema_apply_confirmation
+        && sidecar.schema_version != SCHEMA_APPLY_CONFIRMATION_SCHEMA_VERSION
+    {
+        return Err(malformed(format!(
+            "SchemaApply confirmation fields require schema-v{}, found schema-v{}",
+            SCHEMA_APPLY_CONFIRMATION_SCHEMA_VERSION, sidecar.schema_version,
+        )));
+    }
+    if carries_schema_apply_confirmation && !matches!(sidecar.writer_kind, SidecarKind::SchemaApply)
+    {
+        return Err(malformed(
+            "SchemaApply confirmation fields are present on another writer kind".to_string(),
+        ));
+    }
+    if sidecar.schema_apply_manifest_published
+        && sidecar.schema_apply_target_schema_ir_hash.is_none()
+    {
+        return Err(malformed(
+            "SchemaApply manifest confirmation has no target schema identity".to_string(),
+        ));
+    }
+    if sidecar.ensure_indices_rollback_v6.is_some()
+        && sidecar.schema_version != ENSURE_INDICES_ROLLBACK_SCHEMA_VERSION
+    {
+        return Err(malformed(format!(
+            "EnsureIndices fixed rollback requires schema-v{}, found schema-v{}",
+            ENSURE_INDICES_ROLLBACK_SCHEMA_VERSION, sidecar.schema_version,
+        )));
+    }
+
     if sidecar.schema_version < EXACT_EFFECT_IDENTITY_SCHEMA_VERSION {
         if sidecar.protocol_v3.is_some() || sidecar.protocol_v4.is_some() {
             return Err(malformed(
@@ -997,6 +1131,34 @@ fn validate_sidecar_shape(sidecar_uri: &str, sidecar: &RecoverySidecar) -> Resul
 
     if sidecar.schema_version == BRANCH_MERGE_SIDECAR_SCHEMA_VERSION {
         return validate_branch_merge_v4_shape(sidecar_uri, sidecar);
+    }
+
+    if sidecar.schema_version == SCHEMA_APPLY_CONFIRMATION_SCHEMA_VERSION {
+        if !matches!(sidecar.writer_kind, SidecarKind::SchemaApply) {
+            return Err(malformed(format!(
+                "schema-v5 is reserved for SchemaApply, found {:?}",
+                sidecar.writer_kind,
+            )));
+        }
+        if sidecar.branch.is_some()
+            || sidecar.protocol_v3.is_some()
+            || sidecar.protocol_v4.is_some()
+        {
+            return Err(malformed(
+                "schema-v5 SchemaApply must target main and cannot carry v3/v4 protocols"
+                    .to_string(),
+            ));
+        }
+        if sidecar.schema_apply_target_schema_ir_hash.is_none() {
+            return Err(malformed(
+                "schema-v5 SchemaApply is missing its target schema identity".to_string(),
+            ));
+        }
+        return Ok(());
+    }
+
+    if sidecar.schema_version == ENSURE_INDICES_ROLLBACK_SCHEMA_VERSION {
+        return validate_ensure_indices_v6_shape(sidecar_uri, sidecar);
     }
 
     if sidecar.protocol_v4.is_some() {
@@ -1167,6 +1329,62 @@ fn validate_sidecar_shape(sidecar_uri: &str, sidecar: &RecoverySidecar) -> Resul
                     )));
                 }
             }
+        }
+    }
+    Ok(())
+}
+
+fn validate_ensure_indices_v6_shape(sidecar_uri: &str, sidecar: &RecoverySidecar) -> Result<()> {
+    let malformed = |reason: String| {
+        OmniError::manifest_internal(format!(
+            "recovery sidecar at '{}' has an invalid schema-v{} shape: {}",
+            sidecar_uri, sidecar.schema_version, reason
+        ))
+    };
+    if !matches!(sidecar.writer_kind, SidecarKind::EnsureIndices) {
+        return Err(malformed(format!(
+            "schema-v6 is reserved for EnsureIndices, found {:?}",
+            sidecar.writer_kind,
+        )));
+    }
+    if sidecar.protocol_v3.is_some()
+        || sidecar.protocol_v4.is_some()
+        || sidecar.merge_source_commit_id.is_some()
+        || !sidecar.additional_registrations.is_empty()
+        || !sidecar.tombstones.is_empty()
+    {
+        return Err(malformed(
+            "schema-v6 EnsureIndices cannot carry exact, merge, registration, or tombstone fields"
+                .to_string(),
+        ));
+    }
+    let protocol = sidecar.ensure_indices_rollback_v6.as_ref().ok_or_else(|| {
+        malformed("schema-v6 EnsureIndices is missing its fixed rollback payload".to_string())
+    })?;
+    if protocol.rollback_graph_commit_id.is_empty() {
+        return Err(malformed(
+            "schema-v6 EnsureIndices has an empty rollback commit id".to_string(),
+        ));
+    }
+    let pin_keys: HashSet<&str> = sidecar
+        .tables
+        .iter()
+        .map(|pin| pin.table_key.as_str())
+        .collect();
+    if sidecar.tables.is_empty() || pin_keys.len() != sidecar.tables.len() {
+        return Err(malformed(
+            "schema-v6 EnsureIndices requires unique non-empty table pins".to_string(),
+        ));
+    }
+    if let Some(outcomes) = protocol.rollback_audit_outcomes.as_ref() {
+        let outcome_keys: HashSet<&str> = outcomes
+            .iter()
+            .map(|outcome| outcome.table_key.as_str())
+            .collect();
+        if outcome_keys.len() != outcomes.len() || !outcome_keys.is_subset(&pin_keys) {
+            return Err(malformed(
+                "rollback audit outcomes must name a unique subset of table pins".to_string(),
+            ));
         }
     }
     Ok(())
@@ -2041,10 +2259,11 @@ pub(crate) fn schema_apply_serial_queue_key() -> crate::db::write_queue::TableQu
 /// state), or abort (invariant violation).
 ///
 /// Idempotency: a crash mid-sweep leaves the sidecar (deletion is the final
-/// step). v3 persists an exact rollback audit plan before restoring and uses a
+/// step). v3/v4 persist an ownership-exact rollback audit plan before restoring;
+/// schema-v6 EnsureIndices persists its loose-classifier plan. All three use a
 /// fixed rollback commit id, so re-entry resumes that outcome without another
-/// restore or synthetic commit. Legacy sidecars re-classify and may append an
-/// extra restore commit, which `omnigraph cleanup` reclaims.
+/// restore or synthetic commit. Older legacy sidecars re-classify and may append
+/// an extra restore commit, which `omnigraph cleanup` reclaims.
 ///
 /// Concurrency: a newly-opening handle is not yet published, but another handle
 /// for the same root may already be serving writes. Every handle obtains the
@@ -2166,6 +2385,11 @@ async fn process_sidecar(
             return finalize_visible_v3_outcome(root_uri, storage.as_ref(), sidecar, outcome).await;
         }
     }
+    if sidecar.ensure_indices_rollback_v6.is_some()
+        && detect_visible_ensure_indices_rollback(root_uri, sidecar).await?
+    {
+        return finalize_visible_ensure_indices_rollback(root_uri, storage.as_ref(), sidecar).await;
+    }
     let mut states = Vec::with_capacity(sidecar.tables.len());
     for pin in &sidecar.tables {
         let manifest_pinned = snapshot
@@ -2179,7 +2403,8 @@ async fn process_sidecar(
         // target ref not existing yet: that is the crash-before-fork state, not
         // storage corruption. Once effects are confirmed, a missing ref is
         // impossible and remains a loud error.
-        let unpublished_fork = sidecar.protocol_v3.is_some()
+        let unpublished_fork = (sidecar.protocol_v3.is_some()
+            || matches!(sidecar.writer_kind, SidecarKind::EnsureIndices))
             && pin
                 .table_branch
                 .as_deref()
@@ -2190,10 +2415,11 @@ async fn process_sidecar(
                 .map(|entry| entry.table_branch != pin.table_branch)
                 .unwrap_or(true);
         let allow_missing_target_ref = unpublished_fork
-            && sidecar
-                .protocol_v3
-                .as_ref()
-                .is_some_and(|protocol| protocol.effect_phase == RecoveryEffectPhase::Armed);
+            && (matches!(sidecar.writer_kind, SidecarKind::EnsureIndices)
+                || sidecar
+                    .protocol_v3
+                    .as_ref()
+                    .is_some_and(|protocol| protocol.effect_phase == RecoveryEffectPhase::Armed));
         let planned_effect = sidecar.protocol_v3.as_ref().and_then(|protocol| {
             protocol
                 .effects
@@ -2465,7 +2691,59 @@ async fn process_sidecar(
                 .iter()
                 .zip(states.iter())
                 .any(|(pin, state)| state.manifest_pinned > pin.expected_version);
+            if matches!(sidecar.writer_kind, SidecarKind::EnsureIndices)
+                && all_no_movement
+                && !any_pin_advanced
+            {
+                if matches!(mode, RecoveryMode::RollForwardOnly) {
+                    return Ok(false);
+                }
+                if matches!(
+                    cleanup_unpublished_no_effect_forks(
+                        root_uri,
+                        storage.as_ref(),
+                        sidecar,
+                        &states,
+                    )
+                    .await?,
+                    NoEffectForkCleanup::DeferredPathChild { .. }
+                ) {
+                    return Ok(false);
+                }
+                delete_sidecar_by_operation_id(root_uri, storage.as_ref(), &sidecar.operation_id)
+                    .await?;
+                return Ok(true);
+            }
             if all_no_movement && any_pin_advanced {
+                if matches!(sidecar.writer_kind, SidecarKind::SchemaApply)
+                    && sidecar.schema_version == SCHEMA_APPLY_CONFIRMATION_SCHEMA_VERSION
+                    && !schema_apply_target_identity_is_live(root_uri, storage.as_ref(), sidecar)
+                        .await?
+                {
+                    if sidecar.schema_apply_manifest_published {
+                        let message = format!(
+                            "SchemaApply sidecar '{}' is manifest-aligned, but the live schema \
+                             identity does not match its confirmed target",
+                            sidecar.operation_id,
+                        );
+                        return match mode {
+                            RecoveryMode::RollForwardOnly => {
+                                warn!(operation_id = sidecar.operation_id.as_str(), "{message}");
+                                Ok(false)
+                            }
+                            RecoveryMode::Full => Err(OmniError::manifest_internal(message)),
+                        };
+                    }
+                    // A marker-false v5 sidecar whose live schema is still the
+                    // old contract is a rollback (possibly recovery re-entry
+                    // after its rollback publish), never stale roll-forward.
+                    if matches!(mode, RecoveryMode::RollForwardOnly) {
+                        return Ok(false);
+                    }
+                    return roll_back_sidecar(root_uri, storage.as_ref(), sidecar, &states)
+                        .await
+                        .map(|()| true);
+                }
                 if sidecar.protocol_v3.is_some() {
                     // Fixed outcome ids were checked before table
                     // classification. Alignment without either id is not proof
@@ -2502,6 +2780,7 @@ async fn process_sidecar(
                     storage.as_ref(),
                     sidecar,
                     &states,
+                    snapshot,
                 )
                 .await
                 .map(|()| true);
@@ -2531,26 +2810,85 @@ async fn process_sidecar(
             if matches!(sidecar.writer_kind, SidecarKind::SchemaApply)
                 && !schema_state_recovery.completed_schema_apply_sidecar_rename()
             {
-                return match mode {
-                    RecoveryMode::Full => {
+                if sidecar.schema_version == SCHEMA_APPLY_CONFIRMATION_SCHEMA_VERSION {
+                    let target_is_live =
+                        schema_apply_target_identity_is_live(root_uri, storage.as_ref(), sidecar)
+                            .await?;
+                    if target_is_live && sidecar.schema_apply_manifest_published {
+                        // Phase C and final schema promotion both landed; only
+                        // audit/delete bookkeeping remains.
                         warn!(
                             operation_id = sidecar.operation_id.as_str(),
-                            "recovery: rolling back SchemaApply sidecar because schema staging \
-                             files were not promoted in this recovery pass"
+                            "recovery: cleaning up stale SchemaApply sidecar after its manifest \
+                             publish and schema promotion completed"
                         );
-                        roll_back_sidecar(root_uri, storage.as_ref(), sidecar, &states)
-                            .await
-                            .map(|()| true)
+                        return record_audit_recovery_rollforward(
+                            root_uri,
+                            storage.as_ref(),
+                            sidecar,
+                            &states,
+                            snapshot,
+                        )
+                        .await
+                        .map(|()| true);
                     }
-                    RecoveryMode::RollForwardOnly => {
-                        warn!(
-                            operation_id = sidecar.operation_id.as_str(),
-                            "recovery: deferring SchemaApply sidecar because schema staging files \
-                             were not promoted in this recovery pass"
+                    if target_is_live {
+                        // Recovery may have promoted staging and crashed before
+                        // processing the sidecar. Marker=false proves original
+                        // Phase C is not known to have landed, so fall through
+                        // to normal roll_forward_all to publish registrations,
+                        // tombstones, and table pins.
+                    } else if sidecar.schema_apply_manifest_published {
+                        let message = format!(
+                            "SchemaApply sidecar '{}' confirms manifest publish, but the live \
+                             schema identity does not match its target; refusing to guess whether \
+                             schema promotion completed",
+                            sidecar.operation_id,
                         );
-                        Ok(false)
+                        return match mode {
+                            RecoveryMode::RollForwardOnly => {
+                                warn!(operation_id = sidecar.operation_id.as_str(), "{message}");
+                                Ok(false)
+                            }
+                            RecoveryMode::Full => Err(OmniError::manifest_internal(message)),
+                        };
+                    } else {
+                        return match mode {
+                            RecoveryMode::Full => {
+                                warn!(
+                                    operation_id = sidecar.operation_id.as_str(),
+                                    "recovery: rolling back SchemaApply sidecar because schema \
+                                     staging was not promoted"
+                                );
+                                roll_back_sidecar(root_uri, storage.as_ref(), sidecar, &states)
+                                    .await
+                                    .map(|()| true)
+                            }
+                            RecoveryMode::RollForwardOnly => Ok(false),
+                        };
                     }
-                };
+                } else {
+                    return match mode {
+                        RecoveryMode::Full => {
+                            warn!(
+                                operation_id = sidecar.operation_id.as_str(),
+                                "recovery: rolling back SchemaApply sidecar because schema staging \
+                                 files were not promoted in this recovery pass"
+                            );
+                            roll_back_sidecar(root_uri, storage.as_ref(), sidecar, &states)
+                                .await
+                                .map(|()| true)
+                        }
+                        RecoveryMode::RollForwardOnly => {
+                            warn!(
+                                operation_id = sidecar.operation_id.as_str(),
+                                "recovery: deferring SchemaApply sidecar because schema staging \
+                                 files were not promoted in this recovery pass"
+                            );
+                            Ok(false)
+                        }
+                    };
+                }
             }
             warn!(
                 operation_id = sidecar.operation_id.as_str(),
@@ -2644,6 +2982,24 @@ async fn process_sidecar(
             Ok(true)
         }
     }
+}
+
+async fn schema_apply_target_identity_is_live(
+    root_uri: &str,
+    storage: &dyn StorageAdapter,
+    sidecar: &RecoverySidecar,
+) -> Result<bool> {
+    let target_hash = sidecar
+        .schema_apply_target_schema_ir_hash
+        .as_deref()
+        .ok_or_else(|| {
+            OmniError::manifest_internal(format!(
+                "SchemaApply sidecar '{}' has no target schema identity",
+                sidecar.operation_id,
+            ))
+        })?;
+    let live_schema = read_schema_state_identity(root_uri, storage).await?;
+    Ok(live_schema.schema_ir_hash == target_hash)
 }
 
 struct BranchMergeRefObservation {
@@ -3447,6 +3803,10 @@ fn has_exact_protocol(sidecar: &RecoverySidecar) -> bool {
     sidecar.protocol_v3.is_some() || sidecar.protocol_v4.is_some()
 }
 
+fn has_fixed_rollback_identity(sidecar: &RecoverySidecar) -> bool {
+    has_exact_protocol(sidecar) || sidecar.ensure_indices_rollback_v6.is_some()
+}
+
 fn v4_effect_for<'a>(
     sidecar: &'a RecoverySidecar,
     table_key: &str,
@@ -3466,7 +3826,8 @@ fn first_touch_fork_version(sidecar: &RecoverySidecar, pin: &SidecarTablePin) ->
 }
 
 /// Remove first-touch named-branch refs created by an Armed exact-protocol
-/// attempt that never completed this table's planned effect.
+/// attempt, or by the legacy EnsureIndices adapter, that never completed this
+/// table's planned effect.
 ///
 /// The sidecar is durable before the ref is created, so it is the ownership
 /// record while the manifest still inherits the table from another branch.
@@ -3483,13 +3844,23 @@ async fn cleanup_unpublished_no_effect_forks(
     sidecar: &RecoverySidecar,
     states: &[ClassifiedTable],
 ) -> Result<NoEffectForkCleanup> {
-    if !has_exact_protocol(sidecar) {
+    if !has_exact_protocol(sidecar) && !matches!(sidecar.writer_kind, SidecarKind::EnsureIndices) {
         return Ok(NoEffectForkCleanup::Complete);
     }
 
     let all_sidecars = list_sidecars(root_uri, storage).await?;
     for (pin, state) in sidecar.tables.iter().zip(states.iter()) {
         if !state.unpublished_fork || state.effect_ownership != EffectOwnership::None {
+            continue;
+        }
+        // Legacy EnsureIndices has no transaction-identity ownership signal.
+        // Its loose classifier can still prove the no-effect case exactly:
+        // only `NoMovement` is an untouched fork. A moved HEAD must flow into
+        // the normal derived-state rollback path; treating it as a no-effect
+        // ref would try to delete a ref past its fork point and wedge recovery.
+        if matches!(sidecar.writer_kind, SidecarKind::EnsureIndices)
+            && !matches!(state.classification, TableClassification::NoMovement)
+        {
             continue;
         }
         let Some(target_branch) = pin
@@ -3640,12 +4011,32 @@ fn exact_rollback_audit_outcomes(
         .collect()
 }
 
-/// Durably bind the exact audit payload for a v3/v4 rollback before the first
-/// restore or rollback publish. A retry must replay the original observation,
-/// not reconstruct it from post-restore HEADs. In particular, partial
-/// multi-table attempts omit untouched pins, and a preflight-rebased v3 effect
-/// records its actual `own_head -> current_manifest_pin` compensation.
-async fn prepare_exact_rollback_audit_plan(
+fn rollback_audit_outcomes_for_plan(
+    sidecar: &RecoverySidecar,
+    states: &[ClassifiedTable],
+) -> Vec<TableOutcome> {
+    if has_exact_protocol(sidecar) {
+        return exact_rollback_audit_outcomes(sidecar, states);
+    }
+    sidecar
+        .tables
+        .iter()
+        .zip(states.iter())
+        .filter(|(_, state)| table_requires_rollback_effect(state))
+        .map(|(pin, state)| TableOutcome {
+            table_key: pin.table_key.clone(),
+            from_version: state.lance_head,
+            to_version: state.manifest_pinned,
+        })
+        .collect()
+}
+
+/// Durably bind the audit payload for every fixed-identity rollback before the
+/// first restore or rollback publish. A retry must replay the original
+/// observation, not reconstruct it from post-restore HEADs. v3/v4 filter by
+/// exact ownership; schema-v6 EnsureIndices deliberately retains loose table
+/// classification while making only the rollback outcome exact.
+async fn prepare_fixed_rollback_audit_plan(
     root_uri: &str,
     storage: &dyn StorageAdapter,
     sidecar: &RecoverySidecar,
@@ -3662,26 +4053,34 @@ async fn prepare_exact_rollback_audit_plan(
                 .as_ref()
                 .and_then(|protocol| protocol.rollback_audit_outcomes.as_ref())
         })
+        .or_else(|| {
+            prepared
+                .ensure_indices_rollback_v6
+                .as_ref()
+                .and_then(|protocol| protocol.rollback_audit_outcomes.as_ref())
+        })
         .is_some();
     if already_prepared {
         return Ok(prepared);
     }
 
-    let outcomes = exact_rollback_audit_outcomes(sidecar, states);
+    let outcomes = rollback_audit_outcomes_for_plan(sidecar, states);
     if let Some(protocol) = prepared.protocol_v3.as_mut() {
         protocol.rollback_audit_outcomes = Some(outcomes);
     } else if let Some(protocol) = prepared.protocol_v4.as_mut() {
         protocol.rollback_audit_outcomes = Some(outcomes);
+    } else if let Some(protocol) = prepared.ensure_indices_rollback_v6.as_mut() {
+        protocol.rollback_audit_outcomes = Some(outcomes);
     } else {
         return Err(OmniError::manifest_internal(
-            "prepare_exact_rollback_audit_plan called for a legacy sidecar",
+            "prepare_fixed_rollback_audit_plan called without a fixed rollback identity",
         ));
     }
     let uri = sidecar_uri(root_uri, &prepared.operation_id);
     validate_sidecar_shape(&uri, &prepared)?;
     let json = serde_json::to_string_pretty(&prepared).map_err(|error| {
         OmniError::manifest_internal(format!(
-            "failed to serialize exact rollback audit plan for sidecar '{}': {}",
+            "failed to serialize fixed rollback audit plan for sidecar '{}': {}",
             prepared.operation_id, error
         ))
     })?;
@@ -3725,12 +4124,12 @@ async fn roll_back_sidecar(
     // longer has pre-restore table observations. Persist the exact audit plan
     // after fork cleanup and before the first restore so that path can replay it
     // without fabricating outcomes from pins.
-    let prepared_exact = if has_exact_protocol(sidecar) {
-        Some(prepare_exact_rollback_audit_plan(root_uri, storage, sidecar, states).await?)
+    let prepared_fixed = if has_fixed_rollback_identity(sidecar) {
+        Some(prepare_fixed_rollback_audit_plan(root_uri, storage, sidecar, states).await?)
     } else {
         None
     };
-    let sidecar = prepared_exact.as_ref().unwrap_or(sidecar);
+    let sidecar = prepared_fixed.as_ref().unwrap_or(sidecar);
 
     // Restore every drifted table (RolledPastExpected / UnexpectedAtP1 /
     // UnexpectedMultistep) to its manifest-pinned content, then PUBLISH so
@@ -3824,6 +4223,12 @@ async fn roll_back_sidecar(
                 .as_ref()
                 .and_then(|protocol| protocol.rollback_audit_outcomes.clone())
         })
+        .or_else(|| {
+            sidecar
+                .ensure_indices_rollback_v6
+                .as_ref()
+                .and_then(|protocol| protocol.rollback_audit_outcomes.clone())
+        })
         .unwrap_or(outcomes);
     record_audit(
         root_uri,
@@ -3856,8 +4261,9 @@ async fn record_audit_recovery_rollforward(
     storage: &dyn StorageAdapter,
     sidecar: &RecoverySidecar,
     states: &[ClassifiedTable],
+    snapshot: &Snapshot,
 ) -> Result<()> {
-    let outcomes: Vec<TableOutcome> = sidecar
+    let mut outcomes: Vec<TableOutcome> = sidecar
         .tables
         .iter()
         .zip(states.iter())
@@ -3867,6 +4273,16 @@ async fn record_audit_recovery_rollforward(
             to_version: state.manifest_pinned,
         })
         .collect();
+    for registration in &sidecar.additional_registrations {
+        outcomes.push(TableOutcome {
+            table_key: registration.table_key.clone(),
+            from_version: 0,
+            to_version: snapshot
+                .entry(&registration.table_key)
+                .map(|entry| entry.table_version)
+                .unwrap_or(0),
+        });
+    }
     // The substrate is already in the post-roll-forward state (the prior pass's
     // table re-pin landed), so there are no table `updates` — but a recovery
     // commit is still recorded for this cleanup pass via a lineage-only publish
@@ -3889,6 +4305,84 @@ async fn record_audit_recovery_rollforward(
     .await?;
     delete_sidecar_by_operation_id(root_uri, storage, &sidecar.operation_id).await?;
     Ok(())
+}
+
+/// A schema-v6 EnsureIndices sidecar has no fixed original/forward identity,
+/// but its rollback id is pre-minted before effects. Seeing that id in the
+/// authoritative lineage is therefore exact proof that compensation already
+/// published, even though the physical index effects remain loosely matched.
+async fn detect_visible_ensure_indices_rollback(
+    root_uri: &str,
+    sidecar: &RecoverySidecar,
+) -> Result<bool> {
+    let protocol = sidecar
+        .ensure_indices_rollback_v6
+        .as_ref()
+        .expect("caller checked ensure_indices_rollback_v6");
+    let (commits, _) =
+        ManifestCoordinator::read_graph_lineage_at(root_uri, sidecar.branch.as_deref()).await?;
+    let Some(commit) = commits
+        .iter()
+        .find(|commit| commit.graph_commit_id == protocol.rollback_graph_commit_id)
+    else {
+        return Ok(false);
+    };
+    let expected_branch = sidecar.branch.as_deref().filter(|branch| *branch != "main");
+    let expected_created_at = sidecar.started_at.parse::<i64>().map_err(|error| {
+        OmniError::manifest_internal(format!(
+            "EnsureIndices recovery sidecar '{}' has invalid started_at '{}': {}",
+            sidecar.operation_id, sidecar.started_at, error,
+        ))
+    })?;
+    if commit.manifest_branch.as_deref() != expected_branch
+        || commit.actor_id.as_deref() != Some(RECOVERY_ACTOR)
+        || commit.merged_parent_commit_id.is_some()
+        || commit.created_at != expected_created_at
+    {
+        return Err(OmniError::manifest_internal(format!(
+            "EnsureIndices recovery sidecar '{}' found rollback commit id '{}' with mismatched lineage",
+            sidecar.operation_id, protocol.rollback_graph_commit_id,
+        )));
+    }
+    Ok(true)
+}
+
+async fn finalize_visible_ensure_indices_rollback(
+    root_uri: &str,
+    storage: &dyn StorageAdapter,
+    sidecar: &RecoverySidecar,
+) -> Result<bool> {
+    let protocol = sidecar
+        .ensure_indices_rollback_v6
+        .as_ref()
+        .expect("caller checked ensure_indices_rollback_v6");
+    let outcomes = protocol.rollback_audit_outcomes.clone().ok_or_else(|| {
+        OmniError::manifest_internal(format!(
+            "EnsureIndices recovery sidecar '{}' has visible fixed rollback commit '{}' but no durable rollback audit outcomes",
+            sidecar.operation_id, protocol.rollback_graph_commit_id,
+        ))
+    })?;
+    let mut audit = RecoveryAudit::open(root_uri).await?;
+    let already_recorded = audit.list().await?.iter().any(|record| {
+        record.operation_id == sidecar.operation_id
+            && record.recovery_kind == RecoveryKind::RolledBack
+    });
+    if !already_recorded {
+        crate::failpoints::maybe_fail(crate::failpoints::names::RECOVERY_RECORD_AUDIT)?;
+        audit
+            .append(RecoveryAuditRecord {
+                graph_commit_id: protocol.rollback_graph_commit_id.clone(),
+                recovery_kind: RecoveryKind::RolledBack,
+                recovery_for_actor: sidecar.actor_id.clone(),
+                operation_id: sidecar.operation_id.clone(),
+                sidecar_writer_kind: format!("{:?}", sidecar.writer_kind),
+                per_table_outcomes: outcomes,
+                created_at: crate::db::now_micros()?,
+            })
+            .await?;
+    }
+    delete_sidecar_by_operation_id(root_uri, storage, &sidecar.operation_id).await?;
+    Ok(true)
 }
 
 /// Finalize an exact-protocol sidecar whose tables are already manifest-aligned.
@@ -4483,9 +4977,10 @@ async fn push_table_update(
 /// CAS as the table re-pin), so this only writes the `_graph_commit_recoveries`
 /// row, referencing that commit by `graph_commit_id`. A crash between the
 /// recovery publish and this audit append leaves a recovery commit with no audit
-/// row. For v3, re-entry detects the fixed original/rollback commit and replays
-/// its durable exact audit payload without minting another commit. Legacy
-/// sidecars retain their stale-sidecar cleanup behavior.
+/// row. v3/v4 re-entry detects the fixed original/rollback commit and replays
+/// its durable exact audit payload; schema-v6 EnsureIndices does the same for
+/// its fixed rollback outcome. Older legacy sidecars retain their stale-sidecar
+/// cleanup behavior.
 async fn record_audit(
     root_uri: &str,
     sidecar: &RecoverySidecar,
@@ -4703,9 +5198,29 @@ pub(crate) fn new_sidecar(
         merge_source_commit_id: None,
         additional_registrations: Vec::new(),
         tombstones: Vec::new(),
+        schema_apply_manifest_published: false,
+        schema_apply_target_schema_ir_hash: None,
         protocol_v3: None,
         protocol_v4: None,
+        ensure_indices_rollback_v6: None,
     }
+}
+
+/// Arm the narrow schema-v6 EnsureIndices recovery bridge. Index effects still
+/// use the legacy loose classifier, but compensation gets a stable lineage id
+/// so a crash after rollback publish cannot be misread as roll-forward.
+pub(crate) fn new_ensure_indices_sidecar(
+    branch: Option<String>,
+    tables: Vec<SidecarTablePin>,
+) -> Result<RecoverySidecar> {
+    let mut sidecar = new_sidecar(SidecarKind::EnsureIndices, branch, None, tables);
+    sidecar.schema_version = ENSURE_INDICES_ROLLBACK_SCHEMA_VERSION;
+    sidecar.ensure_indices_rollback_v6 = Some(RecoveryEnsureIndicesRollbackV6 {
+        rollback_graph_commit_id: ulid::Ulid::new().to_string(),
+        rollback_audit_outcomes: None,
+    });
+    validate_sidecar_shape("<new-ensure-indices-sidecar>", &sidecar)?;
+    Ok(sidecar)
 }
 
 /// Arm an RFC-022 mutation/load recovery sidecar.
@@ -4779,6 +5294,8 @@ pub(crate) fn new_occ_sidecar(
         merge_source_commit_id: None,
         additional_registrations: Vec::new(),
         tombstones: Vec::new(),
+        schema_apply_manifest_published: false,
+        schema_apply_target_schema_ir_hash: None,
         protocol_v3: Some(RecoveryProtocolV3 {
             authority,
             lineage,
@@ -4793,6 +5310,7 @@ pub(crate) fn new_occ_sidecar(
             },
         }),
         protocol_v4: None,
+        ensure_indices_rollback_v6: None,
     };
     validate_sidecar_shape("<new-occ-sidecar>", &sidecar)?;
     Ok(sidecar)
@@ -4963,6 +5481,8 @@ pub(crate) fn new_branch_merge_sidecar(
         merge_source_commit_id: None,
         additional_registrations: Vec::new(),
         tombstones: Vec::new(),
+        schema_apply_manifest_published: false,
+        schema_apply_target_schema_ir_hash: None,
         protocol_v3: None,
         protocol_v4: Some(RecoveryProtocolV4 {
             authority,
@@ -4973,6 +5493,7 @@ pub(crate) fn new_branch_merge_sidecar(
             effects,
             intended_delta,
         }),
+        ensure_indices_rollback_v6: None,
     };
     validate_sidecar_shape("<new-branch-merge-sidecar>", &sidecar)?;
     Ok(sidecar)
@@ -5314,6 +5835,63 @@ mod tests {
         assert_eq!(parsed.actor_id.as_deref(), Some("act-alice"));
         assert_eq!(parsed.tables.len(), 1);
         assert_eq!(parsed.tables[0].table_key, "node:Person");
+    }
+
+    #[test]
+    fn schema_apply_confirmation_fields_are_version_gated() {
+        let legacy = new_sidecar(SidecarKind::SchemaApply, None, None, Vec::new());
+        let legacy_json = serde_json::to_string(&legacy).unwrap();
+        parse_sidecar("file:///tmp/__recovery/legacy-schema.json", &legacy_json)
+            .expect("plain schema-v2 SchemaApply remains readable");
+
+        let mut wrong_version = legacy.clone();
+        wrong_version.schema_apply_target_schema_ir_hash = Some("target-hash".to_string());
+        let wrong_json = serde_json::to_string(&wrong_version).unwrap();
+        let error = parse_sidecar(
+            "file:///tmp/__recovery/wrong-version-schema.json",
+            &wrong_json,
+        )
+        .expect_err("schema-v2 must not opt into schema-v5 confirmation semantics");
+        assert!(error.to_string().contains("require schema-v5"));
+
+        wrong_version.schema_version = SCHEMA_APPLY_CONFIRMATION_SCHEMA_VERSION;
+        let v5_json = serde_json::to_string(&wrong_version).unwrap();
+        parse_sidecar("file:///tmp/__recovery/schema-v5.json", &v5_json)
+            .expect("schema-v5 accepts a target identity before Phase C confirmation");
+    }
+
+    #[test]
+    fn ensure_indices_fixed_rollback_is_version_gated() {
+        let pin = make_pin("node:Person", "file:///tmp/people.lance", 5, 6);
+        let legacy = new_sidecar(
+            SidecarKind::EnsureIndices,
+            Some("feature".to_string()),
+            None,
+            vec![pin.clone()],
+        );
+        let legacy_json = serde_json::to_string(&legacy).unwrap();
+        parse_sidecar("file:///tmp/__recovery/legacy-index.json", &legacy_json)
+            .expect("plain schema-v2 EnsureIndices remains readable");
+
+        let current = new_ensure_indices_sidecar(Some("feature".to_string()), vec![pin]).unwrap();
+        assert_eq!(
+            current.schema_version,
+            ENSURE_INDICES_ROLLBACK_SCHEMA_VERSION
+        );
+        assert!(current.ensure_indices_rollback_v6.is_some());
+        let current_json = serde_json::to_string(&current).unwrap();
+        parse_sidecar("file:///tmp/__recovery/index-v6.json", &current_json)
+            .expect("schema-v6 accepts the fixed rollback payload");
+
+        let mut wrong_version = current;
+        wrong_version.schema_version = LEGACY_SIDECAR_SCHEMA_VERSION;
+        let wrong_json = serde_json::to_string(&wrong_version).unwrap();
+        let error = parse_sidecar(
+            "file:///tmp/__recovery/wrong-version-index.json",
+            &wrong_json,
+        )
+        .expect_err("schema-v2 must not opt into schema-v6 rollback semantics");
+        assert!(error.to_string().contains("requires schema-v6"));
     }
 
     #[test]

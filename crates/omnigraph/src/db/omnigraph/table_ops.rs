@@ -84,25 +84,36 @@ pub(super) async fn ensure_indices_for_branch(
     db: &Omnigraph,
     branch: Option<&str>,
 ) -> Result<Vec<PendingIndex>> {
-    db.ensure_schema_state_valid().await?;
     db.ensure_schema_apply_idle("ensure_indices").await?;
-    let resolved = db.resolved_branch_target(branch).await?;
-    let snapshot = resolved.snapshot;
+    // Capture one coherent branch/schema authority for both index-work planning
+    // and the eventual effects. A long-lived handle's ArcSwap catalog can lag a
+    // schema apply performed through another handle; `WriteTxn::catalog` is built
+    // from the exact accepted IR whose identity is rechecked under the final
+    // gates below.
+    let txn = db.open_write_txn(branch).await?;
+    let snapshot = txn.base.clone();
     let mut updates = Vec::new();
-    let mut pending = Vec::new();
-    let active_branch = resolved.branch;
-    let catalog = db.catalog();
+    let mut pending_by_table = HashMap::<String, Vec<PendingIndex>>::new();
+    let active_branch = txn.branch.clone();
+    let catalog = Arc::clone(&txn.catalog);
 
     // Recovery sidecar: protect the per-table commit_staged loop in
-    // build_indices_on_dataset (one commit per index built). Only pins
-    // tables that ACTUALLY need index work — the classifier
-    // loose-matches for SidecarKind::EnsureIndices (the actual N
-    // depends on which indices are missing), but if a table needs zero
-    // commits and gets pinned, the all-or-nothing decision rule
-    // classifies it as `NoMovement` and rolls back legitimately-
-    // committed work on sibling tables. Steady-state runs (everything
-    // already indexed) skip the sidecar entirely.
+    // build_indices_on_dataset (one commit per index built). Only tables with
+    // actual index work enter the durable plan. In particular, a child branch
+    // does not first-touch/fork an inherited table merely to discover there is
+    // nothing to build: lazy inheritance remains the cheaper physical shape and
+    // avoids manufacturing a ref-only effect that the legacy loose sidecar
+    // cannot distinguish from an already-published pointer update.
     let mut recovery_pins: Vec<crate::db::manifest::SidecarTablePin> = Vec::new();
+    // Existing target refs are opened once during planning, verified against
+    // their live HEAD under the final gates, and then reused for the effect.
+    // Reopening after the pre-arm check would recreate a TOCTOU window. Deferred
+    // first-touch refs are intentionally absent here: their target ref may only
+    // be created after the sidecar is durable.
+    let mut existing_targets =
+        std::collections::HashMap::<String, crate::storage_layer::SnapshotHandle>::new();
+    let mut first_touch_sources =
+        std::collections::HashMap::<String, crate::storage_layer::SnapshotHandle>::new();
     for type_name in catalog.node_types.keys() {
         let table_key = format!("node:{}", type_name);
         let Some(entry) = snapshot.entry(&table_key) else {
@@ -118,9 +129,22 @@ pub(super) async fn ensure_indices_for_branch(
             continue;
         }
         let full_path = format!("{}/{}", db.root_uri, entry.table_path);
-        if needs_index_work_node(db, type_name, &full_path, entry.table_branch.as_deref()).await? {
+        let first_touch =
+            active_branch.is_some() && entry.table_branch.as_deref() != active_branch.as_deref();
+        let ds = if first_touch {
+            // The inherited owner's HEAD may advance independently after this
+            // graph branch was cut. Plan from the exact inherited snapshot, not
+            // from that owner's current HEAD.
+            db.storage().open_snapshot_at_entry(entry).await?
+        } else {
+            db.storage()
+                .open_dataset_head(&full_path, active_branch.as_deref())
+                .await?
+        };
+        let work = plan_index_work_node(db, &catalog, type_name, &table_key, &ds).await?;
+        if work.needs_commit {
             recovery_pins.push(crate::db::manifest::SidecarTablePin {
-                table_key,
+                table_key: table_key.clone(),
                 table_path: full_path,
                 expected_version: entry.table_version,
                 post_commit_pin: entry.table_version + 1,
@@ -135,6 +159,16 @@ pub(super) async fn ensure_indices_for_branch(
                 // open_lance_head must check the same branch.
                 table_branch: active_branch.clone(),
             });
+            if !first_touch {
+                existing_targets.insert(table_key, ds);
+            } else {
+                first_touch_sources.insert(table_key, ds);
+            }
+        } else {
+            // Preserve the operator-facing pending status for an untrainable
+            // Vector column without invoking the mutating builder on a table
+            // that is absent from the durable effect plan.
+            pending_by_table.insert(table_key, work.pending);
         }
     }
     for edge_name in catalog.edge_types.keys() {
@@ -146,9 +180,18 @@ pub(super) async fn ensure_indices_for_branch(
             continue;
         }
         let full_path = format!("{}/{}", db.root_uri, entry.table_path);
-        if needs_index_work_edge(db, &full_path, entry.table_branch.as_deref()).await? {
+        let first_touch =
+            active_branch.is_some() && entry.table_branch.as_deref() != active_branch.as_deref();
+        let ds = if first_touch {
+            db.storage().open_snapshot_at_entry(entry).await?
+        } else {
+            db.storage()
+                .open_dataset_head(&full_path, active_branch.as_deref())
+                .await?
+        };
+        if needs_index_work_edge_on_dataset(db, &ds).await? {
             recovery_pins.push(crate::db::manifest::SidecarTablePin {
-                table_key,
+                table_key: table_key.clone(),
                 table_path: full_path,
                 expected_version: entry.table_version,
                 post_commit_pin: entry.table_version + 1,
@@ -163,6 +206,11 @@ pub(super) async fn ensure_indices_for_branch(
                 // open_lance_head must check the same branch.
                 table_branch: active_branch.clone(),
             });
+            if !first_touch {
+                existing_targets.insert(table_key, ds);
+            } else {
+                first_touch_sources.insert(table_key, ds);
+            }
         }
     }
     // Acquire per-(table_key, active_branch) queues for every table
@@ -175,82 +223,135 @@ pub(super) async fn ensure_indices_for_branch(
         .iter()
         .map(|pin| (pin.table_key.clone(), pin.table_branch.clone()))
         .collect();
+    // Match the RFC-022/recovery total order: schema -> active branch -> sorted
+    // affected tables. Planning above is deliberately outside these gates; all
+    // authority and physical baselines are rechecked after waiting and before
+    // our sidecar or any target ref/table effect exists.
+    let _schema_guard = db
+        .write_queue()
+        .acquire(&crate::db::manifest::schema_apply_serial_queue_key())
+        .await;
+    let _branch_guard = db
+        .write_queue()
+        .acquire_branch(active_branch.as_deref())
+        .await;
     let _queue_guards = db.write_queue().acquire_many(&queue_keys).await;
+
+    db.ensure_no_pending_recovery_sidecars_under_gates(
+        &[active_branch.as_deref()],
+        "ensure_indices",
+    )
+    .await?;
+    let live_snapshot = db.revalidate_write_txn(&txn).await?;
+
+    for pin in &recovery_pins {
+        let prepared_entry = snapshot.entry(&pin.table_key).ok_or_else(|| {
+            OmniError::manifest_conflict(format!(
+                "table '{}' disappeared from the prepared index plan",
+                pin.table_key,
+            ))
+        })?;
+        let live_entry = live_snapshot.entry(&pin.table_key).ok_or_else(|| {
+            OmniError::manifest_read_set_changed(
+                format!("table_head:{}", pin.table_key),
+                Some(pin.expected_version.to_string()),
+                None,
+            )
+        })?;
+        if live_entry.table_version != pin.expected_version
+            || live_entry.table_path != prepared_entry.table_path
+            || live_entry.table_branch != prepared_entry.table_branch
+        {
+            return Err(OmniError::manifest_read_set_changed(
+                format!("table_head:{}", pin.table_key),
+                Some(format!(
+                    "{}:{}:{}",
+                    prepared_entry.table_path,
+                    prepared_entry.table_branch.as_deref().unwrap_or("main"),
+                    pin.expected_version,
+                )),
+                Some(format!(
+                    "{}:{}:{}",
+                    live_entry.table_path,
+                    live_entry.table_branch.as_deref().unwrap_or("main"),
+                    live_entry.table_version,
+                )),
+            ));
+        }
+
+        // First-touch target refs do not exist yet and remain governed by the
+        // existing sidecar-before-fork classifier below. Existing refs must be
+        // exactly at the logical manifest pin before this writer may claim any
+        // subsequent physical movement.
+        if let Some(ds) = existing_targets.get(&pin.table_key) {
+            db.ensure_existing_effect_baseline(
+                &pin.table_key,
+                pin.table_branch.as_deref(),
+                pin.expected_version,
+                ds,
+            )
+            .await?;
+        } else if let Some(source) = first_touch_sources.get(&pin.table_key) {
+            let target_branch = active_branch.as_deref().ok_or_else(|| {
+                OmniError::manifest_internal(format!(
+                    "first-touch index target '{}' has no active named branch",
+                    pin.table_key,
+                ))
+            })?;
+            let branches = source
+                .dataset()
+                .list_branches()
+                .await
+                .map_err(|error| OmniError::Lance(error.to_string()))?;
+            if branches.contains_key(target_branch) {
+                return Err(OmniError::manifest_conflict(format!(
+                    "index target ref '{}:{}' already exists while the graph manifest still \
+                     inherits the table from another branch; refusing to claim unowned \
+                     physical state — inspect and remove the orphaned ref before retrying",
+                    pin.table_key, target_branch,
+                )));
+            }
+        }
+    }
 
     let recovery_handle = if recovery_pins.is_empty() {
         None
     } else {
-        let sidecar = crate::db::manifest::new_sidecar(
-            crate::db::manifest::SidecarKind::EnsureIndices,
+        // `ensure_indices` doesn't currently take an actor; recovery remains
+        // system-attributed. Schema-v6 pre-mints the rollback outcome so an
+        // interrupted compensation cannot later be mislabeled as roll-forward.
+        // Future: add `ensure_indices_as` to thread actor context.
+        let sidecar = crate::db::manifest::new_ensure_indices_sidecar(
             active_branch.clone(),
-            // `ensure_indices` doesn't currently take an actor; system-attributed.
-            // Future: add `ensure_indices_as` to thread actor context.
-            None,
-            recovery_pins,
-        );
+            recovery_pins.clone(),
+        )?;
         Some(
             crate::db::manifest::write_sidecar(db.root_uri(), db.storage_adapter(), &sidecar)
                 .await?,
         )
     };
 
-    for type_name in catalog.node_types.keys() {
-        let table_key = format!("node:{}", type_name);
-        let Some(entry) = snapshot.entry(&table_key) else {
-            continue;
-        };
-        let full_path = format!("{}/{}", db.root_uri, entry.table_path);
-        let (mut ds, resolved_branch) = match active_branch.as_deref() {
-            Some(active_branch) => match entry.table_branch.as_deref() {
-                None => continue,
-                _ => {
-                    open_owned_dataset_for_branch_write(
-                        db,
-                        &table_key,
-                        &full_path,
-                        entry.table_branch.as_deref(),
-                        entry.table_version,
-                        active_branch,
-                        crate::db::MutationOpKind::SchemaRewrite,
-                        false,
-                    )
-                    .await?
-                }
-            },
-            None => (
-                db.storage().open_dataset_head(&full_path, None).await?,
-                None,
-            ),
-        };
-        let row_count = db.storage().count_rows(&ds, None).await.unwrap_or(0);
-        if row_count > 0 {
-            pending.extend(build_indices_on_dataset(db, &table_key, &mut ds).await?);
-        }
-
-        let state = db.storage().table_state(&full_path, &ds).await?;
-        if state.version != entry.table_version
-            || resolved_branch.as_deref() != entry.table_branch.as_deref()
-        {
-            updates.push(crate::db::SubTableUpdate {
-                table_key,
-                table_version: state.version,
-                table_branch: resolved_branch,
-                row_count: state.row_count,
-                version_metadata: state.version_metadata,
-            });
-        }
+    if recovery_handle.is_some() && !first_touch_sources.is_empty() {
+        crate::failpoints::maybe_fail(
+            crate::failpoints::names::ENSURE_INDICES_POST_SIDECAR_PRE_FORK,
+        )?;
     }
 
-    for edge_name in catalog.edge_types.keys() {
-        let table_key = format!("edge:{}", edge_name);
-        let Some(entry) = snapshot.entry(&table_key) else {
-            continue;
-        };
-        let full_path = format!("{}/{}", db.root_uri, entry.table_path);
+    // Execute exactly the keys named in the durable effect plan. Visiting every
+    // catalog table here would let a stale no-work observation become an
+    // unpinned commit if physical state changed after planning.
+    for pin in &recovery_pins {
+        let table_key = pin.table_key.clone();
+        let entry = snapshot
+            .entry(&table_key)
+            .ok_or_else(|| OmniError::manifest(format!("no manifest entry for {}", table_key)))?;
+        let full_path = pin.table_path.clone();
         let (mut ds, resolved_branch) = match active_branch.as_deref() {
-            Some(active_branch) => match entry.table_branch.as_deref() {
-                None => continue,
-                _ => {
+            Some(active_branch) => {
+                if let Some(ds) = existing_targets.remove(&table_key) {
+                    (ds, Some(active_branch.to_string()))
+                } else {
+                    first_touch_sources.remove(&table_key);
                     open_owned_dataset_for_branch_write(
                         db,
                         &table_key,
@@ -263,15 +364,22 @@ pub(super) async fn ensure_indices_for_branch(
                     )
                     .await?
                 }
-            },
+            }
             None => (
-                db.storage().open_dataset_head(&full_path, None).await?,
+                existing_targets.remove(&table_key).ok_or_else(|| {
+                    OmniError::manifest_internal(format!(
+                        "missing verified existing target for main table '{}'",
+                        table_key,
+                    ))
+                })?,
                 None,
             ),
         };
-        let row_count = db.storage().count_rows(&ds, None).await.unwrap_or(0);
+        let row_count = db.storage().count_rows(&ds, None).await?;
         if row_count > 0 {
-            pending.extend(build_indices_on_dataset(db, &table_key, &mut ds).await?);
+            let table_pending =
+                build_indices_on_dataset_for_catalog(db, &catalog, &table_key, &mut ds).await?;
+            pending_by_table.insert(table_key.clone(), table_pending);
         }
 
         let state = db.storage().table_state(&full_path, &ds).await?;
@@ -286,6 +394,7 @@ pub(super) async fn ensure_indices_for_branch(
                 version_metadata: state.version_metadata,
             });
         }
+        crate::failpoints::maybe_fail(crate::failpoints::names::ENSURE_INDICES_POST_TABLE_EFFECT)?;
     }
 
     // Failpoint: pin the per-writer Phase B → Phase C residual for
@@ -315,6 +424,14 @@ pub(super) async fn ensure_indices_for_branch(
         }
     }
 
+    // Preserve the historical, observable catalog order even though planning
+    // and physical effects now happen in separate phases.
+    let mut pending = Vec::new();
+    for type_name in catalog.node_types.keys() {
+        if let Some(mut table_pending) = pending_by_table.remove(&format!("node:{type_name}")) {
+            pending.append(&mut table_pending);
+        }
+    }
     Ok(pending)
 }
 
@@ -394,32 +511,33 @@ async fn vector_column_trainable(
 /// (DateTime/Date/numeric/Bool), FTS for free-text Strings, or a Vector index.
 /// Edges get BTree only (id, src, dst). This helper and the builder share
 /// `node_prop_index_kind` so they cannot drift — see its doc comment.
-pub(super) async fn needs_index_work_node(
+#[derive(Default)]
+struct PlannedIndexWork {
+    needs_commit: bool,
+    pending: Vec<PendingIndex>,
+}
+
+/// Classify index work against one already-selected dataset snapshot and one
+/// operation-local accepted catalog. Keeping the opener outside this helper is
+/// load-bearing for named-branch first touch: an inherited graph entry must be
+/// checked at its exact pinned version, not at the inherited owner's newer HEAD.
+async fn plan_index_work_node(
     db: &Omnigraph,
+    catalog: &Catalog,
     type_name: &str,
-    full_path: &str,
-    table_branch: Option<&str>,
-) -> Result<bool> {
-    let ds = db
-        .storage()
-        .open_dataset_head(full_path, table_branch)
-        .await?;
-    // Empty tables are skipped by the ensure_indices loop, so they must
-    // not be pinned in the sidecar — pinning a table that produces zero
-    // commits classifies as NoMovement on recovery and forces all-or-
-    // nothing rollback of sibling tables' legitimate index work.
-    // Errors from count_rows are propagated: silently treating them as
-    // "0 rows" risks skipping a table that is actually about to be
-    // modified.
-    if db.storage().count_rows(&ds, None).await? == 0 {
-        return Ok(false);
+    table_key: &str,
+    ds: &SnapshotHandle,
+) -> Result<PlannedIndexWork> {
+    if db.storage().count_rows(ds, None).await? == 0 {
+        return Ok(PlannedIndexWork::default());
     }
-    if !db.storage().has_btree_index(&ds, "id").await? {
-        return Ok(true);
-    }
-    let catalog = db.catalog();
+
+    let mut work = PlannedIndexWork {
+        needs_commit: !db.storage().has_btree_index(ds, "id").await?,
+        pending: Vec::new(),
+    };
     let Some(node_type) = catalog.node_types.get(type_name) else {
-        return Ok(false);
+        return Ok(work);
     };
     for index_cols in &node_type.indices {
         if index_cols.len() != 1 {
@@ -431,31 +549,46 @@ pub(super) async fn needs_index_work_node(
         };
         match node_prop_index_kind(prop_type) {
             Some(NodePropIndexKind::Fts) => {
-                if !db.storage().has_fts_index(&ds, prop_name).await? {
-                    return Ok(true);
-                }
+                work.needs_commit |= !db.storage().has_fts_index(ds, prop_name).await?;
             }
             Some(NodePropIndexKind::Vector) => {
-                // Only count a missing vector index as buildable *work* when the
-                // column is trainable (>=1 non-null vector). An untrainable
-                // column would defer in the build and commit nothing; pinning it
-                // for recovery would be a zero-commit pin that classifies
-                // NoMovement and rolls back a sibling table's index work.
-                if !db.storage().has_vector_index(&ds, prop_name).await?
-                    && vector_column_trainable(db, &ds, prop_name).await?
-                {
-                    return Ok(true);
+                if !db.storage().has_vector_index(ds, prop_name).await? {
+                    if vector_column_trainable(db, ds, prop_name).await? {
+                        work.needs_commit = true;
+                    } else {
+                        work.pending.push(PendingIndex {
+                            table_key: table_key.to_string(),
+                            column: prop_name.clone(),
+                            reason: "column has no non-null vectors to train on yet".to_string(),
+                        });
+                    }
                 }
             }
             Some(NodePropIndexKind::Btree) => {
-                if !db.storage().has_btree_index(&ds, prop_name).await? {
-                    return Ok(true);
-                }
+                work.needs_commit |= !db.storage().has_btree_index(ds, prop_name).await?;
             }
             None => {}
         }
     }
-    Ok(false)
+    Ok(work)
+}
+
+pub(super) async fn needs_index_work_node(
+    db: &Omnigraph,
+    type_name: &str,
+    full_path: &str,
+    table_branch: Option<&str>,
+) -> Result<bool> {
+    let ds = db
+        .storage()
+        .open_dataset_head(full_path, table_branch)
+        .await?;
+    let catalog = db.catalog();
+    Ok(
+        plan_index_work_node(db, &catalog, type_name, &format!("node:{type_name}"), &ds)
+            .await?
+            .needs_commit,
+    )
 }
 
 /// Companion to `needs_index_work_node` for edge tables.
@@ -477,6 +610,10 @@ pub(super) async fn needs_index_work_edge(
         .storage()
         .open_dataset_head(full_path, table_branch)
         .await?;
+    needs_index_work_edge_on_dataset(db, &ds).await
+}
+
+async fn needs_index_work_edge_on_dataset(db: &Omnigraph, ds: &SnapshotHandle) -> Result<bool> {
     if db.storage().count_rows(&ds, None).await? == 0 {
         return Ok(false);
     }
@@ -1455,8 +1592,7 @@ pub(super) async fn commit_updates(
         .await
         .current_branch()
         .map(str::to_string);
-    let prepared =
-        prepare_updates_for_commit(db, current_branch.as_deref(), updates, None).await?;
+    let prepared = prepare_updates_for_commit(db, current_branch.as_deref(), updates, None).await?;
     commit_prepared_updates(db, &prepared, None).await
 }
 

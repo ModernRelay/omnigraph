@@ -322,6 +322,15 @@ cross-process lock and must not substitute for a target read set.
 With all gates held, the coordinator loads fresh authority state and compares every
 member of `ReadSet`.
 
+Revalidation also proves the physical pre-state that the new recovery intent would
+claim. For every existing table ref in the effect envelope, live Lance `HEAD` must
+equal the prepared manifest pin. `HEAD < pin` is an internal invariant failure;
+`HEAD > pin` belongs either to an already-durable recovery intent or to uncovered
+drift that requires explicit repair. The attempt must reject that state **before**
+writing its own sidecar; a new sidecar may never retroactively claim a pre-existing
+physical effect. A first-touch ref is the deliberate exception: it does not exist at
+this point and follows the sidecar-before-ref protocol in §4.3 instead.
+
 - If all members match, the attempt may arm recovery.
 - If any member differs, no physical effect may run. The attempt releases its gates,
   discards staged state, and restarts from Prepare.
@@ -471,6 +480,15 @@ able to enumerate every adapter and every entry point that invokes it.
 - Include accepted schema identity and every affected table in `ReadSet`.
 - Cover schema staging-file promotion, data-table schema/field-metadata commits,
   registrations, tombstones, and final schema identity with one recovery intent.
+- A non-noop schema change still needs that recovery intent when it has no table
+  effects: schema-contract staging and promotion are independently durable state,
+  so an empty table-pin set means “metadata-only SchemaApply,” not “effect-free.”
+- Until SchemaApply receives the full exact adapter, its schema-v5 bridge records
+  the target schema identity at arm time and durably confirms Phase C before final
+  schema-file promotion. Recovery may classify an empty-pin Phase-D residue as
+  completed only when both that confirmation and the live target identity match;
+  numeric manifest movement alone is not an outcome discriminator because a
+  rollback recovery commit also advances the manifest.
 - Write the sidecar before the first table HEAD advance, including unenforced-PK
   metadata backfill or other inline metadata commits.
 - A branch-wide or graph-wide migration must enumerate every physical manifest/data
@@ -482,6 +500,14 @@ able to enumerate every adapter and every entry point that invokes it.
 - It records the exact achieved version rather than assuming one version of movement.
 - If the new data-table version is selected through `__manifest`, publishing that
   pointer is a graph-visible commit and uses this protocol.
+- Until EnsureIndices receives its full exact effect adapter, its schema-v6 bridge
+  retains legacy loose table classification but pre-mints a stable rollback commit
+  id. Recovery persists the observed rollback audit plan before the first restore;
+  a retry after rollback publish therefore finalizes the same `RolledBack` outcome
+  instead of inferring direction from aligned numeric pins.
+- Schema-v6 does not prove ownership of an index commit and does not add a fixed
+  forward outcome. Exact transaction chains, fixed original lineage, and exact
+  first-touch ref identity remain requirements of the full adapter.
 - Logical operations never fail because a derived index is absent or behind.
 - Physical-only internal-table maintenance remains the exception in Section 8.
 

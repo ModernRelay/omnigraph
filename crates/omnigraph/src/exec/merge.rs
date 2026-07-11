@@ -25,6 +25,26 @@ enum CandidateTableState {
     RewriteMerged(StagedMergeResult),
 }
 
+/// An existing target ref opened and verified against the target manifest pin
+/// under branch merge's final schema -> branch -> table gate envelope.
+///
+/// The handle is carried through Phase A and consumed by the physical effect so
+/// the post-arm path cannot reopen a different HEAD. First-touch refs never
+/// construct this value: their target ref is created only after the v4 recovery
+/// sidecar is durable.
+#[derive(Debug)]
+struct PreparedExistingMergeTarget {
+    current: SnapshotHandle,
+    full_path: String,
+    table_branch: Option<String>,
+}
+
+impl PreparedExistingMergeTarget {
+    fn into_parts(self) -> (SnapshotHandle, String, Option<String>) {
+        (self.current, self.full_path, self.table_branch)
+    }
+}
+
 #[derive(Debug)]
 struct StagedTable {
     _dir: TempDir,
@@ -354,8 +374,7 @@ async fn compute_adopt_delta(
     let schema = schema_for_table_key(catalog, table_key)?;
     let mut append_writer =
         StagedTableWriter::new(&format!("{}_adopt_append", table_key), schema.clone())?;
-    let mut upsert_writer =
-        StagedTableWriter::new(&format!("{}_adopt_upsert", table_key), schema)?;
+    let mut upsert_writer = StagedTableWriter::new(&format!("{}_adopt_upsert", table_key), schema)?;
     let mut deleted_ids: Vec<String> = Vec::new();
     let mut base = OrderedTableCursor::from_snapshot_lazy(base_snapshot, table_key).await?;
     let mut source = OrderedTableCursor::from_snapshot_lazy(source_snapshot, table_key).await?;
@@ -823,9 +842,7 @@ async fn classify_adopt(
         compute_adopt_delta(table_key, catalog, base_snapshot, source_snapshot).await?;
     match (advances_head, validation_delta) {
         (true, Some(delta)) => Ok(CandidateTableState::AdoptWithDelta(delta)),
-        (_, validation_delta) => {
-            Ok(CandidateTableState::AdoptSourceState { validation_delta })
-        }
+        (_, validation_delta) => Ok(CandidateTableState::AdoptSourceState { validation_delta }),
     }
 }
 
@@ -991,6 +1008,7 @@ async fn publish_rewritten_merge_table(
     target_db: &Omnigraph,
     table_key: &str,
     staged: &StagedMergeResult,
+    prepared_target: Option<PreparedExistingMergeTarget>,
     planned_transactions: &[crate::table_store::StagedTransactionIdentity],
 ) -> Result<crate::db::SubTableUpdate> {
     // Branch merge's source-rewrite path is Merge-shaped (upsert from
@@ -998,13 +1016,16 @@ async fn publish_rewritten_merge_table(
     // (`stage_delete` + an exact commit) operates on rows the rewrite chose
     // to remove, not user-facing predicates, so Merge is the correct policy
     // here.
-    // `open_for_mutation` is the no-txn entry, so collapse #1's non-strict
-    // open-skip (gated on `txn.is_some()`) never fires here — the handle is
-    // always `Some`.
-    let (mut current_ds, full_path, table_branch) = target_db
-        .open_for_mutation(table_key, crate::db::MutationOpKind::Merge)
-        .await?
-        .require_handle("branch merge");
+    // Existing refs consume the same handle verified before Phase A. Only a
+    // first-touch target reaches `open_for_mutation` here, after recovery owns
+    // the ref creation; its no-txn path always returns a handle.
+    let (mut current_ds, full_path, table_branch) = match prepared_target {
+        Some(prepared) => prepared.into_parts(),
+        None => target_db
+            .open_for_mutation(table_key, crate::db::MutationOpKind::Merge)
+            .await?
+            .require_handle("branch merge first touch"),
+    };
 
     // Phase 1: merge_insert changed/new rows (preserves _row_created_at_version for
     // existing rows, bumps _row_last_updated_at_version only for actually-changed rows).
@@ -1187,15 +1208,19 @@ async fn publish_adopted_delta(
     target_db: &Omnigraph,
     table_key: &str,
     delta: &AdoptDelta,
+    prepared_target: Option<PreparedExistingMergeTarget>,
     planned_transactions: &[crate::table_store::StagedTransactionIdentity],
 ) -> Result<crate::db::SubTableUpdate> {
-    // `open_for_mutation` is the no-txn entry, so collapse #1's non-strict
-    // open-skip (gated on `txn.is_some()`) never fires here — the handle is
-    // always `Some`.
-    let (mut current_ds, full_path, table_branch) = target_db
-        .open_for_mutation(table_key, crate::db::MutationOpKind::Merge)
-        .await?
-        .require_handle("branch merge");
+    // Existing refs consume the same handle verified before Phase A. Only a
+    // first-touch target reaches `open_for_mutation` here, after recovery owns
+    // the ref creation; its no-txn path always returns a handle.
+    let (mut current_ds, full_path, table_branch) = match prepared_target {
+        Some(prepared) => prepared.into_parts(),
+        None => target_db
+            .open_for_mutation(table_key, crate::db::MutationOpKind::Merge)
+            .await?
+            .require_handle("branch merge first touch"),
+    };
 
     // Phase 1a: append the NEW rows. `stage_append_stream` is a streaming
     // `Operation::Append` — no hash join — so it never buffers the delta and
@@ -1717,6 +1742,7 @@ impl Omnigraph {
         let mut delta_slots = Vec::new();
         let mut first_touch_effects = HashSet::new();
         let mut planned_transactions_by_table = HashMap::new();
+        let mut prepared_existing_targets = HashMap::new();
         for table_key in &ordered_table_keys {
             let Some(candidate) = candidates.get(table_key) else {
                 continue;
@@ -1760,6 +1786,24 @@ impl Omnigraph {
                         .map(|_| entry.table_version);
                     if source_fork_version.is_some() {
                         first_touch_effects.insert(table_key.clone());
+                    } else {
+                        // Existing-ref effects must prove that the physical
+                        // baseline still equals the captured manifest pin
+                        // before this merge writes a sidecar that claims the
+                        // next versions. Keep the opened handle for Phase B so
+                        // the post-arm path cannot reopen a different HEAD.
+                        let (current, full_path, table_branch) = self
+                            .open_for_mutation(table_key, crate::db::MutationOpKind::Merge)
+                            .await?
+                            .require_handle("branch merge existing-effect preflight");
+                        prepared_existing_targets.insert(
+                            table_key.clone(),
+                            PreparedExistingMergeTarget {
+                                current,
+                                full_path,
+                                table_branch,
+                            },
+                        );
                     }
                     let planned_transactions =
                         plan_merge_transactions(table_key, candidate, expected_version)?;
@@ -1811,6 +1855,31 @@ impl Omnigraph {
                     });
                 }
             }
+        }
+
+        // Probe after every existing target handle has been collected, at the
+        // last pre-arm boundary under the complete gate envelope. First-touch
+        // targets are intentionally absent: their native ref does not exist
+        // until the sidecar below is durable.
+        for table_key in &ordered_table_keys {
+            let Some(prepared) = prepared_existing_targets.get(table_key) else {
+                continue;
+            };
+            let expected_version = target_snapshot
+                .entry(table_key)
+                .ok_or_else(|| {
+                    OmniError::manifest_internal(format!(
+                        "prepared branch merge target '{table_key}' has no manifest entry"
+                    ))
+                })?
+                .table_version;
+            self.ensure_existing_effect_baseline(
+                table_key,
+                prepared.table_branch.as_deref(),
+                expected_version,
+                &prepared.current,
+            )
+            .await?;
         }
 
         // Keep the sidecar alongside its handle: after the whole physical
@@ -1874,6 +1943,21 @@ impl Omnigraph {
                 let Some(candidate_state) = candidates.get(table_key) else {
                     continue;
                 };
+                let prepared_target = match candidate_state {
+                    CandidateTableState::RewriteMerged(_)
+                    | CandidateTableState::AdoptWithDelta(_) => {
+                        if first_touch_effects.contains(table_key) {
+                            None
+                        } else {
+                            Some(prepared_existing_targets.remove(table_key).ok_or_else(|| {
+                                OmniError::manifest_internal(format!(
+                                    "branch merge table '{table_key}' lacks its verified existing target handle"
+                                ))
+                            })?)
+                        }
+                    }
+                    CandidateTableState::AdoptSourceState { .. } => None,
+                };
                 let update = match candidate_state {
                     CandidateTableState::AdoptSourceState { .. } => {
                         publish_adopted_source_state(
@@ -1890,7 +1974,8 @@ impl Omnigraph {
                                 "branch merge table '{table_key}' lacks its armed transaction chain"
                             ))
                         })?;
-                        publish_adopted_delta(self, table_key, delta, planned).await?
+                        publish_adopted_delta(self, table_key, delta, prepared_target, planned)
+                            .await?
                     }
                     CandidateTableState::RewriteMerged(staged) => {
                         let planned = planned_transactions_by_table.get(table_key).ok_or_else(|| {
@@ -1898,7 +1983,14 @@ impl Omnigraph {
                                 "branch merge table '{table_key}' lacks its armed transaction chain"
                             ))
                         })?;
-                        publish_rewritten_merge_table(self, table_key, staged, planned).await?
+                        publish_rewritten_merge_table(
+                            self,
+                            table_key,
+                            staged,
+                            prepared_target,
+                            planned,
+                        )
+                        .await?
                     }
                 };
                 if first_touch_effects.contains(table_key) {

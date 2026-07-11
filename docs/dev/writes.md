@@ -54,8 +54,11 @@ Mutation and load use a closed prepare → effect → publish attempt:
    identity instead: Lance branch-local files cannot be staged until its target
    ref exists;
 3. acquire the schema gate, branch gate, then sorted table queues; re-check for
-   a relevant sidecar armed since step 1, then revalidate the token. Any
-   unresolved relevant intent returns typed `RecoveryRequired` before effects;
+   a relevant sidecar armed since step 1, then revalidate the token and require
+   every existing physical target's live Lance HEAD to equal its manifest pin.
+   Any unresolved relevant intent returns typed `RecoveryRequired`; uncovered
+   HEAD drift points to `omnigraph repair`. Both fail before this attempt arms
+   recovery;
 4. on a pre-effect mismatch, discard the complete attempt. Append/Insert/Merge
    reprepare with a bounded retry; strict Update/Delete/Overwrite return typed
    `ReadSetChanged`;
@@ -89,9 +92,13 @@ RFC-022 adapter contract:
    the immutable base/source/target snapshots outside table gates;
 3. acquire the conservative all-catalog source/target table envelope, re-list
    recovery intent, revalidate the complete target token, and revalidate the
-   source incarnation. A target change returns typed `ReadSetChanged` before
-   effects. A later source-head advance is allowed: the contract is "merge the
-   captured source commit," never "substitute whatever source is latest";
+   source incarnation. Before arming, every existing target ref that will receive
+   a physical effect must also have live Lance HEAD equal to its captured target
+   manifest pin; the verified handle is carried into the effect instead of being
+   reopened. First-touch refs remain absent until after the sidecar. A target
+   change returns typed `ReadSetChanged` before effects. A later source-head
+   advance is allowed: the contract is "merge the captured source commit," never
+   "substitute whatever source is latest";
 4. pre-mint the merge lineage and each table's ordered Lance data-transaction
    chain, then arm a schema-v4 BranchMerge sidecar before the first HEAD advance
    or first-touch table ref. Logical data steps commit with those exact
@@ -341,6 +348,14 @@ are left at `Lance HEAD = manifest_pinned + 1`.
 `branch_merge_on_current_target`, `ensure_indices_for_branch`,
 `optimize_all_tables`):
 
+Before Phase A, under the writer's final schema → branch → table gates, existing
+physical targets must still match their manifest pins. Ahead drift is never folded
+or claimed by manufacturing a new sidecar; it is attributed to an existing recovery
+intent or refused with explicit `omnigraph repair` guidance. First-touch targets use
+the separate sidecar-before-ref protocol. SchemaApply also verifies that AddType and
+RenameType target dataset paths are absent, so recovery cannot register an orphan or
+foreign dataset as if this apply created it.
+
 1. **Phase A**: writer writes a sidecar JSON to
    `__recovery/{ulid}.json` BEFORE its first independently durable physical
    effect (including a first-touch Lance branch ref) or HEAD-advancing commit
@@ -355,7 +370,18 @@ are left at `Lance HEAD = manifest_pinned + 1`.
    carries its pre-minted transaction identity. Branch merge uses schema v4:
    it distinguishes multi-commit HEAD effects from ref-only forks, records each
    multi-commit effect's ordered exact transaction chain, and records the
-   complete intended manifest delta, including pointer-only slots.
+   complete intended manifest delta, including pointer-only slots. SchemaApply
+   uses schema v5 as a narrow bridge: every non-noop apply records its target
+   schema hash even when the table-pin set is empty, then durably marks the
+   sidecar manifest-published immediately after Phase C. This distinguishes a
+   pre-staging rollback from completed schema promotion whose Phase-D delete
+   failed; table effects remain on the legacy loose classifier until the full
+   exact SchemaApply adapter lands. EnsureIndices uses schema v6 as a second
+   narrow bridge: table effects are still loosely classified, but the sidecar
+   pre-mints its rollback commit id. Before the first restore, recovery durably
+   binds the original per-table rollback audit plan, so an interruption after
+   rollback publish retries as that same `RolledBack` outcome instead of being
+   mistaken for a stale roll-forward.
 2. **Phase B**: writer's per-table `commit_staged` loop runs.
    - **Phase-B confirmation:** a schema-v4 `BranchMerge` writer
      advances each table's HEAD by *several* exact commits (append → upsert →
@@ -440,8 +466,9 @@ recovery sweep in `crates/omnigraph/src/db/manifest/recovery.rs`:
   `recovery_for_actor` (the original sidecar's actor), `operation_id`, and
   exact per-table outcomes. Schema-v3 Mutation/Load and schema-v4 BranchMerge
   roll-forward publish the interrupted writer's fixed lineage intent,
-  including its original actor; rollback and legacy recovery commits use
-  `actor_id = "omnigraph:recovery"`. Ordinary
+  including its original actor. Schema-v6 EnsureIndices rollback reuses its
+  pre-minted recovery commit id and durable audit plan. Other rollback and
+  legacy recovery commits use `actor_id = "omnigraph:recovery"`. Ordinary
   commit history is therefore not a complete recovery enumeration, and the
   CLI currently has no public query for the recovery-audit table.
 - Sidecar deleted as the final step.
@@ -459,10 +486,15 @@ restart and without an explicit refresh. The heal lists `__recovery/`
 (one `list_dir`; empty in the steady state) and, per sidecar, acquires
 schema → branch → sorted-table gates that overlap the writer's guarded
 sidecar lifetime. RFC-022 mutation/load writers hold the complete order. Branch
-merge now holds schema plus source/target branch authority for its whole attempt
-and then the all-catalog source/target table envelope; other legacy adapters
-serialize through their existing table or schema gate until their own adapter
-slices land. The
+merge holds schema plus source/target branch authority for its whole attempt and
+then the all-catalog source/target table envelope. SchemaApply holds schema → main
+branch → every live table; EnsureIndices holds schema → target branch → every table
+in its durable work plan. SchemaApply's schema-v5 confirmation closes its zero-pin
+outcome ambiguity while retaining loose table classification. EnsureIndices'
+schema-v6 payload also retains loose table-effect classification, but gives rollback
+a fixed commit id and a durable pre-restore audit plan so recovery re-entry cannot
+flip the outcome. Both close the pre-arm ownership boundary while their full exact
+adapters remain future work. Optimize retains its legacy adapter. The
 manager is shared by every
 `Omnigraph` handle for one canonical local root identity (relative, absolute,
 and symlink aliases converge; object-store/custom schemes stay opaque), so this
@@ -471,9 +503,9 @@ in-flight sidecar forward from under it (a sidecar whose queues can be
 acquired belongs to a writer that finished or died; an existence
 re-check after the wait skips the finished case). Lock order is
 schema → branch → sorted tables → coordinator, matching the writer effect path.
-Enrolled mutation/load attempts and branch merge perform one additional
+Mutation/load, branch merge, SchemaApply, and EnsureIndices perform one additional
 `list_dir` after acquiring their authority gates; that final check closes the
-pre-gate recovery TOCTOU without moving mutation/load validation or staged-file
+pre-gate recovery TOCTOU without moving validation or reclaimable staged-file
 construction under the gate.
 Pinned by the four
 `tests/failpoints.rs::*_after_finalize_publisher_failure_heals_without_reopen`
