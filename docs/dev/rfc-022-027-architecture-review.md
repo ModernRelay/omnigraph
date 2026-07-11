@@ -432,8 +432,9 @@ retaining the public lifecycle status `Proposed`.
 
 **Affected:** [RFC-022 §6.2](../rfcs/rfc-022-unified-write-path.md#62-branch-merge)
 
-**Status:** Closed in specification on 2026-07-11; full merge-adapter conversion
-remains rollout work rather than an architecture ambiguity.
+**Status:** Closed in specification and implementation on 2026-07-11. Branch
+merge captures an immutable source commit and revalidates only its incarnation;
+the target publishes and recovers under its own exact authority token.
 
 RFC-022 requires every `ReadSet` member to be arbitrated atomically by the
 publish CAS. A CAS on reserved main cannot arbitrate a row on a named source
@@ -515,6 +516,14 @@ performance.
 > coarse mutation/load cell without claiming a general schema-authority row or
 > multi-process native-ref fencing. RFC-024 remains the false-contention
 > narrowing step.
+
+> **Branch-merge implementation disposition (2026-07-11):** branch merge uses
+> the same coarse target token without pretending the source belongs to that
+> atomic read set. Schema-v4 recovery persists the captured source parent,
+> fixed merge/rollback ids, pre-minted exact transaction chains for multi-commit
+> data effects, ref-only physical effects, and the complete logical delta. A later source advance remains harmless; a target
+> advance after effects becomes `RecoveryRequired` and is compensated rather
+> than re-parented.
 
 ### TIGHTENING-01 — symmetric Lance conflicts are not obviously an activation gate
 

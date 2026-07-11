@@ -1460,20 +1460,6 @@ pub(super) async fn commit_updates(
     commit_prepared_updates(db, &prepared, None).await
 }
 
-pub(super) async fn commit_merge_with_actor(
-    db: &Omnigraph,
-    updates: &[crate::db::SubTableUpdate],
-    merged_parent_commit_id: &str,
-    actor_id: Option<&str>,
-) -> Result<String> {
-    db.coordinator
-        .write()
-        .await
-        .commit_merge_with_actor(updates, merged_parent_commit_id, actor_id)
-        .await
-        .map(|snapshot_id| snapshot_id.as_str().to_string())
-}
-
 /// Commit updates with a publisher-level OCC fence. The
 /// `expected_table_versions` map asserts the manifest's pre-write per-table
 /// versions; mismatches surface as `ManifestConflictDetails::ExpectedVersionMismatch`.

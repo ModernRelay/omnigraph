@@ -55,23 +55,24 @@ use super::{
 };
 
 /// System actor identifier for recovery-owned lineage: legacy recovery,
-/// v3 rollback, and orphan discard. A v3 roll-forward deliberately publishes
-/// the original writer's fixed lineage and actor instead. The recovery audit
-/// row is the authoritative attribution surface in both cases; the original
-/// sidecar actor flows into its `recovery_for_actor` field.
+/// exact-protocol rollback, and orphan discard. A v3/v4 roll-forward
+/// deliberately publishes the original writer's fixed lineage and actor
+/// instead. The recovery audit row is the authoritative attribution surface in
+/// both cases; the original sidecar actor flows into its `recovery_for_actor`
+/// field.
 pub(crate) const RECOVERY_ACTOR: &str = "omnigraph:recovery";
 
 /// Publish a recovery action's manifest `updates` AND its lineage in one CAS
-/// (RFC-013 Phase 7). Legacy recovery and v3 rollback publish a recovery commit;
-/// v3 roll-forward publishes the original writer's fixed lineage intent. The
-/// lineage (`graph_commit` + `graph_head`) rides the same merge-insert as the
-/// table-version re-pin — there is no separate `_graph_commits.lance` write and
-/// no manifest→commit-graph gap.
+/// (RFC-013 Phase 7). Legacy recovery and v3/v4 rollback publish a recovery
+/// commit; v3/v4 roll-forward publishes the original writer's fixed lineage
+/// intent. The lineage (`graph_commit` + `graph_head`) rides the same
+/// merge-insert as the table-version re-pin — there is no separate
+/// `_graph_commits.lance` write and no manifest→commit-graph gap.
 /// `updates` is empty for the no-table-change recovery paths (all-NoMovement
 /// roll-back, stale-sidecar cleanup, orphaned-branch discard); the lineage rows
 /// still publish, so the recovery commit is always durable.
 ///
-/// Legacy commits resolve their parent from the live branch head. A v3
+/// Legacy commits resolve their parent from the live branch head. An exact
 /// roll-forward instead carries an exact graph-head precondition, so it cannot
 /// be silently re-parented after authority changes. Returns the new manifest
 /// version and the stable commit id the audit row references.
@@ -82,10 +83,30 @@ async fn publish_recovery_commit(
     updates: &[ManifestChange],
     expected: &HashMap<String, u64>,
 ) -> Result<(u64, String)> {
-    let intent = match (sidecar.protocol_v3.as_ref(), kind) {
-        (Some(protocol), RecoveryKind::RolledForward) => LineageIntent::from(&protocol.lineage),
-        (Some(protocol), RecoveryKind::RolledBack) => LineageIntent {
-            graph_commit_id: protocol.rollback_graph_commit_id.clone(),
+    let exact_lineage = sidecar
+        .protocol_v3
+        .as_ref()
+        .map(|protocol| &protocol.lineage)
+        .or_else(|| {
+            sidecar
+                .protocol_v4
+                .as_ref()
+                .map(|protocol| &protocol.lineage)
+        });
+    let exact_rollback_id = sidecar
+        .protocol_v3
+        .as_ref()
+        .map(|protocol| protocol.rollback_graph_commit_id.as_str())
+        .or_else(|| {
+            sidecar
+                .protocol_v4
+                .as_ref()
+                .map(|protocol| protocol.rollback_graph_commit_id.as_str())
+        });
+    let intent = match (exact_lineage, exact_rollback_id, kind) {
+        (Some(lineage), _, RecoveryKind::RolledForward) => LineageIntent::from(lineage),
+        (_, Some(rollback_graph_commit_id), RecoveryKind::RolledBack) => LineageIntent {
+            graph_commit_id: rollback_graph_commit_id.to_string(),
             branch: sidecar.branch.clone(),
             actor_id: Some(RECOVERY_ACTOR.to_string()),
             merged_parent_commit_id: None,
@@ -94,12 +115,13 @@ async fn publish_recovery_commit(
                 .parse::<i64>()
                 .unwrap_or(crate::db::now_micros()?),
         },
-        (Some(_), RecoveryKind::OrphanedBranchDiscarded) => {
+        (Some(_), _, RecoveryKind::OrphanedBranchDiscarded)
+        | (_, Some(_), RecoveryKind::OrphanedBranchDiscarded) => {
             return Err(OmniError::manifest_internal(
-                "orphaned-branch discard cannot publish through the v3 OCC recovery path",
+                "orphaned-branch discard cannot publish through an exact recovery protocol",
             ));
         }
-        (None, _) => {
+        (None, None, _) => {
             let merged_parent_commit_id = match (sidecar.writer_kind, kind) {
                 (SidecarKind::BranchMerge, RecoveryKind::RolledForward) => {
                     sidecar.merge_source_commit_id.clone()
@@ -114,14 +136,29 @@ async fn publish_recovery_commit(
                 created_at: crate::db::now_micros()?,
             }
         }
+        _ => {
+            return Err(OmniError::manifest_internal(
+                "exact recovery sidecar is missing either lineage or rollback identity",
+            ));
+        }
     };
     let publisher = GraphNamespacePublisher::new(root_uri, sidecar.branch.as_deref());
-    let precondition = match (sidecar.protocol_v3.as_ref(), kind) {
-        (Some(protocol), RecoveryKind::RolledForward) => {
+    let exact_authority = sidecar
+        .protocol_v3
+        .as_ref()
+        .map(|protocol| &protocol.authority)
+        .or_else(|| {
+            sidecar
+                .protocol_v4
+                .as_ref()
+                .map(|protocol| &protocol.authority)
+        });
+    let precondition = match (exact_authority, kind) {
+        (Some(authority), RecoveryKind::RolledForward) => {
             PublishPrecondition::ExactGraphHead(GraphHeadExpectation::new(
                 sidecar.branch.as_deref(),
-                protocol.authority.branch_identifier.clone(),
-                protocol.authority.graph_head.clone(),
+                authority.branch_identifier.clone(),
+                authority.graph_head.clone(),
             ))
         }
         _ => PublishPrecondition::Any,
@@ -154,7 +191,15 @@ pub(crate) const RECOVERY_DIR_NAME: &str = "__recovery";
 /// transaction identities, a canonical manifest delta, and an explicit
 /// Armed → EffectsConfirmed transition. Legacy writers deliberately continue
 /// producing v2 until their adapter opts into [`new_occ_sidecar`].
-pub(crate) const SIDECAR_SCHEMA_VERSION: u32 = 3;
+///
+/// v3 → v4: RFC-022 branch-merge authority and exact confirmed output. A v4
+/// sidecar carries the captured target authority, fixed merge lineage and
+/// rollback ids, the complete intended manifest delta (including pointer-only
+/// updates), and an ordered exact transaction chain for each multi-commit HEAD
+/// effect or an explicit ref-only first-touch fork. Mutation/Load remain fixed
+/// at v3: raising the reader maximum must not silently enroll an existing writer
+/// in new semantics.
+pub(crate) const SIDECAR_SCHEMA_VERSION: u32 = 4;
 
 /// Schema version emitted by the legacy constructor. Fixed at v2 so merely
 /// teaching this binary to understand v3 does not silently enroll every writer
@@ -171,10 +216,19 @@ pub(crate) const CONFIRMATION_SCHEMA_VERSION: u32 = 2;
 /// to the current maximum so future sidecar versions retain this floor.
 pub(crate) const EXACT_EFFECT_IDENTITY_SCHEMA_VERSION: u32 = 3;
 
-/// Bound the cold-path transaction-history probe used to find a v3 sidecar's
-/// UUID after unexpected drift. Normal recovery reads one version; a larger
-/// gap indicates foreign activity and is surfaced as unverifiable rather than
-/// turning open into an unbounded history walk.
+/// Exact schema generation emitted by [`new_occ_sidecar`]. Keep this fixed when
+/// the reader learns a newer sidecar generation; v3 Mutation/Load semantics are
+/// not reinterpreted by the v4 BranchMerge adapter.
+pub(crate) const MUTATION_LOAD_SIDECAR_SCHEMA_VERSION: u32 = 3;
+
+/// Exact schema generation emitted by [`new_branch_merge_sidecar`].
+pub(crate) const BRANCH_MERGE_SIDECAR_SCHEMA_VERSION: u32 = 4;
+
+/// Bound the cold-path transaction-history probes used by the v3/v4 exact
+/// recovery protocols. Normal v3 recovery reads one version and a v4 logical
+/// merge chain is currently at most three versions; a larger gap is derived
+/// index work or foreign activity. Exceeding the bound is surfaced as
+/// unverifiable rather than turning open into an unbounded history walk.
 const MAX_EFFECT_IDENTITY_SCAN_VERSIONS: u64 = 1024;
 
 /// Selects which recovery actions are allowed in a sweep.
@@ -462,6 +516,88 @@ pub(crate) struct RecoveryProtocolV3 {
     pub intended_delta: RecoveryManifestDelta,
 }
 
+/// One branch-merge physical effect. A merge can make several staged commits
+/// to one table, or it can create only a native target ref and publish that
+/// source state by pointer. The latter is independently durable even though no
+/// table HEAD moves, so it must be represented explicitly rather than inferred
+/// from a numeric version comparison.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub(crate) struct RecoveryBranchMergeEffect {
+    pub table_key: String,
+    pub kind: RecoveryBranchMergeEffectKind,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "PascalCase")]
+pub(crate) enum RecoveryBranchMergeEffectKind {
+    /// One or more logical data commits on the target table. The exact final
+    /// version is unknown while Armed and is bound atomically with the complete
+    /// manifest delta at EffectsConfirmed. `source_fork_version` is present
+    /// when the target table ref itself is first-touch and therefore must be
+    /// recovered before any HEAD movement is considered.
+    MultiCommitHead {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        source_fork_version: Option<u64>,
+        /// Exact Lance transactions the writer pre-minted for the logical
+        /// data effect, in commit order. Recovery proves ownership by reading
+        /// these identities back at their expected versions; a numeric HEAD
+        /// advance alone is never sufficient evidence.
+        planned_transactions: Vec<StagedTransactionIdentity>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        confirmed_version: Option<u64>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        confirmed_branch_identifier: Option<lance::dataset::refs::BranchIdentifier>,
+    },
+    /// A first-touch target ref whose HEAD remains exactly the captured source
+    /// fork version. Lance mints the target BranchIdentifier during create, so
+    /// it is necessarily an EffectsConfirmed output rather than an arm-time
+    /// input.
+    RefOnlyFork {
+        source_version: u64,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        confirmed_branch_identifier: Option<lance::dataset::refs::BranchIdentifier>,
+    },
+}
+
+impl RecoveryBranchMergeEffectKind {
+    fn source_fork_version(&self) -> Option<u64> {
+        match self {
+            Self::MultiCommitHead {
+                source_fork_version,
+                ..
+            } => *source_fork_version,
+            Self::RefOnlyFork { source_version, .. } => Some(*source_version),
+        }
+    }
+
+    fn confirmed_branch_identifier(&self) -> Option<&lance::dataset::refs::BranchIdentifier> {
+        match self {
+            Self::MultiCommitHead {
+                confirmed_branch_identifier,
+                ..
+            }
+            | Self::RefOnlyFork {
+                confirmed_branch_identifier,
+                ..
+            } => confirmed_branch_identifier.as_ref(),
+        }
+    }
+}
+
+/// v4 BranchMerge payload. Kept separate from v3 so old Mutation/Load files
+/// retain their one-transaction-per-table interpretation forever.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub(crate) struct RecoveryProtocolV4 {
+    pub authority: RecoveryAuthorityToken,
+    pub lineage: RecoveryLineageIntent,
+    pub rollback_graph_commit_id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub rollback_audit_outcomes: Option<Vec<TableOutcome>>,
+    pub effect_phase: RecoveryEffectPhase,
+    pub effects: Vec<RecoveryBranchMergeEffect>,
+    pub intended_delta: RecoveryManifestDelta,
+}
+
 /// In-memory representation of the on-disk JSON sidecar.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub(crate) struct RecoverySidecar {
@@ -499,6 +635,9 @@ pub(crate) struct RecoverySidecar {
     /// RFC-022 exact-effect protocol. Absent for every v1/v2 sidecar.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub protocol_v3: Option<RecoveryProtocolV3>,
+    /// RFC-022 BranchMerge protocol. Present only on schema-v4 sidecars.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub protocol_v4: Option<RecoveryProtocolV4>,
 }
 
 /// Opaque handle returned by [`write_sidecar`] so the caller can delete
@@ -670,6 +809,7 @@ pub(crate) async fn write_sidecar(
 /// commit, so the `BranchMerge` arm of `classify_table` could fold back into the
 /// strict single-commit path and `IncompletePhaseB` retire. Do NOT delete this
 /// with the row path — keep the sidecar; only simplify the classifier.
+#[cfg(test)]
 pub(crate) async fn confirm_sidecar_phase_b(
     root_uri: &str,
     storage: &dyn StorageAdapter,
@@ -847,12 +987,22 @@ fn validate_sidecar_shape(sidecar_uri: &str, sidecar: &RecoverySidecar) -> Resul
     };
 
     if sidecar.schema_version < EXACT_EFFECT_IDENTITY_SCHEMA_VERSION {
-        if sidecar.protocol_v3.is_some() {
+        if sidecar.protocol_v3.is_some() || sidecar.protocol_v4.is_some() {
             return Err(malformed(
-                "protocol_v3 is present on a pre-v3 sidecar".to_string(),
+                "an exact-effect protocol is present on a pre-v3 sidecar".to_string(),
             ));
         }
         return Ok(());
+    }
+
+    if sidecar.schema_version == BRANCH_MERGE_SIDECAR_SCHEMA_VERSION {
+        return validate_branch_merge_v4_shape(sidecar_uri, sidecar);
+    }
+
+    if sidecar.protocol_v4.is_some() {
+        return Err(malformed(
+            "protocol_v4 is present on a pre-v4 sidecar".to_string(),
+        ));
     }
 
     if !matches!(
@@ -1020,6 +1170,361 @@ fn validate_sidecar_shape(sidecar_uri: &str, sidecar: &RecoverySidecar) -> Resul
         }
     }
     Ok(())
+}
+
+fn validate_branch_merge_v4_shape(sidecar_uri: &str, sidecar: &RecoverySidecar) -> Result<()> {
+    let malformed = |reason: String| {
+        OmniError::manifest_internal(format!(
+            "recovery sidecar at '{}' has an invalid schema-v{} shape: {}",
+            sidecar_uri, sidecar.schema_version, reason
+        ))
+    };
+
+    if sidecar.writer_kind != SidecarKind::BranchMerge {
+        return Err(malformed(format!(
+            "protocol_v4 is only defined for BranchMerge, found {:?}",
+            sidecar.writer_kind
+        )));
+    }
+    if sidecar.protocol_v3.is_some() {
+        return Err(malformed(
+            "schema-v4 BranchMerge sidecar also carries protocol_v3".to_string(),
+        ));
+    }
+    if sidecar.merge_source_commit_id.is_some()
+        || !sidecar.additional_registrations.is_empty()
+        || !sidecar.tombstones.is_empty()
+    {
+        return Err(malformed(
+            "schema-v4 BranchMerge must carry lineage/delta only in protocol_v4".to_string(),
+        ));
+    }
+    let protocol = sidecar
+        .protocol_v4
+        .as_ref()
+        .ok_or_else(|| malformed("missing required protocol_v4 payload".to_string()))?;
+    if !protocol.intended_delta.registrations.is_empty()
+        || !protocol.intended_delta.tombstones.is_empty()
+    {
+        return Err(malformed(
+            "BranchMerge cannot register or tombstone tables".to_string(),
+        ));
+    }
+
+    let sidecar_branch = sidecar.branch.as_deref().filter(|branch| *branch != "main");
+    let lineage_branch = protocol
+        .lineage
+        .branch
+        .as_deref()
+        .filter(|branch| *branch != "main");
+    if sidecar_branch != lineage_branch {
+        return Err(malformed(
+            "sidecar branch does not match original merge lineage branch".to_string(),
+        ));
+    }
+    if sidecar.actor_id != protocol.lineage.actor_id {
+        return Err(malformed(
+            "sidecar actor does not match original merge lineage actor".to_string(),
+        ));
+    }
+    if protocol.lineage.merged_parent_commit_id.is_none() {
+        return Err(malformed(
+            "BranchMerge lineage must carry the captured source commit".to_string(),
+        ));
+    }
+    if protocol.rollback_graph_commit_id == protocol.lineage.graph_commit_id {
+        return Err(malformed(
+            "original and rollback graph commit ids must differ".to_string(),
+        ));
+    }
+
+    let pin_keys: HashSet<&str> = sidecar
+        .tables
+        .iter()
+        .map(|pin| pin.table_key.as_str())
+        .collect();
+    let effect_keys: HashSet<&str> = protocol
+        .effects
+        .iter()
+        .map(|effect| effect.table_key.as_str())
+        .collect();
+    let delta_keys: HashSet<&str> = protocol
+        .intended_delta
+        .table_updates
+        .iter()
+        .map(|slot| slot.table_key.as_str())
+        .collect();
+    if sidecar.tables.is_empty()
+        || pin_keys.len() != sidecar.tables.len()
+        || effect_keys.len() != protocol.effects.len()
+        || delta_keys.len() != protocol.intended_delta.table_updates.len()
+        || effect_keys != pin_keys
+        || !effect_keys.is_subset(&delta_keys)
+    {
+        return Err(malformed(
+            "physical table pins/effects must be one-to-one and a subset of unique intended-delta slots"
+                .to_string(),
+        ));
+    }
+    if let Some(outcomes) = protocol.rollback_audit_outcomes.as_ref() {
+        let outcome_keys: HashSet<&str> = outcomes
+            .iter()
+            .map(|outcome| outcome.table_key.as_str())
+            .collect();
+        if outcome_keys.len() != outcomes.len() || !outcome_keys.is_subset(&pin_keys) {
+            return Err(malformed(
+                "rollback audit outcomes must name a unique subset of physical table pins"
+                    .to_string(),
+            ));
+        }
+    }
+
+    for slot in &protocol.intended_delta.table_updates {
+        match protocol.effect_phase {
+            RecoveryEffectPhase::Armed if slot.confirmed.is_some() => {
+                return Err(malformed(format!(
+                    "Armed manifest slot '{}' already carries confirmation",
+                    slot.table_key
+                )));
+            }
+            RecoveryEffectPhase::EffectsConfirmed if slot.confirmed.is_none() => {
+                return Err(malformed(format!(
+                    "EffectsConfirmed manifest slot '{}' lacks its exact output",
+                    slot.table_key
+                )));
+            }
+            _ => {}
+        }
+        if let Some(confirmed) = slot.confirmed.as_ref()
+            && confirmed.table_branch != slot.table_branch
+        {
+            return Err(malformed(format!(
+                "confirmed output branch for '{}' differs from its planned slot",
+                slot.table_key
+            )));
+        }
+    }
+
+    let mut planned_transaction_uuids = HashSet::new();
+    for pin in &sidecar.tables {
+        let effect = protocol
+            .effects
+            .iter()
+            .find(|effect| effect.table_key == pin.table_key)
+            .expect("effect/pin key sets checked above");
+        let slot = protocol
+            .intended_delta
+            .table_updates
+            .iter()
+            .find(|slot| slot.table_key == pin.table_key)
+            .expect("physical effects are a subset of delta slots");
+        if slot.expected_version != pin.expected_version || slot.table_branch != pin.table_branch {
+            return Err(malformed(format!(
+                "intended-delta pre-state for '{}' does not match its physical table pin",
+                pin.table_key
+            )));
+        }
+        if pin
+            .table_branch
+            .as_deref()
+            .is_none_or(|branch| branch == "main")
+            && effect.kind.source_fork_version().is_some()
+        {
+            return Err(malformed(format!(
+                "first-touch effect '{}' does not name a non-main target ref",
+                pin.table_key
+            )));
+        }
+        if let Some(source_fork_version) = effect.kind.source_fork_version()
+            && matches!(
+                &effect.kind,
+                RecoveryBranchMergeEffectKind::MultiCommitHead { .. }
+            )
+            && source_fork_version != pin.expected_version
+        {
+            return Err(malformed(format!(
+                "first-touch multi-commit effect '{}' forks from version {}, pin expects {}",
+                pin.table_key, source_fork_version, pin.expected_version
+            )));
+        }
+        match (&effect.kind, protocol.effect_phase) {
+            (
+                RecoveryBranchMergeEffectKind::MultiCommitHead {
+                    planned_transactions,
+                    confirmed_version,
+                    confirmed_branch_identifier,
+                    source_fork_version,
+                },
+                RecoveryEffectPhase::Armed,
+            ) => {
+                validate_branch_merge_transaction_chain(
+                    &malformed,
+                    pin,
+                    planned_transactions,
+                    &mut planned_transaction_uuids,
+                )?;
+                if confirmed_version.is_some()
+                    || confirmed_branch_identifier.is_some()
+                    || pin.confirmed_version.is_some()
+                {
+                    return Err(malformed(format!(
+                        "Armed multi-commit effect '{}' already carries confirmation",
+                        pin.table_key
+                    )));
+                }
+                if source_fork_version.is_none() && confirmed_branch_identifier.is_some() {
+                    return Err(malformed(format!(
+                        "owned-ref effect '{}' unexpectedly carries a branch identifier",
+                        pin.table_key
+                    )));
+                }
+            }
+            (
+                RecoveryBranchMergeEffectKind::MultiCommitHead {
+                    planned_transactions,
+                    confirmed_version,
+                    confirmed_branch_identifier,
+                    source_fork_version,
+                },
+                RecoveryEffectPhase::EffectsConfirmed,
+            ) => {
+                let planned_final_version = validate_branch_merge_transaction_chain(
+                    &malformed,
+                    pin,
+                    planned_transactions,
+                    &mut planned_transaction_uuids,
+                )?;
+                let version = confirmed_version.ok_or_else(|| {
+                    malformed(format!(
+                        "EffectsConfirmed multi-commit effect '{}' lacks final version",
+                        pin.table_key
+                    ))
+                })?;
+                let confirmed = slot.confirmed.as_ref().expect("phase checked above");
+                if pin.confirmed_version != Some(version)
+                    || confirmed.table_version != version
+                    || version < planned_final_version
+                {
+                    return Err(malformed(format!(
+                        "multi-commit effect '{}' confirmation does not match its pin/delta",
+                        pin.table_key
+                    )));
+                }
+                if source_fork_version.is_some() != confirmed_branch_identifier.is_some() {
+                    return Err(malformed(format!(
+                        "first-touch multi-commit effect '{}' must confirm its target ref identity",
+                        pin.table_key
+                    )));
+                }
+            }
+            (
+                RecoveryBranchMergeEffectKind::RefOnlyFork {
+                    source_version: _,
+                    confirmed_branch_identifier,
+                },
+                RecoveryEffectPhase::Armed,
+            ) => {
+                if confirmed_branch_identifier.is_some() || pin.confirmed_version.is_some() {
+                    return Err(malformed(format!(
+                        "Armed ref-only effect '{}' already carries confirmation",
+                        pin.table_key
+                    )));
+                }
+            }
+            (
+                RecoveryBranchMergeEffectKind::RefOnlyFork {
+                    source_version,
+                    confirmed_branch_identifier,
+                },
+                RecoveryEffectPhase::EffectsConfirmed,
+            ) => {
+                let confirmed = slot.confirmed.as_ref().expect("phase checked above");
+                if confirmed_branch_identifier.is_none()
+                    || pin.confirmed_version != Some(*source_version)
+                    || confirmed.table_version != *source_version
+                {
+                    return Err(malformed(format!(
+                        "ref-only effect '{}' confirmation does not match its exact fork version",
+                        pin.table_key
+                    )));
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+fn validate_branch_merge_transaction_chain(
+    malformed: &impl Fn(String) -> OmniError,
+    pin: &SidecarTablePin,
+    planned_transactions: &[StagedTransactionIdentity],
+    planned_transaction_uuids: &mut HashSet<String>,
+) -> Result<u64> {
+    let first = planned_transactions.first().ok_or_else(|| {
+        malformed(format!(
+            "multi-commit effect '{}' has an empty planned transaction chain",
+            pin.table_key
+        ))
+    })?;
+    if first.read_version != pin.expected_version {
+        return Err(malformed(format!(
+            "planned transaction chain for '{}' begins at version {}, pin expects {}",
+            pin.table_key, first.read_version, pin.expected_version
+        )));
+    }
+    let first_output = first.read_version.checked_add(1).ok_or_else(|| {
+        malformed(format!(
+            "planned transaction chain for '{}' overflows its first output version",
+            pin.table_key
+        ))
+    })?;
+    if pin.post_commit_pin != first_output {
+        return Err(malformed(format!(
+            "post-commit pin for '{}' is {}, first planned output is {}",
+            pin.table_key, pin.post_commit_pin, first_output
+        )));
+    }
+
+    for (index, planned) in planned_transactions.iter().enumerate() {
+        if planned.uuid.is_empty() || !planned_transaction_uuids.insert(planned.uuid.clone()) {
+            return Err(malformed(format!(
+                "planned transaction chain for '{}' contains an empty or duplicate identity at offset {}",
+                pin.table_key, index
+            )));
+        }
+        let expected_read_version = pin
+            .expected_version
+            .checked_add(u64::try_from(index).map_err(|_| {
+                malformed(format!(
+                    "planned transaction chain for '{}' exceeds u64",
+                    pin.table_key
+                ))
+            })?)
+            .ok_or_else(|| {
+                malformed(format!(
+                    "planned transaction chain for '{}' overflows at offset {}",
+                    pin.table_key, index
+                ))
+            })?;
+        if planned.read_version != expected_read_version {
+            return Err(malformed(format!(
+                "planned transaction chain for '{}' reads version {} at offset {}, expected {}",
+                pin.table_key, planned.read_version, index, expected_read_version
+            )));
+        }
+    }
+
+    planned_transactions
+        .last()
+        .expect("non-empty chain checked above")
+        .read_version
+        .checked_add(1)
+        .ok_or_else(|| {
+            malformed(format!(
+                "planned transaction chain for '{}' overflows its final output version",
+                pin.table_key
+            ))
+        })
 }
 
 /// Classify one table's observed state vs. the sidecar's intent.
@@ -1653,6 +2158,9 @@ async fn process_sidecar(
     // stale-sidecar audit recovery). `false` = the sidecar was deferred
     // untouched -- callers must not treat that as a completed heal (no
     // schema reload / cache invalidation is warranted).
+    if sidecar.protocol_v4.is_some() {
+        return process_branch_merge_sidecar_v4(root_uri, storage, snapshot, sidecar, mode).await;
+    }
     if sidecar.protocol_v3.is_some() {
         if let Some(outcome) = detect_visible_v3_outcome(root_uri, sidecar).await? {
             return finalize_visible_v3_outcome(root_uri, storage.as_ref(), sidecar, outcome).await;
@@ -2138,6 +2646,542 @@ async fn process_sidecar(
     }
 }
 
+struct BranchMergeRefObservation {
+    dataset: lance::Dataset,
+    version: u64,
+    branch_identifier: lance::dataset::refs::BranchIdentifier,
+    parent_version: Option<u64>,
+}
+
+/// Observe one physical target ref without treating an absent first-touch ref
+/// as a storage error. A named ref's BranchContents identity is separate from
+/// the graph-manifest branch identity carried by `RecoveryAuthorityToken`; both
+/// are required to close their respective delete/recreate ABA windows.
+async fn observe_branch_merge_target_ref(
+    pin: &SidecarTablePin,
+) -> Result<Option<BranchMergeRefObservation>> {
+    let dataset = crate::instrumentation::open_dataset(
+        &pin.table_path,
+        crate::instrumentation::VersionResolution::Latest,
+        None,
+        crate::instrumentation::table_wrapper(),
+    )
+    .await?;
+    let Some(branch) = pin
+        .table_branch
+        .as_deref()
+        .filter(|branch| *branch != "main")
+    else {
+        let branch_identifier = dataset
+            .branch_identifier()
+            .await
+            .map_err(|error| OmniError::Lance(error.to_string()))?;
+        let version = dataset.version().version;
+        return Ok(Some(BranchMergeRefObservation {
+            dataset,
+            version,
+            branch_identifier,
+            parent_version: None,
+        }));
+    };
+    let branches = dataset
+        .list_branches()
+        .await
+        .map_err(|error| OmniError::Lance(error.to_string()))?;
+    let Some(contents) = branches.get(branch) else {
+        return Ok(None);
+    };
+    let target = dataset
+        .checkout_branch(branch)
+        .await
+        .map_err(|error| OmniError::Lance(error.to_string()))?;
+    let version = target.version().version;
+    Ok(Some(BranchMergeRefObservation {
+        dataset: target,
+        version,
+        branch_identifier: contents.identifier.clone(),
+        parent_version: Some(contents.parent_version),
+    }))
+}
+
+struct BranchMergeMultiCommitProof {
+    effect_ownership: EffectOwnership,
+    /// Every planned logical-data transaction is present in exact order and
+    /// every later commit through the observed HEAD is derived CreateIndex
+    /// work. Confirmation still has to bind that exact HEAD before recovery
+    /// may roll it forward.
+    full_effect_at_head: bool,
+    unsafe_reason: Option<String>,
+}
+
+impl BranchMergeMultiCommitProof {
+    fn unverifiable(reason: String) -> Self {
+        Self {
+            effect_ownership: EffectOwnership::Unverifiable,
+            full_effect_at_head: false,
+            unsafe_reason: Some(reason),
+        }
+    }
+}
+
+/// Prove ownership of a BranchMerge multi-commit effect from Lance's durable
+/// transaction history. Numeric version movement is only a scan bound: each
+/// logical data commit must match its pre-minted identity at its exact output
+/// version. Once the full chain is present, inline index reconciliation may
+/// contribute a derived `CreateIndex` tail. No other operation is attributable
+/// to this merge.
+///
+/// A final Restore to the still-manifest-pinned version is the compensation a
+/// previous Full recovery created. Recognizing it makes the restore→manifest
+/// publish crash window restartable without appending another Restore commit.
+async fn prove_branch_merge_multi_commit_effect(
+    observation: &BranchMergeRefObservation,
+    planned_transactions: &[StagedTransactionIdentity],
+    manifest_pinned: u64,
+    table_key: &str,
+) -> Result<BranchMergeMultiCommitProof> {
+    let first = planned_transactions
+        .first()
+        .expect("v4 sidecar validation requires a non-empty transaction chain");
+    let base_version = first.read_version;
+    let lance_head = observation.version;
+    if lance_head < base_version {
+        return Ok(BranchMergeMultiCommitProof::unverifiable(format!(
+            "table '{table_key}' HEAD {lance_head} is behind its planned transaction base {base_version}"
+        )));
+    }
+    if lance_head == base_version {
+        return Ok(BranchMergeMultiCommitProof {
+            effect_ownership: EffectOwnership::None,
+            full_effect_at_head: false,
+            unsafe_reason: None,
+        });
+    }
+    if lance_head.saturating_sub(base_version) > MAX_EFFECT_IDENTITY_SCAN_VERSIONS {
+        return Ok(BranchMergeMultiCommitProof::unverifiable(format!(
+            "table '{table_key}' requires scanning {} transaction versions, above the recovery bound {}",
+            lance_head.saturating_sub(base_version),
+            MAX_EFFECT_IDENTITY_SCAN_VERSIONS
+        )));
+    }
+
+    let mut planned_index = 0usize;
+    for version in base_version + 1..=lance_head {
+        let transaction = if version == lance_head {
+            observation
+                .dataset
+                .read_transaction()
+                .await
+                .map_err(|error| OmniError::Lance(error.to_string()))?
+        } else {
+            observation
+                .dataset
+                .read_transaction_by_version(version)
+                .await
+                .map_err(|error| OmniError::Lance(error.to_string()))?
+        };
+        let Some(transaction) = transaction else {
+            return Ok(BranchMergeMultiCommitProof::unverifiable(format!(
+                "table '{table_key}' has no readable transaction identity at version {version}"
+            )));
+        };
+
+        // Rollback can interrupt a proper prefix of the logical chain, not
+        // only the complete chain. Its final Restore is attributable after at
+        // least one exact planned transaction has established ownership.
+        if version == lance_head
+            && planned_index > 0
+            && matches!(
+                &transaction.operation,
+                lance::dataset::transaction::Operation::Restore { version }
+                    if *version == manifest_pinned
+            )
+        {
+            return Ok(BranchMergeMultiCommitProof {
+                effect_ownership: EffectOwnership::OwnCompensatedAtHead,
+                full_effect_at_head: false,
+                unsafe_reason: None,
+            });
+        }
+
+        let observed_identity = StagedTransactionIdentity::from(&transaction);
+        if let Some(planned) = planned_transactions.get(planned_index) {
+            let expected_output_version = planned.read_version.checked_add(1).ok_or_else(|| {
+                OmniError::manifest_internal(format!(
+                    "BranchMerge transaction version overflow for table '{table_key}'"
+                ))
+            })?;
+            if version != expected_output_version || &observed_identity != planned {
+                return Ok(BranchMergeMultiCommitProof::unverifiable(format!(
+                    "table '{table_key}' transaction at version {version} is {observed_identity:?}, expected exact planned identity {planned:?} at version {expected_output_version}"
+                )));
+            }
+            planned_index += 1;
+            continue;
+        }
+
+        if !matches!(
+            &transaction.operation,
+            lance::dataset::transaction::Operation::CreateIndex { .. }
+        ) {
+            return Ok(BranchMergeMultiCommitProof::unverifiable(format!(
+                "table '{table_key}' has non-derived operation {:?} at version {version} after its complete planned transaction chain",
+                transaction.operation
+            )));
+        }
+    }
+
+    let full_effect_at_head = planned_index == planned_transactions.len();
+    Ok(BranchMergeMultiCommitProof {
+        effect_ownership: if planned_index > 0 {
+            EffectOwnership::OwnAtHead
+        } else {
+            EffectOwnership::None
+        },
+        full_effect_at_head,
+        unsafe_reason: None,
+    })
+}
+
+async fn process_branch_merge_sidecar_v4(
+    root_uri: &str,
+    storage: &std::sync::Arc<dyn StorageAdapter>,
+    snapshot: &Snapshot,
+    sidecar: &RecoverySidecar,
+    mode: RecoveryMode,
+) -> Result<bool> {
+    if let Some(outcome) = detect_visible_v4_outcome(root_uri, sidecar).await? {
+        return finalize_visible_v4_outcome(root_uri, storage.as_ref(), sidecar, outcome).await;
+    }
+    let protocol = sidecar
+        .protocol_v4
+        .as_ref()
+        .expect("caller checked protocol_v4");
+    let mut states = Vec::with_capacity(sidecar.tables.len());
+    let mut any_physical_effect = false;
+    let mut any_head_movement = false;
+    let mut confirmed_mismatch: Option<String> = None;
+    let mut unsafe_observation: Option<String> = None;
+    let mut all_confirmed_effects_at_head =
+        protocol.effect_phase == RecoveryEffectPhase::EffectsConfirmed;
+
+    for pin in &sidecar.tables {
+        let effect = protocol
+            .effects
+            .iter()
+            .find(|effect| effect.table_key == pin.table_key)
+            .expect("v4 sidecar shape validates effect/pin key sets");
+        let manifest_pinned = snapshot
+            .entry(&pin.table_key)
+            .map(|entry| entry.table_version)
+            .unwrap_or(0);
+        let unpublished_fork = pin
+            .table_branch
+            .as_deref()
+            .is_some_and(|branch| branch != "main")
+            && snapshot
+                .entry(&pin.table_key)
+                .map(|entry| entry.table_branch != pin.table_branch)
+                .unwrap_or(true);
+        if manifest_pinned != pin.expected_version {
+            unsafe_observation.get_or_insert_with(|| {
+                format!(
+                    "table '{}' manifest pin changed from {} to {} while its merge effect remained pending",
+                    pin.table_key, pin.expected_version, manifest_pinned
+                )
+            });
+        }
+
+        let observed = observe_branch_merge_target_ref(pin).await?;
+        let first_touch_version = effect.kind.source_fork_version();
+        if observed.is_none() && first_touch_version.is_none() {
+            unsafe_observation.get_or_insert_with(|| {
+                format!(
+                    "existing target ref for table '{}' disappeared while BranchMerge recovery was pending",
+                    pin.table_key
+                )
+            });
+        }
+        if let (Some(observed), Some(source_version)) = (&observed, first_touch_version) {
+            any_physical_effect = true;
+            if observed.parent_version != Some(source_version) {
+                unsafe_observation.get_or_insert_with(|| {
+                    format!(
+                        "first-touch target ref for table '{}' was forked at {:?}, expected exact source version {}",
+                        pin.table_key, observed.parent_version, source_version
+                    )
+                });
+            }
+            if let Some(expected_identifier) = effect.kind.confirmed_branch_identifier()
+                && &observed.branch_identifier != expected_identifier
+            {
+                unsafe_observation.get_or_insert_with(|| {
+                    format!(
+                        "first-touch target ref identity for table '{}' differs from its confirmed merge effect",
+                        pin.table_key
+                    )
+                });
+            }
+        }
+
+        let (classification, lance_head, effect_ownership) = match &effect.kind {
+            RecoveryBranchMergeEffectKind::MultiCommitHead {
+                planned_transactions,
+                confirmed_version,
+                ..
+            } => {
+                let lance_head = observed
+                    .as_ref()
+                    .map(|observation| observation.version)
+                    .unwrap_or(manifest_pinned);
+                if lance_head < pin.expected_version {
+                    unsafe_observation.get_or_insert_with(|| {
+                        format!(
+                            "table '{}' HEAD {} is behind prepared merge pin {}",
+                            pin.table_key, lance_head, pin.expected_version
+                        )
+                    });
+                }
+                let moved = lance_head > pin.expected_version;
+                any_physical_effect |= moved;
+                any_head_movement |= moved;
+                let proof = if let Some(observation) = observed.as_ref() {
+                    prove_branch_merge_multi_commit_effect(
+                        observation,
+                        planned_transactions,
+                        manifest_pinned,
+                        &pin.table_key,
+                    )
+                    .await?
+                } else {
+                    BranchMergeMultiCommitProof {
+                        effect_ownership: EffectOwnership::None,
+                        full_effect_at_head: false,
+                        unsafe_reason: None,
+                    }
+                };
+                if let Some(reason) = proof.unsafe_reason.as_ref() {
+                    unsafe_observation.get_or_insert_with(|| reason.clone());
+                }
+                let complete = protocol.effect_phase == RecoveryEffectPhase::EffectsConfirmed
+                    && proof.full_effect_at_head
+                    && confirmed_version == &Some(lance_head)
+                    && pin.confirmed_version == Some(lance_head);
+                all_confirmed_effects_at_head &= complete;
+                if protocol.effect_phase == RecoveryEffectPhase::EffectsConfirmed
+                    && !complete
+                    && proof.effect_ownership != EffectOwnership::OwnCompensatedAtHead
+                {
+                    confirmed_mismatch.get_or_insert_with(|| {
+                        format!(
+                            "confirmed multi-commit effect '{}' expected HEAD {:?}, observed {}",
+                            pin.table_key, confirmed_version, lance_head
+                        )
+                    });
+                }
+                let classification = if complete {
+                    TableClassification::RolledPastExpected
+                } else if moved {
+                    TableClassification::IncompletePhaseB
+                } else {
+                    TableClassification::NoMovement
+                };
+                (classification, lance_head, proof.effect_ownership)
+            }
+            RecoveryBranchMergeEffectKind::RefOnlyFork { source_version, .. } => {
+                let complete = protocol.effect_phase == RecoveryEffectPhase::EffectsConfirmed
+                    && observed
+                        .as_ref()
+                        .is_some_and(|observation| observation.version == *source_version)
+                    && pin.confirmed_version == Some(*source_version);
+                all_confirmed_effects_at_head &= complete;
+                if protocol.effect_phase == RecoveryEffectPhase::EffectsConfirmed && !complete {
+                    confirmed_mismatch.get_or_insert_with(|| {
+                        format!(
+                            "confirmed ref-only effect '{}' expected exact fork version {}, observed {:?}",
+                            pin.table_key,
+                            source_version,
+                            observed.as_ref().map(|observation| observation.version)
+                        )
+                    });
+                }
+                (
+                    if complete {
+                        TableClassification::RolledPastExpected
+                    } else if observed.is_some() {
+                        TableClassification::IncompletePhaseB
+                    } else {
+                        TableClassification::NoMovement
+                    },
+                    // A ref-only fork never represents a data-HEAD delta. Keep
+                    // rollback on the explicit ref-cleanup path rather than
+                    // presenting the source version as a restore candidate.
+                    manifest_pinned,
+                    EffectOwnership::None,
+                )
+            }
+        };
+        states.push(ClassifiedTable {
+            classification,
+            manifest_pinned,
+            lance_head,
+            effect_ownership,
+            unpublished_fork,
+        });
+    }
+
+    if let Some(reason) = unsafe_observation {
+        let message = format!(
+            "BranchMerge recovery sidecar '{}' observed foreign or unverifiable physical state: {}",
+            sidecar.operation_id, reason
+        );
+        return match mode {
+            RecoveryMode::RollForwardOnly => {
+                warn!(operation_id = sidecar.operation_id.as_str(), "{message}");
+                Ok(false)
+            }
+            RecoveryMode::Full => Err(OmniError::manifest_internal(message)),
+        };
+    }
+    if let Some(reason) = confirmed_mismatch {
+        let message = format!(
+            "BranchMerge recovery sidecar '{}' no longer matches its exact confirmed effects: {}",
+            sidecar.operation_id, reason
+        );
+        return match mode {
+            RecoveryMode::RollForwardOnly => {
+                warn!(operation_id = sidecar.operation_id.as_str(), "{message}");
+                Ok(false)
+            }
+            RecoveryMode::Full => Err(OmniError::manifest_internal(message)),
+        };
+    }
+
+    let live_authority =
+        read_live_recovery_authority(root_uri, storage, sidecar.branch.as_deref()).await?;
+    let branch_recreated = live_authority.branch_identifier != protocol.authority.branch_identifier;
+    let authority_changed = live_authority != protocol.authority;
+    if branch_recreated && any_physical_effect {
+        let message = format!(
+            "BranchMerge recovery sidecar '{}' targets a branch incarnation that was deleted and recreated; refusing to act through the reused name",
+            sidecar.operation_id
+        );
+        return match mode {
+            RecoveryMode::RollForwardOnly => {
+                warn!(operation_id = sidecar.operation_id.as_str(), "{message}");
+                Ok(false)
+            }
+            RecoveryMode::Full => Err(OmniError::manifest_internal(message)),
+        };
+    }
+
+    if !authority_changed && all_confirmed_effects_at_head {
+        return roll_forward_branch_merge_v4(root_uri, storage, sidecar, mode).await;
+    }
+
+    // A first-touch ref with no data commit is a recoverable physical artifact,
+    // but cleaning it restores the exact pre-attempt graph state. Do not
+    // manufacture a rollback graph commit: doing so would advance the target
+    // lineage and turn a later logical fast-forward into a three-way merge.
+    if !any_head_movement {
+        if matches!(mode, RecoveryMode::RollForwardOnly) {
+            warn!(
+                operation_id = sidecar.operation_id.as_str(),
+                "recovery: deferring armed BranchMerge intent with no proven physical effects"
+            );
+            return Ok(false);
+        }
+        if let NoEffectForkCleanup::DeferredPathChild { .. } =
+            cleanup_unpublished_no_effect_forks(root_uri, storage.as_ref(), sidecar, &states)
+                .await?
+        {
+            return Ok(false);
+        }
+        delete_sidecar_by_operation_id(root_uri, storage.as_ref(), &sidecar.operation_id).await?;
+        return Ok(true);
+    }
+
+    if matches!(mode, RecoveryMode::RollForwardOnly) {
+        warn!(
+            operation_id = sidecar.operation_id.as_str(),
+            authority_changed, "recovery: deferring rollback-eligible BranchMerge sidecar"
+        );
+        return Ok(false);
+    }
+    roll_back_sidecar(root_uri, storage.as_ref(), sidecar, &states).await?;
+    Ok(true)
+}
+
+async fn roll_forward_branch_merge_v4(
+    root_uri: &str,
+    storage: &std::sync::Arc<dyn StorageAdapter>,
+    sidecar: &RecoverySidecar,
+    mode: RecoveryMode,
+) -> Result<bool> {
+    let protocol = sidecar
+        .protocol_v4
+        .as_ref()
+        .expect("caller checked protocol_v4");
+    let mut updates = Vec::with_capacity(protocol.intended_delta.table_updates.len());
+    let mut expected = HashMap::with_capacity(protocol.intended_delta.table_updates.len());
+    let mut outcomes = Vec::with_capacity(protocol.intended_delta.table_updates.len());
+    for slot in &protocol.intended_delta.table_updates {
+        let confirmed = slot.confirmed.as_ref().ok_or_else(|| {
+            OmniError::manifest_internal(format!(
+                "BranchMerge recovery sidecar '{}' delta slot '{}' is not confirmed",
+                sidecar.operation_id, slot.table_key
+            ))
+        })?;
+        expected.insert(slot.table_key.clone(), slot.expected_version);
+        updates.push(ManifestChange::Update(SubTableUpdate {
+            table_key: slot.table_key.clone(),
+            table_version: confirmed.table_version,
+            table_branch: confirmed.table_branch.clone(),
+            row_count: confirmed.row_count,
+            version_metadata: confirmed.version_metadata.clone(),
+        }));
+        outcomes.push(TableOutcome {
+            table_key: slot.table_key.clone(),
+            from_version: slot.expected_version,
+            to_version: confirmed.table_version,
+        });
+    }
+
+    crate::failpoints::maybe_fail(crate::failpoints::names::RECOVERY_BEFORE_ROLL_FORWARD_PUBLISH)?;
+    let graph_commit_id = match publish_recovery_commit(
+        root_uri,
+        sidecar,
+        RecoveryKind::RolledForward,
+        &updates,
+        &expected,
+    )
+    .await
+    {
+        Ok((_, graph_commit_id)) => graph_commit_id,
+        Err(error) if error.is_read_set_changed() => {
+            if let Some(outcome) = detect_visible_v4_outcome(root_uri, sidecar).await? {
+                return finalize_visible_v4_outcome(root_uri, storage.as_ref(), sidecar, outcome)
+                    .await;
+            }
+            return match mode {
+                RecoveryMode::RollForwardOnly => Ok(false),
+                RecoveryMode::Full => Err(error),
+            };
+        }
+        Err(error) => return Err(error),
+    };
+    record_audit(
+        root_uri,
+        sidecar,
+        graph_commit_id,
+        RecoveryKind::RolledForward,
+        outcomes,
+    )
+    .await?;
+    delete_sidecar_by_operation_id(root_uri, storage.as_ref(), &sidecar.operation_id).await?;
+    Ok(true)
+}
+
 /// True if `err` is the publisher's per-table CAS precondition failure
 /// (`ExpectedVersionMismatch`) — the signal that a concurrent writer advanced
 /// the manifest past what this caller expected.
@@ -2399,8 +3443,30 @@ enum NoEffectForkCleanup {
     },
 }
 
-/// Remove first-touch named-branch refs created by an Armed v3 attempt that
-/// never landed this table's planned transaction.
+fn has_exact_protocol(sidecar: &RecoverySidecar) -> bool {
+    sidecar.protocol_v3.is_some() || sidecar.protocol_v4.is_some()
+}
+
+fn v4_effect_for<'a>(
+    sidecar: &'a RecoverySidecar,
+    table_key: &str,
+) -> Option<&'a RecoveryBranchMergeEffect> {
+    sidecar
+        .protocol_v4
+        .as_ref()?
+        .effects
+        .iter()
+        .find(|effect| effect.table_key == table_key)
+}
+
+fn first_touch_fork_version(sidecar: &RecoverySidecar, pin: &SidecarTablePin) -> u64 {
+    v4_effect_for(sidecar, &pin.table_key)
+        .and_then(|effect| effect.kind.source_fork_version())
+        .unwrap_or(pin.expected_version)
+}
+
+/// Remove first-touch named-branch refs created by an Armed exact-protocol
+/// attempt that never completed this table's planned effect.
 ///
 /// The sidecar is durable before the ref is created, so it is the ownership
 /// record while the manifest still inherits the table from another branch.
@@ -2417,7 +3483,7 @@ async fn cleanup_unpublished_no_effect_forks(
     sidecar: &RecoverySidecar,
     states: &[ClassifiedTable],
 ) -> Result<NoEffectForkCleanup> {
-    if sidecar.protocol_v3.is_none() {
+    if !has_exact_protocol(sidecar) {
         return Ok(NoEffectForkCleanup::Complete);
     }
 
@@ -2496,7 +3562,8 @@ async fn cleanup_unpublished_no_effect_forks(
             }
             continue;
         };
-        if contents.parent_version != pin.expected_version {
+        let exact_fork_version = first_touch_fork_version(sidecar, pin);
+        if contents.parent_version != exact_fork_version {
             return Err(OmniError::manifest_internal(format!(
                 "OCC recovery sidecar '{}' cannot discard unpublished fork '{}:{}': \
                  parent version is {}, expected exact fork point {}",
@@ -2504,14 +3571,24 @@ async fn cleanup_unpublished_no_effect_forks(
                 pin.table_path,
                 target_branch,
                 contents.parent_version,
-                pin.expected_version
+                exact_fork_version
+            )));
+        }
+        if let Some(expected_identifier) = v4_effect_for(sidecar, &pin.table_key)
+            .and_then(|effect| effect.kind.confirmed_branch_identifier())
+            && &contents.identifier != expected_identifier
+        {
+            return Err(OmniError::manifest_internal(format!(
+                "BranchMerge recovery sidecar '{}' cannot discard unpublished fork '{}:{}': \
+                 live target ref identity differs from the confirmed effect",
+                sidecar.operation_id, pin.table_path, target_branch
             )));
         }
         let target = dataset
             .checkout_branch(target_branch)
             .await
             .map_err(|error| OmniError::Lance(error.to_string()))?;
-        if target.version().version != pin.expected_version {
+        if target.version().version != exact_fork_version {
             return Err(OmniError::manifest_internal(format!(
                 "OCC recovery sidecar '{}' cannot discard unpublished fork '{}:{}': \
                  live HEAD is {}, expected untouched version {}",
@@ -2519,7 +3596,7 @@ async fn cleanup_unpublished_no_effect_forks(
                 pin.table_path,
                 target_branch,
                 target.version().version,
-                pin.expected_version
+                exact_fork_version
             )));
         }
         dataset
@@ -2541,7 +3618,7 @@ fn table_requires_rollback_effect(state: &ClassifiedTable) -> bool {
     )
 }
 
-fn v3_rollback_audit_outcomes(
+fn exact_rollback_audit_outcomes(
     sidecar: &RecoverySidecar,
     states: &[ClassifiedTable],
 ) -> Vec<TableOutcome> {
@@ -2563,32 +3640,48 @@ fn v3_rollback_audit_outcomes(
         .collect()
 }
 
-/// Durably bind the exact audit payload for a v3 rollback before the first
+/// Durably bind the exact audit payload for a v3/v4 rollback before the first
 /// restore or rollback publish. A retry must replay the original observation,
 /// not reconstruct it from post-restore HEADs. In particular, partial
 /// multi-table attempts omit untouched pins, and a preflight-rebased v3 effect
 /// records its actual `own_head -> current_manifest_pin` compensation.
-async fn prepare_v3_rollback_audit_plan(
+async fn prepare_exact_rollback_audit_plan(
     root_uri: &str,
     storage: &dyn StorageAdapter,
     sidecar: &RecoverySidecar,
     states: &[ClassifiedTable],
 ) -> Result<RecoverySidecar> {
     let mut prepared = sidecar.clone();
-    let protocol = prepared
+    let already_prepared = prepared
         .protocol_v3
-        .as_mut()
-        .expect("caller checked protocol_v3");
-    if protocol.rollback_audit_outcomes.is_some() {
+        .as_ref()
+        .and_then(|protocol| protocol.rollback_audit_outcomes.as_ref())
+        .or_else(|| {
+            prepared
+                .protocol_v4
+                .as_ref()
+                .and_then(|protocol| protocol.rollback_audit_outcomes.as_ref())
+        })
+        .is_some();
+    if already_prepared {
         return Ok(prepared);
     }
 
-    protocol.rollback_audit_outcomes = Some(v3_rollback_audit_outcomes(sidecar, states));
+    let outcomes = exact_rollback_audit_outcomes(sidecar, states);
+    if let Some(protocol) = prepared.protocol_v3.as_mut() {
+        protocol.rollback_audit_outcomes = Some(outcomes);
+    } else if let Some(protocol) = prepared.protocol_v4.as_mut() {
+        protocol.rollback_audit_outcomes = Some(outcomes);
+    } else {
+        return Err(OmniError::manifest_internal(
+            "prepare_exact_rollback_audit_plan called for a legacy sidecar",
+        ));
+    }
     let uri = sidecar_uri(root_uri, &prepared.operation_id);
     validate_sidecar_shape(&uri, &prepared)?;
     let json = serde_json::to_string_pretty(&prepared).map_err(|error| {
         OmniError::manifest_internal(format!(
-            "failed to serialize v3 rollback audit plan for sidecar '{}': {}",
+            "failed to serialize exact rollback audit plan for sidecar '{}': {}",
             prepared.operation_id, error
         ))
     })?;
@@ -2632,12 +3725,12 @@ async fn roll_back_sidecar(
     // longer has pre-restore table observations. Persist the exact audit plan
     // after fork cleanup and before the first restore so that path can replay it
     // without fabricating outcomes from pins.
-    let prepared_v3 = if sidecar.protocol_v3.is_some() {
-        Some(prepare_v3_rollback_audit_plan(root_uri, storage, sidecar, states).await?)
+    let prepared_exact = if has_exact_protocol(sidecar) {
+        Some(prepare_exact_rollback_audit_plan(root_uri, storage, sidecar, states).await?)
     } else {
         None
     };
-    let sidecar = prepared_v3.as_ref().unwrap_or(sidecar);
+    let sidecar = prepared_exact.as_ref().unwrap_or(sidecar);
 
     // Restore every drifted table (RolledPastExpected / UnexpectedAtP1 /
     // UnexpectedMultistep) to its manifest-pinned content, then PUBLISH so
@@ -2658,7 +3751,7 @@ async fn roll_back_sidecar(
     let mut updates: Vec<ManifestChange> = Vec::with_capacity(sidecar.tables.len());
     let mut expected: HashMap<String, u64> = HashMap::with_capacity(sidecar.tables.len());
     for (pin, state) in sidecar.tables.iter().zip(states.iter()) {
-        if sidecar.protocol_v3.is_some()
+        if has_exact_protocol(sidecar)
             && !matches!(
                 state.effect_ownership,
                 EffectOwnership::OwnAtHead | EffectOwnership::OwnCompensatedAtHead
@@ -2677,6 +3770,9 @@ async fn roll_back_sidecar(
                     state.manifest_pinned,
                 )
                 .await?;
+                crate::failpoints::maybe_fail(
+                    crate::failpoints::names::RECOVERY_POST_TABLE_RESTORE_PRE_PUBLISH,
+                )?;
             }
             // Publish the post-restore HEAD (the restore commit we just made),
             // CAS against the current (unmoved) manifest pin — the same helper
@@ -2722,6 +3818,12 @@ async fn roll_back_sidecar(
         .protocol_v3
         .as_ref()
         .and_then(|protocol| protocol.rollback_audit_outcomes.clone())
+        .or_else(|| {
+            sidecar
+                .protocol_v4
+                .as_ref()
+                .and_then(|protocol| protocol.rollback_audit_outcomes.clone())
+        })
         .unwrap_or(outcomes);
     record_audit(
         root_uri,
@@ -2789,16 +3891,16 @@ async fn record_audit_recovery_rollforward(
     Ok(())
 }
 
-/// Finalize a v3 sidecar whose tables are already manifest-aligned.
+/// Finalize an exact-protocol sidecar whose tables are already manifest-aligned.
 ///
 /// Numeric table alignment alone is not evidence of WHICH outcome happened:
 /// the original manifest CAS may have succeeded before sidecar deletion, or a
 /// prior full recovery may have rolled the effects back and then failed during
-/// audit/delete. v3 gives both outcomes fixed graph-commit ids, so inspect the
+/// audit/delete. v3/v4 give both outcomes fixed graph-commit ids, so inspect the
 /// authoritative lineage and finish exactly that outcome without publishing a
 /// second synthetic commit.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum VisibleV3Outcome {
+enum VisibleExactOutcome {
     Original,
     RolledBack,
 }
@@ -2806,7 +3908,7 @@ enum VisibleV3Outcome {
 async fn detect_visible_v3_outcome(
     root_uri: &str,
     sidecar: &RecoverySidecar,
-) -> Result<Option<VisibleV3Outcome>> {
+) -> Result<Option<VisibleExactOutcome>> {
     let protocol = sidecar
         .protocol_v3
         .as_ref()
@@ -2871,8 +3973,8 @@ async fn detect_visible_v3_outcome(
     };
 
     match (original_visible, rollback_visible) {
-        (true, false) => Ok(Some(VisibleV3Outcome::Original)),
-        (false, true) => Ok(Some(VisibleV3Outcome::RolledBack)),
+        (true, false) => Ok(Some(VisibleExactOutcome::Original)),
+        (false, true) => Ok(Some(VisibleExactOutcome::RolledBack)),
         (false, false) => Ok(None),
         (true, true) => Err(OmniError::manifest_internal(format!(
             "OCC recovery sidecar '{}' has both original commit '{}' and rollback commit '{}' \
@@ -2888,7 +3990,7 @@ async fn finalize_visible_v3_outcome(
     root_uri: &str,
     storage: &dyn StorageAdapter,
     sidecar: &RecoverySidecar,
-    outcome: VisibleV3Outcome,
+    outcome: VisibleExactOutcome,
 ) -> Result<bool> {
     let protocol = sidecar
         .protocol_v3
@@ -2896,7 +3998,7 @@ async fn finalize_visible_v3_outcome(
         .expect("caller checked protocol_v3");
 
     let (kind, graph_commit_id, outcomes) = match outcome {
-        VisibleV3Outcome::Original => {
+        VisibleExactOutcome::Original => {
             let outcomes = sidecar
                 .tables
                 .iter()
@@ -2921,7 +4023,7 @@ async fn finalize_visible_v3_outcome(
                 outcomes,
             )
         }
-        VisibleV3Outcome::RolledBack => {
+        VisibleExactOutcome::RolledBack => {
             let outcomes = protocol.rollback_audit_outcomes.clone().ok_or_else(|| {
                 OmniError::manifest_internal(format!(
                     "OCC recovery sidecar '{}' has visible fixed rollback commit '{}' but no \
@@ -2940,6 +4042,158 @@ async fn finalize_visible_v3_outcome(
     // Idempotent across an audit-success / sidecar-delete failure. The fixed
     // outcome id is already durable in __manifest; the only remaining work is
     // to ensure one audit row exists and delete the artifact.
+    let mut audit = RecoveryAudit::open(root_uri).await?;
+    let already_recorded =
+        audit.list().await?.iter().any(|record| {
+            record.operation_id == sidecar.operation_id && record.recovery_kind == kind
+        });
+    if !already_recorded {
+        crate::failpoints::maybe_fail(crate::failpoints::names::RECOVERY_RECORD_AUDIT)?;
+        audit
+            .append(RecoveryAuditRecord {
+                graph_commit_id,
+                recovery_kind: kind,
+                recovery_for_actor: sidecar.actor_id.clone(),
+                operation_id: sidecar.operation_id.clone(),
+                sidecar_writer_kind: format!("{:?}", sidecar.writer_kind),
+                per_table_outcomes: outcomes,
+                created_at: crate::db::now_micros()?,
+            })
+            .await?;
+    }
+    delete_sidecar_by_operation_id(root_uri, storage, &sidecar.operation_id).await?;
+    Ok(true)
+}
+
+async fn detect_visible_v4_outcome(
+    root_uri: &str,
+    sidecar: &RecoverySidecar,
+) -> Result<Option<VisibleExactOutcome>> {
+    let protocol = sidecar
+        .protocol_v4
+        .as_ref()
+        .expect("caller checked protocol_v4");
+    let (commits, _) =
+        ManifestCoordinator::read_graph_lineage_at(root_uri, sidecar.branch.as_deref()).await?;
+    let original_commit = commits
+        .iter()
+        .find(|commit| commit.graph_commit_id == protocol.lineage.graph_commit_id);
+    let rollback_visible = commits
+        .iter()
+        .any(|commit| commit.graph_commit_id == protocol.rollback_graph_commit_id);
+    let original_visible = if let Some(commit) = original_commit {
+        let expected_branch = protocol
+            .lineage
+            .branch
+            .as_deref()
+            .filter(|branch| *branch != "main");
+        if commit.manifest_branch.as_deref() != expected_branch
+            || protocol
+                .authority
+                .graph_head
+                .as_ref()
+                .is_some_and(|head| commit.parent_commit_id.as_ref() != Some(head))
+            || commit.merged_parent_commit_id != protocol.lineage.merged_parent_commit_id
+            || commit.actor_id != protocol.lineage.actor_id
+            || commit.created_at != protocol.lineage.created_at
+        {
+            return Err(OmniError::manifest_internal(format!(
+                "BranchMerge recovery sidecar '{}' found original commit id '{}' with mismatched lineage",
+                sidecar.operation_id, protocol.lineage.graph_commit_id
+            )));
+        }
+        let committed_snapshot = ManifestCoordinator::snapshot_at(
+            root_uri,
+            sidecar.branch.as_deref(),
+            commit.manifest_version,
+        )
+        .await?;
+        let delta_matches = protocol.intended_delta.table_updates.iter().all(|slot| {
+            let Some(confirmed) = slot.confirmed.as_ref() else {
+                return false;
+            };
+            committed_snapshot
+                .entry(&slot.table_key)
+                .is_some_and(|entry| {
+                    entry.table_version == confirmed.table_version
+                        && entry.table_branch == confirmed.table_branch
+                        && entry.row_count == confirmed.row_count
+                        && entry.version_metadata == confirmed.version_metadata
+                })
+        });
+        if !delta_matches {
+            return Err(OmniError::manifest_internal(format!(
+                "BranchMerge recovery sidecar '{}' found original commit id '{}' but its exact manifest delta differs",
+                sidecar.operation_id, protocol.lineage.graph_commit_id
+            )));
+        }
+        true
+    } else {
+        false
+    };
+
+    match (original_visible, rollback_visible) {
+        (true, false) => Ok(Some(VisibleExactOutcome::Original)),
+        (false, true) => Ok(Some(VisibleExactOutcome::RolledBack)),
+        (false, false) => Ok(None),
+        (true, true) => Err(OmniError::manifest_internal(format!(
+            "BranchMerge recovery sidecar '{}' has both original commit '{}' and rollback commit '{}' visible; refusing ambiguous finalization",
+            sidecar.operation_id,
+            protocol.lineage.graph_commit_id,
+            protocol.rollback_graph_commit_id
+        ))),
+    }
+}
+
+async fn finalize_visible_v4_outcome(
+    root_uri: &str,
+    storage: &dyn StorageAdapter,
+    sidecar: &RecoverySidecar,
+    outcome: VisibleExactOutcome,
+) -> Result<bool> {
+    let protocol = sidecar
+        .protocol_v4
+        .as_ref()
+        .expect("caller checked protocol_v4");
+    let (kind, graph_commit_id, outcomes) = match outcome {
+        VisibleExactOutcome::Original => {
+            let outcomes = protocol
+                .intended_delta
+                .table_updates
+                .iter()
+                .map(|slot| {
+                    let confirmed = slot
+                        .confirmed
+                        .as_ref()
+                        .expect("visible v4 original requires confirmed delta");
+                    TableOutcome {
+                        table_key: slot.table_key.clone(),
+                        from_version: slot.expected_version,
+                        to_version: confirmed.table_version,
+                    }
+                })
+                .collect();
+            (
+                RecoveryKind::RolledForward,
+                protocol.lineage.graph_commit_id.clone(),
+                outcomes,
+            )
+        }
+        VisibleExactOutcome::RolledBack => {
+            let outcomes = protocol.rollback_audit_outcomes.clone().ok_or_else(|| {
+                OmniError::manifest_internal(format!(
+                    "BranchMerge recovery sidecar '{}' has visible fixed rollback commit '{}' but no durable rollback audit outcomes",
+                    sidecar.operation_id, protocol.rollback_graph_commit_id
+                ))
+            })?;
+            (
+                RecoveryKind::RolledBack,
+                protocol.rollback_graph_commit_id.clone(),
+                outcomes,
+            )
+        }
+    };
+
     let mut audit = RecoveryAudit::open(root_uri).await?;
     let already_recorded =
         audit.list().await?.iter().any(|record| {
@@ -3450,6 +4704,7 @@ pub(crate) fn new_sidecar(
         additional_registrations: Vec::new(),
         tombstones: Vec::new(),
         protocol_v3: None,
+        protocol_v4: None,
     }
 }
 
@@ -3514,7 +4769,7 @@ pub(crate) fn new_occ_sidecar(
         })
         .collect();
     let sidecar = RecoverySidecar {
-        schema_version: SIDECAR_SCHEMA_VERSION,
+        schema_version: MUTATION_LOAD_SIDECAR_SCHEMA_VERSION,
         operation_id,
         started_at,
         branch,
@@ -3537,6 +4792,7 @@ pub(crate) fn new_occ_sidecar(
                 tombstones: Vec::new(),
             },
         }),
+        protocol_v4: None,
     };
     validate_sidecar_shape("<new-occ-sidecar>", &sidecar)?;
     Ok(sidecar)
@@ -3675,6 +4931,288 @@ pub(crate) async fn confirm_occ_sidecar_phase_b(
     Ok(())
 }
 
+/// Arm the RFC-022 BranchMerge recovery protocol.
+///
+/// `tables` and `effects` describe only independently durable physical work;
+/// `intended_delta.table_updates` is deliberately allowed to be a superset so
+/// pointer-only manifest updates are recovered in the same exact graph commit.
+/// Every physical output remains unconfirmed until
+/// [`confirm_branch_merge_sidecar_phase_b`] atomically binds the full delta.
+pub(crate) fn new_branch_merge_sidecar(
+    branch: Option<String>,
+    actor_id: Option<String>,
+    tables: Vec<SidecarTablePin>,
+    authority: RecoveryAuthorityToken,
+    lineage: RecoveryLineageIntent,
+    effects: Vec<RecoveryBranchMergeEffect>,
+    intended_delta: RecoveryManifestDelta,
+) -> Result<RecoverySidecar> {
+    let operation_id = ulid::Ulid::new().to_string();
+    let started_at = match std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH) {
+        Ok(duration) => duration.as_micros().to_string(),
+        Err(_) => "0".to_string(),
+    };
+    let sidecar = RecoverySidecar {
+        schema_version: BRANCH_MERGE_SIDECAR_SCHEMA_VERSION,
+        operation_id,
+        started_at,
+        branch,
+        actor_id,
+        writer_kind: SidecarKind::BranchMerge,
+        tables,
+        merge_source_commit_id: None,
+        additional_registrations: Vec::new(),
+        tombstones: Vec::new(),
+        protocol_v3: None,
+        protocol_v4: Some(RecoveryProtocolV4 {
+            authority,
+            lineage,
+            rollback_graph_commit_id: ulid::Ulid::new().to_string(),
+            rollback_audit_outcomes: None,
+            effect_phase: RecoveryEffectPhase::Armed,
+            effects,
+            intended_delta,
+        }),
+    };
+    validate_sidecar_shape("<new-branch-merge-sidecar>", &sidecar)?;
+    Ok(sidecar)
+}
+
+/// Durably transition a v4 BranchMerge sidecar from Armed to
+/// EffectsConfirmed. `updates` is the complete manifest output, including
+/// pointer-only slots with no physical effect. First-touch physical effects
+/// additionally supply the exact Lance target-ref identity minted during
+/// creation; existing-ref effects must not appear in that map.
+pub(crate) async fn confirm_branch_merge_sidecar_phase_b(
+    root_uri: &str,
+    storage: &dyn StorageAdapter,
+    sidecar: &mut RecoverySidecar,
+    updates: &[SubTableUpdate],
+    confirmed_ref_identifiers: &HashMap<String, lance::dataset::refs::BranchIdentifier>,
+) -> Result<()> {
+    crate::failpoints::maybe_fail(crate::failpoints::names::RECOVERY_SIDECAR_CONFIRM)?;
+    let uri = sidecar_uri(root_uri, &sidecar.operation_id);
+    validate_sidecar_shape(&uri, sidecar)?;
+    let protocol = sidecar.protocol_v4.as_ref().ok_or_else(|| {
+        OmniError::manifest_internal(
+            "confirm_branch_merge_sidecar_phase_b requires a v4 BranchMerge sidecar",
+        )
+    })?;
+    if protocol.effect_phase != RecoveryEffectPhase::Armed {
+        return Err(OmniError::manifest_internal(format!(
+            "BranchMerge sidecar '{}' is already EffectsConfirmed",
+            sidecar.operation_id
+        )));
+    }
+
+    let update_keys: HashSet<&str> = updates
+        .iter()
+        .map(|update| update.table_key.as_str())
+        .collect();
+    let delta_keys: HashSet<&str> = protocol
+        .intended_delta
+        .table_updates
+        .iter()
+        .map(|slot| slot.table_key.as_str())
+        .collect();
+    if update_keys.len() != updates.len() || update_keys != delta_keys {
+        return Err(OmniError::manifest_internal(format!(
+            "BranchMerge sidecar '{}' confirmation updates differ from its complete intended delta",
+            sidecar.operation_id
+        )));
+    }
+    let first_touch_keys: HashSet<&str> = protocol
+        .effects
+        .iter()
+        .filter(|effect| effect.kind.source_fork_version().is_some())
+        .map(|effect| effect.table_key.as_str())
+        .collect();
+    let confirmed_ref_keys: HashSet<&str> = confirmed_ref_identifiers
+        .keys()
+        .map(String::as_str)
+        .collect();
+    if confirmed_ref_keys != first_touch_keys {
+        return Err(OmniError::manifest_internal(format!(
+            "BranchMerge sidecar '{}' confirmed target-ref set differs from its first-touch effects",
+            sidecar.operation_id
+        )));
+    }
+
+    for slot in &protocol.intended_delta.table_updates {
+        let update = updates
+            .iter()
+            .find(|update| update.table_key == slot.table_key)
+            .expect("update/delta key sets checked above");
+        if update.table_branch != slot.table_branch {
+            return Err(OmniError::manifest_internal(format!(
+                "BranchMerge sidecar '{}' table '{}' achieved output branch {:?}, planned {:?}",
+                sidecar.operation_id, slot.table_key, update.table_branch, slot.table_branch
+            )));
+        }
+    }
+    for effect in &protocol.effects {
+        let pin = sidecar
+            .tables
+            .iter()
+            .find(|pin| pin.table_key == effect.table_key)
+            .expect("v4 shape validated effect/pin key sets");
+        let update = updates
+            .iter()
+            .find(|update| update.table_key == effect.table_key)
+            .expect("physical effect is a delta-slot subset");
+        let observed = observe_branch_merge_target_ref(pin).await?.ok_or_else(|| {
+            OmniError::manifest_internal(format!(
+                "BranchMerge sidecar '{}' cannot confirm missing target ref for table '{}'",
+                sidecar.operation_id, effect.table_key
+            ))
+        })?;
+        if observed.version != update.table_version {
+            return Err(OmniError::manifest_internal(format!(
+                "BranchMerge sidecar '{}' table '{}' observed HEAD {}, achieved update says {}",
+                sidecar.operation_id, effect.table_key, observed.version, update.table_version
+            )));
+        }
+        if let Some(source_fork_version) = effect.kind.source_fork_version() {
+            if observed.parent_version != Some(source_fork_version) {
+                return Err(OmniError::manifest_internal(format!(
+                    "BranchMerge sidecar '{}' table '{}' target ref parent is {:?}, exact fork version is {}",
+                    sidecar.operation_id,
+                    effect.table_key,
+                    observed.parent_version,
+                    source_fork_version
+                )));
+            }
+            let expected_identifier = confirmed_ref_identifiers
+                .get(&effect.table_key)
+                .expect("confirmed first-touch ref key set checked above");
+            if &observed.branch_identifier != expected_identifier {
+                return Err(OmniError::manifest_internal(format!(
+                    "BranchMerge sidecar '{}' table '{}' target ref identity differs from the writer's achieved identity",
+                    sidecar.operation_id, effect.table_key
+                )));
+            }
+        }
+        match &effect.kind {
+            RecoveryBranchMergeEffectKind::MultiCommitHead {
+                planned_transactions,
+                ..
+            } => {
+                let planned_final_version = planned_transactions
+                    .last()
+                    .expect("v4 shape validation requires a non-empty transaction chain")
+                    .read_version
+                    .checked_add(1)
+                    .ok_or_else(|| {
+                        OmniError::manifest_internal(format!(
+                            "BranchMerge sidecar '{}' planned transaction chain for '{}' overflows its final output version",
+                            sidecar.operation_id, effect.table_key
+                        ))
+                    })?;
+                if update.table_version < planned_final_version {
+                    return Err(OmniError::manifest_internal(format!(
+                        "BranchMerge sidecar '{}' multi-commit table '{}' stopped before its complete planned transaction chain ({} < {})",
+                        sidecar.operation_id,
+                        effect.table_key,
+                        update.table_version,
+                        planned_final_version
+                    )));
+                }
+                let proof = prove_branch_merge_multi_commit_effect(
+                    &observed,
+                    planned_transactions,
+                    pin.expected_version,
+                    &effect.table_key,
+                )
+                .await?;
+                if proof.effect_ownership != EffectOwnership::OwnAtHead
+                    || !proof.full_effect_at_head
+                    || proof.unsafe_reason.is_some()
+                {
+                    return Err(OmniError::manifest_internal(format!(
+                        "BranchMerge sidecar '{}' cannot confirm unproven transaction chain for table '{}': {}",
+                        sidecar.operation_id,
+                        effect.table_key,
+                        proof
+                            .unsafe_reason
+                            .as_deref()
+                            .unwrap_or("the full exact effect is not at HEAD")
+                    )));
+                }
+            }
+            RecoveryBranchMergeEffectKind::RefOnlyFork { source_version, .. } => {
+                if update.table_version != *source_version {
+                    return Err(OmniError::manifest_internal(format!(
+                        "BranchMerge sidecar '{}' ref-only table '{}' achieved version {}, exact fork version {}",
+                        sidecar.operation_id,
+                        effect.table_key,
+                        update.table_version,
+                        source_version
+                    )));
+                }
+            }
+        }
+    }
+
+    let mut confirmed = sidecar.clone();
+    let confirmed_protocol = confirmed
+        .protocol_v4
+        .as_mut()
+        .expect("validated v4 protocol");
+    for slot in &mut confirmed_protocol.intended_delta.table_updates {
+        let update = updates
+            .iter()
+            .find(|update| update.table_key == slot.table_key)
+            .expect("update/delta key sets checked above");
+        slot.confirmed = Some(RecoveryConfirmedTableUpdate {
+            table_version: update.table_version,
+            table_branch: update.table_branch.clone(),
+            row_count: update.row_count,
+            version_metadata: update.version_metadata.clone(),
+        });
+    }
+    for effect in &mut confirmed_protocol.effects {
+        let update = updates
+            .iter()
+            .find(|update| update.table_key == effect.table_key)
+            .expect("physical effect is a delta-slot subset");
+        let ref_identifier = confirmed_ref_identifiers.get(&effect.table_key).cloned();
+        match &mut effect.kind {
+            RecoveryBranchMergeEffectKind::MultiCommitHead {
+                confirmed_version,
+                confirmed_branch_identifier,
+                ..
+            } => {
+                *confirmed_version = Some(update.table_version);
+                *confirmed_branch_identifier = ref_identifier;
+            }
+            RecoveryBranchMergeEffectKind::RefOnlyFork {
+                confirmed_branch_identifier,
+                ..
+            } => {
+                *confirmed_branch_identifier = ref_identifier;
+            }
+        }
+    }
+    for pin in &mut confirmed.tables {
+        let update = updates
+            .iter()
+            .find(|update| update.table_key == pin.table_key)
+            .expect("effect/pin keys are delta-slot subset");
+        pin.confirmed_version = Some(update.table_version);
+    }
+    confirmed_protocol.effect_phase = RecoveryEffectPhase::EffectsConfirmed;
+
+    validate_sidecar_shape(&uri, &confirmed)?;
+    let json = serde_json::to_string_pretty(&confirmed).map_err(|error| {
+        OmniError::manifest_internal(format!(
+            "failed to serialize confirmed BranchMerge recovery sidecar: {error}"
+        ))
+    })?;
+    storage.write_text(&uri, &json).await?;
+    *sidecar = confirmed;
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -3750,6 +5288,15 @@ mod tests {
         .unwrap()
     }
 
+    fn test_branch_identifier(
+        version: u64,
+        suffix: &str,
+    ) -> lance::dataset::refs::BranchIdentifier {
+        lance::dataset::refs::BranchIdentifier {
+            version_mapping: vec![(version, suffix.to_string())],
+        }
+    }
+
     #[test]
     fn sidecar_round_trips_through_json() {
         let original = new_sidecar(
@@ -3772,7 +5319,10 @@ mod tests {
     #[test]
     fn occ_sidecar_round_trips_armed_with_stable_ids_and_exact_effect() {
         let original = occ_sidecar();
-        assert_eq!(original.schema_version, SIDECAR_SCHEMA_VERSION);
+        assert_eq!(
+            original.schema_version,
+            MUTATION_LOAD_SIDECAR_SCHEMA_VERSION
+        );
         let protocol = original.protocol_v3.as_ref().unwrap();
         assert_eq!(protocol.effect_phase, RecoveryEffectPhase::Armed);
         assert_eq!(protocol.effects.len(), 1);
@@ -3806,6 +5356,130 @@ mod tests {
             ),
             TableClassification::IncompletePhaseB,
             "an Armed sidecar must roll back even when its planned transaction is at HEAD"
+        );
+    }
+
+    #[tokio::test]
+    async fn branch_merge_v4_arms_multi_commit_ref_only_and_pointer_slots() {
+        let root = "mem-root";
+        let storage = ObjectStorageAdapter::in_memory();
+        let target_identifier = test_branch_identifier(3, "target-incarnation");
+        let lineage = RecoveryLineageIntent {
+            graph_commit_id: "01H000000000000000000000M1".to_string(),
+            branch: Some("target".to_string()),
+            actor_id: Some("act-merge".to_string()),
+            merged_parent_commit_id: Some("01H000000000000000000000S1".to_string()),
+            created_at: 456,
+        };
+        let mut multi_pin = make_pin("node:Person", "memory://person", 5, 6);
+        multi_pin.table_branch = Some("target".to_string());
+        let mut ref_pin = make_pin("node:Company", "memory://company", 4, 8);
+        ref_pin.table_branch = Some("target".to_string());
+        let effects = vec![
+            RecoveryBranchMergeEffect {
+                table_key: "node:Person".to_string(),
+                kind: RecoveryBranchMergeEffectKind::MultiCommitHead {
+                    source_fork_version: Some(5),
+                    planned_transactions: vec![
+                        transaction(5, "merge-person-append"),
+                        transaction(6, "merge-person-delete"),
+                    ],
+                    confirmed_version: None,
+                    confirmed_branch_identifier: None,
+                },
+            },
+            RecoveryBranchMergeEffect {
+                table_key: "node:Company".to_string(),
+                kind: RecoveryBranchMergeEffectKind::RefOnlyFork {
+                    // Deliberately differs from the target manifest CAS pin (4):
+                    // ref cleanup must use this exact SOURCE fork point.
+                    source_version: 8,
+                    confirmed_branch_identifier: None,
+                },
+            },
+        ];
+        let intended_delta = RecoveryManifestDelta {
+            table_updates: vec![
+                RecoveryTableUpdateSlot {
+                    table_key: "node:Person".to_string(),
+                    expected_version: 5,
+                    table_branch: Some("target".to_string()),
+                    confirmed: None,
+                },
+                RecoveryTableUpdateSlot {
+                    table_key: "node:Company".to_string(),
+                    expected_version: 4,
+                    table_branch: Some("target".to_string()),
+                    confirmed: None,
+                },
+                // No physical effect/pin: recovery must still publish this
+                // pointer-only output in the same fixed merge commit.
+                RecoveryTableUpdateSlot {
+                    table_key: "edge:WorksAt".to_string(),
+                    expected_version: 2,
+                    table_branch: None,
+                    confirmed: None,
+                },
+            ],
+            registrations: Vec::new(),
+            tombstones: Vec::new(),
+        };
+        let sidecar = new_branch_merge_sidecar(
+            Some("target".to_string()),
+            Some("act-merge".to_string()),
+            vec![multi_pin, ref_pin],
+            RecoveryAuthorityToken {
+                branch_identifier: target_identifier,
+                graph_head: Some("01H000000000000000000000T1".to_string()),
+                schema_ir_hash: "schema-hash".to_string(),
+                schema_identity_version: 1,
+            },
+            lineage,
+            effects,
+            intended_delta,
+        )
+        .unwrap();
+        assert_eq!(sidecar.schema_version, BRANCH_MERGE_SIDECAR_SCHEMA_VERSION);
+        assert!(sidecar.protocol_v3.is_none());
+        assert_eq!(
+            sidecar.protocol_v4.as_ref().unwrap().effect_phase,
+            RecoveryEffectPhase::Armed
+        );
+
+        let mut non_sequential = sidecar.clone();
+        let RecoveryBranchMergeEffectKind::MultiCommitHead {
+            planned_transactions,
+            ..
+        } = &mut non_sequential.protocol_v4.as_mut().unwrap().effects[0].kind
+        else {
+            panic!("first effect must be multi-commit")
+        };
+        planned_transactions[1].read_version = 9;
+        let error = validate_sidecar_shape("<non-sequential>", &non_sequential).unwrap_err();
+        assert!(error.to_string().contains("expected 6"));
+
+        let mut mismatched_slot = sidecar.clone();
+        mismatched_slot
+            .protocol_v4
+            .as_mut()
+            .unwrap()
+            .intended_delta
+            .table_updates[0]
+            .expected_version = 4;
+        let error = validate_sidecar_shape("<mismatched-slot>", &mismatched_slot).unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("does not match its physical table pin")
+        );
+
+        write_sidecar(root, &storage, &sidecar).await.unwrap();
+
+        let listed = list_sidecars(root, &storage).await.unwrap();
+        assert_eq!(listed.len(), 1);
+        assert_eq!(
+            listed[0].schema_version,
+            BRANCH_MERGE_SIDECAR_SCHEMA_VERSION
         );
     }
 
@@ -4360,6 +6034,115 @@ mod tests {
             foreign_restore.effect_ownership,
             EffectOwnership::OwnBeforeHead
         );
+    }
+
+    #[tokio::test]
+    async fn branch_merge_v4_proves_exact_chain_and_interrupted_compensation() {
+        let dir = tempfile::tempdir().unwrap();
+        let uri = format!("{}/people.lance", dir.path().to_str().unwrap());
+        let store = TableStore::new(
+            dir.path().to_str().unwrap(),
+            Arc::new(lance::session::Session::default()),
+        );
+        let ds = TableStore::write_dataset(&uri, person_batch(&[("alice", Some(30))]))
+            .await
+            .unwrap();
+
+        let first_staged = store
+            .stage_append(&ds, person_batch(&[("bob", Some(25))]), &[])
+            .await
+            .unwrap();
+        let first_planned = first_staged.transaction_identity();
+        let (after_first, first_committed) = store
+            .commit_staged_exact(Arc::new(ds), first_staged)
+            .await
+            .unwrap();
+        assert_eq!(first_committed, first_planned);
+
+        let second_staged = store
+            .stage_append(&after_first, person_batch(&[("carol", Some(40))]), &[])
+            .await
+            .unwrap();
+        let second_planned = second_staged.transaction_identity();
+        let (after_second, second_committed) = store
+            .commit_staged_exact(Arc::new(after_first), second_staged)
+            .await
+            .unwrap();
+        assert_eq!(second_committed, second_planned);
+        assert_eq!(after_second.version().version, 3);
+
+        let observation = BranchMergeRefObservation {
+            dataset: after_second.clone(),
+            version: after_second.version().version,
+            branch_identifier: after_second.branch_identifier().await.unwrap(),
+            parent_version: None,
+        };
+        let planned = vec![first_planned.clone(), second_planned.clone()];
+        let proof =
+            prove_branch_merge_multi_commit_effect(&observation, &planned, 1, "node:Person")
+                .await
+                .unwrap();
+        assert_eq!(proof.effect_ownership, EffectOwnership::OwnAtHead);
+        assert!(proof.full_effect_at_head);
+        assert!(proof.unsafe_reason.is_none());
+        drop(observation);
+        drop(after_second);
+
+        // Model Full recovery crashing after it appended Restore(v1), before
+        // it could publish that compensated HEAD through the manifest.
+        restore_table_to_version(&uri, None, 1).await.unwrap();
+        let compensated = Dataset::open(&uri).await.unwrap();
+        let observation = BranchMergeRefObservation {
+            version: compensated.version().version,
+            branch_identifier: compensated.branch_identifier().await.unwrap(),
+            parent_version: None,
+            dataset: compensated,
+        };
+        let proof =
+            prove_branch_merge_multi_commit_effect(&observation, &planned, 1, "node:Person")
+                .await
+                .unwrap();
+        assert_eq!(
+            proof.effect_ownership,
+            EffectOwnership::OwnCompensatedAtHead
+        );
+        assert!(!proof.full_effect_at_head);
+        assert!(proof.unsafe_reason.is_none());
+    }
+
+    #[tokio::test]
+    async fn branch_merge_v4_refuses_unplanned_head_movement() {
+        let dir = tempfile::tempdir().unwrap();
+        let uri = format!("{}/people.lance", dir.path().to_str().unwrap());
+        let store = TableStore::new(
+            dir.path().to_str().unwrap(),
+            Arc::new(lance::session::Session::default()),
+        );
+        let mut ds = TableStore::write_dataset(&uri, person_batch(&[("alice", Some(30))]))
+            .await
+            .unwrap();
+        store
+            .append_batch(&uri, &mut ds, person_batch(&[("foreign", Some(99))]))
+            .await
+            .unwrap();
+        let observation = BranchMergeRefObservation {
+            version: ds.version().version,
+            branch_identifier: ds.branch_identifier().await.unwrap(),
+            parent_version: None,
+            dataset: ds,
+        };
+
+        let proof = prove_branch_merge_multi_commit_effect(
+            &observation,
+            &[transaction(1, "planned-but-not-committed")],
+            1,
+            "node:Person",
+        )
+        .await
+        .unwrap();
+        assert_eq!(proof.effect_ownership, EffectOwnership::Unverifiable);
+        assert!(!proof.full_effect_at_head);
+        assert!(proof.unsafe_reason.is_some());
     }
 
     #[tokio::test]

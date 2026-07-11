@@ -131,6 +131,11 @@ pub(crate) struct WriteTxn {
     pub(crate) base: Snapshot,
     /// Complete coarse authority token for this prepared attempt.
     pub(crate) authority: WriteAuthorityToken,
+    /// Effective lineage head of the captured branch snapshot. Unlike
+    /// `authority.graph_head`, this includes an inherited head on a freshly
+    /// forked named branch whose materialized `graph_head:<branch>` row is
+    /// intentionally absent.
+    pub(crate) effective_graph_head: Option<String>,
     /// Catalog built from the exact accepted IR whose identity is recorded in
     /// `authority`. Mutation/load planning and validation must use this snapshot,
     /// never the handle-global catalog, which can lag a schema apply performed by
@@ -894,7 +899,7 @@ impl Omnigraph {
                 .await?;
             let (schema_ir, schema_state) =
                 load_validated_schema_contract(self.uri(), Arc::clone(&self.storage)).await?;
-            let (branch_identifier, graph_head, snapshot) = self
+            let (branch_identifier, graph_head, effective_graph_head, snapshot) = self
                 .write_authority_for_known_branch(branch.as_deref(), true)
                 .await?;
             self.ensure_schema_apply_not_locked("write preparation")
@@ -918,6 +923,7 @@ impl Omnigraph {
                     schema_ir_hash: schema_state.schema_ir_hash,
                     schema_identity_version: schema_state.schema_identity_version,
                 },
+                effective_graph_head,
                 catalog: Arc::new(catalog),
             });
         }
@@ -972,6 +978,7 @@ impl Omnigraph {
     ) -> Result<(
         lance::dataset::refs::BranchIdentifier,
         Option<String>,
+        Option<String>,
         Snapshot,
     )> {
         {
@@ -987,6 +994,10 @@ impl Omnigraph {
                     return Ok((
                         coord.branch_identifier().await?,
                         coord.exact_graph_head(),
+                        coord
+                            .head_commit_id()
+                            .await?
+                            .map(|head| head.as_str().to_string()),
                         coord.snapshot(),
                     ));
                 }
@@ -997,6 +1008,10 @@ impl Omnigraph {
         Ok((
             coord.branch_identifier().await?,
             coord.exact_graph_head(),
+            coord
+                .head_commit_id()
+                .await?
+                .map(|head| head.as_str().to_string()),
             coord.snapshot(),
         ))
     }
@@ -1008,7 +1023,7 @@ impl Omnigraph {
         // Recheck the durable sentinel inside that critical section so a schema
         // apply observed after preparation cannot be followed by a table effect.
         self.ensure_schema_apply_not_locked("write commit").await?;
-        let (branch_identifier, graph_head, snapshot) = self
+        let (branch_identifier, graph_head, _effective_graph_head, snapshot) = self
             .write_authority_for_known_branch(txn.branch.as_deref(), true)
             .await?;
         let schema_state = self.ensure_schema_state_valid().await?;
@@ -1969,17 +1984,6 @@ impl Omnigraph {
         normalize_branch_name(branch)
     }
 
-    pub(crate) async fn head_commit_id_for_branch(
-        &self,
-        branch: Option<&str>,
-    ) -> Result<Option<String>> {
-        let coordinator = self.open_coordinator_for_branch(branch).await?;
-        coordinator
-            .head_commit_id()
-            .await
-            .map(|id| id.map(|snapshot_id| snapshot_id.as_str().to_string()))
-    }
-
     pub async fn branch_create(&self, name: &str) -> Result<()> {
         self.branch_create_as(name, None).await
     }
@@ -2355,19 +2359,6 @@ impl Omnigraph {
         updates: &[crate::db::SubTableUpdate],
     ) -> Result<u64> {
         table_ops::commit_updates(self, updates).await
-    }
-
-    /// Publish a branch merge: the merged table `updates` and the merge commit
-    /// in one manifest CAS (RFC-013 Phase 7). The merge commit's merged-in parent
-    /// is `merged_parent_commit_id` (the source head); its first parent is the
-    /// live target-branch head, resolved by the publisher.
-    pub(crate) async fn commit_merge_with_actor(
-        &self,
-        updates: &[crate::db::SubTableUpdate],
-        merged_parent_commit_id: &str,
-        actor_id: Option<&str>,
-    ) -> Result<String> {
-        table_ops::commit_merge_with_actor(self, updates, merged_parent_commit_id, actor_id).await
     }
 
     pub(crate) async fn commit_updates_on_branch_with_expected(

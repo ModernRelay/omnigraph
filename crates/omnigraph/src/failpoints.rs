@@ -64,6 +64,10 @@ pub mod names {
     /// any durable table effect.
     pub const BRANCH_MERGE_POST_AUTHORITY_CAPTURE: &str =
         "branch_merge.post_authority_capture";
+    /// The v4 BranchMerge recovery intent is durable, before any first-touch
+    /// target table ref is created.
+    pub const BRANCH_MERGE_POST_SIDECAR_PRE_FORK: &str =
+        "branch_merge.post_sidecar_pre_fork";
     pub const BRANCH_MERGE_POST_PHASE_B_PRE_MANIFEST_COMMIT: &str =
         "branch_merge.post_phase_b_pre_manifest_commit";
     /// Every merge table effect is complete, but the sidecar is still in its
@@ -133,6 +137,11 @@ pub mod names {
     /// its operator-facing audit row is appended.
     pub const RECOVERY_POST_ROLLBACK_PUBLISH_PRE_AUDIT: &str =
         "recovery.post_rollback_publish_pre_audit";
+    /// After recovery restores one table to its prepared pre-effect content,
+    /// before the compensating manifest publish. A retry must recognize that
+    /// restore as this sidecar's owned compensation instead of wedging open.
+    pub const RECOVERY_POST_TABLE_RESTORE_PRE_PUBLISH: &str =
+        "recovery.post_table_restore_pre_publish";
     pub const RECOVERY_RECORD_AUDIT: &str = "recovery.record_audit";
     pub const RECOVERY_SIDECAR_CONFIRM: &str = "recovery.sidecar_confirm";
     pub const RECOVERY_SIDECAR_DELETE: &str = "recovery.sidecar_delete";
