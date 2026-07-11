@@ -78,7 +78,21 @@ pub(crate) async fn load_or_bootstrap_schema_contract(
 pub(crate) async fn validate_schema_contract(
     root_uri: &str,
     storage: Arc<dyn StorageAdapter>,
-) -> Result<()> {
+) -> Result<SchemaState> {
+    load_validated_schema_contract(root_uri, storage)
+        .await
+        .map(|(_, state)| state)
+}
+
+/// Load the accepted IR and its schema identity from one validated contract
+/// read. Mutation/load preparation carries the catalog built from this exact IR
+/// beside the identity in its `WriteTxn`; consulting the handle-global catalog
+/// would let a long-lived handle combine a newly observed schema token with an
+/// older in-memory plan.
+pub(crate) async fn load_validated_schema_contract(
+    root_uri: &str,
+    storage: Arc<dyn StorageAdapter>,
+) -> Result<(SchemaIR, SchemaState)> {
     let current_source_ir = read_current_source_ir(root_uri, storage.as_ref()).await?;
     let (persisted_ir, state) = match read_schema_contract(root_uri, storage.as_ref()).await? {
         SchemaContractRead::Present { ir, state } => (ir, state),
@@ -90,7 +104,33 @@ pub(crate) async fn validate_schema_contract(
     };
 
     validate_persisted_schema_contract(&persisted_ir, &state)?;
-    validate_current_source_matches(&state, &current_source_ir)
+    validate_current_source_matches(&state, &current_source_ir)?;
+    Ok((persisted_ir, state))
+}
+
+/// Read only the durable schema-identity marker. Schema apply promotes this
+/// file after `_schema.pg` and `_schema.ir.json`, then releases its sentinel.
+/// A capture path that already performed one full contract validation can use a
+/// trailing marker read to detect the publish-before-promotion window without
+/// paying for a second full source+IR parse.
+pub(crate) async fn read_schema_state_identity(
+    root_uri: &str,
+    storage: &dyn StorageAdapter,
+) -> Result<SchemaState> {
+    let text = storage.read_text(&schema_state_uri(root_uri)).await?;
+    let state = serde_json::from_str::<SchemaState>(&text).map_err(|err| {
+        schema_lock_conflict(format!(
+            "graph schema state in {} is invalid: {}",
+            SCHEMA_STATE_FILENAME, err
+        ))
+    })?;
+    if state.format_version != SCHEMA_STATE_FORMAT_VERSION {
+        return Err(schema_lock_conflict(format!(
+            "graph schema state format {} is unsupported",
+            state.format_version
+        )));
+    }
+    Ok(state)
 }
 
 pub(crate) async fn write_schema_contract(

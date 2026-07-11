@@ -66,7 +66,7 @@ use lance::dataset::{WhenMatched, WhenNotMatched};
 
 use crate::db::{Snapshot, SubTableEntry};
 use crate::error::Result;
-use crate::table_store::{StagedWrite, TableState, TableStore};
+use crate::table_store::{StagedTransactionIdentity, StagedWrite, TableState, TableStore};
 
 // ─── sealed module ──────────────────────────────────────────────────────────
 
@@ -173,6 +173,59 @@ impl StagedHandle {
     /// Take ownership of the inner `StagedWrite`. Used by `commit_staged`.
     pub(crate) fn into_staged(self) -> StagedWrite {
         self.inner
+    }
+
+    /// Lance transaction identity captured when this effect was staged.
+    pub fn transaction_identity(&self) -> StagedTransactionIdentity {
+        self.inner.transaction_identity()
+    }
+
+    /// Replace Lance's random transaction UUID with the identity durably armed
+    /// before a deferred first-touch fork. The read version must still match.
+    pub(crate) fn bind_transaction_identity(
+        &mut self,
+        planned: &StagedTransactionIdentity,
+    ) -> Result<()> {
+        self.inner.bind_transaction_identity(planned)
+    }
+}
+
+/// Result of the no-conflict-retry commit path used by RFC-022-enrolled
+/// writers. `is_exact` checks both transaction identity and achieved version:
+/// Lance's initial conflict-resolution pass can preserve `(read_version, uuid)`
+/// while committing at a later version. The table effect is durable when that
+/// happens, so the caller must leave its recovery sidecar armed.
+#[derive(Debug)]
+pub struct ExactCommitOutcome {
+    snapshot: SnapshotHandle,
+    planned_transaction: StagedTransactionIdentity,
+    committed_transaction: StagedTransactionIdentity,
+}
+
+impl ExactCommitOutcome {
+    pub fn is_exact(&self) -> bool {
+        self.planned_transaction == self.committed_transaction
+            && self.snapshot.version() == self.planned_transaction.read_version + 1
+    }
+
+    pub fn planned_transaction(&self) -> &StagedTransactionIdentity {
+        &self.planned_transaction
+    }
+
+    pub fn committed_transaction(&self) -> &StagedTransactionIdentity {
+        &self.committed_transaction
+    }
+
+    pub fn committed_version(&self) -> u64 {
+        self.snapshot.version()
+    }
+
+    pub fn snapshot(&self) -> &SnapshotHandle {
+        &self.snapshot
+    }
+
+    pub fn into_snapshot(self) -> SnapshotHandle {
+        self.snapshot
     }
 }
 
@@ -324,6 +377,20 @@ pub trait TableStorage: sealed::Sealed + Send + Sync + Debug {
         key_column: Option<&str>,
     ) -> Result<Vec<RecordBatch>>;
 
+    /// Full-schema blob-aware sibling of `scan_with_pending` for mutation
+    /// updates. The committed predicate scan retains row ids without projecting
+    /// blobs; only matched rows are then taken and rebuilt as Lance's logical
+    /// blob input arrays before unioning the in-memory pending view. This keeps
+    /// the eventual merge source schema independent of scalar-index state.
+    async fn scan_with_pending_materialized_blobs(
+        &self,
+        snapshot: &SnapshotHandle,
+        pending: &[RecordBatch],
+        pending_schema: Option<SchemaRef>,
+        filter: Option<&str>,
+        key_column: Option<&str>,
+    ) -> Result<Vec<RecordBatch>>;
+
     async fn first_row_id_for_filter(
         &self,
         snapshot: &SnapshotHandle,
@@ -365,6 +432,15 @@ pub trait TableStorage: sealed::Sealed + Send + Sync + Debug {
         snapshot: SnapshotHandle,
         staged: StagedHandle,
     ) -> Result<SnapshotHandle>;
+
+    /// Commit one staged effect with Lance conflict retries disabled and expose
+    /// the transaction identity that actually landed. Legacy callers retain
+    /// `commit_staged`; RFC-022 adapters opt into this method explicitly.
+    async fn commit_staged_exact(
+        &self,
+        snapshot: SnapshotHandle,
+        staged: StagedHandle,
+    ) -> Result<ExactCommitOutcome>;
 
     /// Stage an overwrite (Operation::Overwrite). MR-793 Phase 2.
     async fn stage_overwrite(
@@ -636,6 +712,25 @@ impl TableStorage for TableStore {
         .await
     }
 
+    async fn scan_with_pending_materialized_blobs(
+        &self,
+        snapshot: &SnapshotHandle,
+        pending: &[RecordBatch],
+        pending_schema: Option<SchemaRef>,
+        filter: Option<&str>,
+        key_column: Option<&str>,
+    ) -> Result<Vec<RecordBatch>> {
+        TableStore::scan_with_pending_materialized_blobs(
+            self,
+            snapshot.dataset(),
+            pending,
+            pending_schema,
+            filter,
+            key_column,
+        )
+        .await
+    }
+
     async fn first_row_id_for_filter(
         &self,
         snapshot: &SnapshotHandle,
@@ -699,6 +794,22 @@ impl TableStorage for TableStore {
         TableStore::commit_staged(self, ds_arc, staged.into_staged())
             .await
             .map(SnapshotHandle::new)
+    }
+
+    async fn commit_staged_exact(
+        &self,
+        snapshot: SnapshotHandle,
+        staged: StagedHandle,
+    ) -> Result<ExactCommitOutcome> {
+        let planned_transaction = staged.transaction_identity();
+        let ds_arc = snapshot.into_arc();
+        let (dataset, committed_transaction) =
+            TableStore::commit_staged_exact(self, ds_arc, staged.into_staged()).await?;
+        Ok(ExactCommitOutcome {
+            snapshot: SnapshotHandle::new(dataset),
+            planned_transaction,
+            committed_transaction,
+        })
     }
 
     async fn stage_overwrite(

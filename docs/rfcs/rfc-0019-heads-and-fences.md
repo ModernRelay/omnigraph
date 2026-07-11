@@ -2,7 +2,7 @@
 type: spec
 title: "RFC-019 — Heads and Fences: structural O(1) writes without a warm-cache truth fork"
 description: Replaces the warm-publish/pinned-open machinery of PR #318 with two structural changes — durable per-table head rows ("refs, not replay") and substrate-native key-conflict fencing (Lance's unenforced-PK KeyExistenceFilter) — landing together as internal schema v5; composes with RFC-018 (WAL ingest) and the upstream multi-table-commit direction.
-status: draft
+status: superseded
 tags: [eng, rfc, write-path, manifest, lance, omnigraph]
 timestamp: 2026-07-04
 owner:
@@ -10,11 +10,20 @@ owner:
 
 # RFC-019 — Heads and Fences
 
-**Status:** Draft / for discussion
+**Status:** Superseded by [RFC-023](rfc-023-key-conflict-fencing.md) and [RFC-024](rfc-024-durable-table-heads.md)
 **Date:** 2026-07-04
 **Surveyed:** omnigraph `main` @ 98530a0e (0.8.0); Lance pinned 7.0.0 (+ vendored lance-table carrying lance#7480); upstream Lance v8.0.0 (released 2026-07-01), v9.0.0-beta.15; PR #318 at `2aab48ba` (reviewed 2026-07-04, 8 verified findings)
 **Companion docs:** RFC-018 (streaming-ingest WAL), PR #318's plan doc (`unlimited-history-latency-plan.md`, whose §9 "U2" this RFC promotes from follow-up to prerequisite)
 **Audience:** OmniGraph maintainers
+
+> **Supersession note (2026-07-10):** key-conflict fencing and durable table
+> heads are separate irreversible decisions with different substrate gates and
+> rollout requirements. RFC-023 and RFC-024 review them independently under
+> RFC-022's shared graph-write protocol. RFC-023 also corrects this draft's
+> load-bearing symmetry claim: on the surveyed Lance revision, an unfiltered
+> current transaction (including bare `Append`) can rebase after a filtered
+> update. Fencing therefore requires both transaction orders plus a fleet
+> compatibility barrier; it is not “unblocked for new tables” in a mixed graph.
 
 ---
 

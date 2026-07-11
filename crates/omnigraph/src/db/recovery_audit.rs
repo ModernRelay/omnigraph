@@ -1,10 +1,11 @@
 //! Recovery audit row storage in `_graph_commit_recoveries.lance`.
 //!
-//! A standalone internal table (not catalog-tracked). Each successful
-//! recovery sweep — roll-forward or roll-back — records one row here so
-//! operators investigating a sidecar-attributed mutation can correlate
-//! `omnigraph commit list --filter actor=omnigraph:recovery` with the
-//! original actor whose mutation was rolled forward / back.
+//! A standalone internal table (not catalog-tracked). Each completed recovery
+//! action records one row here with the original actor and exact per-table
+//! outcome. A v3 roll-forward preserves the interrupted writer's lineage and
+//! actor, while rollback and legacy recovery lineage use
+//! `omnigraph:recovery`; ordinary commit history is therefore not a complete
+//! recovery log. This table currently has no public CLI query surface.
 //!
 //! This standalone table is additive: it doesn't bump
 //! `INTERNAL_MANIFEST_SCHEMA_VERSION`. Folding `recovery_for_actor` and
@@ -14,10 +15,10 @@
 //! Atomicity caveat: append to `_graph_commit_recoveries.lance` is
 //! sequential w.r.t. the recovery commit, which RFC-013 Phase 7 records in
 //! `__manifest` (folded into the recovery publish CAS via `publish_recovery_commit`).
-//! A crash between the publish and this audit append leaves a recovery commit
-//! with no audit row. The recovery sweep tolerates it the same way (re-entry
-//! sees `NoMovement` for already-restored / already-published tables; the audit
-//! append is retried, minting a fresh recovery commit).
+//! A crash between the publish and this audit append leaves a visible outcome
+//! with no audit row. V3 sidecars carry fixed outcome ids and durable audit
+//! payloads, so re-entry appends the missing row without minting another
+//! commit; legacy sidecars retain their stale-sidecar cleanup behavior.
 
 use std::sync::Arc;
 

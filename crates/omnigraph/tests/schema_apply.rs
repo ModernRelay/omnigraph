@@ -1,14 +1,17 @@
 mod helpers;
 
 use std::fs;
+#[cfg(feature = "failpoints")]
+use std::sync::Arc;
 
-use omnigraph::db::{Omnigraph, ReadTarget};
+use omnigraph::db::{MergeOutcome, Omnigraph, ReadTarget};
 use omnigraph::loader::{LoadMode, load_jsonl};
 use omnigraph_compiler::{SchemaMigrationStep, SchemaTypeKind};
 
 use helpers::*;
 
 #[tokio::test]
+#[cfg_attr(feature = "failpoints", serial_test::parallel)]
 async fn plan_schema_reports_supported_additive_change() {
     let dir = tempfile::tempdir().unwrap();
     let uri = dir.path().to_str().unwrap();
@@ -33,6 +36,322 @@ async fn plan_schema_reports_supported_additive_change() {
 }
 
 #[tokio::test]
+#[cfg_attr(feature = "failpoints", serial_test::parallel)]
+async fn long_lived_handle_uses_the_schema_catalog_bound_to_its_write_token() {
+    let dir = tempfile::tempdir().unwrap();
+    let uri = dir.path().to_str().unwrap();
+    let schema_owner = Omnigraph::init(uri, TEST_SCHEMA).await.unwrap();
+    // Open before the migration: this handle's process-local ArcSwap catalog is
+    // intentionally stale after `schema_owner` completes the apply.
+    let stale_handle = Omnigraph::open(uri).await.unwrap();
+
+    let desired = format!(
+        "{}\nnode Project {{\n    name: String @key\n}}\n",
+        TEST_SCHEMA.replace(
+            "    age: I32?\n}",
+            "    age: I32?\n    nickname: String?\n}",
+        )
+    );
+    schema_owner.apply_schema(&desired).await.unwrap();
+
+    let mutation = r#"
+query insert_with_nickname($name: String, $age: I32, $nickname: String) {
+    insert Person { name: $name, age: $age, nickname: $nickname }
+}
+"#;
+    let inserted = stale_handle
+        .mutate(
+            "main",
+            mutation,
+            "insert_with_nickname",
+            &mixed_params(
+                &[("$name", "mutated-after-schema"), ("$nickname", "fresh")],
+                &[("$age", 31)],
+            ),
+        )
+        .await
+        .expect("mutation must typecheck and build its batch with the token-bound catalog");
+    assert_eq!(inserted.affected_nodes, 1);
+
+    let loaded = stale_handle
+        .load(
+            "main",
+            r#"{"type":"Person","data":{"name":"loaded-after-schema","age":32,"nickname":"fresh"}}"#,
+            LoadMode::Merge,
+        )
+        .await
+        .expect("load parsing and validation must use the same token-bound catalog");
+    assert_eq!(loaded.nodes_loaded.get("Person"), Some(&1));
+    assert_eq!(count_rows(&stale_handle, "node:Person").await, 2);
+
+    // The same stale handle must bind branch-merge planning and conservative
+    // branch-control table gates to the accepted contract captured under the
+    // schema gate. The warm handle catalog predates Project; consulting it here
+    // would fail with `unknown node type` (or omit Project's control queue).
+    stale_handle.branch_create("source").await.unwrap();
+    stale_handle.branch_create("target").await.unwrap();
+    let project_mutation = r#"
+query insert_project($name: String) {
+    insert Project { name: $name }
+}
+"#;
+    stale_handle
+        .mutate(
+            "source",
+            project_mutation,
+            "insert_project",
+            &params(&[("$name", "fresh-catalog-project")]),
+        )
+        .await
+        .expect("source write must use the token-bound post-apply catalog");
+    assert_eq!(
+        stale_handle
+            .branch_merge("source", "target")
+            .await
+            .expect("merge planning must use the schema-gated post-apply catalog"),
+        MergeOutcome::FastForward
+    );
+    assert_eq!(
+        count_rows_branch(&stale_handle, "target", "node:Project").await,
+        1
+    );
+}
+
+/// Native branch controls must enumerate their conservative table envelope
+/// from the accepted catalog captured under the schema gate, not a long-lived
+/// handle's pre-apply ArcSwap. Park delete after that envelope is held and prove
+/// a legacy Project-only index reconciler cannot cross its table queue.
+#[cfg(feature = "failpoints")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[serial_test::serial]
+async fn stale_handle_branch_delete_gates_tables_added_by_schema_apply() {
+    use omnigraph::failpoints::names;
+
+    let dir = tempfile::tempdir().unwrap();
+    let uri = dir.path().to_str().unwrap();
+    let schema_owner = Omnigraph::init(uri, TEST_SCHEMA).await.unwrap();
+    let stale_control = Arc::new(Omnigraph::open(uri).await.unwrap());
+    let desired = format!("{TEST_SCHEMA}\nnode Project {{\n    name: String @key\n}}\n");
+    schema_owner.apply_schema(&desired).await.unwrap();
+    schema_owner.branch_create("target").await.unwrap();
+    schema_owner
+        .load(
+            "target",
+            r#"{"type":"Project","data":{"name":"pending-index"}}"#,
+            LoadMode::Merge,
+        )
+        .await
+        .unwrap();
+    let index_reconciler = Arc::new(Omnigraph::open(uri).await.unwrap());
+
+    let delete_rv =
+        helpers::failpoint::Rendezvous::park_first(names::BRANCH_DELETE_POST_TABLE_GATES);
+    let delete_handle = Arc::clone(&stale_control);
+    let delete_task = tokio::spawn(async move { delete_handle.branch_delete("target").await });
+    delete_rv.wait_until_reached().await;
+
+    let index_handle = Arc::clone(&index_reconciler);
+    let mut index_task = tokio::spawn(async move { index_handle.ensure_indices_on("target").await });
+    let index_blocked = tokio::time::timeout(
+        std::time::Duration::from_millis(250),
+        &mut index_task,
+    )
+    .await
+    .is_err();
+    delete_rv.release();
+    assert!(
+        index_blocked,
+        "stale control catalog omitted the newly-added Project table gate"
+    );
+    delete_task.await.unwrap().unwrap();
+
+    if tokio::time::timeout(std::time::Duration::from_secs(10), &mut index_task)
+        .await
+        .is_err()
+    {
+        index_task.abort();
+        let _ = index_task.await;
+        panic!("index reconciler did not finish after branch delete released its table gate");
+    }
+}
+
+#[cfg(feature = "failpoints")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[serial_test::serial]
+async fn mutation_waits_for_mid_apply_schema_gate_then_reprepares() {
+    use omnigraph::failpoints::names;
+
+    let dir = tempfile::tempdir().unwrap();
+    let db = Arc::new(init_and_load(&dir).await);
+    let desired = TEST_SCHEMA.replace(
+        "    age: I32?\n}",
+        "    age: I32?\n    nickname: String?\n}",
+    );
+
+    // First park the mutation after all validation/staging but before it enters
+    // the schema→branch→table effect gates. This fixes the otherwise tiny race
+    // window deterministically.
+    let mutation_rv =
+        helpers::failpoint::Rendezvous::park_first(names::MUTATION_POST_STAGE_PRE_EFFECT_GATE);
+    let mutation_db = Arc::clone(&db);
+    let mutation_task = tokio::spawn(async move {
+        mutation_db
+            .mutate(
+                "main",
+                MUTATION_QUERIES,
+                "insert_person",
+                &mixed_params(&[("$name", "schema-gated")], &[("$age", 33)]),
+            )
+            .await
+    });
+    mutation_rv.wait_until_reached().await;
+
+    // Start schema apply and park it after its staging files (and any table
+    // rewrite) exist but before manifest/schema promotion. The outer apply owns
+    // the schema-control gate throughout this window.
+    let schema_rv =
+        helpers::failpoint::Rendezvous::park_first(names::SCHEMA_APPLY_AFTER_STAGING_WRITE);
+    let schema_db = Arc::clone(&db);
+    let schema_task = tokio::spawn(async move { schema_db.apply_schema(&desired).await });
+    schema_rv.wait_until_reached().await;
+
+    mutation_rv.release();
+    // Give the already-runnable mutation repeated scheduler turns. It must stay
+    // pending on the schema gate; completing here means it either advanced under
+    // an in-flight migration or returned a spurious post-prepare failure.
+    for _ in 0..128 {
+        tokio::task::yield_now().await;
+        if mutation_task.is_finished() {
+            break;
+        }
+    }
+    assert!(
+        !mutation_task.is_finished(),
+        "mutation must remain behind the schema-control gate while apply is in flight",
+    );
+
+    schema_rv.release();
+    schema_task.await.unwrap().unwrap();
+    let result = mutation_task
+        .await
+        .unwrap()
+        .expect("insert-only mutation must reprepare under the promoted schema");
+    assert_eq!(result.affected_nodes, 1);
+    assert_eq!(count_rows(&db, "node:Person").await, 5);
+}
+
+/// ReadOnly opens participate in the process-local schema publication gate even
+/// though they perform no recovery writes. Park an open immediately before its
+/// source/IR/state read: schema apply must not reach staging until that coherent
+/// catalog capture finishes.
+#[cfg(feature = "failpoints")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[serial_test::serial]
+async fn read_only_open_holds_schema_gate_through_catalog_capture() {
+    use omnigraph::failpoints::names;
+
+    let dir = tempfile::tempdir().unwrap();
+    let uri = dir.path().to_str().unwrap().to_string();
+    let owner = Arc::new(init_and_load(&dir).await);
+    let desired = TEST_SCHEMA.replace(
+        "    age: I32?\n}",
+        "    age: I32?\n    nickname: String?\n}",
+    );
+
+    let open_rv =
+        helpers::failpoint::Rendezvous::park_first(names::OPEN_BEFORE_SCHEMA_CONTRACT_READ);
+    let open_uri = uri.clone();
+    let open_task = tokio::spawn(async move { Omnigraph::open_read_only(&open_uri).await });
+    open_rv.wait_until_reached().await;
+
+    let apply_rv =
+        helpers::failpoint::Rendezvous::park_first(names::SCHEMA_APPLY_AFTER_STAGING_WRITE);
+    let apply_owner = Arc::clone(&owner);
+    let apply_task = tokio::spawn(async move { apply_owner.apply_schema(&desired).await });
+    assert!(
+        tokio::time::timeout(
+            std::time::Duration::from_millis(200),
+            apply_rv.wait_until_reached(),
+        )
+        .await
+        .is_err(),
+        "schema apply must remain behind the ReadOnly catalog-capture gate",
+    );
+
+    open_rv.release();
+    let opened = open_task.await.unwrap().unwrap();
+    assert!(
+        !opened.catalog().node_types["Person"]
+            .properties
+            .contains_key("nickname"),
+        "the serialized open must publish the complete pre-apply catalog"
+    );
+    apply_rv.wait_until_reached().await;
+    apply_rv.release();
+    apply_task.await.unwrap().unwrap();
+    let current = Omnigraph::open_read_only(&uri).await.unwrap();
+    assert!(
+        current.catalog().node_types["Person"]
+            .properties
+            .contains_key("nickname"),
+        "the next open must publish the complete post-apply catalog"
+    );
+}
+
+/// Refresh must reacquire the schema gate after sidecar healing and retain it
+/// through the ArcSwap publication. Otherwise a concurrent three-file schema
+/// promotion can be interleaved with its contract read.
+#[cfg(feature = "failpoints")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[serial_test::serial]
+async fn refresh_holds_schema_gate_through_catalog_publication() {
+    use omnigraph::failpoints::names;
+
+    let dir = tempfile::tempdir().unwrap();
+    let owner = Arc::new(init_and_load(&dir).await);
+    let stale = Arc::new(Omnigraph::open(dir.path().to_str().unwrap()).await.unwrap());
+    let desired = TEST_SCHEMA.replace(
+        "    age: I32?\n}",
+        "    age: I32?\n    nickname: String?\n}",
+    );
+
+    let reload_rv =
+        helpers::failpoint::Rendezvous::park_first(names::SCHEMA_RELOAD_BEFORE_CONTRACT_READ);
+    let refresh_handle = Arc::clone(&stale);
+    let refresh_task = tokio::spawn(async move { refresh_handle.refresh().await });
+    reload_rv.wait_until_reached().await;
+
+    let apply_rv =
+        helpers::failpoint::Rendezvous::park_first(names::SCHEMA_APPLY_AFTER_STAGING_WRITE);
+    let apply_owner = Arc::clone(&owner);
+    let apply_task = tokio::spawn(async move { apply_owner.apply_schema(&desired).await });
+    assert!(
+        tokio::time::timeout(
+            std::time::Duration::from_millis(200),
+            apply_rv.wait_until_reached(),
+        )
+        .await
+        .is_err(),
+        "schema apply must remain behind refresh's catalog-publication gate",
+    );
+
+    reload_rv.release();
+    refresh_task.await.unwrap().unwrap();
+    apply_rv.wait_until_reached().await;
+    apply_rv.release();
+    apply_task.await.unwrap().unwrap();
+
+    stale.refresh().await.unwrap();
+    assert!(
+        stale.catalog().node_types["Person"]
+            .properties
+            .contains_key("nickname"),
+        "a post-apply refresh must publish the complete new catalog"
+    );
+}
+
+#[tokio::test]
+#[cfg_attr(feature = "failpoints", serial_test::parallel)]
 async fn plan_schema_rejects_when_schema_contract_has_drifted() {
     let dir = tempfile::tempdir().unwrap();
     let uri = dir.path().to_str().unwrap();
@@ -49,6 +368,7 @@ async fn plan_schema_rejects_when_schema_contract_has_drifted() {
 }
 
 #[tokio::test]
+#[cfg_attr(feature = "failpoints", serial_test::parallel)]
 async fn apply_schema_noop_returns_not_applied() {
     let dir = tempfile::tempdir().unwrap();
     let uri = dir.path().to_str().unwrap();
@@ -61,6 +381,7 @@ async fn apply_schema_noop_returns_not_applied() {
 }
 
 #[tokio::test]
+#[cfg_attr(feature = "failpoints", serial_test::parallel)]
 async fn apply_schema_rejects_when_non_main_branch_exists() {
     let dir = tempfile::tempdir().unwrap();
     let uri = dir.path().to_str().unwrap();
@@ -79,6 +400,7 @@ async fn apply_schema_rejects_when_non_main_branch_exists() {
 }
 
 #[tokio::test]
+#[cfg_attr(feature = "failpoints", serial_test::parallel)]
 async fn apply_schema_unsupported_plan_does_not_advance_manifest() {
     let dir = tempfile::tempdir().unwrap();
     let uri = dir.path().to_str().unwrap();
@@ -117,6 +439,7 @@ async fn apply_schema_unsupported_plan_does_not_advance_manifest() {
 // contract so a regression in the planner can't silently change behavior.
 
 #[tokio::test]
+#[cfg_attr(feature = "failpoints", serial_test::parallel)]
 async fn apply_schema_drops_a_nullable_property_softly_preserves_prior_version() {
     let dir = tempfile::tempdir().unwrap();
     let mut db = init_and_load(&dir).await;
@@ -221,6 +544,7 @@ async fn apply_schema_drops_a_nullable_property_softly_preserves_prior_version()
 }
 
 #[tokio::test]
+#[cfg_attr(feature = "failpoints", serial_test::parallel)]
 async fn apply_schema_drops_node_and_referencing_edge_softly() {
     let dir = tempfile::tempdir().unwrap();
     let mut db = init_and_load(&dir).await;
@@ -334,6 +658,7 @@ edge Knows: Person -> Person {
 }
 
 #[tokio::test]
+#[cfg_attr(feature = "failpoints", serial_test::parallel)]
 async fn apply_schema_drops_an_edge_type_softly() {
     let dir = tempfile::tempdir().unwrap();
     let mut db = init_and_load(&dir).await;
@@ -391,6 +716,7 @@ async fn apply_schema_drops_an_edge_type_softly() {
 }
 
 #[tokio::test]
+#[cfg_attr(feature = "failpoints", serial_test::parallel)]
 async fn apply_schema_rejects_adding_a_required_property_without_backfill() {
     let dir = tempfile::tempdir().unwrap();
     let mut db = init_and_load(&dir).await;
@@ -419,6 +745,7 @@ async fn apply_schema_rejects_adding_a_required_property_without_backfill() {
 }
 
 #[tokio::test]
+#[cfg_attr(feature = "failpoints", serial_test::parallel)]
 async fn plan_schema_for_property_type_narrowing_is_not_supported() {
     // Symmetric companion to `apply_schema_unsupported_plan_does_not_advance_manifest`,
     // which exercises widening (I32 -> I64). Narrowing (I64 -> I32) is also
@@ -446,6 +773,7 @@ async fn plan_schema_for_property_type_narrowing_is_not_supported() {
 }
 
 #[tokio::test]
+#[cfg_attr(feature = "failpoints", serial_test::parallel)]
 async fn apply_schema_renames_node_type_via_rename_from_and_preserves_rows() {
     // Covers the stable-type-id contract: renaming a type preserves the
     // underlying Lance dataset (by stable id), so existing rows survive the
@@ -535,6 +863,7 @@ edge WorksAt: Human -> Company
 // persists. Full orphan-dataset deletion is a separate follow-up.
 
 #[tokio::test]
+#[cfg_attr(feature = "failpoints", serial_test::parallel)]
 async fn apply_schema_with_allow_data_loss_promotes_drops_to_hard() {
     let dir = tempfile::tempdir().unwrap();
     let mut db = init_and_load(&dir).await;
@@ -601,6 +930,7 @@ async fn apply_schema_with_allow_data_loss_promotes_drops_to_hard() {
 }
 
 #[tokio::test]
+#[cfg_attr(feature = "failpoints", serial_test::parallel)]
 async fn apply_schema_hard_drops_property_makes_prior_version_unreachable() {
     let dir = tempfile::tempdir().unwrap();
     let mut db = init_and_load(&dir).await;
@@ -653,6 +983,7 @@ async fn apply_schema_hard_drops_property_makes_prior_version_unreachable() {
 }
 
 #[tokio::test]
+#[cfg_attr(feature = "failpoints", serial_test::parallel)]
 async fn apply_schema_hard_drops_node_and_edge_with_flag_succeeds() {
     let dir = tempfile::tempdir().unwrap();
     let mut db = init_and_load(&dir).await;
@@ -737,19 +1068,14 @@ edge Knows: Person -> Person {
     // (no manifest entry), which is the user-facing guarantee.
 }
 
-// Regression (bug 3 / dev-graph iss-848): a `Vector @index` on a 0-row table
-// must not abort an otherwise-valid schema apply. A vector (IVF) index trains
-// k-means centroids over the column's vectors, so Lance cannot build it on 0
-// vectors — it errors with "Creating empty vector indices with train=False is
-// not yet implemented". When a *later* migration touches that table (here, an
-// unrelated scalar `@index` on `body`), schema apply reconciles the table's
-// whole index set, which previously tried to materialize the dormant vector
-// index and aborted the entire migration (all-or-nothing). The build is now
-// deferred (pending) when the column is untrainable, instead of failing the
-// migration. The dormant index is materialized by a later `ensure_indices` /
-// `optimize` once the table has rows. Full decoupling — intent recorded at
-// apply, an async reconciler converges physical coverage — is iss-848.
+// Regression (bug 3 / dev-graph iss-848): schema apply records index intent but
+// performs no physical index work. That decoupling is load-bearing for a
+// `Vector @index` on a 0-row table: Lance cannot train IVF centroids on no
+// vectors, yet the logical migration must still succeed. A later
+// `ensure_indices` / `optimize` materializes every buildable declaration once
+// data exists and reports an untrainable vector column as pending meanwhile.
 #[tokio::test]
+#[cfg_attr(feature = "failpoints", serial_test::parallel)]
 async fn apply_schema_defers_vector_index_on_empty_table() {
     let dir = tempfile::tempdir().unwrap();
     let uri = dir.path().to_str().unwrap();
@@ -766,9 +1092,8 @@ async fn apply_schema_defers_vector_index_on_empty_table() {
         }\n";
     let mut db = Omnigraph::init(uri, v1).await.unwrap();
 
-    // Add an *unrelated* scalar @index on `body`. This routes Doc through
-    // schema apply's index reconcile, which must NOT abort on the untrainable
-    // empty vector index.
+    // Add an unrelated scalar @index on `body`. Schema apply must record both
+    // declarations without trying to build either one or train the empty vector.
     let v2 = "node Doc {\n    \
         slug: String @key\n    \
         body: String? @index\n    \
@@ -779,11 +1104,8 @@ async fn apply_schema_defers_vector_index_on_empty_table() {
     );
     assert!(result.applied, "the scalar @index change must apply");
 
-    // The deferred vector index is not dropped — once the table has a
-    // trainable vector, `ensure_indices` materializes it without error. (If
-    // the guard wrongly skipped a non-empty column, this would still be
-    // unindexed; if it wrongly tried to build on empty, the apply above would
-    // have failed.)
+    // The deferred declarations are not dropped: after data arrives, the
+    // explicit reconciler materializes every buildable index without error.
     load_jsonl(
         &mut db,
         r#"{"type":"Doc","data":{"slug":"d1","body":"hello","embedding":[0.1,0.2,0.3,0.4,0.5,0.6,0.7,0.8]}}"#,
@@ -803,6 +1125,7 @@ async fn apply_schema_defers_vector_index_on_empty_table() {
 // optimize. Pre-iss-848 the indexed_tables block built the index inline and
 // bumped the table version.
 #[tokio::test]
+#[cfg_attr(feature = "failpoints", serial_test::parallel)]
 async fn index_only_constraint_apply_touches_no_table_data() {
     let dir = tempfile::tempdir().unwrap();
     let uri = dir.path().to_str().unwrap();
@@ -823,6 +1146,7 @@ async fn index_only_constraint_apply_touches_no_table_data() {
         .entry("node:Doc")
         .unwrap()
         .table_version;
+    let before_commits = db.list_commits(None).await.unwrap();
 
     // Add an @index on the existing `n` column.
     let v2 = "node Doc {\n    slug: String @key\n    n: I64 @index\n}\n";
@@ -840,6 +1164,12 @@ async fn index_only_constraint_apply_touches_no_table_data() {
         before, after,
         "adding an @index must not bump the table version (no inline index build)"
     );
+    let after_commits = db.list_commits(None).await.unwrap();
+    assert_eq!(
+        after_commits.len(),
+        before_commits.len() + 1,
+        "metadata-only schema apply must still advance graph_head so it arbitrates concurrent prepared writes"
+    );
 }
 
 // Enum widening (iss-enum-widening-migration): adding variants to an enum is
@@ -847,6 +1177,7 @@ async fn index_only_constraint_apply_touches_no_table_data() {
 // touched, and the widened set is enforced immediately on writes. Narrowing
 // stays OG-MF-106-refused.
 #[tokio::test]
+#[cfg_attr(feature = "failpoints", serial_test::parallel)]
 async fn enum_widening_apply_is_metadata_only_and_accepts_new_variant() {
     let dir = tempfile::tempdir().unwrap();
     let uri = dir.path().to_str().unwrap();
@@ -867,6 +1198,7 @@ async fn enum_widening_apply_is_metadata_only_and_accepts_new_variant() {
         .entry("node:Ticket")
         .unwrap()
         .table_version;
+    let before_commits = db.list_commits(None).await.unwrap();
 
     let v2 =
         "node Ticket {\n    slug: String @key\n    status: enum(todo, doing, done, blocked)\n}\n";
@@ -884,6 +1216,12 @@ async fn enum_widening_apply_is_metadata_only_and_accepts_new_variant() {
     assert_eq!(
         before, after,
         "enum widening must not bump the table version (metadata-only)"
+    );
+    let after_commits = db.list_commits(None).await.unwrap();
+    assert_eq!(
+        after_commits.len(),
+        before_commits.len() + 1,
+        "metadata-only enum widening must still advance graph_head"
     );
 
     // The NEW variant is accepted on the write path...
@@ -914,6 +1252,7 @@ async fn enum_widening_apply_is_metadata_only_and_accepts_new_variant() {
 }
 
 #[tokio::test]
+#[cfg_attr(feature = "failpoints", serial_test::parallel)]
 async fn enum_narrowing_apply_is_refused() {
     let dir = tempfile::tempdir().unwrap();
     let uri = dir.path().to_str().unwrap();

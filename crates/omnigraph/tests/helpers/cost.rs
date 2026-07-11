@@ -202,7 +202,8 @@ impl ObjectStore for PrefixCountingStore {
     }
 
     fn list(&self, prefix: Option<&Path>) -> BoxStream<'static, OSResult<ObjectMeta>> {
-        self.counter.record_read(&prefix.cloned().unwrap_or_default());
+        self.counter
+            .record_read(&prefix.cloned().unwrap_or_default());
         self.target.list(prefix)
     }
 
@@ -211,12 +212,14 @@ impl ObjectStore for PrefixCountingStore {
         prefix: Option<&Path>,
         offset: &Path,
     ) -> BoxStream<'static, OSResult<ObjectMeta>> {
-        self.counter.record_read(&prefix.cloned().unwrap_or_default());
+        self.counter
+            .record_read(&prefix.cloned().unwrap_or_default());
         self.target.list_with_offset(prefix, offset)
     }
 
     async fn list_with_delimiter(&self, prefix: Option<&Path>) -> OSResult<ListResult> {
-        self.counter.record_read(&prefix.cloned().unwrap_or_default());
+        self.counter
+            .record_read(&prefix.cloned().unwrap_or_default());
         self.target.list_with_delimiter(prefix).await
     }
 

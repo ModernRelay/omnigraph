@@ -635,16 +635,16 @@ fn row_signature(batch: &RecordBatch, row: usize) -> Result<String> {
 /// it is validated like `AdoptWithDelta`; only an empty-delta adopt is skipped.
 async fn build_merge_changeset(
     db: &Omnigraph,
+    catalog: &Catalog,
     candidates: &HashMap<String, CandidateTableState>,
 ) -> Result<crate::validate::ChangeSet> {
-    let catalog = db.catalog();
     let mut changeset = crate::validate::ChangeSet::new();
     for (table_key, candidate) in candidates {
         // Validation reads only id/src/dst + scalar constraint columns; project
         // out Vector/Blob so the change-set never holds embeddings (holding the
         // delta with embeddings would re-introduce the memory pressure the
         // streaming append exists to avoid).
-        let projection = validation_projection(&catalog, table_key);
+        let projection = validation_projection(catalog, table_key);
         let projection: Vec<&str> = projection.iter().map(String::as_str).collect();
         let mut change = crate::validate::TableChange::default();
         match candidate {
@@ -736,7 +736,7 @@ async fn scan_staged_for_validation(
 }
 
 async fn validate_merge_candidates(
-    db: &Omnigraph,
+    catalog: &Catalog,
     target_snapshot: &Snapshot,
     changeset: &crate::validate::ChangeSet,
 ) -> Result<()> {
@@ -746,9 +746,9 @@ async fn validate_merge_candidates(
     // uniqueness, edge-RI, and cardinality all route through one evaluator shared
     // with (eventually) the write path — closing the merge-vs-write drift.
     let committed = crate::validate::CommittedState::merge(target_snapshot);
-    let constraints = crate::validate::constraints_for(&db.catalog());
+    let constraints = crate::validate::constraints_for(catalog);
     let violations =
-        crate::validate::evaluate(&constraints, changeset, &committed, &db.catalog()).await?;
+        crate::validate::evaluate(&constraints, changeset, &committed, catalog).await?;
     if violations.is_empty() {
         Ok(())
     } else {
@@ -1233,13 +1233,6 @@ impl Omnigraph {
             actor_id,
         )?;
         self.ensure_schema_apply_idle("branch_merge").await?;
-        // Converge any pending recovery sidecar before the merge
-        // captures its target snapshot: the merge's publish would
-        // otherwise make the drifted Phase-B commit visible as an
-        // unattributed side effect (manifest catches up to HEAD with no
-        // recovery audit row) and leave the stale sidecar behind. Runs
-        // before the merge's own sidecar exists.
-        self.heal_pending_recovery_sidecars().await?;
         self.branch_merge_impl(source, target, actor_id).await
     }
 
@@ -1262,6 +1255,34 @@ impl Omnigraph {
                 "branch_merge requires distinct source and target branches".to_string(),
             ));
         }
+
+        let relevant_branches = [source_branch.as_deref(), target_branch.as_deref()];
+        // Branch merge is still a legacy per-table publisher, but its graph-ref
+        // authority must be stable for the complete prepare -> publish window.
+        // First converge or reject relevant recovery intent, then join the same
+        // root-shared schema -> branch order used by native branch controls.
+        // Holding both branch gates through publication prevents a target
+        // delete/recreate from reusing the branch name underneath a plan (ABA).
+        self.heal_pending_recovery_sidecars_for_write(&relevant_branches)
+            .await?;
+        let _schema_guard = self
+            .write_queue()
+            .acquire(&crate::db::manifest::schema_apply_serial_queue_key())
+            .await;
+        let _branch_guards = self
+            .write_queue()
+            .acquire_branches(&[source_branch.clone(), target_branch.clone()])
+            .await;
+        self.ensure_no_pending_recovery_sidecars_under_gates(
+            &relevant_branches,
+            "branch_merge",
+        )
+        .await?;
+        self.refresh_coordinator_only().await?;
+        self.ensure_schema_apply_not_locked("branch_merge").await?;
+        let merge_catalog = self
+            .load_accepted_catalog_with_schema_gate_held()
+            .await?;
 
         let source_head_commit_id = self
             .head_commit_id_for_branch(source_branch.as_deref())
@@ -1298,6 +1319,15 @@ impl Omnigraph {
             ))
             .await?
             .snapshot;
+        let target_snapshot = self
+            .resolved_target(ReadTarget::Branch(
+                target_branch.clone().unwrap_or_else(|| "main".to_string()),
+            ))
+            .await?
+            .snapshot;
+        crate::failpoints::maybe_fail(
+            crate::failpoints::names::BRANCH_MERGE_POST_AUTHORITY_CAPTURE,
+        )?;
         // Hold the merge-exclusive mutex across the full swap → operate
         // → restore window. Two concurrent branch_merge calls would
         // otherwise interleave their three separate `coordinator.write()`
@@ -1316,6 +1346,10 @@ impl Omnigraph {
             .branch_merge_on_current_target(
                 &base_snapshot,
                 &source_snapshot,
+                &target_snapshot,
+                merge_catalog.as_ref(),
+                source_branch.as_deref(),
+                target_branch.as_deref(),
                 &target_head_commit_id,
                 &source_head_commit_id,
                 is_fast_forward,
@@ -1353,8 +1387,8 @@ impl Omnigraph {
         // `crates/omnigraph/tests/failpoints.rs`.
         //
         // Err-path refresh is best-effort: the merge body's error
-        // (typically the structured `manifest_conflict` from the
-        // post_queue_snapshot drift check) is the value the caller
+        // (typically the structured read-set conflict from the fresh
+        // post-table-gate manifest check) is the value the caller
         // needs to see. A refresh-time storage error would replace
         // that with a less informative error; the next op or the next
         // `Omnigraph::open` will re-sync the coord anyway.
@@ -1378,13 +1412,15 @@ impl Omnigraph {
         &self,
         base_snapshot: &Snapshot,
         source_snapshot: &Snapshot,
+        target_snapshot: &Snapshot,
+        catalog: &Catalog,
+        source_branch: Option<&str>,
+        target_branch: Option<&str>,
         target_head_commit_id: &str,
         source_head_commit_id: &str,
         is_fast_forward: bool,
         actor_id: Option<&str>,
     ) -> Result<MergeOutcome> {
-        let target_snapshot = self.snapshot().await;
-
         let mut table_keys = HashSet::new();
         for entry in base_snapshot.entries() {
             table_keys.insert(entry.table_key.clone());
@@ -1415,10 +1451,10 @@ impl Omnigraph {
             if same_manifest_state(base_entry, target_entry) {
                 let candidate = classify_adopt(
                     self,
-                    &self.catalog(),
+                    catalog,
                     base_snapshot,
                     source_snapshot,
-                    &target_snapshot,
+                    target_snapshot,
                     table_key,
                 )
                 .await?;
@@ -1428,10 +1464,10 @@ impl Omnigraph {
 
             if let Some(staged) = stage_streaming_table_merge(
                 table_key,
-                &self.catalog(),
+                catalog,
                 base_snapshot,
                 source_snapshot,
-                &target_snapshot,
+                target_snapshot,
                 &mut conflicts,
             )
             .await?
@@ -1447,8 +1483,8 @@ impl Omnigraph {
             return Err(OmniError::MergeConflicts(conflicts));
         }
 
-        let changeset = build_merge_changeset(self, &candidates).await?;
-        validate_merge_candidates(self, &target_snapshot, &changeset).await?;
+        let changeset = build_merge_changeset(self, catalog, &candidates).await?;
+        validate_merge_candidates(catalog, target_snapshot, &changeset).await?;
 
         // Recovery sidecar: protect the per-table commit_staged loop.
         // Pin `RewriteMerged` and `AdoptWithDelta` candidates — both advance
@@ -1469,54 +1505,48 @@ impl Omnigraph {
         // HEAD unpinned — is closed: `classify_adopt` pre-computes the delta, so a
         // HEAD-advancing adopt is `AdoptWithDelta` (pinned here) and an empty-delta
         // adopt stays `AdoptSourceState`.
-        // Acquire per-(table_key, target_branch) queues for every table
-        // touched by the merge plan. Sorted-order acquisition prevents
-        // lock-order inversion against concurrent multi-table writers.
-        // The active branch (set by the caller's `swap_coordinator_for_branch`)
-        // is the merge target; queue keys are scoped to it because a
-        // branch_merge writes only to the target branch.
         //
-        // Held across the per-table publish loop and the manifest
-        // commit + record_merge_commit calls below, so no concurrent
-        // writer to a touched (table, target_branch) can interleave
-        // between our commit_staged and our publish.
-        let active_branch_for_keys = self.active_branch().await;
-        let merge_queue_keys: Vec<(String, Option<String>)> = ordered_table_keys
-            .iter()
-            .filter(|table_key| {
-                matches!(
-                    candidates.get(*table_key),
-                    Some(CandidateTableState::RewriteMerged(_))
-                        | Some(CandidateTableState::AdoptSourceState { .. })
-                        | Some(CandidateTableState::AdoptWithDelta(_))
-                )
-            })
-            .map(|table_key| (table_key.clone(), active_branch_for_keys.clone()))
-            .collect();
+        // This bridge still coexists with legacy maintenance writers that take
+        // only `(table, branch)` queues. Acquire the conservative all-catalog
+        // envelope for BOTH source and target, in the global sorted order, then
+        // re-run the sidecar barrier and re-read both manifest branches before
+        // Phase A. Planning remains outside table queues, but no plan derived
+        // from a stale source/target snapshot can cross into physical effects.
+        let active_branch_for_keys = target_branch.map(str::to_string);
+        let merge_branches = [
+            source_branch.map(str::to_string),
+            active_branch_for_keys.clone(),
+        ];
+        let merge_queue_keys = self.table_queue_keys_for_branches(&merge_branches, catalog);
         let _merge_queue_guards = self.write_queue().acquire_many(&merge_queue_keys).await;
 
-        let post_queue_snapshot = self.snapshot().await;
-        for table_key in &ordered_table_keys {
-            let Some(candidate) = candidates.get(table_key) else {
-                continue;
-            };
-            if !matches!(
-                candidate,
-                CandidateTableState::RewriteMerged(_)
-                    | CandidateTableState::AdoptSourceState { .. }
-                    | CandidateTableState::AdoptWithDelta(_)
-            ) {
-                continue;
-            }
-            let expected = target_snapshot.entry(table_key).map(|e| e.table_version);
-            let current = post_queue_snapshot
-                .entry(table_key)
-                .map(|e| e.table_version);
-            if expected != current {
-                return Err(OmniError::manifest_expected_version_mismatch(
-                    table_key.clone(),
-                    expected.unwrap_or(0),
-                    current.unwrap_or(0),
+        self.ensure_no_pending_recovery_sidecars_under_gates(
+            &[source_branch, target_branch],
+            "branch_merge after acquiring source/target table gates",
+        )
+        .await?;
+        let fresh_source_snapshot = self
+            .fresh_snapshot_for_branch_unchecked(source_branch)
+            .await?;
+        let fresh_target_snapshot = self
+            .fresh_snapshot_for_branch_unchecked(target_branch)
+            .await?;
+        for (member, prepared, current) in [
+            ("source", source_snapshot, &fresh_source_snapshot),
+            ("target", target_snapshot, &fresh_target_snapshot),
+        ] {
+            if prepared.version() != current.version() {
+                return Err(OmniError::manifest_read_set_changed(
+                    format!(
+                        "branch_merge_{member}:{}",
+                        if member == "source" {
+                            source_branch.unwrap_or("main")
+                        } else {
+                            target_branch.unwrap_or("main")
+                        }
+                    ),
+                    Some(prepared.version().to_string()),
+                    Some(current.version().to_string()),
                 ));
             }
         }
@@ -1607,7 +1637,7 @@ impl Omnigraph {
             };
             let update = match candidate_state {
                 CandidateTableState::AdoptSourceState { .. } => {
-                    publish_adopted_source_state(self, source_snapshot, &target_snapshot, table_key)
+                    publish_adopted_source_state(self, source_snapshot, target_snapshot, table_key)
                         .await?
                 }
                 CandidateTableState::AdoptWithDelta(delta) => {
@@ -1631,6 +1661,9 @@ impl Omnigraph {
         // `updates` carry the real per-table final versions (multiple
         // commit_staged calls per table, so not derivable from `post_commit_pin`
         // alone). A failure here leaves the unconfirmed sidecar → roll back.
+        crate::failpoints::maybe_fail(
+            crate::failpoints::names::BRANCH_MERGE_POST_EFFECTS_PRE_CONFIRM,
+        )?;
         if let Some((sidecar, _)) = recovery.as_mut() {
             let confirmed_versions: std::collections::HashMap<String, u64> = updates
                 .iter()

@@ -2,7 +2,7 @@
 type: spec
 title: "RFC-018 — Streaming-ingest WAL on Lance MemWAL"
 description: Adds a durability-first streaming ingest path (ack on WAL durability, asynchronous fold into the graph commit chain) built entirely on Lance's MemWAL primitive; reconciled against Lance v8.0.0 and the v9 beta line; analyzed for composition with the upstream multi-table-commit RFCs.
-status: draft
+status: superseded
 tags: [eng, rfc, wal, ingest, lance, omnigraph]
 timestamp: 2026-07-02
 owner:
@@ -10,11 +10,18 @@ owner:
 
 # RFC-018 — Streaming-ingest WAL on Lance MemWAL
 
-**Status:** Draft / for discussion
+**Status:** Superseded by [RFC-026](rfc-026-memwal-streaming-ingest.md)
 **Date:** 2026-07-02
 **Surveyed version:** 0.7.2 (branch `dst-extract-crate`); Lance pinned at 7.0.0
 **Upstream surveyed:** Lance v8.0.0 (released; RC votes closed 2026-07-01), v9.0.0-beta.10; MemWAL spec (`lance.org/format/table/mem_wal/`, fetched in full 2026-07-02); discussions #7260, #7264, #7222, #7176
 **Audience:** OmniGraph maintainers
+
+> **Supersession note (2026-07-10):** RFC-026 carries the streaming-ingest
+> design forward under RFC-022's unified graph-write protocol. It also corrects
+> this draft's characterization of MemWAL: MemWAL is a strategic Lance
+> architecture and a major substrate investment, not an experimental direction.
+> The integration risk is its evolving API and format surface across Lance
+> releases.
 
 ---
 
@@ -125,8 +132,10 @@ fencing primitive.
 ## 3. Substrate inventory — what Lance provides and how we use all of it
 
 Per the lance.md protocol the MemWAL spec and adjacent pages were fetched in
-full (2026-07-02). The spec is **experimental** upstream — risk register in
-§10. Inventory, mapped to consumption:
+full (2026-07-02). MemWAL is a strategic Lance architecture with substantial
+upstream investment. Its API and format surface are still evolving across
+releases; §10 treats that maturity boundary as an integration risk. Inventory,
+mapped to consumption:
 
 | Lance tooling | Spec/PR | How this RFC uses it |
 |---|---|---|
@@ -323,8 +332,8 @@ this RFC phases on:
   matures it may fit *small in-place updates* better than WAL-upsert-fold;
   watch-listed as a possible Phase 4 refinement, not a dependency.
 - MemWAL fixes keep landing on v9 betas (#7489 cross-generation block-list on
-  in-memory scan arms) — confirming the experimental-spec churn risk (§10)
-  and the value of keeping our exposure transient-state-only.
+  in-memory scan arms) — confirming that its API/format integration surface is
+  still moving (§10) and the value of keeping our exposure transient-state-only.
 
 ## 7. Composition with upcoming Lance multi-table commits
 
@@ -464,8 +473,9 @@ participates in publication authority.
 
 ## 10. Risks
 
-- **MemWAL is experimental upstream** (spec banner; live format votes —
-  #7418 Status field mid-2026-06). Mitigation is structural: WAL state is
+- **MemWAL's API and format surface continues to evolve.** This risk concerns beta-era
+  API churn, not architectural commitment: Lance has made MemWAL a strategic
+  streaming-write investment. Mitigation is structural: WAL state is
   *transient* (folded then GC'd), so a format change between Lance versions
   can be handled by fold-to-quiescent before the bump; no long-lived on-disk
   state depends on the MemWAL format. This must stay true — resist any

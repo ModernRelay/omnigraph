@@ -788,8 +788,9 @@ pub(crate) async fn run_query(
         (status = 400, description = "Bad request", body = ErrorOutput),
         (status = 401, description = "Unauthorized", body = ErrorOutput),
         (status = 403, description = "Forbidden", body = ErrorOutput),
-        (status = 409, description = "Merge conflict", body = ErrorOutput),
+        (status = 409, description = "Write-authority conflict", body = ErrorOutput),
         (status = 429, description = "Per-actor admission cap exceeded; honor `Retry-After` header", body = ErrorOutput),
+        (status = 503, description = "An overlapping durable recovery intent must be resolved before retry", body = ErrorOutput),
     ),
     security(("bearer_token" = [])),
 )]
@@ -837,8 +838,9 @@ pub(crate) async fn server_change(
         (status = 400, description = "Bad request", body = ErrorOutput),
         (status = 401, description = "Unauthorized", body = ErrorOutput),
         (status = 403, description = "Forbidden", body = ErrorOutput),
-        (status = 409, description = "Merge conflict", body = ErrorOutput),
+        (status = 409, description = "Write-authority conflict", body = ErrorOutput),
         (status = 429, description = "Per-actor admission cap exceeded; honor `Retry-After` header", body = ErrorOutput),
+        (status = 503, description = "An overlapping durable recovery intent must be resolved before retry", body = ErrorOutput),
     ),
     security(("bearer_token" = [])),
 )]
@@ -847,7 +849,8 @@ pub(crate) async fn server_change(
 /// Writes to the named `branch` (defaults to `main`). Mutations are atomic
 /// per call and produce a new commit. Returns counts of nodes and edges
 /// affected. **Destructive**: on success the branch is updated; rejected
-/// mutations may still acquire locks briefly. Returns 409 on merge conflict.
+/// mutations may still acquire locks briefly. Returns 409 when the prepared
+/// write authority changes before effects.
 ///
 /// Pairs with `POST /query` (read-only). The legacy `POST /change` route
 /// has identical semantics and is kept as a deprecated alias.
@@ -904,9 +907,10 @@ pub(crate) fn parse_optional_invoke_body(
         (status = 401, description = "Unauthorized", body = ErrorOutput),
         (status = 403, description = "Forbidden (the inner `change` gate for a stored mutation)", body = ErrorOutput),
         (status = 404, description = "Unknown stored query, or `invoke_query` denied — indistinguishable to a caller without the grant", body = ErrorOutput),
-        (status = 409, description = "Merge conflict", body = ErrorOutput),
+        (status = 409, description = "Stored mutation write-authority conflict", body = ErrorOutput),
         (status = 429, description = "Per-actor admission cap exceeded; honor `Retry-After` header", body = ErrorOutput),
         (status = 500, description = "Policy evaluation error (a denial is reported as 404, not 500)", body = ErrorOutput),
+        (status = 503, description = "A stored mutation is blocked by a durable recovery intent", body = ErrorOutput),
     ),
     security(("bearer_token" = [])),
 )]
@@ -1203,25 +1207,11 @@ pub(crate) async fn server_schema_apply(
         .await
         .map_err(ApiError::from_omni)?
     };
-    // Prompt index convergence (iss-848): schema apply records `@index` intent
-    // but defers the physical build. On a long-lived server, materialize it
-    // promptly rather than waiting for the next `optimize` cron — spawned
-    // detached so it never blocks or fails the apply response. Best-effort: a
-    // failure is logged and the index still converges on the next optimize.
-    // The CLI is one-shot, so it has no equivalent; its convergence path is the
-    // operator's optimize cadence.
-    if result.applied {
-        let engine = Arc::clone(&handle.engine);
-        tokio::spawn(async move {
-            if let Err(err) = engine.ensure_indices().await {
-                tracing::warn!(
-                    target: "omnigraph::server",
-                    error = %err,
-                    "post-apply ensure_indices failed; indexes will converge on the next optimize",
-                );
-            }
-        });
-    }
+    // Physical indexes are derived state. Schema apply records intent only;
+    // explicit `ensure_indices` / `optimize` maintenance owns convergence on
+    // every surface, including a long-lived server. Keeping the handler free
+    // of detached physical writes also makes a successful response describe
+    // the complete effect envelope of this request.
     Ok(Json(schema_apply_output(handle.uri.as_str(), result)))
 }
 
@@ -1313,7 +1303,9 @@ async fn run_ingest(
         (status = 400, description = "Bad request", body = ErrorOutput),
         (status = 401, description = "Unauthorized", body = ErrorOutput),
         (status = 403, description = "Forbidden", body = ErrorOutput),
+        (status = 409, description = "Prepared load authority changed before effects", body = ErrorOutput),
         (status = 429, description = "Per-actor admission cap exceeded; honor `Retry-After` header", body = ErrorOutput),
+        (status = 503, description = "An overlapping durable recovery intent must be resolved before retry", body = ErrorOutput),
     ),
     security(("bearer_token" = [])),
 )]
@@ -1357,7 +1349,9 @@ pub(crate) async fn server_load(
         (status = 400, description = "Bad request", body = ErrorOutput),
         (status = 401, description = "Unauthorized", body = ErrorOutput),
         (status = 403, description = "Forbidden", body = ErrorOutput),
+        (status = 409, description = "Prepared load authority changed before effects", body = ErrorOutput),
         (status = 429, description = "Per-actor admission cap exceeded; honor `Retry-After` header", body = ErrorOutput),
+        (status = 503, description = "An overlapping durable recovery intent must be resolved before retry", body = ErrorOutput),
     ),
     security(("bearer_token" = [])),
 )]
@@ -1437,6 +1431,7 @@ pub(crate) async fn server_branch_list(
         (status = 403, description = "Forbidden", body = ErrorOutput),
         (status = 409, description = "Branch already exists", body = ErrorOutput),
         (status = 429, description = "Per-actor admission cap exceeded; honor `Retry-After` header", body = ErrorOutput),
+        (status = 503, description = "An overlapping durable recovery intent must be resolved before retry", body = ErrorOutput),
     ),
     security(("bearer_token" = [])),
 )]
@@ -1518,6 +1513,7 @@ pub(crate) struct BranchPath {
         (status = 403, description = "Forbidden", body = ErrorOutput),
         (status = 404, description = "Branch not found", body = ErrorOutput),
         (status = 429, description = "Per-actor admission cap exceeded; honor `Retry-After` header", body = ErrorOutput),
+        (status = 503, description = "An overlapping durable recovery intent must be resolved before retry", body = ErrorOutput),
     ),
     security(("bearer_token" = [])),
 )]
@@ -1579,6 +1575,7 @@ pub(crate) async fn server_branch_delete(
         (status = 403, description = "Forbidden", body = ErrorOutput),
         (status = 409, description = "Merge conflict", body = ErrorOutput),
         (status = 429, description = "Per-actor admission cap exceeded; honor `Retry-After` header", body = ErrorOutput),
+        (status = 503, description = "An overlapping durable recovery intent must be resolved before retry", body = ErrorOutput),
     ),
     security(("bearer_token" = [])),
 )]

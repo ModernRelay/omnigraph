@@ -391,7 +391,9 @@ const EXPECTED_SCHEMAS: &[&str] = &[
     "MergeConflictOutput",
     "ReadOutput",
     "ReadRequest",
+    "ReadSetConflictOutput",
     "ReadTargetOutput",
+    "RecoveryRequiredOutput",
     "ManifestConflictOutput",
     "SchemaApplyOutput",
     "SchemaApplyRequest",
@@ -614,6 +616,8 @@ fn error_output_schema_has_expected_fields() {
     assert!(props.contains_key("code"));
     assert!(props.contains_key("merge_conflicts"));
     assert!(props.contains_key("manifest_conflict"));
+    assert!(props.contains_key("read_set_conflict"));
+    assert!(props.contains_key("recovery_required"));
 }
 
 #[test]
@@ -624,6 +628,24 @@ fn manifest_conflict_output_schema_has_expected_fields() {
     assert!(props.contains_key("table_key"));
     assert!(props.contains_key("expected"));
     assert!(props.contains_key("actual"));
+}
+
+#[test]
+fn read_set_conflict_output_schema_has_expected_fields() {
+    let doc = openapi_json();
+    let schema = &doc["components"]["schemas"]["ReadSetConflictOutput"];
+    let props = schema["properties"].as_object().unwrap();
+    assert!(props.contains_key("member"));
+    assert!(props.contains_key("expected"));
+    assert!(props.contains_key("actual"));
+}
+
+#[test]
+fn recovery_required_output_schema_has_expected_fields() {
+    let doc = openapi_json();
+    let schema = &doc["components"]["schemas"]["RecoveryRequiredOutput"];
+    let props = schema["properties"].as_object().unwrap();
+    assert!(props.contains_key("operation_id"));
 }
 
 #[test]
@@ -694,12 +716,21 @@ fn error_code_schema_has_expected_variants() {
     let schema = &doc["components"]["schemas"]["ErrorCode"];
     let variants = schema["enum"].as_array().unwrap();
     let values: HashSet<&str> = variants.iter().map(|v| v.as_str().unwrap()).collect();
-    assert!(values.contains("unauthorized"));
-    assert!(values.contains("forbidden"));
-    assert!(values.contains("bad_request"));
-    assert!(values.contains("not_found"));
-    assert!(values.contains("conflict"));
-    assert!(values.contains("internal"));
+    assert_eq!(
+        values,
+        HashSet::from([
+            "unauthorized",
+            "forbidden",
+            "bad_request",
+            "not_found",
+            "method_not_allowed",
+            "conflict",
+            "too_many_requests",
+            "internal",
+        ]),
+        "ErrorCode is a rolling wire contract: new meanings belong in optional \
+         structured fields, not new closed-enum values",
+    );
 }
 
 #[test]
@@ -915,6 +946,32 @@ fn error_responses_reference_error_output_schema() {
         assert!(
             ref_path.contains("ErrorOutput"),
             "{method} {path} {status} should reference ErrorOutput, got {ref_path}"
+        );
+    }
+}
+
+#[test]
+fn recovery_barrier_write_endpoints_document_recovery_required() {
+    let doc = openapi_json();
+    for (path, method) in [
+        ("/graphs/{graph_id}/change", "post"),
+        ("/graphs/{graph_id}/mutate", "post"),
+        ("/graphs/{graph_id}/queries/{name}", "post"),
+        ("/graphs/{graph_id}/load", "post"),
+        ("/graphs/{graph_id}/ingest", "post"),
+        ("/graphs/{graph_id}/branches", "post"),
+        ("/graphs/{graph_id}/branches/{branch}", "delete"),
+        ("/graphs/{graph_id}/branches/merge", "post"),
+    ] {
+        let response = &doc["paths"][path][method]["responses"]["503"];
+        assert!(
+            response.is_object(),
+            "{method} {path} must document the recovery-required 503 outcome"
+        );
+        assert_eq!(
+            response["content"]["application/json"]["schema"]["$ref"],
+            "#/components/schemas/ErrorOutput",
+            "{method} {path} 503 must use ErrorOutput"
         );
     }
 }

@@ -815,16 +815,15 @@ query high_value() {
     assert_eq!(values.value(8), 499);
 }
 
-// ─── Stale handle must refresh-and-retry (no silent rebase) ──────────────
+// ─── Long-lived strict handle refreshes before preparation ───────────────
 
 #[tokio::test]
-async fn stale_handle_public_mutation_must_refresh_then_retry() {
-    // With the Run state machine removed, the engine no longer
-    // auto-rebases stale-handle mutations onto the latest target head.
-    // The publisher's `expected_table_versions` CAS makes the contract
-    // explicit — a stale writer fails loudly with
-    // `ExpectedVersionMismatch` and the client decides whether to
-    // refresh-and-retry.
+async fn long_lived_handle_prepares_strict_mutation_from_current_head() {
+    // Merely opening a handle before another completed commit does not make the
+    // next attempt stale: open_write_txn probes the manifest incarnation and
+    // captures the current branch authority before it plans the strict update.
+    // ReadSetChanged is reserved for movement during an already-prepared
+    // attempt (covered deterministically in the failpoint suite).
     let dir = tempfile::tempdir().unwrap();
     let _db = init_and_load(&dir).await;
     drop(_db);
@@ -843,26 +842,8 @@ async fn stale_handle_public_mutation_must_refresh_then_retry() {
     .await
     .unwrap();
 
-    // Writer 2 is now stale. Its first attempt must fail with
-    // ExpectedVersionMismatch — no silent rebase.
-    let stale_err = mutate_main(
-        &mut db2,
-        MUTATION_QUERIES,
-        "set_age",
-        &mixed_params(&[("$name", "Alice")], &[("$age", 99)]),
-    )
-    .await
-    .expect_err("stale writer must hit ExpectedVersionMismatch");
-    let omnigraph::error::OmniError::Manifest(manifest_err) = stale_err else {
-        panic!("expected Manifest error");
-    };
-    assert!(matches!(
-        manifest_err.details,
-        Some(omnigraph::error::ManifestConflictDetails::ExpectedVersionMismatch { .. })
-    ));
-
-    // Refresh and retry — the canonical client recovery path.
-    db2.sync_branch("main").await.unwrap();
+    // Writer 2's handle predates Eve, but its strict attempt prepares from the
+    // current head and succeeds in one call.
     mutate_main(
         &mut db2,
         MUTATION_QUERIES,

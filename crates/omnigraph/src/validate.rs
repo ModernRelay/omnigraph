@@ -238,9 +238,10 @@ pub(crate) struct CommittedState<'a> {
     /// tables, not a global flag — an edges-only overwrite still sees committed
     /// nodes for RI. Empty on the merge / mutation / append / merge-load paths.
     overwritten: HashSet<String>,
-    /// Write path only: open edge tables at LIVE HEAD for `@card` (the #298
-    /// stale-handle fix). `None` on the merge and load paths — there the snapshot
-    /// (or empty) is the committed view for every check.
+    /// Write path only: open edge tables from a fresh graph-branch manifest
+    /// snapshot for `@card` (the #298 stale-handle fix). This is the live
+    /// committed graph view, not a raw Lance HEAD that may be unpublished or
+    /// belong to an inherited source ref. `None` on merge/load.
     live: Option<(&'a Omnigraph, Option<&'a str>)>,
 }
 
@@ -255,7 +256,8 @@ impl<'a> CommittedState<'a> {
     }
 
     /// Write path: existence/uniqueness read `committed` (the write's pinned
-    /// base); cardinality reads LIVE HEAD per edge table via `db` (#298).
+    /// base); cardinality reads the live committed branch snapshot via `db`
+    /// (#298).
     pub(crate) fn write(committed: &'a Snapshot, db: &'a Omnigraph, branch: Option<&'a str>) -> Self {
         Self {
             committed: Some(committed),
@@ -300,10 +302,12 @@ impl<'a> CommittedState<'a> {
         }
     }
 
-    /// Open an edge table for cardinality counting: LIVE HEAD on the write path
-    /// (so an edge a concurrent writer committed since the base was pinned is
-    /// counted — #298), the committed snapshot otherwise. `None` if there is no
-    /// committed view (Overwrite load) or the table isn't in it.
+    /// Open an edge table for cardinality counting: the current manifest-visible
+    /// graph-branch snapshot on the write path (so a concurrent published edge
+    /// is counted — #298), the pinned committed snapshot otherwise. Resolving
+    /// through the fresh graph snapshot is load-bearing for first-touch named
+    /// branches: their table still inherits another Lance ref until this write's
+    /// sidecar is armed, so opening the target ref directly would be invalid.
     async fn open_cardinality(&self, table_key: &str) -> Result<Option<Dataset>> {
         if self.overwritten.contains(table_key) {
             return Ok(None);
@@ -311,14 +315,21 @@ impl<'a> CommittedState<'a> {
         let Some(committed) = self.committed else {
             return Ok(None);
         };
-        let Some(entry) = committed.entry(table_key) else {
+        let Some(_entry) = committed.entry(table_key) else {
             return Ok(None);
         };
         match self.live {
             Some((db, branch)) => {
-                let full_path = db.storage().dataset_uri(&entry.table_path);
-                let handle = db.storage().open_dataset_head(&full_path, branch).await?;
-                Ok(Some(handle.dataset().clone()))
+                // `CommittedState::write` is constructed only after WriteTxn
+                // schema validation, so use the unchecked manifest refresh to
+                // avoid another full contract read while retaining live branch
+                // authority. Snapshot::open follows the entry's actual
+                // `table_branch` and pinned version (including inheritance).
+                let live = db.fresh_snapshot_for_branch_unchecked(branch).await?;
+                match live.entry(table_key) {
+                    Some(_) => Ok(Some(live.open(table_key).await?)),
+                    None => Ok(None),
+                }
             }
             None => Ok(Some(committed.open(table_key).await?)),
         }

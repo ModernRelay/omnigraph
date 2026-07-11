@@ -152,6 +152,15 @@ where
     // exists, so the heal can never observe it.
     db.heal_pending_recovery_sidecars().await?;
 
+    // Process-local schema-control gate. RFC-022 mutation/load commit paths
+    // acquire this before their branch/table gates and retain it through
+    // publication. Taking it before the durable sentinel closes the old race in
+    // which schema apply could create the sentinel while a mutation already held
+    // a table queue, causing that mutation to advance Lance HEAD and only then
+    // discover the schema lock. The native sentinel remains the cross-handle /
+    // crash-visible authority; this queue removes the avoidable same-handle race.
+    let schema_gate_key = crate::db::manifest::schema_apply_serial_queue_key();
+    let _schema_gate = db.write_queue().acquire(&schema_gate_key).await;
     acquire_schema_apply_lock(db).await?;
     let result = apply_schema_with_lock(db, desired_schema_source, options, validate_catalog).await;
     let release_result = release_schema_apply_lock(db).await;
@@ -440,23 +449,17 @@ where
     // practice. They exist for symmetry with the recovery reconciler, which
     // acquires the same queues before any `Dataset::restore` it issues for
     // SchemaApply sidecars.
-    let mut schema_apply_queue_keys: Vec<(String, Option<String>)> = recovery_pins
+    let schema_apply_queue_keys: Vec<(String, Option<String>)> = recovery_pins
         .iter()
         .map(|pin| (pin.table_key.clone(), pin.table_branch.clone()))
         .collect();
-    // The serialization key the write-entry heal acquires before touching
-    // schema staging or a SchemaApply sidecar. Per-table keys alone don't
-    // cover a registration-only migration (no pins, but a sidecar and
-    // staging files on disk) — without this, a concurrent write's heal can
-    // promote this apply's staging files and publish its registrations out
-    // from under it. Acquired whenever a sidecar will be written, held
-    // through Phase D (the guards live to the end of this function).
+    // The outer `apply_schema` holds the schema-control serialization key from
+    // before sentinel creation through sentinel release. Per-table guards here
+    // therefore cover only the concrete table effects; acquiring the schema key
+    // again would deadlock because these queues are intentionally non-reentrant.
     let writes_sidecar = !(recovery_pins.is_empty()
         && sidecar_registrations.is_empty()
         && sidecar_tombstones.is_empty());
-    if writes_sidecar {
-        schema_apply_queue_keys.push(crate::db::manifest::schema_apply_serial_queue_key());
-    }
     let _schema_apply_queue_guards = db
         .write_queue()
         .acquire_many(&schema_apply_queue_keys)
@@ -862,10 +865,7 @@ pub(super) async fn ensure_snapshot_entry_head_matches(
     let dataset_uri = db.storage().dataset_uri(&entry.table_path);
     let ds = db
         .storage()
-        .open_dataset_head(
-            &dataset_uri,
-            entry.table_branch.as_deref(),
-        )
+        .open_dataset_head(&dataset_uri, entry.table_branch.as_deref())
         .await?;
     db.storage()
         .ensure_expected_version(&ds, &entry.table_key, entry.table_version)

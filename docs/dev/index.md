@@ -74,6 +74,15 @@ pattern, not just the outcome.
 |---|---|
 | camelCase property filters lowercased at runtime (#283) — two engine→Lance boundaries, two different fixes | [bug-case-fix.md](bug-case-fix.md) |
 
+## Active Design Reviews
+
+Review ledgers record open findings against proposed architecture. They remain
+as durable disposition history after closure, so RFC backlinks stay valid.
+
+| Area | Read |
+|---|---|
+| RFC-022–027 split architecture review — open correctness blockers, dependency corrections, and required acceptance evidence | [rfc-022-027-architecture-review.md](rfc-022-027-architecture-review.md) |
+
 ## Active Implementation Plans
 
 Working documents for in-flight feature work. Removed when the work lands.

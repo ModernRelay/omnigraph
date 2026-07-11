@@ -361,7 +361,8 @@ node Doc {
     let uri = dir.path().to_str().unwrap();
     let mut db = Omnigraph::init(uri, SCHEMA).await.unwrap();
 
-    // First load builds the id + rank BTREEs over the initial fragment.
+    // Loads publish only data effects; establish the initial id + rank BTREEs
+    // explicitly through the reconciler before creating partial coverage.
     load_jsonl(
         &mut db,
         "{\"type\":\"Doc\",\"data\":{\"slug\":\"d1\",\"rank\":1}}\n\
@@ -370,6 +371,7 @@ node Doc {
     )
     .await
     .unwrap();
+    db.ensure_indices().await.unwrap();
 
     // A second load with NEW keys appends a fragment the existing BTREEs do not
     // cover (the existence gate skips re-building an index that already exists).
@@ -411,13 +413,9 @@ node Doc {
     );
 }
 
-// Regression: `optimize` must not crash on a graph that has a `Blob` table.
-//
-// Lance `compact_files` forces `BlobHandling::AllBinary`, which mis-decodes
-// blob-v2 columns ("more fields in the schema than provided column indices"),
-// failing even a pristine uniform-V2_2 multi-fragment blob table. `optimize`
-// must skip blob-bearing tables (and report the skip) rather than aborting the
-// whole sweep.
+// Regression: `optimize` must compact a graph that has a `Blob` table through
+// the same positive path as every other data table; a reintroduced skip would
+// hide both fragment growth and a Lance compatibility regression.
 //
 // History: through Lance 7.0.0 `compact_files` mis-decoded blob-v2 columns, so
 // `optimize` skipped blob tables (`SkipReason::BlobColumnsUnsupportedByLance`)
@@ -431,16 +429,17 @@ node Doc {
 async fn optimize_compacts_blob_table_alongside_plain_table() {
     let dir = tempfile::tempdir().unwrap();
     let uri = dir.path().to_str().unwrap();
-    // One Blob node type (`Doc`) + one plain node type (`Tag`): proves the blob
-    // table is skipped while a non-blob table in the same sweep still compacts.
+    // One Blob node type (`Doc`) + one plain node type (`Tag`): proves both use
+    // the normal compaction path in the same sweep.
     let schema = "\
 node Doc {\n    slug: String @key\n    content: Blob\n}\n\
 node Tag {\n    slug: String @key\n}\n";
     let mut db = Omnigraph::init(uri, schema).await.unwrap();
 
     // Multi-fragment blob table: Overwrite creates fragment 1; each Merge of
-    // new keys appends another. A >=2-fragment blob table is exactly what
-    // crashes `compact_files` today (single fragment would no-op and not crash).
+    // new keys appends another. A >=2-fragment blob table exercises the rewrite
+    // path that exposed the historical Lance regression (a single fragment
+    // would be a no-op).
     load_jsonl(
         &mut db,
         "{\"type\":\"Doc\",\"data\":{\"slug\":\"d1\",\"content\":\"base64:aGVsbG8x\"}}\n{\"type\":\"Doc\",\"data\":{\"slug\":\"d2\",\"content\":\"base64:aGVsbG8y\"}}",
@@ -1133,15 +1132,12 @@ async fn cleanup_reconciles_live_branch_orphan_fork_but_keeps_legitimate_fork() 
 }
 
 // Regression (iss-848): a table with rows but NULL vectors (the load-before-
-// embed window) must not abort index building. The vector (IVF) index cannot
-// train on 0 vectors, so `create_vector_index` errors with "KMeans cannot
-// train 1 centroids with 0 vectors". `build_indices_on_dataset_for_catalog`
-// is the chokepoint every caller funnels through (load/mutate via
-// prepare_updates_for_commit, ensure_indices, optimize, schema apply, merge),
-// so per-index fault isolation there must defer that one column (pending) and
-// still build the sibling scalar indexes, instead of propagating the error.
-// This exercises both the load path (which builds indices inline) and the
-// ensure_indices reconciler. Pre-fix this fails at the load step.
+// embed window) must remain writable and reconcilable. RFC-022-enrolled writes
+// publish only their logical data effect; physical indexes are derived work.
+// The vector (IVF) index cannot train on 0 vectors, so the index chokepoint must
+// defer that column as pending while still building eligible sibling indexes.
+// This exercises both halves of the contract: the logical load succeeds without
+// inline index work, then `ensure_indices` tolerates the untrainable vector.
 #[tokio::test]
 async fn index_build_tolerates_null_vector_rows() {
     let dir = tempfile::tempdir().unwrap();

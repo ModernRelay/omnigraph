@@ -146,7 +146,11 @@ converge the physical state.
     drifts" and "manifest-derivable reconciler" items, are instances; so is
     bounding a read's cost to its working set rather than the commit count. This
     is the structural face of "engineering is programming integrated over time":
-    both failure modes are liabilities that compound as the system grows.
+    both failure modes are liabilities that compound as the system grows. At a
+    write/control boundary, schema identity, compiled catalog, and manifest
+    authority must come from one operation-local accepted view: validating a
+    fresh on-disk marker while planning or enumerating gates from a stale warm
+    catalog is not a coherent derivation.
 
 ## Current Truth Matrix
 
@@ -155,11 +159,11 @@ converge the physical state.
 | Multi-table commit | Manifest CAS plus recovery sidecars; not a single Lance primitive | [writes.md](writes.md), [architecture.md](architecture.md) |
 | Constructive mutations | In-memory `MutationStaging`, one end-of-query table commit per touched table, then one manifest publish | [writes.md](writes.md), [execution.md](execution.md) |
 | Deletes | Staged like inserts/updates (`stage_delete` via Lance 7.0 `DeleteBuilder::execute_uncommitted`, MR-A) — no inline HEAD advance; mixed insert/update/delete in one query rejected by D2 as a deliberate boundary (constructive XOR destructive per query; compose via separate mutations or a branch) | [query-language.md](../user/queries/index.md), [writes.md](writes.md) |
-| Branch delete | Manifest is the single authority, flipped atomically first; per-table forks are derived state, reclaimed best-effort (`force_delete_branch`) with the `cleanup` reconciler as the guaranteed backstop. Reusing a name whose reclaim failed before `cleanup` surfaces an actionable error | [branches-commits.md](../user/branching/index.md), [maintenance.md](../user/operations/maintenance.md) |
+| Branch delete | Manifest is the single authority, flipped atomically first; per-table forks are derived state, reclaimed best-effort (`force_delete_branch`) with the `cleanup` reconciler as the guaranteed backstop. Under schema/target/all-table gates, a target-scoped unresolved sidecar may be made unreachable by deletion and is then audit-discarded by recovery; graph-global SchemaApply still blocks. Reusing a name whose fork reclaim failed before `cleanup` surfaces an actionable error | [branches-commits.md](../user/branching/index.md), [maintenance.md](../user/operations/maintenance.md), [writes.md](writes.md) |
 | Schema validation | Type checks, required fields, defaults, edge endpoint checks, and edge cardinality are enforced on write paths | [schema-language.md](../user/schema/index.md), [execution.md](execution.md) |
-| Unique constraints | Value/enum, uniqueness, edge-RI, and cardinality route through ONE unified, catalog-derived evaluator (`crate::validate`) on ALL THREE write surfaces — branch-merge, mutation, and bulk load: Δ-scoped (checks the delta, not the whole graph) and index-backed (probes committed state through its BTREE rather than full-scanning every catalog table), reusing the leaf checks (`loader::validate_value_constraints`/`validate_enum_constraints`/`composite_unique_key`) so the surfaces cannot drift. This closed the prior merge bug (merge validated `@range`/`@check` but not enum) AND the **cross-version uniqueness gap** on the mutation and load paths (a duplicate of a committed `@unique` value is now rejected; the merge path always enforced it). The committed view is the merge target snapshot (merge), the write's pinned `txn.base` (mutation), or the pinned pre-load base (load — `Overwrite` validates the batch as the whole new image, committed view empty); `@card` reads LIVE HEAD per edge table on the mutation path only (the #298 stale-handle fix). `@key` is id-backed, so it is checked intra-delta only (a committed holder of a key value is always the same row — an upsert), skipping a wasted O(Δ) probe per keyed row; `@unique` (non-key) groups do the committed lookup. | [schema-language.md](../user/schema/index.md) |
+| Unique constraints | Value/enum, uniqueness, edge-RI, and cardinality route through ONE unified, catalog-derived evaluator (`crate::validate`) on ALL THREE write surfaces — branch-merge, mutation, and bulk load: Δ-scoped (checks the delta, not the whole graph) and structured-filter-backed (committed probes use a BTREE when reconciled and remain correct by scanning while it is pending), reusing the leaf checks (`loader::validate_value_constraints`/`validate_enum_constraints`/`composite_unique_key`) so the surfaces cannot drift. This closed the prior merge bug (merge validated `@range`/`@check` but not enum) AND the **cross-version uniqueness gap** on the mutation and load paths (a duplicate of a committed `@unique` value is now rejected; the merge path always enforced it). The committed view is the merge target snapshot (merge), the write's pinned `txn.base` (mutation), or the pinned pre-load base (load — `Overwrite` validates the batch as the whole new image, committed view empty); `@card` refreshes the manifest-visible graph-branch snapshot on the mutation path only (the #298 stale-handle fix), then follows each entry's actual inherited/owned Lance ref. `@key` is id-backed, so it is checked intra-delta only (a committed holder of a key value is always the same row — an upsert), skipping a wasted O(Δ) probe per keyed row; `@unique` (non-key) groups do the committed lookup. | [schema-language.md](../user/schema/index.md) |
 | Storage trait | `TableStorage` (via `db.storage()`) is staged-only; the sole inline-commit residual (`create_vector_index`) is split onto a separate sealed `InlineCommitResidual` trait reached via `db.storage_inline_residual()` (MR-854), so §1 holds by construction; capability/stat surfaces are roadmap | [writes.md](writes.md), [architecture.md](architecture.md) |
-| Index lifecycle | `@index`/`@key` declares *intent*; the physical index is derived state and never fails a logical op. `schema apply` builds no indexes (records intent only; index-only changes touch no table data). `load`/`mutate` build inline through one chokepoint (`build_indices_on_dataset_for_catalog`, type-dispatched by `node_prop_index_kind`: enum + orderable scalar → BTREE, free-text String → FTS, Vector → vector) that fault-isolates an untrainable Vector column into a *pending* index instead of aborting. `optimize`/`ensure_indices` is the reconciler: it creates declared-but-missing indexes and folds appended/rewritten fragments into existing ones (`optimize_indices`), reporting still-pending columns. Explicit maintenance call, not yet a background loop | [indexes.md](../user/search/indexes.md), [maintenance.md](../user/operations/maintenance.md) |
+| Index lifecycle | `@index`/`@key` declares *intent*; the physical index is derived state and never fails a logical op. `schema apply`, `load`, and `mutate` build no indexes inline: RFC-022 mutation/load sidecars describe only their exact data effects, and index availability must never become a correctness prerequisite. `optimize`/`ensure_indices` is the reconciler: through the single `build_indices_on_dataset_for_catalog` chokepoint it creates declared-but-missing indexes (enum + orderable scalar → BTREE, free-text String → FTS, Vector → vector), folds appended/rewritten fragments into existing ones (`optimize_indices`), and reports untrainable Vector columns as pending. Explicit maintenance call, not yet a background loop | [indexes.md](../user/search/indexes.md), [maintenance.md](../user/operations/maintenance.md) |
 | Traversal IDs | Runtime still builds `TypeIndex`; Lance stable row-id based graph IDs are roadmap | [architecture.md](architecture.md), [query-language.md](../user/queries/index.md) |
 | Auth | Bearer token hashing and server-side actor resolution are implemented at the HTTP boundary | [server.md](../user/operations/server.md), [policy.md](../user/operations/policy.md) |
 | Tests | Tempdir-backed Lance tests are the current substrate; the storage adapter has an in-memory backend for adapter-level contract tests, but Lance datasets bypass it | [testing.md](testing.md) |
@@ -215,12 +219,15 @@ them explicit.
   `maintenance.rs::optimize_compacts_blob_table_alongside_plain_table` pin the
   positive behavior (a red there means blob compaction regressed — restore the
   skip machinery from git history).
-- **Recovery is serialized against live writers in-process only:** the
-  write-entry heal (and `refresh`) serialize against a live writer's sidecar
-  lifetime via the per-`(table, branch)` write queues plus the schema-apply
-  serialization key — all in-process primitives. A recovery pass in one
-  process cannot serialize against a live writer in another (the open-time
-  sweep has the same exposure, and always has): it may roll a live foreign
+- **Recovery is serialized against live writers in-process only:** every
+  `Omnigraph` handle for one canonical local root identity (lexically absolute,
+  with existing symlink ancestors resolved) shares a root-scoped queue manager;
+  object-store/custom scheme identities remain their normalized opaque URIs.
+  The write-entry heal, `refresh`, and Full ReadWrite-open sweep serialize
+  against a live writer's complete sidecar lifetime in schema → branch → sorted
+  table order and re-check sidecar existence after waiting. These remain
+  in-process primitives: a recovery pass cannot serialize against a live writer
+  in another process. It may roll a live foreign
   writer's sidecar forward, which degrades to publisher-CAS contention for
   data writes but can race the schema-staging promotion for a foreign live
   schema apply. The roll-**forward** CAS contention is now
@@ -238,22 +245,26 @@ them explicit.
   cross-process serialization primitive (e.g. lease-based use of the
   schema-apply lock branch) — design it before promoting multi-process write
   topologies.
-- **Fork reclaim is in-process-safe only:** the first write to a table on a
-  branch forks it (a Lance `create_branch` that advances state before the
-  manifest publish). An interrupted fork (crash, or a cancelled request
-  future) leaves a manifest-unreferenced branch ref. The next write self-heals
-  it — `reclaim_orphaned_fork_and_refork` (`force_delete_branch` + re-fork)
-  — but reclaim is only safe because the writer holds the per-`(table,
-  branch)` write queue from before the fork through the publish AND re-checks
-  the live manifest under it, so no *in-process* writer can be mid-fork. A
-  reclaim cannot serialize against a foreign-*process* in-flight fork: it may
-  force-delete a peer's just-created ref, which makes that peer's commit fail
-  and retry — the same one-winner-CAS exposure as above, not corruption. The
-  reclaim never fires unless in-process-queue + manifest authority both prove
-  the ref is manifest-unreferenced. `cleanup`'s per-table reconciler
-  (`reconcile_orphaned_branches`) is the guaranteed backstop for any fork the
-  write path never revisits. Both degrade to a no-op if Lance ships an atomic
-  multi-dataset branch op.
+- **Fork ownership is durable, but Lance ref deletion is not conditional:** a
+  first-touch Mutation/Load table no longer creates its target ref while
+  preparing. Under schema → branch → table gates it revalidates, durably arms a
+  schema-v3 sidecar naming the target, creates the ref, then stages branch-local
+  files and commits. Both `reclaim_orphaned_fork_and_refork` and
+  `reconcile_orphaned_branches` consult pending sidecars before destruction; a
+  foreign claim is conflict/indeterminate, never permission to delete. Full
+  recovery accepts sidecar-before-ref crashes and deletes an unpublished fork
+  only when it is still exactly at the inherited version and no other sidecar
+  claims `(table_path, target ref)`. A no-effect sidecar with a competitor
+  discards only itself; the last survivor either cleans the untouched ref or
+  recovers its owned effect. Partial rollback performs no-effect cleanup before
+  publishing its fixed outcome. This closes the cross-handle live-ref
+  deletion bug and keeps cleanup as the backstop for truly unclaimed refs.
+  The remaining multi-process gap is narrower but real: Lance exposes
+  `force_delete_branch`, not compare-and-delete by `BranchIdentifier`, so a
+  foreign process can create intent/ref between the final list/check and the
+  delete. The documented single-writer-process support boundary remains until
+  Lance provides a conditional ref primitive (or OmniGraph adds a distributed
+  fence); process-local queues are not credited as that primitive.
 - **Local `write_text_if_match` is not a cross-process CAS:** object-store
   backends use a true conditional put (ETag If-Match; the in-memory test
   backend too), but upstream `object_store` leaves `PutMode::Update`

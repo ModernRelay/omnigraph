@@ -28,25 +28,26 @@ mod recovery;
 mod state;
 
 use graph::{init_manifest_graph, open_manifest_graph, snapshot_state_at};
-use layout::{open_manifest_dataset, table_uri_for_path, type_name_hash};
 pub(crate) use layout::manifest_uri;
+use layout::{open_manifest_dataset, table_uri_for_path, type_name_hash};
 pub(crate) use metadata::TableVersionMetadata;
 #[cfg(test)]
 use metadata::{OMNIGRAPH_ROW_COUNT_KEY, table_version_metadata_for_state};
 #[cfg(test)]
 use namespace::{branch_manifest_namespace, staged_table_namespace};
-pub(crate) use publisher::LineageIntent;
+pub(crate) use publisher::{GraphHeadExpectation, LineageIntent, PublishPrecondition};
 use publisher::{GraphNamespacePublisher, ManifestBatchPublisher, PublishOutcome};
 pub(crate) use recovery::{
-    RecoveryMode, RecoverySidecar, RecoverySidecarHandle, SidecarKind, SidecarTablePin,
-    SidecarTableRegistration, SidecarTombstone, confirm_sidecar_phase_b, delete_sidecar,
-    has_schema_apply_sidecar, heal_pending_sidecars_roll_forward, list_sidecars, new_sidecar,
-    recover_manifest_drift, schema_apply_serial_queue_key, write_sidecar,
+    HealPendingOutcome, RecoveryAuthorityToken, RecoveryLineageIntent, RecoveryMode,
+    RecoverySidecar, RecoverySidecarHandle, SidecarKind, SidecarTablePin, SidecarTableRegistration,
+    SidecarTombstone, confirm_occ_sidecar_phase_b, confirm_sidecar_phase_b, delete_sidecar,
+    has_schema_apply_sidecar, heal_pending_sidecars_roll_forward, list_sidecars, new_occ_sidecar,
+    new_sidecar, recover_manifest_drift, schema_apply_serial_queue_key, write_sidecar,
 };
 pub use state::SubTableEntry;
-pub(crate) use state::{GraphLineageRow, read_graph_lineage};
 #[cfg(test)]
 use state::string_column;
+pub(crate) use state::{GraphLineageRow, read_graph_lineage};
 use state::{ManifestState, read_manifest_state};
 
 /// The internal-schema (storage-format) version this binary writes and reads.
@@ -498,7 +499,30 @@ impl ManifestCoordinator {
         expected_table_versions: &HashMap<String, u64>,
         lineage: Option<&LineageIntent>,
     ) -> Result<CommitOutcome> {
-        if changes.is_empty() && expected_table_versions.is_empty() && lineage.is_none() {
+        self.commit_changes_with_lineage_and_precondition(
+            changes,
+            expected_table_versions,
+            lineage,
+            &PublishPrecondition::Any,
+        )
+        .await
+    }
+
+    /// The token-aware form of [`commit_changes_with_lineage`]. Exact authority
+    /// is checked by the publisher from every CAS attempt's existing one-scan
+    /// state; legacy callers continue through `Any` above.
+    pub(crate) async fn commit_changes_with_lineage_and_precondition(
+        &mut self,
+        changes: &[ManifestChange],
+        expected_table_versions: &HashMap<String, u64>,
+        lineage: Option<&LineageIntent>,
+        precondition: &PublishPrecondition,
+    ) -> Result<CommitOutcome> {
+        if changes.is_empty()
+            && expected_table_versions.is_empty()
+            && lineage.is_none()
+            && matches!(precondition, PublishPrecondition::Any)
+        {
             return Ok(CommitOutcome {
                 version: self.version(),
                 parent_commit_id: None,
@@ -511,7 +535,7 @@ impl ManifestCoordinator {
             known_state,
         } = self
             .publisher
-            .publish(changes, expected_table_versions, lineage)
+            .publish_with_precondition(changes, expected_table_versions, lineage, precondition)
             .await?;
         // RFC-013 PR2 #1b: the publisher folded the new visible state in-memory
         // (byte-identical to a re-scan via the shared `assemble_manifest_state`),
@@ -548,6 +572,28 @@ impl ManifestCoordinator {
             .latest_version_id()
             .await
             .map_err(|e| OmniError::Lance(e.to_string()))
+    }
+
+    /// Lance-native stable identity for the active manifest branch. Unlike a
+    /// manifest version/eTag, this remains stable across ordinary commits and
+    /// changes when a named branch is deleted and recreated (ABA protection).
+    pub(crate) async fn branch_identifier(&self) -> Result<lance::dataset::refs::BranchIdentifier> {
+        self.dataset
+            .branch_identifier()
+            .await
+            .map_err(|e| OmniError::Lance(e.to_string()))
+    }
+
+    /// Exact materialized `graph_head:<active-branch>` from the same pinned
+    /// manifest version as [`Self::snapshot`]. This is write authority, not a
+    /// lineage-cache query: a read may refresh only the manifest, so consulting
+    /// `CommitGraph` here would combine a fresh table snapshot with a stale head.
+    pub(crate) fn exact_graph_head(&self) -> Option<String> {
+        let branch_key = self
+            .active_branch
+            .as_deref()
+            .unwrap_or(MAIN_BRANCH_HEAD_KEY);
+        self.known_state.graph_heads.get(branch_key).cloned()
     }
 
     pub(crate) fn incarnation(&self) -> ManifestIncarnation {

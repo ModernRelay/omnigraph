@@ -10,7 +10,7 @@ pub use commit_graph::GraphCommit;
 pub use graph_coordinator::{GraphCoordinator, ReadTarget, ResolvedTarget, SnapshotId};
 pub use manifest::{Snapshot, SubTableEntry, SubTableUpdate};
 pub(crate) use omnigraph::ensure_public_branch_ref;
-pub(crate) use omnigraph::WriteTxn;
+pub(crate) use omnigraph::{DeferredTableFork, WriteTxn};
 pub use omnigraph::{
     CleanupPolicyOptions, InitOptions, MergeOutcome, Omnigraph, OpenMode, PendingIndex,
     RepairAction, RepairClassification, RepairOptions, RepairStats, SchemaApplyOptions,
@@ -21,30 +21,27 @@ use crate::error::{OmniError, Result};
 
 pub(crate) const SCHEMA_APPLY_LOCK_BRANCH: &str = "__schema_apply_lock__";
 
-/// Mutation kind, threaded through the version-check call sites so the
-/// engine can apply an op-kind-aware policy:
+/// Mutation kind, threaded through the early table-version checks so the
+/// engine can apply an op-kind-aware staging policy. This check is not the
+/// RFC-022 publish authority: enrolled mutation/load attempts additionally
+/// capture an exact branch-wide `WriteTxn`, then revalidate it while holding
+/// the root-shared schema → branch → sorted-table gates.
 ///
 /// - `Insert` / `Merge`: skip the strict pre-stage `ensure_expected_version`
-///   check. Lance's `MergeInsertBuilder` rebases concurrent appends; the
-///   per-(table, branch) writer queue serializes `commit_staged`; the
-///   publisher's CAS (refreshed under the queue via
-///   `MutationStaging::commit_all`'s `snapshot_for_branch` call) catches
-///   genuine cross-process drift as `ManifestConflictDetails::ExpectedVersionMismatch`.
-///   The pre-stage strict check would over-reject in-process concurrent
-///   inserts, which is exactly the case PR 2 / MR-686 designed the
-///   per-table queue to allow.
+///   check because their staged files are reclaimable and the complete prepared
+///   attempt is checked later against the exact branch authority. On a
+///   pre-effect `ReadSetChanged`, mutation Insert and load Append/Merge discard
+///   the whole attempt and reprepare with a bounded retry; they never patch
+///   table pins beneath an already-validated plan.
 ///
-/// - `Update` / `Delete`: keep the strict check. These have read-modify-write
-///   semantics; Lance moving between the read at stage time and the write
-///   at commit time means the staged batch is computed against stale state.
-///   The strict check guards the per-query SI invariant. SERIALIZABLE
-///   opt-in (§VI.36 future seam) is the long-term answer for tighter
-///   semantics; today, in-process update-update races on the same key
-///   stay rejected as 409 — acceptable.
+/// - `Update` / `Delete`: keep the strict early check because these are
+///   read-modify-write effects computed from a pinned image. Enrolled attempts
+///   still perform the later branch-wide revalidation; a mismatch is strict
+///   `ReadSetChanged` (HTTP 409), not a transparent replay.
 ///
-/// - `SchemaRewrite`: keep the strict check. Schema apply runs under the
-///   graph-wide `__schema_apply_lock__` AND per-table queues; the strict
-///   check is uncontested at that point.
+/// - `SchemaRewrite`: keep the strict early check for overwrite/rewrite effects.
+///   An enrolled load Overwrite also uses the exact branch-wide gate and
+///   surfaces `ReadSetChanged`; schema apply has its own schema/table protocol.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum MutationOpKind {
     Insert,
