@@ -856,7 +856,7 @@ impl TableStore {
             return self.table_state(dataset_uri, ds).await;
         }
         let schema = batch.schema();
-        let reader = arrow_array::RecordBatchIterator::new(vec![Ok(batch)], schema);
+        let reader = arrow_array::RecordBatchIterator::new(vec![Ok(batch)], schema.clone());
         let params = WriteParams {
             mode: WriteMode::Append,
             allow_external_blob_outside_bases: true,
@@ -1178,12 +1178,6 @@ impl TableStore {
         }
         let merged_rows = batch.num_rows() as u64;
         let inserts_unmatched = matches!(when_not_matched, WhenNotMatched::InsertAll);
-        let source_columns: Vec<String> = batch
-            .schema()
-            .fields()
-            .iter()
-            .map(|f| f.name().clone())
-            .collect();
 
         // Precondition for the FirstSeen workaround below: every call path that
         // reaches stage_merge_insert (load, MutationStaging::finalize,
@@ -1218,7 +1212,7 @@ impl TableStore {
             .try_build()
             .map_err(|e| OmniError::Lance(e.to_string()))?;
         let schema = batch.schema();
-        let reader = arrow_array::RecordBatchIterator::new(vec![Ok(batch)], schema);
+        let reader = arrow_array::RecordBatchIterator::new(vec![Ok(batch)], schema.clone());
         let stream = lance_datafusion::utils::reader_to_stream(Box::new(reader));
         let uncommitted = job
             .execute_uncommitted(stream)
@@ -1228,7 +1222,7 @@ impl TableStore {
         // not inflate the probe (matches `stage_append`/`stage_append_stream`).
         crate::instrumentation::record_stage_merge_insert(
             merged_rows,
-            source_columns,
+            &schema,
             inserts_unmatched,
         );
         // Operation::Update { removed_fragment_ids, updated_fragments, new_fragments, .. } —

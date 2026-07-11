@@ -41,6 +41,14 @@ use crate::error::{OmniError, Result};
 pub(crate) enum PendingMode {
     Append,
     Merge,
+    /// RFC-022 field-level update: a Merge whose staged source is the batch
+    /// schema MINUS the table's `partial_validation_only` columns, staged
+    /// matched-only (`WhenNotMatched::DoNothing`). A distinct variant — not a
+    /// side-flag on `Merge` — so every `match` on the mode is forced to
+    /// disposition partial batches explicitly: treating one as a full-row
+    /// Merge (a future coalescing change, a retry path) would null-overwrite
+    /// unassigned columns, and the compiler now surfaces that decision.
+    PartialUpdate,
     Overwrite,
 }
 
@@ -52,18 +60,22 @@ pub(crate) struct PendingTable {
     pub(crate) schema: SchemaRef,
     pub(crate) mode: PendingMode,
     pub(crate) batches: Vec<RecordBatch>,
-    /// RFC-022 field-level update: `Some(stage_cols)` marks the accumulated
-    /// batches as PARTIAL — they carry (merge key + assigned + constraint-
-    /// completion) columns for the validation change-set, but the STAGED merge
-    /// source is projected down to `stage_cols` = (merge key + assigned) and
-    /// staged matched-only (`WhenNotMatched::DoNothing`). Completion columns
-    /// are validation inputs, never merge inputs: Lance counts every source
-    /// column as modified, so staging an unassigned `@unique`-group member
-    /// would patch it and prune its index for no semantic reason. Set only by
+    /// RFC-022 field-level update: `Some(validation_only)` marks the
+    /// accumulated batches as PARTIAL — they carry (merge key + assigned +
+    /// constraint-completion) columns for the validation change-set, and the
+    /// STAGED merge source is the batch schema MINUS these validation-only
+    /// completion columns, staged matched-only (`WhenNotMatched::DoNothing`).
+    /// Deriving the staged set by subtraction (rather than listing it) keeps
+    /// it consistent with `apply_assignments`' own omissions — e.g. a Blob
+    /// assigned a non-String value is omitted from the batch entirely.
+    /// Completion columns are validation inputs, never merge inputs: Lance
+    /// counts every source column as modified, so staging an unassigned
+    /// `@unique`-group member would patch it and prune its index for no
+    /// semantic reason. Set only by
     /// [`MutationStaging::append_partial_update_batch`], whose eligibility
     /// rule (the table's ONLY op in this query is a single `update`)
     /// guarantees no full-schema batch ever lands on the same table.
-    pub(crate) partial_stage_cols: Option<Vec<String>>,
+    pub(crate) partial_validation_only: Option<Vec<String>>,
 }
 
 impl PendingTable {
@@ -72,7 +84,7 @@ impl PendingTable {
             schema,
             mode,
             batches: Vec::new(),
-            partial_stage_cols: None,
+            partial_validation_only: None,
         }
     }
 
@@ -197,7 +209,7 @@ impl MutationStaging {
         // caller a clearer point of failure attached to the specific
         // op that introduced the drift.
         if let Some(existing) = self.pending.get(table_key) {
-            if existing.partial_stage_cols.is_some() {
+            if existing.mode == PendingMode::PartialUpdate {
                 return Err(OmniError::manifest_internal(format!(
                     "append_batch: table '{}' holds a partial-update batch — the \
                      eligibility rule should have prevented a second op on this table",
@@ -253,7 +265,7 @@ impl MutationStaging {
         table_key: &str,
         schema: SchemaRef,
         batch: RecordBatch,
-        stage_cols: Vec<String>,
+        validation_only: Vec<String>,
     ) -> Result<()> {
         if batch.num_rows() == 0 {
             return Ok(());
@@ -266,8 +278,8 @@ impl MutationStaging {
                 table_key
             )));
         }
-        let mut entry = PendingTable::new(schema, PendingMode::Merge);
-        entry.partial_stage_cols = Some(stage_cols);
+        let mut entry = PendingTable::new(schema, PendingMode::PartialUpdate);
+        entry.partial_validation_only = Some(validation_only);
         entry.batches.push(batch);
         self.pending.insert(table_key.to_string(), entry);
         Ok(())
@@ -499,7 +511,10 @@ async fn stage_pending_table(
     // same SchemaRewrite policy as schema apply.
     let stage_kind = match table.mode {
         PendingMode::Append => crate::db::MutationOpKind::Insert,
-        PendingMode::Merge => crate::db::MutationOpKind::Merge,
+        // PartialUpdate reopens with the same non-strict policy as Merge;
+        // strictness for the commit-time drift check comes from `op_kinds`
+        // (the update op registered MutationOpKind::Update there).
+        PendingMode::Merge | PendingMode::PartialUpdate => crate::db::MutationOpKind::Merge,
         PendingMode::Overwrite => crate::db::MutationOpKind::SchemaRewrite,
     };
     let ds = db
@@ -517,7 +532,9 @@ async fn stage_pending_table(
     }
 
     let combined = match table.mode {
-        PendingMode::Merge => dedupe_merge_batches_by_id(&table.schema, table.batches)?,
+        PendingMode::Merge | PendingMode::PartialUpdate => {
+            dedupe_merge_batches_by_id(&table.schema, table.batches)?
+        }
         PendingMode::Append | PendingMode::Overwrite => {
             if table.batches.len() == 1 {
                 table.batches.into_iter().next().unwrap()
@@ -533,44 +550,49 @@ async fn stage_pending_table(
     let staged = match table.mode {
         PendingMode::Append => db.storage().stage_append(&ds, combined, &[]).await?,
         PendingMode::Merge => {
-            // RFC-022: a partial-update table stages matched-only, and the
-            // staged source is projected down to (key + assigned) — completion
-            // columns were carried for the validation change-set only; staging
-            // them would patch unassigned columns and prune their indexes.
-            // Lance patches the provided columns in place and never inserts —
-            // the subset schema could not satisfy non-null target columns
-            // anyway (Lance rejects partial-source inserts), and the update
-            // executor only stages rows it matched against the committed table.
-            let (combined, when_not_matched) = match &table.partial_stage_cols {
-                Some(stage_cols) => {
-                    let indices = stage_cols
-                        .iter()
-                        .map(|c| {
-                            combined.schema().index_of(c).map_err(|e| {
-                                OmniError::manifest_internal(format!(
-                                    "partial-update stage column '{}' missing from \
-                                     accumulated batch: {}",
-                                    c, e
-                                ))
-                            })
-                        })
-                        .collect::<Result<Vec<_>>>()?;
-                    (
-                        combined
-                            .project(&indices)
-                            .map_err(|e| OmniError::Lance(e.to_string()))?,
-                        lance::dataset::WhenNotMatched::DoNothing,
-                    )
-                }
-                None => (combined, lance::dataset::WhenNotMatched::InsertAll),
-            };
             db.storage()
                 .stage_merge_insert(
                     ds.clone(),
                     combined,
                     vec!["id".to_string()],
                     lance::dataset::WhenMatched::UpdateAll,
-                    when_not_matched,
+                    lance::dataset::WhenNotMatched::InsertAll,
+                )
+                .await?
+        }
+        PendingMode::PartialUpdate => {
+            // RFC-022: staged source = batch schema − validation-only columns
+            // (completion columns ride the validation change-set only; staging
+            // them would patch unassigned columns and prune their indexes). A
+            // subtraction cannot reference a column the batch lacks, so
+            // apply-time omissions (unassigned blobs) are immune. Matched-only:
+            // Lance patches the provided columns in place and never inserts —
+            // a subset schema could not satisfy non-null target columns anyway,
+            // and the update executor only stages rows it matched.
+            let validation_only =
+                table.partial_validation_only.as_deref().ok_or_else(|| {
+                    OmniError::manifest_internal(
+                        "PartialUpdate entry without validation-only columns".to_string(),
+                    )
+                })?;
+            let schema = combined.schema();
+            let indices: Vec<usize> = schema
+                .fields()
+                .iter()
+                .enumerate()
+                .filter(|(_, f)| !validation_only.contains(f.name()))
+                .map(|(i, _)| i)
+                .collect();
+            let projected = combined
+                .project(&indices)
+                .map_err(|e| OmniError::Lance(e.to_string()))?;
+            db.storage()
+                .stage_merge_insert(
+                    ds.clone(),
+                    projected,
+                    vec!["id".to_string()],
+                    lance::dataset::WhenMatched::UpdateAll,
+                    lance::dataset::WhenNotMatched::DoNothing,
                 )
                 .await?
         }

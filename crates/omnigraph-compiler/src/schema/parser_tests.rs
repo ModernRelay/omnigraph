@@ -1013,3 +1013,37 @@ fn test_parse_error_diagnostic_has_span() {
     let err = parse_schema_diagnostic(input).unwrap_err();
     assert!(err.span.is_some());
 }
+
+#[test]
+fn test_reject_unique_on_blob_property() {
+    let input = r#"
+node Doc {
+name: String @key
+data: Blob?
+@unique(name, data)
+}
+"#;
+    let err = parse_schema(input).unwrap_err();
+    assert!(
+        err.to_string()
+            .contains("@unique is not supported on blob property Doc.data"),
+        "got: {err}"
+    );
+}
+
+#[test]
+fn test_reject_unique_on_vector_property() {
+    let input = r#"
+node Doc {
+name: String @key
+embedding: Vector(4)
+@unique(embedding)
+}
+"#;
+    let err = parse_schema(input).unwrap_err();
+    assert!(
+        err.to_string()
+            .contains("@unique is not supported on vector property Doc.embedding"),
+        "got: {err}"
+    );
+}

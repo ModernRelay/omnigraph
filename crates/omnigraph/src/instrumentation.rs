@@ -247,17 +247,24 @@ pub(crate) fn record_stage_append(rows: u64) {
 
 /// Record one `stage_merge_insert` of `rows` rows against the active probes,
 /// with its observable shape (source columns + unmatched-row disposition).
-/// No-op in production (no probes installed).
+/// No-op in production (no probes installed): the schema arrives as a cheap
+/// `&SchemaRef` borrow and the column-name strings materialize only inside
+/// `try_with` — the same classify-inside-the-closure pattern as
+/// `record_open`, so production pays zero allocations.
 pub(crate) fn record_stage_merge_insert(
     rows: u64,
-    source_columns: Vec<String>,
+    source_schema: &arrow_schema::SchemaRef,
     inserts_unmatched: bool,
 ) {
     let _ = MERGE_WRITE_PROBES.try_with(|p| {
         p.stage_merge_insert_calls.fetch_add(1, Ordering::Relaxed);
         p.stage_merge_insert_rows.fetch_add(rows, Ordering::Relaxed);
         p.merge_shapes.lock().unwrap().push(MergeShape {
-            source_columns,
+            source_columns: source_schema
+                .fields()
+                .iter()
+                .map(|f| f.name().clone())
+                .collect(),
             inserts_unmatched,
         });
     });

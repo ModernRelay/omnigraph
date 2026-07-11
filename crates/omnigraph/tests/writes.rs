@@ -677,8 +677,10 @@ async fn mixed_insert_and_update_on_same_person_coalesces_to_one_merge() {
 
     let pre_version = version_main(&db).await.unwrap();
 
-    let result = db
-        .mutate(
+    let probes = omnigraph::instrumentation::MergeWriteProbes::default();
+    let result = omnigraph::instrumentation::with_merge_write_probes(
+        probes.clone(),
+        db.mutate(
             "main",
             STAGED_QUERIES,
             "insert_then_update_same_person",
@@ -686,10 +688,27 @@ async fn mixed_insert_and_update_on_same_person_coalesces_to_one_merge() {
                 &[("$name", "Yves")],
                 &[("$insert_age", 10), ("$update_age", 99)],
             ),
-        )
-        .await
-        .unwrap();
+        ),
+    )
+    .await
+    .unwrap();
     assert_eq!(result.affected_nodes, 2, "1 insert + 1 update reported");
+
+    // RFC-022 fallback pin: mixing insert + update on one table stages FULL
+    // rows as an upsert — partial and full batches cannot share one
+    // uniform-schema merge source, and one table commits at most one version
+    // per query (invariant 4).
+    let shapes = probes.merge_shapes();
+    assert_eq!(shapes.len(), 1, "insert+update coalesce into one staged merge");
+    assert!(
+        shapes[0].source_columns.contains(&"name".to_string()),
+        "mixed insert+update stages full rows, got {:?}",
+        shapes[0].source_columns
+    );
+    assert!(
+        shapes[0].inserts_unmatched,
+        "mixed insert+update keeps upsert semantics (InsertAll)"
+    );
 
     // The end-state row carries the update value (last-write-wins via
     // dedupe in finalize), proving the staged merge_insert ran with the
@@ -1083,21 +1102,37 @@ async fn chained_updates_with_overlapping_predicate_respects_intermediate_value(
 
     let pre_version = version_main(&db).await.unwrap();
 
-    db.mutate(
-        "main",
-        STAGED_QUERIES,
-        "update_then_filter_by_old_value",
-        &mixed_params(
-            &[("$first_name", "Alice")],
-            &[
-                ("$first_new_age", 99),
-                ("$second_threshold", 50),
-                ("$second_new_age", 10),
-            ],
+    let probes = omnigraph::instrumentation::MergeWriteProbes::default();
+    omnigraph::instrumentation::with_merge_write_probes(
+        probes.clone(),
+        db.mutate(
+            "main",
+            STAGED_QUERIES,
+            "update_then_filter_by_old_value",
+            &mixed_params(
+                &[("$first_name", "Alice")],
+                &[
+                    ("$first_new_age", 99),
+                    ("$second_threshold", 50),
+                    ("$second_new_age", 10),
+                ],
+            ),
         ),
     )
     .await
     .unwrap();
+
+    // RFC-022 fallback pin: two updates on one table stage FULL rows — a
+    // later update's read-your-writes scan must see the earlier update's
+    // full effect, and two partial batches with different assigned sets
+    // cannot share one uniform-schema merge source.
+    let shapes = probes.merge_shapes();
+    assert_eq!(shapes.len(), 1, "chained updates coalesce into one staged merge");
+    assert!(
+        shapes[0].source_columns.contains(&"name".to_string()),
+        "chained updates stage full rows (fallback), got {:?}",
+        shapes[0].source_columns
+    );
 
     // After op-1: Alice = 99. After op-2 (where age > 50): Alice
     // matches (99 > 50) → set to 10. End state: Alice = 10.
@@ -2068,20 +2103,6 @@ async fn filtered_read_after_append_and_delete_is_consistent() {
 
 // ─── RFC-022: field-level update staging shape ──────────────────────────────
 
-const MIXED_INSERT_UPDATE: &str = r#"
-query mix($newname: String, $age: I32, $target: String, $newage: I32) {
-    insert Person { name: $newname, age: $age }
-    update Person set { age: $newage } where name = $target
-}
-"#;
-
-const TWO_UPDATES: &str = r#"
-query two($a: String, $aage: I32, $b: String, $bage: I32) {
-    update Person set { age: $aage } where name = $a
-    update Person set { age: $bage } where name = $b
-}
-"#;
-
 /// RFC-022 acceptance (red → green): a query whose ONLY op on a table is one
 /// `update` stages a PARTIAL source — exactly (merge key + assigned columns) —
 /// as a matched-only merge (`WhenNotMatched::DoNothing`). The whole-row path
@@ -2121,85 +2142,6 @@ async fn single_update_stages_partial_matched_only_source() {
     );
 }
 
-/// Fallback pin: a query mixing insert + update on ONE table stages full rows
-/// as an upsert — partial and full batches cannot share one merge source, and
-/// one table commits at most one version per query (invariant 4). Pins the
-/// RFC-022 fallback so the partial path can never split a table's commit.
-#[tokio::test]
-async fn mixed_insert_update_same_table_stages_full_row_upsert() {
-    use omnigraph::instrumentation::{MergeWriteProbes, with_merge_write_probes};
-    let dir = tempfile::tempdir().unwrap();
-    let db = init_and_load(&dir).await;
-
-    let probes = MergeWriteProbes::default();
-    with_merge_write_probes(
-        probes.clone(),
-        db.mutate(
-            "main",
-            MIXED_INSERT_UPDATE,
-            "mix",
-            &mixed_params(
-                &[("$newname", "Zed"), ("$target", "Alice")],
-                &[("$age", 20), ("$newage", 42)],
-            ),
-        ),
-    )
-    .await
-    .unwrap();
-
-    let shapes = probes.merge_shapes();
-    assert_eq!(shapes.len(), 1, "insert+update coalesce into one staged merge");
-    let mut cols = shapes[0].source_columns.clone();
-    cols.sort();
-    assert!(
-        cols.contains(&"name".to_string()) && cols.contains(&"age".to_string()),
-        "mixed insert+update stages full rows, got {:?}",
-        shapes[0].source_columns
-    );
-    assert!(
-        shapes[0].inserts_unmatched,
-        "mixed insert+update keeps upsert semantics (InsertAll)"
-    );
-}
-
-/// Fallback pin: two updates on one table in one query stage full rows (a
-/// later update's read-your-writes scan must see the earlier update's full
-/// effect; two partial batches with different assigned sets cannot share one
-/// uniform-schema merge source — schema-level partial semantics make a union
-/// unsound). Behavior identical to today.
-#[tokio::test]
-async fn chained_updates_same_table_stage_full_rows() {
-    use omnigraph::instrumentation::{MergeWriteProbes, with_merge_write_probes};
-    let dir = tempfile::tempdir().unwrap();
-    let db = init_and_load(&dir).await;
-
-    let probes = MergeWriteProbes::default();
-    with_merge_write_probes(
-        probes.clone(),
-        db.mutate(
-            "main",
-            TWO_UPDATES,
-            "two",
-            &mixed_params(
-                &[("$a", "Alice"), ("$b", "Bob")],
-                &[("$aage", 51), ("$bage", 52)],
-            ),
-        ),
-    )
-    .await
-    .unwrap();
-
-    let shapes = probes.merge_shapes();
-    assert_eq!(shapes.len(), 1, "chained updates coalesce into one staged merge");
-    let mut cols = shapes[0].source_columns.clone();
-    cols.sort();
-    assert!(
-        cols.contains(&"name".to_string()),
-        "chained updates stage full rows (fallback), got {:?}",
-        shapes[0].source_columns
-    );
-}
-
 /// An update matching zero rows stages nothing and commits nothing —
 /// unchanged by RFC-022 (the early return precedes staging).
 #[tokio::test]
@@ -2223,4 +2165,52 @@ async fn empty_match_update_stages_no_merge() {
 
     assert_eq!(result.affected_nodes, 0);
     assert!(probes.merge_shapes().is_empty(), "no merge staged for an empty match");
+}
+
+const BLOB_DOC_SCHEMA: &str = r#"
+node Doc {
+    name: String @key
+    content: Blob?
+}
+"#;
+
+const BLOB_DOC_MUTATIONS: &str = r#"
+query insert_doc($name: String) {
+    insert Doc { name: $name }
+}
+query set_content($name: String, $c: Blob?) {
+    update Doc set { content: $c } where name = $name
+}
+"#;
+
+/// A sole update assigning `null` to an optional Blob is the historical no-op
+/// (the blob column is omitted from the staged batch and the merge leaves it
+/// untouched). The partial-update plan must mirror that omission: listing the
+/// blob in the stage projection while `apply_assignments` omits it fails the
+/// whole mutation with an internal error — and made the outcome depend on
+/// whether unrelated statements shared the query (whole-row fallback
+/// succeeded). Pinned: the sole-update path succeeds like the fallback does.
+#[tokio::test]
+async fn null_blob_assignment_in_sole_update_is_a_no_op() {
+    use omnigraph_compiler::query::ast::Literal;
+    let dir = tempfile::tempdir().unwrap();
+    let uri = dir.path().to_str().unwrap();
+    let db = Omnigraph::init(uri, BLOB_DOC_SCHEMA).await.unwrap();
+
+    db.mutate(
+        "main",
+        BLOB_DOC_MUTATIONS,
+        "insert_doc",
+        &params(&[("$name", "d1")]),
+    )
+    .await
+    .unwrap();
+
+    let mut p = params(&[("$name", "d1")]);
+    p.insert("c".to_string(), Literal::Null);
+    let result = db
+        .mutate("main", BLOB_DOC_MUTATIONS, "set_content", &p)
+        .await
+        .unwrap();
+    assert_eq!(result.affected_nodes, 1);
 }

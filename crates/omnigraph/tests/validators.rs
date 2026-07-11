@@ -778,3 +778,72 @@ async fn partial_update_completes_composite_unique_group() {
     .await
     .unwrap();
 }
+
+const OVERLAP_UNIQUE_SCHEMA: &str = r#"
+node Booking {
+    name: String @key
+    room: String?
+    hour: I32?
+    day: String?
+    @unique(room, hour)
+    @unique(hour, day)
+}
+"#;
+
+const OVERLAP_MUTATIONS: &str = r#"
+query insert_booking($name: String, $room: String, $hour: I32, $day: String) {
+    insert Booking { name: $name, room: $room, hour: $hour, day: $day }
+}
+query move_room($name: String, $room: String) {
+    update Booking set { room: $room } where name = $name
+}
+"#;
+
+/// Overlapping `@unique` groups: a sole update assigning `room` pulls in
+/// `hour` (its group partner), and `hour`'s OTHER group `(hour, day)` must
+/// then be completed transitively — the evaluator hard-errors on a partially
+/// present group, so without the transitive closure a perfectly legal update
+/// fails with "missing unique column 'day'". Both directions pinned: the
+/// legal move succeeds, and a genuine (room, hour) collision is still caught.
+#[tokio::test]
+async fn overlapping_unique_groups_allow_sole_partial_update() {
+    let dir = tempfile::tempdir().unwrap();
+    let uri = dir.path().to_str().unwrap();
+    let db = Omnigraph::init(uri, OVERLAP_UNIQUE_SCHEMA).await.unwrap();
+
+    for (name, room, hour, day) in [("b1", "roomA", 9i64, "mon"), ("b2", "roomB", 9, "tue")] {
+        db.mutate(
+            "main",
+            OVERLAP_MUTATIONS,
+            "insert_booking",
+            &mixed_params(&[("$name", name), ("$room", room), ("$day", day)], &[("$hour", hour)]),
+        )
+        .await
+        .unwrap();
+    }
+
+    // Legal sole update — touches neither `day` nor collides.
+    db.mutate(
+        "main",
+        OVERLAP_MUTATIONS,
+        "move_room",
+        &params(&[("$name", "b2"), ("$room", "roomC")]),
+    )
+    .await
+    .unwrap();
+
+    // Genuine collision on (room, hour) still rejected.
+    let err = db
+        .mutate(
+            "main",
+            OVERLAP_MUTATIONS,
+            "move_room",
+            &params(&[("$name", "b2"), ("$room", "roomA")]),
+        )
+        .await
+        .unwrap_err();
+    assert!(
+        err.to_string().contains("@unique"),
+        "moving b2 to (roomA, 9) must collide with b1, got: {err}"
+    );
+}

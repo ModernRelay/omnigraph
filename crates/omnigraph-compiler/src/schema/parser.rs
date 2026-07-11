@@ -947,9 +947,26 @@ fn validate_type_constraints(
                     if is_edge && (col == "src" || col == "dst") {
                         continue;
                     }
-                    if !prop_names.contains_key(col.as_str()) {
+                    let Some(prop) = prop_names.get(col.as_str()) else {
                         return Err(CompilerError::Parse(format!(
                             "@unique on {} references unknown property '{}'",
+                            type_name, col
+                        )));
+                    };
+                    // Uniqueness needs a type that reduces to a scalar key: a
+                    // Blob cannot be compared or scanned by projection and a
+                    // Vector has no meaningful equality — mirror the @key
+                    // guards so the class fails at compile time, not at
+                    // validation/scan time.
+                    if matches!(prop.prop_type.scalar, ScalarType::Blob) {
+                        return Err(CompilerError::Parse(format!(
+                            "@unique is not supported on blob property {}.{}",
+                            type_name, col
+                        )));
+                    }
+                    if matches!(prop.prop_type.scalar, ScalarType::Vector(_)) {
+                        return Err(CompilerError::Parse(format!(
+                            "@unique is not supported on vector property {}.{}",
                             type_name, col
                         )));
                     }
