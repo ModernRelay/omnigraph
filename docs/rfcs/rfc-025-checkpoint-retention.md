@@ -274,6 +274,16 @@ The cleanup root set is:
 - every version inside the operator-selected time/count retention window;
 - versions Lance itself protects through non-OmniGraph tags or branch refs.
 
+Checkpoint tags do not physically protect a lazy graph branch whose table row
+still points at an exact version on that data table's `main`: Lance cannot see
+the foreign `__manifest` reference. For each physical main dataset, cleanup
+therefore caps `before_version` at the oldest exact inherited-main version among
+all live graph branches. Native per-table branch refs remain Lance-protected and
+do not need duplicate tags. Failure to resolve or open any live root aborts the
+graph-wide preflight before the first table GC. The current shipped baseline also
+requires each manifest-visible main version to equal Lance HEAD; uncovered drift
+must be repaired before retention work.
+
 Read-only preview may run without a claim, but it is explicitly provisional.
 Confirmed execution uses this order:
 
@@ -283,7 +293,8 @@ Confirmed execution uses this order:
 2. acquire the retention claim, then revalidate the fleet outage, every stream's
    `SEALED` cut, and absence of recovery sidecars;
 3. run pin reconciliation and recompute the exact root set and per-dataset
-   cutoffs under the claim;
+   cutoffs under the claim, including the oldest live lazy-branch inherited-main
+   floor above;
 4. prepare and revalidate a complete RFC-022 `ReadSet` containing format/schema
    identity, branch incarnations, current manifest table entries/heads, prior GC
    boundaries, and the root digest;

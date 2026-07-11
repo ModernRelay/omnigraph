@@ -295,14 +295,12 @@ pub trait TableStorage: sealed::Sealed + Send + Sync + Debug {
         target_branch: &str,
     ) -> Result<ForkOutcome<SnapshotHandle>>;
 
-    async fn delete_branch(&self, dataset_uri: &str, branch: &str) -> Result<()>;
-
-    /// Idempotent variant of `delete_branch` used by the best-effort fork
-    /// reclaim under branch delete (`db/omnigraph.rs::cleanup_deleted_branch_tables`)
+    /// Idempotent branch-tree reclaim used by the best-effort fork cleanup
+    /// under branch delete (`db/omnigraph.rs::cleanup_deleted_branch_tables`)
     /// and by the orphan-fork reconciler in `optimize`. Tolerates an
     /// already-absent branch (both Lance's `RefNotFound` and the local-store
     /// `NotFound` quirk on a missing `tree/{branch}/` dir). A still-referenced
-    /// branch (`RefConflict`) still surfaces as `OmniError::Lance`.
+    /// branch (`RefConflict`) or live physical path-child remains an error.
     async fn force_delete_branch(&self, dataset_uri: &str, branch: &str) -> Result<()>;
 
     /// List the named Lance branches present on the dataset at `dataset_uri`.
@@ -589,10 +587,6 @@ impl TableStorage for TableStore {
                 ForkOutcome::RefAlreadyExists => ForkOutcome::RefAlreadyExists,
             },
         )
-    }
-
-    async fn delete_branch(&self, dataset_uri: &str, branch: &str) -> Result<()> {
-        TableStore::delete_branch(self, dataset_uri, branch).await
     }
 
     async fn force_delete_branch(&self, dataset_uri: &str, branch: &str) -> Result<()> {

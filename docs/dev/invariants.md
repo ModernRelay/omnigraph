@@ -159,7 +159,8 @@ converge the physical state.
 | Multi-table commit | Manifest CAS plus recovery sidecars; not a single Lance primitive | [writes.md](writes.md), [architecture.md](architecture.md) |
 | Constructive mutations | In-memory `MutationStaging`, one end-of-query table commit per touched table, then one manifest publish | [writes.md](writes.md), [execution.md](execution.md) |
 | Deletes | Staged like inserts/updates (`stage_delete` via Lance 7.0 `DeleteBuilder::execute_uncommitted`, MR-A) — no inline HEAD advance; mixed insert/update/delete in one query rejected by D2 as a deliberate boundary (constructive XOR destructive per query; compose via separate mutations or a branch) | [query-language.md](../user/queries/index.md), [writes.md](writes.md) |
-| Branch delete | Manifest is the single authority, flipped atomically first; per-table forks are derived state, reclaimed best-effort (`force_delete_branch`) with the `cleanup` reconciler as the guaranteed backstop. Under schema/target/all-table gates, a target-scoped unresolved sidecar may be made unreachable by deletion and is then audit-discarded by recovery; graph-global SchemaApply still blocks. Reusing a name whose fork reclaim failed before `cleanup` surfaces an actionable error | [branches-commits.md](../user/branching/index.md), [maintenance.md](../user/operations/maintenance.md), [writes.md](writes.md) |
+| Branch create/delete | `__manifest` `BranchContents` is the single logical authority. Lance create is physically two-phase, so OmniGraph prevalidates names, enforces path-prefix-disjoint live graph names, reclaims an absent-ref clone-only tree, and uses a bounded completion classifier; delete removes authority before tree cleanup, so an absent ref is success and derived tree reclaim may converge later. Neither control emits graph lineage. Per-table forks are derived state, reclaimed best-effort with `cleanup` as backstop. Under schema/target/all-table gates, a target-scoped unresolved sidecar may be made unreachable by deletion and is then audit-discarded by recovery; graph-global SchemaApply still blocks | [branches-commits.md](../user/branching/index.md), [maintenance.md](../user/operations/maintenance.md), [writes.md](writes.md) |
+| Cleanup retention | Explicit cleanup derives exact `keep` cutoffs from Lance's available version list, caps each main-table GC cutoff at the oldest exact main version inherited by any live lazy graph branch, and refuses uncovered main HEAD drift. Lance protects native per-table branch refs itself. The graph-wide live-reference preflight fails closed before the first table GC, after which individual table failures remain fault-isolated | [maintenance.md](../user/operations/maintenance.md), [writes.md](writes.md) |
 | Schema validation | Type checks, required fields, defaults, edge endpoint checks, and edge cardinality are enforced on write paths | [schema-language.md](../user/schema/index.md), [execution.md](execution.md) |
 | Unique constraints | Value/enum, uniqueness, edge-RI, and cardinality route through ONE unified, catalog-derived evaluator (`crate::validate`) on ALL THREE write surfaces — branch-merge, mutation, and bulk load: Δ-scoped (checks the delta, not the whole graph) and structured-filter-backed (committed probes use a BTREE when reconciled and remain correct by scanning while it is pending), reusing the leaf checks (`loader::validate_value_constraints`/`validate_enum_constraints`/`composite_unique_key`) so the surfaces cannot drift. This closed the prior merge bug (merge validated `@range`/`@check` but not enum) AND the **cross-version uniqueness gap** on the mutation and load paths (a duplicate of a committed `@unique` value is now rejected; the merge path always enforced it). The committed view is the merge target snapshot (merge), the write's pinned `txn.base` (mutation), or the pinned pre-load base (load — `Overwrite` validates the batch as the whole new image, committed view empty); `@card` refreshes the manifest-visible graph-branch snapshot on the mutation path only (the #298 stale-handle fix), then follows each entry's actual inherited/owned Lance ref. `@key` is id-backed, so it is checked intra-delta only (a committed holder of a key value is always the same row — an upsert), skipping a wasted O(Δ) probe per keyed row; `@unique` (non-key) groups do the committed lookup. | [schema-language.md](../user/schema/index.md) |
 | Storage trait | `TableStorage` (via `db.storage()`) is staged-only; the sole inline-commit residual (`create_vector_index`) is split onto a separate sealed `InlineCommitResidual` trait reached via `db.storage_inline_residual()` (MR-854), so §1 holds by construction; capability/stat surfaces are roadmap | [writes.md](writes.md), [architecture.md](architecture.md) |
@@ -168,12 +169,18 @@ converge the physical state.
 | Auth | Bearer token hashing and server-side actor resolution are implemented at the HTTP boundary | [server.md](../user/operations/server.md), [policy.md](../user/operations/policy.md) |
 | Tests | Tempdir-backed Lance tests are the current substrate; the storage adapter has an in-memory backend for adapter-level contract tests, but Lance datasets bypass it | [testing.md](testing.md) |
 
-The branch-delete reconciler is authority-derived: it reclaims orphaned forks
-today and degrades to a no-op if Lance ships an atomic multi-dataset branch
-operation, so the design composes with that future rather than blocking it. This
-is the same shape as invariant 7 (indexes are derived state); prefer it over a
-recovery-sidecar-style approach for any new multi-dataset metadata operation,
-since the sidecar would be scaffolding to remove once the substrate closes the gap.
+The branch-control reconcilers are authority-derived: same-name create reclaims
+an absent-ref clone-only manifest tree, and delete/cleanup reclaim orphaned
+per-table forks. They degrade to no-ops if Lance closes the corresponding
+physical gaps, so the design composes with that future rather than blocking it.
+This is the same shape as invariant 7 (indexes are derived state); prefer it
+over a recovery-sidecar-style approach for metadata work whose logical target
+is fully derivable from one existing authority. A graph-visible table effect is
+different and still requires durable ownership before it can advance HEAD.
+For legacy path-prefix overlaps, an ancestor clone-only first-touch tree is not
+proven unreachable while a live child remains: Full recovery therefore leaves
+its sidecar intact, allows the graph to open for leaf-first child deletion, and
+reclaims the ancestor on the next Full sweep.
 
 ## Known Gaps
 
@@ -252,19 +259,24 @@ them explicit.
   files and commits. Both `reclaim_orphaned_fork_and_refork` and
   `reconcile_orphaned_branches` consult pending sidecars before destruction; a
   foreign claim is conflict/indeterminate, never permission to delete. Full
-  recovery accepts sidecar-before-ref crashes and deletes an unpublished fork
-  only when it is still exactly at the inherited version and no other sidecar
-  claims `(table_path, target ref)`. A no-effect sidecar with a competitor
+  recovery accepts sidecar-before-ref crashes. When `BranchContents` is absent,
+  the already-armed intent plus the single-writer-process gate makes a same-name
+  clone-only tree unreachable, so recovery force-reclaims it without pretending
+  it can inspect an unlisted version. When a ref exists, recovery deletes the
+  unpublished fork only after proving it is still exactly at the inherited
+  version and no other sidecar claims `(table_path, target ref)`. A no-effect
+  sidecar with a competitor
   discards only itself; the last survivor either cleans the untouched ref or
   recovers its owned effect. Partial rollback performs no-effect cleanup before
   publishing its fixed outcome. This closes the cross-handle live-ref
   deletion bug and keeps cleanup as the backstop for truly unclaimed refs.
-  The remaining multi-process gap is narrower but real: Lance exposes
-  `force_delete_branch`, not compare-and-delete by `BranchIdentifier`, so a
-  foreign process can create intent/ref between the final list/check and the
-  delete. The documented single-writer-process support boundary remains until
-  Lance provides a conditional ref primitive (or OmniGraph adds a distributed
-  fence); process-local queues are not credited as that primitive.
+  The remaining multi-process gap is narrower but real: Lance exposes neither
+  conditional native graph-branch create/delete nor compare-and-delete by
+  `BranchIdentifier` for per-table refs, so a foreign process can mutate a ref
+  between the final list/check and the operation. The documented
+  single-writer-process support boundary remains until Lance provides a
+  conditional ref primitive (or OmniGraph adds a distributed fence);
+  process-local queues are not credited as that primitive.
 - **Local `write_text_if_match` is not a cross-process CAS:** object-store
   backends use a true conditional put (ETag If-Match; the in-memory test
   backend too), but upstream `object_store` leaves `PutMode::Update`

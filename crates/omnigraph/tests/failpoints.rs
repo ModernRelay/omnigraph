@@ -56,6 +56,50 @@ fn node_table_uri(root: &str, type_name: &str) -> String {
     format!("{}/nodes/{hash:016x}", root.trim_end_matches('/'))
 }
 
+// Lance can durably complete a native ref mutation while the caller observes
+// an error (for example, a lost object-store acknowledgement). BranchContents
+// is the logical authority in both directions: matching create metadata means
+// success, and an absent ref means delete succeeded even if tree cleanup or the
+// acknowledgement failed. Neither control emits graph lineage or a main-table
+// version.
+#[tokio::test]
+#[serial]
+async fn native_branch_controls_reclassify_lost_acknowledgements() {
+    let _scenario = FailScenario::setup();
+    let dir = tempfile::tempdir().unwrap();
+    let db = helpers::init_and_load(&dir).await;
+    let before_version = version_main(&db).await.unwrap();
+    let before_commits = db.list_commits(Some("main")).await.unwrap().len();
+
+    {
+        let _fp = ScopedFailPoint::new(names::BRANCH_CREATE_POST_NATIVE, "return");
+        db.branch_create("feature")
+            .await
+            .expect("matching BranchContents must classify a lost create acknowledgement");
+    }
+    assert!(
+        db.branch_list()
+            .await
+            .unwrap()
+            .iter()
+            .any(|branch| branch == "feature")
+    );
+
+    {
+        let _fp = ScopedFailPoint::new(names::BRANCH_DELETE_POST_NATIVE, "return");
+        db.branch_delete("feature")
+            .await
+            .expect("absent BranchContents must classify a lost delete acknowledgement");
+    }
+    assert_eq!(db.branch_list().await.unwrap(), vec!["main".to_string()]);
+    assert_eq!(version_main(&db).await.unwrap(), before_version);
+    assert_eq!(
+        db.list_commits(Some("main")).await.unwrap().len(),
+        before_commits,
+        "native branch controls must not manufacture graph lineage"
+    );
+}
+
 // Branch delete flips the manifest authority first, then reclaims the per-table
 // forks best-effort. A failure during that reclaim (here, the
 // `branch_delete.before_table_cleanup` failpoint, standing in for a transient
@@ -647,6 +691,31 @@ async fn armed_first_touch_recovery_accepts_missing_target_ref() {
         "precondition: crash happened before the target ref was created"
     );
 
+    // Materialize the narrower Lance crash window underneath the already-
+    // durable writer intent: shallow clone present, BranchContents absent.
+    // Full recovery must not equate "not listed" with "no physical fork".
+    let mut person = lance::Dataset::open(&person_uri).await.unwrap();
+    let person_version = person.version().version;
+    person
+        .create_branch("feature", person_version, None)
+        .await
+        .unwrap();
+    std::fs::remove_file(
+        std::path::Path::new(&person_uri)
+            .join("_refs")
+            .join("branches")
+            .join("feature.json"),
+    )
+    .unwrap();
+    assert!(
+        std::path::Path::new(&person_uri)
+            .join("tree")
+            .join("feature")
+            .exists(),
+        "precondition: clone-only target tree exists"
+    );
+    drop(person);
+
     // Stage A is a synchronous, branch-aware barrier. The Armed sidecar has no
     // table effect for a HEAD-drift check to discover, but it is still ownership:
     // another mutation on the same branch must name it and stop before preparing
@@ -726,6 +795,143 @@ async fn armed_first_touch_recovery_accepts_missing_target_ref() {
             .join(format!("{operation_id}.json"))
             .exists(),
         "full recovery must remove the empty armed intent"
+    );
+    assert!(
+        !std::path::Path::new(&person_uri)
+            .join("tree")
+            .join("feature")
+            .exists(),
+        "full recovery must reclaim an unlisted clone-only table fork"
+    );
+}
+
+#[tokio::test]
+#[serial]
+async fn armed_first_touch_recovery_defers_legacy_path_overlap_until_leaf_delete() {
+    let _scenario = FailScenario::setup();
+    let dir = tempfile::tempdir().unwrap();
+    let uri = dir.path().to_str().unwrap().to_string();
+    let db = helpers::init_and_load(&dir).await;
+    let main_rows = helpers::count_rows(&db, "node:Person").await;
+
+    // Materialize the leaf first so its graph snapshot owns a matching
+    // per-table Lance branch. New OmniGraph versions reject the inverse live
+    // namespace, but old stores could contain it.
+    db.branch_create("feature/child").await.unwrap();
+    db.mutate(
+        "feature/child",
+        MUTATION_QUERIES,
+        "insert_person",
+        &mixed_params(&[("$name", "Leaf")], &[("$age", 22)]),
+    )
+    .await
+    .unwrap();
+
+    // Forge only the legacy graph-level ancestor admission. It inherits main,
+    // so an interrupted first write will own an unpublished table fork.
+    let mut manifest = lance::Dataset::open(&format!("{uri}/__manifest"))
+        .await
+        .unwrap();
+    let manifest_version = manifest.version().version;
+    manifest
+        .create_branch("feature", manifest_version, None)
+        .await
+        .unwrap();
+    drop(manifest);
+
+    {
+        let _failpoint = ScopedFailPoint::new(names::MUTATION_POST_SIDECAR_PRE_FORK, "return");
+        let error = db
+            .mutate(
+                "feature",
+                MUTATION_QUERIES,
+                "insert_person",
+                &mixed_params(&[("$name", "Ancestor")], &[("$age", 23)]),
+            )
+            .await
+            .expect_err("failure after arming must leave the ancestor recovery intent");
+        assert!(matches!(error, OmniError::RecoveryRequired { .. }));
+    }
+    let operation_id = single_sidecar_operation_id(dir.path());
+
+    // Reproduce Lance's narrower clone-only crash window under the already
+    // durable intent. The live leaf shares the ancestor's physical path, so a
+    // force-delete of the ancestor cannot safely complete yet.
+    let person_uri = node_table_uri(&uri, "Person");
+    let mut person = lance::Dataset::open(&person_uri).await.unwrap();
+    let person_version = person.version().version;
+    person
+        .create_branch("feature", person_version, None)
+        .await
+        .unwrap();
+    std::fs::remove_file(
+        std::path::Path::new(&person_uri)
+            .join("_refs")
+            .join("branches")
+            .join("feature.json"),
+    )
+    .unwrap();
+    assert!(
+        person
+            .list_branches()
+            .await
+            .unwrap()
+            .contains_key("feature/child"),
+        "precondition: live leaf table branch exists"
+    );
+    assert!(
+        !person
+            .list_branches()
+            .await
+            .unwrap()
+            .contains_key("feature"),
+        "precondition: ancestor is clone-only"
+    );
+    drop(person);
+    drop(db);
+
+    let recovered = Omnigraph::open(&uri)
+        .await
+        .expect("legacy path overlap must defer cleanup instead of wedging read-write open");
+    assert!(
+        dir.path()
+            .join("__recovery")
+            .join(format!("{operation_id}.json"))
+            .exists(),
+        "deferred cleanup must retain its ownership sidecar"
+    );
+    assert_eq!(
+        helpers::count_rows_branch(&recovered, "feature", "node:Person").await,
+        main_rows,
+        "the empty ancestor intent must remain unpublished"
+    );
+
+    recovered
+        .branch_delete("feature/child")
+        .await
+        .expect("open handle must permit the documented leaf-first remediation");
+    drop(recovered);
+
+    let recovered = Omnigraph::open(&uri)
+        .await
+        .expect("the next Full sweep must finish ancestor cleanup");
+    assert!(
+        !dir.path()
+            .join("__recovery")
+            .join(format!("{operation_id}.json"))
+            .exists(),
+        "recovery must retire the intent after the path child is gone"
+    );
+    assert!(
+        !std::path::Path::new(&person_uri)
+            .join("tree")
+            .join("feature")
+            .exists(),
+        "the clone-only ancestor tree must be reclaimed after leaf deletion"
+    );
+    assert_eq!(
+        helpers::count_rows_branch(&recovered, "feature", "node:Person").await,
+        main_rows
     );
 }
 

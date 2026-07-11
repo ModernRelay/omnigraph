@@ -37,17 +37,19 @@ The central architecture remains the right one:
   separate irreversible decisions and should keep separate evidence and format
   gates.
 
-The current blockers are boundary problems, not a reason to replace that core.
-They concern crash classification, actual fencing, foreign-branch authority,
-and capability activation.
+The remaining open blockers are boundary problems, not a reason to replace that
+core. They concern actual cross-process fencing, capability activation, format
+rollout, and public RFC lifecycle. The native branch crash classifier,
+foreign-source merge semantics, and shipped lazy-branch cleanup exposure found
+by this review are now dispositioned below.
 
 > 💬 **Second-pass verification (2026-07-11):** I independently re-verified this
 > ledger's two sharpest new substrate claims against the pinned checkout before
 > commenting: BLOCKER-01's two-phase branch create is confirmed in Lance's own
 > doc comment, and BLOCKER-04's lazy-branch exposure is confirmed
-> architecturally — and appears to be a live bug in the shipped `cleanup`, not
-> only an RFC gap (see the comment there). Overall judgment: concur with this
-> ledger; three of its findings supersede corrections I applied to the RFCs on
+> architecturally. Both findings produced shipped fixes on 2026-07-11 and their
+> durable dispositions are recorded below. Overall judgment: concur with this
+> ledger; three other findings supersede corrections applied to the RFCs on
 > 2026-07-11 (noted inline at BLOCKER-07, BLOCKER-11, and tightening 5).
 
 The latest revisions improved several important points and those changes should
@@ -98,7 +100,9 @@ sub-contract of an unaccepted RFC as a separately accepted decision.
 
 **Affected:** [RFC-022 §7](../rfcs/rfc-022-unified-write-path.md#7-native-graph-branch-ref-control-protocol)
 
-RFC-022 currently models branch create/delete as one native ref mutation whose
+**Status:** Closed in specification and implementation on 2026-07-11.
+
+At review time RFC-022 modeled branch create/delete as one native ref mutation whose
 completion is the visibility point. The pinned Lance implementation is more
 specific:
 
@@ -142,6 +146,20 @@ and between delete authority removal and directory cleanup.
 > RFC-022 §7 revision (single-writer-process boundary + conditional-ref
 > upstream ask) addressed the *conditional-put* gap but not this crash
 > classification — the two dispositions compose; both are needed.
+
+> ✅ **Disposition (2026-07-11):** RFC-022 §7 now makes `BranchContents` the sole
+> logical authority, defines the bounded create/delete classifier, explicitly
+> rejects a graph-branch sidecar/lineage entry, and retains the
+> single-writer-process boundary. The implementation prevalidates names,
+> requires live graph names to be physical-path-prefix-disjoint, reclaims an
+> absent-ref clone before one bounded retry, accepts only a current-attempt
+> matching lost acknowledgement, and fences delete by exact identifier. Full
+> first-touch recovery also force-reclaims clone-only table residue under its
+> already-durable writer sidecar. Coverage includes flat and named-source
+> clone-only recovery, invalid-name-before-clone, lost acknowledgements,
+> absent-ref/tree-present delete, same-identifier error preservation,
+> recreated-identifier refusal, path-prefix collision/legacy leaf-first delete,
+> and no manifest-version/lineage movement.
 
 ### BLOCKER-02 — create-if-absent ownership is not a fencing lease
 
@@ -193,6 +211,9 @@ that takeover is refused until external fencing/death proof is established.
 [RFC-023 §6](../rfcs/rfc-023-key-conflict-fencing.md#6-retry-and-validation-semantics),
 and [RFC-026 §6](../rfcs/rfc-026-memwal-streaming-ingest.md#6-fold-protocol)
 
+**Status:** The RFC-022 mutation/load portion is closed in the shipped adapter
+as of 2026-07-11. RFC-023 and RFC-026 retain their own open dispositions.
+
 A retryable concurrent inserted-row-filter conflict is detected when a table
 transaction attempts to commit. (`WhenMatched::Fail` may instead report a
 pre-existing match during merge execution.) In a multi-table graph write or
@@ -217,9 +238,23 @@ attempt around that sidecar. For non-strict upsert, the barrier must resolve the
 sidecar before the bounded automatic whole-operation retry. Add a failpoint/race
 in which table N conflicts after table 1 has committed.
 
+> ✅ **RFC-022 disposition (2026-07-11):** mutation/load take the conservative
+> safe branch of this requirement. A pre-effect authority mismatch discards and
+> fully reprepares the attempt. Once the exact-effect sidecar is durable and the
+> commit phase begins, every Lance commit failure returns `RecoveryRequired` and
+> leaves that sidecar intact, even when Full recovery later proves that no table
+> effect landed. The adapter performs zero transparent Lance commit retries and
+> never prepares a new semantic attempt around unresolved ownership; the next
+> synchronous barrier classifies and resolves it first. Finalizing a proven-empty
+> intent and automatically retrying would improve ergonomics, but is not required
+> for safety. RFC-023's fenced key-conflict contract and RFC-026's MemWAL fold
+> protocol still need their adapter-specific resolutions.
+
 ### BLOCKER-04 — live graph branches need physical GC protection
 
 **Affected:** [RFC-025 §6](../rfcs/rfc-025-checkpoint-retention.md#6-cleanup-protocol-and-pruned-through-boundary)
+
+**Status:** Closed in the shipped baseline and RFC-025 on 2026-07-11.
 
 The cleanup root set includes live graph branches, but RFC-025 creates Lance
 tags only for named checkpoints. This is insufficient for lazy graph branches.
@@ -252,6 +287,18 @@ runs, and the lazy branch still opens and reads the exact pinned state.
 > rather than owning the discovery. (Snapshot/time-travel pins share the
 > mechanism but are history-trimming under an operator-confirmed policy; a
 > live branch's working state is not history.)
+
+> ✅ **Disposition (2026-07-11):** shipped cleanup now resolves main plus every
+> live non-system graph branch under schema → all-branch → all-table gates,
+> verifies every exact inherited-main version opens, and caps each dataset's
+> cutoff at the oldest such pin before the first table GC. It also derives
+> `keep=N` from Lance's actual ordered version list and refuses uncovered main
+> HEAD drift. Unclassifiable roots abort graph-wide; only later per-table GC
+> failures are fault-isolated. Regression coverage pins count- and time-based
+> retention, the oldest of multiple live pins, exact keep counts, graph-wide
+> fail-closed ordering, and uncovered drift. RFC-025 §6 now composes checkpoint
+> tags with this required lazy-branch floor rather than treating tags as a
+> replacement.
 
 ### BLOCKER-05 — durable-head OCC must compare the full head token
 
@@ -382,6 +429,11 @@ retaining the public lifecycle status `Proposed`.
 
 ### BLOCKER-10 — do not put foreign-branch facts in an atomic `ReadSet`
 
+**Affected:** [RFC-022 §6.2](../rfcs/rfc-022-unified-write-path.md#62-branch-merge)
+
+**Status:** Closed in specification on 2026-07-11; full merge-adapter conversion
+remains rollout work rather than an architecture ambiguity.
+
 RFC-022 requires every `ReadSet` member to be arbitrated atomically by the
 publish CAS. A CAS on reserved main cannot arbitrate a row on a named source
 branch; a merge-target CAS cannot arbitrate a source-branch row.
@@ -399,6 +451,13 @@ Use the right category for each fact:
   fence held through the target CAS.
 
 Keep target-branch values that must remain stable in the atomic `ReadSet`.
+
+> ✅ **Disposition (2026-07-11):** RFC-022 §6.2 defines the exact captured source
+> commit/snapshot as an immutable effect precondition, not a member of the
+> target publisher's atomic `ReadSet`. A later source-head advance is harmless
+> under captured-source semantics; only a future latest-at-target-publish
+> contract would require a source fence through target CAS. The current bridge
+> remains conservatively stricter before effects while its full adapter lands.
 
 ### BLOCKER-11 — RFC-022 and no-heads MemWAL need coarse OCC
 
@@ -525,7 +584,9 @@ RFC set is merged:
 The review does not require all RFCs to land together. A safe order is:
 
 1. accept RFC-022 after branch-control recovery, coarse `graph_head` OCC, and
-   foreign-branch fact classification are explicit;
+   foreign-branch fact classification are explicit (all three are now
+   dispositioned; the public lifecycle decision in BLOCKER-09 still governs
+   what “accepted” means);
 2. accept and land the stable identity RFC/capability;
 3. accept RFC-023 once partial-effect retry and its format/fleet barrier are
    complete;
@@ -540,10 +601,8 @@ The review does not require all RFCs to land together. A safe order is:
 This ordering preserves the split's main benefit: a blocked performance
 optimization or research result does not hold correctness work hostage.
 
-> 💬 **Concur with the order; two sequencing notes (2026-07-11):**
-> BLOCKER-04's escalation means step 5 has a prerequisite outside this list —
-> the live lazy-branch cleanup exposure needs its red regression test and fix
-> in the shipped `cleanup` first, so RFC-025 builds on a correct baseline. And
-> step 3's TIGHTENING-01 demotion hinges on the partial-update filter check
+> 💬 **Order update (2026-07-11):** BLOCKER-04's shipped-cleanup prerequisite is
+> now complete and RFC-025 §6 incorporates its floor. Step 3's TIGHTENING-01
+> demotion still hinges on the partial-update filter check
 > noted there; if that check lands `None`, upstream symmetry returns to the
 > activation gate and RFC-023's timeline moves accordingly.

@@ -38,7 +38,15 @@ pub(crate) fn maybe_fail_retryable_contention(name: &str) -> Result<()> {
 /// reference these constants instead of bare string literals, so a typo is a
 /// compile error rather than a silently-never-firing failpoint.
 pub mod names {
+    /// After Lance returns success from its two-phase native create, before
+    /// OmniGraph acknowledges it. Recovery must classify the matching
+    /// BranchContents as a completed create (lost acknowledgement).
+    pub const BRANCH_CREATE_POST_NATIVE: &str = "branch_create.post_native";
     pub const BRANCH_DELETE_BEFORE_TABLE_CLEANUP: &str = "branch_delete.before_table_cleanup";
+    /// After Lance returns success from native delete, before OmniGraph
+    /// acknowledges it. Recovery must classify the absent BranchContents as a
+    /// completed logical deletion.
+    pub const BRANCH_DELETE_POST_NATIVE: &str = "branch_delete.post_native";
     /// Branch delete holds the schema, target-branch, and fresh-catalog table
     /// envelope and has completed its final recovery check, before the native
     /// manifest-ref mutation.

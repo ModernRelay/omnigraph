@@ -238,10 +238,10 @@ impl GraphCoordinator {
         let branch = normalize_branch_name(name)?
             .ok_or_else(|| OmniError::manifest("cannot create branch 'main'".to_string()))?;
 
-        // Manifest is the single branch authority (it forks `__manifest` first).
-        // The commit graph is a pure `__manifest` projection (Phase B), so a
-        // branch create is one atomic manifest op — no derived commit-graph
-        // branch to fork, and nothing to roll back.
+        // Manifest BranchContents is the single branch authority. Lance creates
+        // it in two physical phases (shallow clone, then BranchContents); the
+        // manifest coordinator classifies/reclaims a clone-only zombie before
+        // a bounded retry. No graph-lineage branch is created or rolled back.
         self.manifest.create_branch(&branch).await
     }
 
@@ -255,10 +255,11 @@ impl GraphCoordinator {
             )));
         }
 
-        // Manifest is the single branch authority (Phase B): one atomic op makes
-        // the branch cease to exist. The commit graph is a pure `__manifest`
-        // projection with no derived branch to reclaim; the per-table data forks
-        // are reclaimed by `cleanup`, not here.
+        // Removing manifest BranchContents is the logical visibility point.
+        // Lance reclaims the branch tree afterward, so an error may still mean
+        // logical deletion succeeded; the manifest coordinator reclassifies
+        // that outcome from fresh authority. Per-table data forks remain
+        // derived state and are reclaimed by the engine afterward.
         self.manifest.delete_branch(&branch).await
     }
 

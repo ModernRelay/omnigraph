@@ -30,28 +30,53 @@
 - Garbage-collects old versions per table.
 - Removes versions (and their unique fragments) older than the retention policy.
 - Policy options `keep_versions` and `older_than` — at least one is required.
+  `keep_versions=N` derives its requested cutoff from the newest `N` available
+  versions per table (the current HEAD is always retained, including for
+  `N=0`); live-branch safety floors may retain additional intervening versions.
+  When both options are set, a version is removed only if it is older than both
+  cutoffs.
 - Returns per-table stats: `table_key, bytes_removed, old_versions_removed, error`.
-- **Fault-isolated per table.** A single table's transient failure (version GC or
-  orphan reclaim) is recorded on that table's stats row (with an `error`) and logged,
-  and never aborts the healthy tables — cleanup is the convergence
-  backstop, so it does as much as it can and converges on re-run. The CLI reports
-  any failed tables; rerun `cleanup` to retry them.
+- **Fault-isolated per table after the graph-wide safety preflight.** A single
+  table's transient version-GC failure is recorded on that table's stats row
+  (with an `error`), logged, and reported by the CLI without aborting healthy
+  tables. Orphan-reclaim failures are also logged and retried on a later cleanup,
+  but the current stats/CLI surface does not attach them to
+  `TableCleanupStats.error`. The recovery and live-branch checks below are
+  preflight invariants instead: either must succeed before any version GC runs.
+  Rerun `cleanup` to converge either kind of per-table failure.
 - CLI guards with `--confirm`; without it, prints a preview line.
 - **Non-local consent.** Against a non-local target (an `s3://` store/cluster), `cleanup` additionally requires `--yes` on top of `--confirm`: a TTY is prompted, and a non-interactive run (no TTY, or `--json`) refuses rather than destroying. A local (`file://`) target needs only `--confirm`. The same `--yes` gate applies to overwrite `load` and `branch delete`; every maintenance run echoes its resolved target to stderr (suppress with `--quiet`).
-- **Recovery floor:** `--keep < 3` may garbage-collect versions that crash recovery needs as a rollback target. Default `--keep 10` is safe.
+- **Recovery floor:** `--keep < 3` may garbage-collect versions that a later
+  rollback would otherwise use. `--keep 10` is the recommended conservative
+  count; there is no implicit default, so pass a policy explicitly.
 - **Requires clean recovery state.** If any durable recovery intent is pending,
   cleanup refuses before orphan reconciliation or version GC. Reopen the graph
   read-write (or restart the server) to resolve recovery, then rerun cleanup;
   deleting transaction/version history while an intent is pending would make
   exact effect ownership unverifiable.
+- **Preserves live lazy branches.** A graph branch initially inherits each data
+  table directly from an exact main-table version; until that table is first
+  written on the branch, there is no native Lance data-table branch for Lance's
+  cleanup to discover. Under the same schema, branch, and table gates used for
+  version GC, cleanup therefore reads every live graph-branch snapshot and caps
+  each main dataset's cutoff at its oldest inherited version. Native per-table
+  forks remain protected by Lance itself. If any live branch snapshot cannot be
+  classified, cleanup refuses before garbage-collecting any table rather than
+  guessing that its referenced versions are disposable.
+- **Refuses uncovered main-table drift.** Every manifest-visible main version
+  must open and equal Lance HEAD during the graph-wide preflight. If an external
+  or interrupted operation advanced HEAD without a recovery sidecar, run
+  `omnigraph repair` before cleanup; version GC never guesses around that drift.
 - **Orphaned-branch reconciliation:** before the version GC, cleanup reclaims any per-table Lance branch absent from the manifest branch list. These orphans arise when a `branch_delete` flips the manifest authority but a downstream best-effort reclaim does not complete (see [branches-commits.md](../branching/index.md)). The reconciler is idempotent (it no-ops once nothing is orphaned), runs regardless of the `keep_versions` / `older_than` values (those gate version GC only), and never reclaims `main` or system-branch forks. Reclaimed forks are logged. Graph lineage has no separate branch dataset: it lives in `__manifest`.
 
 ## Tombstones
 
 Logical sub-table delete markers in `__manifest` that exclude a sub-table version from snapshot reconstruction.
 
-## Internal schema migrations
+## Internal schema versions
 
-Version evolutions of the on-disk `__manifest` shape are reconciled automatically on the first write under a new binary. An on-disk stamp records the shape; the binary migrates it forward before reading state, and reads are side-effect-free. No operator action is required for in-place upgrades. See [storage.md → Internal schema versioning](../concepts/storage.md) for the full mechanism.
-
-A binary opening a manifest stamped at a version *higher* than it knows about refuses to publish with a clear "upgrade omnigraph first" error — old binaries cannot clobber a newer schema.
+The on-disk format is strict-single-version. A binary refuses a graph whose
+internal schema stamp differs from the version it supports; storage-format
+changes use export/import rebuild rather than automatic in-place migration.
+See the [upgrade guide](upgrade.md) and
+[versioning policy](../../dev/versioning.md).

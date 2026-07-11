@@ -1817,8 +1817,21 @@ async fn process_sidecar(
                 return Ok(false);
             }
             if matches!(mode, RecoveryMode::Full) {
-                cleanup_unpublished_no_effect_forks(root_uri, storage.as_ref(), sidecar, &states)
-                    .await?;
+                if !cleanup_unpublished_no_effect_forks(
+                    root_uri,
+                    storage.as_ref(),
+                    sidecar,
+                    &states,
+                )
+                .await?
+                {
+                    warn!(
+                        operation_id = sidecar.operation_id.as_str(),
+                        "recovery: deferring no-effect fork cleanup until legacy path-child \
+                         branches are deleted leaf-first"
+                    );
+                    return Ok(false);
+                }
             }
             warn!(
                 operation_id = sidecar.operation_id.as_str(),
@@ -1879,8 +1892,7 @@ async fn process_sidecar(
                 operation_id = sidecar.operation_id.as_str(),
                 "recovery: rolling back v3 sidecar because its captured authority changed"
             );
-            roll_back_sidecar(root_uri, storage.as_ref(), sidecar, &states).await?;
-            return Ok(true);
+            return roll_back_sidecar(root_uri, storage.as_ref(), sidecar, &states).await;
         }
     }
     let classifications = states
@@ -1995,9 +2007,7 @@ async fn process_sidecar(
                 writer_kind = ?sidecar.writer_kind,
                 "recovery: rolling back sidecar (mixed or unexpected state)"
             );
-            roll_back_sidecar(root_uri, storage.as_ref(), sidecar, &states)
-                .await
-                .map(|()| true)
+            roll_back_sidecar(root_uri, storage.as_ref(), sidecar, &states).await
         }
         SidecarDecision::RollForward => {
             if matches!(sidecar.writer_kind, SidecarKind::SchemaApply)
@@ -2010,9 +2020,7 @@ async fn process_sidecar(
                             "recovery: rolling back SchemaApply sidecar because schema staging \
                              files were not promoted in this recovery pass"
                         );
-                        roll_back_sidecar(root_uri, storage.as_ref(), sidecar, &states)
-                            .await
-                            .map(|()| true)
+                        roll_back_sidecar(root_uri, storage.as_ref(), sidecar, &states).await
                     }
                     RecoveryMode::RollForwardOnly => {
                         warn!(
@@ -2386,9 +2394,9 @@ async fn cleanup_unpublished_no_effect_forks(
     storage: &dyn StorageAdapter,
     sidecar: &RecoverySidecar,
     states: &[ClassifiedTable],
-) -> Result<()> {
+) -> Result<bool> {
     if sidecar.protocol_v3.is_none() {
-        return Ok(());
+        return Ok(true);
     }
 
     let all_sidecars = list_sidecars(root_uri, storage).await?;
@@ -2432,9 +2440,34 @@ async fn cleanup_unpublished_no_effect_forks(
             .list_branches()
             .await
             .map_err(|error| OmniError::Lance(error.to_string()))?;
+        if let Some(child) = crate::branch_control::path_descendant(&branches, target_branch) {
+            // Lance cannot reclaim an ancestor tree while a slash-separated
+            // path-child remains. Old stores could admit that namespace shape.
+            // Keep the ownership sidecar and let open complete so the operator
+            // can delete the child branch first; the next Full sweep then
+            // rechecks authority and reclaims the ancestor fork.
+            warn!(
+                operation_id = sidecar.operation_id.as_str(),
+                table_path = pin.table_path.as_str(),
+                branch = target_branch,
+                path_child = child,
+                "recovery: deferring unpublished fork cleanup for legacy path overlap"
+            );
+            return Ok(false);
+        }
         let Some(contents) = branches.get(target_branch) else {
-            // Crash-before-fork, or a previous cleanup pass that crashed before
-            // its rollback publish. Both are already converged physically.
+            // BranchContents is authoritative, but Lance create writes the
+            // shallow-cloned target dataset first. The absent-ref state is
+            // therefore either crash-before-fork (idempotent no-op) or an
+            // exact clone-only zombie owned by this already-armed sidecar.
+            // Reclaim both through Lance's force API before retiring intent;
+            // merely skipping here leaves the zombie blocking every retry.
+            if !crate::branch_control::reclaim_ref_absent_tree(&mut dataset, target_branch).await? {
+                return Err(OmniError::manifest_conflict(format!(
+                    "target ref '{target_branch}' appeared during no-effect recovery; refusing \
+                     to retire its ownership intent"
+                )));
+            }
             continue;
         };
         if contents.parent_version != pin.expected_version {
@@ -2468,7 +2501,7 @@ async fn cleanup_unpublished_no_effect_forks(
             .await
             .map_err(|error| OmniError::Lance(error.to_string()))?;
     }
-    Ok(())
+    Ok(true)
 }
 
 fn table_requires_rollback_effect(state: &ClassifiedTable) -> bool {
@@ -2545,7 +2578,7 @@ async fn roll_back_sidecar(
     storage: &dyn StorageAdapter,
     sidecar: &RecoverySidecar,
     states: &[ClassifiedTable],
-) -> Result<()> {
+) -> Result<bool> {
     // Once the fixed rollback commit is visible, early recovery finalization no
     // longer has pre-restore table observations. Persist the exact audit plan
     // first so that path can replay it without fabricating outcomes from pins.
@@ -2562,7 +2595,13 @@ async fn roll_back_sidecar(
     // If recovery crashed after publishing first, the fixed rollback outcome
     // would make the next pass finalize/delete the sidecar without ever seeing
     // the still-orphaned refs.
-    cleanup_unpublished_no_effect_forks(root_uri, storage, sidecar, states).await?;
+    if !cleanup_unpublished_no_effect_forks(root_uri, storage, sidecar, states).await? {
+        warn!(
+            operation_id = sidecar.operation_id.as_str(),
+            "recovery: deferring rollback until legacy path-child branches are deleted leaf-first"
+        );
+        return Ok(false);
+    }
 
     // Restore every drifted table (RolledPastExpected / UnexpectedAtP1 /
     // UnexpectedMultistep) to its manifest-pinned content, then PUBLISH so
@@ -2657,7 +2696,7 @@ async fn roll_back_sidecar(
     )
     .await?;
     delete_sidecar_by_operation_id(root_uri, storage, &sidecar.operation_id).await?;
-    Ok(())
+    Ok(true)
 }
 
 /// Cleanup path for stale sidecars where a previous recovery's
