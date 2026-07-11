@@ -30,13 +30,16 @@ authority.
   never created without ownership: the schema-v3 sidecar is durable first and
   names that `(table_path, target ref)`. Reclaim and `cleanup` treat any
   matching pending sidecar as a hard stop. Quiesced full recovery accepts both
-  crash shapes — sidecar durable with no ref yet, or an exact untouched ref at
-  the inherited version — and removes the latter before deleting the empty
-  intent. If several pending intents claim one ref, a no-effect intent discards
-  only itself while any competitor remains; the last no-effect survivor cleans
-  an untouched ref, or the effect-owning survivor recovers normally. `cleanup`
-  remains the backstop for genuinely unclaimed legacy/stale refs; see the
-  fork-reclaim note in [invariants.md](invariants.md).
+  logical crash shapes — sidecar durable with no ref yet, or an exact untouched
+  ref at the inherited version. Because Lance creates a branch dataset before
+  writing its authoritative `BranchContents`, the first shape may still contain
+  a clone-only tree; recovery force-reclaims that absent-ref tree idempotently.
+  It removes an exact untouched ref before deleting the empty intent. If several
+  pending intents claim one ref, a no-effect intent discards only itself while
+  any competitor remains; the last no-effect survivor cleans an untouched ref,
+  or the effect-owning survivor recovers normally. `cleanup` remains the
+  backstop for genuinely unclaimed legacy/stale refs; see the fork-reclaim note
+  in [invariants.md](invariants.md).
 
 ## Mutation/load coarse OCC (RFC-022 first adapter)
 
@@ -87,6 +90,14 @@ source and target, re-lists sidecars, and compares fresh source/target manifest
 versions with the captured snapshots. A stale warm handle catalog or coordinator
 snapshot is never accepted as that revalidation.
 
+The source snapshot is a captured merge input, not authority that the target
+manifest CAS can arbitrate. The current process-local source gate is a stronger
+same-process fence around that capture, including delete/recreate ABA, but the
+semantic contract is still "merge the captured source commit." A later source
+advance does not invalidate an otherwise prepared target publish. Claiming
+"latest source at target publish" would instead require a cross-process source
+fence held through the target CAS.
+
 That fence prevents a same-process target delete/recreate from reusing the branch
 name underneath a merge plan. The race test deliberately recreates a target with
 the same name and numeric Lance version but a different `BranchIdentifier`, so
@@ -108,6 +119,47 @@ records the orphan-discard recovery audit and deletes the sidecar. A
 `SchemaApply` sidecar remains graph-global and blocks deletion. This exception
 is specific to removing the authority that made the intent reachable; create,
 merge, mutation, and load still reject relevant unresolved ownership.
+
+### Native graph-branch control recovery
+
+Graph branch create/delete do not use the graph-visible table-effect sidecar or
+emit graph lineage. Their sole logical authority is Lance `BranchContents` for
+the `__manifest` dataset, and Lance mutates that authority in two physical
+phases:
+
+- create shallow-clones `tree/{branch}` before writing `BranchContents`;
+- delete removes `BranchContents` before reclaiming that tree.
+
+Under the schema/branch/table control gates, create validates the name before
+the clone and rejects a live graph name that is a physical path ancestor or
+descendant of another live name. It then force-reclaims any absent-ref same-name
+tree and performs at most two native attempts. An ambiguous result is accepted
+only when fresh metadata has
+the captured parent branch/version/incarnation plus exactly one new identifier
+element and the target opens. Foreign or broken authoritative refs are never
+deleted. Delete captures the exact target identifier; after an ambiguous error,
+an absent ref is logical success, the same identifier preserves the original
+error, and a different identifier is a typed delete/recreate conflict. Derived
+tree cleanup is retried best-effort.
+
+There is deliberately no branch-control sidecar: within the supported
+single-writer-process topology, an absent ref makes a same-name tree unreachable
+garbage; the path-prefix-disjoint namespace is what makes Lance's recursive
+force cleanup exact. Same-name create is therefore the targeted reconciler.
+First-touch data-table
+forks remain sidecar-owned because they are physical effects of a graph-visible
+mutation/load. Lance does not expose conditional ref create/delete, so this
+classifier is not advertised as a cross-process branch-control fence.
+
+Legacy prefix-overlap recovery is the one first-touch case that does not prove an
+entire nested tree unreachable. If a Full sweep finds an ancestor first-touch
+target with a live path-child, it keeps the sidecar. Open may complete for
+leaf-first deletion only when the sidecar owns no physical table effect. A mixed
+attempt that owns an effect plus an untouched fork must roll back as one recovery
+outcome, so open fails closed while the child blocks fork cleanup. After an
+existing handle or an offline Lance-level branch tool removes the child, a later
+Full sweep reclaims the untouched fork, compensates the owned effect, and retires
+the intent.
 
 ## Read-your-writes within a multi-statement mutation
 
@@ -328,12 +380,17 @@ recovery sweep in `crates/omnigraph/src/db/manifest/recovery.rs`:
   rollback-only; an unknown/foreign effect is refused rather than adopted.
   An Armed first-touch intent with no owned transaction is deferred by live
   roll-forward-only healing because another handle may still own it. Quiesced
-  full recovery tolerates an absent target ref (crash before fork), or removes
-  an exact unchanged unpublished ref after proving no other pending sidecar
-  claims it. With competing claims, the current no-effect sidecar discards
-  itself without touching the ref; the final survivor owns cleanup/recovery.
+  full recovery tolerates an absent target ref (either crash before clone or a
+  clone-only tree with no `BranchContents`) and force-reclaims that absent-ref
+  target idempotently. If an authoritative ref exists, recovery removes it only
+  when it is exactly unchanged and no other pending sidecar claims it. With
+  competing claims, the current no-effect sidecar discards itself without
+  touching the ref; the final survivor owns cleanup/recovery.
   During partial rollback, no-effect refs are removed before the rollback
-  outcome is published so a retry cannot strand them.
+  outcome is published so a retry cannot strand them. If a legacy live
+  path-child blocks that cleanup, rollback returns an error and read-write open
+  fails closed; only a sidecar proven to own no table effect may defer cleanup
+  while returning an open handle.
 - If any table is `InvariantViolation` (Lance HEAD < manifest pinned —
   should be impossible), **abort** with a loud error and leave the
   sidecar on disk for operator review.

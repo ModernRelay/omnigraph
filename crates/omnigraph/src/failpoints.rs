@@ -38,7 +38,15 @@ pub(crate) fn maybe_fail_retryable_contention(name: &str) -> Result<()> {
 /// reference these constants instead of bare string literals, so a typo is a
 /// compile error rather than a silently-never-firing failpoint.
 pub mod names {
+    /// After Lance returns success from its two-phase native create, before
+    /// OmniGraph acknowledges it. Recovery must classify the matching
+    /// BranchContents as a completed create (lost acknowledgement).
+    pub const BRANCH_CREATE_POST_NATIVE: &str = "branch_create.post_native";
     pub const BRANCH_DELETE_BEFORE_TABLE_CLEANUP: &str = "branch_delete.before_table_cleanup";
+    /// After Lance returns success from native delete, before OmniGraph
+    /// acknowledges it. Recovery must classify the absent BranchContents as a
+    /// completed logical deletion.
+    pub const BRANCH_DELETE_POST_NATIVE: &str = "branch_delete.post_native";
     /// Branch delete holds the schema, target-branch, and fresh-catalog table
     /// envelope and has completed its final recovery check, before the native
     /// manifest-ref mutation.
@@ -94,6 +102,11 @@ pub mod names {
     /// After every deferred first-touch table ref is created under a durable
     /// v3 sidecar, before any staged data transaction advances target HEAD.
     pub const MUTATION_POST_FORK_PRE_COMMIT: &str = "mutation.post_fork_pre_commit";
+    /// After each exact staged table transaction advances HEAD, before the next
+    /// table effect or Phase-B confirmation. Used to leave a real partial
+    /// multi-table v3 attempt whose remaining first-touch fork still needs
+    /// recovery cleanup.
+    pub const MUTATION_POST_TABLE_COMMIT: &str = "mutation.post_table_commit";
     /// After the v3 ownership sidecar is durable but before the first deferred
     /// named-table ref is created. Recovery must accept the absent target ref.
     pub const MUTATION_POST_SIDECAR_PRE_FORK: &str = "mutation.post_sidecar_pre_fork";

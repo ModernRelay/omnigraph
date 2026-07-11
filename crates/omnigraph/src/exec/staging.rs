@@ -1155,6 +1155,10 @@ impl StagedMutation {
                 row_count: state.row_count,
                 version_metadata: state.version_metadata,
             });
+            crate::failpoints::maybe_fail(crate::failpoints::names::MUTATION_POST_TABLE_COMMIT)
+                .map_err(|error| {
+                    OmniError::recovery_required(operation_id.clone(), error.to_string())
+                })?;
         }
 
         if let Err(error) = confirm_occ_sidecar_phase_b(

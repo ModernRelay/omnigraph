@@ -18,12 +18,13 @@
 //!   older manifest versions until `cleanup` runs.
 //! * `cleanup_all_tables` — Lance `cleanup_old_versions` on every table.
 //!   Removes manifests (and their unique fragments) older than the configured
-//!   retention. Destructive to version history — callers should gate this
-//!   behind an explicit confirm flag at the CLI layer.
+//!   retention, capped at the oldest main-table version inherited by any live
+//!   lazy graph branch. Destructive to unreferenced version history — callers
+//!   should gate this behind an explicit confirm flag at the CLI layer.
 //!
 //! Both orchestrate the graph's node + edge datasets from main authority;
-//! cleanup preserves Lance-referenced named-branch history according to its
-//! retention policy.
+//! cleanup preserves both Lance-referenced native branch history and the
+//! graph-level lazy-branch references Lance cannot observe.
 
 use std::time::Duration;
 
@@ -786,7 +787,8 @@ async fn compact_internal_table(
 
 /// Run Lance `cleanup_old_versions` on every node + edge table on `main`,
 /// using [`CleanupPolicyOptions`]. The latest manifest is always preserved
-/// regardless (Lance invariant).
+/// regardless (Lance invariant), and the requested cutoff is capped at the
+/// oldest main-table version inherited by a live lazy graph branch.
 pub async fn cleanup_all_tables(
     db: &mut Omnigraph,
     options: CleanupPolicyOptions,
@@ -896,8 +898,77 @@ pub async fn cleanup_all_tables(
         ));
     }
 
+    // Lance protects versions referenced by its own per-dataset branches, but
+    // an OmniGraph branch is lazy: until a table is first written on that
+    // branch its manifest entry points directly at an older MAIN version and
+    // no Lance branch ref exists on the data table. Resolve every live graph
+    // branch from fresh authority while schema + all branch/table gates are
+    // held, then cap each main dataset's GC cutoff at its oldest such pin.
+    // Main itself participates: its manifest-visible version must open and
+    // equal Lance HEAD, so uncovered drift is repaired before cleanup rather
+    // than letting HEAD-based GC collect graph-visible authority.
+    // Any branch snapshot read failure aborts before the first table GC: an
+    // unknown live reference is never evidence that a version is disposable.
+    let mut oldest_live_main_version_by_path = std::collections::HashMap::<String, u64>::new();
+    for branch_target in &graph_branches {
+        if branch_target
+            .as_deref()
+            .is_some_and(crate::db::is_internal_system_branch)
+        {
+            continue;
+        }
+        let branch_label = branch_target.as_deref().unwrap_or("main");
+        let branch_snapshot = db
+            .fresh_snapshot_for_branch(branch_target.as_deref())
+            .await
+            .map_err(|err| {
+                OmniError::manifest_conflict(format!(
+                    "cleanup could not classify live branch '{branch_label}'; refusing version GC: {err}"
+                ))
+            })?;
+        for entry in branch_snapshot
+            .entries()
+            .filter(|entry| entry.table_branch.is_none())
+        {
+            // Validate that the exact protected version is still openable
+            // before GC starts. This catches pre-existing damage from an older
+            // cleanup implementation and keeps the sweep fail-closed instead
+            // of deleting unrelated history around an already-broken branch.
+            entry.open(db.root_uri(), None).await.map_err(|err| {
+                OmniError::manifest_conflict(format!(
+                    "cleanup could not classify live branch '{branch_label}' table '{}' at main version {}; refusing version GC: {err}",
+                    entry.table_key, entry.table_version
+                ))
+            })?;
+            let full_path = format!("{}/{}", db.root_uri, entry.table_path);
+            if branch_target.is_none() {
+                let head = db.storage().open_dataset_head(&full_path, None).await?;
+                if head.version() != entry.table_version {
+                    return Err(OmniError::manifest_conflict(format!(
+                        "cleanup found uncovered HEAD drift for table '{}': manifest version {}, \
+                         Lance HEAD {}; run `omnigraph repair` before version GC",
+                        entry.table_key,
+                        entry.table_version,
+                        head.version()
+                    )));
+                }
+            }
+            oldest_live_main_version_by_path
+                .entry(full_path)
+                .and_modify(|oldest| *oldest = (*oldest).min(entry.table_version))
+                .or_insert(entry.table_version);
+        }
+    }
+
     let before_timestamp = options.older_than.map(|d| Utc::now() - d);
     let keep_versions = options.keep_versions;
+    let table_tasks = table_tasks
+        .into_iter()
+        .map(|(table_key, full_path)| {
+            let live_main_floor = oldest_live_main_version_by_path.get(&full_path).copied();
+            (table_key, full_path, live_main_floor)
+        })
+        .collect::<Vec<_>>();
 
     if table_tasks.is_empty() {
         return Ok(Vec::new());
@@ -911,7 +982,7 @@ pub async fn cleanup_all_tables(
     // cleanup is the convergence backstop, so it must do as much as it can and
     // converge on re-run rather than fail wholesale (invariant 13).
     let results: Vec<TableCleanupStats> = futures::stream::iter(table_tasks.into_iter())
-        .map(|(table_key, full_path)| async move {
+        .map(|(table_key, full_path, live_main_floor)| async move {
             let outcome: Result<RemovalStats> = async {
                 crate::failpoints::maybe_fail(crate::failpoints::names::CLEANUP_TABLE_GC)?;
                 // `cleanup_old_versions` is a Lance-only maintenance API not
@@ -919,9 +990,36 @@ pub async fn cleanup_all_tables(
                 // above for the same rationale. Unwrap via `into_dataset()`.
                 let handle = storage.open_dataset_head(&full_path, None).await?;
                 let ds = handle.into_dataset();
-                let before_version = keep_versions
-                    .map(|n| ds.version().version.saturating_sub(n as u64))
-                    .filter(|v| *v > 0);
+                let requested_before_version = if let Some(keep) = keep_versions {
+                    // Lance versions are not safely derivable from HEAD
+                    // arithmetic after prior GC. Use the actual ordered
+                    // version list so `keep=N` retains exactly the newest N
+                    // available versions (with HEAD as the unavoidable floor
+                    // when N=0).
+                    let versions = ds
+                        .versions()
+                        .await
+                        .map_err(|error| OmniError::Lance(error.to_string()))?;
+                    let retain = (keep as usize).max(1);
+                    let cutoff = if versions.len() <= retain {
+                        versions.first()
+                    } else {
+                        versions.get(versions.len() - retain)
+                    }
+                    .ok_or_else(|| {
+                        OmniError::manifest_internal(format!(
+                            "cleanup found no versions for open table '{table_key}'"
+                        ))
+                    })?;
+                    Some(cutoff.version)
+                } else {
+                    None
+                };
+                let before_version = match (requested_before_version, live_main_floor) {
+                    (Some(requested), Some(floor)) => Some(requested.min(floor)),
+                    (None, Some(floor)) => Some(floor),
+                    (requested, None) => requested,
+                };
                 let policy = CleanupPolicy {
                     before_timestamp,
                     before_version,

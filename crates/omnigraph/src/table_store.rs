@@ -277,19 +277,6 @@ impl TableStore {
         }
     }
 
-    pub async fn delete_branch(&self, dataset_uri: &str, branch: &str) -> Result<()> {
-        let mut ds = crate::instrumentation::open_dataset(
-            dataset_uri,
-            crate::instrumentation::VersionResolution::Latest,
-            Some(&self.session),
-            crate::instrumentation::table_wrapper(),
-        )
-        .await?;
-        ds.delete_branch(branch)
-            .await
-            .map_err(|e| OmniError::Lance(e.to_string()))
-    }
-
     /// List the named Lance branches present on the dataset at `dataset_uri`.
     /// The `cleanup` orphan reconciler diffs this against the manifest branch
     /// set to find orphaned per-table forks. `main`/default is not a named
@@ -311,15 +298,16 @@ impl TableStore {
 
     /// Idempotently drop `branch` from the dataset at `dataset_uri`.
     ///
-    /// Unlike [`delete_branch`](Self::delete_branch), this tolerates an
-    /// already-absent branch — both a missing contents ref (Lance's
+    /// This tolerates an already-absent branch — both a missing contents ref (Lance's
     /// `force_delete_branch` handles that) and a missing `tree/{branch}/`
     /// directory (the local-store `NotFound` quirk pinned by
     /// `lance_surface_guards::force_delete_branch_semantics`). Safe to call on a
     /// possibly-orphaned or already-reclaimed fork.
     ///
-    /// A branch that still has referencing descendants (`RefConflict`) is NOT
-    /// tolerated: that is a real ordering error and surfaces as `OmniError::Lance`.
+    /// A branch that still has referencing descendants (`RefConflict`) or a
+    /// live physical path-child is NOT tolerated: those are real ordering
+    /// errors. The graph namespace prevents new path-prefix overlaps; surfacing
+    /// legacy ones keeps cleanup from falsely reporting a reclaim Lance skipped.
     /// Used by the eager best-effort reclaim in `cleanup_deleted_branch_tables`
     /// and the `cleanup` orphan reconciler.
     pub async fn force_delete_branch(&self, dataset_uri: &str, branch: &str) -> Result<()> {
@@ -330,11 +318,7 @@ impl TableStore {
             crate::instrumentation::table_wrapper(),
         )
         .await?;
-        match ds.force_delete_branch(branch).await {
-            Ok(()) => Ok(()),
-            Err(lance::Error::RefNotFound { .. }) | Err(lance::Error::NotFound { .. }) => Ok(()),
-            Err(e) => Err(OmniError::Lance(e.to_string())),
-        }
+        crate::branch_control::force_delete_branch_idempotent(&mut ds, branch).await
     }
 
     pub fn ensure_expected_version(
@@ -387,49 +371,28 @@ impl TableStore {
             .map_err(|e| OmniError::Lance(e.to_string()))?;
         self.ensure_expected_version(&source_ds, table_key, source_version)?;
 
-        if let Err(create_err) = source_ds
-            .create_branch(target_branch, source_version, None)
-            .await
+        let created = match crate::branch_control::create_branch_recoverably(
+            &mut source_ds,
+            target_branch,
+            source_version,
+        )
+        .await?
         {
-            // Disambiguate the failure: only a genuinely pre-existing ref is a
-            // reclaim candidate. Mapping EVERY create_branch failure to
-            // `RefAlreadyExists` would route a transient I/O / version / Lance
-            // internal error into the destructive reclaim path. So check whether
-            // the ref actually exists; if not, the failure is real — propagate
-            // it (preserving error fidelity) rather than force-deleting.
-            //
-            // `list_branches` reads `_refs/branches/` from the store, so it sees
-            // a fully-formed manifest-unreferenced fork (our common case — a
-            // create_branch that completed but whose manifest publish did not).
-            // It does NOT see a phase-1-only Lance "zombie" (tree dir written,
-            // no BranchContents) — but neither does `cleanup`'s reconciler, also
-            // list_branches-based. A zombie only forms if create_branch is
-            // interrupted *between its two internal phases* (a far narrower
-            // window than the manifest-publish gap), and it surfaces here as the
-            // propagated create error requiring manual reclaim. We deliberately
-            // do NOT force-delete on a not-found-ref failure: it is
-            // indistinguishable from a transient error on a fresh create, and
-            // force-deleting there is the destructive overreach this guard
-            // removes. The caller holds the per-(table, branch) write queue, so
-            // no in-process writer races this fork; a cross-process create
-            // between our check and now is the documented one-winner-CAS gap and
-            // propagates as a retryable error.
-            let ref_exists = source_ds
-                .list_branches()
-                .await
-                .map(|b| b.contains_key(target_branch))
-                .unwrap_or(false);
-            if ref_exists {
+            crate::branch_control::BranchCreateOutcome::Created(dataset) => dataset,
+            crate::branch_control::BranchCreateOutcome::RefAlreadyExists => {
                 return Ok(ForkOutcome::RefAlreadyExists);
             }
-            return Err(OmniError::Lance(create_err.to_string()));
-        }
+        };
 
         // The ref is now independently durable. Any error from this point is an
         // ambiguous/post-effect outcome to the caller and must retain an armed
         // recovery intent rather than being treated as a safe pre-effect retry.
         crate::failpoints::maybe_fail(crate::failpoints::names::FORK_POST_CREATE_PRE_OPEN)?;
 
+        // Re-open through the shared session for normal cache behavior. The
+        // returned handle above is used only as proof that the matching branch
+        // dataset was openable during classification.
+        drop(created);
         let ds = self
             .open_dataset_head(dataset_uri, Some(target_branch))
             .await?;

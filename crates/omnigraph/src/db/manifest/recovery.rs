@@ -1817,8 +1817,28 @@ async fn process_sidecar(
                 return Ok(false);
             }
             if matches!(mode, RecoveryMode::Full) {
-                cleanup_unpublished_no_effect_forks(root_uri, storage.as_ref(), sidecar, &states)
-                    .await?;
+                if let NoEffectForkCleanup::DeferredPathChild {
+                    table_path,
+                    target_branch,
+                    path_child,
+                } = cleanup_unpublished_no_effect_forks(
+                    root_uri,
+                    storage.as_ref(),
+                    sidecar,
+                    &states,
+                )
+                .await?
+                {
+                    warn!(
+                        operation_id = sidecar.operation_id.as_str(),
+                        table_path,
+                        branch = target_branch,
+                        path_child,
+                        "recovery: deferring no-effect fork cleanup until legacy path-child \
+                         branches are deleted leaf-first"
+                    );
+                    return Ok(false);
+                }
             }
             warn!(
                 operation_id = sidecar.operation_id.as_str(),
@@ -2369,6 +2389,16 @@ enum EffectOwnership {
     Unverifiable,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum NoEffectForkCleanup {
+    Complete,
+    DeferredPathChild {
+        table_path: String,
+        target_branch: String,
+        path_child: String,
+    },
+}
+
 /// Remove first-touch named-branch refs created by an Armed v3 attempt that
 /// never landed this table's planned transaction.
 ///
@@ -2386,9 +2416,9 @@ async fn cleanup_unpublished_no_effect_forks(
     storage: &dyn StorageAdapter,
     sidecar: &RecoverySidecar,
     states: &[ClassifiedTable],
-) -> Result<()> {
+) -> Result<NoEffectForkCleanup> {
     if sidecar.protocol_v3.is_none() {
-        return Ok(());
+        return Ok(NoEffectForkCleanup::Complete);
     }
 
     let all_sidecars = list_sidecars(root_uri, storage).await?;
@@ -2432,9 +2462,38 @@ async fn cleanup_unpublished_no_effect_forks(
             .list_branches()
             .await
             .map_err(|error| OmniError::Lance(error.to_string()))?;
+        if let Some(child) = crate::branch_control::path_descendant(&branches, target_branch) {
+            // Lance cannot reclaim an ancestor tree while a slash-separated
+            // path-child remains. Old stores could admit that namespace shape.
+            // Keep the ownership sidecar and let open complete so the operator
+            // can delete the child branch first; the next Full sweep then
+            // rechecks authority and reclaims the ancestor fork.
+            warn!(
+                operation_id = sidecar.operation_id.as_str(),
+                table_path = pin.table_path.as_str(),
+                branch = target_branch,
+                path_child = child,
+                "recovery: deferring unpublished fork cleanup for legacy path overlap"
+            );
+            return Ok(NoEffectForkCleanup::DeferredPathChild {
+                table_path: pin.table_path.clone(),
+                target_branch: target_branch.to_string(),
+                path_child: child.to_string(),
+            });
+        }
         let Some(contents) = branches.get(target_branch) else {
-            // Crash-before-fork, or a previous cleanup pass that crashed before
-            // its rollback publish. Both are already converged physically.
+            // BranchContents is authoritative, but Lance create writes the
+            // shallow-cloned target dataset first. The absent-ref state is
+            // therefore either crash-before-fork (idempotent no-op) or an
+            // exact clone-only zombie owned by this already-armed sidecar.
+            // Reclaim both through Lance's force API before retiring intent;
+            // merely skipping here leaves the zombie blocking every retry.
+            if !crate::branch_control::reclaim_ref_absent_tree(&mut dataset, target_branch).await? {
+                return Err(OmniError::manifest_conflict(format!(
+                    "target ref '{target_branch}' appeared during no-effect recovery; refusing \
+                     to retire its ownership intent"
+                )));
+            }
             continue;
         };
         if contents.parent_version != pin.expected_version {
@@ -2468,7 +2527,7 @@ async fn cleanup_unpublished_no_effect_forks(
             .await
             .map_err(|error| OmniError::Lance(error.to_string()))?;
     }
-    Ok(())
+    Ok(NoEffectForkCleanup::Complete)
 }
 
 fn table_requires_rollback_effect(state: &ClassifiedTable) -> bool {
@@ -2546,23 +2605,39 @@ async fn roll_back_sidecar(
     sidecar: &RecoverySidecar,
     states: &[ClassifiedTable],
 ) -> Result<()> {
+    // An Armed multi-table attempt can create every first-touch ref and then
+    // land effects on only a subset. No-effect refs are not selected by the
+    // rollback manifest publish, so they must be removed BEFORE that publish.
+    // If recovery crashed after publishing first, the fixed rollback outcome
+    // would make the next pass finalize/delete the sidecar without ever seeing
+    // the still-orphaned refs. A rollback that owns any physical effect may not
+    // defer and let read-write open succeed: legacy writers are not all enrolled
+    // in the v3 preparation barrier. Fail closed until the path child is removed.
+    if let NoEffectForkCleanup::DeferredPathChild {
+        table_path,
+        target_branch,
+        path_child,
+    } = cleanup_unpublished_no_effect_forks(root_uri, storage, sidecar, states).await?
+    {
+        return Err(OmniError::manifest_internal(format!(
+            "OCC recovery sidecar '{}' owns physical effects but cannot clean unpublished fork \
+             '{}:{}' while legacy path-child '{}' is live; refusing read-write open; delete the \
+             child branch leaf-first using an existing handle or an offline Lance-level branch \
+             tool, then reopen",
+            sidecar.operation_id, table_path, target_branch, path_child
+        )));
+    }
+
     // Once the fixed rollback commit is visible, early recovery finalization no
     // longer has pre-restore table observations. Persist the exact audit plan
-    // first so that path can replay it without fabricating outcomes from pins.
+    // after fork cleanup and before the first restore so that path can replay it
+    // without fabricating outcomes from pins.
     let prepared_v3 = if sidecar.protocol_v3.is_some() {
         Some(prepare_v3_rollback_audit_plan(root_uri, storage, sidecar, states).await?)
     } else {
         None
     };
     let sidecar = prepared_v3.as_ref().unwrap_or(sidecar);
-
-    // An Armed multi-table attempt can create every first-touch ref and then
-    // land effects on only a subset. No-effect refs are not selected by the
-    // rollback manifest publish, so they must be removed BEFORE that publish.
-    // If recovery crashed after publishing first, the fixed rollback outcome
-    // would make the next pass finalize/delete the sidecar without ever seeing
-    // the still-orphaned refs.
-    cleanup_unpublished_no_effect_forks(root_uri, storage, sidecar, states).await?;
 
     // Restore every drifted table (RolledPastExpected / UnexpectedAtP1 /
     // UnexpectedMultistep) to its manifest-pinned content, then PUBLISH so

@@ -446,7 +446,15 @@ able to enumerate every adapter and every entry point that invokes it.
 
 ### 6.2 Branch merge
 
-- Compute row classification outside the gates.
+- Capture the exact source graph commit/snapshot and compute row classification
+  against that immutable input outside the effect gates. The source commit is an
+  effect precondition, not a member of the target publisher's atomic `ReadSet`:
+  a target CAS cannot arbitrate a foreign source-branch row.
+- Revalidate that the captured source incarnation and commit still identify the
+  prepared input before effects. A later source-head advance is intentionally
+  harmless: merge means "merge this captured source commit," not "whatever is
+  latest when the target publishes." A future latest-at-publish contract would
+  require a real source-branch fence held through target CAS.
 - Include the target graph head and every target table used by classification or
   validation in `ReadSet`.
 - Any target change before effects forces a complete reclassification; publishing a
@@ -495,15 +503,82 @@ There is no target branch on which to publish before create, and no target remai
 which to publish after delete. They therefore cannot truthfully be instances of the
 graph-visible manifest-CAS protocol.
 
+The native control is not one physical mutation. At the pinned Lance revision:
+
+- create first commits a shallow-cloned branch dataset under `tree/{branch}` and
+  then writes `BranchContents`; the two phases are non-atomic and
+  `BranchContents` is the sole logical authority;
+- delete removes `BranchContents` first and then reclaims the branch directory.
+
+Accordingly, a clone without `BranchContents` is unreachable physical garbage,
+while an absent `BranchContents` after delete means the logical delete succeeded
+even if directory cleanup returned an error.
+
+Lance maps slash-separated branch names into nested physical directories and will
+not reclaim an ancestor directory while a live descendant name exists. Live graph
+branch names are therefore path-prefix-disjoint: `review/2026` is valid, but it
+cannot coexist with a live `review` branch. This is checked before native create,
+and legacy overlapping names must be deleted leaf-first. Without this namespace
+invariant, `force_delete_branch` may return success while deliberately leaving an
+ancestor clone-only dataset in place.
+
 Their control protocol is:
 
 1. run and await the recovery barrier;
 2. quiesce enrolled streams as required by RFC-026;
 3. acquire any active global claim, such as RFC-025's retention claim, and then
    the graph/branch-control gate in §4.3 order;
-4. freshly revalidate source ref, target existence, and branch incarnation;
-5. perform one native Lance ref mutation, which is the visibility point;
-6. release the gate and reclaim orphaned per-table forks asynchronously.
+4. freshly capture source ref/version/incarnation and target absence (or the
+   delete target's exact `BranchIdentifier`);
+5. validate a create name and the path-prefix-disjoint namespace before Lance's
+   shallow-clone phase;
+6. execute the bounded native classifier below; and
+7. reclaim owned per-table forks best-effort while the complete control-gate set
+   remains held, then release the gates. A reclaim failure is logged for the
+   cleanup reconciler; this implementation does not schedule asynchronous reclaim.
+
+| Operation | Fresh physical state | Classifier action |
+|---|---|---|
+| create | no ref, no clone | idempotent force-reclaim (no-op), then create |
+| create | clone only | force-reclaim the unreachable clone, then create |
+| create | matching ref + openable clone observed after this invocation's ambiguous native result | complete; accept a lost acknowledgement |
+| create | mismatching/broken ref | conflict; never adopt or delete it |
+| delete | captured identifier still present | not deleted; return the native error |
+| delete | ref absent, directory remains | logically deleted; retry reclaim best-effort |
+| delete | ref and directory absent | complete |
+| delete | different identifier present | delete/recreate ABA; conflict, never delete it |
+
+Create retries the native call at most once after reclaiming an absent-ref tree.
+It never adopts a matching ref that was already present before the invocation;
+that remains ordinary `AlreadyExists` because there is no operation marker.
+Matching completion requires the expected parent branch and version plus a target
+identifier whose mapping is exactly the captured parent identifier followed by one
+new `(parent_version, uuid)` element; the target dataset must also open. Lance does
+not let the caller pre-mint that UUID, so the proof is intentionally scoped to the
+supported single-writer-process boundary.
+
+No separate graph-branch sidecar is written. Under the held target gate,
+path-prefix-disjoint namespace, and supported topology, absent `BranchContents`
+means there is no logical branch and any same-name tree is safe derived garbage;
+the next same-name create is the targeted, idempotent reconciler. A recovery
+sidecar would introduce a second authority and would incorrectly pull native
+controls into graph lineage. First-touch **data-table** forks are different: their
+mutation/load sidecar is already durable before branch creation. Full recovery
+force-reclaims an absent-ref target as either a no-op (crash-before-clone) or that
+intent's clone-only zombie before retiring the intent.
+
+One compatibility case deliberately defers that cleanup. A legacy graph may
+already contain path-prefix-overlapping live names. If an unresolved first-touch
+intent targets an ancestor table tree while a live path-child still exists, Full
+recovery leaves the sidecar durable instead of recursively deleting the child's
+storage. Read-write open may complete for leaf-first remediation only when the
+intent owns no physical table effect. If a multi-table attempt owns any effect
+while another untouched fork is blocked by the child, rollback is
+complete-or-error: open fails closed, the sidecar remains authoritative, and an
+existing handle or offline Lance-level branch tool must remove the descendant
+before the next Full recovery reclaims the untouched fork, compensates the owned
+effect, and retires the sidecar. This distinction prevents legacy writers outside
+the v3 barrier from preparing against an unresolved partial rollback.
 
 Delete has one recovery disposition that create does not: after the complete
 schema/target-branch/all-table gate set has waited out any live in-process owner,
@@ -515,13 +590,14 @@ create/merge may not adopt this exception.
 The native ref operation itself should enforce the freshly checked precondition or
 surface concurrent ref mutation as a conflict — but at the pinned Lance revision it
 does not: branch-ref creation is an existence check followed by an unconditional
-put, not a conditional primitive (the same fact for which RFC-025 §2.3 rejects a
-branch ref as a claim mechanism). Until Lance ships a conditional/CAS ref mutation,
-graph-branch create/delete therefore inherit the documented single-writer-process
-support boundary — the same disposition RFC-023 §10 applies to recovery ownership —
-and multi-process branch operations are not advertised. The upstream ask for a
-conditional ref primitive is filed alongside this RFC; a process-local branch gate
-remains a local optimization, not the missing cross-process guarantee.
+put, and delete is not compare-and-delete by `BranchIdentifier` (the same substrate
+gap for which RFC-025 §2.3 rejects a branch ref as a claim mechanism). Until Lance
+ships conditional/CAS ref mutation, graph-branch create/delete therefore inherit the
+documented single-writer-process support boundary — the same disposition RFC-023
+§10 applies to recovery ownership — and multi-process branch operations are not
+advertised. The upstream ask for a conditional ref primitive is filed alongside
+this RFC; a process-local branch gate remains a local optimization, not the missing
+cross-process guarantee.
 
 These operations do not emit a synthetic graph commit. If a future product contract
 requires a native ref mutation and manifest/audit rows to become atomic together, it
@@ -628,6 +704,16 @@ Implementation proceeds in this order:
    > its full exact-effect adapter remains future work. Schema apply,
    > optimize/index, and MemWAL fold remain on their writer-specific paths until
    > their adapter slices land.
+
+   > **Branch-control/cleanup slice (2026-07-11):** native graph-branch create
+   > and delete now use the §7 authority classifier, including pre-clone name
+   > validation, prefix-disjoint live names, bounded clone-only recovery,
+   > lost-acknowledgement classification, exact delete-incarnation fencing, and
+   > no synthetic graph lineage. First-touch Full recovery also reclaims an
+   > absent-ref clone-only table fork. Cleanup now protects every exact lazy
+   > branch pin, computes `keep` from Lance's actual version list, refuses
+   > uncovered main HEAD drift, and completes its live-root preflight before the
+   > first table GC.
 3. Convert mutation/load, branch merge, schema apply/migration, data-table optimize,
    and graph-visible index work one adapter at a time.
 4. Add static or runtime enumeration proving no graph-visible entry point bypasses the
@@ -661,6 +747,10 @@ writers.
 - An edge insert racing deletion of an endpoint must revalidate or conflict.
 - Cardinality probes of an untouched table participate in arbitration.
 - A target advance after merge classification forces complete reclassification.
+- A source branch advancing after capture does not silently substitute its new
+  head: the merge either uses the captured source commit or fails its pre-effect
+  source-incarnation/commit check. A latest-at-target-publish variant requires a
+  real source fence and is not inferred from the target `ReadSet`.
 - Run the same cells with separate `Omnigraph` handles sharing one root-scoped
   process-local gate manager, then with separate processes that do not share it.
 
@@ -685,6 +775,19 @@ writers.
   retryable physical contention.
 - MemWAL fold, when RFC-026 lands: merged-generation conflict and every fold crash
   boundary.
+- Native graph branch control: invalid name before clone; live path-prefix
+  collision before clone; clone-only create recovery on main and a named source;
+  pre-existing matching ref remains `AlreadyExists`; current-call lost create
+  acknowledgement is accepted only with exact parent/incarnation metadata and an
+  openable target; delete with absent ref plus remaining tree is success and
+  reclaims best-effort; same identifier preserves the native error; a recreated
+  identifier is a typed conflict and survives; neither direction advances a
+  manifest version or emits graph lineage.
+- First-touch recovery with legacy path overlap: a proven no-effect intent may
+  defer clone-only ancestor cleanup and return an open handle for leaf-first
+  remediation; a mixed multi-table intent with one owned effect and one blocked
+  untouched fork must fail read-write open, retain the sidecar without restoring
+  or publishing, and converge after offline Lance-level leaf cleanup.
 
 ### 11.5 Cost gates
 

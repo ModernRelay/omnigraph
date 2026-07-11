@@ -129,6 +129,19 @@ async fn branch_create_open_list_and_lazy_branching_work() {
     let mut main = init_and_load(&dir).await;
 
     main.branch_create("feature").await.unwrap();
+    // Reproduce Lance's phase-1-only crash state: keep the shallow-cloned
+    // `tree/feature` dataset but remove BranchContents, its sole logical
+    // authority. A same-name graph create must reclaim the zombie and retry,
+    // rather than surfacing DatasetAlreadyExists forever.
+    std::fs::remove_file(
+        dir.path()
+            .join("__manifest")
+            .join("_refs")
+            .join("branches")
+            .join("feature.json"),
+    )
+    .unwrap();
+    main.branch_create("feature").await.unwrap();
     assert_eq!(main.branch_list().await.unwrap(), vec!["main", "feature"]);
 
     let mut feature = Omnigraph::open(uri).await.unwrap();
@@ -1044,6 +1057,18 @@ async fn branch_created_from_non_main_inherits_branch_state() {
         .branch_create_from(ReadTarget::branch("feature"), "experiment")
         .await
         .unwrap();
+    std::fs::remove_file(
+        dir.path()
+            .join("__manifest")
+            .join("_refs")
+            .join("branches")
+            .join("experiment.json"),
+    )
+    .unwrap();
+    feature
+        .branch_create_from(ReadTarget::branch("feature"), "experiment")
+        .await
+        .expect("non-main create must also reclaim a clone-only target");
 
     assert_eq!(
         feature.branch_list().await.unwrap(),
@@ -1530,6 +1555,17 @@ async fn branch_api_rejects_reserved_main_and_same_source_target_merge() {
     let err = db.branch_delete("main").await.unwrap_err();
     assert!(err.to_string().contains("cannot delete branch 'main'"));
 
+    let err = db.branch_create("bad branch").await.unwrap_err();
+    assert!(err.to_string().contains("invalid") || err.to_string().contains("allowed"));
+    assert!(
+        !dir.path()
+            .join("__manifest")
+            .join("tree")
+            .join("bad branch")
+            .exists(),
+        "branch names must be validated before Lance's shallow-clone phase"
+    );
+
     let err = db.branch_merge("main", "main").await.unwrap_err();
     assert!(err.to_string().contains("distinct source and target"));
 
@@ -1572,6 +1608,91 @@ async fn branch_delete_removes_owned_table_branches_and_allows_recreate() {
     .unwrap();
 
     assert_eq!(count_rows_branch(&main, "feature", "node:Person").await, 5);
+}
+
+#[tokio::test]
+async fn branch_namespace_rejects_live_physical_path_prefix_collisions() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut db = init_and_load(&dir).await;
+
+    db.branch_create("feature").await.unwrap();
+    let err = db.branch_create("feature/child").await.unwrap_err();
+    assert!(
+        err.to_string().contains("physical Lance path")
+            && err.to_string().contains("ancestors or descendants"),
+        "prefix collision must be actionable; got: {err}"
+    );
+    assert!(
+        !dir.path()
+            .join("__manifest")
+            .join("tree")
+            .join("feature")
+            .join("child")
+            .exists(),
+        "prefix admission must reject before Lance creates the target clone"
+    );
+
+    db.branch_delete("feature").await.unwrap();
+    db.branch_create("feature/child").await.unwrap();
+    let err = db.branch_create("feature").await.unwrap_err();
+    assert!(
+        err.to_string().contains("physical Lance path")
+            && err.to_string().contains("feature/child"),
+        "ancestor creation must reject the inverse prefix collision; got: {err}"
+    );
+    assert!(
+        !lance::Dataset::open(&format!("{}/__manifest", dir.path().display()))
+            .await
+            .unwrap()
+            .list_branches()
+            .await
+            .unwrap()
+            .contains_key("feature"),
+        "inverse admission refusal must not create an ancestor ref"
+    );
+}
+
+#[tokio::test]
+async fn branch_delete_refuses_legacy_physical_path_children() {
+    let dir = tempfile::tempdir().unwrap();
+    let uri = dir.path().to_str().unwrap();
+    let mut db = init_and_load(&dir).await;
+    db.branch_create("feature/child").await.unwrap();
+
+    // Forge a graph written before the prefix-disjoint namespace invariant.
+    // Lance permits both refs but intentionally cannot reclaim the ancestor's
+    // dataset directory while the child path is live.
+    let mut manifest = lance::Dataset::open(&format!("{uri}/__manifest"))
+        .await
+        .unwrap();
+    let version = manifest.version().version;
+    manifest
+        .create_branch("feature", version, None)
+        .await
+        .unwrap();
+
+    let err = db.branch_delete("feature").await.unwrap_err();
+    assert!(
+        err.to_string().contains("feature/child")
+            && err.to_string().contains("delete the child branch first"),
+        "legacy prefix collisions must be deleted leaf-first; got: {err}"
+    );
+    assert!(
+        manifest
+            .list_branches()
+            .await
+            .unwrap()
+            .contains_key("feature"),
+        "refusal must not remove ancestor authority"
+    );
+
+    db.branch_delete("feature/child").await.unwrap();
+    db.branch_delete("feature").await.unwrap();
+    assert_eq!(
+        db.branch_list().await.unwrap(),
+        vec!["main"],
+        "legacy overlap must converge when deleted leaf-first"
+    );
 }
 
 #[tokio::test]

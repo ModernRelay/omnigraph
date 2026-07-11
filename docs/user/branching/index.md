@@ -6,12 +6,34 @@ Lance supports branching at the dataset level: a branch is a named lineage of ve
 
 ## L2 — Graph-level branches
 
-OmniGraph builds *graph branches* on top by branching every sub-table coherently:
+OmniGraph builds *graph branches* on top with one authoritative `__manifest`
+ref whose table entries form a coherent graph snapshot; data-table forks are
+created lazily on first write:
 
-- **Create** (`branch create` / `branch create --from <target>`) — the name `main` is disallowed; fails if the branch exists. Atomic: the new branch becomes visible all-or-nothing, so a name never half-exists.
+- **Create** (`branch create` / `branch create --from <target>`) — the name `main` is disallowed; fails if the branch exists. Logically atomic: the branch becomes visible only when its authoritative ref exists, so a name never half-exists in graph reads. If storage interruption leaves only Lance's unreachable shallow-clone directory, the next same-name create reclaims it and retries automatically.
 - **List** (`branch list`) — returns public branches, **filtering the internal** `__schema_apply_lock__` branch.
-- **Delete** (`branch delete`) — refuses if there are descendants on the branch, or if it is the current branch. Once deleted, the branch is gone from every snapshot. The owned per-table forks are reclaimed best-effort; if that reclaim hits a transient object-store error, the leftover storage is reclaimed later by the [`cleanup`](../operations/maintenance.md) command. One consequence: if a delete's reclaim fails, reusing that branch name before the next `cleanup` surfaces a clear error pointing at `cleanup`.
+- **Delete** (`branch delete`) — refuses if there are descendants on the branch, or if it is the current branch. Once its authoritative ref is removed, the branch is gone from every snapshot even if reclaiming a now-unreachable storage directory needs a later retry. Owned per-table forks are reclaimed best-effort; same-name create/first write safely reconciles relevant leftovers, and [`cleanup`](../operations/maintenance.md) remains the general backstop.
 - **Lazy forking**: a branch only forks a sub-table when that sub-table is first mutated on it. Pure-read branches share storage with their source. If two writers race to first-write the same branch, the loser gets a retryable "refresh and retry".
+- **Names are path-prefix-disjoint while live.** Slash-separated names are
+  supported (`review/2026-07`), but `review` and `review/2026-07` cannot both be
+  live because Lance stores them in overlapping physical directories. Choose
+  sibling names, or delete the existing ancestor/descendant first.
+
+Graph branch create/delete are coordinated across handles in one writer
+process. Until Lance exposes conditional native ref mutation, separate writer
+processes must not concurrently control branches on the same graph.
+
+For a legacy graph that already contains path-prefix-overlapping live names,
+recovery also preserves the leaf-first escape hatch. If read-write open finds an
+unresolved first-touch sidecar for an ancestor table fork while a live path-child
+remains, it never deletes the child's storage. When the interrupted write owns no
+table effect, it leaves the sidecar in place and completes the open so you can
+delete the descendant branch leaf-first. When the same sidecar owns a partial
+table effect, open fails closed because cleanup and rollback must finish together;
+remove the descendant through an already-open handle or an offline Lance-level
+branch tool, then reopen. The next read-write open reclaims the ancestor residue,
+rolls back the partial effect, and retires the sidecar. `omnigraph repair` is not
+that offline tool: it correctly refuses to run while a recovery sidecar is pending.
 
 ## L2 — Commit graph
 

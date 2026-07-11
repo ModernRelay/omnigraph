@@ -7,6 +7,7 @@
 // future Lance bumps stop needing this.
 #![recursion_limit = "256"]
 
+mod branch_control;
 pub mod changes;
 pub mod db;
 pub mod embedding;

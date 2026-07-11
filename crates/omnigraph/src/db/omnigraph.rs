@@ -1825,7 +1825,41 @@ impl Omnigraph {
         queue_keys
     }
 
+    fn ensure_branch_create_namespace_safe(target: &str, branches: &[String]) -> Result<()> {
+        if branches.iter().any(|candidate| candidate == target) {
+            return Err(OmniError::manifest_conflict(format!(
+                "branch '{}' already exists",
+                target
+            )));
+        }
+
+        let target_prefix = format!("{target}/");
+        if let Some(conflicting) = branches.iter().find(|candidate| {
+            candidate.as_str() != "main"
+                && (candidate.starts_with(&target_prefix)
+                    || target.starts_with(&format!("{candidate}/")))
+        }) {
+            return Err(OmniError::manifest_conflict(format!(
+                "cannot create branch '{target}' while live branch '{conflicting}' shares its \
+                 physical Lance path; live graph branch names may not be ancestors or descendants"
+            )));
+        }
+
+        Ok(())
+    }
+
     async fn ensure_branch_delete_safe(&self, branch: &str, branches: &[String]) -> Result<()> {
+        let path_prefix = format!("{branch}/");
+        if let Some(child) = branches
+            .iter()
+            .find(|candidate| candidate.starts_with(&path_prefix))
+        {
+            return Err(OmniError::manifest_conflict(format!(
+                "cannot delete branch '{branch}' while live branch '{child}' shares its physical \
+                 Lance path; delete the child branch first"
+            )));
+        }
+
         let descendants = self
             .coordinator
             .read()
@@ -1921,7 +1955,9 @@ impl Omnigraph {
             .map(|entry| (entry.table_key.clone(), entry.table_path.clone()))
             .collect::<Vec<_>>();
 
-        // Authority flip (+ best-effort commit-graph reclaim) — must succeed.
+        // Authority removal is the logical branch deletion. Lance tree cleanup
+        // follows that ref removal; the coordinator classifies an absent ref as
+        // success even if the physical cleanup acknowledgement failed.
         self.coordinator.write().await.branch_delete(branch).await?;
         // Best-effort per-table fork reclaim; cleanup reconciles any leftover.
         self.cleanup_deleted_branch_tables(branch, &owned_tables)
@@ -1998,20 +2034,8 @@ impl Omnigraph {
         self.refresh_coordinator_only().await?;
         self.ensure_schema_apply_not_locked("branch_create").await?;
         self.ensure_schema_state_valid().await?;
-        if self
-            .coordinator
-            .read()
-            .await
-            .all_branches()
-            .await?
-            .iter()
-            .any(|branch| branch == &target)
-        {
-            return Err(OmniError::manifest_conflict(format!(
-                "branch '{}' already exists",
-                target
-            )));
-        }
+        let branches = self.coordinator.read().await.all_branches().await?;
+        Self::ensure_branch_create_namespace_safe(&target, &branches)?;
         self.coordinator.write().await.branch_create(name).await
     }
 
@@ -2107,20 +2131,8 @@ impl Omnigraph {
         self.ensure_schema_apply_not_locked("branch_create_from")
             .await?;
         self.ensure_schema_state_valid().await?;
-        if self
-            .coordinator
-            .read()
-            .await
-            .all_branches()
-            .await?
-            .iter()
-            .any(|candidate| candidate == &target_branch)
-        {
-            return Err(OmniError::manifest_conflict(format!(
-                "branch '{}' already exists",
-                target_branch
-            )));
-        }
+        let branches = self.coordinator.read().await.all_branches().await?;
+        Self::ensure_branch_create_namespace_safe(&target_branch, &branches)?;
         // Operate on a freshly-opened source coordinator that's owned locally
         // — never touch `self.coordinator`. The pre-fix implementation used
         // `swap_coordinator_for_branch` + operate + `restore_coordinator` as

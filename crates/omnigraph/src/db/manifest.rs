@@ -634,10 +634,14 @@ impl ManifestCoordinator {
 
     pub async fn create_branch(&mut self, name: &str) -> Result<()> {
         let mut ds = self.dataset.clone();
-        ds.create_branch(name, self.version(), None)
-            .await
-            .map_err(|e| OmniError::Lance(e.to_string()))?;
-        Ok(())
+        match crate::branch_control::create_branch_recoverably(&mut ds, name, self.version())
+            .await?
+        {
+            crate::branch_control::BranchCreateOutcome::Created(_) => Ok(()),
+            crate::branch_control::BranchCreateOutcome::RefAlreadyExists => Err(
+                OmniError::manifest_conflict(format!("branch '{}' already exists", name)),
+            ),
+        }
     }
 
     pub async fn delete_branch(&mut self, name: &str) -> Result<()> {
@@ -649,9 +653,17 @@ impl ManifestCoordinator {
             crate::instrumentation::manifest_wrapper(),
         )
         .await?;
-        ds.delete_branch(name)
+        let branches = ds
+            .list_branches()
             .await
-            .map_err(|e| OmniError::Lance(e.to_string()))?;
+            .map_err(|error| OmniError::Lance(error.to_string()))?;
+        let expected_identifier = branches
+            .get(name)
+            .ok_or_else(|| OmniError::manifest_not_found(format!("branch '{}' not found", name)))?
+            .identifier
+            .clone();
+        crate::branch_control::delete_branch_recoverably(&mut ds, name, &expected_identifier)
+            .await?;
         self.dataset = open_manifest_dataset(&self.root_uri, self.active_branch.as_deref()).await?;
         self.known_state = read_manifest_state(&self.dataset).await?;
         Ok(())
