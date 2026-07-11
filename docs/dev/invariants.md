@@ -84,6 +84,11 @@ converge the physical state.
 
 5. **Recovery is part of the commit protocol.** Writers that can advance Lance
    HEAD before manifest publish must write `__recovery/{ulid}.json` sidecars.
+   Under their final schema → branch → table gates, they must first prove every
+   existing physical target still equals its manifest pin; a new sidecar must
+   never claim an older writer's effect or uncovered drift. First-touch refs use
+   sidecar-before-ref ordering. A non-noop SchemaApply writes a sidecar even
+   with zero table pins because schema-contract staging is durable state.
    `Omnigraph::open` in read-write mode runs the all-or-nothing sweep; the
    write entry points (`load_as`, `mutate_as`, `apply_schema_as`,
    `branch_merge_as`) and `refresh` run roll-forward-only recovery in-process,

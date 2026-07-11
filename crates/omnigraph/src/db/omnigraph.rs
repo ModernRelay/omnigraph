@@ -47,8 +47,7 @@ pub(crate) use table_ops::{DeferredTableFork, OpenedForMutation};
 
 use super::commit_graph::GraphCommit;
 use super::manifest::{
-    ManifestChange, Snapshot, SubTableEntry, TableRegistration, TableTombstone,
-    table_path_for_table_key,
+    ManifestChange, Snapshot, TableRegistration, TableTombstone, table_path_for_table_key,
 };
 use super::schema_state::{
     SCHEMA_SOURCE_FILENAME, load_or_bootstrap_schema_contract, load_validated_schema_contract,
@@ -514,9 +513,7 @@ impl Omnigraph {
             )
             .await?;
         }
-        crate::failpoints::maybe_fail(
-            crate::failpoints::names::OPEN_BEFORE_SCHEMA_CONTRACT_READ,
-        )?;
+        crate::failpoints::maybe_fail(crate::failpoints::names::OPEN_BEFORE_SCHEMA_CONTRACT_READ)?;
         // Read _schema.pg (post-recovery — may have just been renamed in).
         let schema_path = schema_source_uri(&root);
         let schema_source = storage.read_text(&schema_path).await?;
@@ -684,9 +681,7 @@ impl Omnigraph {
     /// for planning and conservative table-gate enumeration. The caller MUST
     /// already hold `schema_apply_serial_queue_key`; this helper does not acquire
     /// it because the gate is a non-reentrant mutex.
-    pub(crate) async fn load_accepted_catalog_with_schema_gate_held(
-        &self,
-    ) -> Result<Arc<Catalog>> {
+    pub(crate) async fn load_accepted_catalog_with_schema_gate_held(&self) -> Result<Arc<Catalog>> {
         let (schema_ir, _) =
             load_validated_schema_contract(self.uri(), Arc::clone(&self.storage)).await?;
         let mut catalog = build_catalog_from_ir(&schema_ir)?;
@@ -1346,10 +1341,7 @@ impl Omnigraph {
     /// schema -> target branch -> every accepted-catalog table gate before the
     /// ref mutation, which waits out any live in-process owner. SchemaApply
     /// remains graph-global and must still block deletion.
-    async fn heal_pending_recovery_sidecars_for_branch_delete(
-        &self,
-        branch: &str,
-    ) -> Result<()> {
+    async fn heal_pending_recovery_sidecars_for_branch_delete(&self, branch: &str) -> Result<()> {
         let outcome = self.heal_pending_recovery_sidecars_outcome().await?;
         if let Some(intent) = outcome
             .unresolved
@@ -1383,14 +1375,11 @@ impl Omnigraph {
         let sidecars =
             crate::db::manifest::list_sidecars(&self.root_uri, self.storage.as_ref()).await?;
         let blocking = sidecars.iter().find(|sidecar| {
-            let sidecar_branch = sidecar
-                .branch
-                .as_deref()
-                .filter(|branch| *branch != "main");
+            let sidecar_branch = sidecar.branch.as_deref().filter(|branch| *branch != "main");
             sidecar.writer_kind == crate::db::manifest::SidecarKind::SchemaApply
-                || relevant_branches.iter().any(|branch| {
-                    branch.filter(|name| *name != "main") == sidecar_branch
-                })
+                || relevant_branches
+                    .iter()
+                    .any(|branch| branch.filter(|name| *name != "main") == sidecar_branch)
         });
         if let Some(sidecar) = blocking {
             return Err(OmniError::recovery_required(
@@ -1405,20 +1394,90 @@ impl Omnigraph {
         Ok(())
     }
 
+    /// Final pre-arm ownership check for an existing physical table ref.
+    ///
+    /// Callers must already hold their complete schema -> branch -> table gate
+    /// envelope and must invoke this before writing their own recovery sidecar.
+    /// The manifest pin is the logical authority; a live Lance HEAD ahead of it
+    /// is either owned by an older recovery intent or is uncovered drift that
+    /// requires explicit operator repair. A new writer must never manufacture a
+    /// sidecar that retroactively claims that pre-existing physical effect.
+    ///
+    /// First-touch refs deliberately do not call this helper: their target ref
+    /// does not exist until after the writer's recovery intent is durable.
+    pub(crate) async fn ensure_existing_effect_baseline(
+        &self,
+        table_key: &str,
+        table_branch: Option<&str>,
+        expected_version: u64,
+        dataset: &SnapshotHandle,
+    ) -> Result<()> {
+        let head = dataset
+            .dataset()
+            .latest_version_id()
+            .await
+            .map_err(|error| OmniError::Lance(error.to_string()))?;
+        if head < expected_version {
+            return Err(OmniError::manifest_internal(format!(
+                "table '{}' Lance HEAD version {} is behind manifest version {}",
+                table_key, head, expected_version,
+            )));
+        }
+        if head == expected_version {
+            return Ok(());
+        }
+
+        let normalized_branch = table_branch.filter(|branch| *branch != "main");
+        let sidecars =
+            crate::db::manifest::list_sidecars(self.root_uri(), self.storage_adapter()).await;
+        match sidecars {
+            Ok(sidecars) => {
+                if let Some(owner) = sidecars.iter().find(|sidecar| {
+                    sidecar.tables.iter().any(|pin| {
+                        pin.table_key == table_key
+                            && pin
+                                .table_branch
+                                .as_deref()
+                                .filter(|branch| *branch != "main")
+                                == normalized_branch
+                    })
+                }) {
+                    return Err(OmniError::recovery_required(
+                        owner.operation_id.clone(),
+                        format!(
+                            "table '{}' has Lance HEAD version {} ahead of manifest version {}; \
+                             the pending recovery operation owns this drift",
+                            table_key, head, expected_version,
+                        ),
+                    ));
+                }
+                Err(OmniError::manifest_conflict(format!(
+                    "table '{}' has Lance HEAD version {} ahead of manifest version {}; \
+                     run `omnigraph repair` before writing",
+                    table_key, head, expected_version,
+                )))
+            }
+            Err(list_error) => Err(OmniError::manifest_conflict(format!(
+                "table '{}' has Lance HEAD version {} ahead of manifest version {}; could not \
+                 classify the drift (sidecar listing failed: {}); run `omnigraph repair`, or \
+                 reopen the graph read-write if repair reports a pending recovery sidecar",
+                table_key, head, expected_version, list_error,
+            ))),
+        }
+    }
+
     /// Final under-gate check for branch deletion. Target-branch sidecars are
     /// intentionally allowed: the held complete table envelope proves no live
     /// in-process owner can still be applying them, and deleting the branch
     /// makes their effects unreachable. Only graph-global schema recovery can
     /// still invalidate the operation.
-    async fn ensure_branch_delete_recovery_safe_under_gates(
-        &self,
-        branch: &str,
-    ) -> Result<()> {
+    async fn ensure_branch_delete_recovery_safe_under_gates(&self, branch: &str) -> Result<()> {
         let sidecars =
             crate::db::manifest::list_sidecars(&self.root_uri, self.storage.as_ref()).await?;
-        if let Some(sidecar) = sidecars.iter().find(|sidecar| {
-            sidecar.writer_kind == crate::db::manifest::SidecarKind::SchemaApply
-        }) {
+        if let Some(sidecar) = sidecars
+            .iter()
+            .find(|sidecar| sidecar.writer_kind == crate::db::manifest::SidecarKind::SchemaApply)
+        {
             return Err(OmniError::recovery_required(
                 sidecar.operation_id.clone(),
                 format!(
@@ -1693,15 +1752,18 @@ impl Omnigraph {
     /// Ensure BTree scalar indices exist on key columns.
     /// Idempotent — Lance skips if index already exists.
     ///
-    /// Opens sub-tables at their latest version (not snapshot-pinned) because
-    /// indices must be created on the current head. Any version drift from the
-    /// snapshot is expected and logged. The resulting versions are committed
-    /// back to the manifest.
+    /// Plans from one manifest/schema token, then revalidates under the final
+    /// schema → branch → table gates. Existing target refs must still have live
+    /// Lance HEAD equal to their manifest pin; uncovered drift is refused with
+    /// explicit `omnigraph repair` guidance instead of being silently folded.
+    /// The verified handle is reused for index effects and the resulting
+    /// versions are committed back to the manifest.
     ///
     /// On named branches, indexing preserves lazy branching:
     /// unbranched subtables keep inheriting `main`, while subtables inherited
-    /// from an ancestor branch are first forked into the active branch before
-    /// their index metadata is updated.
+    /// from an ancestor branch remain inherited when no index work is needed.
+    /// When real index work exists they are forked into the active branch only
+    /// after the recovery sidecar is durable.
     /// Returns the declared indexes that could not be materialized on this
     /// pass (today: vector columns with no trainable vectors yet). They are
     /// deferred, not errors; a later `ensure_indices`/`optimize` builds them
@@ -2025,9 +2087,7 @@ impl Omnigraph {
             .await;
         self.refresh_coordinator_only().await?;
         self.ensure_schema_apply_not_locked("branch_create").await?;
-        let control_catalog = self
-            .load_accepted_catalog_with_schema_gate_held()
-            .await?;
+        let control_catalog = self.load_accepted_catalog_with_schema_gate_held().await?;
         let table_queue_keys = self.table_queue_keys_for_branches(
             &[source.clone(), Some(target.clone())],
             &control_catalog,
@@ -2117,20 +2177,14 @@ impl Omnigraph {
         self.refresh_coordinator_only().await?;
         self.ensure_schema_apply_not_locked("branch_create_from")
             .await?;
-        let control_catalog = self
-            .load_accepted_catalog_with_schema_gate_held()
-            .await?;
-        let table_queue_keys = self
-            .table_queue_keys_for_branches(
-                &[branch.clone(), Some(target_branch.clone())],
-                &control_catalog,
-            );
+        let control_catalog = self.load_accepted_catalog_with_schema_gate_held().await?;
+        let table_queue_keys = self.table_queue_keys_for_branches(
+            &[branch.clone(), Some(target_branch.clone())],
+            &control_catalog,
+        );
         let _table_guards = self.write_queue().acquire_many(&table_queue_keys).await;
-        self.ensure_no_pending_recovery_sidecars_under_gates(
-            &relevant,
-            "branch_create_from",
-        )
-        .await?;
+        self.ensure_no_pending_recovery_sidecars_under_gates(&relevant, "branch_create_from")
+            .await?;
         self.refresh_coordinator_only().await?;
         self.ensure_schema_apply_not_locked("branch_create_from")
             .await?;
@@ -2195,17 +2249,13 @@ impl Omnigraph {
         let _branch_guard = self.write_queue().acquire_branch(Some(&branch)).await;
         self.refresh_coordinator_only().await?;
         self.ensure_schema_apply_not_locked("branch_delete").await?;
-        let control_catalog = self
-            .load_accepted_catalog_with_schema_gate_held()
-            .await?;
+        let control_catalog = self.load_accepted_catalog_with_schema_gate_held().await?;
         let table_queue_keys =
             self.table_queue_keys_for_branches(&[Some(branch.clone())], &control_catalog);
         let _table_guards = self.write_queue().acquire_many(&table_queue_keys).await;
         self.ensure_branch_delete_recovery_safe_under_gates(&branch)
             .await?;
-        crate::failpoints::maybe_fail(
-            crate::failpoints::names::BRANCH_DELETE_POST_TABLE_GATES,
-        )?;
+        crate::failpoints::maybe_fail(crate::failpoints::names::BRANCH_DELETE_POST_TABLE_GATES)?;
         self.refresh_coordinator_only().await?;
         self.ensure_schema_apply_not_locked("branch_delete").await?;
         self.ensure_schema_state_valid().await?;

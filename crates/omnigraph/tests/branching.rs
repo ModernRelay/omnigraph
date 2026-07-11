@@ -1100,7 +1100,7 @@ async fn branch_created_from_non_main_inherits_branch_state() {
 }
 
 #[tokio::test]
-async fn ensure_indices_on_child_branch_forks_inherited_table_ownership() {
+async fn ensure_indices_on_child_branch_keeps_inherited_table_when_no_work_is_needed() {
     let dir = tempfile::tempdir().unwrap();
     let uri = dir.path().to_str().unwrap();
     let mut main = init_and_load(&dir).await;
@@ -1141,7 +1141,8 @@ async fn ensure_indices_on_child_branch_forks_inherited_table_ownership() {
             .unwrap()
             .table_branch
             .as_deref(),
-        Some("experiment")
+        Some("feature"),
+        "index reconciliation must not manufacture a ref-only first-touch effect"
     );
     assert_eq!(
         experiment_snap
