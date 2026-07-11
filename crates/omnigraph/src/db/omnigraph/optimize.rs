@@ -21,8 +21,9 @@
 //!   retention. Destructive to version history — callers should gate this
 //!   behind an explicit confirm flag at the CLI layer.
 //!
-//! Both walk every node + edge table on the `main` branch. Run branches
-//! are ephemeral by design so we do not optimize them.
+//! Both orchestrate the graph's node + edge datasets from main authority;
+//! cleanup preserves Lance-referenced named-branch history according to its
+//! retention policy.
 
 use std::time::Duration;
 
@@ -113,10 +114,10 @@ pub struct TableOptimizeStats {
     /// `fragments_removed == 0`, `fragments_added == 0`, and `!committed`.
     pub skipped: Option<SkipReason>,
     /// Manifest table version observed by optimize for drift skips. `None` for
-    /// normal compaction/no-op/blob skips.
+    /// normal compaction/no-op outcomes.
     pub manifest_version: Option<u64>,
     /// Lance HEAD version observed by optimize for drift skips. `None` for
-    /// normal compaction/no-op/blob skips.
+    /// normal compaction/no-op outcomes.
     pub lance_head_version: Option<u64>,
     /// Declared `@index` columns on this table the reconciler could not build
     /// this run, each with the `reason` (today: a vector column with no
@@ -135,20 +136,6 @@ impl TableOptimizeStats {
             fragments_added: metrics.fragments_added,
             committed,
             skipped: None,
-            manifest_version: None,
-            lance_head_version: None,
-            pending_indexes: Vec::new(),
-        }
-    }
-
-    /// Stat for a table that was deliberately skipped (compaction not attempted).
-    fn skipped(table_key: String, reason: SkipReason) -> Self {
-        Self {
-            table_key,
-            fragments_removed: 0,
-            fragments_added: 0,
-            committed: false,
-            skipped: Some(reason),
             manifest_version: None,
             lance_head_version: None,
             pending_indexes: Vec::new(),
@@ -207,7 +194,6 @@ pub async fn optimize_all_tables(db: &Omnigraph) -> Result<Vec<TableOptimizeStat
              recovery sweep before optimizing",
         ));
     }
-
     let snapshot = db.fresh_snapshot_for_branch(None).await?;
 
     // Compute per-table paths up front, in a scope that drops the catalog
@@ -402,8 +388,7 @@ async fn optimize_one_table(
         // recovery and rolls back siblings).
         let needs_reindex = TableStore::has_unindexed_fragments(&ds).await?;
         let needs_index_create = if let Some(type_name) = table_key.strip_prefix("node:") {
-            super::table_ops::needs_index_work_node(db, type_name, &full_path, None)
-                .await?
+            super::table_ops::needs_index_work_node(db, type_name, &full_path, None).await?
         } else {
             super::table_ops::needs_index_work_edge(db, &full_path, None).await?
         };
@@ -450,7 +435,8 @@ async fn optimize_one_table(
                 }],
             );
             sidecar = Some(
-                crate::db::manifest::write_sidecar(db.root_uri(), db.storage_adapter(), &sc).await?,
+                crate::db::manifest::write_sidecar(db.root_uri(), db.storage_adapter(), &sc)
+                    .await?,
             );
         }
 
@@ -493,7 +479,8 @@ async fn optimize_one_table(
         // committed (so HEAD is already ahead of the manifest from our own work),
         // exercising the own-HEAD (not external) drift classification on the next
         // reopened attempt.
-        if crate::failpoints::maybe_fail(crate::failpoints::names::OPTIMIZE_INJECT_REINDEX_CONFLICT).is_err()
+        if crate::failpoints::maybe_fail(crate::failpoints::names::OPTIMIZE_INJECT_REINDEX_CONFLICT)
+            .is_err()
             && attempt < COMPACTION_RETRY_BUDGET
         {
             continue;
@@ -504,7 +491,10 @@ async fn optimize_one_table(
                 continue;
             }
             Err(e) => {
-                return Err(OmniError::Lance(format!("optimize_indices on {}: {}", table_key, e)));
+                return Err(OmniError::Lance(format!(
+                    "optimize_indices on {}: {}",
+                    table_key, e
+                )));
             }
         }
 
@@ -528,7 +518,9 @@ async fn optimize_one_table(
 
     // Pin the per-writer Phase B → Phase C residual: Lance HEAD has advanced but the
     // manifest publish below hasn't run.
-    crate::failpoints::maybe_fail(crate::failpoints::names::OPTIMIZE_POST_PHASE_B_PRE_MANIFEST_COMMIT)?;
+    crate::failpoints::maybe_fail(
+        crate::failpoints::names::OPTIMIZE_POST_PHASE_B_PRE_MANIFEST_COMMIT,
+    )?;
 
     // Phase C: monotonic fast-forward publish. The compaction is committed at Lance
     // HEAD `N`; publish a manifest pointer that includes it. If a concurrent writer
@@ -734,10 +726,7 @@ async fn compact_internal_table(
     // conflict we re-open at the new HEAD and rerun — the canonical Lance-consumer
     // pattern. Each attempt opens fresh because the conflict means the version moved.
     for attempt in 0..COMPACTION_RETRY_BUDGET {
-        let handle = db
-            .storage()
-            .open_dataset_head(&uri, None)
-            .await?;
+        let handle = db.storage().open_dataset_head(&uri, None).await?;
         let mut ds = handle.into_dataset();
 
         // Keep optimize non-destructive by construction (see clear_stale_auto_cleanup_config).
@@ -745,8 +734,7 @@ async fn compact_internal_table(
         let cleared_config = match clear_stale_auto_cleanup_config(&mut ds).await {
             Ok(cleared) => cleared,
             Err(e) => {
-                if attempt + 1 < COMPACTION_RETRY_BUDGET && is_retryable_lance_conflict(&e)
-                {
+                if attempt + 1 < COMPACTION_RETRY_BUDGET && is_retryable_lance_conflict(&e) {
                     continue;
                 }
                 return Err(OmniError::Lance(e.to_string()));
@@ -784,10 +772,7 @@ async fn compact_internal_table(
                     true,
                 ));
             }
-            Err(e)
-                if attempt + 1 < COMPACTION_RETRY_BUDGET
-                    && is_retryable_lance_conflict(&e) =>
-            {
+            Err(e) if attempt + 1 < COMPACTION_RETRY_BUDGET && is_retryable_lance_conflict(&e) => {
                 continue;
             }
             Err(e) => return Err(OmniError::Lance(e.to_string())),
@@ -815,11 +800,46 @@ pub async fn cleanup_all_tables(
     db.ensure_schema_state_valid().await?;
     db.ensure_schema_apply_idle("cleanup").await?;
 
+    // Version GC must never run while recovery still needs exact Lance
+    // transaction/version history to prove effect ownership or resume an
+    // interrupted compensation. Refuse before orphan reconciliation or any
+    // per-table cleanup so this operation is all-or-nothing with respect to the
+    // recovery-history floor. A read-write reopen resolves the sidecar first.
+    if !crate::db::manifest::list_sidecars(db.root_uri(), db.storage_adapter())
+        .await?
+        .is_empty()
+    {
+        return Err(OmniError::manifest_conflict(
+            "cleanup requires a clean recovery state; reopen the graph to run the \
+             recovery sweep before garbage-collecting versions",
+        ));
+    }
+    crate::failpoints::maybe_fail(
+        crate::failpoints::names::CLEANUP_POST_RECOVERY_CHECK_PRE_GATES,
+    )?;
+
+    // Close the empty-check -> GC race. Mutation/load take schema then branch
+    // then table gates; current legacy sidecar writers take at least their table
+    // gates. Cleanup takes the conservative superset and holds it through every
+    // `cleanup_old_versions` call, then performs the authoritative sidecar check
+    // under those gates. Without this envelope a writer can arm+commit+fail after
+    // the fast check and GC can delete the exact transaction/version history
+    // Full recovery needs to prove ownership or Restore.
+    let _cleanup_schema_guard = db
+        .write_queue()
+        .acquire(&crate::db::manifest::schema_apply_serial_queue_key())
+        .await;
+    db.refresh_coordinator_only().await?;
+    db.ensure_schema_apply_not_locked("cleanup").await?;
+    let cleanup_catalog = db
+        .load_accepted_catalog_with_schema_gate_held()
+        .await?;
+
     // Reclaim orphaned branch forks (from an incomplete prior `branch_delete`)
     // before version GC. Authority-derived and idempotent; the eager
     // best-effort reclaim in `branch_delete` covers the common case, this is
     // the guaranteed backstop. Logged for observability.
-    let reconciled = reconcile_orphaned_branches(db).await?;
+    let reconciled = reconcile_orphaned_branches_with_catalog(db, &cleanup_catalog).await?;
     if !reconciled.reclaimed.is_empty() {
         tracing::info!(
             count = reconciled.reclaimed.len(),
@@ -835,13 +855,10 @@ pub async fn cleanup_all_tables(
         );
     }
 
-    let before_timestamp = options.older_than.map(|d| Utc::now() - d);
-    let keep_versions = options.keep_versions;
-
     let resolved = db.resolved_branch_target(None).await?;
     let snapshot = resolved.snapshot;
 
-    let table_tasks: Vec<_> = all_table_keys(&db.catalog())
+    let table_tasks: Vec<_> = all_table_keys(&cleanup_catalog)
         .into_iter()
         .filter_map(|table_key| {
             let entry = snapshot.entry(&table_key)?;
@@ -849,6 +866,38 @@ pub async fn cleanup_all_tables(
             Some((table_key, full_path))
         })
         .collect();
+
+    // Schema gate stability means no native branch create/delete can change this
+    // set between enumeration and acquisition. Include main canonically as None;
+    // `all_branches` returns the user-facing "main" spelling.
+    let mut graph_branches = db
+        .coordinator
+        .read()
+        .await
+        .all_branches()
+        .await?
+        .into_iter()
+        .map(|branch| if branch == "main" { None } else { Some(branch) })
+        .collect::<Vec<_>>();
+    graph_branches.push(None);
+    graph_branches.sort();
+    graph_branches.dedup();
+    let _cleanup_branch_guards = db.write_queue().acquire_branches(&graph_branches).await;
+    let gc_queue_keys = db.table_queue_keys_for_branches(&graph_branches, &cleanup_catalog);
+    let _cleanup_table_guards = db.write_queue().acquire_many(&gc_queue_keys).await;
+
+    if !crate::db::manifest::list_sidecars(db.root_uri(), db.storage_adapter())
+        .await?
+        .is_empty()
+    {
+        return Err(OmniError::manifest_conflict(
+            "cleanup observed a recovery sidecar after acquiring its GC gates; reopen the graph \
+             read-write to recover before garbage-collecting versions",
+        ));
+    }
+
+    let before_timestamp = options.older_than.map(|d| Utc::now() - d);
+    let keep_versions = options.keep_versions;
 
     if table_tasks.is_empty() {
         return Ok(Vec::new());
@@ -868,9 +917,7 @@ pub async fn cleanup_all_tables(
                 // `cleanup_old_versions` is a Lance-only maintenance API not
                 // surfaced through `TableStorage` — see the optimize path
                 // above for the same rationale. Unwrap via `into_dataset()`.
-                let handle = storage
-                    .open_dataset_head(&full_path, None)
-                    .await?;
+                let handle = storage.open_dataset_head(&full_path, None).await?;
                 let ds = handle.into_dataset();
                 let before_version = keep_versions
                     .map(|n| ds.version().version.saturating_sub(n as u64))
@@ -928,8 +975,9 @@ pub struct BranchReconcileStats {
     pub failures: Vec<(String, String)>,
 }
 
-/// Drop every per-table and commit-graph Lance branch fork the manifest does
-/// not reference.
+/// Drop every per-table Lance branch fork the manifest does not reference.
+/// Graph lineage lives in `__manifest`; the retired standalone commit datasets
+/// have no branch-ref cleanup path here.
 ///
 /// Two origins produce a manifest-unreferenced fork:
 ///   1. A `branch_delete` flips the manifest authority (atomic) but a
@@ -953,7 +1001,16 @@ pub struct BranchReconcileStats {
 /// are dropped before parents (longest name first). Idempotent and authority-
 /// derived: no-ops once reconciled, and degrades to finding nothing if a future
 /// Lance atomic multi-dataset branch op prevents orphans from forming.
+#[cfg(all(test, feature = "failpoints"))]
 pub async fn reconcile_orphaned_branches(db: &Omnigraph) -> Result<BranchReconcileStats> {
+    let catalog = db.catalog();
+    reconcile_orphaned_branches_with_catalog(db, &catalog).await
+}
+
+async fn reconcile_orphaned_branches_with_catalog(
+    db: &Omnigraph,
+    catalog: &omnigraph_compiler::catalog::Catalog,
+) -> Result<BranchReconcileStats> {
     use std::collections::{HashMap, HashSet};
 
     // Live manifest branches: the set whose per-table placements are
@@ -969,7 +1026,7 @@ pub async fn reconcile_orphaned_branches(db: &Omnigraph) -> Result<BranchReconci
 
     let resolved = db.resolved_branch_target(None).await?;
     let snapshot = resolved.snapshot;
-    let table_targets: Vec<(String, String)> = all_table_keys(&db.catalog())
+    let table_targets: Vec<(String, String)> = all_table_keys(catalog)
         .into_iter()
         .filter_map(|table_key| {
             let entry = snapshot.entry(&table_key)?;
@@ -1021,11 +1078,12 @@ pub async fn reconcile_orphaned_branches(db: &Omnigraph) -> Result<BranchReconci
                     continue;
                 }
                 if !branch_snapshots.contains_key(&branch) {
-                    let branch_snapshot =
-                        match crate::failpoints::maybe_fail(crate::failpoints::names::CLEANUP_RESOLVE_BRANCH_SNAPSHOT) {
-                            Ok(()) => db.snapshot_for_branch(Some(&branch)).await,
-                            Err(injected) => Err(injected),
-                        };
+                    let branch_snapshot = match crate::failpoints::maybe_fail(
+                        crate::failpoints::names::CLEANUP_RESOLVE_BRANCH_SNAPSHOT,
+                    ) {
+                        Ok(()) => db.snapshot_for_branch(Some(&branch)).await,
+                        Err(injected) => Err(injected),
+                    };
                     match branch_snapshot {
                         Ok(snap) => {
                             branch_snapshots.insert(branch.clone(), snap);
@@ -1083,7 +1141,7 @@ pub async fn reconcile_orphaned_branches(db: &Omnigraph) -> Result<BranchReconci
             // skipped and recorded. (Cross-process writers remain the documented
             // one-winner-CAS gap.) One key held at a time → no lock-order
             // inversion vs multi-table `acquire_many` writers.
-            match super::table_ops::classify_fork_ref(db, &table_key, &branch).await {
+            match super::table_ops::classify_fork_ref(db, &table_key, &branch, None).await {
                 super::table_ops::ForkRefStatus::Orphan => {}
                 super::table_ops::ForkRefStatus::Legitimate => continue,
                 super::table_ops::ForkRefStatus::Indeterminate => {
@@ -1101,7 +1159,9 @@ pub async fn reconcile_orphaned_branches(db: &Omnigraph) -> Result<BranchReconci
                     continue;
                 }
             }
-            let outcome = match crate::failpoints::maybe_fail(crate::failpoints::names::CLEANUP_RECONCILE_FORK) {
+            let outcome = match crate::failpoints::maybe_fail(
+                crate::failpoints::names::CLEANUP_RECONCILE_FORK,
+            ) {
                 Ok(()) => storage.force_delete_branch(&full_path, &branch).await,
                 Err(injected) => Err(injected),
             };

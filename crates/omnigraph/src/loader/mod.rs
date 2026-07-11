@@ -187,17 +187,6 @@ impl Omnigraph {
             &omnigraph_policy::ResourceScope::Branch(branch.to_string()),
             actor_id,
         )?;
-        // Schema-contract validation is captured ONCE per write via the
-        // `WriteTxn` opened in `load_jsonl_reader` (after branch resolution).
-        // The redundant `ensure_schema_state_valid` that used to run here is
-        // subsumed by `open_write_txn`'s `resolved_branch_target` call.
-        // Converge any pending recovery sidecar (a previously failed
-        // writer's Phase B → Phase C residual) before staging anything:
-        // without this, sidecar-covered drift wedges every load on the
-        // commit-time drift guard until a process restart — `repair`
-        // refuses while a sidecar is pending. One `list_dir` when no
-        // sidecars exist (the steady state).
-        self.heal_pending_recovery_sidecars().await?;
         // Reject internal `__run__*` / system-prefixed branches at the
         // public write boundary. Direct-publish paths assert this
         // explicitly so a caller can't write to legacy or system
@@ -215,6 +204,23 @@ impl Omnigraph {
             }
             None => None,
         };
+        // Schema/catalog authority is captured once via the `WriteTxn` (plus its
+        // cheap trailing identity-marker fence); the only second full validation
+        // is the required pre-effect recheck under gates. Per-table resolution
+        // performs no additional contract reads.
+        //
+        // Stage A precedes both an implicit target-branch fork and data staging.
+        // The target branch and an explicit base are read/write authority for the
+        // operation, so an unresolved intent on either closes the barrier. The
+        // helper folds `Some("main")` to main's canonical `None` identity.
+        let mut recovery_branches = vec![requested.as_deref()];
+        if base.is_some() {
+            // `base_branch` retains `Some("main")` for the result DTO; the
+            // barrier helper canonicalizes it to main's `None` identity.
+            recovery_branches.push(base_branch.as_deref());
+        }
+        self.heal_pending_recovery_sidecars_for_write(&recovery_branches)
+            .await?;
         // Fork-if-missing only when a base branch was explicitly given.
         // `requested == None` is `main`, which always exists.
         let mut branch_created = false;
@@ -238,7 +244,7 @@ impl Omnigraph {
         }
         // Direct-to-target writes: no Run state machine, no `__run__` staging
         // branch. Cross-table OCC is enforced by the publisher's
-        // `expected_table_versions` CAS inside `load_jsonl_reader`.
+        // `expected_table_versions` CAS inside the load attempt.
         let mut result = self
             .load_direct_on_branch(requested.as_deref(), data, mode, actor_id)
             .await?;
@@ -274,8 +280,7 @@ impl Omnigraph {
         mode: LoadMode,
         actor_id: Option<&str>,
     ) -> Result<LoadResult> {
-        let reader = BufReader::new(Cursor::new(data.as_bytes()));
-        load_jsonl_reader(self, branch, reader, mode, actor_id).await
+        load_jsonl_data(self, branch, data, mode, actor_id).await
     }
 }
 
@@ -312,14 +317,55 @@ impl LoadResult {
     }
 }
 
-async fn load_jsonl_reader<R: BufRead>(
+async fn load_jsonl_data(
+    db: &Omnigraph,
+    branch: Option<&str>,
+    data: &str,
+    mode: LoadMode,
+    actor_id: Option<&str>,
+) -> Result<LoadResult> {
+    const MAX_PRE_EFFECT_REPREPARES: usize = 32;
+
+    // Every public load entry point already owns a stable `&str` payload
+    // (`load_file_as` reads its file once). Replay that slice directly on a
+    // pre-effect retry; copying it into a second raw byte buffer would double
+    // peak input memory before the parser's per-type materialization.
+    let retryable = matches!(mode, LoadMode::Append | LoadMode::Merge);
+    for attempt in 0..=MAX_PRE_EFFECT_REPREPARES {
+        let replay = BufReader::new(Cursor::new(data.as_bytes()));
+        match load_jsonl_reader_once(db, branch, replay, mode, actor_id).await {
+            Err(err)
+                if retryable
+                    && err.is_read_set_changed()
+                    && attempt < MAX_PRE_EFFECT_REPREPARES =>
+            {
+                tracing::debug!(
+                    attempt = attempt + 1,
+                    branch = branch.unwrap_or("main"),
+                    "prepared load authority changed before effects; repreparing"
+                );
+                db.refresh().await?;
+            }
+            result => return result,
+        }
+    }
+    unreachable!("bounded load retry loop always returns")
+}
+
+async fn load_jsonl_reader_once<R: BufRead>(
     db: &Omnigraph,
     branch: Option<&str>,
     reader: R,
     mode: LoadMode,
     actor_id: Option<&str>,
 ) -> Result<LoadResult> {
-    let catalog = db.catalog().clone();
+    // Capture the manifest/schema authority before interpreting any input. The
+    // catalog rides the WriteTxn and was built from the exact accepted IR named
+    // by its schema token; a long-lived handle's global catalog may legitimately
+    // lag a schema apply completed through another handle.
+    let txn = db.open_write_txn(branch).await?;
+    let catalog = Arc::clone(&txn.catalog);
+    let snapshot = txn.base.clone();
 
     // Phase 1: Parse all lines, spool into per-type collections
     let mut node_rows: HashMap<String, Vec<JsonValue>> = HashMap::new();
@@ -400,16 +446,10 @@ async fn load_jsonl_reader<R: BufRead>(
     // inline path.
 
     let mut result = LoadResult::default();
-    // Capture-once write transaction (RFC-013 step 3b). `open_write_txn`
-    // validates the schema contract ONCE and pins the base snapshot. Threaded
-    // as `Some(&txn)` through the per-table opens and the manifest publish so
-    // each resolve point reuses the pinned base instead of re-validating the
-    // contract. The branch already exists here (fork-if-missing ran in
-    // `load_as` before this), so this captures the post-fork snapshot. The
-    // load's own base read (`db.snapshot_for_branch` previously) is the same
-    // per-branch snapshot, so reuse `txn.base` for it — dropping a validation.
-    let txn = db.open_write_txn(branch).await?;
-    let snapshot = txn.base.clone();
+    // The branch-wide WriteTxn captured above is threaded through every table
+    // open and the manifest publish, so the parsed batches, validation catalog,
+    // base snapshot, native branch identity, exact graph head, and schema
+    // identity form one immutable authority unit.
     let mut staging = MutationStaging::default();
     let pending_mode = match mode {
         LoadMode::Merge => PendingMode::Merge,
@@ -419,54 +459,15 @@ async fn load_jsonl_reader<R: BufRead>(
         LoadMode::Append => PendingMode::Append,
         LoadMode::Overwrite => PendingMode::Overwrite,
     };
-    // Map LoadMode to MutationOpKind for the version-check policy.
-    // Append/Merge skip the strict pre-stage check (concurrency-safe
-    // under the per-(table, branch) queue + publisher CAS); Overwrite
-    // uses the strict check because it truncates and replaces the
-    // dataset — concurrent advances change what "replace" means.
+    // Map LoadMode to the early table-version policy. Append/Merge may stage
+    // reclaimable files before the effect gates, then revalidate the complete
+    // branch token and fully reprepare on a bounded pre-effect conflict.
+    // Overwrite keeps the strict early check because it replaces the image; its
+    // later branch-wide mismatch surfaces `ReadSetChanged` without replay.
     let load_op_kind = match mode {
         LoadMode::Append => crate::db::MutationOpKind::Insert,
         LoadMode::Merge => crate::db::MutationOpKind::Merge,
         LoadMode::Overwrite => crate::db::MutationOpKind::SchemaRewrite,
-    };
-
-    // Up-front fork-queue acquisition. The first write to a table on a
-    // non-main branch forks it (create_branch), which advances Lance state
-    // before the manifest publish; the reclaim of any manifest-unreferenced
-    // leftover (`reclaim_orphaned_fork_and_refork`) must not race a concurrent
-    // in-process fork. So when this load will fork at least one touched table,
-    // acquire the per-(table, branch) write queues for ALL touched tables up
-    // front (one sorted `acquire_many`, keyed uniformly by the target branch
-    // so it covers what `commit_all` recomputes) and hold them through the
-    // publish. Main-branch loads never fork; branch loads where every touched
-    // table is already forked skip this and let `commit_all` acquire at commit.
-    let fork_queue_guards: Option<(
-        Vec<(String, Option<String>)>,
-        Vec<tokio::sync::OwnedMutexGuard<()>>,
-    )> = if let Some(active) = branch {
-        let touched: Vec<(String, Option<String>)> = node_rows
-            .keys()
-            .map(|t| (format!("node:{t}"), Some(active.to_string())))
-            .chain(
-                edge_rows
-                    .keys()
-                    .map(|e| (format!("edge:{e}"), Some(active.to_string()))),
-            )
-            .collect();
-        let needs_fork = touched.iter().any(|(table_key, _)| {
-            snapshot
-                .entry(table_key)
-                .map(|e| e.table_branch.as_deref() != Some(active))
-                .unwrap_or(false)
-        });
-        if needs_fork {
-            let guards = db.write_queue().acquire_many(&touched).await;
-            Some((touched, guards))
-        } else {
-            None
-        }
-    } else {
-        None
     };
 
     // Phase 2a: build and validate every node batch up front. Cheap and
@@ -499,6 +500,7 @@ async fn load_jsonl_reader<R: BufRead>(
             &table_key,
             opened.full_path,
             opened.table_branch,
+            opened.deferred_fork,
             opened.expected_version,
             load_op_kind,
         );
@@ -534,6 +536,7 @@ async fn load_jsonl_reader<R: BufRead>(
             &table_key,
             opened.full_path,
             opened.table_branch,
+            opened.deferred_fork,
             opened.expected_version,
             load_op_kind,
         );
@@ -581,43 +584,60 @@ async fn load_jsonl_reader<R: BufRead>(
     let staged = staging
         .stage_all_with_concurrency(db, branch, load_write_concurrency())
         .await?;
-    // `_queue_guards` holds per-(table_key, branch) write queues
-    // across the manifest publish below — see exec/mutation.rs for
-    // the rationale (interleaving prevention).
+    crate::failpoints::maybe_fail(crate::failpoints::names::MUTATION_POST_STAGE_PRE_EFFECT_GATE)?;
+    let lineage_intent = db.new_lineage_intent_for_branch(branch, actor_id).await?;
+    // `_queue_guards` holds the root-shared schema → branch → sorted-table
+    // gates across manifest publication. This closes same-process
+    // interleaving across the v3 sidecar/effect lifetime. The exact publisher
+    // token and durable sidecar remain persistent correctness authorities, but
+    // these local gates do not expand the documented single-writer-process
+    // recovery boundary.
     let crate::exec::staging::CommittedMutation {
         updates,
         expected_versions,
         sidecar_handle,
         guards: _queue_guards,
-        committed_handles,
     } = staged
         .commit_all(
             db,
             branch,
             crate::db::manifest::SidecarKind::Load,
             actor_id,
-            fork_queue_guards,
-            Some(&txn),
+            &txn,
+            &lineage_intent,
         )
         .await?;
-    // Same finalize → publisher residual as mutations: per-table
-    // staged commits have advanced Lance HEAD, but the manifest
-    // publish has not run yet. Reuse the mutation failpoint name so
-    // one failpoint pins the shared `MutationStaging` boundary.
+    // Same confirmed-effects → publisher boundary as mutations: table HEADs
+    // have advanced and the v3 sidecar contains their exact transaction
+    // identities, but the graph manifest has not published the result. Reuse
+    // the mutation failpoint name so one failpoint pins the shared boundary.
     crate::failpoints::maybe_fail(crate::failpoints::names::MUTATION_POST_FINALIZE_PRE_PUBLISHER)?;
-    db.commit_updates_on_branch_with_expected(
-        branch,
-        &updates,
-        &expected_versions,
-        actor_id,
-        Some(&txn),
-        committed_handles,
-    )
-    .await?;
-    // The recovery sidecar protects the per-table commit_staged →
-    // manifest publish window. Phase C succeeded — clean up
-    // best-effort: failing the user here would error out a write
-    // that already landed durably.
+    let publish_result = db
+        .commit_updates_on_branch_with_expected(
+            branch,
+            &updates,
+            &expected_versions,
+            actor_id,
+            &txn,
+            lineage_intent,
+        )
+        .await;
+    if let Err(err) = publish_result {
+        // Empty loads can still publish lineage but have no table effect and
+        // therefore no recovery sidecar. Preserve that publish error instead
+        // of manufacturing an "unknown" recovery operation.
+        return match sidecar_handle.as_ref() {
+            Some(handle) => Err(OmniError::recovery_required(
+                handle.operation_id.clone(),
+                err.to_string(),
+            )),
+            None => Err(err),
+        };
+    }
+    // The v3 recovery sidecar protects every independently durable table effect
+    // through the one manifest visibility point. Phase C succeeded — clean up
+    // best-effort: failing the user here would error out a write that already
+    // landed durably; a leftover fixed outcome is idempotently finalized later.
     if let Some(handle) = sidecar_handle {
         if let Err(err) = crate::db::manifest::delete_sidecar(&handle, db.storage_adapter()).await {
             tracing::warn!(
@@ -1843,7 +1863,10 @@ edge WorksAt: Person -> Company
         let result = db
             .load_as("nonexistent", None, TEST_DATA, LoadMode::Merge, None)
             .await;
-        assert!(result.is_err(), "load without base must not create branches");
+        assert!(
+            result.is_err(),
+            "load without base must not create branches"
+        );
         assert!(
             !db.branch_list()
                 .await
@@ -1853,7 +1876,10 @@ edge WorksAt: Person -> Company
         );
 
         // Loads to main carry the default branch metadata.
-        let main_load = db.load("main", TEST_DATA, LoadMode::Overwrite).await.unwrap();
+        let main_load = db
+            .load("main", TEST_DATA, LoadMode::Overwrite)
+            .await
+            .unwrap();
         assert_eq!(main_load.branch, "main");
         assert_eq!(main_load.base_branch, None);
         assert!(!main_load.branch_created);

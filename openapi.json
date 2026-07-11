@@ -212,6 +212,16 @@
                 }
               }
             }
+          },
+          "503": {
+            "description": "An overlapping durable recovery intent must be resolved before retry",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorOutput"
+                }
+              }
+            }
           }
         },
         "security": [
@@ -310,6 +320,16 @@
                 }
               }
             }
+          },
+          "503": {
+            "description": "An overlapping durable recovery intent must be resolved before retry",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorOutput"
+                }
+              }
+            }
           }
         },
         "security": [
@@ -397,6 +417,16 @@
                 }
               }
             }
+          },
+          "503": {
+            "description": "An overlapping durable recovery intent must be resolved before retry",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorOutput"
+                }
+              }
+            }
           }
         },
         "security": [
@@ -477,7 +507,7 @@
             }
           },
           "409": {
-            "description": "Merge conflict",
+            "description": "Write-authority conflict",
             "content": {
               "application/json": {
                 "schema": {
@@ -488,6 +518,16 @@
           },
           "429": {
             "description": "Per-actor admission cap exceeded; honor `Retry-After` header",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorOutput"
+                }
+              }
+            }
+          },
+          "503": {
+            "description": "An overlapping durable recovery intent must be resolved before retry",
             "content": {
               "application/json": {
                 "schema": {
@@ -795,8 +835,28 @@
               }
             }
           },
+          "409": {
+            "description": "Prepared load authority changed before effects",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorOutput"
+                }
+              }
+            }
+          },
           "429": {
             "description": "Per-actor admission cap exceeded; honor `Retry-After` header",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorOutput"
+                }
+              }
+            }
+          },
+          "503": {
+            "description": "An overlapping durable recovery intent must be resolved before retry",
             "content": {
               "application/json": {
                 "schema": {
@@ -884,8 +944,28 @@
               }
             }
           },
+          "409": {
+            "description": "Prepared load authority changed before effects",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorOutput"
+                }
+              }
+            }
+          },
           "429": {
             "description": "Per-actor admission cap exceeded; honor `Retry-After` header",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorOutput"
+                }
+              }
+            }
+          },
+          "503": {
+            "description": "An overlapping durable recovery intent must be resolved before retry",
             "content": {
               "application/json": {
                 "schema": {
@@ -908,7 +988,7 @@
           "mutations"
         ],
         "summary": "Apply a GQ mutation to a branch (canonical mutation endpoint).",
-        "description": "Writes to the named `branch` (defaults to `main`). Mutations are atomic\nper call and produce a new commit. Returns counts of nodes and edges\naffected. **Destructive**: on success the branch is updated; rejected\nmutations may still acquire locks briefly. Returns 409 on merge conflict.\n\nPairs with `POST /query` (read-only). The legacy `POST /change` route\nhas identical semantics and is kept as a deprecated alias.",
+        "description": "Writes to the named `branch` (defaults to `main`). Mutations are atomic\nper call and produce a new commit. Returns counts of nodes and edges\naffected. **Destructive**: on success the branch is updated; rejected\nmutations may still acquire locks briefly. Returns 409 when the prepared\nwrite authority changes before effects.\n\nPairs with `POST /query` (read-only). The legacy `POST /change` route\nhas identical semantics and is kept as a deprecated alias.",
         "operationId": "cluster_mutate",
         "parameters": [
           {
@@ -973,7 +1053,7 @@
             }
           },
           "409": {
-            "description": "Merge conflict",
+            "description": "Write-authority conflict",
             "content": {
               "application/json": {
                 "schema": {
@@ -984,6 +1064,16 @@
           },
           "429": {
             "description": "Per-actor admission cap exceeded; honor `Retry-After` header",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorOutput"
+                }
+              }
+            }
+          },
+          "503": {
+            "description": "An overlapping durable recovery intent must be resolved before retry",
             "content": {
               "application/json": {
                 "schema": {
@@ -1154,7 +1244,7 @@
             }
           },
           "409": {
-            "description": "Merge conflict",
+            "description": "Stored mutation write-authority conflict",
             "content": {
               "application/json": {
                 "schema": {
@@ -1175,6 +1265,16 @@
           },
           "500": {
             "description": "Policy evaluation error (a denial is reported as 404, not 500)",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorOutput"
+                }
+              }
+            }
+          },
+          "503": {
+            "description": "A stored mutation is blocked by a durable recovery intent",
             "content": {
               "application/json": {
                 "schema": {
@@ -1862,6 +1962,7 @@
           "method_not_allowed",
           "conflict",
           "too_many_requests",
+          "service_unavailable",
           "internal"
         ]
       },
@@ -1900,6 +2001,28 @@
             "items": {
               "$ref": "#/components/schemas/MergeConflictOutput"
             }
+          },
+          "read_set_conflict": {
+            "oneOf": [
+              {
+                "type": "null"
+              },
+              {
+                "$ref": "#/components/schemas/ReadSetConflictOutput",
+                "description": "Set when a prepared write's logical authority changed before effects."
+              }
+            ]
+          },
+          "recovery_required": {
+            "oneOf": [
+              {
+                "type": "null"
+              },
+              {
+                "$ref": "#/components/schemas/RecoveryRequiredOutput",
+                "description": "Set when an overlapping durable recovery intent must be resolved before\nretry. Its table effects may or may not have started."
+              }
+            ]
           }
         }
       },
@@ -2413,6 +2536,30 @@
           }
         }
       },
+      "ReadSetConflictOutput": {
+        "type": "object",
+        "description": "Structured authority mismatch for an RFC-022 prepared write. Values are\nstrings because members include optional graph commit ids and future\nauthority tokens, not only numeric table versions.",
+        "required": [
+          "member"
+        ],
+        "properties": {
+          "actual": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "expected": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "member": {
+            "type": "string"
+          }
+        }
+      },
       "ReadTargetOutput": {
         "type": "object",
         "properties": {
@@ -2427,6 +2574,17 @@
               "string",
               "null"
             ]
+          }
+        }
+      },
+      "RecoveryRequiredOutput": {
+        "type": "object",
+        "required": [
+          "operation_id"
+        ],
+        "properties": {
+          "operation_id": {
+            "type": "string"
           }
         }
       },

@@ -1099,18 +1099,15 @@ query vector_search_string($q: String) {
 }
 
 #[tokio::test(flavor = "multi_thread")]
-async fn change_conflict_returns_manifest_conflict_409() {
-    // A write that races with another writer surfaces as HTTP 409 with
-    // a structured `manifest_conflict` body — `table_key`, `expected`,
-    // and `actual` — so clients can detect-and-retry without parsing
-    // the message.
+async fn change_long_lived_handle_refreshes_before_preparing_write() {
+    // A handle that merely predates another committed write is not stale
+    // authority: open_write_txn probes the manifest incarnation and prepares
+    // from the fresh head. ReadSetChanged is reserved for movement *during* an
+    // already-prepared attempt (covered by the concurrent test below).
     let temp = init_loaded_graph().await;
     let graph = graph_path(temp.path());
 
-    // Build the server first so its handle pins the pre-mutation manifest
-    // version. Then advance the manifest from outside the server. The
-    // server's next /change call will capture stale `expected_versions`
-    // (from its still-pinned snapshot) and the publisher's CAS rejects.
+    // Build the server first, then advance the graph through another handle.
     let state = AppState::open(graph.to_string_lossy().to_string())
         .await
         .unwrap();
@@ -1154,34 +1151,17 @@ async fn change_conflict_returns_manifest_conflict_409() {
     )
     .await;
 
-    assert_eq!(status, StatusCode::CONFLICT);
-    let error: ErrorOutput = serde_json::from_value(body).unwrap();
-    assert_eq!(error.code, Some(omnigraph_server::api::ErrorCode::Conflict));
-    let conflict = error
-        .manifest_conflict
-        .expect("publisher CAS rejection must populate manifest_conflict body");
-    assert_eq!(conflict.table_key, "node:Person");
-    assert!(
-        conflict.actual > conflict.expected,
-        "actual ({}) should be ahead of expected ({})",
-        conflict.actual,
-        conflict.expected,
-    );
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body["affected_nodes"], 1);
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn change_concurrent_inserts_same_key_serialize_without_409() {
-    // PR 2 Phase 2 (MR-686): pin the design fix for the same-key
-    // concurrency hazard. Pre-fix, in-process concurrent inserts on
-    // the same `(table, branch)` rejected with 409 manifest_conflict
-    // because `ensure_expected_version` fired before the per-table
-    // queue was acquired and saw Lance HEAD already advanced by a
-    // peer writer. Post-fix, Insert/Merge skip the strict pre-stage
-    // check (see `MutationOpKind::strict_pre_stage_version_check`);
-    // the queue serializes commit_staged; Lance's natural rebase
-    // handles the in-flight stage; the publisher's CAS on a fresh
-    // per-branch snapshot under the queue catches genuine cross-
-    // process drift.
+    // RFC-022 preservation guard: concurrent retryable inserts still all
+    // succeed, but not by rebasing an already-validated Lance transaction.
+    // The coarse branch gate serializes effects; a waiter whose authority
+    // token changed discards its complete attempt and reprepares from the
+    // winner's committed branch state.
     //
     // This test spawns N concurrent /change inserts on a single
     // node type and asserts: every request returns 200 (no 409),
@@ -1270,36 +1250,10 @@ async fn change_concurrent_inserts_same_key_serialize_without_409() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn change_concurrent_updates_same_key_serialize_via_publisher_cas() {
-    // Pin Update RYW semantics under in-process concurrency on the same
-    // `(table, branch)`. With per-table queue serialization and op-kind-aware
-    // drift detection at commit time, exactly one of N concurrent UPDATEs
-    // on the same row commits; the rest are rejected as 409 manifest_conflict.
-    //
-    // Pre-fix bug class: in `MutationStaging::commit_all`, after queue
-    // acquisition, the staged Lance transaction is handed straight to
-    // `commit_staged`. For a writer whose staged dataset is at V0 but
-    // Lance HEAD has advanced to V1 (because the queue's prior winner
-    // already published), Lance's transaction conflict resolver fires
-    // `RetryableCommitConflict` on Update vs Update on the same row.
-    // That error gets wrapped as `OmniError::Lance(<string>)` and the
-    // API surfaces it as **500 internal**, not 409. Users see "internal
-    // server error" instead of a retryable conflict, breaking the
-    // documented 409 contract for in-process drift.
-    //
-    // Post-fix invariant: `commit_all` does an op-kind-aware drift check
-    // before each `commit_staged`. For tables whose tracked op_kind has
-    // `strict_pre_stage_version_check() == true` (Update / Delete /
-    // SchemaRewrite), if the staged dataset's version doesn't match the
-    // fresh manifest pin, return `OmniError::manifest_expected_version_mismatch`
-    // → 409 ExpectedVersionMismatch. The N-1 losers see a clean 409
-    // before Lance's commit_staged ever runs.
-    //
-    // Why correct-by-design: closing the class "Lance internal conflict
-    // surfaces as 500 instead of 409" rather than mapping the specific
-    // Lance error variant. The drift check fires at the right architectural
-    // layer (engine boundary, under the queue) and respects the existing
-    // `MutationOpKind` policy.
+async fn change_concurrent_updates_same_key_return_typed_pre_effect_conflicts() {
+    // Strict read-modify-write attempts are never automatically reprepared.
+    // Exactly one concurrent UPDATE commits; once it changes branch authority,
+    // every waiter reports a typed 409 before any of its Lance effects begin.
     let temp = init_loaded_graph().await;
     let graph = graph_path(temp.path());
     let state = AppState::open(graph.to_string_lossy().to_string())
@@ -1373,27 +1327,37 @@ async fn change_concurrent_updates_same_key_serialize_via_publisher_cas() {
     assert_eq!(
         ok_count,
         1,
-        "expected exactly one update to commit and N-1 to receive 409 manifest_conflict \
-         (op-kind-aware drift check rejects stale-V0 staged datasets at commit_all entry). \
-         Got {} OK + {} 409 + {} other. \
-         Pre-fix symptom: 1 OK + (N-1) x 500 because Lance's RetryableCommitConflict for \
-         Update vs Update on the same row bubbles up as `OmniError::Lance(<string>)` and \
-         the API maps it to 500 internal, not 409. Statuses: {:?}",
+        "expected exactly one update to commit and N-1 to receive typed 409 conflicts \
+         before effects. Got {} OK + {} 409 + {} other. Statuses: {:?}",
         ok_count,
         conflict_count,
         statuses.len() - ok_count - conflict_count,
         statuses,
     );
+
+    for (status, bytes) in &results {
+        if *status != StatusCode::CONFLICT {
+            continue;
+        }
+        let error: ErrorOutput = serde_json::from_slice(bytes).unwrap();
+        assert_eq!(error.code, Some(omnigraph_server::api::ErrorCode::Conflict));
+        let conflict = error
+            .read_set_conflict
+            .expect("strict OCC loser must include structured read-set authority");
+        assert_eq!(conflict.member, "graph_head:main");
+        assert_ne!(conflict.actual, conflict.expected);
+        assert!(error.manifest_conflict.is_none());
+        assert!(error.recovery_required.is_none());
+    }
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn change_disjoint_table_concurrency_succeeds_at_http_level() {
-    // HTTP-level pin for MR-686's disjoint-table promise: concurrent /change
-    // requests touching different node types must coexist without admission
-    // rejection or publisher-CAS conflict. The bench harness measures
-    // throughput; this test is the regression sentinel that catches a
-    // future change which accidentally re-introduces graph-wide
-    // serialization on the disjoint path.
+async fn change_disjoint_table_concurrency_succeeds_under_branch_occ_gate() {
+    // RFC-022 intentionally serializes effect publication per branch because
+    // graph-head authority protects validation dependencies across tables.
+    // Disjoint retryable inserts must nevertheless all succeed through bounded
+    // full-attempt repreparation, without admission rejection or a user-visible
+    // publisher conflict.
     //
     // Setup: test.jsonl seeds 4 Persons + 2 Companies. Spawn N=4 concurrent
     // /change inserts on `node:Person` and N=4 concurrent inserts on

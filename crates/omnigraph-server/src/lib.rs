@@ -290,6 +290,8 @@ pub struct ApiError {
     message: String,
     merge_conflicts: Vec<api::MergeConflictOutput>,
     manifest_conflict: Option<api::ManifestConflictOutput>,
+    read_set_conflict: Option<api::ReadSetConflictOutput>,
+    recovery_required: Option<api::RecoveryRequiredOutput>,
 }
 
 impl AppState {
@@ -620,6 +622,8 @@ impl ApiError {
             message: message.into(),
             merge_conflicts: Vec::new(),
             manifest_conflict: None,
+            read_set_conflict: None,
+            recovery_required: None,
         }
     }
 
@@ -630,6 +634,8 @@ impl ApiError {
             message: message.into(),
             merge_conflicts: Vec::new(),
             manifest_conflict: None,
+            read_set_conflict: None,
+            recovery_required: None,
         }
     }
 
@@ -640,6 +646,8 @@ impl ApiError {
             message: message.into(),
             merge_conflicts: Vec::new(),
             manifest_conflict: None,
+            read_set_conflict: None,
+            recovery_required: None,
         }
     }
 
@@ -650,6 +658,8 @@ impl ApiError {
             message: message.into(),
             merge_conflicts: Vec::new(),
             manifest_conflict: None,
+            read_set_conflict: None,
+            recovery_required: None,
         }
     }
 
@@ -664,6 +674,8 @@ impl ApiError {
             message: message.into(),
             merge_conflicts: Vec::new(),
             manifest_conflict: None,
+            read_set_conflict: None,
+            recovery_required: None,
         }
     }
 
@@ -674,6 +686,8 @@ impl ApiError {
             message: message.into(),
             merge_conflicts: Vec::new(),
             manifest_conflict: None,
+            read_set_conflict: None,
+            recovery_required: None,
         }
     }
 
@@ -684,6 +698,8 @@ impl ApiError {
             message: message.into(),
             merge_conflicts: Vec::new(),
             manifest_conflict: None,
+            read_set_conflict: None,
+            recovery_required: None,
         }
     }
 
@@ -698,6 +714,8 @@ impl ApiError {
             message: message.into(),
             merge_conflicts: Vec::new(),
             manifest_conflict: None,
+            read_set_conflict: None,
+            recovery_required: None,
         }
     }
 
@@ -719,6 +737,8 @@ impl ApiError {
             message: summarize_merge_conflicts(&conflicts),
             merge_conflicts: conflicts,
             manifest_conflict: None,
+            read_set_conflict: None,
+            recovery_required: None,
         }
     }
 
@@ -729,6 +749,32 @@ impl ApiError {
             message,
             merge_conflicts: Vec::new(),
             manifest_conflict: Some(details),
+            read_set_conflict: None,
+            recovery_required: None,
+        }
+    }
+
+    fn read_set_conflict(message: String, details: api::ReadSetConflictOutput) -> Self {
+        Self {
+            status: StatusCode::CONFLICT,
+            code: ErrorCode::Conflict,
+            message,
+            merge_conflicts: Vec::new(),
+            manifest_conflict: None,
+            read_set_conflict: Some(details),
+            recovery_required: None,
+        }
+    }
+
+    fn recovery_required(message: String, operation_id: String) -> Self {
+        Self {
+            status: StatusCode::SERVICE_UNAVAILABLE,
+            code: ErrorCode::ServiceUnavailable,
+            message,
+            merge_conflicts: Vec::new(),
+            manifest_conflict: None,
+            read_set_conflict: None,
+            recovery_required: Some(api::RecoveryRequiredOutput { operation_id }),
         }
     }
 
@@ -752,6 +798,18 @@ impl ApiError {
                             actual,
                         },
                     ),
+                    Some(ManifestConflictDetails::ReadSetChanged {
+                        member,
+                        expected,
+                        actual,
+                    }) => Self::read_set_conflict(
+                        err.message,
+                        api::ReadSetConflictOutput {
+                            member,
+                            expected,
+                            actual,
+                        },
+                    ),
                     _ => Self::conflict(err.message),
                 },
                 ManifestErrorKind::Internal => Self::internal(err.message),
@@ -761,6 +819,13 @@ impl ApiError {
                     .iter()
                     .map(api::MergeConflictOutput::from)
                     .collect(),
+            ),
+            OmniError::RecoveryRequired {
+                operation_id,
+                reason,
+            } => Self::recovery_required(
+                format!("recovery required for operation {operation_id}: {reason}"),
+                operation_id,
             ),
             OmniError::Lance(message) => Self::internal(format!("storage: {message}")),
             OmniError::Io(err) => Self::internal(format!("io: {err}")),
@@ -829,6 +894,8 @@ impl IntoResponse for ApiError {
                 code: Some(self.code),
                 merge_conflicts: self.merge_conflicts,
                 manifest_conflict: self.manifest_conflict,
+                read_set_conflict: self.read_set_conflict,
+                recovery_required: self.recovery_required,
             }),
         )
             .into_response()

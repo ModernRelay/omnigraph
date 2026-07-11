@@ -351,6 +351,22 @@ async fn branch_merge_with_blob_columns_preserves_blob_data() {
     )
     .await
     .unwrap();
+
+    // This regression must not rely on an incidental physical index selecting
+    // Lance's legacy partial-column merge plan. The materialized-blob update
+    // path is correct even when the table has no user index at all.
+    let ds = snapshot_main(&main)
+        .await
+        .unwrap()
+        .open("node:Document")
+        .await
+        .unwrap();
+    let indices = ds.load_indices().await.unwrap();
+    assert!(
+        indices.iter().all(is_system_index),
+        "blob correctness regression requires an index-absent table"
+    );
+
     main.branch_create("feature").await.unwrap();
 
     let mut feature = Omnigraph::open(uri).await.unwrap();
@@ -629,7 +645,10 @@ async fn same_branch_insert_after_external_commit_is_linear() {
         .iter()
         .filter(|c| c.parent_commit_id.as_deref() == Some(c0.graph_commit_id.as_str()))
         .count();
-    assert_eq!(c0_children, 1, "C0 must have exactly one child; two is the fork");
+    assert_eq!(
+        c0_children, 1,
+        "C0 must have exactly one child; two is the fork"
+    );
 }
 
 /// Strict update after a read: Fix 1's `refresh_manifest_only` makes the read
@@ -676,7 +695,10 @@ async fn same_branch_update_after_external_commit_and_read_is_linear() {
         .await
         .unwrap()
         .unwrap();
-    assert_eq!(cb.parent_commit_id.as_deref(), Some(ca.graph_commit_id.as_str()));
+    assert_eq!(
+        cb.parent_commit_id.as_deref(),
+        Some(ca.graph_commit_id.as_str())
+    );
 
     // A reads main: the stale-probe path refreshes A's MANIFEST (via
     // refresh_manifest_only) but not its commit-graph head, freshening the
@@ -713,7 +735,10 @@ async fn same_branch_update_after_external_commit_and_read_is_linear() {
         .iter()
         .filter(|c| c.parent_commit_id.as_deref() == Some(ca.graph_commit_id.as_str()))
         .count();
-    assert_eq!(ca_children, 1, "Ca must have exactly one child; two is the fork");
+    assert_eq!(
+        ca_children, 1,
+        "Ca must have exactly one child; two is the fork"
+    );
 }
 
 #[tokio::test]

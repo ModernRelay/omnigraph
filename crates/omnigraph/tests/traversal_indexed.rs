@@ -58,7 +58,8 @@ async fn key_column_index_coverage_detects_btree_presence() {
     let db = init_and_load(&dir).await;
     let snap = snapshot_main(&db).await.unwrap();
 
-    // Edge `src` gets a BTREE from ensure_indices on load → Indexed.
+    // The shared fixture explicitly reconciles indexes after loading, so the
+    // edge `src` BTREE is present and fully covered here.
     let edge_ds = snap.open("edge:Knows").await.unwrap();
     let src_cov = TableStore::key_column_index_coverage(&edge_ds, "src")
         .await
@@ -86,7 +87,8 @@ async fn coverage_degrades_for_appended_unindexed_fragment() {
     let dir = tempfile::tempdir().unwrap();
     let mut db = init_and_load(&dir).await;
 
-    // Fresh load: the Knows BTREE covers every fragment → Indexed.
+    // The fixture's explicit post-load `ensure_indices` covers every current
+    // Knows fragment → Indexed.
     let snap = snapshot_main(&db).await.unwrap();
     let edge_ds = snap.open("edge:Knows").await.unwrap();
     assert_eq!(

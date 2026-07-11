@@ -1,7 +1,7 @@
 //! RFC-013 Phase 7 acceptance gate: graph lineage lives ONLY in `__manifest`.
 //!
 //! The `graph_commit` + `graph_head` rows ride the same publish CAS as the
-//! table-version rows, so `_graph_commits.lance` carries NO commit rows. This
+//! table-version rows, so no standalone commit-lineage dataset exists. This
 //! gate proves two things over a realistic history (commits on main, a branch,
 //! a merge, all with actors):
 //!

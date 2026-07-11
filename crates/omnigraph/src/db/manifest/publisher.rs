@@ -36,12 +36,12 @@ use super::metadata::{TableVersionMetadata, parse_namespace_version_request};
 use super::migrations::{read_stamp, refuse_if_stamp_unsupported};
 use super::state::{
     GraphLineageRow, GraphLineageRowPart, ManifestState, assemble_manifest_state,
-    graph_lineage_row_parts, head_lineage_row, manifest_rows_batch, manifest_schema,
-    read_manifest_state, read_publish_scan,
+    graph_head_object_id, graph_lineage_row_parts, head_lineage_row, manifest_rows_batch,
+    manifest_schema, read_manifest_state, read_publish_scan,
 };
 use super::{
-    ManifestChange, OBJECT_TYPE_TABLE, OBJECT_TYPE_TABLE_TOMBSTONE, OBJECT_TYPE_TABLE_VERSION,
-    SubTableEntry, TableRegistration, TableTombstone,
+    MAIN_BRANCH_HEAD_KEY, ManifestChange, OBJECT_TYPE_TABLE, OBJECT_TYPE_TABLE_TOMBSTONE,
+    OBJECT_TYPE_TABLE_VERSION, SubTableEntry, TableRegistration, TableTombstone,
 };
 
 /// Bound on the publisher-level retry loop that wraps Lance's row-level CAS
@@ -54,11 +54,10 @@ const PUBLISHER_RETRY_BUDGET: u32 = 5;
 /// The graph-lineage commit to record atomically with a manifest publish
 /// (RFC-013 Phase 7). One logical commit per publish: the `graph_commit_id` is
 /// minted once by the caller and stays stable across the publisher's CAS
-/// retries; only the parent re-resolves per attempt (against the freshly loaded
-/// `__manifest`), so a retry after a concurrent commit parents off the new head
-/// — the TOCTOU the dual-write era's `commit_graph.refresh()` guarded is closed
-/// by construction.
-#[derive(Debug, Clone)]
+/// retries. Legacy [`PublishPrecondition::Any`] publishes re-resolve the parent
+/// per attempt. An exact-head publish instead rejects a retry once that authority
+/// changed, so a prepared write can never be silently re-parented.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub(crate) struct LineageIntent {
     /// ULID minted once before the publish loop; the graph commit's identity.
     pub graph_commit_id: String,
@@ -71,6 +70,55 @@ pub(crate) struct LineageIntent {
     pub merged_parent_commit_id: Option<String>,
     /// Commit timestamp (microseconds since the UNIX epoch).
     pub created_at: i64,
+}
+
+/// The exact mutable graph-head authority a prepared write observed. A missing
+/// row is first-class: a freshly-created named branch inherits lineage commits
+/// but has no `graph_head:<its-name>` until its first graph commit.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub(crate) struct GraphHeadExpectation {
+    /// `None` means main; `Some("main")` is normalized to `None` by [`new`].
+    pub(crate) branch: Option<String>,
+    /// Lance-native stable branch identity. This detects delete/recreate ABA;
+    /// manifest versions/eTags are deliberately not branch identity.
+    pub(crate) branch_identifier: lance::dataset::refs::BranchIdentifier,
+    /// Exact commit id stored in the branch's head row, or `None` when absent.
+    pub(crate) head_commit_id: Option<String>,
+}
+
+impl GraphHeadExpectation {
+    pub(crate) fn new(
+        branch: Option<&str>,
+        branch_identifier: lance::dataset::refs::BranchIdentifier,
+        head_commit_id: Option<String>,
+    ) -> Self {
+        Self {
+            branch: branch
+                .filter(|branch| *branch != "main")
+                .map(ToOwned::to_owned),
+            branch_identifier,
+            head_commit_id,
+        }
+    }
+
+    fn object_id(&self) -> String {
+        graph_head_object_id(self.branch.as_deref())
+    }
+}
+
+/// Authority checked by the manifest publisher on every CAS attempt.
+///
+/// `Any` preserves the legacy dispatcher semantics: row-level contention may
+/// retry and re-parent a lineage intent. `ExactGraphHead` is the RFC-022
+/// foundation for prepared writes: after contention, any head movement becomes
+/// `ReadSetChanged` rather than a transparent re-parent. Its native branch-id
+/// check detects delete/recreate ABA on every attempt; it is not a distributed
+/// ref-control fence (Lance branch create/delete still lacks conditional CAS),
+/// so branch control remains within the documented single-writer-process bound.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub(crate) enum PublishPrecondition {
+    Any,
+    ExactGraphHead(GraphHeadExpectation),
 }
 
 /// The result of a manifest publish that may have folded in a graph commit.
@@ -92,11 +140,29 @@ pub(super) struct PublishOutcome {
 
 #[async_trait]
 pub(super) trait ManifestBatchPublisher: Send + Sync {
+    /// Legacy publish behavior. All existing writers deliberately retain
+    /// `Any` until enrolled in their RFC-022 adapter.
     async fn publish(
         &self,
         changes: &[ManifestChange],
         expected_table_versions: &HashMap<String, u64>,
         lineage: Option<&LineageIntent>,
+    ) -> Result<PublishOutcome> {
+        self.publish_with_precondition(
+            changes,
+            expected_table_versions,
+            lineage,
+            &PublishPrecondition::Any,
+        )
+        .await
+    }
+
+    async fn publish_with_precondition(
+        &self,
+        changes: &[ManifestChange],
+        expected_table_versions: &HashMap<String, u64>,
+        lineage: Option<&LineageIntent>,
+        precondition: &PublishPrecondition,
     ) -> Result<PublishOutcome>;
 }
 
@@ -119,15 +185,16 @@ struct PendingVersionRow {
 
 /// Everything one CAS attempt needs out of a single `__manifest` scan
 /// (RFC-013 P2): the open dataset, table state for the pre-check + pending-row
-/// build, and the `graph_commit` lineage rows for parent resolution. Folding the
-/// lineage into this struct is what lets `resolve_lineage_rows` skip its own
-/// `read_graph_lineage` scan.
+/// build, `graph_commit` lineage rows for parent resolution, and exact
+/// `graph_head` rows for OCC. Folding lineage authority into this struct is what
+/// lets both checks skip their own `read_graph_lineage` scan.
 struct LoadedPublishState {
     dataset: Dataset,
     registered_tables: HashMap<String, String>,
     existing_versions: HashMap<(String, u64), SubTableEntry>,
     existing_tombstones: HashMap<(String, u64), ()>,
     lineage_rows: Vec<GraphLineageRow>,
+    graph_heads: HashMap<String, String>,
 }
 
 impl GraphNamespacePublisher {
@@ -159,12 +226,11 @@ impl GraphNamespacePublisher {
         // `db/manifest/migrations.rs`.
         refuse_if_stamp_unsupported(read_stamp(&dataset))?;
         // ONE `__manifest` scan for everything the publish needs: table
-        // locations, version entries, tombstones, AND the `graph_commit` lineage
-        // rows for parent resolution (RFC-013 P2). The lineage extraction rides
-        // this pass instead of a second `read_graph_lineage` scan in
-        // `resolve_lineage_rows`; the per-attempt re-read is preserved because
-        // `load_publish_state` runs once per CAS attempt, so a retry sees the
-        // advanced head and re-parents correctly.
+        // locations, version entries, tombstones, `graph_commit` lineage rows
+        // for parent resolution, AND exact `graph_head` rows for OCC (RFC-013
+        // P2 / RFC-022). Extraction rides this pass instead of a second
+        // `read_graph_lineage` scan; the per-attempt re-read is preserved because
+        // `load_publish_state` runs once per CAS attempt.
         let scan = read_publish_scan(&dataset).await?;
         let existing_versions = scan
             .version_entries
@@ -183,6 +249,7 @@ impl GraphNamespacePublisher {
             existing_versions,
             existing_tombstones,
             lineage_rows: scan.lineage_rows,
+            graph_heads: scan.graph_heads,
         })
     }
 
@@ -506,12 +573,15 @@ impl GraphNamespacePublisher {
                         ))
                     })?;
                     let table_path =
-                        table_locations.get(&row.table_key).cloned().ok_or_else(|| {
-                            OmniError::manifest_internal(format!(
-                                "post-publish fold: missing table row for {}",
-                                row.table_key
-                            ))
-                        })?;
+                        table_locations
+                            .get(&row.table_key)
+                            .cloned()
+                            .ok_or_else(|| {
+                                OmniError::manifest_internal(format!(
+                                    "post-publish fold: missing table row for {}",
+                                    row.table_key
+                                ))
+                            })?;
                     let metadata_json = row.metadata.as_deref().ok_or_else(|| {
                         OmniError::manifest_internal(format!(
                             "post-publish fold: table_version row missing metadata for {}",
@@ -568,6 +638,80 @@ impl GraphNamespacePublisher {
                     actual,
                 ));
             }
+        }
+        Ok(())
+    }
+
+    /// Check authority inside the publisher retry loop before pending rows are
+    /// built. The graph head comes from the SAME scan used to build this CAS
+    /// attempt; Lance's native branch identifier is re-read from the ref. Thus a
+    /// row-level-CAS loser with an exact expectation cannot silently re-parent
+    /// on its next attempt.
+    async fn check_publish_precondition(
+        &self,
+        dataset: &Dataset,
+        graph_heads: &HashMap<String, String>,
+        precondition: &PublishPrecondition,
+    ) -> Result<()> {
+        let PublishPrecondition::ExactGraphHead(expected) = precondition else {
+            return Ok(());
+        };
+
+        let expected_branch = expected
+            .branch
+            .as_deref()
+            .filter(|branch| *branch != "main");
+        if expected_branch != self.branch.as_deref() {
+            return Err(OmniError::manifest_internal(format!(
+                "publish graph-head precondition targets branch '{}' but publisher is bound to '{}'",
+                expected_branch.unwrap_or("main"),
+                self.branch.as_deref().unwrap_or("main"),
+            )));
+        }
+
+        let branch_identity_member =
+            format!("branch_identifier:{}", expected_branch.unwrap_or("main"));
+        let expected_branch_identifier = serde_json::to_string(&expected.branch_identifier)
+            .map_err(|e| {
+                OmniError::manifest_internal(format!(
+                    "failed to encode expected Lance branch identifier: {e}"
+                ))
+            })?;
+        let actual_branch_identifier = match dataset.branch_identifier().await {
+            Ok(identifier) => identifier,
+            Err(LanceError::RefNotFound { .. }) => {
+                return Err(OmniError::manifest_read_set_changed(
+                    branch_identity_member,
+                    Some(expected_branch_identifier),
+                    None,
+                ));
+            }
+            Err(err) => return Err(OmniError::Lance(err.to_string())),
+        };
+        if actual_branch_identifier != expected.branch_identifier {
+            let actual = serde_json::to_string(&actual_branch_identifier).map_err(|e| {
+                OmniError::manifest_internal(format!(
+                    "failed to encode current Lance branch identifier: {e}"
+                ))
+            })?;
+            return Err(OmniError::manifest_read_set_changed(
+                branch_identity_member,
+                Some(expected_branch_identifier),
+                Some(actual),
+            ));
+        }
+
+        let object_id = expected.object_id();
+        let branch_key = object_id
+            .strip_prefix("graph_head:")
+            .expect("graph_head_object_id always supplies the prefix");
+        let actual = graph_heads.get(branch_key).cloned();
+        if actual != expected.head_commit_id {
+            return Err(OmniError::manifest_read_set_changed(
+                object_id,
+                expected.head_commit_id.clone(),
+                actual,
+            ));
         }
         Ok(())
     }
@@ -671,13 +815,18 @@ pub(crate) fn map_lance_publish_error(err: LanceError) -> OmniError {
 
 #[async_trait]
 impl ManifestBatchPublisher for GraphNamespacePublisher {
-    async fn publish(
+    async fn publish_with_precondition(
         &self,
         changes: &[ManifestChange],
         expected_table_versions: &HashMap<String, u64>,
         lineage: Option<&LineageIntent>,
+        precondition: &PublishPrecondition,
     ) -> Result<PublishOutcome> {
-        if changes.is_empty() && expected_table_versions.is_empty() && lineage.is_none() {
+        if changes.is_empty()
+            && expected_table_versions.is_empty()
+            && lineage.is_none()
+            && matches!(precondition, PublishPrecondition::Any)
+        {
             // Defensive no-op (never reached from `commit_changes_with_lineage`,
             // which short-circuits the all-empty case): state is unchanged, so a
             // re-scan here is acceptable.
@@ -709,7 +858,15 @@ impl ManifestBatchPublisher for GraphNamespacePublisher {
                 existing_versions,
                 existing_tombstones,
                 lineage_rows,
+                graph_heads,
             } = loaded;
+
+            // Exact logical authority is checked on EVERY attempt from this
+            // attempt's single manifest scan. In particular, a CAS retry after
+            // another writer creates or advances `graph_head:<branch>` fails
+            // here instead of transparently re-parenting the prepared intent.
+            self.check_publish_precondition(&dataset, &graph_heads, precondition)
+                .await?;
 
             let latest_per_table =
                 Self::latest_visible_per_table(&existing_versions, &existing_tombstones);
@@ -754,6 +911,7 @@ impl ManifestBatchPublisher for GraphNamespacePublisher {
                     existing_tombstones
                         .keys()
                         .map(|(key, version)| (key.clone(), *version)),
+                    graph_heads,
                 );
                 return Ok(PublishOutcome {
                     dataset,
@@ -765,8 +923,23 @@ impl ManifestBatchPublisher for GraphNamespacePublisher {
             // Build the post-publish fold inputs from the pre-publish state ∪ the
             // rows we are about to commit, BEFORE `rows` is moved into merge_rows
             // (RFC-013 PR2 #1b). Recomputed per attempt from freshly-loaded state.
-            let (fold_entries, fold_tombstones) =
-                Self::fold_inputs(&existing_versions, &existing_tombstones, &rows, &known_tables)?;
+            let (fold_entries, fold_tombstones) = Self::fold_inputs(
+                &existing_versions,
+                &existing_tombstones,
+                &rows,
+                &known_tables,
+            )?;
+            let mut fold_graph_heads = graph_heads;
+            if let Some(intent) = lineage {
+                fold_graph_heads.insert(
+                    intent
+                        .branch
+                        .as_deref()
+                        .unwrap_or(MAIN_BRANCH_HEAD_KEY)
+                        .to_string(),
+                    intent.graph_commit_id.clone(),
+                );
+            }
 
             match self.merge_rows(dataset, rows).await {
                 Ok(new_dataset) => {
@@ -774,6 +947,7 @@ impl ManifestBatchPublisher for GraphNamespacePublisher {
                         new_dataset.version().version,
                         fold_entries,
                         fold_tombstones,
+                        fold_graph_heads,
                     );
                     return Ok(PublishOutcome {
                         dataset: new_dataset,

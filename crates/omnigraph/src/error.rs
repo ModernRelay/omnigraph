@@ -22,6 +22,15 @@ pub enum ManifestConflictDetails {
         expected: u64,
         actual: u64,
     },
+    /// A logical authority value captured during write preparation changed
+    /// before the manifest visibility decision. Unlike a touched-table
+    /// version mismatch, this may name a read-only dependency such as the
+    /// target branch's graph head or schema identity.
+    ReadSetChanged {
+        member: String,
+        expected: Option<String>,
+        actual: Option<String>,
+    },
     /// Lance's row-level CAS rejected the publish because a concurrent writer
     /// landed a row with the same `object_id`. Distinct from
     /// `ExpectedVersionMismatch`: the caller's expectations (if any) still
@@ -85,6 +94,16 @@ pub enum OmniError {
     Manifest(ManifestError),
     #[error("merge conflicts: {0:?}")]
     MergeConflicts(Vec<MergeConflict>),
+    /// A durable recovery intent overlaps this write. Its physical effects may
+    /// already have landed, or it may still be armed before its first effect;
+    /// either way the sidecar named by `operation_id` must be resolved before
+    /// the caller retries. Treating this as ordinary OCC would let a writer
+    /// advance around unresolved commit ownership.
+    #[error("recovery required for operation {operation_id}: {reason}")]
+    RecoveryRequired {
+        operation_id: String,
+        reason: String,
+    },
     /// Engine-layer policy enforcement (MR-722). Wraps either a policy
     /// denial ("you can't do that") or a policy-evaluation failure
     /// ("the policy engine itself blew up"). The HTTP layer maps
@@ -103,6 +122,16 @@ pub enum OmniError {
 }
 
 impl OmniError {
+    pub(crate) fn is_read_set_changed(&self) -> bool {
+        matches!(
+            self,
+            Self::Manifest(ManifestError {
+                details: Some(ManifestConflictDetails::ReadSetChanged { .. }),
+                ..
+            })
+        )
+    }
+
     pub fn manifest(message: impl Into<String>) -> Self {
         Self::Manifest(ManifestError::new(ManifestErrorKind::BadRequest, message))
     }
@@ -145,5 +174,38 @@ impl OmniError {
             ManifestError::new(ManifestErrorKind::Conflict, message)
                 .with_details(ManifestConflictDetails::RowLevelCasContention),
         )
+    }
+
+    pub fn manifest_read_set_changed(
+        member: impl Into<String>,
+        expected: Option<String>,
+        actual: Option<String>,
+    ) -> Self {
+        let member = member.into();
+        let message = format!(
+            "write authority '{}' changed during preparation (expected {}, current {}) — reprepare from the current branch state",
+            member,
+            expected.as_deref().unwrap_or("<absent>"),
+            actual.as_deref().unwrap_or("<absent>"),
+        );
+        Self::Manifest(
+            ManifestError::new(ManifestErrorKind::Conflict, message).with_details(
+                ManifestConflictDetails::ReadSetChanged {
+                    member,
+                    expected,
+                    actual,
+                },
+            ),
+        )
+    }
+
+    pub fn recovery_required(
+        operation_id: impl Into<String>,
+        reason: impl Into<String>,
+    ) -> Self {
+        Self::RecoveryRequired {
+            operation_id: operation_id.into(),
+            reason: reason.into(),
+        }
     }
 }

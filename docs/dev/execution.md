@@ -79,16 +79,16 @@ Hybrid example: `order { rrf(nearest($d.embedding, $q), bm25($d.body, $q_text)) 
 
 ## Mutation execution (`exec/mutation.rs`)
 
-Resolves expression values to literals, converts to typed Arrow arrays (`literal_to_typed_array(lit, DataType, num_rows)`), then writes via Lance's two-phase distributed-write API at end-of-query:
+Resolves expression values to literals, converts to typed Arrow arrays (`literal_to_typed_array(lit, DataType, num_rows)`), then writes via Lance's two-phase distributed-write API at end-of-query. Before lowering/execution, one `WriteTxn` captures the target's Lance-native branch identity, exact optional graph head, accepted schema identity/catalog, and base table snapshot; every step in the attempt uses that immutable authority.
 
-- `insert` (no `@key`, edges) → accumulate into `MutationStaging.pending` (Append mode); finalize calls `stage_append` once per touched table.
-- `insert` (`@key` node) → accumulate into `pending` (Merge mode); finalize calls `stage_merge_insert` once per touched table.
+- `insert` (no `@key`, edges) → accumulate into `MutationStaging.pending` (Append mode); `stage_all` later calls `stage_append` once per touched table.
+- `insert` (`@key` node) → accumulate into `pending` (Merge mode); `stage_all` later calls `stage_merge_insert` once per touched table.
 - `update` → scan committed via Lance + pending via DataFusion `MemTable` (read-your-writes), apply assignments, accumulate into `pending` (Merge mode).
-- `delete` → records a predicate into `MutationStaging.delete_predicates` (count matching committed rows now for `affected_*`); finalize combines a table's predicates into one `stage_delete` (Lance 7.0 `DeleteBuilder::execute_uncommitted`, a deletion-vector transaction) committed via `commit_staged` — no inline HEAD advance (MR-A).
+- `delete` → records a predicate into `MutationStaging.delete_predicates` (count matching committed rows now for `affected_*`); `stage_all` combines a table's predicates into one `stage_delete` (Lance 7.0 `DeleteBuilder::execute_uncommitted`, a deletion-vector transaction) — no inline HEAD advance (MR-A).
 
 **D₂ parse-time rule.** A single mutation query is either insert/update-only or delete-only. Mixed → reject before any I/O. The check fires in `enforce_no_mixed_destructive_constructive(&ir)` inside `execute_named_mutation`.
 
-Multi-statement mutations are atomic at the publisher commit boundary: every insert/update batch lives in memory until end-of-query, then exactly one `stage_*` + `commit_staged` runs per touched table, then `ManifestBatchPublisher::publish` commits the manifest atomically with per-table `expected_table_versions` CAS.
+Multi-statement mutations are atomic at the publisher commit boundary. Every batch lives in memory until all statements and validation succeed; `stage_all` then prepares one exact transaction per touched table without advancing HEAD. `commit_all` acquires the root-shared schema → branch → sorted-table gates, rechecks for recovery intent, revalidates the complete branch authority, writes the schema-v3 recovery sidecar, and commits the table transactions with zero transparent conflict retries. The guards remain held while `ManifestBatchPublisher` publishes the pre-minted lineage under the same exact native-branch/head and table-version precondition.
 
 ### Mutation flow — sequence
 
@@ -100,11 +100,12 @@ sequenceDiagram
     participant cmp as omnigraph-compiler
     participant stg as MutationStaging<br/>(exec/staging.rs)
     participant ts as table_store
-    participant lance as Lance dataset
+    participant rec as schema-v3 recovery sidecar
     participant pub as ManifestBatchPublisher
 
     client->>og: mutate_as(branch, source, name, params, actor_id)
-    og->>cmp: parse + typecheck + lower_mutation_query
+    og->>og: heal/reject recovery intent; open_write_txn
+    og->>cmp: parse + typecheck + lower using txn catalog
     cmp-->>og: MutationIR
     og->>og: enforce_no_mixed_destructive_constructive (D₂)
     loop for each mutation op
@@ -116,23 +117,43 @@ sequenceDiagram
                 og->>ts: scan_with_pending (Lance + DataFusion MemTable union)
                 ts-->>og: matched batches
             end
-        else delete (stage, D₂ keeps separate)
+        else delete (record predicate; D₂ keeps separate)
             og->>ts: count_rows (committed match → affected_*)
             og->>stg: ensure_path + record_delete (predicate)
         end
     end
-    og->>stg: finalize(db, branch)
-    loop per pending table
-        stg->>ts: stage_append OR stage_merge_insert (one per table)
-        ts-->>stg: StagedWrite (transaction + commit metadata + fragments)
-        stg->>ts: commit_staged (advances Lance HEAD)
-        ts-->>stg: new Dataset
+    og->>og: validate complete staged change-set against txn base
+    og->>stg: stage_all(db, branch)
+    loop per touched table
+        stg->>ts: stage_append OR stage_merge_insert OR stage_delete (one per table)
+        ts-->>stg: exact staged transaction (no HEAD movement)
     end
-    stg-->>og: (updates: Vec<SubTableUpdate>, expected_versions)
-    og->>pub: commit_updates_on_branch_with_expected
-    pub->>pub: publisher CAS (cross-table OCC on __manifest)
-    pub-->>og: new manifest version
-    og-->>client: MutationResult
+    stg->>stg: acquire schema → branch → sorted-table gates
+    stg->>og: recheck recovery barrier + revalidate complete WriteTxn
+    alt authority changed before effects
+        stg-->>og: ReadSetChanged
+        alt insert-only mutation
+            og->>og: discard complete attempt; bounded full reprepare
+        else Update/Delete
+            og-->>client: ReadSetChanged (409)
+        end
+    else authority unchanged
+        stg->>rec: persist fixed lineage + exact transaction identities
+        loop per touched table
+            stg->>ts: commit_staged (zero transparent retries)
+            ts-->>stg: confirm achieved transaction + table update
+        end
+        stg-->>og: updates + expected versions + sidecar + held gates
+        og->>pub: publish exact graph-head/table precondition
+        alt publish succeeds
+            pub-->>og: new manifest version
+            og->>rec: delete sidecar
+            og-->>client: MutationResult
+        else any error after an effect
+            pub-->>og: error
+            og-->>client: RecoveryRequired (sidecar remains authoritative)
+        end
+    end
 ```
 
 **Code paths:**
@@ -143,11 +164,11 @@ sequenceDiagram
 - Per-op execution: `execute_insert`, `execute_update`, `execute_delete_node`, `execute_delete_edge`
 - Pending-aware reads: `TableStore::scan_with_pending` / `count_rows_with_pending` at `crates/omnigraph/src/table_store.rs`
 - Edge cardinality with pending: `validate_edge_cardinality_with_pending` at `crates/omnigraph/src/exec/mutation.rs`
-- Per-query accumulator: `crates/omnigraph/src/exec/staging.rs` (`MutationStaging`, `PendingTable`, `PendingMode`, `finalize`)
-- End-of-query Lance commit: `TableStore::stage_append`, `stage_merge_insert`, `commit_staged` at `crates/omnigraph/src/table_store.rs`
-- Manifest commit primitive: `commit_updates_on_branch_with_expected` at `crates/omnigraph/src/db/omnigraph/table_ops.rs`
+- Per-query accumulator and protocol adapter: `crates/omnigraph/src/exec/staging.rs` (`MutationStaging::stage_all`, `StagedMutation::commit_all`)
+- End-of-query Lance operations: `TableStore::stage_append`, `stage_merge_insert`, `stage_delete`, `commit_staged` at `crates/omnigraph/src/table_store.rs`
+- Manifest commit primitive: `commit_updates_on_branch_with_expected` at `crates/omnigraph/src/db/omnigraph/table_ops.rs` (exact native-branch/head precondition plus expected table versions)
 
-Atomicity guarantee for multi-statement mutations: a mid-query failure leaves Lance HEAD untouched on staged tables (no inline commit happened during op execution), so the next mutation proceeds normally with no `ExpectedVersionMismatch`. The publisher CAS at the very end either succeeds (manifest advances atomically across all touched sub-tables) or fails with a typed `ManifestConflictDetails::ExpectedVersionMismatch` (no partial publish). See [docs/dev/invariants.md](invariants.md) and [docs/dev/writes.md](writes.md).
+Atomicity guarantee for multi-statement mutations: a mid-query failure leaves Lance HEAD untouched because no effect occurs during statement execution or staging. A pre-effect authority mismatch discards the complete attempt: insert-only mutations fully reprepare with a bounded retry, while Update/Delete returns typed `ReadSetChanged`. Once any `commit_staged` effect is durable, the attempt either makes every update visible together or returns `RecoveryRequired` with the fixed sidecar left for recovery; the engine never treats that post-effect error as an ordinary rebase. See [docs/dev/invariants.md](invariants.md) and [docs/dev/writes.md](writes.md).
 
 ## Bulk loader (`loader/mod.rs`)
 
@@ -162,11 +183,11 @@ Atomicity guarantee for multi-statement mutations: a mid-query failure leaves La
 
 | Mode | Semantics | Path (post-MR-794) |
 |---|---|---|
-| `Overwrite` | Replace all data in the target tables on the branch | Same accumulator; one `stage_overwrite` + `commit_staged` per touched table at end-of-load (a staged Lance `Operation::Overwrite` transaction — HEAD does not advance until commit; MR-793 Phase 2); publisher CAS. |
-| `Append` | Strict insert; duplicates error | In-memory `MutationStaging` accumulator; one `stage_append` + `commit_staged` per touched table at end-of-load; publisher CAS. |
-| `Merge` | Upsert by `id` (`merge_insert`) | Same accumulator; one `stage_merge_insert` per touched table at end-of-load (Merge mode dedupes by `id`, last-write-wins); publisher CAS. |
+| `Overwrite` | Replace all data in the target tables on the branch | Same accumulator; one staged Lance `Operation::Overwrite` transaction per touched table. A pre-effect authority change is strict `ReadSetChanged`; no automatic replay. |
+| `Append` | Strict insert; duplicates error | One `stage_append` transaction per touched table. A pre-effect authority change discards the whole parsed/validated attempt and fully reprepares with a bounded retry. |
+| `Merge` | Upsert by `id` (`merge_insert`) | One `stage_merge_insert` transaction per touched table (deduped by `id`, last-write-wins). The same bounded full-reprepare rule as Append applies before effects. |
 
-For all three modes, a mid-load failure (RI / cardinality violation, validation error) leaves Lance HEAD untouched on the staged tables — the next load on the same tables proceeds normally with no `ExpectedVersionMismatch`.
+All three modes then use the same schema → branch → sorted-table gate, v3 recovery, zero-retry table commit, and exact publisher-precondition path as mutation. A parse, RI, cardinality, or validation failure leaves Lance HEAD untouched. After any table effect, any later error is `RecoveryRequired`. Load, mutation, and schema apply build no physical indexes inline; explicit `ensure_indices`/`optimize` reconciliation materializes declared intent later.
 
 ## `load` and the deprecated `ingest` shims
 

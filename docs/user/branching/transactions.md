@@ -19,7 +19,7 @@ Two primitives, two scopes:
 | **One `.gq` query** (any number of statements inside) | The query itself — handled by the publisher's atomic manifest commit | Yes — all statements land together or none of them do | The publisher never publishes; target unchanged |
 | **Many queries that must succeed together** | Branches: `branch_create` → run N queries on the branch → `branch_merge` | Yes — the merge is a single atomic publish | Drop the branch (`branch_delete`); main is unaffected |
 
-Snapshot isolation is per-query — every read inside one query sees one consistent manifest version. Two concurrent queries on the same branch see independent snapshots; the publisher's CAS catches racing writes.
+Snapshot isolation is per-query — every read inside one query sees one consistent manifest version. Two concurrent queries on the same branch see independent snapshots. Mutation/load capture the branch head as coarse OCC authority, so a prepared plan is never silently reparented after another graph commit.
 
 ## Comparison with `BEGIN` / `COMMIT`
 
@@ -136,7 +136,9 @@ This is the workflow agentic loops are designed around: **branches are the unit 
 | Scenario | What happens | Caller action |
 |---|---|---|
 | Single query fails mid-flight | Publisher never publishes; target unchanged | Read the error, decide whether to retry |
-| Concurrent writers race the same `(table, branch)` | Publisher CAS rejects the loser with a version-mismatch conflict | Refresh handle, retry the query |
+| Branch authority changes before physical effects | Retryable inserts/loads fully reprepare; strict writes return `read_set_conflict` | For a surfaced strict conflict, refresh and retry deliberately |
+| Authority changes after a physical effect | The write returns `recovery_required` and leaves its durable sidecar | Resolve recovery by read-write reopen/server restart before retrying |
+| An overlapping recovery intent remains unresolved before effects | The write returns `recovery_required` with that intent's operation id and does not advance a table | Resolve recovery by read-write reopen/server restart before retrying |
 | Branch with N successful mutations, then merge fails (three-way conflict) | Each individual mutation already committed on the branch; merge surfaces `MergeConflicts` | Inspect, decide whether to keep working on the branch, abandon it (`branch_delete`), or resolve and re-merge |
 | Process crashes mid-branch-workflow | Each completed mutation on the branch is durable | Re-open the graph, continue where you left off |
 

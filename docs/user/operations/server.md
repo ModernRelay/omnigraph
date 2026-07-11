@@ -162,25 +162,48 @@ Only `/export` streams (`application/x-ndjson`, MPSC channel + `Body::from_strea
 
 ## Error model
 
-Uniform `ErrorOutput { error, code?, merge_conflicts[], manifest_conflict? }` with `code ∈ unauthorized | forbidden | bad_request | not_found | conflict | too_many_requests | internal`. Merge conflicts attach structured `MergeConflictOutput { table_key, row_id?, kind, message }`.
+Uniform
+`ErrorOutput { error, code?, merge_conflicts[], manifest_conflict?, read_set_conflict?, recovery_required? }`
+with
+`code ∈ unauthorized | forbidden | bad_request | not_found | method_not_allowed | conflict | too_many_requests | service_unavailable | internal`.
+Merge conflicts attach structured
+`MergeConflictOutput { table_key, row_id?, kind, message }`.
 
-`manifest_conflict` is set on **concurrent-write rejections** (HTTP 409): the
-caller's pre-write view of one table's manifest version was stale.
-`ManifestConflictOutput { table_key, expected, actual }` tells the client
-which table to refresh and retry. This is the conflict shape produced by
-concurrent `/mutate` (or its `/change` alias), `/load` (or its deprecated
-`/ingest` alias) calls landing the same `(table, branch)` race.
+`manifest_conflict` is set on legacy per-table manifest-version rejections
+(HTTP 409). `ManifestConflictOutput { table_key, expected, actual }` tells the
+client which table was stale. Mutation and load use the unified coarse-OCC
+adapter described next; other writers retain this older conflict shape until
+they are enrolled.
 
-HTTP status codes used: 200, 400, 401, 403, 404, 409, 429, 500.
+`read_set_conflict` is set when a prepared write is rejected before any table
+effect because its branch authority changed. The HTTP status is 409 and
+`ReadSetConflictOutput { member, expected, actual }` identifies the stale
+authority member. The engine already performs a bounded full-attempt retry for
+mutation inserts and load `append`/`merge`. Strict mutation updates/deletes and
+load `overwrite` return the 409 to the caller instead of being replayed.
+
+`recovery_required` is set when an overlapping durable recovery intent remains
+unresolved; its table effects may or may not have started. The HTTP status is 503 and
+`RecoveryRequiredOutput { operation_id }` names the durable recovery intent.
+Do not blindly resubmit the write: let a read-write open or the recovery sweep
+resolve that operation first, then retry from a fresh snapshot.
+
+HTTP status codes used: 200, 400, 401, 403, 404, 405, 409, 429, 500, 503.
 
 ## Per-actor admission control
 
-Disjoint
-`(table, branch)` writes from different actors now run concurrently,
-guarded only by the engine's per-(table, branch) write queue. To keep
-one heavy actor from exhausting shared capacity (Lance I/O, manifest
-churn, network), the server gates mutating handlers through per-process
-admission limits configured from environment variables:
+RFC-022-enrolled mutation/load preparation runs outside the effect gates, so
+parsing, validation, and reclaimable fragment staging can overlap across branches.
+Readers acquire none of these gates. Before the first durable effect, however, an
+attempt acquires the exclusive root schema gate, then its branch-effect gate and
+sorted table queues, and holds all of them through manifest publication. The root
+schema gate means enrolled effect windows on one graph currently serialize
+in-process even across different branches; the branch gate preserves one atomic
+graph-head validation authority, while table queues protect each concrete Lance
+effect and legacy writer. These are process-local ordering gates, not a
+cross-process lock. To keep one heavy actor from exhausting shared capacity
+(Lance I/O, manifest churn, network), the server gates mutating handlers through
+per-process admission limits configured from environment variables:
 
 | Env var | Default | Purpose |
 |---|---|---|

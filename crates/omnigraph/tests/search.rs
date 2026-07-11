@@ -86,6 +86,7 @@ async fn init_search_db(dir: &tempfile::TempDir) -> Omnigraph {
     load_jsonl(&mut db, SEARCH_DATA, LoadMode::Overwrite)
         .await
         .unwrap();
+    db.ensure_indices().await.unwrap();
     db
 }
 
@@ -95,6 +96,7 @@ async fn init_mock_embedding_search_db(dir: &tempfile::TempDir) -> Omnigraph {
     load_jsonl(&mut db, &mock_embedding_seed_data(), LoadMode::Overwrite)
         .await
         .unwrap();
+    db.ensure_indices().await.unwrap();
     db
 }
 
@@ -104,6 +106,7 @@ async fn init_model_recorded_search_db(dir: &tempfile::TempDir) -> Omnigraph {
     load_jsonl(&mut db, &mock_embedding_seed_data(), LoadMode::Overwrite)
         .await
         .unwrap();
+    db.ensure_indices().await.unwrap();
     db
 }
 
@@ -200,6 +203,40 @@ async fn doc_user_index_count(db: &Omnigraph) -> usize {
         .iter()
         .filter(|idx| !is_system_index(idx))
         .count()
+}
+
+/// RFC-022 data writes publish only their exact table effects. Declared FTS
+/// and vector indexes may therefore still be pending immediately after load;
+/// both retrieval modes (and their RRF composition) must remain logically
+/// correct through Lance's flat-search paths.
+#[tokio::test]
+#[serial]
+async fn deferred_indexes_do_not_block_hybrid_reads() {
+    let dir = tempfile::tempdir().unwrap();
+    let uri = dir.path().to_str().unwrap();
+    let mut db = Omnigraph::init(uri, MOCK_SEARCH_SCHEMA).await.unwrap();
+    load_jsonl(
+        &mut db,
+        &mock_embedding_seed_data(),
+        LoadMode::Overwrite,
+    )
+    .await
+    .unwrap();
+
+    assert_eq!(
+        doc_user_index_count(&db).await,
+        0,
+        "load must leave declared physical indexes to the reconciler"
+    );
+    let result = query_main(
+        &mut db,
+        MOCK_SEARCH_QUERIES,
+        "hybrid_search_vector",
+        &vector_and_string_params("$vq", &mock_embedding("alpha", 4), "$tq", "alpha"),
+    )
+    .await
+    .expect("pending FTS/vector indexes must degrade to flat search");
+    assert_eq!(result_slugs(&result)[0], "alpha-doc");
 }
 
 struct EnvGuard {
@@ -853,7 +890,7 @@ async fn rrf_fuses_two_vector_queries() {
 
 #[tokio::test]
 #[serial]
-async fn mutation_commit_refreshes_search_indices_without_manual_ensure() {
+async fn mutation_with_deferred_index_coverage_remains_searchable() {
     let dir = tempfile::tempdir().unwrap();
     let mut db = init_search_db(&dir).await;
     assert_eq!(doc_user_index_count(&db).await, 4);
@@ -879,7 +916,7 @@ async fn mutation_commit_refreshes_search_indices_without_manual_ensure() {
     assert_eq!(
         doc_user_index_count(&db).await,
         4,
-        "mutation commit should refresh required indices without duplicating them"
+        "mutation must leave physical index materialization to the reconciler"
     );
 
     let result = query_main(
@@ -892,7 +929,7 @@ async fn mutation_commit_refreshes_search_indices_without_manual_ensure() {
     .unwrap();
     assert!(
         result_slugs(&result).contains(&"quasar-notes".to_string()),
-        "newly inserted row should be searchable without an explicit ensure_indices step"
+        "a row outside current index coverage must remain searchable via fallback scan"
     );
 }
 
@@ -919,7 +956,7 @@ async fn rrf_fuses_vector_and_text() {
 
 #[tokio::test]
 #[serial]
-async fn load_commit_creates_vector_index_for_vector_annotations() {
+async fn index_reconciler_creates_vector_index_for_vector_annotations() {
     let schema = r#"
 node Doc {
     slug: String @key
@@ -935,6 +972,12 @@ node Doc {
     load_jsonl(&mut db, data, LoadMode::Overwrite)
         .await
         .unwrap();
+    assert_eq!(
+        doc_user_index_count(&db).await,
+        0,
+        "load publishes exact data effects and leaves physical indexes pending"
+    );
+    db.ensure_indices().await.unwrap();
 
     let ds = snapshot_main(&db)
         .await

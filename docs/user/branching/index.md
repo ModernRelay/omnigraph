@@ -33,8 +33,10 @@ conflict kinds are on the [merge](merge.md) page.
 
 ## L2 — Recovery audit trail
 
-Interrupted multi-table writes are recovered automatically the next time the graph is opened read-write. Recovery commits are recorded in the audit trail under the actor `omnigraph:recovery`, so you can find them with:
-
-```bash
-omnigraph commit list --filter actor=omnigraph:recovery
-```
+Interrupted multi-table writes are recovered automatically the next time the
+graph is opened read-write. Each completed recovery is recorded internally in
+`_graph_commit_recoveries.lance`. A roll-forward keeps the interrupted
+writer's original commit id and actor; rollback and legacy recovery commits use
+the reserved actor `omnigraph:recovery`. Consequently, `commit list` is not a
+complete recovery log, and the CLI does not currently expose a query for the
+internal recovery-audit table.

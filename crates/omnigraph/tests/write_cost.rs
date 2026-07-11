@@ -5,8 +5,9 @@
 //! boundary. Guards invariant 15 (cost bounded by work, not history) on writes.
 //!
 //! **Backend split (see docs/dev/testing.md / RFC-013).** This file runs on
-//! **local FS** and gates the **internal-table** term (`__manifest`/`_graph_commits`
-//! fragment scans, ~+18/depth — O(fragments) on any backend, step 2's target).
+//! **local FS** and gates the **internal-table** term (`__manifest` fragment
+//! scans, including inline lineage/actor rows — O(fragments) on any backend,
+//! step 2's target). The former standalone lineage tables are retired.
 //!
 //! The **data-table opener** term (step 3a's win) is a per-object-store-RPC
 //! phenomenon and is NOT gated here: local-FS latest-resolution is cheap whether
@@ -270,14 +271,16 @@ async fn keyed_insert_routes_through_merge_insert_only() {
 
 // ── (D) Step-3b capture-once fitness asserts (RED today → GREEN after WriteTxn) ──
 
-/// A write must validate the schema contract EXACTLY ONCE (3 `read_text` + 2 `exists`).
-/// Today the write path re-validates at every resolve point (entry, per-table
-/// `resolved_branch_target`, commit-time `fresh_snapshot_for_branch`), so the delta is
-/// a multiple of that. Step 3b's `WriteTxn` validates once and threads it. The shape is
+/// A write performs one full schema validation while capturing the catalog-bound
+/// `WriteTxn`, one trailing state-marker read that fences torn head/schema capture,
+/// and one full validation under the pre-effect gates (7 `read_text` + 4 `exists`
+/// total). Per-table resolves must not add more validation. The gate read is
+/// correctness work: it arbitrates schema identity after preparation and before
+/// the recovery sidecar or any Lance HEAD movement. The shape is
 /// the write twin of `warm_read_cost.rs::warm_query_validates_schema_contract_once`,
 /// built with ZERO production change via the counting storage adapter.
 #[tokio::test]
-async fn write_validates_schema_contract_once() {
+async fn write_schema_io_is_bounded_to_capture_fence_and_effect_gate() {
     use omnigraph::instrumentation::CountingStorageAdapter;
     use omnigraph::storage::storage_for_uri;
 
@@ -291,6 +294,8 @@ async fn write_validates_schema_contract_once() {
 
     let before_read_text = counts.read_text();
     let before_exists = counts.exists();
+    let before_write_text = counts.write_text();
+    let before_delete = counts.delete();
     db.mutate(
         "main",
         MUTATION_QUERIES,
@@ -302,14 +307,24 @@ async fn write_validates_schema_contract_once() {
 
     let read_text_delta = counts.read_text() - before_read_text;
     let exists_delta = counts.exists() - before_exists;
+    let write_text_delta = counts.write_text() - before_write_text;
+    let delete_delta = counts.delete() - before_delete;
     eprintln!("schema-contract reads on one write: read_text={read_text_delta} exists={exists_delta}");
     assert_eq!(
-        read_text_delta, 3,
-        "a write must validate the schema contract once (3 reads), not N times",
+        read_text_delta, 7,
+        "a write must do capture validation + trailing identity fence + pre-effect validation (7 reads), not per table",
     );
     assert_eq!(
-        exists_delta, 2,
-        "a write must probe contract-file existence once (2 probes), not N times",
+        exists_delta, 4,
+        "a write must probe contract-file existence at capture + pre-effect revalidation (4 probes)",
+    );
+    assert_eq!(
+        write_text_delta, 2,
+        "an enrolled write must write its recovery sidecar exactly twice (arm + exact confirmation)",
+    );
+    assert_eq!(
+        delete_delta, 1,
+        "a successful enrolled write must delete its confirmed sidecar once",
     );
 }
 

@@ -1172,12 +1172,10 @@ async fn recovery_ensure_indices_steady_state_no_sidecar() {
 /// `count_rows == 0 → return false` short-circuit in `needs_index_work_*`
 /// is what makes this work.
 ///
-/// A stronger assertion that captured the sidecar mid-flight and verified
-/// the persisted JSON omits empty tables would require bypassing
-/// `load_jsonl` (which auto-builds indices via
-/// `prepare_updates_for_commit`); pinning that with a unit test on the
-/// helpers directly would require bootstrapping an engine plus raw Lance
-/// writes — left as a follow-up.
+/// A stronger assertion that captured the sidecar after arming but before the
+/// first index effect could inspect the persisted pin set directly. That needs
+/// a dedicated pre-effect EnsureIndices rendezvous; the current failpoint is
+/// after its effects, so this remains an end-to-end behavioral assertion.
 #[tokio::test]
 async fn recovery_ensure_indices_handles_empty_tables() {
     let dir = tempfile::tempdir().unwrap();
