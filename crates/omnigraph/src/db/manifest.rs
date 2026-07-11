@@ -38,10 +38,12 @@ use namespace::{branch_manifest_namespace, staged_table_namespace};
 pub(crate) use publisher::{GraphHeadExpectation, LineageIntent, PublishPrecondition};
 use publisher::{GraphNamespacePublisher, ManifestBatchPublisher, PublishOutcome};
 pub(crate) use recovery::{
-    HealPendingOutcome, RecoveryAuthorityToken, RecoveryLineageIntent, RecoveryMode,
-    RecoverySidecar, RecoverySidecarHandle, SidecarKind, SidecarTablePin, SidecarTableRegistration,
-    SidecarTombstone, confirm_occ_sidecar_phase_b, confirm_sidecar_phase_b, delete_sidecar,
-    has_schema_apply_sidecar, heal_pending_sidecars_roll_forward, list_sidecars, new_occ_sidecar,
+    HealPendingOutcome, RecoveryAuthorityToken, RecoveryBranchMergeEffect,
+    RecoveryBranchMergeEffectKind, RecoveryLineageIntent, RecoveryManifestDelta, RecoveryMode,
+    RecoverySidecar, RecoverySidecarHandle, RecoveryTableUpdateSlot, SidecarKind, SidecarTablePin,
+    SidecarTableRegistration, SidecarTombstone, confirm_branch_merge_sidecar_phase_b,
+    confirm_occ_sidecar_phase_b, delete_sidecar, has_schema_apply_sidecar,
+    heal_pending_sidecars_roll_forward, list_sidecars, new_branch_merge_sidecar, new_occ_sidecar,
     new_sidecar, recover_manifest_drift, schema_apply_serial_queue_key, write_sidecar,
 };
 pub use state::SubTableEntry;

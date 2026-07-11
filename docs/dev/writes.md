@@ -75,38 +75,55 @@ The native branch identifier detects delete/recreate ABA but is not a Lance
 conditional-ref fence, and destructive recovery remains unsafe beside a live
 foreign process.
 
-### Branch-merge authority fence (adapter bridge)
+### Branch-merge authority and recovery adapter (RFC-022 v4)
 
-Branch merge still uses its writer-specific multi-commit table effects and
-confirmation sidecar; it has not yet been converted to the RFC-022 exact-effect
-adapter. It does, however, join the closed control boundary needed by this first
-slice: after the strict recovery barrier it acquires the root-shared schema gate
-and the sorted source/target branch gates, performs the final sidecar check,
-loads one operation-local catalog from the accepted contract, captures both graph
-heads plus the base/source/target snapshots, and holds those gates through table
-effects and manifest publication. Planning stays outside table queues. Before
-Phase A, merge acquires the conservative all-catalog table envelope for both
-source and target, re-lists sidecars, and compares fresh source/target manifest
-versions with the captured snapshots. A stale warm handle catalog or coordinator
-snapshot is never accepted as that revalidation.
+Branch merge retains its writer-specific row classifier and multi-commit table
+algorithms, but its authority, recovery, and visibility boundary now use the
+RFC-022 adapter contract:
 
-The source snapshot is a captured merge input, not authority that the target
-manifest CAS can arbitrate. The current process-local source gate is a stronger
-same-process fence around that capture, including delete/recreate ABA, but the
-semantic contract is still "merge the captured source commit." A later source
-advance does not invalidate an otherwise prepared target publish. Claiming
-"latest source at target publish" would instead require a cross-process source
-fence held through the target CAS.
+1. capture source and target as coherent `WriteTxn` snapshots. The target token
+   is `(BranchIdentifier, exact optional graph_head, accepted schema identity)`;
+   the effective lineage head is captured separately because a fresh named
+   branch can inherit a parent while its own `graph_head:<branch>` row is absent;
+2. compute the merge base from those captured commit ids and classify against
+   the immutable base/source/target snapshots outside table gates;
+3. acquire the conservative all-catalog source/target table envelope, re-list
+   recovery intent, revalidate the complete target token, and revalidate the
+   source incarnation. A target change returns typed `ReadSetChanged` before
+   effects. A later source-head advance is allowed: the contract is "merge the
+   captured source commit," never "substitute whatever source is latest";
+4. pre-mint the merge lineage and each table's ordered Lance data-transaction
+   chain, then arm a schema-v4 BranchMerge sidecar before the first HEAD advance
+   or first-touch table ref. Logical data steps commit with those exact
+   `(read_version, uuid)` identities and zero transparent conflict retries. Its
+   physical-effect set can be smaller than its intended manifest delta:
+   pointer-only table updates are still recorded so recovery publishes the
+   complete logical merge;
+5. after every multi-commit table effect completes, confirm exact final table
+   versions, every logical `SubTableUpdate`, and every first-touch target
+   `BranchIdentifier`; then publish once with `ExactGraphHead` and the captured
+   table expectations.
 
-That fence prevents a same-process target delete/recreate from reusing the branch
-name underneath a merge plan. The race test deliberately recreates a target with
-the same name and numeric Lance version but a different `BranchIdentifier`, so
-version-only checking cannot accidentally satisfy it. This is a process-local
-bridge, not a cross-process conditional-ref primitive and not a substitute for
-the later full branch-merge read-set/reprepare adapter. `sync_branch` joins the
-same root schema gate before replacing a handle's coordinator, so it cannot
-overwrite merge's temporary target coordinator or change a native control's
-active-branch authority mid-operation.
+Publisher retries cannot re-parent the prepared merge onto a newer target. Any
+failure after the v4 sidecar is durable returns `RecoveryRequired`. Full recovery
+rolls confirmed effects forward only while the captured target authority still
+matches; otherwise it compensates the owned effects while preserving the target
+winner, or fails closed when foreign/interleaved table state makes compensation
+unverifiable. An Armed first-touch ref with no data HEAD movement is reclaimed
+without manufacturing rollback lineage. Armed recovery accepts only a
+contiguous prefix of the pre-minted data chain. Rebuildable `CreateIndex`
+transactions may follow only the complete chain and are rollback-discardable
+derived state; any other, unreadable, or non-contiguous transaction fails
+closed. A compensating Lance `Restore` is also recognized by its exact target so
+a crash after restore but before the manifest publish resumes without restoring
+again.
+
+The handle-local coordinator swap and `merge_exclusive` mutex remain an
+implementation detail until target-context extraction lands; neither is treated
+as persistent authority. Native ref create/delete still lack conditional CAS, so
+first-touch destructive recovery retains the documented single-writer-process
+boundary. `sync_branch` continues to join the schema gate and cannot replace the
+temporary coordinator during a merge.
 
 ### Branch-delete orphaning exception
 
@@ -334,16 +351,19 @@ are left at `Lance HEAD = manifest_pinned + 1`.
    post_commit_pin)` it intends to commit + the writer kind +
    actor_id.
    For a first-touch named-branch Mutation/Load table, Phase A is followed by
-   target-ref creation and branch-local `stage_*`; the sidecar already carries
-   its pre-minted transaction identity.
+   target-ref creation and branch-local `stage_*`; the schema-v3 sidecar already
+   carries its pre-minted transaction identity. Branch merge uses schema v4:
+   it distinguishes multi-commit HEAD effects from ref-only forks, records each
+   multi-commit effect's ordered exact transaction chain, and records the
+   complete intended manifest delta, including pointer-only slots.
 2. **Phase B**: writer's per-table `commit_staged` loop runs.
-   - **Phase-B confirmation:** a `BranchMerge` writer
-     advances each table's HEAD by *several* commits (append → upsert →
-     delete), so a bare "HEAD moved" is ambiguous — it could be a complete
-     publish or one crashed mid-sequence. After the whole per-table loop
-     finishes, the writer re-writes the sidecar stamping each pin's
-     `confirmed_version` with the exact achieved version, then proceeds to
-     Phase C. Schema-v3 Mutation/Load sidecars also confirm: each table must
+   - **Phase-B confirmation:** a schema-v4 `BranchMerge` writer
+     advances each table's HEAD by *several* exact commits (append → upsert →
+     delete). Recovery proves a contiguous prefix of the pre-armed transaction
+     chain rather than inferring ownership from numeric HEAD movement. After the
+     whole per-table loop finishes, the writer atomically confirms each exact
+     achieved version, the complete logical manifest delta, and first-touch ref
+     identities, then proceeds to Phase C. Schema-v3 Mutation/Load sidecars also confirm: each table must
      match the staged Lance transaction's `(read_version, uuid)`, and the
      sidecar records the exact `SubTableUpdate` plus original lineage intent.
      This is the commit point of the recovery WAL: a crash *after* confirmation
@@ -371,9 +391,16 @@ recovery sweep in `crates/omnigraph/src/db/manifest/recovery.rs`:
   Lance HEAD to the manifest pin. Classify per the all-or-nothing
   decision tree (RolledPastExpected / NoMovement / UnexpectedAtP1 /
   UnexpectedMultistep / IncompletePhaseB / InvariantViolation). For a
-  `BranchMerge` sidecar, a moved HEAD with no `confirmed_version` classifies
-  as `IncompletePhaseB` (a partial multi-commit publish) and forces roll-back;
-  with a `confirmed_version`, roll-forward targets exactly that version.
+  legacy `BranchMerge` sidecar, a moved HEAD with no `confirmed_version`
+  classifies as `IncompletePhaseB` (a partial multi-commit publish) and forces
+  roll-back; with a `confirmed_version`, roll-forward targets exactly that
+  version. Schema-v4 BranchMerge recovery additionally requires the captured
+  target token, fixed original/rollback lineage ids, the exact ordered data
+  transaction chains, exact confirmed physical effects, first-touch ref
+  identities, and the complete confirmed manifest delta. A changed target token
+  is rollback-only and can never re-parent the merge onto the winner. Recovery
+  refuses a foreign or non-contiguous transaction instead of restoring through
+  it, and recognizes an already-landed exact compensation restore on restart.
   Schema-v3 Mutation/Load additionally requires `EffectsConfirmed`, the exact
   Lance transaction identity at the confirmed version, the original immutable
   manifest delta, and a matching captured authority token. A changed token is
@@ -411,9 +438,10 @@ recovery sweep in `crates/omnigraph/src/db/manifest/recovery.rs`:
 - After a successful roll-forward or roll-back, an internal
   `_graph_commit_recoveries.lance` row records `recovery_kind`,
   `recovery_for_actor` (the original sidecar's actor), `operation_id`, and
-  exact per-table outcomes. A v3 roll-forward publishes the interrupted
-  writer's fixed lineage intent, including its original actor; rollback and
-  legacy recovery commits use `actor_id = "omnigraph:recovery"`. Ordinary
+  exact per-table outcomes. Schema-v3 Mutation/Load and schema-v4 BranchMerge
+  roll-forward publish the interrupted writer's fixed lineage intent,
+  including its original actor; rollback and legacy recovery commits use
+  `actor_id = "omnigraph:recovery"`. Ordinary
   commit history is therefore not a complete recovery enumeration, and the
   CLI currently has no public query for the recovery-audit table.
 - Sidecar deleted as the final step.
@@ -469,7 +497,7 @@ guard says so explicitly ("a pending recovery sidecar requires
 rollback — reopen the graph read-write") instead of pointing at
 `omnigraph repair`, which refuses while a sidecar is pending.
 `cleanup` refuses pending sidecars at entry as well, before orphan reconciliation
-or version GC: v3 ownership and compensation recovery may need the retained
+or version GC: v3/v4 ownership and compensation recovery may need the retained
 Lance transaction/version history, so garbage collection cannot outrun the
 recovery barrier.
 Continuous in-process recovery for the rollback path is the goal of a
@@ -477,15 +505,16 @@ future background reconciler. `ensure_indices` does not heal at entry itself;
 it is an explicit maintenance/reconciliation call, separate from mutation,
 load, and schema apply, and its strict preconditions fail loudly on drift.
 
-For enrolled mutation/load, the publisher rechecks the attempt's exact native
-branch identity and `graph_head` as well as the touched-table versions. A
+For enrolled mutation/load and branch merge, the publisher rechecks the
+attempt's exact native branch identity and `graph_head` as well as table
+expectations. A
 concurrent graph commit anywhere on the target branch therefore invalidates the
 prepared authority instead of silently reparenting it. Before effects, an
 insert-only mutation or Append/Merge load fully reprepares with a bounded retry; strict
-Update/Delete/Overwrite returns `ReadSetChanged`; after any effect, any later
-error returns `RecoveryRequired` and leaves the fixed v3 intent durable. Legacy
-writers still arbitrate only their explicit touched-table expectations until
-their adapters are enrolled.
+Update/Delete/Overwrite and branch merge return `ReadSetChanged`; after any
+effect, any later error returns `RecoveryRequired` and leaves the fixed v3/v4
+intent durable. Schema apply and optimize/index remain on their writer-specific
+arbitration until their adapters are enrolled.
 
 **Sidecar I/O failure semantics** (all sidecar I/O goes through the
 backend-generic `StorageAdapter`; the contracts below are pinned by the

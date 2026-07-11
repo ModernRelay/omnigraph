@@ -694,14 +694,19 @@ Implementation proceeds in this order:
    > **Implementation note (2026-07-11):** mutation/load now use this coarse
    > token, schema-v3 exact-effect sidecars, fixed lineage/rollback outcome ids,
    > zero transparent Lance commit retries, and bounded full reprepare before
-   > effects. Branch merge remains on its writer-specific multi-commit path, but
-   > now holds the root-shared schema plus source/target branch gates from its
-   > strict recovery barrier and authority capture through publication. It plans
-   > with an accepted-contract catalog captured under that schema gate, then
-   > acquires all catalog table gates for source and target, re-lists recovery,
-   > and compares fresh manifest versions before Phase A. This closes
-   > same-process delete/recreate ABA and legacy table-only-writer races while
-   > its full exact-effect adapter remains future work. Schema apply,
+   > effects. Branch merge now captures an immutable source commit/snapshot and
+   > the target coarse token, computes its merge base from those captured ids,
+   > and revalidates target authority plus source incarnation under the ordered
+   > gates. Its schema-v4 recovery envelope distinguishes multi-commit HEAD
+   > effects from first-touch ref-only forks, persists an ordered pre-minted
+   > Lance transaction chain for every logical data effect plus fixed
+   > merge/rollback lineage, and confirms the complete manifest delta (including
+   > pointer-only slots) before publishing with `ExactGraphHead`. Those data
+   > transactions commit with zero transparent conflict retries; recovery accepts
+   > only their contiguous exact prefix (plus a derived `CreateIndex` tail after
+   > the complete chain) and fails closed on foreign movement. A pre-effect target change
+   > returns `ReadSetChanged`; any post-arm failure returns `RecoveryRequired`
+   > and recovery never re-parents onto a target winner. Schema apply,
    > optimize/index, and MemWAL fold remain on their writer-specific paths until
    > their adapter slices land.
 

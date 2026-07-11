@@ -16,8 +16,9 @@ pub enum RecoveryExpectation {
     RolledForward {
         tables: Vec<TableExpectation>,
     },
-    /// Protocol-v3 mutation/load recovery republishes the writer's fixed
-    /// lineage intent rather than minting a synthetic recovery commit.
+    /// RFC-022 v3 mutation/load and v4 branch-merge recovery republish the
+    /// writer's fixed lineage intent rather than minting a synthetic recovery
+    /// commit.
     RolledForwardOriginalLineage {
         tables: Vec<TableExpectation>,
     },

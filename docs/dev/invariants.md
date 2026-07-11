@@ -258,10 +258,15 @@ them explicit.
   schema-apply lock branch) — design it before promoting multi-process write
   topologies.
 - **Fork ownership is durable, but Lance ref deletion is not conditional:** a
-  first-touch Mutation/Load table no longer creates its target ref while
-  preparing. Under schema → branch → table gates it revalidates, durably arms a
-  schema-v3 sidecar naming the target, creates the ref, then stages branch-local
-  files and commits. Both `reclaim_orphaned_fork_and_refork` and
+  first-touch Mutation/Load or BranchMerge table never creates its target ref
+  before recovery ownership is durable. Under schema → branch → table gates it
+  revalidates and arms a schema-v3 mutation/load or schema-v4 merge sidecar
+  naming the target; branch merge additionally records the exact fork version
+  and a pre-minted ordered transaction chain for every logical data effect,
+  commits that chain without transparent conflict retries, and confirms the
+  minted target `BranchIdentifier`. Recovery proves the exact chain rather than
+  treating numeric HEAD movement as ownership. Both
+  `reclaim_orphaned_fork_and_refork` and
   `reconcile_orphaned_branches` consult pending sidecars before destruction; a
   foreign claim is conflict/indeterminate, never permission to delete. Full
   recovery accepts sidecar-before-ref crashes. When `BranchContents` is absent,

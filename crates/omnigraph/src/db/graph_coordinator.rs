@@ -447,30 +447,6 @@ impl GraphCoordinator {
         })
     }
 
-    /// Publish a branch-merge: `updates` (the merged table versions) plus the
-    /// merge commit, in one manifest CAS (RFC-013 Phase 7). The merge commit's
-    /// merged-in parent is `merged_parent_commit_id` (the source head, stable);
-    /// its first parent is resolved by the publisher as the current target-branch
-    /// head — the live head, which is the post-merge correct parent even if the
-    /// target advanced since the merge began.
-    pub(crate) async fn commit_merge_with_actor(
-        &mut self,
-        updates: &[SubTableUpdate],
-        merged_parent_commit_id: &str,
-        actor_id: Option<&str>,
-    ) -> Result<SnapshotId> {
-        let intent =
-            self.new_lineage_intent(actor_id, Some(merged_parent_commit_id.to_string()))?;
-        failpoints::maybe_fail(crate::failpoints::names::GRAPH_PUBLISH_BEFORE_COMMIT_APPEND)?;
-        let changes = updates_to_changes(updates);
-        let outcome = self
-            .manifest
-            .commit_changes_with_lineage(&changes, &HashMap::new(), Some(&intent))
-            .await?;
-        failpoints::maybe_fail(crate::failpoints::names::GRAPH_PUBLISH_AFTER_MANIFEST_COMMIT)?;
-        Ok(self.apply_lineage_to_cache(intent, &outcome))
-    }
-
     /// Mint a [`LineageIntent`] for the next commit on the current branch: a
     /// fresh ULID (stable across the publisher's CAS retries) and a timestamp.
     /// The parent is NOT chosen here — the publisher resolves it per attempt

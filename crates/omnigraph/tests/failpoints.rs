@@ -12,7 +12,7 @@ use serial_test::serial;
 
 use helpers::recovery::{
     FollowUpMutation, RecoveryExpectation, TableExpectation, assert_post_recovery_invariants,
-    branch_head_commit_id, single_sidecar_operation_id,
+    branch_head_commit_id, recovery_audit_kinds, single_sidecar_operation_id,
 };
 use helpers::{
     MUTATION_QUERIES, collect_column_strings, count_rows, mixed_params, mutate_main, params,
@@ -5176,11 +5176,9 @@ async fn branch_merge_phase_b_failure_recovered_on_next_open() {
     let uri = dir.path().to_str().unwrap().to_string();
 
     // Seed main with a row, branch off, mutate BOTH sides so the merge
-    // produces at least one `RewriteMerged` candidate (target moved past
-    // base too — required for the recovery sidecar to pin anything; the
-    // sidecar only pins RewriteMerged candidates because they're the
-    // only path that always advances Lance HEAD via
-    // `publish_rewritten_merge_table`).
+    // produces a `RewriteMerged` candidate (target moved past base too). The
+    // v4 sidecar records its exact planned data transactions and any contiguous
+    // derived-index tail before publishing the complete logical delta.
     {
         let mut db = Omnigraph::init(&uri, helpers::TEST_SCHEMA).await.unwrap();
         load_jsonl(
@@ -5246,12 +5244,9 @@ async fn branch_merge_phase_b_failure_recovered_on_next_open() {
         );
     }
 
-    // Recovery: reopen runs the sweep. BranchMerge uses LOOSE
-    // classification — `publish_rewritten_merge_table` runs multiple
-    // commit_staged calls per table (stage_merge_insert + stage_delete +
-    // index rebuilds), so post_commit_pin in the sidecar is a lower
-    // bound; the loose-match classifier accepts any HEAD > expected_version
-    // when expected_version == manifest_pinned.
+    // Recovery: reopen proves the v4 sidecar's exact planned transaction chain,
+    // accepts only its contiguous derived CreateIndex suffix, and publishes the
+    // confirmed final version plus fixed lineage and complete manifest delta.
     let db = Omnigraph::open(&uri).await.unwrap();
 
     let recovery_dir = dir.path().join("__recovery");
@@ -5303,6 +5298,931 @@ async fn branch_merge_phase_b_failure_recovered_on_next_open() {
         );
     }
     drop(db);
+}
+
+/// The v4 recovery delta is wider than its physical pin set. A mixed merge can
+/// rewrite one table while another table needs only a manifest pointer switch;
+/// recovery must publish both under the original merge lineage.
+#[tokio::test]
+#[serial(branch_merge_phase_b)]
+async fn branch_merge_recovery_replays_pointer_slots_with_fixed_lineage() {
+    let _scenario = FailScenario::setup();
+    let dir = tempfile::tempdir().unwrap();
+    let uri = dir.path().to_str().unwrap().to_string();
+    let db = helpers::init_and_load(&dir).await;
+    db.branch_create("target").await.unwrap();
+
+    // Main is the source. Advance Person and Company after target forked;
+    // target independently advances Person. Person therefore needs a physical
+    // three-way rewrite, while Company is a source-on-main pointer adoption.
+    db.mutate(
+        "main",
+        MUTATION_QUERIES,
+        "insert_person",
+        &mixed_params(&[("$name", "source-main-person")], &[("$age", 51)]),
+    )
+    .await
+    .unwrap();
+    db.mutate(
+        "main",
+        OCC_DISJOINT_MUTATIONS,
+        "insert_company",
+        &params(&[("$name", "source-main-company")]),
+    )
+    .await
+    .unwrap();
+    db.mutate(
+        "target",
+        MUTATION_QUERIES,
+        "insert_person",
+        &mixed_params(&[("$name", "target-person")], &[("$age", 52)]),
+    )
+    .await
+    .unwrap();
+    let source_head = branch_head_commit_id(dir.path(), "main").await.unwrap();
+    let target_parent = branch_head_commit_id(dir.path(), "target").await.unwrap();
+
+    let error = {
+        let _failpoint = ScopedFailPoint::new(
+            names::BRANCH_MERGE_POST_PHASE_B_PRE_MANIFEST_COMMIT,
+            "return",
+        );
+        db.branch_merge_as("main", "target", Some("merge-author"))
+            .await
+            .unwrap_err()
+    };
+    let operation_id = match error {
+        OmniError::RecoveryRequired { operation_id, .. } => operation_id,
+        other => panic!("confirmed mixed merge must retain recovery ownership: {other}"),
+    };
+    let sidecar_path = dir
+        .path()
+        .join("__recovery")
+        .join(format!("{operation_id}.json"));
+    let sidecar: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(&sidecar_path).unwrap()).unwrap();
+    let fixed_commit_id = sidecar["protocol_v4"]["lineage"]["graph_commit_id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    let delta_keys = sidecar["protocol_v4"]["intended_delta"]["table_updates"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|slot| slot["table_key"].as_str().unwrap())
+        .collect::<std::collections::HashSet<_>>();
+    let effect_keys = sidecar["protocol_v4"]["effects"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|effect| effect["table_key"].as_str().unwrap())
+        .collect::<std::collections::HashSet<_>>();
+    assert_eq!(
+        delta_keys,
+        std::collections::HashSet::from(["node:Person", "node:Company"])
+    );
+    assert_eq!(
+        effect_keys,
+        std::collections::HashSet::from(["node:Person"]),
+        "pointer-only Company must be in the logical delta but not physical pins"
+    );
+    drop(db);
+
+    let recovered = Omnigraph::open(&uri).await.unwrap();
+    assert!(!sidecar_path.exists());
+    let people = collect_column_strings(
+        &helpers::read_table_branch(&recovered, "target", "node:Person").await,
+        "name",
+    );
+    assert!(people.iter().any(|name| name == "source-main-person"));
+    assert!(people.iter().any(|name| name == "target-person"));
+    let companies = collect_column_strings(
+        &helpers::read_table_branch(&recovered, "target", "node:Company").await,
+        "name",
+    );
+    assert!(companies.iter().any(|name| name == "source-main-company"));
+
+    let recovered_head = branch_head_commit_id(dir.path(), "target").await.unwrap();
+    assert_eq!(recovered_head, fixed_commit_id);
+    let commit = recovered.get_commit(&recovered_head).await.unwrap();
+    assert_eq!(
+        commit.parent_commit_id.as_deref(),
+        Some(target_parent.as_str())
+    );
+    assert_eq!(
+        commit.merged_parent_commit_id.as_deref(),
+        Some(source_head.as_str())
+    );
+    assert_eq!(commit.actor_id.as_deref(), Some("merge-author"));
+}
+
+/// Phase D is outside the logical commit boundary. If deleting a confirmed v4
+/// sidecar fails after the exact merge commit is already visible, the merge
+/// still succeeds. The next open must recognize that fixed outcome, append only
+/// its recovery audit, and retire the stale artifact without publishing a
+/// second graph commit or changing any lineage field.
+#[tokio::test]
+#[serial]
+#[serial(branch_merge_phase_b)]
+async fn branch_merge_sidecar_delete_failure_finalizes_visible_fixed_lineage_once() {
+    let _scenario = FailScenario::setup();
+    let dir = tempfile::tempdir().unwrap();
+    let (uri, _) = setup_diverged_merge_branches(&dir).await;
+    let db = Omnigraph::open(&uri).await.unwrap();
+    let source_head = branch_head_commit_id(dir.path(), "source").await.unwrap();
+    let target_parent = branch_head_commit_id(dir.path(), "target").await.unwrap();
+
+    let outcome = {
+        let _failpoint = ScopedFailPoint::new(names::RECOVERY_SIDECAR_DELETE, "return");
+        db.branch_merge_as("source", "target", Some("phase-d-actor"))
+            .await
+            .expect("Phase-D sidecar deletion failure must not fail a visible merge")
+    };
+    assert_eq!(outcome, omnigraph::db::MergeOutcome::Merged);
+
+    let operation_id = single_sidecar_operation_id(dir.path());
+    let sidecar_path = dir
+        .path()
+        .join("__recovery")
+        .join(format!("{operation_id}.json"));
+    let sidecar: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(&sidecar_path).unwrap()).unwrap();
+    let fixed_commit_id = sidecar["protocol_v4"]["lineage"]["graph_commit_id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    let fixed_created_at = sidecar["protocol_v4"]["lineage"]["created_at"]
+        .as_i64()
+        .unwrap();
+    assert_eq!(
+        branch_head_commit_id(dir.path(), "target").await.unwrap(),
+        fixed_commit_id,
+        "the writer must already have published the sidecar's fixed commit"
+    );
+    let commits_before_reopen = db.list_commits(Some("target")).await.unwrap().len();
+    assert!(
+        recovery_audit_kinds(dir.path()).await.is_empty(),
+        "the writer does not append a recovery audit before stale-sidecar finalization"
+    );
+    drop(db);
+
+    let recovered = Omnigraph::open(&uri).await.unwrap();
+    assert!(!sidecar_path.exists());
+    let recovered_head = branch_head_commit_id(dir.path(), "target").await.unwrap();
+    assert_eq!(recovered_head, fixed_commit_id);
+    let recovered_commit = recovered.get_commit(&recovered_head).await.unwrap();
+    assert_eq!(
+        recovered_commit.parent_commit_id.as_deref(),
+        Some(target_parent.as_str())
+    );
+    assert_eq!(
+        recovered_commit.merged_parent_commit_id.as_deref(),
+        Some(source_head.as_str())
+    );
+    assert_eq!(recovered_commit.actor_id.as_deref(), Some("phase-d-actor"));
+    assert_eq!(recovered_commit.created_at, fixed_created_at);
+    assert_eq!(
+        recovered.list_commits(Some("target")).await.unwrap().len(),
+        commits_before_reopen,
+        "stale-sidecar finalization must not publish a second graph commit"
+    );
+    assert_eq!(
+        recovery_audit_kinds(dir.path())
+            .await
+            .into_iter()
+            .filter(|kind| kind == "RolledForward")
+            .count(),
+        1,
+        "the visible fixed outcome must have exactly one recovery audit row"
+    );
+
+    drop(recovered);
+    let reopened = Omnigraph::open(&uri).await.unwrap();
+    assert_eq!(
+        reopened.list_commits(Some("target")).await.unwrap().len(),
+        commits_before_reopen,
+        "a second reopen must remain a lineage no-op"
+    );
+    assert_eq!(
+        recovery_audit_kinds(dir.path())
+            .await
+            .into_iter()
+            .filter(|kind| kind == "RolledForward")
+            .count(),
+        1,
+        "a second reopen must not duplicate the audit row"
+    );
+}
+
+/// A merge plan is classified against one exact target graph head. Advancing
+/// that head after every table effect is confirmed but before the manifest CAS
+/// must not silently re-parent the stale merge. This uses the queue-bypassing
+/// test seam to model a writer in another process: ordinary `Omnigraph`
+/// handles share the root-scoped gates and therefore cannot exercise the
+/// persistent-authority boundary.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[serial(branch_merge_phase_b)]
+async fn branch_merge_post_effect_target_advance_requires_recovery_and_preserves_winner() {
+    let _scenario = FailScenario::setup();
+    let dir = tempfile::tempdir().unwrap();
+    let (uri, main_rows) = setup_diverged_merge_branches(&dir).await;
+    {
+        let db = Omnigraph::open(&uri).await.unwrap();
+        db.mutate(
+            "target",
+            OCC_DISJOINT_MUTATIONS,
+            "insert_company",
+            &params(&[("$name", "target-winner-company")]),
+        )
+        .await
+        .unwrap();
+    }
+    let merge_db = std::sync::Arc::new(Omnigraph::open(&uri).await.unwrap());
+    let mut target_winner = Omnigraph::open(&uri).await.unwrap();
+    let source_head = branch_head_commit_id(dir.path(), "source").await.unwrap();
+
+    let merge_rv = helpers::failpoint::Rendezvous::park_first(
+        names::BRANCH_MERGE_POST_PHASE_B_PRE_MANIFEST_COMMIT,
+    );
+    let merge_handle = std::sync::Arc::clone(&merge_db);
+    let merge_task = tokio::spawn(async move {
+        merge_handle.branch_merge("source", "target").await
+    });
+    merge_rv.wait_until_reached().await;
+
+    // Publish a logically redundant Company pin directly on the target. The
+    // table is disjoint from the merge's Person effect, but the graph lineage
+    // still advances, invalidating the merge's coarse target authority token.
+    // The test-only seam deliberately bypasses the process-local queues.
+    let company_uri = node_table_uri(&uri, "Company");
+    let mut raw_company = lance::Dataset::open(&company_uri)
+        .await
+        .unwrap()
+        .checkout_branch("target")
+        .await
+        .unwrap();
+    helpers::lance_delete_inline(&mut raw_company, "1 = 2").await;
+    target_winner
+        .failpoint_publish_table_head_without_index_rebuild_for_test(
+            "target",
+            "node:Company",
+            Some("target"),
+        )
+        .await
+        .unwrap();
+    let winner_head = branch_head_commit_id(dir.path(), "target").await.unwrap();
+    merge_rv.release();
+
+    let error = merge_task
+        .await
+        .unwrap()
+        .expect_err("a post-effect target advance must reject the stale merge publish");
+    let operation_id = match error {
+        OmniError::RecoveryRequired { operation_id, .. } => operation_id,
+        other => panic!("expected RecoveryRequired after merge effects, got {other}"),
+    };
+
+    let sidecar_path = dir
+        .path()
+        .join("__recovery")
+        .join(format!("{operation_id}.json"));
+    let sidecar: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(&sidecar_path).unwrap()).unwrap();
+    assert_eq!(sidecar["schema_version"], 4);
+    assert_eq!(
+        sidecar["protocol_v4"]["lineage"]["merged_parent_commit_id"],
+        source_head.as_str(),
+        "recovery must retain the captured source commit as the merge parent"
+    );
+
+    drop(merge_db);
+    drop(target_winner);
+
+    // Full recovery sees that target authority changed. It must preserve the
+    // winning graph commit and compensate only the unpublished merge effects.
+    let recovered = Omnigraph::open(&uri).await.unwrap();
+    assert!(
+        !sidecar_path.exists(),
+        "successful compensation must retire the merge recovery intent"
+    );
+    assert_eq!(
+        helpers::count_rows_branch(&recovered, "target", "node:Person").await,
+        main_rows + 1,
+        "recovery must restore the pre-merge target image"
+    );
+    let target_names = collect_column_strings(
+        &helpers::read_table_branch(&recovered, "target", "node:Person").await,
+        "name",
+    );
+    assert!(target_names.iter().any(|name| name == "old-target-only"));
+    assert!(!target_names.iter().any(|name| name == "source-only"));
+
+    let recovered_head = branch_head_commit_id(dir.path(), "target").await.unwrap();
+    let recovered_commit = recovered.get_commit(&recovered_head).await.unwrap();
+    assert_eq!(
+        recovered_commit.parent_commit_id.as_deref(),
+        Some(winner_head.as_str()),
+        "rollback lineage must descend from, never replace, the target winner"
+    );
+}
+
+/// If a foreign writer advances and publishes the SAME target table after the
+/// merge's confirmed effect, that effect is buried under foreign state. Full
+/// recovery must fail closed instead of restoring through the winner or
+/// adopting the newer numeric HEAD as this merge's output.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[serial(branch_merge_phase_b)]
+async fn branch_merge_post_effect_same_table_advance_fails_closed() {
+    let _scenario = FailScenario::setup();
+    let dir = tempfile::tempdir().unwrap();
+    let (uri, _) = setup_diverged_merge_branches(&dir).await;
+    let merge_db = std::sync::Arc::new(Omnigraph::open(&uri).await.unwrap());
+    let mut target_winner = Omnigraph::open(&uri).await.unwrap();
+    let merge_rv = helpers::failpoint::Rendezvous::park_first(
+        names::BRANCH_MERGE_POST_PHASE_B_PRE_MANIFEST_COMMIT,
+    );
+
+    let merge_handle = std::sync::Arc::clone(&merge_db);
+    let merge_task = tokio::spawn(async move {
+        merge_handle.branch_merge("source", "target").await
+    });
+    merge_rv.wait_until_reached().await;
+
+    let person_uri = node_table_uri(&uri, "Person");
+    let mut raw_target = lance::Dataset::open(&person_uri)
+        .await
+        .unwrap()
+        .checkout_branch("target")
+        .await
+        .unwrap();
+    helpers::lance_delete_inline(&mut raw_target, "1 = 2").await;
+    let winner_lance_head = raw_target.version().version;
+    target_winner
+        .failpoint_publish_table_head_without_index_rebuild_for_test(
+            "target",
+            "node:Person",
+            Some("target"),
+        )
+        .await
+        .unwrap();
+    let winner_manifest_version = helpers::version_branch(&target_winner, "target")
+        .await
+        .unwrap();
+    merge_rv.release();
+
+    let operation_id = match merge_task.await.unwrap().unwrap_err() {
+        OmniError::RecoveryRequired { operation_id, .. } => operation_id,
+        other => panic!("same-table post-effect contention must require recovery: {other}"),
+    };
+    let sidecar_path = dir
+        .path()
+        .join("__recovery")
+        .join(format!("{operation_id}.json"));
+    assert!(sidecar_path.exists());
+    drop(merge_db);
+
+    let error = match Omnigraph::open(&uri).await {
+        Ok(_) => panic!("Full recovery must refuse to restore through a same-table winner"),
+        Err(error) => error,
+    };
+    assert!(
+        error.to_string().contains("manifest pin changed")
+            || error.to_string().contains("foreign or unverifiable"),
+        "unexpected fail-closed error: {error}"
+    );
+    assert!(
+        sidecar_path.exists(),
+        "operator-owned intent must remain durable"
+    );
+    assert_eq!(
+        helpers::version_branch(&target_winner, "target")
+            .await
+            .unwrap(),
+        winner_manifest_version,
+        "failed recovery must not move the winning target manifest"
+    );
+    let lance_after_failed_recovery = lance::Dataset::open(&person_uri)
+        .await
+        .unwrap()
+        .checkout_branch("target")
+        .await
+        .unwrap()
+        .version()
+        .version;
+    assert_eq!(
+        lance_after_failed_recovery, winner_lance_head,
+        "fail-closed recovery must not restore through the winning Lance HEAD"
+    );
+}
+
+/// A v4 rollback is itself a recoverable multi-step write. If open restores an
+/// owned merge effect and then crashes before publishing that compensated HEAD,
+/// the next open must recognize the restore transaction, reuse it, and finish
+/// the fixed rollback once. Re-restoring forever would monotonically advance
+/// Lance HEAD while every read-write open remained wedged.
+#[tokio::test]
+#[serial]
+#[serial(branch_merge_phase_b)]
+async fn branch_merge_rollback_restarts_after_restore_before_publish() {
+    let _scenario = FailScenario::setup();
+    let dir = tempfile::tempdir().unwrap();
+    let (uri, main_rows) = setup_diverged_merge_branches(&dir).await;
+
+    // Give the target a disjoint owned table. After the merge reaches its
+    // confirmed Phase B, a no-op commit on this table advances target graph
+    // authority without burying the merge-owned Person HEAD, making safe
+    // compensation both necessary and possible.
+    let db = Omnigraph::open(&uri).await.unwrap();
+    db.mutate(
+        "target",
+        OCC_DISJOINT_MUTATIONS,
+        "insert_company",
+        &params(&[("$name", "rollback-winner-company")]),
+    )
+    .await
+    .unwrap();
+    let mut target_winner = Omnigraph::open(&uri).await.unwrap();
+
+    let operation_id = {
+        let _failpoint = ScopedFailPoint::new(
+            names::BRANCH_MERGE_POST_PHASE_B_PRE_MANIFEST_COMMIT,
+            "return",
+        );
+        match db.branch_merge("source", "target").await.unwrap_err() {
+            OmniError::RecoveryRequired { operation_id, .. } => operation_id,
+            other => panic!("confirmed merge must retain recovery ownership: {other}"),
+        }
+    };
+    let sidecar_path = dir
+        .path()
+        .join("__recovery")
+        .join(format!("{operation_id}.json"));
+    assert!(sidecar_path.exists());
+
+    let company_uri = node_table_uri(&uri, "Company");
+    let mut raw_company = lance::Dataset::open(&company_uri)
+        .await
+        .unwrap()
+        .checkout_branch("target")
+        .await
+        .unwrap();
+    helpers::lance_delete_inline(&mut raw_company, "1 = 2").await;
+    target_winner
+        .failpoint_publish_table_head_without_index_rebuild_for_test(
+            "target",
+            "node:Company",
+            Some("target"),
+        )
+        .await
+        .unwrap();
+    let winner_head = branch_head_commit_id(dir.path(), "target").await.unwrap();
+
+    let person_uri = node_table_uri(&uri, "Person");
+    let person_before_restore = lance::Dataset::open(&person_uri)
+        .await
+        .unwrap()
+        .checkout_branch("target")
+        .await
+        .unwrap()
+        .version()
+        .version;
+    drop(db);
+    drop(target_winner);
+
+    {
+        let _failpoint =
+            ScopedFailPoint::new(names::RECOVERY_POST_TABLE_RESTORE_PRE_PUBLISH, "return");
+        let error = match Omnigraph::open(&uri).await {
+            Ok(_) => panic!("recovery must stop after the injected table restore"),
+            Err(error) => error,
+        };
+        assert!(
+            error
+                .to_string()
+                .contains("recovery.post_table_restore_pre_publish"),
+            "unexpected interrupted-rollback error: {error}"
+        );
+    }
+    assert!(
+        sidecar_path.exists(),
+        "an interrupted rollback must retain its recovery intent"
+    );
+    assert_eq!(
+        branch_head_commit_id(dir.path(), "target").await.unwrap(),
+        winner_head,
+        "the rollback manifest publish must not occur before the failpoint"
+    );
+    assert!(
+        recovery_audit_kinds(dir.path()).await.is_empty(),
+        "an interrupted rollback must not claim a completed audit outcome"
+    );
+    let person_after_interrupted_restore = lance::Dataset::open(&person_uri)
+        .await
+        .unwrap()
+        .checkout_branch("target")
+        .await
+        .unwrap()
+        .version()
+        .version;
+    assert!(
+        person_after_interrupted_restore > person_before_restore,
+        "the fixture must durably restore Person before interrupting the manifest publish"
+    );
+
+    let recovered = Omnigraph::open(&uri)
+        .await
+        .expect("the next open must recognize and finish the interrupted compensation");
+    assert!(!sidecar_path.exists());
+    let person_after_recovery = lance::Dataset::open(&person_uri)
+        .await
+        .unwrap()
+        .checkout_branch("target")
+        .await
+        .unwrap()
+        .version()
+        .version;
+    assert_eq!(
+        person_after_recovery, person_after_interrupted_restore,
+        "restartable rollback must reuse the owned restore instead of restoring again"
+    );
+    assert_eq!(
+        helpers::count_rows_branch(&recovered, "target", "node:Person").await,
+        main_rows + 1
+    );
+    let target_names = collect_column_strings(
+        &helpers::read_table_branch(&recovered, "target", "node:Person").await,
+        "name",
+    );
+    assert!(target_names.iter().any(|name| name == "old-target-only"));
+    assert!(!target_names.iter().any(|name| name == "source-only"));
+    let rollback_head = branch_head_commit_id(dir.path(), "target").await.unwrap();
+    let rollback_commit = recovered.get_commit(&rollback_head).await.unwrap();
+    assert_eq!(
+        rollback_commit.parent_commit_id.as_deref(),
+        Some(winner_head.as_str())
+    );
+    assert_eq!(
+        recovery_audit_kinds(dir.path())
+            .await
+            .into_iter()
+            .filter(|kind| kind == "RolledBack")
+            .count(),
+        1
+    );
+
+    drop(recovered);
+    let _reopened = Omnigraph::open(&uri).await.unwrap();
+    let person_after_second_open = lance::Dataset::open(&person_uri)
+        .await
+        .unwrap()
+        .checkout_branch("target")
+        .await
+        .unwrap()
+        .version()
+        .version;
+    assert_eq!(person_after_second_open, person_after_recovery);
+    assert_eq!(
+        recovery_audit_kinds(dir.path())
+            .await
+            .into_iter()
+            .filter(|kind| kind == "RolledBack")
+            .count(),
+        1,
+        "a second open must not repeat rollback or its audit"
+    );
+}
+
+/// A pure first-touch/ref-only merge can reach EffectsConfirmed without any
+/// data HEAD movement. Recovery must validate the minted ref identity and roll
+/// the exact pointer delta forward, not discard it as an empty intent.
+#[tokio::test]
+#[serial(branch_merge_first_touch)]
+async fn branch_merge_confirmed_ref_only_effect_rolls_forward() {
+    let _scenario = FailScenario::setup();
+    let dir = tempfile::tempdir().unwrap();
+    let uri = dir.path().to_str().unwrap().to_string();
+    let db = helpers::init_and_load(&dir).await;
+    let main_rows = helpers::count_rows(&db, "node:Person").await;
+    db.branch_create("source").await.unwrap();
+    db.branch_create("target").await.unwrap();
+    db.mutate(
+        "source",
+        MUTATION_QUERIES,
+        "insert_person",
+        &mixed_params(&[("$name", "confirmed-ref-row")], &[("$age", 38)]),
+    )
+    .await
+    .unwrap();
+
+    let operation_id = {
+        let _failpoint = ScopedFailPoint::new(
+            names::BRANCH_MERGE_POST_PHASE_B_PRE_MANIFEST_COMMIT,
+            "return",
+        );
+        match db.branch_merge("source", "target").await.unwrap_err() {
+            OmniError::RecoveryRequired { operation_id, .. } => operation_id,
+            other => panic!("confirmed ref-only merge must retain recovery ownership: {other}"),
+        }
+    };
+    let sidecar_path = dir
+        .path()
+        .join("__recovery")
+        .join(format!("{operation_id}.json"));
+    let sidecar: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(&sidecar_path).unwrap()).unwrap();
+    assert_eq!(sidecar["protocol_v4"]["effect_phase"], "EffectsConfirmed");
+    assert!(!sidecar["protocol_v4"]["effects"][0]["kind"]["confirmed_branch_identifier"].is_null());
+    drop(db);
+
+    let recovered = Omnigraph::open(&uri).await.unwrap();
+    assert!(!sidecar_path.exists());
+    assert_eq!(
+        helpers::count_rows_branch(&recovered, "target", "node:Person").await,
+        main_rows + 1
+    );
+    let names = collect_column_strings(
+        &helpers::read_table_branch(&recovered, "target", "node:Person").await,
+        "name",
+    );
+    assert!(names.iter().any(|name| name == "confirmed-ref-row"));
+}
+
+/// RewriteMerged can append reconciler-owned CreateIndex commits after its
+/// pre-minted logical data transactions. An Armed crash in that derived tail is
+/// still rollback-only, but recovery must prove the exact planned transaction
+/// prefix and accept only the contiguous CreateIndex suffix rather than treating
+/// its larger numeric HEAD as foreign movement.
+#[tokio::test]
+#[serial]
+#[serial(branch_merge_phase_b)]
+async fn branch_merge_armed_index_tail_rolls_back_after_exact_transaction_prefix() {
+    use lance::index::DatasetIndexExt;
+    use omnigraph::table_store::TableStore;
+
+    let _scenario = FailScenario::setup();
+    let dir = tempfile::tempdir().unwrap();
+    let (uri, main_rows) = setup_diverged_merge_branches(&dir).await;
+    let mut db = Omnigraph::open(&uri).await.unwrap();
+    let person_uri = node_table_uri(&uri, "Person");
+
+    // Make the rewrite rebuild `id_idx` after its logical data transaction.
+    // Publish the dropped-index HEAD first so the merge's expected version and
+    // planned transaction chain are anchored to a fully consistent target.
+    let store = TableStore::new(&uri, test_session());
+    let mut target_person = store
+        .open_dataset_head(&person_uri, Some("target"))
+        .await
+        .unwrap();
+    target_person.drop_index("id_idx").await.unwrap();
+    let dropped_index_head = target_person.version().version;
+    db.failpoint_publish_table_head_without_index_rebuild_for_test(
+        "target",
+        "node:Person",
+        Some("target"),
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        db.snapshot_of(omnigraph::db::ReadTarget::branch("target"))
+            .await
+            .unwrap()
+            .entry("node:Person")
+            .unwrap()
+            .table_version,
+        dropped_index_head
+    );
+
+    let operation_id = {
+        let _failpoint =
+            ScopedFailPoint::new(names::BRANCH_MERGE_POST_EFFECTS_PRE_CONFIRM, "return");
+        match db.branch_merge("source", "target").await.unwrap_err() {
+            OmniError::RecoveryRequired { operation_id, .. } => operation_id,
+            other => panic!("Armed derived-tail failure must retain recovery ownership: {other}"),
+        }
+    };
+    let sidecar_path = dir
+        .path()
+        .join("__recovery")
+        .join(format!("{operation_id}.json"));
+    let sidecar: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(&sidecar_path).unwrap()).unwrap();
+    assert_eq!(sidecar["protocol_v4"]["effect_phase"], "Armed");
+    let person_pin = sidecar["tables"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|pin| pin["table_key"] == "node:Person")
+        .unwrap();
+    let expected_version = person_pin["expected_version"].as_u64().unwrap();
+    let person_effect = sidecar["protocol_v4"]["effects"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|effect| effect["table_key"] == "node:Person")
+        .unwrap();
+    let planned_transaction_count = person_effect["kind"]["planned_transactions"]
+        .as_array()
+        .unwrap()
+        .len();
+    assert!(
+        planned_transaction_count > 0,
+        "fixture must plan at least one logical Person transaction"
+    );
+    let raw_head_with_index_tail = store
+        .open_dataset_head(&person_uri, Some("target"))
+        .await
+        .unwrap()
+        .version()
+        .version;
+    assert!(
+        raw_head_with_index_tail > expected_version + planned_transaction_count as u64,
+        "raw HEAD {raw_head_with_index_tail} must include at least one CreateIndex tail after \
+         expected {expected_version} + {planned_transaction_count} planned transactions"
+    );
+    drop(db);
+
+    let recovered = Omnigraph::open(&uri)
+        .await
+        .expect("Full recovery must roll an exact Armed transaction+index tail back");
+    assert!(!sidecar_path.exists());
+    assert_eq!(
+        helpers::count_rows_branch(&recovered, "target", "node:Person").await,
+        main_rows + 1
+    );
+    let names = collect_column_strings(
+        &helpers::read_table_branch(&recovered, "target", "node:Person").await,
+        "name",
+    );
+    assert!(names.iter().any(|name| name == "old-target-only"));
+    assert!(!names.iter().any(|name| name == "source-only"));
+}
+
+/// Phase-B confirmation is an ownership proof, not a numeric HEAD stamp. A
+/// foreign logical Append can land after the merge's exact data transaction and
+/// before its retrying CreateIndex tail; Lance may validly rebase that index
+/// build over the Append, but the merge must not confirm or recover the foreign
+/// row as its own output.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[serial]
+#[serial(branch_merge_phase_b)]
+async fn branch_merge_confirmation_rejects_foreign_append_before_index_tail() {
+    use futures::TryStreamExt;
+    use lance::index::DatasetIndexExt;
+    use omnigraph::table_store::TableStore;
+
+    let _scenario = FailScenario::setup();
+    let dir = tempfile::tempdir().unwrap();
+    let (uri, _) = setup_diverged_merge_branches(&dir).await;
+    let mut db = Omnigraph::open(&uri).await.unwrap();
+
+    // Prepare one schema-exact row on an unrelated branch. Its RecordBatch can
+    // then be appended directly to target Lance HEAD without invoking any
+    // target manifest publisher or process-local write gate.
+    db.branch_create("foreign-seed").await.unwrap();
+    db.mutate(
+        "foreign-seed",
+        MUTATION_QUERIES,
+        "insert_person",
+        &mixed_params(&[("$name", "foreign-unpublished")], &[("$age", 61)]),
+    )
+    .await
+    .unwrap();
+    let foreign_batch = helpers::read_table_branch(&db, "foreign-seed", "node:Person")
+        .await
+        .into_iter()
+        .find_map(|batch| {
+            let names = batch
+                .column_by_name("name")?
+                .as_any()
+                .downcast_ref::<arrow_array::StringArray>()?;
+            (0..batch.num_rows())
+                .find(|row| names.value(*row) == "foreign-unpublished")
+                .map(|row| batch.slice(row, 1))
+        })
+        .expect("foreign seed row must be readable as one append batch");
+
+    // Force RewriteMerged to execute a CreateIndex tail after its exact data
+    // transaction, while keeping the target manifest consistent before merge.
+    let person_uri = node_table_uri(&uri, "Person");
+    let store = TableStore::new(&uri, test_session());
+    let mut target_person = store
+        .open_dataset_head(&person_uri, Some("target"))
+        .await
+        .unwrap();
+    target_person.drop_index("id_idx").await.unwrap();
+    let dropped_index_head = target_person.version().version;
+    db.failpoint_publish_table_head_without_index_rebuild_for_test(
+        "target",
+        "node:Person",
+        Some("target"),
+    )
+    .await
+    .unwrap();
+    let target_head_before_merge = branch_head_commit_id(dir.path(), "target").await.unwrap();
+
+    let merge_db = std::sync::Arc::new(db);
+    let merge_rv = helpers::failpoint::Rendezvous::park_first(
+        names::BRANCH_MERGE_REWRITE_AFTER_DELETE_PRE_INDEX,
+    );
+    let merge_handle = std::sync::Arc::clone(&merge_db);
+    let merge_task = tokio::spawn(async move {
+        merge_handle.branch_merge("source", "target").await
+    });
+    merge_rv.wait_until_reached().await;
+
+    // The merge's logical data transaction is now at HEAD, but its index build
+    // has not started. Append a real logical row without publishing target
+    // manifest authority, then let CreateIndex rebase over that foreign commit.
+    let mut raw_target = store
+        .open_dataset_head(&person_uri, Some("target"))
+        .await
+        .unwrap();
+    helpers::lance_append_inline(&mut raw_target, foreign_batch).await;
+    let foreign_append_head = raw_target.version().version;
+    merge_rv.release();
+
+    let operation_id = match merge_task.await.unwrap().unwrap_err() {
+        OmniError::RecoveryRequired { operation_id, .. } => operation_id,
+        other => panic!("foreign confirmation tail must retain recovery ownership: {other}"),
+    };
+    let sidecar_path = dir
+        .path()
+        .join("__recovery")
+        .join(format!("{operation_id}.json"));
+    let sidecar: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(&sidecar_path).unwrap()).unwrap();
+    assert_eq!(
+        sidecar["protocol_v4"]["effect_phase"], "Armed",
+        "confirmation must reject before persisting EffectsConfirmed"
+    );
+    let raw_head_after_index_rebase = store
+        .open_dataset_head(&person_uri, Some("target"))
+        .await
+        .unwrap()
+        .version()
+        .version;
+    assert!(
+        raw_head_after_index_rebase > foreign_append_head,
+        "fixture must place at least one rebased CreateIndex commit after the foreign Append"
+    );
+    assert_eq!(
+        branch_head_commit_id(dir.path(), "target").await.unwrap(),
+        target_head_before_merge,
+        "rejected confirmation must not advance target graph lineage"
+    );
+    drop(merge_db);
+
+    let open_error = match Omnigraph::open(&uri).await {
+        Ok(_) => panic!("Full recovery must fail closed on a non-CreateIndex foreign tail"),
+        Err(error) => error,
+    };
+    assert!(
+        open_error.to_string().contains("foreign")
+            || open_error.to_string().contains("unverifiable")
+            || open_error.to_string().contains("CreateIndex"),
+        "unexpected fail-closed error: {open_error}"
+    );
+    assert!(sidecar_path.exists());
+    assert_eq!(
+        branch_head_commit_id(dir.path(), "target").await.unwrap(),
+        target_head_before_merge,
+        "failed recovery must not publish or re-parent the merge"
+    );
+    let read_only = Omnigraph::open_read_only(&uri).await.unwrap();
+    assert_eq!(
+        read_only
+            .snapshot_of(omnigraph::db::ReadTarget::branch("target"))
+            .await
+            .unwrap()
+            .entry("node:Person")
+            .unwrap()
+            .table_version,
+        dropped_index_head,
+        "target manifest must remain at its pre-merge Person pin"
+    );
+    let raw_after_failed_recovery = store
+        .open_dataset_head(&person_uri, Some("target"))
+        .await
+        .unwrap();
+    assert_eq!(
+        raw_after_failed_recovery.version().version,
+        raw_head_after_index_rebase,
+        "fail-closed recovery must not restore through the foreign Append"
+    );
+    let raw_batches: Vec<arrow_array::RecordBatch> = raw_after_failed_recovery
+        .scan()
+        .try_into_stream()
+        .await
+        .unwrap()
+        .try_collect()
+        .await
+        .unwrap();
+    assert!(
+        collect_column_strings(&raw_batches, "name")
+            .iter()
+            .any(|name| name == "foreign-unpublished"),
+        "the unpublished foreign row must survive fail-closed confirmation and recovery"
+    );
 }
 
 /// AdoptWithDelta recovery (the gap closure): a fast-forward merge — main has
@@ -5425,9 +6345,9 @@ async fn sorted_person_names(db: &Omnigraph) -> Vec<String> {
 /// THE recovery-atomicity regression gate. A branch merge whose per-table publish
 /// is a multi-commit sequence (append → upsert → delete, or merge_insert → delete
 /// → index) advances Lance HEAD step by step before the manifest publish. If the
-/// process dies *mid*-sequence — after some commits but before the achieved-version
-/// intent is recorded — recovery must roll the whole merge **back**, not publish
-/// the partial and record the merge as complete.
+/// process dies *mid*-sequence — after some planned commits but while the v4
+/// sidecar remains Armed — recovery must roll the whole merge **back**, not
+/// publish the partial and record the merge as complete.
 ///
 /// The delta is deliberately MIXED — a fresh id (`bob`, append), a modified base id
 /// (`carol`, upsert) and a removed base id (`dave`, delete) — so every partial
@@ -5435,10 +6355,11 @@ async fn sorted_person_names(db: &Omnigraph) -> Vec<String> {
 /// back at its base name-set, and a *re-run* of the merge re-applies the full delta
 /// (the partial was not silently recorded as "already merged").
 ///
-/// RED before the fix: the loose `BranchMerge` classification rolls any
-/// `lance_head > manifest_pinned` forward, so the partial is published (e.g. `bob`
-/// present, `dave` kept) and the merge recorded — the first assert (back at base)
-/// fails. GREEN after: `achieved_version == None` → `IncompletePhaseB` → roll back.
+/// RED before the fix: the legacy loose `BranchMerge` classifier rolled any
+/// `lance_head > manifest_pinned` forward, so the partial was published (e.g.
+/// `bob` present, `dave` kept) and the merge recorded. GREEN after: an Armed v4
+/// sidecar can prove only a proper prefix of its planned transaction chain, so
+/// recovery compensates it rather than treating numeric movement as completion.
 async fn assert_partial_merge_rolls_back(scenario: MergeScenario, failpoint: &str) {
     use omnigraph::loader::load_jsonl;
 
@@ -5642,7 +6563,10 @@ async fn pre_upgrade_v1_branch_merge_sidecar_rolls_forward_not_back() {
             .expect("a recovery sidecar must exist after the post-Phase-B crash");
         let mut v: serde_json::Value =
             serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+        v["merge_source_commit_id"] =
+            v["protocol_v4"]["lineage"]["merged_parent_commit_id"].clone();
         v["schema_version"] = serde_json::json!(1);
+        v.as_object_mut().unwrap().remove("protocol_v4");
         for table in v["tables"].as_array_mut().unwrap() {
             table.as_object_mut().unwrap().remove("confirmed_version");
         }
@@ -5765,7 +6689,7 @@ async fn branch_merge_phase_b_failure_recovered_on_non_main_target() {
     assert_post_recovery_invariants(
         dir.path(),
         &operation_id,
-        RecoveryExpectation::RolledForward {
+        RecoveryExpectation::RolledForwardOriginalLineage {
             tables: vec![
                 TableExpectation::branch("node:Person", "target_branch")
                     .expected_main_manifest_pin(main_person_pin)
@@ -6561,6 +7485,169 @@ async fn branch_merge_rejects_fresh_target_manifest_change_before_effects() {
     );
 }
 
+/// Source is a captured immutable input, not part of the target publisher's
+/// atomic read set. A later commit on the same source incarnation must not make
+/// the merge substitute the newer source head (or reject an otherwise-valid
+/// captured snapshot).
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[serial]
+async fn branch_merge_source_advance_keeps_captured_source_parent() {
+    let _scenario = FailScenario::setup();
+    let dir = tempfile::tempdir().unwrap();
+    let (uri, main_rows) = setup_diverged_merge_branches(&dir).await;
+    let merge_db = std::sync::Arc::new(Omnigraph::open(&uri).await.unwrap());
+    let mut source_writer = Omnigraph::open(&uri).await.unwrap();
+    let captured_source_head = branch_head_commit_id(dir.path(), "source").await.unwrap();
+    let merge_rv =
+        helpers::failpoint::Rendezvous::park_first(names::BRANCH_MERGE_POST_AUTHORITY_CAPTURE);
+
+    let merge_handle = std::sync::Arc::clone(&merge_db);
+    let merge_task = tokio::spawn(async move {
+        merge_handle.branch_merge("source", "target").await
+    });
+    merge_rv.wait_until_reached().await;
+
+    // Model a foreign source writer without changing row content: advance the
+    // source table HEAD with a no-op delete, then publish it through the
+    // queue-bypassing seam. The source branch incarnation remains unchanged.
+    let person_uri = node_table_uri(&uri, "Person");
+    let mut raw_source = lance::Dataset::open(&person_uri)
+        .await
+        .unwrap()
+        .checkout_branch("source")
+        .await
+        .unwrap();
+    helpers::lance_delete_inline(&mut raw_source, "1 = 2").await;
+    source_writer
+        .failpoint_publish_table_head_without_index_rebuild_for_test(
+            "source",
+            "node:Person",
+            Some("source"),
+        )
+        .await
+        .unwrap();
+    let advanced_source_head = branch_head_commit_id(dir.path(), "source").await.unwrap();
+    assert_ne!(advanced_source_head, captured_source_head);
+    merge_rv.release();
+
+    assert_eq!(
+        merge_task.await.unwrap().unwrap(),
+        omnigraph::db::MergeOutcome::Merged
+    );
+    let reopened = Omnigraph::open(&uri).await.unwrap();
+    assert_eq!(
+        helpers::count_rows_branch(&reopened, "target", "node:Person").await,
+        main_rows + 2
+    );
+    let target_head = branch_head_commit_id(dir.path(), "target").await.unwrap();
+    let merge_commit = reopened.get_commit(&target_head).await.unwrap();
+    assert_eq!(
+        merge_commit.merged_parent_commit_id.as_deref(),
+        Some(captured_source_head.as_str()),
+        "merge lineage must name the source commit captured before planning"
+    );
+    assert_ne!(
+        merge_commit.merged_parent_commit_id.as_deref(),
+        Some(advanced_source_head.as_str()),
+        "a later source head must never be substituted at publish time"
+    );
+}
+
+async fn assert_branch_merge_first_touch_ref_is_recovered(
+    failpoint: &str,
+    ref_exists_before_recovery: bool,
+) {
+    let dir = tempfile::tempdir().unwrap();
+    let uri = dir.path().to_str().unwrap().to_string();
+    let db = helpers::init_and_load(&dir).await;
+    let main_rows = helpers::count_rows(&db, "node:Person").await;
+    db.branch_create("source").await.unwrap();
+    db.branch_create("target").await.unwrap();
+    db.mutate(
+        "source",
+        MUTATION_QUERIES,
+        "insert_person",
+        &mixed_params(&[("$name", "source-first-touch")], &[("$age", 37)]),
+    )
+    .await
+    .unwrap();
+
+    let person_uri = node_table_uri(&uri, "Person");
+    let person = lance::Dataset::open(&person_uri).await.unwrap();
+    assert!(
+        !person.list_branches().await.unwrap().contains_key("target"),
+        "fixture requires the target table ref to be lazy"
+    );
+
+    let error = {
+        let _failpoint = ScopedFailPoint::new(failpoint, "return");
+        db.branch_merge("source", "target").await.unwrap_err()
+    };
+    let operation_id = match error {
+        OmniError::RecoveryRequired { operation_id, .. } => operation_id,
+        other => panic!("first-touch failure must retain recovery ownership: {other}"),
+    };
+    let sidecar_path = dir
+        .path()
+        .join("__recovery")
+        .join(format!("{operation_id}.json"));
+    let sidecar: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(&sidecar_path).unwrap()).unwrap();
+    assert_eq!(sidecar["schema_version"], 4);
+    assert_eq!(
+        sidecar["protocol_v4"]["effects"][0]["kind"]["kind"],
+        "RefOnlyFork"
+    );
+
+    let person = lance::Dataset::open(&person_uri).await.unwrap();
+    assert_eq!(
+        person.list_branches().await.unwrap().contains_key("target"),
+        ref_exists_before_recovery,
+        "fixture must stop at the intended sidecar/ref boundary"
+    );
+    drop(db);
+
+    let recovered = Omnigraph::open(&uri).await.unwrap();
+    assert!(!sidecar_path.exists());
+    let person = lance::Dataset::open(&person_uri).await.unwrap();
+    assert!(
+        !person.list_branches().await.unwrap().contains_key("target"),
+        "Full recovery must reclaim an unpublished first-touch target ref"
+    );
+    assert_eq!(
+        helpers::count_rows_branch(&recovered, "target", "node:Person").await,
+        main_rows,
+        "failed first-touch merge must leave target inheriting its old image"
+    );
+
+    assert_eq!(
+        recovered.branch_merge("source", "target").await.unwrap(),
+        omnigraph::db::MergeOutcome::FastForward
+    );
+    assert_eq!(
+        helpers::count_rows_branch(&recovered, "target", "node:Person").await,
+        main_rows + 1
+    );
+}
+
+#[tokio::test]
+#[serial(branch_merge_first_touch)]
+async fn branch_merge_sidecar_precedes_first_touch_target_ref() {
+    let _scenario = FailScenario::setup();
+    assert_branch_merge_first_touch_ref_is_recovered(
+        names::BRANCH_MERGE_POST_SIDECAR_PRE_FORK,
+        false,
+    )
+    .await;
+}
+
+#[tokio::test]
+#[serial(branch_merge_first_touch)]
+async fn branch_merge_recovers_ambiguous_first_touch_ref_creation() {
+    let _scenario = FailScenario::setup();
+    assert_branch_merge_first_touch_ref_is_recovered(names::FORK_POST_CREATE_PRE_OPEN, true).await;
+}
+
 /// A legacy writer can arm a relevant sidecar after merge's initial recovery
 /// barrier. Merge acquires the complete source/target table envelope and lists
 /// again before Phase A, so the late intent blocks it even when no table HEAD
@@ -6750,6 +7837,26 @@ async fn full_recovery_rereads_sidecar_body_after_discovery() {
     );
     for table in tables {
         table["confirmed_version"] = serde_json::Value::Null;
+    }
+    let protocol = sidecar["protocol_v4"]
+        .as_object_mut()
+        .expect("branch-merge sidecar must carry protocol_v4");
+    protocol.insert(
+        "effect_phase".to_string(),
+        serde_json::Value::String("Armed".to_string()),
+    );
+    for effect in protocol["effects"]
+        .as_array_mut()
+        .expect("branch-merge effects must be an array")
+    {
+        effect["kind"]["confirmed_version"] = serde_json::Value::Null;
+        effect["kind"]["confirmed_branch_identifier"] = serde_json::Value::Null;
+    }
+    for slot in protocol["intended_delta"]["table_updates"]
+        .as_array_mut()
+        .expect("branch-merge delta slots must be an array")
+    {
+        slot["confirmed"] = serde_json::Value::Null;
     }
     std::fs::write(
         &sidecar_path,

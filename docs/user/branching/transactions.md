@@ -19,7 +19,7 @@ Two primitives, two scopes:
 | **One `.gq` query** (any number of statements inside) | The query itself — handled by the publisher's atomic manifest commit | Yes — all statements land together or none of them do | The publisher never publishes; target unchanged |
 | **Many queries that must succeed together** | Branches: `branch_create` → run N queries on the branch → `branch_merge` | Yes — the merge is a single atomic publish | Drop the branch (`branch_delete`); main is unaffected |
 
-Snapshot isolation is per-query — every read inside one query sees one consistent manifest version. Two concurrent queries on the same branch see independent snapshots. Mutation/load capture the branch head as coarse OCC authority, so a prepared plan is never silently reparented after another graph commit.
+Snapshot isolation is per-query — every read inside one query sees one consistent manifest version. Two concurrent queries on the same branch see independent snapshots. Mutation/load and branch merge capture the target branch head as coarse OCC authority, so a prepared plan is never silently reparented after another graph commit. Merge additionally pins the exact source commit it classified; a later source advance is not substituted into the prepared result.
 
 ## Comparison with `BEGIN` / `COMMIT`
 

@@ -65,7 +65,7 @@ use lance::dataset::scanner::{ColumnOrdering, DatasetRecordBatchStream};
 use lance::dataset::{WhenMatched, WhenNotMatched};
 
 use crate::db::{Snapshot, SubTableEntry};
-use crate::error::Result;
+use crate::error::{OmniError, Result};
 use crate::table_store::{StagedTransactionIdentity, StagedWrite, TableState, TableStore};
 
 // ─── sealed module ──────────────────────────────────────────────────────────
@@ -285,6 +285,14 @@ pub trait TableStorage: sealed::Sealed + Send + Sync + Debug {
         dataset_uri: &str,
         branch: Option<&str>,
     ) -> Result<SnapshotHandle>;
+
+    /// Native identity of the branch backing an already-open snapshot. Used
+    /// by recovery-enrolled first-touch effects to confirm the exact ref they
+    /// created, closing delete/recreate ABA during later recovery.
+    async fn branch_identifier(
+        &self,
+        snapshot: &SnapshotHandle,
+    ) -> Result<lance::dataset::refs::BranchIdentifier>;
 
     async fn fork_branch_from_state(
         &self,
@@ -562,6 +570,17 @@ impl TableStorage for TableStore {
         TableStore::open_dataset_head(self, dataset_uri, branch)
             .await
             .map(SnapshotHandle::new)
+    }
+
+    async fn branch_identifier(
+        &self,
+        snapshot: &SnapshotHandle,
+    ) -> Result<lance::dataset::refs::BranchIdentifier> {
+        snapshot
+            .dataset()
+            .branch_identifier()
+            .await
+            .map_err(|error| OmniError::Lance(error.to_string()))
     }
 
     async fn fork_branch_from_state(
