@@ -179,7 +179,7 @@ pub struct MergeWriteProbes {
     /// names (schema order) and whether unmatched source rows insert
     /// (`WhenNotMatched::InsertAll`) or drop (`DoNothing`). Lets a fitness test
     /// assert a partial-schema matched-only update stages exactly
-    /// (key + assigned + completion) columns — the RFC-022 staging shape.
+    /// (key + assigned + completion) columns — the field-level-update staging shape.
     pub merge_shapes: Arc<std::sync::Mutex<Vec<MergeShape>>>,
     /// Inline vector-index (IVF) builds. The fast-forward adopt path defers
     /// index coverage to the reconciler, so an adopt merge must do 0 of these.
@@ -347,6 +347,8 @@ pub struct StorageReadCounts {
     pub exists: AtomicU64,
     pub read_text_versioned: AtomicU64,
     pub list_dir: AtomicU64,
+    pub write_text: AtomicU64,
+    pub delete: AtomicU64,
 }
 
 impl StorageReadCounts {
@@ -361,6 +363,12 @@ impl StorageReadCounts {
     }
     pub fn list_dir(&self) -> u64 {
         self.list_dir.load(Ordering::Relaxed)
+    }
+    pub fn write_text(&self) -> u64 {
+        self.write_text.load(Ordering::Relaxed)
+    }
+    pub fn delete(&self) -> u64 {
+        self.delete.load(Ordering::Relaxed)
     }
 }
 
@@ -394,6 +402,7 @@ impl StorageAdapter for CountingStorageAdapter {
     }
 
     async fn write_text(&self, uri: &str, contents: &str) -> Result<()> {
+        self.counts.write_text.fetch_add(1, Ordering::Relaxed);
         self.inner.write_text(uri, contents).await
     }
 
@@ -411,6 +420,7 @@ impl StorageAdapter for CountingStorageAdapter {
     }
 
     async fn delete(&self, uri: &str) -> Result<()> {
+        self.counts.delete.fetch_add(1, Ordering::Relaxed);
         self.inner.delete(uri).await
     }
 

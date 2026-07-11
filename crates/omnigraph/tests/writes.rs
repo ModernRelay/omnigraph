@@ -1,13 +1,17 @@
-//! Tests for the direct-publish write path: mutations and loads write
-//! directly to target tables and commit once via the publisher's
-//! `expected_table_versions` CAS. (History: this replaced the removed Run
+//! Tests for the direct-publish write path. Mutations and loads capture one
+//! branch-wide authority token, prepare exact per-table transactions, then
+//! acquire the root-shared schema → branch → sorted-table gates, revalidate,
+//! arm schema-v3 recovery, commit the table effects, and publish once under the
+//! same exact-head/table precondition. (History: this replaced the removed Run
 //! state machine / `__run__` staging branches / RunRecord — MR-771.)
 //!
 //! What this file covers:
 //! - No `__run__*` branches are created by load or mutate.
 //! - Cancellation of a mutation future leaves no graph-level state.
-//! - Concurrent non-strict inserts/merges rebase under the per-table queue;
-//!   strict updates/deletes surface `ExpectedVersionMismatch` on stale state.
+//! - A pre-effect branch-authority change makes an insert-only mutation or
+//!   Append/Merge load discard and fully reprepare with a bounded retry; strict
+//!   Update/Delete/Overwrite surfaces `ReadSetChanged`. Post-effect failures
+//!   require recovery.
 //! - Failed mutations and loads leave the target unchanged.
 //! - Multi-statement mutations are atomic (one commit per query).
 //! - actor_id propagates through to the commit graph.
@@ -242,11 +246,12 @@ async fn partial_failure_leaves_target_queryable_and_unblocks_next_mutation() {
     assert_eq!(frank.num_rows(), 1, "Frank must be visible after publish");
 }
 
-/// Stale non-strict writers rebase to the live manifest pin under the
-/// per-table queue instead of folding raw drift or returning a false 409.
-/// Strict update/delete semantics are covered by the consistency/server tests.
+/// Stale non-strict writers discard and reprepare their whole logical attempt
+/// from the live branch authority instead of rebasing an already-validated
+/// staged transaction or returning a false 409. Strict update/delete semantics
+/// are covered by the consistency/server tests.
 #[tokio::test]
-async fn stale_non_strict_insert_rebases_to_live_manifest_pin() {
+async fn stale_non_strict_insert_reprepares_from_live_branch_state() {
     let dir = tempfile::tempdir().unwrap();
     let uri = dir.path().to_string_lossy().into_owned();
 
@@ -276,9 +281,10 @@ async fn stale_non_strict_insert_rebases_to_live_manifest_pin() {
     }
 
     // Writer B's coordinator is still at the pre-A snapshot, but Insert is
-    // non-strict: commit_all re-reads the live manifest pin under the queue,
-    // verifies Lance HEAD equals that pin, and then lets Lance rebase the
-    // staged append.
+    // retryable: the RFC-022 adapter notices the authority change under the
+    // branch gate, discards B's prepared/staged attempt, and reruns the full
+    // operation from A's committed state. Lance never rebases a plan whose
+    // validation inputs are stale.
     db_b.mutate(
         "main",
         MUTATION_QUERIES,
@@ -598,8 +604,16 @@ async fn overlapping_delete_predicates_do_not_double_count_affected() {
     );
 
     // The data is correct regardless of the count: Bob + Diana remain.
-    assert_eq!(count_rows(&db, "node:Person").await, 2, "Bob and Diana remain");
-    assert_eq!(count_rows(&db, "edge:Knows").await, 1, "only Bob→Diana remains");
+    assert_eq!(
+        count_rows(&db, "node:Person").await,
+        2,
+        "Bob and Diana remain"
+    );
+    assert_eq!(
+        count_rows(&db, "edge:Knows").await,
+        1,
+        "only Bob→Diana remains"
+    );
     assert_eq!(
         count_rows(&db, "edge:WorksAt").await,
         1,
@@ -633,7 +647,9 @@ edge Knows: Person -> Person
 {"type":"Person","data":{"name":"Zoe"}}
 {"edge":"Knows","from":"Zoe","to":"Charlie"}"#;
     let mut db = Omnigraph::init(uri, schema).await.unwrap();
-    load_jsonl(&mut db, data, LoadMode::Overwrite).await.unwrap();
+    load_jsonl(&mut db, data, LoadMode::Overwrite)
+        .await
+        .unwrap();
 
     let q = r#"
 query del_age_then_name($threshold: I32, $name: String) {
@@ -668,7 +684,7 @@ query del_age_then_name($threshold: I32, $name: String) {
 /// `insert Person 'X'; update Person where name='X' set age=...` — both
 /// ops produce content on `node:Person` and coalesce into one
 /// `stage_merge_insert` at end-of-query. The accumulator's last-write-wins
-/// dedupe (in `MutationStaging::finalize`) ensures the update's value
+/// dedupe (during `MutationStaging::stage_all`) ensures the update's value
 /// wins. Single Lance commit per table per query.
 #[tokio::test]
 async fn mixed_insert_and_update_on_same_person_coalesces_to_one_merge() {
@@ -694,7 +710,7 @@ async fn mixed_insert_and_update_on_same_person_coalesces_to_one_merge() {
     .unwrap();
     assert_eq!(result.affected_nodes, 2, "1 insert + 1 update reported");
 
-    // RFC-022 fallback pin: mixing insert + update on one table stages FULL
+    // Field-level-update fallback pin: mixing insert + update on one table stages FULL
     // rows as an upsert — partial and full batches cannot share one
     // uniform-schema merge source, and one table commits at most one version
     // per query (invariant 4).
@@ -711,7 +727,7 @@ async fn mixed_insert_and_update_on_same_person_coalesces_to_one_merge() {
     );
 
     // The end-state row carries the update value (last-write-wins via
-    // dedupe in finalize), proving the staged merge_insert ran with the
+    // end-of-query dedupe), proving the staged merge_insert ran with the
     // correct source dedupe. Read the underlying Person table directly
     // and assert age=99 for the row we just inserted+updated.
     let batches = read_table(&db, "node:Person").await;
@@ -1082,7 +1098,7 @@ edge WorksAt: Person -> Company @card(0..1)
 /// `scan_with_pending`, the second update sees the stale committed value
 /// (the first update's row still appears in the Lance scan because the
 /// pending side hasn't committed), the predicate matches it, and the
-/// dedupe-last-wins step at finalize ends up applying the second update
+/// end-of-query dedupe-last-wins step ends up applying the second update
 /// to a row whose pending value should have shielded it.
 ///
 /// Concretely: Alice starts at age=30 in TEST_DATA. Op-1 sets Alice to
@@ -1122,7 +1138,7 @@ async fn chained_updates_with_overlapping_predicate_respects_intermediate_value(
     .await
     .unwrap();
 
-    // RFC-022 fallback pin: two updates on one table stage FULL rows — a
+    // Field-level-update fallback pin: two updates on one table stage FULL rows — a
     // later update's read-your-writes scan must see the earlier update's
     // full effect, and two partial batches with different assigned sets
     // cannot share one uniform-schema merge source.
@@ -1382,7 +1398,7 @@ edge WorksAt: Person -> Company @card(0..1)
 }
 
 /// A Merge load whose input has TWO rows with the same edge id must be
-/// deduped at cardinality-count time, not just at finalize. Without
+/// deduped at cardinality-count time, not just during end-of-query staging. Without
 /// dedup, two pending rows count twice → spurious `@card` violation.
 /// With dedup (last-occurrence-wins, mirroring
 /// `dedupe_merge_batches_by_id`), the pending side counts once.
@@ -1417,7 +1433,7 @@ edge WorksAt: Person -> Company @card(0..1)
         .unwrap();
 
     // Merge load with the SAME edge id twice — the second row supersedes
-    // the first in the finalize-time dedupe. If pending-counting doesn't
+    // the first in the end-of-query dedupe. If pending-counting doesn't
     // dedupe, Alice has 2 pending edges → @card(0..1) trips → load
     // fails. With dedupe, Alice has 1 → load succeeds.
     let dup_data = r#"{"edge": "WorksAt", "from": "Alice", "to": "Acme", "data": {"id": "w1"}}
@@ -1525,21 +1541,13 @@ async fn scan_with_pending_rejects_key_column_missing_from_projection() {
     );
 }
 
-/// `PendingTable.schema` is captured from the first `append_batch` call
-/// and never updated. On a blob-bearing table, an `insert` produces a
-/// full-schema batch (blob columns included) and an `update` that
-/// doesn't assign every blob produces a subset-schema batch. Mixed in
-/// one query, the second `append_batch` would silently push an
-/// incompatible batch — the mismatch surfaced eventually at
-/// `concat_batches`/MemTable construction inside finalize, but the
-/// failure point was distant from the offending op.
-///
-/// `append_batch` validates the new batch's schema against the existing
-/// accumulator's schema and returns a typed error directing the caller
-/// to split the mutation. The error fires at the second op (the
-/// update), not at end-of-query.
+/// A blob-table insert followed by a non-blob update must remain one
+/// full-schema merge stream. The update reads the just-inserted pending row,
+/// copies its logical blob column through, and replaces the pending row under
+/// the existing last-write-wins shadow semantics. This used to produce a
+/// partial update batch and fail schema validation at the second op.
 #[tokio::test]
-async fn append_batch_rejects_mismatched_schema_in_blob_table_at_offending_op() {
+async fn blob_table_insert_then_non_blob_update_preserves_full_schema() {
     use omnigraph::loader::{LoadMode, load_jsonl};
 
     const BLOB_SCHEMA: &str = r#"
@@ -1562,10 +1570,9 @@ query insert_then_update_note(
     let uri = dir.path().to_str().unwrap();
     let mut db = Omnigraph::init(uri, BLOB_SCHEMA).await.unwrap();
 
-    // Seed with a Document so the update has something to match (the
-    // mid-query case is the chained-update scenario where the update's
-    // predicate matches the just-inserted row, exercising the in-memory
-    // pending union).
+    // Keep one committed blob row as well as the just-inserted pending row so
+    // the table has the real blob-v2 physical representation while this query
+    // exercises the pending union.
     load_jsonl(
         &mut db,
         r#"{"type":"Document","data":{"title":"seed","content":"base64:AQID"}}"#,
@@ -1574,7 +1581,7 @@ query insert_then_update_note(
     .await
     .unwrap();
 
-    let err = db
+    let result = db
         .mutate(
             "main",
             BLOB_QUERIES,
@@ -1586,36 +1593,35 @@ query insert_then_update_note(
             ]),
         )
         .await
-        .expect_err("blob-table mixed insert+update with non-fully-assigned blob must error early");
-    let OmniError::Manifest(manifest_err) = err else {
-        panic!("expected Manifest error, got {err:?}");
-    };
-    assert!(
-        manifest_err.message.contains("mismatched schemas")
-            && manifest_err.message.contains("Split the mutation"),
-        "error must direct user to split: {}",
-        manifest_err.message,
+        .expect("blob-table insert + non-blob update must share a full-schema merge batch");
+    assert_eq!(
+        result.affected_nodes, 2,
+        "one insert plus one pending-row update"
     );
 
-    // Confirm the manifest didn't advance — early error must be
-    // before any commit.
+    let blob = db
+        .read_blob("Document", "letter", "content")
+        .await
+        .expect("inserted blob must remain readable after the update");
+    assert_eq!(&blob.read().await.unwrap()[..], &[4, 5, 6]);
+
     let qr = db
         .query(
             ReadTarget::branch("main"),
             r#"query get_doc($title: String) {
                 match { $d: Document { title: $title } }
-                return { $d.title }
+                return { $d.title, $d.note }
             }"#,
             "get_doc",
             &params(&[("$title", "letter")]),
         )
         .await
         .unwrap();
-    assert_eq!(
-        qr.num_rows(),
-        0,
-        "letter must not be visible after early error"
-    );
+    assert_eq!(qr.num_rows(), 1);
+    let json = qr.to_sdk_json();
+    let row = json.as_array().unwrap().first().unwrap();
+    assert_eq!(row["d.title"], "letter");
+    assert_eq!(row["d.note"], "draft 1");
 }
 
 /// MR-920 regression: two sequential `update T set {f:v} where x=y`
@@ -1829,7 +1835,9 @@ async fn camelcase_mutation_predicate_updates_and_deletes() {
     let dir = tempfile::tempdir().unwrap();
     let uri = dir.path().to_str().unwrap();
     let mut db = Omnigraph::init(uri, CC_SCHEMA).await.unwrap();
-    load_jsonl(&mut db, CC_DATA, LoadMode::Overwrite).await.unwrap();
+    load_jsonl(&mut db, CC_DATA, LoadMode::Overwrite)
+        .await
+        .unwrap();
 
     let m = r#"
 query set_status($repo: String, $st: String) { update Doc set { status: $st } where repoName = $repo }
@@ -1837,7 +1845,12 @@ query del($repo: String) { delete Doc where repoName = $repo }
 "#;
 
     let upd = db
-        .mutate("main", m, "set_status", &params(&[("$repo", "acme"), ("$st", "closed")]))
+        .mutate(
+            "main",
+            m,
+            "set_status",
+            &params(&[("$repo", "acme"), ("$st", "closed")]),
+        )
         .await
         .expect("update with a camelCase predicate must execute");
     assert_eq!(upd.affected_nodes, 1, "exactly the acme Doc should update");
@@ -1846,9 +1859,16 @@ query del($repo: String) { delete Doc where repoName = $repo }
         .mutate("main", m, "del", &params(&[("$repo", "globex")]))
         .await
         .expect("delete with a camelCase predicate must execute");
-    assert_eq!(del.affected_nodes, 1, "exactly the globex Doc should delete");
+    assert_eq!(
+        del.affected_nodes, 1,
+        "exactly the globex Doc should delete"
+    );
 
-    assert_eq!(count_rows(&db, "node:Doc").await, 1, "one Doc (acme) should remain");
+    assert_eq!(
+        count_rows(&db, "node:Doc").await,
+        1,
+        "one Doc (acme) should remain"
+    );
 }
 
 // #283 (pending side): a chained mutation whose 2nd op filters a camelCase
@@ -1860,7 +1880,9 @@ async fn camelcase_chained_mutation_reads_pending_by_camelcase() {
     let dir = tempfile::tempdir().unwrap();
     let uri = dir.path().to_str().unwrap();
     let mut db = Omnigraph::init(uri, CC_SCHEMA).await.unwrap();
-    load_jsonl(&mut db, CC_DATA, LoadMode::Overwrite).await.unwrap();
+    load_jsonl(&mut db, CC_DATA, LoadMode::Overwrite)
+        .await
+        .unwrap();
 
     // op-1 stages a status change to the acme Doc; op-2 re-filters the same
     // camelCase column, so it must match op-1's pending row.
@@ -1873,8 +1895,13 @@ query chain($repo: String) {
     let r = db
         .mutate("main", m, "chain", &params(&[("$repo", "acme")]))
         .await
-        .expect("chained camelCase mutation must read the pending row, not fail at the MemTable SELECT");
-    assert_eq!(r.affected_nodes, 2, "both ops should touch the acme Doc (read-your-writes)");
+        .expect(
+            "chained camelCase mutation must read the pending row, not fail at the MemTable SELECT",
+        );
+    assert_eq!(
+        r.affected_nodes, 2,
+        "both ops should touch the acme Doc (read-your-writes)"
+    );
 }
 
 /// A zero-row cascade delete must not advance an edge table's Lance HEAD past
@@ -2027,7 +2054,9 @@ async fn filtered_read_after_merge_update_and_delete_keeps_row_ids_consistent() 
             )
         })
         .collect();
-    load_jsonl(&mut db, &updates, LoadMode::Merge).await.unwrap();
+    load_jsonl(&mut db, &updates, LoadMode::Merge)
+        .await
+        .unwrap();
 
     // The delete adds a deletion vector, so the overlapping region no longer
     // densely tiles its id range — the shape lance#7444 choked on.
@@ -2101,9 +2130,9 @@ async fn filtered_read_after_append_and_delete_is_consistent() {
     }
 }
 
-// ─── RFC-022: field-level update staging shape ──────────────────────────────
+// ─── Field-level update staging shape ──────────────────────────────
 
-/// RFC-022 acceptance (red → green): a query whose ONLY op on a table is one
+/// Field-level-update acceptance (red → green): a query whose ONLY op on a table is one
 /// `update` stages a PARTIAL source — exactly (merge key + assigned columns) —
 /// as a matched-only merge (`WhenNotMatched::DoNothing`). The whole-row path
 /// stages every column with `InsertAll`.
@@ -2143,7 +2172,7 @@ async fn single_update_stages_partial_matched_only_source() {
 }
 
 /// An update matching zero rows stages nothing and commits nothing —
-/// unchanged by RFC-022 (the early return precedes staging).
+/// unchanged by field-level updates (the early return precedes staging).
 #[tokio::test]
 async fn empty_match_update_stages_no_merge() {
     use omnigraph::instrumentation::{MergeWriteProbes, with_merge_write_probes};

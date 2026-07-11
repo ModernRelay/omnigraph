@@ -30,8 +30,8 @@ const DATA: &str = r#"{"type":"Item","data":{"slug":"a","status":"active","publi
 {"type":"Item","data":{"slug":"b","status":"archived","published":"2023-01-01T00:00:00Z","rank":2,"title":"beta","note":"n2"}}
 {"type":"Item","data":{"slug":"c","status":"active","published":"2025-02-02T00:00:00Z","rank":3,"title":"gamma","note":"n3"}}"#;
 
-// Enums and orderable scalars (DateTime, numeric) get a BTREE from load's
-// build-indices pass, so a `=`/range filter on them uses the index. Free-text
+// Enums and orderable scalars (DateTime, numeric) get a BTREE from the index
+// reconciler, so a `=`/range filter on them uses the index. Free-text
 // String `@index` keeps FTS (no BTREE), and an un-annotated column has no
 // scalar index — both report `Degraded`, which is the negative control that
 // keeps this test from being vacuously green.
@@ -41,6 +41,7 @@ async fn node_scalar_and_enum_index_columns_get_btree() {
     let uri = dir.path().to_str().unwrap();
     let mut db = Omnigraph::init(uri, SCHEMA).await.unwrap();
     load_jsonl(&mut db, DATA, LoadMode::Overwrite).await.unwrap();
+    db.ensure_indices().await.unwrap();
 
     let snap = snapshot_main(&db).await.unwrap();
     let ds = snap.open("node:Item").await.unwrap();
@@ -79,7 +80,7 @@ query touch_note($slug: String, $note: String) {
 }
 "#;
 
-// RFC-022 acceptance cell (red → green): updating an UN-indexed property must
+// Field-level-update acceptance cell (red → green): updating an UN-indexed property must
 // not degrade index coverage on any OTHER column. The whole-row update merge
 // marks every column modified, so Lance prunes the touched fragments from every
 // index (`prune_updated_fields_from_indices`) and the rewritten rows land
@@ -94,6 +95,7 @@ async fn update_of_unindexed_property_preserves_other_index_coverage() {
     let uri = dir.path().to_str().unwrap();
     let mut db = Omnigraph::init(uri, SCHEMA).await.unwrap();
     load_jsonl(&mut db, DATA, LoadMode::Overwrite).await.unwrap();
+    db.ensure_indices().await.unwrap();
 
     db.mutate(
         "main",
@@ -161,6 +163,7 @@ async fn completion_column_index_survives_partial_update() {
     load_jsonl(&mut db, COMPOSITE_DATA, LoadMode::Overwrite)
         .await
         .unwrap();
+    db.ensure_indices().await.unwrap();
 
     db.mutate(
         "main",

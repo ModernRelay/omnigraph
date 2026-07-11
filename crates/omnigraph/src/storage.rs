@@ -502,6 +502,54 @@ pub fn normalize_root_uri(uri: &str) -> Result<String> {
     }
 }
 
+/// Process-local identity used to share writer queues across handles for the
+/// same graph root.
+///
+/// The storage URI remains unchanged: this identity is used only as the key in
+/// the in-process queue registry. Local paths are first made absolute
+/// lexically, then the deepest canonicalizable ancestor is resolved so aliases
+/// through symlinks converge. Any suffix that does not exist yet is appended
+/// unchanged, which makes the identity safe to compute before `init` creates
+/// the graph directory. Object-store and caller-defined URI schemes are opaque
+/// and retain their normalized spelling.
+pub(crate) fn write_queue_root_identity(normalized_root: &str) -> Result<String> {
+    let local_path = if normalized_root.starts_with(FILE_SCHEME_PREFIX) {
+        local_path_from_file_uri(normalized_root)?
+    } else if Path::new(normalized_root).is_absolute() {
+        PathBuf::from(normalized_root)
+    } else if has_uri_scheme(normalized_root) {
+        return Ok(normalized_root.to_string());
+    } else {
+        PathBuf::from(normalized_root)
+    };
+
+    let absolute = absolutize_lexically(local_path)?;
+    let mut ancestor = absolute.as_path();
+    let mut suffix = Vec::new();
+
+    loop {
+        if let Ok(canonical) = std::fs::canonicalize(ancestor) {
+            let mut identity = canonical;
+            for component in suffix.iter().rev() {
+                identity.push(component);
+            }
+            return Ok(normalize_local_path(&identity));
+        }
+
+        let Some(name) = ancestor.file_name() else {
+            // Filesystem roots should always canonicalize. Falling back to the
+            // lexical absolute path preserves queue availability on unusual
+            // platforms/filesystems without changing the storage root.
+            return Ok(normalize_local_path(&absolute));
+        };
+        suffix.push(name.to_os_string());
+        let Some(parent) = ancestor.parent() else {
+            return Ok(normalize_local_path(&absolute));
+        };
+        ancestor = parent;
+    }
+}
+
 pub fn join_uri(root_uri: &str, relative_path: &str) -> String {
     let relative_path = relative_path.trim_start_matches('/');
     match storage_kind_for_uri(root_uri) {
@@ -532,6 +580,18 @@ fn local_path_from_uri(uri: &str) -> Result<PathBuf> {
         return local_path_from_file_uri(uri);
     }
     Ok(PathBuf::from(uri))
+}
+
+fn has_uri_scheme(value: &str) -> bool {
+    let Some(colon) = value.find(':') else {
+        return false;
+    };
+    let scheme = &value[..colon];
+    !scheme.is_empty()
+        && scheme.as_bytes()[0].is_ascii_alphabetic()
+        && scheme
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'+' | b'-' | b'.'))
 }
 
 /// Lexically absolutize a local path: join relative paths onto the current
@@ -906,6 +966,17 @@ mod tests {
             normalize_root_uri("s3://bucket/prefix/").unwrap(),
             "s3://bucket/prefix"
         );
+    }
+
+    #[test]
+    fn write_queue_identity_keeps_remote_and_custom_schemes_opaque() {
+        for root in [
+            "s3://bucket/prefix",
+            "memory://write-queue/custom",
+            "custom+transport:opaque-root",
+        ] {
+            assert_eq!(write_queue_root_identity(root).unwrap(), root);
+        }
     }
 
     #[test]

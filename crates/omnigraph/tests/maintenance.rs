@@ -17,8 +17,8 @@ use omnigraph::loader::{LoadMode, load_jsonl};
 use omnigraph::table_store::{IndexCoverage, TableStore};
 
 use helpers::{
-    MUTATION_QUERIES, TEST_DATA, TEST_SCHEMA, count_rows, init_and_load, mixed_params, mutate_main,
-    snapshot_main,
+    MUTATION_QUERIES, TEST_DATA, TEST_SCHEMA, count_rows, count_rows_branch, init_and_load,
+    mixed_params, mutate_main, snapshot_main,
 };
 
 /// Filesystem URI of a node sub-table, mirroring the engine's layout
@@ -361,7 +361,8 @@ node Doc {
     let uri = dir.path().to_str().unwrap();
     let mut db = Omnigraph::init(uri, SCHEMA).await.unwrap();
 
-    // First load builds the id + rank BTREEs over the initial fragment.
+    // Loads publish only data effects; establish the initial id + rank BTREEs
+    // explicitly through the reconciler before creating partial coverage.
     load_jsonl(
         &mut db,
         "{\"type\":\"Doc\",\"data\":{\"slug\":\"d1\",\"rank\":1}}\n\
@@ -370,6 +371,7 @@ node Doc {
     )
     .await
     .unwrap();
+    db.ensure_indices().await.unwrap();
 
     // A second load with NEW keys appends a fragment the existing BTREEs do not
     // cover (the existence gate skips re-building an index that already exists).
@@ -411,13 +413,9 @@ node Doc {
     );
 }
 
-// Regression: `optimize` must not crash on a graph that has a `Blob` table.
-//
-// Lance `compact_files` forces `BlobHandling::AllBinary`, which mis-decodes
-// blob-v2 columns ("more fields in the schema than provided column indices"),
-// failing even a pristine uniform-V2_2 multi-fragment blob table. `optimize`
-// must skip blob-bearing tables (and report the skip) rather than aborting the
-// whole sweep.
+// Regression: `optimize` must compact a graph that has a `Blob` table through
+// the same positive path as every other data table; a reintroduced skip would
+// hide both fragment growth and a Lance compatibility regression.
 //
 // History: through Lance 7.0.0 `compact_files` mis-decoded blob-v2 columns, so
 // `optimize` skipped blob tables (`SkipReason::BlobColumnsUnsupportedByLance`)
@@ -431,16 +429,17 @@ node Doc {
 async fn optimize_compacts_blob_table_alongside_plain_table() {
     let dir = tempfile::tempdir().unwrap();
     let uri = dir.path().to_str().unwrap();
-    // One Blob node type (`Doc`) + one plain node type (`Tag`): proves the blob
-    // table is skipped while a non-blob table in the same sweep still compacts.
+    // One Blob node type (`Doc`) + one plain node type (`Tag`): proves both use
+    // the normal compaction path in the same sweep.
     let schema = "\
 node Doc {\n    slug: String @key\n    content: Blob\n}\n\
 node Tag {\n    slug: String @key\n}\n";
     let mut db = Omnigraph::init(uri, schema).await.unwrap();
 
     // Multi-fragment blob table: Overwrite creates fragment 1; each Merge of
-    // new keys appends another. A >=2-fragment blob table is exactly what
-    // crashes `compact_files` today (single fragment would no-op and not crash).
+    // new keys appends another. A >=2-fragment blob table exercises the rewrite
+    // path that exposed the historical Lance regression (a single fragment
+    // would be a no-op).
     load_jsonl(
         &mut db,
         "{\"type\":\"Doc\",\"data\":{\"slug\":\"d1\",\"content\":\"base64:aGVsbG8x\"}}\n{\"type\":\"Doc\",\"data\":{\"slug\":\"d2\",\"content\":\"base64:aGVsbG8y\"}}",
@@ -926,7 +925,9 @@ async fn cleanup_without_any_policy_option_errors() {
 #[tokio::test]
 async fn cleanup_keep_one_preserves_head_and_table_remains_readable() {
     let dir = tempfile::tempdir().unwrap();
+    let uri = dir.path().to_str().unwrap().to_string();
     let mut db = init_and_load(&dir).await;
+    add_person_fragments(&mut db).await;
 
     let people_before = count_rows(&db, "node:Person").await;
     assert!(
@@ -934,9 +935,21 @@ async fn cleanup_keep_one_preserves_head_and_table_remains_readable() {
         "fixture should seed Person rows for this test to be meaningful"
     );
 
-    // Most aggressive version-based cleanup short of forcing keep=0. Lance's
-    // contract is that head is always preserved regardless, so the table
-    // must remain openable and rows must still be visible.
+    let person_uri = node_table_uri(&uri, "Person");
+    assert!(
+        Dataset::open(&person_uri)
+            .await
+            .unwrap()
+            .versions()
+            .await
+            .unwrap()
+            .len()
+            > 1,
+        "precondition: Person must have history to collect"
+    );
+
+    // Most aggressive version-based cleanup short of forcing keep=0. `keep`
+    // is exact over the available version list, not HEAD arithmetic.
     let _stats = db
         .cleanup(CleanupPolicyOptions {
             keep_versions: Some(1),
@@ -946,6 +959,52 @@ async fn cleanup_keep_one_preserves_head_and_table_remains_readable() {
         .unwrap();
 
     assert_eq!(count_rows(&db, "node:Person").await, people_before);
+    assert_eq!(
+        Dataset::open(&person_uri)
+            .await
+            .unwrap()
+            .versions()
+            .await
+            .unwrap()
+            .len(),
+        1,
+        "keep=1 must retain exactly the latest available version"
+    );
+}
+
+#[tokio::test]
+async fn cleanup_keep_exceeding_history_preserves_every_available_version() {
+    let dir = tempfile::tempdir().unwrap();
+    let uri = dir.path().to_str().unwrap().to_string();
+    let mut db = init_and_load(&dir).await;
+    let person_uri = node_table_uri(&uri, "Person");
+    let before = Dataset::open(&person_uri)
+        .await
+        .unwrap()
+        .versions()
+        .await
+        .unwrap()
+        .len();
+    assert!(before > 1, "fixture must contain version history");
+
+    db.cleanup(CleanupPolicyOptions {
+        keep_versions: Some(10),
+        older_than: None,
+    })
+    .await
+    .unwrap();
+
+    let after = Dataset::open(&person_uri)
+        .await
+        .unwrap()
+        .versions()
+        .await
+        .unwrap()
+        .len();
+    assert_eq!(
+        after, before,
+        "keep greater than available history must not become an unbounded cleanup"
+    );
 }
 
 #[tokio::test]
@@ -969,6 +1028,224 @@ async fn cleanup_older_than_zero_preserves_head() {
     load_jsonl(&mut db, TEST_DATA, LoadMode::Merge)
         .await
         .unwrap();
+}
+
+#[tokio::test]
+async fn cleanup_preserves_main_version_pinned_by_live_lazy_branch() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut db = init_and_load(&dir).await;
+
+    db.branch_create("feature").await.unwrap();
+    let feature_before = db.snapshot_of(ReadTarget::branch("feature")).await.unwrap();
+    let feature_person = feature_before.entry("node:Person").unwrap();
+    assert_eq!(
+        feature_person.table_branch, None,
+        "precondition: Person must still be inherited lazily from main"
+    );
+    let pinned_main_version = feature_person.table_version;
+    let feature_people_before = count_rows_branch(&db, "feature", "node:Person").await;
+
+    // Move main far enough that keep=1 would collect the version inherited by
+    // the lazy branch unless cleanup accounts for graph-level branch pins.
+    add_person_fragments(&mut db).await;
+    let main_person_version = db
+        .snapshot_of(ReadTarget::branch("main"))
+        .await
+        .unwrap()
+        .entry("node:Person")
+        .unwrap()
+        .table_version;
+    assert!(
+        pinned_main_version < main_person_version.saturating_sub(1),
+        "precondition: lazy-branch pin must fall outside keep=1 retention"
+    );
+
+    db.cleanup(CleanupPolicyOptions {
+        keep_versions: Some(1),
+        older_than: None,
+    })
+    .await
+    .unwrap();
+
+    assert_eq!(
+        count_rows_branch(&db, "feature", "node:Person").await,
+        feature_people_before,
+        "cleanup must preserve the exact main-table version inherited by a live lazy branch"
+    );
+
+    // The same floor must constrain a time-only policy. Lance combines the
+    // timestamp and version predicates with AND, so injecting the branch pin
+    // as `before_version` keeps the inherited version even when every old
+    // manifest satisfies the timestamp cutoff.
+    db.cleanup(CleanupPolicyOptions {
+        keep_versions: None,
+        older_than: Some(Duration::from_secs(0)),
+    })
+    .await
+    .unwrap();
+    assert_eq!(
+        count_rows_branch(&db, "feature", "node:Person").await,
+        feature_people_before,
+        "time-only cleanup must honor the same live lazy-branch floor"
+    );
+}
+
+#[tokio::test]
+async fn cleanup_uses_oldest_pin_across_multiple_live_lazy_branches() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut db = init_and_load(&dir).await;
+
+    db.branch_create("a-old").await.unwrap();
+    let old_rows = count_rows_branch(&db, "a-old", "node:Person").await;
+    add_person_fragments(&mut db).await;
+    db.branch_create("z-new").await.unwrap();
+    let new_rows = count_rows_branch(&db, "z-new", "node:Person").await;
+    mutate_main(
+        &mut db,
+        MUTATION_QUERIES,
+        "insert_person",
+        &mixed_params(&[("$name", "Ivan")], &[("$age", 44)]),
+    )
+    .await
+    .unwrap();
+
+    db.cleanup(CleanupPolicyOptions {
+        keep_versions: Some(1),
+        older_than: None,
+    })
+    .await
+    .unwrap();
+
+    assert_eq!(
+        count_rows_branch(&db, "a-old", "node:Person").await,
+        old_rows,
+        "the oldest live pin must win over later branch pins"
+    );
+    assert_eq!(
+        count_rows_branch(&db, "z-new", "node:Person").await,
+        new_rows,
+        "newer lazy pins must remain readable too"
+    );
+}
+
+#[tokio::test]
+async fn cleanup_fails_closed_when_live_lazy_branch_pin_is_unopenable() {
+    let dir = tempfile::tempdir().unwrap();
+    let uri = dir.path().to_str().unwrap().to_string();
+    let mut db = init_and_load(&dir).await;
+
+    db.branch_create("feature").await.unwrap();
+    let pinned_main_version = db
+        .snapshot_of(ReadTarget::branch("feature"))
+        .await
+        .unwrap()
+        .entry("node:Person")
+        .unwrap()
+        .table_version;
+    add_person_fragments(&mut db).await;
+
+    // Simulate damage created by an older cleanup implementation: raw Lance
+    // sees no native Person branch for the lazy graph branch and removes its
+    // inherited main manifest.
+    let person_uri = node_table_uri(&uri, "Person");
+    let ds = Dataset::open(&person_uri).await.unwrap();
+    let head = ds.version().version;
+    assert!(pinned_main_version < head, "precondition: main advanced");
+    let removed = lance::dataset::cleanup::cleanup_old_versions(
+        &ds,
+        lance::dataset::cleanup::CleanupPolicy {
+            before_timestamp: None,
+            before_version: Some(head),
+            delete_unverified: false,
+            error_if_tagged_old_versions: false,
+            clean_referenced_branches: false,
+            delete_rate_limit: None,
+        },
+    )
+    .await
+    .unwrap();
+    assert!(
+        removed.old_versions > 0,
+        "precondition: raw Lance cleanup removed old main versions"
+    );
+    let company_uri = node_table_uri(&uri, "Company");
+    let company_versions_before = Dataset::open(&company_uri)
+        .await
+        .unwrap()
+        .versions()
+        .await
+        .unwrap()
+        .len();
+
+    let err = db
+        .cleanup(CleanupPolicyOptions {
+            keep_versions: Some(1),
+            older_than: None,
+        })
+        .await
+        .expect_err("cleanup must fail closed when a live lazy pin cannot be opened");
+    let message = err.to_string();
+    assert!(
+        message.contains("could not classify live branch 'feature'")
+            && message.contains("node:Person"),
+        "error must identify the unclassifiable live reference; got: {message}"
+    );
+    assert_eq!(
+        Dataset::open(&company_uri)
+            .await
+            .unwrap()
+            .versions()
+            .await
+            .unwrap()
+            .len(),
+        company_versions_before,
+        "the graph-wide preflight must fail before any unrelated table GC"
+    );
+}
+
+#[tokio::test]
+async fn cleanup_refuses_uncovered_main_head_drift_before_any_version_gc() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path().to_str().unwrap().to_string();
+    let mut db = init_and_load(&dir).await;
+    let (manifest_version, head_version, _) = forge_person_compaction_drift(&mut db, &root).await;
+    let company_uri = node_table_uri(&root, "Company");
+    let company_versions_before = Dataset::open(&company_uri)
+        .await
+        .unwrap()
+        .versions()
+        .await
+        .unwrap()
+        .len();
+
+    let err = db
+        .cleanup(CleanupPolicyOptions {
+            keep_versions: Some(1),
+            older_than: None,
+        })
+        .await
+        .expect_err("cleanup must not garbage-collect around uncovered HEAD drift");
+    let message = err.to_string();
+    assert!(
+        message.contains("uncovered HEAD drift")
+            && message.contains("node:Person")
+            && message.contains("repair"),
+        "drift refusal must be actionable; got: {message}"
+    );
+    let (manifest_after, head_after, _) = person_manifest_and_head(&db, &root).await;
+    assert_eq!(manifest_after, manifest_version);
+    assert_eq!(head_after, head_version);
+    assert_eq!(
+        Dataset::open(&company_uri)
+            .await
+            .unwrap()
+            .versions()
+            .await
+            .unwrap()
+            .len(),
+        company_versions_before,
+        "drift preflight must abort before unrelated table history is collected"
+    );
 }
 
 #[tokio::test]
@@ -1133,15 +1410,12 @@ async fn cleanup_reconciles_live_branch_orphan_fork_but_keeps_legitimate_fork() 
 }
 
 // Regression (iss-848): a table with rows but NULL vectors (the load-before-
-// embed window) must not abort index building. The vector (IVF) index cannot
-// train on 0 vectors, so `create_vector_index` errors with "KMeans cannot
-// train 1 centroids with 0 vectors". `build_indices_on_dataset_for_catalog`
-// is the chokepoint every caller funnels through (load/mutate via
-// prepare_updates_for_commit, ensure_indices, optimize, schema apply, merge),
-// so per-index fault isolation there must defer that one column (pending) and
-// still build the sibling scalar indexes, instead of propagating the error.
-// This exercises both the load path (which builds indices inline) and the
-// ensure_indices reconciler. Pre-fix this fails at the load step.
+// embed window) must remain writable and reconcilable. RFC-022-enrolled writes
+// publish only their logical data effect; physical indexes are derived work.
+// The vector (IVF) index cannot train on 0 vectors, so the index chokepoint must
+// defer that column as pending while still building eligible sibling indexes.
+// This exercises both halves of the contract: the logical load succeeds without
+// inline index work, then `ensure_indices` tolerates the untrainable vector.
 #[tokio::test]
 async fn index_build_tolerates_null_vector_rows() {
     let dir = tempfile::tempdir().unwrap();

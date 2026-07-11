@@ -29,6 +29,11 @@ pub struct SubTableEntry {
 pub(super) struct ManifestState {
     pub(super) version: u64,
     pub(super) entries: Vec<SubTableEntry>,
+    /// Exact materialized `graph_head:<branch>` values from this SAME manifest
+    /// version. Keeping the head beside the table snapshot prevents a
+    /// manifest-only refresh from leaving coarse write authority split between
+    /// a fresh table view and the commit graph's older derived cache.
+    pub(super) graph_heads: HashMap<String, String>,
 }
 
 #[derive(Debug, Clone)]
@@ -91,10 +96,13 @@ struct ManifestScan {
     /// the caller asked (`collect_lineage`). Empty on the table-state read hot
     /// path so it never pays the O(commits) lineage JSON decode; populated on the
     /// publish path, where `load_publish_state` already needs the parent and would
-    /// otherwise scan `__manifest` a second time via `read_graph_lineage`. `graph_head`
-    /// rows are not collected here — parent resolution uses the head-over-commits
-    /// computation, not the denormalized head pointer (see `resolve_lineage_rows`).
+    /// otherwise scan `__manifest` a second time via `read_graph_lineage`.
     lineage_rows: Vec<GraphLineageRow>,
+    /// Exact materialized `graph_head:<branch>` values, collected on every
+    /// table-state/publish pass. This is bounded by branch count; unlike
+    /// `lineage_rows`, it does not grow with commit history. OCC must distinguish
+    /// a present head from an absent one (notably on a fresh named branch).
+    graph_heads: HashMap<String, String>,
 }
 
 pub(super) fn manifest_schema() -> SchemaRef {
@@ -137,6 +145,7 @@ pub(super) async fn read_manifest_state(dataset: &Dataset) -> Result<ManifestSta
         scan.tombstones
             .into_iter()
             .map(|t| (t.table_key, t.tombstone_version)),
+        scan.graph_heads,
     ))
 }
 
@@ -152,6 +161,7 @@ pub(super) fn assemble_manifest_state(
     version: u64,
     version_entries: Vec<SubTableEntry>,
     tombstones: impl IntoIterator<Item = (String, u64)>,
+    graph_heads: HashMap<String, String>,
 ) -> ManifestState {
     let mut latest_versions = HashMap::<String, SubTableEntry>::new();
     for entry in version_entries {
@@ -183,7 +193,11 @@ pub(super) fn assemble_manifest_state(
         })
         .collect();
     entries.sort_by(|a, b| a.table_key.cmp(&b.table_key));
-    ManifestState { version, entries }
+    ManifestState {
+        version,
+        entries,
+        graph_heads,
+    }
 }
 
 // After RFC-013 P2 folded the publish path off this accessor (it now projects
@@ -208,6 +222,9 @@ pub(super) struct PublishScan {
     pub(super) version_entries: Vec<SubTableEntry>,
     pub(super) tombstones: Vec<((String, u64), ())>,
     pub(super) lineage_rows: Vec<GraphLineageRow>,
+    /// Exact `graph_head:<branch>` rows keyed by the branch suffix (`main` for
+    /// main). Absence is meaningful and is preserved by a missing map entry.
+    pub(super) graph_heads: HashMap<String, String>,
 }
 
 /// One-scan read of everything the publish path needs. `collect_lineage` is
@@ -224,6 +241,7 @@ pub(super) async fn read_publish_scan(dataset: &Dataset) -> Result<PublishScan> 
             .map(|tombstone| ((tombstone.table_key, tombstone.tombstone_version), ()))
             .collect(),
         lineage_rows: scan.lineage_rows,
+        graph_heads: scan.graph_heads,
     })
 }
 
@@ -264,14 +282,43 @@ fn decode_graph_commit_row(
     })
 }
 
+/// Decode one `graph_head` row into its exact branch-key / commit-id pair.
+/// Shared by the dedicated lineage reader and the publisher's folded one-scan
+/// path so presence, absence, and malformed-row handling cannot drift.
+fn decode_graph_head_row(
+    object_ids: &StringArray,
+    metadata: &StringArray,
+    row: usize,
+) -> Result<(String, String)> {
+    if metadata.is_null(row) {
+        return Err(OmniError::manifest_internal(format!(
+            "manifest graph_head row missing metadata for {}",
+            object_ids.value(row)
+        )));
+    }
+    let head_meta: GraphHeadMetadata = serde_json::from_str(metadata.value(row)).map_err(|e| {
+        OmniError::manifest_internal(format!("failed to decode graph_head metadata: {e}"))
+    })?;
+    let branch_key = object_ids
+        .value(row)
+        .strip_prefix("graph_head:")
+        .ok_or_else(|| {
+            OmniError::manifest_internal(format!(
+                "invalid graph_head object id {}",
+                object_ids.value(row)
+            ))
+        })?
+        .to_string();
+    Ok((branch_key, head_meta.head_commit_id))
+}
+
 async fn read_manifest_scan(dataset: &Dataset, collect_lineage: bool) -> Result<ManifestScan> {
     // Project only the columns the assembly below reads (RFC-013 PR2 #1c). The
-    // table-state hot path never touches `object_id` (lineage decode only) or
-    // `base_objects` (reserved/unused — never read on any path), so reading them
-    // is wasted bytes on every `__manifest` scan — write publish AND every
-    // branch-op open. Mirrors Lance's own directory-catalog `__manifest` reads,
-    // which project to the needed columns rather than scanning all of them.
-    let mut projection: Vec<&str> = vec![
+    // `object_id` is needed for the bounded graph-head authority decode on every
+    // path; `base_objects` remains reserved/unused. Mirrors Lance's own
+    // directory-catalog `__manifest` reads, which project only needed columns.
+    let projection: Vec<&str> = vec![
+        "object_id",
         "object_type",
         "location",
         "metadata",
@@ -280,9 +327,6 @@ async fn read_manifest_scan(dataset: &Dataset, collect_lineage: bool) -> Result<
         "table_branch",
         "row_count",
     ];
-    if collect_lineage {
-        projection.push("object_id");
-    }
     let mut scanner = dataset.scan();
     scanner
         .project(&projection)
@@ -299,6 +343,7 @@ async fn read_manifest_scan(dataset: &Dataset, collect_lineage: bool) -> Result<
     let mut version_entries = Vec::new();
     let mut tombstones = Vec::new();
     let mut lineage_rows = Vec::new();
+    let mut graph_heads = HashMap::new();
 
     for batch in &batches {
         let object_types = string_column(batch, "object_type")?;
@@ -308,13 +353,11 @@ async fn read_manifest_scan(dataset: &Dataset, collect_lineage: bool) -> Result<
         let versions = u64_column(batch, "table_version")?;
         let branches = string_column(batch, "table_branch")?;
         let row_counts = u64_column(batch, "row_count")?;
-        // `object_id` is only needed for lineage decoding; skip the lookup
-        // entirely on the table-state hot path (`collect_lineage == false`).
-        let object_ids = if collect_lineage {
-            Some(string_column(batch, "object_id")?)
-        } else {
-            None
-        };
+        // `object_id` is needed for the exact graph-head authority even on the
+        // table-state path. We still skip every `graph_commit` decode there, so
+        // the added work is bounded by the number of branch-head rows rather
+        // than growing with commit history.
+        let object_ids = string_column(batch, "object_id")?;
 
         for row in 0..batch.num_rows() {
             let table_key = table_keys.value(row).to_string();
@@ -358,21 +401,22 @@ async fn read_manifest_scan(dataset: &Dataset, collect_lineage: bool) -> Result<
                         tombstone_version,
                     });
                 }
-                // `graph_commit` rows (RFC-013) are decoded into the scan ONLY
-                // when `collect_lineage` is set (the publish path, which resolves
-                // a parent). The table-state hot path leaves them — and
-                // `graph_head` + any future object type — in the `_` arm so it
-                // never pays the O(commits) lineage JSON decode. When NOT
-                // collecting, `object_ids` is `None`, so this arm is the same
-                // forward-compat skip as the `_` arm.
+                // `graph_commit` rows (RFC-013) are decoded ONLY for the publish
+                // path, which resolves a parent. The table-state hot path skips
+                // them, while still decoding the bounded graph-head authority
+                // rows below.
                 OBJECT_TYPE_GRAPH_COMMIT if collect_lineage => {
-                    let object_ids = object_ids.expect("object_ids read when collect_lineage");
                     lineage_rows.push(decode_graph_commit_row(
                         object_ids, metadata, versions, branches, row,
                     )?);
                 }
-                // Skipped on the table-state path (and for `graph_head` / unknown
-                // future object types on every path): no table snapshot needs them.
+                OBJECT_TYPE_GRAPH_HEAD => {
+                    let (branch_key, head_commit_id) =
+                        decode_graph_head_row(object_ids, metadata, row)?;
+                    graph_heads.insert(branch_key, head_commit_id);
+                }
+                // Commit rows are skipped on the table-state path; unknown future
+                // object types are skipped on every path.
                 _ => {}
             }
         }
@@ -404,6 +448,7 @@ async fn read_manifest_scan(dataset: &Dataset, collect_lineage: bool) -> Result<
         version_entries: entries,
         tombstones,
         lineage_rows,
+        graph_heads,
     })
 }
 
@@ -447,26 +492,9 @@ pub(crate) async fn read_graph_lineage(
                     )?);
                 }
                 OBJECT_TYPE_GRAPH_HEAD => {
-                    if metadata.is_null(row) {
-                        return Err(OmniError::manifest_internal(format!(
-                            "manifest graph_head row missing metadata for {}",
-                            object_ids.value(row)
-                        )));
-                    }
-                    let head_meta: GraphHeadMetadata = serde_json::from_str(metadata.value(row))
-                        .map_err(|e| {
-                            OmniError::manifest_internal(format!(
-                                "failed to decode graph_head metadata: {e}"
-                            ))
-                        })?;
-                    // `object_id` is `graph_head:<branch>`; the branch key after
-                    // the prefix is the projection's map key (`main` for main).
-                    let branch_key = object_ids
-                        .value(row)
-                        .strip_prefix("graph_head:")
-                        .unwrap_or_default()
-                        .to_string();
-                    graph_heads.insert(branch_key, head_meta.head_commit_id);
+                    let (branch_key, head_commit_id) =
+                        decode_graph_head_row(object_ids, metadata, row)?;
+                    graph_heads.insert(branch_key, head_commit_id);
                 }
                 _ => {}
             }
@@ -622,7 +650,6 @@ pub(super) fn entries_to_batch(
         row_counts,
     )
 }
-
 
 pub(super) fn manifest_rows_batch(
     object_ids: Vec<String>,

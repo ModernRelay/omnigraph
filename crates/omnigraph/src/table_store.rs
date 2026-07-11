@@ -16,13 +16,14 @@ use lance::dataset::{
 use lance::datatypes::{BlobKind, Schema as LanceSchema};
 use lance::index::DatasetIndexExt;
 use lance::index::scalar::IndexDetails;
-use lance_select::mask::RowAddrTreeMap;
 use lance_file::version::LanceFileVersion;
 use lance_index::scalar::{InvertedIndexParams, ScalarIndexParams};
 use lance_index::{IndexType, is_system_index};
 use lance_linalg::distance::MetricType;
+use lance_select::mask::RowAddrTreeMap;
 use lance_table::format::{Fragment, IndexMetadata, RowIdMeta};
 use lance_table::rowids::{RowIdSequence, write_row_ids};
+use serde::{Deserialize, Serialize};
 use std::sync::Arc;
 
 use crate::db::manifest::TableVersionMetadata;
@@ -48,6 +49,30 @@ pub enum IndexCoverage {
     Indexed,
     /// Lance will not use the scalar index for this scan (correct, full scan).
     Degraded { reason: String },
+}
+
+/// Stable identity of one Lance transaction.
+///
+/// Lance persists both fields in the transaction file referenced by the
+/// committed manifest. Recovery uses the pair, rather than a numeric table
+/// version alone, to prove that an observed HEAD was produced by the staged
+/// effect named in a recovery sidecar. The UUID distinguishes two writers that
+/// started from the same version. Lance may preserve both fields while
+/// rebasing, so enrolled callers must also require the achieved table version
+/// to be exactly `read_version + 1`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct StagedTransactionIdentity {
+    pub read_version: u64,
+    pub uuid: String,
+}
+
+impl From<&Transaction> for StagedTransactionIdentity {
+    fn from(transaction: &Transaction) -> Self {
+        Self {
+            read_version: transaction.read_version,
+            uuid: transaction.uuid.clone(),
+        }
+    }
 }
 
 /// A Lance write that has produced fragment files on object storage but is
@@ -136,6 +161,30 @@ impl StagedWrite {
 
     pub fn removed_fragment_ids(&self) -> &[u64] {
         &self.removed_fragment_ids
+    }
+
+    /// Identity Lance assigned when this effect was staged.
+    pub fn transaction_identity(&self) -> StagedTransactionIdentity {
+        StagedTransactionIdentity::from(&self.transaction)
+    }
+
+    /// Bind a pre-minted recovery identity to a transaction staged after a
+    /// deferred branch fork. The operation and read version still come from
+    /// Lance; only its otherwise-random UUID is replaced so the sidecar can be
+    /// durable before the target ref (and its branch-local fragment paths)
+    /// exist.
+    pub(crate) fn bind_transaction_identity(
+        &mut self,
+        planned: &StagedTransactionIdentity,
+    ) -> Result<()> {
+        if self.transaction.read_version != planned.read_version {
+            return Err(OmniError::manifest_internal(format!(
+                "staged transaction read version {} does not match pre-minted recovery pin {}",
+                self.transaction.read_version, planned.read_version
+            )));
+        }
+        self.transaction.uuid.clone_from(&planned.uuid);
+        Ok(())
     }
 }
 
@@ -228,19 +277,6 @@ impl TableStore {
         }
     }
 
-    pub async fn delete_branch(&self, dataset_uri: &str, branch: &str) -> Result<()> {
-        let mut ds = crate::instrumentation::open_dataset(
-            dataset_uri,
-            crate::instrumentation::VersionResolution::Latest,
-            Some(&self.session),
-            crate::instrumentation::table_wrapper(),
-        )
-        .await?;
-        ds.delete_branch(branch)
-            .await
-            .map_err(|e| OmniError::Lance(e.to_string()))
-    }
-
     /// List the named Lance branches present on the dataset at `dataset_uri`.
     /// The `cleanup` orphan reconciler diffs this against the manifest branch
     /// set to find orphaned per-table forks. `main`/default is not a named
@@ -262,15 +298,16 @@ impl TableStore {
 
     /// Idempotently drop `branch` from the dataset at `dataset_uri`.
     ///
-    /// Unlike [`delete_branch`](Self::delete_branch), this tolerates an
-    /// already-absent branch — both a missing contents ref (Lance's
+    /// This tolerates an already-absent branch — both a missing contents ref (Lance's
     /// `force_delete_branch` handles that) and a missing `tree/{branch}/`
     /// directory (the local-store `NotFound` quirk pinned by
     /// `lance_surface_guards::force_delete_branch_semantics`). Safe to call on a
     /// possibly-orphaned or already-reclaimed fork.
     ///
-    /// A branch that still has referencing descendants (`RefConflict`) is NOT
-    /// tolerated: that is a real ordering error and surfaces as `OmniError::Lance`.
+    /// A branch that still has referencing descendants (`RefConflict`) or a
+    /// live physical path-child is NOT tolerated: those are real ordering
+    /// errors. The graph namespace prevents new path-prefix overlaps; surfacing
+    /// legacy ones keeps cleanup from falsely reporting a reclaim Lance skipped.
     /// Used by the eager best-effort reclaim in `cleanup_deleted_branch_tables`
     /// and the `cleanup` orphan reconciler.
     pub async fn force_delete_branch(&self, dataset_uri: &str, branch: &str) -> Result<()> {
@@ -281,11 +318,7 @@ impl TableStore {
             crate::instrumentation::table_wrapper(),
         )
         .await?;
-        match ds.force_delete_branch(branch).await {
-            Ok(()) => Ok(()),
-            Err(lance::Error::RefNotFound { .. }) | Err(lance::Error::NotFound { .. }) => Ok(()),
-            Err(e) => Err(OmniError::Lance(e.to_string())),
-        }
+        crate::branch_control::force_delete_branch_idempotent(&mut ds, branch).await
     }
 
     pub fn ensure_expected_version(
@@ -338,44 +371,28 @@ impl TableStore {
             .map_err(|e| OmniError::Lance(e.to_string()))?;
         self.ensure_expected_version(&source_ds, table_key, source_version)?;
 
-        if let Err(create_err) = source_ds
-            .create_branch(target_branch, source_version, None)
-            .await
+        let created = match crate::branch_control::create_branch_recoverably(
+            &mut source_ds,
+            target_branch,
+            source_version,
+        )
+        .await?
         {
-            // Disambiguate the failure: only a genuinely pre-existing ref is a
-            // reclaim candidate. Mapping EVERY create_branch failure to
-            // `RefAlreadyExists` would route a transient I/O / version / Lance
-            // internal error into the destructive reclaim path. So check whether
-            // the ref actually exists; if not, the failure is real — propagate
-            // it (preserving error fidelity) rather than force-deleting.
-            //
-            // `list_branches` reads `_refs/branches/` from the store, so it sees
-            // a fully-formed manifest-unreferenced fork (our common case — a
-            // create_branch that completed but whose manifest publish did not).
-            // It does NOT see a phase-1-only Lance "zombie" (tree dir written,
-            // no BranchContents) — but neither does `cleanup`'s reconciler, also
-            // list_branches-based. A zombie only forms if create_branch is
-            // interrupted *between its two internal phases* (a far narrower
-            // window than the manifest-publish gap), and it surfaces here as the
-            // propagated create error requiring manual reclaim. We deliberately
-            // do NOT force-delete on a not-found-ref failure: it is
-            // indistinguishable from a transient error on a fresh create, and
-            // force-deleting there is the destructive overreach this guard
-            // removes. The caller holds the per-(table, branch) write queue, so
-            // no in-process writer races this fork; a cross-process create
-            // between our check and now is the documented one-winner-CAS gap and
-            // propagates as a retryable error.
-            let ref_exists = source_ds
-                .list_branches()
-                .await
-                .map(|b| b.contains_key(target_branch))
-                .unwrap_or(false);
-            if ref_exists {
+            crate::branch_control::BranchCreateOutcome::Created(dataset) => dataset,
+            crate::branch_control::BranchCreateOutcome::RefAlreadyExists => {
                 return Ok(ForkOutcome::RefAlreadyExists);
             }
-            return Err(OmniError::Lance(create_err.to_string()));
-        }
+        };
 
+        // The ref is now independently durable. Any error from this point is an
+        // ambiguous/post-effect outcome to the caller and must retain an armed
+        // recovery intent rather than being treated as a safe pre-effect retry.
+        crate::failpoints::maybe_fail(crate::failpoints::names::FORK_POST_CREATE_PRE_OPEN)?;
+
+        // Re-open through the shared session for normal cache behavior. The
+        // returned handle above is used only as proof that the matching branch
+        // dataset was openable during classification.
+        drop(created);
         let ds = self
             .open_dataset_head(dataset_uri, Some(target_branch))
             .await?;
@@ -445,6 +462,30 @@ impl TableStore {
             .iter()
             .copied()
             .collect::<Vec<_>>();
+
+        Self::materialize_blob_batch_with_row_ids(ds, batch, &row_ids).await
+    }
+
+    /// Rebuild the blob columns in `batch` using explicit stable row ids.
+    ///
+    /// Most rewrite callers scan with `_rowid` and use
+    /// [`Self::materialize_blob_batch`]. A predicate-filtered blob mutation
+    /// cannot include blob descriptors in that scan on the pinned Lance
+    /// revision (the filter projection panics), so it first scans only
+    /// non-blob columns + `_rowid`, takes the full descriptor rows by id, and
+    /// calls this sibling with the ids captured by the safe scan.
+    async fn materialize_blob_batch_with_row_ids(
+        ds: &Dataset,
+        batch: RecordBatch,
+        row_ids: &[u64],
+    ) -> Result<RecordBatch> {
+        if batch.num_rows() != row_ids.len() {
+            return Err(OmniError::Lance(format!(
+                "blob materialization row count {} does not match {} row ids",
+                batch.num_rows(),
+                row_ids.len()
+            )));
+        }
 
         let schema: SchemaRef = Arc::new(ds.schema().into());
         let mut columns = Vec::with_capacity(schema.fields().len());
@@ -1268,6 +1309,44 @@ impl TableStore {
     /// the publisher at end-of-query to materialize all staged writes before
     /// the meta-manifest commit.
     pub async fn commit_staged(&self, ds: Arc<Dataset>, staged: StagedWrite) -> Result<Dataset> {
+        self.commit_staged_with_retry_budget(ds, staged, None)
+            .await
+            .map(|(dataset, _)| dataset)
+    }
+
+    /// Commit an RFC-022-enrolled staged effect with no commit-conflict retry.
+    ///
+    /// `CommitBuilder::with_max_retries(0)` gives Lance one commit attempt. It
+    /// can still perform its initial conflict-resolution pass before that
+    /// attempt, so this method also reads back and returns the identity of the
+    /// transaction that actually landed. Callers must compare it with
+    /// [`StagedWrite::transaction_identity`] AND require the returned dataset
+    /// version to equal `read_version + 1`: Lance's preflight rebase can
+    /// preserve the transaction fields while committing at a later version.
+    /// Either mismatch is a post-effect recovery case, not permission to widen
+    /// the prepared plan.
+    pub async fn commit_staged_exact(
+        &self,
+        ds: Arc<Dataset>,
+        staged: StagedWrite,
+    ) -> Result<(Dataset, StagedTransactionIdentity)> {
+        let (dataset, committed_identity) = self
+            .commit_staged_with_retry_budget(ds, staged, Some(0))
+            .await?;
+        let committed_identity = committed_identity.ok_or_else(|| {
+            OmniError::manifest_internal(
+                "Lance committed a staged effect without a readable transaction identity",
+            )
+        })?;
+        Ok((dataset, committed_identity))
+    }
+
+    async fn commit_staged_with_retry_budget(
+        &self,
+        ds: Arc<Dataset>,
+        staged: StagedWrite,
+        max_retries: Option<u32>,
+    ) -> Result<(Dataset, Option<StagedTransactionIdentity>)> {
         // Skip Lance's auto-cleanup hook on every commit. OmniGraph owns version
         // GC explicitly (optimize.rs::cleanup_all_tables); Lance's hook fires off
         // the *dataset's stored* `lance.auto_cleanup.*` config, which graphs
@@ -1277,13 +1356,27 @@ impl TableStore {
         // data path) for new and legacy datasets alike, preventing Lance from
         // GC'ing versions the __manifest still pins for snapshots/time-travel.
         let mut builder = CommitBuilder::new(ds).with_skip_auto_cleanup(true);
+        if let Some(max_retries) = max_retries {
+            builder = builder.with_max_retries(max_retries);
+        }
         if let Some(affected_rows) = staged.commit_metadata.affected_rows {
             builder = builder.with_affected_rows(affected_rows);
         }
-        builder
+        let dataset = builder
             .execute(staged.transaction)
             .await
-            .map_err(|e| OmniError::Lance(e.to_string()))
+            .map_err(|e| OmniError::Lance(e.to_string()))?;
+        let committed_identity = if max_retries.is_some() {
+            dataset
+                .read_transaction()
+                .await
+                .map_err(|e| OmniError::Lance(e.to_string()))?
+                .as_ref()
+                .map(StagedTransactionIdentity::from)
+        } else {
+            None
+        };
+        Ok((dataset, committed_identity))
     }
 
     /// Stage an overwrite (write_fragments + Operation::Overwrite { schema, fragments }).
@@ -1586,33 +1679,119 @@ impl TableStore {
         }
 
         let committed = self.scan(committed_ds, projection, filter, None).await?;
-        if pending_batches.is_empty() {
-            return Ok(committed);
+        combine_committed_with_pending(
+            committed,
+            pending_batches,
+            pending_schema,
+            projection,
+            filter,
+            key_column,
+        )
+        .await
+    }
+
+    /// Read a blob-bearing table as a full logical merge source while retaining
+    /// [`Self::scan_with_pending`]'s merge-shadow semantics.
+    ///
+    /// Lance normally scans blob-v2 columns as physical descriptor structs.
+    /// Those descriptors are a read representation, not valid writer input: a
+    /// full-row merge sends them through the blob writer, which requires the
+    /// logical `Struct<data, uri>` shape and fails with `Blob struct missing
+    /// data field`. This remained hidden while an `id` BTREE forced Lance's
+    /// partial-column merge plan; once index creation became reconciler-owned,
+    /// an index-absent table correctly selected the full-scan plan and exposed
+    /// the representation mismatch.
+    ///
+    /// A first scan evaluates `filter` with blob columns excluded and retains
+    /// stable row ids. Full descriptor rows are then taken by those ids without
+    /// a filter, and only their payloads are rebuilt as logical
+    /// [`BlobArrayBuilder`] columns. Pending rows already carry logical blob
+    /// arrays; both sides have the dataset's full logical schema before the
+    /// existing shadow union. The resulting batch is therefore valid for either
+    /// of Lance's merge plans, making physical index presence a performance
+    /// detail rather than a correctness precondition.
+    pub async fn scan_with_pending_materialized_blobs(
+        &self,
+        committed_ds: &Dataset,
+        pending_batches: &[RecordBatch],
+        pending_schema: Option<SchemaRef>,
+        filter: Option<&str>,
+        key_column: Option<&str>,
+    ) -> Result<Vec<RecordBatch>> {
+        let blob_columns = committed_ds
+            .schema()
+            .fields
+            .iter()
+            .filter(|field| field.is_blob())
+            .map(|field| field.name.clone())
+            .collect::<Vec<_>>();
+        if blob_columns.is_empty() {
+            return self
+                .scan_with_pending(
+                    committed_ds,
+                    pending_batches,
+                    pending_schema,
+                    None,
+                    filter,
+                    key_column,
+                )
+                .await;
         }
 
-        // Shadow committed rows whose key value also appears in pending.
-        // This makes scan_with_pending implement merge semantics rather
-        // than naive union: any row that has a pending update is
-        // represented ONLY by its pending value, never by both its
-        // (stale) committed value and its (current) pending value.
-        let committed = match key_column {
-            Some(key_col) => {
-                let pending_keys = collect_string_column_values(pending_batches, key_col)?;
-                if pending_keys.is_empty() {
-                    committed
-                } else {
-                    filter_out_rows_where_string_in(committed, key_col, &pending_keys)?
-                }
+        // The pinned Lance revision cannot combine a predicate filter with a
+        // full blob-v2 projection: `FilteredReadExec` applies the descriptor
+        // child projection to the logical blob field and panics. Select the
+        // matched rows without blob columns, retaining stable `_rowid`, then
+        // take exactly those full descriptor rows without a filter and rebuild
+        // their logical blobs. Thus payload I/O remains proportional to matched
+        // rows while avoiding any dependence on which merge/index plan Lance
+        // selects later.
+        let non_blob_columns = committed_ds
+            .schema()
+            .fields
+            .iter()
+            .filter(|field| !field.is_blob())
+            .map(|field| field.name.as_str())
+            .collect::<Vec<_>>();
+        let matched = Self::scan_stream(committed_ds, Some(&non_blob_columns), filter, None, true)
+            .await?
+            .try_collect::<Vec<RecordBatch>>()
+            .await
+            .map_err(|error| OmniError::Lance(error.to_string()))?;
+
+        let mut committed = Vec::with_capacity(matched.len());
+        for batch in matched {
+            let row_ids = batch
+                .column_by_name("_rowid")
+                .and_then(|column| column.as_any().downcast_ref::<UInt64Array>())
+                .ok_or_else(|| {
+                    OmniError::Lance("expected _rowid in predicate-matched blob scan".to_string())
+                })?
+                .values()
+                .to_vec();
+            if row_ids.is_empty() {
+                continue;
             }
-            None => committed,
-        };
+            let descriptors = committed_ds
+                .take_rows(&row_ids, committed_ds.schema().clone())
+                .await
+                .map_err(|error| OmniError::Lance(error.to_string()))?;
+            committed.push(
+                Self::materialize_blob_batch_with_row_ids(committed_ds, descriptors, &row_ids)
+                    .await?,
+            );
+        }
 
-        let pending =
-            scan_pending_batches(pending_batches, pending_schema, projection, filter).await?;
-
-        let mut out = committed;
-        out.extend(pending);
-        Ok(out)
+        let combined = combine_committed_with_pending(
+            committed,
+            pending_batches,
+            pending_schema,
+            None,
+            filter,
+            key_column,
+        )
+        .await?;
+        Ok(combined)
     }
 
     /// `count_rows` variant that respects staged writes. Used for
@@ -1847,6 +2026,42 @@ fn assign_row_id_meta(fragments: &mut [Fragment], start_row_id: u64) -> Result<(
         next_row_id += physical_rows;
     }
     Ok(())
+}
+
+/// Apply the in-memory half of `scan_with_pending` to an already-scanned
+/// committed view. Kept as one helper so the ordinary descriptor scan and the
+/// blob-materializing scan cannot drift in their key-shadow semantics.
+async fn combine_committed_with_pending(
+    committed: Vec<RecordBatch>,
+    pending_batches: &[RecordBatch],
+    pending_schema: Option<SchemaRef>,
+    projection: Option<&[&str]>,
+    filter: Option<&str>,
+    key_column: Option<&str>,
+) -> Result<Vec<RecordBatch>> {
+    if pending_batches.is_empty() {
+        return Ok(committed);
+    }
+
+    // Shadow committed rows whose key value also appears in pending. This is
+    // deliberately applied before filtering pending: a pending row that no
+    // longer matches must still suppress its stale committed predecessor.
+    let committed = match key_column {
+        Some(key_col) => {
+            let pending_keys = collect_string_column_values(pending_batches, key_col)?;
+            if pending_keys.is_empty() {
+                committed
+            } else {
+                filter_out_rows_where_string_in(committed, key_col, &pending_keys)?
+            }
+        }
+        None => committed,
+    };
+
+    let pending = scan_pending_batches(pending_batches, pending_schema, projection, filter).await?;
+    let mut out = committed;
+    out.extend(pending);
+    Ok(out)
 }
 
 /// Collect the set of values in a Utf8 column across multiple batches.

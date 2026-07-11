@@ -12,7 +12,11 @@ use lance_namespace::models::{
 use lance_namespace_impls::DirectoryNamespaceBuilder;
 use tokio::sync::Mutex;
 
-use super::publisher::{LineageIntent, ManifestBatchPublisher, PublishOutcome};
+use super::publisher::{
+    GraphHeadExpectation, LineageIntent, ManifestBatchPublisher, PublishOutcome,
+    PublishPrecondition,
+};
+use super::state::read_publish_scan;
 use super::*;
 use omnigraph_compiler::catalog::build_catalog;
 use omnigraph_compiler::schema::parser::parse_schema;
@@ -154,10 +158,11 @@ async fn test_commit_changes_can_register_new_table_and_tombstone_old_one() {
     let ds = crate::table_store::TableStore::create_empty_dataset(&dataset_uri, &schema)
         .await
         .unwrap();
-    let state = crate::table_store::TableStore::new(uri, Arc::new(lance::session::Session::default()))
-        .table_state(&dataset_uri, &ds)
-        .await
-        .unwrap();
+    let state =
+        crate::table_store::TableStore::new(uri, Arc::new(lance::session::Session::default()))
+            .table_state(&dataset_uri, &ds)
+            .await
+            .unwrap();
 
     mc.commit_changes(&[
         ManifestChange::RegisterTable(TableRegistration {
@@ -611,7 +616,10 @@ async fn test_branch_manifest_namespace_uses_entry_owner_branch_for_latest_table
     .with_branch("feature", None)
     .load()
     .await;
-    let err = format!("{:?}", mismatched.expect_err("branch-mismatched open must fail on v9"));
+    let err = format!(
+        "{:?}",
+        mismatched.expect_err("branch-mismatched open must fail on v9")
+    );
     assert!(
         err.contains("belonging to branch"),
         "expected the v9 branch-consistency error, got: {err}"
@@ -1148,11 +1156,12 @@ impl RecordingPublisher {
 
 #[async_trait]
 impl ManifestBatchPublisher for RecordingPublisher {
-    async fn publish(
+    async fn publish_with_precondition(
         &self,
         changes: &[ManifestChange],
         expected_table_versions: &HashMap<String, u64>,
         lineage: Option<&LineageIntent>,
+        precondition: &PublishPrecondition,
     ) -> Result<PublishOutcome> {
         let requests: Vec<CreateTableVersionRequest> = changes
             .iter()
@@ -1163,7 +1172,7 @@ impl ManifestBatchPublisher for RecordingPublisher {
             .collect();
         self.requests.lock().await.extend_from_slice(&requests);
         self.inner
-            .publish(changes, expected_table_versions, lineage)
+            .publish_with_precondition(changes, expected_table_versions, lineage, precondition)
             .await
     }
 }
@@ -1172,11 +1181,12 @@ struct FailingPublisher;
 
 #[async_trait]
 impl ManifestBatchPublisher for FailingPublisher {
-    async fn publish(
+    async fn publish_with_precondition(
         &self,
         _changes: &[ManifestChange],
         _expected_table_versions: &HashMap<String, u64>,
         _lineage: Option<&LineageIntent>,
+        _precondition: &PublishPrecondition,
     ) -> Result<PublishOutcome> {
         Err(OmniError::manifest(
             "injected batch publisher failure".to_string(),
@@ -1760,7 +1770,9 @@ async fn sub_current_graph_is_refused_on_open_with_rebuild_hint() {
     // (v4) cannot open, since `MIN_SUPPORTED == CURRENT == 4`.
     {
         let mut ds = open_manifest_dataset(uri, None).await.unwrap();
-        super::migrations::set_stamp_for_test(&mut ds, 3).await.unwrap();
+        super::migrations::set_stamp_for_test(&mut ds, 3)
+            .await
+            .unwrap();
     }
 
     // Read-write open is refused with the rebuild hint.
@@ -1820,7 +1832,9 @@ async fn sub_current_graph_is_refused_then_rebuilt_via_export_import() {
     // Make it look like a graph from an older release: rewind the stamp below CURRENT.
     {
         let mut ds = open_manifest_dataset(uri_old, None).await.unwrap();
-        super::migrations::set_stamp_for_test(&mut ds, 3).await.unwrap();
+        super::migrations::set_stamp_for_test(&mut ds, 3)
+            .await
+            .unwrap();
     }
     let err = match Omnigraph::open(uri_old).await {
         Ok(_) => panic!("a sub-CURRENT graph must be refused on open"),
@@ -1866,12 +1880,11 @@ async fn sub_current_graph_is_refused_then_rebuilt_via_export_import() {
 // Two (or N) writers committing DISJOINT tables on the same branch still share
 // one mutable `graph_head:main` row (one `object_id`, `WhenMatched::UpdateAll`).
 // Their table-version rows never collide (distinct `object_id`s), so the *only*
-// row-level CAS contention is on `graph_head:main`. The contract under test:
-// exactly one writer wins each CAS round; the loser retries, re-resolves its
-// parent off the freshly-advanced head (inside the publisher's retry loop), and
-// re-commits — so every writer commits and the resulting graph_commit DAG is a
-// single LINEAR chain (no fork), not a tree. This is the cross-process
-// disjoint-table fork closed by the shared head row (invariants.md §7.1).
+// row-level CAS contention is on `graph_head:main`. Two contracts coexist:
+// legacy `Any` publishers retry, re-parent, and eventually form one linear DAG;
+// RFC-022 `ExactGraphHead` publishers instead reject the stale prepared write
+// after the first winner changes authority. Both rely on the same shared row to
+// prevent a fork; the tests below pin both behaviors explicitly.
 
 /// A microsecond UNIX timestamp for a `LineageIntent`, matching the genesis /
 /// commit-graph `created_at` unit.
@@ -1880,6 +1893,180 @@ fn lineage_now_micros() -> i64 {
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap()
         .as_micros() as i64
+}
+
+/// Race two lineage-only publishes against the same exact named-branch head.
+/// Returns after proving exactly one committed and the loser surfaced a typed
+/// read-set change. `establish_head=false` exercises the load-bearing absent-row
+/// case on a fresh branch; `true` exercises ordinary head advancement.
+async fn assert_exact_named_head_race(establish_head: bool) {
+    use crate::error::ManifestConflictDetails;
+
+    let dir = tempfile::tempdir().unwrap();
+    let uri = dir.path().to_str().unwrap();
+    let catalog = build_test_catalog();
+    let mut mc = ManifestCoordinator::init(uri, &catalog).await.unwrap();
+    mc.create_branch("feature").await.unwrap();
+
+    let publisher = GraphNamespacePublisher::new(uri, Some("feature"));
+    let empty = HashMap::new();
+    let expected_head = if establish_head {
+        let intent = LineageIntent {
+            graph_commit_id: ulid::Ulid::new().to_string(),
+            branch: Some("feature".to_string()),
+            actor_id: None,
+            merged_parent_commit_id: None,
+            created_at: lineage_now_micros(),
+        };
+        publisher
+            .publish(&[], &empty, Some(&intent))
+            .await
+            .expect("establish named-branch graph head");
+        Some(intent.graph_commit_id)
+    } else {
+        None
+    };
+
+    // The folded publish scan must preserve exact absence. In particular, the
+    // inferred lineage head inherited from main must not masquerade as a
+    // materialized `graph_head:feature` row.
+    let branch_manifest = open_manifest_dataset(uri, Some("feature")).await.unwrap();
+    let scan = read_publish_scan(&branch_manifest).await.unwrap();
+    assert_eq!(scan.graph_heads.get("feature").cloned(), expected_head);
+    let branch_identifier = branch_manifest.branch_identifier().await.unwrap();
+
+    let precondition = PublishPrecondition::ExactGraphHead(GraphHeadExpectation::new(
+        Some("feature"),
+        branch_identifier,
+        expected_head.clone(),
+    ));
+    let intent_a = LineageIntent {
+        graph_commit_id: ulid::Ulid::new().to_string(),
+        branch: Some("feature".to_string()),
+        actor_id: Some("act-a".to_string()),
+        merged_parent_commit_id: None,
+        created_at: lineage_now_micros(),
+    };
+    let intent_b = LineageIntent {
+        graph_commit_id: ulid::Ulid::new().to_string(),
+        branch: Some("feature".to_string()),
+        actor_id: Some("act-b".to_string()),
+        merged_parent_commit_id: None,
+        created_at: lineage_now_micros(),
+    };
+    let publisher_a = GraphNamespacePublisher::new(uri, Some("feature"));
+    let publisher_b = GraphNamespacePublisher::new(uri, Some("feature"));
+    let precondition_a = precondition.clone();
+    let precondition_b = precondition;
+
+    let (result_a, result_b) = tokio::join!(
+        async {
+            publisher_a
+                .publish_with_precondition(&[], &empty, Some(&intent_a), &precondition_a)
+                .await
+        },
+        async {
+            publisher_b
+                .publish_with_precondition(&[], &empty, Some(&intent_b), &precondition_b)
+                .await
+        }
+    );
+
+    let (winner_id, loser_error) = match (result_a, result_b) {
+        (Ok(_), Err(err)) => (intent_a.graph_commit_id.clone(), err),
+        (Err(err), Ok(_)) => (intent_b.graph_commit_id.clone(), err),
+        (Ok(_), Ok(_)) => panic!("exact-head race silently re-parented both writers"),
+        (Err(a), Err(b)) => panic!("both exact-head writers failed: {a:?} / {b:?}"),
+    };
+
+    let OmniError::Manifest(error) = loser_error else {
+        panic!("expected typed manifest conflict, got {loser_error:?}");
+    };
+    assert_eq!(
+        error.details,
+        Some(ManifestConflictDetails::ReadSetChanged {
+            member: "graph_head:feature".to_string(),
+            expected: expected_head,
+            actual: Some(winner_id.clone()),
+        })
+    );
+
+    let branch_manifest = open_manifest_dataset(uri, Some("feature")).await.unwrap();
+    let (commits, heads) = read_graph_lineage(&branch_manifest).await.unwrap();
+    assert_eq!(heads.get("feature"), Some(&winner_id));
+    assert_eq!(
+        commits
+            .iter()
+            .filter(|commit| {
+                commit.graph_commit_id == intent_a.graph_commit_id
+                    || commit.graph_commit_id == intent_b.graph_commit_id
+            })
+            .count(),
+        1,
+        "the rejected intent must not leave an immutable graph_commit row"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn exact_head_publish_rejects_reparent_on_fresh_and_established_named_branch() {
+    assert_exact_named_head_race(false).await;
+    assert_exact_named_head_race(true).await;
+}
+
+#[tokio::test]
+async fn exact_publish_rejects_named_branch_delete_recreate_aba() {
+    use crate::error::ManifestConflictDetails;
+
+    let dir = tempfile::tempdir().unwrap();
+    let uri = dir.path().to_str().unwrap();
+    let catalog = build_test_catalog();
+    let mut mc = ManifestCoordinator::init(uri, &catalog).await.unwrap();
+    mc.create_branch("feature").await.unwrap();
+
+    let old_branch = open_manifest_dataset(uri, Some("feature")).await.unwrap();
+    let old_identifier = old_branch.branch_identifier().await.unwrap();
+    assert!(
+        read_publish_scan(&old_branch)
+            .await
+            .unwrap()
+            .graph_heads
+            .get("feature")
+            .is_none(),
+        "fresh named branch starts without its own graph_head row"
+    );
+
+    // Recreate the same name at the same logical fork point. Numeric manifest
+    // version and exact graph-head absence can repeat; only Lance's native
+    // branch identifier distinguishes the incarnation.
+    mc.delete_branch("feature").await.unwrap();
+    mc.create_branch("feature").await.unwrap();
+    let recreated = open_manifest_dataset(uri, Some("feature")).await.unwrap();
+    let recreated_identifier = recreated.branch_identifier().await.unwrap();
+    assert_ne!(old_identifier, recreated_identifier);
+
+    let precondition = PublishPrecondition::ExactGraphHead(GraphHeadExpectation::new(
+        Some("feature"),
+        old_identifier,
+        None,
+    ));
+    let err = GraphNamespacePublisher::new(uri, Some("feature"))
+        .publish_with_precondition(&[], &HashMap::new(), None, &precondition)
+        .await
+        .expect_err("recreated branch must reject the old incarnation token");
+    let OmniError::Manifest(error) = err else {
+        panic!("expected typed manifest conflict, got {err:?}");
+    };
+    match error.details {
+        Some(ManifestConflictDetails::ReadSetChanged {
+            member,
+            expected: Some(expected),
+            actual: Some(actual),
+        }) => {
+            assert_eq!(member, "branch_identifier:feature");
+            assert_ne!(expected, actual);
+        }
+        other => panic!("expected branch-identifier ReadSetChanged, got {other:?}"),
+    }
 }
 
 /// Append one row to a two-column NODE table (`id`, `name`) and return the
@@ -1943,8 +2130,10 @@ async fn assert_linear_chain(uri: &str, expected_total: usize) -> String {
     );
 
     // (1) exactly one genesis.
-    let genesis: Vec<&GraphLineageRow> =
-        rows.iter().filter(|r| r.parent_commit_id.is_none()).collect();
+    let genesis: Vec<&GraphLineageRow> = rows
+        .iter()
+        .filter(|r| r.parent_commit_id.is_none())
+        .collect();
     assert_eq!(
         genesis.len(),
         1,
@@ -2038,8 +2227,16 @@ async fn concurrent_disjoint_writes_share_head_and_form_linear_chain() {
     // version on the other's table; contention is purely the shared head row.
     let empty = HashMap::new();
     let (res_a, res_b) = tokio::join!(
-        async { publisher_a.publish(&changes_a, &empty, Some(&intent_a)).await },
-        async { publisher_b.publish(&changes_b, &empty, Some(&intent_b)).await }
+        async {
+            publisher_a
+                .publish(&changes_a, &empty, Some(&intent_a))
+                .await
+        },
+        async {
+            publisher_b
+                .publish(&changes_b, &empty, Some(&intent_b))
+                .await
+        }
     );
 
     // BOTH commit: disjoint tables → the head-row CAS loser retries within
@@ -2114,8 +2311,16 @@ async fn concurrent_disjoint_writes_form_linear_chain_on_s3() {
     };
     let empty = HashMap::new();
     let (res_a, res_b) = tokio::join!(
-        async { publisher_a.publish(&changes_a, &empty, Some(&intent_a)).await },
-        async { publisher_b.publish(&changes_b, &empty, Some(&intent_b)).await }
+        async {
+            publisher_a
+                .publish(&changes_a, &empty, Some(&intent_a))
+                .await
+        },
+        async {
+            publisher_b
+                .publish(&changes_b, &empty, Some(&intent_b))
+                .await
+        }
     );
     res_a.expect("writer A must commit on S3");
     res_b.expect("writer B must commit on S3");
@@ -2161,8 +2366,13 @@ async fn n_concurrent_disjoint_writers_converge_to_one_linear_chain() {
                 .await,
         );
         updates.push(
-            append_node_row_and_make_update(uri, &company_entry, &format!("c{i}"), &format!("C{i}"))
-                .await,
+            append_node_row_and_make_update(
+                uri,
+                &company_entry,
+                &format!("c{i}"),
+                &format!("C{i}"),
+            )
+            .await,
         );
     }
     assert_eq!(updates.len(), N);
@@ -2216,7 +2426,11 @@ async fn n_concurrent_disjoint_writers_converge_to_one_linear_chain() {
     // All 8 distinct writer ids committed (no lost commit, no duplicate id).
     committed_ids.sort();
     committed_ids.dedup();
-    assert_eq!(committed_ids.len(), N, "every writer must commit exactly once");
+    assert_eq!(
+        committed_ids.len(),
+        N,
+        "every writer must commit exactly once"
+    );
 
     // The final DAG is a single linear chain of genesis + 8 = 9, no fork.
     assert_linear_chain(uri, N + 1).await;

@@ -1,0 +1,881 @@
+---
+type: spec
+title: "RFC-022 — Unified graph-write protocol"
+description: One correctness protocol for graph-visible writes, with synchronous recovery, complete read-set arbitration, writer-specific physical-effect adapters, and explicit control-plane exceptions.
+status: draft
+tags: [eng, rfc, write-path, manifest, recovery, concurrency, lance, omnigraph]
+timestamp: 2026-07-10
+owner:
+---
+
+# RFC-022: Unified graph-write protocol
+
+**Status:** Draft / for team review
+**Date:** 2026-07-10
+**Surveyed:** OmniGraph 0.8.1 (`main`); Lance 9.0.0-beta.15, git rev `f24e42c1`
+**Audience:** engine and storage maintainers
+**Open architecture review:** [RFC-022–027 review ledger](../dev/rfc-022-027-architecture-review.md).
+Findings marked **BLOCKER** must be dispositioned before acceptance.
+
+---
+
+## 0. Summary
+
+OmniGraph will have one **correctness protocol** for every operation that changes
+manifest-resolved graph state. The protocol does not require every writer to use
+the same Lance primitive. A mutation can commit one staged transaction per table,
+a branch merge can make several commits to a table, and optimize can use Lance
+operations that have no staged API. Writer-specific **effect adapters** describe
+those physical operations; one coordinator enforces the common safety rules.
+
+A graph-visible write follows this state machine:
+
+```text
+recovery barrier
+    → prepare pinned base + complete ReadSet + Effects
+    → acquire ordered process-local gates
+    → revalidate the complete ReadSet, or restart
+    → durably arm recovery
+    → apply writer-specific physical effects
+    → publish exactly one graph-visible __manifest CAS
+    → finalize derived state
+```
+
+The protocol has three hard boundaries:
+
+1. Recovery is a synchronous pre-write safety barrier. It may also run in the
+   background, but a writer never proceeds merely because recovery was scheduled.
+2. Validation and merge classification are valid only for their complete read set.
+   A changed probed table causes revalidation or a full restart; the writer never
+   refreshes expected versions underneath a plan computed from an older base.
+3. “One `__manifest` CAS” applies only to graph-visible commits. Native graph-branch
+   ref creation/deletion and physical-only maintenance have explicit, smaller
+   control protocols and do not manufacture graph commits.
+
+This RFC deliberately does not combine key fencing, durable table heads,
+checkpoint retention, MemWAL ingest, or lineage-based merge-delta discovery into
+one format and rollout. They are focused follow-ups:
+
+- [RFC-023 — Key-conflict fencing](rfc-023-key-conflict-fencing.md)
+- [RFC-024 — Durable table heads](rfc-024-durable-table-heads.md)
+- [RFC-025 — Checkpoint retention](rfc-025-checkpoint-retention.md)
+- [RFC-026 — MemWAL streaming ingest](rfc-026-memwal-streaming-ingest.md)
+- [RFC-027 — Lineage merge deltas](rfc-027-lineage-merge-deltas.md)
+
+## 1. Scope and authority
+
+### 1.1 Graph-visible writes
+
+A **graph-visible write** changes state resolved through a graph manifest snapshot:
+
+- a node or edge table version;
+- a registered or tombstoned table;
+- accepted schema identity or schema-visible table metadata;
+- a graph commit or graph head;
+- any future logical marker that changes query or time-travel semantics.
+
+For such an operation, the only visibility point is one successful `__manifest`
+commit containing the entire graph delta. Per-table Lance commits before that point
+are physical effects covered by recovery; they are not independently graph-visible.
+
+### 1.2 Control operations
+
+Two classes are not graph-visible commits:
+
+1. Native graph-branch ref create/delete. Lance stores these refs outside the
+   dataset-version chain and creates no new `__manifest` version for either action.
+2. Physical-only maintenance whose result is content-equivalent and is not selected
+   through a data-table pointer in `__manifest`, such as compacting `__manifest`
+   itself or reclaiming unreachable files.
+
+Sections 7 and 8 define their control protocols. Branch **merge** and a data-table
+optimize whose new version must be published are graph-visible writes and remain in
+the main protocol.
+
+### 1.3 What “unified” means
+
+Unified means one set of safety obligations, one coordinator state machine, and one
+closed registry of effect adapters. It does **not** mean:
+
+- one storage trait method for every Lance operation;
+- exactly one physical commit per table;
+- pretending native refs are manifest rows;
+- treating process-local queues as a distributed transaction manager;
+- moving commit recovery out of the correctness path.
+
+## 2. Protocol objects
+
+The names below are conceptual. Implementations may choose different Rust names,
+but they must preserve the represented information and transitions.
+
+```rust
+struct PreparedWrite {
+    operation_id: OperationId,
+    writer_kind: WriterKind,
+    target: BranchTarget,
+    base: BaseView,
+    read_set: ReadSet,
+    effects: Effects,
+    manifest_delta: ManifestDelta,
+    lineage_intent: Option<LineageIntent>,
+    recovery: RecoveryPlan,
+}
+```
+
+### 2.1 `BaseView`
+
+`BaseView` is the immutable state against which the operation was computed. It
+contains at least:
+
+- target manifest branch and its incarnation/freshness token;
+- pinned manifest version;
+- accepted schema identity;
+- pinned table entries used by the operation;
+- graph head when parentage, merge base, or branch semantics depend on it.
+
+The base is captured only after the recovery barrier completes. A recovery pass may
+advance the manifest or promote schema state, so a base captured before recovery is
+not valid write input.
+
+### 2.2 `ReadSet`
+
+`ReadSet` is every authority value whose stability is required for the prepared
+result to remain correct. It includes, as applicable:
+
+- target branch incarnation;
+- accepted schema identity;
+- graph head;
+- the table head for every table written;
+- the table head for every table probed by uniqueness, referential-integrity,
+  cardinality, policy-independent structural validation, or merge classification;
+- writer-specific authority, such as an enrolled stream's configuration and merge
+  generation.
+
+A table belongs in the read set because its value affected the decision, not because
+the writer happens to update it. Read-only dependencies are load-bearing.
+
+The publisher must arbitrate every read-set member atomically with the manifest
+commit. A fresh pre-check followed by an unconditional write is not a CAS. The
+implementation must ensure that a concurrent change after the check contends on a
+stable authority row or equivalent substrate token. If the current representation
+cannot arbitrate a read-only dependency, that writer has not completed this RFC and
+must not ship the outside-gate validation optimization.
+
+### 2.3 `Effects`
+
+`Effects` is an adapter-owned physical plan. Each effect declares:
+
+- physical dataset and Lance branch/ref it targets;
+- expected pre-state;
+- whether it is staged, inline, ref-only, or zero-commit;
+- the possible post-state shape: exact version, bounded range, or adapter-confirmed
+  version;
+- whether rollback is safe;
+- how recovery distinguishes no movement, partial movement, completed movement,
+  and an already-published result.
+
+The generic coordinator never assumes `expected_version + 1`. That assumption is
+valid for some mutation/load effects and false for branch merge, compaction, index
+work, schema metadata changes, and no-op plans.
+
+### 2.4 `ManifestDelta`
+
+`ManifestDelta` is the complete logical result to publish. It contains table-version
+journal entries, registrations/tombstones, mutable logical heads when present, schema
+identity, and lineage rows as required by the operation. Its logical contents are
+immutable for one prepared attempt. Physical version fields may be declared output
+slots that the adapter binds to an allowed, confirmed effect result; binding such a
+slot cannot widen or otherwise change the logical plan. A revalidation mismatch
+discards the delta and restarts preparation.
+
+### 2.5 `RecoveryPlan`
+
+`RecoveryPlan` supplies the writer-specific classifier and compensation/roll-forward
+rules. It must be serializable into a recovery sidecar before the first independently
+durable physical effect. It is part of the commit protocol, not a best-effort
+maintenance hint.
+
+## 3. Normative invariants
+
+1. **Recovery before base capture.** Every graph-visible writer runs and awaits the
+   recovery barrier before pinning `BaseView`.
+2. **No durable effect before durable intent.** On an existing physical ref,
+   reclaimable uncommitted files may be staged first. A first-touch named-table
+   transaction is different: Lance writes its uncommitted files into the opened
+   branch tree, so Prepare retains the logical batch/predicate and pre-mints its
+   transaction identity; after revalidation the recovery sidecar becomes durable,
+   then the writer creates the target ref and stages those branch-local files under
+   the held gates. In every case the sidecar precedes the first independently
+   persistent physical effect, including a native table ref, data-table HEAD
+   advance, or native tag/index mutation needed by the graph-visible result.
+3. **Complete read-set validation.** Physical effects may start only while the fresh
+   authority state equals the complete `ReadSet` used to prepare the operation.
+4. **Recompute, do not patch.** On a pre-effect mismatch, discard the prepared plan
+   and rerun validation/classification. Never refresh expected versions beneath an
+   old plan.
+5. **One graph visibility point.** A graph-visible write publishes one manifest CAS;
+   no subset of its table effects becomes graph-visible independently.
+6. **Adapters own effect truth.** Every effect-producing writer uses a registered
+   adapter. There is no generic fallback that guesses version movement or recovery
+   safety.
+7. **Queues are local optimization.** Ordered process-local gates prevent avoidable
+   in-process races and deadlocks. Cross-process correctness comes from Lance
+   conflicts, manifest arbitration, and recovery.
+8. **Recovery safety is synchronous.** Background sweeping is permitted, but a later
+   overlapping writer waits for, performs, or fails on unresolved recovery before it
+   can advance state.
+9. **Derived work follows visibility.** Expensive index reconciliation, cache warming,
+   and orphan reclaim may run asynchronously only when logical correctness does not
+   depend on their completion.
+
+These refine, and do not weaken, invariants 2, 3, 4, 5, 7, 9, 13, and 15 in
+[`docs/dev/invariants.md`](../dev/invariants.md).
+
+## 4. The graph-write state machine
+
+### 4.1 Stage A — recovery barrier
+
+Before accepting a base, the coordinator discovers pending recovery intents that can
+overlap this operation. It must reach one of three outcomes:
+
+1. all relevant intents are fully resolved;
+2. each remaining intent is proven already satisfied and can be finalized safely;
+3. the write fails with a typed recovery-required or live-writer-contention error.
+
+“Spawn recovery and continue” is not an outcome. Listing sidecars may run concurrently
+with non-authoritative I/O, but preparation cannot accept its base until recovery has
+completed and the post-recovery schema/manifest state is available.
+
+Recovery must not destructively act on a sidecar that may belong to a live writer
+without ownership/fencing proof. It waits, returns contention, or uses a protocol that
+proves the prior owner cannot continue.
+
+Recovery classifiers use exact effect identity or confirmed post-state. A numeric
+test such as `manifest_version >= observed_lance_head` is sufficient only when the
+adapter independently proves lineage containment; version ordering alone is not that
+proof. Exact identity cuts both ways: a roll-forward that loses its manifest CAS to
+a concurrent writer which already published this intent's exact goal state is
+**convergence, not failure** — the barrier records the audit outcome and removes the
+intent rather than failing the write (preserving the concurrent-advance convergence
+behavior fixed in #296). "Exact" forbids adopting an unrelated newer version; it does
+not forbid recognizing one's own goal already achieved.
+
+The barrier is a deliberate availability trade, stated plainly: an unresolvable
+overlapping recovery intent — including a live foreign writer's sidecar that cannot
+be fenced — fails every overlapping write with a typed error until resolved. Safety
+outranks availability here by design; operators observe the condition through the
+typed error and recovery telemetry rather than through silently degraded writes.
+
+### 4.2 Stage B — prepare
+
+Prepare runs without writer gates. It may:
+
+- capture `BaseView`;
+- evaluate the complete constraint set;
+- classify a merge;
+- compute embeddings or other deterministic payloads;
+- build staged Lance transactions and reclaimable uncommitted objects for targets
+  whose physical refs already exist;
+- for a first-touch named-table target, retain the complete logical stage input and
+  pre-mint its recovery transaction identity without creating the ref;
+- construct the complete `ReadSet`, `Effects`, `ManifestDelta`, and `RecoveryPlan`.
+
+Prepare must not advance a Lance HEAD or the graph's native branch refs. Staged files
+that are not referenced by a committed Lance manifest are permitted and are
+reclaimable if the attempt restarts.
+
+After Stage E arms recovery, a first-touch adapter may create its declared target ref
+under the held gates, stage branch-local files on that ref, bind the resulting Lance
+transaction to the pre-minted identity, and only then advance HEAD. The ref is itself
+an independently durable effect covered by the sidecar; recovery must classify both
+sidecar-before-ref and ref-before-HEAD crash states.
+
+Every validator registers its actual committed-state probes in `ReadSet`. Key fences
+are an additional same-key conflict signal; they do not replace read-set arbitration
+for non-key uniqueness, RI, cardinality, or merge-target stability.
+
+### 4.3 Stage C — acquire ordered gates
+
+The prepared effects declare their gate keys. One attempt acquires the complete set in
+this total order:
+
+1. durable global operation claims (migration, retention, or future claims) by
+   deterministic claim key;
+2. graph/schema-control key, if required;
+3. target branch-control key, if required;
+4. `(physical_branch, table_key)` keys in deterministic sorted order.
+
+The gates are held through revalidation, recovery arming, physical effects, and the
+manifest visibility decision. They may be released after a successful manifest CAS or
+after a failed post-effect attempt has safely left its sidecar for recovery.
+
+Acquiring a global claim is coordination, not a graph effect for §3's sidecar-order
+rule: the claim record must itself contain an owner/fencing token and an explicit
+crash-release/takeover contract. No data HEAD, tag, index, or logical authority may
+move merely because the claim was acquired.
+
+The merge-exclusive mutex may protect a coordinator swap, but it is not a semantic
+cross-process lock and must not substitute for a target read set.
+
+### 4.4 Stage D — revalidate or restart
+
+With all gates held, the coordinator loads fresh authority state and compares every
+member of `ReadSet`.
+
+- If all members match, the attempt may arm recovery.
+- If any member differs, no physical effect may run. The attempt releases its gates,
+  discards staged state, and restarts from Prepare.
+- A strict API may return a typed conflict instead of retrying, but it may not publish
+  the stale plan.
+
+Retries are bounded and observable. Retrying a merge means recomputing the merge base
+and reclassifying against the new target. Retrying a validation-sensitive mutation
+means rerunning the validators, including probes of tables the mutation does not
+write.
+
+### 4.5 Stage E — arm recovery
+
+After successful revalidation, write the recovery sidecar durably before the first
+independently durable physical effect. An effect-free or authority-first workflow
+described in §4.9 may omit the sidecar. Otherwise the sidecar contains at least:
+
+- operation id, writer kind, actor, and target branch/incarnation;
+- pinned schema identity and complete read set;
+- every physical target and expected pre-state;
+- adapter recovery strategy;
+- intended manifest delta and lineage intent, or a durable reference to them;
+- confirmed post-state once the adapter reaches its all-effects-complete boundary.
+
+A multi-step adapter first records its pre-state plan. After all its physical effects
+finish, it durably records the exact confirmed post-state before manifest publish.
+Until that confirmation exists, recovery treats the effect set as possibly partial.
+
+### 4.6 Stage F — apply effects
+
+The adapter applies its declared physical effects. A failure after recovery is armed
+leaves the sidecar intact. The request must not delete it, silently adopt live HEAD, or
+start a fresh plan around it.
+
+The adapter returns exact achieved state to bind the physical output slots declared by
+`ManifestDelta`. If achieved state differs from the prepared effect envelope, the
+operation fails into recovery rather than widening its plan in place.
+
+### 4.7 Stage G — manifest CAS
+
+A graph-visible operation performs exactly one `__manifest` CAS carrying its complete
+logical delta and lineage when the plan has `LineageIntent`. Metadata-only plans carry
+their explicit authority/operation rows without manufacturing graph lineage. On every
+CAS attempt, the commit authority re-reads and arbitrates the complete `ReadSet`.
+
+The following cases are distinct:
+
+- **Conflict before any physical effect:** safe bounded restart from Prepare.
+- **Conflict after physical effects:** recovery case. Keep the sidecar; do not simply
+  re-stage or point the manifest at whatever HEAD is now live.
+- **CAS success:** the graph commit is visible atomically.
+
+When durable table heads land under RFC-024, tombstoning a table must update its mutable
+head to an explicit deleted state in this same CAS. A stale live head plus an immutable
+tombstone history is not a valid O(tables) current-state representation.
+
+### 4.8 Stage H — finalize
+
+After CAS success:
+
+- delete the sidecar best-effort when the workflow has one;
+- refresh/invalidate process-local views;
+- enqueue derived index reconciliation and orphan reclaim;
+- record recovery/audit completion when applicable.
+
+Sidecar deletion failure does not turn a durable successful graph commit into a user
+error. The next recovery barrier proves the exact intent satisfied and removes the
+artifact.
+
+### 4.9 Authority-first control workflows
+
+Some metadata workflows have no independently durable physical effect before their
+manifest CAS. They may use an **authority-first** subtype:
+
+1. run the recovery barrier, prepare, acquire gates/claims, and revalidate exactly as
+   above;
+2. publish the metadata transition as the first durable effect;
+3. perform only idempotent work whose desired target is fully encoded by that
+   transition and whose interruption cannot expose incorrect graph data.
+
+No generic sidecar is required before step 2 because there is no pre-authority effect
+to recover. The authority row itself is the durable recovery cursor. Checkpoint
+deletion, a GC-boundary publish, and `OPEN -> DRAINING` stream intent are candidate
+examples; each follow-up RFC must prove its post-CAS work is convergent and safe.
+
+A long control workflow is not one giant RFC-022 attempt. Each lifecycle transition,
+fold, schema/branch operation, and resume transition is a separate prepared write or
+native-ref control step with its own read set and visibility point. If a later phase
+needs a non-idempotent or independently visible effect not fully described by the
+authority row, that phase uses a normal sidecar before the effect.
+
+## 5. Crash contract
+
+| Crash point | Required result |
+|---|---|
+| Before sidecar | No independently durable effect occurred; uncommitted objects are reclaimable. |
+| Sidecar durable, no effect | Recovery aborts/finalizes the empty intent. |
+| Some effects applied, not confirmed | The adapter rolls back, completes, or refuses safely according to its declared strategy. |
+| All effects confirmed, before manifest CAS | Recovery rolls forward the exact confirmed manifest delta, or applies the adapter's explicit all-or-nothing rule. |
+| Manifest CAS succeeded, sidecar remains | Recovery proves the exact intent visible, audits it, and removes the sidecar. |
+
+Rollback is not assumed safe. Lance `Restore`, schema-file promotion, native refs, and
+content-replacing operations have different concurrency properties; each adapter must
+state which recovery direction is legal and under what fencing.
+
+## 6. Writer-effect adapters
+
+The adapter registry is closed by default: adding a graph-visible writer requires a
+new adapter or an explicit use of an existing adapter. Code review and tests must be
+able to enumerate every adapter and every entry point that invokes it.
+
+### 6.1 Mutation and load
+
+- Construct one staged effect per touched table where the Lance API permits it.
+  Existing-table effects may stage in Prepare; first-touch named-table effects use
+  the sidecar → target ref → branch-local stage ordering above.
+- Put every uniqueness, RI, and cardinality probe in `ReadSet`.
+- Revalidate or restart when a probed-but-untouched table changes.
+- Preserve strict replacement semantics for overwrite/delete.
+- Treat key-conflict fencing and strict keyed Append semantics as RFC-023 concerns;
+  no fence is credited as protection until that RFC's rollout gates pass.
+
+### 6.2 Branch merge
+
+- Capture the exact source graph commit/snapshot and compute row classification
+  against that immutable input outside the effect gates. The source commit is an
+  effect precondition, not a member of the target publisher's atomic `ReadSet`:
+  a target CAS cannot arbitrate a foreign source-branch row.
+- Revalidate that the captured source incarnation and commit still identify the
+  prepared input before effects. A later source-head advance is intentionally
+  harmless: merge means "merge this captured source commit," not "whatever is
+  latest when the target publishes." A future latest-at-publish contract would
+  require a real source-branch fence held through target CAS.
+- Include the target graph head and every target table used by classification or
+  validation in `ReadSet`.
+- Any target change before effects forces a complete reclassification; publishing a
+  result computed against an old target and parenting it to a new live head is
+  forbidden.
+- The adapter supports zero, one, or several physical commits per table and records
+  exact confirmed post-state before manifest publish.
+- Lineage-based candidate discovery may replace the classifier only under RFC-027;
+  this protocol does not assume it is O(delta).
+
+### 6.3 Schema apply and storage migration
+
+- Acquire the schema-control gate before effect application.
+- Include accepted schema identity and every affected table in `ReadSet`.
+- Cover schema staging-file promotion, data-table schema/field-metadata commits,
+  registrations, tombstones, and final schema identity with one recovery intent.
+- Write the sidecar before the first table HEAD advance, including unenforced-PK
+  metadata backfill or other inline metadata commits.
+- A branch-wide or graph-wide migration must enumerate every physical manifest/data
+  branch it changes; updating main does not implicitly migrate older branch manifests.
+
+### 6.4 Data-table optimize and index work
+
+- The adapter may describe zero or multiple inline, content-preserving Lance commits.
+- It records the exact achieved version rather than assuming one version of movement.
+- If the new data-table version is selected through `__manifest`, publishing that
+  pointer is a graph-visible commit and uses this protocol.
+- Logical operations never fail because a derived index is absent or behind.
+- Physical-only internal-table maintenance remains the exception in Section 8.
+
+### 6.5 MemWAL fold
+
+RFC-026 owns enrollment, acknowledgement, quiescence, fresh-read semantics, and the
+public ingest surface. Any fold that becomes graph-visible is an adapter here:
+
+- fold-time validation contributes its complete read set;
+- Lance `merged_generations` changes atomically with the base-table data commit;
+- the sidecar covers the data-commit-to-manifest gap;
+- one successful manifest CAS makes the folded graph state visible.
+
+## 7. Native graph-branch ref control protocol
+
+Creating or deleting a graph branch mutates a native Lance branch ref for
+`__manifest`. Lance specifies that these operations do not generate a dataset version.
+There is no target branch on which to publish before create, and no target remains on
+which to publish after delete. They therefore cannot truthfully be instances of the
+graph-visible manifest-CAS protocol.
+
+The native control is not one physical mutation. At the pinned Lance revision:
+
+- create first commits a shallow-cloned branch dataset under `tree/{branch}` and
+  then writes `BranchContents`; the two phases are non-atomic and
+  `BranchContents` is the sole logical authority;
+- delete removes `BranchContents` first and then reclaims the branch directory.
+
+Accordingly, a clone without `BranchContents` is unreachable physical garbage,
+while an absent `BranchContents` after delete means the logical delete succeeded
+even if directory cleanup returned an error.
+
+Lance maps slash-separated branch names into nested physical directories and will
+not reclaim an ancestor directory while a live descendant name exists. Live graph
+branch names are therefore path-prefix-disjoint: `review/2026` is valid, but it
+cannot coexist with a live `review` branch. This is checked before native create,
+and legacy overlapping names must be deleted leaf-first. Without this namespace
+invariant, `force_delete_branch` may return success while deliberately leaving an
+ancestor clone-only dataset in place.
+
+Their control protocol is:
+
+1. run and await the recovery barrier;
+2. quiesce enrolled streams as required by RFC-026;
+3. acquire any active global claim, such as RFC-025's retention claim, and then
+   the graph/branch-control gate in §4.3 order;
+4. freshly capture source ref/version/incarnation and target absence (or the
+   delete target's exact `BranchIdentifier`);
+5. validate a create name and the path-prefix-disjoint namespace before Lance's
+   shallow-clone phase;
+6. execute the bounded native classifier below; and
+7. reclaim owned per-table forks best-effort while the complete control-gate set
+   remains held, then release the gates. A reclaim failure is logged for the
+   cleanup reconciler; this implementation does not schedule asynchronous reclaim.
+
+| Operation | Fresh physical state | Classifier action |
+|---|---|---|
+| create | no ref, no clone | idempotent force-reclaim (no-op), then create |
+| create | clone only | force-reclaim the unreachable clone, then create |
+| create | matching ref + openable clone observed after this invocation's ambiguous native result | complete; accept a lost acknowledgement |
+| create | mismatching/broken ref | conflict; never adopt or delete it |
+| delete | captured identifier still present | not deleted; return the native error |
+| delete | ref absent, directory remains | logically deleted; retry reclaim best-effort |
+| delete | ref and directory absent | complete |
+| delete | different identifier present | delete/recreate ABA; conflict, never delete it |
+
+Create retries the native call at most once after reclaiming an absent-ref tree.
+It never adopts a matching ref that was already present before the invocation;
+that remains ordinary `AlreadyExists` because there is no operation marker.
+Matching completion requires the expected parent branch and version plus a target
+identifier whose mapping is exactly the captured parent identifier followed by one
+new `(parent_version, uuid)` element; the target dataset must also open. Lance does
+not let the caller pre-mint that UUID, so the proof is intentionally scoped to the
+supported single-writer-process boundary.
+
+No separate graph-branch sidecar is written. Under the held target gate,
+path-prefix-disjoint namespace, and supported topology, absent `BranchContents`
+means there is no logical branch and any same-name tree is safe derived garbage;
+the next same-name create is the targeted, idempotent reconciler. A recovery
+sidecar would introduce a second authority and would incorrectly pull native
+controls into graph lineage. First-touch **data-table** forks are different: their
+mutation/load sidecar is already durable before branch creation. Full recovery
+force-reclaims an absent-ref target as either a no-op (crash-before-clone) or that
+intent's clone-only zombie before retiring the intent.
+
+One compatibility case deliberately defers that cleanup. A legacy graph may
+already contain path-prefix-overlapping live names. If an unresolved first-touch
+intent targets an ancestor table tree while a live path-child still exists, Full
+recovery leaves the sidecar durable instead of recursively deleting the child's
+storage. Read-write open may complete for leaf-first remediation only when the
+intent owns no physical table effect. If a multi-table attempt owns any effect
+while another untouched fork is blocked by the child, rollback is
+complete-or-error: open fails closed, the sidecar remains authoritative, and an
+existing handle or offline Lance-level branch tool must remove the descendant
+before the next Full recovery reclaims the untouched fork, compensates the owned
+effect, and retires the sidecar. This distinction prevents legacy writers outside
+the v3 barrier from preparing against an unresolved partial rollback.
+
+Delete has one recovery disposition that create does not: after the complete
+schema/target-branch/all-table gate set has waited out any live in-process owner,
+an unresolved sidecar scoped to the branch being removed may be rendered
+unreachable by the native ref deletion. A later heal records the orphan-discard
+audit and retires it. Graph-global schema recovery still blocks the control, and
+create/merge may not adopt this exception.
+
+The native ref operation itself should enforce the freshly checked precondition or
+surface concurrent ref mutation as a conflict — but at the pinned Lance revision it
+does not: branch-ref creation is an existence check followed by an unconditional
+put, and delete is not compare-and-delete by `BranchIdentifier` (the same substrate
+gap for which RFC-025 §2.3 rejects a branch ref as a claim mechanism). Until Lance
+ships conditional/CAS ref mutation, graph-branch create/delete therefore inherit the
+documented single-writer-process support boundary — the same disposition RFC-023
+§10 applies to recovery ownership — and multi-process branch operations are not
+advertised. The upstream ask for a conditional ref primitive is filed alongside
+this RFC; a process-local branch gate remains a local optimization, not the missing
+cross-process guarantee.
+
+These operations do not emit a synthetic graph commit. If a future product contract
+requires a native ref mutation and manifest/audit rows to become atomic together, it
+needs a separate multi-authority recovery protocol; this RFC does not claim an
+atomicity the substrate does not provide.
+
+This exception applies only to graph-level create/delete. Branch merge is a
+graph-visible write. Lazy per-table forks created while preparing a branch write are
+declared physical effects of that writer and remain subject to its recovery/reclaim
+contract.
+
+## 8. Physical-maintenance control protocol
+
+Physical work that does not change manifest-resolved logical graph state does not
+create graph lineage merely to fit the main protocol. Examples include:
+
+- compacting `__manifest`, which is itself the authority and is read at its Lance HEAD;
+- deleting versions/files already proven unreachable under the active retention
+  contract;
+- reclaiming orphaned branch refs or uncommitted objects;
+- rebuilding derived physical state when no graph-visible data-table pointer changes.
+
+Such work must still be idempotent, bounded, observable, and safe under concurrent
+native Lance commits. It uses substrate conflict/retry semantics appropriate to the
+operation. It must never expose partial logical graph state.
+
+The exception is from graph-lineage publication, not from recovery safety. Maintenance
+must run the recovery barrier or refuse before it can replace or delete an artifact
+named by an unresolved sidecar. It must also acquire any relevant process-local gates;
+as elsewhere, those gates are an optimization rather than cross-process authority.
+
+Data-table compaction/index work that advances a version which graph reads must select
+through `__manifest` is not exempt; Section 6.4 applies. Checkpoint reachability and
+the mapping from graph checkpoint rows to Lance-native GC pins belong to RFC-025.
+
+## 9. Concurrency and retry semantics
+
+Process-local gates reduce same-process races and establish one deadlock-free order.
+They do not coordinate two servers or CLIs. A conforming implementation remains safe
+if every process has its own gate manager.
+
+Cross-process safety comes from:
+
+- complete read-set arbitration at the manifest authority;
+- Lance transaction conflicts for physical table effects;
+- durable recovery before physical HEAD movement;
+- refusal to continue past unresolved overlapping recovery.
+
+Retry rules are phase-specific:
+
+- before effects, a read-set mismatch discards and recomputes the whole attempt;
+- while applying an effect, the adapter may retry only when Lance guarantees the
+  operation can be safely replanned from fresh physical state;
+- after any effect, manifest contention is resolved through the armed recovery intent,
+  not by silently rebasing the logical plan;
+- retry exhaustion returns a typed, observable conflict.
+
+## 10. Rollout and compatibility
+
+This RFC authorizes a protocol refactor, not a manifest v5 format moment. RFC-023
+through RFC-027 own their respective format and public-surface changes.
+
+It also does not require a mutable-tip `GraphState` singleton. Three measured,
+local latency fixes can land independently of the adapter conversion:
+
+1. make the graph's shared Lance `Session` a required parameter of every
+   manifest open/publisher path, so remote opens do not rebuild clients and cold
+   metadata state;
+2. capture one immutable operation-local manifest/lineage view and pass it down
+   the call stack instead of reopening the same state repeatedly; and
+3. remove the verified-redundant branch-idle refresh and the back-to-back second
+   `branch_delete_as` refresh once their existing coverage asserts unchanged
+   behavior.
+
+These are narrow access-shape fixes, not a second commit-input authority. They
+must preserve snapshot pinning and still cross the recovery/read-set barriers
+defined above.
+
+Implementation proceeds in this order:
+
+1. Introduce `PreparedWrite`, `ReadSet`, effect-adapter, and recovery-plan concepts
+   while preserving existing behavior.
+2. Ship conservative branch-wide arbitration first. Mutation/load captures
+   `(Lance BranchIdentifier, exact optional graph_head, accepted schema identity)`;
+   every publisher retry compares that token instead of reparenting. Because every
+   supported graph-content and schema apply advances `graph_head:<branch>` before
+   schema promotion, the shared head row atomically arbitrates probed-but-untouched
+   same-branch dependencies. The native branch identifier detects delete/recreate
+   ABA under the documented single-writer-process branch-control boundary. RFC-024
+   later narrows false contention with table heads; it is not a correctness
+   prerequisite for this coarse step. Existing live committed-state validation
+   probes remain until the narrowed read set replaces them.
+
+   > **Implementation note (2026-07-11):** mutation/load now use this coarse
+   > token, schema-v3 exact-effect sidecars, fixed lineage/rollback outcome ids,
+   > zero transparent Lance commit retries, and bounded full reprepare before
+   > effects. Branch merge now captures an immutable source commit/snapshot and
+   > the target coarse token, computes its merge base from those captured ids,
+   > and revalidates target authority plus source incarnation under the ordered
+   > gates. Its schema-v4 recovery envelope distinguishes multi-commit HEAD
+   > effects from first-touch ref-only forks, persists an ordered pre-minted
+   > Lance transaction chain for every logical data effect plus fixed
+   > merge/rollback lineage, and confirms the complete manifest delta (including
+   > pointer-only slots) before publishing with `ExactGraphHead`. Those data
+   > transactions commit with zero transparent conflict retries; recovery accepts
+   > only their contiguous exact prefix (plus a derived `CreateIndex` tail after
+   > the complete chain) and fails closed on foreign movement. A pre-effect target change
+   > returns `ReadSetChanged`; any post-arm failure returns `RecoveryRequired`
+   > and recovery never re-parents onto a target winner. Schema apply,
+   > optimize/index, and MemWAL fold remain on their writer-specific paths until
+   > their adapter slices land.
+
+   > **Branch-control/cleanup slice (2026-07-11):** native graph-branch create
+   > and delete now use the §7 authority classifier, including pre-clone name
+   > validation, prefix-disjoint live names, bounded clone-only recovery,
+   > lost-acknowledgement classification, exact delete-incarnation fencing, and
+   > no synthetic graph lineage. First-touch Full recovery also reclaims an
+   > absent-ref clone-only table fork. Cleanup now protects every exact lazy
+   > branch pin, computes `keep` from Lance's actual version list, refuses
+   > uncovered main HEAD drift, and completes its live-root preflight before the
+   > first table GC.
+3. Convert mutation/load, branch merge, schema apply/migration, data-table optimize,
+   and graph-visible index work one adapter at a time.
+4. Add static or runtime enumeration proving no graph-visible entry point bypasses the
+   coordinator.
+5. Delete superseded writer-specific orchestration only after its crash and
+   concurrency cells pass through the adapter.
+6. Optimize background recovery latency only after the synchronous barrier and all
+   recovery classifications remain intact.
+
+Mixed writer binaries are not made safe by process-local gates. A deployment may
+enable the new protocol only when every writer that can reach the graph obeys the same
+sidecar and manifest-arbitration contract, or when a compatibility gate rejects older
+writers.
+
+## 11. Required tests and cost gates
+
+### 11.1 Protocol conformance
+
+- Enumerate every graph-visible entry point and its adapter.
+- Assert no sidecar-backed adapter can create an independently durable physical
+  effect before its sidecar is durable.
+- Enumerate authority-first workflows and assert their CAS is the first durable
+  effect and every post-CAS action is idempotently derivable from its authority row.
+- Assert one graph-visible operation produces exactly one manifest visibility commit.
+- Assert branch create/delete and physical-maintenance exceptions produce no synthetic
+  graph lineage.
+
+### 11.2 Read-set races
+
+- Two distinct ids racing on the same non-key `@unique` value cannot both publish.
+- An edge insert racing deletion of an endpoint must revalidate or conflict.
+- Cardinality probes of an untouched table participate in arbitration.
+- A target advance after merge classification forces complete reclassification.
+- A source branch advancing after capture does not silently substitute its new
+  head: the merge either uses the captured source commit or fails its pre-effect
+  source-incarnation/commit check. A latest-at-target-publish variant requires a
+  real source fence and is not inferred from the target `ReadSet`.
+- Run the same cells with separate `Omnigraph` handles sharing one root-scoped
+  process-local gate manager, then with separate processes that do not share it.
+
+### 11.3 Recovery
+
+- Fail before sidecar, after sidecar, after each physical effect, after confirmation,
+  after manifest CAS, and during sidecar deletion for every adapter.
+- A later overlapping writer blocks, heals, or returns recovery-required; it never
+  advances around the sidecar.
+- A live foreign writer's sidecar is not destructively recovered without fencing.
+- Recovery proves exact effect identity; a numerically newer unrelated version is not
+  accepted as proof of ancestry.
+
+### 11.4 Adapter-specific truth tables
+
+- Mutation/load: zero/one table, multi-table, strict, non-strict, and
+  probed-but-untouched dependency cases.
+- Merge: adopt, rewrite, multi-commit, no-op, target advance, and partial-Phase-B crash.
+- Schema: staging files, registration-only, metadata HEAD advance, partial multi-table
+  migration, and branch-local state.
+- Optimize/index: zero, one, and several Lance commits, including monotonic publish and
+  retryable physical contention.
+- MemWAL fold, when RFC-026 lands: merged-generation conflict and every fold crash
+  boundary.
+- Native graph branch control: invalid name before clone; live path-prefix
+  collision before clone; clone-only create recovery on main and a named source;
+  pre-existing matching ref remains `AlreadyExists`; current-call lost create
+  acknowledgement is accepted only with exact parent/incarnation metadata and an
+  openable target; delete with absent ref plus remaining tree is success and
+  reclaims best-effort; same identifier preserves the native error; a recreated
+  identifier is a typed conflict and survives; neither direction advances a
+  manifest version or emits graph lineage.
+- First-touch recovery with legacy path overlap: a proven no-effect intent may
+  defer clone-only ancestor cleanup and return an open handle for leaf-first
+  remediation; a mixed multi-table intent with one owned effect and one blocked
+  untouched fork must fail read-write open, retain the sidecar without restoring
+  or publishing, and converge after offline Lance-level leaf cleanup.
+
+### 11.5 Cost gates
+
+The protocol must not move validation, classification, embedding computation, or
+staged-file construction under process-local gates. Measure gate hold time separately
+from Prepare. Correctness gates precede latency optimization: a cost regression can
+delay rollout, but it cannot justify touched-table-only validation or asynchronous
+recovery safety.
+
+## 12. Invariants and deny-list check
+
+This design reinforces the existing architecture:
+
+- Lance and `__manifest` remain the sources of truth; `PreparedWrite` is immutable
+  attempt-local state, not a shadow mutable tip.
+- Graph visibility remains manifest-atomic.
+- Recovery remains part of the commit protocol.
+- Logical constraints fail loudly and are revalidated when their inputs change.
+- Derived indexes and reclaim work converge without becoming logical commit points.
+- No custom WAL, transaction manager, buffer pool, or distributed lock is introduced.
+
+The design rejects two tempting deny-list violations: treating process-local queues as
+distributed correctness, and treating recovery as derivable background work that a
+new writer may outrun.
+
+Acceptance should also add one clarification to invariant 15: a view of immutable,
+version-pinned state may be cached, while an in-memory view of the mutable tip is only
+a hint. Every use of mutable-tip state as write input must be re-arbitrated by the
+commit authority. Durable heads under RFC-024 are one possible authoritative
+representation; this protocol does not require or bless a warm parallel truth path.
+
+## 13. Drawbacks and rejected alternatives
+
+### 13.1 One generic staged-storage method
+
+Rejected. Lance does not expose staged forms for every operation, and existing writers
+have materially different version movement and rollback safety. A generic method would
+either lie about those differences or accumulate writer-kind conditionals. One
+protocol plus explicit adapters has lower long-run liability.
+
+### 13.2 Asynchronous heal with optimistic continuation
+
+Rejected. Current recovery classification relies on later writers not advancing past
+an unresolved sidecar. Scheduling a sweep does not establish that fact. Recovery may
+be proactively asynchronous, but the next writer still crosses a synchronous barrier.
+
+### 13.3 Touched-table-only CAS
+
+Rejected. Non-key uniqueness, RI, cardinality, and merge classification read tables
+the operation may not write. Ignoring those dependencies admits commits that were never
+valid against one serial graph state.
+
+### 13.4 Treat every state change as a manifest commit
+
+Rejected. Native branch refs and physical maintenance have different substrate
+visibility points. Manufacturing manifest commits would add coordination without
+making the native mutation atomic with them.
+
+## 14. Reversibility
+
+The in-memory coordinator and adapter refactor is reversible. Recovery-sidecar schema
+changes must be versioned and backward-compatible during rollout. This RFC alone does
+not authorize a `__manifest` schema-stamp bump, a public wire change, or a new storage
+substrate.
+
+The correctness contract is intentionally difficult to reverse: after writers rely on
+complete read-set arbitration and recovery-before-write, weakening either would
+reintroduce silent integrity or recovery races. Focused irreversible changes are
+reviewed in RFC-023 through RFC-027.
+
+## 15. Follow-up RFC boundaries
+
+- **RFC-023** owns PK annotation, fenced merge routing, strict keyed Append behavior,
+  mixed fenced/unfenced rollout, conflict mapping, and both commit-order tests.
+- **RFC-024** owns mutable table-head rows, explicit live/tombstoned head state,
+  current-state read shape, migration, and cost gates.
+- **RFC-025** owns checkpoint rows, Lance-native physical pins, cleanup reachability,
+  pruned-through semantics, and checkpoint/cleanup crash ordering.
+- **RFC-026** owns MemWAL enrollment, durable acknowledgements, fold/dead-letter
+  behavior, stream quiescence, fresh reads, public surfaces, and upgrade fencing.
+- **RFC-027** owns candidate discovery from row lineage, deletion discovery, fallback
+  semantics, and evidence for any O(delta) merge claim.
+
+Those RFCs call this protocol when they produce a graph-visible write. None may weaken
+the recovery barrier, omit read dependencies from `ReadSet`, or create a second graph
+visibility point.

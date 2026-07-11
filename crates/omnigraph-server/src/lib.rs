@@ -286,10 +286,12 @@ impl Write for ExportStreamWriter {
 #[derive(Debug)]
 pub struct ApiError {
     status: StatusCode,
-    code: ErrorCode,
+    code: Option<ErrorCode>,
     message: String,
     merge_conflicts: Vec<api::MergeConflictOutput>,
     manifest_conflict: Option<api::ManifestConflictOutput>,
+    read_set_conflict: Option<api::ReadSetConflictOutput>,
+    recovery_required: Option<api::RecoveryRequiredOutput>,
 }
 
 impl AppState {
@@ -616,40 +618,48 @@ impl ApiError {
     pub fn unauthorized(message: impl Into<String>) -> Self {
         Self {
             status: StatusCode::UNAUTHORIZED,
-            code: ErrorCode::Unauthorized,
+            code: Some(ErrorCode::Unauthorized),
             message: message.into(),
             merge_conflicts: Vec::new(),
             manifest_conflict: None,
+            read_set_conflict: None,
+            recovery_required: None,
         }
     }
 
     pub fn forbidden(message: impl Into<String>) -> Self {
         Self {
             status: StatusCode::FORBIDDEN,
-            code: ErrorCode::Forbidden,
+            code: Some(ErrorCode::Forbidden),
             message: message.into(),
             merge_conflicts: Vec::new(),
             manifest_conflict: None,
+            read_set_conflict: None,
+            recovery_required: None,
         }
     }
 
     pub fn bad_request(message: impl Into<String>) -> Self {
         Self {
             status: StatusCode::BAD_REQUEST,
-            code: ErrorCode::BadRequest,
+            code: Some(ErrorCode::BadRequest),
             message: message.into(),
             merge_conflicts: Vec::new(),
             manifest_conflict: None,
+            read_set_conflict: None,
+            recovery_required: None,
         }
     }
 
     pub fn not_found(message: impl Into<String>) -> Self {
         Self {
             status: StatusCode::NOT_FOUND,
-            code: ErrorCode::NotFound,
+            code: Some(ErrorCode::NotFound),
             message: message.into(),
             merge_conflicts: Vec::new(),
             manifest_conflict: None,
+            read_set_conflict: None,
+            recovery_required: None,
         }
     }
 
@@ -660,30 +670,36 @@ impl ApiError {
     pub fn method_not_allowed(message: impl Into<String>) -> Self {
         Self {
             status: StatusCode::METHOD_NOT_ALLOWED,
-            code: ErrorCode::MethodNotAllowed,
+            code: Some(ErrorCode::MethodNotAllowed),
             message: message.into(),
             merge_conflicts: Vec::new(),
             manifest_conflict: None,
+            read_set_conflict: None,
+            recovery_required: None,
         }
     }
 
     pub fn conflict(message: impl Into<String>) -> Self {
         Self {
             status: StatusCode::CONFLICT,
-            code: ErrorCode::Conflict,
+            code: Some(ErrorCode::Conflict),
             message: message.into(),
             merge_conflicts: Vec::new(),
             manifest_conflict: None,
+            read_set_conflict: None,
+            recovery_required: None,
         }
     }
 
     pub fn internal(message: impl Into<String>) -> Self {
         Self {
             status: StatusCode::INTERNAL_SERVER_ERROR,
-            code: ErrorCode::Internal,
+            code: Some(ErrorCode::Internal),
             message: message.into(),
             merge_conflicts: Vec::new(),
             manifest_conflict: None,
+            read_set_conflict: None,
+            recovery_required: None,
         }
     }
 
@@ -694,10 +710,12 @@ impl ApiError {
     pub fn too_many_requests(message: impl Into<String>) -> Self {
         Self {
             status: StatusCode::TOO_MANY_REQUESTS,
-            code: ErrorCode::TooManyRequests,
+            code: Some(ErrorCode::TooManyRequests),
             message: message.into(),
             merge_conflicts: Vec::new(),
             manifest_conflict: None,
+            read_set_conflict: None,
+            recovery_required: None,
         }
     }
 
@@ -715,20 +733,51 @@ impl ApiError {
     fn merge_conflict(conflicts: Vec<api::MergeConflictOutput>) -> Self {
         Self {
             status: StatusCode::CONFLICT,
-            code: ErrorCode::Conflict,
+            code: Some(ErrorCode::Conflict),
             message: summarize_merge_conflicts(&conflicts),
             merge_conflicts: conflicts,
             manifest_conflict: None,
+            read_set_conflict: None,
+            recovery_required: None,
         }
     }
 
     fn manifest_version_conflict(message: String, details: api::ManifestConflictOutput) -> Self {
         Self {
             status: StatusCode::CONFLICT,
-            code: ErrorCode::Conflict,
+            code: Some(ErrorCode::Conflict),
             message,
             merge_conflicts: Vec::new(),
             manifest_conflict: Some(details),
+            read_set_conflict: None,
+            recovery_required: None,
+        }
+    }
+
+    fn read_set_conflict(message: String, details: api::ReadSetConflictOutput) -> Self {
+        Self {
+            status: StatusCode::CONFLICT,
+            code: Some(ErrorCode::Conflict),
+            message,
+            merge_conflicts: Vec::new(),
+            manifest_conflict: None,
+            read_set_conflict: Some(details),
+            recovery_required: None,
+        }
+    }
+
+    fn recovery_required(message: String, operation_id: String) -> Self {
+        Self {
+            status: StatusCode::SERVICE_UNAVAILABLE,
+            // `ErrorCode` is a closed rolling wire contract. The additive
+            // `recovery_required` field carries the new meaning while older
+            // clients continue to deserialize the otherwise familiar body.
+            code: None,
+            message,
+            merge_conflicts: Vec::new(),
+            manifest_conflict: None,
+            read_set_conflict: None,
+            recovery_required: Some(api::RecoveryRequiredOutput { operation_id }),
         }
     }
 
@@ -752,6 +801,18 @@ impl ApiError {
                             actual,
                         },
                     ),
+                    Some(ManifestConflictDetails::ReadSetChanged {
+                        member,
+                        expected,
+                        actual,
+                    }) => Self::read_set_conflict(
+                        err.message,
+                        api::ReadSetConflictOutput {
+                            member,
+                            expected,
+                            actual,
+                        },
+                    ),
                     _ => Self::conflict(err.message),
                 },
                 ManifestErrorKind::Internal => Self::internal(err.message),
@@ -761,6 +822,13 @@ impl ApiError {
                     .iter()
                     .map(api::MergeConflictOutput::from)
                     .collect(),
+            ),
+            OmniError::RecoveryRequired {
+                operation_id,
+                reason,
+            } => Self::recovery_required(
+                format!("recovery required for operation {operation_id}: {reason}"),
+                operation_id,
             ),
             OmniError::Lance(message) => Self::internal(format!("storage: {message}")),
             OmniError::Io(err) => Self::internal(format!("io: {err}")),
@@ -815,7 +883,7 @@ const RETRY_AFTER_SECONDS: &str = "60";
 impl IntoResponse for ApiError {
     fn into_response(self) -> Response {
         let mut headers = axum::http::HeaderMap::new();
-        if matches!(self.code, ErrorCode::TooManyRequests) {
+        if matches!(self.code, Some(ErrorCode::TooManyRequests)) {
             headers.insert(
                 axum::http::header::RETRY_AFTER,
                 axum::http::HeaderValue::from_static(RETRY_AFTER_SECONDS),
@@ -826,12 +894,39 @@ impl IntoResponse for ApiError {
             headers,
             Json(ErrorOutput {
                 error: self.message,
-                code: Some(self.code),
+                code: self.code,
                 merge_conflicts: self.merge_conflicts,
                 manifest_conflict: self.manifest_conflict,
+                read_set_conflict: self.read_set_conflict,
+                recovery_required: self.recovery_required,
             }),
         )
             .into_response()
+    }
+}
+
+#[cfg(test)]
+mod api_error_tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn recovery_required_503_omits_closed_error_code() {
+        let response = ApiError::from_omni(OmniError::RecoveryRequired {
+            operation_id: "01JTESTRECOVERY".to_string(),
+            reason: "pending recovery intent".to_string(),
+        })
+        .into_response();
+
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let error: ErrorOutput = serde_json::from_slice(&body).unwrap();
+        assert_eq!(error.code, None);
+        assert_eq!(
+            error.recovery_required.unwrap().operation_id,
+            "01JTESTRECOVERY"
+        );
     }
 }
 

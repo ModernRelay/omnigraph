@@ -11,7 +11,8 @@ use crate::storage::{StorageAdapter, normalize_root_uri};
 use super::commit_graph::{CommitGraph, GraphCommit};
 use super::is_internal_system_branch;
 use super::manifest::{
-    ManifestChange, ManifestCoordinator, ManifestIncarnation, Snapshot, SubTableUpdate,
+    LineageIntent, ManifestChange, ManifestCoordinator, ManifestIncarnation, PublishPrecondition,
+    Snapshot, SubTableUpdate,
 };
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
@@ -167,6 +168,20 @@ impl GraphCoordinator {
         self.manifest.incarnation()
     }
 
+    /// Lance-native identity of the active `__manifest` branch. Stable across
+    /// commits; changes when a named branch is deleted and recreated.
+    pub(crate) async fn branch_identifier(&self) -> Result<lance::dataset::refs::BranchIdentifier> {
+        self.manifest.branch_identifier().await
+    }
+
+    /// Exact `graph_head:<active-branch>` pointer, preserving `None` for a
+    /// freshly-created named branch even though its inherited commit history has
+    /// an inferred head. Sourced from the manifest coordinator's SAME pinned
+    /// state as [`Self::snapshot`], not the separately refreshed lineage cache.
+    pub(crate) fn exact_graph_head(&self) -> Option<String> {
+        self.manifest.exact_graph_head()
+    }
+
     pub fn snapshot(&self) -> Snapshot {
         self.manifest.snapshot()
     }
@@ -223,10 +238,10 @@ impl GraphCoordinator {
         let branch = normalize_branch_name(name)?
             .ok_or_else(|| OmniError::manifest("cannot create branch 'main'".to_string()))?;
 
-        // Manifest is the single branch authority (it forks `__manifest` first).
-        // The commit graph is a pure `__manifest` projection (Phase B), so a
-        // branch create is one atomic manifest op — no derived commit-graph
-        // branch to fork, and nothing to roll back.
+        // Manifest BranchContents is the single branch authority. Lance creates
+        // it in two physical phases (shallow clone, then BranchContents); the
+        // manifest coordinator classifies/reclaims a clone-only zombie before
+        // a bounded retry. No graph-lineage branch is created or rolled back.
         self.manifest.create_branch(&branch).await
     }
 
@@ -240,10 +255,11 @@ impl GraphCoordinator {
             )));
         }
 
-        // Manifest is the single branch authority (Phase B): one atomic op makes
-        // the branch cease to exist. The commit graph is a pure `__manifest`
-        // projection with no derived branch to reclaim; the per-table data forks
-        // are reclaimed by `cleanup`, not here.
+        // Removing manifest BranchContents is the logical visibility point.
+        // Lance reclaims the branch tree afterward, so an error may still mean
+        // logical deletion succeeded; the manifest coordinator reclassifies
+        // that outcome from fresh authority. Per-table data forks remain
+        // derived state and are reclaimed by the engine afterward.
         self.manifest.delete_branch(&branch).await
     }
 
@@ -393,10 +409,35 @@ impl GraphCoordinator {
         actor_id: Option<&str>,
     ) -> Result<PublishedSnapshot> {
         let intent = self.new_lineage_intent(actor_id, None)?;
+        self.commit_changes_with_intent_and_expected(
+            changes,
+            expected_table_versions,
+            intent,
+            &PublishPrecondition::Any,
+        )
+        .await
+    }
+
+    /// Publish a pre-minted lineage intent under an explicit authority
+    /// precondition. The intent's identity and timestamp remain stable across
+    /// publisher retries and can also be persisted by the caller's recovery
+    /// protocol before this method is invoked.
+    pub(crate) async fn commit_changes_with_intent_and_expected(
+        &mut self,
+        changes: &[ManifestChange],
+        expected_table_versions: &HashMap<String, u64>,
+        intent: LineageIntent,
+        precondition: &PublishPrecondition,
+    ) -> Result<PublishedSnapshot> {
         failpoints::maybe_fail(crate::failpoints::names::GRAPH_PUBLISH_BEFORE_COMMIT_APPEND)?;
         let outcome = self
             .manifest
-            .commit_changes_with_lineage(changes, expected_table_versions, Some(&intent))
+            .commit_changes_with_lineage_and_precondition(
+                changes,
+                expected_table_versions,
+                Some(&intent),
+                precondition,
+            )
             .await?;
         failpoints::maybe_fail(crate::failpoints::names::GRAPH_PUBLISH_AFTER_MANIFEST_COMMIT)?;
         let snapshot_id = self.apply_lineage_to_cache(intent, &outcome);
@@ -406,40 +447,16 @@ impl GraphCoordinator {
         })
     }
 
-    /// Publish a branch-merge: `updates` (the merged table versions) plus the
-    /// merge commit, in one manifest CAS (RFC-013 Phase 7). The merge commit's
-    /// merged-in parent is `merged_parent_commit_id` (the source head, stable);
-    /// its first parent is resolved by the publisher as the current target-branch
-    /// head — the live head, which is the post-merge correct parent even if the
-    /// target advanced since the merge began.
-    pub(crate) async fn commit_merge_with_actor(
-        &mut self,
-        updates: &[SubTableUpdate],
-        merged_parent_commit_id: &str,
-        actor_id: Option<&str>,
-    ) -> Result<SnapshotId> {
-        let intent =
-            self.new_lineage_intent(actor_id, Some(merged_parent_commit_id.to_string()))?;
-        failpoints::maybe_fail(crate::failpoints::names::GRAPH_PUBLISH_BEFORE_COMMIT_APPEND)?;
-        let changes = updates_to_changes(updates);
-        let outcome = self
-            .manifest
-            .commit_changes_with_lineage(&changes, &HashMap::new(), Some(&intent))
-            .await?;
-        failpoints::maybe_fail(crate::failpoints::names::GRAPH_PUBLISH_AFTER_MANIFEST_COMMIT)?;
-        Ok(self.apply_lineage_to_cache(intent, &outcome))
-    }
-
     /// Mint a [`LineageIntent`] for the next commit on the current branch: a
     /// fresh ULID (stable across the publisher's CAS retries) and a timestamp.
     /// The parent is NOT chosen here — the publisher resolves it per attempt
     /// against the manifest it commits against.
-    fn new_lineage_intent(
+    pub(crate) fn new_lineage_intent(
         &self,
         actor_id: Option<&str>,
         merged_parent_commit_id: Option<String>,
-    ) -> Result<crate::db::manifest::LineageIntent> {
-        Ok(crate::db::manifest::LineageIntent {
+    ) -> Result<LineageIntent> {
+        Ok(LineageIntent {
             graph_commit_id: ulid::Ulid::new().to_string(),
             branch: self.current_branch().map(str::to_string),
             actor_id: actor_id.map(str::to_string),

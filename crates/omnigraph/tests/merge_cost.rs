@@ -53,7 +53,9 @@ where
 /// one inserted Person must NOT open the untouched tables for validation — cost
 /// follows the delta, not the catalog. Pre-#5 this opened ~6 tables via a
 /// full-graph validation scan; the index-backed evaluator probes only the
-/// committed Person table (for uniqueness) plus the delta.
+/// committed Person table (for uniqueness) plus the delta, and RFC-022 v4
+/// re-opens the one physical effect to prove its exact transaction history
+/// before confirmation.
 #[test]
 fn merge_validation_is_delta_scoped() {
     on_big_stack(|| async {
@@ -102,12 +104,12 @@ fn merge_validation_is_delta_scoped() {
         );
 
         // The proof: only Person changed, so the merge opens only Person-related
-        // tables (the delta + the committed-target index probe for uniqueness) —
-        // never the untouched Company / Knows / WorksAt. Pre-#5 this was ~6
-        // (every catalog table, full-scanned).
+        // tables (the delta + committed-target index probe + exact confirmation
+        // re-observation) — never the untouched Company / Knows / WorksAt.
+        // Pre-#5 this was ~6 (every catalog table, full-scanned).
         assert!(
-            io.data_open_count <= 3,
-            "merge of a 1-Person delta opened {} data tables; expected <= 3 (Δ-scoped). \
+            io.data_open_count <= 4,
+            "merge of a 1-Person delta opened {} data tables; expected <= 4 (Δ-scoped, including exact confirmation). \
              Pre-#5 it opened every catalog table (~6) via a whole-graph validation scan.",
             io.data_open_count
         );

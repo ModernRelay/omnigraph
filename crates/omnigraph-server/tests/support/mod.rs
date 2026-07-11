@@ -502,12 +502,6 @@ pub fn renamed_age_schema() -> String {
         .replace("age: I32?", "years: I32? @rename_from(\"age\")")
 }
 
-pub fn indexed_name_schema() -> String {
-    fs::read_to_string(fixture("test.pg"))
-        .unwrap()
-        .replace("name: String @key", "name: String @key @index")
-}
-
 pub fn unsupported_schema_change() -> String {
     fs::read_to_string(fixture("test.pg"))
         .unwrap()

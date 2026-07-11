@@ -577,6 +577,21 @@ pub struct ManifestConflictOutput {
     pub actual: u64,
 }
 
+/// Structured authority mismatch for an RFC-022 prepared write. Values are
+/// strings because members include optional graph commit ids and future
+/// authority tokens, not only numeric table versions.
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+pub struct ReadSetConflictOutput {
+    pub member: String,
+    pub expected: Option<String>,
+    pub actual: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+pub struct RecoveryRequiredOutput {
+    pub operation_id: String,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
 pub struct ErrorOutput {
     pub error: String,
@@ -590,6 +605,13 @@ pub struct ErrorOutput {
     /// manifest is now at `actual`. Refresh and retry.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub manifest_conflict: Option<ManifestConflictOutput>,
+    /// Set when a prepared write's logical authority changed before effects.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub read_set_conflict: Option<ReadSetConflictOutput>,
+    /// Set when an overlapping durable recovery intent must be resolved before
+    /// retry. Its table effects may or may not have started.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub recovery_required: Option<RecoveryRequiredOutput>,
 }
 
 pub fn snapshot_payload(

@@ -49,6 +49,11 @@ impl CommitGraph {
     /// keeps the cache consistent for same-handle reads, with no storage I/O.
     /// Head selection matches the manifest-sourced load (`should_replace_head`).
     pub fn insert_committed(&mut self, commit: GraphCommit) {
+        debug_assert_eq!(
+            commit.manifest_branch.as_deref(),
+            self.active_branch.as_deref(),
+            "published lineage must target the commit graph's active branch"
+        );
         if should_replace_head(self.head_commit.as_ref(), &commit) {
             self.head_commit = Some(commit.clone());
         }
@@ -71,7 +76,8 @@ impl CommitGraph {
         let root = root_uri.trim_end_matches('/');
         // `load_commit_cache_for_branch` opens the branch's `__manifest` (the
         // authoritative table), so a truly absent branch fails loudly here.
-        let (commit_by_id, head_commit) = load_commit_cache_for_branch(root, Some(branch)).await?;
+        let (commit_by_id, head_commit) =
+            load_commit_cache_for_branch(root, Some(branch)).await?;
         Ok(Self {
             root_uri: root.to_string(),
             active_branch: Some(branch.to_string()),
@@ -128,6 +134,45 @@ impl CommitGraph {
             None => return Ok(None),
         };
 
+        Self::merge_base_from_open_graphs(
+            source,
+            target,
+            &source_head.graph_commit_id,
+            &target_head.graph_commit_id,
+        )
+        .await
+    }
+
+    /// Compute a merge base for two already-captured graph commits rather than
+    /// re-reading each branch's live head. Branch merge uses this after it has
+    /// captured immutable source/target authority: a later source advance must
+    /// not silently substitute a newer source commit, and a later target
+    /// advance is rejected by the target OCC token instead of changing the
+    /// classifier input.
+    pub(crate) async fn merge_base_between(
+        root_uri: &str,
+        source_branch: Option<&str>,
+        target_branch: Option<&str>,
+        source_commit_id: &str,
+        target_commit_id: &str,
+    ) -> Result<Option<GraphCommit>> {
+        let source = open_for_branch(root_uri, source_branch).await?;
+        let target = open_for_branch(root_uri, target_branch).await?;
+        Self::merge_base_from_open_graphs(
+            source,
+            target,
+            source_commit_id,
+            target_commit_id,
+        )
+        .await
+    }
+
+    async fn merge_base_from_open_graphs(
+        source: Self,
+        target: Self,
+        source_commit_id: &str,
+        target_commit_id: &str,
+    ) -> Result<Option<GraphCommit>> {
         let mut commits = HashMap::new();
         for commit in source.load_commits().await? {
             commits.insert(commit.graph_commit_id.clone(), commit);
@@ -136,8 +181,12 @@ impl CommitGraph {
             commits.insert(commit.graph_commit_id.clone(), commit);
         }
 
-        let source_distances = ancestor_distances(&source_head.graph_commit_id, &commits);
-        let target_distances = ancestor_distances(&target_head.graph_commit_id, &commits);
+        if !commits.contains_key(source_commit_id) || !commits.contains_key(target_commit_id) {
+            return Ok(None);
+        }
+
+        let source_distances = ancestor_distances(source_commit_id, &commits);
+        let target_distances = ancestor_distances(target_commit_id, &commits);
 
         let best = source_distances
             .iter()
@@ -180,7 +229,7 @@ async fn load_commit_cache_from_manifest(
     root_uri: &str,
     branch: Option<&str>,
 ) -> Result<(HashMap<String, GraphCommit>, Option<GraphCommit>)> {
-    let (rows, _heads) =
+    let (rows, _) =
         crate::db::manifest::ManifestCoordinator::read_graph_lineage_at(root_uri, branch).await?;
     let mut commit_by_id = HashMap::with_capacity(rows.len());
     let mut head_commit = None;

@@ -13,8 +13,18 @@ const RECOVERY_ACTOR: &str = "omnigraph:recovery";
 
 #[derive(Debug)]
 pub enum RecoveryExpectation {
-    RolledForward { tables: Vec<TableExpectation> },
-    RolledBack { tables: Vec<TableExpectation> },
+    RolledForward {
+        tables: Vec<TableExpectation>,
+    },
+    /// RFC-022 v3 mutation/load and v4 branch-merge recovery republish the
+    /// writer's fixed lineage intent rather than minting a synthetic recovery
+    /// commit.
+    RolledForwardOriginalLineage {
+        tables: Vec<TableExpectation>,
+    },
+    RolledBack {
+        tables: Vec<TableExpectation>,
+    },
     Deferred,
     NoOp,
 }
@@ -41,6 +51,7 @@ pub struct FollowUpMutation {
 struct RecoveryAuditRow {
     graph_commit_id: String,
     recovery_kind: String,
+    recovery_for_actor: Option<String>,
     operation_id: String,
     sidecar_writer_kind: String,
     per_table_outcomes: Vec<TableOutcome>,
@@ -201,7 +212,21 @@ pub async fn assert_post_recovery_invariants(
             );
             assert_manifest_pins_match_lance_heads(graph_root, &tables).await?;
             assert_audit_to_versions_match_lance_heads(graph_root, &audit, &tables).await?;
-            assert_recovery_commit_shape(graph_root, &audit, &tables).await?;
+            assert_recovery_commit_shape(graph_root, &audit, &tables, false).await?;
+            assert_non_main_did_not_move_main(graph_root, &tables).await?;
+            assert_idempotent_reopen(graph_root, operation_id).await?;
+            run_follow_up_mutations(graph_root, tables).await?;
+        }
+        RecoveryExpectation::RolledForwardOriginalLineage { tables } => {
+            assert_sidecar_absent(graph_root, operation_id);
+            let audit = read_audit_row(graph_root, operation_id).await?;
+            assert_eq!(
+                audit.recovery_kind, "RolledForward",
+                "audit row for {operation_id} recorded the wrong recovery_kind",
+            );
+            assert_manifest_pins_match_lance_heads(graph_root, &tables).await?;
+            assert_audit_to_versions_match_lance_heads(graph_root, &audit, &tables).await?;
+            assert_recovery_commit_shape(graph_root, &audit, &tables, true).await?;
             assert_non_main_did_not_move_main(graph_root, &tables).await?;
             assert_idempotent_reopen(graph_root, operation_id).await?;
             run_follow_up_mutations(graph_root, tables).await?;
@@ -217,7 +242,7 @@ pub async fn assert_post_recovery_invariants(
             // Roll-back now publishes the restored HEAD, so manifest == Lance
             // HEAD afterward (symmetric with roll-forward) — no residual drift.
             assert_manifest_pins_match_lance_heads(graph_root, &tables).await?;
-            assert_recovery_commit_shape(graph_root, &audit, &tables).await?;
+            assert_recovery_commit_shape(graph_root, &audit, &tables, false).await?;
             assert_non_main_did_not_move_main(graph_root, &tables).await?;
             assert_idempotent_reopen(graph_root, operation_id).await?;
             run_follow_up_mutations(graph_root, tables).await?;
@@ -366,19 +391,29 @@ async fn assert_recovery_commit_shape(
     graph_root: &Path,
     audit: &RecoveryAuditRow,
     tables: &[TableExpectation],
+    preserves_original_intent: bool,
 ) -> Result<()> {
     let branch = branch_context(tables);
     let expected_parent = expected_recovery_parent(tables)?;
     let branch = branch.as_deref();
     let commit = read_recovery_commit(graph_root, audit, branch).await?;
 
+    // RFC-022 mutation/load roll-forward publishes the writer's original,
+    // pre-minted lineage intent. That preserves its original actor (including
+    // `None`) and makes a crash after publish distinguishable from a new
+    // synthetic recovery content commit. Rollback and legacy writer recovery
+    // still publish an explicit `omnigraph:recovery` commit.
+    let expected_actor = if preserves_original_intent {
+        audit.recovery_for_actor.as_deref()
+    } else {
+        Some(RECOVERY_ACTOR)
+    };
     assert_eq!(
         commit.actor_id.as_deref(),
-        Some(RECOVERY_ACTOR),
-        "recovery commit {} for operation {} must use actor {}",
+        expected_actor,
+        "recovery commit {} for operation {} recorded the wrong actor",
         commit.graph_commit_id,
         audit.operation_id,
-        RECOVERY_ACTOR,
     );
 
     if let Some(expected_parent) = expected_parent {
@@ -573,6 +608,7 @@ async fn matching_audit_rows(
     for batch in batches {
         let graph_commit_ids = string_column(&batch, "graph_commit_id")?;
         let kinds = string_column(&batch, "recovery_kind")?;
+        let recovery_actors = string_column(&batch, "recovery_for_actor")?;
         let ops = string_column(&batch, "operation_id")?;
         let writers = string_column(&batch, "sidecar_writer_kind")?;
         let outcomes_json = string_column(&batch, "per_table_outcomes_json")?;
@@ -589,6 +625,8 @@ async fn matching_audit_rows(
             rows.push(RecoveryAuditRow {
                 graph_commit_id: graph_commit_ids.value(row).to_string(),
                 recovery_kind: kinds.value(row).to_string(),
+                recovery_for_actor: (!recovery_actors.is_null(row))
+                    .then(|| recovery_actors.value(row).to_string()),
                 operation_id: ops.value(row).to_string(),
                 sidecar_writer_kind: writers.value(row).to_string(),
                 per_table_outcomes,

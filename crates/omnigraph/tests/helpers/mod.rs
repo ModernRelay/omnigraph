@@ -61,6 +61,9 @@ pub async fn init_and_load(dir: &tempfile::TempDir) -> Omnigraph {
     load_jsonl(&mut db, TEST_DATA, LoadMode::Overwrite)
         .await
         .unwrap();
+    // Mutation/load publish only exact data effects; physical indexes are
+    // reconciled separately as derived state.
+    db.ensure_indices().await.unwrap();
     db
 }
 
@@ -211,15 +214,18 @@ pub async fn commit_many(db: &mut Omnigraph, n: usize) {
     }
 }
 
-/// Like [`commit_many`] but every commit carries an actor, so it grows
-/// `_graph_commit_actors.lance` too — the authenticated (server/CLI) write path.
+/// Like [`commit_many`] but every commit carries an actor in its inline
+/// `__manifest` lineage row — the authenticated (server/CLI) write path.
 pub async fn commit_many_as(db: &mut Omnigraph, n: usize, actor: &str) {
     for i in 0..n {
         db.mutate_as(
             "main",
             MUTATION_QUERIES,
             "insert_person",
-            &mixed_params(&[("$name", &format!("commit_many_as_{i}"))], &[("$age", 30)]),
+            &mixed_params(
+                &[("$name", &format!("commit_many_as_{i}"))],
+                &[("$age", 30)],
+            ),
             Some(actor),
         )
         .await

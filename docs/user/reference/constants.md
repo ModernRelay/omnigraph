@@ -4,14 +4,14 @@
 |---|---|---|
 | `MANIFEST_DIR` | `__manifest` | manifest layout |
 | Commit graph dirs (retired) | `_graph_commits.lance` / `_graph_commit_actors.lance` | retired in Phase B; lineage lives in `__manifest` (`graph_commit` / `graph_head` rows) since RFC-013 Phase 7. A graph this binary creates has neither. |
-| Recovery audit dir | `_graph_commit_recoveries.lance` | one row per crash-recovery action (`omnigraph commit list --filter actor=omnigraph:recovery`) |
+| Recovery audit dir | `_graph_commit_recoveries.lance` | internal exact record of completed crash-recovery actions; no public CLI query yet |
+| Exact recovery history-scan ceiling | `MAX_EFFECT_IDENTITY_SCAN_VERSIONS = 1024` | v3/v4 recovery fails closed as unverifiable rather than scanning an unbounded Lance transaction history; a v4 logical merge chain is at most three commits today, with only derived `CreateIndex` commits allowed after it |
 | Run branch prefix (legacy, removed) | `__run__` | pre-v0.4.0 Run state machine; no longer a reserved name. A graph still carrying `__run__*` branches is sub-v4 and refused on open (rebuild via export/import). |
 | Schema apply lock | `__schema_apply_lock__` | schema apply |
 | Manifest publisher retry budget | `PUBLISHER_RETRY_BUDGET = 5` | manifest publish |
 | Internal manifest schema version | `INTERNAL_MANIFEST_SCHEMA_VERSION = 4` | manifest migrations (v4 = graph lineage in `__manifest`, RFC-013 Phase 7) |
 | Merge stage batch | `MERGE_STAGE_BATCH_ROWS = 8192` | merge execution |
 | Maintenance concurrency | `OMNIGRAPH_MAINTENANCE_CONCURRENCY=8` | optimize/cleanup |
-| Lance blob compaction support | `LANCE_SUPPORTS_BLOB_COMPACTION = false` | optimize |
 | Graph index cache size | `8` (LRU) | runtime cache |
 | Expand indexed-path frontier ceiling | `OMNIGRAPH_EXPAND_INDEXED_MAX_FRONTIER=1024` | traversal |
 | Expand indexed-path hop ceiling | `OMNIGRAPH_EXPAND_INDEXED_MAX_HOPS=6` | traversal |

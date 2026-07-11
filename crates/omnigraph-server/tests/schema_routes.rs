@@ -371,8 +371,7 @@ async fn schema_apply_route_can_rename_property() {
 
 #[tokio::test]
 async fn schema_apply_route_can_add_index() {
-    let (temp, app) = app_for_graph_with_auth_tokens_and_policy(
-        &fs::read_to_string(fixture("test.pg")).unwrap(),
+    let (temp, app) = app_for_loaded_graph_with_auth_tokens_and_policy(
         &[("act-ragnor", "admin-token")],
         SCHEMA_APPLY_POLICY_YAML,
     )
@@ -392,7 +391,9 @@ async fn schema_apply_route_can_add_index() {
         .header("authorization", "Bearer admin-token")
         .body(Body::from(
             serde_json::to_vec(&SchemaApplyRequest {
-                schema_source: indexed_name_schema(),
+                schema_source: fs::read_to_string(fixture("test.pg"))
+                    .unwrap()
+                    .replace("age: I32?", "age: I32? @index"),
                 ..Default::default()
             })
             .unwrap(),
@@ -404,9 +405,24 @@ async fn schema_apply_route_can_add_index() {
     assert_eq!(payload["applied"], true);
     // iss-848: the /schema/apply route accepts the index-add and applies it as a
     // metadata change — it records the `@index` intent in the catalog/IR but does
-    // NOT build the physical index inline (the build is deferred to
-    // ensure_indices/optimize; on this empty table nothing would build anyway).
-    // So the physical index count is unchanged by the apply.
+    // NOT build the physical index inline or spawn a server-only build (the
+    // build is deferred to explicit ensure_indices/optimize maintenance).
+    // Pin the detached-work half structurally instead of waiting an arbitrary
+    // amount of wall-clock time for a task that must not exist. The physical
+    // assertion below independently covers synchronous/awaited index builds.
+    let handlers = include_str!("../src/handlers.rs");
+    let (_, after_apply_signature) = handlers
+        .split_once("pub(crate) async fn server_schema_apply")
+        .expect("server_schema_apply handler must remain present");
+    let (apply_handler, _) = after_apply_signature
+        .split_once("/// Shared body for `POST /load`")
+        .expect("schema apply handler must precede the load handler");
+    assert!(
+        !apply_handler.contains("tokio::spawn") && !apply_handler.contains(".ensure_indices("),
+        "schema apply must not schedule implicit physical index convergence"
+    );
+
+    // The physical index count is unchanged by the apply.
     let reopened = Omnigraph::open(graph.to_str().unwrap()).await.unwrap();
     let snapshot = reopened
         .snapshot_of(ReadTarget::branch("main"))

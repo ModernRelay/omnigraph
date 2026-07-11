@@ -21,6 +21,12 @@ properties in the assignment block (`insert WorksAt { person: $p, org: $o }`).
 
 `<value>` is a literal, `$param`, or `now()`.
 
+On a blob-bearing type, an update materializes and rewrites blob payloads only
+for the rows matched by its predicate, including blobs the update does not
+change. This keeps correctness independent of physical index state, but adds
+read/write I/O proportional to the matched blob bytes; use selective update
+predicates for large blobs.
+
 ## Atomicity
 
 A change query publishes **one commit** at the end of the query. Multiple
@@ -37,12 +43,29 @@ complete a `@unique` group the assignment touches) and patches them in place.
 Unassigned columns — including large `Vector` embedding columns — are neither
 read nor rewritten, and indexes over them keep their coverage. Semantics are
 identical to a whole-row update; the difference is cost: update latency and
-write volume scale with what you assign, not with row width.
+write volume scale with what you assign, not with row width. Types with a
+`Blob` property currently always use the whole-row path (including the blob
+materialization described above).
 
 Queries that combine an update with other statements on the same type fall back
 to whole-row staging (same semantics, previous cost). Note that updating a
 property that feeds an `@embed` column does **not** recompute the embedding —
 re-run the embedding pass after changing embed-source text.
+
+## Concurrency
+
+Concurrent changes use optimistic concurrency over the whole target branch.
+Insert/Merge/Append operations whose branch changed before physical effects are
+discarded and fully revalidated with a bounded internal retry. Strict
+Update/Delete/Overwrite operations instead return a structured conflict. This
+branch-wide token is deliberately conservative: a change to a different table
+can invalidate a prepared strict write because constraints may have read it.
+
+If the synchronous barrier finds an unresolved overlapping recovery intent, or
+if a conflict is discovered after a Lance table effect is durable, the request
+returns `recovery_required` with an operation id. Do not immediately retry that
+request; reopen the graph read-write (or restart the server) so the durable
+recovery intent is resolved first.
 
 ## Inserts/updates and deletes cannot mix in one query
 

@@ -450,6 +450,56 @@ async fn stage_merge_insert_commit_rebases_over_disjoint_committed_delete() {
     assert_eq!(collect_age_for_id(&batches, "p10"), None);
 }
 
+#[tokio::test]
+async fn exact_commit_exposes_lance_preflight_rebase_version() {
+    let dir = tempfile::tempdir().unwrap();
+    let uri = format!("{}/people.lance", dir.path().to_str().unwrap());
+    let store = TableStore::new(dir.path().to_str().unwrap(), test_session());
+
+    let ds = TableStore::write_dataset(&uri, person_batch(&[("alice", Some(30))]))
+        .await
+        .unwrap();
+    let staged = store
+        .stage_append(&ds, person_batch(&[("bob", Some(25))]), &[])
+        .await
+        .unwrap();
+    let planned = staged.transaction_identity();
+    assert_eq!(planned.read_version, 1);
+
+    // A foreign append lands after staging. Even with max_retries(0), Lance
+    // performs one preflight conflict-resolution pass and can rebase this
+    // append before its sole manifest-write attempt. Lance preserves the
+    // transaction fields, so the exact path must expose the later achieved
+    // version as the second half of the identity check.
+    let mut foreign = ds.clone();
+    lance_append_inline_local(&mut foreign, person_batch(&[("carol", Some(40))])).await;
+    let (committed, observed) = store
+        .commit_staged_exact(Arc::new(ds), staged)
+        .await
+        .unwrap();
+    assert_eq!(committed.version().version, 3);
+    assert_eq!(observed, planned);
+    assert_ne!(
+        committed.version().version,
+        planned.read_version + 1,
+        "Lance preserves transaction identity during this preflight rebase; \
+         the achieved version is the second half of exact-effect identity"
+    );
+
+    // Without a concurrent advance, the same one-attempt path lands the exact
+    // staged transaction identity.
+    let next = store
+        .stage_append(&committed, person_batch(&[("dave", Some(50))]), &[])
+        .await
+        .unwrap();
+    let next_planned = next.transaction_identity();
+    let (_committed, next_observed) = store
+        .commit_staged_exact(Arc::new(committed), next)
+        .await
+        .unwrap();
+    assert_eq!(next_observed, next_planned);
+}
+
 /// **Documented limitation** (see `scan_with_staged` doc): when a filter
 /// is supplied, Lance's stats-based pruning drops the staged fragment from
 /// the filtered scan because uncommitted fragments produced by
@@ -1075,10 +1125,9 @@ async fn lance_restore_appends_one_commit_with_checked_out_content() {
     );
 }
 
-/// Empirical pin of the `Dataset::restore` concurrency hazard that
-/// motivates the recovery sweep's open-time-only invocation strategy
-/// and any future continuous-recovery reconciler's queue-acquisition
-/// requirement.
+/// Empirical pin of the `Dataset::restore` concurrency hazard that requires
+/// Full recovery to join the root-scoped writer gates and leaves a real
+/// cross-process fencing boundary.
 ///
 /// `Dataset::restore`'s `check_restore_txn` (lance-6.0.1
 /// `src/io/commit/conflict_resolver.rs:986`) returns `Ok(())` against
@@ -1091,18 +1140,17 @@ async fn lance_restore_appends_one_commit_with_checked_out_content() {
 /// rewind commit AFTER the legitimate concurrent Append, silently
 /// orphaning that Append's data from the active timeline.
 ///
-/// The recovery sweep sidesteps this by running only at `Omnigraph::open`
-/// (before any other writers can race). A future continuous-recovery
-/// reconciler must acquire per-(table_key, branch) queues for sidecar
-/// tables before invoking restore — otherwise this hazard becomes
-/// reachable during in-flight tenant traffic.
+/// Full recovery may invoke Restore on a read-write open, but first joins the
+/// same root-scoped schema → branch → sorted-table gates as live writers and
+/// rechecks that the sidecar still exists after waiting. The in-process healer
+/// is roll-forward-only and never restores beneath live traffic. Together those
+/// rules keep this substrate asymmetry unreachable against another handle in
+/// the same process.
 ///
-/// MR-686 introduces those per-(table_key, branch) writer queues as the
-/// application-layer mechanism that closes this hazard once continuous
-/// in-process recovery (MR-870) lands. Until MR-686's queue is wired into
-/// the recovery path, the open-time-only invocation strategy is the
-/// only thing keeping this hazard out of production. See
-/// `docs/invariants.md` §VI.30, §VI.32, §VI.33.
+/// The gates remain process-local. A recovery pass cannot fence a live writer
+/// in another process, so general multi-process write/recovery topologies remain
+/// outside the supported boundary until a distributed fence exists. See
+/// `docs/dev/invariants.md` and `docs/dev/writes.md`.
 ///
 /// This test is the load-bearing constraint any future reconciler must
 /// honor.
@@ -1159,10 +1207,10 @@ async fn lance_restore_loses_to_concurrent_append_via_orphaning() {
         ids,
         vec!["alice".to_string()],
         "Concurrent Append's row 'bob' was silently orphaned by the \
-         Restore. Active-timeline contents == v1's contents. The recovery \
-         sweep sidesteps this hazard via open-time-only invocation; any \
-         future continuous-recovery reconciler must guard against it via \
-         per-(table, branch) queue acquisition. Got: {:?}",
+         Restore. Active-timeline contents == v1's contents. Full recovery \
+         must join the root-scoped writer gates before Restore; those gates \
+         remain process-local, so a distributed fence is required before \
+         multi-process recovery can be supported. Got: {:?}",
         ids,
     );
 

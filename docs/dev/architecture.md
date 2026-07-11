@@ -170,30 +170,36 @@ Code paths:
 - Graph index: `crates/omnigraph/src/graph_index/`
 - Loader: `Omnigraph::ingest` at `crates/omnigraph/src/loader/mod.rs:74`
 
-### Mutation atomicity — in-memory accumulator (MR-794)
+### Mutation atomicity — in-memory accumulator + branch-wide OCC (MR-794 / RFC-022)
 
-Inserts and updates inside `mutate_as` and the bulk loader's
-Append/Merge modes go through `MutationStaging`
+Mutations inside `mutate_as` and every bulk-load mode go through `MutationStaging`
 ([`crates/omnigraph/src/exec/staging.rs`](../../crates/omnigraph/src/exec/staging.rs)),
 a per-query in-memory accumulator. No Lance HEAD advance happens during
-op execution; one `stage_*` + `commit_staged` per touched table runs
-at end-of-query, then the publisher commits the manifest atomically.
+op execution. The attempt captures one native branch identity, exact graph head,
+accepted schema identity/catalog, and base snapshot. At end-of-query it stages
+one exact Lance transaction per touched table outside the effect gates, then
+acquires the root-shared schema → branch → sorted-table gates and revalidates the
+complete authority before arming recovery or advancing any table HEAD.
 
 ```
 op-1 (insert/update) → push RecordBatch → MutationStaging.pending[table]
 op-2 (insert/update) → read committed via Lance + pending via DataFusion
                        MemTable (read-your-writes) → push batch
 op-N → push batch
-─── end of query ───────────────────────────────────────
-finalize: per pending table:
-   concat batches → stage_append OR stage_merge_insert OR stage_overwrite
-                  → commit_staged
-publisher: ManifestBatchPublisher::publish (one cross-table CAS)
+─── end of query ────────────────────────────────────────────────
+stage_all: concat batches → one exact stage_* transaction per table (no HEAD move)
+commit_all: acquire schema → branch → sorted-table gates
+            → reject a new recovery intent → revalidate the complete branch token
+            → arm schema-v3 recovery → commit_staged per table
+publisher: publish pre-minted lineage under the exact native-branch/head + table precondition
 ```
 
-A failed op leaves Lance HEAD untouched on the staged tables: the next
-mutation proceeds normally with no drift to reconcile. Concrete
-contracts:
+A failed op leaves Lance HEAD untouched on the staged tables. If authority
+changes before effects, insert-only mutations and Append/Merge loads discard the
+whole attempt and fully reprepare with a bounded retry; Update/Delete/Overwrite
+returns `ReadSetChanged`. After any physical effect, any later error returns
+`RecoveryRequired` and leaves the v3 sidecar to converge the fixed outcome.
+Concrete contracts:
 
 - `D₂` parse-time rule: a query is either insert/update-only or
   delete-only. Mixed → reject. Deletes now stage like inserts/updates
@@ -262,7 +268,7 @@ flowchart LR
     rec --> diff --> wp
 ```
 
-Today, indexes are built explicitly via `ensure_indices`. Reads degrade gracefully when index coverage is partial — Lance's scanner unions indexed and scan paths automatically. The roadmap reconciler observes manifest state and converges coverage in the background.
+Today, physical indexes are built explicitly via `ensure_indices`/`optimize`; schema apply, mutation, and load only record intent or publish their exact data effects and never build indexes inline. Reads degrade gracefully when index coverage is missing or partial — Lance's scanner unions indexed and scan paths automatically (vector search falls back to brute force). A future background reconciler may automate the same explicit convergence path.
 
 ### Server / CLI
 
@@ -276,14 +282,14 @@ flowchart LR
     pol[Cedar policy gate<br/>per request]:::l2
     wl[WorkloadController<br/>per-actor admission]:::l2
     eng[engine API<br/>Arc&lt;Omnigraph&gt;]:::l2
-    wq[WriteQueueManager<br/>per-(table, branch)]:::l2
+    wq[WriteQueueManager<br/>root-scoped schema → branch → table gates]:::l2
 
     cli -.-> eng
     srv_in --> auth --> pol --> wl --> eng
     eng --> wq
 ```
 
-The server applies Cedar policy at the HTTP boundary today. The roadmap, called out in [docs/dev/invariants.md](invariants.md) as a known gap, is to push policy into the planner as predicates. After Cedar, mutating handlers go through `WorkloadController` (per-actor admission cap + byte budget; PR 2 / MR-686) before reaching the engine. The engine itself holds an `Arc<WriteQueueManager>` so concurrent mutations on the same `(table, branch)` serialize at the queue, while disjoint keys run in parallel — see [docs/user/server.md](../user/operations/server.md) "Per-actor admission control" and [docs/dev/writes.md](writes.md). The CLI bypasses the HTTP layer (and admission) and calls the engine API directly.
+The server applies Cedar policy at the HTTP boundary today. The roadmap, called out in [docs/dev/invariants.md](invariants.md) as a known gap, is to push policy into the planner as predicates. After Cedar, mutating handlers go through `WorkloadController` (per-actor admission cap + byte budget; PR 2 / MR-686) before reaching the engine. Every handle for one canonical graph root shares an `Arc<WriteQueueManager>` in-process. RFC-022-enrolled mutation/load attempts prepare outside the effect gates, then acquire the exclusive root schema gate, the target branch-effect gate, and sorted `(table, branch)` gates and hold them through publish. The root schema gate means enrolled effect windows on one graph currently serialize even across different branches; readers remain ungated, and pre-effect parsing, validation, and fragment staging can overlap. The branch gate preserves the complete per-branch validation authority, while table gates protect each concrete Lance effect and legacy adapter. These gates prevent same-process races and impose one deadlock-free order; the exact publisher precondition and durable recovery intent remain the correctness authorities, and the gates are not a cross-process lock. See [docs/user/server.md](../user/operations/server.md) "Per-actor admission control" and [docs/dev/writes.md](writes.md). The CLI bypasses the HTTP layer (and admission) and calls the engine API directly.
 
 Code paths:
 
@@ -303,8 +309,8 @@ Throughout the docs, capabilities are split into:
 
 - **MVCC**: every Lance write bumps a per-dataset version; the OmniGraph manifest version coordinates which sub-table versions are visible together.
 - **Snapshot isolation**: a query holds one `Snapshot` for its lifetime; concurrent writes don't leak in.
-- **Cross-branch isolation**: copy-on-write means readers and writers on different branches don't block each other.
-- **Per-query staging**: `mutate_as` and `load` (Append/Merge) accumulate insert/update batches in an in-memory `MutationStaging`; one `stage_*` + `commit_staged` per touched table runs at end-of-query, then the publisher commits the manifest atomically. A mid-query failure leaves Lance HEAD untouched on staged tables. (MR-794; pre-v0.4.0 used a `__run__<id>` staging branch + Run state machine, removed in MR-771.)
+- **Cross-branch isolation**: Lance copy-on-write keeps branch data independent, and readers never acquire write gates. Enrolled writer preparation can overlap across branches, but their effect/publish windows currently share one exclusive root schema gate before the branch/table gates, so those windows serialize in-process even for different branches.
+- **Per-query staging**: `mutate_as` and every `load` mode accumulate their work in an in-memory `MutationStaging`; `stage_all` prepares exact per-table transactions without moving HEAD. At commit, the root schema → branch → sorted-table gates protect complete-token revalidation, v3 recovery arming, zero-retry table effects, and one atomic manifest publish. A mid-query failure leaves Lance HEAD untouched on staged tables. (MR-794 / RFC-022; pre-v0.4.0 used a `__run__<id>` staging branch + Run state machine, removed in MR-771.)
 - **Schema-apply lock**: `__schema_apply_lock__` system branch serializes schema migrations.
 - **Fail-points** (`failpoints` cargo feature): `failpoints::maybe_fail("operation.step")?` in `branch_create`, publish, etc., for deterministic failure injection in tests.
 

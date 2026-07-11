@@ -338,7 +338,7 @@ async fn _compile_uncommitted_merge_insert_field_shape() -> lance::Result<()> {
 // The branch-delete reconciler (`db/omnigraph/optimize.rs::reconcile_orphaned_branches`)
 // and the eager best-effort reclaim in `cleanup_deleted_branch_tables` call
 // `force_delete_branch` to drop orphaned branch refs. The single-authority
-// design relies on three facts pinned here:
+// design relies on five facts pinned here:
 //   1. plain `delete_branch` errors on a missing ref (so the design uses the
 //      force variant instead);
 //   2. `force_delete_branch` removes an existing (forked) branch — the orphan
@@ -347,7 +347,14 @@ async fn _compile_uncommitted_merge_insert_field_shape() -> lance::Result<()> {
 //      errors on the local store, because `remove_dir_all`'s NotFound is not
 //      caught for Lance's native error variant. `TableStore::force_delete_branch`
 //      wraps this to be fully idempotent. Pin the raw quirk so a future Lance
-//      fix (which would let us simplify the wrapper) is noticed.
+//      fix (which would let us simplify the wrapper) is noticed;
+//   4. a clone-only zombie (branch dataset present, BranchContents absent)
+//      blocks raw create and is reclaimed by `force_delete_branch`. Lance's
+//      create is explicitly two-phase, so this is the crash state OmniGraph's
+//      native branch-control wrapper must heal before retrying;
+//   5. a live slash-name path-child makes force delete remove an ancestor's
+//      BranchContents but intentionally retain its dataset files. OmniGraph's
+//      prefix-disjoint live-name invariant prevents this false-success shape.
 
 #[tokio::test]
 async fn force_delete_branch_semantics() {
@@ -378,6 +385,56 @@ async fn force_delete_branch_semantics() {
         ds.force_delete_branch("never").await.is_err(),
         "force_delete_branch on a fully-absent branch no longer errors — \
          TableStore::force_delete_branch's NotFound tolerance can be simplified."
+    );
+
+    // (4) Exact phase-1-only create state: create the shallow-cloned branch
+    // dataset, then remove only its authoritative BranchContents ref. This is
+    // the same fixture Lance's own dataset-versioning test uses for a zombie.
+    ds.create_branch("zombie", base, None).await.unwrap();
+    std::fs::remove_file(
+        std::path::Path::new(uri)
+            .join("_refs")
+            .join("branches")
+            .join("zombie.json"),
+    )
+    .unwrap();
+    assert!(
+        !ds.list_branches().await.unwrap().contains_key("zombie"),
+        "BranchContents is the authority; the clone-only tree must not list as a branch"
+    );
+    assert!(
+        ds.create_branch("zombie", base, None).await.is_err(),
+        "the clone-only tree should block an unclassified raw create"
+    );
+    ds.force_delete_branch("zombie").await.unwrap();
+    assert!(
+        !std::path::Path::new(uri)
+            .join("tree")
+            .join("zombie")
+            .exists(),
+        "force_delete_branch must reclaim the clone-only tree"
+    );
+
+    // (5) Slash-separated names overlap physically. A path-child created from
+    // main is not a lineage descendant of its lexical ancestor, so raw force
+    // delete removes the ancestor ref but deliberately leaves its dataset
+    // files to avoid recursively deleting the child.
+    ds.create_branch("ancestor/child", base, None)
+        .await
+        .unwrap();
+    ds.create_branch("ancestor", base, None).await.unwrap();
+    ds.force_delete_branch("ancestor").await.unwrap();
+    assert!(
+        !ds.list_branches().await.unwrap().contains_key("ancestor"),
+        "raw force delete still removes authoritative ancestor metadata"
+    );
+    assert!(
+        std::path::Path::new(uri)
+            .join("tree")
+            .join("ancestor")
+            .join("_versions")
+            .exists(),
+        "Lance must retain ancestor dataset files while a physical path-child is live"
     );
 }
 

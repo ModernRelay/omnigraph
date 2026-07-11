@@ -4,7 +4,7 @@ mod helpers;
 
 use fail::FailScenario;
 use omnigraph::db::Omnigraph;
-use omnigraph::error::{ManifestErrorKind, OmniError};
+use omnigraph::error::OmniError;
 use omnigraph::failpoints::ScopedFailPoint;
 use omnigraph::failpoints::names;
 use omnigraph::loader::LoadMode;
@@ -12,16 +12,40 @@ use serial_test::serial;
 
 use helpers::recovery::{
     FollowUpMutation, RecoveryExpectation, TableExpectation, assert_post_recovery_invariants,
-    branch_head_commit_id, single_sidecar_operation_id,
+    branch_head_commit_id, recovery_audit_kinds, single_sidecar_operation_id,
 };
 use helpers::{
-    MUTATION_QUERIES, collect_column_strings, mixed_params, mutate_main, read_table, test_session,
-    version_main,
+    MUTATION_QUERIES, collect_column_strings, count_rows, mixed_params, mutate_main, params,
+    read_table, test_session, version_main,
 };
 
 const SCHEMA_V1: &str = "node Person { name: String @key }\n";
 const SCHEMA_V2_ADDED_TYPE: &str =
     "node Person { name: String @key }\nnode Company { name: String @key }\n";
+
+const OCC_UNIQUE_SCHEMA: &str = r#"
+node User {
+    name: String @key
+    email: String?
+    @unique(email)
+}
+"#;
+
+const OCC_UNIQUE_MUTATIONS: &str = r#"
+query insert_user($name: String, $email: String) {
+    insert User { name: $name, email: $email }
+}
+"#;
+
+const OCC_DISJOINT_MUTATIONS: &str = r#"
+query set_age($name: String, $age: I32) {
+    update Person set { age: $age } where name = $name
+}
+
+query insert_company($name: String) {
+    insert Company { name: $name }
+}
+"#;
 
 fn node_table_uri(root: &str, type_name: &str) -> String {
     let mut hash: u64 = 0xcbf2_9ce4_8422_2325;
@@ -30,6 +54,50 @@ fn node_table_uri(root: &str, type_name: &str) -> String {
         hash = hash.wrapping_mul(0x100_0000_01b3);
     }
     format!("{}/nodes/{hash:016x}", root.trim_end_matches('/'))
+}
+
+// Lance can durably complete a native ref mutation while the caller observes
+// an error (for example, a lost object-store acknowledgement). BranchContents
+// is the logical authority in both directions: matching create metadata means
+// success, and an absent ref means delete succeeded even if tree cleanup or the
+// acknowledgement failed. Neither control emits graph lineage or a main-table
+// version.
+#[tokio::test]
+#[serial]
+async fn native_branch_controls_reclassify_lost_acknowledgements() {
+    let _scenario = FailScenario::setup();
+    let dir = tempfile::tempdir().unwrap();
+    let db = helpers::init_and_load(&dir).await;
+    let before_version = version_main(&db).await.unwrap();
+    let before_commits = db.list_commits(Some("main")).await.unwrap().len();
+
+    {
+        let _fp = ScopedFailPoint::new(names::BRANCH_CREATE_POST_NATIVE, "return");
+        db.branch_create("feature")
+            .await
+            .expect("matching BranchContents must classify a lost create acknowledgement");
+    }
+    assert!(
+        db.branch_list()
+            .await
+            .unwrap()
+            .iter()
+            .any(|branch| branch == "feature")
+    );
+
+    {
+        let _fp = ScopedFailPoint::new(names::BRANCH_DELETE_POST_NATIVE, "return");
+        db.branch_delete("feature")
+            .await
+            .expect("absent BranchContents must classify a lost delete acknowledgement");
+    }
+    assert_eq!(db.branch_list().await.unwrap(), vec!["main".to_string()]);
+    assert_eq!(version_main(&db).await.unwrap(), before_version);
+    assert_eq!(
+        db.list_commits(Some("main")).await.unwrap().len(),
+        before_commits,
+        "native branch controls must not manufacture graph lineage"
+    );
 }
 
 // Branch delete flips the manifest authority first, then reclaims the per-table
@@ -178,10 +246,11 @@ async fn recreate_over_orphaned_fork_self_heals_without_cleanup() {
 }
 
 // The write-path orphan reclaim shares the same fresh-authority classifier as
-// cleanup. If that classifier is Indeterminate (transient read on a live
-// branch), the write must return a clear retryable authority-read conflict and
-// leave the ref in place. It must not squeeze the ambiguity through
-// ExpectedVersionMismatch with expected == actual, which lies about the cause.
+// cleanup. If that classifier is Indeterminate after v3 recovery has been
+// armed, the write must retain recovery ownership and return RecoveryRequired;
+// deleting the sidecar would lose authority over a target ref that may already
+// have been created. A full read-write reopen resolves the armed no-HEAD-effect
+// attempt before the write can be retried.
 #[tokio::test]
 #[serial]
 async fn recreate_over_orphaned_fork_reports_indeterminate_authority_read() {
@@ -206,16 +275,10 @@ async fn recreate_over_orphaned_fork_reports_indeterminate_authority_read() {
             .await
             .expect_err("indeterminate authority read must fail retryably");
 
-        match &err {
-            OmniError::Manifest(manifest) => {
-                assert_eq!(manifest.kind, ManifestErrorKind::Conflict);
-                assert!(
-                    manifest.details.is_none(),
-                    "indeterminate authority read is not an expected-version mismatch: {manifest:?}"
-                );
-            }
-            other => panic!("expected manifest conflict, got {other:?}"),
-        }
+        assert!(
+            matches!(err, OmniError::RecoveryRequired { .. }),
+            "an ambiguous post-arm fork error must retain recovery ownership: {err:?}"
+        );
         let message = err.to_string();
         assert!(
             message.contains("could not verify")
@@ -235,9 +298,13 @@ async fn recreate_over_orphaned_fork_reports_indeterminate_authority_read() {
         );
     }
 
+    drop(db);
+    let db = Omnigraph::open(&uri)
+        .await
+        .expect("read-write reopen must resolve the retained armed sidecar");
     db.load_as("feature", None, row, LoadMode::Merge, None)
         .await
-        .expect("when fresh authority is available, the orphan is reclaimed and write converges");
+        .expect("after recovery, fresh authority reclaims the orphan and the write converges");
 }
 
 // cleanup is the guaranteed convergence backstop, so one table's transient
@@ -409,12 +476,11 @@ async fn reconcile_skips_fork_when_fresh_recheck_is_unavailable_then_converges()
     }
 }
 
-
 // A fork collision must be classified by the manifest authority, not by Lance
 // branch versions. When a concurrent first-write legitimately wins the fork
-// race, the loser sees a version mismatch — but that is a stale snapshot, not
-// an orphan, so it must be a retryable "refresh and retry", never a misleading
-// "run cleanup".
+// race, the loser sees a changed read set — but that is a safe pre-effect
+// retry for Insert. RFC-022 discards and reprepares it automatically, never
+// misclassifying the live fork as an orphan that needs cleanup.
 //
 // Ordering is made deterministic (no fixed sleeps) via the shared rendezvous:
 // it parks the first arrival (writer A) at the fork point until released; later
@@ -422,7 +488,7 @@ async fn reconcile_skips_fork_when_fresh_recheck_is_unavailable_then_converges()
 // lets B win and commit the fork, then releases A.
 #[tokio::test(flavor = "multi_thread")]
 #[serial]
-async fn fork_collision_with_live_concurrent_fork_is_retryable() {
+async fn fork_collision_with_live_concurrent_fork_reprepares() {
     let _scenario = FailScenario::setup();
 
     let dir = tempfile::tempdir().unwrap();
@@ -460,22 +526,1004 @@ async fn fork_collision_with_live_concurrent_fork_is_retryable() {
     .await
     .unwrap();
 
-    // Release A; it resumes, re-reads the manifest, and sees the fork is live.
+    // Release A; it resumes, sees that B changed branch authority, discards its
+    // stale attempt, and reprepares Eve against the now-live feature fork.
     rv.release();
-    let err = writer_a
+    writer_a
         .await
         .unwrap()
-        .expect_err("A's stale-snapshot fork should be a retryable conflict");
+        .expect("A's retryable insert must reprepare after B wins the fork");
 
-    let msg = err.to_string();
+    let db = Omnigraph::open(&uri).await.unwrap();
+    assert_eq!(
+        helpers::count_rows_branch(&db, "feature", "node:Person").await,
+        6,
+        "feature must preserve four inherited rows plus both concurrent inserts"
+    );
+    assert_eq!(
+        helpers::count_rows(&db, "node:Person").await,
+        4,
+        "feature fork retries must not change main"
+    );
+}
+
+/// RFC-022 first-touch forks are physical effects and must be protected before
+/// `create_branch` runs. Writer A parks after its target ref exists but before
+/// any data commit. A separately-opened writer B shares the root-scoped gates:
+/// it waits rather than reclaiming/deleting A's live ref merely because the
+/// graph manifest has not published it yet.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[serial]
+async fn cross_handle_reclaim_never_deletes_live_intent_owned_fork() {
+    let _scenario = FailScenario::setup();
+    let dir = tempfile::tempdir().unwrap();
+    let uri = dir.path().to_str().unwrap().to_string();
+    let main = helpers::init_and_load(&dir).await;
+    main.branch_create("feature").await.unwrap();
+    drop(main);
+
+    // Open both handles before A creates a pending sidecar. Opening B afterward
+    // would deliberately invoke the quiesced full recovery sweep instead of the
+    // live-writer roll-forward-only path this race exercises.
+    let db_a = std::sync::Arc::new(Omnigraph::open(&uri).await.unwrap());
+    let db_b = std::sync::Arc::new(Omnigraph::open(&uri).await.unwrap());
+    let rendezvous =
+        helpers::failpoint::Rendezvous::park_first(names::MUTATION_POST_FORK_PRE_COMMIT);
+
+    let writer_a_db = std::sync::Arc::clone(&db_a);
+    let writer_a = tokio::spawn(async move {
+        writer_a_db
+            .mutate(
+                "feature",
+                MUTATION_QUERIES,
+                "insert_person",
+                &mixed_params(&[("$name", "Eve")], &[("$age", 22)]),
+            )
+            .await
+    });
+    rendezvous.wait_until_reached().await;
+
+    let person_uri = node_table_uri(&uri, "Person");
+    let fork_before = lance::Dataset::open(&person_uri)
+        .await
+        .unwrap()
+        .checkout_branch("feature")
+        .await
+        .unwrap()
+        .branch_identifier()
+        .await
+        .unwrap();
+
+    let writer_b_db = std::sync::Arc::clone(&db_b);
+    let mut writer_b = tokio::spawn(async move {
+        writer_b_db
+            .mutate(
+                "feature",
+                MUTATION_QUERIES,
+                "set_age",
+                &mixed_params(&[("$name", "Alice")], &[("$age", 99)]),
+            )
+            .await
+    });
     assert!(
-        !msg.contains("cleanup"),
-        "a live concurrent fork must not be misclassified as an orphan, got: {msg}"
+        tokio::time::timeout(std::time::Duration::from_millis(200), &mut writer_b)
+            .await
+            .is_err(),
+        "the second handle must wait on A's root-scoped effect gates"
+    );
+
+    let fork_after = lance::Dataset::open(&person_uri)
+        .await
+        .unwrap()
+        .checkout_branch("feature")
+        .await
+        .unwrap()
+        .branch_identifier()
+        .await
+        .unwrap();
+    assert_eq!(
+        fork_after, fork_before,
+        "B must not delete and recreate A's intent-owned Lance ref"
+    );
+
+    rendezvous.release();
+    writer_a
+        .await
+        .unwrap()
+        .expect("A must commit normally after the competing reclaim is rejected");
+    writer_b
+        .await
+        .unwrap()
+        .expect("B must reprepare after A publishes and update without recreating the ref");
+    drop(db_a);
+
+    let mut db = Omnigraph::open(&uri).await.unwrap();
+    assert_eq!(
+        helpers::count_rows_branch(&db, "feature", "node:Person").await,
+        5,
+        "feature must contain the four inherited rows plus A's insert"
+    );
+    let alice = helpers::query_branch(
+        &mut db,
+        "feature",
+        helpers::TEST_QUERIES,
+        "get_person",
+        &params(&[("$name", "Alice")]),
+    )
+    .await
+    .unwrap();
+    assert_eq!(alice.to_rust_json()[0]["p.age"], serde_json::json!(99));
+}
+
+#[tokio::test]
+#[serial]
+async fn armed_first_touch_recovery_accepts_missing_target_ref() {
+    let _scenario = FailScenario::setup();
+    let dir = tempfile::tempdir().unwrap();
+    let uri = dir.path().to_str().unwrap().to_string();
+    let db = helpers::init_and_load(&dir).await;
+    let main_rows = helpers::count_rows(&db, "node:Person").await;
+    db.branch_create("feature").await.unwrap();
+
+    {
+        let _failpoint = ScopedFailPoint::new(names::MUTATION_POST_SIDECAR_PRE_FORK, "return");
+        let err = db
+            .mutate(
+                "feature",
+                MUTATION_QUERIES,
+                "insert_person",
+                &mixed_params(&[("$name", "Eve")], &[("$age", 22)]),
+            )
+            .await
+            .expect_err("failure after arming must leave recovery intent");
+        assert!(matches!(err, OmniError::RecoveryRequired { .. }));
+    }
+    let operation_id = single_sidecar_operation_id(dir.path());
+    let person_uri = node_table_uri(&uri, "Person");
+    assert!(
+        !lance::Dataset::open(&person_uri)
+            .await
+            .unwrap()
+            .list_branches()
+            .await
+            .unwrap()
+            .contains_key("feature"),
+        "precondition: crash happened before the target ref was created"
+    );
+
+    // Materialize the narrower Lance crash window underneath the already-
+    // durable writer intent: shallow clone present, BranchContents absent.
+    // Full recovery must not equate "not listed" with "no physical fork".
+    let mut person = lance::Dataset::open(&person_uri).await.unwrap();
+    let person_version = person.version().version;
+    person
+        .create_branch("feature", person_version, None)
+        .await
+        .unwrap();
+    std::fs::remove_file(
+        std::path::Path::new(&person_uri)
+            .join("_refs")
+            .join("branches")
+            .join("feature.json"),
+    )
+    .unwrap();
+    assert!(
+        std::path::Path::new(&person_uri)
+            .join("tree")
+            .join("feature")
+            .exists(),
+        "precondition: clone-only target tree exists"
+    );
+    drop(person);
+
+    // Stage A is a synchronous, branch-aware barrier. The Armed sidecar has no
+    // table effect for a HEAD-drift check to discover, but it is still ownership:
+    // another mutation on the same branch must name it and stop before preparing
+    // a competing first-touch effect.
+    let mutation_err = db
+        .mutate(
+            "feature",
+            MUTATION_QUERIES,
+            "insert_person",
+            &mixed_params(&[("$name", "Follower")], &[("$age", 23)]),
+        )
+        .await
+        .expect_err("same-branch mutation must stop at the unresolved Armed intent");
+    match mutation_err {
+        OmniError::RecoveryRequired {
+            operation_id: actual,
+            ..
+        } => assert_eq!(actual, operation_id),
+        other => panic!("expected RecoveryRequired for the Armed intent, got {other}"),
+    }
+
+    // An explicit load base is read authority too. Reject before the implicit
+    // child branch is created, even though the load target itself has no sidecar.
+    let load_err = db
+        .load_as(
+            "child",
+            Some("feature"),
+            r#"{"type":"Person","data":{"name":"LoadFollower","age":24}}"#,
+            LoadMode::Merge,
+            None,
+        )
+        .await
+        .expect_err("load must stop on an unresolved intent for its explicit base");
+    match load_err {
+        OmniError::RecoveryRequired {
+            operation_id: actual,
+            ..
+        } => assert_eq!(actual, operation_id),
+        other => panic!("expected RecoveryRequired for the load base, got {other}"),
+    }
+    assert!(
+        !db.branch_list()
+            .await
+            .unwrap()
+            .iter()
+            .any(|branch| branch == "child"),
+        "barrier rejection must precede the load's implicit branch creation"
+    );
+
+    // The feature intent does not overlap main. Branch filtering must avoid
+    // turning one branch's rollback-eligible residue into a graph-wide outage.
+    db.mutate(
+        "main",
+        MUTATION_QUERIES,
+        "insert_person",
+        &mixed_params(&[("$name", "MainFollower")], &[("$age", 25)]),
+    )
+    .await
+    .expect("an unresolved feature intent must not block a main mutation");
+    assert_eq!(helpers::count_rows(&db, "node:Person").await, main_rows + 1);
+    assert_eq!(
+        helpers::recovery::sidecar_operation_ids(dir.path()),
+        vec![operation_id.clone()],
+        "blocked attempts must neither replace nor delete the owning sidecar"
+    );
+    drop(db);
+
+    let recovered = Omnigraph::open(&uri).await.unwrap();
+    assert_eq!(
+        helpers::count_rows_branch(&recovered, "feature", "node:Person").await,
+        main_rows,
+        "abandoned intent must leave the feature table inherited"
     );
     assert!(
-        msg.contains("refresh and retry") || msg.contains("expected manifest table version"),
-        "expected a retryable stale-view error, got: {msg}"
+        !dir.path()
+            .join("__recovery")
+            .join(format!("{operation_id}.json"))
+            .exists(),
+        "full recovery must remove the empty armed intent"
     );
+    assert!(
+        !std::path::Path::new(&person_uri)
+            .join("tree")
+            .join("feature")
+            .exists(),
+        "full recovery must reclaim an unlisted clone-only table fork"
+    );
+}
+
+#[tokio::test]
+#[serial]
+async fn armed_first_touch_recovery_defers_legacy_path_overlap_until_leaf_delete() {
+    let _scenario = FailScenario::setup();
+    let dir = tempfile::tempdir().unwrap();
+    let uri = dir.path().to_str().unwrap().to_string();
+    let db = helpers::init_and_load(&dir).await;
+    let main_rows = helpers::count_rows(&db, "node:Person").await;
+
+    // Materialize the leaf first so its graph snapshot owns a matching
+    // per-table Lance branch. New OmniGraph versions reject the inverse live
+    // namespace, but old stores could contain it.
+    db.branch_create("feature/child").await.unwrap();
+    db.mutate(
+        "feature/child",
+        MUTATION_QUERIES,
+        "insert_person",
+        &mixed_params(&[("$name", "Leaf")], &[("$age", 22)]),
+    )
+    .await
+    .unwrap();
+
+    // Forge only the legacy graph-level ancestor admission. It inherits main,
+    // so an interrupted first write will own an unpublished table fork.
+    let mut manifest = lance::Dataset::open(&format!("{uri}/__manifest"))
+        .await
+        .unwrap();
+    let manifest_version = manifest.version().version;
+    manifest
+        .create_branch("feature", manifest_version, None)
+        .await
+        .unwrap();
+    drop(manifest);
+
+    {
+        let _failpoint = ScopedFailPoint::new(names::MUTATION_POST_SIDECAR_PRE_FORK, "return");
+        let error = db
+            .mutate(
+                "feature",
+                MUTATION_QUERIES,
+                "insert_person",
+                &mixed_params(&[("$name", "Ancestor")], &[("$age", 23)]),
+            )
+            .await
+            .expect_err("failure after arming must leave the ancestor recovery intent");
+        assert!(matches!(error, OmniError::RecoveryRequired { .. }));
+    }
+    let operation_id = single_sidecar_operation_id(dir.path());
+
+    // Reproduce Lance's narrower clone-only crash window under the already
+    // durable intent. The live leaf shares the ancestor's physical path, so a
+    // force-delete of the ancestor cannot safely complete yet.
+    let person_uri = node_table_uri(&uri, "Person");
+    let mut person = lance::Dataset::open(&person_uri).await.unwrap();
+    let person_version = person.version().version;
+    person
+        .create_branch("feature", person_version, None)
+        .await
+        .unwrap();
+    std::fs::remove_file(
+        std::path::Path::new(&person_uri)
+            .join("_refs")
+            .join("branches")
+            .join("feature.json"),
+    )
+    .unwrap();
+    assert!(
+        person
+            .list_branches()
+            .await
+            .unwrap()
+            .contains_key("feature/child"),
+        "precondition: live leaf table branch exists"
+    );
+    assert!(
+        !person
+            .list_branches()
+            .await
+            .unwrap()
+            .contains_key("feature"),
+        "precondition: ancestor is clone-only"
+    );
+    drop(person);
+    drop(db);
+
+    let recovered = Omnigraph::open(&uri)
+        .await
+        .expect("legacy path overlap must defer cleanup instead of wedging read-write open");
+    assert!(
+        dir.path()
+            .join("__recovery")
+            .join(format!("{operation_id}.json"))
+            .exists(),
+        "deferred cleanup must retain its ownership sidecar"
+    );
+    assert_eq!(
+        helpers::count_rows_branch(&recovered, "feature", "node:Person").await,
+        main_rows,
+        "the empty ancestor intent must remain unpublished"
+    );
+
+    recovered
+        .branch_delete("feature/child")
+        .await
+        .expect("open handle must permit the documented leaf-first remediation");
+    drop(recovered);
+
+    let recovered = Omnigraph::open(&uri)
+        .await
+        .expect("the next Full sweep must finish ancestor cleanup");
+    assert!(
+        !dir.path()
+            .join("__recovery")
+            .join(format!("{operation_id}.json"))
+            .exists(),
+        "recovery must retire the intent after the path child is gone"
+    );
+    assert!(
+        !std::path::Path::new(&person_uri)
+            .join("tree")
+            .join("feature")
+            .exists(),
+        "the clone-only ancestor tree must be reclaimed after leaf deletion"
+    );
+    assert_eq!(
+        helpers::count_rows_branch(&recovered, "feature", "node:Person").await,
+        main_rows
+    );
+}
+
+#[tokio::test]
+#[serial]
+async fn partial_first_touch_recovery_fails_closed_on_legacy_path_overlap() {
+    let _scenario = FailScenario::setup();
+    let dir = tempfile::tempdir().unwrap();
+    let uri = dir.path().to_str().unwrap().to_string();
+    let db = helpers::init_and_load(&dir).await;
+    let main_person_rows = helpers::count_rows(&db, "node:Person").await;
+    let main_edge_rows = helpers::count_rows(&db, "edge:Knows").await;
+
+    let main_snapshot = db.snapshot_of("main").await.unwrap();
+    let table_pins = ["node:Person", "edge:Knows"]
+        .into_iter()
+        .map(|table_key| {
+            let entry = main_snapshot.entry(table_key).unwrap();
+            (
+                table_key.to_string(),
+                format!("{uri}/{}", entry.table_path),
+                entry.table_version,
+            )
+        })
+        .collect::<Vec<_>>();
+
+    db.branch_create("feature").await.unwrap();
+    let operation_id = {
+        let _failpoint = ScopedFailPoint::new(names::MUTATION_POST_TABLE_COMMIT, "return");
+        let error = db
+            .mutate(
+                "feature",
+                MUTATION_QUERIES,
+                "insert_person_and_friend",
+                &mixed_params(
+                    &[("$name", "Ancestor"), ("$friend", "Alice")],
+                    &[("$age", 23)],
+                ),
+            )
+            .await
+            .expect_err("the first exact table effect must leave a partial v3 intent");
+        match error {
+            OmniError::RecoveryRequired { operation_id, .. } => operation_id,
+            other => panic!("expected RecoveryRequired, got {other}"),
+        }
+    };
+    assert_eq!(single_sidecar_operation_id(dir.path()), operation_id);
+
+    // All deferred first-touch refs are created before the table-commit loop.
+    // Staging order is intentionally non-semantic, so either table may own the
+    // one durable effect while its sibling remains at the exact fork point.
+    let mut head_deltas = Vec::new();
+    let mut heads_before_open = Vec::new();
+    for (table_key, table_uri, expected_version) in &table_pins {
+        let mut root = lance::Dataset::open(table_uri).await.unwrap();
+        let branches = root.list_branches().await.unwrap();
+        assert!(
+            branches.contains_key("feature"),
+            "precondition: {table_key} has its armed first-touch ref"
+        );
+        let head = root
+            .checkout_branch("feature")
+            .await
+            .unwrap()
+            .version()
+            .version;
+        heads_before_open.push((table_key.clone(), head));
+        head_deltas.push(head.checked_sub(*expected_version).unwrap());
+
+        // Forge the legacy namespace only after the partial effect exists. New
+        // OmniGraph versions reject this path-prefix overlap at branch create,
+        // but old stores can contain it. Clone from the exact feature HEAD so
+        // the child itself introduces no extra ancestor movement.
+        root.create_branch("feature/child", ("feature", head), None)
+            .await
+            .unwrap();
+    }
+    head_deltas.sort_unstable();
+    assert_eq!(
+        head_deltas,
+        vec![0, 1],
+        "exactly one table effect must be durable while its sibling remains an untouched fork"
+    );
+
+    let mut manifest = lance::Dataset::open(&format!("{uri}/__manifest"))
+        .await
+        .unwrap();
+    let feature_manifest_version = manifest
+        .checkout_branch("feature")
+        .await
+        .unwrap()
+        .version()
+        .version;
+    manifest
+        .create_branch("feature/child", ("feature", feature_manifest_version), None)
+        .await
+        .unwrap();
+    drop(manifest);
+
+    let open_error = match Omnigraph::open(&uri).await {
+        Ok(_) => panic!(
+            "Full recovery must not return a writable handle while owned effects remain unrolled"
+        ),
+        Err(error) => error,
+    };
+    assert!(
+        open_error.to_string().contains("owns physical effects")
+            && open_error.to_string().contains("feature/child"),
+        "failure must explain the safe leaf-first remediation boundary: {open_error}"
+    );
+    assert!(
+        dir.path()
+            .join("__recovery")
+            .join(format!("{operation_id}.json"))
+            .exists(),
+        "failed Full recovery must retain exact ownership"
+    );
+    let manifest_after_failed_open = lance::Dataset::open(&format!("{uri}/__manifest"))
+        .await
+        .unwrap()
+        .checkout_branch("feature")
+        .await
+        .unwrap()
+        .version()
+        .version;
+    assert_eq!(
+        manifest_after_failed_open, feature_manifest_version,
+        "failed rollback preflight must not publish the manifest"
+    );
+    for ((table_key, table_uri, _), (_, before)) in table_pins.iter().zip(heads_before_open.iter())
+    {
+        let root = lance::Dataset::open(table_uri).await.unwrap();
+        let after = root
+            .checkout_branch("feature")
+            .await
+            .unwrap()
+            .version()
+            .version;
+        assert_eq!(
+            after, *before,
+            "failed preflight must not restore or publish {table_key}"
+        );
+    }
+
+    // A handle that predates the interrupted attempt can remove the graph leaf
+    // under the normal branch-control gates. This fixture forged its table refs
+    // outside the manifest, so finish the documented offline leaf cleanup at
+    // Lance level. Once the physical overlap is gone, the next quiesced Full
+    // sweep can compensate the owned effect atomically.
+    db.branch_delete("feature/child").await.unwrap();
+    for (_, table_uri, _) in &table_pins {
+        lance::Dataset::open(table_uri)
+            .await
+            .unwrap()
+            .force_delete_branch("feature/child")
+            .await
+            .unwrap();
+    }
+    drop(db);
+
+    let recovered = Omnigraph::open(&uri)
+        .await
+        .expect("rollback must converge after leaf-first remediation");
+    assert!(helpers::recovery::sidecar_operation_ids(dir.path()).is_empty());
+    assert_eq!(
+        helpers::count_rows_branch(&recovered, "feature", "node:Person").await,
+        main_person_rows
+    );
+    assert_eq!(
+        helpers::count_rows_branch(&recovered, "feature", "edge:Knows").await,
+        main_edge_rows
+    );
+}
+
+#[tokio::test]
+#[serial]
+async fn load_without_explicit_base_does_not_add_main_to_recovery_scope() {
+    let _scenario = FailScenario::setup();
+    let dir = tempfile::tempdir().unwrap();
+    let uri = dir.path().to_str().unwrap().to_string();
+    let db = helpers::init_and_load(&dir).await;
+    let main_rows = helpers::count_rows(&db, "node:Person").await;
+    db.branch_create("feature").await.unwrap();
+
+    // Leave an Armed main intent with an exact physical effect. RollForwardOnly
+    // must defer it, giving the load barrier a real unresolved main operation to
+    // filter rather than a synthetic test-only record.
+    {
+        let _failpoint = ScopedFailPoint::new(names::RECOVERY_SIDECAR_CONFIRM, "return");
+        let err = db
+            .mutate(
+                "main",
+                MUTATION_QUERIES,
+                "insert_person",
+                &mixed_params(&[("$name", "InterruptedMain")], &[("$age", 26)]),
+            )
+            .await
+            .expect_err("confirmation failure must leave an Armed main intent");
+        assert!(matches!(err, OmniError::RecoveryRequired { .. }));
+    }
+    let operation_id = single_sidecar_operation_id(dir.path());
+
+    // `base=None` means no explicit base dependency; it must not be represented
+    // as a phantom main branch in the recovery scope. The feature snapshot was
+    // cut before the interrupted main effect and can proceed independently.
+    db.load(
+        "feature",
+        r#"{"type":"Person","data":{"name":"FeatureLoad","age":27}}"#,
+        LoadMode::Merge,
+    )
+    .await
+    .expect("a feature load without --from must ignore unresolved main recovery");
+    assert_eq!(
+        helpers::count_rows_branch(&db, "feature", "node:Person").await,
+        main_rows + 1
+    );
+    assert_eq!(
+        helpers::recovery::sidecar_operation_ids(dir.path()),
+        vec![operation_id],
+        "the unrelated main intent must remain for Full recovery"
+    );
+
+    drop(db);
+    let recovered = Omnigraph::open(&uri)
+        .await
+        .expect("Full recovery must still compensate the interrupted main effect");
+    assert_eq!(
+        helpers::count_rows(&recovered, "node:Person").await,
+        main_rows
+    );
+    assert_eq!(
+        helpers::count_rows_branch(&recovered, "feature", "node:Person").await,
+        main_rows + 1
+    );
+}
+
+#[tokio::test]
+#[serial]
+async fn armed_first_touch_recovery_reclaims_exact_no_effect_fork() {
+    let _scenario = FailScenario::setup();
+    let dir = tempfile::tempdir().unwrap();
+    let uri = dir.path().to_str().unwrap().to_string();
+    let db = helpers::init_and_load(&dir).await;
+    let main_rows = helpers::count_rows(&db, "node:Person").await;
+    db.branch_create("feature").await.unwrap();
+
+    {
+        let _failpoint = ScopedFailPoint::new(names::MUTATION_POST_FORK_PRE_COMMIT, "return");
+        let err = db
+            .mutate(
+                "feature",
+                MUTATION_QUERIES,
+                "insert_person",
+                &mixed_params(&[("$name", "Eve")], &[("$age", 22)]),
+            )
+            .await
+            .expect_err("failure after the fork must require recovery");
+        assert!(matches!(err, OmniError::RecoveryRequired { .. }));
+    }
+    let operation_id = single_sidecar_operation_id(dir.path());
+    let person_uri = node_table_uri(&uri, "Person");
+    assert!(
+        lance::Dataset::open(&person_uri)
+            .await
+            .unwrap()
+            .list_branches()
+            .await
+            .unwrap()
+            .contains_key("feature"),
+        "precondition: intent-owned target ref exists without a committed effect"
+    );
+    drop(db);
+
+    let recovered = Omnigraph::open(&uri).await.unwrap();
+    assert_eq!(
+        helpers::count_rows_branch(&recovered, "feature", "node:Person").await,
+        main_rows,
+        "recovery must leave the feature table inherited"
+    );
+    assert!(
+        !lance::Dataset::open(&person_uri)
+            .await
+            .unwrap()
+            .list_branches()
+            .await
+            .unwrap()
+            .contains_key("feature"),
+        "full recovery must reclaim the exact unpublished no-effect ref"
+    );
+    assert!(
+        !dir.path()
+            .join("__recovery")
+            .join(format!("{operation_id}.json"))
+            .exists(),
+        "full recovery must delete the abandoned sidecar"
+    );
+}
+
+/// A live writer keeps its schema/branch/table guards through Phase D. A
+/// refresh from a separately-opened handle must share those root-scoped gates,
+/// wait, and then skip the sidecar after A publishes/deletes it. Recovering the
+/// confirmed effect early would make A's own publisher lose authority.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[serial]
+async fn cross_handle_refresh_waits_for_live_confirmed_writer() {
+    let _scenario = FailScenario::setup();
+    let dir = tempfile::tempdir().unwrap();
+    let uri = dir.path().to_str().unwrap().to_string();
+    drop(helpers::init_and_load(&dir).await);
+    let db_a = std::sync::Arc::new(Omnigraph::open(&uri).await.unwrap());
+    let db_b = std::sync::Arc::new(Omnigraph::open(&uri).await.unwrap());
+
+    let rendezvous =
+        helpers::failpoint::Rendezvous::park_first(names::MUTATION_POST_FINALIZE_PRE_PUBLISHER);
+    let writer_db = std::sync::Arc::clone(&db_a);
+    let writer = tokio::spawn(async move {
+        writer_db
+            .mutate(
+                "main",
+                MUTATION_QUERIES,
+                "insert_person",
+                &mixed_params(&[("$name", "Eve")], &[("$age", 22)]),
+            )
+            .await
+    });
+    rendezvous.wait_until_reached().await;
+
+    let refresher_db = std::sync::Arc::clone(&db_b);
+    let mut refresher = tokio::spawn(async move { refresher_db.refresh().await });
+    assert!(
+        tokio::time::timeout(std::time::Duration::from_millis(200), &mut refresher)
+            .await
+            .is_err(),
+        "refresh must wait for the live writer's shared table gate"
+    );
+
+    rendezvous.release();
+    writer
+        .await
+        .unwrap()
+        .expect("A must publish normally; refresh must not steal its sidecar");
+    refresher
+        .await
+        .unwrap()
+        .expect("refresh must skip A's now-deleted sidecar");
+    assert_eq!(helpers::count_rows(&db_b, "node:Person").await, 5);
+    let recovery_dir = dir.path().join("__recovery");
+    assert!(
+        !recovery_dir.exists() || std::fs::read_dir(recovery_dir).unwrap().next().is_none(),
+        "the successful writer must leave no recovery sidecar"
+    );
+}
+
+/// A ReadWrite open is itself a recovery actor. It must join the same
+/// root-scoped gates as an already-open handle before running Full recovery;
+/// otherwise it can classify an Armed pre-fork sidecar as dead and delete it
+/// while the live writer is still about to create the target ref.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[serial]
+async fn read_write_open_waits_for_live_armed_prefork_writer() {
+    let _scenario = FailScenario::setup();
+    let dir = tempfile::tempdir().unwrap();
+    let uri = dir.path().to_str().unwrap().to_string();
+    let db_a = std::sync::Arc::new(helpers::init_and_load(&dir).await);
+    db_a.branch_create("feature").await.unwrap();
+
+    let rendezvous =
+        helpers::failpoint::Rendezvous::park_first(names::MUTATION_POST_SIDECAR_PRE_FORK);
+    let writer_db = std::sync::Arc::clone(&db_a);
+    let writer = tokio::spawn(async move {
+        writer_db
+            .mutate(
+                "feature",
+                MUTATION_QUERIES,
+                "insert_person",
+                &mixed_params(&[("$name", "Eve")], &[("$age", 22)]),
+            )
+            .await
+    });
+    rendezvous.wait_until_reached().await;
+
+    let opener_uri = uri.clone();
+    let mut opener = tokio::spawn(async move { Omnigraph::open(&opener_uri).await });
+    assert!(
+        tokio::time::timeout(std::time::Duration::from_millis(200), &mut opener)
+            .await
+            .is_err(),
+        "ReadWrite open must wait on the live writer's root-scoped schema gate"
+    );
+
+    rendezvous.release();
+    writer
+        .await
+        .unwrap()
+        .expect("A must finish; Full recovery must not delete its live intent");
+    let opened = opener
+        .await
+        .unwrap()
+        .expect("the waiting open must succeed after A releases its gates");
+    assert_eq!(
+        helpers::count_rows_branch(&opened, "feature", "node:Person").await,
+        5
+    );
+    let recovery_dir = dir.path().join("__recovery");
+    assert!(!recovery_dir.exists() || std::fs::read_dir(recovery_dir).unwrap().next().is_none());
+}
+
+/// Two dead Armed attempts may name the same first-touch ref: A created the
+/// exact no-effect fork and failed, then B armed and failed before its fork.
+/// Full recovery is quiesced by the shared gates: while another claim exists a
+/// no-effect sidecar discards only itself, and the last survivor performs the
+/// exact-ref cleanup. Mutual foreign-claim rejection would wedge every future
+/// ReadWrite open forever.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[serial]
+async fn full_recovery_converges_multiple_no_effect_claims_for_one_fork() {
+    let _scenario = FailScenario::setup();
+    let dir = tempfile::tempdir().unwrap();
+    let uri = dir.path().to_str().unwrap().to_string();
+    let db = helpers::init_and_load(&dir).await;
+    let main_rows = helpers::count_rows(&db, "node:Person").await;
+    db.branch_create("feature").await.unwrap();
+
+    // B passes the synchronous recovery barrier before A's sidecar exists,
+    // then parks before gates/effects. This models a foreign process or an
+    // already-prepared attempt; a newly-started in-process write is blocked by
+    // Stage A once A leaves its unresolved intent.
+    let before_effect =
+        helpers::failpoint::Rendezvous::park_first(names::MUTATION_POST_STAGE_PRE_EFFECT_GATE);
+    let writer_b_db = std::sync::Arc::new(db);
+    let writer_b_handle = std::sync::Arc::clone(&writer_b_db);
+    let writer_b = tokio::spawn(async move {
+        writer_b_handle
+            .mutate(
+                "feature",
+                MUTATION_QUERIES,
+                "insert_person",
+                &mixed_params(&[("$name", "B")], &[("$age", 21)]),
+            )
+            .await
+    });
+    before_effect.wait_until_reached().await;
+
+    {
+        let _failpoint = ScopedFailPoint::new(names::MUTATION_POST_FORK_PRE_COMMIT, "return");
+        let err = writer_b_db
+            .mutate(
+                "feature",
+                MUTATION_QUERIES,
+                "insert_person",
+                &mixed_params(&[("$name", "A")], &[("$age", 20)]),
+            )
+            .await
+            .unwrap_err();
+        assert!(matches!(err, OmniError::RecoveryRequired { .. }));
+    }
+    let first_operation = single_sidecar_operation_id(dir.path());
+    let first_sidecar_path = dir
+        .path()
+        .join("__recovery")
+        .join(format!("{first_operation}.json"));
+    let first_sidecar_body = std::fs::read_to_string(&first_sidecar_path).unwrap();
+    // Model a foreign/already-prepared B that did not observe A at the current
+    // binary's second Stage-A check; restore A afterward to exercise recovery's
+    // compatibility path for the preexisting two-claim state.
+    std::fs::remove_file(&first_sidecar_path).unwrap();
+    {
+        let _failpoint = ScopedFailPoint::new(names::MUTATION_POST_SIDECAR_PRE_FORK, "return");
+        before_effect.release();
+        let err = writer_b.await.unwrap().unwrap_err();
+        assert!(matches!(err, OmniError::RecoveryRequired { .. }));
+    }
+    std::fs::write(&first_sidecar_path, first_sidecar_body).unwrap();
+    assert_eq!(
+        helpers::recovery::sidecar_operation_ids(dir.path()).len(),
+        2,
+        "precondition: both no-effect claims are durable"
+    );
+    let person_uri = node_table_uri(&uri, "Person");
+    assert!(
+        lance::Dataset::open(&person_uri)
+            .await
+            .unwrap()
+            .list_branches()
+            .await
+            .unwrap()
+            .contains_key("feature"),
+        "precondition: A's exact no-effect target ref exists"
+    );
+    drop(writer_b_db);
+
+    let recovered = Omnigraph::open(&uri)
+        .await
+        .expect("ordered no-effect claim recovery must converge");
+    assert_eq!(
+        helpers::count_rows_branch(&recovered, "feature", "node:Person").await,
+        main_rows
+    );
+    assert!(helpers::recovery::sidecar_operation_ids(dir.path()).is_empty());
+    assert!(
+        !lance::Dataset::open(&person_uri)
+            .await
+            .unwrap()
+            .list_branches()
+            .await
+            .unwrap()
+            .contains_key("feature"),
+        "the last no-effect claim must reclaim the exact unpublished ref"
+    );
+}
+
+/// A no-effect Armed intent must not delete a ref while a competing confirmed
+/// intent claims it. A starts first and fails before fork; a synthesized
+/// foreign/older writer B does not observe A, creates/commits/confirms that same
+/// ref, and fails before publish. Full recovery discards A without touching B's
+/// ref, then rolls B's exact effect forward.
+#[tokio::test]
+#[serial]
+async fn full_recovery_discards_no_effect_claim_before_confirmed_competitor() {
+    let _scenario = FailScenario::setup();
+    let dir = tempfile::tempdir().unwrap();
+    let uri = dir.path().to_str().unwrap().to_string();
+    let db = std::sync::Arc::new(helpers::init_and_load(&dir).await);
+    let main_rows = helpers::count_rows(&db, "node:Person").await;
+    db.branch_create("feature").await.unwrap();
+
+    // Produce a real, valid Armed pre-fork sidecar for A.
+    let armed_sidecar_path;
+    let armed_sidecar_body;
+    {
+        let _failpoint = ScopedFailPoint::new(names::MUTATION_POST_SIDECAR_PRE_FORK, "return");
+        let err = db
+            .mutate(
+                "feature",
+                MUTATION_QUERIES,
+                "insert_person",
+                &mixed_params(&[("$name", "Abandoned")], &[("$age", 40)]),
+            )
+            .await
+            .unwrap_err();
+        assert!(matches!(err, OmniError::RecoveryRequired { .. }));
+        let armed_operation = single_sidecar_operation_id(dir.path());
+        armed_sidecar_path = dir
+            .path()
+            .join("__recovery")
+            .join(format!("{armed_operation}.json"));
+        armed_sidecar_body = std::fs::read_to_string(&armed_sidecar_path).unwrap();
+    }
+
+    // Current binaries close the Stage-A TOCTOU in commit_all and would reject
+    // B while A is visible. Temporarily hide A to synthesize the compatible
+    // preexisting/foreign-process state an older writer can leave, then restore
+    // the exact sidecar bytes after B's confirmed effect is durable.
+    std::fs::remove_file(&armed_sidecar_path).unwrap();
+    {
+        let _failpoint =
+            ScopedFailPoint::new(names::MUTATION_POST_FINALIZE_PRE_PUBLISHER, "return");
+        let err = db
+            .mutate(
+                "feature",
+                MUTATION_QUERIES,
+                "insert_person",
+                &mixed_params(&[("$name", "Winner")], &[("$age", 41)]),
+            )
+            .await
+            .unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("mutation.post_finalize_pre_publisher"),
+            "unexpected confirmed-writer failure: {err}"
+        );
+    }
+    std::fs::write(&armed_sidecar_path, armed_sidecar_body).unwrap();
+    assert_eq!(
+        helpers::recovery::sidecar_operation_ids(dir.path()).len(),
+        2,
+        "precondition: Armed A and EffectsConfirmed B are both pending"
+    );
+    drop(db);
+
+    let recovered = Omnigraph::open(&uri)
+        .await
+        .expect("A must discard without deleting B's confirmed ref");
+    assert_eq!(
+        helpers::count_rows_branch(&recovered, "feature", "node:Person").await,
+        main_rows + 1
+    );
+    let people = helpers::read_table_branch(&recovered, "feature", "node:Person").await;
+    let names = collect_column_strings(&people, "name");
+    assert!(names.iter().any(|name| name == "Winner"));
+    assert!(!names.iter().any(|name| name == "Abandoned"));
+    assert!(helpers::recovery::sidecar_operation_ids(dir.path()).is_empty());
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -499,6 +1547,585 @@ async fn graph_publish_failpoint_triggers_before_commit_append() {
     assert!(
         err.to_string()
             .contains("injected failpoint triggered: graph_publish.before_commit_append")
+    );
+}
+
+/// RFC-022 coarse OCC must protect the *validated plan*, not only the table
+/// version handed to Lance. Writer A validates that an email is free and parks
+/// after staging but before the branch effect gate. Writer B then commits the
+/// same `@unique` email under a different key. Releasing A must discard the
+/// stale attempt and rerun validation against B's commit; merely refreshing
+/// A's expected table version would publish an invalid duplicate.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[serial]
+async fn mutation_revalidates_unique_after_pre_effect_authority_change() {
+    let _scenario = FailScenario::setup();
+    let dir = tempfile::tempdir().unwrap();
+    let uri = dir.path().to_str().unwrap();
+    let db = std::sync::Arc::new(Omnigraph::init(uri, OCC_UNIQUE_SCHEMA).await.unwrap());
+
+    let rendezvous =
+        helpers::failpoint::Rendezvous::park_first(names::MUTATION_POST_STAGE_PRE_EFFECT_GATE);
+    let writer_a_db = std::sync::Arc::clone(&db);
+    let writer_a = tokio::spawn(async move {
+        writer_a_db
+            .mutate(
+                "main",
+                OCC_UNIQUE_MUTATIONS,
+                "insert_user",
+                &params(&[("$name", "stale-plan"), ("$email", "winner@example.com")]),
+            )
+            .await
+    });
+
+    rendezvous.wait_until_reached().await;
+    db.mutate(
+        "main",
+        OCC_UNIQUE_MUTATIONS,
+        "insert_user",
+        &params(&[("$name", "winner"), ("$email", "winner@example.com")]),
+    )
+    .await
+    .expect("the second writer commits while the first attempt is parked pre-effect");
+    let winner_manifest_pin = helpers::snapshot_main(&db)
+        .await
+        .unwrap()
+        .entry("node:User")
+        .unwrap()
+        .table_version;
+    let user_uri = node_table_uri(uri, "User");
+    let winner_lance_head = lance::Dataset::open(&user_uri)
+        .await
+        .unwrap()
+        .latest_version_id()
+        .await
+        .unwrap();
+    rendezvous.release();
+
+    let err = writer_a
+        .await
+        .unwrap()
+        .expect_err("the stale attempt must be replanned and fail @unique validation");
+    assert!(
+        err.to_string().contains("@unique violation on User.email"),
+        "expected fresh @unique validation, got: {err}"
+    );
+
+    let final_manifest_pin = helpers::snapshot_main(&db)
+        .await
+        .unwrap()
+        .entry("node:User")
+        .unwrap()
+        .table_version;
+    let final_lance_head = lance::Dataset::open(&user_uri)
+        .await
+        .unwrap()
+        .latest_version_id()
+        .await
+        .unwrap();
+    assert_eq!(
+        (final_manifest_pin, final_lance_head),
+        (winner_manifest_pin, winner_lance_head),
+        "the rejected stale attempt must not move either manifest pin or Lance HEAD"
+    );
+
+    assert_eq!(count_rows(&db, "node:User").await, 1);
+    let users = read_table(&db, "node:User").await;
+    assert_eq!(collect_column_strings(&users, "name"), vec!["winner"]);
+}
+
+/// The coarse token is branch-wide: a commit to a table that the prepared
+/// mutation does not write can still invalidate schema/cardinality/RI inputs.
+/// A strict update therefore reports `ReadSetChanged` before moving its Person
+/// table HEAD when a disjoint Company commit wins during preparation.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[serial]
+async fn strict_mutation_rejects_disjoint_head_change_before_effects() {
+    let _scenario = FailScenario::setup();
+    let dir = tempfile::tempdir().unwrap();
+    let uri = dir.path().to_str().unwrap();
+    let db = std::sync::Arc::new(helpers::init_and_load(&dir).await);
+
+    let rendezvous =
+        helpers::failpoint::Rendezvous::park_first(names::MUTATION_POST_STAGE_PRE_EFFECT_GATE);
+    let writer_a_db = std::sync::Arc::clone(&db);
+    let writer_a = tokio::spawn(async move {
+        writer_a_db
+            .mutate(
+                "main",
+                OCC_DISJOINT_MUTATIONS,
+                "set_age",
+                &helpers::mixed_params(&[("$name", "Alice")], &[("$age", 99)]),
+            )
+            .await
+    });
+
+    rendezvous.wait_until_reached().await;
+    db.mutate(
+        "main",
+        OCC_DISJOINT_MUTATIONS,
+        "insert_company",
+        &params(&[("$name", "ConcurrentCo")]),
+    )
+    .await
+    .expect("the disjoint Company insert commits while Person update is parked");
+
+    let winner_person_pin = helpers::snapshot_main(&db)
+        .await
+        .unwrap()
+        .entry("node:Person")
+        .unwrap()
+        .table_version;
+    let person_uri = node_table_uri(uri, "Person");
+    let winner_person_head = lance::Dataset::open(&person_uri)
+        .await
+        .unwrap()
+        .latest_version_id()
+        .await
+        .unwrap();
+    rendezvous.release();
+
+    let err = writer_a
+        .await
+        .unwrap()
+        .expect_err("strict stale read set must fail rather than auto-reprepare");
+    let OmniError::Manifest(manifest_err) = err else {
+        panic!("expected a typed manifest conflict");
+    };
+    assert!(matches!(
+        manifest_err.details,
+        Some(omnigraph::error::ManifestConflictDetails::ReadSetChanged {
+            ref member,
+            ..
+        }) if member == "graph_head:main"
+    ));
+
+    let final_person_pin = helpers::snapshot_main(&db)
+        .await
+        .unwrap()
+        .entry("node:Person")
+        .unwrap()
+        .table_version;
+    let final_person_head = lance::Dataset::open(&person_uri)
+        .await
+        .unwrap()
+        .latest_version_id()
+        .await
+        .unwrap();
+    assert_eq!(
+        (final_person_pin, final_person_head),
+        (winner_person_pin, winner_person_head),
+        "strict rejection must happen before any Person table effect"
+    );
+}
+
+/// The load adapter shares the same prepared-write boundary as mutations.
+/// Append is retryable, but a retry means rebuilding and revalidating the
+/// whole attempt; it must never mean rebasing an already-validated batch.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[serial]
+async fn append_load_revalidates_unique_after_pre_effect_authority_change() {
+    let _scenario = FailScenario::setup();
+    let dir = tempfile::tempdir().unwrap();
+    let uri = dir.path().to_str().unwrap();
+    let db = std::sync::Arc::new(Omnigraph::init(uri, OCC_UNIQUE_SCHEMA).await.unwrap());
+
+    let rendezvous =
+        helpers::failpoint::Rendezvous::park_first(names::MUTATION_POST_STAGE_PRE_EFFECT_GATE);
+    let writer_a_db = std::sync::Arc::clone(&db);
+    let writer_a = tokio::spawn(async move {
+        writer_a_db
+            .load(
+                "main",
+                r#"{"type":"User","data":{"name":"stale-plan","email":"winner@example.com"}}"#,
+                LoadMode::Append,
+            )
+            .await
+    });
+
+    rendezvous.wait_until_reached().await;
+    db.load(
+        "main",
+        r#"{"type":"User","data":{"name":"winner","email":"winner@example.com"}}"#,
+        LoadMode::Append,
+    )
+    .await
+    .expect("the second load commits while the first attempt is parked pre-effect");
+    let winner_manifest_pin = helpers::snapshot_main(&db)
+        .await
+        .unwrap()
+        .entry("node:User")
+        .unwrap()
+        .table_version;
+    let user_uri = node_table_uri(uri, "User");
+    let winner_lance_head = lance::Dataset::open(&user_uri)
+        .await
+        .unwrap()
+        .latest_version_id()
+        .await
+        .unwrap();
+    rendezvous.release();
+
+    let err = writer_a
+        .await
+        .unwrap()
+        .expect_err("the stale append must be rebuilt and fail @unique validation");
+    assert!(
+        err.to_string().contains("@unique violation on User.email"),
+        "expected fresh @unique validation, got: {err}"
+    );
+
+    let final_manifest_pin = helpers::snapshot_main(&db)
+        .await
+        .unwrap()
+        .entry("node:User")
+        .unwrap()
+        .table_version;
+    let final_lance_head = lance::Dataset::open(&user_uri)
+        .await
+        .unwrap()
+        .latest_version_id()
+        .await
+        .unwrap();
+    assert_eq!(
+        (final_manifest_pin, final_lance_head),
+        (winner_manifest_pin, winner_lance_head),
+        "the rejected stale load must not move either manifest pin or Lance HEAD"
+    );
+
+    assert_eq!(count_rows(&db, "node:User").await, 1);
+    let users = read_table(&db, "node:User").await;
+    assert_eq!(collect_column_strings(&users, "name"), vec!["winner"]);
+}
+
+/// Overwrite is strict because its replacement image was computed from the
+/// captured branch state. Even a disjoint graph commit invalidates that coarse
+/// read token, and rejection must happen before the overwritten table moves.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[serial]
+async fn overwrite_load_rejects_disjoint_head_change_before_effects() {
+    let _scenario = FailScenario::setup();
+    let dir = tempfile::tempdir().unwrap();
+    let uri = dir.path().to_str().unwrap();
+    let db = std::sync::Arc::new(helpers::init_and_load(&dir).await);
+
+    let rendezvous =
+        helpers::failpoint::Rendezvous::park_first(names::MUTATION_POST_STAGE_PRE_EFFECT_GATE);
+    let writer_a_db = std::sync::Arc::clone(&db);
+    let writer_a = tokio::spawn(async move {
+        writer_a_db
+            .load(
+                "main",
+                r#"{"type":"Person","data":{"name":"Alice","age":31}}
+{"type":"Person","data":{"name":"Bob","age":25}}
+{"type":"Person","data":{"name":"Charlie","age":35}}
+{"type":"Person","data":{"name":"Diana","age":28}}"#,
+                LoadMode::Overwrite,
+            )
+            .await
+    });
+
+    rendezvous.wait_until_reached().await;
+    db.mutate(
+        "main",
+        OCC_DISJOINT_MUTATIONS,
+        "insert_company",
+        &params(&[("$name", "ConcurrentCo")]),
+    )
+    .await
+    .expect("the disjoint Company insert commits while overwrite is parked");
+
+    let winner_person_pin = helpers::snapshot_main(&db)
+        .await
+        .unwrap()
+        .entry("node:Person")
+        .unwrap()
+        .table_version;
+    let person_uri = node_table_uri(uri, "Person");
+    let winner_person_head = lance::Dataset::open(&person_uri)
+        .await
+        .unwrap()
+        .latest_version_id()
+        .await
+        .unwrap();
+    rendezvous.release();
+
+    let err = writer_a
+        .await
+        .unwrap()
+        .expect_err("strict overwrite must reject the changed read set");
+    let OmniError::Manifest(manifest_err) = err else {
+        panic!("expected a typed manifest conflict");
+    };
+    assert!(matches!(
+        manifest_err.details,
+        Some(omnigraph::error::ManifestConflictDetails::ReadSetChanged {
+            ref member,
+            ..
+        }) if member == "graph_head:main"
+    ));
+
+    let final_person_pin = helpers::snapshot_main(&db)
+        .await
+        .unwrap()
+        .entry("node:Person")
+        .unwrap()
+        .table_version;
+    let final_person_head = lance::Dataset::open(&person_uri)
+        .await
+        .unwrap()
+        .latest_version_id()
+        .await
+        .unwrap();
+    assert_eq!(
+        (final_person_pin, final_person_head),
+        (winner_person_pin, winner_person_head),
+        "overwrite rejection must happen before any Person table effect"
+    );
+}
+
+/// Stage A's entry-point heal and Stage C's effect gate are separated by
+/// reclaimable preparation. B can therefore observe a clean graph, stage, and
+/// pause while A leaves an EffectsConfirmed sidecar behind. Once B acquires
+/// the shared gates it must attribute the barrier to A's exact operation — not
+/// commit a second effect and not collapse the condition into generic manifest
+/// drift.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[serial]
+async fn follower_after_initial_heal_reports_exact_pending_recovery_operation() {
+    let _scenario = FailScenario::setup();
+    let dir = tempfile::tempdir().unwrap();
+    let uri = dir.path().to_str().unwrap().to_string();
+    drop(helpers::init_and_load(&dir).await);
+    let db_a = std::sync::Arc::new(Omnigraph::open(&uri).await.unwrap());
+    let db_b = std::sync::Arc::new(Omnigraph::open(&uri).await.unwrap());
+    let person_uri = node_table_uri(&uri, "Person");
+    let initial_manifest_pin = helpers::snapshot_main(&db_a)
+        .await
+        .unwrap()
+        .entry("node:Person")
+        .unwrap()
+        .table_version;
+
+    // B passes its initial (empty) recovery heal, stages from the old pin, and
+    // pauses before acquiring the effect gates.
+    let before_effect =
+        helpers::failpoint::Rendezvous::park_first(names::MUTATION_POST_STAGE_PRE_EFFECT_GATE);
+    let follower_db = std::sync::Arc::clone(&db_b);
+    let follower = tokio::spawn(async move {
+        follower_db
+            .mutate(
+                "main",
+                MUTATION_QUERIES,
+                "insert_person",
+                &mixed_params(&[("$name", "Follower")], &[("$age", 44)]),
+            )
+            .await
+    });
+    before_effect.wait_until_reached().await;
+
+    // A passes through the same pre-effect point (only the rendezvous's first
+    // arrival parks), commits its exact Lance transaction, confirms the v3
+    // sidecar, then fails before manifest visibility.
+    {
+        let _post_effect_failure =
+            ScopedFailPoint::new(names::MUTATION_POST_FINALIZE_PRE_PUBLISHER, "return");
+        let err = db_a
+            .mutate(
+                "main",
+                MUTATION_QUERIES,
+                "insert_person",
+                &mixed_params(&[("$name", "Interrupted")], &[("$age", 55)]),
+            )
+            .await
+            .expect_err("A must stop after confirming its physical effect");
+        assert!(
+            err.to_string()
+                .contains("mutation.post_finalize_pre_publisher"),
+            "unexpected A failure: {err}"
+        );
+
+        let operation_id = single_sidecar_operation_id(dir.path());
+        let sidecar: serde_json::Value = serde_json::from_str(
+            &std::fs::read_to_string(
+                dir.path()
+                    .join("__recovery")
+                    .join(format!("{operation_id}.json")),
+            )
+            .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(
+            sidecar["protocol_v3"]["effect_phase"], "EffectsConfirmed",
+            "A must leave the exact confirmed-effect state this race targets"
+        );
+
+        let a_effect_head = lance::Dataset::open(&person_uri)
+            .await
+            .unwrap()
+            .latest_version_id()
+            .await
+            .unwrap();
+        assert_eq!(
+            a_effect_head,
+            initial_manifest_pin + 1,
+            "A must advance exactly one physical table version"
+        );
+        assert_eq!(
+            helpers::snapshot_main(&db_a)
+                .await
+                .unwrap()
+                .entry("node:Person")
+                .unwrap()
+                .table_version,
+            initial_manifest_pin,
+            "A's failed publisher must leave the manifest pin unchanged"
+        );
+
+        before_effect.release();
+        let follower_err = follower
+            .await
+            .unwrap()
+            .expect_err("B must stop at A's recovery barrier before effects");
+        match follower_err {
+            OmniError::RecoveryRequired {
+                operation_id: actual,
+                ..
+            } => assert_eq!(
+                actual, operation_id,
+                "B must name the deterministic sidecar that owns the barrier"
+            ),
+            other => panic!("expected exact RecoveryRequired attribution, got: {other}"),
+        }
+
+        let after_b_head = lance::Dataset::open(&person_uri)
+            .await
+            .unwrap()
+            .latest_version_id()
+            .await
+            .unwrap();
+        assert_eq!(
+            after_b_head, a_effect_head,
+            "B must not advance a second physical effect"
+        );
+        assert_eq!(
+            helpers::snapshot_main(&db_b)
+                .await
+                .unwrap()
+                .entry("node:Person")
+                .unwrap()
+                .table_version,
+            initial_manifest_pin,
+            "B must not publish around A's pending recovery"
+        );
+        assert_eq!(
+            helpers::recovery::sidecar_operation_ids(dir.path()),
+            vec![operation_id.clone()],
+            "the attributed sidecar must remain available for recovery"
+        );
+    }
+
+    drop(before_effect);
+    drop(db_a);
+    drop(db_b);
+    let recovered = Omnigraph::open(&uri)
+        .await
+        .expect("A's confirmed sidecar must remain recoverable");
+    assert!(helpers::recovery::sidecar_operation_ids(dir.path()).is_empty());
+    let people = read_table(&recovered, "node:Person").await;
+    let names = collect_column_strings(&people, "name");
+    assert!(names.iter().any(|name| name == "Interrupted"));
+    assert!(
+        !names.iter().any(|name| name == "Follower"),
+        "B's staged-but-uncommitted row must never become visible"
+    );
+}
+
+/// Separately-opened handles share the root-scoped branch gate. Once A's exact
+/// Lance effect is durable, a disjoint B write on the same graph branch must
+/// wait through A's manifest publish instead of moving graph_head and forcing
+/// A into post-effect recovery.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[serial]
+async fn cross_handle_branch_gate_serializes_post_effect_publish() {
+    let _scenario = FailScenario::setup();
+    let dir = tempfile::tempdir().unwrap();
+    let uri = dir.path().to_str().unwrap().to_string();
+    let db = helpers::init_and_load(&dir).await;
+    drop(db);
+
+    let db_a = std::sync::Arc::new(Omnigraph::open(&uri).await.unwrap());
+    let db_b = std::sync::Arc::new(Omnigraph::open(&uri).await.unwrap());
+
+    // B prepares first but pauses before effects. A then commits its Person
+    // table effect and pauses before visibility. Releasing B makes it contend
+    // for the shared branch gate, which A still holds through Phase D.
+    let before_effect =
+        helpers::failpoint::Rendezvous::park_first(names::MUTATION_POST_STAGE_PRE_EFFECT_GATE);
+    let after_effect =
+        helpers::failpoint::Rendezvous::park_first(names::MUTATION_POST_FINALIZE_PRE_PUBLISHER);
+
+    let writer_b_db = std::sync::Arc::clone(&db_b);
+    let mut writer_b = tokio::spawn(async move {
+        writer_b_db
+            .mutate(
+                "main",
+                OCC_DISJOINT_MUTATIONS,
+                "insert_company",
+                &params(&[("$name", "VisibleCo")]),
+            )
+            .await
+    });
+    before_effect.wait_until_reached().await;
+
+    let writer_a_db = std::sync::Arc::clone(&db_a);
+    let writer_a = tokio::spawn(async move {
+        writer_a_db
+            .mutate(
+                "main",
+                MUTATION_QUERIES,
+                "insert_person",
+                &mixed_params(&[("$name", "Doomed")], &[("$age", 55)]),
+            )
+            .await
+    });
+    after_effect.wait_until_reached().await;
+
+    before_effect.release();
+    assert!(
+        tokio::time::timeout(std::time::Duration::from_millis(200), &mut writer_b)
+            .await
+            .is_err(),
+        "B must wait while A holds the shared branch gate after its table effect"
+    );
+    after_effect.release();
+
+    writer_a
+        .await
+        .unwrap()
+        .expect("A must publish normally while B waits");
+    writer_b
+        .await
+        .unwrap()
+        .expect("B must reprepare against A's published authority and then commit");
+
+    assert_eq!(
+        count_rows(&db_a, "node:Person").await,
+        5,
+        "A's Person insert must remain visible"
+    );
+    assert_eq!(
+        count_rows(&db_b, "node:Company").await,
+        3,
+        "B's disjoint Company insert must publish after A"
+    );
+    assert!(
+        !std::path::Path::new(&uri).join("__recovery").exists()
+            || std::fs::read_dir(std::path::Path::new(&uri).join("__recovery"))
+                .unwrap()
+                .next()
+                .is_none(),
+        "both successful writers must delete their recovery intents"
     );
 }
 
@@ -653,7 +2280,8 @@ async fn recovery_rolls_forward_after_finalize_publisher_failure() {
     // Setup: trigger the residual.
     {
         let mut db = Omnigraph::init(&uri, helpers::TEST_SCHEMA).await.unwrap();
-        let _failpoint = ScopedFailPoint::new(names::MUTATION_POST_FINALIZE_PRE_PUBLISHER, "return");
+        let _failpoint =
+            ScopedFailPoint::new(names::MUTATION_POST_FINALIZE_PRE_PUBLISHER, "return");
 
         // The mutation's finalize completes (commit_staged advances Lance
         // HEAD on node:Person AND writes a `__recovery/{ulid}.json`
@@ -708,7 +2336,7 @@ async fn recovery_rolls_forward_after_finalize_publisher_failure() {
     assert_post_recovery_invariants(
         dir.path(),
         &operation_id,
-        RecoveryExpectation::RolledForward {
+        RecoveryExpectation::RolledForwardOriginalLineage {
             tables: vec![TableExpectation::main("node:Person").follow_up_mutation(
                 FollowUpMutation::new(
                     "main",
@@ -775,9 +2403,8 @@ async fn open_sweep_roll_forward_converges_when_manifest_advances_concurrently()
     // Park the FIRST sweep to reach the publish window; later arrivals fall
     // through. wait_until_reached gates the second open so it is guaranteed
     // to be the one that converges the sidecar.
-    let rv = helpers::failpoint::Rendezvous::park_first(
-        names::RECOVERY_BEFORE_ROLL_FORWARD_PUBLISH,
-    );
+    let rv =
+        helpers::failpoint::Rendezvous::park_first(names::RECOVERY_BEFORE_ROLL_FORWARD_PUBLISH);
 
     let uri_parked = uri.clone();
     let parked_open = tokio::spawn(async move { Omnigraph::open(&uri_parked).await });
@@ -940,7 +2567,8 @@ async fn recovery_rolls_forward_load_on_feature_branch() {
             .table_version;
         feature_parent_commit_id = branch_head_commit_id(dir.path(), "feature").await.unwrap();
 
-        let _failpoint = ScopedFailPoint::new(names::MUTATION_POST_FINALIZE_PRE_PUBLISHER, "return");
+        let _failpoint =
+            ScopedFailPoint::new(names::MUTATION_POST_FINALIZE_PRE_PUBLISHER, "return");
         let err = db
             .load(
                 "feature",
@@ -974,7 +2602,7 @@ async fn recovery_rolls_forward_load_on_feature_branch() {
     assert_post_recovery_invariants(
         dir.path(),
         &operation_id,
-        RecoveryExpectation::RolledForward {
+        RecoveryExpectation::RolledForwardOriginalLineage {
             tables: vec![
                 TableExpectation::branch("node:Person", "feature")
                     .expected_main_manifest_pin(main_person_pin)
@@ -1033,7 +2661,8 @@ async fn recovery_rolls_forward_load_overwrite() {
         .unwrap();
         parent_commit_id = branch_head_commit_id(dir.path(), "main").await.unwrap();
 
-        let _failpoint = ScopedFailPoint::new(names::MUTATION_POST_FINALIZE_PRE_PUBLISHER, "return");
+        let _failpoint =
+            ScopedFailPoint::new(names::MUTATION_POST_FINALIZE_PRE_PUBLISHER, "return");
         let err = db
             .load(
                 "main",
@@ -1062,7 +2691,7 @@ async fn recovery_rolls_forward_load_overwrite() {
     assert_post_recovery_invariants(
         dir.path(),
         &operation_id,
-        RecoveryExpectation::RolledForward {
+        RecoveryExpectation::RolledForwardOriginalLineage {
             tables: vec![
                 TableExpectation::main("node:Person")
                     .expected_recovery_parent_commit_id(parent_commit_id)
@@ -1119,6 +2748,11 @@ async fn recovery_rolls_forward_ensure_indices_on_feature_branch() {
     .await
     .unwrap();
 
+    // RFC-022 writes no longer build declared indexes inline. Materialize the
+    // feature index once so the setup below can deliberately drop it and test
+    // ensure_indices recovery rather than first materialization.
+    db.ensure_indices_on("feature").await.unwrap();
+
     main_person_pin = db
         .snapshot_of(omnigraph::db::ReadTarget::branch("main"))
         .await
@@ -1161,8 +2795,10 @@ async fn recovery_rolls_forward_ensure_indices_on_feature_branch() {
     feature_parent_commit_id = branch_head_commit_id(dir.path(), "feature").await.unwrap();
 
     {
-        let _failpoint =
-            ScopedFailPoint::new(names::ENSURE_INDICES_POST_PHASE_B_PRE_MANIFEST_COMMIT, "return");
+        let _failpoint = ScopedFailPoint::new(
+            names::ENSURE_INDICES_POST_PHASE_B_PRE_MANIFEST_COMMIT,
+            "return",
+        );
         let err = db.ensure_indices_on("feature").await.unwrap_err();
         assert!(
             err.to_string().contains(
@@ -1240,7 +2876,8 @@ async fn refresh_runs_roll_forward_recovery_in_process() {
 
     // Setup: trigger the residual (sidecar persists; manifest unchanged).
     {
-        let _failpoint = ScopedFailPoint::new(names::MUTATION_POST_FINALIZE_PRE_PUBLISHER, "return");
+        let _failpoint =
+            ScopedFailPoint::new(names::MUTATION_POST_FINALIZE_PRE_PUBLISHER, "return");
         let err = mutate_main(
             &mut db,
             MUTATION_QUERIES,
@@ -1301,6 +2938,73 @@ async fn refresh_runs_roll_forward_recovery_in_process() {
     assert_eq!(helpers::count_rows(&db, "node:Person").await, 2);
 }
 
+/// Destructive version GC must not erase the transaction/version history that
+/// schema-v3 recovery uses to prove exact effect ownership. A pending sidecar
+/// is therefore a graph-wide cleanup barrier, checked before orphan reclaim or
+/// any per-table fault-isolated GC begins.
+#[tokio::test]
+#[serial]
+async fn cleanup_refuses_pending_v3_sidecar_before_version_gc() {
+    let _scenario = FailScenario::setup();
+    let dir = tempfile::tempdir().unwrap();
+    let uri = dir.path().to_str().unwrap().to_string();
+    let mut db = Omnigraph::init(&uri, helpers::TEST_SCHEMA).await.unwrap();
+
+    {
+        let _failpoint =
+            ScopedFailPoint::new(names::MUTATION_POST_FINALIZE_PRE_PUBLISHER, "return");
+        mutate_main(
+            &mut db,
+            MUTATION_QUERIES,
+            "insert_person",
+            &mixed_params(&[("$name", "pending-gc")], &[("$age", 22)]),
+        )
+        .await
+        .expect_err("failpoint must leave a confirmed v3 recovery intent");
+    }
+
+    let person_uri = node_table_uri(&uri, "Person");
+    let before = lance::Dataset::open(&person_uri).await.unwrap();
+    let before_head = before.version().version;
+    let before_versions = before.versions().await.unwrap().len();
+    assert_eq!(
+        std::fs::read_dir(dir.path().join("__recovery"))
+            .unwrap()
+            .count(),
+        1,
+        "test precondition: one v3 sidecar is pending"
+    );
+
+    let err = db
+        .cleanup(omnigraph::db::CleanupPolicyOptions {
+            keep_versions: Some(1),
+            older_than: None,
+        })
+        .await
+        .expect_err("cleanup must not outrun recovery");
+    assert!(
+        err.to_string()
+            .contains("cleanup requires a clean recovery state"),
+        "unexpected cleanup error: {err}"
+    );
+
+    let after = lance::Dataset::open(&person_uri).await.unwrap();
+    assert_eq!(after.version().version, before_head);
+    assert_eq!(after.versions().await.unwrap().len(), before_versions);
+    assert_eq!(
+        std::fs::read_dir(dir.path().join("__recovery"))
+            .unwrap()
+            .count(),
+        1,
+        "refused cleanup must leave recovery ownership intact"
+    );
+
+    drop(db);
+    Omnigraph::open(&uri)
+        .await
+        .expect("read-write reopen resolves the retained sidecar");
+}
+
 /// The long-lived-process contract for `load`: a Phase B → Phase C
 /// failure (per-table `commit_staged` advanced Lance HEAD, manifest
 /// publish did not land, sidecar persists) must not wedge subsequent
@@ -1324,7 +3028,8 @@ async fn load_after_finalize_publisher_failure_heals_without_reopen() {
     // commit_staged (Lance HEAD advances on three tables), then the
     // publisher is wedged before the manifest commit.
     {
-        let _failpoint = ScopedFailPoint::new(names::MUTATION_POST_FINALIZE_PRE_PUBLISHER, "return");
+        let _failpoint =
+            ScopedFailPoint::new(names::MUTATION_POST_FINALIZE_PRE_PUBLISHER, "return");
         let err = load_jsonl(
             &mut db,
             r#"{"type":"Person","data":{"name":"Alice","age":30}}
@@ -1491,7 +3196,8 @@ async fn s3_load_recovers_after_publisher_failure_without_reopen() {
     // Failed load: commit_staged lands on S3, manifest publish does not;
     // the sidecar PUT went through the S3 adapter.
     {
-        let _failpoint = ScopedFailPoint::new(names::MUTATION_POST_FINALIZE_PRE_PUBLISHER, "return");
+        let _failpoint =
+            ScopedFailPoint::new(names::MUTATION_POST_FINALIZE_PRE_PUBLISHER, "return");
         let err = load_jsonl(
             &mut db,
             r#"{"type":"Person","data":{"name":"Alice","age":30}}
@@ -1550,7 +3256,8 @@ async fn record_audit_failure_after_roll_forward_converges_on_next_write() {
 
     // Pending sidecar with real drift.
     {
-        let _failpoint = ScopedFailPoint::new(names::MUTATION_POST_FINALIZE_PRE_PUBLISHER, "return");
+        let _failpoint =
+            ScopedFailPoint::new(names::MUTATION_POST_FINALIZE_PRE_PUBLISHER, "return");
         load_jsonl(
             &mut db,
             r#"{"type":"Person","data":{"name":"Alice","age":30}}
@@ -1642,7 +3349,8 @@ async fn sidecar_list_failure_fails_write_and_open_loudly_then_clears() {
 
     // Pending sidecar via the usual finalize → publisher failure.
     {
-        let _failpoint = ScopedFailPoint::new(names::MUTATION_POST_FINALIZE_PRE_PUBLISHER, "return");
+        let _failpoint =
+            ScopedFailPoint::new(names::MUTATION_POST_FINALIZE_PRE_PUBLISHER, "return");
         let err = load_jsonl(
             &mut db,
             r#"{"type":"Person","data":{"name":"Alice","age":30}}
@@ -1870,7 +3578,8 @@ async fn mutation_after_finalize_publisher_failure_heals_without_reopen() {
     let mut db = Omnigraph::init(&uri, helpers::TEST_SCHEMA).await.unwrap();
 
     {
-        let _failpoint = ScopedFailPoint::new(names::MUTATION_POST_FINALIZE_PRE_PUBLISHER, "return");
+        let _failpoint =
+            ScopedFailPoint::new(names::MUTATION_POST_FINALIZE_PRE_PUBLISHER, "return");
         let err = mutate_main(
             &mut db,
             MUTATION_QUERIES,
@@ -1936,7 +3645,8 @@ async fn schema_apply_after_finalize_publisher_failure_heals_without_reopen() {
     let mut db = Omnigraph::init(&uri, helpers::TEST_SCHEMA).await.unwrap();
 
     {
-        let _failpoint = ScopedFailPoint::new(names::MUTATION_POST_FINALIZE_PRE_PUBLISHER, "return");
+        let _failpoint =
+            ScopedFailPoint::new(names::MUTATION_POST_FINALIZE_PRE_PUBLISHER, "return");
         let err = load_jsonl(
             &mut db,
             r#"{"type":"Person","data":{"name":"Alice","age":30}}
@@ -1957,7 +3667,10 @@ async fn schema_apply_after_finalize_publisher_failure_heals_without_reopen() {
 
     // Additive migration on the SAME handle. Must heal the load's
     // sidecar first, then apply normally.
-    let desired = format!("{}\nnode Tag {{ name: String @key }}\n", helpers::TEST_SCHEMA);
+    let desired = format!(
+        "{}\nnode Tag {{ name: String @key }}\n",
+        helpers::TEST_SCHEMA
+    );
     db.apply_schema(&desired).await.expect(
         "schema apply on the same handle must heal sidecar-covered \
          drift in-process instead of failing until restart",
@@ -2018,7 +3731,8 @@ async fn branch_merge_after_finalize_publisher_failure_heals_without_reopen() {
     // Failed load on MAIN: Person drifts ahead of the manifest with a
     // sidecar covering it.
     {
-        let _failpoint = ScopedFailPoint::new(names::MUTATION_POST_FINALIZE_PRE_PUBLISHER, "return");
+        let _failpoint =
+            ScopedFailPoint::new(names::MUTATION_POST_FINALIZE_PRE_PUBLISHER, "return");
         let err = load_jsonl(
             &mut db,
             r#"{"type":"Person","data":{"name":"Bob","age":25}}
@@ -2127,8 +3841,13 @@ async fn orphaned_branch_discard_is_idempotent_across_delete_failure() {
     )
     .unwrap();
 
-    // Orphan the sidecar.
-    db.branch_delete("feature").await.unwrap();
+    // Orphan the synthetic sidecar with a raw substrate ref delete. The public
+    // branch-control protocol now runs the synchronous recovery barrier and
+    // correctly refuses to delete a branch named by pending recovery intent;
+    // this test needs the crash/external-state shape that recovery must handle.
+    let manifest_uri = format!("{uri}/__manifest");
+    let mut manifest = lance::Dataset::open(&manifest_uri).await.unwrap();
+    manifest.delete_branch("feature").await.unwrap();
 
     // First write: the discard path writes its audit row, then the
     // sidecar delete fails (injected). The write fails loudly.
@@ -2170,15 +3889,13 @@ async fn orphaned_branch_discard_is_idempotent_across_delete_failure() {
     );
 }
 
-/// When the commit-time drift guard cannot LIST sidecars to classify
-/// the drift (transient storage fault on the guard's list, after the
-/// entry heal's list succeeded), it must say so and name BOTH recovery
-/// paths — not confidently route to `omnigraph repair`, which refuses
-/// while a sidecar is pending. Sequenced failpoint: first list (entry
-/// heal) passes, second list (the guard) fails.
+/// The closed mutation/load Stage-A barrier owns pending covered drift before
+/// the later HEAD guard has to guess between recovery and repair. It reports the
+/// exact operation id and recovery action instead of routing an enrolled write
+/// toward `repair`.
 #[tokio::test]
 #[serial]
-async fn drift_guard_names_both_paths_when_sidecar_list_fails() {
+async fn stage_a_barrier_reports_exact_operation_before_drift_guard() {
     use omnigraph::loader::{LoadMode, load_jsonl};
 
     let _scenario = FailScenario::setup();
@@ -2235,9 +3952,6 @@ async fn drift_guard_names_both_paths_when_sidecar_list_fails() {
     )
     .unwrap();
 
-    // First list (entry heal) passes and defers the sidecar; second
-    // list (the guard's classification) fails.
-    let _failpoint = ScopedFailPoint::new(names::RECOVERY_SIDECAR_LIST, "1*off->1*return");
     let err = load_jsonl(
         &mut db,
         "{\"type\":\"Person\",\"data\":{\"name\":\"bob\",\"age\":25}}\n",
@@ -2248,22 +3962,23 @@ async fn drift_guard_names_both_paths_when_sidecar_list_fails() {
     .expect("drift must still fail the write");
     let msg = err.to_string();
     assert!(
-        msg.contains("could not classify the drift")
-            && msg.contains("omnigraph repair")
-            && msg.contains("reopen the graph read-write"),
-        "an unclassifiable drift must name BOTH recovery paths, not \
-         confidently route to repair; got: {msg}"
+        matches!(
+            err,
+            OmniError::RecoveryRequired { ref operation_id, .. }
+                if operation_id == "01H0000000000000000000LSTF"
+        ) && msg.contains("reopen the graph read-write")
+            && !msg.contains("omnigraph repair"),
+        "the Stage-A barrier must attribute the pending recovery exactly; got: {msg}"
     );
 }
 
 /// The other half of the orphan-discard fault matrix: the audit append
 /// fails AFTER the recovery commit landed. The retry (keyed on the
 /// audit row, the operator-facing record) must converge to exactly one
-/// audit row and a consumed sidecar. The second recovery commit the
-/// retry appends is the documented not-atomic-pair-write tolerance
-/// (same class as `record_audit` and the manifest→commit-graph Known
-/// Gap): bounded commit-graph noise, never a lost or duplicated audit
-/// record under clean failures.
+/// audit row and a consumed sidecar. Lineage and the recovery audit remain two
+/// durable writes; a legacy sidecar has no fixed recovery-commit id, so a retry
+/// after the lineage CAS but before the audit append may add bounded lineage
+/// noise. The operator-facing audit record still lands exactly once.
 #[tokio::test]
 #[serial]
 async fn orphaned_branch_discard_converges_across_audit_append_failure() {
@@ -2320,13 +4035,19 @@ async fn orphaned_branch_discard_converges_across_audit_append_failure() {
         &sidecar_json,
     )
     .unwrap();
-    db.branch_delete("feature").await.unwrap();
+    // Manufacture the dead-branch recovery shape below the public branch
+    // control protocol, which now refuses a ref delete while this sidecar is
+    // pending.
+    let manifest_uri = format!("{uri}/__manifest");
+    let mut manifest = lance::Dataset::open(&manifest_uri).await.unwrap();
+    manifest.delete_branch("feature").await.unwrap();
 
     // First write: the recovery commit lands, then the audit append
     // fails (injected). The write fails loudly; the sidecar survives so
     // the discard is retried with the audit still owed.
     {
-        let _failpoint = ScopedFailPoint::new(names::RECOVERY_ORPHAN_DISCARD_AUDIT_APPEND, "return");
+        let _failpoint =
+            ScopedFailPoint::new(names::RECOVERY_ORPHAN_DISCARD_AUDIT_APPEND, "return");
         let err = load_jsonl(
             &mut db,
             "{\"type\":\"Person\",\"data\":{\"name\":\"Bob\",\"age\":25}}\n",
@@ -2478,13 +4199,19 @@ async fn heal_does_not_promote_live_schema_apply_staging() {
     let rv = helpers::failpoint::Rendezvous::park_first(names::SCHEMA_APPLY_AFTER_STAGING_WRITE);
 
     let apply_db = Arc::clone(&db);
-    let desired = format!("{}\nnode Tag {{ name: String @key }}\n", helpers::TEST_SCHEMA);
+    let desired = format!(
+        "{}\nnode Tag {{ name: String @key }}\n",
+        helpers::TEST_SCHEMA
+    );
     let apply = tokio::spawn(async move { apply_db.apply_schema(&desired).await });
 
     // Wait until the apply is parked in the window (staging files written).
     rv.wait_until_reached().await;
     let staging_pg = dir.path().join("_schema.pg.staging");
-    assert!(staging_pg.exists(), "schema apply never reached the paused window");
+    assert!(
+        staging_pg.exists(),
+        "schema apply never reached the paused window"
+    );
 
     // Concurrent load on the same handle: its entry heal runs while the
     // apply is paused. The load itself may fail (schema apply in
@@ -2644,11 +4371,9 @@ async fn refresh_defers_rollback_eligible_sidecar_to_next_open() {
          pre_head={pre_head}, post_head={post_head}",
     );
 
-    // A write attempt while the rollback-eligible sidecar is deferred:
-    // the write-entry heal defers it again (roll-forward-only), and the
-    // commit-time drift guard must name the actual recovery path (a
-    // read-write reopen) — NOT `omnigraph repair`, which refuses while
-    // a sidecar is pending.
+    // A write attempt while the rollback-eligible sidecar is deferred stops at
+    // the synchronous Stage-A barrier, before base capture/effects, and names
+    // the exact operation that requires a read-write reopen.
     let err = mutate_main(
         &mut db,
         MUTATION_QUERIES,
@@ -2657,12 +4382,19 @@ async fn refresh_defers_rollback_eligible_sidecar_to_next_open() {
     )
     .await
     .unwrap_err();
-    assert!(
-        err.to_string()
-            .contains("a pending recovery sidecar requires rollback"),
-        "drift guard must point at a read-write reopen for sidecar-covered \
-         rollback-eligible drift; got: {err}"
-    );
+    match err {
+        OmniError::RecoveryRequired {
+            operation_id,
+            reason,
+        } => {
+            assert_eq!(operation_id, "01H0000000000000000000RBCK");
+            assert!(
+                reason.contains("reopen the graph read-write"),
+                "barrier must point at the safe recovery path; got: {reason}"
+            );
+        }
+        other => panic!("expected typed RecoveryRequired barrier, got: {other}"),
+    }
 
     // Cross-check: drop the engine and reopen — full sweep handles
     // the rollback (will use Dataset::restore safely; no concurrent
@@ -2719,7 +4451,8 @@ async fn finalize_publisher_residual_does_not_drift_untouched_tables() {
         .unwrap();
 
     {
-        let _failpoint = ScopedFailPoint::new(names::MUTATION_POST_FINALIZE_PRE_PUBLISHER, "return");
+        let _failpoint =
+            ScopedFailPoint::new(names::MUTATION_POST_FINALIZE_PRE_PUBLISHER, "return");
         let _ = mutate_main(
             &mut db,
             MUTATION_QUERIES,
@@ -2745,17 +4478,16 @@ async fn finalize_publisher_residual_does_not_drift_untouched_tables() {
 /// (`stage_create_btree_index` succeeded; `commit_staged` not yet called)
 /// leaves NO Lance-HEAD drift, so other tables stay writable.
 ///
-/// Under iss-848 schema apply no longer builds indexes inline — the build
-/// happens in the reconciler (`ensure_indices`/`optimize`) and at load. So this
+/// Under RFC-022 schema apply and enrolled data writes no longer build indexes
+/// inline; the build happens in the reconciler (`ensure_indices`/`optimize`). This
 /// fires the failpoint where it lives now: an `ensure_indices` build of a BTREE
 /// that a prior apply declared (`@index`) but deferred. The failpoint fires
 /// between `stage_create_btree_index` and `commit_staged`, so the staged
 /// segment is written under `_indices/<uuid>/` but `node:Person`'s Lance HEAD is
-/// unchanged. `ensure_indices` fails and its EnsureIndices sidecar pins only
-/// Person at NoMovement (a clean no-op on the next open). A write to a
-/// different, unpinned table (`node:Company`) is unaffected: mutations/loads run
-/// a roll-forward-only heal and proceed — they do not refuse on a pending
-/// sidecar the way `optimize`/`repair` do — so the write succeeds with no drift.
+/// unchanged. `ensure_indices` fails and its EnsureIndices sidecar pins Person
+/// at NoMovement. The coarse branch-wide Stage-A barrier nevertheless blocks a
+/// Company write until Full ReadWrite-open recovery consumes that unresolved
+/// intent; after reopen the unrelated table is writable with no drift.
 #[tokio::test]
 #[serial]
 async fn ensure_indices_stage_btree_failure_leaves_existing_tables_writable() {
@@ -2764,7 +4496,8 @@ async fn ensure_indices_stage_btree_failure_leaves_existing_tables_writable() {
     let uri = dir.path().to_str().unwrap().to_string();
     let mut db = Omnigraph::init(&uri, helpers::TEST_SCHEMA).await.unwrap();
 
-    // Seed a Person row — the load builds Person's id BTREE + name FTS.
+    // Seed a Person row. The enrolled mutation publishes only its logical data
+    // effect; physical index construction remains reconciler-owned.
     mutate_main(
         &mut db,
         helpers::MUTATION_QUERIES,
@@ -2794,15 +4527,30 @@ async fn ensure_indices_stage_btree_failure_leaves_existing_tables_writable() {
         );
     }
 
-    // A different, unpinned table is untouched by the failed index build.
+    // A different table is physically untouched, but the branch-wide recovery
+    // barrier does not let a new graph commit advance around any unresolved
+    // main-branch intent.
     use omnigraph::loader::{LoadMode, load_jsonl};
-    load_jsonl(
+    let err = load_jsonl(
         &mut db,
         r#"{"type": "Company", "data": {"name": "Acme"}}"#,
         LoadMode::Append,
     )
     .await
-    .expect("Company write on a table untouched by the failed ensure_indices should succeed");
+    .expect_err("Stage A must block even a disjoint table on the same graph branch");
+    assert!(matches!(err, OmniError::RecoveryRequired { .. }));
+
+    drop(db);
+    let mut recovered = Omnigraph::open(&uri)
+        .await
+        .expect("Full recovery must consume the no-effect EnsureIndices sidecar");
+    load_jsonl(
+        &mut recovered,
+        r#"{"type": "Company", "data": {"name": "Acme"}}"#,
+        LoadMode::Append,
+    )
+    .await
+    .expect("Company write must succeed after Full recovery closes the barrier");
 }
 
 fn assert_no_staging_files(graph: &std::path::Path) {
@@ -3175,17 +4923,13 @@ async fn optimize_phase_b_failure_recovered_on_next_open() {
         .expect("schema apply after optimize recovery must succeed");
 }
 
-/// Cross-process race (the prod bug): a served write advances the manifest on the
-/// same table while a SEPARATE `optimize` process is paused between its compaction
-/// and its manifest publish. The in-process write queue does NOT serialize across
-/// processes, so optimize's equality-CAS publish (expected = its pre-compaction
-/// version) finds the manifest already advanced. optimize must CONVERGE — the
-/// concurrent write built on top of the compacted HEAD, so the compaction is
-/// already reflected — not fail with "expected X but current Y". RED before the
-/// monotonic-publish fix.
+/// Separately-opened handles for one root share the table/recovery gates. A
+/// served insert that starts while optimize is paused before compaction must
+/// wait, then commit after optimize releases its sidecar lifetime; it must not
+/// deadlock in the synchronous recovery barrier or lose either result.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 #[serial(optimize)]
-async fn optimize_survives_concurrent_insert_advancing_manifest() {
+async fn optimize_serializes_concurrent_insert_across_handles() {
     let _scenario = FailScenario::setup();
     let dir = tempfile::tempdir().unwrap();
     let uri = dir.path().to_str().unwrap().to_string();
@@ -3204,10 +4948,10 @@ async fn optimize_survives_concurrent_insert_advancing_manifest() {
         }
     }
 
-    // Pause optimize BEFORE it compacts, so the concurrent insert lands while
-    // HEAD == manifest (no in-flight optimize drift for the writer to trip on); the
-    // insert advances the manifest, then optimize compacts on top and must converge
-    // its publish over the advanced manifest rather than fail the equality CAS.
+    let db_b = std::sync::Arc::new(Omnigraph::open(&uri).await.unwrap());
+
+    // Pause optimize before compaction while it owns the Person table's
+    // sidecar/queue lifetime.
     let failpoint = ScopedFailPoint::new(names::OPTIMIZE_BEFORE_COMPACT, "pause");
 
     let uri_opt = uri.clone();
@@ -3222,26 +4966,33 @@ async fn optimize_survives_concurrent_insert_advancing_manifest() {
         "optimize never reached the pre-compact pause",
     );
 
-    // Concurrent insert on the SAME table via a SEPARATE handle (= separate
-    // in-process write queue = a different process) advances the manifest.
-    {
-        let db_b = Omnigraph::open(&uri).await.unwrap();
-        db_b.mutate(
-            "main",
-            MUTATION_QUERIES,
-            "insert_person",
-            &mixed_params(&[("$name", "eve")], &[("$age", 34)]),
-        )
-        .await
-        .unwrap();
-    }
+    let writer_db = std::sync::Arc::clone(&db_b);
+    let writer = tokio::spawn(async move {
+        writer_db
+            .mutate(
+                "main",
+                MUTATION_QUERIES,
+                "insert_person",
+                &mixed_params(&[("$name", "eve")], &[("$age", 34)]),
+            )
+            .await
+    });
+    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    assert!(
+        !writer.is_finished(),
+        "same-root writer must wait for optimize's guarded sidecar lifetime"
+    );
 
     drop(failpoint); // release optimize
     let result = tokio::time::timeout(std::time::Duration::from_secs(20), optimize)
         .await
         .expect("optimize task hung")
         .unwrap();
-    result.expect("optimize must survive a concurrent same-table write (cross-process)");
+    result.expect("optimize must finish before the queued same-table writer");
+    writer
+        .await
+        .expect("writer task panicked")
+        .expect("queued insert must resume after optimize");
 
     // No lost write: 4 seed + eve all present; graph remains re-optimizable.
     let db = Omnigraph::open(&uri).await.unwrap();
@@ -3255,17 +5006,12 @@ async fn optimize_survives_concurrent_insert_advancing_manifest() {
         .expect("graph must remain healthy / re-optimizable");
 }
 
-/// Cross-process race: a served DELETE commits on the same table while a SEPARATE
-/// `optimize` process is parked just before its compaction. Lance rebases the
-/// compaction past the delete cleanly (so this surfaces as a manifest-CAS mismatch
-/// at publish, not a Lance `Rewrite` conflict — the genuine `Rewrite`-vs-`Rewrite`
-/// overlap is the rarer many-fragment/concurrent-compaction case, covered by the
-/// shared `is_retryable_lance_conflict` retry the internal-table path already
-/// exercises). optimize must converge its publish over the advanced manifest and
-/// preserve the delete. RED before the fix.
+/// Same as the insert cell, for a strict delete: the second handle waits for
+/// optimize, then replans from the manifest-visible post-optimize state and
+/// preserves the deletion.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 #[serial(optimize)]
-async fn optimize_survives_concurrent_delete_before_compaction() {
+async fn optimize_serializes_concurrent_delete_across_handles() {
     let _scenario = FailScenario::setup();
     let dir = tempfile::tempdir().unwrap();
     let uri = dir.path().to_str().unwrap().to_string();
@@ -3283,6 +5029,8 @@ async fn optimize_survives_concurrent_delete_before_compaction() {
             .unwrap();
         }
     }
+
+    let db_b = std::sync::Arc::new(Omnigraph::open(&uri).await.unwrap());
 
     // Pause optimize BEFORE its compaction commits.
     let failpoint = ScopedFailPoint::new(names::OPTIMIZE_BEFORE_COMPACT, "pause");
@@ -3298,27 +5046,33 @@ async fn optimize_survives_concurrent_delete_before_compaction() {
         "optimize never reached the pre-compact pause",
     );
 
-    // Concurrent DELETE of an existing row writes a deletion vector onto the
-    // fragment optimize is about to compact → optimize's Rewrite overlap-conflicts
-    // at the Lance level ("Rewrite … preempted by concurrent Delete/Update").
-    {
-        let db_b = Omnigraph::open(&uri).await.unwrap();
-        db_b.mutate(
-            "main",
-            MUTATION_QUERIES,
-            "remove_person",
-            &mixed_params(&[("$name", "alice")], &[]),
-        )
-        .await
-        .unwrap();
-    }
+    let writer_db = std::sync::Arc::clone(&db_b);
+    let writer = tokio::spawn(async move {
+        writer_db
+            .mutate(
+                "main",
+                MUTATION_QUERIES,
+                "remove_person",
+                &mixed_params(&[("$name", "alice")], &[]),
+            )
+            .await
+    });
+    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    assert!(
+        !writer.is_finished(),
+        "same-root delete must wait for optimize's guarded sidecar lifetime"
+    );
 
     drop(failpoint); // release optimize
     let result = tokio::time::timeout(std::time::Duration::from_secs(20), optimize)
         .await
         .expect("optimize task hung")
         .unwrap();
-    result.expect("optimize must reopen+replan past a concurrent overlapping delete");
+    result.expect("optimize must finish before the queued delete");
+    writer
+        .await
+        .expect("writer task panicked")
+        .expect("queued delete must resume after optimize");
 
     // No lost write: alice's delete persisted (3 rows); graph remains re-optimizable.
     let db = Omnigraph::open(&uri).await.unwrap();
@@ -3422,11 +5176,9 @@ async fn branch_merge_phase_b_failure_recovered_on_next_open() {
     let uri = dir.path().to_str().unwrap().to_string();
 
     // Seed main with a row, branch off, mutate BOTH sides so the merge
-    // produces at least one `RewriteMerged` candidate (target moved past
-    // base too — required for the recovery sidecar to pin anything; the
-    // sidecar only pins RewriteMerged candidates because they're the
-    // only path that always advances Lance HEAD via
-    // `publish_rewritten_merge_table`).
+    // produces a `RewriteMerged` candidate (target moved past base too). The
+    // v4 sidecar records its exact planned data transactions and any contiguous
+    // derived-index tail before publishing the complete logical delta.
     {
         let mut db = Omnigraph::init(&uri, helpers::TEST_SCHEMA).await.unwrap();
         load_jsonl(
@@ -3468,8 +5220,10 @@ async fn branch_merge_phase_b_failure_recovered_on_next_open() {
     // but before commit_manifest_updates. Sidecar persists.
     {
         let db = Omnigraph::open(&uri).await.unwrap();
-        let _failpoint =
-            ScopedFailPoint::new(names::BRANCH_MERGE_POST_PHASE_B_PRE_MANIFEST_COMMIT, "return");
+        let _failpoint = ScopedFailPoint::new(
+            names::BRANCH_MERGE_POST_PHASE_B_PRE_MANIFEST_COMMIT,
+            "return",
+        );
         let err = db.branch_merge("feature", "main").await.unwrap_err();
         assert!(
             err.to_string().contains(
@@ -3490,12 +5244,9 @@ async fn branch_merge_phase_b_failure_recovered_on_next_open() {
         );
     }
 
-    // Recovery: reopen runs the sweep. BranchMerge uses LOOSE
-    // classification — `publish_rewritten_merge_table` runs multiple
-    // commit_staged calls per table (stage_merge_insert + stage_delete +
-    // index rebuilds), so post_commit_pin in the sidecar is a lower
-    // bound; the loose-match classifier accepts any HEAD > expected_version
-    // when expected_version == manifest_pinned.
+    // Recovery: reopen proves the v4 sidecar's exact planned transaction chain,
+    // accepts only its contiguous derived CreateIndex suffix, and publishes the
+    // confirmed final version plus fixed lineage and complete manifest delta.
     let db = Omnigraph::open(&uri).await.unwrap();
 
     let recovery_dir = dir.path().join("__recovery");
@@ -3533,16 +5284,13 @@ async fn branch_merge_phase_b_failure_recovered_on_next_open() {
     // `merged_parent_commit_id`. Only a recovered branch_merge can produce one
     // here (we never completed a normal merge in this test).
     {
-        let commits =
-            omnigraph::db::commit_graph::CommitGraph::open(dir.path().to_str().unwrap())
-                .await
-                .unwrap()
-                .load_commits()
-                .await
-                .unwrap();
-        let found_recovery_merge = commits
-            .iter()
-            .any(|c| c.merged_parent_commit_id.is_some());
+        let commits = omnigraph::db::commit_graph::CommitGraph::open(dir.path().to_str().unwrap())
+            .await
+            .unwrap()
+            .load_commits()
+            .await
+            .unwrap();
+        let found_recovery_merge = commits.iter().any(|c| c.merged_parent_commit_id.is_some());
         assert!(
             found_recovery_merge,
             "recovered branch_merge must record `merged_parent_commit_id` so future \
@@ -3550,6 +5298,931 @@ async fn branch_merge_phase_b_failure_recovered_on_next_open() {
         );
     }
     drop(db);
+}
+
+/// The v4 recovery delta is wider than its physical pin set. A mixed merge can
+/// rewrite one table while another table needs only a manifest pointer switch;
+/// recovery must publish both under the original merge lineage.
+#[tokio::test]
+#[serial(branch_merge_phase_b)]
+async fn branch_merge_recovery_replays_pointer_slots_with_fixed_lineage() {
+    let _scenario = FailScenario::setup();
+    let dir = tempfile::tempdir().unwrap();
+    let uri = dir.path().to_str().unwrap().to_string();
+    let db = helpers::init_and_load(&dir).await;
+    db.branch_create("target").await.unwrap();
+
+    // Main is the source. Advance Person and Company after target forked;
+    // target independently advances Person. Person therefore needs a physical
+    // three-way rewrite, while Company is a source-on-main pointer adoption.
+    db.mutate(
+        "main",
+        MUTATION_QUERIES,
+        "insert_person",
+        &mixed_params(&[("$name", "source-main-person")], &[("$age", 51)]),
+    )
+    .await
+    .unwrap();
+    db.mutate(
+        "main",
+        OCC_DISJOINT_MUTATIONS,
+        "insert_company",
+        &params(&[("$name", "source-main-company")]),
+    )
+    .await
+    .unwrap();
+    db.mutate(
+        "target",
+        MUTATION_QUERIES,
+        "insert_person",
+        &mixed_params(&[("$name", "target-person")], &[("$age", 52)]),
+    )
+    .await
+    .unwrap();
+    let source_head = branch_head_commit_id(dir.path(), "main").await.unwrap();
+    let target_parent = branch_head_commit_id(dir.path(), "target").await.unwrap();
+
+    let error = {
+        let _failpoint = ScopedFailPoint::new(
+            names::BRANCH_MERGE_POST_PHASE_B_PRE_MANIFEST_COMMIT,
+            "return",
+        );
+        db.branch_merge_as("main", "target", Some("merge-author"))
+            .await
+            .unwrap_err()
+    };
+    let operation_id = match error {
+        OmniError::RecoveryRequired { operation_id, .. } => operation_id,
+        other => panic!("confirmed mixed merge must retain recovery ownership: {other}"),
+    };
+    let sidecar_path = dir
+        .path()
+        .join("__recovery")
+        .join(format!("{operation_id}.json"));
+    let sidecar: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(&sidecar_path).unwrap()).unwrap();
+    let fixed_commit_id = sidecar["protocol_v4"]["lineage"]["graph_commit_id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    let delta_keys = sidecar["protocol_v4"]["intended_delta"]["table_updates"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|slot| slot["table_key"].as_str().unwrap())
+        .collect::<std::collections::HashSet<_>>();
+    let effect_keys = sidecar["protocol_v4"]["effects"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|effect| effect["table_key"].as_str().unwrap())
+        .collect::<std::collections::HashSet<_>>();
+    assert_eq!(
+        delta_keys,
+        std::collections::HashSet::from(["node:Person", "node:Company"])
+    );
+    assert_eq!(
+        effect_keys,
+        std::collections::HashSet::from(["node:Person"]),
+        "pointer-only Company must be in the logical delta but not physical pins"
+    );
+    drop(db);
+
+    let recovered = Omnigraph::open(&uri).await.unwrap();
+    assert!(!sidecar_path.exists());
+    let people = collect_column_strings(
+        &helpers::read_table_branch(&recovered, "target", "node:Person").await,
+        "name",
+    );
+    assert!(people.iter().any(|name| name == "source-main-person"));
+    assert!(people.iter().any(|name| name == "target-person"));
+    let companies = collect_column_strings(
+        &helpers::read_table_branch(&recovered, "target", "node:Company").await,
+        "name",
+    );
+    assert!(companies.iter().any(|name| name == "source-main-company"));
+
+    let recovered_head = branch_head_commit_id(dir.path(), "target").await.unwrap();
+    assert_eq!(recovered_head, fixed_commit_id);
+    let commit = recovered.get_commit(&recovered_head).await.unwrap();
+    assert_eq!(
+        commit.parent_commit_id.as_deref(),
+        Some(target_parent.as_str())
+    );
+    assert_eq!(
+        commit.merged_parent_commit_id.as_deref(),
+        Some(source_head.as_str())
+    );
+    assert_eq!(commit.actor_id.as_deref(), Some("merge-author"));
+}
+
+/// Phase D is outside the logical commit boundary. If deleting a confirmed v4
+/// sidecar fails after the exact merge commit is already visible, the merge
+/// still succeeds. The next open must recognize that fixed outcome, append only
+/// its recovery audit, and retire the stale artifact without publishing a
+/// second graph commit or changing any lineage field.
+#[tokio::test]
+#[serial]
+#[serial(branch_merge_phase_b)]
+async fn branch_merge_sidecar_delete_failure_finalizes_visible_fixed_lineage_once() {
+    let _scenario = FailScenario::setup();
+    let dir = tempfile::tempdir().unwrap();
+    let (uri, _) = setup_diverged_merge_branches(&dir).await;
+    let db = Omnigraph::open(&uri).await.unwrap();
+    let source_head = branch_head_commit_id(dir.path(), "source").await.unwrap();
+    let target_parent = branch_head_commit_id(dir.path(), "target").await.unwrap();
+
+    let outcome = {
+        let _failpoint = ScopedFailPoint::new(names::RECOVERY_SIDECAR_DELETE, "return");
+        db.branch_merge_as("source", "target", Some("phase-d-actor"))
+            .await
+            .expect("Phase-D sidecar deletion failure must not fail a visible merge")
+    };
+    assert_eq!(outcome, omnigraph::db::MergeOutcome::Merged);
+
+    let operation_id = single_sidecar_operation_id(dir.path());
+    let sidecar_path = dir
+        .path()
+        .join("__recovery")
+        .join(format!("{operation_id}.json"));
+    let sidecar: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(&sidecar_path).unwrap()).unwrap();
+    let fixed_commit_id = sidecar["protocol_v4"]["lineage"]["graph_commit_id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    let fixed_created_at = sidecar["protocol_v4"]["lineage"]["created_at"]
+        .as_i64()
+        .unwrap();
+    assert_eq!(
+        branch_head_commit_id(dir.path(), "target").await.unwrap(),
+        fixed_commit_id,
+        "the writer must already have published the sidecar's fixed commit"
+    );
+    let commits_before_reopen = db.list_commits(Some("target")).await.unwrap().len();
+    assert!(
+        recovery_audit_kinds(dir.path()).await.is_empty(),
+        "the writer does not append a recovery audit before stale-sidecar finalization"
+    );
+    drop(db);
+
+    let recovered = Omnigraph::open(&uri).await.unwrap();
+    assert!(!sidecar_path.exists());
+    let recovered_head = branch_head_commit_id(dir.path(), "target").await.unwrap();
+    assert_eq!(recovered_head, fixed_commit_id);
+    let recovered_commit = recovered.get_commit(&recovered_head).await.unwrap();
+    assert_eq!(
+        recovered_commit.parent_commit_id.as_deref(),
+        Some(target_parent.as_str())
+    );
+    assert_eq!(
+        recovered_commit.merged_parent_commit_id.as_deref(),
+        Some(source_head.as_str())
+    );
+    assert_eq!(recovered_commit.actor_id.as_deref(), Some("phase-d-actor"));
+    assert_eq!(recovered_commit.created_at, fixed_created_at);
+    assert_eq!(
+        recovered.list_commits(Some("target")).await.unwrap().len(),
+        commits_before_reopen,
+        "stale-sidecar finalization must not publish a second graph commit"
+    );
+    assert_eq!(
+        recovery_audit_kinds(dir.path())
+            .await
+            .into_iter()
+            .filter(|kind| kind == "RolledForward")
+            .count(),
+        1,
+        "the visible fixed outcome must have exactly one recovery audit row"
+    );
+
+    drop(recovered);
+    let reopened = Omnigraph::open(&uri).await.unwrap();
+    assert_eq!(
+        reopened.list_commits(Some("target")).await.unwrap().len(),
+        commits_before_reopen,
+        "a second reopen must remain a lineage no-op"
+    );
+    assert_eq!(
+        recovery_audit_kinds(dir.path())
+            .await
+            .into_iter()
+            .filter(|kind| kind == "RolledForward")
+            .count(),
+        1,
+        "a second reopen must not duplicate the audit row"
+    );
+}
+
+/// A merge plan is classified against one exact target graph head. Advancing
+/// that head after every table effect is confirmed but before the manifest CAS
+/// must not silently re-parent the stale merge. This uses the queue-bypassing
+/// test seam to model a writer in another process: ordinary `Omnigraph`
+/// handles share the root-scoped gates and therefore cannot exercise the
+/// persistent-authority boundary.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[serial(branch_merge_phase_b)]
+async fn branch_merge_post_effect_target_advance_requires_recovery_and_preserves_winner() {
+    let _scenario = FailScenario::setup();
+    let dir = tempfile::tempdir().unwrap();
+    let (uri, main_rows) = setup_diverged_merge_branches(&dir).await;
+    {
+        let db = Omnigraph::open(&uri).await.unwrap();
+        db.mutate(
+            "target",
+            OCC_DISJOINT_MUTATIONS,
+            "insert_company",
+            &params(&[("$name", "target-winner-company")]),
+        )
+        .await
+        .unwrap();
+    }
+    let merge_db = std::sync::Arc::new(Omnigraph::open(&uri).await.unwrap());
+    let mut target_winner = Omnigraph::open(&uri).await.unwrap();
+    let source_head = branch_head_commit_id(dir.path(), "source").await.unwrap();
+
+    let merge_rv = helpers::failpoint::Rendezvous::park_first(
+        names::BRANCH_MERGE_POST_PHASE_B_PRE_MANIFEST_COMMIT,
+    );
+    let merge_handle = std::sync::Arc::clone(&merge_db);
+    let merge_task = tokio::spawn(async move {
+        merge_handle.branch_merge("source", "target").await
+    });
+    merge_rv.wait_until_reached().await;
+
+    // Publish a logically redundant Company pin directly on the target. The
+    // table is disjoint from the merge's Person effect, but the graph lineage
+    // still advances, invalidating the merge's coarse target authority token.
+    // The test-only seam deliberately bypasses the process-local queues.
+    let company_uri = node_table_uri(&uri, "Company");
+    let mut raw_company = lance::Dataset::open(&company_uri)
+        .await
+        .unwrap()
+        .checkout_branch("target")
+        .await
+        .unwrap();
+    helpers::lance_delete_inline(&mut raw_company, "1 = 2").await;
+    target_winner
+        .failpoint_publish_table_head_without_index_rebuild_for_test(
+            "target",
+            "node:Company",
+            Some("target"),
+        )
+        .await
+        .unwrap();
+    let winner_head = branch_head_commit_id(dir.path(), "target").await.unwrap();
+    merge_rv.release();
+
+    let error = merge_task
+        .await
+        .unwrap()
+        .expect_err("a post-effect target advance must reject the stale merge publish");
+    let operation_id = match error {
+        OmniError::RecoveryRequired { operation_id, .. } => operation_id,
+        other => panic!("expected RecoveryRequired after merge effects, got {other}"),
+    };
+
+    let sidecar_path = dir
+        .path()
+        .join("__recovery")
+        .join(format!("{operation_id}.json"));
+    let sidecar: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(&sidecar_path).unwrap()).unwrap();
+    assert_eq!(sidecar["schema_version"], 4);
+    assert_eq!(
+        sidecar["protocol_v4"]["lineage"]["merged_parent_commit_id"],
+        source_head.as_str(),
+        "recovery must retain the captured source commit as the merge parent"
+    );
+
+    drop(merge_db);
+    drop(target_winner);
+
+    // Full recovery sees that target authority changed. It must preserve the
+    // winning graph commit and compensate only the unpublished merge effects.
+    let recovered = Omnigraph::open(&uri).await.unwrap();
+    assert!(
+        !sidecar_path.exists(),
+        "successful compensation must retire the merge recovery intent"
+    );
+    assert_eq!(
+        helpers::count_rows_branch(&recovered, "target", "node:Person").await,
+        main_rows + 1,
+        "recovery must restore the pre-merge target image"
+    );
+    let target_names = collect_column_strings(
+        &helpers::read_table_branch(&recovered, "target", "node:Person").await,
+        "name",
+    );
+    assert!(target_names.iter().any(|name| name == "old-target-only"));
+    assert!(!target_names.iter().any(|name| name == "source-only"));
+
+    let recovered_head = branch_head_commit_id(dir.path(), "target").await.unwrap();
+    let recovered_commit = recovered.get_commit(&recovered_head).await.unwrap();
+    assert_eq!(
+        recovered_commit.parent_commit_id.as_deref(),
+        Some(winner_head.as_str()),
+        "rollback lineage must descend from, never replace, the target winner"
+    );
+}
+
+/// If a foreign writer advances and publishes the SAME target table after the
+/// merge's confirmed effect, that effect is buried under foreign state. Full
+/// recovery must fail closed instead of restoring through the winner or
+/// adopting the newer numeric HEAD as this merge's output.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[serial(branch_merge_phase_b)]
+async fn branch_merge_post_effect_same_table_advance_fails_closed() {
+    let _scenario = FailScenario::setup();
+    let dir = tempfile::tempdir().unwrap();
+    let (uri, _) = setup_diverged_merge_branches(&dir).await;
+    let merge_db = std::sync::Arc::new(Omnigraph::open(&uri).await.unwrap());
+    let mut target_winner = Omnigraph::open(&uri).await.unwrap();
+    let merge_rv = helpers::failpoint::Rendezvous::park_first(
+        names::BRANCH_MERGE_POST_PHASE_B_PRE_MANIFEST_COMMIT,
+    );
+
+    let merge_handle = std::sync::Arc::clone(&merge_db);
+    let merge_task = tokio::spawn(async move {
+        merge_handle.branch_merge("source", "target").await
+    });
+    merge_rv.wait_until_reached().await;
+
+    let person_uri = node_table_uri(&uri, "Person");
+    let mut raw_target = lance::Dataset::open(&person_uri)
+        .await
+        .unwrap()
+        .checkout_branch("target")
+        .await
+        .unwrap();
+    helpers::lance_delete_inline(&mut raw_target, "1 = 2").await;
+    let winner_lance_head = raw_target.version().version;
+    target_winner
+        .failpoint_publish_table_head_without_index_rebuild_for_test(
+            "target",
+            "node:Person",
+            Some("target"),
+        )
+        .await
+        .unwrap();
+    let winner_manifest_version = helpers::version_branch(&target_winner, "target")
+        .await
+        .unwrap();
+    merge_rv.release();
+
+    let operation_id = match merge_task.await.unwrap().unwrap_err() {
+        OmniError::RecoveryRequired { operation_id, .. } => operation_id,
+        other => panic!("same-table post-effect contention must require recovery: {other}"),
+    };
+    let sidecar_path = dir
+        .path()
+        .join("__recovery")
+        .join(format!("{operation_id}.json"));
+    assert!(sidecar_path.exists());
+    drop(merge_db);
+
+    let error = match Omnigraph::open(&uri).await {
+        Ok(_) => panic!("Full recovery must refuse to restore through a same-table winner"),
+        Err(error) => error,
+    };
+    assert!(
+        error.to_string().contains("manifest pin changed")
+            || error.to_string().contains("foreign or unverifiable"),
+        "unexpected fail-closed error: {error}"
+    );
+    assert!(
+        sidecar_path.exists(),
+        "operator-owned intent must remain durable"
+    );
+    assert_eq!(
+        helpers::version_branch(&target_winner, "target")
+            .await
+            .unwrap(),
+        winner_manifest_version,
+        "failed recovery must not move the winning target manifest"
+    );
+    let lance_after_failed_recovery = lance::Dataset::open(&person_uri)
+        .await
+        .unwrap()
+        .checkout_branch("target")
+        .await
+        .unwrap()
+        .version()
+        .version;
+    assert_eq!(
+        lance_after_failed_recovery, winner_lance_head,
+        "fail-closed recovery must not restore through the winning Lance HEAD"
+    );
+}
+
+/// A v4 rollback is itself a recoverable multi-step write. If open restores an
+/// owned merge effect and then crashes before publishing that compensated HEAD,
+/// the next open must recognize the restore transaction, reuse it, and finish
+/// the fixed rollback once. Re-restoring forever would monotonically advance
+/// Lance HEAD while every read-write open remained wedged.
+#[tokio::test]
+#[serial]
+#[serial(branch_merge_phase_b)]
+async fn branch_merge_rollback_restarts_after_restore_before_publish() {
+    let _scenario = FailScenario::setup();
+    let dir = tempfile::tempdir().unwrap();
+    let (uri, main_rows) = setup_diverged_merge_branches(&dir).await;
+
+    // Give the target a disjoint owned table. After the merge reaches its
+    // confirmed Phase B, a no-op commit on this table advances target graph
+    // authority without burying the merge-owned Person HEAD, making safe
+    // compensation both necessary and possible.
+    let db = Omnigraph::open(&uri).await.unwrap();
+    db.mutate(
+        "target",
+        OCC_DISJOINT_MUTATIONS,
+        "insert_company",
+        &params(&[("$name", "rollback-winner-company")]),
+    )
+    .await
+    .unwrap();
+    let mut target_winner = Omnigraph::open(&uri).await.unwrap();
+
+    let operation_id = {
+        let _failpoint = ScopedFailPoint::new(
+            names::BRANCH_MERGE_POST_PHASE_B_PRE_MANIFEST_COMMIT,
+            "return",
+        );
+        match db.branch_merge("source", "target").await.unwrap_err() {
+            OmniError::RecoveryRequired { operation_id, .. } => operation_id,
+            other => panic!("confirmed merge must retain recovery ownership: {other}"),
+        }
+    };
+    let sidecar_path = dir
+        .path()
+        .join("__recovery")
+        .join(format!("{operation_id}.json"));
+    assert!(sidecar_path.exists());
+
+    let company_uri = node_table_uri(&uri, "Company");
+    let mut raw_company = lance::Dataset::open(&company_uri)
+        .await
+        .unwrap()
+        .checkout_branch("target")
+        .await
+        .unwrap();
+    helpers::lance_delete_inline(&mut raw_company, "1 = 2").await;
+    target_winner
+        .failpoint_publish_table_head_without_index_rebuild_for_test(
+            "target",
+            "node:Company",
+            Some("target"),
+        )
+        .await
+        .unwrap();
+    let winner_head = branch_head_commit_id(dir.path(), "target").await.unwrap();
+
+    let person_uri = node_table_uri(&uri, "Person");
+    let person_before_restore = lance::Dataset::open(&person_uri)
+        .await
+        .unwrap()
+        .checkout_branch("target")
+        .await
+        .unwrap()
+        .version()
+        .version;
+    drop(db);
+    drop(target_winner);
+
+    {
+        let _failpoint =
+            ScopedFailPoint::new(names::RECOVERY_POST_TABLE_RESTORE_PRE_PUBLISH, "return");
+        let error = match Omnigraph::open(&uri).await {
+            Ok(_) => panic!("recovery must stop after the injected table restore"),
+            Err(error) => error,
+        };
+        assert!(
+            error
+                .to_string()
+                .contains("recovery.post_table_restore_pre_publish"),
+            "unexpected interrupted-rollback error: {error}"
+        );
+    }
+    assert!(
+        sidecar_path.exists(),
+        "an interrupted rollback must retain its recovery intent"
+    );
+    assert_eq!(
+        branch_head_commit_id(dir.path(), "target").await.unwrap(),
+        winner_head,
+        "the rollback manifest publish must not occur before the failpoint"
+    );
+    assert!(
+        recovery_audit_kinds(dir.path()).await.is_empty(),
+        "an interrupted rollback must not claim a completed audit outcome"
+    );
+    let person_after_interrupted_restore = lance::Dataset::open(&person_uri)
+        .await
+        .unwrap()
+        .checkout_branch("target")
+        .await
+        .unwrap()
+        .version()
+        .version;
+    assert!(
+        person_after_interrupted_restore > person_before_restore,
+        "the fixture must durably restore Person before interrupting the manifest publish"
+    );
+
+    let recovered = Omnigraph::open(&uri)
+        .await
+        .expect("the next open must recognize and finish the interrupted compensation");
+    assert!(!sidecar_path.exists());
+    let person_after_recovery = lance::Dataset::open(&person_uri)
+        .await
+        .unwrap()
+        .checkout_branch("target")
+        .await
+        .unwrap()
+        .version()
+        .version;
+    assert_eq!(
+        person_after_recovery, person_after_interrupted_restore,
+        "restartable rollback must reuse the owned restore instead of restoring again"
+    );
+    assert_eq!(
+        helpers::count_rows_branch(&recovered, "target", "node:Person").await,
+        main_rows + 1
+    );
+    let target_names = collect_column_strings(
+        &helpers::read_table_branch(&recovered, "target", "node:Person").await,
+        "name",
+    );
+    assert!(target_names.iter().any(|name| name == "old-target-only"));
+    assert!(!target_names.iter().any(|name| name == "source-only"));
+    let rollback_head = branch_head_commit_id(dir.path(), "target").await.unwrap();
+    let rollback_commit = recovered.get_commit(&rollback_head).await.unwrap();
+    assert_eq!(
+        rollback_commit.parent_commit_id.as_deref(),
+        Some(winner_head.as_str())
+    );
+    assert_eq!(
+        recovery_audit_kinds(dir.path())
+            .await
+            .into_iter()
+            .filter(|kind| kind == "RolledBack")
+            .count(),
+        1
+    );
+
+    drop(recovered);
+    let _reopened = Omnigraph::open(&uri).await.unwrap();
+    let person_after_second_open = lance::Dataset::open(&person_uri)
+        .await
+        .unwrap()
+        .checkout_branch("target")
+        .await
+        .unwrap()
+        .version()
+        .version;
+    assert_eq!(person_after_second_open, person_after_recovery);
+    assert_eq!(
+        recovery_audit_kinds(dir.path())
+            .await
+            .into_iter()
+            .filter(|kind| kind == "RolledBack")
+            .count(),
+        1,
+        "a second open must not repeat rollback or its audit"
+    );
+}
+
+/// A pure first-touch/ref-only merge can reach EffectsConfirmed without any
+/// data HEAD movement. Recovery must validate the minted ref identity and roll
+/// the exact pointer delta forward, not discard it as an empty intent.
+#[tokio::test]
+#[serial(branch_merge_first_touch)]
+async fn branch_merge_confirmed_ref_only_effect_rolls_forward() {
+    let _scenario = FailScenario::setup();
+    let dir = tempfile::tempdir().unwrap();
+    let uri = dir.path().to_str().unwrap().to_string();
+    let db = helpers::init_and_load(&dir).await;
+    let main_rows = helpers::count_rows(&db, "node:Person").await;
+    db.branch_create("source").await.unwrap();
+    db.branch_create("target").await.unwrap();
+    db.mutate(
+        "source",
+        MUTATION_QUERIES,
+        "insert_person",
+        &mixed_params(&[("$name", "confirmed-ref-row")], &[("$age", 38)]),
+    )
+    .await
+    .unwrap();
+
+    let operation_id = {
+        let _failpoint = ScopedFailPoint::new(
+            names::BRANCH_MERGE_POST_PHASE_B_PRE_MANIFEST_COMMIT,
+            "return",
+        );
+        match db.branch_merge("source", "target").await.unwrap_err() {
+            OmniError::RecoveryRequired { operation_id, .. } => operation_id,
+            other => panic!("confirmed ref-only merge must retain recovery ownership: {other}"),
+        }
+    };
+    let sidecar_path = dir
+        .path()
+        .join("__recovery")
+        .join(format!("{operation_id}.json"));
+    let sidecar: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(&sidecar_path).unwrap()).unwrap();
+    assert_eq!(sidecar["protocol_v4"]["effect_phase"], "EffectsConfirmed");
+    assert!(!sidecar["protocol_v4"]["effects"][0]["kind"]["confirmed_branch_identifier"].is_null());
+    drop(db);
+
+    let recovered = Omnigraph::open(&uri).await.unwrap();
+    assert!(!sidecar_path.exists());
+    assert_eq!(
+        helpers::count_rows_branch(&recovered, "target", "node:Person").await,
+        main_rows + 1
+    );
+    let names = collect_column_strings(
+        &helpers::read_table_branch(&recovered, "target", "node:Person").await,
+        "name",
+    );
+    assert!(names.iter().any(|name| name == "confirmed-ref-row"));
+}
+
+/// RewriteMerged can append reconciler-owned CreateIndex commits after its
+/// pre-minted logical data transactions. An Armed crash in that derived tail is
+/// still rollback-only, but recovery must prove the exact planned transaction
+/// prefix and accept only the contiguous CreateIndex suffix rather than treating
+/// its larger numeric HEAD as foreign movement.
+#[tokio::test]
+#[serial]
+#[serial(branch_merge_phase_b)]
+async fn branch_merge_armed_index_tail_rolls_back_after_exact_transaction_prefix() {
+    use lance::index::DatasetIndexExt;
+    use omnigraph::table_store::TableStore;
+
+    let _scenario = FailScenario::setup();
+    let dir = tempfile::tempdir().unwrap();
+    let (uri, main_rows) = setup_diverged_merge_branches(&dir).await;
+    let mut db = Omnigraph::open(&uri).await.unwrap();
+    let person_uri = node_table_uri(&uri, "Person");
+
+    // Make the rewrite rebuild `id_idx` after its logical data transaction.
+    // Publish the dropped-index HEAD first so the merge's expected version and
+    // planned transaction chain are anchored to a fully consistent target.
+    let store = TableStore::new(&uri, test_session());
+    let mut target_person = store
+        .open_dataset_head(&person_uri, Some("target"))
+        .await
+        .unwrap();
+    target_person.drop_index("id_idx").await.unwrap();
+    let dropped_index_head = target_person.version().version;
+    db.failpoint_publish_table_head_without_index_rebuild_for_test(
+        "target",
+        "node:Person",
+        Some("target"),
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        db.snapshot_of(omnigraph::db::ReadTarget::branch("target"))
+            .await
+            .unwrap()
+            .entry("node:Person")
+            .unwrap()
+            .table_version,
+        dropped_index_head
+    );
+
+    let operation_id = {
+        let _failpoint =
+            ScopedFailPoint::new(names::BRANCH_MERGE_POST_EFFECTS_PRE_CONFIRM, "return");
+        match db.branch_merge("source", "target").await.unwrap_err() {
+            OmniError::RecoveryRequired { operation_id, .. } => operation_id,
+            other => panic!("Armed derived-tail failure must retain recovery ownership: {other}"),
+        }
+    };
+    let sidecar_path = dir
+        .path()
+        .join("__recovery")
+        .join(format!("{operation_id}.json"));
+    let sidecar: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(&sidecar_path).unwrap()).unwrap();
+    assert_eq!(sidecar["protocol_v4"]["effect_phase"], "Armed");
+    let person_pin = sidecar["tables"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|pin| pin["table_key"] == "node:Person")
+        .unwrap();
+    let expected_version = person_pin["expected_version"].as_u64().unwrap();
+    let person_effect = sidecar["protocol_v4"]["effects"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|effect| effect["table_key"] == "node:Person")
+        .unwrap();
+    let planned_transaction_count = person_effect["kind"]["planned_transactions"]
+        .as_array()
+        .unwrap()
+        .len();
+    assert!(
+        planned_transaction_count > 0,
+        "fixture must plan at least one logical Person transaction"
+    );
+    let raw_head_with_index_tail = store
+        .open_dataset_head(&person_uri, Some("target"))
+        .await
+        .unwrap()
+        .version()
+        .version;
+    assert!(
+        raw_head_with_index_tail > expected_version + planned_transaction_count as u64,
+        "raw HEAD {raw_head_with_index_tail} must include at least one CreateIndex tail after \
+         expected {expected_version} + {planned_transaction_count} planned transactions"
+    );
+    drop(db);
+
+    let recovered = Omnigraph::open(&uri)
+        .await
+        .expect("Full recovery must roll an exact Armed transaction+index tail back");
+    assert!(!sidecar_path.exists());
+    assert_eq!(
+        helpers::count_rows_branch(&recovered, "target", "node:Person").await,
+        main_rows + 1
+    );
+    let names = collect_column_strings(
+        &helpers::read_table_branch(&recovered, "target", "node:Person").await,
+        "name",
+    );
+    assert!(names.iter().any(|name| name == "old-target-only"));
+    assert!(!names.iter().any(|name| name == "source-only"));
+}
+
+/// Phase-B confirmation is an ownership proof, not a numeric HEAD stamp. A
+/// foreign logical Append can land after the merge's exact data transaction and
+/// before its retrying CreateIndex tail; Lance may validly rebase that index
+/// build over the Append, but the merge must not confirm or recover the foreign
+/// row as its own output.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[serial]
+#[serial(branch_merge_phase_b)]
+async fn branch_merge_confirmation_rejects_foreign_append_before_index_tail() {
+    use futures::TryStreamExt;
+    use lance::index::DatasetIndexExt;
+    use omnigraph::table_store::TableStore;
+
+    let _scenario = FailScenario::setup();
+    let dir = tempfile::tempdir().unwrap();
+    let (uri, _) = setup_diverged_merge_branches(&dir).await;
+    let mut db = Omnigraph::open(&uri).await.unwrap();
+
+    // Prepare one schema-exact row on an unrelated branch. Its RecordBatch can
+    // then be appended directly to target Lance HEAD without invoking any
+    // target manifest publisher or process-local write gate.
+    db.branch_create("foreign-seed").await.unwrap();
+    db.mutate(
+        "foreign-seed",
+        MUTATION_QUERIES,
+        "insert_person",
+        &mixed_params(&[("$name", "foreign-unpublished")], &[("$age", 61)]),
+    )
+    .await
+    .unwrap();
+    let foreign_batch = helpers::read_table_branch(&db, "foreign-seed", "node:Person")
+        .await
+        .into_iter()
+        .find_map(|batch| {
+            let names = batch
+                .column_by_name("name")?
+                .as_any()
+                .downcast_ref::<arrow_array::StringArray>()?;
+            (0..batch.num_rows())
+                .find(|row| names.value(*row) == "foreign-unpublished")
+                .map(|row| batch.slice(row, 1))
+        })
+        .expect("foreign seed row must be readable as one append batch");
+
+    // Force RewriteMerged to execute a CreateIndex tail after its exact data
+    // transaction, while keeping the target manifest consistent before merge.
+    let person_uri = node_table_uri(&uri, "Person");
+    let store = TableStore::new(&uri, test_session());
+    let mut target_person = store
+        .open_dataset_head(&person_uri, Some("target"))
+        .await
+        .unwrap();
+    target_person.drop_index("id_idx").await.unwrap();
+    let dropped_index_head = target_person.version().version;
+    db.failpoint_publish_table_head_without_index_rebuild_for_test(
+        "target",
+        "node:Person",
+        Some("target"),
+    )
+    .await
+    .unwrap();
+    let target_head_before_merge = branch_head_commit_id(dir.path(), "target").await.unwrap();
+
+    let merge_db = std::sync::Arc::new(db);
+    let merge_rv = helpers::failpoint::Rendezvous::park_first(
+        names::BRANCH_MERGE_REWRITE_AFTER_DELETE_PRE_INDEX,
+    );
+    let merge_handle = std::sync::Arc::clone(&merge_db);
+    let merge_task = tokio::spawn(async move {
+        merge_handle.branch_merge("source", "target").await
+    });
+    merge_rv.wait_until_reached().await;
+
+    // The merge's logical data transaction is now at HEAD, but its index build
+    // has not started. Append a real logical row without publishing target
+    // manifest authority, then let CreateIndex rebase over that foreign commit.
+    let mut raw_target = store
+        .open_dataset_head(&person_uri, Some("target"))
+        .await
+        .unwrap();
+    helpers::lance_append_inline(&mut raw_target, foreign_batch).await;
+    let foreign_append_head = raw_target.version().version;
+    merge_rv.release();
+
+    let operation_id = match merge_task.await.unwrap().unwrap_err() {
+        OmniError::RecoveryRequired { operation_id, .. } => operation_id,
+        other => panic!("foreign confirmation tail must retain recovery ownership: {other}"),
+    };
+    let sidecar_path = dir
+        .path()
+        .join("__recovery")
+        .join(format!("{operation_id}.json"));
+    let sidecar: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(&sidecar_path).unwrap()).unwrap();
+    assert_eq!(
+        sidecar["protocol_v4"]["effect_phase"], "Armed",
+        "confirmation must reject before persisting EffectsConfirmed"
+    );
+    let raw_head_after_index_rebase = store
+        .open_dataset_head(&person_uri, Some("target"))
+        .await
+        .unwrap()
+        .version()
+        .version;
+    assert!(
+        raw_head_after_index_rebase > foreign_append_head,
+        "fixture must place at least one rebased CreateIndex commit after the foreign Append"
+    );
+    assert_eq!(
+        branch_head_commit_id(dir.path(), "target").await.unwrap(),
+        target_head_before_merge,
+        "rejected confirmation must not advance target graph lineage"
+    );
+    drop(merge_db);
+
+    let open_error = match Omnigraph::open(&uri).await {
+        Ok(_) => panic!("Full recovery must fail closed on a non-CreateIndex foreign tail"),
+        Err(error) => error,
+    };
+    assert!(
+        open_error.to_string().contains("foreign")
+            || open_error.to_string().contains("unverifiable")
+            || open_error.to_string().contains("CreateIndex"),
+        "unexpected fail-closed error: {open_error}"
+    );
+    assert!(sidecar_path.exists());
+    assert_eq!(
+        branch_head_commit_id(dir.path(), "target").await.unwrap(),
+        target_head_before_merge,
+        "failed recovery must not publish or re-parent the merge"
+    );
+    let read_only = Omnigraph::open_read_only(&uri).await.unwrap();
+    assert_eq!(
+        read_only
+            .snapshot_of(omnigraph::db::ReadTarget::branch("target"))
+            .await
+            .unwrap()
+            .entry("node:Person")
+            .unwrap()
+            .table_version,
+        dropped_index_head,
+        "target manifest must remain at its pre-merge Person pin"
+    );
+    let raw_after_failed_recovery = store
+        .open_dataset_head(&person_uri, Some("target"))
+        .await
+        .unwrap();
+    assert_eq!(
+        raw_after_failed_recovery.version().version,
+        raw_head_after_index_rebase,
+        "fail-closed recovery must not restore through the foreign Append"
+    );
+    let raw_batches: Vec<arrow_array::RecordBatch> = raw_after_failed_recovery
+        .scan()
+        .try_into_stream()
+        .await
+        .unwrap()
+        .try_collect()
+        .await
+        .unwrap();
+    assert!(
+        collect_column_strings(&raw_batches, "name")
+            .iter()
+            .any(|name| name == "foreign-unpublished"),
+        "the unpublished foreign row must survive fail-closed confirmation and recovery"
+    );
 }
 
 /// AdoptWithDelta recovery (the gap closure): a fast-forward merge — main has
@@ -3601,8 +6274,10 @@ async fn branch_merge_adopt_with_delta_phase_b_failure_recovered_on_next_open() 
     // Fail after the per-table publish loop, before commit_manifest_updates.
     {
         let db = Omnigraph::open(&uri).await.unwrap();
-        let _failpoint =
-            ScopedFailPoint::new(names::BRANCH_MERGE_POST_PHASE_B_PRE_MANIFEST_COMMIT, "return");
+        let _failpoint = ScopedFailPoint::new(
+            names::BRANCH_MERGE_POST_PHASE_B_PRE_MANIFEST_COMMIT,
+            "return",
+        );
         let err = db.branch_merge("feature", "main").await.unwrap_err();
         assert!(
             err.to_string().contains(
@@ -3670,9 +6345,9 @@ async fn sorted_person_names(db: &Omnigraph) -> Vec<String> {
 /// THE recovery-atomicity regression gate. A branch merge whose per-table publish
 /// is a multi-commit sequence (append → upsert → delete, or merge_insert → delete
 /// → index) advances Lance HEAD step by step before the manifest publish. If the
-/// process dies *mid*-sequence — after some commits but before the achieved-version
-/// intent is recorded — recovery must roll the whole merge **back**, not publish
-/// the partial and record the merge as complete.
+/// process dies *mid*-sequence — after some planned commits but while the v4
+/// sidecar remains Armed — recovery must roll the whole merge **back**, not
+/// publish the partial and record the merge as complete.
 ///
 /// The delta is deliberately MIXED — a fresh id (`bob`, append), a modified base id
 /// (`carol`, upsert) and a removed base id (`dave`, delete) — so every partial
@@ -3680,10 +6355,11 @@ async fn sorted_person_names(db: &Omnigraph) -> Vec<String> {
 /// back at its base name-set, and a *re-run* of the merge re-applies the full delta
 /// (the partial was not silently recorded as "already merged").
 ///
-/// RED before the fix: the loose `BranchMerge` classification rolls any
-/// `lance_head > manifest_pinned` forward, so the partial is published (e.g. `bob`
-/// present, `dave` kept) and the merge recorded — the first assert (back at base)
-/// fails. GREEN after: `achieved_version == None` → `IncompletePhaseB` → roll back.
+/// RED before the fix: the legacy loose `BranchMerge` classifier rolled any
+/// `lance_head > manifest_pinned` forward, so the partial was published (e.g.
+/// `bob` present, `dave` kept) and the merge recorded. GREEN after: an Armed v4
+/// sidecar can prove only a proper prefix of its planned transaction chain, so
+/// recovery compensates it rather than treating numeric movement as completion.
 async fn assert_partial_merge_rolls_back(scenario: MergeScenario, failpoint: &str) {
     use omnigraph::loader::load_jsonl;
 
@@ -3869,7 +6545,10 @@ async fn pre_upgrade_v1_branch_merge_sidecar_rolls_forward_not_back() {
     // sidecar lands on disk.
     {
         let db = Omnigraph::open(&uri).await.unwrap();
-        let _fp = ScopedFailPoint::new(names::BRANCH_MERGE_POST_PHASE_B_PRE_MANIFEST_COMMIT, "return");
+        let _fp = ScopedFailPoint::new(
+            names::BRANCH_MERGE_POST_PHASE_B_PRE_MANIFEST_COMMIT,
+            "return",
+        );
         db.branch_merge("feature", "main").await.unwrap_err();
     }
 
@@ -3884,7 +6563,10 @@ async fn pre_upgrade_v1_branch_merge_sidecar_rolls_forward_not_back() {
             .expect("a recovery sidecar must exist after the post-Phase-B crash");
         let mut v: serde_json::Value =
             serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+        v["merge_source_commit_id"] =
+            v["protocol_v4"]["lineage"]["merged_parent_commit_id"].clone();
         v["schema_version"] = serde_json::json!(1);
+        v.as_object_mut().unwrap().remove("protocol_v4");
         for table in v["tables"].as_array_mut().unwrap() {
             table.as_object_mut().unwrap().remove("confirmed_version");
         }
@@ -3975,8 +6657,10 @@ async fn branch_merge_phase_b_failure_recovered_on_non_main_target() {
     // branch=Some("target_branch").
     {
         let db = Omnigraph::open(&uri).await.unwrap();
-        let _failpoint =
-            ScopedFailPoint::new(names::BRANCH_MERGE_POST_PHASE_B_PRE_MANIFEST_COMMIT, "return");
+        let _failpoint = ScopedFailPoint::new(
+            names::BRANCH_MERGE_POST_PHASE_B_PRE_MANIFEST_COMMIT,
+            "return",
+        );
         let err = db
             .branch_merge("source_branch", "target_branch")
             .await
@@ -4005,7 +6689,7 @@ async fn branch_merge_phase_b_failure_recovered_on_non_main_target() {
     assert_post_recovery_invariants(
         dir.path(),
         &operation_id,
-        RecoveryExpectation::RolledForward {
+        RecoveryExpectation::RolledForwardOriginalLineage {
             tables: vec![
                 TableExpectation::branch("node:Person", "target_branch")
                     .expected_main_manifest_pin(main_person_pin)
@@ -4078,8 +6762,10 @@ async fn branch_merge_sidecar_pins_table_branch_to_active_branch() {
 
     {
         let db = Omnigraph::open(&uri).await.unwrap();
-        let _failpoint =
-            ScopedFailPoint::new(names::BRANCH_MERGE_POST_PHASE_B_PRE_MANIFEST_COMMIT, "return");
+        let _failpoint = ScopedFailPoint::new(
+            names::BRANCH_MERGE_POST_PHASE_B_PRE_MANIFEST_COMMIT,
+            "return",
+        );
         let _ = db
             .branch_merge("source_branch", "target_branch")
             .await
@@ -4127,18 +6813,15 @@ async fn branch_merge_sidecar_pins_table_branch_to_active_branch() {
 /// (every declared index already built, or empty tables that the loop
 /// skips), the sidecar is omitted entirely.
 ///
-/// Test setup: `load_jsonl` auto-builds indices via
-/// `prepare_updates_for_commit`. So after the load, every Person/Knows
-/// index is built and Company is empty. `ensure_indices` correctly
-/// produces zero pins → no sidecar. The failpoint still fires (it sits
-/// after the loops), so the call returns Err — but no recovery state
-/// persists. Reopen is a clean no-op.
+/// Test setup: RFC-022 leaves index materialization to the reconciler, so the
+/// first `ensure_indices` after load builds Person's declared index. A second
+/// call is then the steady-state no-work case: zero pins → no sidecar. The
+/// failpoint still fires (it sits after the loops), so the call returns Err —
+/// but no recovery state persists. Reopen is a clean no-op.
 ///
-/// Triggering an actual sidecar persistence requires bypassing
-/// `load_jsonl`'s auto-build via raw `TableStore::append_batch` — the
-/// helper-direct path. That's covered structurally by the
-/// `needs_index_work_*` code path and the
-/// `recovery_ensure_indices_handles_empty_tables` integration test.
+/// Actual EnsureIndices sidecar persistence and staged-index failure are covered
+/// by `ensure_indices_stage_btree_failure_leaves_existing_tables_writable`; this
+/// test deliberately reaches the second, no-work reconciliation pass.
 #[tokio::test]
 #[serial]
 async fn ensure_indices_phase_b_failure_does_not_leak_sidecar_when_no_work_needed() {
@@ -4148,9 +6831,8 @@ async fn ensure_indices_phase_b_failure_does_not_leak_sidecar_when_no_work_neede
     let dir = tempfile::tempdir().unwrap();
     let uri = dir.path().to_str().unwrap().to_string();
 
-    // Seed: load_jsonl auto-builds Person's indices via
-    // prepare_updates_for_commit. After this, ensure_indices has no
-    // work to do (steady state).
+    // Seed, then reconcile the index declaration once. RFC-022 writes publish
+    // only their exact data effect; index construction is derived work.
     {
         let mut db = Omnigraph::init(&uri, helpers::TEST_SCHEMA).await.unwrap();
         load_jsonl(
@@ -4162,6 +6844,7 @@ async fn ensure_indices_phase_b_failure_does_not_leak_sidecar_when_no_work_neede
         )
         .await
         .unwrap();
+        db.ensure_indices().await.unwrap();
     }
 
     // Setup: trigger the failpoint. Steady-state ensure_indices
@@ -4170,8 +6853,10 @@ async fn ensure_indices_phase_b_failure_does_not_leak_sidecar_when_no_work_neede
     // still fires, surfacing the Err.
     {
         let db = Omnigraph::open(&uri).await.unwrap();
-        let _failpoint =
-            ScopedFailPoint::new(names::ENSURE_INDICES_POST_PHASE_B_PRE_MANIFEST_COMMIT, "return");
+        let _failpoint = ScopedFailPoint::new(
+            names::ENSURE_INDICES_POST_PHASE_B_PRE_MANIFEST_COMMIT,
+            "return",
+        );
         let err = db.ensure_indices().await.unwrap_err();
         assert!(
             err.to_string().contains(
@@ -4389,4 +7074,804 @@ async fn publisher_retries_retryable_load_publish_state_error() {
     db.load_as("main", None, row, LoadMode::Merge, None)
         .await
         .expect("publisher must retry the one-shot retryable load_publish_state error and commit");
+}
+
+/// `create_branch` can succeed before reopening the new ref fails. That error is
+/// post-effect even on the first deferred table: the v3 sidecar must remain so
+/// Full recovery can reclaim the exact untouched ref.
+#[tokio::test]
+#[serial]
+async fn first_touch_post_create_open_error_keeps_recovery_ownership() {
+    let _scenario = FailScenario::setup();
+    let dir = tempfile::tempdir().unwrap();
+    let uri = dir.path().to_str().unwrap().to_string();
+    let db = helpers::init_and_load(&dir).await;
+    db.branch_create("feature").await.unwrap();
+
+    let error = {
+        let _fp = ScopedFailPoint::new(names::FORK_POST_CREATE_PRE_OPEN, "return");
+        db.mutate(
+            "feature",
+            MUTATION_QUERIES,
+            "insert_person",
+            &mixed_params(&[("$name", "post-create")], &[("$age", 22)]),
+        )
+        .await
+        .expect_err("post-create reopen failure must fail into recovery")
+    };
+    assert!(matches!(error, OmniError::RecoveryRequired { .. }));
+    assert_eq!(
+        std::fs::read_dir(dir.path().join("__recovery"))
+            .unwrap()
+            .count(),
+        1,
+        "ambiguous post-create failure must retain its ownership sidecar"
+    );
+    let person_uri = node_table_uri(&uri, "Person");
+    assert!(
+        lance::Dataset::open(&person_uri)
+            .await
+            .unwrap()
+            .list_branches()
+            .await
+            .unwrap()
+            .contains_key("feature"),
+        "test seam fires only after the target ref is durable"
+    );
+
+    drop(db);
+    let recovered = Omnigraph::open(&uri).await.unwrap();
+    assert_eq!(
+        helpers::count_rows_branch(&recovered, "feature", "node:Person").await,
+        4,
+        "failed first touch must not publish its row"
+    );
+    assert!(
+        !lance::Dataset::open(&person_uri)
+            .await
+            .unwrap()
+            .list_branches()
+            .await
+            .unwrap()
+            .contains_key("feature"),
+        "Full recovery must reclaim the sidecar-owned untouched ref"
+    );
+}
+
+/// A branch delete's first recovery probe is not its authority boundary. A data
+/// writer can arm an intent in the prepare-to-gate gap; after delete acquires
+/// schema/branch/all-table gates the owner is no longer live, so removing the
+/// native ref safely makes that branch-local intent unreachable. The next heal
+/// must audit/discard it instead of wedging the graph.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[serial]
+async fn branch_delete_orphans_sidecar_armed_after_initial_barrier() {
+    let _scenario = FailScenario::setup();
+    let dir = tempfile::tempdir().unwrap();
+    let uri = dir.path().to_str().unwrap().to_string();
+    let initial = helpers::init_and_load(&dir).await;
+    initial.branch_create("feature").await.unwrap();
+    drop(initial);
+    let delete_db = std::sync::Arc::new(Omnigraph::open(&uri).await.unwrap());
+    let writer_db = Omnigraph::open(&uri).await.unwrap();
+
+    let branch_rv =
+        helpers::failpoint::Rendezvous::park_first(names::BRANCH_CONTROL_POST_RECOVERY_BARRIER);
+    let delete_handle = std::sync::Arc::clone(&delete_db);
+    let delete_task = tokio::spawn(async move { delete_handle.branch_delete("feature").await });
+    branch_rv.wait_until_reached().await;
+
+    {
+        let _fp = ScopedFailPoint::new(names::MUTATION_POST_FINALIZE_PRE_PUBLISHER, "return");
+        writer_db
+            .mutate(
+                "feature",
+                MUTATION_QUERIES,
+                "insert_person",
+                &mixed_params(&[("$name", "late-sidecar")], &[("$age", 23)]),
+            )
+            .await
+            .expect_err("writer must leave a confirmed sidecar in the branch-control gap");
+    }
+    branch_rv.release();
+    delete_task.await.unwrap().unwrap();
+    assert!(
+        !delete_db
+            .branch_list()
+            .await
+            .unwrap()
+            .iter()
+            .any(|branch| branch == "feature"),
+        "branch delete must remove the authority that made the sidecar reachable"
+    );
+    assert_eq!(
+        std::fs::read_dir(dir.path().join("__recovery"))
+            .unwrap()
+            .count(),
+        1,
+        "delete leaves the orphaned intent for the audited recovery path"
+    );
+    writer_db
+        .mutate(
+            "main",
+            MUTATION_QUERIES,
+            "insert_person",
+            &mixed_params(&[("$name", "after-delete")], &[("$age", 24)]),
+        )
+        .await
+        .expect("the next write must discard the dead-branch sidecar and proceed");
+    assert_eq!(
+        std::fs::read_dir(dir.path().join("__recovery"))
+            .unwrap()
+            .count(),
+        0,
+        "orphan-discard recovery must retire the late sidecar"
+    );
+}
+
+async fn setup_diverged_merge_branches(dir: &tempfile::TempDir) -> (String, usize) {
+    let uri = dir.path().to_str().unwrap().to_string();
+    let db = helpers::init_and_load(dir).await;
+    let main_rows = helpers::count_rows(&db, "node:Person").await;
+    db.branch_create("source").await.unwrap();
+    db.branch_create("target").await.unwrap();
+    db.mutate(
+        "source",
+        MUTATION_QUERIES,
+        "insert_person",
+        &mixed_params(&[("$name", "source-only")], &[("$age", 34)]),
+    )
+    .await
+    .unwrap();
+    db.mutate(
+        "target",
+        MUTATION_QUERIES,
+        "insert_person",
+        &mixed_params(&[("$name", "old-target-only")], &[("$age", 35)]),
+    )
+    .await
+    .unwrap();
+    drop(db);
+    (uri, main_rows)
+}
+
+/// A branch merge captures source/target authority before it builds a plan.
+/// Once captured, native target delete+recreate must not reuse the same name
+/// underneath that plan: both operations join the root-shared schema -> branch
+/// gate order, so the control operation linearizes after the merge.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[serial]
+async fn branch_merge_fences_target_delete_recreate_aba() {
+    let _scenario = FailScenario::setup();
+    let dir = tempfile::tempdir().unwrap();
+    let (uri, main_rows) = setup_diverged_merge_branches(&dir).await;
+
+    // A recreated Lance ref can reuse the same branch name and numeric
+    // version; BranchIdentifier is the incarnation component that prevents
+    // that pair from masquerading as the authority captured by the merge.
+    let person_uri = node_table_uri(&uri, "Person");
+    let old_target = lance::Dataset::open(&person_uri)
+        .await
+        .unwrap()
+        .checkout_branch("target")
+        .await
+        .unwrap();
+    let old_target_version = old_target.version().version;
+    let old_target_identifier = old_target.branch_identifier().await.unwrap();
+
+    // Open both handles before the merge takes the schema gate. Open itself
+    // captures one coherent schema contract under that gate.
+    let merge_db = std::sync::Arc::new(Omnigraph::open(&uri).await.unwrap());
+    let control_db = std::sync::Arc::new(Omnigraph::open(&uri).await.unwrap());
+
+    let merge_rv =
+        helpers::failpoint::Rendezvous::park_first(names::BRANCH_MERGE_POST_AUTHORITY_CAPTURE);
+    let control_rv =
+        helpers::failpoint::Rendezvous::park_first(names::BRANCH_CONTROL_POST_RECOVERY_BARRIER);
+
+    let merge_handle = std::sync::Arc::clone(&merge_db);
+    let merge_task = tokio::spawn(async move {
+        merge_handle.branch_merge("source", "target").await
+    });
+    merge_rv.wait_until_reached().await;
+
+    let control_handle = std::sync::Arc::clone(&control_db);
+    let mut control_task = tokio::spawn(async move {
+        control_handle.branch_delete("target").await?;
+        control_handle.branch_create("target").await?;
+        control_handle
+            .mutate(
+                "target",
+                MUTATION_QUERIES,
+                "insert_person",
+                &mixed_params(&[("$name", "replacement-only")], &[("$age", 36)]),
+            )
+            .await?;
+        Ok::<(), OmniError>(())
+    });
+    control_rv.wait_until_reached().await;
+    control_rv.release();
+
+    // The control task is known to be immediately before its gate acquisition.
+    // It must remain blocked while merge holds the target-incarnation gate.
+    let control_blocked = tokio::time::timeout(
+        std::time::Duration::from_millis(250),
+        &mut control_task,
+    )
+    .await
+    .is_err();
+    let target_unchanged_while_parked = lance::Dataset::open(&person_uri)
+        .await
+        .unwrap()
+        .checkout_branch("target")
+        .await
+        .unwrap()
+        .branch_identifier()
+        .await
+        .unwrap()
+        == old_target_identifier;
+    // Always release before assertions so a failed oracle cannot strand the
+    // parked callback thread for its 30-second safety bound.
+    merge_rv.release();
+    assert!(
+        control_blocked,
+        "target delete+recreate crossed a merge authority window (branch-name ABA)"
+    );
+    assert!(
+        target_unchanged_while_parked,
+        "the target ref incarnation changed while merge authority was parked"
+    );
+
+    let outcome = merge_task.await.unwrap().unwrap();
+    assert_eq!(outcome, omnigraph::db::MergeOutcome::Merged);
+    control_task.await.unwrap().unwrap();
+
+    let reopened = Omnigraph::open(&uri).await.unwrap();
+    assert_eq!(
+        helpers::count_rows_branch(&reopened, "source", "node:Person").await,
+        main_rows + 1,
+        "source branch retains the source-only row"
+    );
+    assert_eq!(
+        helpers::count_rows_branch(&reopened, "target", "node:Person").await,
+        main_rows + 1,
+        "the recreated target must contain only main plus its replacement row"
+    );
+    let target_names = helpers::collect_column_strings(
+        &helpers::read_table_branch(&reopened, "target", "node:Person").await,
+        "name",
+    );
+    assert!(
+        target_names.iter().any(|name| name == "replacement-only")
+            && !target_names.iter().any(|name| name == "source-only")
+            && !target_names.iter().any(|name| name == "old-target-only"),
+        "recreated target leaked state from the deleted target incarnation: {target_names:?}"
+    );
+    let new_target = lance::Dataset::open(&person_uri)
+        .await
+        .unwrap()
+        .checkout_branch("target")
+        .await
+        .unwrap();
+    assert_ne!(
+        new_target.branch_identifier().await.unwrap(),
+        old_target_identifier,
+        "delete+recreate must mint a new target incarnation"
+    );
+    assert_eq!(
+        new_target.version().version,
+        old_target_version,
+        "the regression fixture must exercise same-name/same-version ABA"
+    );
+}
+
+/// `sync_branch` replaces a handle's active coordinator. It must join the same
+/// schema authority gate held by branch merge, otherwise it can overwrite the
+/// temporary target coordinator inside merge's swap -> publish -> restore
+/// window and redirect physical effects or the merge commit.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[serial]
+async fn branch_merge_fences_concurrent_sync_on_same_handle() {
+    let _scenario = FailScenario::setup();
+    let dir = tempfile::tempdir().unwrap();
+    let (uri, main_rows) = setup_diverged_merge_branches(&dir).await;
+    let db = Omnigraph::open(&uri).await.unwrap();
+    db.branch_create("other").await.unwrap();
+    let db = std::sync::Arc::new(db);
+    let merge_rv =
+        helpers::failpoint::Rendezvous::park_first(names::BRANCH_MERGE_POST_AUTHORITY_CAPTURE);
+
+    let merge_handle = std::sync::Arc::clone(&db);
+    let merge_task = tokio::spawn(async move {
+        merge_handle.branch_merge("source", "target").await
+    });
+    merge_rv.wait_until_reached().await;
+
+    let sync_handle = std::sync::Arc::clone(&db);
+    let mut sync_task = tokio::spawn(async move { sync_handle.sync_branch("other").await });
+    let sync_blocked = tokio::time::timeout(
+        std::time::Duration::from_millis(250),
+        &mut sync_task,
+    )
+    .await
+    .is_err();
+    merge_rv.release();
+    assert!(
+        sync_blocked,
+        "sync replaced the active coordinator inside merge's authority window"
+    );
+
+    assert_eq!(
+        merge_task.await.unwrap().unwrap(),
+        omnigraph::db::MergeOutcome::Merged
+    );
+    sync_task.await.unwrap().unwrap();
+    assert_eq!(
+        helpers::count_rows_branch(&db, "target", "node:Person").await,
+        main_rows + 2,
+        "merge must publish both divergent rows to target before sync takes effect"
+    );
+}
+
+/// The post-table-gate merge check must read storage, not the swapped
+/// coordinator's cached snapshot. Advance only the target manifest while merge
+/// is parked after authority capture; the table version itself stays unchanged,
+/// so only a fresh manifest-incarnation comparison catches the stale plan.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[serial]
+async fn branch_merge_rejects_fresh_target_manifest_change_before_effects() {
+    let _scenario = FailScenario::setup();
+    let dir = tempfile::tempdir().unwrap();
+    let (uri, _) = setup_diverged_merge_branches(&dir).await;
+    let merge_db = std::sync::Arc::new(Omnigraph::open(&uri).await.unwrap());
+    let mut target_writer = Omnigraph::open(&uri).await.unwrap();
+    let merge_rv =
+        helpers::failpoint::Rendezvous::park_first(names::BRANCH_MERGE_POST_AUTHORITY_CAPTURE);
+
+    let merge_handle = std::sync::Arc::clone(&merge_db);
+    let merge_task = tokio::spawn(async move {
+        merge_handle.branch_merge("source", "target").await
+    });
+    merge_rv.wait_until_reached().await;
+
+    let before = helpers::version_branch(&merge_db, "target").await.unwrap();
+    // Advance the target's physical HEAD without changing row content, then
+    // publish that new pin through the legacy test seam. The merge handle's
+    // cached target snapshot remains at `before`.
+    let person_uri = node_table_uri(&uri, "Person");
+    let mut raw_target = lance::Dataset::open(&person_uri)
+        .await
+        .unwrap()
+        .checkout_branch("target")
+        .await
+        .unwrap();
+    helpers::lance_delete_inline(&mut raw_target, "1 = 2").await;
+    let publish_result = target_writer
+        .failpoint_publish_table_head_without_index_rebuild_for_test(
+            "target",
+            "node:Person",
+            Some("target"),
+        )
+        .await;
+    let after_result = helpers::version_branch(&target_writer, "target").await;
+    // Release before asserting fixture setup so an unexpected setup error does
+    // not strand the parked callback thread.
+    merge_rv.release();
+    publish_result.unwrap();
+    let after = after_result.unwrap();
+    assert!(after > before, "fixture must advance the target manifest");
+
+    let error = merge_task
+        .await
+        .unwrap()
+        .expect_err("merge must discard a plan prepared from the old target manifest");
+    let OmniError::Manifest(manifest_error) = error else {
+        panic!("expected a typed read-set conflict");
+    };
+    assert!(matches!(
+        manifest_error.details,
+        Some(omnigraph::error::ManifestConflictDetails::ReadSetChanged {
+            ref member,
+            ..
+        }) if member == "branch_merge_target:target"
+    ));
+    assert!(
+        !dir.path().join("__recovery").exists()
+            || std::fs::read_dir(dir.path().join("__recovery"))
+                .unwrap()
+                .next()
+                .is_none(),
+        "pre-effect revalidation must fail before merge arms recovery"
+    );
+}
+
+/// Source is a captured immutable input, not part of the target publisher's
+/// atomic read set. A later commit on the same source incarnation must not make
+/// the merge substitute the newer source head (or reject an otherwise-valid
+/// captured snapshot).
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[serial]
+async fn branch_merge_source_advance_keeps_captured_source_parent() {
+    let _scenario = FailScenario::setup();
+    let dir = tempfile::tempdir().unwrap();
+    let (uri, main_rows) = setup_diverged_merge_branches(&dir).await;
+    let merge_db = std::sync::Arc::new(Omnigraph::open(&uri).await.unwrap());
+    let mut source_writer = Omnigraph::open(&uri).await.unwrap();
+    let captured_source_head = branch_head_commit_id(dir.path(), "source").await.unwrap();
+    let merge_rv =
+        helpers::failpoint::Rendezvous::park_first(names::BRANCH_MERGE_POST_AUTHORITY_CAPTURE);
+
+    let merge_handle = std::sync::Arc::clone(&merge_db);
+    let merge_task = tokio::spawn(async move {
+        merge_handle.branch_merge("source", "target").await
+    });
+    merge_rv.wait_until_reached().await;
+
+    // Model a foreign source writer without changing row content: advance the
+    // source table HEAD with a no-op delete, then publish it through the
+    // queue-bypassing seam. The source branch incarnation remains unchanged.
+    let person_uri = node_table_uri(&uri, "Person");
+    let mut raw_source = lance::Dataset::open(&person_uri)
+        .await
+        .unwrap()
+        .checkout_branch("source")
+        .await
+        .unwrap();
+    helpers::lance_delete_inline(&mut raw_source, "1 = 2").await;
+    source_writer
+        .failpoint_publish_table_head_without_index_rebuild_for_test(
+            "source",
+            "node:Person",
+            Some("source"),
+        )
+        .await
+        .unwrap();
+    let advanced_source_head = branch_head_commit_id(dir.path(), "source").await.unwrap();
+    assert_ne!(advanced_source_head, captured_source_head);
+    merge_rv.release();
+
+    assert_eq!(
+        merge_task.await.unwrap().unwrap(),
+        omnigraph::db::MergeOutcome::Merged
+    );
+    let reopened = Omnigraph::open(&uri).await.unwrap();
+    assert_eq!(
+        helpers::count_rows_branch(&reopened, "target", "node:Person").await,
+        main_rows + 2
+    );
+    let target_head = branch_head_commit_id(dir.path(), "target").await.unwrap();
+    let merge_commit = reopened.get_commit(&target_head).await.unwrap();
+    assert_eq!(
+        merge_commit.merged_parent_commit_id.as_deref(),
+        Some(captured_source_head.as_str()),
+        "merge lineage must name the source commit captured before planning"
+    );
+    assert_ne!(
+        merge_commit.merged_parent_commit_id.as_deref(),
+        Some(advanced_source_head.as_str()),
+        "a later source head must never be substituted at publish time"
+    );
+}
+
+async fn assert_branch_merge_first_touch_ref_is_recovered(
+    failpoint: &str,
+    ref_exists_before_recovery: bool,
+) {
+    let dir = tempfile::tempdir().unwrap();
+    let uri = dir.path().to_str().unwrap().to_string();
+    let db = helpers::init_and_load(&dir).await;
+    let main_rows = helpers::count_rows(&db, "node:Person").await;
+    db.branch_create("source").await.unwrap();
+    db.branch_create("target").await.unwrap();
+    db.mutate(
+        "source",
+        MUTATION_QUERIES,
+        "insert_person",
+        &mixed_params(&[("$name", "source-first-touch")], &[("$age", 37)]),
+    )
+    .await
+    .unwrap();
+
+    let person_uri = node_table_uri(&uri, "Person");
+    let person = lance::Dataset::open(&person_uri).await.unwrap();
+    assert!(
+        !person.list_branches().await.unwrap().contains_key("target"),
+        "fixture requires the target table ref to be lazy"
+    );
+
+    let error = {
+        let _failpoint = ScopedFailPoint::new(failpoint, "return");
+        db.branch_merge("source", "target").await.unwrap_err()
+    };
+    let operation_id = match error {
+        OmniError::RecoveryRequired { operation_id, .. } => operation_id,
+        other => panic!("first-touch failure must retain recovery ownership: {other}"),
+    };
+    let sidecar_path = dir
+        .path()
+        .join("__recovery")
+        .join(format!("{operation_id}.json"));
+    let sidecar: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(&sidecar_path).unwrap()).unwrap();
+    assert_eq!(sidecar["schema_version"], 4);
+    assert_eq!(
+        sidecar["protocol_v4"]["effects"][0]["kind"]["kind"],
+        "RefOnlyFork"
+    );
+
+    let person = lance::Dataset::open(&person_uri).await.unwrap();
+    assert_eq!(
+        person.list_branches().await.unwrap().contains_key("target"),
+        ref_exists_before_recovery,
+        "fixture must stop at the intended sidecar/ref boundary"
+    );
+    drop(db);
+
+    let recovered = Omnigraph::open(&uri).await.unwrap();
+    assert!(!sidecar_path.exists());
+    let person = lance::Dataset::open(&person_uri).await.unwrap();
+    assert!(
+        !person.list_branches().await.unwrap().contains_key("target"),
+        "Full recovery must reclaim an unpublished first-touch target ref"
+    );
+    assert_eq!(
+        helpers::count_rows_branch(&recovered, "target", "node:Person").await,
+        main_rows,
+        "failed first-touch merge must leave target inheriting its old image"
+    );
+
+    assert_eq!(
+        recovered.branch_merge("source", "target").await.unwrap(),
+        omnigraph::db::MergeOutcome::FastForward
+    );
+    assert_eq!(
+        helpers::count_rows_branch(&recovered, "target", "node:Person").await,
+        main_rows + 1
+    );
+}
+
+#[tokio::test]
+#[serial(branch_merge_first_touch)]
+async fn branch_merge_sidecar_precedes_first_touch_target_ref() {
+    let _scenario = FailScenario::setup();
+    assert_branch_merge_first_touch_ref_is_recovered(
+        names::BRANCH_MERGE_POST_SIDECAR_PRE_FORK,
+        false,
+    )
+    .await;
+}
+
+#[tokio::test]
+#[serial(branch_merge_first_touch)]
+async fn branch_merge_recovers_ambiguous_first_touch_ref_creation() {
+    let _scenario = FailScenario::setup();
+    assert_branch_merge_first_touch_ref_is_recovered(names::FORK_POST_CREATE_PRE_OPEN, true).await;
+}
+
+/// A legacy writer can arm a relevant sidecar after merge's initial recovery
+/// barrier. Merge acquires the complete source/target table envelope and lists
+/// again before Phase A, so the late intent blocks it even when no table HEAD
+/// moved and a version-only check would pass.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[serial]
+async fn branch_merge_rechecks_late_sidecar_after_table_gates() {
+    let _scenario = FailScenario::setup();
+    let dir = tempfile::tempdir().unwrap();
+    let (uri, main_rows) = setup_diverged_merge_branches(&dir).await;
+    let merge_db = std::sync::Arc::new(Omnigraph::open(&uri).await.unwrap());
+    let merge_rv =
+        helpers::failpoint::Rendezvous::park_first(names::BRANCH_MERGE_POST_AUTHORITY_CAPTURE);
+
+    let merge_handle = std::sync::Arc::clone(&merge_db);
+    let merge_task = tokio::spawn(async move {
+        merge_handle.branch_merge("source", "target").await
+    });
+    merge_rv.wait_until_reached().await;
+
+    const OPERATION_ID: &str = "01H000000000000000000LATE";
+    let recovery_dir = dir.path().join("__recovery");
+    std::fs::create_dir_all(&recovery_dir).unwrap();
+    std::fs::write(
+        recovery_dir.join(format!("{OPERATION_ID}.json")),
+        serde_json::to_string_pretty(&serde_json::json!({
+            "schema_version": 1,
+            "operation_id": OPERATION_ID,
+            "started_at": "0",
+            "branch": "target",
+            "actor_id": null,
+            "writer_kind": "EnsureIndices",
+            "tables": []
+        }))
+        .unwrap(),
+    )
+    .unwrap();
+
+    merge_rv.release();
+    let error = merge_task
+        .await
+        .unwrap()
+        .expect_err("late recovery ownership must block merge before effects");
+    assert!(matches!(
+        error,
+        OmniError::RecoveryRequired {
+            ref operation_id,
+            ..
+        } if operation_id == OPERATION_ID
+    ));
+    assert_eq!(
+        helpers::count_rows_branch(&merge_db, "target", "node:Person").await,
+        main_rows + 1,
+        "blocked merge must leave the target image unchanged"
+    );
+}
+
+/// Cleanup's fast sidecar probe is only an optimization. A writer can fail
+/// after that probe; the schema/branch/table GC envelope and final recheck must
+/// refuse before Lance can delete recovery history.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[serial]
+async fn cleanup_rechecks_sidecars_under_gc_gates() {
+    let _scenario = FailScenario::setup();
+    let dir = tempfile::tempdir().unwrap();
+    let uri = dir.path().to_str().unwrap().to_string();
+    drop(helpers::init_and_load(&dir).await);
+
+    let cleanup_rv = helpers::failpoint::Rendezvous::park_first(
+        names::CLEANUP_POST_RECOVERY_CHECK_PRE_GATES,
+    );
+    let cleanup_uri = uri.clone();
+    let cleanup_task = tokio::spawn(async move {
+        let mut db = Omnigraph::open(&cleanup_uri).await.unwrap();
+        db.cleanup(omnigraph::db::CleanupPolicyOptions {
+            keep_versions: Some(1),
+            older_than: None,
+        })
+        .await
+    });
+    cleanup_rv.wait_until_reached().await;
+
+    let writer = Omnigraph::open(&uri).await.unwrap();
+    {
+        let _fp = ScopedFailPoint::new(names::MUTATION_POST_FINALIZE_PRE_PUBLISHER, "return");
+        writer
+            .mutate(
+                "main",
+                MUTATION_QUERIES,
+                "insert_person",
+                &mixed_params(&[("$name", "gc-race")], &[("$age", 24)]),
+            )
+            .await
+            .expect_err("writer must leave a sidecar after cleanup's fast probe");
+    }
+    let person_uri = node_table_uri(&uri, "Person");
+    let before_versions = lance::Dataset::open(&person_uri)
+        .await
+        .unwrap()
+        .versions()
+        .await
+        .unwrap()
+        .len();
+    cleanup_rv.release();
+    let error = cleanup_task
+        .await
+        .unwrap()
+        .expect_err("authoritative under-gate check must refuse cleanup");
+    assert!(error.to_string().contains("after acquiring its GC gates"));
+    assert_eq!(
+        lance::Dataset::open(&person_uri)
+            .await
+            .unwrap()
+            .versions()
+            .await
+            .unwrap()
+            .len(),
+        before_versions,
+        "refused cleanup must not delete any recovery version history"
+    );
+}
+
+/// Full recovery must classify the sidecar body it re-reads after discovery,
+/// not the stale parsed copy from its directory listing. Branch merge now holds
+/// the schema gate for its complete authority window, so a second open cannot
+/// discover its live sidecar underneath it. Instead, leave a confirmed crash
+/// residual, park recovery after discovery, change that body to the valid
+/// unconfirmed crash shape, and require the fresh body to drive rollback.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[serial]
+async fn full_recovery_rereads_sidecar_body_after_discovery() {
+    let _scenario = FailScenario::setup();
+    let dir = tempfile::tempdir().unwrap();
+    let uri = dir.path().to_str().unwrap().to_string();
+    let db = helpers::init_and_load(&dir).await;
+    db.branch_create("feature").await.unwrap();
+    db.mutate(
+        "feature",
+        MUTATION_QUERIES,
+        "insert_person",
+        &mixed_params(&[("$name", "merge-feature")], &[("$age", 31)]),
+    )
+    .await
+    .unwrap();
+    db.mutate(
+        "main",
+        MUTATION_QUERIES,
+        "insert_person",
+        &mixed_params(&[("$name", "merge-main")], &[("$age", 32)]),
+    )
+    .await
+    .unwrap();
+    drop(db);
+
+    {
+        let _publish_failure = ScopedFailPoint::new(
+            names::BRANCH_MERGE_POST_PHASE_B_PRE_MANIFEST_COMMIT,
+            "return",
+        );
+        Omnigraph::open(&uri)
+            .await
+            .unwrap()
+            .branch_merge("feature", "main")
+            .await
+            .expect_err("merge must leave a confirmed pre-publish sidecar");
+    }
+
+    let recovery_rv =
+        helpers::failpoint::Rendezvous::park_first(names::RECOVERY_POST_LIST_PRE_GATES);
+    let recovery_uri = uri.clone();
+    let recovery_task = tokio::spawn(async move { Omnigraph::open(&recovery_uri).await });
+    recovery_rv.wait_until_reached().await;
+
+    let operation_id = single_sidecar_operation_id(dir.path());
+    let sidecar_path = dir
+        .path()
+        .join("__recovery")
+        .join(format!("{operation_id}.json"));
+    let mut sidecar: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(&sidecar_path).unwrap()).unwrap();
+    let tables = sidecar["tables"]
+        .as_array_mut()
+        .expect("branch-merge sidecar tables must be an array");
+    assert!(
+        tables.iter().any(|table| !table["confirmed_version"].is_null()),
+        "fixture must begin with a confirmed BranchMerge residual"
+    );
+    for table in tables {
+        table["confirmed_version"] = serde_json::Value::Null;
+    }
+    let protocol = sidecar["protocol_v4"]
+        .as_object_mut()
+        .expect("branch-merge sidecar must carry protocol_v4");
+    protocol.insert(
+        "effect_phase".to_string(),
+        serde_json::Value::String("Armed".to_string()),
+    );
+    for effect in protocol["effects"]
+        .as_array_mut()
+        .expect("branch-merge effects must be an array")
+    {
+        effect["kind"]["confirmed_version"] = serde_json::Value::Null;
+        effect["kind"]["confirmed_branch_identifier"] = serde_json::Value::Null;
+    }
+    for slot in protocol["intended_delta"]["table_updates"]
+        .as_array_mut()
+        .expect("branch-merge delta slots must be an array")
+    {
+        slot["confirmed"] = serde_json::Value::Null;
+    }
+    std::fs::write(
+        &sidecar_path,
+        serde_json::to_string_pretty(&sidecar).unwrap(),
+    )
+    .unwrap();
+
+    recovery_rv.release();
+    let recovered = recovery_task
+        .await
+        .unwrap()
+        .expect("full recovery must consume the freshly re-read body");
+    assert_eq!(
+        helpers::count_rows(&recovered, "node:Person").await,
+        5,
+        "fresh unconfirmed sidecar must roll the interrupted merge back; stale discovery would expose six rows"
+    );
 }
