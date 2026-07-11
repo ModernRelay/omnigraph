@@ -158,8 +158,9 @@ and between delete authority removal and directory cleanup.
 > already-durable writer sidecar. Coverage includes flat and named-source
 > clone-only recovery, invalid-name-before-clone, lost acknowledgements,
 > absent-ref/tree-present delete, same-identifier error preservation,
-> recreated-identifier refusal, path-prefix collision/legacy leaf-first delete,
-> and no manifest-version/lineage movement.
+> recreated-identifier refusal, path-prefix collision, legacy no-effect
+> leaf-first delete, mixed-effect rollback fail-closed behavior, and no
+> manifest-version/lineage movement.
 
 ### BLOCKER-02 — create-if-absent ownership is not a fencing lease
 

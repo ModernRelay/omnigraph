@@ -937,6 +937,177 @@ async fn armed_first_touch_recovery_defers_legacy_path_overlap_until_leaf_delete
 
 #[tokio::test]
 #[serial]
+async fn partial_first_touch_recovery_fails_closed_on_legacy_path_overlap() {
+    let _scenario = FailScenario::setup();
+    let dir = tempfile::tempdir().unwrap();
+    let uri = dir.path().to_str().unwrap().to_string();
+    let db = helpers::init_and_load(&dir).await;
+    let main_person_rows = helpers::count_rows(&db, "node:Person").await;
+    let main_edge_rows = helpers::count_rows(&db, "edge:Knows").await;
+
+    let main_snapshot = db.snapshot_of("main").await.unwrap();
+    let table_pins = ["node:Person", "edge:Knows"]
+        .into_iter()
+        .map(|table_key| {
+            let entry = main_snapshot.entry(table_key).unwrap();
+            (
+                table_key.to_string(),
+                format!("{uri}/{}", entry.table_path),
+                entry.table_version,
+            )
+        })
+        .collect::<Vec<_>>();
+
+    db.branch_create("feature").await.unwrap();
+    let operation_id = {
+        let _failpoint = ScopedFailPoint::new(names::MUTATION_POST_TABLE_COMMIT, "return");
+        let error = db
+            .mutate(
+                "feature",
+                MUTATION_QUERIES,
+                "insert_person_and_friend",
+                &mixed_params(
+                    &[("$name", "Ancestor"), ("$friend", "Alice")],
+                    &[("$age", 23)],
+                ),
+            )
+            .await
+            .expect_err("the first exact table effect must leave a partial v3 intent");
+        match error {
+            OmniError::RecoveryRequired { operation_id, .. } => operation_id,
+            other => panic!("expected RecoveryRequired, got {other}"),
+        }
+    };
+    assert_eq!(single_sidecar_operation_id(dir.path()), operation_id);
+
+    // All deferred first-touch refs are created before the table-commit loop.
+    // Staging order is intentionally non-semantic, so either table may own the
+    // one durable effect while its sibling remains at the exact fork point.
+    let mut head_deltas = Vec::new();
+    let mut heads_before_open = Vec::new();
+    for (table_key, table_uri, expected_version) in &table_pins {
+        let mut root = lance::Dataset::open(table_uri).await.unwrap();
+        let branches = root.list_branches().await.unwrap();
+        assert!(
+            branches.contains_key("feature"),
+            "precondition: {table_key} has its armed first-touch ref"
+        );
+        let head = root
+            .checkout_branch("feature")
+            .await
+            .unwrap()
+            .version()
+            .version;
+        heads_before_open.push((table_key.clone(), head));
+        head_deltas.push(head.checked_sub(*expected_version).unwrap());
+
+        // Forge the legacy namespace only after the partial effect exists. New
+        // OmniGraph versions reject this path-prefix overlap at branch create,
+        // but old stores can contain it. Clone from the exact feature HEAD so
+        // the child itself introduces no extra ancestor movement.
+        root.create_branch("feature/child", ("feature", head), None)
+            .await
+            .unwrap();
+    }
+    head_deltas.sort_unstable();
+    assert_eq!(
+        head_deltas,
+        vec![0, 1],
+        "exactly one table effect must be durable while its sibling remains an untouched fork"
+    );
+
+    let mut manifest = lance::Dataset::open(&format!("{uri}/__manifest"))
+        .await
+        .unwrap();
+    let feature_manifest_version = manifest
+        .checkout_branch("feature")
+        .await
+        .unwrap()
+        .version()
+        .version;
+    manifest
+        .create_branch("feature/child", ("feature", feature_manifest_version), None)
+        .await
+        .unwrap();
+    drop(manifest);
+
+    let open_error = match Omnigraph::open(&uri).await {
+        Ok(_) => panic!(
+            "Full recovery must not return a writable handle while owned effects remain unrolled"
+        ),
+        Err(error) => error,
+    };
+    assert!(
+        open_error.to_string().contains("owns physical effects")
+            && open_error.to_string().contains("feature/child"),
+        "failure must explain the safe leaf-first remediation boundary: {open_error}"
+    );
+    assert!(
+        dir.path()
+            .join("__recovery")
+            .join(format!("{operation_id}.json"))
+            .exists(),
+        "failed Full recovery must retain exact ownership"
+    );
+    let manifest_after_failed_open = lance::Dataset::open(&format!("{uri}/__manifest"))
+        .await
+        .unwrap()
+        .checkout_branch("feature")
+        .await
+        .unwrap()
+        .version()
+        .version;
+    assert_eq!(
+        manifest_after_failed_open, feature_manifest_version,
+        "failed rollback preflight must not publish the manifest"
+    );
+    for ((table_key, table_uri, _), (_, before)) in table_pins.iter().zip(heads_before_open.iter())
+    {
+        let root = lance::Dataset::open(table_uri).await.unwrap();
+        let after = root
+            .checkout_branch("feature")
+            .await
+            .unwrap()
+            .version()
+            .version;
+        assert_eq!(
+            after, *before,
+            "failed preflight must not restore or publish {table_key}"
+        );
+    }
+
+    // A handle that predates the interrupted attempt can remove the graph leaf
+    // under the normal branch-control gates. This fixture forged its table refs
+    // outside the manifest, so finish the documented offline leaf cleanup at
+    // Lance level. Once the physical overlap is gone, the next quiesced Full
+    // sweep can compensate the owned effect atomically.
+    db.branch_delete("feature/child").await.unwrap();
+    for (_, table_uri, _) in &table_pins {
+        lance::Dataset::open(table_uri)
+            .await
+            .unwrap()
+            .force_delete_branch("feature/child")
+            .await
+            .unwrap();
+    }
+    drop(db);
+
+    let recovered = Omnigraph::open(&uri)
+        .await
+        .expect("rollback must converge after leaf-first remediation");
+    assert!(helpers::recovery::sidecar_operation_ids(dir.path()).is_empty());
+    assert_eq!(
+        helpers::count_rows_branch(&recovered, "feature", "node:Person").await,
+        main_person_rows
+    );
+    assert_eq!(
+        helpers::count_rows_branch(&recovered, "feature", "edge:Knows").await,
+        main_edge_rows
+    );
+}
+
+#[tokio::test]
+#[serial]
 async fn load_without_explicit_base_does_not_add_main_to_recovery_scope() {
     let _scenario = FailScenario::setup();
     let dir = tempfile::tempdir().unwrap();

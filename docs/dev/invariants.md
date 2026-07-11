@@ -177,10 +177,15 @@ This is the same shape as invariant 7 (indexes are derived state); prefer it
 over a recovery-sidecar-style approach for metadata work whose logical target
 is fully derivable from one existing authority. A graph-visible table effect is
 different and still requires durable ownership before it can advance HEAD.
-For legacy path-prefix overlaps, an ancestor clone-only first-touch tree is not
-proven unreachable while a live child remains: Full recovery therefore leaves
-its sidecar intact, allows the graph to open for leaf-first child deletion, and
-reclaims the ancestor on the next Full sweep.
+For legacy path-prefix overlaps, an ancestor first-touch tree is not proven
+unreachable while a live child remains. Full recovery may leave the sidecar
+intact and allow the graph to open for leaf-first child deletion **only when the
+intent owns no physical table effect**. If the same sidecar owns any durable
+effect, cleanup is part of an all-or-nothing rollback: read-write open fails
+closed until the child is removed through an existing handle or an offline
+Lance-level branch tool, then the next Full sweep reclaims the untouched fork and
+compensates the owned effect. Returning a writable handle with that rollback
+incomplete would let a legacy writer prepare from unresolved physical state.
 
 ## Known Gaps
 

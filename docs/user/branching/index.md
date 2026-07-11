@@ -25,10 +25,15 @@ processes must not concurrently control branches on the same graph.
 
 For a legacy graph that already contains path-prefix-overlapping live names,
 recovery also preserves the leaf-first escape hatch. If read-write open finds an
-unresolved first-touch sidecar for an ancestor clone-only table while a live
-path-child remains, it leaves that sidecar in place and completes the open rather
-than deleting the child's storage. Delete the descendant branch leaf-first; the
-next read-write open reclaims the ancestor residue and retires the sidecar.
+unresolved first-touch sidecar for an ancestor table fork while a live path-child
+remains, it never deletes the child's storage. When the interrupted write owns no
+table effect, it leaves the sidecar in place and completes the open so you can
+delete the descendant branch leaf-first. When the same sidecar owns a partial
+table effect, open fails closed because cleanup and rollback must finish together;
+remove the descendant through an already-open handle or an offline Lance-level
+branch tool, then reopen. The next read-write open reclaims the ancestor residue,
+rolls back the partial effect, and retires the sidecar. `omnigraph repair` is not
+that offline tool: it correctly refuses to run while a recovery sidecar is pending.
 
 ## L2 — Commit graph
 

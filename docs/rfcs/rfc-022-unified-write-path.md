@@ -569,11 +569,16 @@ intent's clone-only zombie before retiring the intent.
 
 One compatibility case deliberately defers that cleanup. A legacy graph may
 already contain path-prefix-overlapping live names. If an unresolved first-touch
-intent targets an ancestor clone-only table tree while a live path-child still
-exists, Full recovery leaves the sidecar durable instead of recursively deleting
-the child's storage. The read-write open completes so the operator can delete the
-live descendant leaf-first; the next Full recovery then reclaims the ancestor tree
-and retires the sidecar.
+intent targets an ancestor table tree while a live path-child still exists, Full
+recovery leaves the sidecar durable instead of recursively deleting the child's
+storage. Read-write open may complete for leaf-first remediation only when the
+intent owns no physical table effect. If a multi-table attempt owns any effect
+while another untouched fork is blocked by the child, rollback is
+complete-or-error: open fails closed, the sidecar remains authoritative, and an
+existing handle or offline Lance-level branch tool must remove the descendant
+before the next Full recovery reclaims the untouched fork, compensates the owned
+effect, and retires the sidecar. This distinction prevents legacy writers outside
+the v3 barrier from preparing against an unresolved partial rollback.
 
 Delete has one recovery disposition that create does not: after the complete
 schema/target-branch/all-table gate set has waited out any live in-process owner,
@@ -778,6 +783,11 @@ writers.
   reclaims best-effort; same identifier preserves the native error; a recreated
   identifier is a typed conflict and survives; neither direction advances a
   manifest version or emits graph lineage.
+- First-touch recovery with legacy path overlap: a proven no-effect intent may
+  defer clone-only ancestor cleanup and return an open handle for leaf-first
+  remediation; a mixed multi-table intent with one owned effect and one blocked
+  untouched fork must fail read-write open, retain the sidecar without restoring
+  or publishing, and converge after offline Lance-level leaf cleanup.
 
 ### 11.5 Cost gates
 

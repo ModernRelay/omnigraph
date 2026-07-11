@@ -102,6 +102,11 @@ pub mod names {
     /// After every deferred first-touch table ref is created under a durable
     /// v3 sidecar, before any staged data transaction advances target HEAD.
     pub const MUTATION_POST_FORK_PRE_COMMIT: &str = "mutation.post_fork_pre_commit";
+    /// After each exact staged table transaction advances HEAD, before the next
+    /// table effect or Phase-B confirmation. Used to leave a real partial
+    /// multi-table v3 attempt whose remaining first-touch fork still needs
+    /// recovery cleanup.
+    pub const MUTATION_POST_TABLE_COMMIT: &str = "mutation.post_table_commit";
     /// After the v3 ownership sidecar is durable but before the first deferred
     /// named-table ref is created. Recovery must accept the absent target ref.
     pub const MUTATION_POST_SIDECAR_PRE_FORK: &str = "mutation.post_sidecar_pre_fork";

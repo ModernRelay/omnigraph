@@ -151,11 +151,15 @@ forks remain sidecar-owned because they are physical effects of a graph-visible
 mutation/load. Lance does not expose conditional ref create/delete, so this
 classifier is not advertised as a cross-process branch-control fence.
 
-Legacy prefix-overlap recovery is the one absent-ref case that does not prove an
-entire nested tree unreachable. If a Full sweep finds an ancestor clone-only
-first-touch target with a live path-child, it keeps the sidecar and permits open
-to complete so the child can be deleted leaf-first. A later Full sweep, after the
-child is gone, reclaims the ancestor tree and retires the intent.
+Legacy prefix-overlap recovery is the one first-touch case that does not prove an
+entire nested tree unreachable. If a Full sweep finds an ancestor first-touch
+target with a live path-child, it keeps the sidecar. Open may complete for
+leaf-first deletion only when the sidecar owns no physical table effect. A mixed
+attempt that owns an effect plus an untouched fork must roll back as one recovery
+outcome, so open fails closed while the child blocks fork cleanup. After an
+existing handle or an offline Lance-level branch tool removes the child, a later
+Full sweep reclaims the untouched fork, compensates the owned effect, and retires
+the intent.
 
 ## Read-your-writes within a multi-statement mutation
 
@@ -383,7 +387,10 @@ recovery sweep in `crates/omnigraph/src/db/manifest/recovery.rs`:
   competing claims, the current no-effect sidecar discards itself without
   touching the ref; the final survivor owns cleanup/recovery.
   During partial rollback, no-effect refs are removed before the rollback
-  outcome is published so a retry cannot strand them.
+  outcome is published so a retry cannot strand them. If a legacy live
+  path-child blocks that cleanup, rollback returns an error and read-write open
+  fails closed; only a sidecar proven to own no table effect may defer cleanup
+  while returning an open handle.
 - If any table is `InvariantViolation` (Lance HEAD < manifest pinned —
   should be impossible), **abort** with a loud error and leave the
   sidecar on disk for operator review.
