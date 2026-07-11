@@ -1962,7 +1962,6 @@
           "method_not_allowed",
           "conflict",
           "too_many_requests",
-          "service_unavailable",
           "internal"
         ]
       },

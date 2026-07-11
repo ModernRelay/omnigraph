@@ -716,13 +716,21 @@ fn error_code_schema_has_expected_variants() {
     let schema = &doc["components"]["schemas"]["ErrorCode"];
     let variants = schema["enum"].as_array().unwrap();
     let values: HashSet<&str> = variants.iter().map(|v| v.as_str().unwrap()).collect();
-    assert!(values.contains("unauthorized"));
-    assert!(values.contains("forbidden"));
-    assert!(values.contains("bad_request"));
-    assert!(values.contains("not_found"));
-    assert!(values.contains("conflict"));
-    assert!(values.contains("service_unavailable"));
-    assert!(values.contains("internal"));
+    assert_eq!(
+        values,
+        HashSet::from([
+            "unauthorized",
+            "forbidden",
+            "bad_request",
+            "not_found",
+            "method_not_allowed",
+            "conflict",
+            "too_many_requests",
+            "internal",
+        ]),
+        "ErrorCode is a rolling wire contract: new meanings belong in optional \
+         structured fields, not new closed-enum values",
+    );
 }
 
 #[test]

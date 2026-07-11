@@ -563,9 +563,6 @@ pub enum ErrorCode {
     /// 429 Too Many Requests — per-actor admission cap exceeded.
     /// Clients should respect the `Retry-After` header.
     TooManyRequests,
-    /// 503 Service Unavailable — a durable write recovery intent must be
-    /// resolved before the operation can be retried safely.
-    ServiceUnavailable,
     Internal,
 }
 

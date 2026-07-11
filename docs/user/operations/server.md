@@ -165,7 +165,7 @@ Only `/export` streams (`application/x-ndjson`, MPSC channel + `Body::from_strea
 Uniform
 `ErrorOutput { error, code?, merge_conflicts[], manifest_conflict?, read_set_conflict?, recovery_required? }`
 with
-`code ∈ unauthorized | forbidden | bad_request | not_found | method_not_allowed | conflict | too_many_requests | service_unavailable | internal`.
+`code ∈ unauthorized | forbidden | bad_request | not_found | method_not_allowed | conflict | too_many_requests | internal`.
 Merge conflicts attach structured
 `MergeConflictOutput { table_key, row_id?, kind, message }`.
 
@@ -185,6 +185,9 @@ load `overwrite` return the 409 to the caller instead of being replayed.
 `recovery_required` is set when an overlapping durable recovery intent remains
 unresolved; its table effects may or may not have started. The HTTP status is 503 and
 `RecoveryRequiredOutput { operation_id }` names the durable recovery intent.
+The optional `code` field is omitted for this response: adding a new value to
+the closed error-code enum would break older clients, while the optional
+structured field is additive and rolling-safe.
 Do not blindly resubmit the write: let a read-write open or the recovery sweep
 resolve that operation first, then retry from a fresh snapshot.
 
