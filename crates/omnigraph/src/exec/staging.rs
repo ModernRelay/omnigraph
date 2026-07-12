@@ -460,21 +460,20 @@ impl MutationStaging {
             stage_inputs.push((table_key, table, path, expected));
         }
         let concurrency = concurrency.min(stage_inputs.len()).max(1);
-        let mut staged_entries: Vec<StagedTableEntry> = futures::stream::iter(
-            stage_inputs.into_iter().map(
+        let mut staged_entries: Vec<StagedTableEntry> =
+            futures::stream::iter(stage_inputs.into_iter().map(
                 |(table_key, table, path, expected)| async move {
                     stage_pending_table(db, table_key, table, path, expected).await
                 },
-            ),
-        )
-        .buffered(concurrency)
-        .collect::<Vec<Result<Option<StagedTableEntry>>>>()
-        .await
-        .into_iter()
-        .collect::<Result<Vec<_>>>()?
-        .into_iter()
-        .flatten()
-        .collect();
+            ))
+            .buffered(concurrency)
+            .collect::<Vec<Result<Option<StagedTableEntry>>>>()
+            .await
+            .into_iter()
+            .collect::<Result<Vec<_>>>()?
+            .into_iter()
+            .flatten()
+            .collect();
 
         // Second pass: stage deletes through the same staged path. D₂
         // guarantees a delete-touched table carries no pending write batches,
@@ -508,8 +507,7 @@ impl MutationStaging {
                     .collect::<Vec<_>>()
                     .join(" OR ")
             };
-            if let Some(entry) =
-                stage_delete_table(db, table_key, combined, path, expected).await?
+            if let Some(entry) = stage_delete_table(db, table_key, combined, path, expected).await?
             {
                 staged_entries.push(entry);
             }
@@ -541,7 +539,11 @@ async fn stage_pending_table(
         PendingMode::Overwrite => crate::db::MutationOpKind::SchemaRewrite,
     };
     let ds = match path.deferred_fork.as_ref() {
-        Some(fork) => db.storage().open_snapshot_at_entry(&fork.source_entry).await?,
+        Some(fork) => {
+            db.storage()
+                .open_snapshot_at_entry(&fork.source_entry)
+                .await?
+        }
         None => {
             db.reopen_for_mutation(
                 &table_key,
@@ -675,7 +677,11 @@ async fn stage_delete_table(
     expected: u64,
 ) -> Result<Option<StagedTableEntry>> {
     let ds = match path.deferred_fork.as_ref() {
-        Some(fork) => db.storage().open_snapshot_at_entry(&fork.source_entry).await?,
+        Some(fork) => {
+            db.storage()
+                .open_snapshot_at_entry(&fork.source_entry)
+                .await?
+        }
         None => {
             db.reopen_for_mutation(
                 &table_key,
@@ -905,8 +911,7 @@ impl StagedMutation {
         // are staged like every other write, so holding the queue from before
         // `commit_staged` through the publish keeps no Lance HEAD ahead of the
         // manifest on the happy path.
-        let mut queue_keys: Vec<(String, Option<String>)> =
-            Vec::with_capacity(staged.len());
+        let mut queue_keys: Vec<(String, Option<String>)> = Vec::with_capacity(staged.len());
         for entry in &staged {
             queue_keys.push((entry.table_key.clone(), entry.path.table_branch.clone()));
         }
@@ -1007,90 +1012,19 @@ impl StagedMutation {
             }
 
             // Separate manifest-visible concurrency from uncovered Lance drift.
-            // The exact table pin already matched above; now verify that the
-            // live Lance HEAD also equals that pin. If an external raw Lance
-            // write or a pre-fix maintenance path moved HEAD without publishing
-            // `__manifest`, this write must not silently fold it.
-            //
-            // `latest_version_id` reads the latest manifest pointer off the
-            // already-open staged handle (the #2 staging open) WITHOUT a fresh
-            // `Dataset::open` — the same cheap live-HEAD probe
-            // `ManifestCoordinator::probe_latest_version` uses. This replaces a
-            // redundant `open_dataset_head` (RFC-013 step 3b, collapse
-            // #3): the drift comparison below is byte-identical; only how `head`
-            // is obtained changes (probe vs cold open).
-            let head = entry
-                .dataset
-                .dataset()
-                .latest_version_id()
-                .await
-                .map_err(|e| OmniError::Lance(e.to_string()))?;
-            if head < current {
-                return Err(OmniError::manifest_internal(format!(
-                    "table '{}' Lance HEAD version {} is behind manifest version {}",
-                    entry.table_key, head, current
-                )));
-            }
-            if head > current {
-                // Error path only: attribute covered drift to the exact
-                // recovery operation that owns it. The entry-point heal ran
-                // before this attempt was prepared, so another writer can arm
-                // and confirm a sidecar while this attempt stages reclaimable
-                // files outside the gates. Calling the healer here would be a
-                // lock-order violation: recovery acquires the same
-                // schema -> branch -> table gates we currently hold.
-                //
-                // `list_sidecars` returns URI-sorted sidecars. Use the first
-                // matching table/ref claim so attribution stays deterministic
-                // even if malformed/concurrent state contains more than one
-                // claimant. Uncovered drift (external raw Lance write or a
-                // pre-fix maintenance path) remains a generic conflict routed
-                // through `omnigraph repair`.
-                let sidecars = crate::db::manifest::list_sidecars(
-                    db.root_uri(),
-                    db.storage_adapter(),
-                )
-                .await;
-                match sidecars {
-                    Ok(sidecars) => {
-                        if let Some(owner) = sidecars.iter().find(|sidecar| {
-                            sidecar.tables.iter().any(|pin| {
-                                // Branch-aware: a sidecar pinning the same
-                                // table on another branch does not own this
-                                // branch's drift.
-                                pin.table_key == entry.table_key
-                                    && pin.table_branch == entry.path.table_branch
-                            })
-                        }) {
-                            return Err(OmniError::recovery_required(
-                                owner.operation_id.clone(),
-                                format!(
-                                    "table '{}' has Lance HEAD version {} ahead of manifest \
-                                     version {}; the pending recovery operation owns this drift",
-                                    entry.table_key, head, current,
-                                ),
-                            ));
-                        }
-                        return Err(OmniError::manifest_conflict(format!(
-                            "table '{}' has Lance HEAD version {} ahead of manifest version {}; \
-                             run `omnigraph repair` before writing",
-                            entry.table_key, head, current,
-                        )));
-                    }
-                    Err(list_err) => {
-                        let action = format!(
-                            "could not classify the drift (sidecar listing failed: {}); \
-                             run `omnigraph repair`, or reopen the graph read-write if \
-                             repair reports a pending recovery sidecar",
-                            list_err
-                        );
-                        return Err(OmniError::manifest_conflict(format!(
-                            "table '{}' has Lance HEAD version {} ahead of manifest version {}; {}",
-                            entry.table_key, head, current, action
-                        )));
-                    }
-                }
-            }
+            // The shared pre-arm check probes this already-open staged handle,
+            // attributes covered drift to its exact recovery operation, and
+            // routes uncovered drift through explicit operator repair. Keeping
+            // the rule here and in control/maintenance adapters behind one
+            // helper prevents a future writer from weakening ownership by
+            // emitting its sidecar before checking the physical baseline.
+            db.ensure_existing_effect_baseline(
+                &entry.table_key,
+                entry.path.table_branch.as_deref(),
+                current,
+                &entry.dataset,
+            )
+            .await?;
         }
         // An empty load/mutation has no independently durable table effect.
         // It may still publish its fixed lineage intent, but arming recovery
@@ -1113,10 +1047,7 @@ impl StagedMutation {
         let mut pins: Vec<SidecarTablePin> = Vec::with_capacity(staged.len());
         let mut planned_transactions = HashMap::with_capacity(staged.len());
         for entry in &staged {
-            planned_transactions.insert(
-                entry.table_key.clone(),
-                entry.planned_transaction.clone(),
-            );
+            planned_transactions.insert(entry.table_key.clone(), entry.planned_transaction.clone());
             pins.push(SidecarTablePin {
                 table_key: entry.table_key.clone(),
                 table_path: entry.path.full_path.clone(),
@@ -1154,17 +1085,17 @@ impl StagedMutation {
         // sidecar nor a target fork exists yet. A concurrent winner may publish;
         // this attempt then discards/reprepares on the collision below.
         crate::failpoints::maybe_fail(crate::failpoints::names::FORK_BEFORE_CLASSIFY)?;
-        let sidecar_handle = Some(
-            write_sidecar(db.root_uri(), db.storage_adapter(), &sidecar).await?,
-        );
+        let sidecar_handle =
+            Some(write_sidecar(db.root_uri(), db.storage_adapter(), &sidecar).await?);
         let operation_id = sidecar.operation_id.clone();
-        if staged.iter().any(|entry| entry.path.deferred_fork.is_some()) {
-            crate::failpoints::maybe_fail(
-                crate::failpoints::names::MUTATION_POST_SIDECAR_PRE_FORK,
-            )
-            .map_err(|error| {
-                OmniError::recovery_required(operation_id.clone(), error.to_string())
-            })?;
+        if staged
+            .iter()
+            .any(|entry| entry.path.deferred_fork.is_some())
+        {
+            crate::failpoints::maybe_fail(crate::failpoints::names::MUTATION_POST_SIDECAR_PRE_FORK)
+                .map_err(|error| {
+                    OmniError::recovery_required(operation_id.clone(), error.to_string())
+                })?;
         }
 
         // The v3 intent is now durable. Only now may a first-touch named-table
@@ -1226,18 +1157,18 @@ impl StagedMutation {
                     // when it can *prove* the ref was never changed.
                     return Err(OmniError::recovery_required(
                         operation_id,
-                        format!("deferred table fork failed after recovery intent was armed: {error}"),
+                        format!(
+                            "deferred table fork failed after recovery intent was armed: {error}"
+                        ),
                     ));
                 }
             }
         }
         if created_any_fork {
-            crate::failpoints::maybe_fail(
-                crate::failpoints::names::MUTATION_POST_FORK_PRE_COMMIT,
-            )
-            .map_err(|error| {
-                OmniError::recovery_required(operation_id.clone(), error.to_string())
-            })?;
+            crate::failpoints::maybe_fail(crate::failpoints::names::MUTATION_POST_FORK_PRE_COMMIT)
+                .map_err(|error| {
+                    OmniError::recovery_required(operation_id.clone(), error.to_string())
+                })?;
         }
 
         let mut updates: Vec<SubTableUpdate> = Vec::with_capacity(staged.len());
@@ -1280,10 +1211,8 @@ impl StagedMutation {
                     ),
                 ));
             }
-            committed_transactions.insert(
-                table_key.clone(),
-                outcome.committed_transaction().clone(),
-            );
+            committed_transactions
+                .insert(table_key.clone(), outcome.committed_transaction().clone());
             let new_ds = outcome.into_snapshot();
             let state = db
                 .storage()

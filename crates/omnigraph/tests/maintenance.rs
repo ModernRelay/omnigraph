@@ -111,7 +111,10 @@ async fn optimize_on_empty_graph_returns_stats_per_table_with_no_changes() {
         .iter()
         .find(|s| s.table_key == "__manifest")
         .expect("optimize stats missing internal table __manifest");
-    assert!(!s.committed, "__manifest should be a no-op on an empty graph");
+    assert!(
+        !s.committed,
+        "__manifest should be a no-op on an empty graph"
+    );
 }
 
 #[tokio::test]
@@ -267,7 +270,9 @@ async fn optimize_clears_stale_auto_cleanup_and_preserves_versions() {
     let ds = Dataset::open(&manifest_uri).await.unwrap();
     // (a) the stale auto_cleanup config was cleared (non-destructive by construction).
     assert!(
-        !ds.config().keys().any(|k| k.starts_with("lance.auto_cleanup.")),
+        !ds.config()
+            .keys()
+            .any(|k| k.starts_with("lance.auto_cleanup.")),
         "optimize must clear stale auto_cleanup config; config = {:?}",
         ds.config()
     );
@@ -290,7 +295,12 @@ async fn optimize_clears_stale_auto_cleanup_and_preserves_versions() {
 #[tokio::test]
 async fn optimize_clears_stale_auto_cleanup_on_data_tables_too() {
     let dir = tempfile::tempdir().unwrap();
-    let root = dir.path().to_str().unwrap().trim_end_matches('/').to_string();
+    let root = dir
+        .path()
+        .to_str()
+        .unwrap()
+        .trim_end_matches('/')
+        .to_string();
     let mut db = init_and_load(&dir).await;
     add_person_fragments(&mut db).await; // multiple fragments → will_compact
 
@@ -330,7 +340,9 @@ async fn optimize_clears_stale_auto_cleanup_on_data_tables_too() {
     let ds = Dataset::open(&person_full).await.unwrap();
     // (a) the stale auto_cleanup config was cleared (non-destructive by construction).
     assert!(
-        !ds.config().keys().any(|k| k.starts_with("lance.auto_cleanup.")),
+        !ds.config()
+            .keys()
+            .any(|k| k.starts_with("lance.auto_cleanup.")),
         "optimize must clear stale auto_cleanup config on data tables; config = {:?}",
         ds.config()
     );
@@ -854,6 +866,132 @@ async fn delete_only_mutation_refuses_uncovered_drift_before_inline_commit() {
         8,
         "manifest-pinned reads should still see all rows present before the failed delete"
     );
+}
+
+fn recovery_sidecar_count(dir: &tempfile::TempDir) -> usize {
+    let recovery = dir.path().join("__recovery");
+    if !recovery.exists() {
+        return 0;
+    }
+    std::fs::read_dir(recovery).unwrap().count()
+}
+
+#[tokio::test]
+async fn schema_apply_refuses_uncovered_drift_before_arming_recovery() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir
+        .path()
+        .to_str()
+        .unwrap()
+        .trim_end_matches('/')
+        .to_string();
+    let mut db = init_and_load(&dir).await;
+    let (manifest_before, head_before, _) = forge_person_compaction_drift(&mut db, &root).await;
+    let desired = TEST_SCHEMA.replace(
+        "    age: I32?\n}",
+        "    age: I32?\n    nickname: String?\n}",
+    );
+
+    let err = db
+        .apply_schema(&desired)
+        .await
+        .expect_err("schema apply must not claim or fold uncovered table drift");
+    assert!(
+        err.to_string().contains("omnigraph repair"),
+        "error should direct the operator to repair; got: {err}"
+    );
+    assert_eq!(
+        recovery_sidecar_count(&dir),
+        0,
+        "a pre-existing effect must be rejected before SchemaApply writes its sidecar"
+    );
+
+    let (manifest_after, head_after, _) = person_manifest_and_head(&db, &root).await;
+    assert_eq!(manifest_after, manifest_before);
+    assert_eq!(head_after, head_before);
+}
+
+#[tokio::test]
+async fn ensure_indices_refuses_uncovered_drift_before_arming_recovery() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir
+        .path()
+        .to_str()
+        .unwrap()
+        .trim_end_matches('/')
+        .to_string();
+    let uri = dir.path().to_str().unwrap();
+    let mut db = Omnigraph::init(uri, TEST_SCHEMA).await.unwrap();
+    load_jsonl(&mut db, TEST_DATA, LoadMode::Overwrite)
+        .await
+        .unwrap();
+    let (manifest_before, head_before, _) = forge_person_delete_drift(&db, &root).await;
+
+    let err = db
+        .ensure_indices()
+        .await
+        .expect_err("index reconciliation must not claim or fold uncovered table drift");
+    assert!(
+        err.to_string().contains("omnigraph repair"),
+        "error should direct the operator to repair; got: {err}"
+    );
+    assert_eq!(
+        recovery_sidecar_count(&dir),
+        0,
+        "a pre-existing effect must be rejected before EnsureIndices writes its sidecar"
+    );
+    let (manifest_after, head_after, _) = person_manifest_and_head(&db, &root).await;
+    assert_eq!(manifest_after, manifest_before);
+    assert_eq!(head_after, head_before);
+
+    db.repair(RepairOptions {
+        confirm: true,
+        force: true,
+    })
+    .await
+    .expect("explicit repair should remain available after the refusal");
+    db.ensure_indices()
+        .await
+        .expect("index reconciliation should succeed once repair establishes ownership");
+}
+
+#[tokio::test]
+async fn branch_merge_refuses_uncovered_target_drift_before_arming_recovery() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir
+        .path()
+        .to_str()
+        .unwrap()
+        .trim_end_matches('/')
+        .to_string();
+    let mut db = init_and_load(&dir).await;
+    db.branch_create("feature").await.unwrap();
+    db.mutate(
+        "feature",
+        MUTATION_QUERIES,
+        "insert_person",
+        &mixed_params(&[("$name", "feature-only")], &[("$age", 39)]),
+    )
+    .await
+    .unwrap();
+    let (manifest_before, head_before, _) = forge_person_compaction_drift(&mut db, &root).await;
+
+    let err = db
+        .branch_merge("feature", "main")
+        .await
+        .expect_err("branch merge must not claim or fold uncovered target drift");
+    assert!(
+        err.to_string().contains("omnigraph repair"),
+        "error should direct the operator to repair; got: {err}"
+    );
+    assert_eq!(
+        recovery_sidecar_count(&dir),
+        0,
+        "a pre-existing effect must be rejected before BranchMerge writes its sidecar"
+    );
+    let (manifest_after, head_after, _) = person_manifest_and_head(&db, &root).await;
+    assert_eq!(manifest_after, manifest_before);
+    assert_eq!(head_after, head_before);
 }
 
 // Regression: `optimize` must REFUSE when an unresolved recovery sidecar is

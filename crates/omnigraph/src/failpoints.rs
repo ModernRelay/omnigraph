@@ -53,8 +53,7 @@ pub mod names {
     pub const BRANCH_DELETE_POST_TABLE_GATES: &str = "branch_delete.post_table_gates";
     /// After native branch control completed its first recovery barrier, before
     /// it acquires schema -> branch -> table gates and performs the final check.
-    pub const BRANCH_CONTROL_POST_RECOVERY_BARRIER: &str =
-        "branch_control.post_recovery_barrier";
+    pub const BRANCH_CONTROL_POST_RECOVERY_BARRIER: &str = "branch_control.post_recovery_barrier";
     pub const BRANCH_MERGE_ADOPT_AFTER_APPEND_PRE_UPSERT: &str =
         "branch_merge.adopt_after_append_pre_upsert";
     pub const BRANCH_MERGE_ADOPT_AFTER_UPSERT_PRE_DELETE: &str =
@@ -62,18 +61,15 @@ pub mod names {
     /// Source/target heads and snapshots have been captured while the schema
     /// and both branch-incarnation gates are held, before merge planning or
     /// any durable table effect.
-    pub const BRANCH_MERGE_POST_AUTHORITY_CAPTURE: &str =
-        "branch_merge.post_authority_capture";
+    pub const BRANCH_MERGE_POST_AUTHORITY_CAPTURE: &str = "branch_merge.post_authority_capture";
     /// The v4 BranchMerge recovery intent is durable, before any first-touch
     /// target table ref is created.
-    pub const BRANCH_MERGE_POST_SIDECAR_PRE_FORK: &str =
-        "branch_merge.post_sidecar_pre_fork";
+    pub const BRANCH_MERGE_POST_SIDECAR_PRE_FORK: &str = "branch_merge.post_sidecar_pre_fork";
     pub const BRANCH_MERGE_POST_PHASE_B_PRE_MANIFEST_COMMIT: &str =
         "branch_merge.post_phase_b_pre_manifest_commit";
     /// Every merge table effect is complete, but the sidecar is still in its
     /// pre-confirmation shape.
-    pub const BRANCH_MERGE_POST_EFFECTS_PRE_CONFIRM: &str =
-        "branch_merge.post_effects_pre_confirm";
+    pub const BRANCH_MERGE_POST_EFFECTS_PRE_CONFIRM: &str = "branch_merge.post_effects_pre_confirm";
     pub const BRANCH_MERGE_REWRITE_AFTER_DELETE_PRE_INDEX: &str =
         "branch_merge.rewrite_after_delete_pre_index";
     pub const BRANCH_MERGE_REWRITE_AFTER_MERGE_PRE_DELETE: &str =
@@ -82,12 +78,13 @@ pub mod names {
     pub const CLEANUP_RECONCILE_FORK: &str = "cleanup.reconcile_fork";
     /// After cleanup's fast empty-sidecar probe, before it acquires the closed
     /// schema/branch/table GC gate set and performs the authoritative recheck.
-    pub const CLEANUP_POST_RECOVERY_CHECK_PRE_GATES: &str =
-        "cleanup.post_recovery_check_pre_gates";
+    pub const CLEANUP_POST_RECOVERY_CHECK_PRE_GATES: &str = "cleanup.post_recovery_check_pre_gates";
     pub const CLEANUP_RESOLVE_BRANCH_SNAPSHOT: &str = "cleanup.resolve_branch_snapshot";
     pub const CLEANUP_TABLE_GC: &str = "cleanup.table_gc";
     pub const ENSURE_INDICES_POST_PHASE_B_PRE_MANIFEST_COMMIT: &str =
         "ensure_indices.post_phase_b_pre_manifest_commit";
+    pub const ENSURE_INDICES_POST_SIDECAR_PRE_FORK: &str = "ensure_indices.post_sidecar_pre_fork";
+    pub const ENSURE_INDICES_POST_TABLE_EFFECT: &str = "ensure_indices.post_table_effect";
     pub const ENSURE_INDICES_POST_STAGE_PRE_COMMIT_BTREE: &str =
         "ensure_indices.post_stage_pre_commit_btree";
     pub const FORK_BEFORE_CLASSIFY: &str = "fork.before_classify";
@@ -126,6 +123,11 @@ pub mod names {
     pub const OPEN_BEFORE_SCHEMA_CONTRACT_READ: &str = "open.before_schema_contract_read";
     pub const OPTIMIZE_BEFORE_COMPACT: &str = "optimize.before_compact";
     pub const OPTIMIZE_INJECT_REINDEX_CONFLICT: &str = "optimize.inject_reindex_conflict";
+    /// After Optimize's broad recovery fast-path check, before the main-branch
+    /// writer gate is acquired. Tests arm a late recovery intent in this window
+    /// and prove the under-branch-gate check refuses to advance around it.
+    pub const OPTIMIZE_POST_RECOVERY_CHECK_PRE_MAIN_GATE: &str =
+        "optimize.post_recovery_check_pre_main_gate";
     pub const OPTIMIZE_POST_PHASE_B_PRE_MANIFEST_COMMIT: &str =
         "optimize.post_phase_b_pre_manifest_commit";
     pub const RECOVERY_BEFORE_ROLL_FORWARD_PUBLISH: &str = "recovery.before_roll_forward_publish";
@@ -151,8 +153,7 @@ pub mod names {
     pub const SCHEMA_APPLY_AFTER_STAGING_WRITE: &str = "schema_apply.after_staging_write";
     pub const SCHEMA_APPLY_BEFORE_STAGING_WRITE: &str = "schema_apply.before_staging_write";
     /// Reload owns the schema gate and is about to read/publish one contract view.
-    pub const SCHEMA_RELOAD_BEFORE_CONTRACT_READ: &str =
-        "schema_reload.before_contract_read";
+    pub const SCHEMA_RELOAD_BEFORE_CONTRACT_READ: &str = "schema_reload.before_contract_read";
     /// Injects a retryable `RowLevelCasContention` from `load_publish_state` so a
     /// test can prove the publisher's outer retry re-runs the load.
     pub const PUBLISH_LOAD_STATE_RETRYABLE_CONTENTION: &str =
