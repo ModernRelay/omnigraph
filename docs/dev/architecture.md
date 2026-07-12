@@ -243,7 +243,14 @@ flowchart LR
     t --> impl2
 ```
 
-The staged-write trait exists today as `TableStorage`, implemented by `TableStore`. Full engine migration plus capability and statistics surfaces remain roadmap, so the planner cannot yet reason about all pushdown opportunities through a documented trait surface.
+The staged-write trait exists today as `TableStorage`, implemented by
+`TableStore`. Every staged-capable graph-visible effect routes through its
+primitives; Optimize remains the documented Lance-maintenance exception because
+its compaction/index-fold APIs have no uncommitted form. The final storage-trait
+inline residual was removed when full-table vector index creation moved into
+`stage_create_indices`. Capability and statistics surfaces remain roadmap, so
+the planner cannot yet reason about all pushdown opportunities through a
+documented trait surface.
 
 ### Index lifecycle — today vs. roadmap
 
@@ -268,7 +275,19 @@ flowchart LR
     rec --> diff --> wp
 ```
 
-Today, physical indexes are built explicitly via `ensure_indices`/`optimize`; schema apply, mutation, and load only record intent or publish their exact data effects and never build indexes inline. Reads degrade gracefully when index coverage is missing or partial — Lance's scanner unions indexed and scan paths automatically (vector search falls back to brute force). A future background reconciler may automate the same explicit convergence path.
+Today, physical indexes are built explicitly via `ensure_indices`/`optimize`;
+schema apply, mutation, and load only record intent or publish their exact data
+effects and never build indexes inline. EnsureIndices batches every missing
+BTREE, FTS, and full-table vector artifact for one table into one staged Lance
+`CreateIndex` transaction. Its schema-v8 recovery intent captures exact
+branch/schema authority, fixed original and rollback lineage, the complete
+manifest delta, and first-touch ref ownership before publication. Schema-v6
+sidecars remain readable with their original loose compatibility semantics.
+Optimize is separate: its compaction/index-coverage fold still uses the legacy
+maintenance adapter. Reads degrade gracefully when index coverage is missing or
+partial — Lance's scanner unions indexed and scan paths automatically (vector
+search falls back to brute force). A future background reconciler may automate
+the same explicit convergence path.
 
 ### Server / CLI
 

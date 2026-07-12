@@ -466,8 +466,10 @@ async fn optimize_one_table(
         // Phase B: scrub stale auto_cleanup (keeps optimize non-destructive on a
         // graph upgraded from a pre-v7 binary whose `compact_files`/`optimize_indices`
         // commits would otherwise fire Lance's auto-cleanup GC hook), compact,
-        // incremental reindex, then materialize declared-but-missing indexes. Each is
-        // an inline-commit residual covered by the sidecar. A retryable Lance conflict
+        // incremental reindex, then materialize declared-but-missing indexes. The
+        // maintenance APIs still commit inline; missing-index materialization uses a
+        // staged CreateIndex immediately committed under this legacy loose sidecar.
+        // A retryable Lance conflict
         // here means a concurrent writer preempted an overlapping fragment → reopen at
         // the new HEAD and re-plan. Baseline captured BEFORE the scrub so that if the
         // scrub is the only commit, `committed` still triggers the Phase-C publish.

@@ -7,7 +7,7 @@ use omnigraph::db::Omnigraph;
 use omnigraph::error::OmniError;
 use omnigraph::failpoints::ScopedFailPoint;
 use omnigraph::failpoints::names;
-use omnigraph::loader::LoadMode;
+use omnigraph::loader::{LoadMode, load_jsonl};
 use serial_test::serial;
 
 use helpers::recovery::{
@@ -2978,7 +2978,7 @@ async fn recovery_rolls_forward_ensure_indices_on_feature_branch() {
     assert_post_recovery_invariants(
         dir.path(),
         &operation_id,
-        RecoveryExpectation::RolledForward {
+        RecoveryExpectation::RolledForwardOriginalLineage {
             tables: vec![
                 TableExpectation::branch("node:Person", "feature")
                     .expected_main_manifest_pin(main_person_pin)
@@ -3005,6 +3005,217 @@ async fn recovery_rolls_forward_ensure_indices_on_feature_branch() {
         helpers::count_rows(&db, "node:Person").await,
         1,
         "follow-up feature mutation must not move main"
+    );
+}
+
+/// Even when every planned CreateIndex transaction landed exactly, an v8
+/// sidecar that is still Armed is rollback-only. Recovery must not infer the
+/// intended manifest delta from complete-looking physical state.
+#[tokio::test]
+#[serial]
+async fn ensure_indices_complete_armed_effects_roll_back() {
+    let _scenario = FailScenario::setup();
+    let dir = tempfile::tempdir().unwrap();
+    let uri = dir.path().to_str().unwrap().to_string();
+    let mut db = Omnigraph::init(&uri, helpers::TEST_SCHEMA).await.unwrap();
+    load_jsonl(
+        &mut db,
+        r#"{"type":"Person","data":{"name":"alice","age":30}}"#,
+        LoadMode::Append,
+    )
+    .await
+    .unwrap();
+    let indexed_schema = helpers::TEST_SCHEMA.replace("age: I32?", "age: I32? @index");
+    db.apply_schema(&indexed_schema).await.unwrap();
+
+    let operation_id;
+    {
+        let _failpoint =
+            ScopedFailPoint::new(names::ENSURE_INDICES_POST_EFFECTS_PRE_CONFIRM, "return");
+        let err = db
+            .ensure_indices()
+            .await
+            .expect_err("failpoint must stop after exact effects but before confirmation");
+        assert!(matches!(err, OmniError::RecoveryRequired { .. }));
+        operation_id = single_sidecar_operation_id(dir.path());
+    }
+    drop(db);
+
+    let recovered = Omnigraph::open(&uri)
+        .await
+        .expect("Armed exact index effects must roll back on Full recovery");
+    drop(recovered);
+    assert_post_recovery_invariants(
+        dir.path(),
+        &operation_id,
+        RecoveryExpectation::RolledBack {
+            tables: vec![TableExpectation::main("node:Person")],
+        },
+    )
+    .await
+    .unwrap();
+
+    let recovered = Omnigraph::open(&uri).await.unwrap();
+    recovered
+        .ensure_indices()
+        .await
+        .expect("clean retry must rebuild the compensated index batch");
+}
+
+/// A foreign process can publish a disjoint table after v8 confirmation but
+/// before the exact graph-head CAS. Full recovery must compensate only the
+/// unpublished index effect and descend from the winning graph commit.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[serial]
+async fn ensure_indices_post_effect_disjoint_winner_is_preserved() {
+    let _scenario = FailScenario::setup();
+    let dir = tempfile::tempdir().unwrap();
+    let uri = dir.path().to_str().unwrap().to_string();
+    let db = helpers::init_and_load(&dir).await;
+    let indexed_schema = helpers::TEST_SCHEMA.replace("age: I32?", "age: I32? @index");
+    db.apply_schema(&indexed_schema).await.unwrap();
+    drop(db);
+
+    let index_db = std::sync::Arc::new(Omnigraph::open(&uri).await.unwrap());
+    let mut winner_db = Omnigraph::open(&uri).await.unwrap();
+    let rendezvous = helpers::failpoint::Rendezvous::park_first(
+        names::ENSURE_INDICES_POST_PHASE_B_PRE_MANIFEST_COMMIT,
+    );
+    let index_handle = std::sync::Arc::clone(&index_db);
+    let index_task = tokio::spawn(async move { index_handle.ensure_indices().await });
+    rendezvous.wait_until_reached().await;
+
+    let company_uri = node_table_uri(&uri, "Company");
+    let mut raw_company = lance::Dataset::open(&company_uri).await.unwrap();
+    helpers::lance_delete_inline(&mut raw_company, "1 = 2").await;
+    let winner_company_version = raw_company.version().version;
+    winner_db
+        .failpoint_publish_table_head_without_index_rebuild_for_test(
+            "main",
+            "node:Company",
+            None,
+        )
+        .await
+        .unwrap();
+    let winner_head = branch_head_commit_id(dir.path(), "main").await.unwrap();
+    rendezvous.release();
+
+    let operation_id = match index_task.await.unwrap().unwrap_err() {
+        OmniError::RecoveryRequired { operation_id, .. } => operation_id,
+        other => panic!("post-effect authority loss must require recovery: {other}"),
+    };
+    drop(index_db);
+    drop(winner_db);
+
+    let recovered = Omnigraph::open(&uri)
+        .await
+        .expect("Full recovery must compensate around the disjoint winner");
+    drop(recovered);
+
+    assert_post_recovery_invariants(
+        dir.path(),
+        &operation_id,
+        RecoveryExpectation::RolledBack {
+            tables: vec![TableExpectation::main("node:Person")
+                .expected_recovery_parent_commit_id(winner_head)],
+        },
+    )
+    .await
+    .unwrap();
+    let recovered = Omnigraph::open(&uri).await.unwrap();
+    let main = recovered
+        .snapshot_of(omnigraph::db::ReadTarget::branch("main"))
+        .await
+        .unwrap();
+    assert_eq!(
+        main.entry("node:Company").unwrap().table_version,
+        winner_company_version,
+        "index compensation must preserve the disjoint winner"
+    );
+}
+
+/// A same-table foreign commit can bury the exact CreateIndex transaction.
+/// Recovery must retain the sidecar and leave the winning manifest/HEAD alone;
+/// restoring through that winner would be destructive.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[serial]
+async fn ensure_indices_post_effect_same_table_winner_fails_closed() {
+    let _scenario = FailScenario::setup();
+    let dir = tempfile::tempdir().unwrap();
+    let uri = dir.path().to_str().unwrap().to_string();
+    let db = helpers::init_and_load(&dir).await;
+    let indexed_schema = helpers::TEST_SCHEMA.replace("age: I32?", "age: I32? @index");
+    db.apply_schema(&indexed_schema).await.unwrap();
+    drop(db);
+
+    let index_db = std::sync::Arc::new(Omnigraph::open(&uri).await.unwrap());
+    let mut winner_db = Omnigraph::open(&uri).await.unwrap();
+    let rendezvous = helpers::failpoint::Rendezvous::park_first(
+        names::ENSURE_INDICES_POST_PHASE_B_PRE_MANIFEST_COMMIT,
+    );
+    let index_handle = std::sync::Arc::clone(&index_db);
+    let index_task = tokio::spawn(async move { index_handle.ensure_indices().await });
+    rendezvous.wait_until_reached().await;
+
+    let person_uri = node_table_uri(&uri, "Person");
+    let mut raw_person = lance::Dataset::open(&person_uri).await.unwrap();
+    helpers::lance_delete_inline(&mut raw_person, "1 = 2").await;
+    let winner_lance_head = raw_person.version().version;
+    winner_db
+        .failpoint_publish_table_head_without_index_rebuild_for_test(
+            "main",
+            "node:Person",
+            None,
+        )
+        .await
+        .unwrap();
+    let winner_manifest_version = winner_db
+        .snapshot_of(omnigraph::db::ReadTarget::branch("main"))
+        .await
+        .unwrap()
+        .entry("node:Person")
+        .unwrap()
+        .table_version;
+    rendezvous.release();
+
+    let operation_id = match index_task.await.unwrap().unwrap_err() {
+        OmniError::RecoveryRequired { operation_id, .. } => operation_id,
+        other => panic!("same-table authority loss must require recovery: {other}"),
+    };
+    let sidecar_path = dir
+        .path()
+        .join("__recovery")
+        .join(format!("{operation_id}.json"));
+    drop(index_db);
+
+    let error = match Omnigraph::open(&uri).await {
+        Ok(_) => panic!("Full recovery must refuse to restore through a buried index effect"),
+        Err(error) => error,
+    };
+    assert!(
+        error.to_string().contains("buried")
+            || error.to_string().contains("foreign")
+            || error.to_string().contains("unverifiable"),
+        "unexpected fail-closed error: {error}"
+    );
+    assert!(sidecar_path.exists());
+    assert_eq!(
+        winner_db
+            .snapshot_of(omnigraph::db::ReadTarget::branch("main"))
+            .await
+            .unwrap()
+            .entry("node:Person")
+            .unwrap()
+            .table_version,
+        winner_manifest_version
+    );
+    assert_eq!(
+        lance::Dataset::open(&person_uri)
+            .await
+            .unwrap()
+            .version()
+            .version,
+        winner_lance_head
     );
 }
 
@@ -4806,21 +5017,12 @@ async fn finalize_publisher_residual_does_not_drift_untouched_tables() {
     .expect("Company write on a non-drifted table should succeed");
 }
 
-/// Acceptance test: a stage-step failure in the staged-index path
-/// (`stage_create_btree_index` succeeded; `commit_staged` not yet called)
-/// leaves NO Lance-HEAD drift, so other tables stay writable.
-///
-/// Under RFC-022 schema apply and enrolled data writes no longer build indexes
-/// inline; the build happens in the reconciler (`ensure_indices`/`optimize`). This
-/// fires the failpoint where it lives now: an `ensure_indices` build of a BTREE
-/// that a prior apply declared (`@index`) but deferred. The failpoint fires
-/// between `stage_create_btree_index` and `commit_staged`, so the staged
-/// segment is written under `_indices/<uuid>/` but `node:Person`'s Lance HEAD is
-/// unchanged. `ensure_indices` fails and its EnsureIndices sidecar pins Person
-/// at NoMovement. The coarse branch-wide Stage-A barrier nevertheless blocks a
-/// Company write until Full ReadWrite-open recovery consumes that unresolved
-/// intent; after reopen the unrelated table is writable with no drift.
-#[tokio::test]
+/// Expensive index artifact construction happens before the RFC-022 gates and
+/// before the v8 recovery intent is armed. While A is parked after staging its
+/// immutable files, B can publish a disjoint graph write. A then loses final
+/// authority revalidation, abandons its uncommitted artifacts, and leaves no
+/// table movement or recovery sidecar behind.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 #[serial]
 async fn ensure_indices_stage_btree_failure_leaves_existing_tables_writable() {
     let _scenario = FailScenario::setup();
@@ -4845,44 +5047,67 @@ async fn ensure_indices_stage_btree_failure_leaves_existing_tables_writable() {
     db.apply_schema(&indexed_schema)
         .await
         .expect("adding an @index is metadata-only and succeeds");
-
-    {
-        // ensure_indices builds the deferred `age` BTREE on Person; the failpoint
-        // fires between stage and commit, so Person's Lance HEAD does not move.
-        let _failpoint =
-            ScopedFailPoint::new(names::ENSURE_INDICES_POST_STAGE_PRE_COMMIT_BTREE, "return");
-        let err = db.ensure_indices().await.unwrap_err();
-        assert!(
-            err.to_string()
-                .contains("ensure_indices.post_stage_pre_commit_btree"),
-            "ensure_indices should fail with the synthetic failpoint error, got: {err}"
-        );
-    }
-
-    // A different table is physically untouched, but the branch-wide recovery
-    // barrier does not let a new graph commit advance around any unresolved
-    // main-branch intent.
-    use omnigraph::loader::{LoadMode, load_jsonl};
-    let err = load_jsonl(
-        &mut db,
-        r#"{"type": "Company", "data": {"name": "Acme"}}"#,
-        LoadMode::Append,
-    )
-    .await
-    .expect_err("Stage A must block even a disjoint table on the same graph branch");
-    assert!(matches!(err, OmniError::RecoveryRequired { .. }));
-
-    drop(db);
-    let mut recovered = Omnigraph::open(&uri)
+    let person_uri = node_table_uri(&uri, "Person");
+    let person_pin_before = helpers::snapshot_main(&db)
         .await
-        .expect("Full recovery must consume the no-effect EnsureIndices sidecar");
-    load_jsonl(
-        &mut recovered,
-        r#"{"type": "Company", "data": {"name": "Acme"}}"#,
+        .unwrap()
+        .entry("node:Person")
+        .unwrap()
+        .table_version;
+    let person_head_before = lance::Dataset::open(&person_uri)
+        .await
+        .unwrap()
+        .version()
+        .version;
+    let db = std::sync::Arc::new(db);
+
+    let rendezvous = helpers::failpoint::Rendezvous::park_first(
+        names::ENSURE_INDICES_POST_STAGE_PRE_COMMIT_BTREE,
+    );
+    let writer_a_db = std::sync::Arc::clone(&db);
+    let writer_a = tokio::spawn(async move { writer_a_db.ensure_indices().await });
+    rendezvous.wait_until_reached().await;
+
+    db.load(
+        "main",
+        r#"{"type":"Company","data":{"name":"Acme"}}"#,
         LoadMode::Append,
     )
     .await
-    .expect("Company write must succeed after Full recovery closes the barrier");
+    .expect("disjoint writer must publish while index artifacts are staged pre-gate");
+    rendezvous.release();
+
+    let err = writer_a
+        .await
+        .unwrap()
+        .expect_err("stale index plan must fail final authority revalidation");
+    let OmniError::Manifest(manifest_err) = err else {
+        panic!("expected a typed read-set change, got {err}");
+    };
+    assert!(matches!(
+        manifest_err.details,
+        Some(omnigraph::error::ManifestConflictDetails::ReadSetChanged {
+            ref member,
+            ..
+        }) if member == "graph_head:main"
+    ));
+    assert!(
+        helpers::recovery::sidecar_operation_ids(dir.path()).is_empty(),
+        "pre-gate stale preparation must not arm recovery"
+    );
+    let person_pin_after = helpers::snapshot_main(&db)
+        .await
+        .unwrap()
+        .entry("node:Person")
+        .unwrap()
+        .table_version;
+    let person_head_after = lance::Dataset::open(&person_uri)
+        .await
+        .unwrap()
+        .version()
+        .version;
+    assert_eq!(person_pin_after, person_pin_before);
+    assert_eq!(person_head_after, person_head_before);
 }
 
 fn assert_no_staging_files(graph: &std::path::Path) {

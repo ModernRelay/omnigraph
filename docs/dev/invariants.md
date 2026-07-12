@@ -101,7 +101,12 @@ converge the physical state.
    process-local schema gate, keeping snapshot + catalog coherent across live
    publication. Read-only open does not repair, but refuses a fixed SchemaApply
    manifest outcome until the matching schema identity is live. Schema-v5 files
-   remain readable under their original bridge semantics.
+   remain readable under their original bridge semantics. EnsureIndices uses
+   the same exact boundary in schema v8: one pre-minted mixed CreateIndex
+   transaction per touched table, captured branch/schema authority, fixed
+   lineage and manifest delta, and exact first-touch ref ownership. Schema-v6
+   EnsureIndices files remain readable under their original loose bridge
+   semantics and are never reinterpreted as v8 ownership proofs.
    `Omnigraph::open` in read-write mode runs the all-or-nothing sweep; the
    write entry points (`load_as`, `mutate_as`, `apply_schema_as`,
    `branch_merge_as`) and `refresh` run roll-forward-only recovery in-process,
@@ -117,8 +122,10 @@ converge the physical state.
 7. **Indexes are derived state.** Reads must see the correct result for the
    branch they read even when index coverage is partial. Expensive index work
    should converge from manifest state instead of extending the critical write
-   path. Scalar staged index builds and vector inline residuals are documented
-   in [writes.md](writes.md) and [indexes.md](../user/search/indexes.md).
+   path. BTREE, FTS, and full-table vector artifacts stage together as one
+   CreateIndex transaction per touched table; Optimize's index-coverage fold is
+   a separate legacy maintenance adapter. See [writes.md](writes.md) and
+   [indexes.md](../user/search/indexes.md).
 
 8. **Schema identity survives renames.** Accepted schema identity must remain
    stable across type and property renames. Rename support belongs in migration
@@ -181,8 +188,8 @@ converge the physical state.
 | Cleanup retention | Explicit cleanup derives exact `keep` cutoffs from Lance's available version list, caps each main-table GC cutoff at the oldest exact main version inherited by any live lazy graph branch, and refuses uncovered main HEAD drift. Lance protects native per-table branch refs itself. The graph-wide live-reference preflight fails closed before the first table GC, after which individual table failures remain fault-isolated | [maintenance.md](../user/operations/maintenance.md), [writes.md](writes.md) |
 | Schema validation | Type checks, required fields, defaults, edge endpoint checks, and edge cardinality are enforced on write paths | [schema-language.md](../user/schema/index.md), [execution.md](execution.md) |
 | Unique constraints | Value/enum, uniqueness, edge-RI, and cardinality route through ONE unified, catalog-derived evaluator (`crate::validate`) on ALL THREE write surfaces — branch-merge, mutation, and bulk load: Δ-scoped (checks the delta, not the whole graph) and structured-filter-backed (committed probes use a BTREE when reconciled and remain correct by scanning while it is pending), reusing the leaf checks (`loader::validate_value_constraints`/`validate_enum_constraints`/`composite_unique_key`) so the surfaces cannot drift. This closed the prior merge bug (merge validated `@range`/`@check` but not enum) AND the **cross-version uniqueness gap** on the mutation and load paths (a duplicate of a committed `@unique` value is now rejected; the merge path always enforced it). The committed view is the merge target snapshot (merge), the write's pinned `txn.base` (mutation), or the pinned pre-load base (load — `Overwrite` validates the batch as the whole new image, committed view empty); `@card` refreshes the manifest-visible graph-branch snapshot on the mutation path only (the #298 stale-handle fix), then follows each entry's actual inherited/owned Lance ref. `@key` is id-backed, so it is checked intra-delta only (a committed holder of a key value is always the same row — an upsert), skipping a wasted O(Δ) probe per keyed row; `@unique` (non-key) groups do the committed lookup. | [schema-language.md](../user/schema/index.md) |
-| Storage trait | `TableStorage` (via `db.storage()`) is staged-only; the sole inline-commit residual (`create_vector_index`) is split onto a separate sealed `InlineCommitResidual` trait reached via `db.storage_inline_residual()` (MR-854), so §1 holds by construction; capability/stat surfaces are roadmap | [writes.md](writes.md), [architecture.md](architecture.md) |
-| Index lifecycle | `@index`/`@key` declares *intent*; the physical index is derived state and never fails a logical op. `schema apply`, `load`, and `mutate` build no indexes inline: RFC-022 mutation/load sidecars describe only their exact data effects, and index availability must never become a correctness prerequisite. `optimize`/`ensure_indices` is the reconciler: through the single `build_indices_on_dataset_for_catalog` chokepoint it creates declared-but-missing indexes (enum + orderable scalar → BTREE, free-text String → FTS, Vector → vector), folds appended/rewritten fragments into existing ones (`optimize_indices`), and reports untrainable Vector columns as pending. Explicit maintenance call, not yet a background loop | [indexes.md](../user/search/indexes.md), [maintenance.md](../user/operations/maintenance.md) |
+| Storage trait | `TableStorage` (via `db.storage()`) is sealed and staged-only. `stage_create_indices` builds a typed mixed BTREE/FTS/full-table-vector batch without moving HEAD, and `commit_staged{,_exact}` is the only publication boundary; `InlineCommitResidual` and `storage_inline_residual()` are removed. Capability/stat surfaces remain roadmap | [writes.md](writes.md), [architecture.md](architecture.md) |
+| Index lifecycle | `@index`/`@key` declares *intent*; the physical index is derived state and never fails a logical op. `schema apply`, `load`, and `mutate` build no indexes inline: RFC-022 mutation/load sidecars describe only their exact data effects, and index availability must never become a correctness prerequisite. `ensure_indices` materializes every missing index for one table through one staged mixed `CreateIndex` transaction and an exact schema-v8 recovery intent; untrainable Vector columns remain pending. `optimize` separately folds appended/rewritten fragments into existing indexes (`optimize_indices`) and retains its legacy recovery adapter. Explicit maintenance call, not yet a background loop | [indexes.md](../user/search/indexes.md), [maintenance.md](../user/operations/maintenance.md) |
 | Traversal IDs | Runtime still builds `TypeIndex`; Lance stable row-id based graph IDs are roadmap | [architecture.md](architecture.md), [query-language.md](../user/queries/index.md) |
 | Auth | Bearer token hashing and server-side actor resolution are implemented at the HTTP boundary | [server.md](../user/operations/server.md), [policy.md](../user/operations/policy.md) |
 | Tests | Tempdir-backed Lance tests are the current substrate; the storage adapter has an in-memory backend for adapter-level contract tests, but Lance datasets bypass it | [testing.md](testing.md) |
@@ -214,28 +221,15 @@ them explicit.
   renames. The current compiler still derives type IDs from `kind:name`; this
   must be fixed before relying on renamed IDs across accepted schemas.
 - **Storage abstraction:** `TableStorage` is present, sealed, and canonical for
-  staged writes. MR-854 sealed it: `db.storage()` exposes only staged primitives
-  + reads, and the inline-commit residuals are split onto a separate sealed
-  `InlineCommitResidual` trait reached via `db.storage_inline_residual()`, so a
-  new writer cannot couple a write with a HEAD advance through the default
-  surface. The dead legacy methods (`append_batch` on the trait,
-  `merge_insert_batch{,es}`, `create_{btree,inverted}_index`) were removed. MR-A
-  migrated `delete` onto the staged surface (`TableStorage::stage_delete` via
-  Lance 7.0 `DeleteBuilder::execute_uncommitted`, #6658) and retired
-  `InlineCommitResidual::delete_where`, so the sole remaining residual is
-  `create_vector_index`. The beta.21 audit confirmed that OmniGraph's current
-  one-segment full-table vector build can now use public
-  `execute_uncommitted` + `Operation::CreateIndex`; retiring the residual is an
-  OmniGraph adapter migration, while Lance #6666 remains relevant only to the
-  generic multi-segment exact-publication path. See [lance.md](lance.md) and
-  [writes.md](writes.md). New write paths should use the staged shape unless a
-  documented Lance blocker applies.
-- **Vector indexes:** `create_vector_index` still advances Lance HEAD inline —
-  the engine has not yet migrated it to beta.21's usable full-table staged
-  shape. Keep recovery coverage in place until that residual is removed by the
-  exact EnsureIndices adapter. (`delete` is no longer a residual — staged in
-  MR-A. D2 is not a gap: it is a deliberate constructive-XOR-destructive
-  boundary, documented in Invariant 4 and the truth matrix.)
+  staged writes. MR-854 made `db.storage()` staged-only; the exact EnsureIndices
+  adapter then migrated beta.21's full-table vector shape into the typed mixed
+  `stage_create_indices` batch and removed `InlineCommitResidual` entirely. The
+  dead legacy methods (`append_batch` on the trait, `merge_insert_batch{,es}`,
+  `create_{btree,inverted}_index`, and inline `create_vector_index`) remain
+  removed. The remaining abstraction gap is capability/statistics coverage for
+  planner decisions, not an inline write escape hatch. Lance #6666 remains
+  relevant only to generic multi-segment exact publication. See
+  [lance.md](lance.md) and [writes.md](writes.md).
 - **Vendored lance-table pin — CLOSED (9.0.0-beta.15 bump):** lance#7480
   shipped upstream in 9.0.0-beta.11, so the `vendor/lance-table` pin and its
   `[patch.crates-io]` entry were removed per their documented removal

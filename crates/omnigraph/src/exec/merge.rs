@@ -1129,13 +1129,11 @@ async fn publish_rewritten_merge_table(
 
     // Phase 3: rebuild indices.
     //
-    // `build_indices_on_dataset` uses `stage_create_btree_index` /
-    // `stage_create_inverted_index` + `commit_staged` for scalar indices.
-    // These are rebuildable `CreateIndex` tail transactions, not part of the
-    // merge's logical pre-minted data chain; Armed v4 recovery accepts them
-    // only after that complete exact chain and discards them with a rollback.
-    // Vector indices remain inline-commit until the exact EnsureIndices adapter
-    // migrates beta.21's usable full-table `execute_uncommitted` shape.
+    // `build_indices_on_dataset` stages every missing BTREE/FTS/vector artifact
+    // into one table-level `CreateIndex` tail transaction. This rebuildable
+    // derived-state tail is not part of the merge's logical pre-minted data
+    // chain; Armed v4 recovery accepts it only after that complete exact chain
+    // and discards it with a rollback.
     let row_count = target_db
         .storage()
         .table_state(&full_path, &current_ds)

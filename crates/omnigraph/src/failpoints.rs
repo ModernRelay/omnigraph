@@ -83,6 +83,11 @@ pub mod names {
     pub const CLEANUP_TABLE_GC: &str = "cleanup.table_gc";
     pub const ENSURE_INDICES_POST_PHASE_B_PRE_MANIFEST_COMMIT: &str =
         "ensure_indices.post_phase_b_pre_manifest_commit";
+    /// Every exact index transaction and first-touch ref effect is durable,
+    /// but the v8 sidecar is still Armed. Recovery must therefore compensate
+    /// rather than infer the intended manifest delta from physical state.
+    pub const ENSURE_INDICES_POST_EFFECTS_PRE_CONFIRM: &str =
+        "ensure_indices.post_effects_pre_confirm";
     pub const ENSURE_INDICES_POST_SIDECAR_PRE_FORK: &str = "ensure_indices.post_sidecar_pre_fork";
     pub const ENSURE_INDICES_POST_TABLE_EFFECT: &str = "ensure_indices.post_table_effect";
     pub const ENSURE_INDICES_POST_STAGE_PRE_COMMIT_BTREE: &str =

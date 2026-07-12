@@ -140,7 +140,7 @@ async fn fast_forward_merge_defers_vector_index_to_reconciler() {
     let feature = Omnigraph::open(uri).await.unwrap();
     feature.load("feature", &rows, LoadMode::Merge).await.unwrap();
 
-    // Merge, asserting that its publish path performs no inline vector-index build.
+    // Merge, asserting that its publish path stages no vector-index artifact.
     let probes = MergeWriteProbes::default();
     let outcome = with_merge_write_probes(probes.clone(), main.branch_merge("feature", "main"))
         .await
@@ -148,11 +148,11 @@ async fn fast_forward_merge_defers_vector_index_to_reconciler() {
     assert_eq!(outcome, MergeOutcome::FastForward);
 
     assert_eq!(
-        probes.create_vector_index_calls(),
+        probes.stage_vector_index_calls(),
         0,
         "fast-forward adopt merge must defer vector-index coverage to the reconciler \
          (0 inline IVF builds); did {}",
-        probes.create_vector_index_calls(),
+        probes.stage_vector_index_calls(),
     );
     // Correctness: the rows landed on main (reads brute-force until optimize).
     assert_eq!(count_rows(&main, "node:Chunk").await, 24);

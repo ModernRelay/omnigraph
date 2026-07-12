@@ -4,8 +4,7 @@
 //! call Lance's inline-commit data-write APIs directly. The
 //! `Storage` trait (`crate::storage_layer::TableStorage`) is the canonical
 //! surface; staged primitives (`stage_append`, `stage_merge_insert`,
-//! `stage_overwrite`, `stage_create_btree_index`,
-//! `stage_create_inverted_index`) plus `commit_staged` are the only
+//! `stage_overwrite`, `stage_create_indices`) plus `commit_staged` are the only
 //! way to advance Lance HEAD.
 //!
 //! The trait is sealed (only `TableStore` impls it), so by-construction
@@ -31,15 +30,11 @@
 //!
 //! ## Allow-list shape
 //!
-//! After MR-854, `db.storage()` (`&dyn TableStorage`) exposes only staged
-//! primitives + reads. The inline-commit writes live on a separate
-//! `InlineCommitResidual` trait reached via
-//! `Omnigraph::storage_inline_residual()`, so the default storage surface
-//! cannot couple "write bytes" with "advance HEAD" — engine code that
-//! wants an inline residual must name the residual accessor explicitly.
-//! The sole residual is `create_vector_index` (pending the exact EnsureIndices
-//! migration onto beta.21's staged full-table shape); `delete`
-//! migrated to the staged `stage_delete` path in MR-A (Lance 7.0 #6658).
+//! After the exact EnsureIndices adapter, `db.storage()` (`&dyn TableStorage`)
+//! exposes only staged primitives + reads and there is no separate inline
+//! residual surface. Vector index creation uses beta.21's full-table
+//! `execute_uncommitted` path inside `stage_create_indices`; `delete` likewise
+//! migrated to `stage_delete` in MR-A (Lance 7.0 #6658).
 //! The dead legacy methods
 //! (trait `append_batch` / `merge_insert_batches`, inherent
 //! `merge_insert_batch{,es}`, `create_{btree,inverted}_index`) were
@@ -115,7 +110,7 @@ const ALLOW_LIST_FILES: &[&str] = &[
     "storage_layer.rs",     // The trait module.
     "graph_coordinator.rs", // Drives the manifest publisher / branch coordinator.
     "recovery_audit.rs",    // Maintains `_graph_commit_recoveries.lance` (recovery audit trail).
-    "instrumentation.rs",   // The instrumented dataset opener (open_dataset_tracked / open_table_dataset).
+    "instrumentation.rs", // The instrumented dataset opener (open_dataset_tracked / open_table_dataset).
 ];
 
 /// Directories exempt from the guard. Files under these paths may use
@@ -167,6 +162,22 @@ fn walk_into(dir: &Path, out: &mut Vec<PathBuf>) {
 fn engine_code_does_not_call_forbidden_lance_apis() {
     let src = engine_src_root();
     let mut violations = Vec::new();
+
+    // The final inline-commit storage escape hatch was retired with staged
+    // full-table vector indexing. Pin its absence across the storage trait and
+    // Omnigraph accessor so a future change cannot silently reopen it.
+    for relative in ["storage_layer.rs", "db/omnigraph.rs"] {
+        let file = src.join(relative);
+        let contents = std::fs::read_to_string(&file)
+            .unwrap_or_else(|error| panic!("failed to read {}: {error}", file.display()));
+        for forbidden in ["InlineCommitResidual", "storage_inline_residual"] {
+            assert!(
+                !contents.contains(forbidden),
+                "{} must not reintroduce retired inline storage symbol `{forbidden}`",
+                file.display()
+            );
+        }
+    }
 
     for file in walk_rust_files(&src) {
         if is_allow_listed(&file) {

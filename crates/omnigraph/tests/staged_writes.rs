@@ -23,10 +23,8 @@ use arrow_schema::{DataType, Field, Schema};
 use futures::TryStreamExt;
 use lance::Dataset;
 use lance::dataset::{DeleteBuilder, WhenMatched, WhenNotMatched};
-use lance::index::DatasetIndexExt;
-use lance_index::IndexType;
-use lance_linalg::distance::MetricType;
 use lance_table::format::Fragment;
+use omnigraph::storage_layer::IndexBuildSpec;
 use omnigraph::table_store::{StagedWrite, TableStore};
 
 /// A standalone Lance `Session` per test store (this binary is primitive-level
@@ -942,87 +940,103 @@ async fn stage_overwrite_empty_batch_replaces_all_rows() {
     );
 }
 
-/// `stage_create_btree_index` writes index segments to object storage
-/// but does NOT advance Lance HEAD until `commit_staged`. After commit,
-/// the index is queryable.
+/// A mixed BTREE + FTS + full-table vector batch writes immutable index files
+/// without moving HEAD, then lands every index in one exact transaction and
+/// exactly one table-version advance.
 #[tokio::test]
-async fn stage_create_btree_index_does_not_advance_head_until_commit() {
+async fn stage_create_indices_batches_mixed_types_into_one_exact_commit() {
+    use arrow_array::{FixedSizeListArray, Float32Array};
+    use arrow_schema::FieldRef;
+
     let dir = tempfile::tempdir().unwrap();
-    let uri = format!("{}/people.lance", dir.path().to_str().unwrap());
+    let uri = format!("{}/mixed.lance", dir.path().to_str().unwrap());
     let store = TableStore::new(dir.path().to_str().unwrap(), test_session());
 
-    let ds = TableStore::write_dataset(
-        &uri,
-        person_batch(&[("alice", Some(30)), ("bob", Some(25))]),
-    )
-    .await
-    .unwrap();
-    let pre_version = ds.version().version;
-    assert!(
-        !store.has_btree_index(&ds, "id").await.unwrap(),
-        "fresh dataset has no btree index on `id`"
+    let dim = 4usize;
+    let n_rows = 8usize;
+    let item_field: FieldRef = Arc::new(Field::new("item", DataType::Float32, true));
+    let schema = Arc::new(Schema::new(vec![
+        Field::new("id", DataType::Utf8, false),
+        Field::new("body", DataType::Utf8, false),
+        Field::new(
+            "embedding",
+            DataType::FixedSizeList(item_field.clone(), dim as i32),
+            false,
+        ),
+    ]));
+    let ids = StringArray::from((0..n_rows).map(|i| format!("v{i}")).collect::<Vec<_>>());
+    let bodies = StringArray::from(
+        (0..n_rows)
+            .map(|i| format!("searchable document {i}"))
+            .collect::<Vec<_>>(),
     );
+    let vectors = FixedSizeListArray::new(
+        item_field,
+        dim as i32,
+        Arc::new(Float32Array::from(
+            (0..n_rows * dim).map(|i| i as f32).collect::<Vec<_>>(),
+        )),
+        None,
+    );
+    let batch = RecordBatch::try_new(
+        schema,
+        vec![Arc::new(ids), Arc::new(bodies), Arc::new(vectors)],
+    )
+    .unwrap();
+    let ds = TableStore::write_dataset(&uri, batch).await.unwrap();
+    let pre_version = ds.version().version;
 
-    let staged = store.stage_create_btree_index(&ds, &["id"]).await.unwrap();
+    let staged = store
+        .stage_create_indices(
+            &ds,
+            &[
+                IndexBuildSpec::BTree {
+                    column: "id".to_string(),
+                },
+                IndexBuildSpec::FullText {
+                    column: "body".to_string(),
+                },
+                IndexBuildSpec::Vector {
+                    column: "embedding".to_string(),
+                },
+            ],
+        )
+        .await
+        .unwrap();
+    let planned_transaction = staged.transaction_identity();
     assert_eq!(
         ds.version().version,
         pre_version,
-        "stage_create_btree_index must not advance HEAD"
+        "building mixed index artifacts must not advance the held snapshot"
     );
     let reopened = Dataset::open(&uri).await.unwrap();
     assert_eq!(
         reopened.version().version,
         pre_version,
-        "no Lance commit happened on disk"
+        "building mixed index artifacts must not advance on-disk HEAD"
     );
+    assert!(!store.has_btree_index(&reopened, "id").await.unwrap());
+    assert!(!store.has_fts_index(&reopened, "body").await.unwrap());
     assert!(
-        !store.has_btree_index(&reopened, "id").await.unwrap(),
-        "index is not visible until commit_staged"
+        !store
+            .has_vector_index(&reopened, "embedding")
+            .await
+            .unwrap()
     );
 
-    let new_ds = store
-        .commit_staged(Arc::new(ds.clone()), staged)
+    let (new_ds, committed_transaction) = store
+        .commit_staged_exact(Arc::new(ds), staged)
         .await
         .unwrap();
-    assert!(new_ds.version().version > pre_version);
-    assert!(
-        store.has_btree_index(&new_ds, "id").await.unwrap(),
-        "after commit_staged, the index IS visible"
-    );
-}
-
-/// `stage_create_inverted_index` (FTS) — same shape as the BTREE test.
-#[tokio::test]
-async fn stage_create_inverted_index_does_not_advance_head_until_commit() {
-    let dir = tempfile::tempdir().unwrap();
-    let uri = format!("{}/people.lance", dir.path().to_str().unwrap());
-    let store = TableStore::new(dir.path().to_str().unwrap(), test_session());
-
-    let ds = TableStore::write_dataset(
-        &uri,
-        person_batch(&[("alice", Some(30)), ("bob", Some(25))]),
-    )
-    .await
-    .unwrap();
-    let pre_version = ds.version().version;
-
-    let staged = store.stage_create_inverted_index(&ds, "id").await.unwrap();
+    assert_eq!(committed_transaction, planned_transaction);
     assert_eq!(
-        ds.version().version,
-        pre_version,
-        "stage_create_inverted_index must not advance HEAD"
+        new_ds.version().version,
+        pre_version + 1,
+        "one mixed CreateIndex transaction must advance exactly once"
     );
-    assert!(!store.has_fts_index(&ds, "id").await.unwrap());
-
-    let new_ds = store
-        .commit_staged(Arc::new(ds.clone()), staged)
-        .await
-        .unwrap();
-    assert!(new_ds.version().version > pre_version);
-    assert!(
-        store.has_fts_index(&new_ds, "id").await.unwrap(),
-        "after commit_staged, the FTS index IS visible"
-    );
+    assert!(store.has_btree_index(&new_ds, "id").await.unwrap());
+    assert!(store.has_fts_index(&new_ds, "body").await.unwrap());
+    assert!(store.has_vector_index(&new_ds, "embedding").await.unwrap());
 }
 
 /// Staged delete (Lance 7.0 `DeleteBuilder::execute_uncommitted`, lance#6658):
@@ -1113,61 +1127,6 @@ async fn stage_delete_commit_rebases_over_disjoint_committed_delete() {
         .await
         .unwrap();
     assert_eq!(committed.count_rows(None).await.unwrap(), 80);
-}
-
-/// Pin the inline-commit behavior of `create_vector_index` — the SOLE
-/// remaining inline residual now that `delete` has migrated to `stage_delete`
-/// (MR-A). Beta.21 exposes a usable staged shape for OmniGraph's one-segment
-/// full-table vector build, but the exact EnsureIndices adapter has not migrated
-/// it yet. Until that slice lands, the trait deliberately does NOT include
-/// `stage_create_vector_index` — keeping the inline coupling off `TableStorage`
-/// so no side-channel exists between the staged and inline write paths.
-#[tokio::test]
-async fn create_vector_index_advances_head_inline_documents_residual() {
-    use arrow_array::FixedSizeListArray;
-    use arrow_schema::FieldRef;
-
-    let dir = tempfile::tempdir().unwrap();
-    let uri = format!("{}/vec.lance", dir.path().to_str().unwrap());
-    let store = TableStore::new(dir.path().to_str().unwrap(), test_session());
-
-    // Build a small dataset with a fixed-size vector column. Vector index
-    // training requires multiple rows; provide enough.
-    let dim = 4usize;
-    let n_rows = 8usize;
-    let item_field: FieldRef = Arc::new(Field::new("item", DataType::Float32, true));
-    let vec_field = Field::new(
-        "embedding",
-        DataType::FixedSizeList(item_field.clone(), dim as i32),
-        false,
-    );
-    let id_field = Field::new("id", DataType::Utf8, false);
-    let schema = Arc::new(Schema::new(vec![id_field, vec_field]));
-
-    let ids: Vec<String> = (0..n_rows).map(|i| format!("v{}", i)).collect();
-    let id_arr = StringArray::from(ids);
-    let flat: Vec<f32> = (0..(n_rows * dim)).map(|i| i as f32).collect();
-    let values = arrow_array::Float32Array::from(flat);
-    let vec_arr = FixedSizeListArray::new(item_field, dim as i32, Arc::new(values), None);
-    let batch =
-        RecordBatch::try_new(schema.clone(), vec![Arc::new(id_arr), Arc::new(vec_arr)]).unwrap();
-
-    let mut ds = TableStore::write_dataset(&uri, batch).await.unwrap();
-    let pre_version = ds.version().version;
-    assert!(!store.has_vector_index(&ds, "embedding").await.unwrap());
-
-    let params = lance::index::vector::VectorIndexParams::ivf_flat(1, MetricType::L2);
-    ds.create_index_builder(&["embedding"], IndexType::Vector, &params)
-        .replace(true)
-        .await
-        .unwrap();
-    assert!(
-        ds.version().version > pre_version,
-        "create_vector_index ADVANCES Lance HEAD inline (the residual). \
-         The exact EnsureIndices adapter must add `stage_create_vector_index` \
-         to the trait and flip this test to assert staging does NOT advance HEAD."
-    );
-    assert!(store.has_vector_index(&ds, "embedding").await.unwrap());
 }
 
 /// Empirical pin of `Dataset::restore` semantics for the recovery sweep.
