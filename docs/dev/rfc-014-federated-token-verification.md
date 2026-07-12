@@ -189,6 +189,11 @@ auth:
           "read:graph": readers
 ```
 
+- **The schema is issuer-agnostic by construction.** `groups.from` takes arbitrary claim names —
+  `[role, permissions]` for WorkOS, `[groups]` for an Entra/Okta token carrying AD group claims —
+  and `map` normalizes foreign claim values onto the cluster's Cedar group vocabulary. Nothing in
+  the config (or the verifier) is WorkOS-specific; WorkOS is one set of values (§5.9).
+
 - **`issuers` is a list** (live-validated: AuthKit deployments present both the root and the
   `user_management/<client_id>` issuer).
 - **`jwks`** accepts an HTTPS URL (normal), a `file://` path, or inline JWKS JSON — the latter two
@@ -310,7 +315,48 @@ Agent tokens verify through the same path (`aud` present by default; `sub = agen
   fact is a commit-metadata change that must not ride an auth RFC. Until then, delegation is
   visible in server logs only — flagged as a known gap, not silently claimed.
 
-### 5.8 Invariant check (docs/dev/invariants.md)
+### 5.9 Deployment topologies — one verifier, three value-sets
+
+The same `OidcJwtVerifier` + config schema serves every deployment model; only the *values*
+change — whose issuer is trusted, where JWKS comes from, and what fences the tenant. No forks, no
+deployment-specific code (the RFC-003 requirement "on-prem and cloud from one endpoint, switched
+by configuration only", made concrete):
+
+| | Managed cloud | BYOC (customer VPC, our software) | On-prem / air-gapped |
+|---|---|---|---|
+| Authorization server | **Our WorkOS environment** (one per stage) | Ours by default; optionally theirs | **Customer IdP directly** — or none |
+| Customer IdP's role | Federates *into* our WorkOS (per-org SSO/SCIM via Admin Portal) | Same, or is the issuer itself | Is the issuer itself |
+| Tenant fence | `expected_org` = the customer's WorkOS org | Same | None needed |
+| `aud` binding | Per-cluster Resource Indicator | Same | Optional (their IdP's audience) |
+| JWKS reachability | Outbound HTTPS (cached; request path offline) | Outbound-only egress, or `file://` snapshot | LAN-internal IdP, `file://`, or static-only |
+| WorkOS account | Ours | Ours (default) / theirs | **None** |
+
+- **Managed cloud.** One WorkOS environment per stage (separate `client_id` per stage — so a
+  staging token cannot verify against prod even before the `aud` check). Every customer is a
+  WorkOS **Organization** in that environment; their enterprise IdP connects into *their org*
+  (self-serve SSO/SCIM). Role/permission slugs are defined once, environment-wide (they are the
+  product's capability vocabulary); orgs assign members via IdP group→role mapping. Each customer
+  cluster gets the same fleet-templated `auth:` block with only `audience` (its URL) and
+  `expected_org` (its org) varying. `org_id → tenant_id` is recorded on the actor (the reserved
+  Cloud seam); true multi-tenant serving (one process, many orgs, `GraphKey::cloud` routing)
+  remains deferred Cloud-mode work — cluster-per-customer + `expected_org` is this RFC's model.
+- **BYOC.** Identity is control-plane: it stays on our WorkOS by default, with the data plane in
+  the customer's VPC — the `auth:` block is byte-identical to managed cloud, and the only
+  infrastructure requirement is outbound HTTPS for JWKS refresh (verification is offline per
+  request, so there is no availability coupling). Egress-forbidden postures use a `file://` JWKS
+  snapshot plus a rotation runbook. Customers who require identity to never leave their tenancy
+  point the same verifier at *their* issuer (their own WorkOS account, or their IdP directly) and
+  use `groups.from`/`map` to normalize their claims — Cedar rules do not change.
+- **On-prem / air-gapped.** The customer's IdP is the issuer; JWKS is LAN-internal or `file://`.
+  Zero ModernRelay dependency and no phone-home. Fully air-gapped with no IdP → the static-token
+  path alone, unchanged.
+
+One adjacent flag (not this RFC's scope): the **engine** is issuer-agnostic, but the **Tower
+console** is WorkOS-coupled today (AuthKit SDK). An on-prem customer wanting the console against
+their own IdP needs Tower to grow generic-OIDC support or run their own WorkOS environment — a
+console roadmap item recorded in Open Questions.
+
+### 5.10 Invariant check (docs/dev/invariants.md)
 
 - **Inv 11 (transport/auth at the boundary):** all additions live in `omnigraph-server` (+ one
   additive `omnigraph-policy` entry point). ✅
@@ -384,3 +430,7 @@ model), `policy.md` (federated principals + `--groups`), `docs/user/clusters/ind
    (Hyrum's law — every exposed knob becomes a contract).
 5. **Refresh-on-401 UX for long-lived server processes** whose clock drifts — rely on `exp` leeway
    or add an explicit skew metric? Lean: leeway only, observable via a rejected-token counter.
+6. **Console (Tower) issuer coupling** — the engine accepts any OIDC issuer (§5.9), but the Tower
+   console authenticates exclusively through WorkOS AuthKit today. Generic-OIDC console sign-in
+   (for on-prem customers who bring their own IdP and want the console) is a Tower roadmap item,
+   tracked outside this RFC.
