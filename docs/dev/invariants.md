@@ -223,15 +223,19 @@ them explicit.
   migrated `delete` onto the staged surface (`TableStorage::stage_delete` via
   Lance 7.0 `DeleteBuilder::execute_uncommitted`, #6658) and retired
   `InlineCommitResidual::delete_where`, so the sole remaining residual is
-  `create_vector_index`, gated on Lance #6666 (still open). See [lance.md](lance.md)
-  and [writes.md](writes.md). New write paths should use the staged shape unless a
+  `create_vector_index`. The beta.21 audit confirmed that OmniGraph's current
+  one-segment full-table vector build can now use public
+  `execute_uncommitted` + `Operation::CreateIndex`; retiring the residual is an
+  OmniGraph adapter migration, while Lance #6666 remains relevant only to the
+  generic multi-segment exact-publication path. See [lance.md](lance.md) and
+  [writes.md](writes.md). New write paths should use the staged shape unless a
   documented Lance blocker applies.
 - **Vector indexes:** `create_vector_index` still advances Lance HEAD inline —
-  segment-commit needs `build_index_metadata_from_segments`, still `pub(crate)` at Lance
-  9.0.0-beta.15 (#6666 open). Keep recovery coverage in place until that residual is
-  removed. (`delete` is no longer a residual — staged in MR-A. D2 is not a gap:
-  it is a deliberate constructive-XOR-destructive boundary, documented in
-  Invariant 4 and the truth matrix.)
+  the engine has not yet migrated it to beta.21's usable full-table staged
+  shape. Keep recovery coverage in place until that residual is removed by the
+  exact EnsureIndices adapter. (`delete` is no longer a residual — staged in
+  MR-A. D2 is not a gap: it is a deliberate constructive-XOR-destructive
+  boundary, documented in Invariant 4 and the truth matrix.)
 - **Vendored lance-table pin — CLOSED (9.0.0-beta.15 bump):** lance#7480
   shipped upstream in 9.0.0-beta.11, so the `vendor/lance-table` pin and its
   `[patch.crates-io]` entry were removed per their documented removal

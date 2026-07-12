@@ -791,15 +791,16 @@ impl Omnigraph {
         &self.table_store
     }
 
-    /// Inline-commit residual surface (`create_vector_index`) — the sole
-    /// write Lance cannot yet express as a stage-then-commit pair (segment
-    /// commit needs `build_index_metadata_from_segments`, Lance #6666).
+    /// Inline-commit residual surface (`create_vector_index`) — the sole write
+    /// OmniGraph has not yet migrated to beta.21's usable full-table staged
+    /// shape. The exact EnsureIndices adapter owns that migration; Lance #6666
+    /// remains relevant to generic multi-segment exact publication.
     /// Deliberately separate from [`Self::storage`] so the default storage
     /// surface is staged-only and a new writer cannot couple "write bytes" with
     /// "advance HEAD" by reaching for `db.storage()`. Only the vector-index
     /// build uses this accessor — delete migrated to the staged path
     /// (`stage_delete`) in MR-A. See
-    /// `crate::storage_layer::InlineCommitResidual` for the per-method blocker.
+    /// `crate::storage_layer::InlineCommitResidual` for the migration boundary.
     pub(crate) fn storage_inline_residual(
         &self,
     ) -> &dyn crate::storage_layer::InlineCommitResidual {

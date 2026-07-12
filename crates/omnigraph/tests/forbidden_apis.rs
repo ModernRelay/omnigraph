@@ -37,7 +37,8 @@
 //! `Omnigraph::storage_inline_residual()`, so the default storage surface
 //! cannot couple "write bytes" with "advance HEAD" — engine code that
 //! wants an inline residual must name the residual accessor explicitly.
-//! The sole residual is `create_vector_index` (Lance #6666); `delete`
+//! The sole residual is `create_vector_index` (pending the exact EnsureIndices
+//! migration onto beta.21's staged full-table shape); `delete`
 //! migrated to the staged `stage_delete` path in MR-A (Lance 7.0 #6658).
 //! The dead legacy methods
 //! (trait `append_batch` / `merge_insert_batches`, inherent

@@ -9,18 +9,19 @@
 //!
 //! ## Inline-commit residuals live on a separate trait
 //!
-//! The inline-commit writes that Lance cannot yet express as
-//! stage-then-commit are NOT on `TableStorage`. They sit on
+//! The inline-commit write OmniGraph has not yet migrated to
+//! stage-then-commit is NOT on `TableStorage`. It sits on
 //! [`InlineCommitResidual`], reachable only via
 //! `Omnigraph::storage_inline_residual()`, so the default `db.storage()`
 //! surface is staged-only and cannot couple "write bytes" with "advance
 //! HEAD" — MR-793 acceptance §1 closes by construction. The sole remaining
 //! residual:
 //!
-//! * `create_vector_index` — segment-commit-path needs
-//!   `build_index_metadata_from_segments`, still `pub(crate)` in Lance
-//!   7.0.0 ([#6666](https://github.com/lance-format/lance/issues/6666),
-//!   open). Scalar indices already stage.
+//! * `create_vector_index` — beta.21 exposes a usable staged shape for the
+//!   current one-segment full-table build, but the engine keeps the existing
+//!   residual until the exact EnsureIndices adapter can pre-mint and recover
+//!   its transaction. Lance #6666 remains relevant to generic multi-segment
+//!   exact publication. Scalar indices already stage.
 //!
 //! `delete_where` was the other residual until MR-A: Lance 7.0's
 //! `DeleteBuilder::execute_uncommitted` (#6658) made delete a staged write
@@ -305,9 +306,8 @@ pub trait TableStorage: sealed::Sealed + Send + Sync + Debug {
 
     /// Idempotent branch-tree reclaim used by the best-effort fork cleanup
     /// under branch delete (`db/omnigraph.rs::cleanup_deleted_branch_tables`)
-    /// and by the orphan-fork reconciler in `optimize`. Tolerates an
-    /// already-absent branch (both Lance's `RefNotFound` and the local-store
-    /// `NotFound` quirk on a missing `tree/{branch}/` dir). A still-referenced
+    /// and by the orphan-fork reconciler in `optimize`. Beta.21 makes an
+    /// already-absent native branch/ref tree a success. A still-referenced
     /// branch (`RefConflict`) or live physical path-child remains an error.
     async fn force_delete_branch(&self, dataset_uri: &str, branch: &str) -> Result<()>;
 
@@ -533,17 +533,18 @@ pub trait TableStorage: sealed::Sealed + Send + Sync + Debug {
 
 // ─── InlineCommitResidual trait ────────────────────────────────────────────
 
-/// Inline-commit residual surface: the writes Lance cannot yet express as a
-/// stage-then-commit pair, so they advance Lance HEAD as a side effect of
+/// Inline-commit residual surface: the write OmniGraph has not yet migrated to
+/// a stage-then-commit pair, so it advances Lance HEAD as a side effect of
 /// writing. Kept OFF `TableStorage` and reachable only through
 /// `Omnigraph::storage_inline_residual()`, so the default `db.storage()` path
 /// is staged-only and a new writer cannot reintroduce the write+commit coupling
 /// by accident (MR-793 acceptance §1, by construction).
 ///
 /// Residual reasons (each is named honestly at its call site):
-/// * `create_vector_index` — vector-index segment-commit needs
-///   `build_index_metadata_from_segments`, still `pub(crate)` in Lance 7.0.0
-///   (Lance #6666). Scalar indices already stage.
+/// * `create_vector_index` — beta.21 can stage the current full-table vector
+///   shape; the exact EnsureIndices adapter still has to migrate it and retire
+///   this residual. Lance #6666 remains relevant to generic multi-segment exact
+///   publication. Scalar indices already stage.
 ///
 /// `delete_where` used to live here, but Lance 7.0's
 /// `DeleteBuilder::execute_uncommitted` (#6658) made delete a staged write

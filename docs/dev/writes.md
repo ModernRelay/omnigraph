@@ -262,9 +262,9 @@ Three writers have been migrated onto staged primitives:
   — scalar indices (BTree, Inverted) use `stage_create_*_index` +
   `commit_staged`. Which index a `@index`/`@key` property gets is dispatched by
   type via `node_prop_index_kind` (enum + orderable scalar → BTree, free-text
-  String → Inverted/FTS, Vector → vector). Vector indices stay inline (residual
-  — Lance `build_index_metadata_from_segments` is `pub(crate)` in 6.0.1;
-  companion ticket to lance-format/lance#6658 needed). This build is
+  String → Inverted/FTS, Vector → vector). Vector indices stay inline in the
+  current engine, although beta.21 exposes the full-table staged shape that the
+  exact EnsureIndices adapter will adopt. This build is
   existence-gated (it creates a *missing* index over current fragments); folding
   fragments appended afterward into an *existing* index is `optimize`'s
   `optimize_indices` pass — an inline-commit residual, not a staged write (Lance
@@ -292,13 +292,13 @@ described in `.context/mr-793-design.md` §15 (deferred to MR-795).
 
 ### Inline-commit residuals live on `InlineCommitResidual`, not `db.storage()` (MR-793 acceptance §1, by construction)
 
-MR-793's acceptance criterion §1 ("`TableStore` (or successor) public API has no method that performs a manifest commit as a side effect of writing") holds **by construction** after MR-854. `db.storage()` (`&dyn TableStorage`) exposes only staged primitives + reads; the inline-commit writes Lance cannot yet stage live on a separate `InlineCommitResidual` trait reached via `Omnigraph::storage_inline_residual()`. A new engine writer cannot couple a write with a Lance HEAD advance through the default surface — it would have to name the residual accessor explicitly. The dead legacy methods (trait `append_batch` / `merge_insert_batches`, inherent `merge_insert_batch{,es}`, `create_{btree,inverted}_index`) were removed; appends/merges and scalar index builds all use the `stage_*` primitives.
+MR-793's acceptance criterion §1 ("`TableStore` (or successor) public API has no method that performs a manifest commit as a side effect of writing") holds **by construction** after MR-854. `db.storage()` (`&dyn TableStorage`) exposes only staged primitives + reads; the one inline-commit write not yet migrated by OmniGraph lives on a separate `InlineCommitResidual` trait reached via `Omnigraph::storage_inline_residual()`. A new engine writer cannot couple a write with a Lance HEAD advance through the default surface — it would have to name the residual accessor explicitly. The dead legacy methods (trait `append_batch` / `merge_insert_batches`, inherent `merge_insert_batch{,es}`, `create_{btree,inverted}_index`) were removed; appends/merges and scalar index builds all use the `stage_*` primitives.
 
 One method remains on `InlineCommitResidual`, named honestly at its call site:
 
 | Residual method | Inline-commit reason | Closes when |
 |---|---|---|
-| `create_vector_index` | Vector indices take Lance's "segment commit path"; `build_index_metadata_from_segments` is `pub(crate)` (Lance [#6666](https://github.com/lance-format/lance/issues/6666) still open) | Lance #6666 lands and `stage_create_vector_index` joins the staged surface |
+| `create_vector_index` | The engine still calls Lance's inline `execute` path. Beta.21's one-segment full-table build exposes enough public surface to mirror Lance's `execute_uncommitted` → `Operation::CreateIndex` path exactly; generic multi-segment exact publication remains covered by Lance [#6666](https://github.com/lance-format/lance/issues/6666). | The exact EnsureIndices adapter adds `stage_create_vector_index` and removes the residual. |
 
 `delete_where` used to be the second residual. Lance 7.0's
 `DeleteBuilder::execute_uncommitted` ([#6658](https://github.com/lance-format/lance/issues/6658))
