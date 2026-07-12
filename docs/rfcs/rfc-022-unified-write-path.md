@@ -4,14 +4,14 @@ title: "RFC-022 — Unified graph-write protocol"
 description: One correctness protocol for graph-visible writes, with synchronous recovery, complete read-set arbitration, writer-specific physical-effect adapters, and explicit control-plane exceptions.
 status: draft
 tags: [eng, rfc, write-path, manifest, recovery, concurrency, lance, omnigraph]
-timestamp: 2026-07-10
+timestamp: 2026-07-12
 owner:
 ---
 
 # RFC-022: Unified graph-write protocol
 
 **Status:** Draft / for team review
-**Date:** 2026-07-10
+**Date:** 2026-07-12
 **Surveyed:** OmniGraph 0.8.1 (`main`); Lance 9.0.0-beta.15, git rev `f24e42c1`
 **Audience:** engine and storage maintainers
 **Open architecture review:** [RFC-022–027 review ledger](../dev/rfc-022-027-architecture-review.md).
@@ -477,18 +477,47 @@ able to enumerate every adapter and every entry point that invokes it.
 ### 6.3 Schema apply and storage migration
 
 - Acquire the schema-control gate before effect application.
-- Include accepted schema identity and every affected table in `ReadSet`.
-- Cover schema staging-file promotion, data-table schema/field-metadata commits,
-  registrations, tombstones, and final schema identity with one recovery intent.
+- Capture the main native branch identity, exact optional `graph_head:main`, and
+  accepted schema identity; include every affected table in `ReadSet`.
+- Pre-mint the original graph commit (including the initiating actor) and rollback
+  commit. Cover schema staging-file promotion, exact table effects, registrations,
+  updates, tombstones, and final schema identity with one recovery intent and one
+  complete manifest delta.
 - A non-noop schema change still needs that recovery intent when it has no table
   effects: schema-contract staging and promotion are independently durable state,
   so an empty table-pin set means “metadata-only SchemaApply,” not “effect-free.”
-- Until SchemaApply receives the full exact adapter, its schema-v5 bridge records
-  the target schema identity at arm time and durably confirms Phase C before final
-  schema-file promotion. Recovery may classify an empty-pin Phase-D residue as
-  completed only when both that confirmation and the live target identity match;
-  numeric manifest movement alone is not an outcome discriminator because a
-  rollback recovery commit also advances the manifest.
+- Schema-v7 plans one exact Lance transaction identity per independently durable
+  effect: `Overwrite` for an existing table and a strict read-version-zero create
+  for each AddType/RenameType target. These commits use zero transparent conflict
+  retries; the achieved identity and version must equal the plan.
+- The durable sidecar starts `Armed`. After every exact table effect and all three
+  schema staging files are durable, one sidecar replacement confirms the achieved
+  identities and the complete registration/update/tombstone delta, transitioning
+  to `EffectsConfirmed`. `Armed` is rollback-only; `EffectsConfirmed` may roll
+  forward only under the captured authority token.
+- Publish the fixed original manifest outcome before promoting schema staging.
+  A crash during promotion is completed only after recovery proves that exact
+  commit and delta visible. Rollback discards target staging; an owned first-touch
+  version-one dataset is deleted so a retry can recreate it.
+- Recovery never treats a numerically newer table version as SchemaApply output.
+  A disjoint graph-head winner is preserved while owned effects are compensated;
+  an owned effect buried beneath same-table foreign movement is unverifiable and
+  fails closed with the sidecar intact. A foreign winner at an unregistered
+  first-touch path is preserved but never adopted or deleted; recovery may still
+  compensate this attempt's other exact owned effects and retire its intent.
+- Read-only open performs no recovery writes. If the fixed original manifest
+  outcome is visible before the target schema identity is fully promoted, it
+  fails with `RecoveryRequired` rather than exposing a torn manifest/catalog pair.
+- In-process query, export, graph-index, and blob-read entry points capture their
+  manifest snapshot and an operation-local catalog rebuilt from the accepted
+  contract under the schema-control gate; a stale handle ArcSwap is not
+  authoritative. A read that starts before the apply keeps the old pair; one that
+  overlaps publication waits for the fully promoted pair. This is process-local;
+  a long-lived reader in another process still needs the distributed
+  schema-publication fence called out in the remaining concurrency limitations.
+- Readers remain backward-compatible with schema-v5 bridge sidecars. Those files
+  retain their original target-hash plus Phase-C-confirmation semantics and loose
+  table classification; they are not reinterpreted as v7 exact intents.
 - Write the sidecar before the first table HEAD advance, including unenforced-PK
   metadata backfill or other inline metadata commits.
 - A branch-wide or graph-wide migration must enumerate every physical manifest/data
@@ -729,7 +758,7 @@ Implementation proceeds in this order:
    prerequisite for this coarse step. Existing live committed-state validation
    probes remain until the narrowed read set replaces them.
 
-   > **Implementation note (2026-07-11):** mutation/load now use this coarse
+   > **Implementation note (updated 2026-07-12):** mutation/load now use this coarse
    > token, schema-v3 exact-effect sidecars, fixed lineage/rollback outcome ids,
    > zero transparent Lance commit retries, and bounded full reprepare before
    > effects. Branch merge now captures an immutable source commit/snapshot and
@@ -744,9 +773,19 @@ Implementation proceeds in this order:
    > only their contiguous exact prefix (plus a derived `CreateIndex` tail after
    > the complete chain) and fails closed on foreign movement. A pre-effect target change
    > returns `ReadSetChanged`; any post-arm failure returns `RecoveryRequired`
-   > and recovery never re-parents onto a target winner. Schema apply,
-   > optimize/index, and MemWAL fold remain on their writer-specific paths until
-   > their adapter slices land.
+   > and recovery never re-parents onto a target winner. SchemaApply now uses
+   > schema-v7 exact authority, fixed actor-bearing lineage, exact existing-table
+   > overwrite and first-touch create identities, and a complete confirmed
+   > registration/update/tombstone delta. Its `Armed` attempts roll back, its
+   > `EffectsConfirmed` attempts roll forward only under the captured token, and
+   > schema staging is promoted only after the fixed manifest outcome is visible.
+   > Owned first-touch paths are reclaimed on rollback. An unregistered foreign
+   > first-touch winner is preserved but never adopted; foreign movement on an
+   > existing manifest-owned table or a buried same-table effect fails closed.
+   > Read-only open also refuses the fixed-manifest/pre-promotion window without
+   > mutating it. The reader still understands schema-v5 bridge files without
+   > upgrading their semantics. Optimize/index and MemWAL fold remain on their
+   > writer-specific paths until their adapter slices land.
 
    > **Branch-control/cleanup slice (2026-07-11):** native graph-branch create
    > and delete now use the §7 authority classifier, including pre-clone name
@@ -758,7 +797,9 @@ Implementation proceeds in this order:
    > uncovered main HEAD drift, and completes its live-root preflight before the
    > first table GC.
 3. Convert mutation/load, branch merge, schema apply/migration, data-table optimize,
-   and graph-visible index work one adapter at a time.
+   and graph-visible index work one adapter at a time. Mutation/load, branch merge,
+   and SchemaApply are complete as of 2026-07-12; Optimize/EnsureIndices remain on
+   their documented legacy/bridge adapters.
 4. Add static or runtime enumeration proving no graph-visible entry point bypasses the
    coordinator.
 5. Delete superseded writer-specific orchestration only after its crash and
@@ -813,14 +854,24 @@ writers.
 - A live foreign writer's sidecar is not destructively recovered without fencing.
 - Recovery proves exact effect identity; a numerically newer unrelated version is not
   accepted as proof of ancestry.
+- SchemaApply recovery preserves the initiating actor and fixed original lineage,
+  rolls back an exact partial multi-table prefix, reclaims an owned first-touch
+  dataset, and completes a crash after only part of schema staging was promoted.
+- A live query on the applying handle waits across the fixed-manifest/catalog-swap
+  window and then captures one coherent pair.
+- A disjoint post-effect SchemaApply winner remains the rollback parent and keeps its
+  table pin; a same-table winner burying the owned overwrite fails closed without a
+  restore, manifest movement, or sidecar deletion.
 
 ### 11.4 Adapter-specific truth tables
 
 - Mutation/load: zero/one table, multi-table, strict, non-strict, and
   probed-but-untouched dependency cases.
 - Merge: adopt, rewrite, multi-commit, no-op, target advance, and partial-Phase-B crash.
-- Schema: staging files, registration-only, metadata HEAD advance, partial multi-table
-  migration, and branch-local state.
+- Schema: staging files (including partial promotion), registration-only, metadata
+  HEAD advance, exact existing overwrite, strict first-touch create, fixed actor
+  lineage, partial multi-table migration, foreign-winner races, and branch-local
+  state.
 - Optimize/index: zero, one, and several Lance commits, including monotonic publish and
   retryable physical contention.
 - MemWAL fold, when RFC-026 lands: merged-generation conflict and every fold crash

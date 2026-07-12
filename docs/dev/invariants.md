@@ -88,7 +88,20 @@ converge the physical state.
    existing physical target still equals its manifest pin; a new sidecar must
    never claim an older writer's effect or uncovered drift. First-touch refs use
    sidecar-before-ref ordering. A non-noop SchemaApply writes a sidecar even
-   with zero table pins because schema-contract staging is durable state.
+   with zero table pins because schema-contract staging is durable state. Its
+   schema-v7 sidecar captures native main authority + accepted schema identity,
+   fixed actor-bearing lineage, exact overwrite/first-touch transaction
+   identities, and the complete registration/update/tombstone delta. `Armed`
+   rolls back; only an exact `EffectsConfirmed` outcome can roll forward, and
+   schema staging is promoted only after that fixed manifest outcome is visible.
+   Owned first-touch paths are reclaimed on rollback. An unregistered foreign
+   first-touch winner is preserved but never adopted; foreign movement on a
+   manifest-owned table or an owned effect buried by a same-table winner fails
+   closed. Query, export, graph-index, and blob-read capture joins the same
+   process-local schema gate, keeping snapshot + catalog coherent across live
+   publication. Read-only open does not repair, but refuses a fixed SchemaApply
+   manifest outcome until the matching schema identity is live. Schema-v5 files
+   remain readable under their original bridge semantics.
    `Omnigraph::open` in read-write mode runs the all-or-nothing sweep; the
    write entry points (`load_as`, `mutate_as`, `apply_schema_as`,
    `branch_merge_as`) and `refresh` run roll-forward-only recovery in-process,
@@ -244,24 +257,22 @@ them explicit.
   against a live writer's complete sidecar lifetime in schema → branch → sorted
   table order and re-check sidecar existence after waiting. These remain
   in-process primitives: a recovery pass cannot serialize against a live writer
-  in another process. It may roll a live foreign
-  writer's sidecar forward, which degrades to publisher-CAS contention for
-  data writes but can race the schema-staging promotion for a foreign live
-  schema apply. The roll-**forward** CAS contention is now
-  convergence-idempotent: when the publish loses the CAS to a concurrent
-  writer that already reached the sidecar's goal, the sweep treats it as
-  convergence (record the `RolledForward` audit + delete) rather than a fatal
-  `ExpectedVersionMismatch`, and defers when the manifest is only partway
-  (`converge_or_defer_roll_forward` in `db/manifest/recovery.rs`;
-  iss-schema-apply-reopen-recovery-race). So a concurrent advance no longer
-  fails the open. The schema-staging promotion race and the destructive
-  roll-**back** path (Lance `Restore` "trumps" a concurrent commit, so it
-  cannot be made idempotent — iss-recovery-sweep-live-writer-rollback) still
-  need the cross-process primitive. Multi-process writers on one graph are
-  already documented one-winner-CAS territory; closing this fully needs a
-  cross-process serialization primitive (e.g. lease-based use of the
-  schema-apply lock branch) — design it before promoting multi-process write
-  topologies.
+  in another process. Exact v3/v4/v7 authority and effect identity prevent a
+  stale roll-forward from being silently reparented or a foreign numeric HEAD
+  from being adopted; schema-v7 promotion additionally requires the fixed
+  manifest outcome and exact target identity. They do **not** make destructive
+  recovery safe against a still-running foreign process. Full recovery may
+  otherwise Restore an existing table or delete an owned first-touch path while
+  that process continues, and Lance `Restore` "trumps" most concurrent commits
+  (iss-recovery-sweep-live-writer-rollback). The same boundary means the
+  snapshot/catalog capture gate cannot serialize a long-lived reader in another
+  process through the short manifest-before-schema-promotion window; read-only
+  *open* detects the durable torn state, but a distributed publication fence is
+  still required for live cross-process capture. Multi-process writers on one
+  graph remain documented one-winner-CAS territory; closing recovery fully
+  needs a cross-process serialization primitive (for example, a lease-based use
+  of the schema-apply lock branch). Design and test that fence before promoting
+  multi-process write topologies.
 - **Fork ownership is durable, but Lance ref deletion is not conditional:** a
   first-touch Mutation/Load or BranchMerge table never creates its target ref
   before recovery ownership is durable. Under schema → branch → table gates it

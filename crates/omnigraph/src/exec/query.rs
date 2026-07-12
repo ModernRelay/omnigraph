@@ -35,9 +35,11 @@ impl Omnigraph {
         query_name: &str,
         params: &ParamMap,
     ) -> Result<QueryResult> {
-        // resolved_target validates the schema contract; no redundant call here.
-        let resolved = self.resolved_target(target).await?;
-        let catalog = self.catalog();
+        // Capture the manifest snapshot and immutable catalog under the same
+        // schema-publication gate. SchemaApply publishes its fixed manifest
+        // outcome before promoting files/ArcSwap; without this gate a query on
+        // the applying handle could pair that new snapshot with the old catalog.
+        let (resolved, catalog) = self.capture_read_view(target).await?;
 
         let query_decl = omnigraph_compiler::find_named_query(query_source, query_name)
             .map_err(|e| OmniError::manifest(e.to_string()))?;
@@ -84,9 +86,10 @@ impl Omnigraph {
         query_name: &str,
         params: &ParamMap,
     ) -> Result<QueryResult> {
-        // snapshot_at_version validates the schema contract; no redundant call here.
-        let snapshot = self.snapshot_at_version(version).await?;
-        let catalog = self.catalog();
+        // Historical resolution still uses the current accepted catalog, so
+        // capture both sides of that view under schema publication just like a
+        // live-target query.
+        let (snapshot, catalog) = self.capture_historical_read_view(version).await?;
 
         let query_decl = omnigraph_compiler::find_named_query(query_source, query_name)
             .map_err(|e| OmniError::manifest(e.to_string()))?;

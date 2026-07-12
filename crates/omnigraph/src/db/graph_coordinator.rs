@@ -386,15 +386,6 @@ impl GraphCoordinator {
             .await
     }
 
-    pub(crate) async fn commit_changes_with_actor(
-        &mut self,
-        changes: &[ManifestChange],
-        actor_id: Option<&str>,
-    ) -> Result<PublishedSnapshot> {
-        self.commit_changes_with_actor_with_expected(changes, &HashMap::new(), actor_id)
-            .await
-    }
-
     /// Publish `changes` and record one graph commit in the SAME manifest CAS
     /// (RFC-013 Phase 7). The lineage intent (a freshly minted commit id, the
     /// branch, the actor) rides the publish so the `graph_commit` + `graph_head`
