@@ -5247,9 +5247,33 @@ pub(crate) async fn ensure_read_only_schema_coherent(
             continue;
         }
         let Some(protocol) = sidecar.protocol_v7.as_ref() else {
+            // v5's narrow bridge cannot classify an active intent exactly, but
+            // its durable marker is written only after the manifest publish.
+            // Marker=true plus the target identity already live proves that
+            // schema and manifest are coherent and only audit/delete cleanup
+            // remains. Every other legacy state still needs mutable recovery.
+            if sidecar.schema_version == SCHEMA_APPLY_CONFIRMATION_SCHEMA_VERSION
+                && sidecar.schema_apply_manifest_published
+            {
+                let target_is_live = schema_apply_target_identity_is_live(
+                    root_uri,
+                    storage,
+                    &sidecar,
+                )
+                .await
+                .map_err(|error| {
+                    OmniError::recovery_required(
+                        sidecar.operation_id.clone(),
+                        error.to_string(),
+                    )
+                })?;
+                if target_is_live {
+                    continue;
+                }
+            }
             return Err(OmniError::recovery_required(
                 sidecar.operation_id,
-                "read-only open cannot prove schema coherence for a legacy SchemaApply recovery intent; run a read-write open to recover it",
+                "read-only open cannot prove schema coherence for an active or incomplete legacy SchemaApply recovery intent; run a read-write open to recover it",
             ));
         };
         let outcome = detect_visible_v7_outcome(root_uri, &sidecar)

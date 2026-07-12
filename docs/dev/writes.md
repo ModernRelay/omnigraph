@@ -626,6 +626,11 @@ storage-fault failpoints `recovery.sidecar_{write,delete,list}` /
   `RecoveryRequired` when any schema-staging artifact is present because the
   malformed intent may be the only proof of a committed-but-unpromoted
   SchemaApply.
+- **Legacy schema-v5 SchemaApply sidecar**: read-only open admits only the
+  provably completed residue (`schema_apply_manifest_published = true` and the
+  target schema identity already live). Marker-false or target-mismatched v5
+  intents still return `RecoveryRequired`; they need the mutable legacy
+  recovery path.
 - **Audit append fails after a roll-forward publish**: that recovery
   attempt errors and keeps the sidecar; re-entry sees the
   already-published manifest, records exactly one `RolledForward`

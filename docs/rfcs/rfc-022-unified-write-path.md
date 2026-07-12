@@ -520,7 +520,10 @@ able to enumerate every adapter and every entry point that invokes it.
   schema-publication fence called out in the remaining concurrency limitations.
 - Readers remain backward-compatible with schema-v5 bridge sidecars. Those files
   retain their original target-hash plus Phase-C-confirmation semantics and loose
-  table classification; they are not reinterpreted as v7 exact intents.
+  table classification; they are not reinterpreted as v7 exact intents. A
+  read-only opener admits a stale completed v5 sidecar only when its durable
+  manifest-published marker is true and its target identity is already live;
+  every active or ambiguous v5 state still defers to read-write recovery.
 - Write the sidecar before the first table HEAD advance, including unenforced-PK
   metadata backfill or other inline metadata commits.
 - A branch-wide or graph-wide migration must enumerate every physical manifest/data

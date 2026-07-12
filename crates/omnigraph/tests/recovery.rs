@@ -388,6 +388,69 @@ async fn read_only_open_skips_recovery_sweep() {
 }
 
 #[tokio::test]
+async fn read_only_open_accepts_only_completed_coherent_v5_schema_apply_sidecar() {
+    let dir = tempfile::tempdir().unwrap();
+    let uri = dir.path().to_str().unwrap();
+    let db = Omnigraph::init(uri, TEST_SCHEMA).await.unwrap();
+    drop(db);
+
+    let schema_state: serde_json::Value = serde_json::from_str(
+        &std::fs::read_to_string(dir.path().join("__schema_state.json")).unwrap(),
+    )
+    .unwrap();
+    let live_hash = schema_state["schema_ir_hash"].as_str().unwrap();
+    let operation_id = "01H000000000000000000000V5";
+    let sidecar_json = |published: bool, target_hash: &str| {
+        format!(
+            r#"{{
+                "schema_version": 5,
+                "operation_id": "{operation_id}",
+                "started_at": "0",
+                "branch": null,
+                "actor_id": null,
+                "writer_kind": "SchemaApply",
+                "tables": [],
+                "schema_apply_manifest_published": {published},
+                "schema_apply_target_schema_ir_hash": "{target_hash}"
+            }}"#,
+        )
+    };
+
+    // v5 writes the marker only after its manifest publish. If the target
+    // identity is also live, only audit/delete cleanup remains and read-only
+    // open can prove that its manifest/catalog pair is coherent.
+    write_sidecar_file(
+        dir.path(),
+        operation_id,
+        &sidecar_json(true, live_hash),
+    );
+    let read_only = Omnigraph::open_read_only(uri).await.unwrap();
+    drop(read_only);
+    assert!(
+        list_recovery_dir(dir.path()).contains(&format!("{operation_id}.json")),
+        "read-only open must not delete completed v5 residue"
+    );
+
+    // Without the published marker, even a matching target may be an active
+    // recovery that still needs its manifest delta; read-only must fail closed.
+    write_sidecar_file(
+        dir.path(),
+        operation_id,
+        &sidecar_json(false, live_hash),
+    );
+    assert!(Omnigraph::open_read_only(uri).await.is_err());
+
+    // A published marker paired with a non-live target is the torn window and
+    // remains unavailable until read-write recovery completes promotion.
+    write_sidecar_file(
+        dir.path(),
+        operation_id,
+        &sidecar_json(true, "not-the-live-schema"),
+    );
+    assert!(Omnigraph::open_read_only(uri).await.is_err());
+}
+
+#[tokio::test]
 async fn recovery_rolls_back_synthetic_drift_on_open() {
     use omnigraph::loader::{LoadMode, load_jsonl};
 
