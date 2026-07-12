@@ -300,8 +300,9 @@ impl TableStore {
     ///
     /// This tolerates an already-absent branch — beta.21's native
     /// `force_delete_branch` treats both a missing contents ref and a missing
-    /// `tree/{branch}/` directory as success. Safe to call on a possibly-orphaned
-    /// or already-reclaimed fork.
+    /// `tree/{branch}/` directory as success, while OmniGraph also normalizes a
+    /// raced `RefNotFound` / `NotFound` around the non-atomic contents delete.
+    /// Safe to call on a possibly-orphaned or already-reclaimed fork.
     ///
     /// A branch that still has referencing descendants (`RefConflict`) or a
     /// live physical path-child is NOT tolerated: those are real ordering

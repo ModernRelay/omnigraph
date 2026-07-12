@@ -307,8 +307,10 @@ pub trait TableStorage: sealed::Sealed + Send + Sync + Debug {
     /// Idempotent branch-tree reclaim used by the best-effort fork cleanup
     /// under branch delete (`db/omnigraph.rs::cleanup_deleted_branch_tables`)
     /// and by the orphan-fork reconciler in `optimize`. Beta.21 makes an
-    /// already-absent native branch/ref tree a success. A still-referenced
-    /// branch (`RefConflict`) or live physical path-child remains an error.
+    /// already-absent native branch/ref tree a success; OmniGraph additionally
+    /// normalizes a raced `RefNotFound` / `NotFound` from the non-atomic native
+    /// branch-contents delete. A still-referenced branch (`RefConflict`) or live
+    /// physical path-child remains an error.
     async fn force_delete_branch(&self, dataset_uri: &str, branch: &str) -> Result<()>;
 
     /// List the named Lance branches present on the dataset at `dataset_uri`.
