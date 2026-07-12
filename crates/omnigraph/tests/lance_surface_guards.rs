@@ -343,11 +343,9 @@ async fn _compile_uncommitted_merge_insert_field_shape() -> lance::Result<()> {
 //      force variant instead);
 //   2. `force_delete_branch` removes an existing (forked) branch — the orphan
 //      case, where a `tree/{branch}/` exists;
-//   3. `force_delete_branch` on a *fully-absent* branch (no tree dir) still
-//      errors on the local store, because `remove_dir_all`'s NotFound is not
-//      caught for Lance's native error variant. `TableStore::force_delete_branch`
-//      wraps this to be fully idempotent. Pin the raw quirk so a future Lance
-//      fix (which would let us simplify the wrapper) is noticed;
+//   3. `force_delete_branch` on a *fully-absent* branch (no tree dir) is
+//      idempotent. Beta.18 maps object-store absence to Lance `NotFound`, and
+//      branch cleanup now treats that as success. Pin the positive contract;
 //   4. a clone-only zombie (branch dataset present, BranchContents absent)
 //      blocks raw create and is reclaimed by `force_delete_branch`. Lance's
 //      create is explicitly two-phase, so this is the crash state OmniGraph's
@@ -379,13 +377,8 @@ async fn force_delete_branch_semantics() {
         "force_delete_branch should remove an existing branch ref"
     );
 
-    // (3) Quirk: force_delete on a fully-absent branch errors on the local
-    // store (worked around by TableStore::force_delete_branch).
-    assert!(
-        ds.force_delete_branch("never").await.is_err(),
-        "force_delete_branch on a fully-absent branch no longer errors — \
-         TableStore::force_delete_branch's NotFound tolerance can be simplified."
-    );
+    // (3) Force delete is idempotent even when both the ref and tree are absent.
+    ds.force_delete_branch("never").await.unwrap();
 
     // (4) Exact phase-1-only create state: create the shallow-cloned branch
     // dataset, then remove only its authoritative BranchContents ref. This is

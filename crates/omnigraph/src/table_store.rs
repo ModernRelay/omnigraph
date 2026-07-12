@@ -298,11 +298,11 @@ impl TableStore {
 
     /// Idempotently drop `branch` from the dataset at `dataset_uri`.
     ///
-    /// This tolerates an already-absent branch — both a missing contents ref (Lance's
-    /// `force_delete_branch` handles that) and a missing `tree/{branch}/`
-    /// directory (the local-store `NotFound` quirk pinned by
-    /// `lance_surface_guards::force_delete_branch_semantics`). Safe to call on a
-    /// possibly-orphaned or already-reclaimed fork.
+    /// This tolerates an already-absent branch — beta.21's native
+    /// `force_delete_branch` treats both a missing contents ref and a missing
+    /// `tree/{branch}/` directory as success, while OmniGraph also normalizes a
+    /// raced `RefNotFound` / `NotFound` around the non-atomic contents delete.
+    /// Safe to call on a possibly-orphaned or already-reclaimed fork.
     ///
     /// A branch that still has referencing descendants (`RefConflict`) or a
     /// live physical path-child is NOT tolerated: those are real ordering
@@ -1567,10 +1567,10 @@ impl TableStore {
     /// build replaces an existing same-named index, those entries are
     /// listed for tombstoning by the manifest commit.
     ///
-    /// MR-793 Phase 2: scalar index types (BTree, Inverted) are
-    /// stage-able. Vector indices are NOT (segment-commit-path requires
-    /// `build_index_metadata_from_segments` which is `pub(crate)` in
-    /// lance-6.0.1); see `create_vector_index` and Appendix A.3.
+    /// MR-793 Phase 2 staged scalar index types (BTree, Inverted). The current
+    /// vector path remains inline until the exact EnsureIndices adapter mirrors
+    /// beta.21's now-public full-table `execute_uncommitted` transaction shape;
+    /// see `create_vector_index` and `docs/dev/lance.md`.
     pub async fn stage_create_btree_index(
         &self,
         ds: &Dataset,

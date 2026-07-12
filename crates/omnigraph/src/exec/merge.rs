@@ -1134,9 +1134,8 @@ async fn publish_rewritten_merge_table(
     // These are rebuildable `CreateIndex` tail transactions, not part of the
     // merge's logical pre-minted data chain; Armed v4 recovery accepts them
     // only after that complete exact chain and discards them with a rollback.
-    // Vector indices remain inline-commit
-    // (`build_index_metadata_from_segments` is `pub(crate)` in lance-
-    // 6.0.1 — companion ticket to lance-format/lance#6666).
+    // Vector indices remain inline-commit until the exact EnsureIndices adapter
+    // migrates beta.21's usable full-table `execute_uncommitted` shape.
     let row_count = target_db
         .storage()
         .table_state(&full_path, &current_ds)

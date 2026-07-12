@@ -528,9 +528,10 @@ substrate-shaped scaffolding (custom WAL / job queue / second coordination table
 over the window — strictly higher liability than either Design A or waiting for MTT.
 
 **Deeper-than-A (post-MTT or as Lance exposes uncommitted variants):** all-uncommitted-fragments
-+ one manifest commit would shrink the A-before-B window itself, blocked today by Lance not
-exposing uncommitted variants for `compact_files` / `optimize_indices` / vector index (#6666
-open; delete #6658 shipped). Track, don't build yet.
++ one manifest commit would shrink the A-before-B window itself. Lance still exposes no
+uncommitted `compact_files` / `optimize_indices`; beta.21 does expose the full-table vector
+stage OmniGraph needs, while #6666 remains about generic multi-segment publication (delete
+#6658 shipped). Track the maintenance primitives; migrate vector through the reconciler.
 
 ### 5.1 Step-5 design constraints inherited from the #295 spec review
 3b shipped a **minimal** `WriteTxn { branch, base }` (schema-once + open-collapse via

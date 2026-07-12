@@ -1117,12 +1117,11 @@ async fn stage_delete_commit_rebases_over_disjoint_committed_delete() {
 
 /// Pin the inline-commit behavior of `create_vector_index` — the SOLE
 /// remaining inline residual now that `delete` has migrated to `stage_delete`
-/// (MR-A). Vector indices take Lance's "segment commit path" which calls
-/// `build_index_metadata_from_segments` (`pub(crate)` in Lance 7.0.0). Until
-/// upstream exposes that helper (lance-format/lance#6666), the trait surface
-/// deliberately does NOT include `stage_create_vector_index` — keeping the
-/// inline coupling off `TableStorage` so no side-channel exists between the
-/// staged and inline write paths.
+/// (MR-A). Beta.21 exposes a usable staged shape for OmniGraph's one-segment
+/// full-table vector build, but the exact EnsureIndices adapter has not migrated
+/// it yet. Until that slice lands, the trait deliberately does NOT include
+/// `stage_create_vector_index` — keeping the inline coupling off `TableStorage`
+/// so no side-channel exists between the staged and inline write paths.
 #[tokio::test]
 async fn create_vector_index_advances_head_inline_documents_residual() {
     use arrow_array::FixedSizeListArray;
@@ -1165,9 +1164,8 @@ async fn create_vector_index_advances_head_inline_documents_residual() {
     assert!(
         ds.version().version > pre_version,
         "create_vector_index ADVANCES Lance HEAD inline (the residual). \
-         When the upstream Lance helper `build_index_metadata_from_segments` \
-         is made `pub`, add `stage_create_vector_index` to the trait and \
-         flip this test to assert staging does NOT advance HEAD."
+         The exact EnsureIndices adapter must add `stage_create_vector_index` \
+         to the trait and flip this test to assert staging does NOT advance HEAD."
     );
     assert!(store.has_vector_index(&ds, "embedding").await.unwrap());
 }

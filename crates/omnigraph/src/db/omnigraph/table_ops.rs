@@ -1240,8 +1240,9 @@ pub(super) async fn build_indices_on_dataset_for_catalog(
                                 // fails a logical operation. Only when trainable do we
                                 // attempt the build, and then we PROPAGATE any error: a
                                 // genuine I/O/manifest/Lance failure must stay fatal,
-                                // not be hidden as pending. (Vector creation is an
-                                // inline-commit residual until lance#6666; iss-951.)
+                                // not be hidden as pending. Vector creation remains an
+                                // inline-commit residual until the exact EnsureIndices
+                                // adapter migrates beta.21's staged full-table shape.
                                 if vector_column_trainable(db, ds, prop_name).await? {
                                     let new_snap = db
                                         .storage_inline_residual()
