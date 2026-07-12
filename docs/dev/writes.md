@@ -494,8 +494,18 @@ outcome ambiguity while retaining loose table classification. EnsureIndices'
 schema-v6 payload also retains loose table-effect classification, but gives rollback
 a fixed commit id and a durable pre-restore audit plan so recovery re-entry cannot
 flip the outcome. Both close the pre-arm ownership boundary while their full exact
-adapters remain future work. Optimize retains its legacy adapter. The
-manager is shared by every
+adapters remain future work. Optimize retains its legacy effect adapter and a
+branch-authority two-stage recovery barrier: the graph-wide entry probe is a fast
+path; after acquiring main's process-local branch-writer gate, Optimize relists and
+rejects every main-target sidecar plus graph-global SchemaApply before it reads table
+HEADs, classifies drift, or arms its own sidecars. The gate is retained through the
+internally parallel per-table effects/publishes because each table-pointer publish
+advances shared `graph_head:main`. It remains held through final physical-only
+`__manifest` compaction so a new main recovery intent cannot arm before raw manifest
+movement finishes. This coarse legacy-adapter fence makes same-process sidecar-enrolled
+main writers wait for the entire graph-wide Optimize, while Optimize's own table tasks
+remain parallel.
+The manager is shared by every
 `Omnigraph` handle for one canonical local root identity (relative, absolute,
 and symlink aliases converge; object-store/custom schemes stay opaque), so this
 also serializes a refresh or separately-opened handle against a live writer instead of rolling its
@@ -506,7 +516,8 @@ schema → branch → sorted tables → coordinator, matching the writer effect 
 Mutation/load, branch merge, SchemaApply, and EnsureIndices perform one additional
 `list_dir` after acquiring their authority gates; that final check closes the
 pre-gate recovery TOCTOU without moving validation or reclaimable staged-file
-construction under the gate.
+construction under the gate. Optimize's separate final `list_dir` runs under the
+main branch gate because even table-disjoint main intents share graph-head authority.
 Pinned by the four
 `tests/failpoints.rs::*_after_finalize_publisher_failure_heals_without_reopen`
 tests (load, mutation, schema apply, branch merge). The maintenance

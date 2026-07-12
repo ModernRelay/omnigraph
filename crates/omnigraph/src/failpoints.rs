@@ -123,6 +123,11 @@ pub mod names {
     pub const OPEN_BEFORE_SCHEMA_CONTRACT_READ: &str = "open.before_schema_contract_read";
     pub const OPTIMIZE_BEFORE_COMPACT: &str = "optimize.before_compact";
     pub const OPTIMIZE_INJECT_REINDEX_CONFLICT: &str = "optimize.inject_reindex_conflict";
+    /// After Optimize's broad recovery fast-path check, before the main-branch
+    /// writer gate is acquired. Tests arm a late recovery intent in this window
+    /// and prove the under-branch-gate check refuses to advance around it.
+    pub const OPTIMIZE_POST_RECOVERY_CHECK_PRE_MAIN_GATE: &str =
+        "optimize.post_recovery_check_pre_main_gate";
     pub const OPTIMIZE_POST_PHASE_B_PRE_MANIFEST_COMMIT: &str =
         "optimize.post_phase_b_pre_manifest_commit";
     pub const RECOVERY_BEFORE_ROLL_FORWARD_PUBLISH: &str = "recovery.before_roll_forward_publish";

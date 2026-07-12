@@ -195,6 +195,24 @@ pub async fn optimize_all_tables(db: &Omnigraph) -> Result<Vec<TableOptimizeStat
              recovery sweep before optimizing",
         ));
     }
+    // Deterministic race seam: the broad fast-path probe above has completed,
+    // but main's branch-writer gate is not held yet. A writer may arm recovery
+    // in this window; the load-bearing check below runs only after Optimize owns
+    // the branch authority every sidecar-enrolled main writer must cross.
+    crate::failpoints::maybe_fail(
+        crate::failpoints::names::OPTIMIZE_POST_RECOVERY_CHECK_PRE_MAIN_GATE,
+    )?;
+
+    // Optimize publishes each changed table pointer as a main graph commit, so
+    // its authority is branch-wide even though its physical effects are
+    // table-local. Hold main's process-local writer gate through every table
+    // effect/publish and the final physical-only __manifest compaction. This
+    // still lets this one Optimize call process distinct tables concurrently,
+    // but another main writer cannot arm an intent after our final check or
+    // have its fixed graph-head authority invalidated underneath recovery.
+    let _main_branch_guard = db.write_queue().acquire_branch(None).await;
+    ensure_no_pending_recovery_for_optimize_under_main_gate(db).await?;
+
     let snapshot = db.fresh_snapshot_for_branch(None).await?;
 
     // Compute per-table paths up front, in a scope that drops the catalog
@@ -601,6 +619,41 @@ async fn optimize_one_table(
     let mut stat = TableOptimizeStats::compacted(table_key, &metrics, committed);
     stat.pending_indexes = pending_indexes;
     Ok(stat)
+}
+
+/// Final recovery-ownership check for main-branch Optimize.
+///
+/// The caller must hold main's branch-writer gate and retain it through all data
+/// effects and graph-head publishes. The top-level probe stays deliberately
+/// conservative and refuses any pre-existing sidecar; this final check rejects
+/// every late main-target intent plus graph-global SchemaApply. Table-disjoint
+/// intents still overlap because each fixed recovery authority includes the
+/// shared `graph_head:main` that Optimize advances.
+///
+/// This is a process-local gate proof, matching the repository's documented
+/// single-writer-process boundary. Separate processes remain governed by Lance
+/// OCC and recovery classification; this helper is not a distributed lock.
+async fn ensure_no_pending_recovery_for_optimize_under_main_gate(db: &Omnigraph) -> Result<()> {
+    let sidecars = crate::db::manifest::list_sidecars(db.root_uri(), db.storage_adapter()).await?;
+    let blocking = sidecars.iter().find(|sidecar| {
+        sidecar.writer_kind == crate::db::manifest::SidecarKind::SchemaApply
+            || sidecar
+                .branch
+                .as_deref()
+                .filter(|branch| *branch != "main")
+                .is_none()
+    });
+    if let Some(sidecar) = blocking {
+        return Err(OmniError::recovery_required(
+            sidecar.operation_id.clone(),
+            format!(
+                "pending {:?} recovery operation on branch '{}' blocks optimize",
+                sidecar.writer_kind,
+                sidecar.branch.as_deref().unwrap_or("main"),
+            ),
+        ));
+    }
+    Ok(())
 }
 
 /// Bound on the app-level retry of an internal-table compaction against a
