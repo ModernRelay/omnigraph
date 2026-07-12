@@ -508,6 +508,18 @@ able to enumerate every adapter and every entry point that invokes it.
 - Schema-v6 does not prove ownership of an index commit and does not add a fixed
   forward outcome. Exact transaction chains, fixed original lineage, and exact
   first-touch ref identity remain requirements of the full adapter.
+- Optimize retains its legacy loose effect adapter. Its synchronous overlap
+  barrier is two-stage: a broad entry probe, then a relist under main's
+  process-local branch-writer gate that rejects every main-target sidecar plus
+  graph-global SchemaApply before HEAD inspection, drift classification, or its
+  own recovery arm. The gate remains held through internally parallel table
+  effects/publishes because every published table pointer advances shared
+  `graph_head:main`, and through final physical `__manifest` compaction so a new
+  main intent cannot arm before raw manifest movement finishes. This coarse
+  legacy-adapter safety cost makes same-process sidecar-enrolled main writers
+  wait for the entire graph-wide Optimize, while Optimize's own table tasks stay
+  parallel. This is not the future exact Optimize adapter, a universal mutex for
+  every main publisher, or a distributed fence.
 - Logical operations never fail because a derived index is absent or behind.
 - Physical-only internal-table maintenance remains the exception in Section 8.
 
@@ -791,6 +803,13 @@ writers.
   after manifest CAS, and during sidecar deletion for every adapter.
 - A later overlapping writer blocks, heals, or returns recovery-required; it never
   advances around the sidecar.
+- If Optimize's entry probe passes and a SchemaApply or table-disjoint main intent
+  arms before its branch gate is acquired, Optimize returns recovery-required with
+  that intent's id; it does not create an Optimize sidecar, move another table,
+  advance `graph_head:main`, or compact `__manifest` afterward.
+- After Optimize's under-gate relist passes, a table-disjoint main writer started
+  while productive table compaction is paused remains queued until Optimize
+  releases its branch-wide effect envelope, then completes normally.
 - A live foreign writer's sidecar is not destructively recovered without fencing.
 - Recovery proves exact effect identity; a numerically newer unrelated version is not
   accepted as proof of ancestry.
