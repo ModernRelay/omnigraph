@@ -179,7 +179,9 @@ pub struct MergeWriteProbes {
     /// names (schema order) and whether unmatched source rows insert
     /// (`WhenNotMatched::InsertAll`) or drop (`DoNothing`). Lets a fitness test
     /// assert a partial-schema matched-only update stages exactly
-    /// (key + assigned + completion) columns — the field-level-update staging shape.
+    /// (key + assigned) columns — the field-level-update staging shape.
+    /// (`@unique`-completion columns ride only the validation change-set and
+    /// are projected out before staging, so they never appear here.)
     pub merge_shapes: Arc<std::sync::Mutex<Vec<MergeShape>>>,
     /// Inline vector-index (IVF) builds. The fast-forward adopt path defers
     /// index coverage to the reconciler, so an adopt merge must do 0 of these.

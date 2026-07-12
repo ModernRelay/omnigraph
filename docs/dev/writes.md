@@ -240,8 +240,10 @@ shared by both `mutate_as` and the bulk loader:
   unassigned group member would patch it and prune its index for no semantic
   reason. Lance's partial-schema path patches the
   provided columns in place on the same fragment (`update_mode:
-  RewriteColumns`), so unassigned columns are never read or rewritten and
-  indexes over them keep fragment coverage (Lance prunes only
+  RewriteColumns`), so the staged source is exactly (row key + assigned):
+  completion columns are read as validation-only inputs but never rewritten,
+  every other unassigned column is neither read nor rewritten, and indexes
+  over all unassigned columns keep fragment coverage (Lance prunes only
   `fields_modified`). Every other shape (insert+update on one table, multiple
   updates, etc.) falls back to whole-row staging: partial and full batches
   cannot share one uniform-schema merge source (a present column's null cell

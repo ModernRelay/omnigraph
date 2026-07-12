@@ -38,12 +38,14 @@ multi-query workflows.
 ## Updates write only the columns they assign
 
 When an `update` is the only statement touching its type in a query, the engine
-stages just the assigned columns (plus the row key and any columns needed to
-complete a `@unique` group the assignment touches) and patches them in place.
-Unassigned columns — including large `Vector` embedding columns — are neither
-read nor rewritten, and indexes over them keep their coverage. Semantics are
-identical to a whole-row update; the difference is cost: update latency and
-write volume scale with what you assign, not with row width. Types with a
+patches just the row key plus the assigned columns in place. Columns that
+complete a `@unique` group the assignment touches may be **read** as
+validation-only inputs (so the whole tuple is checked), but they are never
+rewritten. All other unassigned columns — including large `Vector` embedding
+columns — are neither read nor rewritten, and indexes over every unassigned
+column keep their coverage. Semantics are identical to a whole-row update; the
+difference is cost: update latency and write volume scale with what you assign,
+not with row width. Types with a
 `Blob` property currently always use the whole-row path (including the blob
 materialization described above).
 
