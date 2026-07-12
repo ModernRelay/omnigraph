@@ -259,19 +259,13 @@ pub async fn optimize_all_tables(db: &Omnigraph) -> Result<Vec<TableOptimizeStat
         }
     }
 
-    // A data-table failure is propagated only after invalidating any sibling
-    // table that already published, but before starting a new internal-table
-    // effect. This is especially load-bearing for the late recovery barrier:
-    // once an overlapping intent is discovered, Optimize must return without
-    // compacting `__manifest` after the fact.
-    let mut all: Vec<TableOptimizeStats> = stats.into_iter().collect::<Result<_>>()?;
-
     // Compact the internal system tables too (RFC-013 step 2). They are not
     // catalog-tracked, so they take a separate, simpler path (`compact_internal_table`):
     // compact in place, no manifest publish, no sidecar. Appended after the
     // data-table stats so the data-table cache invalidation above is computed from
     // data-table stats only; each internal compaction does its own coordinator
     // refresh for cache coherence.
+    let mut all = stats;
     // The only internal system table optimize compacts is `__manifest`: it
     // accumulates one fragment per commit (both the table-version rows and the
     // folded-in graph-lineage rows — RFC-013 Phase 7), so a long history leaves
@@ -283,10 +277,10 @@ pub async fn optimize_all_tables(db: &Omnigraph) -> Result<Vec<TableOptimizeStat
     let internal_tables: [(&str, String); 1] =
         [("__manifest", crate::db::manifest::manifest_uri(root))];
     for (table_key, uri) in internal_tables {
-        all.push(compact_internal_table(db, table_key, uri).await?);
+        all.push(compact_internal_table(db, table_key, uri).await);
     }
 
-    Ok(all)
+    all.into_iter().collect()
 }
 
 /// Compact one table and publish the compacted version to the `__manifest`.
