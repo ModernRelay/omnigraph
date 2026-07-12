@@ -152,6 +152,13 @@ pub mod names {
     pub const SCHEMA_APPLY_AFTER_MANIFEST_COMMIT: &str = "schema_apply.after_manifest_commit";
     pub const SCHEMA_APPLY_AFTER_STAGING_WRITE: &str = "schema_apply.after_staging_write";
     pub const SCHEMA_APPLY_BEFORE_STAGING_WRITE: &str = "schema_apply.before_staging_write";
+    /// The schema-v7 ownership sidecar is durable, but no table transaction
+    /// has been staged or committed yet. Tests use this to install a genuinely
+    /// foreign first-touch dataset winner.
+    pub const SCHEMA_APPLY_POST_SIDECAR_PRE_EFFECT: &str = "schema_apply.post_sidecar_pre_effect";
+    /// After each exact SchemaApply table transaction commits, before the next
+    /// table effect or durable EffectsConfirmed transition.
+    pub const SCHEMA_APPLY_POST_TABLE_COMMIT: &str = "schema_apply.post_table_commit";
     /// Reload owns the schema gate and is about to read/publish one contract view.
     pub const SCHEMA_RELOAD_BEFORE_CONTRACT_READ: &str = "schema_reload.before_contract_read";
     /// Injects a retryable `RowLevelCasContention` from `load_publish_state` so a

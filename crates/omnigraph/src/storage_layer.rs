@@ -406,6 +406,20 @@ pub trait TableStorage: sealed::Sealed + Send + Sync + Debug {
     async fn table_state(&self, dataset_uri: &str, snapshot: &SnapshotHandle)
     -> Result<TableState>;
 
+    /// Stage a first-touch dataset creation. This may write unreferenced data
+    /// files, but no Lance manifest/HEAD exists until
+    /// [`Self::commit_staged_create_exact`] succeeds.
+    async fn stage_create(&self, dataset_uri: &str, batch: RecordBatch) -> Result<StagedHandle>;
+
+    /// Atomically create version 1 from a staged read-version-0 transaction.
+    /// Lance conflict retries are disabled so a concurrently-created dataset
+    /// is rejected rather than overwritten.
+    async fn commit_staged_create_exact(
+        &self,
+        dataset_uri: &str,
+        staged: StagedHandle,
+    ) -> Result<ExactCommitOutcome>;
+
     // ── Staged writes (no HEAD advance) ────────────────────────────────
 
     async fn stage_append(
@@ -758,6 +772,27 @@ impl TableStorage for TableStore {
         snapshot: &SnapshotHandle,
     ) -> Result<TableState> {
         TableStore::table_state(self, dataset_uri, snapshot.dataset()).await
+    }
+
+    async fn stage_create(&self, dataset_uri: &str, batch: RecordBatch) -> Result<StagedHandle> {
+        TableStore::stage_create(self, dataset_uri, batch)
+            .await
+            .map(StagedHandle::new)
+    }
+
+    async fn commit_staged_create_exact(
+        &self,
+        dataset_uri: &str,
+        staged: StagedHandle,
+    ) -> Result<ExactCommitOutcome> {
+        let planned_transaction = staged.transaction_identity();
+        let (dataset, committed_transaction) =
+            TableStore::commit_staged_create_exact(self, dataset_uri, staged.into_staged()).await?;
+        Ok(ExactCommitOutcome {
+            snapshot: SnapshotHandle::new(dataset),
+            planned_transaction,
+            committed_transaction,
+        })
     }
 
     async fn stage_append(

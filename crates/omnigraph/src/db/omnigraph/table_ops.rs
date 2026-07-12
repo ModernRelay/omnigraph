@@ -1,15 +1,7 @@
 use super::*;
 
 pub(super) async fn graph_index(db: &Omnigraph) -> Result<Arc<crate::graph_index::GraphIndex>> {
-    db.ensure_schema_state_valid().await?;
-    let coord = db.coordinator.read().await;
-    let resolved = coord
-        .resolve_target(&ReadTarget::Branch(
-            coord.current_branch().unwrap_or("main").to_string(),
-        ))
-        .await?;
-    drop(coord);
-    let catalog = db.catalog();
+    let (resolved, catalog) = db.capture_current_read_view().await?;
     // Whole-graph entry point: cover every edge type. Query execution scopes to
     // the edges it actually traverses (see `referenced_edge_types`).
     let edge_types: std::collections::HashMap<String, (String, String)> = catalog

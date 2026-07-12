@@ -1336,6 +1336,56 @@ impl TableStore {
         Ok((dataset, committed_identity))
     }
 
+    /// Commit a staged first-touch dataset creation with no conflict retry.
+    ///
+    /// A create transaction is Lance's `Operation::Overwrite` at
+    /// `read_version = 0`. `with_max_retries(0)` selects Lance's strict
+    /// overwrite path: if another writer created the dataset after this
+    /// transaction was staged, Lance refuses the stale read-version-0 commit
+    /// instead of rebasing it over the winner. If both writers still observe
+    /// absence, the object store's atomic manifest create admits exactly one.
+    pub async fn commit_staged_create_exact(
+        &self,
+        dataset_uri: &str,
+        staged: StagedWrite,
+    ) -> Result<(Dataset, StagedTransactionIdentity)> {
+        if staged.transaction.read_version != 0
+            || !matches!(staged.transaction.operation, Operation::Overwrite { .. })
+        {
+            return Err(OmniError::manifest_internal(
+                "staged dataset creation must be an Overwrite transaction at read version 0",
+            ));
+        }
+        if staged.commit_metadata.affected_rows.is_some() {
+            return Err(OmniError::manifest_internal(
+                "staged dataset creation cannot carry affected-row metadata",
+            ));
+        }
+
+        let dataset = CommitBuilder::new(dataset_uri)
+            .use_stable_row_ids(true)
+            .with_storage_format(LanceFileVersion::V2_2)
+            .enable_v2_manifest_paths(true)
+            .with_session(self.session.clone())
+            .with_skip_auto_cleanup(true)
+            .with_max_retries(0)
+            .execute(staged.transaction)
+            .await
+            .map_err(|e| OmniError::Lance(e.to_string()))?;
+        let committed_identity = dataset
+            .read_transaction()
+            .await
+            .map_err(|e| OmniError::Lance(e.to_string()))?
+            .as_ref()
+            .map(StagedTransactionIdentity::from)
+            .ok_or_else(|| {
+                OmniError::manifest_internal(
+                    "Lance created a dataset without a readable transaction identity",
+                )
+            })?;
+        Ok((dataset, committed_identity))
+    }
+
     async fn commit_staged_with_retry_budget(
         &self,
         ds: Arc<Dataset>,
@@ -1372,6 +1422,47 @@ impl TableStore {
             None
         };
         Ok((dataset, committed_identity))
+    }
+
+    /// Stage creation of a new dataset without publishing its first manifest.
+    ///
+    /// Lance models creation as an `Operation::Overwrite` transaction based on
+    /// version 0. Data files may be written by this call, but the dataset is not
+    /// readable until [`Self::commit_staged_create_exact`] atomically creates
+    /// version 1. The transaction UUID can therefore be bound to a recovery
+    /// identity before that first visible effect.
+    pub async fn stage_create(&self, dataset_uri: &str, batch: RecordBatch) -> Result<StagedWrite> {
+        let params = WriteParams {
+            mode: WriteMode::Create,
+            enable_stable_row_ids: true,
+            data_storage_version: Some(LanceFileVersion::V2_2),
+            allow_external_blob_outside_bases: true,
+            session: Some(self.session.clone()),
+            auto_cleanup: None,
+            skip_auto_cleanup: true,
+            ..Default::default()
+        };
+        let transaction = InsertBuilder::new(dataset_uri)
+            .with_params(&params)
+            .execute_uncommitted(vec![batch])
+            .await
+            .map_err(|e| OmniError::Lance(e.to_string()))?;
+        if transaction.read_version != 0 {
+            return Err(OmniError::manifest_internal(format!(
+                "stage_create resolved '{}' at existing version {}; expected an absent dataset",
+                dataset_uri, transaction.read_version
+            )));
+        }
+        let new_fragments = match &transaction.operation {
+            Operation::Overwrite { fragments, .. } => fragments.clone(),
+            other => {
+                return Err(OmniError::manifest_internal(format!(
+                    "stage_create: unexpected Lance operation {:?}",
+                    std::mem::discriminant(other)
+                )));
+            }
+        };
+        Ok(StagedWrite::new(transaction, new_fragments, Vec::new()))
     }
 
     /// Stage an overwrite (write_fragments + Operation::Overwrite { schema, fragments }).

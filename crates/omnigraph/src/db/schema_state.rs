@@ -386,7 +386,35 @@ pub(crate) async fn recover_schema_state_files(
     // logic below sees actual_keys == live_keys (manifest didn't move)
     // and deletes the staging files, leaving the graph with new-schema
     // data on disk but the old `_schema.pg` live — corruption.
-    if crate::db::manifest::has_schema_apply_sidecar(root_uri, storage.as_ref()).await? {
+    let schema_apply_sidecars = crate::db::manifest::list_sidecars(root_uri, storage.as_ref())
+        .await?
+        .into_iter()
+        .filter(|sidecar| {
+            matches!(
+                sidecar.writer_kind,
+                crate::db::manifest::SidecarKind::SchemaApply
+            )
+        })
+        .collect::<Vec<_>>();
+    if schema_apply_sidecars
+        .iter()
+        .any(|sidecar| sidecar.protocol_v7.is_some())
+    {
+        if schema_apply_sidecars
+            .iter()
+            .any(|sidecar| sidecar.protocol_v7.is_none())
+        {
+            return Err(schema_lock_conflict(
+                "found both legacy and exact SchemaApply recovery intents; refusing to choose a schema-staging direction",
+            ));
+        }
+        // Schema-v7 owns schema staging inside its exact state machine. An
+        // Armed intent rolls back; an EffectsConfirmed intent promotes only
+        // after its fixed manifest outcome is visible. The legacy eager
+        // promotion below would turn a partial v7 migration into live schema.
+        return Ok(SchemaStateRecovery::Noop);
+    }
+    if !schema_apply_sidecars.is_empty() {
         warn!(
             "recovery: SchemaApply sidecar present; completing schema-staging rename so the \
              manifest-drift sweep's roll-forward sees the new catalog (manifest v{})",
@@ -487,14 +515,20 @@ pub(crate) async fn recover_schema_state_files(
     }
 }
 
-async fn cleanup_staging_files(root_uri: &str, storage: &dyn StorageAdapter) -> Result<()> {
+pub(crate) async fn cleanup_staging_files(
+    root_uri: &str,
+    storage: &dyn StorageAdapter,
+) -> Result<()> {
     storage.delete(&schema_source_staging_uri(root_uri)).await?;
     storage.delete(&schema_ir_staging_uri(root_uri)).await?;
     storage.delete(&schema_state_staging_uri(root_uri)).await?;
     Ok(())
 }
 
-async fn complete_staging_rename(root_uri: &str, storage: &dyn StorageAdapter) -> Result<()> {
+pub(crate) async fn complete_staging_rename(
+    root_uri: &str,
+    storage: &dyn StorageAdapter,
+) -> Result<()> {
     // Each rename is independent and idempotent: if the source no longer
     // exists (already renamed) we skip it. This handles partial-rename
     // recovery (e.g. one file renamed before crash).
@@ -516,6 +550,158 @@ async fn complete_staging_rename(root_uri: &str, storage: &dyn StorageAdapter) -
         &schema_state_uri(root_uri),
     )
     .await?;
+    Ok(())
+}
+
+/// Verify that every durable staging artifact belongs to one exact
+/// SchemaApply target. A partial promotion is accepted only when the live
+/// identity already equals that same target; mismatched files are never
+/// renamed or deleted on another intent's behalf.
+pub(crate) async fn validate_exact_schema_staging_target(
+    root_uri: &str,
+    storage: &dyn StorageAdapter,
+    target_schema_ir_hash: &str,
+) -> Result<()> {
+    let pg_staging = schema_source_staging_uri(root_uri);
+    let ir_staging = schema_ir_staging_uri(root_uri);
+    let state_staging = schema_state_staging_uri(root_uri);
+    let pg_exists = storage.exists(&pg_staging).await?;
+    let ir_exists = storage.exists(&ir_staging).await?;
+    let state_exists = storage.exists(&state_staging).await?;
+    // Promotion renames source -> IR -> state independently. A crash between
+    // any two renames therefore leaves a mixture of live and staging files.
+    // Verify each artifact at whichever location currently owns it instead of
+    // using the state marker as a proxy for the whole three-file contract.
+    let source_uri = if pg_exists {
+        pg_staging
+    } else {
+        schema_source_uri(root_uri)
+    };
+    let source = storage.read_text(&source_uri).await?;
+    let source_ir = compile_schema_source(&source)?;
+    let source_hash =
+        schema_ir_hash(&source_ir).map_err(|error| schema_lock_conflict(error.to_string()))?;
+    if source_hash != target_schema_ir_hash {
+        return Err(schema_lock_conflict(format!(
+            "schema source at '{}' does not belong to the exact SchemaApply intent",
+            source_uri
+        )));
+    }
+
+    let ir_uri = if ir_exists {
+        ir_staging
+    } else {
+        schema_ir_uri(root_uri)
+    };
+    let ir_text = storage.read_text(&ir_uri).await?;
+    let ir = serde_json::from_str::<SchemaIR>(&ir_text)
+        .map_err(|error| schema_lock_conflict(error.to_string()))?;
+    let ir_hash = schema_ir_hash(&ir).map_err(|error| schema_lock_conflict(error.to_string()))?;
+    if ir_hash != target_schema_ir_hash {
+        return Err(schema_lock_conflict(format!(
+            "compiled schema at '{}' does not belong to the exact SchemaApply intent",
+            ir_uri
+        )));
+    }
+
+    let state_uri = if state_exists {
+        state_staging
+    } else {
+        schema_state_uri(root_uri)
+    };
+    let state_text = storage.read_text(&state_uri).await?;
+    let state = serde_json::from_str::<SchemaState>(&state_text)
+        .map_err(|error| schema_lock_conflict(error.to_string()))?;
+    if state.format_version != SCHEMA_STATE_FORMAT_VERSION
+        || state.schema_ir_hash != target_schema_ir_hash
+    {
+        return Err(schema_lock_conflict(format!(
+            "schema identity at '{}' does not belong to the exact SchemaApply intent",
+            state_uri
+        )));
+    }
+    Ok(())
+}
+
+pub(crate) async fn promote_exact_schema_staging(
+    root_uri: &str,
+    storage: &dyn StorageAdapter,
+    target_schema_ir_hash: &str,
+) -> Result<()> {
+    validate_exact_schema_staging_target(root_uri, storage, target_schema_ir_hash).await?;
+    complete_staging_rename(root_uri, storage).await?;
+    let live = read_schema_state_identity(root_uri, storage).await?;
+    if live.schema_ir_hash != target_schema_ir_hash {
+        return Err(schema_lock_conflict(
+            "exact SchemaApply promotion completed without the intended live identity",
+        ));
+    }
+    Ok(())
+}
+
+pub(crate) async fn discard_exact_schema_staging(
+    root_uri: &str,
+    storage: &dyn StorageAdapter,
+    accepted_schema_ir_hash: &str,
+    target_schema_ir_hash: &str,
+) -> Result<()> {
+    let live = read_schema_state_identity(root_uri, storage).await?;
+    if live.schema_ir_hash != accepted_schema_ir_hash {
+        return Err(schema_lock_conflict(format!(
+            "cannot discard exact SchemaApply staging: live schema identity '{}' differs from captured authority '{}'",
+            live.schema_ir_hash, accepted_schema_ir_hash
+        )));
+    }
+    let any_staging = storage.exists(&schema_source_staging_uri(root_uri)).await?
+        || storage.exists(&schema_ir_staging_uri(root_uri)).await?
+        || storage.exists(&schema_state_staging_uri(root_uri)).await?;
+    if any_staging {
+        validate_present_exact_schema_staging_artifacts(root_uri, storage, target_schema_ir_hash)
+            .await?;
+        cleanup_staging_files(root_uri, storage).await?;
+    }
+    Ok(())
+}
+
+async fn validate_present_exact_schema_staging_artifacts(
+    root_uri: &str,
+    storage: &dyn StorageAdapter,
+    target_schema_ir_hash: &str,
+) -> Result<()> {
+    let pg_staging = schema_source_staging_uri(root_uri);
+    if storage.exists(&pg_staging).await? {
+        let source = storage.read_text(&pg_staging).await?;
+        let ir = compile_schema_source(&source)?;
+        let hash = schema_ir_hash(&ir).map_err(|error| schema_lock_conflict(error.to_string()))?;
+        if hash != target_schema_ir_hash {
+            return Err(schema_lock_conflict(
+                "_schema.pg.staging does not belong to the exact SchemaApply intent",
+            ));
+        }
+    }
+    let ir_staging = schema_ir_staging_uri(root_uri);
+    if storage.exists(&ir_staging).await? {
+        let text = storage.read_text(&ir_staging).await?;
+        let ir = serde_json::from_str::<SchemaIR>(&text)
+            .map_err(|error| schema_lock_conflict(error.to_string()))?;
+        let hash = schema_ir_hash(&ir).map_err(|error| schema_lock_conflict(error.to_string()))?;
+        if hash != target_schema_ir_hash {
+            return Err(schema_lock_conflict(
+                "_schema.ir.json.staging does not belong to the exact SchemaApply intent",
+            ));
+        }
+    }
+    let state_staging = schema_state_staging_uri(root_uri);
+    if storage.exists(&state_staging).await? {
+        let text = storage.read_text(&state_staging).await?;
+        let state = serde_json::from_str::<SchemaState>(&text)
+            .map_err(|error| schema_lock_conflict(error.to_string()))?;
+        if state.schema_ir_hash != target_schema_ir_hash {
+            return Err(schema_lock_conflict(
+                "__schema_state.json.staging does not belong to the exact SchemaApply intent",
+            ));
+        }
+    }
     Ok(())
 }
 

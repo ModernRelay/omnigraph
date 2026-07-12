@@ -500,6 +500,125 @@ async fn exact_commit_exposes_lance_preflight_rebase_version() {
     assert_eq!(next_observed, next_planned);
 }
 
+#[tokio::test]
+async fn staged_create_is_invisible_until_exact_commit_and_never_replaces_a_winner() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path().to_str().unwrap();
+    let store = TableStore::new(root, test_session());
+    let cases = [
+        (
+            "empty",
+            person_batch(&[("loser", Some(99))]),
+            RecordBatch::new_empty(person_schema()),
+            Vec::<String>::new(),
+        ),
+        (
+            "rows",
+            person_batch(&[("loser", Some(99))]),
+            person_batch(&[("alice", Some(30)), ("bob", Some(25))]),
+            vec!["alice".to_string(), "bob".to_string()],
+        ),
+    ];
+
+    for (name, losing_batch, winning_batch, expected_ids) in cases {
+        let uri = format!("{root}/{name}.lance");
+        // Both writers stage while the dataset is still absent. Distinct
+        // payloads and UUIDs are load-bearing: replaying one identical
+        // transaction would only test idempotency, not winner preservation.
+        let losing_stage = store.stage_create(&uri, losing_batch).await.unwrap();
+        let losing_planned = losing_stage.transaction_identity();
+        let winning_stage = store.stage_create(&uri, winning_batch).await.unwrap();
+        let winning_planned = winning_stage.transaction_identity();
+        assert_eq!(
+            losing_planned.read_version, 0,
+            "first-touch creation must be based on the absent version"
+        );
+        assert_eq!(winning_planned.read_version, 0);
+        assert_ne!(
+            losing_planned.uuid, winning_planned.uuid,
+            "independent creators must carry distinct transaction identities"
+        );
+
+        assert!(
+            Dataset::open(&uri).await.is_err(),
+            "staging may write data files but must not publish version 1"
+        );
+
+        let (created, observed) = store
+            .commit_staged_create_exact(&uri, winning_stage)
+            .await
+            .unwrap();
+        assert_eq!(created.version().version, 1);
+        assert_eq!(observed, winning_planned);
+        assert_eq!(
+            collect_ids(&store.scan_batches(&created).await.unwrap()),
+            expected_ids
+        );
+        assert!(
+            created.manifest.uses_stable_row_ids(),
+            "all graph tables require stable row IDs from their first version"
+        );
+
+        store
+            .commit_staged_create_exact(&uri, losing_stage)
+            .await
+            .expect_err("strict read-version-0 overwrite must reject a concurrent winner");
+        let winner = Dataset::open(&uri).await.unwrap();
+        assert_eq!(
+            winner.version().version,
+            1,
+            "the rejected stale create must not overwrite or advance the winner"
+        );
+        assert_eq!(
+            collect_ids(&store.scan_batches(&winner).await.unwrap()),
+            expected_ids,
+            "the losing creator's distinct payload must never replace the winner"
+        );
+    }
+}
+
+#[tokio::test]
+async fn exact_overwrite_rejects_foreign_append_without_altering_the_winner() {
+    let dir = tempfile::tempdir().unwrap();
+    let uri = format!("{}/people.lance", dir.path().to_str().unwrap());
+    let store = TableStore::new(dir.path().to_str().unwrap(), test_session());
+
+    let base = TableStore::write_dataset(&uri, person_batch(&[("alice", Some(30))]))
+        .await
+        .unwrap();
+    let staged = store
+        .stage_overwrite(&base, person_batch(&[("replacement", Some(99))]))
+        .await
+        .unwrap();
+    let planned = staged.transaction_identity();
+    assert_eq!(planned.read_version, 1);
+
+    // A foreign append owns version 2 before the stale Overwrite attempts its
+    // one exact commit. Lance Overwrite is normally permissive relative to a
+    // concurrent Append, so `with_max_retries(0)`'s strict-overwrite behavior
+    // is the only thing preventing the replacement image from landing at v3.
+    let mut foreign_winner = base.clone();
+    lance_append_inline_local(&mut foreign_winner, person_batch(&[("foreign", Some(40))])).await;
+    assert_eq!(foreign_winner.version().version, 2);
+
+    store
+        .commit_staged_exact(Arc::new(base), staged)
+        .await
+        .expect_err("strict exact Overwrite must reject the already-owned next version");
+
+    let winner = Dataset::open(&uri).await.unwrap();
+    assert_eq!(
+        winner.version().version,
+        2,
+        "the rejected Overwrite must not advance HEAD past the foreign winner"
+    );
+    assert_eq!(
+        collect_ids(&store.scan_batches(&winner).await.unwrap()),
+        vec!["alice".to_string(), "foreign".to_string()],
+        "the foreign append must survive and the replacement image must stay invisible"
+    );
+}
+
 /// **Documented limitation** (see `scan_with_staged` doc): when a filter
 /// is supplied, Lance's stats-based pruning drops the staged fragment from
 /// the filtered scan because uncommitted fragments produced by

@@ -40,13 +40,14 @@ use publisher::{GraphNamespacePublisher, ManifestBatchPublisher, PublishOutcome}
 pub(crate) use recovery::{
     HealPendingOutcome, RecoveryAuthorityToken, RecoveryBranchMergeEffect,
     RecoveryBranchMergeEffectKind, RecoveryLineageIntent, RecoveryManifestDelta, RecoveryMode,
-    RecoverySidecar, RecoverySidecarHandle, RecoveryTableUpdateSlot,
-    SCHEMA_APPLY_CONFIRMATION_SCHEMA_VERSION, SidecarKind, SidecarTablePin,
+    RecoverySchemaApplyEffect, RecoverySchemaApplyEffectKind, RecoverySidecar,
+    RecoverySidecarHandle, RecoveryTableUpdateSlot, SidecarKind, SidecarTablePin,
     SidecarTableRegistration, SidecarTombstone, confirm_branch_merge_sidecar_phase_b,
-    confirm_occ_sidecar_phase_b, confirm_schema_apply_manifest_published, delete_sidecar,
-    has_schema_apply_sidecar, heal_pending_sidecars_roll_forward, list_sidecars,
-    new_branch_merge_sidecar, new_ensure_indices_sidecar, new_occ_sidecar, new_sidecar,
-    recover_manifest_drift, schema_apply_serial_queue_key, write_sidecar,
+    confirm_occ_sidecar_phase_b, confirm_schema_apply_sidecar_v7, delete_sidecar,
+    ensure_read_only_schema_coherent, heal_pending_sidecars_roll_forward, list_sidecars,
+    new_branch_merge_sidecar, new_ensure_indices_sidecar, new_occ_sidecar,
+    new_schema_apply_sidecar_v7, new_sidecar, recover_manifest_drift,
+    schema_apply_serial_queue_key, write_sidecar,
 };
 pub use state::SubTableEntry;
 #[cfg(test)]
