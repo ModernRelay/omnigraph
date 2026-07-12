@@ -2204,6 +2204,33 @@ async fn schema_apply_recovers_partial_schema_promotion_after_commit_crash() {
         .path()
         .join("__recovery")
         .join(format!("{}.json", single_sidecar_operation_id(dir.path())));
+
+    // Even though read-only open historically ignores corrupt recovery files,
+    // it must fail closed when schema-staging artifacts mean that the corrupt
+    // file could be the only proof of a committed-but-unpromoted SchemaApply.
+    // Keep the valid body so the rest of this test can exercise recovery.
+    let valid_sidecar = std::fs::read_to_string(&sidecar_path).unwrap();
+    std::fs::write(&sidecar_path, "{not json").unwrap();
+    let corrupt_read_only_error = match Omnigraph::open_read_only(&uri).await {
+        Ok(_) => panic!("read-only open must refuse corrupt intent plus schema staging"),
+        Err(error) => error,
+    };
+    assert!(matches!(
+        corrupt_read_only_error,
+        OmniError::RecoveryRequired { .. }
+    ));
+    assert!(
+        corrupt_read_only_error
+            .to_string()
+            .contains("schema-staging artifacts alongside unparseable recovery sidecar")
+    );
+    assert_eq!(
+        std::fs::read_to_string(dir.path().join("_schema.pg")).unwrap(),
+        SCHEMA_V1,
+        "the corrupt-sidecar guard must remain non-mutating"
+    );
+    std::fs::write(&sidecar_path, valid_sidecar).unwrap();
+
     let read_only_error = match Omnigraph::open_read_only(&uri).await {
         Ok(_) => panic!("read-only open must refuse a committed-but-unpromoted SchemaApply"),
         Err(error) => error,

@@ -620,9 +620,12 @@ storage-fault failpoints `recovery.sidecar_{write,delete,list}` /
   consumer — the write-entry heal fails the write, the open-time sweep
   fails the open. Silently skipping recovery would be consumer
   tolerance of drift.
-- **Corrupt / unparseable sidecar**: refused loudly by heal and open
-  alike; the file stays on disk for operator inspection (read-only
-  opens still work — the sweep is skipped there).
+- **Corrupt / unparseable sidecar**: refused loudly by heal and read-write
+  open; the file stays on disk for operator inspection. Read-only open keeps
+  its historical tolerance when no schema staging exists, but returns
+  `RecoveryRequired` when any schema-staging artifact is present because the
+  malformed intent may be the only proof of a committed-but-unpromoted
+  SchemaApply.
 - **Audit append fails after a roll-forward publish**: that recovery
   attempt errors and keeps the sidecar; re-entry sees the
   already-published manifest, records exactly one `RolledForward`

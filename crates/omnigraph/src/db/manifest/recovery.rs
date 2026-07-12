@@ -40,7 +40,10 @@ use tracing::warn;
 
 use crate::db::graph_coordinator::GraphCoordinator;
 use crate::db::recovery_audit::{RecoveryAudit, RecoveryAuditRecord, RecoveryKind, TableOutcome};
-use crate::db::schema_state::{SchemaStateRecovery, read_schema_state_identity};
+use crate::db::schema_state::{
+    SchemaStateRecovery, read_schema_state_identity, schema_ir_staging_uri,
+    schema_source_staging_uri, schema_state_staging_uri,
+};
 use crate::error::{OmniError, Result};
 use crate::storage::StorageAdapter;
 use crate::table_store::StagedTransactionIdentity;
@@ -1085,15 +1088,18 @@ pub(crate) async fn list_sidecars(
 /// guard. ReadOnly historically skips recovery classification entirely, so a
 /// corrupt/future sidecar must not make an otherwise coherent read fail. Valid
 /// SchemaApply intents are still inspected; malformed files remain untouched
-/// for the next read-write open to reject and for operator inspection.
+/// for the next read-write open to reject and for operator inspection. Their
+/// URIs and parse errors are returned separately so the caller can fail closed
+/// if schema-staging artifacts make them relevant to catalog coherence.
 async fn list_parseable_sidecars_for_read_only(
     root_uri: &str,
     storage: &dyn StorageAdapter,
-) -> Result<Vec<RecoverySidecar>> {
+) -> Result<(Vec<RecoverySidecar>, Vec<(String, String)>)> {
     let dir = recovery_dir_uri(root_uri);
     let mut uris = storage.list_dir(&dir).await?;
     uris.sort();
     let mut out = Vec::with_capacity(uris.len());
+    let mut unparseable = Vec::new();
     for uri in uris {
         if !uri.ends_with(".json") {
             continue;
@@ -1101,14 +1107,17 @@ async fn list_parseable_sidecars_for_read_only(
         let body = storage.read_text(&uri).await?;
         match parse_sidecar(&uri, &body) {
             Ok(sidecar) => out.push(sidecar),
-            Err(error) => warn!(
-                sidecar_uri = uri.as_str(),
-                error = %error,
-                "read-only open is leaving an unparseable recovery sidecar for read-write recovery"
-            ),
+            Err(error) => {
+                warn!(
+                    sidecar_uri = uri.as_str(),
+                    error = %error,
+                    "read-only open is leaving an unparseable recovery sidecar for read-write recovery"
+                );
+                unparseable.push((uri, error.to_string()));
+            }
         }
     }
-    Ok(out)
+    Ok((out, unparseable))
 }
 
 /// Re-read one listed sidecar after its process-local recovery gates are held.
@@ -5210,7 +5219,30 @@ pub(crate) async fn ensure_read_only_schema_coherent(
     root_uri: &str,
     storage: &dyn StorageAdapter,
 ) -> Result<()> {
-    for sidecar in list_parseable_sidecars_for_read_only(root_uri, storage).await? {
+    let (sidecars, unparseable) =
+        list_parseable_sidecars_for_read_only(root_uri, storage).await?;
+    if let Some((uri, parse_error)) = unparseable.first() {
+        let has_schema_staging = storage.exists(&schema_source_staging_uri(root_uri)).await?
+            || storage.exists(&schema_ir_staging_uri(root_uri)).await?
+            || storage.exists(&schema_state_staging_uri(root_uri)).await?;
+        if has_schema_staging {
+            let operation_id = uri
+                .rsplit('/')
+                .next()
+                .and_then(|name| name.strip_suffix(".json"))
+                .unwrap_or(uri)
+                .to_string();
+            return Err(OmniError::recovery_required(
+                operation_id,
+                format!(
+                    "read-only open found schema-staging artifacts alongside unparseable recovery sidecar '{}', so schema coherence cannot be proven: {}; run a read-write open or inspect the sidecar",
+                    uri, parse_error
+                ),
+            ));
+        }
+    }
+
+    for sidecar in sidecars {
         if !matches!(sidecar.writer_kind, SidecarKind::SchemaApply) {
             continue;
         }

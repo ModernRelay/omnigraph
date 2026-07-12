@@ -508,6 +508,9 @@ able to enumerate every adapter and every entry point that invokes it.
 - Read-only open performs no recovery writes. If the fixed original manifest
   outcome is visible before the target schema identity is fully promoted, it
   fails with `RecoveryRequired` rather than exposing a torn manifest/catalog pair.
+  An unparseable recovery sidecar remains tolerated only when no schema-staging
+  artifact exists; their coexistence also fails closed because the sidecar may
+  be the missing SchemaApply outcome proof.
 - In-process query, export, graph-index, and blob-read entry points capture their
   manifest snapshot and an operation-local catalog rebuilt from the accepted
   contract under the schema-control gate; a stale handle ArcSwap is not
