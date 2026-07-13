@@ -1,3 +1,5 @@
+#![cfg(test)]
+
 //! Primitive-level tests for `TableStore`'s staged-write API. These
 //! exercise `stage_append`, `stage_merge_insert`, `scan_with_staged`,
 //! and `count_rows_with_staged` directly against a Lance dataset — no
@@ -18,14 +20,14 @@
 //!    behavior so a future change either (a) preserves it or
 //!    (b) consciously fixes it (and updates this test).
 
+use crate::storage_layer::IndexBuildSpec;
+use crate::table_store::{StagedWrite, TableStore};
 use arrow_array::{Array, Int32Array, RecordBatch, StringArray, UInt64Array};
 use arrow_schema::{DataType, Field, Schema};
 use futures::TryStreamExt;
 use lance::Dataset;
 use lance::dataset::{DeleteBuilder, WhenMatched, WhenNotMatched};
 use lance_table::format::Fragment;
-use omnigraph::storage_layer::IndexBuildSpec;
-use omnigraph::table_store::{StagedWrite, TableStore};
 
 /// A standalone Lance `Session` per test store (this binary is primitive-level
 /// and deliberately does not include the shared `helpers` module).
@@ -238,6 +240,81 @@ async fn count_rows_with_staged_matches_scan() {
         .await
         .unwrap();
     assert_eq!(count, 3);
+}
+
+/// `scan_with_pending` must reject a call where `key_column` is
+/// requested but the projection omits that column. Without the
+/// up-front check, the helper silently degraded to union semantics —
+/// letting a chained-update bug slip through unnoticed. This test
+/// verifies the contract is enforced at the API boundary.
+#[tokio::test]
+async fn scan_with_pending_rejects_key_column_missing_from_projection() {
+    let dir = tempfile::tempdir().unwrap();
+    let uri = format!("{}/people.lance", dir.path().to_str().unwrap());
+    let store = TableStore::new(dir.path().to_str().unwrap(), test_session());
+
+    let schema = Arc::new(Schema::new(vec![
+        Field::new("id", DataType::Utf8, false),
+        Field::new("note", DataType::Utf8, true),
+    ]));
+    let seed = RecordBatch::try_new(
+        schema.clone(),
+        vec![
+            Arc::new(StringArray::from(vec!["a", "b"])) as _,
+            Arc::new(StringArray::from(vec![Some("seed-a"), Some("seed-b")])) as _,
+        ],
+    )
+    .unwrap();
+    let ds = TableStore::write_dataset(&uri, seed).await.unwrap();
+
+    let pending = RecordBatch::try_new(
+        schema,
+        vec![
+            Arc::new(StringArray::from(vec!["a"])) as _,
+            Arc::new(StringArray::from(vec![Some("pending-a")])) as _,
+        ],
+    )
+    .unwrap();
+
+    // Bad call: key_column = "id" but projection doesn't include "id".
+    // Pre-fix this silently disabled merge-shadowing and returned both
+    // committed "a" and pending "a" rows. Now it must error.
+    let err = store
+        .scan_with_pending(
+            &ds,
+            std::slice::from_ref(&pending),
+            None,
+            Some(&["note"]),
+            None,
+            Some("id"),
+        )
+        .await
+        .expect_err("scan_with_pending must reject merge-shadow with missing key in projection");
+    let msg = err.to_string();
+    assert!(
+        msg.contains("key_column 'id'") && msg.contains("must appear in projection"),
+        "unexpected error: {msg}"
+    );
+
+    // Good call: projection includes the key column. Shadow works:
+    // pending row 'a' shadows committed 'a', so the result has only
+    // committed 'b' + pending 'a'.
+    let batches = store
+        .scan_with_pending(
+            &ds,
+            std::slice::from_ref(&pending),
+            None,
+            Some(&["id", "note"]),
+            None,
+            Some("id"),
+        )
+        .await
+        .expect("projection containing key_column must succeed");
+    assert_eq!(
+        collect_ids(&batches),
+        vec!["a", "b"],
+        "merge-shadow should drop committed 'a' and surface pending 'a' + committed 'b'"
+    );
 }
 
 /// Two `stage_append` calls on the same dataset must produce

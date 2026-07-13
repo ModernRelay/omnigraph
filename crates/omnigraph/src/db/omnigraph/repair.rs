@@ -167,13 +167,10 @@ pub async fn repair_all_tables(db: &Omnigraph, options: RepairOptions) -> Result
     for (table_key, full_path) in table_tasks {
         // `classify_drift` inspects raw Lance transaction history
         // (`read_transaction_by_version`), a Lance-only maintenance read the
-        // staged-write trait does not surface. Open via `db.storage()` and
-        // unwrap the opaque handle (mirrors optimize / cleanup).
-        let ds = db
-            .storage()
-            .open_dataset_head(&full_path, None)
-            .await?
-            .into_dataset();
+        // staged-write trait does not surface. The raw borrow is an enumerated,
+        // read-only escape; repair never takes ownership or moves Lance HEAD.
+        let handle = db.storage().open_dataset_head(&full_path, None).await?;
+        let ds = handle.dataset();
         let manifest_version = snapshot
             .entry(&table_key)
             .map(|e| e.table_version)
@@ -200,7 +197,7 @@ pub async fn repair_all_tables(db: &Omnigraph, options: RepairOptions) -> Result
             continue;
         }
 
-        let classification = classify_drift(&ds, manifest_version, lance_head_version).await;
+        let classification = classify_drift(ds, manifest_version, lance_head_version).await;
         let action = match (
             options.confirm,
             options.force,
@@ -219,10 +216,7 @@ pub async fn repair_all_tables(db: &Omnigraph, options: RepairOptions) -> Result
         };
 
         if matches!(action, RepairAction::Healed | RepairAction::Forced) {
-            // Re-wrap the opened dataset to read its state through the trait
-            // surface (`table_state` is a read; no HEAD advance).
-            let snapshot = crate::storage_layer::SnapshotHandle::new(ds);
-            let state = db.storage().table_state(&full_path, &snapshot).await?;
+            let state = db.storage().table_state(&full_path, &handle).await?;
             updates.push(crate::db::SubTableUpdate {
                 table_key: table_key.clone(),
                 table_version: state.version,

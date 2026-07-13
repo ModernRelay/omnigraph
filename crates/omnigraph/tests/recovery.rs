@@ -18,7 +18,7 @@ use lance::Dataset;
 use omnigraph::db::Omnigraph;
 
 mod helpers;
-use helpers::{snapshot_main, test_session};
+use helpers::snapshot_main;
 use helpers::recovery::{RecoveryExpectation, TableExpectation, assert_post_recovery_invariants};
 
 const TEST_SCHEMA: &str = include_str!("fixtures/test.pg");
@@ -1484,8 +1484,6 @@ async fn recovery_multi_sidecar_requires_fresh_snapshot_for_correctness() {
 #[tokio::test]
 async fn recovery_classifies_feature_branch_sidecar_against_feature_branch() {
     use omnigraph::loader::{LoadMode, load_jsonl};
-    use omnigraph::table_store::TableStore;
-
     let dir = tempfile::tempdir().unwrap();
     let uri = dir.path().to_str().unwrap();
 
@@ -1530,11 +1528,7 @@ async fn recovery_classifies_feature_branch_sidecar_against_feature_branch() {
     // Bypass the manifest: append directly to Person's Lance HEAD on the
     // feature branch ref to advance HEAD past v_pin.
     let person_uri = node_table_uri(uri, "Person");
-    let store = TableStore::new(uri, test_session());
-    let mut ds = store
-        .open_dataset_head(&person_uri, feature_branch_name.as_deref())
-        .await
-        .unwrap();
+    let mut ds = helpers::open_dataset_head(&person_uri, feature_branch_name.as_deref()).await;
     helpers::lance_append_inline(&mut ds, person_batch(&[("carol-id", "carol", Some(40))])).await;
     let v_head = ds.version().version;
     assert_eq!(v_head, v_pin + 1, "append must advance HEAD by 1");
@@ -1600,8 +1594,6 @@ async fn recovery_classifies_feature_branch_sidecar_against_feature_branch() {
 #[tokio::test]
 async fn recovery_rolls_back_feature_branch_sidecar_against_feature_branch() {
     use omnigraph::loader::{LoadMode, load_jsonl};
-    use omnigraph::table_store::TableStore;
-
     let dir = tempfile::tempdir().unwrap();
     let uri = dir.path().to_str().unwrap();
 
@@ -1645,11 +1637,7 @@ async fn recovery_rolls_back_feature_branch_sidecar_against_feature_branch() {
     // Bypass the manifest: append on the feature ref to advance HEAD past
     // the manifest pin.
     let person_uri = node_table_uri(uri, "Person");
-    let store = TableStore::new(uri, test_session());
-    let mut ds = store
-        .open_dataset_head(&person_uri, feature_branch_name.as_deref())
-        .await
-        .unwrap();
+    let mut ds = helpers::open_dataset_head(&person_uri, feature_branch_name.as_deref()).await;
     helpers::lance_append_inline(&mut ds, person_batch(&[("dave-id", "dave", Some(50))])).await;
     let v_head = ds.version().version;
     assert_eq!(v_head, v_pin + 1);
@@ -1704,10 +1692,7 @@ async fn recovery_rolls_back_feature_branch_sidecar_against_feature_branch() {
     .unwrap();
 
     // Lance HEAD on the feature ref must have advanced (real restore ran).
-    let post = store
-        .open_dataset_head(&person_uri, feature_branch_name.as_deref())
-        .await
-        .unwrap();
+    let post = helpers::open_dataset_head(&person_uri, feature_branch_name.as_deref()).await;
     assert!(
         post.version().version > v_head,
         "real restore must have appended a commit on feature; v_head={}, post={}",

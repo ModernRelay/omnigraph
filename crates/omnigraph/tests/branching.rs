@@ -4,7 +4,6 @@ use std::fs;
 
 use arrow_array::{Array, Int32Array, UInt64Array};
 use futures::TryStreamExt;
-use lance::index::DatasetIndexExt;
 use lance_index::is_system_index;
 
 use omnigraph::db::commit_graph::CommitGraph;

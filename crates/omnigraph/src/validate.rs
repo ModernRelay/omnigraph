@@ -297,7 +297,7 @@ impl<'a> CommittedState<'a> {
             return Ok(None);
         };
         match committed.entry(table_key) {
-            Some(_) => Ok(Some(committed.open(table_key).await?)),
+            Some(_) => Ok(Some(committed.open_dataset(table_key).await?)),
             None => Ok(None),
         }
     }
@@ -327,11 +327,11 @@ impl<'a> CommittedState<'a> {
                 // `table_branch` and pinned version (including inheritance).
                 let live = db.fresh_snapshot_for_branch_unchecked(branch).await?;
                 match live.entry(table_key) {
-                    Some(_) => Ok(Some(live.open(table_key).await?)),
+                    Some(_) => Ok(Some(live.open_dataset(table_key).await?)),
                     None => Ok(None),
                 }
             }
-            None => Ok(Some(committed.open(table_key).await?)),
+            None => Ok(Some(committed.open_dataset(table_key).await?)),
         }
     }
 
@@ -518,7 +518,7 @@ pub(crate) async fn overwrite_removed_ids(
             }
         }
     }
-    let ds = base.open(table_key).await?;
+    let ds = base.open_dataset(table_key).await?;
     let mut removed = Vec::new();
     for batch in &scan_all(&ds, &["id"]).await? {
         let column = string_col(batch, "id")?;

@@ -140,8 +140,9 @@ pub(super) struct PublishOutcome {
 
 #[async_trait]
 pub(super) trait ManifestBatchPublisher: Send + Sync {
-    /// Legacy publish behavior. All existing writers deliberately retain
-    /// `Any` until enrolled in their RFC-022 adapter.
+    /// Compatibility/default publish behavior for bounded or recovery paths
+    /// that do not carry an exact graph-head precondition. Exact RFC-022
+    /// adapters call `publish_with_precondition` directly.
     async fn publish(
         &self,
         changes: &[ManifestChange],

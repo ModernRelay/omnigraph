@@ -1,5 +1,5 @@
 pub mod commit_graph;
-pub mod graph_coordinator;
+mod graph_coordinator;
 pub mod manifest;
 mod omnigraph;
 mod recovery_audit;
@@ -7,8 +7,8 @@ mod schema_state;
 pub(crate) mod write_queue;
 
 pub use commit_graph::GraphCommit;
-pub use graph_coordinator::{GraphCoordinator, ReadTarget, ResolvedTarget, SnapshotId};
-pub use manifest::{Snapshot, SubTableEntry, SubTableUpdate};
+pub use graph_coordinator::{ReadTarget, ResolvedTarget, SnapshotId};
+pub use manifest::{Snapshot, SnapshotScanner, SnapshotTable, SubTableEntry, SubTableUpdate};
 pub(crate) use omnigraph::ensure_public_branch_ref;
 pub(crate) use omnigraph::{DeferredTableFork, WriteTxn};
 pub use omnigraph::{

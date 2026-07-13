@@ -90,7 +90,7 @@ pub(crate) struct PublishedSnapshot {
     pub _snapshot_id: SnapshotId,
 }
 
-pub struct GraphCoordinator {
+pub(crate) struct GraphCoordinator {
     root_uri: String,
     storage: Arc<dyn StorageAdapter>,
     manifest: ManifestCoordinator,
@@ -99,7 +99,7 @@ pub struct GraphCoordinator {
 }
 
 impl GraphCoordinator {
-    pub async fn init(
+    pub(crate) async fn init(
         root_uri: &str,
         catalog: &Catalog,
         storage: Arc<dyn StorageAdapter>,
@@ -234,7 +234,7 @@ impl GraphCoordinator {
             })
     }
 
-    pub async fn branch_create(&mut self, name: &str) -> Result<()> {
+    pub(crate) async fn branch_create(&mut self, name: &str) -> Result<()> {
         let branch = normalize_branch_name(name)?
             .ok_or_else(|| OmniError::manifest("cannot create branch 'main'".to_string()))?;
 
@@ -245,7 +245,7 @@ impl GraphCoordinator {
         self.manifest.create_branch(&branch).await
     }
 
-    pub async fn branch_delete(&mut self, name: &str) -> Result<()> {
+    pub(crate) async fn branch_delete(&mut self, name: &str) -> Result<()> {
         let branch = normalize_branch_name(name)?
             .ok_or_else(|| OmniError::manifest("cannot delete branch 'main'".to_string()))?;
         if self.current_branch() == Some(branch.as_str()) {

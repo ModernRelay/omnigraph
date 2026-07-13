@@ -551,8 +551,8 @@ able to enumerate every adapter and every entry point that invokes it.
 - Readers retain schema-v6 EnsureIndices sidecars under their original loose
   classification, fixed rollback id, and durable rollback-audit semantics. A v6
   file is a compatibility input, never reinterpreted as a v8 ownership proof.
-- Optimize now uses one graph-wide visibility envelope while retaining legacy
-  schema-v2 loose effect provenance. After its broad entry probe it acquires
+- Optimize uses one graph-wide visibility envelope through the bounded
+  schema-v2 maintenance adapter. After its broad entry probe it acquires
   schema → main branch → every accepted-catalog table gate, loads one
   operation-local accepted catalog, relists recovery, and plans productive work
   from a fresh snapshot. One multi-pin sidecar covers every productive table;
@@ -562,10 +562,14 @@ able to enumerate every adapter and every entry point that invokes it.
   omitted, not rejected by strict graph-head/read-set OCC. Post-arm failure leaves
   the shared sidecar and returns `RecoveryRequired`; v2 Full recovery rolls a
   complete effect set forward in one batch or compensates a partial set. Main stays
-  held through final physical `__manifest` compaction. This is not the future exact
-  Optimize adapter: the v2 reader has no transaction/authority/fixed-lineage proof,
-  remains inside the single-writer-process recovery boundary, and is not a
-  distributed fence.
+  held through final physical `__manifest` compaction. The v2 reader has no
+  transaction/authority/fixed-lineage proof, so this supported adapter remains
+  inside the single-writer-process recovery boundary and is not a distributed
+  fence. Replacing it with exact provenance is deliberately deferred until both
+  Lance exposes a stable public caller-controlled transaction API for the complete
+  compact/reindex operation and OmniGraph has distributed recovery ownership or
+  fencing. Exact identities without the latter would still leave destructive
+  cross-process recovery unsafe.
 - Logical operations never fail because a derived index is absent or behind.
 - Physical-only internal-table maintenance remains the exception in Section 8.
 
@@ -804,10 +808,12 @@ Implementation proceeds in this order:
    > upgrading their semantics. EnsureIndices now uses schema-v8 exact authority,
    > one mixed CreateIndex transaction per table, fixed lineage/delta, exact
    > first-touch ownership, and retains the schema-v6 compatibility reader.
-   > Optimize now has one graph-wide recovery/visibility envelope: one schema-v2
+   > Optimize now has one graph-wide recovery/visibility envelope: one bounded schema-v2
    > multi-pin sidecar, bounded-parallel physical effects, and one maintenance-class
-   > monotonic batch publish. Its exact provenance/authority conversion remains the
-   > final adapter slice. MemWAL is the supported, strategic substrate selected by
+   > monotonic batch publish. Exact provenance is deferred until Lance exposes a
+   > stable public caller-controlled maintenance transaction API and OmniGraph has
+   > distributed recovery fencing; it is not an RFC-022 rollout gate. MemWAL is the
+   > supported, strategic substrate selected by
    > RFC-026; its separate fold enrollment remains owned by that RFC.
 
    > **Branch-control/cleanup slice (2026-07-11):** native graph-branch create
@@ -819,17 +825,42 @@ Implementation proceeds in this order:
    > branch pin, computes `keep` from Lance's actual version list, refuses
    > uncovered main HEAD drift, and completes its live-root preflight before the
    > first table GC.
-3. Convert mutation/load, branch merge, schema apply/migration, data-table optimize,
-   and graph-visible index work one adapter at a time. Mutation/load, branch merge,
-   SchemaApply, and EnsureIndices are exact as of 2026-07-13. Optimize has one
-   graph-wide visibility envelope but retains schema-v2 loose recovery; exact
-   provenance/authority is its remaining adapter work.
-4. Add static or runtime enumeration proving no graph-visible entry point bypasses the
-   coordinator.
-5. Delete superseded writer-specific orchestration only after its crash and
-   concurrency cells pass through the adapter.
-6. Optimize background recovery latency only after the synchronous barrier and all
-   recovery classifications remain intact.
+3. Convert every current graph-visible effect writer. This is structurally complete
+   as of 2026-07-13: Mutation/Load, BranchMerge, SchemaApply, and EnsureIndices use
+   exact adapters; Optimize uses the bounded schema-v2 adapter described in §6.4.
+   The deferred exact Optimize upgrade is not an RFC-022 rollout gate.
+4. Keep the supported writer set closed. This is complete as of 2026-07-13:
+   raw storage/coordinator/handle-cache modules are crate-private and public
+   snapshots expose a read-only table/scan facade without Lance's raw scanner
+   or physical plan. `crates/omnigraph/tests/forbidden_apis.rs` adds a
+   defense-in-depth registry over public async inherent `Omnigraph` methods and
+   loader conveniences, every crate-visible async low-level coordinator method,
+   and exact per-file occurrences of registered durable-call shapes (including
+   recovery). A new supported surface or durable gateway fails the guard until
+   it is assigned an adapter or explicit exception. The source scanner covers
+   the concrete method/UFCS/raw-Dataset and selected rename/macro shapes pinned
+   by its self-tests; Rust visibility, not heuristic macro expansion, is the
+   structural closure.
+5. Remove superseded orchestration after its crash and concurrency cells pass through
+   the adapter. The old bypass surfaces are removed; writer-specific physical-effect
+   implementations remain intentionally behind their registered adapters.
+6. Treat further work as post-close-out latency or capability work: preserve the
+   synchronous barrier and recovery classifications, and require the two §6.4
+   triggers before replacing Optimize's bounded adapter.
+
+The close-out intentionally narrows `TableStore`, `TableStorage`, the raw table
+handle cache, `GraphCoordinator`, and `ManifestCoordinator` to crate visibility;
+public `Snapshot::open` now yields a read-only table facade and safe scan builder
+instead of Lance's writable `Dataset` / plan-exposing `Scanner`. That is a downstream Rust
+source break and therefore lands on the v0.9 line, where registry publication
+resumes; it has no CLI, wire, or storage-format effect. SDK callers use the
+registered `Omnigraph` and snapshot-read surfaces instead. The retired low-level
+methods expose writable Lance handles or bypass policy, recovery barriers, and
+ordered writer gates, so they are not supported alternatives to the unified path.
+The `failpoints` Cargo feature retains one doc-hidden, registry-classified
+`TestOnly` manifest-publish helper solely for adversarial integration fixtures;
+enabling fault injection is an explicit non-production exception to the SDK
+surface described here.
 
 Mixed writer binaries are not made safe by process-local gates. A deployment may
 enable the new protocol only when every writer that can reach the graph obeys the same
@@ -840,7 +871,13 @@ writers.
 
 ### 11.1 Protocol conformance
 
-- Enumerate every graph-visible entry point and its adapter.
+- Keep the shipped boundary and registry in
+  `crates/omnigraph/tests/forbidden_apis.rs` exhaustive for their declared
+  surface: raw storage/coordinator types stay crate-private; public snapshots
+  stay read-only without exposing raw scanners/plans; every public async inherent `Omnigraph`/loader entry point and
+  crate-visible async coordinator method is classified; and every registered
+  durable-call shape, including recovery execution, keeps its exact per-file
+  count.
 - Assert no sidecar-backed adapter can create an independently durable physical
   effect before its sidecar is durable.
 - Enumerate authority-first workflows and assert their CAS is the first durable
@@ -906,7 +943,9 @@ writers.
   rolls forward together; a partial set exposes no pointer and compensates under
   one v2 sidecar; monotonic publish, retryable physical contention, no-work/no-sidecar,
   lost acknowledgement after the manifest CAS, pending-only vector exclusion, and
-  history-flat manifest cost remain pinned. Exact provenance remains outstanding.
+  history-flat manifest cost remain pinned. Exact provenance is a deferred upgrade,
+  triggered only by a stable public Lance maintenance-transaction API plus
+  distributed OmniGraph recovery fencing.
 - MemWAL fold (supported strategic substrate; enrollment owned by RFC-026):
   merged-generation conflict and every fold crash boundary.
 - Native graph branch control: invalid name before clone; live path-prefix
@@ -947,11 +986,11 @@ The design rejects two tempting deny-list violations: treating process-local que
 distributed correctness, and treating recovery as derivable background work that a
 new writer may outrun.
 
-Acceptance should also add one clarification to invariant 15: a view of immutable,
+Invariant 15 already supplies the applicable rule: a view of immutable,
 version-pinned state may be cached, while an in-memory view of the mutable tip is only
-a hint. Every use of mutable-tip state as write input must be re-arbitrated by the
-commit authority. Durable heads under RFC-024 are one possible authoritative
-representation; this protocol does not require or bless a warm parallel truth path.
+a hint. Every use of mutable-tip state as write input is re-arbitrated by the commit
+authority. Durable heads under RFC-024 are one possible authoritative representation;
+this protocol does not require or bless a warm parallel truth path.
 
 ## 13. Drawbacks and rejected alternatives
 

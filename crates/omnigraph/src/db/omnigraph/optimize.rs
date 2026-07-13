@@ -293,9 +293,9 @@ pub async fn optimize_all_tables(db: &Omnigraph) -> Result<Vec<TableOptimizeStat
     prepared.sort_by(|left, right| left.table_key.cmp(&right.table_key));
 
     if !prepared.is_empty() {
-        // Phase A: one durable legacy-v2 intent before the first table HEAD
-        // advance. v2 remains deliberately loose until Optimize's exact-v9
-        // provenance slice; this change narrows visibility, not provenance.
+        // Phase A: one durable bounded-v2 intent before the first table HEAD
+        // advance. Exact provenance is deferred until Lance has a stable public
+        // maintenance-transaction API and recovery has a distributed fence.
         let pins = prepared
             .iter()
             .map(|work| crate::db::manifest::SidecarTablePin {
@@ -597,7 +597,7 @@ async fn apply_optimize_table_effects(
         // commits would otherwise fire Lance's auto-cleanup GC hook), compact,
         // incremental reindex, then materialize declared-but-missing indexes. The
         // maintenance APIs still commit inline; missing-index materialization uses a
-        // staged CreateIndex immediately committed under this legacy loose sidecar.
+        // staged CreateIndex immediately committed under this bounded-v2 sidecar.
         // A retryable Lance conflict
         // here means a concurrent writer preempted an overlapping fragment → reopen at
         // the new HEAD and re-plan. Baseline captured BEFORE the scrub so that if the
@@ -660,7 +660,7 @@ async fn apply_optimize_table_effects(
             .await?;
         // optimize_indices / index build may also have committed (folded fragments,
         // built a deferred index). Any HEAD advance this attempt counts too.
-        let version_after = snapshot.dataset().version().version;
+        let version_after = snapshot.version();
         head_advanced |= version_after != version_before;
 
         break (snapshot, metrics, pending_indexes, head_advanced);
@@ -1164,9 +1164,9 @@ pub async fn cleanup_all_tables(
                 crate::failpoints::maybe_fail(crate::failpoints::names::CLEANUP_TABLE_GC)?;
                 // `cleanup_old_versions` is a Lance-only maintenance API not
                 // surfaced through `TableStorage` — see the optimize path
-                // above for the same rationale. Unwrap via `into_dataset()`.
+                // above for the same rationale. It only needs a raw read borrow.
                 let handle = storage.open_dataset_head(&full_path, None).await?;
-                let ds = handle.into_dataset();
+                let ds = handle.dataset();
                 let requested_before_version = if let Some(keep) = keep_versions {
                     // Lance versions are not safely derivable from HEAD
                     // arithmetic after prior GC. Use the actual ordered
@@ -1205,7 +1205,7 @@ pub async fn cleanup_all_tables(
                     clean_referenced_branches: false,
                     delete_rate_limit: None,
                 };
-                lance::dataset::cleanup::cleanup_old_versions(&ds, policy)
+                lance::dataset::cleanup::cleanup_old_versions(ds, policy)
                     .await
                     .map_err(|e| OmniError::Lance(e.to_string()))
             }

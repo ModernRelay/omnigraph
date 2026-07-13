@@ -132,7 +132,7 @@ impl GraphIndex {
                 continue;
             }
 
-            let ds = snapshot.open(&table_key).await?;
+            let ds = snapshot.open_dataset(&table_key).await?;
 
             let batches: Vec<arrow_array::RecordBatch> = ds
                 .scan()

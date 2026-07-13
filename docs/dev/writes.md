@@ -277,11 +277,26 @@ Three writers have been migrated onto staged primitives:
   — rewrites use `stage_overwrite` + `commit_staged`, including empty-table
   rewrites via a zero-fragment Lance `Operation::Overwrite`.
 
-A defense-in-depth integration test (`tests/forbidden_apis.rs`) walks
-engine source and fails if non-allow-listed code calls Lance's
-inline-commit APIs directly. The trait surface itself is the primary
-enforcement (sealed + only-callable-via-trait once call sites land);
-the grep test catches type-system bypass attempts.
+Rust visibility is the primary graph-write boundary: the raw storage,
+handle-cache, and coordinator modules are crate-private. Public snapshot access
+returns a read-only table facade rather than Lance's writable `Dataset`, and its
+scan facade executes the configured read without exposing Lance's raw `Scanner`
+or physical plan (a scan execution node can otherwise reveal its dataset). A
+defense-in-depth integration test (`tests/forbidden_apis.rs`) walks engine source
+and rejects known direct Lance open/inline-commit shapes outside exact gateway
+files. It classifies public async inherent `Omnigraph` methods and loader
+conveniences, every crate-visible async coordinator method, and exact per-file
+occurrences of registered durable-call shapes, including recovery. Its
+syntax-tree checks cover the concrete method/UFCS/raw-Dataset and selected
+rename/macro forms pinned by scanner self-tests; they are deliberately not a
+substitute for Rust visibility or a claim to expand arbitrary macros and
+function-pointer aliases. A new supported writer or durable gateway is therefore
+an explicit registry change rather than an accidental call site.
+
+The `failpoints` Cargo feature retains one doc-hidden, registry-classified
+`TestOnly` manifest-publish helper for adversarial integration fixtures. It is
+an explicit non-production exception: enabling failpoints already opts into
+fault-injection behavior and is outside the supported SDK surface.
 
 The "finalize → publisher residual" described below applies equally to
 the migrated writers — Lance has no multi-dataset atomic commit primitive, so
@@ -291,8 +306,9 @@ The shipped sidecar recovery protocol closes that gap.
 ### The storage surface has no inline-commit residual
 
 MR-793's acceptance criterion §1 ("`TableStore` (or successor) public API has
-no method that performs a manifest commit as a side effect of writing") holds
-**by construction**. `db.storage()` (`&dyn TableStorage`) exposes only staged
+no method that performs a manifest commit as a side effect of writing") now
+holds more narrowly **by construction**: `TableStore` / `TableStorage` are
+crate-private, and their internal `db.storage()` surface exposes only staged
 primitives + reads. Lance 7.0's `DeleteBuilder::execute_uncommitted`
 ([#6658](https://github.com/lance-format/lance/issues/6658)) moved delete to
 `stage_delete`; beta.21's full-table index `execute_uncommitted` shape moved the
@@ -301,6 +317,14 @@ last vector build into `stage_create_indices`. `InlineCommitResidual`,
 Generic multi-segment exact index publication remains covered by Lance
 [#6666](https://github.com/lance-format/lance/issues/6666), but it is not used by
 the current one-segment full-table shape.
+
+`SnapshotHandle`'s Lance field is private. The few crate-private raw accessors
+remain only for enumerated read/maintenance bridges and are exact-counted by the
+same conformance guard. In particular, only Optimize's two physical compaction
+paths take mutable Dataset ownership; read-only planning, repair classification,
+cleanup enumeration/GC, export, and blob access use registered borrows/handles.
+Adding another extraction changes its registered count and fails the guard
+rather than silently reopening a data-write side door.
 
 The parse-time D₂ rule remains a deliberate boundary (constructive XOR
 destructive per query), not residual scaffolding. The
@@ -406,8 +430,8 @@ foreign dataset as if this apply created it.
      `Armed → EffectsConfirmed`. Schema-v8 EnsureIndices likewise requires one
      exact achieved transaction at `read_version + 1` per table, binds every
      first-touch ref identity, confirms the complete table-pointer delta, and
-     only then moves `Armed → EffectsConfirmed`. Optimize remains the legacy
-     writer without this confirmation boundary.
+     only then moves `Armed → EffectsConfirmed`. Optimize's bounded schema-v2
+     adapter intentionally has no exact confirmation boundary.
 3. **Phase C**: publisher commits the manifest.
 4. **Phase D**: writer deletes the sidecar.
 
@@ -549,8 +573,8 @@ per table, the complete manifest delta, and exact first-touch ownership from arm
 through one `ExactGraphHead` publish. `Armed` is rollback-only;
 `EffectsConfirmed` rolls forward only while the captured authority still matches.
 Schema-v6 files remain backward-compatible bridge inputs with their original loose
-classification and fixed rollback plan. Optimize retains legacy schema-v2 effect
-provenance, but now has one graph-wide visibility envelope. Its entry recovery probe is
+classification and fixed rollback plan. Optimize uses bounded schema-v2 effect
+provenance with one graph-wide visibility envelope. Its entry recovery probe is
 a fast path; it then acquires schema → main branch → every accepted-catalog table gate,
 loads one operation-local accepted catalog, relists recovery, and plans productive work
 from one fresh snapshot. All productive tables share one multi-pin Optimize sidecar;
@@ -561,9 +585,12 @@ pointer already at or beyond Optimize's achieved version is converged and omitte
 than forcing strict graph-head OCC. Any post-arm error returns `RecoveryRequired` and
 leaves the shared intent for all-or-nothing v2 recovery. Main remains held through final
 physical-only `__manifest` compaction so a new main recovery intent cannot arm before raw
-manifest movement finishes. The remaining legacy boundary is provenance: v2 loose
-classification has no exact transaction/authority/fixed-lineage proof and stays within
-the documented single-writer-process recovery model until the exact Optimize adapter.
+manifest movement finishes. The v2 loose classification has no exact
+transaction/authority/fixed-lineage proof and therefore stays within the documented
+single-writer-process recovery model. Replacing it with exact provenance is deferred
+until Lance exposes a stable public caller-controlled transaction API for the complete
+compact/reindex operation and OmniGraph has distributed recovery ownership or fencing;
+transaction identity alone would not make destructive cross-process recovery safe.
 The manager is shared by every
 `Omnigraph` handle for one canonical local root identity (relative, absolute,
 and symlink aliases converge; object-store/custom schemes stay opaque), so this
@@ -593,7 +620,7 @@ same process. Restore remains unsafe across processes because Lance's
 `check_restore_txn` accepts
 the restore against in-flight Append/Update/Delete commits and
 silently orphans them (pinned by
-`tests/staged_writes.rs::lance_restore_loses_to_concurrent_append_via_orphaning`).
+`src/table_store/staged_tests.rs::lance_restore_loses_to_concurrent_append_via_orphaning`).
 When such a deferred sidecar blocks a write, the commit-time drift
 guard says so explicitly ("a pending recovery sidecar requires
 rollback — reopen the graph read-write") instead of pointing at
@@ -618,8 +645,9 @@ effect, any later error returns `RecoveryRequired` and leaves the fixed v3/v4/v7
 intent durable. SchemaApply does not transparently reprepare after arming: a lost
 authority token is resolved by exact recovery, preserving a disjoint winner or
 failing closed on a buried same-table effect. EnsureIndices follows the same rule
-without transparent post-arm reprepare. Optimize alone remains on its
-writer-specific legacy arbitration until its adapter is enrolled.
+without transparent post-arm reprepare. Optimize instead uses the bounded schema-v2
+maintenance arbitration described above; its exact-provenance upgrade is deferred
+behind the upstream transaction-API and distributed-fencing triggers.
 
 **Sidecar I/O failure semantics** (all sidecar I/O goes through the
 backend-generic `StorageAdapter`; the contracts below are pinned by the

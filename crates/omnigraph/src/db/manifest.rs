@@ -2,8 +2,13 @@ use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
 use crate::error::{OmniError, Result};
+use datafusion::logical_expr::Expr;
 use lance::Dataset;
+use lance::dataset::scanner::{DatasetRecordBatchStream, Scanner};
+use lance::datatypes::{BlobHandling, Schema as LanceSchema};
+use lance::index::DatasetIndexExt;
 use lance_namespace::models::CreateTableVersionRequest;
+use lance_table::format::IndexMetadata;
 use omnigraph_compiler::catalog::Catalog;
 
 #[path = "manifest/graph.rs"]
@@ -137,11 +142,156 @@ pub struct Snapshot {
     read_caches: Option<Arc<crate::runtime_cache::ReadCaches>>,
 }
 
+/// Read-only view of one table pinned by a [`Snapshot`].
+///
+/// The underlying Lance [`Dataset`] is deliberately private: a snapshot table
+/// can scan rows and inspect read metadata, but it cannot reach Lance's
+/// mutating APIs or advance a table HEAD outside OmniGraph's coordinated write
+/// path.
+#[derive(Debug, Clone)]
+pub struct SnapshotTable {
+    dataset: Dataset,
+}
+
+/// Read-only scan builder for a [`SnapshotTable`].
+///
+/// This forwards scan configuration and execution, but not Lance's raw
+/// [`Scanner`] or physical-plan construction. A Lance physical scan plan
+/// exposes its embedded [`Dataset`], which would let SDK callers recover a
+/// writable handle and bypass graph publication.
+pub struct SnapshotScanner {
+    scanner: Scanner,
+}
+
+impl SnapshotScanner {
+    /// Select the output columns.
+    pub fn project<T: AsRef<str>>(&mut self, columns: &[T]) -> Result<&mut Self> {
+        self.scanner
+            .project(columns)
+            .map_err(|error| OmniError::Lance(error.to_string()))?;
+        Ok(self)
+    }
+
+    /// Apply a SQL filter expression.
+    pub fn filter(&mut self, filter: &str) -> Result<&mut Self> {
+        self.scanner
+            .filter(filter)
+            .map_err(|error| OmniError::Lance(error.to_string()))?;
+        Ok(self)
+    }
+
+    /// Apply a structured DataFusion filter expression.
+    pub fn filter_expr(&mut self, filter: Expr) -> &mut Self {
+        self.scanner.filter_expr(filter);
+        self
+    }
+
+    /// Apply a row limit and offset.
+    pub fn limit(&mut self, limit: Option<i64>, offset: Option<i64>) -> Result<&mut Self> {
+        self.scanner
+            .limit(limit, offset)
+            .map_err(|error| OmniError::Lance(error.to_string()))?;
+        Ok(self)
+    }
+
+    /// Include Lance's stable row-id column in the output.
+    pub fn with_row_id(&mut self) -> &mut Self {
+        self.scanner.with_row_id();
+        self
+    }
+
+    /// Choose how blob columns are represented in scan output.
+    pub fn blob_handling(&mut self, blob_handling: BlobHandling) -> &mut Self {
+        self.scanner.blob_handling(blob_handling);
+        self
+    }
+
+    /// Execute the configured read without exposing its physical plan.
+    pub async fn try_into_stream(&self) -> Result<DatasetRecordBatchStream> {
+        self.scanner
+            .try_into_stream()
+            .await
+            .map_err(|error| OmniError::Lance(error.to_string()))
+    }
+}
+
+impl SnapshotTable {
+    fn new(dataset: Dataset) -> Self {
+        Self { dataset }
+    }
+
+    /// Build a read-only scanner over this pinned table version.
+    pub fn scan(&self) -> SnapshotScanner {
+        SnapshotScanner {
+            scanner: self.dataset.scan(),
+        }
+    }
+
+    /// Count rows in this pinned table version, optionally with a filter.
+    pub async fn count_rows(&self, filter: Option<String>) -> Result<usize> {
+        self.dataset
+            .count_rows(filter)
+            .await
+            .map_err(|error| OmniError::Lance(error.to_string()))
+    }
+
+    /// Lance schema of this pinned table version.
+    pub fn schema(&self) -> &LanceSchema {
+        self.dataset.schema()
+    }
+
+    /// Lance manifest version of this pinned table.
+    pub fn version(&self) -> u64 {
+        self.dataset.version().version
+    }
+
+    /// Read-only physical index metadata for this pinned table version.
+    pub async fn load_indices(&self) -> Result<Arc<Vec<IndexMetadata>>> {
+        self.dataset
+            .load_indices()
+            .await
+            .map_err(|error| OmniError::Lance(error.to_string()))
+    }
+
+    /// Whether `column` has complete usable BTREE coverage.
+    pub async fn index_coverage(&self, column: &str) -> Result<crate::IndexCoverage> {
+        crate::table_store::TableStore::key_column_index_coverage(&self.dataset, column).await
+    }
+
+    /// Whether any user index leaves current fragments uncovered.
+    pub async fn has_unindexed_fragments(&self) -> Result<bool> {
+        crate::table_store::TableStore::has_unindexed_fragments(&self.dataset).await
+    }
+
+    /// Whether this table has a user BTREE index on `column`.
+    pub async fn has_btree_index(&self, column: &str) -> Result<bool> {
+        crate::table_store::TableStore::has_btree_index_on(&self.dataset, column).await
+    }
+
+    /// Whether this table has a user full-text index on `column`.
+    pub async fn has_fts_index(&self, column: &str) -> Result<bool> {
+        crate::table_store::TableStore::has_fts_index_on(&self.dataset, column).await
+    }
+
+    /// Whether this table has a user vector index on `column`.
+    pub async fn has_vector_index(&self, column: &str) -> Result<bool> {
+        crate::table_store::TableStore::has_vector_index_on(&self.dataset, column).await
+    }
+}
+
 impl Snapshot {
     /// Open a sub-table dataset at its pinned version. With read caches present
     /// (live Branch reads), reuse a held handle through the cache (0 open IO on a
     /// warm repeat) and the shared `Session`; otherwise plain-open (Fix 2).
-    pub async fn open(&self, table_key: &str) -> Result<Dataset> {
+    pub async fn open(&self, table_key: &str) -> Result<SnapshotTable> {
+        self.open_dataset(table_key).await.map(SnapshotTable::new)
+    }
+
+    /// Open the raw Lance dataset for engine-internal read execution.
+    ///
+    /// This stays crate-private so downstream SDK callers cannot obtain a
+    /// writable `Dataset` from a logical graph snapshot.
+    pub(crate) async fn open_dataset(&self, table_key: &str) -> Result<Dataset> {
         let entry = self
             .entries
             .get(table_key)
@@ -311,7 +461,7 @@ pub struct SubTableUpdate {
 /// `table_version` rows are the graph publish boundary and reconstruct the
 /// current graph snapshot by selecting the latest visible version row per
 /// sub-table.
-pub struct ManifestCoordinator {
+pub(crate) struct ManifestCoordinator {
     root_uri: String,
     dataset: Dataset,
     known_state: ManifestState,
@@ -378,7 +528,7 @@ impl ManifestCoordinator {
     /// The genesis graph commit is folded into the init write, so `__manifest`
     /// is the single source of graph lineage from version one — callers read it
     /// back through the lineage projection rather than via a second write.
-    pub async fn init(root_uri: &str, catalog: &Catalog) -> Result<Self> {
+    pub(crate) async fn init(root_uri: &str, catalog: &Catalog) -> Result<Self> {
         let root = root_uri.trim_end_matches('/');
         let (dataset, known_state) = init_manifest_graph(root, catalog).await?;
 
@@ -446,7 +596,8 @@ impl ManifestCoordinator {
     ///
     /// Atomically inserts one immutable `table_version` row per updated table.
     /// The merge-insert commit on `__manifest` is the graph-level publish point.
-    pub async fn commit(&mut self, updates: &[SubTableUpdate]) -> Result<u64> {
+    #[cfg(test)]
+    pub(crate) async fn commit(&mut self, updates: &[SubTableUpdate]) -> Result<u64> {
         let changes = updates
             .iter()
             .cloned()
@@ -460,7 +611,8 @@ impl ManifestCoordinator {
     /// the manifest's current latest non-tombstoned `table_version` for that
     /// `table_key` is exactly what the caller observed; mismatches surface
     /// as `OmniError::Manifest` with `ManifestConflictDetails::ExpectedVersionMismatch`.
-    pub async fn commit_with_expected(
+    #[cfg(test)]
+    pub(crate) async fn commit_with_expected(
         &mut self,
         updates: &[SubTableUpdate],
         expected_table_versions: &HashMap<String, u64>,
@@ -474,11 +626,13 @@ impl ManifestCoordinator {
             .await
     }
 
+    #[cfg(test)]
     pub(crate) async fn commit_changes(&mut self, changes: &[ManifestChange]) -> Result<u64> {
         self.commit_changes_with_expected(changes, &HashMap::new())
             .await
     }
 
+    #[cfg(test)]
     pub(crate) async fn commit_changes_with_expected(
         &mut self,
         changes: &[ManifestChange],
@@ -498,6 +652,7 @@ impl ManifestCoordinator {
     /// per-write commit-graph refresh. Returns the new version and the parent the
     /// publisher resolved for the commit (so the caller can update its in-memory
     /// commit cache without a re-read).
+    #[cfg(test)]
     pub(crate) async fn commit_changes_with_lineage(
         &mut self,
         changes: &[ManifestChange],
@@ -513,9 +668,8 @@ impl ManifestCoordinator {
         .await
     }
 
-    /// The token-aware form of [`commit_changes_with_lineage`]. Exact authority
-    /// is checked by the publisher from every CAS attempt's existing one-scan
-    /// state; legacy callers continue through `Any` above.
+    /// Token-aware graph publication. Exact authority is checked by the
+    /// publisher from every CAS attempt's existing one-scan state.
     pub(crate) async fn commit_changes_with_lineage_and_precondition(
         &mut self,
         changes: &[ManifestChange],
@@ -633,11 +787,7 @@ impl ManifestCoordinator {
         })
     }
 
-    pub fn active_branch(&self) -> Option<&str> {
-        self.active_branch.as_deref()
-    }
-
-    pub async fn create_branch(&mut self, name: &str) -> Result<()> {
+    pub(crate) async fn create_branch(&mut self, name: &str) -> Result<()> {
         let mut ds = self.dataset.clone();
         match crate::branch_control::create_branch_recoverably(&mut ds, name, self.version())
             .await?
@@ -649,7 +799,7 @@ impl ManifestCoordinator {
         }
     }
 
-    pub async fn delete_branch(&mut self, name: &str) -> Result<()> {
+    pub(crate) async fn delete_branch(&mut self, name: &str) -> Result<()> {
         let uri = manifest_uri(&self.root_uri);
         let mut ds = crate::instrumentation::open_dataset(
             &uri,
@@ -715,11 +865,6 @@ impl ManifestCoordinator {
         }
 
         Ok(descendants)
-    }
-
-    /// Root URI of the graph.
-    pub fn root_uri(&self) -> &str {
-        &self.root_uri
     }
 }
 

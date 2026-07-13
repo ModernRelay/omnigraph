@@ -426,6 +426,21 @@ retaining the public lifecycle status `Proposed`.
 > track is chosen, decide it before any of the set merges, since it defines
 > what "dispositioned before acceptance" means for every other finding here.
 
+> ✅ **RFC-022 implementation close-out (2026-07-13):** every currently
+> supported graph-write surface is enrolled in an exact adapter, the bounded
+> Optimize schema-v2 adapter, or an explicit authority/physical/bootstrap/
+> recovery exception. Rust visibility keeps the supported SDK set closed: raw
+> storage/coordinator/handle-cache modules are crate-private and public snapshots
+> expose a read-only table/scan facade without Lance's raw scanner or physical
+> plan. `crates/omnigraph/tests/forbidden_apis.rs` adds a
+> defense-in-depth registry over public async inherent `Omnigraph`/loader
+> surfaces, crate-visible low-level coordinator methods, and exact per-file
+> occurrences of registered durable-call shapes including recovery. Exact Optimize
+> provenance is intentionally deferred until both a stable public Lance
+> maintenance-transaction API and distributed recovery fencing exist. This
+> closes RFC-022's structural rollout work; it does **not** close BLOCKER-09 or
+> change the RFC's public lifecycle status.
+
 ## Protocol clarifications
 
 ### BLOCKER-10 — do not put foreign-branch facts in an atomic `ReadSet`
@@ -458,8 +473,9 @@ Keep target-branch values that must remain stable in the atomic `ReadSet`.
 > commit/snapshot as an immutable effect precondition, not a member of the
 > target publisher's atomic `ReadSet`. A later source-head advance is harmless
 > under captured-source semantics; only a future latest-at-target-publish
-> contract would require a source fence through target CAS. The current bridge
-> remains conservatively stricter before effects while its full adapter lands.
+> contract would require a source fence through target CAS. The shipped
+> schema-v4 exact adapter preserves that captured-source contract while
+> revalidating source incarnation before effects.
 
 ### BLOCKER-11 — RFC-022 and no-heads MemWAL need coarse OCC
 

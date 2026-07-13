@@ -23,11 +23,11 @@
 //!   `self.manifest.version` (currently checked-out version). From HEAD =
 //!   `h`, produces a new commit at `h + 1` with content == checked-out
 //!   version. Pinned by
-//!   `tests/staged_writes.rs::lance_restore_appends_one_commit_with_checked_out_content`.
+//!   `src/table_store/staged_tests.rs::lance_restore_appends_one_commit_with_checked_out_content`.
 //! - `Dataset::restore` "wins" against concurrent Append/Update/Delete/
 //!   CreateIndex/Merge — see `check_restore_txn` at lance-6.0.1
 //!   `src/io/commit/conflict_resolver.rs:986`. The hazard is documented
-//!   by `tests/staged_writes.rs::lance_restore_loses_to_concurrent_append_via_orphaning`.
+//!   by `src/table_store/staged_tests.rs::lance_restore_loses_to_concurrent_append_via_orphaning`.
 //!   The open-time sweep and live healer both join the root-scoped ordered
 //!   gates. The in-process healer ([`heal_pending_sidecars_roll_forward`])
 //!   additionally never restores (roll-forward only); foreign processes remain
@@ -240,8 +240,9 @@ pub(crate) const RECOVERY_DIR_NAME: &str = "__recovery";
 /// v2 → v3: RFC-022 exact mutation/load effects. An enrolled sidecar carries
 /// the captured authority, stable lineage/rollback ids, planned Lance
 /// transaction identities, a canonical manifest delta, and an explicit
-/// Armed → EffectsConfirmed transition. Legacy writers deliberately continue
-/// producing v2 until their adapter opts into [`new_occ_sidecar`].
+/// Armed → EffectsConfirmed transition. Schema v2 remains the bounded
+/// Optimize maintenance protocol; exact adapters use their assigned later
+/// schema rather than reinterpreting a v2 file.
 ///
 /// v3 → v4: RFC-022 branch-merge authority and exact confirmed output. A v4
 /// sidecar carries the captured target authority, fixed merge lineage and
@@ -254,11 +255,13 @@ pub(crate) const RECOVERY_DIR_NAME: &str = "__recovery";
 /// v4 → v5: SchemaApply Phase-C confirmation. A v5 SchemaApply sidecar carries
 /// the target schema identity and a durable manifest-published marker so an
 /// empty table-pin set can distinguish pre-staging rollback from Phase-D delete
-/// residue. This is a narrow bridge, not the future exact table-effect adapter.
+/// residue. This bridge is retained for compatibility; current SchemaApply uses
+/// the exact v7 protocol.
 ///
-/// v5 → v6: EnsureIndices fixed rollback identity. Its physical effects still
-/// use the legacy loose classifier, but a pre-minted rollback commit id and a
-/// durably prepared audit payload make rollback re-entry outcome-exact.
+/// v5 → v6: EnsureIndices fixed rollback identity. This compatibility protocol
+/// uses the loose classifier, but a pre-minted rollback commit id and a durably
+/// prepared audit payload make rollback re-entry outcome-exact. Current
+/// EnsureIndices uses the exact v8 protocol.
 ///
 /// v6 → v7: exact SchemaApply authority and physical ownership. A v7
 /// sidecar carries the initiating actor/fixed lineage, exact existing-table
@@ -330,7 +333,7 @@ const MAX_EFFECT_IDENTITY_SCAN_VERSIONS: u64 = 1024;
 /// `Dataset::restore`: it "wins" against concurrent Append/Update/
 /// Delete/CreateIndex/Merge per `check_restore_txn`, silently orphaning
 /// the concurrent writer's commit (pinned by
-/// `tests/staged_writes.rs::lance_restore_loses_to_concurrent_append_via_orphaning`).
+/// `src/table_store/staged_tests.rs::lance_restore_loses_to_concurrent_append_via_orphaning`).
 /// Roll-forward is safe under concurrency because
 /// `ManifestBatchPublisher::publish` uses row-level CAS.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -826,10 +829,10 @@ pub(crate) struct RecoveryProtocolV8 {
     pub intended_delta: RecoveryManifestDelta,
 }
 
-/// Schema-v6 EnsureIndices rollback identity. EnsureIndices remains a
-/// loose-effect writer until its full RFC-022 adapter lands, but recovery must
-/// still be able to prove that a previously published compensation was a
-/// rollback rather than infer the outcome from aligned numeric table pins.
+/// Schema-v6 EnsureIndices rollback identity retained for compatibility.
+/// Recovery must still be able to prove that a previously published
+/// compensation was a rollback rather than infer the outcome from aligned
+/// numeric table pins; current writers emit the exact v8 protocol.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub(crate) struct RecoveryEnsureIndicesRollbackV6 {
     pub rollback_graph_commit_id: String,
@@ -2401,7 +2404,8 @@ fn validate_branch_merge_transaction_chain(
 /// - **Strict** (`Mutation`, `Load`): exactly one `commit_staged` per
 ///   table, so `lance_head == manifest_pinned + 1` AND
 ///   `post_commit_pin == lance_head` is required.
-/// - **Loose** (legacy SchemaApply, `EnsureIndices`, `Optimize`): the writer
+/// - **Loose** (schema-v5 SchemaApply, schema-v6 EnsureIndices, schema-v2
+///   Optimize): the writer
 ///   advances the Lance HEAD by N ≥ 1 commits per table (one per index
 ///   built + one for the overwrite, etc.; `Optimize` runs `compact_files`,
 ///   which commits reserve-fragments + rewrite) and the exact N is hard to
@@ -9472,7 +9476,7 @@ node Person {
         let lineage = db.new_lineage_intent_for_branch(None, None).await.unwrap();
         let entry = txn.base.entry("node:Person").unwrap().clone();
         let table_uri = format!("{}/{}", root.trim_end_matches('/'), entry.table_path);
-        let stale_dataset = txn.base.open("node:Person").await.unwrap();
+        let stale_dataset = txn.base.open_dataset("node:Person").await.unwrap();
         let store = TableStore::new(root, Arc::new(lance::session::Session::default()));
         let staged = store
             .stage_append(
@@ -9633,8 +9637,8 @@ node Company { age: I32? }
             root.trim_end_matches('/'),
             company_entry.table_path
         );
-        let person_ds = txn.base.open("node:Person").await.unwrap();
-        let company_ds = txn.base.open("node:Company").await.unwrap();
+        let person_ds = txn.base.open_dataset("node:Person").await.unwrap();
+        let company_ds = txn.base.open_dataset("node:Company").await.unwrap();
         let person_staged = store
             .stage_append(&person_ds, person_batch(&[("partial", Some(10))]), &[])
             .await
@@ -9788,7 +9792,7 @@ node Person { age: I32? }
         let lineage = db.new_lineage_intent_for_branch(None, None).await.unwrap();
         let entry = txn.base.entry("node:Person").unwrap().clone();
         let table_uri = format!("{}/{}", root.trim_end_matches('/'), entry.table_path);
-        let stale_dataset = txn.base.open("node:Person").await.unwrap();
+        let stale_dataset = txn.base.open_dataset("node:Person").await.unwrap();
         let store = TableStore::new(root, Arc::new(lance::session::Session::default()));
         let staged = store
             .stage_append(
