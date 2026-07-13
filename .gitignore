@@ -29,3 +29,6 @@ demo/*.omni/
 /schema-prior-art.md
 mdrip/
 crates/omnigraph/benches/results.jsonl
+# CocoIndex Code (ccc)
+/.cocoindex_code/cocoindex.db/
+/.cocoindex_code/target_sqlite.db*
