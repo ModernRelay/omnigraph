@@ -114,6 +114,53 @@ async fn ensure_indices_manifest_reads_are_flat_in_history() {
     .await;
 }
 
+/// Optimize is now one graph-wide writer rather than one writer per productive
+/// table. Its planning and monotonic batch publication must stay bounded by the
+/// current table set, not by graph commit-history depth. Each depth fixture is
+/// normalized first, then receives the same three-commit productive tail so the
+/// measured physical work is comparable.
+#[tokio::test]
+async fn optimize_manifest_reads_are_flat_in_history() {
+    cost_harness(async {
+        let mut curve: Vec<(u64, IoCounts)> = Vec::new();
+        for depth in [10u64, 100] {
+            let dir = tempfile::tempdir().unwrap();
+            let mut db = local_graph(&dir).await;
+            commit_many(&mut db, depth as usize).await;
+            db.optimize().await.unwrap();
+            commit_many(&mut db, 3).await;
+
+            let commits_before = db.list_commits(None).await.unwrap().len();
+            let (result, io) = measure(db.optimize()).await;
+            result.unwrap();
+            assert_eq!(
+                db.list_commits(None).await.unwrap().len(),
+                commits_before + 1,
+                "productive graph-wide Optimize must publish exactly one lineage commit"
+            );
+            eprintln!(
+                "optimize depth~{depth}: __manifest={} data={} opens={}",
+                io.manifest_reads, io.data_reads, io.data_open_count
+            );
+            curve.push((depth, io));
+        }
+
+        assert_flat(
+            &curve,
+            |counts| counts.manifest_reads,
+            8,
+            "graph-wide Optimize __manifest reads",
+        );
+        assert_flat(
+            &curve,
+            |counts| counts.data_open_count,
+            2,
+            "graph-wide Optimize data-table opens",
+        );
+    })
+    .await;
+}
+
 /// **Served-regime twin of `internal_table_scans_are_flat_in_history` — the gate
 /// that was missing.** The flat gate above calls `db.optimize()` before EVERY
 /// measured write, so it only ever proves the *compacted* invariant and stays green

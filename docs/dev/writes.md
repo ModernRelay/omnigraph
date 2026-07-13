@@ -549,17 +549,21 @@ per table, the complete manifest delta, and exact first-touch ownership from arm
 through one `ExactGraphHead` publish. `Armed` is rollback-only;
 `EffectsConfirmed` rolls forward only while the captured authority still matches.
 Schema-v6 files remain backward-compatible bridge inputs with their original loose
-classification and fixed rollback plan. Optimize retains its legacy effect adapter and a
-branch-authority two-stage recovery barrier: the graph-wide entry probe is a fast
-path; after acquiring main's process-local branch-writer gate, Optimize relists and
-rejects every main-target sidecar plus graph-global SchemaApply before it reads table
-HEADs, classifies drift, or arms its own sidecars. The gate is retained through the
-internally parallel per-table effects/publishes because each table-pointer publish
-advances shared `graph_head:main`. It remains held through final physical-only
-`__manifest` compaction so a new main recovery intent cannot arm before raw manifest
-movement finishes. This coarse legacy-adapter fence makes same-process sidecar-enrolled
-main writers wait for the entire graph-wide Optimize, while Optimize's own table tasks
-remain parallel.
+classification and fixed rollback plan. Optimize retains legacy schema-v2 effect
+provenance, but now has one graph-wide visibility envelope. Its entry recovery probe is
+a fast path; it then acquires schema → main branch → every accepted-catalog table gate,
+loads one operation-local accepted catalog, relists recovery, and plans productive work
+from one fresh snapshot. All productive tables share one multi-pin Optimize sidecar;
+their compact/reindex/index-create effects remain bounded-parallel, but no task publishes
+or deletes recovery independently. After every effect settles, one maintenance-class
+monotonic batch CAS publishes every still-needed pointer and one lineage commit. A
+pointer already at or beyond Optimize's achieved version is converged and omitted rather
+than forcing strict graph-head OCC. Any post-arm error returns `RecoveryRequired` and
+leaves the shared intent for all-or-nothing v2 recovery. Main remains held through final
+physical-only `__manifest` compaction so a new main recovery intent cannot arm before raw
+manifest movement finishes. The remaining legacy boundary is provenance: v2 loose
+classification has no exact transaction/authority/fixed-lineage proof and stays within
+the documented single-writer-process recovery model until the exact Optimize adapter.
 The manager is shared by every
 `Omnigraph` handle for one canonical local root identity (relative, absolute,
 and symlink aliases converge; object-store/custom schemes stay opaque), so this

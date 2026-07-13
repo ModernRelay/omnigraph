@@ -6071,6 +6071,56 @@ async fn schema_apply_post_effect_same_table_winner_fails_closed() {
 /// (loose-match, like SchemaApply/EnsureIndices) must roll the compacted version
 /// forward on next open so the manifest tracks the Lance HEAD — and the healed
 /// table must then accept a schema apply (the original bug's victim).
+async fn seed_two_productive_optimize_tables(uri: &str) {
+    let db = Omnigraph::init(uri, helpers::TEST_SCHEMA).await.unwrap();
+    for (name, age) in [("alice", 30), ("bob", 31), ("carol", 32), ("dave", 33)] {
+        db.mutate(
+            "main",
+            MUTATION_QUERIES,
+            "insert_person",
+            &mixed_params(&[("$name", name)], &[("$age", age)]),
+        )
+        .await
+        .unwrap();
+    }
+    for name in ["acme", "beta", "cygnus", "delta"] {
+        db.mutate(
+            "main",
+            OCC_DISJOINT_MUTATIONS,
+            "insert_company",
+            &params(&[("$name", name)]),
+        )
+        .await
+        .unwrap();
+    }
+}
+
+fn assert_optimize_v2_sidecar_tables(
+    graph_root: &std::path::Path,
+    operation_id: &str,
+    expected: &[&str],
+) {
+    let body = std::fs::read_to_string(
+        graph_root
+            .join("__recovery")
+            .join(format!("{operation_id}.json")),
+    )
+    .unwrap();
+    let json: serde_json::Value = serde_json::from_str(&body).unwrap();
+    assert_eq!(json["schema_version"], 2);
+    assert_eq!(json["writer_kind"], "Optimize");
+    let mut actual = json["tables"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|table| table["table_key"].as_str().unwrap())
+        .collect::<Vec<_>>();
+    actual.sort_unstable();
+    let mut expected = expected.to_vec();
+    expected.sort_unstable();
+    assert_eq!(actual, expected, "Optimize sidecar pinned the wrong tables");
+}
+
 #[tokio::test]
 #[serial(optimize)]
 async fn optimize_phase_b_failure_recovered_on_next_open() {
@@ -6079,21 +6129,9 @@ async fn optimize_phase_b_failure_recovered_on_next_open() {
     let uri = dir.path().to_str().unwrap().to_string();
     let operation_id;
 
-    // Seed: several separate Person inserts → multiple fragments, so compaction
-    // has real work and advances the Lance HEAD.
-    {
-        let db = Omnigraph::init(&uri, helpers::TEST_SCHEMA).await.unwrap();
-        for (name, age) in [("alice", 30), ("bob", 31), ("carol", 32), ("dave", 33)] {
-            db.mutate(
-                "main",
-                MUTATION_QUERIES,
-                "insert_person",
-                &mixed_params(&[("$name", name)], &[("$age", age)]),
-            )
-            .await
-            .unwrap();
-        }
-    }
+    // Both node tables have multiple fragments, so one Optimize arms one
+    // multi-pin sidecar and completes both physical effects before the seam.
+    seed_two_productive_optimize_tables(&uri).await;
 
     let pre_failure_version = {
         let db = Omnigraph::open(&uri).await.unwrap();
@@ -6101,8 +6139,7 @@ async fn optimize_phase_b_failure_recovered_on_next_open() {
     };
 
     // Failpoint fires AFTER compact_files advanced the Lance HEAD but BEFORE the
-    // manifest publish. The Optimize sidecar persists (only node:Person has
-    // compactable fragments, so exactly one sidecar is written).
+    // graph-wide manifest publish. Exactly one multi-table sidecar persists.
     {
         let db = Omnigraph::open(&uri).await.unwrap();
         let _failpoint =
@@ -6126,6 +6163,11 @@ async fn optimize_phase_b_failure_recovered_on_next_open() {
             "exactly one Optimize sidecar must persist after optimize failure"
         );
         operation_id = single_sidecar_operation_id(dir.path());
+        assert_optimize_v2_sidecar_tables(
+            dir.path(),
+            &operation_id,
+            &["node:Company", "node:Person"],
+        );
     }
 
     // Recovery: reopen runs the sweep. The Optimize sidecar classifies
@@ -6144,7 +6186,10 @@ async fn optimize_phase_b_failure_recovered_on_next_open() {
         dir.path(),
         &operation_id,
         RecoveryExpectation::RolledForward {
-            tables: vec![TableExpectation::main("node:Person")],
+            tables: vec![
+                TableExpectation::main("node:Company"),
+                TableExpectation::main("node:Person"),
+            ],
         },
     )
     .await
@@ -6160,6 +6205,254 @@ async fn optimize_phase_b_failure_recovered_on_next_open() {
     db.apply_schema(&desired)
         .await
         .expect("schema apply after optimize recovery must succeed");
+}
+
+/// Lost acknowledgement after the one graph-wide manifest CAS: both table
+/// pointers and Optimize lineage are already visible, but the shared v2
+/// sidecar remains. Recovery must recognize a stale successful intent, preserve
+/// both pointers, record RolledForward, and remove the sidecar.
+#[tokio::test]
+#[serial(optimize)]
+async fn optimize_post_manifest_failure_finalizes_multi_table_v2_sidecar() {
+    let _scenario = FailScenario::setup();
+    let dir = tempfile::tempdir().unwrap();
+    let uri = dir.path().to_str().unwrap().to_string();
+    seed_two_productive_optimize_tables(&uri).await;
+
+    let operation_id;
+    {
+        let db = Omnigraph::open(&uri).await.unwrap();
+        let _failpoint = ScopedFailPoint::new(names::GRAPH_PUBLISH_AFTER_MANIFEST_COMMIT, "1*return");
+        let error = db.optimize().await.unwrap_err();
+        assert!(
+            matches!(error, OmniError::RecoveryRequired { .. }),
+            "lost graph-publish acknowledgement must require recovery, got {error}"
+        );
+        operation_id = single_sidecar_operation_id(dir.path());
+        assert_optimize_v2_sidecar_tables(
+            dir.path(),
+            &operation_id,
+            &["node:Company", "node:Person"],
+        );
+    }
+
+    // Opening read-write finalizes the already-visible outcome; it must not
+    // compensate either content-preserving table effect.
+    let recovered = Omnigraph::open(&uri).await.unwrap();
+    assert_eq!(helpers::count_rows(&recovered, "node:Person").await, 4);
+    assert_eq!(helpers::count_rows(&recovered, "node:Company").await, 4);
+    drop(recovered);
+    assert_post_recovery_invariants(
+        dir.path(),
+        &operation_id,
+        RecoveryExpectation::RolledForward {
+            tables: vec![
+                TableExpectation::main("node:Company"),
+                TableExpectation::main("node:Person"),
+            ],
+        },
+    )
+    .await
+    .unwrap();
+}
+
+/// Pending-only index intent is status, not a physical effect. An untrainable
+/// vector table beside a productive sibling must be reported but excluded from
+/// the shared Optimize sidecar; otherwise its NoMovement classification would
+/// spuriously roll back the sibling after a crash.
+#[tokio::test]
+#[serial(optimize)]
+async fn optimize_excludes_pending_only_vector_table_from_v2_sidecar() {
+    const SCHEMA: &str = r#"
+node Work {
+    name: String @key
+}
+
+node Embedding {
+    name: String @key
+    vector: Vector(2)? @index
+}
+"#;
+    let _scenario = FailScenario::setup();
+    let dir = tempfile::tempdir().unwrap();
+    let uri = dir.path().to_str().unwrap().to_string();
+    let mut db = Omnigraph::init(&uri, SCHEMA).await.unwrap();
+    load_jsonl(
+        &mut db,
+        r#"{"type":"Work","data":{"name":"w0"}}
+{"type":"Embedding","data":{"name":"e0","vector":null}}
+"#,
+        LoadMode::Merge,
+    )
+    .await
+    .unwrap();
+    let pending = db.ensure_indices().await.unwrap();
+    assert!(
+        pending.iter().any(|index| {
+            index.table_key == "node:Embedding" && index.column == "vector"
+        }),
+        "fixture must leave the null vector index pending"
+    );
+    // Fixed productive tail on Work only; Embedding stays a one-fragment table
+    // whose buildable indexes are current and whose vector remains pending-only.
+    for name in ["w1", "w2", "w3", "w4"] {
+        load_jsonl(
+            &mut db,
+            &format!(r#"{{"type":"Work","data":{{"name":"{name}"}}}}"#),
+            LoadMode::Merge,
+        )
+        .await
+        .unwrap();
+    }
+
+    let _failpoint = ScopedFailPoint::new(
+        names::OPTIMIZE_POST_PHASE_B_PRE_MANIFEST_COMMIT,
+        "1*return",
+    );
+    let error = db.optimize().await.unwrap_err();
+    assert!(matches!(error, OmniError::RecoveryRequired { .. }));
+    let operation_id = single_sidecar_operation_id(dir.path());
+    assert_optimize_v2_sidecar_tables(dir.path(), &operation_id, &["node:Work"]);
+    drop(db);
+
+    drop(Omnigraph::open(&uri).await.unwrap());
+    assert_post_recovery_invariants(
+        dir.path(),
+        &operation_id,
+        RecoveryExpectation::RolledForward {
+            tables: vec![TableExpectation::main("node:Work")],
+        },
+    )
+    .await
+    .unwrap();
+
+    let db = Omnigraph::open(&uri).await.unwrap();
+    let stats = db.optimize().await.unwrap();
+    let embedding = stats
+        .iter()
+        .find(|stat| stat.table_key == "node:Embedding")
+        .expect("Embedding stat present");
+    assert!(!embedding.committed, "pending-only table must stay a no-op");
+    assert!(
+        embedding
+            .pending_indexes
+            .iter()
+            .any(|index| index.column == "vector"),
+        "pending-only vector status must remain visible"
+    );
+}
+
+/// One graph-wide v2 sidecar makes partial physical completion an
+/// all-or-nothing recovery unit. One table stops before its first effect while
+/// its sibling finishes; no table pointer becomes graph-visible, and Full open
+/// compensates the moved sibling before publishing one rollback commit.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[serial(optimize)]
+async fn optimize_multi_table_partial_effect_rolls_back_under_one_v2_sidecar() {
+    let _scenario = FailScenario::setup();
+    let dir = tempfile::tempdir().unwrap();
+    let uri = dir.path().to_str().unwrap().to_string();
+    seed_two_productive_optimize_tables(&uri).await;
+
+    let db = Omnigraph::open(&uri).await.unwrap();
+    let snapshot_before = db
+        .snapshot_of(omnigraph::db::ReadTarget::branch("main"))
+        .await
+        .unwrap();
+    let person_pin = snapshot_before.entry("node:Person").unwrap().table_version;
+    let company_pin = snapshot_before.entry("node:Company").unwrap().table_version;
+    let commits_before = db.list_commits(Some("main")).await.unwrap().len();
+    let person_rows = helpers::count_rows(&db, "node:Person").await;
+    let company_rows = helpers::count_rows(&db, "node:Company").await;
+
+    // The first table task to hit the seam returns; the other task proceeds.
+    // Collection waits for both, leaving one completed physical effect under
+    // the one shared sidecar and no graph publish.
+    let _failpoint = ScopedFailPoint::new(names::OPTIMIZE_BEFORE_COMPACT, "1*return");
+    let error = db.optimize().await.unwrap_err();
+    assert!(
+        matches!(error, OmniError::RecoveryRequired { .. }),
+        "post-arm partial Optimize must require recovery, got {error}"
+    );
+    let operation_id = single_sidecar_operation_id(dir.path());
+    assert_optimize_v2_sidecar_tables(dir.path(), &operation_id, &["node:Company", "node:Person"]);
+
+    let snapshot_after_failure = db
+        .snapshot_of(omnigraph::db::ReadTarget::branch("main"))
+        .await
+        .unwrap();
+    assert_eq!(
+        snapshot_after_failure
+            .entry("node:Person")
+            .unwrap()
+            .table_version,
+        person_pin,
+        "partial Optimize must not publish Person"
+    );
+    assert_eq!(
+        snapshot_after_failure
+            .entry("node:Company")
+            .unwrap()
+            .table_version,
+        company_pin,
+        "partial Optimize must not publish Company"
+    );
+    assert_eq!(
+        db.list_commits(Some("main")).await.unwrap().len(),
+        commits_before,
+        "partial Optimize must not publish graph lineage"
+    );
+
+    let person_head = lance::Dataset::open(&node_table_uri(&uri, "Person"))
+        .await
+        .unwrap()
+        .version()
+        .version;
+    let company_head = lance::Dataset::open(&node_table_uri(&uri, "Company"))
+        .await
+        .unwrap()
+        .version()
+        .version;
+    assert_eq!(
+        [person_head > person_pin, company_head > company_pin]
+            .into_iter()
+            .filter(|moved| *moved)
+            .count(),
+        1,
+        "fixture must leave exactly one sibling physical effect before recovery"
+    );
+    drop(db);
+
+    // Read-write open owns the quiescent v2 intent and compensates the moved
+    // table; the no-movement sibling remains at its original pin.
+    let recovered = Omnigraph::open(&uri).await.unwrap();
+    assert_eq!(
+        helpers::count_rows(&recovered, "node:Person").await,
+        person_rows
+    );
+    assert_eq!(
+        helpers::count_rows(&recovered, "node:Company").await,
+        company_rows
+    );
+    assert_eq!(
+        recovered.list_commits(Some("main")).await.unwrap().len(),
+        commits_before + 1,
+        "recovery must publish exactly one compensation lineage commit"
+    );
+    drop(recovered);
+
+    assert_post_recovery_invariants(
+        dir.path(),
+        &operation_id,
+        RecoveryExpectation::RolledBack {
+            tables: vec![
+                TableExpectation::main("node:Company"),
+                TableExpectation::main("node:Person"),
+            ],
+        },
+    )
+    .await
+    .unwrap();
 }
 
 async fn seed_optimize_late_sidecar_race(dir: &tempfile::TempDir) {

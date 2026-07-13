@@ -125,6 +125,13 @@ async fn optimize_after_load_then_again_is_idempotent() {
     // First pass may compact (load wrote real fragments).
     let _first = db.optimize().await.unwrap();
 
+    let commits_before = db.list_commits(None).await.unwrap();
+    let head_before = commits_before
+        .last()
+        .expect("loaded graph has a lineage head")
+        .graph_commit_id
+        .clone();
+
     // Second pass should be a no-op: already-compacted graph produces no
     // fragments_removed / fragments_added.
     let second = db.optimize().await.unwrap();
@@ -145,6 +152,21 @@ async fn optimize_after_load_then_again_is_idempotent() {
             s.table_key
         );
     }
+    let commits_after = db.list_commits(None).await.unwrap();
+    assert_eq!(
+        commits_after.len(),
+        commits_before.len(),
+        "steady-state Optimize must not manufacture graph lineage"
+    );
+    assert_eq!(
+        commits_after.last().unwrap().graph_commit_id,
+        head_before,
+        "steady-state Optimize must preserve the graph head"
+    );
+    assert!(
+        helpers::recovery::sidecar_operation_ids(dir.path()).is_empty(),
+        "steady-state Optimize must not arm a recovery sidecar"
+    );
 }
 
 /// RFC-013 step 2 + Phase 7 + Phase B: `optimize` compacts `__manifest`, which
@@ -152,8 +174,8 @@ async fn optimize_after_load_then_again_is_idempotent() {
 /// folded-in graph-lineage rows (`graph_commit` + `graph_head`). Graph lineage
 /// lives entirely in `__manifest` (Phase B retired the commit-graph datasets), so
 /// `__manifest` is the only internal table optimize compacts. After compaction
-/// `__manifest` sheds fragments, writes no recovery sidecar (a single atomic Lance
-/// commit — no HEAD-before-publish gap), and the graph stays coherent for
+/// `__manifest` sheds fragments and writes no recovery sidecar (it is read at
+/// HEAD and every config/reserve/rewrite step is content-preserving), and the graph stays coherent for
 /// subsequent reads + strict writes.
 #[tokio::test]
 async fn optimize_compacts_internal_tables() {
@@ -286,7 +308,7 @@ async fn optimize_clears_stale_auto_cleanup_and_preserves_versions() {
 }
 
 /// The same non-destructive guarantee on a DATA (node/edge) table, not just the
-/// internal tables. `optimize_one_table` runs `compact_files` / `optimize_indices`
+/// internal tables. `apply_optimize_table_effects` runs `compact_files` / `optimize_indices`
 /// with a default `CommitConfig` (`skip_auto_cleanup = false`); on an upgraded
 /// graph whose Person table still carries the pre-v7 `lance.auto_cleanup.*` config,
 /// those commits would fire Lance's version-GC hook and prune `__manifest`-pinned
@@ -489,6 +511,13 @@ node Tag {\n    slug: String @key\n}\n";
     .await
     .unwrap();
 
+    let commits_before = db.list_commits(None).await.unwrap();
+    let head_before = commits_before
+        .last()
+        .expect("seeded graph has a lineage head")
+        .graph_commit_id
+        .clone();
+
     let stats = db
         .optimize()
         .await
@@ -513,6 +542,22 @@ node Tag {\n    slug: String @key\n}\n";
         doc.fragments_added
     );
     assert_eq!(tag.skipped, None, "non-blob table must not be skipped");
+    assert!(tag.committed, "plain table compaction must be published");
+
+    // Both productive tables share one graph visibility point. Physical
+    // __manifest compaction below may add Lance versions, so lineage is the
+    // stable counter for the public Optimize contract.
+    let commits_after = db.list_commits(None).await.unwrap();
+    assert_eq!(
+        commits_after.len(),
+        commits_before.len() + 1,
+        "one graph-wide Optimize must publish one lineage commit even when two tables move"
+    );
+    assert_eq!(
+        commits_after.last().unwrap().parent_commit_id.as_deref(),
+        Some(head_before.as_str()),
+        "the graph-wide Optimize commit must extend the prior head"
+    );
 
     // Every blob row survives the rewrite and stays readable.
     let count = count_rows(&db, "node:Doc").await;

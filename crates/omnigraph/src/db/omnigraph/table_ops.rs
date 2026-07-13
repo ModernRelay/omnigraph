@@ -538,7 +538,7 @@ fn pre_minted_index_transaction(
 /// indexable here (a list column or `Blob`).
 ///
 /// Shared by `build_indices_on_dataset_for_catalog` (which builds the index)
-/// and `needs_index_work_node` (which checks coverage to decide recovery-
+/// and `index_work_status_on_dataset_for_catalog` (which decides recovery-
 /// sidecar pinning) so the two cannot drift: an enum or orderable scalar the
 /// builder gives a BTREE must also be reported as "needs work" until that
 /// BTREE exists, or the HEAD-advancing build would run without sidecar cover.
@@ -577,7 +577,7 @@ fn node_prop_index_kind(prop_type: &PropType) -> Option<NodePropIndexKind> {
 
 /// Whether a vector column currently has at least one non-null vector — the
 /// minimum for Lance IVF k-means to train (the `ivf_flat(1)` index we build
-/// needs >=1 vector). Used identically by `needs_index_work_node` (so an
+/// needs >=1 vector). Used identically by index-work status planning (so an
 /// untrainable column is not pinned for recovery — avoiding a zero-commit pin
 /// that would roll back a sibling's index work) and by the vector build arm (so
 /// vector staging is only attempted when it can succeed, keeping genuine
@@ -595,9 +595,19 @@ async fn vector_column_trainable(
         > 0)
 }
 
-/// Returns true if the node table is missing at least one declared
-/// scalar/vector index that `build_indices_on_dataset_for_catalog` would
-/// build AND has at least one row (the ensure_indices loop has
+/// Describes the index work visible from one already-selected dataset snapshot.
+/// `needs_commit` excludes pending-only work (today an untrainable vector
+/// column), which is load-bearing for multi-table recovery: a table that cannot
+/// advance HEAD must not become a zero-movement pin beside productive siblings.
+pub(super) struct IndexWorkStatus {
+    pub(super) needs_commit: bool,
+    pub(super) pending: Vec<PendingIndex>,
+}
+
+/// Returns the declared scalar/vector index work that
+/// `build_indices_on_dataset_for_catalog` would build, plus pending-only work,
+/// for one operation-local accepted catalog and one selected dataset snapshot.
+/// The table must have at least one row (the ensure_indices loop has
 /// `if row_count > 0 { build_indices(...) }`, so empty tables produce
 /// zero commits and must NOT be pinned in the sidecar — pinning them
 /// would force `NoMovement` classification on recovery and trigger the
@@ -699,46 +709,27 @@ async fn plan_index_work_node(
     Ok(work)
 }
 
-pub(super) async fn needs_index_work_node(
+pub(super) async fn index_work_status_on_dataset_for_catalog(
     db: &Omnigraph,
-    type_name: &str,
-    full_path: &str,
-    table_branch: Option<&str>,
-) -> Result<bool> {
-    let ds = db
-        .storage()
-        .open_dataset_head(full_path, table_branch)
-        .await?;
-    let catalog = db.catalog();
-    Ok(
-        plan_index_work_node(db, &catalog, type_name, &format!("node:{type_name}"), &ds)
-            .await?
-            .needs_commit(),
-    )
-}
-
-/// Companion to `needs_index_work_node` for edge tables.
-///
-/// **Intentional asymmetry with the node helper**: edges only need
-/// BTree indices (id, src, dst) per `build_indices_on_dataset_for_catalog`
-/// at the edge branch (this file, lines 474-485). FTS / vector indices
-/// on edge properties are not built today; if they ever are, this
-/// helper plus the build function must be updated together.
-///
-/// Empty edge tables are skipped by the ensure_indices loop the same
-/// way node tables are; see `needs_index_work_node`.
-pub(super) async fn needs_index_work_edge(
-    db: &Omnigraph,
-    full_path: &str,
-    table_branch: Option<&str>,
-) -> Result<bool> {
-    let ds = db
-        .storage()
-        .open_dataset_head(full_path, table_branch)
-        .await?;
-    Ok(plan_index_work_edge_on_dataset(db, &ds)
-        .await?
-        .needs_commit())
+    catalog: &Catalog,
+    table_key: &str,
+    ds: &SnapshotHandle,
+) -> Result<IndexWorkStatus> {
+    let work = if let Some(type_name) = table_key.strip_prefix("node:") {
+        plan_index_work_node(db, catalog, type_name, table_key, ds).await?
+    } else if table_key.starts_with("edge:") {
+        // Intentional asymmetry: edges only receive the id/src/dst BTREEs.
+        plan_index_work_edge_on_dataset(db, ds).await?
+    } else {
+        return Err(OmniError::manifest(format!(
+            "invalid table key '{}'",
+            table_key
+        )));
+    };
+    Ok(IndexWorkStatus {
+        needs_commit: work.needs_commit(),
+        pending: work.pending,
+    })
 }
 
 async fn plan_index_work_edge_on_dataset(
