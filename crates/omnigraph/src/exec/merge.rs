@@ -133,7 +133,7 @@ impl OrderedTableCursor {
 
     async fn open(snapshot: &Snapshot, table_key: &str, eager_signatures: bool) -> Result<Self> {
         let dataset = match snapshot.entry(table_key) {
-            Some(_) => Some(snapshot.open(table_key).await?),
+            Some(_) => Some(snapshot.open_dataset(table_key).await?),
             None => None,
         };
         Self::from_dataset(dataset, eager_signatures).await

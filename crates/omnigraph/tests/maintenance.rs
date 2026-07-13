@@ -9,12 +9,12 @@ use std::time::Duration;
 
 use lance::Dataset;
 use lance::dataset::optimize::{CompactionOptions, compact_files};
+use omnigraph::IndexCoverage;
 use omnigraph::db::{
     CleanupPolicyOptions, Omnigraph, ReadTarget, RepairAction, RepairClassification, RepairOptions,
     SkipReason,
 };
 use omnigraph::loader::{LoadMode, load_jsonl};
-use omnigraph::table_store::{IndexCoverage, TableStore};
 
 use helpers::{
     MUTATION_QUERIES, TEST_DATA, TEST_SCHEMA, count_rows, count_rows_branch, init_and_load,
@@ -423,7 +423,7 @@ node Doc {
         let snap = snapshot_main(&db).await.unwrap();
         let ds = snap.open("node:Doc").await.unwrap();
         assert!(
-            TableStore::has_unindexed_fragments(&ds).await.unwrap(),
+            ds.has_unindexed_fragments().await.unwrap(),
             "appended fragment should be unindexed before optimize"
         );
     }
@@ -435,13 +435,11 @@ node Doc {
     let snap = snapshot_main(&db).await.unwrap();
     let ds = snap.open("node:Doc").await.unwrap();
     assert!(
-        !TableStore::has_unindexed_fragments(&ds).await.unwrap(),
+        !ds.has_unindexed_fragments().await.unwrap(),
         "optimize must extend index coverage to all fragments"
     );
     assert_eq!(
-        TableStore::key_column_index_coverage(&ds, "rank")
-            .await
-            .unwrap(),
+        ds.index_coverage("rank").await.unwrap(),
         IndexCoverage::Indexed,
         "rank BTREE must cover all fragments after optimize"
     );
@@ -1649,11 +1647,10 @@ async fn index_build_tolerates_null_vector_rows() {
         "one reconciliation publishes exactly one graph commit"
     );
     let ds = after.open("node:Doc").await.unwrap();
-    let store = TableStore::new(uri, helpers::test_session());
-    assert!(store.has_btree_index(&ds, "id").await.unwrap());
-    assert!(store.has_fts_index(&ds, "slug").await.unwrap());
-    assert!(store.has_btree_index(&ds, "n").await.unwrap());
-    assert!(!store.has_vector_index(&ds, "embedding").await.unwrap());
+    assert!(ds.has_btree_index("id").await.unwrap());
+    assert!(ds.has_fts_index("slug").await.unwrap());
+    assert!(ds.has_btree_index("n").await.unwrap());
+    assert!(!ds.has_vector_index("embedding").await.unwrap());
 }
 
 // iss-848: `optimize` converges declared-but-unbuilt indexes. After an @index is
@@ -1688,9 +1685,7 @@ async fn optimize_materializes_index_declared_but_unbuilt() {
         let ds = snap.open("node:Doc").await.unwrap();
         assert!(
             matches!(
-                TableStore::key_column_index_coverage(&ds, "rank")
-                    .await
-                    .unwrap(),
+                ds.index_coverage("rank").await.unwrap(),
                 IndexCoverage::Degraded { .. }
             ),
             "rank must be unindexed after the deferred apply"
@@ -1702,14 +1697,11 @@ async fn optimize_materializes_index_declared_but_unbuilt() {
     // Postcondition: optimize's reconciler materialized the declared index.
     let snap = snapshot_main(&db).await.unwrap();
     let ds = snap.open("node:Doc").await.unwrap();
-    let store = TableStore::new(uri, helpers::test_session());
-    assert!(store.has_btree_index(&ds, "id").await.unwrap());
-    assert!(store.has_fts_index(&ds, "slug").await.unwrap());
-    assert!(store.has_btree_index(&ds, "rank").await.unwrap());
+    assert!(ds.has_btree_index("id").await.unwrap());
+    assert!(ds.has_fts_index("slug").await.unwrap());
+    assert!(ds.has_btree_index("rank").await.unwrap());
     assert_eq!(
-        TableStore::key_column_index_coverage(&ds, "rank")
-            .await
-            .unwrap(),
+        ds.index_coverage("rank").await.unwrap(),
         IndexCoverage::Indexed,
         "optimize must build the declared-but-unbuilt rank index"
     );
@@ -1750,9 +1742,7 @@ async fn optimize_materializes_index_after_type_rename() {
         let ds = snap.open("node:Item").await.unwrap();
         assert!(
             matches!(
-                TableStore::key_column_index_coverage(&ds, "rank")
-                    .await
-                    .unwrap(),
+                ds.index_coverage("rank").await.unwrap(),
                 IndexCoverage::Degraded { .. }
             ),
             "rank must be unindexed immediately after the rename"
@@ -1764,9 +1754,7 @@ async fn optimize_materializes_index_after_type_rename() {
     let snap = snapshot_main(&db).await.unwrap();
     let ds = snap.open("node:Item").await.unwrap();
     assert_eq!(
-        TableStore::key_column_index_coverage(&ds, "rank")
-            .await
-            .unwrap(),
+        ds.index_coverage("rank").await.unwrap(),
         IndexCoverage::Indexed,
         "optimize must build the renamed table's deferred rank index"
     );

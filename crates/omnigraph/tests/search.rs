@@ -3,7 +3,6 @@ mod helpers;
 use std::env;
 
 use arrow_array::{Array, StringArray};
-use lance::index::DatasetIndexExt;
 use lance_index::is_system_index;
 use serial_test::serial;
 

@@ -245,7 +245,7 @@ impl TableStore {
         snapshot: &Snapshot,
         table_key: &str,
     ) -> Result<Dataset> {
-        snapshot.open(table_key).await
+        snapshot.open_dataset(table_key).await
     }
 
     pub async fn open_at_entry(&self, entry: &SubTableEntry) -> Result<Dataset> {
@@ -1481,7 +1481,7 @@ impl TableStore {
         // `enable_stable_row_ids: true` is defensive — empirically Lance 6.0.1
         // preserves the source dataset's flag through `Operation::Overwrite`
         // when WriteParams omits it (pinned by
-        // `stage_overwrite_preserves_stable_row_ids` in tests/staged_writes.rs),
+        // `stage_overwrite_preserves_stable_row_ids` in table_store/staged_tests.rs),
         // but setting it explicitly keeps the invariant documented at every Overwrite site
         // (see docs/storage.md "Stable row IDs"). Setting it on an existing
         // dataset that was created without stable row IDs is a no-op per
@@ -1944,7 +1944,6 @@ impl TableStore {
     }
 
     async fn user_indices_for_column(
-        &self,
         ds: &Dataset,
         column: &str,
     ) -> Result<Vec<IndexMetadata>> {
@@ -1971,7 +1970,11 @@ impl TableStore {
     }
 
     pub async fn has_btree_index(&self, ds: &Dataset, column: &str) -> Result<bool> {
-        let indices = self.user_indices_for_column(ds, column).await?;
+        Self::has_btree_index_on(ds, column).await
+    }
+
+    pub(crate) async fn has_btree_index_on(ds: &Dataset, column: &str) -> Result<bool> {
+        let indices = Self::user_indices_for_column(ds, column).await?;
         Ok(indices.iter().any(|index| {
             index
                 .index_details
@@ -1982,7 +1985,11 @@ impl TableStore {
     }
 
     pub async fn has_fts_index(&self, ds: &Dataset, column: &str) -> Result<bool> {
-        let indices = self.user_indices_for_column(ds, column).await?;
+        Self::has_fts_index_on(ds, column).await
+    }
+
+    pub(crate) async fn has_fts_index_on(ds: &Dataset, column: &str) -> Result<bool> {
+        let indices = Self::user_indices_for_column(ds, column).await?;
         Ok(indices.iter().any(|index| {
             index
                 .index_details
@@ -1993,7 +2000,11 @@ impl TableStore {
     }
 
     pub async fn has_vector_index(&self, ds: &Dataset, column: &str) -> Result<bool> {
-        let indices = self.user_indices_for_column(ds, column).await?;
+        Self::has_vector_index_on(ds, column).await
+    }
+
+    pub(crate) async fn has_vector_index_on(ds: &Dataset, column: &str) -> Result<bool> {
+        let indices = Self::user_indices_for_column(ds, column).await?;
         Ok(indices.iter().any(|index| {
             index
                 .index_details
@@ -2430,3 +2441,6 @@ mod tests {
         assert!(err.to_string().contains("single-column keys only"));
     }
 }
+
+#[cfg(test)]
+mod staged_tests;

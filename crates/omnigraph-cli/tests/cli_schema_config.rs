@@ -3,7 +3,6 @@
 
 use std::fs;
 
-use lance::index::DatasetIndexExt;
 use omnigraph::db::{Omnigraph, ReadTarget};
 use serde_json::Value;
 use tempfile::tempdir;

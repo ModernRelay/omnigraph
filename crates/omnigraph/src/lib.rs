@@ -17,8 +17,10 @@ pub mod failpoints;
 pub mod graph_index;
 pub mod instrumentation;
 pub mod loader;
-pub mod runtime_cache;
+pub(crate) mod runtime_cache;
 pub mod storage;
-pub mod storage_layer;
-pub mod table_store;
+pub(crate) mod storage_layer;
+pub(crate) mod table_store;
 pub(crate) mod validate;
+
+pub use table_store::IndexCoverage;

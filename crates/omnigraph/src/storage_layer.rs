@@ -86,33 +86,33 @@ pub enum IndexBuildSpec {
 /// Opaque handle to a snapshot of a single sub-table dataset at a
 /// specific version.
 ///
-/// Engine code never sees `lance::Dataset` directly; it holds
-/// `SnapshotHandle` and passes it back to `TableStorage` methods.
-/// Inside this crate, `pub(crate)` accessors expose the inner
-/// `Arc<Dataset>` to the `TableStorage` impl.
+/// Engine code normally holds `SnapshotHandle` and passes it back to
+/// `TableStorage` methods. The inner field is private. A small set of
+/// `pub(crate)` accessors remains for the trait implementation and explicitly
+/// registered read/maintenance exceptions; `tests/forbidden_apis.rs` pins
+/// every call site by file and count.
 #[derive(Debug, Clone)]
 pub struct SnapshotHandle {
-    pub(crate) inner: Arc<Dataset>,
+    inner: Arc<Dataset>,
 }
 
 impl SnapshotHandle {
-    /// Construct from a Lance dataset. `pub(crate)` — only
-    /// `TableStore` should produce these.
+    /// Construct from a Lance dataset. `pub(crate)` for the storage
+    /// implementation and explicitly registered writer bridges.
     pub(crate) fn new(ds: Dataset) -> Self {
         Self {
             inner: Arc::new(ds),
         }
     }
 
-    /// Borrow the underlying Lance dataset. `pub(crate)` so only the
-    /// `TableStorage` impl in this crate can reach through.
+    /// Borrow the underlying Lance dataset. Calls outside this module are
+    /// enumerated as read-only or maintenance exceptions by the protocol guard.
     pub(crate) fn dataset(&self) -> &Dataset {
         &self.inner
     }
 
-    /// Take ownership of the inner `Arc<Dataset>`. Used by the
-    /// `TableStorage` impl when an op needs to mutate the dataset in
-    /// place (commit a staged write, append, overwrite, …).
+    /// Take ownership of the inner `Arc<Dataset>`. Used by the `TableStorage`
+    /// impl for staged commits and by the registered read-only blob accessor.
     ///
     /// Performance note: callers consume the returned `Arc` via
     /// `Arc::try_unwrap(...).unwrap_or_else(|arc| (*arc).clone())`. The
@@ -127,9 +127,9 @@ impl SnapshotHandle {
     }
 
     /// Take ownership of the inner `Dataset` by unwrapping the `Arc`
-    /// (or cloning if the snapshot is shared). `pub(crate)` — used
-    /// only by the maintenance path (`optimize`, `cleanup`) which
-    /// must hand `&mut Dataset` to Lance compaction / cleanup APIs
+    /// (or cloning if the snapshot is shared). `pub(crate)` — used only by
+    /// Optimize's registered physical-maintenance paths, which must hand
+    /// `&mut Dataset` to Lance compaction APIs
     /// that the `TableStorage` trait does not (and should not)
     /// surface. Engine code that participates in the staged-write
     /// invariant must stay on the trait methods.
@@ -163,7 +163,7 @@ impl SnapshotHandle {
 /// `pub(crate)`.
 #[derive(Debug, Clone)]
 pub struct StagedHandle {
-    pub(crate) inner: StagedWrite,
+    inner: StagedWrite,
 }
 
 impl StagedHandle {

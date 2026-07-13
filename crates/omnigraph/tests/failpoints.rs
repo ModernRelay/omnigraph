@@ -16,7 +16,7 @@ use helpers::recovery::{
 };
 use helpers::{
     MUTATION_QUERIES, collect_column_strings, count_rows, mixed_params, mutate_main, params,
-    read_table, test_session, version_main,
+    read_table, version_main,
 };
 
 const SCHEMA_V1: &str = "node Person { name: String @key }\n";
@@ -2872,7 +2872,6 @@ async fn recovery_rolls_forward_load_overwrite() {
 async fn recovery_rolls_forward_ensure_indices_on_feature_branch() {
     use lance::index::DatasetIndexExt;
     use omnigraph::loader::{LoadMode, load_jsonl};
-    use omnigraph::table_store::TableStore;
 
     let _scenario = FailScenario::setup();
     let dir = tempfile::tempdir().unwrap();
@@ -2918,11 +2917,7 @@ async fn recovery_rolls_forward_ensure_indices_on_feature_branch() {
     // publisher deliberately skips the normal index-rebuild preparation;
     // the failed writer below is still the real `ensure_indices_on`.
     let person_uri = node_table_uri(&uri, "Person");
-    let store = TableStore::new(&uri, test_session());
-    let mut ds = store
-        .open_dataset_head(&person_uri, Some("feature"))
-        .await
-        .unwrap();
+    let mut ds = helpers::open_dataset_head(&person_uri, Some("feature")).await;
     ds.drop_index("id_idx").await.unwrap();
     let dropped_index_head = ds.version().version;
     db.failpoint_publish_table_head_without_index_rebuild_for_test(
@@ -5599,17 +5594,32 @@ async fn schema_apply_first_touch_foreign_winner_is_preserved_not_adopted() {
         ]))],
     )
     .unwrap();
-    let store = omnigraph::table_store::TableStore::new(&uri, test_session());
-    let staged = store
-        .stage_create(&company_uri, foreign_batch)
+    let reader = arrow_array::RecordBatchIterator::new(
+        vec![Ok(foreign_batch.clone())],
+        foreign_batch.schema(),
+    );
+    let foreign = lance::Dataset::write(
+        reader,
+        &company_uri,
+        Some(lance::dataset::WriteParams {
+            mode: lance::dataset::WriteMode::Create,
+            enable_stable_row_ids: true,
+            data_storage_version: Some(lance_file::version::LanceFileVersion::V2_2),
+            allow_external_blob_outside_bases: true,
+            auto_cleanup: None,
+            skip_auto_cleanup: true,
+            ..Default::default()
+        }),
+    )
+    .await
+    .unwrap();
+    let foreign_identity = foreign
+        .read_transaction()
         .await
-        .unwrap();
-    let foreign_identity = staged.transaction_identity();
-    let (foreign, committed_identity) = store
-        .commit_staged_create_exact(&company_uri, staged)
-        .await
-        .unwrap();
-    assert_eq!(committed_identity, foreign_identity);
+        .unwrap()
+        .expect("version-one foreign create must retain its transaction")
+        .uuid
+        .clone();
     assert_eq!(foreign.version().version, 1);
     assert_eq!(foreign.count_rows(None).await.unwrap(), 1);
     drop(foreign);
@@ -5653,7 +5663,7 @@ async fn schema_apply_first_touch_foreign_winner_is_preserved_not_adopted() {
             .as_ref()
             .unwrap()
             .uuid,
-        foreign_identity.uuid,
+        foreign_identity,
         "recovery must leave the foreign transaction identity untouched"
     );
 }
@@ -7760,7 +7770,6 @@ async fn branch_merge_confirmed_ref_only_effect_rolls_forward() {
 #[serial(branch_merge_phase_b)]
 async fn branch_merge_armed_index_tail_rolls_back_after_exact_transaction_prefix() {
     use lance::index::DatasetIndexExt;
-    use omnigraph::table_store::TableStore;
 
     let _scenario = FailScenario::setup();
     let dir = tempfile::tempdir().unwrap();
@@ -7771,11 +7780,7 @@ async fn branch_merge_armed_index_tail_rolls_back_after_exact_transaction_prefix
     // Make the rewrite rebuild `id_idx` after its logical data transaction.
     // Publish the dropped-index HEAD first so the merge's expected version and
     // planned transaction chain are anchored to a fully consistent target.
-    let store = TableStore::new(&uri, test_session());
-    let mut target_person = store
-        .open_dataset_head(&person_uri, Some("target"))
-        .await
-        .unwrap();
+    let mut target_person = helpers::open_dataset_head(&person_uri, Some("target")).await;
     target_person.drop_index("id_idx").await.unwrap();
     let dropped_index_head = target_person.version().version;
     db.failpoint_publish_table_head_without_index_rebuild_for_test(
@@ -7831,10 +7836,8 @@ async fn branch_merge_armed_index_tail_rolls_back_after_exact_transaction_prefix
         planned_transaction_count > 0,
         "fixture must plan at least one logical Person transaction"
     );
-    let raw_head_with_index_tail = store
-        .open_dataset_head(&person_uri, Some("target"))
+    let raw_head_with_index_tail = helpers::open_dataset_head(&person_uri, Some("target"))
         .await
-        .unwrap()
         .version()
         .version;
     assert!(
@@ -7871,7 +7874,6 @@ async fn branch_merge_armed_index_tail_rolls_back_after_exact_transaction_prefix
 async fn branch_merge_confirmation_rejects_foreign_append_before_index_tail() {
     use futures::TryStreamExt;
     use lance::index::DatasetIndexExt;
-    use omnigraph::table_store::TableStore;
 
     let _scenario = FailScenario::setup();
     let dir = tempfile::tempdir().unwrap();
@@ -7907,11 +7909,7 @@ async fn branch_merge_confirmation_rejects_foreign_append_before_index_tail() {
     // Force RewriteMerged to execute a CreateIndex tail after its exact data
     // transaction, while keeping the target manifest consistent before merge.
     let person_uri = node_table_uri(&uri, "Person");
-    let store = TableStore::new(&uri, test_session());
-    let mut target_person = store
-        .open_dataset_head(&person_uri, Some("target"))
-        .await
-        .unwrap();
+    let mut target_person = helpers::open_dataset_head(&person_uri, Some("target")).await;
     target_person.drop_index("id_idx").await.unwrap();
     let dropped_index_head = target_person.version().version;
     db.failpoint_publish_table_head_without_index_rebuild_for_test(
@@ -7935,10 +7933,7 @@ async fn branch_merge_confirmation_rejects_foreign_append_before_index_tail() {
     // The merge's logical data transaction is now at HEAD, but its index build
     // has not started. Append a real logical row without publishing target
     // manifest authority, then let CreateIndex rebase over that foreign commit.
-    let mut raw_target = store
-        .open_dataset_head(&person_uri, Some("target"))
-        .await
-        .unwrap();
+    let mut raw_target = helpers::open_dataset_head(&person_uri, Some("target")).await;
     helpers::lance_append_inline(&mut raw_target, foreign_batch).await;
     let foreign_append_head = raw_target.version().version;
     merge_rv.release();
@@ -7957,10 +7952,8 @@ async fn branch_merge_confirmation_rejects_foreign_append_before_index_tail() {
         sidecar["protocol_v4"]["effect_phase"], "Armed",
         "confirmation must reject before persisting EffectsConfirmed"
     );
-    let raw_head_after_index_rebase = store
-        .open_dataset_head(&person_uri, Some("target"))
+    let raw_head_after_index_rebase = helpers::open_dataset_head(&person_uri, Some("target"))
         .await
-        .unwrap()
         .version()
         .version;
     assert!(
@@ -8002,10 +7995,7 @@ async fn branch_merge_confirmation_rejects_foreign_append_before_index_tail() {
         dropped_index_head,
         "target manifest must remain at its pre-merge Person pin"
     );
-    let raw_after_failed_recovery = store
-        .open_dataset_head(&person_uri, Some("target"))
-        .await
-        .unwrap();
+    let raw_after_failed_recovery = helpers::open_dataset_head(&person_uri, Some("target")).await;
     assert_eq!(
         raw_after_failed_recovery.version().version,
         raw_head_after_index_rebase,

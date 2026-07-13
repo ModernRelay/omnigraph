@@ -12,7 +12,7 @@ mod helpers;
 use omnigraph::db::Omnigraph;
 use omnigraph::instrumentation::with_traversal_mode;
 use omnigraph::loader::{LoadMode, load_jsonl};
-use omnigraph::table_store::{IndexCoverage, TableStore};
+use omnigraph::IndexCoverage;
 use omnigraph_compiler::ir::ParamMap;
 
 use helpers::*;
@@ -61,16 +61,12 @@ async fn key_column_index_coverage_detects_btree_presence() {
     // The shared fixture explicitly reconciles indexes after loading, so the
     // edge `src` BTREE is present and fully covered here.
     let edge_ds = snap.open("edge:Knows").await.unwrap();
-    let src_cov = TableStore::key_column_index_coverage(&edge_ds, "src")
-        .await
-        .unwrap();
+    let src_cov = edge_ds.index_coverage("src").await.unwrap();
     assert_eq!(src_cov, IndexCoverage::Indexed, "edge src is BTREE-indexed");
 
     // A node property column with no scalar index → Degraded (the warn path).
     let node_ds = snap.open("node:Person").await.unwrap();
-    let age_cov = TableStore::key_column_index_coverage(&node_ds, "age")
-        .await
-        .unwrap();
+    let age_cov = node_ds.index_coverage("age").await.unwrap();
     assert!(
         matches!(age_cov, IndexCoverage::Degraded { .. }),
         "non-indexed column should be Degraded, got {age_cov:?}"
@@ -92,7 +88,7 @@ async fn coverage_degrades_for_appended_unindexed_fragment() {
     let snap = snapshot_main(&db).await.unwrap();
     let edge_ds = snap.open("edge:Knows").await.unwrap();
     assert_eq!(
-        TableStore::key_column_index_coverage(&edge_ds, "src").await.unwrap(),
+        edge_ds.index_coverage("src").await.unwrap(),
         IndexCoverage::Indexed,
         "freshly-loaded edge BTREE covers all fragments"
     );
@@ -109,7 +105,7 @@ async fn coverage_degrades_for_appended_unindexed_fragment() {
 
     let snap2 = snapshot_main(&db).await.unwrap();
     let edge_ds2 = snap2.open("edge:Knows").await.unwrap();
-    let cov = TableStore::key_column_index_coverage(&edge_ds2, "src").await.unwrap();
+    let cov = edge_ds2.index_coverage("src").await.unwrap();
     assert!(
         matches!(cov, IndexCoverage::Degraded { .. }),
         "appended unindexed fragment must degrade coverage, got {cov:?}"

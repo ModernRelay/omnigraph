@@ -187,6 +187,16 @@ Behavior-affecting findings in this audit:
   `build_index_metadata_from_segments` remains `pub(crate)`. Lance #6666 is
   therefore still relevant to external generic multi-segment publication, but
   it does not block OmniGraph's current full-table vector shape.
+- **Maintenance still has no stable public caller-controlled transaction
+  boundary.** In beta.21, `compact_files` and `optimize_indices` remain
+  high-level committing operations; their internal transaction construction is
+  not a public contract that OmniGraph can pre-mint and later prove as one
+  complete compact/reindex effect. RFC-022 therefore keeps Optimize's bounded
+  schema-v2 adapter instead of binding an "exact-v9" protocol to beta internals.
+  Revisit exact Optimize provenance only after Lance exposes a stable public
+  maintenance-transaction API and OmniGraph has distributed recovery fencing;
+  the latter is independently required before destructive recovery is safe
+  against a live foreign process.
 - **Index construction gained correctness and bounded-resource fixes:** beta.17
   prevents an FTS builder thread-pool deadlock and bounds tail-partition merge
   memory; beta.18 fixes a streaming IVF training hang; beta.19 caps nullable

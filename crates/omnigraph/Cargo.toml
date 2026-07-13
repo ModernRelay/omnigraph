@@ -62,6 +62,7 @@ lance-namespace-impls = { workspace = true }
 lance-io = { git = "https://github.com/lance-format/lance", rev = "1aec14652dcbace23ac277fa8ced35000bea0c40", features = ["test-util"] }
 serial_test = "3"
 proptest = "1"
+syn = { version = "2", features = ["full", "visit"] }
 # benches/scenarios.rs only: wait4/rusage peak-RSS + setrlimit memory caps.
 libc = "0.2"
 

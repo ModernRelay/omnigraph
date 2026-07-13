@@ -166,9 +166,11 @@ Code paths:
 
 - Read entry: `Omnigraph::query` at `crates/omnigraph/src/exec/query.rs:7`
 - Mutation entry: `Omnigraph::mutate` at `crates/omnigraph/src/exec/mutation.rs:511`
-- Manifest commit: `ManifestCoordinator::commit` at `crates/omnigraph/src/db/manifest.rs:280`
+- Manifest publish: `GraphCoordinator::commit_changes_with_intent_and_expected`
+  gates the exact writer path and delegates to
+  `ManifestCoordinator::commit_changes_with_lineage_and_precondition`
 - Graph index: `crates/omnigraph/src/graph_index/`
-- Loader: `Omnigraph::ingest` at `crates/omnigraph/src/loader/mod.rs:74`
+- Loader: `Omnigraph::load_as` in `crates/omnigraph/src/loader/mod.rs`
 
 ### Mutation atomicity — in-memory accumulator + branch-wide OCC (MR-794 / RFC-022)
 
@@ -245,8 +247,9 @@ flowchart LR
 
 The staged-write trait exists today as `TableStorage`, implemented by
 `TableStore`. Every staged-capable graph-visible effect routes through its
-primitives; Optimize remains the documented Lance-maintenance exception because
-its compaction/index-fold APIs have no uncommitted form. The final storage-trait
+primitives; Optimize remains the documented bounded schema-v2 Lance-maintenance
+exception because its compaction/index-fold APIs have no stable public
+caller-controlled transaction form. The final storage-trait
 inline residual was removed when full-table vector index creation moved into
 `stage_create_indices`. Capability and statistics surfaces remain roadmap, so
 the planner cannot yet reason about all pushdown opportunities through a
@@ -283,11 +286,26 @@ BTREE, FTS, and full-table vector artifact for one table into one staged Lance
 branch/schema authority, fixed original and rollback lineage, the complete
 manifest delta, and first-touch ref ownership before publication. Schema-v6
 sidecars remain readable with their original loose compatibility semantics.
-Optimize is separate: its compaction/index-coverage fold still uses the legacy
-maintenance adapter. Reads degrade gracefully when index coverage is missing or
+Optimize is separate: its compaction/index-coverage fold uses the bounded
+schema-v2 maintenance adapter within the single-writer-process recovery boundary.
+Reads degrade gracefully when index coverage is missing or
 partial — Lance's scanner unions indexed and scan paths automatically (vector
 search falls back to brute force). A future background reconciler may automate
 the same explicit convergence path.
+
+The supported SDK graph-write set is closed first by Rust visibility: raw
+`TableStore` / `TableStorage`, handle-cache, and coordinator surfaces are
+crate-private. Public snapshot tables expose reads rather than a writable Lance
+`Dataset`; their scan facade withholds Lance's raw `Scanner` and physical plan,
+which can otherwise reveal the dataset embedded in a scan execution node.
+`crates/omnigraph/tests/forbidden_apis.rs` then provides defense in depth by
+classifying public async inherent `Omnigraph` methods and loader conveniences,
+every crate-visible async coordinator method, and exact per-file occurrences of
+registered durable-call shapes, including recovery execution. It rejects known
+direct Lance open/mutation shapes outside exact gateway files. Adding a
+supported writer therefore changes that registry; the scanner supplements the
+visibility boundary rather than pretending to expand arbitrary Rust macros or
+prove function-pointer aliases.
 
 ### Server / CLI
 
