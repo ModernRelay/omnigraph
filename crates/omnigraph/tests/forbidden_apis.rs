@@ -31,14 +31,20 @@
 //! Rust macro expander or general function-pointer alias analysis; visibility
 //! remains the structural closure.
 //!
-//! ## What's deliberately out of scope (allow-listed by exact file)
+//! ## What's deliberately outside the lexical deny-list
 //!
 //! - `crates/omnigraph/src/table_store.rs` — the crate-private storage layer.
 //!   The forbidden Lance APIs live here legitimately.
 //! - The exact manifest gateway implementations listed below — bootstrap,
 //!   namespace plumbing, row-level publishing, and recovery — plus their
-//!   out-of-line test module. Other files under `db/manifest/` are scanned.
+//!   out-of-line test module.
 //! - `crates/omnigraph/src/storage_layer.rs` — IS the trait module.
+//!
+//! Every production file in that lexical allow-list is still parsed by the
+//! structural registry. Only standalone files compiled exclusively through a
+//! parent `#[cfg(test)]` module are omitted from that pass. The callable
+//! surfaces of the storage and manifest gateways are also pinned exactly, so a
+//! new wrapper cannot hide behind a new primitive name.
 //!
 //! ## Allow-list shape
 //!
@@ -50,9 +56,9 @@
 //! The dead legacy methods
 //! (trait `append_batch` / `merge_insert_batches`, inherent
 //! `merge_insert_batch{,es}`, `create_{btree,inverted}_index`) were
-//! removed entirely. This guard's scope is unchanged: it catches direct
-//! `lance::*` inline-commit misuse outside the storage layer. The
-//! file-level allow-list below matches that boundary.
+//! removed entirely. The lexical pass catches direct `lance::*` misuse outside
+//! the implementation boundary; the structural pass exact-counts the raw
+//! builder/commit shapes inside that boundary as well.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
@@ -137,18 +143,16 @@ const ALLOW_LIST_FILES: &[&str] = &[
     "instrumentation.rs",          // The instrumented dataset opener.
 ];
 
-/// Lowest-level implementations which define the primitives inventoried at
-/// their callers, plus the out-of-line manifest test module. This list is
-/// intentionally file-exact: a new sibling under `db/manifest/` is scanned.
+/// Out-of-line test modules are parsed as standalone files, so their enclosing
+/// `#[cfg(test)]` is not visible to the syntax walker. Production gateway and
+/// primitive-definition files are deliberately *not* excluded: their current
+/// durable calls are exact-registered below, so adding a new call inside a
+/// trusted implementation still requires an explicit protocol disposition.
 const PROTOCOL_SCAN_EXCLUDED_FILES: &[&str] = &[
-    "table_store.rs",
     "table_store/staged_tests.rs",
-    "storage_layer.rs",
-    "storage.rs",
-    "instrumentation.rs",
-    "db/manifest/graph.rs",
+    // The parent module declaration is `#[cfg(test)]`, but this standalone
+    // source walk cannot see that attribute.
     "db/manifest/namespace.rs",
-    "db/manifest/publisher.rs",
     "db/manifest/tests.rs",
 ];
 
@@ -413,6 +417,125 @@ const LOW_LEVEL_WRITE_SURFACES: &[(&str, &str, &str, WriteProtocol)] = &[
     ),
 ];
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum GatewayDisposition {
+    ReadOrPure,
+    StageOnly,
+    Durable(WriteProtocol),
+}
+
+impl GatewayDisposition {
+    fn label(self) -> String {
+        match self {
+            Self::ReadOrPure => "read/pure".into(),
+            Self::StageOnly => "stage-only physical effect".into(),
+            Self::Durable(protocol) => protocol.label(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+struct GatewaySurface {
+    file: &'static str,
+    owner: &'static str,
+    function: &'static str,
+    disposition: GatewayDisposition,
+}
+
+macro_rules! gateway_surfaces {
+    ($($file:literal => $owner:literal => $disposition:expr => [$($function:literal),+ $(,)?]),+ $(,)?) => {
+        const GATEWAY_SURFACES: &[GatewaySurface] = &[
+            $($(GatewaySurface {
+                file: $file,
+                owner: $owner,
+                function: $function,
+                disposition: $disposition,
+            },)+)+
+        ];
+    };
+}
+
+// Closed callable surface for the primitive/gateway types themselves. The raw
+// call inventory below catches body growth; this registry catches a new wrapper
+// or an entirely new primitive name before a crate-internal caller can use it.
+gateway_surfaces! {
+    "storage.rs" => "StorageAdapter" => GatewayDisposition::ReadOrPure => [
+        "read_text", "exists", "list_dir", "read_text_versioned",
+    ],
+    "storage.rs" => "StorageAdapter" => GatewayDisposition::Durable(WriteProtocol::Composed("object storage primitive")) => [
+        "write_text", "write_text_if_absent", "rename_text", "delete",
+        "write_text_if_match", "delete_prefix",
+    ],
+    "storage_layer.rs" => "TableStorage" => GatewayDisposition::ReadOrPure => [
+        "open_snapshot_at_entry", "open_snapshot_at_table", "open_dataset_head",
+        "branch_identifier", "list_branches", "reopen_for_mutation",
+        "ensure_expected_version", "scan", "scan_with_row_id", "scan_batches",
+        "scan_batches_for_rewrite", "count_rows", "count_rows_with_staged",
+        "scan_with_staged", "scan_with_pending", "scan_with_pending_materialized_blobs",
+        "first_row_id_for_filter", "table_state", "has_btree_index",
+        "has_fts_index", "has_vector_index", "root_uri", "dataset_uri", "scan_stream",
+    ],
+    "storage_layer.rs" => "TableStorage" => GatewayDisposition::StageOnly => [
+        "stage_create", "stage_append", "stage_append_stream", "stage_merge_insert",
+        "stage_overwrite", "stage_delete", "stage_create_indices",
+    ],
+    "storage_layer.rs" => "TableStorage" => GatewayDisposition::Durable(WriteProtocol::Composed("first-touch native ref")) => [
+        "fork_branch_from_state",
+    ],
+    "storage_layer.rs" => "TableStorage" => GatewayDisposition::Durable(WriteProtocol::NativeRefControl) => [
+        "force_delete_branch",
+    ],
+    "storage_layer.rs" => "TableStorage" => GatewayDisposition::Durable(WriteProtocol::Composed("shared staged commit gateway")) => [
+        "commit_staged",
+    ],
+    "storage_layer.rs" => "TableStorage" => GatewayDisposition::Durable(WriteProtocol::Exact("staged create gateway")) => [
+        "commit_staged_create_exact",
+    ],
+    "storage_layer.rs" => "TableStorage" => GatewayDisposition::Durable(WriteProtocol::Exact("staged exact commit gateway")) => [
+        "commit_staged_exact",
+    ],
+    "table_store.rs" => "TableStore" => GatewayDisposition::ReadOrPure => [
+        "new", "root_uri", "dataset_uri", "open_snapshot_table", "open_at_entry",
+        "open_dataset_head", "list_branches", "ensure_expected_version",
+        "reopen_for_mutation", "scan_batches", "scan_batches_for_rewrite",
+        "scan_stream_for_rewrite", "materialize_blob_batch", "scan_stream",
+        "scan_stream_with", "scan", "scan_with", "scan_edges_by_endpoint",
+        "key_column_index_coverage", "has_unindexed_fragments", "count_rows",
+        "dataset_version", "table_state", "scan_with_staged", "scan_with_pending",
+        "scan_with_pending_materialized_blobs", "count_rows_with_staged",
+        "has_btree_index", "has_btree_index_on", "has_fts_index", "has_fts_index_on",
+        "has_vector_index", "has_vector_index_on", "first_row_id_for_filter",
+    ],
+    "table_store.rs" => "TableStore" => GatewayDisposition::StageOnly => [
+        "stage_create", "stage_append", "stage_append_stream", "stage_merge_insert",
+        "stage_overwrite", "stage_delete", "stage_create_indices",
+    ],
+    "table_store.rs" => "TableStore" => GatewayDisposition::Durable(WriteProtocol::Composed("first-touch native ref")) => [
+        "fork_branch_from_state",
+    ],
+    "table_store.rs" => "TableStore" => GatewayDisposition::Durable(WriteProtocol::NativeRefControl) => [
+        "force_delete_branch",
+    ],
+    "table_store.rs" => "TableStore" => GatewayDisposition::Durable(WriteProtocol::Composed("shared staged commit gateway")) => [
+        "commit_staged",
+    ],
+    "table_store.rs" => "TableStore" => GatewayDisposition::Durable(WriteProtocol::Exact("staged create gateway")) => [
+        "commit_staged_create_exact",
+    ],
+    "table_store.rs" => "TableStore" => GatewayDisposition::Durable(WriteProtocol::Exact("staged exact commit gateway")) => [
+        "commit_staged_exact",
+    ],
+    "table_store.rs" => "TableStore" => GatewayDisposition::Durable(WriteProtocol::EphemeralScratch) => [
+        "append_or_create_batch", "create_empty_dataset", "write_dataset",
+    ],
+    "db/manifest/publisher.rs" => "ManifestBatchPublisher" => GatewayDisposition::Durable(WriteProtocol::Exact("manifest publisher gateway")) => [
+        "publish", "publish_with_precondition",
+    ],
+    "db/manifest/publisher.rs" => "GraphNamespacePublisher" => GatewayDisposition::ReadOrPure => [
+        "new",
+    ],
+}
+
 #[derive(Debug, Clone, Copy)]
 struct DurableCallsite {
     file: &'static str,
@@ -430,10 +553,45 @@ macro_rules! durable_calls {
 }
 
 // Exact per-file counts, not file allow-lists: a second caller in an approved
-// adapter is still a new writer and fails this guard. The storage and manifest
-// publisher implementations provide the lowest gateways and are excluded;
-// recovery execution is deliberately included and inventoried below.
+// adapter is still a new writer and fails this guard. Production storage and
+// manifest implementations are included; only standalone test-only sources
+// whose parent cfg is invisible to this file walker are excluded.
 durable_calls! {
+    ("db/manifest/graph.rs", "Dataset::write(", 2, WriteProtocol::Bootstrap),
+    ("db/manifest/graph.rs", ".update_config(", 1, WriteProtocol::Bootstrap),
+    ("db/manifest/graph.rs", "stamp_current_version(", 1, WriteProtocol::Bootstrap),
+    ("db/manifest/publisher.rs", ".dataset()", 2, WriteProtocol::ReadOnlyAccess),
+    ("db/manifest/publisher.rs", ".publish_with_precondition(", 1, WriteProtocol::Exact("manifest publisher trait forwarding")),
+    ("db/manifest/publisher.rs", "MergeInsertBuilder::try_new(", 1, WriteProtocol::Exact("lowest manifest publisher gateway")),
+    ("db/manifest/publisher.rs", ".execute_reader(", 1, WriteProtocol::Exact("lowest manifest publisher gateway")),
+    ("db/manifest/migrations.rs", ".update_schema_metadata(", 1, WriteProtocol::Bootstrap),
+    ("instrumentation.rs", ".write_text(", 1, WriteProtocol::Composed("instrumented storage forwarding")),
+    ("instrumentation.rs", ".write_text_if_absent(", 1, WriteProtocol::Composed("instrumented storage forwarding")),
+    ("instrumentation.rs", ".write_text_if_match(", 1, WriteProtocol::Composed("instrumented storage forwarding")),
+    ("instrumentation.rs", ".rename_text(", 1, WriteProtocol::Composed("instrumented storage forwarding")),
+    ("instrumentation.rs", ".delete(", 1, WriteProtocol::Composed("instrumented storage forwarding")),
+    ("instrumentation.rs", ".delete_prefix(", 1, WriteProtocol::Composed("instrumented storage forwarding")),
+    ("storage.rs", ".delete(", 2, WriteProtocol::Composed("storage adapter primitive")),
+    ("storage.rs", ".put(", 2, WriteProtocol::Composed("object storage put primitive")),
+    ("storage.rs", ".put_opts(", 2, WriteProtocol::Composed("object storage conditional put primitive")),
+    ("storage.rs", ".rename(", 1, WriteProtocol::Composed("object storage rename primitive")),
+    ("storage_layer.rs", ".fork_branch_from_state(", 1, WriteProtocol::Composed("sealed TableStorage forwarding")),
+    ("storage_layer.rs", ".force_delete_branch(", 1, WriteProtocol::NativeRefControl),
+    ("storage_layer.rs", ".commit_staged_create_exact(", 1, WriteProtocol::Exact("sealed TableStorage create forwarding")),
+    ("storage_layer.rs", ".commit_staged(", 1, WriteProtocol::Composed("sealed TableStorage forwarding")),
+    ("storage_layer.rs", ".commit_staged_exact(", 1, WriteProtocol::Exact("sealed TableStorage forwarding")),
+    ("storage_layer.rs", ".dataset()", 23, WriteProtocol::Composed("sealed TableStorage forwarding")),
+    ("storage_layer.rs", ".into_arc()", 3, WriteProtocol::Composed("sealed TableStorage forwarding")),
+    ("storage_layer.rs", "SnapshotHandle::new(", 3, WriteProtocol::Composed("sealed TableStorage forwarding")),
+    ("table_store.rs", ".raw_dataset_append(", 1, WriteProtocol::EphemeralScratch),
+    ("table_store.rs", "Dataset::write(", 2, WriteProtocol::EphemeralScratch),
+    ("table_store.rs", "DeleteBuilder::new(", 1, WriteProtocol::Composed("staged delete primitive")),
+    ("table_store.rs", "InsertBuilder::new(", 4, WriteProtocol::Composed("staged insert primitive")),
+    ("table_store.rs", "MergeInsertBuilder::try_new(", 1, WriteProtocol::Composed("staged merge primitive")),
+    ("table_store.rs", "CommitBuilder::new(", 2, WriteProtocol::Composed("staged commit primitive")),
+    ("table_store.rs", ".create_index_builder(", 3, WriteProtocol::Composed("staged index primitive")),
+    ("table_store.rs", ".execute_uncommitted(", 8, WriteProtocol::Composed("staged physical primitive")),
+    ("table_store.rs", ".execute_uncommitted_stream(", 1, WriteProtocol::Composed("staged physical primitive")),
     ("exec/staging.rs", "write_sidecar(", 1, WriteProtocol::Exact("Mutation/Load v3")),
     ("exec/merge.rs", "write_sidecar(", 1, MERGE_V4),
     ("db/omnigraph/schema_apply.rs", "write_sidecar(", 1, SCHEMA_V7),
@@ -487,6 +645,7 @@ durable_calls! {
     ("db/omnigraph.rs", "load_or_bootstrap_schema_contract(", 2, WriteProtocol::LegacySchemaBootstrap),
     ("db/omnigraph/optimize.rs", "compact_files(", 2, WriteProtocol::Composed("Optimize v2 data + physical manifest compaction")),
     ("db/omnigraph/optimize.rs", ".optimize_indices(", 1, OPTIMIZE_V2),
+    ("db/omnigraph/optimize.rs", ".update_config(", 1, WriteProtocol::PhysicalOnly),
     ("db/omnigraph/optimize.rs", "cleanup_old_versions(", 1, WriteProtocol::PhysicalOnly),
     ("db/omnigraph/schema_apply.rs", "cleanup_old_versions(", 1, WriteProtocol::Composed("SchemaApply hard-drop GC")),
     ("db/omnigraph/schema_apply.rs", "write_schema_contract_staging(", 1, SCHEMA_V7),
@@ -550,9 +709,13 @@ const DURABLE_PRIMITIVES: &[&str] = &[
     ".publish_with_precondition(",
     ".publish(",
     ".write_text_if_absent(",
+    ".write_text_if_match(",
     ".write_text(",
     ".delete(",
     ".delete_prefix(",
+    ".put(",
+    ".put_opts(",
+    ".rename(",
     ".rename_text(",
     "GraphCoordinator::init(",
     "recover_manifest_drift(",
@@ -562,6 +725,9 @@ const DURABLE_PRIMITIVES: &[&str] = &[
     "compact_files(",
     ".optimize_indices(",
     "cleanup_old_versions(",
+    ".update_config(",
+    ".update_schema_metadata(",
+    "stamp_current_version(",
     "write_schema_contract_staging(",
     "promote_exact_schema_staging(",
     "discard_exact_schema_staging(",
@@ -574,6 +740,14 @@ const DURABLE_PRIMITIVES: &[&str] = &[
     "TableStore::append_or_create_batch(",
     "TableStore::write_dataset(",
     "Dataset::write(",
+    "DeleteBuilder::new(",
+    "InsertBuilder::new(",
+    "MergeInsertBuilder::try_new(",
+    "CommitBuilder::new(",
+    ".create_index_builder(",
+    ".execute_uncommitted(",
+    ".execute_uncommitted_stream(",
+    ".execute_reader(",
     ".raw_dataset_append(",
     ".merge_insert(",
     ".add_columns(",
@@ -803,10 +977,14 @@ fn primitive_terminal_identifier(primitive: &str) -> &str {
 fn is_durable_identifier(identifier: &str) -> bool {
     [
         "Dataset",
+        "CommitBuilder",
+        "DeleteBuilder",
         "GraphCoordinator",
+        "GraphNamespacePublisher",
+        "InsertBuilder",
         "ManifestBatchPublisher",
         "ManifestCoordinator",
-        "GraphNamespacePublisher",
+        "MergeInsertBuilder",
         "RecoveryAudit",
         "SnapshotHandle",
         "StorageAdapter",
@@ -814,9 +992,10 @@ fn is_durable_identifier(identifier: &str) -> bool {
         "TableStore",
     ]
     .contains(&identifier)
-        || DURABLE_PRIMITIVES
-            .iter()
-            .any(|primitive| primitive_terminal_identifier(primitive) == identifier)
+        || DURABLE_PRIMITIVES.iter().any(|primitive| {
+            !primitive.trim_start_matches('.').contains("::")
+                && primitive_terminal_identifier(primitive) == identifier
+        })
 }
 
 fn collect_durable_use_renames(tree: &syn::UseTree, hits: &mut Vec<String>) {
@@ -935,25 +1114,14 @@ impl<'ast> Visit<'ast> for CallInventory {
                 self.record(".append(RecoveryAuditRecord");
             }
         }
-        for (suffix, key) in [
-            (&["GraphCoordinator", "init"][..], "GraphCoordinator::init("),
-            (
-                &["TableStore", "create_empty_dataset"][..],
-                "TableStore::create_empty_dataset(",
-            ),
-            (
-                &["TableStore", "append_or_create_batch"][..],
-                "TableStore::append_or_create_batch(",
-            ),
-            (
-                &["TableStore", "write_dataset"][..],
-                "TableStore::write_dataset(",
-            ),
-            (&["Dataset", "write"][..], "Dataset::write("),
-            (&["SnapshotHandle", "new"][..], "SnapshotHandle::new("),
-        ] {
-            if path_ends_with(&node.func, suffix) {
-                self.record(key);
+        for primitive in DURABLE_PRIMITIVES {
+            let qualified = primitive.trim_start_matches('.').trim_end_matches('(');
+            if !qualified.contains("::") {
+                continue;
+            }
+            let suffix = qualified.split("::").collect::<Vec<_>>();
+            if path_ends_with(&node.func, &suffix) {
+                self.record(*primitive);
             }
         }
         visit::visit_expr_call(self, node);
@@ -982,31 +1150,27 @@ impl<'ast> Visit<'ast> for CallInventory {
         }
         for primitive in DURABLE_PRIMITIVES {
             let key = primitive_inventory_key(primitive);
+            // Common object-store verbs occur in logging strings inside macro
+            // tokens. Their real method calls are exact-counted by the AST
+            // visitor, but treating arbitrary literal text as code would make
+            // ordinary diagnostics fail the guard.
+            if ["put", "put_opts", "rename"].contains(&key.as_str()) {
+                continue;
+            }
             if !key.contains("::") && !key.contains('(') && tokens.contains(&format!("{key} (")) {
                 self.macro_hits
                     .push(format!("{macro_name}! contains `{key}`"));
             }
         }
-        for (marker, key) in [
-            ("GraphCoordinator :: init (", "GraphCoordinator::init("),
-            (
-                "TableStore :: create_empty_dataset (",
-                "TableStore::create_empty_dataset(",
-            ),
-            (
-                "TableStore :: append_or_create_batch (",
-                "TableStore::append_or_create_batch(",
-            ),
-            (
-                "TableStore :: write_dataset (",
-                "TableStore::write_dataset(",
-            ),
-            ("Dataset :: write (", "Dataset::write("),
-            ("SnapshotHandle :: new (", "SnapshotHandle::new("),
-        ] {
-            if tokens.contains(marker) {
+        for primitive in DURABLE_PRIMITIVES {
+            let qualified = primitive.trim_start_matches('.').trim_end_matches('(');
+            if !qualified.contains("::") {
+                continue;
+            }
+            let marker = format!("{} (", qualified.replace("::", " :: "));
+            if tokens.contains(&marker) {
                 self.macro_hits
-                    .push(format!("{macro_name}! contains `{key}`"));
+                    .push(format!("{macro_name}! contains `{primitive}`"));
             }
         }
         if tokens.contains("append (") && tokens.contains("RecoveryAuditRecord") {
@@ -1018,21 +1182,20 @@ impl<'ast> Visit<'ast> for CallInventory {
 }
 
 fn primitive_inventory_key(primitive: &str) -> String {
-    match primitive {
-        "GraphCoordinator::init("
-        | "TableStore::create_empty_dataset("
-        | "TableStore::append_or_create_batch("
-        | "TableStore::write_dataset("
-        | "Dataset::write("
-        | ".raw_dataset_append("
-        | ".append(RecoveryAuditRecord"
-        | "SnapshotHandle::new(" => primitive.to_string(),
-        _ => primitive
-            .trim_start_matches('.')
-            .split('(')
-            .next()
-            .expect("durable primitive identifier")
-            .to_string(),
+    let identifier = primitive
+        .trim_start_matches('.')
+        .split('(')
+        .next()
+        .expect("durable primitive identifier");
+    if identifier.contains("::")
+        || matches!(
+            primitive,
+            ".raw_dataset_append(" | ".append(RecoveryAuditRecord"
+        )
+    {
+        primitive.to_string()
+    } else {
+        identifier.to_string()
     }
 }
 
@@ -1164,6 +1327,72 @@ fn low_level_async_surfaces(src: &Path, owner: &str) -> BTreeSet<(String, String
     surfaces
 }
 
+fn is_gateway_owner(relative: &str, owner: &str) -> bool {
+    GATEWAY_SURFACES
+        .iter()
+        .any(|surface| surface.file == relative && surface.owner == owner)
+}
+
+fn callable_gateway_surfaces(src: &Path) -> BTreeSet<(String, String, String)> {
+    let mut surfaces = BTreeSet::new();
+    for file in walk_rust_files(src) {
+        let relative = relative_to_src(src, &file);
+        let contents = std::fs::read_to_string(&file)
+            .unwrap_or_else(|error| panic!("failed to read {}: {error}", file.display()));
+        let ast = parse_rust_source(&contents, &relative);
+        for item in &ast.items {
+            match item {
+                Item::Trait(definition)
+                    if !cfg_requires_test(&definition.attrs)
+                        && is_gateway_owner(&relative, &definition.ident.to_string()) =>
+                {
+                    for item in &definition.items {
+                        let syn::TraitItem::Fn(function) = item else {
+                            continue;
+                        };
+                        if cfg_requires_test(&function.attrs) {
+                            continue;
+                        }
+                        surfaces.insert((
+                            relative.clone(),
+                            definition.ident.to_string(),
+                            function.sig.ident.to_string(),
+                        ));
+                    }
+                }
+                Item::Impl(implementation)
+                    if !cfg_requires_test(&implementation.attrs)
+                        && implementation.trait_.is_none() =>
+                {
+                    let Some(owner) = type_final_ident(&implementation.self_ty) else {
+                        continue;
+                    };
+                    if !is_gateway_owner(&relative, &owner.to_string()) {
+                        continue;
+                    }
+                    for item in &implementation.items {
+                        let syn::ImplItem::Fn(function) = item else {
+                            continue;
+                        };
+                        if cfg_requires_test(&function.attrs)
+                            || matches!(function.vis, Visibility::Inherited)
+                        {
+                            continue;
+                        }
+                        surfaces.insert((
+                            relative.clone(),
+                            owner.to_string(),
+                            function.sig.ident.to_string(),
+                        ));
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+    surfaces
+}
+
 #[test]
 fn graph_write_surfaces_are_registered() {
     let src = engine_src_root();
@@ -1263,6 +1492,44 @@ fn low_level_coordinator_surfaces_are_registered() {
         missing.is_empty() && unregistered.is_empty(),
         "low-level coordinator API registry drifted. Missing definitions: {missing:?}. \
          Unclassified crate-visible async functions: {unregistered:?}"
+    );
+}
+
+#[test]
+fn callable_storage_and_manifest_gateway_surfaces_are_registered() {
+    let src = engine_src_root();
+    let mut registered = BTreeMap::new();
+    for surface in GATEWAY_SURFACES {
+        let key = (
+            surface.file.to_string(),
+            surface.owner.to_string(),
+            surface.function.to_string(),
+        );
+        assert!(
+            registered
+                .insert(key.clone(), surface.disposition)
+                .is_none(),
+            "duplicate callable gateway registration: {}::{} ({})",
+            key.1,
+            key.2,
+            surface.disposition.label()
+        );
+    }
+
+    let discovered = callable_gateway_surfaces(&src);
+    let classified = registered.keys().cloned().collect::<BTreeSet<_>>();
+    let missing = classified
+        .difference(&discovered)
+        .cloned()
+        .collect::<Vec<_>>();
+    let unregistered = discovered
+        .difference(&classified)
+        .cloned()
+        .collect::<Vec<_>>();
+    assert!(
+        missing.is_empty() && unregistered.is_empty(),
+        "callable storage/manifest gateway registry drifted. Missing definitions: {missing:?}. \
+         Unclassified callable methods: {unregistered:?}"
     );
 }
 
@@ -1392,9 +1659,14 @@ fn structural_call_scanner_closes_raw_dataset_and_ufcs_routes() {
             <Dataset>::merge_insert(ds, params);
             ds.add_columns(transforms, None);
             Dataset::write(reader, uri, params);
+            CommitBuilder::new(ds);
+            MergeInsertBuilder::try_new(ds, keys);
             TableStore::write_dataset(uri, batch);
             storage.delete(uri);
             StorageAdapter::write_text(storage, uri, contents);
+            object_store.put(location, payload);
+            object_store.put_opts(location, payload, options);
+            object_store.rename(from, to);
             audit.append(RecoveryAuditRecord {});
         }
         "#,
@@ -1405,9 +1677,17 @@ fn structural_call_scanner_closes_raw_dataset_and_ufcs_routes() {
     assert_eq!(inventory.counts.get("merge_insert"), Some(&1));
     assert_eq!(inventory.counts.get("add_columns"), Some(&1));
     assert_eq!(inventory.counts.get("Dataset::write("), Some(&1));
+    assert_eq!(inventory.counts.get("CommitBuilder::new("), Some(&1));
+    assert_eq!(
+        inventory.counts.get("MergeInsertBuilder::try_new("),
+        Some(&1)
+    );
     assert_eq!(inventory.counts.get("TableStore::write_dataset("), Some(&1));
     assert_eq!(inventory.counts.get("delete"), Some(&1));
     assert_eq!(inventory.counts.get("write_text"), Some(&1));
+    assert_eq!(inventory.counts.get("put"), Some(&1));
+    assert_eq!(inventory.counts.get("put_opts"), Some(&1));
+    assert_eq!(inventory.counts.get("rename"), Some(&1));
     assert_eq!(
         inventory.counts.get(".append(RecoveryAuditRecord"),
         Some(&1)
@@ -1484,9 +1764,21 @@ fn lexical_allow_list_matches_only_exact_source_paths() {
 }
 
 #[test]
-fn protocol_scan_exclusions_match_only_exact_gateway_files() {
+fn protocol_scan_exclusions_match_only_exact_test_files() {
     let src = Path::new("/engine/src");
     assert!(is_protocol_scan_excluded(
+        src,
+        Path::new("/engine/src/table_store/staged_tests.rs")
+    ));
+    assert!(is_protocol_scan_excluded(
+        src,
+        Path::new("/engine/src/db/manifest/namespace.rs")
+    ));
+    assert!(is_protocol_scan_excluded(
+        src,
+        Path::new("/engine/src/db/manifest/tests.rs")
+    ));
+    assert!(!is_protocol_scan_excluded(
         src,
         Path::new("/engine/src/db/manifest/publisher.rs")
     ));
