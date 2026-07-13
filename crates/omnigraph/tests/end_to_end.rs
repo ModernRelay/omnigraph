@@ -1151,6 +1151,7 @@ async fn blob_read_after_mutation_insert() {
     let dir = tempfile::tempdir().unwrap();
     let uri = dir.path().to_str().unwrap();
     let mut db = Omnigraph::init(uri, BLOB_SCHEMA).await.unwrap();
+    let stale_reader = Omnigraph::open(uri).await.unwrap();
 
     // Insert via mutation (base64 for bytes [1, 2, 3])
     mutate_main(
@@ -1162,7 +1163,10 @@ async fn blob_read_after_mutation_insert() {
     .await
     .unwrap();
 
-    let blob = db
+    // The reader was opened before the other handle's commit. `read_blob`
+    // must freshness-probe its current branch instead of using its held
+    // coordinator snapshot.
+    let blob = stale_reader
         .read_blob("Document", "inserted", "content")
         .await
         .unwrap();

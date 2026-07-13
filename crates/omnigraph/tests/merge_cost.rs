@@ -94,13 +94,13 @@ fn merge_validation_is_delta_scoped() {
         );
         eprintln!(
             "MERGE    1-Person-row delta   : data_open_count={} data_reads={} manifest_reads={} \
-             [stage_append={} stage_merge_insert={} create_vector_index={}]",
+             [stage_append={} stage_merge_insert={} stage_vector_index={}]",
             io.data_open_count,
             io.data_reads,
             io.manifest_reads,
             staged.stage_append,
             staged.stage_merge_insert,
-            staged.create_vector_index,
+            staged.stage_vector_index,
         );
 
         // The proof: only Person changed, so the merge opens only Person-related

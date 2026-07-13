@@ -3,7 +3,6 @@ mod helpers;
 use std::env;
 
 use arrow_array::{Array, StringArray};
-use lance::index::DatasetIndexExt;
 use lance_index::is_system_index;
 use serial_test::serial;
 
@@ -859,6 +858,10 @@ async fn match_text_matches_exact_set_excludes_unrelated() {
 
 // RRF fuses arms OTHER than the default nearest+bm25: two FTS arms (title+body).
 // Proves primary_var resolves when neither arm is `nearest`, and fusion runs.
+// Lance beta.19 #7621 completed the ICU English stop-word list, changing BM25
+// document-length normalization in the body arm. Under the beta.21 pin the
+// title arm ranks rl/ml/dl, the body arm ranks dl/rl/ml, and RRF therefore
+// deterministically ranks rl/dl/ml.
 #[tokio::test]
 #[serial]
 async fn rrf_fuses_two_fts_fields() {
@@ -867,7 +870,7 @@ async fn rrf_fuses_two_fts_fields() {
     let r = query_main(&mut db, SEARCH_QUERIES, "rrf_two_fts", &params(&[("$q", "learning")]))
         .await
         .unwrap();
-    assert_eq!(result_slugs(&r), vec!["dl-basics", "ml-intro", "rl-intro"]);
+    assert_eq!(result_slugs(&r), vec!["rl-intro", "dl-basics", "ml-intro"]);
 }
 
 // RRF fuses two vector arms (no embedding creds — explicit vectors). A doc near

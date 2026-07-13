@@ -67,13 +67,13 @@ pub(crate) struct WriteQueueManager {
     /// Held only briefly per `acquire` call: clone out the per-key Arc,
     /// release the std mutex, then await the per-key tokio Mutex.
     queues: Mutex<HashMap<TableQueueKey, Arc<AsyncMutex<()>>>>,
-    /// Coarse per-branch effect gate used by RFC-022-enrolled writers.
+    /// Coarse per-branch effect gate used by sidecar-backed RFC-022 writers.
     ///
     /// This is deliberately separate from `queues`: a branch is authority,
-    /// not a synthetic table key. Enrolled writers acquire this gate before
-    /// any table queue and hold it through manifest publication. Legacy
-    /// writers continue to use only the table queues until their adapters are
-    /// migrated.
+    /// not a synthetic table key. Registered graph-visible effect writers
+    /// acquire this gate before any table queue and hold it through manifest
+    /// publication; explicit authority/physical exceptions follow their own
+    /// registered ordering contracts.
     branch_queues: Mutex<HashMap<Option<String>, Arc<AsyncMutex<()>>>>,
 }
 

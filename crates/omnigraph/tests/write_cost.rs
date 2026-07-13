@@ -79,6 +79,88 @@ async fn internal_table_scans_are_flat_in_history() {
     .await;
 }
 
+/// EnsureIndices is a graph-visible writer too: after data/internal compaction,
+/// its manifest work must be bounded by the affected table set rather than by
+/// commit-history depth. The physical index scan itself is intentionally not a
+/// cost assertion here; compaction merely keeps the fixture shape comparable.
+#[tokio::test]
+async fn ensure_indices_manifest_reads_are_flat_in_history() {
+    cost_harness(async {
+        let mut curve: Vec<(u64, IoCounts)> = Vec::new();
+        for depth in [10u64, 100] {
+            let dir = tempfile::tempdir().unwrap();
+            let mut db = local_graph(&dir).await;
+            commit_many(&mut db, depth as usize).await;
+            db.optimize().await.unwrap();
+
+            let indexed_schema = helpers::TEST_SCHEMA.replace("age: I32?", "age: I32? @index");
+            db.apply_schema(&indexed_schema).await.unwrap();
+            let (result, io) = measure(db.ensure_indices()).await;
+            result.unwrap();
+            eprintln!(
+                "ensure_indices depth~{depth}: __manifest={} data={}",
+                io.manifest_reads, io.data_reads
+            );
+            curve.push((depth, io));
+        }
+
+        assert_flat(
+            &curve,
+            |counts| counts.manifest_reads,
+            6,
+            "ensure_indices __manifest reads",
+        );
+    })
+    .await;
+}
+
+/// Optimize is now one graph-wide writer rather than one writer per productive
+/// table. Its planning and monotonic batch publication must stay bounded by the
+/// current table set, not by graph commit-history depth. Each depth fixture is
+/// normalized first, then receives the same three-commit productive tail so the
+/// measured physical work is comparable.
+#[tokio::test]
+async fn optimize_manifest_reads_are_flat_in_history() {
+    cost_harness(async {
+        let mut curve: Vec<(u64, IoCounts)> = Vec::new();
+        for depth in [10u64, 100] {
+            let dir = tempfile::tempdir().unwrap();
+            let mut db = local_graph(&dir).await;
+            commit_many(&mut db, depth as usize).await;
+            db.optimize().await.unwrap();
+            commit_many(&mut db, 3).await;
+
+            let commits_before = db.list_commits(None).await.unwrap().len();
+            let (result, io) = measure(db.optimize()).await;
+            result.unwrap();
+            assert_eq!(
+                db.list_commits(None).await.unwrap().len(),
+                commits_before + 1,
+                "productive graph-wide Optimize must publish exactly one lineage commit"
+            );
+            eprintln!(
+                "optimize depth~{depth}: __manifest={} data={} opens={}",
+                io.manifest_reads, io.data_reads, io.data_open_count
+            );
+            curve.push((depth, io));
+        }
+
+        assert_flat(
+            &curve,
+            |counts| counts.manifest_reads,
+            8,
+            "graph-wide Optimize __manifest reads",
+        );
+        assert_flat(
+            &curve,
+            |counts| counts.data_open_count,
+            2,
+            "graph-wide Optimize data-table opens",
+        );
+    })
+    .await;
+}
+
 /// **Served-regime twin of `internal_table_scans_are_flat_in_history` — the gate
 /// that was missing.** The flat gate above calls `db.optimize()` before EVERY
 /// measured write, so it only ever proves the *compacted* invariant and stays green
@@ -251,7 +333,7 @@ async fn write_op_count_ceiling_at_shallow_depth() {
 // ── (C) Fitness assert via the staged-write probes ──
 
 /// A keyed `Person` insert routes through `stage_merge_insert` exactly once, does
-/// no `stage_append`, and no inline vector-index build. Pins the structural shape.
+/// no `stage_append`, and no vector-index artifact build. Pins the structural shape.
 #[tokio::test]
 async fn keyed_insert_routes_through_merge_insert_only() {
     let dir = tempfile::tempdir().unwrap();
@@ -266,7 +348,10 @@ async fn keyed_insert_routes_through_merge_insert_only() {
     res.unwrap();
     assert_eq!(staged.stage_merge_insert, 1, "keyed Person insert stages one merge-insert");
     assert_eq!(staged.stage_append, 0, "keyed insert must not stage_append");
-    assert_eq!(staged.create_vector_index, 0, "no inline vector-index build on a plain insert");
+    assert_eq!(
+        staged.stage_vector_index, 0,
+        "no vector-index artifact build on a plain insert"
+    );
 }
 
 // ── (D) Step-3b capture-once fitness asserts (RED today → GREEN after WriteTxn) ──

@@ -1233,8 +1233,9 @@ performed anyway).
   `iss-overwrite-orphans-committed-edges` (the *sequential* face; fix =
   **inbound-RI validation on node removal**, ships independently, no contention row).
   *(`iss-984` — remote branch-merge idempotency — is unrelated; not a write-skew.)*
-- Blockers: `blk-lance-6658` (shipped 7.0.0), `blk-lance-6666` (open, vector
-  index two-phase), `blk-lance-blob-compaction`.
+- Blockers: `blk-lance-6658` (shipped 7.0.0), `blk-lance-6666` (still relevant
+  to generic multi-segment exact publication, but no longer a blocker for the
+  engine's full-table vector shape), `blk-lance-blob-compaction`.
 - Epics: `epc-bulk-data-plane`, `epc-lance-v7-migration`, `epc-783` (reliability
   harness), `epc-929` (Quint verification).
 
@@ -1387,7 +1388,8 @@ new item (Q6), surfaced by peer review, remains genuinely open.
    two-phase via MR-A / `iss-950` (now unblocked — `blk-lance-6658` shipped); **D2
    retires then** (`enforce_no_mixed_destructive_constructive`,
    `exec/mutation.rs:640-673`). `TableAction::CreateVectorIndex` stays inline until
-   `blk-lance-6666` ships (`iss-848` reconciler path).
+   `iss-848` migrates beta.21's staged full-table shape; `blk-lance-6666` remains
+   relevant only to generic multi-segment exact publication.
 
 **Resolved post-review:**
 

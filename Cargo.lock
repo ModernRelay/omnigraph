@@ -1180,6 +1180,20 @@ name = "bytemuck"
 version = "1.25.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "c8efb64bd706a16a1bdde310ae86b351e4d21550d98d056f22f8a7f7a2183fec"
+dependencies = [
+ "bytemuck_derive",
+]
+
+[[package]]
+name = "bytemuck_derive"
+version = "1.11.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "f65693059b6b9c588b9f62fed1cedbf0a8b805631457ea162d68f0de186f3de5"
+dependencies = [
+ "proc-macro2",
+ "quote",
+ "syn",
+]
 
 [[package]]
 name = "byteorder"
@@ -2772,8 +2786,8 @@ checksum = "42703706b716c37f96a77aea830392ad231f44c9e9a67872fa5548707e11b11c"
 
 [[package]]
 name = "fsst"
-version = "9.0.0-beta.15"
-source = "git+https://github.com/lance-format/lance?rev=f24e42c11a742581365e1cbe17c906ea2dac1bc6#f24e42c11a742581365e1cbe17c906ea2dac1bc6"
+version = "9.0.0-beta.21"
+source = "git+https://github.com/lance-format/lance?rev=1aec14652dcbace23ac277fa8ced35000bea0c40#1aec14652dcbace23ac277fa8ced35000bea0c40"
 dependencies = [
  "arrow-array",
  "rand 0.9.4",
@@ -3043,6 +3057,7 @@ version = "2.7.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "6ea2d84b969582b4b1864a92dc5d27cd2b77b622a8d79306834f1be5ba20d84b"
 dependencies = [
+ "bytemuck",
  "cfg-if 1.0.4",
  "crunchy",
  "num-traits",
@@ -3794,8 +3809,8 @@ dependencies = [
 
 [[package]]
 name = "lance"
-version = "9.0.0-beta.15"
-source = "git+https://github.com/lance-format/lance?rev=f24e42c11a742581365e1cbe17c906ea2dac1bc6#f24e42c11a742581365e1cbe17c906ea2dac1bc6"
+version = "9.0.0-beta.21"
+source = "git+https://github.com/lance-format/lance?rev=1aec14652dcbace23ac277fa8ced35000bea0c40#1aec14652dcbace23ac277fa8ced35000bea0c40"
 dependencies = [
  "arc-swap",
  "arrow",
@@ -3868,8 +3883,8 @@ dependencies = [
 
 [[package]]
 name = "lance-arrow"
-version = "9.0.0-beta.15"
-source = "git+https://github.com/lance-format/lance?rev=f24e42c11a742581365e1cbe17c906ea2dac1bc6#f24e42c11a742581365e1cbe17c906ea2dac1bc6"
+version = "9.0.0-beta.21"
+source = "git+https://github.com/lance-format/lance?rev=1aec14652dcbace23ac277fa8ced35000bea0c40#1aec14652dcbace23ac277fa8ced35000bea0c40"
 dependencies = [
  "arrow-array",
  "arrow-buffer",
@@ -3878,6 +3893,7 @@ dependencies = [
  "arrow-ord",
  "arrow-schema",
  "arrow-select",
+ "bytemuck",
  "bytes",
  "futures",
  "getrandom 0.2.17",
@@ -3890,7 +3906,7 @@ dependencies = [
 [[package]]
 name = "lance-arrow-scalar"
 version = "58.0.0"
-source = "git+https://github.com/lance-format/lance?rev=f24e42c11a742581365e1cbe17c906ea2dac1bc6#f24e42c11a742581365e1cbe17c906ea2dac1bc6"
+source = "git+https://github.com/lance-format/lance?rev=1aec14652dcbace23ac277fa8ced35000bea0c40#1aec14652dcbace23ac277fa8ced35000bea0c40"
 dependencies = [
  "arrow-array",
  "arrow-buffer",
@@ -3904,7 +3920,7 @@ dependencies = [
 [[package]]
 name = "lance-arrow-stats"
 version = "58.0.0"
-source = "git+https://github.com/lance-format/lance?rev=f24e42c11a742581365e1cbe17c906ea2dac1bc6#f24e42c11a742581365e1cbe17c906ea2dac1bc6"
+source = "git+https://github.com/lance-format/lance?rev=1aec14652dcbace23ac277fa8ced35000bea0c40#1aec14652dcbace23ac277fa8ced35000bea0c40"
 dependencies = [
  "arrow-array",
  "arrow-schema",
@@ -3913,8 +3929,8 @@ dependencies = [
 
 [[package]]
 name = "lance-bitpacking"
-version = "9.0.0-beta.15"
-source = "git+https://github.com/lance-format/lance?rev=f24e42c11a742581365e1cbe17c906ea2dac1bc6#f24e42c11a742581365e1cbe17c906ea2dac1bc6"
+version = "9.0.0-beta.21"
+source = "git+https://github.com/lance-format/lance?rev=1aec14652dcbace23ac277fa8ced35000bea0c40#1aec14652dcbace23ac277fa8ced35000bea0c40"
 dependencies = [
  "arrayref",
  "crunchy",
@@ -3924,8 +3940,8 @@ dependencies = [
 
 [[package]]
 name = "lance-core"
-version = "9.0.0-beta.15"
-source = "git+https://github.com/lance-format/lance?rev=f24e42c11a742581365e1cbe17c906ea2dac1bc6#f24e42c11a742581365e1cbe17c906ea2dac1bc6"
+version = "9.0.0-beta.21"
+source = "git+https://github.com/lance-format/lance?rev=1aec14652dcbace23ac277fa8ced35000bea0c40#1aec14652dcbace23ac277fa8ced35000bea0c40"
 dependencies = [
  "arrow-array",
  "arrow-buffer",
@@ -3963,8 +3979,8 @@ dependencies = [
 
 [[package]]
 name = "lance-datafusion"
-version = "9.0.0-beta.15"
-source = "git+https://github.com/lance-format/lance?rev=f24e42c11a742581365e1cbe17c906ea2dac1bc6#f24e42c11a742581365e1cbe17c906ea2dac1bc6"
+version = "9.0.0-beta.21"
+source = "git+https://github.com/lance-format/lance?rev=1aec14652dcbace23ac277fa8ced35000bea0c40#1aec14652dcbace23ac277fa8ced35000bea0c40"
 dependencies = [
  "arrow",
  "arrow-array",
@@ -3994,8 +4010,8 @@ dependencies = [
 
 [[package]]
 name = "lance-datagen"
-version = "9.0.0-beta.15"
-source = "git+https://github.com/lance-format/lance?rev=f24e42c11a742581365e1cbe17c906ea2dac1bc6#f24e42c11a742581365e1cbe17c906ea2dac1bc6"
+version = "9.0.0-beta.21"
+source = "git+https://github.com/lance-format/lance?rev=1aec14652dcbace23ac277fa8ced35000bea0c40#1aec14652dcbace23ac277fa8ced35000bea0c40"
 dependencies = [
  "arrow",
  "arrow-array",
@@ -4012,8 +4028,8 @@ dependencies = [
 
 [[package]]
 name = "lance-derive"
-version = "9.0.0-beta.15"
-source = "git+https://github.com/lance-format/lance?rev=f24e42c11a742581365e1cbe17c906ea2dac1bc6#f24e42c11a742581365e1cbe17c906ea2dac1bc6"
+version = "9.0.0-beta.21"
+source = "git+https://github.com/lance-format/lance?rev=1aec14652dcbace23ac277fa8ced35000bea0c40#1aec14652dcbace23ac277fa8ced35000bea0c40"
 dependencies = [
  "proc-macro2",
  "quote",
@@ -4022,8 +4038,8 @@ dependencies = [
 
 [[package]]
 name = "lance-encoding"
-version = "9.0.0-beta.15"
-source = "git+https://github.com/lance-format/lance?rev=f24e42c11a742581365e1cbe17c906ea2dac1bc6#f24e42c11a742581365e1cbe17c906ea2dac1bc6"
+version = "9.0.0-beta.21"
+source = "git+https://github.com/lance-format/lance?rev=1aec14652dcbace23ac277fa8ced35000bea0c40#1aec14652dcbace23ac277fa8ced35000bea0c40"
 dependencies = [
  "arrow-arith",
  "arrow-array",
@@ -4058,8 +4074,8 @@ dependencies = [
 
 [[package]]
 name = "lance-file"
-version = "9.0.0-beta.15"
-source = "git+https://github.com/lance-format/lance?rev=f24e42c11a742581365e1cbe17c906ea2dac1bc6#f24e42c11a742581365e1cbe17c906ea2dac1bc6"
+version = "9.0.0-beta.21"
+source = "git+https://github.com/lance-format/lance?rev=1aec14652dcbace23ac277fa8ced35000bea0c40#1aec14652dcbace23ac277fa8ced35000bea0c40"
 dependencies = [
  "arrow-arith",
  "arrow-array",
@@ -4089,8 +4105,8 @@ dependencies = [
 
 [[package]]
 name = "lance-index"
-version = "9.0.0-beta.15"
-source = "git+https://github.com/lance-format/lance?rev=f24e42c11a742581365e1cbe17c906ea2dac1bc6#f24e42c11a742581365e1cbe17c906ea2dac1bc6"
+version = "9.0.0-beta.21"
+source = "git+https://github.com/lance-format/lance?rev=1aec14652dcbace23ac277fa8ced35000bea0c40#1aec14652dcbace23ac277fa8ced35000bea0c40"
 dependencies = [
  "arc-swap",
  "arrow",
@@ -4154,8 +4170,8 @@ dependencies = [
 
 [[package]]
 name = "lance-io"
-version = "9.0.0-beta.15"
-source = "git+https://github.com/lance-format/lance?rev=f24e42c11a742581365e1cbe17c906ea2dac1bc6#f24e42c11a742581365e1cbe17c906ea2dac1bc6"
+version = "9.0.0-beta.21"
+source = "git+https://github.com/lance-format/lance?rev=1aec14652dcbace23ac277fa8ced35000bea0c40#1aec14652dcbace23ac277fa8ced35000bea0c40"
 dependencies = [
  "arrow",
  "arrow-arith",
@@ -4196,8 +4212,8 @@ dependencies = [
 
 [[package]]
 name = "lance-linalg"
-version = "9.0.0-beta.15"
-source = "git+https://github.com/lance-format/lance?rev=f24e42c11a742581365e1cbe17c906ea2dac1bc6#f24e42c11a742581365e1cbe17c906ea2dac1bc6"
+version = "9.0.0-beta.21"
+source = "git+https://github.com/lance-format/lance?rev=1aec14652dcbace23ac277fa8ced35000bea0c40#1aec14652dcbace23ac277fa8ced35000bea0c40"
 dependencies = [
  "arrow-array",
  "arrow-buffer",
@@ -4213,8 +4229,8 @@ dependencies = [
 
 [[package]]
 name = "lance-namespace"
-version = "9.0.0-beta.15"
-source = "git+https://github.com/lance-format/lance?rev=f24e42c11a742581365e1cbe17c906ea2dac1bc6#f24e42c11a742581365e1cbe17c906ea2dac1bc6"
+version = "9.0.0-beta.21"
+source = "git+https://github.com/lance-format/lance?rev=1aec14652dcbace23ac277fa8ced35000bea0c40#1aec14652dcbace23ac277fa8ced35000bea0c40"
 dependencies = [
  "arrow",
  "async-trait",
@@ -4226,8 +4242,8 @@ dependencies = [
 
 [[package]]
 name = "lance-namespace-impls"
-version = "9.0.0-beta.15"
-source = "git+https://github.com/lance-format/lance?rev=f24e42c11a742581365e1cbe17c906ea2dac1bc6#f24e42c11a742581365e1cbe17c906ea2dac1bc6"
+version = "9.0.0-beta.21"
+source = "git+https://github.com/lance-format/lance?rev=1aec14652dcbace23ac277fa8ced35000bea0c40#1aec14652dcbace23ac277fa8ced35000bea0c40"
 dependencies = [
  "arrow",
  "arrow-ipc",
@@ -4271,8 +4287,8 @@ dependencies = [
 
 [[package]]
 name = "lance-select"
-version = "9.0.0-beta.15"
-source = "git+https://github.com/lance-format/lance?rev=f24e42c11a742581365e1cbe17c906ea2dac1bc6#f24e42c11a742581365e1cbe17c906ea2dac1bc6"
+version = "9.0.0-beta.21"
+source = "git+https://github.com/lance-format/lance?rev=1aec14652dcbace23ac277fa8ced35000bea0c40#1aec14652dcbace23ac277fa8ced35000bea0c40"
 dependencies = [
  "arrow-array",
  "arrow-buffer",
@@ -4287,8 +4303,8 @@ dependencies = [
 
 [[package]]
 name = "lance-table"
-version = "9.0.0-beta.15"
-source = "git+https://github.com/lance-format/lance?rev=f24e42c11a742581365e1cbe17c906ea2dac1bc6#f24e42c11a742581365e1cbe17c906ea2dac1bc6"
+version = "9.0.0-beta.21"
+source = "git+https://github.com/lance-format/lance?rev=1aec14652dcbace23ac277fa8ced35000bea0c40#1aec14652dcbace23ac277fa8ced35000bea0c40"
 dependencies = [
  "arrow",
  "arrow-array",
@@ -4325,8 +4341,8 @@ dependencies = [
 
 [[package]]
 name = "lance-tokenizer"
-version = "9.0.0-beta.15"
-source = "git+https://github.com/lance-format/lance?rev=f24e42c11a742581365e1cbe17c906ea2dac1bc6#f24e42c11a742581365e1cbe17c906ea2dac1bc6"
+version = "9.0.0-beta.21"
+source = "git+https://github.com/lance-format/lance?rev=1aec14652dcbace23ac277fa8ced35000bea0c40#1aec14652dcbace23ac277fa8ced35000bea0c40"
 dependencies = [
  "icu_segmenter",
  "rust-stemmers",
@@ -5071,6 +5087,7 @@ dependencies = [
  "serde_json",
  "serial_test",
  "sha2 0.10.9",
+ "syn",
  "tempfile",
  "thiserror",
  "time",

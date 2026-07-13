@@ -330,6 +330,7 @@ async fn test_directory_namespace_direct_publish_cannot_replace_native_omnigraph
         table_version_metadata_for_state(uri, &person_entry.table_path, None, person_version)
             .await
             .unwrap();
+    let graph_manifest_version = mc.version();
 
     let namespace = DirectoryNamespaceBuilder::new(uri)
         .manifest_enabled(true)
@@ -340,86 +341,66 @@ async fn test_directory_namespace_direct_publish_cannot_replace_native_omnigraph
         .await
         .unwrap();
 
-    // Lance 9.0.0-beta.15 realignment: `table_version_storage_enabled` was
-    // removed upstream (the `__manifest` version-storage experiment was
-    // retired, PR #7222) and dir.rs no longer eagerly rewrites PK annotations —
-    // yet the guard's thesis holds unchanged: with dir-listing disabled the
-    // native namespace still reports omnigraph's manifest-tracked tables as
-    // TableNotFound and cannot publish over the manifest. The v7 mechanism
-    // notes below are retained as history.
-    //
-    // Lance 7: the native `DirectoryNamespace` no longer recognizes omnigraph's
-    // manifest-tracked tables, so list / describe / create_table_version all
-    // return `TableNotFound`. The mechanism is *contingent on omnigraph's legacy
-    // boolean PK key*, not an unconditional v7 property: v7's namespace eagerly
-    // rewrites any `__manifest` whose `object_id` lacks the new
-    // `lance-schema:unenforced-primary-key:position` key, omnigraph declares the
-    // PK with the legacy boolean key, and v7 forbids changing a PK once set — so
-    // `ensure_manifest_table_up_to_date` errors, the namespace silently falls
-    // back to directory listing (disabled here), and `check_table_status` reports
-    // the table absent. omnigraph keeps the boolean key deliberately: Lance
-    // honors it permanently (it maps to PK position 0) and one uniform on-disk
-    // format beats a new-vs-old split, since existing graphs can't be re-keyed to
-    // the position key under that same immutability rule. The decoupling is
-    // therefore an accepted, production-irrelevant tradeoff (omnigraph never uses
-    // the native namespace — its publisher writes `__manifest` via merge_insert
-    // and its reads go through its own `LanceNamespace` impls), and it only
-    // strengthens this guard's thesis: native tooling cannot enumerate, inspect,
-    // or publish over omnigraph's tables, let alone replace the write path.
-    let assert_table_not_found = |what: &str, dbg: String| {
-        assert!(
-            dbg.contains("TableNotFound") && dbg.contains("node:Person"),
-            "{what}: expected TableNotFound for node:Person, got: {dbg}"
-        );
-    };
-    assert_table_not_found(
-        "list_table_versions",
-        format!(
-            "{:?}",
-            namespace
-                .list_table_versions(ListTableVersionsRequest {
-                    id: Some(vec!["node:Person".to_string()]),
-                    descending: Some(true),
-                    ..Default::default()
-                })
-                .await
-                .unwrap_err()
-        ),
+    // Lance 9.0.0-beta.19 #7687 split DirectoryNamespace initialization into
+    // a read-only open and a deferred write-time migration. Native tooling can
+    // therefore resolve omnigraph's manifest rows without trying to rewrite the
+    // legacy boolean PK annotation first. Its version APIs expose the physical
+    // Lance history (including the unpublished append above), not omnigraph's
+    // authoritative graph snapshot. That distinction is the guard's thesis:
+    // per-table visibility/publication cannot replace the graph-wide manifest
+    // publisher.
+    let versions = namespace
+        .list_table_versions(ListTableVersionsRequest {
+            id: Some(vec!["node:Person".to_string()]),
+            descending: Some(true),
+            ..Default::default()
+        })
+        .await
+        .unwrap();
+    assert_eq!(
+        versions
+            .versions
+            .iter()
+            .map(|version| version.version as u64)
+            .collect::<Vec<_>>(),
+        vec![person_version, person_entry.table_version]
     );
-    assert_table_not_found(
-        "describe_table_version",
-        format!(
-            "{:?}",
-            namespace
-                .describe_table_version(DescribeTableVersionRequest {
-                    id: Some(vec!["node:Person".to_string()]),
-                    version: Some(person_version as i64),
-                    ..Default::default()
-                })
-                .await
-                .unwrap_err()
-        ),
-    );
-    assert_table_not_found(
-        "create_table_version",
-        format!(
-            "{:?}",
-            namespace
-                .create_table_version(version_metadata.to_create_table_version_request(
-                    "node:Person",
-                    person_version,
-                    1,
-                    None,
-                ))
-                .await
-                .unwrap_err()
-        ),
+
+    let described = namespace
+        .describe_table_version(DescribeTableVersionRequest {
+            id: Some(vec!["node:Person".to_string()]),
+            version: Some(person_version as i64),
+            ..Default::default()
+        })
+        .await
+        .unwrap();
+    assert_eq!(described.version.version as u64, person_version);
+
+    // The append already installed this per-table version, so trying to publish
+    // the same manifest through DirectoryNamespace conflicts at the physical
+    // version path. Even a successful native per-table publish would not update
+    // omnigraph's graph-wide table pointer below.
+    let create_err = namespace
+        .create_table_version(version_metadata.to_create_table_version_request(
+            "node:Person",
+            person_version,
+            1,
+            None,
+        ))
+        .await
+        .unwrap_err();
+    let create_dbg = format!("{create_err:?}");
+    assert!(
+        create_dbg.contains("ConcurrentModification")
+            && create_dbg.contains(&person_version.to_string()),
+        "expected an existing-version conflict, got: {create_dbg}"
     );
 
     // omnigraph's manifest stays authoritative: refresh ignores the direct
     // `person_ds.append` above (it was never manifest-published), so the row
     // count stays 0 and the version is unchanged.
     mc.refresh().await.unwrap();
+    assert_eq!(mc.version(), graph_manifest_version);
     assert_eq!(
         mc.snapshot().entry("node:Person").unwrap().table_version,
         person_entry.table_version

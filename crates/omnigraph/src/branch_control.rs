@@ -30,10 +30,12 @@ fn lance_error(error: lance::Error) -> OmniError {
     OmniError::Lance(error.to_string())
 }
 
-/// Lance's local backend reports `NotFound` when the target tree is already
-/// absent, while object stores commonly treat the empty-prefix delete as a
-/// success. Normalize both to the idempotent contract every OmniGraph branch
-/// reconciler needs.
+/// Lance beta.21 treats an already-absent target tree as success. OmniGraph
+/// still normalizes `RefNotFound` / `NotFound` around the whole call because
+/// Lance's branch-contents existence check and delete are separate operations,
+/// so a concurrent cleanup can win between them. The live path-descendant
+/// precheck remains ours because Lance deliberately retains an ancestor tree
+/// while a child branch shares that physical path.
 pub(crate) async fn force_delete_branch_idempotent(
     dataset: &mut Dataset,
     branch: &str,

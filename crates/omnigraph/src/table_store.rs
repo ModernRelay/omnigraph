@@ -29,7 +29,7 @@ use std::sync::Arc;
 use crate::db::manifest::TableVersionMetadata;
 use crate::db::{Snapshot, SubTableEntry};
 use crate::error::{OmniError, Result};
-use crate::storage_layer::ForkOutcome;
+use crate::storage_layer::{ForkOutcome, IndexBuildSpec};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TableState {
@@ -245,7 +245,7 @@ impl TableStore {
         snapshot: &Snapshot,
         table_key: &str,
     ) -> Result<Dataset> {
-        snapshot.open(table_key).await
+        snapshot.open_dataset(table_key).await
     }
 
     pub async fn open_at_entry(&self, entry: &SubTableEntry) -> Result<Dataset> {
@@ -298,11 +298,11 @@ impl TableStore {
 
     /// Idempotently drop `branch` from the dataset at `dataset_uri`.
     ///
-    /// This tolerates an already-absent branch — both a missing contents ref (Lance's
-    /// `force_delete_branch` handles that) and a missing `tree/{branch}/`
-    /// directory (the local-store `NotFound` quirk pinned by
-    /// `lance_surface_guards::force_delete_branch_semantics`). Safe to call on a
-    /// possibly-orphaned or already-reclaimed fork.
+    /// This tolerates an already-absent branch — beta.21's native
+    /// `force_delete_branch` treats both a missing contents ref and a missing
+    /// `tree/{branch}/` directory as success, while OmniGraph also normalizes a
+    /// raced `RefNotFound` / `NotFound` around the non-atomic contents delete.
+    /// Safe to call on a possibly-orphaned or already-reclaimed fork.
     ///
     /// A branch that still has referencing descendants (`RefConflict`) or a
     /// live physical path-child is NOT tolerated: those are real ordering
@@ -1341,6 +1341,56 @@ impl TableStore {
         Ok((dataset, committed_identity))
     }
 
+    /// Commit a staged first-touch dataset creation with no conflict retry.
+    ///
+    /// A create transaction is Lance's `Operation::Overwrite` at
+    /// `read_version = 0`. `with_max_retries(0)` selects Lance's strict
+    /// overwrite path: if another writer created the dataset after this
+    /// transaction was staged, Lance refuses the stale read-version-0 commit
+    /// instead of rebasing it over the winner. If both writers still observe
+    /// absence, the object store's atomic manifest create admits exactly one.
+    pub async fn commit_staged_create_exact(
+        &self,
+        dataset_uri: &str,
+        staged: StagedWrite,
+    ) -> Result<(Dataset, StagedTransactionIdentity)> {
+        if staged.transaction.read_version != 0
+            || !matches!(staged.transaction.operation, Operation::Overwrite { .. })
+        {
+            return Err(OmniError::manifest_internal(
+                "staged dataset creation must be an Overwrite transaction at read version 0",
+            ));
+        }
+        if staged.commit_metadata.affected_rows.is_some() {
+            return Err(OmniError::manifest_internal(
+                "staged dataset creation cannot carry affected-row metadata",
+            ));
+        }
+
+        let dataset = CommitBuilder::new(dataset_uri)
+            .use_stable_row_ids(true)
+            .with_storage_format(LanceFileVersion::V2_2)
+            .enable_v2_manifest_paths(true)
+            .with_session(self.session.clone())
+            .with_skip_auto_cleanup(true)
+            .with_max_retries(0)
+            .execute(staged.transaction)
+            .await
+            .map_err(|e| OmniError::Lance(e.to_string()))?;
+        let committed_identity = dataset
+            .read_transaction()
+            .await
+            .map_err(|e| OmniError::Lance(e.to_string()))?
+            .as_ref()
+            .map(StagedTransactionIdentity::from)
+            .ok_or_else(|| {
+                OmniError::manifest_internal(
+                    "Lance created a dataset without a readable transaction identity",
+                )
+            })?;
+        Ok((dataset, committed_identity))
+    }
+
     async fn commit_staged_with_retry_budget(
         &self,
         ds: Arc<Dataset>,
@@ -1379,6 +1429,47 @@ impl TableStore {
         Ok((dataset, committed_identity))
     }
 
+    /// Stage creation of a new dataset without publishing its first manifest.
+    ///
+    /// Lance models creation as an `Operation::Overwrite` transaction based on
+    /// version 0. Data files may be written by this call, but the dataset is not
+    /// readable until [`Self::commit_staged_create_exact`] atomically creates
+    /// version 1. The transaction UUID can therefore be bound to a recovery
+    /// identity before that first visible effect.
+    pub async fn stage_create(&self, dataset_uri: &str, batch: RecordBatch) -> Result<StagedWrite> {
+        let params = WriteParams {
+            mode: WriteMode::Create,
+            enable_stable_row_ids: true,
+            data_storage_version: Some(LanceFileVersion::V2_2),
+            allow_external_blob_outside_bases: true,
+            session: Some(self.session.clone()),
+            auto_cleanup: None,
+            skip_auto_cleanup: true,
+            ..Default::default()
+        };
+        let transaction = InsertBuilder::new(dataset_uri)
+            .with_params(&params)
+            .execute_uncommitted(vec![batch])
+            .await
+            .map_err(|e| OmniError::Lance(e.to_string()))?;
+        if transaction.read_version != 0 {
+            return Err(OmniError::manifest_internal(format!(
+                "stage_create resolved '{}' at existing version {}; expected an absent dataset",
+                dataset_uri, transaction.read_version
+            )));
+        }
+        let new_fragments = match &transaction.operation {
+            Operation::Overwrite { fragments, .. } => fragments.clone(),
+            other => {
+                return Err(OmniError::manifest_internal(format!(
+                    "stage_create: unexpected Lance operation {:?}",
+                    std::mem::discriminant(other)
+                )));
+            }
+        };
+        Ok(StagedWrite::new(transaction, new_fragments, Vec::new()))
+    }
+
     /// Stage an overwrite (write_fragments + Operation::Overwrite { schema, fragments }).
     /// Returns a StagedWrite carrying the replacement fragments. HEAD does
     /// NOT advance.
@@ -1395,7 +1486,7 @@ impl TableStore {
         // `enable_stable_row_ids: true` is defensive — empirically Lance 6.0.1
         // preserves the source dataset's flag through `Operation::Overwrite`
         // when WriteParams omits it (pinned by
-        // `stage_overwrite_preserves_stable_row_ids` in tests/staged_writes.rs),
+        // `stage_overwrite_preserves_stable_row_ids` in table_store/staged_tests.rs),
         // but setting it explicitly keeps the invariant documented at every Overwrite site
         // (see docs/storage.md "Stable row IDs"). Setting it on an existing
         // dataset that was created without stable row IDs is a no-op per
@@ -1468,87 +1559,123 @@ impl TableStore {
         ))
     }
 
-    /// Stage a BTREE scalar index build. Returns a StagedWrite whose
-    /// transaction commits via `commit_staged`. HEAD does NOT advance.
+    /// Stage a batch of full-table index builds as one Lance transaction.
     ///
-    /// Lance shape: `CreateIndexBuilder::execute_uncommitted` returns
-    /// `IndexMetadata`; we manually wrap it in `Operation::CreateIndex
-    /// { new_indices, removed_indices }` via the public `TransactionBuilder`,
-    /// replicating the simple (non-segment-commit-path) branch of Lance's
-    /// `CreateIndexBuilder::execute` (lance-6.0.1 `src/index/create.rs:502-512`).
+    /// Each builder writes its immutable index artifact and returns complete
+    /// `IndexMetadata` through beta.21's public `execute_uncommitted` surface.
+    /// All metadata is based on the same pinned dataset version and is wrapped
+    /// in one `Operation::CreateIndex`, so committing any number of requested
+    /// BTREE, FTS, and vector indexes advances the table exactly once. HEAD does
+    /// not move during this method.
     ///
-    /// `removed_indices` mirrors `execute()` lines 466-476: when the
-    /// build replaces an existing same-named index, those entries are
-    /// listed for tombstoning by the manifest commit.
-    ///
-    /// MR-793 Phase 2: scalar index types (BTree, Inverted) are
-    /// stage-able. Vector indices are NOT (segment-commit-path requires
-    /// `build_index_metadata_from_segments` which is `pub(crate)` in
-    /// lance-6.0.1); see `create_vector_index` and Appendix A.3.
-    pub async fn stage_create_btree_index(
+    /// This intentionally covers OmniGraph's current one-segment full-table
+    /// vector shape. Lance's generic multi-segment commit helper remains an
+    /// inline-commit API and is not used here.
+    pub async fn stage_create_indices(
         &self,
         ds: &Dataset,
-        columns: &[&str],
+        specs: &[IndexBuildSpec],
     ) -> Result<StagedWrite> {
-        let params = ScalarIndexParams::default();
-        let mut ds_clone = ds.clone();
-        let new_idx = ds_clone
-            .create_index_builder(columns, IndexType::BTree, &params)
-            .replace(true)
-            .execute_uncommitted()
-            .await
-            .map_err(|e| OmniError::Lance(format!("stage_create_btree_index: {}", e)))?;
-        let removed_indices: Vec<IndexMetadata> = ds
-            .load_indices()
-            .await
-            .map_err(|e| OmniError::Lance(e.to_string()))?
-            .iter()
-            .filter(|idx| idx.name == new_idx.name)
-            .cloned()
-            .collect();
-        let transaction = TransactionBuilder::new(
-            new_idx.dataset_version,
-            Operation::CreateIndex {
-                new_indices: vec![new_idx],
-                removed_indices,
-            },
-        )
-        .build();
-        Ok(StagedWrite::new(transaction, Vec::new(), Vec::new()))
-    }
+        if specs.is_empty() {
+            return Err(OmniError::manifest_internal(
+                "stage_create_indices requires at least one index specification",
+            ));
+        }
 
-    /// Stage an INVERTED (FTS) scalar index build. Same shape as
-    /// `stage_create_btree_index`; see its docs for the Lance API
-    /// citation and contract notes.
-    pub async fn stage_create_inverted_index(
-        &self,
-        ds: &Dataset,
-        column: &str,
-    ) -> Result<StagedWrite> {
-        let params = InvertedIndexParams::default();
-        let mut ds_clone = ds.clone();
-        let new_idx = ds_clone
-            .create_index_builder(&[column], IndexType::Inverted, &params)
-            .replace(true)
-            .execute_uncommitted()
-            .await
-            .map_err(|e| OmniError::Lance(format!("stage_create_inverted_index: {}", e)))?;
-        let removed_indices: Vec<IndexMetadata> = ds
+        let read_version = ds.manifest.version;
+        let existing_indices = ds
             .load_indices()
             .await
-            .map_err(|e| OmniError::Lance(e.to_string()))?
+            .map_err(|e| OmniError::Lance(format!("stage_create_indices: {e}")))?;
+        let mut new_indices = Vec::with_capacity(specs.len());
+        let mut new_names = std::collections::HashSet::with_capacity(specs.len());
+        let mut vector_builds = 0usize;
+
+        for spec in specs {
+            let (column, index_type) = match spec {
+                IndexBuildSpec::BTree { column } => (column, "BTREE"),
+                IndexBuildSpec::FullText { column } => (column, "FTS"),
+                IndexBuildSpec::Vector { column } => (column, "Vector"),
+            };
+            if column.is_empty() {
+                return Err(OmniError::manifest_internal(format!(
+                    "stage_create_indices received an empty {index_type} column name"
+                )));
+            }
+
+            let mut ds_clone = ds.clone();
+            let new_idx = match spec {
+                IndexBuildSpec::BTree { column } => {
+                    let params = ScalarIndexParams::default();
+                    ds_clone
+                        .create_index_builder(&[column.as_str()], IndexType::BTree, &params)
+                        .replace(true)
+                        .execute_uncommitted()
+                        .await
+                }
+                IndexBuildSpec::FullText { column } => {
+                    let params = InvertedIndexParams::default();
+                    ds_clone
+                        .create_index_builder(&[column.as_str()], IndexType::Inverted, &params)
+                        .replace(true)
+                        .execute_uncommitted()
+                        .await
+                }
+                IndexBuildSpec::Vector { column } => {
+                    let params =
+                        lance::index::vector::VectorIndexParams::ivf_flat(1, MetricType::L2);
+                    let new_idx = ds_clone
+                        .create_index_builder(&[column.as_str()], IndexType::Vector, &params)
+                        .replace(true)
+                        .execute_uncommitted()
+                        .await;
+                    if new_idx.is_ok() {
+                        vector_builds += 1;
+                    }
+                    new_idx
+                }
+            }
+            .map_err(|e| {
+                OmniError::Lance(format!(
+                    "stage_create_indices: build {index_type} index on '{column}': {e}"
+                ))
+            })?;
+
+            if new_idx.dataset_version != read_version {
+                return Err(OmniError::manifest_internal(format!(
+                    "staged index '{}' was built from dataset version {}, expected {}",
+                    new_idx.name, new_idx.dataset_version, read_version
+                )));
+            }
+            if !new_names.insert(new_idx.name.clone()) {
+                return Err(OmniError::manifest_internal(format!(
+                    "stage_create_indices produced duplicate index name '{}'",
+                    new_idx.name
+                )));
+            }
+            new_indices.push(new_idx);
+        }
+
+        let removed_indices: Vec<IndexMetadata> = existing_indices
             .iter()
-            .filter(|idx| idx.name == new_idx.name)
+            .filter(|idx| new_names.contains(&idx.name))
             .cloned()
             .collect();
         let transaction = TransactionBuilder::new(
-            new_idx.dataset_version,
+            read_version,
             Operation::CreateIndex {
-                new_indices: vec![new_idx],
+                new_indices,
                 removed_indices,
             },
         )
         .build();
+
+        // Preserve the existing build-count probe while moving the vector
+        // operation from inline commit to staged publication. Record only once
+        // the entire batch staged successfully.
+        for _ in 0..vector_builds {
+            crate::instrumentation::record_stage_vector_index();
+        }
         Ok(StagedWrite::new(transaction, Vec::new(), Vec::new()))
     }
 
@@ -1822,7 +1949,6 @@ impl TableStore {
     }
 
     async fn user_indices_for_column(
-        &self,
         ds: &Dataset,
         column: &str,
     ) -> Result<Vec<IndexMetadata>> {
@@ -1849,7 +1975,11 @@ impl TableStore {
     }
 
     pub async fn has_btree_index(&self, ds: &Dataset, column: &str) -> Result<bool> {
-        let indices = self.user_indices_for_column(ds, column).await?;
+        Self::has_btree_index_on(ds, column).await
+    }
+
+    pub(crate) async fn has_btree_index_on(ds: &Dataset, column: &str) -> Result<bool> {
+        let indices = Self::user_indices_for_column(ds, column).await?;
         Ok(indices.iter().any(|index| {
             index
                 .index_details
@@ -1860,7 +1990,11 @@ impl TableStore {
     }
 
     pub async fn has_fts_index(&self, ds: &Dataset, column: &str) -> Result<bool> {
-        let indices = self.user_indices_for_column(ds, column).await?;
+        Self::has_fts_index_on(ds, column).await
+    }
+
+    pub(crate) async fn has_fts_index_on(ds: &Dataset, column: &str) -> Result<bool> {
+        let indices = Self::user_indices_for_column(ds, column).await?;
         Ok(indices.iter().any(|index| {
             index
                 .index_details
@@ -1871,7 +2005,11 @@ impl TableStore {
     }
 
     pub async fn has_vector_index(&self, ds: &Dataset, column: &str) -> Result<bool> {
-        let indices = self.user_indices_for_column(ds, column).await?;
+        Self::has_vector_index_on(ds, column).await
+    }
+
+    pub(crate) async fn has_vector_index_on(ds: &Dataset, column: &str) -> Result<bool> {
+        let indices = Self::user_indices_for_column(ds, column).await?;
         Ok(indices.iter().any(|index| {
             index
                 .index_details
@@ -1879,18 +2017,6 @@ impl TableStore {
                 .map(|details| IndexDetails(details.clone()).is_vector())
                 .unwrap_or(false)
         }))
-    }
-
-    pub(crate) async fn create_vector_index(&self, ds: &mut Dataset, column: &str) -> Result<()> {
-        let params = lance::index::vector::VectorIndexParams::ivf_flat(1, MetricType::L2);
-        ds.create_index_builder(&[column], IndexType::Vector, &params)
-            .replace(true)
-            .await
-            .map_err(|e| OmniError::Lance(e.to_string()))?;
-        // Record only after the index build succeeds, so a failed build does not
-        // inflate the probe (matches the `stage_*` probes).
-        crate::instrumentation::record_create_vector_index();
-        Ok(())
     }
 
     pub async fn create_empty_dataset(dataset_uri: &str, schema: &SchemaRef) -> Result<Dataset> {
@@ -2320,3 +2446,6 @@ mod tests {
         assert!(err.to_string().contains("single-column keys only"));
     }
 }
+
+#[cfg(test)]
+mod staged_tests;

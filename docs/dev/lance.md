@@ -156,7 +156,95 @@ If a future need pulls one of these into scope, add a row to the matching domain
 
 When Lance ships a major release that changes any of the above (file format bump, new index type, transaction semantics change, new branching primitive), refresh this index in the same change as the omnigraph upgrade. Stale Lance pointers are worse than no pointers.
 
-### Last alignment audit: 2026-07-05 (Lance 9.0.0-beta.15 upstream; omnigraph pinned at 9.0.0-beta.15 via git rev)
+### Last alignment audit: 2026-07-12 (Lance 9.0.0-beta.21 upstream; omnigraph pinned at 9.0.0-beta.21 via git rev)
+
+The pin advanced from `v9.0.0-beta.15` (`f24e42c1`) to
+`v9.0.0-beta.21` (`1aec1465`) after reviewing all 77 intervening commits and
+the beta.16–beta.21 release notes. Every Lance workspace dependency, including
+the engine's `lance-io` test dependency, uses that same rev. Arrow remains 58,
+DataFusion remains 53, and `object_store` remains 0.13.2; the only new
+third-party lockfile entry is `bytemuck_derive`, enabled by Lance's encoding
+work. No upstream migration note or Lance file-version bump accompanies this
+beta-to-beta move; OmniGraph continues to write explicit V2_2 datasets and
+requires one pinned Lance version across a deployment.
+
+Behavior-affecting findings in this audit:
+
+- **The RFC-022 full-table vector-index stage is no longer substrate-blocked.**
+  `CreateIndexBuilder::execute_uncommitted` builds the physical vector artifact
+  and returns complete `IndexMetadata`; Lance's own `execute` wraps that value
+  directly in public `Operation::CreateIndex`. That source is byte-for-byte
+  unchanged between beta.15 and beta.21 and has had this shape since upstream
+  #7129. OmniGraph can therefore mirror the scalar staging path, pre-mint the
+  transaction identity, and commit through `commit_staged_exact`. The exact
+  EnsureIndices v8 adapter now does so: all missing BTREE, FTS, and full-table
+  vector artifacts for a table are combined into one `Operation::CreateIndex`,
+  and `InlineCommitResidual` has been removed. This closes the OmniGraph rollout
+  gap for the one-segment full-table IVF-Flat build.
+- **The generic multi-segment API is still not an exact-commit primitive.**
+  `commit_existing_index_segments` constructs and inline-commits its own
+  transaction with default retry behavior, while
+  `build_index_metadata_from_segments` remains `pub(crate)`. Lance #6666 is
+  therefore still relevant to external generic multi-segment publication, but
+  it does not block OmniGraph's current full-table vector shape.
+- **Maintenance still has no stable public caller-controlled transaction
+  boundary.** In beta.21, `compact_files` and `optimize_indices` remain
+  high-level committing operations; their internal transaction construction is
+  not a public contract that OmniGraph can pre-mint and later prove as one
+  complete compact/reindex effect. RFC-022 therefore keeps Optimize's bounded
+  schema-v2 adapter instead of binding an "exact-v9" protocol to beta internals.
+  Revisit exact Optimize provenance only after Lance exposes a stable public
+  maintenance-transaction API and OmniGraph has distributed recovery fencing;
+  the latter is independently required before destructive recovery is safe
+  against a live foreign process.
+- **Index construction gained correctness and bounded-resource fixes:** beta.17
+  prevents an FTS builder thread-pool deadlock and bounds tail-partition merge
+  memory; beta.18 fixes a streaming IVF training hang; beta.19 caps nullable
+  IVF training prefetch memory and translates address-domain scalar-index
+  results under stable row ids; beta.21 packs prewarmed FTS posting groups.
+  Beta.19 also completes the ICU English stop-word list (#7621), which changes
+  BM25 document-length normalization and therefore legitimately changes some
+  score/rank ties. `search::rrf_fuses_two_fts_fields` pins the new deterministic
+  fused order rather than treating output ordering as an incidental detail.
+- **MemWAL durability tightened:** beta.17 fences the writer after WAL
+  persistence failure and makes the memtable flush threshold slice-aware.
+  These are upstream correctness fixes for RFC-026's chosen substrate, not a
+  change to its OmniGraph enrollment or acknowledgement protocol.
+- **Blob and runtime fixes are additive:** beta.20 fixes late-materialized blob
+  columns being read as binary; beta.21 fixes empty-blob structural round trips
+  and removes an aliased mutable Tokio runtime reference.
+- **Native `DirectoryNamespace` reads now open an existing manifest without
+  migrating it** (beta.19 #7687). With directory listing disabled, native
+  `list_table_versions` / `describe_table_version` can therefore resolve
+  OmniGraph's manifest rows and enumerate the physical Lance history, including
+  a data-table HEAD that OmniGraph has not graph-published. This is visibility,
+  not graph authority: those per-table APIs cannot atomically advance
+  OmniGraph's graph-wide table pointers, and production does not route through
+  the native namespace. The manifest guard now pins both sides explicitly: the
+  native namespace sees the unpublished physical version while
+  `ManifestCoordinator::refresh` remains on the unchanged logical snapshot.
+  This supersedes the beta.15 `TableNotFound` behavior recorded below and also
+  proves that read-only namespace construction does not rewrite OmniGraph's
+  legacy PK annotation.
+- **No RFC-022 control-protocol change was found.** Native branch create/delete
+  remains the same two-phase shape. Beta.18 does make force-deleting a fully
+  absent branch tree idempotent by mapping object-store absence to Lance
+  `NotFound` and accepting that during cleanup; the positive behavior is pinned
+  by Guard 9. OmniGraph retains its outer `RefNotFound` / `NotFound`
+  normalization because Lance still performs the branch-contents existence
+  check and delete separately, leaving a concurrent-delete TOCTOU window around
+  the otherwise-idempotent tree cleanup.
+  The index-create source is unchanged; compaction changes are mechanical
+  iterator cleanup; the transaction change only centralizes calculation of the
+  next version. Branch checkout now reuses the session-cached manifest,
+  improving the warm-access shape without changing branch identity or commit
+  semantics.
+
+The existing Lance surface guards plus the canonical workspace and failpoint
+suites are the compatibility gate for this pin. Keep the beta.15 audit below as
+historical provenance for the larger 7.0 → 9.0 migration.
+
+### Prior alignment audit: 2026-07-05 (Lance 9.0.0-beta.15 upstream; omnigraph pinned at 9.0.0-beta.15 via git rev)
 
 Migration from Lance 7.0.0 → 9.0.0-beta.15 landed in this cycle. The 9.x betas
 are **git tags only** (crates.io carries ≤ 8.0.0), so every lance crate is a git
@@ -212,11 +300,13 @@ findings:
   identifier field, so the pinned Rust shape remains load-bearing. Guard 9 in
   `lance_surface_guards.rs` pins clone-only raw-create failure plus force reclaim;
   `src/branch_control.rs` pins delete classification and JSON identity fencing.
-- **Native DirectoryNamespace churn** (#7222 removed
+- **Native DirectoryNamespace churn at beta.15** (#7222 removed
   `table_version_storage_enabled` + the `__manifest` version-storage
   experiment; #7176/#7191/#7234 rewrote manifest handling): the decoupling
-  guard's thesis holds at v9 (manifest-tracked tables still `TableNotFound` to
-  native tooling with dir-listing disabled) and was realigned.
+  guard then observed manifest-tracked tables as `TableNotFound` to native
+  tooling with dir-listing disabled and was realigned. Beta.19 #7687 later
+  replaced that accidental read-time decoupling with a non-mutating manifest
+  open; the beta.21 audit above records the current behavior.
 - **merge_insert substantially rewritten** (+1321 lines across #6878 composite
   indexed join keys, #7484 WhenNotMatchedBySource::Delete/Fail fixed on the
   indexed-scan path, #7410/#7359 stale scalar-index entries after
@@ -234,10 +324,14 @@ findings:
   (v8 #6773); `alter_columns` with a cast on an indexed column now hard-errors
   (v8 #7158 — omnigraph's planner never emits casts today, OG-MF-106 refuses
   type changes first).
-- **Still NOT fixed at 9.0.0-beta.15:** vector-index two-phase (lance#6666 —
-  `build_index_metadata_from_segments` still `pub(crate)`; the
-  `create_vector_index` inline residual and its recovery coverage are
-  retained), #6914 per-row version-metadata refresh (unshipped), and upstream
+- **Audit correction:** beta.15 already exposed a usable uncommitted shape for
+  OmniGraph's one-segment full-table vector build; Lance's own `execute` wraps
+  that returned `IndexMetadata` directly in `Operation::CreateIndex`. The
+  original audit incorrectly treated #6666's generic multi-segment helper as a
+  blocker. The `create_vector_index` inline residual and its recovery coverage
+  were retained because the OmniGraph adapter migration had not landed, not
+  because this full-table shape was impossible. #6914 per-row version-metadata
+  refresh remained unshipped, and upstream
   **#7508 is open** (FTS "record batch length" errors after frequent
   `optimize_indices` — omnigraph's reconciler call pattern; watch it).
 - **RowAddrTreeMap moved** from `lance_core::utils::mask` to the new
@@ -268,7 +362,7 @@ Migration from Lance 6.0.1 → 7.0.0 landed in this cycle. **Arrow stayed 58, Da
 - **`WriteParams::auto_cleanup` default flipped from on (every-20-commits) to `None`** (PR #6755). On 6.0.1 the on-by-default hook could GC versions the `__manifest` pins for snapshots/time-travel. omnigraph owns cleanup explicitly (`optimize.rs::cleanup_all_tables`). Two parts to the fix, because `auto_cleanup` is **create-time config only and has no effect on existing datasets** (Lance `write.rs` docs): (1) `auto_cleanup: None` at all 11 `WriteParams` sites so *new* datasets store no cleanup config; (2) — the load-bearing half — `skip_auto_cleanup: true` on every commit path, because graphs created **before** the bump still carry the on-config in their datasets, and Lance's hook fires off the *dataset's stored* config at commit time (`io/commit.rs`: `if !commit_config.skip_auto_cleanup`). So the staged commit path (`commit_staged` → `CommitBuilder::with_skip_auto_cleanup(true)`), the `__manifest` publisher (`MergeInsertBuilder::skip_auto_cleanup(true)`), and the direct `WriteParams` paths all skip the hook. Without this, an upgraded graph would still auto-cleanup and delete `__manifest`-pinned versions. Pinned by `lance_surface_guards.rs::skip_auto_cleanup_suppresses_version_gc` (negative control + with-skip survival).
 - **Lance #6658 SHIPPED in 7.0.0** (`DeleteBuilder::execute_uncommitted`, exposed via PR #6781) → MR-A (migrate `delete` to the staged two-phase API) **has since landed** (dev-graph `iss-950`): `delete_where` is retired, deletes stage via `TableStorage::stage_delete`, and the guard was flipped to `_compile_uncommitted_delete_field_shape` (pins `execute_uncommitted` / `UncommittedDelete`). `StagedWrite` must carry `UncommittedDelete.affected_rows` through `commit_staged` so Lance's row-level rebase metadata is preserved. The parse-time D2 rule is retained as a deliberate boundary (constructive XOR destructive per query), not as scaffolding awaiting further work.
 - **The unenforced primary key is now immutable once set** (`lance::dataset::transaction`, ~L2472–2480: `if !primary_key_before.is_empty() && (writes_primary_key || primary_key_after != primary_key_before) → "the unenforced primary key is a reserved key and cannot be changed once set"`). omnigraph marks `__manifest.object_id` as the unenforced PK (`lance-schema:unenforced-primary-key`) for merge-insert row-level CAS — baked into the manifest schema at init (`db/manifest/state.rs`). With the strand model there is no in-place migration, so the PK is only ever set at init: a graph that predates the annotation is refused on open (`refuse_if_stamp_unsupported`) and rebuilt via export/import, never re-keyed — which is also what Lance's immutability rule would require, since the wrong PK could not be changed once set. Pinned by `lance_surface_guards.rs::unenforced_primary_key_is_immutable_once_set` (red if Lance relaxes immutability).
-- **Native `DirectoryNamespace` no longer recognizes omnigraph's manifest-tracked tables** (`lance-namespace-impls` dir.rs ~L1310): `list/describe/create_table_version` route through `check_table_status`, which reports an omnigraph table absent → `TableNotFound`. The decoupling is *contingent on omnigraph's legacy boolean PK key*, not an unconditional v7 property: v7's namespace eagerly adds the new `lance-schema:unenforced-primary-key:position` key to any `__manifest` lacking it; that write hits the immutable-PK rule above (the boolean key already set the PK), so `ensure_manifest_table_up_to_date` errors and the namespace silently falls back to directory listing. omnigraph keeps the boolean key deliberately — Lance honors it permanently (maps to PK position 0), and one uniform on-disk format beats a new-vs-old split (existing graphs can't be re-keyed to the position key under that same immutability rule). omnigraph production never uses Lance's native namespace (its publisher writes `__manifest` directly via merge_insert; its own `namespace.rs` impls are custom), so this is test-only — the `test_directory_namespace_direct_publish_cannot_replace_native_omnigraph_write_path` surface guard was realigned to the v7 behavior (it now asserts the native namespace is fully decoupled, which only strengthens the guard's thesis).
+- **Native `DirectoryNamespace` no longer recognizes omnigraph's manifest-tracked tables** (`lance-namespace-impls` dir.rs ~L1310): `list/describe/create_table_version` route through `check_table_status`, which reports an omnigraph table absent → `TableNotFound`. The decoupling is *contingent on omnigraph's legacy boolean PK key*, not an unconditional v7 property: v7's namespace eagerly adds the new `lance-schema:unenforced-primary-key:position` key to any `__manifest` lacking it; that write hits the immutable-PK rule above (the boolean key already set the PK), so `ensure_manifest_table_up_to_date` errors and the namespace silently falls back to directory listing. omnigraph keeps the boolean key deliberately — Lance honors it permanently (maps to PK position 0), and one uniform on-disk format beats a new-vs-old split (existing graphs can't be re-keyed to the position key under that same immutability rule). omnigraph production never uses Lance's native namespace (its publisher writes `__manifest` directly via merge_insert; its own `namespace.rs` impls are custom), so this was test-only. This paragraph records the v7 behavior; beta.19 #7687 later made manifest opening non-mutating and restored native physical-version reads, as documented in the beta.21 audit above.
 - **Still NOT fixed in 7.0.0:** vector-index two-phase (Lance #6666 open) — `create_vector_index` inline residual retained; blob-column compaction — `compact_files_still_fails_on_blob_columns` guard still red on a fix, `optimize` still skips blob tables behind `LANCE_SUPPORTS_BLOB_COMPACTION`.
 - **No Lance API surface omnigraph uses changed at *compile* time** (the only compile break was object_store) — but **two runtime behaviors did** (the unenforced-PK immutability and the native-namespace `TableNotFound`, above), each caught by the full engine test suite rather than the build. `CleanupPolicy`, `WriteParams` (apart from the `auto_cleanup` default), `CompactionOptions`, the namespace models (resolved via `lance-namespace-reqwest-client` 0.7.7, unchanged across the bump), `Operation`, `ManifestLocation`, and `MergeInsertBuilder` shapes are all stable. Lesson: a clean build is not a clean alignment — run `cargo test --workspace` before declaring a Lance bump done.
 - **The v3→v4 migration-robustness surface guards were removed with the strand.**
@@ -301,7 +395,7 @@ Migration from Lance 4.0.0 → 6.0.1 landed in this cycle (DataFusion 52 → 53,
 - **Lance #6658 closed** (2026-05-14) but `DeleteBuilder::execute_uncommitted` did **not** ship in v6.0.1 — binary search across the release stream shows it first appears in `v7.0.0-beta.10` (the closing commits landed on main but didn't backport to the 6.x line). Tracked as MR-A: migrate `delete_where` to staged, retire the parse-time D2 mutation rule, extend recovery sidecar coverage. **Gated on the Lance v7.x bump**, not this PR. v7.0.0-rc.1 dropped 2026-05-21.
 - **Lance #6666 still open** (`build_index_metadata_from_segments` public): vector-index two-phase blocked; inline `create_vector_index` residual retained.
 - **Lance #6877 still open** (`MergeInsertBuilder` dup-rowid): PR #109's `SourceDedupeBehavior::FirstSeen` + `check_batch_unique_by_keys` precondition stay load-bearing.
-- **`Dataset::force_delete_branch`** (`branches().delete(name, force=true)`, dataset.rs:524) tolerates a missing branch-*contents* ref (vs plain `delete_branch`'s `RefNotFound`), but on the local store still errors `NotFound` if the branch `tree/` directory is fully absent (`remove_dir_all`'s NotFound is not caught for Lance's native error variant, refs.rs:526-549). Both delete variants still refuse a branch with referencing descendants (`RefConflict`). The current OmniGraph disposition for these still-present substrate behaviors is recorded in the beta.15 audit above.
+- **`Dataset::force_delete_branch`** (`branches().delete(name, force=true)`) tolerates both a missing branch-*contents* ref and, since beta.18, a fully absent `tree/{branch}/` directory. Plain `delete_branch` still returns `RefNotFound`, and both delete variants still refuse a branch with referencing descendants (`RefConflict`). OmniGraph retains its path-descendant precheck because Lance deliberately preserves an ancestor tree while a live path-child exists, and defensively normalizes `RefNotFound` / `NotFound` around the full force-delete call because the native branch-contents existence check and delete are not atomic.
 - **Lance blob-v2 `compact_files` bug** (no public issue found as of 2026-06): `compact_files` disables binary-copy for blob datasets and forces `BlobHandling::AllBinary` on the read side; the v2.1+ structural decoder then mis-counts column infos for the blob-v2 struct and fails with `Invalid user input: there were more fields in the schema than provided column indices / infos` (`lance-encoding/src/decoder.rs::ColumnInfoIter::expect_next`). This fails even a pristine uniform-V2_2 multi-fragment blob table; vector/list/scalar/ragged columns and mixed file versions all compact fine. Reads/queries use descriptor handling (`BlobHandling::default()`) and are unaffected. `optimize` skips blob-bearing tables behind `LANCE_SUPPORTS_BLOB_COMPACTION = false` (`db/omnigraph/optimize.rs`), reporting `SkipReason::BlobColumnsUnsupportedByLance`. Pinned by `lance_surface_guards.rs::compact_files_still_fails_on_blob_columns`, which turns red when the bug is fixed → flip the gate, remove the skip branch + the `maintenance.rs::optimize_skips_blob_table_and_reports_skip` skip assertions.
 
 Surface guards added: `crates/omnigraph/tests/lance_surface_guards.rs` (10 named guards; 5 runtime + 5 compile-only; plus the index-coverage work's `_compile_optimize_indices_signature` and `optimize_indices_extends_fragment_coverage`). Future Lance bumps re-run this file first as the smoke check. Two additional guards from the original plan deferred to follow-up (`manifest_cas_returns_row_level_contention_variant` needs full publisher-race harness; `table_version_metadata_byte_compatible_with_v4` needs `pub(crate)` reach extension).

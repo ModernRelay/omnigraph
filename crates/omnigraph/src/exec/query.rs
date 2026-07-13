@@ -35,9 +35,11 @@ impl Omnigraph {
         query_name: &str,
         params: &ParamMap,
     ) -> Result<QueryResult> {
-        // resolved_target validates the schema contract; no redundant call here.
-        let resolved = self.resolved_target(target).await?;
-        let catalog = self.catalog();
+        // Capture the manifest snapshot and immutable catalog under the same
+        // schema-publication gate. SchemaApply publishes its fixed manifest
+        // outcome before promoting files/ArcSwap; without this gate a query on
+        // the applying handle could pair that new snapshot with the old catalog.
+        let (resolved, catalog) = self.capture_read_view(target).await?;
 
         let query_decl = omnigraph_compiler::find_named_query(query_source, query_name)
             .map_err(|e| OmniError::manifest(e.to_string()))?;
@@ -84,9 +86,10 @@ impl Omnigraph {
         query_name: &str,
         params: &ParamMap,
     ) -> Result<QueryResult> {
-        // snapshot_at_version validates the schema contract; no redundant call here.
-        let snapshot = self.snapshot_at_version(version).await?;
-        let catalog = self.catalog();
+        // Historical resolution still uses the current accepted catalog, so
+        // capture both sides of that view under schema publication just like a
+        // live-target query.
+        let (snapshot, catalog) = self.capture_historical_read_view(version).await?;
 
         let query_decl = omnigraph_compiler::find_named_query(query_source, query_name)
             .map_err(|e| OmniError::manifest(e.to_string()))?;
@@ -1217,7 +1220,7 @@ async fn execute_expand(
     // Leaning indexed: open the edge dataset once, confirm real coverage, and
     // (unless forced) re-decide with it. The opened dataset is threaded into the
     // indexed path so it is never opened twice.
-    let edge_ds = snapshot.open(&edge_table_key).await?;
+    let edge_ds = snapshot.open_dataset(&edge_table_key).await?;
     // An undirected traversal scans BOTH endpoint columns; price it by the
     // worst coverage of the columns it will actually probe (a degraded dst
     // index must not be masked by a healthy src index).
@@ -1702,7 +1705,7 @@ async fn hydrate_nodes(
     }
 
     let table_key = format!("node:{}", type_name);
-    let ds = snapshot.open(&table_key).await?;
+    let ds = snapshot.open_dataset(&table_key).await?;
 
     // `id IN (ids)` AND any pushable destination filters, as a structured Expr.
     let id_list: Vec<datafusion::prelude::Expr> = ids.iter().map(|id| lit(id.clone())).collect();
@@ -1959,7 +1962,7 @@ async fn execute_node_scan(
     search_mode: &SearchMode,
 ) -> Result<RecordBatch> {
     let table_key = format!("node:{}", type_name);
-    let ds = snapshot.open(&table_key).await?;
+    let ds = snapshot.open_dataset(&table_key).await?;
 
     let node_type = &catalog.node_types[type_name];
 

@@ -110,7 +110,7 @@ impl ChangeFilter {
 /// 1. Manifest diff — skip unchanged sub-tables
 /// 2. Lineage check — same branch → version-column diff; different → ID-based diff
 /// 3. Row-level diff
-pub async fn diff_snapshots(
+pub(crate) async fn diff_snapshots(
     table_store: &TableStore,
     from: &Snapshot,
     to: &Snapshot,

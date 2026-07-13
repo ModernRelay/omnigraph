@@ -307,6 +307,39 @@ async fn _compile_uncommitted_delete_field_shape() -> lance::Result<()> {
     Ok(())
 }
 
+// --- Guard 8a: full-table vector indexing exposes uncommitted metadata -----
+//
+// EnsureIndices batches BTREE, FTS, and the current one-segment full-table
+// vector shape into one exact `Operation::CreateIndex`. This requires the
+// beta.21 builder to return complete public `IndexMetadata` without committing
+// HEAD. Compile-only: a Lance bump that removes or narrows the surface must
+// turn the compatibility smoke test red.
+#[allow(
+    dead_code,
+    unreachable_code,
+    unused_variables,
+    unused_mut,
+    clippy::diverging_sub_expression
+)]
+async fn _compile_uncommitted_full_table_vector_index_shape() -> lance::Result<()> {
+    use lance::index::vector::VectorIndexParams;
+    use lance_linalg::distance::MetricType;
+    use lance_table::format::IndexMetadata;
+
+    let mut ds: Dataset = unimplemented!();
+    let params = VectorIndexParams::ivf_flat(1, MetricType::L2);
+    let metadata: IndexMetadata = ds
+        .create_index_builder(&["embedding"], IndexType::Vector, &params)
+        .replace(true)
+        .execute_uncommitted()
+        .await?;
+    let _transaction_shape = Operation::CreateIndex {
+        new_indices: vec![metadata],
+        removed_indices: Vec::new(),
+    };
+    Ok(())
+}
+
 // --- Guard 8b: MergeInsertJob::execute_uncommitted returns
 //     UncommittedMergeInsert { transaction, affected_rows, stats, inserted_rows_filter } ---
 //
@@ -343,11 +376,9 @@ async fn _compile_uncommitted_merge_insert_field_shape() -> lance::Result<()> {
 //      force variant instead);
 //   2. `force_delete_branch` removes an existing (forked) branch — the orphan
 //      case, where a `tree/{branch}/` exists;
-//   3. `force_delete_branch` on a *fully-absent* branch (no tree dir) still
-//      errors on the local store, because `remove_dir_all`'s NotFound is not
-//      caught for Lance's native error variant. `TableStore::force_delete_branch`
-//      wraps this to be fully idempotent. Pin the raw quirk so a future Lance
-//      fix (which would let us simplify the wrapper) is noticed;
+//   3. `force_delete_branch` on a *fully-absent* branch (no tree dir) is
+//      idempotent. Beta.18 maps object-store absence to Lance `NotFound`, and
+//      branch cleanup now treats that as success. Pin the positive contract;
 //   4. a clone-only zombie (branch dataset present, BranchContents absent)
 //      blocks raw create and is reclaimed by `force_delete_branch`. Lance's
 //      create is explicitly two-phase, so this is the crash state OmniGraph's
@@ -379,13 +410,8 @@ async fn force_delete_branch_semantics() {
         "force_delete_branch should remove an existing branch ref"
     );
 
-    // (3) Quirk: force_delete on a fully-absent branch errors on the local
-    // store (worked around by TableStore::force_delete_branch).
-    assert!(
-        ds.force_delete_branch("never").await.is_err(),
-        "force_delete_branch on a fully-absent branch no longer errors — \
-         TableStore::force_delete_branch's NotFound tolerance can be simplified."
-    );
+    // (3) Force delete is idempotent even when both the ref and tree are absent.
+    ds.force_delete_branch("never").await.unwrap();
 
     // (4) Exact phase-1-only create state: create the shallow-cloned branch
     // dataset, then remove only its authoritative BranchContents ref. This is

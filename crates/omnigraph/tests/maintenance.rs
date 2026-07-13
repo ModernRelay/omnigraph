@@ -9,12 +9,12 @@ use std::time::Duration;
 
 use lance::Dataset;
 use lance::dataset::optimize::{CompactionOptions, compact_files};
+use omnigraph::IndexCoverage;
 use omnigraph::db::{
     CleanupPolicyOptions, Omnigraph, ReadTarget, RepairAction, RepairClassification, RepairOptions,
     SkipReason,
 };
 use omnigraph::loader::{LoadMode, load_jsonl};
-use omnigraph::table_store::{IndexCoverage, TableStore};
 
 use helpers::{
     MUTATION_QUERIES, TEST_DATA, TEST_SCHEMA, count_rows, count_rows_branch, init_and_load,
@@ -125,6 +125,13 @@ async fn optimize_after_load_then_again_is_idempotent() {
     // First pass may compact (load wrote real fragments).
     let _first = db.optimize().await.unwrap();
 
+    let commits_before = db.list_commits(None).await.unwrap();
+    let head_before = commits_before
+        .last()
+        .expect("loaded graph has a lineage head")
+        .graph_commit_id
+        .clone();
+
     // Second pass should be a no-op: already-compacted graph produces no
     // fragments_removed / fragments_added.
     let second = db.optimize().await.unwrap();
@@ -145,6 +152,21 @@ async fn optimize_after_load_then_again_is_idempotent() {
             s.table_key
         );
     }
+    let commits_after = db.list_commits(None).await.unwrap();
+    assert_eq!(
+        commits_after.len(),
+        commits_before.len(),
+        "steady-state Optimize must not manufacture graph lineage"
+    );
+    assert_eq!(
+        commits_after.last().unwrap().graph_commit_id,
+        head_before,
+        "steady-state Optimize must preserve the graph head"
+    );
+    assert!(
+        helpers::recovery::sidecar_operation_ids(dir.path()).is_empty(),
+        "steady-state Optimize must not arm a recovery sidecar"
+    );
 }
 
 /// RFC-013 step 2 + Phase 7 + Phase B: `optimize` compacts `__manifest`, which
@@ -152,8 +174,8 @@ async fn optimize_after_load_then_again_is_idempotent() {
 /// folded-in graph-lineage rows (`graph_commit` + `graph_head`). Graph lineage
 /// lives entirely in `__manifest` (Phase B retired the commit-graph datasets), so
 /// `__manifest` is the only internal table optimize compacts. After compaction
-/// `__manifest` sheds fragments, writes no recovery sidecar (a single atomic Lance
-/// commit — no HEAD-before-publish gap), and the graph stays coherent for
+/// `__manifest` sheds fragments and writes no recovery sidecar (it is read at
+/// HEAD and every config/reserve/rewrite step is content-preserving), and the graph stays coherent for
 /// subsequent reads + strict writes.
 #[tokio::test]
 async fn optimize_compacts_internal_tables() {
@@ -286,7 +308,7 @@ async fn optimize_clears_stale_auto_cleanup_and_preserves_versions() {
 }
 
 /// The same non-destructive guarantee on a DATA (node/edge) table, not just the
-/// internal tables. `optimize_one_table` runs `compact_files` / `optimize_indices`
+/// internal tables. `apply_optimize_table_effects` runs `compact_files` / `optimize_indices`
 /// with a default `CommitConfig` (`skip_auto_cleanup = false`); on an upgraded
 /// graph whose Person table still carries the pre-v7 `lance.auto_cleanup.*` config,
 /// those commits would fire Lance's version-GC hook and prune `__manifest`-pinned
@@ -401,7 +423,7 @@ node Doc {
         let snap = snapshot_main(&db).await.unwrap();
         let ds = snap.open("node:Doc").await.unwrap();
         assert!(
-            TableStore::has_unindexed_fragments(&ds).await.unwrap(),
+            ds.has_unindexed_fragments().await.unwrap(),
             "appended fragment should be unindexed before optimize"
         );
     }
@@ -413,13 +435,11 @@ node Doc {
     let snap = snapshot_main(&db).await.unwrap();
     let ds = snap.open("node:Doc").await.unwrap();
     assert!(
-        !TableStore::has_unindexed_fragments(&ds).await.unwrap(),
+        !ds.has_unindexed_fragments().await.unwrap(),
         "optimize must extend index coverage to all fragments"
     );
     assert_eq!(
-        TableStore::key_column_index_coverage(&ds, "rank")
-            .await
-            .unwrap(),
+        ds.index_coverage("rank").await.unwrap(),
         IndexCoverage::Indexed,
         "rank BTREE must cover all fragments after optimize"
     );
@@ -489,6 +509,13 @@ node Tag {\n    slug: String @key\n}\n";
     .await
     .unwrap();
 
+    let commits_before = db.list_commits(None).await.unwrap();
+    let head_before = commits_before
+        .last()
+        .expect("seeded graph has a lineage head")
+        .graph_commit_id
+        .clone();
+
     let stats = db
         .optimize()
         .await
@@ -513,6 +540,22 @@ node Tag {\n    slug: String @key\n}\n";
         doc.fragments_added
     );
     assert_eq!(tag.skipped, None, "non-blob table must not be skipped");
+    assert!(tag.committed, "plain table compaction must be published");
+
+    // Both productive tables share one graph visibility point. Physical
+    // __manifest compaction below may add Lance versions, so lineage is the
+    // stable counter for the public Optimize contract.
+    let commits_after = db.list_commits(None).await.unwrap();
+    assert_eq!(
+        commits_after.len(),
+        commits_before.len() + 1,
+        "one graph-wide Optimize must publish one lineage commit even when two tables move"
+    );
+    assert_eq!(
+        commits_after.last().unwrap().parent_commit_id.as_deref(),
+        Some(head_before.as_str()),
+        "the graph-wide Optimize commit must extend the prior head"
+    );
 
     // Every blob row survives the rewrite and stays readable.
     let count = count_rows(&db, "node:Doc").await;
@@ -1574,11 +1617,40 @@ async fn index_build_tolerates_null_vector_rows() {
     .await
     .expect("load rows with null embeddings");
 
-    // Must not abort: the untrainable vector column is deferred, the sibling
-    // BTREE on `n` still builds.
-    db.ensure_indices()
+    let before = snapshot_main(&db).await.unwrap();
+    let before_manifest_version = before.version();
+    let before_table_version = before.entry("node:Doc").unwrap().table_version;
+
+    // Must not abort: the untrainable vector column is deferred, while id,
+    // slug (FTS), and n (BTREE) are built together in one table transaction.
+    let pending = db
+        .ensure_indices()
         .await
         .expect("ensure_indices must not abort when a vector column has no trainable vectors yet");
+    assert_eq!(pending.len(), 1, "only the null vector index is pending");
+    assert_eq!(pending[0].table_key, "node:Doc");
+    assert_eq!(pending[0].column, "embedding");
+    assert_eq!(
+        pending[0].reason,
+        "column has no non-null vectors to train on yet"
+    );
+
+    let after = snapshot_main(&db).await.unwrap();
+    assert_eq!(
+        after.entry("node:Doc").unwrap().table_version,
+        before_table_version + 1,
+        "all buildable indexes for one table must land in one CreateIndex transaction"
+    );
+    assert_eq!(
+        after.version(),
+        before_manifest_version + 1,
+        "one reconciliation publishes exactly one graph commit"
+    );
+    let ds = after.open("node:Doc").await.unwrap();
+    assert!(ds.has_btree_index("id").await.unwrap());
+    assert!(ds.has_fts_index("slug").await.unwrap());
+    assert!(ds.has_btree_index("n").await.unwrap());
+    assert!(!ds.has_vector_index("embedding").await.unwrap());
 }
 
 // iss-848: `optimize` converges declared-but-unbuilt indexes. After an @index is
@@ -1613,9 +1685,7 @@ async fn optimize_materializes_index_declared_but_unbuilt() {
         let ds = snap.open("node:Doc").await.unwrap();
         assert!(
             matches!(
-                TableStore::key_column_index_coverage(&ds, "rank")
-                    .await
-                    .unwrap(),
+                ds.index_coverage("rank").await.unwrap(),
                 IndexCoverage::Degraded { .. }
             ),
             "rank must be unindexed after the deferred apply"
@@ -1627,10 +1697,11 @@ async fn optimize_materializes_index_declared_but_unbuilt() {
     // Postcondition: optimize's reconciler materialized the declared index.
     let snap = snapshot_main(&db).await.unwrap();
     let ds = snap.open("node:Doc").await.unwrap();
+    assert!(ds.has_btree_index("id").await.unwrap());
+    assert!(ds.has_fts_index("slug").await.unwrap());
+    assert!(ds.has_btree_index("rank").await.unwrap());
     assert_eq!(
-        TableStore::key_column_index_coverage(&ds, "rank")
-            .await
-            .unwrap(),
+        ds.index_coverage("rank").await.unwrap(),
         IndexCoverage::Indexed,
         "optimize must build the declared-but-unbuilt rank index"
     );
@@ -1671,9 +1742,7 @@ async fn optimize_materializes_index_after_type_rename() {
         let ds = snap.open("node:Item").await.unwrap();
         assert!(
             matches!(
-                TableStore::key_column_index_coverage(&ds, "rank")
-                    .await
-                    .unwrap(),
+                ds.index_coverage("rank").await.unwrap(),
                 IndexCoverage::Degraded { .. }
             ),
             "rank must be unindexed immediately after the rename"
@@ -1685,9 +1754,7 @@ async fn optimize_materializes_index_after_type_rename() {
     let snap = snapshot_main(&db).await.unwrap();
     let ds = snap.open("node:Item").await.unwrap();
     assert_eq!(
-        TableStore::key_column_index_coverage(&ds, "rank")
-            .await
-            .unwrap(),
+        ds.index_coverage("rank").await.unwrap(),
         IndexCoverage::Indexed,
         "optimize must build the renamed table's deferred rank index"
     );

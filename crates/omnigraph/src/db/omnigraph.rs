@@ -1,4 +1,4 @@
-use std::collections::{BTreeSet, HashMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::io::Write;
 use std::sync::Arc;
 
@@ -51,10 +51,9 @@ use super::manifest::{
 };
 use super::schema_state::{
     SCHEMA_SOURCE_FILENAME, load_or_bootstrap_schema_contract, load_validated_schema_contract,
-    read_accepted_schema_ir, read_schema_state_identity, recover_schema_state_files,
-    schema_ir_staging_uri, schema_ir_uri, schema_source_staging_uri, schema_source_uri,
-    schema_state_staging_uri, schema_state_uri, validate_schema_contract, write_schema_contract,
-    write_schema_contract_staging,
+    read_accepted_schema_ir, read_schema_state_identity, recover_schema_state_files, schema_ir_uri,
+    schema_source_staging_uri, schema_source_uri, schema_state_uri, validate_schema_contract,
+    write_schema_contract, write_schema_contract_staging,
 };
 use super::{
     ReadTarget, ResolvedTarget, SCHEMA_APPLY_LOCK_BRANCH, SnapshotId, is_internal_system_branch,
@@ -484,10 +483,10 @@ impl Omnigraph {
         // consumers (NDJSON export, `commit list`, schema show) shouldn't
         // trigger object-store mutations: they may run with read-only
         // credentials, and silent open-time writes are surprising. Both
-        // sweeps' work is recoverable on the next ReadWrite open, so
-        // skipping under ReadOnly doesn't lose any safety guarantees —
-        // the manifest pin is the consistent snapshot regardless of
-        // drift on the per-table side or leftover schema-staging files.
+        // sweeps' work is recoverable on the next ReadWrite open. ReadOnly
+        // still performs the non-mutating coherence proof below: an exact
+        // SchemaApply manifest outcome cannot be served with the old schema
+        // contract merely because promotion is pending.
         if matches!(mode, OpenMode::ReadWrite) {
             // Schema staging is itself mutable recovery state. Hold the shared
             // schema gate across BOTH its file pre-pass and the complete Full
@@ -512,6 +511,13 @@ impl Omnigraph {
                 write_queue.as_ref(),
             )
             .await?;
+        } else {
+            // ReadOnly performs no repair, but it must not expose a manifest
+            // that already contains a fixed SchemaApply outcome with the old
+            // live schema contract. Exact v7 intents can prove coherence from
+            // lineage + schema identity; legacy intents fail closed until a
+            // read-write open resolves them.
+            crate::db::manifest::ensure_read_only_schema_coherent(&root, storage.as_ref()).await?;
         }
         crate::failpoints::maybe_fail(crate::failpoints::names::OPEN_BEFORE_SCHEMA_CONTRACT_READ)?;
         // Read _schema.pg (post-recovery — may have just been renamed in).
@@ -782,21 +788,6 @@ impl Omnigraph {
     /// (the trait's `stage_*` + `commit_staged` pair is the only way to
     /// land a write).
     pub(crate) fn storage(&self) -> &dyn crate::storage_layer::TableStorage {
-        &self.table_store
-    }
-
-    /// Inline-commit residual surface (`create_vector_index`) — the sole
-    /// write Lance cannot yet express as a stage-then-commit pair (segment
-    /// commit needs `build_index_metadata_from_segments`, Lance #6666).
-    /// Deliberately separate from [`Self::storage`] so the default storage
-    /// surface is staged-only and a new writer cannot couple "write bytes" with
-    /// "advance HEAD" by reaching for `db.storage()`. Only the vector-index
-    /// build uses this accessor — delete migrated to the staged path
-    /// (`stage_delete`) in MR-A. See
-    /// `crate::storage_layer::InlineCommitResidual` for the per-method blocker.
-    pub(crate) fn storage_inline_residual(
-        &self,
-    ) -> &dyn crate::storage_layer::InlineCommitResidual {
         &self.table_store
     }
 
@@ -1113,6 +1104,7 @@ impl Omnigraph {
     }
 
     /// Return an immutable Snapshot from the known manifest state. No storage I/O.
+    #[cfg(test)]
     pub(crate) async fn snapshot(&self) -> Snapshot {
         self.coordinator.read().await.snapshot()
     }
@@ -1570,7 +1562,17 @@ impl Omnigraph {
         target: impl Into<ReadTarget>,
     ) -> Result<ResolvedTarget> {
         self.ensure_schema_state_valid().await?;
-        let target = target.into();
+        self.resolve_target_after_schema_validation(target.into())
+            .await
+    }
+
+    /// Resolve a target after the caller has already validated/captured the
+    /// accepted schema contract. Kept separate so coherent read capture can
+    /// build one operation-local catalog and avoid a second full contract read.
+    async fn resolve_target_after_schema_validation(
+        &self,
+        target: ReadTarget,
+    ) -> Result<ResolvedTarget> {
         let mut resolved = self.resolve_target_inner(&target).await?;
         // Attach the read caches (shared Session + held-handle cache) for live
         // Branch reads so table opens reuse handles (0 IO on a warm repeat).
@@ -1584,6 +1586,70 @@ impl Omnigraph {
                 .set_read_caches(Arc::clone(&self.read_caches));
         }
         Ok(resolved)
+    }
+
+    /// Capture one live/historical target snapshot and the accepted immutable
+    /// catalog under the same process-local schema-publication gate.
+    ///
+    /// The catalog is rebuilt from the accepted on-disk contract rather than
+    /// read from this handle's ArcSwap: a handle opened before another handle's
+    /// SchemaApply intentionally has a stale warm catalog until refresh.
+    pub(crate) async fn capture_read_view(
+        &self,
+        target: impl Into<ReadTarget>,
+    ) -> Result<(ResolvedTarget, Arc<Catalog>)> {
+        let _schema_guard = self
+            .write_queue()
+            .acquire(&crate::db::manifest::schema_apply_serial_queue_key())
+            .await;
+        let catalog = self.load_accepted_catalog_with_schema_gate_held().await?;
+        let resolved = self
+            .resolve_target_after_schema_validation(target.into())
+            .await?;
+        Ok((resolved, catalog))
+    }
+
+    pub(crate) async fn capture_current_read_view(&self) -> Result<(ResolvedTarget, Arc<Catalog>)> {
+        let _schema_guard = self
+            .write_queue()
+            .acquire(&crate::db::manifest::schema_apply_serial_queue_key())
+            .await;
+        let current_branch = self
+            .coordinator
+            .read()
+            .await
+            .current_branch()
+            .unwrap_or("main")
+            .to_string();
+        let catalog = self.load_accepted_catalog_with_schema_gate_held().await?;
+        let resolved = self
+            .resolve_target_after_schema_validation(ReadTarget::branch(current_branch))
+            .await?;
+        Ok((resolved, catalog))
+    }
+
+    pub(crate) async fn capture_historical_read_view(
+        &self,
+        version: u64,
+    ) -> Result<(Snapshot, Arc<Catalog>)> {
+        let _schema_guard = self
+            .write_queue()
+            .acquire(&crate::db::manifest::schema_apply_serial_queue_key())
+            .await;
+        let catalog = self.load_accepted_catalog_with_schema_gate_held().await?;
+        let branch = self
+            .coordinator
+            .read()
+            .await
+            .current_branch()
+            .map(str::to_string);
+        let snapshot = crate::db::manifest::ManifestCoordinator::snapshot_at(
+            self.uri(),
+            branch.as_deref(),
+            version,
+        )
+        .await?;
+        Ok((snapshot, catalog))
     }
 
     /// Resolve a read target to its snapshot, without attaching read caches.
@@ -1826,8 +1892,7 @@ impl Omnigraph {
     /// let bytes = blob.read().await?;
     /// ```
     pub async fn read_blob(&self, type_name: &str, id: &str, property: &str) -> Result<BlobFile> {
-        self.ensure_schema_state_valid().await?;
-        let catalog = self.catalog();
+        let (resolved, catalog) = self.capture_current_read_view().await?;
         let node_type = catalog
             .node_types
             .get(type_name)
@@ -1839,11 +1904,10 @@ impl Omnigraph {
             )));
         }
 
-        let snapshot = self.snapshot().await;
         let table_key = format!("node:{}", type_name);
         let handle = self
             .storage()
-            .open_snapshot_at_table(&snapshot, &table_key)
+            .open_snapshot_at_table(&resolved.snapshot, &table_key)
             .await?;
 
         let filter_sql = format!("id = '{}'", id.replace('\'', "''"));

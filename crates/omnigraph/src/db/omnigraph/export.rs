@@ -44,9 +44,16 @@ pub(super) async fn export_jsonl_to_writer<W: Write>(
     table_keys: &[String],
     writer: &mut W,
 ) -> Result<()> {
-    db.ensure_schema_state_valid().await?;
-    let snapshot = db.snapshot_of(ReadTarget::branch(branch)).await?;
-    export_snapshot_jsonl_to_writer(db, &snapshot, type_names, table_keys, writer).await
+    let (resolved, catalog) = db.capture_read_view(ReadTarget::branch(branch)).await?;
+    export_snapshot_jsonl_to_writer(
+        db,
+        &resolved.snapshot,
+        catalog.as_ref(),
+        type_names,
+        table_keys,
+        writer,
+    )
+    .await
 }
 
 async fn entity_from_snapshot(
@@ -77,13 +84,14 @@ async fn entity_from_snapshot(
 async fn export_snapshot_jsonl_to_writer<W: Write>(
     db: &Omnigraph,
     snapshot: &Snapshot,
+    catalog: &Catalog,
     type_names: &[String],
     table_keys: &[String],
     writer: &mut W,
 ) -> Result<()> {
     let selected_tables = export_table_keys(snapshot, type_names, table_keys)?;
     for table_key in selected_tables {
-        export_table_to_writer(db, snapshot, &table_key, writer).await?;
+        export_table_to_writer(db, snapshot, catalog, &table_key, writer).await?;
     }
     Ok(())
 }
@@ -139,6 +147,7 @@ fn export_table_keys(
 async fn export_table_to_writer<W: Write>(
     db: &Omnigraph,
     snapshot: &Snapshot,
+    catalog: &Catalog,
     table_key: &str,
     writer: &mut W,
 ) -> Result<()> {
@@ -147,12 +156,11 @@ async fn export_table_to_writer<W: Write>(
         .open_snapshot_at_table(snapshot, table_key)
         .await?;
     let ordering = Some(vec![ColumnOrdering::asc_nulls_last("id".to_string())]);
-    let catalog = db.catalog();
-    let blob_properties = blob_properties_for_table_key(&catalog, table_key)?;
+    let blob_properties = blob_properties_for_table_key(catalog, table_key)?;
 
     if blob_properties.is_empty() {
         for batch in db.storage().scan(&ds, None, None, ordering).await? {
-            write_export_rows_from_batch(db, table_key, &batch, None, writer)?;
+            write_export_rows_from_batch(catalog, table_key, &batch, None, writer)?;
         }
         return Ok(());
     }
@@ -182,7 +190,7 @@ async fn export_table_to_writer<W: Write>(
         // materialization sits outside that surface).
         let blob_values =
             export_blob_values(ds.dataset(), &batch, &row_ids, blob_properties).await?;
-        write_export_rows_from_batch(db, table_key, &batch, Some(&blob_values), writer)?;
+        write_export_rows_from_batch(catalog, table_key, &batch, Some(&blob_values), writer)?;
     }
     Ok(())
 }
@@ -213,13 +221,12 @@ async fn export_blob_values(
 }
 
 fn write_export_rows_from_batch<W: Write>(
-    db: &Omnigraph,
+    catalog: &Catalog,
     table_key: &str,
     batch: &RecordBatch,
     blob_values: Option<&HashMap<String, Vec<Option<String>>>>,
     writer: &mut W,
 ) -> Result<()> {
-    let catalog = db.catalog();
     if let Some(type_name) = table_key.strip_prefix("node:") {
         let node_type = catalog
             .node_types

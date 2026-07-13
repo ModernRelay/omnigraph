@@ -59,9 +59,10 @@ tokio = { workspace = true }
 lance-namespace-impls = { workspace = true }
 # test-util gates IoStats.requests + assert_io_eq! (failure diagnostics only); dev-dep,
 # so production builds (which exclude dev-deps) never see it.
-lance-io = { git = "https://github.com/lance-format/lance", rev = "f24e42c11a742581365e1cbe17c906ea2dac1bc6", features = ["test-util"] }
+lance-io = { git = "https://github.com/lance-format/lance", rev = "1aec14652dcbace23ac277fa8ced35000bea0c40", features = ["test-util"] }
 serial_test = "3"
 proptest = "1"
+syn = { version = "2", features = ["full", "visit"] }
 # benches/scenarios.rs only: wait4/rusage peak-RSS + setrlimit memory caps.
 libc = "0.2"
 

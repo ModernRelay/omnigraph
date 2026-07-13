@@ -31,21 +31,21 @@ datafusion-common = "53"
 datafusion-expr = "53"
 datafusion-functions-aggregate = "53"
 
-# Lance 9.0.0-beta.15 (tag v9.0.0-beta.15 -> rev f24e42c1): the 9.x betas are
+# Lance 9.0.0-beta.21 (tag v9.0.0-beta.21 -> rev 1aec1465): the 9.x betas are
 # git-tags only (crates.io carries <= 8.0.0). rev-pinned for reproducibility.
 # Carries lance#7480 (rowid overlap, closes #7444 -> vendor pin retired) and
 # lance#7320 (BTREE segment-merge, closes #7230). See docs/dev/lance.md.
-lance = { git = "https://github.com/lance-format/lance", rev = "f24e42c11a742581365e1cbe17c906ea2dac1bc6", default-features = false, features = ["aws"] }
-lance-core = { git = "https://github.com/lance-format/lance", rev = "f24e42c11a742581365e1cbe17c906ea2dac1bc6" }
+lance = { git = "https://github.com/lance-format/lance", rev = "1aec14652dcbace23ac277fa8ced35000bea0c40", default-features = false, features = ["aws"] }
+lance-core = { git = "https://github.com/lance-format/lance", rev = "1aec14652dcbace23ac277fa8ced35000bea0c40" }
 # RowAddrTreeMap moved from lance-core::utils::mask to the new lance-select crate in 9.x.
-lance-select = { git = "https://github.com/lance-format/lance", rev = "f24e42c11a742581365e1cbe17c906ea2dac1bc6" }
-lance-datafusion = { git = "https://github.com/lance-format/lance", rev = "f24e42c11a742581365e1cbe17c906ea2dac1bc6" }
-lance-file = { git = "https://github.com/lance-format/lance", rev = "f24e42c11a742581365e1cbe17c906ea2dac1bc6" }
-lance-index = { git = "https://github.com/lance-format/lance", rev = "f24e42c11a742581365e1cbe17c906ea2dac1bc6" }
-lance-linalg = { git = "https://github.com/lance-format/lance", rev = "f24e42c11a742581365e1cbe17c906ea2dac1bc6" }
-lance-namespace = { git = "https://github.com/lance-format/lance", rev = "f24e42c11a742581365e1cbe17c906ea2dac1bc6" }
-lance-namespace-impls = { git = "https://github.com/lance-format/lance", rev = "f24e42c11a742581365e1cbe17c906ea2dac1bc6" }
-lance-table = { git = "https://github.com/lance-format/lance", rev = "f24e42c11a742581365e1cbe17c906ea2dac1bc6" }
+lance-select = { git = "https://github.com/lance-format/lance", rev = "1aec14652dcbace23ac277fa8ced35000bea0c40" }
+lance-datafusion = { git = "https://github.com/lance-format/lance", rev = "1aec14652dcbace23ac277fa8ced35000bea0c40" }
+lance-file = { git = "https://github.com/lance-format/lance", rev = "1aec14652dcbace23ac277fa8ced35000bea0c40" }
+lance-index = { git = "https://github.com/lance-format/lance", rev = "1aec14652dcbace23ac277fa8ced35000bea0c40" }
+lance-linalg = { git = "https://github.com/lance-format/lance", rev = "1aec14652dcbace23ac277fa8ced35000bea0c40" }
+lance-namespace = { git = "https://github.com/lance-format/lance", rev = "1aec14652dcbace23ac277fa8ced35000bea0c40" }
+lance-namespace-impls = { git = "https://github.com/lance-format/lance", rev = "1aec14652dcbace23ac277fa8ced35000bea0c40" }
+lance-table = { git = "https://github.com/lance-format/lance", rev = "1aec14652dcbace23ac277fa8ced35000bea0c40" }
 
 ulid = "1"
 futures = "0.3"
@@ -92,4 +92,3 @@ opt-level = 2
 lto = "thin"
 codegen-units = 16
 strip = true
-

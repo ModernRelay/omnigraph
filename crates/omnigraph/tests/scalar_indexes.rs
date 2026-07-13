@@ -1,7 +1,7 @@
 //! Coverage for `build_indices_on_dataset_for_catalog`'s per-property index
 //! dispatch: which scalar/vector index each `@index`/`@key` column gets.
 //!
-//! The observable signal is `TableStore::key_column_index_coverage`, which
+//! The observable signal is `SnapshotTable::index_coverage`, which
 //! reports `Indexed` only when a BTREE covers the column (the same helper the
 //! traversal chooser uses). Enums and orderable scalars must get a BTREE so
 //! `=`/range/IN/IS NULL are index-accelerated; free-text Strings keep FTS
@@ -11,7 +11,7 @@ mod helpers;
 
 use omnigraph::db::Omnigraph;
 use omnigraph::loader::{LoadMode, load_jsonl};
-use omnigraph::table_store::{IndexCoverage, TableStore};
+use omnigraph::IndexCoverage;
 
 use helpers::*;
 
@@ -47,7 +47,7 @@ async fn node_scalar_and_enum_index_columns_get_btree() {
     let ds = snap.open("node:Item").await.unwrap();
 
     for col in ["status", "published", "rank"] {
-        let cov = TableStore::key_column_index_coverage(&ds, col).await.unwrap();
+        let cov = ds.index_coverage(col).await.unwrap();
         assert_eq!(
             cov,
             IndexCoverage::Indexed,
@@ -56,18 +56,14 @@ async fn node_scalar_and_enum_index_columns_get_btree() {
     }
 
     // Free-text String @index -> FTS, which is not a BTREE -> Degraded.
-    let title_cov = TableStore::key_column_index_coverage(&ds, "title")
-        .await
-        .unwrap();
+    let title_cov = ds.index_coverage("title").await.unwrap();
     assert!(
         matches!(title_cov, IndexCoverage::Degraded { .. }),
         "free-text String @index should keep FTS (no BTREE), got {title_cov:?}"
     );
 
     // No @index annotation -> no scalar index at all -> Degraded.
-    let note_cov = TableStore::key_column_index_coverage(&ds, "note")
-        .await
-        .unwrap();
+    let note_cov = ds.index_coverage("note").await.unwrap();
     assert!(
         matches!(note_cov, IndexCoverage::Degraded { .. }),
         "un-annotated column should have no scalar index, got {note_cov:?}"

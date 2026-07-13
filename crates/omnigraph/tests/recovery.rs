@@ -18,7 +18,7 @@ use lance::Dataset;
 use omnigraph::db::Omnigraph;
 
 mod helpers;
-use helpers::test_session;
+use helpers::snapshot_main;
 use helpers::recovery::{RecoveryExpectation, TableExpectation, assert_post_recovery_invariants};
 
 const TEST_SCHEMA: &str = include_str!("fixtures/test.pg");
@@ -385,6 +385,69 @@ async fn read_only_open_skips_recovery_sweep() {
         list_recovery_dir(dir.path()).contains(&"01H000000000000000000000RO.json".to_string()),
         "ReadOnly open must leave the sidecar untouched"
     );
+}
+
+#[tokio::test]
+async fn read_only_open_accepts_only_completed_coherent_v5_schema_apply_sidecar() {
+    let dir = tempfile::tempdir().unwrap();
+    let uri = dir.path().to_str().unwrap();
+    let db = Omnigraph::init(uri, TEST_SCHEMA).await.unwrap();
+    drop(db);
+
+    let schema_state: serde_json::Value = serde_json::from_str(
+        &std::fs::read_to_string(dir.path().join("__schema_state.json")).unwrap(),
+    )
+    .unwrap();
+    let live_hash = schema_state["schema_ir_hash"].as_str().unwrap();
+    let operation_id = "01H000000000000000000000V5";
+    let sidecar_json = |published: bool, target_hash: &str| {
+        format!(
+            r#"{{
+                "schema_version": 5,
+                "operation_id": "{operation_id}",
+                "started_at": "0",
+                "branch": null,
+                "actor_id": null,
+                "writer_kind": "SchemaApply",
+                "tables": [],
+                "schema_apply_manifest_published": {published},
+                "schema_apply_target_schema_ir_hash": "{target_hash}"
+            }}"#,
+        )
+    };
+
+    // v5 writes the marker only after its manifest publish. If the target
+    // identity is also live, only audit/delete cleanup remains and read-only
+    // open can prove that its manifest/catalog pair is coherent.
+    write_sidecar_file(
+        dir.path(),
+        operation_id,
+        &sidecar_json(true, live_hash),
+    );
+    let read_only = Omnigraph::open_read_only(uri).await.unwrap();
+    drop(read_only);
+    assert!(
+        list_recovery_dir(dir.path()).contains(&format!("{operation_id}.json")),
+        "read-only open must not delete completed v5 residue"
+    );
+
+    // Without the published marker, even a matching target may be an active
+    // recovery that still needs its manifest delta; read-only must fail closed.
+    write_sidecar_file(
+        dir.path(),
+        operation_id,
+        &sidecar_json(false, live_hash),
+    );
+    assert!(Omnigraph::open_read_only(uri).await.is_err());
+
+    // A published marker paired with a non-live target is the torn window and
+    // remains unavailable until read-write recovery completes promotion.
+    write_sidecar_file(
+        dir.path(),
+        operation_id,
+        &sidecar_json(true, "not-the-live-schema"),
+    );
+    assert!(Omnigraph::open_read_only(uri).await.is_err());
 }
 
 #[tokio::test]
@@ -1150,8 +1213,17 @@ async fn recovery_ensure_indices_steady_state_no_sidecar() {
     db.ensure_indices().await.unwrap();
     drop(db);
 
-    let mut db = Omnigraph::open(uri).await.unwrap();
+    let db = Omnigraph::open(uri).await.unwrap();
+    let before = snapshot_main(&db).await.unwrap();
     db.ensure_indices().await.unwrap();
+    let after = snapshot_main(&db).await.unwrap();
+    assert_eq!(after.version(), before.version());
+    for key in ["node:Person", "node:Company", "edge:Knows", "edge:WorksAt"] {
+        assert_eq!(
+            after.entry(key).unwrap().table_version,
+            before.entry(key).unwrap().table_version
+        );
+    }
     assert!(
         list_recovery_dir(dir.path()).is_empty(),
         "steady-state ensure_indices must not leave a sidecar (no tables need work)"
@@ -1180,17 +1252,35 @@ async fn recovery_ensure_indices_steady_state_no_sidecar() {
 async fn recovery_ensure_indices_handles_empty_tables() {
     let dir = tempfile::tempdir().unwrap();
     let uri = dir.path().to_str().unwrap();
-    let mut db = Omnigraph::init(uri, TEST_SCHEMA).await.unwrap();
+    let db = Omnigraph::init(uri, TEST_SCHEMA).await.unwrap();
     // Don't load any data — every table is empty.
+    let before = snapshot_main(&db).await.unwrap();
     db.ensure_indices().await.unwrap();
+    let after = snapshot_main(&db).await.unwrap();
+    assert_eq!(after.version(), before.version());
+    for key in ["node:Person", "node:Company", "edge:Knows", "edge:WorksAt"] {
+        assert_eq!(
+            after.entry(key).unwrap().table_version,
+            before.entry(key).unwrap().table_version
+        );
+    }
     assert!(
         list_recovery_dir(dir.path()).is_empty(),
         "ensure_indices on an all-empty graph must not leave a sidecar"
     );
     // Reopen + ensure_indices — still steady state, still no sidecar.
     drop(db);
-    let mut db = Omnigraph::open(uri).await.unwrap();
+    let db = Omnigraph::open(uri).await.unwrap();
+    let before = snapshot_main(&db).await.unwrap();
     db.ensure_indices().await.unwrap();
+    let after = snapshot_main(&db).await.unwrap();
+    assert_eq!(after.version(), before.version());
+    for key in ["node:Person", "node:Company", "edge:Knows", "edge:WorksAt"] {
+        assert_eq!(
+            after.entry(key).unwrap().table_version,
+            before.entry(key).unwrap().table_version
+        );
+    }
     assert!(
         list_recovery_dir(dir.path()).is_empty(),
         "second ensure_indices on an all-empty graph must also not leave a sidecar"
@@ -1394,8 +1484,6 @@ async fn recovery_multi_sidecar_requires_fresh_snapshot_for_correctness() {
 #[tokio::test]
 async fn recovery_classifies_feature_branch_sidecar_against_feature_branch() {
     use omnigraph::loader::{LoadMode, load_jsonl};
-    use omnigraph::table_store::TableStore;
-
     let dir = tempfile::tempdir().unwrap();
     let uri = dir.path().to_str().unwrap();
 
@@ -1440,11 +1528,7 @@ async fn recovery_classifies_feature_branch_sidecar_against_feature_branch() {
     // Bypass the manifest: append directly to Person's Lance HEAD on the
     // feature branch ref to advance HEAD past v_pin.
     let person_uri = node_table_uri(uri, "Person");
-    let store = TableStore::new(uri, test_session());
-    let mut ds = store
-        .open_dataset_head(&person_uri, feature_branch_name.as_deref())
-        .await
-        .unwrap();
+    let mut ds = helpers::open_dataset_head(&person_uri, feature_branch_name.as_deref()).await;
     helpers::lance_append_inline(&mut ds, person_batch(&[("carol-id", "carol", Some(40))])).await;
     let v_head = ds.version().version;
     assert_eq!(v_head, v_pin + 1, "append must advance HEAD by 1");
@@ -1510,8 +1594,6 @@ async fn recovery_classifies_feature_branch_sidecar_against_feature_branch() {
 #[tokio::test]
 async fn recovery_rolls_back_feature_branch_sidecar_against_feature_branch() {
     use omnigraph::loader::{LoadMode, load_jsonl};
-    use omnigraph::table_store::TableStore;
-
     let dir = tempfile::tempdir().unwrap();
     let uri = dir.path().to_str().unwrap();
 
@@ -1555,11 +1637,7 @@ async fn recovery_rolls_back_feature_branch_sidecar_against_feature_branch() {
     // Bypass the manifest: append on the feature ref to advance HEAD past
     // the manifest pin.
     let person_uri = node_table_uri(uri, "Person");
-    let store = TableStore::new(uri, test_session());
-    let mut ds = store
-        .open_dataset_head(&person_uri, feature_branch_name.as_deref())
-        .await
-        .unwrap();
+    let mut ds = helpers::open_dataset_head(&person_uri, feature_branch_name.as_deref()).await;
     helpers::lance_append_inline(&mut ds, person_batch(&[("dave-id", "dave", Some(50))])).await;
     let v_head = ds.version().version;
     assert_eq!(v_head, v_pin + 1);
@@ -1614,10 +1692,7 @@ async fn recovery_rolls_back_feature_branch_sidecar_against_feature_branch() {
     .unwrap();
 
     // Lance HEAD on the feature ref must have advanced (real restore ran).
-    let post = store
-        .open_dataset_head(&person_uri, feature_branch_name.as_deref())
-        .await
-        .unwrap();
+    let post = helpers::open_dataset_head(&person_uri, feature_branch_name.as_deref()).await;
     assert!(
         post.version().version > v_head,
         "real restore must have appended a commit on feature; v_head={}, post={}",

@@ -90,7 +90,7 @@ pub(crate) struct PublishedSnapshot {
     pub _snapshot_id: SnapshotId,
 }
 
-pub struct GraphCoordinator {
+pub(crate) struct GraphCoordinator {
     root_uri: String,
     storage: Arc<dyn StorageAdapter>,
     manifest: ManifestCoordinator,
@@ -99,7 +99,7 @@ pub struct GraphCoordinator {
 }
 
 impl GraphCoordinator {
-    pub async fn init(
+    pub(crate) async fn init(
         root_uri: &str,
         catalog: &Catalog,
         storage: Arc<dyn StorageAdapter>,
@@ -234,7 +234,7 @@ impl GraphCoordinator {
             })
     }
 
-    pub async fn branch_create(&mut self, name: &str) -> Result<()> {
+    pub(crate) async fn branch_create(&mut self, name: &str) -> Result<()> {
         let branch = normalize_branch_name(name)?
             .ok_or_else(|| OmniError::manifest("cannot create branch 'main'".to_string()))?;
 
@@ -245,7 +245,7 @@ impl GraphCoordinator {
         self.manifest.create_branch(&branch).await
     }
 
-    pub async fn branch_delete(&mut self, name: &str) -> Result<()> {
+    pub(crate) async fn branch_delete(&mut self, name: &str) -> Result<()> {
         let branch = normalize_branch_name(name)?
             .ok_or_else(|| OmniError::manifest("cannot delete branch 'main'".to_string()))?;
         if self.current_branch() == Some(branch.as_str()) {
@@ -361,6 +361,7 @@ impl GraphCoordinator {
             .map(|id| id.map(SnapshotId::new))
     }
 
+    #[cfg(test)]
     pub(crate) async fn commit_updates_with_actor(
         &mut self,
         updates: &[SubTableUpdate],
@@ -383,15 +384,6 @@ impl GraphCoordinator {
     ) -> Result<PublishedSnapshot> {
         let changes = updates_to_changes(updates);
         self.commit_changes_with_actor_with_expected(&changes, expected_table_versions, actor_id)
-            .await
-    }
-
-    pub(crate) async fn commit_changes_with_actor(
-        &mut self,
-        changes: &[ManifestChange],
-        actor_id: Option<&str>,
-    ) -> Result<PublishedSnapshot> {
-        self.commit_changes_with_actor_with_expected(changes, &HashMap::new(), actor_id)
             .await
     }
 
