@@ -551,18 +551,21 @@ able to enumerate every adapter and every entry point that invokes it.
 - Readers retain schema-v6 EnsureIndices sidecars under their original loose
   classification, fixed rollback id, and durable rollback-audit semantics. A v6
   file is a compatibility input, never reinterpreted as a v8 ownership proof.
-- Optimize retains its legacy loose effect adapter. Its synchronous overlap
-  barrier is two-stage: a broad entry probe, then a relist under main's
-  process-local branch-writer gate that rejects every main-target sidecar plus
-  graph-global SchemaApply before HEAD inspection, drift classification, or its
-  own recovery arm. The gate remains held through internally parallel table
-  effects/publishes because every published table pointer advances shared
-  `graph_head:main`, and through final physical `__manifest` compaction so a new
-  main intent cannot arm before raw manifest movement finishes. This coarse
-  legacy-adapter safety cost makes same-process sidecar-enrolled main writers
-  wait for the entire graph-wide Optimize, while Optimize's own table tasks stay
-  parallel. This is not the future exact Optimize adapter, a universal mutex for
-  every main publisher, or a distributed fence.
+- Optimize now uses one graph-wide visibility envelope while retaining legacy
+  schema-v2 loose effect provenance. After its broad entry probe it acquires
+  schema → main branch → every accepted-catalog table gate, loads one
+  operation-local accepted catalog, relists recovery, and plans productive work
+  from a fresh snapshot. One multi-pin sidecar covers every productive table;
+  physical effects remain bounded-parallel, then one monotonic batch CAS publishes
+  every still-needed pointer and one lineage commit. Maintenance-class monotonicity
+  is load-bearing: a current pointer already at or beyond an achieved version is
+  omitted, not rejected by strict graph-head/read-set OCC. Post-arm failure leaves
+  the shared sidecar and returns `RecoveryRequired`; v2 Full recovery rolls a
+  complete effect set forward in one batch or compensates a partial set. Main stays
+  held through final physical `__manifest` compaction. This is not the future exact
+  Optimize adapter: the v2 reader has no transaction/authority/fixed-lineage proof,
+  remains inside the single-writer-process recovery boundary, and is not a
+  distributed fence.
 - Logical operations never fail because a derived index is absent or behind.
 - Physical-only internal-table maintenance remains the exception in Section 8.
 
@@ -801,9 +804,11 @@ Implementation proceeds in this order:
    > upgrading their semantics. EnsureIndices now uses schema-v8 exact authority,
    > one mixed CreateIndex transaction per table, fixed lineage/delta, exact
    > first-touch ownership, and retains the schema-v6 compatibility reader.
-   > Optimize remains on its legacy writer-specific path. MemWAL is the supported,
-   > strategic substrate selected by RFC-026; its separate fold enrollment remains
-   > owned by that RFC rather than this EnsureIndices slice.
+   > Optimize now has one graph-wide recovery/visibility envelope: one schema-v2
+   > multi-pin sidecar, bounded-parallel physical effects, and one maintenance-class
+   > monotonic batch publish. Its exact provenance/authority conversion remains the
+   > final adapter slice. MemWAL is the supported, strategic substrate selected by
+   > RFC-026; its separate fold enrollment remains owned by that RFC.
 
    > **Branch-control/cleanup slice (2026-07-11):** native graph-branch create
    > and delete now use the §7 authority classifier, including pre-clone name
@@ -816,8 +821,9 @@ Implementation proceeds in this order:
    > first table GC.
 3. Convert mutation/load, branch merge, schema apply/migration, data-table optimize,
    and graph-visible index work one adapter at a time. Mutation/load, branch merge,
-   SchemaApply, and EnsureIndices are complete as of 2026-07-13; Optimize remains
-   on its documented legacy adapter.
+   SchemaApply, and EnsureIndices are exact as of 2026-07-13. Optimize has one
+   graph-wide visibility envelope but retains schema-v2 loose recovery; exact
+   provenance/authority is its remaining adapter work.
 4. Add static or runtime enumeration proving no graph-visible entry point bypasses the
    coordinator.
 5. Delete superseded writer-specific orchestration only after its crash and
@@ -895,8 +901,12 @@ writers.
   loss, exact confirmation, first-touch sidecar ordering/identity, partial-Phase-B
   rollback, confirmed roll-forward, and foreign/buried winner refusal. Retain a
   frozen schema-v6 compatibility fixture.
-- Optimize: zero, one, and several Lance commits, including monotonic publish and
-  retryable physical contention; it remains the legacy adapter.
+- Optimize: zero, one, and several Lance commits; two productive tables become
+  visible through one lineage/manifest CAS; a complete multi-table effect set
+  rolls forward together; a partial set exposes no pointer and compensates under
+  one v2 sidecar; monotonic publish, retryable physical contention, no-work/no-sidecar,
+  lost acknowledgement after the manifest CAS, pending-only vector exclusion, and
+  history-flat manifest cost remain pinned. Exact provenance remains outstanding.
 - MemWAL fold (supported strategic substrate; enrollment owned by RFC-026):
   merged-generation conflict and every fold crash boundary.
 - Native graph branch control: invalid name before clone; live path-prefix

@@ -9,9 +9,9 @@
 //!
 //! * `optimize_all_tables` — Lance `compact_files` on every table. Rewrites
 //!   small fragments into fewer large ones, then **publishes the compacted
-//!   version to the `__manifest`** so the manifest's `table_version` tracks the
-//!   compacted Lance HEAD (reads pin the manifest version, so without the
-//!   publish compaction would be invisible to readers and would break the
+//!   versions together in one `__manifest` batch** so each `table_version`
+//!   tracks the compacted Lance HEAD (reads pin the manifest version, so without
+//!   the publish compaction would be invisible to readers and would break the
 //!   HEAD-vs-manifest precondition of schema apply / strict writes). Compaction
 //!   is content-preserving (Lance `Operation::Rewrite` "reorganizes data
 //!   without semantic modification"), so old fragments remain reachable via
@@ -173,10 +173,35 @@ pub struct TableCleanupStats {
     pub error: Option<String>,
 }
 
-/// Run Lance `compact_files` on every node + edge table on `main`, publishing
-/// each compacted table's new version to the `__manifest`. Tables run in
-/// parallel (bounded concurrency); each is fault-isolated only at the Lance
-/// level — a publish error is propagated (the recovery sidecar covers it).
+struct OptimizeTableTask {
+    table_key: String,
+    full_path: String,
+    expected_version: u64,
+}
+
+struct PreparedOptimizeTable {
+    table_key: String,
+    full_path: String,
+    expected_version: u64,
+    initial_snapshot: crate::storage_layer::SnapshotHandle,
+}
+
+enum OptimizePreparation {
+    Work(PreparedOptimizeTable),
+    Stat(TableOptimizeStats),
+}
+
+struct OptimizeEffectOutcome {
+    stat: TableOptimizeStats,
+    update: Option<crate::db::SubTableUpdate>,
+}
+
+/// Run Lance maintenance across every node + edge table on `main` under one
+/// graph visibility envelope. Physical table work remains bounded-parallel,
+/// but every productive table shares one recovery sidecar and one monotonic
+/// manifest batch publish, so one public Optimize produces at most one graph
+/// commit. The final physical `__manifest` compaction remains outside that
+/// graph-visible envelope because the internal table is read directly at HEAD.
 pub async fn optimize_all_tables(db: &Omnigraph) -> Result<Vec<TableOptimizeStats>> {
     db.ensure_schema_state_valid().await?;
     db.ensure_schema_apply_idle("optimize").await?;
@@ -203,61 +228,176 @@ pub async fn optimize_all_tables(db: &Omnigraph) -> Result<Vec<TableOptimizeStat
         crate::failpoints::names::OPTIMIZE_POST_RECOVERY_CHECK_PRE_MAIN_GATE,
     )?;
 
-    // Optimize publishes each changed table pointer as a main graph commit, so
-    // its authority is branch-wide even though its physical effects are
-    // table-local. Hold main's process-local writer gate through every table
-    // effect/publish and the final physical-only __manifest compaction. This
-    // still lets this one Optimize call process distinct tables concurrently,
-    // but another main writer cannot arm an intent after our final check or
-    // have its fixed graph-head authority invalidated underneath recovery.
-    let _main_branch_guard = db.write_queue().acquire_branch(None).await;
-    ensure_no_pending_recovery_for_optimize_under_main_gate(db).await?;
+    // Canonical writer order: schema -> branch -> sorted tables. Planning reads
+    // catalog index intent, so it must use an operation-local accepted catalog
+    // under the same schema gate as schema apply and the exact RFC-022 writers.
+    let schema_gate_key = crate::db::manifest::schema_apply_serial_queue_key();
+    let schema_guard = db.write_queue().acquire(&schema_gate_key).await;
+    db.refresh_coordinator_only().await?;
+    db.ensure_schema_apply_not_locked("optimize").await?;
+    let catalog = db.load_accepted_catalog_with_schema_gate_held().await?;
 
+    // Optimize's one visibility point advances main's graph head, so its
+    // authority is branch-wide even though physical effects are table-local.
+    // Retain main through the final physical-only __manifest compaction so a
+    // new main recovery intent cannot arm before raw manifest movement ends.
+    let _main_branch_guard = db.write_queue().acquire_branch(None).await;
+
+    let table_keys = all_table_keys(&catalog);
+    let queue_keys = table_keys
+        .iter()
+        .map(|table_key| (table_key.clone(), None))
+        .collect::<Vec<_>>();
+    let table_guards = db.write_queue().acquire_many(&queue_keys).await;
+
+    // This relist is authoritative: every in-process writer that could have
+    // armed a main/global intent crosses one of the gates now held. The entry
+    // probe above is only a cheap fast-path/race seam.
+    ensure_no_pending_recovery_for_optimize_under_main_gate(db).await?;
     let snapshot = db.fresh_snapshot_for_branch(None).await?;
 
-    // Compute per-table paths up front, in a scope that drops the catalog
-    // handle before the async stream starts.
-    let table_tasks: Vec<(String, String)> = {
-        let catalog = db.catalog();
-        let mut tasks = Vec::new();
-        for table_key in all_table_keys(&catalog) {
-            let Some(entry) = snapshot.entry(&table_key) else {
-                continue;
-            };
-            let full_path = format!("{}/{}", db.root_uri, entry.table_path);
-            tasks.push((table_key, full_path));
-        }
-        tasks
-    };
+    let table_tasks = table_keys
+        .into_iter()
+        .filter_map(|table_key| {
+            let entry = snapshot.entry(&table_key)?;
+            Some(OptimizeTableTask {
+                table_key,
+                full_path: format!("{}/{}", db.root_uri, entry.table_path),
+                expected_version: entry.table_version,
+            })
+        })
+        .collect::<Vec<_>>();
 
     // NB: do NOT early-return when `table_tasks` is empty (a schema with no
     // node/edge types) — the internal system tables below must still be compacted.
     let concurrency = maint_concurrency().min(table_tasks.len()).max(1);
 
-    let stats: Vec<Result<TableOptimizeStats>> = futures::stream::iter(table_tasks.into_iter())
-        .map(move |(table_key, full_path)| async move {
-            optimize_one_table(db, table_key, full_path).await
-        })
-        .buffer_unordered(concurrency)
-        .collect()
-        .await;
+    let preparations: Vec<Result<OptimizePreparation>> =
+        futures::stream::iter(table_tasks.into_iter())
+            .map(|task| {
+                let catalog = std::sync::Arc::clone(&catalog);
+                async move { prepare_optimize_table(db, catalog.as_ref(), task).await }
+            })
+            .buffer_unordered(concurrency)
+            .collect()
+            .await;
 
-    // Invalidate caches for any table that published a compaction — done BEFORE
-    // propagating a sibling table's error, since the published versions are
-    // durable and reads must observe the new fragment layout (Lance invalidates
-    // the original row addresses on rewrite). The CSR/CSC graph topology index
-    // is rebuilt only when an edge table moved. Mirrors schema_apply's
-    // post-publish invalidation.
-    let any_committed = stats.iter().any(|s| matches!(s, Ok(st) if st.committed));
-    let edge_committed = stats
-        .iter()
-        .any(|s| matches!(s, Ok(st) if st.committed && st.table_key.starts_with("edge:")));
-    if any_committed {
-        db.runtime_cache.invalidate_all().await;
-        if edge_committed {
-            db.invalidate_graph_index().await;
+    let mut prepared = Vec::new();
+    let mut stats = Vec::new();
+    for preparation in preparations {
+        match preparation? {
+            OptimizePreparation::Work(work) => prepared.push(work),
+            OptimizePreparation::Stat(stat) => stats.push(stat),
         }
     }
+    prepared.sort_by(|left, right| left.table_key.cmp(&right.table_key));
+
+    if !prepared.is_empty() {
+        // Phase A: one durable legacy-v2 intent before the first table HEAD
+        // advance. v2 remains deliberately loose until Optimize's exact-v9
+        // provenance slice; this change narrows visibility, not provenance.
+        let pins = prepared
+            .iter()
+            .map(|work| crate::db::manifest::SidecarTablePin {
+                table_key: work.table_key.clone(),
+                table_path: work.full_path.clone(),
+                expected_version: work.expected_version,
+                // Lower bound: compact_files may reserve then rewrite, while
+                // reindex/config/index work can add more versions.
+                post_commit_pin: work.expected_version + 1,
+                confirmed_version: None,
+                table_branch: None,
+            })
+            .collect();
+        let sidecar = crate::db::manifest::new_sidecar(
+            crate::db::manifest::SidecarKind::Optimize,
+            None,
+            None,
+            pins,
+        );
+        let recovery_handle =
+            crate::db::manifest::write_sidecar(db.root_uri(), db.storage_adapter(), &sidecar)
+                .await?;
+
+        // Phase B: settle every bounded-parallel task. Never early-cancel
+        // siblings: after the shared sidecar is armed, recovery needs the most
+        // knowable completed effect set possible.
+        let effect_concurrency = maint_concurrency().min(prepared.len()).max(1);
+        let effect_results: Vec<Result<OptimizeEffectOutcome>> =
+            futures::stream::iter(prepared.into_iter())
+                .map(|work| {
+                    let catalog = std::sync::Arc::clone(&catalog);
+                    async move { apply_optimize_table_effects(db, catalog.as_ref(), work).await }
+                })
+                .buffer_unordered(effect_concurrency)
+                .collect()
+                .await;
+
+        let mut outcomes = Vec::new();
+        let mut first_error = None;
+        for result in effect_results {
+            match result {
+                Ok(outcome) => outcomes.push(outcome),
+                Err(error) if first_error.is_none() => first_error = Some(error),
+                Err(_) => {}
+            }
+        }
+        if let Some(error) = first_error {
+            return Err(optimize_recovery_required(&recovery_handle, error));
+        }
+
+        // One graph-wide Phase-B -> Phase-C crash seam, after every physical
+        // effect and before the only graph visibility point.
+        if let Err(error) = crate::failpoints::maybe_fail(
+            crate::failpoints::names::OPTIMIZE_POST_PHASE_B_PRE_MANIFEST_COMMIT,
+        ) {
+            return Err(optimize_recovery_required(&recovery_handle, error));
+        }
+
+        let updates = outcomes
+            .iter()
+            .filter_map(|outcome| outcome.update.clone())
+            .collect::<Vec<_>>();
+        if let Err(error) = publish_optimize_batch_monotonic(db, &updates).await {
+            return Err(optimize_recovery_required(&recovery_handle, error));
+        }
+
+        let any_committed = outcomes.iter().any(|outcome| outcome.stat.committed);
+        let edge_committed = outcomes
+            .iter()
+            .any(|outcome| outcome.stat.committed && outcome.stat.table_key.starts_with("edge:"));
+        stats.extend(outcomes.into_iter().map(|outcome| outcome.stat));
+
+        // Phase D: the graph-visible postcondition is durable. A failed delete
+        // is harmless; legacy recovery recognizes the manifest-aligned stale
+        // sidecar and records/cleans it on the next pass.
+        if let Err(err) =
+            crate::db::manifest::delete_sidecar(&recovery_handle, db.storage_adapter()).await
+        {
+            tracing::warn!(
+                error = %err,
+                operation_id = recovery_handle.operation_id.as_str(),
+                "graph-wide optimize recovery sidecar cleanup failed; next open will resolve it"
+            );
+        }
+
+        // Cache invalidation happens once, after the one visibility point. A
+        // partial Phase B is deliberately not exposed through runtime caches.
+        if any_committed {
+            db.runtime_cache.invalidate_all().await;
+            if edge_committed {
+                db.invalidate_graph_index().await;
+            }
+        }
+    }
+
+    stats.sort_by(|left, right| left.table_key.cmp(&right.table_key));
+
+    // Data-table recovery/publish is finished. Release the sorted table and
+    // schema gates before physical internal maintenance; retain main's branch
+    // gate through that maintenance to preserve the late-intent barrier.
+    drop(table_guards);
+    drop(schema_guard);
 
     // Compact the internal system tables too (RFC-013 step 2). They are not
     // catalog-tracked, so they take a separate, simpler path (`compact_internal_table`):
@@ -265,7 +405,7 @@ pub async fn optimize_all_tables(db: &Omnigraph) -> Result<Vec<TableOptimizeStat
     // data-table stats so the data-table cache invalidation above is computed from
     // data-table stats only; each internal compaction does its own coordinator
     // refresh for cache coherence.
-    let mut all = stats;
+    let mut all = stats.into_iter().map(Ok).collect::<Vec<Result<_>>>();
     // The only internal system table optimize compacts is `__manifest`: it
     // accumulates one fragment per commit (both the table-version rows and the
     // folded-in graph-lineage rows — RFC-013 Phase 7), so a long history leaves
@@ -283,52 +423,82 @@ pub async fn optimize_all_tables(db: &Omnigraph) -> Result<Vec<TableOptimizeStat
     all.into_iter().collect()
 }
 
-/// Compact one table and publish the compacted version to the `__manifest`.
-///
-/// Compaction (`compact_files`) advances the *dataset's* Lance HEAD via a
-/// reserve-fragments + rewrite commit, but Lance knows nothing about the
-/// `__manifest`. To keep the manifest the single authority for each table's
-/// visible version (invariant 2), optimize must publish the compacted version.
-/// The Lance-HEAD-before-manifest-publish gap is unavoidable (Lance has no
-/// staged/uncommitted compaction), so it is covered by a recovery sidecar like
-/// the other multi-commit writers; roll-forward is always safe because
-/// compaction is content-preserving.
-async fn optimize_one_table(
+/// Pure planning: classify drift/no-work/productive state without advancing
+/// any Lance HEAD. The caller holds schema -> main -> all table gates.
+async fn prepare_optimize_table(
     db: &Omnigraph,
-    table_key: String,
-    full_path: String,
-) -> Result<TableOptimizeStats> {
-    // Serialize the whole compact→publish against concurrent mutations on this
-    // (table, main): compaction is a Rewrite op that retryable-conflicts with a
-    // concurrent Merge/Update/Delete on overlapping fragments, and an
-    // interleaved write would also move the manifest version out from under the
-    // CAS below. Holding the queue makes the CAS baseline read under it exact.
-    let _guard = db
-        .write_queue()
-        .acquire_many(&[(table_key.clone(), None)])
-        .await;
+    catalog: &omnigraph_compiler::catalog::Catalog,
+    task: OptimizeTableTask,
+) -> Result<OptimizePreparation> {
+    let snapshot = db
+        .storage()
+        .open_dataset_head(&task.full_path, None)
+        .await?;
+    let lance_head_version = snapshot.version();
+    if lance_head_version < task.expected_version {
+        return Err(OmniError::manifest_internal(format!(
+            "table '{}' Lance HEAD version {} is behind manifest version {}",
+            task.table_key, lance_head_version, task.expected_version
+        )));
+    }
+    if lance_head_version > task.expected_version {
+        tracing::warn!(
+            target: "omnigraph::optimize",
+            table = %task.table_key,
+            manifest_version = task.expected_version,
+            lance_head_version,
+            "skipping compaction: Lance HEAD is ahead of the manifest; run `omnigraph repair` \
+             to classify and publish covered maintenance drift explicitly",
+        );
+        return Ok(OptimizePreparation::Stat(
+            TableOptimizeStats::skipped_for_drift(
+                task.table_key,
+                task.expected_version,
+                lance_head_version,
+            ),
+        ));
+    }
 
-    // Survive a CROSS-PROCESS race (a CLI `optimize` vs the served server): the
-    // in-process write queue above serializes only same-process writers, so we also
-    // retry. Two failure modes, two retry levels:
-    //   * Outer loop — a genuine Lance `Rewrite`-vs-`Update/Delete` same-fragment
-    //     conflict (compaction did NOT commit). Reopen at the new HEAD and re-plan,
-    //     exactly as the internal-table path does. (Lance rebases the common disjoint
-    //     case — a concurrent insert/delete on other fragments — for free, so this
-    //     fires only on real overlap.)
-    //   * Inner loop (Phase C) — the manifest advanced under us between our
-    //     compaction and our publish. The compaction IS committed at Lance HEAD, so
-    //     we must NOT reopen (that would trip the HEAD>manifest drift guard on our
-    //     own work); instead re-read the current manifest version and either no-op
-    //     (the manifest already moved past our version — being linear, it descends
-    //     from and includes our compaction) or fast-forward to it. Monotonic, never
-    //     the strict equality CAS that manufactured the bug.
-    //
-    // The Phase-A sidecar is written ONCE on the first productive attempt and reused
-    // across reopen attempts: every Phase-B commit is content-preserving, so a crash
-    // mid-retry leaves the table readable and recovery either rolls the observed HEAD
-    // forward (pin still matches the manifest) or safely rolls the compaction back.
-    let mut sidecar: Option<crate::db::manifest::RecoverySidecarHandle> = None;
+    let options = CompactionOptions::default();
+    let will_compact = plan_compaction(snapshot.dataset(), &options)
+        .await
+        .map_err(|e| OmniError::Lance(e.to_string()))?
+        .num_tasks()
+        > 0;
+    let needs_reindex = TableStore::has_unindexed_fragments(snapshot.dataset()).await?;
+    let index_work = super::table_ops::index_work_status_on_dataset_for_catalog(
+        db,
+        catalog,
+        &task.table_key,
+        &snapshot,
+    )
+    .await?;
+    if !will_compact && !needs_reindex && !index_work.needs_commit {
+        let mut stat =
+            TableOptimizeStats::compacted(task.table_key, &CompactionMetrics::default(), false);
+        stat.pending_indexes = index_work.pending;
+        return Ok(OptimizePreparation::Stat(stat));
+    }
+
+    Ok(OptimizePreparation::Work(PreparedOptimizeTable {
+        table_key: task.table_key,
+        full_path: task.full_path,
+        expected_version: task.expected_version,
+        initial_snapshot: snapshot,
+    }))
+}
+
+/// Apply one productive table's physical maintenance work. This helper owns no
+/// locks, sidecar, or graph publish; those are graph-wide responsibilities of
+/// `optimize_all_tables`.
+async fn apply_optimize_table_effects(
+    db: &Omnigraph,
+    catalog: &omnigraph_compiler::catalog::Catalog,
+    work: PreparedOptimizeTable,
+) -> Result<OptimizeEffectOutcome> {
+    let table_key = work.table_key;
+    let full_path = work.full_path;
+    let mut initial_snapshot = Some(work.initial_snapshot);
 
     // Tracks whether one of OUR Phase-B ops (auto-cleanup strip / compact / reindex)
     // already committed and advanced Lance HEAD past the manifest in a prior attempt.
@@ -343,14 +513,10 @@ async fn optimize_one_table(
     let (snapshot, metrics, pending_indexes, committed) = loop {
         attempt += 1;
 
-        // `compact_files` is a Lance-only maintenance API that needs `&mut Dataset`.
-        // The `TableStorage` trait deliberately does not surface it; unwrap the
-        // opaque `SnapshotHandle` via `into_dataset()` (gated to the maintenance path).
-        let mut ds = db
-            .storage()
-            .open_dataset_head(&full_path, None)
-            .await?
-            .into_dataset();
+        let selected = match initial_snapshot.take() {
+            Some(snapshot) => snapshot,
+            None => db.storage().open_dataset_head(&full_path, None).await?,
+        };
 
         // CAS baseline: the table's current manifest version, re-read each attempt
         // (a reopen means the manifest may have advanced).
@@ -361,7 +527,7 @@ async fn optimize_one_table(
             .map(|e| e.table_version)
             .ok_or_else(|| OmniError::manifest(format!("no manifest entry for {}", table_key)))?;
 
-        let lance_head_version = ds.version().version;
+        let lance_head_version = selected.version();
         if lance_head_version < expected_version {
             return Err(OmniError::manifest_internal(format!(
                 "table '{}' Lance HEAD version {} is behind manifest version {}",
@@ -374,28 +540,17 @@ async fn optimize_one_table(
             // `lance_head > manifest` is our own prior Phase-B commit (sidecar-covered)
             // that the publish below fast-forwards, NOT external drift, so this guard is
             // skipped on those retries.
-            if let Some(h) = sidecar.take() {
-                let _ = crate::db::manifest::delete_sidecar(&h, db.storage_adapter()).await;
-            }
-            tracing::warn!(
-                target: "omnigraph::optimize",
-                table = %table_key,
-                manifest_version = expected_version,
-                lance_head_version,
-                "skipping compaction: Lance HEAD is ahead of the manifest; run `omnigraph repair` \
-                 to classify and publish covered maintenance drift explicitly",
-            );
-            return Ok(TableOptimizeStats::skipped_for_drift(
-                table_key.clone(),
-                expected_version,
-                lance_head_version,
-            ));
+            return Err(OmniError::manifest_conflict(format!(
+                "optimize table '{}' moved after the graph-wide recovery intent armed: \
+                 manifest version {}, Lance HEAD {}",
+                table_key, expected_version, lance_head_version
+            )));
         }
 
         // Precise "will it compact?" check — `plan_compaction` also accounts for
         // deletion materialization (which can rewrite even a single fragment).
         let options = CompactionOptions::default();
-        let plan = plan_compaction(&ds, &options)
+        let plan = plan_compaction(selected.dataset(), &options)
             .await
             .map_err(|e| OmniError::Lance(e.to_string()))?;
         let will_compact = plan.num_tasks() > 0;
@@ -405,12 +560,12 @@ async fn optimize_one_table(
         // Any of the three enters the publish path. If NONE, this is a no-op and must
         // NOT be pinned in a sidecar (a zero-commit pin classifies NoMovement on
         // recovery and rolls back siblings).
-        let needs_reindex = TableStore::has_unindexed_fragments(&ds).await?;
-        let needs_index_create = if let Some(type_name) = table_key.strip_prefix("node:") {
-            super::table_ops::needs_index_work_node(db, type_name, &full_path, None).await?
-        } else {
-            super::table_ops::needs_index_work_edge(db, &full_path, None).await?
-        };
+        let needs_reindex = TableStore::has_unindexed_fragments(selected.dataset()).await?;
+        let index_work = super::table_ops::index_work_status_on_dataset_for_catalog(
+            db, catalog, &table_key, &selected,
+        )
+        .await?;
+        let needs_index_create = index_work.needs_commit;
         if !will_compact && !needs_reindex && !needs_index_create {
             if head_advanced {
                 // Nothing left to compact, but a prior attempt already advanced HEAD
@@ -418,45 +573,19 @@ async fn optimize_one_table(
                 // is now already compacted). Publish that committed work instead of
                 // dropping it as uncovered drift.
                 break (
-                    crate::storage_layer::SnapshotHandle::new(ds),
+                    selected,
                     CompactionMetrics::default(),
-                    Vec::new(),
+                    index_work.pending,
                     true,
                 );
             }
-            if let Some(h) = sidecar.take() {
-                let _ = crate::db::manifest::delete_sidecar(&h, db.storage_adapter()).await;
-            }
-            return Ok(TableOptimizeStats::compacted(
+            let mut stat = TableOptimizeStats::compacted(
                 table_key.clone(),
                 &CompactionMetrics::default(),
                 false,
-            ));
-        }
-
-        // Phase A: recovery sidecar BEFORE any HEAD-advancing op, written once and
-        // reused across reopen attempts.
-        if sidecar.is_none() {
-            let sc = crate::db::manifest::new_sidecar(
-                crate::db::manifest::SidecarKind::Optimize,
-                None,
-                // optimize is system-attributed (no `optimize_as` actor API today).
-                None,
-                vec![crate::db::manifest::SidecarTablePin {
-                    table_key: table_key.clone(),
-                    table_path: full_path.clone(),
-                    expected_version,
-                    // Lower bound — compaction commits N≥1 versions (reserve + rewrite);
-                    // the classifier loose-matches SidecarKind::Optimize.
-                    post_commit_pin: expected_version + 1,
-                    confirmed_version: None,
-                    table_branch: None,
-                }],
             );
-            sidecar = Some(
-                crate::db::manifest::write_sidecar(db.root_uri(), db.storage_adapter(), &sc)
-                    .await?,
-            );
+            stat.pending_indexes = index_work.pending;
+            return Ok(OptimizeEffectOutcome { stat, update: None });
         }
 
         // Test seam: a concurrent (cross-process) writer can interleave here, before
@@ -473,6 +602,7 @@ async fn optimize_one_table(
         // here means a concurrent writer preempted an overlapping fragment → reopen at
         // the new HEAD and re-plan. Baseline captured BEFORE the scrub so that if the
         // scrub is the only commit, `committed` still triggers the Phase-C publish.
+        let mut ds = selected.into_dataset();
         let version_before = ds.version().version;
         match clear_stale_auto_cleanup_config(&mut ds).await {
             // `true` ⇒ the strip committed and advanced HEAD past the manifest.
@@ -519,12 +649,11 @@ async fn optimize_one_table(
             }
         }
 
-        let catalog = db.catalog();
         let mut snapshot = crate::storage_layer::SnapshotHandle::new(ds);
         let pending_indexes: Vec<super::PendingIndex> =
             super::table_ops::build_indices_on_dataset_for_catalog(
                 db,
-                &catalog,
+                catalog,
                 &table_key,
                 &mut snapshot,
             )
@@ -537,90 +666,94 @@ async fn optimize_one_table(
         break (snapshot, metrics, pending_indexes, head_advanced);
     };
 
-    // Pin the per-writer Phase B → Phase C residual: Lance HEAD has advanced but the
-    // manifest publish below hasn't run.
-    crate::failpoints::maybe_fail(
-        crate::failpoints::names::OPTIMIZE_POST_PHASE_B_PRE_MANIFEST_COMMIT,
-    )?;
-
-    // Phase C: monotonic fast-forward publish. The compaction is committed at Lance
-    // HEAD `N`; publish a manifest pointer that includes it. If a concurrent writer
-    // already advanced the manifest to ≥ N (it built on our compaction), there is
-    // nothing to do. Otherwise advance to N; a concurrent advance during this window
-    // is a retryable manifest conflict — re-read the current version and re-evaluate
-    // (NOT a reopen: the compaction is already committed).
-    if committed {
-        let state = db.storage().table_state(&full_path, &snapshot).await?;
-        let mut published = false;
-        let mut last_conflict: Option<OmniError> = None;
-        for _ in 0..COMPACTION_RETRY_BUDGET {
-            let current = current_manifest_version(db, &table_key).await?;
-            if current >= state.version {
-                // The manifest already points at a version that includes our
-                // compaction (Lance versions are linear). Nothing to publish.
-                published = true;
-                break;
-            }
-            let update = crate::db::SubTableUpdate {
-                table_key: table_key.clone(),
-                table_version: state.version,
-                table_branch: None,
-                row_count: state.row_count,
-                version_metadata: state.version_metadata.clone(),
-            };
-            let mut expected = std::collections::HashMap::new();
-            expected.insert(table_key.clone(), current);
-            match db
-                .coordinator
-                .write()
-                .await
-                .commit_updates_with_actor_with_expected(&[update], &expected, None)
-                .await
-            {
-                Ok(_) => {
-                    published = true;
-                    break;
-                }
-                // A retryable manifest conflict means the manifest moved under us —
-                // loop and re-read `current` (the top check converges if it now
-                // already includes our compaction). Record it for the exhaustion path.
-                Err(e) if is_retryable_manifest_conflict(&e) => last_conflict = Some(e),
-                // Leave the sidecar for the open-time recovery sweep to roll forward.
-                Err(e) => return Err(e),
-            }
-        }
-        if !published {
-            // Budget exhausted under sustained contention. The final conflict may
-            // itself mean a concurrent writer published a version that already
-            // includes our (content-preserving) compaction — the postcondition is
-            // "the manifest reflects our compaction," not "we won the CAS" — so
-            // re-check before surfacing an error (§6.6).
-            let current = current_manifest_version(db, &table_key).await?;
-            if current < state.version {
-                return Err(last_conflict.unwrap_or_else(|| {
-                    OmniError::manifest_conflict(format!(
-                        "optimize publish of {table_key} exhausted {COMPACTION_RETRY_BUDGET} \
-                         retries against concurrent writers"
-                    ))
-                }));
-            }
-        }
-    }
-
-    // Phase D: delete the sidecar (best-effort; recovery resolves a leftover).
-    if let Some(h) = sidecar.take() {
-        if let Err(err) = crate::db::manifest::delete_sidecar(&h, db.storage_adapter()).await {
-            tracing::warn!(
-                error = %err,
-                operation_id = h.operation_id.as_str(),
-                "optimize recovery sidecar cleanup failed; next open's recovery sweep will resolve it"
-            );
-        }
-    }
-
     let mut stat = TableOptimizeStats::compacted(table_key, &metrics, committed);
     stat.pending_indexes = pending_indexes;
-    Ok(stat)
+    let update = if committed {
+        let state = db.storage().table_state(&full_path, &snapshot).await?;
+        Some(crate::db::SubTableUpdate {
+            table_key: stat.table_key.clone(),
+            table_version: state.version,
+            table_branch: None,
+            row_count: state.row_count,
+            version_metadata: state.version_metadata,
+        })
+    } else {
+        None
+    };
+    Ok(OptimizeEffectOutcome { stat, update })
+}
+
+/// Publish every still-needed table pointer in one manifest/lineage CAS. This
+/// is maintenance-class OCC, not logical read-set OCC: a current pointer at or
+/// beyond the achieved target is already converged and is omitted; remaining
+/// pointers use their freshly observed versions as row-level expectations.
+async fn publish_optimize_batch_monotonic(
+    db: &Omnigraph,
+    targets: &[crate::db::SubTableUpdate],
+) -> Result<()> {
+    if targets.is_empty() {
+        return Ok(());
+    }
+
+    let mut last_conflict = None;
+    for _ in 0..COMPACTION_RETRY_BUDGET {
+        let current = db.fresh_snapshot_for_branch(None).await?;
+        let mut updates = Vec::with_capacity(targets.len());
+        let mut expected = std::collections::HashMap::with_capacity(targets.len());
+        for target in targets {
+            let entry = current.entry(&target.table_key).ok_or_else(|| {
+                OmniError::manifest_conflict(format!(
+                    "optimize target '{}' disappeared before graph-wide publish",
+                    target.table_key
+                ))
+            })?;
+            if entry.table_version < target.table_version {
+                expected.insert(target.table_key.clone(), entry.table_version);
+                updates.push(target.clone());
+            }
+        }
+        if updates.is_empty() {
+            return Ok(());
+        }
+
+        match db
+            .coordinator
+            .write()
+            .await
+            .commit_updates_with_actor_with_expected(&updates, &expected, None)
+            .await
+        {
+            Ok(_) => return Ok(()),
+            Err(error) if is_retryable_manifest_conflict(&error) => last_conflict = Some(error),
+            Err(error) => return Err(error),
+        }
+    }
+
+    let current = db.fresh_snapshot_for_branch(None).await?;
+    if targets.iter().all(|target| {
+        current
+            .entry(&target.table_key)
+            .is_some_and(|entry| entry.table_version >= target.table_version)
+    }) {
+        return Ok(());
+    }
+    Err(last_conflict.unwrap_or_else(|| {
+        OmniError::manifest_conflict(format!(
+            "graph-wide optimize publish exhausted {COMPACTION_RETRY_BUDGET} retries"
+        ))
+    }))
+}
+
+fn optimize_recovery_required(
+    handle: &crate::db::manifest::RecoverySidecarHandle,
+    error: OmniError,
+) -> OmniError {
+    OmniError::recovery_required(
+        handle.operation_id.clone(),
+        format!(
+            "graph-wide optimize failed after arming recovery; reopen read-write to converge it: {error}"
+        ),
+    )
 }
 
 /// Final recovery-ownership check for main-branch Optimize.
@@ -693,21 +826,10 @@ fn is_retryable_manifest_conflict(err: &OmniError) -> bool {
     )
 }
 
-/// The table's current manifest version on `main` (0 if absent), read fresh. Used by
-/// optimize's monotonic publish loop to decide no-op (`current >= N`) vs fast-forward.
-async fn current_manifest_version(db: &Omnigraph, table_key: &str) -> Result<u64> {
-    Ok(db
-        .fresh_snapshot_for_branch(None)
-        .await?
-        .entry(table_key)
-        .map(|e| e.table_version)
-        .unwrap_or(0))
-}
-
 /// Remove any stored `lance.auto_cleanup.*` config from a table so compaction
 /// stays **non-destructive by construction**. Used by both the internal-table
 /// path ([`compact_internal_table`]) and the data-table path
-/// ([`optimize_one_table`]).
+/// ([`apply_optimize_table_effects`]).
 ///
 /// `compact_files` / `optimize_indices` commit with a default `CommitConfig`
 /// (`skip_auto_cleanup = false`) and `CompactionOptions` exposes no override, so on
@@ -753,7 +875,7 @@ async fn clear_stale_auto_cleanup_config(
 /// `__manifest` (they ARE the manifest / the lineage DAG): readers open them at
 /// their latest Lance HEAD, so compaction just advances that HEAD and the next
 /// reader transparently observes the compacted version. That makes this path much
-/// simpler than [`optimize_one_table`] — no manifest publish (nothing to publish
+/// simpler than [`apply_optimize_table_effects`] — no manifest publish (nothing to publish
 /// to), and no recovery sidecar. The sidecar-free claim does NOT rest on
 /// single-commit atomicity: `compact_files` can emit a `ReserveFragments` commit
 /// before the final `Rewrite` (and the config strip is a separate commit before
