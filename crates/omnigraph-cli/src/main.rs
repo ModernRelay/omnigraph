@@ -386,6 +386,7 @@ async fn main() -> Result<()> {
                 uri,
                 source,
                 into,
+                delete_branch,
                 json,
             } => {
                 let client = client::GraphClient::resolve_with_policy(
@@ -399,7 +400,29 @@ async fn main() -> Result<()> {
                 .await?;
                 let into = resolve_branch(into, None, "main");
                 echo_write_target(cli.quiet, "branch merge", client.uri(), client.is_remote());
-                let payload = client.branch_merge(&source, &into).await?;
+                let payload = client.branch_merge(&source, &into, delete_branch).await?;
+                // Warnings go to stderr so `--json` consumers reading stdout
+                // are unaffected. `branch_deleted: None` after requesting
+                // deletion means an older server ignored the unknown request
+                // field — surface that instead of silently leaving the branch.
+                if delete_branch {
+                    match payload.branch_deleted {
+                        Some(true) => {}
+                        Some(false) => eprintln!(
+                            "warning: merged, but could not delete branch '{}': {}",
+                            payload.source,
+                            payload
+                                .branch_delete_error
+                                .as_deref()
+                                .unwrap_or("unknown error")
+                        ),
+                        None => eprintln!(
+                            "warning: merged, but the server does not support --delete-branch; \
+                             branch '{}' was not deleted",
+                            payload.source
+                        ),
+                    }
+                }
                 if json {
                     print_json(&payload)?;
                 } else {
@@ -409,6 +432,9 @@ async fn main() -> Result<()> {
                         payload.target,
                         payload.outcome.as_str()
                     );
+                    if payload.branch_deleted == Some(true) {
+                        println!("deleted branch {}", payload.source);
+                    }
                 }
             }
         },
