@@ -669,6 +669,7 @@ impl GraphClient {
                     Some(serde_json::to_value(BranchMergeRequest {
                         source: source.to_string(),
                         target: Some(into.to_string()),
+                        delete_branch: false,
                     })?),
                     token.as_deref(),
                 )
@@ -683,6 +684,8 @@ impl GraphClient {
                     target: into.to_string(),
                     outcome: outcome.into(),
                     actor_id: actor.map(String::from),
+                    branch_deleted: None,
+                    branch_delete_error: None,
                 })
             }
         }

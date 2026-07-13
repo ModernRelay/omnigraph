@@ -533,6 +533,7 @@ async fn policy_blocks_non_admin_merge_to_main_and_allows_admin() {
     let merge = BranchMergeRequest {
         source: "feature".to_string(),
         target: Some("main".to_string()),
+        delete_branch: false,
     };
     let (deny_status, deny_body) = json_response(
         &app,
@@ -659,6 +660,7 @@ async fn authenticated_branch_merge_stamps_merge_actor_on_head_commit() {
     let merge = BranchMergeRequest {
         source: "feature".to_string(),
         target: Some("main".to_string()),
+        delete_branch: false,
     };
     let (merge_status, merge_body) = json_response(
         &app,
@@ -691,6 +693,58 @@ async fn authenticated_branch_merge_stamps_merge_actor_on_head_commit() {
         .last()
         .expect("head commit should exist");
     assert_eq!(head["actor_id"], "act-ragnor");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn branch_merge_delete_branch_policy_denial_is_non_fatal() {
+    // act-ragnor (admins) may merge into the protected target, but the
+    // composed source deletion targets the UNPROTECTED branch `feature`,
+    // which `admins-merge` (target_branch_scope: protected) does not allow.
+    // The deletion runs under its own `branch_delete` decision, so the merge
+    // must succeed while the denial is reported non-fatally — composition
+    // never smuggles a delete through a merge permission.
+    let (temp, app) = app_for_loaded_graph_with_auth_tokens_and_policy(
+        &[("act-ragnor", "token-admin")],
+        POLICY_YAML,
+    )
+    .await;
+    let graph = graph_path(temp.path());
+
+    let db = Omnigraph::open(graph.to_str().unwrap()).await.unwrap();
+    db.branch_create_from(ReadTarget::branch("main"), "feature")
+        .await
+        .unwrap();
+    drop(db);
+
+    let merge = BranchMergeRequest {
+        source: "feature".to_string(),
+        target: Some("main".to_string()),
+        delete_branch: true,
+    };
+    let (merge_status, merge_body) = json_response(
+        &app,
+        Request::builder()
+            .uri(g("/branches/merge"))
+            .method(Method::POST)
+            .header("authorization", "Bearer token-admin")
+            .header("content-type", "application/json")
+            .body(Body::from(serde_json::to_vec(&merge).unwrap()))
+            .unwrap(),
+    )
+    .await;
+    assert_eq!(merge_status, StatusCode::OK);
+    assert_eq!(merge_body["outcome"], "already_up_to_date");
+    assert_eq!(merge_body["branch_deleted"], false);
+    assert!(
+        merge_body["branch_delete_error"]
+            .as_str()
+            .unwrap()
+            .contains("policy denied action 'branch_delete'")
+    );
+
+    let db = Omnigraph::open(graph.to_str().unwrap()).await.unwrap();
+    let branches = db.branch_list().await.unwrap();
+    assert!(branches.iter().any(|branch| branch == "feature"));
 }
 
 #[tokio::test(flavor = "multi_thread")]
