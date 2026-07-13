@@ -100,7 +100,7 @@ The CLI system tests (`system_local.rs`) spawn the workspace-built `omnigraph` a
 
 ## OpenAPI drift
 
-`crates/omnigraph-server/tests/openapi.rs` regenerates `openapi.json` and diffs against the checked-in copy. CI auto-commits the regeneration on same-repository PRs and otherwise runs in strict-check mode (env: `OMNIGRAPH_UPDATE_OPENAPI`).
+`crates/omnigraph-server/tests/openapi.rs` regenerates `openapi.json` and diffs against the checked-in copy. The drift check runs strict on PRs (the auto-commit step lives in the heavy `test` job, which is post-merge-only) — for server/API changes, regenerate locally with `OMNIGRAPH_UPDATE_OPENAPI=1 cargo test -p omnigraph-server --test openapi` and commit the result, or the PR's `test_aws_feature` job fails on drift. See [ci.md](ci.md).
 
 ## Examples & benches
 
