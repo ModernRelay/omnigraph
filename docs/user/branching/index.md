@@ -18,6 +18,13 @@ created lazily on first write:
   supported (`review/2026-07`), but `review` and `review/2026-07` cannot both be
   live because Lance stores them in overlapping physical directories. Choose
   sibling names, or delete the existing ancestor/descendant first.
+- **Delete branches after merging.** Branches are designed as short-lived
+  transactions: create → write → merge → delete. A merged branch is not cleaned
+  up automatically — it stays in `branch list`, and every live branch caps how
+  far [`cleanup`](../operations/maintenance.md) can GC the main versions it
+  inherited, so stale merged branches quietly retain old data. Pass
+  `--delete-branch` to [`branch merge`](merge.md) (or `delete_branch: true` on
+  the merge endpoint) to do it in one step.
 
 Graph branch create/delete are coordinated across handles in one writer
 process. Until Lance exposes conditional native ref mutation, separate writer
