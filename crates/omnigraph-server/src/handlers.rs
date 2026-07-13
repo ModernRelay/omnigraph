@@ -1585,6 +1585,11 @@ pub(crate) async fn server_branch_delete(
 /// `already_up_to_date`, `fast_forward`, or `merged`. Returns 409 with the
 /// list of conflicts if the merge cannot be completed; the target is left
 /// unchanged in that case. **Destructive** to `target` on success.
+///
+/// With `delete_branch: true` the source branch is deleted after a successful
+/// merge, under its own `branch_delete` policy check. The merge is durable by
+/// then, so a deletion refusal or failure never fails the request; it is
+/// reported via `branch_deleted: false` + `branch_delete_error`.
 pub(crate) async fn server_branch_merge(
     State(state): State<AppState>,
     Extension(handle): Extension<Arc<GraphHandle>>,
@@ -1621,12 +1626,55 @@ pub(crate) async fn server_branch_merge(
             .await
             .map_err(ApiError::from_omni)?
     };
+    let (branch_deleted, branch_delete_error) = if request.delete_branch {
+        match delete_merged_source_branch(&handle, actor.as_ref().map(|Extension(a)| a), &request.source)
+            .await
+        {
+            Ok(()) => (Some(true), None),
+            Err(message) => (Some(false), Some(message)),
+        }
+    } else {
+        (None, None)
+    };
     Ok(Json(BranchMergeOutput {
         source: request.source,
         target,
         outcome: outcome.into(),
         actor_id: actor_id.map(str::to_string),
+        branch_deleted,
+        branch_delete_error,
     }))
+}
+
+/// Delete the source branch of a just-landed merge, mirroring
+/// `server_branch_delete`'s authorization (same action and target scope) but
+/// converting every failure — policy denial, dependent-branch refusal,
+/// operational error — into a message instead of an error status: the merge is
+/// already durable, so the request must not report failure for it.
+async fn delete_merged_source_branch(
+    handle: &GraphHandle,
+    actor: Option<&ResolvedActor>,
+    source: &str,
+) -> std::result::Result<(), String> {
+    match authorize(
+        actor,
+        handle.policy.as_deref(),
+        PolicyRequest {
+            action: PolicyAction::BranchDelete,
+            branch: None,
+            target_branch: Some(source.to_string()),
+        },
+    ) {
+        Ok(Authz::Allowed) => {}
+        Ok(Authz::Denied(message)) => return Err(message),
+        Err(err) => return Err(err.message),
+    }
+    let actor_id = actor.map(|actor| actor.actor_id.as_ref());
+    handle
+        .engine
+        .branch_delete_as(source, actor_id)
+        .await
+        .map_err(|err| err.to_string())
 }
 
 #[utoipa::path(

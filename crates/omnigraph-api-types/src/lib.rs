@@ -83,6 +83,12 @@ pub struct BranchMergeRequest {
     pub source: String,
     /// Target branch that will receive the merge. Defaults to `main`.
     pub target: Option<String>,
+    /// Delete the source branch after a successful merge. The deletion runs
+    /// under its own `branch_delete` policy check; a refusal or failure is
+    /// reported via `branch_deleted` / `branch_delete_error` on the response
+    /// and never fails the already-landed merge.
+    #[serde(default)]
+    pub delete_branch: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
@@ -119,6 +125,16 @@ pub struct BranchMergeOutput {
     pub target: String,
     pub outcome: BranchMergeOutcome,
     pub actor_id: Option<String>,
+    /// Result of the requested post-merge source-branch deletion. Absent when
+    /// `delete_branch` was not requested; `true` when the source branch was
+    /// deleted; `false` when the deletion was refused or failed (the merge
+    /// itself still succeeded — see `branch_delete_error`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub branch_deleted: Option<bool>,
+    /// Why the requested source-branch deletion did not happen. Present iff
+    /// `branch_deleted` is `false`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub branch_delete_error: Option<String>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
