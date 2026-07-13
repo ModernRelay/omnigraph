@@ -16,7 +16,7 @@ Top-level command families and subcommands. Graph-targeting commands accept a po
 | `alias <name> [args]` | invoke an operator alias — a read-only personal binding (under `aliases:` in `~/.omnigraph/config.yaml`) to a stored query on a named server (replaces the removed `--alias` flag; stored mutations are rejected before execution) |
 | `snapshot` | print current snapshot (per-table version + row count) |
 | `export` | dump to JSONL on stdout (`--type T`, `--table K` filters) |
-| `branch create \| list \| delete \| merge` | branching ops |
+| `branch create \| list \| delete \| merge` | branching ops. `merge --delete-branch` deletes the source branch after a successful merge (its own `branch_delete` policy check; a refusal is a stderr warning, not a failure — see [merge](../branching/merge.md)) |
 | `commit list \| show` | inspect commit graph |
 | `schema plan \| apply \| show (alias: get)` | migrations. `apply` refuses a cluster-managed graph (one whose storage is inside a cluster) and points at `cluster apply` — those graphs evolve through the cluster ledger, not a direct apply |
 | `lint` (alias: `check`) | offline / graph-backed query validation. Replaces `query lint` / `query check`, which are kept as deprecated argv-level shims that print a one-line warning and rewrite to `omnigraph lint` |
