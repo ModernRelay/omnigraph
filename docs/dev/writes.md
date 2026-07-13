@@ -247,24 +247,24 @@ instead require an in-query delete view, pending pruning, and per-table
 two-commit ordering in the hot mutation path — complexity this boundary
 deliberately avoids.
 
-### MR-793 status (storage trait two-phase invariant) — partial
+### MR-793 status (storage trait two-phase invariant) — complete
 
 MR-793 hoists the staged-write pattern into a `TableStorage` trait
 surface with sealed-trait enforcement and opaque `SnapshotHandle` /
 `StagedHandle` types — see `crates/omnigraph/src/storage_layer.rs`.
 The trait is the canonical surface for new engine code; existing call
-sites still use the inherent `TableStore` methods (mechanical migration
-deferred to a follow-up cycle — tracked).
+sites route graph-visible effects through it. Capability and statistics
+surfaces for planner decisions remain separate roadmap work.
 
 Three writers have been migrated onto staged primitives:
 
-* **`ensure_indices`** (`db/omnigraph/table_ops.rs::build_indices_on_dataset_for_catalog`)
-  — scalar indices (BTree, Inverted) use `stage_create_*_index` +
-  `commit_staged`. Which index a `@index`/`@key` property gets is dispatched by
-  type via `node_prop_index_kind` (enum + orderable scalar → BTree, free-text
-  String → Inverted/FTS, Vector → vector). Vector indices stay inline in the
-  current engine, although beta.21 exposes the full-table staged shape that the
-  exact EnsureIndices adapter will adopt. This build is
+* **`ensure_indices`** (`db/omnigraph/table_ops.rs::ensure_indices_for_branch`)
+  — a typed `stage_create_indices` request combines every missing BTree,
+  Inverted/FTS, and full-table vector artifact for one table into one Lance
+  `Operation::CreateIndex`, followed by one `commit_staged_exact`. Which index a
+  `@index`/`@key` property gets is dispatched by type via
+  `node_prop_index_kind` (enum + orderable scalar → BTree, free-text String →
+  Inverted/FTS, Vector → vector). This build is
   existence-gated (it creates a *missing* index over current fragments); folding
   fragments appended afterward into an *existing* index is `optimize`'s
   `optimize_indices` pass — an inline-commit residual, not a staged write (Lance
@@ -284,30 +284,28 @@ enforcement (sealed + only-callable-via-trait once call sites land);
 the grep test catches type-system bypass attempts.
 
 The "finalize → publisher residual" described below applies equally to
-the migrated writers — Lance has no multi-dataset atomic commit
-primitive, so the per-table commit_staged → manifest publish gap is
-the same drift class. Closing it requires either upstream Lance
-multi-dataset commit OR the omnigraph-side recovery-on-open reconciler
-described in `.context/mr-793-design.md` §15 (deferred to MR-795).
+the migrated writers — Lance has no multi-dataset atomic commit primitive, so
+the per-table `commit_staged` → manifest-publish gap is the same drift class.
+The shipped sidecar recovery protocol closes that gap.
 
-### Inline-commit residuals live on `InlineCommitResidual`, not `db.storage()` (MR-793 acceptance §1, by construction)
+### The storage surface has no inline-commit residual
 
-MR-793's acceptance criterion §1 ("`TableStore` (or successor) public API has no method that performs a manifest commit as a side effect of writing") holds **by construction** after MR-854. `db.storage()` (`&dyn TableStorage`) exposes only staged primitives + reads; the one inline-commit write not yet migrated by OmniGraph lives on a separate `InlineCommitResidual` trait reached via `Omnigraph::storage_inline_residual()`. A new engine writer cannot couple a write with a Lance HEAD advance through the default surface — it would have to name the residual accessor explicitly. The dead legacy methods (trait `append_batch` / `merge_insert_batches`, inherent `merge_insert_batch{,es}`, `create_{btree,inverted}_index`) were removed; appends/merges and scalar index builds all use the `stage_*` primitives.
+MR-793's acceptance criterion §1 ("`TableStore` (or successor) public API has
+no method that performs a manifest commit as a side effect of writing") holds
+**by construction**. `db.storage()` (`&dyn TableStorage`) exposes only staged
+primitives + reads. Lance 7.0's `DeleteBuilder::execute_uncommitted`
+([#6658](https://github.com/lance-format/lance/issues/6658)) moved delete to
+`stage_delete`; beta.21's full-table index `execute_uncommitted` shape moved the
+last vector build into `stage_create_indices`. `InlineCommitResidual`,
+`storage_inline_residual()`, and inline `create_vector_index` are removed.
+Generic multi-segment exact index publication remains covered by Lance
+[#6666](https://github.com/lance-format/lance/issues/6666), but it is not used by
+the current one-segment full-table shape.
 
-One method remains on `InlineCommitResidual`, named honestly at its call site:
-
-| Residual method | Inline-commit reason | Closes when |
-|---|---|---|
-| `create_vector_index` | The engine still calls Lance's inline `execute` path. Beta.21's one-segment full-table build exposes enough public surface to mirror Lance's `execute_uncommitted` → `Operation::CreateIndex` path exactly; generic multi-segment exact publication remains covered by Lance [#6666](https://github.com/lance-format/lance/issues/6666). | The exact EnsureIndices adapter adds `stage_create_vector_index` and removes the residual. |
-
-`delete_where` used to be the second residual. Lance 7.0's
-`DeleteBuilder::execute_uncommitted` ([#6658](https://github.com/lance-format/lance/issues/6658))
-made delete a staged write, so MR-A migrated it to `TableStorage::stage_delete`
-and removed `InlineCommitResidual::delete_where`. The parse-time D₂ rule is
-retained as a deliberate boundary (constructive XOR destructive per query) — see
-the D₂ section above.
-
-The `tests/forbidden_apis.rs` guard still catches direct `lance::*` inline-commit misuse outside the storage layer; the trait split makes the staged-only default a type-system guarantee on top of it.
+The parse-time D₂ rule remains a deliberate boundary (constructive XOR
+destructive per query), not residual scaffolding. The
+`tests/forbidden_apis.rs` guard catches direct `lance::*` inline-commit misuse
+outside the storage layer and also pins the retired residual symbols absent.
 
 ### `LoadMode::Overwrite` uses staged Lance `Overwrite`
 
@@ -380,12 +378,13 @@ foreign dataset as if this apply created it.
    whose table-effect set is empty. Readers retain the old schema-v5 target-hash
    + Phase-C-confirmation bridge semantics for files written by older binaries;
    v5 table effects remain loose and are never reinterpreted as v7. EnsureIndices
-   uses schema v6 as a second
-   narrow bridge: table effects are still loosely classified, but the sidecar
-   pre-mints its rollback commit id. Before the first restore, recovery durably
-   binds the original per-table rollback audit plan, so an interruption after
-   rollback publish retries as that same `RolledBack` outcome instead of being
-   mistaken for a stale roll-forward.
+   uses schema v8: it captures native branch + graph-head + schema authority,
+   fixed original and rollback lineage, one pre-minted mixed CreateIndex
+   transaction per touched table, and the complete table-pointer delta. A
+   first-touch effect also records its inherited source version and later binds
+   the exact created ref identity. Readers retain schema-v6 EnsureIndices files
+   as a narrow compatibility bridge under their original loose classification
+   and fixed-rollback semantics; v6 is never reinterpreted as v8 ownership.
 2. **Phase B**: writer's per-table `commit_staged` loop runs.
    - **Phase-B confirmation:** a schema-v4 `BranchMerge` writer
      advances each table's HEAD by *several* exact commits (append → upsert →
@@ -404,9 +403,11 @@ foreign dataset as if this apply created it.
      target path, all committed with zero transparent conflict retries. After
      every achieved identity/version and all schema staging files are durable,
      it confirms the complete registration/update/tombstone delta and moves
-     `Armed → EffectsConfirmed`. Remaining legacy writers don't confirm — their
-     drift is derived state (index coverage, compaction) that a partial
-     roll-forward never corrupts.
+     `Armed → EffectsConfirmed`. Schema-v8 EnsureIndices likewise requires one
+     exact achieved transaction at `read_version + 1` per table, binds every
+     first-touch ref identity, confirms the complete table-pointer delta, and
+     only then moves `Armed → EffectsConfirmed`. Optimize remains the legacy
+     writer without this confirmation boundary.
 3. **Phase C**: publisher commits the manifest.
 4. **Phase D**: writer deletes the sidecar.
 
@@ -450,6 +451,14 @@ recovery sweep in `crates/omnigraph/src/db/manifest/recovery.rs`:
   authority winner is preserved while recovery compensates only owned effects.
   If foreign movement buries an owned same-table effect, recovery fails closed
   with the sidecar intact instead of restoring through or adopting the winner.
+  Schema-v8 EnsureIndices applies the exact rule to each one-transaction mixed
+  index batch: the observed transaction UUID/read version and achieved
+  `expected + 1` version must match the plan, `EffectsConfirmed` must carry the
+  complete fixed table-pointer delta, and a first-touch named branch must retain
+  the confirmed Lance ref identity. Changed authority is rollback-only; a
+  foreign or buried index commit is never adopted or restored through. Schema-v6
+  files continue through the old loose classifier rather than being upgraded in
+  place.
   First-touch rollback deletes only the exact owned version-one dataset and only
   while no manifest registration or competing recovery claim owns the path. A
   foreign winner at an unregistered first-touch path is left untouched and is
@@ -501,12 +510,14 @@ recovery sweep in `crates/omnigraph/src/db/manifest/recovery.rs`:
 - After a successful roll-forward or roll-back, an internal
   `_graph_commit_recoveries.lance` row records `recovery_kind`,
   `recovery_for_actor` (the original sidecar's actor), `operation_id`, and
-  exact per-table outcomes. Schema-v3 Mutation/Load, schema-v4 BranchMerge, and
-  schema-v7 SchemaApply roll-forward publish the interrupted writer's fixed
-  lineage intent, including its original actor. Schema-v7 rollback and
-  schema-v6 EnsureIndices rollback reuse their pre-minted recovery commit ids
-  and durable audit plans, with the recovery actor. Other rollback and legacy
-  recovery commits use `actor_id = "omnigraph:recovery"`. Ordinary
+  exact per-table outcomes. Schema-v3 Mutation/Load, schema-v4 BranchMerge,
+  schema-v7 SchemaApply, and schema-v8 EnsureIndices roll-forward publish the
+  interrupted writer's fixed lineage intent, including its original actor.
+  Schema-v7/v8 rollback reuse their pre-minted recovery commit ids and durable
+  audit plans, with the recovery actor. Schema-v6 EnsureIndices files retain
+  that compatibility behavior under their original loose classification.
+  Other rollback and legacy recovery commits use
+  `actor_id = "omnigraph:recovery"`. Ordinary
   commit history is therefore not a complete recovery enumeration, and the
   CLI currently has no public query for the recovery-audit table.
 - Sidecar deleted as the final step.
@@ -532,10 +543,13 @@ it holds fixed authority/lineage and exact table identities from arm through one
 `ExactGraphHead` publish, including an empty effect set for metadata-only changes.
 Its owned first-touch cleanup and partial-table rollback happen only during Full
 recovery; the in-process healer remains roll-forward-only. Schema-v5 remains a
-backward-compatible bridge reader, not the current writer. EnsureIndices' schema-v6
-payload retains loose table-effect classification, but gives rollback a fixed commit
-id and a durable pre-restore audit plan so recovery re-entry cannot flip the outcome.
-Optimize retains its legacy effect adapter and a
+backward-compatible bridge reader, not the current writer. EnsureIndices' current
+schema-v8 payload holds fixed authority/lineage, one exact mixed-index transaction
+per table, the complete manifest delta, and exact first-touch ownership from arm
+through one `ExactGraphHead` publish. `Armed` is rollback-only;
+`EffectsConfirmed` rolls forward only while the captured authority still matches.
+Schema-v6 files remain backward-compatible bridge inputs with their original loose
+classification and fixed rollback plan. Optimize retains its legacy effect adapter and a
 branch-authority two-stage recovery barrier: the graph-wide entry probe is a fast
 path; after acquiring main's process-local branch-writer gate, Optimize relists and
 rejects every main-target sidecar plus graph-global SchemaApply before it reads table
@@ -589,18 +603,19 @@ future background reconciler. `ensure_indices` does not heal at entry itself;
 it is an explicit maintenance/reconciliation call, separate from mutation,
 load, and schema apply, and its strict preconditions fail loudly on drift.
 
-For enrolled mutation/load, branch merge, and SchemaApply, the publisher rechecks the
+For enrolled mutation/load, branch merge, SchemaApply, and EnsureIndices, the publisher rechecks the
 attempt's exact native branch identity and `graph_head` as well as table
 expectations. A
 concurrent graph commit anywhere on the target branch therefore invalidates the
 prepared authority instead of silently reparenting it. Before effects, an
 insert-only mutation or Append/Merge load fully reprepares with a bounded retry; strict
 Update/Delete/Overwrite and branch merge return `ReadSetChanged`; after any
-effect, any later error returns `RecoveryRequired` and leaves the fixed v3/v4/v7
+effect, any later error returns `RecoveryRequired` and leaves the fixed v3/v4/v7/v8
 intent durable. SchemaApply does not transparently reprepare after arming: a lost
 authority token is resolved by exact recovery, preserving a disjoint winner or
-failing closed on a buried same-table effect. Optimize/index remain on their
-writer-specific arbitration until their adapters are enrolled.
+failing closed on a buried same-table effect. EnsureIndices follows the same rule
+without transparent post-arm reprepare. Optimize alone remains on its
+writer-specific legacy arbitration until its adapter is enrolled.
 
 **Sidecar I/O failure semantics** (all sidecar I/O goes through the
 backend-generic `StorageAdapter`; the contracts below are pinned by the

@@ -2,38 +2,23 @@
 //!
 //! `TableStorage` is the engine-internal trait that exposes the
 //! staged-write primitives (`stage_append`, `stage_merge_insert`,
-//! `stage_overwrite`, `stage_create_btree_index`,
-//! `stage_create_inverted_index`) plus `commit_staged` as the canonical
+//! `stage_overwrite`, `stage_create_indices`) plus `commit_staged` as the canonical
 //! way for new engine writers to advance Lance HEAD without coupling
 //! "write bytes" with "advance HEAD" in one Lance API call.
 //!
-//! ## Inline-commit residuals live on a separate trait
-//!
-//! The inline-commit write OmniGraph has not yet migrated to
-//! stage-then-commit is NOT on `TableStorage`. It sits on
-//! [`InlineCommitResidual`], reachable only via
-//! `Omnigraph::storage_inline_residual()`, so the default `db.storage()`
-//! surface is staged-only and cannot couple "write bytes" with "advance
-//! HEAD" — MR-793 acceptance §1 closes by construction. The sole remaining
-//! residual:
-//!
-//! * `create_vector_index` — beta.21 exposes a usable staged shape for the
-//!   current one-segment full-table build, but the engine keeps the existing
-//!   residual until the exact EnsureIndices adapter can pre-mint and recover
-//!   its transaction. Lance #6666 remains relevant to generic multi-segment
-//!   exact publication. Scalar indices already stage.
-//!
-//! `delete_where` was the other residual until MR-A: Lance 7.0's
+//! `delete_where` was the final data-write residual until MR-A: Lance 7.0's
 //! `DeleteBuilder::execute_uncommitted` (#6658) made delete a staged write
 //! (`TableStorage::stage_delete` → `commit_staged`), so delete no longer
-//! advances Lance HEAD inline and the residual is gone.
+//! advances Lance HEAD inline. Lance beta.21's public full-table index
+//! `execute_uncommitted` shape now does the same for BTREE, FTS, and vector
+//! index builds. There is no separate inline-commit storage surface left.
 //!
-//! Each is named honestly at its call site; the forbidden-API guard test
-//! catches direct lance::* misuse outside the storage layer.
+//! The forbidden-API guard test catches direct lance::* misuse outside the
+//! storage layer.
 //!
 //! ## Sealed
 //!
-//! Both `TableStorage` and `InlineCommitResidual` are `: sealed::Sealed`.
+//! `TableStorage` is `: sealed::Sealed`.
 //! Only types in this crate can implement them, so a downstream crate
 //! cannot subvert the contract by providing its own impl.
 //!
@@ -50,9 +35,9 @@
 //! Phases 1a / 2 / 4 / 5 / 6 landed in MR-793 PR #70 (trait scaffolding,
 //! staged primitives, migration of `ensure_indices` / `branch_merge` /
 //! `schema_apply` onto the staged surface). Phase 1b (call-site
-//! conversion) and Phase 9 landed in MR-854, which also split the
-//! inline-commit residuals onto `InlineCommitResidual` so `db.storage()`
-//! is staged-only. Phase 7 (recovery reconciler) shipped as MR-847;
+//! conversion) and Phase 9 landed in MR-854, which made `db.storage()`
+//! staged-only. The exact EnsureIndices adapter later retired the final
+//! inline-commit residual. Phase 7 (recovery reconciler) shipped as MR-847;
 //! Phase 8 (index reconciler) is tracked as MR-848.
 
 use std::fmt::Debug;
@@ -79,6 +64,21 @@ pub(crate) mod sealed {
     pub trait Sealed {}
 
     impl Sealed for crate::table_store::TableStore {}
+}
+
+/// One physical index artifact to include in a staged table-level index
+/// transaction.
+///
+/// A non-empty slice of these specs is built against one pinned Lance dataset
+/// version and published by [`TableStorage::stage_create_indices`] as one
+/// transaction. The type deliberately describes only the full-table shapes
+/// OmniGraph owns today; generic prebuilt/multi-segment publication remains
+/// outside this storage contract.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum IndexBuildSpec {
+    BTree { column: String },
+    FullText { column: String },
+    Vector { column: String },
 }
 
 // ─── opaque handles ────────────────────────────────────────────────────────
@@ -480,28 +480,16 @@ pub trait TableStorage: sealed::Sealed + Send + Sync + Debug {
         filter: &str,
     ) -> Result<Option<StagedHandle>>;
 
-    /// Stage a BTREE scalar index build. MR-793 Phase 2.
-    async fn stage_create_btree_index(
+    /// Stage every requested full-table index in one Lance transaction.
+    /// Building the index files does not advance HEAD; the returned handle is
+    /// committed through `commit_staged` or `commit_staged_exact`.
+    async fn stage_create_indices(
         &self,
         snapshot: &SnapshotHandle,
-        columns: &[&str],
-    ) -> Result<StagedHandle>;
-
-    /// Stage an INVERTED (FTS) scalar index build. MR-793 Phase 2.
-    async fn stage_create_inverted_index(
-        &self,
-        snapshot: &SnapshotHandle,
-        column: &str,
+        specs: &[IndexBuildSpec],
     ) -> Result<StagedHandle>;
 
     // ── Index presence (reads, no HEAD advance) ──────────────────────
-    //
-    // The inline-commit residual (`create_vector_index`) is deliberately NOT
-    // on this trait. It lives on
-    // the separate `InlineCommitResidual` trait, reachable only through
-    // `Omnigraph::storage_inline_residual()`. As a result the default
-    // `db.storage()` surface cannot couple "write bytes" with "advance HEAD"
-    // — closing MR-793 acceptance §1 by construction rather than by review.
 
     async fn has_btree_index(&self, snapshot: &SnapshotHandle, column: &str) -> Result<bool>;
     async fn has_fts_index(&self, snapshot: &SnapshotHandle, column: &str) -> Result<bool>;
@@ -531,34 +519,6 @@ pub trait TableStorage: sealed::Sealed + Send + Sync + Debug {
         order_by: Option<Vec<ColumnOrdering>>,
         with_row_id: bool,
     ) -> Result<DatasetRecordBatchStream>;
-}
-
-// ─── InlineCommitResidual trait ────────────────────────────────────────────
-
-/// Inline-commit residual surface: the write OmniGraph has not yet migrated to
-/// a stage-then-commit pair, so it advances Lance HEAD as a side effect of
-/// writing. Kept OFF `TableStorage` and reachable only through
-/// `Omnigraph::storage_inline_residual()`, so the default `db.storage()` path
-/// is staged-only and a new writer cannot reintroduce the write+commit coupling
-/// by accident (MR-793 acceptance §1, by construction).
-///
-/// Residual reasons (each is named honestly at its call site):
-/// * `create_vector_index` — beta.21 can stage the current full-table vector
-///   shape; the exact EnsureIndices adapter still has to migrate it and retire
-///   this residual. Lance #6666 remains relevant to generic multi-segment exact
-///   publication. Scalar indices already stage.
-///
-/// `delete_where` used to live here, but Lance 7.0's
-/// `DeleteBuilder::execute_uncommitted` (#6658) made delete a staged write
-/// (`TableStorage::stage_delete` → `commit_staged`); it was retired in MR-A so
-/// delete no longer advances Lance HEAD inline.
-#[async_trait]
-pub(crate) trait InlineCommitResidual: sealed::Sealed + Send + Sync + Debug {
-    async fn create_vector_index(
-        &self,
-        snapshot: SnapshotHandle,
-        column: &str,
-    ) -> Result<SnapshotHandle>;
 }
 
 // ─── single impl: TableStore ──────────────────────────────────────────────
@@ -883,22 +843,12 @@ impl TableStorage for TableStore {
             .map(StagedHandle::new))
     }
 
-    async fn stage_create_btree_index(
+    async fn stage_create_indices(
         &self,
         snapshot: &SnapshotHandle,
-        columns: &[&str],
+        specs: &[IndexBuildSpec],
     ) -> Result<StagedHandle> {
-        TableStore::stage_create_btree_index(self, snapshot.dataset(), columns)
-            .await
-            .map(StagedHandle::new)
-    }
-
-    async fn stage_create_inverted_index(
-        &self,
-        snapshot: &SnapshotHandle,
-        column: &str,
-    ) -> Result<StagedHandle> {
-        TableStore::stage_create_inverted_index(self, snapshot.dataset(), column)
+        TableStore::stage_create_indices(self, snapshot.dataset(), specs)
             .await
             .map(StagedHandle::new)
     }
@@ -942,18 +892,5 @@ impl TableStorage for TableStore {
             with_row_id,
         )
         .await
-    }
-}
-
-#[async_trait]
-impl InlineCommitResidual for TableStore {
-    async fn create_vector_index(
-        &self,
-        snapshot: SnapshotHandle,
-        column: &str,
-    ) -> Result<SnapshotHandle> {
-        let mut ds = Arc::try_unwrap(snapshot.into_arc()).unwrap_or_else(|arc| (*arc).clone());
-        TableStore::create_vector_index(self, &mut ds, column).await?;
-        Ok(SnapshotHandle::new(ds))
     }
 }

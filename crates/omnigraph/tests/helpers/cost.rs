@@ -78,7 +78,7 @@ impl IoCounts {
 pub struct StagedCounts {
     pub stage_append: u64,
     pub stage_merge_insert: u64,
-    pub create_vector_index: u64,
+    pub stage_vector_index: u64,
     pub scan_staged_combined: u64,
 }
 
@@ -372,7 +372,7 @@ pub async fn measure_with_staged<F: Future>(op: F) -> (F::Output, IoCounts, Stag
     let staged = StagedCounts {
         stage_append: merge.stage_append_calls(),
         stage_merge_insert: merge.stage_merge_insert_calls(),
-        create_vector_index: merge.create_vector_index_calls(),
+        stage_vector_index: merge.stage_vector_index_calls(),
         scan_staged_combined: merge.scan_staged_combined_calls(),
     };
     (out, handles.counts(), staged)

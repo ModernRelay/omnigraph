@@ -12,7 +12,7 @@ owner:
 
 **Status:** Draft / for team review
 **Date:** 2026-07-12
-**Surveyed:** OmniGraph 0.8.1 (`main`); Lance 9.0.0-beta.15, git rev `f24e42c1`
+**Surveyed:** OmniGraph 0.8.1 (`main`); Lance 9.0.0-beta.21, git rev `1aec1465`
 **Audience:** engine and storage maintainers
 **Open architecture review:** [RFC-022–027 review ledger](../dev/rfc-022-027-architecture-review.md).
 Findings marked **BLOCKER** must be dispositioned before acceptance.
@@ -535,14 +535,22 @@ able to enumerate every adapter and every entry point that invokes it.
 - It records the exact achieved version rather than assuming one version of movement.
 - If the new data-table version is selected through `__manifest`, publishing that
   pointer is a graph-visible commit and uses this protocol.
-- Until EnsureIndices receives its full exact effect adapter, its schema-v6 bridge
-  retains legacy loose table classification but pre-mints a stable rollback commit
-  id. Recovery persists the observed rollback audit plan before the first restore;
-  a retry after rollback publish therefore finalizes the same `RolledBack` outcome
-  instead of inferring direction from aligned numeric pins.
-- Schema-v6 does not prove ownership of an index commit and does not add a fixed
-  forward outcome. Exact transaction chains, fixed original lineage, and exact
-  first-touch ref identity remain requirements of the full adapter.
+- EnsureIndices uses the exact schema-v8 adapter. It plans every missing BTREE,
+  FTS, and full-table vector artifact for one table against one pinned base and
+  combines them into one staged `Operation::CreateIndex`, so a touched table
+  advances exactly once. Before effects it captures native branch + exact graph
+  head + schema authority, fixed original/rollback lineage, the exact transaction
+  identity per table, and the complete table-pointer delta. First-touch named refs
+  remain sidecar-before-ref and bind their exact Lance ref identity at
+  confirmation.
+- `Armed` v8 effects are rollback-only. After every exact transaction lands at
+  `read_version + 1`, the writer atomically records `EffectsConfirmed` with the
+  complete fixed delta; only that state may roll forward under the unchanged
+  authority token. Foreign movement is never adopted, and an owned effect buried
+  by a same-table winner fails closed.
+- Readers retain schema-v6 EnsureIndices sidecars under their original loose
+  classification, fixed rollback id, and durable rollback-audit semantics. A v6
+  file is a compatibility input, never reinterpreted as a v8 ownership proof.
 - Optimize retains its legacy loose effect adapter. Its synchronous overlap
   barrier is two-stage: a broad entry probe, then a relist under main's
   process-local branch-writer gate that rejects every main-target sidecar plus
@@ -790,8 +798,12 @@ Implementation proceeds in this order:
    > existing manifest-owned table or a buried same-table effect fails closed.
    > Read-only open also refuses the fixed-manifest/pre-promotion window without
    > mutating it. The reader still understands schema-v5 bridge files without
-   > upgrading their semantics. Optimize/index and MemWAL fold remain on their
-   > writer-specific paths until their adapter slices land.
+   > upgrading their semantics. EnsureIndices now uses schema-v8 exact authority,
+   > one mixed CreateIndex transaction per table, fixed lineage/delta, exact
+   > first-touch ownership, and retains the schema-v6 compatibility reader.
+   > Optimize remains on its legacy writer-specific path. MemWAL is the supported,
+   > strategic substrate selected by RFC-026; its separate fold enrollment remains
+   > owned by that RFC rather than this EnsureIndices slice.
 
    > **Branch-control/cleanup slice (2026-07-11):** native graph-branch create
    > and delete now use the §7 authority classifier, including pre-clone name
@@ -804,8 +816,8 @@ Implementation proceeds in this order:
    > first table GC.
 3. Convert mutation/load, branch merge, schema apply/migration, data-table optimize,
    and graph-visible index work one adapter at a time. Mutation/load, branch merge,
-   and SchemaApply are complete as of 2026-07-12; Optimize/EnsureIndices remain on
-   their documented legacy/bridge adapters.
+   SchemaApply, and EnsureIndices are complete as of 2026-07-13; Optimize remains
+   on its documented legacy adapter.
 4. Add static or runtime enumeration proving no graph-visible entry point bypasses the
    coordinator.
 5. Delete superseded writer-specific orchestration only after its crash and
@@ -878,10 +890,15 @@ writers.
   HEAD advance, exact existing overwrite, strict first-touch create, fixed actor
   lineage, partial multi-table migration, foreign-winner races, and branch-local
   state.
-- Optimize/index: zero, one, and several Lance commits, including monotonic publish and
-  retryable physical contention.
-- MemWAL fold, when RFC-026 lands: merged-generation conflict and every fold crash
-  boundary.
+- EnsureIndices: zero-work/no-sidecar, one or several touched tables, one mixed
+  CreateIndex transaction and one version advance per table, pre-effect authority
+  loss, exact confirmation, first-touch sidecar ordering/identity, partial-Phase-B
+  rollback, confirmed roll-forward, and foreign/buried winner refusal. Retain a
+  frozen schema-v6 compatibility fixture.
+- Optimize: zero, one, and several Lance commits, including monotonic publish and
+  retryable physical contention; it remains the legacy adapter.
+- MemWAL fold (supported strategic substrate; enrollment owned by RFC-026):
+  merged-generation conflict and every fold crash boundary.
 - Native graph branch control: invalid name before clone; live path-prefix
   collision before clone; clone-only create recovery on main and a named source;
   pre-existing matching ref remains `AlreadyExists`; current-call lost create

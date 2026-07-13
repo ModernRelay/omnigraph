@@ -18,7 +18,7 @@ use lance::Dataset;
 use omnigraph::db::Omnigraph;
 
 mod helpers;
-use helpers::test_session;
+use helpers::{snapshot_main, test_session};
 use helpers::recovery::{RecoveryExpectation, TableExpectation, assert_post_recovery_invariants};
 
 const TEST_SCHEMA: &str = include_str!("fixtures/test.pg");
@@ -1213,8 +1213,17 @@ async fn recovery_ensure_indices_steady_state_no_sidecar() {
     db.ensure_indices().await.unwrap();
     drop(db);
 
-    let mut db = Omnigraph::open(uri).await.unwrap();
+    let db = Omnigraph::open(uri).await.unwrap();
+    let before = snapshot_main(&db).await.unwrap();
     db.ensure_indices().await.unwrap();
+    let after = snapshot_main(&db).await.unwrap();
+    assert_eq!(after.version(), before.version());
+    for key in ["node:Person", "node:Company", "edge:Knows", "edge:WorksAt"] {
+        assert_eq!(
+            after.entry(key).unwrap().table_version,
+            before.entry(key).unwrap().table_version
+        );
+    }
     assert!(
         list_recovery_dir(dir.path()).is_empty(),
         "steady-state ensure_indices must not leave a sidecar (no tables need work)"
@@ -1243,17 +1252,35 @@ async fn recovery_ensure_indices_steady_state_no_sidecar() {
 async fn recovery_ensure_indices_handles_empty_tables() {
     let dir = tempfile::tempdir().unwrap();
     let uri = dir.path().to_str().unwrap();
-    let mut db = Omnigraph::init(uri, TEST_SCHEMA).await.unwrap();
+    let db = Omnigraph::init(uri, TEST_SCHEMA).await.unwrap();
     // Don't load any data — every table is empty.
+    let before = snapshot_main(&db).await.unwrap();
     db.ensure_indices().await.unwrap();
+    let after = snapshot_main(&db).await.unwrap();
+    assert_eq!(after.version(), before.version());
+    for key in ["node:Person", "node:Company", "edge:Knows", "edge:WorksAt"] {
+        assert_eq!(
+            after.entry(key).unwrap().table_version,
+            before.entry(key).unwrap().table_version
+        );
+    }
     assert!(
         list_recovery_dir(dir.path()).is_empty(),
         "ensure_indices on an all-empty graph must not leave a sidecar"
     );
     // Reopen + ensure_indices — still steady state, still no sidecar.
     drop(db);
-    let mut db = Omnigraph::open(uri).await.unwrap();
+    let db = Omnigraph::open(uri).await.unwrap();
+    let before = snapshot_main(&db).await.unwrap();
     db.ensure_indices().await.unwrap();
+    let after = snapshot_main(&db).await.unwrap();
+    assert_eq!(after.version(), before.version());
+    for key in ["node:Person", "node:Company", "edge:Knows", "edge:WorksAt"] {
+        assert_eq!(
+            after.entry(key).unwrap().table_version,
+            before.entry(key).unwrap().table_version
+        );
+    }
     assert!(
         list_recovery_dir(dir.path()).is_empty(),
         "second ensure_indices on an all-empty graph must also not leave a sidecar"

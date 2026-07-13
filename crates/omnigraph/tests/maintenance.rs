@@ -1574,11 +1574,41 @@ async fn index_build_tolerates_null_vector_rows() {
     .await
     .expect("load rows with null embeddings");
 
-    // Must not abort: the untrainable vector column is deferred, the sibling
-    // BTREE on `n` still builds.
-    db.ensure_indices()
+    let before = snapshot_main(&db).await.unwrap();
+    let before_manifest_version = before.version();
+    let before_table_version = before.entry("node:Doc").unwrap().table_version;
+
+    // Must not abort: the untrainable vector column is deferred, while id,
+    // slug (FTS), and n (BTREE) are built together in one table transaction.
+    let pending = db
+        .ensure_indices()
         .await
         .expect("ensure_indices must not abort when a vector column has no trainable vectors yet");
+    assert_eq!(pending.len(), 1, "only the null vector index is pending");
+    assert_eq!(pending[0].table_key, "node:Doc");
+    assert_eq!(pending[0].column, "embedding");
+    assert_eq!(
+        pending[0].reason,
+        "column has no non-null vectors to train on yet"
+    );
+
+    let after = snapshot_main(&db).await.unwrap();
+    assert_eq!(
+        after.entry("node:Doc").unwrap().table_version,
+        before_table_version + 1,
+        "all buildable indexes for one table must land in one CreateIndex transaction"
+    );
+    assert_eq!(
+        after.version(),
+        before_manifest_version + 1,
+        "one reconciliation publishes exactly one graph commit"
+    );
+    let ds = after.open("node:Doc").await.unwrap();
+    let store = TableStore::new(uri, helpers::test_session());
+    assert!(store.has_btree_index(&ds, "id").await.unwrap());
+    assert!(store.has_fts_index(&ds, "slug").await.unwrap());
+    assert!(store.has_btree_index(&ds, "n").await.unwrap());
+    assert!(!store.has_vector_index(&ds, "embedding").await.unwrap());
 }
 
 // iss-848: `optimize` converges declared-but-unbuilt indexes. After an @index is
@@ -1627,6 +1657,10 @@ async fn optimize_materializes_index_declared_but_unbuilt() {
     // Postcondition: optimize's reconciler materialized the declared index.
     let snap = snapshot_main(&db).await.unwrap();
     let ds = snap.open("node:Doc").await.unwrap();
+    let store = TableStore::new(uri, helpers::test_session());
+    assert!(store.has_btree_index(&ds, "id").await.unwrap());
+    assert!(store.has_fts_index(&ds, "slug").await.unwrap());
+    assert!(store.has_btree_index(&ds, "rank").await.unwrap());
     assert_eq!(
         TableStore::key_column_index_coverage(&ds, "rank")
             .await

@@ -361,6 +361,7 @@ impl GraphCoordinator {
             .map(|id| id.map(SnapshotId::new))
     }
 
+    #[cfg(test)]
     pub(crate) async fn commit_updates_with_actor(
         &mut self,
         updates: &[SubTableUpdate],

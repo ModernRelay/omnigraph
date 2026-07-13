@@ -176,10 +176,11 @@ Behavior-affecting findings in this audit:
   directly in public `Operation::CreateIndex`. That source is byte-for-byte
   unchanged between beta.15 and beta.21 and has had this shape since upstream
   #7129. OmniGraph can therefore mirror the scalar staging path, pre-mint the
-  transaction identity, and commit through `commit_staged_exact`. The current
-  `InlineCommitResidual::create_vector_index` remains until the exact
-  EnsureIndices adapter lands; this is now an OmniGraph rollout gap, not an
-  upstream blocker for the one-segment full-table IVF-Flat build.
+  transaction identity, and commit through `commit_staged_exact`. The exact
+  EnsureIndices v8 adapter now does so: all missing BTREE, FTS, and full-table
+  vector artifacts for a table are combined into one `Operation::CreateIndex`,
+  and `InlineCommitResidual` has been removed. This closes the OmniGraph rollout
+  gap for the one-segment full-table IVF-Flat build.
 - **The generic multi-segment API is still not an exact-commit primitive.**
   `commit_existing_index_segments` constructs and inline-commits its own
   transaction with default retry behavior, while

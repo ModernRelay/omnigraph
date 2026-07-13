@@ -51,9 +51,9 @@ use super::manifest::{
 };
 use super::schema_state::{
     SCHEMA_SOURCE_FILENAME, load_or_bootstrap_schema_contract, load_validated_schema_contract,
-    read_accepted_schema_ir, read_schema_state_identity, recover_schema_state_files,
-    schema_ir_uri, schema_source_staging_uri, schema_source_uri, schema_state_uri,
-    validate_schema_contract, write_schema_contract, write_schema_contract_staging,
+    read_accepted_schema_ir, read_schema_state_identity, recover_schema_state_files, schema_ir_uri,
+    schema_source_staging_uri, schema_source_uri, schema_state_uri, validate_schema_contract,
+    write_schema_contract, write_schema_contract_staging,
 };
 use super::{
     ReadTarget, ResolvedTarget, SCHEMA_APPLY_LOCK_BRANCH, SnapshotId, is_internal_system_branch,
@@ -788,22 +788,6 @@ impl Omnigraph {
     /// (the trait's `stage_*` + `commit_staged` pair is the only way to
     /// land a write).
     pub(crate) fn storage(&self) -> &dyn crate::storage_layer::TableStorage {
-        &self.table_store
-    }
-
-    /// Inline-commit residual surface (`create_vector_index`) — the sole write
-    /// OmniGraph has not yet migrated to beta.21's usable full-table staged
-    /// shape. The exact EnsureIndices adapter owns that migration; Lance #6666
-    /// remains relevant to generic multi-segment exact publication.
-    /// Deliberately separate from [`Self::storage`] so the default storage
-    /// surface is staged-only and a new writer cannot couple "write bytes" with
-    /// "advance HEAD" by reaching for `db.storage()`. Only the vector-index
-    /// build uses this accessor — delete migrated to the staged path
-    /// (`stage_delete`) in MR-A. See
-    /// `crate::storage_layer::InlineCommitResidual` for the migration boundary.
-    pub(crate) fn storage_inline_residual(
-        &self,
-    ) -> &dyn crate::storage_layer::InlineCommitResidual {
         &self.table_store
     }
 
@@ -1578,7 +1562,8 @@ impl Omnigraph {
         target: impl Into<ReadTarget>,
     ) -> Result<ResolvedTarget> {
         self.ensure_schema_state_valid().await?;
-        self.resolve_target_after_schema_validation(target.into()).await
+        self.resolve_target_after_schema_validation(target.into())
+            .await
     }
 
     /// Resolve a target after the caller has already validated/captured the
@@ -1624,9 +1609,7 @@ impl Omnigraph {
         Ok((resolved, catalog))
     }
 
-    pub(crate) async fn capture_current_read_view(
-        &self,
-    ) -> Result<(ResolvedTarget, Arc<Catalog>)> {
+    pub(crate) async fn capture_current_read_view(&self) -> Result<(ResolvedTarget, Arc<Catalog>)> {
         let _schema_guard = self
             .write_queue()
             .acquire(&crate::db::manifest::schema_apply_serial_queue_key())

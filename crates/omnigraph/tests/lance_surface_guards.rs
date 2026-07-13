@@ -307,6 +307,39 @@ async fn _compile_uncommitted_delete_field_shape() -> lance::Result<()> {
     Ok(())
 }
 
+// --- Guard 8a: full-table vector indexing exposes uncommitted metadata -----
+//
+// EnsureIndices batches BTREE, FTS, and the current one-segment full-table
+// vector shape into one exact `Operation::CreateIndex`. This requires the
+// beta.21 builder to return complete public `IndexMetadata` without committing
+// HEAD. Compile-only: a Lance bump that removes or narrows the surface must
+// turn the compatibility smoke test red.
+#[allow(
+    dead_code,
+    unreachable_code,
+    unused_variables,
+    unused_mut,
+    clippy::diverging_sub_expression
+)]
+async fn _compile_uncommitted_full_table_vector_index_shape() -> lance::Result<()> {
+    use lance::index::vector::VectorIndexParams;
+    use lance_linalg::distance::MetricType;
+    use lance_table::format::IndexMetadata;
+
+    let mut ds: Dataset = unimplemented!();
+    let params = VectorIndexParams::ivf_flat(1, MetricType::L2);
+    let metadata: IndexMetadata = ds
+        .create_index_builder(&["embedding"], IndexType::Vector, &params)
+        .replace(true)
+        .execute_uncommitted()
+        .await?;
+    let _transaction_shape = Operation::CreateIndex {
+        new_indices: vec![metadata],
+        removed_indices: Vec::new(),
+    };
+    Ok(())
+}
+
 // --- Guard 8b: MergeInsertJob::execute_uncommitted returns
 //     UncommittedMergeInsert { transaction, affected_rows, stats, inserted_rows_filter } ---
 //

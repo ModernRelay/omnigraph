@@ -175,9 +175,10 @@ pub struct MergeWriteProbes {
     pub stage_append_rows: Arc<AtomicU64>,
     pub stage_merge_insert_calls: Arc<AtomicU64>,
     pub stage_merge_insert_rows: Arc<AtomicU64>,
-    /// Inline vector-index (IVF) builds. The fast-forward adopt path defers
-    /// index coverage to the reconciler, so an adopt merge must do 0 of these.
-    pub create_vector_index_calls: Arc<AtomicU64>,
+    /// Full-table vector-index (IVF) artifact builds. These count successful
+    /// staging, not HEAD publication; a stale prepared attempt may abandon the
+    /// immutable artifact before commit.
+    pub stage_vector_index_calls: Arc<AtomicU64>,
     /// Times the merge materialized a staged delta into one in-memory batch
     /// (`scan_staged_combined`). The append path streams instead, so an
     /// append-only fast-forward merge must do 0 of these.
@@ -197,8 +198,8 @@ impl MergeWriteProbes {
     pub fn stage_merge_insert_rows(&self) -> u64 {
         self.stage_merge_insert_rows.load(Ordering::Relaxed)
     }
-    pub fn create_vector_index_calls(&self) -> u64 {
-        self.create_vector_index_calls.load(Ordering::Relaxed)
+    pub fn stage_vector_index_calls(&self) -> u64 {
+        self.stage_vector_index_calls.load(Ordering::Relaxed)
     }
     pub fn scan_staged_combined_calls(&self) -> u64 {
         self.scan_staged_combined_calls.load(Ordering::Relaxed)
@@ -236,11 +237,11 @@ pub(crate) fn record_stage_merge_insert(rows: u64) {
     });
 }
 
-/// Record one inline vector-index build against the active probes. No-op in
-/// production (no probes installed).
-pub(crate) fn record_create_vector_index() {
+/// Record one successfully staged vector-index artifact build against the
+/// active probes. No-op in production (no probes installed).
+pub(crate) fn record_stage_vector_index() {
     let _ = MERGE_WRITE_PROBES.try_with(|p| {
-        p.create_vector_index_calls.fetch_add(1, Ordering::Relaxed);
+        p.stage_vector_index_calls.fetch_add(1, Ordering::Relaxed);
     });
 }
 
