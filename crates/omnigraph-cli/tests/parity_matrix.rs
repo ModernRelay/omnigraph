@@ -159,6 +159,24 @@ fn parity_branch_merge() {
     let (l, r) = p.run(&["branch", "merge", "feature", "--into", "main", "--json"],
     );
     assert_parity("branch merge", &l, &r);
+    // `--delete-branch` composes merge + delete at each arm's own boundary
+    // (embedded: two engine calls; remote: the server handler) — this row is
+    // the referee that keeps the two composition sites from drifting.
+    let (l, r) = p.run(&["branch", "create", "--from", "main", "feature2", "--json"],
+    );
+    assert_parity("branch create (delete-branch setup)", &l, &r);
+    let (l, r) = p.run(&[
+        "branch",
+        "merge",
+        "feature2",
+        "--into",
+        "main",
+        "--delete-branch",
+        "--json",
+    ]);
+    assert_parity("branch merge --delete-branch", &l, &r);
+    let (l, r) = p.run(&["branch", "list", "--json"]);
+    assert_parity("branch list (post delete-branch)", &l, &r);
 }
 
 #[test]

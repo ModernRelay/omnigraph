@@ -1900,6 +1900,127 @@ fn branch_merge_supports_explicit_target() {
 }
 
 #[test]
+fn branch_merge_delete_branch_deletes_source() {
+    let temp = tempdir().unwrap();
+    let graph = graph_path(temp.path());
+    init_graph(&graph);
+    load_fixture(&graph);
+
+    output_success(
+        cli()
+            .arg("branch")
+            .arg("create")
+            .arg("--uri")
+            .arg(&graph)
+            .arg("--from")
+            .arg("main")
+            .arg("feature"),
+    );
+    let feature_data = temp.path().join("feature-delete.jsonl");
+    write_jsonl(
+        &feature_data,
+        r#"{"type":"Person","data":{"name":"Gwen","age":35}}"#,
+    );
+    output_success(
+        cli()
+            .arg("load")
+            .arg("--data")
+            .arg(&feature_data)
+            .arg("--branch")
+            .arg("feature")
+            .arg("--mode")
+            .arg("append")
+            .arg(&graph),
+    );
+
+    let merge_output = output_success(
+        cli()
+            .arg("branch")
+            .arg("merge")
+            .arg("--uri")
+            .arg(&graph)
+            .arg("feature")
+            .arg("--delete-branch")
+            .arg("--json"),
+    );
+    let merge_payload: Value = serde_json::from_slice(&merge_output.stdout).unwrap();
+    assert_eq!(merge_payload["outcome"], "fast_forward");
+    assert_eq!(merge_payload["branch_deleted"], true);
+    assert!(merge_payload["branch_delete_error"].is_null());
+
+    let list_output = output_success(
+        cli()
+            .arg("branch")
+            .arg("list")
+            .arg("--uri")
+            .arg(&graph)
+            .arg("--json"),
+    );
+    let list_payload: Value = serde_json::from_slice(&list_output.stdout).unwrap();
+    assert_eq!(list_payload["branches"], serde_json::json!(["main"]));
+}
+
+#[test]
+fn branch_merge_delete_branch_refusal_warns_and_exits_zero() {
+    let temp = tempdir().unwrap();
+    let graph = graph_path(temp.path());
+    init_graph(&graph);
+    load_fixture(&graph);
+
+    for (from, name) in [("main", "feature"), ("feature", "feature-child")] {
+        output_success(
+            cli()
+                .arg("branch")
+                .arg("create")
+                .arg("--uri")
+                .arg(&graph)
+                .arg("--from")
+                .arg(from)
+                .arg(name),
+        );
+    }
+
+    // `feature` has a dependent descendant, so the post-merge deletion is
+    // refused — the merge (already_up_to_date: deletion is still attempted)
+    // must succeed with exit code 0 and a stderr warning.
+    let merge_output = output_success(
+        cli()
+            .arg("branch")
+            .arg("merge")
+            .arg("--uri")
+            .arg(&graph)
+            .arg("feature")
+            .arg("--delete-branch")
+            .arg("--json"),
+    );
+    let merge_payload: Value = serde_json::from_slice(&merge_output.stdout).unwrap();
+    assert_eq!(merge_payload["outcome"], "already_up_to_date");
+    assert_eq!(merge_payload["branch_deleted"], false);
+    assert!(
+        merge_payload["branch_delete_error"]
+            .as_str()
+            .unwrap()
+            .contains("feature-child")
+    );
+    let stderr = String::from_utf8_lossy(&merge_output.stderr);
+    assert!(stderr.contains("could not delete branch 'feature'"));
+
+    let list_output = output_success(
+        cli()
+            .arg("branch")
+            .arg("list")
+            .arg("--uri")
+            .arg(&graph)
+            .arg("--json"),
+    );
+    let list_payload: Value = serde_json::from_slice(&list_output.stdout).unwrap();
+    assert_eq!(
+        list_payload["branches"],
+        serde_json::json!(["feature", "feature-child", "main"])
+    );
+}
+
+#[test]
 fn snapshot_json_returns_manifest_version_and_tables() {
     let temp = tempdir().unwrap();
     let graph = graph_path(temp.path());

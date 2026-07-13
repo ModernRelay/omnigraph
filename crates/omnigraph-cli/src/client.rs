@@ -655,7 +655,12 @@ impl GraphClient {
         }
     }
 
-    pub(crate) async fn branch_merge(&self, source: &str, into: &str) -> Result<BranchMergeOutput> {
+    pub(crate) async fn branch_merge(
+        &self,
+        source: &str,
+        into: &str,
+        delete_branch: bool,
+    ) -> Result<BranchMergeOutput> {
         match self {
             GraphClient::Remote {
                 http,
@@ -669,7 +674,7 @@ impl GraphClient {
                     Some(serde_json::to_value(BranchMergeRequest {
                         source: source.to_string(),
                         target: Some(into.to_string()),
-                        delete_branch: false,
+                        delete_branch,
                     })?),
                     token.as_deref(),
                 )
@@ -679,13 +684,25 @@ impl GraphClient {
                 let db = Self::open_embedded(uri).await?;
                 let actor = actor.as_deref();
                 let outcome = db.branch_merge_as(source, into, actor).await?;
+                // Composed exactly like the server handler: the merge is
+                // durable, so a deletion refusal/failure is reported in the
+                // payload, never as an error (parity_matrix pins the two
+                // composition sites against drift).
+                let (branch_deleted, branch_delete_error) = if delete_branch {
+                    match db.branch_delete_as(source, actor).await {
+                        Ok(()) => (Some(true), None),
+                        Err(err) => (Some(false), Some(err.to_string())),
+                    }
+                } else {
+                    (None, None)
+                };
                 Ok(BranchMergeOutput {
                     source: source.to_string(),
                     target: into.to_string(),
                     outcome: outcome.into(),
                     actor_id: actor.map(String::from),
-                    branch_deleted: None,
-                    branch_delete_error: None,
+                    branch_deleted,
+                    branch_delete_error,
                 })
             }
         }
