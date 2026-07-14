@@ -17,6 +17,7 @@ use helpers::*;
 const SCHEMA: &str = r#"
 node Metric {
     name: String @key
+    label: String? @index
     score: F64?
     ratio: F32?
     count: I32?
@@ -24,13 +25,23 @@ node Metric {
     born: Date?
     seen: DateTime?
 }
+node Tag {
+    tname: String @key
+}
+edge Tagged: Metric -> Tag
 "#;
 
 // Seeds partition every predicate, so a dropped filter returns all 4 rows.
-const DATA: &str = r#"{"type":"Metric","data":{"name":"m1","score":2.5,"ratio":0.5,"count":1,"active":true,"born":"2024-06-01","seen":"2024-06-01T12:00:00Z"}}
-{"type":"Metric","data":{"name":"m2","score":1.0,"ratio":0.25,"count":2,"active":false,"born":"2023-01-01","seen":"2023-01-01T00:00:00Z"}}
-{"type":"Metric","data":{"name":"m3","score":3.0,"ratio":0.75,"count":3,"active":true,"born":"2025-01-01","seen":"2025-01-01T00:00:00Z"}}
-{"type":"Metric","data":{"name":"m4","score":0.5,"ratio":0.1,"count":4,"active":false,"born":"2022-12-31","seen":"2022-01-01T00:00:00Z"}}"#;
+// m4 carries no label, pinning NULL-is-not-a-match for the string predicates.
+const DATA: &str = r#"{"type":"Metric","data":{"name":"m1","label":"alpha one","score":2.5,"ratio":0.5,"count":1,"active":true,"born":"2024-06-01","seen":"2024-06-01T12:00:00Z"}}
+{"type":"Metric","data":{"name":"m2","label":"alps","score":1.0,"ratio":0.25,"count":2,"active":false,"born":"2023-01-01","seen":"2023-01-01T00:00:00Z"}}
+{"type":"Metric","data":{"name":"m3","label":"beta ray","score":3.0,"ratio":0.75,"count":3,"active":true,"born":"2025-01-01","seen":"2025-01-01T00:00:00Z"}}
+{"type":"Metric","data":{"name":"m4","score":0.5,"ratio":0.1,"count":4,"active":false,"born":"2022-12-31","seen":"2022-01-01T00:00:00Z"}}
+{"type":"Tag","data":{"tname":"alpine"}}
+{"type":"Tag","data":{"tname":"basalt"}}
+{"edge":"Tagged","from":"m1","to":"alpine"}
+{"edge":"Tagged","from":"m1","to":"basalt"}
+{"edge":"Tagged","from":"m3","to":"basalt"}"#;
 
 async fn metric_db(dir: &tempfile::TempDir) -> Omnigraph {
     let uri = dir.path().to_str().unwrap();
@@ -144,6 +155,139 @@ query seen_eq() { match { $m: Metric { seen: datetime("2024-06-01T12:00:00Z") } 
     // Date32/Date64 literal: the epoch conversion must select exactly m1.
     assert_eq!(sorted_metric_names(&mut db, q, "born_eq").await, vec!["m1"]);
     assert_eq!(sorted_metric_names(&mut db, q, "seen_eq").await, vec!["m1"]);
+}
+
+// Exact string predicates: `starts_with` and the String overload of
+// `contains`. Standalone filters on a scanned variable are hoisted into the
+// NodeScan (the pushdown arm — Lance probes a covering BTREE/NGRAM index when
+// one exists and scans otherwise); the same predicates on a variable
+// introduced by a traversal stay in the in-memory arm. Both arms must agree,
+// and NULL is never a match on either.
+#[tokio::test]
+async fn string_predicate_filters_execute_on_scanned_variable() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut db = metric_db(&dir).await;
+    let q = r#"
+query prefix() { match { $m: Metric  $m.label starts_with "alp" } return { $m.name } }
+query prefix_param($q: String) { match { $m: Metric  $m.label starts_with $q } return { $m.name } }
+query substr() { match { $m: Metric  $m.label contains "ta r" } return { $m.name } }
+query substr_all() { match { $m: Metric  $m.label contains "a" } return { $m.name } }
+query key_prefix() { match { $m: Metric  $m.name starts_with "m" } return { $m.name } }
+"#;
+    // Prefix: "alpha one", "alps" start with "alp"; NULL label (m4) is not a match.
+    assert_eq!(sorted_metric_names(&mut db, q, "prefix").await, vec!["m1", "m2"]);
+    // Substring across a token boundary — proves exact substring, not FTS
+    // token matching ("ta r" spans "beta ray").
+    assert_eq!(sorted_metric_names(&mut db, q, "substr").await, vec!["m3"]);
+    // Single-char needle (below the NGRAM trigram width) still returns exact results.
+    assert_eq!(
+        sorted_metric_names(&mut db, q, "substr_all").await,
+        vec!["m1", "m2", "m3"]
+    );
+    // Prefix over the BTREE'd @key column: every row matches.
+    assert_eq!(
+        sorted_metric_names(&mut db, q, "key_prefix").await,
+        vec!["m1", "m2", "m3", "m4"]
+    );
+    // Param-bound needle takes the same path as a literal.
+    let r = query_main(&mut db, q, "prefix_param", &params(&[("$q", "alph")]))
+        .await
+        .unwrap();
+    assert_eq!(r.num_rows(), 1, "only m1's label starts with 'alph'");
+}
+
+// Structural pin for the hoist: a standalone string predicate on a scanned
+// variable must be lowered into the NodeScan's `filter_expr` (pushdown arm,
+// where Lance can probe a covering index), NOT evaluated by the in-memory
+// arm — results alone cannot tell the two apart, because a silent full-scan
+// fallback returns the same rows. Same probe pattern as the merge
+// fast-forward structural gates (`omnigraph::instrumentation`).
+#[tokio::test]
+async fn standalone_string_predicate_is_hoisted_into_scan() {
+    use omnigraph::instrumentation::{QueryIoProbes, with_query_io_probes};
+    use std::sync::atomic::Ordering;
+
+    let dir = tempfile::tempdir().unwrap();
+    let mut db = metric_db(&dir).await;
+    let q = r#"query prefix() { match { $m: Metric  $m.label starts_with "alp" } return { $m.name } }"#;
+
+    let probes = QueryIoProbes::default();
+    let r = with_query_io_probes(
+        probes.clone(),
+        query_main(&mut db, q, "prefix", &ParamMap::new()),
+    )
+    .await
+    .unwrap();
+    assert_eq!(r.num_rows(), 2, "alpha one + alps");
+    assert_eq!(
+        probes.pushed_filter_exprs.load(Ordering::Relaxed),
+        1,
+        "the standalone starts_with must be hoisted into the scan's filter_expr"
+    );
+    assert_eq!(
+        probes.in_memory_filters.load(Ordering::Relaxed),
+        0,
+        "no in-memory filter application — the hoist must fully consume the predicate"
+    );
+}
+
+// Composition shapes: a string predicate combined with an FTS search filter
+// on the same scanned variable (both reach the same NodeScan — FTS via
+// full_text_search, the predicate via filter_expr), and a string predicate
+// inside `not { }` (anti-join inner pipeline). `ensure_indices` runs first,
+// so the prefix predicate here executes over a real dual-indexed (FTS +
+// companion BTREE) free-text column, not just the scan fallback.
+#[tokio::test]
+async fn string_predicates_compose_with_search_and_negation() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut db = metric_db(&dir).await;
+    db.ensure_indices().await.unwrap();
+    let q = r#"
+query prefix_and_search() {
+    match {
+        $m: Metric
+        search($m.label, "alps")
+        $m.label starts_with "al"
+    }
+    return { $m.name }
+}
+query not_alp_tagged() {
+    match {
+        $m: Metric
+        not { $m tagged $t  $t.tname starts_with "alp" }
+    }
+    return { $m.name }
+}
+"#;
+    // FTS matches the "alps" token (m2); the prefix filter keeps it.
+    assert_eq!(
+        sorted_metric_names(&mut db, q, "prefix_and_search").await,
+        vec!["m2"]
+    );
+    // Only m1 is tagged "alpine"; the anti-join drops it and keeps the rest.
+    assert_eq!(
+        sorted_metric_names(&mut db, q, "not_alp_tagged").await,
+        vec!["m2", "m3", "m4"]
+    );
+}
+
+#[tokio::test]
+async fn string_predicate_filters_execute_on_expanded_variable() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut db = metric_db(&dir).await;
+    // $t is introduced by the traversal, so these standalone filters take the
+    // in-memory arm — results must match the pushdown arm's semantics.
+    let q = r#"
+query tag_prefix() { match { $m: Metric  $m tagged $t  $t.tname starts_with "alp" } return { $m.name } }
+query tag_substr() { match { $m: Metric  $m tagged $t  $t.tname contains "sal" } return { $m.name } }
+"#;
+    // Only m1 is tagged "alpine".
+    assert_eq!(sorted_metric_names(&mut db, q, "tag_prefix").await, vec!["m1"]);
+    // "basalt" contains "sal": m1 and m3.
+    assert_eq!(
+        sorted_metric_names(&mut db, q, "tag_substr").await,
+        vec!["m1", "m3"]
+    );
 }
 
 // #283: a property-match on a camelCase `@index` field must execute, not fail

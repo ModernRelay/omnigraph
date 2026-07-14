@@ -67,6 +67,15 @@ pub struct QueryIoProbes {
     /// invocations). A cost test asserts a query referencing one edge builds only
     /// that edge, not every catalog edge (the cold-build shrink A2 ships).
     pub graph_edges_built: Arc<AtomicU64>,
+    /// IR filters lowered into a scan-level DataFusion `filter_expr` (summed
+    /// over `build_lance_filter_expr` calls). Lets a test assert a standalone
+    /// string-match predicate was HOISTED into the NodeScan (where Lance can
+    /// probe a covering index) rather than silently degrading to the
+    /// in-memory arm — a result-only assertion passes either way.
+    pub pushed_filter_exprs: Arc<AtomicU64>,
+    /// Filters evaluated by the in-memory arm (`projection.rs::apply_filter`),
+    /// the complement of `pushed_filter_exprs` for hoist assertions.
+    pub in_memory_filters: Arc<AtomicU64>,
 }
 
 tokio::task_local! {
@@ -161,6 +170,20 @@ pub(crate) fn record_graph_build(edges: usize) {
         p.graph_build_count.fetch_add(1, Ordering::Relaxed);
         p.graph_edges_built.fetch_add(edges as u64, Ordering::Relaxed);
     });
+}
+
+/// Record `n` IR filters lowered into a scan-level `filter_expr`. No-op when
+/// no probes are installed (production) and when nothing was pushed.
+pub(crate) fn record_pushed_filter_exprs(n: u64) {
+    if n > 0 {
+        let _ = current(|p| p.pushed_filter_exprs.fetch_add(n, Ordering::Relaxed));
+    }
+}
+
+/// Record one in-memory filter application (`apply_filter`). No-op when no
+/// probes are installed (production).
+pub(crate) fn record_in_memory_filter() {
+    let _ = current(|p| p.in_memory_filters.fetch_add(1, Ordering::Relaxed));
 }
 
 /// Per-operation staged-write counts, installed for a task via

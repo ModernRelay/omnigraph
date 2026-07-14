@@ -879,9 +879,21 @@ fn typecheck_filter(
 
     if let (ResolvedType::Scalar(l), ResolvedType::Scalar(r)) = (&left_type, &right_type) {
         if filter.op == CompOp::Contains {
+            // Overloaded on the left operand: list → membership, scalar
+            // String → exact substring. Lowering resolves the String form to
+            // `StringContains` so execution never re-derives the dispatch.
+            if !l.list && matches!(l.scalar, ScalarType::String) {
+                if r.list || !matches!(r.scalar, ScalarType::String) {
+                    return Err(CompilerError::Type(format!(
+                        "T7: string contains requires a String right operand, got {}",
+                        r.display_name()
+                    )));
+                }
+                return Ok(());
+            }
             if !l.list {
                 return Err(CompilerError::Type(format!(
-                    "T7: contains requires a list property on the left, got {}",
+                    "T7: contains requires a list property (membership) or a String property (substring) on the left, got {}",
                     l.display_name()
                 )));
             }
@@ -904,6 +916,28 @@ fn typecheck_filter(
                     "T7: cannot test membership of {} in {}",
                     r.display_name(),
                     l.display_name()
+                )));
+            }
+            return Ok(());
+        }
+
+        if matches!(filter.op, CompOp::StartsWith | CompOp::StringContains) {
+            // Exact, case-sensitive string predicates: scalar String on both
+            // sides. (`StringContains` only exists post-lowering, but the
+            // check is written over both ops so re-typechecking IR-shaped
+            // input stays consistent.)
+            if l.list || !matches!(l.scalar, ScalarType::String) {
+                return Err(CompilerError::Type(format!(
+                    "T7: {} requires a String property on the left, got {}",
+                    filter.op,
+                    l.display_name()
+                )));
+            }
+            if r.list || !matches!(r.scalar, ScalarType::String) {
+                return Err(CompilerError::Type(format!(
+                    "T7: {} requires a String right operand, got {}",
+                    filter.op,
+                    r.display_name()
                 )));
             }
             return Ok(());

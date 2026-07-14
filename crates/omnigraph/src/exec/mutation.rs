@@ -364,9 +364,16 @@ fn predicate_to_sql(
         CompOp::Lt => "<",
         CompOp::Ge => ">=",
         CompOp::Le => "<=",
-        CompOp::Contains => {
+        // The mutation grammar only admits comparison ops; these arms are
+        // defense in depth for IR built outside the parser.
+        CompOp::Contains | CompOp::StringContains => {
             return Err(OmniError::manifest(
                 "contains predicate not supported in mutations".to_string(),
+            ));
+        }
+        CompOp::StartsWith => {
+            return Err(OmniError::manifest(
+                "starts_with predicate not supported in mutations".to_string(),
             ));
         }
     };

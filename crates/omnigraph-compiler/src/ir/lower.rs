@@ -4,7 +4,7 @@ use crate::catalog::Catalog;
 use crate::error::Result;
 use crate::query::ast::*;
 use crate::query::typecheck::TypeContext;
-use crate::types::Direction;
+use crate::types::{Direction, PropType, ScalarType};
 
 use super::*;
 
@@ -19,6 +19,15 @@ pub fn lower_query(
         ));
     }
     let param_names: HashSet<String> = query.params.iter().map(|p| p.name.clone()).collect();
+    // Param types were validated during typecheck; unknown names simply
+    // don't participate in `contains` overload resolution below.
+    let param_types: HashMap<String, PropType> = query
+        .params
+        .iter()
+        .filter_map(|p| {
+            PropType::from_param_type_name(&p.type_name, p.nullable).map(|t| (p.name.clone(), t))
+        })
+        .collect();
 
     let mut pipeline = Vec::new();
     let mut bound_vars = HashSet::new();
@@ -30,6 +39,7 @@ pub fn lower_query(
         &mut pipeline,
         &mut bound_vars,
         &param_names,
+        &param_types,
     )?;
 
     let return_exprs: Vec<IRProjection> = query
@@ -131,6 +141,7 @@ fn lower_clauses(
     pipeline: &mut Vec<IROp>,
     bound_vars: &mut HashSet<String>,
     param_names: &HashSet<String>,
+    param_types: &HashMap<String, PropType>,
 ) -> Result<()> {
     // Separate clause types for ordering: bindings first, then traversals, then filters
     let mut bindings = Vec::new();
@@ -375,7 +386,7 @@ fn lower_clauses(
     for filter in &filters {
         pipeline.push(IROp::Filter(IRFilter {
             left: lower_expr(&filter.left, param_names),
-            op: filter.op,
+            op: resolve_filter_op(catalog, type_ctx, param_types, filter),
             right: lower_expr(&filter.right, param_names),
         }));
     }
@@ -394,6 +405,7 @@ fn lower_clauses(
             &mut inner_pipeline,
             &mut inner_bound,
             param_names,
+            param_types,
         )?;
 
         pipeline.push(IROp::AntiJoin {
@@ -403,6 +415,38 @@ fn lower_clauses(
     }
 
     Ok(())
+}
+
+/// Resolve the overloaded `contains` keyword to its String-substring form
+/// (`StringContains`) when the left operand is a scalar String, so execution
+/// dispatches on the IR op alone and never re-derives operand types.
+fn resolve_filter_op(
+    catalog: &Catalog,
+    type_ctx: &TypeContext,
+    param_types: &HashMap<String, PropType>,
+    filter: &Filter,
+) -> CompOp {
+    if filter.op != CompOp::Contains {
+        return filter.op;
+    }
+    let left_is_scalar_string = match &filter.left {
+        Expr::PropAccess { variable, property } => type_ctx
+            .bindings
+            .get(variable)
+            .and_then(|bv| catalog.node_types.get(&bv.type_name))
+            .and_then(|nt| nt.properties.get(property))
+            .is_some_and(|p| !p.list && matches!(p.scalar, ScalarType::String)),
+        Expr::Literal(Literal::String(_)) => true,
+        Expr::Variable(v) => param_types
+            .get(v)
+            .is_some_and(|t| !t.list && matches!(t.scalar, ScalarType::String)),
+        _ => false,
+    };
+    if left_is_scalar_string {
+        CompOp::StringContains
+    } else {
+        CompOp::Contains
+    }
 }
 
 /// Build IR filters from a binding's inline property matches.
