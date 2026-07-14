@@ -174,7 +174,6 @@ enum WriteProtocol {
     TestOnly,
     Bootstrap,
     RecoveryExecutor,
-    LegacySchemaBootstrap,
     ReadOnlyAccess,
 }
 
@@ -191,7 +190,6 @@ impl WriteProtocol {
             Self::TestOnly => "test/failpoint-only".into(),
             Self::Bootstrap => "bootstrap".into(),
             Self::RecoveryExecutor => "recovery executor".into(),
-            Self::LegacySchemaBootstrap => "legacy schema bootstrap".into(),
             Self::ReadOnlyAccess => "read-only raw snapshot access".into(),
         }
     }
@@ -222,7 +220,6 @@ macro_rules! write_surfaces {
 write_surfaces! {
     "db/omnigraph.rs" => WriteProtocol::Bootstrap => ["init", "init_with_options"],
     "db/omnigraph.rs" => WriteProtocol::RecoveryExecutor => ["open", "open_with_storage", "refresh"],
-    "db/omnigraph.rs" => WriteProtocol::LegacySchemaBootstrap => ["open_read_only"],
     "exec/mutation.rs" => MUTATION_V3 => ["mutate", "mutate_as"],
     "loader/mod.rs" => LOAD_V3 => ["load_jsonl", "load_jsonl_file", "load", "load_file"],
     "loader/mod.rs" => WriteProtocol::Composed("optional branch create, then Load v3") => ["load_as", "load_file_as"],
@@ -243,6 +240,7 @@ write_surfaces! {
 // name-independent: a newly named `transact`, `publish`, or `vacuum` method
 // cannot evade discovery.
 const READ_ONLY_SURFACES: &[(&str, &str)] = &[
+    ("db/omnigraph.rs", "open_read_only"),
     ("db/omnigraph.rs", "plan_schema"),
     ("db/omnigraph.rs", "plan_schema_with_options"),
     ("db/omnigraph.rs", "preview_schema_apply_with_options"),
@@ -642,7 +640,6 @@ durable_calls! {
     ("db/omnigraph.rs", "heal_pending_sidecars_roll_forward(", 2, WriteProtocol::RecoveryExecutor),
     ("db/omnigraph.rs", "recover_schema_state_files(", 2, WriteProtocol::RecoveryExecutor),
     ("db/manifest/recovery.rs", "recover_schema_state_files(", 1, WriteProtocol::RecoveryExecutor),
-    ("db/omnigraph.rs", "load_or_bootstrap_schema_contract(", 2, WriteProtocol::LegacySchemaBootstrap),
     ("db/omnigraph/optimize.rs", "compact_files(", 2, WriteProtocol::Composed("Optimize v2 data + physical manifest compaction")),
     ("db/omnigraph/optimize.rs", ".optimize_indices(", 1, OPTIMIZE_V2),
     ("db/omnigraph/optimize.rs", ".update_config(", 1, WriteProtocol::PhysicalOnly),
@@ -721,7 +718,6 @@ const DURABLE_PRIMITIVES: &[&str] = &[
     "recover_manifest_drift(",
     "heal_pending_sidecars_roll_forward(",
     "recover_schema_state_files(",
-    "load_or_bootstrap_schema_contract(",
     "compact_files(",
     ".optimize_indices(",
     "cleanup_old_versions(",
