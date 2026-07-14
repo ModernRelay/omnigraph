@@ -1270,9 +1270,10 @@ impl Omnigraph {
     ///
     /// Schema apply calls this broad barrier before acquiring its schema gate;
     /// exact adapters then relist and revalidate relevant recovery and authority
-    /// under their own ordered effect gates. Mutation/load and branch merge use
+    /// under their own ordered effect gates. Mutation/load, branch merge, and
+    /// EnsureIndices use
     /// [`heal_pending_recovery_sidecars_for_write`](Self::heal_pending_recovery_sidecars_for_write)
-    /// to reject relevant unresolved intents before capturing a base.
+    /// to reject relevant unresolved intents before capturing a base or plan.
     ///
     /// Steady-state cost here is one `list_dir` of `__recovery/` (typically
     /// empty → immediate return). Exact adapters perform a second check under

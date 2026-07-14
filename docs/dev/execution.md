@@ -184,10 +184,18 @@ Atomicity guarantee for multi-statement mutations: a mid-query failure leaves La
 | Mode | Semantics | Path (post-MR-794) |
 |---|---|---|
 | `Overwrite` | Replace all data in the target tables on the branch | Same accumulator; one staged Lance `Operation::Overwrite` transaction per touched table. A pre-effect authority change is strict `ReadSetChanged`; no automatic replay. |
-| `Append` | Strict insert; duplicates error | One `stage_append` transaction per touched table. A pre-effect authority change discards the whole parsed/validated attempt and fully reprepares with a bounded retry. |
+| `Append` | Append rows without checking or matching against committed `id` values. Intra-batch duplicate `@key` values and the ordinary schema/integrity constraints still error, but a collision with an `id` already present in the target is not fenced today. | One bare `stage_append` transaction per touched table. A pre-effect authority change discards the whole parsed/validated attempt and fully reprepares with a bounded retry. |
 | `Merge` | Upsert by `id` (`merge_insert`) | One `stage_merge_insert` transaction per touched table (deduped by `id`, last-write-wins). The same bounded full-reprepare rule as Append applies before effects. |
 
 All three modes then use the same schema → branch → sorted-table gate, v3 recovery, zero-retry table commit, and exact publisher-precondition path as mutation. A parse, RI, cardinality, or validation failure leaves Lance HEAD untouched. After any table effect, any later error is `RecoveryRequired`. Load, mutation, and schema apply build no physical indexes inline; explicit `ensure_indices`/`optimize` reconciliation materializes declared intent later.
+
+`Append` is therefore not yet the strict-insert surface described by RFC-023.
+Lance `Append` does not compare keys, and the shared validator checks `@key`
+only within the incoming delta because keyed Merge and mutation writes treat a
+committed holder as the row being upserted. RFC-023 owns the compatible-format
+switch to a filtered merge-insert with `WhenMatched::Fail`; until that activation
+lands, callers that require upsert semantics should use `Merge`, and callers
+must not rely on `Append` to reject an existing `id`.
 
 ## `load` and the deprecated `ingest` shims
 

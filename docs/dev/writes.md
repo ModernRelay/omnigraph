@@ -259,7 +259,13 @@ surfaces for planner decisions remain separate roadmap work.
 Three writers have been migrated onto staged primitives:
 
 * **`ensure_indices`** (`db/omnigraph/table_ops.rs::ensure_indices_for_branch`)
-  — a typed `stage_create_indices` request combines every missing BTree,
+  — runs the branch-aware, roll-forward-only recovery barrier before schema-idle
+  checking, base capture, or index planning. A roll-forward-eligible
+  `EffectsConfirmed` predecessor whose captured token still holds therefore
+  finishes on the same handle before this attempt starts, while an `Armed`
+  intent that needs compensation returns `RecoveryRequired` before any new
+  index artifact is staged. A typed `stage_create_indices` request then
+  combines every missing BTree,
   Inverted/FTS, and full-table vector artifact for one table into one Lance
   `Operation::CreateIndex`, followed by one `commit_staged_exact`. Which index a
   `@index`/`@key` property gets is dispatched by type via
@@ -551,10 +557,11 @@ Triggers for the residual: transient Lance write errors during finalize
 contention exceeding `PUBLISHER_RETRY_BUDGET = 5` retries.
 
 **Long-running servers**: the write entry points (`load_as`,
-`mutate_as`, `apply_schema_as`, `branch_merge_as`) and
-`Omnigraph::refresh` run roll-forward-only recovery in-process
+`mutate_as`, `apply_schema_as`, `branch_merge_as`), the explicit
+`ensure_indices{,_on}` reconciler, and `Omnigraph::refresh` run
+roll-forward-only recovery in-process
 (`recovery::heal_pending_sidecars_roll_forward`) — the common
-Phase B → Phase C residual closes on the next write, without a
+Phase B → Phase C residual closes on the next enrolled entry, without a
 restart and without an explicit refresh. The heal lists `__recovery/`
 (one `list_dir`; empty in the steady state) and, per sidecar, acquires
 schema → branch → sorted-table gates that overlap the writer's guarded
@@ -606,7 +613,16 @@ construction under the gate. Optimize's separate final `list_dir` runs under the
 main branch gate because even table-disjoint main intents share graph-head authority.
 Pinned by the four
 `tests/failpoints.rs::*_after_finalize_publisher_failure_heals_without_reopen`
-tests (load, mutation, schema apply, branch merge). The maintenance
+tests (load, mutation, schema apply, branch merge), plus
+`recovery_rolls_forward_ensure_indices_on_feature_branch`, which retains the
+next-read-write-open roll-forward boundary and then completes a second
+roll-forward-eligible `EffectsConfirmed` predecessor under its unchanged token
+on the same handle before new planning. The authority-clean
+`ensure_indices_complete_armed_effects_roll_back` keeps the complete-effect
+rollback rule isolated;
+`ensure_indices_entry_barrier_refuses_partial_armed_before_staging` separately
+proves that an `Armed` predecessor needing compensation is refused before the
+remaining table's post-stage failpoint can fire. The maintenance
 entries need the heal for more than liveness: without it, a schema
 apply re-plans rewrites from the manifest pin and orphans the drifted
 Phase-B commit (dropping its rows), and a branch merge publishes the
@@ -630,9 +646,13 @@ or version GC: v3/v4 ownership and compensation recovery may need the retained
 Lance transaction/version history, so garbage collection cannot outrun the
 recovery barrier.
 Continuous in-process recovery for the rollback path is the goal of a
-future background reconciler. `ensure_indices` does not heal at entry itself;
-it is an explicit maintenance/reconciliation call, separate from mutation,
-load, and schema apply, and its strict preconditions fail loudly on drift.
+future background reconciler. EnsureIndices' entry barrier remains
+roll-forward-only: it never performs a `Dataset::restore` under a live handle.
+It runs before schema-idle checking and `open_write_txn`, so unresolved
+rollback state cannot be mistaken for a fresh base or trigger another expensive
+index build. Its final under-gate sidecar relist remains separately required to
+close the entry-barrier-to-effect TOCTOU; uncovered non-sidecar drift still
+fails loudly under the existing strict preconditions.
 
 For enrolled mutation/load, branch merge, SchemaApply, and EnsureIndices, the publisher rechecks the
 attempt's exact native branch identity and `graph_head` as well as table
