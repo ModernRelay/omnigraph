@@ -1496,13 +1496,21 @@ mod tests {
         )));
     }
 
-    fn node_table_uri(root: &str, type_name: &str) -> String {
-        let mut hash: u64 = 0xcbf2_9ce4_8422_2325;
-        for &b in type_name.as_bytes() {
-            hash ^= b as u64;
-            hash = hash.wrapping_mul(0x100_0000_01b3);
-        }
-        format!("{}/nodes/{hash:016x}", root.trim_end_matches('/'))
+    async fn node_table_uri(db: &Omnigraph, type_name: &str) -> String {
+        let table_key = format!("node:{type_name}");
+        let snapshot = db
+            .snapshot_of(crate::db::ReadTarget::branch("main"))
+            .await
+            .unwrap();
+        let table_path = &snapshot
+            .entry(&table_key)
+            .unwrap_or_else(|| panic!("live manifest has no registration for {table_key}"))
+            .table_path;
+        format!(
+            "{}/{}",
+            db.uri().trim_end_matches('/'),
+            table_path.trim_start_matches('/')
+        )
     }
 
     #[tokio::test]
@@ -1523,7 +1531,7 @@ mod tests {
         db.branch_create("feature").await.unwrap();
 
         for type_name in ["Person", "Company"] {
-            let table_uri = node_table_uri(uri, type_name);
+            let table_uri = node_table_uri(&db, type_name).await;
             // forbidden-api-allow: test synthesizes a branch ref directly on the Lance dataset.
             let mut ds = lance::Dataset::open(&table_uri).await.unwrap();
             let base = ds.version().version;

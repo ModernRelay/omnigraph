@@ -84,19 +84,6 @@ pub async fn init_and_load(dir: &tempfile::TempDir) -> Omnigraph {
     db
 }
 
-/// On-disk Lance dataset URI for a node type, mirroring the engine's
-/// `nodes/{fnv1a(type)}` layout. Used by tests that reach the raw Lance
-/// dataset to forge or inspect branch state. (Local copies exist in
-/// `failpoints.rs` / `maintenance.rs`; this is the shared one for new tests.)
-pub fn node_table_uri(root: &str, type_name: &str) -> String {
-    let mut hash: u64 = 0xcbf2_9ce4_8422_2325;
-    for &b in type_name.as_bytes() {
-        hash ^= b as u64;
-        hash = hash.wrapping_mul(0x100_0000_01b3);
-    }
-    format!("{}/nodes/{hash:016x}", root.trim_end_matches('/'))
-}
-
 /// Read all rows from a sub-table by table_key.
 pub async fn read_table(db: &Omnigraph, table_key: &str) -> Vec<RecordBatch> {
     let snap = snapshot_main(db).await.unwrap();
