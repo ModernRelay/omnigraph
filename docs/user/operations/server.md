@@ -66,7 +66,7 @@ graph id from the cluster's applied revision:
 | GET | `/graphs/{id}/branches` | bearer + `read` | list branches |
 | POST | `/graphs/{id}/branches` | bearer + `branch_create` | create |
 | DELETE | `/graphs/{id}/branches/{branch}` | bearer + `branch_delete` | delete |
-| POST | `/graphs/{id}/branches/merge` | bearer + `branch_merge` | merge `source → target` |
+| POST | `/graphs/{id}/branches/merge` | bearer + `branch_merge` (+ `branch_delete` only when `delete_branch` is set) | merge `source → target`; `delete_branch: true` also deletes the source after the merge lands — a delete refusal is reported via `branch_deleted`/`branch_delete_error` on the 200 response, never as an error |
 | GET | `/graphs/{id}/commits?branch=` | bearer + `read` | list |
 | GET | `/graphs/{id}/commits/{commit_id}` | bearer + `read` | show |
 

@@ -237,7 +237,7 @@
           "branches"
         ],
         "summary": "Merge one branch into another.",
-        "description": "Merges `source` into `target` (defaults to `main`). Outcome is one of\n`already_up_to_date`, `fast_forward`, or `merged`. Returns 409 with the\nlist of conflicts if the merge cannot be completed; the target is left\nunchanged in that case. **Destructive** to `target` on success.",
+        "description": "Merges `source` into `target` (defaults to `main`). Outcome is one of\n`already_up_to_date`, `fast_forward`, or `merged`. Returns 409 with the\nlist of conflicts if the merge cannot be completed; the target is left\nunchanged in that case. **Destructive** to `target` on success.\n\nWith `delete_branch: true` the source branch is deleted after a successful\nmerge, under its own `branch_delete` policy check. The merge is durable by\nthen, so a deletion refusal or failure never fails the request; it is\nreported via `branch_deleted: false` + `branch_delete_error`.",
         "operationId": "cluster_mergeBranches",
         "parameters": [
           {
@@ -1799,6 +1799,20 @@
               "null"
             ]
           },
+          "branch_delete_error": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "Why the requested source-branch deletion did not happen. Present iff\n`branch_deleted` is `false`."
+          },
+          "branch_deleted": {
+            "type": [
+              "boolean",
+              "null"
+            ],
+            "description": "Result of the requested post-merge source-branch deletion. Absent when\n`delete_branch` was not requested; `true` when the source branch was\ndeleted; `false` when the deletion was refused or failed (the merge\nitself still succeeded — see `branch_delete_error`)."
+          },
           "outcome": {
             "$ref": "#/components/schemas/BranchMergeOutcome"
           },
@@ -1816,6 +1830,10 @@
           "source"
         ],
         "properties": {
+          "delete_branch": {
+            "type": "boolean",
+            "description": "Delete the source branch after a successful merge. The deletion runs\nunder its own `branch_delete` policy check; a refusal or failure is\nreported via `branch_deleted` / `branch_delete_error` on the response\nand never fails the already-landed merge."
+          },
           "source": {
             "type": "string",
             "description": "Source branch whose commits will be merged."

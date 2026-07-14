@@ -203,6 +203,24 @@ S3-backed tests (`s3_storage`, and the S3 paths in server/CLI system tests) **sk
 
 CI does **not** run `clippy` or `rustfmt` as gates — but `cargo test --workspace --locked` is the exact gate, so run it before pushing. Two non-test CI checks: `scripts/check-agents-md.sh` (doc cross-link integrity — run it after moving/renaming docs) and OpenAPI drift (`crates/omnigraph-server/tests/openapi.rs` regenerates `openapi.json`; set `OMNIGRAPH_UPDATE_OPENAPI=1` to update the checked-in copy when a server/API change is intentional).
 
+## CocoIndex code search
+
+This repo has CocoIndex project settings in `.cocoindex_code/settings.yml`. Use `ccc` when semantic search or structural AST search is faster than reading files manually.
+
+```bash
+ccc doctor                         # verify settings, model, matched files, index health
+ccc index                          # build or refresh the local index
+ccc status                         # show indexed file/chunk counts by language
+ccc search "query pipeline"        # semantic search across indexed chunks
+ccc search --lang rust "manifest publish recovery"
+ccc search --path 'docs/dev/*' "write path"
+ccc search --refresh "recent change"  # refresh index before searching
+ccc grep 'fn \NAME(\(ARGS*\))' --lang rust   # structural AST search, no index needed
+ccc grep 'Operation::\NAME { \(FIELDS*\) }' crates/
+```
+
+Generated index databases under `.cocoindex_code/` are local-only and ignored; keep `settings.yml` tracked.
+
 ---
 
 ## Quick-reference flows
