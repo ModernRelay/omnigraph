@@ -21,16 +21,22 @@ use helpers::{
     mixed_params, mutate_main, snapshot_main,
 };
 
-/// Filesystem URI of a node sub-table, mirroring the engine's layout
-/// (FNV-1a of the type name under `nodes/`). Matches the helper in
-/// `failpoints.rs`; used to inspect/forge Lance branches directly in tests.
-fn node_table_uri(root: &str, type_name: &str) -> String {
-    let mut hash: u64 = 0xcbf2_9ce4_8422_2325;
-    for &b in type_name.as_bytes() {
-        hash ^= b as u64;
-        hash = hash.wrapping_mul(0x100_0000_01b3);
-    }
-    format!("{}/nodes/{hash:016x}", root.trim_end_matches('/'))
+/// Filesystem URI of the live main-branch incarnation of a node table.
+/// Physical paths are identity-derived, so test fixtures must resolve the
+/// authoritative manifest registration instead of reconstructing a path from
+/// the public type name.
+async fn node_table_uri(db: &Omnigraph, type_name: &str) -> String {
+    let table_key = format!("node:{type_name}");
+    let snapshot = db.snapshot_of(ReadTarget::branch("main")).await.unwrap();
+    let table_path = &snapshot
+        .entry(&table_key)
+        .unwrap_or_else(|| panic!("live manifest has no registration for {table_key}"))
+        .table_path;
+    format!(
+        "{}/{}",
+        db.uri().trim_end_matches('/'),
+        table_path.trim_start_matches('/')
+    )
 }
 
 async fn person_manifest_and_head(db: &Omnigraph, root: &str) -> (u64, u64, String) {
@@ -1044,13 +1050,12 @@ async fn branch_merge_refuses_uncovered_target_drift_before_arming_recovery() {
 #[tokio::test]
 async fn optimize_defers_when_recovery_sidecar_is_pending() {
     let dir = tempfile::tempdir().unwrap();
-    let uri = dir.path().to_str().unwrap();
     let db = init_and_load(&dir).await;
 
     // Simulate an in-process failed write that left a recovery sidecar on disk.
     let recovery_dir = dir.path().join("__recovery");
     std::fs::create_dir_all(&recovery_dir).unwrap();
-    let person_path = node_table_uri(uri, "Person");
+    let person_path = node_table_uri(&db, "Person").await;
     let sidecar_json = format!(
         r#"{{
             "schema_version": 1,
@@ -1106,7 +1111,6 @@ async fn cleanup_without_any_policy_option_errors() {
 #[tokio::test]
 async fn cleanup_keep_one_preserves_head_and_table_remains_readable() {
     let dir = tempfile::tempdir().unwrap();
-    let uri = dir.path().to_str().unwrap().to_string();
     let mut db = init_and_load(&dir).await;
     add_person_fragments(&mut db).await;
 
@@ -1116,7 +1120,7 @@ async fn cleanup_keep_one_preserves_head_and_table_remains_readable() {
         "fixture should seed Person rows for this test to be meaningful"
     );
 
-    let person_uri = node_table_uri(&uri, "Person");
+    let person_uri = node_table_uri(&db, "Person").await;
     assert!(
         Dataset::open(&person_uri)
             .await
@@ -1156,9 +1160,8 @@ async fn cleanup_keep_one_preserves_head_and_table_remains_readable() {
 #[tokio::test]
 async fn cleanup_keep_exceeding_history_preserves_every_available_version() {
     let dir = tempfile::tempdir().unwrap();
-    let uri = dir.path().to_str().unwrap().to_string();
     let mut db = init_and_load(&dir).await;
-    let person_uri = node_table_uri(&uri, "Person");
+    let person_uri = node_table_uri(&db, "Person").await;
     let before = Dataset::open(&person_uri)
         .await
         .unwrap()
@@ -1312,7 +1315,6 @@ async fn cleanup_uses_oldest_pin_across_multiple_live_lazy_branches() {
 #[tokio::test]
 async fn cleanup_fails_closed_when_live_lazy_branch_pin_is_unopenable() {
     let dir = tempfile::tempdir().unwrap();
-    let uri = dir.path().to_str().unwrap().to_string();
     let mut db = init_and_load(&dir).await;
 
     db.branch_create("feature").await.unwrap();
@@ -1328,7 +1330,7 @@ async fn cleanup_fails_closed_when_live_lazy_branch_pin_is_unopenable() {
     // Simulate damage created by an older cleanup implementation: raw Lance
     // sees no native Person branch for the lazy graph branch and removes its
     // inherited main manifest.
-    let person_uri = node_table_uri(&uri, "Person");
+    let person_uri = node_table_uri(&db, "Person").await;
     let ds = Dataset::open(&person_uri).await.unwrap();
     let head = ds.version().version;
     assert!(pinned_main_version < head, "precondition: main advanced");
@@ -1349,7 +1351,7 @@ async fn cleanup_fails_closed_when_live_lazy_branch_pin_is_unopenable() {
         removed.old_versions > 0,
         "precondition: raw Lance cleanup removed old main versions"
     );
-    let company_uri = node_table_uri(&uri, "Company");
+    let company_uri = node_table_uri(&db, "Company").await;
     let company_versions_before = Dataset::open(&company_uri)
         .await
         .unwrap()
@@ -1390,7 +1392,7 @@ async fn cleanup_refuses_uncovered_main_head_drift_before_any_version_gc() {
     let root = dir.path().to_str().unwrap().to_string();
     let mut db = init_and_load(&dir).await;
     let (manifest_version, head_version, _) = forge_person_compaction_drift(&mut db, &root).await;
-    let company_uri = node_table_uri(&root, "Company");
+    let company_uri = node_table_uri(&db, "Company").await;
     let company_versions_before = Dataset::open(&company_uri)
         .await
         .unwrap()
@@ -1472,14 +1474,13 @@ async fn cleanup_reconciles_orphaned_branch_forks() {
     // `cleanup` must reconcile it away: drop every Lance branch absent from the
     // manifest authority, without touching `main`.
     let dir = tempfile::tempdir().unwrap();
-    let uri = dir.path().to_str().unwrap().to_string();
     let mut db = init_and_load(&dir).await;
 
     let people_before = count_rows(&db, "node:Person").await;
     assert!(people_before > 0, "fixture should seed Person rows");
 
     // Forge an orphaned fork the manifest never knew about.
-    let person_uri = node_table_uri(&uri, "Person");
+    let person_uri = node_table_uri(&db, "Person").await;
     {
         let mut ds = Dataset::open(&person_uri).await.unwrap();
         let base = ds.version().version;
@@ -1528,7 +1529,6 @@ async fn cleanup_reconciles_orphaned_branch_forks() {
 #[tokio::test]
 async fn cleanup_reconciles_live_branch_orphan_fork_but_keeps_legitimate_fork() {
     let dir = tempfile::tempdir().unwrap();
-    let uri = dir.path().to_str().unwrap().to_string();
     let mut db = init_and_load(&dir).await;
 
     db.branch_create("feature").await.unwrap();
@@ -1547,7 +1547,7 @@ async fn cleanup_reconciles_live_branch_orphan_fork_but_keeps_legitimate_fork() 
     // Forge a manifest-unreferenced Person fork on the SAME live branch: the
     // manifest's `feature` snapshot still places Person on main (Person was
     // never written on feature), so this ref is an origin-2 orphan.
-    let person_uri = node_table_uri(&uri, "Person");
+    let person_uri = node_table_uri(&db, "Person").await;
     {
         let mut ds = Dataset::open(&person_uri).await.unwrap();
         let base = ds.version().version;
@@ -1558,7 +1558,7 @@ async fn cleanup_reconciles_live_branch_orphan_fork_but_keeps_legitimate_fork() 
         );
     }
 
-    let company_uri = node_table_uri(&uri, "Company");
+    let company_uri = node_table_uri(&db, "Company").await;
     let main_people = count_rows(&db, "node:Person").await;
     let main_companies = count_rows(&db, "node:Company").await;
 

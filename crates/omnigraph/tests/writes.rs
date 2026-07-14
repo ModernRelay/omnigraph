@@ -1598,12 +1598,20 @@ async fn second_sequential_update_on_same_row_succeeds() {
 #[tokio::test]
 async fn first_write_self_heals_manifest_unreferenced_fork_on_live_branch() {
     let dir = tempfile::tempdir().unwrap();
-    let uri = dir.path().to_str().unwrap().to_string();
     let mut db = init_and_load(&dir).await;
     db.branch_create("feature").await.unwrap();
 
     // Forge the manifest-unreferenced fork directly at the Lance layer.
-    let person_uri = node_table_uri(&uri, "Person");
+    let main = db
+        .snapshot_of(ReadTarget::branch("main"))
+        .await
+        .unwrap();
+    let person_path = &main.entry("node:Person").unwrap().table_path;
+    let person_uri = format!(
+        "{}/{}",
+        db.uri().trim_end_matches('/'),
+        person_path.trim_start_matches('/')
+    );
     {
         let mut ds = lance::Dataset::open(&person_uri).await.unwrap();
         let base = ds.version().version;
