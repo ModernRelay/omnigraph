@@ -4,16 +4,9 @@ use lance_namespace::Error as LanceNamespaceError;
 use crate::error::{OmniError, Result};
 use crate::storage::{StorageKind, join_uri, storage_kind_for_uri};
 
-const MANIFEST_DIR: &str = "__manifest";
+use super::TableIdentity;
 
-pub(super) fn type_name_hash(name: &str) -> String {
-    let mut h: u64 = 0xcbf29ce484222325;
-    for byte in name.as_bytes() {
-        h ^= *byte as u64;
-        h = h.wrapping_mul(0x100000001b3);
-    }
-    format!("{:016x}", h)
-}
+const MANIFEST_DIR: &str = "__manifest";
 
 pub(crate) fn manifest_uri(root: &str) -> String {
     format!("{}/{}", root.trim_end_matches('/'), MANIFEST_DIR)
@@ -41,12 +34,29 @@ fn format_table_version(version: u64) -> String {
     format!("{version:020}")
 }
 
-pub(super) fn version_object_id(table_key: &str, version: u64) -> String {
-    format!("{}${}", table_key, format_table_version(version))
+pub(super) fn table_object_id(identity: TableIdentity) -> String {
+    format!(
+        "table:{:016x}:{:016x}",
+        identity.stable_table_id, identity.table_incarnation_id
+    )
 }
 
-pub(super) fn tombstone_object_id(table_key: &str, version: u64) -> String {
-    format!("{}$tombstone${}", table_key, format_table_version(version))
+pub(super) fn version_object_id(identity: TableIdentity, version: u64) -> String {
+    format!(
+        "table_version:{:016x}:{:016x}:{}",
+        identity.stable_table_id,
+        identity.table_incarnation_id,
+        format_table_version(version)
+    )
+}
+
+pub(super) fn tombstone_object_id(identity: TableIdentity, version: u64) -> String {
+    format!(
+        "table_tombstone:{:016x}:{:016x}:{}",
+        identity.stable_table_id,
+        identity.table_incarnation_id,
+        format_table_version(version)
+    )
 }
 
 pub(super) fn table_id_to_key(request_id: Option<&Vec<String>>) -> lance_namespace::Result<String> {
