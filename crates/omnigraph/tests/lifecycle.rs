@@ -25,6 +25,19 @@ fn schema_state_json(ir: &SchemaIR) -> serde_json::Value {
     })
 }
 
+fn persist_schema_contract(root: &std::path::Path, ir: &SchemaIR) {
+    fs::write(
+        root.join("_schema.ir.json"),
+        schema_ir_pretty_json(ir).unwrap(),
+    )
+    .unwrap();
+    fs::write(
+        root.join("__schema_state.json"),
+        serde_json::to_string_pretty(&schema_state_json(ir)).unwrap(),
+    )
+    .unwrap();
+}
+
 #[tokio::test]
 async fn init_creates_graph() {
     let dir = tempfile::tempdir().unwrap();
@@ -182,6 +195,129 @@ async fn open_refuses_pre_identity_schema_state_format() {
         err.to_string()
             .contains("schema state format 1 is unsupported")
     );
+}
+
+#[tokio::test]
+async fn open_rejects_same_alias_with_foreign_table_identity() {
+    let dir = tempfile::tempdir().unwrap();
+    let uri = dir.path().to_str().unwrap();
+    Omnigraph::init(uri, TEST_SCHEMA).await.unwrap();
+
+    let accepted: SchemaIR =
+        serde_json::from_str(&fs::read_to_string(dir.path().join("_schema.ir.json")).unwrap())
+            .unwrap();
+    let company_only = r#"
+node Company {
+    name: String @key
+}
+"#;
+    let after_drop = resolve_schema_ir(&accepted, &compile_shape(company_only))
+        .unwrap()
+        .schema_ir;
+    let replacement = resolve_schema_ir(&after_drop, &compile_shape(TEST_SCHEMA))
+        .unwrap()
+        .schema_ir;
+    assert_ne!(
+        replacement
+            .nodes
+            .iter()
+            .find(|node| node.name == "Person")
+            .unwrap()
+            .type_id,
+        accepted
+            .nodes
+            .iter()
+            .find(|node| node.name == "Person")
+            .unwrap()
+            .type_id
+    );
+    persist_schema_contract(dir.path(), &replacement);
+
+    let err = match Omnigraph::open(uri).await {
+        Ok(_) => panic!("open must reject a same-name table with a foreign stable identity"),
+        Err(err) => err,
+    };
+    assert!(
+        err.to_string()
+            .contains("accepted schema/manifest identity mismatch")
+    );
+    assert!(err.to_string().contains("has identity"));
+    assert!(err.to_string().contains("accepted SchemaIR requires"));
+}
+
+#[tokio::test]
+async fn open_rejects_live_manifest_tables_absent_from_schema_ir() {
+    let dir = tempfile::tempdir().unwrap();
+    let uri = dir.path().to_str().unwrap();
+    Omnigraph::init(uri, TEST_SCHEMA).await.unwrap();
+
+    let accepted: SchemaIR =
+        serde_json::from_str(&fs::read_to_string(dir.path().join("_schema.ir.json")).unwrap())
+            .unwrap();
+    let company_only = r#"
+node Company {
+    name: String @key
+}
+"#;
+    let replacement = resolve_schema_ir(&accepted, &compile_shape(company_only))
+        .unwrap()
+        .schema_ir;
+    fs::write(dir.path().join("_schema.pg"), company_only).unwrap();
+    persist_schema_contract(dir.path(), &replacement);
+
+    let err = match Omnigraph::open(uri).await {
+        Ok(_) => panic!("open must reject manifest tables omitted by accepted SchemaIR"),
+        Err(err) => err,
+    };
+    assert!(err.to_string().contains("contains live table"));
+    assert!(err.to_string().contains("absent from accepted SchemaIR"));
+}
+
+#[tokio::test]
+async fn refresh_rejects_schema_ir_tables_missing_from_manifest() {
+    let dir = tempfile::tempdir().unwrap();
+    let uri = dir.path().to_str().unwrap();
+    let db = Omnigraph::init(uri, TEST_SCHEMA).await.unwrap();
+    let accepted = db.catalog().bound_schema_ir().unwrap().clone();
+    let with_temporary_source =
+        format!("{TEST_SCHEMA}\nnode Temporary {{\n    key: String @key\n}}\n");
+    let replacement = resolve_schema_ir(&accepted, &compile_shape(&with_temporary_source))
+        .unwrap()
+        .schema_ir;
+    fs::write(dir.path().join("_schema.pg"), with_temporary_source).unwrap();
+    persist_schema_contract(dir.path(), &replacement);
+
+    let err = db
+        .refresh()
+        .await
+        .expect_err("refresh must reject an IR table with no manifest registration");
+    assert!(err.to_string().contains("node:Temporary"));
+    assert!(err.to_string().contains("is missing from manifest"));
+}
+
+#[tokio::test]
+async fn write_capture_rejects_schema_ir_tables_missing_from_manifest() {
+    let dir = tempfile::tempdir().unwrap();
+    let uri = dir.path().to_str().unwrap();
+    let mut db = Omnigraph::init(uri, TEST_SCHEMA).await.unwrap();
+    let accepted = db.catalog().bound_schema_ir().unwrap().clone();
+    let with_temporary_source =
+        format!("{TEST_SCHEMA}\nnode Temporary {{\n    key: String @key\n}}\n");
+    let replacement = resolve_schema_ir(&accepted, &compile_shape(&with_temporary_source))
+        .unwrap()
+        .schema_ir;
+    fs::write(dir.path().join("_schema.pg"), with_temporary_source).unwrap();
+    persist_schema_contract(dir.path(), &replacement);
+
+    let err = omnigraph::loader::load_jsonl(
+        &mut db,
+        r#"{"type":"Person","data":{"name":"blocked"}}"#,
+        omnigraph::loader::LoadMode::Merge,
+    )
+    .await
+    .expect_err("write preparation must reject schema/manifest identity drift");
+    assert!(err.to_string().contains("node:Temporary"));
+    assert!(err.to_string().contains("is missing from manifest"));
 }
 
 #[tokio::test]

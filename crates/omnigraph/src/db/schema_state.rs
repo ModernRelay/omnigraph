@@ -1,4 +1,4 @@
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
 
 use omnigraph_compiler::schema::parser::parse_schema;
@@ -9,7 +9,7 @@ use omnigraph_compiler::{
 use serde::{Deserialize, Serialize};
 use tracing::warn;
 
-use crate::db::manifest::Snapshot;
+use crate::db::manifest::{Snapshot, TableIdentity, table_path_for_identity};
 use crate::error::{OmniError, Result};
 use crate::storage::{StorageAdapter, join_uri};
 
@@ -189,6 +189,114 @@ pub(crate) async fn read_accepted_schema_ir(
     }
 }
 
+/// Prove that one accepted identity-bearing SchemaIR and one live manifest
+/// snapshot describe exactly the same physical table lifetimes.
+///
+/// Names are aliases, not identity. A same-name drop/re-add therefore fails
+/// unless the manifest carries the IR's new stable type ID, incarnation, and
+/// canonical identity-derived path. The reverse scan rejects orphan manifest
+/// registrations that no longer exist in the accepted IR.
+pub(crate) fn validate_schema_ir_against_snapshot(
+    schema_ir: &SchemaIR,
+    snapshot: &Snapshot,
+) -> Result<()> {
+    validate_schema_ir(schema_ir).map_err(|error| {
+        schema_manifest_conflict(format!("accepted SchemaIR is invalid: {error}"))
+    })?;
+
+    let mut expected_by_alias = BTreeMap::<String, (TableIdentity, String)>::new();
+    let mut expected_by_identity = BTreeMap::<TableIdentity, String>::new();
+    for (kind, name, stable_type_id, table_incarnation_id) in schema_ir
+        .nodes
+        .iter()
+        .map(|node| {
+            (
+                "node",
+                node.name.as_str(),
+                node.type_id.get(),
+                node.table_incarnation_id.get(),
+            )
+        })
+        .chain(schema_ir.edges.iter().map(|edge| {
+            (
+                "edge",
+                edge.name.as_str(),
+                edge.type_id.get(),
+                edge.table_incarnation_id.get(),
+            )
+        }))
+    {
+        let table_key = format!("{kind}:{name}");
+        let identity = TableIdentity::new(stable_type_id, table_incarnation_id)
+            .map_err(|error| schema_manifest_conflict(error.to_string()))?;
+        let table_path = table_path_for_identity(&table_key, identity)
+            .map_err(|error| schema_manifest_conflict(error.to_string()))?;
+        if let Some(previous) = expected_by_identity.insert(identity, table_key.clone()) {
+            return Err(schema_manifest_conflict(format!(
+                "SchemaIR aliases '{previous}' and '{table_key}' reuse table identity {identity}"
+            )));
+        }
+        if expected_by_alias
+            .insert(table_key.clone(), (identity, table_path))
+            .is_some()
+        {
+            return Err(schema_manifest_conflict(format!(
+                "SchemaIR contains duplicate live table alias '{table_key}'"
+            )));
+        }
+    }
+
+    let mut manifest_by_identity = BTreeMap::<TableIdentity, String>::new();
+    for entry in snapshot.entries() {
+        let Some((expected_identity, expected_path)) = expected_by_alias.get(&entry.table_key)
+        else {
+            return Err(schema_manifest_conflict(format!(
+                "manifest v{} contains live table '{}' that is absent from accepted SchemaIR",
+                snapshot.version(),
+                entry.table_key
+            )));
+        };
+        if entry.identity != *expected_identity {
+            return Err(schema_manifest_conflict(format!(
+                "manifest v{} table '{}' has identity {}, but accepted SchemaIR requires {}",
+                snapshot.version(),
+                entry.table_key,
+                entry.identity,
+                expected_identity
+            )));
+        }
+        if entry.table_path != *expected_path {
+            return Err(schema_manifest_conflict(format!(
+                "manifest v{} table '{}' has non-canonical path '{}', expected '{}' for identity {}",
+                snapshot.version(),
+                entry.table_key,
+                entry.table_path,
+                expected_path,
+                expected_identity
+            )));
+        }
+        if let Some(previous) = manifest_by_identity.insert(entry.identity, entry.table_key.clone())
+        {
+            return Err(schema_manifest_conflict(format!(
+                "manifest v{} aliases '{previous}' and '{}' to the same table identity {}",
+                snapshot.version(),
+                entry.table_key,
+                entry.identity
+            )));
+        }
+    }
+
+    for (table_key, (identity, _)) in expected_by_alias {
+        if snapshot.entry(&table_key).is_none() {
+            return Err(schema_manifest_conflict(format!(
+                "accepted SchemaIR table '{table_key}' with identity {identity} is missing from manifest v{}",
+                snapshot.version()
+            )));
+        }
+    }
+    Ok(())
+}
+
 pub(crate) fn schema_source_uri(root_uri: &str) -> String {
     join_uri(root_uri, SCHEMA_SOURCE_FILENAME)
 }
@@ -350,6 +458,13 @@ fn compile_schema_source(source: &str) -> Result<SchemaShape> {
 fn schema_lock_conflict(detail: impl Into<String>) -> OmniError {
     OmniError::manifest_conflict(format!(
         "schema evolution is locked down in phase 1: {}; manual coordination is required",
+        detail.into()
+    ))
+}
+
+fn schema_manifest_conflict(detail: impl Into<String>) -> OmniError {
+    OmniError::manifest_conflict(format!(
+        "accepted schema/manifest identity mismatch: {}",
         detail.into()
     ))
 }
