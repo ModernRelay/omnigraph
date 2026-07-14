@@ -126,6 +126,12 @@ async fn branch_create_open_list_and_lazy_branching_work() {
     let dir = tempfile::tempdir().unwrap();
     let uri = dir.path().to_str().unwrap();
     let mut main = init_and_load(&dir).await;
+    let main_person = snapshot_main(&main)
+        .await
+        .unwrap()
+        .entry("node:Person")
+        .unwrap()
+        .clone();
 
     main.branch_create("feature").await.unwrap();
     // Reproduce Lance's phase-1-only crash state: keep the shallow-cloned
@@ -149,14 +155,13 @@ async fn branch_create_open_list_and_lazy_branching_work() {
         4
     );
     let initial_feature_snap = snapshot_branch(&feature, "feature").await.unwrap();
+    let inherited_person = initial_feature_snap.entry("node:Person").unwrap();
     assert_eq!(
-        initial_feature_snap
-            .entry("node:Person")
-            .unwrap()
-            .table_branch
-            .as_deref(),
-        None
+        inherited_person.table_path, main_person.table_path,
+        "branch creation must inherit the source table identity/path"
     );
+    assert_eq!(inherited_person.table_version, main_person.table_version);
+    assert_eq!(inherited_person.table_branch.as_deref(), None);
 
     mutate_branch(
         &mut feature,
@@ -169,6 +174,11 @@ async fn branch_create_open_list_and_lazy_branching_work() {
     .unwrap();
 
     let snap = snapshot_branch(&feature, "feature").await.unwrap();
+    assert_eq!(
+        snap.entry("node:Person").unwrap().table_path,
+        main_person.table_path,
+        "the first lazy fork must preserve the logical table identity/path"
+    );
     assert_eq!(
         snap.entry("node:Person").unwrap().table_branch.as_deref(),
         Some("feature")

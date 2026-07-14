@@ -362,6 +362,37 @@ mod tests {
     }
 
     #[test]
+    fn table_reincarnation_splits_graph_index_cache_key_without_etag_help() {
+        let old_lifetime = GraphIndexTableState {
+            identity: crate::db::manifest::TableIdentity::new(1, 2).unwrap(),
+            table_key: "edge:Knows".to_string(),
+            table_version: 1,
+            table_branch: None,
+            e_tag: None,
+            endpoints: ("Person".to_string(), "Person".to_string()),
+        };
+        let new_lifetime = GraphIndexTableState {
+            identity: crate::db::manifest::TableIdentity::new(1, 3).unwrap(),
+            ..old_lifetime.clone()
+        };
+        let old_key = GraphIndexCacheKey {
+            edge_tables: vec![old_lifetime],
+        };
+        let new_key = GraphIndexCacheKey {
+            edge_tables: vec![new_lifetime],
+        };
+
+        let mut cache = GraphIndexCache::default();
+        cache.insert(old_key.clone(), empty_index());
+        cache.insert(new_key.clone(), empty_index());
+
+        assert_ne!(old_key, new_key);
+        assert_eq!(cache.entries.len(), 2);
+        assert!(cache.entries.contains_key(&old_key));
+        assert!(cache.entries.contains_key(&new_key));
+    }
+
+    #[test]
     fn graph_index_cache_evicts_oldest_entry() {
         let mut cache = GraphIndexCache::default();
         for idx in 0..9 {
