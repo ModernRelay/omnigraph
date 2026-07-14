@@ -6055,6 +6055,87 @@ edge WorksAt: Person -> Company
     );
 }
 
+/// A rename+rewrite pin uses the desired alias (`node:Human`) for its forward
+/// output, but an Armed crash must compensate back into the accepted manifest
+/// binding (`node:Person`). Publishing the restore under the target alias would
+/// fail OCC after the physical Restore and wedge every subsequent open.
+#[tokio::test]
+#[serial]
+async fn schema_apply_rename_rewrite_partial_effect_restores_source_alias() {
+    let _scenario = FailScenario::setup();
+    let dir = tempfile::tempdir().unwrap();
+    let uri = dir.path().to_str().unwrap().to_string();
+    let db = helpers::init_and_load(&dir).await;
+    let people_before = helpers::count_rows(&db, "node:Person").await;
+    let desired = r#"
+node Human @rename_from("Person") {
+    full_name: String @key @rename_from("name")
+    age: I32?
+}
+
+node Company {
+    name: String @key
+}
+
+edge Knows: Human -> Human {
+    since: Date?
+}
+
+edge WorksAt: Human -> Company
+"#;
+
+    let operation_id = {
+        let _failpoint = ScopedFailPoint::new(names::SCHEMA_APPLY_POST_TABLE_COMMIT, "return");
+        let error = db
+            .apply_schema(desired)
+            .await
+            .expect_err("rename+rewrite must stop after its exact table effect");
+        assert!(
+            error.to_string().contains("schema_apply.post_table_commit"),
+            "unexpected partial rename error: {error}"
+        );
+        single_sidecar_operation_id(dir.path())
+    };
+    let sidecar_path = dir
+        .path()
+        .join("__recovery")
+        .join(format!("{operation_id}.json"));
+    let sidecar: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(&sidecar_path).unwrap()).unwrap();
+    assert_eq!(sidecar["schema_version"], 9);
+    assert_eq!(sidecar["protocol_v7"]["effect_phase"], "Armed");
+    let rename = &sidecar["protocol_v7"]["intended_delta"]["renames"][0];
+    assert_eq!(rename["expected_table_key"], "node:Person");
+    assert_eq!(rename["table_key"], "node:Human");
+    drop(db);
+
+    let recovered = Omnigraph::open(&uri)
+        .await
+        .expect("Full recovery must publish the restored source alias");
+    let snapshot = recovered
+        .snapshot_of(omnigraph::db::ReadTarget::branch("main"))
+        .await
+        .unwrap();
+    assert!(snapshot.entry("node:Person").is_some());
+    assert!(snapshot.entry("node:Human").is_none());
+    assert_eq!(
+        helpers::count_rows(&recovered, "node:Person").await,
+        people_before
+    );
+    assert!(!recovered.schema_source().contains("node Human"));
+    drop(recovered);
+
+    assert_post_recovery_invariants(
+        dir.path(),
+        &operation_id,
+        RecoveryExpectation::RolledBack {
+            tables: vec![TableExpectation::main("node:Person")],
+        },
+    )
+    .await
+    .unwrap();
+}
+
 /// A multi-table apply can crash after only its first exact transaction. The
 /// Armed sidecar must prove and compensate that proper subset without touching
 /// a planned table whose HEAD never moved.

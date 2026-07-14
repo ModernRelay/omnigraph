@@ -1085,6 +1085,7 @@ pub(crate) async fn write_sidecar(
     debug_assert!(sidecar.schema_version <= SIDECAR_SCHEMA_VERSION);
     let uri = sidecar_uri(root_uri, &sidecar.operation_id);
     validate_sidecar_shape(&uri, sidecar)?;
+    validate_identity_aware_pin_paths(root_uri, &uri, sidecar)?;
     let json = serde_json::to_string_pretty(sidecar).map_err(|err| {
         OmniError::manifest_internal(format!("failed to serialize recovery sidecar: {}", err))
     })?;
@@ -1193,6 +1194,7 @@ pub(crate) async fn list_sidecars(
         }
         let body = storage.read_text(&uri).await?;
         let sidecar = parse_sidecar(&uri, &body)?;
+        validate_identity_aware_pin_paths(root_uri, &uri, &sidecar)?;
         out.push(sidecar);
     }
     Ok(out)
@@ -1219,7 +1221,10 @@ async fn list_parseable_sidecars_for_read_only(
             continue;
         }
         let body = storage.read_text(&uri).await?;
-        match parse_sidecar(&uri, &body) {
+        match parse_sidecar(&uri, &body).and_then(|sidecar| {
+            validate_identity_aware_pin_paths(root_uri, &uri, &sidecar)?;
+            Ok(sidecar)
+        }) {
             Ok(sidecar) => out.push(sidecar),
             Err(error) => {
                 warn!(
@@ -1254,6 +1259,7 @@ async fn reread_sidecar_under_gates(
     }
     let body = storage.read_text(&uri).await?;
     let current = parse_sidecar(&uri, &body)?;
+    validate_identity_aware_pin_paths(root_uri, &uri, &current)?;
 
     // Confirmation/rollback-plan rewrites may change only recovery payload, not
     // the keys whose gates protect the artifact.  Refuse a coordination-shape
@@ -1463,6 +1469,36 @@ fn validate_sidecar_shape(sidecar_uri: &str, sidecar: &RecoverySidecar) -> Resul
     validate_mutation_load_shape(sidecar_uri, sidecar)
 }
 
+/// Bind identity-aware recovery ownership to this graph root before any path
+/// can be opened, restored, or deleted. A canonical identity suffix alone is
+/// insufficient: an otherwise valid sidecar copied from another graph could
+/// point recovery at that foreign graph's dataset.
+///
+/// Older sidecars retain their historical path semantics. They predate stable
+/// table identity and cannot be tightened by inferring ownership during read.
+fn validate_identity_aware_pin_paths(
+    root_uri: &str,
+    sidecar_uri: &str,
+    sidecar: &RecoverySidecar,
+) -> Result<()> {
+    if sidecar.schema_version != IDENTITY_AWARE_SIDECAR_SCHEMA_VERSION {
+        return Ok(());
+    }
+
+    let root = root_uri.trim_end_matches('/');
+    for pin in &sidecar.tables {
+        let relative = super::table_path_for_identity(&pin.table_key, pin.identity)?;
+        let expected = format!("{root}/{relative}");
+        if pin.table_path != expected {
+            return Err(OmniError::manifest_internal(format!(
+                "recovery sidecar at '{}' binds table identity {} alias '{}' to foreign or non-canonical URI '{}'; expected exact graph-owned URI '{}'",
+                sidecar_uri, pin.identity, pin.table_key, pin.table_path, expected
+            )));
+        }
+    }
+    Ok(())
+}
+
 fn validate_mutation_load_shape(sidecar_uri: &str, sidecar: &RecoverySidecar) -> Result<()> {
     let malformed = |reason: String| {
         OmniError::manifest_internal(format!(
@@ -1474,6 +1510,18 @@ fn validate_mutation_load_shape(sidecar_uri: &str, sidecar: &RecoverySidecar) ->
         .protocol_v3
         .as_ref()
         .ok_or_else(|| malformed("missing required protocol_v3 payload".to_string()))?;
+    if sidecar.protocol_v4.is_some()
+        || sidecar.protocol_v7.is_some()
+        || sidecar.protocol_v8.is_some()
+        || sidecar.ensure_indices_rollback_v6.is_some()
+        || sidecar.merge_source_commit_id.is_some()
+        || sidecar.schema_apply_manifest_published
+        || sidecar.schema_apply_target_schema_ir_hash.is_some()
+    {
+        return Err(malformed(
+            "Mutation/Load sidecars must carry only the protocol_v3 writer payload".to_string(),
+        ));
+    }
     validate_authority_identity(&malformed, &protocol.authority)?;
     if !sidecar.additional_registrations.is_empty()
         || !sidecar.tombstones.is_empty()
@@ -2038,10 +2086,10 @@ fn validate_schema_apply_v7_shape(sidecar_uri: &str, sidecar: &RecoverySidecar) 
 
     validate_unique_pin_identities(&malformed, &sidecar.tables, false)?;
     let pin_ids: HashSet<TableIdentity> = sidecar.tables.iter().map(|pin| pin.identity).collect();
-    let pin_aliases: HashSet<&str> = sidecar
+    let rollback_aliases: HashSet<&str> = sidecar
         .tables
         .iter()
-        .map(|pin| pin.table_key.as_str())
+        .map(|pin| schema_apply_rollback_table_key(protocol, pin))
         .collect();
     let effect_ids: HashSet<TableIdentity> = protocol
         .effects
@@ -2209,9 +2257,9 @@ fn validate_schema_apply_v7_shape(sidecar_uri: &str, sidecar: &RecoverySidecar) 
             .iter()
             .map(|outcome| outcome.table_key.as_str())
             .collect();
-        if outcome_keys.len() != outcomes.len() || !outcome_keys.is_subset(&pin_aliases) {
+        if outcome_keys.len() != outcomes.len() || !outcome_keys.is_subset(&rollback_aliases) {
             return Err(malformed(
-                "schema-v7 rollback audit outcomes must name a unique subset of table pins"
+                "schema-v7 rollback audit outcomes must name a unique subset of restored table aliases"
                     .to_string(),
             ));
         }
@@ -3376,17 +3424,57 @@ async fn process_sidecar(
     // stale-sidecar audit recovery). `false` = the sidecar was deferred
     // untouched -- callers must not treat that as a completed heal (no
     // schema reload / cache invalidation is warranted).
-    if sidecar.protocol_v8.is_some() {
-        return process_ensure_indices_sidecar_v8(root_uri, storage, snapshot, sidecar, mode).await;
-    }
-    if sidecar.protocol_v7.is_some() {
-        return process_schema_apply_sidecar_v7(root_uri, storage, snapshot, sidecar, mode).await;
-    }
-    if sidecar.protocol_v4.is_some() {
-        return process_branch_merge_sidecar_v4(root_uri, storage, snapshot, sidecar, mode).await;
-    }
-    if sidecar.protocol_v3.is_some() {
-        if let Some(outcome) = detect_visible_v3_outcome(root_uri, sidecar).await? {
+    // v9 is one identity-bearing envelope shared by all active writers. Route
+    // by the declared writer kind, never by whichever optional payload happens
+    // to be checked first. Shape validation makes foreign/multiple payloads
+    // malformed; this dispatch remains explicit defense in depth.
+    if sidecar.schema_version == IDENTITY_AWARE_SIDECAR_SCHEMA_VERSION {
+        match sidecar.writer_kind {
+            SidecarKind::EnsureIndices => {
+                return process_ensure_indices_sidecar_v8(
+                    root_uri, storage, snapshot, sidecar, mode,
+                )
+                .await;
+            }
+            SidecarKind::SchemaApply => {
+                return process_schema_apply_sidecar_v7(root_uri, storage, snapshot, sidecar, mode)
+                    .await;
+            }
+            SidecarKind::BranchMerge => {
+                return process_branch_merge_sidecar_v4(root_uri, storage, snapshot, sidecar, mode)
+                    .await;
+            }
+            SidecarKind::Mutation | SidecarKind::Load => {
+                if let Some(outcome) = detect_visible_v3_outcome(root_uri, sidecar).await? {
+                    return finalize_visible_v3_outcome(
+                        root_uri,
+                        storage.as_ref(),
+                        sidecar,
+                        outcome,
+                    )
+                    .await;
+                }
+            }
+            SidecarKind::Optimize => {}
+        }
+    } else {
+        // Historical envelopes retain their original generation-specific
+        // payload dispatch.
+        if sidecar.protocol_v8.is_some() {
+            return process_ensure_indices_sidecar_v8(root_uri, storage, snapshot, sidecar, mode)
+                .await;
+        }
+        if sidecar.protocol_v7.is_some() {
+            return process_schema_apply_sidecar_v7(root_uri, storage, snapshot, sidecar, mode)
+                .await;
+        }
+        if sidecar.protocol_v4.is_some() {
+            return process_branch_merge_sidecar_v4(root_uri, storage, snapshot, sidecar, mode)
+                .await;
+        }
+        if sidecar.protocol_v3.is_some()
+            && let Some(outcome) = detect_visible_v3_outcome(root_uri, sidecar).await?
+        {
             return finalize_visible_v3_outcome(root_uri, storage.as_ref(), sidecar, outcome).await;
         }
     }
@@ -5236,10 +5324,11 @@ async fn roll_back_schema_apply_v7(
                 crate::failpoints::names::RECOVERY_POST_TABLE_RESTORE_PRE_PUBLISH,
             )?;
         }
+        let restored_table_key = schema_apply_rollback_table_key(protocol, pin);
         push_table_update(
             root_uri,
             pin.identity,
-            &pin.table_key,
+            restored_table_key,
             &pin.table_path,
             None,
             state.manifest_pinned,
@@ -6100,6 +6189,30 @@ fn table_requires_rollback_effect(state: &ClassifiedTable) -> bool {
     )
 }
 
+/// A SchemaApply rewrite pin uses the desired alias because that is the
+/// forward manifest output. Compensation restores the accepted pre-apply
+/// binding, which is the rename's expected/source alias.
+fn schema_apply_rollback_table_key<'a>(
+    protocol: &'a RecoveryProtocolV7,
+    pin: &'a SidecarTablePin,
+) -> &'a str {
+    protocol
+        .intended_delta
+        .renames
+        .iter()
+        .find(|rename| rename.identity == pin.identity)
+        .map(|rename| rename.expected_table_key.as_str())
+        .unwrap_or(pin.table_key.as_str())
+}
+
+fn rollback_table_key<'a>(sidecar: &'a RecoverySidecar, pin: &'a SidecarTablePin) -> &'a str {
+    sidecar
+        .protocol_v7
+        .as_ref()
+        .map(|protocol| schema_apply_rollback_table_key(protocol, pin))
+        .unwrap_or(pin.table_key.as_str())
+}
+
 fn exact_rollback_audit_outcomes(
     sidecar: &RecoverySidecar,
     states: &[ClassifiedTable],
@@ -6115,7 +6228,7 @@ fn exact_rollback_audit_outcomes(
             ) && table_requires_rollback_effect(state)
         })
         .map(|(pin, state)| TableOutcome {
-            table_key: pin.table_key.clone(),
+            table_key: rollback_table_key(sidecar, pin).to_string(),
             from_version: state.lance_head,
             to_version: state.manifest_pinned,
         })
@@ -8830,6 +8943,14 @@ mod tests {
         }
     }
 
+    fn bind_sidecar_pins_to_root(sidecar: &mut RecoverySidecar, root: &str) {
+        for pin in &mut sidecar.tables {
+            let relative =
+                crate::db::manifest::table_path_for_identity(&pin.table_key, pin.identity).unwrap();
+            pin.table_path = format!("{}/{relative}", root.trim_end_matches('/'));
+        }
+    }
+
     fn transaction(read_version: u64, uuid: &str) -> StagedTransactionIdentity {
         StagedTransactionIdentity {
             read_version,
@@ -9246,7 +9367,7 @@ mod tests {
 
     #[tokio::test]
     async fn branch_merge_v9_arms_multi_commit_ref_only_and_pointer_slots() {
-        let root = "mem-root";
+        let root = "test-graph";
         let storage = ObjectStorageAdapter::in_memory();
         let target_identifier = test_branch_identifier(3, "target-incarnation");
         let lineage = RecoveryLineageIntent {
@@ -9318,7 +9439,7 @@ mod tests {
             renames: Vec::new(),
             tombstones: Vec::new(),
         };
-        let sidecar = new_branch_merge_sidecar_v9(
+        let mut sidecar = new_branch_merge_sidecar_v9(
             Some("target".to_string()),
             Some("act-merge".to_string()),
             vec![multi_pin, ref_pin],
@@ -9334,6 +9455,7 @@ mod tests {
             intended_delta,
         )
         .unwrap();
+        bind_sidecar_pins_to_root(&mut sidecar, root);
         assert_eq!(
             sidecar.schema_version,
             IDENTITY_AWARE_SIDECAR_SCHEMA_VERSION
@@ -9391,6 +9513,78 @@ mod tests {
         )
         .unwrap_err();
         assert!(error.to_string().contains("missing required protocol_v3"));
+    }
+
+    #[test]
+    fn parse_sidecar_refuses_mutation_with_multiple_writer_protocols() {
+        let mut sidecar = occ_sidecar();
+        let protocol_v3 = sidecar.protocol_v3.as_ref().unwrap();
+        sidecar.protocol_v7 = Some(RecoveryProtocolV7 {
+            authority: protocol_v3.authority.clone(),
+            lineage: protocol_v3.lineage.clone(),
+            rollback_graph_commit_id: "01H000000000000000000000BC".to_string(),
+            rollback_audit_outcomes: None,
+            target_schema_ir_hash: "foreign-schema-payload".to_string(),
+            effect_phase: RecoveryEffectPhase::Armed,
+            effects: Vec::new(),
+            intended_delta: RecoveryManifestDelta {
+                table_updates: Vec::new(),
+                registrations: Vec::new(),
+                renames: Vec::new(),
+                tombstones: Vec::new(),
+            },
+        });
+
+        let error = parse_sidecar(
+            "memory://graph/__recovery/multi-protocol.json",
+            &serde_json::to_string(&sidecar).unwrap(),
+        )
+        .expect_err("a v9 Mutation must not dispatch through a foreign payload");
+        assert!(
+            error
+                .to_string()
+                .contains("must carry only the protocol_v3 writer payload"),
+            "unexpected malformed-sidecar error: {error}"
+        );
+    }
+
+    #[tokio::test]
+    async fn identity_aware_sidecar_refuses_foreign_graph_root() {
+        let root = "own-graph";
+        let storage = ObjectStorageAdapter::in_memory();
+        let sidecar = occ_sidecar();
+        let uri = sidecar_uri(root, &sidecar.operation_id);
+        storage
+            .write_text(&uri, &serde_json::to_string(&sidecar).unwrap())
+            .await
+            .unwrap();
+
+        let error = list_sidecars(root, &storage)
+            .await
+            .expect_err("v9 recovery must never accept another graph's canonical table URI");
+        assert!(
+            error.to_string().contains("foreign or non-canonical URI"),
+            "unexpected foreign-root error: {error}"
+        );
+
+        storage.delete(&uri).await.unwrap();
+        let legacy = new_unvalidated_sidecar(
+            LEGACY_SIDECAR_SCHEMA_VERSION,
+            SidecarKind::Optimize,
+            None,
+            None,
+            vec![make_pin("node:Person", "memory://foreign", 5, 6)],
+        );
+        let legacy_uri = sidecar_uri(root, &legacy.operation_id);
+        storage
+            .write_text(&legacy_uri, &serde_json::to_string(&legacy).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(
+            list_sidecars(root, &storage).await.unwrap().len(),
+            1,
+            "legacy sidecars retain their historical path interpretation"
+        );
     }
 
     #[test]
@@ -9452,6 +9646,7 @@ mod tests {
         let root = dir.path().to_str().unwrap();
         let storage = ObjectStorageAdapter::local();
         let mut sidecar = occ_sidecar();
+        bind_sidecar_pins_to_root(&mut sidecar, root);
         write_sidecar(root, &storage, &sidecar).await.unwrap();
 
         let version_metadata: crate::db::manifest::TableVersionMetadata =
@@ -10574,9 +10769,10 @@ node Person { age: I32? }
         let storage = ObjectStorageAdapter::local();
         let root = dir.path().to_str().unwrap();
 
-        let sidecar =
+        let mut sidecar =
             new_optimize_sidecar_v9(vec![make_pin("node:Person", "file:///tmp/x.lance", 5, 6)])
                 .unwrap();
+        bind_sidecar_pins_to_root(&mut sidecar, root);
         let handle = write_sidecar(root, &storage, &sidecar).await.unwrap();
         assert_eq!(handle.operation_id, sidecar.operation_id);
 
@@ -10662,6 +10858,7 @@ node Person { age: I32? }
             // Override operation_id to use our deterministic ID.
             let mut sc = sc;
             sc.operation_id = id.to_string();
+            bind_sidecar_pins_to_root(&mut sc, root);
             write_sidecar(root, &storage, &sc).await.unwrap();
         }
 
