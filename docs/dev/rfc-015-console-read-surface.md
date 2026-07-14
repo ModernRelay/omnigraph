@@ -21,6 +21,10 @@ computes — no new write paths, no storage changes, no new invariants:
    ordering finally pinned in the contract.
 5. **Graph status** — `GET /graphs/{id}/status` projecting the boot-time serving snapshot
    (applied revision digests, policy bindings, quarantine diagnostics).
+6. **Blob content** — `GET /graphs/{id}/blob` streaming one row's `Blob` property with
+   `Content-Length`, `Accept-Ranges`, and HTTP Range support — exposing the engine's existing
+   SDK-only `read_blob` over the wire (Lance's `BlobFile::read_range` makes partial reads
+   zero-copy against the object store).
 
 Explicit non-goals, with rationale: push/streaming change subscription, a metrics/stats surface,
 maintenance operations over HTTP, and runtime graph add/remove (§Non-goals).
@@ -60,6 +64,14 @@ live 0.8.1 server and this branch's source):
   bindings, quarantine state, and schema digest all exist in the cluster ledger and the boot
   snapshot, but are only reachable via `omnigraph cluster status` against the cluster directory
   — which a remote console, by design, cannot address.
+- **Blob content is unreachable over HTTP.** `Blob` properties come back as `null` from `/query`
+  (the executor deliberately excludes blob columns from scans and re-adds them as null — partly
+  a Lance workaround: `BlobsDescriptions` + filter trips a projection assertion,
+  `exec/query.rs:1904`), and `entity_at_target` never materializes them. The ONLY wire path that
+  carries blob bytes is `POST /export`, which inlines `base64:`-prefixed strings into a bulk
+  NDJSON stream of the whole table — O(table) transfer to preview one image. Meanwhile the
+  engine already ships `Omnigraph::read_blob(type, id, prop) → lance::BlobFile`
+  (`db/omnigraph.rs:1377`) — SDK-only, main-snapshot-only, and never routed.
 
 ## Validated current state
 
@@ -75,6 +87,10 @@ Source-checked claims this design rests on:
 | `PolicyRequest { action, branch, target_branch }` already carries two branch scopes (the merge handler uses both), so no Cedar vocabulary change is needed for two-branch reads | `handlers.rs`, `omnigraph-policy` |
 | The server boots from `ServingSnapshot { graphs, queries, policies, diagnostics }`; policies carry `applies_to` bindings; the applied revision records `config_digest` plus a per-resource `digest`; serving deliberately never re-reads mutable cluster state after boot | `omnigraph-cluster/src/serve.rs:1–52`, `types.rs:568–597` |
 | Read endpoints are not admission-gated; mutating endpoints are | [server.md](../user/operations/server.md) |
+| `Omnigraph::read_blob(type, id, prop)` exists: snapshot → SQL row lookup → `take_blobs` → `lance::BlobFile`; it pins the MAIN snapshot only (no branch/target param) and reaches Lance through the `pub(crate)` `SnapshotHandle::dataset()` accessor — deliberately NOT on the sealed `TableStorage` trait | `db/omnigraph.rs:1377–1422`, `export.rs:179` |
+| Lance 7.0.0 `BlobFile` supports true partial reads: `read_range(Range<u64>) → Bytes` and `read_ranges(&[Range])` translate blob-local to physical offsets and issue bounded object-store `get_opts` — no whole-blob materialization; plus `size()`, `seek/tell`, and `uri()` for external blobs. Storage classes: Inline ≤64KB (in data file), Packed ≤4MB / Dedicated >4MB (sidecar `.blob` files), External (URI) | `lance-7.0.0/src/dataset/blob.rs:1185–1298` |
+| Blob reads are version-pinned (a dataset handle checked out at version V reads that version's descriptors/sidecars) and require stable row ids — which every OmniGraph table has (`_rowid` is already load-bearing for export) | `lance-7.0.0/src/dataset.rs:1460`, `export.rs:162` |
+| Lance stores NO content-type/MIME anywhere in the blob descriptor or field metadata — media type is entirely the application's concern | `lance-arrow-7.0.0/src/lib.rs:49–54` |
 
 ## Design
 
@@ -197,11 +213,59 @@ GET /graphs/{id}/status
 - Per-graph quarantine diagnostics (the boot loader already quarantines a graph with pending
   recovery sidecars while siblings serve) surface as `quarantined.reason` — today they exist
   only in startup logs.
+- **The convergence pairing:** the booted `config_digest` here is the *serving-side* half of
+  the applied-vs-serving check; the *ledger-side* half (the currently applied digest + run
+  history) is the control-plane service's `GET /clusters/{id}/status|runs`
+  ([rfc-016](rfc-016-control-plane-service.md)). A console compares the two digests — mismatch
+  means "applied but not yet serving; restart pending." Neither side reads the other's source.
 - **Auth:** bearer + `read` **on the graph** — deliberately per-graph, not the server-scoped
   `graph_list` action. A console holding a graph-scoped token can render its own graph's status
   without the cluster-management policy bundle that `GET /graphs` requires. `GET /graphs` itself
   stays minimal (`{graph_id, uri}`) — it is a routing surface, and enriching it would drag
   status data behind the wrong (server-scoped) auth boundary.
+
+### 6. Blob content — `GET /graphs/{id}/blob`
+
+```
+GET  /graphs/{id}/blob?type=Artifact&id=art-…&prop=blob[&branch=main]
+HEAD /graphs/{id}/blob?…                                  → Content-Length + Accept-Ranges only
+```
+
+- **The engine primitive already exists**: `Omnigraph::read_blob(type, id, prop)` resolves a
+  snapshot, finds the row by key, and returns a `lance::BlobFile`
+  (`db/omnigraph.rs:1377–1422`). This surface is an HTTP exposure plus two upgrades — it is NOT
+  a new read path:
+  1. **Branch/target parameter**: `read_blob` pins the main snapshot today; extend it to
+     `read_blob_at(target: ReadTarget, …)` so the endpoint reads the requested branch at one
+     pinned snapshot (invariant 3), exactly like `/snapshot` and `/query`.
+  2. **Streamed, range-capable body**: never call `BlobFile::read()` (whole-blob
+     materialization — fine for export's small artifacts, wrong for video). Lance 7.0.0's
+     `BlobFile::read_range(Range<u64>)` does bounded object-store reads with zero whole-blob
+     buffering, so the handler maps HTTP `Range` → `206 Partial Content` directly, and
+     full-body GETs stream fixed-size chunks (e.g. 4 MB) through the same `Body::from_stream`
+     pattern `/export` already uses. `Content-Length` comes free from `BlobFile::size()`;
+     `Accept-Ranges: bytes` is advertised. Storage classes make this efficient by construction:
+     Lance keeps blobs >4 MB in dedicated sidecar files, so a range read touches only that blob.
+- **External-URI blobs**: `BlobFile::uri()` is `Some` for `External` blobs (the loader accepts
+  `s3://…` references as well as `base64:` payloads). The endpoint answers
+  `302 Found → Location: <uri>` rather than proxying bytes it does not hold — the descriptor is
+  the source of truth, the content deliberately lives elsewhere.
+- **Content-Type**: Lance stores no MIME anywhere (validated — descriptor and field metadata
+  carry only position/size/kind/uri). The handler sniffs magic bytes from the first chunk
+  (`infer`-style) and falls back to `application/octet-stream`; a schema-level MIME property
+  convention stays an application concern. `ETag` derives from the pinned
+  `(table version, row id)` pair — stable, content-addressed enough for caching, and free.
+- **Errors**: 404 unknown row / null blob, 400 non-Blob property, 416 unsatisfiable range —
+  all typed (invariant 13).
+- **Auth:** bearer + `read` with branch scope — a blob is row data, same class as `/query` and
+  `/snapshot`. Not admission-gated (read-only); large-transfer rate control, if ever needed, is
+  a reverse-proxy concern like `/export`'s today.
+- **Boundary note:** `take_blobs` stays OFF the sealed `TableStorage` trait (it is a
+  Lance-specific descriptor-materialization API; both existing call sites — export and
+  `read_blob` — reach the inner dataset through the `pub(crate)` accessor, and the
+  `forbidden_apis` source-walk guard already sanctions this shape). No upstream Lance change is
+  needed for any of this — everything required is public in 7.0.0. The only blob item still
+  Lance-blocked is compaction (`LANCE_SUPPORTS_BLOB_COMPACTION`, unrelated to reads).
 
 ## Non-goals
 
@@ -216,6 +280,10 @@ GET /graphs/{id}/status
   directly by design (RFC-011); exposing them through the serving path needs the Admin action
   vocabulary (MR-724 Option A reserves it) and a two-person-rule story first.
 - **Runtime graph add/remove.** Unchanged: `cluster apply` + restart ([server.md](../user/operations/server.md)).
+- **Ledger-side status and cluster operations.** Applied-revision state, run history, and
+  remote `plan`/`apply` belong to the control-plane service track
+  ([rfc-016](rfc-016-control-plane-service.md)), never the serving path — this RFC's surfaces
+  stay pure projections of what the *server* holds.
 
 ## Compatibility & rollout
 
@@ -256,6 +324,7 @@ GET /graphs/{id}/status
 | 3 | branches `verbose=true` | M — server-side divergence walk | branches page in one request, exact counts |
 | 4 | merge `dry_run` | M — write-skipping cursor mode | pre-merge conflict UX, CI mergeability gates |
 | 5 | `/graphs/{id}/status` | S — project boot snapshot | console graph/deployment status |
+| 6 | `/graphs/{id}/blob` | M — `read_blob_at` target param + Range/streaming handler | image/file preview + download in consoles; media-bearing agent tools |
 
 Ordered by consumer pain over implementation order; 1a and 2 are each afternoon-sized and
 independently shippable.
