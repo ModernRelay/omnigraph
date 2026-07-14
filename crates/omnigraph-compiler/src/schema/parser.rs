@@ -657,8 +657,16 @@ fn validate_string_annotation(
 fn validate_schema_annotations(schema: &SchemaFile) -> Result<()> {
     for decl in &schema.declarations {
         match decl {
-            SchemaDecl::Interface(_) => {} // Interfaces have no type-level annotations
+            SchemaDecl::Interface(interface) => {
+                for prop in &interface.properties {
+                    rename_from_annotation(
+                        &prop.annotations,
+                        &format!("property {}.{}", interface.name, prop.name),
+                    )?;
+                }
+            } // Interfaces have no type-level annotations
             SchemaDecl::Node(node) => {
+                rename_from_annotation(&node.annotations, &format!("node {}", node.name))?;
                 // Reject constraint annotations on node level (must be on properties or as body constraints)
                 for ann in &node.annotations {
                     if ann.name == "key"
@@ -689,6 +697,7 @@ fn validate_schema_annotations(schema: &SchemaFile) -> Result<()> {
                 }
             }
             SchemaDecl::Edge(edge) => {
+                rename_from_annotation(&edge.annotations, &format!("edge {}", edge.name))?;
                 for ann in &edge.annotations {
                     if ann.name == "key"
                         || ann.name == "unique"
@@ -733,6 +742,10 @@ fn validate_property_annotations(
     validate_string_annotation(
         &prop.annotations,
         "description",
+        &format!("property {}.{}", type_name, prop.name),
+    )?;
+    rename_from_annotation(
+        &prop.annotations,
         &format!("property {}.{}", type_name, prop.name),
     )?;
 

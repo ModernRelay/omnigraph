@@ -581,16 +581,21 @@ fn resolve(
         .map(|node| {
             let assigned = assignments[&(TypeKind::Node, node.name.clone())];
             let incarnation = assigned.incarnation.expect("nodes receive incarnations");
+            let mut implements = node
+                .implements
+                .iter()
+                .map(|name| type_ref(TypeKind::Interface, name, &assignments))
+                .collect::<Result<Vec<_>>>()?;
+            // References are canonicalized by immutable identity. Diagnostic
+            // names may move across lexical order as interfaces are added or
+            // renamed; they must not control accepted-IR ordering.
+            implements.sort();
             Ok(NodeIR {
                 name: node.name.clone(),
                 type_id: assigned.type_id,
                 table_incarnation_id: incarnation,
                 annotations: node.annotations.clone(),
-                implements: node
-                    .implements
-                    .iter()
-                    .map(|name| type_ref(TypeKind::Interface, name, &assignments))
-                    .collect::<Result<Vec<_>>>()?,
+                implements,
                 properties: build_properties(
                     assigned.type_id,
                     &node.name,
@@ -952,17 +957,25 @@ pub fn schema_shape_from_ir(ir: &SchemaIR) -> Result<SchemaShape> {
     let nodes = ir
         .nodes
         .iter()
-        .map(|node| NodeShape {
-            name: node.name.clone(),
-            rename_from: None,
-            annotations: node.annotations.clone(),
-            implements: node
+        .map(|node| {
+            let mut implements = node
                 .implements
                 .iter()
                 .map(|reference| reference.type_name.clone())
-                .collect(),
-            properties: node.properties.iter().map(property_shape_from_ir).collect(),
-            constraints: node.constraints.iter().map(constraint_from_ir).collect(),
+                .collect::<Vec<_>>();
+            // SchemaShape is identity-free and canonical by source names.
+            // Accepted IR uses identity order, so crossing the boundary must
+            // re-establish the shape's name order before hashing.
+            implements.sort();
+            implements.dedup();
+            NodeShape {
+                name: node.name.clone(),
+                rename_from: None,
+                annotations: node.annotations.clone(),
+                implements,
+                properties: node.properties.iter().map(property_shape_from_ir).collect(),
+                constraints: node.constraints.iter().map(constraint_from_ir).collect(),
+            }
         })
         .collect();
     let edges = ir
@@ -991,6 +1004,16 @@ pub fn schema_shape_hash_from_ir(ir: &SchemaIR) -> Result<String> {
 }
 
 fn property_shape_from_ir(property: &PropertyIR) -> PropertyShape {
+    let mut satisfies_interface_properties = property
+        .satisfies_interface_properties
+        .iter()
+        .map(|reference| ShapePropertyRef {
+            owner_name: reference.owner_type_name.clone(),
+            property_name: reference.property_name.clone(),
+        })
+        .collect::<Vec<_>>();
+    satisfies_interface_properties.sort();
+    satisfies_interface_properties.dedup();
     PropertyShape {
         name: property.name.clone(),
         rename_from: None,
@@ -1005,14 +1028,7 @@ fn property_shape_from_ir(property: &PropertyIR) -> PropertyShape {
                 model: embed.model.clone(),
             }),
         declared_directly: property.declared_directly,
-        satisfies_interface_properties: property
-            .satisfies_interface_properties
-            .iter()
-            .map(|reference| ShapePropertyRef {
-                owner_name: reference.owner_type_name.clone(),
-                property_name: reference.property_name.clone(),
-            })
-            .collect(),
+        satisfies_interface_properties,
     }
 }
 
@@ -1481,6 +1497,55 @@ mod tests {
     }
 
     #[test]
+    fn evolved_references_use_identity_order_and_shape_projection_restores_name_order() {
+        let accepted = initialize("interface Z { name: String } node N implements Z {}");
+        let desired_shape = compile_schema_shape(
+            &parse_schema(
+                "interface A { name: String } interface Z { name: String } node N implements A, Z {}",
+            )
+            .unwrap(),
+        )
+        .unwrap();
+        let resolved = resolve_schema_ir(&accepted, &desired_shape)
+            .unwrap()
+            .schema_ir;
+
+        // Z retains the older (smaller) identity even though A is lexically
+        // first. Accepted references therefore use Z,A identity order.
+        assert_eq!(
+            resolved.nodes[0]
+                .implements
+                .iter()
+                .map(|reference| reference.type_name.as_str())
+                .collect::<Vec<_>>(),
+            vec!["Z", "A"]
+        );
+        assert_eq!(
+            resolved.nodes[0].properties[0]
+                .satisfies_interface_properties
+                .iter()
+                .map(|reference| reference.owner_type_name.as_str())
+                .collect::<Vec<_>>(),
+            vec!["Z", "A"]
+        );
+
+        let projected = schema_shape_from_ir(&resolved).unwrap();
+        assert_eq!(projected.nodes[0].implements, vec!["A", "Z"]);
+        assert_eq!(
+            projected.nodes[0].properties[0]
+                .satisfies_interface_properties
+                .iter()
+                .map(|reference| reference.owner_name.as_str())
+                .collect::<Vec<_>>(),
+            vec!["A", "Z"]
+        );
+        assert_eq!(
+            schema_shape_hash(&projected).unwrap(),
+            schema_shape_hash(&desired_shape).unwrap()
+        );
+    }
+
+    #[test]
     fn explicit_renames_preserve_type_property_and_incarnation_ids() {
         let accepted = initialize("node Person { name: String age: I32? }");
         let desired = parse_schema(
@@ -1642,6 +1707,55 @@ edge Relates: Human -> Human @rename_from("Knows") { @unique(src, dst) }
             Some(ir.nodes[0].properties[0].property_id)
         );
         assert_eq!(catalog.node_types["Person"].key_property(), Some("name"));
+    }
+
+    #[test]
+    fn catalog_generic_identity_accessors_refuse_cross_kind_name_ambiguity() {
+        let ir = initialize(
+            "node Shared { value: String } edge Shared: Shared -> Shared { value: String edge_only: String }",
+        );
+        let catalog = build_catalog_from_ir(&ir).unwrap();
+
+        assert_eq!(catalog.type_id("Shared"), None);
+        assert_eq!(catalog.table_incarnation_id("Shared"), None);
+        assert_eq!(catalog.property_id("Shared", "value"), None);
+        assert_eq!(catalog.property_id("Shared", "edge_only"), None);
+        assert_eq!(catalog.node_type_id("Shared"), Some(ir.nodes[0].type_id));
+        assert_eq!(catalog.edge_type_id("Shared"), Some(ir.edges[0].type_id));
+        assert_eq!(
+            catalog.node_table_incarnation_id("Shared"),
+            Some(ir.nodes[0].table_incarnation_id)
+        );
+        assert_eq!(
+            catalog.edge_table_incarnation_id("Shared"),
+            Some(ir.edges[0].table_incarnation_id)
+        );
+        assert_eq!(
+            catalog.node_property_id("Shared", "value"),
+            Some(ir.nodes[0].properties[0].property_id)
+        );
+        assert_eq!(
+            catalog.edge_property_id("Shared", "value"),
+            Some(
+                ir.edges[0]
+                    .properties
+                    .iter()
+                    .find(|property| property.name == "value")
+                    .unwrap()
+                    .property_id
+            )
+        );
+        assert_eq!(
+            catalog.edge_property_id("Shared", "edge_only"),
+            Some(
+                ir.edges[0]
+                    .properties
+                    .iter()
+                    .find(|property| property.name == "edge_only")
+                    .unwrap()
+                    .property_id
+            )
+        );
     }
 
     #[test]

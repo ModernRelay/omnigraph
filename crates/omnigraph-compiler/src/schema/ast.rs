@@ -1,5 +1,6 @@
 use std::collections::BTreeMap;
 
+use crate::error::{CompilerError, Result};
 use crate::types::PropType;
 use serde::{Deserialize, Serialize};
 
@@ -85,6 +86,38 @@ pub struct Annotation {
     /// hash) stay byte-identical; `BTreeMap` keeps the order deterministic.
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub kwargs: BTreeMap<String, String>,
+}
+
+pub(crate) fn rename_from_annotation<'a>(
+    annotations: &'a [Annotation],
+    target: &str,
+) -> Result<Option<&'a str>> {
+    let mut matches = annotations
+        .iter()
+        .filter(|annotation| annotation.name == "rename_from");
+    let Some(annotation) = matches.next() else {
+        return Ok(None);
+    };
+    if matches.next().is_some() {
+        return Err(CompilerError::Parse(format!(
+            "{target} declares @rename_from multiple times"
+        )));
+    }
+    let value = annotation
+        .value
+        .as_deref()
+        .filter(|value| !value.trim().is_empty())
+        .ok_or_else(|| {
+            CompilerError::Parse(format!(
+                "@rename_from on {target} requires exactly one non-empty positional value"
+            ))
+        })?;
+    if !annotation.kwargs.is_empty() {
+        return Err(CompilerError::Parse(format!(
+            "@rename_from on {target} does not accept keyword arguments"
+        )));
+    }
+    Ok(Some(value))
 }
 
 /// A typed constraint declared in a node or edge body.

@@ -7,9 +7,10 @@ use crate::schema::ast::{Annotation, Constraint};
 use crate::types::PropType;
 
 use super::schema_ir::{
-    ConstraintIR, EdgeIR, InterfaceIR, NodeIR, PropertyIR, SchemaIR, StablePropertyId,
-    StableTypeId, TableIncarnationId, constraint_from_ir, validate_schema_ir,
+    ConstraintIR, EdgeIR, EmbedSourceIR, InterfaceIR, NodeIR, PropertyIR, PropertyRefIR, SchemaIR,
+    StablePropertyId, StableTypeId, TableIncarnationId, constraint_from_ir, validate_schema_ir,
 };
+use super::schema_shape::PropertyConstraintShape;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -199,6 +200,14 @@ pub fn plan_schema_migration(
     plan_interfaces(&accepted.interfaces, &desired.interfaces, &mut steps);
     plan_nodes(&accepted.nodes, &desired.nodes, &mut steps);
     plan_edges(&accepted.edges, &desired.edges, &mut steps);
+
+    if steps.is_empty() && accepted != desired {
+        steps.push(SchemaMigrationStep::UnsupportedChange {
+            entity: "schema".to_string(),
+            reason: "schema migration contains an unclassified semantic IR change".to_string(),
+            code: None,
+        });
+    }
 
     Ok(SchemaMigrationPlan {
         supported: !steps
@@ -650,6 +659,65 @@ fn plan_properties(
             });
         }
 
+        if !embed_sources_semantically_equal(&existing.embed_source, &property.embed_source) {
+            steps.push(SchemaMigrationStep::UnsupportedChange {
+                entity: format!(
+                    "{}:{}.{}",
+                    schema_type_kind_key(type_kind),
+                    type_name,
+                    property.name
+                ),
+                reason: format!(
+                    "changing @embed source or model for '{}.{}' is not supported in schema migration v1; rebuild the graph so stored vectors and their declared embedding space cannot diverge",
+                    type_name, property.name
+                ),
+                code: None,
+            });
+        }
+
+        plan_property_constraints(
+            type_kind,
+            type_name,
+            &property.name,
+            &existing.property_constraints,
+            &property.property_constraints,
+            steps,
+        );
+
+        if existing.declared_directly != property.declared_directly {
+            steps.push(SchemaMigrationStep::UnsupportedChange {
+                entity: format!(
+                    "{}:{}.{}",
+                    schema_type_kind_key(type_kind),
+                    type_name,
+                    property.name
+                ),
+                reason: format!(
+                    "changing declaration provenance for '{}.{}' is not supported in schema migration v1",
+                    type_name, property.name
+                ),
+                code: None,
+            });
+        }
+
+        if stable_property_refs(&existing.satisfies_interface_properties)
+            != stable_property_refs(&property.satisfies_interface_properties)
+        {
+            steps.push(SchemaMigrationStep::UnsupportedChange {
+                entity: format!(
+                    "{}:{}.{}",
+                    schema_type_kind_key(type_kind),
+                    type_name,
+                    property.name
+                ),
+                reason: format!(
+                    "changing interface-property satisfaction links for '{}.{}' is not supported in schema migration v1",
+                    type_name, property.name
+                ),
+                code: None,
+            });
+        }
+
         plan_property_metadata(
             type_kind,
             type_name,
@@ -681,6 +749,90 @@ fn plan_properties(
             property_name: leftover.name.clone(),
             mode: DropMode::Soft,
         });
+    }
+}
+
+fn embed_sources_semantically_equal(
+    accepted: &Option<EmbedSourceIR>,
+    desired: &Option<EmbedSourceIR>,
+) -> bool {
+    match (accepted, desired) {
+        (None, None) => true,
+        (Some(accepted), Some(desired)) => {
+            accepted.source.owner_type_id == desired.source.owner_type_id
+                && accepted.source.property_id == desired.source.property_id
+                && accepted.model == desired.model
+        }
+        _ => false,
+    }
+}
+
+fn stable_property_refs(
+    references: &[PropertyRefIR],
+) -> BTreeSet<(StableTypeId, StablePropertyId)> {
+    references
+        .iter()
+        .map(|reference| (reference.owner_type_id, reference.property_id))
+        .collect()
+}
+
+fn plan_property_constraints(
+    type_kind: SchemaTypeKind,
+    type_name: &str,
+    property_name: &str,
+    accepted: &[PropertyConstraintShape],
+    desired: &[PropertyConstraintShape],
+    steps: &mut Vec<SchemaMigrationStep>,
+) {
+    let accepted = accepted.iter().copied().collect::<BTreeSet<_>>();
+    let desired = desired.iter().copied().collect::<BTreeSet<_>>();
+    let entity = format!(
+        "{}:{}.{}",
+        schema_type_kind_key(type_kind),
+        type_name,
+        property_name
+    );
+
+    if accepted.difference(&desired).next().is_some() {
+        steps.push(SchemaMigrationStep::UnsupportedChange {
+            entity: entity.clone(),
+            reason: format!(
+                "removing property constraints from '{}.{}' is not supported in schema migration v1",
+                type_name, property_name
+            ),
+            code: None,
+        });
+    }
+
+    for addition in desired.difference(&accepted) {
+        match addition {
+            PropertyConstraintShape::Index => {
+                let step = SchemaMigrationStep::AddConstraint {
+                    type_kind,
+                    type_name: type_name.to_string(),
+                    constraint: Constraint::Index(vec![property_name.to_string()]),
+                };
+                if !steps.contains(&step) {
+                    steps.push(step);
+                }
+            }
+            PropertyConstraintShape::Key | PropertyConstraintShape::Unique => {
+                steps.push(SchemaMigrationStep::UnsupportedChange {
+                    entity: entity.clone(),
+                    reason: format!(
+                        "adding a property-level @{} constraint to '{}.{}' is not supported in schema migration v1",
+                        match addition {
+                            PropertyConstraintShape::Key => "key",
+                            PropertyConstraintShape::Unique => "unique",
+                            PropertyConstraintShape::Index => unreachable!(),
+                        },
+                        type_name,
+                        property_name
+                    ),
+                    code: None,
+                });
+            }
+        }
     }
 }
 
@@ -723,11 +875,16 @@ fn plan_constraints(
             continue;
         }
         match &constraint {
-            ConstraintIR::Index { .. } => steps.push(SchemaMigrationStep::AddConstraint {
-                type_kind,
-                type_name: type_name.to_string(),
-                constraint: constraint_from_ir(&constraint),
-            }),
+            ConstraintIR::Index { .. } => {
+                let step = SchemaMigrationStep::AddConstraint {
+                    type_kind,
+                    type_name: type_name.to_string(),
+                    constraint: constraint_from_ir(&constraint),
+                };
+                if !steps.contains(&step) {
+                    steps.push(step);
+                }
+            }
             _ => steps.push(SchemaMigrationStep::UnsupportedChange {
                 entity: format!("{}:{}", schema_type_kind_key(type_kind), type_name),
                 reason: format!(
@@ -905,7 +1062,11 @@ fn constraint_ir_key(constraint: &ConstraintIR) -> String {
             }
         ),
     };
-    let fields = |fields: &[FieldRefIR]| fields.iter().map(&field).collect::<Vec<_>>().join(",");
+    let fields = |fields: &[FieldRefIR]| {
+        let mut keys = fields.iter().map(&field).collect::<Vec<_>>();
+        keys.sort();
+        keys.join(",")
+    };
     match constraint {
         ConstraintIR::Key { fields: values } => format!("key:{}", fields(values)),
         ConstraintIR::Unique { fields: values } => format!("unique:{}", fields(values)),
@@ -1141,6 +1302,14 @@ node Person {
             type_name: "Person".to_string(),
             constraint: Constraint::Index(vec!["age".to_string()]),
         }));
+        assert_eq!(
+            plan.steps
+                .iter()
+                .filter(|step| matches!(step, AddConstraint { type_kind: SchemaTypeKind::Node, type_name, constraint: Constraint::Index(fields) } if type_name == "Person" && fields == &["age"]))
+                .count(),
+            1,
+            "property and table constraint classification must not duplicate the supported index step"
+        );
     }
 
     #[test]
@@ -1343,6 +1512,179 @@ node Person @description("new") {
                 kwargs: Default::default(),
             }],
         }));
+    }
+
+    #[test]
+    fn plan_rejects_embed_source_or_model_changes() {
+        let accepted = ir(r#"
+node Doc {
+    slug: String @key
+    title: String
+    body: String
+    embedding: Vector(3) @embed("body", model="model-a")
+}
+"#);
+
+        for desired_source in [
+            r#"
+node Doc {
+    slug: String @key
+    title: String
+    body: String
+    embedding: Vector(3) @embed("title", model="model-a")
+}
+"#,
+            r#"
+node Doc {
+    slug: String @key
+    title: String
+    body: String
+    embedding: Vector(3) @embed("body", model="model-b")
+}
+"#,
+        ] {
+            let desired = evolve(&accepted, desired_source);
+            let plan = plan_schema_migration(&accepted, &desired).unwrap();
+            assert!(!plan.supported);
+            assert!(plan.steps.iter().any(|step| matches!(
+                step,
+                UnsupportedChange { entity, reason, .. }
+                    if entity == "node:Doc.embedding" && reason.contains("@embed")
+            )));
+        }
+    }
+
+    #[test]
+    fn plan_keeps_embed_binding_supported_across_type_and_source_property_rename() {
+        let accepted = ir(r#"
+node Doc {
+    body: String
+    embedding: Vector(3) @embed("body", model="model-a")
+}
+"#);
+        let desired = evolve(
+            &accepted,
+            r#"
+node Article @rename_from("Doc") {
+    text: String @rename_from("body")
+    embedding: Vector(3) @embed("text", model="model-a")
+}
+"#,
+        );
+
+        let plan = plan_schema_migration(&accepted, &desired).unwrap();
+        assert!(
+            plan.supported,
+            "diagnostic rename text is not embed identity: {plan:?}"
+        );
+        assert!(plan.steps.iter().any(|step| matches!(
+            step,
+            RenameType { from, to, .. } if from == "Doc" && to == "Article"
+        )));
+        assert!(plan.steps.iter().any(|step| matches!(
+            step,
+            RenameProperty { from, to, .. } if from == "body" && to == "text"
+        )));
+        assert!(!plan.steps.iter().any(|step| matches!(
+            step,
+            UnsupportedChange { reason, .. } if reason.contains("@embed")
+        )));
+    }
+
+    #[test]
+    fn plan_normalizes_composite_constraint_field_identity_order_across_rename() {
+        let accepted = ir(r#"
+node Pair {
+    alpha: String
+    beta: String
+    @unique(alpha, beta)
+}
+"#);
+        let desired = evolve(
+            &accepted,
+            r#"
+node Pair {
+    zeta: String @rename_from("alpha")
+    beta: String
+    @unique(zeta, beta)
+}
+"#,
+        );
+
+        let plan = plan_schema_migration(&accepted, &desired).unwrap();
+        assert!(
+            plan.supported,
+            "field order is not constraint identity: {plan:?}"
+        );
+        assert_eq!(
+            plan.steps
+                .iter()
+                .filter(|step| matches!(step, RenameProperty { .. }))
+                .count(),
+            1
+        );
+        assert!(
+            !plan
+                .steps
+                .iter()
+                .any(|step| matches!(step, UnsupportedChange { .. }))
+        );
+    }
+
+    #[test]
+    fn plan_classifies_property_constraint_provenance_and_satisfaction_changes() {
+        let accepted = ir("node N { value: String @unique }");
+        let desired = evolve(&accepted, "node N { value: String @unique(value) }");
+        let plan = plan_schema_migration(&accepted, &desired).unwrap();
+        assert!(!plan.supported);
+        assert!(plan.steps.iter().any(|step| matches!(
+            step,
+            UnsupportedChange { entity, reason, .. }
+                if entity == "node:N.value" && reason.contains("property constraints")
+        )));
+
+        let accepted = ir("interface A { value: String } node N implements A {}");
+        let desired = evolve(
+            &accepted,
+            "interface A { value: String } node N implements A { value: String }",
+        );
+        let plan = plan_schema_migration(&accepted, &desired).unwrap();
+        assert!(!plan.supported);
+        assert!(plan.steps.iter().any(|step| matches!(
+            step,
+            UnsupportedChange { entity, reason, .. }
+                if entity == "node:N.value" && reason.contains("declaration provenance")
+        )));
+
+        let accepted = ir(
+            "interface A { value: String } interface B { value: String } node N implements A, B {}",
+        );
+        let desired = evolve(
+            &accepted,
+            "interface A { value: String } interface B { value: String } node N implements A {}",
+        );
+        let plan = plan_schema_migration(&accepted, &desired).unwrap();
+        assert!(!plan.supported);
+        assert!(plan.steps.iter().any(|step| matches!(
+            step,
+            UnsupportedChange { entity, reason, .. }
+                if entity == "node:N.value" && reason.contains("satisfaction links")
+        )));
+    }
+
+    #[test]
+    fn plan_guard_rejects_unclassified_zero_step_ir_change() {
+        let accepted = ir("node N { value: String }");
+        let mut desired = accepted.clone();
+        desired.next_identity_id += 1;
+
+        let plan = plan_schema_migration(&accepted, &desired).unwrap();
+        assert!(!plan.supported);
+        assert!(plan.steps.iter().any(|step| matches!(
+            step,
+            UnsupportedChange { entity, reason, .. }
+                if entity == "schema" && reason.contains("unclassified")
+        )));
     }
 
     #[test]

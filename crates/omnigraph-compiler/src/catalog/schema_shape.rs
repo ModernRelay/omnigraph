@@ -14,7 +14,7 @@ use sha2::{Digest, Sha256};
 use crate::error::{CompilerError, Result};
 use crate::schema::ast::{
     Annotation, Cardinality, Constraint, InterfacePropertyOrigin, PropDecl, SchemaDecl, SchemaFile,
-    annotation_value,
+    rename_from_annotation,
 };
 use crate::types::PropType;
 
@@ -188,8 +188,11 @@ pub fn compile_schema_shape(schema: &SchemaFile) -> Result<SchemaShape> {
 
                 nodes.push(NodeShape {
                     name: node.name.clone(),
-                    rename_from: annotation_value(&node.annotations, "rename_from")
-                        .map(str::to_string),
+                    rename_from: rename_from_annotation(
+                        &node.annotations,
+                        &format!("node {}", node.name),
+                    )?
+                    .map(str::to_string),
                     annotations: canonical_annotations(&node.annotations),
                     implements,
                     properties,
@@ -199,8 +202,11 @@ pub fn compile_schema_shape(schema: &SchemaFile) -> Result<SchemaShape> {
             SchemaDecl::Edge(edge) => {
                 edges.push(EdgeShape {
                     name: edge.name.clone(),
-                    rename_from: annotation_value(&edge.annotations, "rename_from")
-                        .map(str::to_string),
+                    rename_from: rename_from_annotation(
+                        &edge.annotations,
+                        &format!("edge {}", edge.name),
+                    )?
+                    .map(str::to_string),
                     from_type: edge.from_type.clone(),
                     to_type: edge.to_type.clone(),
                     cardinality: edge.cardinality.clone(),
@@ -346,7 +352,11 @@ fn property_shape(property: &PropDecl, declared_directly: bool) -> Result<Proper
         });
     Ok(PropertyShape {
         name: property.name.clone(),
-        rename_from: annotation_value(&property.annotations, "rename_from").map(str::to_string),
+        rename_from: rename_from_annotation(
+            &property.annotations,
+            &format!("property {}", property.name),
+        )?
+        .map(str::to_string),
         prop_type,
         annotations: canonical_annotations(&property.annotations),
         property_constraints,
@@ -520,6 +530,24 @@ mod tests {
         assert_eq!(
             schema_shape_hash(&left).unwrap(),
             schema_shape_hash(&right).unwrap()
+        );
+    }
+
+    #[test]
+    fn shape_compilation_revalidates_rename_hint_structure() {
+        let mut schema = parse_schema("node Person @rename_from(\"OldPerson\") {}").unwrap();
+        let SchemaDecl::Node(node) = &mut schema.declarations[0] else {
+            unreachable!()
+        };
+        node.annotations[0]
+            .kwargs
+            .insert("typo".to_string(), "ignored".to_string());
+
+        let error = compile_schema_shape(&schema).unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("does not accept keyword arguments")
         );
     }
 

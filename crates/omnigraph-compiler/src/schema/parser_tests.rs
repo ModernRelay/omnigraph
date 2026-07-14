@@ -618,6 +618,31 @@ edge ConnectedTo: Account -> Account @rename_from("Knows")
 }
 
 #[test]
+fn test_reject_malformed_rename_annotations_on_types_and_properties() {
+    for input in [
+        "node Account @rename_from {}",
+        "node Account @rename_from(\"\") {}",
+        "node Account @rename_from(\"User\", \"Member\") {}",
+        "node Account @rename_from(\"User\", typo=\"ignored\") {}",
+        "node Account @rename_from(\"User\") @rename_from(\"Member\") {}",
+        "node Account { name: String @rename_from }",
+        "node Account { name: String @rename_from(\"\") }",
+        "node Account { name: String @rename_from(\"old\", typo=\"ignored\") }",
+        "node Account { name: String @rename_from(\"old\") @rename_from(\"legacy\") }",
+        "node Account {} edge Connected: Account -> Account @rename_from",
+        "node Account {} edge Connected: Account -> Account @rename_from(\"\")",
+        "node Account {} edge Connected: Account -> Account @rename_from(\"Old\", typo=\"ignored\")",
+        "node Account {} edge Connected: Account -> Account @rename_from(\"Old\") @rename_from(\"Legacy\")",
+    ] {
+        let error = parse_schema(input).unwrap_err();
+        assert!(
+            error.to_string().contains("rename_from"),
+            "expected a rename-specific error for {input:?}, got: {error}"
+        );
+    }
+}
+
+#[test]
 fn test_reject_multiple_node_keys() {
     let input = r#"
 node Person {

@@ -135,37 +135,66 @@ impl Catalog {
     }
 
     pub fn type_id(&self, name: &str) -> Option<schema_ir::StableTypeId> {
-        let ir = self.bound_schema_ir()?;
-        ir.interfaces
+        let mut matches = [
+            self.interface_type_id(name),
+            self.node_type_id(name),
+            self.edge_type_id(name),
+        ]
+        .into_iter()
+        .flatten();
+        let identity = matches.next()?;
+        matches.next().is_none().then_some(identity)
+    }
+
+    pub fn interface_type_id(&self, name: &str) -> Option<schema_ir::StableTypeId> {
+        self.bound_schema_ir()?
+            .interfaces
             .iter()
             .find(|entry| entry.name == name)
             .map(|entry| entry.type_id)
-            .or_else(|| {
-                ir.nodes
-                    .iter()
-                    .find(|entry| entry.name == name)
-                    .map(|entry| entry.type_id)
-            })
-            .or_else(|| {
-                ir.edges
-                    .iter()
-                    .find(|entry| entry.name == name)
-                    .map(|entry| entry.type_id)
-            })
+    }
+
+    pub fn node_type_id(&self, name: &str) -> Option<schema_ir::StableTypeId> {
+        self.bound_schema_ir()?
+            .nodes
+            .iter()
+            .find(|entry| entry.name == name)
+            .map(|entry| entry.type_id)
+    }
+
+    pub fn edge_type_id(&self, name: &str) -> Option<schema_ir::StableTypeId> {
+        self.bound_schema_ir()?
+            .edges
+            .iter()
+            .find(|entry| entry.name == name)
+            .map(|entry| entry.type_id)
     }
 
     pub fn table_incarnation_id(&self, name: &str) -> Option<schema_ir::TableIncarnationId> {
-        let ir = self.bound_schema_ir()?;
-        ir.nodes
+        let mut matches = [
+            self.node_table_incarnation_id(name),
+            self.edge_table_incarnation_id(name),
+        ]
+        .into_iter()
+        .flatten();
+        let identity = matches.next()?;
+        matches.next().is_none().then_some(identity)
+    }
+
+    pub fn node_table_incarnation_id(&self, name: &str) -> Option<schema_ir::TableIncarnationId> {
+        self.bound_schema_ir()?
+            .nodes
             .iter()
             .find(|entry| entry.name == name)
             .map(|entry| entry.table_incarnation_id)
-            .or_else(|| {
-                ir.edges
-                    .iter()
-                    .find(|entry| entry.name == name)
-                    .map(|entry| entry.table_incarnation_id)
-            })
+    }
+
+    pub fn edge_table_incarnation_id(&self, name: &str) -> Option<schema_ir::TableIncarnationId> {
+        self.bound_schema_ir()?
+            .edges
+            .iter()
+            .find(|entry| entry.name == name)
+            .map(|entry| entry.table_incarnation_id)
     }
 
     pub fn property_id(
@@ -173,27 +202,73 @@ impl Catalog {
         owner_name: &str,
         property_name: &str,
     ) -> Option<schema_ir::StablePropertyId> {
-        let ir = self.bound_schema_ir()?;
-        ir.interfaces
+        let mut owners = [
+            (
+                self.interface_type_id(owner_name),
+                self.interface_property_id(owner_name, property_name),
+            ),
+            (
+                self.node_type_id(owner_name),
+                self.node_property_id(owner_name, property_name),
+            ),
+            (
+                self.edge_type_id(owner_name),
+                self.edge_property_id(owner_name, property_name),
+            ),
+        ]
+        .into_iter()
+        .filter(|(owner, _)| owner.is_some());
+        let (_, property) = owners.next()?;
+        if owners.next().is_some() {
+            None
+        } else {
+            property
+        }
+    }
+
+    pub fn interface_property_id(
+        &self,
+        owner_name: &str,
+        property_name: &str,
+    ) -> Option<schema_ir::StablePropertyId> {
+        self.bound_schema_ir()?
+            .interfaces
             .iter()
-            .map(|entry| (entry.name.as_str(), entry.properties.as_slice()))
-            .chain(
-                ir.nodes
-                    .iter()
-                    .map(|entry| (entry.name.as_str(), entry.properties.as_slice())),
-            )
-            .chain(
-                ir.edges
-                    .iter()
-                    .map(|entry| (entry.name.as_str(), entry.properties.as_slice())),
-            )
-            .find(|(name, _)| *name == owner_name)
-            .and_then(|(_, properties)| {
-                properties
-                    .iter()
-                    .find(|property| property.name == property_name)
-                    .map(|property| property.property_id)
-            })
+            .find(|entry| entry.name == owner_name)?
+            .properties
+            .iter()
+            .find(|property| property.name == property_name)
+            .map(|property| property.property_id)
+    }
+
+    pub fn node_property_id(
+        &self,
+        owner_name: &str,
+        property_name: &str,
+    ) -> Option<schema_ir::StablePropertyId> {
+        self.bound_schema_ir()?
+            .nodes
+            .iter()
+            .find(|entry| entry.name == owner_name)?
+            .properties
+            .iter()
+            .find(|property| property.name == property_name)
+            .map(|property| property.property_id)
+    }
+
+    pub fn edge_property_id(
+        &self,
+        owner_name: &str,
+        property_name: &str,
+    ) -> Option<schema_ir::StablePropertyId> {
+        self.bound_schema_ir()?
+            .edges
+            .iter()
+            .find(|entry| entry.name == owner_name)?
+            .properties
+            .iter()
+            .find(|property| property.name == property_name)
+            .map(|property| property.property_id)
     }
 }
 
