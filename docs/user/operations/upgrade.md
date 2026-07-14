@@ -17,9 +17,9 @@ message that **names the release line that wrote it** and the exact commands —
 so you can fetch the right old binary without guessing:
 
 ```
-__manifest is stamped at internal schema v3, but this omnigraph reads only v4.
-This graph was created by omnigraph 0.6.2 to 0.7.2. Rebuild it: with an omnigraph
-0.6.2 to 0.7.2 binary run `omnigraph export <graph> > graph.jsonl`, then with this
+__manifest is stamped at internal schema v4, but this omnigraph reads only v5.
+This graph was created by omnigraph 0.8.x. Rebuild it: with an omnigraph
+0.8.x binary run `omnigraph export <graph> > graph.jsonl`, then with this
 binary run `omnigraph init --schema <schema.pg> <new-graph>` and `omnigraph load
 --mode overwrite --data graph.jsonl <new-graph>`. (Data, vectors, and blobs are
 preserved; commit history and branches are not.) See docs/user/operations/upgrade.md.
@@ -35,7 +35,8 @@ from that line (the latest is safest):
 | internal schema v1 | omnigraph ≤ 0.3.1 | any 0.3.1-or-earlier binary |
 | internal schema v2 | omnigraph 0.4.1–0.6.1 | the latest 0.6.x (e.g. 0.6.1) |
 | internal schema v3 | omnigraph 0.6.2–0.7.2 | the latest 0.7.x (e.g. 0.7.2) |
-| internal schema v4 | omnigraph 0.8.x and later | — current format; no rebuild needed |
+| internal schema v4 | omnigraph 0.8.x | the latest 0.8.x (e.g. 0.8.1) |
+| internal schema v5 | omnigraph 0.9.x | — current format; no rebuild needed |
 
 You can also check versions before you hit a refusal:
 
@@ -167,3 +168,25 @@ The two CLI checks are listed in
 [How you know you need this](#how-you-know-you-need-this) (`omnigraph version`,
 `omnigraph snapshot`). New in v0.8.0, the server's `GET /healthz` response also
 reports `internal_schema_version`.
+
+## Migrating to internal schema v5
+
+Internal schema v5 activates RFC-028 stable schema identity. Accepted type and
+property IDs are allocated inside one graph identity domain and survive
+supported renames; dropping and later recreating a declaration starts a new
+logical lifetime. The `__manifest` journal keys table registrations, versions,
+and tombstones by stable table ID plus incarnation, and initial table paths are
+derived from that pair rather than a mutable type name.
+
+This is why a v4 graph must be rebuilt instead of opened in place: v4 has only
+name-derived SchemaIR IDs and name-keyed manifest history, so there is no safe,
+unambiguous identity to backfill after renames or drop/recreate events. Export
+with the latest v0.8.x binary, initialize a different root with the v5 binary,
+load the export, verify it, and then cut clients over. The new root deliberately
+mints a new identity domain; identity continuity across export/import is not
+claimed.
+
+Tooling that reads `__manifest` directly must treat `stable_table_id` and
+`table_incarnation_id` as the table coordinate. `table_key` remains the current
+human-readable alias and can change during a type rename. A pure rename keeps
+the same physical dataset path and Lance version.

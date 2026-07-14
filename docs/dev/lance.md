@@ -177,7 +177,8 @@ Behavior-affecting findings in this audit:
   unchanged between beta.15 and beta.21 and has had this shape since upstream
   #7129. OmniGraph can therefore mirror the scalar staging path, pre-mint the
   transaction identity, and commit through `commit_staged_exact`. The exact
-  EnsureIndices v8 adapter now does so: all missing BTREE, FTS, and full-table
+  EnsureIndices adapter now does so inside the RFC-028 identity-bearing v9
+  envelope: all missing BTREE, FTS, and full-table
   vector artifacts for a table are combined into one `Operation::CreateIndex`,
   and `InlineCommitResidual` has been removed. This closes the OmniGraph rollout
   gap for the one-segment full-table IVF-Flat build.
@@ -192,7 +193,8 @@ Behavior-affecting findings in this audit:
   high-level committing operations; their internal transaction construction is
   not a public contract that OmniGraph can pre-mint and later prove as one
   complete compact/reindex effect. RFC-022 therefore keeps Optimize's bounded
-  schema-v2 adapter instead of binding an "exact-v9" protocol to beta internals.
+  maintenance payload inside the v9 identity envelope instead of claiming
+  exact maintenance provenance from beta internals.
   Revisit exact Optimize provenance only after Lance exposes a stable public
   maintenance-transaction API and OmniGraph has distributed recovery fencing;
   the latter is independently required before destructive recovery is safe

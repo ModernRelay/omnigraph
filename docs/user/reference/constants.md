@@ -5,11 +5,11 @@
 | `MANIFEST_DIR` | `__manifest` | manifest layout |
 | Commit graph dirs (retired) | `_graph_commits.lance` / `_graph_commit_actors.lance` | retired in Phase B; lineage lives in `__manifest` (`graph_commit` / `graph_head` rows) since RFC-013 Phase 7. A graph this binary creates has neither. |
 | Recovery audit dir | `_graph_commit_recoveries.lance` | internal exact record of completed crash-recovery actions; no public CLI query yet |
-| Exact recovery history-scan ceiling | `MAX_EFFECT_IDENTITY_SCAN_VERSIONS = 1024` | v3/v4 recovery fails closed as unverifiable rather than scanning an unbounded Lance transaction history; a v4 logical merge chain is at most three commits today, with only derived `CreateIndex` commits allowed after it |
+| Exact recovery history-scan ceiling | `MAX_EFFECT_IDENTITY_SCAN_VERSIONS = 1024` | schema-v9 recovery's retained `protocol_v3` / `protocol_v4` payloads fail closed as unverifiable rather than scanning an unbounded Lance transaction history; a `protocol_v4` logical merge chain is at most three commits today, with only derived `CreateIndex` commits allowed after it |
 | Run branch prefix (legacy, removed) | `__run__` | pre-v0.4.0 Run state machine; no longer a reserved name. A graph still carrying `__run__*` branches is sub-v4 and refused on open (rebuild via export/import). |
 | Schema apply lock | `__schema_apply_lock__` | schema apply |
 | Manifest publisher retry budget | `PUBLISHER_RETRY_BUDGET = 5` | manifest publish |
-| Internal manifest schema version | `INTERNAL_MANIFEST_SCHEMA_VERSION = 4` | manifest migrations (v4 = graph lineage in `__manifest`, RFC-013 Phase 7) |
+| Internal manifest schema version | `INTERNAL_MANIFEST_SCHEMA_VERSION = 5` | strict RFC-028 identity strand (SchemaIR v2 and identity-bearing manifest/recovery ownership) |
 | Merge stage batch | `MERGE_STAGE_BATCH_ROWS = 8192` | merge execution |
 | Maintenance concurrency | `OMNIGRAPH_MAINTENANCE_CONCURRENCY=8` | optimize/cleanup |
 | Graph index cache size | `8` (LRU) | runtime cache |

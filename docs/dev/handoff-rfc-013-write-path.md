@@ -7,9 +7,12 @@
 > internal tables, and the per-write `_graph_commits` scan term is gone. See
 > [versioning.md](versioning.md) and [invariants.md](invariants.md).
 
-**Status:** living handoff. **Source of truth is [`rfc-013-write-path-latency.md`](rfc-013-write-path-latency.md)** —
-this doc is the *current-state map + the decisions/validation from the latest work cycle
-+ the concrete next actions*. When they disagree, the RFC wins (and fix this doc).
+**Status:** historical handoff. **Source of truth is
+[`rfc-013-write-path-latency.md`](rfc-013-write-path-latency.md)**; current write
+and identity behavior lives in [writes.md](writes.md), [canon.md](canon.md), and
+[RFC-028](../rfcs/0028-stable-schema-identity.md). The cycle-specific branch,
+line-number, and “next action” notes below are retained as implementation history,
+not a current work queue.
 
 **Audience:** the engineer/agent who picks up RFC-013 next.
 
@@ -93,7 +96,9 @@ correctness fix, and PR2.1's ground-truth cost harness.
    row UPDATEd in place at the same Lance version with a new `table_branch` (merge-insert `UpdateAll`
    on the deterministic `version_object_id`) was appended after `existing_versions`, and
    `assemble_manifest_state` kept the stale first entry, so the warm coordinator held the wrong fork
-   until refresh. Fix: key the fold's version entries by `(table_key, table_version)` so a pending row
+   until refresh. The original fix keyed by `(table_key, table_version)`; RFC-028
+   later replaced that mutable-name coordinate with `(stable_table_id,
+   table_incarnation_id, table_version)` so a pending row
    **replaces** the existing one (mirroring `UpdateAll`). Test-first repro in
    `db/manifest/tests.rs::test_post_publish_fold_reflects_owner_branch_handoff` (red→green).
 3. **PR2.1 — ground-truth cost harness** (`fd73f01b`, `59d9ff39`, `3cd2b2c1`, `383022e8`, `9f1e5b6e`).
@@ -180,9 +185,11 @@ a 0-IO cache hit). So, apples-to-apples (both ground truth), per-write `__manife
 - **`cost_harness` must wrap the WHOLE test body** (the graph must open inside it), and the body future
   must be **`Box::pin`-ed** — wrapping a whole test body in another async layer overflows the test
   thread's stack (these cost tests already raise `recursion_limit`).
-- **The fold must mirror merge-insert identity.** `version_object_id(table_key, version)` is
-  deterministic, so a same-version handoff is an in-place `UpdateAll`; the in-memory fold must key by
-  `(table_key, version)` and replace, or the warm coordinator desyncs from a fresh re-scan. The
+- **The fold must mirror merge-insert identity.** The historical implementation
+  used `version_object_id(table_key, version)`; RFC-028 now derives the object ID
+  and fold key from `(stable_table_id, table_incarnation_id, version)`. A
+  same-version handoff is still an in-place `UpdateAll`, so the in-memory fold
+  must replace by that immutable key or the warm coordinator desyncs from a fresh re-scan. The
   byte-identity guard is `writes.rs::post_publish_fold_matches_fresh_reopen`.
 - **`lance-io` `test-util`** is enabled in dev-deps (gives `IoStats.requests` + `assert_io_eq!`,
   diagnostics only); production builds exclude dev-deps so they never see it.

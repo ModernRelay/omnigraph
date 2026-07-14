@@ -180,7 +180,8 @@ validation. An edge endpoint move is an update of the row identified by `id`.
 The PK field is addressed by the pinned Lance schema's stable field ID, not
 column position or mutable name. The surrounding logical table contract is
 bound to [RFC-028](0028-stable-schema-identity.md)'s stable table ID and
-incarnation. Fencing cannot activate before that capability lands.
+incarnation. That prerequisite is active in internal schema v5; fencing still
+owns all of its independent routing, evidence, and format gates.
 
 ### 4.2 Keyless append-only tables
 
@@ -378,9 +379,9 @@ Once set, the following are storage invariants:
 - schema apply cannot remove, replace, reorder semantically, or make nullable a
   PK field;
 - a property rename within one dataset preserves the PK field ID and metadata;
-- a supported type rename may rematerialize a new dataset with different Lance
-  field IDs, but the target is created with `id` as its exact PK before data is
-  accepted and retains RFC-028's logical table ID/incarnation;
+- a supported pure type rename is metadata-only under RFC-028: it preserves the
+  same dataset, logical table ID/incarnation, Lance schema, field IDs, and PK
+  metadata; a separate property change may still rewrite that same dataset;
 - branch fork/clone preserves it;
 - import/rebuild creates it before accepting data;
 - recovery restore may select an older data image only if that image is already
@@ -518,7 +519,8 @@ keyed fast-forward removal waits for the mitigation named in §5.1.
    revision.
 2. v2-path scale result versus indexed-path filter availability.
 3. Operator repair procedure for pre-existing duplicate IDs.
-4. Accepted and implemented [RFC-028](0028-stable-schema-identity.md) identity.
+4. **Satisfied 2026-07-15:** accepted and implemented
+   [RFC-028](0028-stable-schema-identity.md) identity (internal schema v5).
 5. Cross-process recovery ownership before any broadened topology claim.
 6. Final format-number/co-release sequencing and genuine cross-version rebuild
    evidence.

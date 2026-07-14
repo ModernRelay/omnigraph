@@ -122,7 +122,9 @@ converge the physical state.
 8. **Schema identity survives renames.** Accepted type and property identities
    remain stable across supported renames. Drop/re-add creates a new logical
    lifetime. Names, paths, Lance versions, and Lance field IDs are not
-   substitutes for graph-level identity. See the known gap below and
+   substitutes for graph-level identity. Internal schema v5 makes the accepted
+   SchemaIR v2 identity domain authoritative and keys manifest ownership,
+   recovery, and physical paths by `(stable_table_id, incarnation_id)`. See
    [RFC-028](../rfcs/0028-stable-schema-identity.md).
 
 9. **Schema and data integrity failures are loud.** Type, required-field,
@@ -181,11 +183,11 @@ converge the physical state.
 | Streaming ingest | Not implemented yet. RFC-026 adopts Lance MemWAL as the strategic substrate; activation waits on its stated public API and evidence gates. Once active, append acknowledgement means MemWAL-durable, while graph visibility still occurs only through graph-atomic RFC-022 folds | [RFC-026](../rfcs/0026-memwal-streaming-ingest.md), [writes.md](writes.md) |
 | Branch create/delete | `__manifest` `BranchContents` is the single logical authority. Lance create is physically two-phase, so OmniGraph prevalidates names, enforces path-prefix-disjoint live graph names, reclaims an absent-ref clone-only tree, and uses a bounded completion classifier; delete removes authority before tree cleanup, so an absent ref is success and derived tree reclaim may converge later. Neither control emits graph lineage. Per-table forks are derived state, reclaimed best-effort with `cleanup` as backstop. Under schema/target/all-table gates, a target-scoped unresolved sidecar may be made unreachable by deletion and is then audit-discarded by recovery; graph-global SchemaApply still blocks | [branches-commits.md](../user/branching/index.md), [maintenance.md](../user/operations/maintenance.md), [writes.md](writes.md) |
 | Cleanup retention | Explicit cleanup derives exact `keep` cutoffs from Lance's available version list, caps each main-table GC cutoff at the oldest exact main version inherited by any live lazy graph branch, and refuses uncovered main HEAD drift. Lance protects native per-table branch refs itself. The graph-wide live-reference preflight fails closed before the first table GC, after which individual table failures remain fault-isolated | [maintenance.md](../user/operations/maintenance.md), [writes.md](writes.md) |
-| Optimize visibility | One operation-local accepted catalog and fresh main snapshot are planned under schema → main → all-table gates. Every productive table shares one bounded schema-v2 recovery sidecar; bounded-parallel physical effects become visible through at most one monotonic manifest/lineage CAS. Complete crash residuals roll forward together and partial residuals compensate before visibility. The adapter is supported within the single-writer-process recovery boundary. Exact provenance is deferred until Lance exposes a stable public caller-controlled maintenance transaction API and OmniGraph has distributed recovery fencing | [maintenance.md](../user/operations/maintenance.md), [writes.md](writes.md), [RFC-022](../rfcs/0022-unified-write-path.md) |
+| Optimize visibility | One operation-local accepted catalog and fresh main snapshot are planned under schema → main → all-table gates. Every productive table shares one identity-bearing v9 recovery envelope; bounded-parallel physical effects become visible through at most one monotonic manifest/lineage CAS. Complete crash residuals roll forward together and partial residuals compensate before visibility. Optimize's payload remains a bounded maintenance adapter rather than an exact caller-minted Lance transaction proof, so it is supported within the single-writer-process recovery boundary. Exact provenance is deferred until Lance exposes a stable public caller-controlled maintenance transaction API and OmniGraph has distributed recovery fencing | [maintenance.md](../user/operations/maintenance.md), [writes.md](writes.md), [RFC-022](../rfcs/0022-unified-write-path.md) |
 | Schema validation | Type checks, required fields, defaults, edge endpoint checks, and edge cardinality are enforced on write paths | [schema-language.md](../user/schema/index.md), [execution.md](execution.md) |
 | Unique constraints | Value/enum, uniqueness, edge-RI, and cardinality route through ONE unified, catalog-derived evaluator (`crate::validate`) on ALL THREE write surfaces — branch-merge, mutation, and bulk load: Δ-scoped (checks the delta, not the whole graph) and structured-filter-backed (committed probes use a BTREE when reconciled and remain correct by scanning while it is pending), reusing the leaf checks (`loader::validate_value_constraints`/`validate_enum_constraints`/`composite_unique_key`) so the surfaces cannot drift. This closed the prior merge bug (merge validated `@range`/`@check` but not enum) AND the **cross-version uniqueness gap** on the mutation and load paths (a duplicate of a committed `@unique` value is now rejected; the merge path always enforced it). The committed view is the merge target snapshot (merge), the write's pinned `txn.base` (mutation), or the pinned pre-load base (load — `Overwrite` validates the batch as the whole new image, committed view empty); `@card` refreshes the manifest-visible graph-branch snapshot on the mutation path only (the #298 stale-handle fix), then follows each entry's actual inherited/owned Lance ref. `@key` is id-backed and currently checked intra-delta only. That is correct for Merge and mutation upserts, but bare `LoadMode::Append` does not match committed IDs and can append a duplicate existing `id`; strict existing-ID rejection is RFC-023 activation work. `@unique` (non-key) groups do the committed lookup. | [schema-language.md](../user/schema/index.md) |
 | Storage trait | `TableStorage` (via `db.storage()`) is sealed and staged-only. `stage_create_indices` builds a typed mixed BTREE/FTS/full-table-vector batch without moving HEAD, and `commit_staged{,_exact}` is the only publication boundary; `InlineCommitResidual` and `storage_inline_residual()` are removed. Capability/stat surfaces remain roadmap | [writes.md](writes.md), [architecture.md](architecture.md) |
-| Index lifecycle | `@index`/`@key` declares *intent*; the physical index is derived state and never fails a logical op. `schema apply`, `load`, and `mutate` build no indexes inline: RFC-022 mutation/load sidecars describe only their exact data effects, and index availability must never become a correctness prerequisite. `ensure_indices` materializes every missing index for one table through one staged mixed `CreateIndex` transaction and an exact schema-v8 recovery intent; untrainable Vector columns remain pending. `optimize` separately folds appended/rewritten fragments into existing indexes (`optimize_indices`) through its bounded schema-v2 maintenance adapter. Explicit maintenance call, not yet a background loop | [indexes.md](../user/search/indexes.md), [maintenance.md](../user/operations/maintenance.md) |
+| Index lifecycle | `@index`/`@key` declares *intent*; the physical index is derived state and never fails a logical op. `schema apply`, `load`, and `mutate` build no indexes inline: RFC-022 mutation/load sidecars describe only their exact data effects, and index availability must never become a correctness prerequisite. `ensure_indices` materializes every missing index for one table through one staged mixed `CreateIndex` transaction and an exact identity-bearing v9 recovery envelope; untrainable Vector columns remain pending. `optimize` separately folds appended/rewritten fragments into existing indexes (`optimize_indices`) through its identity-bearing v9 bounded maintenance envelope. Explicit maintenance call, not yet a background loop | [indexes.md](../user/search/indexes.md), [maintenance.md](../user/operations/maintenance.md) |
 | Traversal IDs | Runtime still builds `TypeIndex`; Lance stable row-id based graph IDs are roadmap | [architecture.md](architecture.md), [query-language.md](../user/queries/index.md) |
 | Auth | Bearer token hashing and server-side actor resolution are implemented at the HTTP boundary | [server.md](../user/operations/server.md), [policy.md](../user/operations/policy.md) |
 | Tests | Tempdir-backed Lance tests are the current substrate; the storage adapter has an in-memory backend for adapter-level contract tests, but Lance datasets bypass it | [testing.md](testing.md) |
@@ -214,12 +216,6 @@ incomplete would let a legacy writer prepare from unresolved physical state.
 Do not hide these behind invariant wording. Either move them forward or keep
 them explicit.
 
-- **Rename-stable schema identity:** the invariant is that accepted IDs survive
-  renames. The current compiler still derives type IDs from `kind:name`; this
-  must be fixed before relying on renamed IDs across accepted schemas. Draft
-  [RFC-028](../rfcs/0028-stable-schema-identity.md) now owns the identity,
-  incarnation, allocation, and strict-rebuild design; the gap remains open
-  until that RFC is accepted and implemented.
 - **Storage abstraction:** `TableStorage` is present, sealed, and canonical for
   staged writes. MR-854 made `db.storage()` staged-only; the exact EnsureIndices
   adapter then migrated beta.21's full-table vector shape into the typed mixed
@@ -255,9 +251,10 @@ them explicit.
   against a live writer's complete sidecar lifetime in schema → branch → sorted
   table order and re-check sidecar existence after waiting. These remain
   in-process primitives: a recovery pass cannot serialize against a live writer
-  in another process. Exact v3/v4/v7 authority and effect identity prevent a
-  stale roll-forward from being silently reparented or a foreign numeric HEAD
-  from being adopted; schema-v7 promotion additionally requires the fixed
+  in another process. Every active writer emits an identity-bearing v9 envelope;
+  its writer-specific exact authority/effect payload prevents a stale
+  roll-forward from being silently reparented or a foreign numeric HEAD from
+  being adopted. SchemaApply promotion additionally requires the fixed
   manifest outcome and exact target identity. They do **not** make destructive
   recovery safe against a still-running foreign process. Full recovery may
   otherwise Restore an existing table or delete an owned first-touch path while
@@ -274,7 +271,7 @@ them explicit.
 - **Fork ownership is durable, but Lance ref deletion is not conditional:** a
   first-touch Mutation/Load or BranchMerge table never creates its target ref
   before recovery ownership is durable. Under schema → branch → table gates it
-  revalidates and arms a schema-v3 mutation/load or schema-v4 merge sidecar
+  revalidates and arms the writer's identity-bearing v9 recovery envelope
   naming the target; branch merge additionally records the exact fork version
   and a pre-minted ordered transaction chain for every logical data effect,
   commits that chain without transparent conflict retries, and confirms the
@@ -382,8 +379,9 @@ them explicit.
   and share no Lance `Session`. That was an O(commits) cost that never warmed up.
   Fix 1 (warm coordinator reuse behind a `latest_version_id` probe), Fix 2 (open
   tables by location+version), finding A (validate once), and Fix 3 (a held
-  `Dataset`-handle cache keyed by `(table, branch, version, e_tag when Lance
-  exposes it)` plus one shared `Session` per graph) remove that tax: a warm
+  `Dataset`-handle cache keyed by `(identity-derived table_path, branch, version,
+  e_tag when Lance exposes it)` plus one shared `Session` per graph) remove that
+  tax: a warm
   same-branch read does one probe, one schema read, and zero opens on a repeat.
   Non-main branch freshness compares the manifest incarnation (`version` plus
   manifest-location e_tag when available, otherwise Lance manifest timestamp),
@@ -404,16 +402,19 @@ them explicit.
   only the edge types a query traverses (`referenced_edge_types` over
   `Expand`/`AntiJoin`, not every catalog edge — a single-edge join no longer
   scans the whole graph's edge data), and the `RuntimeCache` cache key is each
-  edge table's physical identity `(table_key, version, table_branch, e_tag)`
+  edge table's physical identity `(stable_table_id, incarnation_id, table_key,
+  version, table_branch, e_tag)`
   plus the edge's `(from_type, to_type)` endpoint mapping — rather than the
   resolved snapshot id — so a lazy-fork branch reuses main's built index instead
   of cold-scanning it, while a schema repoint of an edge type (which changes the
   built `TypeIndex` namespace) still rebuilds even if the edge table's physical
-  identity is unchanged. Residual: on stores without per-table e_tags (local FS)
-  a branch deleted and recreated at the same version with the same endpoints has
-  the same key, so the incarnation distinction falls back to the same-branch
-  manifest refresh clearing read caches (`invalidate_all`); production object
-  stores carry real e_tags, so the key alone distinguishes incarnations there
+  identity is unchanged. Drop/re-add under a reused alias is closed by the stable
+  table/incarnation pair even on local filesystems. Residual: on stores without
+  per-table e_tags (local FS), deleting and recreating a *branch ref on the same
+  table lifetime* at the same version with the same endpoints has the same key,
+  so that branch-ref ABA falls back to same-branch manifest refresh clearing read
+  caches (`invalidate_all`); production object stores carry real e_tags, so the
+  key alone distinguishes branch-ref incarnations there
   (the e_tag-present cross-branch-reuse path is exercised in CI by
   `s3_storage.rs::s3_fresh_branch_traversal_reuses_main_graph_index_with_etags`
   against RustFS, which surfaces real ETags — local-FS tests cannot reach it).

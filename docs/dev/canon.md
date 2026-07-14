@@ -3,7 +3,7 @@
 **Audience:** maintainers, contributors, and coding agents — internal
 **Type:** narrative reference ("the book"), read top-to-bottom
 **Status:** living document
-**Surveyed:** OmniGraph 0.8.1 (`main`); Lance 9.0.0-beta.21 (git rev `1aec1465`); internal manifest schema v4
+**Surveyed:** OmniGraph 0.8.1 development (`main`); Lance 9.0.0-beta.21 (git rev `1aec1465`); internal manifest schema v5
 
 ---
 
@@ -283,16 +283,17 @@ A graph is one directory (or S3 prefix). Details: [storage.md](../user/concepts/
 ```
 graph-root/
   __manifest/                      # the coordination table (a Lance dataset itself)
-  nodes/{fnv1a64-hex(TypeName)}/   # one Lance dataset per node type
-  edges/{fnv1a64-hex(EdgeName)}/   # one Lance dataset per edge type
+  nodes/{stable-id}-{incarnation}/ # one dataset per node-table lifetime
+  edges/{stable-id}-{incarnation}/ # one dataset per edge-table lifetime
   _graph_commit_recoveries.lance/  # internal crash-recovery audit log
   __recovery/{ulid}.json           # transient recovery sidecars (empty at steady state)
   _refs/branches/{name}.json       # graph-level branch metadata
 ```
 
 `__manifest` is the load-bearing object. Its rows describe, per branch, which
-version of each sub-table is published (`table_version` rows, minus
-tombstones), **and** — since internal schema v4 (RFC-013 Phase 7) — the graph
+version of each identity-paired sub-table is published (`table_version` rows,
+minus tombstones scoped to the same stable ID + incarnation), **and** — since
+internal schema v4 (RFC-013 Phase 7) — the graph
 commit lineage itself: one immutable `graph_commit` row per commit (ULID id,
 parents, merge parents, actor, timestamp) plus one mutable `graph_head:<branch>`
 pointer per branch. Lineage rows are written *in the same merge-insert commit*
@@ -314,7 +315,7 @@ Two mechanisms make concurrent publishes safe:
   N-writer convergence tests).
 
 The internal manifest schema is stamped
-(`omnigraph:internal_schema_version`, currently v4) and **strict
+(`omnigraph:internal_schema_version`, currently v5) and **strict
 single-version** — see [the strand model](#schema-and-migration--the-strand-model).
 
 ---
@@ -337,7 +338,8 @@ The path (details: [execution.md](execution.md)):
 3. **Topology, if needed.** If the pipeline traverses, build or fetch a CSR/CSC
    `GraphIndex` **scoped to exactly the edge types the query touches** —
    never the whole catalog. The cache key is each edge table's physical
-   identity `(table_key, version, branch, e_tag)`, so a lazy-fork branch whose
+   identity `(stable table ID, incarnation ID, table_key, version, branch,
+   e_tag)`, so a lazy-fork branch whose
    edge tables physically *are* main's reuses main's built index instead of
    cold-scanning.
 4. **Execute.** Scans push structured filters down to Lance (BTREE/FTS/vector
@@ -403,7 +405,8 @@ atomic commit.
 At end-of-query, `stage_all` prepares exactly one staged Lance transaction per
 touched table (append / merge-insert deduped by id / deletion-vector delete /
 overwrite), still without moving HEAD. Then the gates are acquired, the full
-authority token revalidated, the schema-v3 sidecar armed, tables committed with
+authority token revalidated, the identity-bearing v9 recovery envelope armed,
+tables committed with
 their exact pre-minted transaction identities and **zero transparent conflict
 retries**, and the pre-minted lineage published under the exact
 native-branch/head + table-version precondition.
@@ -439,11 +442,11 @@ writer describes its physical effects to the shared coordinator:
 
 | Writer | Sidecar schema | Physical shape |
 |---|---|---|
-| Mutation / Load | v3 | one exact staged transaction per touched table |
-| Branch merge | v4 | an *ordered chain* of exact transactions per table (append → upsert → delete), pointer-only deltas recorded too |
-| Schema apply | v7 | exact `Overwrite` per rewritten table + strict read-version-zero `Create` per new type; plus the schema registration/tombstone delta (a metadata-only apply has an empty effect set but still arms — schema staging is durable state) |
-| EnsureIndices | v8 | one pre-minted *mixed* CreateIndex transaction per table (every missing BTREE + FTS + full-table vector together) |
-| Optimize | v2 (bounded) | compaction + index folds have **no** public caller-controlled Lance transaction identity, so Optimize keeps a looser, bounded envelope: one graph-wide sidecar pinning the complete productive set, one monotonic batch CAS for visibility. Exact provenance is trigger-gated on upstream API + distributed fencing |
+| Mutation / Load | v9 (`protocol_v3` payload) | one exact staged transaction per touched table |
+| Branch merge | v9 (`protocol_v4` payload) | an *ordered chain* of exact transactions per table (append → upsert → delete), pointer-only deltas recorded too |
+| Schema apply | v9 (`protocol_v7` payload) | exact `Overwrite` per rewritten table + strict read-version-zero `Create` per new type; a pure rename retains its existing identity/path/version. The payload also carries the schema registration/rename/tombstone delta (a metadata-only apply has an empty effect set but still arms — schema staging is durable state) |
+| EnsureIndices | v9 (`protocol_v8` payload) | one pre-minted *mixed* CreateIndex transaction per table (every missing BTREE + FTS + full-table vector together) |
+| Optimize | v9 (bounded payload) | compaction + index folds have **no** public caller-controlled Lance transaction identity, so Optimize keeps looser, bounded provenance inside the identity-bearing envelope: one graph-wide sidecar pinning the complete productive set, one monotonic batch CAS for visibility. Exact provenance is trigger-gated on upstream API + distributed fencing |
 
 First-touch tables (a branch's first write to a table) follow
 **sidecar-before-ref** ordering: the recovery intent that names the
@@ -506,9 +509,11 @@ When recovery runs:
   schema-apply state (fixed manifest outcome visible, schema identity not yet
   live) rather than lying.
 
-Older sidecar formats (v5 SchemaApply, v6 EnsureIndices) remain readable
-forever under their original, looser semantics — a v6 file is never
-reinterpreted as a v8 ownership proof.
+All active writers emit an identity-bearing schema-v9 envelope. Historical
+payload field names such as `protocol_v3`, `protocol_v4`, `protocol_v7`, and
+`protocol_v8` describe retained per-writer payload shapes, not older active
+envelopes. A pre-v9 file without explicit table identity is refused; recovery
+never infers ownership from an alias or path.
 
 Ahead-of-manifest drift *not* covered by any sidecar is never silently
 adopted: writers refuse it and point at `omnigraph repair`, which classifies it
@@ -563,7 +568,7 @@ the new row and column are dispositioned.
 
 The contract under concurrency: **"merge the captured source commit," never
 "substitute whatever source is latest."** A source advance after capture is
-fine; a target change is `ReadSetChanged`. Merge's recovery adapter (schema v4)
+fine; a target change is `ReadSetChanged`. Merge's identity-bearing v9 recovery envelope
 pre-mints each table's exact ordered transaction chain, so recovery proves a
 contiguous prefix of *this merge's* commits rather than inferring ownership
 from version arithmetic.
@@ -585,7 +590,7 @@ physical intent (`@index`, `@embed`). The compiler produces a typed catalog;
 a linter (`OG-XXX-NNN` codes) gates footguns. `schema plan` diffs the accepted
 schema against the proposal and produces a migration plan; `schema apply`
 executes it under the `__schema_apply_lock__` system branch, as a first-class
-RFC-022 writer (v7 adapter — the fixed manifest outcome lands *before* schema
+RFC-022 writer (identity-bearing v9 envelope — the fixed manifest outcome lands *before* schema
 staging is promoted, and capture-time coherence means readers can never observe
 the manifest-before-catalog window on a live handle).
 
@@ -595,7 +600,7 @@ enum bumps no table version. Destructive or narrowing changes are refused
 
 **Storage versioning is strict single-version** (the strand model,
 [versioning.md](versioning.md)): this binary reads exactly one internal
-manifest schema (`MIN_SUPPORTED == CURRENT == 4`). An older graph is refused
+manifest schema (`MIN_SUPPORTED == CURRENT == 5`). An older graph is refused
 with a self-service export/import rebuild recipe naming the right old release;
 a newer graph is refused with "upgrade omnigraph". There is deliberately no
 in-place migration dispatcher — that machinery is permanent liability (every
@@ -606,10 +611,11 @@ it if a concrete graph ever demands it. Note the four version axes (release /
 wire / storage / Lance) have deliberately different policies — conflating them
 is how you ship a silent misread or carry migration code you don't need.
 
-Known gap worth internalizing: type IDs are still derived from `kind:name`, so
-**rename-stable schema identity is not yet real** — don't build on renamed IDs
-surviving across accepted schemas until draft
-[RFC-028](../rfcs/0028-stable-schema-identity.md) is accepted and implemented.
+Internal schema v5 implements [RFC-028](../rfcs/0028-stable-schema-identity.md):
+accepted SchemaIR v2 owns one graph identity domain and monotonic allocator;
+type/property IDs survive explicit renames, while drop/re-add mints a new table
+identity and incarnation. Manifest rows, paths, OCC, and recovery carry that
+identity pair instead of reconstructing ownership from a mutable name.
 
 ---
 
@@ -650,8 +656,9 @@ materialization, correct reads at any coverage*:
   kind (enum/orderable scalar → BTREE, free-text String → FTS, Vector → vector
   ANN). Writes never build indexes inline — mutation/load/schema-apply publish
   only their exact data effects. `ensure_indices` materializes every missing
-  artifact for a table in **one** staged mixed CreateIndex transaction (v8
-  adapter); `optimize` separately folds new fragments into existing indexes.
+  artifact for a table in **one** staged mixed CreateIndex transaction (the v9
+  envelope retains the `protocol_v8` payload field); `optimize` separately
+  folds new fragments into existing indexes.
   Reads are correct under partial coverage (Lance unions indexed and scan
   paths; vector search falls back to brute force). A background reconciler to
   automate the explicit calls is **(roadmap)**.
@@ -671,8 +678,9 @@ materialization, correct reads at any coverage*:
 ## Maintenance: optimize, cleanup, repair
 
 - **`optimize`** compacts fragments and folds index coverage across all tables
-  with bounded parallelism and **one graph visibility envelope**: one bounded
-  v2 sidecar pins the complete productive set before any HEAD moves, and one
+  with bounded parallelism and **one graph visibility envelope**: one
+  identity-bearing v9 sidecar with bounded maintenance provenance pins the
+  complete productive set before any HEAD moves, and one
   monotonic manifest CAS publishes everything together — two changed tables
   become visible atomically, a no-work run leaves no trace. It also compacts
   `__manifest` itself (physical-only, no graph commit), which is what keeps
@@ -826,18 +834,18 @@ this section is the orientation summary, not the authority.
 **Solid and shipped:** the unified write protocol with exact per-writer
 recovery (RFC-022 implemented 2026-07-13, across PRs #343–#353); manifest-atomic
 multi-table publish with lineage-in-CAS; branches/commits/time-travel/merge
-with typed conflicts; the strand storage model (v4); multi-modal query runtime;
+with typed conflicts; the strand storage model (v5); multi-modal query runtime;
 unified Δ-scoped validation; engine-wide Cedar; cluster control plane and
 cluster-only serving; the warm read-path cost contract; sealed write surface;
-the full failpoint/recovery test lattice.
+the full failpoint/recovery test lattice; stable schema identity and table
+incarnation (RFC-028, internal schema v5).
 
-**Explicitly bounded:** Optimize's recovery envelope (bounded v2, exact
-provenance trigger-gated on upstream API + distributed fencing); destructive
+**Explicitly bounded:** Optimize's v9 recovery envelope (bounded maintenance
+provenance; exact provenance trigger-gated on upstream API + distributed fencing); destructive
 recovery's single-writer-process boundary; merge cost at divergence
 (full-width classification).
 
-**Roadmap / draft:** stable schema identity and table incarnation **(RFC-028,
-draft)**; substrate-native key-conflict fencing **(RFC-023, draft;
+**Roadmap / draft:** substrate-native key-conflict fencing **(RFC-023, draft;
 substrate probes landed, production routing unchanged)**; durable table heads /
 heads format **(RFC-024, draft)**; checkpoint-pinned retention **(RFC-025,
 draft)**; MemWAL streaming ingest **(RFC-026, draft)**; lineage-based merge
@@ -855,7 +863,7 @@ resource budgets.
 | **R2: Pre-stable Lance pin.** 9.0.0-beta.21 via git rev; betas have regressed mid-line before (blob reads broke in beta.13, fixed beta.15). Blocks crates.io publishing (v0.8.1 is binaries-only; v0.9.0 gated on 9.0.0 stable). | High | Full alignment audit per bump (all commits reviewed, findings in [lance.md](lance.md)); surface guards as first smoke check; `cargo test --workspace` as the alignment gate, never the build alone. |
 | **R3: Keyed-write fencing rests on engine revalidation, not a substrate primitive.** Lance's key-filter behavior is route-dependent and directional (probed 2026-07-14). | Medium | Branch-head CAS serializes same-branch commits; Δ-scoped revalidation runs on reprepare; RFC-023 owns the substrate-native fence behind a fleet/format barrier; guards pin both conflict orders so an upstream symmetry change forces an audit. |
 | **R4: Manifest fold cost grows with commit count.** Current-state resolution folds history. | Medium | `optimize` compacts internal tables (keeps periodically-optimized graphs flat — cost-gated every PR); durable head rows are the structural fix **(RFC-024)**; internal-table *cleanup* still deferred behind the resurrection watermark. |
-| **R5: Rename-stable schema identity not yet real** (type IDs from `kind:name`). | Medium | Recorded known gap; RFC-028 owns graph-scoped IDs, incarnation, SchemaApply recovery, and strict rebuild. Do not build features assuming renamed IDs survive until it is accepted and implemented. |
+| **R5: Schema identity corruption or alias/identity drift.** Internal schema v5 makes stable IDs and incarnation durable authority. | Medium | Open/init validate the SchemaIR domain and exact bidirectional IR↔manifest identity/path/alias contract; every active recovery envelope carries the identity pair; zero, duplicate, missing, or mismatched identity fails closed. |
 | **R6: Merge cost at divergence** — full-width classification, history-growing manifest opens. | Medium | Fast-forward path structurally pinned; `merge_cost.rs` keeps the terms visible; O(delta) merge blocked on a real deletion-delta source **(RFC-027)**; fragment adoption **(RFC-0001, draft)**. |
 | **R7: No streaming ingest** — per-branch write throughput is capped by the `graph_head` CAS rate; high-frequency small writes are wasteful. | Medium | Deliberate: the interactive path's guarantees come first. MemWAL-based ingest with durable per-row ack + graph-atomic folds is the design **(RFC-026)**. MemWAL is the strategic substrate, but beta.21's public initializer commits opaquely and shard provisioning is separate; activation waits for a public exact enrollment receipt plus reversible admission seal rather than using private APIs. |
 | **R8: Some operations lack enforced memory/time budgets.** | Medium | Known gap; the merge memory blow-up class was closed structurally (fast-forward append routing); new long-running work must add explicit bounds rather than widen the gap. |
@@ -876,12 +884,11 @@ Live design questions, each owned by an RFC or a known gap — not a wishlist:
    here: a deleted row is absent from the target snapshot, so version columns
    can't identify it, and `_row_last_updated_at_version` filtering is O(rows)
    without a substrate index or change log.
-3. **Which accepted capabilities co-release at the next rebuild boundary?**
-   RFC-028 provisionally owns the next format through stable identity;
-   RFC-023's fence, RFC-024's heads, RFC-025's retention, and RFC-026's stream
-   capability remain independently reviewable. Co-release can reduce operator
-   cutovers only after the combined initialization/recovery matrix passes; a
-   separate format release requires a separate export/init/load rebuild.
+3. **Which capability owns the next rebuild boundary after v5?** RFC-028 has
+   activated stable identity in v5. RFC-023's fence, RFC-024's heads, RFC-025's
+   retention, and RFC-026's stream capability remain independently reviewable;
+   any later format activation requires its own export/init/load rebuild unless
+   capabilities deliberately co-release after their combined matrix passes.
 4. **What is the checkpoint/retention contract?** RFC-025: checkpoint rows as
    logical authority, Lance tags as physical pins, and the asymmetric safe
    ordering between them — plus how the Q8 resurrection watermark unlocks
@@ -903,7 +910,7 @@ The plan of record is the RFC-022…028 family (all under
 | RFC | Owns | Status |
 |---|---|---|
 | [0022 — Unified graph-write protocol](../rfcs/0022-unified-write-path.md) | One correctness protocol for all graph-visible writes; per-writer effect adapters; synchronous recovery | **Implemented** (2026-07-13) |
-| [0028 — Stable schema identity and table incarnation](../rfcs/0028-stable-schema-identity.md) | Graph-scoped rename-stable type/property IDs, table lifetimes, SchemaApply recovery, and the shared strict-rebuild prerequisite | Draft |
+| [0028 — Stable schema identity and table incarnation](../rfcs/0028-stable-schema-identity.md) | Graph-scoped rename-stable type/property IDs, table lifetimes, SchemaApply recovery, and the shared strict-rebuild prerequisite | **Implemented** (2026-07-15) |
 | [0023 — Key-conflict fencing](../rfcs/0023-key-conflict-fencing.md) | Substrate-native keyed-write fencing via Lance's unenforced-PK filter; fleet/format activation barrier | Draft |
 | [0024 — Durable table heads](../rfcs/0024-durable-table-heads.md) | O(1) current-state resolution via materialized head rows; heads-format initialization and strict rebuild boundary | Draft |
 | [0025 — Checkpoint-pinned retention](../rfcs/0025-checkpoint-retention.md) | Named checkpoints as authoritative retention roots, materialized as Lance tags | Draft |

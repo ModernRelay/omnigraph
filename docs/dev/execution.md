@@ -6,7 +6,7 @@ Pipeline:
 
 1. Parse + typecheck via `omnigraph-compiler`.
 2. Lower to IR.
-3. If `Expand` or `AntiJoin` is present, build (or fetch from `RuntimeCache`) a `GraphIndex` **scoped to the edge types the query actually traverses** (`referenced_edge_types`, recursing through `AntiJoin` inners) — not every edge type in the catalog. The CSR build full-scans each covered edge dataset, so scoping is what keeps a single-edge join (`$x identifiesPerson $p`) from scanning the whole graph's edge data. The `RuntimeCache` key is each covered edge table's **physical identity** `(table_key, version, table_branch, e_tag)` (not the resolved snapshot id), so a `{Knows}` index and a `{Knows, WorksAt}` index are distinct entries AND a lazy-fork branch whose edge tables physically *are* main's reuses main's built index instead of cold-scanning it.
+3. If `Expand` or `AntiJoin` is present, build (or fetch from `RuntimeCache`) a `GraphIndex` **scoped to the edge types the query actually traverses** (`referenced_edge_types`, recursing through `AntiJoin` inners) — not every edge type in the catalog. The CSR build full-scans each covered edge dataset, so scoping is what keeps a single-edge join (`$x identifiesPerson $p`) from scanning the whole graph's edge data. The `RuntimeCache` key is each covered edge table's **physical identity** `(stable_table_id, incarnation_id, table_key, version, table_branch, e_tag)` (not the resolved snapshot id), so a `{Knows}` index and a `{Knows, WorksAt}` index are distinct entries AND a lazy-fork branch whose edge tables physically *are* main's reuses main's built index instead of cold-scanning it.
 4. Run `execute_query` against the snapshot.
 
 ### Read flow — sequence
@@ -88,7 +88,7 @@ Resolves expression values to literals, converts to typed Arrow arrays (`literal
 
 **D₂ parse-time rule.** A single mutation query is either insert/update-only or delete-only. Mixed → reject before any I/O. The check fires in `enforce_no_mixed_destructive_constructive(&ir)` inside `execute_named_mutation`.
 
-Multi-statement mutations are atomic at the publisher commit boundary. Every batch lives in memory until all statements and validation succeed; `stage_all` then prepares one exact transaction per touched table without advancing HEAD. `commit_all` acquires the root-shared schema → branch → sorted-table gates, rechecks for recovery intent, revalidates the complete branch authority, writes the schema-v3 recovery sidecar, and commits the table transactions with zero transparent conflict retries. The guards remain held while `ManifestBatchPublisher` publishes the pre-minted lineage under the same exact native-branch/head and table-version precondition.
+Multi-statement mutations are atomic at the publisher commit boundary. Every batch lives in memory until all statements and validation succeed; `stage_all` then prepares one exact transaction per touched table without advancing HEAD. `commit_all` acquires the root-shared schema → branch → sorted-table gates, rechecks for recovery intent, revalidates the complete branch authority, writes the identity-bearing v9 recovery sidecar, and commits the table transactions with zero transparent conflict retries. The guards remain held while `ManifestBatchPublisher` publishes the pre-minted lineage under the same exact native-branch/head and table-version precondition.
 
 ### Mutation flow — sequence
 
@@ -100,7 +100,7 @@ sequenceDiagram
     participant cmp as omnigraph-compiler
     participant stg as MutationStaging<br/>(exec/staging.rs)
     participant ts as table_store
-    participant rec as schema-v3 recovery sidecar
+    participant rec as identity-bearing v9 recovery sidecar
     participant pub as ManifestBatchPublisher
 
     client->>og: mutate_as(branch, source, name, params, actor_id)
@@ -187,7 +187,7 @@ Atomicity guarantee for multi-statement mutations: a mid-query failure leaves La
 | `Append` | Append rows without checking or matching against committed `id` values. Intra-batch duplicate `@key` values and the ordinary schema/integrity constraints still error, but a collision with an `id` already present in the target is not fenced today. | One bare `stage_append` transaction per touched table. A pre-effect authority change discards the whole parsed/validated attempt and fully reprepares with a bounded retry. |
 | `Merge` | Upsert by `id` (`merge_insert`) | One `stage_merge_insert` transaction per touched table (deduped by `id`, last-write-wins). The same bounded full-reprepare rule as Append applies before effects. |
 
-All three modes then use the same schema → branch → sorted-table gate, v3 recovery, zero-retry table commit, and exact publisher-precondition path as mutation. A parse, RI, cardinality, or validation failure leaves Lance HEAD untouched. After any table effect, any later error is `RecoveryRequired`. Load, mutation, and schema apply build no physical indexes inline; explicit `ensure_indices`/`optimize` reconciliation materializes declared intent later.
+All three modes then use the same schema → branch → sorted-table gate, v9 recovery envelope (retaining the `protocol_v3` payload), zero-retry table commit, and exact publisher-precondition path as mutation. A parse, RI, cardinality, or validation failure leaves Lance HEAD untouched. After any table effect, any later error is `RecoveryRequired`. Load, mutation, and schema apply build no physical indexes inline; explicit `ensure_indices`/`optimize` reconciliation materializes declared intent later.
 
 `Append` is therefore not yet the strict-insert surface described by RFC-023.
 Lance `Append` does not compare keys, and the shared validator checks `@key`

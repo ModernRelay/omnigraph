@@ -89,7 +89,7 @@ as durable disposition history after closure, so RFC backlinks stay valid.
 
 | Area | Read |
 |---|---|
-| RFC-022–028 split architecture review — RFC-022 implemented; sibling blockers, dependency corrections, and acceptance evidence remain tracked | [rfc-022-027-architecture-review.md](rfc-022-027-architecture-review.md) |
+| RFC-022–028 split architecture review — RFC-022 and RFC-028 implemented; RFC-023–027 blockers, dependency corrections, and acceptance evidence remain tracked | [rfc-022-027-architecture-review.md](rfc-022-027-architecture-review.md) |
 
 ## Active Implementation Plans
 
