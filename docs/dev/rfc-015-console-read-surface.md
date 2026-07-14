@@ -25,6 +25,9 @@ computes — no new write paths, no storage changes, no new invariants:
    `Content-Length`, `Accept-Ranges`, and HTTP Range support — exposing the engine's existing
    SDK-only `read_blob` over the wire (Lance's `BlobFile::read_range` makes partial reads
    zero-copy against the object store).
+7. **Structured schema catalog** — a `catalog` representation on `GET /graphs/{id}/schema`
+   (types, properties, keys, edges as JSON), so clients stop re-parsing `.pg` source with
+   approximations of the grammar.
 
 Explicit non-goals, with rationale: push/streaming change subscription, a metrics/stats surface,
 maintenance operations over HTTP, and runtime graph add/remove (§Non-goals).
@@ -64,6 +67,15 @@ live 0.8.1 server and this branch's source):
   bindings, quarantine state, and schema digest all exist in the cluster ledger and the boot
   snapshot, but are only reachable via `omnigraph cluster status` against the cluster directory
   — which a remote console, by design, cannot address.
+- **Clients re-parse `.pg` source because the catalog isn't served.** `GET /schema` returns
+  `{schema_source}` only (`handlers.rs:1114`), so a console that needs the type list, key
+  properties, or edge endpoints must re-derive them from source text with its own parser — a
+  second implementation of the grammar that WILL drift (observed 2026-07-14: a client regex
+  parser silently dropped every type annotated inline with `@instruction("…")`, rendering a
+  whole graph empty). The authoritative structure already exists: the compiler's `Catalog`
+  (`omnigraph-compiler/src/catalog/mod.rs:14` — `node_types`/`edge_types`/`interfaces`, each
+  with properties, keys, unique/index/range/check constraints, embed sources, blob properties)
+  is built for every serve and never leaves the process.
 - **Blob content is unreachable over HTTP.** `Blob` properties come back as `null` from `/query`
   (the executor deliberately excludes blob columns from scans and re-adds them as null — partly
   a Lance workaround: `BlobsDescriptions` + filter trips a projection assertion,
@@ -267,6 +279,38 @@ HEAD /graphs/{id}/blob?…                                  → Content-Length +
   needed for any of this — everything required is public in 7.0.0. The only blob item still
   Lance-blocked is compaction (`LANCE_SUPPORTS_BLOB_COMPACTION`, unrelated to reads).
 
+### 7. Structured schema catalog — `format=catalog` on `GET /graphs/{id}/schema`
+
+```
+GET /graphs/{id}/schema?format=catalog
+→ { "types": [ { "name": "Person", "kind": "node", "implements": [],
+                 "key": ["slug"],
+                 "properties": [ { "name": "slug", "type": "String", "nullable": false,
+                                   "key": true, "unique": false, "indexed": true,
+                                   "blob": false, "embedSource": null } ],
+                 ... } ],
+    "edges": [ { "name": "Knows", "from": "Person", "to": "Person",
+                 "card": null, "properties": [...] } ],
+    "interfaces": [ ... ] }
+```
+
+- **A pure projection of the compiler's `Catalog`** — the struct the engine already builds and
+  validates on every boot (`node_types`/`edge_types`/`interfaces` with properties, keys,
+  unique/index constraints, embed sources, blob properties). No new computation; the handler
+  serializes what's in memory.
+- **Why it belongs in this RFC:** every schema-aware client currently re-parses `.pg` source
+  text, i.e. maintains a second implementation of the grammar. That is the "shadow copy that
+  drifts" failure shape of invariant 15, exported to consumers — and it has already bitten
+  (silent type loss on annotated schemas). One source of truth, cheaply projected, lets clients
+  delete their parsers; the raw source stays the default response for display/editing.
+- **Scope discipline:** the catalog response is a *read model for consumers* (form generation,
+  browse projections, graph topology), not a schema-migration surface — `schema plan/apply`
+  semantics are untouched, and internal fields with no consumer meaning (e.g. Arrow schemas)
+  are not serialized. Property types use the `.pg` spellings (`String`, `Vector(3072)`,
+  `[String]`, `enum(a, b)`) so clients never re-derive them.
+- **Auth:** bearer + `read`, same as the source form. Additive: `format` defaults to the
+  current `{schema_source}` response, byte-stable.
+
 ## Non-goals
 
 - **Push/streaming (SSE, webhooks, change subscriptions).** Deferred, not rejected. The changes
@@ -325,6 +369,7 @@ HEAD /graphs/{id}/blob?…                                  → Content-Length +
 | 4 | merge `dry_run` | M — write-skipping cursor mode | pre-merge conflict UX, CI mergeability gates |
 | 5 | `/graphs/{id}/status` | S — project boot snapshot | console graph/deployment status |
 | 6 | `/graphs/{id}/blob` | M — `read_blob_at` target param + Range/streaming handler | image/file preview + download in consoles; media-bearing agent tools |
+| 7 | schema `format=catalog` | S — serialize the in-memory `Catalog` | clients delete their `.pg` parsers (drift class closed at the source) |
 
 Ordered by consumer pain over implementation order; 1a and 2 are each afternoon-sized and
 independently shippable.
