@@ -1265,19 +1265,18 @@ impl Omnigraph {
         Ok(())
     }
 
-    /// Legacy write-entry heal: converge any roll-forward-eligible recovery
+    /// Broad write-entry heal: converge any roll-forward-eligible recovery
     /// sidecars and leave rollback-eligible intents for the next ReadWrite open.
     ///
-    /// This preserves the pre-RFC-022 behavior for adapters that have not yet
-    /// enrolled in the closed recovery barrier (schema apply and maintenance
-    /// adapters in this slice). Mutation/load and branch merge use
+    /// Schema apply calls this broad barrier before acquiring its schema gate;
+    /// exact adapters then relist and revalidate relevant recovery and authority
+    /// under their own ordered effect gates. Mutation/load and branch merge use
     /// [`heal_pending_recovery_sidecars_for_write`](Self::heal_pending_recovery_sidecars_for_write)
-    /// instead and reject relevant unresolved intents before capturing a base.
+    /// to reject relevant unresolved intents before capturing a base.
     ///
     /// Steady-state cost here is one `list_dir` of `__recovery/` (typically
-    /// empty → immediate return). Enrolled mutation/load and branch-merge
-    /// attempts perform a second check under their effect gates to close the
-    /// post-prepare race. See
+    /// empty → immediate return). Exact adapters perform a second check under
+    /// their effect gates to close the post-prepare race. See
     /// `recovery::heal_pending_sidecars_roll_forward` for the
     /// concurrency contract (root-scoped ordered gate acquisition).
     pub(crate) async fn heal_pending_recovery_sidecars(&self) -> Result<()> {

@@ -30,12 +30,15 @@ use arrow_schema::{DataType, Field, Schema};
 use lance::Dataset;
 use lance::dataset::builder::DatasetBuilder;
 use lance::dataset::optimize::{CompactionOptions, compact_files};
-use lance::dataset::transaction::Operation;
+use lance::dataset::transaction::{Operation, Transaction};
 use lance::dataset::write::delete::DeleteResult;
+use lance::dataset::write::merge_insert::UncommittedMergeInsert;
+use lance::dataset::write::merge_insert::inserted_rows::{FilterType, KeyExistenceFilter};
 use lance::dataset::{
     CommitBuilder, InsertBuilder, MergeInsertBuilder, WhenMatched, WhenNotMatched, WriteMode,
     WriteParams,
 };
+use lance::datatypes::LANCE_UNENFORCED_PRIMARY_KEY;
 use lance::index::DatasetIndexExt;
 use lance_file::version::LanceFileVersion;
 use lance_index::IndexType;
@@ -67,6 +70,175 @@ async fn fresh_dataset(uri: &str) -> Dataset {
         ..Default::default()
     };
     Dataset::write(reader, uri, Some(params)).await.unwrap()
+}
+
+/// RFC-023 substrate fixture: a V2_2 table whose internal `id` is Lance's
+/// unenforced primary key. `note` is nullable so the matched-only partial-schema
+/// guard can omit it without testing an unrelated nullability rejection.
+async fn fresh_pk_dataset(uri: &str) -> Dataset {
+    let schema = Arc::new(Schema::new(vec![
+        Field::new("id", DataType::Utf8, false).with_metadata(
+            [(LANCE_UNENFORCED_PRIMARY_KEY.to_string(), "true".to_string())]
+                .into_iter()
+                .collect(),
+        ),
+        Field::new("value", DataType::Int32, false),
+        Field::new("note", DataType::Utf8, true),
+    ]));
+    let batch = RecordBatch::try_new(
+        schema.clone(),
+        vec![
+            Arc::new(StringArray::from(vec!["alice", "bob"])),
+            Arc::new(Int32Array::from(vec![1, 2])),
+            Arc::new(StringArray::from(vec![Some("a"), Some("b")])),
+        ],
+    )
+    .unwrap();
+    let reader = RecordBatchIterator::new(vec![Ok(batch)], schema);
+    let params = WriteParams {
+        mode: WriteMode::Create,
+        enable_stable_row_ids: true,
+        data_storage_version: Some(LanceFileVersion::V2_2),
+        ..Default::default()
+    };
+    Dataset::write(reader, uri, Some(params)).await.unwrap()
+}
+
+fn pk_full_row(dataset: &Dataset, id: &str, value: i32) -> RecordBatch {
+    let schema = Arc::new(Schema::from(dataset.schema()));
+    RecordBatch::try_new(
+        schema,
+        vec![
+            Arc::new(StringArray::from(vec![id])),
+            Arc::new(Int32Array::from(vec![value])),
+            Arc::new(StringArray::from(vec![Some("guard")])),
+        ],
+    )
+    .unwrap()
+}
+
+async fn stage_pk_merge(
+    dataset: Arc<Dataset>,
+    batch: RecordBatch,
+    on: &str,
+    when_matched: WhenMatched,
+    when_not_matched: WhenNotMatched,
+    use_index: Option<bool>,
+) -> UncommittedMergeInsert {
+    let schema = batch.schema();
+    let reader = RecordBatchIterator::new(vec![Ok(batch)], schema);
+    let mut builder = MergeInsertBuilder::try_new(dataset, vec![on.to_string()]).unwrap();
+    builder
+        .when_matched(when_matched)
+        .when_not_matched(when_not_matched)
+        .conflict_retries(0);
+    if let Some(use_index) = use_index {
+        builder.use_index(use_index);
+    }
+    builder
+        .try_build()
+        .unwrap()
+        .execute_uncommitted(reader)
+        .await
+        .unwrap()
+}
+
+fn transaction_inserted_rows_filter(transaction: &Transaction) -> Option<&KeyExistenceFilter> {
+    match &transaction.operation {
+        Operation::Update {
+            inserted_rows_filter,
+            ..
+        } => inserted_rows_filter.as_ref(),
+        other => panic!("expected merge_insert to stage Operation::Update, got {other:?}"),
+    }
+}
+
+fn staged_inserted_rows_filter(staged: &UncommittedMergeInsert) -> Option<&KeyExistenceFilter> {
+    let transaction_filter = transaction_inserted_rows_filter(&staged.transaction);
+    assert_eq!(
+        staged.inserted_rows_filter.as_ref(),
+        transaction_filter,
+        "the public uncommitted result and its transaction must expose the same key filter"
+    );
+    transaction_filter
+}
+
+fn assert_bloom_empty(filter: &KeyExistenceFilter, expected_empty: bool, case: &str) {
+    let FilterType::Bloom { bitmap, .. } = &filter.filter else {
+        panic!("{case}: beta.21 merge_insert should emit a Bloom key filter")
+    };
+    assert_eq!(
+        bitmap.iter().all(|byte| *byte == 0),
+        expected_empty,
+        "{case}: unexpected Bloom-filter population state"
+    );
+}
+
+#[derive(Debug, Clone, Copy)]
+enum ConflictMatrixTxn {
+    Filtered { id: &'static str, value: i32 },
+    UnfilteredUpdate { id: &'static str, value: i32 },
+    Append { id: &'static str, value: i32 },
+}
+
+async fn stage_conflict_matrix_txn(dataset: Arc<Dataset>, kind: ConflictMatrixTxn) -> Transaction {
+    let (id, value) = match kind {
+        ConflictMatrixTxn::Filtered { id, value }
+        | ConflictMatrixTxn::UnfilteredUpdate { id, value }
+        | ConflictMatrixTxn::Append { id, value } => (id, value),
+    };
+    let batch = pk_full_row(dataset.as_ref(), id, value);
+
+    let transaction = match kind {
+        ConflictMatrixTxn::Filtered { .. } => {
+            stage_pk_merge(
+                dataset,
+                batch,
+                "id",
+                WhenMatched::UpdateAll,
+                WhenNotMatched::InsertAll,
+                Some(false),
+            )
+            .await
+            .transaction
+        }
+        ConflictMatrixTxn::UnfilteredUpdate { .. } => {
+            stage_pk_merge(
+                dataset,
+                batch,
+                "value",
+                WhenMatched::UpdateAll,
+                WhenNotMatched::InsertAll,
+                Some(false),
+            )
+            .await
+            .transaction
+        }
+        ConflictMatrixTxn::Append { .. } => InsertBuilder::new(dataset)
+            .with_params(&WriteParams {
+                mode: WriteMode::Append,
+                ..Default::default()
+            })
+            .execute_uncommitted(vec![batch])
+            .await
+            .unwrap(),
+    };
+
+    match kind {
+        ConflictMatrixTxn::Filtered { .. } => assert!(
+            transaction_inserted_rows_filter(&transaction).is_some(),
+            "filtered matrix fixture must carry the PK filter"
+        ),
+        ConflictMatrixTxn::UnfilteredUpdate { .. } => assert!(
+            transaction_inserted_rows_filter(&transaction).is_none(),
+            "non-PK merge matrix fixture must be an unfiltered Update"
+        ),
+        ConflictMatrixTxn::Append { .. } => assert!(
+            matches!(&transaction.operation, Operation::Append { .. }),
+            "append matrix fixture must stage Operation::Append"
+        ),
+    }
+    transaction
 }
 
 // --- Guard 1: LanceError::TooMuchWriteContention variant exists ------------
@@ -1152,6 +1324,281 @@ async fn unenforced_primary_key_is_immutable_once_set() {
          (got: {outcome:?}); immutability relaxed or moved off the commit path \
          — revisit migrate_v1_to_v2's field-guard and re-pin docs/dev/lance.md."
     );
+}
+
+// --- Guard 19b: beta.21 merge_insert PK-filter shape -----------------------
+//
+// RFC-023 can rely on Lance's key-conflict fencing only when every keyed
+// insert produces an `Operation::Update.inserted_rows_filter`. In beta.21 that
+// is a route-dependent contract: the v2 plan emits a filter when the ordered
+// ON field ids exactly match the unenforced PK, while the scalar-index v1 path
+// and non-PK ON shapes emit `None`. A matched-only v2 update still emits
+// `Some(empty Bloom)`, which is important because `Some` selects the strict
+// conflict-resolver branch even though this attempt inserted no key.
+#[tokio::test]
+async fn unenforced_pk_filter_shape_is_route_dependent_on_beta21() {
+    let dir = tempfile::tempdir().unwrap();
+    let uri = dir.path().join("rfc023_filter_v2.lance");
+    let dataset = Arc::new(fresh_pk_dataset(uri.to_str().unwrap()).await);
+    let id_field_id = dataset.schema().field("id").unwrap().id;
+
+    // Exact PK ON + forced non-index plan: a real insert produces a populated
+    // Bloom filter over exactly the PK field id.
+    let upsert = stage_pk_merge(
+        dataset.clone(),
+        pk_full_row(dataset.as_ref(), "fresh-upsert", 10),
+        "id",
+        WhenMatched::UpdateAll,
+        WhenNotMatched::InsertAll,
+        Some(false),
+    )
+    .await;
+    assert_eq!(upsert.stats.num_inserted_rows, 1);
+    assert_eq!(upsert.stats.num_updated_rows, 0);
+    let filter = staged_inserted_rows_filter(&upsert)
+        .expect("exact PK v2 upsert must carry a key-existence filter");
+    assert_eq!(filter.field_ids, vec![id_field_id]);
+    assert_bloom_empty(filter, false, "exact-PK upsert");
+
+    // Strict insert uses the same filter-bearing v2 route. The source
+    // key must be fresh: `WhenMatched::Fail` correctly errors during staging
+    // if the key already exists.
+    let strict_create = stage_pk_merge(
+        dataset.clone(),
+        pk_full_row(dataset.as_ref(), "fresh-strict", 11),
+        "id",
+        WhenMatched::Fail,
+        WhenNotMatched::InsertAll,
+        Some(false),
+    )
+    .await;
+    let filter = staged_inserted_rows_filter(&strict_create)
+        .expect("strict create on the PK must retain the key-existence filter");
+    assert_eq!(filter.field_ids, vec![id_field_id]);
+    assert_bloom_empty(filter, false, "strict PK create");
+
+    // A valid but non-PK ON column still uses v2 when indices are disabled,
+    // yet it must not claim PK conflict coverage.
+    let mismatched_on = stage_pk_merge(
+        dataset.clone(),
+        pk_full_row(dataset.as_ref(), "fresh-non-pk", 12),
+        "value",
+        WhenMatched::UpdateAll,
+        WhenNotMatched::InsertAll,
+        Some(false),
+    )
+    .await;
+    assert!(
+        staged_inserted_rows_filter(&mismatched_on).is_none(),
+        "v2 merge on a non-PK field must not emit a PK filter"
+    );
+
+    // Matched-only partial-schema v2 update: no Insert action touches the
+    // filter builder, but beta.21 deliberately retains `Some(empty Bloom)`.
+    let partial_schema = Arc::new(Schema::new(vec![
+        Field::new("id", DataType::Utf8, false),
+        Field::new("value", DataType::Int32, false),
+    ]));
+    let partial_batch = RecordBatch::try_new(
+        partial_schema.clone(),
+        vec![
+            Arc::new(StringArray::from(vec!["alice"])),
+            Arc::new(Int32Array::from(vec![42])),
+        ],
+    )
+    .unwrap();
+    let matched_only = stage_pk_merge(
+        dataset,
+        partial_batch,
+        "id",
+        WhenMatched::UpdateAll,
+        WhenNotMatched::DoNothing,
+        Some(false),
+    )
+    .await;
+    assert_eq!(matched_only.stats.num_updated_rows, 1);
+    assert_eq!(matched_only.stats.num_inserted_rows, 0);
+    let filter = staged_inserted_rows_filter(&matched_only)
+        .expect("matched-only PK v2 update must emit Some(empty filter)");
+    assert_eq!(filter.field_ids, vec![id_field_id]);
+    assert_bloom_empty(filter, true, "matched-only partial-schema PK update");
+
+    // With a scalar index on every ON column and the default `use_index=true`,
+    // beta.21 selects v1. That route hardcodes `inserted_rows_filter=None`.
+    let indexed_uri = dir.path().join("rfc023_filter_indexed_v1.lance");
+    let mut indexed = fresh_pk_dataset(indexed_uri.to_str().unwrap()).await;
+    indexed
+        .create_index_builder(&["id"], IndexType::BTree, &ScalarIndexParams::default())
+        .replace(true)
+        .await
+        .unwrap();
+    let indexed = Arc::new(indexed);
+    let indexed_route = stage_pk_merge(
+        indexed.clone(),
+        pk_full_row(indexed.as_ref(), "fresh-indexed", 13),
+        "id",
+        WhenMatched::UpdateAll,
+        WhenNotMatched::InsertAll,
+        None, // preserve MergeInsertBuilder's default use_index=true
+    )
+    .await;
+    assert!(
+        staged_inserted_rows_filter(&indexed_route).is_none(),
+        "the beta.21 all-keys-indexed v1 route must remain visibly unfenced"
+    );
+}
+
+// --- Guard 19c: beta.21 key-filter conflict checks are directional ---------
+//
+// Lance evaluates compatibility from the transaction currently being rebased
+// against the transaction already committed. beta.21 is deliberately strict
+// for `filtered current / unfiltered committed`, but the reverse order is
+// accepted. RFC-023 must not assume a symmetric conflict matrix until the
+// upstream resolver actually supplies one.
+#[tokio::test]
+async fn unenforced_pk_conflict_matrix_is_directional_on_beta21() {
+    struct Case {
+        name: &'static str,
+        committed: ConflictMatrixTxn,
+        current: ConflictMatrixTxn,
+        current_succeeds: bool,
+        assert_disjoint_filters: bool,
+    }
+
+    let cases = [
+        Case {
+            name: "same-key filtered current / filtered committed",
+            committed: ConflictMatrixTxn::Filtered {
+                id: "same-fresh-key",
+                value: 10,
+            },
+            current: ConflictMatrixTxn::Filtered {
+                id: "same-fresh-key",
+                value: 11,
+            },
+            current_succeeds: false,
+            assert_disjoint_filters: false,
+        },
+        Case {
+            name: "disjoint filtered current / filtered committed",
+            committed: ConflictMatrixTxn::Filtered {
+                id: "left-fresh-key",
+                value: 10,
+            },
+            current: ConflictMatrixTxn::Filtered {
+                id: "right-fresh-key",
+                value: 11,
+            },
+            current_succeeds: true,
+            assert_disjoint_filters: true,
+        },
+        Case {
+            name: "filtered current / unfiltered Update committed",
+            committed: ConflictMatrixTxn::UnfilteredUpdate {
+                id: "same-mixed-update-key",
+                value: 10,
+            },
+            current: ConflictMatrixTxn::Filtered {
+                id: "same-mixed-update-key",
+                value: 11,
+            },
+            current_succeeds: false,
+            assert_disjoint_filters: false,
+        },
+        Case {
+            name: "unfiltered Update current / filtered committed",
+            committed: ConflictMatrixTxn::Filtered {
+                id: "same-mixed-update-key",
+                value: 10,
+            },
+            current: ConflictMatrixTxn::UnfilteredUpdate {
+                id: "same-mixed-update-key",
+                value: 11,
+            },
+            current_succeeds: true,
+            assert_disjoint_filters: false,
+        },
+        Case {
+            name: "filtered current / Append committed",
+            committed: ConflictMatrixTxn::Append {
+                id: "same-mixed-append-key",
+                value: 10,
+            },
+            current: ConflictMatrixTxn::Filtered {
+                id: "same-mixed-append-key",
+                value: 11,
+            },
+            current_succeeds: false,
+            assert_disjoint_filters: false,
+        },
+        Case {
+            name: "Append current / filtered Update committed",
+            committed: ConflictMatrixTxn::Filtered {
+                id: "same-mixed-append-key",
+                value: 10,
+            },
+            current: ConflictMatrixTxn::Append {
+                id: "same-mixed-append-key",
+                value: 11,
+            },
+            current_succeeds: true,
+            assert_disjoint_filters: false,
+        },
+    ];
+
+    let dir = tempfile::tempdir().unwrap();
+    for (case_index, case) in cases.into_iter().enumerate() {
+        let uri = dir
+            .path()
+            .join(format!("rfc023_conflict_{case_index}.lance"));
+        let base = Arc::new(fresh_pk_dataset(uri.to_str().unwrap()).await);
+
+        // Stage both operations from the exact same stale base. Staging the
+        // second after the first commit would avoid the rebase this guard owns.
+        let committed_tx = stage_conflict_matrix_txn(base.clone(), case.committed).await;
+        let current_tx = stage_conflict_matrix_txn(base.clone(), case.current).await;
+
+        if case.assert_disjoint_filters {
+            let committed_filter = transaction_inserted_rows_filter(&committed_tx).unwrap();
+            let current_filter = transaction_inserted_rows_filter(&current_tx).unwrap();
+            assert_eq!(
+                committed_filter.intersects(current_filter).unwrap(),
+                (false, false),
+                "{}: chosen Bloom-filter fixtures must be definitively disjoint",
+                case.name
+            );
+        }
+
+        CommitBuilder::new(base.clone())
+            .with_max_retries(0)
+            .execute(committed_tx)
+            .await
+            .unwrap_or_else(|error| panic!("{}: first commit failed: {error}", case.name));
+
+        // This is the raw commit/rebase result. `MergeInsertJob::execute`
+        // wraps an exhausted semantic retry as TooMuchWriteContention; the
+        // substrate contract exposed here is RetryableCommitConflict.
+        let current_result = CommitBuilder::new(base)
+            .with_max_retries(0)
+            .execute(current_tx)
+            .await;
+        if case.current_succeeds {
+            assert!(
+                current_result.is_ok(),
+                "{}: beta.21 should accept this direction, got {current_result:?}",
+                case.name
+            );
+        } else {
+            assert!(
+                matches!(
+                    &current_result,
+                    Err(lance::Error::RetryableCommitConflict { .. })
+                ),
+                "{}: expected beta.21 RetryableCommitConflict, got {current_result:?}",
+                case.name
+            );
+        }
+    }
 }
 
 // --- Guard 20: camelCase @index equality routes to the scalar index (#283) ----

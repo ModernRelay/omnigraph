@@ -66,11 +66,11 @@ flowchart TB
         coord[coordinator<br/>ManifestCoordinator · CommitGraph]:::l2
     end
 
-    subgraph storage[storage trait — wraps Lance]
-        ts[table_store · storage.rs<br/>direct lance::Dataset today]:::l2
+    subgraph storage[storage boundary — wraps Lance]
+        ts[sealed TableStorage writes<br/>read-only snapshot facade]:::l2
     end
 
-    subgraph lance_layer[Lance 4.x — substrate]
+    subgraph lance_layer[Lance 9.x — substrate]
         lance[per-dataset versions, fragments<br/>BTREE · Inverted FTS · IVF/HNSW vector<br/>merge_insert · compact_files · cleanup_old_versions]:::l1
     end
 
@@ -86,7 +86,10 @@ flowchart TB
     lance_layer -- bytes --> object_store
 ```
 
-The storage seam is partly aspirational. `TableStorage` exists as the sealed staged-write trait, but capability/stat surfaces and full call-site migration are still roadmap. The diagram shows the intended boundary.
+The write-side storage seam is enforced: supported data-table write effects route
+through the sealed `TableStorage` staging surface, with Optimize as the documented
+bounded maintenance exception. Read, capability, and statistics surfaces are not
+yet one complete substrate trait; that planner-facing boundary remains roadmap.
 
 ## Component zoom-ins
 
@@ -230,19 +233,17 @@ flowchart LR
     classDef future fill:#fff,stroke:#888,stroke-dasharray:5 5,color:#444
 
     subgraph today[Today]
-        d1[table_store<br/>opens lance::Dataset directly]:::now
-        d2[storage.rs<br/>S3 / file URI plumbing]:::now
+        d1[sealed TableStorage<br/>staged write primitives]:::now
+        d2[TableStore + snapshots<br/>private Lance reads]:::now
     end
 
-    subgraph roadmap[Roadmap - storage capabilities]
-        t[trait Dataset<br/>schema · stats · placement<br/>capabilities · scan · write]:::future
-        impl1[LanceStorage]:::future
-        impl2[future test impl]:::future
+    subgraph roadmap[Roadmap - planner-facing capabilities]
+        t[read/capability surface<br/>schema · stats · placement<br/>pushdown support]:::future
+        impl1[Lance-backed implementation]:::future
     end
 
     today -.-> roadmap
     t --> impl1
-    t --> impl2
 ```
 
 The staged-write trait exists today as `TableStorage`, implemented by
@@ -263,7 +264,7 @@ flowchart LR
     classDef future fill:#fff,stroke:#888,stroke-dasharray:5 5,color:#444
 
     subgraph today[Today]
-        ei[ensure_indices<br/>omnigraph.rs:445]:::now
+        ei[ensure_indices]:::now
         manual[called manually<br/>or from optimize]:::now
     end
 

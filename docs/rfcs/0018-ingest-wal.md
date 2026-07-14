@@ -5,13 +5,14 @@ description: Adds a durability-first streaming ingest path (ack on WAL durabilit
 status: superseded
 tags: [eng, rfc, wal, ingest, lance, omnigraph]
 timestamp: 2026-07-02
-owner:
+owner: OmniGraph maintainers
 ---
 
 # RFC-018 — Streaming-ingest WAL on Lance MemWAL
 
-**Status:** Superseded by [RFC-026](rfc-026-memwal-streaming-ingest.md)
+**Status:** Superseded by [RFC-026](0026-memwal-streaming-ingest.md)
 **Date:** 2026-07-02
+**Author track:** Maintainer design series
 **Surveyed version:** 0.7.2 (branch `dst-extract-crate`); Lance pinned at 7.0.0
 **Upstream surveyed:** Lance v8.0.0 (released; RC votes closed 2026-07-01), v9.0.0-beta.10; MemWAL spec (`lance.org/format/table/mem_wal/`, fetched in full 2026-07-02); discussions #7260, #7264, #7222, #7176
 **Audience:** OmniGraph maintainers
