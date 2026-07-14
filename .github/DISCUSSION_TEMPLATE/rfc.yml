@@ -6,8 +6,9 @@ body:
         Use this to **incubate an RFC** — socialize a design and reach rough
         consensus before writing the formal document. When it's ready, graduate
         it into a pull request that adds `docs/rfcs/NNNN-title.md`
+        from the public template with `Author track: Public contribution`
         (see [docs/rfcs/README.md](../blob/main/docs/rfcs/README.md)); a
-        maintainer merging that PR is acceptance.
+        maintainer merging that public-track PR is acceptance.
 
         For a plain feature request or open-ended idea, use the **Ideas**
         category instead. For bugs, open an [Issue](../../issues/new/choose).

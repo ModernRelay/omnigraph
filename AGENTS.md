@@ -72,6 +72,7 @@ Full diagram and concurrency model: [docs/dev/architecture.md](docs/dev/architec
 | **Architectural invariants & deny-list (read before any non-trivial proposal or review)** | **[docs/dev/invariants.md](docs/dev/invariants.md)** |
 | **Lance docs index — fetch upstream Lance docs by problem domain** | **[docs/dev/lance.md](docs/dev/lance.md)** |
 | **Test coverage map — what's covered, what helpers to reuse, before-every-task checklist** | **[docs/dev/testing.md](docs/dev/testing.md)** |
+| The canon — linear internal narrative of the whole system (philosophy, read/write/crash walkthroughs, exclusions, risk register, roadmap) | [docs/dev/canon.md](docs/dev/canon.md) |
 | Architecture, L1/L2 framing, concurrency model | [docs/dev/architecture.md](docs/dev/architecture.md) |
 | Storage layout, `__manifest` schema, URI schemes, S3 env vars | [docs/user/concepts/storage.md](docs/user/concepts/storage.md) |
 | `.pg` schema language, types, constraints, annotations, migration planning | [docs/user/schema/index.md](docs/user/schema/index.md) |
@@ -106,7 +107,7 @@ Full diagram and concurrency model: [docs/dev/architecture.md](docs/dev/architec
 | CI / release workflows | [docs/dev/ci.md](docs/dev/ci.md) |
 | Branch protection policy (declarative, applied via `scripts/apply-branch-protection.sh`) | [docs/dev/branch-protection.md](docs/dev/branch-protection.md) |
 | Constants & tunables cheat sheet | [docs/user/reference/constants.md](docs/user/reference/constants.md) |
-| RFC process — public contribution track (substantial / irreversible changes) | [docs/rfcs/README.md](docs/rfcs/README.md) |
+| RFC process — public contribution and maintainer design-series tracks | [docs/rfcs/README.md](docs/rfcs/README.md) |
 | Per-version release notes | [docs/releases/](docs/releases/) |
 
 ---

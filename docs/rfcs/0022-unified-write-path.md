@@ -2,26 +2,44 @@
 type: spec
 title: "RFC-022 — Unified graph-write protocol"
 description: One correctness protocol for graph-visible writes, with synchronous recovery, complete read-set arbitration, writer-specific physical-effect adapters, and explicit control-plane exceptions.
-status: draft
+status: implemented
 tags: [eng, rfc, write-path, manifest, recovery, concurrency, lance, omnigraph]
-timestamp: 2026-07-12
-owner:
+timestamp: 2026-07-13
+owner: OmniGraph maintainers
 ---
 
 # RFC-022: Unified graph-write protocol
 
-**Status:** Draft / for team review
+**Status:** Implemented on 2026-07-13
 **Date:** 2026-07-12
+**Author track:** Maintainer design series
 **Surveyed:** OmniGraph 0.8.1 (`main`); Lance 9.0.0-beta.21, git rev `1aec1465`
 **Audience:** engine and storage maintainers
-**Open architecture review:** [RFC-022–027 review ledger](../dev/rfc-022-027-architecture-review.md).
-Findings marked **BLOCKER** must be dispositioned before acceptance.
+**Architecture review:** [RFC-022–028 review ledger](../dev/rfc-022-027-architecture-review.md).
+RFC-022's structural rollout and lifecycle findings are closed; the ledger
+remains active for RFC-023–027.
+
+**Implementation evidence:** [#343](https://github.com/ModernRelay/omnigraph/pull/343),
+[#344](https://github.com/ModernRelay/omnigraph/pull/344),
+[#345](https://github.com/ModernRelay/omnigraph/pull/345),
+[#346](https://github.com/ModernRelay/omnigraph/pull/346),
+[#347](https://github.com/ModernRelay/omnigraph/pull/347),
+[#348](https://github.com/ModernRelay/omnigraph/pull/348),
+[#349](https://github.com/ModernRelay/omnigraph/pull/349),
+[#350](https://github.com/ModernRelay/omnigraph/pull/350),
+[#351](https://github.com/ModernRelay/omnigraph/pull/351), and
+[#353](https://github.com/ModernRelay/omnigraph/pull/353).
+
+Implementation is complete for the documented single-writer-process support
+boundary. This status does not claim distributed destructive recovery. Exact
+Optimize provenance remains trigger-gated by §6.4, and MemWAL fold enrollment
+remains owned by RFC-026.
 
 ---
 
 ## 0. Summary
 
-OmniGraph will have one **correctness protocol** for every operation that changes
+OmniGraph has one **correctness protocol** for every operation that changes
 manifest-resolved graph state. The protocol does not require every writer to use
 the same Lance primitive. A mutation can commit one staged transaction per table,
 a branch merge can make several commits to a table, and optimize can use Lance
@@ -56,11 +74,11 @@ This RFC deliberately does not combine key fencing, durable table heads,
 checkpoint retention, MemWAL ingest, or lineage-based merge-delta discovery into
 one format and rollout. They are focused follow-ups:
 
-- [RFC-023 — Key-conflict fencing](rfc-023-key-conflict-fencing.md)
-- [RFC-024 — Durable table heads](rfc-024-durable-table-heads.md)
-- [RFC-025 — Checkpoint retention](rfc-025-checkpoint-retention.md)
-- [RFC-026 — MemWAL streaming ingest](rfc-026-memwal-streaming-ingest.md)
-- [RFC-027 — Lineage merge deltas](rfc-027-lineage-merge-deltas.md)
+- [RFC-023 — Key-conflict fencing](0023-key-conflict-fencing.md)
+- [RFC-024 — Durable table heads](0024-durable-table-heads.md)
+- [RFC-025 — Checkpoint retention](0025-checkpoint-retention.md)
+- [RFC-026 — MemWAL streaming ingest](0026-memwal-streaming-ingest.md)
+- [RFC-027 — Lineage merge deltas](0027-lineage-merge-deltas.md)
 
 ## 1. Scope and authority
 
@@ -746,7 +764,7 @@ Retry rules are phase-specific:
 ## 10. Rollout and compatibility
 
 This RFC authorizes a protocol refactor, not a manifest v5 format moment. RFC-023
-through RFC-027 own their respective format and public-surface changes.
+through RFC-028 own their respective format and public-surface changes.
 
 It also does not require a mutable-tip `GraphState` singleton. Three measured,
 local latency fixes can land independently of the adapter conversion:
@@ -764,11 +782,11 @@ These are narrow access-shape fixes, not a second commit-input authority. They
 must preserve snapshot pinning and still cross the recovery/read-set barriers
 defined above.
 
-Implementation proceeds in this order:
+The implementation landed in this order:
 
-1. Introduce `PreparedWrite`, `ReadSet`, effect-adapter, and recovery-plan concepts
-   while preserving existing behavior.
-2. Ship conservative branch-wide arbitration first. Mutation/load captures
+1. `PreparedWrite`, `ReadSet`, effect-adapter, and recovery-plan concepts were
+   introduced while preserving existing behavior.
+2. Conservative branch-wide arbitration shipped first. Mutation/load captures
    `(Lance BranchIdentifier, exact optional graph_head, accepted schema identity)`;
    every publisher retry compares that token instead of reparenting. Because every
    supported graph-content and schema apply advances `graph_head:<branch>` before
@@ -825,11 +843,11 @@ Implementation proceeds in this order:
    > branch pin, computes `keep` from Lance's actual version list, refuses
    > uncovered main HEAD drift, and completes its live-root preflight before the
    > first table GC.
-3. Convert every current graph-visible effect writer. This is structurally complete
+3. Every current graph-visible effect writer was converted. This is structurally complete
    as of 2026-07-13: Mutation/Load, BranchMerge, SchemaApply, and EnsureIndices use
    exact adapters; Optimize uses the bounded schema-v2 adapter described in §6.4.
    The deferred exact Optimize upgrade is not an RFC-022 rollout gate.
-4. Keep the supported writer set closed. This is complete as of 2026-07-13:
+4. The supported writer set was closed. This is complete as of 2026-07-13:
    raw storage/coordinator/handle-cache modules are crate-private and public
    snapshots expose a read-only table/scan facade without Lance's raw scanner
    or physical plan. `crates/omnigraph/tests/forbidden_apis.rs` adds a
@@ -841,10 +859,10 @@ Implementation proceeds in this order:
    the concrete method/UFCS/raw-Dataset and selected rename/macro shapes pinned
    by its self-tests; Rust visibility, not heuristic macro expansion, is the
    structural closure.
-5. Remove superseded orchestration after its crash and concurrency cells pass through
-   the adapter. The old bypass surfaces are removed; writer-specific physical-effect
+5. Superseded orchestration was removed after its crash and concurrency cells passed
+   through the adapter. The old bypass surfaces are removed; writer-specific physical-effect
    implementations remain intentionally behind their registered adapters.
-6. Treat further work as post-close-out latency or capability work: preserve the
+6. Further work is post-close-out latency or capability work: preserve the
    synchronous barrier and recovery classifications, and require the two §6.4
    triggers before replacing Optimize's bounded adapter.
 
@@ -1029,7 +1047,7 @@ substrate.
 The correctness contract is intentionally difficult to reverse: after writers rely on
 complete read-set arbitration and recovery-before-write, weakening either would
 reintroduce silent integrity or recovery races. Focused irreversible changes are
-reviewed in RFC-023 through RFC-027.
+reviewed in RFC-023 through RFC-028.
 
 ## 15. Follow-up RFC boundaries
 
@@ -1043,6 +1061,8 @@ reviewed in RFC-023 through RFC-027.
   behavior, stream quiescence, fresh reads, public surfaces, and upgrade fencing.
 - **RFC-027** owns candidate discovery from row lineage, deletion discovery, fallback
   semantics, and evidence for any O(delta) merge claim.
+- **RFC-028** owns graph-scoped schema identity, rename/drop lifecycle,
+  allocation, SchemaApply integration, and the shared identity-format gate.
 
 Those RFCs call this protocol when they produce a graph-visible write. None may weaken
 the recovery barrier, omit read dependencies from `ReadSet`, or create a second graph

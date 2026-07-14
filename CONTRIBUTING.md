@@ -9,7 +9,7 @@ rules and decision authority behind it live in [GOVERNANCE.md](GOVERNANCE.md).
 |---|---|---|
 | **Report a bug** or wrong behavior | **[Open an Issue](../../issues/new/choose)** | Concrete and reproducible. A maintainer triages it; once labelled **`accepted`** it's open for a PR. |
 | **Suggest a feature / share an idea / ask** | **[Start a Discussion](../../discussions)** | Ideas and questions live here, not in Issues. |
-| **Propose a design / RFC** | **An RFC pull request** | Anyone can author one — see [docs/rfcs/README.md](docs/rfcs/README.md). A maintainer merging it is acceptance. |
+| **Propose a design / RFC** | **An RFC pull request** | Anyone can copy the public template and declare `Author track: Public contribution` — see [docs/rfcs/README.md](docs/rfcs/README.md). A maintainer merging a public RFC is acceptance; maintainer design series use their explicit status lifecycle. |
 | **Fix something / implement a change** | **A pull request** | Must link an `accepted` issue or an accepted RFC — unless it's trivial (below). |
 | **Report a security vulnerability** | **[SECURITY.md](SECURITY.md)** | Do **not** open a public Issue. |
 

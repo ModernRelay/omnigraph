@@ -1,10 +1,11 @@
 # RFC-015: Ingest-time `@embed` via the embedding reconciler
 
-**Status:** Proposed
+**Status:** Draft
 **Date:** 2026-06-21
+**Owner:** OmniGraph maintainers
 **Tickets:** `iss-ingest-embed` (umbrella); relates to RFC-012 (embedding client),
 invariant 7 (indexes are derived state)
-**Author track:** maintainer-internal RFC
+**Author track:** Maintainer design series
 
 > Evidence tags: **[S]** verified in v0.7.1 source (`file:line`), **[U]** verified
 > against an external system, **[D]** documented behavior. Unmarked = design intent.
@@ -35,13 +36,13 @@ The natural request — "embed automatically when I add data" — has one obviou
 implementation (embed inline during `mutate`/`load`) that is **wrong for this
 codebase on three independent counts**:
 
-1. **It is on the deny-list.** [invariants.md](invariants.md) forbids
+1. **It is on the deny-list.** [invariants.md](../dev/invariants.md) forbids
    "synchronous inline vector/FTS index rebuilds on the write path." An
    embedding is the same shape (expensive, network-bound, derivable). The
    deny-list does not distinguish "build the index" from "compute the value the
    index covers."
-2. **It blows the write-path cost contract.** RFC-013 (and step 3b,
-   [rfc-013-step-3b-writetxn.md](rfc-013-step-3b-writetxn.md)) is making the
+2. **It blows the write-path cost contract.** RFC-013 (and its
+   [Step 3b handoff](../dev/handoff-rfc-013-write-path.md)) is making the
    write path O(1) and failure-bounded. A per-row embedding call is
    O(network-latency) and fallible — a single-row `mutate` would block on a
    model round-trip (the latency that makes this unacceptable for interactive

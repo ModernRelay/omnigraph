@@ -7,6 +7,11 @@ invariants, implementation contracts, test ownership, and upstream Lance
 constraints. User-facing behavior should still be documented through
 [docs/user/index.md](../user/index.md) and the relevant public reference docs.
 
+New to the codebase, or re-anchoring after time away? Read
+[canon.md](canon.md) — the linear narrative of the whole system (why it
+exists, how a read/write/merge/crash unfolds, deliberate exclusions, risks,
+roadmap). The per-area docs below remain the mechanical authority.
+
 ## Required For Every Non-Trivial Change
 
 | Need | Read |
@@ -58,11 +63,14 @@ constraints. User-facing behavior should still be documented through
 |---|---|
 | How to contribute (external) | [CONTRIBUTING.md](../../CONTRIBUTING.md) |
 | Governance model, roles, decision authority | [GOVERNANCE.md](../../GOVERNANCE.md) |
-| Public contribution RFC track | [rfcs/](../rfcs/) |
+| RFC process — public contribution and maintainer design-series tracks | [rfcs/](../rfcs/) |
 
-The `docs/rfcs/` track is the **public, externally-authorable** RFC process. The
-maintainer/internal RFCs below (`rfc-00N-*.md`) are a separate, team-owned
-track; don't conflate the two.
+`docs/rfcs/` is the durable home for both formal tracks. Every formal RFC uses
+the four-digit `NNNN-*` filename namespace; explicit `Author track` and `Status`
+metadata select the public contribution or maintainer design-series lifecycle.
+Public RFC merge means acceptance, while maintainer design series may remain
+draft across merged revisions. Existing `docs/dev/rfc-00N-*` files are legacy
+internal design and implementation records that retain their current lifecycle.
 
 ## Case Studies
 
@@ -81,7 +89,7 @@ as durable disposition history after closure, so RFC backlinks stay valid.
 
 | Area | Read |
 |---|---|
-| RFC-022–027 split architecture review — open correctness blockers, dependency corrections, and required acceptance evidence | [rfc-022-027-architecture-review.md](rfc-022-027-architecture-review.md) |
+| RFC-022–028 split architecture review — RFC-022 implemented; sibling blockers, dependency corrections, and acceptance evidence remain tracked | [rfc-022-027-architecture-review.md](rfc-022-027-architecture-review.md) |
 
 ## Active Implementation Plans
 

@@ -65,10 +65,11 @@ first, or pick one already labelled `accepted` / `help wanted`.
 ### Discussions → RFCs → accepted
 Ideas and feature requests start in **Discussions**. Anyone — including external
 contributors — may then **author an RFC** by opening a pull request that adds
-`docs/rfcs/NNNN-title.md` (see [docs/rfcs/README.md](docs/rfcs/README.md)). The
-RFC is reviewed as code; **a maintainer merging it is the act of acceptance**
-(it becomes the durable decision record). Implementation PRs then reference the
-accepted RFC.
+`docs/rfcs/NNNN-title.md` from the public template with
+`Author track: Public contribution` (see
+[docs/rfcs/README.md](docs/rfcs/README.md)). The RFC is reviewed as code; **a
+maintainer merging it is the act of acceptance** (it becomes the durable
+decision record). Implementation PRs then reference the accepted RFC.
 
 Authoring an RFC is open to everyone; **accepting one is a maintainer
 decision.** Maintainers may also decline an RFC, with rationale, by closing it.

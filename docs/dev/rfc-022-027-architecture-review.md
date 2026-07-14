@@ -1,6 +1,6 @@
-# Architecture review: RFC-022 through RFC-027
+# Architecture review: RFC-022 through RFC-028
 
-**Status:** Open review findings
+**Status:** RFC-022 implemented; RFC-023–028 review and acceptance work remains open
 **Date:** 2026-07-11
 **Audience:** RFC authors, engine/storage maintainers, and release reviewers
 **Reviewed against:** OmniGraph 0.8.1; Lance 9.0.0-beta.15 at
@@ -8,9 +8,23 @@
 branch/tag, MemWAL, row-lineage, read/write, compaction, and cleanup
 specifications; pinned Rust implementation where the public specification is
 not precise enough
+**RFC-022 close-out revalidated against:** Lance 9.0.0-beta.21 at
+`1aec14652dcbace23ac277fa8ced35000bea0c40`; see the
+[2026-07-12 alignment audit](lance.md#last-alignment-audit-2026-07-12-lance-900-beta21-upstream-omnigraph-pinned-at-900-beta21-via-git-rev).
+**RFC-023 substrate evidence revalidated against:** the same beta.21 revision;
+filter-shape and conflict-order probes are recorded in RFC-023 §2 and do not
+constitute fencing activation or acceptance.
+**RFC-026 substrate contract revalidated against:** the same beta.21 revision;
+the full MemWAL table and system-index specifications, including the
+durability/fencing behavior carried forward from beta.17, are reflected in the
+RFC's survey and acceptance guards.
+**RFC-024/025/027 substrate claims revalidated against:** the same beta.21
+revision and the full matching table/index/branch/tag/cleanup, transaction, and
+row-lineage specification sections; their survey headers now record beta.21.
 
 This is a review ledger, not a competing specification. The RFCs remain the
-normative proposals. A finding is closed only when the affected RFC either:
+normative design records: RFC-022 documents the implemented protocol and its
+siblings remain proposals. A finding is closed only when the affected RFC either:
 
 1. incorporates the required contract and tests; or
 2. explicitly rejects the finding with evidence and records the resulting
@@ -31,17 +45,19 @@ The central architecture remains the right one:
 - Lance is the physical storage/versioning truth.
 - `__manifest` is the graph-visible authority and one graph publish is the
   visibility point for a logical graph commit.
-- RFC-022 should define one correctness protocol with explicit physical-effect
-  adapters, not pretend that Lance offers one universal staged primitive.
-- Key fencing, durable heads, retention, MemWAL, and lineage acceleration are
-  separate irreversible decisions and should keep separate evidence and format
-  gates.
+- RFC-022 defines one correctness protocol with explicit physical-effect
+  adapters rather than pretending that Lance offers one universal staged
+  primitive.
+- Stable schema identity, key fencing, durable heads, retention, MemWAL, and
+  lineage acceleration are separate irreversible decisions and should keep
+  separate evidence and format gates.
 
 The remaining open blockers are boundary problems, not a reason to replace that
-core. They concern actual cross-process fencing, capability activation, format
-rollout, and public RFC lifecycle. The native branch crash classifier,
-foreign-source merge semantics, and shipped lazy-branch cleanup exposure found
-by this review are now dispositioned below.
+core. They concern sibling capability activation, strict rebuild rollout,
+cross-process claims, and acceptance evidence. RFC-022's structural
+rollout and the RFC-track classification are now closed. The native branch crash
+classifier, foreign-source merge semantics, and shipped lazy-branch cleanup
+exposure found by this review are also dispositioned below.
 
 > 💬 **Second-pass verification (2026-07-11):** I independently re-verified this
 > ledger's two sharpest new substrate claims against the pinned checkout before
@@ -75,30 +91,33 @@ The intended dependency shape is therefore:
 ```text
 RFC-022 unified write protocol
     |
-    +-- stable identity/incarnation capability
-    |       +-- RFC-024 durable heads
-    |       +-- RFC-025 checkpoint rows
-    |       `-- RFC-026 stream/reject authority
-    |
-    +-- RFC-023 key fencing
-    |       `-- RFC-026 keyed streaming mode
-    |
-    +-- RFC-025 retention
-    +-- RFC-026 MemWAL
-    `-- RFC-027 merge-delta research
+    `-- RFC-028 stable identity/incarnation capability
+            +-- RFC-023 key fencing
+            |       `-- RFC-026 keyed streaming mode
+            +-- RFC-024 durable heads
+            +-- RFC-025 checkpoint rows
+            `-- RFC-026 stream/reject authority
 ```
 
-The public RFC process accepts whole RFCs, not independently accepted sections.
-The identity capability must therefore be extracted into its own RFC, or
-RFC-024 must be accepted in full before identity-dependent siblings. An
-implementation may phase an accepted RFC internally, but it cannot treat a
-sub-contract of an unaccepted RFC as a separately accepted decision.
+RFC-023 through RFC-026 also consume RFC-022's write/recovery protocol
+directly; RFC-025 additionally owns retention, RFC-026 owns MemWAL, and RFC-027
+depends on RFC-022's branch-merge pipeline without consuming RFC-028 yet. The
+diagram highlights the identity dependency rather than duplicating every direct
+protocol edge.
+
+The maintainer design-series process permits incremental draft merges, but it
+does not make a sub-contract of an unaccepted RFC independently authoritative.
+RFC-028 now owns the extracted identity capability. RFC-023 through RFC-026
+depend on that shared contract and cannot activate their identity-bearing
+formats until RFC-028 is accepted and implemented. An implementation may phase
+an accepted RFC internally, but it cannot silently promote one section of a
+draft into a shared format contract.
 
 ## Blocking findings
 
 ### BLOCKER-01 — native graph-branch control is multi-phase
 
-**Affected:** [RFC-022 §7](../rfcs/rfc-022-unified-write-path.md#7-native-graph-branch-ref-control-protocol)
+**Affected:** [RFC-022 §7](../rfcs/0022-unified-write-path.md#7-native-graph-branch-ref-control-protocol)
 
 **Status:** Closed in specification and implementation on 2026-07-11.
 
@@ -164,14 +183,16 @@ and between delete authority removal and directory cleanup.
 
 ### BLOCKER-02 — create-if-absent ownership is not a fencing lease
 
-**Affected:** RFC-023 migration claim, RFC-024 migration claim, and
-[RFC-025 §2.3](../rfcs/rfc-025-checkpoint-retention.md#23-cross-process-retention-claim)
+**Affected:** [RFC-025 §2.3](../rfcs/0025-checkpoint-retention.md#23-cross-process-retention-claim)
+
+**Status:** Closed in specification on 2026-07-14; subprocess death proof and
+offline-repair implementation remain RFC-025 acceptance gates.
 
 `PutMode::Create` correctly elects one initial owner. A random token in that
-object does not by itself fence a paused owner, because Lance tag, branch,
-migration, and cleanup effects do not condition their commits on that token.
-RFC-025 proposes a check-then-delete release; RFC-023 does not yet specify a
-release protocol at all. For the check-then-delete shape, the race is:
+object does not by itself fence a paused owner, because Lance tag, branch, and
+cleanup effects do not condition their commits on that token. The reviewed
+RFC-025 proposed a check-then-delete release plus takeover. For that shape, the
+race is:
 
 1. old owner reads and verifies token A;
 2. old owner pauses;
@@ -206,14 +227,21 @@ that takeover is refused until external fencing/death proof is established.
 > uses explicit offline repair. The substrate-enforced lease is the right end
 > state but should be written as an upstream/adapter work item, not assumed.
 
+**Disposition:** RFC-025 now calls the value an owner token, makes a crashed
+claim non-takeoverable, and refuses stale-claim removal until an operator proves
+the prior process/host cannot resume or runs offline repair after revoking that
+ability. A fleet outage, elapsed time, and token recheck are explicitly
+insufficient. Acceptance tests pause a live owner and require takeover refusal,
+then exercise removal only after subprocess death/offline isolation.
+
 ### BLOCKER-03 — key-conflict retry must first resolve partial effects
 
-**Affected:** [RFC-022 §9](../rfcs/rfc-022-unified-write-path.md#9-concurrency-and-retry-semantics),
-[RFC-023 §6](../rfcs/rfc-023-key-conflict-fencing.md#6-retry-and-validation-semantics),
-and [RFC-026 §6](../rfcs/rfc-026-memwal-streaming-ingest.md#6-fold-protocol)
+**Affected:** [RFC-022 §9](../rfcs/0022-unified-write-path.md#9-concurrency-and-retry-semantics),
+[RFC-023 §6](../rfcs/0023-key-conflict-fencing.md#6-retry-and-validation-semantics),
+and [RFC-026 §6](../rfcs/0026-memwal-streaming-ingest.md#6-fold-protocol)
 
-**Status:** The RFC-022 mutation/load portion is closed in the shipped adapter
-as of 2026-07-11. RFC-023 and RFC-026 retain their own open dispositions.
+**Status:** Closed in specification on 2026-07-14. RFC-022 is shipped;
+RFC-023/RFC-026 failpoint evidence remains an acceptance gate for those drafts.
 
 A retryable concurrent inserted-row-filter conflict is detected when a table
 transaction attempts to commit. (`WhenMatched::Fail` may instead report a
@@ -232,9 +260,9 @@ forbids.
   before a new semantic attempt can be prepared. If rollback is not safe, return
   a typed recovery-required failure rather than retrying around it.
 
-For strict insert, finalize an empty intent or retain a partial-effect sidecar,
-as applicable, and return the terminal `KeyConflict`; RFC-022 permits partial
-recovery to finish at the next synchronous barrier. Do not start another
+For strict insert, finalize a proven-empty intent and return the terminal
+`KeyConflict`; if an earlier participant advanced or emptiness is not provable,
+retain the sidecar and return `RecoveryRequired` instead. Do not start another
 attempt around that sidecar. For non-strict upsert, the barrier must resolve the
 sidecar before the bounded automatic whole-operation retry. Add a failpoint/race
 in which table N conflicts after table 1 has committed.
@@ -251,9 +279,17 @@ in which table N conflicts after table 1 has committed.
 > for safety. RFC-023's fenced key-conflict contract and RFC-026's MemWAL fold
 > protocol still need their adapter-specific resolutions.
 
+**RFC-023/RFC-026 disposition:** RFC-023 §6 now permits a bounded whole-operation
+retry only before sidecar arm or after exact classification proves the armed
+intent effect-free and finalizes it. Any landed or unclassifiable participant
+retains the sidecar and returns `RecoveryRequired`; strict insert applies the
+same recovery precedence and never changes mode. RFC-026 §6 applies that rule
+to folds and forbids replanning `merged_generations` around unresolved state.
+Both RFCs require the table-N-after-table-1 failpoint before acceptance.
+
 ### BLOCKER-04 — live graph branches need physical GC protection
 
-**Affected:** [RFC-025 §6](../rfcs/rfc-025-checkpoint-retention.md#6-cleanup-protocol-and-pruned-through-boundary)
+**Affected:** [RFC-025 §6](../rfcs/0025-checkpoint-retention.md#6-cleanup-protocol-and-pruned-through-boundary)
 
 **Status:** Closed in the shipped baseline and RFC-025 on 2026-07-11.
 
@@ -303,7 +339,10 @@ runs, and the lazy branch still opens and reads the exact pinned state.
 
 ### BLOCKER-05 — durable-head OCC must compare the full head token
 
-**Affected:** [RFC-024 §5](../rfcs/rfc-024-durable-table-heads.md#5-atomic-publisher-contract)
+**Affected:** [RFC-024 §5](../rfcs/0024-durable-table-heads.md#5-atomic-publisher-contract)
+
+**Status:** Closed in specification on 2026-07-14; backend-token proof and ABA
+tests remain RFC-024 acceptance gates.
 
 The RFC says expected table versions are compared against table heads. Lance
 version numbers can repeat across recreated datasets/branches, so version-only
@@ -314,24 +353,36 @@ identity, at least:
 
 ```text
 (state, stable_table_id, incarnation_id, table_path,
- table_branch, physical_ref_incarnation, table_version, schema_hash)
+ table_branch, physical_ref_incarnation, table_version, schema_ir_hash)
 ```
 
 The publisher may encode that token differently, but retry/revalidation must
 not reduce it to `table_version`. `physical_ref_incarnation` means an e_tag when
 the backend supplies one, or another proven token that changes when a dataset
 or native ref is deleted and recreated at the same path/branch/version. This is
-distinct from the logical `incarnation_id`, which RFC-024 deliberately preserves
+distinct from the logical `incarnation_id`, which RFC-028 deliberately preserves
 across an owner handoff. Add stale-writer races for both logical drop/recreate
 and physical ref recreation at the same numeric version.
 
+**Disposition:** RFC-024 §3.2 now persists the separate physical-ref token and
+refuses activation on a backend without a proven source. §5 compares the full
+token on every retry and derives the desired token from the achieved effect;
+§12 adds local and S3/RustFS same-version ABA tests. Its open gates retain the
+backend proof rather than silently accepting a timestamp/version fallback.
+
 ### BLOCKER-06 — MemWAL needs a capability/format activation barrier
 
-**Affected:** [RFC-026 §3](../rfcs/rfc-026-memwal-streaming-ingest.md#3-enrollment-is-a-recoverable-inline-commit),
-[§5](../rfcs/rfc-026-memwal-streaming-ingest.md#5-ack-path-validation-and-writer-lifecycle),
-[§6](../rfcs/rfc-026-memwal-streaming-ingest.md#6-fold-protocol),
-[§8](../rfcs/rfc-026-memwal-streaming-ingest.md#8-epoch-fenced-quiescence-barrier),
-and [§12](../rfcs/rfc-026-memwal-streaming-ingest.md#12-phasing)
+**Affected:** [RFC-026 §3](../rfcs/0026-memwal-streaming-ingest.md#3-enrollment-is-a-recoverable-multi-effect-adapter),
+[§5](../rfcs/0026-memwal-streaming-ingest.md#5-ack-path-validation-and-writer-lifecycle),
+[§6](../rfcs/0026-memwal-streaming-ingest.md#6-fold-protocol),
+[§8](../rfcs/0026-memwal-streaming-ingest.md#8-epoch-fenced-quiescence-barrier),
+[§9](../rfcs/0026-memwal-streaming-ingest.md#9-fresh-read-cuts),
+and [§11–13](../rfcs/0026-memwal-streaming-ingest.md#11-format-activation-and-rebuild)
+
+**Status:** Open. The format/refusal portion is specified, but beta.21 lacks the
+public exact enrollment and reversible shard-admission surface needed by the
+recovery/quiescence adapter. RFC-026 cannot be accepted or activated until that
+API gate and its crash evidence close.
 
 Enrollment creates persistent MemWAL metadata and `stream_state` changes the
 correctness preconditions for schema, branch, maintenance, and data operations.
@@ -339,14 +390,34 @@ An older binary that understands key fencing but not stream lifecycle can ignore
 `OPEN | DRAINING | SEALED`, mutate the base table, or perform a schema/branch
 operation without draining acknowledged rows.
 
-**Required disposition:** define:
+**Format disposition:** RFC-026 §11 makes streaming a graph-format capability present
+at new-root initialization, never a feature stamp added by first enrollment.
+It defines:
 
 - a graph capability/internal-format stamp written only after every enrolled
   table and lifecycle authority is valid;
 - old-binary/new-format and new-binary/partial-format refusal behavior;
-- migration and rollback/roll-forward ordering;
+- strict export/init/load rebuild and source/target failure isolation;
 - preservation rules for later heads/retention formats;
 - genuine cross-version tests, not a stamp-rewind simulation.
+
+RFC-026 §12 carries those tests and §13 places them in Phase A before the public
+stream path. RFC-026 §3/§8 also make a rematerialized table a separate physical
+enrollment boundary: SchemaApply leaves the preserved logical identity
+`SEALED`, and only an exact sidecar-covered rebind with a fresh enrollment and
+shard namespace may publish `OPEN`. Recovery never infers adoption from the
+logical pair, name, path, or a compatible-looking index.
+
+**Remaining required disposition:** in beta.21,
+`InitializeMemWalBuilder::execute` internally commits the `CreateIndex`
+transaction and returns only `Result<()>`; `mem_wal_writer` separately creates
+or claims shard-manifest objects. That cannot satisfy a sidecar that pre-arms
+one exact combined effect. RFC-026 §3 now rejects private-module/object-store
+emulation and requires a public caller-controlled transaction plus idempotent
+shard provision/classify/seal/reopen/reclaim APIs, or one recoverable enrollment
+receipt covering both effects. §5/§8 require the physical admission seal that
+closes the final lifecycle-check-to-put race. The same-path/ref ABA, multi-
+effect crash, and paused-claimant tests remain red acceptance gates.
 
 Replica scope must also match RFC-023's recovery support boundary. Multiple
 replicas may route acknowledgement traffic to one shard owner, but enrollment,
@@ -356,24 +427,40 @@ failover for those operations merely because MemWAL has a shard epoch.
 
 ### BLOCKER-07 — stable identity ownership contradicts sibling dependencies
 
-**Affected:** [RFC-024 §3.1](../rfcs/rfc-024-durable-table-heads.md#31-identity-and-object-key),
-[RFC-025 §2.1](../rfcs/rfc-025-checkpoint-retention.md#21-logical-authority-manifest-rows),
-[RFC-026 §7](../rfcs/rfc-026-memwal-streaming-ingest.md#7-fold-time-rejection-is-atomic),
-and [RFC-026 §8](../rfcs/rfc-026-memwal-streaming-ingest.md#8-epoch-fenced-quiescence-barrier)
+**Affected:** [RFC-023 §4.1](../rfcs/0023-key-conflict-fencing.md#41-keyed-graph-tables),
+[RFC-024 §3.1](../rfcs/0024-durable-table-heads.md#31-identity-and-object-key),
+[RFC-025 §2.1](../rfcs/0025-checkpoint-retention.md#21-logical-authority-manifest-rows),
+[RFC-026 §2](../rfcs/0026-memwal-streaming-ingest.md#2-stream-mode-and-key-semantics),
+[RFC-026 §7](../rfcs/0026-memwal-streaming-ingest.md#7-fold-time-rejection-is-atomic),
+and [RFC-026 §8](../rfcs/0026-memwal-streaming-ingest.md#8-epoch-fenced-quiescence-barrier),
+with the shared contract in [RFC-028](../rfcs/0028-stable-schema-identity.md)
 
-RFC-024 now says it exclusively owns stable table identity and incarnation and
-that identity-dependent sibling claims must wait for it. RFC-025 still calls
-RFC-024 optional, and RFC-026 persists `stable-table-id` without declaring the
-dependency.
+**Status:** Closed in specification on 2026-07-14; RFC-028 acceptance and
+implementation remain prerequisites for every identity-consuming sibling.
 
-**Required disposition:** extract the identity/incarnation format and migration
-as a shared prerequisite RFC, or accept RFC-024 in full before RFC-025 and
-RFC-026. Durable-head implementation can remain a later phase only after its
-owning RFC and format contract are accepted.
+The reviewed drafts had RFC-024 exclusively owning stable table identity and
+incarnation while RFC-025 called heads optional and RFC-026 persisted a stable
+table ID without declaring that dependency.
 
-The `_ingest_rejects` deterministic key must use stable table ID plus
-incarnation rather than mutable `table_key`, or rename/recreate can change reject
-identity and break replay idempotence.
+**Disposition:** RFC-028 now exclusively owns graph-scoped type/property IDs,
+table incarnation, allocation, SchemaApply recovery, and strict rebuild. RFC-023
+through RFC-026 declare it as the prerequisite; RFC-024 owns only durable-head
+storage and lookup. RFC-023 uses the stable pair for keyed-table format
+authority, and RFC-026 distinguishes that preserved logical pair from its
+separately fenced physical MemWAL enrollment.
+
+RFC-026's `_ingest_rejects` deterministic key now uses stable table ID plus
+incarnation rather than mutable `table_key`, while a rematerializing rename
+mints a fresh shard namespace under an exact sidecar-covered rebind. Thus
+logical history ownership survives rename, physical WAL artifacts are never
+adopted by implication, and drop/re-add cannot claim a predecessor's rows.
+
+The same correction keeps logical identity separate from physical ABA proof.
+RFC-025 now owns a heads-independent exact manifest/table version token,
+backend refusal, recovery/reconciler checks, and local/S3 same-coordinate ABA
+tests. RFC-026 owns a binding-stable physical-ref incarnation token and remains
+blocked under BLOCKER-06 until its backend/API guards pass. Neither silently
+imports RFC-024's head storage merely to obtain those proofs.
 
 > 💬 **Concur; supersedes a 2026-07-11 correction (2026-07-11):** the earlier
 > pass placed identity ownership *inside* RFC-024 §3.1, which created exactly
@@ -385,46 +472,62 @@ identity and break replay idempotence.
 
 ### BLOCKER-08 — retention activation cannot precede migration selection
 
-**Affected:** [RFC-025 §8](../rfcs/rfc-025-checkpoint-retention.md#8-migration-and-compatibility)
-and [§11](../rfcs/rfc-025-checkpoint-retention.md#11-phasing)
+**Affected:** [RFC-025 §8](../rfcs/0025-checkpoint-retention.md#8-format-activation-and-rebuild-compatibility)
+and [§11](../rfcs/0025-checkpoint-retention.md#11-phasing)
 
-RFC-025 leaves in-place migration versus export/import undecided. Its phase
-table nevertheless puts “format activation” in Phase A and “selected migration
-path” in Phase D. Activation cannot be implemented or reviewed before the
-upgrade contract is known.
+**Status:** Closed in specification on 2026-07-14; rebuild implementation and
+cross-version evidence remain RFC-025 acceptance gates.
 
-**Required disposition:** select the migration before Phase A, then specify
-quiescence, partial-state refusal, main-stamp ordering, branch coverage, crash
-recovery, and later capability preservation. If export/import is selected,
-state the irreversible loss of branches, commit DAG, snapshots, and historical
-checkpoints as part of the acceptance decision.
+The reviewed draft left in-place migration versus export/import undecided while
+putting format activation before migration selection.
+
+**Disposition:** RFC-025 §8 selects strict export/init/load rebuild before Phase
+A, defines old/new-format refusal and co-release ordering, and names the loss of
+branches not separately rebuilt, commit DAG, snapshots, tombstones, recovery
+history, time travel, and historical checkpoints. Its phasing now puts the
+format/refusal/rebuild contract in Phase A.
 
 ### BLOCKER-09 — decide whether these are public or internal RFCs
 
-**Affected:** [public RFC process](../rfcs/README.md), RFC-022 through RFC-027
+**Affected:** [RFC process](../rfcs/README.md), RFC-022 through RFC-028
 
-The files currently live in the public RFC track but use internal-style
-`rfc-022-*` names, noncanonical `draft`/`research-blocked` statuses, and empty
-owner metadata. In the public process, merging an RFC is acceptance; a merged
-public RFC cannot simultaneously retain undispositioned acceptance blockers.
+**Status:** Closed in process and documentation on 2026-07-13.
 
-**Required disposition:** choose the track before merge:
+At review time the files lived in a directory defined exclusively as the public
+track, while using internal-style `rfc-022-*` names, `draft` and
+`research-blocked` statuses, and empty owner metadata. That made merge mean both
+“accepted” and “still under review.”
 
-- for the public track, rename to `NNNN-title.md`, use `Status: Proposed`, fill
-  the template's author/discussion/implementation metadata, and resolve every
-  blocker before the RFC PR merges; or
-- move the proposals to `docs/dev/` and follow the maintainer-internal process,
-  leaving the public RFC directory for externally authorable accepted records.
+**Disposition:** keep formal RFCs together in `docs/rfcs/` and use one
+four-digit `NNNN-title.md` namespace. The filename identifies the RFC; explicit
+metadata selects its lifecycle:
 
-RFC-027 may state “research-blocked” prominently as its technical state while
-retaining the public lifecycle status `Proposed`.
+- `Author track: Public contribution` uses the public template and status
+  vocabulary. Anyone may author it, and merge means maintainer acceptance.
+- `Author track: Maintainer design series` permits `draft`,
+  `research-blocked`, `accepted`, `implemented`, and `superseded` as
+  machine-readable statuses. A merged revision is durable review state, not
+  automatic acceptance.
+- Every RFC declares an explicit status. If YAML frontmatter and rendered
+  metadata are both present, they agree.
 
-> 💬 **Concur (2026-07-11):** same recommendation as the original family
-> review — these are maintainer-internal proposals mid-revision; `docs/dev/`
-> with the internal process is the low-friction disposition, keeping
-> `docs/rfcs/` for its defined merge-equals-acceptance lifecycle. Whichever
-> track is chosen, decide it before any of the set merges, since it defines
-> what "dispositioned before acceptance" means for every other finding here.
+RFC-022 through RFC-028 now identify the maintainer design-series track and an
+owner. RFC-022 is `implemented` at its documented support boundary, RFC-023
+through RFC-026 and RFC-028 remain `draft`, and RFC-027 remains
+`research-blocked`.
+All formal RFC filenames in the central directory are normalized to four
+digits. Legacy `docs/dev/rfc-00N-*` files remain in place with their existing
+lifecycle; they are internal design and implementation records, not members of
+the formal RFC filename namespace.
+
+> 📝 **Historical review record (2026-07-11):** the original disposition offered
+> two choices under the then-current process: normalize the files into the
+> public track and resolve every blocker before merge, or move the in-flight
+> series to `docs/dev/`. The reviewer recommended the latter as the
+> lower-friction choice. Maintainers instead selected a third option: keep one
+> RFC directory, distinguish lifecycles through explicit `Author track` and
+> `Status` metadata, and normalize every formal filename to four digits. The
+> public merge-equals-acceptance rule was preserved rather than weakened.
 
 > ✅ **RFC-022 implementation close-out (2026-07-13):** every currently
 > supported graph-write surface is enrolled in an exact adapter, the bounded
@@ -437,15 +540,17 @@ retaining the public lifecycle status `Proposed`.
 > surfaces, crate-visible low-level coordinator methods, and exact per-file
 > occurrences of registered durable-call shapes including recovery. Exact Optimize
 > provenance is intentionally deferred until both a stable public Lance
-> maintenance-transaction API and distributed recovery fencing exist. This
-> closes RFC-022's structural rollout work; it does **not** close BLOCKER-09 or
-> change the RFC's public lifecycle status.
+> maintenance-transaction API and distributed recovery fencing exist. Together
+> with the lifecycle disposition above, this closes RFC-022 and marks it
+> implemented at the documented single-writer-process support boundary. It does
+> not claim distributed destructive recovery or make exact Optimize provenance
+> a rollout gate.
 
 ## Protocol clarifications
 
 ### BLOCKER-10 — do not put foreign-branch facts in an atomic `ReadSet`
 
-**Affected:** [RFC-022 §6.2](../rfcs/rfc-022-unified-write-path.md#62-branch-merge)
+**Affected:** [RFC-022 §6.2](../rfcs/0022-unified-write-path.md#62-branch-merge)
 
 **Status:** Closed in specification and implementation on 2026-07-11. Branch
 merge captures an immutable source commit and revalidates only its incarnation;
@@ -479,12 +584,16 @@ Keep target-branch values that must remain stable in the atomic `ReadSet`.
 
 ### BLOCKER-11 — RFC-022 and no-heads MemWAL need coarse OCC
 
-**Affected:** [RFC-022 §10](../rfcs/rfc-022-unified-write-path.md#10-rollout-and-compatibility)
-and [RFC-026 §6](../rfcs/rfc-026-memwal-streaming-ingest.md#6-fold-protocol)
+**Affected:** [RFC-022 §10](../rfcs/0022-unified-write-path.md#10-rollout-and-compatibility)
+and [RFC-026 §6](../rfcs/0026-memwal-streaming-ingest.md#6-fold-protocol)
 
-[RFC-022's rollout](../rfcs/rfc-022-unified-write-path.md#10-rollout-and-compatibility)
-currently says mutation/load read-set arbitration is likely blocked on
-RFC-024 because probed-but-untouched tables lack mutable head rows.
+**Status:** RFC-022 is closed in the shipped adapter. RFC-026 is closed in
+specification on 2026-07-14; its no-heads concurrency/failpoint evidence remains
+an acceptance gate.
+
+[RFC-022's rollout](../rfcs/0022-unified-write-path.md#10-rollout-and-compatibility)
+said at review time that mutation/load read-set arbitration was likely blocked
+on RFC-024 because probed-but-untouched tables lacked mutable head rows.
 
 For graph-content writes, `(branch incarnation, optional graph head)` is already
 a conservative branch-wide authority token. An established branch changes its
@@ -523,6 +632,14 @@ performance.
 > on agent-fleet branches, and precisely the honest motivation for RFC-024's
 > later narrowing (rather than a correctness argument for it).
 
+**Disposition:** shipped RFC-022 mutation/load and BranchMerge retain their
+documented coarse branch/schema authority. RFC-026 §6 now captures
+`(native branch incarnation, optional graph_head)` plus schema identity and the
+complete stream/probe cut, and requires every publisher retry to return to full
+fold revalidation on a change rather than reparenting. Its acceptance suite
+races a concurrent commit on a probed-but-untouched table and requires that
+revalidation without RFC-024.
+
 > **Implementation disposition (2026-07-11):** mutation/load now capture the
 > native Lance `BranchIdentifier`, exact optional `graph_head`, and accepted
 > schema identity; revalidate under a branch-then-table gate; and pass the same
@@ -541,7 +658,37 @@ performance.
 > advance after effects becomes `RecoveryRequired` and is compensated rather
 > than re-parented.
 
+### BLOCKER-12 — in-place format conversion contradicted the strand model
+
+**Affected:** [RFC-023 §7–8](../rfcs/0023-key-conflict-fencing.md#7-format-boundary-and-rebuild-cutover),
+[RFC-024 §9–11](../rfcs/0024-durable-table-heads.md#9-heads-format-boundary-and-compatibility),
+[RFC-025 §8](../rfcs/0025-checkpoint-retention.md#8-format-activation-and-rebuild-compatibility),
+[RFC-026 §11](../rfcs/0026-memwal-streaming-ingest.md#11-format-activation-and-rebuild),
+and [RFC-028 §8](../rfcs/0028-stable-schema-identity.md#8-format-activation-and-upgrade)
+
+**Status:** Closed in specification on 2026-07-14; each format still requires
+its own implementation and genuine old/new-binary evidence before acceptance.
+
+The reviewed RFC-023 and RFC-024 drafts designed all-branch, in-place conversion
+protocols even though OmniGraph's strict-single-version strand intentionally has
+no migration dispatcher or compatibility reader. That would create permanent
+claims, ledgers, crash recovery, and branch traversal solely to preserve a
+transition model the project had already rejected.
+
+**Disposition:** RFC-023 through RFC-026 and RFC-028 now use one rule. A format
+capability is complete at new-graph initialization; old and new binaries refuse
+the opposite format; an existing graph moves by quiescing, exporting current
+logical state with the old binary, initializing a different root with the new
+binary, and loading through RFC-022. No source graph is mutated in place.
+Capabilities may co-release to reduce cutovers only after independent
+acceptance and a combined initialization/recovery matrix. The rebuild's loss of
+unselected branches and history is explicit rather than hidden behind the word
+“migration.”
+
 ### TIGHTENING-01 — symmetric Lance conflicts are not obviously an activation gate
+
+**Status:** the deciding beta.21 substrate check is closed; the production
+routing and activation dispositions remain open.
 
 RFC-023 correctly identifies Lance's directional filtered/unfiltered behavior.
 However, its own mandatory fleet outage, recovery drain, historical-duplicate
@@ -570,27 +717,40 @@ protected by symmetry in either case.
 > sound. That is a one-test question against the pinned revision and should be
 > pinned as a surface guard before the demotion is accepted.
 
+> 🧪 **Beta.21 evidence (2026-07-14):** with `use_index(false)`, the matched-only
+> partial-schema UpdateAll + DoNothing shape emits `Some` with a semantically
+> empty Bloom filter, not `None`. That closes the narrow substrate question in
+> favor of a possible demotion. It does **not** close activation: the
+> scalar-indexed/default-v1 path still emits `None`, keyed Append remains
+> reachable in today's engine, and beta.21 still permits unfiltered Update or
+> Append to land second after a filtered Update. TIGHTENING-01 remains open
+> until the engine proves every insertion-bearing keyed path is filtered,
+> structurally forbids keyed Append, and proves any remaining unfiltered update
+> cannot insert or alter `id`. Upstream symmetry is defense in depth only after
+> that proof.
+
 ## Specification and acceptance tightening
 
 These are smaller than the blockers above, but should be resolved before the
-RFC set is merged:
+affected RFC is accepted or implemented:
 
 1. **Checkpoint-name normalization:** define allowed bytes, Unicode
    normalization, case sensitivity, maximum encoded length, reserved prefixes,
    and normalization-version compatibility. Test collisions and reuse across
    versions.
-2. **RFC lifecycle values:** [`docs/rfcs/README.md`](../rfcs/README.md#status-values)
-   defines `Proposed`, `Accepted`, `Declined`, `Superseded by NNNN`, and
-   `Implemented`. Either use those values or amend the process before using
-   `draft` and `research-blocked` as machine-readable statuses. Research-blocked
-   can remain prominent in RFC-027's body while its lifecycle status is
-   `Proposed`.
-3. **Provisional version naming:** sibling RFCs should say “RFC-024 heads
-   format” rather than treating `v5` as permanent while RFC-024 says the numeral
-   will change if another format lands first.
-4. **Capability ordering:** RFC-025 must specify retention-first, heads-first,
-   and co-release preservation rules. RFC-026 is a conditional dependency when
-   streams are enrolled because cleanup must persistently quiesce them.
+2. **RFC lifecycle values (closed 2026-07-13):**
+   [`docs/rfcs/README.md`](../rfcs/README.md) now uses one four-digit filename
+   namespace and distinguishes the public contribution lifecycle from the
+   maintainer design-series lifecycle through explicit `Author track` and
+   `Status` metadata. `draft` and `research-blocked` are valid only in the
+   latter; public merge remains acceptance.
+3. **Provisional version naming (closed 2026-07-14):** RFC-024 now says “heads
+   format”; RFC-028 provisionally takes the next number while explicitly
+   allowing the numeral to move. No sibling treats `v5` as permanent.
+4. **Capability ordering (closed in specification 2026-07-14):** RFC-025 and
+   RFC-026 define independent-release rebuilds and combined initialization /
+   recovery gates for co-release. Cleanup continues to require persistent
+   quiescence whenever streams are enrolled.
 5. **Memory measurement:** `helpers::cost` measures I/O, not peak RSS. RFC-023's
    adopted-merge and RFC-027's lineage memory gates should use the subprocess
    `scenarios.rs` harness or an equivalent `wait4`/`ru_maxrss` instrument and
@@ -609,26 +769,28 @@ RFC set is merged:
 
 The review does not require all RFCs to land together. A safe order is:
 
-1. accept RFC-022 after branch-control recovery, coarse `graph_head` OCC, and
-   foreign-branch fact classification are explicit (all three are now
-   dispositioned; the public lifecycle decision in BLOCKER-09 still governs
-   what “accepted” means);
-2. accept and land the stable identity RFC/capability;
-3. accept RFC-023 once partial-effect retry and its format/fleet barrier are
-   complete;
+1. RFC-022 is implemented at the documented single-writer-process boundary;
+   branch-control recovery, coarse `graph_head` OCC, foreign-branch fact
+   classification, writer-surface closure, and lifecycle are dispositioned;
+2. accept and land RFC-028's stable identity capability;
+3. accept RFC-023 once partial-effect retry and its format/fleet implementation
+   and evidence are complete;
 4. evaluate RFC-024 independently on its physical lookup cost gate;
 5. accept RFC-025 after physical protection of both checkpoints and live graph
-   branches plus a selected upgrade path;
-6. accept RFC-026 after its capability barrier and writer-ownership scope are
-   explicit;
+   branches plus strict-rebuild implementation evidence;
+6. accept RFC-026 only after Lance exposes the public exact-enrollment and
+   admission-seal surface, then its capability/refusal/rebuild, multi-effect
+   recovery, and writer-ownership evidence match the specified scope;
 7. keep RFC-027 in research until deletion-delta discovery passes its stated
    correctness and flat-cost gates.
 
 This ordering preserves the split's main benefit: a blocked performance
 optimization or research result does not hold correctness work hostage.
 
-> 💬 **Order update (2026-07-11):** BLOCKER-04's shipped-cleanup prerequisite is
-> now complete and RFC-025 §6 incorporates its floor. Step 3's TIGHTENING-01
-> demotion still hinges on the partial-update filter check
-> noted there; if that check lands `None`, upstream symmetry returns to the
-> activation gate and RFC-023's timeline moves accordingly.
+> 💬 **Order update (2026-07-14):** BLOCKER-04's shipped-cleanup prerequisite is
+> complete and RFC-025 §6 incorporates its floor. TIGHTENING-01's beta.21 check
+> landed `Some(empty)`, so an upstream symmetry change may be demoted after the
+> engine routing proof. Step 3 remains blocked on that proof, RFC-023's
+> partial-effect recovery implementation evidence, stable identity, the cost
+> gates, and its format/fleet barrier; the substrate result alone does not move
+> acceptance.

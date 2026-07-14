@@ -197,6 +197,21 @@ Behavior-affecting findings in this audit:
   maintenance-transaction API and OmniGraph has distributed recovery fencing;
   the latter is independently required before destructive recovery is safe
   against a live foreign process.
+- **RFC-023 key-filter behavior remains route-dependent and directional.** A
+  2026-07-14 follow-up probe on this same beta.21 pin shows that an explicitly
+  selected v2 merge plan (`use_index(false)`) over the exact unenforced PK emits
+  `Some(KeyExistenceFilter)`: a fresh insert and fresh-key
+  `WhenMatched::Fail` populate the Bloom filter, while a matched-only
+  partial-schema UpdateAll + DoNothing emits a semantically empty filter rather
+  than `None`. A mismatched ON set emits `None`; when all ON columns have scalar
+  indexes and `use_index` remains enabled, Lance selects legacy v1, which also
+  emits `None`. Conflict resolution is still directional: filtered-current
+  conflicts with committed unfiltered Update or Append, but current unfiltered
+  Update or Append can rebase after a committed filtered Update. The RFC-023
+  guards pin both orders so a future symmetry fix forces an alignment audit.
+  This is substrate evidence only: OmniGraph has not changed production
+  routing, removed keyed Append, installed PK metadata graph-wide, or crossed a
+  fencing-compatible fleet/format barrier.
 - **Index construction gained correctness and bounded-resource fixes:** beta.17
   prevents an FTS builder thread-pool deadlock and bounds tail-partition merge
   memory; beta.18 fixes a streaming IVF training hang; beta.19 caps nullable
@@ -240,9 +255,11 @@ Behavior-affecting findings in this audit:
   improving the warm-access shape without changing branch identity or commit
   semantics.
 
-The existing Lance surface guards plus the canonical workspace and failpoint
-suites are the compatibility gate for this pin. Keep the beta.15 audit below as
-historical provenance for the larger 7.0 → 9.0 migration.
+The Lance surface guards, including the RFC-023 route and conflict-order probes,
+plus the canonical workspace and failpoint suites are the compatibility gate
+for this pin. Keep the beta.15 audit below as historical provenance for the
+larger 7.0 → 9.0 migration. A substrate guard records current Lance truth; it
+does not by itself satisfy an RFC activation gate.
 
 ### Prior alignment audit: 2026-07-05 (Lance 9.0.0-beta.15 upstream; omnigraph pinned at 9.0.0-beta.15 via git rev)
 
