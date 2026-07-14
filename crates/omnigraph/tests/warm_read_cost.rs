@@ -453,6 +453,7 @@ async fn recreated_branch_owned_table_handle_uses_table_etag() {
 /// topology is never stale regardless of path.
 #[tokio::test]
 async fn recreated_branch_traversal_uses_graph_index_incarnation() {
+    cost_harness(async {
     let dir = tempfile::tempdir().unwrap();
     let mut writer = init_and_load(&dir).await;
     let uri = dir.path().to_str().unwrap();
@@ -556,6 +557,8 @@ async fn recreated_branch_traversal_uses_graph_index_incarnation() {
         Vec::<String>::new(),
         "old branch topology must not leak after branch recreation"
     );
+    })
+    .await;
 }
 
 /// When an external writer advances the manifest, the reader's next query takes

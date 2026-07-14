@@ -49,6 +49,22 @@ fn build_test_catalog() -> Catalog {
     build_catalog_from_ir(&schema_ir).unwrap()
 }
 
+fn build_same_name_node_edge_catalog() -> Catalog {
+    let schema = parse_schema(
+        r#"
+node Link {
+    name: String @key
+}
+edge Link: Link -> Link
+"#,
+    )
+    .unwrap();
+    let shape = compile_schema_shape(&schema).unwrap();
+    let domain = SchemaIdentityDomain::parse("01ARZ3NDEKTSV4RRFFQ69G5FAW").unwrap();
+    let schema_ir = initialize_schema_ir(domain, &shape).unwrap().schema_ir;
+    build_catalog_from_ir(&schema_ir).unwrap()
+}
+
 fn entity_batch(
     schema: Arc<Schema>,
     id: impl Into<String>,
@@ -98,6 +114,25 @@ fn table_identity_rejects_zero_and_drives_paths_and_object_ids() {
         super::layout::tombstone_object_id(identity, 4),
         "table_tombstone:000000000000002a:0000000000000007:00000000000000000004"
     );
+}
+
+#[tokio::test]
+async fn historical_alias_binding_keeps_same_name_node_and_edge_identities_distinct() {
+    let dir = tempfile::tempdir().unwrap();
+    let uri = dir.path().to_str().unwrap();
+    let catalog = build_same_name_node_edge_catalog();
+    let mut snapshot = ManifestCoordinator::init(uri, &catalog)
+        .await
+        .unwrap()
+        .snapshot();
+    let node_identity = snapshot.entry("node:Link").unwrap().identity;
+    let edge_identity = snapshot.entry("edge:Link").unwrap().identity;
+    assert_ne!(node_identity, edge_identity);
+
+    snapshot.bind_catalog_aliases(&catalog).unwrap();
+
+    assert_eq!(snapshot.entry("node:Link").unwrap().identity, node_identity);
+    assert_eq!(snapshot.entry("edge:Link").unwrap().identity, edge_identity);
 }
 
 #[tokio::test]

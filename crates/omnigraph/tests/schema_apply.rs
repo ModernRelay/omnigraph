@@ -962,6 +962,65 @@ edge WorksAt: Human -> Company
 
 #[tokio::test]
 #[cfg_attr(feature = "failpoints", serial_test::parallel)]
+async fn apply_schema_rename_and_hard_property_drop_cleans_source_incarnation() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = init_and_load(&dir).await;
+    let before_snapshot = db.snapshot_of(ReadTarget::branch("main")).await.unwrap();
+    let before_manifest_version = before_snapshot.version();
+    let before = before_snapshot.entry("node:Person").unwrap().clone();
+
+    let desired = r#"
+node Human @rename_from("Person") {
+    name: String @key
+}
+
+node Company {
+    name: String @key
+}
+
+edge Knows: Human -> Human {
+    since: Date?
+}
+
+edge WorksAt: Human -> Company
+"#;
+    let result = db
+        .apply_schema_with_options(
+            desired,
+            omnigraph::db::SchemaApplyOptions {
+                allow_data_loss: true,
+            },
+        )
+        .await
+        .unwrap();
+    assert!(result.applied);
+    assert!(result.steps.iter().any(|step| matches!(
+        step,
+        SchemaMigrationStep::DropProperty {
+            type_name,
+            mode: omnigraph_compiler::DropMode::Hard,
+            ..
+        } if type_name == "Human"
+    )));
+
+    let after_snapshot = db.snapshot_of(ReadTarget::branch("main")).await.unwrap();
+    let after = after_snapshot.entry("node:Human").unwrap();
+    assert_eq!(after.table_path, before.table_path);
+    assert!(after.table_version > before.table_version);
+    assert!(after_snapshot.entry("node:Person").is_none());
+    assert!(
+        db.snapshot_at_version(before_manifest_version)
+            .await
+            .unwrap()
+            .open("node:Person")
+            .await
+            .is_err(),
+        "hard cleanup must reclaim the renamed source incarnation's prior version"
+    );
+}
+
+#[tokio::test]
+#[cfg_attr(feature = "failpoints", serial_test::parallel)]
 async fn apply_schema_renames_node_type_via_rename_from_and_preserves_rows() {
     // Covers the stable-type-id contract: renaming a type preserves the
     // underlying Lance dataset (by stable id), so existing rows survive the

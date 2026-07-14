@@ -330,7 +330,7 @@ impl Omnigraph {
         // class: there is no longer a code path where strict-mode
         // `init` can mutate a populated graph root.
         if options.force {
-            refuse_force_init_over_existing_manifest(&root).await?;
+            refuse_force_init_over_existing_manifest(&root, storage.as_ref()).await?;
         } else {
             for candidate in [
                 schema_source_uri(&root),
@@ -1699,14 +1699,17 @@ impl Omnigraph {
     ) -> Result<(ResolvedTarget, Arc<Catalog>)> {
         let target = target.into();
         let validate_live_snapshot = matches!(&target, ReadTarget::Branch(_));
+        let bind_historical_aliases = matches!(&target, ReadTarget::Snapshot(_));
         let _schema_guard = self
             .write_queue()
             .acquire(&crate::db::manifest::schema_apply_serial_queue_key())
             .await;
         let catalog = self.build_accepted_catalog_with_schema_gate_held().await?;
-        let resolved = self.resolve_target_after_schema_validation(target).await?;
+        let mut resolved = self.resolve_target_after_schema_validation(target).await?;
         if validate_live_snapshot {
             validate_bound_catalog_against_snapshot(&catalog, &resolved.snapshot)?;
+        } else if bind_historical_aliases {
+            resolved.snapshot.bind_catalog_aliases(&catalog)?;
         }
         Ok((resolved, catalog))
     }
@@ -1746,12 +1749,13 @@ impl Omnigraph {
             .await
             .current_branch()
             .map(str::to_string);
-        let snapshot = crate::db::manifest::ManifestCoordinator::snapshot_at(
+        let mut snapshot = crate::db::manifest::ManifestCoordinator::snapshot_at(
             self.uri(),
             branch.as_deref(),
             version,
         )
         .await?;
+        snapshot.bind_catalog_aliases(&catalog)?;
         Ok((snapshot, catalog))
     }
 
@@ -2490,6 +2494,7 @@ impl Omnigraph {
     pub(crate) async fn fork_dataset_from_entry_state(
         &self,
         table_key: &str,
+        identity: crate::db::manifest::TableIdentity,
         full_path: &str,
         source_branch: Option<&str>,
         source_version: u64,
@@ -2497,6 +2502,7 @@ impl Omnigraph {
     ) -> Result<SnapshotHandle> {
         self.fork_dataset_from_entry_state_under_intent(
             table_key,
+            identity,
             full_path,
             source_branch,
             source_version,
@@ -2509,6 +2515,7 @@ impl Omnigraph {
     pub(crate) async fn fork_dataset_from_entry_state_under_intent(
         &self,
         table_key: &str,
+        identity: crate::db::manifest::TableIdentity,
         full_path: &str,
         source_branch: Option<&str>,
         source_version: u64,
@@ -2530,6 +2537,7 @@ impl Omnigraph {
                 table_ops::reclaim_orphaned_fork_and_refork(
                     self,
                     table_key,
+                    identity,
                     full_path,
                     source_branch,
                     source_version,
@@ -2807,14 +2815,17 @@ fn read_schema_shape_from_source(schema_source: &str) -> Result<SchemaShape> {
 /// `--force` may replace orphan schema files, but it must never mint a new
 /// identity domain over an existing source-of-truth manifest. Reusing the root
 /// would make old rows appear to belong to unrelated freshly allocated IDs.
-async fn refuse_force_init_over_existing_manifest(root: &str) -> Result<()> {
+async fn refuse_force_init_over_existing_manifest(
+    root: &str,
+    storage: &dyn StorageAdapter,
+) -> Result<()> {
     let manifest_uri = crate::db::manifest::manifest_uri(root);
-    match Dataset::open(&manifest_uri).await {
-        Ok(_) => Err(OmniError::manifest_conflict(format!(
+    if storage.exists(&manifest_uri).await? {
+        Err(OmniError::manifest_conflict(format!(
             "force init refuses graph root '{root}' because an existing __manifest would be rebound to a newly minted schema identity domain; initialize an empty root instead"
-        ))),
-        Err(lance::Error::DatasetNotFound { .. } | lance::Error::NotFound { .. }) => Ok(()),
-        Err(error) => Err(OmniError::Lance(error.to_string())),
+        )))
+    } else {
+        Ok(())
     }
 }
 

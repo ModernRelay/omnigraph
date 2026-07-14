@@ -30,7 +30,8 @@ enum CandidateTableState {
 ///
 /// The handle is carried through Phase A and consumed by the physical effect so
 /// the post-arm path cannot reopen a different HEAD. First-touch refs never
-/// construct this value: their target ref is created only after the v4 recovery
+/// construct this value: their target ref is created only after the v9 recovery
+/// envelope (whose retained merge payload field is `protocol_v4`)
 /// sidecar is durable.
 #[derive(Debug)]
 struct PreparedExistingMergeTarget {
@@ -596,10 +597,70 @@ fn same_manifest_state(
 ) -> bool {
     match (left, right) {
         (Some(left), Some(right)) => {
-            left.table_version == right.table_version && left.table_branch == right.table_branch
+            left.identity == right.identity
+                && left.table_version == right.table_version
+                && left.table_branch == right.table_branch
         }
         (None, None) => true,
         _ => false,
+    }
+}
+
+fn ensure_merge_identity_compatible(
+    table_key: &str,
+    base: Option<crate::db::manifest::TableIdentity>,
+    source: Option<crate::db::manifest::TableIdentity>,
+    target: Option<crate::db::manifest::TableIdentity>,
+) -> Result<()> {
+    let mut observed = None;
+    for candidate_identity in [base, source, target].into_iter().flatten() {
+        if let Some(observed_identity) = observed {
+            if candidate_identity != observed_identity {
+                return Err(OmniError::manifest_read_set_changed(
+                    format!("branch_merge_table_identity:{table_key}"),
+                    Some(observed_identity.to_string()),
+                    Some(candidate_identity.to_string()),
+                ));
+            }
+        } else {
+            observed = Some(candidate_identity);
+        }
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+mod table_identity_tests {
+    use super::ensure_merge_identity_compatible;
+    use crate::db::manifest::TableIdentity;
+
+    #[test]
+    fn merge_identity_guard_includes_base_and_allows_absence() {
+        let old = TableIdentity::new(1, 1).unwrap();
+        let replacement = TableIdentity::new(2, 2).unwrap();
+
+        let error = ensure_merge_identity_compatible(
+            "node:Person",
+            Some(old),
+            Some(replacement),
+            Some(replacement),
+        )
+        .unwrap_err();
+        assert!(error.is_read_set_changed());
+
+        assert!(
+            ensure_merge_identity_compatible("node:Person", Some(old), None, Some(old)).is_ok(),
+            "absence is a row-lifecycle change, not a different table lifetime"
+        );
+        assert!(
+            ensure_merge_identity_compatible(
+                "node:Person",
+                None,
+                Some(replacement),
+                Some(replacement),
+            )
+            .is_ok()
+        );
     }
 }
 
@@ -816,6 +877,12 @@ async fn classify_adopt(
         });
     };
     let target_entry = target_snapshot.entry(table_key);
+    ensure_merge_identity_compatible(
+        table_key,
+        base_snapshot.entry(table_key).map(|entry| entry.identity),
+        Some(source_entry.identity),
+        target_entry.map(|entry| entry.identity),
+    )?;
     let target_active = target_db.active_branch().await;
     let advances_head = match (
         target_active.as_deref(),
@@ -861,6 +928,13 @@ async fn publish_adopted_source_state(
         .entry(table_key)
         .ok_or_else(|| OmniError::manifest(format!("missing source entry for {}", table_key)))?;
     let target_entry = target_snapshot.entry(table_key);
+    ensure_merge_identity_compatible(
+        table_key,
+        None,
+        Some(source_entry.identity),
+        target_entry.map(|entry| entry.identity),
+    )?;
+    let identity = source_entry.identity;
 
     let target_active = target_db.active_branch().await;
     match (
@@ -869,6 +943,7 @@ async fn publish_adopted_source_state(
     ) {
         // Both on main — pointer switch is safe (same lineage, version columns valid)
         (None, None) => Ok(crate::db::SubTableUpdate {
+            identity,
             table_key: table_key.to_string(),
             table_version: source_entry.table_version,
             table_branch: None,
@@ -878,6 +953,7 @@ async fn publish_adopted_source_state(
         // Source on main, target on branch — pointer switch to main version
         // (target reads from main, same lineage)
         (Some(_target_branch), None) => Ok(crate::db::SubTableUpdate {
+            identity,
             table_key: table_key.to_string(),
             table_version: source_entry.table_version,
             table_branch: None,
@@ -887,6 +963,7 @@ async fn publish_adopted_source_state(
         // Source on branch, target on main, empty delta — adopt source's
         // version by a pointer switch (the non-empty case is `AdoptWithDelta`).
         (None, Some(_source_branch)) => Ok(crate::db::SubTableUpdate {
+            identity,
             table_key: table_key.to_string(),
             table_version: target_entry
                 .map(|e| e.table_version)
@@ -903,6 +980,7 @@ async fn publish_adopted_source_state(
                 // Target already owns this table, empty delta — pointer switch
                 // onto its own lineage (the non-empty case is `AdoptWithDelta`).
                 Ok(crate::db::SubTableUpdate {
+                    identity,
                     table_key: table_key.to_string(),
                     table_version: target_entry.unwrap().table_version,
                     table_branch: Some(target_branch.to_string()),
@@ -916,6 +994,7 @@ async fn publish_adopted_source_state(
                 let ds = target_db
                     .fork_dataset_from_entry_state(
                         table_key,
+                        source_entry.identity,
                         &full_path,
                         Some(source_branch),
                         source_entry.table_version,
@@ -924,6 +1003,7 @@ async fn publish_adopted_source_state(
                     .await?;
                 let state = target_db.storage().table_state(&full_path, &ds).await?;
                 Ok(crate::db::SubTableUpdate {
+                    identity,
                     table_key: table_key.to_string(),
                     table_version: state.version,
                     table_branch: Some(target_branch.to_string()),
@@ -1007,6 +1087,7 @@ async fn commit_exact_merge_stage(
 async fn publish_rewritten_merge_table(
     target_db: &Omnigraph,
     table_key: &str,
+    identity: crate::db::manifest::TableIdentity,
     staged: &StagedMergeResult,
     prepared_target: Option<PreparedExistingMergeTarget>,
     planned_transactions: &[crate::table_store::StagedTransactionIdentity],
@@ -1132,7 +1213,7 @@ async fn publish_rewritten_merge_table(
     // `build_indices_on_dataset` stages every missing BTREE/FTS/vector artifact
     // into one table-level `CreateIndex` tail transaction. This rebuildable
     // derived-state tail is not part of the merge's logical pre-minted data
-    // chain; Armed v4 recovery accepts it only after that complete exact chain
+    // chain; Armed v9 recovery accepts it only after that complete exact chain
     // and discards it with a rollback.
     let row_count = target_db
         .storage()
@@ -1150,6 +1231,7 @@ async fn publish_rewritten_merge_table(
         .await?;
 
     Ok(crate::db::SubTableUpdate {
+        identity,
         table_key: table_key.to_string(),
         table_version: final_state.version,
         table_branch,
@@ -1204,6 +1286,7 @@ async fn scan_staged_combined(
 async fn publish_adopted_delta(
     target_db: &Omnigraph,
     table_key: &str,
+    identity: crate::db::manifest::TableIdentity,
     delta: &AdoptDelta,
     prepared_target: Option<PreparedExistingMergeTarget>,
     planned_transactions: &[crate::table_store::StagedTransactionIdentity],
@@ -1338,6 +1421,7 @@ async fn publish_adopted_delta(
         .await?;
 
     Ok(crate::db::SubTableUpdate {
+        identity,
         table_key: table_key.to_string(),
         table_version: final_state.version,
         table_branch,
@@ -1582,6 +1666,17 @@ impl Omnigraph {
             if same_manifest_state(base_entry, source_entry) {
                 continue;
             }
+            // A branch may still point at a dropped incarnation while another
+            // branch has the replacement under the same public alias. Row
+            // merging across those physical lifetimes would silently adopt
+            // stale data, so only the unchanged-source fast path above may
+            // ignore the mismatch.
+            ensure_merge_identity_compatible(
+                table_key,
+                base_entry.map(|entry| entry.identity),
+                source_entry.map(|entry| entry.identity),
+                target_entry.map(|entry| entry.identity),
+            )?;
             if same_manifest_state(base_entry, target_entry) {
                 let candidate = classify_adopt(
                     self,
@@ -1694,43 +1789,55 @@ impl Omnigraph {
                 ),
             ));
         }
-        if live_source.authority.schema_ir_hash != source_txn.authority.schema_ir_hash
+        if live_source.authority.schema_identity_domain
+            != source_txn.authority.schema_identity_domain
+            || live_source.authority.schema_ir_hash != source_txn.authority.schema_ir_hash
             || live_source.authority.schema_identity_version
                 != source_txn.authority.schema_identity_version
         {
             return Err(OmniError::manifest_read_set_changed(
                 "branch_merge_source_schema".to_string(),
                 Some(format!(
-                    "{}:{}",
+                    "{}:{}:{}",
+                    source_txn.authority.schema_identity_domain,
                     source_txn.authority.schema_identity_version,
                     source_txn.authority.schema_ir_hash
                 )),
                 Some(format!(
-                    "{}:{}",
+                    "{}:{}:{}",
+                    live_source.authority.schema_identity_domain,
                     live_source.authority.schema_identity_version,
                     live_source.authority.schema_ir_hash
                 )),
             ));
         }
 
-        let expected_versions = ordered_table_keys
-            .iter()
-            .map(|table_key| {
-                (
-                    table_key.clone(),
-                    target_snapshot
-                        .entry(table_key)
-                        .map(|entry| entry.table_version)
-                        .unwrap_or(0),
-                )
+        let expected_versions = candidates
+            .keys()
+            .filter_map(|table_key| {
+                let identity = target_snapshot
+                    .entry(table_key)
+                    .or_else(|| source_snapshot.entry(table_key))
+                    .or_else(|| base_snapshot.entry(table_key))?
+                    .identity;
+                Some((
+                    identity,
+                    crate::db::manifest::TableVersionExpectation {
+                        table_key: table_key.clone(),
+                        table_version: target_snapshot
+                            .entry(table_key)
+                            .map(|entry| entry.table_version)
+                            .unwrap_or(0),
+                    },
+                ))
             })
-            .collect::<HashMap<_, _>>();
+            .collect::<crate::db::manifest::ExpectedTableVersions>();
         let mut merge_lineage = self
             .new_lineage_intent_for_branch(target_branch, actor_id)
             .await?;
         merge_lineage.merged_parent_commit_id = Some(source_head_commit_id.to_string());
 
-        // Build the v4 recovery envelope. Physical pins are a subset of the
+        // Build the v9 recovery envelope (`protocol_v4` payload). Physical pins are a subset of the
         // complete intended manifest delta: pointer-only candidates have no
         // pre-authority effect, but must still be replayed if a sibling table's
         // durable effect forces recovery to finish the merge atomically.
@@ -1751,6 +1858,13 @@ impl Omnigraph {
                 ))
             })?;
             let target_entry = target_snapshot.entry(table_key);
+            ensure_merge_identity_compatible(
+                table_key,
+                base_snapshot.entry(table_key).map(|entry| entry.identity),
+                Some(source_entry.identity),
+                target_entry.map(|entry| entry.identity),
+            )?;
+            let identity = source_entry.identity;
             let expected_version = target_entry.map(|entry| entry.table_version).unwrap_or(0);
             let planned_output_branch = match candidate {
                 CandidateTableState::RewriteMerged(_) | CandidateTableState::AdoptWithDelta(_) => {
@@ -1764,6 +1878,7 @@ impl Omnigraph {
                 }
             };
             delta_slots.push(crate::db::manifest::RecoveryTableUpdateSlot {
+                identity,
                 table_key: table_key.clone(),
                 expected_version,
                 table_branch: planned_output_branch,
@@ -1807,6 +1922,7 @@ impl Omnigraph {
                     planned_transactions_by_table
                         .insert(table_key.clone(), planned_transactions.clone());
                     recovery_pins.push(crate::db::manifest::SidecarTablePin {
+                        identity,
                         table_key: table_key.clone(),
                         table_path: self.storage().dataset_uri(&entry.table_path),
                         expected_version,
@@ -1815,6 +1931,7 @@ impl Omnigraph {
                         table_branch: active_branch_for_keys.clone(),
                     });
                     recovery_effects.push(crate::db::manifest::RecoveryBranchMergeEffect {
+                        identity,
                         table_key: table_key.clone(),
                         kind: crate::db::manifest::RecoveryBranchMergeEffectKind::MultiCommitHead {
                             source_fork_version,
@@ -1836,6 +1953,7 @@ impl Omnigraph {
                     }
                     first_touch_effects.insert(table_key.clone());
                     recovery_pins.push(crate::db::manifest::SidecarTablePin {
+                        identity,
                         table_key: table_key.clone(),
                         table_path: self.storage().dataset_uri(&source_entry.table_path),
                         expected_version,
@@ -1844,6 +1962,7 @@ impl Omnigraph {
                         table_branch: Some(target.to_string()),
                     });
                     recovery_effects.push(crate::db::manifest::RecoveryBranchMergeEffect {
+                        identity,
                         table_key: table_key.clone(),
                         kind: crate::db::manifest::RecoveryBranchMergeEffectKind::RefOnlyFork {
                             source_version: source_entry.table_version,
@@ -1891,6 +2010,7 @@ impl Omnigraph {
             let authority = crate::db::manifest::RecoveryAuthorityToken {
                 branch_identifier: target_txn.authority.branch_identifier.clone(),
                 graph_head: target_txn.authority.graph_head.clone(),
+                schema_identity_domain: target_txn.authority.schema_identity_domain.clone(),
                 schema_ir_hash: target_txn.authority.schema_ir_hash.clone(),
                 schema_identity_version: target_txn.authority.schema_identity_version,
             };
@@ -1901,7 +2021,7 @@ impl Omnigraph {
                 merged_parent_commit_id: merge_lineage.merged_parent_commit_id.clone(),
                 created_at: merge_lineage.created_at,
             };
-            let sidecar = crate::db::manifest::new_branch_merge_sidecar(
+            let sidecar = crate::db::manifest::new_branch_merge_sidecar_v9(
                 active_branch_for_keys.clone(),
                 actor_id.map(str::to_string),
                 recovery_pins,
@@ -1911,6 +2031,7 @@ impl Omnigraph {
                 crate::db::manifest::RecoveryManifestDelta {
                     table_updates: delta_slots,
                     registrations: Vec::new(),
+                    renames: Vec::new(),
                     tombstones: Vec::new(),
                 },
             )?;
@@ -1940,6 +2061,14 @@ impl Omnigraph {
                 let Some(candidate_state) = candidates.get(table_key) else {
                     continue;
                 };
+                let identity = source_snapshot
+                    .entry(table_key)
+                    .ok_or_else(|| {
+                        OmniError::manifest_internal(format!(
+                            "branch merge candidate '{table_key}' lost its source identity"
+                        ))
+                    })?
+                    .identity;
                 let prepared_target = match candidate_state {
                     CandidateTableState::RewriteMerged(_)
                     | CandidateTableState::AdoptWithDelta(_) => {
@@ -1971,8 +2100,15 @@ impl Omnigraph {
                                 "branch merge table '{table_key}' lacks its armed transaction chain"
                             ))
                         })?;
-                        publish_adopted_delta(self, table_key, delta, prepared_target, planned)
-                            .await?
+                        publish_adopted_delta(
+                            self,
+                            table_key,
+                            identity,
+                            delta,
+                            prepared_target,
+                            planned,
+                        )
+                        .await?
                     }
                     CandidateTableState::RewriteMerged(staged) => {
                         let planned = planned_transactions_by_table.get(table_key).ok_or_else(|| {
@@ -1983,6 +2119,7 @@ impl Omnigraph {
                         publish_rewritten_merge_table(
                             self,
                             table_key,
+                            identity,
                             staged,
                             prepared_target,
                             planned,
@@ -2012,7 +2149,7 @@ impl Omnigraph {
                         .open_dataset_head(&full_path, Some(target))
                         .await?;
                     confirmed_ref_identifiers.insert(
-                        table_key.clone(),
+                        update.identity,
                         self.storage().branch_identifier(&target_head).await?,
                     );
                 }
@@ -2029,7 +2166,7 @@ impl Omnigraph {
                 crate::failpoints::names::BRANCH_MERGE_POST_EFFECTS_PRE_CONFIRM,
             )?;
             if let Some((sidecar, _)) = recovery.as_mut() {
-                crate::db::manifest::confirm_branch_merge_sidecar_phase_b(
+                crate::db::manifest::confirm_branch_merge_sidecar_v9(
                     self.root_uri(),
                     self.storage_adapter(),
                     sidecar,

@@ -6,8 +6,9 @@
 //!
 //! 1. Each writer that performs a multi-table commit writes a small JSON
 //!    sidecar at `__recovery/{ulid}.json` BEFORE its per-table
-//!    `commit_staged` loop, listing every `(table_key, table_path,
-//!    expected_version, post_commit_pin)` it intends to publish.
+//!    `commit_staged` loop, listing every `(stable_table_id,
+//!    table_incarnation_id, table_key, table_path, expected_version,
+//!    post_commit_pin)` it intends to publish.
 //! 2. After the manifest publish (Phase C) succeeds, the writer deletes
 //!    the sidecar.
 //! 3. If the writer crashes between Phase B begin and Phase C success,
@@ -287,8 +288,9 @@ pub(crate) const SIDECAR_SCHEMA_VERSION: u32 = 9;
 /// The only recovery generation emitted by the manifest-v5 write paths.
 pub(crate) const IDENTITY_AWARE_SIDECAR_SCHEMA_VERSION: u32 = 9;
 
-/// Oldest loose-classification generation retained for test fixtures and
-/// reader dispatch. No active constructor emits it.
+/// Oldest loose-classification generation retained for test fixtures. No
+/// active constructor emits it.
+#[cfg(test)]
 pub(crate) const LEGACY_SIDECAR_SCHEMA_VERSION: u32 = 2;
 
 /// The version at which Phase-B confirmation shipped. A `BranchMerge` sidecar is
@@ -303,6 +305,7 @@ pub(crate) const EXACT_EFFECT_IDENTITY_SCHEMA_VERSION: u32 = 3;
 
 /// Historical Mutation/Load protocol floor. Active writers emit v9 while
 /// retaining the `protocol_v3` payload field name.
+#[cfg(test)]
 pub(crate) const MUTATION_LOAD_SIDECAR_SCHEMA_VERSION: u32 = 3;
 
 /// Historical BranchMerge protocol floor.

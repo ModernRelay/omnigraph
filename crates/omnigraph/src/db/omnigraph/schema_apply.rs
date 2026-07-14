@@ -292,7 +292,25 @@ where
         )
     };
     let mut added_tables = BTreeSet::new();
-    let mut renamed_tables = BTreeMap::new();
+    // Resolve every rename before classifying dependent property steps. The
+    // planner currently emits RenameType first, but correctness must not depend
+    // on step ordering: a same-apply rename + hard property drop still cleans
+    // the source incarnation captured under its old alias.
+    let renamed_tables = plan
+        .steps
+        .iter()
+        .filter_map(|step| match step {
+            SchemaMigrationStep::RenameType {
+                type_kind,
+                from,
+                to,
+            } if !matches!(type_kind, SchemaTypeKind::Interface) => Some((
+                schema_table_key(*type_kind, to),
+                schema_table_key(*type_kind, from),
+            )),
+            _ => None,
+        })
+        .collect::<BTreeMap<_, _>>();
     let mut rewritten_tables = BTreeSet::new();
     let mut dropped_tables = BTreeSet::new();
     // Hard-drop cleanup targets: (table_key, full_dataset_uri).
@@ -329,7 +347,7 @@ where
                 if source_key.starts_with("edge:") {
                     changed_edge_tables = true;
                 }
-                renamed_tables.insert(target_key, source_key);
+                debug_assert_eq!(renamed_tables.get(&target_key), Some(&source_key));
             }
             SchemaMigrationStep::AddProperty {
                 type_kind,
@@ -407,10 +425,11 @@ where
                     changed_edge_tables = true;
                 }
                 if matches!(mode, DropMode::Hard) {
-                    let entry = snapshot.entry(&table_key).ok_or_else(|| {
+                    let source_table_key = renamed_tables.get(&table_key).unwrap_or(&table_key);
+                    let entry = snapshot.entry(source_table_key).ok_or_else(|| {
                         OmniError::manifest(format!(
-                            "missing table '{}' for hard property drop",
-                            table_key
+                            "missing source table '{}' for hard property drop targeting '{}'",
+                            source_table_key, table_key
                         ))
                     })?;
                     let full_uri = format!("{}/{}", db.root_uri, entry.table_path);

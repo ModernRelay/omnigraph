@@ -23,6 +23,10 @@ struct GraphIndexCacheKey {
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 struct GraphIndexTableState {
+    /// Logical table lifetime. This closes local-filesystem same-name
+    /// reincarnation ABA even when Lance version and e_tag are unavailable or
+    /// repeat after drop/re-add.
+    identity: crate::db::manifest::TableIdentity,
     table_key: String,
     table_version: u64,
     table_branch: Option<String>,
@@ -182,6 +186,7 @@ fn graph_index_cache_key(
                 .snapshot
                 .entry(&table_key)
                 .map(|entry| GraphIndexTableState {
+                    identity: entry.identity,
                     table_key,
                     table_version: entry.table_version,
                     table_branch: entry.table_branch.clone(),
@@ -320,6 +325,7 @@ mod tests {
         // a snapshot id — it is the physical edge-table identity set, A1).
         GraphIndexCacheKey {
             edge_tables: vec![GraphIndexTableState {
+                identity: crate::db::manifest::TableIdentity::new(id as u64 + 1, 1).unwrap(),
                 table_key: format!("edge:t{id}"),
                 table_version: 1,
                 table_branch: None,
@@ -339,6 +345,7 @@ mod tests {
     #[test]
     fn endpoint_remap_at_same_physical_identity_splits_cache_key() {
         let base = GraphIndexTableState {
+            identity: crate::db::manifest::TableIdentity::new(1, 2).unwrap(),
             table_key: "edge:Knows".to_string(),
             table_version: 7,
             table_branch: None,

@@ -59,7 +59,7 @@ use crate::error::{OmniError, Result};
 ///   table registration, version, tombstone, fold, OCC, and physical paths are
 ///   keyed by that immutable identity rather than the mutable table alias.
 ///
-/// v1–v3 graphs are not served by this binary (see `MIN_SUPPORTED`); the history
+/// v1–v4 graphs are not served by this binary (see `MIN_SUPPORTED`); the history
 /// is kept for provenance and to document what each stamp value meant.
 pub(crate) const INTERNAL_MANIFEST_SCHEMA_VERSION: u32 = 5;
 
@@ -87,7 +87,7 @@ pub(crate) fn release_for_internal_schema_version(stamp: u32) -> &'static str {
         3 => "0.6.2 to 0.7.2",
         4 => "0.8.x",
         5 => "0.9.x",
-        // Unreachable today (1–4 are mapped; ≥ CURRENT is caught by the ceiling
+        // Unreachable today (1–5 are mapped; > CURRENT is caught by the ceiling
         // guard before this is consulted). Worded to read naturally after
         // "created by omnigraph " if a future bump ever leaves a gap.
         _ => "an unrecognized older release",

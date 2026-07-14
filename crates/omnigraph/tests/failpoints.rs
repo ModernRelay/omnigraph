@@ -64,6 +64,22 @@ async fn node_table_uri(db: &Omnigraph, type_name: &str) -> String {
     )
 }
 
+fn node_table_identity_json(db: &Omnigraph, type_name: &str) -> serde_json::Value {
+    let catalog = db.catalog();
+    let stable_table_id = catalog
+        .type_id(type_name)
+        .unwrap_or_else(|| panic!("bound catalog has no stable id for {type_name}"))
+        .get();
+    let table_incarnation_id = catalog
+        .table_incarnation_id(type_name)
+        .unwrap_or_else(|| panic!("bound catalog has no incarnation id for {type_name}"))
+        .get();
+    serde_json::json!({
+        "stable_table_id": stable_table_id,
+        "table_incarnation_id": table_incarnation_id,
+    })
+}
+
 fn pending_schema_apply_node_table_uri(root: &str, type_name: &str) -> String {
     let operation_id = single_sidecar_operation_id(std::path::Path::new(root));
     let sidecar_path = std::path::Path::new(root)
@@ -2316,8 +2332,7 @@ edge WorksAt: Person -> Company
         helpers::failpoint::Rendezvous::park_first(names::SCHEMA_APPLY_AFTER_MANIFEST_COMMIT);
 
     let apply_db = std::sync::Arc::clone(&db);
-    let apply_task =
-        tokio::spawn(async move { apply_db.apply_schema(SCHEMA_V2_WITH_EDGE).await });
+    let apply_task = tokio::spawn(async move { apply_db.apply_schema(SCHEMA_V2_WITH_EDGE).await });
     rendezvous.wait_until_reached().await;
 
     let query_db = std::sync::Arc::clone(&db);
@@ -3299,11 +3314,7 @@ async fn ensure_indices_post_effect_disjoint_winner_is_preserved() {
     helpers::lance_delete_inline(&mut raw_company, "1 = 2").await;
     let winner_company_version = raw_company.version().version;
     winner_db
-        .failpoint_publish_table_head_without_index_rebuild_for_test(
-            "main",
-            "node:Company",
-            None,
-        )
+        .failpoint_publish_table_head_without_index_rebuild_for_test("main", "node:Company", None)
         .await
         .unwrap();
     let winner_head = branch_head_commit_id(dir.path(), "main").await.unwrap();
@@ -3325,8 +3336,10 @@ async fn ensure_indices_post_effect_disjoint_winner_is_preserved() {
         dir.path(),
         &operation_id,
         RecoveryExpectation::RolledBack {
-            tables: vec![TableExpectation::main("node:Person")
-                .expected_recovery_parent_commit_id(winner_head)],
+            tables: vec![
+                TableExpectation::main("node:Person")
+                    .expected_recovery_parent_commit_id(winner_head),
+            ],
         },
     )
     .await
@@ -3371,11 +3384,7 @@ async fn ensure_indices_post_effect_same_table_winner_fails_closed() {
     helpers::lance_delete_inline(&mut raw_person, "1 = 2").await;
     let winner_lance_head = raw_person.version().version;
     winner_db
-        .failpoint_publish_table_head_without_index_rebuild_for_test(
-            "main",
-            "node:Person",
-            None,
-        )
+        .failpoint_publish_table_head_without_index_rebuild_for_test("main", "node:Person", None)
         .await
         .unwrap();
     let winner_manifest_version = winner_db
@@ -4566,6 +4575,7 @@ async fn orphaned_branch_discard_is_idempotent_across_delete_failure() {
     // Deferred-shape sidecar pinned to feature (head < expected ⇒
     // invariant violation ⇒ every roll-forward-only pass defers it).
     let person_uri = node_table_uri(&db, "Person").await;
+    let person_identity = node_table_identity_json(&db, "Person");
     let sidecar_json = format!(
         r#"{{
         "schema_version": 1,
@@ -4576,6 +4586,7 @@ async fn orphaned_branch_discard_is_idempotent_across_delete_failure() {
         "writer_kind": "Mutation",
         "tables": [
             {{
+                "identity": {person_identity},
                 "table_key": "node:Person",
                 "table_path": "{person_uri}",
                 "expected_version": 999,
@@ -4671,6 +4682,7 @@ async fn stage_a_barrier_reports_exact_operation_before_drift_guard() {
         .unwrap();
     let entry = snapshot.entry("node:Person").unwrap();
     let person_uri = format!("{}/{}", uri.trim_end_matches('/'), entry.table_path);
+    let person_identity = node_table_identity_json(&db, "Person");
     let manifest_pin = entry.table_version;
     let mut ds = lance::Dataset::open(&person_uri).await.unwrap();
     helpers::lance_delete_inline(&mut ds, "1 = 2").await;
@@ -4685,6 +4697,7 @@ async fn stage_a_barrier_reports_exact_operation_before_drift_guard() {
             "writer_kind": "Mutation",
             "tables": [
                 {{
+                    "identity":{person_identity},
                     "table_key":"node:Person",
                     "table_path":"{}",
                     "expected_version":{},
@@ -4761,6 +4774,7 @@ async fn orphaned_branch_discard_converges_across_audit_append_failure() {
 
     // Deferred-shape sidecar pinned to feature, then orphaned.
     let person_uri = node_table_uri(&db, "Person").await;
+    let person_identity = node_table_identity_json(&db, "Person");
     let sidecar_json = format!(
         r#"{{
         "schema_version": 1,
@@ -4771,6 +4785,7 @@ async fn orphaned_branch_discard_converges_across_audit_append_failure() {
         "writer_kind": "Mutation",
         "tables": [
             {{
+                "identity": {person_identity},
                 "table_key": "node:Person",
                 "table_path": "{person_uri}",
                 "expected_version": 999,
@@ -5042,6 +5057,7 @@ async fn refresh_defers_rollback_eligible_sidecar_to_next_open() {
         .unwrap();
     let entry = snapshot.entry("node:Person").unwrap();
     let person_uri = format!("{}/{}", uri.trim_end_matches('/'), entry.table_path);
+    let person_identity = node_table_identity_json(&db, "Person");
     let manifest_pin = entry.table_version;
 
     // Drift Person's Lance HEAD ahead of the manifest pin (without
@@ -5073,6 +5089,7 @@ async fn refresh_defers_rollback_eligible_sidecar_to_next_open() {
             "writer_kind": "Mutation",
             "tables": [
                 {{
+                    "identity":{person_identity},
                     "table_key":"node:Person",
                     "table_path":"{}",
                     "expected_version":{},
@@ -6401,7 +6418,7 @@ async fn seed_two_productive_optimize_tables(uri: &str) {
     }
 }
 
-fn assert_optimize_v2_sidecar_tables(
+fn assert_optimize_v9_sidecar_tables(
     graph_root: &std::path::Path,
     operation_id: &str,
     expected: &[&str],
@@ -6413,7 +6430,7 @@ fn assert_optimize_v2_sidecar_tables(
     )
     .unwrap();
     let json: serde_json::Value = serde_json::from_str(&body).unwrap();
-    assert_eq!(json["schema_version"], 2);
+    assert_eq!(json["schema_version"], 9);
     assert_eq!(json["writer_kind"], "Optimize");
     let mut actual = json["tables"]
         .as_array()
@@ -6469,7 +6486,7 @@ async fn optimize_phase_b_failure_recovered_on_next_open() {
             "exactly one Optimize sidecar must persist after optimize failure"
         );
         operation_id = single_sidecar_operation_id(dir.path());
-        assert_optimize_v2_sidecar_tables(
+        assert_optimize_v9_sidecar_tables(
             dir.path(),
             &operation_id,
             &["node:Company", "node:Person"],
@@ -6528,14 +6545,15 @@ async fn optimize_post_manifest_failure_finalizes_multi_table_v2_sidecar() {
     let operation_id;
     {
         let db = Omnigraph::open(&uri).await.unwrap();
-        let _failpoint = ScopedFailPoint::new(names::GRAPH_PUBLISH_AFTER_MANIFEST_COMMIT, "1*return");
+        let _failpoint =
+            ScopedFailPoint::new(names::GRAPH_PUBLISH_AFTER_MANIFEST_COMMIT, "1*return");
         let error = db.optimize().await.unwrap_err();
         assert!(
             matches!(error, OmniError::RecoveryRequired { .. }),
             "lost graph-publish acknowledgement must require recovery, got {error}"
         );
         operation_id = single_sidecar_operation_id(dir.path());
-        assert_optimize_v2_sidecar_tables(
+        assert_optimize_v9_sidecar_tables(
             dir.path(),
             &operation_id,
             &["node:Company", "node:Person"],
@@ -6594,9 +6612,9 @@ node Embedding {
     .unwrap();
     let pending = db.ensure_indices().await.unwrap();
     assert!(
-        pending.iter().any(|index| {
-            index.table_key == "node:Embedding" && index.column == "vector"
-        }),
+        pending
+            .iter()
+            .any(|index| { index.table_key == "node:Embedding" && index.column == "vector" }),
         "fixture must leave the null vector index pending"
     );
     // Fixed productive tail on Work only; Embedding stays a one-fragment table
@@ -6611,14 +6629,12 @@ node Embedding {
         .unwrap();
     }
 
-    let _failpoint = ScopedFailPoint::new(
-        names::OPTIMIZE_POST_PHASE_B_PRE_MANIFEST_COMMIT,
-        "1*return",
-    );
+    let _failpoint =
+        ScopedFailPoint::new(names::OPTIMIZE_POST_PHASE_B_PRE_MANIFEST_COMMIT, "1*return");
     let error = db.optimize().await.unwrap_err();
     assert!(matches!(error, OmniError::RecoveryRequired { .. }));
     let operation_id = single_sidecar_operation_id(dir.path());
-    assert_optimize_v2_sidecar_tables(dir.path(), &operation_id, &["node:Work"]);
+    assert_optimize_v9_sidecar_tables(dir.path(), &operation_id, &["node:Work"]);
     drop(db);
 
     drop(Omnigraph::open(&uri).await.unwrap());
@@ -6683,7 +6699,7 @@ async fn optimize_multi_table_partial_effect_rolls_back_under_one_v2_sidecar() {
         "post-arm partial Optimize must require recovery, got {error}"
     );
     let operation_id = single_sidecar_operation_id(dir.path());
-    assert_optimize_v2_sidecar_tables(dir.path(), &operation_id, &["node:Company", "node:Person"]);
+    assert_optimize_v9_sidecar_tables(dir.path(), &operation_id, &["node:Company", "node:Person"]);
 
     let snapshot_after_failure = db
         .snapshot_of(omnigraph::db::ReadTarget::branch("main"))
@@ -7700,7 +7716,7 @@ async fn branch_merge_post_effect_target_advance_requires_recovery_and_preserves
         .join(format!("{operation_id}.json"));
     let sidecar: serde_json::Value =
         serde_json::from_str(&std::fs::read_to_string(&sidecar_path).unwrap()).unwrap();
-    assert_eq!(sidecar["schema_version"], 4);
+    assert_eq!(sidecar["schema_version"], 9);
     assert_eq!(
         sidecar["protocol_v4"]["lineage"]["merged_parent_commit_id"],
         source_head.as_str(),
@@ -9757,7 +9773,7 @@ async fn assert_branch_merge_first_touch_ref_is_recovered(
         .join(format!("{operation_id}.json"));
     let sidecar: serde_json::Value =
         serde_json::from_str(&std::fs::read_to_string(&sidecar_path).unwrap()).unwrap();
-    assert_eq!(sidecar["schema_version"], 4);
+    assert_eq!(sidecar["schema_version"], 9);
     assert_eq!(
         sidecar["protocol_v4"]["effects"][0]["kind"]["kind"],
         "RefOnlyFork"

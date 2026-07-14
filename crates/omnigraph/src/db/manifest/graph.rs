@@ -10,13 +10,14 @@ use omnigraph_compiler::catalog::Catalog;
 use crate::error::{OmniError, Result};
 
 use super::TABLE_VERSION_MANAGEMENT_KEY;
-use super::layout::{manifest_uri, open_manifest_dataset, type_name_hash};
+use super::layout::{manifest_uri, open_manifest_dataset};
 use super::metadata::TableVersionMetadata;
 use super::migrations::stamp_current_version;
 use super::state::{
     GraphLineageRow, ManifestState, SubTableEntry, entries_to_batch, graph_lineage_row_parts,
     manifest_schema, read_manifest_state,
 };
+use super::{TableIdentity, table_path_for_identity};
 
 /// The manifest version the init `Dataset::write` produces (Lance datasets start
 /// at version one). The genesis graph commit pins this version — a snapshot at
@@ -96,20 +97,36 @@ pub(super) async fn snapshot_state_at(
 async fn build_initial_entries(
     root_uri: &str,
     catalog: &Catalog,
-) -> Result<(Vec<SubTableEntry>, HashMap<String, String>)> {
+) -> Result<(Vec<SubTableEntry>, HashMap<TableIdentity, String>)> {
     let mut entries = Vec::new();
     let mut version_metadata = HashMap::new();
+    let accepted_ir = catalog.bound_schema_ir().ok_or_else(|| {
+        OmniError::manifest_internal(
+            "manifest initialization requires an identity-bound accepted catalog",
+        )
+    })?;
 
     for (name, node_type) in &catalog.node_types {
-        let hash = type_name_hash(name);
-        let table_path = format!("nodes/{}", hash);
+        let node_ir = accepted_ir
+            .nodes
+            .iter()
+            .find(|node| node.name == *name)
+            .ok_or_else(|| {
+                OmniError::manifest_internal(format!(
+                    "identity-bound catalog is missing node IR for '{name}'"
+                ))
+            })?;
+        let identity =
+            TableIdentity::new(node_ir.type_id.get(), node_ir.table_incarnation_id.get())?;
+        let table_key = format!("node:{}", name);
+        let table_path = table_path_for_identity(&table_key, identity)?;
         let full_path = format!("{}/{}", root_uri, table_path);
 
         let ds = create_empty_dataset(&full_path, &node_type.arrow_schema).await?;
-        let table_key = format!("node:{}", name);
         let metadata = TableVersionMetadata::from_dataset(root_uri, &table_path, &ds)?;
 
         entries.push(SubTableEntry {
+            identity,
             table_key: table_key.clone(),
             table_path: table_path.clone(),
             table_version: ds.version().version,
@@ -117,19 +134,30 @@ async fn build_initial_entries(
             row_count: 0,
             version_metadata: metadata.clone(),
         });
-        version_metadata.insert(table_key, metadata.to_json_string()?);
+        version_metadata.insert(identity, metadata.to_json_string()?);
     }
 
     for (name, edge_type) in &catalog.edge_types {
-        let hash = type_name_hash(name);
-        let table_path = format!("edges/{}", hash);
+        let edge_ir = accepted_ir
+            .edges
+            .iter()
+            .find(|edge| edge.name == *name)
+            .ok_or_else(|| {
+                OmniError::manifest_internal(format!(
+                    "identity-bound catalog is missing edge IR for '{name}'"
+                ))
+            })?;
+        let identity =
+            TableIdentity::new(edge_ir.type_id.get(), edge_ir.table_incarnation_id.get())?;
+        let table_key = format!("edge:{}", name);
+        let table_path = table_path_for_identity(&table_key, identity)?;
         let full_path = format!("{}/{}", root_uri, table_path);
 
         let ds = create_empty_dataset(&full_path, &edge_type.arrow_schema).await?;
-        let table_key = format!("edge:{}", name);
         let metadata = TableVersionMetadata::from_dataset(root_uri, &table_path, &ds)?;
 
         entries.push(SubTableEntry {
+            identity,
             table_key: table_key.clone(),
             table_path: table_path.clone(),
             table_version: ds.version().version,
@@ -137,7 +165,7 @@ async fn build_initial_entries(
             row_count: 0,
             version_metadata: metadata.clone(),
         });
-        version_metadata.insert(table_key, metadata.to_json_string()?);
+        version_metadata.insert(identity, metadata.to_json_string()?);
     }
 
     Ok((entries, version_metadata))

@@ -281,6 +281,65 @@ impl SnapshotTable {
 }
 
 impl Snapshot {
+    /// Bind the current accepted catalog's aliases onto a historical snapshot
+    /// by immutable table identity for query execution.
+    ///
+    /// Public historical snapshots retain their original aliases. This method
+    /// is used only on the operation-local copy behind `run_query_at` and an
+    /// explicit snapshot-target query, whose source is typechecked against the
+    /// current catalog. A pure type rename can therefore address the same old
+    /// table lifetime under its current name. Conversely, a reused name whose
+    /// current identity is absent from the historical snapshot is removed from
+    /// the execution view, preventing cross-incarnation adoption.
+    pub(crate) fn bind_catalog_aliases(&mut self, catalog: &Catalog) -> Result<()> {
+        // Freeze the historical identity map before changing any aliases. A
+        // renamed-away alias may later be reused by a new live type; resolving
+        // that replacement first must not remove the only entry needed to bind
+        // the original identity under its current renamed alias.
+        let historical_by_identity = self
+            .entries
+            .values()
+            .cloned()
+            .map(|entry| (entry.identity, entry))
+            .collect::<HashMap<_, _>>();
+        let schema_ir = catalog.bound_schema_ir().ok_or_else(|| {
+            OmniError::manifest_internal(
+                "historical query alias binding requires an identity-bound catalog".to_string(),
+            )
+        })?;
+        let table_aliases = schema_ir
+            .nodes
+            .iter()
+            .map(|node| {
+                (
+                    format!("node:{}", node.name),
+                    node.type_id.get(),
+                    node.table_incarnation_id.get(),
+                )
+            })
+            .chain(schema_ir.edges.iter().map(|edge| {
+                (
+                    format!("edge:{}", edge.name),
+                    edge.type_id.get(),
+                    edge.table_incarnation_id.get(),
+                )
+            }))
+            .collect::<Vec<_>>();
+
+        for (table_key, stable_table_id, incarnation_id) in table_aliases {
+            let identity = TableIdentity::new(stable_table_id, incarnation_id)?;
+
+            // An exact alias belonging to another lifetime is actively unsafe:
+            // remove it before looking for this catalog type's identity under a
+            // historical name.
+            self.entries.remove(&table_key);
+            if let Some(entry) = historical_by_identity.get(&identity) {
+                self.entries.insert(table_key, entry.clone());
+            }
+        }
+        Ok(())
+    }
+
     /// Open a sub-table dataset at its pinned version. With read caches present
     /// (live Branch reads), reuse a held handle through the cache (0 open IO on a
     /// warm repeat) and the shared `Session`; otherwise plain-open (Fix 2).
