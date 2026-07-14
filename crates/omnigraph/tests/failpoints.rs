@@ -2990,7 +2990,7 @@ async fn recovery_rolls_forward_ensure_indices_on_feature_branch() {
     .await
     .unwrap();
 
-    let db = Omnigraph::open(&uri).await.unwrap();
+    let mut db = Omnigraph::open(&uri).await.unwrap();
     assert_eq!(
         helpers::count_rows_branch(&db, "feature", "node:Person").await,
         3,
@@ -3001,9 +3001,78 @@ async fn recovery_rolls_forward_ensure_indices_on_feature_branch() {
         1,
         "follow-up feature mutation must not move main"
     );
+
+    // Repeat the same confirmed residual on the feature branch, but keep this
+    // handle alive. The entry barrier must finish the roll-forward-eligible v8
+    // intent before the retry captures another base or plans another index.
+    let mut ds = helpers::open_dataset_head(&person_uri, Some("feature")).await;
+    ds.drop_index("id_idx").await.unwrap();
+    db.failpoint_publish_table_head_without_index_rebuild_for_test(
+        "feature",
+        "node:Person",
+        Some("feature"),
+    )
+    .await
+    .unwrap();
+    let same_handle_parent_commit_id = branch_head_commit_id(dir.path(), "feature").await.unwrap();
+
+    let same_handle_operation_id;
+    {
+        let _failpoint = ScopedFailPoint::new(
+            names::ENSURE_INDICES_POST_PHASE_B_PRE_MANIFEST_COMMIT,
+            "return",
+        );
+        let err = db.ensure_indices_on("feature").await.unwrap_err();
+        assert!(
+            err.to_string().contains(
+                "injected failpoint triggered: ensure_indices.post_phase_b_pre_manifest_commit"
+            ),
+            "unexpected error: {err}"
+        );
+        same_handle_operation_id = single_sidecar_operation_id(dir.path());
+    }
+
+    let sidecar_path = dir
+        .path()
+        .join("__recovery")
+        .join(format!("{same_handle_operation_id}.json"));
+    let sidecar: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(&sidecar_path).unwrap()).unwrap();
+    assert_eq!(
+        sidecar["protocol_v8"]["effect_phase"], "EffectsConfirmed",
+        "the same-handle retry fixture requires a roll-forward-eligible v8 intent",
+    );
+
+    let pending = db
+        .ensure_indices_on("feature")
+        .await
+        .expect("same-handle retry must heal the confirmed index intent before repreparing");
+    assert!(
+        pending.is_empty(),
+        "the healed feature index should leave no deferred index work"
+    );
+    assert!(
+        helpers::recovery::sidecar_operation_ids(dir.path()).is_empty(),
+        "the entry barrier must finalize the prior confirmed intent before continuing",
+    );
+    drop(db);
+
+    assert_post_recovery_invariants(
+        dir.path(),
+        &same_handle_operation_id,
+        RecoveryExpectation::RolledForwardOriginalLineage {
+            tables: vec![
+                TableExpectation::branch("node:Person", "feature")
+                    .expected_main_manifest_pin(main_person_pin)
+                    .expected_recovery_parent_commit_id(same_handle_parent_commit_id),
+            ],
+        },
+    )
+    .await
+    .unwrap();
 }
 
-/// Even when every planned CreateIndex transaction landed exactly, an v8
+/// Even when every planned CreateIndex transaction landed exactly, a v8
 /// sidecar that is still Armed is rollback-only. Recovery must not infer the
 /// intended manifest delta from complete-looking physical state.
 #[tokio::test]
@@ -3034,6 +3103,17 @@ async fn ensure_indices_complete_armed_effects_roll_back() {
         assert!(matches!(err, OmniError::RecoveryRequired { .. }));
         operation_id = single_sidecar_operation_id(dir.path());
     }
+
+    let sidecar_path = dir
+        .path()
+        .join("__recovery")
+        .join(format!("{operation_id}.json"));
+    let sidecar: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(&sidecar_path).unwrap()).unwrap();
+    assert_eq!(
+        sidecar["protocol_v8"]["effect_phase"], "Armed",
+        "the complete-effect rollback fixture requires Armed v8 ownership",
+    );
     drop(db);
 
     let recovered = Omnigraph::open(&uri)
@@ -3055,6 +3135,112 @@ async fn ensure_indices_complete_armed_effects_roll_back() {
         .ensure_indices()
         .await
         .expect("clean retry must rebuild the compensated index batch");
+}
+
+/// A partial Armed v8 intent can leave one planned table still missing its
+/// index. A retry must reject that recovery requirement at entry, before it
+/// stages the remaining table's immutable artifacts.
+#[tokio::test]
+#[serial]
+async fn ensure_indices_entry_barrier_refuses_partial_armed_before_staging() {
+    let _scenario = FailScenario::setup();
+    let dir = tempfile::tempdir().unwrap();
+    let uri = dir.path().to_str().unwrap().to_string();
+    let mut db = Omnigraph::init(&uri, helpers::TEST_SCHEMA).await.unwrap();
+    load_jsonl(
+        &mut db,
+        r#"{"type":"Person","data":{"name":"alice","age":30}}
+{"type":"Company","data":{"name":"acme"}}"#,
+        LoadMode::Append,
+    )
+    .await
+    .unwrap();
+
+    let operation_id;
+    {
+        let _failpoint = ScopedFailPoint::new(names::ENSURE_INDICES_POST_TABLE_EFFECT, "return");
+        let err = db
+            .ensure_indices()
+            .await
+            .expect_err("failpoint must stop after the first of two table effects");
+        assert!(matches!(err, OmniError::RecoveryRequired { .. }));
+        operation_id = single_sidecar_operation_id(dir.path());
+    }
+
+    let sidecar_path = dir
+        .path()
+        .join("__recovery")
+        .join(format!("{operation_id}.json"));
+    let sidecar: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(&sidecar_path).unwrap()).unwrap();
+    assert_eq!(
+        sidecar["protocol_v8"]["effect_phase"], "Armed",
+        "a partial table-effect failure must remain rollback-only",
+    );
+    assert_eq!(
+        sidecar["tables"].as_array().map(Vec::len),
+        Some(2),
+        "the fixture must pin two planned table effects so one remains to stage",
+    );
+
+    let snapshot = helpers::snapshot_main(&db).await.unwrap();
+    let mut effected_tables = Vec::new();
+    for (table_key, type_name) in [("node:Person", "Person"), ("node:Company", "Company")] {
+        let manifest_pin = snapshot.entry(table_key).unwrap().table_version;
+        let lance_head = helpers::open_dataset_head(&node_table_uri(&uri, type_name), None)
+            .await
+            .version()
+            .version;
+        if lance_head > manifest_pin {
+            effected_tables.push(table_key);
+        }
+    }
+    assert_eq!(
+        effected_tables.len(),
+        1,
+        "the first-table failpoint must leave exactly one owned index effect",
+    );
+
+    let retry_error = {
+        let _failpoint =
+            ScopedFailPoint::new(names::ENSURE_INDICES_POST_STAGE_PRE_COMMIT_BTREE, "return");
+        db.ensure_indices()
+            .await
+            .expect_err("rollback-only ownership must refuse before remaining index staging")
+    };
+    match retry_error {
+        OmniError::RecoveryRequired {
+            operation_id: actual,
+            ..
+        } => assert_eq!(actual, operation_id),
+        other => panic!("expected exact pre-staging RecoveryRequired attribution, got {other}"),
+    }
+    assert_eq!(
+        single_sidecar_operation_id(dir.path()),
+        operation_id,
+        "the refused retry must leave only the original Armed intent",
+    );
+    drop(db);
+
+    let recovered = Omnigraph::open(&uri)
+        .await
+        .expect("Full recovery must compensate the exact partial index effect");
+    drop(recovered);
+    assert_post_recovery_invariants(
+        dir.path(),
+        &operation_id,
+        RecoveryExpectation::RolledBack {
+            tables: vec![TableExpectation::main(effected_tables[0])],
+        },
+    )
+    .await
+    .unwrap();
+
+    let recovered = Omnigraph::open(&uri).await.unwrap();
+    recovered
+        .ensure_indices()
+        .await
+        .expect("clean retry must build both compensated and never-committed indexes");
 }
 
 /// A foreign process can publish a disjoint table after v8 confirmation but

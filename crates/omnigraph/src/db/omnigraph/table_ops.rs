@@ -76,6 +76,13 @@ pub(super) async fn ensure_indices_for_branch(
     db: &Omnigraph,
     branch: Option<&str>,
 ) -> Result<Vec<PendingIndex>> {
+    // RFC-022 entry recovery barrier: recovery may advance the manifest, so
+    // resolve or refuse every relevant intent before capturing the index
+    // plan's base.
+    // The final under-gate relist below remains necessary to close the race
+    // between this entry barrier and the first table-HEAD effect.
+    db.heal_pending_recovery_sidecars_for_write(&[branch])
+        .await?;
     db.ensure_schema_apply_idle("ensure_indices").await?;
     let txn = db.open_write_txn(branch).await?;
     let snapshot = txn.base.clone();
