@@ -28,6 +28,34 @@ pub struct NodeDecl {
     pub implements: Vec<String>,
     pub properties: Vec<PropDecl>,
     pub constraints: Vec<Constraint>,
+    /// Constraints written directly on this node (including property-level
+    /// annotations desugared before interface expansion).  `constraints` is
+    /// the legacy effective view and may additionally contain constraints
+    /// injected from an implemented interface.
+    ///
+    /// Keeping the source-owned set lets the identity-free schema compiler
+    /// rebuild interface expansion deterministically instead of depending on
+    /// the order in which `implements` entries happened to be visited.
+    #[serde(default)]
+    pub source_constraints: Vec<Constraint>,
+    /// Provenance for every effective node property.  The parser retains the
+    /// historical expanded `properties` view for source-only catalog callers,
+    /// but SchemaShape uses this map to distinguish a direct declaration from
+    /// an injected one and to retain every contributing interface contract.
+    #[serde(default)]
+    pub property_origins: BTreeMap<String, NodePropertyOrigin>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+pub struct InterfacePropertyOrigin {
+    pub interface_name: String,
+    pub property_name: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct NodePropertyOrigin {
+    pub declared_directly: bool,
+    pub interface_properties: Vec<InterfacePropertyOrigin>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]

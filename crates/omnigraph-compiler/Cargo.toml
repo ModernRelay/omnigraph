@@ -22,3 +22,4 @@ serde = { workspace = true }
 serde_json = { workspace = true }
 ahash = { workspace = true }
 sha2 = { workspace = true }
+ulid = { workspace = true }

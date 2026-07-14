@@ -1,5 +1,6 @@
 pub mod schema_ir;
 pub mod schema_plan;
+pub mod schema_shape;
 
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
@@ -18,6 +19,16 @@ pub struct Catalog {
     pub edge_name_index: HashMap<String, String>,
     /// Interface declarations (for Phase 2 polymorphic queries)
     pub interfaces: HashMap<String, InterfaceType>,
+    /// Source-only callers are intentionally unbound. Runtime catalogs are a
+    /// direct projection of one validated accepted SchemaIR and retain that
+    /// authority so no consumer can reconstruct IDs from mutable names.
+    pub identity: CatalogIdentity,
+}
+
+#[derive(Debug, Clone)]
+pub enum CatalogIdentity {
+    SourceUnbound,
+    Bound(Arc<schema_ir::SchemaIR>),
 }
 
 #[derive(Debug, Clone)]
@@ -110,6 +121,79 @@ impl Catalog {
             return self.edge_types.get(key);
         }
         None
+    }
+
+    pub fn is_identity_bound(&self) -> bool {
+        matches!(self.identity, CatalogIdentity::Bound(_))
+    }
+
+    pub fn bound_schema_ir(&self) -> Option<&schema_ir::SchemaIR> {
+        match &self.identity {
+            CatalogIdentity::SourceUnbound => None,
+            CatalogIdentity::Bound(ir) => Some(ir),
+        }
+    }
+
+    pub fn type_id(&self, name: &str) -> Option<schema_ir::StableTypeId> {
+        let ir = self.bound_schema_ir()?;
+        ir.interfaces
+            .iter()
+            .find(|entry| entry.name == name)
+            .map(|entry| entry.type_id)
+            .or_else(|| {
+                ir.nodes
+                    .iter()
+                    .find(|entry| entry.name == name)
+                    .map(|entry| entry.type_id)
+            })
+            .or_else(|| {
+                ir.edges
+                    .iter()
+                    .find(|entry| entry.name == name)
+                    .map(|entry| entry.type_id)
+            })
+    }
+
+    pub fn table_incarnation_id(&self, name: &str) -> Option<schema_ir::TableIncarnationId> {
+        let ir = self.bound_schema_ir()?;
+        ir.nodes
+            .iter()
+            .find(|entry| entry.name == name)
+            .map(|entry| entry.table_incarnation_id)
+            .or_else(|| {
+                ir.edges
+                    .iter()
+                    .find(|entry| entry.name == name)
+                    .map(|entry| entry.table_incarnation_id)
+            })
+    }
+
+    pub fn property_id(
+        &self,
+        owner_name: &str,
+        property_name: &str,
+    ) -> Option<schema_ir::StablePropertyId> {
+        let ir = self.bound_schema_ir()?;
+        ir.interfaces
+            .iter()
+            .map(|entry| (entry.name.as_str(), entry.properties.as_slice()))
+            .chain(
+                ir.nodes
+                    .iter()
+                    .map(|entry| (entry.name.as_str(), entry.properties.as_slice())),
+            )
+            .chain(
+                ir.edges
+                    .iter()
+                    .map(|entry| (entry.name.as_str(), entry.properties.as_slice())),
+            )
+            .find(|(name, _)| *name == owner_name)
+            .and_then(|(_, properties)| {
+                properties
+                    .iter()
+                    .find(|property| property.name == property_name)
+                    .map(|property| property.property_id)
+            })
     }
 }
 
@@ -331,6 +415,184 @@ pub fn build_catalog(schema: &SchemaFile) -> Result<Catalog> {
         edge_types,
         edge_name_index,
         interfaces,
+        identity: CatalogIdentity::SourceUnbound,
+    })
+}
+
+/// Build the runtime catalog directly from validated accepted identity
+/// authority. This path never round-trips through the source AST and never
+/// mints or derives an identity from a name.
+pub fn build_catalog_from_ir(ir: &schema_ir::SchemaIR) -> Result<Catalog> {
+    schema_ir::validate_schema_ir(ir)?;
+
+    let interfaces = ir
+        .interfaces
+        .iter()
+        .map(|interface| {
+            (
+                interface.name.clone(),
+                InterfaceType {
+                    name: interface.name.clone(),
+                    properties: interface
+                        .properties
+                        .iter()
+                        .map(|property| (property.name.clone(), property.prop_type.clone()))
+                        .collect(),
+                },
+            )
+        })
+        .collect::<HashMap<_, _>>();
+
+    let mut node_types = HashMap::new();
+    for node in &ir.nodes {
+        let properties = node
+            .properties
+            .iter()
+            .map(|property| (property.name.clone(), property.prop_type.clone()))
+            .collect::<HashMap<_, _>>();
+        let blob_properties = node
+            .properties
+            .iter()
+            .filter(|property| matches!(property.prop_type.scalar, ScalarType::Blob))
+            .map(|property| property.name.clone())
+            .collect();
+        let embed_sources = node
+            .properties
+            .iter()
+            .filter_map(|property| {
+                property.embed_source.as_ref().map(|embed| {
+                    (
+                        property.name.clone(),
+                        EmbedSource {
+                            source: embed.source.property_name.clone(),
+                            model: embed.model.clone(),
+                        },
+                    )
+                })
+            })
+            .collect();
+        let mut key = None;
+        let mut unique_constraints = Vec::new();
+        let mut indices = Vec::new();
+        let mut range_constraints = Vec::new();
+        let mut check_constraints = Vec::new();
+        for constraint in &node.constraints {
+            match schema_ir::constraint_from_ir(constraint) {
+                Constraint::Key(columns) => {
+                    key = Some(columns.clone());
+                    indices.push(columns);
+                }
+                Constraint::Unique(columns) => unique_constraints.push(columns),
+                Constraint::Index(columns) => indices.push(columns),
+                Constraint::Range { property, min, max } => {
+                    range_constraints.push(RangeConstraint {
+                        property,
+                        min: min.as_ref().map(bound_to_literal),
+                        max: max.as_ref().map(bound_to_literal),
+                    });
+                }
+                Constraint::Check { property, pattern } => {
+                    check_constraints.push(CheckConstraint { property, pattern });
+                }
+            }
+        }
+        let mut fields = vec![Field::new("id", DataType::Utf8, false)];
+        fields.extend(node.properties.iter().map(|property| {
+            Field::new(
+                &property.name,
+                property.prop_type.to_arrow(),
+                property.prop_type.nullable,
+            )
+        }));
+        node_types.insert(
+            node.name.clone(),
+            NodeType {
+                name: node.name.clone(),
+                implements: node
+                    .implements
+                    .iter()
+                    .map(|reference| reference.type_name.clone())
+                    .collect(),
+                properties,
+                key,
+                unique_constraints,
+                indices,
+                range_constraints,
+                check_constraints,
+                embed_sources,
+                blob_properties,
+                arrow_schema: Arc::new(Schema::new(fields)),
+            },
+        );
+    }
+
+    let mut edge_types = HashMap::new();
+    let mut edge_name_index = HashMap::new();
+    for edge in &ir.edges {
+        let properties = edge
+            .properties
+            .iter()
+            .map(|property| (property.name.clone(), property.prop_type.clone()))
+            .collect::<HashMap<_, _>>();
+        let blob_properties = edge
+            .properties
+            .iter()
+            .filter(|property| matches!(property.prop_type.scalar, ScalarType::Blob))
+            .map(|property| property.name.clone())
+            .collect();
+        let mut unique_constraints = Vec::new();
+        let mut indices = Vec::new();
+        for constraint in &edge.constraints {
+            match schema_ir::constraint_from_ir(constraint) {
+                Constraint::Unique(columns) => unique_constraints.push(columns),
+                Constraint::Index(columns) => indices.push(columns),
+                _ => {}
+            }
+        }
+        let mut fields = vec![
+            Field::new("id", DataType::Utf8, false),
+            Field::new("src", DataType::Utf8, false),
+            Field::new("dst", DataType::Utf8, false),
+        ];
+        fields.extend(edge.properties.iter().map(|property| {
+            Field::new(
+                &property.name,
+                property.prop_type.to_arrow(),
+                property.prop_type.nullable,
+            )
+        }));
+        let normalized_name = normalize_edge_name(&edge.name);
+        if let Some(existing) = edge_name_index.get(&normalized_name)
+            && existing != &edge.name
+        {
+            return Err(CompilerError::Catalog(format!(
+                "edge name collision after case folding: '{}' conflicts with '{}'",
+                edge.name, existing
+            )));
+        }
+        edge_name_index.insert(normalized_name, edge.name.clone());
+        edge_types.insert(
+            edge.name.clone(),
+            EdgeType {
+                name: edge.name.clone(),
+                from_type: edge.from_type.type_name.clone(),
+                to_type: edge.to_type.type_name.clone(),
+                cardinality: edge.cardinality.clone(),
+                properties,
+                unique_constraints,
+                indices,
+                blob_properties,
+                arrow_schema: Arc::new(Schema::new(fields)),
+            },
+        );
+    }
+
+    Ok(Catalog {
+        node_types,
+        edge_types,
+        edge_name_index,
+        interfaces,
+        identity: CatalogIdentity::Bound(Arc::new(ir.clone())),
     })
 }
 

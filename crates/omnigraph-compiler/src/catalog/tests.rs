@@ -169,6 +169,8 @@ fn test_edge_lookup_handles_non_ascii_leading_character() {
                     annotations: vec![],
                 }],
                 constraints: vec![],
+                source_constraints: vec![],
+                property_origins: Default::default(),
             }),
             SchemaDecl::Edge(EdgeDecl {
                 name: "Édges".to_string(),
