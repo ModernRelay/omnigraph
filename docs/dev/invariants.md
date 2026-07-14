@@ -21,23 +21,28 @@ The hard invariants below are instances of one rule. Keep it in view whenever
 a change touches the boundary between what the graph *means* and how it is
 physically stored.
 
-> **Logical state is the contract. Physical state — index coverage, fragment
-> layout, compaction versions, staged writes — is derived, rebuildable, and may
-> be produced asynchronously. A physical operation must never fail a logical
-> one. Preconditions are checked against logical state; physical reconciliation
-> is idempotent and may lag or retry. Genuine logical conflicts still fail
-> loudly: the licence to lag covers physical convergence, not correctness.**
+> **Accepted schema and manifest state define the logical contract. Derived
+> physical state — fragment layout, index coverage, compaction output, and
+> caches — may lag, retry, or be rebuilt. Pending physical state — including an
+> unpublished Lance HEAD, staged effects, or, once streaming is activated,
+> acknowledged MemWAL data — is not graph-visible, but must remain durable and
+> recoverable until publication or a contract-defined terminal disposition;
+> compensation must preserve every acknowledgement guarantee. Neither category
+> may silently change logical correctness.
+> Genuine logical conflicts still fail loudly: the licence to lag covers
+> physical convergence, not correctness.**
 
-Invariants that instantiate it: **2** (manifest-atomic visibility) and **5**
+Invariants that instantiate it: **2** (one graph-content publication door) and **5**
 (recovery is part of the commit protocol) — a partially-written physical layer
-never changes what a graph commit means; **7** (indexes are derived state) — a
-query is correct under partial index coverage, and expensive index work
-converges from manifest state instead of gating the write path; **13** (failures
-bounded and observable) — the licence to lag is not a licence to drop, so a
-physical step that cannot make progress is surfaced, not swallowed. Deny-list
-items that enforce it: synchronous inline vector/FTS index rebuilds on the
-commit path; state that drifts from Lance or the manifest when it can be
-derived; job queues for manifest-derivable state where a reconciler fits.
+never changes what a graph commit means; **7** (physical acceleration and
+layout are derived state) — a query is correct under partial index coverage,
+and expensive index work converges from manifest state instead of gating the
+write path; and **13** (failures are bounded, typed, and observable) — the
+licence to lag is not a licence to drop, so a physical step that cannot make
+progress is surfaced, not swallowed. Deny-list items that enforce it include
+synchronous inline vector/FTS index rebuilds on the commit path, state that
+drifts from Lance or the manifest when it can be derived, and job queues for
+manifest-derivable state where a reconciler fits.
 
 The failure shape it rules out: a legitimate background operation on the
 physical layer (compaction, an index build, an interrupted staged write) is
@@ -49,142 +54,122 @@ converge the physical state.
 
 ## Hard Invariants
 
-1. **Respect the substrate.** Lance owns columnar storage, per-dataset
-   versioning, fragments, branches, compaction, cleanup, and index primitives.
-   DataFusion should own relational execution where it fits. Do not add custom
-   WALs, transaction managers, buffer pools, page formats, or local clones of
-   substrate behavior. Read [lance.md](lance.md) before guessing. Respecting the
-   substrate also means *using* it idiomatically, not only refraining from
-   rebuilding it: reuse long-lived handles instead of re-opening per call,
-   resolve latest state through the substrate's cheap primitive instead of
-   re-scanning, and share its caches/session. Re-deriving per call what the
-   substrate keeps warm is a substrate violation even when no code is
-   reimplemented.
+1. **Respect the substrate.** Lance owns storage, per-dataset versions,
+   branches and transactions, fragments, indexes, compaction, cleanup
+   primitives, and MemWAL; DataFusion owns relational execution where it fits.
+   Adopt public substrate primitives once their contracts pass the required
+   evidence gates. Do not clone them or reach through private APIs. Use them
+   idiomatically: share sessions and caches, reuse long-lived handles, and
+   prefer a cheap substrate probe over reopening or rescanning. Read
+   [lance.md](lance.md) before guessing.
 
-2. **Graph visibility is manifest-atomic.** Lance commits are per dataset.
-   OmniGraph's graph-level atomicity comes from publishing one manifest update
-   for the whole graph, guarded by expected table versions and sidecar recovery.
-   No write path may make a subset of touched node/edge tables visible as a
-   graph commit.
+2. **There is one graph-content publication door.** Every graph-content,
+   accepted-schema, and maintenance-pointer transition becomes authoritative at
+   one atomic `__manifest` publish. Those transitions use the shared publisher
+   and recovery protocol; writer-specific physical-effect adapters are allowed,
+   but alternate graph-visibility paths and per-table graph publication are not.
+   Native branch-ref create/delete is the control-plane exception: it uses the
+   documented authority-derived protocol, with Lance `BranchContents` as the
+   sole logical authority, and never exposes partial per-table state. Lance HEADs
+   carrying data or schema effects may move earlier only under durable recovery
+   ownership sufficient for the operation's documented support boundary.
 
-3. **A query reads one snapshot.** Query execution captures a manifest snapshot
-   for its lifetime. Do not re-read branch head mid-query to discover newer
-   table versions.
+3. **Each operation uses one coherent accepted view.** A read uses one
+   immutable manifest snapshot for its lifetime. A graph-content or schema
+   publication attempt captures every schema, catalog, base-snapshot, and
+   authority fact it needs from one accepted view, then revalidates the complete
+   token before effects. Control and maintenance paths likewise capture and
+   revalidate their complete logical authority token at the documented
+   boundary. A retry starts a new attempt; it never combines a fresh head with
+   stale planning state.
 
-4. **Mutations publish at one boundary.** A `mutate_as` or `load` operation
-   accumulates writes — inserts/updates as pending batches, deletes as
-   predicates — stages each touched table at the end (deletes via
-   `stage_delete`, no inline HEAD advance), then publishes one manifest update.
-   Do not commit per statement. The parse-time D2 rule is a deliberate
-   boundary: one mutation query is constructive (insert/update) or destructive
-   (delete), not both — so read-your-writes within a query stays unambiguous
-   and each table commits at most one version. Compose mixed operations via
-   separate mutations, or a branch for single-commit atomicity.
-   Read [writes.md](writes.md) and [execution.md](execution.md).
+4. **A mutation publishes once.** `mutate`, `load`, and equivalent
+   multi-statement operations stage every participant and publish once; they do
+   not commit per statement. The parse-time D2 rule remains the explicit
+   constructive-versus-destructive boundary. Compose mixed operations through
+   separate mutations, or use a branch when one later merge commit must make
+   them visible together. See [writes.md](writes.md) and
+   [execution.md](execution.md).
 
-5. **Recovery is part of the commit protocol.** Writers that can advance Lance
-   HEAD before manifest publish must write `__recovery/{ulid}.json` sidecars.
-   Under their final schema → branch → table gates, they must first prove every
-   existing physical target still equals its manifest pin; a new sidecar must
-   never claim an older writer's effect or uncovered drift. First-touch refs use
-   sidecar-before-ref ordering. A non-noop SchemaApply writes a sidecar even
-   with zero table pins because schema-contract staging is durable state. Its
-   schema-v7 sidecar captures native main authority + accepted schema identity,
-   fixed actor-bearing lineage, exact overwrite/first-touch transaction
-   identities, and the complete registration/update/tombstone delta. `Armed`
-   rolls back; only an exact `EffectsConfirmed` outcome can roll forward, and
-   schema staging is promoted only after that fixed manifest outcome is visible.
-   Owned first-touch paths are reclaimed on rollback. An unregistered foreign
-   first-touch winner is preserved but never adopted; foreign movement on a
-   manifest-owned table or an owned effect buried by a same-table winner fails
-   closed. Query, export, graph-index, and blob-read capture joins the same
-   process-local schema gate, keeping snapshot + catalog coherent across live
-   publication. Read-only open does not repair, but refuses a fixed SchemaApply
-   manifest outcome until the matching schema identity is live. Schema-v5 files
-   remain readable under their original bridge semantics. EnsureIndices uses
-   the same exact boundary in schema v8: one pre-minted mixed CreateIndex
-   transaction per touched table, captured branch/schema authority, fixed
-   lineage and manifest delta, and exact first-touch ref ownership. Schema-v6
-   EnsureIndices files remain readable under their original loose bridge
-   semantics and are never reinterpreted as v8 ownership proofs.
-   `Omnigraph::open` in read-write mode runs the all-or-nothing sweep; the
-   write entry points (`load_as`, `mutate_as`, `apply_schema_as`,
-   `branch_merge_as`) and `refresh` run roll-forward-only recovery in-process,
-   so a long-lived process converges on its next write rather than at restart.
-   Rust visibility closes the supported SDK surface: raw storage, handle-cache,
-   and graph/manifest coordinator modules are crate-private. Public snapshot
-   access is read-only and its scan facade does not expose Lance's raw scanner
-   or physical plan. The defense-in-depth registry in
-   `tests/forbidden_apis.rs` classifies public async inherent `Omnigraph` and
-   loader surfaces, every crate-visible async coordinator method, and exact
-   per-file occurrences of registered durable-call shapes, including recovery.
-   Do not add a new writer kind without registering sidecar coverage or an
-   explicit exception whose ordering proof shows why no independently durable
-   graph-visible effect can escape the coordinator.
+5. **Recovery is part of the commit protocol.** Any independently durable data
+   or schema effect that can later become graph-visible requires durable
+   recovery ownership sufficient for the operation's documented support
+   boundary. Authority-derived metadata residue may use a reconciler only when
+   it cannot be adopted as graph state and its target is fully derivable from
+   existing authority. Before proceeding, a writer resolves or refuses every
+   recovery intent relevant to its authority or effects; it never replans around
+   unresolved partial state. Recovery may roll forward or compensate only when
+   its identity and authority proof is sufficient for that boundary; ambiguity
+   fails closed. A new writer kind must join the shared protocol or carry an
+   explicit no-escape and ordering proof. See [writes.md](writes.md) for adapter
+   schemas, gate ordering, legacy readers, and the current process boundary.
 
 6. **Strong consistency is the default.** Reads are snapshot-isolated, writes
-   are durable before acknowledgement, and branch reads observe the current
-   committed graph state. Any eventual-consistency mode must be explicit,
-   read-only, auditable, and non-default.
+   are durable before acknowledgement, and normal reads observe
+   manifest-committed state. Any weaker mode must be explicit, read-only,
+   auditable, and non-default. A stream-admission acknowledgement is a distinct
+   durability contract, not acknowledgement of a graph-visible write; it follows
+   [RFC-026](../rfcs/0026-memwal-streaming-ingest.md) and never weakens
+   manifest-visible reads.
 
-7. **Indexes are derived state.** Reads must see the correct result for the
-   branch they read even when index coverage is partial. Expensive index work
-   should converge from manifest state instead of extending the critical write
-   path. BTREE, FTS, and full-table vector artifacts stage together as one
-   CreateIndex transaction per touched table; Optimize's index-coverage fold is
-   a separate bounded schema-v2 maintenance adapter. See [writes.md](writes.md) and
-   [indexes.md](../user/search/indexes.md).
+7. **Physical acceleration and layout are derived state.** Indexes,
+   graph-topology structures, fragment layout, and similar physical structures
+   may lag or rebuild. Missing or partial coverage must not make a logically
+   valid operation incorrect. Expensive reconciliation converges from manifest
+   authority outside the critical write path. See
+   [indexes.md](../user/search/indexes.md) and [writes.md](writes.md).
 
-8. **Schema identity survives renames.** Accepted schema identity must remain
-   stable across type and property renames. Rename support belongs in migration
-   planning, not in "drop and recreate" behavior. See the known gap below and
-   [RFC-028](../rfcs/0028-stable-schema-identity.md) for the proposed contract.
+8. **Schema identity survives renames.** Accepted type and property identities
+   remain stable across supported renames. Drop/re-add creates a new logical
+   lifetime. Names, paths, Lance versions, and Lance field IDs are not
+   substitutes for graph-level identity. See the known gap below and
+   [RFC-028](../rfcs/0028-stable-schema-identity.md).
 
-9. **Schema/data integrity failures are loud.** Type errors, required-field
-   misses, invalid edge endpoints, cardinality violations, and unsupported
-   mixed mutation modes fail before a graph commit is published. The system must
-   not invent placeholder nodes or silently weaken integrity.
+9. **Schema and data integrity failures are loud.** Type, required-field,
+   uniqueness, endpoint, cardinality, schema, and mutation-mode violations fail
+   before publication. The engine never invents placeholders, weakens
+   constraints, or silently accepts ambiguous state.
 
 10. **Query semantics are first-class IR concepts.** Search modes, mutations,
-    polymorphism, traversal, retrieval scores, imports, and policy predicates
-    belong in typed AST/IR/planner structures. Do not smuggle semantics through
-    strings, side tables, global state, or transport-specific flags.
+    traversal, polymorphism, retrieval scores, imports, and policy predicates
+    belong in typed AST, IR, and planner structures. Do not smuggle semantics
+    through strings, side tables, global state, or transport-specific flags.
 
-11. **Transport/auth stay at the boundary.** Kernel crates should not depend on
-    HTTP, OpenAPI, bearer-token parsing, or future transport protocols. The
-    server resolves bearer tokens to actors; clients cannot set actor identity
-    directly.
+11. **Transport and authentication stay at the boundary.** Kernel crates remain
+    independent of HTTP, OpenAPI, bearer-token parsing, and deployment-specific
+    protocols. The trusted server boundary resolves actors; HTTP clients cannot
+    choose the server-resolved actor identity.
 
-12. **Bearer-token plaintext is not retained.** Server startup hashes bearer
-    tokens, authentication uses constant-time comparison, and request handling
-    carries only the resolved actor identity and hash-derived match state.
+12. **Bearer-token plaintext is not retained.** Server startup hashes tokens,
+    authentication uses constant-time comparison, and request execution carries
+    only resolved identity and hash-derived match state.
 
-13. **Operational failures are bounded and observable.** Timeout, memory, OOM,
-    partial result, recovery, and conflict paths must fail loudly or degrade in
-    a documented way. If a metric affects plan choice or operator behavior, it
-    must be exposed through the relevant trait or observability surface.
+13. **Failures are bounded, typed, and observable.** Conflict, recovery,
+    timeout, memory, OOM, partial-result, and backpressure paths must have
+    explicit outcomes and enforced bounds where process survival permits.
+    Nothing is dropped, auto-merged, or degraded silently. Permitted retries are
+    defined by the operation's contract and bounded; failures are never
+    swallowed. Metrics and capabilities must be exposed before planning or
+    operator behavior depends on them.
 
-14. **Tests match the boundary being changed.** Prefer extending the existing
-    test that owns the area. Planner changes need planner-level coverage,
-    storage changes need storage/recovery coverage, and end-to-end tests are not
-    a substitute for missing lower-level assertions. Read [testing.md](testing.md)
-    before adding tests.
+14. **Evidence matches the boundary and reversibility.** Tests exercise the
+    layer whose contract changed; end-to-end coverage does not replace missing
+    lower-level assertions. Irreversible substrate, on-disk format, protocol,
+    or database-guarantee changes require an RFC plus the applicable
+    compatibility, refusal, recovery, crash, and rebuild evidence. Performance
+    or complexity claims require a checked-in instrument and representative
+    measurements; a claim without an instrument does not count. Prefer
+    extending the existing test owner described in [testing.md](testing.md).
 
-15. **One source of truth, cheaply derived.** Lance and the manifest are the
-    source of truth. Everything the engine needs at runtime is a derived view of
-    them: read or projected on demand, held warm, refreshed by a cheap probe. Two
-    failure modes are forbidden. A *parallel copy* the engine maintains can drift
-    from the source, and that divergence compounds over time. *Cold
-    re-derivation* rebuilds the view from the full source on every call, so its
-    cost grows with history. Invariants 1 and 7, and the deny-list "state that
-    drifts" and "manifest-derivable reconciler" items, are instances; so is
-    bounding a read's cost to its working set rather than the commit count. This
-    is the structural face of "engineering is programming integrated over time":
-    both failure modes are liabilities that compound as the system grows. At a
-    write/control boundary, schema identity, compiled catalog, and manifest
-    authority must come from one operation-local accepted view: validating a
-    fresh on-disk marker while planning or enumerating gates from a stale warm
-    catalog is not a coherent derivation.
+15. **One source of truth, cheaply derived.** The persisted accepted schema
+   contract, Lance, and `__manifest` are authoritative. Immutable,
+   version-pinned state may be cached. Mutable-tip projections may remain warm
+   only to locate or hint at authority; they are never the commit's source of
+   current truth. Every commit reads or arbitrates durable authority. A parallel
+   maintained copy that can drift and cold full-history reconstruction on every
+   call are both forbidden. Runtime cost should scale with the working set, not
+   accumulated history; every known exception remains an explicit, instrumented
+   gap.
 
 ## Current Truth Matrix
 
@@ -193,6 +178,7 @@ converge the physical state.
 | Multi-table commit | Manifest CAS plus recovery sidecars; not a single Lance primitive | [writes.md](writes.md), [architecture.md](architecture.md) |
 | Constructive mutations | In-memory `MutationStaging`, one end-of-query table commit per touched table, then one manifest publish | [writes.md](writes.md), [execution.md](execution.md) |
 | Deletes | Staged like inserts/updates (`stage_delete` via Lance 7.0 `DeleteBuilder::execute_uncommitted`, MR-A) — no inline HEAD advance; mixed insert/update/delete in one query rejected by D2 as a deliberate boundary (constructive XOR destructive per query; compose via separate mutations or a branch) | [query-language.md](../user/queries/index.md), [writes.md](writes.md) |
+| Streaming ingest | Not implemented yet. RFC-026 adopts Lance MemWAL as the strategic substrate; activation waits on its stated public API and evidence gates. Once active, append acknowledgement means MemWAL-durable, while graph visibility still occurs only through graph-atomic RFC-022 folds | [RFC-026](../rfcs/0026-memwal-streaming-ingest.md), [writes.md](writes.md) |
 | Branch create/delete | `__manifest` `BranchContents` is the single logical authority. Lance create is physically two-phase, so OmniGraph prevalidates names, enforces path-prefix-disjoint live graph names, reclaims an absent-ref clone-only tree, and uses a bounded completion classifier; delete removes authority before tree cleanup, so an absent ref is success and derived tree reclaim may converge later. Neither control emits graph lineage. Per-table forks are derived state, reclaimed best-effort with `cleanup` as backstop. Under schema/target/all-table gates, a target-scoped unresolved sidecar may be made unreachable by deletion and is then audit-discarded by recovery; graph-global SchemaApply still blocks | [branches-commits.md](../user/branching/index.md), [maintenance.md](../user/operations/maintenance.md), [writes.md](writes.md) |
 | Cleanup retention | Explicit cleanup derives exact `keep` cutoffs from Lance's available version list, caps each main-table GC cutoff at the oldest exact main version inherited by any live lazy graph branch, and refuses uncovered main HEAD drift. Lance protects native per-table branch refs itself. The graph-wide live-reference preflight fails closed before the first table GC, after which individual table failures remain fault-isolated | [maintenance.md](../user/operations/maintenance.md), [writes.md](writes.md) |
 | Optimize visibility | One operation-local accepted catalog and fresh main snapshot are planned under schema → main → all-table gates. Every productive table shares one bounded schema-v2 recovery sidecar; bounded-parallel physical effects become visible through at most one monotonic manifest/lineage CAS. Complete crash residuals roll forward together and partial residuals compensate before visibility. The adapter is supported within the single-writer-process recovery boundary. Exact provenance is deferred until Lance exposes a stable public caller-controlled maintenance transaction API and OmniGraph has distributed recovery fencing | [maintenance.md](../user/operations/maintenance.md), [writes.md](writes.md), [RFC-022](../rfcs/0022-unified-write-path.md) |
@@ -208,10 +194,11 @@ The branch-control reconcilers are authority-derived: same-name create reclaims
 an absent-ref clone-only manifest tree, and delete/cleanup reclaim orphaned
 per-table forks. They degrade to no-ops if Lance closes the corresponding
 physical gaps, so the design composes with that future rather than blocking it.
-This is the same shape as invariant 7 (indexes are derived state); prefer it
-over a recovery-sidecar-style approach for metadata work whose logical target
-is fully derivable from one existing authority. A graph-visible table effect is
-different and still requires durable ownership before it can advance HEAD.
+This is the same shape as invariant 7 (physical acceleration and layout are
+derived state); prefer it over a recovery-sidecar-style approach for metadata
+work whose logical target is fully derivable from one existing authority. A
+graph-visible table effect is different and still requires durable ownership
+before it can advance HEAD.
 For legacy path-prefix overlaps, an ancestor first-touch tree is not proven
 unreachable while a live child remains. Full recovery may leave the sidecar
 intact and allow the graph to open for leaf-first child deletion **only when the
@@ -373,12 +360,20 @@ them explicit.
   and factorization are target patterns, not current fact.
 - **Retrieval ranks:** hybrid search works, but rank/score are not yet carried
   everywhere as ordinary columns through the plan.
-- **Policy pushdown and `Source`:** Cedar enforcement is at the HTTP boundary
-  today, and imports are still loader-shaped. Planner predicates and a unified
-  `Source` operator are roadmap.
+- **Policy pushdown and `Source`:** Cedar enforcement is engine-wide at writer
+  entry points, but policy-predicate pushdown is not implemented and imports are
+  still loader-shaped. Planner predicates and a unified `Source` operator are
+  roadmap.
 - **Resource bounds:** some operations still lack enforced per-query memory or
   time budgets. New long-running work should add explicit bounds rather than
   widening the gap.
+- **Branch-merge manifest history amplification:** branch merge still performs
+  multiple cold cross-branch coordinator opens, so `__manifest` reads grow with
+  commit depth on an uncompacted graph. The checked-in
+  `merge_cost.rs::merge_manifest_cost_grows_with_history` instrument pins this
+  as a known non-flat term rather than disguising it as an acceptance result.
+  This remains an explicit invariant-15 gap; do not claim history-flat merge
+  cost until the same instrument proves it.
 - **Read-path re-derivation (largely closed by the query-latency work):**
   snapshot resolution used to re-open a fresh coordinator per read (a full
   `__manifest` re-scan plus the then-separate commit-graph-table scans, since
@@ -451,11 +446,14 @@ case is exceptional.
 - Per-table graph publishing outside the manifest publisher.
 - Re-reading current branch head during a query instead of using the captured
   snapshot.
-- New write paths that can advance Lance HEAD before manifest publish without a
-  recovery sidecar.
+- New write or control paths with independently durable pre-manifest effects and
+  neither durable recovery ownership nor an explicit no-escape,
+  authority-derived reconciliation proof.
 - Cross-query `BEGIN`/`COMMIT` transactions in the OSS engine. Use branches and
   merges for multi-query workflows.
-- Acknowledging writes before durable Lance and manifest persistence.
+- Acknowledging a graph-visible write before its Lance and manifest persistence,
+  or, once streaming ingest exists, acknowledging an append before its MemWAL
+  durability barrier.
 - Silent fallback to eventual consistency, partial results, or dropped rows.
 - State that drifts from Lance or the manifest when it can be derived.
 - Job queues for manifest-derivable state where a reconciler is the right shape.
@@ -465,6 +463,11 @@ case is exceptional.
   flags, or out-of-band metadata.
 - Cost-blind plan choice when statistics are available or required.
 - Hidden statistics for behavior that affects planning or operator choice.
+- An irreversible substrate, on-disk format, protocol, or database-guarantee
+  change without an RFC and the applicable compatibility, refusal, recovery,
+  crash, and rebuild evidence.
+- A performance or complexity claim without a checked-in instrument and
+  representative measurements at the claimed scale.
 - Hash-map iteration order in result ordering, plan choice, or migration output.
 - Cold re-derivation on the hot path: rebuilding from the full source what could
   be held warm and refreshed cheaply, so cost scales with history rather than the
@@ -493,11 +496,18 @@ case is exceptional.
 
 Use this as yes/no/NA for any non-trivial design or PR:
 
-- Does it respect Lance/DataFusion instead of rebuilding them?
-- Does it preserve manifest-atomic graph visibility?
-- Does every query keep one snapshot for its lifetime?
+- Does it use the public Lance/DataFusion substrate instead of rebuilding or
+  reaching through it?
+- Does every graph-content, schema, and maintenance-pointer transition use the
+  one `__manifest` publication door, and do native branch controls derive
+  visibility only from Lance `BranchContents` authority?
+- Does each operation derive every snapshot/schema/catalog/authority fact from
+  one coherent accepted view?
 - Do mutations publish once at the commit boundary?
-- Can every Lance-HEAD-before-manifest gap recover all-or-nothing?
+- Does the writer resolve or refuse every relevant recovery intent? Does each
+  independently durable pre-manifest data/schema effect have recovery ownership,
+  or each authority-derived residue have an explicit no-escape reconciliation
+  proof?
 - Are schema and edge integrity checks strict by default?
 - Are query semantics represented in AST/IR/planner structures?
 - Are transport, auth, and policy boundaries preserved?
@@ -505,9 +515,16 @@ Use this as yes/no/NA for any non-trivial design or PR:
 - Are result ordering and plan choices deterministic within a snapshot?
 - Are stats/capabilities exposed when behavior depends on them?
 - Are existing known gaps left no worse and documented if touched?
-- Does the test live at the same boundary as the change?
+- Does the evidence live at the same boundary as the change?
+- If the change is irreversible, does it have an RFC and the applicable
+  compatibility, refusal, recovery, crash, and rebuild proof?
+- If it makes a performance or complexity claim, is the instrument checked in
+  and is the claimed scale measured?
 - Is this operation's cost bounded with respect to history and scale, or does it
   re-derive warm state from cold storage per call?
+- Is mutable-current runtime state only a non-authoritative hint, never the
+  commit's source of current truth, with the commit revalidating against or
+  arbitrating through durable authority?
 - Does the change avoid every deny-list pattern, or justify the exception?
 
 ## Maintenance Policy
