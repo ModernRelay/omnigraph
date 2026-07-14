@@ -868,6 +868,7 @@ pub mod matrix {
                 let body = serde_json::to_vec(&BranchMergeRequest {
                     source,
                     target: Some(target),
+                    delete_branch: false,
                 })
                 .unwrap();
                 let response = app
@@ -1136,6 +1137,7 @@ pub async fn http_merge_decision(
     let req = BranchMergeRequest {
         source: "feature".to_string(),
         target: Some("main".to_string()),
+        delete_branch: false,
     };
     let (status, _body) = json_response(
         &app,

@@ -12,6 +12,33 @@ omnigraph branch merge review/2026-04-25 --into main s3://bucket/graph.omni
 `branch merge <source> [--into <target>]` merges `<source>` into `<target>`
 (default `main`).
 
+## Deleting the source branch
+
+A merge never touches the source branch — it stays in `branch list`, holds its
+per-table storage, and pins the main versions it inherited against
+[`cleanup`](../operations/maintenance.md) GC until someone deletes it. Since a
+successful merge guarantees the target no longer depends on the source's
+storage, the recommended lifecycle is to delete the source right after merging.
+
+`--delete-branch` does that in one step (over HTTP, set `delete_branch: true`
+on `POST /branches/merge`):
+
+```bash
+omnigraph branch merge review/2026-04-25 --into main --delete-branch s3://bucket/graph.omni
+```
+
+The deletion runs after the merge has landed, under its **own** `branch_delete`
+policy check — an actor allowed to merge but not to delete branches gets the
+merge without the deletion. Deletion runs on every successful outcome,
+including `already_up_to_date` (the "already merged, clean me up" case). A
+refusal or failure — policy denial, a dependent descendant branch, a branch
+another branch's tables still fork from — never fails the request: the merge is
+durable by then, so the CLI exits 0 with a stderr warning, and the response
+reports `branch_deleted: false` plus `branch_delete_error` (on success,
+`branch_deleted: true`). Deleting a branch is irreversible: its own commit
+history is not retained (only the merge commit on the target records the merged
+state).
+
 ## Outcomes
 
 A merge resolves to one of three outcomes:

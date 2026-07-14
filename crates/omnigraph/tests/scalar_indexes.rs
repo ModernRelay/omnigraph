@@ -5,7 +5,7 @@
 //! reports `Indexed` only when a BTREE covers the column (the same helper the
 //! traversal chooser uses). Enums and orderable scalars must get a BTREE so
 //! `=`/range/IN/IS NULL are index-accelerated; free-text Strings keep FTS
-//! (which `key_column_index_coverage` does not count as a BTREE, by design).
+//! (which `index_coverage` does not count as a BTREE, by design).
 
 mod helpers;
 
@@ -105,7 +105,7 @@ async fn update_of_unindexed_property_preserves_other_index_coverage() {
     let snap = snapshot_main(&db).await.unwrap();
     let ds = snap.open("node:Item").await.unwrap();
     for col in ["status", "published", "rank"] {
-        let cov = TableStore::key_column_index_coverage(&ds, col).await.unwrap();
+        let cov = ds.index_coverage(col).await.unwrap();
         assert_eq!(
             cov,
             IndexCoverage::Indexed,
@@ -121,7 +121,7 @@ async fn update_of_unindexed_property_preserves_other_index_coverage() {
     // with the whole-row path for `id`, strictly better for every other index.
     // When upstream excludes ON columns from column patches this assertion
     // goes red — flip it to `Indexed` and delete this comment.
-    let id_cov = TableStore::key_column_index_coverage(&ds, "id").await.unwrap();
+    let id_cov = ds.index_coverage("id").await.unwrap();
     assert!(
         matches!(id_cov, IndexCoverage::Degraded { .. }),
         "id-BTREE currently loses patched fragments (join key rides the source); \
@@ -172,7 +172,7 @@ async fn completion_column_index_survives_partial_update() {
 
     let snap = snapshot_main(&db).await.unwrap();
     let ds = snap.open("node:Slot").await.unwrap();
-    let cov = TableStore::key_column_index_coverage(&ds, "hour").await.unwrap();
+    let cov = ds.index_coverage("hour").await.unwrap();
     assert_eq!(
         cov,
         IndexCoverage::Indexed,

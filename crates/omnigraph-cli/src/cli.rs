@@ -517,6 +517,11 @@ pub(crate) enum BranchCommand {
         source: String,
         #[arg(long)]
         into: Option<String>,
+        /// Delete the source branch after a successful merge. Runs under its
+        /// own branch_delete policy check; a refusal is reported as a warning
+        /// and never fails the already-landed merge.
+        #[arg(long)]
+        delete_branch: bool,
         #[arg(long)]
         json: bool,
     },
