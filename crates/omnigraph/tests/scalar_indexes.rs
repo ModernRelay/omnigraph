@@ -4,8 +4,8 @@
 //! The observable signal is `SnapshotTable::index_coverage`, which
 //! reports `Indexed` only when a BTREE covers the column (the same helper the
 //! traversal chooser uses). Enums and orderable scalars must get a BTREE so
-//! `=`/range/IN/IS NULL are index-accelerated; free-text Strings keep FTS
-//! (which `key_column_index_coverage` does not count as a BTREE, by design).
+//! `=`/range/IN/IS NULL are index-accelerated; free-text Strings get FTS
+//! *plus* an explicitly-named companion BTREE (equality + `starts_with`).
 
 mod helpers;
 
@@ -31,10 +31,12 @@ const DATA: &str = r#"{"type":"Item","data":{"slug":"a","status":"active","publi
 {"type":"Item","data":{"slug":"c","status":"active","published":"2025-02-02T00:00:00Z","rank":3,"title":"gamma","note":"n3"}}"#;
 
 // Enums and orderable scalars (DateTime, numeric) get a BTREE from the index
-// reconciler, so a `=`/range filter on them uses the index. Free-text
-// String `@index` keeps FTS (no BTREE), and an un-annotated column has no
-// scalar index — both report `Degraded`, which is the negative control that
-// keeps this test from being vacuously green.
+// reconciler, so a `=`/range filter on them uses the index. A free-text
+// String `@index` gets FTS plus a companion BTREE (so `=` and `starts_with`
+// are index-accelerated too); an un-annotated column has no scalar index and
+// reports `Degraded`, the negative control that keeps this test from being
+// vacuously green. A second `ensure_indices` run must be a no-op (the
+// dual-index check matches by column + type, not name).
 #[tokio::test]
 async fn node_scalar_and_enum_index_columns_get_btree() {
     let dir = tempfile::tempdir().unwrap();
@@ -55,11 +57,16 @@ async fn node_scalar_and_enum_index_columns_get_btree() {
         );
     }
 
-    // Free-text String @index -> FTS, which is not a BTREE -> Degraded.
+    // Free-text String @index -> FTS plus a companion BTREE; both must stand.
     let title_cov = ds.index_coverage("title").await.unwrap();
+    assert_eq!(
+        title_cov,
+        IndexCoverage::Indexed,
+        "free-text String @index must get a companion BTREE alongside FTS, got {title_cov:?}"
+    );
     assert!(
-        matches!(title_cov, IndexCoverage::Degraded { .. }),
-        "free-text String @index should keep FTS (no BTREE), got {title_cov:?}"
+        ds.has_fts_index("title").await.unwrap(),
+        "the companion BTREE must not replace the FTS index (explicit-name contract)"
     );
 
     // No @index annotation -> no scalar index at all -> Degraded.
@@ -67,5 +74,17 @@ async fn node_scalar_and_enum_index_columns_get_btree() {
     assert!(
         matches!(note_cov, IndexCoverage::Degraded { .. }),
         "un-annotated column should have no scalar index, got {note_cov:?}"
+    );
+
+    // Idempotence: a second run finds every declared index present and
+    // publishes nothing (dual indexes must not re-plan as missing forever).
+    let version_before = ds.version();
+    db.ensure_indices().await.unwrap();
+    let snap2 = snapshot_main(&db).await.unwrap();
+    let ds2 = snap2.open("node:Item").await.unwrap();
+    assert_eq!(
+        version_before,
+        ds2.version(),
+        "second ensure_indices must be a no-op on a fully-indexed graph"
     );
 }

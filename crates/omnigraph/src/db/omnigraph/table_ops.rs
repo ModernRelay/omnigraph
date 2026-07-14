@@ -616,9 +616,10 @@ pub(super) struct IndexWorkStatus {
 /// Per `build_indices_on_dataset_for_catalog`, nodes get BTree (id) plus, for
 /// each one-column `@index`/`@key` property, the index `node_prop_index_kind`
 /// assigns: a scalar BTREE for enums and orderable scalars
-/// (DateTime/Date/numeric/Bool), FTS for free-text Strings, or a Vector index.
-/// Edges get BTree only (id, src, dst). This helper and the builder share
-/// `node_prop_index_kind` so they cannot drift — see its doc comment.
+/// (DateTime/Date/numeric/Bool), FTS *plus* an explicitly-named BTREE for
+/// free-text Strings (equality + `starts_with` acceleration), or a Vector
+/// index. Edges get BTree only (id, src, dst). This helper and the builder
+/// share `node_prop_index_kind` so they cannot drift — see its doc comment.
 #[derive(Default)]
 struct PlannedIndexWork {
     specs: Vec<crate::storage_layer::IndexBuildSpec>,
@@ -660,6 +661,7 @@ async fn plan_index_work_node(
     if !db.storage().has_btree_index(ds, "id").await? {
         work.push_spec(crate::storage_layer::IndexBuildSpec::BTree {
             column: "id".to_string(),
+            name: None,
         });
     }
     let Some(node_type) = catalog.node_types.get(type_name) else {
@@ -678,6 +680,18 @@ async fn plan_index_work_node(
                 if !db.storage().has_fts_index(ds, prop_name).await? {
                     work.push_spec(crate::storage_layer::IndexBuildSpec::FullText {
                         column: prop_name.clone(),
+                    });
+                }
+                // Free-text Strings additionally get a BTREE so equality and
+                // `starts_with` (LikePrefix) filters are index-accelerated —
+                // Lance never consults an inverted index for either. The
+                // explicit name is load-bearing: the FTS index holds the
+                // column's default name, and an unnamed BTREE build would
+                // replace it (see `IndexBuildSpec::BTree`).
+                if !db.storage().has_btree_index(ds, prop_name).await? {
+                    work.push_spec(crate::storage_layer::IndexBuildSpec::BTree {
+                        column: prop_name.clone(),
+                        name: Some(format!("{prop_name}_btree_idx")),
                     });
                 }
             }
@@ -700,6 +714,7 @@ async fn plan_index_work_node(
                 if !db.storage().has_btree_index(ds, prop_name).await? {
                     work.push_spec(crate::storage_layer::IndexBuildSpec::BTree {
                         column: prop_name.clone(),
+                        name: None,
                     });
                 }
             }
@@ -744,6 +759,7 @@ async fn plan_index_work_edge_on_dataset(
         if !db.storage().has_btree_index(ds, column).await? {
             work.push_spec(crate::storage_layer::IndexBuildSpec::BTree {
                 column: column.to_string(),
+                name: None,
             });
         }
     }

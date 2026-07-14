@@ -1588,7 +1588,7 @@ impl TableStore {
 
         for spec in specs {
             let (column, index_type) = match spec {
-                IndexBuildSpec::BTree { column } => (column, "BTREE"),
+                IndexBuildSpec::BTree { column, .. } => (column, "BTREE"),
                 IndexBuildSpec::FullText { column } => (column, "FTS"),
                 IndexBuildSpec::Vector { column } => (column, "Vector"),
             };
@@ -1600,13 +1600,18 @@ impl TableStore {
 
             let mut ds_clone = ds.clone();
             let new_idx = match spec {
-                IndexBuildSpec::BTree { column } => {
+                IndexBuildSpec::BTree { column, name } => {
                     let params = ScalarIndexParams::default();
-                    ds_clone
-                        .create_index_builder(&[column.as_str()], IndexType::BTree, &params)
-                        .replace(true)
-                        .execute_uncommitted()
-                        .await
+                    let columns = [column.as_str()];
+                    let mut builder =
+                        ds_clone.create_index_builder(&columns, IndexType::BTree, &params);
+                    // An explicit name keeps this BTREE from replacing a
+                    // same-column index of another kind under Lance's shared
+                    // default name (see `IndexBuildSpec::BTree`).
+                    if let Some(name) = name {
+                        builder = builder.name(name.clone());
+                    }
+                    builder.replace(true).execute_uncommitted().await
                 }
                 IndexBuildSpec::FullText { column } => {
                     let params = InvertedIndexParams::default();

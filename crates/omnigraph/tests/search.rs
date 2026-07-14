@@ -896,7 +896,7 @@ async fn rrf_fuses_two_vector_queries() {
 async fn mutation_with_deferred_index_coverage_remains_searchable() {
     let dir = tempfile::tempdir().unwrap();
     let mut db = init_search_db(&dir).await;
-    assert_eq!(doc_user_index_count(&db).await, 4);
+    assert_eq!(doc_user_index_count(&db).await, 7);
 
     let mut mutation_params = vector_param("$embedding", &[0.9, 0.1, 0.1, 0.1]);
     mutation_params.insert(
@@ -918,7 +918,7 @@ async fn mutation_with_deferred_index_coverage_remains_searchable() {
 
     assert_eq!(
         doc_user_index_count(&db).await,
-        4,
+        7,
         "mutation must leave physical index materialization to the reconciler"
     );
 
@@ -992,8 +992,9 @@ node Doc {
     let user_indices: Vec<_> = indices.iter().filter(|idx| !is_system_index(idx)).collect();
     assert_eq!(
         user_indices.len(),
-        3,
-        "expected id BTree index plus key-property and vector indices"
+        4,
+        "expected id BTree, the slug inverted index with its companion BTREE, \
+         and the vector index"
     );
 }
 
@@ -1013,7 +1014,8 @@ async fn load_commit_creates_inverted_indices_for_string_annotations() {
     let user_indices: Vec<_> = indices.iter().filter(|idx| !is_system_index(idx)).collect();
     assert_eq!(
         user_indices.len(),
-        4,
-        "expected id BTree index plus key-property and title/body inverted indices"
+        7,
+        "expected id BTree plus slug/title/body inverted indices, each with a \
+         companion BTREE (equality + starts_with acceleration)"
     );
 }

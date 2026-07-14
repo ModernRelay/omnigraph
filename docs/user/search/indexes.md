@@ -4,21 +4,23 @@
 
 | Index | Use | Notes |
 |---|---|---|
-| **BTREE scalar** | `=` / range / `IN` / `IS NULL` on a scalar | always on the node `id` and edge `src`/`dst`; and on each one-column `@index`/`@key` property that is an **enum** or an **orderable scalar** (`DateTime`/`Date`/`I32`/`I64`/`U32`/`U64`/`F32`/`F64`/`Bool`) |
+| **BTREE scalar** | `=` / range / `IN` / `IS NULL` / `starts_with` (prefix) on a scalar | always on the node `id` and edge `src`/`dst`; on each one-column `@index`/`@key` property that is an **enum** or an **orderable scalar** (`DateTime`/`Date`/`I32`/`I64`/`U32`/`U64`/`F32`/`F64`/`Bool`); and **alongside the FTS index** on free-text `String` `@index`/`@key` columns |
 | **Inverted (FTS)** | `search`, `fuzzy`, `match_text`, `bm25` | created on **free-text** (non-enum) `String` `@index`/`@key` columns |
 | **Vector** | `nearest()` k-NN | Lance picks IVF_PQ vs HNSW family by configuration; OmniGraph stores as FixedSizeList(Float32, dim) |
 
 The per-property index a column gets is decided by `node_prop_index_kind` (shared
 by the builder and the sidecar-pinning coverage check so they cannot drift):
-enums and orderable scalars → BTREE, free-text Strings → FTS, `Vector` → vector,
-list/`Blob` columns → none.
+enums and orderable scalars → BTREE, free-text Strings → FTS **plus** BTREE,
+`Vector` → vector, list/`Blob` columns → none. A second index on the same column
+carries an explicit name (`{column}_btree_idx`) because Lance's default index
+name is shared per column and `replace` removes by name.
 
-> **Free-text Strings are not equality-indexed.** A non-enum `String` column
-> (including a `String @key` slug) gets an FTS inverted index, which Lance does
-> **not** consult for `=`/range — only for `search`/`match_text`/`bm25`. So an
-> equality filter on a free-text String falls back to a full scan. If you filter
-> a String identifier by equality on a large table, model it so the value is the
-> node id, or track it as a follow-up to also build a BTREE on such columns.
+> **Free-text Strings are equality- and prefix-indexed via the companion
+> BTREE.** The FTS inverted index is only consulted for
+> `search`/`match_text`/`bm25`; the BTREE built alongside it serves `=`, range,
+> and `starts_with` (rewritten by Lance to an exact prefix range). Graphs
+> indexed before this dual-index behavior gain the BTREE on the next
+> `ensure_indices`/`optimize` run.
 
 > **Coverage and cost.** Each indexed column adds index files and build time, and
 > an index only covers the fragments it was built over. Rows appended after the
