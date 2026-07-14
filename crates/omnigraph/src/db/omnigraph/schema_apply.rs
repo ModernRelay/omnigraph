@@ -43,6 +43,59 @@ fn pre_minted_schema_transaction(
     }
 }
 
+fn resolve_desired_schema_ir(
+    accepted_ir: &SchemaIR,
+    desired_schema_source: &str,
+) -> Result<SchemaIR> {
+    let desired_shape = read_schema_shape_from_source(desired_schema_source)?;
+    let resolution = omnigraph_compiler::resolve_schema_ir(accepted_ir, &desired_shape)
+        .map_err(|error| OmniError::manifest(error.to_string()))?;
+    for diagnostic in &resolution.diagnostics {
+        tracing::warn!(
+            target: "omnigraph::schema::identity",
+            kind = ?diagnostic.kind,
+            entity = %diagnostic.entity,
+            hint = %diagnostic.hint,
+            "schema identity rename hint was ignored after an exact-name match"
+        );
+    }
+    Ok(resolution.schema_ir)
+}
+
+fn table_identity_for_schema_key(
+    schema_ir: &SchemaIR,
+    table_key: &str,
+) -> Result<crate::db::manifest::TableIdentity> {
+    let (type_id, incarnation_id) = if let Some(type_name) = table_key.strip_prefix("node:") {
+        let node = schema_ir
+            .nodes
+            .iter()
+            .find(|node| node.name == type_name)
+            .ok_or_else(|| {
+                OmniError::manifest(format!(
+                    "schema IR has no node identity for table alias '{table_key}'"
+                ))
+            })?;
+        (node.type_id.get(), node.table_incarnation_id.get())
+    } else if let Some(type_name) = table_key.strip_prefix("edge:") {
+        let edge = schema_ir
+            .edges
+            .iter()
+            .find(|edge| edge.name == type_name)
+            .ok_or_else(|| {
+                OmniError::manifest(format!(
+                    "schema IR has no edge identity for table alias '{table_key}'"
+                ))
+            })?;
+        (edge.type_id.get(), edge.table_incarnation_id.get())
+    } else {
+        return Err(OmniError::manifest(format!(
+            "invalid schema table key '{table_key}'"
+        )));
+    };
+    crate::db::manifest::TableIdentity::new(type_id, incarnation_id)
+}
+
 pub(super) async fn plan_schema(
     db: &Omnigraph,
     desired_schema_source: &str,
@@ -50,7 +103,7 @@ pub(super) async fn plan_schema(
 ) -> Result<SchemaMigrationPlan> {
     db.ensure_schema_state_valid().await?;
     let accepted_ir = read_accepted_schema_ir(db.uri(), Arc::clone(&db.storage)).await?;
-    let desired_ir = read_schema_ir_from_source(desired_schema_source)?;
+    let desired_ir = resolve_desired_schema_ir(&accepted_ir, desired_schema_source)?;
     let mut plan = plan_schema_migration(&accepted_ir, &desired_ir)
         .map_err(|err| OmniError::manifest(err.to_string()))?;
     promote_drops_to_hard(&mut plan, options.allow_data_loss);
@@ -96,7 +149,7 @@ async fn plan_schema_for_apply_from_accepted(
         )));
     }
 
-    let desired_ir = read_schema_ir_from_source(desired_schema_source)?;
+    let desired_ir = resolve_desired_schema_ir(accepted_ir, desired_schema_source)?;
     let mut plan = plan_schema_migration(accepted_ir, &desired_ir)
         .map_err(|err| OmniError::manifest(err.to_string()))?;
     promote_drops_to_hard(&mut plan, options.allow_data_loss);
@@ -254,6 +307,9 @@ where
     for step in &plan.steps {
         match step {
             SchemaMigrationStep::AddType { type_kind, name } => {
+                if matches!(type_kind, SchemaTypeKind::Interface) {
+                    continue;
+                }
                 let table_key = schema_table_key(*type_kind, name);
                 if table_key.starts_with("edge:") {
                     changed_edge_tables = true;
@@ -265,6 +321,9 @@ where
                 from,
                 to,
             } => {
+                if matches!(type_kind, SchemaTypeKind::Interface) {
+                    continue;
+                }
                 let source_key = schema_table_key(*type_kind, from);
                 let target_key = schema_table_key(*type_kind, to);
                 if source_key.starts_with("edge:") {
@@ -277,6 +336,9 @@ where
                 type_name,
                 ..
             } => {
+                if matches!(type_kind, SchemaTypeKind::Interface) {
+                    continue;
+                }
                 let table_key = schema_table_key(*type_kind, type_name);
                 if table_key.starts_with("edge:") {
                     changed_edge_tables = true;
@@ -289,6 +351,9 @@ where
                 from,
                 to,
             } => {
+                if matches!(type_kind, SchemaTypeKind::Interface) {
+                    continue;
+                }
                 let table_key = schema_table_key(*type_kind, type_name);
                 if table_key.starts_with("edge:") {
                     changed_edge_tables = true;
@@ -319,6 +384,9 @@ where
                 mode,
                 ..
             } => {
+                if matches!(type_kind, SchemaTypeKind::Interface) {
+                    continue;
+                }
                 // Both Soft and Hard route through the existing
                 // stage_overwrite rewrite path. batch_for_schema_apply_rewrite
                 // iterates the *target* schema fields, so a property
@@ -355,6 +423,9 @@ where
                 name,
                 mode,
             } => {
+                if matches!(type_kind, SchemaTypeKind::Interface) {
+                    continue;
+                }
                 // Both Soft and Hard tombstone the table's entry in
                 // the current __manifest version (no per-table write).
                 //
@@ -395,23 +466,33 @@ where
         }
     }
 
-    let mut table_registrations = BTreeMap::<String, String>::new();
-    let mut table_updates = BTreeMap::<String, crate::db::SubTableUpdate>::new();
-    let mut table_tombstones = BTreeMap::<String, u64>::new();
+    let mut table_registrations =
+        BTreeMap::<String, (crate::db::manifest::TableIdentity, String)>::new();
+    let mut table_updates =
+        BTreeMap::<crate::db::manifest::TableIdentity, crate::db::SubTableUpdate>::new();
+    let mut table_tombstones = BTreeMap::<crate::db::manifest::TableIdentity, (String, u64)>::new();
 
     // Pre-mint every table transaction before recovery is armed. Existing
     // rewrites are exact Overwrite transactions at their manifest pins;
-    // AddType/RenameType targets are strict first-version Overwrites at
-    // read_version=0. Metadata/tombstone-only applies deliberately have no
-    // table effects but still arm v7 because schema staging is durable state.
+    // AddType targets are strict first-version Overwrites at read_version=0.
+    // A type rename is metadata-only: it preserves identity, path, version,
+    // and Lance history. When a rename also changes properties, only that
+    // property rewrite advances the existing dataset at the preserved path.
+    // Metadata/tombstone-only applies deliberately have no table effects but
+    // still arm recovery because schema staging is durable state.
     let mut recovery_pins = Vec::new();
     let mut recovery_effects = Vec::new();
     let mut recovery_slots = Vec::new();
-    let mut planned_transactions = HashMap::new();
-    for table_key in added_tables.iter().chain(renamed_tables.keys()) {
-        let table_path = table_path_for_table_key(table_key)?;
+    let mut planned_transactions = HashMap::<
+        crate::db::manifest::TableIdentity,
+        crate::table_store::StagedTransactionIdentity,
+    >::new();
+    for table_key in &added_tables {
+        let identity = table_identity_for_schema_key(&desired_ir, table_key)?;
+        let table_path = crate::db::manifest::table_path_for_identity(table_key, identity)?;
         let planned = pre_minted_schema_transaction(0);
         recovery_pins.push(crate::db::manifest::SidecarTablePin {
+            identity,
             table_key: table_key.clone(),
             table_path: db.storage().dataset_uri(&table_path),
             expected_version: 0,
@@ -419,8 +500,9 @@ where
             confirmed_version: None,
             table_branch: None,
         });
-        planned_transactions.insert(table_key.clone(), planned.clone());
+        planned_transactions.insert(identity, planned.clone());
         recovery_effects.push(crate::db::manifest::RecoverySchemaApplyEffect {
+            identity,
             table_key: table_key.clone(),
             kind: crate::db::manifest::RecoverySchemaApplyEffectKind::FirstTouchDataset {
                 planned_transaction: planned,
@@ -428,6 +510,7 @@ where
             },
         });
         recovery_slots.push(crate::db::manifest::RecoveryTableUpdateSlot {
+            identity,
             table_key: table_key.clone(),
             expected_version: 0,
             table_branch: None,
@@ -435,23 +518,33 @@ where
         });
     }
     for table_key in &rewritten_tables {
-        if added_tables.contains(table_key) || renamed_tables.contains_key(table_key) {
+        if added_tables.contains(table_key) {
             continue;
         }
-        let entry = snapshot.entry(table_key).ok_or_else(|| {
+        let source_table_key = renamed_tables.get(table_key).unwrap_or(table_key);
+        let entry = snapshot.entry(source_table_key).ok_or_else(|| {
             OmniError::manifest(format!(
-                "missing source table '{}' for schema apply recovery plan",
-                table_key
+                "missing source table '{}' for schema apply recovery plan targeting '{}'",
+                source_table_key, table_key
             ))
         })?;
         if entry.table_branch.is_some() {
             return Err(OmniError::manifest_internal(format!(
                 "schema apply expected main-owned table '{}', found branch {:?}",
-                table_key, entry.table_branch
+                source_table_key, entry.table_branch
+            )));
+        }
+        let identity = table_identity_for_schema_key(&desired_ir, table_key)?;
+        let accepted_identity = table_identity_for_schema_key(&accepted_ir, source_table_key)?;
+        if identity != accepted_identity || identity != entry.identity {
+            return Err(OmniError::manifest_internal(format!(
+                "schema apply rewrite identity mismatch: source '{}' is {}, target '{}' is {}",
+                source_table_key, entry.identity, table_key, identity
             )));
         }
         let planned = pre_minted_schema_transaction(entry.table_version);
         recovery_pins.push(crate::db::manifest::SidecarTablePin {
+            identity,
             table_key: table_key.clone(),
             table_path: db.storage().dataset_uri(&entry.table_path),
             expected_version: entry.table_version,
@@ -459,8 +552,9 @@ where
             confirmed_version: None,
             table_branch: None,
         });
-        planned_transactions.insert(table_key.clone(), planned.clone());
+        planned_transactions.insert(identity, planned.clone());
         recovery_effects.push(crate::db::manifest::RecoverySchemaApplyEffect {
+            identity,
             table_key: table_key.clone(),
             kind: crate::db::manifest::RecoverySchemaApplyEffectKind::ExistingOverwrite {
                 planned_transaction: planned,
@@ -468,13 +562,14 @@ where
             },
         });
         recovery_slots.push(crate::db::manifest::RecoveryTableUpdateSlot {
+            identity,
             table_key: table_key.clone(),
             expected_version: entry.table_version,
             table_branch: None,
             confirmed: None,
         });
     }
-    // Capture additional registrations + tombstones for the sidecar so
+    // Capture registrations, metadata-only renames, and tombstones for the sidecar so
     // recovery can publish them alongside the per-table updates. Without
     // this, an added type's dataset is created in Phase B but the
     // manifest never gains an entry for it after roll-forward — the
@@ -482,32 +577,47 @@ where
     // and reads through the engine fail with "no manifest entry for X".
     let mut sidecar_registrations: Vec<crate::db::manifest::SidecarTableRegistration> = Vec::new();
     for table_key in &added_tables {
+        let identity = table_identity_for_schema_key(&desired_ir, table_key)?;
         sidecar_registrations.push(crate::db::manifest::SidecarTableRegistration {
+            identity,
             table_key: table_key.clone(),
-            table_path: table_path_for_table_key(table_key)?,
+            table_path: crate::db::manifest::table_path_for_identity(table_key, identity)?,
             table_branch: None,
         });
     }
-    for target_table_key in renamed_tables.keys() {
-        sidecar_registrations.push(crate::db::manifest::SidecarTableRegistration {
-            table_key: target_table_key.clone(),
-            table_path: table_path_for_table_key(target_table_key)?,
-            table_branch: None,
-        });
-    }
-    let mut sidecar_tombstones: Vec<crate::db::manifest::SidecarTombstone> = Vec::new();
-    for source_table_key in renamed_tables.values() {
+    let mut sidecar_renames = Vec::<crate::db::manifest::SidecarTableRename>::new();
+    for (target_table_key, source_table_key) in &renamed_tables {
         let source_entry = snapshot.entry(source_table_key).ok_or_else(|| {
             OmniError::manifest(format!(
                 "missing source table '{}' for schema rename when building recovery sidecar",
                 source_table_key
             ))
         })?;
-        sidecar_tombstones.push(crate::db::manifest::SidecarTombstone {
-            table_key: source_table_key.clone(),
-            tombstone_version: source_entry.table_version.saturating_add(1),
+        let desired_identity = table_identity_for_schema_key(&desired_ir, target_table_key)?;
+        let accepted_identity = table_identity_for_schema_key(&accepted_ir, source_table_key)?;
+        if source_entry.identity != desired_identity || desired_identity != accepted_identity {
+            return Err(OmniError::manifest_internal(format!(
+                "schema rename '{}' -> '{}' changed table identity",
+                source_table_key, target_table_key
+            )));
+        }
+        let canonical_target_path =
+            crate::db::manifest::table_path_for_identity(target_table_key, desired_identity)?;
+        if canonical_target_path != source_entry.table_path {
+            return Err(OmniError::manifest_internal(format!(
+                "schema rename '{}' -> '{}' would change physical path '{}' to '{}'",
+                source_table_key, target_table_key, source_entry.table_path, canonical_target_path
+            )));
+        }
+        sidecar_renames.push(crate::db::manifest::SidecarTableRename {
+            identity: desired_identity,
+            expected_table_key: source_table_key.clone(),
+            expected_version: source_entry.table_version,
+            table_key: target_table_key.clone(),
+            table_path: source_entry.table_path.clone(),
         });
     }
+    let mut sidecar_tombstones: Vec<crate::db::manifest::SidecarTombstone> = Vec::new();
     // Soft DropType: mark each dropped table for tombstoning in the
     // recovery sidecar AND in the live table_tombstones map. The
     // mechanism mirrors rename's source-table tombstone — manifest
@@ -523,10 +633,14 @@ where
         })?;
         let tombstone_version = entry.table_version.saturating_add(1);
         sidecar_tombstones.push(crate::db::manifest::SidecarTombstone {
+            identity: entry.identity,
             table_key: dropped_table_key.clone(),
             tombstone_version,
         });
-        table_tombstones.insert(dropped_table_key.clone(), tombstone_version);
+        table_tombstones.insert(
+            entry.identity,
+            (dropped_table_key.clone(), tombstone_version),
+        );
     }
 
     // Complete effect envelope: the outer `apply_schema` already holds the
@@ -628,16 +742,11 @@ where
         existing_heads.insert(entry.table_key.clone(), head);
     }
 
-    // Added types and rename targets have no manifest authority yet. A physical
-    // dataset already present at one of those paths is therefore an orphan or a
-    // foreign effect, never state this apply may retroactively claim through
-    // `additional_registrations` recovery.
-    let target_table_keys = added_tables
-        .iter()
-        .chain(renamed_tables.keys())
-        .collect::<BTreeSet<_>>();
-    for table_key in target_table_keys {
-        let table_path = table_path_for_table_key(table_key)?;
+    // Only added types are first-touch paths. Rename targets deliberately reuse
+    // the existing identity-owned path and therefore must already exist.
+    for table_key in &added_tables {
+        let identity = table_identity_for_schema_key(&desired_ir, table_key)?;
+        let table_path = crate::db::manifest::table_path_for_identity(table_key, identity)?;
         let dataset_uri = db.storage().dataset_uri(&table_path);
         if db.storage_adapter().exists(&dataset_uri).await? {
             return Err(OmniError::manifest_conflict(format!(
@@ -658,6 +767,7 @@ where
     let recovery_authority = crate::db::manifest::RecoveryAuthorityToken {
         branch_identifier: base_branch_identifier.clone(),
         graph_head: base_graph_head.clone(),
+        schema_identity_domain: accepted_ir.schema_identity_domain.as_str().to_string(),
         schema_ir_hash: accepted_schema_state.schema_ir_hash.clone(),
         schema_identity_version: accepted_schema_state.schema_identity_version,
     };
@@ -668,7 +778,7 @@ where
         merged_parent_commit_id: lineage_intent.merged_parent_commit_id.clone(),
         created_at: lineage_intent.created_at,
     };
-    let mut sidecar = crate::db::manifest::new_schema_apply_sidecar_v7(
+    let mut sidecar = crate::db::manifest::new_schema_apply_sidecar_v9(
         actor.map(str::to_string),
         recovery_pins,
         recovery_authority,
@@ -677,6 +787,7 @@ where
         crate::db::manifest::RecoveryManifestDelta {
             table_updates: recovery_slots,
             registrations: sidecar_registrations,
+            renames: sidecar_renames,
             tombstones: sidecar_tombstones,
         },
         target_schema_ir_hash,
@@ -692,12 +803,14 @@ where
         let mut committed_transactions = HashMap::new();
 
         for table_key in &added_tables {
-            let table_path = table_path_for_table_key(table_key)?;
+            let identity = table_identity_for_schema_key(&desired_ir, table_key)?;
+            let table_path =
+                crate::db::manifest::table_path_for_identity(table_key, identity)?;
             let dataset_uri = db.storage().dataset_uri(&table_path);
             let schema = schema_for_table_key(&desired_catalog, table_key)?;
             let batch = RecordBatch::new_empty(schema);
             let mut staged = db.storage().stage_create(&dataset_uri, batch).await?;
-            let planned = planned_transactions.get(table_key).ok_or_else(|| {
+            let planned = planned_transactions.get(&identity).ok_or_else(|| {
                 OmniError::manifest_internal(format!(
                     "missing planned SchemaApply transaction for '{}'",
                     table_key
@@ -714,19 +827,17 @@ where
                     table_key
                 )));
             }
-            committed_transactions.insert(
-                table_key.clone(),
-                outcome.committed_transaction().clone(),
-            );
+            committed_transactions.insert(identity, outcome.committed_transaction().clone());
             let ds = outcome.into_snapshot();
             // Indexes for the new table are materialized off the critical path by
             // ensure_indices/optimize (iss-848); a 0-row table is never trainable
             // anyway. The @index intent is recorded in the persisted catalog/IR.
             let state = db.storage().table_state(&dataset_uri, &ds).await?;
-            table_registrations.insert(table_key.clone(), table_path);
+            table_registrations.insert(table_key.clone(), (identity, table_path));
             table_updates.insert(
-                table_key.clone(),
+                identity,
                 crate::db::SubTableUpdate {
+                    identity,
                     table_key: table_key.clone(),
                     table_version: state.version,
                     table_branch: None,
@@ -739,96 +850,27 @@ where
             )?;
         }
 
-        for (target_table_key, source_table_key) in &renamed_tables {
-            let source_entry = snapshot.entry(source_table_key).ok_or_else(|| {
-                OmniError::manifest(format!(
-                    "missing source table '{}' for schema rename",
-                    source_table_key
-                ))
-            })?;
-            let source_ds = existing_heads.get(source_table_key).ok_or_else(|| {
-                OmniError::manifest_internal(format!(
-                    "missing preflighted source table '{}' for schema rename",
-                    source_table_key
-                ))
-            })?;
-            let batch = batch_for_schema_apply_rewrite(
-                db,
-                source_ds,
-                source_table_key,
-                accepted_catalog.as_ref(),
-                target_table_key,
-                &desired_catalog,
-                property_renames.get(target_table_key),
-            )
-            .await?;
-            let table_path = table_path_for_table_key(target_table_key)?;
-            let dataset_uri = db.storage().dataset_uri(&table_path);
-            let mut staged = db.storage().stage_create(&dataset_uri, batch).await?;
-            let planned = planned_transactions.get(target_table_key).ok_or_else(|| {
-                OmniError::manifest_internal(format!(
-                    "missing planned SchemaApply transaction for '{}'",
-                    target_table_key
-                ))
-            })?;
-            staged.bind_transaction_identity(planned)?;
-            let outcome = db
-                .storage()
-                .commit_staged_create_exact(&dataset_uri, staged)
-                .await?;
-            if !outcome.is_exact() {
-                return Err(OmniError::manifest_internal(format!(
-                    "SchemaApply rename target '{}' committed outside its exact version-one transaction plan",
-                    target_table_key
-                )));
-            }
-            committed_transactions.insert(
-                target_table_key.clone(),
-                outcome.committed_transaction().clone(),
-            );
-            let target_ds = outcome.into_snapshot();
-            // Indexes on the renamed table are reconciled later (iss-848).
-            let state = db.storage().table_state(&dataset_uri, &target_ds).await?;
-            table_registrations.insert(target_table_key.clone(), table_path);
-            table_updates.insert(
-                target_table_key.clone(),
-                crate::db::SubTableUpdate {
-                    table_key: target_table_key.clone(),
-                    table_version: state.version,
-                    table_branch: None,
-                    row_count: state.row_count,
-                    version_metadata: state.version_metadata,
-                },
-            );
-            table_tombstones.insert(
-                source_table_key.clone(),
-                source_entry.table_version.saturating_add(1),
-            );
-            crate::failpoints::maybe_fail(
-                crate::failpoints::names::SCHEMA_APPLY_POST_TABLE_COMMIT,
-            )?;
-        }
-
         for table_key in &rewritten_tables {
-            if added_tables.contains(table_key) || renamed_tables.contains_key(table_key) {
+            if added_tables.contains(table_key) {
                 continue;
             }
-            let entry = snapshot.entry(table_key).ok_or_else(|| {
+            let source_table_key = renamed_tables.get(table_key).unwrap_or(table_key);
+            let entry = snapshot.entry(source_table_key).ok_or_else(|| {
                 OmniError::manifest(format!(
-                    "missing source table '{}' for schema apply",
-                    table_key
+                    "missing source table '{}' for schema apply targeting '{}'",
+                    source_table_key, table_key
                 ))
             })?;
-            let source_ds = existing_heads.remove(table_key).ok_or_else(|| {
+            let source_ds = existing_heads.remove(source_table_key).ok_or_else(|| {
                 OmniError::manifest_internal(format!(
                     "missing preflighted source table '{}' for schema apply",
-                    table_key
+                    source_table_key
                 ))
             })?;
             let batch = batch_for_schema_apply_rewrite(
                 db,
                 &source_ds,
-                table_key,
+                source_table_key,
                 accepted_catalog.as_ref(),
                 table_key,
                 &desired_catalog,
@@ -840,7 +882,14 @@ where
             // reopening here would introduce a second HEAD observation.
             let existing = source_ds;
             let mut staged = db.storage().stage_overwrite(&existing, batch).await?;
-            let planned = planned_transactions.get(table_key).ok_or_else(|| {
+            let identity = table_identity_for_schema_key(&desired_ir, table_key)?;
+            if identity != entry.identity {
+                return Err(OmniError::manifest_internal(format!(
+                    "SchemaApply rewrite '{}' changed table identity {} to {}",
+                    table_key, entry.identity, identity
+                )));
+            }
+            let planned = planned_transactions.get(&identity).ok_or_else(|| {
                 OmniError::manifest_internal(format!(
                     "missing planned SchemaApply transaction for '{}'",
                     table_key
@@ -857,18 +906,16 @@ where
                     table_key
                 )));
             }
-            committed_transactions.insert(
-                table_key.clone(),
-                outcome.committed_transaction().clone(),
-            );
+            committed_transactions.insert(identity, outcome.committed_transaction().clone());
             let target_ds = outcome.into_snapshot();
             // The rewrite drops the table's existing index coverage; it is
             // restored off the critical path by optimize's optimize_indices /
             // ensure_indices (iss-848). Reads scan uncovered fragments meanwhile.
             let state = db.storage().table_state(&dataset_uri, &target_ds).await?;
             table_updates.insert(
-                table_key.clone(),
+                identity,
                 crate::db::SubTableUpdate {
+                    identity,
                     table_key: table_key.clone(),
                     table_version: state.version,
                     table_branch: None,
@@ -889,18 +936,48 @@ where
         // pin (no Lance HEAD advances). Reads stay correct meanwhile via a scan.
 
         let mut manifest_changes = Vec::new();
-        let mut expected_versions = HashMap::new();
-        for (table_key, table_path) in table_registrations {
-            expected_versions.insert(table_key.clone(), 0);
+        let mut expected_versions = crate::db::manifest::ExpectedTableVersions::new();
+        for (table_key, (identity, table_path)) in table_registrations {
+            expected_versions.insert(
+                identity,
+                crate::db::manifest::TableVersionExpectation {
+                    table_key: table_key.clone(),
+                    table_version: 0,
+                },
+            );
             manifest_changes.push(ManifestChange::RegisterTable(TableRegistration {
+                identity,
                 table_key,
                 table_path,
             }));
         }
+        for (target_table_key, source_table_key) in &renamed_tables {
+            let source_entry = snapshot.entry(source_table_key).ok_or_else(|| {
+                OmniError::manifest(format!(
+                    "missing source table '{}' for schema rename publication",
+                    source_table_key
+                ))
+            })?;
+            expected_versions.insert(
+                source_entry.identity,
+                crate::db::manifest::TableVersionExpectation {
+                    table_key: source_table_key.clone(),
+                    table_version: source_entry.table_version,
+                },
+            );
+            manifest_changes.push(ManifestChange::RenameTable(
+                crate::db::manifest::TableRename {
+                    identity: source_entry.identity,
+                    expected_table_key: source_table_key.clone(),
+                    table_key: target_table_key.clone(),
+                    table_path: source_entry.table_path.clone(),
+                },
+            ));
+        }
         let confirmed_updates = table_updates.into_values().collect::<Vec<_>>();
         for update in &confirmed_updates {
             let expected = planned_transactions
-                .get(&update.table_key)
+                .get(&update.identity)
                 .map(|transaction| transaction.read_version)
                 .ok_or_else(|| {
                     OmniError::manifest_internal(format!(
@@ -908,12 +985,29 @@ where
                         update.table_key
                     ))
                 })?;
-            expected_versions.insert(update.table_key.clone(), expected);
+            let expected_table_key = renamed_tables
+                .get(&update.table_key)
+                .cloned()
+                .unwrap_or_else(|| update.table_key.clone());
+            expected_versions.insert(
+                update.identity,
+                crate::db::manifest::TableVersionExpectation {
+                    table_key: expected_table_key,
+                    table_version: expected,
+                },
+            );
             manifest_changes.push(ManifestChange::Update(update.clone()));
         }
-        for (table_key, tombstone_version) in table_tombstones {
-            expected_versions.insert(table_key.clone(), tombstone_version.saturating_sub(1));
+        for (identity, (table_key, tombstone_version)) in table_tombstones {
+            expected_versions.insert(
+                identity,
+                crate::db::manifest::TableVersionExpectation {
+                    table_key: table_key.clone(),
+                    table_version: tombstone_version.saturating_sub(1),
+                },
+            );
             manifest_changes.push(ManifestChange::Tombstone(TableTombstone {
+                identity,
                 table_key,
                 tombstone_version,
             }));
@@ -944,7 +1038,7 @@ where
         )
         .await?;
 
-        crate::db::manifest::confirm_schema_apply_sidecar_v7(
+        crate::db::manifest::confirm_schema_apply_sidecar_v9(
             db.root_uri(),
             db.storage_adapter(),
             &mut sidecar,
@@ -992,8 +1086,11 @@ where
         )
         .await?;
 
-        db.store_catalog(desired_catalog);
-        db.store_schema_source(desired_schema_source.to_string());
+        db.store_schema_view(
+            desired_catalog,
+            desired_schema_source.to_string(),
+            &desired_ir,
+        )?;
         db.coordinator.write().await.refresh().await?;
         db.runtime_cache.invalidate_all().await;
         if changed_edge_tables {

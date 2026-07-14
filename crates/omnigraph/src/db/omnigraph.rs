@@ -736,10 +736,21 @@ impl Omnigraph {
     /// already hold `schema_apply_serial_queue_key`; this helper does not acquire
     /// it because the gate is a non-reentrant mutex.
     pub(crate) async fn load_accepted_catalog_with_schema_gate_held(&self) -> Result<Arc<Catalog>> {
+        let catalog = self.build_accepted_catalog_with_schema_gate_held().await?;
+        let snapshot = self.coordinator.read().await.snapshot();
+        validate_bound_catalog_against_snapshot(&catalog, &snapshot)?;
+        Ok(catalog)
+    }
+
+    /// Build the accepted operation-local catalog without joining it to this
+    /// handle's warm manifest snapshot. Coherent read capture uses this form so
+    /// it can run the manifest freshness probe first, then validate the catalog
+    /// against the exact resolved snapshot. Other callers should use
+    /// [`Self::load_accepted_catalog_with_schema_gate_held`] unless they perform
+    /// that post-resolution identity join themselves.
+    async fn build_accepted_catalog_with_schema_gate_held(&self) -> Result<Arc<Catalog>> {
         let (schema_ir, _) =
             load_validated_schema_contract(self.uri(), Arc::clone(&self.storage)).await?;
-        let snapshot = self.coordinator.read().await.snapshot();
-        validate_schema_ir_against_snapshot(&schema_ir, &snapshot)?;
         let mut catalog = build_catalog_from_ir(&schema_ir)?;
         fixup_blob_schemas(&mut catalog);
         Ok(Arc::new(catalog))
@@ -1692,7 +1703,7 @@ impl Omnigraph {
             .write_queue()
             .acquire(&crate::db::manifest::schema_apply_serial_queue_key())
             .await;
-        let catalog = self.load_accepted_catalog_with_schema_gate_held().await?;
+        let catalog = self.build_accepted_catalog_with_schema_gate_held().await?;
         let resolved = self.resolve_target_after_schema_validation(target).await?;
         if validate_live_snapshot {
             validate_bound_catalog_against_snapshot(&catalog, &resolved.snapshot)?;
@@ -1712,7 +1723,7 @@ impl Omnigraph {
             .current_branch()
             .unwrap_or("main")
             .to_string();
-        let catalog = self.load_accepted_catalog_with_schema_gate_held().await?;
+        let catalog = self.build_accepted_catalog_with_schema_gate_held().await?;
         let resolved = self
             .resolve_target_after_schema_validation(ReadTarget::branch(current_branch))
             .await?;
