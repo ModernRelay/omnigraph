@@ -3,9 +3,10 @@
 //! Engine code (`exec/`, `db/omnigraph/`, `loader/`, `changes/`) MUST NOT
 //! call Lance's inline-commit data-write APIs directly. The
 //! `Storage` trait (`crate::storage_layer::TableStorage`) is the canonical
-//! surface; staged primitives (`stage_append`, `stage_merge_insert`,
-//! `stage_overwrite`, `stage_create_indices`) plus `commit_staged` are the only
-//! way to advance Lance HEAD.
+//! surface; graph rows route through the exact-id `stage_keyed_write` adapter,
+//! while the remaining staged primitives plus `commit_staged` are the only way
+//! to advance Lance HEAD. Bare `stage_append` is compiled only for private
+//! primitive tests, never as a graph-visible keyed route.
 //!
 //! The raw storage modules are crate-private and the trait is sealed (only
 //! `TableStore` implements it), so Rust visibility is the primary boundary.
@@ -287,6 +288,11 @@ const LOW_LEVEL_READ_ONLY_SURFACES: &[(&str, &str, &str)] = &[
     (
         "db/graph_coordinator.rs",
         "GraphCoordinator",
+        "load_commits",
+    ),
+    (
+        "db/graph_coordinator.rs",
+        "GraphCoordinator",
         "refresh_manifest_only",
     ),
     ("db/graph_coordinator.rs", "GraphCoordinator", "branch_list"),
@@ -472,10 +478,13 @@ gateway_surfaces! {
         "scan_with_staged", "scan_with_pending", "scan_with_pending_materialized_blobs",
         "first_row_id_for_filter", "table_state", "has_btree_index",
         "has_fts_index", "has_vector_index", "root_uri", "dataset_uri", "scan_stream",
+        "scan_stream_bounded", "scan_stream_for_rewrite_bounded",
+        "scan_proven_insert_delta_bounded",
+        "prepare_keyed_write_batch", "validate_keyed_write_batch", "first_existing_id",
     ],
     "storage_layer.rs" => "TableStorage" => GatewayDisposition::StageOnly => [
-        "stage_create", "stage_append", "stage_append_stream", "stage_merge_insert",
-        "stage_overwrite", "stage_delete", "stage_create_indices",
+        "stage_create", "stage_keyed_write", "stage_proven_strict_insert", "stage_overwrite",
+        "stage_delete", "stage_create_indices",
     ],
     "storage_layer.rs" => "TableStorage" => GatewayDisposition::Durable(WriteProtocol::Composed("first-touch native ref")) => [
         "fork_branch_from_state",
@@ -496,17 +505,21 @@ gateway_surfaces! {
         "new", "root_uri", "dataset_uri", "open_snapshot_table", "open_at_entry",
         "open_dataset_head", "list_branches", "ensure_expected_version",
         "reopen_for_mutation", "scan_batches", "scan_batches_for_rewrite",
-        "scan_stream_for_rewrite", "materialize_blob_batch", "scan_stream",
+        "scan_stream_for_rewrite", "scan_stream_for_rewrite_bounded",
+        "scan_proven_insert_delta_bounded",
+        "materialize_blob_batch", "scan_stream", "scan_stream_bounded",
         "scan_stream_with", "scan", "scan_with", "scan_edges_by_endpoint",
         "key_column_index_coverage", "has_unindexed_fragments", "count_rows",
         "dataset_version", "table_state", "scan_with_staged", "scan_with_pending",
         "scan_with_pending_materialized_blobs", "count_rows_with_staged",
         "has_btree_index", "has_btree_index_on", "has_fts_index", "has_fts_index_on",
         "has_vector_index", "has_vector_index_on", "first_row_id_for_filter",
+        "prepare_keyed_write_batch", "validate_keyed_write_batch", "first_existing_id",
+        "materialize_blob_batch_bounded",
     ],
     "table_store.rs" => "TableStore" => GatewayDisposition::StageOnly => [
-        "stage_create", "stage_append", "stage_append_stream", "stage_merge_insert",
-        "stage_overwrite", "stage_delete", "stage_create_indices",
+        "stage_create", "stage_keyed_write", "stage_proven_strict_insert", "stage_overwrite",
+        "stage_delete", "stage_create_indices",
     ],
     "table_store.rs" => "TableStore" => GatewayDisposition::Durable(WriteProtocol::Composed("first-touch native ref")) => [
         "fork_branch_from_state",
@@ -578,18 +591,17 @@ durable_calls! {
     ("storage_layer.rs", ".commit_staged_create_exact(", 1, WriteProtocol::Exact("sealed TableStorage create forwarding")),
     ("storage_layer.rs", ".commit_staged(", 1, WriteProtocol::Composed("sealed TableStorage forwarding")),
     ("storage_layer.rs", ".commit_staged_exact(", 1, WriteProtocol::Exact("sealed TableStorage forwarding")),
-    ("storage_layer.rs", ".dataset()", 23, WriteProtocol::Composed("sealed TableStorage forwarding")),
-    ("storage_layer.rs", ".into_arc()", 3, WriteProtocol::Composed("sealed TableStorage forwarding")),
+    ("storage_layer.rs", ".dataset()", 25, WriteProtocol::Composed("sealed TableStorage forwarding")),
+    ("storage_layer.rs", ".into_arc()", 4, WriteProtocol::Composed("sealed TableStorage forwarding")),
     ("storage_layer.rs", "SnapshotHandle::new(", 3, WriteProtocol::Composed("sealed TableStorage forwarding")),
     ("table_store.rs", ".raw_dataset_append(", 1, WriteProtocol::EphemeralScratch),
     ("table_store.rs", "Dataset::write(", 2, WriteProtocol::EphemeralScratch),
     ("table_store.rs", "DeleteBuilder::new(", 1, WriteProtocol::Composed("staged delete primitive")),
-    ("table_store.rs", "InsertBuilder::new(", 4, WriteProtocol::Composed("staged insert primitive")),
+    ("table_store.rs", "InsertBuilder::new(", 3, WriteProtocol::Composed("staged insert primitive")),
     ("table_store.rs", "MergeInsertBuilder::try_new(", 1, WriteProtocol::Composed("staged merge primitive")),
     ("table_store.rs", "CommitBuilder::new(", 2, WriteProtocol::Composed("staged commit primitive")),
     ("table_store.rs", ".create_index_builder(", 3, WriteProtocol::Composed("staged index primitive")),
     ("table_store.rs", ".execute_uncommitted(", 8, WriteProtocol::Composed("staged physical primitive")),
-    ("table_store.rs", ".execute_uncommitted_stream(", 1, WriteProtocol::Composed("staged physical primitive")),
     ("exec/staging.rs", "write_sidecar(", 1, WriteProtocol::Exact("Mutation/Load v9")),
     ("exec/merge.rs", "write_sidecar(", 1, MERGE_V9),
     ("db/omnigraph/schema_apply.rs", "write_sidecar(", 1, SCHEMA_V9),
@@ -667,7 +679,7 @@ durable_calls! {
     ("db/manifest/recovery.rs", "publish_recovery_commit(", 8, WriteProtocol::RecoveryExecutor),
     ("db/manifest/recovery.rs", "restore_table_to_version(", 3, WriteProtocol::RecoveryExecutor),
     ("db/manifest/recovery.rs", "record_audit(", 9, WriteProtocol::RecoveryExecutor),
-    ("db/manifest/recovery.rs", "delete_sidecar_by_operation_id(", 18, WriteProtocol::RecoveryExecutor),
+    ("db/manifest/recovery.rs", "delete_sidecar_by_operation_id(", 19, WriteProtocol::RecoveryExecutor),
     ("db/manifest/recovery.rs", "delete_sidecar(", 1, WriteProtocol::RecoveryExecutor),
     ("db/recovery_audit.rs", ".raw_dataset_append(", 1, WriteProtocol::RecoveryExecutor),
     ("db/recovery_audit.rs", "Dataset::write(", 1, WriteProtocol::RecoveryExecutor),
@@ -684,7 +696,7 @@ durable_calls! {
     ("db/omnigraph/optimize.rs", ".dataset()", 5, WriteProtocol::Composed("Optimize v9 planning + physical cleanup")),
     ("db/omnigraph/optimize.rs", ".into_dataset()", 2, OPTIMIZE_V9),
     ("db/omnigraph/optimize.rs", "SnapshotHandle::new(", 1, OPTIMIZE_V9),
-    ("exec/merge.rs", "SnapshotHandle::new(", 4, MERGE_V9),
+    ("exec/merge.rs", "SnapshotHandle::new(", 5, MERGE_V9),
 }
 
 const DURABLE_PRIMITIVES: &[&str] = &[
@@ -1526,6 +1538,85 @@ fn callable_storage_and_manifest_gateway_surfaces_are_registered() {
         missing.is_empty() && unregistered.is_empty(),
         "callable storage/manifest gateway registry drifted. Missing definitions: {missing:?}. \
          Unclassified callable methods: {unregistered:?}"
+    );
+}
+
+/// RFC-023 closes the keyed-Append side door at the source boundary. The raw
+/// append primitives are test-only behind the sealed storage adapter; every
+/// production graph writer must select the exact-id fenced adapter.
+///
+/// This walks syntax rather than text, so comments and test-only fixtures do
+/// not weaken the guard. A future call from mutation, load, branch merge, or a
+/// newly-added production module fails here even if it is added to another
+/// protocol allow-list.
+#[test]
+fn graph_visible_keyed_writes_cannot_reach_unfenced_append() {
+    let src = engine_src_root();
+    let mut violations = Vec::new();
+    for file in protocol_scan_files(&src) {
+        let relative = relative_to_src(&src, &file);
+        // This is the one sealed forwarding boundary. TableStore's inherent
+        // implementation and its cfg(test) primitive coverage contain no
+        // graph-facing call site.
+        if relative == "storage_layer.rs" {
+            continue;
+        }
+        let contents = std::fs::read_to_string(&file)
+            .unwrap_or_else(|error| panic!("failed to read {}: {error}", file.display()));
+        let ast = parse_rust_source(&contents, &relative);
+        let inventory = call_inventory(&ast);
+        for primitive in ["stage_append", "stage_append_stream"] {
+            let count = inventory.counts.get(primitive).copied().unwrap_or(0);
+            if count > 0 {
+                violations.push(format!("{relative}: {primitive} called {count} time(s)"));
+            }
+        }
+    }
+
+    assert!(
+        violations.is_empty(),
+        "graph-visible writes must use the exact-id fenced adapter; bare append call sites found:\n  {}",
+        violations.join("\n  ")
+    );
+}
+
+/// Removing the proven adapter's own target lookup makes its opaque chunk a
+/// correctness capability. Pin the sole production mint to the branch-merge
+/// history classifier/physical replay module; primitive tests may construct
+/// chunks directly, but no other production caller may admit one.
+#[test]
+fn proven_insert_capability_has_one_production_mint_site() {
+    let src = engine_src_root();
+    let mut sites = Vec::new();
+    for file in protocol_scan_files(&src) {
+        let relative = relative_to_src(&src, &file);
+        if relative.contains("/staged_tests.rs") || relative.ends_with("staged_tests.rs") {
+            continue;
+        }
+        let contents = std::fs::read_to_string(&file)
+            .unwrap_or_else(|error| panic!("failed to read {}: {error}", file.display()));
+        let ast = parse_rust_source(&contents, &relative);
+        let count = call_inventory(&ast)
+            .counts
+            .get("from_verified_history")
+            .copied()
+            .unwrap_or(0);
+        if count > 0 {
+            sites.push((relative, count));
+        }
+    }
+    assert_eq!(
+        sites,
+        vec![("exec/merge.rs".to_string(), 1)],
+        "ProvenInsertChunk admission must remain exclusive to verified branch-merge history"
+    );
+
+    let merge = std::fs::read_to_string(src.join("exec/merge.rs"))
+        .expect("read branch-merge implementation for capability-route guard");
+    assert_eq!(
+        merge.matches("KeyedChunkStage::ProvenStrictInsert").count(),
+        2,
+        "the proven staging mode must appear only in its shared-loop match arm and the verified pure-insert publisher; another admission caller would bypass the constructor-site count"
     );
 }
 

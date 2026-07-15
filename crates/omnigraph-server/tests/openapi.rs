@@ -386,6 +386,7 @@ const EXPECTED_SCHEMAS: &[&str] = &[
     "IngestOutput",
     "IngestRequest",
     "IngestTableOutput",
+    "KeyConflictOutput",
     "LoadMode",
     "MergeConflictKindOutput",
     "MergeConflictOutput",
@@ -394,6 +395,7 @@ const EXPECTED_SCHEMAS: &[&str] = &[
     "ReadSetConflictOutput",
     "ReadTargetOutput",
     "RecoveryRequiredOutput",
+    "ResourceLimitOutput",
     "ManifestConflictOutput",
     "SchemaApplyOutput",
     "SchemaApplyRequest",
@@ -617,6 +619,8 @@ fn error_output_schema_has_expected_fields() {
     assert!(props.contains_key("merge_conflicts"));
     assert!(props.contains_key("manifest_conflict"));
     assert!(props.contains_key("read_set_conflict"));
+    assert!(props.contains_key("key_conflict"));
+    assert!(props.contains_key("resource_limit"));
     assert!(props.contains_key("recovery_required"));
 }
 
@@ -637,6 +641,25 @@ fn read_set_conflict_output_schema_has_expected_fields() {
     let props = schema["properties"].as_object().unwrap();
     assert!(props.contains_key("member"));
     assert!(props.contains_key("expected"));
+    assert!(props.contains_key("actual"));
+}
+
+#[test]
+fn key_conflict_output_schema_has_expected_fields() {
+    let doc = openapi_json();
+    let schema = &doc["components"]["schemas"]["KeyConflictOutput"];
+    let props = schema["properties"].as_object().unwrap();
+    assert!(props.contains_key("table_key"));
+    assert!(props.contains_key("key"));
+}
+
+#[test]
+fn resource_limit_output_schema_has_expected_fields() {
+    let doc = openapi_json();
+    let schema = &doc["components"]["schemas"]["ResourceLimitOutput"];
+    let props = schema["properties"].as_object().unwrap();
+    assert!(props.contains_key("resource"));
+    assert!(props.contains_key("limit"));
     assert!(props.contains_key("actual"));
 }
 
@@ -972,6 +995,30 @@ fn recovery_barrier_write_endpoints_document_recovery_required() {
             response["content"]["application/json"]["schema"]["$ref"],
             "#/components/schemas/ErrorOutput",
             "{method} {path} 503 must use ErrorOutput"
+        );
+    }
+}
+
+#[test]
+fn bounded_keyed_write_endpoints_document_resource_limit() {
+    let doc = openapi_json();
+    for (path, method) in [
+        ("/graphs/{graph_id}/change", "post"),
+        ("/graphs/{graph_id}/mutate", "post"),
+        ("/graphs/{graph_id}/queries/{name}", "post"),
+        ("/graphs/{graph_id}/load", "post"),
+        ("/graphs/{graph_id}/ingest", "post"),
+        ("/graphs/{graph_id}/branches/merge", "post"),
+    ] {
+        let response = &doc["paths"][path][method]["responses"]["413"];
+        assert!(
+            response.is_object(),
+            "{method} {path} must document the keyed-write resource-limit 413 outcome"
+        );
+        assert_eq!(
+            response["content"]["application/json"]["schema"]["$ref"],
+            "#/components/schemas/ErrorOutput",
+            "{method} {path} 413 must use ErrorOutput"
         );
     }
 }

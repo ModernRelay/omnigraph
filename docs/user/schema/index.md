@@ -32,7 +32,7 @@
 
 | Constraint | On | Effect |
 |---|---|---|
-| `@key(p, …)` | node | Primary key; implies index on key columns; `key_property()` returns the first key |
+| `@key(p, …)` | node | Primary key; the complete ordered tuple identifies the node and implies indexes on its columns |
 | `@unique(p, …)` | node, edge | Uniqueness across listed columns |
 | `@index(p, …)` | node, edge | Build a scalar (BTREE) index on the columns |
 | `@range(p, min..max)` | node | Numeric range validation (open ranges allowed) |
@@ -53,6 +53,19 @@ Edge bodies only allow `@unique` and `@index`.
 
 - Each node type compiles to a table with an `id: Utf8` column plus all declared properties (blob columns are stored as `LargeBinary`); `implements` clauses expand the interface's properties into the node.
 - Each edge type compiles to a table with `id: Utf8, src: Utf8, dst: Utf8` plus the edge's own properties. Edge endpoint types (`from`/`to`) must exist, and edge names are matched case-insensitively.
+
+For a keyed node, `id` is derived from the complete typed `@key` tuple. A
+single-column key keeps its canonical scalar spelling. A composite key is an
+unambiguous JSON array of those canonical scalar strings, ordered by stable
+property identity so renaming a key property cannot change existing node IDs.
+Integers use decimal spelling, booleans use `true`/`false`, Date and DateTime
+use their stored epoch-day and epoch-millisecond values, finite floats use
+their stored-width spelling, and both signed zeros become `0`; non-finite
+floats are not valid keys. Load and mutation use this same derivation. Exported
+keyed rows include the physical `data.id`; on rebuild, a legacy scalar spelling
+that is typed-equivalent is accepted and rewritten to the canonical ID, with
+typed edge endpoints rewritten in the same import. New hand-authored rows may
+omit `data.id` and let the loader derive it.
 
 ## Schema migration planning
 

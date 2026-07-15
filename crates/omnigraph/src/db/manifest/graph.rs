@@ -1,9 +1,10 @@
 use std::collections::HashMap;
 
 use arrow_array::{RecordBatch, RecordBatchIterator};
-use arrow_schema::SchemaRef;
+use arrow_schema::{Field, Schema, SchemaRef};
 use lance::Dataset;
 use lance::dataset::{WriteMode, WriteParams};
+use lance::datatypes::{LANCE_UNENFORCED_PRIMARY_KEY, LANCE_UNENFORCED_PRIMARY_KEY_POSITION};
 use lance_file::version::LanceFileVersion;
 use omnigraph_compiler::catalog::Catalog;
 
@@ -172,8 +173,14 @@ async fn build_initial_entries(
 }
 
 async fn create_empty_dataset(uri: &str, schema: &SchemaRef) -> Result<Dataset> {
+    // Keep initialization self-contained even for manifest-level callers that
+    // construct an identity-bound compiler catalog directly in tests. Engine
+    // catalogs already carry this metadata, but there must never be a
+    // create-then-annotate window: Lance makes the PK metadata immutable after
+    // dataset creation and RFC-023 activates it only for new format-v6 graphs.
+    let schema = keyed_graph_table_schema(schema)?;
     let batch = RecordBatch::new_empty(schema.clone());
-    let reader = RecordBatchIterator::new(vec![Ok(batch)], schema.clone());
+    let reader = RecordBatchIterator::new(vec![Ok(batch)], schema);
     let params = WriteParams {
         mode: WriteMode::Create,
         enable_stable_row_ids: true,
@@ -186,4 +193,45 @@ async fn create_empty_dataset(uri: &str, schema: &SchemaRef) -> Result<Dataset> 
     Dataset::write(reader, uri, Some(params))
         .await
         .map_err(|e| OmniError::Lance(e.to_string()))
+}
+
+fn keyed_graph_table_schema(schema: &SchemaRef) -> Result<SchemaRef> {
+    let mut id_count = 0;
+    let fields = schema
+        .fields()
+        .iter()
+        .map(|field| {
+            let mut field = field.as_ref().clone();
+            let mut metadata = field.metadata().clone();
+            metadata.remove(LANCE_UNENFORCED_PRIMARY_KEY_POSITION);
+            if field.name() == "id" {
+                id_count += 1;
+                metadata.insert(LANCE_UNENFORCED_PRIMARY_KEY.to_string(), "true".to_string());
+            } else {
+                metadata.remove(LANCE_UNENFORCED_PRIMARY_KEY);
+            }
+            field.set_metadata(metadata);
+            field
+        })
+        .collect::<Vec<Field>>();
+
+    if id_count != 1 {
+        return Err(OmniError::manifest_internal(format!(
+            "graph table initialization requires exactly one top-level `id` field; found {id_count}"
+        )));
+    }
+    let id = fields
+        .iter()
+        .find(|field| field.name() == "id")
+        .expect("id_count == 1");
+    if id.is_nullable() {
+        return Err(OmniError::manifest_internal(
+            "graph table initialization requires a non-null `id` field",
+        ));
+    }
+
+    Ok(std::sync::Arc::new(Schema::new_with_metadata(
+        fields,
+        schema.metadata.clone(),
+    )))
 }

@@ -17,8 +17,8 @@ use std::env;
 use std::fs;
 
 use omnigraph_cluster::{
-    apply_config_dir, import_config_dir, read_serving_snapshot,
-    read_serving_snapshot_from_storage, status_config_dir, validate_config_dir,
+    apply_config_dir, import_config_dir, read_serving_snapshot, read_serving_snapshot_from_storage,
+    status_config_dir, validate_config_dir,
 };
 use ulid::Ulid;
 
@@ -144,12 +144,8 @@ async fn s3_cluster_full_lifecycle_import_apply_serve_evolve_delete() {
         .approvals_required
         .first()
         .expect("graph delete requires approval");
-    let approve = omnigraph_cluster::approve_config_dir(
-        dir.path(),
-        &approval.resource,
-        "e2e-operator",
-    )
-    .await;
+    let approve =
+        omnigraph_cluster::approve_config_dir(dir.path(), &approval.resource, "e2e-operator").await;
     assert!(approve.ok, "{:?}", approve.diagnostics);
     let delete = apply_config_dir(dir.path()).await;
     assert!(delete.ok && delete.converged, "{:?}", delete.diagnostics);

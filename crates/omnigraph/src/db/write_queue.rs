@@ -129,10 +129,7 @@ impl WriteQueueManager {
     /// RFC-022-enrolled callers MUST acquire this before any per-table queue.
     /// It is an in-process contention optimization only; publisher OCC and
     /// recovery remain the correctness authorities.
-    pub(crate) async fn acquire_branch(
-        &self,
-        branch: Option<&str>,
-    ) -> OwnedMutexGuard<()> {
+    pub(crate) async fn acquire_branch(&self, branch: Option<&str>) -> OwnedMutexGuard<()> {
         let key = branch.map(str::to_string);
         self.branch_slot(&key).lock_owned().await
     }

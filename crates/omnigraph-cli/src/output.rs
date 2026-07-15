@@ -187,7 +187,11 @@ pub(crate) fn print_cluster_plan_human(output: &PlanOutput) {
             output.approvals_required.len()
         );
         for change in &output.changes {
-            let bindings = if change.binding_change { " [bindings]" } else { "" };
+            let bindings = if change.binding_change {
+                " [bindings]"
+            } else {
+                ""
+            };
             println!("  {:?} {}{bindings}", change.operation, change.resource);
             if let Some(migration) = &change.migration {
                 if !migration.supported {
@@ -228,14 +232,20 @@ pub(crate) fn print_cluster_apply_human(output: &ApplyOutput) {
             "  state: revision {}, converged: {}, written: {}",
             state.state_revision, output.converged, output.state_written
         );
-        println!("  note: cluster-booted servers (--cluster) serve this on their next restart; omnigraph.yaml deployments are unaffected");
+        println!(
+            "  note: cluster-booted servers (--cluster) serve this on their next restart; omnigraph.yaml deployments are unaffected"
+        );
     }
     print_cluster_diagnostics(&output.diagnostics);
 }
 
 pub(crate) fn print_cluster_apply_changes(changes: &[omnigraph_cluster::PlanChange]) {
     for change in changes {
-        let bindings = if change.binding_change { " [bindings]" } else { "" };
+        let bindings = if change.binding_change {
+            " [bindings]"
+        } else {
+            ""
+        };
         match (&change.disposition, change.reason.as_deref()) {
             (Some(disposition), Some(reason)) => println!(
                 "  {:?} {}{bindings} [{disposition:?}: {reason}]",
@@ -686,7 +696,9 @@ pub(crate) fn render_prop_type(prop_type: &omnigraph_compiler::PropType) -> Stri
     }
 }
 
-pub(crate) fn render_constraint(constraint: &omnigraph_compiler::schema::ast::Constraint) -> String {
+pub(crate) fn render_constraint(
+    constraint: &omnigraph_compiler::schema::ast::Constraint,
+) -> String {
     match constraint {
         omnigraph_compiler::schema::ast::Constraint::Key(columns) => {
             format!("@key({})", columns.join(", "))
@@ -706,7 +718,9 @@ pub(crate) fn render_constraint(constraint: &omnigraph_compiler::schema::ast::Co
     }
 }
 
-pub(crate) fn render_annotations(annotations: &[omnigraph_compiler::schema::ast::Annotation]) -> String {
+pub(crate) fn render_annotations(
+    annotations: &[omnigraph_compiler::schema::ast::Annotation],
+) -> String {
     annotations
         .iter()
         .map(|annotation| {
@@ -765,10 +779,7 @@ pub(crate) fn print_snapshot_human(
     }
 }
 
-pub(crate) fn print_read_output(
-    output: &ReadOutput,
-    format: ReadOutputFormat,
-) -> Result<()> {
+pub(crate) fn print_read_output(output: &ReadOutput, format: ReadOutputFormat) -> Result<()> {
     println!(
         "{}",
         render_read(output, format, &resolve_table_render_options())?
@@ -822,7 +833,11 @@ pub(crate) fn print_commit_human(commit: &CommitOutput) {
     println!("created_at: {}", commit.created_at);
 }
 
-pub(crate) fn print_policy_explain(decision: &PolicyDecision, actor_id: &str, request: &PolicyRequest) {
+pub(crate) fn print_policy_explain(
+    decision: &PolicyDecision,
+    actor_id: &str,
+    request: &PolicyRequest,
+) {
     println!(
         "decision: {}",
         if decision.allowed { "allow" } else { "deny" }

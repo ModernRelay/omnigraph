@@ -1567,6 +1567,70 @@ mod tests {
     }
 
     #[test]
+    fn runtime_composite_key_order_survives_lexically_crossing_property_renames() {
+        let accepted = initialize(
+            r#"
+node Pair {
+  alpha: String
+  zeta: String
+  @key(alpha, zeta)
+}
+"#,
+        );
+        let accepted_catalog = build_catalog_from_ir(&accepted).unwrap();
+        assert_eq!(
+            accepted_catalog.node_types["Pair"].key.as_deref(),
+            Some(&["alpha".to_string(), "zeta".to_string()][..])
+        );
+
+        let desired = compile_schema_shape(
+            &parse_schema(
+                r#"
+node Pair {
+  aaaa: String @rename_from("zeta")
+  zzzz: String @rename_from("alpha")
+  @key(aaaa, zzzz)
+}
+"#,
+            )
+            .unwrap(),
+        )
+        .unwrap();
+        let resolved = resolve_schema_ir(&accepted, &desired).unwrap().schema_ir;
+
+        let ir_key_names = resolved.nodes[0]
+            .constraints
+            .iter()
+            .find_map(|constraint| match constraint {
+                ConstraintIR::Key { fields } => Some(
+                    fields
+                        .iter()
+                        .map(|field| match field {
+                            FieldRefIR::Property(reference) => reference.property_name.as_str(),
+                            FieldRefIR::System(_) => {
+                                panic!("node key unexpectedly uses system field")
+                            }
+                        })
+                        .collect::<Vec<_>>(),
+                ),
+                _ => None,
+            })
+            .unwrap();
+        assert_eq!(
+            ir_key_names,
+            ["aaaa", "zzzz"],
+            "schema-shape normalization is intentionally lexical"
+        );
+
+        let resolved_catalog = build_catalog_from_ir(&resolved).unwrap();
+        assert_eq!(
+            resolved_catalog.node_types["Pair"].key.as_deref(),
+            Some(&["zzzz".to_string(), "aaaa".to_string()][..]),
+            "runtime tuple order must follow preserved property identity, not renamed spelling"
+        );
+    }
+
+    #[test]
     fn exact_name_wins_and_stale_hint_is_diagnostic_only() {
         let accepted = initialize("node Person { name: String }");
         let desired = parse_schema(

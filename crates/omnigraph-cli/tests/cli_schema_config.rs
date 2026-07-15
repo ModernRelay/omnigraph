@@ -11,7 +11,6 @@ mod support;
 
 use support::*;
 
-
 #[test]
 fn version_command_prints_current_cli_version() {
     let output = output_success(cli().arg("version"));

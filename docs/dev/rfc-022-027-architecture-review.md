@@ -1,6 +1,7 @@
 # Architecture review: RFC-022 through RFC-028
 
-**Status:** RFC-022 and RFC-028 implemented; RFC-023–027 review and acceptance work remains open
+**Status:** RFC-022, RFC-023, and RFC-028 implemented; RFC-024–027 review and
+acceptance work remains open
 **Date:** 2026-07-11
 **Audience:** RFC authors, engine/storage maintainers, and release reviewers
 **Reviewed against:** OmniGraph 0.8.1; Lance 9.0.0-beta.15 at
@@ -12,8 +13,11 @@ not precise enough
 `1aec14652dcbace23ac277fa8ced35000bea0c40`; see the
 [2026-07-12 alignment audit](lance.md#last-alignment-audit-2026-07-12-lance-900-beta21-upstream-omnigraph-pinned-at-900-beta21-via-git-rev).
 **RFC-023 substrate evidence revalidated against:** the same beta.21 revision;
-filter-shape and conflict-order probes are recorded in RFC-023 §2 and do not
-constitute fencing activation or acceptance.
+filter-shape and conflict-order probes are recorded in RFC-023 §2. Internal
+schema v6 now consumes that evidence through exact-`id` fenced production
+routing. Its final insertion-absence certificate/no-target-preflight route and
+predeclared 10K/100K production series now satisfy the remaining implementation
+and acceptance gates.
 **RFC-026 substrate contract revalidated against:** the same beta.21 revision;
 the full MemWAL table and system-index specifications, including the
 durability/fencing behavior carried forward from beta.17, are reflected in the
@@ -23,8 +27,10 @@ revision and the full matching table/index/branch/tag/cleanup, transaction, and
 row-lineage specification sections; their survey headers now record beta.21.
 
 This is a review ledger, not a competing specification. The RFCs remain the
-normative design records: RFC-022 documents the implemented protocol and its
-siblings remain proposals. A finding is closed only when the affected RFC either:
+normative design records: RFC-022/RFC-028 document implemented contracts;
+RFC-023 now documents an implemented and fully accepted contract; the later
+siblings remain proposals. A finding is closed only when the affected RFC
+either:
 
 1. incorporates the required contract and tests; or
 2. explicitly rejects the finding with evidence and records the resulting
@@ -76,6 +82,10 @@ remain:
 - MemWAL is treated as Lance's strategic streaming architecture, with API and
   format evolution as the integration risk;
 - keyed fast-forward merge now has an explicit embedding-table memory gate;
+- its final production shortcut consumes a complete persisted v1
+  insertion-absence chain, revalidates both native ref incarnations, and emits
+  another certified filtered `Update` without a target preflight, target join,
+  or committed Append, so the proof composes across branch generations;
 - the legacy `__manifest` PK representation is preserved rather than
   “normalized” into an incompatible form;
 - cleanup's required operating cadence and the cost of indefinite deferral are
@@ -240,8 +250,9 @@ then exercise removal only after subprocess death/offline isolation.
 [RFC-023 §6](../rfcs/0023-key-conflict-fencing.md#6-retry-and-validation-semantics),
 and [RFC-026 §6](../rfcs/0026-memwal-streaming-ingest.md#6-fold-protocol)
 
-**Status:** Closed in specification on 2026-07-14. RFC-022 is shipped;
-RFC-023/RFC-026 failpoint evidence remains an acceptance gate for those drafts.
+**Status:** Closed in specification on 2026-07-14 and in the RFC-023
+implementation on 2026-07-15. RFC-026 failpoint evidence remains an acceptance
+gate for that draft.
 
 A retryable concurrent inserted-row-filter conflict is detected when a table
 transaction attempts to commit. (`WhenMatched::Fail` may instead report a
@@ -286,6 +297,21 @@ retains the sidecar and returns `RecoveryRequired`; strict insert applies the
 same recovery precedence and never changes mode. RFC-026 §6 applies that rule
 to folds and forbids replanning `merged_generations` around unresolved state.
 Both RFCs require the table-N-after-table-1 failpoint before acceptance.
+RFC-023 now has both Mutation/Load adapter-specific cells:
+`rfc023_effect_free_conflict_is_typed_or_fully_reprepared` proves strict
+`KeyConflict` versus a fresh upsert reprepare, and
+`rfc023_table_n_conflict_after_table_1_keeps_recovery_ownership` proves the
+partial-effect `RecoveryRequired` outcome with the exact sidecar retained.
+This normalization does not extend to BranchMerge's internal strict chunks:
+once its exact `protocol_v4` chain is armed, any chunk conflict—including the
+first chunk before a merge-owned effect lands—retains recovery ownership and
+returns `RecoveryRequired` without a semantic merge retry.
+Nor is Lance's broad retryable class alone proof of a key collision. After an
+effect-free Mutation/Load intent is retired, strict insert re-probes the
+attempted IDs against fresh manifest-visible authority; only an exact match is
+`KeyConflict`, while no match is an internal typed read-set conflict that causes
+bounded full strict-mode reprepare.
+RFC-026 must supply the equivalent evidence for folds when implemented.
 
 ### BLOCKER-04 — live graph branches need physical GC protection
 
@@ -435,10 +461,11 @@ failover for those operations merely because MemWAL has a shard epoch.
 and [RFC-026 §8](../rfcs/0026-memwal-streaming-ingest.md#8-epoch-fenced-quiescence-barrier),
 with the shared contract in [RFC-028](../rfcs/0028-stable-schema-identity.md)
 
-**Status:** Closed in implementation on 2026-07-15. RFC-028 is active in
-SchemaIR v2, internal manifest schema v5, every writer/recovery envelope, and
-identity-derived table paths. Identity-consuming siblings may rely on that
-contract while retaining their independent activation gates.
+**Status:** Closed in implementation on 2026-07-15. RFC-028 was activated by
+SchemaIR v2 and internal manifest schema v5 and remains intact in v6, every
+writer/recovery envelope, and identity-derived table path. Identity-consuming
+siblings may rely on that contract while retaining their independent activation
+gates.
 
 The reviewed drafts had RFC-024 exclusively owning stable table identity and
 incarnation while RFC-025 called heads optional and RFC-026 persisted a stable
@@ -516,8 +543,8 @@ metadata selects its lifecycle:
 
 RFC-022 through RFC-028 now identify the maintainer design-series track and an
 owner. RFC-022 and RFC-028 are `implemented` at their documented support
-boundaries, RFC-023 through RFC-026 remain `draft`, and RFC-027 remains
-`research-blocked`.
+boundaries, RFC-023 is `implemented`, RFC-024 through RFC-026 remain `draft`,
+and RFC-027 remains `research-blocked`.
 All formal RFC filenames in the central directory are normalized to four
 digits. Legacy `docs/dev/rfc-00N-*` files remain in place with their existing
 lifecycle; they are internal design and implementation records, not members of
@@ -672,8 +699,10 @@ revalidation without RFC-024.
 [RFC-026 §11](../rfcs/0026-memwal-streaming-ingest.md#11-format-activation-and-rebuild),
 and [RFC-028 §8](../rfcs/0028-stable-schema-identity.md#8-format-activation-and-upgrade)
 
-**Status:** Closed in specification on 2026-07-14; each format still requires
-its own implementation and genuine old/new-binary evidence before acceptance.
+**Status:** Closed in specification on 2026-07-14. RFC-023 assigns and
+implements internal schema v6; its genuine v5↔v6 rebuild and bidirectional
+refusal run passed on 2026-07-15. Each later format still requires its own
+implementation and genuine evidence.
 
 The reviewed RFC-023 and RFC-024 drafts designed all-branch, in-place conversion
 protocols even though OmniGraph's strict-single-version strand intentionally has
@@ -693,20 +722,23 @@ unselected branches and history is explicit rather than hidden behind the word
 
 ### TIGHTENING-01 — symmetric Lance conflicts are not obviously an activation gate
 
-**Status:** the deciding beta.21 substrate check is closed; the production
-routing and activation dispositions remain open.
+**Status:** Closed in implementation and acceptance on 2026-07-15. The beta.21
+substrate check, v6 production routing proof, genuine v5↔v6 cross-version
+evidence, small-upsert/one-ceiling substrate cells, and corrected production
+BranchMerge latency/RSS series are green.
 
 RFC-023 correctly identifies Lance's directional filtered/unfiltered behavior.
 However, its own mandatory fleet outage, recovery drain, historical-duplicate
 validation, stamp-last activation, and old-binary refusal are intended to make
 unfiltered writers unreachable after activation.
 
-The current RFC-023 routing table still permits a direct existing-row `Update`,
-whose Lance operation has no inserted-row filter. Therefore unfiltered
-transactions do remain reachable after activation. Symmetry can be demoted only
-if every insertion-bearing keyed path routes through filtered merge-insert and
-the RFC proves a direct update cannot insert a row or change `id`; affected-row
-conflict metadata must continue to cover updates to the same existing row.
+At the time of this finding, the RFC-023 routing table still permitted a direct
+existing-row `Update`, and the emitted filter shape had not yet been measured.
+The required disposition was therefore to prove that every insertion-bearing
+keyed path routes through the filtered adapter and that a matched-only update
+cannot insert a row or change `id`; affected-row conflict metadata must continue
+to cover updates to the same existing row. The beta.21 measurement and v6
+routing closure recorded below satisfy that disposition.
 
 After that narrowing, upstream symmetry is useful defense in depth and a
 valuable Lance surface guard, but it need not block activation for transaction
@@ -729,11 +761,11 @@ protected by symmetry in either case.
 > favor of a possible demotion. It does **not** close activation: the
 > scalar-indexed/default-v1 path still emits `None`, keyed Append remains
 > reachable in today's engine, and beta.21 still permits unfiltered Update or
-> Append to land second after a filtered Update. TIGHTENING-01 remains open
-> until the engine proves every insertion-bearing keyed path is filtered,
-> structurally forbids keyed Append, and proves any remaining unfiltered update
-> cannot insert or alter `id`. Upstream symmetry is defense in depth only after
-> that proof.
+> Append to land second after a filtered Update. Internal schema v6 now closes
+> that routing condition: every production insertion-bearing graph path uses
+> the exact-`id`, forced-v2 keyed adapter, generic Append is test-only, and the
+> adapter verifies the emitted field-ID filter. Upstream symmetry is therefore
+> defense in depth rather than an activation prerequisite.
 
 ## Specification and acceptance tightening
 
@@ -757,7 +789,9 @@ affected RFC is accepted or implemented:
    RFC-026 define independent-release rebuilds and combined initialization /
    recovery gates for co-release. Cleanup continues to require persistent
    quiescence whenever streams are enrolled.
-5. **Memory measurement:** `helpers::cost` measures I/O, not peak RSS. RFC-023's
+5. **Memory measurement (RFC-023 production bulk cell closed 2026-07-15;
+   RFC-027 still pending):**
+   `helpers::cost` measures I/O, not peak RSS. RFC-023's
    adopted-merge and RFC-027's lineage memory gates should use the subprocess
    `scenarios.rs` harness or an equivalent `wait4`/`ru_maxrss` instrument and
    name dataset sizes, baseline, cap, and pass threshold.
@@ -766,6 +800,66 @@ affected RFC is accepted or implemented:
    > §11.4 memory gate added that day states the bound ("peak memory bounded by
    > batch size") without naming an instrument that can measure it — this item
    > is what makes that gate enforceable rather than aspirational.
+
+   RFC-023 now has a subprocess `wait4`/`ru_maxrss` scenario instrument for the
+   indexed-target upsert scale curve, one exact filtered transaction at the
+   Mutation/Load ceiling, and an embedding-bearing all-new adopt. The corrected
+   adopt normal arm executes the full graph lifecycle and measured production
+   `Omnigraph::branch_merge`; `--baseline` is explicitly only a labeled direct
+   Lance Append comparator.
+
+   The final production route admits its shortcut only from a complete
+   persisted `omnigraph.insert_absence = "v1"` chain. StrictInsert mints a link
+   after exact preflight; an all-new Upsert may mint one only when completed
+   statistics prove one-attempt insert-only effects, with certification failure
+   treated as an optimization miss. Every consumed link must bind the exact
+   parent, filtered insertion-only `Update`, full nested schema field-ID
+   preorder, and physical-row total. Under the final gates the source and
+   existing target native ref incarnations are both revalidated. The output
+   uses public `InsertBuilder` only to stage immutable fragments, replaces its
+   uncommitted Append descriptor with another certified filtered `Update`, and
+   therefore composes across later branch generations. It performs no target-ID
+   preflight, target merge join, committed Append, general ordered diff, or
+   temporary delta. A first-touch lazy target stays on the ref-only fork path;
+   missing or unfamiliar history falls back to the general route. Raw Lance
+   writers remain unsupported and the marker is explicitly non-cryptographic.
+   Its first whole-delta fenced-adopt diagnostic failed decisively (about 447
+   MB peak RSS at 100K × 256 versus 74 MB for Append), so production was changed
+   to actual chunks capped at 8,192 rows / 32 MiB in a pre-minted transaction
+   chain under one sidecar, with a 1,024 logical data-transaction ceiling.
+   Exact recovery's distinct 1,026-version history bound reserves one allowed
+   index tail and one compensating restore.
+   Mutation/Load intentionally remains one transaction per table and refuses
+   the same row/byte ceiling before arming; larger incremental loads are
+   operator-chunked graph commits rather than an unreviewed v3 chain protocol.
+   External Blob URI cells are size-summed before payload reads and materialized
+   on keyed Append/Merge because Lance merge-insert has no `WriteParams` hook;
+   Overwrite retains external-reference semantics.
+   Three-run release evidence on an Apple M5 Pro records the host and uncapped
+   macOS `RLIMIT_AS` limitation. The 1M small-upsert cell passed 29 ms median /
+   243,875,840-byte max RSS against 50 ms / 256 MiB thresholds, and the 8,192 ×
+   256 ceiling cell peaked at 104,333,312 bytes against 128 MiB. The recorded
+   10K/100K bounded-bulk rows passed their *direct-substrate* comparison, but
+   the old normal arm directly staged Lance merge-insert chunks and omitted the
+   production BranchMerge pipeline. The first corrected full-lifecycle 10K
+   series then failed both production thresholds: 30.0× median latency and
+   108,625,920-byte maximum paired RSS overhead versus the raw Append
+   comparator. That result triggered the certificate/source-interval shortcut
+   above while retaining the bounded recovery chain. A one-transaction
+   replacement was rejected because beta.21's v2 join constructs an unbounded
+   DataFusion runtime.
+
+   After a passing no-target-preflight diagnostic, the exact output paths,
+   clean tree/binary digest, five seeds per size, and AB/BA/AB/BA/AB order were
+   predeclared. The final 10K production/comparator medians were 31/8 ms
+   (**3.875×**) with maximum signed paired peak-RSS overhead 24,297,472 bytes.
+   The 100K medians were 136/35 ms (**about 3.886×**) with maximum overhead
+   32,604,160 bytes. Both pass the fixed 5× and 67,108,864-byte gates. All 20
+   aggregate records, all 60 setup/operation/verification child phases,
+   exact-content checks, and route assertions passed with no replacement or
+   completed-trial exclusion. RFC-023's production performance gate is closed.
+   Full tables and methodology are in RFC-023 §11.4. RFC-027 still needs its own
+   evidence.
 6. **Derived-index fallbacks:** acceptance tests must force index-absent and
    partially covered states for RFC-024 head lookup and RFC-027 candidate
    discovery, assert identical logical results, and assert the promised
@@ -779,8 +873,10 @@ The review does not require all RFCs to land together. A safe order is:
    branch-control recovery, coarse `graph_head` OCC, foreign-branch fact
    classification, writer-surface closure, and lifecycle are dispositioned;
 2. RFC-028's stable identity capability landed on 2026-07-15;
-3. accept RFC-023 once partial-effect retry and its format/fleet implementation
-   and evidence are complete;
+3. RFC-023's optimized production BranchMerge bulk latency/RSS cells passed on
+   2026-07-15; the RFC is implemented with its operator duplicate-repair
+   runbook, v6 routing/PK, effect-aware recovery, bounded safety, certificate
+   chain, and independent named-branch rebuild evidence complete;
 4. evaluate RFC-024 independently on its physical lookup cost gate;
 5. accept RFC-025 after physical protection of both checkpoints and live graph
    branches plus strict-rebuild implementation evidence;
@@ -796,7 +892,16 @@ optimization or research result does not hold correctness work hostage.
 > 💬 **Order update (2026-07-14):** BLOCKER-04's shipped-cleanup prerequisite is
 > complete and RFC-025 §6 incorporates its floor. TIGHTENING-01's beta.21 check
 > landed `Some(empty)`, so an upstream symmetry change may be demoted after the
-> engine routing proof. Step 3 remains blocked on that proof, RFC-023's
-> partial-effect recovery implementation evidence, stable identity, the cost
-> gates, and its format/fleet barrier; the substrate result alone does not move
-> acceptance.
+> engine routing proof. That routing proof, stable identity, and RFC-023's
+> effect-aware recovery implementation are now present in v6. The 16-writer
+> stress, blob/duplicate-rebuild, branch-fork, restore, later-import, fresh-no-
+> match, row/byte/transaction-boundary, both between-chunk recovery directions,
+> separately rebuilt named-branch identity/history, genuine-v5 reverse-refusal,
+> and the small-upsert/one-ceiling cost cells are green as of 2026-07-15. The
+> historical bounded-bulk rows were substrate-only, and the first corrected
+> 10K production series failed both thresholds. That historical block is now
+> closed: the certificate/no-target-preflight diagnostic passed, followed by
+> predeclared five-pair 10K and 100K series at 3.875× / ~3.886× median latency
+> and 24,297,472 / 32,604,160-byte maximum paired RSS overhead. The operator
+> duplicate-repair procedure in RFC-023 §11 is complete. The destructive-
+> recovery topology remains single-writer-process.

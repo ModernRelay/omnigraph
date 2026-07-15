@@ -1,14 +1,15 @@
-use std::ffi::OsString;
-use std::fs;
-use std::io::{self, Write};
-use std::path::PathBuf;
 use clap::{Arg, ArgAction, Args, CommandFactory, FromArgMatches, Parser, Subcommand, ValueEnum};
 use color_eyre::eyre::{Result, bail};
 use omnigraph::db::{Omnigraph, ReadTarget, SnapshotId};
 use omnigraph::loader::LoadMode;
+use omnigraph_api_types::{
+    ChangeOutput, CommitOutput, ErrorOutput, IngestOutput, ReadOutput, SchemaApplyOutput,
+    SnapshotTableOutput,
+};
 use omnigraph_cluster::{
-    ApplyOptions, ApplyOutput, ApproveOutput, DiagnosticSeverity, ForceUnlockOutput, PlanOutput, StateSyncOutput, StatusOutput,
-    ValidateOutput, apply_config_dir_with_options, approve_config_dir, force_unlock_config_dir, import_config_dir, plan_config_dir,
+    ApplyOptions, ApplyOutput, ApproveOutput, DiagnosticSeverity, ForceUnlockOutput, PlanOutput,
+    StateSyncOutput, StatusOutput, ValidateOutput, apply_config_dir_with_options,
+    approve_config_dir, force_unlock_config_dir, import_config_dir, plan_config_dir,
     refresh_config_dir, status_config_dir, validate_config_dir,
 };
 use omnigraph_compiler::query::parser::parse_query;
@@ -17,10 +18,6 @@ use omnigraph_compiler::{
     JsonParamMode, ParamMap, QueryLintOutput, QueryLintQueryKind, QueryLintSchemaSource,
     QueryLintSeverity, QueryLintStatus, SchemaMigrationPlan, SchemaMigrationStep, build_catalog,
     json_params_to_param_map, lint_query_file,
-};
-use omnigraph_api_types::{
-    ChangeOutput, CommitOutput, ErrorOutput, IngestOutput, ReadOutput, SchemaApplyOutput,
-    SnapshotTableOutput,
 };
 use omnigraph_server::queries::{QueryRegistry, check};
 use omnigraph_server::{
@@ -31,6 +28,10 @@ use reqwest::header::AUTHORIZATION;
 use serde::Serialize;
 use serde::de::DeserializeOwned;
 use serde_json::Value;
+use std::ffi::OsString;
+use std::fs;
+use std::io::{self, Write};
+use std::path::PathBuf;
 
 mod embed;
 mod operator;
@@ -43,8 +44,8 @@ mod cli;
 mod client;
 mod helpers;
 mod output;
-mod scope;
 mod planes;
+mod scope;
 use cli::*;
 use helpers::*;
 use output::*;
@@ -338,10 +339,7 @@ async fn main() -> Result<()> {
                     println!("created branch {} from {}", payload.name, payload.from);
                 }
             }
-            BranchCommand::List {
-                uri,
-                json,
-            } => {
+            BranchCommand::List { uri, json } => {
                 let client = client::GraphClient::resolve(
                     cli.server.as_deref(),
                     cli.graph.as_deref(),
@@ -359,11 +357,7 @@ async fn main() -> Result<()> {
                     }
                 }
             }
-            BranchCommand::Delete {
-                uri,
-                name,
-                json,
-            } => {
+            BranchCommand::Delete { uri, name, json } => {
                 let client = client::GraphClient::resolve_with_policy(
                     cli.server.as_deref(),
                     cli.graph.as_deref(),
@@ -439,11 +433,7 @@ async fn main() -> Result<()> {
             }
         },
         Command::Commit { command } => match command {
-            CommitCommand::List {
-                uri,
-                branch,
-                json,
-            } => {
+            CommitCommand::List { uri, branch, json } => {
                 let client = client::GraphClient::resolve(
                     cli.server.as_deref(),
                     cli.graph.as_deref(),
@@ -565,10 +555,7 @@ async fn main() -> Result<()> {
                     print_schema_apply_human(&output);
                 }
             }
-            SchemaCommand::Show {
-                uri,
-                json,
-            } => {
+            SchemaCommand::Show { uri, json } => {
                 let client = client::GraphClient::resolve(
                     cli.server.as_deref(),
                     cli.graph.as_deref(),
@@ -625,11 +612,7 @@ async fn main() -> Result<()> {
                 }
             }
         }
-        Command::Snapshot {
-            uri,
-            branch,
-            json,
-        } => {
+        Command::Snapshot { uri, branch, json } => {
             let client = client::GraphClient::resolve(
                 cli.server.as_deref(),
                 cli.graph.as_deref(),
@@ -748,7 +731,12 @@ async fn main() -> Result<()> {
                 let query_source =
                     resolve_query_source(query.as_ref(), query_string.as_deref(), None)?;
                 client
-                    .mutate(&branch, &query_source, name.as_deref(), params_json.as_ref())
+                    .mutate(
+                        &branch,
+                        &query_source,
+                        name.as_deref(),
+                        params_json.as_ref(),
+                    )
                     .await?
             } else {
                 // Catalog lane (served-only): invoke the stored mutation by name.
@@ -1125,10 +1113,7 @@ async fn main() -> Result<()> {
             }
         },
         Command::Graphs { command } => match command {
-            GraphsCommand::List {
-                uri,
-                json,
-            } => {
+            GraphsCommand::List { uri, json } => {
                 let client = client::GraphClient::resolve(
                     cli.server.as_deref(),
                     cli.graph.as_deref(),
@@ -1150,7 +1135,6 @@ async fn main() -> Result<()> {
     }
     Ok(())
 }
-
 
 #[cfg(test)]
 #[path = "main_tests.rs"]

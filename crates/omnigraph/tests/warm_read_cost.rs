@@ -30,34 +30,34 @@ use helpers::{
 #[tokio::test]
 async fn warm_same_branch_read_does_no_resolution_opens() {
     cost_harness(async {
-    let dir = tempfile::tempdir().unwrap();
-    let mut db = init_and_load(&dir).await;
-    // Deep history: warm-read resolution cost must be flat in commit count.
-    commit_many(&mut db, 20).await;
+        let dir = tempfile::tempdir().unwrap();
+        let mut db = init_and_load(&dir).await;
+        // Deep history: warm-read resolution cost must be flat in commit count.
+        commit_many(&mut db, 20).await;
 
-    let (out, io) = measure(db.query(
-        ReadTarget::branch("main"),
-        TEST_QUERIES,
-        "total_people",
-        &params(&[]),
-    ))
-    .await;
-    out.unwrap();
+        let (out, io) = measure(db.query(
+            ReadTarget::branch("main"),
+            TEST_QUERIES,
+            "total_people",
+            &params(&[]),
+        ))
+        .await;
+        out.unwrap();
 
-    // A warm same-branch read opens nothing from the internal tables, even at
-    // commit-history depth. Fix 1 reuses the coordinator (no re-open: 0
-    // commit-graph opens, exactly 1 cheap version probe). Fix 2 opens the touched
-    // data table by location+version instead of via the namespace, so the
-    // per-table __manifest scan is gone too. Pre-fix, each of these is a deep scan
-    // of an internal table that grows with commit count.
-    assert_eq!(
-        io.manifest_reads, 0,
-        "warm same-branch read must not scan __manifest (resolution or per-table)"
-    );
-    assert_eq!(
-        io.version_probes, 1,
-        "warm same-branch read performs exactly one version probe"
-    );
+        // A warm same-branch read opens nothing from the internal tables, even at
+        // commit-history depth. Fix 1 reuses the coordinator (no re-open: 0
+        // commit-graph opens, exactly 1 cheap version probe). Fix 2 opens the touched
+        // data table by location+version instead of via the namespace, so the
+        // per-table __manifest scan is gone too. Pre-fix, each of these is a deep scan
+        // of an internal table that grows with commit count.
+        assert_eq!(
+            io.manifest_reads, 0,
+            "warm same-branch read must not scan __manifest (resolution or per-table)"
+        );
+        assert_eq!(
+            io.version_probes, 1,
+            "warm same-branch read performs exactly one version probe"
+        );
     })
     .await;
 }
@@ -70,22 +70,22 @@ async fn warm_same_branch_read_does_no_resolution_opens() {
 #[tokio::test]
 async fn multi_table_query_does_no_manifest_scans() {
     cost_harness(async {
-    let dir = tempfile::tempdir().unwrap();
-    let db = init_and_load(&dir).await;
+        let dir = tempfile::tempdir().unwrap();
+        let db = init_and_load(&dir).await;
 
-    let (out, io) = measure(db.query(
-        ReadTarget::branch("main"),
-        TEST_QUERIES,
-        "age_stats",
-        &params(&[]),
-    ))
-    .await;
-    out.unwrap();
+        let (out, io) = measure(db.query(
+            ReadTarget::branch("main"),
+            TEST_QUERIES,
+            "age_stats",
+            &params(&[]),
+        ))
+        .await;
+        out.unwrap();
 
-    assert_eq!(
-        io.manifest_reads, 0,
-        "a multi-table read must not scan __manifest once per touched table"
-    );
+        assert_eq!(
+            io.manifest_reads, 0,
+            "a multi-table read must not scan __manifest once per touched table"
+        );
     })
     .await;
 }
@@ -213,38 +213,38 @@ async fn schema_source_drift_is_caught_on_read() {
 #[tokio::test]
 async fn warm_branch_read_does_no_manifest_scans() {
     cost_harness(async {
-    let dir = tempfile::tempdir().unwrap();
-    let db = init_and_load(&dir).await;
-    db.branch_create("feature").await.unwrap();
-    // Write to the branch so its tables are branch-owned (under tree/feature).
-    db.mutate(
-        "feature",
-        MUTATION_QUERIES,
-        "insert_person",
-        &mixed_params(&[("$name", "Eve")], &[("$age", 22)]),
-    )
-    .await
-    .unwrap();
-    // Bind the handle's coordinator to the branch so reads of it take the warm path.
-    db.sync_branch("feature").await.unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let db = init_and_load(&dir).await;
+        db.branch_create("feature").await.unwrap();
+        // Write to the branch so its tables are branch-owned (under tree/feature).
+        db.mutate(
+            "feature",
+            MUTATION_QUERIES,
+            "insert_person",
+            &mixed_params(&[("$name", "Eve")], &[("$age", 22)]),
+        )
+        .await
+        .unwrap();
+        // Bind the handle's coordinator to the branch so reads of it take the warm path.
+        db.sync_branch("feature").await.unwrap();
 
-    let (out, io) = measure(db.query(
-        ReadTarget::branch("feature"),
-        TEST_QUERIES,
-        "total_people",
-        &params(&[]),
-    ))
-    .await;
-    out.unwrap();
+        let (out, io) = measure(db.query(
+            ReadTarget::branch("feature"),
+            TEST_QUERIES,
+            "total_people",
+            &params(&[]),
+        ))
+        .await;
+        out.unwrap();
 
-    assert_eq!(
-        io.manifest_reads, 0,
-        "warm branch read must not scan __manifest (branch-owned table opened by location)"
-    );
-    assert_eq!(
-        io.version_probes, 1,
-        "warm branch read performs exactly one version probe"
-    );
+        assert_eq!(
+            io.manifest_reads, 0,
+            "warm branch read must not scan __manifest (branch-owned table opened by location)"
+        );
+        assert_eq!(
+            io.version_probes, 1,
+            "warm branch read performs exactly one version probe"
+        );
     })
     .await;
 }
@@ -454,109 +454,109 @@ async fn recreated_branch_owned_table_handle_uses_table_etag() {
 #[tokio::test]
 async fn recreated_branch_traversal_uses_graph_index_incarnation() {
     cost_harness(async {
-    let dir = tempfile::tempdir().unwrap();
-    let mut writer = init_and_load(&dir).await;
-    let uri = dir.path().to_str().unwrap();
-    let reader = Omnigraph::open(uri).await.unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let mut writer = init_and_load(&dir).await;
+        let uri = dir.path().to_str().unwrap();
+        let reader = Omnigraph::open(uri).await.unwrap();
 
-    writer.branch_create("feature").await.unwrap();
-    mutate_branch(
-        &mut writer,
-        "feature",
-        MUTATION_QUERIES,
-        "insert_person_and_friend",
-        &mixed_params(
-            &[("$name", "OldWalker"), ("$friend", "Alice")],
-            &[("$age", 41)],
-        ),
-    )
-    .await
-    .unwrap();
-
-    reader.sync_branch("feature").await.unwrap();
-    let old_friends = reader
-        .query(
-            ReadTarget::branch("feature"),
-            TEST_QUERIES,
-            "friends_of",
-            &params(&[("$name", "OldWalker")]),
+        writer.branch_create("feature").await.unwrap();
+        mutate_branch(
+            &mut writer,
+            "feature",
+            MUTATION_QUERIES,
+            "insert_person_and_friend",
+            &mixed_params(
+                &[("$name", "OldWalker"), ("$friend", "Alice")],
+                &[("$age", 41)],
+            ),
         )
         .await
         .unwrap();
-    assert_eq!(first_column_sorted(&old_friends), vec!["Alice"]);
-    let old_edge_entry = reader
-        .snapshot_of(ReadTarget::branch("feature"))
-        .await
-        .unwrap()
-        .entry("edge:Knows")
-        .unwrap()
-        .clone();
-    assert_eq!(old_edge_entry.table_branch.as_deref(), Some("feature"));
 
-    writer.branch_delete("feature").await.unwrap();
-    writer.branch_create("feature").await.unwrap();
-    mutate_branch(
-        &mut writer,
-        "feature",
-        MUTATION_QUERIES,
-        "insert_person_and_friend",
-        &mixed_params(
-            &[("$name", "NewWalker"), ("$friend", "Bob")],
-            &[("$age", 42)],
-        ),
-    )
-    .await
-    .unwrap();
-    let new_edge_entry = writer
-        .snapshot_of(ReadTarget::branch("feature"))
-        .await
-        .unwrap()
-        .entry("edge:Knows")
-        .unwrap()
-        .clone();
-    assert_eq!(new_edge_entry.table_path, old_edge_entry.table_path);
-    assert_eq!(new_edge_entry.table_branch, old_edge_entry.table_branch);
-    assert_eq!(
-        new_edge_entry.table_version, old_edge_entry.table_version,
-        "test setup must force graph-index identity to differ only by snapshot incarnation"
-    );
+        reader.sync_branch("feature").await.unwrap();
+        let old_friends = reader
+            .query(
+                ReadTarget::branch("feature"),
+                TEST_QUERIES,
+                "friends_of",
+                &params(&[("$name", "OldWalker")]),
+            )
+            .await
+            .unwrap();
+        assert_eq!(first_column_sorted(&old_friends), vec!["Alice"]);
+        let old_edge_entry = reader
+            .snapshot_of(ReadTarget::branch("feature"))
+            .await
+            .unwrap()
+            .entry("edge:Knows")
+            .unwrap()
+            .clone();
+        assert_eq!(old_edge_entry.table_branch.as_deref(), Some("feature"));
 
-    let (new_friends, io) = measure(reader.query(
-        ReadTarget::branch("feature"),
-        TEST_QUERIES,
-        "friends_of",
-        &params(&[("$name", "NewWalker")]),
-    ))
-    .await;
-    let new_friends = new_friends.unwrap();
-    assert_eq!(
-        first_column_sorted(&new_friends),
-        vec!["Bob"],
-        "traversal must use the recreated branch's topology, not stale cached graph index"
-    );
-    assert!(
-        io.manifest_reads > 0,
-        "recreated branch traversal must refresh the manifest"
-    );
-    assert_eq!(
-        io.version_probes, 2,
-        "stale same-branch read probes once under each lock"
-    );
-
-    let stale_old_friends = reader
-        .query(
-            ReadTarget::branch("feature"),
-            TEST_QUERIES,
-            "friends_of",
-            &params(&[("$name", "OldWalker")]),
+        writer.branch_delete("feature").await.unwrap();
+        writer.branch_create("feature").await.unwrap();
+        mutate_branch(
+            &mut writer,
+            "feature",
+            MUTATION_QUERIES,
+            "insert_person_and_friend",
+            &mixed_params(
+                &[("$name", "NewWalker"), ("$friend", "Bob")],
+                &[("$age", 42)],
+            ),
         )
         .await
         .unwrap();
-    assert_eq!(
-        first_column_sorted(&stale_old_friends),
-        Vec::<String>::new(),
-        "old branch topology must not leak after branch recreation"
-    );
+        let new_edge_entry = writer
+            .snapshot_of(ReadTarget::branch("feature"))
+            .await
+            .unwrap()
+            .entry("edge:Knows")
+            .unwrap()
+            .clone();
+        assert_eq!(new_edge_entry.table_path, old_edge_entry.table_path);
+        assert_eq!(new_edge_entry.table_branch, old_edge_entry.table_branch);
+        assert_eq!(
+            new_edge_entry.table_version, old_edge_entry.table_version,
+            "test setup must force graph-index identity to differ only by snapshot incarnation"
+        );
+
+        let (new_friends, io) = measure(reader.query(
+            ReadTarget::branch("feature"),
+            TEST_QUERIES,
+            "friends_of",
+            &params(&[("$name", "NewWalker")]),
+        ))
+        .await;
+        let new_friends = new_friends.unwrap();
+        assert_eq!(
+            first_column_sorted(&new_friends),
+            vec!["Bob"],
+            "traversal must use the recreated branch's topology, not stale cached graph index"
+        );
+        assert!(
+            io.manifest_reads > 0,
+            "recreated branch traversal must refresh the manifest"
+        );
+        assert_eq!(
+            io.version_probes, 2,
+            "stale same-branch read probes once under each lock"
+        );
+
+        let stale_old_friends = reader
+            .query(
+                ReadTarget::branch("feature"),
+                TEST_QUERIES,
+                "friends_of",
+                &params(&[("$name", "OldWalker")]),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            first_column_sorted(&stale_old_friends),
+            Vec::<String>::new(),
+            "old branch topology must not leak after branch recreation"
+        );
     })
     .await;
 }
@@ -625,44 +625,44 @@ async fn stale_read_refreshes_manifest_only() {
 #[tokio::test]
 async fn repeat_warm_read_reuses_table_handles() {
     cost_harness(async {
-    let dir = tempfile::tempdir().unwrap();
-    let mut db = init_and_load(&dir).await;
-    // Deep history: the win must hold regardless of commit count.
-    commit_many(&mut db, 10).await;
+        let dir = tempfile::tempdir().unwrap();
+        let mut db = init_and_load(&dir).await;
+        // Deep history: the win must hold regardless of commit count.
+        commit_many(&mut db, 10).await;
 
-    // Cold first read: opens the touched table.
-    let (cold_out, cold) = measure(db.query(
-        ReadTarget::branch("main"),
-        TEST_QUERIES,
-        "total_people",
-        &params(&[]),
-    ))
-    .await;
-    cold_out.unwrap();
-    assert!(
-        cold.data_reads > 0,
-        "the cold first read must open the table"
-    );
+        // Cold first read: opens the touched table.
+        let (cold_out, cold) = measure(db.query(
+            ReadTarget::branch("main"),
+            TEST_QUERIES,
+            "total_people",
+            &params(&[]),
+        ))
+        .await;
+        cold_out.unwrap();
+        assert!(
+            cold.data_reads > 0,
+            "the cold first read must open the table"
+        );
 
-    // Warm repeat: the held handle is reused, so no open happens through this
-    // query's table wrapper. A fresh `measure()` isolates the warm repeat's cost.
-    let (warm_out, warm) = measure(db.query(
-        ReadTarget::branch("main"),
-        TEST_QUERIES,
-        "total_people",
-        &params(&[]),
-    ))
-    .await;
-    warm_out.unwrap();
-    assert_eq!(
-        warm.data_reads, 0,
-        "a warm repeat read must reuse the held handle (0 table opens)"
-    );
-    assert_eq!(warm.manifest_reads, 0, "warm repeat read: 0 manifest opens");
-    assert_eq!(
-        warm.version_probes, 1,
-        "warm repeat read: exactly one version probe"
-    );
+        // Warm repeat: the held handle is reused, so no open happens through this
+        // query's table wrapper. A fresh `measure()` isolates the warm repeat's cost.
+        let (warm_out, warm) = measure(db.query(
+            ReadTarget::branch("main"),
+            TEST_QUERIES,
+            "total_people",
+            &params(&[]),
+        ))
+        .await;
+        warm_out.unwrap();
+        assert_eq!(
+            warm.data_reads, 0,
+            "a warm repeat read must reuse the held handle (0 table opens)"
+        );
+        assert_eq!(warm.manifest_reads, 0, "warm repeat read: 0 manifest opens");
+        assert_eq!(
+            warm.version_probes, 1,
+            "warm repeat read: exactly one version probe"
+        );
     })
     .await;
 }
@@ -742,7 +742,10 @@ async fn fresh_branch_traversal_reuses_main_graph_index() {
         &mut writer,
         MUTATION_QUERIES,
         "insert_person_and_friend",
-        &mixed_params(&[("$name", "Walker"), ("$friend", "Alice")], &[("$age", 41)]),
+        &mixed_params(
+            &[("$name", "Walker"), ("$friend", "Alice")],
+            &[("$age", 41)],
+        ),
     )
     .await
     .unwrap();
@@ -819,7 +822,10 @@ async fn single_edge_query_builds_only_referenced_edge() {
         &mut db,
         MUTATION_QUERIES,
         "insert_person_and_friend",
-        &mixed_params(&[("$name", "Walker"), ("$friend", "Alice")], &[("$age", 41)]),
+        &mixed_params(
+            &[("$name", "Walker"), ("$friend", "Alice")],
+            &[("$age", 41)],
+        ),
     )
     .await
     .unwrap();

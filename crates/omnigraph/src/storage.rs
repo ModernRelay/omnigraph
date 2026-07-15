@@ -222,14 +222,12 @@ impl ObjectStorageAdapter {
                     ))
                 })
             }
-            UriCodec::Memory => {
-                ObjectPath::parse(uri.trim_start_matches('/')).map_err(|err| {
-                    OmniError::manifest_internal(format!(
-                        "invalid memory object path for '{}': {}",
-                        uri, err
-                    ))
-                })
-            }
+            UriCodec::Memory => ObjectPath::parse(uri.trim_start_matches('/')).map_err(|err| {
+                OmniError::manifest_internal(format!(
+                    "invalid memory object path for '{}': {}",
+                    uri, err
+                ))
+            }),
         }
     }
 }
@@ -412,11 +410,11 @@ impl StorageAdapter for ObjectStorageAdapter {
                 )
                 .await
             {
-                Ok(result) => Ok(Some(
-                    result
-                        .e_tag
-                        .unwrap_or_else(|| local_version_token(contents.as_bytes())),
-                )),
+                Ok(result) => {
+                    Ok(Some(result.e_tag.unwrap_or_else(|| {
+                        local_version_token(contents.as_bytes())
+                    })))
+                }
                 Err(object_store::Error::Precondition { .. })
                 | Err(object_store::Error::NotFound { .. }) => Ok(None),
                 Err(err) => Err(storage_backend_error("write_if_match", uri, err)),
@@ -713,7 +711,12 @@ mod tests {
         // object untouched.
         let claim = format!("{root}/contract/claim.json");
         assert!(adapter.write_text_if_absent(&claim, "first").await.unwrap());
-        assert!(!adapter.write_text_if_absent(&claim, "second").await.unwrap());
+        assert!(
+            !adapter
+                .write_text_if_absent(&claim, "second")
+                .await
+                .unwrap()
+        );
         assert_eq!(adapter.read_text(&claim).await.unwrap(), "first");
 
         // Versioned CAS: fresh token wins, stale token loses with Ok(None)
@@ -774,10 +777,7 @@ mod tests {
         listed.sort();
         assert_eq!(
             listed,
-            vec![
-                format!("{dir_uri}/one.json"),
-                format!("{dir_uri}/two.json")
-            ]
+            vec![format!("{dir_uri}/one.json"), format!("{dir_uri}/two.json")]
         );
         for uri in &listed {
             adapter.read_text(uri).await.unwrap();
@@ -1001,5 +1001,4 @@ mod tests {
         assert_eq!(location.bucket, "bucket");
         assert_eq!(location.key, "graph/_schema.pg");
     }
-
 }

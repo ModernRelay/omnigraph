@@ -19,7 +19,11 @@ pub struct Diagnostic {
 }
 
 impl Diagnostic {
-    pub(crate) fn error(code: impl Into<String>, path: impl Into<String>, message: impl Into<String>) -> Self {
+    pub(crate) fn error(
+        code: impl Into<String>,
+        path: impl Into<String>,
+        message: impl Into<String>,
+    ) -> Self {
         Self {
             code: code.into(),
             severity: DiagnosticSeverity::Error,
@@ -473,13 +477,13 @@ impl EmbeddingProviderConfig {
         }
 
         match self.api_key.as_deref() {
-            Some(api_key) if secret_ref_name(api_key).is_err() => diagnostics.push(
-                Diagnostic::error(
+            Some(api_key) if secret_ref_name(api_key).is_err() => {
+                diagnostics.push(Diagnostic::error(
                     "embedding_api_key_inline",
                     format!("{path}.api_key"),
                     "embedding api_key must be a ${NAME} env reference, not an inline secret",
-                ),
-            ),
+                ))
+            }
             Some(_) => {}
             None => diagnostics.push(Diagnostic::error(
                 "embedding_api_key_required",
@@ -517,7 +521,10 @@ fn secret_ref_name(value: &str) -> Result<&str, String> {
         .and_then(|s| s.strip_suffix('}'))
         .filter(|name| !name.trim().is_empty())
         .ok_or_else(|| {
-            format!("embedding api_key must be a ${{NAME}} env reference, got '{}'", value.trim())
+            format!(
+                "embedding api_key must be a ${{NAME}} env reference, got '{}'",
+                value.trim()
+            )
         })
 }
 

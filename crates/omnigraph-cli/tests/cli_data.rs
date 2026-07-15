@@ -11,7 +11,6 @@ mod support;
 
 use support::*;
 
-
 #[test]
 fn short_version_flag_prints_current_cli_version() {
     let output = output_success(cli().arg("-v"));
@@ -253,8 +252,9 @@ fn optimize_with_remote_target_errors_storage_plane() {
     let output = output_failure(cli().arg("optimize").arg("https://graph.example.invalid"));
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert!(
-        stderr.contains("`optimize` is a direct (storage-native) command and needs direct storage access")
-            && stderr.contains("remote server"),
+        stderr.contains(
+            "`optimize` is a direct (storage-native) command and needs direct storage access"
+        ) && stderr.contains("remote server"),
         "direct remote-target message not found; got: {stderr}"
     );
 }
@@ -274,9 +274,11 @@ fn repair_json_reports_noop_on_clean_graph() {
     assert_eq!(payload["manifest_version"], Value::Null);
     let tables = payload["tables"].as_array().unwrap();
     assert_eq!(tables.len(), 4);
-    assert!(tables.iter().all(|table| {
-        table["classification"] == "no_drift" && table["action"] == "no_op"
-    }));
+    assert!(
+        tables
+            .iter()
+            .all(|table| { table["classification"] == "no_drift" && table["action"] == "no_op" })
+    );
 }
 
 #[test]
@@ -662,8 +664,9 @@ query list_people() {
     // RFC-010/011: the direct (storage-native) verbs share one declared message
     // (was: "query lint is only supported against local graph URIs …").
     assert!(
-        stderr.contains("`lint` is a direct (storage-native) command and needs direct storage access")
-            && stderr.contains("remote server"),
+        stderr.contains(
+            "`lint` is a direct (storage-native) command and needs direct storage access"
+        ) && stderr.contains("remote server"),
         "direct remote-target message not found; got: {stderr}"
     );
 }
@@ -1487,7 +1490,14 @@ fn read_rejects_empty_query_string() {
     init_graph(&repo);
     load_fixture(&repo);
 
-    let output = output_failure(cli().arg("read").arg("--store").arg(&repo).arg("-e").arg(""));
+    let output = output_failure(
+        cli()
+            .arg("read")
+            .arg("--store")
+            .arg(&repo)
+            .arg("-e")
+            .arg(""),
+    );
     let stderr = String::from_utf8(output.stderr).unwrap();
     assert!(
         stderr.contains("must not be empty"),
@@ -2235,7 +2245,10 @@ fn profile_list_names_each_profile_with_its_binding_and_marks_active() {
     assert!(stdout.contains("cluster: brain"), "{stdout}");
     assert!(stdout.contains("store: file:///data/dev.omni"), "{stdout}");
     // A malformed (two-scope) profile is reported, not a hard failure.
-    assert!(stdout.contains("broken") && stdout.contains("invalid:"), "{stdout}");
+    assert!(
+        stdout.contains("broken") && stdout.contains("invalid:"),
+        "{stdout}"
+    );
 }
 
 #[test]

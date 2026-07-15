@@ -311,6 +311,16 @@
               }
             }
           },
+          "413": {
+            "description": "Merge row, byte, or recovery-chain ceiling exceeded before effects",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorOutput"
+                }
+              }
+            }
+          },
           "429": {
             "description": "Per-actor admission cap exceeded; honor `Retry-After` header",
             "content": {
@@ -508,6 +518,16 @@
           },
           "409": {
             "description": "Write-authority conflict",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorOutput"
+                }
+              }
+            }
+          },
+          "413": {
+            "description": "Keyed write exceeds the per-commit row or byte ceiling",
             "content": {
               "application/json": {
                 "schema": {
@@ -845,6 +865,16 @@
               }
             }
           },
+          "413": {
+            "description": "Keyed load exceeds the per-commit row or byte ceiling",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorOutput"
+                }
+              }
+            }
+          },
           "429": {
             "description": "Per-actor admission cap exceeded; honor `Retry-After` header",
             "content": {
@@ -880,7 +910,7 @@
           "mutations"
         ],
         "summary": "Bulk-load NDJSON data into a branch (canonical load endpoint).",
-        "description": "`data` is NDJSON with one record per line. `mode` controls behavior on\nexisting rows: `merge` upserts by id (default), `append` blindly inserts,\n`overwrite` replaces table contents. Branch creation is opt-in by\npresence of `from`: with `from` set, a missing `branch` is created from\nit; without `from`, `branch` must already exist — a missing branch is a\n404, never an implicit fork. **Destructive** when `mode` is `overwrite`\nor when the load produces conflicting writes.\n\nThe legacy `POST /ingest` route has identical semantics and is kept as a\ndeprecated alias.",
+        "description": "`data` is NDJSON with one record per line. `mode` controls behavior on\nexisting rows: `merge` upserts by id (default), `append` strictly inserts\nabsent ids, and `overwrite` replaces table contents. Branch creation is opt-in by\npresence of `from`: with `from` set, a missing `branch` is created from\nit; without `from`, `branch` must already exist — a missing branch is a\n404, never an implicit fork. **Destructive** when `mode` is `overwrite`\nor when the load produces conflicting writes.\n\nThe legacy `POST /ingest` route has identical semantics and is kept as a\ndeprecated alias.",
         "operationId": "cluster_load",
         "parameters": [
           {
@@ -946,6 +976,16 @@
           },
           "409": {
             "description": "Prepared load authority changed before effects",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorOutput"
+                }
+              }
+            }
+          },
+          "413": {
+            "description": "Keyed load exceeds the per-commit row or byte ceiling",
             "content": {
               "application/json": {
                 "schema": {
@@ -1054,6 +1094,16 @@
           },
           "409": {
             "description": "Write-authority conflict",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorOutput"
+                }
+              }
+            }
+          },
+          "413": {
+            "description": "Keyed write exceeds the per-commit row or byte ceiling",
             "content": {
               "application/json": {
                 "schema": {
@@ -1245,6 +1295,16 @@
           },
           "409": {
             "description": "Stored mutation write-authority conflict",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorOutput"
+                }
+              }
+            }
+          },
+          "413": {
+            "description": "Stored keyed mutation exceeds the per-commit row or byte ceiling",
             "content": {
               "application/json": {
                 "schema": {
@@ -2002,6 +2062,17 @@
           "error": {
             "type": "string"
           },
+          "key_conflict": {
+            "oneOf": [
+              {
+                "type": "null"
+              },
+              {
+                "$ref": "#/components/schemas/KeyConflictOutput",
+                "description": "Set when a strict keyed insert found an existing or concurrently\ninserted logical id.  The caller may choose a different id; replaying\nthe same strict operation will not convert it into an upsert."
+              }
+            ]
+          },
           "manifest_conflict": {
             "oneOf": [
               {
@@ -2038,6 +2109,17 @@
               {
                 "$ref": "#/components/schemas/RecoveryRequiredOutput",
                 "description": "Set when an overlapping durable recovery intent must be resolved before\nretry. Its table effects may or may not have started."
+              }
+            ]
+          },
+          "resource_limit": {
+            "oneOf": [
+              {
+                "type": "null"
+              },
+              {
+                "$ref": "#/components/schemas/ResourceLimitOutput",
+                "description": "Set when the request must be split into smaller graph commits. The\nrejected attempt has no durable sidecar and no table effect."
               }
             ]
           }
@@ -2265,6 +2347,24 @@
           }
         ],
         "description": "Response for `POST /queries/{name}`: the read envelope for a stored\nread, or the mutation envelope for a stored mutation. Serialized\n**untagged**, so the wire shape is exactly [`ReadOutput`] or\n[`ChangeOutput`] — classification follows the stored query, not a\nwrapper field."
+      },
+      "KeyConflictOutput": {
+        "type": "object",
+        "description": "A strict insert rejected because `key` already names a row in the keyed\ngraph table.  The operation is effect-free when this output is returned;\npartial or ambiguous attempts surface `recovery_required` instead.",
+        "required": [
+          "table_key"
+        ],
+        "properties": {
+          "key": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "table_key": {
+            "type": "string"
+          }
+        }
       },
       "LoadMode": {
         "type": "string",
@@ -2601,6 +2701,30 @@
         ],
         "properties": {
           "operation_id": {
+            "type": "string"
+          }
+        }
+      },
+      "ResourceLimitOutput": {
+        "type": "object",
+        "description": "A write rejected before durable recovery ownership because its bounded\nphysical plan exceeded an explicit row, byte, or transaction-chain ceiling.",
+        "required": [
+          "resource",
+          "limit",
+          "actual"
+        ],
+        "properties": {
+          "actual": {
+            "type": "integer",
+            "format": "int64",
+            "minimum": 0
+          },
+          "limit": {
+            "type": "integer",
+            "format": "int64",
+            "minimum": 0
+          },
+          "resource": {
             "type": "string"
           }
         }

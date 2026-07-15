@@ -330,12 +330,17 @@ pub(crate) const SCHEMA_APPLY_EXACT_SCHEMA_VERSION: u32 = 7;
 /// original loose-classifier/fixed-rollback semantics.
 pub(crate) const ENSURE_INDICES_EXACT_SCHEMA_VERSION: u32 = 8;
 
-/// Bound the cold-path transaction-history probes used by the v3/v4 exact
-/// recovery protocols. Normal v3 recovery reads one version and a v4 logical
-/// merge chain is currently at most three versions; a larger gap is derived
-/// index work or foreign activity. Exceeding the bound is surfaced as
-/// unverifiable rather than turning open into an unbounded history walk.
-const MAX_EFFECT_IDENTITY_SCAN_VERSIONS: u64 = 1024;
+/// Maximum logical data transactions one table may arm in a BranchMerge chain.
+/// The writer rejects a larger plan before the sidecar exists.
+pub(crate) const MAX_BRANCH_MERGE_DATA_TRANSACTIONS: u64 = 1024;
+
+/// Bound the cold-path transaction-history probes used by exact recovery.
+/// BranchMerge reserves two versions beyond its logical chain: one allowed
+/// derived `CreateIndex` tail and one compensating `Restore`. Recovery may
+/// crash after that Restore but before its manifest publish, so both versions
+/// must remain classifiable on the next sweep. Exceeding this bound fails
+/// closed rather than turning open into an unbounded history walk.
+pub(crate) const MAX_EFFECT_IDENTITY_SCAN_VERSIONS: u64 = MAX_BRANCH_MERGE_DATA_TRANSACTIONS + 2;
 
 /// Selects which recovery actions are allowed in a sweep.
 ///
@@ -2661,6 +2666,18 @@ fn validate_branch_merge_transaction_chain(
     planned_transactions: &[StagedTransactionIdentity],
     planned_transaction_uuids: &mut HashSet<String>,
 ) -> Result<u64> {
+    let transaction_count = u64::try_from(planned_transactions.len()).map_err(|_| {
+        malformed(format!(
+            "planned transaction chain for '{}' exceeds u64",
+            pin.table_key
+        ))
+    })?;
+    if transaction_count > MAX_BRANCH_MERGE_DATA_TRANSACTIONS {
+        return Err(malformed(format!(
+            "planned transaction chain for '{}' contains {} data transactions, exceeding the recovery-safe limit of {}",
+            pin.table_key, transaction_count, MAX_BRANCH_MERGE_DATA_TRANSACTIONS
+        )));
+    }
     let first = planned_transactions.first().ok_or_else(|| {
         malformed(format!(
             "multi-commit effect '{}' has an empty planned transaction chain",
@@ -3415,6 +3432,140 @@ fn snapshot_entry_for_schema_pin<'a>(
     Ok(None)
 }
 
+/// Classify the exact physical ownership of every table named by a recovery
+/// sidecar against one manifest snapshot.
+///
+/// Keeping this probe separate from the recovery decision lets a live writer
+/// use the same transaction-identity evidence for RFC-023's narrow
+/// effect-free-finalization rule.  The probe itself never restores, publishes,
+/// or deletes anything.
+async fn classify_sidecar_tables(
+    snapshot: &Snapshot,
+    sidecar: &RecoverySidecar,
+) -> Result<Vec<ClassifiedTable>> {
+    let mut states = Vec::with_capacity(sidecar.tables.len());
+    for pin in &sidecar.tables {
+        let manifest_entry = snapshot_entry_for_pin(snapshot, pin)?;
+        let manifest_pinned = manifest_entry.map(|entry| entry.table_version).unwrap_or(0);
+        // A first-touch named-branch mutation/load stages against the inherited
+        // source snapshot, arms its v3 sidecar, and only then creates the Lance
+        // target ref. Until Phase C publishes, the branch snapshot therefore
+        // still points at the source ref. Armed recovery must tolerate the
+        // target ref not existing yet: that is the crash-before-fork state, not
+        // storage corruption. Once effects are confirmed, a missing ref is
+        // impossible and remains a loud error.
+        let unpublished_fork = (sidecar.protocol_v3.is_some()
+            || matches!(sidecar.writer_kind, SidecarKind::EnsureIndices))
+            && pin
+                .table_branch
+                .as_deref()
+                .is_some_and(|branch| branch != "main")
+            && sidecar.branch.as_deref() == pin.table_branch.as_deref()
+            && manifest_entry
+                .map(|entry| entry.table_branch != pin.table_branch)
+                .unwrap_or(true);
+        let allow_missing_target_ref = unpublished_fork
+            && (matches!(sidecar.writer_kind, SidecarKind::EnsureIndices)
+                || sidecar
+                    .protocol_v3
+                    .as_ref()
+                    .is_some_and(|protocol| protocol.effect_phase == RecoveryEffectPhase::Armed));
+        let planned_effect = sidecar.protocol_v3.as_ref().and_then(|protocol| {
+            protocol
+                .effects
+                .iter()
+                .find(|effect| effect.identity == pin.identity)
+                .map(|effect| {
+                    (
+                        pin.post_commit_pin,
+                        &effect.planned_transaction,
+                        manifest_pinned,
+                    )
+                })
+        });
+        let observation = open_lance_head_if_present(
+            &pin.table_path,
+            pin.table_branch.as_deref(),
+            planned_effect,
+            allow_missing_target_ref,
+            false,
+        )
+        .await?;
+        let observation = observation.unwrap_or(LanceHeadObservation {
+            version: manifest_pinned,
+            transaction: None,
+            effect_ownership: EffectOwnership::None,
+        });
+        let lance_head = observation.version;
+        states.push(ClassifiedTable {
+            classification: classify_table_observation(
+                pin,
+                lance_head,
+                observation.transaction.as_ref(),
+                manifest_pinned,
+                sidecar.writer_kind,
+                sidecar.schema_version,
+                sidecar.protocol_v3.as_ref(),
+            ),
+            manifest_pinned,
+            lance_head,
+            effect_ownership: observation.effect_ownership,
+            unpublished_fork,
+        });
+    }
+    Ok(states)
+}
+
+/// Retire an Armed mutation/load intent only when exact transaction-identity
+/// classification proves that none of its participants advanced.
+///
+/// This is deliberately narrower than a Full recovery sweep: it never rolls
+/// back or publishes an effect.  Callers must hold the normal
+/// schema -> branch -> table gate envelope, which is the same single-writer-
+/// process boundary under which destructive recovery is supported today.
+/// `false` means ownership was present or could not be retired safely; the
+/// sidecar remains the authority and the caller must return RecoveryRequired.
+pub(crate) async fn finalize_effect_free_occ_sidecar(
+    root_uri: &str,
+    storage: &dyn StorageAdapter,
+    snapshot: &Snapshot,
+    sidecar: &RecoverySidecar,
+) -> Result<bool> {
+    if sidecar.schema_version != IDENTITY_AWARE_SIDECAR_SCHEMA_VERSION
+        || !matches!(
+            sidecar.writer_kind,
+            SidecarKind::Mutation | SidecarKind::Load
+        )
+    {
+        return Err(OmniError::manifest_internal(
+            "effect-free finalization requires an identity-aware mutation/load sidecar",
+        ));
+    }
+    let protocol = sidecar.protocol_v3.as_ref().ok_or_else(|| {
+        OmniError::manifest_internal(
+            "effect-free finalization requires an exact OCC protocol payload",
+        )
+    })?;
+    if protocol.effect_phase != RecoveryEffectPhase::Armed {
+        return Ok(false);
+    }
+
+    let states = classify_sidecar_tables(snapshot, sidecar).await?;
+    if states
+        .iter()
+        .any(|state| state.effect_ownership != EffectOwnership::None)
+    {
+        return Ok(false);
+    }
+
+    match cleanup_unpublished_no_effect_forks(root_uri, storage, sidecar, &states).await? {
+        NoEffectForkCleanup::Complete => {}
+        NoEffectForkCleanup::DeferredPathChild { .. } => return Ok(false),
+    }
+    delete_sidecar_by_operation_id(root_uri, storage, &sidecar.operation_id).await?;
+    Ok(true)
+}
+
 async fn process_sidecar(
     root_uri: &str,
     storage: &std::sync::Arc<dyn StorageAdapter>,
@@ -3486,76 +3637,7 @@ async fn process_sidecar(
     {
         return finalize_visible_ensure_indices_rollback(root_uri, storage.as_ref(), sidecar).await;
     }
-    let mut states = Vec::with_capacity(sidecar.tables.len());
-    for pin in &sidecar.tables {
-        let manifest_entry = snapshot_entry_for_pin(snapshot, pin)?;
-        let manifest_pinned = manifest_entry.map(|entry| entry.table_version).unwrap_or(0);
-        // A first-touch named-branch mutation/load stages against the inherited
-        // source snapshot, arms its v3 sidecar, and only then creates the Lance
-        // target ref. Until Phase C publishes, the branch snapshot therefore
-        // still points at the source ref. Armed recovery must tolerate the
-        // target ref not existing yet: that is the crash-before-fork state, not
-        // storage corruption. Once effects are confirmed, a missing ref is
-        // impossible and remains a loud error.
-        let unpublished_fork = (sidecar.protocol_v3.is_some()
-            || matches!(sidecar.writer_kind, SidecarKind::EnsureIndices))
-            && pin
-                .table_branch
-                .as_deref()
-                .is_some_and(|branch| branch != "main")
-            && sidecar.branch.as_deref() == pin.table_branch.as_deref()
-            && manifest_entry
-                .map(|entry| entry.table_branch != pin.table_branch)
-                .unwrap_or(true);
-        let allow_missing_target_ref = unpublished_fork
-            && (matches!(sidecar.writer_kind, SidecarKind::EnsureIndices)
-                || sidecar
-                    .protocol_v3
-                    .as_ref()
-                    .is_some_and(|protocol| protocol.effect_phase == RecoveryEffectPhase::Armed));
-        let planned_effect = sidecar.protocol_v3.as_ref().and_then(|protocol| {
-            protocol
-                .effects
-                .iter()
-                .find(|effect| effect.identity == pin.identity)
-                .map(|effect| {
-                    (
-                        pin.post_commit_pin,
-                        &effect.planned_transaction,
-                        manifest_pinned,
-                    )
-                })
-        });
-        let observation = open_lance_head_if_present(
-            &pin.table_path,
-            pin.table_branch.as_deref(),
-            planned_effect,
-            allow_missing_target_ref,
-            false,
-        )
-        .await?;
-        let observation = observation.unwrap_or(LanceHeadObservation {
-            version: manifest_pinned,
-            transaction: None,
-            effect_ownership: EffectOwnership::None,
-        });
-        let lance_head = observation.version;
-        states.push(ClassifiedTable {
-            classification: classify_table_observation(
-                pin,
-                lance_head,
-                observation.transaction.as_ref(),
-                manifest_pinned,
-                sidecar.writer_kind,
-                sidecar.schema_version,
-                sidecar.protocol_v3.as_ref(),
-            ),
-            manifest_pinned,
-            lance_head,
-            effect_ownership: observation.effect_ownership,
-            unpublished_fork,
-        });
-    }
+    let states = classify_sidecar_tables(snapshot, sidecar).await?;
 
     if let Some(protocol) = sidecar.protocol_v3.as_ref() {
         let live_authority =
@@ -4157,9 +4239,9 @@ async fn observe_branch_merge_target_ref(
 struct BranchMergeMultiCommitProof {
     effect_ownership: EffectOwnership,
     /// Every planned logical-data transaction is present in exact order and
-    /// every later commit through the observed HEAD is derived CreateIndex
-    /// work. Confirmation still has to bind that exact HEAD before recovery
-    /// may roll it forward.
+    /// the only later commit, if any, is BranchMerge's one derived CreateIndex
+    /// tail. Confirmation still has to bind that exact HEAD before recovery may
+    /// roll it forward.
     full_effect_at_head: bool,
     unsafe_reason: Option<String>,
 }
@@ -4258,6 +4340,7 @@ async fn prove_branch_merge_multi_commit_effect(
     }
 
     let mut planned_index = 0usize;
+    let mut derived_index_tail_seen = false;
     for version in base_version + 1..=lance_head {
         let transaction = if version == lance_head {
             observation
@@ -4315,12 +4398,14 @@ async fn prove_branch_merge_multi_commit_effect(
         if !matches!(
             &transaction.operation,
             lance::dataset::transaction::Operation::CreateIndex { .. }
-        ) {
+        ) || derived_index_tail_seen
+        {
             return Ok(BranchMergeMultiCommitProof::unverifiable(format!(
-                "table '{table_key}' has non-derived operation {:?} at version {version} after its complete planned transaction chain",
+                "table '{table_key}' has an operation outside its single derived CreateIndex tail at version {version}: {:?}",
                 transaction.operation
             )));
         }
+        derived_index_tail_seen = true;
     }
 
     let full_effect_at_head = planned_index == planned_transactions.len();
@@ -8893,6 +8978,7 @@ pub(crate) async fn confirm_branch_merge_sidecar_v9(
 mod tests {
     use super::*;
     use crate::storage::ObjectStorageAdapter;
+    use crate::storage_layer::IndexBuildSpec;
     use crate::table_store::TableStore;
     use arrow_array::{Array, Int32Array, RecordBatch, StringArray};
     use arrow_schema::{DataType, Field, Schema};
@@ -9480,6 +9566,25 @@ mod tests {
         planned_transactions[1].read_version = 9;
         let error = validate_sidecar_shape("<non-sequential>", &non_sequential).unwrap_err();
         assert!(error.to_string().contains("expected 6"));
+
+        let mut oversized = sidecar.clone();
+        let RecoveryBranchMergeEffectKind::MultiCommitHead {
+            planned_transactions,
+            ..
+        } = &mut oversized.protocol_v4.as_mut().unwrap().effects[0].kind
+        else {
+            panic!("first effect must be multi-commit")
+        };
+        *planned_transactions = (0..=MAX_BRANCH_MERGE_DATA_TRANSACTIONS)
+            .map(|offset| transaction(5 + offset, &format!("merge-person-{offset}")))
+            .collect();
+        let error = validate_sidecar_shape("<oversized-chain>", &oversized).unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("exceeding the recovery-safe limit of 1024"),
+            "unexpected oversized-chain error: {error}"
+        );
 
         let mut mismatched_slot = sidecar.clone();
         mismatched_slot
@@ -10255,6 +10360,87 @@ mod tests {
         )
         .await
         .unwrap();
+        assert_eq!(proof.effect_ownership, EffectOwnership::Unverifiable);
+        assert!(!proof.full_effect_at_head);
+        assert!(proof.unsafe_reason.is_some());
+    }
+
+    #[tokio::test]
+    async fn branch_merge_v4_accepts_only_one_derived_index_tail() {
+        let dir = tempfile::tempdir().unwrap();
+        let uri = format!("{}/people.lance", dir.path().to_str().unwrap());
+        let store = TableStore::new(
+            dir.path().to_str().unwrap(),
+            Arc::new(lance::session::Session::default()),
+        );
+        let ds = TableStore::write_dataset(&uri, person_batch(&[("alice", Some(30))]))
+            .await
+            .unwrap();
+        let staged = store
+            .stage_append(&ds, person_batch(&[("bob", Some(25))]), &[])
+            .await
+            .unwrap();
+        let planned = staged.transaction_identity();
+        let (after_data, committed) = store
+            .commit_staged_exact(Arc::new(ds), staged)
+            .await
+            .unwrap();
+        assert_eq!(committed, planned);
+
+        let index = store
+            .stage_create_indices(
+                &after_data,
+                &[IndexBuildSpec::BTree {
+                    column: "id".to_string(),
+                }],
+            )
+            .await
+            .unwrap();
+        let (after_one_index, _) = store
+            .commit_staged_exact(Arc::new(after_data), index)
+            .await
+            .unwrap();
+        let observation = BranchMergeRefObservation {
+            version: after_one_index.version().version,
+            branch_identifier: after_one_index.branch_identifier().await.unwrap(),
+            parent_version: None,
+            dataset: after_one_index.clone(),
+        };
+        let proof = prove_branch_merge_multi_commit_effect(
+            &observation,
+            &[planned.clone()],
+            1,
+            "node:Person",
+        )
+        .await
+        .unwrap();
+        assert_eq!(proof.effect_ownership, EffectOwnership::OwnAtHead);
+        assert!(proof.full_effect_at_head);
+        drop(observation);
+
+        let second_index = store
+            .stage_create_indices(
+                &after_one_index,
+                &[IndexBuildSpec::BTree {
+                    column: "age".to_string(),
+                }],
+            )
+            .await
+            .unwrap();
+        let (after_two_indices, _) = store
+            .commit_staged_exact(Arc::new(after_one_index), second_index)
+            .await
+            .unwrap();
+        let observation = BranchMergeRefObservation {
+            version: after_two_indices.version().version,
+            branch_identifier: after_two_indices.branch_identifier().await.unwrap(),
+            parent_version: None,
+            dataset: after_two_indices,
+        };
+        let proof =
+            prove_branch_merge_multi_commit_effect(&observation, &[planned], 1, "node:Person")
+                .await
+                .unwrap();
         assert_eq!(proof.effect_ownership, EffectOwnership::Unverifiable);
         assert!(!proof.full_effect_at_head);
         assert!(proof.unsafe_reason.is_some());

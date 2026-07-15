@@ -30,9 +30,9 @@ use omnigraph_api_types::{
     BranchCreateOutput, BranchCreateRequest, BranchDeleteOutput, BranchListOutput,
     BranchMergeOutput, BranchMergeRequest, ChangeOutput, CommitListOutput, CommitOutput,
     ErrorOutput, ExportRequest, GraphListResponse, IngestOutput, IngestRequest,
-    InvokeStoredQueryRequest, ReadOutput,
-    ReadRequest, SchemaApplyOutput, SchemaApplyRequest, SchemaOutput, SnapshotOutput, commit_output,
-    ingest_output, read_output, schema_apply_output, snapshot_payload,
+    InvokeStoredQueryRequest, ReadOutput, ReadRequest, SchemaApplyOutput, SchemaApplyRequest,
+    SchemaOutput, SnapshotOutput, commit_output, ingest_output, read_output, schema_apply_output,
+    snapshot_payload,
 };
 use omnigraph_compiler::catalog::Catalog;
 use reqwest::Method;
@@ -41,9 +41,8 @@ use serde_json::Value;
 use crate::cli::CliLoadMode;
 use crate::helpers::{
     apply_bearer_token, apply_server_flag, build_http_client, is_remote_uri,
-    legacy_change_request_body, query_params_from_json,
-    remote_json, remote_url, resolve_cli_actor, resolve_cli_graph, resolve_remote_bearer_token,
-    resolve_server_flag, select_named_query,
+    legacy_change_request_body, query_params_from_json, remote_json, remote_url, resolve_cli_actor,
+    resolve_cli_graph, resolve_remote_bearer_token, resolve_server_flag, select_named_query,
 };
 use crate::output::{LoadOutput, load_output_from_result, load_output_from_tables};
 
@@ -52,10 +51,7 @@ pub(crate) enum GraphClient {
     /// writes (`resolve_with_policy()`) attribute the resolved actor.
     /// Direct-store access carries no Cedar policy (RFC-011: policy lives
     /// in the cluster/server, not in per-operator addressing).
-    Embedded {
-        uri: String,
-        actor: Option<String>,
-    },
+    Embedded { uri: String, actor: Option<String> },
     /// Remote HTTP server. The actor is resolved server-side from the
     /// token; the client never sets identity.
     Remote {
@@ -72,9 +68,7 @@ pub(crate) enum GraphClient {
 /// a policy-gated `/graphs`, or an unreachable server all proceed — the bare URL
 /// is then correct, or the real request surfaces the failure. Only fires on the
 /// no-graph path, so a `--graph`/`default_graph` happy path does no extra I/O.
-async fn require_graph_for_multi_graph_server(
-    scope: &crate::scope::ResolvedScope,
-) -> Result<()> {
+async fn require_graph_for_multi_graph_server(scope: &crate::scope::ResolvedScope) -> Result<()> {
     let (Some(server), None) = (scope.server.as_deref(), scope.graph.as_deref()) else {
         return Ok(());
     };
@@ -135,14 +129,17 @@ impl GraphClient {
         let scope = crate::scope::resolve_scope(
             &crate::operator::load_operator_config()?,
             crate::planes::Capability::Any,
-            crate::scope::ScopeFlags { profile, store, server, cluster: None, graph, uri },
+            crate::scope::ScopeFlags {
+                profile,
+                store,
+                server,
+                cluster: None,
+                graph,
+                uri,
+            },
         )?;
         require_graph_for_multi_graph_server(&scope).await?;
-        let (server, graph, uri) = (
-            scope.server.as_deref(),
-            scope.graph.as_deref(),
-            scope.uri,
-        );
+        let (server, graph, uri) = (scope.server.as_deref(), scope.graph.as_deref(), scope.uri);
         let via_server = server.is_some();
         let uri = apply_server_flag(server, graph, uri)?;
         let token = resolve_remote_bearer_token(uri.as_deref())?;
@@ -178,14 +175,17 @@ impl GraphClient {
         let scope = crate::scope::resolve_scope(
             &crate::operator::load_operator_config()?,
             crate::planes::Capability::Any,
-            crate::scope::ScopeFlags { profile, store, server, cluster: None, graph, uri },
+            crate::scope::ScopeFlags {
+                profile,
+                store,
+                server,
+                cluster: None,
+                graph,
+                uri,
+            },
         )?;
         require_graph_for_multi_graph_server(&scope).await?;
-        let (server, graph, uri) = (
-            scope.server.as_deref(),
-            scope.graph.as_deref(),
-            scope.uri,
-        );
+        let (server, graph, uri) = (scope.server.as_deref(), scope.graph.as_deref(), scope.uri);
         let via_server = server.is_some();
         let uri = apply_server_flag(server, graph, uri)?;
         let token = resolve_remote_bearer_token(uri.as_deref())?;
@@ -394,7 +394,12 @@ impl GraphClient {
                     token.as_deref(),
                 )
                 .await?;
-                Ok(load_output_from_tables(base_url, branch, mode.as_str(), &output))
+                Ok(load_output_from_tables(
+                    base_url,
+                    branch,
+                    mode.as_str(),
+                    &output,
+                ))
             }
             GraphClient::Embedded { uri, actor } => {
                 let db = Self::open_embedded(uri).await?;

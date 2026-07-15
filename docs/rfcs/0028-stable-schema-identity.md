@@ -462,10 +462,12 @@ logical identity and retain their own exact physical tokens.
 ## 8. Format activation and upgrade
 
 SchemaIR v2, the identity domain/allocator, and identity-bearing manifest rows
-are one internal storage-format capability. The implementation uses internal
-manifest schema v5, keeps `MIN_SUPPORTED == CURRENT == 5`, and adds the identity
-version to the release/stamp history. A v5 graph is never served with a partial
-combination such as identity-bearing IR over name-keyed manifest rows.
+are one internal storage-format capability. RFC-028 landed as internal manifest
+schema v5; that release kept `MIN_SUPPORTED == CURRENT == 5` and added the
+identity version to the release/stamp history. The currently served v6 format
+preserves this contract and adds RFC-023 key fencing; it does not reinterpret or
+backfill v5 in place. A v5 graph was never served with a partial combination
+such as identity-bearing IR over name-keyed manifest rows.
 
 There is no v1→v2 IR backfill and no new-binary in-place conversion of an old
 graph. Activation follows the documented strand:

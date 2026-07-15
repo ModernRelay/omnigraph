@@ -90,11 +90,7 @@ pub(crate) fn confirm_destructive(label: &str, uri: &str, yes: bool, json: bool)
 /// misses the route and 404s. Because callers pass structured segments rather
 /// than a pre-joined string, neither a stray `//` nor an un-encoded dynamic
 /// component is representable here.
-pub(crate) fn remote_url(
-    base: &str,
-    segments: &[&str],
-    query: &[(&str, &str)],
-) -> Result<String> {
+pub(crate) fn remote_url(base: &str, segments: &[&str], query: &[(&str, &str)]) -> Result<String> {
     let mut url = reqwest::Url::parse(base.trim_end_matches('/'))?;
     url.path_segments_mut()
         .map_err(|_| color_eyre::eyre::eyre!("invalid remote base url"))?
@@ -155,9 +151,11 @@ pub(crate) fn require_cluster_scope(
         return Ok(resolve_name(cluster));
     }
     // A cluster profile (flag, else OMNIGRAPH_PROFILE) binds the cluster too.
-    let profile_name = profile
-        .map(str::to_string)
-        .or_else(|| std::env::var(scope::PROFILE_ENV).ok().filter(|s| !s.is_empty()));
+    let profile_name = profile.map(str::to_string).or_else(|| {
+        std::env::var(scope::PROFILE_ENV)
+            .ok()
+            .filter(|s| !s.is_empty())
+    });
     if let Some(name) = profile_name {
         let profile = op.profile(&name).ok_or_else(|| {
             color_eyre::eyre::eyre!("unknown profile '{name}' (not defined under `profiles:`)")
@@ -232,7 +230,10 @@ pub(crate) fn select_cluster_policy<'p>(
                 "graph `{graph_id}` in cluster `{cluster}` matches {} policy bundles ([{}]); \
                  the cluster model expects one bundle per graph scope",
                 many.len(),
-                many.iter().map(|p| p.name.as_str()).collect::<Vec<_>>().join(", ")
+                many.iter()
+                    .map(|p| p.name.as_str())
+                    .collect::<Vec<_>>()
+                    .join(", ")
             ),
         };
     }
@@ -242,7 +243,10 @@ pub(crate) fn select_cluster_policy<'p>(
         many => bail!(
             "cluster `{cluster}` has {} policy bundles ([{}]); pass --graph <id> to select one",
             many.len(),
-            many.iter().map(|p| p.name.as_str()).collect::<Vec<_>>().join(", ")
+            many.iter()
+                .map(|p| p.name.as_str())
+                .collect::<Vec<_>>()
+                .join(", ")
         ),
     }
 }
@@ -620,7 +624,10 @@ pub(crate) fn resolve_read_target(
     if cli_branch.is_some() && cli_snapshot.is_some() {
         bail!("read target may specify branch or snapshot, not both");
     }
-    Ok(read_target_from_cli(cli_branch.or(alias_branch), cli_snapshot))
+    Ok(read_target_from_cli(
+        cli_branch.or(alias_branch),
+        cli_snapshot,
+    ))
 }
 
 pub(crate) fn resolve_query_path(
@@ -679,8 +686,6 @@ pub(crate) fn resolve_read_format(
         })
         .unwrap_or_default()
 }
-
-
 
 pub(crate) fn read_target_from_cli(branch: Option<String>, snapshot: Option<String>) -> ReadTarget {
     if let Some(snapshot) = snapshot {
@@ -796,7 +801,6 @@ fn registry_from_serving_queries(
     })
 }
 
-
 /// `queries validate --cluster <dir>` (RFC-011): type-check every stored query
 /// in the cluster catalog against its graph's applied schema. Both the registry
 /// and the schemas come from the cluster serving snapshot — no omnigraph.yaml.
@@ -820,7 +824,8 @@ pub(crate) async fn execute_queries_validate(
             continue;
         }
         matched_any = true;
-        let registry = registry_from_serving_queries(&snapshot.queries, Some(&serving_graph.graph_id))?;
+        let registry =
+            registry_from_serving_queries(&snapshot.queries, Some(&serving_graph.graph_id))?;
         let db = Omnigraph::open(&serving_graph.root.to_string_lossy()).await?;
         let report = check(&registry, &db.catalog());
         total += registry.len();

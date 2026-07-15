@@ -52,7 +52,9 @@ pub struct NodeType {
     /// Interface names this type implements
     pub implements: Vec<String>,
     pub properties: HashMap<String, PropType>,
-    /// Key property names (from `@key` or `@key(name)`). Usually 0 or 1 element.
+    /// Key property names (from `@key` or `@key(name, ...)`). Runtime catalogs
+    /// project composite members in stable property-ID order so renames cannot
+    /// change physical tuple identity.
     pub key: Option<Vec<String>>,
     /// Uniqueness constraints (each entry is a list of column names)
     pub unique_constraints: Vec<Vec<String>>,
@@ -552,11 +554,42 @@ pub fn build_catalog_from_ir(ir: &schema_ir::SchemaIR) -> Result<Catalog> {
         let mut range_constraints = Vec::new();
         let mut check_constraints = Vec::new();
         for constraint in &node.constraints {
-            match schema_ir::constraint_from_ir(constraint) {
-                Constraint::Key(columns) => {
-                    key = Some(columns.clone());
-                    indices.push(columns);
+            if let schema_ir::ConstraintIR::Key { fields } = constraint {
+                let mut stable_fields = fields
+                    .iter()
+                    .map(|field| match field {
+                        schema_ir::FieldRefIR::Property(reference) => {
+                            Ok((reference.property_id, reference.property_name.clone()))
+                        }
+                        schema_ir::FieldRefIR::System(_) => Err(CompilerError::Catalog(format!(
+                            "node '{}' @key must reference declared properties",
+                            node.name
+                        ))),
+                    })
+                    .collect::<Result<Vec<_>>>()?;
+                stable_fields.sort_by_key(|(property_id, _)| *property_id);
+                if stable_fields.is_empty() {
+                    return Err(CompilerError::Catalog(format!(
+                        "node '{}' @key cannot be empty",
+                        node.name
+                    )));
                 }
+                if stable_fields.windows(2).any(|pair| pair[0].0 == pair[1].0) {
+                    return Err(CompilerError::Catalog(format!(
+                        "node '{}' @key repeats a property identity",
+                        node.name
+                    )));
+                }
+                let columns = stable_fields
+                    .into_iter()
+                    .map(|(_, property_name)| property_name)
+                    .collect::<Vec<_>>();
+                key = Some(columns.clone());
+                indices.push(columns);
+                continue;
+            }
+            match schema_ir::constraint_from_ir(constraint) {
+                Constraint::Key(_) => unreachable!("@key handled in stable property-id order"),
                 Constraint::Unique(columns) => unique_constraints.push(columns),
                 Constraint::Index(columns) => indices.push(columns),
                 Constraint::Range { property, min, max } => {

@@ -9,7 +9,6 @@ mod support;
 
 use support::*;
 
-
 #[test]
 fn cluster_validate_config_success() {
     let temp = tempdir().unwrap();
@@ -884,12 +883,17 @@ graphs:
     let (a, b) = (validate(baseline.path()), validate(with_config.path()));
     // Compare the path-free invariants (paths embed each tempdir).
     for key in ["ok", "diagnostics", "resource_digests", "dependencies"] {
-        assert_eq!(a[key], b[key], "conflicting omnigraph.yaml leaked into cluster validate ({key})");
+        assert_eq!(
+            a[key], b[key],
+            "conflicting omnigraph.yaml leaked into cluster validate ({key})"
+        );
     }
     let leaked = b.to_string();
-    assert!(!leaked.contains("phantom") && !leaked.contains("9999"), "{leaked}");
+    assert!(
+        !leaked.contains("phantom") && !leaked.contains("9999"),
+        "{leaked}"
+    );
 }
-
 
 // ── RFC-010 Slice 3: cluster-managed maintenance addressing + init signpost ──
 

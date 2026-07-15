@@ -214,13 +214,9 @@ async fn deferred_indexes_do_not_block_hybrid_reads() {
     let dir = tempfile::tempdir().unwrap();
     let uri = dir.path().to_str().unwrap();
     let mut db = Omnigraph::init(uri, MOCK_SEARCH_SCHEMA).await.unwrap();
-    load_jsonl(
-        &mut db,
-        &mock_embedding_seed_data(),
-        LoadMode::Overwrite,
-    )
-    .await
-    .unwrap();
+    load_jsonl(&mut db, &mock_embedding_seed_data(), LoadMode::Overwrite)
+        .await
+        .unwrap();
 
     assert_eq!(
         doc_user_index_count(&db).await,
@@ -460,7 +456,9 @@ query filtered_nearest($q: Vector(4)) {
     let dir = tempfile::tempdir().unwrap();
     let uri = dir.path().to_str().unwrap();
     let mut db = Omnigraph::init(uri, SCHEMA).await.unwrap();
-    load_jsonl(&mut db, DATA, LoadMode::Overwrite).await.unwrap();
+    load_jsonl(&mut db, DATA, LoadMode::Overwrite)
+        .await
+        .unwrap();
 
     let result = query_main(
         &mut db,
@@ -800,7 +798,10 @@ async fn nearest_full_rank_order() {
     .await
     .unwrap();
     // [0.1,0.2,0.3,0.4] == ml-intro's embedding (dist 0); the rest by ascending L2.
-    assert_eq!(result_slugs(&result), vec!["ml-intro", "nlp-guide", "rl-intro"]);
+    assert_eq!(
+        result_slugs(&result),
+        vec!["ml-intro", "nlp-guide", "rl-intro"]
+    );
 }
 
 #[tokio::test]
@@ -817,7 +818,10 @@ async fn bm25_full_rank_order() {
     .await
     .unwrap();
     // Descending BM25 score order.
-    assert_eq!(result_slugs(&result), vec!["rl-intro", "ml-intro", "dl-basics"]);
+    assert_eq!(
+        result_slugs(&result),
+        vec!["rl-intro", "ml-intro", "dl-basics"]
+    );
 }
 
 // Characterization: fuzzy() does NOT match under the default tokenizer/index in
@@ -832,9 +836,14 @@ async fn bm25_full_rank_order() {
 async fn fuzzy_does_not_match_under_default_tokenizer() {
     let dir = tempfile::tempdir().unwrap();
     let mut db = init_search_db(&dir).await;
-    let r = query_main(&mut db, SEARCH_QUERIES, "fuzzy_search", &params(&[("$q", "Introductio")]))
-        .await
-        .unwrap();
+    let r = query_main(
+        &mut db,
+        SEARCH_QUERIES,
+        "fuzzy_search",
+        &params(&[("$q", "Introductio")]),
+    )
+    .await
+    .unwrap();
     assert!(
         result_slugs(&r).is_empty(),
         "fuzzy now matches — promote this to a real matched-set/exclusion golden"
@@ -848,9 +857,14 @@ async fn match_text_matches_exact_set_excludes_unrelated() {
     let dir = tempfile::tempdir().unwrap();
     let mut db = init_search_db(&dir).await;
     // "neural" appears only in dl-basics's body ("neural networks").
-    let r = query_main(&mut db, SEARCH_QUERIES, "phrase_search", &params(&[("$q", "neural")]))
-        .await
-        .unwrap();
+    let r = query_main(
+        &mut db,
+        SEARCH_QUERIES,
+        "phrase_search",
+        &params(&[("$q", "neural")]),
+    )
+    .await
+    .unwrap();
     let mut got = result_slugs(&r);
     got.sort();
     assert_eq!(got, vec!["dl-basics"]);
@@ -867,9 +881,14 @@ async fn match_text_matches_exact_set_excludes_unrelated() {
 async fn rrf_fuses_two_fts_fields() {
     let dir = tempfile::tempdir().unwrap();
     let mut db = init_search_db(&dir).await;
-    let r = query_main(&mut db, SEARCH_QUERIES, "rrf_two_fts", &params(&[("$q", "learning")]))
-        .await
-        .unwrap();
+    let r = query_main(
+        &mut db,
+        SEARCH_QUERIES,
+        "rrf_two_fts",
+        &params(&[("$q", "learning")]),
+    )
+    .await
+    .unwrap();
     assert_eq!(result_slugs(&r), vec!["rl-intro", "dl-basics", "ml-intro"]);
 }
 

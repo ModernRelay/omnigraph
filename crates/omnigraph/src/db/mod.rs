@@ -10,12 +10,12 @@ pub use commit_graph::GraphCommit;
 pub use graph_coordinator::{ReadTarget, ResolvedTarget, SnapshotId};
 pub use manifest::{Snapshot, SnapshotScanner, SnapshotTable, SubTableEntry, SubTableUpdate};
 pub(crate) use omnigraph::ensure_public_branch_ref;
-pub(crate) use omnigraph::{DeferredTableFork, WriteTxn};
 pub use omnigraph::{
     CleanupPolicyOptions, InitOptions, MergeOutcome, Omnigraph, OpenMode, PendingIndex,
     RepairAction, RepairClassification, RepairOptions, RepairStats, SchemaApplyOptions,
     SchemaApplyResult, SkipReason, TableCleanupStats, TableOptimizeStats, TableRepairStats,
 };
+pub(crate) use omnigraph::{DeferredTableFork, WriteAuthorityToken, WriteTxn};
 
 use crate::error::{OmniError, Result};
 

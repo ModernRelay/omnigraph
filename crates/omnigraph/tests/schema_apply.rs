@@ -10,6 +10,22 @@ use omnigraph_compiler::{SchemaMigrationStep, SchemaTypeKind};
 
 use helpers::*;
 
+async fn assert_exact_id_primary_key(db: &Omnigraph, table_key: &str) {
+    let snapshot = db.snapshot_of(ReadTarget::branch("main")).await.unwrap();
+    let dataset = snapshot.open(table_key).await.unwrap();
+    let primary_key = dataset
+        .schema()
+        .unenforced_primary_key()
+        .iter()
+        .map(|field| field.name.clone())
+        .collect::<Vec<_>>();
+    assert_eq!(
+        primary_key,
+        ["id"],
+        "schema apply must preserve exactly `id` as the Lance unenforced primary key for {table_key}"
+    );
+}
+
 #[tokio::test]
 #[cfg_attr(feature = "failpoints", serial_test::parallel)]
 async fn plan_schema_reports_supported_additive_change() {
@@ -133,6 +149,11 @@ async fn long_lived_handle_uses_the_schema_catalog_bound_to_its_write_token() {
         )
     );
     schema_owner.apply_schema(&desired).await.unwrap();
+    // The same apply exercises both physical schema shapes: Person is rebuilt
+    // through a staged overwrite for the added property, while Project is a
+    // newly created table incarnation. Neither may drop the immutable v6 PK.
+    assert_exact_id_primary_key(&schema_owner, "node:Person").await;
+    assert_exact_id_primary_key(&schema_owner, "node:Project").await;
 
     let projects = stale_handle
         .query(
@@ -590,6 +611,7 @@ async fn apply_schema_drops_a_nullable_property_softly_preserves_prior_version()
     let result = db.apply_schema(&desired).await.unwrap();
     assert!(result.supported);
     assert!(result.applied);
+    assert_exact_id_primary_key(&db, "node:Person").await;
 
     // Manifest advanced; row count unchanged.
     let after_version = db
@@ -638,6 +660,7 @@ async fn apply_schema_drops_a_nullable_property_softly_preserves_prior_version()
     let uri = dir.path().to_str().unwrap().to_string();
     drop(db);
     let reopened = Omnigraph::open(&uri).await.unwrap();
+    assert_exact_id_primary_key(&reopened, "node:Person").await;
     let reopened_snapshot = reopened
         .snapshot_of(ReadTarget::branch("main"))
         .await
@@ -1118,6 +1141,81 @@ edge WorksAt: Human -> Company
         after_snapshot.entry("node:Person").is_none(),
         "old node:Person table key should be unmapped after rename"
     );
+}
+
+#[tokio::test]
+#[cfg_attr(feature = "failpoints", serial_test::parallel)]
+async fn composite_key_identity_survives_lexically_crossing_property_renames() {
+    let initial = r#"
+node Pair {
+    alpha: String
+    zeta: String
+    label: String
+    @key(alpha, zeta)
+}
+"#;
+    let desired = r#"
+node Pair {
+    aaaa: String @rename_from("zeta")
+    zzzz: String @rename_from("alpha")
+    label: String
+    @key(aaaa, zzzz)
+}
+"#;
+    let mutation = r#"
+query put_pair($aaaa: String, $zzzz: String, $label: String) {
+    insert Pair { aaaa: $aaaa, zzzz: $zzzz, label: $label }
+}
+"#;
+
+    let dir = tempfile::tempdir().unwrap();
+    let db = Omnigraph::init(dir.path().to_str().unwrap(), initial)
+        .await
+        .unwrap();
+    load_jsonl(
+        &db,
+        r#"{"type":"Pair","data":{"alpha":"A","zeta":"Z","label":"before"}}"#,
+        LoadMode::Append,
+    )
+    .await
+    .unwrap();
+    let canonical_id = r#"["A","Z"]"#;
+    assert_eq!(
+        collect_column_strings(&read_table(&db, "node:Pair").await, "id"),
+        [canonical_id]
+    );
+    let alpha_id = db.catalog().property_id("Pair", "alpha").unwrap();
+    let zeta_id = db.catalog().property_id("Pair", "zeta").unwrap();
+
+    let applied = db.apply_schema(desired).await.unwrap();
+    assert!(applied.supported && applied.applied);
+    assert_eq!(
+        db.catalog().node_types["Pair"].key.as_deref(),
+        Some(&["zzzz".to_string(), "aaaa".to_string()][..]),
+        "runtime key order follows stable property identity across lexical crossing"
+    );
+    assert_eq!(db.catalog().property_id("Pair", "zzzz"), Some(alpha_id));
+    assert_eq!(db.catalog().property_id("Pair", "aaaa"), Some(zeta_id));
+    assert_eq!(
+        collect_column_strings(&read_table(&db, "node:Pair").await, "id"),
+        [canonical_id],
+        "schema rewrite must retain the existing physical identity"
+    );
+
+    db.mutate(
+        "main",
+        mutation,
+        "put_pair",
+        &params(&[("$aaaa", "Z"), ("$zzzz", "A"), ("$label", "after")]),
+    )
+    .await
+    .unwrap();
+
+    let rows = read_table(&db, "node:Pair").await;
+    assert_eq!(count_rows(&db, "node:Pair").await, 1);
+    assert_eq!(collect_column_strings(&rows, "id"), [canonical_id]);
+    assert_eq!(collect_column_strings(&rows, "label"), ["after"]);
+    assert_exact_id_primary_key(&db, "node:Pair").await;
 }
 
 #[tokio::test]

@@ -43,7 +43,9 @@ The on-disk shape of `__manifest` is reconciled with the binary via a single ver
   - a stamp *above* CURRENT — a graph written by a newer release — is refused with an **"upgrade omnigraph first"** message, so an old binary cannot misread a newer format.
 - The stamp is read with no object-store writes, so the check is safe under a read-only open. Operators can see a graph's stamp with `omnigraph snapshot` and the binary's served version with `omnigraph version` (the `internal-schema` line).
 
-The stamp values below are historical; this binary serves only the current one (`v5`). An earlier-stamped graph is rebuilt via export/import, not migrated in place.
+The stamp values below are historical; this binary serves only the current one
+(`v6`). An earlier-stamped graph is rebuilt via export/import, not migrated in
+place.
 
 | Stamp | Shape |
 |---|---|
@@ -51,7 +53,8 @@ The stamp values below are historical; this binary serves only the current one (
 | v2 | `__manifest.object_id` carries an unenforced-primary-key annotation; row-level CAS engaged. |
 | v3 | Legacy `__run__*` staging branches (pre-v0.4.0 Run state machine) swept off `__manifest`. |
 | v4 | Graph lineage folded into `__manifest` as `graph_commit` / `graph_head` rows (RFC-013 Phase 7); the `_graph_commits.lance` / `_graph_commit_actors.lance` tables retired. |
-| v5 | RFC-028 SchemaIR v2 plus graph-domain stable schema IDs; manifest table rows, OCC, recovery ownership, and physical paths keyed by stable table ID + incarnation. **The only version this binary serves.** |
+| v5 | RFC-028 SchemaIR v2 plus graph-domain stable schema IDs; manifest table rows, OCC, recovery ownership, and physical paths keyed by stable table ID + incarnation. |
+| v6 | Preserves v5 identity and activates RFC-023: every graph node/edge dataset has exact non-null physical `id` as Lance's unenforced PK, and every production strict insert/upsert uses the exact-`id` filter-bearing adapter. **The only version this binary serves.** |
 
 ## On-disk layout
 

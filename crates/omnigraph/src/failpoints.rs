@@ -56,12 +56,25 @@ pub mod names {
     pub const BRANCH_CONTROL_POST_RECOVERY_BARRIER: &str = "branch_control.post_recovery_barrier";
     pub const BRANCH_MERGE_ADOPT_AFTER_APPEND_PRE_UPSERT: &str =
         "branch_merge.adopt_after_append_pre_upsert";
+    /// After one bounded strict-insert chunk committed while at least one later
+    /// chunk from the same Armed BranchMerge transaction chain remains.
+    pub const BRANCH_MERGE_ADOPT_BETWEEN_INSERT_CHUNKS: &str =
+        "branch_merge.adopt_between_insert_chunks";
     pub const BRANCH_MERGE_ADOPT_AFTER_UPSERT_PRE_DELETE: &str =
         "branch_merge.adopt_after_upsert_pre_delete";
+    /// After one bounded delete chunk committed while at least one later
+    /// delete chunk from the same Armed BranchMerge chain remains.
+    pub const BRANCH_MERGE_BETWEEN_DELETE_CHUNKS: &str = "branch_merge.between_delete_chunks";
     /// Source/target heads and snapshots have been captured while the schema
     /// and both branch-incarnation gates are held, before merge planning or
     /// any durable table effect.
     pub const BRANCH_MERGE_POST_AUTHORITY_CAPTURE: &str = "branch_merge.post_authority_capture";
+    /// Candidate classification and validation have completed, before the
+    /// final source/target table-gate envelope and recovery arm. Tests use this
+    /// boundary to prove a raw source-table ref delete/recreate cannot pass as
+    /// the native incarnation whose immutable rows were proven.
+    pub const BRANCH_MERGE_POST_CANDIDATE_VALIDATION: &str =
+        "branch_merge.post_candidate_validation";
     /// The v4 BranchMerge recovery intent is durable, before any first-touch
     /// target table ref is created.
     pub const BRANCH_MERGE_POST_SIDECAR_PRE_FORK: &str = "branch_merge.post_sidecar_pre_fork";
