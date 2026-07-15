@@ -18,8 +18,9 @@ use omnigraph_compiler::catalog::{Catalog, EdgeType, NodeType};
 use omnigraph_compiler::schema::parser::parse_schema;
 use omnigraph_compiler::types::{PropType, ScalarType};
 use omnigraph_compiler::{
-    DropMode, SchemaIR, SchemaMigrationPlan, SchemaMigrationStep, SchemaTypeKind,
-    build_catalog_from_ir, build_schema_ir, plan_schema_migration,
+    DropMode, SchemaIR, SchemaIdentityDomain, SchemaMigrationPlan, SchemaMigrationStep,
+    SchemaShape, SchemaTypeKind, build_catalog_from_ir, compile_schema_shape, initialize_schema_ir,
+    plan_schema_migration,
 };
 
 use crate::db::graph_coordinator::{GraphCoordinator, PublishedSnapshot};
@@ -46,13 +47,12 @@ pub use table_ops::PendingIndex;
 pub(crate) use table_ops::{DeferredTableFork, OpenedForMutation};
 
 use super::commit_graph::GraphCommit;
-use super::manifest::{
-    ManifestChange, Snapshot, TableRegistration, TableTombstone, table_path_for_table_key,
-};
+use super::manifest::{ManifestChange, Snapshot, TableRegistration, TableTombstone};
 use super::schema_state::{
-    SCHEMA_SOURCE_FILENAME, load_or_bootstrap_schema_contract, load_validated_schema_contract,
-    read_accepted_schema_ir, read_schema_state_identity, recover_schema_state_files, schema_ir_uri,
-    schema_source_staging_uri, schema_source_uri, schema_state_uri, validate_schema_contract,
+    SCHEMA_SOURCE_FILENAME, load_validated_schema_contract,
+    load_validated_schema_contract_for_source, read_accepted_schema_ir, read_schema_state_identity,
+    recover_schema_state_files, schema_ir_uri, schema_source_staging_uri, schema_source_uri,
+    schema_state_uri, validate_schema_contract, validate_schema_ir_against_snapshot,
     write_schema_contract, write_schema_contract_staging,
 };
 use super::{
@@ -118,6 +118,10 @@ pub(crate) struct WriteAuthorityToken {
     /// transitions also advance `graph_head`, which is the atomically
     /// contended authority row for this first coarse-OCC slice.
     pub(crate) schema_ir_hash: String,
+    /// Opaque namespace for every stable numeric schema identity. It is read
+    /// from the validated accepted IR, never reconstructed from names or copied
+    /// from an unvalidated state marker.
+    pub(crate) schema_identity_domain: String,
     pub(crate) schema_identity_version: u32,
 }
 
@@ -139,6 +143,17 @@ pub(crate) struct WriteTxn {
     /// never the handle-global catalog, which can lag a schema apply performed by
     /// another long-lived handle.
     pub(crate) catalog: Arc<Catalog>,
+}
+
+/// One coherent handle-local projection of the durable schema contract.
+/// Source and catalog move through one ArcSwap publication so readers never
+/// combine an old source with a new identity-bearing catalog (or vice versa).
+#[derive(Debug)]
+struct HandleSchemaView {
+    catalog: Arc<Catalog>,
+    source: Arc<String>,
+    schema_ir_hash: String,
+    schema_identity_domain: String,
 }
 
 /// Top-level handle to an Omnigraph database.
@@ -174,14 +189,11 @@ pub struct Omnigraph {
     /// and one session. Invalidated alongside `runtime_cache` on branch switch /
     /// refresh — hygiene only; version-in-key carries correctness.
     read_caches: Arc<crate::runtime_cache::ReadCaches>,
-    /// Read-heavy on every query, written only by `apply_schema`. ArcSwap
-    /// gives atomic pointer swap with zero-cost reads (`load()` returns a
-    /// `Guard<Arc<Catalog>>`), so concurrent queries on different actors
-    /// don't contend on a lock to read the catalog.
-    catalog: Arc<ArcSwap<Catalog>>,
-    /// Read-heavy on schema introspection paths, written only by
-    /// `apply_schema`. Same ArcSwap rationale as `catalog`.
-    schema_source: Arc<ArcSwap<String>>,
+    /// Read-heavy source + catalog projection of the durable schema contract.
+    /// One ArcSwap keeps both values coherent for concurrent readers. The
+    /// accepted IR hash is the refresh fence: unlike source bytes, it changes
+    /// when a drop/re-add returns to the same names with new identities.
+    schema_view: Arc<ArcSwap<HandleSchemaView>>,
     /// Root-scoped writer queues shared by every `Omnigraph` handle for this
     /// canonical local root identity (or opaque remote URI) in the process.
     /// Reachable from engine internals
@@ -266,26 +278,22 @@ pub enum OpenMode {
 /// accidental re-init from overwriting an existing graph's schema
 /// metadata. Default behavior (`force: false`) fails fast with
 /// [`OmniError::AlreadyInitialized`] if any of `_schema.pg`,
-/// `_schema.ir.json`, or `__schema_state.json` already exists at
-/// the target URI. With `force: true` the preflight is skipped —
-/// existing schema files are overwritten in place. Force does NOT
-/// purge old Lance datasets or `__manifest/`; reclaiming those
-/// still requires deleting the graph directory by hand (or via a
-/// future `DELETE /graphs/{id}`).
+/// `_schema.ir.json`, or `__schema_state.json` already exists at the target
+/// URI. With `force: true`, orphan schema files may be replaced only when no
+/// `__manifest` exists. Force never rebinds an existing graph to a newly
+/// minted schema identity domain and does not purge Lance datasets.
 #[derive(Debug, Clone, Copy, Default)]
 pub struct InitOptions {
-    /// Skip the existing-graph preflight. Operators set this when
-    /// they actually mean to overwrite — e.g. `omnigraph init --force`.
+    /// Replace orphan schema artifacts at a root with no `__manifest`.
     pub force: bool,
 }
 
 impl Omnigraph {
     /// Create a new graph at `uri` from schema source.
     ///
-    /// Strict mode: errors with [`OmniError::AlreadyInitialized`] if
-    /// `uri` already holds any of the three schema artifacts. To
-    /// overwrite an existing graph deliberately, call
-    /// [`Self::init_with_options`] with `InitOptions { force: true }`.
+    /// Strict mode errors with [`OmniError::AlreadyInitialized`] if `uri`
+    /// already holds any schema artifact. Force is intentionally limited to
+    /// orphan artifacts and refuses a root with an existing `__manifest`.
     pub async fn init(uri: &str, schema_source: &str) -> Result<Self> {
         Self::init_with_options(uri, schema_source, InitOptions::default()).await
     }
@@ -313,16 +321,17 @@ impl Omnigraph {
         let write_queue =
             crate::db::write_queue::WriteQueueManager::for_root(&write_queue_identity);
 
-        // Preflight: refuse to clobber an existing graph unless the
-        // operator passed `force`. This runs BEFORE any parse or
-        // write so a misdirected `init` against an existing graph
-        // URI cannot reach a code path that overwrites or, on a
-        // later cleanup, deletes the schema files.
+        // Preflight before parse or write. Strict init refuses any schema
+        // artifact; force may recover orphan schema files but still refuses an
+        // existing manifest so a newly minted identity domain can never be
+        // attached to old tables.
         //
         // Closes the "init is destructive against existing state"
         // class: there is no longer a code path where strict-mode
         // `init` can mutate a populated graph root.
-        if !options.force {
+        if options.force {
+            refuse_force_init_over_existing_manifest(&root, storage.as_ref()).await?;
+        } else {
             for candidate in [
                 schema_source_uri(&root),
                 schema_ir_uri(&root),
@@ -334,7 +343,22 @@ impl Omnigraph {
             }
         }
 
-        let schema_ir = read_schema_ir_from_source(schema_source)?;
+        let schema_shape = read_schema_shape_from_source(schema_source)?;
+        let resolution = initialize_schema_ir(SchemaIdentityDomain::new(), &schema_shape)
+            .map_err(|error| OmniError::manifest(error.to_string()))?;
+        for diagnostic in &resolution.diagnostics {
+            tracing::warn!(
+                target: "omnigraph::schema::identity",
+                kind = ?diagnostic.kind,
+                entity = %diagnostic.entity,
+                hint = %diagnostic.hint,
+                "schema identity hint is inert during graph initialization"
+            );
+        }
+        let schema_ir = resolution.schema_ir;
+        let accepted_schema_ir_hash = omnigraph_compiler::schema_ir_hash(&schema_ir)
+            .map_err(|error| OmniError::manifest(error.to_string()))?;
+        let schema_identity_domain = schema_ir.schema_identity_domain.as_str().to_string();
         let mut catalog = build_catalog_from_ir(&schema_ir)?;
         fixup_blob_schemas(&mut catalog);
 
@@ -364,10 +388,10 @@ impl Omnigraph {
             true
         };
 
-        // Run the I/O phase. On any error, best-effort-clean schema
-        // artifacts only when this invocation owns them: strict mode owns
-        // them after the atomic `_schema.pg` claim above; force mode owns
-        // destructive overwrite semantics by explicit operator request.
+        // Run the I/O phase. On any error, best-effort-clean schema artifacts
+        // only when this invocation owns them: strict mode owns them after the
+        // atomic `_schema.pg` claim above; force is allowed only for orphan
+        // schema artifacts after proving that no manifest exists.
         //
         // Coverage gap: Lance per-type datasets and `__manifest/`
         // directory created by `GraphCoordinator::init` are NOT cleaned
@@ -414,8 +438,12 @@ impl Omnigraph {
                 session,
                 handles: Arc::new(crate::runtime_cache::TableHandleCache::default()),
             }),
-            catalog: Arc::new(ArcSwap::from_pointee(catalog)),
-            schema_source: Arc::new(ArcSwap::from_pointee(schema_source.to_string())),
+            schema_view: Arc::new(ArcSwap::from_pointee(HandleSchemaView {
+                catalog: Arc::new(catalog),
+                source: Arc::new(schema_source.to_string()),
+                schema_ir_hash: accepted_schema_ir_hash,
+                schema_identity_domain,
+            })),
             write_queue,
             merge_exclusive: Arc::new(tokio::sync::Mutex::new(())),
             policy: None,
@@ -523,15 +551,11 @@ impl Omnigraph {
         // Read _schema.pg (post-recovery — may have just been renamed in).
         let schema_path = schema_source_uri(&root);
         let schema_source = storage.read_text(&schema_path).await?;
-        let current_source_ir = read_schema_ir_from_source(&schema_source)?;
-        let branches = coordinator.branch_list().await?;
-        let (accepted_ir, _) = load_or_bootstrap_schema_contract(
-            &root,
-            Arc::clone(&storage),
-            &branches,
-            &current_source_ir,
-        )
-        .await?;
+        let (accepted_ir, accepted_state) =
+            load_validated_schema_contract_for_source(&root, Arc::clone(&storage), &schema_source)
+                .await?;
+        validate_schema_ir_against_snapshot(&accepted_ir, &coordinator.snapshot())?;
+        let schema_identity_domain = accepted_ir.schema_identity_domain.as_str().to_string();
         let mut catalog = build_catalog_from_ir(&accepted_ir)?;
         fixup_blob_schemas(&mut catalog);
 
@@ -552,8 +576,12 @@ impl Omnigraph {
                 session,
                 handles: Arc::new(crate::runtime_cache::TableHandleCache::default()),
             }),
-            catalog: Arc::new(ArcSwap::from_pointee(catalog)),
-            schema_source: Arc::new(ArcSwap::from_pointee(schema_source)),
+            schema_view: Arc::new(ArcSwap::from_pointee(HandleSchemaView {
+                catalog: Arc::new(catalog),
+                source: Arc::new(schema_source),
+                schema_ir_hash: accepted_state.schema_ir_hash,
+                schema_identity_domain,
+            })),
             write_queue,
             merge_exclusive: Arc::new(tokio::sync::Mutex::new(())),
             policy: None,
@@ -570,25 +598,45 @@ impl Omnigraph {
     /// catalog pointer; callers can hold the returned `Arc` across awaits
     /// without blocking concurrent `apply_schema`.
     pub fn catalog(&self) -> Arc<Catalog> {
-        self.catalog.load_full()
+        Arc::clone(&self.schema_view.load().catalog)
     }
 
     /// Returns an `Arc<String>` snapshot of the schema source.
     pub fn schema_source(&self) -> Arc<String> {
-        self.schema_source.load_full()
+        Arc::clone(&self.schema_view.load().source)
     }
 
-    /// Atomically swap the in-memory catalog. Concurrent readers see
-    /// either the old or the new pointer; never a torn state. Used by
-    /// `apply_schema` and `reload_schema_if_source_changed`.
-    pub(crate) fn store_catalog(&self, catalog: Catalog) {
-        self.catalog.store(Arc::new(catalog));
-    }
-
-    /// Atomically swap the in-memory schema source. Same rationale as
-    /// [`store_catalog`](Self::store_catalog).
-    pub(crate) fn store_schema_source(&self, schema_source: String) {
-        self.schema_source.store(Arc::new(schema_source));
+    /// Publish one coherent handle-local projection after the durable schema
+    /// contract is live. The catalog must be bound to the exact accepted IR;
+    /// source, catalog, hash, and domain then move through one ArcSwap.
+    pub(crate) fn store_schema_view(
+        &self,
+        catalog: Catalog,
+        schema_source: String,
+        accepted_ir: &SchemaIR,
+    ) -> Result<()> {
+        let schema_ir_hash = omnigraph_compiler::schema_ir_hash(accepted_ir)
+            .map_err(|error| OmniError::manifest_internal(error.to_string()))?;
+        let catalog_ir = catalog.bound_schema_ir().ok_or_else(|| {
+            OmniError::manifest_internal(
+                "cannot publish an identity-unbound runtime catalog".to_string(),
+            )
+        })?;
+        let catalog_ir_hash = omnigraph_compiler::schema_ir_hash(catalog_ir)
+            .map_err(|error| OmniError::manifest_internal(error.to_string()))?;
+        if catalog_ir_hash != schema_ir_hash {
+            return Err(OmniError::manifest_internal(
+                "cannot publish a runtime catalog bound to a different accepted SchemaIR"
+                    .to_string(),
+            ));
+        }
+        self.schema_view.store(Arc::new(HandleSchemaView {
+            catalog: Arc::new(catalog),
+            source: Arc::new(schema_source),
+            schema_ir_hash,
+            schema_identity_domain: accepted_ir.schema_identity_domain.as_str().to_string(),
+        }));
+        Ok(())
     }
 
     pub fn uri(&self) -> &str {
@@ -688,6 +736,19 @@ impl Omnigraph {
     /// already hold `schema_apply_serial_queue_key`; this helper does not acquire
     /// it because the gate is a non-reentrant mutex.
     pub(crate) async fn load_accepted_catalog_with_schema_gate_held(&self) -> Result<Arc<Catalog>> {
+        let catalog = self.build_accepted_catalog_with_schema_gate_held().await?;
+        let snapshot = self.coordinator.read().await.snapshot();
+        validate_bound_catalog_against_snapshot(&catalog, &snapshot)?;
+        Ok(catalog)
+    }
+
+    /// Build the accepted operation-local catalog without joining it to this
+    /// handle's warm manifest snapshot. Coherent read capture uses this form so
+    /// it can run the manifest freshness probe first, then validate the catalog
+    /// against the exact resolved snapshot. Other callers should use
+    /// [`Self::load_accepted_catalog_with_schema_gate_held`] unless they perform
+    /// that post-resolution identity join themselves.
+    async fn build_accepted_catalog_with_schema_gate_held(&self) -> Result<Arc<Catalog>> {
         let (schema_ir, _) =
             load_validated_schema_contract(self.uri(), Arc::clone(&self.storage)).await?;
         let mut catalog = build_catalog_from_ir(&schema_ir)?;
@@ -897,9 +958,11 @@ impl Omnigraph {
                 tokio::task::yield_now().await;
                 continue;
             }
+            validate_schema_ir_against_snapshot(&schema_ir, &snapshot)?;
 
             let mut catalog = build_catalog_from_ir(&schema_ir)?;
             fixup_blob_schemas(&mut catalog);
+            let schema_identity_domain = schema_ir.schema_identity_domain.as_str().to_string();
             return Ok(WriteTxn {
                 branch,
                 base: snapshot,
@@ -907,6 +970,7 @@ impl Omnigraph {
                     branch_identifier,
                     graph_head,
                     schema_ir_hash: schema_state.schema_ir_hash,
+                    schema_identity_domain,
                     schema_identity_version: schema_state.schema_identity_version,
                 },
                 effective_graph_head,
@@ -925,8 +989,11 @@ impl Omnigraph {
         &self,
         branch: Option<&str>,
     ) -> Result<ResolvedTarget> {
-        self.ensure_schema_state_valid().await?;
-        self.resolved_branch_target_unchecked(branch).await
+        let (schema_ir, _) =
+            load_validated_schema_contract(self.uri(), Arc::clone(&self.storage)).await?;
+        let resolved = self.resolved_branch_target_unchecked(branch).await?;
+        validate_schema_ir_against_snapshot(&schema_ir, &resolved.snapshot)?;
+        Ok(resolved)
     }
 
     async fn resolved_branch_target_unchecked(
@@ -1012,8 +1079,10 @@ impl Omnigraph {
         let (branch_identifier, graph_head, _effective_graph_head, snapshot) = self
             .write_authority_for_known_branch(txn.branch.as_deref(), true)
             .await?;
-        let schema_state = self.ensure_schema_state_valid().await?;
+        let (schema_ir, schema_state) =
+            load_validated_schema_contract(self.uri(), Arc::clone(&self.storage)).await?;
         self.ensure_schema_apply_not_locked("write commit").await?;
+        validate_schema_ir_against_snapshot(&schema_ir, &snapshot)?;
         if branch_identifier != txn.authority.branch_identifier {
             return Err(OmniError::manifest_read_set_changed(
                 format!(
@@ -1046,6 +1115,14 @@ impl Omnigraph {
                 Some(schema_state.schema_ir_hash),
             ));
         }
+        let schema_identity_domain = schema_ir.schema_identity_domain.as_str();
+        if schema_identity_domain != txn.authority.schema_identity_domain {
+            return Err(OmniError::manifest_read_set_changed(
+                "schema_identity_domain".to_string(),
+                Some(txn.authority.schema_identity_domain.clone()),
+                Some(schema_identity_domain.to_string()),
+            ));
+        }
         if schema_state.schema_identity_version != txn.authority.schema_identity_version {
             return Err(OmniError::manifest_read_set_changed(
                 "schema_identity_version".to_string(),
@@ -1063,8 +1140,11 @@ impl Omnigraph {
     }
 
     pub(crate) async fn fresh_snapshot_for_branch(&self, branch: Option<&str>) -> Result<Snapshot> {
-        self.ensure_schema_state_valid().await?;
-        self.fresh_snapshot_for_branch_unchecked(branch).await
+        let (schema_ir, _) =
+            load_validated_schema_contract(self.uri(), Arc::clone(&self.storage)).await?;
+        let snapshot = self.fresh_snapshot_for_branch_unchecked(branch).await?;
+        validate_schema_ir_against_snapshot(&schema_ir, &snapshot)?;
+        Ok(snapshot)
     }
 
     /// Fresh per-branch manifest snapshot WITHOUT the schema-contract
@@ -1149,9 +1229,11 @@ impl Omnigraph {
             .write_queue()
             .acquire(&crate::db::manifest::schema_apply_serial_queue_key())
             .await;
-        self.ensure_schema_state_valid().await?;
+        let (schema_ir, _) =
+            load_validated_schema_contract(self.uri(), Arc::clone(&self.storage)).await?;
         let branch = normalize_branch_name(branch)?;
         let next = self.open_coordinator_for_branch(branch.as_deref()).await?;
+        validate_schema_ir_against_snapshot(&schema_ir, &next.snapshot())?;
         *self.coordinator.write().await = next;
         self.invalidate_read_caches().await;
         Ok(())
@@ -1516,22 +1598,33 @@ impl Omnigraph {
         )?;
         let schema_path = schema_source_uri(&self.root_uri);
         let schema_source = self.storage.read_text(&schema_path).await?;
-        if schema_source == *self.schema_source.load_full() {
-            return Ok(());
-        }
-        let current_source_ir = read_schema_ir_from_source(&schema_source)?;
-        let branches = self.coordinator.read().await.branch_list().await?;
-        let (accepted_ir, _) = load_or_bootstrap_schema_contract(
+        let (accepted_ir, accepted_state) = load_validated_schema_contract_for_source(
             &self.root_uri,
             Arc::clone(&self.storage),
-            &branches,
-            &current_source_ir,
+            &schema_source,
         )
         .await?;
-        let mut catalog = build_catalog_from_ir(&accepted_ir)?;
-        fixup_blob_schemas(&mut catalog);
-        self.store_schema_source(schema_source);
-        self.store_catalog(catalog);
+        let live_snapshot = self.coordinator.read().await.snapshot();
+        validate_schema_ir_against_snapshot(&accepted_ir, &live_snapshot)?;
+        let accepted_domain = accepted_ir.schema_identity_domain.as_str().to_string();
+        let current = self.schema_view.load_full();
+        if accepted_state.schema_ir_hash == current.schema_ir_hash
+            && accepted_domain == current.schema_identity_domain
+            && schema_source == *current.source
+        {
+            return Ok(());
+        }
+        let catalog = if accepted_state.schema_ir_hash == current.schema_ir_hash
+            && accepted_domain == current.schema_identity_domain
+        {
+            (*current.catalog).clone()
+        } else {
+            let mut catalog = build_catalog_from_ir(&accepted_ir)?;
+            fixup_blob_schemas(&mut catalog);
+            catalog
+        };
+        drop(current);
+        self.store_schema_view(catalog, schema_source, &accepted_ir)?;
         Ok(())
     }
 
@@ -1561,9 +1654,15 @@ impl Omnigraph {
         &self,
         target: impl Into<ReadTarget>,
     ) -> Result<ResolvedTarget> {
-        self.ensure_schema_state_valid().await?;
-        self.resolve_target_after_schema_validation(target.into())
-            .await
+        let target = target.into();
+        let validate_live_snapshot = matches!(&target, ReadTarget::Branch(_));
+        let (schema_ir, _) =
+            load_validated_schema_contract(self.uri(), Arc::clone(&self.storage)).await?;
+        let resolved = self.resolve_target_after_schema_validation(target).await?;
+        if validate_live_snapshot {
+            validate_schema_ir_against_snapshot(&schema_ir, &resolved.snapshot)?;
+        }
+        Ok(resolved)
     }
 
     /// Resolve a target after the caller has already validated/captured the
@@ -1598,14 +1697,20 @@ impl Omnigraph {
         &self,
         target: impl Into<ReadTarget>,
     ) -> Result<(ResolvedTarget, Arc<Catalog>)> {
+        let target = target.into();
+        let validate_live_snapshot = matches!(&target, ReadTarget::Branch(_));
+        let bind_historical_aliases = matches!(&target, ReadTarget::Snapshot(_));
         let _schema_guard = self
             .write_queue()
             .acquire(&crate::db::manifest::schema_apply_serial_queue_key())
             .await;
-        let catalog = self.load_accepted_catalog_with_schema_gate_held().await?;
-        let resolved = self
-            .resolve_target_after_schema_validation(target.into())
-            .await?;
+        let catalog = self.build_accepted_catalog_with_schema_gate_held().await?;
+        let mut resolved = self.resolve_target_after_schema_validation(target).await?;
+        if validate_live_snapshot {
+            validate_bound_catalog_against_snapshot(&catalog, &resolved.snapshot)?;
+        } else if bind_historical_aliases {
+            resolved.snapshot.bind_catalog_aliases(&catalog)?;
+        }
         Ok((resolved, catalog))
     }
 
@@ -1621,10 +1726,11 @@ impl Omnigraph {
             .current_branch()
             .unwrap_or("main")
             .to_string();
-        let catalog = self.load_accepted_catalog_with_schema_gate_held().await?;
+        let catalog = self.build_accepted_catalog_with_schema_gate_held().await?;
         let resolved = self
             .resolve_target_after_schema_validation(ReadTarget::branch(current_branch))
             .await?;
+        validate_bound_catalog_against_snapshot(&catalog, &resolved.snapshot)?;
         Ok((resolved, catalog))
     }
 
@@ -1643,12 +1749,13 @@ impl Omnigraph {
             .await
             .current_branch()
             .map(str::to_string);
-        let snapshot = crate::db::manifest::ManifestCoordinator::snapshot_at(
+        let mut snapshot = crate::db::manifest::ManifestCoordinator::snapshot_at(
             self.uri(),
             branch.as_deref(),
             version,
         )
         .await?;
+        snapshot.bind_catalog_aliases(&catalog)?;
         Ok((snapshot, catalog))
     }
 
@@ -2387,6 +2494,7 @@ impl Omnigraph {
     pub(crate) async fn fork_dataset_from_entry_state(
         &self,
         table_key: &str,
+        identity: crate::db::manifest::TableIdentity,
         full_path: &str,
         source_branch: Option<&str>,
         source_version: u64,
@@ -2394,6 +2502,7 @@ impl Omnigraph {
     ) -> Result<SnapshotHandle> {
         self.fork_dataset_from_entry_state_under_intent(
             table_key,
+            identity,
             full_path,
             source_branch,
             source_version,
@@ -2406,6 +2515,7 @@ impl Omnigraph {
     pub(crate) async fn fork_dataset_from_entry_state_under_intent(
         &self,
         table_key: &str,
+        identity: crate::db::manifest::TableIdentity,
         full_path: &str,
         source_branch: Option<&str>,
         source_version: u64,
@@ -2427,6 +2537,7 @@ impl Omnigraph {
                 table_ops::reclaim_orphaned_fork_and_refork(
                     self,
                     table_key,
+                    identity,
                     full_path,
                     source_branch,
                     source_version,
@@ -2479,7 +2590,7 @@ impl Omnigraph {
         &self,
         branch: Option<&str>,
         updates: &[crate::db::SubTableUpdate],
-        expected_table_versions: &std::collections::HashMap<String, u64>,
+        expected_table_versions: &crate::db::manifest::ExpectedTableVersions,
         actor_id: Option<&str>,
         txn: &crate::db::WriteTxn,
         lineage_intent: crate::db::manifest::LineageIntent,
@@ -2687,9 +2798,35 @@ fn fixup_blob_schemas(catalog: &mut Catalog) {
     }
 }
 
-fn read_schema_ir_from_source(schema_source: &str) -> Result<SchemaIR> {
+fn validate_bound_catalog_against_snapshot(catalog: &Catalog, snapshot: &Snapshot) -> Result<()> {
+    let schema_ir = catalog.bound_schema_ir().ok_or_else(|| {
+        OmniError::manifest_internal(
+            "runtime catalog is not bound to an accepted identity-bearing SchemaIR".to_string(),
+        )
+    })?;
+    validate_schema_ir_against_snapshot(schema_ir, snapshot)
+}
+
+fn read_schema_shape_from_source(schema_source: &str) -> Result<SchemaShape> {
     let schema_ast = parse_schema(schema_source)?;
-    build_schema_ir(&schema_ast).map_err(|err| OmniError::manifest(err.to_string()))
+    compile_schema_shape(&schema_ast).map_err(|err| OmniError::manifest(err.to_string()))
+}
+
+/// `--force` may replace orphan schema files, but it must never mint a new
+/// identity domain over an existing source-of-truth manifest. Reusing the root
+/// would make old rows appear to belong to unrelated freshly allocated IDs.
+async fn refuse_force_init_over_existing_manifest(
+    root: &str,
+    storage: &dyn StorageAdapter,
+) -> Result<()> {
+    let manifest_uri = crate::db::manifest::manifest_uri(root);
+    if storage.exists(&manifest_uri).await? {
+        Err(OmniError::manifest_conflict(format!(
+            "force init refuses graph root '{root}' because an existing __manifest would be rebound to a newly minted schema identity domain; initialize an empty root instead"
+        )))
+    } else {
+        Ok(())
+    }
 }
 
 /// I/O phase of `Omnigraph::init_with_storage`. Split out so the caller
@@ -2724,6 +2861,7 @@ async fn init_storage_phase(
     crate::failpoints::maybe_fail(crate::failpoints::names::INIT_AFTER_SCHEMA_CONTRACT_WRITTEN)?;
 
     let coordinator = GraphCoordinator::init(root, catalog, Arc::clone(storage)).await?;
+    validate_schema_ir_against_snapshot(schema_ir, &coordinator.snapshot())?;
     crate::failpoints::maybe_fail(crate::failpoints::names::INIT_AFTER_COORDINATOR_INIT)?;
 
     Ok(coordinator)
@@ -3270,6 +3408,7 @@ edge WorksAt: Person -> Company
     async fn seed_person_row(db: &mut Omnigraph, name: &str, age: Option<i32>) {
         // No-txn entry, so the handle is always `Some` (collapse #1's skip is
         // gated on `txn.is_some()`).
+        let identity = db.snapshot().await.entry("node:Person").unwrap().identity;
         let (ds, full_path, table_branch) = db
             .open_for_mutation("node:Person", crate::db::MutationOpKind::Insert)
             .await
@@ -3295,6 +3434,7 @@ edge WorksAt: Person -> Company
             .await
             .unwrap();
         db.commit_updates(&[crate::db::SubTableUpdate {
+            identity,
             table_key: "node:Person".to_string(),
             table_version: state.version,
             table_branch,

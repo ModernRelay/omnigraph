@@ -448,9 +448,11 @@ then acquires the normal queue. Crash recovery resumes from the durable state
 and per-shard epoch map.
 
 Schema apply must drain every affected enrolled type before changing fields,
-constraints, PK, embeddings, or `@stream` and resumes only when compatible. A
-rematerializing type rename preserves RFC-028's logical pair but not the old
-physical enrollment:
+constraints, PK, embeddings, or `@stream` and resumes only when compatible.
+RFC-028's current pure type rename retains the same dataset, identity, path,
+and Lance version, so it does not by itself rebind the physical enrollment. If
+a future schema feature supports a rematerializing rename while preserving the
+logical pair, it cannot preserve the old physical enrollment:
 
 1. drain, fold, fence, and publish the old binding as `SEALED`;
 2. let SchemaApply rematerialize and publish the target table while leaving the
@@ -635,7 +637,7 @@ authorize general replica failover.
 - Local and S3/RustFS same-path/ref delete-recreate races change the physical-ref
   incarnation and make enrollment, ack, fold, recovery, and fresh capture refuse
   the replacement. A backend without a proven token refuses activation.
-- A rematerializing type rename preserves the RFC-028 logical pair, leaves the
+- A future rematerializing type rename preserves the RFC-028 logical pair, leaves the
   target `SEALED`, and cannot acknowledge until an exact sidecar-covered rebind
   publishes a fresh enrollment/shard namespace. Crash tests cover every old-
   drain, SchemaApply, rebind-effect, and rebind-publish boundary; recovery never

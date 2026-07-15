@@ -130,12 +130,28 @@ fn parse_node_decl(pair: pest::iterators::Pair<Rule>) -> Result<NodeDecl> {
     // Desugar property-level @key/@unique/@index annotations into constraints
     desugar_property_constraints(&properties, &mut constraints);
 
+    let source_constraints = constraints.clone();
+    let property_origins = properties
+        .iter()
+        .map(|property| {
+            (
+                property.name.clone(),
+                NodePropertyOrigin {
+                    declared_directly: true,
+                    interface_properties: Vec::new(),
+                },
+            )
+        })
+        .collect();
+
     Ok(NodeDecl {
         name,
         annotations,
         implements,
         properties,
         constraints,
+        source_constraints,
+        property_origins,
     })
 }
 
@@ -423,6 +439,17 @@ fn resolve_interfaces(node: &mut NodeDecl, interfaces: &[&InterfaceDecl]) -> Res
         })?;
 
         for iface_prop in &iface.properties {
+            let origin = node
+                .property_origins
+                .entry(iface_prop.name.clone())
+                .or_insert_with(|| NodePropertyOrigin {
+                    declared_directly: false,
+                    interface_properties: Vec::new(),
+                });
+            origin.interface_properties.push(InterfacePropertyOrigin {
+                interface_name: iface.name.clone(),
+                property_name: iface_prop.name.clone(),
+            });
             if let Some(existing) = node.properties.iter().find(|p| p.name == iface_prop.name) {
                 // Property exists — verify type compatibility
                 if existing.prop_type != iface_prop.prop_type {
@@ -445,6 +472,11 @@ fn resolve_interfaces(node: &mut NodeDecl, interfaces: &[&InterfaceDecl]) -> Res
                 );
             }
         }
+    }
+
+    for origin in node.property_origins.values_mut() {
+        origin.interface_properties.sort();
+        origin.interface_properties.dedup();
     }
 
     Ok(())
@@ -625,8 +657,16 @@ fn validate_string_annotation(
 fn validate_schema_annotations(schema: &SchemaFile) -> Result<()> {
     for decl in &schema.declarations {
         match decl {
-            SchemaDecl::Interface(_) => {} // Interfaces have no type-level annotations
+            SchemaDecl::Interface(interface) => {
+                for prop in &interface.properties {
+                    rename_from_annotation(
+                        &prop.annotations,
+                        &format!("property {}.{}", interface.name, prop.name),
+                    )?;
+                }
+            } // Interfaces have no type-level annotations
             SchemaDecl::Node(node) => {
+                rename_from_annotation(&node.annotations, &format!("node {}", node.name))?;
                 // Reject constraint annotations on node level (must be on properties or as body constraints)
                 for ann in &node.annotations {
                     if ann.name == "key"
@@ -657,6 +697,7 @@ fn validate_schema_annotations(schema: &SchemaFile) -> Result<()> {
                 }
             }
             SchemaDecl::Edge(edge) => {
+                rename_from_annotation(&edge.annotations, &format!("edge {}", edge.name))?;
                 for ann in &edge.annotations {
                     if ann.name == "key"
                         || ann.name == "unique"
@@ -701,6 +742,10 @@ fn validate_property_annotations(
     validate_string_annotation(
         &prop.annotations,
         "description",
+        &format!("property {}.{}", type_name, prop.name),
+    )?;
+    rename_from_annotation(
+        &prop.annotations,
         &format!("property {}.{}", type_name, prop.name),
     )?;
 

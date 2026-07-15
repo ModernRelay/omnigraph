@@ -34,10 +34,9 @@ Findings marked **BLOCKER** must be dispositioned before acceptance.
 ---
 
 Throughout this draft, **heads format** means the first internal schema that
-contains the table-head contract. RFC-028 provisionally takes the next internal
-schema after today's v4, so this RFC deliberately does not reserve the numeral
-v5. The exact number is assigned when the independently accepted capabilities
-for a release are known.
+contains the table-head contract. RFC-028 now occupies internal schema v5, so
+this RFC deliberately does not reserve a numeral. The exact later number is
+assigned when the independently accepted capabilities for a release are known.
 
 ## 0. Decision summary
 

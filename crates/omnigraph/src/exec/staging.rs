@@ -33,7 +33,7 @@ use futures::stream::StreamExt;
 
 use crate::db::manifest::{
     RecoveryAuthorityToken, RecoveryLineageIntent, RecoverySidecarHandle, SidecarKind,
-    SidecarTablePin, confirm_occ_sidecar_phase_b, new_occ_sidecar, write_sidecar,
+    SidecarTablePin, confirm_occ_sidecar_v9, new_occ_sidecar_v9, write_sidecar,
 };
 use crate::db::{MutationOpKind, SubTableUpdate};
 use crate::error::{OmniError, Result};
@@ -89,10 +89,13 @@ impl PendingTable {
 /// finalize time. Avoids re-resolving the dataset path / branch.
 #[derive(Debug, Clone)]
 pub(crate) struct StagedTablePath {
+    /// Immutable logical table lifetime captured with this path/version.
+    pub(crate) identity: crate::db::manifest::TableIdentity,
     pub(crate) full_path: String,
     /// Final Lance ref recorded in the manifest update.
     pub(crate) table_branch: Option<String>,
-    /// First-touch named-branch fork deferred until the v3 recovery sidecar is
+    /// First-touch named-branch fork deferred until the v9 recovery envelope
+    /// (whose retained mutation/load payload field is `protocol_v3`) is
     /// durable. Preparation reads the inherited `source_entry`; after arming,
     /// commit creates `target_branch` and stages branch-local files there.
     pub(crate) deferred_fork: Option<crate::db::DeferredTableFork>,
@@ -146,15 +149,26 @@ impl MutationStaging {
     pub(crate) fn ensure_path(
         &mut self,
         table_key: &str,
+        identity: crate::db::manifest::TableIdentity,
         full_path: String,
         table_branch: Option<String>,
         deferred_fork: Option<crate::db::DeferredTableFork>,
         expected_version: u64,
         op_kind: MutationOpKind,
-    ) {
+    ) -> Result<()> {
+        if let Some(existing) = self.paths.get(table_key) {
+            if existing.identity != identity {
+                return Err(OmniError::manifest_read_set_changed(
+                    format!("table_identity:{table_key}"),
+                    Some(existing.identity.to_string()),
+                    Some(identity.to_string()),
+                ));
+            }
+        }
         self.paths
             .entry(table_key.to_string())
             .or_insert(StagedTablePath {
+                identity,
                 full_path,
                 table_branch,
                 deferred_fork,
@@ -175,6 +189,7 @@ impl MutationStaging {
                 }
             })
             .or_insert(op_kind);
+        Ok(())
     }
 
     /// Append a batch to the per-table accumulator.
@@ -378,6 +393,11 @@ impl MutationStaging {
             op_kinds: _,
         } = self;
 
+        let expected_identities = paths
+            .iter()
+            .map(|(table_key, path)| (table_key.clone(), path.identity))
+            .collect();
+
         let mut stage_inputs: Vec<(String, PendingTable, StagedTablePath, u64)> =
             Vec::with_capacity(pending.len());
         for (table_key, table) in pending {
@@ -452,6 +472,7 @@ impl MutationStaging {
         Ok(StagedMutation {
             staged: staged_entries,
             expected_versions,
+            expected_identities,
         })
     }
 }
@@ -636,6 +657,9 @@ pub(crate) struct StagedMutation {
     staged: Vec<StagedTableEntry>,
     /// Pre-write manifest version per table — the publisher's CAS fence.
     expected_versions: HashMap<String, u64>,
+    /// Identity paired with every alias in `expected_versions`, including a
+    /// zero-row delete that produced no physical staged effect.
+    expected_identities: HashMap<String, crate::db::manifest::TableIdentity>,
 }
 
 /// Per-table state captured during `stage_all` and consumed by
@@ -711,7 +735,7 @@ pub(crate) struct CommittedMutation {
     /// Per-table physical pins captured in the immutable `WriteTxn`; the
     /// publisher checks them together with native branch identity, exact graph
     /// head, and schema identity as one authority precondition.
-    pub(crate) expected_versions: HashMap<String, u64>,
+    pub(crate) expected_versions: crate::db::manifest::ExpectedTableVersions,
     /// Recovery sidecar to delete during Stage H after manifest CAS succeeds
     /// (`None` when nothing staged).
     pub(crate) sidecar_handle: Option<RecoverySidecarHandle>,
@@ -731,7 +755,7 @@ impl StagedMutation {
     /// would let another writer interleave its physical effects between ours
     /// and publish. The exact publisher precondition would still reject stale
     /// authority, but our already-advanced Lance HEAD would then require the
-    /// durable v3 sidecar to recover. Holding the guards closes that avoidable
+    /// durable v9 sidecar to recover. Holding the guards closes that avoidable
     /// same-process window; the sidecar remains the crash/foreign-process
     /// correctness authority.
     ///
@@ -745,7 +769,7 @@ impl StagedMutation {
     /// remain unreferenced and reclaimable.
     /// First-touch named-branch forks are also deferred to this phase. The
     /// method acquires schema → branch → table gates, revalidates the complete
-    /// read token, arms v3 recovery, and only then creates any Lance refs.
+    /// read token, arms the v9 recovery envelope, and only then creates any Lance refs.
     pub(crate) async fn commit_all(
         self,
         db: &crate::db::Omnigraph,
@@ -758,7 +782,29 @@ impl StagedMutation {
         let StagedMutation {
             mut staged,
             expected_versions,
+            expected_identities,
         } = self;
+
+        let expected_versions = expected_versions
+            .into_iter()
+            .map(|(table_key, table_version)| {
+                let identity = expected_identities
+                    .get(&table_key)
+                    .copied()
+                    .ok_or_else(|| {
+                        OmniError::manifest_internal(format!(
+                            "staged mutation is missing identity for table '{table_key}'"
+                        ))
+                    })?;
+                Ok((
+                    identity,
+                    crate::db::manifest::TableVersionExpectation {
+                        table_key,
+                        table_version,
+                    },
+                ))
+            })
+            .collect::<Result<crate::db::manifest::ExpectedTableVersions>>()?;
 
         // Per-(table_key, branch) queues for every touched table. Sorted by
         // `acquire_many` internally so all multi-table writers (mutation,
@@ -903,8 +949,9 @@ impl StagedMutation {
         let mut pins: Vec<SidecarTablePin> = Vec::with_capacity(staged.len());
         let mut planned_transactions = HashMap::with_capacity(staged.len());
         for entry in &staged {
-            planned_transactions.insert(entry.table_key.clone(), entry.planned_transaction.clone());
+            planned_transactions.insert(entry.path.identity, entry.planned_transaction.clone());
             pins.push(SidecarTablePin {
+                identity: entry.path.identity,
                 table_key: entry.table_key.clone(),
                 table_path: entry.path.full_path.clone(),
                 expected_version: entry.expected_version,
@@ -917,6 +964,7 @@ impl StagedMutation {
         let authority = RecoveryAuthorityToken {
             branch_identifier: txn.authority.branch_identifier.clone(),
             graph_head: txn.authority.graph_head.clone(),
+            schema_identity_domain: txn.authority.schema_identity_domain.clone(),
             schema_ir_hash: txn.authority.schema_ir_hash.clone(),
             schema_identity_version: txn.authority.schema_identity_version,
         };
@@ -927,7 +975,7 @@ impl StagedMutation {
             merged_parent_commit_id: lineage_intent.merged_parent_commit_id.clone(),
             created_at: lineage_intent.created_at,
         };
-        let mut sidecar = new_occ_sidecar(
+        let mut sidecar = new_occ_sidecar_v9(
             sidecar_kind,
             branch.map(str::to_string),
             actor_id.map(str::to_string),
@@ -954,7 +1002,8 @@ impl StagedMutation {
                 })?;
         }
 
-        // The v3 intent is now durable. Only now may a first-touch named-table
+        // The v9 intent (with the retained `protocol_v3` payload shape) is now
+        // durable. Only now may a first-touch named-table
         // fork become visible in Lance. Its transaction is then staged on the
         // fresh target handle (so Lance writes branch-local file paths) and
         // bound to the pre-minted UUID already recorded in the sidecar.
@@ -966,6 +1015,7 @@ impl StagedMutation {
             match db
                 .fork_dataset_from_entry_state_under_intent(
                     &entry.table_key,
+                    fork.source_entry.identity,
                     &entry.path.full_path,
                     fork.source_entry.table_branch.as_deref(),
                     fork.source_entry.table_version,
@@ -1067,8 +1117,7 @@ impl StagedMutation {
                     ),
                 ));
             }
-            committed_transactions
-                .insert(table_key.clone(), outcome.committed_transaction().clone());
+            committed_transactions.insert(path.identity, outcome.committed_transaction().clone());
             let new_ds = outcome.into_snapshot();
             let state = db
                 .storage()
@@ -1078,6 +1127,7 @@ impl StagedMutation {
                     OmniError::recovery_required(operation_id.clone(), error.to_string())
                 })?;
             updates.push(SubTableUpdate {
+                identity: path.identity,
                 table_key: table_key.clone(),
                 table_version: state.version,
                 table_branch: path.table_branch.clone(),
@@ -1090,7 +1140,7 @@ impl StagedMutation {
                 })?;
         }
 
-        if let Err(error) = confirm_occ_sidecar_phase_b(
+        if let Err(error) = confirm_occ_sidecar_v9(
             db.root_uri(),
             db.storage_adapter(),
             &mut sidecar,

@@ -42,20 +42,42 @@ fn list_recovery_dir(graph_root: &Path) -> Vec<String> {
         .collect()
 }
 
-/// Full URI of a node-type Lance dataset under a fresh Omnigraph graph.
-/// Mirrors the `nodes/{fnv1a64-hex(type_name)}` layout in `db/manifest/layout.rs`.
-fn node_table_uri(root: &str, type_name: &str) -> String {
-    let h: u64 = fnv1a64(type_name.as_bytes());
-    format!("{}/nodes/{:016x}", root.trim_end_matches('/'), h)
-}
-
-fn fnv1a64(bytes: &[u8]) -> u64 {
-    let mut hash: u64 = 0xcbf2_9ce4_8422_2325;
-    for &b in bytes {
-        hash ^= b as u64;
-        hash = hash.wrapping_mul(0x100_0000_01b3);
-    }
-    hash
+/// Resolve one live node table's identity-bound physical URI and serialize the
+/// explicit identity required by every recovery generation. The snapshot owns
+/// the path; the accepted bound catalog owns the same stable/incarnation pair.
+async fn node_table_fixture(
+    db: &Omnigraph,
+    type_name: &str,
+) -> (String, serde_json::Value) {
+    let table_key = format!("node:{type_name}");
+    let snapshot = db
+        .snapshot_of(omnigraph::db::ReadTarget::branch("main"))
+        .await
+        .unwrap();
+    let table_path = &snapshot
+        .entry(&table_key)
+        .unwrap_or_else(|| panic!("live manifest has no registration for {table_key}"))
+        .table_path;
+    let catalog = db.catalog();
+    let stable_table_id = catalog
+        .type_id(type_name)
+        .unwrap_or_else(|| panic!("bound catalog has no stable id for {type_name}"))
+        .get();
+    let table_incarnation_id = catalog
+        .table_incarnation_id(type_name)
+        .unwrap_or_else(|| panic!("bound catalog has no incarnation id for {type_name}"))
+        .get();
+    (
+        format!(
+            "{}/{}",
+            db.uri().trim_end_matches('/'),
+            table_path.trim_start_matches('/')
+        ),
+        serde_json::json!({
+            "stable_table_id": stable_table_id,
+            "table_incarnation_id": table_incarnation_id,
+        }),
+    )
 }
 
 /// Build a Person RecordBatch matching the post-init Lance schema:
@@ -224,7 +246,7 @@ async fn drift_guard_advice_ignores_other_branch_sidecars() {
     // heal defers it (head < expected_version classifies as an invariant
     // violation; roll-forward-only mode leaves it for the next ReadWrite
     // open) — it persists through the write attempt below.
-    let person_uri = node_table_uri(uri, "Person");
+    let (person_uri, person_identity) = node_table_fixture(&db, "Person").await;
     let sidecar_json = format!(
         r#"{{
         "schema_version": 1,
@@ -235,6 +257,7 @@ async fn drift_guard_advice_ignores_other_branch_sidecars() {
         "writer_kind": "Mutation",
         "tables": [
             {{
+                "identity": {person_identity},
                 "table_key": "node:Person",
                 "table_path": "{person_uri}",
                 "expected_version": 999,
@@ -299,7 +322,7 @@ async fn deleted_branch_sidecar_does_not_wedge_writes_or_open() {
 
     // A rollback-eligible (deferred) sidecar pinned to feature — shaped
     // so every roll-forward-only pass leaves it on disk.
-    let person_uri = node_table_uri(&uri, "Person");
+    let (person_uri, person_identity) = node_table_fixture(&db, "Person").await;
     let sidecar_json = format!(
         r#"{{
         "schema_version": 1,
@@ -310,6 +333,7 @@ async fn deleted_branch_sidecar_does_not_wedge_writes_or_open() {
         "writer_kind": "Mutation",
         "tables": [
             {{
+                "identity": {person_identity},
                 "table_key": "node:Person",
                 "table_path": "{person_uri}",
                 "expected_version": 999,
@@ -353,13 +377,14 @@ async fn deleted_branch_sidecar_does_not_wedge_writes_or_open() {
 async fn read_only_open_skips_recovery_sweep() {
     let dir = tempfile::tempdir().unwrap();
     let uri = dir.path().to_str().unwrap();
-    let _db = Omnigraph::init(uri, TEST_SCHEMA).await.unwrap();
-    drop(_db);
+    let db = Omnigraph::init(uri, TEST_SCHEMA).await.unwrap();
+    let (_, person_identity) = node_table_fixture(&db, "Person").await;
+    drop(db);
 
     // Drop a syntactically-valid but invariant-violating sidecar (HEAD < pin
     // would error if classified). Read-only must NOT classify it — it must
     // skip the sweep entirely.
-    let sidecar_json = r#"{
+    let sidecar_json = format!(r#"{{
         "schema_version": 1,
         "operation_id": "01H000000000000000000000RO",
         "started_at": "0",
@@ -367,15 +392,16 @@ async fn read_only_open_skips_recovery_sweep() {
         "actor_id": null,
         "writer_kind": "Mutation",
         "tables": [
-            {
+            {{
+                "identity": {person_identity},
                 "table_key": "node:Person",
                 "table_path": "/dev/null/nonexistent.lance",
                 "expected_version": 99,
                 "post_commit_pin": 100
-            }
+            }}
         ]
-    }"#;
-    write_sidecar_file(dir.path(), "01H000000000000000000000RO", sidecar_json);
+    }}"#);
+    write_sidecar_file(dir.path(), "01H000000000000000000000RO", &sidecar_json);
 
     // ReadOnly open must succeed — the sweep is skipped, so the bogus
     // sidecar is never inspected.
@@ -466,6 +492,7 @@ async fn recovery_rolls_back_synthetic_drift_on_open() {
     load_jsonl(&mut db, test_data, LoadMode::Append)
         .await
         .unwrap();
+    let (person_uri, person_identity) = node_table_fixture(&db, "Person").await;
     drop(db);
 
     // Synthetic drift: advance Person's Lance HEAD WITHOUT updating the
@@ -479,7 +506,6 @@ async fn recovery_rolls_back_synthetic_drift_on_open() {
     // and without depending on the dataset's exact column set. The actual
     // residual the sweep recovers from is the manifest-vs-Lance-HEAD gap;
     // it's agnostic to *what* op caused the gap.
-    let person_uri = node_table_uri(uri, "Person");
     let mut ds = Dataset::open(&person_uri).await.unwrap();
     let head_before_drift = ds.version().version;
     let _ = helpers::lance_delete_inline(&mut ds, "1 = 2").await;
@@ -506,6 +532,7 @@ async fn recovery_rolls_back_synthetic_drift_on_open() {
             "writer_kind": "Mutation",
             "tables": [
                 {{
+                    "identity": {person_identity},
                     "table_key": "node:Person",
                     "table_path": "{}",
                     "expected_version": {},
@@ -578,11 +605,11 @@ async fn recovery_rollback_converges_manifest_so_schema_apply_succeeds() {
     )
     .await
     .unwrap();
+    let (person_uri, person_identity) = node_table_fixture(&db, "Person").await;
     drop(db);
 
     // Forge a Phase-B residual: advance Person's Lance HEAD without publishing to
     // the manifest (the manifest pin stays at the load's committed version).
-    let person_uri = node_table_uri(uri, "Person");
     let mut ds = Dataset::open(&person_uri).await.unwrap();
     let manifest_pin = ds.version().version;
     let _ = helpers::lance_delete_inline(&mut ds, "1 = 2").await;
@@ -600,6 +627,7 @@ async fn recovery_rollback_converges_manifest_so_schema_apply_succeeds() {
             "writer_kind": "Mutation",
             "tables": [
                 {{
+                    "identity": {person_identity},
                     "table_key": "node:Person",
                     "table_path": "{}",
                     "expected_version": {},
@@ -783,9 +811,9 @@ async fn recovery_rolls_forward_after_phase_b_completes() {
     load_jsonl(&mut db, test_data, LoadMode::Append)
         .await
         .unwrap();
+    let (person_uri, person_identity) = node_table_fixture(&db, "Person").await;
     drop(db);
 
-    let person_uri = node_table_uri(uri, "Person");
     let mut ds = Dataset::open(&person_uri).await.unwrap();
     let head_before = ds.version().version;
 
@@ -808,6 +836,7 @@ async fn recovery_rolls_forward_after_phase_b_completes() {
             "writer_kind": "Mutation",
             "tables": [
                 {{
+                    "identity": {person_identity},
                     "table_key": "node:Person",
                     "table_path": "{}",
                     "expected_version": {},
@@ -881,9 +910,9 @@ async fn recovery_records_rolled_forward_for_stale_sidecar_after_successful_roll
         .expect("Person entry exists post-load")
         .clone();
     let manifest_pin = person_entry.table_version;
+    let (person_uri, person_identity) = node_table_fixture(&db, "Person").await;
     drop(db);
 
-    let person_uri = node_table_uri(uri, "Person");
     let head_now = Dataset::open(&person_uri).await.unwrap().version().version;
     assert_eq!(
         head_now, manifest_pin,
@@ -904,6 +933,7 @@ async fn recovery_records_rolled_forward_for_stale_sidecar_after_successful_roll
             "writer_kind": "Mutation",
             "tables": [
                 {{
+                    "identity": {person_identity},
                     "table_key": "node:Person",
                     "table_path": "{}",
                     "expected_version": {},
@@ -985,9 +1015,9 @@ async fn recovery_rolls_back_records_audit_row_with_recovery_actor() {
     load_jsonl(&mut db, test_data, LoadMode::Append)
         .await
         .unwrap();
+    let (person_uri, person_identity) = node_table_fixture(&db, "Person").await;
     drop(db);
 
-    let person_uri = node_table_uri(uri, "Person");
     let mut ds = Dataset::open(&person_uri).await.unwrap();
     let head_before = ds.version().version;
     let _ = helpers::lance_delete_inline(&mut ds, "1 = 2").await;
@@ -1006,6 +1036,7 @@ async fn recovery_rolls_back_records_audit_row_with_recovery_actor() {
             "writer_kind": "Load",
             "tables": [
                 {{
+                    "identity": {person_identity},
                     "table_key": "node:Person",
                     "table_path": "{}",
                     "expected_version": {},
@@ -1047,9 +1078,9 @@ async fn recovery_rolls_forward_with_null_actor() {
     load_jsonl(&mut db, test_data, LoadMode::Append)
         .await
         .unwrap();
+    let (person_uri, person_identity) = node_table_fixture(&db, "Person").await;
     drop(db);
 
-    let person_uri = node_table_uri(uri, "Person");
     let mut ds = Dataset::open(&person_uri).await.unwrap();
     let head_before = ds.version().version;
     let _ = helpers::lance_delete_inline(&mut ds, "1 = 2").await;
@@ -1066,6 +1097,7 @@ async fn recovery_rolls_forward_with_null_actor() {
             "writer_kind": "EnsureIndices",
             "tables": [
                 {{
+                    "identity": {person_identity},
                     "table_key": "node:Person",
                     "table_path": "{}",
                     "expected_version": {},
@@ -1120,11 +1152,11 @@ async fn recovery_processes_multiple_sidecars_with_fresh_snapshot_per_iter() {
     load_jsonl(&mut db, test_data, LoadMode::Append)
         .await
         .unwrap();
+    let (person_uri, person_identity) = node_table_fixture(&db, "Person").await;
+    let (company_uri, company_identity) = node_table_fixture(&db, "Company").await;
     drop(db);
 
     // Synthesize drift on both tables independently.
-    let person_uri = node_table_uri(uri, "Person");
-    let company_uri = node_table_uri(uri, "Company");
     let mut person_ds = Dataset::open(&person_uri).await.unwrap();
     let person_pre = person_ds.version().version;
     let _ = helpers::lance_delete_inline(&mut person_ds, "1 = 2").await;
@@ -1145,7 +1177,7 @@ async fn recovery_processes_multiple_sidecars_with_fresh_snapshot_per_iter() {
             "actor_id": "act-a",
             "writer_kind": "EnsureIndices",
             "tables": [
-                {{"table_key":"node:Person","table_path":"{}","expected_version":{},"post_commit_pin":{}}}
+                {{"identity":{person_identity},"table_key":"node:Person","table_path":"{}","expected_version":{},"post_commit_pin":{}}}
             ]
         }}"#,
         person_uri, person_pre, person_post
@@ -1159,7 +1191,7 @@ async fn recovery_processes_multiple_sidecars_with_fresh_snapshot_per_iter() {
             "actor_id": "act-b",
             "writer_kind": "EnsureIndices",
             "tables": [
-                {{"table_key":"node:Company","table_path":"{}","expected_version":{},"post_commit_pin":{}}}
+                {{"identity":{company_identity},"table_key":"node:Company","table_path":"{}","expected_version":{},"post_commit_pin":{}}}
             ]
         }}"#,
         company_uri, company_pre, company_post
@@ -1352,9 +1384,9 @@ async fn recovery_multi_sidecar_requires_fresh_snapshot_for_correctness() {
     )
     .await
     .unwrap();
+    let (person_uri, person_identity) = node_table_fixture(&db, "Person").await;
     drop(db);
 
-    let person_uri = node_table_uri(uri, "Person");
     let mut ds = Dataset::open(&person_uri).await.unwrap();
     let v1 = ds.version().version;
 
@@ -1387,7 +1419,7 @@ async fn recovery_multi_sidecar_requires_fresh_snapshot_for_correctness() {
             "actor_id": "act-a",
             "writer_kind": "EnsureIndices",
             "tables": [
-                {{"table_key":"node:Person","table_path":"{}","expected_version":{},"post_commit_pin":{}}}
+                {{"identity":{person_identity},"table_key":"node:Person","table_path":"{}","expected_version":{},"post_commit_pin":{}}}
             ]
         }}"#,
         person_uri, v1, v2
@@ -1401,7 +1433,7 @@ async fn recovery_multi_sidecar_requires_fresh_snapshot_for_correctness() {
             "actor_id": "act-b",
             "writer_kind": "EnsureIndices",
             "tables": [
-                {{"table_key":"node:Person","table_path":"{}","expected_version":{},"post_commit_pin":{}}}
+                {{"identity":{person_identity},"table_key":"node:Person","table_path":"{}","expected_version":{},"post_commit_pin":{}}}
             ]
         }}"#,
         person_uri, v2, v3
@@ -1523,11 +1555,11 @@ async fn recovery_classifies_feature_branch_sidecar_against_feature_branch() {
         .entry("node:Person")
         .expect("main snapshot must have Person entry")
         .table_version;
+    let (person_uri, person_identity) = node_table_fixture(&db, "Person").await;
     drop(db);
 
     // Bypass the manifest: append directly to Person's Lance HEAD on the
     // feature branch ref to advance HEAD past v_pin.
-    let person_uri = node_table_uri(uri, "Person");
     let mut ds = helpers::open_dataset_head(&person_uri, feature_branch_name.as_deref()).await;
     helpers::lance_append_inline(&mut ds, person_batch(&[("carol-id", "carol", Some(40))])).await;
     let v_head = ds.version().version;
@@ -1545,6 +1577,7 @@ async fn recovery_classifies_feature_branch_sidecar_against_feature_branch() {
             "writer_kind": "Mutation",
             "tables": [
                 {{
+                    "identity":{person_identity},
                     "table_key":"node:Person",
                     "table_path":"{}",
                     "expected_version":{},
@@ -1632,11 +1665,11 @@ async fn recovery_rolls_back_feature_branch_sidecar_against_feature_branch() {
         .entry("node:Person")
         .expect("main snapshot must have Person entry")
         .table_version;
+    let (person_uri, person_identity) = node_table_fixture(&db, "Person").await;
     drop(db);
 
     // Bypass the manifest: append on the feature ref to advance HEAD past
     // the manifest pin.
-    let person_uri = node_table_uri(uri, "Person");
     let mut ds = helpers::open_dataset_head(&person_uri, feature_branch_name.as_deref()).await;
     helpers::lance_append_inline(&mut ds, person_batch(&[("dave-id", "dave", Some(50))])).await;
     let v_head = ds.version().version;
@@ -1656,6 +1689,7 @@ async fn recovery_rolls_back_feature_branch_sidecar_against_feature_branch() {
             "writer_kind": "Mutation",
             "tables": [
                 {{
+                    "identity":{person_identity},
                     "table_key":"node:Person",
                     "table_path":"{}",
                     "expected_version":{},

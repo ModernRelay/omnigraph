@@ -1,6 +1,6 @@
-//! Cross-version upgrade: prove the CURRENT binary handles a GENUINE old-format
-//! (internal schema v3) graph minted by omnigraph 0.7.2 — not a v4-shaped graph
-//! with a rewound stamp. Two things the stamp-rewind stand-in
+//! Cross-version upgrade: prove the CURRENT binary handles GENUINE old-format
+//! graphs minted by released binaries — not a current-shaped graph with a
+//! rewound stamp. Two things the stamp-rewind stand-in
 //! (`sub_current_graph_is_refused_then_rebuilt_via_export_import`) cannot prove:
 //!
 //! 1. the open-refusal fires on the REAL on-disk v3 shape (lineage in
@@ -9,11 +9,10 @@
 //! 2. the documented `export → init → load` rebuild round-trips the data,
 //!    including a `Vector` column, off a genuine v3 export.
 //!
-//! Gated: requires `OMNIGRAPH_OLD_BIN` (an absolute path to a 0.7.2 `omnigraph`
-//! binary). Skips gracefully when unset — the same convention as the S3 and
-//! system-e2e gates — so the default `cargo test --workspace` stays green
-//! without it. CI sets it in the `crossversion_upgrade` job (see
-//! `docs/dev/testing.md`).
+//! The v3 case uses `OMNIGRAPH_OLD_BIN` (0.7.2). The immediate-predecessor v4
+//! case uses `OMNIGRAPH_PREVIOUS_BIN` (0.8.1) and also proves that binary
+//! refuses a v5 graph. Each case skips only when its variable is unset; a set
+//! but invalid path fails loudly.
 
 mod support;
 
@@ -34,6 +33,17 @@ fn old_bin() -> Option<PathBuf> {
         path.exists(),
         "OMNIGRAPH_OLD_BIN is set but does not exist: {} \
          (unset it to skip, or point it at a real 0.7.2 omnigraph binary)",
+        path.display(),
+    );
+    Some(path)
+}
+
+fn previous_bin() -> Option<PathBuf> {
+    let path = PathBuf::from(std::env::var_os("OMNIGRAPH_PREVIOUS_BIN")?);
+    assert!(
+        path.exists(),
+        "OMNIGRAPH_PREVIOUS_BIN is set but does not exist: {} \
+         (unset it to skip, or point it at a real 0.8.1 omnigraph binary)",
         path.display(),
     );
     Some(path)
@@ -65,6 +75,15 @@ fn nonblank_lines(bytes: &[u8]) -> usize {
         .count()
 }
 
+fn exported_row_with_slug(bytes: &[u8], slug: &str) -> serde_json::Value {
+    String::from_utf8_lossy(bytes)
+        .lines()
+        .filter(|line| !line.trim().is_empty())
+        .map(|line| serde_json::from_str::<serde_json::Value>(line).expect("valid export JSONL"))
+        .find(|row| row["data"]["slug"].as_str() == Some(slug))
+        .unwrap_or_else(|| panic!("export must contain slug '{slug}'"))
+}
+
 #[test]
 fn current_binary_refuses_and_rebuilds_a_genuine_v3_graph() {
     let Some(old) = old_bin() else {
@@ -91,7 +110,14 @@ fn current_binary_refuses_and_rebuilds_a_genuine_v3_graph() {
         "load",
         &run_old(
             &old,
-            &["load", "--mode", "overwrite", "--data", data.to_str().unwrap(), og],
+            &[
+                "load",
+                "--mode",
+                "overwrite",
+                "--data",
+                data.to_str().unwrap(),
+                og,
+            ],
         ),
     );
 
@@ -124,8 +150,14 @@ fn current_binary_refuses_and_rebuilds_a_genuine_v3_graph() {
     );
 
     // 4. The CURRENT binary rebuilds: fresh init + load the v3 export.
-    let new_graph = temp.path().join("new-v4.omni");
-    output_success(cli().arg("init").arg("--schema").arg(&schema).arg(&new_graph));
+    let new_graph = temp.path().join("new-current.omni");
+    output_success(
+        cli()
+            .arg("init")
+            .arg("--schema")
+            .arg(&schema)
+            .arg(&new_graph),
+    );
     output_success(
         cli()
             .arg("load")
@@ -141,7 +173,7 @@ fn current_binary_refuses_and_rebuilds_a_genuine_v3_graph() {
     assert_eq!(
         nonblank_lines(&export.stdout),
         nonblank_lines(&reexport.stdout),
-        "row count must round-trip v3 → v4",
+        "row count must round-trip v3 → current",
     );
     let rebuilt = String::from_utf8_lossy(&reexport.stdout);
     assert!(
@@ -151,5 +183,99 @@ fn current_binary_refuses_and_rebuilds_a_genuine_v3_graph() {
     assert!(
         rebuilt.contains("ml-intro"),
         "the rebuilt graph must preserve node data, got: {rebuilt}",
+    );
+}
+
+#[test]
+fn v5_refuses_and_rebuilds_genuine_v4_and_v4_refuses_v5() {
+    let Some(previous) = previous_bin() else {
+        eprintln!(
+            "skipping immediate-predecessor upgrade test: OMNIGRAPH_PREVIOUS_BIN is not set to a 0.8.1 binary"
+        );
+        return;
+    };
+
+    let temp = tempdir().unwrap();
+    let old_graph = temp.path().join("old-v4.omni");
+    let schema = fixture("search.pg");
+    let data = fixture("search.jsonl");
+    let old_uri = old_graph.to_str().unwrap();
+
+    assert_ok(
+        "v4 init",
+        &run_old(
+            &previous,
+            &["init", "--schema", schema.to_str().unwrap(), old_uri],
+        ),
+    );
+    assert_ok(
+        "v4 load",
+        &run_old(
+            &previous,
+            &[
+                "load",
+                "--mode",
+                "overwrite",
+                "--data",
+                data.to_str().unwrap(),
+                old_uri,
+            ],
+        ),
+    );
+    assert!(
+        !old_graph.join("_graph_commits.lance").exists(),
+        "a genuine v4 graph keeps graph lineage inside __manifest",
+    );
+
+    let export = run_old(&previous, &["export", old_uri]);
+    assert_ok("v4 export", &export);
+    let jsonl = temp.path().join("v4.jsonl");
+    std::fs::write(&jsonl, &export.stdout).unwrap();
+
+    let refusal = output_failure(cli().arg("snapshot").arg(&old_graph));
+    let stderr = String::from_utf8_lossy(&refusal.stderr);
+    assert!(stderr.contains("0.8.x"), "got: {stderr}");
+    assert!(stderr.contains("export"), "got: {stderr}");
+
+    let new_graph = temp.path().join("new-v5.omni");
+    output_success(
+        cli()
+            .arg("init")
+            .arg("--schema")
+            .arg(&schema)
+            .arg(&new_graph),
+    );
+    output_success(
+        cli()
+            .arg("load")
+            .arg("--mode")
+            .arg("overwrite")
+            .arg("--data")
+            .arg(&jsonl)
+            .arg(&new_graph),
+    );
+    let reexport = output_success(cli().arg("export").arg(&new_graph));
+    assert_eq!(
+        nonblank_lines(&export.stdout),
+        nonblank_lines(&reexport.stdout)
+    );
+    let original_ml_intro = exported_row_with_slug(&export.stdout, "ml-intro");
+    let rebuilt_ml_intro = exported_row_with_slug(&reexport.stdout, "ml-intro");
+    assert_eq!(
+        rebuilt_ml_intro["data"]["embedding"], original_ml_intro["data"]["embedding"],
+        "v4 → v5 rebuild must preserve vector values, not merely row count"
+    );
+
+    let reverse = run_old(&previous, &["snapshot", new_graph.to_str().unwrap()]);
+    assert!(
+        !reverse.status.success(),
+        "a v4 binary must refuse a genuine v5 graph"
+    );
+    let reverse_stderr = String::from_utf8_lossy(&reverse.stderr);
+    assert!(
+        reverse_stderr.contains("upgrade omnigraph")
+            || reverse_stderr.contains("newer")
+            || reverse_stderr.contains("expects v4"),
+        "unexpected reverse-refusal message: {reverse_stderr}",
     );
 }

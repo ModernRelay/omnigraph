@@ -1,6 +1,6 @@
 # Architecture review: RFC-022 through RFC-028
 
-**Status:** RFC-022 implemented; RFC-023–028 review and acceptance work remains open
+**Status:** RFC-022 and RFC-028 implemented; RFC-023–027 review and acceptance work remains open
 **Date:** 2026-07-11
 **Audience:** RFC authors, engine/storage maintainers, and release reviewers
 **Reviewed against:** OmniGraph 0.8.1; Lance 9.0.0-beta.15 at
@@ -435,8 +435,10 @@ failover for those operations merely because MemWAL has a shard epoch.
 and [RFC-026 §8](../rfcs/0026-memwal-streaming-ingest.md#8-epoch-fenced-quiescence-barrier),
 with the shared contract in [RFC-028](../rfcs/0028-stable-schema-identity.md)
 
-**Status:** Closed in specification on 2026-07-14; RFC-028 acceptance and
-implementation remain prerequisites for every identity-consuming sibling.
+**Status:** Closed in implementation on 2026-07-15. RFC-028 is active in
+SchemaIR v2, internal manifest schema v5, every writer/recovery envelope, and
+identity-derived table paths. Identity-consuming siblings may rely on that
+contract while retaining their independent activation gates.
 
 The reviewed drafts had RFC-024 exclusively owning stable table identity and
 incarnation while RFC-025 called heads optional and RFC-026 persisted a stable
@@ -450,8 +452,9 @@ authority, and RFC-026 distinguishes that preserved logical pair from its
 separately fenced physical MemWAL enrollment.
 
 RFC-026's `_ingest_rejects` deterministic key now uses stable table ID plus
-incarnation rather than mutable `table_key`, while a rematerializing rename
-mints a fresh shard namespace under an exact sidecar-covered rebind. Thus
+incarnation rather than mutable `table_key`. If a future explicit
+rematerializing-rename capability is added, it must mint a fresh shard namespace
+under an exact sidecar-covered rebind. Thus
 logical history ownership survives rename, physical WAL artifacts are never
 adopted by implication, and drop/re-add cannot claim a predecessor's rows.
 
@@ -512,8 +515,8 @@ metadata selects its lifecycle:
   metadata are both present, they agree.
 
 RFC-022 through RFC-028 now identify the maintainer design-series track and an
-owner. RFC-022 is `implemented` at its documented support boundary, RFC-023
-through RFC-026 and RFC-028 remain `draft`, and RFC-027 remains
+owner. RFC-022 and RFC-028 are `implemented` at their documented support
+boundaries, RFC-023 through RFC-026 remain `draft`, and RFC-027 remains
 `research-blocked`.
 All formal RFC filenames in the central directory are normalized to four
 digits. Legacy `docs/dev/rfc-00N-*` files remain in place with their existing
@@ -529,9 +532,9 @@ the formal RFC filename namespace.
 > `Status` metadata, and normalize every formal filename to four digits. The
 > public merge-equals-acceptance rule was preserved rather than weakened.
 
-> ✅ **RFC-022 implementation close-out (2026-07-13):** every currently
-> supported graph-write surface is enrolled in an exact adapter, the bounded
-> Optimize schema-v2 adapter, or an explicit authority/physical/bootstrap/
+> ✅ **RFC-022 implementation close-out (2026-07-13; identity envelope activated
+> 2026-07-15):** every currently supported graph-write surface is enrolled in an
+> exact adapter, the bounded Optimize payload, or an explicit authority/physical/bootstrap/
 > recovery exception. Rust visibility keeps the supported SDK set closed: raw
 > storage/coordinator/handle-cache modules are crate-private and public snapshots
 > expose a read-only table/scan facade without Lance's raw scanner or physical
@@ -579,7 +582,8 @@ Keep target-branch values that must remain stable in the atomic `ReadSet`.
 > target publisher's atomic `ReadSet`. A later source-head advance is harmless
 > under captured-source semantics; only a future latest-at-target-publish
 > contract would require a source fence through target CAS. The shipped
-> schema-v4 exact adapter preserves that captured-source contract while
+> active schema-v9 envelope's retained `protocol_v4` exact adapter preserves
+> that captured-source contract while
 > revalidating source incarnation before effects.
 
 ### BLOCKER-11 — RFC-022 and no-heads MemWAL need coarse OCC
@@ -643,7 +647,8 @@ revalidation without RFC-024.
 > **Implementation disposition (2026-07-11):** mutation/load now capture the
 > native Lance `BranchIdentifier`, exact optional `graph_head`, and accepted
 > schema identity; revalidate under a branch-then-table gate; and pass the same
-> token to every publisher retry and schema-v3 recovery decision. Metadata-only
+> token to every publisher retry and the active schema-v9 envelope's retained
+> `protocol_v3` recovery decision. Metadata-only
 > schema-apply tests pin the required invariant that supported schema changes
 > move `graph_head` even when no data-table version changes. This closes the
 > coarse mutation/load cell without claiming a general schema-authority row or
@@ -652,7 +657,8 @@ revalidation without RFC-024.
 
 > **Branch-merge implementation disposition (2026-07-11):** branch merge uses
 > the same coarse target token without pretending the source belongs to that
-> atomic read set. Schema-v4 recovery persists the captured source parent,
+> atomic read set. The active schema-v9 envelope's retained `protocol_v4`
+> recovery payload persists the captured source parent,
 > fixed merge/rollback ids, pre-minted exact transaction chains for multi-commit
 > data effects, ref-only physical effects, and the complete logical delta. A later source advance remains harmless; a target
 > advance after effects becomes `RecoveryRequired` and is compensated rather
@@ -744,9 +750,9 @@ affected RFC is accepted or implemented:
    maintainer design-series lifecycle through explicit `Author track` and
    `Status` metadata. `draft` and `research-blocked` are valid only in the
    latter; public merge remains acceptance.
-3. **Provisional version naming (closed 2026-07-14):** RFC-024 now says “heads
-   format”; RFC-028 provisionally takes the next number while explicitly
-   allowing the numeral to move. No sibling treats `v5` as permanent.
+3. **Version naming (closed 2026-07-15):** RFC-024 says “heads format”; RFC-028
+   activated internal manifest v5. Sibling drafts name capabilities rather than
+   assuming the next numeral.
 4. **Capability ordering (closed in specification 2026-07-14):** RFC-025 and
    RFC-026 define independent-release rebuilds and combined initialization /
    recovery gates for co-release. Cleanup continues to require persistent
@@ -772,7 +778,7 @@ The review does not require all RFCs to land together. A safe order is:
 1. RFC-022 is implemented at the documented single-writer-process boundary;
    branch-control recovery, coarse `graph_head` OCC, foreign-branch fact
    classification, writer-surface closure, and lifecycle are dispositioned;
-2. accept and land RFC-028's stable identity capability;
+2. RFC-028's stable identity capability landed on 2026-07-15;
 3. accept RFC-023 once partial-effect retry and its format/fleet implementation
    and evidence are complete;
 4. evaluate RFC-024 independently on its physical lookup cost gate;

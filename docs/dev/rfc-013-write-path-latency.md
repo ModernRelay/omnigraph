@@ -7,8 +7,14 @@
 > below are historical: the remaining `optimize` / `cleanup` internal-table scope is
 > **`__manifest`-only**, and the per-write `_graph_commits` scan term is gone. See
 > [invariants.md](invariants.md) and [versioning.md](versioning.md).
+>
+> **RFC-028 identity update (2026-07-15):** table-version object IDs and folds now
+> use `(stable_table_id, table_incarnation_id, version)`. Any older passage below
+> that keys a current table lifetime by mutable `table_key` is historical.
 
-**Status:** Proposed
+**Status:** Historical design record (partially implemented); current write and
+identity contracts are [RFC-022](../rfcs/0022-unified-write-path.md) and
+[RFC-028](../rfcs/0028-stable-schema-identity.md).
 **Author(s):** write-path latency investigation (handoff + multi-agent validation)
 **Date:** 2026-06-19
 **Audience:** engine / storage maintainers
@@ -959,7 +965,8 @@ DB-canon review flags three places not to over-claim:
   (`check_expected_table_versions`, `publisher.rs:353`) was prototyped exactly; debug
   confirmed the pins reach the check, **and both writers still committed — the orphan
   persisted.** Every publish writes a *unique per-`object_id` row* into `__manifest`
-  (merge key `object_id = version_object_id(table, version)`). Two disjoint-table
+  (the current merge key derives from stable table ID + incarnation + version;
+  the implementation at the time used `version_object_id(table_key, version)`). Two disjoint-table
   writers (`node:Person` vs `edge:Knows`) touch **no common row**, so Lance's
   row-level merge-insert CAS commits both with **no conflict**, the publisher's retry
   loop **never fires**, and `check_expected_table_versions` — a **non-atomic

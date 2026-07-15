@@ -6,8 +6,6 @@
 //! intent. `repair` classifies that uncovered drift from Lance transactions and
 //! only auto-publishes maintenance-only drift when the operator confirms.
 
-use std::collections::HashMap;
-
 use lance::Dataset;
 use lance::dataset::transaction::Operation;
 
@@ -121,6 +119,13 @@ struct ClassificationResult {
     error: Option<String>,
 }
 
+struct RepairTableTask {
+    identity: crate::db::manifest::TableIdentity,
+    table_key: String,
+    full_path: String,
+    manifest_version: u64,
+}
+
 pub async fn repair_all_tables(db: &Omnigraph, options: RepairOptions) -> Result<RepairStats> {
     if options.force && !options.confirm {
         return Err(OmniError::manifest("repair --force requires --confirm"));
@@ -130,19 +135,41 @@ pub async fn repair_all_tables(db: &Omnigraph, options: RepairOptions) -> Result
     db.ensure_schema_apply_idle("repair").await?;
     ensure_no_pending_recovery_sidecars(db, "repair").await?;
 
+    // Repair publishes manifest authority, so it joins the canonical writer
+    // envelope. The accepted catalog, identity/path pairs, raw Lance reads, and
+    // final publish all remain under schema -> main -> sorted-table gates. This
+    // prevents a concurrent drop/re-add from pairing the old dataset path with
+    // the replacement's same public alias and new identity.
+    let _schema_guard = db
+        .write_queue()
+        .acquire(&crate::db::manifest::schema_apply_serial_queue_key())
+        .await;
+    db.refresh_coordinator_only().await?;
+    db.ensure_schema_apply_not_locked("repair").await?;
+    let catalog = db.load_accepted_catalog_with_schema_gate_held().await?;
+    let _main_branch_guard = db.write_queue().acquire_branch(None).await;
+
+    let table_keys = optimize::all_table_keys(&catalog);
+    let queue_keys = table_keys
+        .iter()
+        .map(|table_key| (table_key.clone(), None))
+        .collect::<Vec<_>>();
+    let _table_guards = db.write_queue().acquire_many(&queue_keys).await;
+    ensure_no_pending_recovery_sidecars(db, "repair").await?;
+
     let snapshot = db.fresh_snapshot_for_branch(None).await?;
-    let table_tasks: Vec<(String, String)> = {
-        let catalog = db.catalog();
-        let mut tasks = Vec::new();
-        for table_key in optimize::all_table_keys(&catalog) {
-            let Some(entry) = snapshot.entry(&table_key) else {
-                continue;
-            };
-            let full_path = format!("{}/{}", db.root_uri, entry.table_path);
-            tasks.push((table_key, full_path));
-        }
-        tasks
-    };
+    let table_tasks = table_keys
+        .into_iter()
+        .filter_map(|table_key| {
+            let entry = snapshot.entry(&table_key)?;
+            Some(RepairTableTask {
+                identity: entry.identity,
+                table_key,
+                full_path: format!("{}/{}", db.root_uri, entry.table_path),
+                manifest_version: entry.table_version,
+            })
+        })
+        .collect::<Vec<_>>();
 
     if table_tasks.is_empty() {
         return Ok(RepairStats {
@@ -151,30 +178,24 @@ pub async fn repair_all_tables(db: &Omnigraph, options: RepairOptions) -> Result
         });
     }
 
-    let queue_keys: Vec<(String, Option<String>)> = table_tasks
-        .iter()
-        .map(|(table_key, _)| (table_key.clone(), None))
-        .collect();
-    let _guards = db.write_queue().acquire_many(&queue_keys).await;
-    ensure_no_pending_recovery_sidecars(db, "repair").await?;
-
-    let snapshot = db.fresh_snapshot_for_branch(None).await?;
     let mut tables = Vec::with_capacity(table_tasks.len());
     let mut updates = Vec::new();
-    let mut expected = HashMap::new();
+    let mut expected = crate::db::manifest::ExpectedTableVersions::new();
     let mut any_forced = false;
 
-    for (table_key, full_path) in table_tasks {
+    for task in table_tasks {
+        let RepairTableTask {
+            identity,
+            table_key,
+            full_path,
+            manifest_version,
+        } = task;
         // `classify_drift` inspects raw Lance transaction history
         // (`read_transaction_by_version`), a Lance-only maintenance read the
         // staged-write trait does not surface. The raw borrow is an enumerated,
         // read-only escape; repair never takes ownership or moves Lance HEAD.
         let handle = db.storage().open_dataset_head(&full_path, None).await?;
         let ds = handle.dataset();
-        let manifest_version = snapshot
-            .entry(&table_key)
-            .map(|e| e.table_version)
-            .ok_or_else(|| OmniError::manifest(format!("no manifest entry for {}", table_key)))?;
         let lance_head_version = ds.version().version;
 
         if lance_head_version < manifest_version {
@@ -218,13 +239,20 @@ pub async fn repair_all_tables(db: &Omnigraph, options: RepairOptions) -> Result
         if matches!(action, RepairAction::Healed | RepairAction::Forced) {
             let state = db.storage().table_state(&full_path, &handle).await?;
             updates.push(crate::db::SubTableUpdate {
+                identity,
                 table_key: table_key.clone(),
                 table_version: state.version,
                 table_branch: None,
                 row_count: state.row_count,
                 version_metadata: state.version_metadata,
             });
-            expected.insert(table_key.clone(), manifest_version);
+            expected.insert(
+                identity,
+                crate::db::manifest::TableVersionExpectation {
+                    table_key: table_key.clone(),
+                    table_version: manifest_version,
+                },
+            );
         }
 
         tables.push(TableRepairStats {

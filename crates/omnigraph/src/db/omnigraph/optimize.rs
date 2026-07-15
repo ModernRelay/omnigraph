@@ -174,12 +174,14 @@ pub struct TableCleanupStats {
 }
 
 struct OptimizeTableTask {
+    identity: crate::db::manifest::TableIdentity,
     table_key: String,
     full_path: String,
     expected_version: u64,
 }
 
 struct PreparedOptimizeTable {
+    identity: crate::db::manifest::TableIdentity,
     table_key: String,
     full_path: String,
     expected_version: u64,
@@ -261,6 +263,7 @@ pub async fn optimize_all_tables(db: &Omnigraph) -> Result<Vec<TableOptimizeStat
         .filter_map(|table_key| {
             let entry = snapshot.entry(&table_key)?;
             Some(OptimizeTableTask {
+                identity: entry.identity,
                 table_key,
                 full_path: format!("{}/{}", db.root_uri, entry.table_path),
                 expected_version: entry.table_version,
@@ -299,6 +302,7 @@ pub async fn optimize_all_tables(db: &Omnigraph) -> Result<Vec<TableOptimizeStat
         let pins = prepared
             .iter()
             .map(|work| crate::db::manifest::SidecarTablePin {
+                identity: work.identity,
                 table_key: work.table_key.clone(),
                 table_path: work.full_path.clone(),
                 expected_version: work.expected_version,
@@ -309,12 +313,7 @@ pub async fn optimize_all_tables(db: &Omnigraph) -> Result<Vec<TableOptimizeStat
                 table_branch: None,
             })
             .collect();
-        let sidecar = crate::db::manifest::new_sidecar(
-            crate::db::manifest::SidecarKind::Optimize,
-            None,
-            None,
-            pins,
-        );
+        let sidecar = crate::db::manifest::new_optimize_sidecar_v9(pins)?;
         let recovery_handle =
             crate::db::manifest::write_sidecar(db.root_uri(), db.storage_adapter(), &sidecar)
                 .await?;
@@ -481,6 +480,7 @@ async fn prepare_optimize_table(
     }
 
     Ok(OptimizePreparation::Work(PreparedOptimizeTable {
+        identity: task.identity,
         table_key: task.table_key,
         full_path: task.full_path,
         expected_version: task.expected_version,
@@ -496,6 +496,7 @@ async fn apply_optimize_table_effects(
     catalog: &omnigraph_compiler::catalog::Catalog,
     work: PreparedOptimizeTable,
 ) -> Result<OptimizeEffectOutcome> {
+    let identity = work.identity;
     let table_key = work.table_key;
     let full_path = work.full_path;
     let mut initial_snapshot = Some(work.initial_snapshot);
@@ -671,6 +672,7 @@ async fn apply_optimize_table_effects(
     let update = if committed {
         let state = db.storage().table_state(&full_path, &snapshot).await?;
         Some(crate::db::SubTableUpdate {
+            identity,
             table_key: stat.table_key.clone(),
             table_version: state.version,
             table_branch: None,
@@ -707,8 +709,21 @@ async fn publish_optimize_batch_monotonic(
                     target.table_key
                 ))
             })?;
+            if entry.identity != target.identity {
+                return Err(OmniError::manifest_read_set_changed(
+                    format!("table_identity:{}", target.table_key),
+                    Some(target.identity.to_string()),
+                    Some(entry.identity.to_string()),
+                ));
+            }
             if entry.table_version < target.table_version {
-                expected.insert(target.table_key.clone(), entry.table_version);
+                expected.insert(
+                    entry.identity,
+                    crate::db::manifest::TableVersionExpectation {
+                        table_key: target.table_key.clone(),
+                        table_version: entry.table_version,
+                    },
+                );
                 updates.push(target.clone());
             }
         }
@@ -731,9 +746,9 @@ async fn publish_optimize_batch_monotonic(
 
     let current = db.fresh_snapshot_for_branch(None).await?;
     if targets.iter().all(|target| {
-        current
-            .entry(&target.table_key)
-            .is_some_and(|entry| entry.table_version >= target.table_version)
+        current.entry(&target.table_key).is_some_and(|entry| {
+            entry.identity == target.identity && entry.table_version >= target.table_version
+        })
     }) {
         return Ok(());
     }
@@ -993,9 +1008,7 @@ pub async fn cleanup_all_tables(
              recovery sweep before garbage-collecting versions",
         ));
     }
-    crate::failpoints::maybe_fail(
-        crate::failpoints::names::CLEANUP_POST_RECOVERY_CHECK_PRE_GATES,
-    )?;
+    crate::failpoints::maybe_fail(crate::failpoints::names::CLEANUP_POST_RECOVERY_CHECK_PRE_GATES)?;
 
     // Close the empty-check -> GC race. Mutation/load take schema then branch
     // then table gates; current legacy sidecar writers take at least their table
@@ -1010,9 +1023,7 @@ pub async fn cleanup_all_tables(
         .await;
     db.refresh_coordinator_only().await?;
     db.ensure_schema_apply_not_locked("cleanup").await?;
-    let cleanup_catalog = db
-        .load_accepted_catalog_with_schema_gate_held()
-        .await?;
+    let cleanup_catalog = db.load_accepted_catalog_with_schema_gate_held().await?;
 
     // Reclaim orphaned branch forks (from an incomplete prior `branch_delete`)
     // before version GC. Authority-derived and idempotent; the eager
@@ -1301,14 +1312,15 @@ async fn reconcile_orphaned_branches_with_catalog(
 
     let resolved = db.resolved_branch_target(None).await?;
     let snapshot = resolved.snapshot;
-    let table_targets: Vec<(String, String)> = all_table_keys(catalog)
-        .into_iter()
-        .filter_map(|table_key| {
-            let entry = snapshot.entry(&table_key)?;
-            let full_path = format!("{}/{}", db.root_uri, entry.table_path);
-            Some((table_key, full_path))
-        })
-        .collect();
+    let table_targets: Vec<(crate::db::manifest::TableIdentity, String, String)> =
+        all_table_keys(catalog)
+            .into_iter()
+            .filter_map(|table_key| {
+                let entry = snapshot.entry(&table_key)?;
+                let full_path = format!("{}/{}", db.root_uri, entry.table_path);
+                Some((entry.identity, table_key, full_path))
+            })
+            .collect();
 
     let mut stats = BranchReconcileStats::default();
     // Per-branch snapshots are resolved once and cached across tables (few
@@ -1321,7 +1333,7 @@ async fn reconcile_orphaned_branches_with_catalog(
     // Per-table fault isolation: one table's transient failure is recorded and
     // logged, never aborting the rest of the sweep.
     let storage = db.storage();
-    for (table_key, full_path) in table_targets {
+    for (identity, table_key, full_path) in table_targets {
         let listed = match storage.list_branches(&full_path).await {
             Ok(listed) => listed,
             Err(err) => {
@@ -1378,7 +1390,8 @@ async fn reconcile_orphaned_branches_with_catalog(
                     }
                 }
                 branch_snapshots[&branch]
-                    .entry(&table_key)
+                    .entries()
+                    .find(|entry| entry.identity == identity)
                     .map(|e| e.table_branch.as_deref() != Some(branch.as_str()))
                     .unwrap_or(true)
             };
@@ -1416,7 +1429,8 @@ async fn reconcile_orphaned_branches_with_catalog(
             // skipped and recorded. (Cross-process writers remain the documented
             // one-winner-CAS gap.) One key held at a time → no lock-order
             // inversion vs multi-table `acquire_many` writers.
-            match super::table_ops::classify_fork_ref(db, &table_key, &branch, None).await {
+            match super::table_ops::classify_fork_ref(db, &table_key, identity, &branch, None).await
+            {
                 super::table_ops::ForkRefStatus::Orphan => {}
                 super::table_ops::ForkRefStatus::Legitimate => continue,
                 super::table_ops::ForkRefStatus::Indeterminate => {
@@ -1496,13 +1510,21 @@ mod tests {
         )));
     }
 
-    fn node_table_uri(root: &str, type_name: &str) -> String {
-        let mut hash: u64 = 0xcbf2_9ce4_8422_2325;
-        for &b in type_name.as_bytes() {
-            hash ^= b as u64;
-            hash = hash.wrapping_mul(0x100_0000_01b3);
-        }
-        format!("{}/nodes/{hash:016x}", root.trim_end_matches('/'))
+    async fn node_table_uri(db: &Omnigraph, type_name: &str) -> String {
+        let table_key = format!("node:{type_name}");
+        let snapshot = db
+            .snapshot_of(crate::db::ReadTarget::branch("main"))
+            .await
+            .unwrap();
+        let table_path = &snapshot
+            .entry(&table_key)
+            .unwrap_or_else(|| panic!("live manifest has no registration for {table_key}"))
+            .table_path;
+        format!(
+            "{}/{}",
+            db.uri().trim_end_matches('/'),
+            table_path.trim_start_matches('/')
+        )
     }
 
     #[tokio::test]
@@ -1523,7 +1545,7 @@ mod tests {
         db.branch_create("feature").await.unwrap();
 
         for type_name in ["Person", "Company"] {
-            let table_uri = node_table_uri(uri, type_name);
+            let table_uri = node_table_uri(&db, type_name).await;
             // forbidden-api-allow: test synthesizes a branch ref directly on the Lance dataset.
             let mut ds = lance::Dataset::open(&table_uri).await.unwrap();
             let base = ds.version().version;

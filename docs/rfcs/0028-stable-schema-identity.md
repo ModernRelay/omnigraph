@@ -2,7 +2,7 @@
 type: spec
 title: "RFC-028 — Stable schema identity and table incarnation"
 description: Defines accepted rename-stable type, property, and table identities plus drop/recreate incarnation semantics as the shared prerequisite for RFC-023 through RFC-026.
-status: draft
+status: implemented
 tags: [eng, rfc, schema, identity, incarnation, migration, versioning, lance, omnigraph]
 timestamp: 2026-07-14
 owner: OmniGraph maintainers
@@ -10,7 +10,7 @@ owner: OmniGraph maintainers
 
 # RFC-028: Stable schema identity and table incarnation
 
-**Status:** Draft / for team review
+**Status:** Implemented (2026-07-15)
 **Date:** 2026-07-14
 **Author track:** Maintainer design series
 **Depends on:** [RFC-022](0022-unified-write-path.md)'s accepted-schema capture,
@@ -19,14 +19,15 @@ SchemaApply recovery, and strict publication boundary
 `1aec14652dcbace23ac277fa8ced35000bea0c40`; full Lance table-schema,
 schema-evolution, transaction, and versioning specifications
 **Audience:** compiler, schema, engine, migration, and release maintainers
-**Open architecture review:** [RFC-022–028 review ledger](../dev/rfc-022-027-architecture-review.md).
-Findings marked **BLOCKER** must be dispositioned before acceptance.
+**Architecture review:** [RFC-022–028 review ledger](../dev/rfc-022-027-architecture-review.md).
+BLOCKER-07 is closed by this implementation; sibling blockers retain their own
+RFC boundaries.
 
 ---
 
 ## 0. Decision summary
 
-OmniGraph will make the persisted accepted SchemaIR the sole authority for
+OmniGraph makes the persisted accepted SchemaIR the sole authority for
 schema identity. A `.pg` file describes canonical schema shape and migration
 hints; it does not contain, derive, or let a caller choose authoritative IDs.
 
@@ -56,16 +57,16 @@ all-branch conversion framework.
 
 ## 1. Problem
 
-The current SchemaIR calls its IDs stable but computes them from mutable names:
+Before this RFC, SchemaIR called its IDs stable but computed them from mutable names:
 
 ```text
 type_id = fnv1a(kind + ":" + name)
 prop_id = fnv1a(owner + ":" + property_name)
 ```
 
-A type or property rename therefore changes identity. Rebuilding `Catalog`
-from SchemaIR currently discards those IDs, and open-time source validation
-recompiles `.pg` into a fresh name-derived IR before comparing the exact hash.
+A type or property rename therefore changed identity. Rebuilding `Catalog`
+from SchemaIR discarded those IDs, and open-time source validation recompiled
+`.pg` into a fresh name-derived IR before comparing the exact hash.
 Preserving an old ID in only SchemaApply would consequently make the next open
 reject the graph.
 
@@ -94,6 +95,8 @@ In scope:
 - node/edge table incarnation;
 - identity-aware schema planning, source validation, catalog derivation, and
   SchemaApply recovery;
+- identity-keyed manifest registrations, version rows, tombstones, and
+  physical table paths;
 - graph-root and branch semantics;
 - the boundary between logical identity and Lance physical field/ref identity;
 - internal-format activation and upgrade behavior;
@@ -225,11 +228,13 @@ The incarnation is not any of:
 Those physical tokens remain necessary for exact effect ownership and ref ABA.
 They are compared alongside, not substituted for, logical incarnation.
 
-In particular, today's supported type rename may materialize a new physical
-dataset/path while preserving the logical type. That changes the exact physical
-effect/ref identity but not the RFC-028 type ID or table incarnation. Only an
-accepted schema event that explicitly starts a new logical table lifetime may
-change the incarnation.
+In particular, a supported type rename preserves the existing physical
+dataset, table path, Lance history, type ID, and table incarnation. The manifest
+changes only the current public alias for that identity. A property change in
+the same apply may still advance the existing Lance dataset, but a type rename
+is never implemented as name-derived rematerialization. Only an accepted schema
+event that explicitly starts a new logical table lifetime may change the
+incarnation.
 
 ## 4. One authority, two projections
 
@@ -328,6 +333,45 @@ not a second source of IDs. The handle refreshes the catalog under the existing
 schema gate and cheap schema-identity probe. This does not introduce a second
 maintained identity registry.
 
+### 4.5 Identity-bearing manifest journal
+
+Schema identity is active only when the graph publication journal uses it. A
+name-keyed SchemaIR layered over name-keyed manifest rows would still alias a
+dropped table with a later same-name declaration, because both lifetimes could
+produce the same registration key, path, Lance version number, and tombstone
+scope.
+
+Manifest v5 therefore stores `stable_table_id` and `table_incarnation_id` on
+every table registration, version, and tombstone row. Both are nonzero and
+required for table rows; graph-lineage rows leave them null. The pair is the
+table coordinate for registration lookup, version reduction, tombstone scope,
+OCC, and recovery ownership. `table_key` remains the current public alias and a
+diagnostic field; it is not object identity.
+
+Object IDs and initial physical paths are name-independent:
+
+```text
+table:{stable_table_id:016x}:{table_incarnation_id:016x}
+table_version:{stable_table_id:016x}:{table_incarnation_id:016x}:{version:020}
+table_tombstone:{stable_table_id:016x}:{table_incarnation_id:016x}:{version:020}
+
+nodes/{stable_table_id:016x}-{table_incarnation_id:016x}
+edges/{stable_table_id:016x}-{table_incarnation_id:016x}
+```
+
+The current registration row binds one identity pair to its current alias and
+unchanging path. A type rename updates that binding under the same registration
+object ID; historical manifest versions retain the prior alias. A drop writes a
+tombstone for the dropped pair. A later same-name add has a new pair, object ID,
+path, and independent Lance version sequence, so the old tombstone cannot hide
+it. The fold rejects two live identities exposing the same alias.
+
+Every active recovery protocol carries the identity pair beside the physical
+pin. A sidecar may never infer ownership from `table_key`, path, or a matching
+Lance version. The manifest-v5 stamp is not written until mutation/load,
+SchemaApply, BranchMerge, EnsureIndices, optimize, and their recovery paths all
+obey that rule.
+
 ## 5. Lifecycle truth table
 
 | Event | Stable type/table ID | Property ID | Table incarnation |
@@ -391,20 +435,21 @@ boundary or introduce branch-local schemas.
 
 ## 7. Lance physical identity mapping
 
-Lance field IDs are immutable within one Lance table schema and survive column
-rename and reorder. OmniGraph uses that property for physical schema evolution,
-but a Lance field ID is scoped to one exact physical dataset/schema lineage,
-not to RFC-028's logical table incarnation, and is not a graph-level type or
-property ID.
+Lance field IDs are immutable within one Lance table schema and Lance's native
+column-rename operation preserves them. A Lance field ID is nevertheless scoped
+to one exact physical dataset/schema lineage, not to RFC-028's logical table
+incarnation, and is not a graph-level type or property ID. OmniGraph's current
+staged overwrite path does not claim to preserve a field ID across a property
+rename until it uses, and verifies, Lance's native rename primitive.
 
 For each pinned table image, OmniGraph derives and validates the mapping from
 an accepted user-property ID or sealed system-field role to the Lance field ID
 in that physical schema. The mapping comes from the accepted catalog plus the
-pinned Lance schema; it is not an independently maintained registry. An
-in-place property rename captures the old field ID and proves the resulting
-schema kept it. A newly materialized table, including the target of today's
-supported type rename, may assign different Lance field IDs while its logical
-contract is governed by the accepted type/property IDs and incarnation.
+pinned Lance schema; it is not an independently maintained registry. Any
+rewrite may assign a different physical field ID, so the mapping is derived
+again for the resulting pinned image. A supported type rename alone retains the
+same Lance dataset and schema; a genuinely new table lifetime may reuse the
+same numeric field IDs as an older lifetime without identity continuity.
 For an interface projection, the catalog first resolves the interface-owned
 property ID through the node property's satisfaction link; only the resulting
 node-owned property ID maps to that table's Lance field.
@@ -416,12 +461,11 @@ logical identity and retain their own exact physical tokens.
 
 ## 8. Format activation and upgrade
 
-SchemaIR v2 and the identity domain/allocator are an internal storage-format
-capability. The implementation takes the next internal manifest schema number
-(provisionally v5 while current is v4), keeps `MIN_SUPPORTED == CURRENT`, and
-adds the identity version to the release/stamp history. The exact numeral may
-move if another accepted format change lands first; the capability semantics do
-not.
+SchemaIR v2, the identity domain/allocator, and identity-bearing manifest rows
+are one internal storage-format capability. The implementation uses internal
+manifest schema v5, keeps `MIN_SUPPORTED == CURRENT == 5`, and adds the identity
+version to the release/stamp history. A v5 graph is never served with a partial
+combination such as identity-bearing IR over name-keyed manifest rows.
 
 There is no v1→v2 IR backfill and no new-binary in-place conversion of an old
 graph. Activation follows the documented strand:
@@ -464,9 +508,9 @@ release coordination, not permission for a draft sibling to define identity.
   authority and Lance tags, not identity.
 - **RFC-026:** stream lifecycle rows and deterministic reject keys carry stable
   table ID plus incarnation. A same-dataset rename preserves the physical
-  enrollment; a rematerializing rename preserves logical history ownership but
-  must fence and rebind through a fresh shard namespace. Drop/re-add cannot
-  adopt old WAL/reject state.
+  enrollment. Any future explicit rematerializing-rename capability would
+  preserve logical history ownership but must fence and rebind through a fresh
+  shard namespace. Drop/re-add cannot adopt old WAL/reject state.
 
 No consumer may fall back to mutable `table_key`, path, or name when an identity
 is absent. Missing, duplicate, zero, out-of-domain, or mismatched identity is a
@@ -474,8 +518,8 @@ typed format/authority error.
 
 ## 10. Invariants and deny-list check
 
-- **Invariant 8 moves from gap to implemented contract only when this RFC's
-  implementation lands.** The draft itself does not close the current gap.
+- **Invariant 8 is now an implemented contract.** Stable identity is active in
+  SchemaIR v2, manifest schema v5, every graph-visible writer, and recovery v9.
 - **Invariant 5:** identity minting joins the existing exact SchemaApply sidecar;
   there is no second recovery protocol.
 - **Invariant 15:** accepted SchemaIR is the sole authority and `Catalog` is a
@@ -497,22 +541,32 @@ queue or parallel copy. No hard invariant is weakened.
 - source order, comments, and repeated planning produce the same shape and
   allocation plan;
 - new graphs start at allocator value `1`; kind ordering and exact ASCII-byte
-  name ordering are pinned by golden SchemaIR fixtures;
+  name ordering are pinned by in-source canonical-allocation assertions;
 - type and same-owner property renames preserve IDs;
 - interface expansion gives each node-effective property one owner ID and
   preserves sorted interface-property satisfaction links, including two
   compatible interfaces contributing the same property name;
 - removing one of several satisfied interface contracts preserves the
-  still-live node property ID; removing the effective property and later
-  reintroducing it mints a new node-owned ID;
-- edge endpoints, interfaces, constraints, indexes, and embedding references
-  resolve through stable IDs after rename;
+  still-live node property ID; whole-type drop/re-add separately proves that
+  replacement properties receive new IDs;
+- edge endpoints, interfaces, constraints, and embedding references resolve
+  through stable IDs after rename; planner regressions additionally pin
+  rename-stable composite constraint comparison;
 - `id`/`src`/`dst` use only the valid sealed system-field role and consume no
   allocator values;
 - drop/re-add mints a new type/property ID and new table incarnation;
 - implicit rename, cross-kind rename, cross-owner property move, duplicate ID,
   zero ID, allocator regression, and overflow fail loudly;
+- missing-value, duplicate, empty, or keyword-bearing `@rename_from` hints fail
+  before planning, so malformed continuity intent cannot degrade into drop/add;
+- identity-bearing reference vectors remain canonical when allocation order and
+  lexical name order diverge, and semantically unchanged embed/constraint
+  references survive rename without depending on diagnostic names or field order;
+- the migration planner classifies every persisted property semantic/provenance
+  field; a changed accepted IR cannot disappear behind an empty plan;
 - `build_catalog_from_ir` preserves every ID/incarnation and never mints one;
+- name-only catalog identity lookup fails on a valid cross-kind ambiguity instead
+  of returning whichever declaration kind happens to be searched first;
 - SchemaIR v1 is refused by the identity-capable binary.
 
 ### 11.2 Engine and recovery
@@ -523,7 +577,20 @@ queue or parallel copy. No hard invariant is weakened.
   and every consumer token takes its domain from the IR;
 - reopen validates source shape without regenerating IDs;
 - type and property rename tests inspect the promoted IR and prove IDs and
-  incarnation are unchanged while names and hashes change;
+  incarnation are unchanged while names and hashes change; a pure type rename
+  also preserves the table path, Lance HEAD, rows, and indexes;
+- a manifest snapshot taken before a type rename resolves the old alias while
+  the new snapshot resolves the new alias for the same identity and path;
+- drop followed by later same-name add mints a new identity/incarnation/path,
+  starts an independent Lance version sequence, and remains visible despite the
+  old pair's tombstone;
+- zero or missing manifest identity, duplicate live aliases, rename path
+  changes, and a sidecar identity/name mismatch fail loudly;
+- an identity-bearing sidecar whose table pin belongs to a different graph root
+  is refused before recovery opens, restores, or deletes that table;
+- rollback of a combined type rename and table rewrite restores and republishes
+  the source alias, while same-name node/edge historical bindings stay separated
+  by kind and immutable identity;
 - SchemaApply failpoints before arming, after each table effect, after manifest
   publish, and during schema promotion prove fixed IDs roll forward or old IDs
   remain authoritative on rollback;
@@ -536,16 +603,19 @@ queue or parallel copy. No hard invariant is weakened.
 
 - genuine old-format graphs are refused before recovery/schema parsing by the
   new binary and new-format graphs are refused by the old binary;
-- old-binary export followed by new-binary init/load round-trips current rows,
-  vectors, and blobs into a new identity domain;
-- rebuild initialization accepts and strips a stale, previously consumed
-  `@rename_from` hint from old-binary schema output, while a missing rename
-  target during non-empty schema evolution still fails;
-- a subsequent non-empty SchemaApply with the same accepted name and retained
-  stale hint treats the hint as inert, preserves IDs, and removing it later is
-  a semantic no-op;
-- branch/history loss and per-branch separate rebuild behavior match the
-  upgrade guide;
+- old-binary export followed by new-binary init/load round-trips current rows and
+  vectors into a new identity domain; blob round-trip remains covered by the
+  ordinary export/load suites rather than the cross-version binary fixture;
+- compiler initialization treats a valid `@rename_from` hint as inert when no
+  accepted identity authority exists, while non-empty evolution rejects a
+  missing rename target; the cross-version fixture does not manufacture stale
+  hints in old-binary schema output;
+- exact-name evolution with a retained stale hint is pinned as diagnostic-only
+  in compiler tests and preserves IDs; it is not claimed as a separate
+  old-binary/new-binary integration flow;
+- the upgrade guide states that the one-branch export does not preserve branches
+  or history; automated cross-version branch-loss evidence remains a release gate
+  before claiming that behavior as separately exercised by the binary fixture;
 - co-released capability tests, if any, prove the first valid target manifest
   already contains every accepted capability—there is no partially activated
   serving window.
@@ -585,26 +655,25 @@ converter, all-branch claim, crash protocol, and old-format recovery path would
 reverse the project's strict-single-version liability decision. Export/import
 already gives an atomic source-preserving cutover.
 
-## 13. Reversibility and open gates
+## 13. Reversibility and implementation disposition
 
-The document is reversible while draft. Once written, the identity domain,
+The identity domain,
 numeric encoding, allocation order, shape/IR hash split, and drop/re-add rule
-become on-disk and recovery contracts. Changing them requires another internal
+are now on-disk and recovery contracts. Changing them requires another internal
 format and rebuild.
 
-Before acceptance:
+The implementation review completed these gates:
 
 1. review the SchemaIR v2 wire shape and canonical allocation order against the
    implementation plan;
 2. confirm every name-bearing internal reference that must become ID-bearing;
 3. confirm format refusal runs before schema/recovery parsing on every open
    mode;
-4. enumerate the exact RFC-022 SchemaApply sidecar fields that fix desired
-   identity and allocator state;
+4. enumerate the exact RFC-022 sidecar fields that fix desired identity,
+   allocator state, manifest identity pairs, and rename bindings;
 5. name the implementation tests that extend existing compiler,
    `lifecycle.rs`, `schema_apply.rs`, recovery, and cross-version owners.
 
-Extracting this contract closes BLOCKER-07's specification-ownership
-contradiction; accepting RFC-028 makes the shared decision authoritative. The
-implementation and format tests must land before RFC-023 through RFC-026 may
-claim the capability is active.
+This implementation closes BLOCKER-07's specification-ownership contradiction.
+RFC-023 through RFC-026 may consume the stable pair, but each still owns its
+independent activation, evidence, and format/recovery gates.

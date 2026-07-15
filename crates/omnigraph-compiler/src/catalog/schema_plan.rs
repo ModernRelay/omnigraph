@@ -6,7 +6,11 @@ use crate::error::Result;
 use crate::schema::ast::{Annotation, Constraint};
 use crate::types::PropType;
 
-use super::schema_ir::{EdgeIR, InterfaceIR, NodeIR, PropertyIR, SchemaIR};
+use super::schema_ir::{
+    ConstraintIR, EdgeIR, EmbedSourceIR, InterfaceIR, NodeIR, PropertyIR, PropertyRefIR, SchemaIR,
+    StablePropertyId, StableTypeId, TableIncarnationId, constraint_from_ir, validate_schema_ir,
+};
+use super::schema_shape::PropertyConstraintShape;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -182,15 +186,28 @@ pub fn plan_schema_migration(
     accepted: &SchemaIR,
     desired: &SchemaIR,
 ) -> Result<SchemaMigrationPlan> {
+    validate_schema_ir(accepted)?;
+    validate_schema_ir(desired)?;
+    if accepted.schema_identity_domain != desired.schema_identity_domain {
+        return Err(crate::error::SchemaIdentityError::Resolution(
+            "migration planning requires accepted and desired IR in the same identity domain"
+                .to_string(),
+        )
+        .into());
+    }
+    validate_evolution_identity(accepted, desired)?;
     let mut steps = Vec::new();
-    let interface_renames = plan_interfaces(&accepted.interfaces, &desired.interfaces, &mut steps);
-    let node_renames = plan_nodes(
-        &accepted.nodes,
-        &desired.nodes,
-        &interface_renames,
-        &mut steps,
-    );
-    plan_edges(&accepted.edges, &desired.edges, &node_renames, &mut steps);
+    plan_interfaces(&accepted.interfaces, &desired.interfaces, &mut steps);
+    plan_nodes(&accepted.nodes, &desired.nodes, &mut steps);
+    plan_edges(&accepted.edges, &desired.edges, &mut steps);
+
+    if steps.is_empty() && accepted != desired {
+        steps.push(SchemaMigrationStep::UnsupportedChange {
+            entity: "schema".to_string(),
+            reason: "schema migration contains an unclassified semantic IR change".to_string(),
+            code: None,
+        });
+    }
 
     Ok(SchemaMigrationPlan {
         supported: !steps
@@ -200,21 +217,168 @@ pub fn plan_schema_migration(
     })
 }
 
+fn validate_evolution_identity(accepted: &SchemaIR, desired: &SchemaIR) -> Result<()> {
+    use crate::error::SchemaIdentityError;
+
+    if desired.next_identity_id < accepted.next_identity_id {
+        return Err(SchemaIdentityError::Resolution(format!(
+            "desired next_identity_id {} regresses accepted high-water mark {}",
+            desired.next_identity_id, accepted.next_identity_id
+        ))
+        .into());
+    }
+
+    #[derive(Clone, Copy, PartialEq, Eq)]
+    enum Kind {
+        Interface,
+        Node,
+        Edge,
+    }
+    let accepted_types = accepted
+        .interfaces
+        .iter()
+        .map(|entry| (entry.type_id, (Kind::Interface, None)))
+        .chain(accepted.nodes.iter().map(|entry| {
+            (
+                entry.type_id,
+                (Kind::Node, Some(entry.table_incarnation_id)),
+            )
+        }))
+        .chain(accepted.edges.iter().map(|entry| {
+            (
+                entry.type_id,
+                (Kind::Edge, Some(entry.table_incarnation_id)),
+            )
+        }))
+        .collect::<HashMap<StableTypeId, (Kind, Option<TableIncarnationId>)>>();
+    let desired_types = desired
+        .interfaces
+        .iter()
+        .map(|entry| (entry.type_id, (Kind::Interface, None)))
+        .chain(desired.nodes.iter().map(|entry| {
+            (
+                entry.type_id,
+                (Kind::Node, Some(entry.table_incarnation_id)),
+            )
+        }))
+        .chain(desired.edges.iter().map(|entry| {
+            (
+                entry.type_id,
+                (Kind::Edge, Some(entry.table_incarnation_id)),
+            )
+        }));
+    for (type_id, (kind, incarnation)) in desired_types {
+        if let Some((accepted_kind, accepted_incarnation)) = accepted_types.get(&type_id) {
+            if *accepted_kind != kind || *accepted_incarnation != incarnation {
+                return Err(SchemaIdentityError::Resolution(format!(
+                    "stable type id {type_id} changes declaration kind or table incarnation"
+                ))
+                .into());
+            }
+        } else if type_id.get() < accepted.next_identity_id {
+            return Err(SchemaIdentityError::Resolution(format!(
+                "new stable type id {type_id} reuses retired allocator space"
+            ))
+            .into());
+        }
+        if let Some(incarnation) = incarnation
+            && !accepted_types
+                .get(&type_id)
+                .is_some_and(|(_, previous)| *previous == Some(incarnation))
+            && incarnation.get() < accepted.next_identity_id
+        {
+            return Err(SchemaIdentityError::Resolution(format!(
+                "new table incarnation id {incarnation} reuses retired allocator space"
+            ))
+            .into());
+        }
+    }
+
+    let accepted_properties = accepted
+        .interfaces
+        .iter()
+        .map(|entry| (entry.type_id, entry.properties.as_slice()))
+        .chain(
+            accepted
+                .nodes
+                .iter()
+                .map(|entry| (entry.type_id, entry.properties.as_slice())),
+        )
+        .chain(
+            accepted
+                .edges
+                .iter()
+                .map(|entry| (entry.type_id, entry.properties.as_slice())),
+        )
+        .flat_map(|(owner, properties)| {
+            properties
+                .iter()
+                .map(move |property| (property.property_id, owner))
+        })
+        .collect::<HashMap<StablePropertyId, StableTypeId>>();
+    let desired_properties = desired
+        .interfaces
+        .iter()
+        .map(|entry| (entry.type_id, entry.properties.as_slice()))
+        .chain(
+            desired
+                .nodes
+                .iter()
+                .map(|entry| (entry.type_id, entry.properties.as_slice())),
+        )
+        .chain(
+            desired
+                .edges
+                .iter()
+                .map(|entry| (entry.type_id, entry.properties.as_slice())),
+        );
+    for (owner, properties) in desired_properties {
+        for property in properties {
+            match accepted_properties.get(&property.property_id) {
+                Some(accepted_owner) if *accepted_owner != owner => {
+                    return Err(SchemaIdentityError::Resolution(format!(
+                        "stable property id {} moves across owners",
+                        property.property_id
+                    ))
+                    .into());
+                }
+                None if property.property_id.get() < accepted.next_identity_id => {
+                    return Err(SchemaIdentityError::Resolution(format!(
+                        "new stable property id {} reuses retired allocator space",
+                        property.property_id
+                    ))
+                    .into());
+                }
+                _ => {}
+            }
+        }
+    }
+    Ok(())
+}
+
 fn plan_interfaces(
     accepted: &[InterfaceIR],
     desired: &[InterfaceIR],
     steps: &mut Vec<SchemaMigrationStep>,
-) -> HashMap<String, String> {
-    let accepted_by_name = accepted
+) {
+    let accepted_by_id = accepted
         .iter()
-        .map(|interface| (interface.name.as_str(), interface))
+        .map(|interface| (interface.type_id, interface))
         .collect::<HashMap<_, _>>();
     let mut consumed = HashSet::new();
 
     for interface in desired {
-        if let Some(existing) = accepted_by_name.get(interface.name.as_str()) {
-            consumed.insert(existing.name.clone());
-            let _property_renames = plan_properties(
+        if let Some(existing) = accepted_by_id.get(&interface.type_id) {
+            consumed.insert(existing.type_id);
+            if existing.name != interface.name {
+                steps.push(SchemaMigrationStep::UnsupportedChange {
+                    entity: format!("interface:{}", interface.name),
+                    reason: "renaming interfaces is not supported in schema migration v1"
+                        .to_string(),
+                    code: None,
+                });
+            }
+            plan_properties(
                 SchemaTypeKind::Interface,
                 &interface.name,
                 &existing.properties,
@@ -232,7 +396,7 @@ fn plan_interfaces(
 
     for leftover in accepted
         .iter()
-        .filter(|interface| !consumed.contains(&interface.name))
+        .filter(|interface| !consumed.contains(&interface.type_id))
     {
         steps.push(SchemaMigrationStep::UnsupportedChange {
             entity: format!("interface:{}", leftover.name),
@@ -243,59 +407,26 @@ fn plan_interfaces(
             code: None,
         });
     }
-
-    HashMap::new()
 }
 
-fn plan_nodes(
-    accepted: &[NodeIR],
-    desired: &[NodeIR],
-    interface_renames: &HashMap<String, String>,
-    steps: &mut Vec<SchemaMigrationStep>,
-) -> HashMap<String, String> {
-    let accepted_by_name = accepted
+fn plan_nodes(accepted: &[NodeIR], desired: &[NodeIR], steps: &mut Vec<SchemaMigrationStep>) {
+    let accepted_by_id = accepted
         .iter()
-        .map(|node| (node.name.as_str(), node))
+        .map(|node| (node.type_id, node))
         .collect::<HashMap<_, _>>();
     let mut consumed = HashSet::new();
-    let mut renames = HashMap::new();
 
     for node in desired {
-        let rename_from = rename_from_value(&node.annotations);
-        let matched = accepted_by_name
-            .get(node.name.as_str())
-            .copied()
-            .or_else(|| {
-                rename_from.and_then(|from| {
-                    accepted_by_name
-                        .get(from)
-                        .copied()
-                        .filter(|candidate| candidate.name != node.name)
-                })
+        let Some(existing) = accepted_by_id.get(&node.type_id).copied() else {
+            steps.push(SchemaMigrationStep::AddType {
+                type_kind: SchemaTypeKind::Node,
+                name: node.name.clone(),
             });
-
-        let Some(existing) = matched else {
-            if let Some(from) = rename_from {
-                steps.push(SchemaMigrationStep::UnsupportedChange {
-                    entity: format!("node:{}", node.name),
-                    reason: format!(
-                        "node '{}' declares @rename_from(\"{}\") but no accepted node with that name exists",
-                        node.name, from
-                    ),
-                    code: None,
-                });
-            } else {
-                steps.push(SchemaMigrationStep::AddType {
-                    type_kind: SchemaTypeKind::Node,
-                    name: node.name.clone(),
-                });
-            }
             continue;
         };
 
-        consumed.insert(existing.name.clone());
+        consumed.insert(existing.type_id);
         if existing.name != node.name {
-            renames.insert(existing.name.clone(), node.name.clone());
             steps.push(SchemaMigrationStep::RenameType {
                 type_kind: SchemaTypeKind::Node,
                 from: existing.name.clone(),
@@ -303,9 +434,17 @@ fn plan_nodes(
             });
         }
 
-        if normalize_strings(&existing.implements, interface_renames)
-            != normalize_strings(&node.implements, &HashMap::new())
-        {
+        let accepted_implements = existing
+            .implements
+            .iter()
+            .map(|reference| reference.type_id)
+            .collect::<BTreeSet<_>>();
+        let desired_implements = node
+            .implements
+            .iter()
+            .map(|reference| reference.type_id)
+            .collect::<BTreeSet<_>>();
+        if accepted_implements != desired_implements {
             steps.push(SchemaMigrationStep::UnsupportedChange {
                 entity: format!("node:{}", node.name),
                 reason: format!(
@@ -323,7 +462,7 @@ fn plan_nodes(
             &node.annotations,
             steps,
         );
-        let property_renames = plan_properties(
+        plan_properties(
             SchemaTypeKind::Node,
             &node.name,
             &existing.properties,
@@ -335,14 +474,13 @@ fn plan_nodes(
             &node.name,
             &existing.constraints,
             &node.constraints,
-            &property_renames,
             steps,
         );
     }
 
     for leftover in accepted
         .iter()
-        .filter(|node| !consumed.contains(&node.name))
+        .filter(|node| !consumed.contains(&node.type_id))
     {
         // Node type removed from the desired schema: emit
         // DropType { Node, Soft } per docs/dev/schema-lint-v1-plan.md
@@ -358,56 +496,25 @@ fn plan_nodes(
             mode: DropMode::Soft,
         });
     }
-
-    renames
 }
 
-fn plan_edges(
-    accepted: &[EdgeIR],
-    desired: &[EdgeIR],
-    node_renames: &HashMap<String, String>,
-    steps: &mut Vec<SchemaMigrationStep>,
-) {
-    let accepted_by_name = accepted
+fn plan_edges(accepted: &[EdgeIR], desired: &[EdgeIR], steps: &mut Vec<SchemaMigrationStep>) {
+    let accepted_by_id = accepted
         .iter()
-        .map(|edge| (edge.name.as_str(), edge))
+        .map(|edge| (edge.type_id, edge))
         .collect::<HashMap<_, _>>();
     let mut consumed = HashSet::new();
 
     for edge in desired {
-        let rename_from = rename_from_value(&edge.annotations);
-        let matched = accepted_by_name
-            .get(edge.name.as_str())
-            .copied()
-            .or_else(|| {
-                rename_from.and_then(|from| {
-                    accepted_by_name
-                        .get(from)
-                        .copied()
-                        .filter(|candidate| candidate.name != edge.name)
-                })
+        let Some(existing) = accepted_by_id.get(&edge.type_id).copied() else {
+            steps.push(SchemaMigrationStep::AddType {
+                type_kind: SchemaTypeKind::Edge,
+                name: edge.name.clone(),
             });
-
-        let Some(existing) = matched else {
-            if let Some(from) = rename_from {
-                steps.push(SchemaMigrationStep::UnsupportedChange {
-                    entity: format!("edge:{}", edge.name),
-                    reason: format!(
-                        "edge '{}' declares @rename_from(\"{}\") but no accepted edge with that name exists",
-                        edge.name, from
-                    ),
-                    code: None,
-                });
-            } else {
-                steps.push(SchemaMigrationStep::AddType {
-                    type_kind: SchemaTypeKind::Edge,
-                    name: edge.name.clone(),
-                });
-            }
             continue;
         };
 
-        consumed.insert(existing.name.clone());
+        consumed.insert(existing.type_id);
         if existing.name != edge.name {
             steps.push(SchemaMigrationStep::RenameType {
                 type_kind: SchemaTypeKind::Edge,
@@ -416,9 +523,9 @@ fn plan_edges(
             });
         }
 
-        let normalized_from = normalize_type_ref(&existing.from_type, node_renames);
-        let normalized_to = normalize_type_ref(&existing.to_type, node_renames);
-        if normalized_from != edge.from_type || normalized_to != edge.to_type {
+        if existing.from_type.type_id != edge.from_type.type_id
+            || existing.to_type.type_id != edge.to_type.type_id
+        {
             steps.push(SchemaMigrationStep::UnsupportedChange {
                 entity: format!("edge:{}", edge.name),
                 reason: format!(
@@ -446,7 +553,7 @@ fn plan_edges(
             &edge.annotations,
             steps,
         );
-        let property_renames = plan_properties(
+        plan_properties(
             SchemaTypeKind::Edge,
             &edge.name,
             &existing.properties,
@@ -458,14 +565,13 @@ fn plan_edges(
             &edge.name,
             &existing.constraints,
             &edge.constraints,
-            &property_renames,
             steps,
         );
     }
 
     for leftover in accepted
         .iter()
-        .filter(|edge| !consumed.contains(&edge.name))
+        .filter(|edge| !consumed.contains(&edge.type_id))
     {
         // Edge type removed from the desired schema: emit
         // DropType { Edge, Soft } per docs/dev/schema-lint-v1-plan.md
@@ -486,44 +592,16 @@ fn plan_properties(
     accepted: &[PropertyIR],
     desired: &[PropertyIR],
     steps: &mut Vec<SchemaMigrationStep>,
-) -> HashMap<String, String> {
-    let accepted_by_name = accepted
+) {
+    let accepted_by_id = accepted
         .iter()
-        .map(|property| (property.name.as_str(), property))
+        .map(|property| (property.property_id, property))
         .collect::<HashMap<_, _>>();
     let mut consumed = HashSet::new();
-    let mut renames = HashMap::new();
 
     for property in desired {
-        let rename_from = rename_from_value(&property.annotations);
-        let matched = accepted_by_name
-            .get(property.name.as_str())
-            .copied()
-            .or_else(|| {
-                rename_from.and_then(|from| {
-                    accepted_by_name
-                        .get(from)
-                        .copied()
-                        .filter(|candidate| candidate.name != property.name)
-                })
-            });
-
-        let Some(existing) = matched else {
-            if let Some(from) = rename_from {
-                steps.push(SchemaMigrationStep::UnsupportedChange {
-                    entity: format!(
-                        "{}:{}.{}",
-                        schema_type_kind_key(type_kind),
-                        type_name,
-                        property.name
-                    ),
-                    reason: format!(
-                        "property '{}.{}' declares @rename_from(\"{}\") but no accepted property with that name exists",
-                        type_name, property.name, from
-                    ),
-                    code: None,
-                });
-            } else if property.prop_type.nullable {
+        let Some(existing) = accepted_by_id.get(&property.property_id).copied() else {
+            if property.prop_type.nullable {
                 steps.push(SchemaMigrationStep::AddProperty {
                     type_kind,
                     type_name: type_name.to_string(),
@@ -548,9 +626,8 @@ fn plan_properties(
             continue;
         };
 
-        consumed.insert(existing.name.clone());
+        consumed.insert(existing.property_id);
         if existing.name != property.name {
-            renames.insert(existing.name.clone(), property.name.clone());
             steps.push(SchemaMigrationStep::RenameProperty {
                 type_kind,
                 type_name: type_name.to_string(),
@@ -582,6 +659,65 @@ fn plan_properties(
             });
         }
 
+        if !embed_sources_semantically_equal(&existing.embed_source, &property.embed_source) {
+            steps.push(SchemaMigrationStep::UnsupportedChange {
+                entity: format!(
+                    "{}:{}.{}",
+                    schema_type_kind_key(type_kind),
+                    type_name,
+                    property.name
+                ),
+                reason: format!(
+                    "changing @embed source or model for '{}.{}' is not supported in schema migration v1; rebuild the graph so stored vectors and their declared embedding space cannot diverge",
+                    type_name, property.name
+                ),
+                code: None,
+            });
+        }
+
+        plan_property_constraints(
+            type_kind,
+            type_name,
+            &property.name,
+            &existing.property_constraints,
+            &property.property_constraints,
+            steps,
+        );
+
+        if existing.declared_directly != property.declared_directly {
+            steps.push(SchemaMigrationStep::UnsupportedChange {
+                entity: format!(
+                    "{}:{}.{}",
+                    schema_type_kind_key(type_kind),
+                    type_name,
+                    property.name
+                ),
+                reason: format!(
+                    "changing declaration provenance for '{}.{}' is not supported in schema migration v1",
+                    type_name, property.name
+                ),
+                code: None,
+            });
+        }
+
+        if stable_property_refs(&existing.satisfies_interface_properties)
+            != stable_property_refs(&property.satisfies_interface_properties)
+        {
+            steps.push(SchemaMigrationStep::UnsupportedChange {
+                entity: format!(
+                    "{}:{}.{}",
+                    schema_type_kind_key(type_kind),
+                    type_name,
+                    property.name
+                ),
+                reason: format!(
+                    "changing interface-property satisfaction links for '{}.{}' is not supported in schema migration v1",
+                    type_name, property.name
+                ),
+                code: None,
+            });
+        }
+
         plan_property_metadata(
             type_kind,
             type_name,
@@ -594,7 +730,7 @@ fn plan_properties(
 
     for leftover in accepted
         .iter()
-        .filter(|property| !consumed.contains(&property.name))
+        .filter(|property| !consumed.contains(&property.property_id))
     {
         // Property removed from the desired schema: emit
         // DropProperty { Soft } per docs/schema-lint-v1-plan.md
@@ -614,31 +750,108 @@ fn plan_properties(
             mode: DropMode::Soft,
         });
     }
+}
 
-    renames
+fn embed_sources_semantically_equal(
+    accepted: &Option<EmbedSourceIR>,
+    desired: &Option<EmbedSourceIR>,
+) -> bool {
+    match (accepted, desired) {
+        (None, None) => true,
+        (Some(accepted), Some(desired)) => {
+            accepted.source.owner_type_id == desired.source.owner_type_id
+                && accepted.source.property_id == desired.source.property_id
+                && accepted.model == desired.model
+        }
+        _ => false,
+    }
+}
+
+fn stable_property_refs(
+    references: &[PropertyRefIR],
+) -> BTreeSet<(StableTypeId, StablePropertyId)> {
+    references
+        .iter()
+        .map(|reference| (reference.owner_type_id, reference.property_id))
+        .collect()
+}
+
+fn plan_property_constraints(
+    type_kind: SchemaTypeKind,
+    type_name: &str,
+    property_name: &str,
+    accepted: &[PropertyConstraintShape],
+    desired: &[PropertyConstraintShape],
+    steps: &mut Vec<SchemaMigrationStep>,
+) {
+    let accepted = accepted.iter().copied().collect::<BTreeSet<_>>();
+    let desired = desired.iter().copied().collect::<BTreeSet<_>>();
+    let entity = format!(
+        "{}:{}.{}",
+        schema_type_kind_key(type_kind),
+        type_name,
+        property_name
+    );
+
+    if accepted.difference(&desired).next().is_some() {
+        steps.push(SchemaMigrationStep::UnsupportedChange {
+            entity: entity.clone(),
+            reason: format!(
+                "removing property constraints from '{}.{}' is not supported in schema migration v1",
+                type_name, property_name
+            ),
+            code: None,
+        });
+    }
+
+    for addition in desired.difference(&accepted) {
+        match addition {
+            PropertyConstraintShape::Index => {
+                let step = SchemaMigrationStep::AddConstraint {
+                    type_kind,
+                    type_name: type_name.to_string(),
+                    constraint: Constraint::Index(vec![property_name.to_string()]),
+                };
+                if !steps.contains(&step) {
+                    steps.push(step);
+                }
+            }
+            PropertyConstraintShape::Key | PropertyConstraintShape::Unique => {
+                steps.push(SchemaMigrationStep::UnsupportedChange {
+                    entity: entity.clone(),
+                    reason: format!(
+                        "adding a property-level @{} constraint to '{}.{}' is not supported in schema migration v1",
+                        match addition {
+                            PropertyConstraintShape::Key => "key",
+                            PropertyConstraintShape::Unique => "unique",
+                            PropertyConstraintShape::Index => unreachable!(),
+                        },
+                        type_name,
+                        property_name
+                    ),
+                    code: None,
+                });
+            }
+        }
+    }
 }
 
 fn plan_constraints(
     type_kind: SchemaTypeKind,
     type_name: &str,
-    accepted: &[Constraint],
-    desired: &[Constraint],
-    property_renames: &HashMap<String, String>,
+    accepted: &[ConstraintIR],
+    desired: &[ConstraintIR],
     steps: &mut Vec<SchemaMigrationStep>,
 ) {
-    let accepted = accepted
-        .iter()
-        .cloned()
-        .map(|constraint| rename_constraint_properties(constraint, property_renames))
-        .collect::<Vec<_>>();
     let desired_map = desired
         .iter()
         .cloned()
-        .map(|constraint| (constraint_key(&constraint), constraint))
+        .map(|constraint| (constraint_ir_key(&constraint), constraint))
         .collect::<BTreeMap<_, _>>();
     let accepted_map = accepted
-        .into_iter()
-        .map(|constraint| (constraint_key(&constraint), constraint))
+        .iter()
+        .cloned()
+        .map(|constraint| (constraint_ir_key(&constraint), constraint))
         .collect::<BTreeMap<_, _>>();
 
     let removed = accepted_map
@@ -661,12 +874,17 @@ fn plan_constraints(
         if accepted_map.contains_key(&key) {
             continue;
         }
-        match constraint {
-            Constraint::Index(_) => steps.push(SchemaMigrationStep::AddConstraint {
-                type_kind,
-                type_name: type_name.to_string(),
-                constraint,
-            }),
+        match &constraint {
+            ConstraintIR::Index { .. } => {
+                let step = SchemaMigrationStep::AddConstraint {
+                    type_kind,
+                    type_name: type_name.to_string(),
+                    constraint: constraint_from_ir(&constraint),
+                };
+                if !steps.contains(&step) {
+                    steps.push(step);
+                }
+            }
             _ => steps.push(SchemaMigrationStep::UnsupportedChange {
                 entity: format!("{}:{}", schema_type_kind_key(type_kind), type_name),
                 reason: format!(
@@ -824,82 +1042,47 @@ fn metadata_annotations(annotations: &[Annotation]) -> Vec<Annotation> {
         .collect()
 }
 
-fn normalize_strings(values: &[String], renames: &HashMap<String, String>) -> BTreeSet<String> {
-    values
-        .iter()
-        .map(|value| normalize_type_ref(value, renames))
-        .collect()
-}
+fn constraint_ir_key(constraint: &ConstraintIR) -> String {
+    use super::schema_ir::{FieldRefIR, SystemFieldRole};
 
-fn normalize_type_ref(value: &str, renames: &HashMap<String, String>) -> String {
-    renames
-        .get(value)
-        .cloned()
-        .unwrap_or_else(|| value.to_string())
-}
-
-fn rename_constraint_properties(
-    constraint: Constraint,
-    property_renames: &HashMap<String, String>,
-) -> Constraint {
+    let field = |field: &FieldRefIR| match field {
+        FieldRefIR::Property(reference) => format!(
+            "property:{}:{}",
+            reference.owner_type_id.get(),
+            reference.property_id.get()
+        ),
+        FieldRefIR::System(reference) => format!(
+            "system:{}:{}:{}",
+            reference.stable_table_id.get(),
+            reference.table_incarnation_id.get(),
+            match reference.role {
+                SystemFieldRole::Id => "id",
+                SystemFieldRole::Src => "src",
+                SystemFieldRole::Dst => "dst",
+            }
+        ),
+    };
+    let fields = |fields: &[FieldRefIR]| {
+        let mut keys = fields.iter().map(&field).collect::<Vec<_>>();
+        keys.sort();
+        keys.join(",")
+    };
     match constraint {
-        Constraint::Key(columns) => {
-            Constraint::Key(rename_constraint_columns(columns, property_renames))
-        }
-        Constraint::Unique(columns) => {
-            Constraint::Unique(rename_constraint_columns(columns, property_renames))
-        }
-        Constraint::Index(columns) => {
-            Constraint::Index(rename_constraint_columns(columns, property_renames))
-        }
-        Constraint::Range { property, min, max } => Constraint::Range {
-            property: normalize_property_ref(&property, property_renames),
+        ConstraintIR::Key { fields: values } => format!("key:{}", fields(values)),
+        ConstraintIR::Unique { fields: values } => format!("unique:{}", fields(values)),
+        ConstraintIR::Index { fields: values } => format!("index:{}", fields(values)),
+        ConstraintIR::Range {
+            field: value,
             min,
             max,
-        },
-        Constraint::Check { property, pattern } => Constraint::Check {
-            property: normalize_property_ref(&property, property_renames),
-            pattern,
-        },
-    }
-}
-
-fn rename_constraint_columns(
-    columns: Vec<String>,
-    property_renames: &HashMap<String, String>,
-) -> Vec<String> {
-    let mut columns = columns
-        .into_iter()
-        .map(|column| normalize_property_ref(&column, property_renames))
-        .collect::<Vec<_>>();
-    columns.sort();
-    columns
-}
-
-fn normalize_property_ref(value: &str, renames: &HashMap<String, String>) -> String {
-    renames
-        .get(value)
-        .cloned()
-        .unwrap_or_else(|| value.to_string())
-}
-
-fn constraint_key(constraint: &Constraint) -> String {
-    match constraint {
-        Constraint::Key(columns) => format!("key:{}", columns.join(",")),
-        Constraint::Unique(columns) => format!("unique:{}", columns.join(",")),
-        Constraint::Index(columns) => format!("index:{}", columns.join(",")),
-        Constraint::Range { property, min, max } => {
-            format!("range:{}:{:?}:{:?}", property, min, max)
+        } => {
+            format!("range:{}:{min:?}:{max:?}", field(value))
         }
-        Constraint::Check { property, pattern } => format!("check:{}:{}", property, pattern),
+        ConstraintIR::Check {
+            field: value,
+            pattern,
+        } => format!("check:{}:{pattern}", field(value)),
     }
-}
-
-fn rename_from_value(annotations: &[Annotation]) -> Option<&str> {
-    annotations
-        .iter()
-        .find(|annotation| annotation.name == "rename_from")
-        .and_then(|annotation| annotation.value.as_deref())
 }
 
 fn schema_type_kind_key(kind: SchemaTypeKind) -> &'static str {
@@ -912,7 +1095,10 @@ fn schema_type_kind_key(kind: SchemaTypeKind) -> &'static str {
 
 #[cfg(test)]
 mod tests {
-    use crate::catalog::schema_ir::build_schema_ir;
+    use crate::catalog::schema_ir::{
+        SchemaIdentityDomain, initialize_schema_ir, resolve_schema_ir,
+    };
+    use crate::catalog::schema_shape::compile_schema_shape;
     use crate::schema::parser::parse_schema;
 
     use super::SchemaMigrationStep::{
@@ -922,7 +1108,21 @@ mod tests {
     use super::*;
 
     fn ir(source: &str) -> crate::catalog::schema_ir::SchemaIR {
-        build_schema_ir(&parse_schema(source).unwrap()).unwrap()
+        let shape = compile_schema_shape(&parse_schema(source).unwrap()).unwrap();
+        initialize_schema_ir(
+            SchemaIdentityDomain::parse("01ARZ3NDEKTSV4RRFFQ69G5FAV").unwrap(),
+            &shape,
+        )
+        .unwrap()
+        .schema_ir
+    }
+
+    fn evolve(
+        accepted: &crate::catalog::schema_ir::SchemaIR,
+        source: &str,
+    ) -> crate::catalog::schema_ir::SchemaIR {
+        let shape = compile_schema_shape(&parse_schema(source).unwrap()).unwrap();
+        resolve_schema_ir(accepted, &shape).unwrap().schema_ir
     }
 
     const ENUM_ACCEPTED: &str = r#"
@@ -935,7 +1135,8 @@ node Ticket {
     #[test]
     fn plan_supports_pure_enum_widening() {
         let accepted = ir(ENUM_ACCEPTED);
-        let desired = ir(
+        let desired = evolve(
+            &accepted,
             r#"
 node Ticket {
     slug: String @key
@@ -944,7 +1145,10 @@ node Ticket {
 "#,
         );
         let plan = plan_schema_migration(&accepted, &desired).unwrap();
-        assert!(plan.supported, "widening must be a supported plan: {plan:?}");
+        assert!(
+            plan.supported,
+            "widening must be a supported plan: {plan:?}"
+        );
         assert!(plan.steps.contains(&SchemaMigrationStep::ExtendEnum {
             type_kind: SchemaTypeKind::Node,
             type_name: "Ticket".to_string(),
@@ -958,7 +1162,8 @@ node Ticket {
         // Enum values are sorted + deduped by the schema IR, so a reorder is
         // type-identical — no step at all, not even a widening.
         let accepted = ir(ENUM_ACCEPTED);
-        let desired = ir(
+        let desired = evolve(
+            &accepted,
             r#"
 node Ticket {
     slug: String @key
@@ -981,7 +1186,8 @@ node Ticket {
         // RenameProperty first, then ExtendEnum carrying the post-rename name
         // (the sequential-consumer contract pinned on the variant's doc).
         let accepted = ir(ENUM_ACCEPTED);
-        let desired = ir(
+        let desired = evolve(
+            &accepted,
             r#"
 node Ticket {
     slug: String @key
@@ -991,9 +1197,9 @@ node Ticket {
         );
         let plan = plan_schema_migration(&accepted, &desired).unwrap();
         assert!(plan.supported, "rename+widen must be supported: {plan:?}");
-        let rename_pos = plan.steps.iter().position(|s| {
-            matches!(s, RenameProperty { from, to, .. } if from == "status" && to == "state")
-        });
+        let rename_pos = plan.steps.iter().position(
+            |s| matches!(s, RenameProperty { from, to, .. } if from == "status" && to == "state"),
+        );
         let widen_pos = plan.steps.iter().position(|s| {
             matches!(
                 s,
@@ -1002,7 +1208,10 @@ node Ticket {
             )
         });
         let (Some(rename_pos), Some(widen_pos)) = (rename_pos, widen_pos) else {
-            panic!("expected RenameProperty + ExtendEnum, got: {:?}", plan.steps);
+            panic!(
+                "expected RenameProperty + ExtendEnum, got: {:?}",
+                plan.steps
+            );
         };
         assert!(
             rename_pos < widen_pos,
@@ -1019,7 +1228,7 @@ node Ticket {
             // rename of a variant (doing -> in_progress) = remove + add
             "node Ticket {\n    slug: String @key\n    status: enum(todo, in_progress, done)\n}\n",
         ] {
-            let desired = ir(desired_src);
+            let desired = evolve(&accepted, desired_src);
             let plan = plan_schema_migration(&accepted, &desired).unwrap();
             assert!(!plan.supported, "must be unsupported: {desired_src}");
             assert!(
@@ -1035,7 +1244,8 @@ node Ticket {
     #[test]
     fn plan_rejects_widening_combined_with_nullability_change() {
         let accepted = ir(ENUM_ACCEPTED);
-        let desired = ir(
+        let desired = evolve(
+            &accepted,
             r#"
 node Ticket {
     slug: String @key
@@ -1050,7 +1260,10 @@ node Ticket {
     #[test]
     fn plan_rejects_enum_to_free_string_and_back() {
         let accepted = ir(ENUM_ACCEPTED);
-        let free = ir("node Ticket {\n    slug: String @key\n    status: String\n}\n");
+        let free = evolve(
+            &accepted,
+            "node Ticket {\n    slug: String @key\n    status: String\n}\n",
+        );
         let plan = plan_schema_migration(&accepted, &free).unwrap();
         assert!(!plan.supported, "enum->String must stay unsupported");
         let plan_back = plan_schema_migration(&free, &accepted).unwrap();
@@ -1059,31 +1272,22 @@ node Ticket {
 
     #[test]
     fn plan_supports_additive_nullable_property_and_index() {
-        let accepted = build_schema_ir(
-            &parse_schema(
-                r#"
+        let accepted = ir(r#"
 node Person {
     name: String @key
     age: I32?
 }
-"#,
-            )
-            .unwrap(),
-        )
-        .unwrap();
-        let desired = build_schema_ir(
-            &parse_schema(
-                r#"
+"#);
+        let desired = evolve(
+            &accepted,
+            r#"
 node Person {
     name: String @key
     age: I32? @index
     nickname: String?
 }
 "#,
-            )
-            .unwrap(),
-        )
-        .unwrap();
+        );
 
         let plan = plan_schema_migration(&accepted, &desired).unwrap();
         assert!(plan.supported);
@@ -1098,32 +1302,31 @@ node Person {
             type_name: "Person".to_string(),
             constraint: Constraint::Index(vec!["age".to_string()]),
         }));
+        assert_eq!(
+            plan.steps
+                .iter()
+                .filter(|step| matches!(step, AddConstraint { type_kind: SchemaTypeKind::Node, type_name, constraint: Constraint::Index(fields) } if type_name == "Person" && fields == &["age"]))
+                .count(),
+            1,
+            "property and table constraint classification must not duplicate the supported index step"
+        );
     }
 
     #[test]
     fn plan_supports_explicit_type_and_property_rename() {
-        let accepted = build_schema_ir(
-            &parse_schema(
-                r#"
+        let accepted = ir(r#"
 node User {
     name: String @key
 }
-"#,
-            )
-            .unwrap(),
-        )
-        .unwrap();
-        let desired = build_schema_ir(
-            &parse_schema(
-                r#"
+"#);
+        let desired = evolve(
+            &accepted,
+            r#"
 node Account @rename_from("User") {
     full_name: String @key @rename_from("name")
 }
 "#,
-            )
-            .unwrap(),
-        )
-        .unwrap();
+        );
 
         let plan = plan_schema_migration(&accepted, &desired).unwrap();
         assert!(plan.supported);
@@ -1149,29 +1352,20 @@ node Account @rename_from("User") {
         // projection. Verified at the integration level by
         // `apply_schema_drops_a_nullable_property_softly_preserves_prior_version`
         // in `crates/omnigraph/tests/schema_apply.rs`.
-        let accepted = build_schema_ir(
-            &parse_schema(
-                r#"
+        let accepted = ir(r#"
 node Person {
     name: String @key
     age: I32?
 }
-"#,
-            )
-            .unwrap(),
-        )
-        .unwrap();
-        let desired = build_schema_ir(
-            &parse_schema(
-                r#"
+"#);
+        let desired = evolve(
+            &accepted,
+            r#"
 node Person {
     name: String @key
 }
 "#,
-            )
-            .unwrap(),
-        )
-        .unwrap();
+        );
 
         let plan = plan_schema_migration(&accepted, &desired).unwrap();
         assert!(
@@ -1210,9 +1404,7 @@ node Person {
         // at the integration level by
         // `apply_schema_drops_node_and_referencing_edge_softly`
         // in `crates/omnigraph/tests/schema_apply.rs`.
-        let accepted = build_schema_ir(
-            &parse_schema(
-                r#"
+        let accepted = ir(r#"
 node Person {
     name: String @key
 }
@@ -1222,22 +1414,15 @@ node Company {
 }
 
 edge WorksAt: Person -> Company
-"#,
-            )
-            .unwrap(),
-        )
-        .unwrap();
-        let desired = build_schema_ir(
-            &parse_schema(
-                r#"
+"#);
+        let desired = evolve(
+            &accepted,
+            r#"
 node Person {
     name: String @key
 }
 "#,
-            )
-            .unwrap(),
-        )
-        .unwrap();
+        );
 
         let plan = plan_schema_migration(&accepted, &desired).unwrap();
         assert!(plan.supported, "drop-type plan must be supported: {plan:?}");
@@ -1275,29 +1460,20 @@ node Person {
 
     #[test]
     fn plan_rejects_required_property_addition() {
-        let accepted = build_schema_ir(
-            &parse_schema(
-                r#"
+        let accepted = ir(r#"
 node Person {
     name: String @key
 }
-"#,
-            )
-            .unwrap(),
-        )
-        .unwrap();
-        let desired = build_schema_ir(
-            &parse_schema(
-                r#"
+"#);
+        let desired = evolve(
+            &accepted,
+            r#"
 node Person {
     name: String @key
     age: I32
 }
 "#,
-            )
-            .unwrap(),
-        )
-        .unwrap();
+        );
 
         let plan = plan_schema_migration(&accepted, &desired).unwrap();
         assert!(!plan.supported);
@@ -1311,28 +1487,19 @@ node Person {
 
     #[test]
     fn plan_supports_metadata_only_annotation_changes() {
-        let accepted = build_schema_ir(
-            &parse_schema(
-                r#"
+        let accepted = ir(r#"
 node Person @description("old") {
     name: String @key
 }
-"#,
-            )
-            .unwrap(),
-        )
-        .unwrap();
-        let desired = build_schema_ir(
-            &parse_schema(
-                r#"
+"#);
+        let desired = evolve(
+            &accepted,
+            r#"
 node Person @description("new") {
     name: String @key
 }
 "#,
-            )
-            .unwrap(),
-        )
-        .unwrap();
+        );
 
         let plan = plan_schema_migration(&accepted, &desired).unwrap();
         assert!(plan.supported);
@@ -1345,6 +1512,179 @@ node Person @description("new") {
                 kwargs: Default::default(),
             }],
         }));
+    }
+
+    #[test]
+    fn plan_rejects_embed_source_or_model_changes() {
+        let accepted = ir(r#"
+node Doc {
+    slug: String @key
+    title: String
+    body: String
+    embedding: Vector(3) @embed("body", model="model-a")
+}
+"#);
+
+        for desired_source in [
+            r#"
+node Doc {
+    slug: String @key
+    title: String
+    body: String
+    embedding: Vector(3) @embed("title", model="model-a")
+}
+"#,
+            r#"
+node Doc {
+    slug: String @key
+    title: String
+    body: String
+    embedding: Vector(3) @embed("body", model="model-b")
+}
+"#,
+        ] {
+            let desired = evolve(&accepted, desired_source);
+            let plan = plan_schema_migration(&accepted, &desired).unwrap();
+            assert!(!plan.supported);
+            assert!(plan.steps.iter().any(|step| matches!(
+                step,
+                UnsupportedChange { entity, reason, .. }
+                    if entity == "node:Doc.embedding" && reason.contains("@embed")
+            )));
+        }
+    }
+
+    #[test]
+    fn plan_keeps_embed_binding_supported_across_type_and_source_property_rename() {
+        let accepted = ir(r#"
+node Doc {
+    body: String
+    embedding: Vector(3) @embed("body", model="model-a")
+}
+"#);
+        let desired = evolve(
+            &accepted,
+            r#"
+node Article @rename_from("Doc") {
+    text: String @rename_from("body")
+    embedding: Vector(3) @embed("text", model="model-a")
+}
+"#,
+        );
+
+        let plan = plan_schema_migration(&accepted, &desired).unwrap();
+        assert!(
+            plan.supported,
+            "diagnostic rename text is not embed identity: {plan:?}"
+        );
+        assert!(plan.steps.iter().any(|step| matches!(
+            step,
+            RenameType { from, to, .. } if from == "Doc" && to == "Article"
+        )));
+        assert!(plan.steps.iter().any(|step| matches!(
+            step,
+            RenameProperty { from, to, .. } if from == "body" && to == "text"
+        )));
+        assert!(!plan.steps.iter().any(|step| matches!(
+            step,
+            UnsupportedChange { reason, .. } if reason.contains("@embed")
+        )));
+    }
+
+    #[test]
+    fn plan_normalizes_composite_constraint_field_identity_order_across_rename() {
+        let accepted = ir(r#"
+node Pair {
+    alpha: String
+    beta: String
+    @unique(alpha, beta)
+}
+"#);
+        let desired = evolve(
+            &accepted,
+            r#"
+node Pair {
+    zeta: String @rename_from("alpha")
+    beta: String
+    @unique(zeta, beta)
+}
+"#,
+        );
+
+        let plan = plan_schema_migration(&accepted, &desired).unwrap();
+        assert!(
+            plan.supported,
+            "field order is not constraint identity: {plan:?}"
+        );
+        assert_eq!(
+            plan.steps
+                .iter()
+                .filter(|step| matches!(step, RenameProperty { .. }))
+                .count(),
+            1
+        );
+        assert!(
+            !plan
+                .steps
+                .iter()
+                .any(|step| matches!(step, UnsupportedChange { .. }))
+        );
+    }
+
+    #[test]
+    fn plan_classifies_property_constraint_provenance_and_satisfaction_changes() {
+        let accepted = ir("node N { value: String @unique }");
+        let desired = evolve(&accepted, "node N { value: String @unique(value) }");
+        let plan = plan_schema_migration(&accepted, &desired).unwrap();
+        assert!(!plan.supported);
+        assert!(plan.steps.iter().any(|step| matches!(
+            step,
+            UnsupportedChange { entity, reason, .. }
+                if entity == "node:N.value" && reason.contains("property constraints")
+        )));
+
+        let accepted = ir("interface A { value: String } node N implements A {}");
+        let desired = evolve(
+            &accepted,
+            "interface A { value: String } node N implements A { value: String }",
+        );
+        let plan = plan_schema_migration(&accepted, &desired).unwrap();
+        assert!(!plan.supported);
+        assert!(plan.steps.iter().any(|step| matches!(
+            step,
+            UnsupportedChange { entity, reason, .. }
+                if entity == "node:N.value" && reason.contains("declaration provenance")
+        )));
+
+        let accepted = ir(
+            "interface A { value: String } interface B { value: String } node N implements A, B {}",
+        );
+        let desired = evolve(
+            &accepted,
+            "interface A { value: String } interface B { value: String } node N implements A {}",
+        );
+        let plan = plan_schema_migration(&accepted, &desired).unwrap();
+        assert!(!plan.supported);
+        assert!(plan.steps.iter().any(|step| matches!(
+            step,
+            UnsupportedChange { entity, reason, .. }
+                if entity == "node:N.value" && reason.contains("satisfaction links")
+        )));
+    }
+
+    #[test]
+    fn plan_guard_rejects_unclassified_zero_step_ir_change() {
+        let accepted = ir("node N { value: String }");
+        let mut desired = accepted.clone();
+        desired.next_identity_id += 1;
+
+        let plan = plan_schema_migration(&accepted, &desired).unwrap();
+        assert!(!plan.supported);
+        assert!(plan.steps.iter().any(|step| matches!(
+            step,
+            UnsupportedChange { entity, reason, .. }
+                if entity == "schema" && reason.contains("unclassified")
+        )));
     }
 
     #[test]

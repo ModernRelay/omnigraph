@@ -18,16 +18,17 @@ authority.
 - No `RunRecord`, no `_graph_runs.lance`, no `_graph_run_actors.lance`.
 - No `omnigraph run *` CLI subcommands and no `/runs/*` HTTP endpoints.
 - No `__run__<id>` staging branches; `__run__*` is no longer a reserved
-  name. The branch-name guard was removed in MR-770, and any stale
-  `__run__*` branch on an upgraded graph is swept off `__manifest` by the
-  v2→v3 internal-schema migration on first read-write open. (The inert
-  `_graph_runs.lance` bytes remain until a `delete_prefix` primitive lands.)
+  name. The branch-name guard was removed in MR-770. Historically, the v2→v3
+  in-place migration swept stale `__run__*` entries; the current v5 strand is
+  strict single-version, so older graphs are refused and rebuilt by
+  export/init/load rather than migrated on open. (Inert `_graph_runs.lance`
+  bytes in an old export source remain irrelevant to the rebuilt graph.)
 - Cancelled mutation futures leave **no graph-visible state** unless the
   manifest publish already completed. Before that point they can leave
   reclaimable uncommitted Lance files, or sidecar-covered committed table
   effects that the next quiesced recovery rolls forward/compensates. A
   first-touch named-branch write can also leave a target table ref, but it is
-  never created without ownership: the schema-v3 sidecar is durable first and
+  never created without ownership: the identity-bearing v9 sidecar is durable first and
   names that `(table_path, target ref)`. Reclaim and `cleanup` treat any
   matching pending sidecar as a hard stop. Quiesced full recovery accepts both
   logical crash shapes — sidecar durable with no ref yet, or an exact untouched
@@ -62,7 +63,7 @@ Mutation and load use a closed prepare → effect → publish attempt:
 4. on a pre-effect mismatch, discard the complete attempt. Append/Insert/Merge
    reprepare with a bounded retry; strict Update/Delete/Overwrite return typed
    `ReadSetChanged`;
-5. arm a schema-v3 recovery sidecar. For each deferred first-touch table, create
+5. arm an identity-bearing v9 recovery sidecar. For each deferred first-touch table, create
    its target ref, stage branch-local files on that ref, and bind the staged
    transaction to the pre-minted UUID. Then commit every planned transaction
    with zero transparent conflict retries, confirm exact transaction UUIDs and
@@ -78,7 +79,7 @@ The native branch identifier detects delete/recreate ABA but is not a Lance
 conditional-ref fence, and destructive recovery remains unsafe beside a live
 foreign process.
 
-### Branch-merge authority and recovery adapter (RFC-022 v4)
+### Branch-merge authority and recovery adapter (RFC-022, v9 envelope)
 
 Branch merge retains its writer-specific row classifier and multi-commit table
 algorithms, but its authority, recovery, and visibility boundary now use the
@@ -100,7 +101,7 @@ RFC-022 adapter contract:
    advance is allowed: the contract is "merge the captured source commit," never
    "substitute whatever source is latest";
 4. pre-mint the merge lineage and each table's ordered Lance data-transaction
-   chain, then arm a schema-v4 BranchMerge sidecar before the first HEAD advance
+   chain, then arm an identity-bearing v9 BranchMerge sidecar before the first HEAD advance
    or first-touch table ref. Logical data steps commit with those exact
    `(read_version, uuid)` identities and zero transparent conflict retries. Its
    physical-effect set can be smaller than its intended manifest delta:
@@ -112,7 +113,7 @@ RFC-022 adapter contract:
    table expectations.
 
 Publisher retries cannot re-parent the prepared merge onto a newer target. Any
-failure after the v4 sidecar is durable returns `RecoveryRequired`. Full recovery
+failure after the v9 sidecar is durable returns `RecoveryRequired`. Full recovery
 rolls confirmed effects forward only while the captured target authority still
 matches; otherwise it compensates the owned effects while preserving the target
 winner, or fails closed when foreign/interleaved table state makes compensation
@@ -380,9 +381,10 @@ Before Phase A, under the writer's final schema → branch → table gates, exis
 physical targets must still match their manifest pins. Ahead drift is never folded
 or claimed by manufacturing a new sidecar; it is attributed to an existing recovery
 intent or refused with explicit `omnigraph repair` guidance. First-touch targets use
-the separate sidecar-before-ref protocol. SchemaApply also verifies that AddType and
-RenameType target dataset paths are absent, so recovery cannot register an orphan or
-foreign dataset as if this apply created it.
+the separate sidecar-before-ref protocol. SchemaApply also verifies that every AddType
+target dataset path is absent, so recovery cannot register an orphan or foreign dataset
+as if this apply created it. A pure type rename is metadata-only and retains the same
+identity, incarnation, path, and Lance version.
 
 1. **Phase A**: writer writes a sidecar JSON to
    `__recovery/{ulid}.json` BEFORE its first independently durable physical
@@ -390,54 +392,56 @@ foreign dataset as if this apply created it.
    (`commit_staged`, or `compact_files` for `optimize_all_tables`,
    which advances the Lance HEAD via a reserve-fragments + rewrite
    commit rather than a staged write). The
-   sidecar names every `(table_key, table_path, expected_version,
-   post_commit_pin)` it intends to commit + the writer kind +
-   actor_id.
+   sidecar names every `(stable_table_id, incarnation_id, table_key,
+   table_path, expected_version, post_commit_pin)` it intends to commit + the
+   writer kind + actor_id.
    For a first-touch named-branch Mutation/Load table, Phase A is followed by
-   target-ref creation and branch-local `stage_*`; the schema-v3 sidecar already
-   carries its pre-minted transaction identity. Branch merge uses schema v4:
-   it distinguishes multi-commit HEAD effects from ref-only forks, records each
+   target-ref creation and branch-local `stage_*`; the v9 sidecar already
+   carries its pre-minted transaction identity. Branch merge's v9 envelope
+   distinguishes multi-commit HEAD effects from ref-only forks, records each
    multi-commit effect's ordered exact transaction chain, and records the
-   complete intended manifest delta, including pointer-only slots. SchemaApply
-   uses schema v7: it captures the main native branch identity, exact optional
+   complete intended manifest delta, including pointer-only slots. SchemaApply's
+   v9 envelope captures the main native branch identity, exact optional
    graph head, accepted schema identity, fixed original lineage + initiating
-   actor, and fixed rollback id. Every existing-table overwrite and AddType /
-   RenameType first-touch create has one pre-minted Lance transaction identity;
-   the latter is a strict read-version-zero create. The sidecar also carries the
+   actor, and fixed rollback id. Every existing-table overwrite and AddType
+   first-touch create has one pre-minted Lance transaction identity; the latter
+   is a strict read-version-zero create. The sidecar also carries the
    complete registration/update/tombstone delta, including metadata-only applies
-   whose table-effect set is empty. Readers retain the old schema-v5 target-hash
-   + Phase-C-confirmation bridge semantics for files written by older binaries;
-   v5 table effects remain loose and are never reinterpreted as v7. EnsureIndices
-   uses schema v8: it captures native branch + graph-head + schema authority,
-   fixed original and rollback lineage, one pre-minted mixed CreateIndex
+   whose table-effect set is empty. EnsureIndices' v9 envelope captures native
+   branch + graph-head + schema authority, fixed original and rollback lineage,
+   one pre-minted mixed CreateIndex
    transaction per touched table, and the complete table-pointer delta. A
    first-touch effect also records its inherited source version and later binds
-   the exact created ref identity. Readers retain schema-v6 EnsureIndices files
-   as a narrow compatibility bridge under their original loose classification
-   and fixed-rollback semantics; v6 is never reinterpreted as v8 ownership.
+   the exact created ref identity. The persisted writer-specific payload field
+   names (`protocol_v3`, `protocol_v4`, `protocol_v7`, and `protocol_v8`) remain
+   for shape continuity, but every active writer emits schema v9 and every
+   ownership-bearing field carries the stable identity pair. Pre-v9 files are
+   never upgraded by alias inference or serde defaults.
 2. **Phase B**: writer's per-table `commit_staged` loop runs.
-   - **Phase-B confirmation:** a schema-v4 `BranchMerge` writer
+   - **Phase-B confirmation:** a v9 `BranchMerge` writer
      advances each table's HEAD by *several* exact commits (append → upsert →
      delete). Recovery proves a contiguous prefix of the pre-armed transaction
      chain rather than inferring ownership from numeric HEAD movement. After the
      whole per-table loop finishes, the writer atomically confirms each exact
      achieved version, the complete logical manifest delta, and first-touch ref
-     identities, then proceeds to Phase C. Schema-v3 Mutation/Load sidecars also confirm: each table must
+     identities, then proceeds to Phase C. V9 Mutation/Load sidecars also
+     confirm: each table must
      match the staged Lance transaction's `(read_version, uuid)`, and the
      sidecar records the exact `SubTableUpdate` plus original lineage intent.
      This is the commit point of the recovery WAL: a crash *after* confirmation
      rolls forward only when the captured branch token still matches; a crash
-     *during* Phase B (sidecar still unconfirmed) rolls back. Schema-v7
+     *during* Phase B (sidecar still unconfirmed) rolls back. V9
      SchemaApply follows the same boundary with writer-specific effects: exact
      `Overwrite` for an existing table and exact version-one `Create` for a new
      target path, all committed with zero transparent conflict retries. After
      every achieved identity/version and all schema staging files are durable,
      it confirms the complete registration/update/tombstone delta and moves
-     `Armed → EffectsConfirmed`. Schema-v8 EnsureIndices likewise requires one
+     `Armed → EffectsConfirmed`. V9 EnsureIndices likewise requires one
      exact achieved transaction at `read_version + 1` per table, binds every
      first-touch ref identity, confirms the complete table-pointer delta, and
-     only then moves `Armed → EffectsConfirmed`. Optimize's bounded schema-v2
-     adapter intentionally has no exact confirmation boundary.
+     only then moves `Armed → EffectsConfirmed`. Optimize also emits an
+     identity-bearing v9 envelope, but its bounded maintenance payload
+     intentionally has no exact caller-minted transaction confirmation boundary.
 3. **Phase C**: publisher commits the manifest.
 4. **Phase D**: writer deletes the sidecar.
 
@@ -454,25 +458,30 @@ A failure between Phase A and Phase D leaves the sidecar on disk. The
 next `Omnigraph::open` (gated on `OpenMode::ReadWrite`) runs the
 recovery sweep in `crates/omnigraph/src/db/manifest/recovery.rs`:
 
+All current writers emit sidecar schema v9. The JSON field names
+`protocol_v3`, `protocol_v4`, `protocol_v7`, and `protocol_v8` are retained
+payload-version names for mutation/load, BranchMerge, SchemaApply, and
+EnsureIndices respectively; they do not mean the outer envelope is pre-v9.
+
 - For each sidecar in `__recovery/`, compare every named table's
   Lance HEAD to the manifest pin. Classify per the all-or-nothing
   decision tree (RolledPastExpected / NoMovement / UnexpectedAtP1 /
   UnexpectedMultistep / IncompletePhaseB / InvariantViolation). For a
-  legacy `BranchMerge` sidecar, a moved HEAD with no `confirmed_version`
+  `BranchMerge` payload, a moved HEAD with no `confirmed_version`
   classifies as `IncompletePhaseB` (a partial multi-commit publish) and forces
   roll-back; with a `confirmed_version`, roll-forward targets exactly that
-  version. Schema-v4 BranchMerge recovery additionally requires the captured
+  version. The v9 BranchMerge envelope's `protocol_v4` payload additionally requires the captured
   target token, fixed original/rollback lineage ids, the exact ordered data
   transaction chains, exact confirmed physical effects, first-touch ref
   identities, and the complete confirmed manifest delta. A changed target token
   is rollback-only and can never re-parent the merge onto the winner. Recovery
   refuses a foreign or non-contiguous transaction instead of restoring through
   it, and recognizes an already-landed exact compensation restore on restart.
-  Schema-v3 Mutation/Load additionally requires `EffectsConfirmed`, the exact
+  The v9 Mutation/Load envelope's `protocol_v3` payload additionally requires `EffectsConfirmed`, the exact
   Lance transaction identity at the confirmed version, the original immutable
   manifest delta, and a matching captured authority token. A changed token is
   rollback-only; an unknown/foreign effect is refused rather than adopted.
-  Schema-v7 SchemaApply applies the same exact-ownership rule to each existing
+  The v9 SchemaApply envelope's `protocol_v7` payload applies the same exact-ownership rule to each existing
   overwrite and first-touch create, and additionally binds accepted + target
   schema identities, fixed original/rollback lineage, the initiating actor, and
   its complete registration/update/tombstone delta. `Armed` is rollback-only;
@@ -481,14 +490,14 @@ recovery sweep in `crates/omnigraph/src/db/manifest/recovery.rs`:
   authority winner is preserved while recovery compensates only owned effects.
   If foreign movement buries an owned same-table effect, recovery fails closed
   with the sidecar intact instead of restoring through or adopting the winner.
-  Schema-v8 EnsureIndices applies the exact rule to each one-transaction mixed
+  The v9 EnsureIndices envelope's `protocol_v8` payload applies the exact rule to each one-transaction mixed
   index batch: the observed transaction UUID/read version and achieved
   `expected + 1` version must match the plan, `EffectsConfirmed` must carry the
   complete fixed table-pointer delta, and a first-touch named branch must retain
   the confirmed Lance ref identity. Changed authority is rollback-only; a
-  foreign or buried index commit is never adopted or restored through. Schema-v6
-  files continue through the old loose classifier rather than being upgraded in
-  place.
+  foreign or buried index commit is never adopted or restored through. A
+  pre-v9 identity-less file is refused rather than upgraded or classified by
+  mutable alias.
   First-touch rollback deletes only the exact owned version-one dataset and only
   while no manifest registration or competing recovery claim owns the path. A
   foreign winner at an unregistered first-touch path is left untouched and is
@@ -511,14 +520,13 @@ recovery sweep in `crates/omnigraph/src/db/manifest/recovery.rs`:
   sidecar on disk for operator review.
 - Otherwise, if every table is `RolledPastExpected`, **roll forward**:
   a single `ManifestBatchPublisher::publish` call extends every pin
-  atomically. For schema-v7 SchemaApply, the exact fixed manifest outcome lands
+  atomically. For v9 SchemaApply, the exact fixed manifest outcome lands
   first; only then does the writer or recovery promote the matching staged
   source/IR/state contract. A crash after one or two renames is completed by
   proving that fixed commit + delta visible and validating every remaining/live
-  file against the same target identity. Schema-v5 bridge files retain their
-  older confirmation-and-live-target recovery rule.
+  file against the same target identity.
 - Read-only open performs this check without repairing anything: it may serve an
-  unpublished v7 attempt against the old manifest/schema pair, but it returns
+  unpublished v9 attempt against the old manifest/schema pair, but it returns
   `RecoveryRequired` when the fixed original manifest outcome is visible and the
   target schema identity is not yet fully live. A read-write open completes it.
 - On a live handle, query, export, graph-index, and blob-read capture takes the
@@ -540,13 +548,11 @@ recovery sweep in `crates/omnigraph/src/db/manifest/recovery.rs`:
 - After a successful roll-forward or roll-back, an internal
   `_graph_commit_recoveries.lance` row records `recovery_kind`,
   `recovery_for_actor` (the original sidecar's actor), `operation_id`, and
-  exact per-table outcomes. Schema-v3 Mutation/Load, schema-v4 BranchMerge,
-  schema-v7 SchemaApply, and schema-v8 EnsureIndices roll-forward publish the
+  exact per-table outcomes. V9 Mutation/Load, BranchMerge, SchemaApply, and
+  EnsureIndices roll-forward publish the
   interrupted writer's fixed lineage intent, including its original actor.
-  Schema-v7/v8 rollback reuse their pre-minted recovery commit ids and durable
-  audit plans, with the recovery actor. Schema-v6 EnsureIndices files retain
-  that compatibility behavior under their original loose classification.
-  Other rollback and legacy recovery commits use
+  Their rollback paths reuse pre-minted recovery commit ids and durable audit
+  plans, with the recovery actor. Other rollback and legacy recovery commits use
   `actor_id = "omnigraph:recovery"`. Ordinary
   commit history is therefore not a complete recovery enumeration, and the
   CLI currently has no public query for the recovery-audit table.
@@ -569,19 +575,18 @@ sidecar lifetime. RFC-022 mutation/load writers hold the complete order. Branch
 merge holds schema plus source/target branch authority for its whole attempt and
 then the all-catalog source/target table envelope. SchemaApply holds schema → main
 branch → every live table; EnsureIndices holds schema → target branch → every table
-in its durable work plan. SchemaApply's schema-v7 payload is its full exact adapter:
+in its durable work plan. SchemaApply's v9 envelope is its full exact adapter:
 it holds fixed authority/lineage and exact table identities from arm through one
 `ExactGraphHead` publish, including an empty effect set for metadata-only changes.
 Its owned first-touch cleanup and partial-table rollback happen only during Full
-recovery; the in-process healer remains roll-forward-only. Schema-v5 remains a
-backward-compatible bridge reader, not the current writer. EnsureIndices' current
-schema-v8 payload holds fixed authority/lineage, one exact mixed-index transaction
+recovery; the in-process healer remains roll-forward-only. EnsureIndices' current
+v9 envelope holds fixed authority/lineage, one exact mixed-index transaction
 per table, the complete manifest delta, and exact first-touch ownership from arm
 through one `ExactGraphHead` publish. `Armed` is rollback-only;
 `EffectsConfirmed` rolls forward only while the captured authority still matches.
-Schema-v6 files remain backward-compatible bridge inputs with their original loose
-classification and fixed rollback plan. Optimize uses bounded schema-v2 effect
-provenance with one graph-wide visibility envelope. Its entry recovery probe is
+Pre-v9 sidecars are never completed by inferring identity from their aliases.
+Optimize uses bounded effect provenance inside an identity-bearing v9 graph-wide
+visibility envelope. Its entry recovery probe is
 a fast path; it then acquires schema → main branch → every accepted-catalog table gate,
 loads one operation-local accepted catalog, relists recovery, and plans productive work
 from one fresh snapshot. All productive tables share one multi-pin Optimize sidecar;
@@ -590,9 +595,9 @@ or deletes recovery independently. After every effect settles, one maintenance-c
 monotonic batch CAS publishes every still-needed pointer and one lineage commit. A
 pointer already at or beyond Optimize's achieved version is converged and omitted rather
 than forcing strict graph-head OCC. Any post-arm error returns `RecoveryRequired` and
-leaves the shared intent for all-or-nothing v2 recovery. Main remains held through final
+leaves the shared intent for all-or-nothing v9 recovery. Main remains held through final
 physical-only `__manifest` compaction so a new main recovery intent cannot arm before raw
-manifest movement finishes. The v2 loose classification has no exact
+manifest movement finishes. The bounded Optimize classifier has no exact
 transaction/authority/fixed-lineage proof and therefore stays within the documented
 single-writer-process recovery model. Replacing it with exact provenance is deferred
 until Lance exposes a stable public caller-controlled transaction API for the complete
@@ -661,12 +666,12 @@ concurrent graph commit anywhere on the target branch therefore invalidates the
 prepared authority instead of silently reparenting it. Before effects, an
 insert-only mutation or Append/Merge load fully reprepares with a bounded retry; strict
 Update/Delete/Overwrite and branch merge return `ReadSetChanged`; after any
-effect, any later error returns `RecoveryRequired` and leaves the fixed v3/v4/v7/v8
+effect, any later error returns `RecoveryRequired` and leaves the fixed v9
 intent durable. SchemaApply does not transparently reprepare after arming: a lost
 authority token is resolved by exact recovery, preserving a disjoint winner or
 failing closed on a buried same-table effect. EnsureIndices follows the same rule
-without transparent post-arm reprepare. Optimize instead uses the bounded schema-v2
-maintenance arbitration described above; its exact-provenance upgrade is deferred
+without transparent post-arm reprepare. Optimize instead uses the bounded
+maintenance payload inside the same v9 identity envelope; its exact-provenance upgrade is deferred
 behind the upstream transaction-API and distributed-fencing triggers.
 
 **Sidecar I/O failure semantics** (all sidecar I/O goes through the
@@ -693,11 +698,9 @@ storage-fault failpoints `recovery.sidecar_{write,delete,list}` /
   `RecoveryRequired` when any schema-staging artifact is present because the
   malformed intent may be the only proof of a committed-but-unpromoted
   SchemaApply.
-- **Legacy schema-v5 SchemaApply sidecar**: read-only open admits only the
-  provably completed residue (`schema_apply_manifest_published = true` and the
-  target schema identity already live). Marker-false or target-mismatched v5
-  intents still return `RecoveryRequired`; they need the mutable legacy
-  recovery path.
+- **Pre-v9 identity-less sidecar**: refused loudly. The v5 storage strand is
+  rebuilt rather than upgraded in place, and recovery never infers table
+  ownership from a mutable alias or path.
 - **Audit append fails after a roll-forward publish**: that recovery
   attempt errors and keeps the sidecar; re-entry sees the
   already-published manifest, records exactly one `RolledForward`
@@ -742,7 +745,7 @@ does not yet have a public CLI query.
 `db/manifest/migrations.rs` is the single place the on-disk `__manifest` shape is
 reconciled with what the binary expects. Storage is **strict-single-version** (the
 strand model): this binary reads exactly ONE internal-schema version
-(`MIN_SUPPORTED == CURRENT == 4`), so there is no in-place migration.
+(`MIN_SUPPORTED == CURRENT == 5`), so there is no in-place migration.
 
 - **Graph creation** stamps `omnigraph:internal_schema_version` at CURRENT, so a
   fresh graph always opens.
@@ -760,8 +763,8 @@ strand model): this binary reads exactly ONE internal-schema version
   recipe).
 
 The stamp history (v1 PK-less, v2 unenforced-PK, v3 `__run__*` sweep, v4 lineage
-in `__manifest` with the commit-graph tables retired) is recorded on the
-`INTERNAL_MANIFEST_SCHEMA_VERSION` doc-comment; only v4 is served. An earlier-stamped
+in `__manifest` with the commit-graph tables retired, v5 stable table identity)
+is recorded on the `INTERNAL_MANIFEST_SCHEMA_VERSION` doc-comment; only v5 is served. An earlier-stamped
 graph is rebuilt via export/import, not migrated in place.
 
 ## Mid-query partial failure: closed by MR-794

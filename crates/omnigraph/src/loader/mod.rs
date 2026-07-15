@@ -498,12 +498,13 @@ async fn load_jsonl_reader_once<R: BufRead>(
             .await?;
         staging.ensure_path(
             &table_key,
+            opened.identity,
             opened.full_path,
             opened.table_branch,
             opened.deferred_fork,
             opened.expected_version,
             load_op_kind,
-        );
+        )?;
         let schema = batch.schema();
         staging.append_batch(&table_key, schema, pending_mode, batch)?;
         result.nodes_loaded.insert(type_name, loaded_count);
@@ -534,12 +535,13 @@ async fn load_jsonl_reader_once<R: BufRead>(
             .await?;
         staging.ensure_path(
             &table_key,
+            opened.identity,
             opened.full_path,
             opened.table_branch,
             opened.deferred_fork,
             opened.expected_version,
             load_op_kind,
-        );
+        )?;
         let schema = batch.schema();
         staging.append_batch(&table_key, schema, pending_mode, batch)?;
         result.edges_loaded.insert(edge_name, loaded_count);

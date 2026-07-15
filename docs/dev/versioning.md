@@ -32,6 +32,12 @@ The below-CURRENT refusal names the release line that wrote the stamp
 the exact `export` / `init` / `load` commands, so the upgrade is fail-closed **and**
 self-service — the operator can fetch the right old binary without guessing.
 
+Internal schema v5 is the RFC-028 identity boundary: SchemaIR v2, its graph
+identity domain and allocator, and the identity-keyed manifest journal activate
+together. A v4 graph cannot be backfilled safely because its logical IDs,
+registration keys, paths, versions, and tombstones are all name-derived; the
+normal strand rebuild mints a fresh domain and table incarnations instead.
+
 There is no in-place migration dispatcher. The single source file
 `db/manifest/migrations.rs` holds only the version constant, the stamp read/write,
 and `refuse_if_stamp_unsupported`.
