@@ -163,7 +163,7 @@ async fn plan_schema_for_apply_from_accepted(
     }
 
     let mut desired_catalog = build_catalog_from_ir(&desired_ir)?;
-    fixup_blob_schemas(&mut desired_catalog);
+    fixup_physical_schemas(&mut desired_catalog)?;
     Ok(PlannedSchemaApply {
         plan,
         desired_ir,
@@ -262,7 +262,7 @@ where
     let (accepted_ir, accepted_schema_state) =
         load_validated_schema_contract(db.uri(), Arc::clone(&db.storage)).await?;
     let mut accepted_catalog = build_catalog_from_ir(&accepted_ir)?;
-    fixup_blob_schemas(&mut accepted_catalog);
+    fixup_physical_schemas(&mut accepted_catalog)?;
     let accepted_catalog = Arc::new(accepted_catalog);
     let planned =
         plan_schema_for_apply_from_accepted(db, desired_schema_source, options, &accepted_ir)

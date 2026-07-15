@@ -1,9 +1,11 @@
 mod helpers;
 
 use std::fs;
+use std::io::Write;
 
 use arrow_array::{Array, Int32Array, UInt64Array};
 use futures::TryStreamExt;
+use lance::Dataset;
 use lance_index::is_system_index;
 
 use omnigraph::db::commit_graph::CommitGraph;
@@ -98,6 +100,28 @@ query update_doc_note($title: String, $note: String) {
 }
 "#;
 
+const WIDE_BLOB_SCHEMA: &str = r#"
+node Document {
+    title: String @key
+    first: Blob?
+    second: Blob?
+}
+"#;
+
+fn write_sized_external_blob(path: &std::path::Path, bytes: u64) {
+    const BLOCK_BYTES: usize = 1024 * 1024;
+
+    let mut file = fs::File::create(path).unwrap();
+    let block = vec![0x5a_u8; BLOCK_BYTES];
+    let mut remaining = bytes;
+    while remaining > 0 {
+        let write = remaining.min(BLOCK_BYTES as u64) as usize;
+        file.write_all(&block[..write]).unwrap();
+        remaining -= write as u64;
+    }
+    file.flush().unwrap();
+}
+
 async fn init_search_db(dir: &tempfile::TempDir) -> Omnigraph {
     let uri = dir.path().to_str().unwrap();
     let mut db = Omnigraph::init(uri, SEARCH_SCHEMA).await.unwrap();
@@ -119,6 +143,22 @@ async fn init_db_from_schema_and_data(
         .await
         .unwrap();
     db
+}
+
+async fn assert_exact_id_primary_key_on_branch(db: &Omnigraph, branch: &str, table_key: &str) {
+    let snapshot = db.snapshot_of(ReadTarget::branch(branch)).await.unwrap();
+    let dataset = snapshot.open(table_key).await.unwrap();
+    let primary_key = dataset
+        .schema()
+        .unenforced_primary_key()
+        .iter()
+        .map(|field| field.name.clone())
+        .collect::<Vec<_>>();
+    assert_eq!(
+        primary_key,
+        ["id"],
+        "branch {branch} table {table_key} must preserve exactly `id` as its Lance unenforced primary key"
+    );
 }
 
 #[tokio::test]
@@ -162,6 +202,7 @@ async fn branch_create_open_list_and_lazy_branching_work() {
     );
     assert_eq!(inherited_person.table_version, main_person.table_version);
     assert_eq!(inherited_person.table_branch.as_deref(), None);
+    assert_exact_id_primary_key_on_branch(&feature, "feature", "node:Person").await;
 
     mutate_branch(
         &mut feature,
@@ -187,6 +228,7 @@ async fn branch_create_open_list_and_lazy_branching_work() {
         snap.entry("edge:Knows").unwrap().table_branch.as_deref(),
         None
     );
+    assert_exact_id_primary_key_on_branch(&feature, "feature", "node:Person").await;
 
     let main = Omnigraph::open(uri).await.unwrap();
     assert_eq!(count_rows(&main, "node:Person").await, 4);
@@ -494,6 +536,110 @@ async fn branch_merge_with_external_blob_uri_materializes_payload() {
         .unwrap();
     let external_bytes = external.read().await.unwrap();
     assert_eq!(&external_bytes[..], b"External");
+}
+
+/// Blob descriptors are tiny even when their referenced payload is not. The
+/// merge planner must account from `BlobFile::size()` before reading bytes,
+/// both for one over-limit cell and for several individually-valid cells whose
+/// row total exceeds 32 MiB. Both failures are entirely pre-effect.
+#[tokio::test]
+async fn branch_merge_rejects_oversized_blob_payloads_pre_effect() {
+    const LIMIT: u64 = 32 * 1024 * 1024;
+
+    for (case, first_bytes, second_bytes, expected_actual) in [
+        ("single", LIMIT + 1, None, LIMIT + 1),
+        ("cumulative", LIMIT / 2 + 1, Some(LIMIT / 2 + 1), LIMIT + 2),
+    ] {
+        let dir = tempfile::tempdir().unwrap();
+        let graph_path = dir.path().join("graph");
+        let graph_uri = graph_path.to_str().unwrap();
+        let first_path = dir.path().join("first.blob");
+        write_sized_external_blob(&first_path, first_bytes);
+        let first_uri = format!("file://{}", first_path.display());
+
+        let mut wide_data = serde_json::Map::new();
+        wide_data.insert(
+            "title".to_string(),
+            serde_json::Value::String(format!("wide-{case}")),
+        );
+        wide_data.insert("first".to_string(), serde_json::Value::String(first_uri));
+        if let Some(second_bytes) = second_bytes {
+            let second_path = dir.path().join("second.blob");
+            write_sized_external_blob(&second_path, second_bytes);
+            wide_data.insert(
+                "second".to_string(),
+                serde_json::Value::String(format!("file://{}", second_path.display())),
+            );
+        }
+        let wide_row = serde_json::json!({
+            "type": "Document",
+            "data": serde_json::Value::Object(wide_data),
+        })
+        .to_string();
+
+        let mut db = Omnigraph::init(graph_uri, WIDE_BLOB_SCHEMA).await.unwrap();
+        let base = r#"{"type":"Document","data":{"title":"base"}}"#;
+        load_jsonl(&mut db, base, LoadMode::Overwrite)
+            .await
+            .unwrap();
+        db.branch_create("feature").await.unwrap();
+        db.load(
+            "feature",
+            &format!("{base}\n{wide_row}"),
+            LoadMode::Overwrite,
+        )
+        .await
+        .unwrap();
+
+        let before = snapshot_main(&db).await.unwrap();
+        let before_manifest = before.version();
+        let entry = before.entry("node:Document").unwrap();
+        let before_table = entry.table_version;
+        let table_uri = format!(
+            "{}/{}",
+            db.uri().trim_end_matches('/'),
+            entry.table_path.trim_start_matches('/')
+        );
+        let before_head = Dataset::open(&table_uri).await.unwrap().version().version;
+        let before_commits = db.list_commits(Some("main")).await.unwrap().len();
+
+        let error = db.branch_merge("feature", "main").await.unwrap_err();
+        assert!(
+            matches!(
+                error,
+                OmniError::ResourceLimitExceeded {
+                    ref resource,
+                    limit: LIMIT,
+                    actual,
+                } if resource == "materialized blob payload bytes"
+                    && actual == expected_actual
+            ),
+            "{case}: oversized blob merge must return the typed pre-read limit, got {error:?}"
+        );
+        let after = snapshot_main(&db).await.unwrap();
+        assert_eq!(after.version(), before_manifest, "{case}: manifest moved");
+        assert_eq!(
+            after.entry("node:Document").unwrap().table_version,
+            before_table,
+            "{case}: main table pointer moved"
+        );
+        assert_eq!(
+            Dataset::open(&table_uri).await.unwrap().version().version,
+            before_head,
+            "{case}: main Lance HEAD moved"
+        );
+        assert_eq!(count_rows(&db, "node:Document").await, 1);
+        assert_eq!(
+            db.list_commits(Some("main")).await.unwrap().len(),
+            before_commits,
+            "{case}: main lineage moved"
+        );
+        let recovery_dir = graph_path.join("__recovery");
+        assert!(
+            !recovery_dir.exists() || std::fs::read_dir(recovery_dir).unwrap().next().is_none(),
+            "{case}: pre-effect rejection must not leave a recovery sidecar"
+        );
+    }
 }
 
 #[tokio::test]

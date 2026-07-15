@@ -789,6 +789,7 @@ pub(crate) async fn run_query(
         (status = 401, description = "Unauthorized", body = ErrorOutput),
         (status = 403, description = "Forbidden", body = ErrorOutput),
         (status = 409, description = "Write-authority conflict", body = ErrorOutput),
+        (status = 413, description = "Keyed write exceeds the per-commit row or byte ceiling", body = ErrorOutput),
         (status = 429, description = "Per-actor admission cap exceeded; honor `Retry-After` header", body = ErrorOutput),
         (status = 503, description = "An overlapping durable recovery intent must be resolved before retry", body = ErrorOutput),
     ),
@@ -839,6 +840,7 @@ pub(crate) async fn server_change(
         (status = 401, description = "Unauthorized", body = ErrorOutput),
         (status = 403, description = "Forbidden", body = ErrorOutput),
         (status = 409, description = "Write-authority conflict", body = ErrorOutput),
+        (status = 413, description = "Keyed write exceeds the per-commit row or byte ceiling", body = ErrorOutput),
         (status = 429, description = "Per-actor admission cap exceeded; honor `Retry-After` header", body = ErrorOutput),
         (status = 503, description = "An overlapping durable recovery intent must be resolved before retry", body = ErrorOutput),
     ),
@@ -908,6 +910,7 @@ pub(crate) fn parse_optional_invoke_body(
         (status = 403, description = "Forbidden (the inner `change` gate for a stored mutation)", body = ErrorOutput),
         (status = 404, description = "Unknown stored query, or `invoke_query` denied — indistinguishable to a caller without the grant", body = ErrorOutput),
         (status = 409, description = "Stored mutation write-authority conflict", body = ErrorOutput),
+        (status = 413, description = "Stored keyed mutation exceeds the per-commit row or byte ceiling", body = ErrorOutput),
         (status = 429, description = "Per-actor admission cap exceeded; honor `Retry-After` header", body = ErrorOutput),
         (status = 500, description = "Policy evaluation error (a denial is reported as 404, not 500)", body = ErrorOutput),
         (status = 503, description = "A stored mutation is blocked by a durable recovery intent", body = ErrorOutput),
@@ -1304,6 +1307,7 @@ async fn run_ingest(
         (status = 401, description = "Unauthorized", body = ErrorOutput),
         (status = 403, description = "Forbidden", body = ErrorOutput),
         (status = 409, description = "Prepared load authority changed before effects", body = ErrorOutput),
+        (status = 413, description = "Keyed load exceeds the per-commit row or byte ceiling", body = ErrorOutput),
         (status = 429, description = "Per-actor admission cap exceeded; honor `Retry-After` header", body = ErrorOutput),
         (status = 503, description = "An overlapping durable recovery intent must be resolved before retry", body = ErrorOutput),
     ),
@@ -1312,8 +1316,8 @@ async fn run_ingest(
 /// Bulk-load NDJSON data into a branch (canonical load endpoint).
 ///
 /// `data` is NDJSON with one record per line. `mode` controls behavior on
-/// existing rows: `merge` upserts by id (default), `append` blindly inserts,
-/// `overwrite` replaces table contents. Branch creation is opt-in by
+/// existing rows: `merge` upserts by id (default), `append` strictly inserts
+/// absent ids, and `overwrite` replaces table contents. Branch creation is opt-in by
 /// presence of `from`: with `from` set, a missing `branch` is created from
 /// it; without `from`, `branch` must already exist — a missing branch is a
 /// 404, never an implicit fork. **Destructive** when `mode` is `overwrite`
@@ -1350,6 +1354,7 @@ pub(crate) async fn server_load(
         (status = 401, description = "Unauthorized", body = ErrorOutput),
         (status = 403, description = "Forbidden", body = ErrorOutput),
         (status = 409, description = "Prepared load authority changed before effects", body = ErrorOutput),
+        (status = 413, description = "Keyed load exceeds the per-commit row or byte ceiling", body = ErrorOutput),
         (status = 429, description = "Per-actor admission cap exceeded; honor `Retry-After` header", body = ErrorOutput),
         (status = 503, description = "An overlapping durable recovery intent must be resolved before retry", body = ErrorOutput),
     ),
@@ -1574,6 +1579,7 @@ pub(crate) async fn server_branch_delete(
         (status = 401, description = "Unauthorized", body = ErrorOutput),
         (status = 403, description = "Forbidden", body = ErrorOutput),
         (status = 409, description = "Merge conflict", body = ErrorOutput),
+        (status = 413, description = "Merge row, byte, or recovery-chain ceiling exceeded before effects", body = ErrorOutput),
         (status = 429, description = "Per-actor admission cap exceeded; honor `Retry-After` header", body = ErrorOutput),
         (status = 503, description = "An overlapping durable recovery intent must be resolved before retry", body = ErrorOutput),
     ),

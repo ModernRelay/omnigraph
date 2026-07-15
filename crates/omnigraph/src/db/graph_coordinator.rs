@@ -200,6 +200,13 @@ impl GraphCoordinator {
         self.manifest.probe_latest_incarnation().await
     }
 
+    /// Clone the already-loaded lineage projection. This performs no storage
+    /// I/O; branch merge uses it to compute the base from the same coordinator
+    /// instances that supplied source/target authority.
+    pub(crate) async fn load_commits(&self) -> Result<Vec<GraphCommit>> {
+        self.commit_graph.load_commits().await
+    }
+
     /// Refresh only the manifest (not the commit graph). The read path uses this
     /// on a stale same-branch probe: a read pins its snapshot by manifest version
     /// and never needs the commit graph, so a full `refresh` (which also scans

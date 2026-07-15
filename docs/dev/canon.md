@@ -3,7 +3,7 @@
 **Audience:** maintainers, contributors, and coding agents — internal
 **Type:** narrative reference ("the book"), read top-to-bottom
 **Status:** living document
-**Surveyed:** OmniGraph 0.8.1 development (`main`); Lance 9.0.0-beta.21 (git rev `1aec1465`); internal manifest schema v5
+**Surveyed:** OmniGraph 0.8.1 development (`main`), with the v6/0.10.x format work present; Lance 9.0.0-beta.21 (git rev `1aec1465`); internal manifest schema v6
 
 ---
 
@@ -56,7 +56,9 @@ that substrate it adds:
    write — mutation, bulk load, schema apply, branch merge, index build —
    follows one state machine: prepare against a pinned authority token, arm a
    durable recovery intent, apply exact physical effects, publish exactly one
-   manifest CAS. Crash anywhere and recovery converges all-or-nothing.
+   manifest CAS. Within the documented single-writer-process recovery boundary,
+   a crash leaves enough durable evidence for a later quiesced read-write open
+   to converge the fixed outcome all-or-nothing.
 3. **Multi-modal querying in one runtime.** A `.gq` query can combine vector
    `nearest`, BM25/FTS, Reciprocal Rank Fusion, property filters, and graph
    traversal (`Expand`, anti-join) against one snapshot.
@@ -309,13 +311,15 @@ Two mechanisms make concurrent publishes safe:
   landing the same row — **row-level CAS**. Without it, Lance's transparent
   rebase would admit silent duplicates from racing publishers.
 - Same-branch writers all touch the shared `graph_head:<branch>` row, so even
-  commits to *disjoint tables* contend there: one wins, the other retries and
-  re-parents inside the publisher's retry loop. This closes the
+  commits to *disjoint tables* contend there: one wins and the other's exact
+  publish precondition fails. Only a writer whose semantics permit it may then
+  discard the whole effect-free attempt and reprepare from fresh authority; the
+  publisher never re-parents a prepared intent. This closes the
   disjoint-table-fork race and yields a linear per-branch chain (pinned by the
   N-writer convergence tests).
 
 The internal manifest schema is stamped
-(`omnigraph:internal_schema_version`, currently v5) and **strict
+(`omnigraph:internal_schema_version`, currently v6) and **strict
 single-version** — see [the strand model](#schema-and-migration--the-strand-model).
 
 ---
@@ -403,21 +407,47 @@ in the hot path. Compose mixed work as two mutations, or a branch for one
 atomic commit.
 
 At end-of-query, `stage_all` prepares exactly one staged Lance transaction per
-touched table (append / merge-insert deduped by id / deletion-vector delete /
-overwrite), still without moving HEAD. Then the gates are acquired, the full
-authority token revalidated, the identity-bearing v9 recovery envelope armed,
-tables committed with
+touched table (exact-`id` fenced strict insert or upsert / deletion-vector
+delete / overwrite), still without moving HEAD. A keyed Mutation/Load table
+above 8,192 rows or 32 MiB fails here with `ResourceLimitExceeded`, before
+recovery arm. Bare Lance Append is not a production graph-write route. External
+Blob URI cells on keyed Append/Merge are size-summed before payload reads and
+materialized under the same 32 MiB ceiling because Lance merge-insert has no
+`WriteParams` hook; Overwrite retains external references. Then the gates are
+acquired, the full authority token revalidated, the identity-bearing v9
+recovery envelope armed, tables committed with
 their exact pre-minted transaction identities and **zero transparent conflict
 retries**, and the pre-minted lineage published under the exact
 native-branch/head + table-version precondition.
+
+Pure keyed insertions also leave a durable, inductive proof link in Lance
+history: `omnigraph.insert_absence = "v1"`. StrictInsert mints it only after
+the exact target-ID preflight; an all-new Upsert may mint it only when Lance's
+completed statistics prove one attempt inserted every row and changed/skipped
+nothing. Upsert certification is optional—an unfamiliar shape disables the
+optimization, not the logical write. The marker is accepted only with an exact
+parent, filtered insertion-only `Update`, full nested schema field-ID preorder,
+physical-row totals, and the rest of the structural proof; it is not a
+cryptographic trust signal for raw Lance writers.
 
 Failure semantics are typed by *when* the failure happens:
 
 - **Before any effect** (validation failure, or authority changed):
   the attempt is discarded whole. Insert-only mutations and Append/Merge loads
-  silently reprepare from fresh authority with a bounded retry; strict
+  may reprepare from fresh authority with a bounded retry after unrelated
+  authority movement; load Append remains strict insert. Strict
   Update/Delete/Overwrite (and branch merge) return `ReadSetChanged` (HTTP 409)
-  — a stale plan is never rebased onto a moved base.
+  — a stale plan is never rebased onto a moved base. A pre-existing or
+  effect-free concurrent strict same-key match is terminal `KeyConflict`
+  (HTTP 409) only after a fresh manifest-visible probe finds an attempted ID;
+  a broad storage conflict without that exact match becomes an internal
+  `ReadSetChanged`, causing bounded full strict-mode reprepare rather than a
+  false duplicate. An effect-free upsert conflict likewise reprepares the
+  entire operation and reruns validation. Those
+  effect-free key outcomes are Mutation/Load `protocol_v3` behavior;
+  BranchMerge retains its armed `protocol_v4` chain and returns
+  `RecoveryRequired` for any chunk conflict, even before its first owned table
+  effect.
 - **After any effect**: any later error returns `RecoveryRequired` (HTTP 503)
   and leaves the sidecar authoritative. This is deliberately *not* a retry
   loop — the fixed outcome converges through recovery, preserving the
@@ -443,7 +473,7 @@ writer describes its physical effects to the shared coordinator:
 | Writer | Sidecar schema | Physical shape |
 |---|---|---|
 | Mutation / Load | v9 (`protocol_v3` payload) | one exact staged transaction per touched table |
-| Branch merge | v9 (`protocol_v4` payload) | an *ordered chain* of exact transactions per table (append → upsert → delete), pointer-only deltas recorded too |
+| Branch merge | v9 (`protocol_v4` payload) | new and changed keyed rows use actual chunks capped at 8,192 rows / 32 MiB in a pre-minted exact-`id` strict-insert/upsert chain, capped at 1,024 logical data transactions per table; deletes and pointer-only deltas are recorded too. Exact recovery scans at most 1,026 versions so one allowed index tail and one compensating restore remain classifiable |
 | Schema apply | v9 (`protocol_v7` payload) | exact `Overwrite` per rewritten table + strict read-version-zero `Create` per new type; a pure rename retains its existing identity/path/version. The payload also carries the schema registration/rename/tombstone delta (a metadata-only apply has an empty effect set but still arms — schema staging is durable state) |
 | EnsureIndices | v9 (`protocol_v8` payload) | one pre-minted *mixed* CreateIndex transaction per table (every missing BTREE + FTS + full-table vector together) |
 | Optimize | v9 (bounded payload) | compaction + index folds have **no** public caller-controlled Lance transaction identity, so Optimize keeps looser, bounded provenance inside the identity-bearing envelope: one graph-wide sidecar pinning the complete productive set, one monotonic batch CAS for visibility. Exact provenance is trigger-gated on upstream API + distributed fencing |
@@ -557,9 +587,15 @@ retention — named snapshots as authoritative retention roots — is
 
 ### Three-way merge
 
-`branch_merge` computes the merge base from captured commit IDs, classifies
-row-by-row against immutable base/source/target snapshots (ordered cursor
-merge, batched staging writer), and publishes one atomic manifest update.
+`branch_merge` computes the merge base from captured commit IDs and publishes
+one atomic manifest update. Its general route classifies row-by-row against
+immutable base/source/target snapshots (ordered cursor merge, batched staging
+writer). A proven insertion-only descendant instead verifies every contiguous
+v1 certificate in the complete source-history interval: exact parent and UUID,
+filtered insertion-only `Update`, no rewrite/update residue, full nested schema
+preorder, physical-row totals, stable identity/path/row IDs, and native ancestry.
+It then streams the exact source row-version interval through the same bounded
+fenced transaction chain without the general ordered diff or temporary delta.
 Conflicts are typed (`DivergentInsert`, `DivergentUpdate`, `DeleteVsUpdate`,
 `OrphanEdge`, plus constraint violations re-checked Δ-scoped at the merge
 boundary) and surface as structured 409s. The merge-pair truth table test pins
@@ -573,12 +609,25 @@ pre-mints each table's exact ordered transaction chain, so recovery proves a
 contiguous prefix of *this merge's* commits rather than inferring ownership
 from version arithmetic.
 
-Cost honesty: an append-only fast-forward routes new rows through cheap
-appends (structurally pinned — the test asserts *which* staged primitive runs,
-not a timing threshold), but a diverged merge still classifies full-width;
+Cost honesty: a keyed append-only fast-forward routes proven new rows through
+bounded exact-`id` filtered transactions—never committed Append—and the test
+structurally pins that writer, zero target-ID preflights, zero target merge
+joins, and zero ordered-diff cursors. Lance `InsertBuilder` only stages the
+immutable files; OmniGraph replaces its uncommitted Append descriptor with the
+certified `Update`, so a second branch generation can prove the output again.
+Both source and existing-target native ref incarnations are revalidated under
+the final gates. A first-touch lazy target does not enter this data-replay route;
+it keeps the ref-only fork. Missing or unfamiliar history falls back to the
+general ordered diff. A diverged or unproven merge still classifies full-width;
 its `__manifest` open amplification still grows with history. O(delta) merge
 via row-version lineage is **(research-blocked RFC-027)** — the deletion-delta
 source doesn't exist yet — and fragment-adoption merge is **(draft RFC-0001)**.
+
+The final predeclared five-pair production series passed the fixed bulk gates.
+At 10K rows, median production/comparator operation time was 31/8 ms
+(**3.875×**) and maximum signed paired peak-RSS overhead was 24,297,472 bytes;
+at 100K it was 136/35 ms (**about 3.886×**) and 32,604,160 bytes. Every route,
+exact-content, and setup/operation/verification phase check passed.
 
 ---
 
@@ -600,7 +649,7 @@ enum bumps no table version. Destructive or narrowing changes are refused
 
 **Storage versioning is strict single-version** (the strand model,
 [versioning.md](versioning.md)): this binary reads exactly one internal
-manifest schema (`MIN_SUPPORTED == CURRENT == 5`). An older graph is refused
+manifest schema (`MIN_SUPPORTED == CURRENT == 6`). An older graph is refused
 with a self-service export/import rebuild recipe naming the right old release;
 a newer graph is refused with "upgrade omnigraph". There is deliberately no
 in-place migration dispatcher — that machinery is permanent liability (every
@@ -611,11 +660,16 @@ it if a concrete graph ever demands it. Note the four version axes (release /
 wire / storage / Lance) have deliberately different policies — conflating them
 is how you ship a silent misread or carry migration code you don't need.
 
-Internal schema v5 implements [RFC-028](../rfcs/0028-stable-schema-identity.md):
+Internal schema v5 introduced [RFC-028](../rfcs/0028-stable-schema-identity.md):
 accepted SchemaIR v2 owns one graph identity domain and monotonic allocator;
 type/property IDs survive explicit renames, while drop/re-add mints a new table
 identity and incarnation. Manifest rows, paths, OCC, and recovery carry that
-identity pair instead of reconstructing ownership from a mutable name.
+identity pair instead of reconstructing ownership from a mutable name. The
+currently served v6 format preserves that identity model and adds RFC-023:
+every graph table declares exact non-null physical `id` as Lance's unenforced
+PK from creation, and every production insert/upsert uses the filter-bearing
+keyed adapter. Moving from v5 to v6 is rebuild-only; the genuine cross-version
+binary rebuild/refusal run passed on 2026-07-15.
 
 ---
 
@@ -735,11 +789,13 @@ What is guaranteed, from strongest to most bounded:
 2. **Same-process concurrency** — fully arbitrated: shared root-scoped gates
    order writers, healers, and recovery; readers are never gated; capture-time
    coherence protects snapshot/catalog pairs.
-3. **Cross-process, non-destructive** — safe by CAS: the publisher's exact
-   precondition admits one winner; losers get typed conflicts
-   (`ReadSetChanged`/`RecoveryRequired`), never silent rebase. Concurrent
-   multi-process writers on one graph are *functional* but documented as
-   one-winner-CAS territory, not a supported high-contention topology.
+3. **Cross-process, failure-free non-destructive commit arbitration** — an
+   individual fenced table transaction plus the publisher's exact CAS
+   precondition admits one same-key winner; losers get typed conflicts
+   (`KeyConflict`/`ReadSetChanged`/`RecoveryRequired`), never silent key merge.
+   This does not make recovery beside a live foreign writer safe. Concurrent
+   multi-process writers on one graph are *functional* in the failure-free
+   one-winner-CAS case, not a supported high-contention or failover topology.
 4. **Cross-process, destructive recovery** — **the documented boundary.**
    Recovery's rollback (`Dataset::restore`) and first-touch reclaim are unsafe
    beside a live writer in *another process*: Lance's restore silently orphans
@@ -834,19 +890,24 @@ this section is the orientation summary, not the authority.
 **Solid and shipped:** the unified write protocol with exact per-writer
 recovery (RFC-022 implemented 2026-07-13, across PRs #343–#353); manifest-atomic
 multi-table publish with lineage-in-CAS; branches/commits/time-travel/merge
-with typed conflicts; the strand storage model (v5); multi-modal query runtime;
-unified Δ-scoped validation; engine-wide Cedar; cluster control plane and
+with typed conflicts; the strict-strand storage model; unified Δ-scoped
+validation; engine-wide Cedar; cluster control plane and
 cluster-only serving; the warm read-path cost contract; sealed write surface;
 the full failpoint/recovery test lattice; stable schema identity and table
-incarnation (RFC-028, internal schema v5).
+incarnation (RFC-028, introduced in internal schema v5).
 
 **Explicitly bounded:** Optimize's v9 recovery envelope (bounded maintenance
 provenance; exact provenance trigger-gated on upstream API + distributed fencing); destructive
 recovery's single-writer-process boundary; merge cost at divergence
 (full-width classification).
 
-**Roadmap / draft:** substrate-native key-conflict fencing **(RFC-023, draft;
-substrate probes landed, production routing unchanged)**; durable table heads /
+**Implemented:** substrate-native key-conflict fencing **(RFC-023, internal
+schema v6)**, including the sealed production routing/PK/error/recovery
+contract, the inductive insertion-absence certificate, bounded branch replay,
+cross-version rebuild/refusal evidence, duplicate-repair runbook, and passed
+10K/100K production latency/RSS acceptance series.
+
+**Roadmap / draft:** durable table heads /
 heads format **(RFC-024, draft)**; checkpoint-pinned retention **(RFC-025,
 draft)**; MemWAL streaming ingest **(RFC-026, draft)**; lineage-based merge
 deltas **(RFC-027, research-blocked)**; background reconciler; planner
@@ -861,12 +922,12 @@ resource budgets.
 |---|---|---|
 | **R1: Destructive recovery beside a live foreign process.** Lance restore orphans concurrent commits; no conditional ref primitives; gates are process-local. | High | Documented single-writer-process support boundary; exact ownership prevents false adoption; distributed fence (lease on the schema-apply lock branch) is the sketched close **(roadmap)**. Do not promote multi-process write topologies before it exists. |
 | **R2: Pre-stable Lance pin.** 9.0.0-beta.21 via git rev; betas have regressed mid-line before (blob reads broke in beta.13, fixed beta.15). Blocks crates.io publishing (v0.8.1 is binaries-only; v0.9.0 gated on 9.0.0 stable). | High | Full alignment audit per bump (all commits reviewed, findings in [lance.md](lance.md)); surface guards as first smoke check; `cargo test --workspace` as the alignment gate, never the build alone. |
-| **R3: Keyed-write fencing rests on engine revalidation, not a substrate primitive.** Lance's key-filter behavior is route-dependent and directional (probed 2026-07-14). | Medium | Branch-head CAS serializes same-branch commits; Δ-scoped revalidation runs on reprepare; RFC-023 owns the substrate-native fence behind a fleet/format barrier; guards pin both conflict orders so an upstream symmetry change forces an audit. |
+| **R3: RFC-023 consumes a beta.21 route-dependent key-filter primitive.** Lance's filter emission and filtered/unfiltered resolution are directional (probed 2026-07-14). | Medium | v6 closes production insertion-bearing routes through exact-`id`, forced-v2 filtered staging and source-guards bare Append; the adapter verifies the emitted field-ID filter and effect-aware recovery refuses ambiguity. Guards pin both conflict orders so any upstream symmetry/route change forces an audit. Three-run release evidence passed the 1M forced-v2 50 ms median / 256 MiB max-RSS thresholds (29 ms / 243,875,840 bytes). |
 | **R4: Manifest fold cost grows with commit count.** Current-state resolution folds history. | Medium | `optimize` compacts internal tables (keeps periodically-optimized graphs flat — cost-gated every PR); durable head rows are the structural fix **(RFC-024)**; internal-table *cleanup* still deferred behind the resurrection watermark. |
-| **R5: Schema identity corruption or alias/identity drift.** Internal schema v5 makes stable IDs and incarnation durable authority. | Medium | Open/init validate the SchemaIR domain and exact bidirectional IR↔manifest identity/path/alias contract; every active recovery envelope carries the identity pair; zero, duplicate, missing, or mismatched identity fails closed. |
+| **R5: Schema identity corruption or alias/identity drift.** Internal schema v5 introduced stable IDs/incarnation as durable authority; v6 preserves them. | Medium | Open/init validate the SchemaIR domain and exact bidirectional IR↔manifest identity/path/alias contract; every active recovery envelope carries the identity pair; zero, duplicate, missing, or mismatched identity fails closed. |
 | **R6: Merge cost at divergence** — full-width classification, history-growing manifest opens. | Medium | Fast-forward path structurally pinned; `merge_cost.rs` keeps the terms visible; O(delta) merge blocked on a real deletion-delta source **(RFC-027)**; fragment adoption **(RFC-0001, draft)**. |
 | **R7: No streaming ingest** — per-branch write throughput is capped by the `graph_head` CAS rate; high-frequency small writes are wasteful. | Medium | Deliberate: the interactive path's guarantees come first. MemWAL-based ingest with durable per-row ack + graph-atomic folds is the design **(RFC-026)**. MemWAL is the strategic substrate, but beta.21's public initializer commits opaquely and shard provisioning is separate; activation waits for a public exact enrollment receipt plus reversible admission seal rather than using private APIs. |
-| **R8: Some operations lack enforced memory/time budgets.** | Medium | Known gap; the merge memory blow-up class was closed structurally (fast-forward append routing); new long-running work must add explicit bounds rather than widen the gap. |
+| **R8: Some operations lack enforced memory/time budgets.** | Medium | Known gap, narrowed and accepted for RFC-023. Its direct-substrate instrument rejected the first whole-delta fenced adopt (~447 MB peak at 100K × 256 versus ~74 MB Append), and the first corrected production 10K series failed at 30.0× / 108,625,920 bytes overhead; both negative results remain evidence. Mutation/Load now refuses a keyed table above 8,192 rows / 32 MiB before arm, while BranchMerge uses a recovery-enrolled chain with the same per-chunk bounds and a 1,024-transaction ceiling. The inductive certificate route removes the general diff, temporary delta, target preflight, and target join without weakening that chain. Final five-pair production medians passed at 31/8 ms (3.875×) for 10K and 136/35 ms (~3.886×) for 100K; maximum signed paired RSS overheads were 24,297,472 and 32,604,160 bytes. Inclusive row/transaction ceilings, byte refusal (including materialized blobs), operation-wide validation retention, exact source/target incarnation revalidation, second-generation certificate composition, and both between-chunk recovery directions are pinned; other operations still need explicit bounds. |
 | **R9: Local-FS conditional-write emulation** (`write_text_if_match` check-then-act gap). | Low | All current callers sit behind the cluster lock protocol; S3 uses true conditional puts; close before admitting any lock-free caller. |
 | **R10: Doc/spec drift as the system grows** — this document included. | Low | Maintenance contract (same-PR doc updates, `check-agents-md.sh` link CI, "don't lie" stale markers); this canon defers to area docs by construction. |
 
@@ -884,11 +945,12 @@ Live design questions, each owned by an RFC or a known gap — not a wishlist:
    here: a deleted row is absent from the target snapshot, so version columns
    can't identify it, and `_row_last_updated_at_version` filtering is O(rows)
    without a substrate index or change log.
-3. **Which capability owns the next rebuild boundary after v5?** RFC-028 has
-   activated stable identity in v5. RFC-023's fence, RFC-024's heads, RFC-025's
-   retention, and RFC-026's stream capability remain independently reviewable;
-   any later format activation requires its own export/init/load rebuild unless
-   capabilities deliberately co-release after their combined matrix passes.
+3. **Which capability owns the next rebuild boundary after v6?** RFC-028
+   activated stable identity in v5; RFC-023 assigns exact-`id` fencing to v6.
+   RFC-024's heads, RFC-025's retention, and RFC-026's stream capability remain
+   independently reviewable. Any later format activation requires its own
+   export/init/load rebuild unless capabilities deliberately co-release after
+   their combined matrix passes.
 4. **What is the checkpoint/retention contract?** RFC-025: checkpoint rows as
    logical authority, Lance tags as physical pins, and the asymmetric safe
    ordering between them — plus how the Q8 resurrection watermark unlocks
@@ -911,7 +973,7 @@ The plan of record is the RFC-022…028 family (all under
 |---|---|---|
 | [0022 — Unified graph-write protocol](../rfcs/0022-unified-write-path.md) | One correctness protocol for all graph-visible writes; per-writer effect adapters; synchronous recovery | **Implemented** (2026-07-13) |
 | [0028 — Stable schema identity and table incarnation](../rfcs/0028-stable-schema-identity.md) | Graph-scoped rename-stable type/property IDs, table lifetimes, SchemaApply recovery, and the shared strict-rebuild prerequisite | **Implemented** (2026-07-15) |
-| [0023 — Key-conflict fencing](../rfcs/0023-key-conflict-fencing.md) | Substrate-native keyed-write fencing via Lance's unenforced-PK filter; fleet/format activation barrier | Draft |
+| [0023 — Key-conflict fencing](../rfcs/0023-key-conflict-fencing.md) | Substrate-native keyed-write fencing via Lance's unenforced-PK filter; fleet/format activation barrier | **Implemented** (2026-07-15) |
 | [0024 — Durable table heads](../rfcs/0024-durable-table-heads.md) | O(1) current-state resolution via materialized head rows; heads-format initialization and strict rebuild boundary | Draft |
 | [0025 — Checkpoint-pinned retention](../rfcs/0025-checkpoint-retention.md) | Named checkpoints as authoritative retention roots, materialized as Lance tags | Draft |
 | [0026 — MemWAL streaming ingest](../rfcs/0026-memwal-streaming-ingest.md) | Durability-first streaming writes: ack on WAL durability, asynchronous graph-atomic folds | Draft |

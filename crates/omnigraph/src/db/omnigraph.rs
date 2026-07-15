@@ -4,16 +4,18 @@ use std::sync::Arc;
 
 use arc_swap::ArcSwap;
 use arrow_array::{
-    Array, BinaryArray, BooleanArray, Date32Array, FixedSizeListArray, Float32Array, Float64Array,
-    Int32Array, Int64Array, LargeBinaryArray, LargeListArray, LargeStringArray, ListArray,
-    RecordBatch, StringArray, StructArray, UInt32Array, UInt64Array, new_null_array,
+    Array, BinaryArray, BooleanArray, Date32Array, Date64Array, FixedSizeListArray, Float32Array,
+    Float64Array, Int32Array, Int64Array, LargeBinaryArray, LargeListArray, LargeStringArray,
+    ListArray, RecordBatch, StringArray, StructArray, UInt32Array, UInt64Array, new_null_array,
 };
 use arrow_schema::{DataType, Field, Schema};
 use lance::Dataset;
 use lance::blob::{BlobArrayBuilder, blob_field};
 use lance::dataset::BlobFile;
 use lance::dataset::scanner::ColumnOrdering;
-use lance::datatypes::BlobKind;
+use lance::datatypes::{
+    BlobKind, LANCE_UNENFORCED_PRIMARY_KEY, LANCE_UNENFORCED_PRIMARY_KEY_POSITION,
+};
 use omnigraph_compiler::catalog::{Catalog, EdgeType, NodeType};
 use omnigraph_compiler::schema::parser::parse_schema;
 use omnigraph_compiler::types::{PropType, ScalarType};
@@ -47,7 +49,9 @@ pub use table_ops::PendingIndex;
 pub(crate) use table_ops::{DeferredTableFork, OpenedForMutation};
 
 use super::commit_graph::GraphCommit;
-use super::manifest::{ManifestChange, Snapshot, TableRegistration, TableTombstone};
+use super::manifest::{
+    ManifestChange, ManifestCoordinator, Snapshot, TableRegistration, TableTombstone,
+};
 use super::schema_state::{
     SCHEMA_SOURCE_FILENAME, load_validated_schema_contract,
     load_validated_schema_contract_for_source, read_accepted_schema_ir, read_schema_state_identity,
@@ -360,7 +364,7 @@ impl Omnigraph {
             .map_err(|error| OmniError::manifest(error.to_string()))?;
         let schema_identity_domain = schema_ir.schema_identity_domain.as_str().to_string();
         let mut catalog = build_catalog_from_ir(&schema_ir)?;
-        fixup_blob_schemas(&mut catalog);
+        fixup_physical_schemas(&mut catalog)?;
 
         // Establish an atomic ownership claim on `_schema.pg` before
         // writing the remaining init artifacts. A check-then-write preflight
@@ -557,7 +561,7 @@ impl Omnigraph {
         validate_schema_ir_against_snapshot(&accepted_ir, &coordinator.snapshot())?;
         let schema_identity_domain = accepted_ir.schema_identity_domain.as_str().to_string();
         let mut catalog = build_catalog_from_ir(&accepted_ir)?;
-        fixup_blob_schemas(&mut catalog);
+        fixup_physical_schemas(&mut catalog)?;
 
         let session = Arc::new(lance::session::Session::default());
         let db = Self {
@@ -752,7 +756,7 @@ impl Omnigraph {
         let (schema_ir, _) =
             load_validated_schema_contract(self.uri(), Arc::clone(&self.storage)).await?;
         let mut catalog = build_catalog_from_ir(&schema_ir)?;
-        fixup_blob_schemas(&mut catalog);
+        fixup_physical_schemas(&mut catalog)?;
         Ok(Arc::new(catalog))
     }
 
@@ -961,7 +965,7 @@ impl Omnigraph {
             validate_schema_ir_against_snapshot(&schema_ir, &snapshot)?;
 
             let mut catalog = build_catalog_from_ir(&schema_ir)?;
-            fixup_blob_schemas(&mut catalog);
+            fixup_physical_schemas(&mut catalog)?;
             let schema_identity_domain = schema_ir.schema_identity_domain.as_str().to_string();
             return Ok(WriteTxn {
                 branch,
@@ -980,6 +984,185 @@ impl Omnigraph {
 
         Err(OmniError::manifest_read_set_changed(
             format!("write_authority:{}", branch.as_deref().unwrap_or("main")),
+            None,
+            None,
+        ))
+    }
+
+    /// Capture the source and target inputs for one branch merge under one
+    /// accepted schema read.
+    ///
+    /// `branch_merge` already holds the process-local schema and both branch
+    /// gates. External writers still require the same durable marker sandwich
+    /// as [`Self::open_write_txn`], but parsing/building the identical schema
+    /// contract twice adds no authority. Both snapshots are validated against
+    /// the same IR and share one immutable catalog.
+    pub(crate) async fn open_merge_write_txns(
+        &self,
+        source_branch: Option<&str>,
+        target_branch: Option<&str>,
+    ) -> Result<(WriteTxn, WriteTxn, Vec<GraphCommit>, Vec<GraphCommit>)> {
+        const MAX_CAPTURE_RETRIES: usize = 8;
+        let source_branch = normalize_branch_name(source_branch.unwrap_or("main"))?;
+        let target_branch = normalize_branch_name(target_branch.unwrap_or("main"))?;
+
+        for _ in 0..MAX_CAPTURE_RETRIES {
+            self.ensure_schema_apply_not_locked("branch merge preparation")
+                .await?;
+            let (schema_ir, schema_state) =
+                load_validated_schema_contract(self.uri(), Arc::clone(&self.storage)).await?;
+            let source_authority = self
+                .merge_authority_for_known_branch(source_branch.as_deref())
+                .await?;
+            let target_authority = self
+                .merge_authority_for_known_branch(target_branch.as_deref())
+                .await?;
+            self.ensure_schema_apply_not_locked("branch merge preparation")
+                .await?;
+            let trailing_schema_state =
+                read_schema_state_identity(self.uri(), self.storage.as_ref()).await?;
+            if schema_state != trailing_schema_state {
+                tokio::task::yield_now().await;
+                continue;
+            }
+
+            validate_schema_ir_against_snapshot(&schema_ir, &source_authority.3)?;
+            validate_schema_ir_against_snapshot(&schema_ir, &target_authority.3)?;
+            let mut catalog = build_catalog_from_ir(&schema_ir)?;
+            fixup_physical_schemas(&mut catalog)?;
+            let catalog = Arc::new(catalog);
+            let schema_identity_domain = schema_ir.schema_identity_domain.as_str().to_string();
+            let (
+                source_branch_identifier,
+                source_graph_head,
+                source_effective_graph_head,
+                source_base,
+                source_commits,
+            ) = source_authority;
+            let (
+                target_branch_identifier,
+                target_graph_head,
+                target_effective_graph_head,
+                target_base,
+                target_commits,
+            ) = target_authority;
+            let make_txn = |branch: Option<String>,
+                            (branch_identifier, graph_head, effective_graph_head, base): (
+                lance::dataset::refs::BranchIdentifier,
+                Option<String>,
+                Option<String>,
+                Snapshot,
+            )| WriteTxn {
+                branch,
+                base,
+                authority: WriteAuthorityToken {
+                    branch_identifier,
+                    graph_head,
+                    schema_ir_hash: schema_state.schema_ir_hash.clone(),
+                    schema_identity_domain: schema_identity_domain.clone(),
+                    schema_identity_version: schema_state.schema_identity_version,
+                },
+                effective_graph_head,
+                catalog: Arc::clone(&catalog),
+            };
+            return Ok((
+                make_txn(
+                    source_branch.clone(),
+                    (
+                        source_branch_identifier,
+                        source_graph_head,
+                        source_effective_graph_head,
+                        source_base,
+                    ),
+                ),
+                make_txn(
+                    target_branch.clone(),
+                    (
+                        target_branch_identifier,
+                        target_graph_head,
+                        target_effective_graph_head,
+                        target_base,
+                    ),
+                ),
+                source_commits,
+                target_commits,
+            ));
+        }
+
+        Err(OmniError::manifest_read_set_changed(
+            format!(
+                "branch_merge_authority:{}->{}",
+                source_branch.as_deref().unwrap_or("main"),
+                target_branch.as_deref().unwrap_or("main")
+            ),
+            None,
+            None,
+        ))
+    }
+
+    /// Fresh pre-effect source/target authority for branch merge without
+    /// rebuilding catalogs or reopening the source lineage projection.
+    /// Planning already owns the immutable catalog and commit ancestry; this
+    /// fence needs only the current accepted schema plus both manifest states.
+    pub(crate) async fn revalidate_merge_inputs(
+        &self,
+        source_branch: Option<&str>,
+        target_branch: Option<&str>,
+    ) -> Result<(WriteAuthorityToken, Snapshot, WriteAuthorityToken, Snapshot)> {
+        const MAX_CAPTURE_RETRIES: usize = 8;
+        let source_branch = normalize_branch_name(source_branch.unwrap_or("main"))?;
+        let target_branch = normalize_branch_name(target_branch.unwrap_or("main"))?;
+
+        for _ in 0..MAX_CAPTURE_RETRIES {
+            self.ensure_schema_apply_not_locked("branch merge revalidation")
+                .await?;
+            let (schema_ir, schema_state) =
+                load_validated_schema_contract(self.uri(), Arc::clone(&self.storage)).await?;
+            let target = self
+                .write_authority_for_known_branch(target_branch.as_deref(), true)
+                .await?;
+            let source_manifest = match source_branch.as_deref() {
+                Some(branch) => ManifestCoordinator::open_at_branch(self.uri(), branch).await?,
+                None => ManifestCoordinator::open(self.uri()).await?,
+            };
+            let source_branch_identifier = source_manifest.branch_identifier().await?;
+            let source_graph_head = source_manifest.exact_graph_head();
+            let source_snapshot = source_manifest.snapshot();
+            self.ensure_schema_apply_not_locked("branch merge revalidation")
+                .await?;
+            let trailing_schema_state =
+                read_schema_state_identity(self.uri(), self.storage.as_ref()).await?;
+            if schema_state != trailing_schema_state {
+                tokio::task::yield_now().await;
+                continue;
+            }
+
+            validate_schema_ir_against_snapshot(&schema_ir, &source_snapshot)?;
+            validate_schema_ir_against_snapshot(&schema_ir, &target.3)?;
+            let schema_identity_domain = schema_ir.schema_identity_domain.as_str().to_string();
+            let make_token =
+                |branch_identifier: lance::dataset::refs::BranchIdentifier,
+                 graph_head: Option<String>| WriteAuthorityToken {
+                    branch_identifier,
+                    graph_head,
+                    schema_ir_hash: schema_state.schema_ir_hash.clone(),
+                    schema_identity_domain: schema_identity_domain.clone(),
+                    schema_identity_version: schema_state.schema_identity_version,
+                };
+            return Ok((
+                make_token(source_branch_identifier, source_graph_head),
+                source_snapshot,
+                make_token(target.0, target.1),
+                target.3,
+            ));
+        }
+
+        Err(OmniError::manifest_read_set_changed(
+            format!(
+                "branch_merge_revalidation:{}->{}",
+                source_branch.as_deref().unwrap_or("main"),
+                target_branch.as_deref().unwrap_or("main")
+            ),
             None,
             None,
         ))
@@ -1066,6 +1249,52 @@ impl Omnigraph {
                 .await?
                 .map(|head| head.as_str().to_string()),
             coord.snapshot(),
+        ))
+    }
+
+    /// Merge-specific authority capture that also returns the coordinator's
+    /// already-loaded lineage projection. Keeping the projection attached to
+    /// this exact authority read avoids reopening both manifest branches solely
+    /// to rediscover the merge base.
+    async fn merge_authority_for_known_branch(
+        &self,
+        branch: Option<&str>,
+    ) -> Result<(
+        lance::dataset::refs::BranchIdentifier,
+        Option<String>,
+        Option<String>,
+        Snapshot,
+        Vec<GraphCommit>,
+    )> {
+        {
+            let coord = self.coordinator.read().await;
+            if branch == coord.current_branch() {
+                let held = coord.manifest_incarnation();
+                if coord.probe_latest_incarnation().await?.matches(&held) {
+                    return Ok((
+                        coord.branch_identifier().await?,
+                        coord.exact_graph_head(),
+                        coord
+                            .head_commit_id()
+                            .await?
+                            .map(|head| head.as_str().to_string()),
+                        coord.snapshot(),
+                        coord.load_commits().await?,
+                    ));
+                }
+            }
+        }
+
+        let coord = self.open_coordinator_for_branch(branch).await?;
+        Ok((
+            coord.branch_identifier().await?,
+            coord.exact_graph_head(),
+            coord
+                .head_commit_id()
+                .await?
+                .map(|head| head.as_str().to_string()),
+            coord.snapshot(),
+            coord.load_commits().await?,
         ))
     }
 
@@ -1620,7 +1849,7 @@ impl Omnigraph {
             (*current.catalog).clone()
         } else {
             let mut catalog = build_catalog_from_ir(&accepted_ir)?;
-            fixup_blob_schemas(&mut catalog);
+            fixup_physical_schemas(&mut catalog)?;
             catalog
         };
         drop(current);
@@ -2049,6 +2278,22 @@ impl Omnigraph {
             .await
             .current_branch()
             .map(str::to_string)
+    }
+
+    /// Whether the handle's active coordinator is exactly the freshly captured
+    /// target authority. A warm coordinator can lag an external process; branch
+    /// merge may skip its historical swap only when native ref identity, graph
+    /// head, and manifest version all match the capture.
+    pub(crate) async fn active_coordinator_matches(&self, txn: &WriteTxn) -> Result<bool> {
+        let coord = self.coordinator.read().await;
+        if coord.current_branch() != txn.branch.as_deref() {
+            return Ok(false);
+        }
+        Ok(
+            coord.branch_identifier().await? == txn.authority.branch_identifier
+                && coord.exact_graph_head() == txn.authority.graph_head
+                && coord.version() == txn.base.version(),
+        )
     }
 
     /// Conservative table-gate envelope for graph-level control/maintenance.
@@ -2754,48 +2999,95 @@ fn blob_description_is_null(descriptions: &StructArray, row: usize) -> Result<bo
     Ok(position.unwrap_or(0) == 0 && size.unwrap_or(0) == 0 && blob_uri.unwrap_or("").is_empty())
 }
 
-/// Replace placeholder `LargeBinary` fields with Lance blob v2 fields.
+/// Convert compiler placeholders into the physical Lance schema contract.
 ///
-/// The compiler crate has no Lance dependency, so `ScalarType::Blob` maps to
-/// `DataType::LargeBinary` as a placeholder. This function replaces those
-/// fields with the real blob v2 struct type via `lance::blob::blob_field()`.
-fn fixup_blob_schemas(catalog: &mut Catalog) {
-    for node_type in catalog.node_types.values_mut() {
-        if node_type.blob_properties.is_empty() {
-            continue;
-        }
-        let fields: Vec<Field> = node_type
-            .arrow_schema
-            .fields()
-            .iter()
-            .map(|f| {
-                if node_type.blob_properties.contains(f.name()) {
-                    blob_field(f.name(), f.is_nullable())
-                } else {
-                    f.as_ref().clone()
-                }
-            })
-            .collect();
-        node_type.arrow_schema = Arc::new(Schema::new(fields));
+/// The compiler crate deliberately has no Lance dependency, so it cannot
+/// express either blob-v2 fields or Lance's unenforced-primary-key metadata.
+/// Every engine catalog is therefore normalized at this single boundary before
+/// it can create, overwrite, or rebuild a physical graph table:
+///
+/// - `ScalarType::Blob`'s `LargeBinary` placeholder becomes a blob-v2 field;
+/// - exactly the injected, non-null top-level `id` field is the Lance PK; and
+/// - schema metadata and unrelated field metadata survive the reconstruction.
+///
+/// RFC-023 makes this part of internal format v6. Older physical images are
+/// never annotated in place: the strict format floor rejects them before a v6
+/// catalog is allowed to write.
+fn fixup_physical_schemas(catalog: &mut Catalog) -> Result<()> {
+    for (name, node_type) in &mut catalog.node_types {
+        node_type.arrow_schema = physical_table_schema(
+            &node_type.arrow_schema,
+            &node_type.blob_properties,
+            &format!("node:{name}"),
+        )?;
     }
-    for edge_type in catalog.edge_types.values_mut() {
-        if edge_type.blob_properties.is_empty() {
-            continue;
-        }
-        let fields: Vec<Field> = edge_type
-            .arrow_schema
-            .fields()
-            .iter()
-            .map(|f| {
-                if edge_type.blob_properties.contains(f.name()) {
-                    blob_field(f.name(), f.is_nullable())
-                } else {
-                    f.as_ref().clone()
-                }
-            })
-            .collect();
-        edge_type.arrow_schema = Arc::new(Schema::new(fields));
+    for (name, edge_type) in &mut catalog.edge_types {
+        edge_type.arrow_schema = physical_table_schema(
+            &edge_type.arrow_schema,
+            &edge_type.blob_properties,
+            &format!("edge:{name}"),
+        )?;
     }
+    Ok(())
+}
+
+fn physical_table_schema(
+    schema: &Arc<Schema>,
+    blob_properties: &HashSet<String>,
+    table_key: &str,
+) -> Result<Arc<Schema>> {
+    let mut id_count = 0;
+    let fields = schema
+        .fields()
+        .iter()
+        .map(|field| {
+            let mut physical = if blob_properties.contains(field.name()) {
+                let mut blob = blob_field(field.name(), field.is_nullable());
+                // Keep compiler-side annotations if any are added later while
+                // letting the Lance blob extension metadata remain authoritative.
+                let mut metadata = field.metadata().clone();
+                metadata.extend(blob.metadata().clone());
+                blob.set_metadata(metadata);
+                blob
+            } else {
+                field.as_ref().clone()
+            };
+
+            let mut metadata = physical.metadata().clone();
+            // The legacy boolean form is intentional. It is the form whose
+            // conflict-filter behavior RFC-023 pins, and a PK is immutable once
+            // a Lance dataset has been created.
+            metadata.remove(LANCE_UNENFORCED_PRIMARY_KEY_POSITION);
+            if physical.name() == "id" {
+                id_count += 1;
+                metadata.insert(LANCE_UNENFORCED_PRIMARY_KEY.to_string(), "true".to_string());
+            } else {
+                metadata.remove(LANCE_UNENFORCED_PRIMARY_KEY);
+            }
+            physical.set_metadata(metadata);
+            physical
+        })
+        .collect::<Vec<Field>>();
+
+    if id_count != 1 {
+        return Err(OmniError::manifest_internal(format!(
+            "physical schema for '{table_key}' must contain exactly one top-level `id` field; found {id_count}"
+        )));
+    }
+    let id = fields
+        .iter()
+        .find(|field| field.name() == "id")
+        .expect("id_count == 1");
+    if id.is_nullable() {
+        return Err(OmniError::manifest_internal(format!(
+            "physical schema for '{table_key}' has a nullable `id` field"
+        )));
+    }
+
+    Ok(Arc::new(Schema::new_with_metadata(
+        fields,
+        schema.metadata.clone(),
+    )))
 }
 
 fn validate_bound_catalog_against_snapshot(catalog: &Catalog, snapshot: &Snapshot) -> Result<()> {
@@ -3021,6 +3313,13 @@ fn json_value_from_array(array: &dyn Array, row: usize) -> Result<serde_json::Va
                 .as_any()
                 .downcast_ref::<Date32Array>()
                 .ok_or_else(|| OmniError::Lance("expected Date32Array".to_string()))?
+                .value(row),
+        ))),
+        DataType::Date64 => Ok(serde_json::Value::Number(serde_json::Number::from(
+            array
+                .as_any()
+                .downcast_ref::<Date64Array>()
+                .ok_or_else(|| OmniError::Lance("expected Date64Array".to_string()))?
                 .value(row),
         ))),
         DataType::Binary => Ok(serde_json::Value::String(base64::Engine::encode(

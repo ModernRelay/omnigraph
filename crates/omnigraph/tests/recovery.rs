@@ -1733,6 +1733,17 @@ async fn recovery_rolls_back_feature_branch_sidecar_against_feature_branch() {
         v_head,
         post.version().version,
     );
+    let primary_key = post
+        .schema()
+        .unenforced_primary_key()
+        .iter()
+        .map(|field| field.name.clone())
+        .collect::<Vec<_>>();
+    assert_eq!(
+        primary_key,
+        ["id"],
+        "restoring an older feature-branch image must preserve exactly `id` as its Lance unenforced primary key"
+    );
 
     let db = Omnigraph::open(uri).await.unwrap();
     assert_eq!(

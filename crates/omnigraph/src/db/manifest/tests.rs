@@ -4,6 +4,7 @@ use std::sync::Arc;
 use arrow_array::{Int32Array, RecordBatch, RecordBatchIterator, StringArray, UInt64Array};
 use arrow_schema::{DataType, Field, Schema};
 use async_trait::async_trait;
+use futures::TryStreamExt;
 use lance::dataset::builder::DatasetBuilder;
 use lance_namespace::LanceNamespace;
 use lance_namespace::models::{
@@ -375,6 +376,46 @@ async fn test_snapshot_open_sub_table() {
 
     assert_eq!(person_ds.schema().fields.len(), 3);
     assert_eq!(person_ds.count_rows(None).await.unwrap(), 0);
+}
+
+#[tokio::test]
+async fn snapshot_scanner_strict_rows_survive_byte_target_override() {
+    const ROWS: usize = 10_000;
+    const BATCH_ROWS: usize = 8_192;
+
+    let dir = tempfile::tempdir().unwrap();
+    let schema = Arc::new(Schema::new(vec![Field::new("id", DataType::Utf8, false)]));
+    let batch = RecordBatch::try_new(
+        Arc::clone(&schema),
+        vec![Arc::new(StringArray::from_iter_values(
+            (0..ROWS).map(|row| format!("row-{row:05}")),
+        ))],
+    )
+    .unwrap();
+    let reader = RecordBatchIterator::new([Ok(batch)], Arc::clone(&schema));
+    let dataset = Dataset::write(reader, dir.path().to_str().unwrap(), None)
+        .await
+        .unwrap();
+    let table = SnapshotTable::new(dataset);
+    let mut scanner = table.scan();
+    scanner.batch_size(BATCH_ROWS);
+    scanner.batch_size_bytes(32 * 1024 * 1024);
+    scanner.strict_batch_size(true);
+
+    let batches = scanner
+        .try_into_stream()
+        .await
+        .unwrap()
+        .try_collect::<Vec<_>>()
+        .await
+        .unwrap();
+    assert_eq!(
+        batches
+            .iter()
+            .map(RecordBatch::num_rows)
+            .collect::<Vec<_>>(),
+        vec![BATCH_ROWS, ROWS - BATCH_ROWS]
+    );
 }
 
 #[tokio::test]

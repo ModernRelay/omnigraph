@@ -1,17 +1,17 @@
 //! Tests for the direct-publish write path. Mutations and loads capture one
 //! branch-wide authority token, prepare exact per-table transactions, then
 //! acquire the root-shared schema → branch → sorted-table gates, revalidate,
-//! arm schema-v3 recovery, commit the table effects, and publish once under the
-//! same exact-head/table precondition. (History: this replaced the removed Run
-//! state machine / `__run__` staging branches / RunRecord — MR-771.)
+//! arm identity-bearing recovery-v9, commit the table effects, and publish once
+//! under the same exact-head/table precondition. (History: this replaced the
+//! removed Run state machine / `__run__` staging branches / RunRecord — MR-771.)
 //!
 //! What this file covers:
 //! - No `__run__*` branches are created by load or mutate.
 //! - Cancellation of a mutation future leaves no graph-level state.
-//! - A pre-effect branch-authority change makes an insert-only mutation or
-//!   Append/Merge load discard and fully reprepare with a bounded retry; strict
-//!   Update/Delete/Overwrite surfaces `ReadSetChanged`. Post-effect failures
-//!   require recovery.
+//! - A pre-effect branch-authority change makes an upsert mutation/load discard
+//!   and fully reprepare with a bounded retry; strict insert conflicts return
+//!   `KeyConflict`, while Update/Delete/Overwrite authority movement surfaces
+//!   `ReadSetChanged`. Post-effect failures require recovery.
 //! - Failed mutations and loads leave the target unchanged.
 //! - Multi-statement mutations are atomic (one commit per query).
 //! - actor_id propagates through to the commit graph.
@@ -521,6 +521,286 @@ query update_age_by_name($name: String, $age: I32) {
 }
 "#;
 
+fn bulk_insert_mutation(rows: usize) -> String {
+    let mut query = String::with_capacity(rows * 48);
+    query.push_str("query bulk_insert() {\n");
+    for row in 0..rows {
+        query.push_str(&format!("    insert Thing {{ key: \"mutation-{row}\" }}\n"));
+    }
+    query.push_str("}\n");
+    query
+}
+
+fn bulk_update_fixture(rows: usize) -> String {
+    let mut data = String::with_capacity(rows * 64);
+    for row in 0..rows {
+        data.push_str(&format!(
+            "{{\"type\":\"Thing\",\"data\":{{\"key\":\"update-{row}\"}}}}\n"
+        ));
+    }
+    data
+}
+
+/// Mutation staging shares the same inclusive 8,192-row keyed-write cap as
+/// bulk load. The rejected one-over query must remain entirely pre-effect: no
+/// recovery sidecar, table version, manifest version, or row may move.
+#[tokio::test]
+async fn mutation_keyed_write_row_cap_accepts_limit_and_rejects_one_over_pre_effect() {
+    const LIMIT: usize = 8192;
+    const SCHEMA: &str = "node Thing { key: String @key }\n";
+
+    let exact_dir = tempfile::tempdir().unwrap();
+    let exact = Omnigraph::init(exact_dir.path().to_str().unwrap(), SCHEMA)
+        .await
+        .unwrap();
+    let exact_result = exact
+        .mutate(
+            "main",
+            &bulk_insert_mutation(LIMIT),
+            "bulk_insert",
+            &params(&[]),
+        )
+        .await
+        .expect("the exact mutation keyed-row limit is inclusive");
+    assert_eq!(exact_result.affected_nodes, LIMIT);
+    assert_eq!(count_rows(&exact, "node:Thing").await, LIMIT);
+
+    let over_dir = tempfile::tempdir().unwrap();
+    let over = Omnigraph::init(over_dir.path().to_str().unwrap(), SCHEMA)
+        .await
+        .unwrap();
+    let before = snapshot_main(&over).await.unwrap();
+    let before_manifest = before.version();
+    let entry = before.entry("node:Thing").unwrap();
+    let before_table = entry.table_version;
+    let table_uri = format!(
+        "{}/{}",
+        over.uri().trim_end_matches('/'),
+        entry.table_path.trim_start_matches('/')
+    );
+    let before_head = Dataset::open(&table_uri).await.unwrap().version().version;
+    let error = over
+        .mutate(
+            "main",
+            &bulk_insert_mutation(LIMIT + 1),
+            "bulk_insert",
+            &params(&[]),
+        )
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(
+            error,
+            OmniError::ResourceLimitExceeded {
+                ref resource,
+                limit: 8192,
+                actual: 8193,
+            } if resource == "keyed rows for node:Thing"
+        ),
+        "one-over mutation must return the typed keyed-row limit, got {error:?}"
+    );
+    let after = snapshot_main(&over).await.unwrap();
+    assert_eq!(after.version(), before_manifest);
+    assert_eq!(
+        after.entry("node:Thing").unwrap().table_version,
+        before_table
+    );
+    assert_eq!(
+        Dataset::open(&table_uri).await.unwrap().version().version,
+        before_head,
+        "one-over mutation must fail before a Lance table effect"
+    );
+    assert_eq!(count_rows(&over, "node:Thing").await, 0);
+    let recovery_dir = over_dir.path().join("__recovery");
+    assert!(
+        !recovery_dir.exists() || std::fs::read_dir(recovery_dir).unwrap().next().is_none(),
+        "one-over mutation must fail before writing a recovery sidecar"
+    );
+}
+
+/// Update predicate matching is itself a bounded allocation. The committed
+/// side must stream and charge rows before it is retained/concatenated, rather
+/// than first collecting an arbitrarily wide match set and relying on the
+/// later staging guard.
+#[tokio::test]
+async fn mutation_update_row_cap_accepts_limit_and_rejects_one_over_pre_effect() {
+    const LIMIT: usize = 8192;
+    const SCHEMA: &str = "node Thing { key: String @key marked: Bool? }\n";
+    const UPDATE_ALL: &str = r#"
+query update_all() {
+    update Thing set { marked: true } where key != ""
+}
+"#;
+
+    let exact_dir = tempfile::tempdir().unwrap();
+    let mut exact = Omnigraph::init(exact_dir.path().to_str().unwrap(), SCHEMA)
+        .await
+        .unwrap();
+    load_jsonl(&mut exact, &bulk_update_fixture(LIMIT), LoadMode::Overwrite)
+        .await
+        .unwrap();
+    let exact_result = exact
+        .mutate("main", UPDATE_ALL, "update_all", &params(&[]))
+        .await
+        .expect("the exact mutation update-row limit is inclusive");
+    assert_eq!(exact_result.affected_nodes, LIMIT);
+    assert_eq!(count_rows(&exact, "node:Thing").await, LIMIT);
+
+    let over_dir = tempfile::tempdir().unwrap();
+    let mut over = Omnigraph::init(over_dir.path().to_str().unwrap(), SCHEMA)
+        .await
+        .unwrap();
+    load_jsonl(
+        &mut over,
+        &bulk_update_fixture(LIMIT + 1),
+        LoadMode::Overwrite,
+    )
+    .await
+    .unwrap();
+    let before = snapshot_main(&over).await.unwrap();
+    let before_manifest = before.version();
+    let entry = before.entry("node:Thing").unwrap();
+    let before_table = entry.table_version;
+    let table_uri = format!(
+        "{}/{}",
+        over.uri().trim_end_matches('/'),
+        entry.table_path.trim_start_matches('/')
+    );
+    let before_head = Dataset::open(&table_uri).await.unwrap().version().version;
+
+    let error = over
+        .mutate("main", UPDATE_ALL, "update_all", &params(&[]))
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(
+            error,
+            OmniError::ResourceLimitExceeded {
+                ref resource,
+                limit: 8192,
+                actual: 8193,
+            } if resource == "keyed rows for node:Thing"
+        ),
+        "one-over update must return the typed keyed-row limit, got {error:?}"
+    );
+    let after = snapshot_main(&over).await.unwrap();
+    assert_eq!(after.version(), before_manifest);
+    assert_eq!(
+        after.entry("node:Thing").unwrap().table_version,
+        before_table
+    );
+    assert_eq!(
+        Dataset::open(&table_uri).await.unwrap().version().version,
+        before_head,
+        "one-over update must fail before a Lance table effect"
+    );
+    assert_eq!(count_rows(&over, "node:Thing").await, LIMIT + 1);
+    let recovery_dir = over_dir.path().join("__recovery");
+    assert!(
+        !recovery_dir.exists() || std::fs::read_dir(recovery_dir).unwrap().next().is_none(),
+        "one-over update must fail before writing a recovery sidecar"
+    );
+}
+
+/// Blob descriptors do not represent their payload allocation. An update must
+/// consult `BlobFile::size()` against its remaining byte budget before calling
+/// `BlobFile::read`; the scoped payload-read probe makes this a structural
+/// assertion rather than inferring it from the eventual error.
+#[tokio::test]
+async fn mutation_update_rejects_oversized_blob_before_payload_read_pre_effect() {
+    const LIMIT: u64 = 32 * 1024 * 1024;
+    const SCHEMA: &str = r#"
+node Document {
+    title: String @key
+    content: Blob?
+    note: String?
+}
+"#;
+    const UPDATE: &str = r#"
+query update_note($note: String) {
+    update Document set { note: $note } where title = "wide"
+}
+"#;
+
+    let dir = tempfile::tempdir().unwrap();
+    let external_path = dir.path().join("wide.blob");
+    let file = std::fs::File::create(&external_path).unwrap();
+    file.set_len(LIMIT + 1).unwrap();
+    drop(file);
+    let external_uri = format!("file://{}", external_path.display());
+
+    let graph_path = dir.path().join("graph");
+    let mut db = Omnigraph::init(graph_path.to_str().unwrap(), SCHEMA)
+        .await
+        .unwrap();
+    let row = serde_json::json!({
+        "type": "Document",
+        "data": {
+            "title": "wide",
+            "content": external_uri,
+        }
+    })
+    .to_string();
+    load_jsonl(&mut db, &row, LoadMode::Overwrite)
+        .await
+        .unwrap();
+    let before = snapshot_main(&db).await.unwrap();
+    let before_manifest = before.version();
+    let entry = before.entry("node:Document").unwrap();
+    let before_table = entry.table_version;
+    let table_uri = format!(
+        "{}/{}",
+        db.uri().trim_end_matches('/'),
+        entry.table_path.trim_start_matches('/')
+    );
+    let before_head = Dataset::open(&table_uri).await.unwrap().version().version;
+
+    let probes = omnigraph::instrumentation::MergeWriteProbes::default();
+    let error = omnigraph::instrumentation::with_merge_write_probes(
+        probes.clone(),
+        db.mutate(
+            "main",
+            UPDATE,
+            "update_note",
+            &params(&[("$note", "bounded")]),
+        ),
+    )
+    .await
+    .unwrap_err();
+    assert!(
+        matches!(
+            error,
+            OmniError::ResourceLimitExceeded {
+                ref resource,
+                limit: LIMIT,
+                actual,
+            } if resource == "keyed bytes for node:Document" && actual > LIMIT
+        ),
+        "oversized update blob must be rejected before payload read, got {error:?}"
+    );
+    assert_eq!(
+        probes.blob_payload_read_calls(),
+        0,
+        "BlobFile::size must reject the update before BlobFile::read"
+    );
+    let after = snapshot_main(&db).await.unwrap();
+    assert_eq!(after.version(), before_manifest);
+    assert_eq!(
+        after.entry("node:Document").unwrap().table_version,
+        before_table
+    );
+    assert_eq!(
+        Dataset::open(&table_uri).await.unwrap().version().version,
+        before_head,
+        "oversized update must fail before a Lance table effect"
+    );
+    let recovery_dir = graph_path.join("__recovery");
+    assert!(
+        !recovery_dir.exists() || std::fs::read_dir(recovery_dir).unwrap().next().is_none(),
+        "oversized update must fail before writing a recovery sidecar"
+    );
+}
+
 /// D₂: a query mixing inserts/updates with deletes is rejected at parse
 /// time, BEFORE any I/O. The error shape directs the user to split the
 /// query into two mutations.
@@ -753,11 +1033,11 @@ async fn mixed_insert_and_update_on_same_person_coalesces_to_one_merge() {
 }
 
 /// `insert Knows from='Alice' to='Bob'; insert Knows from='Alice' to='Eve'`
-/// — both append to `edge:Knows`. The accumulator coalesces them into one
-/// `stage_append` at end-of-query. Edge IDs are ULID-generated so no
-/// dedupe is needed (Append mode).
+/// — both add rows to `edge:Knows`. The accumulator coalesces them into one
+/// strict exact-id fenced write at end-of-query. Edge IDs are ULID-generated,
+/// but the write still carries the same conflict filter as every graph table.
 #[tokio::test]
-async fn multiple_appends_to_same_edge_coalesce_to_one_append() {
+async fn multiple_edge_inserts_coalesce_to_one_fenced_write() {
     let dir = tempfile::tempdir().unwrap();
     let mut db = init_and_load(&dir).await;
 

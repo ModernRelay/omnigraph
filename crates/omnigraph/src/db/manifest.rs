@@ -42,18 +42,20 @@ use metadata::{OMNIGRAPH_ROW_COUNT_KEY, table_version_metadata_for_state};
 use namespace::{branch_manifest_namespace, staged_table_namespace};
 pub(crate) use publisher::{GraphHeadExpectation, LineageIntent, PublishPrecondition};
 use publisher::{GraphNamespacePublisher, ManifestBatchPublisher, PublishOutcome};
+#[cfg(test)]
+pub(crate) use recovery::MAX_EFFECT_IDENTITY_SCAN_VERSIONS;
 pub(crate) use recovery::{
-    HealPendingOutcome, RecoveryAuthorityToken, RecoveryBranchMergeEffect,
-    RecoveryBranchMergeEffectKind, RecoveryLineageIntent, RecoveryManifestDelta, RecoveryMode,
-    RecoverySchemaApplyEffect, RecoverySchemaApplyEffectKind, RecoverySidecar,
-    RecoverySidecarHandle, RecoveryTableUpdateSlot, SidecarKind, SidecarTablePin,
+    HealPendingOutcome, MAX_BRANCH_MERGE_DATA_TRANSACTIONS, RecoveryAuthorityToken,
+    RecoveryBranchMergeEffect, RecoveryBranchMergeEffectKind, RecoveryLineageIntent,
+    RecoveryManifestDelta, RecoveryMode, RecoverySchemaApplyEffect, RecoverySchemaApplyEffectKind,
+    RecoverySidecar, RecoverySidecarHandle, RecoveryTableUpdateSlot, SidecarKind, SidecarTablePin,
     SidecarTableRegistration, SidecarTableRename, SidecarTombstone,
     confirm_branch_merge_sidecar_v9, confirm_ensure_indices_sidecar_v9, confirm_occ_sidecar_v9,
     confirm_schema_apply_sidecar_v9, delete_sidecar, ensure_read_only_schema_coherent,
-    heal_pending_sidecars_roll_forward, list_sidecars, new_branch_merge_sidecar_v9,
-    new_ensure_indices_sidecar_v9, new_occ_sidecar_v9, new_optimize_sidecar_v9,
-    new_schema_apply_sidecar_v9, recover_manifest_drift, schema_apply_serial_queue_key,
-    write_sidecar,
+    finalize_effect_free_occ_sidecar, heal_pending_sidecars_roll_forward, list_sidecars,
+    new_branch_merge_sidecar_v9, new_ensure_indices_sidecar_v9, new_occ_sidecar_v9,
+    new_optimize_sidecar_v9, new_schema_apply_sidecar_v9, recover_manifest_drift,
+    schema_apply_serial_queue_key, write_sidecar,
 };
 pub use state::SubTableEntry;
 #[cfg(test)]
@@ -184,6 +186,30 @@ impl SnapshotScanner {
     /// Apply a structured DataFusion filter expression.
     pub fn filter_expr(&mut self, filter: Expr) -> &mut Self {
         self.scanner.filter_expr(filter);
+        self
+    }
+
+    /// Set the requested number of rows returned in one scan batch.
+    ///
+    /// Lance's byte-based batch target overrides this setting unless
+    /// [`Self::strict_batch_size`] is also enabled.
+    pub fn batch_size(&mut self, batch_size: usize) -> &mut Self {
+        self.scanner.batch_size(batch_size);
+        self
+    }
+
+    /// Set the approximate in-memory byte target for one scan batch.
+    pub fn batch_size_bytes(&mut self, batch_size_bytes: u64) -> &mut Self {
+        self.scanner.batch_size_bytes(batch_size_bytes);
+        self
+    }
+
+    /// Require full output batches to contain exactly the requested row count.
+    ///
+    /// The final batch may contain fewer rows. This restores a hard output-row
+    /// ceiling when [`Self::batch_size_bytes`] is also configured.
+    pub fn strict_batch_size(&mut self, strict_batch_size: bool) -> &mut Self {
+        self.scanner.strict_batch_size(strict_batch_size);
         self
     }
 

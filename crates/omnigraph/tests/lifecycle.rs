@@ -90,6 +90,20 @@ async fn init_creates_graph() {
     assert!(snap.entry("node:Company").is_some());
     assert!(snap.entry("edge:Knows").is_some());
     assert!(snap.entry("edge:WorksAt").is_some());
+    for table_key in ["node:Person", "node:Company", "edge:Knows", "edge:WorksAt"] {
+        let dataset = snap.open(table_key).await.unwrap();
+        let primary_key = dataset
+            .schema()
+            .unenforced_primary_key()
+            .iter()
+            .map(|field| field.name.clone())
+            .collect::<Vec<_>>();
+        assert_eq!(
+            primary_key,
+            ["id"],
+            "fresh graph table {table_key} must be created with exactly `id` as its Lance unenforced primary key"
+        );
+    }
 
     assert_eq!(db.catalog().node_types.len(), 2);
     assert_eq!(db.catalog().edge_types.len(), 2);

@@ -603,6 +603,25 @@ pub struct ReadSetConflictOutput {
     pub actual: Option<String>,
 }
 
+/// A strict insert rejected because `key` already names a row in the keyed
+/// graph table.  The operation is effect-free when this output is returned;
+/// partial or ambiguous attempts surface `recovery_required` instead.
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+pub struct KeyConflictOutput {
+    pub table_key: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub key: Option<String>,
+}
+
+/// A write rejected before durable recovery ownership because its bounded
+/// physical plan exceeded an explicit row, byte, or transaction-chain ceiling.
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+pub struct ResourceLimitOutput {
+    pub resource: String,
+    pub limit: u64,
+    pub actual: u64,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
 pub struct RecoveryRequiredOutput {
     pub operation_id: String,
@@ -624,6 +643,15 @@ pub struct ErrorOutput {
     /// Set when a prepared write's logical authority changed before effects.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub read_set_conflict: Option<ReadSetConflictOutput>,
+    /// Set when a strict keyed insert found an existing or concurrently
+    /// inserted logical id.  The caller may choose a different id; replaying
+    /// the same strict operation will not convert it into an upsert.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub key_conflict: Option<KeyConflictOutput>,
+    /// Set when the request must be split into smaller graph commits. The
+    /// rejected attempt has no durable sidecar and no table effect.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub resource_limit: Option<ResourceLimitOutput>,
     /// Set when an overlapping durable recovery intent must be resolved before
     /// retry. Its table effects may or may not have started.
     #[serde(skip_serializing_if = "Option::is_none")]

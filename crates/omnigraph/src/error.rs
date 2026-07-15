@@ -86,6 +86,12 @@ pub enum OmniError {
     Compiler(#[from] omnigraph_compiler::error::CompilerError),
     #[error("storage: {0}")]
     Lance(String),
+    /// Lance rejected a stale transaction as semantically retryable. Kept
+    /// typed at the storage boundary so RFC-023 can distinguish an
+    /// effect-free key fence from an arbitrary I/O or execution failure
+    /// without parsing upstream error text.
+    #[error("retryable storage commit conflict: {0}")]
+    RetryableCommitConflict(String),
     #[error("query: {0}")]
     DataFusion(String),
     #[error("io: {0}")]
@@ -94,6 +100,28 @@ pub enum OmniError {
     Manifest(ManifestError),
     #[error("merge conflicts: {0:?}")]
     MergeConflicts(Vec<MergeConflict>),
+    /// A strict keyed insert found that the logical row id already exists in
+    /// the pinned table image, or lost a concurrent exact-id insertion race
+    /// before any effect from this attempt became visible.  This is distinct
+    /// from a stale read set: retrying the same strict insert must not silently
+    /// turn it into an upsert.
+    #[error("key conflict in table '{table_key}'")]
+    KeyConflict {
+        table_key: String,
+        /// Exact id observed by pinned preflight or the required fresh probe
+        /// after an effect-free substrate conflict. Optional on the wire only
+        /// for backward compatibility with older producers.
+        key: Option<String>,
+    },
+    /// A write was rejected before recovery was armed because its bounded
+    /// physical plan would exceed an explicit safety ceiling. This is a
+    /// retryable input-shaping error, not a partial-success signal.
+    #[error("resource limit exceeded for {resource}: actual {actual}, limit {limit}")]
+    ResourceLimitExceeded {
+        resource: String,
+        limit: u64,
+        actual: u64,
+    },
     /// A durable recovery intent overlaps this write. Its physical effects may
     /// already have landed, or it may still be armed before its first effect;
     /// either way the sidecar named by `operation_id` must be resolved before
@@ -122,6 +150,25 @@ pub enum OmniError {
 }
 
 impl OmniError {
+    pub fn key_conflict(table_key: impl Into<String>, key: impl Into<String>) -> Self {
+        Self::KeyConflict {
+            table_key: table_key.into(),
+            key: Some(key.into()),
+        }
+    }
+
+    pub(crate) fn resource_limit(resource: impl Into<String>, limit: u64, actual: u64) -> Self {
+        Self::ResourceLimitExceeded {
+            resource: resource.into(),
+            limit,
+            actual,
+        }
+    }
+
+    pub(crate) fn is_retryable_commit_conflict(&self) -> bool {
+        matches!(self, Self::RetryableCommitConflict(_))
+    }
+
     pub(crate) fn is_read_set_changed(&self) -> bool {
         matches!(
             self,
