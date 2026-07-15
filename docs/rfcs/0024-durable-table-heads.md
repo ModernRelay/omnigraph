@@ -2,7 +2,7 @@
 type: spec
 title: "RFC-024 — Durable table heads"
 description: Materialize one live-or-tombstoned current-state row per stable table identity inside each manifest branch and prove bounded physical lookup without weakening derived-index correctness.
-status: draft
+status: research-blocked
 tags: [eng, rfc, manifest, write-path, versioning, migration, lance]
 timestamp: 2026-07-10
 owner: OmniGraph maintainers
@@ -10,7 +10,7 @@ owner: OmniGraph maintainers
 
 # RFC-024: Durable table heads
 
-**Status:** Draft / for team review
+**Status:** Research blocked — Gate A physical lookup rejected
 **Date:** 2026-07-10
 **Author track:** Maintainer design series
 **Surveyed:** omnigraph 0.8.1 (`main`); Lance 9.0.0-beta.21 at git rev
@@ -55,6 +55,14 @@ The format does **not** ship merely because the logical result has O(tables)
 rows. A filtered scan over a history-sized Lance table is still O(history)
 physical work. The heads format is gated on a Lance-native indexed lookup whose measured I/O
 is flat at history depth and whose uncovered tail is bounded and observable.
+
+The first Gate A instrument rejected the proposed in-manifest BTREE shape on
+2026-07-15. Exact indexed scan work is flat at fixed catalog width, but the
+complete required cost is not: latest-manifest discovery on uncompacted
+RustFS grows in object reads and bytes, and compacted reads still grow in bytes.
+No heads-format production code ships from this RFC; internal schema v6 and its
+journal-fold current-state path remain authoritative while research looks for a
+different substrate/access shape.
 
 Normative decisions:
 
@@ -154,13 +162,31 @@ TableHeadMetadata {
 }
 ```
 
-`physical_ref_incarnation` is an opaque, backend-derived token that changes
-when the Lance dataset or native ref at the same path/branch/version is deleted
-and recreated. Use the manifest/ref e_tag when the backend provides one;
-otherwise the implementation must prove an equivalent Lance-native token. A
-backend with no proven token cannot activate the heads format. Logical
-`incarnation_id` cannot substitute for this field because a physical owner or
-ref may be replaced while logical table identity is preserved.
+`physical_ref_incarnation` is the opaque encoding of one public Lance composite:
+
+```text
+(BranchIdentifier, current Transaction.uuid, ManifestLocation.e_tag)
+```
+
+Capture reads `BranchIdentifier` before and after the current transaction and
+manifest-location evidence and rejects movement during capture. A missing
+current transaction, an empty transaction UUID, or a missing backend-required
+e_tag fails closed. On beta.21, local `current_manifest_path` synthesizes the
+e_tag from inode, mtime, and size; S3/RustFS returns the object e_tag. Main's
+`BranchIdentifier` is canonically empty, so its transaction UUID and e_tag are
+load-bearing; a named-ref recreation additionally changes `BranchIdentifier`.
+Logical `incarnation_id` cannot substitute for this composite because a
+physical owner or ref may be replaced while logical table identity is
+preserved.
+
+The public-surface guards prove stable unchanged reopens and same-version
+delete/recreate detection for main and named refs on local FS and S3/RustFS,
+including a local reopen through the original shared `Session`. This is an ABA
+token for the supported OmniGraph-wired writer topology, not authentication:
+raw byte-identical restoration or a forged transaction/ref replacement is
+outside the support boundary. Actual stale-writer rejection remains an
+implementation acceptance gate because the heads-format publisher does not
+exist.
 
 The row columns have these meanings:
 
@@ -315,7 +341,7 @@ positive slope in:
 - manifest object-store reads;
 - bytes read;
 - fragments/pages scanned; and
-- rows decoded
+- beta.21 `rows_scanned` proxy
 
 as commit history grows.
 
@@ -350,6 +376,50 @@ If no in-manifest Lance-native access shape passes the gate, the heads format
 does not ship. The fallback is to retain the then-current identity-capable
 format plus the local session/view-passing improvements, not to waive the cost
 claim.
+
+### 7.4 Gate A result: candidate rejected
+
+The test-only `durable_head_lookup_cost.rs` fixture models the production
+manifest publication shape without changing the production schema or
+publisher. At catalog width 10 it exercises compacted and uncompacted histories,
+an absent BTREE, a fully reconciled BTREE, one uncovered fragment, an
+eight-fragment uncovered tail, and reconciliation after that tail. Each state
+is measured as a cold tracked open and a warm repeat over the same `Dataset` and
+shared `Session`, on local FS and bucket-gated S3/RustFS.
+
+Representative reconciled RustFS curves from 20 to 80 publishes were:
+
+| Shape | 20 publishes | 80 publishes | Disposition |
+|---|---:|---:|---|
+| Uncompacted cold object reads | 34 | 94 | grows — fail |
+| Uncompacted cold object bytes | 61,947 | 121,592 | grows — fail |
+| Compacted cold object bytes | 30,545 | 61,642 | grows — fail |
+| Compacted cold plan bytes | 39,085 | 61,894 | grows — fail |
+| Compacted warm object bytes | 22,934 | 45,413 | grows — fail |
+
+The indexed scan itself did what the design wanted: the beta.21
+`rows_scanned` proxy stayed 10→10, ranges stayed 10→10, result fragments stayed
+10→10 uncompacted and
+1→1 compacted, and BTREE pages stayed 1→1 cold and 0→0 warm. The index-absent
+negative control grows in `rows_scanned`, proving the instrument sees the
+original history scan. One- and eight-fragment uncovered tails return the same
+logical heads, expose their bounded extra work, and reconciliation restores the
+catalog-width curve: in the representative eight-fragment cell,
+`optimize_indices` returns coverage to zero uncovered and reduces `rows_scanned`
+27→10 and ranges 17→10.
+
+These counters have two intentionally separate scopes. Object reads/bytes come
+from an `IOTracker` attached before the dataset load, so they include cold
+latest-manifest resolution. Plan I/O comes from Lance's execution summary. They
+are not additive. `iops`, `requests`, `bytes_read`, and `parts_loaded` are public
+summary fields on the surveyed pin; `fragments_scanned`, `ranges_scanned`, and
+`rows_scanned` come from beta.21's explicitly debug/subject-to-change
+`all_counts` map and must be re-audited on a Lance bump.
+
+Flat indexed row work cannot cancel history-growing latest-manifest metadata or
+byte ranges. Because §7.1 requires the complete compacted and uncompacted,
+local and object-store cost to be flat, this candidate fails Gate A. The RFC is
+therefore research-blocked, not accepted with a narrower claim.
 
 ## 8. Recovery protocol
 
@@ -472,7 +542,8 @@ No migration claimant, per-branch conversion ledger, old-format writer mode, or
 - owner-branch handoff at an equal table version updates the head;
 - delete/recreate of a dataset or native ref at the same path, branch, and
   numeric version changes `physical_ref_incarnation` and rejects a stale
-  writer, on local FS and S3/RustFS;
+  writer, on local FS and S3/RustFS; public token detection is proven, while
+  publisher-level stale-writer rejection remains unimplemented;
 - a current read refuses that same replacement until an authoritative publish
   selects its exact token; it never opens replacement data under the old head;
 - missing, duplicate, malformed, and schema-mismatched heads fail loudly.
@@ -512,7 +583,7 @@ No migration claimant, per-branch conversion ledger, old-format writer mode, or
 ### 12.4 Cost gates
 
 At fixed table count and increasing commit depth, assert flat curves for
-manifest reads, bytes, fragments/pages, and decoded rows:
+manifest reads, bytes, fragments/pages, and the `rows_scanned` proxy:
 
 - local FS, compacted and uncompacted;
 - S3/RustFS with real e_tags;
@@ -529,6 +600,14 @@ JSON `TableHeadMetadata` payload — must be bounded by catalog width. A
 per-read parse cost that grows with anything other than table count fails the
 gate even when I/O is flat.
 
+**Measured disposition (2026-07-15): rejected.** The exact BTREE lookup passes
+the logical-result, `rows_scanned`, range, fragment, page, absent-index negative
+control, and one/eight-uncovered-tail checks. It fails the required
+object-store-read/byte and compacted-byte curves recorded in §7.4. The
+bucket-gated S3 cost matrix remains an on-demand decision instrument rather
+than a correctness-CI test; the exact S3 physical-token guard is correctness
+coverage and does run against RustFS in CI.
+
 ### 12.5 Format guards
 
 - exact heads-format metadata schema and object IDs;
@@ -538,7 +617,7 @@ gate even when I/O is flat.
 - RFC-023 PK metadata on node and edge tables when the release combines them;
 - heads-format publisher source always pairs a journal/tombstone event with a head row.
 
-## 13. Decisions and open gates
+## 13. Decisions and gate disposition
 
 ### Decided
 
@@ -551,16 +630,29 @@ gate even when I/O is flat.
 - RFC-023 PK activation is verified at target initialization only when
   deliberately co-released.
 - Checkpoint retention is deferred.
+- The first in-manifest BTREE candidate is rejected: flat indexed scan work is
+  insufficient while latest-manifest/object byte work grows with history.
+- Production remains on internal schema v6; no heads-format number or partial
+  implementation is assigned.
 
-### Open ship gates
+### Gate status
 
-1. Accepted and implemented
-   [RFC-028](0028-stable-schema-identity.md) identity/incarnation contract.
-2. The in-manifest indexed lookup implementation and bounded uncovered-tail
-   proof.
-3. Passing local and object-store depth-slope cost gates.
-4. Final heads metadata JSON/typed-column compatibility review.
-5. Genuine old/new binary refusal plus export/init/load rebuild evidence.
-6. Combined initialization/recovery matrix for any co-released capability.
-7. A proven `physical_ref_incarnation` source on every supported backend; no
-   timestamp/version-only fallback is accepted without an ABA test.
+1. **Closed prerequisite:** [RFC-028](0028-stable-schema-identity.md)'s accepted
+   and implemented identity/incarnation contract.
+2. **Rejected candidate:** the in-manifest BTREE has correct bounded scan work
+   and bounded observable uncovered tails, but fails the complete physical cost
+   gate.
+3. **Failed ship gate:** local/object-store compacted and uncompacted
+   depth-slope requirements do not all pass; §7.4 records the no-go evidence.
+4. **Closed substrate proof for OmniGraph-wired file/S3 backends:** the public
+   `BranchIdentifier` + current transaction UUID + manifest e_tag composite
+   detects the measured same-version ABA cells and is stable for unchanged
+   reopens. Publisher capture/revalidation and stale-writer rejection remain
+   unimplemented.
+5. **Open if research resumes:** final metadata compatibility review, genuine
+   old/new refusal and export/init/load rebuild evidence, and the combined
+   initialization/recovery matrix for any co-released capability.
+
+Acceptance requires a new access shape that passes the original gate; it does
+not require weakening the gate or promoting this partially successful
+candidate.

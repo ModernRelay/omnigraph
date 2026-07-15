@@ -21,7 +21,11 @@ use std::sync::{Arc, Mutex};
 
 use async_trait::async_trait;
 use futures::stream::BoxStream;
+use lance::Dataset;
+use lance::dataset::builder::DatasetBuilder;
 use lance::io::WrappingObjectStore;
+use lance::session::Session;
+use lance_io::object_store::ObjectStoreParams;
 use lance_io::utils::tracking_store::IOTracker;
 use object_store::path::Path;
 use object_store::{
@@ -36,6 +40,24 @@ use omnigraph::instrumentation::{
 use omnigraph::loader::{LoadMode, load_jsonl};
 
 use super::{MUTATION_QUERIES, TEST_DATA, TEST_SCHEMA, init_and_load, mixed_params};
+
+/// Open a Lance dataset with its object-store tracker installed before the
+/// first manifest load. Cost fixtures must use this seam for cold-open evidence;
+/// wrapping an already-open handle misses latest-manifest resolution entirely.
+pub async fn open_tracked_lance_dataset(
+    uri: &str,
+    session: Arc<Session>,
+    tracker: &IOTracker,
+) -> lance::Result<Dataset> {
+    DatasetBuilder::from_uri(uri)
+        .with_session(session)
+        .with_store_params(ObjectStoreParams {
+            object_store_wrapper: Some(Arc::new(tracker.clone())),
+            ..Default::default()
+        })
+        .load()
+        .await
+}
 
 /// Object-store op counts for one measured operation, by table class — the
 /// vocabulary cost tests assert in (vs raw `IOTracker::stats().read_iops`).

@@ -88,7 +88,7 @@ jobs:
               .github/workflows/ci.yml|Cargo.toml|Cargo.lock|crates/*/Cargo.toml) run_rustfs_ci=true ;;
               crates/omnigraph/src/storage.rs) run_rustfs_ci=true ;;
               crates/omnigraph/src/db/manifest.rs|crates/omnigraph/src/db/manifest/*) run_rustfs_ci=true ;;
-              crates/omnigraph/tests/s3_storage.rs|crates/omnigraph/tests/write_cost_s3.rs|crates/omnigraph/tests/helpers/*) run_rustfs_ci=true ;;
+              crates/omnigraph/tests/s3_storage.rs|crates/omnigraph/tests/write_cost_s3.rs|crates/omnigraph/tests/lance_surface_guards.rs|crates/omnigraph/tests/helpers/*) run_rustfs_ci=true ;;
               crates/omnigraph/src/table_store.rs|crates/omnigraph/src/instrumentation.rs) run_rustfs_ci=true ;;
               crates/omnigraph/src/runtime_cache.rs|crates/omnigraph/src/graph_index/*) run_rustfs_ci=true ;;
               crates/omnigraph-cluster/src/store.rs|crates/omnigraph-cluster/src/serve.rs) run_rustfs_ci=true ;;
@@ -400,6 +400,19 @@ jobs:
       - name: Run RustFS storage tests
         if: matrix.shard == 'engine'
         run: cargo test --locked -p omnigraph-engine --test s3_storage -- --nocapture
+
+      - name: Run RustFS physical-ref incarnation guard
+        if: matrix.shard == 'engine'
+        run: |
+          set +e
+          output=$(cargo test --locked -p omnigraph-engine --test lance_surface_guards \
+            public_physical_ref_token_rejects_s3_same_version_aba -- --exact --nocapture 2>&1)
+          status=$?
+          set -e
+          echo "$output"
+          [ "$status" -eq 0 ] || exit "$status"
+          echo "$output" | grep -Eq "test result: ok\. 1 passed" \
+            || { echo "::error::S3 physical-ref guard matched no test — vacuous pass"; exit 1; }
 
       # NOTE: the RFC-013 step-3a data-table opener COST gate (write_cost_s3) used
       # to run here. It is a deterministic IO-count gate, not a correctness test —
