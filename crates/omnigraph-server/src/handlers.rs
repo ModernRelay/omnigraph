@@ -83,9 +83,7 @@ pub(crate) async fn server_graphs_list(
     Ok(Json(GraphListResponse { graphs }))
 }
 
-pub(crate) async fn server_openapi(
-    State(state): State<AppState>,
-) -> Json<utoipa::openapi::OpenApi> {
+pub(crate) async fn server_openapi(State(state): State<AppState>) -> Json<utoipa::openapi::OpenApi> {
     // `served_openapi` is the single nesting source — the protected
     // routes always live under `/graphs/{graph_id}/...` (public/management
     // paths `/healthz`, `/graphs` stay flat). Building from it here means
@@ -294,11 +292,7 @@ pub(crate) async fn resolve_graph_handle(
     Ok(next.run(request).await)
 }
 
-pub(crate) fn log_policy_decision(
-    actor_id: &str,
-    request: &PolicyRequest,
-    decision: &PolicyDecision,
-) {
+pub(crate) fn log_policy_decision(actor_id: &str, request: &PolicyRequest, decision: &PolicyDecision) {
     info!(
         actor_id = actor_id,
         action = %request.action,
@@ -514,9 +508,7 @@ pub(crate) fn deprecation_headers(successor_link: &'static str) -> [(HeaderName,
     ),
     security(("bearer_token" = [])),
 )]
-#[deprecated(
-    note = "use POST /query instead; /read is kept indefinitely for byte-stable back-compat"
-)]
+#[deprecated(note = "use POST /query instead; /read is kept indefinitely for byte-stable back-compat")]
 /// **Deprecated** — use [`POST /query`](#tag/queries/operation/query) instead.
 ///
 /// Execute a GQ read query. Behavior is unchanged from prior releases; the
@@ -687,8 +679,10 @@ pub(crate) async fn run_mutate(
     // estimated bytes per actor. Cedar runs FIRST so denied requests
     // don't consume admission slots. Estimate uses the request body
     // size as a coarse proxy; engine memory pressure can run higher.
-    let est_bytes =
-        query.len() as u64 + params_json.map(|p| p.to_string().len() as u64).unwrap_or(0);
+    let est_bytes = query.len() as u64
+        + params_json
+            .map(|p| p.to_string().len() as u64)
+            .unwrap_or(0);
     let _admission = state
         .workload
         .try_admit(&actor_arc, est_bytes)
@@ -762,8 +756,8 @@ pub(crate) async fn run_query(
             target_branch: None,
         },
     )?;
-    let query_decl = select_named_query_decl(query, name)
-        .map_err(|err| ApiError::bad_request(err.to_string()))?;
+    let query_decl =
+        select_named_query_decl(query, name).map_err(|err| ApiError::bad_request(err.to_string()))?;
     if reject_mutations && !query_decl.mutations.is_empty() {
         return Err(ApiError::bad_request(format!(
             "query '{}' contains mutations (insert/update/delete); use POST /mutate for write queries",
@@ -1639,12 +1633,8 @@ pub(crate) async fn server_branch_merge(
             .map_err(ApiError::from_omni)?
     };
     let (branch_deleted, branch_delete_error) = if request.delete_branch {
-        match delete_merged_source_branch(
-            &handle,
-            actor.as_ref().map(|Extension(a)| a),
-            &request.source,
-        )
-        .await
+        match delete_merged_source_branch(&handle, actor.as_ref().map(|Extension(a)| a), &request.source)
+            .await
         {
             Ok(()) => (Some(true), None),
             Err(message) => (Some(false), Some(message)),
@@ -1786,10 +1776,7 @@ pub(crate) async fn server_commit_show(
     Ok(Json(api::commit_output(&commit)))
 }
 
-pub(crate) fn read_target_from_request(
-    branch: Option<String>,
-    snapshot: Option<String>,
-) -> ReadTarget {
+pub(crate) fn read_target_from_request(branch: Option<String>, snapshot: Option<String>) -> ReadTarget {
     if let Some(snapshot) = snapshot {
         ReadTarget::snapshot(omnigraph::db::SnapshotId::new(snapshot))
     } else {

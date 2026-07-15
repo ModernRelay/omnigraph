@@ -10,6 +10,7 @@ mod support;
 
 use support::*;
 
+
 #[test]
 fn cluster_e2e_lifecycle_import_apply_status_refresh_converges() {
     let temp = tempdir().unwrap();
@@ -44,10 +45,7 @@ fn cluster_e2e_lifecycle_import_apply_status_refresh_converges() {
         status["resource_statuses"]["query.knowledge.find_person"]["status"],
         "applied"
     );
-    assert_eq!(
-        status["resource_statuses"]["policy.base"]["status"],
-        "applied"
-    );
+    assert_eq!(status["resource_statuses"]["policy.base"]["status"], "applied");
     assert!(
         status["state_observations"]["applied_config_digest"].is_string(),
         "converged apply must record the applied config digest: {status}"
@@ -124,10 +122,7 @@ node Person {
     let evolve = cluster_json(temp.path(), "apply");
     assert_eq!(evolve["ok"], true, "{evolve}");
     assert_eq!(evolve["converged"], true, "{evolve}");
-    assert_eq!(
-        change_for(&evolve, "schema.knowledge")["disposition"],
-        "applied"
-    );
+    assert_eq!(change_for(&evolve, "schema.knowledge")["disposition"], "applied");
 
     // The live graph carries the new schema; the plan is empty.
     let schema_show = output_success(
@@ -136,10 +131,7 @@ node Person {
             .arg("show")
             .arg(temp.path().join("graphs/knowledge.omni")),
     );
-    assert!(
-        stdout_string(&schema_show).contains("bio"),
-        "live schema updated"
-    );
+    assert!(stdout_string(&schema_show).contains("bio"), "live schema updated");
     let replan = cluster_json(temp.path(), "plan");
     assert!(
         replan["changes"].as_array().unwrap().is_empty(),
@@ -339,11 +331,7 @@ fn cluster_e2e_graph_root_destruction_drifts_then_apply_recreates_empty_graph() 
     );
     // Graph/schema digests removed; query/policy digests preserved.
     assert!(refresh["resource_digests"].get("graph.knowledge").is_none());
-    assert!(
-        refresh["resource_digests"]
-            .get("schema.knowledge")
-            .is_none()
-    );
+    assert!(refresh["resource_digests"].get("schema.knowledge").is_none());
     assert!(
         refresh["resource_digests"]
             .get("query.knowledge.find_person")
@@ -356,14 +344,8 @@ fn cluster_e2e_graph_root_destruction_drifts_then_apply_recreates_empty_graph() 
     // Stage 4A: the re-create is executable and the plan says so — nothing
     // hidden about converging a destroyed root back to an EMPTY graph (the
     // data was already lost; this is declarative convergence, RFC-004 §D1).
-    assert_eq!(
-        change_for(&plan, "graph.knowledge")["disposition"],
-        "applied"
-    );
-    assert_eq!(
-        change_for(&plan, "schema.knowledge")["disposition"],
-        "applied"
-    );
+    assert_eq!(change_for(&plan, "graph.knowledge")["disposition"], "applied");
+    assert_eq!(change_for(&plan, "schema.knowledge")["disposition"], "applied");
     // Converged-then-destroyed: query/policy are already in state at the
     // desired digests, so they are not changes at all.
     assert_eq!(plan["changes"].as_array().unwrap().len(), 2, "{plan}");
@@ -401,10 +383,7 @@ fn cluster_e2e_multi_graph_mixed_dispositions_then_approve_and_converge() {
     let apply = cluster_json(temp.path(), "apply");
     assert_eq!(apply["ok"], true, "{apply}");
     assert_eq!(apply["converged"], true, "{apply}");
-    assert_eq!(
-        change_for(&apply, "graph.knowledge")["disposition"],
-        "applied"
-    );
+    assert_eq!(change_for(&apply, "graph.knowledge")["disposition"], "applied");
     assert_eq!(
         change_for(&apply, "graph.engineering")["disposition"],
         "applied"
@@ -414,10 +393,7 @@ fn cluster_e2e_multi_graph_mixed_dispositions_then_approve_and_converge() {
         "applied"
     );
     // The graph-spanning and cluster-scoped policies ride the same run.
-    assert_eq!(
-        change_for(&apply, "policy.shared")["disposition"],
-        "applied"
-    );
+    assert_eq!(change_for(&apply, "policy.shared")["disposition"], "applied");
     assert_eq!(
         change_for(&apply, "policy.cluster_wide")["disposition"],
         "applied"
@@ -492,10 +468,7 @@ policies:
     // 5A: policy.shared's applies_to narrowed with an unchanged file digest
     // — now a first-class binding change, applied in the same run.
     assert_eq!(change_for(&mixed, "policy.shared")["binding_change"], true);
-    assert_eq!(
-        change_for(&mixed, "policy.shared")["disposition"],
-        "applied"
-    );
+    assert_eq!(change_for(&mixed, "policy.shared")["disposition"], "applied");
     assert_eq!(
         change_for(&mixed, "graph.knowledge")["disposition"],
         "derived"
@@ -535,10 +508,7 @@ policies:
     assert!(!temp.path().join("graphs/engineering.omni").exists());
 
     let status = cluster_json(temp.path(), "status");
-    assert_eq!(
-        status["observations"]["graph.engineering"]["kind"],
-        "tombstone"
-    );
+    assert_eq!(status["observations"]["graph.engineering"]["kind"], "tombstone");
     let final_plan = cluster_json(temp.path(), "plan");
     assert!(
         final_plan["changes"].as_array().unwrap().is_empty(),
@@ -574,10 +544,7 @@ fn cluster_e2e_declared_graph_created_by_apply() {
     let apply = cluster_json(temp.path(), "apply");
     assert_eq!(apply["ok"], true, "{apply}");
     assert_eq!(apply["converged"], true, "{apply}");
-    assert_eq!(
-        change_for(&apply, "graph.knowledge")["disposition"],
-        "applied"
-    );
+    assert_eq!(change_for(&apply, "graph.knowledge")["disposition"], "applied");
     assert!(temp.path().join("graphs/knowledge.omni").exists());
 
     // The created graph is a real graph: the per-graph CLI can open it.

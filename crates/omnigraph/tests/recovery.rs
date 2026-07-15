@@ -18,8 +18,8 @@ use lance::Dataset;
 use omnigraph::db::Omnigraph;
 
 mod helpers;
-use helpers::recovery::{RecoveryExpectation, TableExpectation, assert_post_recovery_invariants};
 use helpers::snapshot_main;
+use helpers::recovery::{RecoveryExpectation, TableExpectation, assert_post_recovery_invariants};
 
 const TEST_SCHEMA: &str = include_str!("fixtures/test.pg");
 
@@ -45,7 +45,10 @@ fn list_recovery_dir(graph_root: &Path) -> Vec<String> {
 /// Resolve one live node table's identity-bound physical URI and serialize the
 /// explicit identity required by every recovery generation. The snapshot owns
 /// the path; the accepted bound catalog owns the same stable/incarnation pair.
-async fn node_table_fixture(db: &Omnigraph, type_name: &str) -> (String, serde_json::Value) {
+async fn node_table_fixture(
+    db: &Omnigraph,
+    type_name: &str,
+) -> (String, serde_json::Value) {
     let table_key = format!("node:{type_name}");
     let snapshot = db
         .snapshot_of(omnigraph::db::ReadTarget::branch("main"))
@@ -381,8 +384,7 @@ async fn read_only_open_skips_recovery_sweep() {
     // Drop a syntactically-valid but invariant-violating sidecar (HEAD < pin
     // would error if classified). Read-only must NOT classify it — it must
     // skip the sweep entirely.
-    let sidecar_json = format!(
-        r#"{{
+    let sidecar_json = format!(r#"{{
         "schema_version": 1,
         "operation_id": "01H000000000000000000000RO",
         "started_at": "0",
@@ -398,8 +400,7 @@ async fn read_only_open_skips_recovery_sweep() {
                 "post_commit_pin": 100
             }}
         ]
-    }}"#
-    );
+    }}"#);
     write_sidecar_file(dir.path(), "01H000000000000000000000RO", &sidecar_json);
 
     // ReadOnly open must succeed — the sweep is skipped, so the bogus
@@ -444,7 +445,11 @@ async fn read_only_open_accepts_only_completed_coherent_v5_schema_apply_sidecar(
     // v5 writes the marker only after its manifest publish. If the target
     // identity is also live, only audit/delete cleanup remains and read-only
     // open can prove that its manifest/catalog pair is coherent.
-    write_sidecar_file(dir.path(), operation_id, &sidecar_json(true, live_hash));
+    write_sidecar_file(
+        dir.path(),
+        operation_id,
+        &sidecar_json(true, live_hash),
+    );
     let read_only = Omnigraph::open_read_only(uri).await.unwrap();
     drop(read_only);
     assert!(
@@ -454,7 +459,11 @@ async fn read_only_open_accepts_only_completed_coherent_v5_schema_apply_sidecar(
 
     // Without the published marker, even a matching target may be an active
     // recovery that still needs its manifest delta; read-only must fail closed.
-    write_sidecar_file(dir.path(), operation_id, &sidecar_json(false, live_hash));
+    write_sidecar_file(
+        dir.path(),
+        operation_id,
+        &sidecar_json(false, live_hash),
+    );
     assert!(Omnigraph::open_read_only(uri).await.is_err());
 
     // A published marker paired with a non-live target is the torn window and

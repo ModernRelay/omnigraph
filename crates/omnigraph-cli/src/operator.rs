@@ -440,7 +440,11 @@ pub(crate) fn remove_credential(server: &str) -> Result<PathBuf> {
     Ok(path)
 }
 
-pub(crate) fn rewrite_credentials_at(path: &Path, server: &str, token: Option<&str>) -> Result<()> {
+pub(crate) fn rewrite_credentials_at(
+    path: &Path,
+    server: &str,
+    token: Option<&str>,
+) -> Result<()> {
     let existing = match std::fs::read_to_string(path) {
         Ok(text) => {
             refuse_over_permissive(path)?;
@@ -669,16 +673,9 @@ profiles:
         let config = load_operator_config_at(&path).unwrap();
         assert_eq!(config.default_server(), Some("prod"));
         assert_eq!(config.default_graph(), Some("knowledge"));
+        assert_eq!(config.cluster_root("brain"), Some("s3://acme/clusters/brain"));
         assert_eq!(
-            config.cluster_root("brain"),
-            Some("s3://acme/clusters/brain")
-        );
-        assert_eq!(
-            config
-                .profile("staging")
-                .unwrap()
-                .binding("staging")
-                .unwrap(),
+            config.profile("staging").unwrap().binding("staging").unwrap(),
             ScopeBinding::Server("staging".into())
         );
         assert_eq!(
@@ -690,11 +687,7 @@ profiles:
             ScopeBinding::Cluster("brain".into())
         );
         // No unknown-key warnings for the new blocks.
-        assert!(
-            config.unknown_key_warnings().is_empty(),
-            "{:?}",
-            config.unknown_key_warnings()
-        );
+        assert!(config.unknown_key_warnings().is_empty(), "{:?}", config.unknown_key_warnings());
     }
 
     #[test]

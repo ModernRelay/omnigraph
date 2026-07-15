@@ -415,9 +415,7 @@ mod tests {
 
     #[test]
     fn flat_default_server_drives_data_verbs() {
-        let op = cfg(
-            "defaults:\n  server: prod\n  default_graph: knowledge\nservers:\n  prod:\n    url: https://x\n",
-        );
+        let op = cfg("defaults:\n  server: prod\n  default_graph: knowledge\nservers:\n  prod:\n    url: https://x\n");
         let scope = resolve_scope(&op, Capability::Any, flags()).unwrap();
         assert_eq!(scope.server.as_deref(), Some("prod"));
         assert_eq!(scope.graph.as_deref(), Some("knowledge"));
@@ -484,9 +482,7 @@ mod tests {
     #[test]
     fn server_scope_on_maintenance_verb_errors() {
         let op = cfg("defaults:\n  server: prod\nservers:\n  prod:\n    url: https://x\n");
-        let err = resolve_scope(&op, Capability::Direct, flags())
-            .unwrap_err()
-            .to_string();
+        let err = resolve_scope(&op, Capability::Direct, flags()).unwrap_err().to_string();
         assert!(err.contains("direct storage access"), "{err}");
     }
 

@@ -319,30 +319,16 @@ mod tests {
 
     #[test]
     fn command_capability_classifies_representative_verbs() {
-        let cap = |args: &[&str]| command_capability(&Cli::try_parse_from(args).unwrap().command);
+        let cap = |args: &[&str]| {
+            command_capability(&Cli::try_parse_from(args).unwrap().command)
+        };
         // The one Data→Served refinement — if the `graphs` guard were deleted,
         // every other assertion here would still pass.
         assert_eq!(cap(&["omnigraph", "graphs", "list"]), Capability::Served);
         assert_eq!(cap(&["omnigraph", "alias", "who"]), Capability::Local);
-        assert_eq!(
-            cap(&["omnigraph", "optimize", "graph.omni"]),
-            Capability::Direct
-        );
-        assert_eq!(
-            cap(&[
-                "omnigraph",
-                "schema",
-                "plan",
-                "--schema",
-                "s.pg",
-                "graph.omni"
-            ]),
-            Capability::Direct
-        );
-        assert_eq!(
-            cap(&["omnigraph", "cluster", "status", "--config", "."]),
-            Capability::Control
-        );
+        assert_eq!(cap(&["omnigraph", "optimize", "graph.omni"]), Capability::Direct);
+        assert_eq!(cap(&["omnigraph", "schema", "plan", "--schema", "s.pg", "graph.omni"]), Capability::Direct);
+        assert_eq!(cap(&["omnigraph", "cluster", "status", "--config", "."]), Capability::Control);
         assert_eq!(cap(&["omnigraph", "version"]), Capability::Local);
         // `queries`/`policy` tooling reads cluster state now (control plane).
         assert_eq!(cap(&["omnigraph", "queries", "list"]), Capability::Control);

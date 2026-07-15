@@ -246,7 +246,10 @@ impl OmniError {
         )
     }
 
-    pub fn recovery_required(operation_id: impl Into<String>, reason: impl Into<String>) -> Self {
+    pub fn recovery_required(
+        operation_id: impl Into<String>,
+        reason: impl Into<String>,
+    ) -> Self {
         Self::RecoveryRequired {
             operation_id: operation_id.into(),
             reason: reason.into(),

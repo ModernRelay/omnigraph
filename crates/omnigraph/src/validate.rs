@@ -95,10 +95,7 @@ pub(crate) type ChangeSet = HashMap<String, TableChange>;
 /// (nodes **and** edges) — Δ-scoped to the changed rows. Reuses the loader
 /// leaves so the merge and write paths share one implementation; including the
 /// enum check here is what closes the merge-vs-write drift.
-pub(crate) fn evaluate_value_constraints(
-    changeset: &ChangeSet,
-    catalog: &Catalog,
-) -> Vec<Violation> {
+pub(crate) fn evaluate_value_constraints(changeset: &ChangeSet, catalog: &Catalog) -> Vec<Violation> {
     let mut violations = Vec::new();
     for (table_key, change) in changeset {
         if let Some(type_name) = table_key.strip_prefix("node:") {
@@ -109,8 +106,7 @@ pub(crate) fn evaluate_value_constraints(
                 if let Err(err) = validate_value_constraints(batch, node_type) {
                     violations.push(value_violation(table_key, err));
                 }
-                if let Err(err) = validate_enum_constraints(batch, &node_type.properties, type_name)
-                {
+                if let Err(err) = validate_enum_constraints(batch, &node_type.properties, type_name) {
                     violations.push(value_violation(table_key, err));
                 }
             }
@@ -121,8 +117,7 @@ pub(crate) fn evaluate_value_constraints(
             // Edges carry no @range/@check (NodeType-only), but their properties
             // can be enum-typed — the check the merge path was missing.
             for batch in change.value_batches() {
-                if let Err(err) = validate_enum_constraints(batch, &edge_type.properties, type_name)
-                {
+                if let Err(err) = validate_enum_constraints(batch, &edge_type.properties, type_name) {
                     violations.push(value_violation(table_key, err));
                 }
             }
@@ -263,11 +258,7 @@ impl<'a> CommittedState<'a> {
     /// Write path: existence/uniqueness read `committed` (the write's pinned
     /// base); cardinality reads the live committed branch snapshot via `db`
     /// (#298).
-    pub(crate) fn write(
-        committed: &'a Snapshot,
-        db: &'a Omnigraph,
-        branch: Option<&'a str>,
-    ) -> Self {
+    pub(crate) fn write(committed: &'a Snapshot, db: &'a Omnigraph, branch: Option<&'a str>) -> Self {
         Self {
             committed: Some(committed),
             overwritten: HashSet::new(),
@@ -638,10 +629,8 @@ pub(crate) async fn evaluate(
                 let change = changeset.get(table_key);
                 if change.is_some() || node_deleted(from_type) || node_deleted(to_type) {
                     violations.extend(
-                        evaluate_edge_ri(
-                            table_key, from_type, to_type, change, changeset, committed,
-                        )
-                        .await?,
+                        evaluate_edge_ri(table_key, from_type, to_type, change, changeset, committed)
+                            .await?,
                     );
                 }
             }
@@ -652,10 +641,8 @@ pub(crate) async fn evaluate(
                     };
                     if let Some(edge_type) = catalog.edge_types.get(type_name) {
                         violations.extend(
-                            evaluate_cardinality(
-                                table_key, edge_type, change, changeset, committed,
-                            )
-                            .await?,
+                            evaluate_cardinality(table_key, edge_type, change, changeset, committed)
+                                .await?,
                         );
                     }
                 }
@@ -799,8 +786,7 @@ async fn evaluate_edge_ri(
         if !edges.is_empty() {
             let srcs: Vec<String> = edges.iter().map(|(_, src, _)| src.clone()).collect();
             let dsts: Vec<String> = edges.iter().map(|(_, _, dst)| dst.clone()).collect();
-            let from_exist =
-                merged_node_existence(&from_table, &srcs, changeset, committed).await?;
+            let from_exist = merged_node_existence(&from_table, &srcs, changeset, committed).await?;
             let to_exist = merged_node_existence(&to_table, &dsts, changeset, committed).await?;
             for (id, src, dst) in &edges {
                 if !from_exist.contains(src) {
@@ -921,12 +907,8 @@ async fn evaluate_cardinality(
     // in `deleted_ids`). `moved_from` are the changed ids' OLD committed srcs: an
     // upsert that moves an edge's src vacates its old src, which must be
     // recounted or a drop below @card min is missed.
-    let removed_edges = committed
-        .committed_edges(edge_table, "id", &removed_ids)
-        .await?;
-    let moved_from = committed
-        .committed_edges(edge_table, "id", &changed_ids)
-        .await?;
+    let removed_edges = committed.committed_edges(edge_table, "id", &removed_ids).await?;
+    let moved_from = committed.committed_edges(edge_table, "id", &changed_ids).await?;
 
     let deleted_src_nodes: HashSet<String> = changeset
         .get(&format!("node:{}", edge_type.from_type))
@@ -1068,8 +1050,7 @@ mod tests {
     use omnigraph_compiler::catalog::build_catalog;
     use omnigraph_compiler::schema::parser::parse_schema;
 
-    const DOC_SCHEMA: &str =
-        "node Doc {\n  slug: String @key\n  status: enum(draft, published)\n}\n";
+    const DOC_SCHEMA: &str = "node Doc {\n  slug: String @key\n  status: enum(draft, published)\n}\n";
 
     fn catalog(src: &str) -> Catalog {
         build_catalog(&parse_schema(src).unwrap()).unwrap()
@@ -1077,16 +1058,10 @@ mod tests {
 
     /// A change-set touching only `Doc.status` with the given values.
     fn status_change(values: &[&str]) -> ChangeSet {
-        let schema = Arc::new(Schema::new(vec![Field::new(
-            "status",
-            DataType::Utf8,
-            true,
-        )]));
-        let batch = RecordBatch::try_new(
-            schema,
-            vec![Arc::new(StringArray::from(values.to_vec())) as _],
-        )
-        .unwrap();
+        let schema = Arc::new(Schema::new(vec![Field::new("status", DataType::Utf8, true)]));
+        let batch =
+            RecordBatch::try_new(schema, vec![Arc::new(StringArray::from(values.to_vec())) as _])
+                .unwrap();
         let mut change = TableChange::default();
         change.changed.push(batch);
         let mut cs = ChangeSet::new();
@@ -1102,11 +1077,7 @@ mod tests {
         let v = evaluate_value_constraints(&status_change(&["bogus"]), &catalog(DOC_SCHEMA));
         assert_eq!(v.len(), 1, "expected one enum violation, got {v:?}");
         assert_eq!(v[0].kind, MergeConflictKind::ValueConstraintViolation);
-        assert!(
-            v[0].message.contains("bogus"),
-            "message was: {}",
-            v[0].message
-        );
+        assert!(v[0].message.contains("bogus"), "message was: {}", v[0].message);
     }
 
     #[test]

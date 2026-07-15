@@ -1882,7 +1882,10 @@ async fn first_write_self_heals_manifest_unreferenced_fork_on_live_branch() {
     db.branch_create("feature").await.unwrap();
 
     // Forge the manifest-unreferenced fork directly at the Lance layer.
-    let main = db.snapshot_of(ReadTarget::branch("main")).await.unwrap();
+    let main = db
+        .snapshot_of(ReadTarget::branch("main"))
+        .await
+        .unwrap();
     let person_path = &main.entry("node:Person").unwrap().table_path;
     let person_uri = format!(
         "{}/{}",

@@ -106,28 +106,30 @@ impl QueryRegistry {
 
         for spec in specs {
             match parse_query(&spec.source) {
-                Ok(file) => match file.queries.into_iter().find(|q| q.name == spec.name) {
-                    Some(decl) => {
-                        by_name.insert(
-                            spec.name.clone(),
-                            StoredQuery {
-                                name: spec.name,
-                                source: Arc::from(spec.source),
-                                decl,
-                                expose: spec.expose,
-                                tool_name: spec.tool_name,
-                            },
-                        );
-                    }
-                    None => errors.push(LoadError {
-                        query: Some(spec.name.clone()),
-                        message: format!(
-                            "no `query {}` declaration found in its `.gq` file \
+                Ok(file) => {
+                    match file.queries.into_iter().find(|q| q.name == spec.name) {
+                        Some(decl) => {
+                            by_name.insert(
+                                spec.name.clone(),
+                                StoredQuery {
+                                    name: spec.name,
+                                    source: Arc::from(spec.source),
+                                    decl,
+                                    expose: spec.expose,
+                                    tool_name: spec.tool_name,
+                                },
+                            );
+                        }
+                        None => errors.push(LoadError {
+                            query: Some(spec.name.clone()),
+                            message: format!(
+                                "no `query {}` declaration found in its `.gq` file \
                                  (the registry key must match the query symbol)",
-                            spec.name
-                        ),
-                    }),
-                },
+                                spec.name
+                            ),
+                        }),
+                    }
+                }
                 Err(err) => errors.push(LoadError {
                     query: Some(spec.name),
                     message: format!("parse error: {err}"),
@@ -364,10 +366,7 @@ mod tests {
         let q = reg.lookup("b").unwrap();
         assert_eq!(q.name, "b");
         assert_eq!(q.decl.params[0].name, "y");
-        assert!(
-            reg.lookup("a").is_none(),
-            "only the selected symbol is registered"
-        );
+        assert!(reg.lookup("a").is_none(), "only the selected symbol is registered");
     }
 
     #[test]
@@ -376,18 +375,8 @@ mod tests {
         // the catalog key space — refused at load, naming both queries and
         // the contested tool.
         let errors = QueryRegistry::from_specs(vec![
-            spec_tool(
-                "a",
-                "query a() { match { $u: User } return { $u.name } }",
-                true,
-                "dup",
-            ),
-            spec_tool(
-                "b",
-                "query b() { match { $u: User } return { $u.name } }",
-                true,
-                "dup",
-            ),
+            spec_tool("a", "query a() { match { $u: User } return { $u.name } }", true, "dup"),
+            spec_tool("b", "query b() { match { $u: User } return { $u.name } }", true, "dup"),
         ])
         .unwrap_err();
         assert_eq!(errors.len(), 1);
@@ -402,18 +391,8 @@ mod tests {
         // Unexposed queries have no MCP tool, so a shared effective tool
         // name is inert — must not error (pins the exposed-only scope).
         let reg = QueryRegistry::from_specs(vec![
-            spec_tool(
-                "a",
-                "query a() { match { $u: User } return { $u.name } }",
-                false,
-                "dup",
-            ),
-            spec_tool(
-                "b",
-                "query b() { match { $u: User } return { $u.name } }",
-                false,
-                "dup",
-            ),
+            spec_tool("a", "query a() { match { $u: User } return { $u.name } }", false, "dup"),
+            spec_tool("b", "query b() { match { $u: User } return { $u.name } }", false, "dup"),
         ])
         .unwrap();
         assert_eq!(reg.len(), 2);
@@ -431,16 +410,8 @@ mod tests {
     #[test]
     fn errors_collect_rather_than_fail_fast() {
         let errors = QueryRegistry::from_specs(vec![
-            spec(
-                "good",
-                "query good() { match { $u: User } return { $u.name } }",
-                false,
-            ),
-            spec(
-                "mismatch",
-                "query other() { match { $u: User } return { $u.name } }",
-                false,
-            ),
+            spec("good", "query good() { match { $u: User } return { $u.name } }", false),
+            spec("mismatch", "query other() { match { $u: User } return { $u.name } }", false),
             spec("broken", "query broken(", false),
         ])
         .unwrap_err();
@@ -522,16 +493,8 @@ embedding: Vector(4)
     #[test]
     fn check_collects_every_breakage_not_fail_fast() {
         let reg = QueryRegistry::from_specs(vec![
-            spec(
-                "a",
-                "query a() { match { $w: Widget } return { $w.x } }",
-                false,
-            ),
-            spec(
-                "b",
-                "query b() { match { $g: Gadget } return { $g.y } }",
-                false,
-            ),
+            spec("a", "query a() { match { $w: Widget } return { $w.x } }", false),
+            spec("b", "query b() { match { $g: Gadget } return { $g.y } }", false),
             spec(
                 "ok",
                 "query ok() { match { $u: User } return { $u.name } }",
@@ -540,12 +503,7 @@ embedding: Vector(4)
         ])
         .unwrap();
         let report = check(&reg, &test_catalog());
-        assert_eq!(
-            report.breakages.len(),
-            2,
-            "both bad queries reported: {:?}",
-            report
-        );
+        assert_eq!(report.breakages.len(), 2, "both bad queries reported: {:?}", report);
     }
 
     #[test]
@@ -589,11 +547,7 @@ embedding: Vector(4)
         )])
         .unwrap();
         let report = check(&reg, &test_catalog());
-        assert!(
-            report.is_clean(),
-            "no breakage or warning expected: {:?}",
-            report
-        );
+        assert!(report.is_clean(), "no breakage or warning expected: {:?}", report);
     }
 
     // --- catalog projection (api::query_catalog_entry) ---
@@ -619,11 +573,7 @@ embedding: Vector(4)
             entry.params.iter().map(|p| (p.name.as_str(), p)).collect();
         assert_eq!(by["s"].kind, ParamKind::String);
         assert_eq!(by["i"].kind, ParamKind::Int);
-        assert_eq!(
-            by["big"].kind,
-            ParamKind::BigInt,
-            "I64 → bigint (string on the wire)"
-        );
+        assert_eq!(by["big"].kind, ParamKind::BigInt, "I64 → bigint (string on the wire)");
         assert_eq!(by["u"].kind, ParamKind::BigInt, "U64 → bigint");
         assert_eq!(by["f"].kind, ParamKind::Float);
         assert_eq!(by["b"].kind, ParamKind::Bool);
@@ -633,11 +583,7 @@ embedding: Vector(4)
         assert!(!by["s"].nullable);
         assert!(by["opt"].nullable, "String? → nullable");
         assert_eq!(by["list"].kind, ParamKind::List);
-        assert_eq!(
-            by["list"].item_kind,
-            Some(ParamKind::Int),
-            "[I32] → list of int"
-        );
+        assert_eq!(by["list"].item_kind, Some(ParamKind::Int), "[I32] → list of int");
         assert_eq!(by["vec"].kind, ParamKind::Vector);
         assert_eq!(by["vec"].vector_dim, Some(4));
     }
@@ -663,4 +609,5 @@ embedding: Vector(4)
         let entry2 = api::query_catalog_entry(reg2.lookup("no_params").unwrap());
         assert!(entry2.params.is_empty(), "no declared params → empty list");
     }
+
 }

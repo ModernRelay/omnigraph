@@ -1,11 +1,13 @@
 //! Stored-query commands and alias resolution.
 //! Moved verbatim from tests/cli.rs in the modularization.
 
+
 use tempfile::tempdir;
 
 mod support;
 
 use support::*;
+
 
 #[test]
 fn query_check_alias_matches_lint_output() {
@@ -140,11 +142,7 @@ fn queries_and_policy_wrong_server_scope_points_at_cluster_scope() {
 
 /// Build a converged single-graph cluster (id `knowledge`) with one stored
 /// query. `query_block` is the YAML under the graph's `queries:` key.
-fn converged_cluster_with_query(
-    query_file: &str,
-    query_src: &str,
-    query_block: &str,
-) -> tempfile::TempDir {
+fn converged_cluster_with_query(query_file: &str, query_src: &str, query_block: &str) -> tempfile::TempDir {
     let temp = tempdir().unwrap();
     let dir = temp.path();
     std::fs::copy(fixture("test.pg"), dir.join("graph.pg")).unwrap();
@@ -250,11 +248,7 @@ fn queries_list_surfaces_description_and_instruction() {
 
     // Human output.
     let output = output_success(
-        cli()
-            .arg("queries")
-            .arg("list")
-            .arg("--cluster")
-            .arg(cluster.path()),
+        cli().arg("queries").arg("list").arg("--cluster").arg(cluster.path()),
     );
     let stdout = stdout_string(&output);
     assert!(
@@ -302,11 +296,7 @@ fn queries_list_indents_multiline_annotation_continuation() {
         "      multi:\n        file: ./multi.gq\n",
     );
     let output = output_success(
-        cli()
-            .arg("queries")
-            .arg("list")
-            .arg("--cluster")
-            .arg(cluster.path()),
+        cli().arg("queries").arg("list").arg("--cluster").arg(cluster.path()),
     );
     let stdout = stdout_string(&output);
     // "    description: " is 17 chars wide; the continuation aligns under it.
@@ -329,11 +319,7 @@ fn queries_list_omits_annotations_when_absent() {
 
     // Human output: the query is listed, but no annotation lines.
     let output = output_success(
-        cli()
-            .arg("queries")
-            .arg("list")
-            .arg("--cluster")
-            .arg(cluster.path()),
+        cli().arg("queries").arg("list").arg("--cluster").arg(cluster.path()),
     );
     let stdout = stdout_string(&output);
     assert!(stdout.contains("bare()"), "stdout:\n{stdout}");

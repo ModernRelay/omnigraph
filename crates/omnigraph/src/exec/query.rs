@@ -162,10 +162,9 @@ async fn extract_search_mode(
             property,
             query,
         } => {
-            let vec = resolve_nearest_query_vec(
-                ir, catalog, variable, property, query, params, embedding,
-            )
-            .await?;
+            let vec =
+                resolve_nearest_query_vec(ir, catalog, variable, property, query, params, embedding)
+                    .await?;
             let k = ir.limit.ok_or_else(|| {
                 OmniError::manifest("nearest() ordering requires a limit clause".to_string())
             })? as usize;
@@ -242,10 +241,9 @@ async fn extract_sub_search_mode(
             property,
             query,
         } => {
-            let vec = resolve_nearest_query_vec(
-                ir, catalog, variable, property, query, params, embedding,
-            )
-            .await?;
+            let vec =
+                resolve_nearest_query_vec(ir, catalog, variable, property, query, params, embedding)
+                    .await?;
             let k = limit.unwrap_or(100) as usize;
             Ok(SearchMode {
                 nearest: Some((variable.clone(), property.clone(), vec, k)),
@@ -792,7 +790,10 @@ fn referenced_edge_types(
         .collect()
 }
 
-fn collect_referenced_edge_names(pipeline: &[IROp], out: &mut std::collections::BTreeSet<String>) {
+fn collect_referenced_edge_names(
+    pipeline: &[IROp],
+    out: &mut std::collections::BTreeSet<String>,
+) {
     for op in pipeline {
         match op {
             IROp::Expand { edge_type, .. } => {
@@ -864,12 +865,12 @@ impl<'a> GraphIndexHandle<'a> {
             .get_or_try_init(|| async {
                 match &self.builder {
                     GraphIndexBuilder::None => Ok::<Option<Arc<GraphIndex>>, OmniError>(None),
-                    GraphIndexBuilder::Cached(db, resolved, edge_types) => Ok(Some(
-                        db.graph_index_for_resolved(resolved, edge_types).await?,
-                    )),
-                    GraphIndexBuilder::Direct(snapshot, edge_types) => Ok(Some(Arc::new(
-                        GraphIndex::build(snapshot, edge_types).await?,
-                    ))),
+                    GraphIndexBuilder::Cached(db, resolved, edge_types) => {
+                        Ok(Some(db.graph_index_for_resolved(resolved, edge_types).await?))
+                    }
+                    GraphIndexBuilder::Direct(snapshot, edge_types) => {
+                        Ok(Some(Arc::new(GraphIndex::build(snapshot, edge_types).await?)))
+                    }
                 }
             })
             .await?;
@@ -1210,19 +1211,8 @@ async fn execute_expand(
             OmniError::manifest("graph index required for CSR traversal".to_string())
         })?;
         return execute_expand_csr(
-            wide,
-            gi,
-            snapshot,
-            catalog,
-            src_var,
-            dst_var,
-            edge_type,
-            direction,
-            dst_type,
-            min_hops,
-            max_hops,
-            dst_filters,
-            params,
+            wide, gi, snapshot, catalog, src_var, dst_var, edge_type, direction, dst_type,
+            min_hops, max_hops, dst_filters, params,
         )
         .await;
     }
@@ -1270,19 +1260,8 @@ async fn execute_expand(
                     OmniError::manifest("graph index required for CSR traversal".to_string())
                 })?;
                 return execute_expand_csr(
-                    wide,
-                    gi,
-                    snapshot,
-                    catalog,
-                    src_var,
-                    dst_var,
-                    edge_type,
-                    direction,
-                    dst_type,
-                    min_hops,
-                    max_hops,
-                    dst_filters,
-                    params,
+                    wide, gi, snapshot, catalog, src_var, dst_var, edge_type, direction, dst_type,
+                    min_hops, max_hops, dst_filters, params,
                 )
                 .await;
             }
@@ -1300,19 +1279,8 @@ async fn execute_expand(
     // Surface the C6 silent scalar-index fallback once, now that coverage is known.
     warn_on_degraded_coverage(&coverage, key_col, edge_type);
     execute_expand_indexed(
-        wide,
-        snapshot,
-        catalog,
-        src_var,
-        dst_var,
-        edge_type,
-        direction,
-        dst_type,
-        min_hops,
-        max_hops,
-        dst_filters,
-        params,
-        edge_ds,
+        wide, snapshot, catalog, src_var, dst_var, edge_type, direction, dst_type, min_hops,
+        max_hops, dst_filters, params, edge_ds,
     )
     .await
 }
@@ -1427,10 +1395,7 @@ async fn execute_expand_indexed(
         let mut neighbor_map: HashMap<u32, Vec<u32>> = HashMap::new();
         for &(key_col, opp_col) in probes {
             let batches = crate::table_store::TableStore::scan_edges_by_endpoint(
-                &edge_ds,
-                key_col,
-                opp_col,
-                &union_keys,
+                &edge_ds, key_col, opp_col, &union_keys,
             )
             .await?;
             for batch in &batches {
@@ -1441,9 +1406,7 @@ async fn execute_expand_indexed(
                     })?
                     .as_any()
                     .downcast_ref::<StringArray>()
-                    .ok_or_else(|| {
-                        OmniError::manifest(format!("edge '{}' is not Utf8", key_col))
-                    })?;
+                    .ok_or_else(|| OmniError::manifest(format!("edge '{}' is not Utf8", key_col)))?;
                 let opps = batch
                     .column_by_name(opp_col)
                     .ok_or_else(|| {
@@ -1451,9 +1414,7 @@ async fn execute_expand_indexed(
                     })?
                     .as_any()
                     .downcast_ref::<StringArray>()
-                    .ok_or_else(|| {
-                        OmniError::manifest(format!("edge '{}' is not Utf8", opp_col))
-                    })?;
+                    .ok_or_else(|| OmniError::manifest(format!("edge '{}' is not Utf8", opp_col)))?;
                 for r in 0..batch.num_rows() {
                     let k = interner.get_or_insert(keys.value(r));
                     let o = interner.get_or_insert(opps.value(r));
@@ -1497,15 +1458,7 @@ async fn execute_expand_indexed(
         .collect();
 
     expand_hydrate_and_align(
-        wide,
-        src_indices,
-        dst_ids,
-        snapshot,
-        catalog,
-        dst_type,
-        dst_var,
-        dst_filters,
-        params,
+        wide, src_indices, dst_ids, snapshot, catalog, dst_type, dst_var, dst_filters, params,
     )
     .await
 }
@@ -1543,15 +1496,8 @@ async fn expand_hydrate_and_align(
             }
         }
     }
-    let dst_batch = hydrate_nodes(
-        snapshot,
-        catalog,
-        dst_type,
-        &unique_dst_list,
-        dst_filters,
-        params,
-    )
-    .await?;
+    let dst_batch =
+        hydrate_nodes(snapshot, catalog, dst_type, &unique_dst_list, dst_filters, params).await?;
 
     // id -> row index in the hydrated batch.
     let dst_batch_id_col = dst_batch
@@ -1645,9 +1591,11 @@ async fn execute_expand_csr(
     // Undirected: additionally walk incoming edges (CSC); the BFS gates below
     // dedup pairs that exist in both directions and self-loops.
     let adj_rev = match direction {
-        Direction::Both => Some(graph_index.csc(edge_type).ok_or_else(|| {
-            OmniError::manifest(format!("no adjacency index for edge '{}'", edge_type))
-        })?),
+        Direction::Both => Some(
+            graph_index
+                .csc(edge_type)
+                .ok_or_else(|| OmniError::manifest(format!("no adjacency index for edge '{}'", edge_type)))?,
+        ),
         _ => None,
     };
 
@@ -1762,8 +1710,7 @@ async fn hydrate_nodes(
     // `id IN (ids)` AND any pushable destination filters, as a structured Expr.
     let id_list: Vec<datafusion::prelude::Expr> = ids.iter().map(|id| lit(id.clone())).collect();
     let mut filter_expr = col("id").in_list(id_list, false);
-    if let Some(dst_expr) =
-        build_lance_filter_expr(dst_filters, params, Some(&node_type.arrow_schema))
+    if let Some(dst_expr) = build_lance_filter_expr(dst_filters, params, Some(&node_type.arrow_schema))
     {
         filter_expr = filter_expr.and(dst_expr);
     }
@@ -1997,9 +1944,7 @@ async fn execute_anti_join(
         }
     }
 
-    let keep_mask: Vec<bool> = (0..num_rows as u32)
-        .map(|i| !matched.contains(&i))
-        .collect();
+    let keep_mask: Vec<bool> = (0..num_rows as u32).map(|i| !matched.contains(&i)).collect();
     let mask = BooleanArray::from(keep_mask);
     *wide = arrow_select::filter::filter_record_batch(wide, &mask)
         .map_err(|e| OmniError::Lance(e.to_string()))?;
@@ -2567,13 +2512,7 @@ mod expand_chooser_tests {
     fn selective_frontier_on_large_graph_picks_indexed() {
         // 50 source rows against 1M source vertices, one hop: tiny selectivity —
         // the PR #149 win the chooser must preserve.
-        let m = choose_expand_mode(&inputs(
-            50,
-            10_000_000,
-            1_000_000,
-            1,
-            IndexCoverage::Indexed,
-        ));
+        let m = choose_expand_mode(&inputs(50, 10_000_000, 1_000_000, 1, IndexCoverage::Indexed));
         assert_eq!(m, ExpandMode::IndexedScan);
     }
 
@@ -2582,13 +2521,8 @@ mod expand_chooser_tests {
         // Same selectivity (frontier/|V_src|), 1000× difference in |E|. Indexed
         // cost is independent of |E|, so the choice must not flip.
         let small = choose_expand_mode(&inputs(50, 100_000, 1_000_000, 1, IndexCoverage::Indexed));
-        let huge = choose_expand_mode(&inputs(
-            50,
-            100_000_000,
-            1_000_000,
-            1,
-            IndexCoverage::Indexed,
-        ));
+        let huge =
+            choose_expand_mode(&inputs(50, 100_000_000, 1_000_000, 1, IndexCoverage::Indexed));
         assert_eq!(small, ExpandMode::IndexedScan);
         assert_eq!(huge, ExpandMode::IndexedScan);
     }
@@ -2604,25 +2538,13 @@ mod expand_chooser_tests {
     #[test]
     fn frontier_over_hard_cap_picks_csr() {
         // 2000 > 1024 ceiling, even though the selectivity is tiny.
-        let m = choose_expand_mode(&inputs(
-            2000,
-            10_000_000,
-            1_000_000,
-            1,
-            IndexCoverage::Indexed,
-        ));
+        let m = choose_expand_mode(&inputs(2000, 10_000_000, 1_000_000, 1, IndexCoverage::Indexed));
         assert_eq!(m, ExpandMode::Csr);
     }
 
     #[test]
     fn hops_over_hard_cap_picks_csr() {
-        let m = choose_expand_mode(&inputs(
-            10,
-            10_000_000,
-            1_000_000,
-            8,
-            IndexCoverage::Indexed,
-        ));
+        let m = choose_expand_mode(&inputs(10, 10_000_000, 1_000_000, 8, IndexCoverage::Indexed));
         assert_eq!(m, ExpandMode::Csr);
     }
 
@@ -2677,13 +2599,7 @@ mod expand_chooser_tests {
         // Consequence: a selective frontier where the requested 5 hops would
         // (wrongly) flip cross-type to CSR, but the capped 1 hop — what actually
         // runs — keeps it indexed.
-        let mut i = inputs(
-            50,
-            10_000,
-            100,
-            cost_effective_hops(5, false),
-            IndexCoverage::Indexed,
-        );
+        let mut i = inputs(50, 10_000, 100, cost_effective_hops(5, false), IndexCoverage::Indexed);
         assert_eq!(choose_expand_mode(&i), ExpandMode::IndexedScan);
         i.effective_max_hops = 5; // as if the cross-type cap were not applied
         assert_eq!(choose_expand_mode(&i), ExpandMode::Csr);
@@ -2814,9 +2730,8 @@ mod literal_lowering_tests {
             matches!(dt, Expr::Literal(ScalarValue::Date64(Some(_)), ..)),
             "DateTime vs Date64 column must coerce to a typed Date64, got {dt:?}"
         );
-        let d =
-            literal_to_expr_coerced(&Literal::Date("2024-06-01".into()), Some(&DataType::Date32))
-                .unwrap();
+        let d = literal_to_expr_coerced(&Literal::Date("2024-06-01".into()), Some(&DataType::Date32))
+            .unwrap();
         assert!(
             matches!(d, Expr::Literal(ScalarValue::Date32(Some(_)), ..)),
             "Date vs Date32 column must coerce to a typed Date32, got {d:?}"
@@ -2851,14 +2766,12 @@ mod literal_lowering_tests {
     #[test]
     fn integer_literal_coerces_to_narrow_column_type() {
         use arrow_schema::DataType;
-        let i32_lit =
-            literal_to_expr_coerced(&Literal::Integer(5), Some(&DataType::Int32)).unwrap();
+        let i32_lit = literal_to_expr_coerced(&Literal::Integer(5), Some(&DataType::Int32)).unwrap();
         assert!(
             matches!(i32_lit, Expr::Literal(ScalarValue::Int32(Some(5)), ..)),
             "integer literal vs Int32 column must lower to Int32, got {i32_lit:?}"
         );
-        let u32_lit =
-            literal_to_expr_coerced(&Literal::Integer(7), Some(&DataType::UInt32)).unwrap();
+        let u32_lit = literal_to_expr_coerced(&Literal::Integer(7), Some(&DataType::UInt32)).unwrap();
         assert!(
             matches!(u32_lit, Expr::Literal(ScalarValue::UInt32(Some(7)), ..)),
             "integer literal vs UInt32 column must lower to UInt32, got {u32_lit:?}"
@@ -2908,10 +2821,7 @@ mod literal_lowering_tests {
         let e = literal_to_expr_coerced(&Literal::Integer(3_000_000_000), Some(&DataType::Int32))
             .unwrap();
         assert!(
-            matches!(
-                e,
-                Expr::Literal(ScalarValue::Int64(Some(3_000_000_000)), ..)
-            ),
+            matches!(e, Expr::Literal(ScalarValue::Int64(Some(3_000_000_000)), ..)),
             "out-of-range integer vs Int32 must fall back to natural Int64, got {e:?}"
         );
     }

@@ -297,10 +297,7 @@ pub fn spawn_server_with_config(config: &Path) -> TestServer {
 
 pub fn spawn_server_with_cluster(cluster_dir: &Path) -> TestServer {
     let mut command = server_process();
-    command
-        .arg("--cluster")
-        .arg(cluster_dir)
-        .arg("--unauthenticated");
+    command.arg("--cluster").arg(cluster_dir).arg("--unauthenticated");
     spawn_server_process(command)
 }
 
@@ -525,7 +522,10 @@ pub fn forge_person_delete_drift(graph: &std::path::Path) -> (u64, u64) {
     tokio::runtime::Runtime::new().unwrap().block_on(async {
         let uri = graph.to_string_lossy();
         let db = Omnigraph::open(uri.as_ref()).await.unwrap();
-        let snap = db.snapshot_of(ReadTarget::branch("main")).await.unwrap();
+        let snap = db
+            .snapshot_of(ReadTarget::branch("main"))
+            .await
+            .unwrap();
         let entry = snap.entry("node:Person").unwrap();
         let full_path = format!("{}/{}", uri.trim_end_matches('/'), entry.table_path);
         let mut ds = Dataset::open(&full_path).await.unwrap();
@@ -537,9 +537,7 @@ pub fn forge_person_delete_drift(graph: &std::path::Path) -> (u64, u64) {
     })
 }
 
-pub fn write_policy_config_fixture(
-    root: &std::path::Path,
-) -> (std::path::PathBuf, std::path::PathBuf) {
+pub fn write_policy_config_fixture(root: &std::path::Path) -> (std::path::PathBuf, std::path::PathBuf) {
     let config = root.join("omnigraph.yaml");
     let policy = root.join("policy.yaml");
     fs::write(
@@ -849,18 +847,11 @@ pub fn copy_dir(from: &Path, to: &Path) {
 pub fn scrub_volatile(value: &mut serde_json::Value) {
     const VOLATILE_KEYS: &[&str] = &[
         // identity-bearing per-instance values
-        "commit_id",
-        "id",
-        "parent_id",
-        "merge_parent_id",
-        "snapshot",
+        "commit_id", "id", "parent_id", "merge_parent_id", "snapshot",
         // wall-clock
-        "committed_at",
-        "created_at",
-        "timestamp",
+        "committed_at", "created_at", "timestamp",
         // transport / location
-        "uri",
-        "path",
+        "uri", "path",
     ];
     match value {
         serde_json::Value::Object(map) => {

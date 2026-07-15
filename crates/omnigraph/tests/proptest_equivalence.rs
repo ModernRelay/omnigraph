@@ -80,7 +80,7 @@ query unemployed() {
 struct GenGraph {
     persons: Vec<String>,
     companies: Vec<String>,
-    knows: Vec<(usize, usize)>, // indices into persons (self-loops & cycles allowed)
+    knows: Vec<(usize, usize)>,    // indices into persons (self-loops & cycles allowed)
     works_at: Vec<(usize, usize)>, // (person idx, company idx)
 }
 
@@ -88,14 +88,10 @@ impl GenGraph {
     fn to_jsonl(&self) -> String {
         let mut s = String::new();
         for p in &self.persons {
-            s.push_str(&format!(
-                "{{\"type\":\"Person\",\"data\":{{\"name\":\"{p}\"}}}}\n"
-            ));
+            s.push_str(&format!("{{\"type\":\"Person\",\"data\":{{\"name\":\"{p}\"}}}}\n"));
         }
         for c in &self.companies {
-            s.push_str(&format!(
-                "{{\"type\":\"Company\",\"data\":{{\"name\":\"{c}\"}}}}\n"
-            ));
+            s.push_str(&format!("{{\"type\":\"Company\",\"data\":{{\"name\":\"{c}\"}}}}\n"));
         }
         // Dedup exact-duplicate edge rows (the loader rejects intra-batch
         // duplicate keys); collisions/cycles/self-loops are unaffected.
@@ -148,6 +144,7 @@ fn config() -> Config {
         ..Config::default()
     }
 }
+
 
 async fn load_graph(graph: &GenGraph) -> (tempfile::TempDir, Omnigraph) {
     let dir = tempfile::tempdir().unwrap();
@@ -217,7 +214,11 @@ fn prop_expand_indexed_eq_csr() {
                 }
                 None
             });
-            prop_assert!(mismatch.is_none(), "Expand mode divergence: {:?}", mismatch);
+            prop_assert!(
+                mismatch.is_none(),
+                "Expand mode divergence: {:?}",
+                mismatch
+            );
             Ok(())
         })
         .unwrap();

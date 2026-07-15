@@ -160,8 +160,7 @@ pub(crate) fn record_open(uri: &str) {
 pub(crate) fn record_graph_build(edges: usize) {
     let _ = current(|p| {
         p.graph_build_count.fetch_add(1, Ordering::Relaxed);
-        p.graph_edges_built
-            .fetch_add(edges as u64, Ordering::Relaxed);
+        p.graph_edges_built.fetch_add(edges as u64, Ordering::Relaxed);
     });
 }
 
@@ -560,9 +559,7 @@ pub struct CountingStorageAdapter {
 
 impl CountingStorageAdapter {
     /// Wrap `inner`, returning the adapter and a shared handle to its counts.
-    pub fn new(
-        inner: Arc<dyn StorageAdapter>,
-    ) -> (Arc<dyn StorageAdapter>, Arc<StorageReadCounts>) {
+    pub fn new(inner: Arc<dyn StorageAdapter>) -> (Arc<dyn StorageAdapter>, Arc<StorageReadCounts>) {
         let counts = Arc::new(StorageReadCounts::default());
         let adapter: Arc<dyn StorageAdapter> = Arc::new(Self {
             inner,
@@ -608,9 +605,7 @@ impl StorageAdapter for CountingStorageAdapter {
     }
 
     async fn read_text_versioned(&self, uri: &str) -> Result<(String, String)> {
-        self.counts
-            .read_text_versioned
-            .fetch_add(1, Ordering::Relaxed);
+        self.counts.read_text_versioned.fetch_add(1, Ordering::Relaxed);
         self.inner.read_text_versioned(uri).await
     }
 

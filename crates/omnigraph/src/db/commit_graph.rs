@@ -76,7 +76,8 @@ impl CommitGraph {
         let root = root_uri.trim_end_matches('/');
         // `load_commit_cache_for_branch` opens the branch's `__manifest` (the
         // authoritative table), so a truly absent branch fails loudly here.
-        let (commit_by_id, head_commit) = load_commit_cache_for_branch(root, Some(branch)).await?;
+        let (commit_by_id, head_commit) =
+            load_commit_cache_for_branch(root, Some(branch)).await?;
         Ok(Self {
             root_uri: root.to_string(),
             active_branch: Some(branch.to_string()),

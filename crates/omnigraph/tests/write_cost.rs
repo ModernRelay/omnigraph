@@ -48,33 +48,33 @@ async fn internal_table_scans_are_flat_in_history() {
     // so `manifest_reads` includes the warm-coordinator probe (a constant per write
     // that cancels in this depth-difference assertion).
     cost_harness(async {
-        const ACTOR: &str = "act-cost-gate";
-        let dir = tempfile::tempdir().unwrap();
-        let mut db = local_graph(&dir).await;
+    const ACTOR: &str = "act-cost-gate";
+    let dir = tempfile::tempdir().unwrap();
+    let mut db = local_graph(&dir).await;
 
-        let mut curve: Vec<(u64, IoCounts)> = Vec::new();
-        let mut current = 0u64;
-        for d in [10u64, 100] {
-            if d > current {
-                commit_many_as(&mut db, (d - current) as usize, ACTOR).await;
-                current = d;
-            }
-            // Step 2: compaction folds all three internal tables' O(depth) fragments back
-            // to a small constant, so the following write's scan of them is flat.
-            db.optimize().await.unwrap();
-            let io = measure_insert_as(&mut db, &format!("lock_{d}"), ACTOR).await;
-            current += 1; // the measured write advanced depth by one
-            eprintln!(
-                "depth~{d}: data={} __manifest={}",
-                io.data_reads, io.manifest_reads
-            );
-            curve.push((d, io));
+    let mut curve: Vec<(u64, IoCounts)> = Vec::new();
+    let mut current = 0u64;
+    for d in [10u64, 100] {
+        if d > current {
+            commit_many_as(&mut db, (d - current) as usize, ACTOR).await;
+            current = d;
         }
+        // Step 2: compaction folds all three internal tables' O(depth) fragments back
+        // to a small constant, so the following write's scan of them is flat.
+        db.optimize().await.unwrap();
+        let io = measure_insert_as(&mut db, &format!("lock_{d}"), ACTOR).await;
+        current += 1; // the measured write advanced depth by one
+        eprintln!(
+            "depth~{d}: data={} __manifest={}",
+            io.data_reads, io.manifest_reads
+        );
+        curve.push((d, io));
+    }
 
-        // Lineage + actor rows live in `__manifest` now, so this single flat-assertion
-        // gates the whole internal-table scan (including the authenticated path's actor
-        // rows) across history.
-        assert_flat(&curve, |c| c.manifest_reads, 4, "__manifest scan");
+    // Lineage + actor rows live in `__manifest` now, so this single flat-assertion
+    // gates the whole internal-table scan (including the authenticated path's actor
+    // rows) across history.
+    assert_flat(&curve, |c| c.manifest_reads, 4, "__manifest scan");
     })
     .await;
 }
@@ -187,39 +187,34 @@ async fn optimize_manifest_reads_are_flat_in_history() {
 #[tokio::test]
 async fn internal_table_scans_grow_without_compaction() {
     cost_harness(async {
-        const ACTOR: &str = "act-cost-gate-served";
-        let dir = tempfile::tempdir().unwrap();
-        let mut db = local_graph(&dir).await;
+    const ACTOR: &str = "act-cost-gate-served";
+    let dir = tempfile::tempdir().unwrap();
+    let mut db = local_graph(&dir).await;
 
-        let mut curve: Vec<(u64, IoCounts)> = Vec::new();
-        let mut current = 0u64;
-        for d in [10u64, 100] {
-            if d > current {
-                commit_many_as(&mut db, (d - current) as usize, ACTOR).await;
-                current = d;
-            }
-            // NO `db.optimize()` here — that omission is the whole point. The flat gate
-            // above compacts before measuring and so never exercises this served regime.
-            let io = measure_insert_as(&mut db, &format!("served_{d}"), ACTOR).await;
-            current += 1; // the measured write advanced depth by one
-            eprintln!(
-                "depth~{d} (uncompacted): data={} __manifest={}",
-                io.data_reads, io.manifest_reads
-            );
-            curve.push((d, io));
+    let mut curve: Vec<(u64, IoCounts)> = Vec::new();
+    let mut current = 0u64;
+    for d in [10u64, 100] {
+        if d > current {
+            commit_many_as(&mut db, (d - current) as usize, ACTOR).await;
+            current = d;
         }
-
-        // Green TODAY (the bug): the per-write `__manifest` scan is O(fragments) and grows
-        // by far more than the flat gate's slack of 4 across a 10→100 depth sweep. The `20`
-        // floor mirrors the proven-safe `assert_grows` sibling (data-table scan) and sits
-        // comfortably below the real growth (~+3 `__manifest` reads/depth × ~90 depth × the
-        // 3–4 publish-path scans) while unambiguously distinguishing "grows" from "flat".
-        assert_grows(
-            &curve,
-            |c| c.manifest_reads,
-            20,
-            "__manifest scan (uncompacted/served)",
+        // NO `db.optimize()` here — that omission is the whole point. The flat gate
+        // above compacts before measuring and so never exercises this served regime.
+        let io = measure_insert_as(&mut db, &format!("served_{d}"), ACTOR).await;
+        current += 1; // the measured write advanced depth by one
+        eprintln!(
+            "depth~{d} (uncompacted): data={} __manifest={}",
+            io.data_reads, io.manifest_reads
         );
+        curve.push((d, io));
+    }
+
+    // Green TODAY (the bug): the per-write `__manifest` scan is O(fragments) and grows
+    // by far more than the flat gate's slack of 4 across a 10→100 depth sweep. The `20`
+    // floor mirrors the proven-safe `assert_grows` sibling (data-table scan) and sits
+    // comfortably below the real growth (~+3 `__manifest` reads/depth × ~90 depth × the
+    // 3–4 publish-path scans) while unambiguously distinguishing "grows" from "flat".
+    assert_grows(&curve, |c| c.manifest_reads, 20, "__manifest scan (uncompacted/served)");
     })
     .await;
 }
@@ -267,21 +262,11 @@ async fn data_table_reads_split_into_flat_opener_and_scan_flat_with_session() {
         "opener reads must be > 0 — the classifier missed version-resolution reads, \
          so a flat opener assertion would be vacuous"
     );
-    assert_flat(
-        &curve,
-        |c| c.data_opener_reads,
-        4,
-        "local data-table opener",
-    );
+    assert_flat(&curve, |c| c.data_opener_reads, 4, "local data-table opener");
     // Pre-session this term GREW with fragment count (the merge-insert/RI scan
     // re-reading O(depth) fragment metadata per write); the shared session
     // makes repeat reads of immutable metadata cache hits, so it is now flat.
-    assert_flat(
-        &curve,
-        |c| c.data_scan_reads,
-        4,
-        "local data-table scan (session-cached)",
-    );
+    assert_flat(&curve, |c| c.data_scan_reads, 4, "local data-table scan (session-cached)");
 }
 
 // ── (B) Green-today regression guards — run on every PR ──
@@ -295,11 +280,7 @@ async fn single_insert_data_write_is_bounded() {
     commit_many(&mut db, 5).await;
     let io = measure_insert(&mut db, "w").await;
     eprintln!("single insert: data_writes={}", io.data_writes);
-    assert!(
-        io.data_writes <= 4,
-        "data-table write_iops should be a small constant, got {}",
-        io.data_writes
-    );
+    assert!(io.data_writes <= 4, "data-table write_iops should be a small constant, got {}", io.data_writes);
 }
 
 /// At a fixed shallow depth, the per-write object-store read count is below a
@@ -317,36 +298,34 @@ async fn single_insert_data_write_is_bounded() {
 #[tokio::test]
 async fn write_op_count_ceiling_at_shallow_depth() {
     cost_harness(async {
-        let dir = tempfile::tempdir().unwrap();
-        let mut db = local_graph(&dir).await;
-        commit_many(&mut db, 5).await;
-        let io = measure_insert(&mut db, "ceil").await;
-        eprintln!(
-            "depth~5: data={} __manifest={} total_reads={}",
-            io.data_reads,
-            io.manifest_reads,
-            io.total_reads()
-        );
-        // Sub-ceiling on ground-truth `__manifest` reads. ~18 measured at this depth =
-        // ~15 publish-path scans (one fold, not four — RFC-013 P2) + ~3 from the
-        // warm-coordinator freshness probe, which ground truth now counts (the
-        // `version_probes=1` call is 3 object-store RPCs). A re-added publish scan trips
-        // this; `last_manifest_reads()` dumps the read log (method + path) so a breach
-        // names the offending objects. (Deterministic on local FS.)
-        const MANIFEST_CEILING: u64 = 24;
-        assert!(
-            io.manifest_reads <= MANIFEST_CEILING,
-            "per-write __manifest reads {} exceeded ceiling {MANIFEST_CEILING} — a publish-path \
+    let dir = tempfile::tempdir().unwrap();
+    let mut db = local_graph(&dir).await;
+    commit_many(&mut db, 5).await;
+    let io = measure_insert(&mut db, "ceil").await;
+    eprintln!(
+        "depth~5: data={} __manifest={} total_reads={}",
+        io.data_reads, io.manifest_reads, io.total_reads()
+    );
+    // Sub-ceiling on ground-truth `__manifest` reads. ~18 measured at this depth =
+    // ~15 publish-path scans (one fold, not four — RFC-013 P2) + ~3 from the
+    // warm-coordinator freshness probe, which ground truth now counts (the
+    // `version_probes=1` call is 3 object-store RPCs). A re-added publish scan trips
+    // this; `last_manifest_reads()` dumps the read log (method + path) so a breach
+    // names the offending objects. (Deterministic on local FS.)
+    const MANIFEST_CEILING: u64 = 24;
+    assert!(
+        io.manifest_reads <= MANIFEST_CEILING,
+        "per-write __manifest reads {} exceeded ceiling {MANIFEST_CEILING} — a publish-path \
          scan was re-added (RFC-013 P2 folds them into one). Reads: {:#?}",
-            io.manifest_reads,
-            last_manifest_reads(),
-        );
-        const CEILING: u64 = 80;
-        assert!(
-            io.total_reads() <= CEILING,
-            "per-write read ops {} exceeded ceiling {CEILING} — a new round-trip was added",
-            io.total_reads()
-        );
+        io.manifest_reads,
+        last_manifest_reads(),
+    );
+    const CEILING: u64 = 80;
+    assert!(
+        io.total_reads() <= CEILING,
+        "per-write read ops {} exceeded ceiling {CEILING} — a new round-trip was added",
+        io.total_reads()
+    );
     })
     .await;
 }
@@ -369,14 +348,8 @@ async fn keyed_insert_routes_through_fenced_adapter_only() {
     ))
     .await;
     res.unwrap();
-    assert_eq!(
-        staged.stage_merge_insert, 1,
-        "keyed Person insert stages one exact-id fenced merge"
-    );
-    assert_eq!(
-        staged.stage_append, 0,
-        "keyed insert must not use bare stage_append"
-    );
+    assert_eq!(staged.stage_merge_insert, 1, "keyed Person insert stages one exact-id fenced merge");
+    assert_eq!(staged.stage_append, 0, "keyed insert must not use bare stage_append");
     assert_eq!(
         staged.stage_vector_index, 0,
         "no vector-index artifact build on a plain insert"
@@ -423,9 +396,7 @@ async fn write_schema_io_is_bounded_to_capture_fence_and_effect_gate() {
     let exists_delta = counts.exists() - before_exists;
     let write_text_delta = counts.write_text() - before_write_text;
     let delete_delta = counts.delete() - before_delete;
-    eprintln!(
-        "schema-contract reads on one write: read_text={read_text_delta} exists={exists_delta}"
-    );
+    eprintln!("schema-contract reads on one write: read_text={read_text_delta} exists={exists_delta}");
     assert_eq!(
         read_text_delta, 7,
         "a write must do capture validation + trailing identity fence + pre-effect validation (7 reads), not per table",

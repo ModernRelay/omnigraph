@@ -2931,7 +2931,10 @@ impl TableStore {
         Ok(count as usize)
     }
 
-    async fn user_indices_for_column(ds: &Dataset, column: &str) -> Result<Vec<IndexMetadata>> {
+    async fn user_indices_for_column(
+        ds: &Dataset,
+        column: &str,
+    ) -> Result<Vec<IndexMetadata>> {
         let field_id = ds
             .schema()
             .field(column)

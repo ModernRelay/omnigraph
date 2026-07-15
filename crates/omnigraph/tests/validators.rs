@@ -166,9 +166,7 @@ async fn non_numeric_vector_element_rejected_on_jsonl_load() {
 
     // A valid row still loads.
     let good = r#"{"type":"Doc","data":{"slug":"d4","embedding":[0.1,0.2,0.3]}}"#;
-    load_jsonl(&mut db, good, LoadMode::Overwrite)
-        .await
-        .unwrap();
+    load_jsonl(&mut db, good, LoadMode::Overwrite).await.unwrap();
 }
 
 // ─── Enum validation ─────────────────────────────────────────────────────────
@@ -604,9 +602,7 @@ query reassign() {
 "#;
     mutate_main(&mut db, Q, "reassign", &params(&[]))
         .await
-        .expect(
-            "Alice ends at 'final' and Carol takes the freed 'temp' — final image has no collision",
-        );
+        .expect("Alice ends at 'final' and Carol takes the freed 'temp' — final image has no collision");
 }
 
 // ─── Edge cardinality ────────────────────────────────────────────────────────

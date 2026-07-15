@@ -104,17 +104,13 @@ impl EmbeddingConfig {
         let model =
             env_string("OMNIGRAPH_EMBED_MODEL").unwrap_or_else(|| default_model.to_string());
 
-        let api_key = key_envs
-            .iter()
-            .copied()
-            .find_map(env_string)
-            .ok_or_else(|| {
-                OmniError::manifest_internal(format!(
-                    "{} is required for the {} embedding provider",
-                    key_envs.join(" or "),
-                    alias.as_deref().unwrap_or("openai-compatible")
-                ))
-            })?;
+        let api_key = key_envs.iter().copied().find_map(env_string).ok_or_else(|| {
+            OmniError::manifest_internal(format!(
+                "{} is required for the {} embedding provider",
+                key_envs.join(" or "),
+                alias.as_deref().unwrap_or("openai-compatible")
+            ))
+        })?;
 
         Ok(Self {
             provider,
@@ -272,8 +268,7 @@ impl EmbeddingClient {
     }
 
     pub async fn embed_document_text(&self, input: &str, expected_dim: usize) -> Result<Vec<f32>> {
-        self.embed_text(input, expected_dim, EmbedRole::Document)
-            .await
+        self.embed_text(input, expected_dim, EmbedRole::Document).await
     }
 
     async fn embed_text(
@@ -428,10 +423,7 @@ impl EmbeddingClient {
             Ok(body) => body,
             Err(err) => {
                 return Err(EmbedCallError {
-                    message: format!(
-                        "embedding response read failed (status {}): {}",
-                        status, err
-                    ),
+                    message: format!("embedding response read failed (status {}): {}", status, err),
                     retryable: status.is_server_error() || status.as_u16() == 429,
                 });
             }
@@ -440,10 +432,7 @@ impl EmbeddingClient {
         if !status.is_success() {
             let message = parse_google_error_message(&body).unwrap_or(body);
             return Err(EmbedCallError {
-                message: format!(
-                    "embedding request failed with status {}: {}",
-                    status, message
-                ),
+                message: format!("embedding request failed with status {}: {}", status, message),
                 retryable: status.is_server_error() || status.as_u16() == 429,
             });
         }
@@ -471,11 +460,7 @@ impl EmbeddingClient {
             .http
             .post(format!("{}/embeddings", self.config.base_url))
             .bearer_auth(&self.config.api_key)
-            .json(&build_openai_request(
-                &self.config.model,
-                input,
-                expected_dim,
-            ))
+            .json(&build_openai_request(&self.config.model, input, expected_dim))
             .send()
             .await;
         let response = match response {
@@ -494,10 +479,7 @@ impl EmbeddingClient {
             Ok(body) => body,
             Err(err) => {
                 return Err(EmbedCallError {
-                    message: format!(
-                        "embedding response read failed (status {}): {}",
-                        status, err
-                    ),
+                    message: format!("embedding response read failed (status {}): {}", status, err),
                     retryable: status.is_server_error() || status.as_u16() == 429,
                 });
             }
@@ -506,10 +488,7 @@ impl EmbeddingClient {
         if !status.is_success() {
             let message = parse_openai_error_message(&body).unwrap_or(body);
             return Err(EmbedCallError {
-                message: format!(
-                    "embedding request failed with status {}: {}",
-                    status, message
-                ),
+                message: format!("embedding request failed with status {}: {}", status, message),
                 retryable: status.is_server_error() || status.as_u16() == 429,
             });
         }
@@ -646,12 +625,7 @@ fn parse_openai_error_message(body: &str) -> Option<String> {
 /// (not the enum) determines the key-env order here.
 fn provider_profile(
     alias: Option<&str>,
-) -> Result<(
-    Provider,
-    &'static str,
-    &'static str,
-    &'static [&'static str],
-)> {
+) -> Result<(Provider, &'static str, &'static str, &'static [&'static str])> {
     Ok(match alias {
         None | Some("openai-compatible") => (
             Provider::OpenAiCompatible,
@@ -860,14 +834,12 @@ mod tests {
         // An Inf component must be rejected — not normalized into 0s + NaN.
         let err = validate_and_normalize_embedding(vec![f32::INFINITY, 1.0], 2).unwrap_err();
         assert!(err.contains("finite"), "Inf must be rejected, got: {err}");
-        let err = validate_and_normalize_embedding(vec![1.0, f32::NEG_INFINITY], 2).unwrap_err();
+        let err =
+            validate_and_normalize_embedding(vec![1.0, f32::NEG_INFINITY], 2).unwrap_err();
         assert!(err.contains("finite"), "-Inf must be rejected, got: {err}");
         // An all-zero vector has no direction — undefined under cosine/ANN.
         let err = validate_and_normalize_embedding(vec![0.0, 0.0], 2).unwrap_err();
-        assert!(
-            err.contains("zero"),
-            "zero vector must be rejected, got: {err}"
-        );
+        assert!(err.contains("zero"), "zero vector must be rejected, got: {err}");
     }
 
     #[test]
@@ -1045,13 +1017,9 @@ mod tests {
         // must resolve to model X — it is what the query-time same-space check
         // compares against. Env cleared so the assertion isolates the arg.
         let _guard = cleared_env(&[]);
-        let pinned = EmbeddingConfig::from_parts(
-            Some("mock"),
-            None,
-            Some("recorded-x".to_string()),
-            String::new(),
-        )
-        .unwrap();
+        let pinned =
+            EmbeddingConfig::from_parts(Some("mock"), None, Some("recorded-x".to_string()), String::new())
+                .unwrap();
         assert_eq!(pinned.provider, Provider::Mock);
         assert_eq!(pinned.model, "recorded-x");
         // With no explicit model, mock falls back to its env-based default (here
@@ -1113,10 +1081,7 @@ mod tests {
     fn from_env_errors_when_no_key_present() {
         let _guard = cleared_env(&[]);
         let err = EmbeddingConfig::from_env().unwrap_err();
-        assert!(
-            err.to_string()
-                .contains("OPENROUTER_API_KEY or OPENAI_API_KEY")
-        );
+        assert!(err.to_string().contains("OPENROUTER_API_KEY or OPENAI_API_KEY"));
     }
 
     #[test]

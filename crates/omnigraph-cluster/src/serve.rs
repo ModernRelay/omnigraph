@@ -115,16 +115,11 @@ pub async fn cluster_root_for_graph_uri(graph_uri: &str) -> Option<String> {
 ///
 /// `cluster` is a config directory or a storage-root URI (`s3://…`, config-free),
 /// mirroring the server's `--cluster` dispatch.
-pub async fn resolve_graph_storage_uri(
-    cluster: &str,
-    graph_id: &str,
-) -> Result<String, Diagnostic> {
+pub async fn resolve_graph_storage_uri(cluster: &str, graph_id: &str) -> Result<String, Diagnostic> {
     let backend = open_cluster_backend(cluster)?;
     let mut observations = backend.observations();
     let snapshot = backend.read_state(&mut observations).await?;
-    let state = snapshot
-        .state
-        .ok_or_else(|| missing_state_diagnostic(cluster))?;
+    let state = snapshot.state.ok_or_else(|| missing_state_diagnostic(cluster))?;
     let address = format!("graph.{graph_id}");
     if !state.applied_revision.resources.contains_key(&address) {
         let applied = applied_graph_ids(&state);
@@ -149,9 +144,7 @@ pub async fn cluster_graph_ids(cluster: &str) -> Result<Vec<String>, Diagnostic>
     let backend = open_cluster_backend(cluster)?;
     let mut observations = backend.observations();
     let snapshot = backend.read_state(&mut observations).await?;
-    let state = snapshot
-        .state
-        .ok_or_else(|| missing_state_diagnostic(cluster))?;
+    let state = snapshot.state.ok_or_else(|| missing_state_diagnostic(cluster))?;
     Ok(applied_graph_ids(&state))
 }
 

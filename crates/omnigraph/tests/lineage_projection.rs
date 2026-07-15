@@ -48,7 +48,12 @@ async fn head_id(root: &str, branch: Option<&str>) -> String {
         Some(branch) => CommitGraph::open_at_branch(root, branch).await.unwrap(),
         None => CommitGraph::open(root).await.unwrap(),
     };
-    graph.head_commit().await.unwrap().unwrap().graph_commit_id
+    graph
+        .head_commit()
+        .await
+        .unwrap()
+        .unwrap()
+        .graph_commit_id
 }
 
 #[tokio::test]
@@ -205,7 +210,10 @@ async fn graph_lineage_lives_only_in_manifest() {
     // main's authored commits: Alice, Bob, Erin (direct) + the merge (act-merger)
     // = 4. Carol/Dave were authored on the feature branch, not main. Genesis has
     // no actor.
-    let authored = main_commits.iter().filter(|c| c.actor_id.is_some()).count();
+    let authored = main_commits
+        .iter()
+        .filter(|c| c.actor_id.is_some())
+        .count();
     assert!(
         authored >= 4,
         "expected the authored commits to surface their actor in the projection, saw {authored}"

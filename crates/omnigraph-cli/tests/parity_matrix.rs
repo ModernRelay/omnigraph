@@ -81,14 +81,15 @@ fn parity_query() {
     let p = parity();
     let query = fixture("test.gq");
     let (l, r) = p.run(&[
-        "query",
-        "--query",
-        query.to_str().unwrap(),
-        "get_person",
-        "--params",
-        r#"{"name":"Alice"}"#,
-        "--json",
-    ]);
+            "query",
+            "--query",
+            query.to_str().unwrap(),
+            "get_person",
+            "--params",
+            r#"{"name":"Alice"}"#,
+            "--json",
+        ],
+    );
     assert_parity("query", &l, &r);
 }
 
@@ -124,46 +125,45 @@ fn parity_commit_list() {
 fn parity_mutate() {
     let p = parity();
     let (l, r) = p.run(&[
-        "mutate",
-        "-e",
-        "query add($name: String, $age: I32) { insert Person { name: $name, age: $age } }",
-        "--params",
-        r#"{"name":"Parity","age":7}"#,
-        "--json",
-    ]);
+            "mutate",
+            "-e",
+            "query add($name: String, $age: I32) { insert Person { name: $name, age: $age } }",
+            "--params",
+            r#"{"name":"Parity","age":7}"#,
+            "--json",
+        ],
+    );
     assert_parity("mutate", &l, &r);
 }
 
 #[test]
 fn parity_branch_create_delete() {
     let p = parity();
-    let (l, r) = p.run(&[
-        "branch",
-        "create",
-        "--from",
-        "main",
-        "parity-branch",
-        "--json",
-    ]);
+    let (l, r) = p.run(&["branch", "create", "--from", "main", "parity-branch", "--json"],
+    );
     assert_parity("branch create", &l, &r);
     // `branch delete` is destructive: the served (remote) arm is non-local and
     // requires consent (RFC-011 Decision 9), so the row passes `--yes` to test
     // the operation itself, not the safety gate. The local arm ignores `--yes`.
-    let (l, r) = p.run(&["branch", "delete", "parity-branch", "--yes", "--json"]);
+    let (l, r) = p.run(&["branch", "delete", "parity-branch", "--yes", "--json"],
+    );
     assert_parity("branch delete", &l, &r);
 }
 
 #[test]
 fn parity_branch_merge() {
     let p = parity();
-    let (l, r) = p.run(&["branch", "create", "--from", "main", "feature", "--json"]);
+    let (l, r) = p.run(&["branch", "create", "--from", "main", "feature", "--json"],
+    );
     assert_parity("branch create (merge setup)", &l, &r);
-    let (l, r) = p.run(&["branch", "merge", "feature", "--into", "main", "--json"]);
+    let (l, r) = p.run(&["branch", "merge", "feature", "--into", "main", "--json"],
+    );
     assert_parity("branch merge", &l, &r);
     // `--delete-branch` composes merge + delete at each arm's own boundary
     // (embedded: two engine calls; remote: the server handler) — this row is
     // the referee that keeps the two composition sites from drifting.
-    let (l, r) = p.run(&["branch", "create", "--from", "main", "feature2", "--json"]);
+    let (l, r) = p.run(&["branch", "create", "--from", "main", "feature2", "--json"],
+    );
     assert_parity("branch create (delete-branch setup)", &l, &r);
     let (l, r) = p.run(&[
         "branch",
@@ -189,13 +189,14 @@ fn parity_load() {
     )
     .unwrap();
     let (l, r) = p.run(&[
-        "load",
-        "--mode",
-        "merge",
-        "--data",
-        data.to_str().unwrap(),
-        "--json",
-    ]);
+            "load",
+            "--mode",
+            "merge",
+            "--data",
+            data.to_str().unwrap(),
+            "--json",
+        ],
+    );
     assert_parity("load", &l, &r);
 }
 
@@ -235,14 +236,8 @@ fn parity_errors_share_exit_codes() {
     let p = parity();
 
     // unknown branch on merge
-    let (l, r) = p.run(&[
-        "branch",
-        "merge",
-        "no-such-branch",
-        "--into",
-        "main",
-        "--json",
-    ]);
+    let (l, r) = p.run(&["branch", "merge", "no-such-branch", "--into", "main", "--json"],
+    );
     assert_eq!(
         (l.status.success(), r.status.success()),
         (false, false),
@@ -252,12 +247,13 @@ fn parity_errors_share_exit_codes() {
     // unknown query name in the source
     let query = fixture("test.gq");
     let (l, r) = p.run(&[
-        "query",
-        "--query",
-        query.to_str().unwrap(),
-        "no_such_query",
-        "--json",
-    ]);
+            "query",
+            "--query",
+            query.to_str().unwrap(),
+            "no_such_query",
+            "--json",
+        ],
+    );
     assert_eq!(
         (l.status.success(), r.status.success()),
         (false, false),
@@ -270,12 +266,13 @@ fn parity_errors_share_exit_codes() {
     // path hard-errors 'parameter not provided'. Pinned here as agreeing
     // behavior; the cross-path asymmetry is filed separately.
     let (l, r) = p.run(&[
-        "query",
-        "--query",
-        query.to_str().unwrap(),
-        "get_person",
-        "--json",
-    ]);
+            "query",
+            "--query",
+            query.to_str().unwrap(),
+            "get_person",
+            "--json",
+        ],
+    );
     assert_eq!(
         (l.status.success(), r.status.success()),
         (true, true),

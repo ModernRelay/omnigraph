@@ -64,10 +64,7 @@ fn remote_server_and_cli_end_to_end_flow() {
     let cluster = converged_loaded_cluster(GRAPH_ID, None);
     let server = spawn_server_with_cluster(cluster.path());
     // The served graph's storage root — used for embedded-side cross checks.
-    let served_root = cluster
-        .path()
-        .join("graphs")
-        .join(format!("{GRAPH_ID}.omni"));
+    let served_root = cluster.path().join("graphs").join(format!("{GRAPH_ID}.omni"));
     let temp = tempfile::tempdir().unwrap();
     let mutation_file = temp.path().join("system-remote-change.gq");
     fs::write(
@@ -247,10 +244,7 @@ query insert_person($name: String, $age: I32) {
         }))
         .send()
         .unwrap();
-    assert_eq!(
-        http_query_mutation.status(),
-        reqwest::StatusCode::BAD_REQUEST
-    );
+    assert_eq!(http_query_mutation.status(), reqwest::StatusCode::BAD_REQUEST);
 }
 
 #[test]
@@ -258,10 +252,7 @@ query insert_person($name: String, $age: I32) {
 fn remote_schema_apply_via_cli_updates_graph() {
     let cluster = converged_loaded_cluster(GRAPH_ID, None);
     let server = spawn_server_with_cluster(cluster.path());
-    let served_root = cluster
-        .path()
-        .join("graphs")
-        .join(format!("{GRAPH_ID}.omni"));
+    let served_root = cluster.path().join("graphs").join(format!("{GRAPH_ID}.omni"));
     let temp = tempfile::tempdir().unwrap();
     let next_schema = temp.path().join("next.pg");
     fs::write(
@@ -1145,11 +1136,7 @@ fn graphs_list_against_multi_graph_server() {
     let cfg_dir = tempfile::tempdir().unwrap();
     let dir = cfg_dir.path();
     fs::copy(fixture("test.pg"), dir.join("alpha.pg")).unwrap();
-    fs::write(
-        dir.join("server.policy.yaml"),
-        GRAPH_LIST_SERVER_POLICY_YAML,
-    )
-    .unwrap();
+    fs::write(dir.join("server.policy.yaml"), GRAPH_LIST_SERVER_POLICY_YAML).unwrap();
     fs::write(
         dir.join("cluster.yaml"),
         "version: 1\nmetadata:\n  name: sys\nstate:\n  backend: cluster\n  lock: true\ngraphs:\n  alpha:\n    schema: ./alpha.pg\npolicies:\n  server:\n    file: ./server.policy.yaml\n    applies_to: [cluster]\n",

@@ -844,7 +844,9 @@ node ExternalID {
     // message reads `(external_id, source)`; assert order-agnostically that
     // both composite columns are named (not just the first, as pre-fix).
     assert!(
-        msg.contains("@unique violation") && msg.contains("source") && msg.contains("external_id"),
+        msg.contains("@unique violation")
+            && msg.contains("source")
+            && msg.contains("external_id"),
         "composite violation must name both columns (got: {msg})"
     );
 }

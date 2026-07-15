@@ -856,11 +856,7 @@ fn seeded_vector(seed: u64, slug: &str, dims: usize, pole: f32) -> Vec<f32> {
         // Dominate the direction with the pole while keeping per-row jitter.
         v[0] = pole * 10.0;
     }
-    let norm = v
-        .iter()
-        .map(|x| (*x as f64) * (*x as f64))
-        .sum::<f64>()
-        .sqrt() as f32;
+    let norm = v.iter().map(|x| (*x as f64) * (*x as f64)).sum::<f64>().sqrt() as f32;
     if norm > f32::EPSILON {
         for x in &mut v {
             *x /= norm;
@@ -916,21 +912,11 @@ async fn merge_all_changed(args: &Args) -> serde_json::Value {
     {
         let mut jsonl = String::new();
         let slug = "doc-main-diverge";
-        let _ = write!(
-            jsonl,
-            r#"{{"type":"Doc","data":{{"slug":"{slug}","embedding":"#
-        );
-        push_vector_json(
-            &mut jsonl,
-            &seeded_vector(args.seed ^ 0x5eed, slug, args.dims, 0.0),
-        );
-        jsonl.push_str(
-            "}}
-",
-        );
-        db.load("main", &jsonl, LoadMode::Merge)
-            .await
-            .expect("diverge main");
+        let _ = write!(jsonl, r#"{{"type":"Doc","data":{{"slug":"{slug}","embedding":"#);
+        push_vector_json(&mut jsonl, &seeded_vector(args.seed ^ 0x5eed, slug, args.dims, 0.0));
+        jsonl.push_str("}}
+");
+        db.load("main", &jsonl, LoadMode::Merge).await.expect("diverge main");
     }
 
     // Rewrite every row's vector on the branch (same keys, new seed).
@@ -949,10 +935,7 @@ async fn merge_all_changed(args: &Args) -> serde_json::Value {
 
     // The measured window: the merge alone.
     let merge_start = Instant::now();
-    let outcome = db
-        .branch_merge("bench", "main")
-        .await
-        .expect("branch_merge");
+    let outcome = db.branch_merge("bench", "main").await.expect("branch_merge");
     let merge_ms = merge_start.elapsed().as_millis() as u64;
 
     serde_json::json!({
@@ -979,16 +962,11 @@ async fn load_vector_rows(
         let mut jsonl = String::with_capacity(batch_rows * (args.dims * 12 + 64));
         for i in row..end {
             let slug = format!("doc-{i:08}");
-            let _ = write!(
-                jsonl,
-                r#"{{"type":"Doc","data":{{"slug":"{slug}","embedding":"#
-            );
+            let _ = write!(jsonl, r#"{{"type":"Doc","data":{{"slug":"{slug}","embedding":"#);
             push_vector_json(&mut jsonl, &seeded_vector(seed, &slug, args.dims, pole));
             jsonl.push_str("}}\n");
         }
-        db.load(branch, &jsonl, LoadMode::Merge)
-            .await
-            .expect("load batch");
+        db.load(branch, &jsonl, LoadMode::Merge).await.expect("load batch");
         row = end;
     }
 }
@@ -1036,15 +1014,10 @@ async fn nearest_prefilter(args: &Args) -> serde_json::Value {
                 jsonl,
                 r#"{{"type":"Doc","data":{{"slug":"{slug}","status":"{status}","embedding":"#
             );
-            push_vector_json(
-                &mut jsonl,
-                &seeded_vector(args.seed, &slug, args.dims, pole),
-            );
+            push_vector_json(&mut jsonl, &seeded_vector(args.seed, &slug, args.dims, pole));
             jsonl.push_str("}}\n");
         }
-        db.load("main", &jsonl, LoadMode::Merge)
-            .await
-            .expect("load batch");
+        db.load("main", &jsonl, LoadMode::Merge).await.expect("load batch");
         row = end;
     }
     let seed_ms = seed_start.elapsed().as_millis() as u64;
@@ -1081,12 +1054,7 @@ async fn nearest_prefilter(args: &Args) -> serde_json::Value {
     for i in 0..QUERY_ITERS {
         let q_start = Instant::now();
         let result = db
-            .query(
-                ReadTarget::branch("main"),
-                &query_src,
-                "filtered_nearest",
-                &params,
-            )
+            .query(ReadTarget::branch("main"), &query_src, "filtered_nearest", &params)
             .await
             .expect("filtered nearest query");
         total_ms += q_start.elapsed().as_millis() as u64;

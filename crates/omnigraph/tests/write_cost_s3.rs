@@ -31,8 +31,8 @@
 
 mod helpers;
 
-use helpers::commit_many;
 use helpers::cost::{IoCounts, assert_flat, measure_insert, s3_graph};
+use helpers::commit_many;
 
 /// After step 3a the data-table opener term is flat across depth on a real object
 /// store (the measured win). RED on the pre-3a namespace-builder opener (O(depth)
@@ -58,7 +58,10 @@ async fn data_table_opener_is_flat_in_history_on_s3() {
         current += 1;
         eprintln!(
             "depth~{d}: opener={} scan={} data_total={} __manifest={}",
-            io.data_opener_reads, io.data_scan_reads, io.data_reads, io.manifest_reads
+            io.data_opener_reads,
+            io.data_scan_reads,
+            io.data_reads,
+            io.manifest_reads
         );
         curve.push((d, io));
     }

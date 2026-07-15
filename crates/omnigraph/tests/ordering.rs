@@ -38,9 +38,7 @@ fn names_in_order(result: &QueryResult) -> Vec<String> {
 async fn init_people(dir: &tempfile::TempDir, jsonl: &str) -> Omnigraph {
     let uri = dir.path().to_str().unwrap();
     let mut db = Omnigraph::init(uri, TEST_SCHEMA).await.unwrap();
-    load_jsonl(&mut db, jsonl, LoadMode::Overwrite)
-        .await
-        .unwrap();
+    load_jsonl(&mut db, jsonl, LoadMode::Overwrite).await.unwrap();
     db
 }
 
@@ -119,11 +117,7 @@ query q() {
     order { $p.age asc }
 }
 "#;
-    let got_asc = names_in_order(
-        &query_main(&mut db, asc, "q", &ParamMap::new())
-            .await
-            .unwrap(),
-    );
+    let got_asc = names_in_order(&query_main(&mut db, asc, "q", &ParamMap::new()).await.unwrap());
     // ASC: nulls_first -> Bob(null), then 25, 30.
     assert_eq!(got_asc, vec!["Bob", "Charlie", "Alice"]);
 
@@ -134,11 +128,7 @@ query q() {
     order { $p.age desc }
 }
 "#;
-    let got_desc = names_in_order(
-        &query_main(&mut db, desc, "q", &ParamMap::new())
-            .await
-            .unwrap(),
-    );
+    let got_desc = names_in_order(&query_main(&mut db, desc, "q", &ParamMap::new()).await.unwrap());
     // DESC: nulls last -> 30, 25, then Bob(null).
     assert_eq!(got_desc, vec!["Alice", "Charlie", "Bob"]);
 }

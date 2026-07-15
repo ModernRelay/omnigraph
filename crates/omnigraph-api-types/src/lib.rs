@@ -291,9 +291,7 @@ pub struct QueryRequest {
     /// with `name` when more than one is declared. Mutations
     /// (`insert`/`update`/`delete`) get 400 — use `POST /mutate` (or its
     /// deprecated alias `POST /change`) instead.
-    #[schema(
-        example = "query get_person($name: String) {\n    match {\n        $p: Person { name: $name }\n    }\n    return { $p.name, $p.age }\n}"
-    )]
+    #[schema(example = "query get_person($name: String) {\n    match {\n        $p: Person { name: $name }\n    }\n    return { $p.name, $p.age }\n}")]
     pub query: String,
     /// Name of the query to run when `query` declares multiple. Optional when
     /// only one query is declared.
@@ -479,6 +477,7 @@ pub fn param_descriptor(param: &Param) -> ParamDescriptor {
         },
     }
 }
+
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize, ToSchema)]
 pub struct SchemaApplyRequest {

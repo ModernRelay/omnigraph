@@ -54,9 +54,10 @@ async fn append_only_fast_forward_merge_uses_fenced_insert() {
     append_new_persons(&mut feature, "feature", 5).await;
 
     let probes = MergeWriteProbes::default();
-    let outcome = with_merge_write_probes(probes.clone(), main.branch_merge("feature", "main"))
-        .await
-        .unwrap();
+    let outcome =
+        with_merge_write_probes(probes.clone(), main.branch_merge("feature", "main"))
+            .await
+            .unwrap();
     assert_eq!(outcome, MergeOutcome::FastForward);
 
     assert_eq!(
@@ -703,10 +704,7 @@ async fn fast_forward_merge_defers_vector_index_to_reconciler() {
         ));
     }
     let feature = Omnigraph::open(uri).await.unwrap();
-    feature
-        .load("feature", &rows, LoadMode::Merge)
-        .await
-        .unwrap();
+    feature.load("feature", &rows, LoadMode::Merge).await.unwrap();
 
     // Merge, asserting that its publish path stages no vector-index artifact.
     let probes = MergeWriteProbes::default();
@@ -726,8 +724,7 @@ async fn fast_forward_merge_defers_vector_index_to_reconciler() {
     assert_eq!(count_rows(&main, "node:Chunk").await, 24);
 }
 
-const BLOB_SCHEMA: &str =
-    "node Document {\n  title: String @key\n  content: Blob?\n  note: String?\n}\n";
+const BLOB_SCHEMA: &str = "node Document {\n  title: String @key\n  content: Blob?\n  note: String?\n}\n";
 const BLOB_INSERT: &str = r#"
 query insert_doc($title: String, $content: Blob, $note: String) {
     insert Document { title: $title, content: $content, note: $note }
@@ -775,10 +772,7 @@ async fn fast_forward_merge_streams_blob_columns() {
     assert_eq!(outcome, MergeOutcome::FastForward);
 
     // The new blob row's bytes survive the streaming keyed write; the base row stays intact.
-    let readme = main
-        .read_blob("Document", "readme", "content")
-        .await
-        .unwrap();
+    let readme = main.read_blob("Document", "readme", "content").await.unwrap();
     assert_eq!(&readme.read().await.unwrap()[..], b"Hello");
     let seed = main.read_blob("Document", "seed", "content").await.unwrap();
     assert_eq!(&seed.read().await.unwrap()[..], b"Seed");

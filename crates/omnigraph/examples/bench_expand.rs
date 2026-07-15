@@ -252,9 +252,7 @@ query sel($name: String) {
             let dir = tempfile::tempdir().unwrap();
             let uri = dir.path().to_str().unwrap();
             let mut db = Omnigraph::init(uri, SCHEMA).await.unwrap();
-            load_jsonl(&mut db, &jsonl, LoadMode::Overwrite)
-                .await
-                .unwrap();
+            load_jsonl(&mut db, &jsonl, LoadMode::Overwrite).await.unwrap();
             // SAFE: example main drives queries sequentially; no concurrent env reader.
             unsafe { std::env::set_var("OMNIGRAPH_TRAVERSAL_MODE", mode) };
 

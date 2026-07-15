@@ -100,12 +100,7 @@ pub(crate) enum Command {
         #[arg(long, conflicts_with = "query_string")]
         query: Option<PathBuf>,
         /// Inline ad-hoc GQ source — alternative to `--query <path>`.
-        #[arg(
-            short = 'e',
-            long = "query-string",
-            value_name = "GQ",
-            conflicts_with = "query"
-        )]
+        #[arg(short = 'e', long = "query-string", value_name = "GQ", conflicts_with = "query")]
         query_string: Option<String>,
         #[command(flatten)]
         params: ParamsArgs,
@@ -133,12 +128,7 @@ pub(crate) enum Command {
         #[arg(long, conflicts_with = "query_string")]
         query: Option<PathBuf>,
         /// Inline ad-hoc GQ source — alternative to `--query <path>`.
-        #[arg(
-            short = 'e',
-            long = "query-string",
-            value_name = "GQ",
-            conflicts_with = "query"
-        )]
+        #[arg(short = 'e', long = "query-string", value_name = "GQ", conflicts_with = "query")]
         query_string: Option<String>,
         #[command(flatten)]
         params: ParamsArgs,
