@@ -253,16 +253,20 @@ query not_sal_tagged() {
 // Positional operand semantics (documented contract): `X contains Y` tests
 // that X contains Y whichever side each operand is on, and a same-variable
 // two-property predicate evaluates per row. Neither form is hoisted (the
-// needle isn't a literal/param), so both take the in-memory arm.
+// needle isn't a literal/param), so both take the in-memory arm. The
+// reversed form uses a LITERAL left operand: a bare variable on the left is
+// shadowed by the traversal rule at parse time (`$q contains $m` reads as a
+// traversal over an edge named `contains`), a pre-existing grammar
+// precedence documented in the query-language page.
 #[tokio::test]
 async fn reversed_and_same_variable_string_predicates_execute() {
     let dir = tempfile::tempdir().unwrap();
     let mut db = metric_db(&dir).await;
     let q = r#"
-query reversed($q: String) {
+query reversed() {
     match {
         $m: Metric
-        $q contains $m.label
+        "the alps are tall" contains $m.label
     }
     return { $m.name }
 }
@@ -275,15 +279,11 @@ query same_var() {
 }
 "#;
     // "the alps are tall" contains the label "alps" (m2) only.
-    let r = query_main(
-        &mut db,
-        q,
-        "reversed",
-        &params(&[("$q", "the alps are tall")]),
-    )
-    .await
-    .unwrap();
-    assert_eq!(r.num_rows(), 1, "param-contains-property matches m2 only");
+    assert_eq!(
+        sorted_metric_names(&mut db, q, "reversed").await,
+        vec!["m2"],
+        "literal-contains-property matches m2 only"
+    );
     // No label starts with its own row's name (m1..m4) — and the predicate
     // must compare within each row, not degenerate or error.
     assert!(
@@ -330,9 +330,9 @@ async fn standalone_string_predicate_is_hoisted_into_scan() {
 // Composition shapes: a string predicate combined with an FTS search filter
 // on the same scanned variable (both reach the same NodeScan — FTS via
 // full_text_search, the predicate via filter_expr), and a string predicate
-// inside `not { }` (anti-join inner pipeline). `ensure_indices` runs first,
-// so the prefix predicate here executes over a real dual-indexed (FTS +
-// companion BTREE) free-text column, not just the scan fallback.
+// inside `not { }` (anti-join inner pipeline). `ensure_indices` runs first
+// so `search()` has its FTS index; the prefix predicate executes as a
+// correct scan-backed filter on the same scan.
 #[tokio::test]
 async fn string_predicates_compose_with_search_and_negation() {
     let dir = tempfile::tempdir().unwrap();
