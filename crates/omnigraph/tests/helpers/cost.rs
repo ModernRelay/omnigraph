@@ -87,6 +87,10 @@ pub struct IoCounts {
     /// Internal/system-table (`__manifest`) open CALL count — the complement of
     /// `data_open_count` (publisher CAS).
     pub internal_open_count: u64,
+    /// Full `__manifest` row-scan invocation count. Unlike object-store reads,
+    /// this distinguishes one coherent state+lineage scan from two projections
+    /// over the same already-open handle.
+    pub manifest_scan_count: u64,
 }
 
 impl IoCounts {
@@ -310,6 +314,7 @@ struct OpProbes {
     probe_count: Arc<AtomicU64>,
     data_open_count: Arc<AtomicU64>,
     internal_open_count: Arc<AtomicU64>,
+    manifest_scan_count: Arc<AtomicU64>,
 }
 
 impl OpProbes {
@@ -328,6 +333,7 @@ impl OpProbes {
             probe_count: Arc::new(AtomicU64::new(0)),
             data_open_count: Arc::new(AtomicU64::new(0)),
             internal_open_count: Arc::new(AtomicU64::new(0)),
+            manifest_scan_count: Arc::new(AtomicU64::new(0)),
         };
         let probes = QueryIoProbes {
             manifest_wrapper: Some(Arc::new(h.manifest.clone()) as Arc<dyn WrappingObjectStore>),
@@ -335,6 +341,7 @@ impl OpProbes {
             probe_count: Arc::clone(&h.probe_count),
             data_open_count: Arc::clone(&h.data_open_count),
             internal_open_count: Arc::clone(&h.internal_open_count),
+            manifest_scan_count: Arc::clone(&h.manifest_scan_count),
             // graph_build_count / graph_edges_built unused by this harness.
             ..Default::default()
         };
@@ -365,6 +372,7 @@ impl OpProbes {
             version_probes: self.probe_count.load(Ordering::Relaxed),
             data_open_count: self.data_open_count.load(Ordering::Relaxed),
             internal_open_count: self.internal_open_count.load(Ordering::Relaxed),
+            manifest_scan_count: self.manifest_scan_count.load(Ordering::Relaxed),
         }
     }
 }

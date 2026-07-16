@@ -1578,9 +1578,22 @@ pub(super) async fn commit_prepared_updates_on_branch_with_expected(
 
     let mut coordinator = match requested_branch.as_deref() {
         Some(branch) => {
-            GraphCoordinator::open_branch(db.uri(), branch, Arc::clone(&db.storage)).await?
+            GraphCoordinator::open_branch_with_session(
+                db.uri(),
+                branch,
+                Arc::clone(&db.storage),
+                &db.control_session(),
+            )
+            .await?
         }
-        None => GraphCoordinator::open(db.uri(), Arc::clone(&db.storage)).await?,
+        None => {
+            GraphCoordinator::open_with_session(
+                db.uri(),
+                Arc::clone(&db.storage),
+                &db.control_session(),
+            )
+            .await?
+        }
     };
     let PublishedSnapshot {
         manifest_version,
@@ -1658,9 +1671,22 @@ pub(super) async fn commit_updates_on_branch_with_expected(
     } else {
         let mut coordinator = match requested_branch.as_deref() {
             Some(branch) => {
-                GraphCoordinator::open_branch(db.uri(), branch, Arc::clone(&db.storage)).await?
+                GraphCoordinator::open_branch_with_session(
+                    db.uri(),
+                    branch,
+                    Arc::clone(&db.storage),
+                    &db.control_session(),
+                )
+                .await?
             }
-            None => GraphCoordinator::open(db.uri(), Arc::clone(&db.storage)).await?,
+            None => {
+                GraphCoordinator::open_with_session(
+                    db.uri(),
+                    Arc::clone(&db.storage),
+                    &db.control_session(),
+                )
+                .await?
+            }
         };
         coordinator
             .commit_changes_with_intent_and_expected(

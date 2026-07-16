@@ -11,10 +11,13 @@
 //! - **omnigraph `StorageAdapter`** — [`CountingStorageAdapter`], a decorator that
 //!   counts per-method calls (the schema-contract reads on the query path).
 //!
-//! Nothing here changes runtime behavior: the wrappers only observe, and the
-//! decorator delegates every call. `IOTracker` (the concrete counter) lives in
-//! tests via the `lance-io` dev-dependency; this module stays generic over the
-//! `lance::io`-re-exported trait, so it adds no production dependency.
+//! The probes themselves only observe, and the decorator delegates every call.
+//! The shared dataset opener also supplies the process control session when a
+//! caller has no graph-scoped data session, so detached opens still reuse the
+//! process object-store registry without caching mutable metadata. `IOTracker`
+//! (the concrete counter) lives in tests via the `lance-io` dev-dependency; this
+//! module stays generic over the `lance::io`-re-exported trait, so it adds no
+//! production dependency.
 
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -60,6 +63,10 @@ pub struct QueryIoProbes {
     /// Internal/system-table (`__manifest`) open CALLS — the complement of
     /// `data_open_count`, kept for symmetry and debugging.
     pub internal_open_count: Arc<AtomicU64>,
+    /// Full `__manifest` row-scan invocations. Counted at the shared state scan
+    /// and the dedicated lineage scan, so a coordinator that opens one handle
+    /// but scans state and lineage separately still reports two.
+    pub manifest_scan_count: Arc<AtomicU64>,
     /// Counts topology-index builds (the `RuntimeCache::graph_index` cache-miss
     /// path). A cost test asserts a fresh branch whose edge tables are unchanged
     /// from main reuses main's cached index (0 builds) rather than rebuilding it.
@@ -151,6 +158,13 @@ pub(crate) fn record_open(uri: &str) {
         } else {
             p.data_open_count.fetch_add(1, Ordering::Relaxed);
         }
+    });
+}
+
+/// Record one full `__manifest` row scan. No-op unless a cost probe is active.
+pub(crate) fn record_manifest_scan() {
+    let _ = current(|p| {
+        p.manifest_scan_count.fetch_add(1, Ordering::Relaxed);
     });
 }
 
@@ -483,12 +497,12 @@ pub(crate) enum VersionResolution {
 ///    `ObjectStoreParams` on the builder, so the open itself is counted
 ///    (`Dataset::with_object_store_wrappers` only wraps an already-open
 ///    store). No wrapper (production) adds nothing.
-/// 3. The shared per-graph `Session` (LanceDB's one-session-per-connection
-///    pattern; warms Lance's metadata/index caches across opens) is attached
-///    whenever the caller has one. `None` is for genuinely session-less
-///    contexts (a `Snapshot` detached from its graph's read caches) — owners
-///    that hold a session (`TableStore`, the handle cache) pass it
-///    unconditionally, so it cannot be silently dropped on one path.
+/// 3. A caller-provided graph data `Session` warms Lance's metadata/index
+///    caches across data-table opens. When absent (for example a detached
+///    historical snapshot or recovery helper), the process-wide zero-cache
+///    control session is attached instead. Every open therefore reuses the
+///    shared object-store registry/client pool without letting mutable control
+///    metadata become stale in a session cache.
 pub(crate) async fn open_dataset(
     uri: &str,
     version: VersionResolution,
@@ -500,9 +514,10 @@ pub(crate) async fn open_dataset(
     if let VersionResolution::At(version) = version {
         builder = builder.with_version(version);
     }
-    if let Some(session) = session {
-        builder = builder.with_session(session.clone());
-    }
+    let session = session
+        .cloned()
+        .unwrap_or_else(crate::lance_access::control_session);
+    builder = builder.with_session(session);
     if let Some(wrapper) = wrapper {
         builder = builder.with_store_params(ObjectStoreParams {
             object_store_wrapper: Some(wrapper),

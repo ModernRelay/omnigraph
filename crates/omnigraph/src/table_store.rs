@@ -1203,6 +1203,7 @@ impl TableStore {
                 Ok(ds)
             }
             None => {
+                let control_session = crate::lance_access::control_session();
                 let params = WriteParams {
                     mode: WriteMode::Create,
                     enable_stable_row_ids: true,
@@ -1210,6 +1211,7 @@ impl TableStore {
                     allow_external_blob_outside_bases: true,
                     auto_cleanup: None,
                     skip_auto_cleanup: true,
+                    session: Some(control_session),
                     ..Default::default()
                 };
                 Dataset::write(reader, dataset_uri, Some(params))
@@ -3023,6 +3025,7 @@ impl TableStore {
 
     pub async fn write_dataset(dataset_uri: &str, batch: RecordBatch) -> Result<Dataset> {
         let reader = arrow_array::RecordBatchIterator::new(vec![Ok(batch.clone())], batch.schema());
+        let control_session = crate::lance_access::control_session();
         let params = WriteParams {
             mode: WriteMode::Create,
             enable_stable_row_ids: true,
@@ -3030,6 +3033,7 @@ impl TableStore {
             allow_external_blob_outside_bases: true,
             auto_cleanup: None,
             skip_auto_cleanup: true,
+            session: Some(control_session),
             ..Default::default()
         };
         Dataset::write(reader, dataset_uri, Some(params))

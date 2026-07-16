@@ -49,9 +49,7 @@ pub use table_ops::PendingIndex;
 pub(crate) use table_ops::{DeferredTableFork, OpenedForMutation};
 
 use super::commit_graph::GraphCommit;
-use super::manifest::{
-    ManifestChange, ManifestCoordinator, Snapshot, TableRegistration, TableTombstone,
-};
+use super::manifest::{ManifestChange, Snapshot, TableRegistration, TableTombstone};
 use super::schema_state::{
     SCHEMA_SOURCE_FILENAME, load_validated_schema_contract,
     load_validated_schema_contract_for_source, read_accepted_schema_ir, read_schema_state_identity,
@@ -147,6 +145,12 @@ pub(crate) struct WriteTxn {
     /// never the handle-global catalog, which can lag a schema apply performed by
     /// another long-lived handle.
     pub(crate) catalog: Arc<Catalog>,
+    /// Cheap freshness probe retained from the exact manifest handle that
+    /// supplied `base` and `authority`. It is not publish authority: merge uses
+    /// it only to prove the captured view is still current and falls back to a
+    /// full coherent capture on mismatch. The publisher still performs its own
+    /// fresh CAS read.
+    pub(crate) manifest_probe: crate::db::manifest::CapturedManifestProbe,
 }
 
 /// One coherent handle-local projection of the durable schema contract.
@@ -168,6 +172,10 @@ struct HandleSchemaView {
 pub struct Omnigraph {
     root_uri: String,
     storage: Arc<dyn StorageAdapter>,
+    /// Split Lance access context: data tables receive a graph-scoped cached
+    /// session, while mutable control metadata uses a zero-cache session. Both
+    /// share one process-wide object-store registry/client pool.
+    lance_access: crate::lance_access::LanceAccessContext,
     /// Coordinator state behind a tokio `RwLock`. PR 2 (MR-686) wraps
     /// this so engine write APIs can be `&self` (the HTTP server's
     /// `AppState` holds `Arc<Omnigraph>` and dispatches concurrent
@@ -321,6 +329,7 @@ impl Omnigraph {
         options: InitOptions,
     ) -> Result<Self> {
         let root = normalize_root_uri(uri)?;
+        let lance_access = crate::lance_access::LanceAccessContext::new();
         let write_queue_identity = write_queue_root_identity(&root)?;
         let write_queue =
             crate::db::write_queue::WriteQueueManager::for_root(&write_queue_identity);
@@ -413,6 +422,7 @@ impl Omnigraph {
             &catalog,
             &storage,
             !schema_pg_claimed,
+            &lance_access.control_session(),
         )
         .await
         {
@@ -425,17 +435,16 @@ impl Omnigraph {
             }
         };
 
-        let session = Arc::new(lance::session::Session::default());
+        let session = lance_access.data_session();
         Ok(Self {
             root_uri: root.clone(),
             storage,
+            lance_access,
             coordinator: Arc::new(tokio::sync::RwLock::new(coordinator)),
-            // One shared Session per graph (LanceDB's one-session-per-connection
-            // model), created once and shared by the read path (handle cache)
-            // AND the TableStore's write/maintenance opens, so both sides warm
-            // the same Lance metadata/index caches. Session::default() caps are
-            // lazy (6 GiB index / 1 GiB metadata); multi-graph cap/sharing is a
-            // deferred follow-up.
+            // The graph-scoped data session keeps table metadata/index caches
+            // warm across reads, writes, and maintenance. Mutable control
+            // metadata uses the context's separate zero-cache session; both
+            // sessions reuse the process-wide object-store registry.
             table_store: TableStore::new(&root, session.clone()),
             runtime_cache: RuntimeCache::default(),
             read_caches: Arc::new(crate::runtime_cache::ReadCaches {
@@ -483,6 +492,7 @@ impl Omnigraph {
         mode: OpenMode,
     ) -> Result<Self> {
         let root = normalize_root_uri(uri)?;
+        let lance_access = crate::lance_access::LanceAccessContext::new();
         let write_queue_identity = write_queue_root_identity(&root)?;
         let write_queue =
             crate::db::write_queue::WriteQueueManager::for_root(&write_queue_identity);
@@ -495,7 +505,10 @@ impl Omnigraph {
         crate::db::manifest::refuse_if_internal_schema_unsupported(&root).await?;
         // Open the coordinator first so the schema-staging recovery sweep can
         // compare its snapshot against any leftover staging files.
-        let mut coordinator = GraphCoordinator::open(&root, Arc::clone(&storage)).await?;
+        let control_session = lance_access.control_session();
+        let mut coordinator =
+            GraphCoordinator::open_with_session(&root, Arc::clone(&storage), &control_session)
+                .await?;
         // Schema publication is a three-file promotion plus an in-memory catalog
         // swap.  Every handle — including ReadOnly — must hold the root-scoped
         // schema gate from its final coordinator refresh through the complete
@@ -563,17 +576,16 @@ impl Omnigraph {
         let mut catalog = build_catalog_from_ir(&accepted_ir)?;
         fixup_physical_schemas(&mut catalog)?;
 
-        let session = Arc::new(lance::session::Session::default());
+        let session = lance_access.data_session();
         let db = Self {
             root_uri: root.clone(),
             storage,
+            lance_access,
             coordinator: Arc::new(tokio::sync::RwLock::new(coordinator)),
-            // One shared Session per graph (LanceDB's one-session-per-connection
-            // model), created once and shared by the read path (handle cache)
-            // AND the TableStore's write/maintenance opens, so both sides warm
-            // the same Lance metadata/index caches. Session::default() caps are
-            // lazy (6 GiB index / 1 GiB metadata); multi-graph cap/sharing is a
-            // deferred follow-up.
+            // The graph-scoped data session keeps table metadata/index caches
+            // warm across reads, writes, and maintenance. Mutable control
+            // metadata uses the context's separate zero-cache session; both
+            // sessions reuse the process-wide object-store registry.
             table_store: TableStore::new(&root, session.clone()),
             runtime_cache: RuntimeCache::default(),
             read_caches: Arc::new(crate::runtime_cache::ReadCaches {
@@ -856,6 +868,10 @@ impl Omnigraph {
         &self.table_store
     }
 
+    pub(crate) fn control_session(&self) -> Arc<lance::session::Session> {
+        self.lance_access.control_session()
+    }
+
     /// Engine-level access to the object-store adapter (S3 / local fs).
     /// Used by the recovery sidecar protocol — writers in the engine
     /// call this to write/delete sidecars at `__recovery/{ulid}.json`.
@@ -897,9 +913,22 @@ impl Omnigraph {
     ) -> Result<GraphCoordinator> {
         match branch {
             Some(branch) => {
-                GraphCoordinator::open_branch(self.uri(), branch, Arc::clone(&self.storage)).await
+                GraphCoordinator::open_branch_with_session(
+                    self.uri(),
+                    branch,
+                    Arc::clone(&self.storage),
+                    &self.control_session(),
+                )
+                .await
             }
-            None => GraphCoordinator::open(self.uri(), Arc::clone(&self.storage)).await,
+            None => {
+                GraphCoordinator::open_with_session(
+                    self.uri(),
+                    Arc::clone(&self.storage),
+                    &self.control_session(),
+                )
+                .await
+            }
         }
     }
 
@@ -950,9 +979,9 @@ impl Omnigraph {
                 .await?;
             let (schema_ir, schema_state) =
                 load_validated_schema_contract(self.uri(), Arc::clone(&self.storage)).await?;
-            let (branch_identifier, graph_head, effective_graph_head, snapshot) = self
-                .write_authority_for_known_branch(branch.as_deref(), true)
-                .await?;
+            let (branch_identifier, graph_head, effective_graph_head, snapshot, manifest_probe) =
+                self.write_authority_for_known_branch(branch.as_deref(), true)
+                    .await?;
             self.ensure_schema_apply_not_locked("write preparation")
                 .await?;
             let trailing_schema_state =
@@ -979,6 +1008,7 @@ impl Omnigraph {
                 },
                 effective_graph_head,
                 catalog: Arc::new(catalog),
+                manifest_probe,
             });
         }
 
@@ -1038,6 +1068,7 @@ impl Omnigraph {
                 source_effective_graph_head,
                 source_base,
                 source_commits,
+                source_manifest_probe,
             ) = source_authority;
             let (
                 target_branch_identifier,
@@ -1045,26 +1076,30 @@ impl Omnigraph {
                 target_effective_graph_head,
                 target_base,
                 target_commits,
+                target_manifest_probe,
             ) = target_authority;
-            let make_txn = |branch: Option<String>,
-                            (branch_identifier, graph_head, effective_graph_head, base): (
-                lance::dataset::refs::BranchIdentifier,
-                Option<String>,
-                Option<String>,
-                Snapshot,
-            )| WriteTxn {
-                branch,
-                base,
-                authority: WriteAuthorityToken {
-                    branch_identifier,
-                    graph_head,
-                    schema_ir_hash: schema_state.schema_ir_hash.clone(),
-                    schema_identity_domain: schema_identity_domain.clone(),
-                    schema_identity_version: schema_state.schema_identity_version,
-                },
-                effective_graph_head,
-                catalog: Arc::clone(&catalog),
-            };
+            let make_txn =
+                |branch: Option<String>,
+                 (branch_identifier, graph_head, effective_graph_head, base, manifest_probe): (
+                    lance::dataset::refs::BranchIdentifier,
+                    Option<String>,
+                    Option<String>,
+                    Snapshot,
+                    crate::db::manifest::CapturedManifestProbe,
+                )| WriteTxn {
+                    branch,
+                    base,
+                    authority: WriteAuthorityToken {
+                        branch_identifier,
+                        graph_head,
+                        schema_ir_hash: schema_state.schema_ir_hash.clone(),
+                        schema_identity_domain: schema_identity_domain.clone(),
+                        schema_identity_version: schema_state.schema_identity_version,
+                    },
+                    effective_graph_head,
+                    catalog: Arc::clone(&catalog),
+                    manifest_probe,
+                };
             return Ok((
                 make_txn(
                     source_branch.clone(),
@@ -1073,6 +1108,7 @@ impl Omnigraph {
                         source_graph_head,
                         source_effective_graph_head,
                         source_base,
+                        source_manifest_probe,
                     ),
                 ),
                 make_txn(
@@ -1082,6 +1118,7 @@ impl Omnigraph {
                         target_graph_head,
                         target_effective_graph_head,
                         target_base,
+                        target_manifest_probe,
                     ),
                 ),
                 source_commits,
@@ -1100,34 +1137,55 @@ impl Omnigraph {
         ))
     }
 
-    /// Fresh pre-effect source/target authority for branch merge without
-    /// rebuilding catalogs or reopening the source lineage projection.
-    /// Planning already owns the immutable catalog and commit ancestry; this
-    /// fence needs only the current accepted schema plus both manifest states.
+    /// Probe-first pre-effect source/target authority for branch merge.
+    ///
+    /// The common path proves the exact manifest handles retained by the
+    /// capture are still current and reuses their immutable authority/snapshot.
+    /// A mismatch falls back to a full coherent branch capture. Planning keeps
+    /// its original commit ancestry and source head: a later source advance is
+    /// allowed, while target movement and branch-incarnation/schema changes are
+    /// rejected by the caller. The publisher remains independently fresh on
+    /// every CAS attempt.
     pub(crate) async fn revalidate_merge_inputs(
         &self,
-        source_branch: Option<&str>,
-        target_branch: Option<&str>,
+        source_txn: &WriteTxn,
+        target_txn: &WriteTxn,
     ) -> Result<(WriteAuthorityToken, Snapshot, WriteAuthorityToken, Snapshot)> {
         const MAX_CAPTURE_RETRIES: usize = 8;
-        let source_branch = normalize_branch_name(source_branch.unwrap_or("main"))?;
-        let target_branch = normalize_branch_name(target_branch.unwrap_or("main"))?;
+        let source_branch = source_txn.branch.as_deref();
+        let target_branch = target_txn.branch.as_deref();
 
         for _ in 0..MAX_CAPTURE_RETRIES {
             self.ensure_schema_apply_not_locked("branch merge revalidation")
                 .await?;
             let (schema_ir, schema_state) =
                 load_validated_schema_contract(self.uri(), Arc::clone(&self.storage)).await?;
-            let target = self
-                .write_authority_for_known_branch(target_branch.as_deref(), true)
-                .await?;
-            let source_manifest = match source_branch.as_deref() {
-                Some(branch) => ManifestCoordinator::open_at_branch(self.uri(), branch).await?,
-                None => ManifestCoordinator::open(self.uri()).await?,
+            let source_current = source_txn.manifest_probe.is_current().await?;
+            let target_current = target_txn.manifest_probe.is_current().await?;
+            let source = if source_current {
+                (
+                    source_txn.authority.branch_identifier.clone(),
+                    source_txn.authority.graph_head.clone(),
+                    source_txn.base.clone(),
+                )
+            } else {
+                let (branch_identifier, graph_head, _, snapshot, _) = self
+                    .write_authority_for_known_branch(source_branch, true)
+                    .await?;
+                (branch_identifier, graph_head, snapshot)
             };
-            let source_branch_identifier = source_manifest.branch_identifier().await?;
-            let source_graph_head = source_manifest.exact_graph_head();
-            let source_snapshot = source_manifest.snapshot();
+            let target = if target_current {
+                (
+                    target_txn.authority.branch_identifier.clone(),
+                    target_txn.authority.graph_head.clone(),
+                    target_txn.base.clone(),
+                )
+            } else {
+                let (branch_identifier, graph_head, _, snapshot, _) = self
+                    .write_authority_for_known_branch(target_branch, true)
+                    .await?;
+                (branch_identifier, graph_head, snapshot)
+            };
             self.ensure_schema_apply_not_locked("branch merge revalidation")
                 .await?;
             let trailing_schema_state =
@@ -1137,8 +1195,8 @@ impl Omnigraph {
                 continue;
             }
 
-            validate_schema_ir_against_snapshot(&schema_ir, &source_snapshot)?;
-            validate_schema_ir_against_snapshot(&schema_ir, &target.3)?;
+            validate_schema_ir_against_snapshot(&schema_ir, &source.2)?;
+            validate_schema_ir_against_snapshot(&schema_ir, &target.2)?;
             let schema_identity_domain = schema_ir.schema_identity_domain.as_str().to_string();
             let make_token =
                 |branch_identifier: lance::dataset::refs::BranchIdentifier,
@@ -1150,18 +1208,18 @@ impl Omnigraph {
                     schema_identity_version: schema_state.schema_identity_version,
                 };
             return Ok((
-                make_token(source_branch_identifier, source_graph_head),
-                source_snapshot,
+                make_token(source.0, source.1),
+                source.2,
                 make_token(target.0, target.1),
-                target.3,
+                target.2,
             ));
         }
 
         Err(OmniError::manifest_read_set_changed(
             format!(
                 "branch_merge_revalidation:{}->{}",
-                source_branch.as_deref().unwrap_or("main"),
-                target_branch.as_deref().unwrap_or("main")
+                source_branch.unwrap_or("main"),
+                target_branch.unwrap_or("main")
             ),
             None,
             None,
@@ -1216,6 +1274,7 @@ impl Omnigraph {
         Option<String>,
         Option<String>,
         Snapshot,
+        crate::db::manifest::CapturedManifestProbe,
     )> {
         {
             let coord = self.coordinator.read().await;
@@ -1235,6 +1294,7 @@ impl Omnigraph {
                             .await?
                             .map(|head| head.as_str().to_string()),
                         coord.snapshot(),
+                        coord.captured_manifest_probe(),
                     ));
                 }
             }
@@ -1249,6 +1309,7 @@ impl Omnigraph {
                 .await?
                 .map(|head| head.as_str().to_string()),
             coord.snapshot(),
+            coord.captured_manifest_probe(),
         ))
     }
 
@@ -1265,6 +1326,7 @@ impl Omnigraph {
         Option<String>,
         Snapshot,
         Vec<GraphCommit>,
+        crate::db::manifest::CapturedManifestProbe,
     )> {
         {
             let coord = self.coordinator.read().await;
@@ -1280,6 +1342,7 @@ impl Omnigraph {
                             .map(|head| head.as_str().to_string()),
                         coord.snapshot(),
                         coord.load_commits().await?,
+                        coord.captured_manifest_probe(),
                     ));
                 }
             }
@@ -1295,6 +1358,7 @@ impl Omnigraph {
                 .map(|head| head.as_str().to_string()),
             coord.snapshot(),
             coord.load_commits().await?,
+            coord.captured_manifest_probe(),
         ))
     }
 
@@ -1305,7 +1369,7 @@ impl Omnigraph {
         // Recheck the durable sentinel inside that critical section so a schema
         // apply observed after preparation cannot be followed by a table effect.
         self.ensure_schema_apply_not_locked("write commit").await?;
-        let (branch_identifier, graph_head, _effective_graph_head, snapshot) = self
+        let (branch_identifier, graph_head, _effective_graph_head, snapshot, _) = self
             .write_authority_for_known_branch(txn.branch.as_deref(), true)
             .await?;
         let (schema_ir, schema_state) =
@@ -2341,7 +2405,12 @@ impl Omnigraph {
         Ok(())
     }
 
-    async fn ensure_branch_delete_safe(&self, branch: &str, branches: &[String]) -> Result<()> {
+    async fn ensure_branch_delete_safe(
+        &self,
+        control: &GraphCoordinator,
+        branch: &str,
+        branches: &[String],
+    ) -> Result<()> {
         let path_prefix = format!("{branch}/");
         if let Some(child) = branches
             .iter()
@@ -2353,12 +2422,7 @@ impl Omnigraph {
             )));
         }
 
-        let descendants = self
-            .coordinator
-            .read()
-            .await
-            .branch_descendants(branch)
-            .await?;
+        let descendants = control.branch_descendants(branch).await?;
         if let Some(descendant) = descendants.first() {
             return Err(OmniError::manifest_conflict(format!(
                 "cannot delete branch '{}' because descendant branch '{}' still depends on it",
@@ -2427,7 +2491,11 @@ impl Omnigraph {
         }
     }
 
-    async fn delete_branch_storage_only(&self, branch: &str) -> Result<()> {
+    async fn delete_captured_branch_storage(
+        &self,
+        branch: &str,
+        target: &mut GraphCoordinator,
+    ) -> Result<()> {
         let active = self
             .coordinator
             .read()
@@ -2441,17 +2509,26 @@ impl Omnigraph {
             )));
         }
 
-        let branch_snapshot = self.snapshot_of(ReadTarget::branch(branch)).await?;
+        let branch_snapshot = target.snapshot();
         let owned_tables = branch_snapshot
             .entries()
             .filter(|entry| entry.table_branch.as_deref() == Some(branch))
             .map(|entry| (entry.table_key.clone(), entry.table_path.clone()))
             .collect::<Vec<_>>();
+        let expected_identifier = target.branch_identifier().await?;
 
         // Authority removal is the logical branch deletion. Lance tree cleanup
-        // follows that ref removal; the coordinator classifies an absent ref as
-        // success even if the physical cleanup acknowledgement failed.
-        self.coordinator.write().await.branch_delete(branch).await?;
+        // follows that ref removal. The disposable target capture supplies the
+        // exact native ref identity, so delete/recreate ABA cannot substitute a
+        // replacement branch underneath the validated snapshot.
+        target
+            .branch_delete_captured(branch, &expected_identifier)
+            .await?;
+        // The removed coordinator refreshes used to invalidate these caches
+        // before the authority change. Do it explicitly after success instead:
+        // old branch-incarnation handles/topology can never leak into a later
+        // recreation, while a failed control leaves warm state untouched.
+        self.invalidate_read_caches().await;
         // Best-effort per-table fork reclaim; cleanup reconciles any leftover.
         self.cleanup_deleted_branch_tables(branch, &owned_tables)
             .await;
@@ -2501,9 +2578,8 @@ impl Omnigraph {
             .write_queue()
             .acquire_branches(&[source.clone(), Some(target.clone())])
             .await;
-        self.refresh_coordinator_only().await?;
         self.ensure_schema_apply_not_locked("branch_create").await?;
-        let control_catalog = self.load_accepted_catalog_with_schema_gate_held().await?;
+        let control_catalog = self.build_accepted_catalog_with_schema_gate_held().await?;
         let table_queue_keys = self.table_queue_keys_for_branches(
             &[source.clone(), Some(target.clone())],
             &control_catalog,
@@ -2511,12 +2587,15 @@ impl Omnigraph {
         let _table_guards = self.write_queue().acquire_many(&table_queue_keys).await;
         self.ensure_no_pending_recovery_sidecars_under_gates(&relevant, "branch_create")
             .await?;
-        self.refresh_coordinator_only().await?;
         self.ensure_schema_apply_not_locked("branch_create").await?;
         self.ensure_schema_state_valid().await?;
-        let branches = self.coordinator.read().await.all_branches().await?;
+        let mut source_coord = self.open_coordinator_for_branch(source.as_deref()).await?;
+        validate_bound_catalog_against_snapshot(&control_catalog, &source_coord.snapshot())?;
+        let branches = source_coord.all_branches().await?;
         Self::ensure_branch_create_namespace_safe(&target, &branches)?;
-        self.coordinator.write().await.branch_create(name).await
+        source_coord.branch_create(&target).await?;
+        self.invalidate_read_caches().await;
+        Ok(())
     }
 
     pub async fn branch_create_from(&self, from: impl Into<ReadTarget>, name: &str) -> Result<()> {
@@ -2590,10 +2669,9 @@ impl Omnigraph {
             .write_queue()
             .acquire_branches(&[branch.clone(), Some(target_branch.clone())])
             .await;
-        self.refresh_coordinator_only().await?;
         self.ensure_schema_apply_not_locked("branch_create_from")
             .await?;
-        let control_catalog = self.load_accepted_catalog_with_schema_gate_held().await?;
+        let control_catalog = self.build_accepted_catalog_with_schema_gate_held().await?;
         let table_queue_keys = self.table_queue_keys_for_branches(
             &[branch.clone(), Some(target_branch.clone())],
             &control_catalog,
@@ -2601,11 +2679,12 @@ impl Omnigraph {
         let _table_guards = self.write_queue().acquire_many(&table_queue_keys).await;
         self.ensure_no_pending_recovery_sidecars_under_gates(&relevant, "branch_create_from")
             .await?;
-        self.refresh_coordinator_only().await?;
         self.ensure_schema_apply_not_locked("branch_create_from")
             .await?;
         self.ensure_schema_state_valid().await?;
-        let branches = self.coordinator.read().await.all_branches().await?;
+        let mut source_coord = self.open_coordinator_for_branch(branch.as_deref()).await?;
+        validate_bound_catalog_against_snapshot(&control_catalog, &source_coord.snapshot())?;
+        let branches = source_coord.all_branches().await?;
         Self::ensure_branch_create_namespace_safe(&target_branch, &branches)?;
         // Operate on a freshly-opened source coordinator that's owned locally
         // — never touch `self.coordinator`. The pre-fix implementation used
@@ -2618,13 +2697,13 @@ impl Omnigraph {
         // `concurrent_branch_create_from_distinct_parents_does_not_corrupt_coordinator`
         // in `crates/omnigraph-server/tests/server.rs`.
         //
-        // `branch_create` mutates only the local coord's commit-graph cache;
-        // the manifest write is durable on disk regardless of which
-        // coord-handle issued it. Discarding `source_coord` after the call
-        // is the right shape — the new branch is reachable from any
-        // subsequent open of any coord.
-        let mut source_coord = self.open_coordinator_for_branch(branch.as_deref()).await?;
-        source_coord.branch_create(name).await
+        // The manifest ref write is durable regardless of which coordinator
+        // handle issued it. Discarding `source_coord` after the call is the
+        // right shape — the new branch is reachable from any subsequent
+        // coordinator open.
+        source_coord.branch_create(&target_branch).await?;
+        self.invalidate_read_caches().await;
+        Ok(())
     }
 
     pub async fn branch_list(&self) -> Result<Vec<String>> {
@@ -2663,19 +2742,21 @@ impl Omnigraph {
             .acquire(&crate::db::manifest::schema_apply_serial_queue_key())
             .await;
         let _branch_guard = self.write_queue().acquire_branch(Some(&branch)).await;
-        self.refresh_coordinator_only().await?;
         self.ensure_schema_apply_not_locked("branch_delete").await?;
-        let control_catalog = self.load_accepted_catalog_with_schema_gate_held().await?;
+        let control_catalog = self.build_accepted_catalog_with_schema_gate_held().await?;
         let table_queue_keys =
             self.table_queue_keys_for_branches(&[Some(branch.clone())], &control_catalog);
         let _table_guards = self.write_queue().acquire_many(&table_queue_keys).await;
         self.ensure_branch_delete_recovery_safe_under_gates(&branch)
             .await?;
         crate::failpoints::maybe_fail(crate::failpoints::names::BRANCH_DELETE_POST_TABLE_GATES)?;
-        self.refresh_coordinator_only().await?;
         self.ensure_schema_apply_not_locked("branch_delete").await?;
         self.ensure_schema_state_valid().await?;
-        let branches = self.coordinator.read().await.branch_list().await?;
+        let mut target_control = self
+            .open_coordinator_for_branch(Some(branch.as_str()))
+            .await?;
+        validate_bound_catalog_against_snapshot(&control_catalog, &target_control.snapshot())?;
+        let branches = target_control.branch_list().await?;
         if !branches.iter().any(|candidate| candidate == &branch) {
             return Err(OmniError::manifest_not_found(format!(
                 "branch '{}' not found",
@@ -2683,8 +2764,10 @@ impl Omnigraph {
             )));
         }
 
-        self.ensure_branch_delete_safe(&branch, &branches).await?;
-        self.delete_branch_storage_only(&branch).await
+        self.ensure_branch_delete_safe(&target_control, &branch, &branches)
+            .await?;
+        self.delete_captured_branch_storage(&branch, &mut target_control)
+            .await
     }
 
     pub async fn get_commit(&self, commit_id: &str) -> Result<GraphCommit> {
@@ -3142,6 +3225,7 @@ async fn init_storage_phase(
     catalog: &Catalog,
     storage: &Arc<dyn StorageAdapter>,
     write_schema_pg: bool,
+    control_session: &Arc<lance::session::Session>,
 ) -> Result<GraphCoordinator> {
     if write_schema_pg {
         let schema_path = join_uri(root, SCHEMA_SOURCE_FILENAME);
@@ -3152,7 +3236,9 @@ async fn init_storage_phase(
     write_schema_contract(root, storage.as_ref(), schema_ir).await?;
     crate::failpoints::maybe_fail(crate::failpoints::names::INIT_AFTER_SCHEMA_CONTRACT_WRITTEN)?;
 
-    let coordinator = GraphCoordinator::init(root, catalog, Arc::clone(storage)).await?;
+    let coordinator =
+        GraphCoordinator::init_with_session(root, catalog, Arc::clone(storage), control_session)
+            .await?;
     validate_schema_ir_against_snapshot(schema_ir, &coordinator.snapshot())?;
     crate::failpoints::maybe_fail(crate::failpoints::names::INIT_AFTER_COORDINATOR_INIT)?;
 

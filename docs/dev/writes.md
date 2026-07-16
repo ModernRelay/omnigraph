@@ -158,10 +158,14 @@ Branch merge retains its writer-specific row classifier and multi-commit table
 algorithms, but its authority, recovery, and visibility boundary now use the
 RFC-022 adapter contract:
 
-1. capture source and target as coherent `WriteTxn` snapshots. The target token
-   is `(BranchIdentifier, exact optional graph_head, accepted schema identity)`;
-   the effective lineage head is captured separately because a fresh named
-   branch can inherit a parent while its own `graph_head:<branch>` row is absent;
+1. open source and target once as coherent `WriteTxn` captures. Each temporary
+   coordinator derives manifest state and its lineage projection from the same
+   `__manifest` row scan; the `WriteTxn` retains the exact manifest `Dataset`
+   probe handle rather than reopening both branches to rediscover the same
+   authority. The target token is `(BranchIdentifier, exact optional
+   graph_head, accepted schema identity)`; the effective lineage head is
+   captured separately because a fresh named branch can inherit a parent while
+   its own `graph_head:<branch>` row is absent;
 2. compute the merge base from those captured commit ids and classify against
    the immutable base/source/target snapshots outside table gates. For an
    existing-target, HEAD-advancing all-new adopt, first try the narrow
@@ -174,11 +178,15 @@ RFC-022 adapter contract:
    not admitted to proven data replay; it keeps the existing ref-only fork
    path;
 3. acquire the conservative all-catalog source/target table envelope, re-list
-   recovery intent, revalidate the complete target token, and revalidate the
-   source incarnation. Before arming, every existing target ref that will receive
-   a physical effect must also have live Lance HEAD equal to its captured target
-   manifest pin; the verified handle is carried into the effect instead of being
-   reopened. First-touch refs remain absent until after the sidecar. A target
+   recovery intent, and probe the retained source/target manifest `Dataset`
+   handles for current physical incarnation. An unchanged probe keeps the
+   coherent capture; a mismatch triggers a fresh full manifest capture and the
+   existing typed revalidation/reprepare outcome rather than combining old
+   planning state with a new tip. Before arming, every existing target ref that
+   will receive a physical effect must also have live Lance HEAD equal to its
+   captured target manifest pin; the verified handle is carried into the effect
+   instead of being reopened. First-touch refs remain absent until after the
+   sidecar. A target
    change returns typed `ReadSetChanged` before effects. A later source-head
    advance is allowed: the contract is "merge the captured source commit," never
    "substitute whatever source is latest." A certificate-proven source table
@@ -239,12 +247,13 @@ closed. A compensating Lance `Restore` is also recognized by its exact target so
 a crash after restore but before the manifest publish resumes without restoring
 again.
 
-The handle-local coordinator swap and `merge_exclusive` mutex remain an
-implementation detail until target-context extraction lands; neither is treated
-as persistent authority. Native ref create/delete still lack conditional CAS, so
-first-touch destructive recovery retains the documented single-writer-process
-boundary. `sync_branch` continues to join the schema gate and cannot replace the
-temporary coordinator during a merge.
+The retained operation-local manifest probe handles and `merge_exclusive` mutex
+are implementation details; neither is persistent authority. The final target
+publisher still performs a fresh authority scan for every CAS attempt. Native
+ref create/delete still lack conditional CAS, so first-touch destructive
+recovery retains the documented single-writer-process boundary. `sync_branch`
+continues to join the schema gate and cannot replace the merge capture during
+its authority window.
 
 The final predeclared five-pair production acceptance series passed the fixed
 bulk-adopt gates. At 10K rows, production/comparator median operation time was
@@ -286,6 +295,26 @@ deleted. Delete captures the exact target identifier; after an ambiguous error,
 an absent ref is logical success, the same identifier preserves the original
 error, and a different identifier is a typed delete/recreate conflict. Derived
 tree cleanup is retried best-effort.
+
+The accepted catalog is captured under the schema gate to derive the
+conservative table envelope. After schema, source/target branch, and every
+accepted-catalog table gate are held and recovery intent has been re-listed,
+the control opens one operation-local coordinator and validates the catalog
+against that same manifest state. Its namespace, source version/incarnation,
+and exact delete identifier feed the native classifier. The handle-local active
+coordinator is not refreshed before and after table-gate acquisition. After a
+successful create or delete classification, derived read caches are invalidated
+explicitly so a later same-name branch incarnation cannot reuse stale handles or
+topology. This cache invalidation is derived-state hygiene, not the logical
+authority transition.
+
+All graph-dataset Lance opens share one process-wide `ObjectStoreRegistry`,
+which reuses their object-store clients. Data tables use a graph-handle-scoped
+cached `Session`; `__manifest` and other mutable-tip control datasets use a
+zero-cache control `Session`. A full coordinator open or refresh still folds the
+append-only manifest journal, but manifest state and lineage are decoded
+together in one scan. This reduces duplicate opens and scans; it does not make
+that remaining fold history-flat.
 
 There is deliberately no branch-control sidecar: within the supported
 single-writer-process topology, an absent ref makes a same-name tree unreachable

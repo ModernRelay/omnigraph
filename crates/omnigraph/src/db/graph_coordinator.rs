@@ -10,8 +10,8 @@ use crate::storage::{StorageAdapter, normalize_root_uri};
 use super::commit_graph::{CommitGraph, GraphCommit};
 use super::is_internal_system_branch;
 use super::manifest::{
-    ExpectedTableVersions, LineageIntent, ManifestChange, ManifestCoordinator, ManifestIncarnation,
-    PublishPrecondition, Snapshot, SubTableUpdate,
+    CapturedManifestProbe, ExpectedTableVersions, LineageIntent, ManifestChange,
+    ManifestCoordinator, ManifestIncarnation, PublishPrecondition, Snapshot, SubTableUpdate,
 };
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
@@ -98,18 +98,20 @@ pub(crate) struct GraphCoordinator {
 }
 
 impl GraphCoordinator {
-    pub(crate) async fn init(
+    pub(crate) async fn init_with_session(
         root_uri: &str,
         catalog: &Catalog,
         storage: Arc<dyn StorageAdapter>,
+        control_session: &Arc<lance::session::Session>,
     ) -> Result<Self> {
         let root = normalize_root_uri(root_uri)?;
         // The genesis graph commit is folded into the manifest init write, so
         // `__manifest` is the single source of graph lineage from version one
-        // (RFC-013 Phase 7). `CommitGraph::init` then seeds its cache from that
-        // manifest genesis — it opens no Lance dataset (Phase B).
-        let manifest = ManifestCoordinator::init(&root, catalog).await?;
-        let commit_graph = CommitGraph::init(&root).await?;
+        // (RFC-013 Phase 7). State and lineage are decoded from one coherent
+        // scan, so initialization opens/scans no second manifest dataset.
+        let (manifest, lineage_rows) =
+            ManifestCoordinator::init_with_lineage(&root, catalog, control_session).await?;
+        let commit_graph = CommitGraph::from_manifest_rows(&root, None, lineage_rows);
         Ok(Self {
             root_uri: root,
             storage,
@@ -120,9 +122,19 @@ impl GraphCoordinator {
     }
 
     pub async fn open(root_uri: &str, storage: Arc<dyn StorageAdapter>) -> Result<Self> {
+        let control_session = crate::lance_access::control_session();
+        Self::open_with_session(root_uri, storage, &control_session).await
+    }
+
+    pub(crate) async fn open_with_session(
+        root_uri: &str,
+        storage: Arc<dyn StorageAdapter>,
+        control_session: &Arc<lance::session::Session>,
+    ) -> Result<Self> {
         let root = normalize_root_uri(root_uri)?;
-        let manifest = ManifestCoordinator::open(&root).await?;
-        let commit_graph = CommitGraph::open(&root).await?;
+        let (manifest, lineage_rows) =
+            ManifestCoordinator::open_with_lineage(&root, None, control_session).await?;
+        let commit_graph = CommitGraph::from_manifest_rows(&root, None, lineage_rows);
         Ok(Self {
             root_uri: root,
             storage,
@@ -137,14 +149,26 @@ impl GraphCoordinator {
         branch: &str,
         storage: Arc<dyn StorageAdapter>,
     ) -> Result<Self> {
+        let control_session = crate::lance_access::control_session();
+        Self::open_branch_with_session(root_uri, branch, storage, &control_session).await
+    }
+
+    pub(crate) async fn open_branch_with_session(
+        root_uri: &str,
+        branch: &str,
+        storage: Arc<dyn StorageAdapter>,
+        control_session: &Arc<lance::session::Session>,
+    ) -> Result<Self> {
         let branch = normalize_branch_name(branch)?;
         let Some(branch_name) = branch else {
-            return Self::open(root_uri, storage).await;
+            return Self::open_with_session(root_uri, storage, control_session).await;
         };
 
         let root = normalize_root_uri(root_uri)?;
-        let manifest = ManifestCoordinator::open_at_branch(&root, &branch_name).await?;
-        let commit_graph = CommitGraph::open_at_branch(&root, &branch_name).await?;
+        let (manifest, lineage_rows) =
+            ManifestCoordinator::open_with_lineage(&root, Some(&branch_name), control_session)
+                .await?;
+        let commit_graph = CommitGraph::from_manifest_rows(&root, Some(&branch_name), lineage_rows);
 
         Ok(Self {
             root_uri: root,
@@ -165,6 +189,10 @@ impl GraphCoordinator {
 
     pub(crate) fn manifest_incarnation(&self) -> ManifestIncarnation {
         self.manifest.incarnation()
+    }
+
+    pub(crate) fn captured_manifest_probe(&self) -> CapturedManifestProbe {
+        self.manifest.captured_probe()
     }
 
     /// Lance-native identity of the active `__manifest` branch. Stable across
@@ -190,8 +218,8 @@ impl GraphCoordinator {
     }
 
     pub async fn refresh(&mut self) -> Result<()> {
-        self.manifest.refresh().await?;
-        self.commit_graph.refresh().await?;
+        let lineage_rows = self.manifest.refresh_with_lineage().await?;
+        self.commit_graph.replace_from_manifest_rows(lineage_rows);
         Ok(())
     }
 
@@ -269,6 +297,24 @@ impl GraphCoordinator {
         self.manifest.delete_branch(&branch).await
     }
 
+    /// Delete the branch represented by an operation-local post-gate capture.
+    ///
+    /// Unlike [`Self::branch_delete`], this permits the disposable coordinator
+    /// itself to be bound to `name`. The exact captured BranchIdentifier fences
+    /// delete/recreate ABA; the caller discards this coordinator after the
+    /// native authority change.
+    pub(crate) async fn branch_delete_captured(
+        &mut self,
+        name: &str,
+        expected_identifier: &lance::dataset::refs::BranchIdentifier,
+    ) -> Result<()> {
+        let branch = normalize_branch_name(name)?
+            .ok_or_else(|| OmniError::manifest("cannot delete branch 'main'".to_string()))?;
+        self.manifest
+            .delete_branch_with_expected(&branch, expected_identifier)
+            .await
+    }
+
     pub async fn snapshot_at_version(&self, version: u64) -> Result<Snapshot> {
         ManifestCoordinator::snapshot_at(self.root_uri(), self.current_branch(), version).await
     }
@@ -277,10 +323,22 @@ impl GraphCoordinator {
         let normalized = normalize_branch_name(branch)?;
         let other = match normalized.as_deref() {
             Some(branch) => {
-                GraphCoordinator::open_branch(self.root_uri(), branch, Arc::clone(&self.storage))
-                    .await?
+                GraphCoordinator::open_branch_with_session(
+                    self.root_uri(),
+                    branch,
+                    Arc::clone(&self.storage),
+                    &self.manifest.control_session(),
+                )
+                .await?
             }
-            None => GraphCoordinator::open(self.root_uri(), Arc::clone(&self.storage)).await?,
+            None => {
+                GraphCoordinator::open_with_session(
+                    self.root_uri(),
+                    Arc::clone(&self.storage),
+                    &self.manifest.control_session(),
+                )
+                .await?
+            }
         };
 
         Ok(other.head_commit_id().await?.unwrap_or_else(|| {
@@ -298,15 +356,21 @@ impl GraphCoordinator {
                 let normalized = normalize_branch_name(branch)?;
                 let other = match normalized.as_deref() {
                     Some(branch) => {
-                        GraphCoordinator::open_branch(
+                        GraphCoordinator::open_branch_with_session(
                             self.root_uri(),
                             branch,
                             Arc::clone(&self.storage),
+                            &self.manifest.control_session(),
                         )
                         .await?
                     }
                     None => {
-                        GraphCoordinator::open(self.root_uri(), Arc::clone(&self.storage)).await?
+                        GraphCoordinator::open_with_session(
+                            self.root_uri(),
+                            Arc::clone(&self.storage),
+                            &self.manifest.control_session(),
+                        )
+                        .await?
                     }
                 };
                 let snapshot_id = other.head_commit_id().await?.unwrap_or_else(|| {

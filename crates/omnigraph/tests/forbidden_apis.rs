@@ -273,7 +273,17 @@ const READ_ONLY_SURFACES: &[(&str, &str)] = &[
 // manifest publisher without changing the durable gateway count.
 const LOW_LEVEL_READ_ONLY_SURFACES: &[(&str, &str, &str)] = &[
     ("db/graph_coordinator.rs", "GraphCoordinator", "open"),
+    (
+        "db/graph_coordinator.rs",
+        "GraphCoordinator",
+        "open_with_session",
+    ),
     ("db/graph_coordinator.rs", "GraphCoordinator", "open_branch"),
+    (
+        "db/graph_coordinator.rs",
+        "GraphCoordinator",
+        "open_branch_with_session",
+    ),
     (
         "db/graph_coordinator.rs",
         "GraphCoordinator",
@@ -337,18 +347,25 @@ const LOW_LEVEL_READ_ONLY_SURFACES: &[(&str, &str, &str)] = &[
         "list_commits",
     ),
     ("db/manifest.rs", "ManifestCoordinator", "open"),
+    ("db/manifest.rs", "ManifestCoordinator", "open_with_session"),
     ("db/manifest.rs", "ManifestCoordinator", "open_at_branch"),
+    (
+        "db/manifest.rs",
+        "ManifestCoordinator",
+        "open_at_branch_with_session",
+    ),
+    ("db/manifest.rs", "ManifestCoordinator", "open_with_lineage"),
     ("db/manifest.rs", "ManifestCoordinator", "snapshot_at"),
     ("db/manifest.rs", "ManifestCoordinator", "refresh"),
     (
         "db/manifest.rs",
         "ManifestCoordinator",
-        "read_graph_lineage_at",
+        "refresh_with_lineage",
     ),
     (
         "db/manifest.rs",
         "ManifestCoordinator",
-        "probe_latest_version",
+        "read_graph_lineage_at",
     ),
     ("db/manifest.rs", "ManifestCoordinator", "branch_identifier"),
     (
@@ -368,7 +385,7 @@ const LOW_LEVEL_WRITE_SURFACES: &[(&str, &str, &str, WriteProtocol)] = &[
     (
         "db/graph_coordinator.rs",
         "GraphCoordinator",
-        "init",
+        "init_with_session",
         WriteProtocol::Bootstrap,
     ),
     (
@@ -386,6 +403,12 @@ const LOW_LEVEL_WRITE_SURFACES: &[(&str, &str, &str, WriteProtocol)] = &[
     (
         "db/graph_coordinator.rs",
         "GraphCoordinator",
+        "branch_delete_captured",
+        WriteProtocol::NativeRefControl,
+    ),
+    (
+        "db/graph_coordinator.rs",
+        "GraphCoordinator",
         "commit_updates_with_actor_with_expected",
         WriteProtocol::Exact("shared publisher gateway"),
     ),
@@ -398,7 +421,7 @@ const LOW_LEVEL_WRITE_SURFACES: &[(&str, &str, &str, WriteProtocol)] = &[
     (
         "db/manifest.rs",
         "ManifestCoordinator",
-        "init",
+        "init_with_lineage",
         WriteProtocol::Bootstrap,
     ),
     (
@@ -417,6 +440,12 @@ const LOW_LEVEL_WRITE_SURFACES: &[(&str, &str, &str, WriteProtocol)] = &[
         "db/manifest.rs",
         "ManifestCoordinator",
         "delete_branch",
+        WriteProtocol::NativeRefControl,
+    ),
+    (
+        "db/manifest.rs",
+        "ManifestCoordinator",
+        "delete_branch_with_expected",
         WriteProtocol::NativeRefControl,
     ),
 ];
@@ -543,7 +572,7 @@ gateway_surfaces! {
         "publish", "publish_with_precondition",
     ],
     "db/manifest/publisher.rs" => "GraphNamespacePublisher" => GatewayDisposition::ReadOrPure => [
-        "new",
+        "new_with_session",
     ],
 }
 
@@ -647,7 +676,7 @@ durable_calls! {
     ("db/schema_state.rs", ".rename_text(", 1, WriteProtocol::Composed("schema staging promotion")),
     ("db/manifest/recovery.rs", ".delete(", 2, WriteProtocol::RecoveryExecutor),
     ("db/manifest/recovery.rs", ".delete_prefix(", 2, WriteProtocol::RecoveryExecutor),
-    ("db/omnigraph.rs", "GraphCoordinator::init(", 1, WriteProtocol::Bootstrap),
+    ("db/omnigraph.rs", "GraphCoordinator::init_with_session(", 1, WriteProtocol::Bootstrap),
     ("db/omnigraph.rs", "recover_manifest_drift(", 1, WriteProtocol::RecoveryExecutor),
     ("db/omnigraph.rs", "heal_pending_sidecars_roll_forward(", 2, WriteProtocol::RecoveryExecutor),
     ("db/omnigraph.rs", "recover_schema_state_files(", 2, WriteProtocol::RecoveryExecutor),
@@ -660,11 +689,12 @@ durable_calls! {
     ("db/omnigraph/schema_apply.rs", "write_schema_contract_staging(", 1, SCHEMA_V9),
     ("db/omnigraph/schema_apply.rs", "promote_exact_schema_staging(", 1, SCHEMA_V9),
     ("db/omnigraph.rs", ".branch_create(", 2, WriteProtocol::NativeRefControl),
-    ("db/omnigraph.rs", ".branch_delete(", 1, WriteProtocol::NativeRefControl),
+    ("db/omnigraph.rs", ".branch_delete_captured(", 1, WriteProtocol::NativeRefControl),
     ("db/omnigraph/schema_apply.rs", ".branch_create(", 1, SCHEMA_V9),
     ("db/omnigraph/schema_apply.rs", ".branch_delete(", 1, SCHEMA_V9),
     ("db/graph_coordinator.rs", ".create_branch(", 1, WriteProtocol::NativeRefControl),
     ("db/graph_coordinator.rs", ".delete_branch(", 1, WriteProtocol::NativeRefControl),
+    ("db/graph_coordinator.rs", ".delete_branch_with_expected(", 1, WriteProtocol::NativeRefControl),
     ("branch_control.rs", ".create_branch(", 1, WriteProtocol::Composed("graph/data native refs")),
     ("branch_control.rs", ".delete_branch(", 1, WriteProtocol::Composed("graph/data native refs")),
     ("branch_control.rs", ".force_delete_branch(", 1, WriteProtocol::Composed("graph/data native refs")),
@@ -726,7 +756,7 @@ const DURABLE_PRIMITIVES: &[&str] = &[
     ".put_opts(",
     ".rename(",
     ".rename_text(",
-    "GraphCoordinator::init(",
+    "GraphCoordinator::init_with_session(",
     "recover_manifest_drift(",
     "heal_pending_sidecars_roll_forward(",
     "recover_schema_state_files(",
@@ -741,8 +771,10 @@ const DURABLE_PRIMITIVES: &[&str] = &[
     "discard_exact_schema_staging(",
     ".branch_create(",
     ".branch_delete(",
+    ".branch_delete_captured(",
     ".create_branch(",
     ".delete_branch(",
+    ".delete_branch_with_expected(",
     ".force_delete_branch(",
     "TableStore::create_empty_dataset(",
     "TableStore::append_or_create_batch(",
@@ -2013,7 +2045,7 @@ fn graph_manifest_writer_methods_are_not_public_escape_hatches() {
     }
 
     let methods = [
-        ("db/manifest.rs", "init"),
+        ("db/manifest.rs", "init_with_lineage"),
         ("db/manifest.rs", "commit"),
         ("db/manifest.rs", "commit_with_expected"),
         ("db/manifest.rs", "commit_changes"),
@@ -2025,9 +2057,11 @@ fn graph_manifest_writer_methods_are_not_public_escape_hatches() {
         ),
         ("db/manifest.rs", "create_branch"),
         ("db/manifest.rs", "delete_branch"),
-        ("db/graph_coordinator.rs", "init"),
+        ("db/manifest.rs", "delete_branch_with_expected"),
+        ("db/graph_coordinator.rs", "init_with_session"),
         ("db/graph_coordinator.rs", "branch_create"),
         ("db/graph_coordinator.rs", "branch_delete"),
+        ("db/graph_coordinator.rs", "branch_delete_captured"),
         ("db/graph_coordinator.rs", "commit_updates_with_actor"),
         (
             "db/graph_coordinator.rs",
@@ -2069,6 +2103,104 @@ fn graph_manifest_writer_methods_are_not_public_escape_hatches() {
             "{relative}::{method} is a graph-writer escape hatch; it must remain crate-private"
         );
     }
+}
+
+fn method_call_count(block: &syn::Block, method_name: &str) -> usize {
+    struct Counter<'a> {
+        method_name: &'a str,
+        count: usize,
+    }
+
+    impl<'ast> Visit<'ast> for Counter<'_> {
+        fn visit_expr_method_call(&mut self, node: &'ast syn::ExprMethodCall) {
+            if node.method == self.method_name {
+                self.count += 1;
+            }
+            visit::visit_expr_method_call(self, node);
+        }
+    }
+
+    let mut counter = Counter {
+        method_name,
+        count: 0,
+    };
+    counter.visit_block(block);
+    counter.count
+}
+
+#[test]
+fn native_branch_controls_use_post_gate_captures_not_handle_refreshes() {
+    let relative = "db/omnigraph.rs";
+    let file = engine_src_root().join(relative);
+    let contents = std::fs::read_to_string(&file)
+        .unwrap_or_else(|error| panic!("failed to read {}: {error}", file.display()));
+    let ast = parse_rust_source(&contents, relative);
+
+    let mut functions = BTreeMap::new();
+    for item in &ast.items {
+        let Item::Impl(implementation) = item else {
+            continue;
+        };
+        if !is_omnigraph_type(&implementation.self_ty) {
+            continue;
+        }
+        for item in &implementation.items {
+            let syn::ImplItem::Fn(function) = item else {
+                continue;
+            };
+            functions.insert(function.sig.ident.to_string(), function);
+        }
+    }
+
+    for function_name in [
+        "branch_create_as",
+        "branch_create_from_impl",
+        "branch_delete_as",
+        "delete_captured_branch_storage",
+    ] {
+        let function = functions
+            .get(function_name)
+            .unwrap_or_else(|| panic!("missing Omnigraph::{function_name}"));
+        assert_eq!(
+            method_call_count(&function.block, "refresh_coordinator_only"),
+            0,
+            "Omnigraph::{function_name} must not refresh the handle-local coordinator as native-ref authority"
+        );
+    }
+
+    for function_name in [
+        "branch_create_as",
+        "branch_create_from_impl",
+        "branch_delete_as",
+    ] {
+        let function = functions
+            .get(function_name)
+            .unwrap_or_else(|| panic!("missing Omnigraph::{function_name}"));
+        assert_eq!(
+            method_call_count(&function.block, "open_coordinator_for_branch"),
+            1,
+            "Omnigraph::{function_name} must take exactly one post-gate operation-local control capture"
+        );
+    }
+
+    for function_name in ["branch_create_as", "branch_create_from_impl"] {
+        let function = functions
+            .get(function_name)
+            .unwrap_or_else(|| panic!("missing Omnigraph::{function_name}"));
+        assert_eq!(
+            method_call_count(&function.block, "invalidate_read_caches"),
+            1,
+            "Omnigraph::{function_name} must invalidate derived caches after successful ref creation"
+        );
+    }
+    let delete_helper = functions
+        .get("delete_captured_branch_storage")
+        .expect("missing Omnigraph::delete_captured_branch_storage");
+    assert_eq!(
+        method_call_count(&delete_helper.block, "invalidate_read_caches"),
+        1,
+        "captured branch deletion must invalidate derived caches after successful ref removal"
+    );
 }
 
 #[test]

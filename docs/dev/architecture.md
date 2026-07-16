@@ -146,6 +146,7 @@ flowchart TB
     end
 
     subgraph io[Lance I/O]
+        la[LanceAccessContext<br/>shared store registry<br/>split data/control sessions]:::l2
         ts[table_store]:::l2
         st[storage adapter<br/>storage.rs]:::l2
     end
@@ -160,10 +161,19 @@ flowchart TB
     em --> mr
     coord --> mr
     coord --> cg
+    mr --> la
+    ts --> la
     ts --> st
 ```
 
-The engine binds the compiler IR to Lance. It owns multi-dataset coordination, the graph topology index, the per-query staging accumulator, and the snapshot/manifest read path.
+The engine binds the compiler IR to Lance. It owns multi-dataset coordination,
+the graph topology index, the per-query staging accumulator, and the
+snapshot/manifest read path. Lance graph-dataset access has an explicit split:
+one process-wide `ObjectStoreRegistry` pools graph-dataset object-store clients;
+each graph handle owns a cached data-table `Session`; mutable-tip control
+datasets use a zero-cache control `Session` that shares only the registry. A
+coordinator open or full refresh decodes manifest state and graph lineage from
+one coherent `__manifest` scan.
 
 Code paths:
 
@@ -348,6 +358,12 @@ Throughout the docs, capabilities are split into:
 - **MVCC**: every Lance write bumps a per-dataset version; the OmniGraph manifest version coordinates which sub-table versions are visible together.
 - **Snapshot isolation**: a query holds one `Snapshot` for its lifetime; concurrent writes don't leak in.
 - **Cross-branch isolation**: Lance copy-on-write keeps branch data independent, and readers never acquire write gates. Enrolled writer preparation can overlap across branches, but their effect/publish windows currently share one exclusive root schema gate before the branch/table gates, so those windows serialize in-process even for different branches.
+- **Operation-local control capture**: branch merge retains the exact
+  source/target manifest `Dataset` probe handles and probes them before a
+  full-capture fallback; native branch create/delete capture fresh manifest/ref
+  authority once after the complete schema → branch → table gate envelope.
+  Neither path treats a cached mutable tip as commit authority, and the manifest
+  publisher still performs a fresh CAS-time authority load.
 - **Per-query staging**: `mutate_as` and every `load` mode accumulate their work in an in-memory `MutationStaging`; `stage_all` prepares exact per-table transactions without moving HEAD. At commit, the root schema → branch → sorted-table gates protect complete-token revalidation, v9 recovery arming (with the retained `protocol_v3` mutation/load payload), zero-retry table effects, and one atomic manifest publish. A mid-query failure leaves Lance HEAD untouched on staged tables. (MR-794 / RFC-022; pre-v0.4.0 used a `__run__<id>` staging branch + Run state machine, removed in MR-771.)
 - **Schema-apply lock**: `__schema_apply_lock__` system branch serializes schema migrations.
 - **Fail-points** (`failpoints` cargo feature): `failpoints::maybe_fail("operation.step")?` in `branch_create`, publish, etc., for deterministic failure injection in tests.
