@@ -250,6 +250,48 @@ query not_sal_tagged() {
     );
 }
 
+// Positional operand semantics (documented contract): `X contains Y` tests
+// that X contains Y whichever side each operand is on, and a same-variable
+// two-property predicate evaluates per row. Neither form is hoisted (the
+// needle isn't a literal/param), so both take the in-memory arm.
+#[tokio::test]
+async fn reversed_and_same_variable_string_predicates_execute() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut db = metric_db(&dir).await;
+    let q = r#"
+query reversed($q: String) {
+    match {
+        $m: Metric
+        $q contains $m.label
+    }
+    return { $m.name }
+}
+query same_var() {
+    match {
+        $m: Metric
+        $m.label starts_with $m.name
+    }
+    return { $m.name }
+}
+"#;
+    // "the alps are tall" contains the label "alps" (m2) only.
+    let r = query_main(
+        &mut db,
+        q,
+        "reversed",
+        &params(&[("$q", "the alps are tall")]),
+    )
+    .await
+    .unwrap();
+    assert_eq!(r.num_rows(), 1, "param-contains-property matches m2 only");
+    // No label starts with its own row's name (m1..m4) — and the predicate
+    // must compare within each row, not degenerate or error.
+    assert!(
+        sorted_metric_names(&mut db, q, "same_var").await.is_empty(),
+        "no label starts with its row's name"
+    );
+}
+
 // Structural pin for the hoist: a standalone string predicate on a scanned
 // variable must be lowered into the NodeScan's `filter_expr` (pushdown arm,
 // where Lance can probe a covering index), NOT evaluated by the in-memory
