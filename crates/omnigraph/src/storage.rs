@@ -20,6 +20,14 @@ const S3_SCHEME_PREFIX: &str = "s3://";
 #[async_trait]
 pub trait StorageAdapter: Debug + Send + Sync {
     async fn read_text(&self, uri: &str) -> Result<String>;
+    /// Read a text object if it exists using one backend GET.
+    ///
+    /// Returns `Ok(None)` only when the object store reports `NotFound`.
+    /// Every other transport, permission, body-read, or UTF-8 failure remains
+    /// a loud error. Callers must use this instead of `exists()` followed by
+    /// `read_text()` when disappearance between the probe and read is a valid
+    /// concurrent outcome.
+    async fn read_text_if_exists(&self, uri: &str) -> Result<Option<String>>;
     async fn write_text(&self, uri: &str, contents: &str) -> Result<()>;
     /// Write a text object only if no object exists at `uri`.
     ///
@@ -250,6 +258,24 @@ impl StorageAdapter for ObjectStorageAdapter {
         String::from_utf8(bytes.to_vec()).map_err(|err| {
             OmniError::manifest_internal(format!("storage read failed for '{}': {}", uri, err))
         })
+    }
+
+    async fn read_text_if_exists(&self, uri: &str) -> Result<Option<String>> {
+        let location = self.object_path(uri)?;
+        let result = match self.store.get(&location).await {
+            Ok(result) => result,
+            Err(object_store::Error::NotFound { .. }) => return Ok(None),
+            Err(err) => return Err(storage_backend_error("read", uri, err)),
+        };
+        let bytes = match result.bytes().await {
+            Ok(bytes) => bytes,
+            Err(object_store::Error::NotFound { .. }) => return Ok(None),
+            Err(err) => return Err(storage_backend_error("read", uri, err)),
+        };
+        let text = String::from_utf8(bytes.to_vec()).map_err(|err| {
+            OmniError::manifest_internal(format!("storage read failed for '{}': {}", uri, err))
+        })?;
+        Ok(Some(text))
     }
 
     async fn write_text(&self, uri: &str, contents: &str) -> Result<()> {
@@ -695,8 +721,19 @@ mod tests {
         let a = format!("{root}/contract/a.json");
         adapter.write_text(&a, "v1").await.unwrap();
         assert_eq!(adapter.read_text(&a).await.unwrap(), "v1");
+        assert_eq!(
+            adapter.read_text_if_exists(&a).await.unwrap().as_deref(),
+            Some("v1")
+        );
         adapter.write_text(&a, "v2").await.unwrap();
         assert_eq!(adapter.read_text(&a).await.unwrap(), "v2");
+        assert_eq!(
+            adapter
+                .read_text_if_exists(&format!("{root}/contract/missing.json"))
+                .await
+                .unwrap(),
+            None
+        );
 
         // exists: object yes; missing no; non-empty prefix yes (the
         // directory-shaped probe Lance dataset roots rely on).
@@ -792,6 +829,7 @@ mod tests {
 
         // delete: idempotent.
         adapter.delete(&claim).await.unwrap();
+        assert_eq!(adapter.read_text_if_exists(&claim).await.unwrap(), None);
         adapter.delete(&claim).await.unwrap();
         assert!(!adapter.exists(&claim).await.unwrap());
 
@@ -822,6 +860,27 @@ mod tests {
         // strong-CAS path (ETag tokens + PutMode::Update) without a bucket.
         let adapter = ObjectStorageAdapter::in_memory();
         contract_suite(&adapter, "mem-root").await;
+    }
+
+    #[tokio::test]
+    async fn read_text_if_exists_keeps_non_not_found_errors_loud() {
+        let adapter = ObjectStorageAdapter::in_memory();
+        let uri = "invalid-utf8.json";
+        let location = adapter.object_path(uri).unwrap();
+        adapter
+            .store
+            .put(&location, PutPayload::from(vec![0xff]))
+            .await
+            .unwrap();
+
+        let error = adapter
+            .read_text_if_exists(uri)
+            .await
+            .expect_err("invalid UTF-8 is not absence and must remain loud");
+        assert!(
+            error.to_string().contains("storage read failed"),
+            "unexpected optional-read error: {error}"
+        );
     }
 
     /// `write_text_if_absent` must make the contents visible to any

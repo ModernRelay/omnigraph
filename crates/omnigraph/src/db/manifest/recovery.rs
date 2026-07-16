@@ -1194,13 +1194,22 @@ pub(crate) async fn list_sidecars(
     // ordering-sensitive bugs.
     uris.sort();
     let mut out = Vec::with_capacity(uris.len());
+    let mut before_first_json_read = true;
     for uri in uris {
         // Skip non-JSON files defensively; the directory is ours but a
         // future feature might leave other artifacts here.
         if !uri.ends_with(".json") {
             continue;
         }
-        let body = storage.read_text(&uri).await?;
+        if before_first_json_read {
+            crate::failpoints::maybe_fail(
+                crate::failpoints::names::RECOVERY_POST_SIDECAR_LIST_PRE_READ,
+            )?;
+            before_first_json_read = false;
+        }
+        let Some(body) = storage.read_text_if_exists(&uri).await? else {
+            continue;
+        };
         let sidecar = parse_sidecar(&uri, &body)?;
         validate_identity_aware_pin_paths(root_uri, &uri, &sidecar)?;
         out.push(sidecar);
@@ -1224,11 +1233,20 @@ async fn list_parseable_sidecars_for_read_only(
     uris.sort();
     let mut out = Vec::with_capacity(uris.len());
     let mut unparseable = Vec::new();
+    let mut before_first_json_read = true;
     for uri in uris {
         if !uri.ends_with(".json") {
             continue;
         }
-        let body = storage.read_text(&uri).await?;
+        if before_first_json_read {
+            crate::failpoints::maybe_fail(
+                crate::failpoints::names::RECOVERY_POST_SIDECAR_LIST_PRE_READ,
+            )?;
+            before_first_json_read = false;
+        }
+        let Some(body) = storage.read_text_if_exists(&uri).await? else {
+            continue;
+        };
         match parse_sidecar(&uri, &body).and_then(|sidecar| {
             validate_identity_aware_pin_paths(root_uri, &uri, &sidecar)?;
             Ok(sidecar)
@@ -1262,10 +1280,9 @@ async fn reread_sidecar_under_gates(
     listed: &RecoverySidecar,
 ) -> Result<Option<RecoverySidecar>> {
     let uri = sidecar_uri(root_uri, &listed.operation_id);
-    if !storage.exists(&uri).await? {
+    let Some(body) = storage.read_text_if_exists(&uri).await? else {
         return Ok(None);
-    }
-    let body = storage.read_text(&uri).await?;
+    };
     let current = parse_sidecar(&uri, &body)?;
     validate_identity_aware_pin_paths(root_uri, &uri, &current)?;
 

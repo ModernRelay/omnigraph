@@ -188,6 +188,21 @@ async fn s3_adapter_conditional_writes_contract() {
 
     assert!(adapter.write_text_if_absent(&object, "v1").await.unwrap());
     assert!(!adapter.write_text_if_absent(&object, "v1b").await.unwrap());
+    assert_eq!(
+        adapter
+            .read_text_if_exists(&object)
+            .await
+            .unwrap()
+            .as_deref(),
+        Some("v1")
+    );
+    assert_eq!(
+        adapter
+            .read_text_if_exists(&format!("{uri}/missing-probe.json"))
+            .await
+            .unwrap(),
+        None
+    );
 
     let (text, version) = adapter.read_text_versioned(&object).await.unwrap();
     assert_eq!(text, "v1");
@@ -223,6 +238,7 @@ async fn s3_adapter_conditional_writes_contract() {
     assert!(!adapter.exists(&format!("{uri}/tree/a.json")).await.unwrap());
     adapter.delete_prefix(&format!("{uri}/tree")).await.unwrap();
     adapter.delete(&object).await.unwrap();
+    assert_eq!(adapter.read_text_if_exists(&object).await.unwrap(), None);
 }
 
 /// Schema apply against an S3 graph — the cluster's schema executor will

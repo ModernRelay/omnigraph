@@ -3464,6 +3464,11 @@ edge WorksAt: Person -> Company
             self.inner.read_text(uri).await
         }
 
+        async fn read_text_if_exists(&self, uri: &str) -> Result<Option<String>> {
+            self.reads.lock().unwrap().push(uri.to_string());
+            self.inner.read_text_if_exists(uri).await
+        }
+
         async fn write_text(&self, uri: &str, contents: &str) -> Result<()> {
             self.writes.lock().unwrap().push(uri.to_string());
             self.inner.write_text(uri, contents).await
@@ -3527,6 +3532,10 @@ edge WorksAt: Person -> Company
     impl StorageAdapter for InitRaceStorageAdapter {
         async fn read_text(&self, uri: &str) -> Result<String> {
             self.inner.read_text(uri).await
+        }
+
+        async fn read_text_if_exists(&self, uri: &str) -> Result<Option<String>> {
+            self.inner.read_text_if_exists(uri).await
         }
 
         async fn write_text(&self, uri: &str, contents: &str) -> Result<()> {
