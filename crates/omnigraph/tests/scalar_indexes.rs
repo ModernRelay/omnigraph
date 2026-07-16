@@ -88,3 +88,49 @@ async fn node_scalar_and_enum_index_columns_get_btree() {
         "second ensure_indices must be a no-op on a fully-indexed graph"
     );
 }
+
+// The companion BTREE's name must be impossible to collide with any DEFAULT
+// index name (`{column}_idx`): a column literally named after another
+// column's companion would otherwise produce two indexes with one name,
+// which the staged batch rejects — leaving ensure_indices permanently
+// failing for a legal schema. All defaults end in `_idx`; the companion
+// suffix deliberately does not.
+#[tokio::test]
+async fn companion_btree_name_cannot_collide_with_default_index_names() {
+    const COLLIDING_SCHEMA: &str = r#"
+node Thing {
+    slug: String @key
+    text: String @index
+    text_btree: I32 @index
+}
+"#;
+    const ROWS: &str = r#"{"type":"Thing","data":{"slug":"t1","text":"hello world","text_btree":1}}
+{"type":"Thing","data":{"slug":"t2","text":"beta ray","text_btree":2}}"#;
+
+    let dir = tempfile::tempdir().unwrap();
+    let uri = dir.path().to_str().unwrap();
+    let mut db = Omnigraph::init(uri, COLLIDING_SCHEMA).await.unwrap();
+    load_jsonl(&mut db, ROWS, LoadMode::Overwrite).await.unwrap();
+    db.ensure_indices()
+        .await
+        .expect("companion names must not collide with another column's default index name");
+
+    let snap = snapshot_main(&db).await.unwrap();
+    let ds = snap.open("node:Thing").await.unwrap();
+    for col in ["text", "text_btree"] {
+        assert_eq!(
+            ds.index_coverage(col).await.unwrap(),
+            IndexCoverage::Indexed,
+            "both '{col}' BTREEs must land despite the adversarial column name"
+        );
+    }
+    assert!(ds.has_fts_index("text").await.unwrap());
+
+    // And the second run converges instead of the two same-named indexes
+    // replacing each other forever.
+    let version_before = ds.version();
+    db.ensure_indices().await.unwrap();
+    let snap2 = snapshot_main(&db).await.unwrap();
+    let ds2 = snap2.open("node:Thing").await.unwrap();
+    assert_eq!(version_before, ds2.version(), "second run must be a no-op");
+}

@@ -196,6 +196,60 @@ query key_prefix() { match { $m: Metric  $m.name starts_with "m" } return { $m.n
     assert_eq!(r.num_rows(), 1, "only m1's label starts with 'alph'");
 }
 
+// A cross-variable string predicate ($b.label starts_with $a.label) must NOT
+// be hoisted into either scan: scan-level lowering drops variable qualifiers
+// (PropAccess becomes a bare column ident), so a hoisted cross-variable
+// predicate would compare $b.label with itself and return every cross-join
+// pair. It must evaluate in memory after both variables are bound.
+#[tokio::test]
+async fn cross_variable_string_predicate_is_not_hoisted() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut db = metric_db(&dir).await;
+    let q = r#"
+query cross() {
+    match {
+        $a: Metric
+        $b: Metric
+        $b.label starts_with $a.label
+    }
+    return { $a.name, $b.name }
+}
+"#;
+    let r = query_main(&mut db, q, "cross", &ParamMap::new()).await.unwrap();
+    // Only the three non-null self-pairs match; a wrongly-hoisted predicate
+    // degenerates to `label starts_with label` on $b and returns 3×4 pairs.
+    assert_eq!(
+        r.num_rows(),
+        3,
+        "cross-variable starts_with must evaluate after the cross join"
+    );
+}
+
+// The contains overload must resolve for variables introduced ONLY inside a
+// negation (`not {{ … }}`): negation inners are typechecked into a discarded
+// context clone, so resolution cannot depend on the outer TypeContext alone.
+// A String-column contains left unresolved would execute as list-membership
+// and error at runtime.
+#[tokio::test]
+async fn string_contains_resolves_inside_negation() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut db = metric_db(&dir).await;
+    let q = r#"
+query not_sal_tagged() {
+    match {
+        $m: Metric
+        not { $m tagged $t  $t.tname contains "sal" }
+    }
+    return { $m.name }
+}
+"#;
+    // m1 and m3 are tagged "basalt" (contains "sal") and drop out.
+    assert_eq!(
+        sorted_metric_names(&mut db, q, "not_sal_tagged").await,
+        vec!["m2", "m4"]
+    );
+}
+
 // Structural pin for the hoist: a standalone string predicate on a scanned
 // variable must be lowered into the NodeScan's `filter_expr` (pushdown arm,
 // where Lance can probe a covering index), NOT evaluated by the in-memory
