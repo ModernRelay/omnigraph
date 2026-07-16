@@ -25,7 +25,7 @@
 
 use std::sync::Arc;
 
-use arrow_array::{Int32Array, RecordBatch, RecordBatchIterator, StringArray};
+use arrow_array::{Array, Int32Array, RecordBatch, RecordBatchIterator, StringArray};
 use arrow_schema::{DataType, Field, Schema};
 use lance::Dataset;
 use lance::dataset::builder::DatasetBuilder;
@@ -2140,5 +2140,443 @@ async fn filtered_scan_tolerates_merge_update_row_id_overlap() {
             .unwrap();
         let rows: usize = batches.iter().map(|b| b.num_rows()).sum();
         assert_eq!(rows, expected, "filtered read for {slug}");
+    }
+}
+
+// --- Guard 21: starts_with routes to the BTREE (LikePrefix) and stays literal --
+//
+// The .gq `starts_with` predicate lowers to the DataFusion `starts_with`
+// scalar function pushed via `Scanner::filter_expr`. Lance's scalar-index
+// expression parser rewrites it to `SargableQuery::LikePrefix`, answered
+// exactly by a covering BTREE (range [prefix, next_prefix), unicode-safe
+// successor, no recheck). Two load-bearing behaviors are pinned:
+//
+//   1. The plan uses the scalar index (a result-only assertion would also
+//      pass on a silent full-scan fallback).
+//   2. The prefix is treated LITERALLY: `_`/`%` in the needle are plain
+//      bytes, never LIKE metacharacters ("a_b" must not match "axb").
+#[tokio::test]
+async fn starts_with_filter_routes_to_btree_and_is_literal() {
+    use datafusion::functions::expr_fn::starts_with;
+    use datafusion::physical_plan::displayable;
+    use datafusion::prelude::{ident, lit};
+    use futures::TryStreamExt;
+
+    let dir = tempfile::tempdir().unwrap();
+    let uri = dir.path().join("guard21.lance");
+    let uri = uri.to_str().unwrap();
+
+    let schema = Arc::new(Schema::new(vec![
+        Field::new("id", DataType::Utf8, false),
+        Field::new("name", DataType::Utf8, true),
+    ]));
+    let batch = RecordBatch::try_new(
+        schema.clone(),
+        vec![
+            Arc::new(StringArray::from(vec!["1", "2", "3", "4", "5"])),
+            Arc::new(StringArray::from(vec![
+                Some("alice"),
+                Some("alps"),
+                Some("a_b"),
+                Some("axb"),
+                None,
+            ])),
+        ],
+    )
+    .unwrap();
+    let reader = RecordBatchIterator::new(vec![Ok(batch)], schema);
+    let params = WriteParams {
+        mode: WriteMode::Create,
+        enable_stable_row_ids: true,
+        data_storage_version: Some(LanceFileVersion::V2_2),
+        ..Default::default()
+    };
+    let mut ds = Dataset::write(reader, uri, Some(params)).await.unwrap();
+    ds.create_index_builder(&["name"], IndexType::BTree, &ScalarIndexParams::default())
+        .replace(true)
+        .await
+        .unwrap();
+
+    async fn ids_for(ds: &Dataset, filter: datafusion::prelude::Expr) -> Vec<String> {
+        let mut scanner = ds.scan();
+        scanner.filter_expr(filter);
+        let batches: Vec<RecordBatch> = scanner
+            .try_into_stream()
+            .await
+            .unwrap()
+            .try_collect()
+            .await
+            .unwrap();
+        let mut ids: Vec<String> = Vec::new();
+        for b in &batches {
+            let col = b
+                .column_by_name("id")
+                .unwrap()
+                .as_any()
+                .downcast_ref::<StringArray>()
+                .unwrap();
+            for i in 0..col.len() {
+                ids.push(col.value(i).to_string());
+            }
+        }
+        ids.sort();
+        ids
+    }
+
+    // Plan shape: the starts_with function expr must reach the scalar index.
+    let mut scanner = ds.scan();
+    scanner.filter_expr(starts_with(ident("name"), lit("al")));
+    let plan = scanner.create_plan().await.unwrap();
+    let plan_str = format!("{}", displayable(plan.as_ref()).indent(true));
+    assert!(
+        plan_str.contains("ScalarIndexQuery"),
+        "starts_with on a BTREE'd column must plan a scalar-index probe \
+         (LikePrefix); a red here means the Lance expression parser no longer \
+         maps the DataFusion `starts_with` function. plan:\n{plan_str}"
+    );
+
+    // Exact prefix semantics, NULL excluded.
+    assert_eq!(
+        ids_for(&ds, starts_with(ident("name"), lit("al"))).await,
+        vec!["1", "2"],
+        "prefix 'al' must match alice+alps only (never the NULL row)"
+    );
+    // Literal treatment of LIKE metacharacters: 'a_' matches only 'a_b'.
+    assert_eq!(
+        ids_for(&ds, starts_with(ident("name"), lit("a_"))).await,
+        vec!["3"],
+        "starts_with must treat '_' as a literal byte, not a LIKE wildcard \
+         ('a_' must not match 'axb')"
+    );
+}
+
+// --- Guard 22: contains routes to an NGRAM index and rechecks to exact results --
+//
+// The .gq String `contains` predicate lowers to the DataFusion `contains`
+// scalar function. With an NGRAM index on the column, Lance's expression
+// parser maps it to `TextQuery::StringContains` — an inexact (AtMost)
+// trigram-intersection probe followed by an automatic recheck, so final
+// results are exact. Pins: NGram index creation through the same
+// `create_index_builder` surface the engine uses, the plan probing the
+// index, exact substring semantics across token boundaries, and the
+// below-trigram-width needle (< 3 chars) degrading to a correct recheck-all
+// rather than an error or a wrong result.
+#[tokio::test]
+async fn contains_filter_routes_to_ngram_index_and_rechecks_exactly() {
+    use datafusion::functions::expr_fn::contains;
+    use datafusion::physical_plan::displayable;
+    use datafusion::prelude::{ident, lit};
+    use futures::TryStreamExt;
+
+    let dir = tempfile::tempdir().unwrap();
+    let uri = dir.path().join("guard22.lance");
+    let uri = uri.to_str().unwrap();
+
+    let schema = Arc::new(Schema::new(vec![
+        Field::new("id", DataType::Utf8, false),
+        Field::new("text", DataType::Utf8, true),
+    ]));
+    let batch = RecordBatch::try_new(
+        schema.clone(),
+        vec![
+            Arc::new(StringArray::from(vec!["1", "2", "3", "4"])),
+            Arc::new(StringArray::from(vec![
+                Some("this ramen recipe simmers"),
+                Some("the beta ray shines"),
+                Some("nothing here"),
+                None,
+            ])),
+        ],
+    )
+    .unwrap();
+    let reader = RecordBatchIterator::new(vec![Ok(batch)], schema);
+    let params = WriteParams {
+        mode: WriteMode::Create,
+        enable_stable_row_ids: true,
+        data_storage_version: Some(LanceFileVersion::V2_2),
+        ..Default::default()
+    };
+    let mut ds = Dataset::write(reader, uri, Some(params)).await.unwrap();
+    ds.create_index_builder(&["text"], IndexType::NGram, &ScalarIndexParams::default())
+        .replace(true)
+        .await
+        .unwrap();
+
+    async fn ids_for(ds: &Dataset, filter: datafusion::prelude::Expr) -> Vec<String> {
+        let mut scanner = ds.scan();
+        scanner.filter_expr(filter);
+        let batches: Vec<RecordBatch> = scanner
+            .try_into_stream()
+            .await
+            .unwrap()
+            .try_collect()
+            .await
+            .unwrap();
+        let mut ids: Vec<String> = Vec::new();
+        for b in &batches {
+            let col = b
+                .column_by_name("id")
+                .unwrap()
+                .as_any()
+                .downcast_ref::<StringArray>()
+                .unwrap();
+            for i in 0..col.len() {
+                ids.push(col.value(i).to_string());
+            }
+        }
+        ids.sort();
+        ids
+    }
+
+    // Plan shape: the contains function expr must reach the NGRAM index.
+    let mut scanner = ds.scan();
+    scanner.filter_expr(contains(ident("text"), lit("ramen")));
+    let plan = scanner.create_plan().await.unwrap();
+    let plan_str = format!("{}", displayable(plan.as_ref()).indent(true));
+    assert!(
+        plan_str.contains("ScalarIndexQuery"),
+        "contains on an NGRAM'd column must plan a scalar-index probe \
+         (StringContains); a red here means the Lance expression parser no \
+         longer maps the DataFusion `contains` function. plan:\n{plan_str}"
+    );
+
+    // Exact substring semantics (recheck applied), NULL excluded.
+    assert_eq!(
+        ids_for(&ds, contains(ident("text"), lit("ramen"))).await,
+        vec!["1"]
+    );
+    // Substring crossing a token boundary — substring, not FTS token match.
+    assert_eq!(
+        ids_for(&ds, contains(ident("text"), lit("ta ray"))).await,
+        vec!["2"]
+    );
+    // KNOWN UPSTREAM BUG (pinned): a needle below the trigram width (3)
+    // should degrade to a recheck-everything scan — the NGram index returns
+    // an `at_least(empty)` lower bound for it — but the scan planner treats
+    // the empty probe as authoritative and returns ZERO rows: silent row
+    // loss, not an error. Both rows here contain "ra" (the unindexed scan
+    // path returns them, proven by the in-memory-arm tests), so a red on
+    // this assertion means Lance FIXED sub-trigram containment: flip it to
+    // expect ["1", "2"] and lift the sub-trigram caveat before shipping the
+    // NGRAM `@index` kind — .gq String `contains` must never silently drop
+    // rows on short needles.
+    assert_eq!(
+        ids_for(&ds, contains(ident("text"), lit("ra"))).await,
+        Vec::<String>::new(),
+        "sub-trigram contains on an NGRAM'd column currently drops all rows \
+         (upstream bug); a non-empty result means Lance fixed it — update \
+         this guard and the NGRAM rollout caveat"
+    );
+}
+
+// --- Guard 23: a second index on a column requires an explicit distinct name ---
+//
+// Lance derives the default index name `{column}_idx` and `.replace(true)`
+// removes existing indexes BY NAME. So an unnamed second-index build on an
+// already-indexed column either replaces the first index or refuses — it
+// never yields two coexisting indexes. The engine therefore MUST pass an
+// explicit `.name(...)` whenever it adds a second index kind to one column
+// (dual BTREE beside FTS; opt-in NGRAM). Pins both halves: distinctly-named
+// indexes of different types coexist, and the unnamed path never silently
+// coexists. If Lance changes its naming/replace semantics, this turns red —
+// re-validate the engine's index-naming strategy in stage_create_indices.
+#[tokio::test]
+async fn second_index_on_column_requires_explicit_distinct_name() {
+    let dir = tempfile::tempdir().unwrap();
+    let uri = dir.path().join("guard23.lance");
+    let uri = uri.to_str().unwrap();
+
+    let schema = Arc::new(Schema::new(vec![
+        Field::new("id", DataType::Utf8, false),
+        Field::new("text", DataType::Utf8, false),
+    ]));
+    let batch = RecordBatch::try_new(
+        schema.clone(),
+        vec![
+            Arc::new(StringArray::from(vec!["1", "2"])),
+            Arc::new(StringArray::from(vec!["hello world", "beta ray"])),
+        ],
+    )
+    .unwrap();
+    let reader = RecordBatchIterator::new(vec![Ok(batch)], schema);
+    let params = WriteParams {
+        mode: WriteMode::Create,
+        enable_stable_row_ids: true,
+        data_storage_version: Some(LanceFileVersion::V2_2),
+        ..Default::default()
+    };
+    let mut ds = Dataset::write(reader, uri, Some(params)).await.unwrap();
+
+    fn type_urls(indices: &[lance_table::format::IndexMetadata]) -> Vec<String> {
+        let mut v: Vec<String> = indices
+            .iter()
+            .filter_map(|m| m.index_details.as_ref().map(|d| d.type_url.clone()))
+            .collect();
+        v.sort();
+        v.dedup();
+        v
+    }
+
+    // Baseline: an unnamed FTS build lands under the default `text_idx` name.
+    ds.create_index_builder(
+        &["text"],
+        IndexType::Inverted,
+        &lance_index::scalar::InvertedIndexParams::default(),
+    )
+    .replace(true)
+    .await
+    .unwrap();
+    let after_fts = ds.load_indices().await.unwrap();
+    assert_eq!(after_fts.len(), 1);
+    assert_eq!(after_fts[0].name, "text_idx");
+
+    // The trap: an unnamed BTREE build on the same column must never leave
+    // BOTH indexes standing (today it replaces the FTS under the shared
+    // default name; an error would also satisfy the pin).
+    let unnamed = ds
+        .create_index_builder(&["text"], IndexType::BTree, &ScalarIndexParams::default())
+        .replace(true)
+        .await;
+    ds.checkout_latest().await.unwrap();
+    let after_unnamed = ds.load_indices().await.unwrap();
+    let distinct_types = type_urls(&after_unnamed).len();
+    assert!(
+        unnamed.is_err() || distinct_types == 1,
+        "an unnamed second-index build must replace or refuse, never coexist \
+         (got {} indexes with types {:?}) — if Lance now auto-uniquifies \
+         same-field names, re-validate the engine's explicit-naming strategy",
+        after_unnamed.len(),
+        type_urls(&after_unnamed),
+    );
+
+    // The contract the engine relies on: an explicitly-named second index of a
+    // different type coexists with the first.
+    ds.create_index_builder(
+        &["text"],
+        IndexType::Inverted,
+        &lance_index::scalar::InvertedIndexParams::default(),
+    )
+    .replace(true)
+    .await
+    .unwrap();
+    ds.create_index_builder(&["text"], IndexType::BTree, &ScalarIndexParams::default())
+        .name("text_btree_idx".to_string())
+        .replace(true)
+        .await
+        .unwrap();
+    ds.checkout_latest().await.unwrap();
+    let after_named = ds.load_indices().await.unwrap();
+    let names: Vec<&str> = {
+        let mut n: Vec<&str> = after_named.iter().map(|m| m.name.as_str()).collect();
+        n.sort();
+        n
+    };
+    assert_eq!(
+        names,
+        vec!["text_btree_idx", "text_idx"],
+        "distinctly-named indexes of different types must coexist on one column"
+    );
+    assert_eq!(
+        type_urls(&after_named).len(),
+        2,
+        "expected two distinct index types on the column, got {:?}",
+        type_urls(&after_named)
+    );
+}
+
+// --- Guard 24: second-generation shallow-clone index reads fail upstream ------
+//
+// PURE-LANCE repro of the fork-lineage index bug (no omnigraph code): a
+// dataset's index files are recorded via `base_paths` redirects when a branch
+// is shallow-cloned, but cloning a CLONE records the redirect against the
+// immediate source tree instead of composing the source's own redirect to
+// where the files actually live. Every index-consuming read through the
+// second-generation branch then hard-errors with `Not found:
+// …/tree/<parent>/_indices/…` instead of degrading.
+//
+// Omnigraph hits this whenever a branch-of-a-branch materializes its own
+// table fork (e.g. a fast-forward `branch_merge` into a non-main target) and
+// a query then probes ANY index — BTREE equality, FTS `search`. It is the
+// reason the free-text companion BTREE (equality/prefix acceleration) is
+// deferred: it would widen the exposure to every `@key` equality lookup.
+//
+// This guard asserts the BUG (like the former blob-compaction guard): it
+// turns RED when a Lance bump fixes second-generation clone index reads —
+// then (1) delete this guard, (2) re-land the companion-BTREE dispatch
+// (`plan_index_work_node`) with its tests, and (3) re-check
+// `branch_merge_into_non_main_target_works` against the dual-index truth.
+#[tokio::test]
+async fn second_generation_branch_index_reads_fail_upstream() {
+    use futures::TryStreamExt;
+
+    let dir = tempfile::tempdir().unwrap();
+    let uri = dir.path().join("guard24.lance");
+    let uri = uri.to_str().unwrap();
+
+    // Base dataset with a BTREE on `value` (the exact index-build call shape
+    // the engine uses).
+    let mut ds = fresh_dataset(uri).await;
+    ds.create_index_builder(&["value"], IndexType::BTree, &ScalarIndexParams::default())
+        .replace(true)
+        .await
+        .unwrap();
+
+    // First-generation branch (the engine's fork call shape), plus a write so
+    // the branch has its own commits.
+    let version = ds.version().version;
+    let mut feature = ds.create_branch("feature", version, None).await.unwrap();
+    let schema = Arc::new(Schema::new(vec![
+        Field::new("id", DataType::Utf8, false),
+        Field::new("value", DataType::Int32, false),
+    ]));
+    let batch = RecordBatch::try_new(
+        schema.clone(),
+        vec![
+            Arc::new(StringArray::from(vec!["carol"])),
+            Arc::new(Int32Array::from(vec![3])),
+        ],
+    )
+    .unwrap();
+    let reader = RecordBatchIterator::new(vec![Ok(batch)], schema.clone());
+    feature.append(reader, None).await.unwrap();
+
+    // An indexed read through the FIRST-generation branch works: the clone's
+    // base-path redirect resolves the index files in the root tree.
+    async fn indexed_rows(ds: &Dataset) -> lance::Result<usize> {
+        let mut scanner = ds.scan();
+        scanner.filter("value = 1").unwrap();
+        let batches: Vec<RecordBatch> = scanner.try_into_stream().await?.try_collect().await?;
+        Ok(batches.iter().map(|b| b.num_rows()).sum())
+    }
+    assert_eq!(
+        indexed_rows(&feature).await.unwrap(),
+        1,
+        "first-generation clone must resolve parent index files"
+    );
+
+    // Second-generation branch: clone the clone.
+    let feature_version = feature.version().version;
+    let experiment = feature
+        .create_branch("experiment", feature_version, None)
+        .await
+        .unwrap();
+
+    // The indexed read through the second-generation clone currently fails
+    // with a Not-found on `tree/feature/_indices/...` — the redirect points at
+    // the immediate source tree, where the index files never lived.
+    let result = indexed_rows(&experiment).await;
+    match result {
+        Err(e) => {
+            let msg = e.to_string();
+            assert!(
+                msg.contains("Not found") && msg.contains("_indices"),
+                "expected the known index-file Not-found failure, got: {msg}"
+            );
+        }
+        Ok(n) => panic!(
+            "second-generation clone indexed read SUCCEEDED ({n} rows) — Lance fixed \
+             clone-of-clone index base paths. Delete this guard, re-land the free-text \
+             companion BTREE dispatch, and re-validate the branch-merge topology tests."
+        ),
     }
 }

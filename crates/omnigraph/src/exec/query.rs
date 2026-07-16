@@ -658,6 +658,14 @@ fn search_filter_variable(filter: &IRFilter) -> Option<&str> {
     }
 }
 
+/// Exact string predicates (`starts_with`, string `contains`) that should be
+/// pushed into the scan of the variable they constrain, where Lance can probe
+/// a covering BTREE (LikePrefix) or NGRAM (StringContains) index instead of
+/// filtering a full in-memory materialization of the type.
+fn is_string_match_filter(filter: &IRFilter) -> bool {
+    matches!(filter.op, CompOp::StartsWith | CompOp::StringContains)
+}
+
 fn execute_pipeline<'a>(
     pipeline: &'a [IROp],
     params: &'a ParamMap,
@@ -668,7 +676,20 @@ fn execute_pipeline<'a>(
     search_mode: &'a SearchMode,
 ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<()>> + Send + 'a>> {
     Box::pin(async move {
-        // Pre-pass: collect search filters that need to be hoisted to NodeScan
+        // Pre-pass: collect filters that need to be hoisted to NodeScan —
+        // search filters (Lance full_text_search) and pushable string-match
+        // predicates (starts_with / string contains, which Lance can answer
+        // from a covering BTREE/NGRAM index at the scan). String-match hoists
+        // are gated on the variable actually having a NodeScan: a NodeScan
+        // silently ignores non-applicable filters, whereas leaving the Filter
+        // op in place is always correct (in-memory arm).
+        let scan_vars: HashSet<&str> = pipeline
+            .iter()
+            .filter_map(|op| match op {
+                IROp::NodeScan { variable, .. } => Some(variable.as_str()),
+                _ => None,
+            })
+            .collect();
         let mut hoisted_search_filters: HashMap<String, Vec<IRFilter>> = HashMap::new();
         let mut hoisted_indices: HashSet<usize> = HashSet::new();
         for (i, op) in pipeline.iter().enumerate() {
@@ -680,6 +701,25 @@ fn execute_pipeline<'a>(
                             .or_default()
                             .push(filter.clone());
                         hoisted_indices.insert(i);
+                    }
+                } else if is_string_match_filter(filter)
+                    // The needle must be a literal or param: scan-level
+                    // lowering drops variable qualifiers (PropAccess becomes
+                    // a bare column ident), so a cross-variable predicate
+                    // hoisted into one scan would degenerate to comparing a
+                    // column with itself. Cross-variable forms stay in the
+                    // in-memory arm, which evaluates on the joined wide batch.
+                    && matches!(&filter.right, IRExpr::Literal(_) | IRExpr::Param(_))
+                    && ir_filter_to_expr(filter, params, None).is_some()
+                {
+                    if let IRExpr::PropAccess { variable, .. } = &filter.left {
+                        if scan_vars.contains(variable.as_str()) {
+                            hoisted_search_filters
+                                .entry(variable.clone())
+                                .or_default()
+                                .push(filter.clone());
+                            hoisted_indices.insert(i);
+                        }
                     }
                 }
             }
@@ -2227,10 +2267,12 @@ pub(super) fn build_lance_filter_expr(
     use datafusion::prelude::Expr;
 
     let mut acc: Option<Expr> = None;
+    let mut pushed = 0u64;
     for f in filters {
         let Some(e) = ir_filter_to_expr(f, params, schema) else {
             continue;
         };
+        pushed += 1;
         acc = Some(match acc {
             None => e,
             Some(prev) => Expr::BinaryExpr(datafusion::logical_expr::BinaryExpr::new(
@@ -2240,6 +2282,7 @@ pub(super) fn build_lance_filter_expr(
             )),
         });
     }
+    crate::instrumentation::record_pushed_filter_exprs(pushed);
     acc
 }
 
@@ -2268,6 +2311,22 @@ pub(super) fn ir_filter_to_expr(
         return Some(array_has(left, right));
     }
 
+    // Exact string predicates lower to the DataFusion `starts_with`/`contains`
+    // scalar functions. The function NAMES are load-bearing: Lance's scalar
+    // index expression parser matches them to probe a BTREE (`starts_with` →
+    // LikePrefix) or an NGRAM index (`contains` → StringContains + recheck)
+    // when one covers the column, and falls back to a plain filtered scan
+    // when none does — correct either way.
+    if matches!(filter.op, CompOp::StartsWith | CompOp::StringContains) {
+        use datafusion::functions::expr_fn::{contains, starts_with};
+        let left = ir_expr_to_expr(&filter.left, params, None)?;
+        let right = ir_expr_to_expr(&filter.right, params, None)?;
+        return Some(match filter.op {
+            CompOp::StartsWith => starts_with(left, right),
+            _ => contains(left, right),
+        });
+    }
+
     // A literal/param operand is coerced to the OTHER operand's column type so
     // the predicate stays a direct `col OP literal` and the scalar index is used.
     // Without this, DataFusion widens a narrow column (`CAST(col AS Int64)`),
@@ -2283,7 +2342,9 @@ pub(super) fn ir_filter_to_expr(
         CompOp::Lt => left.lt(right),
         CompOp::Ge => left.gt_eq(right),
         CompOp::Le => left.lt_eq(right),
-        CompOp::Contains => unreachable!("handled above"),
+        CompOp::Contains | CompOp::StartsWith | CompOp::StringContains => {
+            unreachable!("handled above")
+        }
     })
 }
 

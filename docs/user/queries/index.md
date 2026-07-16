@@ -24,8 +24,16 @@ Param types reuse all schema scalars; trailing `?` makes a param optional. The c
 - **Binding**: `$x: NodeType { prop: <literal | $param | now()>, … }`
 - **Traversal**: `$src EDGE_NAME { min, max? } $dst` — variable-length paths via hop bounds; default 1..1 if bounds omitted.
 - **Undirected traversal**: `$src <EDGE_NAME> $dst` — matches the edge in *either* direction with set semantics (a pair connected both ways, or a self-loop, appears once). Only valid on same-endpoint-type edges (e.g. `Related: Issue -> Issue`); an asymmetric edge is rejected at typecheck (`T22`) since it is well-typed in at most one orientation — use the directional form there. Composes with hop bounds (`$a <knows>{1,3} $b`) and `not { }` ("no edge in either direction").
-- **Filter**: `<expr> <op> <expr>` with operators `>=`, `<=`, `!=`, `>`, `<`, `=`, and string `contains`.
+- **Filter**: `<expr> <op> <expr>` with operators `>=`, `<=`, `!=`, `>`, `<`, `=`, plus the string predicates `contains` and `starts_with`.
 - **Negation**: `not { clause+ }` — desugars to anti-join over the inner pipeline.
+
+### String predicates
+
+- `$x.prop contains <needle>` is overloaded on the left operand's type: a **list** property tests membership; a scalar **String** property tests exact substring containment.
+- `$x.prop starts_with <needle>` tests an exact prefix on a scalar String property.
+- Both are **exact and case-sensitive** — no tokenization, stemming, or case folding (for token-based relevance matching use the [search functions](../search/index.md); for case-insensitive matching store a normalized column). A `NULL` value on either side is never a match. `_` and `%` in the needle are literal characters, not wildcards.
+- Operands are **positional**, like comparisons: `X contains Y` tests that X contains Y, and `X starts_with Y` tests that X begins with Y, whichever side each operand is on — `"a haystack" contains $p.name` asks whether the *literal* contains the row's name. Index acceleration applies to the canonical property-on-the-left form. One grammar caveat: a **bare variable** as the left operand (`$q contains $m`) parses as a traversal over an edge named `contains`, not as a filter — use a property access or literal on the left.
+- Both predicates are correct with or without an index. When the filtered variable is scanned directly (not introduced by a traversal) the predicate is pushed into the Lance scan, where a covering index accelerates it — BTREE for `starts_with` (exact prefix range), NGRAM for String `contains` (trigram probe + recheck). See [indexes](../search/indexes.md) for which columns get which index.
 
 ## RETURN clause
 

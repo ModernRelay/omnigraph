@@ -40,6 +40,47 @@ return { $f.name, $f.age }
 }
 
 #[test]
+fn test_lower_resolves_contains_overload_by_left_operand_type() {
+    // `contains` on a scalar String left operand lowers to StringContains
+    // (substring); on a list left operand it stays Contains (membership).
+    let schema = parse_schema("node Person { name: String  tags: [String]? }").unwrap();
+    let catalog = build_catalog(&schema).unwrap();
+    let qf = parse_query(
+        r#"
+query q($q: String) {
+match {
+    $p: Person
+    $p.name contains $q
+    $p.tags contains $q
+    $p.name starts_with $q
+}
+return { $p.name }
+}
+"#,
+    )
+    .unwrap();
+    let tc = typecheck_query(&catalog, &qf.queries[0]).unwrap();
+    let ir = lower_query(&catalog, &qf.queries[0], &tc).unwrap();
+
+    let filter_ops: Vec<CompOp> = ir
+        .pipeline
+        .iter()
+        .filter_map(|op| match op {
+            IROp::Filter(f) => Some(f.op),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(
+        filter_ops,
+        vec![
+            CompOp::StringContains,
+            CompOp::Contains,
+            CompOp::StartsWith
+        ]
+    );
+}
+
+#[test]
 fn test_lower_undirected_traversal_to_direction_both() {
     let catalog = setup();
     let qf = parse_query(

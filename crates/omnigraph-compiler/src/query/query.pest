@@ -93,7 +93,7 @@ agg_call = { agg_func ~ "(" ~ expr ~ ")" }
 agg_func = { "count" | "sum" | "avg" | "min" | "max" }
 
 comp_op = { ">=" | "<=" | "!=" | ">" | "<" | "=" }
-filter_op = { "contains" | comp_op }
+filter_op = { "starts_with" | "contains" | comp_op }
 
 // Terminals
 variable = @{ "$" ~ (ident_chars | "_") }

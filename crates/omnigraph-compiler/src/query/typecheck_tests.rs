@@ -217,7 +217,9 @@ return { $p.tags, $tags, $days }
 }
 
 #[test]
-fn test_contains_filter_requires_list_left_operand() {
+fn test_contains_filter_accepts_string_substring_overload() {
+    // A scalar String left operand resolves the overload to exact substring
+    // matching (previously a T7 error, so no existing query changes meaning).
     let catalog = setup();
     let qf = parse_query(
         r#"
@@ -231,10 +233,111 @@ return { $p.name }
 "#,
     )
     .unwrap();
+    assert!(typecheck_query(&catalog, &qf.queries[0]).is_ok());
+}
+
+#[test]
+fn test_string_contains_requires_string_right_operand() {
+    let catalog = setup();
+    let qf = parse_query(
+        r#"
+query q() {
+match {
+    $p: Person
+    $p.name contains 42
+}
+return { $p.name }
+}
+"#,
+    )
+    .unwrap();
     let err = typecheck_query(&catalog, &qf.queries[0]).unwrap_err();
     assert!(
         err.to_string()
-            .contains("contains requires a list property on the left")
+            .contains("string contains requires a String right operand")
+    );
+}
+
+#[test]
+fn test_contains_filter_requires_list_or_string_left_operand() {
+    let catalog = setup();
+    let qf = parse_query(
+        r#"
+query q() {
+match {
+    $p: Person
+    $p.age contains 3
+}
+return { $p.name }
+}
+"#,
+    )
+    .unwrap();
+    let err = typecheck_query(&catalog, &qf.queries[0]).unwrap_err();
+    assert!(err.to_string().contains(
+        "contains requires a list property (membership) or a String property (substring)"
+    ));
+}
+
+#[test]
+fn test_starts_with_accepts_string_operands() {
+    let catalog = setup();
+    let qf = parse_query(
+        r#"
+query q($q: String) {
+match {
+    $p: Person
+    $p.name starts_with $q
+}
+return { $p.name }
+}
+"#,
+    )
+    .unwrap();
+    assert!(typecheck_query(&catalog, &qf.queries[0]).is_ok());
+}
+
+#[test]
+fn test_starts_with_rejects_non_string_left_operand() {
+    let catalog = setup();
+    let qf = parse_query(
+        r#"
+query q() {
+match {
+    $p: Person
+    $p.age starts_with "4"
+}
+return { $p.name }
+}
+"#,
+    )
+    .unwrap();
+    let err = typecheck_query(&catalog, &qf.queries[0]).unwrap_err();
+    assert!(
+        err.to_string()
+            .contains("starts_with requires a String property on the left")
+    );
+}
+
+#[test]
+fn test_starts_with_rejects_non_string_right_operand() {
+    let catalog = setup();
+    let qf = parse_query(
+        r#"
+query q() {
+match {
+    $p: Person
+    $p.name starts_with 4
+}
+return { $p.name }
+}
+"#,
+    )
+    .unwrap();
+    let err = typecheck_query(&catalog, &qf.queries[0]).unwrap_err();
+    assert!(
+        err.to_string()
+            .contains("starts_with requires a String right operand")
     );
 }
 

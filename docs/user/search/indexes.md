@@ -4,7 +4,7 @@
 
 | Index | Use | Notes |
 |---|---|---|
-| **BTREE scalar** | `=` / range / `IN` / `IS NULL` on a scalar | always on the node `id` and edge `src`/`dst`; and on each one-column `@index`/`@key` property that is an **enum** or an **orderable scalar** (`DateTime`/`Date`/`I32`/`I64`/`U32`/`U64`/`F32`/`F64`/`Bool`) |
+| **BTREE scalar** | `=` / range / `IN` / `IS NULL` / `starts_with` (prefix) on a scalar | always on the node `id` and edge `src`/`dst`; and on each one-column `@index`/`@key` property that is an **enum** or an **orderable scalar** (`DateTime`/`Date`/`I32`/`I64`/`U32`/`U64`/`F32`/`F64`/`Bool`) |
 | **Inverted (FTS)** | `search`, `fuzzy`, `match_text`, `bm25` | created on **free-text** (non-enum) `String` `@index`/`@key` columns |
 | **Vector** | `nearest()` k-NN | Lance picks IVF_PQ vs HNSW family by configuration; OmniGraph stores as FixedSizeList(Float32, dim) |
 
@@ -13,12 +13,18 @@ by the builder and the sidecar-pinning coverage check so they cannot drift):
 enums and orderable scalars → BTREE, free-text Strings → FTS, `Vector` → vector,
 list/`Blob` columns → none.
 
-> **Free-text Strings are not equality-indexed.** A non-enum `String` column
-> (including a `String @key` slug) gets an FTS inverted index, which Lance does
-> **not** consult for `=`/range — only for `search`/`match_text`/`bm25`. So an
-> equality filter on a free-text String falls back to a full scan. If you filter
-> a String identifier by equality on a large table, model it so the value is the
-> node id, or track it as a follow-up to also build a BTREE on such columns.
+> **Free-text Strings are not equality- or prefix-indexed (deferred).** A
+> non-enum `String` column (including a `String @key` slug) gets an FTS
+> inverted index, which Lance does **not** consult for `=`/range/`starts_with`
+> — only for `search`/`match_text`/`bm25`. Those filters stay correct but fall
+> back to a scan. A companion BTREE that closes this gap is implemented (see
+> the `dual-btree-companion` branch) but deferred on an upstream Lance bug:
+> second-generation shallow clones (a branch of a branch, e.g. after a
+> fast-forward merge into a non-main target) cannot read parent index files at
+> all, and the companion would widen that failure to every `@key` equality
+> lookup. The bug is pinned by
+> `lance_surface_guards::second_generation_branch_index_reads_fail_upstream`,
+> which turns red when a Lance bump fixes it.
 
 > **Coverage and cost.** Each indexed column adds index files and build time, and
 > an index only covers the fragments it was built over. Rows appended after the

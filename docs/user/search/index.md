@@ -27,6 +27,23 @@ rank).
 - Scores and ranks propagate as ordinary columns, so you can `return` a score and
   `order` by it.
 
+## Exact string predicates vs. search functions
+
+The search functions above match **tokens** (after lowercasing, stemming, and
+stop-word removal). For exact matching on the stored string — prefix
+autocomplete, substring lookup — use the filter predicates
+[`starts_with` and String `contains`](../queries/index.md#string-predicates)
+instead. They are exact and case-sensitive, work with or without an index, and
+are accelerated by a covering BTREE (`starts_with`) or NGRAM (`contains`)
+index when the filtered variable is scanned directly. One tool per question:
+
+| Question | Use | Acceleration |
+|---|---|---|
+| "is this the prefix?" (autocomplete) | `starts_with` filter | BTREE, exact probe |
+| "does it contain this substring?" | String `contains` filter | NGRAM probe + recheck |
+| "did they misspell a word?" | `fuzzy()` | inverted index |
+| "what's most relevant?" | `bm25()` / `rrf()` | inverted index |
+
 ## Hybrid ranking with `rrf`
 
 Reciprocal Rank Fusion combines two independent rankings (typically one vector and

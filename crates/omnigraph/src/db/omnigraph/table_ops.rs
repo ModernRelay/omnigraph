@@ -645,9 +645,9 @@ pub(super) struct IndexWorkStatus {
 /// Per `build_indices_on_dataset_for_catalog`, nodes get BTree (id) plus, for
 /// each one-column `@index`/`@key` property, the index `node_prop_index_kind`
 /// assigns: a scalar BTREE for enums and orderable scalars
-/// (DateTime/Date/numeric/Bool), FTS for free-text Strings, or a Vector index.
-/// Edges get BTree only (id, src, dst). This helper and the builder share
-/// `node_prop_index_kind` so they cannot drift — see its doc comment.
+/// (DateTime/Date/numeric/Bool), FTS for free-text Strings, or a Vector
+/// index. Edges get BTree only (id, src, dst). This helper and the builder
+/// share `node_prop_index_kind` so they cannot drift — see its doc comment.
 #[derive(Default)]
 struct PlannedIndexWork {
     specs: Vec<crate::storage_layer::IndexBuildSpec>,
@@ -689,6 +689,7 @@ async fn plan_index_work_node(
     if !db.storage().has_btree_index(ds, "id").await? {
         work.push_spec(crate::storage_layer::IndexBuildSpec::BTree {
             column: "id".to_string(),
+            name: None,
         });
     }
     let Some(node_type) = catalog.node_types.get(type_name) else {
@@ -709,6 +710,18 @@ async fn plan_index_work_node(
                         column: prop_name.clone(),
                     });
                 }
+                // DEFERRED: a companion BTREE here would index-accelerate
+                // equality and `starts_with` on free-text Strings (Lance
+                // never consults an inverted index for either), and the
+                // staged machinery supports it (`IndexBuildSpec::BTree`
+                // explicit names; the same-column batch test). It is held
+                // back because Lance's second-generation shallow clones
+                // cannot read parent index files at all — every indexed read
+                // through a branch-of-a-branch fork hard-errors, and the
+                // companion would widen that exposure to every `@key`
+                // equality lookup. Re-land when
+                // `lance_surface_guards::second_generation_branch_index_reads_fail_upstream`
+                // turns red (its panic message carries the checklist).
             }
             Some(NodePropIndexKind::Vector) => {
                 if !db.storage().has_vector_index(ds, prop_name).await? {
@@ -729,6 +742,7 @@ async fn plan_index_work_node(
                 if !db.storage().has_btree_index(ds, prop_name).await? {
                     work.push_spec(crate::storage_layer::IndexBuildSpec::BTree {
                         column: prop_name.clone(),
+                        name: None,
                     });
                 }
             }
@@ -773,6 +787,7 @@ async fn plan_index_work_edge_on_dataset(
         if !db.storage().has_btree_index(ds, column).await? {
             work.push_spec(crate::storage_layer::IndexBuildSpec::BTree {
                 column: column.to_string(),
+                name: None,
             });
         }
     }

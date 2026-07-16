@@ -5,6 +5,7 @@ pub(super) fn apply_filter(
     filter: &IRFilter,
     params: &ParamMap,
 ) -> Result<()> {
+    crate::instrumentation::record_in_memory_filter();
     let mask = evaluate_filter(batch, filter, params)?;
     let filtered = arrow_select::filter::filter_record_batch(batch, &mask)
         .map_err(|e| OmniError::Lance(e.to_string()))?;
@@ -24,6 +25,9 @@ fn evaluate_filter(
     if filter.op == CompOp::Contains {
         return evaluate_contains_filter(&left, &right);
     }
+    if matches!(filter.op, CompOp::StartsWith | CompOp::StringContains) {
+        return evaluate_string_match_filter(filter.op, &left, &right);
+    }
 
     // Cast right to match left's type if needed (e.g. Int64 literal vs Int32 column)
     let right = if left.data_type() != right.data_type() {
@@ -41,7 +45,9 @@ fn evaluate_filter(
         CompOp::Lt => cmp::lt(&left, &right),
         CompOp::Ge => cmp::gt_eq(&left, &right),
         CompOp::Le => cmp::lt_eq(&left, &right),
-        CompOp::Contains => unreachable!("handled above"),
+        CompOp::Contains | CompOp::StartsWith | CompOp::StringContains => {
+            unreachable!("handled above")
+        }
     }
     .map_err(|e| OmniError::Lance(e.to_string()))?;
 
@@ -130,6 +136,45 @@ fn evaluate_contains_filter(left: &ArrayRef, right: &ArrayRef) -> Result<Boolean
             }
         }
         values.push(Some(found));
+    }
+    Ok(BooleanArray::from(values))
+}
+
+/// Exact, case-sensitive string predicates (`starts_with` and the String
+/// overload of `contains`). NULL on either side is not a match, matching the
+/// pushdown arm's SQL semantics.
+fn evaluate_string_match_filter(
+    op: CompOp,
+    left: &ArrayRef,
+    right: &ArrayRef,
+) -> Result<BooleanArray> {
+    let left_str = left
+        .as_any()
+        .downcast_ref::<StringArray>()
+        .ok_or_else(|| OmniError::manifest(format!("{op} requires String operands")))?;
+    let right = if right.data_type() != left.data_type() {
+        arrow_cast::cast::cast(right, left.data_type())
+            .map_err(|e| OmniError::Lance(e.to_string()))?
+    } else {
+        Arc::clone(right)
+    };
+    let right_str = right
+        .as_any()
+        .downcast_ref::<StringArray>()
+        .ok_or_else(|| OmniError::manifest(format!("{op} requires String operands")))?;
+
+    let mut values = Vec::with_capacity(left_str.len());
+    for row in 0..left_str.len() {
+        if left_str.is_null(row) || right_str.is_null(row) {
+            values.push(Some(false));
+            continue;
+        }
+        let (l, r) = (left_str.value(row), right_str.value(row));
+        let matched = match op {
+            CompOp::StartsWith => l.starts_with(r),
+            _ => l.contains(r),
+        };
+        values.push(Some(matched));
     }
     Ok(BooleanArray::from(values))
 }

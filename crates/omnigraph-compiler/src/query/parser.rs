@@ -675,6 +675,7 @@ fn parse_comp_op(pair: pest::iterators::Pair<Rule>) -> Result<CompOp> {
 fn parse_filter_op(pair: pest::iterators::Pair<Rule>) -> Result<CompOp> {
     match pair.as_str() {
         "contains" => Ok(CompOp::Contains),
+        "starts_with" => Ok(CompOp::StartsWith),
         _ => parse_comp_op(pair),
     }
 }
