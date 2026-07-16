@@ -221,6 +221,11 @@ pub(crate) fn constraints_for(catalog: &Catalog) -> Vec<Constraint> {
     out
 }
 
+/// Keys per batched committed-uniqueness scan. Bounds the pushed-down filter
+/// size on the merge path (whose deltas are not row-capped); Mutation/Load
+/// deltas are already capped at this many rows, so they probe in one chunk.
+const UNIQUE_PROBE_CHUNK_KEYS: usize = 8_192;
+
 /// Index-backed view of committed target state for the merge delta's lookups.
 /// Every method reads the (indexed) target table via a structured `filter_expr`
 /// so Lance serves it from the BTREE (index-search → take) rather than a full
@@ -357,46 +362,89 @@ impl<'a> CommittedState<'a> {
         Ok(present)
     }
 
-    /// Ids of committed rows in `table_key` whose `columns` tuple equals `key`.
-    /// Used to detect a cross-version unique collision (the one constraint the
-    /// write path does not enforce, so it is load-bearing at merge).
+    /// Committed holders of the given `columns` tuples in `table_key`, as a map
+    /// from the canonical key to the holder row ids. Used to detect cross-version
+    /// unique collisions (the one constraint the write path does not enforce, so
+    /// it is load-bearing at merge). BATCHED: the dataset is opened once and each
+    /// ≤[`UNIQUE_PROBE_CHUNK_KEYS`]-key chunk is one filtered scan — never one
+    /// scan per key (per-row probes made an S3 merge/append load pay one dataset
+    /// open + one scan per row).
+    ///
+    /// Filter shape: an AND of per-column IN-lists, so each indexed column is
+    /// served by its BTREE as one `IsIn` query (a non-indexed `@unique` column
+    /// falls back to a scan — still one scan for the whole chunk). For a
+    /// composite group the AND of IN-lists is a SUPERSET (the per-column cross
+    /// product); exact tuple membership is decided here against the same
+    /// `composite_unique_key` canonicalization the delta used. The literals are
+    /// TYPED (built from the row's Arrow columns), so the pushed-down filter
+    /// compares like-typed. A stringified key would push a Utf8 literal against a
+    /// typed column — a coercion error on Date/Bool (breaking every write) or a
+    /// silent miss on Float.
     async fn unique_holders(
         &self,
         table_key: &str,
         columns: &[String],
-        key_values: &[ScalarValue],
-    ) -> Result<Vec<String>> {
-        let Some(ds) = self.open(table_key).await? else {
-            return Ok(Vec::new());
-        };
-        // AND of per-column equality so each indexed column is served by its
-        // BTREE (a non-indexed `@unique` column falls back to a scan). The
-        // literal is TYPED (built from the row's Arrow column), so the
-        // pushed-down filter compares like-typed. A stringified key would push a
-        // Utf8 literal against a typed column — a coercion error on Date/Bool
-        // (breaking every write) or a silent miss on Float.
-        let mut expr: Option<Expr> = None;
-        for (column, value) in columns.iter().zip(key_values.iter()) {
-            let eq = col(column.as_str()).eq(lit(value.clone()));
-            expr = Some(match expr {
-                Some(acc) => acc.and(eq),
-                None => eq,
-            });
+        keys: &[(Vec<String>, Vec<ScalarValue>)],
+    ) -> Result<HashMap<Vec<String>, Vec<String>>> {
+        let mut holders: HashMap<Vec<String>, Vec<String>> = HashMap::new();
+        if keys.is_empty() || columns.is_empty() {
+            return Ok(holders);
         }
-        let Some(expr) = expr else {
-            return Ok(Vec::new());
+        let Some(ds) = self.open(table_key).await? else {
+            return Ok(holders);
         };
-        let batches = scan_filtered(&ds, &["id"], expr).await?;
-        let mut ids = Vec::new();
-        for batch in &batches {
-            let column = string_col(batch, "id")?;
-            for i in 0..column.len() {
-                if !column.is_null(i) {
-                    ids.push(column.value(i).to_string());
+        let wanted: HashSet<&Vec<String>> = keys.iter().map(|(canonical, _)| canonical).collect();
+        let projection: Vec<&str> = std::iter::once("id")
+            .chain(columns.iter().map(String::as_str))
+            .collect();
+        for chunk in keys.chunks(UNIQUE_PROBE_CHUNK_KEYS) {
+            let mut expr: Option<Expr> = None;
+            for (i, column) in columns.iter().enumerate() {
+                // Dedup per-column values by their canonical rendering (two keys
+                // sharing a column value push it once).
+                let mut seen: HashSet<&str> = HashSet::new();
+                let values: Vec<Expr> = chunk
+                    .iter()
+                    .filter(|(canonical, _)| seen.insert(canonical[i].as_str()))
+                    .map(|(_, typed)| lit(typed[i].clone()))
+                    .collect();
+                let in_list = col(column.as_str()).in_list(values, false);
+                expr = Some(match expr {
+                    Some(acc) => acc.and(in_list),
+                    None => in_list,
+                });
+            }
+            let expr = expr.expect("columns is non-empty");
+            let batches = scan_filtered(&ds, &projection, expr).await?;
+            for batch in &batches {
+                let ids = string_col(batch, "id")?;
+                let group_columns = columns
+                    .iter()
+                    .map(|name| {
+                        batch.column_by_name(name).cloned().ok_or_else(|| {
+                            OmniError::manifest(format!(
+                                "table {table_key} missing unique column '{name}'"
+                            ))
+                        })
+                    })
+                    .collect::<Result<Vec<_>>>()?;
+                for row in 0..batch.num_rows() {
+                    if ids.is_null(row) {
+                        continue;
+                    }
+                    let Some(key) = composite_unique_key(&group_columns, row)? else {
+                        continue;
+                    };
+                    if wanted.contains(&key) {
+                        holders
+                            .entry(key)
+                            .or_default()
+                            .push(ids.value(row).to_string());
+                    }
                 }
             }
         }
-        Ok(ids)
+        Ok(holders)
     }
 
     /// Committed edges `(id, src)` in `edge_table` matching `keys` on `key_col`
@@ -733,12 +781,23 @@ async fn evaluate_unique(
         }
     }
 
-    // Pass 3: committed cross-version (non-`@key` only).
+    // Pass 3: committed cross-version (non-`@key` only). ONE batched probe for
+    // the whole group — dedup'd keys, dataset opened once — never a scan per row.
     if !is_key {
-        for (id, (key, values)) in &entries {
-            for holder in committed.unique_holders(table_key, columns, values).await? {
-                if !delta_ids.contains(&holder) && !deleted.contains(&holder) {
-                    violations.push(unique_violation(table_key, columns, key, id, &holder));
+        let mut seen: HashSet<&Vec<String>> = HashSet::new();
+        let probe: Vec<(Vec<String>, Vec<ScalarValue>)> = entries
+            .iter()
+            .filter(|(_, (key, _))| seen.insert(key))
+            .map(|(_, (key, values))| (key.clone(), values.clone()))
+            .collect();
+        let holders_by_key = committed.unique_holders(table_key, columns, &probe).await?;
+        for (id, (key, _)) in &entries {
+            let Some(holders) = holders_by_key.get(key) else {
+                continue;
+            };
+            for holder in holders {
+                if !delta_ids.contains(holder) && !deleted.contains(holder) {
+                    violations.push(unique_violation(table_key, columns, key, id, holder));
                     break;
                 }
             }
