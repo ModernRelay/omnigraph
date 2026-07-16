@@ -199,6 +199,47 @@ Behavior-affecting findings in this audit:
   maintenance-transaction API and OmniGraph has distributed recovery fencing;
   the latter is independently required before destructive recovery is safe
   against a live foreign process.
+- **RFC-024 Gate A found a usable public ABA token but rejected the proposed
+  physical lookup shape.** The backend-portable candidate is the composite of
+  public `Dataset::branch_identifier()`, the current public
+  `Dataset::read_transaction()` UUID, and `Dataset::manifest_location().e_tag`.
+  Capture brackets transaction/e_tag collection with two branch-identifier
+  reads and fails if the ref moves; a missing transaction or empty UUID also
+  fails. Beta.21's local `current_manifest_path` synthesizes an
+  inode-mtime-size e_tag, while S3/RustFS returns the object e_tag. Guards prove
+  stable unchanged reopens and distinguish main and named-ref delete/recreate
+  at the same numeric version on local and S3/RustFS. The local guard reuses the
+  original shared `Session`; the S3 guard also pins unchanged-incarnation
+  reopen stability. Main's canonical empty `BranchIdentifier` makes the UUID
+  and e_tag load-bearing; named refs additionally mint a new branch identifier.
+  Raw byte-identical restoration or forged UUID/ref metadata is outside the
+  supported OmniGraph writer topology: this composite fences ABA, but is not
+  authentication. The proof closes the substrate-source question, not
+  publisher-level stale-writer rejection, because no heads-format production
+  path exists.
+
+  The separate test-only `durable_head_lookup_cost.rs` fixture measures a
+  structured exact `object_id IN (...)` scan over a BTREE at catalog width 10.
+  Reconciled rows and ranges are flat at 10→10; result fragments are 10→10
+  uncompacted and 1→1 compacted; cold/warm BTREE pages are 1→1 / 0→0. An
+  absent-index negative control grows, and one/eight uncovered fragments are
+  correct and observable. After `optimize_indices`, coverage returns to zero
+  uncovered and the representative tail work returns from 27→10 in the
+  beta.21 `rows_scanned` proxy
+  and 17→10 ranges. Nevertheless, representative RustFS 20→80 curves grow:
+  uncompacted cold object reads 34→94 and bytes 61,947→121,592; compacted cold
+  object bytes 30,545→61,642 and plan bytes 39,085→61,894; compacted warm object
+  bytes 22,934→45,413. Flat indexed scan work therefore does not make the full
+  latest-manifest/object-byte cost flat, so RFC-024 is research-blocked and no
+  heads format ships.
+
+  The instrument keeps counter scopes separate: object reads/bytes come from an
+  `IOTracker` installed before `DatasetBuilder::load`, while plan counters come
+  from `ExecutionSummaryCounts`; they are not additive. The public summary
+  fields are `iops`, `requests`, `bytes_read`, and `parts_loaded`.
+  `fragments_scanned`, `ranges_scanned`, and `rows_scanned` are beta.21
+  `all_counts` debug names explicitly subject to change, so every Lance bump
+  must re-audit them rather than silently treating them as stable API.
 - **RFC-023 key-filter behavior remains route-dependent and directional, and
   v6 closes production routing around that fact with two distinct adapters.**
   A 2026-07-14 probe on this beta.21 pin shows that an explicitly selected v2

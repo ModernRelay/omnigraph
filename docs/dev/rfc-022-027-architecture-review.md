@@ -1,7 +1,7 @@
 # Architecture review: RFC-022 through RFC-028
 
-**Status:** RFC-022, RFC-023, and RFC-028 implemented; RFC-024–027 review and
-acceptance work remains open
+**Status:** RFC-022, RFC-023, and RFC-028 implemented; RFC-024 and RFC-027
+research-blocked; RFC-025 and RFC-026 remain under review
 **Date:** 2026-07-11
 **Audience:** RFC authors, engine/storage maintainers, and release reviewers
 **Reviewed against:** OmniGraph 0.8.1; Lance 9.0.0-beta.15 at
@@ -25,6 +25,9 @@ RFC's survey and acceptance guards.
 **RFC-024/025/027 substrate claims revalidated against:** the same beta.21
 revision and the full matching table/index/branch/tag/cleanup, transaction, and
 row-lineage specification sections; their survey headers now record beta.21.
+RFC-024 Gate A was subsequently measured on 2026-07-15: its exact BTREE scan
+work is flat, but the required RustFS latest-manifest/object-byte curves grow,
+so the candidate and format are research-blocked rather than accepted.
 
 This is a review ledger, not a competing specification. The RFCs remain the
 normative design records: RFC-022/RFC-028 document implemented contracts;
@@ -367,8 +370,9 @@ runs, and the lazy branch still opens and reads the exact pinned state.
 
 **Affected:** [RFC-024 §5](../rfcs/0024-durable-table-heads.md#5-atomic-publisher-contract)
 
-**Status:** Closed in specification on 2026-07-14; backend-token proof and ABA
-tests remain RFC-024 acceptance gates.
+**Status:** Closed in specification and public-substrate proof on 2026-07-15;
+publisher-level stale-writer rejection remains unimplemented because Gate A
+rejected the heads format.
 
 The RFC says expected table versions are compared against table heads. Lance
 version numbers can repeat across recreated datasets/branches, so version-only
@@ -383,18 +387,25 @@ identity, at least:
 ```
 
 The publisher may encode that token differently, but retry/revalidation must
-not reduce it to `table_version`. `physical_ref_incarnation` means an e_tag when
-the backend supplies one, or another proven token that changes when a dataset
-or native ref is deleted and recreated at the same path/branch/version. This is
-distinct from the logical `incarnation_id`, which RFC-028 deliberately preserves
-across an owner handoff. Add stale-writer races for both logical drop/recreate
-and physical ref recreation at the same numeric version.
+not reduce it to `table_version`. `physical_ref_incarnation` is the public
+`BranchIdentifier` + current `Transaction.uuid` + `ManifestLocation.e_tag`
+composite. Capture brackets transaction/e_tag collection with branch-identifier
+reads and rejects movement; missing/empty transaction identity fails closed.
+This is distinct from the logical `incarnation_id`, which RFC-028 deliberately
+preserves across an owner handoff. Add stale-writer races for both logical
+drop/recreate and physical ref recreation at the same numeric version.
 
 **Disposition:** RFC-024 §3.2 now persists the separate physical-ref token and
-refuses activation on a backend without a proven source. §5 compares the full
-token on every retry and derives the desired token from the achieved effect;
-§12 adds local and S3/RustFS same-version ABA tests. Its open gates retain the
-backend proof rather than silently accepting a timestamp/version fallback.
+refuses activation on a backend without a proven source. Beta.21 local manifest
+resolution supplies an inode-mtime-size e_tag; S3/RustFS supplies the object
+e_tag. Public-surface guards pass main and named-ref same-version ABA on both,
+unchanged reopen stability on S3, and original-shared-`Session` local
+recreation. Main's canonical empty branch identifier makes UUID/e_tag
+load-bearing; named refs also change branch identifier. Raw byte-identical or
+forged replacement is outside the supported writer topology, so the token is
+not authentication. §5 still requires the unbuilt publisher to compare the
+full token and reject stale writers; substrate proof is not production
+integration.
 
 ### BLOCKER-06 — MemWAL needs a capability/format activation barrier
 
@@ -543,8 +554,8 @@ metadata selects its lifecycle:
 
 RFC-022 through RFC-028 now identify the maintainer design-series track and an
 owner. RFC-022 and RFC-028 are `implemented` at their documented support
-boundaries, RFC-023 is `implemented`, RFC-024 through RFC-026 remain `draft`,
-and RFC-027 remains `research-blocked`.
+boundaries, RFC-023 is `implemented`, RFC-024 and RFC-027 are
+`research-blocked`, and RFC-025/RFC-026 remain `draft`.
 All formal RFC filenames in the central directory are normalized to four
 digits. Legacy `docs/dev/rfc-00N-*` files remain in place with their existing
 lifecycle; they are internal design and implementation records, not members of
@@ -860,10 +871,14 @@ affected RFC is accepted or implemented:
    completed-trial exclusion. RFC-023's production performance gate is closed.
    Full tables and methodology are in RFC-023 §11.4. RFC-027 still needs its own
    evidence.
-6. **Derived-index fallbacks:** acceptance tests must force index-absent and
-   partially covered states for RFC-024 head lookup and RFC-027 candidate
-   discovery, assert identical logical results, and assert the promised
-   degraded-cost/fallback telemetry.
+6. **Derived-index fallbacks:** RFC-024's Gate A instrument forces index-absent,
+   one-uncovered, eight-uncovered, and reconciled-after-tail states. Results are
+   logically identical; the absent negative control grows; tail work is
+   observable; and `optimize_indices` returns coverage to zero uncovered and
+   representative `rows_scanned`/range work from 27→10 / 17→10. That part
+   passes, but
+   the overall candidate is rejected because object-read/byte curves fail.
+   RFC-027 still must prove its absent/partial candidate-discovery states.
 
 ## Acceptance order after disposition
 
@@ -877,7 +892,10 @@ The review does not require all RFCs to land together. A safe order is:
    2026-07-15; the RFC is implemented with its operator duplicate-repair
    runbook, v6 routing/PK, effect-aware recovery, bounded safety, certificate
    chain, and independent named-branch rebuild evidence complete;
-4. evaluate RFC-024 independently on its physical lookup cost gate;
+4. RFC-024's independent physical lookup evaluation completed on 2026-07-15:
+   the exact BTREE's scan work is flat, but uncompacted RustFS cold object
+   reads/bytes and compacted byte terms grow, so the format is research-blocked
+   and production remains on internal schema v6;
 5. accept RFC-025 after physical protection of both checkpoints and live graph
    branches plus strict-rebuild implementation evidence;
 6. accept RFC-026 only after Lance exposes the public exact-enrollment and

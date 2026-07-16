@@ -30,6 +30,7 @@ use arrow_schema::{DataType, Field, Schema};
 use lance::Dataset;
 use lance::dataset::builder::DatasetBuilder;
 use lance::dataset::optimize::{CompactionOptions, compact_files};
+use lance::dataset::refs::BranchIdentifier;
 use lance::dataset::transaction::{Operation, Transaction};
 use lance::dataset::write::delete::DeleteResult;
 use lance::dataset::write::merge_insert::UncommittedMergeInsert;
@@ -40,12 +41,13 @@ use lance::dataset::{
 };
 use lance::datatypes::LANCE_UNENFORCED_PRIMARY_KEY;
 use lance::index::DatasetIndexExt;
+use lance::session::Session;
 use lance_file::version::LanceFileVersion;
 use lance_index::IndexType;
 use lance_index::optimize::OptimizeOptions;
 use lance_index::scalar::ScalarIndexParams;
 use lance_namespace::LanceNamespace;
-use lance_table::io::commit::ManifestNamingScheme;
+use lance_table::io::commit::{ManifestLocation, ManifestNamingScheme};
 
 /// Helper: build a small fresh dataset in a tempdir. Pinned at V2_2 to match
 /// production write paths (blob v2 requires V2_2; see `docs/dev/lance.md`).
@@ -70,6 +72,102 @@ async fn fresh_dataset(uri: &str) -> Dataset {
         ..Default::default()
     };
     Dataset::write(reader, uri, Some(params)).await.unwrap()
+}
+
+/// RFC-024 Gate A candidate built exclusively from public Lance surfaces.
+///
+/// `BranchIdentifier` distinguishes named-ref lifetimes, the current
+/// transaction UUID distinguishes main-dataset replacement where main's
+/// identifier is necessarily empty, and the manifest e_tag gives object stores
+/// an independent physical-object witness. The e_tag remains optional at the
+/// type level for backends that omit it; beta.21's local filesystem backend
+/// resolves a metadata-derived e_tag, and the local guards below require it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct PublicPhysicalRefIncarnation {
+    branch_identifier: BranchIdentifier,
+    transaction_uuid: String,
+    manifest_e_tag: Option<String>,
+}
+
+async fn public_physical_ref_incarnation(dataset: &Dataset) -> PublicPhysicalRefIncarnation {
+    let branch_identifier = dataset
+        .branch_identifier()
+        .await
+        .expect("the current dataset/ref must expose its public BranchIdentifier");
+    let transaction = dataset
+        .read_transaction()
+        .await
+        .expect("the current manifest transaction must be readable")
+        .expect("a heads-format candidate cannot admit a manifest without a transaction UUID");
+    assert!(
+        !transaction.uuid.is_empty(),
+        "a heads-format candidate cannot admit an empty transaction UUID"
+    );
+    let manifest_e_tag = dataset.manifest_location().e_tag.clone();
+    let revalidated_branch_identifier = dataset
+        .branch_identifier()
+        .await
+        .expect("the current dataset/ref must re-expose its public BranchIdentifier");
+    assert_eq!(
+        branch_identifier, revalidated_branch_identifier,
+        "physical-ref capture must reject branch movement while reading manifest authority"
+    );
+    PublicPhysicalRefIncarnation {
+        branch_identifier,
+        transaction_uuid: transaction.uuid,
+        manifest_e_tag,
+    }
+}
+
+async fn recreate_named_branch_and_assert_token_changes(main: &mut Dataset, require_etag: bool) {
+    let base_version = main.version().version;
+    let first = main
+        .create_branch("rfc024-physical-token", base_version, None)
+        .await
+        .expect("first named-ref incarnation must be created");
+    let first_version = first.version().version;
+    let first_token = public_physical_ref_incarnation(&first).await;
+
+    main.force_delete_branch("rfc024-physical-token")
+        .await
+        .expect("first named-ref incarnation must be deleted completely");
+    let second = main
+        .create_branch("rfc024-physical-token", base_version, None)
+        .await
+        .expect("same-name named ref must be recreatable");
+    let second_version = second.version().version;
+    let second_token = public_physical_ref_incarnation(&second).await;
+
+    assert_eq!(
+        first_version, second_version,
+        "the ABA fixture must recreate the named ref at the same numeric version"
+    );
+    assert_ne!(
+        first_token.branch_identifier, second_token.branch_identifier,
+        "a same-name/same-version named-ref recreation must mint a new BranchIdentifier"
+    );
+    assert_ne!(
+        first_token.transaction_uuid, second_token.transaction_uuid,
+        "the recreated named ref's current manifest must carry a new transaction UUID"
+    );
+    assert_ne!(
+        first_token, second_token,
+        "the complete public physical-ref token must reject named-ref ABA"
+    );
+    if require_etag {
+        let first_etag = first_token
+            .manifest_e_tag
+            .as_deref()
+            .expect("the selected backend must expose the first named-ref manifest e_tag");
+        let second_etag = second_token
+            .manifest_e_tag
+            .as_deref()
+            .expect("the selected backend must expose the recreated named-ref manifest e_tag");
+        assert_ne!(
+            first_etag, second_etag,
+            "the selected backend must distinguish the recreated named-ref manifest object by e_tag"
+        );
+    }
 }
 
 /// RFC-023 substrate fixture: a V2_2 table whose internal `id` is Lance's
@@ -302,6 +400,263 @@ async fn manifest_location_field_shape() {
     // Runtime sanity — naming_scheme should produce a Debug string we use
     // verbatim in `TableVersionMetadata::naming_scheme`.
     assert!(!format!("{:?}", loc.naming_scheme).is_empty());
+}
+
+// --- Guard 2b: RFC-024 public physical-ref incarnation surfaces -----------
+//
+// RFC-024 may activate durable table heads only if a public, backend-portable
+// token rejects delete/recreate ABA at an unchanged URI/ref name and numeric
+// version. Pin all three candidate components at compile time, then exercise
+// them against real local and object-store datasets below.
+
+#[allow(
+    dead_code,
+    unreachable_code,
+    unused_variables,
+    unused_mut,
+    clippy::diverging_sub_expression
+)]
+async fn _compile_public_physical_ref_incarnation_surfaces() -> lance::Result<()> {
+    let ds: &Dataset = unimplemented!();
+    let _branch_identifier: BranchIdentifier = ds.branch_identifier().await?;
+    let transaction: Option<Transaction> = ds.read_transaction().await?;
+    if let Some(transaction) = transaction {
+        let _transaction_uuid: String = transaction.uuid;
+    }
+    let location: &ManifestLocation = ds.manifest_location();
+    let _manifest_e_tag: Option<String> = location.e_tag.clone();
+    Ok(())
+}
+
+#[tokio::test]
+async fn public_physical_ref_token_rejects_local_same_version_aba() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("rfc024-physical-token.lance");
+    let uri = path.to_str().unwrap();
+
+    let first = fresh_dataset(uri).await;
+    let first_version = first.version().version;
+    let first_token = public_physical_ref_incarnation(&first).await;
+    drop(first);
+
+    std::fs::remove_dir_all(&path).expect("the first local dataset must be deleted completely");
+    let mut second = fresh_dataset(uri).await;
+    let second_version = second.version().version;
+    let second_token = public_physical_ref_incarnation(&second).await;
+
+    assert_eq!(
+        first_version, second_version,
+        "the ABA fixture must recreate main at the same numeric version"
+    );
+    assert_eq!(
+        first_token.branch_identifier, second_token.branch_identifier,
+        "main's BranchIdentifier is intentionally stable/empty and cannot detect replacement"
+    );
+    assert_eq!(
+        first_token.branch_identifier,
+        BranchIdentifier::main(),
+        "main must expose Lance's canonical empty BranchIdentifier"
+    );
+    assert_ne!(
+        first_token.transaction_uuid, second_token.transaction_uuid,
+        "the public current-transaction UUID must distinguish local main replacement"
+    );
+    let first_etag = first_token
+        .manifest_e_tag
+        .as_deref()
+        .expect("beta.21 must expose the first local main manifest's metadata-derived e_tag");
+    let second_etag = second_token
+        .manifest_e_tag
+        .as_deref()
+        .expect("beta.21 must expose the recreated local main manifest's metadata-derived e_tag");
+    assert_ne!(
+        first_etag, second_etag,
+        "beta.21's local e_tag must distinguish the recreated main manifest object"
+    );
+    assert_ne!(
+        first_token, second_token,
+        "the complete public physical-ref token must reject local main ABA"
+    );
+
+    recreate_named_branch_and_assert_token_changes(&mut second, true).await;
+}
+
+/// Exercise the production-shaped shared-Session case. Once the
+/// canonical first incarnation is cached, deleting and recreating main at the
+/// same URI/version must still resolve the second incarnation rather than reuse
+/// the cached transaction UUID. A fresh public DatasetBuilder open is the
+/// cache-bypass fallback and must agree with the shared-Session result.
+#[tokio::test]
+async fn local_physical_ref_token_is_stable_and_survives_shared_session_aba() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("rfc024-shared-session-token.lance");
+    let uri = path.to_str().unwrap();
+
+    let first_committed = fresh_dataset(uri).await;
+    let first_version = first_committed.version().version;
+    let first_committed_token = public_physical_ref_incarnation(&first_committed).await;
+    assert!(
+        first_committed_token.manifest_e_tag.is_some(),
+        "beta.21's public Dataset result must expose the local manifest's metadata-derived e_tag"
+    );
+    drop(first_committed);
+
+    let shared_session = Arc::new(Session::default());
+    let first = DatasetBuilder::from_uri(uri)
+        .with_session(shared_session.clone())
+        .load()
+        .await
+        .expect("the first local incarnation must reopen through the shared Session");
+    let first_token = public_physical_ref_incarnation(&first).await;
+    assert_eq!(
+        first_committed_token, first_token,
+        "the public token must be stable from the commit result through a shared-Session reopen"
+    );
+
+    let first_again = DatasetBuilder::from_uri(uri)
+        .with_session(shared_session.clone())
+        .load()
+        .await
+        .expect("the unchanged first incarnation must reopen from the shared Session");
+    assert_eq!(
+        first_token,
+        public_physical_ref_incarnation(&first_again).await,
+        "a canonical token must be stable across unchanged shared-Session reopens"
+    );
+    drop(first_again);
+    drop(first);
+
+    std::fs::remove_dir_all(&path).expect("the first local dataset must be deleted completely");
+    let second_committed = fresh_dataset(uri).await;
+    let second_version = second_committed.version().version;
+    assert_eq!(
+        first_version, second_version,
+        "the shared-Session ABA fixture must recreate main at the same numeric version"
+    );
+    drop(second_committed);
+
+    let second = DatasetBuilder::from_uri(uri)
+        .with_session(shared_session)
+        .load()
+        .await
+        .expect("the recreated local incarnation must reopen through the original Session");
+    let second_token = public_physical_ref_incarnation(&second).await;
+    assert_ne!(
+        first_token.transaction_uuid, second_token.transaction_uuid,
+        "the shared Session must not return the deleted incarnation's cached transaction"
+    );
+    let first_etag = first_token
+        .manifest_e_tag
+        .as_deref()
+        .expect("beta.21 must retain the first local manifest's metadata-derived e_tag");
+    let second_etag = second_token
+        .manifest_e_tag
+        .as_deref()
+        .expect("beta.21 must expose the recreated local manifest's metadata-derived e_tag");
+    assert_ne!(
+        first_etag, second_etag,
+        "the shared Session must resolve the recreated local manifest's distinct e_tag"
+    );
+    assert_ne!(
+        first_token, second_token,
+        "the canonical public token must distinguish shared-Session local main ABA"
+    );
+
+    let fresh = DatasetBuilder::from_uri(uri)
+        .load()
+        .await
+        .expect("a fresh public Session must reopen the recreated incarnation");
+    assert_eq!(
+        second_token,
+        public_physical_ref_incarnation(&fresh).await,
+        "fresh-session cache bypass must agree with the canonical shared-Session token"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn public_physical_ref_token_rejects_s3_same_version_aba() {
+    let Ok(bucket) = std::env::var("OMNIGRAPH_S3_TEST_BUCKET") else {
+        eprintln!(
+            "skipping RFC-024 S3 physical-ref token guard: \
+             OMNIGRAPH_S3_TEST_BUCKET is not set"
+        );
+        return;
+    };
+    let prefix = std::env::var("OMNIGRAPH_S3_TEST_PREFIX")
+        .ok()
+        .filter(|value| !value.trim().is_empty())
+        .unwrap_or_else(|| "omnigraph-itests".to_string());
+    let unique = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .expect("system clock must be after the Unix epoch")
+        .as_nanos();
+    let uri = format!(
+        "s3://{bucket}/{prefix}/rfc024-physical-token/{}-{unique}.lance",
+        std::process::id()
+    );
+
+    let first = fresh_dataset(&uri).await;
+    let first_version = first.version().version;
+    let first_token = public_physical_ref_incarnation(&first).await;
+    let first_again = DatasetBuilder::from_uri(&uri)
+        .load()
+        .await
+        .expect("the unchanged first S3/RustFS incarnation must reopen");
+    assert_eq!(
+        first_token,
+        public_physical_ref_incarnation(&first_again).await,
+        "the S3/RustFS token must be stable across an unchanged reopen"
+    );
+    drop(first_again);
+    let (store, path) = lance_io::object_store::ObjectStore::from_uri(&uri)
+        .await
+        .expect("configured S3/RustFS dataset URI must resolve");
+    drop(first);
+
+    store
+        .remove_dir_all(path.clone())
+        .await
+        .expect("the first S3/RustFS dataset must be deleted completely");
+    let mut second = fresh_dataset(&uri).await;
+    let second_version = second.version().version;
+    let second_token = public_physical_ref_incarnation(&second).await;
+
+    assert_eq!(
+        first_version, second_version,
+        "the ABA fixture must recreate S3/RustFS main at the same numeric version"
+    );
+    assert_eq!(
+        first_token.branch_identifier, second_token.branch_identifier,
+        "main's BranchIdentifier is intentionally stable/empty and cannot detect replacement"
+    );
+    assert_ne!(
+        first_token.transaction_uuid, second_token.transaction_uuid,
+        "the public current-transaction UUID must distinguish S3/RustFS main replacement"
+    );
+    let first_etag = first_token
+        .manifest_e_tag
+        .as_deref()
+        .expect("S3/RustFS must expose the first main manifest e_tag");
+    let second_etag = second_token
+        .manifest_e_tag
+        .as_deref()
+        .expect("S3/RustFS must expose the recreated main manifest e_tag");
+    assert_ne!(
+        first_etag, second_etag,
+        "S3/RustFS must distinguish the recreated main manifest object by e_tag"
+    );
+    assert_ne!(
+        first_token, second_token,
+        "the complete public physical-ref token must reject S3/RustFS main ABA"
+    );
+
+    recreate_named_branch_and_assert_token_changes(&mut second, true).await;
+
+    drop(second);
+    store
+        .remove_dir_all(path)
+        .await
+        .expect("configured S3/RustFS test prefix cleanup must succeed");
 }
 
 // --- Guard 3: checkout_version + restore async chain -----------------------

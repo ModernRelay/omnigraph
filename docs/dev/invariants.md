@@ -372,7 +372,16 @@ them explicit.
   `merge_cost.rs::merge_manifest_cost_grows_with_history` instrument pins this
   as a known non-flat term rather than disguising it as an acceptance result.
   This remains an explicit invariant-15 gap; do not claim history-flat merge
-  cost until the same instrument proves it.
+  cost until the same instrument proves it. RFC-024 Gate A tested materialized
+  in-manifest heads as the structural alternative. At width 10, reconciled
+  BTREE work is flat in the beta.21 `rows_scanned` proxy and ranges (10→10), fragments
+  (10→10 uncompacted, 1→1 compacted), and cold/warm pages (1→1 / 0→0); absent
+  index work grows, and `optimize_indices` restores an eight-fragment tail from
+  27→10 rows and 17→10 ranges. The full gate still fails: representative
+  RustFS 20→80 uncompacted cold reads grow 34→94 and bytes
+  61,947→121,592, while compacted cold/warm byte terms also grow. RFC-024 is
+  therefore research-blocked and production remains on the v6 journal fold.
+  Do not reinterpret flat scan counters as a history-flat current-state path.
 - **Read-path re-derivation (largely closed by the query-latency work):**
   snapshot resolution used to re-open a fresh coordinator per read (a full
   `__manifest` re-scan plus the then-separate commit-graph-table scans, since
