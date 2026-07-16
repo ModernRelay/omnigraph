@@ -177,7 +177,8 @@ Behavior-affecting findings in this audit:
   unchanged between beta.15 and beta.21 and has had this shape since upstream
   #7129. OmniGraph can therefore mirror the scalar staging path, pre-mint the
   transaction identity, and commit through `commit_staged_exact`. The exact
-  EnsureIndices v8 adapter now does so: all missing BTREE, FTS, and full-table
+  EnsureIndices adapter now does so inside the RFC-028 identity-bearing v9
+  envelope: all missing BTREE, FTS, and full-table
   vector artifacts for a table are combined into one `Operation::CreateIndex`,
   and `InlineCommitResidual` has been removed. This closes the OmniGraph rollout
   gap for the one-segment full-table IVF-Flat build.
@@ -192,11 +193,144 @@ Behavior-affecting findings in this audit:
   high-level committing operations; their internal transaction construction is
   not a public contract that OmniGraph can pre-mint and later prove as one
   complete compact/reindex effect. RFC-022 therefore keeps Optimize's bounded
-  schema-v2 adapter instead of binding an "exact-v9" protocol to beta internals.
+  maintenance payload inside the v9 identity envelope instead of claiming
+  exact maintenance provenance from beta internals.
   Revisit exact Optimize provenance only after Lance exposes a stable public
   maintenance-transaction API and OmniGraph has distributed recovery fencing;
   the latter is independently required before destructive recovery is safe
   against a live foreign process.
+- **RFC-024 Gate A found a usable public ABA token but rejected the proposed
+  physical lookup shape.** The backend-portable candidate is the composite of
+  public `Dataset::branch_identifier()`, the current public
+  `Dataset::read_transaction()` UUID, and `Dataset::manifest_location().e_tag`.
+  Capture brackets transaction/e_tag collection with two branch-identifier
+  reads and fails if the ref moves; a missing transaction or empty UUID also
+  fails. Beta.21's local `current_manifest_path` synthesizes an
+  inode-mtime-size e_tag, while S3/RustFS returns the object e_tag. Guards prove
+  stable unchanged reopens and distinguish main and named-ref delete/recreate
+  at the same numeric version on local and S3/RustFS. The local guard reuses the
+  original shared `Session`; the S3 guard also pins unchanged-incarnation
+  reopen stability. Main's canonical empty `BranchIdentifier` makes the UUID
+  and e_tag load-bearing; named refs additionally mint a new branch identifier.
+  Raw byte-identical restoration or forged UUID/ref metadata is outside the
+  supported OmniGraph writer topology: this composite fences ABA, but is not
+  authentication. The proof closes the substrate-source question, not
+  publisher-level stale-writer rejection, because no heads-format production
+  path exists.
+
+  The separate test-only `durable_head_lookup_cost.rs` fixture measures a
+  structured exact `object_id IN (...)` scan over a BTREE at catalog width 10.
+  Reconciled rows and ranges are flat at 10→10; result fragments are 10→10
+  uncompacted and 1→1 compacted; cold/warm BTREE pages are 1→1 / 0→0. An
+  absent-index negative control grows, and one/eight uncovered fragments are
+  correct and observable. After `optimize_indices`, coverage returns to zero
+  uncovered and the representative tail work returns from 27→10 in the
+  beta.21 `rows_scanned` proxy
+  and 17→10 ranges. Nevertheless, representative RustFS 20→80 curves grow:
+  uncompacted cold object reads 34→94 and bytes 61,947→121,592; compacted cold
+  object bytes 30,545→61,642 and plan bytes 39,085→61,894; compacted warm object
+  bytes 22,934→45,413. Flat indexed scan work therefore does not make the full
+  latest-manifest/object-byte cost flat, so RFC-024 is research-blocked and no
+  heads format ships.
+
+  The instrument keeps counter scopes separate: object reads/bytes come from an
+  `IOTracker` installed before `DatasetBuilder::load`, while plan counters come
+  from `ExecutionSummaryCounts`; they are not additive. The public summary
+  fields are `iops`, `requests`, `bytes_read`, and `parts_loaded`.
+  `fragments_scanned`, `ranges_scanned`, and `rows_scanned` are beta.21
+  `all_counts` debug names explicitly subject to change, so every Lance bump
+  must re-audit them rather than silently treating them as stable API.
+- **RFC-023 key-filter behavior remains route-dependent and directional, and
+  v6 closes production routing around that fact with two distinct adapters.**
+  A 2026-07-14 probe on this beta.21 pin shows that an explicitly selected v2
+  MergeInsert plan (`use_index(false)`) over the exact unenforced PK emits
+  `Some(KeyExistenceFilter)`: a fresh insert and fresh-key
+  `WhenMatched::Fail` populate the Bloom filter, while a matched-only
+  partial-schema UpdateAll + DoNothing emits a semantically empty filter rather
+  than `None`. A mismatched ON set emits `None`; when all ON columns have scalar
+  indexes and `use_index` remains enabled, Lance selects legacy v1, which also
+  emits `None`. Conflict resolution is directional: filtered-current conflicts
+  with committed unfiltered Update or Append, but current unfiltered Update or
+  Append can rebase after a committed filtered Update. The surface guards pin
+  both orders so a future symmetry or route change forces an alignment audit.
+
+  Internal schema v6 creates every graph node/edge table with exact non-null
+  physical `id` as Lance's unenforced PK. General production StrictInsert and
+  Upsert use a sealed MergeInsert adapter that forces beta.21's v2 route and
+  verifies the resulting filter covers exactly the physical `id` field.
+  StrictInsert first performs one exact probe against its pinned parent; after
+  a pure insertion effect is staged it mints the durable transaction property
+  `omnigraph.insert_absence=v1`. Upsert never changes semantics to obtain the
+  optimization, but an all-new result may mint the same property when Lance's
+  completed `MergeStats` prove one attempt inserted all source rows with zero
+  updates, deletes, or skipped duplicates. Certification is optional: an
+  Upsert or historical transaction without it remains correct and simply
+  cannot use the shortcut.
+  The mint additionally proves that the filter encodes exactly every source
+  `id` and that the fragments account for the same number of physical rows.
+
+  BranchMerge admits the proven route only for a complete, contiguous
+  base-to-source v1 chain. Every persisted transaction must name the exact
+  parent and carry the full pure-insert `Operation::Update` shape: no removed or
+  updated fragments, nonempty new fragments with `physical_rows`, no modified
+  fields or merged generations, `RewriteRows`, no updated offsets, the exact
+  `id` filter, and `fields_for_preserving_frag_bitmap` equal to the complete
+  nested schema preorder. The chain's physical-row sum must equal the observed
+  inserted delta. Final under-gate checks fence both source and target native
+  branch identifiers, including same-version delete/recreate ABA. Missing,
+  cleaned, unknown-version, malformed, or otherwise incomplete proof falls
+  back to the general ordered row diff; it is never partially trusted.
+
+  The proven publisher does **not** run MergeInsert. Its opaque,
+  batch-owning `ProvenInsertChunk` binds the classifier's rows to one target
+  version, complete schema, stable-row-id mode, and chunk index; a structural
+  guard keeps its only production mint site in the complete-history classifier.
+  `InsertBuilder::execute_uncommitted` stages immutable data fragments, after
+  which OmniGraph replaces the temporary uncommitted Append operation with the
+  exact-`id` filter-bearing `Update` above and re-mints v1. No target exact-ID
+  preflight, target merge join, or Append transaction is committed. Because
+  the output is itself a valid certificate link, the proof composes across a
+  second merge generation. Generic data-table `stage_append` and
+  `stage_merge_insert` remain test-only primitives.
+
+  Both routes preserve the fixed resource/recovery boundary: Mutation/Load
+  keeps one keyed transaction per table and refuses more than 8,192 rows / 32
+  MiB before arm, while BranchMerge records row/byte-bounded chunks in an
+  ordered recovery chain capped at 1,024 logical data transactions per table.
+  The source-interval scanner deliberately does not enable beta.21
+  `strict_batch_size`: Lance's `StrictBatchSizeStream` concatenates solely to a
+  row count (which `LANCE_DEFAULT_BATCH_SIZE` may override) and ignores the byte
+  target while accumulating. OmniGraph's lazy normalizer hard-bounds each
+  emitted/writer chunk and retains only one raw emission plus bounded working
+  pieces; Lance's approximate raw `batch_size_bytes` emission remains covered
+  by the full-process RSS gate. The proven adapter avoids beta.21's full
+  DataFusion merge join and its unbounded pool; the general adapter still uses
+  that join for rows requiring target comparison. Exact recovery's separate
+  1,026-version scan reserves one derived-index tail and one restore.
+  `MergeInsertBuilder` exposes no `WriteParams` hook, so the general keyed
+  adapter cannot enable `allow_external_blob_outside_bases`: it pre-sums
+  external URI ranges/object sizes under the 32 MiB ceiling and materializes
+  accepted payloads. Overwrite does accept `WriteParams` and retains external
+  references. Because Lance's retryable class is broader than exact key
+  overlap, an effect-free general StrictInsert conflict becomes `KeyConflict`
+  only after a fresh manifest-visible probe finds an attempted ID. This is an
+  intentional beta.21-compatible closure, not an assumption that the indexed
+  path is filtered.
+
+  The certificate is an internal, non-cryptographic capability. A raw Lance
+  writer can omit or forge the transaction property and is outside OmniGraph's
+  supported graph-writer topology; the certificate does not authenticate
+  foreign history. The genuine v5↔v6 binary rebuild/refusal run passed on
+  2026-07-15. The corrected five-pair full-lifecycle production series now also
+  passes both fixed gates: at 10K × 256, the median operation ratio was
+  **3.875×** and maximum paired RSS overhead was **24,297,472 bytes**; at
+  100K × 256, the ratio was **136/35 ≈ 3.886×** and maximum overhead was
+  **32,604,160 bytes**. Every production trial reported zero target strict-
+  insert preflights, zero MergeInsert calls, zero ordered-diff scans, and exact
+  content. The earlier 30.0×/108,625,920-byte production failure remains the
+  evidence that motivated this certificate/InsertBuilder split. These
+  measurements validate the present pin; a later Lance route or transaction-
+  serialization change must rerun them.
 - **Index construction gained correctness and bounded-resource fixes:** beta.17
   prevents an FTS builder thread-pool deadlock and bounds tail-partition merge
   memory; beta.18 fixes a streaming IVF training hang; beta.19 caps nullable
@@ -240,9 +374,13 @@ Behavior-affecting findings in this audit:
   improving the warm-access shape without changing branch identity or commit
   semantics.
 
-The existing Lance surface guards plus the canonical workspace and failpoint
-suites are the compatibility gate for this pin. Keep the beta.15 audit below as
-historical provenance for the larger 7.0 → 9.0 migration.
+The Lance surface guards, including the RFC-023 route and conflict-order probes,
+plus the canonical workspace and failpoint suites are the compatibility gate
+for this pin. The engine-level source guard, PK-lifecycle tests, concurrency
+tests, and recovery failpoints separately prove how v6 consumes that substrate.
+Keep the beta.15 audit below as historical provenance for the larger 7.0 → 9.0
+migration. A substrate guard records current Lance truth; it does not replace
+format, cross-version, or measured-cost evidence.
 
 ### Prior alignment audit: 2026-07-05 (Lance 9.0.0-beta.15 upstream; omnigraph pinned at 9.0.0-beta.15 via git rev)
 

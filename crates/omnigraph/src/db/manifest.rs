@@ -34,7 +34,7 @@ mod state;
 
 use graph::{init_manifest_graph, open_manifest_graph, snapshot_state_at};
 pub(crate) use layout::manifest_uri;
-use layout::{open_manifest_dataset, table_uri_for_path, type_name_hash};
+use layout::{open_manifest_dataset, table_uri_for_path};
 pub(crate) use metadata::TableVersionMetadata;
 #[cfg(test)]
 use metadata::{OMNIGRAPH_ROW_COUNT_KEY, table_version_metadata_for_state};
@@ -42,17 +42,20 @@ use metadata::{OMNIGRAPH_ROW_COUNT_KEY, table_version_metadata_for_state};
 use namespace::{branch_manifest_namespace, staged_table_namespace};
 pub(crate) use publisher::{GraphHeadExpectation, LineageIntent, PublishPrecondition};
 use publisher::{GraphNamespacePublisher, ManifestBatchPublisher, PublishOutcome};
+#[cfg(test)]
+pub(crate) use recovery::MAX_EFFECT_IDENTITY_SCAN_VERSIONS;
 pub(crate) use recovery::{
-    HealPendingOutcome, RecoveryAuthorityToken, RecoveryBranchMergeEffect,
-    RecoveryBranchMergeEffectKind, RecoveryLineageIntent, RecoveryManifestDelta, RecoveryMode,
-    RecoverySchemaApplyEffect, RecoverySchemaApplyEffectKind, RecoverySidecar,
-    RecoverySidecarHandle, RecoveryTableUpdateSlot, SidecarKind, SidecarTablePin,
-    SidecarTableRegistration, SidecarTombstone, confirm_branch_merge_sidecar_phase_b,
-    confirm_ensure_indices_sidecar_v8, confirm_occ_sidecar_phase_b,
-    confirm_schema_apply_sidecar_v7, delete_sidecar, ensure_read_only_schema_coherent,
-    heal_pending_sidecars_roll_forward, list_sidecars, new_branch_merge_sidecar,
-    new_ensure_indices_sidecar_v8, new_occ_sidecar, new_schema_apply_sidecar_v7, new_sidecar,
-    recover_manifest_drift, schema_apply_serial_queue_key, write_sidecar,
+    HealPendingOutcome, MAX_BRANCH_MERGE_DATA_TRANSACTIONS, RecoveryAuthorityToken,
+    RecoveryBranchMergeEffect, RecoveryBranchMergeEffectKind, RecoveryLineageIntent,
+    RecoveryManifestDelta, RecoveryMode, RecoverySchemaApplyEffect, RecoverySchemaApplyEffectKind,
+    RecoverySidecar, RecoverySidecarHandle, RecoveryTableUpdateSlot, SidecarKind, SidecarTablePin,
+    SidecarTableRegistration, SidecarTableRename, SidecarTombstone,
+    confirm_branch_merge_sidecar_v9, confirm_ensure_indices_sidecar_v9, confirm_occ_sidecar_v9,
+    confirm_schema_apply_sidecar_v9, delete_sidecar, ensure_read_only_schema_coherent,
+    finalize_effect_free_occ_sidecar, heal_pending_sidecars_roll_forward, list_sidecars,
+    new_branch_merge_sidecar_v9, new_ensure_indices_sidecar_v9, new_occ_sidecar_v9,
+    new_optimize_sidecar_v9, new_schema_apply_sidecar_v9, recover_manifest_drift,
+    schema_apply_serial_queue_key, write_sidecar,
 };
 pub use state::SubTableEntry;
 #[cfg(test)]
@@ -186,6 +189,30 @@ impl SnapshotScanner {
         self
     }
 
+    /// Set the requested number of rows returned in one scan batch.
+    ///
+    /// Lance's byte-based batch target overrides this setting unless
+    /// [`Self::strict_batch_size`] is also enabled.
+    pub fn batch_size(&mut self, batch_size: usize) -> &mut Self {
+        self.scanner.batch_size(batch_size);
+        self
+    }
+
+    /// Set the approximate in-memory byte target for one scan batch.
+    pub fn batch_size_bytes(&mut self, batch_size_bytes: u64) -> &mut Self {
+        self.scanner.batch_size_bytes(batch_size_bytes);
+        self
+    }
+
+    /// Require full output batches to contain exactly the requested row count.
+    ///
+    /// The final batch may contain fewer rows. This restores a hard output-row
+    /// ceiling when [`Self::batch_size_bytes`] is also configured.
+    pub fn strict_batch_size(&mut self, strict_batch_size: bool) -> &mut Self {
+        self.scanner.strict_batch_size(strict_batch_size);
+        self
+    }
+
     /// Apply a row limit and offset.
     pub fn limit(&mut self, limit: Option<i64>, offset: Option<i64>) -> Result<&mut Self> {
         self.scanner
@@ -280,6 +307,65 @@ impl SnapshotTable {
 }
 
 impl Snapshot {
+    /// Bind the current accepted catalog's aliases onto a historical snapshot
+    /// by immutable table identity for query execution.
+    ///
+    /// Public historical snapshots retain their original aliases. This method
+    /// is used only on the operation-local copy behind `run_query_at` and an
+    /// explicit snapshot-target query, whose source is typechecked against the
+    /// current catalog. A pure type rename can therefore address the same old
+    /// table lifetime under its current name. Conversely, a reused name whose
+    /// current identity is absent from the historical snapshot is removed from
+    /// the execution view, preventing cross-incarnation adoption.
+    pub(crate) fn bind_catalog_aliases(&mut self, catalog: &Catalog) -> Result<()> {
+        // Freeze the historical identity map before changing any aliases. A
+        // renamed-away alias may later be reused by a new live type; resolving
+        // that replacement first must not remove the only entry needed to bind
+        // the original identity under its current renamed alias.
+        let historical_by_identity = self
+            .entries
+            .values()
+            .cloned()
+            .map(|entry| (entry.identity, entry))
+            .collect::<HashMap<_, _>>();
+        let schema_ir = catalog.bound_schema_ir().ok_or_else(|| {
+            OmniError::manifest_internal(
+                "historical query alias binding requires an identity-bound catalog".to_string(),
+            )
+        })?;
+        let table_aliases = schema_ir
+            .nodes
+            .iter()
+            .map(|node| {
+                (
+                    format!("node:{}", node.name),
+                    node.type_id.get(),
+                    node.table_incarnation_id.get(),
+                )
+            })
+            .chain(schema_ir.edges.iter().map(|edge| {
+                (
+                    format!("edge:{}", edge.name),
+                    edge.type_id.get(),
+                    edge.table_incarnation_id.get(),
+                )
+            }))
+            .collect::<Vec<_>>();
+
+        for (table_key, stable_table_id, incarnation_id) in table_aliases {
+            let identity = TableIdentity::new(stable_table_id, incarnation_id)?;
+
+            // An exact alias belonging to another lifetime is actively unsafe:
+            // remove it before looking for this catalog type's identity under a
+            // historical name.
+            self.entries.remove(&table_key);
+            if let Some(entry) = historical_by_identity.get(&identity) {
+                self.entries.insert(table_key, entry.clone());
+            }
+        }
+        Ok(())
+    }
+
     /// Open a sub-table dataset at its pinned version. With read caches present
     /// (live Branch reads), reuse a held handle through the cache (0 open IO on a
     /// warm repeat) and the shared `Session`; otherwise plain-open (Fix 2).
@@ -377,24 +463,100 @@ impl SubTableUpdate {
     }
 }
 
-#[derive(Debug, Clone)]
+/// Immutable graph-level identity of one physical table lifetime.
+///
+/// `stable_table_id` survives supported type renames. Dropping and re-adding a
+/// type mints a new `table_incarnation_id`, so old version and tombstone rows
+/// can never alias the replacement even when it reuses the same display name.
+/// Both components are non-zero; zero remains the sentinel for "no table" in
+/// external formats and is never persisted on a table-bearing manifest row.
+#[derive(
+    Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, serde::Serialize, serde::Deserialize,
+)]
+pub(crate) struct TableIdentity {
+    pub(crate) stable_table_id: u64,
+    pub(crate) table_incarnation_id: u64,
+}
+
+impl TableIdentity {
+    pub(crate) fn new(stable_table_id: u64, table_incarnation_id: u64) -> Result<Self> {
+        let identity = Self {
+            stable_table_id,
+            table_incarnation_id,
+        };
+        identity.validate()?;
+        Ok(identity)
+    }
+
+    pub(crate) fn validate(self) -> Result<()> {
+        if self.stable_table_id == 0 || self.table_incarnation_id == 0 {
+            return Err(OmniError::manifest(format!(
+                "table identity components must be non-zero (stable_table_id={}, \
+                 table_incarnation_id={})",
+                self.stable_table_id, self.table_incarnation_id
+            )));
+        }
+        Ok(())
+    }
+}
+
+impl std::fmt::Display for TableIdentity {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "{:016x}:{:016x}",
+            self.stable_table_id, self.table_incarnation_id
+        )
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct TableRegistration {
+    pub(crate) identity: TableIdentity,
     pub(crate) table_key: String,
     pub(crate) table_path: String,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct TableTombstone {
+    pub(crate) identity: TableIdentity,
     pub(crate) table_key: String,
     pub(crate) tombstone_version: u64,
+}
+
+/// Metadata-only rebinding of one live table identity to a new alias.
+///
+/// `table_path` is the path the caller observed. The publisher requires it to
+/// equal the currently registered path and rewrites only the registration row;
+/// no `table_version` row is emitted, so the Lance version is preserved.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct TableRename {
+    pub(crate) identity: TableIdentity,
+    pub(crate) expected_table_key: String,
+    pub(crate) table_key: String,
+    pub(crate) table_path: String,
 }
 
 #[derive(Debug, Clone)]
 pub(crate) enum ManifestChange {
     Update(SubTableUpdate),
     RegisterTable(TableRegistration),
+    RenameTable(TableRename),
     Tombstone(TableTombstone),
 }
+
+/// One table-version authority assertion supplied to a publish attempt.
+///
+/// The map key is the immutable table identity. `table_key` is retained only
+/// as a diagnostic binding and is itself checked, so a caller prepared before a
+/// metadata-only rename cannot accidentally publish against the renamed table.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct TableVersionExpectation {
+    pub(crate) table_key: String,
+    pub(crate) table_version: u64,
+}
+
+pub(crate) type ExpectedTableVersions = HashMap<TableIdentity, TableVersionExpectation>;
 
 impl SubTableEntry {
     /// Open this sub-table at its pinned version directly by location (Fix 2),
@@ -432,12 +594,18 @@ impl SubTableEntry {
     }
 }
 
-pub(crate) fn table_path_for_table_key(table_key: &str) -> Result<String> {
-    if let Some(type_name) = table_key.strip_prefix("node:") {
-        return Ok(format!("nodes/{}", type_name_hash(type_name)));
+pub(crate) fn table_path_for_identity(table_key: &str, identity: TableIdentity) -> Result<String> {
+    if table_key.strip_prefix("node:").is_some() {
+        return Ok(format!(
+            "nodes/{:016x}-{:016x}",
+            identity.stable_table_id, identity.table_incarnation_id
+        ));
     }
-    if let Some(type_name) = table_key.strip_prefix("edge:") {
-        return Ok(format!("edges/{}", type_name_hash(type_name)));
+    if table_key.strip_prefix("edge:").is_some() {
+        return Ok(format!(
+            "edges/{:016x}-{:016x}",
+            identity.stable_table_id, identity.table_incarnation_id
+        ));
     }
     Err(OmniError::manifest(format!(
         "invalid table key '{}'",
@@ -448,6 +616,7 @@ pub(crate) fn table_path_for_table_key(table_key: &str) -> Result<String> {
 /// An update to apply to the manifest via `commit`.
 #[derive(Debug, Clone)]
 pub struct SubTableUpdate {
+    pub(crate) identity: TableIdentity,
     pub table_key: String,
     pub table_version: u64,
     pub table_branch: Option<String>,
@@ -609,13 +778,13 @@ impl ManifestCoordinator {
     /// Same as [`commit`], but with caller-supplied per-table expected
     /// versions used for optimistic concurrency control. Each entry asserts
     /// the manifest's current latest non-tombstoned `table_version` for that
-    /// `table_key` is exactly what the caller observed; mismatches surface
+    /// table identity is exactly what the caller observed; mismatches surface
     /// as `OmniError::Manifest` with `ManifestConflictDetails::ExpectedVersionMismatch`.
     #[cfg(test)]
     pub(crate) async fn commit_with_expected(
         &mut self,
         updates: &[SubTableUpdate],
-        expected_table_versions: &HashMap<String, u64>,
+        expected_table_versions: &ExpectedTableVersions,
     ) -> Result<u64> {
         let changes = updates
             .iter()
@@ -636,7 +805,7 @@ impl ManifestCoordinator {
     pub(crate) async fn commit_changes_with_expected(
         &mut self,
         changes: &[ManifestChange],
-        expected_table_versions: &HashMap<String, u64>,
+        expected_table_versions: &ExpectedTableVersions,
     ) -> Result<u64> {
         Ok(self
             .commit_changes_with_lineage(changes, expected_table_versions, None)
@@ -656,7 +825,7 @@ impl ManifestCoordinator {
     pub(crate) async fn commit_changes_with_lineage(
         &mut self,
         changes: &[ManifestChange],
-        expected_table_versions: &HashMap<String, u64>,
+        expected_table_versions: &ExpectedTableVersions,
         lineage: Option<&LineageIntent>,
     ) -> Result<CommitOutcome> {
         self.commit_changes_with_lineage_and_precondition(
@@ -673,7 +842,7 @@ impl ManifestCoordinator {
     pub(crate) async fn commit_changes_with_lineage_and_precondition(
         &mut self,
         changes: &[ManifestChange],
-        expected_table_versions: &HashMap<String, u64>,
+        expected_table_versions: &ExpectedTableVersions,
         lineage: Option<&LineageIntent>,
         precondition: &PublishPrecondition,
     ) -> Result<CommitOutcome> {

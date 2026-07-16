@@ -3,6 +3,7 @@ mod helpers;
 use omnigraph::changes::{ChangeFilter, ChangeOp, EntityKind};
 use omnigraph::db::commit_graph::CommitGraph;
 use omnigraph::db::{MergeOutcome, Omnigraph, ReadTarget};
+use omnigraph::loader::LoadMode;
 
 use helpers::*;
 
@@ -57,6 +58,97 @@ async fn diff_empty_when_nothing_changed() {
     assert_eq!(cs.stats.inserts, 0);
     assert_eq!(cs.stats.updates, 0);
     assert_eq!(cs.stats.deletes, 0);
+}
+
+#[tokio::test]
+async fn diff_pairs_type_renames_by_identity_and_separates_reincarnations() {
+    let dir = tempfile::tempdir().unwrap();
+    let uri = dir.path().to_str().unwrap();
+    let db = Omnigraph::init(
+        uri,
+        r#"
+node Person { name: String @key }
+node Anchor { name: String @key }
+"#,
+    )
+    .await
+    .unwrap();
+    db.load(
+        "main",
+        r#"{"type":"Person","data":{"name":"Alice"}}"#,
+        LoadMode::Merge,
+    )
+    .await
+    .unwrap();
+    let before_rename = snapshot_id(&db, "main").await.unwrap();
+
+    db.apply_schema(
+        r#"
+node Human @rename_from("Person") { name: String @key }
+node Anchor { name: String @key }
+"#,
+    )
+    .await
+    .unwrap();
+    let after_rename = snapshot_id(&db, "main").await.unwrap();
+
+    let rename_diff = db
+        .diff_between(
+            ReadTarget::Snapshot(before_rename),
+            ReadTarget::Snapshot(after_rename.clone()),
+            &ChangeFilter::default(),
+        )
+        .await
+        .unwrap();
+    assert!(
+        rename_diff.changes.is_empty(),
+        "a pure alias change on one table identity must not become delete+insert: {:?}",
+        change_tuples(&rename_diff)
+    );
+
+    // Drop the renamed type, then independently declare the same public name.
+    // The replacement is a new logical lifetime even though the alias matches.
+    db.apply_schema("node Anchor { name: String @key }")
+        .await
+        .unwrap();
+    db.apply_schema(
+        r#"
+node Human { name: String @key }
+node Anchor { name: String @key }
+"#,
+    )
+    .await
+    .unwrap();
+    db.load(
+        "main",
+        r#"{"type":"Human","data":{"name":"Bob"}}"#,
+        LoadMode::Merge,
+    )
+    .await
+    .unwrap();
+
+    let reincarnation_diff = diff_since_branch(&db, "main", after_rename, &ChangeFilter::default())
+        .await
+        .unwrap();
+    assert_eq!(
+        change_tuples(&reincarnation_diff),
+        vec![
+            (
+                "node:Human".to_string(),
+                "Alice".to_string(),
+                ChangeOp::Delete,
+            ),
+            (
+                "node:Human".to_string(),
+                "Bob".to_string(),
+                ChangeOp::Insert,
+            ),
+        ],
+        "drop/re-add under one alias must report the old lifetime's deletes and the new lifetime's inserts"
+    );
+    assert_eq!(reincarnation_diff.stats.deletes, 1);
+    assert_eq!(reincarnation_diff.stats.inserts, 1);
+    assert_eq!(reincarnation_diff.stats.updates, 0);
 }
 
 #[tokio::test]

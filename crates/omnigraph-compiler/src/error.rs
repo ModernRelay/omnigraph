@@ -1,5 +1,23 @@
 use thiserror::Error;
 
+#[derive(Debug, Error)]
+pub enum SchemaIdentityError {
+    #[error("invalid schema identity domain: {0}")]
+    InvalidDomain(String),
+
+    #[error("schema identity id for {entity} must be nonzero (got {value})")]
+    ZeroId { entity: String, value: u64 },
+
+    #[error("schema identity allocator is exhausted")]
+    AllocatorExhausted,
+
+    #[error("invalid accepted SchemaIR: {0}")]
+    InvalidIr(String),
+
+    #[error("schema identity resolution failed: {0}")]
+    Resolution(String),
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct SourceSpan {
     pub start: usize,
@@ -116,6 +134,9 @@ pub enum CompilerError {
 
     #[error("manifest error: {0}")]
     Manifest(String),
+
+    #[error(transparent)]
+    SchemaIdentity(#[from] SchemaIdentityError),
 }
 
 #[deprecated(note = "use CompilerError")]

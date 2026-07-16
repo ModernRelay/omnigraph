@@ -32,6 +32,21 @@ The below-CURRENT refusal names the release line that wrote the stamp
 the exact `export` / `init` / `load` commands, so the upgrade is fail-closed **and**
 self-service — the operator can fetch the right old binary without guessing.
 
+Internal schema v5 was the RFC-028 identity boundary: SchemaIR v2, its graph
+identity domain and allocator, and the identity-keyed manifest journal activate
+together. A v4 graph cannot be backfilled safely because its logical IDs,
+registration keys, paths, versions, and tombstones are all name-derived; the
+normal strand rebuild mints a fresh domain and table incarnations instead.
+
+Internal schema **v6 is the currently served format** and maps to OmniGraph
+**0.10.x**. It preserves the v5 identity contract and activates RFC-023 key
+fencing: every graph node/edge dataset declares exactly non-null physical `id`
+as Lance's unenforced primary key from creation, and production strict
+insert/upsert routes use the exact-`id` filter-bearing adapter. A v5/0.9.x graph
+is not annotated or migrated in place; export it with the v5 binary, initialize
+a different v6 root, and load through the v6 writer. Because
+`MIN_SUPPORTED == CURRENT == 6`, v6 refuses v5 and a v5 binary refuses v6.
+
 There is no in-place migration dispatcher. The single source file
 `db/manifest/migrations.rs` holds only the version constant, the stamp read/write,
 and `refuse_if_stamp_unsupported`.
@@ -67,6 +82,13 @@ The CLI↔server boundary is the opposite case: clients and servers are deployed
 independently and a hard gate there would force lockstep redeploys for every field
 addition. So that axis is additive — old and new coexist — and the OpenAPI-drift test
 is the guard that a change stayed additive rather than breaking the shape.
+RFC-023 follows that rule: `ErrorOutput.key_conflict` is optional, and its
+`key` member remains optional on the wire for additive compatibility. The v6
+engine returns `KeyConflict` only after a fresh exact-ID probe identifies an
+attempted key; Lance's broader retryable conflict class is not serialized as a
+key conflict without that evidence. `ErrorOutput.resource_limit` is likewise
+optional and additive; v6 servers use it with HTTP 413 for pre-arm keyed-write
+ceilings.
 
 ## When you change each axis
 

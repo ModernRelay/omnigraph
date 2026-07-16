@@ -3,9 +3,10 @@
 //! Engine code (`exec/`, `db/omnigraph/`, `loader/`, `changes/`) MUST NOT
 //! call Lance's inline-commit data-write APIs directly. The
 //! `Storage` trait (`crate::storage_layer::TableStorage`) is the canonical
-//! surface; staged primitives (`stage_append`, `stage_merge_insert`,
-//! `stage_overwrite`, `stage_create_indices`) plus `commit_staged` are the only
-//! way to advance Lance HEAD.
+//! surface; graph rows route through the exact-id `stage_keyed_write` adapter,
+//! while the remaining staged primitives plus `commit_staged` are the only way
+//! to advance Lance HEAD. Bare `stage_append` is compiled only for private
+//! primitive tests, never as a graph-visible keyed route.
 //!
 //! The raw storage modules are crate-private and the trait is sealed (only
 //! `TableStore` implements it), so Rust visibility is the primary boundary.
@@ -174,7 +175,6 @@ enum WriteProtocol {
     TestOnly,
     Bootstrap,
     RecoveryExecutor,
-    LegacySchemaBootstrap,
     ReadOnlyAccess,
 }
 
@@ -191,18 +191,17 @@ impl WriteProtocol {
             Self::TestOnly => "test/failpoint-only".into(),
             Self::Bootstrap => "bootstrap".into(),
             Self::RecoveryExecutor => "recovery executor".into(),
-            Self::LegacySchemaBootstrap => "legacy schema bootstrap".into(),
             Self::ReadOnlyAccess => "read-only raw snapshot access".into(),
         }
     }
 }
 
-const MUTATION_V3: WriteProtocol = WriteProtocol::Exact("Mutation v3");
-const LOAD_V3: WriteProtocol = WriteProtocol::Exact("Load v3");
-const SCHEMA_V7: WriteProtocol = WriteProtocol::Exact("SchemaApply v7");
-const MERGE_V4: WriteProtocol = WriteProtocol::Exact("BranchMerge v4");
-const INDICES_V8: WriteProtocol = WriteProtocol::Exact("EnsureIndices v8");
-const OPTIMIZE_V2: WriteProtocol = WriteProtocol::Bounded("Optimize v2");
+const MUTATION_V9: WriteProtocol = WriteProtocol::Exact("Mutation v9");
+const LOAD_V9: WriteProtocol = WriteProtocol::Exact("Load v9");
+const SCHEMA_V9: WriteProtocol = WriteProtocol::Exact("SchemaApply v9");
+const MERGE_V9: WriteProtocol = WriteProtocol::Exact("BranchMerge v9");
+const INDICES_V9: WriteProtocol = WriteProtocol::Exact("EnsureIndices v9");
+const OPTIMIZE_V9: WriteProtocol = WriteProtocol::Bounded("Optimize v9");
 
 #[derive(Debug, Clone, Copy)]
 struct WriteSurface {
@@ -222,16 +221,15 @@ macro_rules! write_surfaces {
 write_surfaces! {
     "db/omnigraph.rs" => WriteProtocol::Bootstrap => ["init", "init_with_options"],
     "db/omnigraph.rs" => WriteProtocol::RecoveryExecutor => ["open", "open_with_storage", "refresh"],
-    "db/omnigraph.rs" => WriteProtocol::LegacySchemaBootstrap => ["open_read_only"],
-    "exec/mutation.rs" => MUTATION_V3 => ["mutate", "mutate_as"],
-    "loader/mod.rs" => LOAD_V3 => ["load_jsonl", "load_jsonl_file", "load", "load_file"],
-    "loader/mod.rs" => WriteProtocol::Composed("optional branch create, then Load v3") => ["load_as", "load_file_as"],
-    "loader/mod.rs" => WriteProtocol::Composed("branch create when absent, then Load v3 alias") => ["ingest", "ingest_as", "ingest_file", "ingest_file_as"],
-    "db/omnigraph.rs" => WriteProtocol::Composed("SchemaApply v7 + sentinel ref + optional hard-drop GC") => ["apply_schema", "apply_schema_with_options", "apply_schema_as", "apply_schema_as_with_catalog_check"],
-    "exec/merge.rs" => MERGE_V4 => ["branch_merge", "branch_merge_as"],
-    "db/omnigraph.rs" => INDICES_V8 => ["ensure_indices", "ensure_indices_on"],
+    "exec/mutation.rs" => MUTATION_V9 => ["mutate", "mutate_as"],
+    "loader/mod.rs" => LOAD_V9 => ["load_jsonl", "load_jsonl_file", "load", "load_file"],
+    "loader/mod.rs" => WriteProtocol::Composed("optional branch create, then Load v9") => ["load_as", "load_file_as"],
+    "loader/mod.rs" => WriteProtocol::Composed("branch create when absent, then Load v9 alias") => ["ingest", "ingest_as", "ingest_file", "ingest_file_as"],
+    "db/omnigraph.rs" => WriteProtocol::Composed("SchemaApply v9 + sentinel ref + optional hard-drop GC") => ["apply_schema", "apply_schema_with_options", "apply_schema_as", "apply_schema_as_with_catalog_check"],
+    "exec/merge.rs" => MERGE_V9 => ["branch_merge", "branch_merge_as"],
+    "db/omnigraph.rs" => INDICES_V9 => ["ensure_indices", "ensure_indices_on"],
     "db/omnigraph.rs" => WriteProtocol::TestOnly => ["failpoint_publish_table_head_without_index_rebuild_for_test"],
-    "db/omnigraph.rs" => OPTIMIZE_V2 => ["optimize"],
+    "db/omnigraph.rs" => OPTIMIZE_V9 => ["optimize"],
     "db/omnigraph.rs" => WriteProtocol::ManifestAdoption => ["repair"],
     "db/omnigraph.rs" => WriteProtocol::PhysicalOnly => ["cleanup"],
     "db/omnigraph.rs" => WriteProtocol::NativeRefControl => ["branch_create", "branch_create_as", "branch_create_from", "branch_create_from_as", "branch_delete", "branch_delete_as"],
@@ -243,6 +241,7 @@ write_surfaces! {
 // name-independent: a newly named `transact`, `publish`, or `vacuum` method
 // cannot evade discovery.
 const READ_ONLY_SURFACES: &[(&str, &str)] = &[
+    ("db/omnigraph.rs", "open_read_only"),
     ("db/omnigraph.rs", "plan_schema"),
     ("db/omnigraph.rs", "plan_schema_with_options"),
     ("db/omnigraph.rs", "preview_schema_apply_with_options"),
@@ -285,6 +284,11 @@ const LOW_LEVEL_READ_ONLY_SURFACES: &[(&str, &str, &str)] = &[
         "db/graph_coordinator.rs",
         "GraphCoordinator",
         "probe_latest_incarnation",
+    ),
+    (
+        "db/graph_coordinator.rs",
+        "GraphCoordinator",
+        "load_commits",
     ),
     (
         "db/graph_coordinator.rs",
@@ -460,7 +464,7 @@ macro_rules! gateway_surfaces {
 // or an entirely new primitive name before a crate-internal caller can use it.
 gateway_surfaces! {
     "storage.rs" => "StorageAdapter" => GatewayDisposition::ReadOrPure => [
-        "read_text", "exists", "list_dir", "read_text_versioned",
+        "read_text", "read_text_if_exists", "exists", "list_dir", "read_text_versioned",
     ],
     "storage.rs" => "StorageAdapter" => GatewayDisposition::Durable(WriteProtocol::Composed("object storage primitive")) => [
         "write_text", "write_text_if_absent", "rename_text", "delete",
@@ -474,10 +478,13 @@ gateway_surfaces! {
         "scan_with_staged", "scan_with_pending", "scan_with_pending_materialized_blobs",
         "first_row_id_for_filter", "table_state", "has_btree_index",
         "has_fts_index", "has_vector_index", "root_uri", "dataset_uri", "scan_stream",
+        "scan_stream_bounded", "scan_stream_for_rewrite_bounded",
+        "scan_proven_insert_delta_bounded",
+        "prepare_keyed_write_batch", "validate_keyed_write_batch", "first_existing_id",
     ],
     "storage_layer.rs" => "TableStorage" => GatewayDisposition::StageOnly => [
-        "stage_create", "stage_append", "stage_append_stream", "stage_merge_insert",
-        "stage_overwrite", "stage_delete", "stage_create_indices",
+        "stage_create", "stage_keyed_write", "stage_proven_strict_insert", "stage_overwrite",
+        "stage_delete", "stage_create_indices",
     ],
     "storage_layer.rs" => "TableStorage" => GatewayDisposition::Durable(WriteProtocol::Composed("first-touch native ref")) => [
         "fork_branch_from_state",
@@ -498,17 +505,21 @@ gateway_surfaces! {
         "new", "root_uri", "dataset_uri", "open_snapshot_table", "open_at_entry",
         "open_dataset_head", "list_branches", "ensure_expected_version",
         "reopen_for_mutation", "scan_batches", "scan_batches_for_rewrite",
-        "scan_stream_for_rewrite", "materialize_blob_batch", "scan_stream",
+        "scan_stream_for_rewrite", "scan_stream_for_rewrite_bounded",
+        "scan_proven_insert_delta_bounded",
+        "materialize_blob_batch", "scan_stream", "scan_stream_bounded",
         "scan_stream_with", "scan", "scan_with", "scan_edges_by_endpoint",
         "key_column_index_coverage", "has_unindexed_fragments", "count_rows",
         "dataset_version", "table_state", "scan_with_staged", "scan_with_pending",
         "scan_with_pending_materialized_blobs", "count_rows_with_staged",
         "has_btree_index", "has_btree_index_on", "has_fts_index", "has_fts_index_on",
         "has_vector_index", "has_vector_index_on", "first_row_id_for_filter",
+        "prepare_keyed_write_batch", "validate_keyed_write_batch", "first_existing_id",
+        "materialize_blob_batch_bounded",
     ],
     "table_store.rs" => "TableStore" => GatewayDisposition::StageOnly => [
-        "stage_create", "stage_append", "stage_append_stream", "stage_merge_insert",
-        "stage_overwrite", "stage_delete", "stage_create_indices",
+        "stage_create", "stage_keyed_write", "stage_proven_strict_insert", "stage_overwrite",
+        "stage_delete", "stage_create_indices",
     ],
     "table_store.rs" => "TableStore" => GatewayDisposition::Durable(WriteProtocol::Composed("first-touch native ref")) => [
         "fork_branch_from_state",
@@ -580,49 +591,48 @@ durable_calls! {
     ("storage_layer.rs", ".commit_staged_create_exact(", 1, WriteProtocol::Exact("sealed TableStorage create forwarding")),
     ("storage_layer.rs", ".commit_staged(", 1, WriteProtocol::Composed("sealed TableStorage forwarding")),
     ("storage_layer.rs", ".commit_staged_exact(", 1, WriteProtocol::Exact("sealed TableStorage forwarding")),
-    ("storage_layer.rs", ".dataset()", 23, WriteProtocol::Composed("sealed TableStorage forwarding")),
-    ("storage_layer.rs", ".into_arc()", 3, WriteProtocol::Composed("sealed TableStorage forwarding")),
+    ("storage_layer.rs", ".dataset()", 25, WriteProtocol::Composed("sealed TableStorage forwarding")),
+    ("storage_layer.rs", ".into_arc()", 4, WriteProtocol::Composed("sealed TableStorage forwarding")),
     ("storage_layer.rs", "SnapshotHandle::new(", 3, WriteProtocol::Composed("sealed TableStorage forwarding")),
     ("table_store.rs", ".raw_dataset_append(", 1, WriteProtocol::EphemeralScratch),
     ("table_store.rs", "Dataset::write(", 2, WriteProtocol::EphemeralScratch),
     ("table_store.rs", "DeleteBuilder::new(", 1, WriteProtocol::Composed("staged delete primitive")),
-    ("table_store.rs", "InsertBuilder::new(", 4, WriteProtocol::Composed("staged insert primitive")),
+    ("table_store.rs", "InsertBuilder::new(", 3, WriteProtocol::Composed("staged insert primitive")),
     ("table_store.rs", "MergeInsertBuilder::try_new(", 1, WriteProtocol::Composed("staged merge primitive")),
     ("table_store.rs", "CommitBuilder::new(", 2, WriteProtocol::Composed("staged commit primitive")),
     ("table_store.rs", ".create_index_builder(", 3, WriteProtocol::Composed("staged index primitive")),
     ("table_store.rs", ".execute_uncommitted(", 8, WriteProtocol::Composed("staged physical primitive")),
-    ("table_store.rs", ".execute_uncommitted_stream(", 1, WriteProtocol::Composed("staged physical primitive")),
-    ("exec/staging.rs", "write_sidecar(", 1, WriteProtocol::Exact("Mutation/Load v3")),
-    ("exec/merge.rs", "write_sidecar(", 1, MERGE_V4),
-    ("db/omnigraph/schema_apply.rs", "write_sidecar(", 1, SCHEMA_V7),
-    ("db/omnigraph/table_ops.rs", "write_sidecar(", 1, INDICES_V8),
-    ("db/omnigraph/optimize.rs", "write_sidecar(", 1, OPTIMIZE_V2),
-    ("exec/staging.rs", ".commit_staged_exact(", 1, WriteProtocol::Exact("Mutation/Load v3")),
-    ("exec/merge.rs", ".commit_staged_exact(", 1, MERGE_V4),
-    ("db/omnigraph/schema_apply.rs", ".commit_staged_create_exact(", 2, SCHEMA_V7),
-    ("db/omnigraph/schema_apply.rs", ".commit_staged_exact(", 1, SCHEMA_V7),
-    ("db/omnigraph/table_ops.rs", ".commit_staged_exact(", 1, INDICES_V8),
+    ("exec/staging.rs", "write_sidecar(", 1, WriteProtocol::Exact("Mutation/Load v9")),
+    ("exec/merge.rs", "write_sidecar(", 1, MERGE_V9),
+    ("db/omnigraph/schema_apply.rs", "write_sidecar(", 1, SCHEMA_V9),
+    ("db/omnigraph/table_ops.rs", "write_sidecar(", 1, INDICES_V9),
+    ("db/omnigraph/optimize.rs", "write_sidecar(", 1, OPTIMIZE_V9),
+    ("exec/staging.rs", ".commit_staged_exact(", 1, WriteProtocol::Exact("Mutation/Load v9")),
+    ("exec/merge.rs", ".commit_staged_exact(", 1, MERGE_V9),
+    ("db/omnigraph/schema_apply.rs", ".commit_staged_create_exact(", 1, SCHEMA_V9),
+    ("db/omnigraph/schema_apply.rs", ".commit_staged_exact(", 1, SCHEMA_V9),
+    ("db/omnigraph/table_ops.rs", ".commit_staged_exact(", 1, INDICES_V9),
     ("db/omnigraph/table_ops.rs", ".commit_staged(", 1, WriteProtocol::Composed("shared merge/Optimize index tail")),
     ("db/omnigraph/table_ops.rs", ".fork_branch_from_state(", 1, WriteProtocol::Composed("adapter-owned first-touch data ref")),
-    ("exec/staging.rs", "confirm_occ_sidecar_phase_b(", 1, WriteProtocol::Exact("Mutation/Load v3")),
-    ("exec/merge.rs", "confirm_branch_merge_sidecar_phase_b(", 1, MERGE_V4),
-    ("db/omnigraph/schema_apply.rs", "confirm_schema_apply_sidecar_v7(", 1, SCHEMA_V7),
-    ("db/omnigraph/table_ops.rs", "confirm_ensure_indices_sidecar_v8(", 1, INDICES_V8),
-    ("exec/mutation.rs", "delete_sidecar(", 1, MUTATION_V3),
-    ("loader/mod.rs", "delete_sidecar(", 1, LOAD_V3),
-    ("exec/merge.rs", "delete_sidecar(", 1, MERGE_V4),
-    ("db/omnigraph/schema_apply.rs", "delete_sidecar(", 1, SCHEMA_V7),
-    ("db/omnigraph/table_ops.rs", "delete_sidecar(", 1, INDICES_V8),
-    ("db/omnigraph/optimize.rs", "delete_sidecar(", 1, OPTIMIZE_V2),
-    ("exec/mutation.rs", "commit_updates_on_branch_with_expected(", 1, MUTATION_V3),
-    ("loader/mod.rs", "commit_updates_on_branch_with_expected(", 1, LOAD_V3),
-    ("exec/merge.rs", "commit_updates_on_branch_with_expected(", 1, MERGE_V4),
+    ("exec/staging.rs", "confirm_occ_sidecar_v9(", 1, WriteProtocol::Exact("Mutation/Load v9")),
+    ("exec/merge.rs", "confirm_branch_merge_sidecar_v9(", 1, MERGE_V9),
+    ("db/omnigraph/schema_apply.rs", "confirm_schema_apply_sidecar_v9(", 1, SCHEMA_V9),
+    ("db/omnigraph/table_ops.rs", "confirm_ensure_indices_sidecar_v9(", 1, INDICES_V9),
+    ("exec/mutation.rs", "delete_sidecar(", 1, MUTATION_V9),
+    ("loader/mod.rs", "delete_sidecar(", 1, LOAD_V9),
+    ("exec/merge.rs", "delete_sidecar(", 1, MERGE_V9),
+    ("db/omnigraph/schema_apply.rs", "delete_sidecar(", 1, SCHEMA_V9),
+    ("db/omnigraph/table_ops.rs", "delete_sidecar(", 1, INDICES_V9),
+    ("db/omnigraph/optimize.rs", "delete_sidecar(", 1, OPTIMIZE_V9),
+    ("exec/mutation.rs", "commit_updates_on_branch_with_expected(", 1, MUTATION_V9),
+    ("loader/mod.rs", "commit_updates_on_branch_with_expected(", 1, LOAD_V9),
+    ("exec/merge.rs", "commit_updates_on_branch_with_expected(", 1, MERGE_V9),
     ("db/omnigraph.rs", "commit_updates_on_branch_with_expected(", 1, WriteProtocol::Exact("shared publisher wrapper")),
     ("db/omnigraph/table_ops.rs", "commit_updates_on_branch_with_expected(", 1, WriteProtocol::Exact("shared publisher")),
     ("db/omnigraph/table_ops.rs", ".commit_changes_with_intent_and_expected(", 2, WriteProtocol::Exact("shared publisher")),
-    ("db/omnigraph/schema_apply.rs", ".commit_changes_with_intent_and_expected(", 1, SCHEMA_V7),
+    ("db/omnigraph/schema_apply.rs", ".commit_changes_with_intent_and_expected(", 1, SCHEMA_V9),
     ("db/omnigraph/repair.rs", ".commit_updates_with_actor_with_expected(", 1, WriteProtocol::ManifestAdoption),
-    ("db/omnigraph/optimize.rs", ".commit_updates_with_actor_with_expected(", 1, OPTIMIZE_V2),
+    ("db/omnigraph/optimize.rs", ".commit_updates_with_actor_with_expected(", 1, OPTIMIZE_V9),
     ("db/graph_coordinator.rs", ".commit_changes_with_intent_and_expected(", 1, WriteProtocol::Exact("publisher gateway")),
     ("db/graph_coordinator.rs", ".commit_changes_with_lineage_and_precondition(", 1, WriteProtocol::Exact("lowest manifest publisher gateway")),
     ("db/manifest.rs", ".publish_with_precondition(", 1, WriteProtocol::Exact("lowest manifest publisher gateway")),
@@ -631,7 +641,7 @@ durable_calls! {
     ("db/omnigraph.rs", ".write_text(", 1, WriteProtocol::Bootstrap),
     ("db/schema_state.rs", ".write_text(", 2, WriteProtocol::Composed("schema state publication")),
     ("db/manifest/recovery.rs", ".write_text(", 6, WriteProtocol::RecoveryExecutor),
-    ("db/omnigraph/schema_apply.rs", ".write_text(", 1, SCHEMA_V7),
+    ("db/omnigraph/schema_apply.rs", ".write_text(", 1, SCHEMA_V9),
     ("db/omnigraph.rs", ".delete(", 1, WriteProtocol::Bootstrap),
     ("db/schema_state.rs", ".delete(", 3, WriteProtocol::Composed("schema staging cleanup")),
     ("db/schema_state.rs", ".rename_text(", 1, WriteProtocol::Composed("schema staging promotion")),
@@ -642,18 +652,17 @@ durable_calls! {
     ("db/omnigraph.rs", "heal_pending_sidecars_roll_forward(", 2, WriteProtocol::RecoveryExecutor),
     ("db/omnigraph.rs", "recover_schema_state_files(", 2, WriteProtocol::RecoveryExecutor),
     ("db/manifest/recovery.rs", "recover_schema_state_files(", 1, WriteProtocol::RecoveryExecutor),
-    ("db/omnigraph.rs", "load_or_bootstrap_schema_contract(", 2, WriteProtocol::LegacySchemaBootstrap),
-    ("db/omnigraph/optimize.rs", "compact_files(", 2, WriteProtocol::Composed("Optimize v2 data + physical manifest compaction")),
-    ("db/omnigraph/optimize.rs", ".optimize_indices(", 1, OPTIMIZE_V2),
+    ("db/omnigraph/optimize.rs", "compact_files(", 2, WriteProtocol::Composed("Optimize v9 data + physical manifest compaction")),
+    ("db/omnigraph/optimize.rs", ".optimize_indices(", 1, OPTIMIZE_V9),
     ("db/omnigraph/optimize.rs", ".update_config(", 1, WriteProtocol::PhysicalOnly),
     ("db/omnigraph/optimize.rs", "cleanup_old_versions(", 1, WriteProtocol::PhysicalOnly),
     ("db/omnigraph/schema_apply.rs", "cleanup_old_versions(", 1, WriteProtocol::Composed("SchemaApply hard-drop GC")),
-    ("db/omnigraph/schema_apply.rs", "write_schema_contract_staging(", 1, SCHEMA_V7),
-    ("db/omnigraph/schema_apply.rs", "promote_exact_schema_staging(", 1, SCHEMA_V7),
+    ("db/omnigraph/schema_apply.rs", "write_schema_contract_staging(", 1, SCHEMA_V9),
+    ("db/omnigraph/schema_apply.rs", "promote_exact_schema_staging(", 1, SCHEMA_V9),
     ("db/omnigraph.rs", ".branch_create(", 2, WriteProtocol::NativeRefControl),
     ("db/omnigraph.rs", ".branch_delete(", 1, WriteProtocol::NativeRefControl),
-    ("db/omnigraph/schema_apply.rs", ".branch_create(", 1, SCHEMA_V7),
-    ("db/omnigraph/schema_apply.rs", ".branch_delete(", 1, SCHEMA_V7),
+    ("db/omnigraph/schema_apply.rs", ".branch_create(", 1, SCHEMA_V9),
+    ("db/omnigraph/schema_apply.rs", ".branch_delete(", 1, SCHEMA_V9),
     ("db/graph_coordinator.rs", ".create_branch(", 1, WriteProtocol::NativeRefControl),
     ("db/graph_coordinator.rs", ".delete_branch(", 1, WriteProtocol::NativeRefControl),
     ("branch_control.rs", ".create_branch(", 1, WriteProtocol::Composed("graph/data native refs")),
@@ -670,7 +679,7 @@ durable_calls! {
     ("db/manifest/recovery.rs", "publish_recovery_commit(", 8, WriteProtocol::RecoveryExecutor),
     ("db/manifest/recovery.rs", "restore_table_to_version(", 3, WriteProtocol::RecoveryExecutor),
     ("db/manifest/recovery.rs", "record_audit(", 9, WriteProtocol::RecoveryExecutor),
-    ("db/manifest/recovery.rs", "delete_sidecar_by_operation_id(", 18, WriteProtocol::RecoveryExecutor),
+    ("db/manifest/recovery.rs", "delete_sidecar_by_operation_id(", 19, WriteProtocol::RecoveryExecutor),
     ("db/manifest/recovery.rs", "delete_sidecar(", 1, WriteProtocol::RecoveryExecutor),
     ("db/recovery_audit.rs", ".raw_dataset_append(", 1, WriteProtocol::RecoveryExecutor),
     ("db/recovery_audit.rs", "Dataset::write(", 1, WriteProtocol::RecoveryExecutor),
@@ -682,20 +691,20 @@ durable_calls! {
     ("db/omnigraph.rs", ".into_arc()", 1, WriteProtocol::ReadOnlyAccess),
     ("db/omnigraph/table_ops.rs", ".dataset()", 1, WriteProtocol::ReadOnlyAccess),
     ("db/omnigraph/export.rs", ".dataset()", 1, WriteProtocol::ReadOnlyAccess),
-    ("db/omnigraph/schema_apply.rs", ".dataset()", 1, SCHEMA_V7),
+    ("db/omnigraph/schema_apply.rs", ".dataset()", 1, SCHEMA_V9),
     ("db/omnigraph/repair.rs", ".dataset()", 1, WriteProtocol::ManifestAdoption),
-    ("db/omnigraph/optimize.rs", ".dataset()", 5, WriteProtocol::Composed("Optimize v2 planning + physical cleanup")),
-    ("db/omnigraph/optimize.rs", ".into_dataset()", 2, OPTIMIZE_V2),
-    ("db/omnigraph/optimize.rs", "SnapshotHandle::new(", 1, OPTIMIZE_V2),
-    ("exec/merge.rs", "SnapshotHandle::new(", 4, MERGE_V4),
+    ("db/omnigraph/optimize.rs", ".dataset()", 5, WriteProtocol::Composed("Optimize v9 planning + physical cleanup")),
+    ("db/omnigraph/optimize.rs", ".into_dataset()", 2, OPTIMIZE_V9),
+    ("db/omnigraph/optimize.rs", "SnapshotHandle::new(", 1, OPTIMIZE_V9),
+    ("exec/merge.rs", "SnapshotHandle::new(", 5, MERGE_V9),
 }
 
 const DURABLE_PRIMITIVES: &[&str] = &[
     "write_sidecar(",
-    "confirm_occ_sidecar_phase_b(",
-    "confirm_branch_merge_sidecar_phase_b(",
-    "confirm_schema_apply_sidecar_v7(",
-    "confirm_ensure_indices_sidecar_v8(",
+    "confirm_occ_sidecar_v9(",
+    "confirm_branch_merge_sidecar_v9(",
+    "confirm_schema_apply_sidecar_v9(",
+    "confirm_ensure_indices_sidecar_v9(",
     "delete_sidecar(",
     ".commit_staged_create_exact(",
     ".commit_staged_exact(",
@@ -721,7 +730,6 @@ const DURABLE_PRIMITIVES: &[&str] = &[
     "recover_manifest_drift(",
     "heal_pending_sidecars_roll_forward(",
     "recover_schema_state_files(",
-    "load_or_bootstrap_schema_contract(",
     "compact_files(",
     ".optimize_indices(",
     "cleanup_old_versions(",
@@ -1530,6 +1538,85 @@ fn callable_storage_and_manifest_gateway_surfaces_are_registered() {
         missing.is_empty() && unregistered.is_empty(),
         "callable storage/manifest gateway registry drifted. Missing definitions: {missing:?}. \
          Unclassified callable methods: {unregistered:?}"
+    );
+}
+
+/// RFC-023 closes the keyed-Append side door at the source boundary. The raw
+/// append primitives are test-only behind the sealed storage adapter; every
+/// production graph writer must select the exact-id fenced adapter.
+///
+/// This walks syntax rather than text, so comments and test-only fixtures do
+/// not weaken the guard. A future call from mutation, load, branch merge, or a
+/// newly-added production module fails here even if it is added to another
+/// protocol allow-list.
+#[test]
+fn graph_visible_keyed_writes_cannot_reach_unfenced_append() {
+    let src = engine_src_root();
+    let mut violations = Vec::new();
+    for file in protocol_scan_files(&src) {
+        let relative = relative_to_src(&src, &file);
+        // This is the one sealed forwarding boundary. TableStore's inherent
+        // implementation and its cfg(test) primitive coverage contain no
+        // graph-facing call site.
+        if relative == "storage_layer.rs" {
+            continue;
+        }
+        let contents = std::fs::read_to_string(&file)
+            .unwrap_or_else(|error| panic!("failed to read {}: {error}", file.display()));
+        let ast = parse_rust_source(&contents, &relative);
+        let inventory = call_inventory(&ast);
+        for primitive in ["stage_append", "stage_append_stream"] {
+            let count = inventory.counts.get(primitive).copied().unwrap_or(0);
+            if count > 0 {
+                violations.push(format!("{relative}: {primitive} called {count} time(s)"));
+            }
+        }
+    }
+
+    assert!(
+        violations.is_empty(),
+        "graph-visible writes must use the exact-id fenced adapter; bare append call sites found:\n  {}",
+        violations.join("\n  ")
+    );
+}
+
+/// Removing the proven adapter's own target lookup makes its opaque chunk a
+/// correctness capability. Pin the sole production mint to the branch-merge
+/// history classifier/physical replay module; primitive tests may construct
+/// chunks directly, but no other production caller may admit one.
+#[test]
+fn proven_insert_capability_has_one_production_mint_site() {
+    let src = engine_src_root();
+    let mut sites = Vec::new();
+    for file in protocol_scan_files(&src) {
+        let relative = relative_to_src(&src, &file);
+        if relative.contains("/staged_tests.rs") || relative.ends_with("staged_tests.rs") {
+            continue;
+        }
+        let contents = std::fs::read_to_string(&file)
+            .unwrap_or_else(|error| panic!("failed to read {}: {error}", file.display()));
+        let ast = parse_rust_source(&contents, &relative);
+        let count = call_inventory(&ast)
+            .counts
+            .get("from_verified_history")
+            .copied()
+            .unwrap_or(0);
+        if count > 0 {
+            sites.push((relative, count));
+        }
+    }
+    assert_eq!(
+        sites,
+        vec![("exec/merge.rs".to_string(), 1)],
+        "ProvenInsertChunk admission must remain exclusive to verified branch-merge history"
+    );
+
+    let merge = std::fs::read_to_string(src.join("exec/merge.rs"))
+        .expect("read branch-merge implementation for capability-route guard");
+    assert_eq!(
+        merge.matches("KeyedChunkStage::ProvenStrictInsert").count(),
+        2,
+        "the proven staging mode must appear only in its shared-loop match arm and the verified pure-insert publisher; another admission caller would bypass the constructor-site count"
     );
 }
 

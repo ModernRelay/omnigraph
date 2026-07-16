@@ -1,8 +1,13 @@
 # RFC NNNN: <title>
 
+> This template is for the public contribution track. See
+> [README.md](README.md#maintainer-design-series-lifecycle)
+> for the separately versioned maintainer design-series lifecycle.
+
 | | |
 |---|---|
 | **Status** | Proposed |
+| **Author track** | Public contribution |
 | **Author(s)** | <your name / handle> |
 | **Discussion** | <link to the originating Discussion, if any> |
 | **Implementation** | <issue/PR links, filled in as work lands> |

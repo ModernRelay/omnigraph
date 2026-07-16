@@ -514,7 +514,8 @@ deferred (see below); they do not block the model.
    policy-gated, audited, single-coordinator — with `direct` retained only as
    break-glass (`repair` when the server is down). Runs out-of-band (a worker +
    async job routes, the `POST …` / `GET …/{id}` shape of the bulk-data-plane RFC
-   (`docs/rfcs/0001-bulk-data-plane.md`, PR #219, not yet merged)), never inline in
+   proposed in [closed PR #219](https://github.com/ModernRelay/omnigraph/pull/219),
+   which never landed in `docs/rfcs/`), never inline in
    serving; `schema plan` is
    excluded (≈ `cluster plan` in cluster mode). The **mechanism** (job routes,
    worker, scheduling) is a follow-up RFC; until it lands the capability table above
@@ -571,9 +572,10 @@ keyed credentials; RFC-008 demoted `omnigraph.yaml`; RFC-009 unified execution
 behind `GraphClient`; RFC-010 declared the planes. This RFC removes the last
 legacy addressing surface so the plane model becomes a clean function of the three
 real entities, and folds the planes into a single capability rule. It is adjacent
-to the public-track bulk-data-plane RFC (`docs/rfcs/0001-bulk-data-plane.md`,
-PR #219, not yet merged), which canonicalizes `load`/`export` verbs; this RFC
-canonicalizes how every verb *addresses* a graph.
+to the bulk-data-plane proposal in
+[closed PR #219](https://github.com/ModernRelay/omnigraph/pull/219), which never
+landed in the RFC directory and would have canonicalized `load`/`export` verbs;
+this RFC canonicalizes how every verb *addresses* a graph.
 
 ## Appendix: target CLI taxonomy (end state)
 

@@ -66,11 +66,11 @@ flowchart TB
         coord[coordinator<br/>ManifestCoordinator · CommitGraph]:::l2
     end
 
-    subgraph storage[storage trait — wraps Lance]
-        ts[table_store · storage.rs<br/>direct lance::Dataset today]:::l2
+    subgraph storage[storage boundary — wraps Lance]
+        ts[sealed TableStorage writes<br/>read-only snapshot facade]:::l2
     end
 
-    subgraph lance_layer[Lance 4.x — substrate]
+    subgraph lance_layer[Lance 9.x — substrate]
         lance[per-dataset versions, fragments<br/>BTREE · Inverted FTS · IVF/HNSW vector<br/>merge_insert · compact_files · cleanup_old_versions]:::l1
     end
 
@@ -86,7 +86,10 @@ flowchart TB
     lance_layer -- bytes --> object_store
 ```
 
-The storage seam is partly aspirational. `TableStorage` exists as the sealed staged-write trait, but capability/stat surfaces and full call-site migration are still roadmap. The diagram shows the intended boundary.
+The write-side storage seam is enforced: supported data-table write effects route
+through the sealed `TableStorage` staging surface, with Optimize as the documented
+bounded maintenance exception. Read, capability, and statistics surfaces are not
+yet one complete substrate trait; that planner-facing boundary remains roadmap.
 
 ## Component zoom-ins
 
@@ -192,7 +195,7 @@ op-N → push batch
 stage_all: concat batches → one exact stage_* transaction per table (no HEAD move)
 commit_all: acquire schema → branch → sorted-table gates
             → reject a new recovery intent → revalidate the complete branch token
-            → arm schema-v3 recovery → commit_staged per table
+            → arm identity-bearing v9 recovery → commit_staged per table
 publisher: publish pre-minted lineage under the exact native-branch/head + table precondition
 ```
 
@@ -200,7 +203,7 @@ A failed op leaves Lance HEAD untouched on the staged tables. If authority
 changes before effects, insert-only mutations and Append/Merge loads discard the
 whole attempt and fully reprepare with a bounded retry; Update/Delete/Overwrite
 returns `ReadSetChanged`. After any physical effect, any later error returns
-`RecoveryRequired` and leaves the v3 sidecar to converge the fixed outcome.
+`RecoveryRequired` and leaves the v9 sidecar to converge the fixed outcome.
 Concrete contracts:
 
 - `D₂` parse-time rule: a query is either insert/update-only or
@@ -230,25 +233,24 @@ flowchart LR
     classDef future fill:#fff,stroke:#888,stroke-dasharray:5 5,color:#444
 
     subgraph today[Today]
-        d1[table_store<br/>opens lance::Dataset directly]:::now
-        d2[storage.rs<br/>S3 / file URI plumbing]:::now
+        d1[sealed TableStorage<br/>staged write primitives]:::now
+        d2[TableStore + snapshots<br/>private Lance reads]:::now
     end
 
-    subgraph roadmap[Roadmap - storage capabilities]
-        t[trait Dataset<br/>schema · stats · placement<br/>capabilities · scan · write]:::future
-        impl1[LanceStorage]:::future
-        impl2[future test impl]:::future
+    subgraph roadmap[Roadmap - planner-facing capabilities]
+        t[read/capability surface<br/>schema · stats · placement<br/>pushdown support]:::future
+        impl1[Lance-backed implementation]:::future
     end
 
     today -.-> roadmap
     t --> impl1
-    t --> impl2
 ```
 
 The staged-write trait exists today as `TableStorage`, implemented by
 `TableStore`. Every staged-capable graph-visible effect routes through its
-primitives; Optimize remains the documented bounded schema-v2 Lance-maintenance
-exception because its compaction/index-fold APIs have no stable public
+primitives; Optimize remains the documented exception: its identity-bearing v9
+envelope carries a bounded Lance-maintenance payload because the
+compaction/index-fold APIs have no stable public
 caller-controlled transaction form. The final storage-trait
 inline residual was removed when full-table vector index creation moved into
 `stage_create_indices`. Capability and statistics surfaces remain roadmap, so
@@ -263,7 +265,7 @@ flowchart LR
     classDef future fill:#fff,stroke:#888,stroke-dasharray:5 5,color:#444
 
     subgraph today[Today]
-        ei[ensure_indices<br/>omnigraph.rs:445]:::now
+        ei[ensure_indices]:::now
         manual[called manually<br/>or from optimize]:::now
     end
 
@@ -282,12 +284,11 @@ Today, physical indexes are built explicitly via `ensure_indices`/`optimize`;
 schema apply, mutation, and load only record intent or publish their exact data
 effects and never build indexes inline. EnsureIndices batches every missing
 BTREE, FTS, and full-table vector artifact for one table into one staged Lance
-`CreateIndex` transaction. Its schema-v8 recovery intent captures exact
+`CreateIndex` transaction. Its identity-bearing v9 recovery intent captures exact
 branch/schema authority, fixed original and rollback lineage, the complete
-manifest delta, and first-touch ref ownership before publication. Schema-v6
-sidecars remain readable with their original loose compatibility semantics.
-Optimize is separate: its compaction/index-coverage fold uses the bounded
-schema-v2 maintenance adapter within the single-writer-process recovery boundary.
+manifest delta, and first-touch ref ownership before publication. Optimize is
+separate: its compaction/index-coverage fold uses a bounded payload inside the
+same v9 identity envelope within the single-writer-process recovery boundary.
 Reads degrade gracefully when index coverage is missing or
 partial — Lance's scanner unions indexed and scan paths automatically (vector
 search falls back to brute force). A future background reconciler may automate
@@ -347,7 +348,7 @@ Throughout the docs, capabilities are split into:
 - **MVCC**: every Lance write bumps a per-dataset version; the OmniGraph manifest version coordinates which sub-table versions are visible together.
 - **Snapshot isolation**: a query holds one `Snapshot` for its lifetime; concurrent writes don't leak in.
 - **Cross-branch isolation**: Lance copy-on-write keeps branch data independent, and readers never acquire write gates. Enrolled writer preparation can overlap across branches, but their effect/publish windows currently share one exclusive root schema gate before the branch/table gates, so those windows serialize in-process even for different branches.
-- **Per-query staging**: `mutate_as` and every `load` mode accumulate their work in an in-memory `MutationStaging`; `stage_all` prepares exact per-table transactions without moving HEAD. At commit, the root schema → branch → sorted-table gates protect complete-token revalidation, v3 recovery arming, zero-retry table effects, and one atomic manifest publish. A mid-query failure leaves Lance HEAD untouched on staged tables. (MR-794 / RFC-022; pre-v0.4.0 used a `__run__<id>` staging branch + Run state machine, removed in MR-771.)
+- **Per-query staging**: `mutate_as` and every `load` mode accumulate their work in an in-memory `MutationStaging`; `stage_all` prepares exact per-table transactions without moving HEAD. At commit, the root schema → branch → sorted-table gates protect complete-token revalidation, v9 recovery arming (with the retained `protocol_v3` mutation/load payload), zero-retry table effects, and one atomic manifest publish. A mid-query failure leaves Lance HEAD untouched on staged tables. (MR-794 / RFC-022; pre-v0.4.0 used a `__run__<id>` staging branch + Run state machine, removed in MR-771.)
 - **Schema-apply lock**: `__schema_apply_lock__` system branch serializes schema migrations.
 - **Fail-points** (`failpoints` cargo feature): `failpoints::maybe_fail("operation.step")?` in `branch_create`, publish, etc., for deterministic failure injection in tests.
 

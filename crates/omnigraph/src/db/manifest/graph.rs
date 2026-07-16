@@ -1,22 +1,24 @@
 use std::collections::HashMap;
 
 use arrow_array::{RecordBatch, RecordBatchIterator};
-use arrow_schema::SchemaRef;
+use arrow_schema::{Field, Schema, SchemaRef};
 use lance::Dataset;
 use lance::dataset::{WriteMode, WriteParams};
+use lance::datatypes::{LANCE_UNENFORCED_PRIMARY_KEY, LANCE_UNENFORCED_PRIMARY_KEY_POSITION};
 use lance_file::version::LanceFileVersion;
 use omnigraph_compiler::catalog::Catalog;
 
 use crate::error::{OmniError, Result};
 
 use super::TABLE_VERSION_MANAGEMENT_KEY;
-use super::layout::{manifest_uri, open_manifest_dataset, type_name_hash};
+use super::layout::{manifest_uri, open_manifest_dataset};
 use super::metadata::TableVersionMetadata;
 use super::migrations::stamp_current_version;
 use super::state::{
     GraphLineageRow, ManifestState, SubTableEntry, entries_to_batch, graph_lineage_row_parts,
     manifest_schema, read_manifest_state,
 };
+use super::{TableIdentity, table_path_for_identity};
 
 /// The manifest version the init `Dataset::write` produces (Lance datasets start
 /// at version one). The genesis graph commit pins this version — a snapshot at
@@ -96,20 +98,36 @@ pub(super) async fn snapshot_state_at(
 async fn build_initial_entries(
     root_uri: &str,
     catalog: &Catalog,
-) -> Result<(Vec<SubTableEntry>, HashMap<String, String>)> {
+) -> Result<(Vec<SubTableEntry>, HashMap<TableIdentity, String>)> {
     let mut entries = Vec::new();
     let mut version_metadata = HashMap::new();
+    let accepted_ir = catalog.bound_schema_ir().ok_or_else(|| {
+        OmniError::manifest_internal(
+            "manifest initialization requires an identity-bound accepted catalog",
+        )
+    })?;
 
     for (name, node_type) in &catalog.node_types {
-        let hash = type_name_hash(name);
-        let table_path = format!("nodes/{}", hash);
+        let node_ir = accepted_ir
+            .nodes
+            .iter()
+            .find(|node| node.name == *name)
+            .ok_or_else(|| {
+                OmniError::manifest_internal(format!(
+                    "identity-bound catalog is missing node IR for '{name}'"
+                ))
+            })?;
+        let identity =
+            TableIdentity::new(node_ir.type_id.get(), node_ir.table_incarnation_id.get())?;
+        let table_key = format!("node:{}", name);
+        let table_path = table_path_for_identity(&table_key, identity)?;
         let full_path = format!("{}/{}", root_uri, table_path);
 
         let ds = create_empty_dataset(&full_path, &node_type.arrow_schema).await?;
-        let table_key = format!("node:{}", name);
         let metadata = TableVersionMetadata::from_dataset(root_uri, &table_path, &ds)?;
 
         entries.push(SubTableEntry {
+            identity,
             table_key: table_key.clone(),
             table_path: table_path.clone(),
             table_version: ds.version().version,
@@ -117,19 +135,30 @@ async fn build_initial_entries(
             row_count: 0,
             version_metadata: metadata.clone(),
         });
-        version_metadata.insert(table_key, metadata.to_json_string()?);
+        version_metadata.insert(identity, metadata.to_json_string()?);
     }
 
     for (name, edge_type) in &catalog.edge_types {
-        let hash = type_name_hash(name);
-        let table_path = format!("edges/{}", hash);
+        let edge_ir = accepted_ir
+            .edges
+            .iter()
+            .find(|edge| edge.name == *name)
+            .ok_or_else(|| {
+                OmniError::manifest_internal(format!(
+                    "identity-bound catalog is missing edge IR for '{name}'"
+                ))
+            })?;
+        let identity =
+            TableIdentity::new(edge_ir.type_id.get(), edge_ir.table_incarnation_id.get())?;
+        let table_key = format!("edge:{}", name);
+        let table_path = table_path_for_identity(&table_key, identity)?;
         let full_path = format!("{}/{}", root_uri, table_path);
 
         let ds = create_empty_dataset(&full_path, &edge_type.arrow_schema).await?;
-        let table_key = format!("edge:{}", name);
         let metadata = TableVersionMetadata::from_dataset(root_uri, &table_path, &ds)?;
 
         entries.push(SubTableEntry {
+            identity,
             table_key: table_key.clone(),
             table_path: table_path.clone(),
             table_version: ds.version().version,
@@ -137,15 +166,21 @@ async fn build_initial_entries(
             row_count: 0,
             version_metadata: metadata.clone(),
         });
-        version_metadata.insert(table_key, metadata.to_json_string()?);
+        version_metadata.insert(identity, metadata.to_json_string()?);
     }
 
     Ok((entries, version_metadata))
 }
 
 async fn create_empty_dataset(uri: &str, schema: &SchemaRef) -> Result<Dataset> {
+    // Keep initialization self-contained even for manifest-level callers that
+    // construct an identity-bound compiler catalog directly in tests. Engine
+    // catalogs already carry this metadata, but there must never be a
+    // create-then-annotate window: Lance makes the PK metadata immutable after
+    // dataset creation and RFC-023 activates it only for new format-v6 graphs.
+    let schema = keyed_graph_table_schema(schema)?;
     let batch = RecordBatch::new_empty(schema.clone());
-    let reader = RecordBatchIterator::new(vec![Ok(batch)], schema.clone());
+    let reader = RecordBatchIterator::new(vec![Ok(batch)], schema);
     let params = WriteParams {
         mode: WriteMode::Create,
         enable_stable_row_ids: true,
@@ -158,4 +193,45 @@ async fn create_empty_dataset(uri: &str, schema: &SchemaRef) -> Result<Dataset> 
     Dataset::write(reader, uri, Some(params))
         .await
         .map_err(|e| OmniError::Lance(e.to_string()))
+}
+
+fn keyed_graph_table_schema(schema: &SchemaRef) -> Result<SchemaRef> {
+    let mut id_count = 0;
+    let fields = schema
+        .fields()
+        .iter()
+        .map(|field| {
+            let mut field = field.as_ref().clone();
+            let mut metadata = field.metadata().clone();
+            metadata.remove(LANCE_UNENFORCED_PRIMARY_KEY_POSITION);
+            if field.name() == "id" {
+                id_count += 1;
+                metadata.insert(LANCE_UNENFORCED_PRIMARY_KEY.to_string(), "true".to_string());
+            } else {
+                metadata.remove(LANCE_UNENFORCED_PRIMARY_KEY);
+            }
+            field.set_metadata(metadata);
+            field
+        })
+        .collect::<Vec<Field>>();
+
+    if id_count != 1 {
+        return Err(OmniError::manifest_internal(format!(
+            "graph table initialization requires exactly one top-level `id` field; found {id_count}"
+        )));
+    }
+    let id = fields
+        .iter()
+        .find(|field| field.name() == "id")
+        .expect("id_count == 1");
+    if id.is_nullable() {
+        return Err(OmniError::manifest_internal(
+            "graph table initialization requires a non-null `id` field",
+        ));
+    }
+
+    Ok(std::sync::Arc::new(Schema::new_with_metadata(
+        fields,
+        schema.metadata.clone(),
+    )))
 }

@@ -5,18 +5,21 @@ description: Research specification for replacing full-width branch-merge classi
 status: research-blocked
 tags: [eng, rfc, merge, lineage, change-feed, performance, lance, omnigraph]
 timestamp: 2026-07-10
-owner:
+owner: OmniGraph maintainers
 ---
 
 # RFC-027 — Lineage-based merge deltas
 
-**Status:** Research / blocked on deletion-delta discovery
+**Status:** Research blocked — deletion-delta discovery
 **Date:** 2026-07-10
-**Depends on:** [RFC-022](rfc-022-unified-write-path.md)'s unified branch-merge
+**Author track:** Maintainer design series
+**Depends on:** [RFC-022](0022-unified-write-path.md)'s unified branch-merge
 pipeline and capture-once write view
-**Surveyed:** omnigraph 0.8.1; Lance 9.0.0-beta.15 (`f24e42c1`)
+**Surveyed:** omnigraph 0.8.1; Lance 9.0.0-beta.21 at git rev
+`1aec14652dcbace23ac277fa8ced35000bea0c40`; full Lance row-lineage,
+transaction, branching, and read/write specifications
 **Audience:** merge, storage, and performance maintainers
-**Open architecture review:** [RFC-022–027 review ledger](../dev/rfc-022-027-architecture-review.md).
+**Open architecture review:** [RFC-022–028 review ledger](../dev/rfc-022-027-architecture-review.md).
 Findings marked **BLOCKER** must be dispositioned before acceptance.
 
 ---
@@ -126,8 +129,10 @@ not a dependency; the production surface must be public and pinned by
 
 Write immutable per-commit deleted-ID rows in the same manifest CAS as the graph
 commit. This is first-class commit metadata, not a side channel. It adds storage
-and format liability and therefore needs a separate format decision before use;
-it is not silently folded into v5.
+and format liability and therefore needs its own accepted format-capability
+decision, or an explicit co-release decision with independently accepted
+siblings, before use. It is not implicitly part of RFC-028's identity format or
+any other sibling's provisional format number.
 
 Until one option passes the cost and correctness gates, delete-bearing histories
 use the existing classifier. There is no "usually O(delta)" claim that excludes
@@ -251,4 +256,6 @@ required to catch an apparently correct path silently regressing to O(rows).
 | R5 | Make lineage default and consider cursor retirement | all fallbacks dispositioned; no physical gap can break merge |
 
 The RFC remains **research / blocked** through R2. Choosing an OmniGraph commit
-delta format in §4.3 requires its own format amendment before R3.
+delta format in §4.3 requires its own accepted format-capability decision before
+R3, including the strict rebuild and cross-version refusal contract or an
+explicitly tested co-release with another accepted capability.

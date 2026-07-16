@@ -2,26 +2,55 @@
 type: spec
 title: "RFC-022 — Unified graph-write protocol"
 description: One correctness protocol for graph-visible writes, with synchronous recovery, complete read-set arbitration, writer-specific physical-effect adapters, and explicit control-plane exceptions.
-status: draft
+status: implemented
 tags: [eng, rfc, write-path, manifest, recovery, concurrency, lance, omnigraph]
-timestamp: 2026-07-12
-owner:
+timestamp: 2026-07-13
+owner: OmniGraph maintainers
 ---
 
 # RFC-022: Unified graph-write protocol
 
-**Status:** Draft / for team review
+**Status:** Implemented on 2026-07-13
 **Date:** 2026-07-12
+**Author track:** Maintainer design series
 **Surveyed:** OmniGraph 0.8.1 (`main`); Lance 9.0.0-beta.21, git rev `1aec1465`
 **Audience:** engine and storage maintainers
-**Open architecture review:** [RFC-022–027 review ledger](../dev/rfc-022-027-architecture-review.md).
-Findings marked **BLOCKER** must be dispositioned before acceptance.
+**Architecture review:** [RFC-022–028 review ledger](../dev/rfc-022-027-architecture-review.md).
+RFC-022's structural rollout and lifecycle findings are closed; the ledger
+remains active for RFC-023–027.
+
+**Implementation evidence:** [#343](https://github.com/ModernRelay/omnigraph/pull/343),
+[#344](https://github.com/ModernRelay/omnigraph/pull/344),
+[#345](https://github.com/ModernRelay/omnigraph/pull/345),
+[#346](https://github.com/ModernRelay/omnigraph/pull/346),
+[#347](https://github.com/ModernRelay/omnigraph/pull/347),
+[#348](https://github.com/ModernRelay/omnigraph/pull/348),
+[#349](https://github.com/ModernRelay/omnigraph/pull/349),
+[#350](https://github.com/ModernRelay/omnigraph/pull/350),
+[#351](https://github.com/ModernRelay/omnigraph/pull/351), and
+[#353](https://github.com/ModernRelay/omnigraph/pull/353).
+
+Implementation is complete for the documented single-writer-process support
+boundary. This status does not claim distributed destructive recovery. Exact
+Optimize provenance remains trigger-gated by §6.4, and MemWAL fold enrollment
+remains owned by RFC-026.
+
+**RFC-028 activation update (2026-07-15):** internal manifest schema v5 wraps
+every active writer adapter in one identity-bearing recovery schema v9. The
+persisted payload field names (`protocol_v3`, `protocol_v4`, `protocol_v7`, and
+`protocol_v8`) retain the exact-effect shapes documented below, but their old
+sidecar-generation numbers are implementation history, not the active envelope.
+Every table pin/effect/delta carries stable table ID + incarnation; recovery
+never infers missing identity from an alias. SchemaApply type rename is now
+metadata-only on the same identity/path/version; only AddType is a first-touch
+create. Optimize retains bounded maintenance provenance inside v9 rather than
+claiming an exact caller-minted Lance maintenance transaction.
 
 ---
 
 ## 0. Summary
 
-OmniGraph will have one **correctness protocol** for every operation that changes
+OmniGraph has one **correctness protocol** for every operation that changes
 manifest-resolved graph state. The protocol does not require every writer to use
 the same Lance primitive. A mutation can commit one staged transaction per table,
 a branch merge can make several commits to a table, and optimize can use Lance
@@ -56,11 +85,11 @@ This RFC deliberately does not combine key fencing, durable table heads,
 checkpoint retention, MemWAL ingest, or lineage-based merge-delta discovery into
 one format and rollout. They are focused follow-ups:
 
-- [RFC-023 — Key-conflict fencing](rfc-023-key-conflict-fencing.md)
-- [RFC-024 — Durable table heads](rfc-024-durable-table-heads.md)
-- [RFC-025 — Checkpoint retention](rfc-025-checkpoint-retention.md)
-- [RFC-026 — MemWAL streaming ingest](rfc-026-memwal-streaming-ingest.md)
-- [RFC-027 — Lineage merge deltas](rfc-027-lineage-merge-deltas.md)
+- [RFC-023 — Key-conflict fencing](0023-key-conflict-fencing.md)
+- [RFC-024 — Durable table heads](0024-durable-table-heads.md)
+- [RFC-025 — Checkpoint retention](0025-checkpoint-retention.md)
+- [RFC-026 — MemWAL streaming ingest](0026-memwal-streaming-ingest.md)
+- [RFC-027 — Lineage merge deltas](0027-lineage-merge-deltas.md)
 
 ## 1. Scope and authority
 
@@ -486,10 +515,12 @@ able to enumerate every adapter and every entry point that invokes it.
 - A non-noop schema change still needs that recovery intent when it has no table
   effects: schema-contract staging and promotion are independently durable state,
   so an empty table-pin set means “metadata-only SchemaApply,” not “effect-free.”
-- Schema-v7 plans one exact Lance transaction identity per independently durable
-  effect: `Overwrite` for an existing table and a strict read-version-zero create
-  for each AddType/RenameType target. These commits use zero transparent conflict
-  retries; the achieved identity and version must equal the plan.
+- The active schema-v9 envelope's retained `protocol_v7` payload plans one exact
+  Lance transaction identity per independently durable effect: `Overwrite` for an
+  existing table and a strict read-version-zero create for each AddType target. A
+  pure type rename is metadata-only and preserves identity, path, version, and
+  index history. These commits use zero transparent conflict retries; the achieved
+  identity and version must equal the plan.
 - The durable sidecar starts `Armed`. After every exact table effect and all three
   schema staging files are durable, one sidecar replacement confirms the achieved
   identities and the complete registration/update/tombstone delta, transitioning
@@ -518,12 +549,11 @@ able to enumerate every adapter and every entry point that invokes it.
   overlaps publication waits for the fully promoted pair. This is process-local;
   a long-lived reader in another process still needs the distributed
   schema-publication fence called out in the remaining concurrency limitations.
-- Readers remain backward-compatible with schema-v5 bridge sidecars. Those files
-  retain their original target-hash plus Phase-C-confirmation semantics and loose
-  table classification; they are not reinterpreted as v7 exact intents. A
-  read-only opener admits a stale completed v5 sidecar only when its durable
-  manifest-published marker is true and its target identity is already live;
-  every active or ambiguous v5 state still defers to read-write recovery.
+- The parser retains historical schema-v5 bridge shapes for frozen fixtures, but
+  RFC-028 does not provide an in-place upgrade path for genuine pre-v9 artifacts:
+  those files lack explicit table identity and are refused before classification.
+  They are never reinterpreted as active `protocol_v7` ownership proof or admitted
+  by matching aliases, paths, target hashes, or versions.
 - Write the sidecar before the first table HEAD advance, including unenforced-PK
   metadata backfill or other inline metadata commits.
 - A branch-wide or graph-wide migration must enumerate every physical manifest/data
@@ -535,7 +565,8 @@ able to enumerate every adapter and every entry point that invokes it.
 - It records the exact achieved version rather than assuming one version of movement.
 - If the new data-table version is selected through `__manifest`, publishing that
   pointer is a graph-visible commit and uses this protocol.
-- EnsureIndices uses the exact schema-v8 adapter. It plans every missing BTREE,
+- EnsureIndices uses the active schema-v9 envelope with its retained exact
+  `protocol_v8` payload. It plans every missing BTREE,
   FTS, and full-table vector artifact for one table against one pinned base and
   combines them into one staged `Operation::CreateIndex`, so a touched table
   advances exactly once. Before effects it captures native branch + exact graph
@@ -543,16 +574,16 @@ able to enumerate every adapter and every entry point that invokes it.
   identity per table, and the complete table-pointer delta. First-touch named refs
   remain sidecar-before-ref and bind their exact Lance ref identity at
   confirmation.
-- `Armed` v8 effects are rollback-only. After every exact transaction lands at
+- `Armed` `protocol_v8` effects are rollback-only. After every exact transaction lands at
   `read_version + 1`, the writer atomically records `EffectsConfirmed` with the
   complete fixed delta; only that state may roll forward under the unchanged
   authority token. Foreign movement is never adopted, and an owned effect buried
   by a same-table winner fails closed.
-- Readers retain schema-v6 EnsureIndices sidecars under their original loose
-  classification, fixed rollback id, and durable rollback-audit semantics. A v6
-  file is a compatibility input, never reinterpreted as a v8 ownership proof.
-- Optimize uses one graph-wide visibility envelope through the bounded
-  schema-v2 maintenance adapter. After its broad entry probe it acquires
+- The parser retains schema-v6 EnsureIndices shapes as historical fixtures only.
+  A genuine identity-less v6 file is refused under RFC-028 and is never
+  reinterpreted as `protocol_v8` ownership proof or upgraded by alias inference.
+- Optimize uses one graph-wide schema-v9 identity envelope with a bounded
+  maintenance payload. After its broad entry probe it acquires
   schema → main branch → every accepted-catalog table gate, loads one
   operation-local accepted catalog, relists recovery, and plans productive work
   from a fresh snapshot. One multi-pin sidecar covers every productive table;
@@ -560,9 +591,9 @@ able to enumerate every adapter and every entry point that invokes it.
   every still-needed pointer and one lineage commit. Maintenance-class monotonicity
   is load-bearing: a current pointer already at or beyond an achieved version is
   omitted, not rejected by strict graph-head/read-set OCC. Post-arm failure leaves
-  the shared sidecar and returns `RecoveryRequired`; v2 Full recovery rolls a
+  the shared sidecar and returns `RecoveryRequired`; Full recovery rolls a
   complete effect set forward in one batch or compensates a partial set. Main stays
-  held through final physical `__manifest` compaction. The v2 reader has no
+  held through final physical `__manifest` compaction. The bounded payload has no
   transaction/authority/fixed-lineage proof, so this supported adapter remains
   inside the single-writer-process recovery boundary and is not a distributed
   fence. Replacing it with exact provenance is deliberately deferred until both
@@ -746,7 +777,7 @@ Retry rules are phase-specific:
 ## 10. Rollout and compatibility
 
 This RFC authorizes a protocol refactor, not a manifest v5 format moment. RFC-023
-through RFC-027 own their respective format and public-surface changes.
+through RFC-028 own their respective format and public-surface changes.
 
 It also does not require a mutable-tip `GraphState` singleton. Three measured,
 local latency fixes can land independently of the adapter conversion:
@@ -764,11 +795,11 @@ These are narrow access-shape fixes, not a second commit-input authority. They
 must preserve snapshot pinning and still cross the recovery/read-set barriers
 defined above.
 
-Implementation proceeds in this order:
+The implementation landed in this order:
 
-1. Introduce `PreparedWrite`, `ReadSet`, effect-adapter, and recovery-plan concepts
-   while preserving existing behavior.
-2. Ship conservative branch-wide arbitration first. Mutation/load captures
+1. `PreparedWrite`, `ReadSet`, effect-adapter, and recovery-plan concepts were
+   introduced while preserving existing behavior.
+2. Conservative branch-wide arbitration shipped first. Mutation/load captures
    `(Lance BranchIdentifier, exact optional graph_head, accepted schema identity)`;
    every publisher retry compares that token instead of reparenting. Because every
    supported graph-content and schema apply advances `graph_head:<branch>` before
@@ -780,12 +811,14 @@ Implementation proceeds in this order:
    probes remain until the narrowed read set replaces them.
 
    > **Implementation note (updated 2026-07-12):** mutation/load now use this coarse
-   > token, schema-v3 exact-effect sidecars, fixed lineage/rollback outcome ids,
+   > token, schema-v9 sidecars carrying the retained exact `protocol_v3` payload,
+   > fixed lineage/rollback outcome ids,
    > zero transparent Lance commit retries, and bounded full reprepare before
    > effects. Branch merge now captures an immutable source commit/snapshot and
    > the target coarse token, computes its merge base from those captured ids,
    > and revalidates target authority plus source incarnation under the ordered
-   > gates. Its schema-v4 recovery envelope distinguishes multi-commit HEAD
+   > gates. Its schema-v9 recovery envelope's retained `protocol_v4` payload
+   > distinguishes multi-commit HEAD
    > effects from first-touch ref-only forks, persists an ordered pre-minted
    > Lance transaction chain for every logical data effect plus fixed
    > merge/rollback lineage, and confirms the complete manifest delta (including
@@ -794,8 +827,9 @@ Implementation proceeds in this order:
    > only their contiguous exact prefix (plus a derived `CreateIndex` tail after
    > the complete chain) and fails closed on foreign movement. A pre-effect target change
    > returns `ReadSetChanged`; any post-arm failure returns `RecoveryRequired`
-   > and recovery never re-parents onto a target winner. SchemaApply now uses
-   > schema-v7 exact authority, fixed actor-bearing lineage, exact existing-table
+   > and recovery never re-parents onto a target winner. SchemaApply now uses the
+   > schema-v9 envelope's retained `protocol_v7` exact authority, fixed
+   > actor-bearing lineage, exact existing-table
    > overwrite and first-touch create identities, and a complete confirmed
    > registration/update/tombstone delta. Its `Armed` attempts roll back, its
    > `EffectsConfirmed` attempts roll forward only under the captured token, and
@@ -804,12 +838,16 @@ Implementation proceeds in this order:
    > first-touch winner is preserved but never adopted; foreign movement on an
    > existing manifest-owned table or a buried same-table effect fails closed.
    > Read-only open also refuses the fixed-manifest/pre-promotion window without
-   > mutating it. The reader still understands schema-v5 bridge files without
-   > upgrading their semantics. EnsureIndices now uses schema-v8 exact authority,
+   > mutating it. Historical schema-v5 bridge shapes remain parser fixtures, but
+   > identity-less artifacts are refused rather than upgraded. EnsureIndices now
+   > uses the schema-v9 envelope's
+   > retained `protocol_v8` exact authority,
    > one mixed CreateIndex transaction per table, fixed lineage/delta, exact
-   > first-touch ownership, and retains the schema-v6 compatibility reader.
-   > Optimize now has one graph-wide recovery/visibility envelope: one bounded schema-v2
-   > multi-pin sidecar, bounded-parallel physical effects, and one maintenance-class
+   > first-touch ownership; schema-v6 remains a historical parser fixture, not an
+   > identity-upgrade path.
+   > Optimize now has one graph-wide recovery/visibility envelope: one bounded
+   > payload in an identity-bearing schema-v9 multi-pin sidecar, bounded-parallel
+   > physical effects, and one maintenance-class
    > monotonic batch publish. Exact provenance is deferred until Lance exposes a
    > stable public caller-controlled maintenance transaction API and OmniGraph has
    > distributed recovery fencing; it is not an RFC-022 rollout gate. MemWAL is the
@@ -825,11 +863,11 @@ Implementation proceeds in this order:
    > branch pin, computes `keep` from Lance's actual version list, refuses
    > uncovered main HEAD drift, and completes its live-root preflight before the
    > first table GC.
-3. Convert every current graph-visible effect writer. This is structurally complete
+3. Every current graph-visible effect writer was converted. This is structurally complete
    as of 2026-07-13: Mutation/Load, BranchMerge, SchemaApply, and EnsureIndices use
-   exact adapters; Optimize uses the bounded schema-v2 adapter described in §6.4.
+   exact adapters; Optimize uses the bounded schema-v9 adapter described in §6.4.
    The deferred exact Optimize upgrade is not an RFC-022 rollout gate.
-4. Keep the supported writer set closed. This is complete as of 2026-07-13:
+4. The supported writer set was closed. This is complete as of 2026-07-13:
    raw storage/coordinator/handle-cache modules are crate-private and public
    snapshots expose a read-only table/scan facade without Lance's raw scanner
    or physical plan. `crates/omnigraph/tests/forbidden_apis.rs` adds a
@@ -841,10 +879,10 @@ Implementation proceeds in this order:
    the concrete method/UFCS/raw-Dataset and selected rename/macro shapes pinned
    by its self-tests; Rust visibility, not heuristic macro expansion, is the
    structural closure.
-5. Remove superseded orchestration after its crash and concurrency cells pass through
-   the adapter. The old bypass surfaces are removed; writer-specific physical-effect
+5. Superseded orchestration was removed after its crash and concurrency cells passed
+   through the adapter. The old bypass surfaces are removed; writer-specific physical-effect
    implementations remain intentionally behind their registered adapters.
-6. Treat further work as post-close-out latency or capability work: preserve the
+6. Further work is post-close-out latency or capability work: preserve the
    synchronous barrier and recovery classifications, and require the two §6.4
    triggers before replacing Optimize's bounded adapter.
 
@@ -937,11 +975,11 @@ writers.
   CreateIndex transaction and one version advance per table, pre-effect authority
   loss, exact confirmation, first-touch sidecar ordering/identity, partial-Phase-B
   rollback, confirmed roll-forward, and foreign/buried winner refusal. Retain a
-  frozen schema-v6 compatibility fixture.
+  frozen schema-v6 parser fixture plus explicit refusal of identity-less input.
 - Optimize: zero, one, and several Lance commits; two productive tables become
   visible through one lineage/manifest CAS; a complete multi-table effect set
   rolls forward together; a partial set exposes no pointer and compensates under
-  one v2 sidecar; monotonic publish, retryable physical contention, no-work/no-sidecar,
+  one identity-bearing v9 sidecar; monotonic publish, retryable physical contention, no-work/no-sidecar,
   lost acknowledgement after the manifest CAS, pending-only vector exclusion, and
   history-flat manifest cost remain pinned. Exact provenance is a deferred upgrade,
   triggered only by a stable public Lance maintenance-transaction API plus
@@ -1029,7 +1067,7 @@ substrate.
 The correctness contract is intentionally difficult to reverse: after writers rely on
 complete read-set arbitration and recovery-before-write, weakening either would
 reintroduce silent integrity or recovery races. Focused irreversible changes are
-reviewed in RFC-023 through RFC-027.
+reviewed in RFC-023 through RFC-028.
 
 ## 15. Follow-up RFC boundaries
 
@@ -1043,6 +1081,8 @@ reviewed in RFC-023 through RFC-027.
   behavior, stream quiescence, fresh reads, public surfaces, and upgrade fencing.
 - **RFC-027** owns candidate discovery from row lineage, deletion discovery, fallback
   semantics, and evidence for any O(delta) merge claim.
+- **RFC-028** owns graph-scoped schema identity, rename/drop lifecycle,
+  allocation, SchemaApply integration, and the shared identity-format gate.
 
 Those RFCs call this protocol when they produce a graph-visible write. None may weaken
 the recovery barrier, omit read dependencies from `ReadSet`, or create a second graph

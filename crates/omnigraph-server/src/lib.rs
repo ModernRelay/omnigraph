@@ -291,6 +291,8 @@ pub struct ApiError {
     merge_conflicts: Vec<api::MergeConflictOutput>,
     manifest_conflict: Option<api::ManifestConflictOutput>,
     read_set_conflict: Option<api::ReadSetConflictOutput>,
+    key_conflict: Option<api::KeyConflictOutput>,
+    resource_limit: Option<api::ResourceLimitOutput>,
     recovery_required: Option<api::RecoveryRequiredOutput>,
 }
 
@@ -623,6 +625,8 @@ impl ApiError {
             merge_conflicts: Vec::new(),
             manifest_conflict: None,
             read_set_conflict: None,
+            key_conflict: None,
+            resource_limit: None,
             recovery_required: None,
         }
     }
@@ -635,6 +639,8 @@ impl ApiError {
             merge_conflicts: Vec::new(),
             manifest_conflict: None,
             read_set_conflict: None,
+            key_conflict: None,
+            resource_limit: None,
             recovery_required: None,
         }
     }
@@ -647,6 +653,8 @@ impl ApiError {
             merge_conflicts: Vec::new(),
             manifest_conflict: None,
             read_set_conflict: None,
+            key_conflict: None,
+            resource_limit: None,
             recovery_required: None,
         }
     }
@@ -659,6 +667,8 @@ impl ApiError {
             merge_conflicts: Vec::new(),
             manifest_conflict: None,
             read_set_conflict: None,
+            key_conflict: None,
+            resource_limit: None,
             recovery_required: None,
         }
     }
@@ -675,6 +685,8 @@ impl ApiError {
             merge_conflicts: Vec::new(),
             manifest_conflict: None,
             read_set_conflict: None,
+            key_conflict: None,
+            resource_limit: None,
             recovery_required: None,
         }
     }
@@ -687,6 +699,8 @@ impl ApiError {
             merge_conflicts: Vec::new(),
             manifest_conflict: None,
             read_set_conflict: None,
+            key_conflict: None,
+            resource_limit: None,
             recovery_required: None,
         }
     }
@@ -699,6 +713,8 @@ impl ApiError {
             merge_conflicts: Vec::new(),
             manifest_conflict: None,
             read_set_conflict: None,
+            key_conflict: None,
+            resource_limit: None,
             recovery_required: None,
         }
     }
@@ -715,6 +731,8 @@ impl ApiError {
             merge_conflicts: Vec::new(),
             manifest_conflict: None,
             read_set_conflict: None,
+            key_conflict: None,
+            resource_limit: None,
             recovery_required: None,
         }
     }
@@ -738,6 +756,8 @@ impl ApiError {
             merge_conflicts: conflicts,
             manifest_conflict: None,
             read_set_conflict: None,
+            key_conflict: None,
+            resource_limit: None,
             recovery_required: None,
         }
     }
@@ -750,6 +770,8 @@ impl ApiError {
             merge_conflicts: Vec::new(),
             manifest_conflict: Some(details),
             read_set_conflict: None,
+            key_conflict: None,
+            resource_limit: None,
             recovery_required: None,
         }
     }
@@ -762,6 +784,36 @@ impl ApiError {
             merge_conflicts: Vec::new(),
             manifest_conflict: None,
             read_set_conflict: Some(details),
+            key_conflict: None,
+            resource_limit: None,
+            recovery_required: None,
+        }
+    }
+
+    fn key_conflict(message: String, details: api::KeyConflictOutput) -> Self {
+        Self {
+            status: StatusCode::CONFLICT,
+            code: Some(ErrorCode::Conflict),
+            message,
+            merge_conflicts: Vec::new(),
+            manifest_conflict: None,
+            read_set_conflict: None,
+            key_conflict: Some(details),
+            resource_limit: None,
+            recovery_required: None,
+        }
+    }
+
+    fn resource_limit(message: String, details: api::ResourceLimitOutput) -> Self {
+        Self {
+            status: StatusCode::PAYLOAD_TOO_LARGE,
+            code: Some(ErrorCode::BadRequest),
+            message,
+            merge_conflicts: Vec::new(),
+            manifest_conflict: None,
+            read_set_conflict: None,
+            key_conflict: None,
+            resource_limit: Some(details),
             recovery_required: None,
         }
     }
@@ -777,6 +829,8 @@ impl ApiError {
             merge_conflicts: Vec::new(),
             manifest_conflict: None,
             read_set_conflict: None,
+            key_conflict: None,
+            resource_limit: None,
             recovery_required: Some(api::RecoveryRequiredOutput { operation_id }),
         }
     }
@@ -823,6 +877,25 @@ impl ApiError {
                     .map(api::MergeConflictOutput::from)
                     .collect(),
             ),
+            OmniError::KeyConflict { table_key, key } => Self::key_conflict(
+                key.as_ref().map_or_else(
+                    || format!("key conflict in table '{table_key}'"),
+                    |key| format!("key conflict in table '{table_key}': id '{key}' already exists"),
+                ),
+                api::KeyConflictOutput { table_key, key },
+            ),
+            OmniError::ResourceLimitExceeded {
+                resource,
+                limit,
+                actual,
+            } => Self::resource_limit(
+                format!("resource limit exceeded for {resource}: actual {actual}, limit {limit}"),
+                api::ResourceLimitOutput {
+                    resource,
+                    limit,
+                    actual,
+                },
+            ),
             OmniError::RecoveryRequired {
                 operation_id,
                 reason,
@@ -831,6 +904,9 @@ impl ApiError {
                 operation_id,
             ),
             OmniError::Lance(message) => Self::internal(format!("storage: {message}")),
+            OmniError::RetryableCommitConflict(message) => {
+                Self::conflict(format!("retryable storage commit conflict: {message}"))
+            }
             OmniError::Io(err) => Self::internal(format!("io: {err}")),
             // Engine-layer policy enforcement (MR-722). All denials and
             // evaluation failures surface here as 403. The HTTP-layer
@@ -898,6 +974,8 @@ impl IntoResponse for ApiError {
                 merge_conflicts: self.merge_conflicts,
                 manifest_conflict: self.manifest_conflict,
                 read_set_conflict: self.read_set_conflict,
+                key_conflict: self.key_conflict,
+                resource_limit: self.resource_limit,
                 recovery_required: self.recovery_required,
             }),
         )
@@ -927,6 +1005,53 @@ mod api_error_tests {
             error.recovery_required.unwrap().operation_id,
             "01JTESTRECOVERY"
         );
+    }
+
+    #[tokio::test]
+    async fn key_conflict_is_409_with_structured_optional_key() {
+        for (key, expected_message) in [
+            (Some("alice".to_string()), "id 'alice' already exists"),
+            (None, "key conflict in table 'node:Person'"),
+        ] {
+            let response = ApiError::from_omni(OmniError::KeyConflict {
+                table_key: "node:Person".to_string(),
+                key: key.clone(),
+            })
+            .into_response();
+
+            assert_eq!(response.status(), StatusCode::CONFLICT);
+            let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+                .await
+                .unwrap();
+            let error: ErrorOutput = serde_json::from_slice(&body).unwrap();
+            assert!(error.error.contains(expected_message));
+            let details = error.key_conflict.expect("structured key conflict");
+            assert_eq!(details.table_key, "node:Person");
+            assert_eq!(details.key, key);
+            assert!(error.recovery_required.is_none());
+        }
+    }
+
+    #[tokio::test]
+    async fn resource_limit_is_413_with_structured_ceiling() {
+        let response = ApiError::from_omni(OmniError::ResourceLimitExceeded {
+            resource: "keyed write rows for node:Person".to_string(),
+            limit: 8192,
+            actual: 8193,
+        })
+        .into_response();
+
+        assert_eq!(response.status(), StatusCode::PAYLOAD_TOO_LARGE);
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let error: ErrorOutput = serde_json::from_slice(&body).unwrap();
+        assert_eq!(error.code, Some(ErrorCode::BadRequest));
+        let details = error.resource_limit.expect("structured resource limit");
+        assert_eq!(details.resource, "keyed write rows for node:Person");
+        assert_eq!(details.limit, 8192);
+        assert_eq!(details.actual, 8193);
+        assert!(error.recovery_required.is_none());
     }
 }
 

@@ -1,9 +1,10 @@
 //! Storage trait surface — MR-793.
 //!
 //! `TableStorage` is the engine-internal trait that exposes the
-//! staged-write primitives (`stage_append`, `stage_merge_insert`,
-//! `stage_overwrite`, `stage_create_indices`) plus `commit_staged` as the canonical
-//! way for new engine writers to advance Lance HEAD without coupling
+//! staged-write primitives (`stage_append`, `stage_keyed_write`,
+//! `stage_merge_insert`, `stage_overwrite`, `stage_create_indices`) plus
+//! `commit_staged` as the canonical way for new engine writers to advance
+//! Lance HEAD without coupling
 //! "write bytes" with "advance HEAD" in one Lance API call.
 //!
 //! `delete_where` was the final data-write residual until MR-A: Lance 7.0's
@@ -46,13 +47,49 @@ use std::sync::Arc;
 use arrow_array::RecordBatch;
 use arrow_schema::SchemaRef;
 use async_trait::async_trait;
+use datafusion::physical_plan::SendableRecordBatchStream;
 use lance::Dataset;
 use lance::dataset::scanner::{ColumnOrdering, DatasetRecordBatchStream};
+#[cfg(test)]
 use lance::dataset::{WhenMatched, WhenNotMatched};
 
 use crate::db::{Snapshot, SubTableEntry};
 use crate::error::{OmniError, Result};
 use crate::table_store::{StagedTransactionIdentity, StagedWrite, TableState, TableStore};
+
+/// One fenced merge chunk is bounded in both rows and materialized Arrow
+/// bytes. The byte ceiling bounds the staging adapter; the row ceiling
+/// prevents pathological tiny-row filter expressions and keeps evidence
+/// repeatable. Callers must also bound parsing/materialization before this
+/// final Arrow-sized check.
+pub(crate) const KEYED_WRITE_MAX_ROWS: usize = 8192;
+pub(crate) const KEYED_WRITE_MAX_BYTES: u64 = 32 * 1024 * 1024;
+
+/// Resource budget for a pending-aware keyed scan that will feed one mutation
+/// table transaction.
+///
+/// `initial_*` accounts for batches the mutation has already accumulated on
+/// this table.  A later `update` allocates another full-row batch before the
+/// end-of-query dedupe, so its matched committed/pending view must fit in the
+/// *remaining* table budget rather than receiving a fresh 8,192-row / 32-MiB
+/// allowance.  Keeping this value on the sealed storage boundary makes the
+/// bounded streaming scan part of the only production read-modify-write path.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct PendingScanBudget {
+    pub(crate) table_key: String,
+    pub(crate) initial_rows: u64,
+    pub(crate) initial_bytes: u64,
+}
+
+impl PendingScanBudget {
+    pub(crate) fn new(table_key: impl Into<String>, initial_rows: u64, initial_bytes: u64) -> Self {
+        Self {
+            table_key: table_key.into(),
+            initial_rows,
+            initial_bytes,
+        }
+    }
+}
 
 // ─── sealed module ──────────────────────────────────────────────────────────
 
@@ -92,6 +129,82 @@ pub enum IndexBuildSpec {
     Vector {
         column: String,
     },
+}
+
+/// Logical semantics for an RFC-023 keyed write.
+///
+/// The storage adapter, rather than its callers, maps these modes onto Lance's
+/// merge-insert actions.  This keeps `id` as the only expressible key and
+/// prevents a caller from accidentally weakening strict insert into upsert.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum KeyedWriteSemantics {
+    /// Insert every source row and reject an `id` already present at the pinned
+    /// base.  A proven pre-existing match surfaces `OmniError::KeyConflict`.
+    StrictInsert,
+    /// Insert new ids and replace the full row for ids already present.
+    Upsert,
+}
+
+/// One exact chunk admitted to the join-free strict-insert adapter by the
+/// branch-merge provenance proof.
+///
+/// The batch is owned by this opaque capability instead of travelling beside a
+/// reusable zero-sized token. Construction binds it to the current target
+/// version and complete physical schema, so an accidental in-crate reuse
+/// against another table/version cannot reach Lance staging. Downstream users
+/// cannot construct it because the storage trait is sealed and the constructor
+/// remains crate-private; the structural protocol test pins the one production
+/// mint site to the verified branch-merge path.
+#[derive(Debug)]
+pub struct ProvenInsertChunk {
+    table_key: String,
+    batch: RecordBatch,
+    expected_target_version: u64,
+    expected_schema_preorder_ids: Vec<u32>,
+    expected_stable_row_ids: bool,
+    chunk_index: usize,
+}
+
+impl ProvenInsertChunk {
+    pub(crate) fn from_verified_history(
+        target: &SnapshotHandle,
+        table_key: &str,
+        batch: RecordBatch,
+        chunk_index: usize,
+    ) -> Result<Self> {
+        let expected_schema_preorder_ids = target
+            .dataset()
+            .schema()
+            .fields_pre_order()
+            .map(|field| {
+                u32::try_from(field.id).map_err(|_| {
+                    OmniError::manifest_internal(format!(
+                        "proven insert chunk encountered negative field id {}",
+                        field.id
+                    ))
+                })
+            })
+            .collect::<Result<Vec<_>>>()?;
+        Ok(Self {
+            table_key: table_key.to_string(),
+            batch,
+            expected_target_version: target.version(),
+            expected_schema_preorder_ids,
+            expected_stable_row_ids: target.uses_stable_row_ids(),
+            chunk_index,
+        })
+    }
+
+    pub(crate) fn into_parts(self) -> (String, RecordBatch, u64, Vec<u32>, bool, usize) {
+        (
+            self.table_key,
+            self.batch,
+            self.expected_target_version,
+            self.expected_schema_preorder_ids,
+            self.expected_stable_row_ids,
+            self.chunk_index,
+        )
+    }
 }
 
 // ─── opaque handles ────────────────────────────────────────────────────────
@@ -192,6 +305,13 @@ impl StagedHandle {
     /// Lance transaction identity captured when this effect was staged.
     pub fn transaction_identity(&self) -> StagedTransactionIdentity {
         self.inner.transaction_identity()
+    }
+
+    /// Remove the exact strict-insert ids before the staged transaction is
+    /// consumed by commit. They are retained only for the fresh-authority
+    /// conflict re-probe; Lance's commit packet does not consume them.
+    pub(crate) fn take_strict_source_ids(&mut self) -> Option<Vec<String>> {
+        self.inner.take_strict_source_ids()
     }
 
     /// Replace Lance's random transaction UUID with the identity durably armed
@@ -396,6 +516,7 @@ pub trait TableStorage: sealed::Sealed + Send + Sync + Debug {
         projection: Option<&[&str]>,
         filter: Option<&str>,
         key_column: Option<&str>,
+        budget: PendingScanBudget,
     ) -> Result<Vec<RecordBatch>>;
 
     /// Full-schema blob-aware sibling of `scan_with_pending` for mutation
@@ -410,6 +531,7 @@ pub trait TableStorage: sealed::Sealed + Send + Sync + Debug {
         pending_schema: Option<SchemaRef>,
         filter: Option<&str>,
         key_column: Option<&str>,
+        budget: PendingScanBudget,
     ) -> Result<Vec<RecordBatch>>;
 
     async fn first_row_id_for_filter(
@@ -417,6 +539,15 @@ pub trait TableStorage: sealed::Sealed + Send + Sync + Debug {
         snapshot: &SnapshotHandle,
         filter: &str,
     ) -> Result<Option<u64>>;
+
+    /// Return one exact source id already present in this manifest-pinned
+    /// table image. RFC-023 uses this after an effect-free substrate conflict
+    /// to distinguish a logical duplicate from unrelated physical movement.
+    async fn first_existing_id(
+        &self,
+        snapshot: &SnapshotHandle,
+        source_ids: &[String],
+    ) -> Result<Option<String>>;
 
     async fn table_state(&self, dataset_uri: &str, snapshot: &SnapshotHandle)
     -> Result<TableState>;
@@ -437,6 +568,23 @@ pub trait TableStorage: sealed::Sealed + Send + Sync + Debug {
 
     // ── Staged writes (no HEAD advance) ────────────────────────────────
 
+    /// Resolve bounded keyed-source inputs that require pre-stage I/O (today,
+    /// absolute blob URIs) without writing Lance files or advancing HEAD.
+    /// Deferred first-touch writers call this before recovery arm because the
+    /// target ref needed by `stage_keyed_write` does not exist yet.
+    async fn prepare_keyed_write_batch(
+        &self,
+        table_key: &str,
+        batch: RecordBatch,
+    ) -> Result<RecordBatch>;
+
+    /// Validate the physical key contract shared by every v6 graph-table
+    /// write batch: exact Utf8 `id`, no nulls, and no duplicate ids within the
+    /// batch. Callers preparing a deferred first-touch or Overwrite plan must
+    /// invoke this before recovery is armed or a native branch ref is created.
+    fn validate_keyed_write_batch(&self, table_key: &str, batch: &RecordBatch) -> Result<()>;
+
+    #[cfg(test)]
     async fn stage_append(
         &self,
         snapshot: &SnapshotHandle,
@@ -446,6 +594,7 @@ pub trait TableStorage: sealed::Sealed + Send + Sync + Debug {
 
     /// Append `source`'s rows into `snapshot`'s table, streaming so the whole
     /// row set is never materialized in memory (see `TableStore::stage_append_stream`).
+    #[cfg(test)]
     async fn stage_append_stream(
         &self,
         snapshot: &SnapshotHandle,
@@ -453,6 +602,71 @@ pub trait TableStorage: sealed::Sealed + Send + Sync + Debug {
         prior_stages: &[StagedHandle],
     ) -> Result<StagedHandle>;
 
+    /// Stage one RFC-023 fenced keyed write from an in-memory batch.
+    ///
+    /// This production adapter accepts only the graph `id` key, checks
+    /// that the target dataset declares exactly that unenforced primary key,
+    /// and forces Lance's filter-bearing non-index merge route.
+    async fn stage_keyed_write(
+        &self,
+        snapshot: SnapshotHandle,
+        table_key: &str,
+        batch: RecordBatch,
+        semantics: KeyedWriteSemantics,
+    ) -> Result<StagedHandle>;
+
+    /// Stage a provenance-proven strict insert without re-running Lance's
+    /// target merge join or exact target-membership preflight. The caller's
+    /// complete durable absence proof and final target-incarnation/baseline
+    /// gates discharge that repeated lookup. The adapter commits a Lance
+    /// `Update` carrying the inserted-row key filter, so concurrent key
+    /// conflicts remain loud.
+    async fn stage_proven_strict_insert(
+        &self,
+        snapshot: SnapshotHandle,
+        chunk: ProvenInsertChunk,
+    ) -> Result<StagedHandle>;
+
+    /// Test-only streaming-source sibling of [`Self::stage_keyed_write`].
+    ///
+    /// `source` must be a trusted graph dataset with the same exact-id PK
+    /// contract. It is scanned twice: once in bounded id-only batches for
+    /// validation / strict preflight, then through the existing blob-aware
+    /// rewrite stream. Neither ordinary nor blob rows are collected into one
+    /// delta-wide batch.
+    #[cfg(test)]
+    async fn stage_keyed_write_stream(
+        &self,
+        snapshot: SnapshotHandle,
+        table_key: &str,
+        source: &SnapshotHandle,
+        semantics: KeyedWriteSemantics,
+    ) -> Result<StagedHandle>;
+
+    /// Blob-aware full-row stream with an explicit batch ceiling. Branch
+    /// adoption uses this to turn a large all-new delta into an exact recovery
+    /// chain of bounded fenced writes instead of one delta-wide hash join.
+    async fn scan_stream_for_rewrite_bounded(
+        &self,
+        source: &SnapshotHandle,
+        batch_rows: usize,
+        batch_bytes: u64,
+    ) -> Result<SendableRecordBatchStream>;
+
+    /// Stream a provenance-proven pure-insert source interval as bounded
+    /// full-row batches for the existing per-chunk strict keyed writer.
+    /// `source` must be pinned at `end_version`; only rows whose
+    /// `_row_created_at_version` lies in `(begin_version, end_version]` are
+    /// emitted. This read-only primitive writes no files and advances no HEAD.
+    async fn scan_proven_insert_delta_bounded(
+        &self,
+        source: &SnapshotHandle,
+        table_key: &str,
+        begin_version: u64,
+        end_version: u64,
+    ) -> Result<SendableRecordBatchStream>;
+
+    #[cfg(test)]
     async fn stage_merge_insert(
         &self,
         snapshot: SnapshotHandle,
@@ -531,6 +745,20 @@ pub trait TableStorage: sealed::Sealed + Send + Sync + Debug {
         filter: Option<&str>,
         order_by: Option<Vec<ColumnOrdering>>,
         with_row_id: bool,
+    ) -> Result<DatasetRecordBatchStream>;
+
+    /// Streaming sibling with explicit per-batch row and decoded-byte limits.
+    /// This is the read-side primitive for operations that retain batches under
+    /// a fixed resource budget instead of inheriting Lance's process defaults.
+    async fn scan_stream_bounded(
+        &self,
+        snapshot: &SnapshotHandle,
+        projection: Option<&[&str]>,
+        filter: Option<&str>,
+        order_by: Option<Vec<ColumnOrdering>>,
+        with_row_id: bool,
+        batch_rows: usize,
+        batch_bytes: u64,
     ) -> Result<DatasetRecordBatchStream>;
 }
 
@@ -702,6 +930,7 @@ impl TableStorage for TableStore {
         projection: Option<&[&str]>,
         filter: Option<&str>,
         key_column: Option<&str>,
+        budget: PendingScanBudget,
     ) -> Result<Vec<RecordBatch>> {
         TableStore::scan_with_pending(
             self,
@@ -711,6 +940,7 @@ impl TableStorage for TableStore {
             projection,
             filter,
             key_column,
+            budget,
         )
         .await
     }
@@ -722,6 +952,7 @@ impl TableStorage for TableStore {
         pending_schema: Option<SchemaRef>,
         filter: Option<&str>,
         key_column: Option<&str>,
+        budget: PendingScanBudget,
     ) -> Result<Vec<RecordBatch>> {
         TableStore::scan_with_pending_materialized_blobs(
             self,
@@ -730,6 +961,7 @@ impl TableStorage for TableStore {
             pending_schema,
             filter,
             key_column,
+            budget,
         )
         .await
     }
@@ -740,6 +972,14 @@ impl TableStorage for TableStore {
         filter: &str,
     ) -> Result<Option<u64>> {
         TableStore::first_row_id_for_filter(self, snapshot.dataset(), filter).await
+    }
+
+    async fn first_existing_id(
+        &self,
+        snapshot: &SnapshotHandle,
+        source_ids: &[String],
+    ) -> Result<Option<String>> {
+        TableStore::first_existing_id(snapshot.dataset(), source_ids).await
     }
 
     async fn table_state(
@@ -771,6 +1011,19 @@ impl TableStorage for TableStore {
         })
     }
 
+    async fn prepare_keyed_write_batch(
+        &self,
+        table_key: &str,
+        batch: RecordBatch,
+    ) -> Result<RecordBatch> {
+        TableStore::prepare_keyed_write_batch(self, table_key, batch).await
+    }
+
+    fn validate_keyed_write_batch(&self, table_key: &str, batch: &RecordBatch) -> Result<()> {
+        TableStore::validate_keyed_write_batch(self, table_key, batch)
+    }
+
+    #[cfg(test)]
     async fn stage_append(
         &self,
         snapshot: &SnapshotHandle,
@@ -783,6 +1036,7 @@ impl TableStorage for TableStore {
             .map(StagedHandle::new)
     }
 
+    #[cfg(test)]
     async fn stage_append_stream(
         &self,
         snapshot: &SnapshotHandle,
@@ -795,6 +1049,71 @@ impl TableStorage for TableStore {
             .map(StagedHandle::new)
     }
 
+    async fn stage_keyed_write(
+        &self,
+        snapshot: SnapshotHandle,
+        table_key: &str,
+        batch: RecordBatch,
+        semantics: KeyedWriteSemantics,
+    ) -> Result<StagedHandle> {
+        let ds = Arc::try_unwrap(snapshot.into_arc()).unwrap_or_else(|arc| (*arc).clone());
+        TableStore::stage_keyed_write(self, ds, table_key, batch, semantics)
+            .await
+            .map(StagedHandle::new)
+    }
+
+    async fn stage_proven_strict_insert(
+        &self,
+        snapshot: SnapshotHandle,
+        chunk: ProvenInsertChunk,
+    ) -> Result<StagedHandle> {
+        let ds = Arc::try_unwrap(snapshot.into_arc()).unwrap_or_else(|arc| (*arc).clone());
+        TableStore::stage_proven_strict_insert(self, ds, chunk)
+            .await
+            .map(StagedHandle::new)
+    }
+
+    #[cfg(test)]
+    async fn stage_keyed_write_stream(
+        &self,
+        snapshot: SnapshotHandle,
+        table_key: &str,
+        source: &SnapshotHandle,
+        semantics: KeyedWriteSemantics,
+    ) -> Result<StagedHandle> {
+        let ds = Arc::try_unwrap(snapshot.into_arc()).unwrap_or_else(|arc| (*arc).clone());
+        TableStore::stage_keyed_write_stream(self, ds, table_key, source.dataset(), semantics)
+            .await
+            .map(StagedHandle::new)
+    }
+
+    async fn scan_stream_for_rewrite_bounded(
+        &self,
+        source: &SnapshotHandle,
+        batch_rows: usize,
+        batch_bytes: u64,
+    ) -> Result<SendableRecordBatchStream> {
+        TableStore::scan_stream_for_rewrite_bounded(self, source.dataset(), batch_rows, batch_bytes)
+            .await
+    }
+
+    async fn scan_proven_insert_delta_bounded(
+        &self,
+        source: &SnapshotHandle,
+        table_key: &str,
+        begin_version: u64,
+        end_version: u64,
+    ) -> Result<SendableRecordBatchStream> {
+        TableStore::scan_proven_insert_delta_bounded(
+            source.dataset(),
+            table_key,
+            begin_version,
+            end_version,
+        )
+        .await
+    }
+
+    #[cfg(test)]
     async fn stage_merge_insert(
         &self,
         snapshot: SnapshotHandle,
@@ -903,6 +1222,28 @@ impl TableStorage for TableStore {
             filter,
             order_by,
             with_row_id,
+        )
+        .await
+    }
+
+    async fn scan_stream_bounded(
+        &self,
+        snapshot: &SnapshotHandle,
+        projection: Option<&[&str]>,
+        filter: Option<&str>,
+        order_by: Option<Vec<ColumnOrdering>>,
+        with_row_id: bool,
+        batch_rows: usize,
+        batch_bytes: u64,
+    ) -> Result<DatasetRecordBatchStream> {
+        TableStore::scan_stream_bounded(
+            snapshot.dataset(),
+            projection,
+            filter,
+            order_by,
+            with_row_id,
+            batch_rows,
+            batch_bytes,
         )
         .await
     }

@@ -1,4 +1,3 @@
-use std::collections::HashMap;
 use std::fmt;
 use std::sync::Arc;
 
@@ -11,8 +10,8 @@ use crate::storage::{StorageAdapter, normalize_root_uri};
 use super::commit_graph::{CommitGraph, GraphCommit};
 use super::is_internal_system_branch;
 use super::manifest::{
-    LineageIntent, ManifestChange, ManifestCoordinator, ManifestIncarnation, PublishPrecondition,
-    Snapshot, SubTableUpdate,
+    ExpectedTableVersions, LineageIntent, ManifestChange, ManifestCoordinator, ManifestIncarnation,
+    PublishPrecondition, Snapshot, SubTableUpdate,
 };
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
@@ -201,6 +200,13 @@ impl GraphCoordinator {
         self.manifest.probe_latest_incarnation().await
     }
 
+    /// Clone the already-loaded lineage projection. This performs no storage
+    /// I/O; branch merge uses it to compute the base from the same coordinator
+    /// instances that supplied source/target authority.
+    pub(crate) async fn load_commits(&self) -> Result<Vec<GraphCommit>> {
+        self.commit_graph.load_commits().await
+    }
+
     /// Refresh only the manifest (not the commit graph). The read path uses this
     /// on a stale same-branch probe: a read pins its snapshot by manifest version
     /// and never needs the commit graph, so a full `refresh` (which also scans
@@ -342,7 +348,9 @@ impl GraphCoordinator {
 
         for branch in self.manifest.list_branches().await? {
             let normalized = normalize_branch_name(&branch)?;
-            let commit_graph = self.open_commit_graph_for_branch(normalized.as_deref()).await?;
+            let commit_graph = self
+                .open_commit_graph_for_branch(normalized.as_deref())
+                .await?;
             if let Some(commit) = commit_graph.get_commit(snapshot_id.as_str()) {
                 return Ok(commit);
             }
@@ -367,19 +375,24 @@ impl GraphCoordinator {
         updates: &[SubTableUpdate],
         actor_id: Option<&str>,
     ) -> Result<PublishedSnapshot> {
-        self.commit_updates_with_actor_with_expected(updates, &HashMap::new(), actor_id)
-            .await
+        self.commit_updates_with_actor_with_expected(
+            updates,
+            &ExpectedTableVersions::new(),
+            actor_id,
+        )
+        .await
     }
 
     /// Commit with publisher-level OCC fence. The `expected_table_versions` map
     /// asserts the manifest's current latest non-tombstoned `table_version` for
-    /// each `table_key` matches what the caller observed before writing.
+    /// each immutable table identity matches what the caller observed before
+    /// writing; the diagnostic alias is checked as part of the expectation.
     /// Mismatches surface as `OmniError::Manifest` with
     /// `ManifestConflictDetails::ExpectedVersionMismatch`.
     pub(crate) async fn commit_updates_with_actor_with_expected(
         &mut self,
         updates: &[SubTableUpdate],
-        expected_table_versions: &HashMap<String, u64>,
+        expected_table_versions: &ExpectedTableVersions,
         actor_id: Option<&str>,
     ) -> Result<PublishedSnapshot> {
         let changes = updates_to_changes(updates);
@@ -397,7 +410,7 @@ impl GraphCoordinator {
     async fn commit_changes_with_actor_with_expected(
         &mut self,
         changes: &[ManifestChange],
-        expected_table_versions: &HashMap<String, u64>,
+        expected_table_versions: &ExpectedTableVersions,
         actor_id: Option<&str>,
     ) -> Result<PublishedSnapshot> {
         let intent = self.new_lineage_intent(actor_id, None)?;
@@ -417,7 +430,7 @@ impl GraphCoordinator {
     pub(crate) async fn commit_changes_with_intent_and_expected(
         &mut self,
         changes: &[ManifestChange],
-        expected_table_versions: &HashMap<String, u64>,
+        expected_table_versions: &ExpectedTableVersions,
         intent: LineageIntent,
         precondition: &PublishPrecondition,
     ) -> Result<PublishedSnapshot> {

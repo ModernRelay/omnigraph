@@ -5,19 +5,24 @@ description: Makes named graph checkpoints authoritative retention roots, materi
 status: draft
 tags: [eng, rfc, retention, checkpoint, cleanup, manifest, lance, omnigraph]
 timestamp: 2026-07-10
-owner:
+owner: OmniGraph maintainers
 ---
 
 # RFC-025 — Checkpoint-pinned retention
 
 **Status:** Draft / for team review
 **Date:** 2026-07-10
-**Depends on:** [RFC-022](rfc-022-unified-write-path.md)'s publisher and
-recovery-sidecar protocol. It composes with
-[RFC-024](rfc-024-durable-table-heads.md), but is not part of v5 by implication.
-**Surveyed:** omnigraph 0.8.1; Lance 9.0.0-beta.15 (`f24e42c1`)
+**Author track:** Maintainer design series
+**Depends on:** [RFC-022](0022-unified-write-path.md)'s publisher and
+recovery-sidecar protocol and
+[RFC-028](0028-stable-schema-identity.md)'s stable table identity/incarnation.
+It composes with [RFC-024](0024-durable-table-heads.md), but durable heads are
+not required for checkpoint authority.
+**Surveyed:** omnigraph 0.8.1; Lance 9.0.0-beta.21 at git rev
+`1aec14652dcbace23ac277fa8ced35000bea0c40`; full Lance branch/tag,
+transaction, cleanup, and object-store specifications
 **Audience:** engine, storage, CLI, and operations maintainers
-**Open architecture review:** [RFC-022–027 review ledger](../dev/rfc-022-027-architecture-review.md).
+**Open architecture review:** [RFC-022–028 review ledger](../dev/rfc-022-027-architecture-review.md).
 Findings marked **BLOCKER** must be dispositioned before acceptance.
 
 ---
@@ -51,7 +56,7 @@ This RFC specifies:
 2. deterministic Lance tags for the pinned manifest and every pinned table version;
 3. create, delete, and reconciliation protocols;
 4. how `cleanup` computes and protects its root set;
-5. CLI, policy, audit, observability, migration, and acceptance contracts.
+5. CLI, policy, audit, observability, rebuild, and acceptance contracts.
 
 It does not change snapshot isolation, invent a second transaction log, or
 replace Lance cleanup. It does not make every historical graph commit a
@@ -80,10 +85,23 @@ writes:
   immutable checkpoint ID;
 - `checkpoint:<checkpoint_id>` — header containing `name`, source logical
   branch, `graph_commit_id`, source physical manifest branch and version,
-  manifest schema stamp, `created_at`, and `actor`;
-- `checkpoint_table:<checkpoint_id>:<stable-table-id>:<incarnation-hash>` — one
+  source-manifest `physical_ref_incarnation`, manifest schema stamp,
+  `created_at`, and `actor`;
+- `checkpoint_table:<checkpoint_id>:<stable-table-id>:<incarnation-id>` — one
   row per pinned table containing stable table identity, table key,
-  `table_path`, `table_branch`, `table_version`, and physical incarnation.
+  `table_path`, `table_branch`, `table_version`, and a separately named
+  `physical_ref_incarnation` token (e_tag or the proven backend fallback).
+
+Because RFC-024 heads are optional, RFC-025 owns this token contract for both
+the pinned manifest and every pinned table. The token identifies the immutable
+physical version object and its dataset/native-ref lineage for the exact
+`(path, branch, version)`; it is independent of RFC-028's logical incarnation.
+Use a strong object e_tag plus the Lance-native branch/dataset identifier when
+the backend exposes them, or another backend-specific token proven to change
+when a dataset/ref/version is deleted and recreated at the same coordinates.
+Timestamp, path, branch name, and numeric Lance version alone are not proofs.
+A backend without a token that passes local and S3/RustFS ABA guards cannot
+activate the retention format.
 
 The name reservation, header, and every table row land in one RFC-022 publisher
 CAS on main. First creation is insert-only; reuse requires the exact tombstoned
@@ -92,17 +110,18 @@ normalized name therefore conflict even when they captured different source
 branches. A missing or duplicate table row is an invalid checkpoint, not a
 partial checkpoint.
 
-Stable table identity/incarnation is a ship gate even when RFC-024 has not
-landed; checkpoint rows cannot key retention to mutable names. A deployment may
-reuse RFC-024's identity baseline, but durable heads themselves are not a
-dependency.
+[RFC-028](0028-stable-schema-identity.md)'s stable table ID and incarnation are
+a ship gate; checkpoint rows cannot key retention to mutable names. RFC-024 may
+provide the same manifest's bounded head/index access machinery when it lands,
+but it does not own or supply checkpoint identity.
 
 Deletion changes the name reservation from `live` to `tombstoned` and writes
 manifest tombstones for the checkpoint header and all table rows in one CAS.
 The reservation and every tombstone carry the same fresh
 `delete_operation_id`; that CAS is the durable delete/recovery marker. The
 retention claim may repeat the operation ID while the writer is live, but it is
-only a fence, never recovery authority. Checkpoint IDs are never reused.
+only a live-owner serialization claim, never a fencing token or recovery
+authority. Checkpoint IDs are never reused.
 
 Checkpoint create/delete are manifest metadata transactions. They do not create
 a graph-content commit or move `graph_head`: taking a checkpoint must not change
@@ -162,22 +181,26 @@ explicitly rejected because its branch-metadata step is an existence check
 followed by an unconditional put.
 
 The claim payload records operation ID, action, actor, creation time, and a
-random fencing/owner token. Every protected phase re-reads and verifies that
-token. Normal release verifies the exact token before deleting the claim; no
-other owner can replace it while create-if-absent observes the object. There is
-no time-based lease stealing. Crash takeover requires an explicit fleet write
-outage, classification of the sidecar/manifest operation marker, removal of the
-stale claim, and acquisition with a new token. A resumed stale process must
-fail its next token check.
+random owner token. It is an ownership check, **not** a fencing token. Every
+protected phase re-reads and verifies it, and normal release verifies the exact
+token before deleting the claim. There is no time-based lease stealing and no
+supported takeover while the prior process or host could resume.
+
+A crash leaves a non-takeoverable claim and safely over-retains. Operator
+recovery first establishes external process/host death or runs an explicit
+offline repair in an environment where the old credentials/process cannot
+resume; only then may it classify the sidecar/manifest operation marker, remove
+the stale claim, and acquire a new token. Merely declaring a fleet write outage,
+waiting, or observing an old timestamp is not death proof. Without that proof,
+recovery refuses and leaves the claim in place.
 
 A process-local mutex is only a contention optimization. The retention claim is
 held across tag creation or physical cleanup, preventing this race: cleanup
 computes roots, another process captures an untagged old version, then cleanup
-deletes it before the tag lands. A crash leaves the claim and therefore
-over-retains. Takeover first classifies the prior operation from its recovery
-sidecar and/or exact manifest operation marker, then may release the claim
-only after that operation is completed or safely aborted. It never steals on
-elapsed wall time alone.
+deletes it before the tag lands. After external death proof, offline repair
+classifies the prior operation from its recovery sidecar and/or exact manifest
+operation marker and may release the claim only after that operation is
+completed or safely aborted.
 
 The claim is not presented as a distributed reader/writer lock for arbitrary
 graph writes. Initial destructive cleanup is an **offline** operation: operators
@@ -195,9 +218,9 @@ Checkpoint creation is a writer on the RFC-022 pipeline:
 2. Authorize, capture one immutable source-branch manifest snapshot and graph
    commit, and prepare the complete header/table/tag set plus a `ReadSet` that
    includes source branch incarnation, source manifest version, format/schema
-   identity, applicable GC boundaries, and the main-registry name reservation;
-   a source at or behind a pruned-through boundary is refused even if its files
-   happen to remain.
+   identity, the source-manifest and every table physical-ref token, applicable
+   GC boundaries, and the main-registry name reservation; a source at or behind
+   a pruned-through boundary is refused even if its files happen to remain.
 3. Acquire the retention claim, checkpoint/cleanup process-local serialization,
    source branch-control gate, and adapter-declared metadata gates in RFC-022's
    canonical order. Ordinary data queues are not held merely because immutable
@@ -205,9 +228,12 @@ Checkpoint creation is a writer on the RFC-022 pipeline:
 4. Freshly revalidate the complete `ReadSet`. A changed branch incarnation,
    missing tag target, conflicting name, or format change releases the gates and
    restarts before any tag exists.
-5. Write a generic recovery sidecar containing the intended rows and tags.
-6. Create the manifest tag and every table tag idempotently. Existing correct
-   tags are no-ops; conflicting tags fail.
+5. Write a generic recovery sidecar containing the intended rows, tags, and
+   exact physical-ref tokens.
+6. Reopen and revalidate every exact version/token, then create the manifest
+   tag and every table tag idempotently. Existing tags are no-ops only when
+   their target and physical-ref token match; conflicting or recreated targets
+   fail closed.
 7. Verify every tag, then release source branch control. A source-head advance
    is harmless because the tags already pin the exact captured version;
    source-branch deletion takes the same retention claim, classifies overlapping
@@ -218,8 +244,10 @@ Checkpoint creation is a writer on the RFC-022 pipeline:
 10. Release the retention claim after the outcome is durably classifiable.
 
 A crash before step 8 leaves tags but no checkpoint. Recovery may complete the
-publish when every precondition still holds or remove the orphan tags. A crash
-after step 8 leaves a valid checkpoint even if sidecar cleanup did not finish.
+publish only when every exact version/token precondition still holds, or remove
+only tags proven to belong to that sidecar. A same-path/ref/version replacement
+is never adopted; ambiguity fails closed and safely over-retains. A crash after
+step 8 leaves a valid checkpoint even if sidecar cleanup did not finish.
 
 ## 4. Checkpoint delete protocol
 
@@ -252,8 +280,10 @@ The reconciler:
 
 1. reads the live checkpoint rows once;
 2. classifies checkpoint sidecars before touching apparently orphaned tags;
-3. creates or verifies every required tag;
-4. deletes internal tags proven to have no live or in-flight authority;
+3. reopens every pinned manifest/table version and validates its recorded
+   physical-ref token before creating or verifying the required tag;
+4. deletes internal tags only when their exact target/token is proven to have
+   no live or in-flight authority;
 5. emits a typed result for repaired pins, reclaimed pins, and failures.
 
 `cleanup` is fail-closed: any missing, conflicting, unreadable, or ambiguous
@@ -266,6 +296,22 @@ It may run concurrently across independent graphs, but it must not delete a
 tag belonging to a foreign process's live create sidecar.
 
 ## 6. Cleanup protocol and pruned-through boundary
+
+The retention format stores exactly one current
+`gc_boundary:<dataset-lineage-hash>` row for every registered cleanup-eligible
+manifest or data-table lineage. Target initialization creates those rows with
+`cutoff = 0`, `cleanup_operation_id = null`, and `advanced_at = null`. A later
+AddType, physical rematerialization, or new cleanup-eligible lineage creates its
+own zero row in the same SchemaApply/registration publish that makes the
+lineage live; it never inherits another physical lineage's cutoff. A removed or
+rematerialized old lineage retains its row while any branch, checkpoint,
+recovery intent, or physical cleanup can still address it. The row is
+tombstoned only after that lineage is provably unreachable and reclaimed under
+the retention claim. Missing, duplicate, or mismatched rows are corruption and
+fail cleanup/recovery closed—absence is not an implicit zero. The lineage hash
+excludes mutable HEAD version but includes the dataset/ref lineage component of
+§2.1's physical-ref token, so ordinary commits retain the row while
+delete/recreate cannot revive it.
 
 The cleanup root set is:
 
@@ -287,11 +333,13 @@ must be repaired before retention work.
 Read-only preview may run without a claim, but it is explicitly provisional.
 Confirmed execution uses this order:
 
-1. establish the operator write outage, persistently seal/fold streams through
-   RFC-026 **before** taking the retention claim, and complete the RFC-022
-   recovery barrier;
-2. acquire the retention claim, then revalidate the fleet outage, every stream's
-   `SEALED` cut, and absence of recovery sidecars;
+1. establish the operator write outage; when the graph format includes RFC-026
+   and any target table is stream-enrolled, persistently seal/fold those streams
+   **before** taking the retention claim; then complete the RFC-022 recovery
+   barrier;
+2. acquire the retention claim, then revalidate the fleet outage, absence of
+   recovery sidecars, and—only when streaming is present—the exact `SEALED`
+   cuts; a retention-only graph has no stream gate or RFC-026 dependency;
 3. run pin reconciliation and recompute the exact root set and per-dataset
    cutoffs under the claim, including the oldest live lazy-branch inherited-main
    floor above;
@@ -321,9 +369,10 @@ never starts with an armed recovery that may still need an older version.
 Per-table cleanup remains fault-isolated, but partial operational success is
 reported explicitly. A successful table does not hide another table's error.
 The claim metadata plus `gc_boundary` operation ID is the cleanup recovery
-marker: takeover resumes or reports the remaining table units under the same
-root digest before releasing the claim; it does not silently recompute a
-broader destructive plan after a partial run.
+marker: after externally proven owner death, authorized offline recovery
+resumes or reports the remaining table units under the same root digest before
+releasing the claim; it does not silently recompute a broader destructive plan
+after a partial run.
 
 ### 6.1 Operational cadence — the cost of never running this
 
@@ -366,27 +415,45 @@ hit the same engine gate as the CLI. HTTP management endpoints are out of scope
 until server-side maintenance has a general design; no transport-only bypass is
 introduced here.
 
-## 8. Migration and compatibility
+## 8. Format activation and rebuild compatibility
 
 This RFC owns its own internal-format activation. RFC-022 authorizes no format
 bump, and RFC-024 explicitly excludes checkpoint rows from its heads format.
-The retention format may receive the next schema version after heads, or the
-two may share one release only if both RFCs are independently accepted and
-RFC-024 is amended before implementation. A fresh activated graph starts with
-no named checkpoints and a zero pruned-through boundary. No older commit is
-silently promoted into a checkpoint.
+Retention may therefore be the next independently accepted format capability
+after RFC-028 even when durable heads are absent. A heads-free target writes
+RFC-028 identity plus retention rows in its first valid state and resolves the
+bounded checkpoint registry through retention's own structured lookup; it does
+not rely on table-head rows. If heads already exist in the source format, a
+later retention target preserves that accepted capability and initializes the
+combined format. Heads and retention may also co-release only after both RFCs
+are independently accepted and the combined initialization, lookup, refusal,
+recovery, and rebuild matrix passes. A fresh activated graph starts with no
+named checkpoints and the explicit per-lineage zero boundary rows defined in
+§6. No older commit is silently promoted into a checkpoint.
 
-The upgrade mechanism must be chosen before implementation:
+Activation follows the existing strict-single-version strand. A retention-
+capable binary refuses an older graph before checkpoint/tag logic runs; an old
+binary refuses the retention-format stamp. Existing graphs are exported with a
+binary that reads the source format, then loaded into a separately initialized
+target graph whose first valid state already carries the retention capability.
+There is no in-place checkpoint backfill, predecessor dispatcher, or partial
+activation.
 
-- an in-place upgrade preserves branches and history and must define quiescence,
-  crash recovery, stamp ordering, and rollback;
-- export/import creates a fresh graph at the new format but loses the old commit
-  DAG, branches, snapshots, and time-travel history. Those losses must be shown
-  in the plan and confirmation output; there is nothing left to backfill as a
-  checkpoint.
+The rebuilt target starts with zero named checkpoints and explicit zero
+pruned-through rows for every initial cleanup-eligible lineage. It preserves
+the selected branch's current rows, vectors, blobs, and schema shape, but loses
+the old commit DAG, branches, snapshots, tombstones, recovery intents, recovery
+audit/history, time-travel history, and historical checkpoints. The source
+recovery barrier must resolve every active intent before export; completed
+recovery history is not transferred. An important checkpoint or branch snapshot
+must be exported into a separate target graph before cutover. Those losses
+appear in plan/confirmation output. A failed target rebuild does not mutate the
+source.
 
-Mixed-version writers are unsupported. An old binary must not write after the
-retention format stamp or tag protocol becomes authoritative.
+Mixed-version writers are unsupported. If retention co-releases with heads or
+another independently accepted capability, the first valid target state
+contains all of them and the combined initialization/recovery matrix must pass.
+Separate format releases imply separate rebuilds.
 
 ## 9. Observability and bounds
 
@@ -422,6 +489,10 @@ share the main-manifest CAS.
   to bypass the pin.
 - The source `__manifest` version survives cleanup; data-table tags without the
   manifest tag fail the checkpoint-validity test.
+- Local and S3/RustFS delete/recreate races reuse the same manifest/table
+  path, branch name, and numeric version with a different physical-ref token;
+  checkpoint create, recovery, and reconciliation all refuse the replacement.
+  A backend without a proven token refuses retention-format activation.
 - Concurrent creation of the same normalized name yields exactly one authority
   record; the losing attempt leaves only safely reclaimable tags.
 - After deletion, concurrent attempts to reuse the tombstoned name generation
@@ -431,16 +502,26 @@ share the main-manifest CAS.
   converges to valid pins or safe over-retention.
 - Missing live tags are repaired before cleanup; conflicting tags block cleanup.
 - The retention claim blocks checkpoint create/delete/reconcile and branch delete
-  during cleanup on local FS and S3; destructive cleanup refuses active streams
-  or recovery sidecars.
-- Two-process races prove the atomic retention claim, not a process-local gate,
-  closes checkpoint-vs-branch-delete windows; crash takeover never relies on
-  wall-clock expiry alone.
+  during cleanup on local FS and S3; destructive cleanup refuses recovery
+  sidecars and, when streaming is an active capability, non-`SEALED` streams.
+- Initialization, AddType, and rematerialization tests create the exact
+  per-lineage boundary row; removal retains it through the final reachable
+  checkpoint/recovery/physical cleanup and tombstones it only afterward.
+  Missing/duplicate rows fail closed and a new physical lineage never inherits
+  an old nonzero cutoff.
+- Two-process races prove that the atomic retention claim, not a process-local
+  gate, closes checkpoint-vs-branch-delete windows; a paused live owner causes
+  takeover to be refused even after its final token check.
 - Local and S3 claim tests prove `PutMode::Create` admits exactly one owner and
-  that mismatched owner tokens cannot release another operation's claim.
+  that mismatched owner tokens cannot perform a normal release. A subprocess
+  death/offline-repair test is required before stale-claim removal.
 - A documented fleet write-outage test runs writers before and after cleanup;
   online writer-vs-cleanup concurrency is explicitly not advertised.
-- Genuine cross-version tests cover the selected upgrade path.
+- Genuine cross-version tests prove old/new mutual refusal and old-binary
+  export followed by new-binary init/load, including the documented loss of
+  checkpoints, branches, commit DAG, snapshots, tombstones, recovery
+  intents/audit/history, and time travel; export refuses an active recovery
+  intent.
 - Cost tests use `helpers::cost` at realistic commit depth and prove that a
   steady checkpoint list/lookup and cleanup plan do not grow with commit count
   once physical layout is held constant, including a bounded uncovered tail.
@@ -449,7 +530,7 @@ share the main-manifest CAS.
 
 | Phase | Content | Gate |
 |---|---|---|
-| A | row schemas, engine DTOs, format activation, deterministic tag encoding | schema and tag surface guards |
+| A | row schemas, engine DTOs, strict-format/rebuild activation, deterministic tag encoding | schema, refusal, and tag surface guards |
 | B | create sidecar, delete-operation fields in the authority CAS, and reconciler | crash matrix; sparse-pin correctness |
 | C | offline cleanup integration and GC boundary enforcement | quiescence/refusal tests; cost budgets |
-| D | CLI, policy, audit, docs, and selected migration path | CLI outputs; genuine upgrade test |
+| D | CLI, policy, audit, docs, and rebuild runbook | CLI outputs; genuine upgrade test |

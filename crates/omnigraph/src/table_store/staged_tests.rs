@@ -20,13 +20,20 @@
 //!    behavior so a future change either (a) preserves it or
 //!    (b) consciously fixes it (and updates this test).
 
-use crate::storage_layer::IndexBuildSpec;
+use crate::error::OmniError;
+use crate::instrumentation::{MergeWriteProbes, with_merge_write_probes};
+use crate::storage_layer::{
+    IndexBuildSpec, KEYED_WRITE_MAX_BYTES, KEYED_WRITE_MAX_ROWS, KeyedWriteSemantics,
+    PendingScanBudget, ProvenInsertChunk, SnapshotHandle,
+};
 use crate::table_store::{StagedWrite, TableStore};
-use arrow_array::{Array, Int32Array, RecordBatch, StringArray, UInt64Array};
+use arrow_array::{Array, Int32Array, RecordBatch, StringArray, StructArray, UInt64Array};
 use arrow_schema::{DataType, Field, Schema};
 use futures::TryStreamExt;
 use lance::Dataset;
+use lance::dataset::transaction::Operation;
 use lance::dataset::{DeleteBuilder, WhenMatched, WhenNotMatched};
+use lance::datatypes::LANCE_UNENFORCED_PRIMARY_KEY;
 use lance_table::format::Fragment;
 
 /// A standalone Lance `Session` per test store (this binary is primitive-level
@@ -36,9 +43,22 @@ fn test_session() -> std::sync::Arc<lance::session::Session> {
 }
 use std::sync::Arc;
 
+use super::PendingScanAccount;
+
 fn person_schema() -> Arc<Schema> {
     Arc::new(Schema::new(vec![
         Field::new("id", DataType::Utf8, false),
+        Field::new("age", DataType::Int32, true),
+    ]))
+}
+
+fn person_pk_schema() -> Arc<Schema> {
+    Arc::new(Schema::new(vec![
+        Field::new("id", DataType::Utf8, false).with_metadata(
+            [(LANCE_UNENFORCED_PRIMARY_KEY.to_string(), "true".to_string())]
+                .into_iter()
+                .collect(),
+        ),
         Field::new("age", DataType::Int32, true),
     ]))
 }
@@ -72,11 +92,92 @@ fn person_batch(rows: &[(&str, Option<i32>)]) -> RecordBatch {
     .unwrap()
 }
 
+fn person_pk_batch(rows: &[(&str, Option<i32>)]) -> RecordBatch {
+    let ids: Vec<&str> = rows.iter().map(|(id, _)| *id).collect();
+    let ages: Vec<Option<i32>> = rows.iter().map(|(_, age)| *age).collect();
+    RecordBatch::try_new(
+        person_pk_schema(),
+        vec![
+            Arc::new(StringArray::from(ids)),
+            Arc::new(Int32Array::from(ages)),
+        ],
+    )
+    .unwrap()
+}
+
+fn nested_person_pk_batch(rows: &[(&str, i32)]) -> RecordBatch {
+    let ids: Vec<&str> = rows.iter().map(|(id, _)| *id).collect();
+    let ranks = Int32Array::from(rows.iter().map(|(_, rank)| *rank).collect::<Vec<_>>());
+    let profile = StructArray::from(vec![(
+        Arc::new(Field::new("rank", DataType::Int32, false)),
+        Arc::new(ranks) as Arc<dyn Array>,
+    )]);
+    let schema = Arc::new(Schema::new(vec![
+        Field::new("id", DataType::Utf8, false).with_metadata(
+            [(LANCE_UNENFORCED_PRIMARY_KEY.to_string(), "true".to_string())]
+                .into_iter()
+                .collect(),
+        ),
+        Field::new("profile", profile.data_type().clone(), false),
+    ]));
+    RecordBatch::try_new(
+        schema,
+        vec![Arc::new(StringArray::from(ids)), Arc::new(profile)],
+    )
+    .unwrap()
+}
+
+fn blob_person_pk_batch(id: &str, payload: &[u8]) -> RecordBatch {
+    let mut content = lance::blob::BlobArrayBuilder::new(1);
+    content.push_bytes(payload).unwrap();
+    let schema = Arc::new(Schema::new(vec![
+        Field::new("id", DataType::Utf8, false).with_metadata(
+            [(LANCE_UNENFORCED_PRIMARY_KEY.to_string(), "true".to_string())]
+                .into_iter()
+                .collect(),
+        ),
+        lance::blob::blob_field("content", true),
+    ]));
+    RecordBatch::try_new(
+        schema,
+        vec![
+            Arc::new(StringArray::from(vec![id])) as _,
+            content.finish().unwrap(),
+        ],
+    )
+    .unwrap()
+}
+
+fn staged_key_filter(
+    staged: &StagedWrite,
+) -> &lance::dataset::write::merge_insert::inserted_rows::KeyExistenceFilter {
+    match &staged.transaction.operation {
+        Operation::Update {
+            inserted_rows_filter: Some(filter),
+            ..
+        } => filter,
+        other => panic!("expected filter-bearing Operation::Update, got {other:?}"),
+    }
+}
+
 fn numbered_person_batch(range: std::ops::Range<i32>) -> RecordBatch {
     let ids: Vec<String> = range.clone().map(|i| format!("p{i}")).collect();
     let ages: Vec<Option<i32>> = range.map(Some).collect();
     RecordBatch::try_new(
         person_schema(),
+        vec![
+            Arc::new(StringArray::from(ids)),
+            Arc::new(Int32Array::from(ages)),
+        ],
+    )
+    .unwrap()
+}
+
+fn numbered_person_pk_batch(range: std::ops::Range<i32>) -> RecordBatch {
+    let ids: Vec<String> = range.clone().map(|i| format!("p{i}")).collect();
+    let ages: Vec<Option<i32>> = range.map(Some).collect();
+    RecordBatch::try_new(
+        person_pk_schema(),
         vec![
             Arc::new(StringArray::from(ids)),
             Arc::new(Int32Array::from(ages)),
@@ -123,6 +224,49 @@ fn collect_age_for_id(batches: &[RecordBatch], needle: &str) -> Option<i32> {
         }
     }
     None
+}
+
+#[test]
+fn pending_scan_budget_caps_are_inclusive_and_one_over_is_typed() {
+    PendingScanAccount::new(PendingScanBudget::new(
+        "test:people",
+        KEYED_WRITE_MAX_ROWS as u64,
+        KEYED_WRITE_MAX_BYTES,
+    ))
+    .expect("the exact keyed row/byte limits are inclusive");
+
+    let row_error = PendingScanAccount::new(PendingScanBudget::new(
+        "test:people",
+        KEYED_WRITE_MAX_ROWS as u64 + 1,
+        0,
+    ))
+    .err()
+    .expect("one row over must be rejected");
+    assert!(matches!(
+        row_error,
+        OmniError::ResourceLimitExceeded {
+            ref resource,
+            limit: 8192,
+            actual: 8193,
+        } if resource == "keyed rows for test:people"
+    ));
+
+    let byte_error = PendingScanAccount::new(PendingScanBudget::new(
+        "test:people",
+        0,
+        KEYED_WRITE_MAX_BYTES + 1,
+    ))
+    .err()
+    .expect("one byte over must be rejected");
+    assert!(matches!(
+        byte_error,
+        OmniError::ResourceLimitExceeded {
+            ref resource,
+            limit: KEYED_WRITE_MAX_BYTES,
+            actual,
+        } if resource == "keyed bytes for test:people"
+            && actual == KEYED_WRITE_MAX_BYTES + 1
+    ));
 }
 
 #[tokio::test]
@@ -218,6 +362,935 @@ async fn stage_merge_insert_dedupes_superseded_committed_fragment() {
 }
 
 #[tokio::test]
+async fn keyed_upsert_forces_filter_route_and_preserves_conflict_metadata() {
+    let dir = tempfile::tempdir().unwrap();
+    let uri = format!("{}/people.lance", dir.path().to_str().unwrap());
+    let store = TableStore::new(dir.path().to_str().unwrap(), test_session());
+    let ds = TableStore::write_dataset(&uri, person_pk_batch(&[("alice", Some(30))]))
+        .await
+        .unwrap();
+
+    // An id BTREE makes beta.21's default merge route select v1, which emits
+    // no key filter.  The keyed adapter must override that routing choice.
+    let staged_index = store
+        .stage_create_indices(
+            &ds,
+            &[IndexBuildSpec::BTree {
+                column: "id".to_string(),
+            }],
+        )
+        .await
+        .unwrap();
+    let ds = store
+        .commit_staged(Arc::new(ds), staged_index)
+        .await
+        .unwrap();
+    assert!(store.has_btree_index(&ds, "id").await.unwrap());
+
+    let id_field_id = ds.schema().field("id").unwrap().id;
+    let staged = store
+        .stage_keyed_write(
+            ds.clone(),
+            "Person",
+            person_pk_batch(&[("alice", Some(31)), ("bob", Some(25))]),
+            KeyedWriteSemantics::Upsert,
+        )
+        .await
+        .unwrap();
+    assert!(
+        !super::has_insert_absence_certificate(&staged.transaction),
+        "an upsert that updates any row must not carry the insertion-only absence certificate"
+    );
+    assert_eq!(staged_key_filter(&staged).field_ids, vec![id_field_id]);
+    assert!(
+        staged.commit_metadata.affected_rows.is_some(),
+        "the keyed adapter must carry Lance's affected-row rebase metadata"
+    );
+
+    let committed = store.commit_staged(Arc::new(ds), staged).await.unwrap();
+    let batches = store.scan_batches(&committed).await.unwrap();
+    assert_eq!(collect_ids(&batches), vec!["alice", "bob"]);
+    assert_eq!(collect_age_for_id(&batches, "alice"), Some(31));
+}
+
+#[tokio::test]
+async fn all_new_upsert_certifies_insert_absence_and_persists_it_in_history() {
+    let dir = tempfile::tempdir().unwrap();
+    let uri = format!("{}/people.lance", dir.path().to_str().unwrap());
+    let store = TableStore::new(dir.path().to_str().unwrap(), test_session());
+    let ds = TableStore::write_dataset(&uri, person_pk_batch(&[("alice", Some(30))]))
+        .await
+        .unwrap();
+    let base_version = ds.version().version;
+
+    let mut staged = store
+        .stage_keyed_write(
+            ds.clone(),
+            "Person",
+            person_pk_batch(&[("bob", Some(25))]),
+            KeyedWriteSemantics::Upsert,
+        )
+        .await
+        .unwrap();
+    assert!(
+        super::has_insert_absence_certificate(&staged.transaction),
+        "an all-new upsert must automatically receive the optional insertion-absence certificate"
+    );
+    let schema_preorder_ids = ds
+        .schema()
+        .fields_pre_order()
+        .map(|field| field.id as u32)
+        .collect::<Vec<_>>();
+    let properties = Arc::make_mut(staged.transaction.transaction_properties.as_mut().unwrap());
+    properties.remove(super::INSERT_ABSENCE_PROPERTY);
+    properties.insert("lance.test_property".to_string(), "preserve-me".to_string());
+    super::certify_insert_absence(
+        &mut staged.transaction,
+        base_version,
+        ds.schema().field("id").unwrap().id,
+        &schema_preorder_ids,
+        &["bob".to_string()],
+        "all_new_upsert_certificate_test",
+    )
+    .unwrap();
+    let mut rebound = staged.transaction_identity();
+    rebound.uuid = ulid::Ulid::new().to_string();
+    staged.bind_transaction_identity(&rebound).unwrap();
+    assert!(
+        super::has_insert_absence_certificate(&staged.transaction),
+        "an all-new upsert's completed merge proves every inserted id absent from its parent"
+    );
+    assert!(
+        staged.strict_source_ids.is_none(),
+        "certification must not change upsert conflict-normalization semantics"
+    );
+    assert_eq!(
+        staged
+            .transaction
+            .transaction_properties
+            .as_ref()
+            .and_then(|properties| properties.get("lance.test_property"))
+            .map(String::as_str),
+        Some("preserve-me"),
+        "certificate minting and UUID rebinding must preserve unrelated transaction properties"
+    );
+
+    let committed = store.commit_staged(Arc::new(ds), staged).await.unwrap();
+    let committed_version = committed.version().version;
+    let reopened = Dataset::open(&uri).await.unwrap();
+    let persisted = reopened
+        .read_transaction_by_version(committed_version)
+        .await
+        .unwrap()
+        .expect("committed all-new upsert transaction");
+    assert!(
+        super::has_insert_absence_certificate(&persisted),
+        "certificate must survive commit and reopen"
+    );
+    assert_eq!(
+        persisted
+            .transaction_properties
+            .as_ref()
+            .and_then(|properties| properties.get("lance.test_property"))
+            .map(String::as_str),
+        Some("preserve-me")
+    );
+
+    let history = reopened
+        .delta()
+        .with_begin_version(base_version)
+        .with_end_version(committed_version)
+        .build()
+        .unwrap()
+        .list_transactions()
+        .await
+        .unwrap();
+    assert_eq!(history.len(), 1);
+    assert!(super::has_insert_absence_certificate(&history[0]));
+}
+
+#[tokio::test]
+async fn keyed_strict_insert_preflights_typed_conflict_without_changing_mode() {
+    let dir = tempfile::tempdir().unwrap();
+    let uri = format!("{}/people.lance", dir.path().to_str().unwrap());
+    let store = TableStore::new(dir.path().to_str().unwrap(), test_session());
+    let ds = TableStore::write_dataset(&uri, person_pk_batch(&[("alice", Some(30))]))
+        .await
+        .unwrap();
+    let base_version = ds.version().version;
+
+    let error = store
+        .stage_keyed_write(
+            ds.clone(),
+            "Person",
+            person_pk_batch(&[("alice", Some(99))]),
+            KeyedWriteSemantics::StrictInsert,
+        )
+        .await
+        .unwrap_err();
+    assert!(matches!(
+        error,
+        OmniError::KeyConflict { table_key, key }
+            if table_key == "Person" && key.as_deref() == Some("alice")
+    ));
+    assert_eq!(
+        Dataset::open(&uri).await.unwrap().version().version,
+        base_version
+    );
+
+    // A fresh strict key still stages the filter-bearing Update transaction;
+    // strict semantics are not implemented as a preflight-only shortcut.
+    let probes = MergeWriteProbes::default();
+    let staged = with_merge_write_probes(
+        probes.clone(),
+        store.stage_keyed_write(
+            ds.clone(),
+            "Person",
+            person_pk_batch(&[("bob", Some(25))]),
+            KeyedWriteSemantics::StrictInsert,
+        ),
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        probes.strict_insert_preflight_calls(),
+        1,
+        "general strict insert must exact-probe the pinned target once"
+    );
+    assert!(
+        super::has_insert_absence_certificate(&staged.transaction),
+        "verified general strict insert must carry the durable absence certificate"
+    );
+    assert_eq!(
+        staged_key_filter(&staged).field_ids,
+        vec![ds.schema().field("id").unwrap().id]
+    );
+    let committed = store.commit_staged(Arc::new(ds), staged).await.unwrap();
+    let persisted = committed
+        .read_transaction()
+        .await
+        .unwrap()
+        .expect("committed strict-insert transaction");
+    assert!(
+        super::has_insert_absence_certificate(&persisted),
+        "strict-insert certificate must survive Lance transaction serialization"
+    );
+    assert_eq!(
+        collect_ids(&store.scan_batches(&committed).await.unwrap()),
+        vec!["alice", "bob"]
+    );
+}
+
+#[tokio::test]
+async fn proven_strict_insert_pins_update_shape_and_leaves_new_fragments_unindexed() {
+    let dir = tempfile::tempdir().unwrap();
+    let uri = format!("{}/people.lance", dir.path().to_str().unwrap());
+    let store = TableStore::new(dir.path().to_str().unwrap(), test_session());
+    let ds = TableStore::write_dataset(&uri, nested_person_pk_batch(&[("alice", 1)]))
+        .await
+        .unwrap();
+    let staged_index = store
+        .stage_create_indices(
+            &ds,
+            &[IndexBuildSpec::BTree {
+                column: "id".to_string(),
+            }],
+        )
+        .await
+        .unwrap();
+    let ds = store
+        .commit_staged(Arc::new(ds), staged_index)
+        .await
+        .unwrap();
+    assert!(!TableStore::has_unindexed_fragments(&ds).await.unwrap());
+
+    let expected_field_ids = ds
+        .schema()
+        .fields_pre_order()
+        .map(|field| field.id as u32)
+        .collect::<Vec<_>>();
+    assert!(
+        expected_field_ids.len() > 2,
+        "fixture must include nested field ids, not only top-level columns"
+    );
+    let staged = store
+        .stage_proven_strict_insert(
+            ds.clone(),
+            ProvenInsertChunk::from_verified_history(
+                &SnapshotHandle::new(ds.clone()),
+                "Person",
+                nested_person_pk_batch(&[("bob", 2)]),
+                0,
+            )
+            .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert!(
+        super::has_insert_absence_certificate(&staged.transaction),
+        "proven adapter must propagate the absence certificate"
+    );
+    assert!(
+        staged.commit_metadata.affected_rows.is_some(),
+        "the pin-coupled adapter mirrors Lance's pure-insert merge metadata"
+    );
+    match &staged.transaction.operation {
+        Operation::Update {
+            removed_fragment_ids,
+            updated_fragments,
+            new_fragments,
+            fields_modified,
+            merged_generations,
+            fields_for_preserving_frag_bitmap,
+            update_mode,
+            inserted_rows_filter,
+            updated_fragment_offsets,
+        } => {
+            assert!(removed_fragment_ids.is_empty());
+            assert!(updated_fragments.is_empty());
+            assert!(!new_fragments.is_empty());
+            assert!(fields_modified.is_empty());
+            assert!(merged_generations.is_empty());
+            assert_eq!(fields_for_preserving_frag_bitmap, &expected_field_ids);
+            assert_eq!(
+                update_mode,
+                &Some(lance::dataset::transaction::UpdateMode::RewriteRows)
+            );
+            assert_eq!(
+                inserted_rows_filter.as_ref().unwrap().field_ids,
+                vec![ds.schema().field("id").unwrap().id]
+            );
+            assert!(updated_fragment_offsets.is_none());
+        }
+        other => panic!("expected filter-bearing insert-only Update, got {other:?}"),
+    }
+
+    let committed = store.commit_staged(Arc::new(ds), staged).await.unwrap();
+    let persisted = committed
+        .read_transaction()
+        .await
+        .unwrap()
+        .expect("committed transaction file");
+    assert!(
+        super::has_insert_absence_certificate(&persisted),
+        "proven absence certificate must survive transaction serialization"
+    );
+    assert_eq!(
+        super::certified_insert_absence_rows(
+            &persisted,
+            persisted.read_version,
+            committed.schema().field("id").unwrap().id,
+            &expected_field_ids,
+        ),
+        Some(1),
+        "a proven adapter output must itself be admissible as the next history-proof link"
+    );
+    match persisted.operation {
+        Operation::Update {
+            fields_for_preserving_frag_bitmap,
+            inserted_rows_filter: Some(filter),
+            update_mode,
+            ..
+        } => {
+            assert_eq!(fields_for_preserving_frag_bitmap, expected_field_ids);
+            assert_eq!(
+                update_mode,
+                Some(lance::dataset::transaction::UpdateMode::RewriteRows)
+            );
+            assert_eq!(
+                filter.field_ids,
+                vec![committed.schema().field("id").unwrap().id]
+            );
+        }
+        other => panic!("persisted proven insert lost its Update/filter shape: {other:?}"),
+    }
+    assert!(
+        TableStore::has_unindexed_fragments(&committed)
+            .await
+            .unwrap(),
+        "the pre-existing BTREE must not claim the newly inserted fragment"
+    );
+    assert_eq!(
+        TableStore::first_existing_id(&committed, &["bob".to_string()])
+            .await
+            .unwrap(),
+        Some("bob".to_string()),
+        "indexed lookup must retain its uncovered-fragment correctness fallback"
+    );
+}
+
+#[tokio::test]
+async fn concurrent_proven_strict_inserts_of_same_key_land_exactly_one_effect() {
+    let dir = tempfile::tempdir().unwrap();
+    let uri = format!("{}/people.lance", dir.path().to_str().unwrap());
+    let store = TableStore::new(dir.path().to_str().unwrap(), test_session());
+    let base = TableStore::write_dataset(&uri, person_pk_batch(&[("alice", Some(30))]))
+        .await
+        .unwrap();
+
+    let first = store
+        .stage_proven_strict_insert(
+            base.clone(),
+            ProvenInsertChunk::from_verified_history(
+                &SnapshotHandle::new(base.clone()),
+                "Person",
+                person_pk_batch(&[("bob", Some(25))]),
+                0,
+            )
+            .unwrap(),
+        )
+        .await
+        .unwrap();
+    let second = store
+        .stage_proven_strict_insert(
+            base.clone(),
+            ProvenInsertChunk::from_verified_history(
+                &SnapshotHandle::new(base.clone()),
+                "Person",
+                person_pk_batch(&[("bob", Some(26))]),
+                1,
+            )
+            .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    store
+        .commit_staged_exact(Arc::new(base.clone()), first)
+        .await
+        .unwrap();
+    let error = store
+        .commit_staged_exact(Arc::new(base), second)
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(error, OmniError::RetryableCommitConflict(_)),
+        "same-key filtered loser must fail loudly, got {error:?}"
+    );
+
+    let latest = Dataset::open(&uri).await.unwrap();
+    let batches = store.scan_batches(&latest).await.unwrap();
+    assert_eq!(collect_ids(&batches), vec!["alice", "bob"]);
+    assert_eq!(collect_age_for_id(&batches, "bob"), Some(25));
+}
+
+#[tokio::test]
+async fn proven_insert_chunk_rejects_target_version_reuse_before_staging() {
+    let dir = tempfile::tempdir().unwrap();
+    let uri = format!("{}/people.lance", dir.path().to_str().unwrap());
+    let store = TableStore::new(dir.path().to_str().unwrap(), test_session());
+    let base = TableStore::write_dataset(&uri, person_pk_batch(&[("alice", Some(30))]))
+        .await
+        .unwrap();
+    let chunk = ProvenInsertChunk::from_verified_history(
+        &SnapshotHandle::new(base.clone()),
+        "Person",
+        person_pk_batch(&[("bob", Some(25))]),
+        7,
+    )
+    .unwrap();
+
+    let advance = store
+        .stage_keyed_write(
+            base.clone(),
+            "Person",
+            person_pk_batch(&[("carol", Some(40))]),
+            KeyedWriteSemantics::StrictInsert,
+        )
+        .await
+        .unwrap();
+    let (advanced, _) = store
+        .commit_staged_exact(Arc::new(base), advance)
+        .await
+        .unwrap();
+    let version_before_rejection = advanced.version().version;
+
+    let error = store
+        .stage_proven_strict_insert(advanced, chunk)
+        .await
+        .unwrap_err();
+    assert!(
+        error.is_read_set_changed(),
+        "a chunk bound to an older target version must fail closed, got {error:?}"
+    );
+
+    let latest = Dataset::open(&uri).await.unwrap();
+    assert_eq!(latest.version().version, version_before_rejection);
+    assert_eq!(
+        collect_ids(&store.scan_batches(&latest).await.unwrap()),
+        vec!["alice", "carol"]
+    );
+}
+
+#[tokio::test]
+async fn proven_insert_rejects_prepared_blob_descriptors_before_staging() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path().to_str().unwrap();
+    let target_uri = format!("{root}/target.lance");
+    let source_uri = format!("{root}/source.lance");
+    let store = TableStore::new(root, test_session());
+    let target =
+        TableStore::write_dataset(&target_uri, blob_person_pk_batch("alice", b"target-owned"))
+            .await
+            .unwrap();
+    let source =
+        TableStore::write_dataset(&source_uri, blob_person_pk_batch("bob", b"source-owned"))
+            .await
+            .unwrap();
+    let prepared = store.scan_batches(&source).await.unwrap().remove(0);
+    assert!(
+        prepared
+            .column_by_name("content")
+            .unwrap()
+            .as_any()
+            .downcast_ref::<StructArray>()
+            .unwrap()
+            .column_by_name("kind")
+            .is_some(),
+        "fixture must carry Lance's prepared blob-v2 descriptor shape"
+    );
+    let chunk = ProvenInsertChunk::from_verified_history(
+        &SnapshotHandle::new(target.clone()),
+        "Person",
+        prepared,
+        0,
+    )
+    .unwrap();
+    let version_before_rejection = target.version().version;
+
+    let error = store
+        .stage_proven_strict_insert(target, chunk)
+        .await
+        .unwrap_err();
+    assert!(
+        error.to_string().contains("retained a prepared descriptor"),
+        "prepared source descriptors must fail before fragment staging, got {error:?}"
+    );
+
+    let latest = Dataset::open(&target_uri).await.unwrap();
+    assert_eq!(latest.version().version, version_before_rejection);
+    assert_eq!(
+        collect_ids(&store.scan_batches(&latest).await.unwrap()),
+        vec!["alice"]
+    );
+}
+
+#[tokio::test]
+async fn proven_and_general_strict_same_key_conflict_in_both_commit_orders() {
+    for proven_commits_first in [true, false] {
+        let dir = tempfile::tempdir().unwrap();
+        let uri = format!("{}/people.lance", dir.path().to_str().unwrap());
+        let store = TableStore::new(dir.path().to_str().unwrap(), test_session());
+        let base = TableStore::write_dataset(&uri, person_pk_batch(&[("alice", Some(30))]))
+            .await
+            .unwrap();
+        let proven = store
+            .stage_proven_strict_insert(
+                base.clone(),
+                ProvenInsertChunk::from_verified_history(
+                    &SnapshotHandle::new(base.clone()),
+                    "Person",
+                    person_pk_batch(&[("bob", Some(25))]),
+                    0,
+                )
+                .unwrap(),
+            )
+            .await
+            .unwrap();
+        let general = store
+            .stage_keyed_write(
+                base.clone(),
+                "Person",
+                person_pk_batch(&[("bob", Some(26))]),
+                KeyedWriteSemantics::StrictInsert,
+            )
+            .await
+            .unwrap();
+        let (winner, loser, expected_age) = if proven_commits_first {
+            (proven, general, 25)
+        } else {
+            (general, proven, 26)
+        };
+
+        store
+            .commit_staged_exact(Arc::new(base.clone()), winner)
+            .await
+            .unwrap();
+        let error = store
+            .commit_staged_exact(Arc::new(base), loser)
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(error, OmniError::RetryableCommitConflict(_)),
+            "mixed filtered loser must fail loudly (proven first: {proven_commits_first}), got {error:?}"
+        );
+
+        let latest = Dataset::open(&uri).await.unwrap();
+        let batches = store.scan_batches(&latest).await.unwrap();
+        assert_eq!(collect_ids(&batches), vec!["alice", "bob"]);
+        assert_eq!(collect_age_for_id(&batches, "bob"), Some(expected_age));
+    }
+}
+
+#[test]
+fn keyed_batch_validation_requires_non_null_utf8_unique_physical_ids() {
+    let dir = tempfile::tempdir().unwrap();
+    let store = TableStore::new(dir.path().to_str().unwrap(), test_session());
+
+    let duplicate = person_pk_batch(&[("alice", Some(30)), ("alice", Some(31))]);
+    let duplicate_error = store
+        .validate_keyed_write_batch("node:Person", &duplicate)
+        .unwrap_err();
+    assert!(matches!(
+        duplicate_error,
+        OmniError::KeyConflict { table_key, key }
+            if table_key == "node:Person" && key.as_deref() == Some("alice")
+    ));
+
+    let nullable_schema = Arc::new(Schema::new(vec![
+        Field::new("id", DataType::Utf8, true),
+        Field::new("age", DataType::Int32, true),
+    ]));
+    let null_id = RecordBatch::try_new(
+        nullable_schema,
+        vec![
+            Arc::new(StringArray::from(vec![None::<&str>])),
+            Arc::new(Int32Array::from(vec![Some(30)])),
+        ],
+    )
+    .unwrap();
+    assert!(
+        store
+            .validate_keyed_write_batch("node:Person", &null_id)
+            .unwrap_err()
+            .to_string()
+            .contains("null 'id'")
+    );
+
+    let non_utf8_schema = Arc::new(Schema::new(vec![
+        Field::new("id", DataType::Int32, false),
+        Field::new("age", DataType::Int32, true),
+    ]));
+    let non_utf8 = RecordBatch::try_new(
+        non_utf8_schema,
+        vec![
+            Arc::new(Int32Array::from(vec![1])),
+            Arc::new(Int32Array::from(vec![Some(30)])),
+        ],
+    )
+    .unwrap();
+    assert!(
+        store
+            .validate_keyed_write_batch("node:Person", &non_utf8)
+            .unwrap_err()
+            .to_string()
+            .contains("not Utf8")
+    );
+}
+
+#[tokio::test]
+async fn keyed_write_rejects_missing_or_non_id_primary_key() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path().to_str().unwrap();
+    let store = TableStore::new(root, test_session());
+
+    let missing_uri = format!("{root}/missing-pk.lance");
+    let missing = TableStore::write_dataset(&missing_uri, person_batch(&[("alice", Some(30))]))
+        .await
+        .unwrap();
+    let missing_error = store
+        .stage_keyed_write(
+            missing,
+            "Person",
+            person_batch(&[("bob", Some(25))]),
+            KeyedWriteSemantics::Upsert,
+        )
+        .await
+        .unwrap_err();
+    assert!(missing_error.to_string().contains("exactly ['id']"));
+
+    let wrong_schema = Arc::new(Schema::new(vec![
+        Field::new("id", DataType::Utf8, false),
+        Field::new("age", DataType::Int32, false).with_metadata(
+            [(LANCE_UNENFORCED_PRIMARY_KEY.to_string(), "true".to_string())]
+                .into_iter()
+                .collect(),
+        ),
+    ]));
+    let wrong_batch = RecordBatch::try_new(
+        wrong_schema,
+        vec![
+            Arc::new(StringArray::from(vec!["alice"])),
+            Arc::new(Int32Array::from(vec![Some(30)])),
+        ],
+    )
+    .unwrap();
+    let wrong_uri = format!("{root}/wrong-pk.lance");
+    let wrong = TableStore::write_dataset(&wrong_uri, wrong_batch.clone())
+        .await
+        .unwrap();
+    let wrong_error = store
+        .stage_keyed_write(wrong, "Person", wrong_batch, KeyedWriteSemantics::Upsert)
+        .await
+        .unwrap_err();
+    assert!(wrong_error.to_string().contains("got [\"age\"]"));
+}
+
+#[tokio::test]
+async fn keyed_write_stream_stages_source_dataset_without_wide_collection() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path().to_str().unwrap();
+    let target_uri = format!("{root}/target.lance");
+    let source_uri = format!("{root}/source.lance");
+    let store = TableStore::new(root, test_session());
+    let target = TableStore::write_dataset(&target_uri, person_pk_batch(&[("alice", Some(30))]))
+        .await
+        .unwrap();
+    let source = TableStore::write_dataset(
+        &source_uri,
+        person_pk_batch(&[("bob", Some(25)), ("carol", Some(40))]),
+    )
+    .await
+    .unwrap();
+
+    let staged = store
+        .stage_keyed_write_stream(
+            target.clone(),
+            "Person",
+            &source,
+            KeyedWriteSemantics::StrictInsert,
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        staged_key_filter(&staged).field_ids,
+        vec![target.schema().field("id").unwrap().id]
+    );
+    let committed = store.commit_staged(Arc::new(target), staged).await.unwrap();
+    assert_eq!(
+        collect_ids(&store.scan_batches(&committed).await.unwrap()),
+        vec!["alice", "bob", "carol"]
+    );
+    assert_eq!(source.version().version, 1, "source remains read-only");
+}
+
+#[tokio::test]
+async fn proven_insert_delta_scan_is_interval_exact_and_batch_bounded() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path().to_str().unwrap();
+    let source_uri = format!("{root}/source.lance");
+    let mut source = TableStore::write_dataset(&source_uri, person_pk_batch(&[("base", Some(30))]))
+        .await
+        .unwrap();
+    let begin_version = source.version().version;
+    lance_append_inline_local(&mut source, numbered_person_pk_batch(0..10_000)).await;
+    let end_version = source.version().version;
+
+    let mut stream =
+        TableStore::scan_proven_insert_delta_bounded(&source, "Person", begin_version, end_version)
+            .await
+            .unwrap();
+    let mut rows = 0_usize;
+    let mut batches = 0_usize;
+    while let Some(batch) = stream.try_next().await.unwrap() {
+        assert!(batch.num_rows() <= KEYED_WRITE_MAX_ROWS);
+        assert!(u64::try_from(batch.get_array_memory_size()).unwrap() <= KEYED_WRITE_MAX_BYTES);
+        let ids = batch
+            .column_by_name("id")
+            .unwrap()
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .unwrap();
+        assert!((0..ids.len()).all(|row| ids.value(row) != "base"));
+        rows += batch.num_rows();
+        batches += 1;
+    }
+    assert_eq!(rows, 10_000);
+    assert_eq!(batches, 2, "10K rows must be emitted as 8192 + 1808");
+    assert_eq!(
+        source.version().version,
+        end_version,
+        "the scan is read-only"
+    );
+}
+
+#[tokio::test]
+async fn proven_insert_delta_scan_normalizes_oversized_raw_emission() {
+    const APPENDS: usize = 9;
+    const ROWS_PER_APPEND: usize = 512;
+
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path().to_str().unwrap();
+    let source_uri = format!("{root}/source.lance");
+    let mut source = TableStore::write_dataset(&source_uri, person_pk_batch(&[("base", Some(0))]))
+        .await
+        .unwrap();
+    let begin_version = source.version().version;
+    let padding = "x".repeat(8 * 1024);
+    for append in 0..APPENDS {
+        let start = append * ROWS_PER_APPEND;
+        let ids = (start..start + ROWS_PER_APPEND)
+            .map(|row| format!("p{row:05}-{padding}"))
+            .collect::<Vec<_>>();
+        let batch = RecordBatch::try_new(
+            person_pk_schema(),
+            vec![
+                Arc::new(StringArray::from(ids)),
+                Arc::new(Int32Array::from(vec![Some(append as i32); ROWS_PER_APPEND])),
+            ],
+        )
+        .unwrap();
+        lance_append_inline_local(&mut source, batch).await;
+    }
+    let end_version = source.version().version;
+
+    let probes = MergeWriteProbes::default();
+    let (rows, normalized_batches) = with_merge_write_probes(probes.clone(), async {
+        let mut stream = TableStore::scan_proven_insert_delta_bounded(
+            &source,
+            "Person",
+            begin_version,
+            end_version,
+        )
+        .await
+        .unwrap();
+        let mut rows = 0_usize;
+        let mut batches = 0_usize;
+        while let Some(batch) = stream.try_next().await.unwrap() {
+            assert!(batch.num_rows() <= KEYED_WRITE_MAX_ROWS);
+            assert!(u64::try_from(batch.get_array_memory_size()).unwrap() <= KEYED_WRITE_MAX_BYTES);
+            rows += batch.num_rows();
+            batches += 1;
+        }
+        (rows, batches)
+    })
+    .await;
+
+    assert_eq!(rows, APPENDS * ROWS_PER_APPEND);
+    assert!(
+        normalized_batches >= 2,
+        "the ~36-MiB interval must cross the normalized transaction ceiling"
+    );
+    assert!(probes.proven_insert_raw_batch_calls() > 0);
+    assert!(
+        probes.proven_insert_raw_batch_max_bytes() > KEYED_WRITE_MAX_BYTES,
+        "fixture must expose Lance's approximate byte target before the hard normalizer: max raw batch was {} bytes",
+        probes.proven_insert_raw_batch_max_bytes()
+    );
+}
+
+#[test]
+fn proven_insert_delta_scan_never_enables_strict_batch_size() {
+    let source = include_str!("../table_store.rs");
+    let body = source
+        .split_once("pub async fn scan_proven_insert_delta_bounded(")
+        .unwrap()
+        .1
+        .split_once("/// Stage a merge_insert (upsert)")
+        .unwrap()
+        .0;
+    assert!(
+        !body.contains(".strict_batch_size("),
+        "strict row coalescing can return retained-parent slices; the bounded normalizer owns this boundary"
+    );
+}
+
+#[tokio::test]
+async fn proven_insert_boundary_normalizer_coalesces_safe_small_batches() {
+    let schema = person_pk_schema();
+    let batches = (0..10)
+        .map(|row| {
+            let batch = RecordBatch::try_new(
+                schema.clone(),
+                vec![
+                    Arc::new(StringArray::from(vec![format!("p{row}")])),
+                    Arc::new(Int32Array::from(vec![Some(row)])),
+                ],
+            )
+            .unwrap();
+            Ok(batch)
+        })
+        .collect::<Vec<_>>();
+    let reader = arrow_array::RecordBatchIterator::new(batches, schema.clone());
+    let raw = lance_datafusion::utils::reader_to_stream(Box::new(reader));
+    let output: Vec<RecordBatch> =
+        super::bounded_proven_insert_stream(schema, raw, "Person".to_string())
+            .try_collect()
+            .await
+            .unwrap();
+    assert_eq!(output.len(), 1);
+    assert_eq!(output[0].num_rows(), 10);
+    assert!(u64::try_from(output[0].get_array_memory_size()).unwrap() <= KEYED_WRITE_MAX_BYTES);
+}
+
+#[tokio::test]
+async fn proven_insert_boundary_normalizer_splits_retained_parent_lazily() {
+    let schema = person_pk_schema();
+    let valid_rows = KEYED_WRITE_MAX_ROWS * 3;
+    let mut ids = (0..valid_rows)
+        .map(|row| format!("p{row}"))
+        .collect::<Vec<_>>();
+    ids.push("x".repeat(usize::try_from(KEYED_WRITE_MAX_BYTES).unwrap() + 1));
+    let parent = RecordBatch::try_new(
+        schema.clone(),
+        vec![
+            Arc::new(StringArray::from(ids)),
+            Arc::new(Int32Array::from(vec![Some(0); valid_rows + 1])),
+        ],
+    )
+    .unwrap();
+    assert!(
+        u64::try_from(parent.get_array_memory_size()).unwrap() > KEYED_WRITE_MAX_BYTES,
+        "fixture must retain more than one transaction's byte ceiling"
+    );
+    let parent_values = parent
+        .column_by_name("id")
+        .unwrap()
+        .as_any()
+        .downcast_ref::<StringArray>()
+        .unwrap()
+        .value_data()
+        .as_ptr();
+
+    let reader = arrow_array::RecordBatchIterator::new([Ok(parent)], schema.clone());
+    let raw = lance_datafusion::utils::reader_to_stream(Box::new(reader));
+    let mut output = super::bounded_proven_insert_stream(schema, raw, "Person".to_string());
+
+    for _ in 0..3 {
+        let batch = output
+            .try_next()
+            .await
+            .unwrap()
+            .expect("valid prefix must be yielded before the late oversized row");
+        assert_eq!(batch.num_rows(), KEYED_WRITE_MAX_ROWS);
+        assert!(u64::try_from(batch.get_array_memory_size()).unwrap() <= KEYED_WRITE_MAX_BYTES);
+        let values = batch
+            .column_by_name("id")
+            .unwrap()
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .unwrap()
+            .value_data();
+        assert_ne!(
+            values.as_ptr(),
+            parent_values,
+            "each yielded split must own compact buffers instead of retaining the wide parent"
+        );
+    }
+
+    let error = output
+        .try_next()
+        .await
+        .expect_err("one over-wide row must fail at its own lazy boundary");
+    assert!(
+        error
+            .to_string()
+            .contains("proven insert delta bytes for Person"),
+        "unexpected late-row error: {error}"
+    );
+}
+
+#[tokio::test]
 async fn count_rows_with_staged_matches_scan() {
     let dir = tempfile::tempdir().unwrap();
     let uri = format!("{}/people.lance", dir.path().to_str().unwrap());
@@ -287,6 +1360,7 @@ async fn scan_with_pending_rejects_key_column_missing_from_projection() {
             Some(&["note"]),
             None,
             Some("id"),
+            PendingScanBudget::new("test:people", 0, 0),
         )
         .await
         .expect_err("scan_with_pending must reject merge-shadow with missing key in projection");
@@ -296,9 +1370,10 @@ async fn scan_with_pending_rejects_key_column_missing_from_projection() {
         "unexpected error: {msg}"
     );
 
-    // Good call: projection includes the key column. Shadow works:
-    // pending row 'a' shadows committed 'a', so the result has only
-    // committed 'b' + pending 'a'.
+    // Good call: projection includes the key column. Shadow works before
+    // resource accounting: with 8,190 prior rows, pending 'a' + committed 'b'
+    // exactly fill the cap. Charging shadowed committed 'a' would falsely
+    // reject this call as row 8,193.
     let batches = store
         .scan_with_pending(
             &ds,
@@ -307,6 +1382,7 @@ async fn scan_with_pending_rejects_key_column_missing_from_projection() {
             Some(&["id", "note"]),
             None,
             Some("id"),
+            PendingScanBudget::new("test:people", 8190, 0),
         )
         .await
         .expect("projection containing key_column must succeed");
@@ -315,6 +1391,30 @@ async fn scan_with_pending_rejects_key_column_missing_from_projection() {
         vec!["a", "b"],
         "merge-shadow should drop committed 'a' and surface pending 'a' + committed 'b'"
     );
+
+    // Both retained sides consume the same budget. One fewer remaining slot
+    // admits pending 'a' but rejects committed 'b' with the typed one-over
+    // count; the shadowed committed 'a' still does not count.
+    let err = store
+        .scan_with_pending(
+            &ds,
+            std::slice::from_ref(&pending),
+            None,
+            Some(&["id", "note"]),
+            None,
+            Some("id"),
+            PendingScanBudget::new("test:people", 8191, 0),
+        )
+        .await
+        .expect_err("pending + unshadowed committed output must share the row budget");
+    assert!(matches!(
+        err,
+        OmniError::ResourceLimitExceeded {
+            ref resource,
+            limit: 8192,
+            actual: 8193,
+        } if resource == "keyed rows for test:people"
+    ));
 }
 
 /// Two `stage_append` calls on the same dataset must produce

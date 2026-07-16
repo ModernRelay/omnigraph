@@ -332,10 +332,12 @@ async fn write_op_count_ceiling_at_shallow_depth() {
 
 // ── (C) Fitness assert via the staged-write probes ──
 
-/// A keyed `Person` insert routes through `stage_merge_insert` exactly once, does
-/// no `stage_append`, and no vector-index artifact build. Pins the structural shape.
+/// A keyed `Person` insert routes through the exact-id fenced adapter exactly
+/// once, does no bare `stage_append`, and builds no vector-index artifact. The
+/// adapter intentionally records in the existing merge-insert probe bucket;
+/// `forbidden_apis` separately closes generic/bare graph call sites.
 #[tokio::test]
-async fn keyed_insert_routes_through_merge_insert_only() {
+async fn keyed_insert_routes_through_fenced_adapter_only() {
     let dir = tempfile::tempdir().unwrap();
     let mut db = local_graph(&dir).await;
     let (res, _io, staged) = measure_with_staged(db.mutate(
@@ -346,8 +348,8 @@ async fn keyed_insert_routes_through_merge_insert_only() {
     ))
     .await;
     res.unwrap();
-    assert_eq!(staged.stage_merge_insert, 1, "keyed Person insert stages one merge-insert");
-    assert_eq!(staged.stage_append, 0, "keyed insert must not stage_append");
+    assert_eq!(staged.stage_merge_insert, 1, "keyed Person insert stages one exact-id fenced merge");
+    assert_eq!(staged.stage_append, 0, "keyed insert must not use bare stage_append");
     assert_eq!(
         staged.stage_vector_index, 0,
         "no vector-index artifact build on a plain insert"

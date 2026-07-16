@@ -10,6 +10,22 @@ use omnigraph_compiler::{SchemaMigrationStep, SchemaTypeKind};
 
 use helpers::*;
 
+async fn assert_exact_id_primary_key(db: &Omnigraph, table_key: &str) {
+    let snapshot = db.snapshot_of(ReadTarget::branch("main")).await.unwrap();
+    let dataset = snapshot.open(table_key).await.unwrap();
+    let primary_key = dataset
+        .schema()
+        .unenforced_primary_key()
+        .iter()
+        .map(|field| field.name.clone())
+        .collect::<Vec<_>>();
+    assert_eq!(
+        primary_key,
+        ["id"],
+        "schema apply must preserve exactly `id` as the Lance unenforced primary key for {table_key}"
+    );
+}
+
 #[tokio::test]
 #[cfg_attr(feature = "failpoints", serial_test::parallel)]
 async fn plan_schema_reports_supported_additive_change() {
@@ -37,6 +53,86 @@ async fn plan_schema_reports_supported_additive_change() {
 
 #[tokio::test]
 #[cfg_attr(feature = "failpoints", serial_test::parallel)]
+async fn apply_schema_interface_evolution_is_identity_only_and_durable() {
+    let dir = tempfile::tempdir().unwrap();
+    let uri = dir.path().to_str().unwrap();
+    let db = Omnigraph::init(uri, TEST_SCHEMA).await.unwrap();
+    let mut table_versions_before = db
+        .snapshot_of(ReadTarget::branch("main"))
+        .await
+        .unwrap()
+        .entries()
+        .map(|entry| {
+            (
+                entry.table_key.clone(),
+                entry.table_path.clone(),
+                entry.table_version,
+            )
+        })
+        .collect::<Vec<_>>();
+    table_versions_before.sort();
+
+    let with_interface = format!("interface Named {{\n    name: String\n}}\n\n{TEST_SCHEMA}");
+    let added = db.apply_schema(&with_interface).await.unwrap();
+    assert!(added.supported && added.applied);
+    assert!(added.steps.iter().any(|step| matches!(
+        step,
+        SchemaMigrationStep::AddType {
+            type_kind: SchemaTypeKind::Interface,
+            name,
+        } if name == "Named"
+    )));
+    let interface_id = db.catalog().type_id("Named").unwrap();
+    let name_property_id = db.catalog().property_id("Named", "name").unwrap();
+
+    let extended_interface =
+        format!("interface Named {{\n    name: String\n    alias: String?\n}}\n\n{TEST_SCHEMA}");
+    let extended = db.apply_schema(&extended_interface).await.unwrap();
+    assert!(extended.supported && extended.applied);
+    assert!(extended.steps.iter().any(|step| matches!(
+        step,
+        SchemaMigrationStep::AddProperty {
+            type_kind: SchemaTypeKind::Interface,
+            type_name,
+            property_name,
+            ..
+        } if type_name == "Named" && property_name == "alias"
+    )));
+    assert_eq!(db.catalog().type_id("Named"), Some(interface_id));
+    assert_eq!(
+        db.catalog().property_id("Named", "name"),
+        Some(name_property_id)
+    );
+    assert!(db.catalog().property_id("Named", "alias").is_some());
+
+    let mut table_versions_after = db
+        .snapshot_of(ReadTarget::branch("main"))
+        .await
+        .unwrap()
+        .entries()
+        .map(|entry| {
+            (
+                entry.table_key.clone(),
+                entry.table_path.clone(),
+                entry.table_version,
+            )
+        })
+        .collect::<Vec<_>>();
+    table_versions_after.sort();
+    assert_eq!(table_versions_after, table_versions_before);
+
+    drop(db);
+    let reopened = Omnigraph::open(uri).await.unwrap();
+    assert_eq!(reopened.catalog().type_id("Named"), Some(interface_id));
+    assert_eq!(
+        reopened.catalog().property_id("Named", "name"),
+        Some(name_property_id)
+    );
+    assert!(reopened.catalog().property_id("Named", "alias").is_some());
+}
+
+#[tokio::test]
+#[cfg_attr(feature = "failpoints", serial_test::parallel)]
 async fn long_lived_handle_uses_the_schema_catalog_bound_to_its_write_token() {
     let dir = tempfile::tempdir().unwrap();
     let uri = dir.path().to_str().unwrap();
@@ -53,6 +149,22 @@ async fn long_lived_handle_uses_the_schema_catalog_bound_to_its_write_token() {
         )
     );
     schema_owner.apply_schema(&desired).await.unwrap();
+    // The same apply exercises both physical schema shapes: Person is rebuilt
+    // through a staged overwrite for the added property, while Project is a
+    // newly created table incarnation. Neither may drop the immutable v6 PK.
+    assert_exact_id_primary_key(&schema_owner, "node:Person").await;
+    assert_exact_id_primary_key(&schema_owner, "node:Project").await;
+
+    let projects = stale_handle
+        .query(
+            ReadTarget::branch("main"),
+            "query projects() { match { $p: Project } return { $p.name } }",
+            "projects",
+            &params(&[]),
+        )
+        .await
+        .expect("read capture must refresh the manifest before joining the promoted SchemaIR");
+    assert_eq!(projects.num_rows(), 0);
 
     let mutation = r#"
 query insert_with_nickname($name: String, $age: I32, $nickname: String) {
@@ -499,6 +611,7 @@ async fn apply_schema_drops_a_nullable_property_softly_preserves_prior_version()
     let result = db.apply_schema(&desired).await.unwrap();
     assert!(result.supported);
     assert!(result.applied);
+    assert_exact_id_primary_key(&db, "node:Person").await;
 
     // Manifest advanced; row count unchanged.
     let after_version = db
@@ -547,6 +660,7 @@ async fn apply_schema_drops_a_nullable_property_softly_preserves_prior_version()
     let uri = dir.path().to_str().unwrap().to_string();
     drop(db);
     let reopened = Omnigraph::open(&uri).await.unwrap();
+    assert_exact_id_primary_key(&reopened, "node:Person").await;
     let reopened_snapshot = reopened
         .snapshot_of(ReadTarget::branch("main"))
         .await
@@ -795,6 +909,141 @@ async fn plan_schema_for_property_type_narrowing_is_not_supported() {
 
 #[tokio::test]
 #[cfg_attr(feature = "failpoints", serial_test::parallel)]
+async fn apply_schema_pure_type_rename_preserves_identity_path_and_version() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut db = init_and_load(&dir).await;
+    db.ensure_indices().await.unwrap();
+    let before_snapshot = db.snapshot_of(ReadTarget::branch("main")).await.unwrap();
+    let before_version = before_snapshot.version();
+    let before = before_snapshot.entry("node:Person").unwrap().clone();
+    let before_type_id = db.catalog().type_id("Person").unwrap();
+    let before_incarnation = db.catalog().table_incarnation_id("Person").unwrap();
+    let before_name_property_id = db.catalog().property_id("Person", "name").unwrap();
+    let people_before = count_rows(&db, "node:Person").await;
+
+    let desired = r#"
+node Human @rename_from("Person") {
+    name: String @key
+    age: I32?
+}
+
+node Company {
+    name: String @key
+}
+
+edge Knows: Human -> Human {
+    since: Date?
+}
+
+edge WorksAt: Human -> Company
+"#;
+
+    let result = db.apply_schema(desired).await.unwrap();
+    assert!(result.supported && result.applied);
+    assert!(result.steps.iter().any(|step| matches!(
+        step,
+        SchemaMigrationStep::RenameType {
+            type_kind: SchemaTypeKind::Node,
+            from,
+            to,
+        } if from == "Person" && to == "Human"
+    )));
+    assert!(
+        !result.steps.iter().any(|step| matches!(
+            step,
+            SchemaMigrationStep::AddProperty { .. }
+                | SchemaMigrationStep::RenameProperty { .. }
+                | SchemaMigrationStep::DropProperty { .. }
+        )),
+        "pure rename unexpectedly planned a table rewrite: {:?}",
+        result.steps
+    );
+
+    let after_snapshot = db.snapshot_of(ReadTarget::branch("main")).await.unwrap();
+    let after = after_snapshot.entry("node:Human").unwrap();
+    assert_eq!(after.table_path, before.table_path);
+    assert_eq!(after.table_version, before.table_version);
+    assert_eq!(db.catalog().type_id("Human"), Some(before_type_id));
+    assert_eq!(
+        db.catalog().table_incarnation_id("Human"),
+        Some(before_incarnation)
+    );
+    assert_eq!(
+        db.catalog().property_id("Human", "name"),
+        Some(before_name_property_id)
+    );
+    assert_eq!(count_rows(&db, "node:Human").await, people_before);
+    assert!(after_snapshot.entry("node:Person").is_none());
+
+    let historical_snapshot = db.snapshot_at_version(before_version).await.unwrap();
+    let historical = historical_snapshot.entry("node:Person").unwrap();
+    assert_eq!(historical.table_path, before.table_path);
+    assert_eq!(historical.table_path, after.table_path);
+    assert_eq!(historical.table_version, before.table_version);
+    assert!(historical_snapshot.entry("node:Human").is_none());
+}
+
+#[tokio::test]
+#[cfg_attr(feature = "failpoints", serial_test::parallel)]
+async fn apply_schema_rename_and_hard_property_drop_cleans_source_incarnation() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = init_and_load(&dir).await;
+    let before_snapshot = db.snapshot_of(ReadTarget::branch("main")).await.unwrap();
+    let before_manifest_version = before_snapshot.version();
+    let before = before_snapshot.entry("node:Person").unwrap().clone();
+
+    let desired = r#"
+node Human @rename_from("Person") {
+    name: String @key
+}
+
+node Company {
+    name: String @key
+}
+
+edge Knows: Human -> Human {
+    since: Date?
+}
+
+edge WorksAt: Human -> Company
+"#;
+    let result = db
+        .apply_schema_with_options(
+            desired,
+            omnigraph::db::SchemaApplyOptions {
+                allow_data_loss: true,
+            },
+        )
+        .await
+        .unwrap();
+    assert!(result.applied);
+    assert!(result.steps.iter().any(|step| matches!(
+        step,
+        SchemaMigrationStep::DropProperty {
+            type_name,
+            mode: omnigraph_compiler::DropMode::Hard,
+            ..
+        } if type_name == "Human"
+    )));
+
+    let after_snapshot = db.snapshot_of(ReadTarget::branch("main")).await.unwrap();
+    let after = after_snapshot.entry("node:Human").unwrap();
+    assert_eq!(after.table_path, before.table_path);
+    assert!(after.table_version > before.table_version);
+    assert!(after_snapshot.entry("node:Person").is_none());
+    assert!(
+        db.snapshot_at_version(before_manifest_version)
+            .await
+            .unwrap()
+            .open("node:Person")
+            .await
+            .is_err(),
+        "hard cleanup must reclaim the renamed source incarnation's prior version"
+    );
+}
+
+#[tokio::test]
+#[cfg_attr(feature = "failpoints", serial_test::parallel)]
 async fn apply_schema_renames_node_type_via_rename_from_and_preserves_rows() {
     // Covers the stable-type-id contract: renaming a type preserves the
     // underlying Lance dataset (by stable id), so existing rows survive the
@@ -803,6 +1052,16 @@ async fn apply_schema_renames_node_type_via_rename_from_and_preserves_rows() {
     // rejections above cover.
     let dir = tempfile::tempdir().unwrap();
     let mut db = init_and_load(&dir).await;
+    let before = db
+        .snapshot_of(ReadTarget::branch("main"))
+        .await
+        .unwrap()
+        .entry("node:Person")
+        .unwrap()
+        .clone();
+    let before_type_id = db.catalog().type_id("Person").unwrap();
+    let before_incarnation = db.catalog().table_incarnation_id("Person").unwrap();
+    let before_name_property_id = db.catalog().property_id("Person", "name").unwrap();
     let people_before = count_rows(&db, "node:Person").await;
     assert!(
         people_before > 0,
@@ -861,15 +1120,156 @@ edge WorksAt: Human -> Company
 
     // Rows survive: table key now resolves under the new type name and the
     // old key is gone.
+    let after_snapshot = db.snapshot_of(ReadTarget::branch("main")).await.unwrap();
+    let after = after_snapshot.entry("node:Human").unwrap();
+    assert_eq!(after.table_path, before.table_path);
+    assert!(
+        after.table_version > before.table_version,
+        "property rename must rewrite the same table rather than rematerialize it"
+    );
+    assert_eq!(db.catalog().type_id("Human"), Some(before_type_id));
+    assert_eq!(
+        db.catalog().table_incarnation_id("Human"),
+        Some(before_incarnation)
+    );
+    assert_eq!(
+        db.catalog().property_id("Human", "full_name"),
+        Some(before_name_property_id)
+    );
     assert_eq!(count_rows(&db, "node:Human").await, people_before);
+    assert!(
+        after_snapshot.entry("node:Person").is_none(),
+        "old node:Person table key should be unmapped after rename"
+    );
+}
+
+#[tokio::test]
+#[cfg_attr(feature = "failpoints", serial_test::parallel)]
+async fn composite_key_identity_survives_lexically_crossing_property_renames() {
+    let initial = r#"
+node Pair {
+    alpha: String
+    zeta: String
+    label: String
+    @key(alpha, zeta)
+}
+"#;
+    let desired = r#"
+node Pair {
+    aaaa: String @rename_from("zeta")
+    zzzz: String @rename_from("alpha")
+    label: String
+    @key(aaaa, zzzz)
+}
+"#;
+    let mutation = r#"
+query put_pair($aaaa: String, $zzzz: String, $label: String) {
+    insert Pair { aaaa: $aaaa, zzzz: $zzzz, label: $label }
+}
+"#;
+
+    let dir = tempfile::tempdir().unwrap();
+    let db = Omnigraph::init(dir.path().to_str().unwrap(), initial)
+        .await
+        .unwrap();
+    load_jsonl(
+        &db,
+        r#"{"type":"Pair","data":{"alpha":"A","zeta":"Z","label":"before"}}"#,
+        LoadMode::Append,
+    )
+    .await
+    .unwrap();
+    let canonical_id = r#"["A","Z"]"#;
+    assert_eq!(
+        collect_column_strings(&read_table(&db, "node:Pair").await, "id"),
+        [canonical_id]
+    );
+    let alpha_id = db.catalog().property_id("Pair", "alpha").unwrap();
+    let zeta_id = db.catalog().property_id("Pair", "zeta").unwrap();
+
+    let applied = db.apply_schema(desired).await.unwrap();
+    assert!(applied.supported && applied.applied);
+    assert_eq!(
+        db.catalog().node_types["Pair"].key.as_deref(),
+        Some(&["zzzz".to_string(), "aaaa".to_string()][..]),
+        "runtime key order follows stable property identity across lexical crossing"
+    );
+    assert_eq!(db.catalog().property_id("Pair", "zzzz"), Some(alpha_id));
+    assert_eq!(db.catalog().property_id("Pair", "aaaa"), Some(zeta_id));
+    assert_eq!(
+        collect_column_strings(&read_table(&db, "node:Pair").await, "id"),
+        [canonical_id],
+        "schema rewrite must retain the existing physical identity"
+    );
+
+    db.mutate(
+        "main",
+        mutation,
+        "put_pair",
+        &params(&[("$aaaa", "Z"), ("$zzzz", "A"), ("$label", "after")]),
+    )
+    .await
+    .unwrap();
+
+    let rows = read_table(&db, "node:Pair").await;
+    assert_eq!(count_rows(&db, "node:Pair").await, 1);
+    assert_eq!(collect_column_strings(&rows, "id"), [canonical_id]);
+    assert_eq!(collect_column_strings(&rows, "label"), ["after"]);
+    assert_exact_id_primary_key(&db, "node:Pair").await;
+}
+
+#[tokio::test]
+#[cfg_attr(feature = "failpoints", serial_test::parallel)]
+async fn apply_schema_drop_then_same_name_readd_mints_new_identity_and_path() {
+    let dir = tempfile::tempdir().unwrap();
+    let uri = dir.path().to_str().unwrap();
+    let mut db = Omnigraph::init(
+        uri,
+        r#"
+node Person { name: String @key }
+node Anchor { name: String @key }
+"#,
+    )
+    .await
+    .unwrap();
+    let before = db
+        .snapshot_of(ReadTarget::branch("main"))
+        .await
+        .unwrap()
+        .entry("node:Person")
+        .unwrap()
+        .clone();
+    let before_type_id = db.catalog().type_id("Person").unwrap();
+    let before_incarnation = db.catalog().table_incarnation_id("Person").unwrap();
+
+    db.apply_schema("node Anchor { name: String @key }")
+        .await
+        .unwrap();
     assert!(
         db.snapshot_of(ReadTarget::branch("main"))
             .await
             .unwrap()
             .entry("node:Person")
-            .is_none(),
-        "old node:Person table key should be unmapped after rename"
+            .is_none()
     );
+
+    db.apply_schema(
+        r#"
+node Person { name: String @key }
+node Anchor { name: String @key }
+"#,
+    )
+    .await
+    .unwrap();
+    let after_snapshot = db.snapshot_of(ReadTarget::branch("main")).await.unwrap();
+    let after = after_snapshot.entry("node:Person").unwrap();
+    assert_ne!(db.catalog().type_id("Person"), Some(before_type_id));
+    assert_ne!(
+        db.catalog().table_incarnation_id("Person"),
+        Some(before_incarnation)
+    );
+    assert_ne!(after.table_path, before.table_path);
+    assert_eq!(after.table_version, 1);
 }
 
 // ─── Hard-mode drops (chassis v1 commit #5 — --allow-data-loss) ──────────────

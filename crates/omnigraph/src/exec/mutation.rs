@@ -1,6 +1,7 @@
 use super::*;
 
 use super::query::literal_to_sql;
+use crate::storage_layer::PendingScanBudget;
 
 // ─── Mutation helpers ────────────────────────────────────────────────────────
 
@@ -31,19 +32,36 @@ fn literal_to_typed_array(
             Arc::new(StringArray::from(vec![s.as_str(); num_rows])) as ArrayRef
         }
         (Literal::Integer(n), DataType::Int32) => {
-            Arc::new(Int32Array::from(vec![*n as i32; num_rows]))
+            let value = i32::try_from(*n).map_err(|_| {
+                OmniError::manifest(format!("integer value {n} exceeds Int32 range"))
+            })?;
+            Arc::new(Int32Array::from(vec![value; num_rows]))
         }
         (Literal::Integer(n), DataType::Int64) => Arc::new(Int64Array::from(vec![*n; num_rows])),
         (Literal::Integer(n), DataType::UInt32) => {
-            Arc::new(UInt32Array::from(vec![*n as u32; num_rows]))
+            let value = u32::try_from(*n).map_err(|_| {
+                OmniError::manifest(format!("integer value {n} exceeds UInt32 range"))
+            })?;
+            Arc::new(UInt32Array::from(vec![value; num_rows]))
         }
         (Literal::Integer(n), DataType::UInt64) => {
-            Arc::new(UInt64Array::from(vec![*n as u64; num_rows]))
+            let value = u64::try_from(*n).map_err(|_| {
+                OmniError::manifest(format!("integer value {n} exceeds UInt64 range"))
+            })?;
+            Arc::new(UInt64Array::from(vec![value; num_rows]))
         }
         (Literal::Float(f), DataType::Float32) => {
-            Arc::new(Float32Array::from(vec![*f as f32; num_rows]))
+            Arc::new(Float32Array::from(vec![
+                checked_f32(*f, "float value")?;
+                num_rows
+            ]))
         }
-        (Literal::Float(f), DataType::Float64) => Arc::new(Float64Array::from(vec![*f; num_rows])),
+        (Literal::Float(f), DataType::Float64) => {
+            Arc::new(Float64Array::from(vec![
+                checked_f64(*f, "float value")?;
+                num_rows
+            ]))
+        }
         (Literal::Bool(b), DataType::Boolean) => Arc::new(BooleanArray::from(vec![*b; num_rows])),
         (Literal::Date(s), DataType::Date32) => {
             let days = crate::loader::parse_date32_literal(s)?;
@@ -75,8 +93,12 @@ fn literal_to_typed_array(
             for _ in 0..num_rows {
                 for item in items {
                     match item {
-                        Literal::Integer(value) => builder.values().append_value(*value as f32),
-                        Literal::Float(value) => builder.values().append_value(*value as f32),
+                        Literal::Integer(value) => builder
+                            .values()
+                            .append_value(checked_f32(*value as f64, "vector element")?),
+                        Literal::Float(value) => builder
+                            .values()
+                            .append_value(checked_f32(*value, "vector element")?),
                         _ => {
                             return Err(OmniError::manifest(
                                 "vector elements must be numeric".to_string(),
@@ -95,6 +117,29 @@ fn literal_to_typed_array(
             )));
         }
     })
+}
+
+fn checked_f32(value: f64, context: &str) -> Result<f32> {
+    checked_f64(value, context)?;
+    // Use the result of IEEE round-to-nearest as the range authority. This
+    // accepts decimal round-trips at the finite boundary while still rejecting
+    // every value whose Float32 result is infinite.
+    let narrowed = value as f32;
+    if !narrowed.is_finite() {
+        return Err(OmniError::manifest(format!(
+            "{context} {value} exceeds Float32 range"
+        )));
+    }
+    Ok(narrowed)
+}
+
+fn checked_f64(value: f64, context: &str) -> Result<f64> {
+    if !value.is_finite() {
+        return Err(OmniError::manifest(format!(
+            "{context} {value} must be finite"
+        )));
+    }
+    Ok(value)
 }
 
 fn typed_list_literal_to_array(
@@ -210,8 +255,12 @@ fn typed_list_literal_to_array(
             for _ in 0..num_rows {
                 for item in items {
                     match item {
-                        Literal::Integer(value) => builder.values().append_value(*value as f32),
-                        Literal::Float(value) => builder.values().append_value(*value as f32),
+                        Literal::Integer(value) => builder
+                            .values()
+                            .append_value(checked_f32(*value as f64, "list value")?),
+                        Literal::Float(value) => builder
+                            .values()
+                            .append_value(checked_f32(*value, "list value")?),
                         _ => builder.values().append_null(),
                     }
                 }
@@ -225,7 +274,9 @@ fn typed_list_literal_to_array(
                 for item in items {
                     match item {
                         Literal::Integer(value) => builder.values().append_value(*value as f64),
-                        Literal::Float(value) => builder.values().append_value(*value),
+                        Literal::Float(value) => builder
+                            .values()
+                            .append_value(checked_f64(*value, "list value")?),
                         _ => builder.values().append_null(),
                     }
                 }
@@ -503,12 +554,13 @@ async fn open_table_for_mutation(
     );
     staging.ensure_path(
         table_key,
+        opened.identity,
         opened.full_path.clone(),
         opened.table_branch.clone(),
         opened.deferred_fork.clone(),
         opened.expected_version,
         op_kind,
-    );
+    )?;
     Ok((opened.handle, opened.full_path, opened.table_branch))
 }
 
@@ -956,24 +1008,38 @@ impl Omnigraph {
             let node_type = &catalog.node_types[type_name];
             let schema = node_type.arrow_schema.clone();
             let blob_props = node_type.blob_properties.clone();
-            let id = if let Some(key_prop) = node_type.key_property() {
-                match resolved.get(key_prop) {
-                    Some(Literal::String(s)) => s.clone(),
-                    Some(other) => literal_to_sql(other).trim_matches('\'').to_string(),
-                    None => {
-                        return Err(OmniError::manifest(format!(
-                            "insert missing @key property '{}'",
-                            key_prop
-                        )));
-                    }
+            let id = if let Some(key_properties) = node_type.key.as_ref() {
+                let mut typed_keys = Vec::with_capacity(key_properties.len());
+                for key_prop in key_properties {
+                    let key_literal = resolved.get(key_prop).ok_or_else(|| {
+                        OmniError::manifest(format!("insert missing @key property '{}'", key_prop))
+                    })?;
+                    let key_field = schema.field_with_name(key_prop).map_err(|_| {
+                        OmniError::manifest_internal(format!(
+                            "@key property '{}' is missing from node {} Arrow schema",
+                            key_prop, node_type.name
+                        ))
+                    })?;
+                    typed_keys.push(literal_to_typed_array(
+                        key_literal,
+                        key_field.data_type(),
+                        1,
+                    )?);
                 }
+                crate::loader::canonical_node_id(&typed_keys, 0)?.ok_or_else(|| {
+                    let key_description = match key_properties.as_slice() {
+                        [key] => format!("@key property '{key}'"),
+                        _ => format!("@key properties ({})", key_properties.join(", ")),
+                    };
+                    OmniError::manifest(format!("insert {key_description} cannot contain null"))
+                })?
             } else {
                 ulid::Ulid::new().to_string()
             };
 
             let batch = build_insert_batch(&schema, &id, &resolved, &blob_props)?;
             // Validation (value/enum/unique) runs end-of-query via the evaluator.
-            let has_key = node_type.key_property().is_some();
+            let has_key = node_type.key.is_some();
             let table_key = format!("node:{}", type_name);
             // Capture pre-write metadata on first touch (no Lance write).
             let insert_kind = if has_key {
@@ -992,9 +1058,9 @@ impl Omnigraph {
             // later update on the same id coalesces correctly); no-key
             // inserts go into the Append stream.
             let mode = if has_key {
-                PendingMode::Merge
+                PendingMode::Upsert
             } else {
-                PendingMode::Append
+                PendingMode::StrictInsert
             };
             staging.append_batch(&table_key, schema, mode, batch)?;
 
@@ -1029,7 +1095,7 @@ impl Omnigraph {
             .await?;
             // Accumulate the new edge row. Edge IDs are ULID-generated so
             // Append mode is correct (no key-based dedup needed).
-            staging.append_batch(&table_key, schema, PendingMode::Append, batch)?;
+            staging.append_batch(&table_key, schema, PendingMode::StrictInsert, batch)?;
 
             self.invalidate_graph_index().await;
 
@@ -1061,9 +1127,14 @@ impl Omnigraph {
             )));
         }
 
-        // Reject updates to @key properties — identity is immutable
-        if let Some(key_prop) = catalog.node_types[type_name].key_property() {
-            if assignments.iter().any(|a| a.property == key_prop) {
+        // Reject updates to every @key component — physical identity is the
+        // canonical typed tuple, so changing even a non-leading component
+        // without changing `id` would make the row unreachable by its key.
+        if let Some(key_properties) = catalog.node_types[type_name].key.as_ref() {
+            if let Some(key_prop) = key_properties
+                .iter()
+                .find(|key_prop| assignments.iter().any(|a| a.property == key_prop.as_str()))
+            {
                 return Err(OmniError::manifest(format!(
                     "cannot update @key property '{}' — delete and re-insert instead",
                     key_prop
@@ -1093,6 +1164,8 @@ impl Omnigraph {
         // batches via DataFusion `MemTable` (read-your-writes for prior ops in
         // this query). The pending side may include rows from earlier
         // `insert` / `update` ops on the same table.
+        let (pending_rows, pending_bytes) = staging.pending_resource_usage(&table_key)?;
+        let scan_budget = PendingScanBudget::new(&table_key, pending_rows, pending_bytes);
         let pending_batches = staging.pending_batches(&table_key);
         let pending_schema = staging.pending_schema(&table_key);
         // Use merge semantics on the union: a committed row whose `id`
@@ -1116,6 +1189,7 @@ impl Omnigraph {
                     None,
                     Some(&pred_sql),
                     Some("id"),
+                    scan_budget,
                 )
                 .await?
         } else {
@@ -1126,6 +1200,7 @@ impl Omnigraph {
                     pending_schema,
                     Some(&pred_sql),
                     Some("id"),
+                    scan_budget,
                 )
                 .await?
         };
@@ -1157,7 +1232,7 @@ impl Omnigraph {
         // dedupes by id (last-occurrence wins) before issuing the single
         // `stage_merge_insert` call at end-of-query.
         let updated_schema = updated.schema();
-        staging.append_batch(&table_key, updated_schema, PendingMode::Merge, updated)?;
+        staging.append_batch(&table_key, updated_schema, PendingMode::Upsert, updated)?;
 
         Ok(MutationResult {
             affected_nodes: affected_count,
@@ -1462,5 +1537,59 @@ mod predicate_sql_tests {
             sql, "repoName = 'acme'",
             "column must be unquoted and case-preserved, got {sql}"
         );
+    }
+
+    #[test]
+    fn scalar_narrowing_accepts_boundaries_and_rejects_wraparound() {
+        assert!(
+            literal_to_typed_array(&Literal::Integer(i32::MAX as i64), &DataType::Int32, 1).is_ok()
+        );
+        assert!(
+            literal_to_typed_array(&Literal::Integer(i32::MAX as i64 + 1), &DataType::Int32, 1,)
+                .is_err()
+        );
+        assert!(
+            literal_to_typed_array(&Literal::Integer(u32::MAX as i64), &DataType::UInt32, 1)
+                .is_ok()
+        );
+        assert!(
+            literal_to_typed_array(&Literal::Integer(u32::MAX as i64 + 1), &DataType::UInt32, 1,)
+                .is_err()
+        );
+        assert!(literal_to_typed_array(&Literal::Integer(-1), &DataType::UInt32, 1).is_err());
+        assert!(literal_to_typed_array(&Literal::Integer(-1), &DataType::UInt64, 1).is_err());
+    }
+
+    #[test]
+    fn float32_narrowing_accepts_boundary_and_rejects_nonfinite_results() {
+        assert!(
+            literal_to_typed_array(&Literal::Float(f32::MAX as f64), &DataType::Float32, 1,)
+                .is_ok()
+        );
+        assert!(
+            literal_to_typed_array(
+                &Literal::Float(f32::MAX as f64 * (1.0 + f64::EPSILON)),
+                &DataType::Float32,
+                1,
+            )
+            .is_ok()
+        );
+        assert!(
+            literal_to_typed_array(
+                &Literal::Float(f32::MAX as f64 * (1.0 + f32::EPSILON as f64)),
+                &DataType::Float32,
+                1,
+            )
+            .is_err()
+        );
+        assert!(literal_to_typed_array(&Literal::Float(f64::MAX), &DataType::Float32, 1).is_err());
+        assert!(
+            literal_to_typed_array(&Literal::Float(f64::INFINITY), &DataType::Float32, 1).is_err()
+        );
+        assert!(
+            literal_to_typed_array(&Literal::Float(f64::NEG_INFINITY), &DataType::Float64, 1,)
+                .is_err()
+        );
+        assert!(literal_to_typed_array(&Literal::Float(f64::NAN), &DataType::Float64, 1).is_err());
     }
 }

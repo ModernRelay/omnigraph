@@ -94,22 +94,26 @@ fn merge_validation_is_delta_scoped() {
         );
         eprintln!(
             "MERGE    1-Person-row delta   : data_open_count={} data_reads={} manifest_reads={} \
-             [stage_append={} stage_merge_insert={} stage_vector_index={}]",
+             [stage_append={} stage_merge_insert={} stage_fenced_insert={} stage_vector_index={}]",
             io.data_open_count,
             io.data_reads,
             io.manifest_reads,
             staged.stage_append,
             staged.stage_merge_insert,
+            staged.stage_fenced_insert,
             staged.stage_vector_index,
         );
 
         // The proof: only Person changed, so the merge opens only Person-related
-        // tables (the delta + committed-target index probe + exact confirmation
-        // re-observation) — never the untouched Company / Knows / WorksAt.
+        // state: pinned base + source, fresh source-authority recheck, target
+        // pre-arm handle, and post-effect exact-chain confirmation. The final
+        // reopen is required to prove the landed transaction chain is still at
+        // HEAD rather than buried by an external writer. None of these opens an
+        // untouched Company / Knows / WorksAt table.
         // Pre-#5 this was ~6 (every catalog table, full-scanned).
         assert!(
-            io.data_open_count <= 4,
-            "merge of a 1-Person delta opened {} data tables; expected <= 4 (Δ-scoped, including exact confirmation). \
+            io.data_open_count <= 5,
+            "merge of a 1-Person delta opened {} data tables; expected <= 5 (Δ-scoped, including source authority and exact-chain confirmation). \
              Pre-#5 it opened every catalog table (~6) via a whole-graph validation scan.",
             io.data_open_count
         );

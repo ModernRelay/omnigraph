@@ -3,6 +3,7 @@ mod helpers;
 use arrow_array::{Array, Int32Array};
 use helpers::*;
 use omnigraph::db::Omnigraph;
+use omnigraph::loader::LoadMode;
 use omnigraph_compiler::ir::ParamMap;
 
 // ─── Inline queries for point-in-time tests ─────────────────────────────────
@@ -56,6 +57,20 @@ query get_person($name: String) {
         $p: Person { name: $name }
     }
     return { $p.name, $p.age }
+}
+"#;
+
+const ALL_HUMANS_QUERY: &str = r#"
+query all_humans() {
+    match { $p: Human }
+    return { $p.name }
+}
+"#;
+
+const ALL_REPLACEMENT_PERSONS_QUERY: &str = r#"
+query all_replacement_persons() {
+    match { $p: Person }
+    return { $p.name }
 }
 "#;
 
@@ -117,6 +132,83 @@ async fn run_query_at_returns_historical_data() {
 
     let current_names = collect_column_strings(current.batches(), "p.name");
     assert!(current_names.contains(&"Eve".to_string()));
+}
+
+#[tokio::test]
+async fn historical_query_resolves_rename_by_identity_but_rejects_reincarnation() {
+    let dir = tempfile::tempdir().unwrap();
+    let uri = dir.path().to_str().unwrap();
+    let db = Omnigraph::init(
+        uri,
+        "node Person { name: String @key }\nnode Anchor { name: String @key }\n",
+    )
+    .await
+    .unwrap();
+    db.load(
+        "main",
+        r#"{"type":"Person","data":{"name":"Alice"}}"#,
+        LoadMode::Merge,
+    )
+    .await
+    .unwrap();
+    let before_rename = version_main(&db).await.unwrap();
+
+    db.apply_schema(
+        "node Human @rename_from(\"Person\") { name: String @key }\n\
+         node Anchor { name: String @key }\n",
+    )
+    .await
+    .unwrap();
+    let renamed_view = db
+        .run_query_at(
+            before_rename,
+            ALL_HUMANS_QUERY,
+            "all_humans",
+            &ParamMap::new(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        collect_column_strings(renamed_view.batches(), "p.name"),
+        vec!["Alice".to_string()]
+    );
+
+    db.apply_schema(
+        "node Human { name: String @key }\n\
+         node Person { name: String @key }\n\
+         node Anchor { name: String @key }\n",
+    )
+    .await
+    .unwrap();
+    let still_renamed_view = db
+        .run_query_at(
+            before_rename,
+            ALL_HUMANS_QUERY,
+            "all_humans",
+            &ParamMap::new(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        collect_column_strings(still_renamed_view.batches(), "p.name"),
+        vec!["Alice".to_string()],
+        "reusing the old alias must not erase the historical binding for the renamed identity"
+    );
+    let error = db
+        .run_query_at(
+            before_rename,
+            ALL_REPLACEMENT_PERSONS_QUERY,
+            "all_replacement_persons",
+            &ParamMap::new(),
+        )
+        .await
+        .expect_err("a replacement type must not adopt the prior incarnation's rows");
+    assert!(
+        error
+            .to_string()
+            .contains("no manifest entry for node:Person"),
+        "unexpected cross-incarnation refusal: {error}"
+    );
 }
 
 #[tokio::test]

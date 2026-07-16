@@ -22,6 +22,7 @@ use serde_json::Value as JsonValue;
 use crate::db::Omnigraph;
 use crate::error::{OmniError, Result};
 use crate::exec::staging::{MutationStaging, PendingMode};
+use crate::storage_layer::KEYED_WRITE_MAX_BYTES;
 
 /// Result of a load operation.
 #[derive(Debug, Clone, Default)]
@@ -370,6 +371,8 @@ async fn load_jsonl_reader_once<R: BufRead>(
     // Phase 1: Parse all lines, spool into per-type collections
     let mut node_rows: HashMap<String, Vec<JsonValue>> = HashMap::new();
     let mut edge_rows: HashMap<String, Vec<(String, String, JsonValue)>> = HashMap::new();
+    let mut keyed_input_budget: HashMap<String, (usize, u64)> = HashMap::new();
+    let bounded_keyed_input = matches!(mode, LoadMode::Append | LoadMode::Merge);
 
     // Parse a stream of JSON values. Accepts both compact JSONL (one object
     // per line) and pretty-printed JSON where a single object spans multiple
@@ -380,27 +383,40 @@ async fn load_jsonl_reader_once<R: BufRead>(
         .enumerate()
     {
         let record_num = idx + 1;
-        let value: JsonValue = parsed.map_err(|e| {
+        let mut value: JsonValue = parsed.map_err(|e| {
             OmniError::manifest(format!("invalid JSON at record {}: {}", record_num, e))
         })?;
 
-        if let Some(type_name) = value.get("type").and_then(|v| v.as_str()) {
-            if !catalog.node_types.contains_key(type_name) {
+        if let Some(type_name) = value
+            .get("type")
+            .and_then(|v| v.as_str())
+            .map(str::to_string)
+        {
+            if !catalog.node_types.contains_key(&type_name) {
                 return Err(OmniError::manifest(format!(
                     "record {}: unknown node type '{}'",
                     record_num, type_name
                 )));
             }
             let data = value
-                .get("data")
-                .cloned()
+                .get_mut("data")
+                .map(JsonValue::take)
                 .unwrap_or(JsonValue::Object(serde_json::Map::new()));
-            node_rows
-                .entry(type_name.to_string())
-                .or_default()
-                .push(data);
-        } else if let Some(edge_name) = value.get("edge").and_then(|v| v.as_str()) {
-            if catalog.lookup_edge_by_name(edge_name).is_none() {
+            if bounded_keyed_input {
+                account_keyed_json_row(
+                    &format!("node:{type_name}"),
+                    &data,
+                    0,
+                    &mut keyed_input_budget,
+                )?;
+            }
+            node_rows.entry(type_name).or_default().push(data);
+        } else if let Some(edge_name) = value
+            .get("edge")
+            .and_then(|v| v.as_str())
+            .map(str::to_string)
+        {
+            if catalog.lookup_edge_by_name(&edge_name).is_none() {
                 return Err(OmniError::manifest(format!(
                     "record {}: unknown edge type '{}'",
                     record_num, edge_name
@@ -421,10 +437,22 @@ async fn load_jsonl_reader_once<R: BufRead>(
                 })?
                 .to_string();
             let data = value
-                .get("data")
-                .cloned()
+                .get_mut("data")
+                .map(JsonValue::take)
                 .unwrap_or(JsonValue::Object(serde_json::Map::new()));
-            let canonical = catalog.lookup_edge_by_name(edge_name).unwrap().name.clone();
+            let canonical = catalog
+                .lookup_edge_by_name(&edge_name)
+                .unwrap()
+                .name
+                .clone();
+            if bounded_keyed_input {
+                account_keyed_json_row(
+                    &format!("edge:{canonical}"),
+                    &data,
+                    from.len().saturating_add(to.len()),
+                    &mut keyed_input_budget,
+                )?;
+            }
             edge_rows
                 .entry(canonical)
                 .or_default()
@@ -452,11 +480,12 @@ async fn load_jsonl_reader_once<R: BufRead>(
     // identity form one immutable authority unit.
     let mut staging = MutationStaging::default();
     let pending_mode = match mode {
-        LoadMode::Merge => PendingMode::Merge,
-        // Append-mode loads accumulate as Append. Edge tables (no @key)
-        // and no-key node tables stay safe on the stage_append path. The
-        // Merge mode applies dedupe-by-id; Append assumes unique inputs.
-        LoadMode::Append => PendingMode::Append,
+        LoadMode::Merge => PendingMode::Upsert,
+        // Append mode is a strict exact-id insert. Every physical graph table
+        // has `id` as its Lance PK in format v6, including edges and node types
+        // without a user-declared @key; no keyed table has an Append side door.
+        // Merge mode applies last-write-wins source dedupe before fenced upsert.
+        LoadMode::Append => PendingMode::StrictInsert,
         LoadMode::Overwrite => PendingMode::Overwrite,
     };
     // Map LoadMode to the early table-version policy. Append/Merge may stage
@@ -472,11 +501,12 @@ async fn load_jsonl_reader_once<R: BufRead>(
 
     // Phase 2a: build and validate every node batch up front. Cheap and
     // synchronous — surfaces validation errors before any S3 traffic.
+    let mut node_id_remap = TypedNodeIdRemap::default();
     let mut prepared_nodes: Vec<(String, String, RecordBatch, usize)> =
         Vec::with_capacity(node_rows.len());
     for (type_name, rows) in &node_rows {
         let node_type = &catalog.node_types[type_name];
-        let batch = build_node_batch(node_type, rows)?;
+        let batch = build_node_batch(node_type, rows, &mut node_id_remap)?;
         // Validation (value/enum/unique) runs end-of-load via the evaluator.
         let loaded_count = batch.num_rows();
         let table_key = format!("node:{}", type_name);
@@ -498,12 +528,13 @@ async fn load_jsonl_reader_once<R: BufRead>(
             .await?;
         staging.ensure_path(
             &table_key,
+            opened.identity,
             opened.full_path,
             opened.table_branch,
             opened.deferred_fork,
             opened.expected_version,
             load_op_kind,
-        );
+        )?;
         let schema = batch.schema();
         staging.append_batch(&table_key, schema, pending_mode, batch)?;
         result.nodes_loaded.insert(type_name, loaded_count);
@@ -515,7 +546,7 @@ async fn load_jsonl_reader_once<R: BufRead>(
         Vec::with_capacity(edge_rows.len());
     for (edge_name, rows) in &edge_rows {
         let edge_type = &catalog.edge_types[edge_name];
-        let batch = build_edge_batch(edge_type, rows)?;
+        let batch = build_edge_batch(edge_type, rows, &node_id_remap)?;
         // Validation (enum/unique, edge-RI, @card) runs end-of-load via the evaluator.
         let loaded_count = batch.num_rows();
         let table_key = format!("edge:{}", edge_name);
@@ -534,12 +565,13 @@ async fn load_jsonl_reader_once<R: BufRead>(
             .await?;
         staging.ensure_path(
             &table_key,
+            opened.identity,
             opened.full_path,
             opened.table_branch,
             opened.deferred_fork,
             opened.expected_version,
             load_op_kind,
-        );
+        )?;
         let schema = batch.schema();
         staging.append_batch(&table_key, schema, pending_mode, batch)?;
         result.edges_loaded.insert(edge_name, loaded_count);
@@ -651,36 +683,239 @@ async fn load_jsonl_reader_once<R: BufRead>(
     Ok(result)
 }
 
-fn build_node_batch(node_type: &NodeType, rows: &[JsonValue]) -> Result<RecordBatch> {
-    let schema = node_type.arrow_schema.clone();
+/// Account a keyed JSON record before retaining it in the per-table parse
+/// spool. This is a conservative lower bound on the Arrow payload (string and
+/// decoded blob bytes, scalar widths, and list offsets); the exact accumulated
+/// Arrow check in `MutationStaging::append_batch` remains the final authority.
+/// The early counter prevents an unbounded JSON spool and catches base64 by its
+/// decoded size before the decoder allocates a second copy.
+fn account_keyed_json_row(
+    table_key: &str,
+    data: &JsonValue,
+    structural_string_bytes: usize,
+    budgets: &mut HashMap<String, (usize, u64)>,
+) -> Result<()> {
+    let entry = budgets.entry(table_key.to_string()).or_insert((0, 0));
+    entry.0 = entry
+        .0
+        .checked_add(1)
+        .ok_or_else(|| OmniError::manifest_internal("keyed parsed row count overflow"))?;
+    if entry.0 > crate::storage_layer::KEYED_WRITE_MAX_ROWS {
+        return Err(OmniError::resource_limit(
+            format!("keyed rows for {table_key}"),
+            crate::storage_layer::KEYED_WRITE_MAX_ROWS as u64,
+            entry.0 as u64,
+        ));
+    }
+    let row_bytes = estimate_json_arrow_bytes(data)?
+        .checked_add(
+            u64::try_from(structural_string_bytes)
+                .map_err(|_| OmniError::manifest_internal("keyed string bytes exceed u64"))?,
+        )
+        .ok_or_else(|| OmniError::manifest_internal("keyed parsed row bytes overflow"))?;
+    entry.1 = entry
+        .1
+        .checked_add(row_bytes)
+        .ok_or_else(|| OmniError::manifest_internal("keyed parsed byte count overflow"))?;
+    if entry.1 > KEYED_WRITE_MAX_BYTES {
+        return Err(OmniError::resource_limit(
+            format!("keyed parsed value bytes for {table_key}"),
+            KEYED_WRITE_MAX_BYTES,
+            entry.1,
+        ));
+    }
+    Ok(())
+}
 
-    // Build id column: explicit id, @key value, or generated ULID.
-    let ids: Vec<String> = rows
-        .iter()
-        .map(|row| {
-            let explicit_id = row.get("id").and_then(|v| v.as_str()).map(str::to_string);
-            if let Some(key_prop) = node_type.key_property() {
-                let key_value = row
-                    .get(key_prop)
-                    .and_then(|v| v.as_str())
-                    .map(|s| s.to_string())
-                    .ok_or_else(|| {
-                        OmniError::manifest(format!(
-                            "node {} missing @key property '{}'",
-                            node_type.name, key_prop
+fn estimate_json_arrow_bytes(value: &JsonValue) -> Result<u64> {
+    match value {
+        JsonValue::Null => Ok(0),
+        JsonValue::Bool(_) => Ok(1),
+        // Four bytes avoids rejecting valid Float32/Int32 input early. Wider
+        // physical scalars are charged exactly by the later Arrow batch check.
+        JsonValue::Number(_) => Ok(4),
+        JsonValue::String(value) => {
+            let bytes = match value.strip_prefix("base64:") {
+                Some(encoded) => base64::decoded_len_estimate(encoded.len()).saturating_sub(
+                    encoded
+                        .as_bytes()
+                        .iter()
+                        .rev()
+                        .take_while(|&&byte| byte == b'=')
+                        .count(),
+                ),
+                None => value.len(),
+            };
+            u64::try_from(bytes)
+                .map_err(|_| OmniError::manifest_internal("JSON string bytes exceed u64"))
+        }
+        JsonValue::Array(values) => {
+            let offsets = u64::try_from(values.len())
+                .map_err(|_| OmniError::manifest_internal("JSON array length exceeds u64"))?
+                .checked_add(1)
+                .and_then(|count| count.checked_mul(4))
+                .ok_or_else(|| OmniError::manifest_internal("JSON array offset bytes overflow"))?;
+            values.iter().try_fold(offsets, |bytes, value| {
+                bytes
+                    .checked_add(estimate_json_arrow_bytes(value)?)
+                    .ok_or_else(|| OmniError::manifest_internal("JSON array bytes overflow"))
+            })
+        }
+        // Property names are schema, not per-row Arrow payload. Count values
+        // only so the early lower bound does not reject an otherwise-valid
+        // wide schema; exact field buffers are charged after batch building.
+        JsonValue::Object(values) => values.values().try_fold(0_u64, |bytes, value| {
+            bytes
+                .checked_add(estimate_json_arrow_bytes(value)?)
+                .ok_or_else(|| OmniError::manifest_internal("JSON object bytes overflow"))
+        }),
+    }
+}
+
+/// Legacy exports may carry a physical node id whose spelling predates the
+/// current typed canonical renderer. Edges in the same import still name that
+/// old id, so rebuilding canonical node ids also requires an endpoint rewrite.
+/// Endpoint identity is type-scoped: two concrete node types may legitimately
+/// reuse the same old id string and map it differently.
+#[derive(Default)]
+struct TypedNodeIdRemap {
+    by_node_type: HashMap<String, HashMap<String, String>>,
+}
+
+impl TypedNodeIdRemap {
+    fn record(&mut self, node_type: &str, old_id: &str, canonical_id: &str) -> Result<()> {
+        let by_old_id = self.by_node_type.entry(node_type.to_string()).or_default();
+        if let Some(existing) = by_old_id.get(old_id) {
+            if existing != canonical_id {
+                return Err(OmniError::manifest(format!(
+                    "node {node_type} explicit id '{old_id}' maps to both canonical @key ids \
+                     '{existing}' and '{canonical_id}'; refusing ambiguous edge endpoint remap"
+                )));
+            }
+            return Ok(());
+        }
+        by_old_id.insert(old_id.to_string(), canonical_id.to_string());
+        Ok(())
+    }
+
+    fn endpoint<'a>(&'a self, node_type: &str, old_id: &str) -> Option<&'a str> {
+        self.by_node_type
+            .get(node_type)
+            .and_then(|by_old_id| by_old_id.get(old_id))
+            .map(String::as_str)
+    }
+}
+
+fn build_node_batch(
+    node_type: &NodeType,
+    rows: &[JsonValue],
+    node_id_remap: &mut TypedNodeIdRemap,
+) -> Result<RecordBatch> {
+    let schema = node_type.arrow_schema.clone();
+    let row_refs = rows.iter().collect::<Vec<_>>();
+    preflight_blob_decode_budget(
+        &format!("node:{}", node_type.name),
+        node_type.blob_properties.iter().map(String::as_str),
+        &row_refs,
+    )?;
+
+    // Materialize the typed property columns before deriving physical ids. A
+    // scalar @key's identity is the canonical rendering of the value that will
+    // actually be stored (including width conversion for F32/I32 and the full
+    // U64 range), not an independent rendering of its input JSON token.
+    let mut property_columns: Vec<ArrayRef> = Vec::with_capacity(schema.fields().len() - 1);
+    for field in schema.fields().iter().skip(1) {
+        if node_type.blob_properties.contains(field.name()) {
+            let col = build_blob_column(field.name(), field.is_nullable(), rows)?;
+            property_columns.push(col);
+        } else {
+            let col =
+                build_column_from_json(field.name(), field.data_type(), field.is_nullable(), rows)?;
+            property_columns.push(col);
+        }
+    }
+
+    let key_columns = node_type
+        .key
+        .as_ref()
+        .map(|key_properties| {
+            key_properties
+                .iter()
+                .map(|key_prop| {
+                    let schema_index = schema.index_of(key_prop).map_err(|_| {
+                        OmniError::manifest_internal(format!(
+                            "@key property '{}' is missing from node {} Arrow schema",
+                            key_prop, node_type.name
                         ))
                     })?;
+                    let property_index = schema_index.checked_sub(1).ok_or_else(|| {
+                        OmniError::manifest_internal(format!(
+                            "@key property '{}' aliases reserved physical id",
+                            key_prop
+                        ))
+                    })?;
+                    property_columns
+                        .get(property_index)
+                        .cloned()
+                        .ok_or_else(|| {
+                            OmniError::manifest_internal(format!(
+                                "@key property '{}' has invalid schema position {}",
+                                key_prop, schema_index
+                            ))
+                        })
+                })
+                .collect::<Result<Vec<_>>>()
+        })
+        .transpose()?;
+
+    // Build id column: exact explicit id, canonical typed @key value, or a
+    // generated ULID. Export always emits the physical id as a JSON string;
+    // when present, a non-string explicit id is malformed instead of being
+    // silently ignored and replaced.
+    let ids: Vec<String> = rows
+        .iter()
+        .enumerate()
+        .map(|(row_index, row)| {
+            let explicit_id = match row.get("id") {
+                None => None,
+                Some(JsonValue::String(id)) => Some(id.as_str()),
+                Some(value) => {
+                    return Err(OmniError::manifest(format!(
+                        "node {} explicit id must be a string, got {}",
+                        node_type.name, value
+                    )));
+                }
+            };
+            if let (Some(key_properties), Some(key_columns)) =
+                (node_type.key.as_ref(), key_columns.as_ref())
+            {
+                let key_description = match key_properties.as_slice() {
+                    [key] => format!("@key property '{key}'"),
+                    _ => format!("@key properties ({})", key_properties.join(", ")),
+                };
+                let key_value = canonical_node_id(key_columns, row_index)?.ok_or_else(|| {
+                    OmniError::manifest(format!(
+                        "node {} missing {key_description}",
+                        node_type.name
+                    ))
+                })?;
                 if let Some(explicit_id) = explicit_id {
-                    if explicit_id != key_value {
+                    if !explicit_id_matches_node_key(
+                        key_columns,
+                        row_index,
+                        explicit_id,
+                        &key_value,
+                    )? {
                         return Err(OmniError::manifest(format!(
-                            "node {} has explicit id '{}' that does not match @key property '{}' value '{}'",
-                            node_type.name, explicit_id, key_prop, key_value
+                            "node {} has explicit id '{}' that does not match {key_description} canonical value '{}'",
+                            node_type.name, explicit_id, key_value
                         )));
                     }
+                    node_id_remap.record(&node_type.name, explicit_id, &key_value)?;
                 }
                 Ok(key_value)
             } else if let Some(explicit_id) = explicit_id {
-                Ok(explicit_id)
+                Ok(explicit_id.to_string())
             } else {
                 Ok(generate_id())
             }
@@ -689,18 +924,7 @@ fn build_node_batch(node_type: &NodeType, rows: &[JsonValue]) -> Result<RecordBa
 
     let mut columns: Vec<ArrayRef> = Vec::with_capacity(schema.fields().len());
     columns.push(Arc::new(StringArray::from(ids)));
-
-    // Build property columns (skip "id" field at index 0)
-    for field in schema.fields().iter().skip(1) {
-        if node_type.blob_properties.contains(field.name()) {
-            let col = build_blob_column(field.name(), field.is_nullable(), rows)?;
-            columns.push(col);
-        } else {
-            let col =
-                build_column_from_json(field.name(), field.data_type(), field.is_nullable(), rows)?;
-            columns.push(col);
-        }
-    }
+    columns.extend(property_columns);
 
     RecordBatch::try_new(schema, columns).map_err(|e| OmniError::Lance(e.to_string()))
 }
@@ -708,8 +932,15 @@ fn build_node_batch(node_type: &NodeType, rows: &[JsonValue]) -> Result<RecordBa
 fn build_edge_batch(
     edge_type: &omnigraph_compiler::catalog::EdgeType,
     rows: &[(String, String, JsonValue)],
+    node_id_remap: &TypedNodeIdRemap,
 ) -> Result<RecordBatch> {
     let schema = edge_type.arrow_schema.clone();
+    let row_refs = rows.iter().map(|(_, _, data)| data).collect::<Vec<_>>();
+    preflight_blob_decode_budget(
+        &format!("edge:{}", edge_type.name),
+        edge_type.blob_properties.iter().map(String::as_str),
+        &row_refs,
+    )?;
 
     let ids: Vec<String> = rows
         .iter()
@@ -720,8 +951,24 @@ fn build_edge_batch(
                 .unwrap_or_else(generate_id)
         })
         .collect();
-    let srcs: Vec<&str> = rows.iter().map(|(from, _, _)| from.as_str()).collect();
-    let dsts: Vec<&str> = rows.iter().map(|(_, to, _)| to.as_str()).collect();
+    let srcs: Vec<String> = rows
+        .iter()
+        .map(|(from, _, _)| {
+            node_id_remap
+                .endpoint(&edge_type.from_type, from)
+                .unwrap_or(from)
+                .to_string()
+        })
+        .collect();
+    let dsts: Vec<String> = rows
+        .iter()
+        .map(|(_, to, _)| {
+            node_id_remap
+                .endpoint(&edge_type.to_type, to)
+                .unwrap_or(to)
+                .to_string()
+        })
+        .collect();
 
     let mut columns: Vec<ArrayRef> = Vec::with_capacity(schema.fields().len());
     columns.push(Arc::new(StringArray::from(ids)));
@@ -748,9 +995,66 @@ fn build_edge_batch(
     RecordBatch::try_new(schema, columns).map_err(|e| OmniError::Lance(e.to_string()))
 }
 
+/// Refuse an oversized aggregate base64 payload before any blob bytes are
+/// decoded. The later Arrow-sized staging check remains authoritative for all
+/// columns and allocator overhead; this guard prevents encoded input from
+/// briefly allocating an over-limit decoded copy first.
+fn preflight_blob_decode_budget<'a>(
+    table_key: &str,
+    blob_properties: impl Iterator<Item = &'a str>,
+    rows: &[&JsonValue],
+) -> Result<()> {
+    let mut decoded_bytes = 0_u64;
+    for property in blob_properties {
+        for row in rows {
+            let Some(encoded) = row
+                .get(property)
+                .and_then(JsonValue::as_str)
+                .and_then(|value| value.strip_prefix("base64:"))
+            else {
+                continue;
+            };
+            let estimate = base64::decoded_len_estimate(encoded.len()).saturating_sub(
+                encoded
+                    .as_bytes()
+                    .iter()
+                    .rev()
+                    .take_while(|&&byte| byte == b'=')
+                    .count(),
+            ) as u64;
+            decoded_bytes = decoded_bytes.checked_add(estimate).ok_or_else(|| {
+                OmniError::manifest_internal("decoded blob input byte count overflow")
+            })?;
+            if decoded_bytes > KEYED_WRITE_MAX_BYTES {
+                return Err(OmniError::resource_limit(
+                    format!("decoded blob input bytes for {table_key}"),
+                    KEYED_WRITE_MAX_BYTES,
+                    decoded_bytes,
+                ));
+            }
+        }
+    }
+    Ok(())
+}
+
 /// Append a blob value (URI or base64 bytes) to a BlobArrayBuilder.
 pub(crate) fn append_blob_value(builder: &mut BlobArrayBuilder, value: &str) -> Result<()> {
     if let Some(encoded) = value.strip_prefix("base64:") {
+        let decoded_estimate = base64::decoded_len_estimate(encoded.len()).saturating_sub(
+            encoded
+                .as_bytes()
+                .iter()
+                .rev()
+                .take_while(|&&b| b == b'=')
+                .count(),
+        );
+        if decoded_estimate as u64 > KEYED_WRITE_MAX_BYTES {
+            return Err(OmniError::resource_limit(
+                "decoded blob input bytes",
+                KEYED_WRITE_MAX_BYTES,
+                decoded_estimate as u64,
+            ));
+        }
         let bytes = base64::engine::general_purpose::STANDARD
             .decode(encoded)
             .map_err(|e| OmniError::manifest(format!("invalid base64 blob data: {}", e)))?;
@@ -816,38 +1120,100 @@ fn build_column_from_json(
             Arc::new(StringArray::from(values))
         }
         DataType::Int32 => {
-            let values: Vec<Option<i32>> = rows
-                .iter()
-                .map(|row| row.get(name).and_then(|v| v.as_i64()).map(|v| v as i32))
-                .collect();
+            let mut values = Vec::with_capacity(rows.len());
+            for row in rows {
+                let value = row.get(name).unwrap_or(&JsonValue::Null);
+                let converted = if let Some(value) = value.as_i64() {
+                    Some(i32::try_from(value).map_err(|_| {
+                        OmniError::manifest(format!(
+                            "property '{name}' value {value} exceeds Int32 range"
+                        ))
+                    })?)
+                } else if let Some(value) = value.as_u64() {
+                    Some(i32::try_from(value).map_err(|_| {
+                        OmniError::manifest(format!(
+                            "property '{name}' value {value} exceeds Int32 range"
+                        ))
+                    })?)
+                } else {
+                    None
+                };
+                values.push(converted);
+            }
             Arc::new(Int32Array::from(values))
         }
         DataType::Int64 => {
-            let values: Vec<Option<i64>> = rows
-                .iter()
-                .map(|row| row.get(name).and_then(|v| v.as_i64()))
-                .collect();
+            let mut values = Vec::with_capacity(rows.len());
+            for row in rows {
+                let value = row.get(name).unwrap_or(&JsonValue::Null);
+                let converted = if let Some(value) = value.as_i64() {
+                    Some(value)
+                } else if let Some(value) = value.as_u64() {
+                    Some(i64::try_from(value).map_err(|_| {
+                        OmniError::manifest(format!(
+                            "property '{name}' value {value} exceeds Int64 range"
+                        ))
+                    })?)
+                } else {
+                    None
+                };
+                values.push(converted);
+            }
             Arc::new(Int64Array::from(values))
         }
         DataType::UInt32 => {
-            let values: Vec<Option<u32>> = rows
-                .iter()
-                .map(|row| row.get(name).and_then(|v| v.as_u64()).map(|v| v as u32))
-                .collect();
+            let mut values = Vec::with_capacity(rows.len());
+            for row in rows {
+                let value = row.get(name).unwrap_or(&JsonValue::Null);
+                let converted = if let Some(value) = value.as_u64() {
+                    Some(u32::try_from(value).map_err(|_| {
+                        OmniError::manifest(format!(
+                            "property '{name}' value {value} exceeds UInt32 range"
+                        ))
+                    })?)
+                } else if let Some(value) = value.as_i64() {
+                    Some(u32::try_from(value).map_err(|_| {
+                        OmniError::manifest(format!(
+                            "property '{name}' value {value} exceeds UInt32 range"
+                        ))
+                    })?)
+                } else {
+                    None
+                };
+                values.push(converted);
+            }
             Arc::new(UInt32Array::from(values))
         }
         DataType::UInt64 => {
-            let values: Vec<Option<u64>> = rows
-                .iter()
-                .map(|row| row.get(name).and_then(|v| v.as_u64()))
-                .collect();
+            let mut values = Vec::with_capacity(rows.len());
+            for row in rows {
+                let value = row.get(name).unwrap_or(&JsonValue::Null);
+                let converted = if let Some(value) = value.as_u64() {
+                    Some(value)
+                } else if let Some(value) = value.as_i64() {
+                    Some(u64::try_from(value).map_err(|_| {
+                        OmniError::manifest(format!(
+                            "property '{name}' value {value} exceeds UInt64 range"
+                        ))
+                    })?)
+                } else {
+                    None
+                };
+                values.push(converted);
+            }
             Arc::new(UInt64Array::from(values))
         }
         DataType::Float32 => {
-            let values: Vec<Option<f32>> = rows
-                .iter()
-                .map(|row| row.get(name).and_then(|v| v.as_f64()).map(|v| v as f32))
-                .collect();
+            let mut values = Vec::with_capacity(rows.len());
+            for row in rows {
+                let value = row.get(name).unwrap_or(&JsonValue::Null);
+                values.push(
+                    value
+                        .as_f64()
+                        .map(|value| checked_json_f32(value, &format!("property '{name}'")))
+                        .transpose()?,
+                );
+            }
             Arc::new(Float32Array::from(values))
         }
         DataType::Float64 => {
@@ -938,7 +1304,9 @@ fn build_column_from_json(
                                 name, val
                             )));
                         };
-                        builder.values().append_value(v as f32);
+                        builder
+                            .values()
+                            .append_value(checked_json_f32(v, "vector element")?);
                     }
                     builder.append(true);
                 } else if nullable {
@@ -993,6 +1361,25 @@ fn make_list_value_builder(data_type: &DataType, capacity: usize) -> Result<Box<
     })
 }
 
+fn checked_json_f32(value: f64, context: &str) -> Result<f32> {
+    if !value.is_finite() {
+        return Err(OmniError::manifest(format!(
+            "{context} value {value} must be finite for Float32"
+        )));
+    }
+    // Judge range after IEEE round-to-nearest conversion. A shortest decimal
+    // spelling that round-trips through JSON may land just outside the exact
+    // f64 value of `f32::MAX` while still converting back to finite
+    // `f32::MAX`; rejecting it would make export/import asymmetric.
+    let narrowed = value as f32;
+    if !narrowed.is_finite() {
+        return Err(OmniError::manifest(format!(
+            "{context} value {value} exceeds Float32 range"
+        )));
+    }
+    Ok(narrowed)
+}
+
 fn append_json_list_item(
     builder: &mut Box<dyn ArrayBuilder>,
     data_type: &DataType,
@@ -1031,6 +1418,11 @@ fn append_json_list_item(
                     OmniError::manifest(format!("list value {} exceeds Int32 range", value))
                 })?;
                 builder.append_value(value);
+            } else if let Some(value) = value.as_u64() {
+                let value = i32::try_from(value).map_err(|_| {
+                    OmniError::manifest(format!("list value {} exceeds Int32 range", value))
+                })?;
+                builder.append_value(value);
             } else {
                 builder.append_null();
             }
@@ -1041,6 +1433,11 @@ fn append_json_list_item(
                 .downcast_mut::<Int64Builder>()
                 .ok_or_else(|| OmniError::manifest("list Int64 builder downcast failed"))?;
             if let Some(value) = value.as_i64() {
+                builder.append_value(value);
+            } else if let Some(value) = value.as_u64() {
+                let value = i64::try_from(value).map_err(|_| {
+                    OmniError::manifest(format!("list value {} exceeds Int64 range", value))
+                })?;
                 builder.append_value(value);
             } else {
                 builder.append_null();
@@ -1056,6 +1453,11 @@ fn append_json_list_item(
                     OmniError::manifest(format!("list value {} exceeds UInt32 range", value))
                 })?;
                 builder.append_value(value);
+            } else if let Some(value) = value.as_i64() {
+                let value = u32::try_from(value).map_err(|_| {
+                    OmniError::manifest(format!("list value {} exceeds UInt32 range", value))
+                })?;
+                builder.append_value(value);
             } else {
                 builder.append_null();
             }
@@ -1067,6 +1469,11 @@ fn append_json_list_item(
                 .ok_or_else(|| OmniError::manifest("list UInt64 builder downcast failed"))?;
             if let Some(value) = value.as_u64() {
                 builder.append_value(value);
+            } else if let Some(value) = value.as_i64() {
+                let value = u64::try_from(value).map_err(|_| {
+                    OmniError::manifest(format!("list value {} exceeds UInt64 range", value))
+                })?;
+                builder.append_value(value);
             } else {
                 builder.append_null();
             }
@@ -1077,7 +1484,7 @@ fn append_json_list_item(
                 .downcast_mut::<Float32Builder>()
                 .ok_or_else(|| OmniError::manifest("list Float32 builder downcast failed"))?;
             if let Some(value) = value.as_f64() {
-                builder.append_value(value as f32);
+                builder.append_value(checked_json_f32(value, "list value")?);
             } else {
                 builder.append_null();
             }
@@ -1380,7 +1787,7 @@ pub(crate) fn validate_enum_constraints(
 /// - `Ok(None)` if any column is null: the row is exempt (a partial tuple
 ///   can't violate uniqueness under SQL null semantics).
 /// - `Ok(Some(tuple))` otherwise.
-/// - `Err(..)` propagated from [`unique_key_scalar`] on an un-keyable value.
+/// - `Err(..)` propagated from [`canonical_scalar_key`] on an un-keyable value.
 ///
 /// Shared by every write surface through the unified validation evaluator
 /// (`crate::validate::evaluate_unique`, used by the loader, mutation, and
@@ -1392,12 +1799,33 @@ pub(crate) fn composite_unique_key(
 ) -> Result<Option<Vec<String>>> {
     let mut parts = Vec::with_capacity(group_columns.len());
     for column in group_columns {
-        match unique_key_scalar(column, row)? {
+        match canonical_scalar_key(column, row)? {
             Some(value) => parts.push(value),
             None => return Ok(None),
         }
     }
     Ok(Some(parts))
+}
+
+/// Derive the exact physical node id for a typed `@key` tuple.
+///
+/// A one-column key retains the historical scalar spelling. Composite keys use
+/// a JSON array of the per-column canonical strings: JSON escaping makes the
+/// encoding deterministic and unambiguous without inventing a delimiter that
+/// user data could forge.
+pub(crate) fn canonical_node_id(key_columns: &[ArrayRef], row: usize) -> Result<Option<String>> {
+    let Some(parts) = composite_unique_key(key_columns, row)? else {
+        return Ok(None);
+    };
+    match parts.as_slice() {
+        [] => Err(OmniError::manifest_internal(
+            "cannot derive a physical node id from an empty @key tuple",
+        )),
+        [scalar] => Ok(Some(scalar.clone())),
+        _ => serde_json::to_string(&parts)
+            .map(Some)
+            .map_err(|error| OmniError::manifest_internal(format!("encode @key tuple: {error}"))),
+    }
 }
 
 /// Render a constraint's column tuple for error messages: a single item as
@@ -1410,8 +1838,10 @@ pub(crate) fn format_tuple(items: &[String]) -> String {
     }
 }
 
-/// Reduce a single Arrow scalar at (`array`, `row`) to its uniqueness-key
-/// string.
+/// Reduce one typed Arrow scalar at (`array`, `row`) to its canonical key
+/// string. This one renderer owns both physical node-id derivation for `@key`
+/// writes and logical uniqueness tuples, so input surfaces cannot disagree
+/// about width conversion, dates, booleans, or unsigned values.
 ///
 /// - `Ok(None)` for a null value: nulls are exempt from uniqueness (standard
 ///   SQL semantics over nullable columns).
@@ -1424,7 +1854,7 @@ pub(crate) fn format_tuple(items: &[String]) -> String {
 ///   exempting the row, and because every legal scalar encoding is handled
 ///   above, the error fires only for a genuinely un-keyable column type — never
 ///   for a legal value that merely arrived in an unenumerated encoding.
-fn unique_key_scalar(array: &ArrayRef, row: usize) -> Result<Option<String>> {
+pub(crate) fn canonical_scalar_key(array: &ArrayRef, row: usize) -> Result<Option<String>> {
     use arrow_array::{Array, LargeStringArray, StringViewArray};
     if array.is_null(row) {
         return Ok(None);
@@ -1451,10 +1881,30 @@ fn unique_key_scalar(array: &ArrayRef, row: usize) -> Result<Option<String>> {
         return Ok(Some(a.value(row).to_string()));
     }
     if let Some(a) = array.as_any().downcast_ref::<Float32Array>() {
-        return Ok(Some(a.value(row).to_string()));
+        let value = a.value(row);
+        if !value.is_finite() {
+            return Err(OmniError::manifest(format!(
+                "scalar key: non-finite Float32 value {value} cannot identify a row"
+            )));
+        }
+        return Ok(Some(if value == 0.0 {
+            "0".to_string()
+        } else {
+            value.to_string()
+        }));
     }
     if let Some(a) = array.as_any().downcast_ref::<Float64Array>() {
-        return Ok(Some(a.value(row).to_string()));
+        let value = a.value(row);
+        if !value.is_finite() {
+            return Err(OmniError::manifest(format!(
+                "scalar key: non-finite Float64 value {value} cannot identify a row"
+            )));
+        }
+        return Ok(Some(if value == 0.0 {
+            "0".to_string()
+        } else {
+            value.to_string()
+        }));
     }
     if let Some(a) = array.as_any().downcast_ref::<BooleanArray>() {
         return Ok(Some(a.value(row).to_string()));
@@ -1466,9 +1916,105 @@ fn unique_key_scalar(array: &ArrayRef, row: usize) -> Result<Option<String>> {
         return Ok(Some(a.value(row).to_string()));
     }
     Err(OmniError::manifest(format!(
-        "uniqueness key: unsupported column type {:?} for @unique/@key enforcement",
+        "scalar key: unsupported column type {:?} for @unique/@key enforcement",
         array.data_type()
     )))
+}
+
+/// Compare an explicit physical id from an export with the typed key scalar it
+/// accompanies. Comparison happens in the declared Arrow type, not by string,
+/// because old writers derived some ids from literal text while export emitted
+/// the stored value (notably Date/DateTime and rounded F32).
+fn explicit_id_matches_scalar_key(array: &ArrayRef, row: usize, explicit: &str) -> Result<bool> {
+    use arrow_array::{Array, LargeStringArray, StringViewArray};
+    if array.is_null(row) {
+        return Ok(false);
+    }
+    if let Some(a) = array.as_any().downcast_ref::<StringArray>() {
+        return Ok(a.value(row) == explicit);
+    }
+    if let Some(a) = array.as_any().downcast_ref::<LargeStringArray>() {
+        return Ok(a.value(row) == explicit);
+    }
+    if let Some(a) = array.as_any().downcast_ref::<StringViewArray>() {
+        return Ok(a.value(row) == explicit);
+    }
+    if let Some(a) = array.as_any().downcast_ref::<Int32Array>() {
+        return Ok(explicit.parse::<i32>().ok() == Some(a.value(row)));
+    }
+    if let Some(a) = array.as_any().downcast_ref::<Int64Array>() {
+        return Ok(explicit.parse::<i64>().ok() == Some(a.value(row)));
+    }
+    if let Some(a) = array.as_any().downcast_ref::<UInt32Array>() {
+        return Ok(explicit.parse::<u32>().ok() == Some(a.value(row)));
+    }
+    if let Some(a) = array.as_any().downcast_ref::<UInt64Array>() {
+        return Ok(explicit.parse::<u64>().ok() == Some(a.value(row)));
+    }
+    if let Some(a) = array.as_any().downcast_ref::<Float32Array>() {
+        return Ok(explicit
+            .parse::<f32>()
+            .is_ok_and(|value| value == a.value(row)));
+    }
+    if let Some(a) = array.as_any().downcast_ref::<Float64Array>() {
+        return Ok(explicit
+            .parse::<f64>()
+            .is_ok_and(|value| value == a.value(row)));
+    }
+    if let Some(a) = array.as_any().downcast_ref::<BooleanArray>() {
+        return Ok(explicit
+            .parse::<bool>()
+            .is_ok_and(|value| value == a.value(row)));
+    }
+    if let Some(a) = array.as_any().downcast_ref::<Date32Array>() {
+        let parsed = explicit
+            .parse::<i32>()
+            .ok()
+            .or_else(|| parse_date32_literal(explicit).ok());
+        return Ok(parsed == Some(a.value(row)));
+    }
+    if let Some(a) = array.as_any().downcast_ref::<Date64Array>() {
+        let parsed = explicit
+            .parse::<i64>()
+            .ok()
+            .or_else(|| parse_date64_literal(explicit).ok());
+        return Ok(parsed == Some(a.value(row)));
+    }
+    Err(OmniError::manifest(format!(
+        "scalar key: unsupported column type {:?} for explicit id comparison",
+        array.data_type()
+    )))
+}
+
+/// Accept either the current exact tuple id or a legacy id derived from one
+/// typed key component. Before composite keys were made physical, writers used
+/// whichever component was first in that version's runtime catalog. Supported
+/// property renames could change that lexical order, so one old export may
+/// legitimately contain scalar ids from different tuple positions. The caller
+/// always persists `canonical_id` and records an endpoint remap; accepting an
+/// old spelling never weakens the invariant that physical `id` equals the
+/// complete typed key. If the same old id names different tuples, the typed
+/// remap rejects the import as ambiguous before any effect.
+fn explicit_id_matches_node_key(
+    key_columns: &[ArrayRef],
+    row: usize,
+    explicit: &str,
+    canonical_id: &str,
+) -> Result<bool> {
+    if explicit == canonical_id {
+        return Ok(true);
+    }
+    if key_columns.is_empty() {
+        return Err(OmniError::manifest_internal(
+            "cannot compare an explicit id to an empty @key tuple",
+        ));
+    }
+    for column in key_columns {
+        if explicit_id_matches_scalar_key(column, row, explicit)? {
+            return Ok(true);
+        }
+    }
+    Ok(false)
 }
 
 fn extract_numeric_value(col: &ArrayRef, row: usize) -> Option<f64> {
@@ -1963,7 +2509,7 @@ edge WorksAt: Person -> Company
         // silently un-enforced; now it errors instead of weakening the
         // constraint in silence.
         let blob: ArrayRef = Arc::new(LargeBinaryArray::from(vec![Some(&b"abc"[..])]));
-        let err = unique_key_scalar(&blob, 0).unwrap_err();
+        let err = canonical_scalar_key(&blob, 0).unwrap_err();
         assert!(
             err.to_string().contains("unsupported column type"),
             "un-keyable type must fail loudly (got: {err})"
@@ -1983,11 +2529,133 @@ edge WorksAt: Person -> Company
         let view: ArrayRef = Arc::new(StringViewArray::from(vec![Some("v")]));
         for array in [&utf8, &large, &view] {
             assert_eq!(
-                unique_key_scalar(array, 0).unwrap(),
+                canonical_scalar_key(array, 0).unwrap(),
                 Some("v".to_string()),
                 "string array {:?} must render, not error",
                 array.data_type()
             );
         }
+    }
+
+    #[test]
+    fn canonical_scalar_key_handles_every_supported_non_string_key_type() {
+        let cases: Vec<(ArrayRef, &str)> = vec![
+            (Arc::new(BooleanArray::from(vec![true])), "true"),
+            (Arc::new(Int32Array::from(vec![-32])), "-32"),
+            (
+                Arc::new(Int64Array::from(vec![i64::MIN])),
+                "-9223372036854775808",
+            ),
+            (Arc::new(UInt32Array::from(vec![u32::MAX])), "4294967295"),
+            (
+                Arc::new(UInt64Array::from(vec![u64::MAX])),
+                "18446744073709551615",
+            ),
+            (Arc::new(Float32Array::from(vec![1.25_f32])), "1.25"),
+            (Arc::new(Float64Array::from(vec![-2.5_f64])), "-2.5"),
+            (Arc::new(Float32Array::from(vec![-0.0_f32])), "0"),
+            (Arc::new(Float64Array::from(vec![-0.0_f64])), "0"),
+            (Arc::new(Date32Array::from(vec![19_723])), "19723"),
+            (
+                Arc::new(Date64Array::from(vec![1_704_067_200_000])),
+                "1704067200000",
+            ),
+        ];
+
+        for (array, expected) in cases {
+            assert_eq!(
+                canonical_scalar_key(&array, 0).unwrap().as_deref(),
+                Some(expected),
+                "scalar array {:?} must use its exact stored representation",
+                array.data_type()
+            );
+        }
+
+        for non_finite in [f32::NAN, f32::INFINITY, f32::NEG_INFINITY] {
+            let array: ArrayRef = Arc::new(Float32Array::from(vec![non_finite]));
+            assert!(canonical_scalar_key(&array, 0).is_err());
+        }
+        for non_finite in [f64::NAN, f64::INFINITY, f64::NEG_INFINITY] {
+            let array: ArrayRef = Arc::new(Float64Array::from(vec![non_finite]));
+            assert!(canonical_scalar_key(&array, 0).is_err());
+        }
+    }
+
+    #[test]
+    fn explicit_id_comparison_is_typed_for_legacy_spellings() {
+        let equivalent: Vec<(ArrayRef, &str)> = vec![
+            (Arc::new(BooleanArray::from(vec![true])), "true"),
+            (
+                Arc::new(Float32Array::from(vec![1.234_567_9_f32])),
+                "1.23456789",
+            ),
+            (Arc::new(Date32Array::from(vec![19_723])), "2024-01-01"),
+            (
+                Arc::new(Date64Array::from(vec![1_704_067_200_000])),
+                "2024-01-01T00:00:00Z",
+            ),
+            (
+                Arc::new(UInt64Array::from(vec![u64::MAX])),
+                "18446744073709551615",
+            ),
+        ];
+
+        for (array, explicit) in equivalent {
+            assert!(
+                explicit_id_matches_scalar_key(&array, 0, explicit).unwrap(),
+                "legacy id {explicit:?} must equal typed {:?} value",
+                array.data_type()
+            );
+        }
+        let day: ArrayRef = Arc::new(Date32Array::from(vec![19_723]));
+        assert!(!explicit_id_matches_scalar_key(&day, 0, "2024-01-02").unwrap());
+    }
+
+    #[test]
+    fn composite_node_id_is_deterministic_and_unambiguous() {
+        let scalar: Vec<ArrayRef> = vec![Arc::new(StringArray::from(vec!["a,b"]))];
+        assert_eq!(
+            canonical_node_id(&scalar, 0).unwrap().as_deref(),
+            Some("a,b"),
+            "one-column keys retain their historical scalar id"
+        );
+
+        let composite: Vec<ArrayRef> = vec![
+            Arc::new(StringArray::from(vec!["a,b"])),
+            Arc::new(UInt32Array::from(vec![7])),
+            Arc::new(StringArray::from(vec!["quote\"and\\slash"])),
+        ];
+        assert_eq!(
+            canonical_node_id(&composite, 0).unwrap().as_deref(),
+            Some(r#"["a,b","7","quote\"and\\slash"]"#)
+        );
+    }
+
+    #[test]
+    fn typed_node_id_remap_disambiguates_types_and_rejects_ambiguity() {
+        let mut remap = TypedNodeIdRemap::default();
+        remap.record("Exact", "16777217", "16777217").unwrap();
+        remap.record("Rounded", "16777217", "16777216").unwrap();
+        assert_eq!(remap.endpoint("Exact", "16777217"), Some("16777217"));
+        assert_eq!(remap.endpoint("Rounded", "16777217"), Some("16777216"));
+
+        let err = remap.record("Rounded", "16777217", "16777218").unwrap_err();
+        assert!(
+            err.to_string().contains("ambiguous edge endpoint remap"),
+            "same typed old id must not choose a canonical endpoint silently: {err}"
+        );
+    }
+
+    #[test]
+    fn checked_json_f32_accepts_boundary_and_rejects_overflow_and_nonfinite() {
+        assert_eq!(checked_json_f32(f32::MAX as f64, "test").unwrap(), f32::MAX);
+        assert_eq!(
+            checked_json_f32(f32::MAX as f64 * (1.0 + f64::EPSILON), "test").unwrap(),
+            f32::MAX
+        );
+        assert!(checked_json_f32(f32::MAX as f64 * (1.0 + f32::EPSILON as f64), "test").is_err());
+        assert!(checked_json_f32(f64::MAX, "test").is_err());
+        assert!(checked_json_f32(f64::INFINITY, "test").is_err());
+        assert!(checked_json_f32(f64::NAN, "test").is_err());
     }
 }

@@ -1,9 +1,14 @@
 mod helpers;
 
+use std::sync::Arc;
+
 use arrow_array::{Array, Date32Array, Int32Array, StringArray};
-use futures::TryStreamExt;
+use futures::{TryStreamExt, future::join_all};
+use lance::Dataset;
+use tokio::sync::Barrier;
 
 use omnigraph::db::Omnigraph;
+use omnigraph::error::OmniError;
 use omnigraph::loader::{LoadMode, load_jsonl};
 use omnigraph_compiler::ir::ParamMap;
 use omnigraph_compiler::query::ast::Literal;
@@ -67,6 +72,477 @@ async fn snapshot_returns_stale_data_after_write() {
 }
 
 // ─── LoadMode::Merge ────────────────────────────────────────────────────────
+
+/// Append is strict insert, not an unchecked physical append. Reusing an
+/// existing logical id must return the typed RFC-023 conflict and leave both
+/// graph visibility and the underlying table pointer unchanged.
+#[tokio::test]
+async fn load_append_rejects_existing_id_without_update() {
+    let dir = tempfile::tempdir().unwrap();
+    let uri = dir.path().to_str().unwrap();
+    let mut db = Omnigraph::init(uri, TEST_SCHEMA).await.unwrap();
+
+    load_jsonl(
+        &mut db,
+        r#"{"type":"Person","data":{"name":"Alice","age":30}}"#,
+        LoadMode::Overwrite,
+    )
+    .await
+    .unwrap();
+
+    let before = snapshot_main(&db).await.unwrap();
+    let before_manifest = before.version();
+    let before_table = before
+        .entry("node:Person")
+        .expect("Person entry before strict conflict")
+        .table_version;
+
+    let err = load_jsonl(
+        &mut db,
+        r#"{"type":"Person","data":{"name":"Alice","age":99}}"#,
+        LoadMode::Append,
+    )
+    .await
+    .unwrap_err();
+    match err {
+        OmniError::KeyConflict { table_key, key } => {
+            assert_eq!(table_key, "node:Person");
+            assert_eq!(key.as_deref(), Some("Alice"));
+        }
+        other => panic!("strict append must return typed KeyConflict, got {other:?}"),
+    }
+
+    let after = snapshot_main(&db).await.unwrap();
+    assert_eq!(
+        after.version(),
+        before_manifest,
+        "rejected strict insert must not publish a graph version"
+    );
+    assert_eq!(
+        after
+            .entry("node:Person")
+            .expect("Person entry after strict conflict")
+            .table_version,
+        before_table,
+        "rejected strict insert must not advance the Person table"
+    );
+
+    let rows = read_table(&db, "node:Person").await;
+    assert_eq!(rows.iter().map(|batch| batch.num_rows()).sum::<usize>(), 1);
+    let batch = &rows[0];
+    let ids = batch
+        .column_by_name("id")
+        .unwrap()
+        .as_any()
+        .downcast_ref::<StringArray>()
+        .unwrap();
+    let ages = batch
+        .column_by_name("age")
+        .unwrap()
+        .as_any()
+        .downcast_ref::<Int32Array>()
+        .unwrap();
+    let alice = (0..batch.num_rows())
+        .find(|&row| ids.value(row) == "Alice")
+        .expect("Alice remains visible");
+    assert_eq!(ages.value(alice), 30, "strict conflict must not upsert");
+}
+
+/// RFC-023's in-memory keyed adapter has a hard 8,192-row ceiling per
+/// mutation/load attempt. The boundary is inclusive; one row over must fail
+/// before recovery is armed or either graph/table visibility moves.
+#[tokio::test]
+async fn load_keyed_write_row_cap_accepts_limit_and_rejects_one_over_pre_effect() {
+    const LIMIT: usize = 8192;
+    const SCHEMA: &str = "node Thing { key: String @key }\n";
+
+    let jsonl = |rows: usize| {
+        let mut data = String::with_capacity(rows * 55);
+        for row in 0..rows {
+            data.push_str(&format!(
+                "{{\"type\":\"Thing\",\"data\":{{\"key\":\"load-{row}\"}}}}\n"
+            ));
+        }
+        data
+    };
+
+    let exact_dir = tempfile::tempdir().unwrap();
+    let mut exact = Omnigraph::init(exact_dir.path().to_str().unwrap(), SCHEMA)
+        .await
+        .unwrap();
+    load_jsonl(&mut exact, &jsonl(LIMIT), LoadMode::Append)
+        .await
+        .expect("the exact keyed row limit is inclusive");
+    assert_eq!(count_rows(&exact, "node:Thing").await, LIMIT);
+
+    let over_dir = tempfile::tempdir().unwrap();
+    let mut over = Omnigraph::init(over_dir.path().to_str().unwrap(), SCHEMA)
+        .await
+        .unwrap();
+    let before = snapshot_main(&over).await.unwrap();
+    let before_manifest = before.version();
+    let entry = before.entry("node:Thing").unwrap();
+    let before_table = entry.table_version;
+    let table_uri = format!(
+        "{}/{}",
+        over.uri().trim_end_matches('/'),
+        entry.table_path.trim_start_matches('/')
+    );
+    let before_head = Dataset::open(&table_uri).await.unwrap().version().version;
+    let error = load_jsonl(&mut over, &jsonl(LIMIT + 1), LoadMode::Append)
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(
+            error,
+            OmniError::ResourceLimitExceeded {
+                ref resource,
+                limit: 8192,
+                actual: 8193,
+            } if resource == "keyed rows for node:Thing"
+        ),
+        "one-over load must return the typed keyed-row limit, got {error:?}"
+    );
+    let after = snapshot_main(&over).await.unwrap();
+    assert_eq!(after.version(), before_manifest);
+    assert_eq!(
+        after.entry("node:Thing").unwrap().table_version,
+        before_table
+    );
+    assert_eq!(
+        Dataset::open(&table_uri).await.unwrap().version().version,
+        before_head,
+        "one-over load must fail before a Lance table effect"
+    );
+    assert_eq!(count_rows(&over, "node:Thing").await, 0);
+    let recovery_dir = over_dir.path().join("__recovery");
+    assert!(
+        !recovery_dir.exists() || std::fs::read_dir(recovery_dir).unwrap().next().is_none(),
+        "one-over load must fail before writing a recovery sidecar"
+    );
+}
+
+/// The sibling 32 MiB cap is measured from the staged Arrow batch, not JSON
+/// syntax. A single wide keyed row must be rejected with a typed limit before
+/// either Lance HEAD or graph visibility can move.
+#[tokio::test]
+async fn load_keyed_write_byte_cap_rejects_wide_row_pre_effect() {
+    const LIMIT: u64 = 32 * 1024 * 1024;
+    const SCHEMA: &str = r#"
+node Thing {
+    key: String @key
+    payload: String
+}
+"#;
+
+    let dir = tempfile::tempdir().unwrap();
+    let mut db = Omnigraph::init(dir.path().to_str().unwrap(), SCHEMA)
+        .await
+        .unwrap();
+    let before = snapshot_main(&db).await.unwrap();
+    let before_manifest = before.version();
+    let entry = before.entry("node:Thing").unwrap();
+    let before_table = entry.table_version;
+    let table_uri = format!(
+        "{}/{}",
+        db.uri().trim_end_matches('/'),
+        entry.table_path.trim_start_matches('/')
+    );
+    let before_head = Dataset::open(&table_uri).await.unwrap().version().version;
+
+    let wide = "x".repeat(LIMIT as usize + 1024);
+    let input =
+        format!("{{\"type\":\"Thing\",\"data\":{{\"key\":\"wide\",\"payload\":\"{wide}\"}}}}");
+    let error = load_jsonl(&mut db, &input, LoadMode::Append)
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(
+            error,
+            OmniError::ResourceLimitExceeded {
+                ref resource,
+                limit: LIMIT,
+                actual,
+            } if (resource == "keyed bytes for node:Thing"
+                || resource == "keyed parsed value bytes for node:Thing")
+                && actual > LIMIT
+        ),
+        "wide load must return the typed keyed-byte limit, got {error:?}"
+    );
+
+    let after = snapshot_main(&db).await.unwrap();
+    assert_eq!(after.version(), before_manifest);
+    assert_eq!(
+        after.entry("node:Thing").unwrap().table_version,
+        before_table
+    );
+    assert_eq!(
+        Dataset::open(&table_uri).await.unwrap().version().version,
+        before_head,
+        "wide input must fail before a Lance table effect"
+    );
+    assert_eq!(count_rows(&db, "node:Thing").await, 0);
+    let recovery_dir = dir.path().join("__recovery");
+    assert!(
+        !recovery_dir.exists() || std::fs::read_dir(recovery_dir).unwrap().next().is_none(),
+        "wide input must fail before writing a recovery sidecar"
+    );
+}
+
+/// An external blob reference is small in the staged Arrow descriptor even
+/// when the referenced object is huge. The keyed Append adapter must charge
+/// the object's metadata size before fetching its payload and before arming
+/// recovery. Linux CI also watches the sparse source for `IN_ACCESS`, proving
+/// the rejected payload was never read after its metadata was resolved.
+#[tokio::test]
+async fn load_append_rejects_oversized_external_blob_before_read_or_arm() {
+    const LIMIT: u64 = 32 * 1024 * 1024;
+    const SCHEMA: &str = r#"
+node Document {
+    title: String @key
+    content: Blob
+}
+"#;
+
+    let graph_dir = tempfile::tempdir().unwrap();
+    let external_dir = tempfile::tempdir().unwrap();
+    let external_path = external_dir.path().join("oversized.blob");
+    let external = std::fs::File::create(&external_path).unwrap();
+    external.set_len(LIMIT + 1).unwrap();
+    drop(external);
+
+    #[cfg(target_os = "linux")]
+    let access_watch = {
+        use std::ffi::CString;
+        use std::os::fd::{AsRawFd as _, FromRawFd as _, OwnedFd};
+        use std::os::unix::ffi::OsStrExt as _;
+
+        let raw_fd = unsafe { libc::inotify_init1(libc::IN_CLOEXEC | libc::IN_NONBLOCK) };
+        assert!(
+            raw_fd >= 0,
+            "create inotify payload-read probe: {}",
+            std::io::Error::last_os_error()
+        );
+        let fd = unsafe { OwnedFd::from_raw_fd(raw_fd) };
+        let path = CString::new(external_path.as_os_str().as_bytes()).unwrap();
+        let watch =
+            unsafe { libc::inotify_add_watch(fd.as_raw_fd(), path.as_ptr(), libc::IN_ACCESS) };
+        assert!(
+            watch >= 0,
+            "watch external blob access: {}",
+            std::io::Error::last_os_error()
+        );
+        (fd, watch)
+    };
+
+    let db = Omnigraph::init(graph_dir.path().to_str().unwrap(), SCHEMA)
+        .await
+        .unwrap();
+    db.branch_create("feature").await.unwrap();
+    let before = snapshot_branch(&db, "feature").await.unwrap();
+    let before_manifest = before.version();
+    let entry = before.entry("node:Document").unwrap();
+    let before_table = entry.table_version;
+    assert_eq!(
+        entry.table_branch, None,
+        "precondition: feature still inherits main's table version lazily"
+    );
+    let table_uri = format!(
+        "{}/{}",
+        db.uri().trim_end_matches('/'),
+        entry.table_path.trim_start_matches('/')
+    );
+    let before_dataset = Dataset::open(&table_uri).await.unwrap();
+    let before_head = before_dataset.version().version;
+    assert!(
+        !before_dataset
+            .list_branches()
+            .await
+            .unwrap()
+            .contains_key("feature"),
+        "precondition: feature has no native table ref before first touch"
+    );
+    let external_uri = url::Url::from_file_path(&external_path)
+        .expect("external blob path is absolute")
+        .to_string();
+    let input = serde_json::json!({
+        "type": "Document",
+        "data": {
+            "title": "oversized",
+            "content": external_uri,
+        }
+    })
+    .to_string();
+
+    let result = db.load("feature", &input, LoadMode::Append).await;
+    let error = result.unwrap_err();
+    assert!(
+        matches!(
+            error,
+            OmniError::ResourceLimitExceeded {
+                ref resource,
+                limit: LIMIT,
+                actual,
+            } if resource == "materialized external blob payload bytes" && actual == LIMIT + 1
+        ),
+        "oversized external blob must be rejected from metadata before payload read, got {error:?}"
+    );
+
+    #[cfg(target_os = "linux")]
+    {
+        use std::os::fd::AsRawFd as _;
+
+        let (fd, _watch) = access_watch;
+        let mut events = [0_u8; 256];
+        let read = unsafe {
+            libc::read(
+                fd.as_raw_fd(),
+                events.as_mut_ptr().cast::<libc::c_void>(),
+                events.len(),
+            )
+        };
+        assert_eq!(read, -1, "oversized external payload was read");
+        assert_eq!(
+            std::io::Error::last_os_error().kind(),
+            std::io::ErrorKind::WouldBlock,
+            "payload-read probe failed unexpectedly"
+        );
+    }
+
+    let after = snapshot_branch(&db, "feature").await.unwrap();
+    assert_eq!(after.version(), before_manifest);
+    assert_eq!(
+        after.entry("node:Document").unwrap().table_version,
+        before_table
+    );
+    assert_eq!(
+        after.entry("node:Document").unwrap().table_branch,
+        None,
+        "rejection must not publish a deferred table fork"
+    );
+    let after_dataset = Dataset::open(&table_uri).await.unwrap();
+    assert_eq!(
+        after_dataset.version().version,
+        before_head,
+        "oversized external blob must fail before a Lance table effect"
+    );
+    assert!(
+        !after_dataset
+            .list_branches()
+            .await
+            .unwrap()
+            .contains_key("feature"),
+        "oversized first touch must fail before creating the native feature ref"
+    );
+    assert_eq!(count_rows_branch(&db, "feature", "node:Document").await, 0);
+    let recovery_dir = graph_dir.path().join("__recovery");
+    assert!(
+        !recovery_dir.exists() || std::fs::read_dir(recovery_dir).unwrap().next().is_none(),
+        "oversized external blob must fail before writing a recovery sidecar"
+    );
+}
+
+/// N handles inserting the same id have exactly one winner and every loser is
+/// the typed RFC-023 conflict; disjoint ids still both survive. This is the
+/// graph-level stress counterpart to Lance's lower conflict-matrix guard and
+/// remains valid whether the process-local gates serialize preparation or
+/// Lance resolves stale transactions.
+#[tokio::test]
+async fn n_concurrent_strict_loads_have_one_same_id_winner_and_keep_disjoint_ids() {
+    let dir = tempfile::tempdir().unwrap();
+    let uri = dir.path().to_str().unwrap();
+    let schema = r#"
+node Thing {
+    key: String @key
+    value: String
+}
+"#;
+    let _db = Omnigraph::init(uri, schema).await.unwrap();
+
+    const SAME_KEY_WRITERS: usize = 16;
+    // Open every handle at the same empty graph image, then release every load
+    // together. A Barrier gives this a real N-way contention window without a
+    // timing-dependent sleep.
+    let writers = join_all((0..SAME_KEY_WRITERS).map(|_| Omnigraph::open(uri)))
+        .await
+        .into_iter()
+        .collect::<Result<Vec<_>, _>>()
+        .unwrap();
+    let start = Arc::new(Barrier::new(SAME_KEY_WRITERS));
+    let same_results = join_all(writers.into_iter().enumerate().map(|(writer, mut db)| {
+        let start = Arc::clone(&start);
+        async move {
+            start.wait().await;
+            let row =
+                format!(r#"{{"type":"Thing","data":{{"key":"SAME","value":"writer-{writer}"}}}}"#);
+            (writer, load_jsonl(&mut db, &row, LoadMode::Append).await)
+        }
+    }))
+    .await;
+    assert_eq!(
+        same_results
+            .iter()
+            .filter(|(_, result)| result.is_ok())
+            .count(),
+        1,
+        "same-id strict inserts must have exactly one winner: {same_results:?}"
+    );
+    let winner = same_results
+        .iter()
+        .find_map(|(writer, result)| result.is_ok().then_some(*writer))
+        .expect("one same-id writer must win");
+    for (writer, result) in &same_results {
+        match result {
+            Ok(_) => assert_eq!(*writer, winner),
+            Err(OmniError::KeyConflict { table_key, key }) => {
+                assert_eq!(table_key, "node:Thing");
+                assert!(
+                    key.as_deref().is_none_or(|key| key == "SAME"),
+                    "writer {writer} reported the wrong conflicting key: {key:?}"
+                );
+            }
+            Err(other) => {
+                panic!("same-id loser {writer} must return typed KeyConflict, got {other:?}")
+            }
+        }
+    }
+
+    let observer = Omnigraph::open(uri).await.unwrap();
+    let same_rows = read_table(&observer, "node:Thing").await;
+    let same_ids = collect_column_strings(&same_rows, "id");
+    let same_values = collect_column_strings(&same_rows, "value");
+    assert_eq!(same_ids, ["SAME"], "the N-way race must publish one row");
+    assert_eq!(
+        same_values,
+        [format!("writer-{winner}")],
+        "the persisted row must belong to the sole successful writer"
+    );
+
+    let mut left = Omnigraph::open(uri).await.unwrap();
+    let mut right = Omnigraph::open(uri).await.unwrap();
+    let (left, right) = tokio::join!(
+        load_jsonl(
+            &mut left,
+            r#"{"type":"Thing","data":{"key":"LEFT","value":"l"}}"#,
+            LoadMode::Append,
+        ),
+        load_jsonl(
+            &mut right,
+            r#"{"type":"Thing","data":{"key":"RIGHT","value":"r"}}"#,
+            LoadMode::Append,
+        ),
+    );
+    left.expect("disjoint strict insert LEFT must succeed");
+    right.expect("disjoint strict insert RIGHT must succeed");
+
+    let observer = Omnigraph::open(uri).await.unwrap();
+    let rows = read_table(&observer, "node:Thing").await;
+    let ids = collect_column_strings(&rows, "id");
+    assert_eq!(ids.iter().filter(|id| id.as_str() == "SAME").count(), 1);
+    assert!(ids.iter().any(|id| id == "LEFT"), "LEFT missing: {ids:?}");
+    assert!(ids.iter().any(|id| id == "RIGHT"), "RIGHT missing: {ids:?}");
+    assert_eq!(ids.len(), 3, "unexpected strict-load rows: {ids:?}");
+}
 
 #[tokio::test]
 async fn load_merge_upserts_existing_and_inserts_new() {
@@ -225,6 +701,101 @@ node Thing {
             count_rows(&db, "node:Thing").await,
             0,
             "load mode {mode:?} must not persist any rows when the batch is rejected"
+        );
+    }
+}
+
+/// Internal schema v6 keys every physical graph table by `id`, even when the
+/// public schema has no `@key`. The common pre-arm preparation must therefore
+/// reject duplicate explicit ids for both strict insert and Overwrite before a
+/// lazy branch's first-touch ref or recovery intent exists. In particular,
+/// Overwrite cannot rely on Lance's unenforced-PK metadata to deduplicate rows.
+#[tokio::test]
+async fn lazy_load_rejects_duplicate_physical_ids_before_arm_for_append_and_overwrite() {
+    const SCHEMA: &str = r#"
+node Thing {
+    value: String
+}
+"#;
+    const DUPLICATES: &str = r#"{"type":"Thing","data":{"id":"DUP","value":"first"}}
+{"type":"Thing","data":{"id":"DUP","value":"second"}}
+"#;
+
+    for mode in [LoadMode::Append, LoadMode::Overwrite] {
+        let dir = tempfile::tempdir().unwrap();
+        let db = Omnigraph::init(dir.path().to_str().unwrap(), SCHEMA)
+            .await
+            .unwrap();
+        db.branch_create("feature").await.unwrap();
+
+        let before = snapshot_branch(&db, "feature").await.unwrap();
+        let before_manifest = before.version();
+        let entry = before.entry("node:Thing").unwrap();
+        let before_table = entry.table_version;
+        assert_eq!(
+            entry.table_branch, None,
+            "precondition: feature inherits the empty main table lazily"
+        );
+        let table_uri = format!(
+            "{}/{}",
+            db.uri().trim_end_matches('/'),
+            entry.table_path.trim_start_matches('/')
+        );
+        let before_dataset = Dataset::open(&table_uri).await.unwrap();
+        let before_head = before_dataset.version().version;
+        assert!(
+            !before_dataset
+                .list_branches()
+                .await
+                .unwrap()
+                .contains_key("feature"),
+            "precondition: feature has no native table ref before first touch"
+        );
+
+        let error = db
+            .load("feature", DUPLICATES, mode)
+            .await
+            .expect_err("duplicate physical ids must fail before first touch");
+        assert!(
+            matches!(
+                error,
+                OmniError::KeyConflict { ref table_key, ref key }
+                    if table_key == "node:Thing" && key.as_deref() == Some("DUP")
+            ),
+            "load mode {mode:?} must return typed physical-id conflict, got {error:?}"
+        );
+
+        let after = snapshot_branch(&db, "feature").await.unwrap();
+        assert_eq!(
+            after.version(),
+            before_manifest,
+            "load mode {mode:?} must not publish the feature manifest"
+        );
+        let after_entry = after.entry("node:Thing").unwrap();
+        assert_eq!(after_entry.table_version, before_table);
+        assert_eq!(
+            after_entry.table_branch, None,
+            "load mode {mode:?} must not publish a deferred table fork"
+        );
+        let after_dataset = Dataset::open(&table_uri).await.unwrap();
+        assert_eq!(
+            after_dataset.version().version,
+            before_head,
+            "load mode {mode:?} must not advance raw table HEAD"
+        );
+        assert!(
+            !after_dataset
+                .list_branches()
+                .await
+                .unwrap()
+                .contains_key("feature"),
+            "load mode {mode:?} must fail before creating the native feature ref"
+        );
+        assert_eq!(count_rows_branch(&db, "feature", "node:Thing").await, 0);
+        let recovery_dir = dir.path().join("__recovery");
+        assert!(
+            !recovery_dir.exists() || std::fs::read_dir(recovery_dir).unwrap().next().is_none(),
+            "load mode {mode:?} must fail before writing a recovery sidecar"
         );
     }
 }

@@ -1,4 +1,4 @@
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 
 use arrow_array::{Array, RecordBatch, StringArray, UInt64Array};
 use arrow_cast::display::array_value_to_string;
@@ -117,23 +117,34 @@ pub(crate) async fn diff_snapshots(
     filter: &ChangeFilter,
     branch: Option<String>,
 ) -> Result<ChangeSet> {
-    let mut all_keys: HashSet<String> = HashSet::new();
-    for entry in from.entries() {
-        all_keys.insert(entry.table_key.clone());
-    }
-    for entry in to.entries() {
-        all_keys.insert(entry.table_key.clone());
-    }
+    let from_by_identity = from
+        .entries()
+        .map(|entry| (entry.identity, entry))
+        .collect::<HashMap<_, _>>();
+    let to_by_identity = to
+        .entries()
+        .map(|entry| (entry.identity, entry))
+        .collect::<HashMap<_, _>>();
+    let all_identities = from_by_identity
+        .keys()
+        .chain(to_by_identity.keys())
+        .copied()
+        .collect::<HashSet<_>>();
 
     let mut changes = Vec::new();
 
-    for table_key in &all_keys {
+    for identity in all_identities {
+        let from_entry = from_by_identity.get(&identity).copied();
+        let to_entry = to_by_identity.get(&identity).copied();
+        // Prefer the destination alias for a rename; a removed table has only
+        // its source alias. Logical pairing never depends on either name.
+        let table_key = &to_entry
+            .or(from_entry)
+            .expect("identity came from one snapshot")
+            .table_key;
         if !filter.matches_table(table_key) {
             continue;
         }
-
-        let from_entry = from.entry(table_key);
-        let to_entry = to.entry(table_key);
 
         // Skip if both snapshots have identical state for this table
         if same_state(from_entry, to_entry) {
@@ -145,10 +156,10 @@ pub(crate) async fn diff_snapshots(
 
         let table_changes = if from_entry.is_none() {
             // Table added — all rows are inserts
-            diff_table_added(table_store, to, table_key, is_edge, filter).await?
+            diff_table_added(table_store, to_entry.unwrap(), is_edge, filter).await?
         } else if to_entry.is_none() {
             // Table removed — all rows are deletes
-            diff_table_removed(table_store, from, table_key, is_edge, filter).await?
+            diff_table_removed(table_store, from_entry.unwrap(), is_edge, filter).await?
         } else if same_lineage(from_entry, to_entry) {
             // Fast path: version-column diff
             diff_table_same_lineage(
@@ -161,7 +172,14 @@ pub(crate) async fn diff_snapshots(
             .await?
         } else {
             // Cross-branch path: streaming ID-based diff
-            diff_table_cross_branch(table_store, from, to, table_key, is_edge, filter).await?
+            diff_table_cross_branch(
+                table_store,
+                from_entry.unwrap(),
+                to_entry.unwrap(),
+                is_edge,
+                filter,
+            )
+            .await?
         };
 
         for mut c in table_changes {
@@ -295,17 +313,14 @@ async fn diff_table_same_lineage(
 
 async fn diff_table_cross_branch(
     table_store: &TableStore,
-    from_snap: &Snapshot,
-    to_snap: &Snapshot,
-    table_key: &str,
+    from_entry: &SubTableEntry,
+    to_entry: &SubTableEntry,
     is_edge: bool,
     filter: &ChangeFilter,
 ) -> Result<Vec<EntityChange>> {
     let storage: &dyn TableStorage = table_store;
-    let from_ds = storage
-        .open_snapshot_at_table(from_snap, table_key)
-        .await?;
-    let to_ds = storage.open_snapshot_at_table(to_snap, table_key).await?;
+    let from_ds = storage.open_snapshot_at_entry(from_entry).await?;
+    let to_ds = storage.open_snapshot_at_entry(to_entry).await?;
 
     let from_rows = scan_all_rows_ordered(storage, &from_ds, is_edge).await?;
     let to_rows = scan_all_rows_ordered(storage, &to_ds, is_edge).await?;
@@ -386,8 +401,7 @@ async fn diff_table_cross_branch(
 
 async fn diff_table_added(
     table_store: &TableStore,
-    to_snap: &Snapshot,
-    table_key: &str,
+    to_entry: &SubTableEntry,
     is_edge: bool,
     filter: &ChangeFilter,
 ) -> Result<Vec<EntityChange>> {
@@ -395,7 +409,7 @@ async fn diff_table_added(
         return Ok(Vec::new());
     }
     let storage: &dyn TableStorage = table_store;
-    let ds = storage.open_snapshot_at_table(to_snap, table_key).await?;
+    let ds = storage.open_snapshot_at_entry(to_entry).await?;
     let rows = scan_all_rows_ordered(storage, &ds, is_edge).await?;
     Ok(rows
         .into_iter()
@@ -405,8 +419,7 @@ async fn diff_table_added(
 
 async fn diff_table_removed(
     table_store: &TableStore,
-    from_snap: &Snapshot,
-    table_key: &str,
+    from_entry: &SubTableEntry,
     is_edge: bool,
     filter: &ChangeFilter,
 ) -> Result<Vec<EntityChange>> {
@@ -414,9 +427,7 @@ async fn diff_table_removed(
         return Ok(Vec::new());
     }
     let storage: &dyn TableStorage = table_store;
-    let ds = storage
-        .open_snapshot_at_table(from_snap, table_key)
-        .await?;
+    let ds = storage.open_snapshot_at_entry(from_entry).await?;
     let rows = scan_all_rows_ordered(storage, &ds, is_edge).await?;
     Ok(rows
         .into_iter()
@@ -433,9 +444,7 @@ async fn scan_with_filter(
     cols: &[&str],
     filter_sql: &str,
 ) -> Result<Vec<ScannedRow>> {
-    let batches = storage
-        .scan(ds, Some(cols), Some(filter_sql), None)
-        .await?;
+    let batches = storage.scan(ds, Some(cols), Some(filter_sql), None).await?;
     Ok(extract_rows(&batches))
 }
 

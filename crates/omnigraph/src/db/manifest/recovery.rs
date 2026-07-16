@@ -6,8 +6,9 @@
 //!
 //! 1. Each writer that performs a multi-table commit writes a small JSON
 //!    sidecar at `__recovery/{ulid}.json` BEFORE its per-table
-//!    `commit_staged` loop, listing every `(table_key, table_path,
-//!    expected_version, post_commit_pin)` it intends to publish.
+//!    `commit_staged` loop, listing every `(stable_table_id,
+//!    table_incarnation_id, table_key, table_path, expected_version,
+//!    post_commit_pin)` it intends to publish.
 //! 2. After the manifest publish (Phase C) succeeds, the writer deletes
 //!    the sidecar.
 //! 3. If the writer crashes between Phase B begin and Phase C success,
@@ -54,7 +55,8 @@ use super::publisher::{
     PublishPrecondition,
 };
 use super::{
-    ManifestChange, ManifestCoordinator, SubTableUpdate, TableRegistration, TableTombstone,
+    ExpectedTableVersions, ManifestChange, ManifestCoordinator, SubTableUpdate, TableIdentity,
+    TableRegistration, TableRename, TableTombstone, TableVersionExpectation,
 };
 
 /// System actor identifier for recovery-owned lineage: legacy recovery,
@@ -86,7 +88,7 @@ async fn publish_recovery_commit(
     sidecar: &RecoverySidecar,
     kind: RecoveryKind,
     updates: &[ManifestChange],
-    expected: &HashMap<String, u64>,
+    expected: &ExpectedTableVersions,
 ) -> Result<(u64, String)> {
     let exact_lineage = sidecar
         .protocol_v3
@@ -273,11 +275,22 @@ pub(crate) const RECOVERY_DIR_NAME: &str = "__recovery";
 /// sidecar replaces v6's loose classifier with one exact CreateIndex
 /// transaction per table, a complete fixed manifest delta, and target-ref
 /// identity for first-touch named-branch tables.
-pub(crate) const SIDECAR_SCHEMA_VERSION: u32 = 8;
+///
+/// v8 → v9: RFC-028 table-lifetime identity. Every table pin, effect,
+/// registration, rename, tombstone, and manifest output slot carries an
+/// explicit non-zero `(stable_table_id, table_incarnation_id)`. Active writers
+/// all emit v9; the writer-specific payload field names remain `protocol_v3`,
+/// `protocol_v4`, `protocol_v7`, and `protocol_v8` only to avoid duplicating
+/// their established exact-effect shapes. Pre-v9 files are never upgraded by
+/// alias inference or a serde default.
+pub(crate) const SIDECAR_SCHEMA_VERSION: u32 = 9;
 
-/// Schema version emitted by the legacy constructor. Fixed at v2 so merely
-/// teaching this binary to understand v3 does not silently enroll every writer
-/// in new recovery semantics.
+/// The only recovery generation emitted by the manifest-v5 write paths.
+pub(crate) const IDENTITY_AWARE_SIDECAR_SCHEMA_VERSION: u32 = 9;
+
+/// Oldest loose-classification generation retained for test fixtures. No
+/// active constructor emits it.
+#[cfg(test)]
 pub(crate) const LEGACY_SIDECAR_SCHEMA_VERSION: u32 = 2;
 
 /// The version at which Phase-B confirmation shipped. A `BranchMerge` sidecar is
@@ -290,12 +303,12 @@ pub(crate) const CONFIRMATION_SCHEMA_VERSION: u32 = 2;
 /// to the current maximum so future sidecar versions retain this floor.
 pub(crate) const EXACT_EFFECT_IDENTITY_SCHEMA_VERSION: u32 = 3;
 
-/// Exact schema generation emitted by [`new_occ_sidecar`]. Keep this fixed when
-/// the reader learns a newer sidecar generation; v3 Mutation/Load semantics are
-/// not reinterpreted by the v4 BranchMerge adapter.
+/// Historical Mutation/Load protocol floor. Active writers emit v9 while
+/// retaining the `protocol_v3` payload field name.
+#[cfg(test)]
 pub(crate) const MUTATION_LOAD_SIDECAR_SCHEMA_VERSION: u32 = 3;
 
-/// Exact schema generation emitted by [`new_branch_merge_sidecar`].
+/// Historical BranchMerge protocol floor.
 pub(crate) const BRANCH_MERGE_SIDECAR_SCHEMA_VERSION: u32 = 4;
 
 /// SchemaApply recovery generation with target identity + durable Phase-C
@@ -317,12 +330,17 @@ pub(crate) const SCHEMA_APPLY_EXACT_SCHEMA_VERSION: u32 = 7;
 /// original loose-classifier/fixed-rollback semantics.
 pub(crate) const ENSURE_INDICES_EXACT_SCHEMA_VERSION: u32 = 8;
 
-/// Bound the cold-path transaction-history probes used by the v3/v4 exact
-/// recovery protocols. Normal v3 recovery reads one version and a v4 logical
-/// merge chain is currently at most three versions; a larger gap is derived
-/// index work or foreign activity. Exceeding the bound is surfaced as
-/// unverifiable rather than turning open into an unbounded history walk.
-const MAX_EFFECT_IDENTITY_SCAN_VERSIONS: u64 = 1024;
+/// Maximum logical data transactions one table may arm in a BranchMerge chain.
+/// The writer rejects a larger plan before the sidecar exists.
+pub(crate) const MAX_BRANCH_MERGE_DATA_TRANSACTIONS: u64 = 1024;
+
+/// Bound the cold-path transaction-history probes used by exact recovery.
+/// BranchMerge reserves two versions beyond its logical chain: one allowed
+/// derived `CreateIndex` tail and one compensating `Restore`. Recovery may
+/// crash after that Restore but before its manifest publish, so both versions
+/// must remain classifiable on the next sweep. Exceeding this bound fails
+/// closed rather than turning open into an unbounded history walk.
+pub(crate) const MAX_EFFECT_IDENTITY_SCAN_VERSIONS: u64 = MAX_BRANCH_MERGE_DATA_TRANSACTIONS + 2;
 
 /// Selects which recovery actions are allowed in a sweep.
 ///
@@ -446,7 +464,10 @@ impl SidecarKind {
 /// uses these to decide per-table state at recovery time.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub(crate) struct SidecarTablePin {
-    /// Stable identifier (`node:Person`, `edge:Knows`, etc.).
+    /// Immutable logical table lifetime. Recovery ownership is never inferred
+    /// from the mutable diagnostic alias below.
+    pub identity: super::TableIdentity,
+    /// Current diagnostic alias (`node:Person`, `edge:Knows`, etc.).
     pub table_key: String,
     /// Full URI to the Lance dataset for this table.
     pub table_path: String,
@@ -488,16 +509,30 @@ pub(crate) struct SidecarTablePin {
 /// returns None when the engine tries to read them.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub(crate) struct SidecarTableRegistration {
-    /// Stable identifier (`node:Tag`, `edge:WorksAt`, etc.).
+    /// Immutable logical table lifetime being registered.
+    pub identity: super::TableIdentity,
+    /// Current diagnostic alias (`node:Tag`, `edge:WorksAt`, etc.).
     pub table_key: String,
-    /// Graph-relative path the manifest will register
-    /// (e.g. `nodes/{fnv1a64-hex}`); recovery joins this with `root_uri`
+    /// Graph-relative identity-derived path the manifest will register
+    /// (e.g. `nodes/{stable-id}-{incarnation-id}`); recovery joins this with `root_uri`
     /// to open the dataset Lance HEAD when constructing the
     /// accompanying `Update`.
     pub table_path: String,
     /// Lance branch ref the dataset lives on (None for main / default).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub table_branch: Option<String>,
+}
+
+/// Metadata-only alias rebinding captured by SchemaApply. The identity and
+/// physical path are fixed attempt data; recovery may change only the public
+/// alias, never rematerialize or adopt a name-derived dataset.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub(crate) struct SidecarTableRename {
+    pub identity: super::TableIdentity,
+    pub expected_table_key: String,
+    pub expected_version: u64,
+    pub table_key: String,
+    pub table_path: String,
 }
 
 /// Tombstone metadata captured by SchemaApply sidecars so recovery can
@@ -507,6 +542,7 @@ pub(crate) struct SidecarTableRegistration {
 /// schema no longer declares them.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub(crate) struct SidecarTombstone {
+    pub identity: super::TableIdentity,
     pub table_key: String,
     /// Manifest version at which this table was active before the
     /// tombstone — required by the publisher's CAS pre-check.
@@ -521,6 +557,7 @@ pub(crate) struct SidecarTombstone {
 pub(crate) struct RecoveryAuthorityToken {
     pub branch_identifier: lance::dataset::refs::BranchIdentifier,
     pub graph_head: Option<String>,
+    pub schema_identity_domain: String,
     pub schema_ir_hash: String,
     pub schema_identity_version: u32,
 }
@@ -561,6 +598,7 @@ pub(crate) enum RecoveryEffectPhase {
 /// One exact physical effect enrolled in an RFC-022 sidecar.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub(crate) struct RecoveryTableEffect {
+    pub identity: TableIdentity,
     pub table_key: String,
     pub planned_transaction: StagedTransactionIdentity,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -582,6 +620,7 @@ pub(crate) struct RecoveryConfirmedTableUpdate {
 /// Canonical manifest-delta output slot for one touched table.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub(crate) struct RecoveryTableUpdateSlot {
+    pub identity: super::TableIdentity,
     pub table_key: String,
     pub expected_version: u64,
     pub table_branch: Option<String>,
@@ -597,6 +636,8 @@ pub(crate) struct RecoveryManifestDelta {
     pub table_updates: Vec<RecoveryTableUpdateSlot>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub registrations: Vec<SidecarTableRegistration>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub renames: Vec<SidecarTableRename>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub tombstones: Vec<SidecarTombstone>,
 }
@@ -628,6 +669,7 @@ pub(crate) struct RecoveryProtocolV3 {
 /// from a numeric version comparison.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub(crate) struct RecoveryBranchMergeEffect {
+    pub identity: TableIdentity,
     pub table_key: String,
     pub kind: RecoveryBranchMergeEffectKind,
 }
@@ -706,6 +748,7 @@ pub(crate) struct RecoveryProtocolV4 {
 /// One exact physical effect in a schema-v7 SchemaApply intent.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub(crate) struct RecoverySchemaApplyEffect {
+    pub identity: TableIdentity,
     pub table_key: String,
     pub kind: RecoverySchemaApplyEffectKind,
 }
@@ -798,6 +841,7 @@ pub(crate) struct RecoveryProtocolV7 {
 /// every table effect has completed.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub(crate) struct RecoveryEnsureIndicesEffect {
+    pub identity: TableIdentity,
     pub table_key: String,
     pub planned_transaction: StagedTransactionIdentity,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -895,13 +939,13 @@ pub(crate) struct RecoverySidecar {
     /// RFC-022 exact-effect protocol. Absent for every v1/v2 sidecar.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub protocol_v3: Option<RecoveryProtocolV3>,
-    /// RFC-022 BranchMerge protocol. Present only on schema-v4 sidecars.
+    /// RFC-022 BranchMerge payload (introduced at v4; retained by v9).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub protocol_v4: Option<RecoveryProtocolV4>,
-    /// Exact SchemaApply protocol. Present only on schema-v7 sidecars.
+    /// Exact SchemaApply payload (introduced at v7; retained by v9).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub protocol_v7: Option<RecoveryProtocolV7>,
-    /// Exact EnsureIndices protocol. Present only on schema-v8 sidecars.
+    /// Exact EnsureIndices payload (introduced at v8; retained by v9).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub protocol_v8: Option<RecoveryProtocolV8>,
     /// EnsureIndices-only fixed rollback identity. It does not make the
@@ -1049,6 +1093,7 @@ pub(crate) async fn write_sidecar(
     debug_assert!(sidecar.schema_version <= SIDECAR_SCHEMA_VERSION);
     let uri = sidecar_uri(root_uri, &sidecar.operation_id);
     validate_sidecar_shape(&uri, sidecar)?;
+    validate_identity_aware_pin_paths(root_uri, &uri, sidecar)?;
     let json = serde_json::to_string_pretty(sidecar).map_err(|err| {
         OmniError::manifest_internal(format!("failed to serialize recovery sidecar: {}", err))
     })?;
@@ -1080,11 +1125,11 @@ pub(crate) async fn write_sidecar(
 /// strict single-commit path and `IncompletePhaseB` retire. Do NOT delete this
 /// with the row path — keep the sidecar; only simplify the classifier.
 #[cfg(test)]
-pub(crate) async fn confirm_sidecar_phase_b(
+pub(crate) async fn confirm_sidecar_phase_b_v9(
     root_uri: &str,
     storage: &dyn StorageAdapter,
     sidecar: &mut RecoverySidecar,
-    confirmed_versions: &HashMap<String, u64>,
+    confirmed_versions: &HashMap<TableIdentity, u64>,
 ) -> Result<()> {
     // Failpoint: models a storage failure on the confirmation write — the
     // pre-confirm sidecar stays on disk, so recovery rolls the operation back.
@@ -1096,7 +1141,7 @@ pub(crate) async fn confirm_sidecar_phase_b(
         // read as a partial Phase B and silently roll the whole (complete) merge
         // back. Today the two are kept in lockstep by construction; this guards
         // the invariant against a future edit to either filter.
-        let version = confirmed_versions.get(&pin.table_key).ok_or_else(|| {
+        let version = confirmed_versions.get(&pin.identity).ok_or_else(|| {
             OmniError::manifest_internal(format!(
                 "confirm_sidecar_phase_b: no achieved version for pinned table '{}' \
                  (pins and publish updates diverged)",
@@ -1149,14 +1194,24 @@ pub(crate) async fn list_sidecars(
     // ordering-sensitive bugs.
     uris.sort();
     let mut out = Vec::with_capacity(uris.len());
+    let mut before_first_json_read = true;
     for uri in uris {
         // Skip non-JSON files defensively; the directory is ours but a
         // future feature might leave other artifacts here.
         if !uri.ends_with(".json") {
             continue;
         }
-        let body = storage.read_text(&uri).await?;
+        if before_first_json_read {
+            crate::failpoints::maybe_fail(
+                crate::failpoints::names::RECOVERY_POST_SIDECAR_LIST_PRE_READ,
+            )?;
+            before_first_json_read = false;
+        }
+        let Some(body) = storage.read_text_if_exists(&uri).await? else {
+            continue;
+        };
         let sidecar = parse_sidecar(&uri, &body)?;
+        validate_identity_aware_pin_paths(root_uri, &uri, &sidecar)?;
         out.push(sidecar);
     }
     Ok(out)
@@ -1178,12 +1233,24 @@ async fn list_parseable_sidecars_for_read_only(
     uris.sort();
     let mut out = Vec::with_capacity(uris.len());
     let mut unparseable = Vec::new();
+    let mut before_first_json_read = true;
     for uri in uris {
         if !uri.ends_with(".json") {
             continue;
         }
-        let body = storage.read_text(&uri).await?;
-        match parse_sidecar(&uri, &body) {
+        if before_first_json_read {
+            crate::failpoints::maybe_fail(
+                crate::failpoints::names::RECOVERY_POST_SIDECAR_LIST_PRE_READ,
+            )?;
+            before_first_json_read = false;
+        }
+        let Some(body) = storage.read_text_if_exists(&uri).await? else {
+            continue;
+        };
+        match parse_sidecar(&uri, &body).and_then(|sidecar| {
+            validate_identity_aware_pin_paths(root_uri, &uri, &sidecar)?;
+            Ok(sidecar)
+        }) {
             Ok(sidecar) => out.push(sidecar),
             Err(error) => {
                 warn!(
@@ -1213,11 +1280,11 @@ async fn reread_sidecar_under_gates(
     listed: &RecoverySidecar,
 ) -> Result<Option<RecoverySidecar>> {
     let uri = sidecar_uri(root_uri, &listed.operation_id);
-    if !storage.exists(&uri).await? {
+    let Some(body) = storage.read_text_if_exists(&uri).await? else {
         return Ok(None);
-    }
-    let body = storage.read_text(&uri).await?;
+    };
     let current = parse_sidecar(&uri, &body)?;
+    validate_identity_aware_pin_paths(root_uri, &uri, &current)?;
 
     // Confirmation/rollback-plan rewrites may change only recovery payload, not
     // the keys whose gates protect the artifact.  Refuse a coordination-shape
@@ -1225,12 +1292,26 @@ async fn reread_sidecar_under_gates(
     let listed_keys = listed
         .tables
         .iter()
-        .map(|pin| (&pin.table_key, &pin.table_path, &pin.table_branch))
+        .map(|pin| {
+            (
+                pin.identity,
+                &pin.table_key,
+                &pin.table_path,
+                &pin.table_branch,
+            )
+        })
         .collect::<Vec<_>>();
     let current_keys = current
         .tables
         .iter()
-        .map(|pin| (&pin.table_key, &pin.table_path, &pin.table_branch))
+        .map(|pin| {
+            (
+                pin.identity,
+                &pin.table_key,
+                &pin.table_path,
+                &pin.table_branch,
+            )
+        })
         .collect::<Vec<_>>();
     if current.operation_id != listed.operation_id
         || current.writer_kind != listed.writer_kind
@@ -1337,6 +1418,18 @@ fn validate_sidecar_shape(sidecar_uri: &str, sidecar: &RecoverySidecar) -> Resul
         return Ok(());
     }
 
+    if sidecar.schema_version == IDENTITY_AWARE_SIDECAR_SCHEMA_VERSION {
+        return match sidecar.writer_kind {
+            SidecarKind::Mutation | SidecarKind::Load => {
+                validate_mutation_load_shape(sidecar_uri, sidecar)
+            }
+            SidecarKind::BranchMerge => validate_branch_merge_v4_shape(sidecar_uri, sidecar),
+            SidecarKind::SchemaApply => validate_schema_apply_v7_shape(sidecar_uri, sidecar),
+            SidecarKind::EnsureIndices => validate_ensure_indices_v8_shape(sidecar_uri, sidecar),
+            SidecarKind::Optimize => validate_optimize_v9_shape(sidecar_uri, sidecar),
+        };
+    }
+
     if sidecar.schema_version == BRANCH_MERGE_SIDECAR_SCHEMA_VERSION {
         return validate_branch_merge_v4_shape(sidecar_uri, sidecar);
     }
@@ -1398,13 +1491,67 @@ fn validate_sidecar_shape(sidecar_uri: &str, sidecar: &RecoverySidecar) -> Resul
             sidecar.writer_kind
         )));
     }
+    validate_mutation_load_shape(sidecar_uri, sidecar)
+}
+
+/// Bind identity-aware recovery ownership to this graph root before any path
+/// can be opened, restored, or deleted. A canonical identity suffix alone is
+/// insufficient: an otherwise valid sidecar copied from another graph could
+/// point recovery at that foreign graph's dataset.
+///
+/// Older sidecars retain their historical path semantics. They predate stable
+/// table identity and cannot be tightened by inferring ownership during read.
+fn validate_identity_aware_pin_paths(
+    root_uri: &str,
+    sidecar_uri: &str,
+    sidecar: &RecoverySidecar,
+) -> Result<()> {
+    if sidecar.schema_version != IDENTITY_AWARE_SIDECAR_SCHEMA_VERSION {
+        return Ok(());
+    }
+
+    let root = root_uri.trim_end_matches('/');
+    for pin in &sidecar.tables {
+        let relative = super::table_path_for_identity(&pin.table_key, pin.identity)?;
+        let expected = format!("{root}/{relative}");
+        if pin.table_path != expected {
+            return Err(OmniError::manifest_internal(format!(
+                "recovery sidecar at '{}' binds table identity {} alias '{}' to foreign or non-canonical URI '{}'; expected exact graph-owned URI '{}'",
+                sidecar_uri, pin.identity, pin.table_key, pin.table_path, expected
+            )));
+        }
+    }
+    Ok(())
+}
+
+fn validate_mutation_load_shape(sidecar_uri: &str, sidecar: &RecoverySidecar) -> Result<()> {
+    let malformed = |reason: String| {
+        OmniError::manifest_internal(format!(
+            "recovery sidecar at '{}' has an invalid schema-v{} shape: {}",
+            sidecar_uri, sidecar.schema_version, reason
+        ))
+    };
     let protocol = sidecar
         .protocol_v3
         .as_ref()
         .ok_or_else(|| malformed("missing required protocol_v3 payload".to_string()))?;
+    if sidecar.protocol_v4.is_some()
+        || sidecar.protocol_v7.is_some()
+        || sidecar.protocol_v8.is_some()
+        || sidecar.ensure_indices_rollback_v6.is_some()
+        || sidecar.merge_source_commit_id.is_some()
+        || sidecar.schema_apply_manifest_published
+        || sidecar.schema_apply_target_schema_ir_hash.is_some()
+    {
+        return Err(malformed(
+            "Mutation/Load sidecars must carry only the protocol_v3 writer payload".to_string(),
+        ));
+    }
+    validate_authority_identity(&malformed, &protocol.authority)?;
     if !sidecar.additional_registrations.is_empty()
         || !sidecar.tombstones.is_empty()
         || !protocol.intended_delta.registrations.is_empty()
+        || !protocol.intended_delta.renames.is_empty()
         || !protocol.intended_delta.tombstones.is_empty()
     {
         return Err(malformed(
@@ -1439,46 +1586,45 @@ fn validate_sidecar_shape(sidecar_uri: &str, sidecar: &RecoverySidecar) -> Resul
         ));
     }
 
-    let pin_keys: HashSet<&str> = sidecar
+    validate_unique_pin_identities(&malformed, &sidecar.tables, false)?;
+    let pin_ids: HashSet<TableIdentity> = sidecar.tables.iter().map(|pin| pin.identity).collect();
+    let pin_aliases: HashSet<&str> = sidecar
         .tables
         .iter()
         .map(|pin| pin.table_key.as_str())
         .collect();
-    if pin_keys.len() != sidecar.tables.len() {
-        return Err(malformed("duplicate table pin".to_string()));
-    }
     if let Some(outcomes) = protocol.rollback_audit_outcomes.as_ref() {
         let outcome_keys: HashSet<&str> = outcomes
             .iter()
             .map(|outcome| outcome.table_key.as_str())
             .collect();
-        if outcome_keys.len() != outcomes.len() || !outcome_keys.is_subset(&pin_keys) {
+        if outcome_keys.len() != outcomes.len() || !outcome_keys.is_subset(&pin_aliases) {
             return Err(malformed(
                 "rollback audit outcomes must name a unique subset of table pins".to_string(),
             ));
         }
     }
-    let effect_keys: HashSet<&str> = protocol
+    let effect_ids: HashSet<TableIdentity> = protocol
         .effects
         .iter()
-        .map(|effect| effect.table_key.as_str())
+        .map(|effect| effect.identity)
         .collect();
     let effect_uuids: HashSet<&str> = protocol
         .effects
         .iter()
         .map(|effect| effect.planned_transaction.uuid.as_str())
         .collect();
-    let delta_keys: HashSet<&str> = protocol
+    let delta_ids: HashSet<TableIdentity> = protocol
         .intended_delta
         .table_updates
         .iter()
-        .map(|slot| slot.table_key.as_str())
+        .map(|slot| slot.identity)
         .collect();
-    if effect_keys.len() != protocol.effects.len()
+    if effect_ids.len() != protocol.effects.len()
         || effect_uuids.len() != protocol.effects.len()
-        || delta_keys.len() != protocol.intended_delta.table_updates.len()
-        || effect_keys != pin_keys
-        || delta_keys != pin_keys
+        || delta_ids.len() != protocol.intended_delta.table_updates.len()
+        || effect_ids != pin_ids
+        || delta_ids != pin_ids
     {
         return Err(malformed(
             "table pins, planned transaction identities, and intended-delta key sets are not one-to-one"
@@ -1490,14 +1636,20 @@ fn validate_sidecar_shape(sidecar_uri: &str, sidecar: &RecoverySidecar) -> Resul
         let effect = protocol
             .effects
             .iter()
-            .find(|effect| effect.table_key == pin.table_key)
+            .find(|effect| effect.identity == pin.identity)
             .expect("key sets checked above");
         let slot = protocol
             .intended_delta
             .table_updates
             .iter()
-            .find(|slot| slot.table_key == pin.table_key)
+            .find(|slot| slot.identity == pin.identity)
             .expect("key sets checked above");
+        if effect.table_key != pin.table_key || slot.table_key != pin.table_key {
+            return Err(malformed(format!(
+                "identity {} has inconsistent diagnostic aliases across pin/effect/delta",
+                pin.identity
+            )));
+        }
         if effect.planned_transaction.read_version != pin.expected_version {
             return Err(malformed(format!(
                 "planned transaction for '{}' reads version {}, pin expects {}",
@@ -1553,6 +1705,88 @@ fn validate_sidecar_shape(sidecar_uri: &str, sidecar: &RecoverySidecar) -> Resul
             }
         }
     }
+    Ok(())
+}
+
+fn validate_unique_pin_identities<F>(
+    malformed: &F,
+    pins: &[SidecarTablePin],
+    require_non_empty: bool,
+) -> Result<()>
+where
+    F: Fn(String) -> OmniError,
+{
+    if require_non_empty && pins.is_empty() {
+        return Err(malformed("table pin set must not be empty".to_string()));
+    }
+    let mut identities = HashSet::with_capacity(pins.len());
+    let mut aliases = HashSet::with_capacity(pins.len());
+    for pin in pins {
+        pin.identity
+            .validate()
+            .map_err(|error| malformed(format!("invalid table identity: {error}")))?;
+        let canonical = super::table_path_for_identity(&pin.table_key, pin.identity)
+            .map_err(|error| malformed(format!("invalid table pin path: {error}")))?;
+        let normalized = pin.table_path.trim_end_matches('/');
+        if normalized != canonical && !normalized.ends_with(&format!("/{canonical}")) {
+            return Err(malformed(format!(
+                "table pin identity {} alias '{}' uses path '{}', expected canonical suffix '{}'",
+                pin.identity, pin.table_key, pin.table_path, canonical
+            )));
+        }
+        if !identities.insert(pin.identity) {
+            return Err(malformed(format!(
+                "duplicate table identity {} in pin set",
+                pin.identity
+            )));
+        }
+        if !aliases.insert(pin.table_key.as_str()) {
+            return Err(malformed(format!(
+                "duplicate diagnostic table alias '{}' in pin set",
+                pin.table_key
+            )));
+        }
+    }
+    Ok(())
+}
+
+fn validate_authority_identity<F>(malformed: &F, authority: &RecoveryAuthorityToken) -> Result<()>
+where
+    F: Fn(String) -> OmniError,
+{
+    if authority.schema_identity_domain.is_empty()
+        || authority.schema_ir_hash.is_empty()
+        || authority.schema_identity_version == 0
+    {
+        return Err(malformed(
+            "recovery authority must carry a non-empty schema identity domain/hash and non-zero identity version"
+                .to_string(),
+        ));
+    }
+    Ok(())
+}
+
+fn validate_optimize_v9_shape(sidecar_uri: &str, sidecar: &RecoverySidecar) -> Result<()> {
+    let malformed = |reason: String| {
+        OmniError::manifest_internal(format!(
+            "recovery sidecar at '{}' has an invalid schema-v{} shape: {}",
+            sidecar_uri, sidecar.schema_version, reason
+        ))
+    };
+    if sidecar.writer_kind != SidecarKind::Optimize
+        || sidecar.protocol_v3.is_some()
+        || sidecar.protocol_v4.is_some()
+        || sidecar.protocol_v7.is_some()
+        || sidecar.protocol_v8.is_some()
+        || sidecar.ensure_indices_rollback_v6.is_some()
+        || !sidecar.additional_registrations.is_empty()
+        || !sidecar.tombstones.is_empty()
+    {
+        return Err(malformed(
+            "schema-v9 Optimize must carry only identity-bearing table pins".to_string(),
+        ));
+    }
+    validate_unique_pin_identities(&malformed, &sidecar.tables, true)?;
     Ok(())
 }
 
@@ -1645,7 +1879,9 @@ fn validate_ensure_indices_v8_shape(sidecar_uri: &str, sidecar: &RecoverySidecar
         .protocol_v8
         .as_ref()
         .ok_or_else(|| malformed("missing required protocol_v8 payload".to_string()))?;
+    validate_authority_identity(&malformed, &protocol.authority)?;
     if !protocol.intended_delta.registrations.is_empty()
+        || !protocol.intended_delta.renames.is_empty()
         || !protocol.intended_delta.tombstones.is_empty()
     {
         return Err(malformed(
@@ -1676,35 +1912,35 @@ fn validate_ensure_indices_v8_shape(sidecar_uri: &str, sidecar: &RecoverySidecar
         ));
     }
 
-    let pin_keys: HashSet<&str> = sidecar
+    validate_unique_pin_identities(&malformed, &sidecar.tables, true)?;
+    let pin_ids: HashSet<TableIdentity> = sidecar.tables.iter().map(|pin| pin.identity).collect();
+    let pin_aliases: HashSet<&str> = sidecar
         .tables
         .iter()
         .map(|pin| pin.table_key.as_str())
         .collect();
-    let effect_keys: HashSet<&str> = protocol
+    let effect_ids: HashSet<TableIdentity> = protocol
         .effects
         .iter()
-        .map(|effect| effect.table_key.as_str())
+        .map(|effect| effect.identity)
         .collect();
     let effect_uuids: HashSet<&str> = protocol
         .effects
         .iter()
         .map(|effect| effect.planned_transaction.uuid.as_str())
         .collect();
-    let delta_keys: HashSet<&str> = protocol
+    let delta_ids: HashSet<TableIdentity> = protocol
         .intended_delta
         .table_updates
         .iter()
-        .map(|slot| slot.table_key.as_str())
+        .map(|slot| slot.identity)
         .collect();
-    if sidecar.tables.is_empty()
-        || pin_keys.len() != sidecar.tables.len()
-        || effect_keys.len() != protocol.effects.len()
+    if effect_ids.len() != protocol.effects.len()
         || effect_uuids.len() != protocol.effects.len()
         || effect_uuids.iter().any(|uuid| uuid.is_empty())
-        || delta_keys.len() != protocol.intended_delta.table_updates.len()
-        || effect_keys != pin_keys
-        || delta_keys != pin_keys
+        || delta_ids.len() != protocol.intended_delta.table_updates.len()
+        || effect_ids != pin_ids
+        || delta_ids != pin_ids
     {
         return Err(malformed(
             "schema-v8 pins, effects, transaction UUIDs, and delta slots must be unique and one-to-one"
@@ -1716,7 +1952,7 @@ fn validate_ensure_indices_v8_shape(sidecar_uri: &str, sidecar: &RecoverySidecar
             .iter()
             .map(|outcome| outcome.table_key.as_str())
             .collect();
-        if outcome_keys.len() != outcomes.len() || !outcome_keys.is_subset(&pin_keys) {
+        if outcome_keys.len() != outcomes.len() || !outcome_keys.is_subset(&pin_aliases) {
             return Err(malformed(
                 "schema-v8 rollback audit outcomes must name a unique subset of table pins"
                     .to_string(),
@@ -1728,14 +1964,20 @@ fn validate_ensure_indices_v8_shape(sidecar_uri: &str, sidecar: &RecoverySidecar
         let effect = protocol
             .effects
             .iter()
-            .find(|effect| effect.table_key == pin.table_key)
+            .find(|effect| effect.identity == pin.identity)
             .expect("schema-v8 key sets checked above");
         let slot = protocol
             .intended_delta
             .table_updates
             .iter()
-            .find(|slot| slot.table_key == pin.table_key)
+            .find(|slot| slot.identity == pin.identity)
             .expect("schema-v8 key sets checked above");
+        if effect.table_key != pin.table_key || slot.table_key != pin.table_key {
+            return Err(malformed(format!(
+                "schema-v8 identity {} has inconsistent diagnostic aliases",
+                pin.identity
+            )));
+        }
         let exact_output = pin.expected_version.checked_add(1).ok_or_else(|| {
             malformed(format!(
                 "schema-v8 effect '{}' overflows its output version",
@@ -1844,6 +2086,7 @@ fn validate_schema_apply_v7_shape(sidecar_uri: &str, sidecar: &RecoverySidecar) 
         .protocol_v7
         .as_ref()
         .ok_or_else(|| malformed("missing required protocol_v7 payload".to_string()))?;
+    validate_authority_identity(&malformed, &protocol.authority)?;
     if protocol.target_schema_ir_hash.is_empty() {
         return Err(malformed(
             "schema-v7 SchemaApply has an empty target schema identity".to_string(),
@@ -1866,34 +2109,35 @@ fn validate_schema_apply_v7_shape(sidecar_uri: &str, sidecar: &RecoverySidecar) 
         ));
     }
 
-    let pin_keys: HashSet<&str> = sidecar
+    validate_unique_pin_identities(&malformed, &sidecar.tables, false)?;
+    let pin_ids: HashSet<TableIdentity> = sidecar.tables.iter().map(|pin| pin.identity).collect();
+    let rollback_aliases: HashSet<&str> = sidecar
         .tables
         .iter()
-        .map(|pin| pin.table_key.as_str())
+        .map(|pin| schema_apply_rollback_table_key(protocol, pin))
         .collect();
-    let effect_keys: HashSet<&str> = protocol
+    let effect_ids: HashSet<TableIdentity> = protocol
         .effects
         .iter()
-        .map(|effect| effect.table_key.as_str())
+        .map(|effect| effect.identity)
         .collect();
-    let delta_keys: HashSet<&str> = protocol
+    let delta_ids: HashSet<TableIdentity> = protocol
         .intended_delta
         .table_updates
         .iter()
-        .map(|slot| slot.table_key.as_str())
+        .map(|slot| slot.identity)
         .collect();
     let effect_uuids: HashSet<&str> = protocol
         .effects
         .iter()
         .map(|effect| effect.kind.planned_transaction().uuid.as_str())
         .collect();
-    if pin_keys.len() != sidecar.tables.len()
-        || effect_keys.len() != protocol.effects.len()
-        || delta_keys.len() != protocol.intended_delta.table_updates.len()
+    if effect_ids.len() != protocol.effects.len()
+        || delta_ids.len() != protocol.intended_delta.table_updates.len()
         || effect_uuids.len() != protocol.effects.len()
         || effect_uuids.iter().any(|uuid| uuid.is_empty())
-        || pin_keys != effect_keys
-        || pin_keys != delta_keys
+        || pin_ids != effect_ids
+        || pin_ids != delta_ids
     {
         return Err(malformed(
             "schema-v7 pins, effects, transaction UUIDs, and delta slots must be unique and one-to-one"
@@ -1901,33 +2145,127 @@ fn validate_schema_apply_v7_shape(sidecar_uri: &str, sidecar: &RecoverySidecar) 
         ));
     }
 
-    let registration_keys: HashSet<&str> = protocol
+    let registration_ids: HashSet<TableIdentity> = protocol
         .intended_delta
         .registrations
         .iter()
-        .map(|registration| registration.table_key.as_str())
+        .map(|registration| registration.identity)
         .collect();
-    let tombstone_keys: HashSet<&str> = protocol
+    let tombstone_ids: HashSet<TableIdentity> = protocol
         .intended_delta
         .tombstones
         .iter()
-        .map(|tombstone| tombstone.table_key.as_str())
+        .map(|tombstone| tombstone.identity)
         .collect();
-    let first_touch_keys: HashSet<&str> = protocol
+    let rename_ids: HashSet<TableIdentity> = protocol
+        .intended_delta
+        .renames
+        .iter()
+        .map(|rename| rename.identity)
+        .collect();
+    let first_touch_ids: HashSet<TableIdentity> = protocol
         .effects
         .iter()
         .filter(|effect| effect.kind.is_first_touch())
-        .map(|effect| effect.table_key.as_str())
+        .map(|effect| effect.identity)
         .collect();
-    if registration_keys.len() != protocol.intended_delta.registrations.len()
-        || tombstone_keys.len() != protocol.intended_delta.tombstones.len()
-        || registration_keys != first_touch_keys
-        || !registration_keys.is_disjoint(&tombstone_keys)
+    if registration_ids.len() != protocol.intended_delta.registrations.len()
+        || tombstone_ids.len() != protocol.intended_delta.tombstones.len()
+        || rename_ids.len() != protocol.intended_delta.renames.len()
+        || registration_ids != first_touch_ids
+        || !registration_ids.is_disjoint(&tombstone_ids)
+        || !registration_ids.is_disjoint(&rename_ids)
+        || !tombstone_ids.is_disjoint(&rename_ids)
     {
         return Err(malformed(
-            "schema-v7 first-touch effects must match unique registrations and remain disjoint from tombstones"
+            "SchemaApply first-touch effects must match unique registration identities, while registrations, renames, and tombstones remain identity-disjoint"
                 .to_string(),
         ));
+    }
+    for registration in &protocol.intended_delta.registrations {
+        registration
+            .identity
+            .validate()
+            .map_err(|error| malformed(format!("invalid registration identity: {error}")))?;
+        let expected_path =
+            super::table_path_for_identity(&registration.table_key, registration.identity)?;
+        if registration.table_path != expected_path {
+            return Err(malformed(format!(
+                "registration identity {} alias '{}' has path '{}', expected '{}'",
+                registration.identity,
+                registration.table_key,
+                registration.table_path,
+                expected_path
+            )));
+        }
+        let effect = protocol
+            .effects
+            .iter()
+            .find(|effect| effect.identity == registration.identity)
+            .expect("registration identities match first-touch effects");
+        if effect.table_key != registration.table_key {
+            return Err(malformed(format!(
+                "first-touch identity {} has registration alias '{}' but effect alias '{}'",
+                registration.identity, registration.table_key, effect.table_key
+            )));
+        }
+    }
+    for rename in &protocol.intended_delta.renames {
+        rename
+            .identity
+            .validate()
+            .map_err(|error| malformed(format!("invalid rename identity: {error}")))?;
+        let old_path = super::table_path_for_identity(&rename.expected_table_key, rename.identity)?;
+        let new_path = super::table_path_for_identity(&rename.table_key, rename.identity)?;
+        if rename.expected_version == 0
+            || rename.expected_table_key == rename.table_key
+            || rename.table_path != old_path
+            || rename.table_path != new_path
+        {
+            return Err(malformed(format!(
+                "rename identity {} must carry a live expected version, change alias, and preserve canonical path '{}'",
+                rename.identity, rename.table_path
+            )));
+        }
+        if let Some(slot) = protocol
+            .intended_delta
+            .table_updates
+            .iter()
+            .find(|slot| slot.identity == rename.identity)
+            && (slot.table_key != rename.table_key
+                || slot.expected_version != rename.expected_version)
+        {
+            return Err(malformed(format!(
+                "rename identity {} does not match its physical output alias/version",
+                rename.identity
+            )));
+        }
+    }
+    let mut live_aliases = HashSet::new();
+    for (identity, alias) in protocol
+        .intended_delta
+        .registrations
+        .iter()
+        .map(|registration| (registration.identity, registration.table_key.as_str()))
+        .chain(
+            protocol
+                .intended_delta
+                .renames
+                .iter()
+                .map(|rename| (rename.identity, rename.table_key.as_str())),
+        )
+    {
+        if !live_aliases.insert(alias) {
+            return Err(malformed(format!(
+                "SchemaApply delta binds more than one live identity to alias '{alias}' (including {identity})"
+            )));
+        }
+    }
+    for tombstone in &protocol.intended_delta.tombstones {
+        tombstone
+            .identity
+            .validate()
+            .map_err(|error| malformed(format!("invalid tombstone identity: {error}")))?;
     }
     if protocol
         .intended_delta
@@ -1944,9 +2282,9 @@ fn validate_schema_apply_v7_shape(sidecar_uri: &str, sidecar: &RecoverySidecar) 
             .iter()
             .map(|outcome| outcome.table_key.as_str())
             .collect();
-        if outcome_keys.len() != outcomes.len() || !outcome_keys.is_subset(&pin_keys) {
+        if outcome_keys.len() != outcomes.len() || !outcome_keys.is_subset(&rollback_aliases) {
             return Err(malformed(
-                "schema-v7 rollback audit outcomes must name a unique subset of table pins"
+                "schema-v7 rollback audit outcomes must name a unique subset of restored table aliases"
                     .to_string(),
             ));
         }
@@ -1962,14 +2300,20 @@ fn validate_schema_apply_v7_shape(sidecar_uri: &str, sidecar: &RecoverySidecar) 
         let effect = protocol
             .effects
             .iter()
-            .find(|effect| effect.table_key == pin.table_key)
+            .find(|effect| effect.identity == pin.identity)
             .expect("key sets checked above");
         let slot = protocol
             .intended_delta
             .table_updates
             .iter()
-            .find(|slot| slot.table_key == pin.table_key)
+            .find(|slot| slot.identity == pin.identity)
             .expect("key sets checked above");
+        if effect.table_key != pin.table_key || slot.table_key != pin.table_key {
+            return Err(malformed(format!(
+                "SchemaApply identity {} has inconsistent diagnostic aliases",
+                pin.identity
+            )));
+        }
         let planned = effect.kind.planned_transaction();
         if planned.read_version != pin.expected_version
             || pin.post_commit_pin != pin.expected_version.saturating_add(1)
@@ -2064,7 +2408,9 @@ fn validate_branch_merge_v4_shape(sidecar_uri: &str, sidecar: &RecoverySidecar) 
         .protocol_v4
         .as_ref()
         .ok_or_else(|| malformed("missing required protocol_v4 payload".to_string()))?;
+    validate_authority_identity(&malformed, &protocol.authority)?;
     if !protocol.intended_delta.registrations.is_empty()
+        || !protocol.intended_delta.renames.is_empty()
         || !protocol.intended_delta.tombstones.is_empty()
     {
         return Err(malformed(
@@ -2099,28 +2445,35 @@ fn validate_branch_merge_v4_shape(sidecar_uri: &str, sidecar: &RecoverySidecar) 
         ));
     }
 
-    let pin_keys: HashSet<&str> = sidecar
+    validate_unique_pin_identities(&malformed, &sidecar.tables, true)?;
+    let pin_ids: HashSet<TableIdentity> = sidecar.tables.iter().map(|pin| pin.identity).collect();
+    let pin_aliases: HashSet<&str> = sidecar
         .tables
         .iter()
         .map(|pin| pin.table_key.as_str())
         .collect();
-    let effect_keys: HashSet<&str> = protocol
+    let effect_ids: HashSet<TableIdentity> = protocol
         .effects
         .iter()
-        .map(|effect| effect.table_key.as_str())
+        .map(|effect| effect.identity)
         .collect();
-    let delta_keys: HashSet<&str> = protocol
+    let delta_ids: HashSet<TableIdentity> = protocol
+        .intended_delta
+        .table_updates
+        .iter()
+        .map(|slot| slot.identity)
+        .collect();
+    let delta_aliases: HashSet<&str> = protocol
         .intended_delta
         .table_updates
         .iter()
         .map(|slot| slot.table_key.as_str())
         .collect();
-    if sidecar.tables.is_empty()
-        || pin_keys.len() != sidecar.tables.len()
-        || effect_keys.len() != protocol.effects.len()
-        || delta_keys.len() != protocol.intended_delta.table_updates.len()
-        || effect_keys != pin_keys
-        || !effect_keys.is_subset(&delta_keys)
+    if effect_ids.len() != protocol.effects.len()
+        || delta_ids.len() != protocol.intended_delta.table_updates.len()
+        || delta_aliases.len() != protocol.intended_delta.table_updates.len()
+        || effect_ids != pin_ids
+        || !effect_ids.is_subset(&delta_ids)
     {
         return Err(malformed(
             "physical table pins/effects must be one-to-one and a subset of unique intended-delta slots"
@@ -2132,7 +2485,7 @@ fn validate_branch_merge_v4_shape(sidecar_uri: &str, sidecar: &RecoverySidecar) 
             .iter()
             .map(|outcome| outcome.table_key.as_str())
             .collect();
-        if outcome_keys.len() != outcomes.len() || !outcome_keys.is_subset(&pin_keys) {
+        if outcome_keys.len() != outcomes.len() || !outcome_keys.is_subset(&pin_aliases) {
             return Err(malformed(
                 "rollback audit outcomes must name a unique subset of physical table pins"
                     .to_string(),
@@ -2141,6 +2494,9 @@ fn validate_branch_merge_v4_shape(sidecar_uri: &str, sidecar: &RecoverySidecar) 
     }
 
     for slot in &protocol.intended_delta.table_updates {
+        slot.identity
+            .validate()
+            .map_err(|error| malformed(format!("invalid delta identity: {error}")))?;
         match protocol.effect_phase {
             RecoveryEffectPhase::Armed if slot.confirmed.is_some() => {
                 return Err(malformed(format!(
@@ -2171,14 +2527,20 @@ fn validate_branch_merge_v4_shape(sidecar_uri: &str, sidecar: &RecoverySidecar) 
         let effect = protocol
             .effects
             .iter()
-            .find(|effect| effect.table_key == pin.table_key)
+            .find(|effect| effect.identity == pin.identity)
             .expect("effect/pin key sets checked above");
         let slot = protocol
             .intended_delta
             .table_updates
             .iter()
-            .find(|slot| slot.table_key == pin.table_key)
+            .find(|slot| slot.identity == pin.identity)
             .expect("physical effects are a subset of delta slots");
+        if effect.table_key != pin.table_key || slot.table_key != pin.table_key {
+            return Err(malformed(format!(
+                "BranchMerge identity {} has inconsistent diagnostic aliases",
+                pin.identity
+            )));
+        }
         if slot.expected_version != pin.expected_version || slot.table_branch != pin.table_branch {
             return Err(malformed(format!(
                 "intended-delta pre-state for '{}' does not match its physical table pin",
@@ -2321,6 +2683,18 @@ fn validate_branch_merge_transaction_chain(
     planned_transactions: &[StagedTransactionIdentity],
     planned_transaction_uuids: &mut HashSet<String>,
 ) -> Result<u64> {
+    let transaction_count = u64::try_from(planned_transactions.len()).map_err(|_| {
+        malformed(format!(
+            "planned transaction chain for '{}' exceeds u64",
+            pin.table_key
+        ))
+    })?;
+    if transaction_count > MAX_BRANCH_MERGE_DATA_TRANSACTIONS {
+        return Err(malformed(format!(
+            "planned transaction chain for '{}' contains {} data transactions, exceeding the recovery-safe limit of {}",
+            pin.table_key, transaction_count, MAX_BRANCH_MERGE_DATA_TRANSACTIONS
+        )));
+    }
     let first = planned_transactions.first().ok_or_else(|| {
         malformed(format!(
             "multi-commit effect '{}' has an empty planned transaction chain",
@@ -2509,7 +2883,7 @@ fn classify_table_observation(
             let Some(effect) = protocol
                 .effects
                 .iter()
-                .find(|effect| effect.table_key == pin.table_key)
+                .find(|effect| effect.identity == pin.identity)
             else {
                 return IncompletePhaseB;
             };
@@ -2517,7 +2891,7 @@ fn classify_table_observation(
                 .intended_delta
                 .table_updates
                 .iter()
-                .find(|slot| slot.table_key == pin.table_key)
+                .find(|slot| slot.identity == pin.identity)
             else {
                 return IncompletePhaseB;
             };
@@ -3009,43 +3383,87 @@ pub(crate) async fn recover_manifest_drift(
     Ok(())
 }
 
-async fn process_sidecar(
-    root_uri: &str,
-    storage: &std::sync::Arc<dyn StorageAdapter>,
+fn snapshot_entry_by_identity(
+    snapshot: &Snapshot,
+    identity: TableIdentity,
+) -> Option<&super::SubTableEntry> {
+    snapshot.entries().find(|entry| entry.identity == identity)
+}
+
+/// Resolve manifest authority by immutable identity. The alias is checked only
+/// as the captured diagnostic binding; a rename or same-name reincarnation is
+/// an authority change, never a substitute identity for recovery.
+fn snapshot_entry_for_pin<'a>(
+    snapshot: &'a Snapshot,
+    pin: &SidecarTablePin,
+) -> Result<Option<&'a super::SubTableEntry>> {
+    if let Some(entry) = snapshot_entry_by_identity(snapshot, pin.identity) {
+        if entry.table_key != pin.table_key {
+            return Err(OmniError::manifest_read_set_changed(
+                format!("table_binding:{}", pin.identity),
+                Some(pin.table_key.clone()),
+                Some(entry.table_key.clone()),
+            ));
+        }
+        return Ok(Some(entry));
+    }
+    if let Some(entry) = snapshot.entry(&pin.table_key) {
+        return Err(OmniError::manifest_read_set_changed(
+            format!("table_identity:{}", pin.table_key),
+            Some(pin.identity.to_string()),
+            Some(entry.identity.to_string()),
+        ));
+    }
+    Ok(None)
+}
+
+fn snapshot_entry_for_schema_pin<'a>(
+    snapshot: &'a Snapshot,
+    pin: &SidecarTablePin,
+    protocol: &RecoveryProtocolV7,
+) -> Result<Option<&'a super::SubTableEntry>> {
+    let expected_alias = protocol
+        .intended_delta
+        .renames
+        .iter()
+        .find(|rename| rename.identity == pin.identity)
+        .map(|rename| rename.expected_table_key.as_str())
+        .unwrap_or(pin.table_key.as_str());
+    if let Some(entry) = snapshot_entry_by_identity(snapshot, pin.identity) {
+        if entry.table_key != expected_alias {
+            return Err(OmniError::manifest_read_set_changed(
+                format!("table_binding:{}", pin.identity),
+                Some(expected_alias.to_string()),
+                Some(entry.table_key.clone()),
+            ));
+        }
+        return Ok(Some(entry));
+    }
+    if let Some(entry) = snapshot.entry(expected_alias) {
+        return Err(OmniError::manifest_read_set_changed(
+            format!("table_identity:{expected_alias}"),
+            Some(pin.identity.to_string()),
+            Some(entry.identity.to_string()),
+        ));
+    }
+    Ok(None)
+}
+
+/// Classify the exact physical ownership of every table named by a recovery
+/// sidecar against one manifest snapshot.
+///
+/// Keeping this probe separate from the recovery decision lets a live writer
+/// use the same transaction-identity evidence for RFC-023's narrow
+/// effect-free-finalization rule.  The probe itself never restores, publishes,
+/// or deletes anything.
+async fn classify_sidecar_tables(
     snapshot: &Snapshot,
     sidecar: &RecoverySidecar,
-    mode: RecoveryMode,
-    schema_state_recovery: SchemaStateRecovery,
-) -> Result<bool> {
-    // Returns whether durable state changed (roll-forward, roll-back, or
-    // stale-sidecar audit recovery). `false` = the sidecar was deferred
-    // untouched -- callers must not treat that as a completed heal (no
-    // schema reload / cache invalidation is warranted).
-    if sidecar.protocol_v8.is_some() {
-        return process_ensure_indices_sidecar_v8(root_uri, storage, snapshot, sidecar, mode).await;
-    }
-    if sidecar.protocol_v7.is_some() {
-        return process_schema_apply_sidecar_v7(root_uri, storage, snapshot, sidecar, mode).await;
-    }
-    if sidecar.protocol_v4.is_some() {
-        return process_branch_merge_sidecar_v4(root_uri, storage, snapshot, sidecar, mode).await;
-    }
-    if sidecar.protocol_v3.is_some() {
-        if let Some(outcome) = detect_visible_v3_outcome(root_uri, sidecar).await? {
-            return finalize_visible_v3_outcome(root_uri, storage.as_ref(), sidecar, outcome).await;
-        }
-    }
-    if sidecar.ensure_indices_rollback_v6.is_some()
-        && detect_visible_ensure_indices_rollback(root_uri, sidecar).await?
-    {
-        return finalize_visible_ensure_indices_rollback(root_uri, storage.as_ref(), sidecar).await;
-    }
+) -> Result<Vec<ClassifiedTable>> {
     let mut states = Vec::with_capacity(sidecar.tables.len());
     for pin in &sidecar.tables {
-        let manifest_pinned = snapshot
-            .entry(&pin.table_key)
-            .map(|e| e.table_version)
-            .unwrap_or(0);
+        let manifest_entry = snapshot_entry_for_pin(snapshot, pin)?;
+        let manifest_pinned = manifest_entry.map(|entry| entry.table_version).unwrap_or(0);
         // A first-touch named-branch mutation/load stages against the inherited
         // source snapshot, arms its v3 sidecar, and only then creates the Lance
         // target ref. Until Phase C publishes, the branch snapshot therefore
@@ -3060,8 +3478,7 @@ async fn process_sidecar(
                 .as_deref()
                 .is_some_and(|branch| branch != "main")
             && sidecar.branch.as_deref() == pin.table_branch.as_deref()
-            && snapshot
-                .entry(&pin.table_key)
+            && manifest_entry
                 .map(|entry| entry.table_branch != pin.table_branch)
                 .unwrap_or(true);
         let allow_missing_target_ref = unpublished_fork
@@ -3074,7 +3491,7 @@ async fn process_sidecar(
             protocol
                 .effects
                 .iter()
-                .find(|effect| effect.table_key == pin.table_key)
+                .find(|effect| effect.identity == pin.identity)
                 .map(|effect| {
                     (
                         pin.post_commit_pin,
@@ -3113,6 +3530,131 @@ async fn process_sidecar(
             unpublished_fork,
         });
     }
+    Ok(states)
+}
+
+/// Retire an Armed mutation/load intent only when exact transaction-identity
+/// classification proves that none of its participants advanced.
+///
+/// This is deliberately narrower than a Full recovery sweep: it never rolls
+/// back or publishes an effect.  Callers must hold the normal
+/// schema -> branch -> table gate envelope, which is the same single-writer-
+/// process boundary under which destructive recovery is supported today.
+/// `false` means ownership was present or could not be retired safely; the
+/// sidecar remains the authority and the caller must return RecoveryRequired.
+pub(crate) async fn finalize_effect_free_occ_sidecar(
+    root_uri: &str,
+    storage: &dyn StorageAdapter,
+    snapshot: &Snapshot,
+    sidecar: &RecoverySidecar,
+) -> Result<bool> {
+    if sidecar.schema_version != IDENTITY_AWARE_SIDECAR_SCHEMA_VERSION
+        || !matches!(
+            sidecar.writer_kind,
+            SidecarKind::Mutation | SidecarKind::Load
+        )
+    {
+        return Err(OmniError::manifest_internal(
+            "effect-free finalization requires an identity-aware mutation/load sidecar",
+        ));
+    }
+    let protocol = sidecar.protocol_v3.as_ref().ok_or_else(|| {
+        OmniError::manifest_internal(
+            "effect-free finalization requires an exact OCC protocol payload",
+        )
+    })?;
+    if protocol.effect_phase != RecoveryEffectPhase::Armed {
+        return Ok(false);
+    }
+
+    let states = classify_sidecar_tables(snapshot, sidecar).await?;
+    if states
+        .iter()
+        .any(|state| state.effect_ownership != EffectOwnership::None)
+    {
+        return Ok(false);
+    }
+
+    match cleanup_unpublished_no_effect_forks(root_uri, storage, sidecar, &states).await? {
+        NoEffectForkCleanup::Complete => {}
+        NoEffectForkCleanup::DeferredPathChild { .. } => return Ok(false),
+    }
+    delete_sidecar_by_operation_id(root_uri, storage, &sidecar.operation_id).await?;
+    Ok(true)
+}
+
+async fn process_sidecar(
+    root_uri: &str,
+    storage: &std::sync::Arc<dyn StorageAdapter>,
+    snapshot: &Snapshot,
+    sidecar: &RecoverySidecar,
+    mode: RecoveryMode,
+    schema_state_recovery: SchemaStateRecovery,
+) -> Result<bool> {
+    // Returns whether durable state changed (roll-forward, roll-back, or
+    // stale-sidecar audit recovery). `false` = the sidecar was deferred
+    // untouched -- callers must not treat that as a completed heal (no
+    // schema reload / cache invalidation is warranted).
+    // v9 is one identity-bearing envelope shared by all active writers. Route
+    // by the declared writer kind, never by whichever optional payload happens
+    // to be checked first. Shape validation makes foreign/multiple payloads
+    // malformed; this dispatch remains explicit defense in depth.
+    if sidecar.schema_version == IDENTITY_AWARE_SIDECAR_SCHEMA_VERSION {
+        match sidecar.writer_kind {
+            SidecarKind::EnsureIndices => {
+                return process_ensure_indices_sidecar_v8(
+                    root_uri, storage, snapshot, sidecar, mode,
+                )
+                .await;
+            }
+            SidecarKind::SchemaApply => {
+                return process_schema_apply_sidecar_v7(root_uri, storage, snapshot, sidecar, mode)
+                    .await;
+            }
+            SidecarKind::BranchMerge => {
+                return process_branch_merge_sidecar_v4(root_uri, storage, snapshot, sidecar, mode)
+                    .await;
+            }
+            SidecarKind::Mutation | SidecarKind::Load => {
+                if let Some(outcome) = detect_visible_v3_outcome(root_uri, sidecar).await? {
+                    return finalize_visible_v3_outcome(
+                        root_uri,
+                        storage.as_ref(),
+                        sidecar,
+                        outcome,
+                    )
+                    .await;
+                }
+            }
+            SidecarKind::Optimize => {}
+        }
+    } else {
+        // Historical envelopes retain their original generation-specific
+        // payload dispatch.
+        if sidecar.protocol_v8.is_some() {
+            return process_ensure_indices_sidecar_v8(root_uri, storage, snapshot, sidecar, mode)
+                .await;
+        }
+        if sidecar.protocol_v7.is_some() {
+            return process_schema_apply_sidecar_v7(root_uri, storage, snapshot, sidecar, mode)
+                .await;
+        }
+        if sidecar.protocol_v4.is_some() {
+            return process_branch_merge_sidecar_v4(root_uri, storage, snapshot, sidecar, mode)
+                .await;
+        }
+        if sidecar.protocol_v3.is_some()
+            && let Some(outcome) = detect_visible_v3_outcome(root_uri, sidecar).await?
+        {
+            return finalize_visible_v3_outcome(root_uri, storage.as_ref(), sidecar, outcome).await;
+        }
+    }
+    if sidecar.ensure_indices_rollback_v6.is_some()
+        && detect_visible_ensure_indices_rollback(root_uri, sidecar).await?
+    {
+        return finalize_visible_ensure_indices_rollback(root_uri, storage.as_ref(), sidecar).await;
+    }
+    let states = classify_sidecar_tables(snapshot, sidecar).await?;
 
     if let Some(protocol) = sidecar.protocol_v3.as_ref() {
         let live_authority =
@@ -3608,7 +4150,7 @@ async fn process_sidecar(
                     table_key: pin.table_key.clone(),
                     from_version: pin.expected_version,
                     to_version: published_versions
-                        .get(&pin.table_key)
+                        .get(&pin.identity)
                         .copied()
                         .unwrap_or(pin.post_commit_pin),
                 })
@@ -3617,7 +4159,7 @@ async fn process_sidecar(
                 outcomes.push(TableOutcome {
                     table_key: reg.table_key.clone(),
                     from_version: 0,
-                    to_version: published_versions.get(&reg.table_key).copied().unwrap_or(0),
+                    to_version: published_versions.get(&reg.identity).copied().unwrap_or(0),
                 });
             }
             record_audit(
@@ -3714,9 +4256,9 @@ async fn observe_branch_merge_target_ref(
 struct BranchMergeMultiCommitProof {
     effect_ownership: EffectOwnership,
     /// Every planned logical-data transaction is present in exact order and
-    /// every later commit through the observed HEAD is derived CreateIndex
-    /// work. Confirmation still has to bind that exact HEAD before recovery
-    /// may roll it forward.
+    /// the only later commit, if any, is BranchMerge's one derived CreateIndex
+    /// tail. Confirmation still has to bind that exact HEAD before recovery may
+    /// roll it forward.
     full_effect_at_head: bool,
     unsafe_reason: Option<String>,
 }
@@ -3815,6 +4357,7 @@ async fn prove_branch_merge_multi_commit_effect(
     }
 
     let mut planned_index = 0usize;
+    let mut derived_index_tail_seen = false;
     for version in base_version + 1..=lance_head {
         let transaction = if version == lance_head {
             observation
@@ -3872,12 +4415,14 @@ async fn prove_branch_merge_multi_commit_effect(
         if !matches!(
             &transaction.operation,
             lance::dataset::transaction::Operation::CreateIndex { .. }
-        ) {
+        ) || derived_index_tail_seen
+        {
             return Ok(BranchMergeMultiCommitProof::unverifiable(format!(
-                "table '{table_key}' has non-derived operation {:?} at version {version} after its complete planned transaction chain",
+                "table '{table_key}' has an operation outside its single derived CreateIndex tail at version {version}: {:?}",
                 transaction.operation
             )));
         }
+        derived_index_tail_seen = true;
     }
 
     let full_effect_at_head = planned_index == planned_transactions.len();
@@ -3914,16 +4459,13 @@ async fn process_ensure_indices_sidecar_v8(
         let effect = protocol
             .effects
             .iter()
-            .find(|effect| effect.table_key == pin.table_key)
+            .find(|effect| effect.identity == pin.identity)
             .expect("validated schema-v8 key sets");
-        let manifest_pinned = snapshot
-            .entry(&pin.table_key)
-            .map(|entry| entry.table_version)
-            .unwrap_or(0);
+        let manifest_entry = snapshot_entry_for_pin(snapshot, pin)?;
+        let manifest_pinned = manifest_entry.map(|entry| entry.table_version).unwrap_or(0);
         let first_touch = effect.is_first_touch();
         let unpublished_fork = first_touch
-            && snapshot
-                .entry(&pin.table_key)
+            && manifest_entry
                 .map(|entry| entry.table_branch != pin.table_branch)
                 .unwrap_or(true);
         let target_ref = observe_branch_merge_target_ref(pin).await?;
@@ -4009,7 +4551,7 @@ async fn process_ensure_indices_sidecar_v8(
             .intended_delta
             .table_updates
             .iter()
-            .find(|slot| slot.table_key == pin.table_key)
+            .find(|slot| slot.identity == pin.identity)
             .and_then(|slot| slot.confirmed.as_ref());
         let classification = if observation.version < manifest_pinned {
             TableClassification::InvariantViolation {
@@ -4193,15 +4735,14 @@ async fn roll_back_ensure_indices_v8(
         let effect = protocol
             .effects
             .iter()
-            .find(|effect| effect.table_key == pair.0.table_key)
+            .find(|effect| effect.identity == pair.0.identity)
             .expect("validated schema-v8 key sets");
         (pair, effect)
     }) {
         let Some(source_fork_version) = effect.source_fork_version else {
             continue;
         };
-        if snapshot
-            .entry(&pin.table_key)
+        if snapshot_entry_by_identity(snapshot, pin.identity)
             .is_some_and(|entry| entry.table_branch == pin.table_branch)
         {
             return Err(OmniError::manifest_internal(format!(
@@ -4321,7 +4862,7 @@ async fn roll_back_ensure_indices_v8(
         let effect = protocol
             .effects
             .iter()
-            .find(|effect| effect.table_key == pair.0.table_key)
+            .find(|effect| effect.identity == pair.0.identity)
             .expect("validated schema-v8 key sets");
         (pair, effect)
     }) {
@@ -4346,6 +4887,7 @@ async fn roll_back_ensure_indices_v8(
         }
         push_table_update(
             root_uri,
+            pin.identity,
             &pin.table_key,
             &pin.table_path,
             pin.table_branch.as_deref(),
@@ -4392,7 +4934,8 @@ async fn roll_forward_ensure_indices_v8(
         .as_ref()
         .expect("caller checked protocol_v8");
     let mut updates = Vec::with_capacity(protocol.intended_delta.table_updates.len());
-    let mut expected = HashMap::with_capacity(protocol.intended_delta.table_updates.len());
+    let mut expected =
+        ExpectedTableVersions::with_capacity(protocol.intended_delta.table_updates.len());
     let mut outcomes = Vec::with_capacity(protocol.intended_delta.table_updates.len());
     for slot in &protocol.intended_delta.table_updates {
         let confirmed = slot.confirmed.as_ref().ok_or_else(|| {
@@ -4401,8 +4944,15 @@ async fn roll_forward_ensure_indices_v8(
                 sidecar.operation_id, slot.table_key
             ))
         })?;
-        expected.insert(slot.table_key.clone(), slot.expected_version);
+        expected.insert(
+            slot.identity,
+            TableVersionExpectation {
+                table_key: slot.table_key.clone(),
+                table_version: slot.expected_version,
+            },
+        );
         updates.push(ManifestChange::Update(SubTableUpdate {
+            identity: slot.identity,
             table_key: slot.table_key.clone(),
             table_version: confirmed.table_version,
             table_branch: confirmed.table_branch.clone(),
@@ -4471,12 +5021,10 @@ async fn process_schema_apply_sidecar_v7(
         let effect = protocol
             .effects
             .iter()
-            .find(|effect| effect.table_key == pin.table_key)
+            .find(|effect| effect.identity == pin.identity)
             .expect("validated schema-v7 key sets");
-        let manifest_pinned = snapshot
-            .entry(&pin.table_key)
-            .map(|entry| entry.table_version)
-            .unwrap_or(0);
+        let manifest_entry = snapshot_entry_for_schema_pin(snapshot, pin, protocol)?;
+        let manifest_pinned = manifest_entry.map(|entry| entry.table_version).unwrap_or(0);
         let first_touch = effect.kind.is_first_touch();
         let observation = open_lance_head_if_present(
             &pin.table_path,
@@ -4517,7 +5065,7 @@ async fn process_schema_apply_sidecar_v7(
                 .intended_delta
                 .table_updates
                 .iter()
-                .find(|slot| slot.table_key == pin.table_key)
+                .find(|slot| slot.identity == pin.identity)
                 .and_then(|slot| slot.confirmed.as_ref())
                 .is_some_and(|confirmed| confirmed.table_version == observation.version)
             && manifest_pinned == pin.expected_version
@@ -4538,7 +5086,7 @@ async fn process_schema_apply_sidecar_v7(
             manifest_pinned,
             lance_head: observation.version,
             effect_ownership: observation.effect_ownership,
-            unpublished_fork: first_touch && snapshot.entry(&pin.table_key).is_none(),
+            unpublished_fork: first_touch && manifest_entry.is_none(),
         });
     }
 
@@ -4699,15 +5247,38 @@ async fn publish_schema_apply_v7_forward(
         .expect("caller checked protocol_v7");
     let mut changes = Vec::with_capacity(
         protocol.intended_delta.registrations.len()
+            + protocol.intended_delta.renames.len()
             + protocol.intended_delta.table_updates.len()
             + protocol.intended_delta.tombstones.len(),
     );
-    let mut expected = HashMap::new();
+    let mut expected = ExpectedTableVersions::new();
     for registration in &protocol.intended_delta.registrations {
-        expected.insert(registration.table_key.clone(), 0);
+        expected.insert(
+            registration.identity,
+            TableVersionExpectation {
+                table_key: registration.table_key.clone(),
+                table_version: 0,
+            },
+        );
         changes.push(ManifestChange::RegisterTable(TableRegistration {
+            identity: registration.identity,
             table_key: registration.table_key.clone(),
             table_path: registration.table_path.clone(),
+        }));
+    }
+    for rename in &protocol.intended_delta.renames {
+        expected.insert(
+            rename.identity,
+            TableVersionExpectation {
+                table_key: rename.expected_table_key.clone(),
+                table_version: rename.expected_version,
+            },
+        );
+        changes.push(ManifestChange::RenameTable(TableRename {
+            identity: rename.identity,
+            expected_table_key: rename.expected_table_key.clone(),
+            table_key: rename.table_key.clone(),
+            table_path: rename.table_path.clone(),
         }));
     }
     for slot in &protocol.intended_delta.table_updates {
@@ -4717,8 +5288,14 @@ async fn publish_schema_apply_v7_forward(
                 slot.table_key
             ))
         })?;
-        expected.insert(slot.table_key.clone(), slot.expected_version);
+        expected
+            .entry(slot.identity)
+            .or_insert_with(|| TableVersionExpectation {
+                table_key: slot.table_key.clone(),
+                table_version: slot.expected_version,
+            });
         changes.push(ManifestChange::Update(SubTableUpdate {
+            identity: slot.identity,
             table_key: slot.table_key.clone(),
             table_version: confirmed.table_version,
             table_branch: confirmed.table_branch.clone(),
@@ -4728,10 +5305,14 @@ async fn publish_schema_apply_v7_forward(
     }
     for tombstone in &protocol.intended_delta.tombstones {
         expected.insert(
-            tombstone.table_key.clone(),
-            tombstone.tombstone_version.saturating_sub(1),
+            tombstone.identity,
+            TableVersionExpectation {
+                table_key: tombstone.table_key.clone(),
+                table_version: tombstone.tombstone_version.saturating_sub(1),
+            },
         );
         changes.push(ManifestChange::Tombstone(TableTombstone {
+            identity: tombstone.identity,
             table_key: tombstone.table_key.clone(),
             tombstone_version: tombstone.tombstone_version,
         }));
@@ -4767,14 +5348,14 @@ async fn roll_back_schema_apply_v7(
         let effect = protocol
             .effects
             .iter()
-            .find(|effect| effect.table_key == pair.0.table_key)
+            .find(|effect| effect.identity == pair.0.identity)
             .expect("validated schema-v7 key sets");
         (pair, effect)
     }) {
         if !effect.kind.is_first_touch() {
             continue;
         }
-        if snapshot.entry(&pin.table_key).is_some() {
+        if snapshot_entry_by_identity(snapshot, pin.identity).is_some() {
             return Err(OmniError::manifest_internal(format!(
                 "SchemaApply sidecar '{}' cannot delete first-touch dataset '{}' because the manifest now registers it without the fixed original lineage",
                 prepared.operation_id, pin.table_key
@@ -4830,7 +5411,7 @@ async fn roll_back_schema_apply_v7(
         let effect = protocol
             .effects
             .iter()
-            .find(|effect| effect.table_key == pair.0.table_key)
+            .find(|effect| effect.identity == pair.0.identity)
             .expect("validated schema-v7 key sets");
         (pair, effect)
     }) {
@@ -4848,9 +5429,11 @@ async fn roll_back_schema_apply_v7(
                 crate::failpoints::names::RECOVERY_POST_TABLE_RESTORE_PRE_PUBLISH,
             )?;
         }
+        let restored_table_key = schema_apply_rollback_table_key(protocol, pin);
         push_table_update(
             root_uri,
-            &pin.table_key,
+            pin.identity,
+            restored_table_key,
             &pin.table_path,
             None,
             state.manifest_pinned,
@@ -4917,18 +5500,15 @@ async fn process_branch_merge_sidecar_v4(
         let effect = protocol
             .effects
             .iter()
-            .find(|effect| effect.table_key == pin.table_key)
+            .find(|effect| effect.identity == pin.identity)
             .expect("v4 sidecar shape validates effect/pin key sets");
-        let manifest_pinned = snapshot
-            .entry(&pin.table_key)
-            .map(|entry| entry.table_version)
-            .unwrap_or(0);
+        let manifest_entry = snapshot_entry_for_pin(snapshot, pin)?;
+        let manifest_pinned = manifest_entry.map(|entry| entry.table_version).unwrap_or(0);
         let unpublished_fork = pin
             .table_branch
             .as_deref()
             .is_some_and(|branch| branch != "main")
-            && snapshot
-                .entry(&pin.table_key)
+            && manifest_entry
                 .map(|entry| entry.table_branch != pin.table_branch)
                 .unwrap_or(true);
         if manifest_pinned != pin.expected_version {
@@ -5171,7 +5751,8 @@ async fn roll_forward_branch_merge_v4(
         .as_ref()
         .expect("caller checked protocol_v4");
     let mut updates = Vec::with_capacity(protocol.intended_delta.table_updates.len());
-    let mut expected = HashMap::with_capacity(protocol.intended_delta.table_updates.len());
+    let mut expected =
+        ExpectedTableVersions::with_capacity(protocol.intended_delta.table_updates.len());
     let mut outcomes = Vec::with_capacity(protocol.intended_delta.table_updates.len());
     for slot in &protocol.intended_delta.table_updates {
         let confirmed = slot.confirmed.as_ref().ok_or_else(|| {
@@ -5180,8 +5761,15 @@ async fn roll_forward_branch_merge_v4(
                 sidecar.operation_id, slot.table_key
             ))
         })?;
-        expected.insert(slot.table_key.clone(), slot.expected_version);
+        expected.insert(
+            slot.identity,
+            TableVersionExpectation {
+                table_key: slot.table_key.clone(),
+                table_version: slot.expected_version,
+            },
+        );
         updates.push(ManifestChange::Update(SubTableUpdate {
+            identity: slot.identity,
             table_key: slot.table_key.clone(),
             table_version: confirmed.table_version,
             table_branch: confirmed.table_branch.clone(),
@@ -5266,21 +5854,26 @@ fn sidecar_intent_satisfied(
     states: &[ClassifiedTable],
 ) -> bool {
     for (pin, state) in sidecar.tables.iter().zip(states.iter()) {
-        let current = snapshot
-            .entry(&pin.table_key)
-            .map(|e| e.table_version)
-            .unwrap_or(0);
+        let Some(entry) = snapshot_entry_by_identity(snapshot, pin.identity) else {
+            return false;
+        };
+        if entry.table_key != pin.table_key {
+            return false;
+        }
+        let current = entry.table_version;
         if current < state.lance_head {
             return false;
         }
     }
     for reg in &sidecar.additional_registrations {
-        if snapshot.entry(&reg.table_key).is_none() {
+        if snapshot_entry_by_identity(snapshot, reg.identity)
+            .is_none_or(|entry| entry.table_key != reg.table_key)
+        {
             return false;
         }
     }
     for tomb in &sidecar.tombstones {
-        if snapshot.entry(&tomb.table_key).is_some() {
+        if snapshot_entry_by_identity(snapshot, tomb.identity).is_some() {
             return false;
         }
     }
@@ -5322,6 +5915,7 @@ async fn read_live_recovery_authority(
     Ok(RecoveryAuthorityToken {
         branch_identifier: coordinator.branch_identifier().await?,
         graph_head: coordinator.exact_graph_head(),
+        schema_identity_domain: schema_state.schema_identity_domain,
         schema_ir_hash: schema_state.schema_ir_hash,
         schema_identity_version: schema_state.schema_identity_version,
     })
@@ -5391,8 +5985,7 @@ async fn converge_or_defer_roll_forward(
         .map(|pin| TableOutcome {
             table_key: pin.table_key.clone(),
             from_version: pin.expected_version,
-            to_version: fresh
-                .entry(&pin.table_key)
+            to_version: snapshot_entry_by_identity(&fresh, pin.identity)
                 .map(|e| e.table_version)
                 .unwrap_or(pin.post_commit_pin),
         })
@@ -5405,8 +5998,7 @@ async fn converge_or_defer_roll_forward(
         outcomes.push(TableOutcome {
             table_key: reg.table_key.clone(),
             from_version: 0,
-            to_version: fresh
-                .entry(&reg.table_key)
+            to_version: snapshot_entry_by_identity(&fresh, reg.identity)
                 .map(|e| e.table_version)
                 .unwrap_or(0),
         });
@@ -5504,25 +6096,25 @@ fn has_fixed_rollback_identity(sidecar: &RecoverySidecar) -> bool {
 
 fn v4_effect_for<'a>(
     sidecar: &'a RecoverySidecar,
-    table_key: &str,
+    identity: TableIdentity,
 ) -> Option<&'a RecoveryBranchMergeEffect> {
     sidecar
         .protocol_v4
         .as_ref()?
         .effects
         .iter()
-        .find(|effect| effect.table_key == table_key)
+        .find(|effect| effect.identity == identity)
 }
 
 fn first_touch_fork_version(sidecar: &RecoverySidecar, pin: &SidecarTablePin) -> u64 {
-    v4_effect_for(sidecar, &pin.table_key)
+    v4_effect_for(sidecar, pin.identity)
         .and_then(|effect| effect.kind.source_fork_version())
         .or_else(|| {
             sidecar.protocol_v8.as_ref().and_then(|protocol| {
                 protocol
                     .effects
                     .iter()
-                    .find(|effect| effect.table_key == pin.table_key)
+                    .find(|effect| effect.identity == pin.identity)
                     .and_then(|effect| effect.source_fork_version)
             })
         })
@@ -5649,14 +6241,14 @@ async fn cleanup_unpublished_no_effect_forks(
                 exact_fork_version
             )));
         }
-        if let Some(expected_identifier) = v4_effect_for(sidecar, &pin.table_key)
+        if let Some(expected_identifier) = v4_effect_for(sidecar, pin.identity)
             .and_then(|effect| effect.kind.confirmed_branch_identifier())
             .or_else(|| {
                 sidecar.protocol_v8.as_ref().and_then(|protocol| {
                     protocol
                         .effects
                         .iter()
-                        .find(|effect| effect.table_key == pin.table_key)
+                        .find(|effect| effect.identity == pin.identity)
                         .and_then(|effect| effect.confirmed_branch_identifier.as_ref())
                 })
             })
@@ -5702,6 +6294,30 @@ fn table_requires_rollback_effect(state: &ClassifiedTable) -> bool {
     )
 }
 
+/// A SchemaApply rewrite pin uses the desired alias because that is the
+/// forward manifest output. Compensation restores the accepted pre-apply
+/// binding, which is the rename's expected/source alias.
+fn schema_apply_rollback_table_key<'a>(
+    protocol: &'a RecoveryProtocolV7,
+    pin: &'a SidecarTablePin,
+) -> &'a str {
+    protocol
+        .intended_delta
+        .renames
+        .iter()
+        .find(|rename| rename.identity == pin.identity)
+        .map(|rename| rename.expected_table_key.as_str())
+        .unwrap_or(pin.table_key.as_str())
+}
+
+fn rollback_table_key<'a>(sidecar: &'a RecoverySidecar, pin: &'a SidecarTablePin) -> &'a str {
+    sidecar
+        .protocol_v7
+        .as_ref()
+        .map(|protocol| schema_apply_rollback_table_key(protocol, pin))
+        .unwrap_or(pin.table_key.as_str())
+}
+
 fn exact_rollback_audit_outcomes(
     sidecar: &RecoverySidecar,
     states: &[ClassifiedTable],
@@ -5717,7 +6333,7 @@ fn exact_rollback_audit_outcomes(
             ) && table_requires_rollback_effect(state)
         })
         .map(|(pin, state)| TableOutcome {
-            table_key: pin.table_key.clone(),
+            table_key: rollback_table_key(sidecar, pin).to_string(),
             from_version: state.lance_head,
             to_version: state.manifest_pinned,
         })
@@ -5877,7 +6493,7 @@ async fn roll_back_sidecar(
     // asymmetry so the audit records the drift (`from_version > to_version`).
     let mut outcomes = Vec::with_capacity(sidecar.tables.len());
     let mut updates: Vec<ManifestChange> = Vec::with_capacity(sidecar.tables.len());
-    let mut expected: HashMap<String, u64> = HashMap::with_capacity(sidecar.tables.len());
+    let mut expected = ExpectedTableVersions::with_capacity(sidecar.tables.len());
     for (pin, state) in sidecar.tables.iter().zip(states.iter()) {
         if has_exact_protocol(sidecar)
             && !matches!(
@@ -5908,6 +6524,7 @@ async fn roll_back_sidecar(
             // pin to; the version to publish is the HEAD the restore produced.
             push_table_update(
                 root_uri,
+                pin.identity,
                 &pin.table_key,
                 &pin.table_path,
                 pin.table_branch.as_deref(),
@@ -6006,8 +6623,7 @@ async fn record_audit_recovery_rollforward(
         outcomes.push(TableOutcome {
             table_key: registration.table_key.clone(),
             from_version: 0,
-            to_version: snapshot
-                .entry(&registration.table_key)
+            to_version: snapshot_entry_by_identity(snapshot, registration.identity)
                 .map(|entry| entry.table_version)
                 .unwrap_or(0),
         });
@@ -6210,12 +6826,21 @@ pub(crate) async fn ensure_read_only_schema_coherent(
             Some(VisibleExactOutcome::Original) => &protocol.target_schema_ir_hash,
             Some(VisibleExactOutcome::RolledBack) | None => &protocol.authority.schema_ir_hash,
         };
-        if &live.schema_ir_hash != expected_hash {
+        if &live.schema_ir_hash != expected_hash
+            || live.schema_identity_domain != protocol.authority.schema_identity_domain
+            || live.schema_identity_version != protocol.authority.schema_identity_version
+        {
             return Err(OmniError::recovery_required(
                 sidecar.operation_id,
                 format!(
-                    "read-only open found SchemaApply manifest outcome {:?} but live schema identity '{}' does not match expected '{}'; run a read-write open to finish recovery",
-                    outcome, live.schema_ir_hash, expected_hash
+                    "read-only open found SchemaApply manifest outcome {:?} but live schema authority ({}, {}, v{}) does not match expected ({}, {}, v{}); run a read-write open to finish recovery",
+                    outcome,
+                    live.schema_identity_domain,
+                    live.schema_ir_hash,
+                    live.schema_identity_version,
+                    protocol.authority.schema_identity_domain,
+                    expected_hash,
+                    protocol.authority.schema_identity_version,
                 ),
             ));
         }
@@ -6260,14 +6885,13 @@ async fn detect_visible_v7_outcome(
             let Some(confirmed) = slot.confirmed.as_ref() else {
                 return false;
             };
-            committed_snapshot
-                .entry(&slot.table_key)
-                .is_some_and(|entry| {
-                    entry.table_version == confirmed.table_version
-                        && entry.table_branch == confirmed.table_branch
-                        && entry.row_count == confirmed.row_count
-                        && entry.version_metadata == confirmed.version_metadata
-                })
+            snapshot_entry_by_identity(&committed_snapshot, slot.identity).is_some_and(|entry| {
+                entry.table_key == slot.table_key
+                    && entry.table_version == confirmed.table_version
+                    && entry.table_branch == confirmed.table_branch
+                    && entry.row_count == confirmed.row_count
+                    && entry.version_metadata == confirmed.version_metadata
+            })
         });
         let registrations_match =
             protocol
@@ -6275,19 +6899,22 @@ async fn detect_visible_v7_outcome(
                 .registrations
                 .iter()
                 .all(|registration| {
-                    committed_snapshot
-                        .entry(&registration.table_key)
+                    snapshot_entry_by_identity(&committed_snapshot, registration.identity)
                         .is_some_and(|entry| {
-                            entry.table_path == registration.table_path
+                            entry.table_key == registration.table_key
+                                && entry.table_path == registration.table_path
                                 && entry.table_branch == registration.table_branch
                         })
                 });
-        let tombstones_match = protocol
-            .intended_delta
-            .tombstones
-            .iter()
-            .all(|tombstone| committed_snapshot.entry(&tombstone.table_key).is_none());
-        if !updates_match || !registrations_match || !tombstones_match {
+        let renames_match = protocol.intended_delta.renames.iter().all(|rename| {
+            snapshot_entry_by_identity(&committed_snapshot, rename.identity).is_some_and(|entry| {
+                entry.table_key == rename.table_key && entry.table_path == rename.table_path
+            })
+        });
+        let tombstones_match = protocol.intended_delta.tombstones.iter().all(|tombstone| {
+            snapshot_entry_by_identity(&committed_snapshot, tombstone.identity).is_none()
+        });
+        if !updates_match || !registrations_match || !renames_match || !tombstones_match {
             return Err(OmniError::manifest_internal(format!(
                 "SchemaApply sidecar '{}' found original commit id '{}' but its exact manifest delta differs",
                 sidecar.operation_id, protocol.lineage.graph_commit_id
@@ -6443,14 +7070,13 @@ async fn detect_visible_v8_outcome(
             let Some(confirmed) = slot.confirmed.as_ref() else {
                 return false;
             };
-            committed_snapshot
-                .entry(&slot.table_key)
-                .is_some_and(|entry| {
-                    entry.table_version == confirmed.table_version
-                        && entry.table_branch == confirmed.table_branch
-                        && entry.row_count == confirmed.row_count
-                        && entry.version_metadata == confirmed.version_metadata
-                })
+            snapshot_entry_by_identity(&committed_snapshot, slot.identity).is_some_and(|entry| {
+                entry.table_key == slot.table_key
+                    && entry.table_version == confirmed.table_version
+                    && entry.table_branch == confirmed.table_branch
+                    && entry.row_count == confirmed.row_count
+                    && entry.version_metadata == confirmed.version_metadata
+            })
         });
         if !delta_matches {
             return Err(OmniError::manifest_internal(format!(
@@ -6594,14 +7220,13 @@ async fn detect_visible_v3_outcome(
             let Some(confirmed) = slot.confirmed.as_ref() else {
                 return false;
             };
-            committed_snapshot
-                .entry(&slot.table_key)
-                .is_some_and(|entry| {
-                    entry.table_version == confirmed.table_version
-                        && entry.table_branch == confirmed.table_branch
-                        && entry.row_count == confirmed.row_count
-                        && entry.version_metadata == confirmed.version_metadata
-                })
+            snapshot_entry_by_identity(&committed_snapshot, slot.identity).is_some_and(|entry| {
+                entry.table_key == slot.table_key
+                    && entry.table_version == confirmed.table_version
+                    && entry.table_branch == confirmed.table_branch
+                    && entry.row_count == confirmed.row_count
+                    && entry.version_metadata == confirmed.version_metadata
+            })
         });
         if !delta_matches {
             return Err(OmniError::manifest_internal(format!(
@@ -6649,7 +7274,7 @@ async fn finalize_visible_v3_outcome(
                         .intended_delta
                         .table_updates
                         .iter()
-                        .find(|slot| slot.table_key == pin.table_key)
+                        .find(|slot| slot.identity == pin.identity)
                         .and_then(|slot| slot.confirmed.as_ref())
                         .expect("validated EffectsConfirmed v3 sidecar");
                     TableOutcome {
@@ -6754,14 +7379,13 @@ async fn detect_visible_v4_outcome(
             let Some(confirmed) = slot.confirmed.as_ref() else {
                 return false;
             };
-            committed_snapshot
-                .entry(&slot.table_key)
-                .is_some_and(|entry| {
-                    entry.table_version == confirmed.table_version
-                        && entry.table_branch == confirmed.table_branch
-                        && entry.row_count == confirmed.row_count
-                        && entry.version_metadata == confirmed.version_metadata
-                })
+            snapshot_entry_by_identity(&committed_snapshot, slot.identity).is_some_and(|entry| {
+                entry.table_key == slot.table_key
+                    && entry.table_version == confirmed.table_version
+                    && entry.table_branch == confirmed.table_branch
+                    && entry.row_count == confirmed.row_count
+                    && entry.version_metadata == confirmed.version_metadata
+            })
         });
         if !delta_matches {
             return Err(OmniError::manifest_internal(format!(
@@ -6882,12 +7506,12 @@ async fn roll_forward_all(
     sidecar: &RecoverySidecar,
     states: &[ClassifiedTable],
     snapshot: &Snapshot,
-) -> Result<(u64, HashMap<String, u64>, String)> {
+) -> Result<(u64, HashMap<TableIdentity, u64>, String)> {
     let total_changes =
         sidecar.tables.len() + sidecar.additional_registrations.len() + sidecar.tombstones.len();
     let mut updates: Vec<ManifestChange> = Vec::with_capacity(total_changes);
-    let mut expected: HashMap<String, u64> = HashMap::with_capacity(total_changes);
-    let mut published_versions: HashMap<String, u64> =
+    let mut expected = ExpectedTableVersions::with_capacity(total_changes);
+    let mut published_versions: HashMap<TableIdentity, u64> =
         HashMap::with_capacity(sidecar.tables.len() + sidecar.additional_registrations.len());
 
     for (pin, state) in sidecar.tables.iter().zip(states.iter()) {
@@ -6900,7 +7524,7 @@ async fn roll_forward_all(
                 .intended_delta
                 .table_updates
                 .iter()
-                .find(|slot| slot.table_key == pin.table_key)
+                .find(|slot| slot.identity == pin.identity)
                 .ok_or_else(|| {
                     OmniError::manifest_internal(format!(
                         "OCC recovery delta missing table '{}'",
@@ -6919,15 +7543,22 @@ async fn roll_forward_all(
                     pin.table_key, state.lance_head, confirmed.table_version
                 )));
             }
-            expected.insert(pin.table_key.clone(), slot.expected_version);
+            expected.insert(
+                pin.identity,
+                TableVersionExpectation {
+                    table_key: pin.table_key.clone(),
+                    table_version: slot.expected_version,
+                },
+            );
             updates.push(ManifestChange::Update(SubTableUpdate {
+                identity: pin.identity,
                 table_key: pin.table_key.clone(),
                 table_version: confirmed.table_version,
                 table_branch: confirmed.table_branch.clone(),
                 row_count: confirmed.row_count,
                 version_metadata: confirmed.version_metadata.clone(),
             }));
-            published_versions.insert(pin.table_key.clone(), confirmed.table_version);
+            published_versions.insert(pin.identity, confirmed.table_version);
             continue;
         }
         // Publish the version classification OBSERVED (`state.lance_head`), not a
@@ -6938,6 +7569,7 @@ async fn roll_forward_all(
         // against the pin's pre-write `expected_version`.
         let published = push_table_update(
             root_uri,
+            pin.identity,
             &pin.table_key,
             &pin.table_path,
             pin.table_branch.as_deref(),
@@ -6947,7 +7579,7 @@ async fn roll_forward_all(
             &mut expected,
         )
         .await?;
-        published_versions.insert(pin.table_key.clone(), published);
+        published_versions.insert(pin.identity, published);
     }
 
     // SchemaApply-only: register added tables (and renamed targets) and
@@ -6962,12 +7594,26 @@ async fn roll_forward_all(
     // registration — skip it to avoid the publisher's ExpectedVersionMismatch
     // (expected=0, actual=current_version) on the redundant Register.
     for reg in &sidecar.additional_registrations {
-        if snapshot.entry(&reg.table_key).is_some() {
+        if snapshot
+            .entries()
+            .find(|entry| entry.identity == reg.identity)
+            .is_some()
+        {
             // Already registered — record the current version in
             // published_versions so the audit row's `to_version` reflects
             // reality, but emit no manifest change.
-            if let Some(entry) = snapshot.entry(&reg.table_key) {
-                published_versions.insert(reg.table_key.clone(), entry.table_version);
+            if let Some(entry) = snapshot
+                .entries()
+                .find(|entry| entry.identity == reg.identity)
+            {
+                if entry.table_key != reg.table_key {
+                    return Err(OmniError::manifest_read_set_changed(
+                        format!("table_binding:{}", reg.identity),
+                        Some(reg.table_key.clone()),
+                        Some(entry.table_key.clone()),
+                    ));
+                }
+                published_versions.insert(reg.identity, entry.table_version);
             }
             continue;
         }
@@ -6998,10 +7644,12 @@ async fn roll_forward_all(
         )?;
 
         updates.push(ManifestChange::RegisterTable(TableRegistration {
+            identity: reg.identity,
             table_key: reg.table_key.clone(),
             table_path: reg.table_path.clone(),
         }));
         updates.push(ManifestChange::Update(SubTableUpdate {
+            identity: reg.identity,
             table_key: reg.table_key.clone(),
             table_version: head_version,
             table_branch: reg.table_branch.clone(),
@@ -7009,8 +7657,14 @@ async fn roll_forward_all(
             version_metadata,
         }));
         // No prior manifest entry expected for an added table.
-        expected.insert(reg.table_key.clone(), 0);
-        published_versions.insert(reg.table_key.clone(), head_version);
+        expected.insert(
+            reg.identity,
+            TableVersionExpectation {
+                table_key: reg.table_key.clone(),
+                table_version: 0,
+            },
+        );
+        published_versions.insert(reg.identity, head_version);
     }
 
     // SchemaApply-only: tombstone removed types (and renamed sources).
@@ -7020,10 +7674,15 @@ async fn roll_forward_all(
     // a prior recovery / the writer's Phase C — skip emit so the
     // publisher doesn't error on a redundant tombstone.
     for tomb in &sidecar.tombstones {
-        if snapshot.entry(&tomb.table_key).is_none() {
+        if snapshot
+            .entries()
+            .find(|entry| entry.identity == tomb.identity)
+            .is_none()
+        {
             continue;
         }
         updates.push(ManifestChange::Tombstone(TableTombstone {
+            identity: tomb.identity,
             table_key: tomb.table_key.clone(),
             tombstone_version: tomb.tombstone_version,
         }));
@@ -7031,8 +7690,11 @@ async fn roll_forward_all(
         // `tombstone_version - 1` (the pre-tombstone version, since
         // schema_apply sets `tombstone_version = source.table_version + 1`).
         expected.insert(
-            tomb.table_key.clone(),
-            tomb.tombstone_version.saturating_sub(1),
+            tomb.identity,
+            TableVersionExpectation {
+                table_key: tomb.table_key.clone(),
+                table_version: tomb.tombstone_version.saturating_sub(1),
+            },
         );
     }
 
@@ -7070,13 +7732,14 @@ async fn roll_forward_all(
 ///   created the restore commit, so HEAD *is* the version to publish.
 async fn push_table_update(
     root_uri: &str,
+    identity: TableIdentity,
     table_key: &str,
     table_path: &str,
     branch: Option<&str>,
     expected_version: u64,
     target_version: Option<u64>,
     updates: &mut Vec<ManifestChange>,
-    expected: &mut HashMap<String, u64>,
+    expected: &mut ExpectedTableVersions,
 ) -> Result<u64> {
     let ds = crate::instrumentation::open_dataset(
         table_path,
@@ -7104,17 +7767,24 @@ async fn push_table_update(
         .count_rows(None)
         .await
         .map_err(|e| OmniError::Lance(e.to_string()))? as u64;
-    let table_relative_path = super::table_path_for_table_key(table_key)?;
+    let table_relative_path = super::table_path_for_identity(table_key, identity)?;
     let version_metadata =
         super::metadata::TableVersionMetadata::from_dataset(root_uri, &table_relative_path, &ds)?;
     updates.push(ManifestChange::Update(SubTableUpdate {
+        identity,
         table_key: table_key.to_string(),
         table_version: published_version,
         table_branch: branch.map(str::to_string),
         row_count,
         version_metadata,
     }));
-    expected.insert(table_key.to_string(), expected_version);
+    expected.insert(
+        identity,
+        TableVersionExpectation {
+            table_key: table_key.to_string(),
+            table_version: expected_version,
+        },
+    );
     Ok(published_version)
 }
 
@@ -7318,9 +7988,22 @@ async fn delete_sidecar_by_operation_id(
     storage.delete(&sidecar_uri(root_uri, operation_id)).await
 }
 
-/// Convenience: build a [`RecoverySidecar`] with auto-generated
-/// `operation_id` and `started_at`. The caller fills in the other fields.
-pub(crate) fn new_sidecar(
+/// Arm the identity-aware Optimize protocol. Optimize has no writer-specific
+/// payload: its complete physical set is the table-pin vector itself.
+pub(crate) fn new_optimize_sidecar_v9(tables: Vec<SidecarTablePin>) -> Result<RecoverySidecar> {
+    let sidecar = new_unvalidated_sidecar(
+        IDENTITY_AWARE_SIDECAR_SCHEMA_VERSION,
+        SidecarKind::Optimize,
+        None,
+        None,
+        tables,
+    );
+    validate_sidecar_shape("<new-optimize-sidecar-v9>", &sidecar)?;
+    Ok(sidecar)
+}
+
+fn new_unvalidated_sidecar(
+    schema_version: u32,
     writer_kind: SidecarKind,
     branch: Option<String>,
     actor_id: Option<String>,
@@ -7333,7 +8016,7 @@ pub(crate) fn new_sidecar(
         Err(_) => "0".to_string(),
     };
     RecoverySidecar {
-        schema_version: LEGACY_SIDECAR_SCHEMA_VERSION,
+        schema_version,
         operation_id,
         started_at,
         branch,
@@ -7357,12 +8040,17 @@ pub(crate) fn new_sidecar(
 /// use the legacy loose classifier, but compensation gets a stable lineage id
 /// so a crash after rollback publish cannot be misread as roll-forward.
 #[cfg(test)]
-pub(crate) fn new_ensure_indices_sidecar(
+pub(crate) fn new_ensure_indices_sidecar_v6(
     branch: Option<String>,
     tables: Vec<SidecarTablePin>,
 ) -> Result<RecoverySidecar> {
-    let mut sidecar = new_sidecar(SidecarKind::EnsureIndices, branch, None, tables);
-    sidecar.schema_version = ENSURE_INDICES_ROLLBACK_SCHEMA_VERSION;
+    let mut sidecar = new_unvalidated_sidecar(
+        ENSURE_INDICES_ROLLBACK_SCHEMA_VERSION,
+        SidecarKind::EnsureIndices,
+        branch,
+        None,
+        tables,
+    );
     sidecar.ensure_indices_rollback_v6 = Some(RecoveryEnsureIndicesRollbackV6 {
         rollback_graph_commit_id: ulid::Ulid::new().to_string(),
         rollback_audit_outcomes: None,
@@ -7371,31 +8059,31 @@ pub(crate) fn new_ensure_indices_sidecar(
     Ok(sidecar)
 }
 
-/// Arm an exact schema-v8 EnsureIndices intent. The caller pre-mints one Lance
+/// Arm an exact schema-v9 EnsureIndices intent. The caller pre-mints one Lance
 /// transaction per table and identifies only those named-branch targets whose
 /// native ref must be created after this sidecar becomes durable.
-pub(crate) fn new_ensure_indices_sidecar_v8(
+pub(crate) fn new_ensure_indices_sidecar_v9(
     branch: Option<String>,
     actor_id: Option<String>,
     tables: Vec<SidecarTablePin>,
     authority: RecoveryAuthorityToken,
     lineage: RecoveryLineageIntent,
-    planned_transactions: HashMap<String, StagedTransactionIdentity>,
-    first_touch_source_versions: HashMap<String, u64>,
+    planned_transactions: HashMap<TableIdentity, StagedTransactionIdentity>,
+    first_touch_source_versions: HashMap<TableIdentity, u64>,
 ) -> Result<RecoverySidecar> {
-    let pin_keys: HashSet<&str> = tables.iter().map(|pin| pin.table_key.as_str()).collect();
+    let pin_ids: HashSet<TableIdentity> = tables.iter().map(|pin| pin.identity).collect();
     if tables.is_empty()
-        || pin_keys.len() != tables.len()
+        || pin_ids.len() != tables.len()
         || planned_transactions.len() != tables.len()
         || !tables
             .iter()
-            .all(|pin| planned_transactions.contains_key(&pin.table_key))
+            .all(|pin| planned_transactions.contains_key(&pin.identity))
         || !first_touch_source_versions
             .keys()
-            .all(|key| pin_keys.contains(key.as_str()))
+            .all(|identity| pin_ids.contains(identity))
     {
         return Err(OmniError::manifest_internal(
-            "new_ensure_indices_sidecar_v8 requires one planned transaction per unique table pin and first-touch keys drawn from those pins",
+            "new_ensure_indices_sidecar_v9 requires one planned transaction per unique table pin and first-touch keys drawn from those pins",
         ));
     }
 
@@ -7407,12 +8095,13 @@ pub(crate) fn new_ensure_indices_sidecar_v8(
     let effects = tables
         .iter()
         .map(|pin| RecoveryEnsureIndicesEffect {
+            identity: pin.identity,
             table_key: pin.table_key.clone(),
             planned_transaction: planned_transactions
-                .get(&pin.table_key)
+                .get(&pin.identity)
                 .expect("planned key set checked above")
                 .clone(),
-            source_fork_version: first_touch_source_versions.get(&pin.table_key).copied(),
+            source_fork_version: first_touch_source_versions.get(&pin.identity).copied(),
             confirmed_transaction: None,
             confirmed_branch_identifier: None,
         })
@@ -7421,6 +8110,7 @@ pub(crate) fn new_ensure_indices_sidecar_v8(
         table_updates: tables
             .iter()
             .map(|pin| RecoveryTableUpdateSlot {
+                identity: pin.identity,
                 table_key: pin.table_key.clone(),
                 expected_version: pin.expected_version,
                 table_branch: pin.table_branch.clone(),
@@ -7428,10 +8118,11 @@ pub(crate) fn new_ensure_indices_sidecar_v8(
             })
             .collect(),
         registrations: Vec::new(),
+        renames: Vec::new(),
         tombstones: Vec::new(),
     };
     let sidecar = RecoverySidecar {
-        schema_version: ENSURE_INDICES_EXACT_SCHEMA_VERSION,
+        schema_version: IDENTITY_AWARE_SIDECAR_SCHEMA_VERSION,
         operation_id,
         started_at,
         branch,
@@ -7457,27 +8148,27 @@ pub(crate) fn new_ensure_indices_sidecar_v8(
         }),
         ensure_indices_rollback_v6: None,
     };
-    validate_sidecar_shape("<new-ensure-indices-v8-sidecar>", &sidecar)?;
+    validate_sidecar_shape("<new-ensure-indices-v9-sidecar>", &sidecar)?;
     Ok(sidecar)
 }
 
-/// Bind every exact schema-v8 index output and durably transition the sidecar
+/// Bind every exact schema-v9 index output and durably transition the sidecar
 /// from `Armed` to `EffectsConfirmed`. Validation completes on a clone so any
 /// mismatch leaves the durable intent rollback-only.
-pub(crate) async fn confirm_ensure_indices_sidecar_v8(
+pub(crate) async fn confirm_ensure_indices_sidecar_v9(
     root_uri: &str,
     storage: &dyn StorageAdapter,
     sidecar: &mut RecoverySidecar,
     updates: &[SubTableUpdate],
-    committed_transactions: &HashMap<String, StagedTransactionIdentity>,
-    confirmed_ref_identifiers: &HashMap<String, lance::dataset::refs::BranchIdentifier>,
+    committed_transactions: &HashMap<TableIdentity, StagedTransactionIdentity>,
+    confirmed_ref_identifiers: &HashMap<TableIdentity, lance::dataset::refs::BranchIdentifier>,
 ) -> Result<()> {
     crate::failpoints::maybe_fail(crate::failpoints::names::RECOVERY_SIDECAR_CONFIRM)?;
     let uri = sidecar_uri(root_uri, &sidecar.operation_id);
     validate_sidecar_shape(&uri, sidecar)?;
     let protocol = sidecar.protocol_v8.as_ref().ok_or_else(|| {
         OmniError::manifest_internal(
-            "confirm_ensure_indices_sidecar_v8 requires a schema-v8 EnsureIndices sidecar",
+            "confirm_ensure_indices_sidecar_v9 requires a schema-v9 EnsureIndices sidecar",
         )
     })?;
     if protocol.effect_phase != RecoveryEffectPhase::Armed {
@@ -7486,32 +8177,26 @@ pub(crate) async fn confirm_ensure_indices_sidecar_v8(
             sidecar.operation_id
         )));
     }
-    let planned_keys: HashSet<&str> = protocol
+    let planned_ids: HashSet<TableIdentity> = protocol
         .effects
         .iter()
-        .map(|effect| effect.table_key.as_str())
+        .map(|effect| effect.identity)
         .collect();
-    let update_keys: HashSet<&str> = updates
-        .iter()
-        .map(|update| update.table_key.as_str())
-        .collect();
-    let first_touch_keys: HashSet<&str> = protocol
+    let update_ids: HashSet<TableIdentity> = updates.iter().map(|update| update.identity).collect();
+    let first_touch_ids: HashSet<TableIdentity> = protocol
         .effects
         .iter()
         .filter(|effect| effect.is_first_touch())
-        .map(|effect| effect.table_key.as_str())
+        .map(|effect| effect.identity)
         .collect();
-    let ref_keys: HashSet<&str> = confirmed_ref_identifiers
-        .keys()
-        .map(String::as_str)
-        .collect();
-    if update_keys.len() != updates.len()
-        || update_keys != planned_keys
-        || committed_transactions.len() != planned_keys.len()
-        || !planned_keys
+    let ref_ids: HashSet<TableIdentity> = confirmed_ref_identifiers.keys().copied().collect();
+    if update_ids.len() != updates.len()
+        || update_ids != planned_ids
+        || committed_transactions.len() != planned_ids.len()
+        || !planned_ids
             .iter()
-            .all(|key| committed_transactions.contains_key(*key))
-        || ref_keys != first_touch_keys
+            .all(|identity| committed_transactions.contains_key(identity))
+        || ref_ids != first_touch_ids
     {
         return Err(OmniError::manifest_internal(format!(
             "EnsureIndices sidecar '{}' confirmation key set differs from its exact plan",
@@ -7523,16 +8208,18 @@ pub(crate) async fn confirm_ensure_indices_sidecar_v8(
         let pin = sidecar
             .tables
             .iter()
-            .find(|pin| pin.table_key == effect.table_key)
+            .find(|pin| pin.identity == effect.identity)
             .expect("validated schema-v8 key sets");
         let update = updates
             .iter()
-            .find(|update| update.table_key == effect.table_key)
+            .find(|update| update.identity == effect.identity)
             .expect("confirmation key sets checked above");
         let committed = committed_transactions
-            .get(&effect.table_key)
+            .get(&effect.identity)
             .expect("confirmation key sets checked above");
-        if committed != &effect.planned_transaction
+        if pin.table_key != effect.table_key
+            || update.table_key != effect.table_key
+            || committed != &effect.planned_transaction
             || update.table_version != pin.post_commit_pin
             || update.table_branch != pin.table_branch
         {
@@ -7561,7 +8248,7 @@ pub(crate) async fn confirm_ensure_indices_sidecar_v8(
         }
         if let Some(source_fork_version) = effect.source_fork_version {
             let expected_identifier = confirmed_ref_identifiers
-                .get(&effect.table_key)
+                .get(&effect.identity)
                 .expect("first-touch key sets checked above");
             if observed.parent_version != Some(source_fork_version)
                 || observed.version != update.table_version
@@ -7583,17 +8270,17 @@ pub(crate) async fn confirm_ensure_indices_sidecar_v8(
     for effect in &mut confirmed_protocol.effects {
         effect.confirmed_transaction = Some(
             committed_transactions
-                .get(&effect.table_key)
+                .get(&effect.identity)
                 .expect("confirmation key sets checked above")
                 .clone(),
         );
         effect.confirmed_branch_identifier =
-            confirmed_ref_identifiers.get(&effect.table_key).cloned();
+            confirmed_ref_identifiers.get(&effect.identity).cloned();
     }
     for slot in &mut confirmed_protocol.intended_delta.table_updates {
         let update = updates
             .iter()
-            .find(|update| update.table_key == slot.table_key)
+            .find(|update| update.identity == slot.identity)
             .expect("confirmation key sets checked above");
         slot.confirmed = Some(RecoveryConfirmedTableUpdate {
             table_version: update.table_version,
@@ -7605,7 +8292,7 @@ pub(crate) async fn confirm_ensure_indices_sidecar_v8(
     for pin in &mut confirmed.tables {
         let update = updates
             .iter()
-            .find(|update| update.table_key == pin.table_key)
+            .find(|update| update.identity == pin.identity)
             .expect("confirmation key sets checked above");
         pin.confirmed_version = Some(update.table_version);
     }
@@ -7627,32 +8314,32 @@ pub(crate) async fn confirm_ensure_indices_sidecar_v8(
 /// transaction identity and manifest output slot is durable, but no achieved
 /// version is recorded. The caller must persist it with [`write_sidecar`]
 /// before the first table HEAD advance and later call
-/// [`confirm_occ_sidecar_phase_b`] after every exact effect completes.
-pub(crate) fn new_occ_sidecar(
+/// [`confirm_occ_sidecar_v9`] after every exact effect completes.
+pub(crate) fn new_occ_sidecar_v9(
     writer_kind: SidecarKind,
     branch: Option<String>,
     actor_id: Option<String>,
     tables: Vec<SidecarTablePin>,
     authority: RecoveryAuthorityToken,
     lineage: RecoveryLineageIntent,
-    planned_transactions: HashMap<String, StagedTransactionIdentity>,
+    planned_transactions: HashMap<TableIdentity, StagedTransactionIdentity>,
 ) -> Result<RecoverySidecar> {
     if !matches!(writer_kind, SidecarKind::Mutation | SidecarKind::Load) {
         return Err(OmniError::manifest_internal(format!(
-            "new_occ_sidecar only supports Mutation/Load, found {:?}",
+            "new_occ_sidecar_v9 only supports Mutation/Load, found {:?}",
             writer_kind
         )));
     }
-    let pin_keys: HashSet<&str> = tables.iter().map(|pin| pin.table_key.as_str()).collect();
+    let pin_ids: HashSet<TableIdentity> = tables.iter().map(|pin| pin.identity).collect();
     if tables.is_empty()
-        || pin_keys.len() != tables.len()
+        || pin_ids.len() != tables.len()
         || planned_transactions.len() != tables.len()
         || !tables
             .iter()
-            .all(|pin| planned_transactions.contains_key(&pin.table_key))
+            .all(|pin| planned_transactions.contains_key(&pin.identity))
     {
         return Err(OmniError::manifest_internal(
-            "new_occ_sidecar requires at least one pin and exactly one planned transaction per unique table pin",
+            "new_occ_sidecar_v9 requires at least one pin and exactly one planned transaction per unique table identity",
         ));
     }
 
@@ -7664,9 +8351,10 @@ pub(crate) fn new_occ_sidecar(
     let effects = tables
         .iter()
         .map(|pin| RecoveryTableEffect {
+            identity: pin.identity,
             table_key: pin.table_key.clone(),
             planned_transaction: planned_transactions
-                .get(&pin.table_key)
+                .get(&pin.identity)
                 .expect("planned key set checked above")
                 .clone(),
             confirmed_transaction: None,
@@ -7675,6 +8363,7 @@ pub(crate) fn new_occ_sidecar(
     let table_updates = tables
         .iter()
         .map(|pin| RecoveryTableUpdateSlot {
+            identity: pin.identity,
             table_key: pin.table_key.clone(),
             expected_version: pin.expected_version,
             table_branch: pin.table_branch.clone(),
@@ -7682,7 +8371,7 @@ pub(crate) fn new_occ_sidecar(
         })
         .collect();
     let sidecar = RecoverySidecar {
-        schema_version: MUTATION_LOAD_SIDECAR_SCHEMA_VERSION,
+        schema_version: IDENTITY_AWARE_SIDECAR_SCHEMA_VERSION,
         operation_id,
         started_at,
         branch,
@@ -7704,6 +8393,7 @@ pub(crate) fn new_occ_sidecar(
             intended_delta: RecoveryManifestDelta {
                 table_updates,
                 registrations: Vec::new(),
+                renames: Vec::new(),
                 tombstones: Vec::new(),
             },
         }),
@@ -7723,18 +8413,18 @@ pub(crate) fn new_occ_sidecar(
 /// transaction, or a version/branch mismatch leaves the on-disk sidecar Armed,
 /// which recovery interprets as partial Phase B and rolls back. Only the exact
 /// planned transaction set can become eligible for roll-forward.
-pub(crate) async fn confirm_occ_sidecar_phase_b(
+pub(crate) async fn confirm_occ_sidecar_v9(
     root_uri: &str,
     storage: &dyn StorageAdapter,
     sidecar: &mut RecoverySidecar,
     updates: &[SubTableUpdate],
-    committed_transactions: &HashMap<String, StagedTransactionIdentity>,
+    committed_transactions: &HashMap<TableIdentity, StagedTransactionIdentity>,
 ) -> Result<()> {
     crate::failpoints::maybe_fail(crate::failpoints::names::RECOVERY_SIDECAR_CONFIRM)?;
     validate_sidecar_shape(&sidecar_uri(root_uri, &sidecar.operation_id), sidecar)?;
 
     let protocol = sidecar.protocol_v3.as_ref().ok_or_else(|| {
-        OmniError::manifest_internal("confirm_occ_sidecar_phase_b requires a v3 OCC sidecar")
+        OmniError::manifest_internal("confirm_occ_sidecar_v9 requires a schema-v9 OCC sidecar")
     })?;
     if protocol.effect_phase != RecoveryEffectPhase::Armed {
         return Err(OmniError::manifest_internal(format!(
@@ -7742,21 +8432,18 @@ pub(crate) async fn confirm_occ_sidecar_phase_b(
             sidecar.operation_id
         )));
     }
-    let update_keys: HashSet<&str> = updates
-        .iter()
-        .map(|update| update.table_key.as_str())
-        .collect();
-    let planned_keys: HashSet<&str> = protocol
+    let update_ids: HashSet<TableIdentity> = updates.iter().map(|update| update.identity).collect();
+    let planned_ids: HashSet<TableIdentity> = protocol
         .effects
         .iter()
-        .map(|effect| effect.table_key.as_str())
+        .map(|effect| effect.identity)
         .collect();
-    if update_keys.len() != updates.len()
-        || committed_transactions.len() != planned_keys.len()
-        || update_keys != planned_keys
-        || !planned_keys
+    if update_ids.len() != updates.len()
+        || committed_transactions.len() != planned_ids.len()
+        || update_ids != planned_ids
+        || !planned_ids
             .iter()
-            .all(|key| committed_transactions.contains_key(*key))
+            .all(|identity| committed_transactions.contains_key(identity))
     {
         return Err(OmniError::manifest_internal(format!(
             "OCC sidecar '{}' confirmation key set differs from its planned effects",
@@ -7770,7 +8457,7 @@ pub(crate) async fn confirm_occ_sidecar_phase_b(
     // fields while landing at a later version.
     for effect in &protocol.effects {
         let committed = committed_transactions
-            .get(&effect.table_key)
+            .get(&effect.identity)
             .expect("confirmed key set checked above");
         if committed != &effect.planned_transaction {
             return Err(OmniError::manifest_internal(format!(
@@ -7782,13 +8469,17 @@ pub(crate) async fn confirm_occ_sidecar_phase_b(
         let pin = sidecar
             .tables
             .iter()
-            .find(|pin| pin.table_key == effect.table_key)
+            .find(|pin| pin.identity == effect.identity)
             .expect("sidecar key sets validated");
         let update = updates
             .iter()
-            .find(|update| update.table_key == effect.table_key)
+            .find(|update| update.identity == effect.identity)
             .expect("confirmed key set checked above");
-        if update.table_version != pin.post_commit_pin || update.table_branch != pin.table_branch {
+        if pin.table_key != effect.table_key
+            || update.table_key != effect.table_key
+            || update.table_version != pin.post_commit_pin
+            || update.table_branch != pin.table_branch
+        {
             return Err(OmniError::manifest_internal(format!(
                 "OCC sidecar '{}' table '{}' achieved version/branch ({}, {:?}), \
                  planned ({}, {:?}); leaving recovery Armed",
@@ -7810,7 +8501,7 @@ pub(crate) async fn confirm_occ_sidecar_phase_b(
     for effect in &mut confirmed_protocol.effects {
         effect.confirmed_transaction = Some(
             committed_transactions
-                .get(&effect.table_key)
+                .get(&effect.identity)
                 .expect("confirmed key set checked above")
                 .clone(),
         );
@@ -7818,7 +8509,7 @@ pub(crate) async fn confirm_occ_sidecar_phase_b(
     for slot in &mut confirmed_protocol.intended_delta.table_updates {
         let update = updates
             .iter()
-            .find(|update| update.table_key == slot.table_key)
+            .find(|update| update.identity == slot.identity)
             .expect("confirmed key set checked above");
         slot.confirmed = Some(RecoveryConfirmedTableUpdate {
             table_version: update.table_version,
@@ -7830,7 +8521,7 @@ pub(crate) async fn confirm_occ_sidecar_phase_b(
     for pin in &mut confirmed.tables {
         let update = updates
             .iter()
-            .find(|update| update.table_key == pin.table_key)
+            .find(|update| update.identity == pin.identity)
             .expect("confirmed key set checked above");
         pin.confirmed_version = Some(update.table_version);
     }
@@ -7849,11 +8540,11 @@ pub(crate) async fn confirm_occ_sidecar_phase_b(
     Ok(())
 }
 
-/// Arm an exact schema-v7 SchemaApply intent. `tables`/`effects` name every
+/// Arm an exact schema-v9 SchemaApply intent. `tables`/`effects` name every
 /// independently durable table operation; metadata/tombstone-only applies may
 /// deliberately carry an empty set because schema staging is confirmed by the
 /// same protocol before publication.
-pub(crate) fn new_schema_apply_sidecar_v7(
+pub(crate) fn new_schema_apply_sidecar_v9(
     actor_id: Option<String>,
     tables: Vec<SidecarTablePin>,
     authority: RecoveryAuthorityToken,
@@ -7868,7 +8559,7 @@ pub(crate) fn new_schema_apply_sidecar_v7(
         Err(_) => "0".to_string(),
     };
     let sidecar = RecoverySidecar {
-        schema_version: SCHEMA_APPLY_EXACT_SCHEMA_VERSION,
+        schema_version: IDENTITY_AWARE_SIDECAR_SCHEMA_VERSION,
         operation_id,
         started_at,
         branch: None,
@@ -7895,24 +8586,24 @@ pub(crate) fn new_schema_apply_sidecar_v7(
         protocol_v8: None,
         ensure_indices_rollback_v6: None,
     };
-    validate_sidecar_shape("<new-schema-apply-v7-sidecar>", &sidecar)?;
+    validate_sidecar_shape("<new-schema-apply-v9-sidecar>", &sidecar)?;
     Ok(sidecar)
 }
 
 /// Bind every exact SchemaApply output after all table effects and all three
 /// schema staging files are durable. Validation completes against a clone, so
 /// any mismatch leaves the durable sidecar Armed and therefore rollback-only.
-pub(crate) async fn confirm_schema_apply_sidecar_v7(
+pub(crate) async fn confirm_schema_apply_sidecar_v9(
     root_uri: &str,
     storage: &dyn StorageAdapter,
     sidecar: &mut RecoverySidecar,
     updates: &[SubTableUpdate],
-    committed_transactions: &HashMap<String, StagedTransactionIdentity>,
+    committed_transactions: &HashMap<TableIdentity, StagedTransactionIdentity>,
 ) -> Result<()> {
     crate::failpoints::maybe_fail(crate::failpoints::names::RECOVERY_SIDECAR_CONFIRM)?;
     validate_sidecar_shape(&sidecar_uri(root_uri, &sidecar.operation_id), sidecar)?;
     let protocol = sidecar.protocol_v7.as_ref().ok_or_else(|| {
-        OmniError::manifest_internal("confirm_schema_apply_sidecar_v7 requires a schema-v7 sidecar")
+        OmniError::manifest_internal("confirm_schema_apply_sidecar_v9 requires a schema-v9 sidecar")
     })?;
     if protocol.effect_phase != RecoveryEffectPhase::Armed {
         return Err(OmniError::manifest_internal(format!(
@@ -7920,21 +8611,18 @@ pub(crate) async fn confirm_schema_apply_sidecar_v7(
             sidecar.operation_id
         )));
     }
-    let update_keys: HashSet<&str> = updates
-        .iter()
-        .map(|update| update.table_key.as_str())
-        .collect();
-    let planned_keys: HashSet<&str> = protocol
+    let update_ids: HashSet<TableIdentity> = updates.iter().map(|update| update.identity).collect();
+    let planned_ids: HashSet<TableIdentity> = protocol
         .effects
         .iter()
-        .map(|effect| effect.table_key.as_str())
+        .map(|effect| effect.identity)
         .collect();
-    if update_keys.len() != updates.len()
-        || committed_transactions.len() != planned_keys.len()
-        || update_keys != planned_keys
-        || !planned_keys
+    if update_ids.len() != updates.len()
+        || committed_transactions.len() != planned_ids.len()
+        || update_ids != planned_ids
+        || !planned_ids
             .iter()
-            .all(|key| committed_transactions.contains_key(*key))
+            .all(|identity| committed_transactions.contains_key(identity))
     {
         return Err(OmniError::manifest_internal(format!(
             "SchemaApply sidecar '{}' confirmation key set differs from its planned effects",
@@ -7945,18 +8633,20 @@ pub(crate) async fn confirm_schema_apply_sidecar_v7(
     for effect in &protocol.effects {
         let planned = effect.kind.planned_transaction();
         let committed = committed_transactions
-            .get(&effect.table_key)
+            .get(&effect.identity)
             .expect("confirmed key set checked above");
         let pin = sidecar
             .tables
             .iter()
-            .find(|pin| pin.table_key == effect.table_key)
+            .find(|pin| pin.identity == effect.identity)
             .expect("validated v7 key sets");
         let update = updates
             .iter()
-            .find(|update| update.table_key == effect.table_key)
+            .find(|update| update.identity == effect.identity)
             .expect("confirmed key set checked above");
-        if committed != planned
+        if pin.table_key != effect.table_key
+            || update.table_key != effect.table_key
+            || committed != planned
             || update.table_version != pin.post_commit_pin
             || update.table_branch != pin.table_branch
         {
@@ -7975,7 +8665,7 @@ pub(crate) async fn confirm_schema_apply_sidecar_v7(
     for effect in &mut confirmed_protocol.effects {
         effect.kind.set_confirmed_transaction(
             committed_transactions
-                .get(&effect.table_key)
+                .get(&effect.identity)
                 .expect("confirmed key set checked above")
                 .clone(),
         );
@@ -7983,7 +8673,7 @@ pub(crate) async fn confirm_schema_apply_sidecar_v7(
     for slot in &mut confirmed_protocol.intended_delta.table_updates {
         let update = updates
             .iter()
-            .find(|update| update.table_key == slot.table_key)
+            .find(|update| update.identity == slot.identity)
             .expect("confirmed key set checked above");
         slot.confirmed = Some(RecoveryConfirmedTableUpdate {
             table_version: update.table_version,
@@ -7995,7 +8685,7 @@ pub(crate) async fn confirm_schema_apply_sidecar_v7(
     for pin in &mut confirmed.tables {
         let update = updates
             .iter()
-            .find(|update| update.table_key == pin.table_key)
+            .find(|update| update.identity == pin.identity)
             .expect("confirmed key set checked above");
         pin.confirmed_version = Some(update.table_version);
     }
@@ -8019,8 +8709,8 @@ pub(crate) async fn confirm_schema_apply_sidecar_v7(
 /// `intended_delta.table_updates` is deliberately allowed to be a superset so
 /// pointer-only manifest updates are recovered in the same exact graph commit.
 /// Every physical output remains unconfirmed until
-/// [`confirm_branch_merge_sidecar_phase_b`] atomically binds the full delta.
-pub(crate) fn new_branch_merge_sidecar(
+/// [`confirm_branch_merge_sidecar_v9`] atomically binds the full delta.
+pub(crate) fn new_branch_merge_sidecar_v9(
     branch: Option<String>,
     actor_id: Option<String>,
     tables: Vec<SidecarTablePin>,
@@ -8035,7 +8725,7 @@ pub(crate) fn new_branch_merge_sidecar(
         Err(_) => "0".to_string(),
     };
     let sidecar = RecoverySidecar {
-        schema_version: BRANCH_MERGE_SIDECAR_SCHEMA_VERSION,
+        schema_version: IDENTITY_AWARE_SIDECAR_SCHEMA_VERSION,
         operation_id,
         started_at,
         branch,
@@ -8070,19 +8760,19 @@ pub(crate) fn new_branch_merge_sidecar(
 /// pointer-only slots with no physical effect. First-touch physical effects
 /// additionally supply the exact Lance target-ref identity minted during
 /// creation; existing-ref effects must not appear in that map.
-pub(crate) async fn confirm_branch_merge_sidecar_phase_b(
+pub(crate) async fn confirm_branch_merge_sidecar_v9(
     root_uri: &str,
     storage: &dyn StorageAdapter,
     sidecar: &mut RecoverySidecar,
     updates: &[SubTableUpdate],
-    confirmed_ref_identifiers: &HashMap<String, lance::dataset::refs::BranchIdentifier>,
+    confirmed_ref_identifiers: &HashMap<TableIdentity, lance::dataset::refs::BranchIdentifier>,
 ) -> Result<()> {
     crate::failpoints::maybe_fail(crate::failpoints::names::RECOVERY_SIDECAR_CONFIRM)?;
     let uri = sidecar_uri(root_uri, &sidecar.operation_id);
     validate_sidecar_shape(&uri, sidecar)?;
     let protocol = sidecar.protocol_v4.as_ref().ok_or_else(|| {
         OmniError::manifest_internal(
-            "confirm_branch_merge_sidecar_phase_b requires a v4 BranchMerge sidecar",
+            "confirm_branch_merge_sidecar_v9 requires a schema-v9 BranchMerge sidecar",
         )
     })?;
     if protocol.effect_phase != RecoveryEffectPhase::Armed {
@@ -8092,33 +8782,28 @@ pub(crate) async fn confirm_branch_merge_sidecar_phase_b(
         )));
     }
 
-    let update_keys: HashSet<&str> = updates
-        .iter()
-        .map(|update| update.table_key.as_str())
-        .collect();
-    let delta_keys: HashSet<&str> = protocol
+    let update_ids: HashSet<TableIdentity> = updates.iter().map(|update| update.identity).collect();
+    let delta_ids: HashSet<TableIdentity> = protocol
         .intended_delta
         .table_updates
         .iter()
-        .map(|slot| slot.table_key.as_str())
+        .map(|slot| slot.identity)
         .collect();
-    if update_keys.len() != updates.len() || update_keys != delta_keys {
+    if update_ids.len() != updates.len() || update_ids != delta_ids {
         return Err(OmniError::manifest_internal(format!(
             "BranchMerge sidecar '{}' confirmation updates differ from its complete intended delta",
             sidecar.operation_id
         )));
     }
-    let first_touch_keys: HashSet<&str> = protocol
+    let first_touch_ids: HashSet<TableIdentity> = protocol
         .effects
         .iter()
         .filter(|effect| effect.kind.source_fork_version().is_some())
-        .map(|effect| effect.table_key.as_str())
+        .map(|effect| effect.identity)
         .collect();
-    let confirmed_ref_keys: HashSet<&str> = confirmed_ref_identifiers
-        .keys()
-        .map(String::as_str)
-        .collect();
-    if confirmed_ref_keys != first_touch_keys {
+    let confirmed_ref_ids: HashSet<TableIdentity> =
+        confirmed_ref_identifiers.keys().copied().collect();
+    if confirmed_ref_ids != first_touch_ids {
         return Err(OmniError::manifest_internal(format!(
             "BranchMerge sidecar '{}' confirmed target-ref set differs from its first-touch effects",
             sidecar.operation_id
@@ -8128,9 +8813,9 @@ pub(crate) async fn confirm_branch_merge_sidecar_phase_b(
     for slot in &protocol.intended_delta.table_updates {
         let update = updates
             .iter()
-            .find(|update| update.table_key == slot.table_key)
+            .find(|update| update.identity == slot.identity)
             .expect("update/delta key sets checked above");
-        if update.table_branch != slot.table_branch {
+        if update.table_key != slot.table_key || update.table_branch != slot.table_branch {
             return Err(OmniError::manifest_internal(format!(
                 "BranchMerge sidecar '{}' table '{}' achieved output branch {:?}, planned {:?}",
                 sidecar.operation_id, slot.table_key, update.table_branch, slot.table_branch
@@ -8141,12 +8826,18 @@ pub(crate) async fn confirm_branch_merge_sidecar_phase_b(
         let pin = sidecar
             .tables
             .iter()
-            .find(|pin| pin.table_key == effect.table_key)
+            .find(|pin| pin.identity == effect.identity)
             .expect("v4 shape validated effect/pin key sets");
         let update = updates
             .iter()
-            .find(|update| update.table_key == effect.table_key)
+            .find(|update| update.identity == effect.identity)
             .expect("physical effect is a delta-slot subset");
+        if pin.table_key != effect.table_key || update.table_key != effect.table_key {
+            return Err(OmniError::manifest_internal(format!(
+                "BranchMerge sidecar '{}' identity {} has inconsistent diagnostic aliases",
+                sidecar.operation_id, effect.identity
+            )));
+        }
         let observed = observe_branch_merge_target_ref(pin).await?.ok_or_else(|| {
             OmniError::manifest_internal(format!(
                 "BranchMerge sidecar '{}' cannot confirm missing target ref for table '{}'",
@@ -8170,7 +8861,7 @@ pub(crate) async fn confirm_branch_merge_sidecar_phase_b(
                 )));
             }
             let expected_identifier = confirmed_ref_identifiers
-                .get(&effect.table_key)
+                .get(&effect.identity)
                 .expect("confirmed first-touch ref key set checked above");
             if &observed.branch_identifier != expected_identifier {
                 return Err(OmniError::manifest_internal(format!(
@@ -8248,7 +8939,7 @@ pub(crate) async fn confirm_branch_merge_sidecar_phase_b(
     for slot in &mut confirmed_protocol.intended_delta.table_updates {
         let update = updates
             .iter()
-            .find(|update| update.table_key == slot.table_key)
+            .find(|update| update.identity == slot.identity)
             .expect("update/delta key sets checked above");
         slot.confirmed = Some(RecoveryConfirmedTableUpdate {
             table_version: update.table_version,
@@ -8260,9 +8951,9 @@ pub(crate) async fn confirm_branch_merge_sidecar_phase_b(
     for effect in &mut confirmed_protocol.effects {
         let update = updates
             .iter()
-            .find(|update| update.table_key == effect.table_key)
+            .find(|update| update.identity == effect.identity)
             .expect("physical effect is a delta-slot subset");
-        let ref_identifier = confirmed_ref_identifiers.get(&effect.table_key).cloned();
+        let ref_identifier = confirmed_ref_identifiers.get(&effect.identity).cloned();
         match &mut effect.kind {
             RecoveryBranchMergeEffectKind::MultiCommitHead {
                 confirmed_version,
@@ -8283,7 +8974,7 @@ pub(crate) async fn confirm_branch_merge_sidecar_phase_b(
     for pin in &mut confirmed.tables {
         let update = updates
             .iter()
-            .find(|update| update.table_key == pin.table_key)
+            .find(|update| update.identity == pin.identity)
             .expect("effect/pin keys are delta-slot subset");
         pin.confirmed_version = Some(update.table_version);
     }
@@ -8304,6 +8995,7 @@ pub(crate) async fn confirm_branch_merge_sidecar_phase_b(
 mod tests {
     use super::*;
     use crate::storage::ObjectStorageAdapter;
+    use crate::storage_layer::IndexBuildSpec;
     use crate::table_store::TableStore;
     use arrow_array::{Array, Int32Array, RecordBatch, StringArray};
     use arrow_schema::{DataType, Field, Schema};
@@ -8332,14 +9024,36 @@ mod tests {
         .unwrap()
     }
 
-    fn make_pin(table_key: &str, table_path: &str, expected: u64, post: u64) -> SidecarTablePin {
+    fn test_identity(table_key: &str) -> TableIdentity {
+        match table_key {
+            "node:Person" => TableIdentity::new(1, 11).unwrap(),
+            "node:Company" => TableIdentity::new(2, 22).unwrap(),
+            "edge:WorksAt" => TableIdentity::new(3, 33).unwrap(),
+            other => panic!("test table '{other}' has no explicit identity"),
+        }
+    }
+
+    fn make_pin(table_key: &str, _table_path: &str, expected: u64, post: u64) -> SidecarTablePin {
+        let identity = test_identity(table_key);
         SidecarTablePin {
+            identity,
             table_key: table_key.to_string(),
-            table_path: table_path.to_string(),
+            table_path: format!(
+                "memory://test-graph/{}",
+                crate::db::manifest::table_path_for_identity(table_key, identity).unwrap()
+            ),
             expected_version: expected,
             post_commit_pin: post,
             confirmed_version: None,
             table_branch: None,
+        }
+    }
+
+    fn bind_sidecar_pins_to_root(sidecar: &mut RecoverySidecar, root: &str) {
+        for pin in &mut sidecar.tables {
+            let relative =
+                crate::db::manifest::table_path_for_identity(&pin.table_key, pin.identity).unwrap();
+            pin.table_path = format!("{}/{relative}", root.trim_end_matches('/'));
         }
     }
 
@@ -8352,7 +9066,8 @@ mod tests {
 
     fn occ_sidecar() -> RecoverySidecar {
         let planned = transaction(5, "planned-transaction");
-        new_occ_sidecar(
+        let identity = test_identity("node:Person");
+        new_occ_sidecar_v9(
             SidecarKind::Mutation,
             None,
             Some("act-alice".to_string()),
@@ -8360,6 +9075,7 @@ mod tests {
             RecoveryAuthorityToken {
                 branch_identifier: lance::dataset::refs::BranchIdentifier::main(),
                 graph_head: Some("01H000000000000000000000AA".to_string()),
+                schema_identity_domain: "domain-a".to_string(),
                 schema_ir_hash: "schema-hash".to_string(),
                 schema_identity_version: 1,
             },
@@ -8370,7 +9086,7 @@ mod tests {
                 merged_parent_commit_id: None,
                 created_at: 123,
             },
-            HashMap::from([("node:Person".to_string(), planned)]),
+            HashMap::from([(identity, planned)]),
         )
         .unwrap()
     }
@@ -8386,26 +9102,113 @@ mod tests {
 
     #[test]
     fn sidecar_round_trips_through_json() {
-        let original = new_sidecar(
-            SidecarKind::Mutation,
-            Some("main".to_string()),
-            Some("act-alice".to_string()),
-            vec![make_pin("node:Person", "file:///tmp/people.lance", 5, 6)],
-        );
+        let original = new_optimize_sidecar_v9(vec![make_pin(
+            "node:Person",
+            "file:///tmp/people.lance",
+            5,
+            6,
+        )])
+        .unwrap();
         let json = serde_json::to_string(&original).unwrap();
         let parsed = parse_sidecar("file:///tmp/__recovery/x.json", &json).unwrap();
-        assert_eq!(parsed.schema_version, LEGACY_SIDECAR_SCHEMA_VERSION);
+        assert_eq!(parsed.schema_version, IDENTITY_AWARE_SIDECAR_SCHEMA_VERSION);
         assert_eq!(parsed.operation_id, original.operation_id);
-        assert_eq!(parsed.writer_kind, SidecarKind::Mutation);
-        assert_eq!(parsed.branch.as_deref(), Some("main"));
-        assert_eq!(parsed.actor_id.as_deref(), Some("act-alice"));
+        assert_eq!(parsed.writer_kind, SidecarKind::Optimize);
+        assert_eq!(parsed.branch, None);
+        assert_eq!(parsed.actor_id, None);
         assert_eq!(parsed.tables.len(), 1);
         assert_eq!(parsed.tables[0].table_key, "node:Person");
     }
 
     #[test]
+    fn pre_v9_sidecars_missing_identity_fail_closed() {
+        for schema_version in [MUTATION_LOAD_SIDECAR_SCHEMA_VERSION, 8] {
+            let mut value = serde_json::to_value(occ_sidecar()).unwrap();
+            value["schema_version"] = serde_json::json!(schema_version);
+            value["tables"][0]
+                .as_object_mut()
+                .unwrap()
+                .remove("identity");
+            let error = parse_sidecar(
+                &format!("memory://graph/__recovery/pre-v9-{schema_version}.json"),
+                &serde_json::to_string(&value).unwrap(),
+            )
+            .expect_err("a pre-v9 artifact without explicit identity must never be inferred");
+            assert!(
+                error.to_string().contains("missing field `identity`"),
+                "expected missing-identity refusal, got: {error}"
+            );
+        }
+    }
+
+    #[test]
+    fn schema_apply_v9_round_trips_metadata_only_rename_with_fixed_occ() {
+        let identity = test_identity("node:Person");
+        let path = crate::db::manifest::table_path_for_identity("node:Person", identity).unwrap();
+        let sidecar = new_schema_apply_sidecar_v9(
+            Some("act-schema".to_string()),
+            Vec::new(),
+            RecoveryAuthorityToken {
+                branch_identifier: lance::dataset::refs::BranchIdentifier::main(),
+                graph_head: Some("01H000000000000000000000R0".to_string()),
+                schema_identity_domain: "domain-a".to_string(),
+                schema_ir_hash: "accepted-schema".to_string(),
+                schema_identity_version: 1,
+            },
+            RecoveryLineageIntent {
+                graph_commit_id: "01H000000000000000000000R1".to_string(),
+                branch: None,
+                actor_id: Some("act-schema".to_string()),
+                merged_parent_commit_id: None,
+                created_at: 790,
+            },
+            Vec::new(),
+            RecoveryManifestDelta {
+                table_updates: Vec::new(),
+                registrations: Vec::new(),
+                renames: vec![SidecarTableRename {
+                    identity,
+                    expected_table_key: "node:Person".to_string(),
+                    expected_version: 5,
+                    table_key: "node:Human".to_string(),
+                    table_path: path.clone(),
+                }],
+                tombstones: Vec::new(),
+            },
+            "target-schema".to_string(),
+        )
+        .unwrap();
+
+        let json = serde_json::to_string(&sidecar).unwrap();
+        let parsed = parse_sidecar("memory://graph/__recovery/rename-v9.json", &json).unwrap();
+        let rename = &parsed.protocol_v7.as_ref().unwrap().intended_delta.renames[0];
+        assert_eq!(rename.identity, identity);
+        assert_eq!(rename.expected_version, 5);
+        assert_eq!(rename.table_path, path);
+        assert!(parsed.tables.is_empty());
+
+        let mut missing_occ = sidecar;
+        missing_occ
+            .protocol_v7
+            .as_mut()
+            .unwrap()
+            .intended_delta
+            .renames[0]
+            .expected_version = 0;
+        let error = validate_sidecar_shape("<rename-without-occ>", &missing_occ)
+            .expect_err("metadata-only rename must carry fixed table-version authority");
+        assert!(error.to_string().contains("live expected version"));
+    }
+
+    #[test]
     fn schema_apply_confirmation_fields_are_version_gated() {
-        let legacy = new_sidecar(SidecarKind::SchemaApply, None, None, Vec::new());
+        let legacy = new_unvalidated_sidecar(
+            LEGACY_SIDECAR_SCHEMA_VERSION,
+            SidecarKind::SchemaApply,
+            None,
+            None,
+            Vec::new(),
+        );
         let legacy_json = serde_json::to_string(&legacy).unwrap();
         parse_sidecar("file:///tmp/__recovery/legacy-schema.json", &legacy_json)
             .expect("plain schema-v2 SchemaApply remains readable");
@@ -8429,7 +9232,8 @@ mod tests {
     #[test]
     fn schema_apply_v7_sidecar_round_trips_exact_first_touch_envelope() {
         let planned = transaction(0, "schema-create-company");
-        let sidecar = new_schema_apply_sidecar_v7(
+        let identity = test_identity("node:Company");
+        let sidecar = new_schema_apply_sidecar_v9(
             Some("act-schema".to_string()),
             vec![make_pin(
                 "node:Company",
@@ -8440,6 +9244,7 @@ mod tests {
             RecoveryAuthorityToken {
                 branch_identifier: lance::dataset::refs::BranchIdentifier::main(),
                 graph_head: Some("01H000000000000000000000S0".to_string()),
+                schema_identity_domain: "domain-a".to_string(),
                 schema_ir_hash: "accepted-schema".to_string(),
                 schema_identity_version: 1,
             },
@@ -8451,6 +9256,7 @@ mod tests {
                 created_at: 789,
             },
             vec![RecoverySchemaApplyEffect {
+                identity,
                 table_key: "node:Company".to_string(),
                 kind: RecoverySchemaApplyEffectKind::FirstTouchDataset {
                     planned_transaction: planned,
@@ -8459,29 +9265,39 @@ mod tests {
             }],
             RecoveryManifestDelta {
                 table_updates: vec![RecoveryTableUpdateSlot {
+                    identity,
                     table_key: "node:Company".to_string(),
                     expected_version: 0,
                     table_branch: None,
                     confirmed: None,
                 }],
                 registrations: vec![SidecarTableRegistration {
+                    identity,
                     table_key: "node:Company".to_string(),
-                    table_path: "nodes/company".to_string(),
+                    table_path: crate::db::manifest::table_path_for_identity(
+                        "node:Company",
+                        identity,
+                    )
+                    .unwrap(),
                     table_branch: None,
                 }],
+                renames: Vec::new(),
                 tombstones: Vec::new(),
             },
             "target-schema".to_string(),
         )
         .unwrap();
 
-        assert_eq!(sidecar.schema_version, SCHEMA_APPLY_EXACT_SCHEMA_VERSION);
+        assert_eq!(
+            sidecar.schema_version,
+            IDENTITY_AWARE_SIDECAR_SCHEMA_VERSION
+        );
         assert_eq!(
             sidecar.protocol_v7.as_ref().unwrap().effect_phase,
             RecoveryEffectPhase::Armed
         );
         let json = serde_json::to_string(&sidecar).unwrap();
-        let parsed = parse_sidecar("memory://graph/__recovery/schema-v7.json", &json).unwrap();
+        let parsed = parse_sidecar("memory://graph/__recovery/schema-v9.json", &json).unwrap();
         assert_eq!(parsed.actor_id.as_deref(), Some("act-schema"));
 
         let mut missing_registration = sidecar;
@@ -8500,7 +9316,8 @@ mod tests {
     #[test]
     fn ensure_indices_fixed_rollback_is_version_gated() {
         let pin = make_pin("node:Person", "file:///tmp/people.lance", 5, 6);
-        let legacy = new_sidecar(
+        let legacy = new_unvalidated_sidecar(
+            LEGACY_SIDECAR_SCHEMA_VERSION,
             SidecarKind::EnsureIndices,
             Some("feature".to_string()),
             None,
@@ -8510,7 +9327,8 @@ mod tests {
         parse_sidecar("file:///tmp/__recovery/legacy-index.json", &legacy_json)
             .expect("plain schema-v2 EnsureIndices remains readable");
 
-        let current = new_ensure_indices_sidecar(Some("feature".to_string()), vec![pin]).unwrap();
+        let current =
+            new_ensure_indices_sidecar_v6(Some("feature".to_string()), vec![pin]).unwrap();
         assert_eq!(
             current.schema_version,
             ENSURE_INDICES_ROLLBACK_SCHEMA_VERSION
@@ -8532,18 +9350,21 @@ mod tests {
     }
 
     #[test]
-    fn ensure_indices_v8_round_trips_existing_and_first_touch_effects() {
+    fn ensure_indices_v9_round_trips_existing_and_first_touch_effects() {
         let mut existing = make_pin("node:Person", "file:///tmp/people.lance", 5, 6);
         existing.table_branch = Some("feature".to_string());
         let mut first_touch = make_pin("node:Company", "file:///tmp/companies.lance", 3, 4);
         first_touch.table_branch = Some("feature".to_string());
-        let sidecar = new_ensure_indices_sidecar_v8(
+        let person_identity = existing.identity;
+        let company_identity = first_touch.identity;
+        let sidecar = new_ensure_indices_sidecar_v9(
             Some("feature".to_string()),
             None,
             vec![existing, first_touch],
             RecoveryAuthorityToken {
                 branch_identifier: test_branch_identifier(8, "graph-feature"),
                 graph_head: Some("01H000000000000000000000I0".to_string()),
+                schema_identity_domain: "domain-a".to_string(),
                 schema_ir_hash: "schema-hash".to_string(),
                 schema_identity_version: 1,
             },
@@ -8555,14 +9376,17 @@ mod tests {
                 created_at: 456,
             },
             HashMap::from([
-                ("node:Person".to_string(), transaction(5, "index-person")),
-                ("node:Company".to_string(), transaction(3, "index-company")),
+                (person_identity, transaction(5, "index-person")),
+                (company_identity, transaction(3, "index-company")),
             ]),
-            HashMap::from([("node:Company".to_string(), 3)]),
+            HashMap::from([(company_identity, 3)]),
         )
         .unwrap();
 
-        assert_eq!(sidecar.schema_version, ENSURE_INDICES_EXACT_SCHEMA_VERSION);
+        assert_eq!(
+            sidecar.schema_version,
+            IDENTITY_AWARE_SIDECAR_SCHEMA_VERSION
+        );
         assert!(sidecar.ensure_indices_rollback_v6.is_none());
         let protocol = sidecar.protocol_v8.as_ref().unwrap();
         assert_eq!(protocol.effect_phase, RecoveryEffectPhase::Armed);
@@ -8586,8 +9410,8 @@ mod tests {
             Some(3)
         );
         let json = serde_json::to_string(&sidecar).unwrap();
-        parse_sidecar("file:///tmp/__recovery/index-v8.json", &json)
-            .expect("schema-v8 exact EnsureIndices sidecar round-trips");
+        parse_sidecar("file:///tmp/__recovery/index-v9.json", &json)
+            .expect("schema-v9 exact EnsureIndices sidecar round-trips");
 
         let mut wrong_fork = sidecar;
         wrong_fork
@@ -8609,7 +9433,7 @@ mod tests {
         let original = occ_sidecar();
         assert_eq!(
             original.schema_version,
-            MUTATION_LOAD_SIDECAR_SCHEMA_VERSION
+            IDENTITY_AWARE_SIDECAR_SCHEMA_VERSION
         );
         let protocol = original.protocol_v3.as_ref().unwrap();
         assert_eq!(protocol.effect_phase, RecoveryEffectPhase::Armed);
@@ -8648,8 +9472,8 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn branch_merge_v4_arms_multi_commit_ref_only_and_pointer_slots() {
-        let root = "mem-root";
+    async fn branch_merge_v9_arms_multi_commit_ref_only_and_pointer_slots() {
+        let root = "test-graph";
         let storage = ObjectStorageAdapter::in_memory();
         let target_identifier = test_branch_identifier(3, "target-incarnation");
         let lineage = RecoveryLineageIntent {
@@ -8663,8 +9487,12 @@ mod tests {
         multi_pin.table_branch = Some("target".to_string());
         let mut ref_pin = make_pin("node:Company", "memory://company", 4, 8);
         ref_pin.table_branch = Some("target".to_string());
+        let person_identity = multi_pin.identity;
+        let company_identity = ref_pin.identity;
+        let works_at_identity = test_identity("edge:WorksAt");
         let effects = vec![
             RecoveryBranchMergeEffect {
+                identity: person_identity,
                 table_key: "node:Person".to_string(),
                 kind: RecoveryBranchMergeEffectKind::MultiCommitHead {
                     source_fork_version: Some(5),
@@ -8677,6 +9505,7 @@ mod tests {
                 },
             },
             RecoveryBranchMergeEffect {
+                identity: company_identity,
                 table_key: "node:Company".to_string(),
                 kind: RecoveryBranchMergeEffectKind::RefOnlyFork {
                     // Deliberately differs from the target manifest CAS pin (4):
@@ -8689,12 +9518,14 @@ mod tests {
         let intended_delta = RecoveryManifestDelta {
             table_updates: vec![
                 RecoveryTableUpdateSlot {
+                    identity: person_identity,
                     table_key: "node:Person".to_string(),
                     expected_version: 5,
                     table_branch: Some("target".to_string()),
                     confirmed: None,
                 },
                 RecoveryTableUpdateSlot {
+                    identity: company_identity,
                     table_key: "node:Company".to_string(),
                     expected_version: 4,
                     table_branch: Some("target".to_string()),
@@ -8703,6 +9534,7 @@ mod tests {
                 // No physical effect/pin: recovery must still publish this
                 // pointer-only output in the same fixed merge commit.
                 RecoveryTableUpdateSlot {
+                    identity: works_at_identity,
                     table_key: "edge:WorksAt".to_string(),
                     expected_version: 2,
                     table_branch: None,
@@ -8710,15 +9542,17 @@ mod tests {
                 },
             ],
             registrations: Vec::new(),
+            renames: Vec::new(),
             tombstones: Vec::new(),
         };
-        let sidecar = new_branch_merge_sidecar(
+        let mut sidecar = new_branch_merge_sidecar_v9(
             Some("target".to_string()),
             Some("act-merge".to_string()),
             vec![multi_pin, ref_pin],
             RecoveryAuthorityToken {
                 branch_identifier: target_identifier,
                 graph_head: Some("01H000000000000000000000T1".to_string()),
+                schema_identity_domain: "domain-a".to_string(),
                 schema_ir_hash: "schema-hash".to_string(),
                 schema_identity_version: 1,
             },
@@ -8727,7 +9561,11 @@ mod tests {
             intended_delta,
         )
         .unwrap();
-        assert_eq!(sidecar.schema_version, BRANCH_MERGE_SIDECAR_SCHEMA_VERSION);
+        bind_sidecar_pins_to_root(&mut sidecar, root);
+        assert_eq!(
+            sidecar.schema_version,
+            IDENTITY_AWARE_SIDECAR_SCHEMA_VERSION
+        );
         assert!(sidecar.protocol_v3.is_none());
         assert_eq!(
             sidecar.protocol_v4.as_ref().unwrap().effect_phase,
@@ -8745,6 +9583,25 @@ mod tests {
         planned_transactions[1].read_version = 9;
         let error = validate_sidecar_shape("<non-sequential>", &non_sequential).unwrap_err();
         assert!(error.to_string().contains("expected 6"));
+
+        let mut oversized = sidecar.clone();
+        let RecoveryBranchMergeEffectKind::MultiCommitHead {
+            planned_transactions,
+            ..
+        } = &mut oversized.protocol_v4.as_mut().unwrap().effects[0].kind
+        else {
+            panic!("first effect must be multi-commit")
+        };
+        *planned_transactions = (0..=MAX_BRANCH_MERGE_DATA_TRANSACTIONS)
+            .map(|offset| transaction(5 + offset, &format!("merge-person-{offset}")))
+            .collect();
+        let error = validate_sidecar_shape("<oversized-chain>", &oversized).unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("exceeding the recovery-safe limit of 1024"),
+            "unexpected oversized-chain error: {error}"
+        );
 
         let mut mismatched_slot = sidecar.clone();
         mismatched_slot
@@ -8767,7 +9624,7 @@ mod tests {
         assert_eq!(listed.len(), 1);
         assert_eq!(
             listed[0].schema_version,
-            BRANCH_MERGE_SIDECAR_SCHEMA_VERSION
+            IDENTITY_AWARE_SIDECAR_SCHEMA_VERSION
         );
     }
 
@@ -8781,6 +9638,78 @@ mod tests {
         )
         .unwrap_err();
         assert!(error.to_string().contains("missing required protocol_v3"));
+    }
+
+    #[test]
+    fn parse_sidecar_refuses_mutation_with_multiple_writer_protocols() {
+        let mut sidecar = occ_sidecar();
+        let protocol_v3 = sidecar.protocol_v3.as_ref().unwrap();
+        sidecar.protocol_v7 = Some(RecoveryProtocolV7 {
+            authority: protocol_v3.authority.clone(),
+            lineage: protocol_v3.lineage.clone(),
+            rollback_graph_commit_id: "01H000000000000000000000BC".to_string(),
+            rollback_audit_outcomes: None,
+            target_schema_ir_hash: "foreign-schema-payload".to_string(),
+            effect_phase: RecoveryEffectPhase::Armed,
+            effects: Vec::new(),
+            intended_delta: RecoveryManifestDelta {
+                table_updates: Vec::new(),
+                registrations: Vec::new(),
+                renames: Vec::new(),
+                tombstones: Vec::new(),
+            },
+        });
+
+        let error = parse_sidecar(
+            "memory://graph/__recovery/multi-protocol.json",
+            &serde_json::to_string(&sidecar).unwrap(),
+        )
+        .expect_err("a v9 Mutation must not dispatch through a foreign payload");
+        assert!(
+            error
+                .to_string()
+                .contains("must carry only the protocol_v3 writer payload"),
+            "unexpected malformed-sidecar error: {error}"
+        );
+    }
+
+    #[tokio::test]
+    async fn identity_aware_sidecar_refuses_foreign_graph_root() {
+        let root = "own-graph";
+        let storage = ObjectStorageAdapter::in_memory();
+        let sidecar = occ_sidecar();
+        let uri = sidecar_uri(root, &sidecar.operation_id);
+        storage
+            .write_text(&uri, &serde_json::to_string(&sidecar).unwrap())
+            .await
+            .unwrap();
+
+        let error = list_sidecars(root, &storage)
+            .await
+            .expect_err("v9 recovery must never accept another graph's canonical table URI");
+        assert!(
+            error.to_string().contains("foreign or non-canonical URI"),
+            "unexpected foreign-root error: {error}"
+        );
+
+        storage.delete(&uri).await.unwrap();
+        let legacy = new_unvalidated_sidecar(
+            LEGACY_SIDECAR_SCHEMA_VERSION,
+            SidecarKind::Optimize,
+            None,
+            None,
+            vec![make_pin("node:Person", "memory://foreign", 5, 6)],
+        );
+        let legacy_uri = sidecar_uri(root, &legacy.operation_id);
+        storage
+            .write_text(&legacy_uri, &serde_json::to_string(&legacy).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(
+            list_sidecars(root, &storage).await.unwrap().len(),
+            1,
+            "legacy sidecars retain their historical path interpretation"
+        );
     }
 
     #[test]
@@ -8842,6 +9771,7 @@ mod tests {
         let root = dir.path().to_str().unwrap();
         let storage = ObjectStorageAdapter::local();
         let mut sidecar = occ_sidecar();
+        bind_sidecar_pins_to_root(&mut sidecar, root);
         write_sidecar(root, &storage, &sidecar).await.unwrap();
 
         let version_metadata: crate::db::manifest::TableVersionMetadata =
@@ -8853,6 +9783,7 @@ mod tests {
             }))
             .unwrap();
         let updates = vec![SubTableUpdate {
+            identity: test_identity("node:Person"),
             table_key: "node:Person".to_string(),
             table_version: 6,
             table_branch: None,
@@ -8860,14 +9791,14 @@ mod tests {
             version_metadata,
         }];
         let committed = HashMap::from([(
-            "node:Person".to_string(),
+            test_identity("node:Person"),
             transaction(5, "planned-transaction"),
         )]);
         let rebased = HashMap::from([(
-            "node:Person".to_string(),
+            test_identity("node:Person"),
             transaction(6, "planned-transaction"),
         )]);
-        let error = confirm_occ_sidecar_phase_b(root, &storage, &mut sidecar, &updates, &rebased)
+        let error = confirm_occ_sidecar_v9(root, &storage, &mut sidecar, &updates, &rebased)
             .await
             .unwrap_err();
         assert!(error.to_string().contains("leaving recovery Armed"));
@@ -8875,7 +9806,7 @@ mod tests {
             sidecar.protocol_v3.as_ref().unwrap().effect_phase,
             RecoveryEffectPhase::Armed
         );
-        confirm_occ_sidecar_phase_b(root, &storage, &mut sidecar, &updates, &committed)
+        confirm_occ_sidecar_v9(root, &storage, &mut sidecar, &updates, &committed)
             .await
             .unwrap();
 
@@ -9452,6 +10383,87 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn branch_merge_v4_accepts_only_one_derived_index_tail() {
+        let dir = tempfile::tempdir().unwrap();
+        let uri = format!("{}/people.lance", dir.path().to_str().unwrap());
+        let store = TableStore::new(
+            dir.path().to_str().unwrap(),
+            Arc::new(lance::session::Session::default()),
+        );
+        let ds = TableStore::write_dataset(&uri, person_batch(&[("alice", Some(30))]))
+            .await
+            .unwrap();
+        let staged = store
+            .stage_append(&ds, person_batch(&[("bob", Some(25))]), &[])
+            .await
+            .unwrap();
+        let planned = staged.transaction_identity();
+        let (after_data, committed) = store
+            .commit_staged_exact(Arc::new(ds), staged)
+            .await
+            .unwrap();
+        assert_eq!(committed, planned);
+
+        let index = store
+            .stage_create_indices(
+                &after_data,
+                &[IndexBuildSpec::BTree {
+                    column: "id".to_string(),
+                }],
+            )
+            .await
+            .unwrap();
+        let (after_one_index, _) = store
+            .commit_staged_exact(Arc::new(after_data), index)
+            .await
+            .unwrap();
+        let observation = BranchMergeRefObservation {
+            version: after_one_index.version().version,
+            branch_identifier: after_one_index.branch_identifier().await.unwrap(),
+            parent_version: None,
+            dataset: after_one_index.clone(),
+        };
+        let proof = prove_branch_merge_multi_commit_effect(
+            &observation,
+            &[planned.clone()],
+            1,
+            "node:Person",
+        )
+        .await
+        .unwrap();
+        assert_eq!(proof.effect_ownership, EffectOwnership::OwnAtHead);
+        assert!(proof.full_effect_at_head);
+        drop(observation);
+
+        let second_index = store
+            .stage_create_indices(
+                &after_one_index,
+                &[IndexBuildSpec::BTree {
+                    column: "age".to_string(),
+                }],
+            )
+            .await
+            .unwrap();
+        let (after_two_indices, _) = store
+            .commit_staged_exact(Arc::new(after_one_index), second_index)
+            .await
+            .unwrap();
+        let observation = BranchMergeRefObservation {
+            version: after_two_indices.version().version,
+            branch_identifier: after_two_indices.branch_identifier().await.unwrap(),
+            parent_version: None,
+            dataset: after_two_indices,
+        };
+        let proof =
+            prove_branch_merge_multi_commit_effect(&observation, &[planned], 1, "node:Person")
+                .await
+                .unwrap();
+        assert_eq!(proof.effect_ownership, EffectOwnership::Unverifiable);
+        assert!(!proof.full_effect_at_head);
+        assert!(proof.unsafe_reason.is_some());
+    }
+
+    #[tokio::test]
     async fn exact_preflight_rebase_recovery_preserves_published_winner() {
         // Lance may preflight-rebase an Append even when CommitBuilder's retry
         // budget is zero. Reproduce the exact availability hazard:
@@ -9503,6 +10515,7 @@ node Person {
         let authority = RecoveryAuthorityToken {
             branch_identifier: txn.authority.branch_identifier.clone(),
             graph_head: txn.authority.graph_head.clone(),
+            schema_identity_domain: txn.authority.schema_identity_domain.clone(),
             schema_ir_hash: txn.authority.schema_ir_hash.clone(),
             schema_identity_version: txn.authority.schema_identity_version,
         };
@@ -9513,11 +10526,12 @@ node Person {
             merged_parent_commit_id: lineage.merged_parent_commit_id,
             created_at: lineage.created_at,
         };
-        let sidecar = new_occ_sidecar(
+        let sidecar = new_occ_sidecar_v9(
             SidecarKind::Mutation,
             None,
             None,
             vec![SidecarTablePin {
+                identity: entry.identity,
                 table_key: "node:Person".to_string(),
                 table_path: table_uri.clone(),
                 expected_version: planned.read_version,
@@ -9527,7 +10541,7 @@ node Person {
             }],
             authority,
             recovery_lineage,
-            HashMap::from([("node:Person".to_string(), planned.clone())]),
+            HashMap::from([(entry.identity, planned.clone())]),
         )
         .unwrap();
         write_sidecar(root, db.storage_adapter(), &sidecar)
@@ -9653,6 +10667,7 @@ node Company { age: I32? }
         let authority = RecoveryAuthorityToken {
             branch_identifier: txn.authority.branch_identifier.clone(),
             graph_head: txn.authority.graph_head.clone(),
+            schema_identity_domain: txn.authority.schema_identity_domain.clone(),
             schema_ir_hash: txn.authority.schema_ir_hash.clone(),
             schema_identity_version: txn.authority.schema_identity_version,
         };
@@ -9663,12 +10678,13 @@ node Company { age: I32? }
             merged_parent_commit_id: lineage.merged_parent_commit_id,
             created_at: lineage.created_at,
         };
-        let sidecar = new_occ_sidecar(
+        let sidecar = new_occ_sidecar_v9(
             SidecarKind::Mutation,
             None,
             None,
             vec![
                 SidecarTablePin {
+                    identity: person_entry.identity,
                     table_key: "node:Person".to_string(),
                     table_path: person_uri,
                     expected_version: person_entry.table_version,
@@ -9677,6 +10693,7 @@ node Company { age: I32? }
                     table_branch: person_entry.table_branch,
                 },
                 SidecarTablePin {
+                    identity: company_entry.identity,
                     table_key: "node:Company".to_string(),
                     table_path: company_uri,
                     expected_version: company_entry.table_version,
@@ -9688,8 +10705,8 @@ node Company { age: I32? }
             authority,
             recovery_lineage,
             HashMap::from([
-                ("node:Person".to_string(), person_planned.clone()),
-                ("node:Company".to_string(), company_planned),
+                (person_entry.identity, person_planned.clone()),
+                (company_entry.identity, company_planned),
             ]),
         )
         .unwrap();
@@ -9820,11 +10837,12 @@ node Person { age: I32? }
             .table_version;
         assert_eq!(winner_version, planned.read_version + 1);
 
-        let sidecar = new_occ_sidecar(
+        let sidecar = new_occ_sidecar_v9(
             SidecarKind::Mutation,
             None,
             None,
             vec![SidecarTablePin {
+                identity: entry.identity,
                 table_key: "node:Person".to_string(),
                 table_path: table_uri.clone(),
                 expected_version: planned.read_version,
@@ -9835,6 +10853,7 @@ node Person { age: I32? }
             RecoveryAuthorityToken {
                 branch_identifier: txn.authority.branch_identifier.clone(),
                 graph_head: txn.authority.graph_head.clone(),
+                schema_identity_domain: txn.authority.schema_identity_domain.clone(),
                 schema_ir_hash: txn.authority.schema_ir_hash.clone(),
                 schema_identity_version: txn.authority.schema_identity_version,
             },
@@ -9845,7 +10864,7 @@ node Person { age: I32? }
                 merged_parent_commit_id: lineage.merged_parent_commit_id,
                 created_at: lineage.created_at,
             },
-            HashMap::from([("node:Person".to_string(), planned.clone())]),
+            HashMap::from([(entry.identity, planned.clone())]),
         )
         .unwrap();
         let operation_id = sidecar.operation_id.clone();
@@ -9956,12 +10975,10 @@ node Person { age: I32? }
         let storage = ObjectStorageAdapter::local();
         let root = dir.path().to_str().unwrap();
 
-        let sidecar = new_sidecar(
-            SidecarKind::Mutation,
-            Some("main".to_string()),
-            Some("act-alice".to_string()),
-            vec![make_pin("node:Person", "file:///tmp/x.lance", 5, 6)],
-        );
+        let mut sidecar =
+            new_optimize_sidecar_v9(vec![make_pin("node:Person", "file:///tmp/x.lance", 5, 6)])
+                .unwrap();
+        bind_sidecar_pins_to_root(&mut sidecar, root);
         let handle = write_sidecar(root, &storage, &sidecar).await.unwrap();
         assert_eq!(handle.operation_id, sidecar.operation_id);
 
@@ -9983,15 +11000,12 @@ node Person { age: I32? }
         // invariant against a future divergence between the two filters.
         let dir = tempfile::tempdir().unwrap();
         let storage = ObjectStorageAdapter::local();
-        let mut sidecar = new_sidecar(
-            SidecarKind::BranchMerge,
-            Some("main".to_string()),
-            None,
-            vec![make_pin("node:Person", "file:///tmp/x.lance", 5, 6)],
-        );
+        let mut sidecar =
+            new_optimize_sidecar_v9(vec![make_pin("node:Person", "file:///tmp/x.lance", 5, 6)])
+                .unwrap();
         // The confirmed-versions map does NOT cover the pinned table.
-        let confirmed: HashMap<String, u64> = HashMap::new();
-        let err = confirm_sidecar_phase_b(
+        let confirmed: HashMap<TableIdentity, u64> = HashMap::new();
+        let err = confirm_sidecar_phase_b_v9(
             dir.path().to_str().unwrap(),
             &storage,
             &mut sidecar,
@@ -10044,15 +11058,13 @@ node Person { age: I32? }
             "01H000000000000000000000AA",
         ];
         for id in &ids {
-            let sc = new_sidecar(
-                SidecarKind::Mutation,
-                None,
-                None,
-                vec![make_pin("node:Person", "/dev/null/x.lance", 1, 2)],
-            );
+            let sc =
+                new_optimize_sidecar_v9(vec![make_pin("node:Person", "/dev/null/x.lance", 1, 2)])
+                    .unwrap();
             // Override operation_id to use our deterministic ID.
             let mut sc = sc;
             sc.operation_id = id.to_string();
+            bind_sidecar_pins_to_root(&mut sc, root);
             write_sidecar(root, &storage, &sc).await.unwrap();
         }
 

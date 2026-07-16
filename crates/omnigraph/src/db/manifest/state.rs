@@ -8,15 +8,16 @@ use lance::Dataset;
 
 use crate::error::{OmniError, Result};
 
-use super::layout::version_object_id;
+use super::layout::{table_object_id, version_object_id};
 use super::metadata::TableVersionMetadata;
 use super::{
     MAIN_BRANCH_HEAD_KEY, OBJECT_TYPE_GRAPH_COMMIT, OBJECT_TYPE_GRAPH_HEAD, OBJECT_TYPE_TABLE,
-    OBJECT_TYPE_TABLE_TOMBSTONE, OBJECT_TYPE_TABLE_VERSION,
+    OBJECT_TYPE_TABLE_TOMBSTONE, OBJECT_TYPE_TABLE_VERSION, TableIdentity, TableRegistration,
 };
 
 #[derive(Debug, Clone)]
 pub struct SubTableEntry {
+    pub(crate) identity: TableIdentity,
     pub table_key: String,
     pub table_path: String,
     pub table_version: u64,
@@ -38,6 +39,7 @@ pub(super) struct ManifestState {
 
 #[derive(Debug, Clone)]
 struct TableTombstoneEntry {
+    identity: TableIdentity,
     table_key: String,
     tombstone_version: u64,
 }
@@ -89,7 +91,7 @@ pub(crate) fn graph_head_object_id(branch: Option<&str>) -> String {
 
 #[derive(Debug, Clone)]
 struct ManifestScan {
-    table_locations: HashMap<String, String>,
+    table_registrations: HashMap<TableIdentity, TableRegistration>,
     version_entries: Vec<SubTableEntry>,
     tombstones: Vec<TableTombstoneEntry>,
     /// Graph-lineage `graph_commit` rows, collected in the SAME pass only when
@@ -129,6 +131,8 @@ pub(super) fn manifest_schema() -> SchemaRef {
             true,
         ),
         Field::new("table_key", DataType::Utf8, false),
+        Field::new("stable_table_id", DataType::UInt64, true),
+        Field::new("table_incarnation_id", DataType::UInt64, true),
         Field::new("table_version", DataType::UInt64, true),
         Field::new("table_branch", DataType::Utf8, true),
         Field::new("row_count", DataType::UInt64, true),
@@ -139,46 +143,49 @@ pub(super) async fn read_manifest_state(dataset: &Dataset) -> Result<ManifestSta
     let version = dataset.version().version;
     // The table-state hot path never needs lineage, so don't pay its JSON decode.
     let scan = read_manifest_scan(dataset, false).await?;
-    Ok(assemble_manifest_state(
+    assemble_manifest_state(
         version,
+        scan.table_registrations,
         scan.version_entries,
         scan.tombstones
             .into_iter()
-            .map(|t| (t.table_key, t.tombstone_version)),
+            .map(|t| (t.identity, t.tombstone_version)),
         scan.graph_heads,
-    ))
+    )
 }
 
 /// Reduce raw manifest rows to the visible per-table state: keep the latest
-/// `table_version` per `table_key`, drop any whose latest version is sealed by a
+/// `table_version` per immutable table identity, drop any whose latest version
+/// is sealed by a
 /// tombstone (`tombstone_version >= table_version`), then sort by `table_key` for
 /// deterministic output. Shared by the scan path (`read_manifest_state`) and the
 /// in-memory post-publish fold in the publisher (RFC-013 PR2 #1b), so the two
 /// CANNOT diverge in the dedup/filter/sort — the byte-identity the fold relies on.
-/// Tombstones are passed as `(table_key, tombstone_version)` tuples so callers
+/// Tombstones are passed as `(identity, tombstone_version)` tuples so callers
 /// outside this module need not name the private `TableTombstoneEntry`.
 pub(super) fn assemble_manifest_state(
     version: u64,
+    registrations: HashMap<TableIdentity, TableRegistration>,
     version_entries: Vec<SubTableEntry>,
-    tombstones: impl IntoIterator<Item = (String, u64)>,
+    tombstones: impl IntoIterator<Item = (TableIdentity, u64)>,
     graph_heads: HashMap<String, String>,
-) -> ManifestState {
-    let mut latest_versions = HashMap::<String, SubTableEntry>::new();
+) -> Result<ManifestState> {
+    let mut latest_versions = HashMap::<TableIdentity, SubTableEntry>::new();
     for entry in version_entries {
-        match latest_versions.get(&entry.table_key) {
+        match latest_versions.get(&entry.identity) {
             Some(existing) if existing.table_version >= entry.table_version => {}
             _ => {
-                latest_versions.insert(entry.table_key.clone(), entry);
+                latest_versions.insert(entry.identity, entry);
             }
         }
     }
 
-    let mut tombstone_map = HashMap::<String, u64>::new();
-    for (table_key, tombstone_version) in tombstones {
-        match tombstone_map.get(&table_key) {
+    let mut tombstone_map = HashMap::<TableIdentity, u64>::new();
+    for (identity, tombstone_version) in tombstones {
+        match tombstone_map.get(&identity) {
             Some(existing) if *existing >= tombstone_version => {}
             _ => {
-                tombstone_map.insert(table_key, tombstone_version);
+                tombstone_map.insert(identity, tombstone_version);
             }
         }
     }
@@ -187,17 +194,40 @@ pub(super) fn assemble_manifest_state(
         .into_values()
         .filter(|entry| {
             tombstone_map
-                .get(&entry.table_key)
+                .get(&entry.identity)
                 .map(|tombstone_version| *tombstone_version < entry.table_version)
                 .unwrap_or(true)
         })
-        .collect();
+        .map(|mut entry| {
+            let registration = registrations.get(&entry.identity).ok_or_else(|| {
+                OmniError::manifest_internal(format!(
+                    "manifest missing table row for identity {} (version row alias '{}')",
+                    entry.identity, entry.table_key
+                ))
+            })?;
+            entry.table_key = registration.table_key.clone();
+            entry.table_path = registration.table_path.clone();
+            Ok(entry)
+        })
+        .collect::<Result<Vec<_>>>()?;
+
+    let mut aliases = HashMap::<String, TableIdentity>::new();
+    for entry in &entries {
+        if let Some(existing) = aliases.insert(entry.table_key.clone(), entry.identity) {
+            if existing != entry.identity {
+                return Err(OmniError::manifest_internal(format!(
+                    "manifest has two live table identities ({existing} and {}) bound to alias '{}'",
+                    entry.identity, entry.table_key
+                )));
+            }
+        }
+    }
     entries.sort_by(|a, b| a.table_key.cmp(&b.table_key));
-    ManifestState {
+    Ok(ManifestState {
         version,
         entries,
         graph_heads,
-    }
+    })
 }
 
 // After RFC-013 P2 folded the publish path off this accessor (it now projects
@@ -209,7 +239,22 @@ pub(super) fn assemble_manifest_state(
 // non-test builds.
 #[cfg(test)]
 pub(super) async fn read_manifest_entries(dataset: &Dataset) -> Result<Vec<SubTableEntry>> {
-    Ok(read_manifest_scan(dataset, false).await?.version_entries)
+    let scan = read_manifest_scan(dataset, false).await?;
+    let registrations = scan.table_registrations;
+    scan.version_entries
+        .into_iter()
+        .map(|mut entry| {
+            let registration = registrations.get(&entry.identity).ok_or_else(|| {
+                OmniError::manifest_internal(format!(
+                    "manifest missing table row for identity {}",
+                    entry.identity
+                ))
+            })?;
+            entry.table_key = registration.table_key.clone();
+            entry.table_path = registration.table_path.clone();
+            Ok(entry)
+        })
+        .collect()
 }
 
 /// The full table state the publisher needs to build its CAS batch, plus the
@@ -218,9 +263,9 @@ pub(super) async fn read_manifest_entries(dataset: &Dataset) -> Result<Vec<SubTa
 /// thin accessors + a separate `read_graph_lineage`): `load_publish_state`
 /// projects every piece it needs out of this single result.
 pub(super) struct PublishScan {
-    pub(super) table_locations: HashMap<String, String>,
+    pub(super) table_registrations: HashMap<TableIdentity, TableRegistration>,
     pub(super) version_entries: Vec<SubTableEntry>,
-    pub(super) tombstones: Vec<((String, u64), ())>,
+    pub(super) tombstones: Vec<((TableIdentity, u64), ())>,
     pub(super) lineage_rows: Vec<GraphLineageRow>,
     /// Exact `graph_head:<branch>` rows keyed by the branch suffix (`main` for
     /// main). Absence is meaningful and is preserved by a missing map entry.
@@ -233,12 +278,12 @@ pub(super) struct PublishScan {
 pub(super) async fn read_publish_scan(dataset: &Dataset) -> Result<PublishScan> {
     let scan = read_manifest_scan(dataset, true).await?;
     Ok(PublishScan {
-        table_locations: scan.table_locations,
+        table_registrations: scan.table_registrations,
         version_entries: scan.version_entries,
         tombstones: scan
             .tombstones
             .into_iter()
-            .map(|tombstone| ((tombstone.table_key, tombstone.tombstone_version), ()))
+            .map(|tombstone| ((tombstone.identity, tombstone.tombstone_version), ()))
             .collect(),
         lineage_rows: scan.lineage_rows,
         graph_heads: scan.graph_heads,
@@ -323,6 +368,8 @@ async fn read_manifest_scan(dataset: &Dataset, collect_lineage: bool) -> Result<
         "location",
         "metadata",
         "table_key",
+        "stable_table_id",
+        "table_incarnation_id",
         "table_version",
         "table_branch",
         "row_count",
@@ -339,7 +386,7 @@ async fn read_manifest_scan(dataset: &Dataset, collect_lineage: bool) -> Result<
         .await
         .map_err(|e| OmniError::Lance(e.to_string()))?;
 
-    let mut table_locations = HashMap::new();
+    let mut table_registrations = HashMap::new();
     let mut version_entries = Vec::new();
     let mut tombstones = Vec::new();
     let mut lineage_rows = Vec::new();
@@ -350,6 +397,8 @@ async fn read_manifest_scan(dataset: &Dataset, collect_lineage: bool) -> Result<
         let locations = string_column(batch, "location")?;
         let metadata = string_column(batch, "metadata")?;
         let table_keys = string_column(batch, "table_key")?;
+        let stable_table_ids = u64_column(batch, "stable_table_id")?;
+        let table_incarnation_ids = u64_column(batch, "table_incarnation_id")?;
         let versions = u64_column(batch, "table_version")?;
         let branches = string_column(batch, "table_branch")?;
         let row_counts = u64_column(batch, "row_count")?;
@@ -363,16 +412,61 @@ async fn read_manifest_scan(dataset: &Dataset, collect_lineage: bool) -> Result<
             let table_key = table_keys.value(row).to_string();
             match object_types.value(row) {
                 OBJECT_TYPE_TABLE => {
+                    let identity = required_table_identity(
+                        stable_table_ids,
+                        table_incarnation_ids,
+                        row,
+                        OBJECT_TYPE_TABLE,
+                    )?;
+                    require_object_id(
+                        object_ids,
+                        row,
+                        &table_object_id(identity),
+                        OBJECT_TYPE_TABLE,
+                    )?;
                     if locations.is_null(row) {
                         return Err(OmniError::manifest_internal(format!(
                             "manifest table row missing location for {}",
                             table_key
                         )));
                     }
-                    table_locations.insert(table_key, locations.value(row).to_string());
+                    let table_path = locations.value(row).to_string();
+                    let canonical_path = super::table_path_for_identity(&table_key, identity)?;
+                    if table_path != canonical_path {
+                        return Err(OmniError::manifest_internal(format!(
+                            "manifest table row for identity {identity} has path '{table_path}', \
+                             expected '{canonical_path}'"
+                        )));
+                    }
+                    let registration = TableRegistration {
+                        identity,
+                        table_key,
+                        table_path,
+                    };
+                    if let Some(existing) =
+                        table_registrations.insert(identity, registration.clone())
+                    {
+                        if existing != registration {
+                            return Err(OmniError::manifest_internal(format!(
+                                "manifest has conflicting table rows for identity {identity}"
+                            )));
+                        }
+                    }
                 }
                 OBJECT_TYPE_TABLE_VERSION => {
+                    let identity = required_table_identity(
+                        stable_table_ids,
+                        table_incarnation_ids,
+                        row,
+                        OBJECT_TYPE_TABLE_VERSION,
+                    )?;
                     let table_version = required_u64(versions, row, "table_version")?;
+                    require_object_id(
+                        object_ids,
+                        row,
+                        &version_object_id(identity, table_version),
+                        OBJECT_TYPE_TABLE_VERSION,
+                    )?;
                     let row_count = required_u64(row_counts, row, "row_count")?;
                     if metadata.is_null(row) {
                         return Err(OmniError::manifest_internal(format!(
@@ -386,6 +480,7 @@ async fn read_manifest_scan(dataset: &Dataset, collect_lineage: bool) -> Result<
                         Some(branches.value(row).to_string())
                     };
                     version_entries.push(SubTableEntry {
+                        identity,
                         table_key: table_key.clone(),
                         table_path: String::new(),
                         table_version,
@@ -395,8 +490,21 @@ async fn read_manifest_scan(dataset: &Dataset, collect_lineage: bool) -> Result<
                     });
                 }
                 OBJECT_TYPE_TABLE_TOMBSTONE => {
+                    let identity = required_table_identity(
+                        stable_table_ids,
+                        table_incarnation_ids,
+                        row,
+                        OBJECT_TYPE_TABLE_TOMBSTONE,
+                    )?;
                     let tombstone_version = required_u64(versions, row, "table_version")?;
+                    require_object_id(
+                        object_ids,
+                        row,
+                        &super::layout::tombstone_object_id(identity, tombstone_version),
+                        OBJECT_TYPE_TABLE_TOMBSTONE,
+                    )?;
                     tombstones.push(TableTombstoneEntry {
+                        identity,
                         table_key,
                         tombstone_version,
                     });
@@ -405,12 +513,26 @@ async fn read_manifest_scan(dataset: &Dataset, collect_lineage: bool) -> Result<
                 // path, which resolves a parent. The table-state hot path skips
                 // them, while still decoding the bounded graph-head authority
                 // rows below.
-                OBJECT_TYPE_GRAPH_COMMIT if collect_lineage => {
-                    lineage_rows.push(decode_graph_commit_row(
-                        object_ids, metadata, versions, branches, row,
-                    )?);
+                OBJECT_TYPE_GRAPH_COMMIT => {
+                    require_null_table_identity(
+                        stable_table_ids,
+                        table_incarnation_ids,
+                        row,
+                        OBJECT_TYPE_GRAPH_COMMIT,
+                    )?;
+                    if collect_lineage {
+                        lineage_rows.push(decode_graph_commit_row(
+                            object_ids, metadata, versions, branches, row,
+                        )?);
+                    }
                 }
                 OBJECT_TYPE_GRAPH_HEAD => {
+                    require_null_table_identity(
+                        stable_table_ids,
+                        table_incarnation_ids,
+                        row,
+                        OBJECT_TYPE_GRAPH_HEAD,
+                    )?;
                     let (branch_key, head_commit_id) =
                         decode_graph_head_row(object_ids, metadata, row)?;
                     graph_heads.insert(branch_key, head_commit_id);
@@ -422,30 +544,31 @@ async fn read_manifest_scan(dataset: &Dataset, collect_lineage: bool) -> Result<
         }
     }
 
-    let mut entries = version_entries
-        .into_iter()
-        .map(|mut entry| {
-            entry.table_path = table_locations
-                .get(&entry.table_key)
-                .cloned()
-                .ok_or_else(|| {
-                    OmniError::manifest_internal(format!(
-                        "manifest missing table row for {}",
-                        entry.table_key
-                    ))
-                })?;
-            Ok(entry)
-        })
-        .collect::<Result<Vec<_>>>()?;
-    entries.sort_by(|a, b| {
-        a.table_key
-            .cmp(&b.table_key)
+    version_entries.sort_by(|a, b| {
+        a.identity
+            .cmp(&b.identity)
             .then(a.table_version.cmp(&b.table_version))
     });
+    for tombstone in &tombstones {
+        let registration = table_registrations
+            .get(&tombstone.identity)
+            .ok_or_else(|| {
+                OmniError::manifest_internal(format!(
+                    "manifest tombstone for identity {} has no table registration",
+                    tombstone.identity
+                ))
+            })?;
+        if registration.table_key != tombstone.table_key {
+            return Err(OmniError::manifest_internal(format!(
+                "manifest tombstone identity {} has diagnostic alias '{}', current binding is '{}'",
+                tombstone.identity, tombstone.table_key, registration.table_key
+            )));
+        }
+    }
 
     Ok(ManifestScan {
-        table_locations,
-        version_entries: entries,
+        table_registrations,
+        version_entries,
         tombstones,
         lineage_rows,
         graph_heads,
@@ -481,17 +604,31 @@ pub(crate) async fn read_graph_lineage(
         let object_ids = string_column(batch, "object_id")?;
         let object_types = string_column(batch, "object_type")?;
         let metadata = string_column(batch, "metadata")?;
+        let stable_table_ids = u64_column(batch, "stable_table_id")?;
+        let table_incarnation_ids = u64_column(batch, "table_incarnation_id")?;
         let versions = u64_column(batch, "table_version")?;
         let branches = string_column(batch, "table_branch")?;
 
         for row in 0..batch.num_rows() {
             match object_types.value(row) {
                 OBJECT_TYPE_GRAPH_COMMIT => {
+                    require_null_table_identity(
+                        stable_table_ids,
+                        table_incarnation_ids,
+                        row,
+                        OBJECT_TYPE_GRAPH_COMMIT,
+                    )?;
                     graph_commits.push(decode_graph_commit_row(
                         object_ids, metadata, versions, branches, row,
                     )?);
                 }
                 OBJECT_TYPE_GRAPH_HEAD => {
+                    require_null_table_identity(
+                        stable_table_ids,
+                        table_incarnation_ids,
+                        row,
+                        OBJECT_TYPE_GRAPH_HEAD,
+                    )?;
                     let (branch_key, head_commit_id) =
                         decode_graph_head_row(object_ids, metadata, row)?;
                     graph_heads.insert(branch_key, head_commit_id);
@@ -580,7 +717,7 @@ pub(crate) fn graph_lineage_row_parts(
 
 pub(super) fn entries_to_batch(
     entries: &[SubTableEntry],
-    version_metadata: &HashMap<String, String>,
+    version_metadata: &HashMap<TableIdentity, String>,
     genesis_lineage: &[GraphLineageRowPart],
 ) -> Result<RecordBatch> {
     let cap = entries.len() * 2 + genesis_lineage.len();
@@ -589,26 +726,28 @@ pub(super) fn entries_to_batch(
     let mut locations = Vec::with_capacity(cap);
     let mut metadata = Vec::with_capacity(cap);
     let mut table_keys = Vec::with_capacity(cap);
+    let mut table_identities = Vec::with_capacity(cap);
     let mut table_versions = Vec::with_capacity(cap);
     let mut table_branches = Vec::with_capacity(cap);
     let mut row_counts = Vec::with_capacity(cap);
 
     for entry in entries {
-        object_ids.push(entry.table_key.clone());
+        object_ids.push(table_object_id(entry.identity));
         object_types.push(OBJECT_TYPE_TABLE.to_string());
         locations.push(Some(entry.table_path.clone()));
         metadata.push(None);
         table_keys.push(entry.table_key.clone());
+        table_identities.push(Some(entry.identity));
         table_versions.push(None);
         table_branches.push(None);
         row_counts.push(None);
 
-        object_ids.push(version_object_id(&entry.table_key, entry.table_version));
+        object_ids.push(version_object_id(entry.identity, entry.table_version));
         object_types.push(OBJECT_TYPE_TABLE_VERSION.to_string());
         locations.push(None);
         metadata.push(Some(
             version_metadata
-                .get(&entry.table_key)
+                .get(&entry.identity)
                 .cloned()
                 .ok_or_else(|| {
                     OmniError::manifest_internal(format!(
@@ -618,6 +757,7 @@ pub(super) fn entries_to_batch(
                 })?,
         ));
         table_keys.push(entry.table_key.clone());
+        table_identities.push(Some(entry.identity));
         table_versions.push(Some(entry.table_version));
         table_branches.push(entry.table_branch.clone());
         row_counts.push(Some(entry.row_count));
@@ -634,6 +774,7 @@ pub(super) fn entries_to_batch(
         locations.push(None);
         metadata.push(Some(part.metadata.clone()));
         table_keys.push(String::new());
+        table_identities.push(None);
         table_versions.push(part.table_version);
         table_branches.push(part.table_branch.clone());
         row_counts.push(None);
@@ -645,6 +786,7 @@ pub(super) fn entries_to_batch(
         locations,
         metadata,
         table_keys,
+        table_identities,
         table_versions,
         table_branches,
         row_counts,
@@ -657,11 +799,74 @@ pub(super) fn manifest_rows_batch(
     locations: Vec<Option<String>>,
     metadata: Vec<Option<String>>,
     table_keys: Vec<String>,
+    table_identities: Vec<Option<TableIdentity>>,
     table_versions: Vec<Option<u64>>,
     table_branches: Vec<Option<String>>,
     row_counts: Vec<Option<u64>>,
 ) -> Result<RecordBatch> {
     let len = object_ids.len();
+    if table_identities.len() != len {
+        return Err(OmniError::manifest_internal(format!(
+            "manifest batch has {} object rows but {} table identities",
+            len,
+            table_identities.len()
+        )));
+    }
+    for (row, (object_type, identity)) in
+        object_types.iter().zip(table_identities.iter()).enumerate()
+    {
+        match object_type.as_str() {
+            OBJECT_TYPE_TABLE | OBJECT_TYPE_TABLE_VERSION | OBJECT_TYPE_TABLE_TOMBSTONE => {
+                let identity = identity.ok_or_else(|| {
+                    OmniError::manifest_internal(format!(
+                        "manifest {object_type} row at index {row} is missing table identity"
+                    ))
+                })?;
+                identity.validate()?;
+                let expected_object_id = match object_type.as_str() {
+                    OBJECT_TYPE_TABLE => table_object_id(identity),
+                    OBJECT_TYPE_TABLE_VERSION => {
+                        let version = table_versions.get(row).copied().flatten().ok_or_else(|| {
+                            OmniError::manifest_internal(format!(
+                                "manifest table_version row at index {row} is missing table_version"
+                            ))
+                        })?;
+                        version_object_id(identity, version)
+                    }
+                    OBJECT_TYPE_TABLE_TOMBSTONE => {
+                        let version = table_versions.get(row).copied().flatten().ok_or_else(|| {
+                            OmniError::manifest_internal(format!(
+                                "manifest table_tombstone row at index {row} is missing table_version"
+                            ))
+                        })?;
+                        super::layout::tombstone_object_id(identity, version)
+                    }
+                    _ => unreachable!("outer match restricts object type"),
+                };
+                if object_ids.get(row) != Some(&expected_object_id) {
+                    return Err(OmniError::manifest_internal(format!(
+                        "manifest {object_type} row at index {row} has object_id {:?}, expected '{}'",
+                        object_ids.get(row),
+                        expected_object_id
+                    )));
+                }
+            }
+            OBJECT_TYPE_GRAPH_COMMIT | OBJECT_TYPE_GRAPH_HEAD if identity.is_some() => {
+                return Err(OmniError::manifest_internal(format!(
+                    "manifest {object_type} row at index {row} must not carry table identity"
+                )));
+            }
+            _ => {}
+        }
+    }
+    let stable_table_ids = table_identities
+        .iter()
+        .map(|identity| identity.map(|identity| identity.stable_table_id))
+        .collect::<Vec<_>>();
+    let table_incarnation_ids = table_identities
+        .iter()
+        .map(|identity| identity.map(|identity| identity.table_incarnation_id))
+        .collect::<Vec<_>>();
     RecordBatch::try_new(
         manifest_schema(),
         vec![
@@ -674,6 +879,8 @@ pub(super) fn manifest_rows_batch(
                 len,
             ),
             Arc::new(StringArray::from(table_keys)),
+            Arc::new(UInt64Array::from(stable_table_ids)),
+            Arc::new(UInt64Array::from(table_incarnation_ids)),
             Arc::new(UInt64Array::from(table_versions)),
             Arc::new(StringArray::from(table_branches)),
             Arc::new(UInt64Array::from(row_counts)),
@@ -715,4 +922,48 @@ fn required_u64(column: &UInt64Array, row: usize, name: &str) -> Result<u64> {
         )));
     }
     Ok(column.value(row))
+}
+
+fn required_table_identity(
+    stable_table_ids: &UInt64Array,
+    table_incarnation_ids: &UInt64Array,
+    row: usize,
+    object_type: &str,
+) -> Result<TableIdentity> {
+    let stable_table_id = required_u64(stable_table_ids, row, "stable_table_id")?;
+    let table_incarnation_id = required_u64(table_incarnation_ids, row, "table_incarnation_id")?;
+    TableIdentity::new(stable_table_id, table_incarnation_id).map_err(|error| {
+        OmniError::manifest_internal(format!(
+            "manifest {object_type} row at index {row} has invalid table identity: {error}"
+        ))
+    })
+}
+
+fn require_null_table_identity(
+    stable_table_ids: &UInt64Array,
+    table_incarnation_ids: &UInt64Array,
+    row: usize,
+    object_type: &str,
+) -> Result<()> {
+    if !stable_table_ids.is_null(row) || !table_incarnation_ids.is_null(row) {
+        return Err(OmniError::manifest_internal(format!(
+            "manifest {object_type} row at index {row} must not carry table identity"
+        )));
+    }
+    Ok(())
+}
+
+fn require_object_id(
+    object_ids: &StringArray,
+    row: usize,
+    expected: &str,
+    object_type: &str,
+) -> Result<()> {
+    let actual = object_ids.value(row);
+    if actual != expected {
+        return Err(OmniError::manifest_internal(format!(
+            "manifest {object_type} row at index {row} has object_id '{actual}', expected '{expected}'"
+        )));
+    }
+    Ok(())
 }
