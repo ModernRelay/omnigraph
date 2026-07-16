@@ -46,6 +46,7 @@ use lance_file::version::LanceFileVersion;
 use lance_index::IndexType;
 use lance_index::optimize::OptimizeOptions;
 use lance_index::scalar::ScalarIndexParams;
+use lance_io::object_store::ObjectStoreRegistry;
 use lance_namespace::LanceNamespace;
 use lance_table::io::commit::{ManifestLocation, ManifestNamingScheme};
 
@@ -400,6 +401,88 @@ async fn manifest_location_field_shape() {
     // Runtime sanity — naming_scheme should produce a Debug string we use
     // verbatim in `TableVersionMetadata::naming_scheme`.
     assert!(!format!("{:?}", loc.naming_scheme).is_empty());
+}
+
+// --- Guard 2a: shared client pool with cache-isolated Sessions ---------------
+//
+// OmniGraph uses a cached data Session and a zero-cache control Session. They
+// must reuse the same object-store client pool without turning mutable-tip
+// control metadata into a second shared cache. This exercises the public Lance
+// construction with real Dataset opens: the second Session hits the first
+// Session's live object store, while its own zero-sized metadata cache remains
+// empty.
+
+#[tokio::test]
+async fn cached_and_zero_cache_sessions_share_store_registry_not_metadata_cache() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("shared-registry-isolated-caches.lance");
+    let uri = path.to_str().unwrap();
+    drop(fresh_dataset(uri).await);
+
+    let registry = Arc::new(ObjectStoreRegistry::default());
+    let cached_session = Arc::new(Session::new(
+        16 * 1024 * 1024,
+        16 * 1024 * 1024,
+        Arc::clone(&registry),
+    ));
+    let control_session = Arc::new(Session::new(0, 0, Arc::clone(&registry)));
+
+    let before = registry.stats();
+    let cached = DatasetBuilder::from_uri(uri)
+        .with_session(Arc::clone(&cached_session))
+        .load()
+        .await
+        .expect("the cached data Session must open the dataset");
+    let after_cached = registry.stats();
+    assert!(
+        after_cached.misses > before.misses,
+        "the first Session open must create an object-store client"
+    );
+    let cached_metadata_items = cached_session
+        .metadata_cache_keys()
+        .await
+        .expect("the default Lance cache backend must expose key inventory")
+        .count();
+    assert!(
+        cached_metadata_items > 0,
+        "a real data-Session open must populate its metadata cache"
+    );
+    assert_eq!(
+        control_session
+            .metadata_cache_keys()
+            .await
+            .expect("the zero-cache Session backend must expose key inventory")
+            .count(),
+        0,
+        "the control Session must not observe the data Session's metadata entries"
+    );
+
+    // Keep `cached` alive so the registry's weak entry still has a live store
+    // for the control Session to reuse.
+    let control = DatasetBuilder::from_uri(uri)
+        .with_session(Arc::clone(&control_session))
+        .load()
+        .await
+        .expect("the zero-cache control Session must open the dataset");
+    let after_control = registry.stats();
+    assert!(
+        after_control.hits > after_cached.hits,
+        "the control Session must reuse the data Session's live object-store client"
+    );
+    assert_eq!(
+        after_control.misses, after_cached.misses,
+        "the second Session must not build a duplicate client for identical store parameters"
+    );
+    assert_eq!(
+        control_session
+            .metadata_cache_keys()
+            .await
+            .expect("the zero-cache Session backend must expose key inventory")
+            .count(),
+        0,
+        "a control-plane open must leave the zero-sized metadata cache empty"
+    );
+    assert_eq!(cached.version().version, control.version().version);
 }
 
 // --- Guard 2b: RFC-024 public physical-ref incarnation surfaces -----------

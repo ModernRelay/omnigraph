@@ -249,6 +249,93 @@ async fn warm_branch_read_does_no_manifest_scans() {
     .await;
 }
 
+/// Resolving a different branch cold needs both its table snapshot and lineage
+/// head, but those are projections of the same immutable `__manifest` version.
+/// The control-plane opener must therefore load and scan that branch exactly
+/// once, rather than opening once for `ManifestCoordinator` and again for
+/// `CommitGraph`.
+#[tokio::test]
+async fn cold_other_branch_resolution_uses_one_coherent_manifest_open() {
+    cost_harness(async {
+        let dir = tempfile::tempdir().unwrap();
+        let db = init_and_load(&dir).await;
+        db.branch_create("feature").await.unwrap();
+        db.mutate(
+            "feature",
+            MUTATION_QUERIES,
+            "insert_person",
+            &mixed_params(&[("$name", "coherent-head")], &[("$age", 22)]),
+        )
+        .await
+        .unwrap();
+
+        let (resolved, io) = measure(db.resolve_snapshot("feature")).await;
+        let resolved = resolved.unwrap();
+        eprintln!(
+            "cold feature resolution: head={} internal_open_count={} manifest_scan_count={} \
+             manifest_reads={}",
+            resolved.as_str(),
+            io.internal_open_count,
+            io.manifest_scan_count,
+            io.manifest_reads,
+        );
+        assert_eq!(
+            io.internal_open_count, 1,
+            "cold branch resolution must derive snapshot + lineage from one manifest open"
+        );
+        assert_eq!(
+            io.manifest_scan_count, 1,
+            "cold branch resolution must derive snapshot + lineage in one manifest row scan"
+        );
+    })
+    .await;
+}
+
+/// Native branch controls must take one post-gate operation-local coordinator
+/// capture, not refresh the handle-local coordinator before and after table
+/// gates. Delete additionally opens the native main ref once for its exact
+/// BranchIdentifier-fenced classifier, but performs no second manifest row
+/// scan.
+#[tokio::test]
+async fn native_branch_controls_use_one_post_gate_manifest_capture() {
+    cost_harness(async {
+        let dir = tempfile::tempdir().unwrap();
+        let mut db = init_and_load(&dir).await;
+        commit_many(&mut db, 20).await;
+
+        let (created, create_io) = measure(db.branch_create("feature")).await;
+        created.unwrap();
+        assert_eq!(
+            (create_io.internal_open_count, create_io.manifest_scan_count),
+            (1, 1),
+            "branch create must use one coherent post-gate source capture"
+        );
+
+        let (deleted, delete_io) = measure(db.branch_delete("feature")).await;
+        deleted.unwrap();
+        assert_eq!(
+            (delete_io.internal_open_count, delete_io.manifest_scan_count),
+            (2, 1),
+            "branch delete needs one coherent target capture plus one native-ref opener, \
+             without a second row scan"
+        );
+
+        db.branch_create("feature").await.unwrap();
+        let (created_from, create_from_io) =
+            measure(db.branch_create_from("feature", "review")).await;
+        created_from.unwrap();
+        assert_eq!(
+            (
+                create_from_io.internal_open_count,
+                create_from_io.manifest_scan_count,
+            ),
+            (1, 1),
+            "branch create-from must use one coherent post-gate source capture"
+        );
+    })
+    .await;
+}
+
 /// A non-main branch can be deleted and recreated at the same Lance version
 /// number. Warm branch freshness therefore needs the manifest incarnation, not
 /// just `version()`, or a reader pinned to the old incarnation can serve stale
@@ -285,6 +372,14 @@ async fn warm_read_on_recreated_branch_observes_new_incarnation() {
         old_feature.num_rows(),
         1,
         "test setup: old feature branch must contain Eve"
+    );
+    let old_feature_head = reader.resolve_snapshot("feature").await.unwrap();
+    let old_feature_commits = reader.list_commits(Some("feature")).await.unwrap();
+    assert!(
+        old_feature_commits
+            .iter()
+            .any(|commit| commit.graph_commit_id == old_feature_head.as_str()),
+        "test setup: the old feature head must belong to the old branch lineage"
     );
     let old_version = reader
         .version_of(ReadTarget::branch("feature"))
@@ -331,6 +426,34 @@ async fn warm_read_on_recreated_branch_observes_new_incarnation() {
     assert_eq!(
         io.version_probes, 2,
         "stale same-branch read probes once under the read lock and once under the write lock"
+    );
+
+    let new_feature_head = reader.resolve_snapshot("feature").await.unwrap();
+    assert_ne!(
+        new_feature_head, old_feature_head,
+        "delete/recreate at the same numeric version must replace the branch's logical head"
+    );
+    let new_feature_commits = reader.list_commits(Some("feature")).await.unwrap();
+    assert!(
+        new_feature_commits
+            .iter()
+            .any(|commit| commit.graph_commit_id == new_feature_head.as_str()),
+        "the recreated branch's resolved head must belong to its fresh lineage projection"
+    );
+    assert!(
+        new_feature_commits
+            .iter()
+            .all(|commit| commit.graph_commit_id != old_feature_head.as_str()),
+        "the deleted branch incarnation's private head must not leak into the recreated branch"
+    );
+    let new_feature_head_commit = new_feature_commits
+        .iter()
+        .find(|commit| commit.graph_commit_id == new_feature_head.as_str())
+        .unwrap();
+    assert_eq!(
+        new_feature_head_commit.manifest_version, new_version,
+        "without intervening physical-only maintenance, the recreated branch snapshot and \
+         lineage head must come from one manifest version"
     );
 }
 

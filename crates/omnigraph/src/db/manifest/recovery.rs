@@ -183,7 +183,11 @@ async fn publish_recovery_commit(
             ));
         }
     };
-    let publisher = GraphNamespacePublisher::new(root_uri, sidecar.branch.as_deref());
+    let publisher = GraphNamespacePublisher::new_with_session(
+        root_uri,
+        sidecar.branch.as_deref(),
+        crate::lance_access::control_session(),
+    );
     let exact_authority = sidecar
         .protocol_v3
         .as_ref()
@@ -3230,7 +3234,11 @@ async fn discard_orphaned_branch_sidecar(
             merged_parent_commit_id: None,
             created_at: crate::db::now_micros()?,
         };
-        let publisher = GraphNamespacePublisher::new(root_uri, None);
+        let publisher = GraphNamespacePublisher::new_with_session(
+            root_uri,
+            None,
+            crate::lance_access::control_session(),
+        );
         publisher
             .publish(&[], &HashMap::new(), Some(&intent))
             .await?;
@@ -7867,7 +7875,9 @@ async fn open_lance_head_if_present(
         // files but before committing version one. Preserve Lance's typed
         // DatasetNotFound distinction here; the shared instrumented opener
         // intentionally erases it into OmniError::Lance for ordinary callers.
+        let control_session = crate::lance_access::control_session();
         match lance::dataset::builder::DatasetBuilder::from_uri(table_path)
+            .with_session(control_session)
             .load()
             .await
         {

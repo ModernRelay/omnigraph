@@ -170,6 +170,17 @@ requires one pinned Lance version across a deployment.
 
 Behavior-affecting findings in this audit:
 
+- **Session sharing has two separable layers.** Lance `Session::new` accepts an
+  `Arc<ObjectStoreRegistry>` independently of its metadata/index cache
+  capacities. OmniGraph therefore shares one process-wide registry to reuse
+  graph-dataset object-store clients, but does not use one process-global cached
+  Session. Data tables use a graph-handle-scoped cached Session; `__manifest`
+  and other mutable-tip control datasets use a zero-cache control Session.
+  Coordinator open/full-refresh reads decode manifest state and lineage from
+  one row scan.
+  This access shape reduces duplicate opens and cold client construction while
+  avoiding a mutable-tip cache authority. It does not make the append-only
+  manifest fold history-flat.
 - **The RFC-022 full-table vector-index stage is no longer substrate-blocked.**
   `CreateIndexBuilder::execute_uncommitted` builds the physical vector artifact
   and returns complete `IndexMetadata`; Lance's own `execute` wraps that value
@@ -368,6 +379,11 @@ Behavior-affecting findings in this audit:
   normalization because Lance still performs the branch-contents existence
   check and delete separately, leaving a concurrent-delete TOCTOU window around
   the otherwise-idempotent tree cleanup.
+  OmniGraph's access-shape follow-up performs one operation-local post-gate
+  control capture instead of refreshing the handle-local coordinator around
+  table-gate acquisition, then invalidates derived caches after a successful
+  ref transition. This changes neither `BranchContents` authority nor the
+  single-writer-process support boundary.
   The index-create source is unchanged; compaction changes are mechanical
   iterator cleanup; the transaction change only centralizes calculation of the
   next version. Branch checkout now reuses the session-cached manifest,

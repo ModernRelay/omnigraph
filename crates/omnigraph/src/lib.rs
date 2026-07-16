@@ -16,6 +16,7 @@ mod exec;
 pub mod failpoints;
 pub mod graph_index;
 pub mod instrumentation;
+pub(crate) mod lance_access;
 pub mod loader;
 pub(crate) mod runtime_cache;
 pub mod storage;

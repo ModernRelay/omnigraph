@@ -24,7 +24,8 @@ use object_store::{
 use crate::error::{OmniError, Result};
 
 use super::layout::{
-    namespace_internal_error, open_manifest_dataset, table_id_to_key, table_uri_for_path,
+    namespace_internal_error, open_manifest_dataset_with_session, table_id_to_key,
+    table_uri_for_path,
 };
 use super::metadata::{
     TableVersionMetadata, namespace_version_metadata, parse_namespace_version_request,
@@ -49,7 +50,9 @@ impl BranchManifestNamespace {
     }
 
     async fn dataset(&self) -> Result<Dataset> {
-        open_manifest_dataset(&self.root_uri, self.branch.as_deref()).await
+        let control_session = crate::lance_access::control_session();
+        open_manifest_dataset_with_session(&self.root_uri, self.branch.as_deref(), &control_session)
+            .await
     }
 
     async fn state(&self) -> Result<ManifestState> {
@@ -462,7 +465,9 @@ impl LanceNamespace for StagedTableNamespace {
             Some("V1") => ManifestNamingScheme::V1,
             _ => ManifestNamingScheme::V2,
         };
+        let control_session = crate::lance_access::control_session();
         let (object_store, base_path, _) = DatasetBuilder::from_uri(&self.table_uri())
+            .with_session(control_session)
             .build_object_store()
             .await
             .map_err(|e| namespace_internal_error(e.to_string()))?;

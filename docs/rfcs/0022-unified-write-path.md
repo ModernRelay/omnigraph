@@ -484,20 +484,30 @@ able to enumerate every adapter and every entry point that invokes it.
 
 ### 6.2 Branch merge
 
-- Capture the exact source graph commit/snapshot and compute row classification
-  against that immutable input outside the effect gates. The source commit is an
-  effect precondition, not a member of the target publisher's atomic `ReadSet`:
-  a target CAS cannot arbitrate a foreign source-branch row.
+- Capture the exact source graph commit/snapshot and target authority with
+  temporary coordinators whose manifest state and lineage projection were
+  decoded together from one coherent `__manifest` scan. Retain the exact
+  manifest `Dataset` probe handles through preparation rather than reopening
+  the same branches to rediscover their state. Compute row classification
+  against the immutable captured inputs outside the effect gates. The source
+  commit is an effect precondition, not a member of the target publisher's
+  atomic `ReadSet`: a target CAS cannot arbitrate a foreign source-branch row.
 - Revalidate that the captured source incarnation and commit still identify the
-  prepared input before effects. A later source-head advance is intentionally
-  harmless: merge means "merge this captured source commit," not "whatever is
-  latest when the target publishes." A future latest-at-publish contract would
-  require a real source-branch fence held through target CAS.
+  prepared input before effects. The retained manifest probe handles use cheap
+  current-incarnation probes first; a mismatch falls back to a fresh full
+  manifest capture and the existing typed revalidation/reprepare outcome. A
+  later source-head advance is intentionally harmless: merge means "merge this
+  captured source commit," not "whatever is latest when the target publishes."
+  A future latest-at-publish contract would require a real source-branch fence
+  held through target CAS.
 - Include the target graph head and every target table used by classification or
   validation in `ReadSet`.
 - Any target change before effects forces a complete reclassification; publishing a
   result computed against an old target and parenting it to a new live head is
   forbidden.
+- The target publisher still performs its own fresh authority load on every CAS
+  attempt. Reusing a captured coordinator reduces duplicate preparation reads;
+  it never turns that captured state into mutable-tip commit authority.
 - The adapter supports zero, one, or several physical commits per table and records
   exact confirmed post-state before manifest publish.
 - Lineage-based candidate discovery may replace the classifier only under RFC-027;
@@ -646,15 +656,23 @@ Their control protocol is:
 1. run and await the recovery barrier;
 2. quiesce enrolled streams as required by RFC-026;
 3. acquire any active global claim, such as RFC-025's retention claim, and then
-   the graph/branch-control gate in §4.3 order;
-4. freshly capture source ref/version/incarnation and target absence (or the
-   delete target's exact `BranchIdentifier`);
+   the schema, graph/branch-control, and accepted-catalog table gates in §4.3
+   order, re-listing recovery intent under the complete gate set;
+4. open one operation-local control coordinator after those gates are held and
+   validate the accepted catalog against that same captured manifest state.
+   The capture supplies the source ref/version/incarnation, global namespace,
+   and target absence (or the delete target's exact `BranchIdentifier`) without
+   refreshing the handle-local active coordinator before and after table-gate
+   acquisition;
 5. validate a create name and the path-prefix-disjoint namespace before Lance's
    shallow-clone phase;
 6. execute the bounded native classifier below; and
-7. reclaim owned per-table forks best-effort while the complete control-gate set
-   remains held, then release the gates. A reclaim failure is logged for the
-   cleanup reconciler; this implementation does not schedule asynchronous reclaim.
+7. after a successfully classified authority change, invalidate handle-local
+   derived read caches so a reused branch name cannot expose the prior
+   incarnation; reclaim owned per-table forks best-effort while the complete
+   control-gate set remains held, then release the gates. A reclaim failure is
+   logged for the cleanup reconciler; this implementation does not schedule
+   asynchronous reclaim.
 
 | Operation | Fresh physical state | Classifier action |
 |---|---|---|
@@ -779,21 +797,29 @@ Retry rules are phase-specific:
 This RFC authorizes a protocol refactor, not a manifest v5 format moment. RFC-023
 through RFC-028 own their respective format and public-surface changes.
 
-It also does not require a mutable-tip `GraphState` singleton. Three measured,
-local latency fixes can land independently of the adapter conversion:
+It also does not require a mutable-tip `GraphState` singleton. The follow-up
+access-shape work uses one process-wide Lance `ObjectStoreRegistry` as the
+graph-dataset object-store client pool, while deliberately separating cache
+scopes:
 
-1. make the graph's shared Lance `Session` a required parameter of every
-   manifest open/publisher path, so remote opens do not rebuild clients and cold
-   metadata state;
-2. capture one immutable operation-local manifest/lineage view and pass it down
-   the call stack instead of reopening the same state repeatedly; and
-3. remove the verified-redundant branch-idle refresh and the back-to-back second
-   `branch_delete_as` refresh once their existing coverage asserts unchanged
-   behavior.
+- graph data tables use one graph-handle-scoped cached Lance `Session`;
+- mutable-tip control datasets such as `__manifest` use a zero-cache control
+  `Session`;
+- both sessions share only the object-store registry, not metadata or index
+  cache contents.
 
-These are narrow access-shape fixes, not a second commit-input authority. They
-must preserve snapshot pinning and still cross the recovery/read-set barriers
-defined above.
+A coordinator open or full refresh derives manifest state and graph lineage
+from one coherent row scan. Branch merge retains the captured source/target
+manifest `Dataset` probe handles and probes them before falling back to a full
+fresh capture on movement; the publisher still loads fresh authority for every
+CAS attempt. Native branch controls similarly use one operation-local post-gate
+capture instead of refreshing the handle-local coordinator around table-gate
+acquisition, and invalidate derived caches after a successful ref transition.
+
+These are narrow access-shape fixes, not a second commit-input authority or a
+claim that the journal fold is history-flat. Each required full `__manifest`
+scan can still grow with uncompacted history; snapshot pinning and all
+recovery/read-set barriers above remain unchanged.
 
 The implementation landed in this order:
 

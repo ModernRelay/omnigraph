@@ -3294,9 +3294,7 @@ impl Omnigraph {
             live_source_snapshot,
             live_target_authority,
             fresh_target_snapshot,
-        ) = self
-            .revalidate_merge_inputs(source_branch, target_branch)
-            .await?;
+        ) = self.revalidate_merge_inputs(source_txn, target_txn).await?;
         ensure_merge_target_authority_unchanged(target_txn, &live_target_authority)?;
         if target_snapshot.version() != fresh_target_snapshot.version() {
             return Err(OmniError::manifest_read_set_changed(

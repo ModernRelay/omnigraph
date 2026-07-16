@@ -353,11 +353,18 @@ The path (details: [execution.md](execution.md)):
 
 **The cost model is a tested contract, not an aspiration.** The warm read path
 was once O(commit-history) per query — fresh coordinator per read, full
-manifest re-scans, no shared session. The query-latency work drove it to: one
-cheap freshness probe, one schema read, zero dataset opens on a warm repeat.
-This is *pinned* by IO-counted cost-budget tests (`warm_read_cost.rs`) that
-count object-store operations at commit-history depth — because cost-scaling
-bugs pass every correctness test and only bite in production. See
+manifest re-scans, and independently-created object-store clients. Lance
+graph-dataset access is now split deliberately: a process-wide
+`ObjectStoreRegistry` pools graph-dataset clients, graph data uses a
+graph-handle-scoped cached `Session`, and mutable-tip control state uses a
+zero-cache `Session`. A coordinator open or full refresh derives its manifest
+state and lineage projection together from one row scan. The warm query path
+remains one cheap freshness probe, one schema read, and zero dataset opens on a
+warm repeat. These are *pinned* by IO-counted cost-budget tests
+(`warm_read_cost.rs`) that count object-store operations at commit-history
+depth — because cost-scaling bugs pass every correctness test and only bite in
+production. A required full journal fold may still grow with uncompacted
+history; client/session reuse does not change that fact. See
 [testing.md](testing.md) "Cost-budget tests".
 
 ---
@@ -573,6 +580,12 @@ best-effort tree cleanup (absent ref ⇒ success). This is invariant 3's shape
 applied to metadata: when the logical target is fully derivable from one
 existing authority, a reconciler beats a sidecar — and it degrades to a no-op
 if Lance later closes the physical gap.
+
+After the complete schema → branch → table gate envelope is held, each control
+uses one operation-local manifest/namespace capture. It does not refresh the
+handle-local coordinator before and after table-gate acquisition. A successful
+ref transition explicitly invalidates derived read caches so a reused branch
+name cannot inherit stale handles or topology from its prior incarnation.
 
 ### Commits and time travel
 
@@ -926,7 +939,7 @@ resource budgets.
 | **R3: RFC-023 consumes a beta.21 route-dependent key-filter primitive.** Lance's filter emission and filtered/unfiltered resolution are directional (probed 2026-07-14). | Medium | v6 closes production insertion-bearing routes through exact-`id`, forced-v2 filtered staging and source-guards bare Append; the adapter verifies the emitted field-ID filter and effect-aware recovery refuses ambiguity. Guards pin both conflict orders so any upstream symmetry/route change forces an audit. Three-run release evidence passed the 1M forced-v2 50 ms median / 256 MiB max-RSS thresholds (29 ms / 243,875,840 bytes). |
 | **R4: Manifest fold cost grows with commit count.** Current-state resolution folds history. | Medium | `optimize` compacts internal tables (keeps periodically-optimized graphs flat — cost-gated every PR). RFC-024 Gate A found flat exact-BTREE scan work at width 10, including observable/reconcilable uncovered tails, but rejected the format because representative RustFS 20→80 uncompacted cold reads/bytes (34→94 / 61,947→121,592) and compacted byte terms grow. RFC-024 is research-blocked; v6 retains the journal fold and internal-table *cleanup* remains deferred behind the resurrection watermark. |
 | **R5: Schema identity corruption or alias/identity drift.** Internal schema v5 introduced stable IDs/incarnation as durable authority; v6 preserves them. | Medium | Open/init validate the SchemaIR domain and exact bidirectional IR↔manifest identity/path/alias contract; every active recovery envelope carries the identity pair; zero, duplicate, missing, or mismatched identity fails closed. |
-| **R6: Merge cost at divergence** — full-width classification, history-growing manifest opens. | Medium | Fast-forward path structurally pinned; `merge_cost.rs` keeps the terms visible; O(delta) merge blocked on a real deletion-delta source **(RFC-027)**; fragment adoption **(RFC-0001, draft)**. |
+| **R6: Merge cost at divergence** — full-width classification and history-growing manifest folds. | Medium | Coherent coordinator scans plus retained probe handles reduced the pre-slice measured depth-5/depth-80 baseline from 59/651 manifest reads to 40/410 and cap the common fast-forward route at three internal opens and three scans, but the uncompacted-history slope remains. `merge_cost.rs` keeps both facts visible; O(delta) merge is blocked on a real deletion-delta source **(RFC-027)**; fragment adoption is **(draft RFC-0001)**. |
 | **R7: No streaming ingest** — per-branch write throughput is capped by the `graph_head` CAS rate; high-frequency small writes are wasteful. | Medium | Deliberate: the interactive path's guarantees come first. MemWAL-based ingest with durable per-row ack + graph-atomic folds is the design **(RFC-026)**. MemWAL is the strategic substrate, but beta.21's public initializer commits opaquely and shard provisioning is separate; activation waits for a public exact enrollment receipt plus reversible admission seal rather than using private APIs. |
 | **R8: Some operations lack enforced memory/time budgets.** | Medium | Known gap, narrowed and accepted for RFC-023. Its direct-substrate instrument rejected the first whole-delta fenced adopt (~447 MB peak at 100K × 256 versus ~74 MB Append), and the first corrected production 10K series failed at 30.0× / 108,625,920 bytes overhead; both negative results remain evidence. Mutation/Load now refuses a keyed table above 8,192 rows / 32 MiB before arm, while BranchMerge uses a recovery-enrolled chain with the same per-chunk bounds and a 1,024-transaction ceiling. The inductive certificate route removes the general diff, temporary delta, target preflight, and target join without weakening that chain. Final five-pair production medians passed at 31/8 ms (3.875×) for 10K and 136/35 ms (~3.886×) for 100K; maximum signed paired RSS overheads were 24,297,472 and 32,604,160 bytes. Inclusive row/transaction ceilings, byte refusal (including materialized blobs), operation-wide validation retention, exact source/target incarnation revalidation, second-generation certificate composition, and both between-chunk recovery directions are pinned; other operations still need explicit bounds. |
 | **R9: Local-FS conditional-write emulation** (`write_text_if_match` check-then-act gap). | Low | All current callers sit behind the cluster lock protocol; S3 uses true conditional puts; close before admitting any lock-free caller. |

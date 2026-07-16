@@ -1,4 +1,5 @@
 use std::collections::HashMap;
+use std::sync::Arc;
 
 use arrow_array::{RecordBatch, RecordBatchIterator};
 use arrow_schema::{Field, Schema, SchemaRef};
@@ -11,12 +12,12 @@ use omnigraph_compiler::catalog::Catalog;
 use crate::error::{OmniError, Result};
 
 use super::TABLE_VERSION_MANAGEMENT_KEY;
-use super::layout::{manifest_uri, open_manifest_dataset};
+use super::layout::{manifest_uri, open_manifest_dataset_with_session};
 use super::metadata::TableVersionMetadata;
 use super::migrations::stamp_current_version;
 use super::state::{
     GraphLineageRow, ManifestState, SubTableEntry, entries_to_batch, graph_lineage_row_parts,
-    manifest_schema, read_manifest_state,
+    manifest_schema, read_manifest_state, read_manifest_state_and_lineage,
 };
 use super::{TableIdentity, table_path_for_identity};
 
@@ -30,9 +31,10 @@ const GENESIS_MANIFEST_VERSION: u64 = 1;
 pub(super) async fn init_manifest_graph(
     root_uri: &str,
     catalog: &Catalog,
-) -> Result<(Dataset, ManifestState)> {
+    control_session: &Arc<lance::session::Session>,
+) -> Result<(Dataset, ManifestState, Vec<GraphLineageRow>)> {
     let root = root_uri.trim_end_matches('/');
-    let (entries, version_metadata) = build_initial_entries(root, catalog).await?;
+    let (entries, version_metadata) = build_initial_entries(root, catalog, control_session).await?;
 
     // Genesis graph commit: parentless, actorless, minted once and folded into
     // the init write so `__manifest` is the single source of graph lineage from
@@ -57,6 +59,7 @@ pub(super) async fn init_manifest_graph(
         data_storage_version: Some(LanceFileVersion::V2_2),
         auto_cleanup: None,
         skip_auto_cleanup: true,
+        session: Some(Arc::clone(control_session)),
         ..Default::default()
     };
     let manifest_path = manifest_uri(root);
@@ -69,17 +72,32 @@ pub(super) async fn init_manifest_graph(
         .map_err(|e| OmniError::Lance(e.to_string()))?;
     stamp_current_version(&mut dataset).await?;
 
-    let known_state = read_manifest_state(&dataset).await?;
-    Ok((dataset, known_state))
+    let (known_state, lineage_rows) = read_manifest_state_and_lineage(&dataset).await?;
+    Ok((dataset, known_state, lineage_rows))
 }
 
 pub(super) async fn open_manifest_graph(
     root_uri: &str,
     branch: Option<&str>,
+    control_session: &Arc<lance::session::Session>,
 ) -> Result<(Dataset, ManifestState)> {
-    let dataset = open_manifest_dataset(root_uri.trim_end_matches('/'), branch).await?;
+    let dataset =
+        open_manifest_dataset_with_session(root_uri.trim_end_matches('/'), branch, control_session)
+            .await?;
     let known_state = read_manifest_state(&dataset).await?;
     Ok((dataset, known_state))
+}
+
+pub(super) async fn open_manifest_graph_with_lineage(
+    root_uri: &str,
+    branch: Option<&str>,
+    control_session: &Arc<lance::session::Session>,
+) -> Result<(Dataset, ManifestState, Vec<GraphLineageRow>)> {
+    let dataset =
+        open_manifest_dataset_with_session(root_uri.trim_end_matches('/'), branch, control_session)
+            .await?;
+    let (known_state, lineage_rows) = read_manifest_state_and_lineage(&dataset).await?;
+    Ok((dataset, known_state, lineage_rows))
 }
 
 pub(super) async fn snapshot_state_at(
@@ -87,7 +105,13 @@ pub(super) async fn snapshot_state_at(
     branch: Option<&str>,
     version: u64,
 ) -> Result<ManifestState> {
-    let dataset = open_manifest_dataset(root_uri.trim_end_matches('/'), branch).await?;
+    let control_session = crate::lance_access::control_session();
+    let dataset = open_manifest_dataset_with_session(
+        root_uri.trim_end_matches('/'),
+        branch,
+        &control_session,
+    )
+    .await?;
     let dataset = dataset
         .checkout_version(version)
         .await
@@ -98,6 +122,7 @@ pub(super) async fn snapshot_state_at(
 async fn build_initial_entries(
     root_uri: &str,
     catalog: &Catalog,
+    control_session: &Arc<lance::session::Session>,
 ) -> Result<(Vec<SubTableEntry>, HashMap<TableIdentity, String>)> {
     let mut entries = Vec::new();
     let mut version_metadata = HashMap::new();
@@ -123,7 +148,7 @@ async fn build_initial_entries(
         let table_path = table_path_for_identity(&table_key, identity)?;
         let full_path = format!("{}/{}", root_uri, table_path);
 
-        let ds = create_empty_dataset(&full_path, &node_type.arrow_schema).await?;
+        let ds = create_empty_dataset(&full_path, &node_type.arrow_schema, control_session).await?;
         let metadata = TableVersionMetadata::from_dataset(root_uri, &table_path, &ds)?;
 
         entries.push(SubTableEntry {
@@ -154,7 +179,7 @@ async fn build_initial_entries(
         let table_path = table_path_for_identity(&table_key, identity)?;
         let full_path = format!("{}/{}", root_uri, table_path);
 
-        let ds = create_empty_dataset(&full_path, &edge_type.arrow_schema).await?;
+        let ds = create_empty_dataset(&full_path, &edge_type.arrow_schema, control_session).await?;
         let metadata = TableVersionMetadata::from_dataset(root_uri, &table_path, &ds)?;
 
         entries.push(SubTableEntry {
@@ -172,7 +197,11 @@ async fn build_initial_entries(
     Ok((entries, version_metadata))
 }
 
-async fn create_empty_dataset(uri: &str, schema: &SchemaRef) -> Result<Dataset> {
+async fn create_empty_dataset(
+    uri: &str,
+    schema: &SchemaRef,
+    control_session: &Arc<lance::session::Session>,
+) -> Result<Dataset> {
     // Keep initialization self-contained even for manifest-level callers that
     // construct an identity-bound compiler catalog directly in tests. Engine
     // catalogs already carry this metadata, but there must never be a
@@ -188,6 +217,7 @@ async fn create_empty_dataset(uri: &str, schema: &SchemaRef) -> Result<Dataset> 
         allow_external_blob_outside_bases: true,
         auto_cleanup: None,
         skip_auto_cleanup: true,
+        session: Some(Arc::clone(control_session)),
         ..Default::default()
     };
     Dataset::write(reader, uri, Some(params))

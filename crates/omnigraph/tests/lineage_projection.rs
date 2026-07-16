@@ -16,7 +16,7 @@
 mod helpers;
 
 use omnigraph::db::commit_graph::CommitGraph;
-use omnigraph::db::{GraphCommit, Omnigraph};
+use omnigraph::db::{GraphCommit, Omnigraph, ReadTarget};
 
 use helpers::*;
 
@@ -191,6 +191,20 @@ async fn graph_lineage_lives_only_in_manifest() {
         merge_commit.graph_commit_id,
         "the merge commit is the head of main"
     );
+    let resolved_main_head = main.resolve_snapshot("main").await.unwrap();
+    assert_eq!(
+        resolved_main_head.as_str(),
+        merge_commit.graph_commit_id,
+        "the production snapshot resolver and lineage projection must expose the same main head"
+    );
+    let resolved_main_snapshot = main.snapshot_of(ReadTarget::branch("main")).await.unwrap();
+    let resolved_main_commit = main.get_commit(resolved_main_head.as_str()).await.unwrap();
+    assert_eq!(
+        resolved_main_commit.manifest_version,
+        resolved_main_snapshot.version(),
+        "without intervening physical-only maintenance, main's resolved snapshot and head \
+         lineage must come from one manifest version"
+    );
 
     // ── feature lineage projected from `__manifest` ──────────────────────────
     let feature_commits = projected_commits(&uri, Some("feature")).await;
@@ -204,6 +218,26 @@ async fn graph_lineage_lives_only_in_manifest() {
         feature_head_commit.actor_id.as_deref(),
         Some("act-dave"),
         "feature head is Dave's authored commit"
+    );
+    let resolved_feature_head = main.resolve_snapshot("feature").await.unwrap();
+    assert_eq!(
+        resolved_feature_head.as_str(),
+        feature_head,
+        "the production snapshot resolver and lineage projection must expose the same feature head"
+    );
+    let resolved_feature_snapshot = main
+        .snapshot_of(ReadTarget::branch("feature"))
+        .await
+        .unwrap();
+    let resolved_feature_commit = main
+        .get_commit(resolved_feature_head.as_str())
+        .await
+        .unwrap();
+    assert_eq!(
+        resolved_feature_commit.manifest_version,
+        resolved_feature_snapshot.version(),
+        "without intervening physical-only maintenance, feature's resolved snapshot and head \
+         lineage must come from one manifest version"
     );
 
     // ── actors surface inline from the manifest metadata ─────────────────────

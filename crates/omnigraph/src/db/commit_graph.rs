@@ -44,6 +44,33 @@ impl CommitGraph {
         })
     }
 
+    /// Build the lineage projection from rows decoded alongside one coherent
+    /// manifest-state scan.
+    pub(crate) fn from_manifest_rows(
+        root_uri: &str,
+        active_branch: Option<&str>,
+        rows: Vec<crate::db::manifest::GraphLineageRow>,
+    ) -> Self {
+        let (commit_by_id, head_commit) = build_commit_cache(rows);
+        Self {
+            root_uri: root_uri.trim_end_matches('/').to_string(),
+            active_branch: active_branch.map(str::to_string),
+            commit_by_id,
+            head_commit,
+        }
+    }
+
+    /// Replace this derived cache from rows captured with the coordinator's
+    /// newly-refreshed manifest state.
+    pub(crate) fn replace_from_manifest_rows(
+        &mut self,
+        rows: Vec<crate::db::manifest::GraphLineageRow>,
+    ) {
+        let (commit_by_id, head_commit) = build_commit_cache(rows);
+        self.commit_by_id = commit_by_id;
+        self.head_commit = head_commit;
+    }
+
     /// Insert a just-published commit into the in-memory cache (RFC-013 Phase 7).
     /// The durable write already happened in the manifest publish CAS; this only
     /// keeps the cache consistent for same-handle reads, with no storage I/O.
@@ -225,6 +252,12 @@ async fn load_commit_cache_from_manifest(
 ) -> Result<(HashMap<String, GraphCommit>, Option<GraphCommit>)> {
     let (rows, _) =
         crate::db::manifest::ManifestCoordinator::read_graph_lineage_at(root_uri, branch).await?;
+    Ok(build_commit_cache(rows))
+}
+
+fn build_commit_cache(
+    rows: Vec<crate::db::manifest::GraphLineageRow>,
+) -> (HashMap<String, GraphCommit>, Option<GraphCommit>) {
     let mut commit_by_id = HashMap::with_capacity(rows.len());
     let mut head_commit = None;
     for row in rows {
@@ -242,7 +275,7 @@ async fn load_commit_cache_from_manifest(
         }
         commit_by_id.insert(commit.graph_commit_id.clone(), commit);
     }
-    Ok((commit_by_id, head_commit))
+    (commit_by_id, head_commit)
 }
 
 fn should_replace_head(current: Option<&GraphCommit>, candidate: &GraphCommit) -> bool {
