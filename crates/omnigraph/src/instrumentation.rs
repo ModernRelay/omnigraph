@@ -519,6 +519,7 @@ pub(crate) async fn open_dataset(
 #[derive(Debug, Default)]
 pub struct StorageReadCounts {
     pub read_text: AtomicU64,
+    pub read_text_if_exists: AtomicU64,
     pub exists: AtomicU64,
     pub read_text_versioned: AtomicU64,
     pub list_dir: AtomicU64,
@@ -529,6 +530,9 @@ pub struct StorageReadCounts {
 impl StorageReadCounts {
     pub fn read_text(&self) -> u64 {
         self.read_text.load(Ordering::Relaxed)
+    }
+    pub fn read_text_if_exists(&self) -> u64 {
+        self.read_text_if_exists.load(Ordering::Relaxed)
     }
     pub fn exists(&self) -> u64 {
         self.exists.load(Ordering::Relaxed)
@@ -574,6 +578,13 @@ impl StorageAdapter for CountingStorageAdapter {
     async fn read_text(&self, uri: &str) -> Result<String> {
         self.counts.read_text.fetch_add(1, Ordering::Relaxed);
         self.inner.read_text(uri).await
+    }
+
+    async fn read_text_if_exists(&self, uri: &str) -> Result<Option<String>> {
+        self.counts
+            .read_text_if_exists
+            .fetch_add(1, Ordering::Relaxed);
+        self.inner.read_text_if_exists(uri).await
     }
 
     async fn write_text(&self, uri: &str, contents: &str) -> Result<()> {

@@ -1484,6 +1484,155 @@ async fn cross_handle_refresh_waits_for_live_confirmed_writer() {
     );
 }
 
+/// Recovery discovery lists before it can know which branch/table gates to
+/// acquire. A live writer may publish and delete its completed sidecar between
+/// that LIST and the sidecar GET. The disappearance is successful concurrent
+/// completion, not a storage failure: discovery must skip the vanished URI,
+/// preserve every other error as loud, and let the unrelated branch write
+/// proceed.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[serial]
+async fn recovery_discovery_skips_sidecar_deleted_after_list() {
+    let _scenario = FailScenario::setup();
+    let dir = tempfile::tempdir().unwrap();
+    let uri = dir.path().to_str().unwrap().to_string();
+    let initial = helpers::init_and_load(&dir).await;
+    initial.branch_create("feature").await.unwrap();
+    drop(initial);
+
+    let db_a = Arc::new(Omnigraph::open(&uri).await.unwrap());
+    let db_b = Arc::new(Omnigraph::open(&uri).await.unwrap());
+
+    let writer_rendezvous =
+        helpers::failpoint::Rendezvous::park_first(names::MUTATION_POST_FINALIZE_PRE_PUBLISHER);
+    let writer_db = Arc::clone(&db_a);
+    let writer = tokio::spawn(async move {
+        writer_db
+            .mutate(
+                "main",
+                MUTATION_QUERIES,
+                "insert_person",
+                &mixed_params(&[("$name", "MainListed")], &[("$age", 32)]),
+            )
+            .await
+    });
+    writer_rendezvous.wait_until_reached().await;
+
+    let recovery_dir = dir.path().join("__recovery");
+    assert_eq!(
+        std::fs::read_dir(&recovery_dir).unwrap().count(),
+        1,
+        "precondition: writer A has one confirmed live sidecar"
+    );
+
+    let discovery_rendezvous =
+        helpers::failpoint::Rendezvous::park_first(names::RECOVERY_POST_SIDECAR_LIST_PRE_READ);
+    let follower_db = Arc::clone(&db_b);
+    let follower = tokio::spawn(async move {
+        follower_db
+            .mutate(
+                "feature",
+                MUTATION_QUERIES,
+                "insert_person",
+                &mixed_params(&[("$name", "FeatureFollower")], &[("$age", 33)]),
+            )
+            .await
+    });
+    discovery_rendezvous.wait_until_reached().await;
+
+    writer_rendezvous.release();
+    writer
+        .await
+        .unwrap()
+        .expect("writer A must publish and delete its sidecar normally");
+    assert!(
+        !recovery_dir.exists() || std::fs::read_dir(&recovery_dir).unwrap().next().is_none(),
+        "writer A must delete the sidecar that follower discovery already listed"
+    );
+
+    discovery_rendezvous.release();
+    follower
+        .await
+        .unwrap()
+        .expect("a listed-then-deleted sidecar must not fail the feature write");
+
+    let main_names = collect_column_strings(&read_table(&db_b, "node:Person").await, "name");
+    assert!(main_names.iter().any(|name| name == "MainListed"));
+    assert!(!main_names.iter().any(|name| name == "FeatureFollower"));
+
+    let feature_names = collect_column_strings(
+        &helpers::read_table_branch(&db_b, "feature", "node:Person").await,
+        "name",
+    );
+    assert!(feature_names.iter().any(|name| name == "FeatureFollower"));
+    assert!(!feature_names.iter().any(|name| name == "MainListed"));
+    assert!(
+        !recovery_dir.exists() || std::fs::read_dir(&recovery_dir).unwrap().next().is_none(),
+        "both successful writes must leave no recovery sidecars"
+    );
+}
+
+/// Read-only open has a separate best-effort discovery loop because it does
+/// not run recovery. It must apply the same LIST -> GET disappearance rule:
+/// another process that removes a completed sidecar in that window cannot make
+/// an otherwise coherent read-only open fail. The process-local schema gate
+/// prevents this race against an in-process writer, so the test deletes the
+/// listed file directly to model the cross-process completion.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[serial]
+async fn read_only_recovery_discovery_skips_sidecar_deleted_after_list() {
+    let _scenario = FailScenario::setup();
+    let dir = tempfile::tempdir().unwrap();
+    let uri = dir.path().to_str().unwrap().to_string();
+    let db = helpers::init_and_load(&dir).await;
+
+    {
+        let _failpoint = ScopedFailPoint::new(names::RECOVERY_SIDECAR_CONFIRM, "return");
+        let error = db
+            .mutate(
+                "main",
+                MUTATION_QUERIES,
+                "insert_person",
+                &mixed_params(&[("$name", "ReadOnlyListed")], &[("$age", 34)]),
+            )
+            .await
+            .expect_err("confirmation failure must leave a valid recovery sidecar");
+        assert!(matches!(error, OmniError::RecoveryRequired { .. }));
+    }
+
+    let recovery_dir = dir.path().join("__recovery");
+    assert_eq!(
+        std::fs::read_dir(&recovery_dir).unwrap().count(),
+        1,
+        "precondition: the interrupted writer left one valid sidecar"
+    );
+
+    let discovery_rendezvous =
+        helpers::failpoint::Rendezvous::park_first(names::RECOVERY_POST_SIDECAR_LIST_PRE_READ);
+    let reader_uri = uri.clone();
+    let reader = tokio::spawn(async move { Omnigraph::open_read_only(&reader_uri).await });
+    discovery_rendezvous.wait_until_reached().await;
+
+    let listed_sidecar = std::fs::read_dir(&recovery_dir)
+        .unwrap()
+        .next()
+        .unwrap()
+        .unwrap()
+        .path();
+    std::fs::remove_file(&listed_sidecar).unwrap();
+
+    discovery_rendezvous.release();
+    let read_only = reader
+        .await
+        .unwrap()
+        .expect("a listed-then-deleted sidecar must not fail read-only open");
+    assert_eq!(
+        helpers::count_rows(&read_only, "node:Person").await,
+        4,
+        "read-only open remains pinned to the last published manifest"
+    );
+}
+
 /// A ReadWrite open is itself a recovery actor. It must join the same
 /// root-scoped gates as an already-open handle before running Full recovery;
 /// otherwise it can classify an Armed pre-fork sidecar as dead and delete it
@@ -10281,9 +10430,10 @@ async fn branch_merge_fences_concurrent_sync_on_same_handle() {
 }
 
 /// The post-table-gate merge check must read storage, not the swapped
-/// coordinator's cached snapshot. Advance only the target manifest while merge
-/// is parked after authority capture; the table version itself stays unchanged,
-/// so only a fresh manifest-incarnation comparison catches the stale plan.
+/// coordinator's cached snapshot. Advance the target branch while merge is
+/// parked after authority capture; the legacy publish seam moves both the
+/// table pin and graph lineage, so fresh authority comparison catches the
+/// stale plan before any merge effect.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 #[serial]
 async fn branch_merge_rejects_fresh_target_manifest_change_before_effects() {
@@ -10302,8 +10452,9 @@ async fn branch_merge_rejects_fresh_target_manifest_change_before_effects() {
 
     let before = helpers::version_branch(&merge_db, "target").await.unwrap();
     // Advance the target's physical HEAD without changing row content, then
-    // publish that new pin through the legacy test seam. The merge handle's
-    // cached target snapshot remains at `before`.
+    // publish that new pin through the legacy test seam. The seam also advances
+    // `graph_head`; the merge handle's cached target snapshot remains at
+    // `before`.
     let person_uri = node_table_uri(&target_writer, "Person").await;
     let mut raw_target = lance::Dataset::open(&person_uri)
         .await
@@ -10339,7 +10490,7 @@ async fn branch_merge_rejects_fresh_target_manifest_change_before_effects() {
         Some(omnigraph::error::ManifestConflictDetails::ReadSetChanged {
             ref member,
             ..
-        }) if member == "branch_merge_target:target"
+        }) if member == "graph_head:target"
     ));
     assert!(
         !dir.path().join("__recovery").exists()

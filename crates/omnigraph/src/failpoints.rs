@@ -166,6 +166,12 @@ pub mod names {
     pub const RECOVERY_SIDECAR_CONFIRM: &str = "recovery.sidecar_confirm";
     pub const RECOVERY_SIDECAR_DELETE: &str = "recovery.sidecar_delete";
     pub const RECOVERY_SIDECAR_LIST: &str = "recovery.sidecar_list";
+    /// After recovery discovery lists and sorts `__recovery/`, before it reads
+    /// the first sidecar body. Tests let a live writer publish and delete its
+    /// sidecar in this window, proving a raced NotFound is concurrent
+    /// completion rather than a storage failure.
+    pub const RECOVERY_POST_SIDECAR_LIST_PRE_READ: &str =
+        "recovery.post_sidecar_list_pre_read";
     pub const RECOVERY_SIDECAR_WRITE: &str = "recovery.sidecar_write";
     pub const SCHEMA_APPLY_AFTER_MANIFEST_COMMIT: &str = "schema_apply.after_manifest_commit";
     pub const SCHEMA_APPLY_AFTER_STAGING_WRITE: &str = "schema_apply.after_staging_write";

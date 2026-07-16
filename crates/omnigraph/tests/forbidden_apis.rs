@@ -464,7 +464,7 @@ macro_rules! gateway_surfaces {
 // or an entirely new primitive name before a crate-internal caller can use it.
 gateway_surfaces! {
     "storage.rs" => "StorageAdapter" => GatewayDisposition::ReadOrPure => [
-        "read_text", "exists", "list_dir", "read_text_versioned",
+        "read_text", "read_text_if_exists", "exists", "list_dir", "read_text_versioned",
     ],
     "storage.rs" => "StorageAdapter" => GatewayDisposition::Durable(WriteProtocol::Composed("object storage primitive")) => [
         "write_text", "write_text_if_absent", "rename_text", "delete",

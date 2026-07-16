@@ -789,7 +789,7 @@ drift as an unattributed side effect — both while the stale sidecar
 lingers to misclassify later.
 Sidecars that would require a `Dataset::restore` (mixed / unexpected
 state) are deferred to the next `OpenMode::ReadWrite` open. Full open-time
-recovery uses the same root-scoped ordered gates and post-wait existence check,
+recovery uses the same root-scoped ordered gates and post-wait optional body reread,
 so it cannot Restore/delete under a live writer owned by another handle in the
 same process. Restore remains unsafe across processes because Lance's
 `check_restore_txn` accepts
@@ -851,6 +851,11 @@ storage-fault failpoints `recovery.sidecar_{write,delete,list}` /
   consumer — the write-entry heal fails the write, the open-time sweep
   fails the open. Silently skipping recovery would be consumer
   tolerance of drift.
+- **A listed sidecar disappears before its body is read**: benign
+  concurrent completion. A writer may publish and delete its sidecar
+  between discovery's LIST and GET. The single-GET optional read maps
+  only the backend's typed `NotFound` to absence and skips that URI;
+  malformed/future sidecars and every other read failure remain loud.
 - **Corrupt / unparseable sidecar**: refused loudly by heal and read-write
   open; the file stays on disk for operator inspection. Read-only open keeps
   its historical tolerance when no schema staging exists, but returns
@@ -870,9 +875,12 @@ Backend notes (the adapter is one implementation over `object_store`
 for every backend): local writes stage through `name#<digits>` temp
 files that the backend filters from listings and refuses to address —
 crash residue of that shape is invisible to the sweep, harmless, and
-reclaimed by `delete_prefix`/manual cleanup. Storage errors are
-backend-wrapped text without a typed NotFound discriminant — callers
-that need missing-vs-error (the cluster store) probe `exists()` first.
+reclaimed by `delete_prefix`/manual cleanup. Ordinary `read_text`
+keeps backend-wrapped errors. `read_text_if_exists` performs one GET
+and returns `None` only for the underlying object-store `NotFound`;
+recovery discovery uses it because a listed sidecar may be finalized
+concurrently. It does not use an `exists()` → `read_text` check, which
+would introduce another race. Other storage failures remain errors.
 `exists()` itself is object-store semantics everywhere: only objects
 (or non-empty prefixes) exist, and a permission failure is a loud
 error, not a silent `false`.
