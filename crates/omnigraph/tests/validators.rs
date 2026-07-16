@@ -353,7 +353,11 @@ edge Knows: Person -> Person
 "#;
 
 /// Cross-version uniqueness is now enforced on the bulk-load path too: a second
-/// Append load duplicating a committed `@unique` value is rejected.
+/// Append load duplicating a committed `@unique` value is rejected. The second
+/// load carries a MULTI-ROW batch (one colliding row + one clean row) so it
+/// exercises the batched committed probe (one scan for the whole key set, the
+/// colliding key found in the returned map) and load atomicity (the clean row
+/// must not survive the rejected load).
 #[tokio::test]
 async fn cross_version_unique_rejected_on_append_load() {
     let (_dir, mut db) = init_with(UNIQUE_SCHEMA, "").await;
@@ -366,7 +370,8 @@ async fn cross_version_unique_rejected_on_append_load() {
     .unwrap();
     let err = load_jsonl(
         &mut db,
-        r#"{"type":"User","data":{"name":"Carol","email":"dup@example.com"}}"#,
+        r#"{"type":"User","data":{"name":"Carol","email":"dup@example.com"}}
+{"type":"User","data":{"name":"Dave","email":"dave@example.com"}}"#,
         LoadMode::Append,
     )
     .await
@@ -375,6 +380,12 @@ async fn cross_version_unique_rejected_on_append_load() {
         err.to_string().contains("@unique violation on User.email"),
         "got: {}",
         err
+    );
+    // Atomicity: the clean sibling row was rejected with the batch.
+    assert_eq!(
+        count_rows(&db, "node:User").await,
+        1,
+        "rejected load must not commit its clean sibling row"
     );
 }
 

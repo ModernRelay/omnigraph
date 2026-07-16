@@ -493,3 +493,76 @@ async fn manifest_reads_capture_warm_probe() {
     })
     .await;
 }
+
+// ── (F) Batched committed `@unique` probes — flat in DELTA rows ──
+
+/// The committed cross-version `@unique` probe is BATCHED per (table, group):
+/// one dataset open + one filtered scan per group regardless of how many rows
+/// the delta carries. Pre-batching shape (the ~40× S3 merge-vs-overwrite gap):
+/// Pass 3 of `evaluate_unique` awaited one probe PER ROW, and each probe
+/// re-opened the dataset (validation snapshots deliberately carry no read
+/// caches), so `data_open_count` grew ~1:1 with delta rows. This sweeps DELTA
+/// SIZE (not history depth) at a fixed shallow history and pins the flat term.
+#[tokio::test]
+async fn unique_probe_io_is_flat_in_delta_rows() {
+    const UNIQUE_COST_SCHEMA: &str = r#"
+node User {
+    name: String @key
+    email: String? @unique
+}
+"#;
+    fn users_jsonl(tag: &str, rows: u64) -> String {
+        (0..rows)
+            .map(|i| {
+                format!(
+                    r#"{{"type":"User","data":{{"name":"{tag}-{i}","email":"{tag}-{i}@example.com"}}}}"#
+                )
+            })
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
+    let mut curve: Vec<(u64, IoCounts)> = Vec::new();
+    for rows in [4u64, 64] {
+        let dir = tempfile::tempdir().unwrap();
+        let uri = dir.path().to_str().unwrap();
+        let mut db = omnigraph::db::Omnigraph::init(uri, UNIQUE_COST_SCHEMA)
+            .await
+            .unwrap();
+        // Committed baseline so the cross-version `@unique` probe has a
+        // non-empty committed view (an empty view skips the probe entirely).
+        omnigraph::loader::load_jsonl(
+            &mut db,
+            &users_jsonl("seed", 4),
+            omnigraph::loader::LoadMode::Append,
+        )
+        .await
+        .unwrap();
+        let (res, io) = measure(omnigraph::loader::load_jsonl(
+            &mut db,
+            &users_jsonl(&format!("delta{rows}"), rows),
+            omnigraph::loader::LoadMode::Append,
+        ))
+        .await;
+        res.unwrap();
+        eprintln!(
+            "unique-probe load of {rows} rows: data_open_count={} data_scan_reads={}",
+            io.data_open_count, io.data_scan_reads
+        );
+        curve.push((rows, io));
+    }
+    // Pre-batching this grew ~1:1 with rows (4 → ~8 opens vs 64 → ~68); batched
+    // it is one probe open per (table, group) plus the load's own constant opens.
+    assert_flat(
+        &curve,
+        |c| c.data_open_count,
+        4,
+        "data-table opens per load (batched unique probe)",
+    );
+    assert_flat(
+        &curve,
+        |c| c.data_scan_reads,
+        16,
+        "data-table scan reads per load (batched unique probe)",
+    );
+}
