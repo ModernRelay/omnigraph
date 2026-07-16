@@ -25,7 +25,7 @@
 
 use std::sync::Arc;
 
-use arrow_array::{Int32Array, RecordBatch, RecordBatchIterator, StringArray};
+use arrow_array::{Array, Int32Array, RecordBatch, RecordBatchIterator, StringArray};
 use arrow_schema::{DataType, Field, Schema};
 use lance::Dataset;
 use lance::dataset::builder::DatasetBuilder;
@@ -1669,4 +1669,101 @@ async fn second_index_on_column_requires_explicit_distinct_name() {
         "expected two distinct index types on the column, got {:?}",
         type_urls(&after_named)
     );
+}
+
+// --- Guard 24: second-generation shallow-clone index reads fail upstream ------
+//
+// PURE-LANCE repro of the fork-lineage index bug (no omnigraph code): a
+// dataset's index files are recorded via `base_paths` redirects when a branch
+// is shallow-cloned, but cloning a CLONE records the redirect against the
+// immediate source tree instead of composing the source's own redirect to
+// where the files actually live. Every index-consuming read through the
+// second-generation branch then hard-errors with `Not found:
+// …/tree/<parent>/_indices/…` instead of degrading.
+//
+// Omnigraph hits this whenever a branch-of-a-branch materializes its own
+// table fork (e.g. a fast-forward `branch_merge` into a non-main target) and
+// a query then probes ANY index — BTREE equality, FTS `search`. It is the
+// reason the free-text companion BTREE (equality/prefix acceleration) is
+// deferred: it would widen the exposure to every `@key` equality lookup.
+//
+// This guard asserts the BUG (like the former blob-compaction guard): it
+// turns RED when a Lance bump fixes second-generation clone index reads —
+// then (1) delete this guard, (2) re-land the companion-BTREE dispatch
+// (`plan_index_work_node`) with its tests, and (3) re-check
+// `branch_merge_into_non_main_target_works` against the dual-index truth.
+#[tokio::test]
+async fn second_generation_branch_index_reads_fail_upstream() {
+    use futures::TryStreamExt;
+
+    let dir = tempfile::tempdir().unwrap();
+    let uri = dir.path().join("guard24.lance");
+    let uri = uri.to_str().unwrap();
+
+    // Base dataset with a BTREE on `value` (the exact index-build call shape
+    // the engine uses).
+    let mut ds = fresh_dataset(uri).await;
+    ds.create_index_builder(&["value"], IndexType::BTree, &ScalarIndexParams::default())
+        .replace(true)
+        .await
+        .unwrap();
+
+    // First-generation branch (the engine's fork call shape), plus a write so
+    // the branch has its own commits.
+    let version = ds.version().version;
+    let mut feature = ds.create_branch("feature", version, None).await.unwrap();
+    let schema = Arc::new(Schema::new(vec![
+        Field::new("id", DataType::Utf8, false),
+        Field::new("value", DataType::Int32, false),
+    ]));
+    let batch = RecordBatch::try_new(
+        schema.clone(),
+        vec![
+            Arc::new(StringArray::from(vec!["carol"])),
+            Arc::new(Int32Array::from(vec![3])),
+        ],
+    )
+    .unwrap();
+    let reader = RecordBatchIterator::new(vec![Ok(batch)], schema.clone());
+    feature.append(reader, None).await.unwrap();
+
+    // An indexed read through the FIRST-generation branch works: the clone's
+    // base-path redirect resolves the index files in the root tree.
+    async fn indexed_rows(ds: &Dataset) -> lance::Result<usize> {
+        let mut scanner = ds.scan();
+        scanner.filter("value = 1").unwrap();
+        let batches: Vec<RecordBatch> = scanner.try_into_stream().await?.try_collect().await?;
+        Ok(batches.iter().map(|b| b.num_rows()).sum())
+    }
+    assert_eq!(
+        indexed_rows(&feature).await.unwrap(),
+        1,
+        "first-generation clone must resolve parent index files"
+    );
+
+    // Second-generation branch: clone the clone.
+    let feature_version = feature.version().version;
+    let experiment = feature
+        .create_branch("experiment", feature_version, None)
+        .await
+        .unwrap();
+
+    // The indexed read through the second-generation clone currently fails
+    // with a Not-found on `tree/feature/_indices/...` — the redirect points at
+    // the immediate source tree, where the index files never lived.
+    let result = indexed_rows(&experiment).await;
+    match result {
+        Err(e) => {
+            let msg = e.to_string();
+            assert!(
+                msg.contains("Not found") && msg.contains("_indices"),
+                "expected the known index-file Not-found failure, got: {msg}"
+            );
+        }
+        Ok(n) => panic!(
+            "second-generation clone indexed read SUCCEEDED ({n} rows) — Lance fixed \
+             clone-of-clone index base paths. Delete this guard, re-land the free-text \
+             companion BTREE dispatch, and re-validate the branch-merge topology tests."
+        ),
+    }
 }
