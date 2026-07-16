@@ -12,8 +12,10 @@ The per-property index a column gets is decided by `node_prop_index_kind` (share
 by the builder and the sidecar-pinning coverage check so they cannot drift):
 enums and orderable scalars → BTREE, free-text Strings → FTS **plus** BTREE,
 `Vector` → vector, list/`Blob` columns → none. A second index on the same column
-carries an explicit name (`{column}_btree_idx`) because Lance's default index
-name is shared per column and `replace` removes by name.
+carries an explicit name (`{column}_btree`) because Lance's default index name
+is shared per column and `replace` removes by name; the companion suffix
+deliberately does not end in `_idx`, so no column name can produce a default
+index name that collides with it.
 
 > **Free-text Strings are equality- and prefix-indexed via the companion
 > BTREE.** The FTS inverted index is only consulted for

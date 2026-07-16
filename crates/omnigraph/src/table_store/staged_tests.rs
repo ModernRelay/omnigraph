@@ -1079,7 +1079,7 @@ async fn stage_create_indices_batches_mixed_types_into_one_exact_commit() {
                 // name (the dual-index shape free-text @index columns get).
                 IndexBuildSpec::BTree {
                     column: "body".to_string(),
-                    name: Some("body_btree_idx".to_string()),
+                    name: Some("body_btree".to_string()),
                 },
                 IndexBuildSpec::Vector {
                     column: "embedding".to_string(),

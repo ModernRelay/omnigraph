@@ -687,11 +687,15 @@ async fn plan_index_work_node(
                 // Lance never consults an inverted index for either. The
                 // explicit name is load-bearing: the FTS index holds the
                 // column's default name, and an unnamed BTREE build would
-                // replace it (see `IndexBuildSpec::BTree`).
+                // replace it (see `IndexBuildSpec::BTree`). The `_btree`
+                // suffix deliberately does NOT end in `_idx`: every Lance
+                // default index name is `{column}_idx`, so no column name —
+                // however adversarial — can produce a default that collides
+                // with a companion name.
                 if !db.storage().has_btree_index(ds, prop_name).await? {
                     work.push_spec(crate::storage_layer::IndexBuildSpec::BTree {
                         column: prop_name.clone(),
-                        name: Some(format!("{prop_name}_btree_idx")),
+                        name: Some(format!("{prop_name}_btree")),
                     });
                 }
             }

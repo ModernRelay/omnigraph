@@ -703,6 +703,13 @@ fn execute_pipeline<'a>(
                         hoisted_indices.insert(i);
                     }
                 } else if is_string_match_filter(filter)
+                    // The needle must be a literal or param: scan-level
+                    // lowering drops variable qualifiers (PropAccess becomes
+                    // a bare column ident), so a cross-variable predicate
+                    // hoisted into one scan would degenerate to comparing a
+                    // column with itself. Cross-variable forms stay in the
+                    // in-memory arm, which evaluates on the joined wide batch.
+                    && matches!(&filter.right, IRExpr::Literal(_) | IRExpr::Param(_))
                     && ir_filter_to_expr(filter, params, None).is_some()
                 {
                     if let IRExpr::PropAccess { variable, .. } = &filter.left {
