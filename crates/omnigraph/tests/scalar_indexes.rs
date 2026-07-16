@@ -4,8 +4,9 @@
 //! The observable signal is `SnapshotTable::index_coverage`, which
 //! reports `Indexed` only when a BTREE covers the column (the same helper the
 //! traversal chooser uses). Enums and orderable scalars must get a BTREE so
-//! `=`/range/IN/IS NULL are index-accelerated; free-text Strings get FTS
-//! *plus* an explicitly-named companion BTREE (equality + `starts_with`).
+//! `=`/range/IN/IS NULL are index-accelerated; free-text Strings keep FTS
+//! only (a companion BTREE is deferred on the second-generation clone
+//! index-read bug — see `lance_surface_guards`).
 
 mod helpers;
 
@@ -31,12 +32,12 @@ const DATA: &str = r#"{"type":"Item","data":{"slug":"a","status":"active","publi
 {"type":"Item","data":{"slug":"c","status":"active","published":"2025-02-02T00:00:00Z","rank":3,"title":"gamma","note":"n3"}}"#;
 
 // Enums and orderable scalars (DateTime, numeric) get a BTREE from the index
-// reconciler, so a `=`/range filter on them uses the index. A free-text
-// String `@index` gets FTS plus a companion BTREE (so `=` and `starts_with`
-// are index-accelerated too); an un-annotated column has no scalar index and
-// reports `Degraded`, the negative control that keeps this test from being
-// vacuously green. A second `ensure_indices` run must be a no-op (the
-// dual-index check matches by column + type, not name).
+// reconciler, so a `=`/range filter on them uses the index. Free-text
+// String `@index` keeps FTS only (its companion BTREE is deferred on the
+// upstream clone-of-clone index-read bug), and an un-annotated column has no
+// scalar index — both report `Degraded`, the negative control that keeps
+// this test from being vacuously green. A second `ensure_indices` run must
+// be a no-op.
 #[tokio::test]
 async fn node_scalar_and_enum_index_columns_get_btree() {
     let dir = tempfile::tempdir().unwrap();
@@ -57,17 +58,13 @@ async fn node_scalar_and_enum_index_columns_get_btree() {
         );
     }
 
-    // Free-text String @index -> FTS plus a companion BTREE; both must stand.
+    // Free-text String @index -> FTS, which is not a BTREE -> Degraded.
     let title_cov = ds.index_coverage("title").await.unwrap();
-    assert_eq!(
-        title_cov,
-        IndexCoverage::Indexed,
-        "free-text String @index must get a companion BTREE alongside FTS, got {title_cov:?}"
-    );
     assert!(
-        ds.has_fts_index("title").await.unwrap(),
-        "the companion BTREE must not replace the FTS index (explicit-name contract)"
+        matches!(title_cov, IndexCoverage::Degraded { .. }),
+        "free-text String @index keeps FTS only while the companion BTREE is deferred, got {title_cov:?}"
     );
+    assert!(ds.has_fts_index("title").await.unwrap());
 
     // No @index annotation -> no scalar index at all -> Degraded.
     let note_cov = ds.index_coverage("note").await.unwrap();
@@ -89,48 +86,6 @@ async fn node_scalar_and_enum_index_columns_get_btree() {
     );
 }
 
-// The companion BTREE's name must be impossible to collide with any DEFAULT
-// index name (`{column}_idx`): a column literally named after another
-// column's companion would otherwise produce two indexes with one name,
-// which the staged batch rejects — leaving ensure_indices permanently
-// failing for a legal schema. All defaults end in `_idx`; the companion
-// suffix deliberately does not.
-#[tokio::test]
-async fn companion_btree_name_cannot_collide_with_default_index_names() {
-    const COLLIDING_SCHEMA: &str = r#"
-node Thing {
-    slug: String @key
-    text: String @index
-    text_btree: I32 @index
-}
-"#;
-    const ROWS: &str = r#"{"type":"Thing","data":{"slug":"t1","text":"hello world","text_btree":1}}
-{"type":"Thing","data":{"slug":"t2","text":"beta ray","text_btree":2}}"#;
-
-    let dir = tempfile::tempdir().unwrap();
-    let uri = dir.path().to_str().unwrap();
-    let mut db = Omnigraph::init(uri, COLLIDING_SCHEMA).await.unwrap();
-    load_jsonl(&mut db, ROWS, LoadMode::Overwrite).await.unwrap();
-    db.ensure_indices()
-        .await
-        .expect("companion names must not collide with another column's default index name");
-
-    let snap = snapshot_main(&db).await.unwrap();
-    let ds = snap.open("node:Thing").await.unwrap();
-    for col in ["text", "text_btree"] {
-        assert_eq!(
-            ds.index_coverage(col).await.unwrap(),
-            IndexCoverage::Indexed,
-            "both '{col}' BTREEs must land despite the adversarial column name"
-        );
-    }
-    assert!(ds.has_fts_index("text").await.unwrap());
-
-    // And the second run converges instead of the two same-named indexes
-    // replacing each other forever.
-    let version_before = ds.version();
-    db.ensure_indices().await.unwrap();
-    let snap2 = snapshot_main(&db).await.unwrap();
-    let ds2 = snap2.open("node:Thing").await.unwrap();
-    assert_eq!(version_before, ds2.version(), "second run must be a no-op");
-}
+// (The companion-BTREE naming-collision regression — a column literally
+// named `{other}_btree` colliding with another column's companion index name
+// — lives on the `dual-btree-companion` branch with the deferred dispatch.)

@@ -616,8 +616,7 @@ pub(super) struct IndexWorkStatus {
 /// Per `build_indices_on_dataset_for_catalog`, nodes get BTree (id) plus, for
 /// each one-column `@index`/`@key` property, the index `node_prop_index_kind`
 /// assigns: a scalar BTREE for enums and orderable scalars
-/// (DateTime/Date/numeric/Bool), FTS *plus* an explicitly-named BTREE for
-/// free-text Strings (equality + `starts_with` acceleration), or a Vector
+/// (DateTime/Date/numeric/Bool), FTS for free-text Strings, or a Vector
 /// index. Edges get BTree only (id, src, dst). This helper and the builder
 /// share `node_prop_index_kind` so they cannot drift — see its doc comment.
 #[derive(Default)]
@@ -682,22 +681,18 @@ async fn plan_index_work_node(
                         column: prop_name.clone(),
                     });
                 }
-                // Free-text Strings additionally get a BTREE so equality and
-                // `starts_with` (LikePrefix) filters are index-accelerated —
-                // Lance never consults an inverted index for either. The
-                // explicit name is load-bearing: the FTS index holds the
-                // column's default name, and an unnamed BTREE build would
-                // replace it (see `IndexBuildSpec::BTree`). The `_btree`
-                // suffix deliberately does NOT end in `_idx`: every Lance
-                // default index name is `{column}_idx`, so no column name —
-                // however adversarial — can produce a default that collides
-                // with a companion name.
-                if !db.storage().has_btree_index(ds, prop_name).await? {
-                    work.push_spec(crate::storage_layer::IndexBuildSpec::BTree {
-                        column: prop_name.clone(),
-                        name: Some(format!("{prop_name}_btree")),
-                    });
-                }
+                // DEFERRED: a companion BTREE here would index-accelerate
+                // equality and `starts_with` on free-text Strings (Lance
+                // never consults an inverted index for either), and the
+                // staged machinery supports it (`IndexBuildSpec::BTree`
+                // explicit names; the same-column batch test). It is held
+                // back because Lance's second-generation shallow clones
+                // cannot read parent index files at all — every indexed read
+                // through a branch-of-a-branch fork hard-errors, and the
+                // companion would widen that exposure to every `@key`
+                // equality lookup. Re-land when
+                // `lance_surface_guards::second_generation_branch_index_reads_fail_upstream`
+                // turns red (its panic message carries the checklist).
             }
             Some(NodePropIndexKind::Vector) => {
                 if !db.storage().has_vector_index(ds, prop_name).await? {

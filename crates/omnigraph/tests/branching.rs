@@ -987,9 +987,8 @@ async fn merged_rewritten_indexed_table_is_searchable_immediately() {
     let user_indices: Vec<_> = indices.iter().filter(|idx| !is_system_index(idx)).collect();
     assert_eq!(
         user_indices.len(),
-        7,
-        "expected rebuilt id BTree plus slug/title/body inverted indices and \
-         their companion BTREEs after rewritten merge"
+        4,
+        "expected rebuilt id BTree plus key-property and title/body indices after rewritten merge"
     );
 }
 
