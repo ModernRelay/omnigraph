@@ -24,6 +24,9 @@
 mod helpers;
 
 use std::collections::{BTreeMap, HashMap};
+use std::future::Future;
+use std::panic::{AssertUnwindSafe, resume_unwind};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 
 use arrow_array::{
@@ -31,7 +34,7 @@ use arrow_array::{
 };
 use arrow_schema::{DataType, Field, Schema, SchemaRef};
 use datafusion::prelude::{col, lit};
-use futures::TryStreamExt;
+use futures::{FutureExt, TryStreamExt};
 use lance::Dataset;
 use lance::dataset::optimize::{CompactionOptions, compact_files};
 use lance::dataset::scanner::ExecutionSummaryCounts;
@@ -1151,6 +1154,50 @@ fn assert_matrix_contract(
     assert!(deep.cost.rows_scanned > shallow.cost.rows_scanned);
 }
 
+async fn run_with_cleanup<RunFuture, CleanupFuture>(
+    run: RunFuture,
+    cleanup: CleanupFuture,
+    cleanup_context: &str,
+) where
+    RunFuture: Future<Output = ()>,
+    CleanupFuture: Future<Output = Result<(), String>>,
+{
+    let run_result = AssertUnwindSafe(run).catch_unwind().await;
+    let cleanup_result = cleanup.await;
+
+    match run_result {
+        Ok(()) => cleanup_result.unwrap_or_else(|error| panic!("{cleanup_context}: {error}")),
+        Err(payload) => {
+            if let Err(error) = cleanup_result {
+                eprintln!("{cleanup_context} after the guarded operation also failed: {error}");
+            }
+            resume_unwind(payload);
+        }
+    }
+}
+
+#[tokio::test]
+async fn cleanup_runs_when_guarded_matrix_panics() {
+    let cleaned = Arc::new(AtomicBool::new(false));
+    let cleanup_witness = Arc::clone(&cleaned);
+    let result = AssertUnwindSafe(run_with_cleanup(
+        async { panic!("intentional matrix failure") },
+        async move {
+            cleanup_witness.store(true, Ordering::SeqCst);
+            Ok(())
+        },
+        "test cleanup",
+    ))
+    .catch_unwind()
+    .await;
+
+    assert!(result.is_err(), "the original matrix panic must propagate");
+    assert!(
+        cleaned.load(Ordering::SeqCst),
+        "cleanup must run before the original matrix panic propagates"
+    );
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn local_durable_head_lookup_matrix_is_correct_and_observable() {
     let dir = tempfile::tempdir().unwrap();
@@ -1187,12 +1234,20 @@ async fn s3_durable_head_lookup_matrix_is_correct_and_observable() {
     let (store, path) = lance_io::object_store::ObjectStore::from_uri(&base_uri)
         .await
         .expect("configured RFC-024 S3/RustFS fixture prefix must resolve");
-    let curve = run_matrix(&base_uri, &DEFAULT_DEPTHS, StorageBackend::S3).await;
-    assert_matrix_contract(&curve, &DEFAULT_DEPTHS, StorageBackend::S3);
-    store
-        .remove_dir_all(path)
-        .await
-        .expect("configured RFC-024 S3/RustFS fixture cleanup must succeed");
+    run_with_cleanup(
+        async {
+            let curve = run_matrix(&base_uri, &DEFAULT_DEPTHS, StorageBackend::S3).await;
+            assert_matrix_contract(&curve, &DEFAULT_DEPTHS, StorageBackend::S3);
+        },
+        async move {
+            store
+                .remove_dir_all(path)
+                .await
+                .map_err(|error| error.to_string())
+        },
+        "configured RFC-024 S3/RustFS fixture cleanup must succeed",
+    )
+    .await;
 }
 
 /// On-demand decision-scale run.  It intentionally exercises the complete
