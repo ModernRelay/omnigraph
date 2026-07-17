@@ -393,11 +393,16 @@ impl<'a> CommittedState<'a> {
         let Some(ds) = self.open(table_key).await? else {
             return Ok(holders);
         };
-        let wanted: HashSet<&Vec<String>> = keys.iter().map(|(canonical, _)| canonical).collect();
         let projection: Vec<&str> = std::iter::once("id")
             .chain(columns.iter().map(String::as_str))
             .collect();
         for chunk in keys.chunks(UNIQUE_PROBE_CHUNK_KEYS) {
+            // Per-CHUNK wanted set: a composite chunk's AND-of-IN-lists superset
+            // can match a tuple belonging to a different chunk; every requested
+            // tuple is matched by its own chunk's scan, so collecting it only
+            // there keeps each holder exactly once.
+            let wanted: HashSet<&Vec<String>> =
+                chunk.iter().map(|(canonical, _)| canonical).collect();
             let mut expr: Option<Expr> = None;
             for (i, column) in columns.iter().enumerate() {
                 // Dedup per-column values by their canonical rendering (two keys
