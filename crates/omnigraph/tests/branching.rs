@@ -470,22 +470,13 @@ async fn branch_merge_with_blob_columns_preserves_blob_data() {
     let outcome = main.branch_merge("feature", "main").await.unwrap();
     assert_eq!(outcome, MergeOutcome::Merged);
 
-    let readme = main
-        .read_blob("Document", "readme", "content")
-        .await
-        .unwrap();
-    let readme_bytes = readme.read().await.unwrap();
+    let readme_bytes = read_blob_bytes(&main, "Document", "readme", "content").await;
     assert_eq!(&readme_bytes[..], b"Hello");
 
-    let seed = main.read_blob("Document", "seed", "content").await.unwrap();
-    let seed_bytes = seed.read().await.unwrap();
+    let seed_bytes = read_blob_bytes(&main, "Document", "seed", "content").await;
     assert_eq!(&seed_bytes[..], b"Seed");
 
-    let main_doc = main
-        .read_blob("Document", "main-doc", "content")
-        .await
-        .unwrap();
-    let main_doc_bytes = main_doc.read().await.unwrap();
+    let main_doc_bytes = read_blob_bytes(&main, "Document", "main-doc", "content").await;
     assert_eq!(&main_doc_bytes[..], b"Main");
 }
 
@@ -530,11 +521,10 @@ async fn branch_merge_with_external_blob_uri_materializes_payload() {
     let outcome = main.branch_merge("feature", "main").await.unwrap();
     assert_eq!(outcome, MergeOutcome::Merged);
 
-    let external = main
-        .read_blob("Document", "external", "content")
-        .await
-        .unwrap();
-    let external_bytes = external.read().await.unwrap();
+    // The keyed Append path materializes the external payload, so the merged
+    // cell must classify as an INTERNAL blob (read_blob_bytes panics on an
+    // external reference) with the exact bytes.
+    let external_bytes = read_blob_bytes(&main, "Document", "external", "content").await;
     assert_eq!(&external_bytes[..], b"External");
 }
 

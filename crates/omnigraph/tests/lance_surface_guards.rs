@@ -2605,3 +2605,95 @@ async fn filtered_scan_tolerates_merge_update_row_id_overlap() {
         assert_eq!(rows, expected, "filtered read for {slug}");
     }
 }
+
+// --- Guard 21: blob-v2 descriptor field shape --------------------------------
+//
+// The engine's shared descriptor decoder (`src/blob_descriptor.rs`) and the
+// descriptor-first blob read facade classify rows from the PERSISTED blob-v2
+// descriptor struct: exactly (kind: UInt8, position: UInt64, size: UInt64,
+// blob_id: UInt32, blob_uri: Utf8), with `BlobKind` u8 discriminants
+// 0=Inline, 1=Packed, 2=Dedicated, 3=External. Lance's own take path returns
+// this struct through the public scan/take APIs (LanceDB's blob module reads
+// it the same way). A red here means Lance changed the descriptor format —
+// re-audit `blob_descriptor.rs` and the read facade before bumping.
+
+#[tokio::test]
+async fn blob_v2_descriptor_field_shape_is_pinned() {
+    use futures::TryStreamExt;
+    use lance::datatypes::{BlobHandling, BlobKind};
+
+    // Discriminants the u8 decode relies on.
+    assert!(matches!(BlobKind::try_from(0u8), Ok(BlobKind::Inline)));
+    assert!(matches!(BlobKind::try_from(1u8), Ok(BlobKind::Packed)));
+    assert!(matches!(BlobKind::try_from(2u8), Ok(BlobKind::Dedicated)));
+    assert!(matches!(BlobKind::try_from(3u8), Ok(BlobKind::External)));
+
+    // One inline row written through the public blob input shape.
+    let data = arrow_array::LargeBinaryArray::from_iter_values([b"payload".as_slice()]);
+    let blob_uri = StringArray::from(vec![None::<&str>]);
+    let DataType::Struct(fields) = lance::blob::blob_field("content", true).data_type().clone()
+    else {
+        unreachable!("blob_field is always a Struct");
+    };
+    let content = arrow_array::StructArray::new(
+        fields,
+        vec![Arc::new(data) as _, Arc::new(blob_uri) as _],
+        None,
+    );
+    let schema = Arc::new(Schema::new(vec![
+        Field::new("id", DataType::Utf8, false),
+        lance::blob::blob_field("content", true),
+    ]));
+    let batch = RecordBatch::try_new(
+        schema.clone(),
+        vec![
+            Arc::new(StringArray::from(vec!["g21"])) as _,
+            Arc::new(content) as _,
+        ],
+    )
+    .unwrap();
+
+    let dir = tempfile::tempdir().unwrap();
+    let uri = dir.path().join("guard21-blob.lance");
+    let uri = uri.to_str().unwrap();
+    let reader = RecordBatchIterator::new(vec![Ok(batch)], schema);
+    let params = WriteParams {
+        mode: WriteMode::Create,
+        enable_stable_row_ids: true,
+        data_storage_version: Some(LanceFileVersion::V2_2),
+        ..Default::default()
+    };
+    Dataset::write(reader, uri, Some(params)).await.unwrap();
+
+    let ds = Dataset::open(uri).await.unwrap();
+    let mut scanner = ds.scan();
+    scanner.blob_handling(BlobHandling::BlobsDescriptions);
+    let batches: Vec<RecordBatch> = scanner
+        .try_into_stream()
+        .await
+        .unwrap()
+        .try_collect()
+        .await
+        .unwrap();
+    let descriptions = batches[0]
+        .column_by_name("content")
+        .and_then(|col| col.as_any().downcast_ref::<arrow_array::StructArray>())
+        .expect("blob column reads back as a descriptor struct");
+
+    let field_shape: Vec<(String, DataType)> = descriptions
+        .fields()
+        .iter()
+        .map(|f| (f.name().clone(), f.data_type().clone()))
+        .collect();
+    assert_eq!(
+        field_shape,
+        vec![
+            ("kind".to_string(), DataType::UInt8),
+            ("position".to_string(), DataType::UInt64),
+            ("size".to_string(), DataType::UInt64),
+            ("blob_id".to_string(), DataType::UInt32),
+            ("blob_uri".to_string(), DataType::Utf8),
+        ],
+        "blob-v2 descriptor field shape changed — re-audit blob_descriptor.rs"
+    );
+}

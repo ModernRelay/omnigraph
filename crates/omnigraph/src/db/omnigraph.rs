@@ -11,7 +11,6 @@ use arrow_array::{
 use arrow_schema::{DataType, Field, Schema};
 use lance::Dataset;
 use lance::blob::{BlobArrayBuilder, blob_field};
-use lance::dataset::BlobFile;
 use lance::dataset::scanner::ColumnOrdering;
 use lance::datatypes::{
     BlobKind, LANCE_UNENFORCED_PRIMARY_KEY, LANCE_UNENFORCED_PRIMARY_KEY_POSITION,
@@ -34,6 +33,7 @@ use crate::storage::{
 use crate::storage_layer::SnapshotHandle;
 use crate::table_store::TableStore;
 
+mod blob_read;
 mod export;
 mod optimize;
 mod repair;
@@ -41,6 +41,7 @@ mod schema_apply;
 mod stream_enrollment;
 mod table_ops;
 
+pub use blob_read::{BlobContent, BlobRead, BlobReader, BlobVersionTag};
 pub use optimize::{CleanupPolicyOptions, SkipReason, TableCleanupStats, TableOptimizeStats};
 pub use repair::{
     RepairAction, RepairClassification, RepairOptions, RepairStats, TableRepairStats,
@@ -2337,60 +2338,6 @@ impl Omnigraph {
         options: optimize::CleanupPolicyOptions,
     ) -> Result<Vec<optimize::TableCleanupStats>> {
         optimize::cleanup_all_tables(self, options).await
-    }
-
-    /// Read a blob from a node by its string ID and property name.
-    ///
-    /// Returns a `BlobFile` handle with async `read()`, `seek()`, `tell()`,
-    /// and metadata accessors (`size()`, `kind()`, `uri()`).
-    ///
-    /// ```ignore
-    /// let blob = db.read_blob("Document", "readme", "content").await?;
-    /// let bytes = blob.read().await?;
-    /// ```
-    pub async fn read_blob(&self, type_name: &str, id: &str, property: &str) -> Result<BlobFile> {
-        let (resolved, catalog) = self.capture_current_read_view().await?;
-        let node_type = catalog
-            .node_types
-            .get(type_name)
-            .ok_or_else(|| OmniError::manifest(format!("unknown node type '{}'", type_name)))?;
-        if !node_type.blob_properties.contains(property) {
-            return Err(OmniError::manifest(format!(
-                "property '{}' on type '{}' is not a Blob",
-                property, type_name
-            )));
-        }
-
-        let table_key = format!("node:{}", type_name);
-        let handle = self
-            .storage()
-            .open_snapshot_at_table(&resolved.snapshot, &table_key)
-            .await?;
-
-        let filter_sql = format!("id = '{}'", id.replace('\'', "''"));
-        let row_id = self
-            .storage()
-            .first_row_id_for_filter(&handle, &filter_sql)
-            .await?
-            .ok_or_else(|| {
-                OmniError::manifest(format!("no {} with id '{}' found", type_name, id))
-            })?;
-
-        // `take_blobs` is a Lance-specific blob accessor not surfaced
-        // through the `TableStorage` trait — reach the inner `Arc<Dataset>`
-        // via the `pub(crate)` accessor for this read-only call.
-        let ds = handle.into_arc();
-        let mut blobs = ds
-            .take_blobs(&[row_id], property)
-            .await
-            .map_err(|e| OmniError::Lance(e.to_string()))?;
-
-        blobs.pop().ok_or_else(|| {
-            OmniError::manifest(format!(
-                "blob '{}' on {} '{}' returned no data",
-                property, type_name, id
-            ))
-        })
     }
 
     pub(crate) async fn active_branch(&self) -> Option<String> {

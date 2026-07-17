@@ -1097,11 +1097,7 @@ async fn blob_update_mutation() {
 
     assert_eq!(result.affected_nodes, 1);
 
-    let blob = db
-        .read_blob("Document", "updatable", "content")
-        .await
-        .unwrap();
-    let bytes = blob.read().await.unwrap();
+    let bytes = read_blob_bytes(&db, "Document", "updatable", "content").await;
     assert_eq!(&bytes[..], &[4, 5, 6]);
 }
 
@@ -1119,11 +1115,25 @@ async fn blob_read_returns_bytes() {
         .await
         .unwrap();
 
-    let blob = db.read_blob("Document", "readme", "content").await.unwrap();
-    assert_eq!(blob.size(), 11); // "Hello World" = 11 bytes
+    let blob = db
+        .read_blob_at("main", "Document", "readme", "content")
+        .await
+        .unwrap();
+    assert_eq!(blob.size, Some(11)); // "Hello World" = 11 bytes
+    let omnigraph::db::BlobContent::Streamed(reader) = blob.content else {
+        panic!("expected internal blob");
+    };
+    assert_eq!(reader.size(), 11);
 
-    let bytes = blob.read().await.unwrap();
+    // Bounded range read (the streaming handler's shape) plus full read.
+    let head = reader.read_range(0..5).await.unwrap();
+    assert_eq!(&head[..], b"Hello");
+    let bytes = reader.read_all().await.unwrap();
     assert_eq!(&bytes[..], b"Hello World");
+
+    // Out-of-bounds range is a typed bad-request validated before storage.
+    let oob = reader.read_range(4..12).await;
+    assert!(oob.is_err(), "range past end must fail");
 }
 
 #[tokio::test]
@@ -1138,11 +1148,13 @@ async fn blob_read_not_found_errors() {
         .unwrap();
 
     // Non-existent ID
-    let err = db.read_blob("Document", "nonexistent", "content").await;
+    let err = db
+        .read_blob_at("main", "Document", "nonexistent", "content")
+        .await;
     assert!(err.is_err());
 
     // Non-blob property
-    let err = db.read_blob("Document", "readme", "title").await;
+    let err = db.read_blob_at("main", "Document", "readme", "title").await;
     assert!(err.is_err());
 }
 
@@ -1163,14 +1175,10 @@ async fn blob_read_after_mutation_insert() {
     .await
     .unwrap();
 
-    // The reader was opened before the other handle's commit. `read_blob`
-    // must freshness-probe its current branch instead of using its held
+    // The reader was opened before the other handle's commit. The blob read
+    // must freshness-probe the requested branch instead of using its held
     // coordinator snapshot.
-    let blob = stale_reader
-        .read_blob("Document", "inserted", "content")
-        .await
-        .unwrap();
-    let bytes = blob.read().await.unwrap();
+    let bytes = read_blob_bytes(&stale_reader, "Document", "inserted", "content").await;
     assert_eq!(&bytes[..], &[1, 2, 3]);
 }
 
@@ -1209,6 +1217,28 @@ async fn blob_scan_with_descriptions_on_nonempty_dataset() {
         "blob column should be Struct, got {:?}",
         content_col.data_type()
     );
+
+    // BlobsDescriptions combined with a filter WORKS on the current Lance
+    // pin (9.0.0-rc.1). The query executor still excludes blob columns from
+    // filtered scans and re-adds them as nulls — that response shape is
+    // shipped contract, so returning descriptors from /query is a deliberate
+    // future contract change, not a workaround removal. A red here means the
+    // upstream projection assertion regressed and the exec/query.rs exclusion
+    // is load-bearing again.
+    let mut filtered = ds.scan();
+    filtered.blob_handling(BlobHandling::BlobsDescriptions);
+    filtered.filter("title = 'readme'").unwrap();
+    let filtered_rows: usize = filtered
+        .try_into_stream()
+        .await
+        .expect("filtered BlobsDescriptions scan must plan on rc.1")
+        .try_collect::<Vec<RecordBatch>>()
+        .await
+        .expect("filtered BlobsDescriptions scan must execute on rc.1")
+        .iter()
+        .map(RecordBatch::num_rows)
+        .sum();
+    assert_eq!(filtered_rows, 1);
 }
 
 // ─── Constraint enforcement ──────────────────────────────────────────────────
@@ -1665,9 +1695,66 @@ async fn blob_update_null_to_non_null() {
     .unwrap();
     assert_eq!(result.affected_nodes, 1);
 
-    let blob = db.read_blob("Document", "kid-a", "content").await.unwrap();
-    let bytes = blob.read().await.unwrap();
+    let bytes = read_blob_bytes(&db, "Document", "kid-a", "content").await;
     assert_eq!(&bytes[..], &[1, 2, 3]);
+}
+
+#[tokio::test]
+async fn read_blob_errors_are_typed_and_quoted_ids_need_no_escaping() {
+    use omnigraph::error::{ManifestError, ManifestErrorKind, OmniError};
+
+    let dir = tempfile::tempdir().unwrap();
+    let uri = dir.path().to_str().unwrap();
+    let mut db = Omnigraph::init(uri, BLOB_SCHEMA).await.unwrap();
+
+    // A stored key containing a single quote must be findable through the
+    // typed exact-id predicate (no SQL-text flattening of the caller's id).
+    let data = r#"{"type": "Document", "data": {"title": "O'Brien", "content": "base64:AQID"}}"#;
+    load_jsonl(&mut db, data, LoadMode::Overwrite).await.unwrap();
+    let bytes = read_blob_bytes(&db, "Document", "O'Brien", "content").await;
+    assert_eq!(&bytes[..], &[1u8, 2, 3]);
+
+    // Missing row → typed NotFound, not a generic bad-request.
+    let missing = db.read_blob_at("main", "Document", "absent", "content").await;
+    assert!(
+        matches!(
+            missing,
+            Err(OmniError::Manifest(ManifestError {
+                kind: ManifestErrorKind::NotFound,
+                ..
+            }))
+        ),
+        "missing row should be NotFound, got {:?}",
+        missing.err()
+    );
+
+    // Unknown type → typed NotFound.
+    let unknown_type = db.read_blob_at("main", "Nope", "x", "content").await;
+    assert!(
+        matches!(
+            unknown_type,
+            Err(OmniError::Manifest(ManifestError {
+                kind: ManifestErrorKind::NotFound,
+                ..
+            }))
+        ),
+        "unknown type should be NotFound, got {:?}",
+        unknown_type.err()
+    );
+
+    // Non-Blob property → typed BadRequest.
+    let not_blob = db.read_blob_at("main", "Document", "O'Brien", "title").await;
+    assert!(
+        matches!(
+            not_blob,
+            Err(OmniError::Manifest(ManifestError {
+                kind: ManifestErrorKind::BadRequest,
+                ..
+            }))
+        ),
+        "non-blob property should be BadRequest, got {:?}",
+        not_blob.err()
+    );
 }
 
 // ─── Regression: blob load with external file URI ────────────────────────────
@@ -1697,12 +1784,23 @@ async fn blob_load_external_file_uri() {
         .await
         .unwrap();
 
-    // Verify the blob is accessible
+    // Descriptor-first classification: the external reference comes back
+    // WITHOUT the engine resolving the external store or touching the file.
     let blob = db
-        .read_blob("Document", "from-file", "content")
+        .read_blob_at("main", "Document", "from-file", "content")
         .await
         .unwrap();
-    assert!(blob.uri().is_some(), "external blob should have a URI");
+    match blob.content {
+        omnigraph::db::BlobContent::ExternalRef { uri } => {
+            assert!(
+                uri.starts_with("file://"),
+                "external blob should keep its absolute URI, got {uri}"
+            );
+        }
+        omnigraph::db::BlobContent::Streamed(_) => {
+            panic!("external URI blob must classify as ExternalRef")
+        }
+    }
 }
 
 // ─── Regression: execute_update on edge type ─────────────────────────────────
