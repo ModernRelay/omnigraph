@@ -115,3 +115,128 @@ pub(crate) fn decode_blob_descriptor(
         }
     })
 }
+
+#[cfg(test)]
+mod tests {
+    use std::sync::Arc;
+
+    use arrow_array::{ArrayRef, StringArray, UInt8Array, UInt32Array, UInt64Array};
+    use arrow_schema::{DataType, Field};
+
+    use super::*;
+
+    fn v2_descriptor(
+        kind: Option<u8>,
+        position: Option<u64>,
+        size: Option<u64>,
+        blob_id: Option<u32>,
+        blob_uri: Option<&str>,
+    ) -> StructArray {
+        let fields: Vec<Arc<Field>> = vec![
+            Arc::new(Field::new("kind", DataType::UInt8, true)),
+            Arc::new(Field::new("position", DataType::UInt64, true)),
+            Arc::new(Field::new("size", DataType::UInt64, true)),
+            Arc::new(Field::new("blob_id", DataType::UInt32, true)),
+            Arc::new(Field::new("blob_uri", DataType::Utf8, true)),
+        ];
+        StructArray::new(
+            fields.into(),
+            vec![
+                Arc::new(UInt8Array::from(vec![kind])) as ArrayRef,
+                Arc::new(UInt64Array::from(vec![position])) as ArrayRef,
+                Arc::new(UInt64Array::from(vec![size])) as ArrayRef,
+                Arc::new(UInt32Array::from(vec![blob_id])) as ArrayRef,
+                Arc::new(StringArray::from(vec![blob_uri])) as ArrayRef,
+            ],
+            None,
+        )
+    }
+
+    #[test]
+    fn v2_inline_zero_sentinel_is_null() {
+        let d = v2_descriptor(Some(0), Some(0), Some(0), Some(0), None);
+        assert_eq!(decode_blob_descriptor(&d, 0).unwrap(), BlobDescriptor::Null);
+    }
+
+    #[test]
+    fn v2_inline_with_payload_decodes() {
+        let d = v2_descriptor(Some(0), Some(64), Some(7), Some(0), None);
+        assert_eq!(
+            decode_blob_descriptor(&d, 0).unwrap(),
+            BlobDescriptor::Inline {
+                position: 64,
+                size: 7
+            }
+        );
+    }
+
+    #[test]
+    fn v2_external_without_recorded_size_is_legacy_readable() {
+        // Pre-annotation writers recorded external references with size 0;
+        // those descriptors must still decode (the read facade maps the zero
+        // size to "unknown", never to null).
+        let d = v2_descriptor(Some(3), Some(0), Some(0), Some(0), Some("file:///x"));
+        assert_eq!(
+            decode_blob_descriptor(&d, 0).unwrap(),
+            BlobDescriptor::External {
+                uri: "file:///x".to_string(),
+                size: 0,
+                base_id: 0
+            }
+        );
+    }
+
+    #[test]
+    fn v2_external_with_recorded_size_decodes() {
+        let d = v2_descriptor(Some(3), Some(0), Some(15), Some(0), Some("s3://b/k"));
+        assert_eq!(
+            decode_blob_descriptor(&d, 0).unwrap(),
+            BlobDescriptor::External {
+                uri: "s3://b/k".to_string(),
+                size: 15,
+                base_id: 0
+            }
+        );
+    }
+
+    #[test]
+    fn null_kind_is_null() {
+        let d = v2_descriptor(None, Some(1), Some(2), Some(0), None);
+        assert_eq!(decode_blob_descriptor(&d, 0).unwrap(), BlobDescriptor::Null);
+    }
+
+    #[test]
+    fn legacy_v1_layout_decodes_by_field_nullness() {
+        let fields: Vec<Arc<Field>> = vec![
+            Arc::new(Field::new("position", DataType::UInt64, true)),
+            Arc::new(Field::new("size", DataType::UInt64, true)),
+        ];
+        let present = StructArray::new(
+            fields.clone().into(),
+            vec![
+                Arc::new(UInt64Array::from(vec![Some(8u64)])) as ArrayRef,
+                Arc::new(UInt64Array::from(vec![Some(3u64)])) as ArrayRef,
+            ],
+            None,
+        );
+        assert_eq!(
+            decode_blob_descriptor(&present, 0).unwrap(),
+            BlobDescriptor::Inline {
+                position: 8,
+                size: 3
+            }
+        );
+        let absent = StructArray::new(
+            fields.into(),
+            vec![
+                Arc::new(UInt64Array::from(vec![None::<u64>])) as ArrayRef,
+                Arc::new(UInt64Array::from(vec![None::<u64>])) as ArrayRef,
+            ],
+            None,
+        );
+        assert_eq!(
+            decode_blob_descriptor(&absent, 0).unwrap(),
+            BlobDescriptor::Null
+        );
+    }
+}
