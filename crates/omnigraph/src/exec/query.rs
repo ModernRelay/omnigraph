@@ -1978,9 +1978,15 @@ async fn execute_node_scan(
     // mutation delete path) migrate in follow-up MRs.
     let filter_expr = build_lance_filter_expr(filters, params, Some(&node_type.arrow_schema));
 
-    // Blob columns must be excluded from scan when a filter is present
-    // (Lance bug: BlobsDescriptions + filter triggers a projection assertion).
-    // We exclude blob columns and add metadata post-scan via take_blobs_by_indices.
+    // Blob columns are excluded from filtered scans and re-added as null
+    // placeholder columns post-scan; blob bytes are reachable only through
+    // the dedicated blob read path. The original motivation (a Lance
+    // projection assertion when BlobsDescriptions combined with a filter) is
+    // fixed on the current rc.1 pin — pinned by
+    // end_to_end.rs::blob_scan_with_descriptions_on_nonempty_dataset — but
+    // the null-column response shape is shipped contract, so switching
+    // /query to descriptors is a deliberate contract change, tracked
+    // separately.
     let has_blobs = !node_type.blob_properties.is_empty();
     let non_blob_cols: Vec<&str> = node_type
         .arrow_schema

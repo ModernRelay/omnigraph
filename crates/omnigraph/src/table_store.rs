@@ -1,6 +1,5 @@
 use arrow_array::{
-    Array, ArrayRef, LargeBinaryArray, RecordBatch, StringArray, StructArray, UInt8Array,
-    UInt32Array, UInt64Array,
+    Array, ArrayRef, LargeBinaryArray, RecordBatch, StringArray, StructArray, UInt64Array,
 };
 use arrow_schema::SchemaRef;
 use datafusion::physical_plan::{SendableRecordBatchStream, stream::RecordBatchStreamAdapter};
@@ -17,7 +16,7 @@ use lance::dataset::{
     CommitBuilder, DeleteBuilder, InsertBuilder, MergeInsertBuilder, WhenMatched, WhenNotMatched,
     WriteMode, WriteParams,
 };
-use lance::datatypes::{BlobKind, Schema as LanceSchema};
+use lance::datatypes::Schema as LanceSchema;
 use lance::index::DatasetIndexExt;
 use lance::index::scalar::IndexDetails;
 use lance_file::version::LanceFileVersion;
@@ -826,61 +825,10 @@ impl TableStore {
     }
 
     fn blob_description_is_null(descriptions: &StructArray, row: usize) -> Result<bool> {
-        if descriptions.is_null(row) {
-            return Ok(true);
-        }
-
-        let position = descriptions
-            .column_by_name("position")
-            .and_then(|col| col.as_any().downcast_ref::<UInt64Array>())
-            .ok_or_else(|| {
-                OmniError::Lance(format!(
-                    "unrecognized blob description schema {:?}: missing UInt64 position field",
-                    descriptions.fields()
-                ))
-            })?;
-        let size = descriptions
-            .column_by_name("size")
-            .and_then(|col| col.as_any().downcast_ref::<UInt64Array>())
-            .ok_or_else(|| {
-                OmniError::Lance(format!(
-                    "unrecognized blob description schema {:?}: missing UInt64 size field",
-                    descriptions.fields()
-                ))
-            })?;
-
-        let Some(kind_column) = descriptions.column_by_name("kind") else {
-            return Ok(position.is_null(row) || size.is_null(row));
-        };
-        let kind = if let Some(kind) = kind_column.as_any().downcast_ref::<UInt8Array>() {
-            if kind.is_null(row) {
-                return Ok(true);
-            }
-            kind.value(row)
-        } else if let Some(kind) = kind_column.as_any().downcast_ref::<UInt32Array>() {
-            if kind.is_null(row) {
-                return Ok(true);
-            }
-            kind.value(row) as u8
-        } else {
-            return Err(OmniError::Lance(format!(
-                "unrecognized blob description schema {:?}: kind field must be UInt8 or UInt32",
-                descriptions.fields()
-            )));
-        };
-
-        let kind = BlobKind::try_from(kind).map_err(|e| OmniError::Lance(e.to_string()))?;
-        if kind != BlobKind::Inline {
-            return Ok(false);
-        }
-        let blob_uri = descriptions
-            .column_by_name("blob_uri")
-            .and_then(|col| col.as_any().downcast_ref::<StringArray>())
-            .and_then(|arr| (!arr.is_null(row)).then(|| arr.value(row)));
-
-        Ok((position.is_null(row) || position.value(row) == 0)
-            && (size.is_null(row) || size.value(row) == 0)
-            && blob_uri.unwrap_or("").is_empty())
+        Ok(matches!(
+            crate::blob_descriptor::decode_blob_descriptor(descriptions, row)?,
+            crate::blob_descriptor::BlobDescriptor::Null
+        ))
     }
 
     pub async fn scan_stream(
@@ -3015,12 +2963,35 @@ impl TableStore {
             .try_collect::<Vec<RecordBatch>>()
             .await
             .map_err(|e| OmniError::Lance(e.to_string()))?;
-        Ok(batches.iter().find_map(|batch| {
+        Ok(Self::first_row_id_in_batches(&batches))
+    }
+
+    /// Exact-`id` point-lookup sibling of `first_row_id_for_filter`, built on a
+    /// typed DataFusion predicate instead of flattening the caller's id into
+    /// SQL text — ids containing quotes need no escaping, and the exact-`id`
+    /// BTREE stays usable when reconciled.
+    pub async fn first_row_id_for_id(&self, ds: &Dataset, id: &str) -> Result<Option<u64>> {
+        use datafusion::prelude::{col, lit};
+
+        let filter = col("id").eq(lit(id.to_string()));
+        let batches = Self::scan_stream_with(ds, Some(&["id"]), None, None, true, |scanner| {
+            scanner.filter_expr(filter);
+            Ok(())
+        })
+        .await?
+        .try_collect::<Vec<RecordBatch>>()
+        .await
+        .map_err(|e| OmniError::Lance(e.to_string()))?;
+        Ok(Self::first_row_id_in_batches(&batches))
+    }
+
+    fn first_row_id_in_batches(batches: &[RecordBatch]) -> Option<u64> {
+        batches.iter().find_map(|batch| {
             batch
                 .column_by_name("_rowid")
                 .and_then(|col| col.as_any().downcast_ref::<UInt64Array>())
                 .and_then(|arr| (arr.len() > 0).then(|| arr.value(0)))
-        }))
+        })
     }
 
     pub async fn write_dataset(dataset_uri: &str, batch: RecordBatch) -> Result<Dataset> {

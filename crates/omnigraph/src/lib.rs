@@ -7,6 +7,7 @@
 // future Lance bumps stop needing this.
 #![recursion_limit = "256"]
 
+pub(crate) mod blob_descriptor;
 mod branch_control;
 pub mod changes;
 pub mod db;
