@@ -1801,6 +1801,39 @@ async fn blob_load_external_file_uri() {
             panic!("external URI blob must classify as ExternalRef")
         }
     }
+    // Ingest recorded the object size into the descriptor (one write-time
+    // HEAD), so reads are descriptor-complete: no external I/O for size.
+    assert_eq!(
+        blob.size,
+        Some(b"Hello from file".len() as u64),
+        "external blob size must be recorded at ingest"
+    );
+
+    // The classification proof: delete the referenced file, and the
+    // descriptor read STILL succeeds — nothing server-side resolves the
+    // external store on the read path.
+    std::fs::remove_file(&blob_path).unwrap();
+    let after_delete = db
+        .read_blob_at("main", "Document", "from-file", "content")
+        .await
+        .unwrap();
+    assert!(matches!(
+        after_delete.content,
+        omnigraph::db::BlobContent::ExternalRef { .. }
+    ));
+
+    // An UNREADABLE external URI now fails at load time (fail loudly at
+    // ingest), instead of deferring the failure to the first read.
+    let missing_uri = format!("file://{}", blob_dir.path().join("absent.bin").display());
+    let bad = format!(
+        r#"{{"type": "Document", "data": {{"title": "bad-ref", "content": "{}"}}}}"#,
+        missing_uri
+    );
+    let err = load_jsonl(&mut db, &bad, LoadMode::Overwrite).await;
+    assert!(
+        err.is_err(),
+        "loading an unreadable external blob URI must fail at ingest"
+    );
 }
 
 // ─── Regression: execute_update on edge type ─────────────────────────────────
