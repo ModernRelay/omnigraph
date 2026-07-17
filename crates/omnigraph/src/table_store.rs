@@ -391,7 +391,7 @@ impl TableStore {
 
     /// Idempotently drop `branch` from the dataset at `dataset_uri`.
     ///
-    /// This tolerates an already-absent branch — beta.21's native
+    /// This tolerates an already-absent branch — pinned Lance's native
     /// `force_delete_branch` treats both a missing contents ref and a missing
     /// `tree/{branch}/` directory as success, while OmniGraph also normalizes a
     /// raced `RefNotFound` / `NotFound` around the non-atomic contents delete.
@@ -1551,7 +1551,7 @@ impl TableStore {
     /// that parent, so this adapter does not repeat the exact target probe. It
     /// uses Lance's public insert writer for immutable data fragments and
     /// replaces only its uncommitted `Append` operation with the same
-    /// filter-bearing, insert-only `Update` shape emitted by beta.21
+    /// filter-bearing, insert-only `Update` shape emitted by pinned Lance
     /// merge-insert. The resulting transaction inherits the certificate, so
     /// the proof composes across later branch generations without creating a
     /// graph-visible Append side door.
@@ -2434,7 +2434,7 @@ impl TableStore {
     /// Stage a batch of full-table index builds as one Lance transaction.
     ///
     /// Each builder writes its immutable index artifact and returns complete
-    /// `IndexMetadata` through beta.21's public `execute_uncommitted` surface.
+    /// `IndexMetadata` through pinned Lance's public `execute_uncommitted` surface.
     /// All metadata is based on the same pinned dataset version and is wrapped
     /// in one `Operation::CreateIndex`, so committing any number of requested
     /// BTREE, FTS, and vector indexes advances the table exactly once. HEAD does
@@ -3780,7 +3780,7 @@ fn validate_keyed_write_batch_ids(
     Ok(source_ids)
 }
 
-/// Assert the exact RFC-023 substrate proof carried by beta.21's v2
+/// Assert the exact RFC-023 substrate proof carried by pinned Lance's v2
 /// merge-insert route.  Checking both public copies makes a future Lance
 /// refactor that drops the transaction-level conflict filter fail closed.
 fn validate_exact_id_filter(

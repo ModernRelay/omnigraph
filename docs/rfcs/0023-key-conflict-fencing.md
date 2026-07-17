@@ -13,12 +13,13 @@ owner: OmniGraph maintainers
 **Status:** Implemented (2026-07-15) — all acceptance gates satisfied
 **Date:** 2026-07-10
 **Author track:** Maintainer design series
-**Surveyed:** omnigraph 0.8.1 (`main`); Lance 9.0.0-beta.21 at git rev
-`1aec14652dcbace23ac277fa8ced35000bea0c40`; full Lance transaction,
+**Surveyed:** omnigraph 0.8.1 (`main`); Lance 9.0.0-rc.1 at git rev
+`cec0b7dffe2d85c7e66dbe9d1f3891c297903a1d`; full Lance transaction,
 table-schema, read/write, branching, and MemWAL specifications; pinned Rust
 conflict-resolver and merge-insert sources plus runtime surface probes
-**Evidence status (2026-07-15):** the beta.21 filter shape and directional
-conflict matrix are pinned substrate facts. The implementation now activates
+**Evidence status (2026-07-17):** the beta.21 filter shape and directional
+conflict matrix were revalidated unchanged by the RC.1 surface guards. The
+historical performance measurements below remain labeled beta.21. The implementation now activates
 the contract in internal schema v6 (the OmniGraph 0.10.x format): fresh
 node/edge datasets carry exact-`id` PK metadata from creation, all production
 graph insert/upsert routes use the sealed filter-bearing keyed adapter, bare

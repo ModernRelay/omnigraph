@@ -1038,3 +1038,31 @@ fn test_parse_error_diagnostic_has_span() {
     let err = parse_schema_diagnostic(input).unwrap_err();
     assert!(err.span.is_some());
 }
+
+#[test]
+fn test_reject_lance_virtual_system_column_property_names() {
+    const RESERVED: [&str; 5] = [
+        "_rowid",
+        "_rowaddr",
+        "_rowoffset",
+        "_row_created_at_version",
+        "_row_last_updated_at_version",
+    ];
+
+    for name in RESERVED {
+        let declarations = [
+            format!("interface I {{ {name}: String }}"),
+            format!("node N {{ {name}: String }}"),
+            format!("node N {{}} edge E: N -> N {{ {name}: String }}"),
+        ];
+        for source in declarations {
+            let error = parse_schema(&source).unwrap_err().to_string();
+            assert!(error.contains("reserved"), "unexpected error: {error}");
+            assert!(error.contains(name), "unexpected error: {error}");
+            assert!(error.contains("exported"), "unexpected error: {error}");
+        }
+    }
+
+    parse_schema("node N { _row_id: String _rowid2: String _ROWID: String }")
+        .expect("only the five exact, case-sensitive Lance names are reserved");
+}

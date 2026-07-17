@@ -42,6 +42,10 @@ use lance::dataset::{
 use lance::datatypes::LANCE_UNENFORCED_PRIMARY_KEY;
 use lance::index::DatasetIndexExt;
 use lance::session::Session;
+use lance_core::{
+    ROW_ADDR, ROW_CREATED_AT_VERSION, ROW_ID, ROW_LAST_UPDATED_AT_VERSION, ROW_OFFSET,
+    is_system_column,
+};
 use lance_file::version::LanceFileVersion;
 use lance_index::IndexType;
 use lance_index::optimize::OptimizeOptions;
@@ -49,6 +53,26 @@ use lance_index::scalar::ScalarIndexParams;
 use lance_io::object_store::ObjectStoreRegistry;
 use lance_namespace::LanceNamespace;
 use lance_table::io::commit::{ManifestLocation, ManifestNamingScheme};
+use omnigraph_compiler::schema::parser::parse_schema;
+
+#[test]
+fn compiler_rejects_five_surveyed_lance_virtual_system_columns() {
+    let names = [
+        ROW_ID,
+        ROW_ADDR,
+        ROW_OFFSET,
+        ROW_CREATED_AT_VERSION,
+        ROW_LAST_UPDATED_AT_VERSION,
+    ];
+    for name in names {
+        assert!(is_system_column(name), "Lance no longer reserves {name}");
+        let error = parse_schema(&format!("node N {{ {name}: String }}"))
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("reserved"), "unexpected error: {error}");
+        assert!(error.contains(name), "unexpected error: {error}");
+    }
+}
 
 /// Helper: build a small fresh dataset in a tempdir. Pinned at V2_2 to match
 /// production write paths (blob v2 requires V2_2; see `docs/dev/lance.md`).
@@ -81,7 +105,7 @@ async fn fresh_dataset(uri: &str) -> Dataset {
 /// transaction UUID distinguishes main-dataset replacement where main's
 /// identifier is necessarily empty, and the manifest e_tag gives object stores
 /// an independent physical-object witness. The e_tag remains optional at the
-/// type level for backends that omit it; beta.21's local filesystem backend
+/// type level for backends that omit it; the pinned Lance local filesystem backend
 /// resolves a metadata-derived e_tag, and the local guards below require it.
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct PublicPhysicalRefIncarnation {
@@ -264,7 +288,7 @@ fn staged_inserted_rows_filter(staged: &UncommittedMergeInsert) -> Option<&KeyEx
 
 fn assert_bloom_empty(filter: &KeyExistenceFilter, expected_empty: bool, case: &str) {
     let FilterType::Bloom { bitmap, .. } = &filter.filter else {
-        panic!("{case}: beta.21 merge_insert should emit a Bloom key filter")
+        panic!("{case}: pinned Lance should emit a Bloom key filter")
     };
     assert_eq!(
         bitmap.iter().all(|byte| *byte == 0),
@@ -547,14 +571,13 @@ async fn public_physical_ref_token_rejects_local_same_version_aba() {
     let first_etag = first_token
         .manifest_e_tag
         .as_deref()
-        .expect("beta.21 must expose the first local main manifest's metadata-derived e_tag");
-    let second_etag = second_token
-        .manifest_e_tag
-        .as_deref()
-        .expect("beta.21 must expose the recreated local main manifest's metadata-derived e_tag");
+        .expect("pinned Lance must expose the first local main manifest's metadata-derived e_tag");
+    let second_etag = second_token.manifest_e_tag.as_deref().expect(
+        "pinned Lance must expose the recreated local main manifest's metadata-derived e_tag",
+    );
     assert_ne!(
         first_etag, second_etag,
-        "beta.21's local e_tag must distinguish the recreated main manifest object"
+        "pinned Lance's local e_tag must distinguish the recreated main manifest object"
     );
     assert_ne!(
         first_token, second_token,
@@ -580,7 +603,7 @@ async fn local_physical_ref_token_is_stable_and_survives_shared_session_aba() {
     let first_committed_token = public_physical_ref_incarnation(&first_committed).await;
     assert!(
         first_committed_token.manifest_e_tag.is_some(),
-        "beta.21's public Dataset result must expose the local manifest's metadata-derived e_tag"
+        "pinned Lance's public Dataset result must expose the local manifest's metadata-derived e_tag"
     );
     drop(first_committed);
 
@@ -631,11 +654,11 @@ async fn local_physical_ref_token_is_stable_and_survives_shared_session_aba() {
     let first_etag = first_token
         .manifest_e_tag
         .as_deref()
-        .expect("beta.21 must retain the first local manifest's metadata-derived e_tag");
+        .expect("pinned Lance must retain the first local manifest's metadata-derived e_tag");
     let second_etag = second_token
         .manifest_e_tag
         .as_deref()
-        .expect("beta.21 must expose the recreated local manifest's metadata-derived e_tag");
+        .expect("pinned Lance must expose the recreated local manifest's metadata-derived e_tag");
     assert_ne!(
         first_etag, second_etag,
         "the shared Session must resolve the recreated local manifest's distinct e_tag"
@@ -921,7 +944,7 @@ async fn _compile_uncommitted_delete_field_shape() -> lance::Result<()> {
 //
 // EnsureIndices batches BTREE, FTS, and the current one-segment full-table
 // vector shape into one exact `Operation::CreateIndex`. This requires the
-// beta.21 builder to return complete public `IndexMetadata` without committing
+// pinned Lance builder to return complete public `IndexMetadata` without committing
 // HEAD. Compile-only: a Lance bump that removes or narrows the surface must
 // turn the compatibility smoke test red.
 #[allow(
@@ -1764,17 +1787,17 @@ async fn unenforced_primary_key_is_immutable_once_set() {
     );
 }
 
-// --- Guard 19b: beta.21 merge_insert PK-filter shape -----------------------
+// --- Guard 19b: pinned Lance merge_insert PK-filter shape ------------------
 //
 // RFC-023 can rely on Lance's key-conflict fencing only when every keyed
-// insert produces an `Operation::Update.inserted_rows_filter`. In beta.21 that
-// is a route-dependent contract: the v2 plan emits a filter when the ordered
+// insert produces an `Operation::Update.inserted_rows_filter`. On the pinned
+// Lance revision that is a route-dependent contract: the v2 plan emits a filter when the ordered
 // ON field ids exactly match the unenforced PK, while the scalar-index v1 path
 // and non-PK ON shapes emit `None`. A matched-only v2 update still emits
 // `Some(empty Bloom)`, which is important because `Some` selects the strict
 // conflict-resolver branch even though this attempt inserted no key.
 #[tokio::test]
-async fn unenforced_pk_filter_shape_is_route_dependent_on_beta21() {
+async fn unenforced_pk_filter_shape_is_route_dependent() {
     let dir = tempfile::tempdir().unwrap();
     let uri = dir.path().join("rfc023_filter_v2.lance");
     let dataset = Arc::new(fresh_pk_dataset(uri.to_str().unwrap()).await);
@@ -1832,7 +1855,7 @@ async fn unenforced_pk_filter_shape_is_route_dependent_on_beta21() {
     );
 
     // Matched-only partial-schema v2 update: no Insert action touches the
-    // filter builder, but beta.21 deliberately retains `Some(empty Bloom)`.
+    // filter builder, but pinned Lance deliberately retains `Some(empty Bloom)`.
     let partial_schema = Arc::new(Schema::new(vec![
         Field::new("id", DataType::Utf8, false),
         Field::new("value", DataType::Int32, false),
@@ -1862,7 +1885,7 @@ async fn unenforced_pk_filter_shape_is_route_dependent_on_beta21() {
     assert_bloom_empty(filter, true, "matched-only partial-schema PK update");
 
     // With a scalar index on every ON column and the default `use_index=true`,
-    // beta.21 selects v1. That route hardcodes `inserted_rows_filter=None`.
+    // pinned Lance selects v1. That route hardcodes `inserted_rows_filter=None`.
     let indexed_uri = dir.path().join("rfc023_filter_indexed_v1.lance");
     let mut indexed = fresh_pk_dataset(indexed_uri.to_str().unwrap()).await;
     indexed
@@ -1882,19 +1905,19 @@ async fn unenforced_pk_filter_shape_is_route_dependent_on_beta21() {
     .await;
     assert!(
         staged_inserted_rows_filter(&indexed_route).is_none(),
-        "the beta.21 all-keys-indexed v1 route must remain visibly unfenced"
+        "the pinned Lance all-keys-indexed v1 route must remain visibly unfenced"
     );
 }
 
-// --- Guard 19c: beta.21 key-filter conflict checks are directional ---------
+// --- Guard 19c: pinned Lance key-filter conflicts are directional ----------
 //
 // Lance evaluates compatibility from the transaction currently being rebased
-// against the transaction already committed. beta.21 is deliberately strict
+// against the transaction already committed. Pinned Lance is deliberately strict
 // for `filtered current / unfiltered committed`, but the reverse order is
 // accepted. RFC-023 must not assume a symmetric conflict matrix until the
 // upstream resolver actually supplies one.
 #[tokio::test]
-async fn unenforced_pk_conflict_matrix_is_directional_on_beta21() {
+async fn unenforced_pk_conflict_matrix_is_directional() {
     struct Case {
         name: &'static str,
         committed: ConflictMatrixTxn,
@@ -2023,7 +2046,7 @@ async fn unenforced_pk_conflict_matrix_is_directional_on_beta21() {
         if case.current_succeeds {
             assert!(
                 current_result.is_ok(),
-                "{}: beta.21 should accept this direction, got {current_result:?}",
+                "{}: pinned Lance should accept this direction, got {current_result:?}",
                 case.name
             );
         } else {
@@ -2032,7 +2055,7 @@ async fn unenforced_pk_conflict_matrix_is_directional_on_beta21() {
                     &current_result,
                     Err(lance::Error::RetryableCommitConflict { .. })
                 ),
-                "{}: expected beta.21 RetryableCommitConflict, got {current_result:?}",
+                "{}: expected pinned Lance RetryableCommitConflict, got {current_result:?}",
                 case.name
             );
         }

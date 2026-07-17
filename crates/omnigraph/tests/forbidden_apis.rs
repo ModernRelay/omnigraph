@@ -51,7 +51,7 @@
 //!
 //! After the exact EnsureIndices adapter, `db.storage()` (`&dyn TableStorage`)
 //! exposes only staged primitives + reads and there is no separate inline
-//! residual surface. Vector index creation uses beta.21's full-table
+//! residual surface. Vector index creation uses pinned Lance's full-table
 //! `execute_uncommitted` path inside `stage_create_indices`; `delete` likewise
 //! migrated to `stage_delete` in MR-A (Lance 7.0 #6658).
 //! The dead legacy methods

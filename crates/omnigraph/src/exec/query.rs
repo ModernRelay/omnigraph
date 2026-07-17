@@ -2205,7 +2205,7 @@ pub(super) fn literal_to_sql(lit: &Literal) -> String {
 //   1. `CompOp::Contains` against list-typed columns (lowered to
 //      `array_has(col, value)` — requires the `nested_expressions`
 //      feature on the `datafusion` crate, enabled in the workspace).
-//   2. Optimizer rules in DataFusion 53 that act on `Expr` shapes
+//   2. Optimizer rules in DataFusion 54 that act on `Expr` shapes
 //      (vectorized `IN`-list eq kernel, `PhysicalExprSimplifier`, the
 //      `CASE WHEN x THEN y ELSE NULL` shortcut, etc.).
 //

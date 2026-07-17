@@ -156,7 +156,79 @@ If a future need pulls one of these into scope, add a row to the matching domain
 
 When Lance ships a major release that changes any of the above (file format bump, new index type, transaction semantics change, new branching primitive), refresh this index in the same change as the omnigraph upgrade. Stale Lance pointers are worse than no pointers.
 
-### Last alignment audit: 2026-07-12 (Lance 9.0.0-beta.21 upstream; omnigraph pinned at 9.0.0-beta.21 via git rev)
+### Last alignment audit: 2026-07-17 (Lance 9.0.0-rc.1; git rev `cec0b7df`)
+
+The pin advanced from `v9.0.0-beta.21` (`1aec1465`) to
+`v9.0.0-rc.1` (`cec0b7dffe2d85c7e66dbe9d1f3891c297903a1d`) after reviewing
+all 40 intervening commits, the cumulative RC release notes, and the complete
+matching format/guide pages listed above. Every Lance workspace dependency,
+including the engine's `lance-io` test dependency, uses the same exact rev.
+DataFusion advances 53→54; Arrow remains 58 and `object_store` remains 0.13.2.
+The lockfile adds Lance's new transitive `lance-index-core` crate. OmniGraph
+still writes explicit stable V2_2 files, so this dependency bump does not
+activate a new storage format or require a general OmniGraph format migration
+for schemas that avoid the newly reserved names documented below. RC.1 requires
+Rust 1.91 or newer; OmniGraph continues to track stable Rust and this audit ran
+on Rust 1.95.
+
+Behavior-affecting findings in this audit:
+
+- **The RFC-022 write/recovery architecture remains aligned.** Native
+  branch/tag/cleanup behavior, shared `Session` construction, merge-insert
+  filter emission, the directional filtered/unfiltered conflict resolver, and
+  full-table `CreateIndexBuilder::execute_uncommitted` retain the shapes
+  OmniGraph consumes. All 22 Lance surface guards pass on RC.1, including the
+  branch/ABA, blob-compaction, key-filter, shared-session, vector-staging, and
+  compiler-reservation cells. Search, writes, schema apply, branching,
+  maintenance, row-version, ordinary recovery, and all 129 runnable failpoint
+  tests also pass. A graph initialized and populated by the cached beta.21 CLI
+  was opened, queried, merge-written, and queried again by the RC.1 CLI, proving
+  the supported ordinary-schema V2_2 forward-open/write path rather than
+  relying only on fresh RC fixtures. This proof intentionally does not cover
+  the two newly reserved row-version names; their explicit upgrade path is
+  documented below.
+- **Data Overlay is not an OmniGraph primitive.** RC.1 adds the experimental,
+  opt-in `Operation::DataOverlay` and table feature flag 64. OmniGraph neither
+  enables that flag nor emits the operation; its recovery classifiers keep
+  unknown foreign effects on the fail-closed path. The explicit V2_2 pin does
+  not silently opt a dataset into overlays.
+- **MemWAL's direction improves, but RFC-026's activation blocker remains.**
+  Derived MemWAL datasets now inherit the base dataset's store parameters and
+  `Session`, which is compatible with OmniGraph's shared-session design and
+  remote credentials. The public initializer still commits internally and
+  shard claiming remains a separate effect: there is still no caller-owned
+  exact enrollment receipt plus reversible shard-admission seal. MemWAL stays
+  the strategic substrate; RFC-026 stays draft rather than reaching through
+  private APIs.
+- **Maintenance and index defaults preserve current behavior.** Compaction
+  avoids a useless fragment-reuse-index optimization in a deferred-remap case;
+  OmniGraph uses `defer_index_remap=false`, and Lance still exposes no stable
+  caller-minted maintenance transaction. FTS posting blocks are now
+  configurable, but the default and legacy fallback remain 128; OmniGraph does
+  not opt into the experimental 256/v3 layout. The one-segment full-table
+  vector staging API remains public with the same relevant shape.
+- **Lance virtual system-column names now fail early in OmniGraph.** RC.1
+  rejects writes whose physical schema declares `_rowid`, `_rowaddr`,
+  `_rowoffset`, `_row_created_at_version`, or
+  `_row_last_updated_at_version`. The schema parser and accepted-SchemaIR
+  validator now reserve those five exact, case-sensitive property names before
+  init or SchemaApply can create durable state or arm recovery. A surface guard
+  pins the compiler-owned list to the five surveyed Lance public constants;
+  every Lance bump still audits upstream source for additions. Because internal
+  schema v6 is not released, this is a validation tightening rather than a
+  format bump; a development graph already using either newly reserved
+  row-version name must be exported with the beta.21 binary, renamed, and
+  rebuilt before opening on RC.1. The audit minted a genuine beta.21 v6 graph
+  with `_row_created_at_version`: beta.21 opened it successfully, while RC.1
+  refused it before any write with that exact recovery instruction.
+- **RFC-024's research-blocked cost conclusion survives.** Its ignored
+  10/100/1,000 instrument keeps exact heads and indexed row/range work flat, but
+  RC.1 adds a bounded one-operation boundary at the 1,000-commit endpoint on top
+  of the already-rejected byte curves. The local default and decision-scale
+  instruments pass with these current no-go facts asserted; S3/RustFS remains
+  bucket-gated and was not available for this audit.
+
+### Prior alignment audit: 2026-07-12 (Lance 9.0.0-beta.21 upstream; omnigraph pinned at 9.0.0-beta.21 via git rev)
 
 The pin advanced from `v9.0.0-beta.15` (`f24e42c1`) to
 `v9.0.0-beta.21` (`1aec1465`) after reviewing all 77 intervening commits and

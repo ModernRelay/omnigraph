@@ -859,7 +859,7 @@ async fn match_text_matches_exact_set_excludes_unrelated() {
 // RRF fuses arms OTHER than the default nearest+bm25: two FTS arms (title+body).
 // Proves primary_var resolves when neither arm is `nearest`, and fusion runs.
 // Lance beta.19 #7621 completed the ICU English stop-word list, changing BM25
-// document-length normalization in the body arm. Under the beta.21 pin the
+// document-length normalization in the body arm. Under the RC.1 pin the
 // title arm ranks rl/ml/dl, the body arm ranks dl/rl/ml, and RRF therefore
 // deterministically ranks rl/dl/ml.
 #[tokio::test]

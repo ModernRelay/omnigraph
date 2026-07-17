@@ -17,6 +17,7 @@ use ulid::Ulid;
 
 use crate::error::{CompilerError, Result, SchemaIdentityError};
 use crate::schema::ast::{Annotation, Cardinality, Constraint, ConstraintBound};
+use crate::schema::is_reserved_storage_system_column;
 use crate::types::PropType;
 
 use super::schema_shape::{
@@ -1104,6 +1105,14 @@ pub fn validate_schema_ir(ir: &SchemaIR) -> Result<()> {
         }
         let mut property_names = HashSet::new();
         for property in entry.properties {
+            if is_reserved_storage_system_column(&property.name) {
+                return invalid_ir(format!(
+                    "property '{}.{}' uses a name reserved for a virtual storage system column; \
+                     a graph created with a pre-RC Lance binary must be exported with that binary, \
+                     renamed, and rebuilt",
+                    entry.name, property.name
+                ));
+            }
             if !property_names.insert(property.name.as_str()) {
                 return invalid_ir(format!(
                     "duplicate property '{}.{}'",
@@ -1735,6 +1744,36 @@ edge Relates: Human -> Human @rename_from("Knows") { @unique(src, dst) }
         let mut v1 = ir;
         v1.ir_version = 1;
         assert!(validate_schema_ir(&v1).is_err());
+    }
+
+    #[test]
+    fn validation_rejects_reserved_storage_system_column_names() {
+        const RESERVED: [&str; 5] = [
+            "_rowid",
+            "_rowaddr",
+            "_rowoffset",
+            "_row_created_at_version",
+            "_row_last_updated_at_version",
+        ];
+        let accepted = initialize(
+            "interface I { ip: String } node N { np: String } edge E: N -> N { ep: String }",
+        );
+
+        for name in RESERVED {
+            for owner in ["interface", "node", "edge"] {
+                let mut malformed = accepted.clone();
+                match owner {
+                    "interface" => malformed.interfaces[0].properties[0].name = name.to_string(),
+                    "node" => malformed.nodes[0].properties[0].name = name.to_string(),
+                    "edge" => malformed.edges[0].properties[0].name = name.to_string(),
+                    _ => unreachable!(),
+                }
+                let error = validate_schema_ir(&malformed).unwrap_err().to_string();
+                assert!(error.contains("reserved"), "unexpected error: {error}");
+                assert!(error.contains(name), "unexpected error: {error}");
+                assert!(error.contains("exported"), "unexpected error: {error}");
+            }
+        }
     }
 
     #[test]

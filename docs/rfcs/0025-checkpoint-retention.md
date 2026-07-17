@@ -18,8 +18,8 @@ recovery-sidecar protocol and
 [RFC-028](0028-stable-schema-identity.md)'s stable table identity/incarnation.
 It composes with [RFC-024](0024-durable-table-heads.md), but durable heads are
 not required for checkpoint authority.
-**Surveyed:** omnigraph 0.8.1; Lance 9.0.0-beta.21 at git rev
-`1aec14652dcbace23ac277fa8ced35000bea0c40`; full Lance branch/tag,
+**Surveyed:** omnigraph 0.8.1; Lance 9.0.0-rc.1 at git rev
+`cec0b7dffe2d85c7e66dbe9d1f3891c297903a1d`; full Lance branch/tag,
 transaction, cleanup, and object-store specifications
 **Audience:** engine, storage, CLI, and operations maintainers
 **Open architecture review:** [RFC-022–028 review ledger](../dev/rfc-022-027-architecture-review.md).

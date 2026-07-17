@@ -204,7 +204,7 @@ RFC-022 adapter contract:
    immutable files, then the still-uncommitted Append descriptor is replaced by
    the exact filtered `Update` and certified again. It does not substitute one
    whole-delta merge transaction or commit an Append. The normalizer is
-   lazy and deliberately avoids Lance beta.21's row-only `strict_batch_size`
+   lazy and deliberately avoids pinned Lance's row-only `strict_batch_size`
    accumulator: normalized/writer chunks are hard-capped while the one upstream
    raw emission remains governed by Lance's approximate `batch_size_bytes`
    target and is covered by the process-RSS gate. A row above 32 MiB or a
@@ -482,7 +482,7 @@ holds more narrowly **by construction**: `TableStore` / `TableStorage` are
 crate-private, and their internal `db.storage()` surface exposes only staged
 primitives + reads. Lance 7.0's `DeleteBuilder::execute_uncommitted`
 ([#6658](https://github.com/lance-format/lance/issues/6658)) moved delete to
-`stage_delete`; beta.21's full-table index `execute_uncommitted` shape moved the
+`stage_delete`; pinned Lance's full-table index `execute_uncommitted` shape moved the
 last vector build into `stage_create_indices`. `InlineCommitResidual`,
 `storage_inline_residual()`, and inline `create_vector_index` are removed.
 Generic multi-segment exact index publication remains covered by Lance

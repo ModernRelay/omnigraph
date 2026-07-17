@@ -15,8 +15,8 @@ owner: OmniGraph maintainers
 **Author track:** Maintainer design series
 **Depends on:** [RFC-022](0022-unified-write-path.md)'s accepted-schema capture,
 SchemaApply recovery, and strict publication boundary
-**Surveyed:** OmniGraph 0.8.1 (`main`); Lance 9.0.0-beta.21 at git rev
-`1aec14652dcbace23ac277fa8ced35000bea0c40`; full Lance table-schema,
+**Surveyed:** OmniGraph 0.8.1 (`main`); Lance 9.0.0-rc.1 at git rev
+`cec0b7dffe2d85c7e66dbe9d1f3891c297903a1d`; full Lance table-schema,
 schema-evolution, transaction, and versioning specifications
 **Audience:** compiler, schema, engine, migration, and release maintainers
 **Architecture review:** [RFC-022–028 review ledger](../dev/rfc-022-027-architecture-review.md).

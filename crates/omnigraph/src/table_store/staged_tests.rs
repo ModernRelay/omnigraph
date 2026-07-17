@@ -370,7 +370,7 @@ async fn keyed_upsert_forces_filter_route_and_preserves_conflict_metadata() {
         .await
         .unwrap();
 
-    // An id BTREE makes beta.21's default merge route select v1, which emits
+    // An id BTREE makes pinned Lance's default merge route select v1, which emits
     // no key filter.  The keyed adapter must override that routing choice.
     let staged_index = store
         .stage_create_indices(
