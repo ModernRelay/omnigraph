@@ -15,8 +15,8 @@ owner: OmniGraph maintainers
 **Author track:** Maintainer design series
 **Depends on:** [RFC-022](0022-unified-write-path.md)'s unified branch-merge
 pipeline and capture-once write view
-**Surveyed:** omnigraph 0.8.1; Lance 9.0.0-beta.21 at git rev
-`1aec14652dcbace23ac277fa8ced35000bea0c40`; full Lance row-lineage,
+**Surveyed:** omnigraph 0.8.1; Lance 9.0.0-rc.1 at git rev
+`cec0b7dffe2d85c7e66dbe9d1f3891c297903a1d`; full Lance row-lineage,
 transaction, branching, and read/write specifications
 **Audience:** merge, storage, and performance maintainers
 **Open architecture review:** [RFC-022–028 review ledger](../dev/rfc-022-027-architecture-review.md).

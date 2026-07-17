@@ -11,6 +11,11 @@
 
 `<ident>: <TypeRef> [annotation*]`
 
+The exact names `_rowid`, `_rowaddr`, `_rowoffset`,
+`_row_created_at_version`, and `_row_last_updated_at_version` are reserved for
+Lance virtual system columns and cannot be declared as interface, node, or edge
+properties. Similar names such as `_row_id` remain valid.
+
 ## Built-in scalar types
 
 | Scalar | Arrow type |

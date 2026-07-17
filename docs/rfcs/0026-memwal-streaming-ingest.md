@@ -20,8 +20,8 @@ incarnation contract, plus
 [RFC-023](0023-key-conflict-fencing.md) for the initial keyed graph-stream
 mode. Durable heads from
 [RFC-024](0024-durable-table-heads.md) are compatible but not required.
-**Surveyed:** omnigraph 0.8.1; Lance 9.0.0-beta.21 at git rev
-`1aec14652dcbace23ac277fa8ced35000bea0c40`; complete MemWAL table and
+**Surveyed:** omnigraph 0.8.1; Lance 9.0.0-rc.1 at git rev
+`cec0b7dffe2d85c7e66dbe9d1f3891c297903a1d`; complete MemWAL table and
 system-index specifications, including the durability and writer-fencing
 changes carried forward from beta.17
 **Audience:** engine, server, CLI, policy, and operations maintainers
@@ -45,7 +45,7 @@ small adapter, compile/runtime surface guards, a quiescence requirement before
 Lance upgrades, and a fresh full-spec alignment audit on every bump. It is not a
 reason to fork or reimplement MemWAL.
 
-One beta.21 API gap is a ship blocker, not evidence against the architecture:
+One RC.1 API gap is a ship blocker, not evidence against the architecture:
 `InitializeMemWalBuilder::execute` internally commits the MemWAL `CreateIndex`
 transaction and returns only `Result<()>`, while initial shard-manifest creation
 is a separate object-store effect reached through `mem_wal_writer`. The public
@@ -155,7 +155,7 @@ implementation, Lance must expose one of these public, surface-guarded shapes:
    both the index transaction and initial shard objects, with documented
    classify/roll-forward/rollback semantics.
 
-The beta.21 `execute() -> Result<()>` initializer plus separately claimed shard
+The RC.1 `execute() -> Result<()>` initializer plus separately claimed shard
 writer satisfies neither shape. Private-module access, compatible-looking
 index inference, and direct object-store emulation are rejected. Until this
 gate lands, `@stream` may be parsed/planned in draft work but the streaming
@@ -466,7 +466,7 @@ logical pair, it cannot preserve the old physical enrollment:
 The old shard namespace and artifacts remain retained until SchemaApply and
 rebind sidecars are resolved and every fresh-read/recovery guard releases them.
 A preserved physical enrollment never resets its generation or WAL-position
-counters. A rebind never reuses an old shard UUID; beta.21 surface guards pin
+counters. A rebind never reuses an old shard UUID; pinned-Lance surface guards pin
 that OmniGraph supplies a fresh UUID v4 to `mem_wal_writer` and that the new
 namespace is disjoint from every prior binding for the logical table lifetime.
 
@@ -560,7 +560,7 @@ graph whose format already declares streaming; enrollment adds one table's
 physical MemWAL index and exact lifecycle row but does not change the graph
 format.
 
-The capability stamp is not assigned merely because beta.21 MemWAL APIs are
+The capability stamp is not assigned merely because RC.1 MemWAL APIs are
 present. Initialization can emit a stream-capable first state only after §3's
 public exact-enrollment and admission-seal gate passes; otherwise both new-root
 activation and first enrollment remain disabled.
@@ -620,7 +620,7 @@ authorize general replica failover.
 
 - Surface guards pin claim, append, durability waiter, flush, per-shard epoch
   fencing, staged merge with `merged_generations`, and index catchup. They also
-  pin beta.21's blocking fact that initialization commits internally and shard
+  pin RC.1's blocking fact that initialization commits internally and shard
   creation is separate. Acceptance requires the public exact enrollment
   receipt/staging plus admission seal/reopen surface from §3; until then this
   gate remains red.

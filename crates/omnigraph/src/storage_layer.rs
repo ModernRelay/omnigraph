@@ -10,7 +10,7 @@
 //! `delete_where` was the final data-write residual until MR-A: Lance 7.0's
 //! `DeleteBuilder::execute_uncommitted` (#6658) made delete a staged write
 //! (`TableStorage::stage_delete` → `commit_staged`), so delete no longer
-//! advances Lance HEAD inline. Lance beta.21's public full-table index
+//! advances Lance HEAD inline. Pinned Lance's public full-table index
 //! `execute_uncommitted` shape now does the same for BTREE, FTS, and vector
 //! index builds. There is no separate inline-commit storage surface left.
 //!

@@ -13,10 +13,18 @@ owner: OmniGraph maintainers
 **Status:** Research blocked — Gate A physical lookup rejected
 **Date:** 2026-07-10
 **Author track:** Maintainer design series
-**Surveyed:** omnigraph 0.8.1 (`main`); Lance 9.0.0-beta.21 at git rev
-`1aec14652dcbace23ac277fa8ced35000bea0c40`; full Lance table layout,
+**Surveyed:** omnigraph 0.8.1 (`main`); Lance 9.0.0-rc.1 at git rev
+`cec0b7dffe2d85c7e66dbe9d1f3891c297903a1d`; full Lance table layout,
 transaction, branching, indexing, compaction, cleanup, and object-store
 specifications
+**RC.1 evidence status (2026-07-17):** the public physical-ref and BTREE
+surfaces remain aligned. The local 10/100/1,000 decision instrument was rerun:
+exact indexed rows, ranges, result fragments, and pages remain flat; RC.1 adds
+one bounded range-read operation and at most 128 scan bytes at the deepest
+uncompacted endpoint, while compacted cold scan bytes still grow. The
+representative RustFS table in §7.4 remains explicitly historical beta.21
+evidence; its bucket-gated RC.1 cell was not available for this audit. The
+candidate remains rejected for the same physical-cost reason.
 **Relationship to RFC-022:** this RFC is the durable-heads decision split from
 the earlier monolithic RFC-022 draft. [RFC-022](0022-unified-write-path.md)
 defines the shared publisher/recovery protocol; this RFC owns the heads-format
@@ -171,7 +179,7 @@ TableHeadMetadata {
 Capture reads `BranchIdentifier` before and after the current transaction and
 manifest-location evidence and rejects movement during capture. A missing
 current transaction, an empty transaction UUID, or a missing backend-required
-e_tag fails closed. On beta.21, local `current_manifest_path` synthesizes the
+e_tag fails closed. On pinned Lance, local `current_manifest_path` synthesizes the
 e_tag from inode, mtime, and size; S3/RustFS returns the object e_tag. Main's
 `BranchIdentifier` is canonically empty, so its transaction UUID and e_tag are
 load-bearing; a named-ref recreation additionally changes `BranchIdentifier`.
@@ -341,7 +349,7 @@ positive slope in:
 - manifest object-store reads;
 - bytes read;
 - fragments/pages scanned; and
-- beta.21 `rows_scanned` proxy
+- the pinned Lance `rows_scanned` debug proxy, re-audited on every bump
 
 as commit history grows.
 
@@ -387,7 +395,7 @@ eight-fragment uncovered tail, and reconciliation after that tail. Each state
 is measured as a cold tracked open and a warm repeat over the same `Dataset` and
 shared `Session`, on local FS and bucket-gated S3/RustFS.
 
-Representative reconciled RustFS curves from 20 to 80 publishes were:
+Historical beta.21 reconciled RustFS curves from 20 to 80 publishes were:
 
 | Shape | 20 publishes | 80 publishes | Disposition |
 |---|---:|---:|---|

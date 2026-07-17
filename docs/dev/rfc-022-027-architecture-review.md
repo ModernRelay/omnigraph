@@ -9,20 +9,30 @@ research-blocked; RFC-025 and RFC-026 remain under review
 branch/tag, MemWAL, row-lineage, read/write, compaction, and cleanup
 specifications; pinned Rust implementation where the public specification is
 not precise enough
-**RFC-022 close-out revalidated against:** Lance 9.0.0-beta.21 at
+**Current Lance revalidation:** all RFC-022–028 substrate contracts were
+re-audited on 2026-07-17 against Lance 9.0.0-rc.1 at
+`cec0b7dffe2d85c7e66dbe9d1f3891c297903a1d`; see the
+[RC.1 alignment audit](lance.md#last-alignment-audit-2026-07-17-lance-900-rc1-git-rev-cec0b7df).
+Stable V2_2, native branch/tag/cleanup semantics, exact full-table index
+staging, and RFC-023's route-dependent/directional key-filter behavior remain
+aligned. Data Overlay is opt-in and unused. MemWAL now inherits store/session
+configuration but still lacks RFC-026's exact enrollment receipt and reversible
+admission seal. RC.1 therefore requires no RFC redesign or format activation.
+
+**Prior RFC-022 close-out revalidation:** Lance 9.0.0-beta.21 at
 `1aec14652dcbace23ac277fa8ced35000bea0c40`; see the
-[2026-07-12 alignment audit](lance.md#last-alignment-audit-2026-07-12-lance-900-beta21-upstream-omnigraph-pinned-at-900-beta21-via-git-rev).
-**RFC-023 substrate evidence revalidated against:** the same beta.21 revision;
+[2026-07-12 alignment audit](lance.md#prior-alignment-audit-2026-07-12-lance-900-beta21-upstream-omnigraph-pinned-at-900-beta21-via-git-rev).
+**Prior RFC-023 substrate evidence revalidated against:** the same beta.21 revision;
 filter-shape and conflict-order probes are recorded in RFC-023 §2. Internal
 schema v6 now consumes that evidence through exact-`id` fenced production
 routing. Its final insertion-absence certificate/no-target-preflight route and
 predeclared 10K/100K production series now satisfy the remaining implementation
 and acceptance gates.
-**RFC-026 substrate contract revalidated against:** the same beta.21 revision;
+**Prior RFC-026 substrate contract revalidated against:** the same beta.21 revision;
 the full MemWAL table and system-index specifications, including the
 durability/fencing behavior carried forward from beta.17, are reflected in the
 RFC's survey and acceptance guards.
-**RFC-024/025/027 substrate claims revalidated against:** the same beta.21
+**Prior RFC-024/025/027 substrate claims revalidated against:** the same beta.21
 revision and the full matching table/index/branch/tag/cleanup, transaction, and
 row-lineage specification sections; their survey headers now record beta.21.
 RFC-024 Gate A was subsequently measured on 2026-07-15: its exact BTREE scan
@@ -416,7 +426,7 @@ integration.
 [§9](../rfcs/0026-memwal-streaming-ingest.md#9-fresh-read-cuts),
 and [§11–13](../rfcs/0026-memwal-streaming-ingest.md#11-format-activation-and-rebuild)
 
-**Status:** Open. The format/refusal portion is specified, but beta.21 lacks the
+**Status:** Open. The format/refusal portion is specified, but RC.1 lacks the
 public exact enrollment and reversible shard-admission surface needed by the
 recovery/quiescence adapter. RFC-026 cannot be accepted or activated until that
 API gate and its crash evidence close.
@@ -445,7 +455,7 @@ enrollment boundary: SchemaApply leaves the preserved logical identity
 shard namespace may publish `OPEN`. Recovery never infers adoption from the
 logical pair, name, path, or a compatible-looking index.
 
-**Remaining required disposition:** in beta.21,
+**Remaining required disposition:** in RC.1,
 `InitializeMemWalBuilder::execute` internally commits the `CreateIndex`
 transaction and returns only `Result<()>`; `mem_wal_writer` separately creates
 or claims shard-manifest objects. That cannot satisfy a sidecar that pre-arms

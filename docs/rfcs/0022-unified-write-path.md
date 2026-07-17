@@ -13,7 +13,7 @@ owner: OmniGraph maintainers
 **Status:** Implemented on 2026-07-13
 **Date:** 2026-07-12
 **Author track:** Maintainer design series
-**Surveyed:** OmniGraph 0.8.1 (`main`); Lance 9.0.0-beta.21, git rev `1aec1465`
+**Surveyed:** OmniGraph 0.8.1 (`main`); Lance 9.0.0-rc.1, git rev `cec0b7df`
 **Audience:** engine and storage maintainers
 **Architecture review:** [RFC-022–028 review ledger](../dev/rfc-022-027-architecture-review.md).
 RFC-022's structural rollout and lifecycle findings are closed; the ledger
