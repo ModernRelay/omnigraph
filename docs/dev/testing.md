@@ -79,7 +79,8 @@ RFC-026 Phase A uses the same suite for its three enrollment crash states:
 `stream_enrollment_index_only_crash_rolls_forward_and_fences_ordinary_writes`,
 and
 `stream_enrollment_empty_shard_crash_rolls_forward_without_reclaim_or_reclaiming_epoch`.
-The surrounding cells pin post-publish audit-failure convergence, main-only
+The surrounding cells pin post-publish audit-failure recovery and Phase-D
+sidecar-delete failure returning visible success before reopen cleanup, main-only
 topology, uncovered index and raw-shard residue without lifecycle authority,
 live HEAD movement past the durable witness, typed maintenance/index/GC
 exclusion for `OPEN`, and allowance of a disjoint-table effect. These call only

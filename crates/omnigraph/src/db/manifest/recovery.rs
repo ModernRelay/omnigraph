@@ -1220,8 +1220,9 @@ pub(crate) async fn delete_sidecar(
     storage: &dyn StorageAdapter,
 ) -> Result<()> {
     // Failpoint: models a storage delete failure (S3 DeleteObject) in
-    // Phase D — callers swallow it (the write already published) and the
-    // stale sidecar is healed by the next write or open.
+    // Phase D. Writer-side callers swallow it once publication is durable;
+    // recovery callers may keep cleanup required. Either way, the stale
+    // sidecar remains available for a later write or open to heal.
     crate::failpoints::maybe_fail(crate::failpoints::names::RECOVERY_SIDECAR_DELETE)?;
     storage.delete(&handle.sidecar_uri).await
 }
@@ -3786,6 +3787,16 @@ pub(crate) async fn finalize_effect_free_occ_sidecar(
     Ok(true)
 }
 
+/// A writer has crossed its acknowledgement boundary once the fixed outcome
+/// and recovery audit are durable, so its Phase-D cleanup is best-effort.
+/// Open/write-entry recovery has no user operation to acknowledge and keeps
+/// cleanup required before declaring its sweep complete.
+#[derive(Clone, Copy)]
+enum StreamEnrollmentCleanup {
+    Required,
+    BestEffortAfterVisible,
+}
+
 /// Recover one bounded RFC-026 enrollment intent.
 ///
 /// This adapter deliberately has no rollback branch. The only destructive
@@ -3798,6 +3809,7 @@ async fn process_stream_enrollment_sidecar_v10(
     storage: &std::sync::Arc<dyn StorageAdapter>,
     snapshot: &Snapshot,
     sidecar: &RecoverySidecar,
+    cleanup_policy: StreamEnrollmentCleanup,
 ) -> Result<bool> {
     let protocol = sidecar.protocol_v10.as_ref().ok_or_else(|| {
         OmniError::manifest_internal("schema-v10 StreamEnrollment is missing protocol_v10")
@@ -3878,9 +3890,14 @@ async fn process_stream_enrollment_sidecar_v10(
             .await
             .map_err(|error| stream_enrollment_effect_error(sidecar, error))?
         {
-            return finalize_visible_stream_enrollment(root_uri, storage.as_ref(), sidecar)
-                .await
-                .map_err(|error| stream_enrollment_effect_error(sidecar, error));
+            return finalize_visible_stream_enrollment(
+                root_uri,
+                storage.as_ref(),
+                sidecar,
+                cleanup_policy,
+            )
+            .await
+            .map_err(|error| stream_enrollment_effect_error(sidecar, error));
         }
     }
 
@@ -3932,9 +3949,14 @@ async fn process_stream_enrollment_sidecar_v10(
         .await
         .map_err(|error| stream_enrollment_effect_error(sidecar, error))?
     {
-        return finalize_visible_stream_enrollment(root_uri, storage.as_ref(), sidecar)
-            .await
-            .map_err(|error| stream_enrollment_effect_error(sidecar, error));
+        return finalize_visible_stream_enrollment(
+            root_uri,
+            storage.as_ref(),
+            sidecar,
+            cleanup_policy,
+        )
+        .await
+        .map_err(|error| stream_enrollment_effect_error(sidecar, error));
     }
     if snapshot.stream_lifecycle(pin.identity).is_some()
         || manifest_entry.table_version != pin.expected_version
@@ -4004,10 +4026,36 @@ async fn process_stream_enrollment_sidecar_v10(
     )
     .await
     .map_err(|error| stream_enrollment_effect_error(sidecar, error))?;
-    delete_sidecar_by_operation_id(root_uri, storage.as_ref(), &sidecar.operation_id)
+    cleanup_visible_stream_enrollment_sidecar(root_uri, storage.as_ref(), sidecar, cleanup_policy)
         .await
         .map_err(|error| stream_enrollment_effect_error(sidecar, error))?;
     Ok(true)
+}
+
+async fn cleanup_visible_stream_enrollment_sidecar(
+    root_uri: &str,
+    storage: &dyn StorageAdapter,
+    sidecar: &RecoverySidecar,
+    cleanup_policy: StreamEnrollmentCleanup,
+) -> Result<()> {
+    let handle = RecoverySidecarHandle {
+        operation_id: sidecar.operation_id.clone(),
+        sidecar_uri: sidecar_uri(root_uri, &sidecar.operation_id),
+    };
+    match delete_sidecar(&handle, storage).await {
+        Ok(()) => Ok(()),
+        Err(error) => match cleanup_policy {
+            StreamEnrollmentCleanup::Required => Err(error),
+            StreamEnrollmentCleanup::BestEffortAfterVisible => {
+                tracing::warn!(
+                    error = %error,
+                    operation_id = sidecar.operation_id.as_str(),
+                    "stream enrollment recovery sidecar cleanup failed; the next open will resolve it"
+                );
+                Ok(())
+            }
+        },
+    }
 }
 
 /// Once exact classification observes either enrollment effect, every failure
@@ -4035,9 +4083,15 @@ pub(crate) async fn complete_stream_enrollment_sidecar_v10(
     snapshot: &Snapshot,
     sidecar: &RecoverySidecar,
 ) -> Result<()> {
-    process_stream_enrollment_sidecar_v10(root_uri, &storage, snapshot, sidecar)
-        .await
-        .map(|_| ())
+    process_stream_enrollment_sidecar_v10(
+        root_uri,
+        &storage,
+        snapshot,
+        sidecar,
+        StreamEnrollmentCleanup::BestEffortAfterVisible,
+    )
+    .await
+    .map(|_| ())
 }
 
 fn stream_enrollment_lifecycle(
@@ -4115,6 +4169,7 @@ async fn finalize_visible_stream_enrollment(
     root_uri: &str,
     storage: &dyn StorageAdapter,
     sidecar: &RecoverySidecar,
+    cleanup_policy: StreamEnrollmentCleanup,
 ) -> Result<bool> {
     let protocol = sidecar
         .protocol_v10
@@ -4144,7 +4199,7 @@ async fn finalize_visible_stream_enrollment(
             })
             .await?;
     }
-    delete_sidecar_by_operation_id(root_uri, storage, &sidecar.operation_id).await?;
+    cleanup_visible_stream_enrollment_sidecar(root_uri, storage, sidecar, cleanup_policy).await?;
     Ok(true)
 }
 
@@ -4167,7 +4222,11 @@ async fn process_sidecar(
         // merely adding the unreachable v10 branch made deep EnsureIndices
         // recovery tests overflow Tokio's worker stack.
         return Box::pin(process_stream_enrollment_sidecar_v10(
-            root_uri, storage, snapshot, sidecar,
+            root_uri,
+            storage,
+            snapshot,
+            sidecar,
+            StreamEnrollmentCleanup::Required,
         ))
         .await;
     }

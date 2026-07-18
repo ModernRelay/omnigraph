@@ -210,6 +210,74 @@ async fn stream_enrollment_post_publish_audit_failure_remains_recoverable() {
 
 #[tokio::test]
 #[serial]
+async fn stream_enrollment_post_publish_delete_failure_keeps_visible_success_and_reopen_cleans() {
+    let _scenario = FailScenario::setup();
+    let dir = tempfile::tempdir().unwrap();
+    let uri = dir.path().to_str().unwrap();
+    let db = Omnigraph::init(uri, SCHEMA_V1).await.unwrap();
+    let commits_before = db.list_commits(Some("main")).await.unwrap().len();
+
+    {
+        let _failpoint = ScopedFailPoint::new(names::RECOVERY_SIDECAR_DELETE, "return");
+        db.failpoint_enroll_stream_table_for_test("node:Person")
+            .await
+            .expect("Phase-D sidecar deletion must not fail a visible, audited enrollment");
+        assert_eq!(
+            std::fs::read_dir(dir.path().join("__recovery"))
+                .unwrap()
+                .filter_map(std::result::Result::ok)
+                .count(),
+            1,
+            "the failed cleanup must leave one durable recovery sidecar"
+        );
+        let recovery_error = match Omnigraph::open(uri).await {
+            Ok(_) => panic!("open recovery must not swallow its own sidecar cleanup failure"),
+            Err(error) => error,
+        };
+        assert!(
+            matches!(recovery_error, OmniError::RecoveryRequired { .. }),
+            "open recovery must keep cleanup failure typed: {recovery_error:?}"
+        );
+    }
+
+    let commits_after_publish = db.list_commits(Some("main")).await.unwrap().len();
+    assert_eq!(commits_after_publish, commits_before + 1);
+    assert_eq!(
+        recovery_audit_kinds(dir.path()).await,
+        vec!["RolledForward"],
+        "the writer must audit the visible enrollment before best-effort cleanup"
+    );
+    drop(db);
+
+    let reopened = Omnigraph::open(uri)
+        .await
+        .expect("reopen must finalize the visible enrollment and retire its stale sidecar");
+    assert_eq!(
+        std::fs::read_dir(dir.path().join("__recovery"))
+            .unwrap()
+            .filter_map(std::result::Result::ok)
+            .count(),
+        0
+    );
+    assert_eq!(
+        reopened.list_commits(Some("main")).await.unwrap().len(),
+        commits_after_publish,
+        "stale-sidecar cleanup must not publish a second graph commit"
+    );
+    assert_eq!(
+        recovery_audit_kinds(dir.path()).await,
+        vec!["RolledForward"],
+        "stale-sidecar cleanup must not duplicate the recovery audit"
+    );
+    let error = reopened
+        .failpoint_enroll_stream_table_for_test("node:Person")
+        .await
+        .expect_err("the already-visible OPEN lifecycle must reject repeated enrollment");
+    assert!(matches!(error, OmniError::Manifest(_)));
+}
+
+#[tokio::test]
+#[serial]
 async fn stream_enrollment_refuses_when_a_named_graph_branch_exists() {
     let _scenario = FailScenario::setup();
     let dir = tempfile::tempdir().unwrap();
