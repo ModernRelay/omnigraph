@@ -563,8 +563,10 @@ pub struct BlobQuery {
     pub id: String,
     /// Blob property name.
     pub prop: String,
-    /// Branch to read; defaults to `main`.
+    /// Branch to read from. Mutually exclusive with `snapshot`. Defaults to `main`.
     pub branch: Option<String>,
+    /// Snapshot id to read from. Mutually exclusive with `branch`.
+    pub snapshot: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]

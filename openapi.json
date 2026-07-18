@@ -73,7 +73,7 @@
           "data"
         ],
         "summary": "Stream one row's Blob property.",
-        "description": "Resolves the cell at one pinned snapshot of `branch` (default `main`).\nInternal blobs stream with `Content-Length`, `Accept-Ranges: bytes`, a\nstrong identity-derived `ETag`, and single-range `206` support; external\nURI references answer `302 Found` without server-side resolution. `HEAD`\nreturns the same headers with no body (content-type sniffing reads at\nmost 512 bytes on both methods so the headers agree). Read-only; not\nadmission-gated.",
+        "description": "Resolves the cell at one pinned view of the target — `branch` xor\n`snapshot`, defaulting to branch `main` (the same target semantics as\n`POST /read`).\nInternal blobs stream with `Content-Length`, `Accept-Ranges: bytes`, a\nstrong identity-derived `ETag`, and single-range `206` support; external\nURI references answer `302 Found` without server-side resolution. `HEAD`\nreturns the same headers with no body (content-type sniffing reads at\nmost 512 bytes on both methods so the headers agree). Read-only; not\nadmission-gated.",
         "operationId": "cluster_getBlob",
         "parameters": [
           {
@@ -115,7 +115,19 @@
           {
             "name": "branch",
             "in": "query",
-            "description": "Branch to read; defaults to `main`.",
+            "description": "Branch to read from. Mutually exclusive with `snapshot`. Defaults to `main`.",
+            "required": false,
+            "schema": {
+              "type": [
+                "string",
+                "null"
+              ]
+            }
+          },
+          {
+            "name": "snapshot",
+            "in": "query",
+            "description": "Snapshot id to read from. Mutually exclusive with `branch`.",
             "required": false,
             "schema": {
               "type": [
@@ -145,7 +157,7 @@
             "description": "Not modified (`If-None-Match` matched the ETag)"
           },
           "400": {
-            "description": "Property is not a Blob",
+            "description": "Property is not a Blob, or branch and snapshot were both given (they are mutually exclusive)",
             "content": {
               "application/json": {
                 "schema": {

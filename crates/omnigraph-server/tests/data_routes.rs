@@ -1977,3 +1977,87 @@ async fn blob_route_error_taxonomy() {
     let response = blob_get(&app, "/blob?type=Document&id=readme&prop=title", &[]).await;
     assert_eq!(response.status(), StatusCode::BAD_REQUEST);
 }
+
+#[tokio::test(flavor = "multi_thread")]
+async fn blob_route_snapshot_param_pins_reads() {
+    // v1: readme = "Hello World"; capture main's snapshot id; v2 merge-load
+    // rewrites the same cell. The snapshot-addressed read must still serve
+    // v1's bytes — with a different ETag than the moved branch head, since
+    // the pinned table version participates in the validator.
+    let temp = init_graph_with_schema_and_data(
+        BLOB_ROUTE_SCHEMA,
+        r#"{"type": "Document", "data": {"title": "readme", "content": "base64:SGVsbG8gV29ybGQ="}}"#,
+    )
+    .await;
+    let graph = graph_path(temp.path());
+    let snapshot_id = {
+        let db = Omnigraph::open(graph.to_str().unwrap()).await.unwrap();
+        db.resolve_snapshot("main").await.unwrap().to_string()
+    };
+    {
+        let mut db = Omnigraph::open(graph.to_str().unwrap()).await.unwrap();
+        db.load(
+            "main",
+            r#"{"type": "Document", "data": {"title": "readme", "content": "base64:R29vZGJ5ZQ=="}}"#,
+            LoadMode::Merge,
+        )
+        .await
+        .unwrap();
+    }
+    let state = AppState::open(graph.to_string_lossy().to_string())
+        .await
+        .unwrap();
+    let app = build_app(state);
+
+    let pinned = blob_get(
+        &app,
+        &format!("/blob?type=Document&id=readme&prop=content&snapshot={snapshot_id}"),
+        &[],
+    )
+    .await;
+    assert_eq!(pinned.status(), StatusCode::OK);
+    let pinned_etag = pinned
+        .headers()
+        .get("etag")
+        .unwrap()
+        .to_str()
+        .unwrap()
+        .to_string();
+    let body = to_bytes(pinned.into_body(), usize::MAX).await.unwrap();
+    assert_eq!(&body[..], b"Hello World");
+
+    let live = blob_get(&app, "/blob?type=Document&id=readme&prop=content", &[]).await;
+    assert_eq!(live.status(), StatusCode::OK);
+    let live_etag = live
+        .headers()
+        .get("etag")
+        .unwrap()
+        .to_str()
+        .unwrap()
+        .to_string();
+    let body = to_bytes(live.into_body(), usize::MAX).await.unwrap();
+    assert_eq!(&body[..], b"Goodbye");
+    assert_ne!(
+        pinned_etag, live_etag,
+        "snapshot-pinned and branch-head reads of a rewritten cell must carry distinct validators"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn blob_route_rejects_branch_and_snapshot() {
+    let (_temp, app) = blob_app().await;
+    let response = blob_get(
+        &app,
+        "/blob?type=Document&id=readme&prop=content&branch=main&snapshot=someid",
+        &[],
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+    let error: ErrorOutput = serde_json::from_slice(&body).unwrap();
+    assert!(
+        error.error.contains("branch or snapshot"),
+        "error should name the exclusive params: {}",
+        error.error
+    );
+}
