@@ -59,6 +59,167 @@ pub async fn open_tracked_lance_dataset(
         .await
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub enum AttemptOutcome {
+    Pending,
+    Success,
+    NotFound,
+    Error,
+    StreamStarted,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ObjectStoreAttempt {
+    pub method: &'static str,
+    pub path: Path,
+    pub outcome: AttemptOutcome,
+}
+
+/// Records object-store read attempts, including failed/NotFound HEADs.
+///
+/// Lance's `IOTracker` intentionally records only successful `get_opts`
+/// results. Recovery classifiers need the attempted exact-key shape too,
+/// because an expected NotFound is part of their proof. This wrapper records
+/// before forwarding and then annotates the outcome.
+#[derive(Debug, Default, Clone)]
+pub struct AttemptTracker(Arc<Mutex<Vec<ObjectStoreAttempt>>>);
+
+impl AttemptTracker {
+    fn begin(&self, method: &'static str, path: Path) -> usize {
+        let mut attempts = self.0.lock().unwrap();
+        let index = attempts.len();
+        attempts.push(ObjectStoreAttempt {
+            method,
+            path,
+            outcome: AttemptOutcome::Pending,
+        });
+        index
+    }
+
+    fn finish<T>(&self, index: usize, result: &OSResult<T>) {
+        let outcome = match result {
+            Ok(_) => AttemptOutcome::Success,
+            Err(object_store::Error::NotFound { .. }) => AttemptOutcome::NotFound,
+            Err(_) => AttemptOutcome::Error,
+        };
+        self.0.lock().unwrap()[index].outcome = outcome;
+    }
+
+    fn record_stream(&self, method: &'static str, path: Path) {
+        self.0.lock().unwrap().push(ObjectStoreAttempt {
+            method,
+            path,
+            outcome: AttemptOutcome::StreamStarted,
+        });
+    }
+
+    pub fn incremental_attempts(&self) -> Vec<ObjectStoreAttempt> {
+        std::mem::take(&mut *self.0.lock().unwrap())
+    }
+}
+
+impl WrappingObjectStore for AttemptTracker {
+    fn wrap(&self, _store_prefix: &str, target: Arc<dyn ObjectStore>) -> Arc<dyn ObjectStore> {
+        Arc::new(AttemptTrackingStore {
+            target,
+            tracker: self.clone(),
+        })
+    }
+}
+
+#[derive(Debug)]
+struct AttemptTrackingStore {
+    target: Arc<dyn ObjectStore>,
+    tracker: AttemptTracker,
+}
+
+impl fmt::Display for AttemptTrackingStore {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "AttemptTrackingStore({})", self.target)
+    }
+}
+
+#[async_trait]
+impl ObjectStore for AttemptTrackingStore {
+    async fn put_opts(
+        &self,
+        location: &Path,
+        payload: PutPayload,
+        opts: PutOptions,
+    ) -> OSResult<PutResult> {
+        self.target.put_opts(location, payload, opts).await
+    }
+
+    async fn put_multipart_opts(
+        &self,
+        location: &Path,
+        opts: PutMultipartOptions,
+    ) -> OSResult<Box<dyn MultipartUpload>> {
+        self.target.put_multipart_opts(location, opts).await
+    }
+
+    async fn get_opts(&self, location: &Path, options: GetOptions) -> OSResult<GetResult> {
+        let method = if options.head { "head" } else { "get_opts" };
+        let index = self.tracker.begin(method, location.clone());
+        let result = self.target.get_opts(location, options).await;
+        self.tracker.finish(index, &result);
+        result
+    }
+
+    fn delete_stream(
+        &self,
+        locations: BoxStream<'static, OSResult<Path>>,
+    ) -> BoxStream<'static, OSResult<Path>> {
+        self.target.delete_stream(locations)
+    }
+
+    fn list(&self, prefix: Option<&Path>) -> BoxStream<'static, OSResult<ObjectMeta>> {
+        self.tracker
+            .record_stream("list", prefix.cloned().unwrap_or_default());
+        self.target.list(prefix)
+    }
+
+    fn list_with_offset(
+        &self,
+        prefix: Option<&Path>,
+        offset: &Path,
+    ) -> BoxStream<'static, OSResult<ObjectMeta>> {
+        self.tracker
+            .record_stream("list_with_offset", prefix.cloned().unwrap_or_default());
+        self.target.list_with_offset(prefix, offset)
+    }
+
+    async fn list_with_delimiter(&self, prefix: Option<&Path>) -> OSResult<ListResult> {
+        let index = self
+            .tracker
+            .begin("list_with_delimiter", prefix.cloned().unwrap_or_default());
+        let result = self.target.list_with_delimiter(prefix).await;
+        self.tracker.finish(index, &result);
+        result
+    }
+
+    async fn copy_opts(&self, from: &Path, to: &Path, options: CopyOptions) -> OSResult<()> {
+        self.target.copy_opts(from, to, options).await
+    }
+}
+
+pub async fn open_attempt_tracked_lance_dataset_at_version(
+    uri: &str,
+    version: u64,
+    session: Arc<Session>,
+    tracker: &AttemptTracker,
+) -> lance::Result<Dataset> {
+    DatasetBuilder::from_uri(uri)
+        .with_version(version)
+        .with_session(session)
+        .with_store_params(ObjectStoreParams {
+            object_store_wrapper: Some(Arc::new(tracker.clone())),
+            ..Default::default()
+        })
+        .load()
+        .await
+}
+
 /// Object-store op counts for one measured operation, by table class — the
 /// vocabulary cost tests assert in (vs raw `IOTracker::stats().read_iops`).
 #[derive(Debug, Clone, Copy, Default)]

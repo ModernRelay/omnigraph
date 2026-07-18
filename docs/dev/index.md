@@ -28,6 +28,7 @@ roadmap). The per-area docs below remain the mechanical authority.
 | System structure, L1/L2 framing, component diagrams | [architecture.md](architecture.md) |
 | On-disk layout, manifest schema, URI behavior | [storage.md](../user/concepts/storage.md) |
 | Direct-publish writes, D2, staged writes, recovery sidecars | [writes.md](writes.md) |
+| Write-path state of affairs — shipped RFCs, current boundaries, blockers, upstream alignment, and next gates | [writing-path-state-of-affairs.md](writing-path-state-of-affairs.md) |
 | Query execution, mutation execution, loader flow | [execution.md](execution.md) |
 | Index lifecycle and graph topology indexes | [indexes.md](../user/search/indexes.md) |
 | Branch and commit internals | [branches-commits.md](../user/branching/index.md) |
@@ -89,7 +90,7 @@ as durable disposition history after closure, so RFC backlinks stay valid.
 
 | Area | Read |
 |---|---|
-| RFC-022–028 split architecture review — RFC-022 and RFC-028 implemented; RFC-023–027 blockers, dependency corrections, and acceptance evidence remain tracked | [rfc-022-027-architecture-review.md](rfc-022-027-architecture-review.md) |
+| RFC-022–028 split architecture review — RFC-022/023/028 implemented; RFC-024/025/027 research-blocked; RFC-026 draft; dependency corrections and acceptance evidence remain tracked | [rfc-022-027-architecture-review.md](rfc-022-027-architecture-review.md) |
 
 ## Active Implementation Plans
 
