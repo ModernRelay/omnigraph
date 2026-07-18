@@ -1836,6 +1836,67 @@ async fn blob_load_external_file_uri() {
     );
 }
 
+#[tokio::test]
+async fn keyed_writes_survive_committed_external_blob_reference() {
+    // Regression: a reference-retaining write (create/overwrite) with an
+    // external-URI blob cell must not perturb the table's persisted logical
+    // blob schema. When ingest injected position/size children into the
+    // input struct, the persisted schema diverged from the canonical
+    // {data, uri} shape and every later keyed write fell off Lance's v2
+    // merge fast path: strict insert (Append load) failed with "did not
+    // produce an inserted-row key filter" and upsert (Merge load) failed
+    // inside Lance's legacy merger with a blob structural decode error
+    // ("more fields in the schema than provided column indices").
+    let dir = tempfile::tempdir().unwrap();
+    let uri = dir.path().to_str().unwrap();
+    let blob_dir = tempfile::tempdir().unwrap();
+    let blob_path = blob_dir.path().join("external.bin");
+    std::fs::write(&blob_path, b"external-bytes").unwrap();
+    let file_uri = format!("file://{}", blob_path.display());
+
+    let mut db = Omnigraph::init(uri, BLOB_SCHEMA).await.unwrap();
+    let seed = format!(
+        "{}\n{}",
+        r#"{"type": "Document", "data": {"title": "readme", "content": "base64:SGVsbG8gV29ybGQ="}}"#,
+        format!(r#"{{"type": "Document", "data": {{"title": "ext", "content": "{file_uri}"}}}}"#),
+    );
+    load_jsonl(&mut db, &seed, LoadMode::Overwrite).await.unwrap();
+
+    // Strict insert onto the table holding a committed external row.
+    load_jsonl(
+        &mut db,
+        r#"{"type": "Document", "data": {"title": "second", "content": "base64:c2Vjb25k"}}"#,
+        LoadMode::Append,
+    )
+    .await
+    .expect("strict insert after a committed external blob reference");
+
+    // Upsert rewriting the inline row on the same table.
+    load_jsonl(
+        &mut db,
+        r#"{"type": "Document", "data": {"title": "readme", "content": "base64:R29vZGJ5ZQ=="}}"#,
+        LoadMode::Merge,
+    )
+    .await
+    .expect("upsert after a committed external blob reference");
+
+    assert_eq!(
+        read_blob_bytes(&db, "Document", "readme", "content").await,
+        b"Goodbye",
+        "merge must rewrite the inline cell"
+    );
+    let ext = db
+        .read_blob_at("main", "Document", "ext", "content")
+        .await
+        .unwrap();
+    match ext.content {
+        omnigraph::db::BlobContent::ExternalRef { uri: stored } => {
+            assert_eq!(stored, file_uri, "external reference must survive keyed writes");
+        }
+        _ => panic!("external row must still classify as ExternalRef"),
+    }
+}
+
 // ─── Regression: execute_update on edge type ─────────────────────────────────
 
 #[tokio::test]
