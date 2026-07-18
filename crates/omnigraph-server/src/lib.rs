@@ -26,7 +26,7 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 use api::{
-    BlobQuery, BranchCreateOutput, BranchCreateRequest, BranchDeleteOutput, BranchListOutput,
+    BlobQuery, BranchCreateOutput, BranchCreateRequest, BranchDeleteOutput, BranchListOutput, blob_etag,
     BranchMergeOutput, BranchMergeRequest, ChangeOutput, ChangeRequest, CommitListOutput,
     CommitListQuery, ErrorCode, ErrorOutput, ExportRequest, GraphInfo, GraphListResponse,
     HealthOutput, IngestOutput, IngestRequest, InvokeStoredQueryRequest, InvokeStoredQueryResponse,
