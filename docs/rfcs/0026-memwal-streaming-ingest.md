@@ -584,9 +584,22 @@ the WAL append with every IndexStore update—including the mandatory PK
 BTree—and the watcher advances only after that join. The audit values are
 inventory, not automatically accepted OmniGraph limits.
 
-Admission is keyed by the exact
-`(stable_table_id, incarnation_id, enrollment_id, shard_id)` binding. Every
-admitted call, including one using an already-warm writer, first runs the
+The root-scoped worker registry is keyed by the exact
+`(stable_table_id, incarnation_id, enrollment_id, shard_id)` binding. That is
+a worker identity, **not** an admission-lock key. The outer process-local
+admission lease reuses Phase A's one common `StreamAdmissionKey` domain,
+`(stable_table_id, incarnation_id, resolved_physical_ref)`, where a missing
+physical ref means main. `enrollment_id` and `shard_id` are revalidated under
+that lease but never partition its lock domain. Every affected path for the
+same table/ref—including ordinary graph writers that can move the base-table
+HEAD, MemWAL append, fold, enrollment, drain, and stream recovery—must acquire
+this same domain in its specified shared or exclusive mode; no enrollment- or
+shard-keyed admission lock may be introduced beside it. Multiple shard-specific
+workers may overlap only while holding shared leases on that common table/ref
+domain, so an exclusive enrollment, drain, fold, or recovery waits for all of
+them and for any ordinary writer.
+
+Every admitted call, including one using an already-warm writer, first runs the
 synchronous recovery barrier and resolves or refuses every stream recovery
 kind relevant to this binding/authority before capturing `OPEN`, the complete
 physical binding, `CurrentHeadWitness`, and that shard's epoch floor. B1's set
@@ -1311,16 +1324,21 @@ schema syntax or a production caller.
   watermark. The B1 adapter proves it prevents automatic rollover, seals one
   generation, retires that writer, and reopens at a higher epoch before the
   next put. `ShardWriter::close` is never treated as durability evidence.
-- The root-scoped, cross-handle registry is singleflight per binding. Core
-  config/worker tests remain crate-internal; one `#[doc(hidden)]`,
+- The root-scoped, cross-handle registry is singleflight per full stream
+  binding, while every registry entry reuses the Phase-A table-identity plus
+  resolved-physical-ref `StreamAdmissionKey`; enrollment/shard identity never
+  creates a second admission domain. Core config/worker tests remain
+  crate-internal; one `#[doc(hidden)]`,
   feature-gated test seam owns graph/failpoint/cost integration, and the
   forbidden-API guard exact-counts that seam. A two-handle claim/eviction race
   proves no self-fencing writer pair, no eviction past an in-flight waiter, and
   no put after the worker begins its `abort` retirement sequence.
 - Cold claim/replay and every warm final-check/put hold the shared admission
   lease from before `mem_wal_writer` claims an epoch through durability or
-  quiesced retirement. A claim-vs-drain adversarial race proves the exclusive
-  drainer cannot capture a stale epoch floor while a claimant crosses it.
+  quiesced retirement. A same-table ordinary-writer-vs-drain test and a
+  claim-vs-drain adversarial race prove that all paths contend on the common
+  lock domain and that the exclusive drainer cannot capture a stale epoch floor
+  while a claimant crosses it.
   Stale-capture-vs-fold/drain and late-sidecar races prove the under-lease
   pre-claim and pre-put sidecar/authority checks restart before any row effect.
 - Every admitted B1 call is one non-empty normalized `RecordBatch` with one
