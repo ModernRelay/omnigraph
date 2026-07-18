@@ -60,8 +60,12 @@ enrollment and durably exclude ordinary table/schema/maintenance/repair/recovery
 effects for any materialized lifecycle inside one process. Native branch
 controls alone may proceed at `SEALED`, because they do not move table HEAD.
 That is a format and correctness foundation, not a
-streaming product: no production caller can enroll or put a row. Phase B—row
-admission, durable acknowledgements, and the first strict fold—is next.
+streaming product: no production caller can enroll or put a row. Phase B1—one
+private, no-rollover generation behind a root-scoped worker,
+durability-watcher acknowledgement, replay, and one strict fold—is next. Phase
+B2 is the later public activation and remains gated on attribution,
+reclamation/orphan cleanup, correction, same-key retry sequencing, and
+persistent API/operator escape work.
 
 The largest remaining correctness boundary is topology: destructive recovery
 is serialized across every handle in one process, but not against a live writer
@@ -171,7 +175,7 @@ retry rules, recovery classification, and the full owned limits.
 | [023 — Key-conflict fencing](../rfcs/0023-key-conflict-fencing.md) | **Implemented** | Internal schema v6 introduced exact-`id` PK metadata, closed keyed routing, typed conflicts, bounded replay, rebuild/refusal, and accepted performance evidence; v7 preserves that contract. |
 | [024 — Durable table heads](../rfcs/0024-durable-table-heads.md) | **Research-blocked** | The first in-manifest BTREE candidate has a specified logical contract and flat indexed row/range work, but fails the complete physical-I/O gate. No head rows or heads format are active. |
 | [025 — Checkpoint retention](../rfcs/0025-checkpoint-retention.md) | **Research-blocked** | Lance tag/pin semantics pass, but the proposed in-manifest registry access shape is not history-flat after compaction. No checkpoint rows, `ogcp_` production tags, API, or cleanup integration are active. |
-| [026 — MemWAL streaming ingest](../rfcs/0026-memwal-streaming-ingest.md) | **Draft; Phase A foundation implemented; Phase B next** | Internal schema v7, recovery-v10 empty enrollment, durable lifecycle CAS, process-local admission/exclusion, partial-format refusal, and strict v6↔v7 rebuild are active. MemWAL remains the strategic substrate. No production enrollment, `@stream`, WAL row put/ack, fold, drain/resume, or fresh-read surface exists. |
+| [026 — MemWAL streaming ingest](../rfcs/0026-memwal-streaming-ingest.md) | **Draft; Phase A foundation implemented; Phase B1 next** | Internal schema v7, recovery-v10 empty enrollment, durable lifecycle CAS, process-local admission/exclusion, partial-format refusal, and strict v6↔v7 rebuild are active. MemWAL remains the strategic substrate. No production enrollment, `@stream`, WAL row put/ack, fold, drain/resume, or fresh-read surface exists. Planned B1 is private schema-v8/config-v2 one-generation admission plus recovery-v11 fold; B2 is the later public strict surface. |
 | [027 — Lineage merge deltas](../rfcs/0027-lineage-merge-deltas.md) | **Research-blocked** | The desired O(delta) classifier and fallback contract are specified. Selective live-row and deletion-delta discovery are not yet bounded, so `OrderedTableCursor` remains the correctness path. |
 | [028 — Stable schema identity](../rfcs/0028-stable-schema-identity.md) | **Implemented** | Rename-stable IDs, table incarnation, identity-derived paths, schema/recovery integration, and strict rebuild activation were introduced in v5 and remain active in v7. |
 
@@ -182,7 +186,7 @@ retry rules, recovery classification, and the full owned limits.
 | Distributed recovery fence | Process-local queues cannot stop a live foreign process; Lance restore may orphan its commits and native refs lack conditional compare-delete. Supported destructive recovery remains one writer process per graph. | A separately designed and adversarially tested distributed fence before multi-process writers, background compensation, or cross-process exact maintenance recovery. |
 | History-flat authority | RFC-024/025 show flat BTREE rows/ranges/pages can coexist with history-growing manifest discovery or compacted bytes. No heads/checkpoint format is active; mutable tip caches and a second authority remain rejected. | A new Lance-native access shape—or revised measured operational contract—passes the original cold/warm, compacted/uncompacted, local/object-store gate. |
 | Internal history GC | Safe live-writer cleanup needs a durable resurrection/retention boundary; otherwise a stalled writer can recreate a collected version. | An evidence-backed cleanup watermark/fence before automated `__manifest` version GC. |
-| MemWAL delivery | RC.1 initializes the system index and claims shards as separate effects without a caller-minted combined receipt or cross-process seal. Phase A now recovers that gap exactly for main-only, one-shard, one-live-writer-process empty enrollment and excludes competing local writers. | Implement Phase B row admission/ack plus strict fold without widening topology. The public receipt/seal or a separately accepted distributed fence remains the exit for overlapping processes, multi-shard ownership, and general failover. |
+| MemWAL delivery | RC.1 initializes the system index and claims shards as separate effects without a caller-minted combined receipt or cross-process seal. Phase A recovers that gap exactly for main-only, one-shard, one-live-writer-process empty enrollment. At the row boundary, the durability watermark is writer-wide while batch positions reset after MemTable rollover, `put_no_wait` may mutate before returning `Err`, replay leaves its fresh BatchStore WAL watermark unset, and `wait_for_flush_drain` can lose a completed failure before a late waiter snapshots it. Neither batch positions nor WAL statistics are durable receipts. | B1 uses one root-scoped serialized worker and exactly one hard-bounded generation per writer: prevent rollover; hold admission before claim through watcher/retirement; own invocation; conservatively route non-empty replay and an already-flushed unmerged generation fold-only; mark the exact replayed BatchStore prefix WAL-durable through the pinned public RC.1 bridge before sealing; prove drain from frozen refs plus the authoritative shard manifest; retire; fold once; and reopen at a higher epoch. Any post-invocation ambiguity remains `AckUnknown`. B2 additionally waits for durable attribution, bounded reclamation/orphan cleanup, correction, and same-key retry sequencing. A public receipt/seal or accepted distributed fence remains the exit for overlapping processes and failover. |
 | O(delta) merge | A version-column predicate is still O(rows) without a selective source, and deleted rows have no live version columns. Full ID differencing remains correct. | Bounded live-row and deletion/change discovery, exact shadow agreement, and a table-size-flat one-row-delete gate. |
 | Optimize provenance | Compaction/reindex has no stable caller-minted transaction covering the complete effect. Optimize therefore uses bounded, not exact, provenance. | Both an upstream maintenance transaction API and distributed recovery fencing. |
 | Remaining bounds/operations | Some long-running operations lack complete memory/time budgets; rollback waits for quiesced read-write open; recovery audit has no public query. | Incremental, independently owned hardening without widening format or topology. |
@@ -198,8 +202,10 @@ must publish atomically with the table pointer. Other writer/control/
 maintenance paths touching the table refuse pre-effect or drain first. Gate E0
 proved the classifier and witness model with complete direct-probe and
 object-store evidence; Phase A enforces this reversible support restriction.
-The next slice must consume it for durable put/ack and strict folding without
-pretending the process-local lease is a distributed fence.
+The next slice must consume it privately for one bounded generation,
+watcher-only durable acknowledgement, replay, and strict folding without
+pretending the process-local lease is a distributed fence, inventing a durable
+WAL offset, or reusing a watcher across rollover.
 
 The full known-gap ledger, including adjacent local-CAS and unsupported
 multi-version-topology details, remains in
@@ -213,7 +219,7 @@ write-path redesign.
 | RC.1 finding | Planning effect |
 |---|---|
 | Lance surfaces consumed by RFC-022/023—transactions, branches, key filters, staged indexes, compaction, and shared sessions—remain compatible; separately surveyed tag/cleanup behavior is also unchanged | Keep the current architecture. PR #364 passed 22 surface guards and 129 runnable failpoint tests; the Gate-0 follow-up adds the 23rd guard plus checkpoint cost evidence. No format redesign is needed. |
-| Derived MemWAL datasets now inherit the base store parameters and `Session` | Strengthens the shared-session and remote-credential design and removes one integration concern. It does not create an exact combined enrollment receipt or cross-process seal. MemWAL is strategic, not experimental; Gate E0 passed the narrower exact-version public-state classifier without treating upstream timing as a production plan. |
+| Derived MemWAL datasets inherit the base store parameters and `Session`; `put_no_wait` returns an optional watcher whose completion is `Result<()>`, not a durable row coordinate. RC.1's watcher watermark spans the writer while active-MemTable batch positions reset on rollover; `put_no_wait` can also mutate before a later scheduling error. Replay leaves the fresh BatchStore watermark unset, and a late `wait_for_flush_drain` can miss a completed failure. | Shared-session propagation removes one integration concern, but the watcher is safe only inside B1's proved single-generation lifecycle. B1 acknowledges only watcher success, treats every post-invocation error as `AckUnknown`, prevents rollover, uses the pinned public replay-watermark bridge before fold-only reseal, proves the generation from refs plus authoritative manifest state, and retires/reopens before another generation. It does not create an exact combined enrollment receipt or cross-process seal. MemWAL is strategic, not experimental. |
 | Experimental, opt-in `DataOverlay` was added | Do not adopt it now. OmniGraph does not enable feature flag 64 or emit the operation; unknown foreign overlay effects remain fail-closed. DataOverlay's experimental status says nothing about MemWAL's status. |
 | RC.1 expands Lance write rejection from the three row-address names to all five surveyed virtual system-column names | OmniGraph now rejects `_rowid`, `_rowaddr`, `_rowoffset`, `_row_created_at_version`, and `_row_last_updated_at_version` during parsing and accepted-IR validation. A beta.21 development graph using a newly reserved row-version name must be exported with beta.21, renamed, and rebuilt. |
 | A genuine ordinary-schema beta.21 V2_2 graph forward-opened, queried, and merge-wrote under RC.1 | No general storage-format migration. The reserved-name exception is explicit rather than hidden behind a format bump. |
@@ -231,17 +237,30 @@ or slightly lower incremental RSS. That is not a roadmap signal.
 
 ### Now
 
-1. **Build RFC-026 Phase B as one bounded vertical slice.** Add row admission
-   and durable acknowledgements on the exact v7 binding, then fold a strict
-   generation through the existing RFC-022 publish/recovery chassis. Keep it
-   main-only, one shard, and one live writer process; do not pull drain/resume,
-   fresh reads, dead letters, or multi-shard ownership into this slice.
+1. **Build RFC-026 Phase B1 as one private bounded vertical slice.** Activate
+   internal schema v8/config-v2 and a root-scoped, cross-handle singleflight
+   worker. Hard-cap the complete active generation—not merely each call—at
+   8,192 rows / 32 MiB, prevent Lance rollover, own `put_no_wait` plus its
+   watcher, and leave every post-invocation ambiguity as `AckUnknown`. Seal and
+   drain exactly one generation, retire it through the quiesced public `abort`
+   path, materialize an output that still fits one keyed transaction, fold
+   through recovery schema v11 and the RFC-022 publisher, then reopen at a
+   higher epoch. Validate generation row/Arrow-byte reservations from replayed
+   stored batches after every reopen, route non-empty replay fold-only, and use
+   the guarded public BatchStore watermark bridge before resealing it. Prove
+   flush completion from empty frozen refs plus the authoritative generation
+   and cursor rather than trusting the waiter alone. Keep it main-only, one shard, one live
+   writer process, and free of schema/API surface.
 2. **Instrument the new acknowledgement boundary before quoting a win.** Pin
-   batching policy, sparse-traffic delay, object-store operations, ack latency,
-   and fold visibility lag. Phase A establishes correctness, not performance.
+   the one-call/one-put policy, no-rollover envelope, sparse-traffic delay,
+   object-store operations, ack latency, memory/backpressure limits, and fold
+   visibility lag. Separate warm steady-state acknowledgement from cold
+   claim/reopen/replay, sweep retained already-merged shard-generation metadata,
+   and preserve the publisher's known graph-manifest-history term. Phase A
+   establishes correctness, not performance.
 3. **Keep RFC-024/025/027 stopped at their research no-gos.** Their blockers are
    independent of the v7 stream foundation; do not add heads, checkpoints, or
-   lineage-delta format state as incidental Phase B work.
+   lineage-delta format state as incidental Phase B1 work.
 4. **Give a distributed recovery fence its own design and evidence gate.**
    Define authority, expiry/renewal, fencing tokens, and crash semantics before
    implementation; require adversarial multi-process tests on local and object
@@ -250,17 +269,23 @@ or slightly lower incremental RSS. That is not a roadmap signal.
    preserve cost-at-history-depth gates, and reduce constant factors only where
    the existing authority model remains intact.
 6. **Coordinate upstream without making it the calendar.** The useful
-   Lance asks are recoverable MemWAL enrollment/admission, conditional native
-   ref operations, exact maintenance transaction provenance, and a bounded
-   deletion/change-lineage source.
+   Lance asks are replay initializing the per-MemTable WAL watermark, drain
+   completion that cannot lose a finished error, recoverable MemWAL
+   enrollment/admission, conditional native ref operations, exact maintenance
+   transaction provenance, and a bounded deletion/change-lineage source.
 
 ### Only when an evidence trigger fires
 
-- **MemWAL row activation:** Phase A is green. Durable acknowledgements and
-  strict upsert/fold activate only when Phase B's put/durability/replay/fold
-  crash matrix and acknowledgement cost budget are green. The exact upstream
-  receipt/seal remains the preferred simplification and the broader-topology
-  gate, not a calendar prerequisite for the bounded slice.
+- **MemWAL row activation:** Phase A is green. Private B1 activates only when
+  its no-rollover generation, put/durability/replay/fold crash matrix and
+  qualified acknowledgement cost budget are green. Public B2 additionally
+  requires an accepted durable contributor-attribution design, bounded
+  reclamation plus retained-bytes stop, strict correction/disposition,
+  same-key `AckUnknown` sequencing/idempotency,
+  schema/SDK/API/CLI parity, cancellation ownership, authoritative status, and
+  persistent quiesce/resume/abort-drain/rebuild. The exact upstream
+  receipt/seal remains the preferred simplification and broader-topology gate,
+  not a calendar prerequisite for B1.
 - **Durable heads or checkpoints:** when a new current-authority access shape
   exists, run the full decision instrument before adding production rows or a
   format stamp.
@@ -285,7 +310,9 @@ Do not:
 - implement RFC-024, RFC-025, or RFC-027 production paths behind a nominal
   feature flag before their blocking gate closes;
 - treat the v7 Phase A foundation as permission to expose a put/ack endpoint
-  before Phase B owns durability, replay, fold, and cost evidence;
+  before B1 owns no-rollover durability, replay, fold, and cost evidence and B2
+  owns attribution, reclamation/orphan cleanup, correction, same-key retry
+  sequencing, and the persistent operational escape;
 - permit a base-table writer to advance any Phase A lifecycle's HEAD (including
   `SEALED`) before the Phase D witness-update/rebind adapter exists,
   or use a long-lived enrollment tag without first measuring retained files and

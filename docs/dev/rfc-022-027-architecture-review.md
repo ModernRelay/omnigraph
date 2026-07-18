@@ -1,7 +1,7 @@
 # Architecture review: RFC-022 through RFC-028
 
 **Status:** RFC-022, RFC-023, and RFC-028 implemented; RFC-024, RFC-025, and
-RFC-027 research-blocked; RFC-026 remains under review
+RFC-027 research-blocked; RFC-026 Phase A implemented with B1/B2 under review
 **Date:** 2026-07-11
 **Audience:** RFC authors, engine/storage maintainers, and release reviewers
 **Reviewed against:** OmniGraph 0.8.1; Lance 9.0.0-beta.15 at
@@ -18,11 +18,15 @@ staging, and RFC-023's route-dependent/directional key-filter behavior remain
 aligned. Data Overlay is opt-in and unused. MemWAL now inherits store/session
 configuration but still lacks RFC-026's exact enrollment receipt and reversible
 admission seal. RFC-026 therefore keeps the general multi-process profile
-closed, while a production-neutral bounded Gate E0 tests the existing public
-surface without activating a format. Its 2026-07-18 redesign is green: exact
+closed. A production-neutral bounded Gate E0 tested the existing public
+surface, and its 2026-07-18 redesign is green: exact
 `N`/`N + 1` immediate-successor probes replace latest resolution, complete
 attempt tracking is flat at versions 8/80 with zero lists, and configured
-RustFS runs the strict positive/negative matrix non-vacuously.
+RustFS runs the strict positive/negative matrix non-vacuously. Phase A then
+activated internal schema v7 with exact empty-enrollment recovery,
+identity-keyed lifecycle authority, process-local admission/exclusion,
+partial-format refusal, and strict v6↔v7 rebuild. No production caller can put
+or acknowledge a row; private Phase B1 is next.
 The local RFC-024/025 decision instruments were rerun: both remain
 research-blocked, with the current RC-specific counters recorded in the Lance
 audit and RFC-025.
@@ -31,15 +35,16 @@ audit and RFC-025.
 [2026-07-12 alignment audit](lance.md#prior-alignment-audit-2026-07-12-lance-900-beta21-upstream-omnigraph-pinned-at-900-beta21-via-git-rev).
 **RFC-023 substrate evidence revalidated against:** the same beta.21 revision;
 filter-shape and conflict-order probes are recorded in RFC-023 §2. Internal
-schema v6 now consumes that evidence through exact-`id` fenced production
-routing. Its final insertion-absence certificate/no-target-preflight route and
+schema v6 introduced that evidence through exact-`id` fenced production
+routing, and current v7 preserves it. Its final insertion-absence certificate/no-target-preflight route and
 predeclared 10K/100K production series now satisfy the remaining implementation
 and acceptance gates.
 **RFC-026 substrate contract revalidated against:** RC.1 at the current revision;
 the full MemWAL table and system-index specifications, including the
 durability/fencing behavior carried forward from beta.17, are reflected in the
 RFC's survey and acceptance guards. Gate E0 passed at the explicit bounded
-profile and evidence split above; RFC-026 remains draft and production inactive.
+profile and Phase A consumed it as described above; RFC-026 remains draft and
+public row streaming is inactive.
 **RFC-024/025/027 substrate claims revalidated against:** the current RC.1
 revision and the full matching table/index/branch/tag/cleanup, transaction, and
 row-lineage specification sections; their survey headers now record RC.1.
@@ -49,8 +54,8 @@ so the candidate and format are research-blocked rather than accepted.
 RFC-025 Gate 0 was measured on 2026-07-17: Lance tag semantics pass, but the
 current in-manifest checkpoint-registry BTREE shape has history-sensitive
 compacted scan bytes and crosses another scan-operation boundary at 1,000
-commits. RFC-025 is therefore also research-blocked and production remains on
-internal schema v6. The bucket-gated S3/RustFS cost cell is checked in but was
+commits. RFC-025 is therefore also research-blocked; current internal schema v7
+still contains no retention state. The bucket-gated S3/RustFS cost cell is checked in but was
 not run for that decision.
 
 This is a review ledger, not a competing specification. The RFCs remain the
@@ -442,15 +447,14 @@ integration.
 [§9](../rfcs/0026-memwal-streaming-ingest.md#9-fresh-read-cuts),
 and [§11–13](../rfcs/0026-memwal-streaming-ingest.md#11-format-activation-and-rebuild)
 
-**Status:** Open; bounded Gate E0 passed; Phase A pending. RC.1 lacks the ideal
-caller-owned enrollment receipt and cross-process shard-admission seal, but
-upstream release timing is no longer the only decision path. RFC-026 now
-specifies a production-neutral Gate E0 that may admit a main-only, unsharded,
-single-live-writer-process profile if every exact-classification and ABA cell
-passes. Those cells now pass using exact known-version probes and strict
-object-store classification. RFC-026 remains draft and production inactive
-regardless of E0 until its later format, recovery, writer-exclusion, lifecycle,
-and crash gates close.
+**Status:** Closed for Phase A implementation on 2026-07-18; Phase B1/B2 row
+activation gates remain open. RC.1 lacks the ideal caller-owned enrollment
+receipt and cross-process shard-admission seal, but upstream release timing is
+not the bounded-profile calendar. Gate E0's exact-classification and ABA cells
+passed using known-version probes and strict object-store classification.
+Phase A then activated a main-only, unsharded, single-live-writer-process empty
+enrollment foundation in internal schema v7. RFC-026 remains draft and public
+row streaming remains inactive.
 
 Enrollment creates persistent MemWAL metadata and `stream_state` changes the
 correctness preconditions for schema, branch, maintenance, and data operations.
@@ -458,9 +462,11 @@ An older binary that understands key fencing but not stream lifecycle can ignore
 `OPEN | DRAINING | SEALED`, mutate the base table, or perform a schema/branch
 operation without draining acknowledged rows.
 
-**Format disposition:** RFC-026 §11 makes streaming a graph-format capability present
-at new-root initialization, never a feature stamp added by first enrollment.
-It defines:
+**Format disposition:** RFC-026 §11 makes the stream foundation a graph-format
+capability present at new-root initialization, never a feature stamp added by
+first enrollment. Phase A implemented schema v7, recovery-v10
+`StreamEnrollment`, lifecycle CAS, compatible-open validation, partial-format
+refusal, and genuine v6↔v7 rebuild. The contract includes:
 
 - a graph capability/internal-format stamp written only after every enrolled
   table and lifecycle authority is valid;
@@ -469,8 +475,13 @@ It defines:
 - preservation rules for later heads/retention formats;
 - genuine cross-version tests, not a stamp-rewind simulation.
 
-RFC-026 §12 carries those tests and §13 places them in Phase A before the public
-stream path. RFC-026 §3/§8 also make a rematerialized table a separate physical
+B1 is a second format activation, not an in-place reinterpretation of the v7
+empty-enrollment contract: planned v8 is the first data-bearing stream format,
+uses stream-config v2 and recovery schema v11, refuses v7/config-v1, and must
+carry genuine v7↔v8 rebuild evidence.
+
+RFC-026 §12 records those tests and §13 places the completed Phase A before the
+public stream path. RFC-026 §3/§8 also make a rematerialized table a separate physical
 enrollment boundary: SchemaApply leaves the preserved logical identity
 `SEALED`, and only an exact sidecar-covered rebind with a fresh enrollment and
 shard namespace may publish `OPEN`. Recovery never infers adoption from the
@@ -482,7 +493,36 @@ transaction and returns only `Result<()>`; `mem_wal_writer` separately creates
 or claims shard-manifest objects. That cannot satisfy a sidecar that pre-arms
 one caller-minted combined effect, so the public receipt plus seal/reopen API
 remains the preferred simplification and the gate for overlapping processes.
-RFC-026 still rejects private-module/object-store emulation.
+RFC-026 still rejects private-module/object-store emulation. That missing
+combined receipt gates broader topology, not private B1 inside the implemented
+process boundary. At the row boundary, `put_no_wait` supplies an optional
+status-only durability watcher. RC.1's watcher watermark is writer-wide while
+`WriteResult.batch_positions` reset with the active MemTable, so a later
+generation can falsely resolve from an earlier watermark. `put_no_wait` can
+also mutate before returning a flush-scheduling error. B1 therefore cannot
+interpret an error after invocation as effect-free or use one writer across
+rollover. RC.1 replay also rebuilds a fresh BatchStore without advancing its
+per-MemTable WAL-flush watermark, so a later put or plain reseal re-appends and
+re-indexes the replayed prefix; repeated pre-manifest crashes can multiply it.
+And a late `wait_for_flush_drain` can observe an empty watcher queue after a
+failed handler removed the watcher. Both are explicit B1 compatibility gates,
+not inferred success.
+
+The accepted private design is a root-scoped singleflight worker and one
+hard-bounded generation per writer: internal schema v8/config-v2, no automatic
+rollover, at most 8,192 rows/32 MiB for the complete generation, explicit
+admission from before epoch claim, conservative fold-only replay/unmerged-state
+routing, the pinned public BatchStore watermark bridge before replay reseal,
+drain proof from empty frozen refs plus the authoritative generation/cursor,
+immediate writer retirement, one recovery-v11 keyed fold, and higher-epoch
+reopen only after publication. `AckUnknown` preserves possible
+residue through replay but remains permanently caller-ambiguous. B2 later owns
+public strict activation and cannot start merely because B1 is green: it also
+needs durable authenticated-contributor attribution, bounded reclamation with a
+retained-storage stop and derived-orphan cleanup, strict correction/disposition,
+same-key retry sequencing/idempotency, and persistent
+status/quiesce/resume/abort-drain/rebuild. A `SEALED` B2 stream permits
+export/rebuild; in-place maintenance still waits for Phase D.
 
 The bounded candidate instead makes the support restriction load-bearing. It
 grants an `OPEN` stream exclusive authority to advance that base-table HEAD;
@@ -491,7 +531,8 @@ pre-effect or drain. Stable enrollment identity is kept separate from the
 mutable `CurrentHeadWitness` (`BranchIdentifier`, current table version,
 transaction UUID, manifest e_tag), which advances atomically with every
 allowed table-pointer publish. A root-scoped admission lease closes the final
-check-to-put race only inside the one live writer process.
+claim-to-check and check-to-put races only inside the one live writer process;
+the shared lease begins before `mem_wal_writer` can advance the shard epoch.
 
 Gate E0 must classify exact no effect, the sole `N -> N + 1` singleton MemWAL
 `CreateIndex` carrying the namespaced enrollment/config-version marker, and
@@ -515,8 +556,9 @@ tripwire proves exact probes succeed when latest enumeration fails and that an
 unreadable exact HEAD errors. The configured RustFS cell passes non-vacuously
 with the same shape plus the declared positive and listing-dependent negative
 matrix. Surface guards pin the doc-hidden successor, flush/drain,
-merged-generation, and S3 ABA shapes; CI rejects skipped E0/ABA cells. This is
-green evidence for the bounded profile, not production activation.
+merged-generation, and S3 ABA shapes; CI rejects skipped E0/ABA cells. This was
+green evidence for the bounded profile; Phase A subsequently consumed it, but
+it did not authorize a row acknowledgement.
 
 Replica scope must match RFC-023's recovery support boundary. The bounded
 profile does not permit overlapping replicas: a crash successor proceeds only
@@ -534,7 +576,7 @@ and [RFC-026 §8](../rfcs/0026-memwal-streaming-ingest.md#8-epoch-fenced-quiesce
 with the shared contract in [RFC-028](../rfcs/0028-stable-schema-identity.md)
 
 **Status:** Closed in implementation on 2026-07-15. RFC-028 was activated by
-SchemaIR v2 and internal manifest schema v5 and remains intact in v6, every
+SchemaIR v2 and internal manifest schema v5 and remains intact in v6 and v7, every
 writer/recovery envelope, and identity-derived table path. Identity-consuming
 siblings may rely on that contract while retaining their independent activation
 gates.
@@ -562,10 +604,10 @@ RFC-025 now owns a heads-independent exact manifest/table version token,
 backend refusal, recovery/reconciler checks, and local/S3 same-coordinate ABA
 tests. RFC-026 owns a stable enrollment identity plus a separately mutable
 `CurrentHeadWitness`; it does not pretend one token can be both stable across
-fold commits and sensitive to current-HEAD movement. It remains draft under
-BLOCKER-06 despite green Gate E0 because Phase A and later production gates are
-still open. Neither silently imports RFC-024's head storage merely to obtain
-those proofs.
+fold commits and sensitive to current-HEAD movement. Phase A closed
+BLOCKER-06's format-foundation requirement; RFC-026 remains draft because B1
+row correctness and B2 public/operational gates are still open. Neither
+silently imports RFC-024's head storage merely to obtain those proofs.
 
 > 💬 **Concur; supersedes a 2026-07-11 correction (2026-07-11):** the earlier
 > pass placed identity ownership *inside* RFC-024 §3.1, which created exactly
@@ -774,10 +816,11 @@ revalidation without RFC-024.
 [RFC-026 §11](../rfcs/0026-memwal-streaming-ingest.md#11-format-activation-and-rebuild),
 and [RFC-028 §8](../rfcs/0028-stable-schema-identity.md#8-format-activation-and-upgrade)
 
-**Status:** Closed in specification on 2026-07-14. RFC-023 assigns and
-implements internal schema v6; its genuine v5↔v6 rebuild and bidirectional
-refusal run passed on 2026-07-15. Each later format still requires its own
-implementation and genuine evidence.
+**Status:** Closed in specification on 2026-07-14. RFC-023 assigned and
+implemented internal schema v6; its genuine v5↔v6 rebuild and bidirectional
+refusal run passed on 2026-07-15. RFC-026 Phase A subsequently assigned v7 and
+passed its genuine v6↔v7 rebuild/refusal evidence. Every future format still
+requires its own implementation and genuine evidence.
 
 The reviewed RFC-023 and RFC-024 drafts designed all-branch, in-place conversion
 protocols even though OmniGraph's strict-single-version strand intentionally has
@@ -801,8 +844,8 @@ unselected branches and history is explicit rather than hidden behind the word
 [§9](../rfcs/0025-checkpoint-retention.md#9-observability-and-bounds), and
 [§11](../rfcs/0025-checkpoint-retention.md#11-phasing)
 
-**Status:** Research-blocking no-go recorded on 2026-07-17. Production remains
-on internal schema v6; no retention format or checkpoint API is activated.
+**Status:** Research-blocking no-go recorded on 2026-07-17. Current production
+schema v7 still activates no retention format or checkpoint API.
 
 The production-neutral `checkpoint_retention_cost.rs` fixture holds three live
 checkpoints and catalog width ten fixed while unrelated journal history grows.
@@ -883,8 +926,9 @@ protected by symmetry in either case.
 > favor of a possible demotion. It does **not** close activation: the
 > scalar-indexed/default-v1 path still emits `None`, keyed Append remains
 > reachable in today's engine, and beta.21 still permits unfiltered Update or
-> Append to land second after a filtered Update. Internal schema v6 now closes
-> that routing condition: every production insertion-bearing graph path uses
+> Append to land second after a filtered Update. Internal schema v6 introduced
+> the routing closure, and current v7 preserves it: every production
+> insertion-bearing graph path uses
 > the exact-`id`, forced-v2 keyed adapter, generic Append is test-only, and the
 > adapter verifies the emitted field-ID filter. Upstream symmetry is therefore
 > defense in depth rather than an activation prerequisite.
@@ -1009,17 +1053,22 @@ The review does not require all RFCs to land together. A safe order is:
 4. RFC-024's independent physical lookup evaluation completed on 2026-07-15:
    the exact BTREE's scan work is flat, but uncompacted RustFS cold object
    reads/bytes and compacted byte terms grow, so the format is research-blocked
-   and production remains on internal schema v6;
+   and current production remains on internal schema v7 without table heads;
 5. keep RFC-025 research-blocked after its 2026-07-17 Gate 0 no-go; reconsider
    only after a history-flat current-authority lookup shape or revised
    evidence-backed operational contract passes the full physical-I/O boundary,
    then require physical protection of checkpoints/live graph branches and
    strict-rebuild implementation evidence;
-6. retain RFC-026 Gate E0's green exact-version evidence without production
-   activation, then implement and verify only Phase A's bounded
-   main/unsharded/single-live-writer enrollment recovery, writer exclusion,
-   lifecycle, and admission-lease foundation; retain the public exact-enrollment
-   receipt and cross-process admission seal as the gate for broader topology;
+6. retain RFC-026 Gate E0's green exact-version evidence and Phase A's now
+   implemented bounded main/unsharded/single-live-writer enrollment recovery,
+   writer exclusion, lifecycle, admission lease, and v6↔v7 format strand; next
+   prove private B1's schema-v8/config-v2 one-generation
+   put/watcher/replay/recovery-v11 strict fold, then expose B2 only with durable
+   contributor attribution, bounded reclamation, strict correction, same-key
+   retry sequencing, and
+   persistent status/quiesce/resume/abort-drain/rebuild. Retain the public
+   exact enrollment receipt and cross-process admission seal as the gate for
+   broader topology;
 7. keep RFC-027 in research until deletion-delta discovery passes its stated
    correctness and flat-cost gates.
 
