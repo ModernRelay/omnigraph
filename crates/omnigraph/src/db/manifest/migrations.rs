@@ -62,10 +62,13 @@ use crate::error::{OmniError, Result};
 ///   non-null `id` field using Lance's unenforced-primary-key metadata. The
 ///   annotation is present at dataset creation and preserved by overwrites;
 ///   older graphs cross this immutable boundary by export/init/load rebuild.
+/// - v7 — RFC-026 adds identity-keyed `stream_state` authority rows carrying
+///   the physical enrollment, mutable current-HEAD witness, lifecycle, and
+///   per-shard epoch floor.
 ///
-/// v1–v5 graphs are not served by this binary (see `MIN_SUPPORTED`); the history
+/// v1–v6 graphs are not served by this binary (see `MIN_SUPPORTED`); the history
 /// is kept for provenance and to document what each stamp value meant.
-pub(crate) const INTERNAL_MANIFEST_SCHEMA_VERSION: u32 = 6;
+pub(crate) const INTERNAL_MANIFEST_SCHEMA_VERSION: u32 = 7;
 
 /// The oldest on-disk internal-schema stamp this binary will open. With no
 /// in-place migration, this equals `INTERNAL_MANIFEST_SCHEMA_VERSION`: a graph
@@ -84,7 +87,7 @@ pub(crate) const MIN_SUPPORTED_INTERNAL_SCHEMA_VERSION: u32 = INTERNAL_MANIFEST_
 /// stamped each version (verify with
 /// `git show vX.Y.Z:crates/omnigraph/src/db/manifest/migrations.rs`):
 /// v1 ≤ 0.3.1, v2 0.4.1–0.6.1, v3 0.6.2–0.7.2, v4 0.8.x, v5 0.9.x,
-/// v6 0.10.x.
+/// v6 0.10.x, v7 0.11.x.
 pub(crate) fn release_for_internal_schema_version(stamp: u32) -> &'static str {
     match stamp {
         1 => "0.3.1 or earlier",
@@ -93,7 +96,8 @@ pub(crate) fn release_for_internal_schema_version(stamp: u32) -> &'static str {
         4 => "0.8.x",
         5 => "0.9.x",
         6 => "0.10.x",
-        // Unreachable today (1–6 are mapped; > CURRENT is caught by the ceiling
+        7 => "0.11.x",
+        // Unreachable today (1–7 are mapped; > CURRENT is caught by the ceiling
         // guard before this is consulted). Worded to read naturally after
         // "created by omnigraph " if a future bump ever leaves a gap.
         _ => "an unrecognized older release",
@@ -173,10 +177,12 @@ mod tests {
     use super::*;
 
     /// The guard accepts exactly the single served version and refuses anything
-    /// below the floor or above the ceiling. With `MIN == CURRENT == 6` the live
-    /// range is exactly `[6, 6]`.
+    /// below the floor or above the ceiling. With `MIN == CURRENT == 7` the live
+    /// range is exactly `[7, 7]`.
     #[test]
     fn unsupported_guard_accepts_exactly_the_supported_range() {
+        assert_eq!(INTERNAL_MANIFEST_SCHEMA_VERSION, 7);
+        assert_eq!(MIN_SUPPORTED_INTERNAL_SCHEMA_VERSION, 7);
         for stamp in MIN_SUPPORTED_INTERNAL_SCHEMA_VERSION..=INTERNAL_MANIFEST_SCHEMA_VERSION {
             assert!(
                 refuse_if_stamp_unsupported(stamp).is_ok(),
@@ -204,6 +210,7 @@ mod tests {
         assert_eq!(release_for_internal_schema_version(4), "0.8.x");
         assert_eq!(release_for_internal_schema_version(5), "0.9.x");
         assert_eq!(release_for_internal_schema_version(6), "0.10.x");
+        assert_eq!(release_for_internal_schema_version(7), "0.11.x");
         assert_eq!(
             release_for_internal_schema_version(99),
             "an unrecognized older release"
@@ -212,5 +219,9 @@ mod tests {
         let err = refuse_if_stamp_unsupported(3).unwrap_err().to_string();
         assert!(err.contains("0.6.2 to 0.7.2"), "got: {err}");
         assert!(err.contains("omnigraph export"), "got: {err}");
+
+        let v6_err = refuse_if_stamp_unsupported(6).unwrap_err().to_string();
+        assert!(v6_err.contains("0.10.x"), "got: {v6_err}");
+        assert!(v6_err.contains("omnigraph export"), "got: {v6_err}");
     }
 }

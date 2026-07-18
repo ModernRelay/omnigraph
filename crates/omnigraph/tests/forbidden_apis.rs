@@ -202,6 +202,7 @@ const SCHEMA_V9: WriteProtocol = WriteProtocol::Exact("SchemaApply v9");
 const MERGE_V9: WriteProtocol = WriteProtocol::Exact("BranchMerge v9");
 const INDICES_V9: WriteProtocol = WriteProtocol::Exact("EnsureIndices v9");
 const OPTIMIZE_V9: WriteProtocol = WriteProtocol::Bounded("Optimize v9");
+const STREAM_ENROLLMENT_V10: WriteProtocol = WriteProtocol::Exact("StreamEnrollment v10");
 
 #[derive(Debug, Clone, Copy)]
 struct WriteSurface {
@@ -229,6 +230,7 @@ write_surfaces! {
     "exec/merge.rs" => MERGE_V9 => ["branch_merge", "branch_merge_as"],
     "db/omnigraph.rs" => INDICES_V9 => ["ensure_indices", "ensure_indices_on"],
     "db/omnigraph.rs" => WriteProtocol::TestOnly => ["failpoint_publish_table_head_without_index_rebuild_for_test"],
+    "db/omnigraph/stream_enrollment.rs" => WriteProtocol::TestOnly => ["failpoint_enroll_stream_table_for_test"],
     "db/omnigraph.rs" => OPTIMIZE_V9 => ["optimize"],
     "db/omnigraph.rs" => WriteProtocol::ManifestAdoption => ["repair"],
     "db/omnigraph.rs" => WriteProtocol::PhysicalOnly => ["cleanup"],
@@ -637,6 +639,7 @@ durable_calls! {
     ("db/omnigraph/schema_apply.rs", "write_sidecar(", 1, SCHEMA_V9),
     ("db/omnigraph/table_ops.rs", "write_sidecar(", 1, INDICES_V9),
     ("db/omnigraph/optimize.rs", "write_sidecar(", 1, OPTIMIZE_V9),
+    ("db/omnigraph/stream_enrollment.rs", "write_sidecar(", 1, STREAM_ENROLLMENT_V10),
     ("exec/staging.rs", ".commit_staged_exact(", 1, WriteProtocol::Exact("Mutation/Load v9")),
     ("exec/merge.rs", ".commit_staged_exact(", 1, MERGE_V9),
     ("db/omnigraph/schema_apply.rs", ".commit_staged_create_exact(", 1, SCHEMA_V9),
@@ -706,12 +709,12 @@ durable_calls! {
     ("db/manifest/recovery.rs", ".publish_with_precondition(", 1, WriteProtocol::RecoveryExecutor),
     ("db/manifest/recovery.rs", ".publish(", 1, WriteProtocol::RecoveryExecutor),
     ("db/manifest/recovery.rs", ".restore(", 1, WriteProtocol::RecoveryExecutor),
-    ("db/manifest/recovery.rs", ".append(RecoveryAuditRecord", 7, WriteProtocol::RecoveryExecutor),
-    ("db/manifest/recovery.rs", "publish_recovery_commit(", 8, WriteProtocol::RecoveryExecutor),
+    ("db/manifest/recovery.rs", ".append(RecoveryAuditRecord", 8, WriteProtocol::RecoveryExecutor),
+    ("db/manifest/recovery.rs", "publish_recovery_commit(", 9, WriteProtocol::RecoveryExecutor),
     ("db/manifest/recovery.rs", "restore_table_to_version(", 3, WriteProtocol::RecoveryExecutor),
-    ("db/manifest/recovery.rs", "record_audit(", 9, WriteProtocol::RecoveryExecutor),
-    ("db/manifest/recovery.rs", "delete_sidecar_by_operation_id(", 19, WriteProtocol::RecoveryExecutor),
-    ("db/manifest/recovery.rs", "delete_sidecar(", 1, WriteProtocol::RecoveryExecutor),
+    ("db/manifest/recovery.rs", "record_audit(", 10, WriteProtocol::RecoveryExecutor),
+    ("db/manifest/recovery.rs", "delete_sidecar_by_operation_id(", 20, WriteProtocol::RecoveryExecutor),
+    ("db/manifest/recovery.rs", "delete_sidecar(", 2, WriteProtocol::RecoveryExecutor),
     ("db/recovery_audit.rs", ".raw_dataset_append(", 1, WriteProtocol::RecoveryExecutor),
     ("db/recovery_audit.rs", "Dataset::write(", 1, WriteProtocol::RecoveryExecutor),
     ("db/manifest/recovery.rs", "promote_exact_schema_staging(", 2, WriteProtocol::RecoveryExecutor),
@@ -726,6 +729,10 @@ durable_calls! {
     ("db/omnigraph/repair.rs", ".dataset()", 1, WriteProtocol::ManifestAdoption),
     ("db/omnigraph/optimize.rs", ".dataset()", 5, WriteProtocol::Composed("Optimize v9 planning + physical cleanup")),
     ("db/omnigraph/optimize.rs", ".into_dataset()", 2, OPTIMIZE_V9),
+    ("db/omnigraph/stream_enrollment.rs", ".dataset()", 6, WriteProtocol::ReadOnlyAccess),
+    ("db/omnigraph/stream_enrollment.rs", ".into_dataset()", 1, STREAM_ENROLLMENT_V10),
+    ("table_store/mem_wal.rs", ".initialize_mem_wal()", 1, STREAM_ENROLLMENT_V10),
+    ("table_store/mem_wal.rs", ".mem_wal_writer(", 1, STREAM_ENROLLMENT_V10),
     ("db/omnigraph/optimize.rs", "SnapshotHandle::new(", 1, OPTIMIZE_V9),
     ("exec/merge.rs", "SnapshotHandle::new(", 5, MERGE_V9),
 }
@@ -804,6 +811,8 @@ const DURABLE_PRIMITIVES: &[&str] = &[
     ".dataset()",
     ".into_arc()",
     ".into_dataset()",
+    ".initialize_mem_wal()",
+    ".mem_wal_writer(",
     "SnapshotHandle::new(",
 ];
 

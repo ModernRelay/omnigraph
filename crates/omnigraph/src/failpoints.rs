@@ -183,6 +183,18 @@ pub mod names {
     /// After each exact SchemaApply table transaction commits, before the next
     /// table effect or durable EffectsConfirmed transition.
     pub const SCHEMA_APPLY_POST_TABLE_COMMIT: &str = "schema_apply.post_table_commit";
+    /// RFC-026 enrollment intent is durable, before the singleton MemWAL index
+    /// initializer can advance the base table from N to N+1.
+    pub const STREAM_ENROLLMENT_POST_SIDECAR_PRE_INDEX: &str =
+        "stream_enrollment.post_sidecar_pre_index";
+    /// The initializer returned after its internal commit, before the shared
+    /// exact recovery adapter classifies/provisions/publishes the enrollment.
+    pub const STREAM_ENROLLMENT_POST_INDEX_PRE_RECOVERY: &str =
+        "stream_enrollment.post_index_pre_recovery";
+    /// The pre-minted shard is durably present at exact empty epoch 1, before
+    /// the table pointer and OPEN lifecycle land in one manifest CAS.
+    pub const STREAM_ENROLLMENT_POST_SHARD_PRE_MANIFEST: &str =
+        "stream_enrollment.post_shard_pre_manifest";
     /// Reload owns the schema gate and is about to read/publish one contract view.
     pub const SCHEMA_RELOAD_BEFORE_CONTRACT_READ: &str = "schema_reload.before_contract_read";
     /// Injects a retryable `RowLevelCasContention` from `load_publish_state` so a

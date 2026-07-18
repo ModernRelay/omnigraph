@@ -8,11 +8,12 @@ use lance::Dataset;
 
 use crate::error::{OmniError, Result};
 
-use super::layout::{table_object_id, version_object_id};
+use super::layout::{stream_state_object_id, table_object_id, version_object_id};
 use super::metadata::TableVersionMetadata;
 use super::{
-    MAIN_BRANCH_HEAD_KEY, OBJECT_TYPE_GRAPH_COMMIT, OBJECT_TYPE_GRAPH_HEAD, OBJECT_TYPE_TABLE,
-    OBJECT_TYPE_TABLE_TOMBSTONE, OBJECT_TYPE_TABLE_VERSION, TableIdentity, TableRegistration,
+    MAIN_BRANCH_HEAD_KEY, OBJECT_TYPE_GRAPH_COMMIT, OBJECT_TYPE_GRAPH_HEAD,
+    OBJECT_TYPE_STREAM_STATE, OBJECT_TYPE_TABLE, OBJECT_TYPE_TABLE_TOMBSTONE,
+    OBJECT_TYPE_TABLE_VERSION, StreamLifecycleEntry, TableIdentity, TableRegistration,
 };
 
 #[derive(Debug, Clone)]
@@ -35,6 +36,7 @@ pub(super) struct ManifestState {
     /// manifest-only refresh from leaving coarse write authority split between
     /// a fresh table view and the commit graph's older derived cache.
     pub(super) graph_heads: HashMap<String, String>,
+    pub(super) stream_lifecycles: HashMap<TableIdentity, StreamLifecycleEntry>,
 }
 
 #[derive(Debug, Clone)]
@@ -105,6 +107,7 @@ struct ManifestScan {
     /// `lineage_rows`, it does not grow with commit history. OCC must distinguish
     /// a present head from an absent one (notably on a fresh named branch).
     graph_heads: HashMap<String, String>,
+    stream_lifecycles: HashMap<TableIdentity, StreamLifecycleEntry>,
 }
 
 pub(super) fn manifest_schema() -> SchemaRef {
@@ -162,6 +165,7 @@ pub(super) async fn read_manifest_state_and_lineage(
         tombstones,
         lineage_rows,
         graph_heads,
+        stream_lifecycles,
     } = read_manifest_scan(dataset, true).await?;
     let state = assemble_manifest_state(
         version,
@@ -171,6 +175,7 @@ pub(super) async fn read_manifest_state_and_lineage(
             .into_iter()
             .map(|t| (t.identity, t.tombstone_version)),
         graph_heads,
+        stream_lifecycles,
     )?;
     Ok((state, lineage_rows))
 }
@@ -184,6 +189,7 @@ fn manifest_state_from_scan(version: u64, scan: ManifestScan) -> Result<Manifest
             .into_iter()
             .map(|t| (t.identity, t.tombstone_version)),
         scan.graph_heads,
+        scan.stream_lifecycles,
     )
 }
 
@@ -202,6 +208,7 @@ pub(super) fn assemble_manifest_state(
     version_entries: Vec<SubTableEntry>,
     tombstones: impl IntoIterator<Item = (TableIdentity, u64)>,
     graph_heads: HashMap<String, String>,
+    stream_lifecycles: HashMap<TableIdentity, StreamLifecycleEntry>,
 ) -> Result<ManifestState> {
     let mut latest_versions = HashMap::<TableIdentity, SubTableEntry>::new();
     for entry in version_entries {
@@ -255,11 +262,36 @@ pub(super) fn assemble_manifest_state(
             }
         }
     }
+    let live_identities = entries
+        .iter()
+        .map(|entry| (entry.identity, entry))
+        .collect::<HashMap<_, _>>();
+    for (identity, lifecycle) in &stream_lifecycles {
+        let live_entry = live_identities.get(identity).ok_or_else(|| {
+            OmniError::manifest_internal(format!(
+                "stream lifecycle authority exists for non-live table identity {identity}"
+            ))
+        })?;
+        let registration = registrations.get(identity).ok_or_else(|| {
+            OmniError::manifest_internal(format!(
+                "stream lifecycle authority has no table registration for identity {identity}"
+            ))
+        })?;
+        lifecycle.validate_against_registration(registration)?;
+        if lifecycle.current_head_witness.table_version != live_entry.table_version {
+            return Err(OmniError::manifest_internal(format!(
+                "stream lifecycle HEAD version {} does not match visible table pointer {} for identity {identity}",
+                lifecycle.current_head_witness.table_version, live_entry.table_version
+            )));
+        }
+    }
+
     entries.sort_by(|a, b| a.table_key.cmp(&b.table_key));
     Ok(ManifestState {
         version,
         entries,
         graph_heads,
+        stream_lifecycles,
     })
 }
 
@@ -303,6 +335,7 @@ pub(super) struct PublishScan {
     /// Exact `graph_head:<branch>` rows keyed by the branch suffix (`main` for
     /// main). Absence is meaningful and is preserved by a missing map entry.
     pub(super) graph_heads: HashMap<String, String>,
+    pub(super) stream_lifecycles: HashMap<TableIdentity, StreamLifecycleEntry>,
 }
 
 /// One-scan read of everything the publish path needs. `collect_lineage` is
@@ -320,6 +353,7 @@ pub(super) async fn read_publish_scan(dataset: &Dataset) -> Result<PublishScan> 
             .collect(),
         lineage_rows: scan.lineage_rows,
         graph_heads: scan.graph_heads,
+        stream_lifecycles: scan.stream_lifecycles,
     })
 }
 
@@ -425,6 +459,7 @@ async fn read_manifest_scan(dataset: &Dataset, collect_lineage: bool) -> Result<
     let mut tombstones = Vec::new();
     let mut lineage_rows = Vec::new();
     let mut graph_heads = HashMap::new();
+    let mut stream_lifecycles = HashMap::new();
 
     for batch in &batches {
         let object_types = string_column(batch, "object_type")?;
@@ -571,6 +606,33 @@ async fn read_manifest_scan(dataset: &Dataset, collect_lineage: bool) -> Result<
                         decode_graph_head_row(object_ids, metadata, row)?;
                     graph_heads.insert(branch_key, head_commit_id);
                 }
+                OBJECT_TYPE_STREAM_STATE => {
+                    let identity = required_table_identity(
+                        stable_table_ids,
+                        table_incarnation_ids,
+                        row,
+                        OBJECT_TYPE_STREAM_STATE,
+                    )?;
+                    if metadata.is_null(row) {
+                        return Err(OmniError::manifest_internal(format!(
+                            "manifest stream_state row missing metadata for identity {identity}"
+                        )));
+                    }
+                    let lifecycle = StreamLifecycleEntry::from_manifest_row(
+                        object_ids.value(row),
+                        &table_key,
+                        identity,
+                        (!locations.is_null(row)).then(|| locations.value(row)),
+                        (!versions.is_null(row)).then(|| versions.value(row)),
+                        (!branches.is_null(row)).then(|| branches.value(row)),
+                        metadata.value(row),
+                    )?;
+                    if stream_lifecycles.insert(identity, lifecycle).is_some() {
+                        return Err(OmniError::manifest_internal(format!(
+                            "manifest contains duplicate stream_state rows for identity {identity}"
+                        )));
+                    }
+                }
                 // Commit rows are skipped on the table-state path; unknown future
                 // object types are skipped on every path.
                 _ => {}
@@ -606,6 +668,7 @@ async fn read_manifest_scan(dataset: &Dataset, collect_lineage: bool) -> Result<
         tombstones,
         lineage_rows,
         graph_heads,
+        stream_lifecycles,
     })
 }
 
@@ -851,7 +914,10 @@ pub(super) fn manifest_rows_batch(
         object_types.iter().zip(table_identities.iter()).enumerate()
     {
         match object_type.as_str() {
-            OBJECT_TYPE_TABLE | OBJECT_TYPE_TABLE_VERSION | OBJECT_TYPE_TABLE_TOMBSTONE => {
+            OBJECT_TYPE_TABLE
+            | OBJECT_TYPE_TABLE_VERSION
+            | OBJECT_TYPE_TABLE_TOMBSTONE
+            | OBJECT_TYPE_STREAM_STATE => {
                 let identity = identity.ok_or_else(|| {
                     OmniError::manifest_internal(format!(
                         "manifest {object_type} row at index {row} is missing table identity"
@@ -876,6 +942,7 @@ pub(super) fn manifest_rows_batch(
                         })?;
                         super::layout::tombstone_object_id(identity, version)
                     }
+                    OBJECT_TYPE_STREAM_STATE => stream_state_object_id(identity),
                     _ => unreachable!("outer match restricts object type"),
                 };
                 if object_ids.get(row) != Some(&expected_object_id) {
@@ -884,6 +951,26 @@ pub(super) fn manifest_rows_batch(
                         object_ids.get(row),
                         expected_object_id
                     )));
+                }
+                if object_type == OBJECT_TYPE_STREAM_STATE {
+                    let metadata =
+                        metadata
+                            .get(row)
+                            .and_then(Option::as_deref)
+                            .ok_or_else(|| {
+                                OmniError::manifest_internal(format!(
+                                    "manifest stream_state row at index {row} is missing metadata"
+                                ))
+                            })?;
+                    StreamLifecycleEntry::from_manifest_row(
+                        &expected_object_id,
+                        table_keys.get(row).map(String::as_str).unwrap_or_default(),
+                        identity,
+                        locations.get(row).and_then(Option::as_deref),
+                        table_versions.get(row).copied().flatten(),
+                        table_branches.get(row).and_then(Option::as_deref),
+                        metadata,
+                    )?;
                 }
             }
             OBJECT_TYPE_GRAPH_COMMIT | OBJECT_TYPE_GRAPH_HEAD if identity.is_some() => {
