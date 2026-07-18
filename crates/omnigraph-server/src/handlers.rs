@@ -764,7 +764,7 @@ fn sniff_blob_content_type(head: &[u8]) -> &'static str {
         (status = 206, description = "Requested byte range (single `Range: bytes=` range; multi-range is unsupported and answered with the full body)", content_type = "application/octet-stream"),
         (status = 302, description = "External blob reference; `Location` carries the stored absolute URI. The server never resolves or proxies the external location."),
         (status = 304, description = "Not modified (`If-None-Match` matched the ETag)"),
-        (status = 400, description = "Property is not a Blob", body = ErrorOutput),
+        (status = 400, description = "Property is not a Blob, or branch and snapshot were both given (they are mutually exclusive)", body = ErrorOutput),
         (status = 401, description = "Unauthorized", body = ErrorOutput),
         (status = 403, description = "Forbidden", body = ErrorOutput),
         (status = 404, description = "Unknown type, unknown id, or null blob cell", body = ErrorOutput),
@@ -774,7 +774,9 @@ fn sniff_blob_content_type(head: &[u8]) -> &'static str {
 )]
 /// Stream one row's Blob property.
 ///
-/// Resolves the cell at one pinned snapshot of `branch` (default `main`).
+/// Resolves the cell at one pinned view of the target — `branch` xor
+/// `snapshot`, defaulting to branch `main` (the same target semantics as
+/// `POST /read`).
 /// Internal blobs stream with `Content-Length`, `Accept-Ranges: bytes`, a
 /// strong identity-derived `ETag`, and single-range `206` support; external
 /// URI references answer `302 Found` without server-side resolution. `HEAD`
@@ -788,19 +790,36 @@ pub(crate) async fn server_blob_get(
     headers: HeaderMap,
     Query(query): Query<BlobQuery>,
 ) -> std::result::Result<Response, ApiError> {
+    if query.branch.is_some() && query.snapshot.is_some() {
+        return Err(ApiError::bad_request(
+            "request may specify branch or snapshot, not both",
+        ));
+    }
+    let actor = actor.as_ref().map(|Extension(actor)| actor);
+    let target = read_target_from_request(query.branch.clone(), query.snapshot.clone());
+    let policy_branch = match &target {
+        ReadTarget::Branch(branch) => Some(branch.clone()),
+        ReadTarget::Snapshot(_) if handle.policy.is_some() && actor.is_some() => {
+            let db = &handle.engine;
+            db.resolved_branch_of(target.clone())
+                .await
+                .map(|branch| branch.or_else(|| Some("main".to_string())))
+                .map_err(ApiError::from_omni)?
+        }
+        ReadTarget::Snapshot(_) => None,
+    };
     authorize_request(
-        actor.as_ref().map(|Extension(actor)| actor),
+        actor,
         handle.policy.as_deref(),
         PolicyRequest {
             action: PolicyAction::Read,
-            branch: query.branch.clone(),
+            branch: policy_branch,
             target_branch: None,
         },
     )?;
-    let branch = query.branch.as_deref().unwrap_or("main");
     let blob = handle
         .engine
-        .read_blob_at(branch, &query.type_name, &query.id, &query.prop)
+        .read_blob_at(target, &query.type_name, &query.id, &query.prop)
         .await
         .map_err(ApiError::from_omni)?;
 

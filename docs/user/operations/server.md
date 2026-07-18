@@ -52,7 +52,7 @@ graph id from the cluster's applied revision:
 | GET | `/healthz` | none | — |
 | GET | `/openapi.json` | none | — (strips security if auth disabled; emits the nested cluster paths with `cluster_` operation-id prefix) |
 | GET | `/graphs/{id}/snapshot?branch=` | bearer + `read` | snapshot of branch |
-| GET/HEAD | `/graphs/{id}/blob?type=&id=&prop=&branch=` | bearer + `read` | stream one row's Blob property (see "Blob content" below) |
+| GET/HEAD | `/graphs/{id}/blob?type=&id=&prop=[&branch=\|&snapshot=]` | bearer + `read` | stream one row's Blob property (see "Blob content" below) |
 | POST | `/graphs/{id}/query` | bearer + `read` | inline read query (canonical; clean field names `query`/`name`; mutations → 400) |
 | POST | `/graphs/{id}/read` | bearer + `read` | **deprecated** alias of `/query` (legacy field names `query_source`/`query_name`, byte-stable response; carries `Deprecation: true` + `Link: <query>; rel="successor-version"`) |
 | POST | `/graphs/{id}/export` | bearer + `export` | NDJSON stream |
@@ -164,10 +164,11 @@ and `/blob` streams binary content (below). Everything else is buffered JSON.
 
 ### Blob content (`GET`/`HEAD /graphs/{id}/blob`)
 
-`?type=<NodeType>&id=<key>&prop=<blob property>[&branch=<branch>]` resolves one
-row's `Blob` cell at one pinned snapshot of `branch` (default `main`) and
-streams it in bounded chunks — memory per response is constant regardless of
-blob size. Contract:
+`?type=<NodeType>&id=<key>&prop=<blob property>[&branch=<branch>|&snapshot=<id>]`
+resolves one row's `Blob` cell at one pinned view of the target and streams it
+in bounded chunks — memory per response is constant regardless of blob size.
+`branch` and `snapshot` are mutually exclusive (400 if both are given);
+omitting both reads `main` — the same target semantics as `/read`. Contract:
 
 - **Internal blobs** answer `200` with exact `Content-Length`,
   `Accept-Ranges: bytes`, and a strong `ETag` derived from the cell's stable
