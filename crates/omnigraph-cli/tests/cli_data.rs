@@ -2372,17 +2372,6 @@ node Document {
 /// classification must come from the descriptor alone, so any accidental
 /// external resolution fails loudly.
 fn blob_graph() -> (tempfile::TempDir, std::path::PathBuf, String) {
-    blob_graph_with(true)
-}
-
-/// `with_external: false` builds an inline-only graph. Needed by the
-/// snapshot test, whose second (merge) load would otherwise trip a
-/// pre-existing engine bug: a merge-mode load onto a blob table holding an
-/// external-reference row fails in Lance's blob structural decoder ("more
-/// fields in the schema than provided column indices") — the merge path's
-/// committed-row scan does not use descriptor-aware blob handling.
-/// Inline-only tables merge fine.
-fn blob_graph_with(with_external: bool) -> (tempfile::TempDir, std::path::PathBuf, String) {
     let temp = tempdir().unwrap();
     let schema_path = temp.path().join("blob.pg");
     write_file(&schema_path, BLOB_SCHEMA);
@@ -2400,19 +2389,15 @@ fn blob_graph_with(with_external: bool) -> (tempfile::TempDir, std::path::PathBu
     let readme_row =
         r#"{"type": "Document", "data": {"title": "readme", "content": "base64:SGVsbG8gV29ybGQ="}}"#;
     let data_path = temp.path().join("blob.jsonl");
-    if with_external {
-        write_file(
-            &data_path,
-            &format!(
-                "{readme_row}\n{}",
-                format!(
-                    r#"{{"type": "Document", "data": {{"title": "ext", "content": "{external_uri}"}}}}"#
-                ),
+    write_file(
+        &data_path,
+        &format!(
+            "{readme_row}\n{}",
+            format!(
+                r#"{{"type": "Document", "data": {{"title": "ext", "content": "{external_uri}"}}}}"#
             ),
-        );
-    } else {
-        write_file(&data_path, readme_row);
-    }
+        ),
+    );
     output_success(
         cli()
             .arg("load")
@@ -2522,10 +2507,10 @@ fn blob_stat_external_json() {
 
 #[test]
 fn blob_get_snapshot_pins_read() {
-    // Inline-only fixture: see blob_graph_with — the second (merge) load
-    // below hits a pre-existing engine bug when the table holds an
-    // external-reference row.
-    let (temp, graph, _) = blob_graph_with(false);
+    // The merge load below also exercises a keyed write onto a table
+    // holding a committed external-reference row (the engine regression
+    // pinned by keyed_writes_survive_committed_external_blob_reference).
+    let (temp, graph, _) = blob_graph();
     let snapshot_id = tokio::runtime::Runtime::new().unwrap().block_on(async {
         omnigraph::db::Omnigraph::open(graph.to_string_lossy().as_ref())
             .await
