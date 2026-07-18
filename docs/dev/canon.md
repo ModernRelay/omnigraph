@@ -508,8 +508,13 @@ In Phase A, any materialized stream lifecycle row—including `SEALED`—fences
 base-table, schema, maintenance, repair-adoption, and recovery effects because
 there is no guarded witness-update/rebind adapter yet. Native branch
 create/delete is the narrow exception: it does not advance a table HEAD, so it
-may proceed at `SEALED`; it still refuses `OPEN` or `DRAINING`. Phase D owns the
-future operation-scoped drain and atomic witness advancement/rebind.
+may proceed at `SEALED`; it still refuses `OPEN` or `DRAINING`. RFC-026 B2 must
+add minimum explicit persistent status/quiesce/resume/abort-drain/rebuild,
+durable contributor attribution, bounded reclamation, correction, and
+same-key `AckUnknown` sequencing before
+any public row surface; Phase D owns future automatic operation-scoped drain
+and atomic witness advancement/rebind. Resume rechecks the bounded profile's
+no-named-branch topology; an incompatible branch operation stays `SEALED`.
 
 ---
 
@@ -952,7 +957,10 @@ physical access shape)**; checkpoint-pinned retention **(RFC-025,
 research-blocked after Gate 0 rejected the current compacted registry-access
 shape)**;
 MemWAL row admission/fold and later lifecycle/read phases **(RFC-026, draft;
-Phase B next)**; lineage-based merge deltas
+private one-generation Phase B1 next; public strict Phase B2 only after
+attribution, reclamation, correction, same-key retry sequencing, and persistent
+operational escape)**;
+lineage-based merge deltas
 **(RFC-027, research-blocked)**; background reconciler; planner
 statistics/cost model; policy pushdown; ingest-time embeddings; per-query
 resource budgets.
@@ -969,7 +977,7 @@ resource budgets.
 | **R4: Manifest authority access grows with commit count.** Current-state resolution folds history; a selective index does not by itself bound the complete physical read. | Medium | `optimize` compacts internal tables (keeps periodically-optimized shipped paths flat where separately cost-gated). RFC-024 Gate A rejected durable heads because representative RustFS latest-manifest reads/bytes grow despite flat exact-BTREE row/range work. RFC-025 Gate 0 independently rejected checkpoint-registry activation: at local 10→1,000 on RC.1, uncompacted reconciled work and the eight-fragment tail stay flat, but compacted list/cleanup scan bytes grow 17,012→38,000 cold and 12,336→15,064 warm; exact-show bytes and operation counts also grow. Both RFCs are research-blocked; v7 retains the journal fold and internal-table *cleanup* remains deferred behind the resurrection watermark. |
 | **R5: Schema identity corruption or alias/identity drift.** Internal schema v5 introduced stable IDs/incarnation as durable authority; v6 and v7 preserve them. | Medium | Open/init validate the SchemaIR domain and exact bidirectional IR↔manifest identity/path/alias contract; every active recovery envelope carries the identity pair; zero, duplicate, missing, or mismatched identity fails closed. |
 | **R6: Merge cost at divergence** — full-width classification and history-growing manifest folds. | Medium | Coherent coordinator scans plus retained probe handles reduced the pre-slice measured depth-5/depth-80 baseline from 59/651 manifest reads to 40/410 and cap the common fast-forward route at three internal opens and three scans, but the uncompacted-history slope remains. `merge_cost.rs` keeps both facts visible; O(delta) merge is blocked on a real deletion-delta source **(RFC-027)**; fragment adoption is **(draft RFC-0001)**. |
-| **R7: No streaming row path** — per-branch write throughput is still capped by the `graph_head` CAS rate; high-frequency small writes are wasteful. | Medium | MemWAL is the strategic substrate. Phase A now makes its opaque initializer + separate shard effect recoverable for one main-only/unsharded/single-live-writer-process empty enrollment, durably records lifecycle authority, and excludes competing local effects. Phase B still must implement and measure put/ack/replay plus strict graph-atomic fold. A public exact enrollment receipt plus reversible admission seal gates only broader overlapping-process topology. |
+| **R7: No streaming row path** — per-branch write throughput is still capped by the `graph_head` CAS rate; high-frequency small writes are wasteful. | Medium | MemWAL is the strategic substrate. Phase A now makes its opaque initializer + separate shard effect recoverable for one main-only/unsharded/single-live-writer-process empty enrollment, durably records lifecycle authority, and excludes competing local effects. RC.1's writer-wide watcher watermark is unsafe across MemTable position reset; replay also leaves the fresh BatchStore watermark unset and a late drain waiter can miss a failed flush. Private B1 is therefore one root-scoped, no-rollover generation capped at 8,192 rows/32 MiB: hold admission from before epoch claim, route replay/unmerged residue fold-only through the pinned public watermark bridge, prove the drained generation independently, then seal/retire/recovery-v11 strict fold and higher-epoch reopen. Every post-invocation ambiguity remains `AckUnknown`. Public B2 additionally requires attribution, bounded reclamation/orphan cleanup, correction, same-key retry sequencing, and persistent status/quiesce/resume/abort-drain/rebuild. A public exact enrollment receipt plus reversible admission seal gates only broader overlapping-process topology. |
 | **R8: Some operations lack enforced memory/time budgets.** | Medium | Known gap, narrowed and accepted for RFC-023. Its direct-substrate instrument rejected the first whole-delta fenced adopt (~447 MB peak at 100K × 256 versus ~74 MB Append), and the first corrected production 10K series failed at 30.0× / 108,625,920 bytes overhead; both negative results remain evidence. Mutation/Load now refuses a keyed table above 8,192 rows / 32 MiB before arm, while BranchMerge uses a recovery-enrolled chain with the same per-chunk bounds and a 1,024-transaction ceiling. The inductive certificate route removes the general diff, temporary delta, target preflight, and target join without weakening that chain. Final five-pair production medians passed at 31/8 ms (3.875×) for 10K and 136/35 ms (~3.886×) for 100K; maximum signed paired RSS overheads were 24,297,472 and 32,604,160 bytes. Inclusive row/transaction ceilings, byte refusal (including materialized blobs), operation-wide validation retention, exact source/target incarnation revalidation, second-generation certificate composition, and both between-chunk recovery directions are pinned; other operations still need explicit bounds. |
 | **R9: Local-FS conditional-write emulation** (`write_text_if_match` check-then-act gap). | Low | All current callers sit behind the cluster lock protocol; S3 uses true conditional puts; close before admitting any lock-free caller. |
 | **R10: Doc/spec drift as the system grows** — this document included. | Low | Maintenance contract (same-PR doc updates, `check-agents-md.sh` link CI, "don't lie" stale markers); this canon defers to area docs by construction. |
@@ -1032,7 +1040,7 @@ The plan of record is the RFC-022…028 family (all under
 | [0023 — Key-conflict fencing](../rfcs/0023-key-conflict-fencing.md) | Substrate-native keyed-write fencing via Lance's unenforced-PK filter; fleet/format activation barrier | **Implemented** (2026-07-15) |
 | [0024 — Durable table heads](../rfcs/0024-durable-table-heads.md) | Materialized head-row research; the first exact-BTREE candidate bounded scan work but failed the full latest-manifest/object-byte cost gate | **Research blocked** |
 | [0025 — Checkpoint-pinned retention](../rfcs/0025-checkpoint-retention.md) | Named checkpoints as authoritative retention roots, materialized as Lance tags; current in-manifest registry lookup rejected by Gate 0 | **Research-blocked** |
-| [0026 — MemWAL streaming ingest](../rfcs/0026-memwal-streaming-ingest.md) | Durability-first streaming writes: ack on WAL durability, asynchronous graph-atomic folds | **Draft; Phase A foundation implemented; Phase B next** |
+| [0026 — MemWAL streaming ingest](../rfcs/0026-memwal-streaming-ingest.md) | Durability-first streaming writes: one-generation private watcher acknowledgement, then graph-atomic fold; public activation has separate audit/retention/operator gates | **Draft; Phase A foundation implemented; private Phase B1 next** |
 | [0027 — Lineage merge deltas](../rfcs/0027-lineage-merge-deltas.md) | O(delta) merge classification from row-version lineage | Research-blocked |
 
 Deliberately split, not one mega-format: identity, key fencing, head rows,

@@ -10,7 +10,7 @@
 | Run branch prefix (legacy, removed) | `__run__` | pre-v0.4.0 Run state machine; no longer a reserved name. A graph still carrying `__run__*` branches is sub-v4 and refused on open (rebuild via export/import). |
 | Schema apply lock | `__schema_apply_lock__` | schema apply |
 | Manifest publisher retry budget | `PUBLISHER_RETRY_BUDGET = 5` | manifest publish |
-| Internal manifest schema version | `INTERNAL_MANIFEST_SCHEMA_VERSION = 6` | strict RFC-023 fencing strand; preserves v5's SchemaIR-v2 identity-bearing manifest/recovery ownership |
+| Internal manifest schema version | `INTERNAL_MANIFEST_SCHEMA_VERSION = 7` | strict RFC-026 Phase A strand; preserves v5 identity and v6 keyed fencing while adding identity-keyed stream-lifecycle authority. No production WAL row path is active |
 | Keyed-write row ceiling | `KEYED_WRITE_MAX_ROWS = 8192` | one Mutation/Load keyed table or one BranchMerge chunk; inclusive |
 | Keyed-write Arrow-memory ceiling | `KEYED_WRITE_MAX_BYTES = 33,554,432` (32 MiB) | accumulated Mutation/Load keyed input (including pending state plus a streamed mutation-update match set) or one BranchMerge row/upsert/delete-filter chunk; a single larger row is refused before sidecar arm. Stored update Blobs and keyed external-URI ranges/object sizes are charged before payload reads. The complete retained BranchMerge delete plan and the operation-wide projected scalar validation delta are separately capped at the same value; ordered merge and validation scans explicitly apply it as Lance's per-batch decoded-byte ceiling. Overwrite retains external-reference semantics |
 | Maintenance concurrency | `OMNIGRAPH_MAINTENANCE_CONCURRENCY=8` | optimize/cleanup |

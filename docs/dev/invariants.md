@@ -124,9 +124,10 @@ converge the physical state.
    lifetime. Names, paths, Lance versions, and Lance field IDs are not
    substitutes for graph-level identity. Internal schema v5 introduced the
    accepted SchemaIR v2 identity domain and keys manifest ownership, recovery,
-   and physical paths by `(stable_table_id, incarnation_id)`; the currently
-   served v6 format preserves that identity contract while adding RFC-023 key
-   fencing. See [RFC-028](../rfcs/0028-stable-schema-identity.md).
+   and physical paths by `(stable_table_id, incarnation_id)`. V6 added RFC-023
+   key fencing; the currently served v7 format preserves both contracts and
+   adds identity-keyed RFC-026 stream-lifecycle authority. See
+   [RFC-028](../rfcs/0028-stable-schema-identity.md).
 
 9. **Schema and data integrity failures are loud.** Type, required-field,
    uniqueness, endpoint, cardinality, schema, and mutation-mode violations fail
@@ -180,9 +181,9 @@ converge the physical state.
 |---|---|---|
 | Multi-table commit | Manifest CAS plus recovery sidecars; not a single Lance primitive | [writes.md](writes.md), [architecture.md](architecture.md) |
 | Constructive mutations | In-memory `MutationStaging`, one end-of-query table commit per touched table, then one manifest publish | [writes.md](writes.md), [execution.md](execution.md) |
-| Keyed writes | Every v6 node/edge table declares exact non-null physical `id` as Lance's unenforced PK from creation. General production strict insert and upsert use the sealed exact-`id`, forced-v2 MergeInsert adapter; strict insert exact-probes its pinned parent before minting `omnigraph.insert_absence=v1`, while an all-new upsert may mint it only when completed effect statistics prove one attempt inserted every source row with zero updates, deletes, or skipped duplicates. Certificate admission is optional: BranchMerge uses the shortcut only when every transaction in the complete contiguous source interval carries v1 and its persisted operation is the full pure-insert `Update` shape (exact parent, no removed/updated fragments, nonempty new fragments with `physical_rows`, no field or generation rewrites, `RewriteRows`, exact-`id` filter, full nested schema preorder, and matching physical-row total). It then rechecks both source and target native ref incarnations and passes owned batches through an opaque capability whose one production mint site is structurally guarded. The proven publisher stages immutable fragments with `InsertBuilder`, replaces the uncommitted Append operation with that filter-bearing `Update`, and performs zero target preflights, target merge joins, or committed Appends. Missing, cleaned, unknown, or malformed proof uses the general ordered diff. Mutation/Load remains one keyed transaction per table and rejects more than 8,192 rows or 32 MiB before arm; BranchMerge keeps its bounded v4 chain and exact-recovery limits. Raw Lance graph writers are unsupported, and the certificate is an internal non-cryptographic capability rather than an authenticity mechanism. The final production cost gate passed at 10K (3.875× median; 24,297,472-byte max paired RSS overhead) and 100K (~3.886×; 32,604,160 bytes) | [RFC-023](../rfcs/0023-key-conflict-fencing.md), [writes.md](writes.md), [execution.md](execution.md) |
+| Keyed writes | Every current v7 node/edge table declares exact non-null physical `id` as Lance's unenforced PK from creation, using the v6-introduced, v7-preserved exact-`id` fence. General production strict insert and upsert use the sealed exact-`id`, forced-v2 MergeInsert adapter; strict insert exact-probes its pinned parent before minting `omnigraph.insert_absence=v1`, while an all-new upsert may mint it only when completed effect statistics prove one attempt inserted every source row with zero updates, deletes, or skipped duplicates. Certificate admission is optional: BranchMerge uses the shortcut only when every transaction in the complete contiguous source interval carries v1 and its persisted operation is the full pure-insert `Update` shape (exact parent, no removed/updated fragments, nonempty new fragments with `physical_rows`, no field or generation rewrites, `RewriteRows`, exact-`id` filter, full nested schema preorder, and matching physical-row total). It then rechecks both source and target native ref incarnations and passes owned batches through an opaque capability whose one production mint site is structurally guarded. The proven publisher stages immutable fragments with `InsertBuilder`, replaces the uncommitted Append operation with that filter-bearing `Update`, and performs zero target preflights, target merge joins, or committed Appends. Missing, cleaned, unknown, or malformed proof uses the general ordered diff. Mutation/Load remains one keyed transaction per table and rejects more than 8,192 rows or 32 MiB before arm; BranchMerge keeps its bounded v4 chain and exact-recovery limits. Raw Lance graph writers are unsupported, and the certificate is an internal non-cryptographic capability rather than an authenticity mechanism. The final production cost gate passed at 10K (3.875× median; 24,297,472-byte max paired RSS overhead) and 100K (~3.886×; 32,604,160 bytes) | [RFC-023](../rfcs/0023-key-conflict-fencing.md), [writes.md](writes.md), [execution.md](execution.md) |
 | Deletes | Staged like inserts/updates (`stage_delete` via Lance 7.0 `DeleteBuilder::execute_uncommitted`, MR-A) — no inline HEAD advance; mixed insert/update/delete in one query rejected by D2 as a deliberate boundary (constructive XOR destructive per query; compose via separate mutations or a branch) | [query-language.md](../user/queries/index.md), [writes.md](writes.md) |
-| Streaming ingest | Not implemented. RFC-026 adopts Lance MemWAL as the strategic substrate and remains draft. Its production-neutral Gate E0 passed for an exact main-only, one-unsharded-shard, one-live-writer-process enrollment classifier without adding schema/API/format state: pinned immediate-successor probes reject buried effects with a history-flat six-attempt/zero-list shape, and strict local/RustFS negatives fail closed. The candidate separates stable enrollment identity from a mutable `CurrentHeadWitness` and would give an `OPEN` stream exclusive base-HEAD ownership; those are unimplemented support restrictions, not current guarantees. Green E0 authorizes only the next production foundation, never acknowledgement activation. Once streaming is eventually active, acknowledgement means MemWAL-durable while graph visibility still occurs only through graph-atomic RFC-022 folds | [RFC-026](../rfcs/0026-memwal-streaming-ingest.md), [writes.md](writes.md) |
+| Streaming ingest | Public row streaming is not implemented. RFC-026 adopts Lance MemWAL as the strategic substrate and remains draft. Gate E0 passed, and Phase A is active in schema v7: exact bounded enrollment recovery, identity-keyed lifecycle authority, process-local admission/exclusion, current-HEAD witnesses, compatible-open validation, partial-format refusal, and strict v6↔v7 rebuild are implemented for main-only, one-unsharded-shard, one-live-writer-process empty enrollment. There is still no production first-use caller, WAL row put, acknowledgement, fold, or operator drain/resume surface. Planned B1 is a private schema-v8/config-v2 one-generation worker: hard-cap the complete generation at 8,192 rows/32 MiB; prevent RC.1 watcher reuse across rollover; hold admission from before epoch claim; treat every post-invocation ambiguity as permanently caller-ambiguous `AckUnknown`; route replayed or flushed-unmerged residue fold-only through the pinned public BatchStore watermark bridge; prove drain from frozen refs plus authoritative shard state; then seal/retire and fold once through recovery schema v11 plus RFC-022. B2 stays blocked on durable contributor attribution, bounded reclamation/orphan cleanup, strict correction, same-key retry sequencing, and persistent operator escape. A durability acknowledgement covers one submitted batch and is never a graph-visibility receipt; graph visibility remains one `__manifest` publication | [RFC-026](../rfcs/0026-memwal-streaming-ingest.md), [writes.md](writes.md) |
 | Branch create/delete | `__manifest` `BranchContents` is the single logical authority. Lance create is physically two-phase, so OmniGraph prevalidates names, enforces path-prefix-disjoint live graph names, reclaims an absent-ref clone-only tree, and uses a bounded completion classifier; delete removes authority before tree cleanup, so an absent ref is success and derived tree reclaim may converge later. Neither control emits graph lineage. Under schema/source-target/all-table gates, each control uses one operation-local post-gate manifest/namespace capture rather than refreshing the handle-local coordinator around table-gate acquisition; successful ref movement explicitly invalidates derived read caches. Per-table forks are derived state, reclaimed best-effort with `cleanup` as backstop. A target-scoped unresolved sidecar may be made unreachable by deletion and is then audit-discarded by recovery; graph-global SchemaApply still blocks | [branches-commits.md](../user/branching/index.md), [maintenance.md](../user/operations/maintenance.md), [writes.md](writes.md) |
 | Cleanup retention | Explicit cleanup derives exact `keep` cutoffs from Lance's available version list, caps each main-table GC cutoff at the oldest exact main version inherited by any live lazy graph branch, and refuses uncovered main HEAD drift. Lance protects native per-table branch refs itself. The graph-wide live-reference preflight fails closed before the first table GC, after which individual table failures remain fault-isolated | [maintenance.md](../user/operations/maintenance.md), [writes.md](writes.md) |
 | Optimize visibility | One operation-local accepted catalog and fresh main snapshot are planned under schema → main → all-table gates. Every productive table shares one identity-bearing v9 recovery envelope; bounded-parallel physical effects become visible through at most one monotonic manifest/lineage CAS. Complete crash residuals roll forward together and partial residuals compensate before visibility. Optimize's payload remains a bounded maintenance adapter rather than an exact caller-minted Lance transaction proof, so it is supported within the single-writer-process recovery boundary. Exact provenance is deferred until Lance exposes a stable public caller-controlled maintenance transaction API and OmniGraph has distributed recovery fencing | [maintenance.md](../user/operations/maintenance.md), [writes.md](writes.md), [RFC-022](../rfcs/0022-unified-write-path.md) |
@@ -218,7 +219,7 @@ incomplete would let a legacy writer prepare from unresolved physical state.
 Do not hide these behind invariant wording. Either move them forward or keep
 them explicit.
 
-- **Streaming enrollment is inactive; Gate E0 passed:** RC.1's public
+- **Private enrollment foundation is active; row streaming is not:** RC.1's public
   initializer commits the singleton MemWAL index internally and shard claim is
   a separate durable effect. RFC-026 no longer treats an upstream release as
   the only calendar path: a production-neutral harness proved exact
@@ -233,11 +234,23 @@ them explicit.
   negatives non-vacuously on RustFS. Exclusive HEAD and cleanup/version-GC
   exclusion remain held through decision/publish; only `Ok(false)` means
   absence, and errors, overflow, or detached boundaries fail closed. It may not
-  delete ambiguous artifacts. Until the later lifecycle, writer-exclusion,
-  recovery, format, and rebuild gates pass, internal schema
-  v6 remains authoritative and no `@stream`, enrollment, acknowledgement, or
-  public stream surface exists. The exact upstream receipt and cross-process
-  seal remain required to broaden topology. See
+  delete ambiguous artifacts. Phase A then activated internal schema v7 with a
+  recovery-v10 enrollment intent, identity-keyed lifecycle CAS, process-local
+  exclusion, compatible-open validation, partial-format refusal, and strict
+  v6↔v7 rebuild. Its private adapter can create only an exact empty enrollment;
+  no production caller can put or acknowledge a row. RC.1's writer-wide
+  durability watermark is unsafe with batch positions that reset after
+  MemTable rollover, `put_no_wait` may mutate before returning an error, replay
+  leaves its BatchStore flush watermark unset, and a late drain waiter can miss
+  a completed failure. Planned B1 therefore uses one root-scoped worker and one
+  hard-bounded generation per writer, holds admission before epoch claim,
+  routes replay/unmerged residue fold-only through the guarded public watermark
+  bridge, proves the drained generation independently, then
+  seal/retire/recovery-v11 fold/higher-epoch reopen. B2 is the later public
+  strict surface and remains gated on durable attribution, bounded
+  reclamation/orphan cleanup, correction, same-key retry sequencing, and
+  persistent operational escape. The exact upstream receipt and cross-process seal remain required to
+  broaden topology, not to build B1 inside the existing boundary. See
   [RFC-026](../rfcs/0026-memwal-streaming-ingest.md).
 - **Storage abstraction:** `TableStorage` is present, sealed, and canonical for
   staged writes. MR-854 made `db.storage()` staged-only; the exact EnsureIndices
@@ -411,7 +424,8 @@ them explicit.
   27→10 rows and 17→10 ranges. The full gate still fails: representative
   RustFS 20→80 uncompacted cold reads grow 34→94 and bytes
   61,947→121,592, while compacted cold/warm byte terms also grow. RFC-024 is
-  therefore research-blocked and production remains on the v6 journal fold.
+  therefore research-blocked and production remains on the current v7 journal
+  fold (the fold design predates and is preserved from v6).
   Do not reinterpret flat scan counters as a history-flat current-state path.
 - **Read-path re-derivation (largely closed by the query-latency work):**
   snapshot resolution used to re-open a fresh coordinator per read (a full

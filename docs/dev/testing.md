@@ -93,6 +93,120 @@ without moving table HEAD. The existing lazy-child branching cell also creates
 and deletes a grandchild whose physical ref remains its ancestor, preventing
 Phase-A main admission from regressing inherited named-branch semantics.
 
+### RFC-026 Phase B1 coverage ownership (prepared, not implemented)
+
+Phase B1 is a new private row-admission/fold area, so it earns one focused
+feature-gated `crates/omnigraph/tests/memwal_stream.rs` owner instead of adding
+row behavior to the production-neutral `memwal_enrollment_gate.rs`. A single
+`#[doc(hidden)]` test seam under `failpoints` reaches the crate-private core;
+`forbidden_apis.rs` exact-counts it so production visibility does not widen.
+Keep the boundaries split as follows when implementation begins:
+
+- in-source `table_store::mem_wal` tests own exact persisted writer-config
+  v2 encoding, the no-auto-roll profile, the four-case active/flushed reopen
+  classifier, root-scoped cross-handle singleflight, generation reservation,
+  and registry retirement.
+  Two-handle claim/eviction races prove one owner and no eviction past an
+  in-flight waiter. Retirement closes the worker to puts before public
+  `ShardWriter::abort`, and no test treats `ShardWriter::close` as durability
+  evidence. One background-owned abort completion is retained in the retired
+  entry; a caller deadline never cancels that future, retries abort, or permits
+  reopen. A stalled-handler/deadline/second-retirement test pins that exact
+  RC.1 `shutdown_all` hazard. A claim-vs-drain
+  race holds the shared admission lease from before
+  epoch claim through durability or quiesced retirement and proves an exclusive
+  drainer cannot capture a stale floor. Stale-capture-vs-fold/drain and
+  late-relevant-sidecar races prove fresh under-lease checks run before claim
+  and again before put, releasing to exclusive recovery and restarting when
+  required;
+- `memwal_stream.rs` owns one-call/one-`RecordBatch`/one-put behavior,
+  all-or-nothing validation of one contiguous ordinal range, whole-generation
+  8,192-row/32-MiB reservation (including duplicate submissions while the same
+  live generation remains active), effect-free
+  `FoldRequired`, watcher-only acknowledgement, every post-invocation error as
+  typed `AckUnknown`, cardinality-only same-payload retry without attempt
+  reconciliation, and the adversarial `X(unknown) -> Y(durable) -> retry X`
+  stale-overwrite shape that keeps public B2 gated on sequencing/idempotency.
+  A lost-ack retry crosses the mandatory fold boundary when durable replay
+  residue exists; it is not charged to the retired generation. This file also
+  owns strict blocked input, explicit one-generation fold, output expansion refusal,
+  and pre-/post-`__manifest` visibility. B2, not this file, owns NDJSON
+  caller-order mapping and its reorder buffer;
+- existing `lance_surface_guards.rs` extends its compile/runtime guards for the
+  exact `put_no_wait` return shape; forced seal/drain, epoch, and generation
+  primitives; quiesced `abort`; public `in_memory_memtable_refs`, BatchStore
+  iteration, replayed stored batches, and
+  `BatchStore::set_max_flushed_batch_position`; public
+  `LsmScanner::without_base_table`; caller-supplied exact `ShardSnapshot`;
+  optional-store-parameter/required-Session propagation; and
+  streaming/generation tags.
+  An adversarial rollover cell delays generation `N + 1`'s WAL PUT and pins the
+  RC.1 false-ack bug; adapter tests prove B1 retires before that path. Another
+  guard pins the replay watermark at exact `len - 1` only with zero frozen refs
+  and no possible put, and proves reseal writes no extra WAL entry, performs no
+  second PK-index insertion, and stamps the exact replay cursor. Repeated
+  pre-shard-manifest failures/crashes must not increase replayed batch or row
+  count. A fast failed-flush cell starts `wait_for_flush_drain` after the
+  handler removed its watcher and proves B1 still refuses without empty frozen
+  refs plus the exact authoritative generation/cursor. Channel-loss and
+  handler-stall cells prove the background registry task retains the exclusive
+  lease and owns seal/drain/abort to completion while caller deadlines return
+  typed recovery, keep admission closed, and never arm the fold sidecar. The guard keeps proving
+  that active-MemTable `batch_positions` and WAL statistics are not durable row
+  addresses;
+- existing `db/manifest/recovery.rs` tests own schema-v11 `StreamFold`
+  serialization/version refusal, `Armed`/`EffectsConfirmed` classification,
+  exact effect proof, and the rule that `MergedGeneration` is part of the Lance
+  transaction rather than a separate manifest participant;
+- existing `failpoints.rs` owns post-invocation/lost-watcher ambiguity and
+  crash orchestration before sidecar arm (pre-/mid-generation output and
+  post-shard-manifest publication) and around every `StreamFold` boundary: arm, table effect,
+  achieved-effect confirmation, manifest publication, and sidecar
+  finalization. An unreferenced recognized randomized generation subtree,
+  complete or partial, remains a retained derived orphan and is never
+  adopted/deleted in B1; any other loose state fails closed. Unresolved
+  no-effect and effected fold intents both block
+  a later put until the recovery barrier resolves them;
+- existing `forbidden_apis.rs` keeps B1 crate-private, exact-counts its allowed
+  put/fold durable-call sites, and proves no schema, SDK, HTTP, CLI, OpenAPI, or
+  generic raw-Lance side door appears;
+- a focused feature-gated `memwal_stream_cost.rs` instrument owns warm
+  steady-state ack object-store work across graph-history endpoints. It records
+  cold claim/reopen/replay separately against retained WAL depth, includes the
+  watcher's WAL-plus-in-memory-index completion cost, reports fold data-scan
+  work versus the one selected generation, sweeps accumulated already-merged
+  generation metadata retained in the shard manifest, and retains the
+  publisher's known graph-manifest-history term. Record local and configured RustFS evidence
+  before making a latency or group-commit claim.
+
+Format tests own genuine v7/config-v1 ↔ v8/config-v2 refusal/rebuild. Focused
+behavior also covers empty-batch refusal, exact-cap admission, one-row/one-byte
+over-cap refusal before `put_no_wait` with no row/WAL batch, automatic-rollover
+refusal, higher-epoch reopen,
+restart reconstruction of the exact post-tombstone row/Arrow-byte reservation
+(including physical duplicate batches), conservative fold-only routing for
+non-empty replay and one flushed-unmerged generation, refusal of active data
+beside an unmerged generation, wide/derived embedding expansion
+beyond the post-fold byte limit, active-state authoritative cursor validation,
+and the deliberate absence of a B1 correction generation.
+
+Run the private integration owners with:
+
+```bash
+cargo test -p omnigraph-engine --features failpoints --test memwal_stream
+cargo test -p omnigraph-engine --features failpoints --test memwal_stream_cost
+cargo test -p omnigraph-engine --features failpoints --test failpoints stream_fold
+```
+
+B1 does not add parser/server/CLI tests because it has no public surface. B2
+must extend the existing compiler, server/OpenAPI, CLI parity, Cedar, shutdown,
+audit, retention/GC, and genuine rebuild suites together with persistent
+status/quiesce/resume/abort-drain, strict correction, and retained-storage-stop
+controls; those tests are a B2 gate, not incidental B1 scope. The lifecycle
+matrix includes `quiesce -> create named branch -> resume`: bounded resume must
+recheck branch topology under the closed gates and remain `SEALED`, while a
+compatible main-only resume advances the epoch and opens.
+
 RFC-023's Mutation/Load effect classifier is pinned here, not by ordinary unit tests:
 `rfc023_effect_free_conflict_is_typed_or_fully_reprepared` proves that a strict
 same-key conflict is terminal `KeyConflict` while an upsert stages a fresh,

@@ -25,6 +25,10 @@ uncompacted endpoint, while compacted cold scan bytes still grow. The
 representative RustFS table in §7.4 remains explicitly historical beta.21
 evidence; its bucket-gated RC.1 cell was not available for this audit. The
 candidate remains rejected for the same physical-cost reason.
+**Current production consequence (2026-07-18):** RFC-026 Phase A subsequently
+activated internal schema v7, but added no table-head rows or lookup. The
+candidate remains rejected and v7 still resolves current table state by folding
+the identity-bearing manifest journal.
 **Relationship to RFC-022:** this RFC is the durable-heads decision split from
 the earlier monolithic RFC-022 draft. [RFC-022](0022-unified-write-path.md)
 defines the shared publisher/recovery protocol; this RFC owns the heads-format
@@ -68,8 +72,8 @@ The first Gate A instrument rejected the proposed in-manifest BTREE shape on
 2026-07-15. Exact indexed scan work is flat at fixed catalog width, but the
 complete required cost is not: latest-manifest discovery on uncompacted
 RustFS grows in object reads and bytes, and compacted reads still grow in bytes.
-No heads-format production code ships from this RFC; internal schema v6 and its
-journal-fold current-state path remain authoritative while research looks for a
+No heads-format production code ships from this RFC; current internal schema v7
+preserves the journal-fold current-state path while research looks for a
 different substrate/access shape.
 
 Normative decisions:
@@ -653,8 +657,8 @@ coverage and does run against RustFS in CI.
 - Checkpoint retention is deferred.
 - The first in-manifest BTREE candidate is rejected: flat indexed scan work is
   insufficient while latest-manifest/object byte work grows with history.
-- Production remains on internal schema v6; no heads-format number or partial
-  implementation is assigned.
+- Production remains on current internal schema v7 without table heads; no
+  heads-format number or partial implementation is assigned.
 
 ### Gate status
 

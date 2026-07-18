@@ -171,6 +171,85 @@ for schemas that avoid the newly reserved names documented below. RC.1 requires
 Rust 1.91 or newer; OmniGraph continues to track stable Rust and this audit ran
 on Rust 1.95.
 
+#### Post-audit implementation note: 2026-07-18
+
+RFC-026 Gate E0 subsequently passed and Phase A activated OmniGraph internal
+schema v7. V7 adds only the bounded streaming foundation: exact recovery-v10
+enrollment, identity-keyed lifecycle authority, process-local admission and
+writer exclusion, current-HEAD witness validation, partial-format refusal, and
+strict v6↔v7 rebuild. The private adapter can establish one empty unsharded
+epoch-1 enrollment on main; no production caller can put or acknowledge a row,
+fold a generation, or operate drain/resume.
+
+The Phase-B1 source audit also narrows the RC.1 row contract. `put_no_wait`
+returns a `WriteResult` plus an optional `BatchDurableWatcher`; the watcher's
+successful `Result<()>` is the only per-put durable-completion signal.
+`WriteResult.batch_positions` are active-MemTable/`BatchStore` positions that
+restart after `freeze_memtable`, while the durability watermark is shared for
+the writer lifetime. A generation-`N + 1` watcher can therefore resolve from
+generation `N`'s old watermark before `N + 1` reaches the WAL. In addition,
+`put_no_wait` inserts into the MemTable before a later flush-scheduling error,
+so its `Err` is not generally an effect-free result. Finally,
+`wal_stats.next_wal_entry_position` is mutable status, so neither is a durable
+row address or public receipt. Durable mode returning no watcher is treated as
+post-invocation `AckUnknown`, not effect-free configuration rejection.
+
+RC.1 replay has a second independent bookkeeping hazard. It inserts durable
+WAL batches into a fresh `BatchStore` and rebuilds indexes, but does not advance
+that store's per-MemTable WAL-flush watermark. A later put or plain seal starts
+its WAL range at batch zero, re-appending and re-indexing the replayed prefix.
+Repeated crashes after that duplicate WAL PUT but before the shard-manifest
+commit can multiply the replay tail until BatchStore capacity is exhausted.
+The public `BatchStore::set_max_flushed_batch_position` surface is therefore a
+pinned compatibility bridge: under the exclusive fold lease, B1 verifies that
+the active contiguous prefix came only from authoritative replay, marks it
+already WAL-durable, and then seals without another WAL/index write. Non-empty
+replay is fold-only; it never accepts a new put.
+
+Two flush details also constrain the proof. `wait_for_flush_drain` can return
+`Ok(())` after a fast failed handler has removed its watcher, so B1 separately
+requires empty frozen refs and the exact generation/cursor in the latest shard
+manifest. And RC.1 writes the randomized generation dataset and sidecars before
+that manifest CAS, so a crash may leave a complete or partial unreferenced
+`{hash}_gen_N/` subtree. B1 treats only that recognized subtree shape as
+retained derived orphan output—never adopted, scanned, or deleted—and leaves
+reclamation to B2's proved GC contract. Seal/drain/abort are background-owned
+with deadline-bounded caller waits: an error or stalled handler keeps the
+original task and abort completion retained, the registry retired, and
+admission closed. The caller never cancels `shutdown_all`, retries abort, or
+claims quiescence while the taken handler join may still be active.
+
+The safe B1 profile is deliberately bounded: one root-scoped serialized
+worker owns one generation whose complete input is capped at 8,192 rows/32 MiB;
+its explicit writer configuration prevents automatic rollover; it owns
+`put_no_wait` and the watcher, seals/drains, retires without writing into the
+replacement MemTable, folds one keyed transaction through recovery schema v11,
+then reopens at a higher epoch. Cold claim/replay and warm final-check/put hold
+the shared admission lease from before epoch claim until durability or
+quiesced retirement, preventing a claimant from crossing a drain's captured
+floor. Replay preserves possible residue but cannot resolve which caller
+attempt produced it. Configuration identity binds only
+correctness/topology/no-rollover fields; explicit runtime policy and injected
+Session/store capabilities remain separate. Planned B1 activates graph schema
+v8 and stream-config v2 rather than adopting v7/config-v1 in place. Phase B2 is
+the later public strict activation and additionally waits for durable
+contributor attribution, bounded reclamation, strict correction, a same-key
+`AckUnknown` sequencing/idempotency contract, and persistent
+quiesce/resume/abort-drain/rebuild. The missing combined enrollment receipt and
+cross-process admission seal still gate broader topology, not B1 inside the
+existing single-live-writer-process boundary.
+
+The no-roll profile uses fixed portable capacities (`8,193` rows/batches and
+1-GiB byte/unflushed thresholds), not architecture-dependent `usize::MAX`
+metadata. After reopen, the 32-MiB contract is validated from public
+`in_memory_memtable_refs().active.batch_store`: sum physical rows and exact
+stored post-tombstone Arrow batch memory, including replayed duplicate batches.
+An empty valid reopen may admit; a non-empty valid replay is routed fold-only.
+`MemTableStats::estimated_size` has different accounting and does not replace
+that contract. Retirement first stops the serialized worker and then uses
+public `ShardWriter::abort`; `close` ignores final completion errors and is not
+durability evidence.
+
 Behavior-affecting findings in this audit:
 
 - **The RFC-022 write/recovery architecture remains aligned.** Native
@@ -192,7 +271,8 @@ Behavior-affecting findings in this audit:
   enables that flag nor emits the operation; its recovery classifiers keep
   unknown foreign effects on the fail-closed path. The explicit V2_2 pin does
   not silently opt a dataset into overlays.
-- **MemWAL's direction improves; RFC-026 now owns a bounded decision gate.**
+- **At RC.1 audit time, MemWAL's direction improved and RFC-026 owned a bounded
+  decision gate.**
   Derived MemWAL datasets now inherit the base dataset's store parameters and
   `Session`, which is compatible with OmniGraph's shared-session design and
   remote credentials. The public initializer still commits internally and
@@ -215,7 +295,8 @@ Behavior-affecting findings in this audit:
   defaults.
 
   MemWAL stays the strategic substrate and RFC-026 stays draft. Its
-  production-neutral Gate E0 passed for the bounded profile. The first
+  production-neutral Gate E0 passed for the bounded profile. The post-audit
+  note above records the subsequently implemented Phase A boundary. The first
   history-cost result was rejected: local
   `checkout_latest` may discover the tip through filesystem `read_dir`, which
   bypasses `IOTracker`, so the observed tracked GET count omitted part of the
@@ -239,8 +320,10 @@ Behavior-affecting findings in this audit:
   `has_successor_version`, flush/drain, merged-generation state, and S3 ABA; CI
   rejects skipped E0/ABA cells. Exclusive HEAD and cleanup/version-GC exclusion
   remain load-bearing; only `Ok(false)` means absence, while errors, overflow,
-  or detached boundaries fail closed. No private API, raw object emulation,
-  production schema, or stream acknowledgement is introduced. The exact
+  or detached boundaries fail closed. The RC.1 audit itself introduced no
+  private API, raw object emulation, production schema, or stream
+  acknowledgement; the post-audit note records the later Phase A format work.
+  The exact
   upstream receipt/seal remains the preferred simplification and the gate for
   broader topology.
 - **Maintenance and index defaults preserve current behavior.** Compaction
@@ -257,10 +340,11 @@ Behavior-affecting findings in this audit:
   validator now reserve those five exact, case-sensitive property names before
   init or SchemaApply can create durable state or arm recovery. A surface guard
   pins the compiler-owned list to the five surveyed Lance public constants;
-  every Lance bump still audits upstream source for additions. Because internal
-  schema v6 is not released, this is a validation tightening rather than a
-  format bump; a development graph already using either newly reserved
-  row-version name must be exported with the beta.21 binary, renamed, and
+  every Lance bump still audits upstream source for additions. At pin-audit
+  time internal schema v6 had not been released, so this was a validation
+  tightening rather than a format bump; Phase A's later v7 activation does not
+  change that conclusion. A development graph already using either newly
+  reserved row-version name must be exported with the beta.21 binary, renamed, and
   rebuilt before opening on RC.1. The audit minted a genuine beta.21 v6 graph
   with `_row_created_at_version`: beta.21 opened it successfully, while RC.1
   refused it before any write with that exact recovery instruction.
@@ -405,8 +489,9 @@ Behavior-affecting findings in this audit:
 
   This result blocks the in-manifest BTREE access shape, not checkpoint rows as
   logical authority or Lance tags as physical pins. RFC-025 is
-  research-blocked, no retention format ships, and internal schema v6 remains
-  production truth. A successor needs a history-flat current-authority lookup
+  research-blocked and no retention format ships. Schema v6 was production
+  truth when the gate ran; current schema v7 likewise carries no retention
+  state. A successor needs a history-flat current-authority lookup
   or revised evidence-backed operational contract without adding a second
   authority dataset.
 - **RFC-023 key-filter behavior remains route-dependent and directional, and
