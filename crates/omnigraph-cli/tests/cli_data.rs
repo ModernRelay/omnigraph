@@ -2357,3 +2357,222 @@ fn profile_show_unknown_name_errors() {
     let stderr = String::from_utf8_lossy(&out.stderr);
     assert!(stderr.contains("unknown profile 'nope'"), "{stderr}");
 }
+
+// ─── Blob verb (`blob get` / `blob stat`) ────────────────────────────────────
+
+const BLOB_SCHEMA: &str = r#"
+node Document {
+    title: String @key
+    content: Blob?
+}
+"#;
+
+/// Init + load a blob graph: `readme` carries inline "Hello World" bytes,
+/// `ext` an external file:// reference whose object is DELETED after load —
+/// classification must come from the descriptor alone, so any accidental
+/// external resolution fails loudly.
+fn blob_graph() -> (tempfile::TempDir, std::path::PathBuf, String) {
+    blob_graph_with(true)
+}
+
+/// `with_external: false` builds an inline-only graph. Needed by the
+/// snapshot test, whose second (merge) load would otherwise trip a
+/// pre-existing engine bug: a merge-mode load onto a blob table holding an
+/// external-reference row fails in Lance's blob structural decoder ("more
+/// fields in the schema than provided column indices") — the merge path's
+/// committed-row scan does not use descriptor-aware blob handling.
+/// Inline-only tables merge fine.
+fn blob_graph_with(with_external: bool) -> (tempfile::TempDir, std::path::PathBuf, String) {
+    let temp = tempdir().unwrap();
+    let schema_path = temp.path().join("blob.pg");
+    write_file(&schema_path, BLOB_SCHEMA);
+    let graph = temp.path().join("blob.omni");
+    output_success(
+        cli()
+            .arg("init")
+            .arg("--schema")
+            .arg(&schema_path)
+            .arg(&graph),
+    );
+    let external_path = temp.path().join("external.bin");
+    fs::write(&external_path, b"external-bytes").unwrap();
+    let external_uri = format!("file://{}", external_path.display());
+    let readme_row =
+        r#"{"type": "Document", "data": {"title": "readme", "content": "base64:SGVsbG8gV29ybGQ="}}"#;
+    let data_path = temp.path().join("blob.jsonl");
+    if with_external {
+        write_file(
+            &data_path,
+            &format!(
+                "{readme_row}\n{}",
+                format!(
+                    r#"{{"type": "Document", "data": {{"title": "ext", "content": "{external_uri}"}}}}"#
+                ),
+            ),
+        );
+    } else {
+        write_file(&data_path, readme_row);
+    }
+    output_success(
+        cli()
+            .arg("load")
+            .arg("--data")
+            .arg(&data_path)
+            .arg("--mode")
+            .arg("overwrite")
+            .arg(&graph),
+    );
+    fs::remove_file(&external_path).unwrap();
+    (temp, graph, external_uri)
+}
+
+fn blob_args<'a>(cmd: &'a mut Command, verb: &str, id: &str, graph: &std::path::Path) -> &'a mut Command {
+    cmd.arg("blob")
+        .arg(verb)
+        .arg("Document")
+        .arg(id)
+        .arg("content")
+        .arg("--uri")
+        .arg(graph)
+}
+
+#[test]
+fn blob_get_streams_full_content_to_stdout() {
+    let (_temp, graph, _) = blob_graph();
+    let output = output_success(blob_args(&mut cli(), "get", "readme", &graph));
+    assert_eq!(&output.stdout[..], b"Hello World");
+}
+
+#[test]
+fn blob_get_range_flags_map_to_bounded_reads() {
+    let (_temp, graph, _) = blob_graph();
+    let output = output_success(
+        blob_args(&mut cli(), "get", "readme", &graph)
+            .arg("--offset")
+            .arg("6")
+            .arg("--length")
+            .arg("5"),
+    );
+    assert_eq!(&output.stdout[..], b"World");
+    let output = output_success(blob_args(&mut cli(), "get", "readme", &graph).arg("--offset").arg("6"));
+    assert_eq!(&output.stdout[..], b"World");
+    let output = output_success(blob_args(&mut cli(), "get", "readme", &graph).arg("--length").arg("5"));
+    assert_eq!(&output.stdout[..], b"Hello");
+}
+
+#[test]
+fn blob_get_writes_out_file() {
+    let (temp, graph, _) = blob_graph();
+    let out_path = temp.path().join("payload.bin");
+    let output = output_success(
+        blob_args(&mut cli(), "get", "readme", &graph)
+            .arg("--out")
+            .arg(&out_path),
+    );
+    assert!(output.stdout.is_empty(), "--out must leave stdout empty");
+    assert_eq!(fs::read(&out_path).unwrap(), b"Hello World");
+}
+
+#[test]
+fn blob_get_offset_beyond_size_fails() {
+    let (_temp, graph, _) = blob_graph();
+    let output = output_failure(blob_args(&mut cli(), "get", "readme", &graph).arg("--offset").arg("99"));
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains("not satisfiable"), "stderr: {stderr}");
+    assert!(stderr.contains("11"), "should name the blob size: {stderr}");
+}
+
+#[test]
+fn blob_get_external_reference_errors_with_uri() {
+    let (_temp, graph, external_uri) = blob_graph();
+    let output = output_failure(blob_args(&mut cli(), "get", "ext", &graph));
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains("external reference"), "stderr: {stderr}");
+    assert!(stderr.contains(&external_uri), "stderr should carry the stored URI: {stderr}");
+}
+
+#[test]
+fn blob_stat_internal_json() {
+    let (_temp, graph, _) = blob_graph();
+    let output = output_success(blob_args(&mut cli(), "stat", "readme", &graph).arg("--json"));
+    let payload = parse_stdout_json(&output);
+    assert_eq!(payload["type"], "Document");
+    assert_eq!(payload["id"], "readme");
+    assert_eq!(payload["prop"], "content");
+    assert_eq!(payload["kind"], "internal");
+    assert_eq!(payload["size"], 11);
+    let etag = payload["etag"].as_str().unwrap();
+    assert!(
+        etag.starts_with('"') && etag.ends_with('"') && etag.len() == 34,
+        "strong quoted 16-byte hex ETag, got: {etag}"
+    );
+    assert!(payload.get("uri").is_none(), "internal stat carries no uri");
+}
+
+#[test]
+fn blob_stat_external_json() {
+    let (_temp, graph, external_uri) = blob_graph();
+    let output = output_success(blob_args(&mut cli(), "stat", "ext", &graph).arg("--json"));
+    let payload = parse_stdout_json(&output);
+    assert_eq!(payload["kind"], "external");
+    assert_eq!(payload["uri"], external_uri.as_str());
+    assert!(payload["size"].is_null(), "external stat has no wire size");
+    assert!(payload["etag"].is_null(), "external stat has no wire etag");
+}
+
+#[test]
+fn blob_get_snapshot_pins_read() {
+    // Inline-only fixture: see blob_graph_with — the second (merge) load
+    // below hits a pre-existing engine bug when the table holds an
+    // external-reference row.
+    let (temp, graph, _) = blob_graph_with(false);
+    let snapshot_id = tokio::runtime::Runtime::new().unwrap().block_on(async {
+        omnigraph::db::Omnigraph::open(graph.to_string_lossy().as_ref())
+            .await
+            .unwrap()
+            .resolve_snapshot("main")
+            .await
+            .unwrap()
+            .to_string()
+    });
+    let update_path = temp.path().join("update.jsonl");
+    write_file(
+        &update_path,
+        r#"{"type": "Document", "data": {"title": "readme", "content": "base64:R29vZGJ5ZQ=="}}"#,
+    );
+    output_success(
+        cli()
+            .arg("load")
+            .arg("--data")
+            .arg(&update_path)
+            .arg("--mode")
+            .arg("merge")
+            .arg(&graph),
+    );
+
+    let pinned = output_success(
+        blob_args(&mut cli(), "get", "readme", &graph)
+            .arg("--snapshot")
+            .arg(&snapshot_id),
+    );
+    assert_eq!(&pinned.stdout[..], b"Hello World");
+    let live = output_success(blob_args(&mut cli(), "get", "readme", &graph));
+    assert_eq!(&live.stdout[..], b"Goodbye");
+}
+
+#[test]
+fn blob_branch_and_snapshot_conflict() {
+    let (_temp, graph, _) = blob_graph();
+    let output = output_failure(
+        blob_args(&mut cli(), "get", "readme", &graph)
+            .arg("--branch")
+            .arg("main")
+            .arg("--snapshot")
+            .arg("someid"),
+    );
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("--snapshot") && stderr.contains("--branch"),
+        "clap must reject the exclusive pair: {stderr}"
+    );
+}

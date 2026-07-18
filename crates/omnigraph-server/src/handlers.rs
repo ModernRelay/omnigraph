@@ -650,27 +650,6 @@ const BLOB_STREAM_CHUNK_BYTES: u64 = 4 * 1024 * 1024;
 /// headers agree).
 const BLOB_SNIFF_BYTES: u64 = 512;
 
-/// Strong ETag for one blob cell: an opaque digest of the identity tuple
-/// `(stable_table_id, incarnation_id, table_version, row_id, property)`.
-/// The stable-identity pair (not the mutable `table_key`) makes the tag
-/// rename-stable and drop/re-add ABA-safe (invariant 8).
-fn blob_etag(tag: &omnigraph::db::BlobVersionTag, property: &str) -> String {
-    let mut hasher = Sha256::new();
-    hasher.update(tag.stable_table_id.to_le_bytes());
-    hasher.update(tag.table_incarnation_id.to_le_bytes());
-    hasher.update(tag.table_version.to_le_bytes());
-    hasher.update(tag.row_id.to_le_bytes());
-    hasher.update(property.as_bytes());
-    let digest = hasher.finalize();
-    let mut tag = String::with_capacity(34);
-    tag.push('"');
-    for byte in &digest[..16] {
-        tag.push_str(&format!("{byte:02x}"));
-    }
-    tag.push('"');
-    tag
-}
-
 /// Outcome of parsing a `Range` header against a known total size.
 enum BlobRangeOutcome {
     /// No header, a syntactically invalid header, or a multi-range request
