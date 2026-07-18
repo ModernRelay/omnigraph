@@ -578,9 +578,19 @@ foundation. It does not activate streaming ingestion.
   `OPEN`/`DRAINING` lifecycle coexisting with a named graph branch.
 
 This boundary supports one live writer process only. The admission lease is not
-a distributed lock, and no public row can be written or acknowledged. Phase B
-must add WAL put/durable acknowledgement, replay, and strict graph-atomic fold;
-later phases own drain/resume, witness rebind/advancement, and fresh reads.
+a distributed lock, and no public row can be written or acknowledged. Phase B1
+must privately add one root-scoped no-rollover generation capped in total at
+8,192 rows/32 MiB, admission held from before epoch claim, worker-owned put
+plus watcher, permanently ambiguous `AckUnknown` replay, the pinned public
+BatchStore watermark bridge for conservative fold-only replay, independent
+frozen-ref plus shard-manifest drain proof, active-state compatible-open
+validation, and one recovery-v11 strict graph-atomic fold before higher-epoch reopen. Planned B1 is
+an internal schema-v8/config-v2 format gate, not in-place adoption of v7.
+Phase B2 later owns the public strict surface and additionally requires durable
+contributor attribution, bounded reclamation/orphan cleanup, strict correction,
+same-key retry sequencing, and minimum
+persistent status/quiesce/resume/abort-drain/rebuild escape; automatic
+operation drain, witness rebind, and fresh reads remain later phases.
 
 ### Open-time recovery sweep
 

@@ -23,9 +23,9 @@ OmniGraph is **not** a single Lance dataset; it is a *graph* of datasets coordin
   - `__manifest/` — the catalog of all sub-tables and their published versions, **and** the graph commit lineage (RFC-013 Phase 7: `graph_commit` / `graph_head` rows). Graph-level branches are Lance branches on these datasets.
   - `_graph_commit_recoveries.lance` — the crash-recovery audit log (one row per recovery action; see below). The former `_graph_commits.lance` / `_graph_commit_actors.lance` lineage tables are **retired**: lineage lives in `__manifest`, so a graph this binary creates has neither.
 - **Manifest row schema** (`object_id, object_type, location, metadata, base_objects, table_key, stable_table_id, table_incarnation_id, table_version, table_branch, row_count`):
-  - `object_type` ∈ `table | table_version | table_tombstone | graph_commit | graph_head`
-  - `table_key` ∈ `node:<TypeName> | edge:<EdgeName>` (empty for `graph_commit` / `graph_head` lineage rows)
-  - `(stable_table_id, table_incarnation_id)` is the immutable table coordinate; both fields are nonzero on table rows and null on lineage rows. `table_key` is the current human-readable alias and may change on rename.
+  - `object_type` ∈ `table | table_version | table_tombstone | graph_commit | graph_head | stream_state`
+  - `table_key` ∈ `node:<TypeName> | edge:<EdgeName>` (empty for `graph_commit` / `graph_head` lineage rows). On `stream_state` it is diagnostic only; identity and binding come from the stable pair and metadata payload.
+  - `(stable_table_id, table_incarnation_id)` is the immutable table coordinate; both fields are nonzero on table and `stream_state` rows and null on lineage rows. `table_key` is the current human-readable alias and may change on rename.
   - `table_branch` is `null` for the main lineage and the branch name otherwise
   - **Graph lineage rows** (RFC-013 Phase 7): one immutable `graph_commit` row per commit (`object_id` = the commit ULID; `metadata` JSON carries parent / merged-parent / actor / timestamp) plus one mutable `graph_head:<branch>` pointer per branch (`graph_head:main` for main). The in-memory commit DAG is a projection of these rows.
 - **Snapshot reconstruction**: latest visible `table_version` per stable table ID + incarnation minus tombstones scoped to that same pair, joined to the pair's current registration for its alias and path. Two live pairs cannot expose the same alias. A drop/re-add therefore starts an independent version sequence and cannot be hidden by the old lifetime's tombstone.
@@ -44,7 +44,7 @@ The on-disk shape of `__manifest` is reconciled with the binary via a single ver
 - The stamp is read with no object-store writes, so the check is safe under a read-only open. Operators can see a graph's stamp with `omnigraph snapshot` and the binary's served version with `omnigraph version` (the `internal-schema` line).
 
 The stamp values below are historical; this binary serves only the current one
-(`v6`). An earlier-stamped graph is rebuilt via export/import, not migrated in
+(`v7`). An earlier-stamped graph is rebuilt via export/import, not migrated in
 place.
 
 | Stamp | Shape |
@@ -54,7 +54,8 @@ place.
 | v3 | Legacy `__run__*` staging branches (pre-v0.4.0 Run state machine) swept off `__manifest`. |
 | v4 | Graph lineage folded into `__manifest` as `graph_commit` / `graph_head` rows (RFC-013 Phase 7); the `_graph_commits.lance` / `_graph_commit_actors.lance` tables retired. |
 | v5 | RFC-028 SchemaIR v2 plus graph-domain stable schema IDs; manifest table rows, OCC, recovery ownership, and physical paths keyed by stable table ID + incarnation. |
-| v6 | Preserves v5 identity and activates RFC-023: every graph node/edge dataset has exact non-null physical `id` as Lance's unenforced PK, and every production strict insert/upsert uses the exact-`id` filter-bearing adapter. **The only version this binary serves.** |
+| v6 | Preserves v5 identity and activates RFC-023: every graph node/edge dataset has exact non-null physical `id` as Lance's unenforced PK, and every production strict insert/upsert uses the exact-`id` filter-bearing adapter. |
+| v7 | Preserves v5/v6 identity and keyed-write contracts, and adds RFC-026 identity-keyed `stream_state` authority: physical enrollment binding, mutable current-HEAD witness, lifecycle, and per-shard epoch floor. Phase A can recover one exact empty private enrollment; no production row-streaming API is active. **The only version this binary serves.** |
 
 ## On-disk layout
 

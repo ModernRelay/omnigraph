@@ -55,8 +55,8 @@ Every crash window consequently over-retains. None under-retains.
 
 Retention is an irreversible storage-format capability, so its substrate and
 access-shape claims are proved before any production activation work starts.
-Throughout Gate 0, production remains on internal schema v6: `CURRENT` and
-`MIN_SUPPORTED` do not move, fresh graphs gain no checkpoint or GC-boundary
+Throughout Gate 0, production remained on internal schema v6: `CURRENT` and
+`MIN_SUPPORTED` did not move, fresh graphs gained no checkpoint or GC-boundary
 rows, and no production path creates an `ogcp_` tag. Gate 0 may add only
 decision fixtures, substrate guards, and their recorded measurements.
 
@@ -87,8 +87,10 @@ shape.** The Lance tag/cleanup substrate guards pass, but §9's decision-scale
 local matrix shows history-sensitive compacted scan bytes and an additional
 scan operation at depth 1,000. One required physical-I/O cell failing is
 sufficient to block activation; the unrun S3/RustFS cost cell is not needed to
-turn that result into a pass or a stronger claim. Internal schema v6 remains
-authoritative. This result rejects the proposed access shape, not checkpoint
+turn that result into a pass or a stronger claim. At evaluation time internal
+schema v6 remained authoritative. RFC-026 Phase A subsequently activated v7,
+which likewise adds no checkpoint rows, tags, API, or cleanup integration. This
+result rejects the proposed access shape, not checkpoint
 rows as logical authority or Lance tags as physical pins. A successor needs a
 history-flat current-authority lookup shape or a revised evidence-backed
 operational contract, without weakening the gate or adding a second authority
@@ -516,7 +518,7 @@ introduced here.
 ## 8. Format activation and rebuild compatibility
 
 Gate 0 was production-neutral and returned a no-go for the surveyed access
-shape. The shipped format therefore remains internal schema v6 and none of the
+shape. The current shipped format is now internal schema v7, but none of the
 activation or rebuild behavior below exists. The remainder of this section is
 the contingent format contract for a successor that first clears the same
 physical-I/O boundary; the Gate 0 result itself authorizes no implementation or
@@ -565,8 +567,8 @@ format must include, in one releasable slice, its row initialization and
 strict-rebuild/refusal boundary plus functional engine create, list, show, and
 delete, the retention claim, exact tag verification, recovery, and pin
 reconciliation. Development-only pieces may land behind test-only seams before
-that slice, but production must stay on v6 until the minimum usable contract is
-complete.
+that slice, but production must stay on its then-current non-retention format
+(currently v7) until the minimum usable contract is complete.
 
 ## 9. Observability and bounds
 
@@ -625,8 +627,9 @@ Separately, all 23 Lance surface guards pass on RC.1. The RFC-025 cells prove ex
 main and named-branch tag targets, sparse cleanup pin/unpin behavior, and that
 a tag does not protect the named branch tree. These results validate the
 physical-pin architecture but cannot compensate for the failed registry-access
-gate. Production remains on schema v6 until a successor access shape or revised
-operational contract passes the full boundary.
+gate. Production remains on current schema v7 without retention until a
+successor access shape or revised operational contract passes the full
+boundary.
 
 ## 10. Acceptance gates
 
@@ -679,7 +682,7 @@ operational contract passes the full boundary.
 
 | Phase | Content | Gate |
 |---|---|---|
-| Gate 0 — pre-activation decision | production-neutral tag/cleanup semantics, physical-ref ABA, retention-claim, and checkpoint-registry physical-I/O instruments | **No-go (2026-07-17):** tags pass; compacted local registry scan bytes grow at 10→1,000 and scan operations add one boundary. S3 cost cell not run. Production remains schema v6 |
+| Gate 0 — pre-activation decision | production-neutral tag/cleanup semantics, physical-ref ABA, retention-claim, and checkpoint-registry physical-I/O instruments | **No-go (2026-07-17):** tags pass; compacted local registry scan bytes grow at 10→1,000 and scan operations add one boundary. S3 cost cell not run. Schema v6 remained unchanged at the gate; current v7 also ships no retention state |
 | A — minimum usable activation | row schemas and engine DTOs; deterministic V1 name/tag encoding; retention claim; create/list/show/delete; create sidecar, delete-operation marker, pin reconciler; strict-format/refusal/rebuild activation | **Blocked on a successor Gate 0 access shape or revised evidence-backed operational contract.** Then: schema and deterministic encoding vectors; old/new refusal; complete crash matrix; sparse-pin correctness; no inert format stamp |
 | B — destructive retention | offline cleanup integration and GC-boundary enforcement | blocked with A; then quiescence/refusal tests, complete root proof, and cost budgets |
 | C — operator surface | CLI, policy, audit, observability, docs, and rebuild runbook | blocked with A; then CLI outputs, policy parity, and genuine upgrade test |
