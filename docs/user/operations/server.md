@@ -52,6 +52,7 @@ graph id from the cluster's applied revision:
 | GET | `/healthz` | none | — |
 | GET | `/openapi.json` | none | — (strips security if auth disabled; emits the nested cluster paths with `cluster_` operation-id prefix) |
 | GET | `/graphs/{id}/snapshot?branch=` | bearer + `read` | snapshot of branch |
+| GET/HEAD | `/graphs/{id}/blob?type=&id=&prop=&branch=` | bearer + `read` | stream one row's Blob property (see "Blob content" below) |
 | POST | `/graphs/{id}/query` | bearer + `read` | inline read query (canonical; clean field names `query`/`name`; mutations → 400) |
 | POST | `/graphs/{id}/read` | bearer + `read` | **deprecated** alias of `/query` (legacy field names `query_source`/`query_name`, byte-stable response; carries `Deprecation: true` + `Link: <query>; rel="successor-version"`) |
 | POST | `/graphs/{id}/export` | bearer + `export` | NDJSON stream |
@@ -158,7 +159,38 @@ the request body and response handling alone.
 
 ## Streaming
 
-Only `/export` streams (`application/x-ndjson`, MPSC channel + `Body::from_stream`). Everything else is buffered JSON.
+`/export` streams (`application/x-ndjson`, MPSC channel + `Body::from_stream`)
+and `/blob` streams binary content (below). Everything else is buffered JSON.
+
+### Blob content (`GET`/`HEAD /graphs/{id}/blob`)
+
+`?type=<NodeType>&id=<key>&prop=<blob property>[&branch=<branch>]` resolves one
+row's `Blob` cell at one pinned snapshot of `branch` (default `main`) and
+streams it in bounded chunks — memory per response is constant regardless of
+blob size. Contract:
+
+- **Internal blobs** answer `200` with exact `Content-Length`,
+  `Accept-Ranges: bytes`, and a strong `ETag` derived from the cell's stable
+  identity (survives type renames; changes on any rewrite of the row's table
+  version). `If-None-Match` answers `304`.
+- **Range requests**: one `Range: bytes=` range per request (`start-end`,
+  `start-`, `-suffix`) answers `206` with `Content-Range`; an unsatisfiable
+  range answers `416` with `Content-Range: bytes */<size>`. Multi-range
+  requests are deliberately unsupported and answered with the full body.
+  `If-Range` (ETag form) is honored.
+- **External-URI blobs** (loaded as `s3://…`/`file://…` references) answer
+  `302 Found` with the stored absolute URI in `Location` for both `GET` and
+  `HEAD`. The server never resolves, proxies, or validates the external
+  location at read time — the reference itself is the answer. External blob
+  *sizes* are recorded once at load time (the load fails loudly if the
+  referenced object is unreadable at ingest).
+- **`Content-Type`** is sniffed from at most the first 512 bytes (`HEAD` and
+  `GET` sniff identically, so their headers agree) and falls back to
+  `application/octet-stream`. Lance stores no media type; treat the sniff as
+  presentation, not contract.
+- **Errors**: unknown type, unknown id, and a null blob cell are `404`; a
+  non-Blob property is `400`. Read-only and not admission-gated, like every
+  read endpoint.
 
 ## Error model
 

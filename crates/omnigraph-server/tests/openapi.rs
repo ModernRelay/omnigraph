@@ -167,6 +167,7 @@ const EXPECTED_PATHS: &[&str] = &[
     "/healthz",
     "/graphs",
     "/graphs/{graph_id}/snapshot",
+    "/graphs/{graph_id}/blob",
     "/graphs/{graph_id}/read",
     "/graphs/{graph_id}/query",
     "/graphs/{graph_id}/export",
@@ -795,6 +796,7 @@ fn protected_endpoints_reference_bearer_token_security() {
         ("/graphs/{graph_id}/load", "post"),
         ("/graphs/{graph_id}/ingest", "post"),
         ("/graphs/{graph_id}/export", "post"),
+        ("/graphs/{graph_id}/blob", "get"),
         ("/graphs/{graph_id}/snapshot", "get"),
         ("/graphs/{graph_id}/branches", "get"),
         ("/graphs/{graph_id}/branches", "post"),
@@ -1243,6 +1245,7 @@ fn openapi_spec_is_up_to_date() {
 
 const EXPECTED_CLUSTER_PATHS: &[&str] = &[
     "/graphs/{graph_id}/snapshot",
+    "/graphs/{graph_id}/blob",
     "/graphs/{graph_id}/read",
     "/graphs/{graph_id}/export",
     "/graphs/{graph_id}/change",
@@ -1317,6 +1320,7 @@ async fn multi_mode_openapi_drops_flat_protected_paths() {
     // None of the legacy flat protected paths should appear in multi mode.
     let flat_protected = [
         "/snapshot",
+        "/blob",
         "/read",
         "/export",
         "/change",
@@ -1512,6 +1516,7 @@ async fn served_spec_always_nests_under_cluster_prefix() {
     // cluster surface plus the always-flat `/healthz` and `/graphs`.
     let flat_protected = [
         "/snapshot",
+        "/blob",
         "/read",
         "/query",
         "/export",

@@ -1752,3 +1752,228 @@ async fn ingest_per_actor_admission_cap_returns_429() {
         );
     }
 }
+
+// ─── Blob content endpoint ───────────────────────────────────────────────────
+
+const BLOB_ROUTE_SCHEMA: &str = r#"
+node Document {
+    title: String @key
+    content: Blob?
+}
+"#;
+
+/// Boot an app over a blob graph: one inline "Hello World" row plus one
+/// external file:// reference row (the referenced file is deleted after
+/// loading, so any server-side resolution of the external location fails
+/// loudly in the tests below).
+async fn blob_app() -> (tempfile::TempDir, axum::Router) {
+    let external_dir = tempfile::tempdir().unwrap();
+    let external_path = external_dir.path().join("external.bin");
+    fs::write(&external_path, b"external-bytes").unwrap();
+    let data = format!(
+        "{}\n{}",
+        r#"{"type": "Document", "data": {"title": "readme", "content": "base64:SGVsbG8gV29ybGQ="}}"#,
+        format!(
+            r#"{{"type": "Document", "data": {{"title": "ext", "content": "file://{}"}}}}"#,
+            external_path.display()
+        ),
+    );
+    let temp = init_graph_with_schema_and_data(BLOB_ROUTE_SCHEMA, &data).await;
+    // Classification must come from the descriptor alone: with the external
+    // object gone, only a descriptor-first read path can still answer.
+    drop(external_dir);
+    let graph = graph_path(temp.path());
+    let state = AppState::open(graph.to_string_lossy().to_string())
+        .await
+        .unwrap();
+    (temp, build_app(state))
+}
+
+async fn blob_get(app: &axum::Router, uri: &str, extra: &[(&str, &str)]) -> axum::response::Response {
+    let mut builder = Request::builder().uri(g(uri)).method(Method::GET);
+    for (name, value) in extra {
+        builder = builder.header(*name, *value);
+    }
+    app.clone()
+        .oneshot(builder.body(Body::empty()).unwrap())
+        .await
+        .unwrap()
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn blob_route_streams_full_content_with_headers() {
+    let (_temp, app) = blob_app().await;
+    let response = blob_get(&app, "/blob?type=Document&id=readme&prop=content", &[]).await;
+    assert_eq!(response.status(), StatusCode::OK);
+    let headers = response.headers().clone();
+    assert_eq!(headers.get("content-length").unwrap(), "11");
+    assert_eq!(headers.get("accept-ranges").unwrap(), "bytes");
+    assert_eq!(
+        headers.get("content-type").unwrap(),
+        "application/octet-stream"
+    );
+    let etag = headers.get("etag").unwrap().to_str().unwrap().to_string();
+    assert!(etag.starts_with('"') && etag.ends_with('"'), "strong quoted ETag");
+    let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+    assert_eq!(&body[..], b"Hello World");
+
+    // Same-cell repeat serves the same validator.
+    let repeat = blob_get(&app, "/blob?type=Document&id=readme&prop=content", &[]).await;
+    assert_eq!(repeat.headers().get("etag").unwrap().to_str().unwrap(), etag);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn blob_route_serves_single_ranges_and_rejects_unsatisfiable() {
+    let (_temp, app) = blob_app().await;
+
+    let response = blob_get(
+        &app,
+        "/blob?type=Document&id=readme&prop=content",
+        &[("range", "bytes=6-10")],
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::PARTIAL_CONTENT);
+    assert_eq!(
+        response.headers().get("content-range").unwrap(),
+        "bytes 6-10/11"
+    );
+    assert_eq!(response.headers().get("content-length").unwrap(), "5");
+    let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+    assert_eq!(&body[..], b"World");
+
+    // Suffix range: last five bytes.
+    let response = blob_get(
+        &app,
+        "/blob?type=Document&id=readme&prop=content",
+        &[("range", "bytes=-5")],
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::PARTIAL_CONTENT);
+    let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+    assert_eq!(&body[..], b"World");
+
+    // Open-ended range clamps to the end.
+    let response = blob_get(
+        &app,
+        "/blob?type=Document&id=readme&prop=content",
+        &[("range", "bytes=6-")],
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::PARTIAL_CONTENT);
+    let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+    assert_eq!(&body[..], b"World");
+
+    // Start past the end is unsatisfiable, reporting the total size.
+    let response = blob_get(
+        &app,
+        "/blob?type=Document&id=readme&prop=content",
+        &[("range", "bytes=99-")],
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::RANGE_NOT_SATISFIABLE);
+    assert_eq!(response.headers().get("content-range").unwrap(), "bytes */11");
+
+    // Multi-range is unsupported by documented contract: full body.
+    let response = blob_get(
+        &app,
+        "/blob?type=Document&id=readme&prop=content",
+        &[("range", "bytes=0-1,3-4")],
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+    assert_eq!(&body[..], b"Hello World");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn blob_route_head_and_conditional_requests() {
+    let (_temp, app) = blob_app().await;
+
+    // HEAD: same headers as GET, no body.
+    let response = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri(g("/blob?type=Document&id=readme&prop=content"))
+                .method(Method::HEAD)
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(response.headers().get("content-length").unwrap(), "11");
+    assert_eq!(
+        response.headers().get("content-type").unwrap(),
+        "application/octet-stream"
+    );
+    let etag = response
+        .headers()
+        .get("etag")
+        .unwrap()
+        .to_str()
+        .unwrap()
+        .to_string();
+    let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+    assert!(body.is_empty(), "HEAD must carry no body");
+
+    // If-None-Match with the served validator → 304.
+    let response = blob_get(
+        &app,
+        "/blob?type=Document&id=readme&prop=content",
+        &[("if-none-match", etag.as_str())],
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::NOT_MODIFIED);
+
+    // If-Range mismatch → the Range header is ignored, full 200.
+    let response = blob_get(
+        &app,
+        "/blob?type=Document&id=readme&prop=content",
+        &[("range", "bytes=6-10"), ("if-range", "\"stale\"")],
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+    assert_eq!(&body[..], b"Hello World");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn blob_route_external_reference_redirects_without_resolution() {
+    let (_temp, app) = blob_app().await;
+    // The referenced file was deleted after load — a redirect can only come
+    // from descriptor-first classification, never from resolving the store.
+    for method in [Method::GET, Method::HEAD] {
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri(g("/blob?type=Document&id=ext&prop=content"))
+                    .method(method.clone())
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::FOUND, "{method} must redirect");
+        let location = response.headers().get("location").unwrap().to_str().unwrap();
+        assert!(
+            location.starts_with("file://"),
+            "Location must carry the stored absolute URI, got {location}"
+        );
+    }
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn blob_route_error_taxonomy() {
+    let (_temp, app) = blob_app().await;
+
+    let response = blob_get(&app, "/blob?type=Document&id=absent&prop=content", &[]).await;
+    assert_eq!(response.status(), StatusCode::NOT_FOUND);
+
+    let response = blob_get(&app, "/blob?type=Nope&id=readme&prop=content", &[]).await;
+    assert_eq!(response.status(), StatusCode::NOT_FOUND);
+
+    let response = blob_get(&app, "/blob?type=Document&id=readme&prop=title", &[]).await;
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+}

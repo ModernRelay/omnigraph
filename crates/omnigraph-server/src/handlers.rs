@@ -643,6 +643,270 @@ pub(crate) async fn server_export(
         .into_response())
 }
 
+/// Streaming chunk size for blob bodies. Memory per in-flight response is
+/// bounded by this constant regardless of blob size.
+const BLOB_STREAM_CHUNK_BYTES: u64 = 4 * 1024 * 1024;
+/// Bytes read for content-type sniffing (HEAD and GET alike, so their
+/// headers agree).
+const BLOB_SNIFF_BYTES: u64 = 512;
+
+/// Strong ETag for one blob cell: an opaque digest of the identity tuple
+/// `(stable_table_id, incarnation_id, table_version, row_id, property)`.
+/// The stable-identity pair (not the mutable `table_key`) makes the tag
+/// rename-stable and drop/re-add ABA-safe (invariant 8).
+fn blob_etag(tag: &omnigraph::db::BlobVersionTag, property: &str) -> String {
+    let mut hasher = Sha256::new();
+    hasher.update(tag.stable_table_id.to_le_bytes());
+    hasher.update(tag.table_incarnation_id.to_le_bytes());
+    hasher.update(tag.table_version.to_le_bytes());
+    hasher.update(tag.row_id.to_le_bytes());
+    hasher.update(property.as_bytes());
+    let digest = hasher.finalize();
+    let mut tag = String::with_capacity(34);
+    tag.push('"');
+    for byte in &digest[..16] {
+        tag.push_str(&format!("{byte:02x}"));
+    }
+    tag.push('"');
+    tag
+}
+
+/// Outcome of parsing a `Range` header against a known total size.
+enum BlobRangeOutcome {
+    /// No header, a syntactically invalid header, or a multi-range request
+    /// (unsupported by documented contract) — serve the full body.
+    Full,
+    /// One satisfiable range, half-open `[start, end)`.
+    Partial { start: u64, end: u64 },
+    /// A syntactically valid single range that cannot be satisfied — 416.
+    Unsatisfiable,
+}
+
+/// Parse a single-range `bytes=` header per RFC 9110 §14. Multi-range
+/// requests are deliberately ignored (full response) — single-range only is
+/// the documented contract.
+fn parse_blob_range(header: Option<&HeaderValue>, total: u64) -> BlobRangeOutcome {
+    let Some(raw) = header.and_then(|value| value.to_str().ok()) else {
+        return BlobRangeOutcome::Full;
+    };
+    let Some(spec) = raw.strip_prefix("bytes=") else {
+        return BlobRangeOutcome::Full;
+    };
+    if spec.contains(',') {
+        return BlobRangeOutcome::Full;
+    }
+    let spec = spec.trim();
+    if let Some(suffix) = spec.strip_prefix('-') {
+        // Suffix range: last N bytes.
+        let Ok(n) = suffix.parse::<u64>() else {
+            return BlobRangeOutcome::Full;
+        };
+        if n == 0 || total == 0 {
+            return BlobRangeOutcome::Unsatisfiable;
+        }
+        return BlobRangeOutcome::Partial {
+            start: total.saturating_sub(n),
+            end: total,
+        };
+    }
+    let (start_str, end_str) = match spec.split_once('-') {
+        Some(parts) => parts,
+        None => return BlobRangeOutcome::Full,
+    };
+    let Ok(start) = start_str.parse::<u64>() else {
+        return BlobRangeOutcome::Full;
+    };
+    if start >= total {
+        return BlobRangeOutcome::Unsatisfiable;
+    }
+    if end_str.is_empty() {
+        return BlobRangeOutcome::Partial { start, end: total };
+    }
+    let Ok(end_inclusive) = end_str.parse::<u64>() else {
+        return BlobRangeOutcome::Full;
+    };
+    if end_inclusive < start {
+        return BlobRangeOutcome::Full;
+    }
+    BlobRangeOutcome::Partial {
+        start,
+        end: end_inclusive.saturating_add(1).min(total),
+    }
+}
+
+/// Minimal magic-byte content-type sniffer for common media types; falls
+/// back to `application/octet-stream`. Deliberately small and local — Lance
+/// stores no MIME anywhere, so media type is a best-effort presentation
+/// concern, never contract.
+fn sniff_blob_content_type(head: &[u8]) -> &'static str {
+    match head {
+        [0x89, b'P', b'N', b'G', 0x0D, 0x0A, 0x1A, 0x0A, ..] => "image/png",
+        [0xFF, 0xD8, 0xFF, ..] => "image/jpeg",
+        [b'G', b'I', b'F', b'8', ..] => "image/gif",
+        [b'R', b'I', b'F', b'F', _, _, _, _, b'W', b'E', b'B', b'P', ..] => "image/webp",
+        [b'%', b'P', b'D', b'F', ..] => "application/pdf",
+        [0x50, 0x4B, 0x03, 0x04, ..] | [0x50, 0x4B, 0x05, 0x06, ..] => "application/zip",
+        [0x1F, 0x8B, ..] => "application/gzip",
+        [0x1A, 0x45, 0xDF, 0xA3, ..] => "video/webm",
+        [_, _, _, _, b'f', b't', b'y', b'p', ..] => "video/mp4",
+        _ => "application/octet-stream",
+    }
+}
+
+#[utoipa::path(
+    get,
+    path = "/blob",
+    tag = "data",
+    operation_id = "getBlob",
+    params(BlobQuery),
+    responses(
+        (status = 200, description = "Full blob content", content_type = "application/octet-stream"),
+        (status = 206, description = "Requested byte range (single `Range: bytes=` range; multi-range is unsupported and answered with the full body)", content_type = "application/octet-stream"),
+        (status = 302, description = "External blob reference; `Location` carries the stored absolute URI. The server never resolves or proxies the external location."),
+        (status = 304, description = "Not modified (`If-None-Match` matched the ETag)"),
+        (status = 400, description = "Property is not a Blob", body = ErrorOutput),
+        (status = 401, description = "Unauthorized", body = ErrorOutput),
+        (status = 403, description = "Forbidden", body = ErrorOutput),
+        (status = 404, description = "Unknown type, unknown id, or null blob cell", body = ErrorOutput),
+        (status = 416, description = "Requested range not satisfiable; `Content-Range` reports the total size"),
+    ),
+    security(("bearer_token" = [])),
+)]
+/// Stream one row's Blob property.
+///
+/// Resolves the cell at one pinned snapshot of `branch` (default `main`).
+/// Internal blobs stream with `Content-Length`, `Accept-Ranges: bytes`, a
+/// strong identity-derived `ETag`, and single-range `206` support; external
+/// URI references answer `302 Found` without server-side resolution. `HEAD`
+/// returns the same headers with no body (content-type sniffing reads at
+/// most 512 bytes on both methods so the headers agree). Read-only; not
+/// admission-gated.
+pub(crate) async fn server_blob_get(
+    Extension(handle): Extension<Arc<GraphHandle>>,
+    actor: Option<Extension<ResolvedActor>>,
+    method: Method,
+    headers: HeaderMap,
+    Query(query): Query<BlobQuery>,
+) -> std::result::Result<Response, ApiError> {
+    authorize_request(
+        actor.as_ref().map(|Extension(actor)| actor),
+        handle.policy.as_deref(),
+        PolicyRequest {
+            action: PolicyAction::Read,
+            branch: query.branch.clone(),
+            target_branch: None,
+        },
+    )?;
+    let branch = query.branch.as_deref().unwrap_or("main");
+    let blob = handle
+        .engine
+        .read_blob_at(branch, &query.type_name, &query.id, &query.prop)
+        .await
+        .map_err(ApiError::from_omni)?;
+
+    let reader = match blob.content {
+        omnigraph::db::BlobContent::ExternalRef { uri } => {
+            // GET and HEAD both redirect. The engine classified from the
+            // descriptor alone, so an unreachable external location still
+            // redirects — the client owns the fetch.
+            let location = HeaderValue::from_str(&uri).map_err(|_| {
+                ApiError::internal(format!(
+                    "stored external blob URI is not a valid header value: {uri}"
+                ))
+            })?;
+            return Ok((StatusCode::FOUND, [(LOCATION, location)]).into_response());
+        }
+        omnigraph::db::BlobContent::Streamed(reader) => reader,
+    };
+
+    let total = reader.size();
+    let etag = blob_etag(&blob.version_tag, &query.prop);
+    if headers
+        .get(IF_NONE_MATCH)
+        .and_then(|value| value.to_str().ok())
+        .is_some_and(|value| value.trim() == etag || value.trim() == "*")
+    {
+        return Ok((
+            StatusCode::NOT_MODIFIED,
+            [(ETAG, HeaderValue::from_str(&etag).expect("hex etag"))],
+        )
+            .into_response());
+    }
+
+    // `If-Range`: honor the Range header only when the validator still
+    // matches; otherwise serve the full current representation.
+    let range_applicable = match headers.get(IF_RANGE).and_then(|value| value.to_str().ok()) {
+        Some(validator) => validator.trim() == etag,
+        None => true,
+    };
+    let (status, start, end) = if range_applicable {
+        match parse_blob_range(headers.get(RANGE), total) {
+            BlobRangeOutcome::Full => (StatusCode::OK, 0, total),
+            BlobRangeOutcome::Partial { start, end } => (StatusCode::PARTIAL_CONTENT, start, end),
+            BlobRangeOutcome::Unsatisfiable => {
+                return Ok((
+                    StatusCode::RANGE_NOT_SATISFIABLE,
+                    [(
+                        CONTENT_RANGE,
+                        HeaderValue::from_str(&format!("bytes */{total}")).expect("ascii"),
+                    )],
+                )
+                    .into_response());
+            }
+        }
+    } else {
+        (StatusCode::OK, 0, total)
+    };
+
+    // One bounded prefix read for sniffing, shared by HEAD and GET.
+    let sniff_len = total.min(BLOB_SNIFF_BYTES);
+    let content_type = if sniff_len > 0 {
+        let head = reader
+            .read_range(0..sniff_len)
+            .await
+            .map_err(ApiError::from_omni)?;
+        sniff_blob_content_type(&head)
+    } else {
+        "application/octet-stream"
+    };
+
+    let mut response_headers = HeaderMap::new();
+    response_headers.insert(CONTENT_TYPE, HeaderValue::from_static(content_type));
+    response_headers.insert(ACCEPT_RANGES, HeaderValue::from_static("bytes"));
+    response_headers.insert(ETAG, HeaderValue::from_str(&etag).expect("hex etag"));
+    response_headers.insert(
+        CONTENT_LENGTH,
+        HeaderValue::from_str(&(end - start).to_string()).expect("ascii"),
+    );
+    if status == StatusCode::PARTIAL_CONTENT {
+        response_headers.insert(
+            CONTENT_RANGE,
+            HeaderValue::from_str(&format!("bytes {}-{}/{}", start, end - 1, total))
+                .expect("ascii"),
+        );
+    }
+
+    if method == Method::HEAD {
+        return Ok((status, response_headers).into_response());
+    }
+
+    let body = Body::from_stream(stream::try_unfold(
+        (reader, start),
+        move |(reader, position)| async move {
+            if position >= end {
+                return Ok(None);
+            }
+            let chunk_end = position.saturating_add(BLOB_STREAM_CHUNK_BYTES).min(end);
+            let chunk = reader
+                .read_range(position..chunk_end)
+                .await
+                .map_err(|err| io::Error::other(err.to_string()))?;
+            Ok::<_, io::Error>(Some((chunk, (reader, chunk_end))))
+        },
+    ));
+    Ok((status, response_headers, body).into_response())
+}
+
 /// Shared implementation behind `POST /mutate` (canonical) and
 /// `POST /change` (deprecated alias). Returns the bare `ChangeOutput`;
 /// each route handler wraps it (the alias also attaches Deprecation
