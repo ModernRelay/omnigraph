@@ -1926,6 +1926,36 @@ async fn blob_route_head_and_conditional_requests() {
     .await;
     assert_eq!(response.status(), StatusCode::NOT_MODIFIED);
 
+    // RFC 9110: the header is a comma-separated list with weak comparison —
+    // the current tag inside a list, or in weak form, still answers 304.
+    let listed = format!("\"stale\", {etag}");
+    let response = blob_get(
+        &app,
+        "/blob?type=Document&id=readme&prop=content",
+        &[("if-none-match", listed.as_str())],
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::NOT_MODIFIED);
+    let weak = format!("W/{etag}");
+    let response = blob_get(
+        &app,
+        "/blob?type=Document&id=readme&prop=content",
+        &[("if-none-match", weak.as_str())],
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::NOT_MODIFIED);
+    let response = blob_get(
+        &app,
+        "/blob?type=Document&id=readme&prop=content",
+        &[("if-none-match", "\"stale\", W/\"other\"")],
+    )
+    .await;
+    assert_eq!(
+        response.status(),
+        StatusCode::OK,
+        "a list without the current tag must still stream"
+    );
+
     // If-Range mismatch → the Range header is ignored, full 200.
     let response = blob_get(
         &app,

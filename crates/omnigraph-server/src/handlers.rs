@@ -650,6 +650,26 @@ const BLOB_STREAM_CHUNK_BYTES: u64 = 4 * 1024 * 1024;
 /// headers agree).
 const BLOB_SNIFF_BYTES: u64 = 512;
 
+/// RFC 9110 §13.1.2 `If-None-Match` evaluation against one strong ETag:
+/// the header is `*` or a comma-separated entity-tag list, and comparison
+/// is weak — `W/"x"` matches `"x"`. Splitting on commas is exact for the
+/// hex tags this server mints and for any entity-tag without an embedded
+/// comma (quoted commas are legal but pathological; a non-match there only
+/// costs a full 200, never a wrong 304). `If-Range` deliberately does NOT
+/// use this: RFC 9110 §13.1.5 requires a single validator compared
+/// strongly.
+fn if_none_match_matches(header: &str, etag: &str) -> bool {
+    let header = header.trim();
+    if header == "*" {
+        return true;
+    }
+    header.split(',').any(|candidate| {
+        let candidate = candidate.trim();
+        let candidate = candidate.strip_prefix("W/").unwrap_or(candidate);
+        candidate == etag
+    })
+}
+
 /// Outcome of parsing a `Range` header against a known total size.
 enum BlobRangeOutcome {
     /// No header, a syntactically invalid header, or a multi-range request
@@ -822,7 +842,7 @@ pub(crate) async fn server_blob_get(
     if headers
         .get(IF_NONE_MATCH)
         .and_then(|value| value.to_str().ok())
-        .is_some_and(|value| value.trim() == etag || value.trim() == "*")
+        .is_some_and(|value| if_none_match_matches(value, &etag))
     {
         return Ok((
             StatusCode::NOT_MODIFIED,
