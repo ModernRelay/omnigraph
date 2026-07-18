@@ -1801,12 +1801,15 @@ async fn blob_load_external_file_uri() {
             panic!("external URI blob must classify as ExternalRef")
         }
     }
-    // Ingest recorded the object size into the descriptor (one write-time
-    // HEAD), so reads are descriptor-complete: no external I/O for size.
+    // The descriptor deliberately records no size for an external reference:
+    // injecting position/size children into the logical blob input changes
+    // the batch schema, which create/overwrite persist as the table's blob
+    // shape — and a divergent shape breaks every later keyed write (see
+    // keyed_writes_survive_committed_external_blob_reference). The facade
+    // maps Lance's BlobRange{0,0} "size unknown" encoding to None.
     assert_eq!(
-        blob.size,
-        Some(b"Hello from file".len() as u64),
-        "external blob size must be recorded at ingest"
+        blob.size, None,
+        "external blob size is unknown by design (no schema-perturbing annotation)"
     );
 
     // The classification proof: delete the referenced file, and the

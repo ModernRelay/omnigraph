@@ -1,7 +1,7 @@
 use arrow_array::{
     Array, ArrayRef, LargeBinaryArray, RecordBatch, StringArray, StructArray, UInt64Array,
 };
-use arrow_schema::{DataType, Field, FieldRef, Schema, SchemaRef};
+use arrow_schema::SchemaRef;
 use datafusion::physical_plan::{SendableRecordBatchStream, stream::RecordBatchStreamAdapter};
 use futures::TryStreamExt;
 use lance::Dataset;
@@ -2257,7 +2257,7 @@ impl TableStore {
     /// version 1. The transaction UUID can therefore be bound to a recovery
     /// identity before that first visible effect.
     pub async fn stage_create(&self, dataset_uri: &str, batch: RecordBatch) -> Result<StagedWrite> {
-        let batch = annotate_external_blob_sizes(batch).await?;
+        validate_external_blob_references(&batch).await?;
         let params = WriteParams {
             mode: WriteMode::Create,
             enable_stable_row_ids: true,
@@ -2304,7 +2304,7 @@ impl TableStore {
     /// MR-793 Phase 2: introduces this for the schema_apply rewrite path.
     /// Lance API verified in `.context/mr-793-design.md` Appendix A.1.
     pub async fn stage_overwrite(&self, ds: &Dataset, batch: RecordBatch) -> Result<StagedWrite> {
-        let batch = annotate_external_blob_sizes(batch).await?;
+        validate_external_blob_references(&batch).await?;
         // `enable_stable_row_ids: true` is defensive — empirically Lance 6.0.1
         // preserves the source dataset's flag through `Operation::Overwrite`
         // when WriteParams omits it (pinned by
@@ -3417,44 +3417,35 @@ fn combine_committed_with_staged(ds: &Dataset, staged: &[StagedWrite]) -> Vec<Fr
     combined
 }
 
-/// Materialize logical external-URI blob cells before keyed merge-insert.
-///
-/// Lance's keyed builder currently has no `WriteParams` hook for allowing an
-/// absolute external reference. Size is resolved and charged before the read,
-/// and columns are processed sequentially under one aggregate payload budget.
-/// The returned arrays retain the target's logical blob schema, so Lance can
-/// still choose inline, packed, or dedicated physical storage normally.
-/// Record external blob sizes into the logical blob input at ingest.
+/// Validate external-URI blob cells at ingest on reference-retaining writes.
 ///
 /// The reference-retaining write paths (create/overwrite) keep external URIs
-/// as descriptors, and Lance records `BlobRange { 0, 0 }` when the input
-/// carries no explicit position/size — which makes every later `take_blobs`
-/// on that cell issue a remote HEAD against the external store just to learn
-/// its size. The size fact is knowable exactly once, at ingest, where a
-/// missing object should fail the load loudly anyway; record it then
-/// (`position: 0, size: <object size>`) so reads are descriptor-complete.
+/// as descriptors. An unreadable external object should fail the load loudly
+/// at ingest — the one moment the referencing write can still be refused —
+/// rather than deferring the failure to the first read. This probes each
+/// external URI once (a size call against the external store) and leaves the
+/// batch untouched.
 ///
-/// Rows with inline data, prepared descriptors (`kind` child present), or a
-/// caller-declared `position`/`size` pair pass through untouched; a batch
-/// with no external URI cell is returned unchanged.
-async fn annotate_external_blob_sizes(batch: RecordBatch) -> Result<RecordBatch> {
+/// It deliberately records NOTHING into the logical blob input: injecting
+/// position/size children changes the batch schema, and a create/overwrite
+/// persists that batch schema as the table's logical blob shape. A blob
+/// column whose persisted shape diverges from the canonical `{data, uri}`
+/// input knocks every later keyed write off Lance's v2 merge fast path
+/// (strict inserts lose the inserted-row key filter; upserts fall into the
+/// legacy merger, which cannot decode external-bearing blob fragments).
+/// External descriptors therefore keep Lance's `BlobRange { 0, 0 }`
+/// "size unknown" encoding, which the shared descriptor decoder already
+/// treats as unknown rather than authoritative.
+async fn validate_external_blob_references(batch: &RecordBatch) -> Result<()> {
     let schema = batch.schema();
-    let mut fields: Vec<FieldRef> = Vec::with_capacity(batch.num_columns());
-    let mut columns = Vec::with_capacity(batch.num_columns());
-    let mut changed = false;
     let registry = Arc::new(lance::io::ObjectStoreRegistry::default());
-
     for (field, column) in schema.fields().iter().zip(batch.columns()) {
         let lance_field = lance::datatypes::Field::try_from(field.as_ref())
             .map_err(|error| OmniError::Lance(error.to_string()))?;
         if !lance_field.is_blob() {
-            fields.push(field.clone());
-            columns.push(column.clone());
             continue;
         }
         let Some(descriptions) = column.as_any().downcast_ref::<StructArray>() else {
-            fields.push(field.clone());
-            columns.push(column.clone());
             continue;
         };
         // Prepared descriptors and caller-declared ranges are authoritative.
@@ -3462,32 +3453,18 @@ async fn annotate_external_blob_sizes(batch: RecordBatch) -> Result<RecordBatch>
             || descriptions.column_by_name("size").is_some()
             || descriptions.column_by_name("position").is_some()
         {
-            fields.push(field.clone());
-            columns.push(column.clone());
             continue;
         }
         let Some(uris) = descriptions
             .column_by_name("uri")
             .and_then(|array| array.as_any().downcast_ref::<StringArray>())
         else {
-            fields.push(field.clone());
-            columns.push(column.clone());
             continue;
         };
-        let external_rows: Vec<usize> = (0..descriptions.len())
-            .filter(|&row| {
-                descriptions.is_valid(row) && uris.is_valid(row) && !uris.value(row).is_empty()
-            })
-            .collect();
-        if external_rows.is_empty() {
-            fields.push(field.clone());
-            columns.push(column.clone());
-            continue;
-        }
-
-        let mut positions = vec![None::<u64>; descriptions.len()];
-        let mut sizes = vec![None::<u64>; descriptions.len()];
-        for row in external_rows {
+        for row in 0..descriptions.len() {
+            if !descriptions.is_valid(row) || !uris.is_valid(row) || uris.value(row).is_empty() {
+                continue;
+            }
             let uri = uris.value(row);
             let (store, path) = lance::io::ObjectStore::from_uri_and_params(
                 registry.clone(),
@@ -3496,48 +3473,23 @@ async fn annotate_external_blob_sizes(batch: RecordBatch) -> Result<RecordBatch>
             )
             .await
             .map_err(|error| OmniError::Lance(error.to_string()))?;
-            let object_size = store.size(&path).await.map_err(|error| {
+            store.size(&path).await.map_err(|error| {
                 OmniError::manifest(format!(
                     "external blob URI '{uri}' is not readable at ingest: {error}"
                 ))
             })?;
-            positions[row] = Some(0);
-            sizes[row] = Some(object_size);
         }
-
-        let mut struct_fields: Vec<FieldRef> = descriptions.fields().iter().cloned().collect();
-        let mut children: Vec<ArrayRef> = descriptions.columns().to_vec();
-        struct_fields.push(Arc::new(Field::new("position", DataType::UInt64, true)));
-        children.push(Arc::new(UInt64Array::from(positions)) as ArrayRef);
-        struct_fields.push(Arc::new(Field::new("size", DataType::UInt64, true)));
-        children.push(Arc::new(UInt64Array::from(sizes)) as ArrayRef);
-        let annotated = StructArray::new(
-            struct_fields.clone().into(),
-            children,
-            descriptions.nulls().cloned(),
-        );
-        let annotated_field = Field::new(
-            field.name(),
-            DataType::Struct(struct_fields.into()),
-            field.is_nullable(),
-        )
-        .with_metadata(field.metadata().clone());
-        fields.push(Arc::new(annotated_field));
-        columns.push(Arc::new(annotated) as ArrayRef);
-        changed = true;
     }
-
-    if !changed {
-        return Ok(batch);
-    }
-    let annotated_schema = Arc::new(Schema::new_with_metadata(
-        fields,
-        schema.metadata().clone(),
-    ));
-    RecordBatch::try_new(annotated_schema, columns)
-        .map_err(|error| OmniError::Lance(error.to_string()))
+    Ok(())
 }
 
+/// Materialize logical external-URI blob cells before keyed merge-insert.
+///
+/// Lance's keyed builder currently has no `WriteParams` hook for allowing an
+/// absolute external reference. Size is resolved and charged before the read,
+/// and columns are processed sequentially under one aggregate payload budget.
+/// The returned arrays retain the target's logical blob schema, so Lance can
+/// still choose inline, packed, or dedicated physical storage normally.
 async fn materialize_external_blob_inputs(
     batch: RecordBatch,
     max_payload_bytes: u64,
