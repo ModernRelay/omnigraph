@@ -10,9 +10,10 @@ owner: OmniGraph maintainers
 
 # RFC-026 — MemWAL streaming ingest
 
-**Status:** Draft / Gate E0 passed; Phase A pending; production inactive
+**Status:** Draft / Phase A foundation implemented; Phase B pending; public streaming inactive
 **Date:** 2026-07-10
 **Gate E0 evaluated:** 2026-07-18
+**Phase A foundation completed:** 2026-07-18
 **Author track:** Maintainer design series
 **Depends on:** [RFC-022](0022-unified-write-path.md)'s unified write and
 generic recovery-sidecar protocol, plus
@@ -86,12 +87,14 @@ profile is:
   graph writer, branch/schema operation, repair, index/optimize path, or cleanup
   that touches the table must refuse before effect or first drain the stream.
 
-Gate E0 added no manifest rows, sidecars, `@stream`, public APIs, WAL
-acknowledgements, or a format stamp. Internal schema v6 remains the only served
-production format. Its green result authorizes only the next implementation
-slice (enrollment recovery, writer exclusion, and lifecycle integration); it
-does not authorize durable stream admission. RFC-026 remains draft and
-production inactive until the later gates close.
+Gate E0 itself added no manifest rows, sidecars, `@stream`, public APIs, WAL
+acknowledgements, or a format stamp. The Phase A implementation authorized by
+that result has now activated internal schema v7 and the bounded production
+foundation described in §12.2: recoverable empty enrollment, durable lifecycle
+authority, process-local admission/exclusion, and strict format
+refusal/rebuild. It still exposes no production enrollment entry point and
+cannot append or acknowledge a row. RFC-026 therefore remains draft and public
+streaming remains inactive until the later gates close.
 
 ## 1. Scope and non-goals
 
@@ -148,9 +151,13 @@ The schema and user docs state all three together.
 
 ## 3. Enrollment is a recoverable multi-effect adapter
 
-Schema apply records `@stream` intent only. First stream use enrolls the physical
-table by creating the singleton `__lance_mem_wal` system index and its sharding
-configuration.
+In the eventual public contract, SchemaApply records `@stream` intent and first
+stream use enrolls the physical table by creating the singleton
+`__lance_mem_wal` system index and its sharding configuration. Phase A does not
+yet parse or persist that intent. It implements the enrollment machinery behind
+a crate-private method and a feature-gated failpoint seam, using one fixed
+main-only/unsharded configuration so recovery and exclusion can be proven
+before a production caller exists.
 
 RFC-024 heads are optional. Every lifecycle row therefore carries two distinct
 classes of evidence:
@@ -229,19 +236,19 @@ The RC.1 `execute() -> Result<()>` initializer plus separately claimed shard
 writer satisfies neither general shape. Private-module access,
 compatible-looking index inference, and direct object-store emulation remain
 rejected. Gate E0 established that the public effects are nevertheless exact
-enough for the bounded profile. Until the following production adapter's later
-activation gates pass, `@stream`, the streaming format, first enrollment, and
-acknowledgement all remain inactive.
+enough for the bounded profile. Internal schema v7 and the private Phase A
+adapter now activate the format/recovery foundation. `@stream`, production
+first use, WAL row admission, and acknowledgement remain inactive.
 
-With Gate E0 green, the proposed bounded enrollment uses one RFC-022
+With Gate E0 green, the implemented bounded enrollment uses one RFC-022
 multi-effect sidecar, not an ad-hoc state machine:
 
 1. run and await RFC-022's synchronous recovery barrier;
 2. authorize, pin the manifest/schema/table state, and prepare a complete
    `ReadSet` containing schema identity, stable table ID and incarnation,
    location/main ref, exact pre-enrollment `CurrentHeadWitness`, PK metadata,
-   stream intent/configuration, and lifecycle-row absence for a first enrollment or
-   the exact `SEALED` prior binding for a physical rebind;
+   the fixed Phase A configuration, and lifecycle-row absence. Public
+   schema-declared intent and `SEALED` physical rebind remain later phases;
 3. acquire any global claims and then the `(table, branch)` write queue in
    RFC-022 order, then freshly revalidate the complete `ReadSet`; a mismatch
    restarts before any physical effect;
@@ -265,8 +272,9 @@ multi-effect sidecar, not an ad-hoc state machine:
    overflow, detached-version boundary, same-version ABA, or existing `N + 2`
    is ambiguous and returns `RecoveryRequired`;
 7. pass the pre-minted UUID to the public shard-writer path and accept only its
-   exact empty initial shard state: expected shard/spec identity, observable
-   epoch, no flushed generation, and no data-bearing WAL entry. A deterministic
+   exact empty initial shard state: expected shard/spec identity, epoch 1,
+   generation 1, replay/cursor positions 0, no flushed generation, and no
+   data-bearing WAL entry. A deterministic
    data-less fence sentinel is admissible only if Gate E0 first pins it as part
    of that exact state;
 8. once either allowed effect exists, recover only by rolling forward to the
@@ -277,9 +285,9 @@ multi-effect sidecar, not an ad-hoc state machine:
 9. publish the achieved table version, `CurrentHeadWitness`, stable physical
    binding, exact pre-claim epoch floor, and `stream_state = OPEN` in one
    manifest CAS, including the table-head row when RFC-024 is active; and
-10. resolve the enrollment sidecar before admitting `put`. Ack paths run the
-    recovery barrier, so `OPEN` plus an unresolved enrollment cannot
-    acknowledge.
+10. resolve the enrollment sidecar before any future `put` is admitted. Phase A
+    has no put/ack caller; Phase B must enter through this recovery barrier, so
+    `OPEN` plus an unresolved enrollment can never acknowledge.
 
 An exact no-effect intent may finalize without publication. The exact
 index-only and index-plus-empty-shard states roll forward. No other state is
@@ -686,21 +694,19 @@ but cannot claim history-flat cost while scanning manifest history.
 ## 11. Format activation and rebuild
 
 Streaming is a graph-format capability, not a feature activated by the first
-enrollment. A newly initialized stream-capable graph writes the complete
-internal-format stamp, RFC-028 identity authority, and every other co-released
-capability before it accepts data. First-use enrollment is permitted only on a
-graph whose format already declares streaming; enrollment adds one table's
-physical MemWAL index and exact lifecycle row but does not change the graph
-format.
+enrollment. Internal schema v7 now declares the Phase A foundation on every new
+root: identity-keyed lifecycle rows are a recognized authority kind, the v10
+enrollment intent is recoverable, and uncovered lifecycle/MemWAL mismatches are
+refused. A physical enrollment adds one table's MemWAL index, empty shard, and
+exact lifecycle row; it does not change the graph stamp.
 
-The capability stamp is not assigned merely because RC.1 MemWAL APIs are
-present or because Gate E0's production-neutral harness passes. Initialization
-can emit a stream-capable first state only after Gate E0 is green **and** the
-bounded production enrollment/recovery, writer-exclusion, lifecycle,
-refusal/rebuild, and crash gates below pass. The public exact-enrollment and
-cross-process admission-seal surface remains required before expanding beyond
-the bounded profile. Until the applicable profile is complete, both new-root
-activation and first enrollment remain disabled.
+V7 activation followed Gate E0 and the bounded enrollment/recovery,
+writer-exclusion, lifecycle, crash, and refusal/rebuild evidence. It is not
+activation of row streaming. The ordinary SDK, CLI, server, schema parser, and
+OpenAPI contain no enrollment or stream entry point; only the feature-gated
+fault-injection suite can call the private adapter. The public exact-enrollment
+and cross-process admission-seal surface remains required before expanding
+beyond the bounded profile.
 
 Old binaries refuse a stream-capable graph before reading or writing any table.
 A stream-capable binary refuses an older graph before running recovery. On a
@@ -711,16 +717,18 @@ A covered enrollment crash is recoverable intent, not format corruption. The
 engine never repairs an uncovered mismatch by inferring ownership from a table
 name, path, or compatible-looking system index.
 
-The same rule covers schema rematerialization inside an already stream-capable
-graph. A preserved `(stable_table_id, incarnation_id)` with a new physical
+The same rule will cover schema rematerialization once stream-aware SchemaApply
+is implemented. A preserved `(stable_table_id, incarnation_id)` with a new physical
 table is a `SEALED` stream awaiting the exact §3 rebind, not an `OPEN` stream
 and not permission to attach old shards. Recovery classifies the old and new
 bindings independently and retains the old artifacts until their sidecars and
 read guards permit reclamation.
 
-There is no in-place activation or rollback to an old format. An existing graph
-moves to a stream-capable format only through the strict export/init/load
-strand:
+There is no in-place activation or rollback to an old format. A v6 graph moves
+to v7 only through the strict export/init/load strand. V6 has no acknowledged
+MemWAL rows, so the stream-specific quiesce steps below are vacuous for that
+transition; they become load-bearing for any later rebuild from a format that
+exposes durable admission:
 
 1. persistently quiesce every enrolled stream and fold every acknowledged row
    into the manifest-visible base tables;
@@ -736,8 +744,8 @@ Ordinary export contains only manifest-visible graph state. WAL-only rows,
 MemWAL indexes, shard manifests, epochs, lifecycle rows, reject history,
 fresh-read guards, and fold checkpoints are not transferred. Therefore step 1
 is mandatory: an acknowledged but unfolded row would otherwise be lost. The
-new graph starts with no physical stream enrollment; first use enrolls each
-declared stream through §3 after cutover. The rebuild also loses branches not
+new graph starts with no physical stream enrollment. Phase B must wire declared
+first use through §3 before production can enroll after cutover. The rebuild also loses branches not
 separately exported, commit DAG, snapshots, tombstones, recovery history, and
 time travel, as specified by RFC-028's common format strand.
 
@@ -816,13 +824,66 @@ the same six-attempt, zero-list exact-probe shape. Separate surface guards pin
 same-coordinate ABA; CI rejects a skipped Gate E0 or ABA cell.
 
 This green decision authorizes only Phase A's production foundation: exact
-roll-forward enrollment recovery, central `OPEN`-table writer exclusion,
-lifecycle/current-witness state, and admission-lease races. It does not change
-internal schema v6, parse `@stream`, expose an API, or acknowledge a WAL row.
+roll-forward enrollment recovery, central lifecycle effect exclusion (with the
+narrow `SEALED` native-branch exception), lifecycle/current-witness state, and
+admission-lease races. It does not change
+the schema parser, expose an API, or acknowledge a WAL row.
 The general upstream receipt/seal path remains the preferred simplification and
 the gate for broader topology.
 
-### 12.2 Production activation gates after E0
+### 12.2 Phase A — bounded production foundation (green)
+
+Phase A is implemented at the deliberately narrow boundary established by E0:
+
+- Internal schema v7 adds one identity-keyed
+  `stream_state:<stable_table_id>:<incarnation_id>` authority row carrying the
+  never-reused enrollment/shard binding, exact mutable current-HEAD witness,
+  `OPEN | DRAINING | SEALED`, and per-shard epoch floor. Publication uses an
+  expected-value CAS; identity is never inferred from alias or path.
+- A dedicated schema-v10 `StreamEnrollment` sidecar owns the exact baseline,
+  fixed lineage, intended config/binding, and only allowed `N -> N + 1`
+  initializer effect. Recovery accepts exact no effect, exact index-only, or
+  exact index-plus-empty-shard. Index-only provisions the pre-minted shard;
+  the complete state publishes the table pointer plus `OPEN` row. Once an
+  effect exists the adapter is roll-forward-only: it never restores the table
+  or deletes/reclaims MemWAL artifacts.
+- Enrollment is crate-private (with one feature-gated failpoint seam), supports
+  canonical main and exactly one empty unsharded epoch-1 shard, and refuses
+  while any named graph branch exists. There is no production SDK, CLI, HTTP,
+  OpenAPI, or schema-language call site.
+- One root-scoped process-local admission lease is acquired outside the
+  schema → branch → sorted-table gates. Existing graph writers, SchemaApply,
+  BranchMerge, EnsureIndices, Optimize, Repair, Cleanup, recovery, and native
+  branch controls join the same admission/exclusion discipline and re-check
+  lifecycle authority under their final gates. Phase A fences every
+  base-table, schema, maintenance, repair-adoption, and recovery effect for any
+  lifecycle row, including `SEALED`, because it has no witness-update/rebind
+  adapter yet. Native branch create/delete is the narrow exception: it may
+  proceed at `SEALED` because it does not advance the table HEAD, while
+  `OPEN`/`DRAINING` still refuses it.
+- The initial topology closes the cross-branch authority hole explicitly:
+  enrollment requires a main-only graph, branch create/delete refuses an
+  `OPEN` or `DRAINING` lifecycle, and open-time consistency refuses that
+  lifecycle if a named branch exists. This is a bounded support rule, not
+  branch-aware streaming.
+- Read-write open resolves exact enrollment intents before serving. Read-only
+  open refuses a pending enrollment intent. Compatible opens then validate
+  every lifecycle against the manifest-selected identity/path/witness and
+  exact physical empty-shard state, and reject an uncovered MemWAL index or
+  other partial-format mismatch.
+- V7 remains a strict strand: v7 refuses genuine v6 and v6 refuses v7; upgrade
+  is export/init/load into a different root. Crash tests cover no-effect,
+  index-only, and index-plus-empty-shard recovery, plus named-branch and
+  uncovered-format refusals. Lower-level tests pin lifecycle CAS, typed writer
+  exclusion, admission ordering, and the exact E0 classifier.
+
+This is a production-format and recovery foundation, not a usable stream.
+Phase A never calls the WAL row `put` path, never emits a durability
+acknowledgement, never folds a generation, and never exposes drain/resume or
+fresh reads. Although v7 can encode `DRAINING` and `SEALED`, their operational
+transitions remain Phase D.
+
+### 12.3 Remaining production activation gates
 
 - Surface guards pin claim, append, durability waiter, flush, per-shard epoch
   fencing, staged merge with `merged_generations`, and index catchup. They also
@@ -898,8 +959,8 @@ the gate for broader topology.
 
 | Phase | Content | Gate |
 |---|---|---|
-| E0 | production-neutral public-surface enrollment/witness classifier; no schema, API, sidecar, or format activation | **Passed 2026-07-18:** 14 substantive local cells, complete six-attempt zero-list 8/80 cost shape, Unix no-list/error tripwire, and one non-vacuous configured RustFS positive-plus-negative cell (§12.1); production remains v6 |
-| A | bounded main/unsharded/single-live-writer enrollment adapter, central OPEN-table exclusion, lifecycle/admission lease, then graph-format capability/refusal and strict rebuild | green E0; exact no-effect/roll-forward-only crash matrix; witness-chain and writer-refusal races; genuine cross-version/refusal and rebuild suite |
+| E0 | production-neutral public-surface enrollment/witness classifier; no schema, API, sidecar, or format activation | **Passed 2026-07-18:** 14 substantive local cells, complete six-attempt zero-list 8/80 cost shape, Unix no-list/error tripwire, and one non-vacuous configured RustFS positive-plus-negative cell (§12.1) |
+| A | bounded main/unsharded/single-live-writer enrollment adapter, all-lifecycle effect exclusion with only the `SEALED` native-branch exception, lifecycle/admission lease, then graph-format capability/refusal and strict rebuild | **Implemented 2026-07-18 (§12.2):** internal schema v7, recovery-v10 enrollment, durable lifecycle CAS, process-local exclusion, crash/partial-format refusal, and genuine v6↔v7 strand evidence; no public enrollment or row path |
 | B | new ingest route/CLI, durable ack, strict fold | ack durability; API compatibility; cost budget |
 | C | atomic dead letter, audit provenance, status/bounds | reject crash matrix; backpressure tests |
 | D | epoch-fenced drain, persistent quiesce/resume, schema/branch/upgrade integration, rematerialization rebind | two-coordinator race, old/new physical-binding crash matrix, and format-transition suite |

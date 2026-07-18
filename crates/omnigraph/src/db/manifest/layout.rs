@@ -71,6 +71,17 @@ pub(super) fn tombstone_object_id(identity: TableIdentity, version: u64) -> Stri
     )
 }
 
+/// Deterministic authority row for one RFC-026 physical stream enrollment.
+///
+/// The mutable table alias is deliberately absent: rename-stable table
+/// identity is the only key that may select lifecycle authority.
+pub(super) fn stream_state_object_id(identity: TableIdentity) -> String {
+    format!(
+        "stream_state:{:016x}:{:016x}",
+        identity.stable_table_id, identity.table_incarnation_id
+    )
+}
+
 pub(super) fn table_id_to_key(request_id: Option<&Vec<String>>) -> lance_namespace::Result<String> {
     match request_id {
         Some(request_id) if request_id.len() == 1 && !request_id[0].is_empty() => {

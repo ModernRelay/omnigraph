@@ -248,6 +248,23 @@ pub(super) async fn ensure_indices_for_branch(
         .iter()
         .map(|pin| (pin.table_key.clone(), pin.table_branch.clone()))
         .collect();
+    let stream_admission_keys = recovery_pins
+        .iter()
+        .map(|pin| {
+            crate::db::write_queue::StreamAdmissionKey::for_resolved_ref(
+                pin.identity,
+                pin.table_branch.as_deref(),
+            )
+        })
+        .collect::<Vec<_>>();
+    // RFC-026 admission is the outermost process-local gate. Enrollment/drain
+    // take the same identity + resolved-ref domain exclusively, so acquire all
+    // shared leases before entering schema -> branch -> table ordering and
+    // retain them through the final manifest publication.
+    let _stream_admission_guards = db
+        .write_queue()
+        .acquire_stream_shared_many(&stream_admission_keys)
+        .await;
     let _schema_guard = db
         .write_queue()
         .acquire(&crate::db::manifest::schema_apply_serial_queue_key())
@@ -264,6 +281,10 @@ pub(super) async fn ensure_indices_for_branch(
     )
     .await?;
     let live_snapshot = db.revalidate_write_txn(&txn).await?;
+    live_snapshot.ensure_stream_effects_allowed(
+        "ensure_indices",
+        recovery_pins.iter().map(|pin| pin.identity),
+    )?;
 
     for pin in &recovery_pins {
         let prepared_entry = snapshot.entry(&pin.table_key).ok_or_else(|| {

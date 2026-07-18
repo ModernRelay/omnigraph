@@ -1,3 +1,5 @@
+pub(crate) mod mem_wal;
+
 use arrow_array::{
     Array, ArrayRef, LargeBinaryArray, RecordBatch, StringArray, StructArray, UInt8Array,
     UInt32Array, UInt64Array,

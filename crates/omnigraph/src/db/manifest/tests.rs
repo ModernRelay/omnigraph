@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::sync::Arc;
 
 use arrow_array::{Int32Array, RecordBatch, RecordBatchIterator, StringArray, UInt64Array};
@@ -6,12 +6,15 @@ use arrow_schema::{DataType, Field, Schema};
 use async_trait::async_trait;
 use futures::TryStreamExt;
 use lance::dataset::builder::DatasetBuilder;
+use lance::dataset::refs::BranchIdentifier;
 use lance_namespace::LanceNamespace;
 use lance_namespace::models::{
     DescribeTableRequest, DescribeTableVersionRequest, ListTableVersionsRequest,
 };
 use lance_namespace_impls::DirectoryNamespaceBuilder;
 use tokio::sync::Mutex;
+
+use crate::error::{ManifestConflictDetails, ManifestError};
 
 use super::publisher::{
     GraphHeadExpectation, LineageIntent, ManifestBatchPublisher, PublishOutcome,
@@ -1245,7 +1248,8 @@ impl ManifestBatchPublisher for RecordingPublisher {
                 ManifestChange::Update(update) => Some(update.to_create_table_version_request()),
                 ManifestChange::RegisterTable(_)
                 | ManifestChange::RenameTable(_)
-                | ManifestChange::Tombstone(_) => None,
+                | ManifestChange::Tombstone(_)
+                | ManifestChange::SetStreamLifecycle { .. } => None,
             })
             .collect();
         self.requests.lock().await.extend_from_slice(&requests);
@@ -1427,6 +1431,205 @@ async fn append_person_and_make_update(
         row_count: 1,
         version_metadata,
     }
+}
+
+fn stream_lifecycle_for_person(
+    person_entry: &SubTableEntry,
+    table_version: u64,
+    lifecycle: StreamLifecycle,
+) -> StreamLifecycleEntry {
+    let shard_id = "22222222-2222-4222-8222-222222222222".to_string();
+    StreamLifecycleEntry {
+        identity: person_entry.identity,
+        diagnostic_table_key: person_entry.table_key.clone(),
+        lifecycle,
+        binding: StreamPhysicalBinding {
+            stable_table_id: person_entry.identity.stable_table_id,
+            table_incarnation_id: person_entry.identity.table_incarnation_id,
+            table_location: person_entry.table_path.clone(),
+            table_branch: None,
+            enrollment_id: "11111111-1111-4111-8111-111111111111".to_string(),
+            shard_ids: vec![shard_id.clone()],
+            stream_config_version: STREAM_CONFIG_VERSION,
+            stream_config_hash: format!("sha256:{}", "a".repeat(64)),
+        },
+        current_head_witness: CurrentHeadWitness {
+            branch_identifier: BranchIdentifier::main(),
+            table_version,
+            transaction_uuid: "33333333-3333-4333-8333-333333333333".to_string(),
+            manifest_e_tag: None,
+        },
+        epoch_floor_by_shard: BTreeMap::from([(shard_id, 1)]),
+    }
+}
+
+#[tokio::test]
+async fn stream_lifecycle_and_table_pointer_publish_in_one_manifest_cas() {
+    let dir = tempfile::tempdir().unwrap();
+    let uri = dir.path().to_str().unwrap();
+    let catalog = build_test_catalog();
+    let mut mc = ManifestCoordinator::init(uri, &catalog).await.unwrap();
+    let person_entry = mc.snapshot().entry("node:Person").unwrap().clone();
+    let company_identity = mc.snapshot().entry("node:Company").unwrap().identity;
+
+    let open = stream_lifecycle_for_person(
+        &person_entry,
+        person_entry.table_version,
+        StreamLifecycle::Open,
+    );
+    let before_enrollment = mc.version();
+    mc.commit_changes(&[ManifestChange::SetStreamLifecycle {
+        expected: None,
+        next: open.clone(),
+    }])
+    .await
+    .unwrap();
+    assert_eq!(mc.version(), before_enrollment + 1);
+    assert_eq!(
+        mc.snapshot().stream_lifecycle(person_entry.identity),
+        Some(&open)
+    );
+    let after_enrollment = mc.version();
+    let stale_absence = mc
+        .commit_changes(&[ManifestChange::SetStreamLifecycle {
+            expected: None,
+            next: open.clone(),
+        }])
+        .await
+        .unwrap_err();
+    assert!(matches!(
+        stale_absence,
+        OmniError::Manifest(ManifestError {
+            details: Some(ManifestConflictDetails::ReadSetChanged { .. }),
+            ..
+        })
+    ));
+    assert_eq!(mc.version(), after_enrollment);
+
+    let mut wrong_pointer = open.clone();
+    wrong_pointer.current_head_witness.table_version += 1;
+    let pointer_error = mc
+        .commit_changes(&[ManifestChange::SetStreamLifecycle {
+            expected: Some(open.clone()),
+            next: wrong_pointer,
+        }])
+        .await
+        .unwrap_err();
+    assert!(
+        pointer_error
+            .to_string()
+            .contains("effective table pointer")
+    );
+    assert_eq!(mc.version(), after_enrollment);
+    let open_error = mc
+        .snapshot()
+        .ensure_stream_effects_allowed("mutation", [person_entry.identity])
+        .unwrap_err();
+    assert!(matches!(
+        open_error,
+        OmniError::Manifest(ManifestError {
+            details: Some(ManifestConflictDetails::StreamLifecycleConflict {
+                lifecycle,
+                operation,
+                ..
+            }),
+            ..
+        }) if lifecycle == "OPEN" && operation == "mutation"
+    ));
+
+    let update = append_person_and_make_update(uri, &person_entry, "Alice").await;
+    let draining = stream_lifecycle_for_person(
+        &person_entry,
+        update.table_version,
+        StreamLifecycle::Draining,
+    );
+    let before_transition = mc.version();
+    mc.commit_changes(&[
+        ManifestChange::Update(update.clone()),
+        ManifestChange::SetStreamLifecycle {
+            expected: Some(open.clone()),
+            next: draining.clone(),
+        },
+    ])
+    .await
+    .unwrap();
+
+    assert_eq!(mc.version(), before_transition + 1);
+    assert_eq!(
+        mc.snapshot().entry("node:Person").unwrap().table_version,
+        update.table_version
+    );
+    assert_eq!(
+        mc.snapshot().stream_lifecycle(person_entry.identity),
+        Some(&draining)
+    );
+    assert_eq!(mc.snapshot().stream_lifecycles().count(), 1);
+
+    let mut reopened = ManifestCoordinator::open(uri).await.unwrap();
+    assert_eq!(reopened.version(), mc.version());
+    assert_eq!(
+        reopened
+            .snapshot()
+            .entry("node:Person")
+            .unwrap()
+            .table_version,
+        update.table_version
+    );
+    assert_eq!(
+        reopened.snapshot().stream_lifecycle(person_entry.identity),
+        Some(&draining)
+    );
+    let draining_error = reopened
+        .snapshot()
+        .ensure_stream_effects_allowed("schema apply", [person_entry.identity])
+        .unwrap_err();
+    assert!(matches!(
+        draining_error,
+        OmniError::Manifest(ManifestError {
+            details: Some(ManifestConflictDetails::StreamLifecycleConflict {
+                lifecycle,
+                operation,
+                ..
+            }),
+            ..
+        }) if lifecycle == "DRAINING" && operation == "schema apply"
+    ));
+
+    let mut sealed = draining;
+    sealed.lifecycle = StreamLifecycle::Sealed;
+    let expected_draining = reopened
+        .snapshot()
+        .stream_lifecycle(person_entry.identity)
+        .cloned();
+    reopened
+        .commit_changes(&[ManifestChange::SetStreamLifecycle {
+            expected: expected_draining,
+            next: sealed,
+        }])
+        .await
+        .unwrap();
+    let sealed_effect_error = reopened
+        .snapshot()
+        .ensure_stream_effects_allowed("mutation", [person_entry.identity, company_identity])
+        .unwrap_err();
+    assert!(matches!(
+        sealed_effect_error,
+        OmniError::Manifest(ManifestError {
+            details: Some(ManifestConflictDetails::StreamLifecycleConflict {
+                lifecycle,
+                operation,
+                ..
+            }),
+            ..
+        }) if lifecycle == "SEALED" && operation == "mutation"
+    ));
+    reopened
+        .snapshot()
+        .ensure_stream_branch_controls_allowed(
+            "branch_create",
+            [person_entry.identity, company_identity],
+        )
+        .unwrap();
 }
 
 #[tokio::test]
@@ -1715,6 +1918,7 @@ async fn test_init_stamps_internal_schema_version() {
     ManifestCoordinator::init(uri, &catalog).await.unwrap();
 
     let ds = open_manifest_dataset(uri, None).await.unwrap();
+    assert_eq!(super::migrations::INTERNAL_MANIFEST_SCHEMA_VERSION, 7);
     assert_eq!(
         super::migrations::read_stamp(&ds),
         super::migrations::INTERNAL_MANIFEST_SCHEMA_VERSION,
@@ -1848,7 +2052,7 @@ async fn future_stamp_is_refused_in_both_open_modes() {
 }
 
 // A graph stamped below CURRENT (the strand floor: `MIN_SUPPORTED == CURRENT`,
-// so anything older than v5) is refused on open in BOTH modes, with the
+// so anything older than v7) is refused on open in BOTH modes, with the
 // rebuild-via-export/import hint — there is no in-place migration. This is the
 // floor twin of `future_stamp_is_refused_in_both_open_modes` (the ceiling). The
 // open path (`Omnigraph::open` read-write and `Omnigraph::open_read_only`) routes
@@ -1860,17 +2064,17 @@ async fn sub_current_graph_is_refused_on_open_with_rebuild_hint() {
 
     let dir = tempfile::tempdir().unwrap();
     let uri = dir.path().to_str().unwrap();
-    // A full v5 graph (schema artifacts present) so the open path gets past its
+    // A full graph (schema artifacts present) so the open path gets past its
     // schema read to the stamp check.
     Omnigraph::init(uri, "node Person { name: String }\n")
         .await
         .unwrap();
 
-    // Rewind main's stamp to v4 — a graph this binary's single served version
-    // (v5) cannot open, since `MIN_SUPPORTED == CURRENT == 5`.
+    // Rewind main's stamp to v6 — the immediately preceding strict strand,
+    // which this v7-only binary cannot open (`MIN_SUPPORTED == CURRENT == 7`).
     {
         let mut ds = open_manifest_dataset(uri, None).await.unwrap();
-        super::migrations::set_stamp_for_test(&mut ds, 4)
+        super::migrations::set_stamp_for_test(&mut ds, 6)
             .await
             .unwrap();
     }
@@ -1932,7 +2136,7 @@ async fn sub_current_graph_is_refused_then_rebuilt_via_export_import() {
     // Make it look like a graph from an older release: rewind the stamp below CURRENT.
     {
         let mut ds = open_manifest_dataset(uri_old, None).await.unwrap();
-        super::migrations::set_stamp_for_test(&mut ds, 4)
+        super::migrations::set_stamp_for_test(&mut ds, 6)
             .await
             .unwrap();
     }
@@ -1946,8 +2150,8 @@ async fn sub_current_graph_is_refused_then_rebuilt_via_export_import() {
         "the refusal must nudge the operator to `omnigraph export`, got: {err}",
     );
     assert!(
-        msg.contains("0.8.x"),
-        "the refusal must name the release that wrote this stamp (v4 → 0.8.x) so the \
+        msg.contains("0.10.x"),
+        "the refusal must name the release that wrote this stamp (v6 → 0.10.x) so the \
          operator knows which binary to use, got: {err}",
     );
 

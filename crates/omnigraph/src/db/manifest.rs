@@ -31,6 +31,8 @@ mod publisher;
 mod recovery;
 #[path = "manifest/state.rs"]
 mod state;
+#[path = "manifest/stream.rs"]
+pub(crate) mod stream;
 
 use graph::{
     init_manifest_graph, open_manifest_graph, open_manifest_graph_with_lineage, snapshot_state_at,
@@ -54,11 +56,12 @@ pub(crate) use recovery::{
     RecoveryManifestDelta, RecoveryMode, RecoverySchemaApplyEffect, RecoverySchemaApplyEffectKind,
     RecoverySidecar, RecoverySidecarHandle, RecoveryTableUpdateSlot, SidecarKind, SidecarTablePin,
     SidecarTableRegistration, SidecarTableRename, SidecarTombstone,
-    confirm_branch_merge_sidecar_v9, confirm_ensure_indices_sidecar_v9, confirm_occ_sidecar_v9,
-    confirm_schema_apply_sidecar_v9, delete_sidecar, ensure_read_only_schema_coherent,
-    finalize_effect_free_occ_sidecar, heal_pending_sidecars_roll_forward, list_sidecars,
-    new_branch_merge_sidecar_v9, new_ensure_indices_sidecar_v9, new_occ_sidecar_v9,
-    new_optimize_sidecar_v9, new_schema_apply_sidecar_v9, recover_manifest_drift,
+    complete_stream_enrollment_sidecar_v10, confirm_branch_merge_sidecar_v9,
+    confirm_ensure_indices_sidecar_v9, confirm_occ_sidecar_v9, confirm_schema_apply_sidecar_v9,
+    delete_sidecar, ensure_read_only_schema_coherent, finalize_effect_free_occ_sidecar,
+    heal_pending_sidecars_roll_forward, list_sidecars, new_branch_merge_sidecar_v9,
+    new_ensure_indices_sidecar_v9, new_occ_sidecar_v9, new_optimize_sidecar_v9,
+    new_schema_apply_sidecar_v9, new_stream_enrollment_sidecar_v10, recover_manifest_drift,
     schema_apply_serial_queue_key, write_sidecar,
 };
 pub use state::SubTableEntry;
@@ -66,6 +69,10 @@ pub use state::SubTableEntry;
 use state::string_column;
 pub(crate) use state::{GraphLineageRow, read_graph_lineage};
 use state::{ManifestState, read_manifest_state};
+pub(crate) use stream::{
+    CurrentHeadWitness, STREAM_CONFIG_VERSION, StreamLifecycle, StreamLifecycleEntry,
+    StreamPhysicalBinding,
+};
 
 /// The internal-schema (storage-format) version this binary writes and reads.
 /// A graph's on-disk per-branch stamp is read via [`internal_schema_stamp_at`];
@@ -84,6 +91,7 @@ const OBJECT_TYPE_GRAPH_COMMIT: &str = "graph_commit";
 /// Mutable per-branch head pointer for the graph lineage (RFC-013 Phase 7).
 /// `object_id` is `graph_head:<branch>` (`graph_head:main` for the main branch).
 const OBJECT_TYPE_GRAPH_HEAD: &str = "graph_head";
+const OBJECT_TYPE_STREAM_STATE: &str = "stream_state";
 const TABLE_VERSION_MANAGEMENT_KEY: &str = "table_version_management";
 
 /// Stable head-key segment for the main branch in `graph_head:<branch>` rows.
@@ -142,6 +150,10 @@ pub struct Snapshot {
     root_uri: String,
     version: u64,
     entries: HashMap<String, SubTableEntry>,
+    /// Durable RFC-026 lifecycle authority keyed only by immutable physical
+    /// table identity. `table_key` inside each value is diagnostic and is never
+    /// used to select the authority row.
+    stream_lifecycles: HashMap<TableIdentity, StreamLifecycleEntry>,
     /// Per-graph read caches (shared `Session` + held-handle cache), injected by
     /// `Omnigraph::resolved_target` for live Branch reads so table opens reuse
     /// handles (0 IO on a warm repeat) and one `Session`. `None` for write-prelude
@@ -430,6 +442,83 @@ impl Snapshot {
     pub fn entries(&self) -> impl Iterator<Item = &SubTableEntry> {
         self.entries.values()
     }
+
+    /// Durable stream authority for one immutable table lifetime.
+    pub(crate) fn stream_lifecycle(
+        &self,
+        identity: TableIdentity,
+    ) -> Option<&StreamLifecycleEntry> {
+        self.stream_lifecycles.get(&identity)
+    }
+
+    /// Iterate durable lifecycle authorities without another manifest scan.
+    pub(crate) fn stream_lifecycles(
+        &self,
+    ) -> impl Iterator<Item = (&TableIdentity, &StreamLifecycleEntry)> {
+        self.stream_lifecycles.iter()
+    }
+
+    /// Refuse any physical table/schema effect that would bypass RFC-026
+    /// lifecycle authority. Phase A has no drain operation that can atomically
+    /// advance `CurrentHeadWitness`, so even SEALED is fenced here. Later
+    /// phases may replace this refusal with a sidecar-covered witness update;
+    /// silently advancing the table pointer alone is never valid.
+    pub(crate) fn ensure_stream_effects_allowed(
+        &self,
+        operation: &str,
+        identities: impl IntoIterator<Item = TableIdentity>,
+    ) -> Result<()> {
+        self.ensure_stream_lifecycles_allowed(operation, identities, false)
+    }
+
+    /// Native graph-branch ref controls do not advance an enrolled table HEAD.
+    /// They may therefore run after a complete SEALED barrier, while OPEN and
+    /// DRAINING still close the bounded main-only topology.
+    pub(crate) fn ensure_stream_branch_controls_allowed(
+        &self,
+        operation: &str,
+        identities: impl IntoIterator<Item = TableIdentity>,
+    ) -> Result<()> {
+        self.ensure_stream_lifecycles_allowed(operation, identities, true)
+    }
+
+    fn ensure_stream_lifecycles_allowed(
+        &self,
+        operation: &str,
+        identities: impl IntoIterator<Item = TableIdentity>,
+        allow_sealed: bool,
+    ) -> Result<()> {
+        let mut identities = identities.into_iter().collect::<Vec<_>>();
+        identities.sort_unstable();
+        identities.dedup();
+
+        for identity in identities {
+            let Some(lifecycle) = self.stream_lifecycles.get(&identity) else {
+                continue;
+            };
+            if allow_sealed && lifecycle.lifecycle == StreamLifecycle::Sealed {
+                continue;
+            }
+            let table_key = self
+                .entries
+                .values()
+                .find(|entry| entry.identity == identity)
+                .map(|entry| entry.table_key.as_str())
+                .ok_or_else(|| {
+                    OmniError::manifest_internal(format!(
+                        "stream lifecycle authority exists for non-live table identity {identity}"
+                    ))
+                })?;
+            return Err(OmniError::manifest_stream_lifecycle_conflict(
+                identity.stable_table_id,
+                identity.table_incarnation_id,
+                table_key,
+                lifecycle.lifecycle.as_str(),
+                operation,
+            ));
+        }
+        Ok(())
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -600,6 +689,15 @@ pub(crate) enum ManifestChange {
     RegisterTable(TableRegistration),
     RenameTable(TableRename),
     Tombstone(TableTombstone),
+    /// Materialize or transition one identity-keyed RFC-026 lifecycle row.
+    /// `expected` is exact durable authority (`None` means first enrollment),
+    /// preventing a transparent row-CAS retry from overwriting a concurrent
+    /// lifecycle transition. Callers pair this with [`ManifestChange::Update`]
+    /// when the physical table HEAD moves; both rows land in one manifest CAS.
+    SetStreamLifecycle {
+        expected: Option<StreamLifecycleEntry>,
+        next: StreamLifecycleEntry,
+    },
 }
 
 /// One table-version authority assertion supplied to a publish attempt.
@@ -744,6 +842,7 @@ impl ManifestCoordinator {
                 .into_iter()
                 .map(|entry| (entry.table_key.clone(), entry))
                 .collect(),
+            stream_lifecycles: state.stream_lifecycles,
             read_caches: None,
         }
     }

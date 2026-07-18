@@ -1,11 +1,21 @@
 # WAL Thinking
 
-Working notes, 2026-07-17. Plain-language grounding for the WAL/streaming
+Working notes, updated 2026-07-18. Plain-language grounding for the WAL/streaming
 discussion ([RFC-018](docs/rfcs/0018-ingest-wal.md) →
 [RFC-026](docs/rfcs/0026-memwal-streaming-ingest.md)). Three parts: the
 contract difference between an interactive graph commit and durable stream
 admission, the expected performance shape and evidence still required, and the
 build inventory.
+
+Current boundary: RFC-026 Phase A is built, but streaming is not. Internal
+schema v7 can recover and publish one exact empty main-only MemWAL enrollment,
+persists its lifecycle authority, excludes ordinary local table/schema/
+maintenance/repair/recovery effects for any lifecycle row, and refuses partial
+format state. Native branch controls alone may proceed at `SEALED`, because
+they do not move table HEAD. The enrollment method
+is crate-private and exists only behind a feature-gated fault-injection seam.
+There is still no `@stream`, public enrollment, WAL row put, durability
+acknowledgement, fold, drain/resume operation, or fresh read.
 
 ---
 
@@ -63,6 +73,9 @@ to that floor.
 
 ### Stream admission — durable before graph-visible
 
+This is the Phase B target contract, not an executable path in the current
+binary.
+
 One logical stream row follows a different contract:
 
 ```text
@@ -94,6 +107,9 @@ RFC-026 delivery therefore uses one unsharded owner per `(table, main)`;
 horizontal writer scaling comes later from deterministic key-based sharding.
 
 ### Fold — deferred graph publication, paid once per batch
+
+This is also future work. Phase A establishes the binding, recovery, and
+exclusion preconditions a fold must consume; it does not merge a generation.
 
 There is no fixed 30-second or 10,000-row contract. A folder may be triggered by
 rows, bytes, maximum lag, resource pressure, or an operator request. It consumes
@@ -300,15 +316,42 @@ These are real substrate capabilities, not a turnkey graph-streaming product:
 OmniGraph already has reusable chassis: the manifest publisher, generic
 recovery-sidecar framework, graph lineage, stable table identity, keyed write
 adapter, and validation components. “Reusable” does not mean “unchanged”:
-RFC-026 still needs stream lifecycle authority, fold read sets, reject/audit
-participants, actor-range provenance, fresh cuts, and cleanup coordination.
+Phase A added stream lifecycle authority and enrollment recovery; later phases
+still need row admission, fold read sets, reject/audit participants,
+actor-range provenance, fresh cuts, and cleanup coordination.
+
+### What Phase A added
+
+Phase A turns the enrollment classifier into a recoverable format foundation:
+
+- internal schema v7 recognizes identity-keyed lifecycle rows and refuses v6;
+- one schema-v10 intent binds exact main authority, the `N -> N + 1`
+  initializer effect, pre-minted enrollment/shard IDs, fixed lineage, and the
+  intended physical configuration;
+- no effect retires the intent, index-only provisions the exact empty shard,
+  and index-plus-empty-shard publishes the table pointer and `OPEN` row;
+- once either effect exists, recovery only rolls forward. It never restores a
+  table or deletes/reclaims MemWAL artifacts based on inference;
+- a process-local admission lease sits outside the ordinary schema → branch →
+  table gates. Any lifecycle row, including `SEALED`, fences current
+  base-table/schema/maintenance/repair-adoption/recovery effects because Phase
+  A cannot advance or rebind its witness. Native branch controls alone may
+  proceed at `SEALED` because they do not move table HEAD;
+- enrollment refuses if a named graph branch exists, and branch controls
+  refuse while a lifecycle is `OPEN` or `DRAINING`; and
+- compatible open validates the exact lifecycle/witness/empty-shard state and
+  refuses an uncovered MemWAL index or other partial-format mismatch.
+
+This deliberately stops before the first data entry. `DRAINING` and `SEALED`
+are representable so the authority shape is fixed, but no drain or resume
+workflow is implemented.
 
 ### What OmniGraph must build
 
 | Responsibility | Required contract |
 |---|---|
-| **Format capability and refusal** | Streaming-capable graph stamp, strict old/new binary refusal, and export/init/load rebuild behavior. |
-| **`@stream` intent and enrollment** | Bind stable table/incarnation identity, location/main ref, never-reused enrollment ID, shard namespace, and configuration under recovery; separately persist the mutable current-HEAD witness and advance it with every allowed base commit. |
+| **Format capability and refusal** | **Phase A complete:** v7 stamp, strict v6↔v7 refusal, export/init/load rebuild, exact lifecycle validation, and uncovered-partial-format refusal. |
+| **`@stream` intent and enrollment** | **Foundation only:** Phase A binds stable table/incarnation identity, location/main ref, never-reused enrollment ID, one empty shard, fixed configuration, and the mutable current-HEAD witness under recovery. Still missing: parser/SchemaApply intent, production first-use call, rebind, and witness advancement by folds. |
 | **Public surface** | `POST /graphs/{graph_id}/streams/{type_name}/ingest`, status/fold/quiesce/resume endpoints, `omnigraph stream …` commands, and OpenAPI parity. Existing `/ingest` remains the deprecated load alias. |
 | **Writer registry and routing** | Warm writers keyed by exact table identity, enrollment, and shard; one routed owner per initial `(table, main)`; bounded memory, inflight bytes, idle eviction, and backpressure. |
 | **Durability batching** | Explicitly combine logical rows into submitted Lance puts while bounding latency and preserving ordered acknowledgements, actor accounting, cancellation, and typed failures. |
@@ -353,7 +396,8 @@ An upstream exact receipt and public admission lifecycle would simplify this
 substantially. We should propose that change, but its review and release timing
 is not a prerequisite for the bounded-profile decision. Gate E0 passed; the
 upstream shape still gates overlapping-process topology, while bounded
-activation now depends on OmniGraph's Phase A and later production proofs.
+Phase A is complete and row activation now depends on Phase B's production
+proofs.
 
 ### Gate E0: a no-wait decision, not activation
 
@@ -432,19 +476,20 @@ refusals. Separate surface guards own object-store ABA and pin the doc-hidden
 successor, flush/drain, and merged-generation surfaces; CI rejects skipped E0
 and ABA cells.
 
-E0 added no `@stream`, lifecycle rows, a sidecar schema, public APIs, WAL
-acknowledgements, or a format stamp. Internal schema v6 remains production
-truth. Its green result authorizes only Phase A's enrollment recovery, central
-writer exclusion, lifecycle/current-witness state, and admission-lease races—
-not stream release. The exact upstream receipt/seal remains the preferred
-simplification and the broader-topology gate.
+E0 itself added no `@stream`, lifecycle rows, a sidecar schema, public APIs,
+WAL acknowledgements, or a format stamp. Phase A has since consumed that proof:
+internal schema v7, the v10 enrollment intent, lifecycle authority, writer
+exclusion, and refusal/rebuild are implemented. This still is not stream
+release. The exact upstream receipt/seal remains the preferred simplification
+and the broader-topology gate.
 
-That later activation work still is not the Optimize proof copied to a new
+That Phase A work is not the Optimize proof copied to a new
 writer kind. Optimize is content-preserving maintenance and grants no future
-durability authority. Enrollment authorizes acknowledgements, so its production
-slice must cover initialization, shard claim, fixed binding publication,
-admission lease, first put, lost acknowledgement, drain, restart, and attempted
-foreign ownership before a single row can be acknowledged.
+durability authority. Enrollment is the precondition for future
+acknowledgements, so Phase A separately proves initialization, shard claim,
+fixed binding publication, admission exclusion, restart, and foreign-state
+refusal. Phase B must now prove first put, durability/lost-response semantics,
+replay, and strict folding before a single row can be acknowledged.
 
 ### Bottom line
 
@@ -458,18 +503,17 @@ cleanup integration.
 The plan is:
 
 1. retain Gate E0's green exact-version classifier as the RC.1 substrate gate;
-   schema v6 remains unchanged;
-2. implement exact enrollment recovery, central
-   `OPEN`-table writer exclusion, lifecycle state, and the admission-lease crash
-   matrix while keeping public streaming inactive;
-3. close format/refusal/rebuild and fold/ack durability gates before activating
-   durable admission;
+2. keep Phase A's v7 enrollment recovery, all-lifecycle effect exclusion,
+   narrow `SEALED` native-branch exception, lifecycle state, admission lease,
+   and refusal/rebuild gates as the fixed foundation;
+3. implement Phase B row admission, durable ack/replay, and strict fold as one
+   main-only/unsharded/single-process slice;
 4. design and measure explicit durability batching before claiming group
    commit or a performance multiplier;
 5. pursue the exact upstream receipt/seal API in parallel, then use it to
    simplify the adapter and broaden topology when it lands.
 
 We tested the narrower support contract instead of waiting on the upstream
-calendar, and Gate E0 supports it. Until every later production gate passes,
-RFC-026 remains draft and no stream format, lifecycle, or acknowledgement path
-is active.
+calendar, and Phase A now implements it. RFC-026 remains draft: v7 stream
+format/lifecycle foundations are active, but no production enrollment,
+acknowledgement, fold, or public stream path exists.

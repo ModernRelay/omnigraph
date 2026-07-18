@@ -1325,6 +1325,25 @@ async fn ensure_indices_on_child_branch_keeps_inherited_table_when_no_work_is_ne
         count_rows_branch(&experiment, "experiment", "node:Person").await,
         5
     );
+
+    // A lazy descendant retains its ancestor's physical Lance ref. Native
+    // branch controls must fence main-only Phase-A enrollment without assuming
+    // the logical source name is also the resolved physical ref.
+    experiment
+        .branch_create_from(ReadTarget::branch("experiment"), "grandchild")
+        .await
+        .unwrap();
+    let grandchild = snapshot_branch(&experiment, "grandchild").await.unwrap();
+    assert_eq!(
+        grandchild
+            .entry("node:Person")
+            .unwrap()
+            .table_branch
+            .as_deref(),
+        Some("feature")
+    );
+    experiment.branch_delete("grandchild").await.unwrap();
+    experiment.branch_delete("experiment").await.unwrap();
 }
 
 #[tokio::test]

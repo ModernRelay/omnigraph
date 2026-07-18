@@ -38,6 +38,7 @@ mod export;
 mod optimize;
 mod repair;
 mod schema_apply;
+mod stream_enrollment;
 mod table_ops;
 
 pub use optimize::{CleanupPolicyOptions, SkipReason, TableCleanupStats, TableOptimizeStats};
@@ -57,6 +58,7 @@ use super::schema_state::{
     schema_state_uri, validate_schema_contract, validate_schema_ir_against_snapshot,
     write_schema_contract, write_schema_contract_staging,
 };
+use super::write_queue::StreamAdmissionKey;
 use super::{
     ReadTarget, ResolvedTarget, SCHEMA_APPLY_LOCK_BRANCH, SnapshotId, is_internal_system_branch,
     is_schema_apply_lock_branch,
@@ -470,20 +472,35 @@ impl Omnigraph {
     /// Reads `_schema.pg`, parses it, builds the catalog, and opens `__manifest`.
     /// Runs the open-time recovery sweep before returning — see [`OpenMode`].
     pub async fn open(uri: &str) -> Result<Self> {
-        Self::open_with_storage_and_mode(uri, storage_for_uri(uri)?, OpenMode::ReadWrite).await
+        Box::pin(Self::open_with_storage_and_mode(
+            uri,
+            storage_for_uri(uri)?,
+            OpenMode::ReadWrite,
+        ))
+        .await
     }
 
     /// Open an existing graph for read-only consumers (NDJSON export,
     /// `commit list`, etc.). Skips the recovery sweep — see [`OpenMode`].
     pub async fn open_read_only(uri: &str) -> Result<Self> {
-        Self::open_with_storage_and_mode(uri, storage_for_uri(uri)?, OpenMode::ReadOnly).await
+        Box::pin(Self::open_with_storage_and_mode(
+            uri,
+            storage_for_uri(uri)?,
+            OpenMode::ReadOnly,
+        ))
+        .await
     }
 
     /// Open with a caller-supplied [`StorageAdapter`]. Used by init/test paths
     /// and by embedding/test consumers that wrap storage (e.g. a counting
     /// decorator for IO-budget tests). Defaults to `OpenMode::ReadWrite`.
     pub async fn open_with_storage(uri: &str, storage: Arc<dyn StorageAdapter>) -> Result<Self> {
-        Self::open_with_storage_and_mode(uri, storage, OpenMode::ReadWrite).await
+        Box::pin(Self::open_with_storage_and_mode(
+            uri,
+            storage,
+            OpenMode::ReadWrite,
+        ))
+        .await
     }
 
     pub(crate) async fn open_with_storage_and_mode(
@@ -509,6 +526,34 @@ impl Omnigraph {
         let mut coordinator =
             GraphCoordinator::open_with_session(&root, Arc::clone(&storage), &control_session)
                 .await?;
+        // Full recovery may Restore or publish any table named by a pending
+        // sidecar. Close those admission domains before taking the schema gate,
+        // preserving the global admission -> schema -> branch -> table order
+        // even when another handle is still finishing the writer that created
+        // the sidecar. This is deliberately exclusive and cold-path only.
+        // The recovery sweep re-lists under the schema gate; a sidecar created
+        // after this pre-list is either still protected by the writer's schema
+        // gate (so this open waits) or belongs to a writer that has already
+        // released every effect guard.
+        let recovery_admission_keys = if matches!(mode, OpenMode::ReadWrite) {
+            crate::db::manifest::list_sidecars(&root, storage.as_ref())
+                .await?
+                .into_iter()
+                .flat_map(|sidecar| {
+                    sidecar.tables.into_iter().map(|pin| {
+                        crate::db::write_queue::StreamAdmissionKey::for_resolved_ref(
+                            pin.identity,
+                            pin.table_branch.as_deref(),
+                        )
+                    })
+                })
+                .collect::<Vec<_>>()
+        } else {
+            Vec::new()
+        };
+        let _recovery_admission_guards = write_queue
+            .acquire_stream_exclusive_many(&recovery_admission_keys)
+            .await;
         // Schema publication is a three-file promotion plus an in-memory catalog
         // swap.  Every handle — including ReadOnly — must hold the root-scoped
         // schema gate from its final coordinator refresh through the complete
@@ -604,6 +649,10 @@ impl Omnigraph {
             embedding: Arc::new(tokio::sync::OnceCell::new()),
             embedding_config: None,
         };
+        // Keep the table-by-table Lance inventory validator off the already
+        // deep open/recovery future. The check is cold-path and boxing avoids
+        // inflating every caller's Tokio worker-stack requirement.
+        Box::pin(db.validate_stream_format_consistency()).await?;
         // The returned handle now owns one coherent schema source/catalog view.
         // Release only after both have been installed in the new object.
         drop(schema_contract_guard);
@@ -1559,9 +1608,9 @@ impl Omnigraph {
     /// 3. `heal_pending_sidecars_roll_forward` — close the
     ///    finalize→publisher residual via roll-forward; defer rollback
     ///    work to next ReadWrite open. Serializes against live writers
-    ///    by acquiring each sidecar's root-scoped schema → branch → sorted
-    ///    table gates, so refresh never rolls forward an in-flight writer's
-    ///    sidecar from under it, even from another handle.
+    ///    by acquiring each sidecar's root-scoped stream-admission → schema →
+    ///    branch → sorted-table gates, so refresh never rolls forward an
+    ///    in-flight writer's sidecar from under it, even from another handle.
     /// 4. `runtime_cache.invalidate_all` — drop stale per-snapshot caches.
     ///
     /// Steady-state cost: two empty `list_dir` probes of `__recovery/` (the
@@ -1707,19 +1756,23 @@ impl Omnigraph {
     /// orphan-discard audit. Safety comes from branch_delete subsequently taking
     /// schema -> target branch -> every accepted-catalog table gate before the
     /// ref mutation, which waits out any live in-process owner. SchemaApply
-    /// remains graph-global and must still block deletion.
+    /// remains graph-global and bounded main StreamEnrollment can establish the
+    /// topology-closing lifecycle authority, so both still block deletion.
     async fn heal_pending_recovery_sidecars_for_branch_delete(&self, branch: &str) -> Result<()> {
         let outcome = self.heal_pending_recovery_sidecars_outcome().await?;
-        if let Some(intent) = outcome
-            .unresolved
-            .iter()
-            .find(|intent| intent.writer_kind == crate::db::manifest::SidecarKind::SchemaApply)
-        {
+        if let Some(intent) = outcome.unresolved.iter().find(|intent| {
+            matches!(
+                intent.writer_kind,
+                crate::db::manifest::SidecarKind::SchemaApply
+                    | crate::db::manifest::SidecarKind::StreamEnrollment
+            )
+        }) {
             return Err(OmniError::recovery_required(
                 intent.operation_id.clone(),
                 format!(
-                    "pending SchemaApply recovery operation blocks deletion of branch '{branch}'; \
-                     reopen the graph read-write before retrying"
+                    "pending {:?} recovery operation blocks deletion of branch '{branch}'; \
+                     reopen the graph read-write before retrying",
+                    intent.writer_kind
                 ),
             ));
         }
@@ -1836,19 +1889,23 @@ impl Omnigraph {
     /// Final under-gate check for branch deletion. Target-branch sidecars are
     /// intentionally allowed: the held complete table envelope proves no live
     /// in-process owner can still be applying them, and deleting the branch
-    /// makes their effects unreachable. Only graph-global schema recovery can
-    /// still invalidate the operation.
+    /// makes their effects unreachable. Graph-global schema recovery and a
+    /// canonical-main stream enrollment still invalidate the operation.
     async fn ensure_branch_delete_recovery_safe_under_gates(&self, branch: &str) -> Result<()> {
         let sidecars =
             crate::db::manifest::list_sidecars(&self.root_uri, self.storage.as_ref()).await?;
-        if let Some(sidecar) = sidecars
-            .iter()
-            .find(|sidecar| sidecar.writer_kind == crate::db::manifest::SidecarKind::SchemaApply)
-        {
+        if let Some(sidecar) = sidecars.iter().find(|sidecar| {
+            matches!(
+                sidecar.writer_kind,
+                crate::db::manifest::SidecarKind::SchemaApply
+                    | crate::db::manifest::SidecarKind::StreamEnrollment
+            )
+        }) {
             return Err(OmniError::recovery_required(
                 sidecar.operation_id.clone(),
                 format!(
-                    "pending SchemaApply recovery operation blocks deletion of branch '{branch}'"
+                    "pending {:?} recovery operation blocks deletion of branch '{branch}'",
+                    sidecar.writer_kind,
                 ),
             ));
         }
@@ -2382,6 +2439,97 @@ impl Omnigraph {
         queue_keys
     }
 
+    fn stream_admission_keys_for_snapshot(snapshot: &Snapshot) -> Vec<StreamAdmissionKey> {
+        snapshot
+            .entries()
+            .map(|entry| {
+                StreamAdmissionKey::for_resolved_ref(entry.identity, entry.table_branch.as_deref())
+            })
+            .collect()
+    }
+
+    /// Derive a conservative admission superset without a pre-gate manifest
+    /// open. Native branch controls already own a one-capture cost contract:
+    /// their operation-local source snapshot is loaded once under the inner
+    /// gates. The accepted catalog supplies immutable table lifetimes. Phase A
+    /// enrolls and closes admission only on canonical main, so branch controls
+    /// need the main domain for every lifetime: this excludes enrollment while
+    /// the control changes the named-branch topology. Deliberately do not guess
+    /// a named physical ref from the logical source branch. A lazy descendant
+    /// may still resolve to any live ancestor ref, and named-ref enrollment or
+    /// drain is outside the Phase-A support boundary.
+    fn branch_control_stream_admission_keys(
+        catalog: &Catalog,
+    ) -> Result<Vec<StreamAdmissionKey>> {
+        let schema_ir = catalog.bound_schema_ir().ok_or_else(|| {
+            OmniError::manifest_internal(
+                "native branch control requires an identity-bound catalog for stream admission",
+            )
+        })?;
+        let mut keys = BTreeSet::new();
+        for (stable_table_id, table_incarnation_id) in schema_ir
+            .nodes
+            .iter()
+            .map(|node| (node.type_id.get(), node.table_incarnation_id.get()))
+            .chain(
+                schema_ir
+                    .edges
+                    .iter()
+                    .map(|edge| (edge.type_id.get(), edge.table_incarnation_id.get())),
+            )
+        {
+            let identity = super::manifest::TableIdentity::new(
+                stable_table_id,
+                table_incarnation_id,
+            )?;
+            keys.insert(StreamAdmissionKey::for_resolved_ref(identity, None));
+        }
+        Ok(keys.into_iter().collect())
+    }
+
+    /// Capture provisional admission domains from the durable schema contract,
+    /// not from `__manifest`. This keeps long-lived handles current across a
+    /// schema apply without spending the branch control's single authoritative
+    /// manifest capture before its gates. A concurrent schema transition is
+    /// caught by the fresh under-gate coverage check.
+    async fn capture_branch_control_stream_admission_keys(
+        &self,
+    ) -> Result<Vec<StreamAdmissionKey>> {
+        let (schema_ir, _) =
+            load_validated_schema_contract(self.uri(), Arc::clone(&self.storage)).await?;
+        let catalog = build_catalog_from_ir(&schema_ir)?;
+        Self::branch_control_stream_admission_keys(&catalog)
+    }
+
+    fn ensure_branch_control_stream_admission_covered(
+        operation: &str,
+        expected: &[StreamAdmissionKey],
+        source: &Snapshot,
+    ) -> Result<()> {
+        let mut actual = BTreeSet::new();
+        for entry in source.entries() {
+            actual.insert(StreamAdmissionKey::for_resolved_ref(entry.identity, None));
+        }
+        if actual
+            .iter()
+            .any(|key| expected.binary_search(key).is_err())
+        {
+            return Err(OmniError::manifest_read_set_changed(
+                format!("{operation}:stream_admission_domains"),
+                Some(format!("{expected:?}")),
+                Some(format!("{actual:?}")),
+            ));
+        }
+        Ok(())
+    }
+
+    fn ensure_branch_control_streams_sealed(operation: &str, source: &Snapshot) -> Result<()> {
+        source.ensure_stream_branch_controls_allowed(
+            operation,
+            source.entries().map(|entry| entry.identity),
+        )
+    }
+
     fn ensure_branch_create_namespace_safe(target: &str, branches: &[String]) -> Result<()> {
         if branches.iter().any(|candidate| candidate == target) {
             return Err(OmniError::manifest_conflict(format!(
@@ -2561,7 +2709,7 @@ impl Omnigraph {
             .ok_or_else(|| OmniError::manifest("cannot create branch 'main'".to_string()))?;
         self.ensure_schema_state_valid().await?;
         let source = self.active_branch().await;
-        let relevant = [source.as_deref(), Some(target.as_str())];
+        let relevant = [source.as_deref(), Some(target.as_str()), None];
         // Native ref control follows the same closed barrier shape as data
         // writes: heal before accepting authority, then re-check under
         // schema -> source/target branch gates.
@@ -2570,29 +2718,39 @@ impl Omnigraph {
         crate::failpoints::maybe_fail(
             crate::failpoints::names::BRANCH_CONTROL_POST_RECOVERY_BARRIER,
         )?;
+        let admission_keys = self
+            .capture_branch_control_stream_admission_keys()
+            .await?;
+        let _stream_admission_guards = self
+            .write_queue()
+            .acquire_stream_shared_many(&admission_keys)
+            .await;
+        let control_branches = [source.clone(), Some(target.clone()), None];
         let _schema_guard = self
             .write_queue()
             .acquire(&crate::db::manifest::schema_apply_serial_queue_key())
             .await;
-        let _branch_guards = self
-            .write_queue()
-            .acquire_branches(&[source.clone(), Some(target.clone())])
-            .await;
+        let _branch_guards = self.write_queue().acquire_branches(&control_branches).await;
         self.ensure_schema_apply_not_locked("branch_create").await?;
         let control_catalog = self.build_accepted_catalog_with_schema_gate_held().await?;
-        let table_queue_keys = self.table_queue_keys_for_branches(
-            &[source.clone(), Some(target.clone())],
-            &control_catalog,
-        );
+        let table_queue_keys =
+            self.table_queue_keys_for_branches(&control_branches, &control_catalog);
         let _table_guards = self.write_queue().acquire_many(&table_queue_keys).await;
         self.ensure_no_pending_recovery_sidecars_under_gates(&relevant, "branch_create")
             .await?;
         self.ensure_schema_apply_not_locked("branch_create").await?;
         self.ensure_schema_state_valid().await?;
         let mut source_coord = self.open_coordinator_for_branch(source.as_deref()).await?;
-        validate_bound_catalog_against_snapshot(&control_catalog, &source_coord.snapshot())?;
+        let source_snapshot = source_coord.snapshot();
+        validate_bound_catalog_against_snapshot(&control_catalog, &source_snapshot)?;
+        Self::ensure_branch_control_stream_admission_covered(
+            "branch_create",
+            &admission_keys,
+            &source_snapshot,
+        )?;
         let branches = source_coord.all_branches().await?;
         Self::ensure_branch_create_namespace_safe(&target, &branches)?;
+        Self::ensure_branch_control_streams_sealed("branch_create", &source_snapshot)?;
         source_coord.branch_create(&target).await?;
         self.invalidate_read_caches().await;
         Ok(())
@@ -2655,27 +2813,30 @@ impl Omnigraph {
         let target_branch = normalize_branch_name(name)?
             .ok_or_else(|| OmniError::manifest("cannot create branch 'main'".to_string()))?;
         self.ensure_schema_state_valid().await?;
-        let relevant = [branch.as_deref(), Some(target_branch.as_str())];
+        let relevant = [branch.as_deref(), Some(target_branch.as_str()), None];
         self.heal_pending_recovery_sidecars_for_write(&relevant)
             .await?;
         crate::failpoints::maybe_fail(
             crate::failpoints::names::BRANCH_CONTROL_POST_RECOVERY_BARRIER,
         )?;
+        let admission_keys = self
+            .capture_branch_control_stream_admission_keys()
+            .await?;
+        let _stream_admission_guards = self
+            .write_queue()
+            .acquire_stream_shared_many(&admission_keys)
+            .await;
+        let control_branches = [branch.clone(), Some(target_branch.clone()), None];
         let _schema_guard = self
             .write_queue()
             .acquire(&crate::db::manifest::schema_apply_serial_queue_key())
             .await;
-        let _branch_guards = self
-            .write_queue()
-            .acquire_branches(&[branch.clone(), Some(target_branch.clone())])
-            .await;
+        let _branch_guards = self.write_queue().acquire_branches(&control_branches).await;
         self.ensure_schema_apply_not_locked("branch_create_from")
             .await?;
         let control_catalog = self.build_accepted_catalog_with_schema_gate_held().await?;
-        let table_queue_keys = self.table_queue_keys_for_branches(
-            &[branch.clone(), Some(target_branch.clone())],
-            &control_catalog,
-        );
+        let table_queue_keys =
+            self.table_queue_keys_for_branches(&control_branches, &control_catalog);
         let _table_guards = self.write_queue().acquire_many(&table_queue_keys).await;
         self.ensure_no_pending_recovery_sidecars_under_gates(&relevant, "branch_create_from")
             .await?;
@@ -2683,7 +2844,13 @@ impl Omnigraph {
             .await?;
         self.ensure_schema_state_valid().await?;
         let mut source_coord = self.open_coordinator_for_branch(branch.as_deref()).await?;
-        validate_bound_catalog_against_snapshot(&control_catalog, &source_coord.snapshot())?;
+        let source_snapshot = source_coord.snapshot();
+        validate_bound_catalog_against_snapshot(&control_catalog, &source_snapshot)?;
+        Self::ensure_branch_control_stream_admission_covered(
+            "branch_create_from",
+            &admission_keys,
+            &source_snapshot,
+        )?;
         let branches = source_coord.all_branches().await?;
         Self::ensure_branch_create_namespace_safe(&target_branch, &branches)?;
         // Operate on a freshly-opened source coordinator that's owned locally
@@ -2701,6 +2868,7 @@ impl Omnigraph {
         // handle issued it. Discarding `source_coord` after the call is the
         // right shape — the new branch is reachable from any subsequent
         // coordinator open.
+        Self::ensure_branch_control_streams_sealed("branch_create_from", &source_snapshot)?;
         source_coord.branch_create(&target_branch).await?;
         self.invalidate_read_caches().await;
         Ok(())
@@ -2737,15 +2905,23 @@ impl Omnigraph {
         crate::failpoints::maybe_fail(
             crate::failpoints::names::BRANCH_CONTROL_POST_RECOVERY_BARRIER,
         )?;
+        let admission_keys = self
+            .capture_branch_control_stream_admission_keys()
+            .await?;
+        let _stream_admission_guards = self
+            .write_queue()
+            .acquire_stream_shared_many(&admission_keys)
+            .await;
+        let control_branches = [Some(branch.clone()), None];
         let _schema_guard = self
             .write_queue()
             .acquire(&crate::db::manifest::schema_apply_serial_queue_key())
             .await;
-        let _branch_guard = self.write_queue().acquire_branch(Some(&branch)).await;
+        let _branch_guards = self.write_queue().acquire_branches(&control_branches).await;
         self.ensure_schema_apply_not_locked("branch_delete").await?;
         let control_catalog = self.build_accepted_catalog_with_schema_gate_held().await?;
         let table_queue_keys =
-            self.table_queue_keys_for_branches(&[Some(branch.clone())], &control_catalog);
+            self.table_queue_keys_for_branches(&control_branches, &control_catalog);
         let _table_guards = self.write_queue().acquire_many(&table_queue_keys).await;
         self.ensure_branch_delete_recovery_safe_under_gates(&branch)
             .await?;
@@ -2755,7 +2931,13 @@ impl Omnigraph {
         let mut target_control = self
             .open_coordinator_for_branch(Some(branch.as_str()))
             .await?;
-        validate_bound_catalog_against_snapshot(&control_catalog, &target_control.snapshot())?;
+        let target_snapshot = target_control.snapshot();
+        validate_bound_catalog_against_snapshot(&control_catalog, &target_snapshot)?;
+        Self::ensure_branch_control_stream_admission_covered(
+            "branch_delete",
+            &admission_keys,
+            &target_snapshot,
+        )?;
         let branches = target_control.branch_list().await?;
         if !branches.iter().any(|candidate| candidate == &branch) {
             return Err(OmniError::manifest_not_found(format!(
@@ -2766,6 +2948,7 @@ impl Omnigraph {
 
         self.ensure_branch_delete_safe(&target_control, &branch, &branches)
             .await?;
+        Self::ensure_branch_control_streams_sealed("branch_delete", &target_snapshot)?;
         self.delete_captured_branch_storage(&branch, &mut target_control)
             .await
     }
@@ -4015,6 +4198,158 @@ edge WorksAt: Person -> Company
             .unwrap();
         assert!(db.storage().has_btree_index(&ds, "id").await.unwrap());
         assert!(db.storage().has_fts_index(&ds, "name").await.unwrap());
+    }
+
+    #[tokio::test]
+    async fn schema_apply_refuses_open_stream_before_effect() {
+        let dir = tempfile::tempdir().unwrap();
+        let uri = dir.path().to_str().unwrap();
+        let db = Omnigraph::init(uri, TEST_SCHEMA).await.unwrap();
+        db.enroll_stream_table_phase_a("node:Person", None)
+            .await
+            .unwrap();
+
+        let before = db.snapshot().await;
+        let before_manifest_version = before.version();
+        let before_person_version = before.entry("node:Person").unwrap().table_version;
+        let desired = TEST_SCHEMA.replace(
+            "    age: I32?\n}",
+            "    age: I32?\n    nickname: String?\n}",
+        );
+
+        let error = db.apply_schema(&desired).await.unwrap_err();
+        match error {
+            OmniError::Manifest(error) => assert!(matches!(
+                error.details,
+                Some(crate::error::ManifestConflictDetails::StreamLifecycleConflict {
+                    table_key,
+                    lifecycle,
+                    operation,
+                    ..
+                }) if table_key == "node:Person"
+                    && lifecycle == "OPEN"
+                    && operation == "schema_apply"
+            )),
+            other => panic!("expected typed stream lifecycle conflict, got {other:?}"),
+        }
+
+        let after = db.snapshot().await;
+        assert_eq!(after.version(), before_manifest_version);
+        assert_eq!(
+            after.entry("node:Person").unwrap().table_version,
+            before_person_version,
+            "schema apply must refuse before a table effect"
+        );
+        assert!(
+            crate::db::manifest::list_sidecars(db.root_uri(), db.storage_adapter())
+                .await
+                .unwrap()
+                .is_empty(),
+            "schema apply lifecycle refusal must not arm recovery"
+        );
+    }
+
+    #[tokio::test]
+    async fn native_branch_controls_refuse_open_stream_and_allow_sealed() {
+        let dir = tempfile::tempdir().unwrap();
+        let uri = dir.path().to_str().unwrap();
+        let db = Arc::new(Omnigraph::init(uri, TEST_SCHEMA).await.unwrap());
+        db.enroll_stream_table_phase_a("node:Person", None)
+            .await
+            .unwrap();
+
+        let create_error = db.branch_create("blocked-create").await.unwrap_err();
+        match create_error {
+            OmniError::Manifest(error) => assert!(matches!(
+                error.details,
+                Some(crate::error::ManifestConflictDetails::StreamLifecycleConflict {
+                    table_key,
+                    lifecycle,
+                    operation,
+                    ..
+                }) if table_key == "node:Person"
+                    && lifecycle == "OPEN"
+                    && operation == "branch_create"
+            )),
+            other => panic!("expected typed branch-create lifecycle conflict, got {other:?}"),
+        }
+
+        let create_from_error = db
+            .branch_create_from(ReadTarget::branch("main"), "blocked-create-from")
+            .await
+            .unwrap_err();
+        match create_from_error {
+            OmniError::Manifest(error) => assert!(matches!(
+                error.details,
+                Some(crate::error::ManifestConflictDetails::StreamLifecycleConflict {
+                    table_key,
+                    lifecycle,
+                    operation,
+                    ..
+                }) if table_key == "node:Person"
+                    && lifecycle == "OPEN"
+                    && operation == "branch_create_from"
+            )),
+            other => panic!("expected typed create-from lifecycle conflict, got {other:?}"),
+        }
+        assert_eq!(db.branch_list().await.unwrap(), vec!["main".to_string()]);
+
+        let mut manifest = ManifestCoordinator::open(uri).await.unwrap();
+        let current = manifest
+            .snapshot()
+            .stream_lifecycle(manifest.snapshot().entry("node:Person").unwrap().identity)
+            .cloned()
+            .unwrap();
+        let mut sealed = current.clone();
+        sealed.lifecycle = crate::db::manifest::StreamLifecycle::Sealed;
+        manifest
+            .commit_changes(&[ManifestChange::SetStreamLifecycle {
+                expected: Some(current),
+                next: sealed,
+            }])
+            .await
+            .unwrap();
+
+        let person_identity = manifest.snapshot().entry("node:Person").unwrap().identity;
+        let admission_key = StreamAdmissionKey::for_resolved_ref(person_identity, None);
+        let exclusive = db
+            .write_queue()
+            .acquire_stream_exclusive(&admission_key)
+            .await;
+        let create_db = Arc::clone(&db);
+        let mut create =
+            tokio::spawn(async move { create_db.branch_create("sealed-control").await });
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(50), &mut create)
+                .await
+                .is_err(),
+            "branch create must wait behind the outer stream-admission lease"
+        );
+        drop(exclusive);
+        create.await.unwrap().unwrap();
+        assert!(
+            db.branch_list()
+                .await
+                .unwrap()
+                .contains(&"sealed-control".to_string())
+        );
+
+        let exclusive = db
+            .write_queue()
+            .acquire_stream_exclusive(&admission_key)
+            .await;
+        let delete_db = Arc::clone(&db);
+        let mut delete =
+            tokio::spawn(async move { delete_db.branch_delete("sealed-control").await });
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(50), &mut delete)
+                .await
+                .is_err(),
+            "branch delete must wait behind the outer stream-admission lease"
+        );
+        drop(exclusive);
+        delete.await.unwrap().unwrap();
+        assert_eq!(db.branch_list().await.unwrap(), vec!["main".to_string()]);
     }
 
     #[tokio::test]
