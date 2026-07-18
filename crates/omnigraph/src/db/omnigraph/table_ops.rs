@@ -717,9 +717,9 @@ async fn plan_index_work_node(
                 // explicit names; the same-column batch test). It is held
                 // back because Lance's second-generation shallow clones
                 // cannot read parent index files at all — every indexed read
-                // through a branch-of-a-branch fork hard-errors, and the
-                // companion would widen that exposure to every `@key`
-                // equality lookup. Re-land when
+                // through a branch-of-a-branch fork hard-errors
+                // (lance-format/lance#7840), and the companion would widen
+                // that exposure to every `@key` equality lookup. Re-land when
                 // `lance_surface_guards::second_generation_branch_index_reads_fail_upstream`
                 // turns red (its panic message carries the checklist).
             }

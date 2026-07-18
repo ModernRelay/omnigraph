@@ -2350,7 +2350,7 @@ async fn contains_filter_routes_to_ngram_index_and_rechecks_exactly() {
         ids_for(&ds, contains(ident("text"), lit("ta ray"))).await,
         vec!["2"]
     );
-    // KNOWN UPSTREAM BUG (pinned): a needle below the trigram width (3)
+    // KNOWN UPSTREAM BUG (pinned; lance-format/lance#7841): a needle below the trigram width (3)
     // should degrade to a recheck-everything scan — the NGram index returns
     // an `at_least(empty)` lower bound for it — but the scan planner treats
     // the empty probe as authoritative and returns ZERO rows: silent row
@@ -2485,6 +2485,8 @@ async fn second_index_on_column_requires_explicit_distinct_name() {
 }
 
 // --- Guard 24: second-generation shallow-clone index reads fail upstream ------
+//
+// Upstream tracking: lance-format/lance#7840.
 //
 // PURE-LANCE repro of the fork-lineage index bug (no omnigraph code): a
 // dataset's index files are recorded via `base_paths` redirects when a branch

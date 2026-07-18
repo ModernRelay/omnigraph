@@ -18,11 +18,11 @@ list/`Blob` columns → none.
 > inverted index, which Lance does **not** consult for `=`/range/`starts_with`
 > — only for `search`/`match_text`/`bm25`. Those filters stay correct but fall
 > back to a scan. A companion BTREE that closes this gap is implemented (see
-> the `dual-btree-companion` branch) but deferred on an upstream Lance bug:
-> second-generation shallow clones (a branch of a branch, e.g. after a
-> fast-forward merge into a non-main target) cannot read parent index files at
-> all, and the companion would widen that failure to every `@key` equality
-> lookup. The bug is pinned by
+> the `dual-btree-companion` branch) but deferred on an upstream Lance bug
+> (lance-format/lance#7840): second-generation shallow clones (a branch of a
+> branch, e.g. after a fast-forward merge into a non-main target) cannot read
+> parent index files at all, and the companion would widen that failure to
+> every `@key` equality lookup. The bug is pinned by
 > `lance_surface_guards::second_generation_branch_index_reads_fail_upstream`,
 > which turns red when a Lance bump fixes it.
 
