@@ -23,12 +23,18 @@
 //! Functions decorated `#[tokio::test]` actually run; they construct real
 //! values and assert field shapes / types.
 
+use std::collections::HashMap;
 use std::sync::Arc;
 
 use arrow_array::{Int32Array, RecordBatch, RecordBatchIterator, StringArray};
 use arrow_schema::{DataType, Field, Schema};
 use lance::Dataset;
 use lance::dataset::builder::DatasetBuilder;
+use lance::dataset::cleanup::{CleanupPolicy, cleanup_old_versions};
+use lance::dataset::mem_wal::{
+    BatchDurableWatcher, DatasetMemWalExt, InitializeMemWalBuilder, ShardManifestStore,
+    ShardWriter, ShardWriterConfig, WriteResult,
+};
 use lance::dataset::optimize::{CompactionOptions, compact_files};
 use lance::dataset::refs::BranchIdentifier;
 use lance::dataset::transaction::{Operation, Transaction};
@@ -53,6 +59,10 @@ use lance_index::scalar::ScalarIndexParams;
 use lance_io::object_store::ObjectStoreRegistry;
 use lance_namespace::LanceNamespace;
 use lance_table::io::commit::{ManifestLocation, ManifestNamingScheme};
+use lance_table::system_index::mem_wal::{
+    IndexCatchupProgress, MemWalIndexDetails, MergedGeneration, ShardId, ShardManifest,
+    ShardStatus, ShardingField, ShardingSpec,
+};
 use omnigraph_compiler::schema::parser::parse_schema;
 
 #[test]
@@ -97,6 +107,34 @@ async fn fresh_dataset(uri: &str) -> Dataset {
         ..Default::default()
     };
     Dataset::write(reader, uri, Some(params)).await.unwrap()
+}
+
+/// Append one uniquely keyed row while preserving the V2_2/stable-row-id shape
+/// used by the production tables. Tag/cleanup guards use this to create exact,
+/// distinguishable versions without introducing a graph-level writer.
+async fn append_guard_row(dataset: &mut Dataset, id: &str, value: i32) {
+    let schema = Arc::new(Schema::from(dataset.schema()));
+    let batch = RecordBatch::try_new(
+        schema.clone(),
+        vec![
+            Arc::new(StringArray::from(vec![id])),
+            Arc::new(Int32Array::from(vec![value])),
+        ],
+    )
+    .unwrap();
+    let reader = RecordBatchIterator::new(vec![Ok(batch)], schema);
+    dataset
+        .append(
+            reader,
+            Some(WriteParams {
+                mode: WriteMode::Append,
+                enable_stable_row_ids: true,
+                data_storage_version: Some(LanceFileVersion::V2_2),
+                ..Default::default()
+            }),
+        )
+        .await
+        .unwrap();
 }
 
 /// RFC-024 Gate A candidate built exclusively from public Lance surfaces.
@@ -587,11 +625,14 @@ async fn public_physical_ref_token_rejects_local_same_version_aba() {
     recreate_named_branch_and_assert_token_changes(&mut second, true).await;
 }
 
-/// Exercise the production-shaped shared-Session case. Once the
-/// canonical first incarnation is cached, deleting and recreating main at the
-/// same URI/version must still resolve the second incarnation rather than reuse
-/// the cached transaction UUID. A fresh public DatasetBuilder open is the
-/// cache-bypass fallback and must agree with the shared-Session result.
+/// Exercise the production-shaped shared-Session case. "Stable" here means
+/// stable across an unchanged reopen: an ordinary commit must rotate the
+/// current transaction/e_tag witness while preserving the branch identifier.
+/// Once the canonical first incarnation is cached, deleting and recreating
+/// main at the same URI/version must still resolve the second incarnation
+/// rather than reuse the cached transaction UUID. A fresh public DatasetBuilder
+/// open is the cache-bypass fallback and must agree with the shared-Session
+/// result.
 #[tokio::test]
 async fn local_physical_ref_token_is_stable_and_survives_shared_session_aba() {
     let dir = tempfile::tempdir().unwrap();
@@ -608,7 +649,7 @@ async fn local_physical_ref_token_is_stable_and_survives_shared_session_aba() {
     drop(first_committed);
 
     let shared_session = Arc::new(Session::default());
-    let first = DatasetBuilder::from_uri(uri)
+    let mut first = DatasetBuilder::from_uri(uri)
         .with_session(shared_session.clone())
         .load()
         .await
@@ -630,6 +671,25 @@ async fn local_physical_ref_token_is_stable_and_survives_shared_session_aba() {
         "a canonical token must be stable across unchanged shared-Session reopens"
     );
     drop(first_again);
+
+    append_guard_row(&mut first, "ordinary-head-advance", 3).await;
+    let advanced_token = public_physical_ref_incarnation(&first).await;
+    assert_eq!(
+        advanced_token.branch_identifier, first_token.branch_identifier,
+        "an ordinary main commit must preserve the native branch identifier"
+    );
+    assert_ne!(
+        advanced_token.transaction_uuid, first_token.transaction_uuid,
+        "the public composite is a current-HEAD witness: an ordinary commit must rotate its transaction UUID"
+    );
+    assert_ne!(
+        advanced_token.manifest_e_tag, first_token.manifest_e_tag,
+        "the public composite is a current-HEAD witness: an ordinary commit must rotate its manifest e_tag"
+    );
+    assert_ne!(
+        advanced_token, first_token,
+        "the current-HEAD witness must not be mistaken for an immutable dataset-incarnation token"
+    );
     drop(first);
 
     std::fs::remove_dir_all(&path).expect("the first local dataset must be deleted completely");
@@ -683,8 +743,8 @@ async fn local_physical_ref_token_is_stable_and_survives_shared_session_aba() {
 async fn public_physical_ref_token_rejects_s3_same_version_aba() {
     let Ok(bucket) = std::env::var("OMNIGRAPH_S3_TEST_BUCKET") else {
         eprintln!(
-            "skipping RFC-024 S3 physical-ref token guard: \
-             OMNIGRAPH_S3_TEST_BUCKET is not set"
+            "SKIP public_physical_ref_token_rejects_s3_same_version_aba: \
+             OMNIGRAPH_S3_TEST_BUCKET unset"
         );
         return;
     };
@@ -763,6 +823,149 @@ async fn public_physical_ref_token_rejects_s3_same_version_aba() {
         .remove_dir_all(path)
         .await
         .expect("configured S3/RustFS test prefix cleanup must succeed");
+}
+
+// --- Guard 2c: RFC-026 public MemWAL enrollment/admission surfaces --------
+//
+// Gate E0 consumes only public RC.1 shapes. The initializer still commits
+// internally and returns no receipt; shard claim is a separate writer-open
+// effect. Pin that exact boundary plus the public read-back, fencing, and
+// durability-watcher surfaces. Runtime classification belongs to the isolated
+// enrollment probe rather than being duplicated in this compatibility file.
+#[allow(
+    dead_code,
+    unreachable_code,
+    unused_variables,
+    unused_mut,
+    clippy::diverging_sub_expression
+)]
+async fn _compile_mem_wal_enrollment_and_admission_surfaces() -> lance::Result<()> {
+    let dataset: &mut Dataset = unimplemented!();
+
+    // RFC-026 Gate E0 deliberately consumes this doc-hidden, immediate
+    // attached-successor probe instead of resolving latest/listing history.
+    let _has_exact_successor: bool = dataset.has_successor_version().await?;
+
+    let initializer: InitializeMemWalBuilder<'_> = dataset.initialize_mem_wal();
+    let _: () = initializer
+        .unsharded()
+        .writer_config_defaults(ShardWriterConfig::default())
+        .add_writer_config_default("omnigraph.enrollment_id", "compile-guard")
+        .execute()
+        .await?;
+
+    let details: Option<MemWalIndexDetails> = dataset.mem_wal_index_details().await?;
+    if let Some(details) = details {
+        let _snapshot_ts_millis: i64 = details.snapshot_ts_millis;
+        let _num_shards: u32 = details.num_shards;
+        let _inline_snapshots: Option<Vec<u8>> = details.inline_snapshots;
+        let sharding_specs: Vec<ShardingSpec> = details.sharding_specs;
+        for spec in sharding_specs {
+            let _spec_id: u32 = spec.spec_id;
+            let fields: Vec<ShardingField> = spec.fields;
+            for field in fields {
+                let _field_id: String = field.field_id;
+                let _source_ids: Vec<i32> = field.source_ids;
+                let _transform: Option<String> = field.transform;
+                let _expression: Option<String> = field.expression;
+                let _result_type: String = field.result_type;
+                let _parameters: HashMap<String, String> = field.parameters;
+            }
+        }
+        let _maintained_indexes: Vec<String> = details.maintained_indexes;
+        let _merged_generations: Vec<MergedGeneration> = details.merged_generations;
+        let _index_catchup: Vec<IndexCatchupProgress> = details.index_catchup;
+        let _writer_config_defaults: HashMap<String, String> = details.writer_config_defaults;
+    }
+    let _shard_ids: Vec<ShardId> = dataset.list_mem_wal_latest_shard_ids().await?;
+
+    let shard_id = ShardWriterConfig::default().shard_id;
+    let config = ShardWriterConfig::new(shard_id)
+        .with_shard_spec_id(1)
+        .with_durable_write(true)
+        .with_max_wal_buffer_size(1024 * 1024);
+    let _config_shard_id: ShardId = config.shard_id;
+    let _config_shard_spec_id: u32 = config.shard_spec_id;
+    let _config_durable_write: bool = config.durable_write;
+    let _config_max_wal_buffer_size: usize = config.max_wal_buffer_size;
+    let writer: ShardWriter = dataset.mem_wal_writer(shard_id, config).await?;
+    let _writer_shard_id = writer.shard_id();
+    let _writer_epoch: u64 = writer.epoch();
+    let writer_manifest: Option<ShardManifest> = writer.manifest().await?;
+    if let Some(manifest) = writer_manifest {
+        let _version: u64 = manifest.version;
+        let _epoch: u64 = manifest.writer_epoch;
+        let _status: ShardStatus = manifest.status;
+        let _last_seen: u64 = manifest.wal_entry_position_last_seen;
+    }
+    let _: () = writer.check_fenced().await?;
+
+    let (write, watcher): (WriteResult, Option<BatchDurableWatcher>) =
+        writer.put_no_wait(Vec::new()).await?;
+    let _batch_positions: std::ops::Range<usize> = write.batch_positions;
+    if let Some(mut watcher) = watcher {
+        let _already_durable: bool = watcher.is_durable();
+        let _: () = watcher.wait().await?;
+    }
+
+    let memtable_stats = writer.memtable_stats().await?;
+    let _row_count: usize = memtable_stats.row_count;
+    let _batch_count: usize = memtable_stats.batch_count;
+    let _estimated_size: usize = memtable_stats.estimated_size;
+    let _generation: u64 = memtable_stats.generation;
+    let _max_buffered_batch_position: Option<usize> = memtable_stats.max_buffered_batch_position;
+    let _max_flushed_batch_position: Option<usize> = memtable_stats.max_flushed_batch_position;
+    let _pending_wal_start_batch_position: Option<usize> =
+        memtable_stats.pending_wal_start_batch_position;
+    let _pending_wal_end_batch_position: Option<usize> =
+        memtable_stats.pending_wal_end_batch_position;
+    let _pending_wal_batch_count: usize = memtable_stats.pending_wal_batch_count;
+    let _pending_wal_row_count: usize = memtable_stats.pending_wal_row_count;
+    let _pending_wal_estimated_bytes: usize = memtable_stats.pending_wal_estimated_bytes;
+
+    let wal_stats = writer.wal_stats();
+    let _next_wal_entry_position: u64 = wal_stats.next_wal_entry_position;
+
+    let _: () = writer.force_seal_active().await?;
+    let _: () = writer.wait_for_flush_drain().await?;
+
+    let write_stats = writer.stats();
+    let _put_count: u64 = write_stats.put_count;
+    let _put_time: std::time::Duration = write_stats.put_time;
+    let _wal_flush_count: u64 = write_stats.wal_flush_count;
+    let _wal_flush_time: std::time::Duration = write_stats.wal_flush_time;
+    let _wal_flush_bytes: u64 = write_stats.wal_flush_bytes;
+    let _wal_io_time: std::time::Duration = write_stats.wal_io_time;
+    let _wal_io_count: u64 = write_stats.wal_io_count;
+    let _index_update_time: std::time::Duration = write_stats.index_update_time;
+    let _index_update_count: u64 = write_stats.index_update_count;
+    let _index_update_rows: u64 = write_stats.index_update_rows;
+    let _memtable_flush_count: u64 = write_stats.memtable_flush_count;
+    let _memtable_flush_time: std::time::Duration = write_stats.memtable_flush_time;
+    let _memtable_flush_rows: u64 = write_stats.memtable_flush_rows;
+
+    let manifest_store: &ShardManifestStore = unimplemented!();
+    let initialized: ShardManifest = manifest_store.initialize_shard(1, HashMap::new()).await?;
+    let latest: Option<ShardManifest> = manifest_store.read_latest().await?;
+    if let Some(latest) = latest {
+        let reread: ShardManifest = manifest_store.read_version(latest.version).await?;
+        let _claim: (u64, ShardManifest) = manifest_store.claim_epoch(reread.shard_spec_id).await?;
+        let _: () = manifest_store.check_fenced(reread.writer_epoch).await?;
+    }
+    let _updated: ShardManifest = manifest_store
+        .commit_update(initialized.writer_epoch, |current| ShardManifest {
+            version: current.version + 1,
+            ..current.clone()
+        })
+        .await?;
+
+    let mut merge = MergeInsertBuilder::try_new(Arc::new(dataset.clone()), vec!["id".to_string()])?;
+    let _: &mut MergeInsertBuilder =
+        merge.mark_generations_as_merged(vec![MergedGeneration::new(shard_id, 1)]);
+
+    let _: () = writer.close().await?;
+
+    Ok(())
 }
 
 // --- Guard 3: checkout_version + restore async chain -----------------------
@@ -1004,7 +1207,7 @@ async fn _compile_uncommitted_merge_insert_field_shape() -> lance::Result<()> {
 // The branch-delete reconciler (`db/omnigraph/optimize.rs::reconcile_orphaned_branches`)
 // and the eager best-effort reclaim in `cleanup_deleted_branch_tables` call
 // `force_delete_branch` to drop orphaned branch refs. The single-authority
-// design relies on five facts pinned here:
+// design relies on six facts pinned here:
 //   1. plain `delete_branch` errors on a missing ref (so the design uses the
 //      force variant instead);
 //   2. `force_delete_branch` removes an existing (forked) branch — the orphan
@@ -1019,6 +1222,9 @@ async fn _compile_uncommitted_merge_insert_field_shape() -> lance::Result<()> {
 //   5. a live slash-name path-child makes force delete remove an ancestor's
 //      BranchContents but intentionally retain its dataset files. OmniGraph's
 //      prefix-disjoint live-name invariant prevents this false-success shape.
+//   6. a tag targeting a named branch does not retain `tree/{branch}`. RFC-025
+//      must therefore refuse graph-branch deletion while checkpoint authority
+//      names that branch; the Lance tag alone is not a deletion fence.
 
 #[tokio::test]
 async fn force_delete_branch_semantics() {
@@ -1036,12 +1242,39 @@ async fn force_delete_branch_semantics() {
 
     // (2) force_delete_branch removes an existing (forked) branch.
     let base = ds.version().version;
-    ds.create_branch("feature", base, None).await.unwrap();
+    let feature = ds.create_branch("feature", base, None).await.unwrap();
+    let feature_version = feature.version().version;
+    let branch_delete_tag = concat!(
+        "ogcp_v1_01J00000000000000000000000_t_",
+        "00112233445566778899aabbccddeeff00112233445566778899aabbccddeeff"
+    );
+    ds.tags()
+        .create(branch_delete_tag, ("feature", feature_version))
+        .await
+        .expect("the RFC-025 deterministic internal spelling must be a valid Lance tag");
     ds.force_delete_branch("feature").await.unwrap();
     assert!(
         !ds.list_branches().await.unwrap().contains_key("feature"),
         "force_delete_branch should remove an existing branch ref"
     );
+    assert!(
+        !std::path::Path::new(uri)
+            .join("tree")
+            .join("feature")
+            .exists(),
+        "a tag targeting a named branch must not retain its physical branch tree"
+    );
+    assert_eq!(
+        ds.tags().get(branch_delete_tag).await.unwrap().version,
+        feature_version,
+        "branch deletion must not be mistaken for tag deletion"
+    );
+    assert!(
+        ds.checkout_version(branch_delete_tag).await.is_err(),
+        "the surviving tag must not make a deleted branch version readable; \
+         OmniGraph's checkpoint-aware branch-delete guard is load-bearing"
+    );
+    ds.tags().delete(branch_delete_tag).await.unwrap();
 
     // (3) Force delete is idempotent even when both the ref and tree are absent.
     ds.force_delete_branch("never").await.unwrap();
@@ -1094,6 +1327,129 @@ async fn force_delete_branch_semantics() {
             .join("_versions")
             .exists(),
         "Lance must retain ancestor dataset files while a physical path-child is live"
+    );
+}
+
+// --- Guard 9b: RFC-025 tag targets and sparse cleanup protection -----------
+//
+// This is deliberately a substrate-only activation gate: it writes no
+// OmniGraph checkpoint rows and changes no graph format. It pins the Lance
+// facts RFC-025 would consume:
+//   * the proposed deterministic `ogcp_v1_...` spellings are valid tag names;
+//   * exact main and named-branch targets remain distinct even at overlapping
+//     numeric versions;
+//   * a sparse tagged old version survives cleanup while adjacent eligible
+//     versions are reclaimed; and
+//   * deleting the tag makes that last old version reclaimable.
+#[tokio::test]
+async fn native_tags_pin_exact_main_and_named_branch_versions_through_cleanup() {
+    const MAIN_TAG: &str = concat!(
+        "ogcp_v1_01J00000000000000000000000_m_",
+        "9f86d081884c7d659a2feaa0c55ad015a3bf4f1b2b0b822cd15d6c15b0f00a08"
+    );
+    const TABLE_TAG: &str = concat!(
+        "ogcp_v1_01J00000000000000000000000_t_",
+        "00112233445566778899aabbccddeeff00112233445566778899aabbccddeeff"
+    );
+
+    let dir = tempfile::tempdir().unwrap();
+    let uri = dir.path().join("guard9b.lance");
+    let uri = uri.to_str().unwrap();
+    let mut main = fresh_dataset(uri).await;
+
+    let main_v1 = main.version().version;
+    append_guard_row(&mut main, "main-only", 10).await;
+    let main_v2 = main.version().version;
+    assert_eq!(
+        main_v2,
+        main_v1 + 1,
+        "the main fixture must have two versions"
+    );
+
+    // Fork from main v1 after main has advanced. The branch deliberately
+    // reuses numeric v1 so the tag's branch component is load-bearing.
+    let mut feature = main
+        .create_branch("checkpoint-feature", main_v1, None)
+        .await
+        .unwrap();
+    let feature_v1 = feature.version().version;
+    assert_eq!(feature_v1, main_v1);
+    append_guard_row(&mut feature, "feature-v2", 20).await;
+    let feature_v2 = feature.version().version;
+    append_guard_row(&mut feature, "feature-v3", 30).await;
+    let feature_v3 = feature.version().version;
+    append_guard_row(&mut feature, "feature-v4", 40).await;
+    let feature_v4 = feature.version().version;
+    assert_eq!((feature_v2, feature_v3, feature_v4), (2, 3, 4));
+
+    let main_head_before_tags = main.version().version;
+    let feature_head_before_tags = feature.version().version;
+    main.tags()
+        .create(MAIN_TAG, (None::<&str>, Some(main_v1)))
+        .await
+        .expect("RFC-025's deterministic manifest-tag spelling must be accepted");
+    main.tags()
+        .create(TABLE_TAG, ("checkpoint-feature", feature_v2))
+        .await
+        .expect("RFC-025's deterministic table-tag spelling must be accepted");
+
+    let main_contents = main.tags().get(MAIN_TAG).await.unwrap();
+    assert_eq!(main_contents.branch, None);
+    assert_eq!(main_contents.version, main_v1);
+    let table_contents = main.tags().get(TABLE_TAG).await.unwrap();
+    assert_eq!(table_contents.branch.as_deref(), Some("checkpoint-feature"));
+    assert_eq!(table_contents.version, feature_v2);
+    assert_eq!(
+        main.version().version,
+        main_head_before_tags,
+        "tag creation is auxiliary metadata and must not advance main"
+    );
+    assert_eq!(
+        feature.version().version,
+        feature_head_before_tags,
+        "tag creation is auxiliary metadata and must not advance the named branch"
+    );
+
+    let tagged_main = main.checkout_version(MAIN_TAG).await.unwrap();
+    assert_eq!(tagged_main.version().version, main_v1);
+    assert_eq!(tagged_main.count_rows(None).await.unwrap(), 2);
+    let tagged_feature = main.checkout_version(TABLE_TAG).await.unwrap();
+    assert_eq!(tagged_feature.version().version, feature_v2);
+    assert_eq!(tagged_feature.count_rows(None).await.unwrap(), 3);
+
+    let cleanup_policy = CleanupPolicy {
+        before_version: Some(feature_v4),
+        error_if_tagged_old_versions: false,
+        ..Default::default()
+    };
+    let removed = cleanup_old_versions(&feature, cleanup_policy.clone())
+        .await
+        .unwrap();
+    assert_eq!(
+        removed.old_versions, 2,
+        "branch v1 and v3 are eligible and untagged; sparse tagged v2 must survive"
+    );
+    assert!(feature.checkout_version(feature_v1).await.is_err());
+    assert!(feature.checkout_version(feature_v3).await.is_err());
+    assert!(feature.checkout_version(feature_v2).await.is_ok());
+    assert!(feature.checkout_version(feature_v4).await.is_ok());
+    assert!(
+        main.checkout_version(MAIN_TAG).await.is_ok(),
+        "branch cleanup must not confuse an overlapping main-version tag with a branch tag"
+    );
+
+    main.tags().delete(TABLE_TAG).await.unwrap();
+    let removed = cleanup_old_versions(&feature, cleanup_policy)
+        .await
+        .unwrap();
+    assert_eq!(
+        removed.old_versions, 1,
+        "deleting the tag must make the formerly pinned branch v2 reclaimable"
+    );
+    assert!(feature.checkout_version(feature_v2).await.is_err());
+    assert!(
+        main.checkout_version(MAIN_TAG).await.is_ok(),
+        "deleting one deterministic tag must not disturb a different checkpoint target"
     );
 }
 
@@ -1791,7 +2147,8 @@ async fn unenforced_primary_key_is_immutable_once_set() {
 //
 // RFC-023 can rely on Lance's key-conflict fencing only when every keyed
 // insert produces an `Operation::Update.inserted_rows_filter`. On the pinned
-// Lance revision that is a route-dependent contract: the v2 plan emits a filter when the ordered
+// Lance revision that
+// is a route-dependent contract: the v2 plan emits a filter when the ordered
 // ON field ids exactly match the unenforced PK, while the scalar-index v1 path
 // and non-PK ON shapes emit `None`. A matched-only v2 update still emits
 // `Some(empty Bloom)`, which is important because `Some` selects the strict

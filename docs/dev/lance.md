@@ -177,29 +177,72 @@ Behavior-affecting findings in this audit:
   branch/tag/cleanup behavior, shared `Session` construction, merge-insert
   filter emission, the directional filtered/unfiltered conflict resolver, and
   full-table `CreateIndexBuilder::execute_uncommitted` retain the shapes
-  OmniGraph consumes. All 22 Lance surface guards pass on RC.1, including the
-  branch/ABA, blob-compaction, key-filter, shared-session, vector-staging, and
-  compiler-reservation cells. Search, writes, schema apply, branching,
-  maintenance, row-version, ordinary recovery, and all 129 runnable failpoint
-  tests also pass. A graph initialized and populated by the cached beta.21 CLI
-  was opened, queried, merge-written, and queried again by the RC.1 CLI, proving
-  the supported ordinary-schema V2_2 forward-open/write path rather than
-  relying only on fresh RC fixtures. This proof intentionally does not cover
-  the two newly reserved row-version names; their explicit upgrade path is
-  documented below.
+  OmniGraph consumes. All 23 Lance surface guards pass on RC.1, including the
+  exact tag/branch/ABA, blob-compaction, key-filter, shared-session, and vector
+  staging cells. Search, writes, schema apply, branching, maintenance,
+  row-version, ordinary recovery, and all 129 runnable failpoint tests also
+  pass. A graph initialized and populated by the cached beta.21 CLI was opened,
+  queried, merge-written, and queried again by the RC.1 CLI, proving the
+  supported ordinary-schema V2_2 forward-open/write path rather than relying
+  only on fresh RC fixtures. This proof intentionally does not cover the two
+  newly reserved row-version names; their explicit upgrade path is documented
+  below.
 - **Data Overlay is not an OmniGraph primitive.** RC.1 adds the experimental,
   opt-in `Operation::DataOverlay` and table feature flag 64. OmniGraph neither
   enables that flag nor emits the operation; its recovery classifiers keep
   unknown foreign effects on the fail-closed path. The explicit V2_2 pin does
   not silently opt a dataset into overlays.
-- **MemWAL's direction improves, but RFC-026's activation blocker remains.**
+- **MemWAL's direction improves; RFC-026 now owns a bounded decision gate.**
   Derived MemWAL datasets now inherit the base dataset's store parameters and
   `Session`, which is compatible with OmniGraph's shared-session design and
   remote credentials. The public initializer still commits internally and
   shard claiming remains a separate effect: there is still no caller-owned
-  exact enrollment receipt plus reversible shard-admission seal. MemWAL stays
-  the strategic substrate; RFC-026 stays draft rather than reaching through
-  private APIs.
+  combined enrollment receipt plus reversible cross-process shard-admission
+  seal. Source inspection confirms that `execute()` builds one
+  `Operation::CreateIndex` from the current manifest, commits it through
+  `CommitBuilder`, mutates the handle, and returns `Result<()>`; the public
+  builder persists arbitrary namespaced writer defaults, and the public writer
+  path later accepts a caller-selected shard UUID and claims an observable
+  epoch. Gate E0 uses a pre-minted enrollment/config-version default as
+  read-back evidence independent of the replaceable index UUID. The public
+  branch/version/current-transaction/e_tag tuple
+  is a mutable current-HEAD witness—ordinary commits change it—not a stable
+  enrollment incarnation.
+
+  RC.1 persists writer defaults in the MemWAL index but does not apply them to
+  a caller-supplied `ShardWriterConfig`; any bounded adapter must reconstruct
+  the exact durable-write and buffer configuration rather than infer compatible
+  defaults.
+
+  MemWAL stays the strategic substrate and RFC-026 stays draft. Its
+  production-neutral Gate E0 passed for the bounded profile. The first
+  history-cost result was rejected: local
+  `checkout_latest` may discover the tip through filesystem `read_dir`, which
+  bypasses `IOTracker`, so the observed tracked GET count omitted part of the
+  lookup. RC.1's public but guide-hidden `Dataset::has_successor_version`
+  provides the accepted replacement: from a freshly ABA-verified exact `N`, it
+  tests only `N + 1` through `CommitHandler::version_exists`; the exact `N + 1`
+  handle can then reject a buried `N + 2` without latest resolution or listing.
+  `AttemptTracker` records before forwarding—including failed/`NotFound`
+  HEADs—and observes the identical complete shape at baseline versions 8 and
+  80: four successful manifest HEADs, one `NotFound` manifest HEAD, one
+  successful manifest GET, and zero lists. A Unix permissions tripwire proves
+  the exact probe works while latest enumeration fails and makes an unreadable
+  exact HEAD error.
+
+  Fourteen substantive local cells cover exact initializer readback,
+  lost-result reopening, the pre-minted empty shard, buried-effect refusal, and
+  broad fail-closed classification. The configured RustFS exact cell passes
+  non-vacuously with the same six-attempt/zero-list shape and covers the
+  positive sequence plus foreign shard, malformed/loose root, durable WAL,
+  persisted cursor, and corrupt-manifest negatives. Surface guards pin
+  `has_successor_version`, flush/drain, merged-generation state, and S3 ABA; CI
+  rejects skipped E0/ABA cells. Exclusive HEAD and cleanup/version-GC exclusion
+  remain load-bearing; only `Ok(false)` means absence, while errors, overflow,
+  or detached boundaries fail closed. No private API, raw object emulation,
+  production schema, or stream acknowledgement is introduced. The exact
+  upstream receipt/seal remains the preferred simplification and the gate for
+  broader topology.
 - **Maintenance and index defaults preserve current behavior.** Compaction
   avoids a useless fragment-reuse-index optimization in a deferred-remap case;
   OmniGraph uses `defer_index_remap=false`, and Lance still exposes no stable
@@ -221,12 +264,18 @@ Behavior-affecting findings in this audit:
   rebuilt before opening on RC.1. The audit minted a genuine beta.21 v6 graph
   with `_row_created_at_version`: beta.21 opened it successfully, while RC.1
   refused it before any write with that exact recovery instruction.
-- **RFC-024's research-blocked cost conclusion survives.** Its ignored
-  10/100/1,000 instrument keeps exact heads and indexed row/range work flat, but
-  RC.1 adds a bounded one-operation boundary at the 1,000-commit endpoint on top
-  of the already-rejected byte curves. The local default and decision-scale
-  instruments pass with these current no-go facts asserted; S3/RustFS remains
-  bucket-gated and was not available for this audit.
+- **The research-blocked cost conclusions survive, with RC-specific numbers.**
+  RFC-025's local 10→1,000 compacted reconciled list/cleanup scan bytes are now
+  17,012→38,000 cold and 12,336→15,064 warm; exact show is 29,348→53,064
+  and 24,672→30,128. Cold scan operations still cross 24→25 (show 34→35).
+  These are modest improvements over beta.21, not a change in asymptotic
+  disposition: the proposed in-manifest checkpoint registry remains rejected.
+  RFC-024's ignored 10/100/1,000 instrument likewise keeps exact heads and
+  indexed row/range work flat, but RC.1 adds a bounded one-operation boundary
+  at the 1,000-commit endpoint on top of the already-rejected byte curves. The
+  local default and decision-scale instruments pass with these current no-go
+  facts asserted; S3/RustFS remains bucket-gated and was not available for this
+  audit.
 
 ### Prior alignment audit: 2026-07-12 (Lance 9.0.0-beta.21 upstream; omnigraph pinned at 9.0.0-beta.21 via git rev)
 
@@ -282,16 +331,19 @@ Behavior-affecting findings in this audit:
   maintenance-transaction API and OmniGraph has distributed recovery fencing;
   the latter is independently required before destructive recovery is safe
   against a live foreign process.
-- **RFC-024 Gate A found a usable public ABA token but rejected the proposed
-  physical lookup shape.** The backend-portable candidate is the composite of
-  public `Dataset::branch_identifier()`, the current public
-  `Dataset::read_transaction()` UUID, and `Dataset::manifest_location().e_tag`.
+- **RFC-024 Gate A found a usable current-HEAD witness with ABA sensitivity but
+  rejected the proposed physical lookup shape.** The backend-portable candidate
+  combines the public table version, `Dataset::branch_identifier()`, the
+  current public `Dataset::read_transaction()` UUID, and
+  `Dataset::manifest_location().e_tag`.
   Capture brackets transaction/e_tag collection with two branch-identifier
   reads and fails if the ref moves; a missing transaction or empty UUID also
   fails. Beta.21's local `current_manifest_path` synthesizes an
   inode-mtime-size e_tag, while S3/RustFS returns the object e_tag. Guards prove
-  stable unchanged reopens and distinguish main and named-ref delete/recreate
-  at the same numeric version on local and S3/RustFS. The local guard reuses the
+  stability across unchanged reopens and distinguish main and named-ref
+  delete/recreate at the same numeric version on local and S3/RustFS. An
+  ordinary commit changes the witness; it is not a stable dataset/enrollment
+  incarnation. The local guard reuses the
   original shared `Session`; the S3 guard also pins unchanged-incarnation
   reopen stability. Main's canonical empty `BranchIdentifier` makes the UUID
   and e_tag load-bearing; named refs additionally mint a new branch identifier.
@@ -323,6 +375,40 @@ Behavior-affecting findings in this audit:
   `fragments_scanned`, `ranges_scanned`, and `rows_scanned` are beta.21
   `all_counts` debug names explicitly subject to change, so every Lance bump
   must re-audit them rather than silently treating them as stable API.
+- **RFC-025 Gate 0 validates Lance tags but rejects the current checkpoint-
+  registry access shape.** The pinned public tag surface targets an exact main
+  or named-branch version, creates/deletes auxiliary `_refs/tags/*.json`
+  metadata without advancing the dataset version, and exempts the tagged
+  version from cleanup. Deleting the tag makes the version reclaimable. A tag
+  on a named branch does **not** retain `tree/<branch>` after branch deletion,
+  so OmniGraph's proposed checkpoint-aware branch-delete refusal remains
+  load-bearing. `Tags::create` is an existence check followed by an
+  unconditional put on this revision, not a conditional create; RFC-025's
+  retention claim plus exact post-create verification therefore cannot be
+  replaced by the tag call itself. All 22 `lance_surface_guards` passed,
+  including `native_tags_pin_exact_main_and_named_branch_versions_through_cleanup`
+  and the extended `force_delete_branch_semantics` cell.
+
+  The separate production-neutral `checkpoint_retention_cost.rs` fixture holds
+  three checkpoints and catalog width ten constant while unrelated journal
+  history grows. At the local 10→1,000 decision endpoints, reconciled
+  uncompacted list stays at 3 rows / 3 ranges / 1 fragment / 1 page and 24 scan
+  operations / 13,752 bytes; exact show stays at 12 / 2 / 2 / 3 and 34 /
+  22,952; cleanup returns 44 rows with list-like cost. The eight-fragment tail
+  is exact and history-flat. Compaction rejects the candidate: list/cleanup
+  cold scan bytes grow 17,012→39,668 and warm bytes 12,336→16,736; exact-show
+  cold bytes grow 29,348→56,404 and warm bytes 24,672→33,472. At 1,000 commits
+  scan operations also cross 24→25 for the one-scan paths and 34→35 for show.
+  The default local 20/80 matrix passes its no-go-preservation assertions. The
+  bucket-gated S3/RustFS cost cell exists but was not run for this decision and
+  is not claimed.
+
+  This result blocks the in-manifest BTREE access shape, not checkpoint rows as
+  logical authority or Lance tags as physical pins. RFC-025 is
+  research-blocked, no retention format ships, and internal schema v6 remains
+  production truth. A successor needs a history-flat current-authority lookup
+  or revised evidence-backed operational contract without adding a second
+  authority dataset.
 - **RFC-023 key-filter behavior remains route-dependent and directional, and
   v6 closes production routing around that fact with two distinct adapters.**
   A 2026-07-14 probe on this beta.21 pin shows that an explicitly selected v2

@@ -2,7 +2,7 @@
 type: spec
 title: "RFC-025 — Checkpoint-pinned retention"
 description: Makes named graph checkpoints authoritative retention roots, materializes them as Lance-native manifest and data-table tags, and defines crash-safe reconciliation and cleanup ordering on the RFC-022 unified write path.
-status: draft
+status: research-blocked
 tags: [eng, rfc, retention, checkpoint, cleanup, manifest, lance, omnigraph]
 timestamp: 2026-07-10
 owner: OmniGraph maintainers
@@ -10,8 +10,10 @@ owner: OmniGraph maintainers
 
 # RFC-025 — Checkpoint-pinned retention
 
-**Status:** Draft / for team review
+**Status:** Research-blocked — Gate 0 rejected the current in-manifest BTREE
+access shape; no retention format is active
 **Date:** 2026-07-10
+**Gate 0 evaluated:** 2026-07-17
 **Author track:** Maintainer design series
 **Depends on:** [RFC-022](0022-unified-write-path.md)'s publisher and
 recovery-sidecar protocol and
@@ -29,10 +31,11 @@ Findings marked **BLOCKER** must be dispositioned before acceptance.
 
 ## 0. Decision
 
-OmniGraph adopts checkpoint-pinned retention. A checkpoint is a durable, named
-graph snapshot: one reference set in the reserved main-manifest registry
-containing every physical manifest/table lineage and version needed to
-reconstruct that graph state.
+OmniGraph retains checkpoint-pinned retention as the target architecture, but
+activation is research-blocked on a history-flat current-authority access
+shape. A checkpoint is a durable, named graph snapshot: one reference set in
+the reserved main-manifest registry containing every physical manifest/table
+lineage and version needed to reconstruct that graph state.
 
 The checkpoint rows are the **logical authority**. Lance tags are the
 **physical pins** that make that authority effective. This distinction is
@@ -47,6 +50,49 @@ The safe ordering is asymmetric:
 - tombstone checkpoint authority first, reclaim physical tags last.
 
 Every crash window consequently over-retains. None under-retains.
+
+### 0.1 Pre-activation Gate 0
+
+Retention is an irreversible storage-format capability, so its substrate and
+access-shape claims are proved before any production activation work starts.
+Throughout Gate 0, production remains on internal schema v6: `CURRENT` and
+`MIN_SUPPORTED` do not move, fresh graphs gain no checkpoint or GC-boundary
+rows, and no production path creates an `ogcp_` tag. Gate 0 may add only
+decision fixtures, substrate guards, and their recorded measurements.
+
+Gate 0 must establish all of the following on the pinned Lance release:
+
+- deterministic internal tag names pass Lance validation and resolve the exact
+  main or named-branch version recorded by the proposed checkpoint row;
+- a sparse tagged version survives cleanup while adjacent eligible versions
+  are removed, deleting the tag makes that version collectable, and a tag on a
+  named branch does not protect the branch tree from deletion;
+- the proposed physical-ref token is stable across an unchanged reopen and
+  changes after same-path, same-branch, same-version delete/recreate ABA on
+  local storage and S3/RustFS;
+- the storage adapter's atomic create-if-absent operation admits exactly one
+  retention-claim owner, a mismatched token cannot release the claim, and a
+  paused live owner cannot be taken over; and
+- checkpoint list, exact lookup, and cleanup-root planning pass §9's complete
+  physical-I/O gate across cold/warm, compacted/uncompacted, index-absent,
+  reconciled, and bounded-uncovered-tail cells at realistic history depth.
+
+Lance tag creation on the surveyed release is an existence check followed by
+an unconditional put, not a conditional create. The retention claim and exact
+post-create target verification are therefore load-bearing even when the tag
+surface tests pass.
+
+**Gate 0 result (2026-07-17): no-go for the current in-manifest BTREE access
+shape.** The Lance tag/cleanup substrate guards pass, but §9's decision-scale
+local matrix shows history-sensitive compacted scan bytes and an additional
+scan operation at depth 1,000. One required physical-I/O cell failing is
+sufficient to block activation; the unrun S3/RustFS cost cell is not needed to
+turn that result into a pass or a stronger claim. Internal schema v6 remains
+authoritative. This result rejects the proposed access shape, not checkpoint
+rows as logical authority or Lance tags as physical pins. A successor needs a
+history-flat current-authority lookup shape or a revised evidence-backed
+operational contract, without weakening the gate or adding a second authority
+dataset.
 
 ## 1. Scope and non-goals
 
@@ -81,16 +127,57 @@ global registry, not branch-local graph state: deleting the source branch must
 not delete the authority that protects its snapshot. One main-manifest publish
 writes:
 
-- `checkpoint_name:<normalized-name>` — unique name reservation pointing at the
-  immutable checkpoint ID;
+- `checkpoint_name:v1:<canonical-name>` — unique, normalization-versioned name
+  reservation pointing at the immutable checkpoint ID;
 - `checkpoint:<checkpoint_id>` — header containing `name`, source logical
   branch, `graph_commit_id`, source physical manifest branch and version,
   source-manifest `physical_ref_incarnation`, manifest schema stamp,
-  `created_at`, and `actor`;
+  `name_normalization_version`, `tag_encoding_version`, `created_at`, and
+  `actor`;
 - `checkpoint_table:<checkpoint_id>:<stable-table-id>:<incarnation-id>` — one
   row per pinned table containing stable table identity, table key,
   `table_path`, `table_branch`, `table_version`, and a separately named
   `physical_ref_incarnation` token (e_tag or the proven backend fallback).
+
+#### 2.1.1 CheckpointName normalization v1
+
+Checkpoint-name normalization is persisted equality semantics, not display
+cleanup. Both the name-reservation row and header store
+`name_normalization_version = 1` and the canonical name. The reservation key is
+`checkpoint_name:v1:<canonical-name>`.
+
+V1 is a validation plus identity transform over UTF-8 input:
+
+1. The input is not trimmed, case-folded, locale-folded, or Unicode-normalized.
+   Its canonical value is its exact input byte sequence after validation.
+2. The canonical value is 1 through 128 bytes inclusive and contains ASCII
+   only. Non-ASCII UTF-8, invalid UTF-8 at a decoding boundary, whitespace,
+   controls, NUL, and backslash are rejected rather than rewritten.
+3. Slash separates non-empty segments. A name cannot start or end with `/` or
+   contain `//`.
+4. Every segment matches `[A-Za-z0-9._-]+`. The complete name cannot contain
+   `..`, and no segment may end in `.lock`.
+5. Canonical names beginning with the reserved `__` or `ogcp_` byte prefixes
+   are rejected. These prefix checks are byte-exact; V1 name equality remains
+   case-sensitive, so `Release` and `release` are distinct names.
+
+Every name-taking engine, CLI, and future transport entry point runs this one
+parser before authorization or durable effects. Responses return the canonical
+stored spelling; they do not retain a second display spelling. The same
+canonical bytes are used for reservation lookup, ordering, policy scope, audit,
+and conflict details.
+
+The V1 mapping is immutable once shipped. A future normalization rule uses a
+new persisted version and format capability; it never reinterprets stored V1
+bytes or changes V1's tag names. That later specification must define its
+cross-version equivalence relation. Before admitting a name, creation computes
+the finite candidate keys for every supported normalization version and uses
+bounded exact lookups to find an equivalent live **or tombstoned** reservation.
+A live reservation conflicts; a tombstone participates in its existing
+generation-CAS reuse rather than allowing an independent reservation under the
+new version. A later format may instead use the strand rebuild and begin with
+no checkpoints, but it cannot silently merge, split, or revive V1
+reservations.
 
 Because RFC-024 heads are optional, RFC-025 owns this token contract for both
 the pinned manifest and every pinned table. The token identifies the immutable
@@ -106,7 +193,7 @@ activate the retention format.
 The name reservation, header, and every table row land in one RFC-022 publisher
 CAS on main. First creation is insert-only; reuse requires the exact tombstoned
 reservation generation in the `ReadSet`. Two concurrent attempts for the same
-normalized name therefore conflict even when they captured different source
+V1 canonical name therefore conflict even when they captured different source
 branches. A missing or duplicate table row is an invalid checkpoint, not a
 partial checkpoint.
 
@@ -141,9 +228,20 @@ and manifest version; it never implies that the checkpoint tracks a moving tip.
 Every checkpoint owns deterministic Lance tags of two kinds:
 
 ```text
-ogcp_<checkpoint-id-base32>_manifest_<branch-hash>
-ogcp_<checkpoint-id-base32>_<table-and-lineage-hash>
+ogcp_v1_<checkpoint-id-base32>_m_<physical-lineage-sha256>
+ogcp_v1_<checkpoint-id-base32>_t_<physical-lineage-sha256>
 ```
+
+`tag_encoding_version = 1` fixes this ASCII spelling. The digest is lowercase
+hex SHA-256 over a domain-separated, length-prefixed encoding of the exact
+physical target. The manifest domain includes its identity-derived
+dataset-relative path, branch, version, and physical-ref token. The table
+domain additionally includes stable table ID and incarnation plus the
+identity-derived table path, branch, version, and physical-ref token.
+Length-prefixing makes field boundaries unambiguous; the implementation test
+vectors are part of the format gate. The user-visible checkpoint name is
+deliberately absent from the tag: name-normalization evolution cannot rename a
+physical pin.
 
 The manifest tag targets the exact `(manifest_branch, manifest_version)` named
 by the header. Each table tag targets the exact `(table_branch, table_version)`
@@ -417,6 +515,13 @@ introduced here.
 
 ## 8. Format activation and rebuild compatibility
 
+Gate 0 was production-neutral and returned a no-go for the surveyed access
+shape. The shipped format therefore remains internal schema v6 and none of the
+activation or rebuild behavior below exists. The remainder of this section is
+the contingent format contract for a successor that first clears the same
+physical-I/O boundary; the Gate 0 result itself authorizes no implementation or
+format bump.
+
 This RFC owns its own internal-format activation. RFC-022 authorizes no format
 bump, and RFC-024 explicitly excludes checkpoint rows from its heads format.
 Retention may therefore be the next independently accepted format capability
@@ -455,6 +560,14 @@ another independently accepted capability, the first valid target state
 contains all of them and the combined initialization/recovery matrix must pass.
 Separate format releases imply separate rebuilds.
 
+The retention stamp must not ship as an inert capability. The first activated
+format must include, in one releasable slice, its row initialization and
+strict-rebuild/refusal boundary plus functional engine create, list, show, and
+delete, the retention claim, exact tag verification, recovery, and pin
+reconciliation. Development-only pieces may land behind test-only seams before
+that slice, but production must stay on v6 until the minimum usable contract is
+complete.
+
 ## 9. Observability and bounds
 
 Expose:
@@ -479,6 +592,42 @@ still reads history-sized manifest fragments does not pass this RFC's cost gate;
 a separate checkpoint dataset is rejected because its authority rows could not
 share the main-manifest CAS.
 
+### 9.1 Gate 0 evidence — current access shape rejected
+
+The checked-in `checkpoint_retention_cost.rs` fixture holds three live
+checkpoints and catalog width ten constant while unrelated manifest-journal
+history grows. It measures the complete list, exact show, and cleanup-root
+authority reads from a tracked cold open and a warm repeat over absent,
+reconciled, and eight-fragment uncovered-tail index states, with both compacted
+and uncompacted layouts. Object-store I/O and Lance execution-summary I/O are
+reported separately.
+
+The ignored local decision run at 10, 100, and 1,000 real commits found:
+
+- the reconciled **uncompacted** path is history-flat at the 10→1,000
+  endpoints. List reports 3 rows / 3 ranges / 1 fragment / 1 index page and 24
+  scan operations / 13,752 scan bytes. Exact show reports 12 rows / 2 ranges /
+  2 fragments / 3 pages and 34 operations / 22,952 bytes. Cleanup returns 44
+  rows with the list-like physical cost. The bounded eight-fragment tail stays
+  exact, observable, and history-flat;
+- the reconciled **compacted** path fails the required physical-I/O slope.
+  List and cleanup cold scan bytes grow from 17,012 to 38,000, and warm bytes
+  grow from 12,336 to 15,064. Exact-show cold bytes grow from 29,348 to 53,064,
+  and warm bytes from 24,672 to 30,128. At depth 1,000 the one-scan operations
+  also cross from 24 to 25 scan operations, while show crosses from 34 to 35.
+
+The default local 20/80 matrix passes its checked-in **no-go preservation**
+assertions; that means it reproduces the current blocker, not that Gate 0
+passes. The S3/RustFS matrix is checked in and bucket-gated but was not run for
+this decision, so this RFC makes no S3 cost claim.
+
+Separately, all 23 Lance surface guards pass on RC.1. The RFC-025 cells prove exact
+main and named-branch tag targets, sparse cleanup pin/unpin behavior, and that
+a tag does not protect the named branch tree. These results validate the
+physical-pin architecture but cannot compensate for the failed registry-access
+gate. Production remains on schema v6 until a successor access shape or revised
+operational contract passes the full boundary.
+
 ## 10. Acceptance gates
 
 - A checkpoint on an old sparse version survives cleanup while adjacent
@@ -493,7 +642,7 @@ share the main-manifest CAS.
   path, branch name, and numeric version with a different physical-ref token;
   checkpoint create, recovery, and reconciliation all refuse the replacement.
   A backend without a proven token refuses retention-format activation.
-- Concurrent creation of the same normalized name yields exactly one authority
+- Concurrent creation of the same V1 canonical name yields exactly one authority
   record; the losing attempt leaves only safely reclaimable tags.
 - After deletion, concurrent attempts to reuse the tombstoned name generation
   yield exactly one fresh checkpoint ID; the old checkpoint ID never revives.
@@ -530,7 +679,7 @@ share the main-manifest CAS.
 
 | Phase | Content | Gate |
 |---|---|---|
-| A | row schemas, engine DTOs, strict-format/rebuild activation, deterministic tag encoding | schema, refusal, and tag surface guards |
-| B | create sidecar, delete-operation fields in the authority CAS, and reconciler | crash matrix; sparse-pin correctness |
-| C | offline cleanup integration and GC boundary enforcement | quiescence/refusal tests; cost budgets |
-| D | CLI, policy, audit, docs, and rebuild runbook | CLI outputs; genuine upgrade test |
+| Gate 0 — pre-activation decision | production-neutral tag/cleanup semantics, physical-ref ABA, retention-claim, and checkpoint-registry physical-I/O instruments | **No-go (2026-07-17):** tags pass; compacted local registry scan bytes grow at 10→1,000 and scan operations add one boundary. S3 cost cell not run. Production remains schema v6 |
+| A — minimum usable activation | row schemas and engine DTOs; deterministic V1 name/tag encoding; retention claim; create/list/show/delete; create sidecar, delete-operation marker, pin reconciler; strict-format/refusal/rebuild activation | **Blocked on a successor Gate 0 access shape or revised evidence-backed operational contract.** Then: schema and deterministic encoding vectors; old/new refusal; complete crash matrix; sparse-pin correctness; no inert format stamp |
+| B — destructive retention | offline cleanup integration and GC-boundary enforcement | blocked with A; then quiescence/refusal tests, complete root proof, and cost budgets |
+| C — operator surface | CLI, policy, audit, observability, docs, and rebuild runbook | blocked with A; then CLI outputs, policy parity, and genuine upgrade test |

@@ -17,7 +17,7 @@ owner: OmniGraph maintainers
 `cec0b7dffe2d85c7e66dbe9d1f3891c297903a1d`; full Lance table layout,
 transaction, branching, indexing, compaction, cleanup, and object-store
 specifications
-**RC.1 evidence status (2026-07-17):** the public physical-ref and BTREE
+**RC.1 evidence status (2026-07-17):** the public current-HEAD-witness and BTREE
 surfaces remain aligned. The local 10/100/1,000 decision instrument was rerun:
 exact indexed rows, ranges, result fragments, and pages remain flat; RC.1 adds
 one bounded range-read operation and at most 128 scan bytes at the deepest
@@ -164,16 +164,24 @@ TableHeadMetadata {
     state: "live" | "tombstoned",
     stable_table_id: u64,
     incarnation_id: u64,
-    physical_ref_incarnation: String,
+    current_head_witness: CurrentHeadWitness,
     schema_ir_hash: String,
     head_graph_commit_id: Option<ULID>,
 }
+
+CurrentHeadWitness {
+    branch_identifier: BranchIdentifier,
+    table_version: u64,
+    transaction_uuid: UUID,
+    manifest_e_tag: String,
+}
 ```
 
-`physical_ref_incarnation` is the opaque encoding of one public Lance composite:
+`current_head_witness` is the encoding of one public Lance composite:
 
 ```text
-(BranchIdentifier, current Transaction.uuid, ManifestLocation.e_tag)
+(BranchIdentifier, current table version, current Transaction.uuid,
+ ManifestLocation.e_tag)
 ```
 
 Capture reads `BranchIdentifier` before and after the current transaction and
@@ -183,9 +191,12 @@ e_tag fails closed. On pinned Lance, local `current_manifest_path` synthesizes t
 e_tag from inode, mtime, and size; S3/RustFS returns the object e_tag. Main's
 `BranchIdentifier` is canonically empty, so its transaction UUID and e_tag are
 load-bearing; a named-ref recreation additionally changes `BranchIdentifier`.
-Logical `incarnation_id` cannot substitute for this composite because a
-physical owner or ref may be replaced while logical table identity is
-preserved.
+This is deliberately a **mutable current-HEAD witness**, not a stable physical
+or enrollment incarnation. An ordinary successful table commit changes the
+version, transaction UUID, and manifest e_tag, so the publisher must replace
+the witness with the exact achieved value in the same head-row update. Logical
+`incarnation_id` cannot substitute for the witness because a physical owner or
+ref may be replaced while logical table identity is preserved.
 
 The public-surface guards prove stable unchanged reopens and same-version
 delete/recreate detection for main and named refs on local FS and S3/RustFS,
@@ -231,8 +242,8 @@ transition then follows that accepted schema outcome; RFC-024 never invents it.
 
 The mutable head is not the only place that records identity. Every heads-format
 table-version, registration, rename, and tombstone journal event carries
-`stable_table_id`, `incarnation_id`, and the exact physical location/ref token
-for its table version; otherwise drop/recreate followed by a new physical
+`stable_table_id`, `incarnation_id`, and the exact `current_head_witness` for
+its table version; otherwise drop/recreate followed by a new physical
 dataset whose Lance versions restart cannot be replayed unambiguously or repair
 the full head token.
 
@@ -281,7 +292,7 @@ complete expected token:
 
 ```text
 (state, stable_table_id, incarnation_id, location, table_branch,
- physical_ref_incarnation, table_version, schema_ir_hash)
+ current_head_witness, table_version, schema_ir_hash)
 ```
 
 Any difference returns control to full RFC-022 revalidation before effects; a
@@ -311,7 +322,7 @@ A heads-format current-state read:
 4. includes only rows whose authoritative state is `live`;
 5. validates schema identity from the head payload;
 6. opens the exact pinned physical table/ref and validates
-   `physical_ref_incarnation` before exposing it;
+   `current_head_witness` before exposing it;
 7. returns one immutable `Snapshot` used for the operation's lifetime.
 
 Missing, duplicate, unknown-state, or schema-mismatched **live** heads fail
@@ -548,8 +559,10 @@ No migration claimant, per-branch conversion ledger, old-format writer mode, or
   dataset restarts Lance version numbering;
 - rename preserves identity/incarnation and changes the public key only;
 - owner-branch handoff at an equal table version updates the head;
+- every ordinary table commit advances `current_head_witness` together with
+  `table_version` in the same manifest publish;
 - delete/recreate of a dataset or native ref at the same path, branch, and
-  numeric version changes `physical_ref_incarnation` and rejects a stale
+  numeric version changes `current_head_witness` and rejects a stale
   writer, on local FS and S3/RustFS; public token detection is proven, while
   publisher-level stale-writer rejection remains unimplemented;
 - a current read refuses that same replacement until an authoritative publish
@@ -568,7 +581,7 @@ No migration claimant, per-branch conversion ledger, old-format writer mode, or
 - rollback and roll-forward assertions include head payloads, not only table
   versions;
 - publisher retry compares the complete expected token and never reparents a
-  prepared effect across a physical-ref incarnation change;
+  prepared effect across a current-HEAD-witness change;
 - a stale sidecar converges exactly once with one audit record.
 
 ### 12.3 Format and rebuild
@@ -620,7 +633,7 @@ coverage and does run against RustFS in CI.
 
 - exact heads-format metadata schema and object IDs;
 - one head row per stable identity;
-- RFC-028 stable-ID/incarnation types plus `physical_ref_incarnation` in head
+- RFC-028 stable-ID/incarnation types plus `current_head_witness` in head
   and identity-bearing journal event schemas;
 - RFC-023 PK metadata on node and edge tables when the release combines them;
 - heads-format publisher source always pairs a journal/tombstone event with a head row.
