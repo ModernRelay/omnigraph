@@ -3492,13 +3492,20 @@ async fn validate_external_blob_references(batch: &RecordBatch) -> Result<()> {
                 continue;
             }
             let uri = uris.value(row);
+            // A malformed URI is caller input, not a substrate fault: map it
+            // to the bad-request taxonomy (HTTP 400), like the unreadable
+            // case below — not OmniError::Lance (HTTP 500).
             let (store, path) = lance::io::ObjectStore::from_uri_and_params(
                 registry.clone(),
                 uri,
                 &lance::io::ObjectStoreParams::default(),
             )
             .await
-            .map_err(|error| OmniError::Lance(error.to_string()))?;
+            .map_err(|error| {
+                OmniError::manifest(format!(
+                    "external blob URI '{uri}' is not a valid object-store location: {error}"
+                ))
+            })?;
             store.size(&path).await.map_err(|error| {
                 OmniError::manifest(format!(
                     "external blob URI '{uri}' is not readable at ingest: {error}"
