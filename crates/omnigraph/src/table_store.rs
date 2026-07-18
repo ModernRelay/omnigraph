@@ -3417,25 +3417,24 @@ fn combine_committed_with_staged(ds: &Dataset, staged: &[StagedWrite]) -> Vec<Fr
     combined
 }
 
-/// Validate external-URI blob cells at ingest on reference-retaining writes.
+/// Validate blob input columns at ingest on reference-retaining writes.
 ///
-/// The reference-retaining write paths (create/overwrite) keep external URIs
-/// as descriptors. An unreadable external object should fail the load loudly
-/// at ingest — the one moment the referencing write can still be refused —
-/// rather than deferring the failure to the first read. This probes each
-/// external URI once (a size call against the external store) and leaves the
-/// batch untouched.
-///
-/// It deliberately records NOTHING into the logical blob input: injecting
-/// position/size children changes the batch schema, and a create/overwrite
-/// persists that batch schema as the table's logical blob shape. A blob
-/// column whose persisted shape diverges from the canonical `{data, uri}`
-/// input knocks every later keyed write off Lance's v2 merge fast path
+/// Two checks, both at the one moment the offending write can still be
+/// refused. First, every blob column's input must be the canonical
+/// `{data, uri}` logical struct: a create/overwrite persists the batch
+/// schema as the table's logical blob shape, and a divergent shape (Lance
+/// also accepts a 4-child logical variant and a prepared descriptor
+/// variant) knocks every later keyed write off Lance's v2 merge fast path
 /// (strict inserts lose the inserted-row key filter; upserts fall into the
 /// legacy merger, which cannot decode external-bearing blob fragments).
-/// External descriptors therefore keep Lance's `BlobRange { 0, 0 }`
-/// "size unknown" encoding, which the shared descriptor decoder already
-/// treats as unknown rather than authoritative.
+/// Second, each external URI is probed once (a size call against the
+/// external store) so an unreadable reference fails the load loudly
+/// instead of deferring the failure to the first read.
+///
+/// It deliberately records NOTHING into the logical blob input; external
+/// descriptors keep Lance's `BlobRange { 0, 0 }` "size unknown" encoding,
+/// which the shared descriptor decoder already treats as unknown rather
+/// than authoritative.
 async fn validate_external_blob_references(batch: &RecordBatch) -> Result<()> {
     let schema = batch.schema();
     let registry = Arc::new(lance::io::ObjectStoreRegistry::default());
@@ -3445,21 +3444,48 @@ async fn validate_external_blob_references(batch: &RecordBatch) -> Result<()> {
         if !lance_field.is_blob() {
             continue;
         }
-        let Some(descriptions) = column.as_any().downcast_ref::<StructArray>() else {
-            continue;
-        };
-        // Prepared descriptors and caller-declared ranges are authoritative.
-        if descriptions.column_by_name("kind").is_some()
-            || descriptions.column_by_name("size").is_some()
-            || descriptions.column_by_name("position").is_some()
-        {
-            continue;
+        // Boundary assertion for the canonical logical blob input shape.
+        // Lance also accepts a 4-child {data, uri, position, size} logical
+        // variant and a prepared descriptor variant, but a create/overwrite
+        // persists the batch schema as the table's blob shape, and any
+        // divergence from {data, uri} knocks every later keyed write off the
+        // v2 merge fast path (see keyed_writes_survive_committed_external_
+        // blob_reference). Every engine batch builder emits the canonical
+        // shape via Lance's BlobArrayBuilder, so a non-canonical shape here
+        // is engine code regressing — fail the offending write loudly
+        // instead of poisoning the table for every later writer.
+        let canonical = matches!(
+            field.data_type(),
+            arrow_schema::DataType::Struct(children)
+                if children.len() == 2
+                    && children[0].name() == "data"
+                    && children[0].data_type() == &arrow_schema::DataType::LargeBinary
+                    && children[1].name() == "uri"
+                    && children[1].data_type() == &arrow_schema::DataType::Utf8
+        );
+        if !canonical {
+            return Err(OmniError::manifest_internal(format!(
+                "blob column '{}' input must be the canonical {{data: LargeBinary, uri: Utf8}} \
+                 struct; got {:?} — a divergent shape would persist into the table schema and \
+                 break every later keyed write",
+                field.name(),
+                field.data_type(),
+            )));
         }
+        let Some(descriptions) = column.as_any().downcast_ref::<StructArray>() else {
+            return Err(OmniError::manifest_internal(format!(
+                "blob column '{}' input array is not a StructArray",
+                field.name(),
+            )));
+        };
         let Some(uris) = descriptions
             .column_by_name("uri")
             .and_then(|array| array.as_any().downcast_ref::<StringArray>())
         else {
-            continue;
+            return Err(OmniError::manifest_internal(format!(
+                "blob column '{}' input struct has no Utf8 'uri' child array",
+                field.name(),
+            )));
         };
         for row in 0..descriptions.len() {
             if !descriptions.is_valid(row) || !uris.is_valid(row) || uris.value(row).is_empty() {
