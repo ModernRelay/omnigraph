@@ -1837,6 +1837,18 @@ async fn blob_load_external_file_uri() {
         err.is_err(),
         "loading an unreadable external blob URI must fail at ingest"
     );
+
+    // A MALFORMED external URI is caller input: it must land in the
+    // bad-request manifest taxonomy (HTTP 400 at the server boundary),
+    // never OmniError::Lance (HTTP 500).
+    let malformed = r#"{"type": "Document", "data": {"title": "bad-uri", "content": "bogus-scheme://host/object.bin"}}"#;
+    let err = load_jsonl(&mut db, malformed, LoadMode::Overwrite)
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(&err, omnigraph::error::OmniError::Manifest(_)),
+        "malformed external URI must be a typed manifest error, got: {err:?}"
+    );
 }
 
 #[tokio::test]
