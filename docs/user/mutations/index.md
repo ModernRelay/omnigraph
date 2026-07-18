@@ -27,6 +27,14 @@ change. This keeps correctness independent of physical index state, but adds
 read/write I/O proportional to the matched blob bytes; use selective update
 predicates for large blobs.
 
+This materialization also applies to **external blob references**: updating any
+property of a matched row whose `Blob` cell holds an external URI reads the
+external object at update time (the update fails loudly if it is unreachable)
+and stores the payload inline — the row no longer references the external
+location afterward. Deletes do not touch blob payloads. External references are
+preserved only by writes that never rewrite the row (reads, `blob get`/`stat`,
+and the `/blob` endpoint's redirect all leave the reference intact).
+
 ## Atomicity
 
 A change query publishes **one commit** at the end of the query. Multiple
