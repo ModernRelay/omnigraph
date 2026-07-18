@@ -489,8 +489,9 @@ Behavior-affecting findings in this audit:
 
   This result blocks the in-manifest BTREE access shape, not checkpoint rows as
   logical authority or Lance tags as physical pins. RFC-025 is
-  research-blocked, no retention format ships, and internal schema v6 remains
-  production truth. A successor needs a history-flat current-authority lookup
+  research-blocked and no retention format ships. Schema v6 was production
+  truth when the gate ran; current schema v7 likewise carries no retention
+  state. A successor needs a history-flat current-authority lookup
   or revised evidence-backed operational contract without adding a second
   authority dataset.
 - **RFC-023 key-filter behavior remains route-dependent and directional, and
