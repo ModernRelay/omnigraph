@@ -67,6 +67,134 @@
         ]
       }
     },
+    "/graphs/{graph_id}/blob": {
+      "get": {
+        "tags": [
+          "data"
+        ],
+        "summary": "Stream one row's Blob property.",
+        "description": "Resolves the cell at one pinned snapshot of `branch` (default `main`).\nInternal blobs stream with `Content-Length`, `Accept-Ranges: bytes`, a\nstrong identity-derived `ETag`, and single-range `206` support; external\nURI references answer `302 Found` without server-side resolution. `HEAD`\nreturns the same headers with no body (content-type sniffing reads at\nmost 512 bytes on both methods so the headers agree). Read-only; not\nadmission-gated.",
+        "operationId": "cluster_getBlob",
+        "parameters": [
+          {
+            "name": "graph_id",
+            "in": "path",
+            "description": "Graph id to route the request to.",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "type",
+            "in": "query",
+            "description": "Node type name.",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "id",
+            "in": "query",
+            "description": "Logical row id (the `@key` value).",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "prop",
+            "in": "query",
+            "description": "Blob property name.",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "branch",
+            "in": "query",
+            "description": "Branch to read; defaults to `main`.",
+            "required": false,
+            "schema": {
+              "type": [
+                "string",
+                "null"
+              ]
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Full blob content",
+            "content": {
+              "application/octet-stream": {}
+            }
+          },
+          "206": {
+            "description": "Requested byte range (single `Range: bytes=` range; multi-range is unsupported and answered with the full body)",
+            "content": {
+              "application/octet-stream": {}
+            }
+          },
+          "302": {
+            "description": "External blob reference; `Location` carries the stored absolute URI. The server never resolves or proxies the external location."
+          },
+          "304": {
+            "description": "Not modified (`If-None-Match` matched the ETag)"
+          },
+          "400": {
+            "description": "Property is not a Blob",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorOutput"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Unauthorized",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorOutput"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "Forbidden",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorOutput"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "Unknown type, unknown id, or null blob cell",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorOutput"
+                }
+              }
+            }
+          },
+          "416": {
+            "description": "Requested range not satisfiable; `Content-Range` reports the total size"
+          }
+        },
+        "security": [
+          {
+            "bearer_token": []
+          }
+        ]
+      }
+    },
     "/graphs/{graph_id}/branches": {
       "get": {
         "tags": [

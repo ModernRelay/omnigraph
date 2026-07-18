@@ -553,6 +553,20 @@ pub struct CommitListQuery {
     pub branch: Option<String>,
 }
 
+/// Query-param shape for the blob content endpoint (`GET /blob`).
+#[derive(Debug, Clone, Deserialize, IntoParams)]
+pub struct BlobQuery {
+    /// Node type name.
+    #[serde(rename = "type")]
+    pub type_name: String,
+    /// Logical row id (the `@key` value).
+    pub id: String,
+    /// Blob property name.
+    pub prop: String,
+    /// Branch to read; defaults to `main`.
+    pub branch: Option<String>,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
 pub struct HealthOutput {
     pub status: String,
