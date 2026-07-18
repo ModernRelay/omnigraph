@@ -19,7 +19,7 @@ authority.
 - No `omnigraph run *` CLI subcommands and no `/runs/*` HTTP endpoints.
 - No `__run__<id>` staging branches; `__run__*` is no longer a reserved
   name. The branch-name guard was removed in MR-770. Historically, the v2→v3
-  in-place migration swept stale `__run__*` entries; the current v6 strand is
+  in-place migration swept stale `__run__*` entries; the current v7 strand is
   strict single-version, so older graphs are refused and rebuilt by
   export/init/load rather than migrated on open. (Inert `_graph_runs.lance`
   bytes in an old export source remain irrelevant to the rebuilt graph.)
@@ -63,7 +63,8 @@ Mutation and load use a closed prepare → effect → publish attempt:
    shadows committed rows by pending `id` before charging them, and streams the
    remaining matches into the same budget. Blob matches charge non-blob bytes
    before descriptor fetch and payload size before `BlobFile::read`;
-3. acquire the schema gate, branch gate, then sorted table queues; re-check for
+3. acquire shared stream-admission leases for the exact touched table/ref
+   domains, then the schema gate, branch gate, and sorted table queues; re-check for
    a relevant sidecar armed since step 1, then revalidate the token and require
    every existing physical target's live Lance HEAD to equal its manifest pin.
    Any unresolved relevant intent returns typed `RecoveryRequired`; uncovered
@@ -283,6 +284,13 @@ phases:
 
 - create shallow-clones `tree/{branch}` before writing `BranchContents`;
 - delete removes `BranchContents` before reclaiming that tree.
+
+Both controls first acquire shared stream-admission domains outside their
+schema/branch/table envelope and re-check lifecycle authority under that
+envelope. They refuse while any main-table lifecycle is `OPEN` or `DRAINING`.
+They may proceed when all lifecycle rows are `SEALED`, because native ref
+creation/deletion does not advance a graph table HEAD; this is the only Phase A
+exception to the otherwise complete lifecycle effect fence.
 
 Under the schema/branch/table control gates, create validates the name before
 the clone and rejects a live graph name that is a physical path ancestor or
@@ -530,9 +538,49 @@ each touched table with Lance `Operation::Overwrite`, then runs
 `commit_staged` under the normal `SidecarKind::Load` recovery sidecar
 before publishing `__manifest`. `OMNIGRAPH_LOAD_CONCURRENCY` applies to the
 fragment-writing stage only; the commit and manifest publish run while holding
-the root-shared schema → branch → sorted-table gates. Empty-table overwrite is
+the root-shared stream-admission → schema → branch → sorted-table gates.
+Empty-table overwrite is
 represented as a valid zero-fragment Lance `Overwrite` transaction, not as
 truncate-then-append.
+
+### RFC-026 Phase A stream foundation
+
+Internal schema v7 activates a deliberately bounded MemWAL format and recovery
+foundation. It does not activate streaming ingestion.
+
+- One crate-private adapter can enroll an existing canonical-main table into
+  exactly one empty, unsharded, epoch-1 Lance MemWAL shard. It requires a
+  main-only graph. There is no ordinary SDK, CLI, HTTP, OpenAPI, or schema
+  language caller; the only external seam is feature-gated for the crash suite.
+- Enrollment holds an exclusive root-scoped process-local admission lease
+  outside the normal schema → branch → sorted-table gates. It durably writes a
+  dedicated schema-v10 `StreamEnrollment` sidecar before the initializer. The
+  intent binds exact main authority, stable table/incarnation identity,
+  pre-enrollment HEAD witness, pre-minted enrollment/shard IDs, fixed lineage,
+  and the sole allowed `N -> N + 1` effect.
+- The enrollment classifier accepts only no effect, exact index-only, or exact
+  index-plus-empty-shard. No effect retires the intent; index-only creates the
+  pre-minted empty shard; the complete state publishes the new table pointer and
+  identity-keyed `OPEN` lifecycle row in one manifest CAS. Once either physical
+  effect exists, recovery is roll-forward-only—never restore, delete, reclaim,
+  or infer ownership from a compatible-looking index.
+- Every production table/schema/maintenance/repair-adoption/recovery path takes
+  the matching admission domains in shared mode before its existing gates and
+  revalidates lifecycle authority under those gates. Any materialized lifecycle
+  row, including `SEALED`, fences those effects because Phase A cannot advance
+  or rebind its `CurrentHeadWitness`. Native branch create/delete is the narrow
+  exception: it may proceed at `SEALED` because it does not move a table HEAD;
+  both operations refuse `OPEN` or `DRAINING`.
+- Read-write open resolves exact enrollment intents before serving. Read-only
+  open refuses a pending enrollment intent. A compatible open then validates
+  lifecycle identity, binding, visible pointer/current-HEAD witness, and exact
+  empty-shard physical state; it also refuses an uncovered MemWAL index or an
+  `OPEN`/`DRAINING` lifecycle coexisting with a named graph branch.
+
+This boundary supports one live writer process only. The admission lease is not
+a distributed lock, and no public row can be written or acknowledged. Phase B
+must add WAL put/durable acknowledgement, replay, and strict graph-atomic fold;
+later phases own drain/resume, witness rebind/advancement, and fresh reads.
 
 ### Open-time recovery sweep
 
@@ -554,13 +602,16 @@ commit_staged on tables 1..N succeeded, or if the publisher's CAS
 pre-check rejects *after* every commit_staged succeeded, tables 1..N
 are left at `Lance HEAD = manifest_pinned + 1`.
 
-**Recovery protocol** (lifecycle of every staged-write writer —
+**Recovery protocol** (lifecycle of the established graph-visible and
+maintenance writers —
 `MutationStaging::commit_all`, `schema_apply::apply_schema_with_lock`,
 `branch_merge_on_current_target`, `ensure_indices_for_branch`,
 `optimize_all_tables`):
 
-Before Phase A, under the writer's final schema → branch → table gates, existing
-physical targets must still match their manifest pins. Ahead drift is never folded
+Before Phase A, the writer holds shared stream-admission leases outside its
+final schema → branch → table gates. Under those gates, every table must have no
+stream lifecycle authority and existing physical targets must still match their
+manifest pins. Ahead drift is never folded
 or claimed by manufacturing a new sidecar; it is attributed to an existing recovery
 intent or refused with explicit `omnigraph repair` guidance. First-touch targets use
 the separate sidecar-before-ref protocol. SchemaApply also verifies that every AddType
@@ -596,7 +647,8 @@ identity, incarnation, path, and Lance version.
    first-touch effect also records its inherited source version and later binds
    the exact created ref identity. The persisted writer-specific payload field
    names (`protocol_v3`, `protocol_v4`, `protocol_v7`, and `protocol_v8`) remain
-   for shape continuity, but every active writer emits schema v9 and every
+   for shape continuity, but every established writer in this list emits schema
+   v9 and every
    ownership-bearing field carries the stable identity pair. Pre-v9 files are
    never upgraded by alias inference or serde defaults.
 2. **Phase B**: writer's per-table `commit_staged` loop runs.
@@ -637,11 +689,20 @@ identity, incarnation, path, and Lance version.
 > reader of `recovery.rs`, `failpoints.rs`, or this document only
 > encounters phase letters in the per-writer context.
 
+RFC-026's named “Phase A foundation” is a roadmap slice, not another step in
+that four-phase convention. Its schema-v10 `StreamEnrollment` adapter uses the
+same durable-intent-before-effect and sidecar-delete-last boundary, but has a
+dedicated classifier rather than the generic Phase-B confirmation model. Exact
+no effect retires the intent; exact index-only provisions the fixed empty
+shard; exact index-plus-empty-shard publishes pointer + lifecycle. Once an
+effect exists, enrollment can only roll forward.
+
 A failure between Phase A and Phase D leaves the sidecar on disk. The
 next `Omnigraph::open` (gated on `OpenMode::ReadWrite`) runs the
 recovery sweep in `crates/omnigraph/src/db/manifest/recovery.rs`:
 
-All current writers emit sidecar schema v9. The JSON field names
+The established writers emit sidecar schema v9. RFC-026 Phase A additionally
+emits the dedicated schema-v10 `StreamEnrollment` envelope. The JSON field names
 `protocol_v3`, `protocol_v4`, `protocol_v7`, and `protocol_v8` are retained
 payload-version names for mutation/load, BranchMerge, SchemaApply, and
 EnsureIndices respectively; they do not mean the outer envelope is pre-v9.
@@ -681,6 +742,12 @@ EnsureIndices respectively; they do not mean the outer envelope is pre-v9.
   foreign or buried index commit is never adopted or restored through. A
   pre-v9 identity-less file is refused rather than upgraded or classified by
   mutable alias.
+  Schema-v10 `StreamEnrollment` instead requires its exact canonical-main
+  authority, identity/binding, `N -> N + 1` initializer witness, and pre-minted
+  empty-shard state. No effect retires; either exact allowed effect converges
+  forward through the dedicated completion path; any foreign, buried,
+  data-bearing, mismatched, or ambiguous state fails closed with the sidecar
+  intact.
   First-touch rollback deletes only the exact owned version-one dataset and only
   while no manifest registration or competing recovery claim owns the path. A
   foreign winner at an unregistered first-touch path is left untouched and is
@@ -711,7 +778,9 @@ EnsureIndices respectively; they do not mean the outer envelope is pre-v9.
 - Read-only open performs this check without repairing anything: it may serve an
   unpublished v9 attempt against the old manifest/schema pair, but it returns
   `RecoveryRequired` when the fixed original manifest outcome is visible and the
-  target schema identity is not yet fully live. A read-write open completes it.
+  target schema identity is not yet fully live. It always refuses a pending
+  schema-v10 `StreamEnrollment` intent because enrollment may carry uncovered
+  format effects. A read-write open completes exact recoverable state.
 - On a live handle, query, export, graph-index, and blob-read capture takes the
   process-local schema gate just long enough to bind one manifest snapshot to one
   immutable catalog rebuilt from the accepted contract. It never trusts the
@@ -734,6 +803,9 @@ EnsureIndices respectively; they do not mean the outer envelope is pre-v9.
   exact per-table outcomes. V9 Mutation/Load, BranchMerge, SchemaApply, and
   EnsureIndices roll-forward publish the
   interrupted writer's fixed lineage intent, including its original actor.
+  Schema-v10 `StreamEnrollment` likewise publishes its fixed lineage and
+  records the exact `N -> N + 1` enrollment outcome when recovery completes an
+  effect.
   Their rollback paths reuse pre-minted recovery commit ids and durable audit
   plans, with the recovery actor. Other rollback and legacy recovery commits use
   `actor_id = "omnigraph:recovery"`. Ordinary
@@ -753,11 +825,13 @@ roll-forward-only recovery in-process
 Phase B → Phase C residual closes on the next enrolled entry, without a
 restart and without an explicit refresh. The heal lists `__recovery/`
 (one `list_dir`; empty in the steady state) and, per sidecar, acquires
-schema → branch → sorted-table gates that overlap the writer's guarded
+stream-admission domains (shared for ordinary effects, exclusive for
+`StreamEnrollment`) → schema → branch → sorted-table gates that overlap the writer's guarded
 sidecar lifetime. RFC-022 mutation/load writers hold the complete order. Branch
 merge holds schema plus source/target branch authority for its whole attempt and
-then the all-catalog source/target table envelope. SchemaApply holds schema → main
-branch → every live table; EnsureIndices holds schema → target branch → every table
+then the all-catalog source/target table envelope. SchemaApply holds admission
+domains → schema → main branch → every live table; EnsureIndices holds admission
+domains → schema → target branch → every table
 in its durable work plan. SchemaApply's v9 envelope is its full exact adapter:
 it holds fixed authority/lineage and exact table identities from arm through one
 `ExactGraphHead` publish, including an empty effect set for metadata-only changes.
@@ -770,7 +844,7 @@ through one `ExactGraphHead` publish. `Armed` is rollback-only;
 Pre-v9 sidecars are never completed by inferring identity from their aliases.
 Optimize uses bounded effect provenance inside an identity-bearing v9 graph-wide
 visibility envelope. Its entry recovery probe is
-a fast path; it then acquires schema → main branch → every accepted-catalog table gate,
+a fast path; it then acquires admission domains → schema → main branch → every accepted-catalog table gate,
 loads one operation-local accepted catalog, relists recovery, and plans productive work
 from one fresh snapshot. All productive tables share one multi-pin Optimize sidecar;
 their compact/reindex/index-create effects remain bounded-parallel, but no task publishes
@@ -792,8 +866,9 @@ and symlink aliases converge; object-store/custom schemes stay opaque), so this
 also serializes a refresh or separately-opened handle against a live writer instead of rolling its
 in-flight sidecar forward from under it (a sidecar whose queues can be
 acquired belongs to a writer that finished or died; an existence
-re-check after the wait skips the finished case). Lock order is
-schema → branch → sorted tables → coordinator, matching the writer effect path.
+re-check after the wait skips the finished case). Lock order is stream-admission
+domains → schema → branch → sorted tables → coordinator, matching the writer
+effect path.
 Mutation/load, branch merge, SchemaApply, and EnsureIndices perform one additional
 `list_dir` after acquiring their authority gates; that final check closes the
 pre-gate recovery TOCTOU without moving validation or reclaimable staged-file
@@ -891,7 +966,7 @@ storage-fault failpoints `recovery.sidecar_{write,delete,list}` /
   `RecoveryRequired` when any schema-staging artifact is present because the
   malformed intent may be the only proof of a committed-but-unpromoted
   SchemaApply.
-- **Pre-v9 identity-less sidecar**: refused loudly. The v6 storage strand is
+- **Pre-v9 identity-less sidecar**: refused loudly. The v7 storage strand is
   rebuilt rather than upgraded in place, and recovery never infers table
   ownership from a mutable alias or path.
 - **Audit append fails after a roll-forward publish**: that recovery
@@ -918,12 +993,16 @@ error, not a silent `false`.
 
 For mutation/load, a changed authority detected before effects is
 `ManifestConflictDetails::ReadSetChanged { member, expected, actual }`.
+An operation excluded by durable stream authority receives
+`ManifestConflictDetails::StreamLifecycleConflict { stable_table_id,
+table_incarnation_id, table_key, lifecycle, operation }`; retrying the same
+effect without a later lifecycle transition is not an authority retry.
 Retryable insert/upsert/Append attempts may handle unrelated pre-effect
 authority movement internally by fully repreparing. `OmniError::KeyConflict`
 with `{ table_key, key }` is the terminal strict-insert result for a pre-existing
 ID or an effect-free concurrent same-key winner confirmed by a fresh exact-ID
 probe; HTTP returns **409 Conflict** with structured `key_conflict` details.
-The wire field remains optional for compatibility, while v6 production
+The wire field remains optional for compatibility, while v7 production
 Mutation/Load emits the exact matched ID.
 `RetryableCommitConflict` is the typed internal substrate signal used for the
 upsert and strict-no-match reprepare paths; no logic parses Lance error strings.
@@ -957,7 +1036,7 @@ does not yet have a public CLI query.
 `db/manifest/migrations.rs` is the single place the on-disk `__manifest` shape is
 reconciled with what the binary expects. Storage is **strict-single-version** (the
 strand model): this binary reads exactly ONE internal-schema version
-(`MIN_SUPPORTED == CURRENT == 6`), so there is no in-place migration.
+(`MIN_SUPPORTED == CURRENT == 7`), so there is no in-place migration.
 
 - **Graph creation** stamps `omnigraph:internal_schema_version` at CURRENT, so a
   fresh graph always opens.
@@ -974,10 +1053,18 @@ strand model): this binary reads exactly ONE internal-schema version
   policy) and [the upgrade guide](../user/operations/upgrade.md) (the rebuild
   recipe).
 
+V7 maps to the 0.11.x release line. It preserves v5 stable identity and v6
+exact-`id` key fencing, and adds the RFC-026 Phase A lifecycle/enrollment
+foundation described above. A genuine v6 root moves to v7 only through
+export/init/load into a different root; v7 refuses v6 and a v6 binary refuses
+v7.
+
 The stamp history (v1 PK-less, v2 unenforced-PK, v3 `__run__*` sweep, v4 lineage
 in `__manifest` with the commit-graph tables retired, v5 stable table identity,
-v6 exact-`id` PK metadata plus fenced keyed routing)
-is recorded on the `INTERNAL_MANIFEST_SCHEMA_VERSION` doc-comment; only v6 is served. An earlier-stamped
+v6 exact-`id` PK metadata plus fenced keyed routing, v7 identity-keyed stream
+lifecycle authority plus the recoverable empty-enrollment foundation)
+is recorded on the `INTERNAL_MANIFEST_SCHEMA_VERSION` doc-comment; only v7 is
+served. An earlier-stamped
 graph is rebuilt via export/import, not migrated in place.
 
 ## Mid-query partial failure: closed by MR-794

@@ -38,14 +38,33 @@ together. A v4 graph cannot be backfilled safely because its logical IDs,
 registration keys, paths, versions, and tombstones are all name-derived; the
 normal strand rebuild mints a fresh domain and table incarnations instead.
 
-Internal schema **v6 is the currently served format** and maps to OmniGraph
-**0.10.x**. It preserves the v5 identity contract and activates RFC-023 key
-fencing: every graph node/edge dataset declares exactly non-null physical `id`
-as Lance's unenforced primary key from creation, and production strict
-insert/upsert routes use the exact-`id` filter-bearing adapter. A v5/0.9.x graph
-is not annotated or migrated in place; export it with the v5 binary, initialize
-a different v6 root, and load through the v6 writer. Because
-`MIN_SUPPORTED == CURRENT == 6`, v6 refuses v5 and a v5 binary refuses v6.
+Internal schema v6 mapped to OmniGraph 0.10.x. It preserved the v5 identity
+contract and activated RFC-023 key fencing: every graph node/edge dataset
+declares exactly non-null physical `id` as Lance's unenforced primary key from
+creation, and production strict insert/upsert routes use the exact-`id`
+filter-bearing adapter.
+
+Internal schema **v7 is the currently served format** and maps to OmniGraph
+**0.11.x**. It preserves both the v5 identity and v6 key-fencing contracts, then
+adds RFC-026 Phase A's identity-keyed stream lifecycle authority and dedicated
+schema-v10 recovery envelope for one exact empty main-only/unsharded MemWAL
+enrollment. The lifecycle row durably binds the stable table/incarnation,
+physical location, never-reused enrollment and shard IDs, current-HEAD witness,
+state, and epoch floor. Process-local admission leases fence competing effects,
+and compatible open refuses an uncovered MemWAL index or a lifecycle/physical
+state mismatch. In Phase A, every lifecycle state—including `SEALED`—fences
+base-table, schema, maintenance, repair-adoption, and recovery effects; native
+branch create/delete alone may proceed at `SEALED` because it does not move
+table HEAD.
+
+This is a storage and recovery foundation, not a public streaming feature. V7
+has no `@stream`, production enrollment call, WAL row put or durability ack,
+fold, drain/resume workflow, or fresh-read surface. The only enrollment caller
+is a crate-private adapter exposed to the feature-gated crash suite.
+
+A v6/0.10.x graph is not annotated or migrated in place; export it with the v6
+binary, initialize a different v7 root, and load through the v7 writer. Because
+`MIN_SUPPORTED == CURRENT == 7`, v7 refuses v6 and a v6 binary refuses v7.
 
 There is no in-place migration dispatcher. The single source file
 `db/manifest/migrations.rs` holds only the version constant, the stamp read/write,
@@ -83,11 +102,11 @@ independently and a hard gate there would force lockstep redeploys for every fie
 addition. So that axis is additive — old and new coexist — and the OpenAPI-drift test
 is the guard that a change stayed additive rather than breaking the shape.
 RFC-023 follows that rule: `ErrorOutput.key_conflict` is optional, and its
-`key` member remains optional on the wire for additive compatibility. The v6
+`key` member remains optional on the wire for additive compatibility. The v7
 engine returns `KeyConflict` only after a fresh exact-ID probe identifies an
 attempted key; Lance's broader retryable conflict class is not serialized as a
 key conflict without that evidence. `ErrorOutput.resource_limit` is likewise
-optional and additive; v6 servers use it with HTTP 413 for pre-arm keyed-write
+optional and additive; v7 servers use it with HTTP 413 for pre-arm keyed-write
 ceilings.
 
 ## When you change each axis

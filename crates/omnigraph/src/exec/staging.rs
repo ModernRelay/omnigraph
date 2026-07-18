@@ -37,6 +37,7 @@ use crate::db::manifest::{
     RecoveryAuthorityToken, RecoveryLineageIntent, RecoverySidecarHandle, SidecarKind,
     SidecarTablePin, confirm_occ_sidecar_v9, new_occ_sidecar_v9, write_sidecar,
 };
+use crate::db::write_queue::{StreamAdmissionKey, TableQueueKey, WriteQueueManager};
 use crate::db::{MutationOpKind, SubTableUpdate};
 use crate::error::{OmniError, Result};
 
@@ -893,8 +894,48 @@ async fn fresh_conflicting_strict_id(
     db.storage().first_existing_id(&table, source_ids).await
 }
 
+/// Outermost stream-admission guards plus the existing RFC-022 gate hierarchy.
+///
+/// The fields are intentionally opaque: callers only need to keep this value
+/// alive through manifest publication. Dropping it releases admission and the
+/// schema -> branch -> sorted-table gates together.
+pub(crate) struct MutationCommitGuards {
+    // Struct fields drop in declaration order: release the inner hierarchy
+    // before reopening the outer admission domain.
+    _write_queues: Vec<tokio::sync::OwnedMutexGuard<()>>,
+    _stream_admission: Vec<tokio::sync::OwnedRwLockReadGuard<()>>,
+}
+
+async fn acquire_mutation_commit_guards(
+    write_queue: &WriteQueueManager,
+    admission_keys: &[StreamAdmissionKey],
+    branch: Option<&str>,
+    table_queue_keys: &[TableQueueKey],
+) -> MutationCommitGuards {
+    // RFC-026 admission is the outermost process-local gate. An append needs
+    // only its shared admission lease, while enrollment/drain takes exclusive
+    // admission and then this existing hierarchy. Acquiring admission first
+    // avoids an admission <-> table-queue inversion between those shapes.
+    let stream_admission = write_queue.acquire_stream_shared_many(admission_keys).await;
+
+    // Preserve RFC-022's established order inside the admission window:
+    // schema -> branch -> sorted physical table queues.
+    let schema_guard = write_queue
+        .acquire(&crate::db::manifest::schema_apply_serial_queue_key())
+        .await;
+    let branch_guard = write_queue.acquire_branch(branch).await;
+    let mut write_queues = vec![schema_guard, branch_guard];
+    write_queues.extend(write_queue.acquire_many(table_queue_keys).await);
+
+    MutationCommitGuards {
+        _write_queues: write_queues,
+        _stream_admission: stream_admission,
+    }
+}
+
 /// Output of [`StagedMutation::commit_all`] after Stage F: the publisher's input
-/// plus the queue guards the caller must hold through Stage G manifest publish.
+/// plus the process-local guards the caller must hold through Stage G manifest
+/// publish.
 pub(crate) struct CommittedMutation {
     /// Per-table updates to publish to the manifest.
     pub(crate) updates: Vec<SubTableUpdate>,
@@ -905,19 +946,21 @@ pub(crate) struct CommittedMutation {
     /// Recovery sidecar to delete during Stage H after manifest CAS succeeds
     /// (`None` when nothing staged).
     pub(crate) sidecar_handle: Option<RecoverySidecarHandle>,
-    /// Root schema, coarse branch, and sorted `(table, branch)` guards. The
-    /// caller MUST hold the complete set across manifest publish (see
-    /// `commit_all`) so no same-process writer interleaves after revalidation.
-    pub(crate) guards: Vec<tokio::sync::OwnedMutexGuard<()>>,
+    /// Outermost shared admission plus root schema, coarse branch, and sorted
+    /// `(table, branch)` guards. The caller MUST hold the complete set across
+    /// manifest publish (see `commit_all`) so no same-process writer or drain
+    /// interleaves after revalidation.
+    pub(crate) guards: MutationCommitGuards,
 }
 
 impl StagedMutation {
-    /// RFC-022 Stages C–F: acquire ordered schema/branch/table gates, revalidate
-    /// the complete read set, arm the recovery sidecar, run `commit_staged` per
-    /// table to advance Lance HEAD, and return the publisher input plus guards.
+    /// RFC-022 Stages C–F: acquire outer shared admission followed by ordered
+    /// schema/branch/table gates, revalidate the complete read set, arm the
+    /// recovery sidecar, run `commit_staged` per table to advance Lance HEAD,
+    /// and return the publisher input plus guards.
     ///
-    /// **Caller must hold the returned `_guards` Vec across the
-    /// subsequent manifest publish.** Releasing guards before publish
+    /// **Caller must hold the returned guard bundle across the subsequent
+    /// manifest publish.** Releasing guards before publish
     /// would let another writer interleave its physical effects between ours
     /// and publish. The exact publisher precondition would still reject stale
     /// authority, but our already-advanced Lance HEAD would then require the
@@ -934,8 +977,9 @@ impl StagedMutation {
     /// Both outcomes occur before `commit_staged`, so staged transaction files
     /// remain unreferenced and reclaimable.
     /// First-touch named-branch forks are also deferred to this phase. The
-    /// method acquires schema → branch → table gates, revalidates the complete
-    /// read token, arms the v9 recovery envelope, and only then creates any Lance refs.
+    /// method acquires admission → schema → branch → table gates, revalidates
+    /// the complete read token, arms the v9 recovery envelope, and only then
+    /// creates any Lance refs.
     pub(crate) async fn commit_all(
         self,
         db: &crate::db::Omnigraph,
@@ -950,6 +994,16 @@ impl StagedMutation {
             expected_versions,
             expected_identities,
         } = self;
+
+        let lifecycle_operation = match sidecar_kind {
+            SidecarKind::Mutation => "mutation",
+            SidecarKind::Load => "load",
+            other => {
+                return Err(OmniError::manifest_internal(format!(
+                    "StagedMutation::commit_all does not accept {other:?} sidecars"
+                )));
+            }
+        };
 
         let expected_versions = expected_versions
             .into_iter()
@@ -972,6 +1026,22 @@ impl StagedMutation {
             })
             .collect::<Result<crate::db::manifest::ExpectedTableVersions>>()?;
 
+        // Admission keys use immutable lifetime identity plus the final,
+        // already-resolved physical Lance ref. Alias is deliberately absent:
+        // rename continues to share the same lease, while drop/re-add mints a
+        // distinct incarnation. The key itself encodes no lifecycle policy;
+        // it closes the final-check-through-effect race for the durable policy
+        // enforced below.
+        let admission_keys: Vec<StreamAdmissionKey> = staged
+            .iter()
+            .map(|entry| {
+                StreamAdmissionKey::for_resolved_ref(
+                    entry.path.identity,
+                    entry.path.table_branch.as_deref(),
+                )
+            })
+            .collect();
+
         // Per-(table_key, branch) queues for every touched table. Sorted by
         // `acquire_many` internally so all multi-table writers (mutation,
         // branch_merge, schema_apply, the fork path, recovery) agree on
@@ -979,25 +1049,28 @@ impl StagedMutation {
         // are staged like every other write, so holding the queue from before
         // `commit_staged` through the publish keeps no Lance HEAD ahead of the
         // manifest on the happy path.
-        let mut queue_keys: Vec<(String, Option<String>)> = Vec::with_capacity(staged.len());
+        let mut queue_keys: Vec<TableQueueKey> = Vec::with_capacity(staged.len());
         for entry in &staged {
             queue_keys.push((entry.table_key.clone(), entry.path.table_branch.clone()));
         }
-        // Total order shared with schema apply: schema gate, branch gate, then
-        // sorted per-table gates. Hold the full set through manifest publish.
-        let schema_guard = db
-            .write_queue()
-            .acquire(&crate::db::manifest::schema_apply_serial_queue_key())
-            .await;
-        let branch_guard = db.write_queue().acquire_branch(branch).await;
-        let mut guards = vec![schema_guard, branch_guard];
-        guards.extend(db.write_queue().acquire_many(&queue_keys).await);
+        // Global total order: sorted admission lease(s) first, then the
+        // existing schema -> branch -> sorted-table hierarchy. Hold the whole
+        // bundle through manifest publication at the caller.
+        let write_queue = db.write_queue();
+        let guards = acquire_mutation_commit_guards(
+            write_queue.as_ref(),
+            &admission_keys,
+            branch,
+            &queue_keys,
+        )
+        .await;
 
         // Stage A ran the roll-forward-only healer before preparation, while
         // reclaimable transaction files were staged outside these gates. A
         // different writer can therefore arm a recovery intent in that gap.
-        // Re-list after acquiring schema -> branch -> table gates and reject
-        // that intent before revalidation or any new sidecar/ref/table effect.
+        // Re-list after acquiring admission -> schema -> branch -> table gates
+        // and reject that intent before revalidation or any new
+        // sidecar/ref/table effect.
         // Do NOT invoke the healer here: recovery acquires this same ordered
         // gate set and would deadlock/re-enter the write protocol.
         //
@@ -1039,6 +1112,13 @@ impl StagedMutation {
         // the target branch fresh on any mismatch, returning the snapshot from
         // that same authority view. No prepared table pin is patched forward.
         let snapshot = db.revalidate_write_txn(txn).await?;
+        // The refreshed manifest snapshot is durable authority; the shared
+        // admission lease only keeps enrollment/drain from changing that
+        // authority between this final check and our physical effects.
+        snapshot.ensure_stream_effects_allowed(
+            lifecycle_operation,
+            staged.iter().map(|entry| entry.path.identity),
+        )?;
         for entry in &staged {
             let current = snapshot
                 .entry(&entry.table_key)
@@ -1551,4 +1631,107 @@ fn dedupe_merge_batches_by_id(
     }
     arrow_select::concat::concat_batches(schema, &sliced)
         .map_err(|e| OmniError::Lance(e.to_string()))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::time::Duration;
+    use tokio::sync::oneshot;
+    use tokio::time::timeout;
+
+    #[tokio::test]
+    async fn mutation_commit_guards_take_admission_first_and_hold_the_full_hierarchy() {
+        let write_queue = Arc::new(WriteQueueManager::new());
+        let identity = crate::db::manifest::TableIdentity::new(1, 1).unwrap();
+        let admission_key = StreamAdmissionKey::for_resolved_ref(identity, None);
+        let table_key = ("renamable-alias".to_string(), None);
+
+        // Close admission before the mutation starts. The mutation helper must
+        // block here without taking any inner RFC-022 gate.
+        let closed = write_queue.acquire_stream_exclusive(&admission_key).await;
+        let (started_tx, started_rx) = oneshot::channel();
+        let (acquired_tx, mut acquired_rx) = oneshot::channel();
+        let (release_tx, release_rx) = oneshot::channel();
+        let task_queue = Arc::clone(&write_queue);
+        let task_admission_key = admission_key.clone();
+        let task_table_key = table_key.clone();
+        let task = tokio::spawn(async move {
+            started_tx.send(()).unwrap();
+            let guards = acquire_mutation_commit_guards(
+                task_queue.as_ref(),
+                &[task_admission_key],
+                None,
+                &[task_table_key],
+            )
+            .await;
+            acquired_tx.send(()).unwrap();
+            release_rx.await.unwrap();
+            drop(guards);
+        });
+
+        started_rx.await.unwrap();
+        let inner_schema = timeout(
+            Duration::from_secs(2),
+            write_queue.acquire(&crate::db::manifest::schema_apply_serial_queue_key()),
+        )
+        .await
+        .expect("mutation took the schema gate before outer admission");
+        drop(inner_schema);
+        assert!(
+            timeout(Duration::from_millis(50), &mut acquired_rx)
+                .await
+                .is_err(),
+            "closed admission must stop mutation before its inner gates"
+        );
+
+        drop(closed);
+        timeout(Duration::from_secs(2), &mut acquired_rx)
+            .await
+            .expect("mutation guards did not acquire after admission reopened")
+            .expect("mutation guard task exited before acquisition");
+
+        // The returned opaque bundle is what the Mutation/Load caller retains
+        // through sidecar, effects, and manifest publication. While it lives,
+        // both a drain/enrollment and every existing inner gate stay closed.
+        assert!(
+            timeout(
+                Duration::from_millis(50),
+                write_queue.acquire_stream_exclusive(&admission_key),
+            )
+            .await
+            .is_err(),
+            "returned commit guards must retain shared admission"
+        );
+        assert!(
+            timeout(
+                Duration::from_millis(50),
+                write_queue.acquire(&crate::db::manifest::schema_apply_serial_queue_key()),
+            )
+            .await
+            .is_err(),
+            "returned commit guards must retain the schema gate"
+        );
+        assert!(
+            timeout(Duration::from_millis(50), write_queue.acquire_branch(None),)
+                .await
+                .is_err(),
+            "returned commit guards must retain the branch gate"
+        );
+        assert!(
+            timeout(Duration::from_millis(50), write_queue.acquire(&table_key))
+                .await
+                .is_err(),
+            "returned commit guards must retain the physical table gate"
+        );
+
+        release_tx.send(()).unwrap();
+        task.await.unwrap();
+        let _reopened_admission = timeout(
+            Duration::from_secs(2),
+            write_queue.acquire_stream_exclusive(&admission_key),
+        )
+        .await
+        .expect("dropping commit guards must reopen admission");
+    }
 }

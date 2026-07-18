@@ -1,4 +1,14 @@
 use super::*;
+use crate::db::write_queue::StreamAdmissionKey;
+
+fn schema_apply_stream_admission_keys(snapshot: &Snapshot) -> BTreeSet<StreamAdmissionKey> {
+    snapshot
+        .entries()
+        .map(|entry| {
+            StreamAdmissionKey::for_resolved_ref(entry.identity, entry.table_branch.as_deref())
+        })
+        .collect()
+}
 
 /// Operator-supplied options that gate schema-apply behavior.
 ///
@@ -223,15 +233,41 @@ where
     // exists, so the heal can never observe it.
     db.heal_pending_recovery_sidecars().await?;
 
-    // Process-local schema-control gate. RFC-022 mutation/load commit paths
-    // acquire this before their branch/table gates and retain it through
-    // publication. Taking it before the durable sentinel closes the old race in
-    // which schema apply could create the sentinel while a mutation already held
-    // a table queue, causing that mutation to advance Lance HEAD and only then
-    // discover the schema lock. The native sentinel remains the cross-handle /
-    // crash-visible authority; this queue removes the avoidable same-handle race.
+    // Admission is the outermost process-local gate. Capture every accepted
+    // existing table lifetime/ref before taking it, then prove that coverage is
+    // still complete after entering the schema gate. A concurrent schema apply
+    // may add/drop a lifetime between those points; retrying outside both gates
+    // avoids acquiring a newly discovered admission lease inside the established
+    // admission -> schema order. Adds in *this* apply have no prior lifecycle.
+    db.refresh_coordinator_only().await?;
+    let mut admission_keys = {
+        let snapshot = db.coordinator.read().await.snapshot();
+        schema_apply_stream_admission_keys(&snapshot)
+    };
     let schema_gate_key = crate::db::manifest::schema_apply_serial_queue_key();
-    let _schema_gate = db.write_queue().acquire(&schema_gate_key).await;
+    let write_queue = db.write_queue();
+    let (_stream_admission, _schema_gate) = loop {
+        let keys = admission_keys.iter().cloned().collect::<Vec<_>>();
+        let admission = write_queue.acquire_stream_shared_many(&keys).await;
+        let schema = write_queue.acquire(&schema_gate_key).await;
+
+        db.refresh_coordinator_only().await?;
+        let live_keys = {
+            let snapshot = db.coordinator.read().await.snapshot();
+            schema_apply_stream_admission_keys(&snapshot)
+        };
+        if live_keys == admission_keys {
+            break (admission, schema);
+        }
+
+        drop(schema);
+        drop(admission);
+        admission_keys = live_keys;
+    };
+
+    // The native sentinel remains the cross-handle / crash-visible authority;
+    // the admission and schema gates close avoidable same-process races and are
+    // retained through sentinel release after publication.
     acquire_schema_apply_lock(db).await?;
     let result =
         apply_schema_with_lock(db, desired_schema_source, options, actor, validate_catalog).await;
@@ -739,6 +775,16 @@ where
             )),
         ));
     }
+
+    // Durable manifest lifecycle is the authority. The shared admission lease
+    // held by the outer caller closes enrollment/drain's check-to-effect race.
+    // SchemaApply is graph-global, so conservatively reject if any accepted
+    // existing table has OPEN, DRAINING, or SEALED authority; Phase A has no
+    // witness-advancing drain path. First-touch additions have no lifecycle.
+    snapshot.ensure_stream_effects_allowed(
+        "schema_apply",
+        snapshot.entries().map(|entry| entry.identity),
+    )?;
 
     // Prove every existing physical ref is still exactly at its manifest pin
     // before arming the exact SchemaApply sidecar. Retain the verified handles

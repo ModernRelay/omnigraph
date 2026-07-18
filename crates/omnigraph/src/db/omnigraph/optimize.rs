@@ -230,6 +230,18 @@ pub async fn optimize_all_tables(db: &Omnigraph) -> Result<Vec<TableOptimizeStat
         crate::failpoints::names::OPTIMIZE_POST_RECOVERY_CHECK_PRE_MAIN_GATE,
     )?;
 
+    // Capture the immutable table lifetimes before entering any writer gate so
+    // RFC-026 admission can remain the outermost lock class. The complete
+    // authority token is revalidated after schema -> main -> table gates; if a
+    // concurrent schema/graph publish changed this set, this attempt fails
+    // before a physical maintenance effect instead of acquiring a late lease.
+    let admission_txn = db.open_write_txn(None).await?;
+    let stream_admission_keys = Omnigraph::stream_admission_keys_for_snapshot(&admission_txn.base);
+    let _stream_admission_guards = db
+        .write_queue()
+        .acquire_stream_shared_many(&stream_admission_keys)
+        .await;
+
     // Canonical writer order: schema -> branch -> sorted tables. Planning reads
     // catalog index intent, so it must use an operation-local accepted catalog
     // under the same schema gate as schema apply and the exact RFC-022 writers.
@@ -256,7 +268,7 @@ pub async fn optimize_all_tables(db: &Omnigraph) -> Result<Vec<TableOptimizeStat
     // armed a main/global intent crosses one of the gates now held. The entry
     // probe above is only a cheap fast-path/race seam.
     ensure_no_pending_recovery_for_optimize_under_main_gate(db).await?;
-    let snapshot = db.fresh_snapshot_for_branch(None).await?;
+    let snapshot = db.revalidate_write_txn(&admission_txn).await?;
 
     let table_tasks = table_keys
         .into_iter()
@@ -294,6 +306,11 @@ pub async fn optimize_all_tables(db: &Omnigraph) -> Result<Vec<TableOptimizeStat
         }
     }
     prepared.sort_by(|left, right| left.table_key.cmp(&right.table_key));
+
+    // Planning above is read-only. This is the final durable lifecycle check
+    // before recovery ownership is armed or any base-table HEAD can move.
+    snapshot
+        .ensure_stream_effects_allowed("optimize", prepared.iter().map(|work| work.identity))?;
 
     if !prepared.is_empty() {
         // Phase A: one durable bounded-v2 intent before the first table HEAD
@@ -1010,6 +1027,23 @@ pub async fn cleanup_all_tables(
     }
     crate::failpoints::maybe_fail(crate::failpoints::names::CLEANUP_POST_RECOVERY_CHECK_PRE_GATES)?;
 
+    // Cleanup can destroy the exact versions and transaction history used by
+    // stream enrollment/recovery classification. Conservatively close every
+    // accepted main-table admission domain before taking the schema, branch,
+    // or table queues, and hold those shared leases through orphan-ref
+    // reconciliation and all version GC.
+    let admission_txn = db.open_write_txn(None).await?;
+    let stream_admission_keys = Omnigraph::stream_admission_keys_for_snapshot(&admission_txn.base);
+    let stream_admission_identities = admission_txn
+        .base
+        .entries()
+        .map(|entry| entry.identity)
+        .collect::<Vec<_>>();
+    let _stream_admission_guards = db
+        .write_queue()
+        .acquire_stream_shared_many(&stream_admission_keys)
+        .await;
+
     // Close the empty-check -> GC race. Mutation/load take schema then branch
     // then table gates; current legacy sidecar writers take at least their table
     // gates. Cleanup takes the conservative superset and holds it through every
@@ -1024,6 +1058,9 @@ pub async fn cleanup_all_tables(
     db.refresh_coordinator_only().await?;
     db.ensure_schema_apply_not_locked("cleanup").await?;
     let cleanup_catalog = db.load_accepted_catalog_with_schema_gate_held().await?;
+    let snapshot = db.revalidate_write_txn(&admission_txn).await?;
+    snapshot
+        .ensure_stream_effects_allowed("cleanup", stream_admission_identities.iter().copied())?;
 
     // Reclaim orphaned branch forks (from an incomplete prior `branch_delete`)
     // before version GC. Authority-derived and idempotent; the eager
@@ -1044,9 +1081,6 @@ pub async fn cleanup_all_tables(
             "cleanup could not reconcile some orphaned forks; will retry next cleanup"
         );
     }
-
-    let resolved = db.resolved_branch_target(None).await?;
-    let snapshot = resolved.snapshot;
 
     let table_tasks: Vec<_> = all_table_keys(&cleanup_catalog)
         .into_iter()
@@ -1082,9 +1116,11 @@ pub async fn cleanup_all_tables(
     {
         return Err(OmniError::manifest_conflict(
             "cleanup observed a recovery sidecar after acquiring its GC gates; reopen the graph \
-             read-write to recover before garbage-collecting versions",
+            read-write to recover before garbage-collecting versions",
         ));
     }
+    snapshot
+        .ensure_stream_effects_allowed("cleanup", stream_admission_identities.iter().copied())?;
 
     // Lance protects versions referenced by its own per-dataset branches, but
     // an OmniGraph branch is lazy: until a table is first written on that

@@ -1,4 +1,7 @@
 use super::*;
+use std::collections::BTreeSet;
+
+use crate::db::write_queue::StreamAdmissionKey;
 use crate::storage_layer::{
     KEYED_WRITE_MAX_BYTES, KEYED_WRITE_MAX_ROWS, KeyedWriteSemantics, ProvenInsertChunk,
 };
@@ -17,6 +20,59 @@ const MERGE_VALIDATION_RESOURCE: &str = "branch-merge retained validation delta 
 /// Bound transaction-history metadata work independently of recovery's effect
 /// scan ceiling. This is an optimization budget, never a correctness limit.
 const PURE_INSERT_HISTORY_MAX_VERSIONS: u64 = 1_024;
+
+fn branch_merge_stream_admission_keys(
+    snapshots: &[&Snapshot],
+    target_branch: Option<&str>,
+) -> BTreeSet<StreamAdmissionKey> {
+    let mut keys = BTreeSet::new();
+    for snapshot in snapshots {
+        for entry in snapshot.entries() {
+            // Cover the prospective target-effect domain. The bounded stream
+            // authority is main-only and identity-wide, so main is also included
+            // explicitly for named-target merges; this makes enrollment/drain
+            // contend with the lifecycle check even before named streaming
+            // exists.
+            for physical_ref in [target_branch, None] {
+                keys.insert(StreamAdmissionKey::for_resolved_ref(
+                    entry.identity,
+                    physical_ref,
+                ));
+            }
+        }
+    }
+    keys
+}
+
+fn branch_merge_warm_stream_admission_keys(
+    catalog: &Catalog,
+    target_branch: Option<&str>,
+) -> Result<BTreeSet<StreamAdmissionKey>> {
+    let schema_ir = catalog.bound_schema_ir().ok_or_else(|| {
+        OmniError::manifest_internal(
+            "branch merge requires an identity-bound catalog for stream admission",
+        )
+    })?;
+    let mut keys = BTreeSet::new();
+    for (stable_table_id, table_incarnation_id) in schema_ir
+        .nodes
+        .iter()
+        .map(|node| (node.type_id.get(), node.table_incarnation_id.get()))
+        .chain(
+            schema_ir
+                .edges
+                .iter()
+                .map(|edge| (edge.type_id.get(), edge.table_incarnation_id.get())),
+        )
+    {
+        let identity =
+            crate::db::manifest::TableIdentity::new(stable_table_id, table_incarnation_id)?;
+        for physical_ref in [target_branch, None] {
+            keys.insert(StreamAdmissionKey::for_resolved_ref(identity, physical_ref));
+        }
+    }
+    Ok(keys)
+}
 
 #[derive(Debug)]
 enum CandidateTableState {
@@ -1419,8 +1475,9 @@ fn ensure_merge_identity_compatible(
 
 #[cfg(test)]
 mod table_identity_tests {
-    use super::ensure_merge_identity_compatible;
+    use super::{branch_merge_warm_stream_admission_keys, ensure_merge_identity_compatible};
     use crate::db::manifest::TableIdentity;
+    use crate::db::write_queue::StreamAdmissionKey;
 
     #[test]
     fn merge_identity_guard_includes_base_and_allows_absence() {
@@ -1449,6 +1506,47 @@ mod table_identity_tests {
             )
             .is_ok()
         );
+    }
+
+    #[test]
+    fn merge_admission_covers_main_and_final_target_ref_by_immutable_identity() {
+        let parsed = omnigraph_compiler::schema::parser::parse_schema(
+            r#"
+node Person {
+    name: String @key
+}
+edge Knows: Person -> Person
+"#,
+        )
+        .unwrap();
+        let shape = omnigraph_compiler::compile_schema_shape(&parsed).unwrap();
+        let ir = omnigraph_compiler::initialize_schema_ir(
+            omnigraph_compiler::SchemaIdentityDomain::new(),
+            &shape,
+        )
+        .unwrap()
+        .schema_ir;
+        let catalog = omnigraph_compiler::build_catalog_from_ir(&ir).unwrap();
+        let keys = branch_merge_warm_stream_admission_keys(&catalog, Some("review")).unwrap();
+
+        assert_eq!(keys.len(), 4);
+        for (stable_table_id, table_incarnation_id) in ir
+            .nodes
+            .iter()
+            .map(|node| (node.type_id.get(), node.table_incarnation_id.get()))
+            .chain(
+                ir.edges
+                    .iter()
+                    .map(|edge| (edge.type_id.get(), edge.table_incarnation_id.get())),
+            )
+        {
+            let identity = TableIdentity::new(stable_table_id, table_incarnation_id).unwrap();
+            assert!(keys.contains(&StreamAdmissionKey::for_resolved_ref(identity, None)));
+            assert!(keys.contains(&StreamAdmissionKey::for_resolved_ref(
+                identity,
+                Some("review"),
+            )));
+        }
     }
 }
 
@@ -3012,30 +3110,77 @@ impl Omnigraph {
         let relevant_branches = [source_branch.as_deref(), target_branch.as_deref()];
         // Branch merge is still a legacy per-table publisher, but its graph-ref
         // authority must be stable for the complete prepare -> publish window.
-        // First converge or reject relevant recovery intent, then join the same
-        // root-shared schema -> branch order used by native branch controls.
-        // Holding both branch gates through publication prevents a target
-        // delete/recreate from reusing the branch name underneath a plan (ABA).
+        // First converge or reject relevant recovery intent, then join the
+        // root-shared admission -> schema -> branch order. Holding both branch
+        // gates through publication prevents a target delete/recreate from
+        // reusing the branch name underneath a plan (ABA).
         self.heal_pending_recovery_sidecars_for_write(&relevant_branches)
             .await?;
-        let _schema_guard = self
-            .write_queue()
-            .acquire(&crate::db::manifest::schema_apply_serial_queue_key())
-            .await;
-        let _branch_guards = self
-            .write_queue()
-            .acquire_branches(&[source_branch.clone(), target_branch.clone()])
-            .await;
-        self.ensure_no_pending_recovery_sidecars_under_gates(&relevant_branches, "branch_merge")
+        let write_queue = self.write_queue();
+        let mut admission_keys = branch_merge_warm_stream_admission_keys(
+            self.catalog().as_ref(),
+            target_branch.as_deref(),
+        )?;
+
+        // A long-lived handle can have a pre-schema-apply warm catalog. Enter
+        // admission from that cheap view, capture both branches under the inner
+        // gates, and retry outside every gate only if the fresh accepted table
+        // lifetimes are not covered. The normal path performs no extra manifest
+        // open; the retry is solely a stale-view convergence path.
+        let (
+            _stream_admission,
+            _schema_guard,
+            _branch_guards,
+            source_txn,
+            target_txn,
+            source_commits,
+            target_commits,
+        ) = loop {
+            let keys = admission_keys.iter().cloned().collect::<Vec<_>>();
+            let admission = write_queue.acquire_stream_shared_many(&keys).await;
+            let schema = write_queue
+                .acquire(&crate::db::manifest::schema_apply_serial_queue_key())
+                .await;
+            let branches = write_queue
+                .acquire_branches(&[source_branch.clone(), target_branch.clone()])
+                .await;
+
+            self.ensure_no_pending_recovery_sidecars_under_gates(
+                &relevant_branches,
+                "branch_merge",
+            )
             .await?;
-        self.ensure_schema_apply_not_locked("branch_merge").await?;
-        // Capture each branch as one coherent RFC-022 authority token plus
-        // immutable snapshot. The target token is the coarse publish read set;
-        // the source token pins the exact merge input without requiring the
-        // source head to remain latest until the target CAS.
-        let (source_txn, target_txn, source_commits, target_commits) = self
-            .open_merge_write_txns(source_branch.as_deref(), target_branch.as_deref())
-            .await?;
+            self.ensure_schema_apply_not_locked("branch_merge").await?;
+
+            // Capture each branch as one coherent RFC-022 authority token plus
+            // immutable snapshot. The target token is the coarse publish read
+            // set; the source token pins the exact merge input without requiring
+            // the source head to remain latest until the target CAS.
+            let (source_txn, target_txn, source_commits, target_commits) = self
+                .open_merge_write_txns(source_branch.as_deref(), target_branch.as_deref())
+                .await?;
+            let required = branch_merge_stream_admission_keys(
+                &[&source_txn.base, &target_txn.base],
+                target_branch.as_deref(),
+            );
+            if admission_keys.is_superset(&required) {
+                break (
+                    admission,
+                    schema,
+                    branches,
+                    source_txn,
+                    target_txn,
+                    source_commits,
+                    target_commits,
+                );
+            }
+
+            admission_keys.extend(required);
+            drop((source_txn, target_txn, source_commits, target_commits));
+            drop(branches);
+            drop(schema);
+            drop(admission);
+        };
         let source_head_commit_id = source_txn
             .effective_graph_head
             .clone()
@@ -3360,6 +3505,28 @@ impl Omnigraph {
                 )),
             ));
         }
+
+        // The fresh target manifest is durable lifecycle authority. The outer
+        // shared admission set closes enrollment/drain's final-check-to-effect
+        // race for every candidate that can move the target graph state.
+        let target_effect_identities = candidates
+            .keys()
+            .map(|table_key| {
+                fresh_target_snapshot
+                    .entry(table_key)
+                    .or_else(|| live_source_snapshot.entry(table_key))
+                    .or_else(|| base_snapshot.entry(table_key))
+                    .map(|entry| entry.identity)
+                    .ok_or_else(|| {
+                        OmniError::manifest_internal(format!(
+                            "branch merge target effect '{table_key}' has no fresh table identity"
+                        ))
+                    })
+            })
+            .collect::<Result<Vec<_>>>()?;
+        fresh_target_snapshot
+            .ensure_stream_effects_allowed("branch_merge", target_effect_identities)?;
+
         for (table_key, candidate) in &candidates {
             if let CandidateTableState::AdoptPureInserts(proven) = candidate {
                 revalidate_proven_pure_insert_source(

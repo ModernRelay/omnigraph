@@ -31,6 +31,17 @@ pub enum ManifestConflictDetails {
         expected: Option<String>,
         actual: Option<String>,
     },
+    /// A durable RFC-026 lifecycle owns the physical table ref, so this
+    /// operation is not authorized to move that ref.  This is distinct from a
+    /// stale read set: retrying without first completing the lifecycle
+    /// transition would hit the same authority fence.
+    StreamLifecycleConflict {
+        stable_table_id: u64,
+        table_incarnation_id: u64,
+        table_key: String,
+        lifecycle: String,
+        operation: String,
+    },
     /// Lance's row-level CAS rejected the publish because a concurrent writer
     /// landed a row with the same `object_id`. Distinct from
     /// `ExpectedVersionMismatch`: the caller's expectations (if any) still
@@ -241,6 +252,32 @@ impl OmniError {
                     member,
                     expected,
                     actual,
+                },
+            ),
+        )
+    }
+
+    pub(crate) fn manifest_stream_lifecycle_conflict(
+        stable_table_id: u64,
+        table_incarnation_id: u64,
+        table_key: impl Into<String>,
+        lifecycle: impl Into<String>,
+        operation: impl Into<String>,
+    ) -> Self {
+        let table_key = table_key.into();
+        let lifecycle = lifecycle.into();
+        let operation = operation.into();
+        let message = format!(
+            "operation '{operation}' cannot touch table '{table_key}' while its stream lifecycle is {lifecycle}"
+        );
+        Self::Manifest(
+            ManifestError::new(ManifestErrorKind::Conflict, message).with_details(
+                ManifestConflictDetails::StreamLifecycleConflict {
+                    stable_table_id,
+                    table_incarnation_id,
+                    table_key,
+                    lifecycle,
+                    operation,
                 },
             ),
         )

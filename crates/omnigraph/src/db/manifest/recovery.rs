@@ -34,7 +34,7 @@
 //!   additionally never restores (roll-forward only); foreign processes remain
 //!   outside this serialization boundary.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 
 use serde::{Deserialize, Serialize};
 use tracing::warn;
@@ -48,6 +48,10 @@ use crate::db::schema_state::{
 use crate::error::{OmniError, Result};
 use crate::storage::StorageAdapter;
 use crate::table_store::StagedTransactionIdentity;
+use crate::table_store::mem_wal::{
+    MemWalEnrollmentPlan, MemWalEnrollmentState, classify_enrollment,
+    provision_shard_from_exact_index_only,
+};
 
 use super::Snapshot;
 use super::publisher::{
@@ -109,6 +113,12 @@ async fn publish_recovery_commit(
         .or_else(|| {
             sidecar
                 .protocol_v8
+                .as_ref()
+                .map(|protocol| &protocol.lineage)
+        })
+        .or_else(|| {
+            sidecar
+                .protocol_v10
                 .as_ref()
                 .map(|protocol| &protocol.lineage)
         });
@@ -209,6 +219,12 @@ async fn publish_recovery_commit(
                 .protocol_v8
                 .as_ref()
                 .map(|protocol| &protocol.authority)
+        })
+        .or_else(|| {
+            sidecar
+                .protocol_v10
+                .as_ref()
+                .map(|protocol| &protocol.authority)
         });
     let precondition = match (exact_authority, kind) {
         (Some(authority), RecoveryKind::RolledForward) => {
@@ -287,10 +303,20 @@ pub(crate) const RECOVERY_DIR_NAME: &str = "__recovery";
 /// `protocol_v4`, `protocol_v7`, and `protocol_v8` only to avoid duplicating
 /// their established exact-effect shapes. Pre-v9 files are never upgraded by
 /// alias inference or a serde default.
-pub(crate) const SIDECAR_SCHEMA_VERSION: u32 = 9;
+///
+/// v9 → v10: RFC-026 bounded MemWAL enrollment. Schema v10 is reserved for
+/// one main-branch table, an exact pre-enrollment HEAD witness, a pre-minted
+/// enrollment/shard namespace, and one fixed lifecycle binding. Recovery is
+/// roll-forward-only: it may complete the exact index-only gap and publish the
+/// exact empty enrollment, but it never restores the base table or deletes
+/// MemWAL objects.
+pub(crate) const SIDECAR_SCHEMA_VERSION: u32 = 10;
 
 /// The only recovery generation emitted by the manifest-v5 write paths.
 pub(crate) const IDENTITY_AWARE_SIDECAR_SCHEMA_VERSION: u32 = 9;
+
+/// Exact roll-forward-only RFC-026 MemWAL enrollment generation.
+pub(crate) const STREAM_ENROLLMENT_SIDECAR_SCHEMA_VERSION: u32 = 10;
 
 /// Oldest loose-classification generation retained for test fixtures. No
 /// active constructor emits it.
@@ -392,6 +418,9 @@ pub(crate) enum SidecarKind {
     /// is always safe because compaction is content-preserving (Lance
     /// `Operation::Rewrite` "reorganizes data without semantic modification").
     Optimize,
+    /// RFC-026 Phase A — create the singleton MemWAL index, provision one
+    /// pre-minted empty shard, and publish its durable lifecycle authority.
+    StreamEnrollment,
 }
 
 /// Which recovery-classification semantics a sidecar's tables use. Resolved once
@@ -417,6 +446,9 @@ pub(crate) enum ClassificationMode {
     /// the observed Lance HEAD transaction `(read_version, uuid)` must exactly
     /// equal the planned and confirmed transaction identity.
     ExactEffect,
+    /// Specialized exact N/N+1 plus bounded MemWAL-object classification.
+    /// Generic table recovery must never interpret this mode.
+    StreamEnrollment,
 }
 
 impl SidecarKind {
@@ -460,6 +492,7 @@ impl SidecarKind {
                 }
             }
             SidecarKind::Optimize => ClassificationMode::Loose,
+            SidecarKind::StreamEnrollment => ClassificationMode::StreamEnrollment,
         }
     }
 }
@@ -877,6 +910,23 @@ pub(crate) struct RecoveryProtocolV8 {
     pub intended_delta: RecoveryManifestDelta,
 }
 
+/// Schema-v10 exact, roll-forward-only MemWAL enrollment payload.
+///
+/// `baseline_head` is the manifest-selected base version at arm time. The
+/// enrollment plan owns the two never-reused UUIDs, while `intended_binding`
+/// fixes the durable logical authority that may be published after the adapter
+/// proves the exact N+1 index and exact empty shard. The achieved N+1 witness
+/// remains a physical output and is reconstructed from the exact classifier;
+/// recovery never accepts a latest-HEAD approximation.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub(crate) struct RecoveryProtocolV10 {
+    pub authority: RecoveryAuthorityToken,
+    pub lineage: RecoveryLineageIntent,
+    pub baseline_head: super::CurrentHeadWitness,
+    pub enrollment_plan: MemWalEnrollmentPlan,
+    pub intended_binding: super::StreamPhysicalBinding,
+}
+
 /// Schema-v6 EnsureIndices rollback identity retained for compatibility.
 /// Recovery must still be able to prove that a previously published
 /// compensation was a rollback rather than infer the outcome from aligned
@@ -952,6 +1002,9 @@ pub(crate) struct RecoverySidecar {
     /// Exact EnsureIndices payload (introduced at v8; retained by v9).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub protocol_v8: Option<RecoveryProtocolV8>,
+    /// Exact RFC-026 MemWAL enrollment payload (schema v10 only).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub protocol_v10: Option<RecoveryProtocolV10>,
     /// EnsureIndices-only fixed rollback identity. It does not make the
     /// physical index effects exact; it only makes compensation retry-safe.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -1414,12 +1467,17 @@ fn validate_sidecar_shape(sidecar_uri: &str, sidecar: &RecoverySidecar) -> Resul
             || sidecar.protocol_v4.is_some()
             || sidecar.protocol_v7.is_some()
             || sidecar.protocol_v8.is_some()
+            || sidecar.protocol_v10.is_some()
         {
             return Err(malformed(
                 "an exact-effect protocol is present on a pre-v3 sidecar".to_string(),
             ));
         }
         return Ok(());
+    }
+
+    if sidecar.schema_version == STREAM_ENROLLMENT_SIDECAR_SCHEMA_VERSION {
+        return validate_stream_enrollment_v10_shape(sidecar_uri, sidecar);
     }
 
     if sidecar.schema_version == IDENTITY_AWARE_SIDECAR_SCHEMA_VERSION {
@@ -1431,6 +1489,9 @@ fn validate_sidecar_shape(sidecar_uri: &str, sidecar: &RecoverySidecar) -> Resul
             SidecarKind::SchemaApply => validate_schema_apply_v7_shape(sidecar_uri, sidecar),
             SidecarKind::EnsureIndices => validate_ensure_indices_v8_shape(sidecar_uri, sidecar),
             SidecarKind::Optimize => validate_optimize_v9_shape(sidecar_uri, sidecar),
+            SidecarKind::StreamEnrollment => Err(malformed(
+                "StreamEnrollment requires the dedicated schema-v10 envelope".to_string(),
+            )),
         };
     }
 
@@ -1450,6 +1511,7 @@ fn validate_sidecar_shape(sidecar_uri: &str, sidecar: &RecoverySidecar) -> Resul
             || sidecar.protocol_v4.is_some()
             || sidecar.protocol_v7.is_some()
             || sidecar.protocol_v8.is_some()
+            || sidecar.protocol_v10.is_some()
         {
             return Err(malformed(
                 "schema-v5 SchemaApply must target main and cannot carry v3/v4 protocols"
@@ -1479,6 +1541,7 @@ fn validate_sidecar_shape(sidecar_uri: &str, sidecar: &RecoverySidecar) -> Resul
     if sidecar.protocol_v4.is_some()
         || sidecar.protocol_v7.is_some()
         || sidecar.protocol_v8.is_some()
+        || sidecar.protocol_v10.is_some()
     {
         return Err(malformed(
             "a writer-specific exact protocol is present on the wrong sidecar generation"
@@ -1510,7 +1573,7 @@ fn validate_identity_aware_pin_paths(
     sidecar_uri: &str,
     sidecar: &RecoverySidecar,
 ) -> Result<()> {
-    if sidecar.schema_version != IDENTITY_AWARE_SIDECAR_SCHEMA_VERSION {
+    if sidecar.schema_version < IDENTITY_AWARE_SIDECAR_SCHEMA_VERSION {
         return Ok(());
     }
 
@@ -1542,6 +1605,7 @@ fn validate_mutation_load_shape(sidecar_uri: &str, sidecar: &RecoverySidecar) ->
     if sidecar.protocol_v4.is_some()
         || sidecar.protocol_v7.is_some()
         || sidecar.protocol_v8.is_some()
+        || sidecar.protocol_v10.is_some()
         || sidecar.ensure_indices_rollback_v6.is_some()
         || sidecar.merge_source_commit_id.is_some()
         || sidecar.schema_apply_manifest_published
@@ -1770,6 +1834,104 @@ where
     Ok(())
 }
 
+fn validate_stream_enrollment_v10_shape(
+    sidecar_uri: &str,
+    sidecar: &RecoverySidecar,
+) -> Result<()> {
+    let malformed = |reason: String| {
+        OmniError::manifest_internal(format!(
+            "recovery sidecar at '{}' has an invalid schema-v{} shape: {}",
+            sidecar_uri, sidecar.schema_version, reason
+        ))
+    };
+    if sidecar.writer_kind != SidecarKind::StreamEnrollment
+        || sidecar.branch.is_some()
+        || sidecar.protocol_v3.is_some()
+        || sidecar.protocol_v4.is_some()
+        || sidecar.protocol_v7.is_some()
+        || sidecar.protocol_v8.is_some()
+        || sidecar.ensure_indices_rollback_v6.is_some()
+        || sidecar.merge_source_commit_id.is_some()
+        || !sidecar.additional_registrations.is_empty()
+        || !sidecar.tombstones.is_empty()
+        || sidecar.schema_apply_manifest_published
+        || sidecar.schema_apply_target_schema_ir_hash.is_some()
+    {
+        return Err(malformed(
+            "schema-v10 StreamEnrollment must target canonical main and carry only protocol_v10"
+                .to_string(),
+        ));
+    }
+    let protocol = sidecar
+        .protocol_v10
+        .as_ref()
+        .ok_or_else(|| malformed("missing required protocol_v10 payload".to_string()))?;
+    validate_authority_identity(&malformed, &protocol.authority)?;
+    if protocol.lineage.branch.is_some()
+        || protocol.lineage.merged_parent_commit_id.is_some()
+        || protocol.lineage.graph_commit_id.is_empty()
+        || sidecar.actor_id != protocol.lineage.actor_id
+    {
+        return Err(malformed(
+            "StreamEnrollment lineage must be a fixed canonical-main commit owned by the sidecar actor"
+                .to_string(),
+        ));
+    }
+    validate_unique_pin_identities(&malformed, &sidecar.tables, true)?;
+    if sidecar.tables.len() != 1 {
+        return Err(malformed(format!(
+            "bounded StreamEnrollment requires exactly one table pin, got {}",
+            sidecar.tables.len()
+        )));
+    }
+    let pin = &sidecar.tables[0];
+    let expected_post = pin.expected_version.checked_add(1).ok_or_else(|| {
+        malformed("StreamEnrollment table version overflows its exact N+1 outcome".to_string())
+    })?;
+    if pin.table_branch.is_some()
+        || pin.confirmed_version.is_some()
+        || pin.post_commit_pin != expected_post
+        || protocol.baseline_head.table_version != pin.expected_version
+        || protocol.baseline_head.branch_identifier
+            != lance::dataset::refs::BranchIdentifier::main()
+        || protocol.baseline_head.transaction_uuid.is_empty()
+        || protocol
+            .baseline_head
+            .manifest_e_tag
+            .as_ref()
+            .is_some_and(|e_tag| e_tag.is_empty() || e_tag.trim() != e_tag)
+    {
+        return Err(malformed(
+            "StreamEnrollment pin and exact main-branch baseline witness disagree".to_string(),
+        ));
+    }
+
+    let binding = &protocol.intended_binding;
+    let canonical_path = super::table_path_for_identity(&pin.table_key, pin.identity)
+        .map_err(|error| malformed(format!("invalid bounded stream binding path: {error}")))?;
+    if binding.identity().map_err(|error| {
+        malformed(format!("invalid bounded stream binding identity: {error}"))
+    })? != pin.identity
+        || binding.table_location != canonical_path
+        || binding.table_branch.is_some()
+        || binding.enrollment_id != protocol.enrollment_plan.enrollment_id.to_string()
+        || binding.shard_ids != vec![protocol.enrollment_plan.shard_id.to_string()]
+        || binding.stream_config_version != super::stream::STREAM_CONFIG_VERSION
+        || binding.stream_config_hash != protocol.enrollment_plan.stream_config_hash()
+    {
+        return Err(malformed(
+            "StreamEnrollment physical binding differs from its table pin or pre-minted plan"
+                .to_string(),
+        ));
+    }
+    MemWalEnrollmentPlan::new(
+        protocol.enrollment_plan.enrollment_id,
+        protocol.enrollment_plan.shard_id,
+    )
+    .map_err(|error| malformed(format!("invalid pre-minted enrollment plan: {error}")))?;
+    Ok(())
+}
+
 fn validate_optimize_v9_shape(sidecar_uri: &str, sidecar: &RecoverySidecar) -> Result<()> {
     let malformed = |reason: String| {
         OmniError::manifest_internal(format!(
@@ -1782,6 +1944,7 @@ fn validate_optimize_v9_shape(sidecar_uri: &str, sidecar: &RecoverySidecar) -> R
         || sidecar.protocol_v4.is_some()
         || sidecar.protocol_v7.is_some()
         || sidecar.protocol_v8.is_some()
+        || sidecar.protocol_v10.is_some()
         || sidecar.ensure_indices_rollback_v6.is_some()
         || !sidecar.additional_registrations.is_empty()
         || !sidecar.tombstones.is_empty()
@@ -1811,6 +1974,7 @@ fn validate_ensure_indices_v6_shape(sidecar_uri: &str, sidecar: &RecoverySidecar
         || sidecar.protocol_v4.is_some()
         || sidecar.protocol_v7.is_some()
         || sidecar.protocol_v8.is_some()
+        || sidecar.protocol_v10.is_some()
         || sidecar.merge_source_commit_id.is_some()
         || !sidecar.additional_registrations.is_empty()
         || !sidecar.tombstones.is_empty()
@@ -1868,6 +2032,7 @@ fn validate_ensure_indices_v8_shape(sidecar_uri: &str, sidecar: &RecoverySidecar
     if sidecar.protocol_v3.is_some()
         || sidecar.protocol_v4.is_some()
         || sidecar.protocol_v7.is_some()
+        || sidecar.protocol_v10.is_some()
         || sidecar.ensure_indices_rollback_v6.is_some()
         || sidecar.merge_source_commit_id.is_some()
         || !sidecar.additional_registrations.is_empty()
@@ -2074,6 +2239,7 @@ fn validate_schema_apply_v7_shape(sidecar_uri: &str, sidecar: &RecoverySidecar) 
         || sidecar.protocol_v3.is_some()
         || sidecar.protocol_v4.is_some()
         || sidecar.protocol_v8.is_some()
+        || sidecar.protocol_v10.is_some()
         || sidecar.ensure_indices_rollback_v6.is_some()
         || sidecar.merge_source_commit_id.is_some()
         || !sidecar.additional_registrations.is_empty()
@@ -2394,6 +2560,7 @@ fn validate_branch_merge_v4_shape(sidecar_uri: &str, sidecar: &RecoverySidecar) 
     if sidecar.protocol_v3.is_some()
         || sidecar.protocol_v7.is_some()
         || sidecar.protocol_v8.is_some()
+        || sidecar.protocol_v10.is_some()
         || sidecar.ensure_indices_rollback_v6.is_some()
     {
         return Err(malformed(
@@ -2920,6 +3087,11 @@ fn classify_table_observation(
             }
             RolledPastExpected
         }
+        // Stream enrollment validates more than a numeric table successor: it
+        // also proves the exact CreateIndex transaction, persisted config, and
+        // bounded empty-shard inventory. Generic classification must therefore
+        // fail closed if specialized dispatch is ever bypassed.
+        ClassificationMode::StreamEnrollment => IncompletePhaseB,
     }
 }
 
@@ -3011,16 +3183,15 @@ pub(crate) async fn restore_table_to_version(
 /// as `Omnigraph::refresh` documents.
 ///
 /// Concurrency: unlike the open-time sweep, this runs while other writers may
-/// be in flight. RFC-022 mutation/load holds root-scoped schema → branch →
-/// sorted table gates across its sidecar lifetime; legacy adapters hold their
-/// applicable schema/table gates. Healing takes the ordered superset, so it
-/// blocks until the sidecar writer either
+/// be in flight. Physical writers hold root-scoped stream admission → schema →
+/// branch → sorted-table gates across their sidecar/effect lifetime. Healing
+/// takes the ordered superset, so it blocks until the sidecar writer either
 /// finished (sidecar deleted; the under-gate reread skips it) or died
 /// (the freshly parsed sidecar is genuinely orphaned and safe to process). Without this, the
 /// heal could observe a live writer's sidecar in its commit→publish
 /// window, roll it forward, and fail that writer's own publish CAS.
-/// Lock order is schema → branch → sorted tables → coordinator, matching the
-/// RFC-022 writer and Full-recovery paths.
+/// Lock order is stream admission → schema → branch → sorted tables →
+/// coordinator, matching the RFC-022 writer and Full-recovery paths.
 ///
 /// The schema-staging reconcile runs lazily, per SchemaApply sidecar,
 /// AFTER that sidecar's queue guards are held and its existence is
@@ -3073,8 +3244,32 @@ pub(crate) async fn heal_pending_sidecars_roll_forward(
     for sidecar in sidecars {
         // Serialize against a possibly-live writer (see fn docs). Guards are
         // scoped per sidecar and follow the one total order shared by writers,
-        // Full recovery, and live healing. Taking schema + branch even for an
-        // empty/legacy sidecar also serializes its audit/delete lifecycle.
+        // Full recovery, and live healing. Admission is outermost: an ordinary
+        // sidecar takes shared admission (the same class as its original base
+        // effect), while enrollment closes admission exclusively. Taking
+        // schema + branch even for an empty/legacy sidecar also serializes its
+        // audit/delete lifecycle.
+        let admission_keys = sidecar
+            .tables
+            .iter()
+            .map(|pin| {
+                crate::db::write_queue::StreamAdmissionKey::for_resolved_ref(
+                    pin.identity,
+                    pin.table_branch.as_deref(),
+                )
+            })
+            .collect::<Vec<_>>();
+        let mut _shared_admission_guards = Vec::new();
+        let mut _exclusive_admission_guards = Vec::new();
+        if matches!(sidecar.writer_kind, SidecarKind::StreamEnrollment) {
+            _exclusive_admission_guards = write_queue
+                .acquire_stream_exclusive_many(&admission_keys)
+                .await;
+        } else {
+            _shared_admission_guards = write_queue
+                .acquire_stream_shared_many(&admission_keys)
+                .await;
+        }
         let _schema_guard = write_queue.acquire(&schema_apply_serial_queue_key()).await;
         let _branch_guard = write_queue.acquire_branch(sidecar.branch.as_deref()).await;
         let queue_keys: Vec<crate::db::write_queue::TableQueueKey> = sidecar
@@ -3591,6 +3786,368 @@ pub(crate) async fn finalize_effect_free_occ_sidecar(
     Ok(true)
 }
 
+/// Recover one bounded RFC-026 enrollment intent.
+///
+/// This adapter deliberately has no rollback branch. The only destructive
+/// action available here is deleting a sidecar after exact classification has
+/// proved that neither enrollment effect exists. Once the singleton index is
+/// present, recovery either completes the pre-minted empty shard and publishes
+/// the fixed lifecycle outcome, or retains the sidecar and fails closed.
+async fn process_stream_enrollment_sidecar_v10(
+    root_uri: &str,
+    storage: &std::sync::Arc<dyn StorageAdapter>,
+    snapshot: &Snapshot,
+    sidecar: &RecoverySidecar,
+) -> Result<bool> {
+    let protocol = sidecar.protocol_v10.as_ref().ok_or_else(|| {
+        OmniError::manifest_internal("schema-v10 StreamEnrollment is missing protocol_v10")
+    })?;
+    let pin = sidecar.tables.first().ok_or_else(|| {
+        OmniError::manifest_internal("schema-v10 StreamEnrollment has no table pin")
+    })?;
+    let manifest_entry = snapshot_entry_for_pin(snapshot, pin)
+        .map_err(|error| stream_enrollment_effect_error(sidecar, error))?
+        .ok_or_else(|| {
+            OmniError::recovery_required(
+                sidecar.operation_id.clone(),
+                format!(
+                    "stream enrollment table identity {} is no longer live in the manifest",
+                    pin.identity
+                ),
+            )
+        })?;
+    if manifest_entry.table_path != protocol.intended_binding.table_location
+        || manifest_entry.table_branch.is_some()
+    {
+        return Err(OmniError::recovery_required(
+            sidecar.operation_id.clone(),
+            format!(
+                "stream enrollment manifest authority changed for identity {}: expected path '{}' on main, found path '{}' ref {:?} version {}",
+                pin.identity,
+                protocol.intended_binding.table_location,
+                manifest_entry.table_path,
+                manifest_entry.table_branch,
+                manifest_entry.table_version,
+            ),
+        ));
+    }
+
+    let anchor = crate::instrumentation::open_dataset(
+        &pin.table_path,
+        crate::instrumentation::VersionResolution::At(pin.expected_version),
+        None,
+        crate::instrumentation::table_wrapper(),
+    )
+    .await
+    .map_err(|error| stream_enrollment_effect_error(sidecar, error))?;
+    let mut state = classify_enrollment(
+        &anchor,
+        &protocol.baseline_head,
+        &protocol.enrollment_plan,
+    )
+    .await
+    .map_err(|error| {
+        OmniError::recovery_required(sidecar.operation_id.clone(), error.to_string())
+    })?;
+
+    if matches!(state, MemWalEnrollmentState::ExactNoEffect) {
+        if snapshot.stream_lifecycle(pin.identity).is_some()
+            || manifest_entry.table_version != pin.expected_version
+        {
+            return Err(OmniError::recovery_required(
+                sidecar.operation_id.clone(),
+                "manifest contains stream lifecycle authority but the exact enrollment effects are absent",
+            ));
+        }
+        delete_sidecar_by_operation_id(root_uri, storage.as_ref(), &sidecar.operation_id).await?;
+        return Ok(true);
+    }
+
+    // Publication may have succeeded before audit/sidecar cleanup. In that
+    // state the live graph head is intentionally the fixed lineage id rather
+    // than the pre-effect authority, so recognize the exact visible outcome
+    // before comparing against arm-time authority.
+    if let MemWalEnrollmentState::ExactIndexAndExpectedEmptyShard {
+        receipt,
+        shard_manifest,
+    } = &state
+    {
+        let lifecycle = stream_enrollment_lifecycle(sidecar, receipt, shard_manifest)
+            .map_err(|error| stream_enrollment_effect_error(sidecar, error))?;
+        if stream_enrollment_original_visible(root_uri, sidecar, &lifecycle)
+            .await
+            .map_err(|error| stream_enrollment_effect_error(sidecar, error))?
+        {
+            return finalize_visible_stream_enrollment(root_uri, storage.as_ref(), sidecar)
+                .await
+                .map_err(|error| stream_enrollment_effect_error(sidecar, error));
+        }
+    }
+
+    let live_authority = read_live_recovery_authority(root_uri, storage, None)
+        .await
+        .map_err(|error| stream_enrollment_effect_error(sidecar, error))?;
+    if live_authority != protocol.authority {
+        return Err(OmniError::recovery_required(
+            sidecar.operation_id.clone(),
+            "stream enrollment graph/schema authority changed after recovery was armed",
+        ));
+    }
+
+    if matches!(state, MemWalEnrollmentState::ExactIndexOnly(_)) {
+        provision_shard_from_exact_index_only(
+            &anchor,
+            &protocol.baseline_head,
+            &protocol.enrollment_plan,
+        )
+        .await
+        .map_err(|error| {
+            OmniError::recovery_required(sidecar.operation_id.clone(), error.to_string())
+        })?;
+        state = classify_enrollment(
+            &anchor,
+            &protocol.baseline_head,
+            &protocol.enrollment_plan,
+        )
+        .await
+        .map_err(|error| {
+            OmniError::recovery_required(sidecar.operation_id.clone(), error.to_string())
+        })?;
+    }
+
+    let MemWalEnrollmentState::ExactIndexAndExpectedEmptyShard {
+        receipt,
+        shard_manifest,
+    } = state
+    else {
+        return Err(OmniError::recovery_required(
+            sidecar.operation_id.clone(),
+            "stream enrollment did not converge to the exact index-plus-empty-shard state",
+        ));
+    };
+    let lifecycle = stream_enrollment_lifecycle(sidecar, &receipt, &shard_manifest)
+        .map_err(|error| stream_enrollment_effect_error(sidecar, error))?;
+
+    if stream_enrollment_original_visible(root_uri, sidecar, &lifecycle)
+        .await
+        .map_err(|error| stream_enrollment_effect_error(sidecar, error))?
+    {
+        return finalize_visible_stream_enrollment(root_uri, storage.as_ref(), sidecar)
+            .await
+            .map_err(|error| stream_enrollment_effect_error(sidecar, error));
+    }
+    if snapshot.stream_lifecycle(pin.identity).is_some()
+        || manifest_entry.table_version != pin.expected_version
+    {
+        return Err(OmniError::recovery_required(
+            sidecar.operation_id.clone(),
+            "a different stream lifecycle row is already visible for the enrollment identity",
+        ));
+    }
+    crate::failpoints::maybe_fail(
+        crate::failpoints::names::STREAM_ENROLLMENT_POST_SHARD_PRE_MANIFEST,
+    )
+    .map_err(|error| stream_enrollment_effect_error(sidecar, error))?;
+
+    let successor = anchor
+        .checkout_version(receipt.head.table_version)
+        .await
+        .map_err(|error| {
+            stream_enrollment_effect_error(sidecar, OmniError::Lance(error.to_string()))
+        })?;
+    let version_metadata = super::TableVersionMetadata::from_dataset(
+        root_uri,
+        &manifest_entry.table_path,
+        &successor,
+    )
+    .map_err(|error| stream_enrollment_effect_error(sidecar, error))?;
+    let updates = vec![
+        ManifestChange::Update(SubTableUpdate {
+            identity: pin.identity,
+            table_key: pin.table_key.clone(),
+            table_version: receipt.head.table_version,
+            table_branch: None,
+            row_count: manifest_entry.row_count,
+            version_metadata,
+        }),
+        ManifestChange::SetStreamLifecycle {
+            expected: None,
+            next: lifecycle,
+        },
+    ];
+    let expected = HashMap::from([(
+        pin.identity,
+        TableVersionExpectation {
+            table_key: pin.table_key.clone(),
+            table_version: pin.expected_version,
+        },
+    )]);
+    let (_, graph_commit_id) = publish_recovery_commit(
+        root_uri,
+        sidecar,
+        RecoveryKind::RolledForward,
+        &updates,
+        &expected,
+    )
+    .await
+    .map_err(|error| stream_enrollment_effect_error(sidecar, error))?;
+    record_audit(
+        root_uri,
+        sidecar,
+        graph_commit_id,
+        RecoveryKind::RolledForward,
+        vec![TableOutcome {
+            table_key: pin.table_key.clone(),
+            from_version: pin.expected_version,
+            to_version: receipt.head.table_version,
+        }],
+    )
+    .await
+    .map_err(|error| stream_enrollment_effect_error(sidecar, error))?;
+    delete_sidecar_by_operation_id(root_uri, storage.as_ref(), &sidecar.operation_id)
+        .await
+        .map_err(|error| stream_enrollment_effect_error(sidecar, error))?;
+    Ok(true)
+}
+
+/// Once exact classification observes either enrollment effect, every failure
+/// is an unresolved durable operation. Preserve an already-typed recovery
+/// error and convert lower-level I/O, failpoint, audit, or publication errors
+/// so callers never mistake partial format state for an ordinary retry.
+fn stream_enrollment_effect_error(sidecar: &RecoverySidecar, error: OmniError) -> OmniError {
+    match error {
+        OmniError::RecoveryRequired { .. } => error,
+        other => OmniError::recovery_required(
+            sidecar.operation_id.clone(),
+            format!("stream enrollment completion failed while a durable effect may exist: {other}"),
+        ),
+    }
+}
+
+/// Writer-side entry into the same exact recovery adapter used on reopen.
+/// Callers retain exclusive stream admission and the normal write gates while
+/// this completes; exposing one implementation prevents the success path and
+/// crash path from learning different enrollment semantics.
+#[allow(dead_code)] // Reached by the intentionally dormant Phase-A orchestrator.
+pub(crate) async fn complete_stream_enrollment_sidecar_v10(
+    root_uri: &str,
+    storage: std::sync::Arc<dyn StorageAdapter>,
+    snapshot: &Snapshot,
+    sidecar: &RecoverySidecar,
+) -> Result<()> {
+    process_stream_enrollment_sidecar_v10(root_uri, &storage, snapshot, sidecar)
+        .await
+        .map(|_| ())
+}
+
+fn stream_enrollment_lifecycle(
+    sidecar: &RecoverySidecar,
+    receipt: &crate::table_store::mem_wal::MemWalEnrollmentReceipt,
+    shard_manifest: &lance_index::mem_wal::ShardManifest,
+) -> Result<super::StreamLifecycleEntry> {
+    let protocol = sidecar
+        .protocol_v10
+        .as_ref()
+        .expect("validated StreamEnrollment protocol");
+    let pin = &sidecar.tables[0];
+    let lifecycle = super::StreamLifecycleEntry {
+        identity: pin.identity,
+        diagnostic_table_key: pin.table_key.clone(),
+        lifecycle: super::StreamLifecycle::Open,
+        binding: protocol.intended_binding.clone(),
+        current_head_witness: receipt.head.clone(),
+        epoch_floor_by_shard: BTreeMap::from([(
+            protocol.enrollment_plan.shard_id.to_string(),
+            shard_manifest.writer_epoch,
+        )]),
+    };
+    lifecycle.validate()?;
+    Ok(lifecycle)
+}
+
+async fn stream_enrollment_original_visible(
+    root_uri: &str,
+    sidecar: &RecoverySidecar,
+    expected_lifecycle: &super::StreamLifecycleEntry,
+) -> Result<bool> {
+    let protocol = sidecar
+        .protocol_v10
+        .as_ref()
+        .expect("validated StreamEnrollment protocol");
+    let pin = &sidecar.tables[0];
+    let (commits, _) = ManifestCoordinator::read_graph_lineage_at(root_uri, None).await?;
+    let Some(commit) = commits
+        .iter()
+        .find(|commit| commit.graph_commit_id == protocol.lineage.graph_commit_id)
+    else {
+        return Ok(false);
+    };
+    if commit.manifest_branch.is_some()
+        || commit.parent_commit_id.as_ref() != protocol.authority.graph_head.as_ref()
+        || commit.merged_parent_commit_id.is_some()
+        || commit.actor_id != protocol.lineage.actor_id
+        || commit.created_at != protocol.lineage.created_at
+    {
+        return Err(OmniError::manifest_internal(format!(
+            "StreamEnrollment sidecar '{}' found fixed commit '{}' with mismatched lineage",
+            sidecar.operation_id, protocol.lineage.graph_commit_id
+        )));
+    }
+    let committed = ManifestCoordinator::snapshot_at(root_uri, None, commit.manifest_version).await?;
+    let entry_matches = snapshot_entry_by_identity(&committed, pin.identity).is_some_and(|entry| {
+        entry.table_key == pin.table_key
+            && entry.table_path == protocol.intended_binding.table_location
+            && entry.table_version == expected_lifecycle.current_head_witness.table_version
+            && entry.table_branch.is_none()
+    });
+    if !entry_matches
+        || committed.stream_lifecycle(pin.identity) != Some(expected_lifecycle)
+    {
+        return Err(OmniError::manifest_internal(format!(
+            "StreamEnrollment sidecar '{}' found fixed commit '{}' but its table/lifecycle outcome differs",
+            sidecar.operation_id, protocol.lineage.graph_commit_id
+        )));
+    }
+    Ok(true)
+}
+
+async fn finalize_visible_stream_enrollment(
+    root_uri: &str,
+    storage: &dyn StorageAdapter,
+    sidecar: &RecoverySidecar,
+) -> Result<bool> {
+    let protocol = sidecar
+        .protocol_v10
+        .as_ref()
+        .expect("validated StreamEnrollment protocol");
+    let pin = &sidecar.tables[0];
+    let mut audit = RecoveryAudit::open(root_uri).await?;
+    let already_recorded = audit.list().await?.iter().any(|record| {
+        record.operation_id == sidecar.operation_id
+            && record.recovery_kind == RecoveryKind::RolledForward
+    });
+    if !already_recorded {
+        crate::failpoints::maybe_fail(crate::failpoints::names::RECOVERY_RECORD_AUDIT)?;
+        audit
+            .append(RecoveryAuditRecord {
+                graph_commit_id: protocol.lineage.graph_commit_id.clone(),
+                recovery_kind: RecoveryKind::RolledForward,
+                recovery_for_actor: sidecar.actor_id.clone(),
+                operation_id: sidecar.operation_id.clone(),
+                sidecar_writer_kind: format!("{:?}", sidecar.writer_kind),
+                per_table_outcomes: vec![TableOutcome {
+                    table_key: pin.table_key.clone(),
+                    from_version: pin.expected_version,
+                    to_version: pin.post_commit_pin,
+                }],
+                created_at: crate::db::now_micros()?,
+            })
+            .await?;
+    }
+    delete_sidecar_by_operation_id(root_uri, storage, &sidecar.operation_id).await?;
+    Ok(true)
+}
+
 async fn process_sidecar(
     root_uri: &str,
     storage: &std::sync::Arc<dyn StorageAdapter>,
@@ -3603,6 +4160,39 @@ async fn process_sidecar(
     // stale-sidecar audit recovery). `false` = the sidecar was deferred
     // untouched -- callers must not treat that as a completed heal (no
     // schema reload / cache invalidation is warranted).
+    if sidecar.schema_version == STREAM_ENROLLMENT_SIDECAR_SCHEMA_VERSION {
+        // The v10 classifier deliberately carries the complete exact physical
+        // inventory and roll-forward path. Keep that large future off the
+        // stack of every ordinary v9 recovery call; without this indirection,
+        // merely adding the unreachable v10 branch made deep EnsureIndices
+        // recovery tests overflow Tokio's worker stack.
+        return Box::pin(process_stream_enrollment_sidecar_v10(
+            root_uri, storage, snapshot, sidecar,
+        ))
+        .await;
+    }
+
+    // Recovery is itself a physical writer. Valid Phase-A operation ordering
+    // prevents an ordinary sidecar from coexisting with any lifecycle authority
+    // (including SEALED) for the same identity, but corrupted/foreign state
+    // must fail before a Restore or roll-forward effect rather than relying on
+    // a later format consistency check. SchemaApply is graph-global, so any
+    // lifecycle blocks it; the other writers are fenced only on their pinned
+    // identities.
+    let stream_effect_identities = if matches!(sidecar.writer_kind, SidecarKind::SchemaApply) {
+        snapshot
+            .entries()
+            .map(|entry| entry.identity)
+            .collect::<Vec<_>>()
+    } else {
+        sidecar
+            .tables
+            .iter()
+            .map(|pin| pin.identity)
+            .collect::<Vec<_>>()
+    };
+    snapshot.ensure_stream_effects_allowed("recovery", stream_effect_identities)?;
+
     // v9 is one identity-bearing envelope shared by all active writers. Route
     // by the declared writer kind, never by whichever optional payload happens
     // to be checked first. Shape validation makes foreign/multiple payloads
@@ -3635,6 +4225,11 @@ async fn process_sidecar(
                 }
             }
             SidecarKind::Optimize => {}
+            SidecarKind::StreamEnrollment => {
+                return Err(OmniError::manifest_internal(
+                    "StreamEnrollment appeared outside its schema-v10 recovery envelope",
+                ));
+            }
         }
     } else {
         // Historical envelopes retain their original generation-specific
@@ -6096,6 +6691,7 @@ fn has_exact_protocol(sidecar: &RecoverySidecar) -> bool {
         || sidecar.protocol_v4.is_some()
         || sidecar.protocol_v7.is_some()
         || sidecar.protocol_v8.is_some()
+        || sidecar.protocol_v10.is_some()
 }
 
 fn has_fixed_rollback_identity(sidecar: &RecoverySidecar) -> bool {
@@ -6790,6 +7386,12 @@ pub(crate) async fn ensure_read_only_schema_coherent(
     }
 
     for sidecar in sidecars {
+        if matches!(sidecar.writer_kind, SidecarKind::StreamEnrollment) {
+            return Err(OmniError::recovery_required(
+                sidecar.operation_id,
+                "read-only open cannot resolve an active MemWAL enrollment intent; run a read-write open to prove no effect or roll the exact enrollment forward",
+            ));
+        }
         if !matches!(sidecar.writer_kind, SidecarKind::SchemaApply) {
             continue;
         }
@@ -8042,8 +8644,44 @@ fn new_unvalidated_sidecar(
         protocol_v4: None,
         protocol_v7: None,
         protocol_v8: None,
+        protocol_v10: None,
         ensure_indices_rollback_v6: None,
     }
+}
+
+/// Arm one exact roll-forward-only RFC-026 bounded enrollment intent.
+///
+/// The caller has already captured the exact main-branch baseline and holds
+/// exclusive stream admission plus the ordinary schema/branch/table gates.
+/// This constructor fixes the only physical successor and lifecycle binding
+/// recovery may publish; no later confirmation rewrite is needed because the
+/// N+1 transaction witness is read back from Lance's exact public state.
+#[allow(dead_code)] // Reached by the intentionally dormant Phase-A orchestrator.
+pub(crate) fn new_stream_enrollment_sidecar_v10(
+    actor_id: Option<String>,
+    table: SidecarTablePin,
+    authority: RecoveryAuthorityToken,
+    lineage: RecoveryLineageIntent,
+    baseline_head: super::CurrentHeadWitness,
+    enrollment_plan: MemWalEnrollmentPlan,
+    intended_binding: super::StreamPhysicalBinding,
+) -> Result<RecoverySidecar> {
+    let mut sidecar = new_unvalidated_sidecar(
+        STREAM_ENROLLMENT_SIDECAR_SCHEMA_VERSION,
+        SidecarKind::StreamEnrollment,
+        None,
+        actor_id,
+        vec![table],
+    );
+    sidecar.protocol_v10 = Some(RecoveryProtocolV10 {
+        authority,
+        lineage,
+        baseline_head,
+        enrollment_plan,
+        intended_binding,
+    });
+    validate_sidecar_shape("<new-stream-enrollment-sidecar-v10>", &sidecar)?;
+    Ok(sidecar)
 }
 
 /// Arm the narrow schema-v6 EnsureIndices recovery bridge. Index effects still
@@ -8156,6 +8794,7 @@ pub(crate) fn new_ensure_indices_sidecar_v9(
             effects,
             intended_delta,
         }),
+        protocol_v10: None,
         ensure_indices_rollback_v6: None,
     };
     validate_sidecar_shape("<new-ensure-indices-v9-sidecar>", &sidecar)?;
@@ -8410,6 +9049,7 @@ pub(crate) fn new_occ_sidecar_v9(
         protocol_v4: None,
         protocol_v7: None,
         protocol_v8: None,
+        protocol_v10: None,
         ensure_indices_rollback_v6: None,
     };
     validate_sidecar_shape("<new-occ-sidecar>", &sidecar)?;
@@ -8594,6 +9234,7 @@ pub(crate) fn new_schema_apply_sidecar_v9(
             intended_delta,
         }),
         protocol_v8: None,
+        protocol_v10: None,
         ensure_indices_rollback_v6: None,
     };
     validate_sidecar_shape("<new-schema-apply-v9-sidecar>", &sidecar)?;
@@ -8759,6 +9400,7 @@ pub(crate) fn new_branch_merge_sidecar_v9(
         }),
         protocol_v7: None,
         protocol_v8: None,
+        protocol_v10: None,
         ensure_indices_rollback_v6: None,
     };
     validate_sidecar_shape("<new-branch-merge-sidecar>", &sidecar)?;
@@ -9128,6 +9770,98 @@ mod tests {
         assert_eq!(parsed.actor_id, None);
         assert_eq!(parsed.tables.len(), 1);
         assert_eq!(parsed.tables[0].table_key, "node:Person");
+    }
+
+    #[tokio::test]
+    async fn ordinary_recovery_refuses_open_stream_before_physical_classification() {
+        use crate::db::manifest::{
+            CurrentHeadWitness, StreamLifecycle, StreamLifecycleEntry, StreamPhysicalBinding,
+            STREAM_CONFIG_VERSION,
+        };
+        use lance_index::mem_wal::ShardId;
+        use std::collections::BTreeMap;
+
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().to_str().unwrap();
+        let db = crate::db::Omnigraph::init(root, "node Person { name: String @key }\n")
+            .await
+            .unwrap();
+        drop(db);
+
+        let mut manifest = ManifestCoordinator::open(root).await.unwrap();
+        let entry = manifest.snapshot().entry("node:Person").unwrap().clone();
+        let plan = MemWalEnrollmentPlan::new(ShardId::new_v4(), ShardId::new_v4()).unwrap();
+        let lifecycle = StreamLifecycleEntry {
+            identity: entry.identity,
+            diagnostic_table_key: entry.table_key.clone(),
+            lifecycle: StreamLifecycle::Open,
+            binding: StreamPhysicalBinding {
+                stable_table_id: entry.identity.stable_table_id,
+                table_incarnation_id: entry.identity.table_incarnation_id,
+                table_location: entry.table_path.clone(),
+                table_branch: None,
+                enrollment_id: plan.enrollment_id.to_string(),
+                shard_ids: vec![plan.shard_id.to_string()],
+                stream_config_version: STREAM_CONFIG_VERSION,
+                stream_config_hash: plan.stream_config_hash(),
+            },
+            current_head_witness: CurrentHeadWitness {
+                branch_identifier: lance::dataset::refs::BranchIdentifier::main(),
+                table_version: entry.table_version,
+                transaction_uuid: ShardId::new_v4().to_string(),
+                manifest_e_tag: None,
+            },
+            epoch_floor_by_shard: BTreeMap::from([(plan.shard_id.to_string(), 1)]),
+        };
+        manifest
+            .commit_changes(&[ManifestChange::SetStreamLifecycle {
+                expected: None,
+                next: lifecycle,
+            }])
+            .await
+            .unwrap();
+
+        let table_path = format!(
+            "{}/{}",
+            root.trim_end_matches('/'),
+            entry.table_path.trim_start_matches('/')
+        );
+        let sidecar = new_optimize_sidecar_v9(vec![SidecarTablePin {
+            identity: entry.identity,
+            table_key: entry.table_key.clone(),
+            table_path,
+            expected_version: entry.table_version,
+            post_commit_pin: entry.table_version + 1,
+            confirmed_version: None,
+            table_branch: None,
+        }])
+        .unwrap();
+        let storage: Arc<dyn StorageAdapter> = Arc::new(ObjectStorageAdapter::local());
+        let error = process_sidecar(
+            root,
+            &storage,
+            &manifest.snapshot(),
+            &sidecar,
+            RecoveryMode::Full,
+            SchemaStateRecovery::Noop,
+        )
+        .await
+        .expect_err("recovery must not classify or restore through OPEN authority");
+        assert!(
+            matches!(
+                error,
+                OmniError::Manifest(ref manifest_error)
+                    if matches!(
+                        manifest_error.details,
+                        Some(crate::error::ManifestConflictDetails::StreamLifecycleConflict {
+                            ref lifecycle,
+                            ref operation,
+                            ..
+                        }) if lifecycle == "OPEN" && operation == "recovery"
+                    )
+            ),
+            "expected typed OPEN recovery refusal, got {error:?}",
+        );
     }
 
     #[test]

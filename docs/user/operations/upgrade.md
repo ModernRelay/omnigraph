@@ -17,9 +17,9 @@ message that **names the release line that wrote it** and the exact commands —
 so you can fetch the right old binary without guessing:
 
 ```
-__manifest is stamped at internal schema v5, but this omnigraph reads only v6.
-This graph was created by omnigraph 0.9.x. Rebuild it: with an omnigraph
-0.9.x binary run `omnigraph export <graph> > graph.jsonl`, then with this
+__manifest is stamped at internal schema v6, but this omnigraph reads only v7.
+This graph was created by omnigraph 0.10.x. Rebuild it: with an omnigraph
+0.10.x binary run `omnigraph export <graph> > graph.jsonl`, then with this
 binary run `omnigraph init --schema <schema.pg> <new-graph>` and `omnigraph load
 --mode overwrite --data graph.jsonl <new-graph>`. (Data, vectors, and blobs are
 preserved; commit history and branches are not.) See docs/user/operations/upgrade.md.
@@ -37,7 +37,8 @@ from that line (the latest is safest):
 | internal schema v3 | omnigraph 0.6.2–0.7.2 | the latest 0.7.x (e.g. 0.7.2) |
 | internal schema v4 | omnigraph 0.8.x | the latest 0.8.x (e.g. 0.8.1) |
 | internal schema v5 | omnigraph 0.9.x | the latest 0.9.x |
-| internal schema v6 | omnigraph 0.10.x | — current format; no rebuild needed |
+| internal schema v6 | omnigraph 0.10.x | the latest 0.10.x |
+| internal schema v7 | omnigraph 0.11.x | — current format; no rebuild needed |
 
 You can also check versions before you hit a refusal:
 
@@ -588,3 +589,27 @@ graph enumeration and health before reopening writes. Never swap one graph
 pointer, mix replicas on old and new cluster roots, or delete the old root. A
 rollback likewise stops the whole new fleet and switches every replica back;
 retain both roots and all repair evidence through the rollback window.
+
+## Migrating to internal schema v7
+
+Internal schema v7 preserves v5 stable identity and v6 exact-`id` key fencing,
+then activates RFC-026 Phase A's stream-format foundation: identity-keyed
+lifecycle authority, a recoverable empty main-only/unsharded Lance MemWAL
+enrollment, process-local writer exclusion, and strict partial-format refusal.
+It does **not** expose streaming ingestion. There is no `@stream`, production
+enrollment command or API, WAL row acknowledgement, fold, drain/resume, or
+fresh-read surface in this format slice.
+
+Move a v6 graph to v7 with the ordinary recipe at the top of this page: export
+with the latest 0.10.x binary, initialize a **different** root with the 0.11.x
+binary, load the export, verify the v7 stamp and logical data, and cut the whole
+fleet over together. The 0.11.x binary refuses the v6 source root, and the
+0.10.x binary refuses the new v7 root. Genuine cross-version tests pin both
+directions.
+
+V6 has no acknowledged MemWAL rows, so there is no stream backlog to drain
+before this particular rebuild. Export transfers only manifest-visible logical
+rows; it does not copy MemWAL indexes, shard manifests, lifecycle rows, recovery
+sidecars, or epochs. The new v7 root therefore starts with no physical stream
+enrollment. Keep the old root intact until row, vector, blob, policy, and
+application-integrity verification passes and the fleet cutover is complete.

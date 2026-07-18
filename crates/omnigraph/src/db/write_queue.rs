@@ -1,4 +1,4 @@
-//! Per-`(table_key, branch)` writer queues.
+//! Process-local writer queues and RFC-026 stream-admission leases.
 //!
 //! These queues are the engine's process-local, root-scoped write-serialization
 //! mechanism. The server normally holds one lockless `Arc<Omnigraph>`, but
@@ -13,6 +13,23 @@
 //! before a Lance HEAD advance or destructive recovery action. Serialization
 //! remains in-process only; cross-process writers on one graph remain
 //! one-winner-CAS at publish.
+//!
+//! RFC-026 adds a separate admission lease keyed by immutable
+//! [`TableIdentity`](crate::db::manifest::TableIdentity) plus the resolved
+//! physical Lance ref (`None` means main). Shared leases are the future
+//! final-check-through-effect window for ordinary base-table writers and
+//! MemWAL appends. Enrollment and drain take the same lease exclusively. An
+//! alias is deliberately not accepted by the key: a rename keeps contending on
+//! the same table lifetime, while drop/re-add gets a different incarnation.
+//!
+//! The admission lease is the **outermost** process-local gate. A caller that
+//! composes it with existing gates acquires admission key(s) first, then keeps
+//! the established schema -> branch -> sorted-table order. This prevents an
+//! append (which needs only a shared admission lease) from deadlocking with a
+//! drain or enrollment that also needs the existing gates. These locks are
+//! neither durable lifecycle authority nor distributed fencing. Callers must
+//! still revalidate manifest/Lance authority under the lease, and the bounded
+//! RFC-026 profile still permits only one live writer process per graph.
 //!
 //! ## Why exclusive `tokio::sync::Mutex<()>` per key
 //!
@@ -43,7 +60,12 @@
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex, OnceLock, Weak};
 
-use tokio::sync::{Mutex as AsyncMutex, OwnedMutexGuard};
+use tokio::sync::{
+    Mutex as AsyncMutex, OwnedMutexGuard, OwnedRwLockReadGuard, OwnedRwLockWriteGuard,
+    RwLock as AsyncRwLock,
+};
+
+use crate::db::manifest::TableIdentity;
 
 /// Queue key: `(table_key, branch_ref)`. `branch_ref = None` means main.
 ///
@@ -52,6 +74,30 @@ use tokio::sync::{Mutex as AsyncMutex, OwnedMutexGuard};
 /// writes to the same `table_key` on disjoint branches must NOT
 /// serialize at the queue.
 pub(crate) type TableQueueKey = (String, Option<String>);
+
+/// One process-local RFC-026 admission domain.
+///
+/// `physical_ref = None` is the base table's main ref. A named value is the
+/// already-resolved physical Lance ref, not necessarily the logical graph
+/// branch requested by a caller (a lazy graph branch may still resolve to
+/// main). `table_key` / display alias is intentionally absent.
+/// Representing a named ref here does not activate named-branch streaming;
+/// RFC-026's bounded production profile remains main-only.
+#[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub(crate) struct StreamAdmissionKey {
+    identity: TableIdentity,
+    physical_ref: Option<String>,
+}
+
+impl StreamAdmissionKey {
+    /// Bind one immutable table lifetime to its resolved physical Lance ref.
+    pub(crate) fn for_resolved_ref(identity: TableIdentity, physical_ref: Option<&str>) -> Self {
+        Self {
+            identity,
+            physical_ref: physical_ref.map(str::to_string),
+        }
+    }
+}
 
 /// Per-`(table_key, branch)` writer queue manager.
 ///
@@ -75,6 +121,13 @@ pub(crate) struct WriteQueueManager {
     /// publication; explicit authority/physical exceptions follow their own
     /// registered ordering contracts.
     branch_queues: Mutex<HashMap<Option<String>, Arc<AsyncMutex<()>>>>,
+    /// RFC-026 final-check-through-effect admission domains.
+    ///
+    /// Tokio's fair, write-preferring `RwLock` lets ordinary writers/appends
+    /// share the admitted window while enrollment/drain closes it and waits for
+    /// every admitted effect to finish. This remains an in-process guard only;
+    /// the manifest lifecycle row and Lance witness are durable authority.
+    stream_admission_leases: Mutex<HashMap<StreamAdmissionKey, Arc<AsyncRwLock<()>>>>,
 }
 
 impl WriteQueueManager {
@@ -124,15 +177,83 @@ impl WriteQueueManager {
         fresh
     }
 
+    fn stream_admission_slot(&self, key: &StreamAdmissionKey) -> Arc<AsyncRwLock<()>> {
+        let mut map = self
+            .stream_admission_leases
+            .lock()
+            .expect("stream admission lease map poisoned");
+        if let Some(existing) = map.get(key) {
+            return Arc::clone(existing);
+        }
+        let fresh = Arc::new(AsyncRwLock::new(()));
+        map.insert(key.clone(), Arc::clone(&fresh));
+        fresh
+    }
+
+    /// Acquire a shared RFC-026 admission window for one physical table ref.
+    ///
+    /// Future ordinary writers and MemWAL appends hold this from their final
+    /// durable-authority check through physical-effect/durability resolution.
+    /// Acquire this outer gate before schema, branch, or legacy table queues.
+    pub(crate) async fn acquire_stream_shared(
+        &self,
+        key: &StreamAdmissionKey,
+    ) -> OwnedRwLockReadGuard<()> {
+        self.stream_admission_slot(key).read_owned().await
+    }
+
+    /// Acquire exclusive RFC-026 admission closure for enrollment or drain.
+    ///
+    /// Acquire this outer gate before schema, branch, or legacy table queues,
+    /// then keep it through the lifecycle transition and relevant physical
+    /// effects. It does not replace durable manifest authority or a
+    /// cross-process fence.
+    pub(crate) async fn acquire_stream_exclusive(
+        &self,
+        key: &StreamAdmissionKey,
+    ) -> OwnedRwLockWriteGuard<()> {
+        self.stream_admission_slot(key).write_owned().await
+    }
+
+    /// Acquire shared admission for many physical table refs in stable order.
+    ///
+    /// Sorting and deduplication make this safe for future multi-table ordinary
+    /// writers. All admission keys are acquired before entering the existing
+    /// schema -> branch -> sorted-table hierarchy.
+    pub(crate) async fn acquire_stream_shared_many(
+        &self,
+        keys: &[StreamAdmissionKey],
+    ) -> Vec<OwnedRwLockReadGuard<()>> {
+        let sorted = sorted_unique_stream_admission_keys(keys);
+        let mut guards = Vec::with_capacity(sorted.len());
+        for key in &sorted {
+            guards.push(self.acquire_stream_shared(key).await);
+        }
+        guards
+    }
+
+    /// Acquire exclusive admission for many physical table refs in stable
+    /// order. Enrollment is initially single-table, but keeping the same
+    /// normalization rule prevents a later multi-table drain from introducing
+    /// a second lock order.
+    pub(crate) async fn acquire_stream_exclusive_many(
+        &self,
+        keys: &[StreamAdmissionKey],
+    ) -> Vec<OwnedRwLockWriteGuard<()>> {
+        let sorted = sorted_unique_stream_admission_keys(keys);
+        let mut guards = Vec::with_capacity(sorted.len());
+        for key in &sorted {
+            guards.push(self.acquire_stream_exclusive(key).await);
+        }
+        guards
+    }
+
     /// Acquire the coarse effect gate for one graph branch.
     ///
     /// RFC-022-enrolled callers MUST acquire this before any per-table queue.
     /// It is an in-process contention optimization only; publisher OCC and
     /// recovery remain the correctness authorities.
-    pub(crate) async fn acquire_branch(
-        &self,
-        branch: Option<&str>,
-    ) -> OwnedMutexGuard<()> {
+    pub(crate) async fn acquire_branch(&self, branch: Option<&str>) -> OwnedMutexGuard<()> {
         let key = branch.map(str::to_string);
         self.branch_slot(&key).lock_owned().await
     }
@@ -191,16 +312,202 @@ impl WriteQueueManager {
     }
 }
 
+fn sorted_unique_stream_admission_keys(keys: &[StreamAdmissionKey]) -> Vec<StreamAdmissionKey> {
+    let mut sorted = keys.to_vec();
+    sorted.sort();
+    sorted.dedup();
+    sorted
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::storage::write_queue_root_identity;
     use std::path::PathBuf;
     use std::time::{Duration, Instant};
+    use tokio::sync::oneshot;
     use tokio::time::timeout;
 
     fn key(table: &str, branch: Option<&str>) -> TableQueueKey {
         (table.to_string(), branch.map(str::to_string))
+    }
+
+    fn identity(stable_table_id: u64, table_incarnation_id: u64) -> TableIdentity {
+        TableIdentity::new(stable_table_id, table_incarnation_id).unwrap()
+    }
+
+    fn stream_key(
+        stable_table_id: u64,
+        table_incarnation_id: u64,
+        physical_ref: Option<&str>,
+    ) -> StreamAdmissionKey {
+        StreamAdmissionKey::for_resolved_ref(
+            identity(stable_table_id, table_incarnation_id),
+            physical_ref,
+        )
+    }
+
+    #[test]
+    fn stream_admission_keys_sort_and_dedupe_by_identity_then_physical_ref() {
+        let a_main = stream_key(1, 1, None);
+        let a_feature = stream_key(1, 1, Some("feature"));
+        let b_main = stream_key(2, 1, None);
+
+        let normalized = sorted_unique_stream_admission_keys(&[
+            b_main.clone(),
+            a_feature.clone(),
+            a_main.clone(),
+            b_main.clone(),
+            a_main.clone(),
+        ]);
+
+        assert_eq!(normalized, vec![a_main, a_feature, b_main]);
+    }
+
+    #[tokio::test]
+    async fn stream_admission_many_dedupes_for_both_lease_modes() {
+        let qm = WriteQueueManager::new();
+        let a = stream_key(1, 1, None);
+        let b = stream_key(2, 1, None);
+        let keys = [b.clone(), a.clone(), b, a];
+
+        let shared = timeout(Duration::from_secs(2), qm.acquire_stream_shared_many(&keys))
+            .await
+            .expect("shared multi-key admission must not self-deadlock");
+        assert_eq!(shared.len(), 2);
+        drop(shared);
+
+        let exclusive = timeout(
+            Duration::from_secs(2),
+            qm.acquire_stream_exclusive_many(&keys),
+        )
+        .await
+        .expect("exclusive multi-key admission must not self-deadlock");
+        assert_eq!(exclusive.len(), 2);
+    }
+
+    #[tokio::test]
+    async fn shared_stream_windows_overlap_and_exclusive_closes_admission() {
+        let qm = Arc::new(WriteQueueManager::new());
+        let key = stream_key(1, 1, None);
+
+        let first_shared = qm.acquire_stream_shared(&key).await;
+        let second_shared = timeout(Duration::from_secs(2), qm.acquire_stream_shared(&key))
+            .await
+            .expect("ordinary-write and append windows must be able to overlap");
+        drop(second_shared);
+
+        let (exclusive_started_tx, exclusive_started_rx) = oneshot::channel();
+        let (exclusive_acquired_tx, mut exclusive_acquired_rx) = oneshot::channel();
+        let (release_exclusive_tx, release_exclusive_rx) = oneshot::channel();
+        let exclusive_qm = Arc::clone(&qm);
+        let exclusive_key = key.clone();
+        let exclusive_task = tokio::spawn(async move {
+            exclusive_started_tx.send(()).unwrap();
+            let guard = exclusive_qm.acquire_stream_exclusive(&exclusive_key).await;
+            exclusive_acquired_tx.send(()).unwrap();
+            release_exclusive_rx.await.unwrap();
+            drop(guard);
+        });
+
+        exclusive_started_rx.await.unwrap();
+        assert!(
+            timeout(Duration::from_millis(50), &mut exclusive_acquired_rx)
+                .await
+                .is_err(),
+            "enrollment/drain must wait for an admitted shared effect"
+        );
+
+        drop(first_shared);
+        timeout(Duration::from_secs(2), &mut exclusive_acquired_rx)
+            .await
+            .expect("exclusive admission did not acquire after shared release")
+            .expect("exclusive admission task exited before acquisition");
+
+        let (shared_started_tx, shared_started_rx) = oneshot::channel();
+        let (shared_acquired_tx, mut shared_acquired_rx) = oneshot::channel();
+        let shared_qm = Arc::clone(&qm);
+        let shared_key = key.clone();
+        let shared_task = tokio::spawn(async move {
+            shared_started_tx.send(()).unwrap();
+            let _guard = shared_qm.acquire_stream_shared(&shared_key).await;
+            shared_acquired_tx.send(()).unwrap();
+        });
+
+        shared_started_rx.await.unwrap();
+        assert!(
+            timeout(Duration::from_millis(50), &mut shared_acquired_rx)
+                .await
+                .is_err(),
+            "an exclusive drain/enrollment must close new shared admission"
+        );
+
+        release_exclusive_tx.send(()).unwrap();
+        timeout(Duration::from_secs(2), &mut shared_acquired_rx)
+            .await
+            .expect("shared admission did not reopen after exclusive release")
+            .expect("shared admission task exited before acquisition");
+        exclusive_task.await.unwrap();
+        shared_task.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn root_shared_admission_tracks_lifetime_not_alias_and_separates_refs() {
+        let root = format!("memory://stream-admission/{}", ulid::Ulid::new());
+        let first_handle = WriteQueueManager::for_root(&root);
+        let second_handle = WriteQueueManager::for_root(&root);
+
+        // A rename is not part of the key at all: both aliases resolve to the
+        // same immutable lifetime and physical main ref.
+        let before_rename = stream_key(7, 11, None);
+        let after_rename = StreamAdmissionKey::for_resolved_ref(identity(7, 11), None);
+        assert_eq!(before_rename, after_rename);
+
+        let held = first_handle.acquire_stream_exclusive(&before_rename).await;
+        let (started_tx, started_rx) = oneshot::channel();
+        let (acquired_tx, mut acquired_rx) = oneshot::channel();
+        let renamed_handle = Arc::clone(&second_handle);
+        let renamed_key = after_rename.clone();
+        let renamed_task = tokio::spawn(async move {
+            started_tx.send(()).unwrap();
+            let _guard = renamed_handle.acquire_stream_shared(&renamed_key).await;
+            acquired_tx.send(()).unwrap();
+        });
+        started_rx.await.unwrap();
+        assert!(
+            timeout(Duration::from_millis(50), &mut acquired_rx)
+                .await
+                .is_err(),
+            "separately opened handles must share admission for a renamed lifetime"
+        );
+
+        // Drop/re-add mints a new incarnation; a different table and a named
+        // physical ref are independent domains as well.
+        let _replacement = timeout(
+            Duration::from_secs(2),
+            second_handle.acquire_stream_shared(&stream_key(7, 12, None)),
+        )
+        .await
+        .expect("drop/re-add replacement must use a distinct admission domain");
+        let _disjoint = timeout(
+            Duration::from_secs(2),
+            second_handle.acquire_stream_shared(&stream_key(8, 1, None)),
+        )
+        .await
+        .expect("disjoint table must not wait on another table's admission");
+        let _named_ref = timeout(
+            Duration::from_secs(2),
+            second_handle.acquire_stream_shared(&stream_key(7, 11, Some("feature"))),
+        )
+        .await
+        .expect("resolved named ref must not alias the physical main domain");
+
+        drop(held);
+        timeout(Duration::from_secs(2), &mut acquired_rx)
+            .await
+            .expect("renamed lifetime did not acquire after release")
+            .expect("renamed admission task exited before acquisition");
+        renamed_task.await.unwrap();
     }
 
     #[tokio::test]
