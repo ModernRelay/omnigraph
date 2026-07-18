@@ -929,14 +929,26 @@ pub const PARITY_GRAPH_ID: &str = "parity";
 ///
 /// Returns the `cluster_dir`. The caller spawns the server with `--cluster`.
 pub fn parity_configs(root: &Path, local_graph: &Path, _remote_graph: &Path) -> PathBuf {
+    parity_configs_from(root, local_graph, &fixture("test.pg"), &fixture("test.jsonl"))
+}
+
+/// `parity_configs` generalized over the schema/data pair, so parity rows
+/// can run on non-default fixtures (the blob rows). Same contract: the
+/// served graph is seeded and then byte-mirrored into `local_graph`.
+pub fn parity_configs_from(
+    root: &Path,
+    local_graph: &Path,
+    schema_path: &Path,
+    data_path: &Path,
+) -> PathBuf {
     let policy = root.join("parity.policy.yaml");
     fs::write(&policy, parity_policy_yaml()).unwrap();
 
     // Remote arm: a cluster directory the server boots from. One graph
-    // (`parity`), schema = the shared fixture, policy bound to the graph.
+    // (`parity`), schema = the given fixture, policy bound to the graph.
     let cluster_dir = root.join("parity-cluster");
     fs::create_dir_all(&cluster_dir).unwrap();
-    fs::copy(fixture("test.pg"), cluster_dir.join("parity.pg")).unwrap();
+    fs::copy(schema_path, cluster_dir.join("parity.pg")).unwrap();
     fs::copy(&policy, cluster_dir.join("parity.policy.yaml")).unwrap();
     fs::write(
         cluster_dir.join("cluster.yaml"),
@@ -982,7 +994,7 @@ policies:
         cli()
             .arg("load")
             .arg("--data")
-            .arg(fixture("test.jsonl"))
+            .arg(data_path)
             .arg("--mode")
             .arg("overwrite")
             .arg(&served_root),
