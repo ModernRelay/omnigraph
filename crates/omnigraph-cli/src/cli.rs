@@ -15,7 +15,7 @@ pub(crate) const DEFAULT_BEARER_TOKEN_ENV: &str = "OMNIGRAPH_BEARER_TOKEN";
 #[command(after_help = "\
 COMMANDS BY CAPABILITY:\n  \
 any — run against a graph, served (--server / --profile) or embedded (--store / a \
-URI): query, mutate, load, branch, blob get/stat, snapshot, export, commit, schema show/apply.\n  \
+URI): query, mutate, load, branch, snapshot, export, commit, schema show/apply.\n  \
 served — require a server: graphs.\n  \
 direct — direct storage access; reject --server (init, optimize, repair, cleanup, \
 schema plan, lint).\n  \
@@ -197,11 +197,6 @@ pub(crate) enum Command {
     Branch {
         #[command(subcommand)]
         command: BranchCommand,
-    },
-    /// Blob property operations: stream content, inspect metadata
-    Blob {
-        #[command(subcommand)]
-        command: BlobCommand,
     },
     /// Show graph snapshot
     Snapshot {
@@ -479,59 +474,6 @@ pub(crate) enum GraphsCommand {
         /// Remote server URL (e.g. `https://server.example.com`).
         #[arg(long)]
         uri: Option<String>,
-        #[arg(long)]
-        json: bool,
-    },
-}
-
-#[derive(Debug, Subcommand)]
-pub(crate) enum BlobCommand {
-    /// Stream one row's Blob property to stdout (or --out PATH)
-    Get {
-        /// Node type name
-        #[arg(value_name = "TYPE")]
-        type_name: String,
-        /// Logical row id (the @key value)
-        id: String,
-        /// Blob property name
-        prop: String,
-        /// Graph URI
-        #[arg(long)]
-        uri: Option<String>,
-        /// Branch to read from (defaults to main)
-        #[arg(long, conflicts_with = "snapshot")]
-        branch: Option<String>,
-        /// Snapshot id to read from
-        #[arg(long, conflicts_with = "branch")]
-        snapshot: Option<String>,
-        /// Write content to PATH instead of stdout
-        #[arg(long, value_name = "PATH")]
-        out: Option<PathBuf>,
-        /// First byte to read (0-based)
-        #[arg(long)]
-        offset: Option<u64>,
-        /// Number of bytes to read (from --offset, default 0)
-        #[arg(long)]
-        length: Option<u64>,
-    },
-    /// Show one blob cell's metadata (kind, size, etag, external uri)
-    Stat {
-        /// Node type name
-        #[arg(value_name = "TYPE")]
-        type_name: String,
-        /// Logical row id (the @key value)
-        id: String,
-        /// Blob property name
-        prop: String,
-        /// Graph URI
-        #[arg(long)]
-        uri: Option<String>,
-        /// Branch to read from (defaults to main)
-        #[arg(long, conflicts_with = "snapshot")]
-        branch: Option<String>,
-        /// Snapshot id to read from
-        #[arg(long, conflicts_with = "branch")]
-        snapshot: Option<String>,
         #[arg(long)]
         json: bool,
     },

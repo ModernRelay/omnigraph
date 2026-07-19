@@ -1,7 +1,8 @@
 pub(crate) mod mem_wal;
 
 use arrow_array::{
-    Array, ArrayRef, LargeBinaryArray, RecordBatch, StringArray, StructArray, UInt64Array,
+    Array, ArrayRef, LargeBinaryArray, RecordBatch, StringArray, StructArray, UInt8Array,
+    UInt32Array, UInt64Array,
 };
 use arrow_schema::SchemaRef;
 use datafusion::physical_plan::{SendableRecordBatchStream, stream::RecordBatchStreamAdapter};
@@ -19,7 +20,7 @@ use lance::dataset::{
     CommitBuilder, DeleteBuilder, InsertBuilder, MergeInsertBuilder, WhenMatched, WhenNotMatched,
     WriteMode, WriteParams,
 };
-use lance::datatypes::Schema as LanceSchema;
+use lance::datatypes::{BlobKind, Schema as LanceSchema};
 use lance::index::DatasetIndexExt;
 use lance::index::scalar::IndexDetails;
 use lance_file::version::LanceFileVersion;
@@ -829,10 +830,61 @@ impl TableStore {
     }
 
     fn blob_description_is_null(descriptions: &StructArray, row: usize) -> Result<bool> {
-        Ok(matches!(
-            crate::blob_descriptor::decode_blob_descriptor(descriptions, row)?,
-            crate::blob_descriptor::BlobDescriptor::Null
-        ))
+        if descriptions.is_null(row) {
+            return Ok(true);
+        }
+
+        let position = descriptions
+            .column_by_name("position")
+            .and_then(|col| col.as_any().downcast_ref::<UInt64Array>())
+            .ok_or_else(|| {
+                OmniError::Lance(format!(
+                    "unrecognized blob description schema {:?}: missing UInt64 position field",
+                    descriptions.fields()
+                ))
+            })?;
+        let size = descriptions
+            .column_by_name("size")
+            .and_then(|col| col.as_any().downcast_ref::<UInt64Array>())
+            .ok_or_else(|| {
+                OmniError::Lance(format!(
+                    "unrecognized blob description schema {:?}: missing UInt64 size field",
+                    descriptions.fields()
+                ))
+            })?;
+
+        let Some(kind_column) = descriptions.column_by_name("kind") else {
+            return Ok(position.is_null(row) || size.is_null(row));
+        };
+        let kind = if let Some(kind) = kind_column.as_any().downcast_ref::<UInt8Array>() {
+            if kind.is_null(row) {
+                return Ok(true);
+            }
+            kind.value(row)
+        } else if let Some(kind) = kind_column.as_any().downcast_ref::<UInt32Array>() {
+            if kind.is_null(row) {
+                return Ok(true);
+            }
+            kind.value(row) as u8
+        } else {
+            return Err(OmniError::Lance(format!(
+                "unrecognized blob description schema {:?}: kind field must be UInt8 or UInt32",
+                descriptions.fields()
+            )));
+        };
+
+        let kind = BlobKind::try_from(kind).map_err(|e| OmniError::Lance(e.to_string()))?;
+        if kind != BlobKind::Inline {
+            return Ok(false);
+        }
+        let blob_uri = descriptions
+            .column_by_name("blob_uri")
+            .and_then(|col| col.as_any().downcast_ref::<StringArray>())
+            .and_then(|arr| (!arr.is_null(row)).then(|| arr.value(row)));
+
+        Ok((position.is_null(row) || position.value(row) == 0)
+            && (size.is_null(row) || size.value(row) == 0)
+            && blob_uri.unwrap_or("").is_empty())
     }
 
     pub async fn scan_stream(
@@ -2420,7 +2472,6 @@ impl TableStore {
     /// version 1. The transaction UUID can therefore be bound to a recovery
     /// identity before that first visible effect.
     pub async fn stage_create(&self, dataset_uri: &str, batch: RecordBatch) -> Result<StagedWrite> {
-        validate_external_blob_references(&batch).await?;
         let params = WriteParams {
             mode: WriteMode::Create,
             enable_stable_row_ids: true,
@@ -2467,7 +2518,6 @@ impl TableStore {
     /// MR-793 Phase 2: introduces this for the schema_apply rewrite path.
     /// Lance API verified in `.context/mr-793-design.md` Appendix A.1.
     pub async fn stage_overwrite(&self, ds: &Dataset, batch: RecordBatch) -> Result<StagedWrite> {
-        validate_external_blob_references(&batch).await?;
         // `enable_stable_row_ids: true` is defensive — empirically Lance 6.0.1
         // preserves the source dataset's flag through `Operation::Overwrite`
         // when WriteParams omits it (pinned by
@@ -3128,35 +3178,12 @@ impl TableStore {
             .try_collect::<Vec<RecordBatch>>()
             .await
             .map_err(|e| OmniError::Lance(e.to_string()))?;
-        Ok(Self::first_row_id_in_batches(&batches))
-    }
-
-    /// Exact-`id` point-lookup sibling of `first_row_id_for_filter`, built on a
-    /// typed DataFusion predicate instead of flattening the caller's id into
-    /// SQL text — ids containing quotes need no escaping, and the exact-`id`
-    /// BTREE stays usable when reconciled.
-    pub async fn first_row_id_for_id(&self, ds: &Dataset, id: &str) -> Result<Option<u64>> {
-        use datafusion::prelude::{col, lit};
-
-        let filter = col("id").eq(lit(id.to_string()));
-        let batches = Self::scan_stream_with(ds, Some(&["id"]), None, None, true, |scanner| {
-            scanner.filter_expr(filter);
-            Ok(())
-        })
-        .await?
-        .try_collect::<Vec<RecordBatch>>()
-        .await
-        .map_err(|e| OmniError::Lance(e.to_string()))?;
-        Ok(Self::first_row_id_in_batches(&batches))
-    }
-
-    fn first_row_id_in_batches(batches: &[RecordBatch]) -> Option<u64> {
-        batches.iter().find_map(|batch| {
+        Ok(batches.iter().find_map(|batch| {
             batch
                 .column_by_name("_rowid")
                 .and_then(|col| col.as_any().downcast_ref::<UInt64Array>())
                 .and_then(|arr| (arr.len() > 0).then(|| arr.value(0)))
-        })
+        }))
     }
 
     pub async fn write_dataset(dataset_uri: &str, batch: RecordBatch) -> Result<Dataset> {
@@ -3578,105 +3605,6 @@ fn combine_committed_with_staged(ds: &Dataset, staged: &[StagedWrite]) -> Vec<Fr
         combined.extend(write.new_fragments.iter().cloned());
     }
     combined
-}
-
-/// Validate blob input columns at ingest on reference-retaining writes.
-///
-/// Two checks, both at the one moment the offending write can still be
-/// refused. First, every blob column's input must be the canonical
-/// `{data, uri}` logical struct: a create/overwrite persists the batch
-/// schema as the table's logical blob shape, and a divergent shape (Lance
-/// also accepts a 4-child logical variant and a prepared descriptor
-/// variant) knocks every later keyed write off Lance's v2 merge fast path
-/// (strict inserts lose the inserted-row key filter; upserts fall into the
-/// legacy merger, which cannot decode external-bearing blob fragments).
-/// Second, each external URI is probed once (a size call against the
-/// external store) so an unreadable reference fails the load loudly
-/// instead of deferring the failure to the first read.
-///
-/// It deliberately records NOTHING into the logical blob input; external
-/// descriptors keep Lance's `BlobRange { 0, 0 }` "size unknown" encoding,
-/// which the shared descriptor decoder already treats as unknown rather
-/// than authoritative.
-async fn validate_external_blob_references(batch: &RecordBatch) -> Result<()> {
-    let schema = batch.schema();
-    let registry = Arc::new(lance::io::ObjectStoreRegistry::default());
-    for (field, column) in schema.fields().iter().zip(batch.columns()) {
-        let lance_field = lance::datatypes::Field::try_from(field.as_ref())
-            .map_err(|error| OmniError::Lance(error.to_string()))?;
-        if !lance_field.is_blob() {
-            continue;
-        }
-        // Boundary assertion for the canonical logical blob input shape.
-        // Lance also accepts a 4-child {data, uri, position, size} logical
-        // variant and a prepared descriptor variant, but a create/overwrite
-        // persists the batch schema as the table's blob shape, and any
-        // divergence from {data, uri} knocks every later keyed write off the
-        // v2 merge fast path (see keyed_writes_survive_committed_external_
-        // blob_reference). Every engine batch builder emits the canonical
-        // shape via Lance's BlobArrayBuilder, so a non-canonical shape here
-        // is engine code regressing — fail the offending write loudly
-        // instead of poisoning the table for every later writer.
-        let canonical = matches!(
-            field.data_type(),
-            arrow_schema::DataType::Struct(children)
-                if children.len() == 2
-                    && children[0].name() == "data"
-                    && children[0].data_type() == &arrow_schema::DataType::LargeBinary
-                    && children[1].name() == "uri"
-                    && children[1].data_type() == &arrow_schema::DataType::Utf8
-        );
-        if !canonical {
-            return Err(OmniError::manifest_internal(format!(
-                "blob column '{}' input must be the canonical {{data: LargeBinary, uri: Utf8}} \
-                 struct; got {:?} — a divergent shape would persist into the table schema and \
-                 break every later keyed write",
-                field.name(),
-                field.data_type(),
-            )));
-        }
-        let Some(descriptions) = column.as_any().downcast_ref::<StructArray>() else {
-            return Err(OmniError::manifest_internal(format!(
-                "blob column '{}' input array is not a StructArray",
-                field.name(),
-            )));
-        };
-        let Some(uris) = descriptions
-            .column_by_name("uri")
-            .and_then(|array| array.as_any().downcast_ref::<StringArray>())
-        else {
-            return Err(OmniError::manifest_internal(format!(
-                "blob column '{}' input struct has no Utf8 'uri' child array",
-                field.name(),
-            )));
-        };
-        for row in 0..descriptions.len() {
-            if !descriptions.is_valid(row) || !uris.is_valid(row) || uris.value(row).is_empty() {
-                continue;
-            }
-            let uri = uris.value(row);
-            // A malformed URI is caller input, not a substrate fault: map it
-            // to the bad-request taxonomy (HTTP 400), like the unreadable
-            // case below — not OmniError::Lance (HTTP 500).
-            let (store, path) = lance::io::ObjectStore::from_uri_and_params(
-                registry.clone(),
-                uri,
-                &lance::io::ObjectStoreParams::default(),
-            )
-            .await
-            .map_err(|error| {
-                OmniError::manifest(format!(
-                    "external blob URI '{uri}' is not a valid object-store location: {error}"
-                ))
-            })?;
-            store.size(&path).await.map_err(|error| {
-                OmniError::manifest(format!(
-                    "external blob URI '{uri}' is not readable at ingest: {error}"
-                ))
-            })?;
-        }
-    }
-    Ok(())
 }
 
 /// Materialize logical external-URI blob cells before keyed merge-insert.

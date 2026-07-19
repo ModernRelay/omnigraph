@@ -1751,8 +1751,11 @@ query insert_then_update_note(
         "one insert plus one pending-row update"
     );
 
-    let bytes = read_blob_bytes(&db, "Document", "letter", "content").await;
-    assert_eq!(&bytes[..], &[4, 5, 6]);
+    let blob = db
+        .read_blob("Document", "letter", "content")
+        .await
+        .expect("inserted blob must remain readable after the update");
+    assert_eq!(&blob.read().await.unwrap()[..], &[4, 5, 6]);
 
     let qr = db
         .query(

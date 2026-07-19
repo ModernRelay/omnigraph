@@ -246,14 +246,11 @@ fn assert_current_blob_bytes(graph: &Path, expected: &[u8]) {
             .await
             .expect("open rebuilt current graph for blob read");
         let blob = db
-            .read_blob_at("main", "BinaryAsset", "blob-sentinel", "payload")
+            .read_blob("BinaryAsset", "blob-sentinel", "payload")
             .await
             .expect("open rebuilt blob");
-        let omnigraph::db::BlobContent::Streamed(reader) = blob.content else {
-            panic!("rebuilt blob must be internal, not an external reference");
-        };
         assert_eq!(
-            &reader.read_all().await.expect("read rebuilt blob")[..],
+            &blob.read().await.expect("read rebuilt blob")[..],
             expected,
             "v5 → current rebuild must preserve exact blob bytes",
         );

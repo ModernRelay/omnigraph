@@ -772,8 +772,8 @@ async fn fast_forward_merge_streams_blob_columns() {
     assert_eq!(outcome, MergeOutcome::FastForward);
 
     // The new blob row's bytes survive the streaming keyed write; the base row stays intact.
-    let readme = read_blob_bytes(&main, "Document", "readme", "content").await;
-    assert_eq!(&readme[..], b"Hello");
-    let seed = read_blob_bytes(&main, "Document", "seed", "content").await;
-    assert_eq!(&seed[..], b"Seed");
+    let readme = main.read_blob("Document", "readme", "content").await.unwrap();
+    assert_eq!(&readme.read().await.unwrap()[..], b"Hello");
+    let seed = main.read_blob("Document", "seed", "content").await.unwrap();
+    assert_eq!(&seed.read().await.unwrap()[..], b"Seed");
 }

@@ -13,5 +13,4 @@ omnigraph = { package = "omnigraph-engine", path = "../omnigraph", version = "0.
 omnigraph-compiler = { path = "../omnigraph-compiler", version = "0.8.1" }
 serde = { workspace = true }
 serde_json = { workspace = true }
-sha2 = { workspace = true }
 utoipa = { workspace = true }

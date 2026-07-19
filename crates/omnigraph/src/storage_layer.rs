@@ -528,14 +528,6 @@ pub trait TableStorage: sealed::Sealed + Send + Sync + Debug {
         filter: &str,
     ) -> Result<Option<u64>>;
 
-    /// Exact-`id` point lookup built on a typed predicate — no SQL-text
-    /// flattening of the caller's id (see `TableStore::first_row_id_for_id`).
-    async fn first_row_id_for_id(
-        &self,
-        snapshot: &SnapshotHandle,
-        id: &str,
-    ) -> Result<Option<u64>>;
-
     /// Return one exact source id already present in this manifest-pinned
     /// table image. RFC-023 uses this after an effect-free substrate conflict
     /// to distinguish a logical duplicate from unrelated physical movement.
@@ -982,14 +974,6 @@ impl TableStorage for TableStore {
         filter: &str,
     ) -> Result<Option<u64>> {
         TableStore::first_row_id_for_filter(self, snapshot.dataset(), filter).await
-    }
-
-    async fn first_row_id_for_id(
-        &self,
-        snapshot: &SnapshotHandle,
-        id: &str,
-    ) -> Result<Option<u64>> {
-        TableStore::first_row_id_for_id(self, snapshot.dataset(), id).await
     }
 
     async fn first_existing_id(

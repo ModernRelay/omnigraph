@@ -26,7 +26,7 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 use api::{
-    BlobQuery, BranchCreateOutput, BranchCreateRequest, BranchDeleteOutput, BranchListOutput, blob_etag,
+    BranchCreateOutput, BranchCreateRequest, BranchDeleteOutput, BranchListOutput,
     BranchMergeOutput, BranchMergeRequest, ChangeOutput, ChangeRequest, CommitListOutput,
     CommitListQuery, ErrorCode, ErrorOutput, ExportRequest, GraphInfo, GraphListResponse,
     HealthOutput, IngestOutput, IngestRequest, InvokeStoredQueryRequest, InvokeStoredQueryResponse,
@@ -38,11 +38,8 @@ pub use auth::{AWS_SECRET_ENV, EnvOrFileTokenSource, TokenSource, resolve_token_
 use axum::body::{Body, Bytes};
 use axum::extract::DefaultBodyLimit;
 use axum::extract::{Extension, OriginalUri, Path, Query, Request, State};
-use axum::http::header::{
-    ACCEPT_RANGES, AUTHORIZATION, CONTENT_LENGTH, CONTENT_RANGE, CONTENT_TYPE, ETAG, HeaderName,
-    HeaderValue, IF_NONE_MATCH, IF_RANGE, LOCATION, RANGE,
-};
-use axum::http::{HeaderMap, Method, StatusCode};
+use axum::http::StatusCode;
+use axum::http::header::{AUTHORIZATION, CONTENT_TYPE, HeaderName, HeaderValue};
 use axum::middleware::{self, Next};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{delete, get, post};
@@ -98,7 +95,6 @@ fn hash_bearer_token(token: &str) -> BearerTokenHash {
         #[allow(deprecated)] handlers::server_read,
         handlers::server_query,
         handlers::server_export,
-        handlers::server_blob_get,
         #[allow(deprecated)] handlers::server_change,
         handlers::server_mutate,
         handlers::server_list_queries,
@@ -1121,7 +1117,6 @@ pub fn build_app(state: AppState) -> Router {
     //      `{graph_id}` in the URI path).
     let per_graph_protected = Router::new()
         .route("/snapshot", get(server_snapshot))
-        .route("/blob", get(server_blob_get))
         .route("/export", post(server_export))
         // /read and /change are kept indefinitely for back-compat;
         // their handlers carry #[deprecated] so the OpenAPI operation is
