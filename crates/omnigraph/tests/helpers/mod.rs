@@ -16,22 +16,6 @@ use omnigraph_compiler::ir::ParamMap;
 use omnigraph_compiler::query::ast::Literal;
 use omnigraph_compiler::result::{MutationResult, QueryResult};
 
-/// Read one internal blob's full payload from `main`, panicking on an
-/// external reference — the shape most blob tests want.
-pub async fn read_blob_bytes(db: &Omnigraph, type_name: &str, id: &str, property: &str) -> Vec<u8> {
-    use omnigraph::db::BlobContent;
-    let blob = db
-        .read_blob_at("main", type_name, id, property)
-        .await
-        .unwrap();
-    match blob.content {
-        BlobContent::Streamed(reader) => reader.read_all().await.unwrap().to_vec(),
-        BlobContent::ExternalRef { uri } => {
-            panic!("expected internal blob, got external reference to {uri}")
-        }
-    }
-}
-
 pub const TEST_SCHEMA: &str = include_str!("../fixtures/test.pg");
 pub const TEST_DATA: &str = include_str!("../fixtures/test.jsonl");
 pub const TEST_QUERIES: &str = include_str!("../fixtures/test.gq");

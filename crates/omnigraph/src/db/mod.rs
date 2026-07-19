@@ -12,10 +12,9 @@ pub use manifest::{Snapshot, SnapshotScanner, SnapshotTable, SubTableEntry, SubT
 pub(crate) use omnigraph::ensure_public_branch_ref;
 pub(crate) use omnigraph::{DeferredTableFork, WriteAuthorityToken, WriteTxn};
 pub use omnigraph::{
-    BlobContent, BlobRead, BlobReader, BlobVersionTag, CleanupPolicyOptions, InitOptions,
-    MergeOutcome, Omnigraph, OpenMode, PendingIndex, RepairAction, RepairClassification,
-    RepairOptions, RepairStats, SchemaApplyOptions, SchemaApplyResult, SkipReason,
-    TableCleanupStats, TableOptimizeStats, TableRepairStats,
+    CleanupPolicyOptions, InitOptions, MergeOutcome, Omnigraph, OpenMode, PendingIndex,
+    RepairAction, RepairClassification, RepairOptions, RepairStats, SchemaApplyOptions,
+    SchemaApplyResult, SkipReason, TableCleanupStats, TableOptimizeStats, TableRepairStats,
 };
 
 use crate::error::{OmniError, Result};

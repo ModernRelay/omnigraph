@@ -25,14 +25,14 @@ use std::io::Write;
 
 use color_eyre::Result;
 use color_eyre::eyre::bail;
-use omnigraph::db::{BlobContent, Omnigraph, ReadTarget};
+use omnigraph::db::{Omnigraph, ReadTarget};
 use omnigraph_api_types::{
     BranchCreateOutput, BranchCreateRequest, BranchDeleteOutput, BranchListOutput,
     BranchMergeOutput, BranchMergeRequest, ChangeOutput, CommitListOutput, CommitOutput,
     ErrorOutput, ExportRequest, GraphListResponse, IngestOutput, IngestRequest,
     InvokeStoredQueryRequest, ReadOutput,
-    ReadRequest, SchemaApplyOutput, SchemaApplyRequest, SchemaOutput, SnapshotOutput, blob_etag,
-    commit_output, ingest_output, read_output, schema_apply_output, snapshot_payload,
+    ReadRequest, SchemaApplyOutput, SchemaApplyRequest, SchemaOutput, SnapshotOutput, commit_output,
+    ingest_output, read_output, schema_apply_output, snapshot_payload,
 };
 use omnigraph_compiler::catalog::Catalog;
 use reqwest::Method;
@@ -40,12 +40,12 @@ use serde_json::Value;
 
 use crate::cli::CliLoadMode;
 use crate::helpers::{
-    apply_bearer_token, apply_server_flag, build_http_client, build_http_client_no_redirect,
-    is_remote_uri, legacy_change_request_body, query_params_from_json,
+    apply_bearer_token, apply_server_flag, build_http_client, is_remote_uri,
+    legacy_change_request_body, query_params_from_json,
     remote_json, remote_url, resolve_cli_actor, resolve_cli_graph, resolve_remote_bearer_token,
     resolve_server_flag, select_named_query,
 };
-use crate::output::{BlobStatOutput, LoadOutput, load_output_from_result, load_output_from_tables};
+use crate::output::{LoadOutput, load_output_from_result, load_output_from_tables};
 
 pub(crate) enum GraphClient {
     /// Local engine at `uri`. Reads (`resolve()`) leave `actor` empty;
@@ -100,39 +100,6 @@ async fn require_graph_for_multi_graph_server(
         }
     }
     Ok(())
-}
-
-/// Streaming chunk size for embedded blob reads; mirrors the server route's
-/// chunking so both arms hold the same bounded memory per in-flight read.
-const BLOB_CLI_CHUNK_BYTES: u64 = 4 * 1024 * 1024;
-
-/// The one typed external-reference error BOTH blob arms return, so the
-/// remote `302` and the embedded `ExternalRef` classification are
-/// indistinguishable at the CLI surface (pinned by the parity matrix).
-fn external_blob_error(uri: &str) -> color_eyre::Report {
-    color_eyre::eyre::eyre!(
-        "blob is an external reference; the CLI does not fetch external URIs — location: {uri}"
-    )
-}
-
-/// Split a `ReadTarget` into the `/blob` query param it rides in, mirroring
-/// how `query` splits the target back into `branch`/`snapshot` body fields.
-fn blob_target_param(target: &ReadTarget) -> (&'static str, String) {
-    match target {
-        ReadTarget::Branch(branch) => ("branch", branch.clone()),
-        ReadTarget::Snapshot(snapshot) => ("snapshot", snapshot.as_str().to_string()),
-    }
-}
-
-/// The `Location` of a `302` blob answer. A redirect without a location is
-/// a server contract violation, surfaced loudly rather than fabricated.
-fn blob_redirect_location(response: &reqwest::Response) -> Result<String> {
-    response
-        .headers()
-        .get(reqwest::header::LOCATION)
-        .and_then(|value| value.to_str().ok())
-        .map(str::to_string)
-        .ok_or_else(|| color_eyre::eyre::eyre!("server returned 302 without a Location header"))
 }
 
 /// A remote graph must be addressed with `--server` (RFC-011): a positional or
@@ -842,209 +809,6 @@ impl GraphClient {
                     .await?;
                 writer.flush()?;
                 Ok(())
-            }
-        }
-    }
-
-    /// Stream one row's Blob property into `writer`, optionally bounded to
-    /// `offset`/`length`. External references are never fetched: both arms
-    /// return the same typed error carrying the stored URI (`302` remote,
-    /// descriptor classification embedded).
-    #[allow(clippy::too_many_arguments)]
-    pub(crate) async fn blob_get<W: Write>(
-        &self,
-        target: ReadTarget,
-        type_name: &str,
-        id: &str,
-        prop: &str,
-        offset: Option<u64>,
-        length: Option<u64>,
-        writer: &mut W,
-    ) -> Result<()> {
-        if length == Some(0) {
-            bail!("--length must be at least 1");
-        }
-        match self {
-            GraphClient::Remote {
-                base_url, token, ..
-            } => {
-                let (target_key, target_value) = blob_target_param(&target);
-                let url = remote_url(
-                    base_url,
-                    &["blob"],
-                    &[
-                        ("type", type_name),
-                        ("id", id),
-                        ("prop", prop),
-                        (target_key, &target_value),
-                    ],
-                )?;
-                // The blob verbs use their own no-redirect client; the shared
-                // client's default policy would follow the external 302.
-                let http = build_http_client_no_redirect()?;
-                let mut request =
-                    apply_bearer_token(http.request(Method::GET, url), token.as_deref());
-                if offset.is_some() || length.is_some() {
-                    let start = offset.unwrap_or(0);
-                    let range = match length {
-                        Some(len) => {
-                            format!("bytes={}-{}", start, start.saturating_add(len - 1))
-                        }
-                        None => format!("bytes={}-", start),
-                    };
-                    request = request.header(reqwest::header::RANGE, range);
-                }
-                let mut response = request.send().await?;
-                let status = response.status();
-                if status == reqwest::StatusCode::FOUND {
-                    return Err(external_blob_error(&blob_redirect_location(&response)?));
-                }
-                if status == reqwest::StatusCode::RANGE_NOT_SATISFIABLE {
-                    let total = response
-                        .headers()
-                        .get(reqwest::header::CONTENT_RANGE)
-                        .and_then(|value| value.to_str().ok())
-                        .and_then(|value| value.rsplit('/').next().map(str::to_string));
-                    match total {
-                        Some(total) => bail!(
-                            "blob range is not satisfiable: offset {} is outside blob size {}",
-                            offset.unwrap_or(0),
-                            total
-                        ),
-                        None => bail!("blob range is not satisfiable"),
-                    }
-                }
-                if !status.is_success() {
-                    let text = response.text().await?;
-                    if let Ok(error) = serde_json::from_str::<ErrorOutput>(&text) {
-                        bail!(error.error);
-                    }
-                    bail!("server returned {}: {}", status, text);
-                }
-                while let Some(chunk) = response.chunk().await? {
-                    writer.write_all(&chunk)?;
-                }
-                writer.flush()?;
-                Ok(())
-            }
-            GraphClient::Embedded { uri, .. } => {
-                let db = Omnigraph::open(uri).await?;
-                let blob = db.read_blob_at(target, type_name, id, prop).await?;
-                let reader = match blob.content {
-                    BlobContent::ExternalRef { uri } => {
-                        return Err(external_blob_error(&uri));
-                    }
-                    BlobContent::Streamed(reader) => reader,
-                };
-                let total = reader.size();
-                let start = offset.unwrap_or(0);
-                // A bare get of an empty blob is a valid empty read; only an
-                // explicit range can be unsatisfiable (HTTP 416 semantics).
-                if (offset.is_some() || length.is_some()) && start >= total {
-                    bail!(
-                        "blob range is not satisfiable: offset {} is outside blob size {}",
-                        start,
-                        total
-                    );
-                }
-                let end = match length {
-                    Some(len) => start.saturating_add(len).min(total),
-                    None => total,
-                };
-                let mut pos = start;
-                while pos < end {
-                    let chunk_end = (pos + BLOB_CLI_CHUNK_BYTES).min(end);
-                    writer.write_all(&reader.read_range(pos..chunk_end).await?)?;
-                    pos = chunk_end;
-                }
-                writer.flush()?;
-                Ok(())
-            }
-        }
-    }
-
-    /// One blob cell's metadata with zero payload I/O: a HEAD request on the
-    /// remote arm, a descriptor read on the embedded arm. External refs carry
-    /// only the wire-capable field subset on both arms (see `BlobStatOutput`).
-    pub(crate) async fn blob_stat(
-        &self,
-        target: ReadTarget,
-        type_name: &str,
-        id: &str,
-        prop: &str,
-    ) -> Result<BlobStatOutput> {
-        let base = || BlobStatOutput {
-            type_name: type_name.to_string(),
-            id: id.to_string(),
-            prop: prop.to_string(),
-            kind: "internal",
-            size: None,
-            etag: None,
-            uri: None,
-        };
-        match self {
-            GraphClient::Remote {
-                base_url, token, ..
-            } => {
-                let (target_key, target_value) = blob_target_param(&target);
-                let url = remote_url(
-                    base_url,
-                    &["blob"],
-                    &[
-                        ("type", type_name),
-                        ("id", id),
-                        ("prop", prop),
-                        (target_key, &target_value),
-                    ],
-                )?;
-                let http = build_http_client_no_redirect()?;
-                let response = apply_bearer_token(http.request(Method::HEAD, url), token.as_deref())
-                    .send()
-                    .await?;
-                let status = response.status();
-                if status == reqwest::StatusCode::FOUND {
-                    return Ok(BlobStatOutput {
-                        kind: "external",
-                        uri: Some(blob_redirect_location(&response)?),
-                        ..base()
-                    });
-                }
-                if !status.is_success() {
-                    // A HEAD response carries no body, so there is no
-                    // ErrorOutput to decode — the status is all we have.
-                    bail!("server returned {} for blob stat", status);
-                }
-                let size = response
-                    .headers()
-                    .get(reqwest::header::CONTENT_LENGTH)
-                    .and_then(|value| value.to_str().ok())
-                    .and_then(|value| value.parse::<u64>().ok());
-                let etag = response
-                    .headers()
-                    .get(reqwest::header::ETAG)
-                    .and_then(|value| value.to_str().ok())
-                    .map(str::to_string);
-                Ok(BlobStatOutput {
-                    size,
-                    etag,
-                    ..base()
-                })
-            }
-            GraphClient::Embedded { uri, .. } => {
-                let db = Omnigraph::open(uri).await?;
-                let blob = db.read_blob_at(target, type_name, id, prop).await?;
-                Ok(match blob.content {
-                    BlobContent::Streamed(reader) => BlobStatOutput {
-                        size: Some(reader.size()),
-                        etag: Some(blob_etag(&blob.version_tag, prop)),
-                        ..base()
-                    },
-                    BlobContent::ExternalRef { uri } => BlobStatOutput {
-                        kind: "external",
-                        uri: Some(uri),
-                        ..base()
-                    },
-                })
             }
         }
     }

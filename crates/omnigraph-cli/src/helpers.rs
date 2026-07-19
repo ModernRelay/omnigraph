@@ -404,17 +404,6 @@ pub(crate) fn build_http_client() -> Result<reqwest::Client> {
     Ok(reqwest::Client::new())
 }
 
-/// No-redirect client for the blob verbs only. `/blob` answers an external
-/// reference with `302` + `Location` that the CLI must SURFACE, never
-/// follow: reqwest's default policy follows up to 10 hops and would either
-/// fetch the external object (violating the no-follow contract) or die on a
-/// non-http `Location` (`file://`, `s3://`) with an opaque scheme error.
-pub(crate) fn build_http_client_no_redirect() -> Result<reqwest::Client> {
-    Ok(reqwest::Client::builder()
-        .redirect(reqwest::redirect::Policy::none())
-        .build()?)
-}
-
 pub(crate) fn apply_bearer_token(
     request: reqwest::RequestBuilder,
     token: Option<&str>,

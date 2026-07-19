@@ -765,41 +765,6 @@ pub(crate) fn print_snapshot_human(
     }
 }
 
-/// `blob stat` result. CLI-local (not omnigraph-api-types): there is no
-/// wire endpoint producing this shape — the remote arm translates `/blob`
-/// HEAD headers, the embedded arm reads the descriptor. External refs carry
-/// only the wire-capable subset (uri; no size/etag) so both arms emit
-/// identical output and the parity matrix stays divergence-free.
-#[derive(Debug, serde::Serialize)]
-pub(crate) struct BlobStatOutput {
-    #[serde(rename = "type")]
-    pub type_name: String,
-    pub id: String,
-    pub prop: String,
-    /// "internal" (payload served by the engine) or "external" (stored URI).
-    pub kind: &'static str,
-    pub size: Option<u64>,
-    /// Strong quoted validator, exactly as `/blob` serves it.
-    pub etag: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub uri: Option<String>,
-}
-
-pub(crate) fn print_blob_stat_human(stat: &BlobStatOutput) {
-    println!("{} {} {}", stat.type_name, stat.id, stat.prop);
-    println!("kind: {}", stat.kind);
-    match stat.size {
-        Some(size) => println!("size: {}", size),
-        None => println!("size: -"),
-    }
-    if let Some(etag) = &stat.etag {
-        println!("etag: {}", etag);
-    }
-    if let Some(uri) = &stat.uri {
-        println!("uri: {}", uri);
-    }
-}
-
 pub(crate) fn print_read_output(
     output: &ReadOutput,
     format: ReadOutputFormat,

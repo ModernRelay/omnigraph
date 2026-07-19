@@ -12,7 +12,7 @@
 use color_eyre::Result;
 use color_eyre::eyre::bail;
 
-use crate::cli::{BlobCommand, Cli, Command, QueriesCommand, SchemaCommand};
+use crate::cli::{Cli, Command, QueriesCommand, SchemaCommand};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum Plane {
@@ -106,7 +106,6 @@ pub(crate) fn command_plane(cmd: &Command) -> Plane {
         | Command::Load { .. }
         | Command::Ingest { .. }
         | Command::Branch { .. }
-        | Command::Blob { .. }
         | Command::Snapshot { .. }
         | Command::Export { .. }
         | Command::Commit { .. }
@@ -150,10 +149,6 @@ pub(crate) fn command_label(cmd: &Command) -> &'static str {
         Command::Load { .. } => "load",
         Command::Ingest { .. } => "ingest",
         Command::Branch { .. } => "branch",
-        Command::Blob { command } => match command {
-            BlobCommand::Get { .. } => "blob get",
-            BlobCommand::Stat { .. } => "blob stat",
-        },
         Command::Schema { command } => match command {
             SchemaCommand::Plan { .. } => "schema plan",
             SchemaCommand::Apply { .. } => "schema apply",
@@ -331,7 +326,6 @@ mod tests {
         // every other assertion here would still pass.
         assert_eq!(cap(&["omnigraph", "graphs", "list"]), Capability::Served);
         assert_eq!(cap(&["omnigraph", "alias", "who"]), Capability::Local);
-        assert_eq!(cap(&["omnigraph", "blob", "stat", "Doc", "id1", "content"]), Capability::Any);
         assert_eq!(cap(&["omnigraph", "optimize", "graph.omni"]), Capability::Direct);
         assert_eq!(cap(&["omnigraph", "schema", "plan", "--schema", "s.pg", "graph.omni"]), Capability::Direct);
         assert_eq!(cap(&["omnigraph", "cluster", "status", "--config", "."]), Capability::Control);

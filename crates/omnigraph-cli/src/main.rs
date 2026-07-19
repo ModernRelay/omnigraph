@@ -677,69 +677,6 @@ async fn main() -> Result<()> {
                 .export(&branch, &type_names, &table_keys, &mut stdout)
                 .await?;
         }
-        Command::Blob { command } => match command {
-            BlobCommand::Get {
-                type_name,
-                id,
-                prop,
-                uri,
-                branch,
-                snapshot,
-                out,
-                offset,
-                length,
-            } => {
-                let client = client::GraphClient::resolve(
-                    cli.server.as_deref(),
-                    cli.graph.as_deref(),
-                    uri,
-                    cli.profile.as_deref(),
-                    cli.store.as_deref(),
-                )
-                .await?;
-                let target = resolve_read_target(branch, snapshot, None)?;
-                match out {
-                    Some(path) => {
-                        let mut file = std::fs::File::create(&path)?;
-                        client
-                            .blob_get(target, &type_name, &id, &prop, offset, length, &mut file)
-                            .await?;
-                    }
-                    None => {
-                        let stdout = std::io::stdout();
-                        let mut lock = stdout.lock();
-                        client
-                            .blob_get(target, &type_name, &id, &prop, offset, length, &mut lock)
-                            .await?;
-                    }
-                }
-            }
-            BlobCommand::Stat {
-                type_name,
-                id,
-                prop,
-                uri,
-                branch,
-                snapshot,
-                json,
-            } => {
-                let client = client::GraphClient::resolve(
-                    cli.server.as_deref(),
-                    cli.graph.as_deref(),
-                    uri,
-                    cli.profile.as_deref(),
-                    cli.store.as_deref(),
-                )
-                .await?;
-                let target = resolve_read_target(branch, snapshot, None)?;
-                let stat = client.blob_stat(target, &type_name, &id, &prop).await?;
-                if json {
-                    print_json(&stat)?;
-                } else {
-                    print_blob_stat_human(&stat);
-                }
-            }
-        },
         Command::Query {
             name,
             query,

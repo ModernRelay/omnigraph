@@ -908,7 +908,11 @@ node Document {
         .await
         .unwrap();
 
-    let bytes = read_blob_bytes(&imported, "Document", "readme", "content").await;
+    let blob = imported
+        .read_blob("Document", "readme", "content")
+        .await
+        .unwrap();
+    let bytes = blob.read().await.unwrap();
     assert_eq!(&bytes[..], b"Hello");
 
     // A later import into the already-populated v6 table must retain both the
@@ -921,6 +925,9 @@ node Document {
     .await
     .unwrap();
     assert_exact_id_primary_key(&imported, "node:Document").await;
-    let later = read_blob_bytes(&imported, "Document", "later", "content").await;
-    assert_eq!(&later[..], &[0, 1, 2, 3, 255]);
+    let later = imported
+        .read_blob("Document", "later", "content")
+        .await
+        .unwrap();
+    assert_eq!(&later.read().await.unwrap()[..], &[0, 1, 2, 3, 255]);
 }
