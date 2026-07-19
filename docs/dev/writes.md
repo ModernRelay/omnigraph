@@ -635,11 +635,63 @@ marked, or authority-mismatched effect fails closed.
 B1 performs no fresh-tier reads and no generation GC. Acknowledged rows become
 query-visible only after fold. The support boundary remains main-only,
 unsharded, one resident stream worker, and one live writer process; the
-admission lease is not a distributed fence. Phase B2 must still design and
-prove authenticated contributor attribution, bounded WAL/generation
-reclamation plus a retained-storage stop, correction/disposition, same-key
-retry sequencing after `AckUnknown`, persistent
-status/quiesce/resume/abort-drain/rebuild, and every public policy/wire surface.
+admission lease is not a distributed fence.
+
+RFC-026 Phase B2-0 now specifies—but does not implement—the next contract.
+`@stream` declares eligibility but explicit, request-idempotent enrollment
+creates the stream incarnation and physical binding. A caller-stable `write_id`
+and exact predecessor then form an
+opaque compare-and-chain token; trusted contributor/digest/tagged-origin and
+same-generation chain-certificate metadata travels with the row. A
+manifest-selected graph-global token dataset is the sole post-fold per-key
+sequencing authority and publishes atomically with the base pointer under the
+shared stream-token gate/recovery envelope. Because that participant is
+graph-global, every token-moving sidecar blocks every manifest/main writer,
+including table-disjoint writers. A final-barrier late discovery releases all
+admission, graph-history, schema, branch, token, and table gates and restarts from the root
+barrier; it never recovers while retaining a leaf gate. Durable
+`OPEN -> DRAINING -> SEALED -> OPEN` state carries a monotonic lifecycle
+revision. Every external mutating management call compares that revision and
+records a bounded, complete terminal receipt; roll-forward-only resume/abort and
+bounded `REPLACE`/`WITHDRAW` correction use recovery-v12. Public activation
+also requires Lance-owned durable reclamation with whole-cut proof,
+attempt/receipt recovery, bounded history checkpointing, strong PUT/DELETE
+inventory plus multipart accounting/abort or durable accounting, a post-success
+epoch check, and a source-derived enforced
+retained-object/byte admission watermark. Patched epoch claims are
+sentinel-first and manifest-named: ordinary open/quiesce/resume/checkpoint
+claims preserve the prior replay cursor and classify its tail; only a proved
+whole-cut reclaim may advance to its new sentinel. The patch also needs a
+genesis bootstrap plus a new stock-RC.1-rejected MemWAL details kind, bounded
+ordinary-claim/reclaim receipt history, durable materialization-attempt limits,
+exact multipart accounting/abort, and reserved control headroom. A single
+bootstrap-selected reserve-first ledger serializes all shards per physical
+binding before any WAL/upload effect and reconstructs/settles from exact
+inventory; materialized bytes remain `observed` while only possible remainder
+stays reserved. Versioned/soft-delete/Object-Lock stores are refused unless all
+retained physical bytes are countable and eligible versions permanently
+deletable. Measurements validate those bounds; they do not create them. Generic
+Lance cleanup does not reclaim `_mem_wal`, and OmniGraph must never delete its
+raw paths. Internal
+schema v9/config-v3/state-v2/recovery-v12 and every public policy/wire surface
+remain inactive until their crash, storage, cross-version, authorization, and
+parity evidence passes. The physical watermark is per binding and does not
+bound base/token or shared manifest history. B2-0 therefore specifies a separate
+manifest-authoritative, graph-global `GraphHistoryBudget`. Every manifest
+publisher—stream and ordinary—takes the graph-history gate, reserves the exact
+logical publication plus a source-bounded physical-growth envelope before
+effect, and settles pending recovery charges exactly once. Initial B2 holds that
+gate continuously from final reserve/sidecar arm through physical effects,
+manifest CAS, and charge finalization, so only one expected budget revision is
+live. Dynamic per-stream
+closure reserves cannot be consumed by ordinary commits or by another stream;
+at the shared floor ordinary work returns `GraphRebuildRequired`, while the
+named stream retains correction, quiesce, and `SEALED` export/rebuild headroom.
+The universal B2 gate order is sorted relevant stream admission → graph history
+→ schema → main branch → stream token → sorted graph tables; late global
+authority discovery releases the complete suffix and restarts at the root
+barrier. A writer with no relevant stream still begins at graph history.
+Indefinite in-place maintenance remains a later accepted strand.
 
 ### Open-time recovery sweep
 

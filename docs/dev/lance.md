@@ -249,16 +249,71 @@ which caller attempt produced it. Configuration identity binds only
 correctness/topology/no-rollover fields; explicit runtime policy and injected
 Session/store capabilities remain separate. Private B1 activates graph schema
 v8 and stream-config v2 rather than adopting v7/config-v1 in place. Phase B2 is
-the later public strict activation and additionally waits for durable
-contributor attribution, bounded reclamation, strict correction, a same-key
-`AckUnknown` sequencing/idempotency contract, and persistent
-quiesce/resume/abort-drain/rebuild. B1's genuine v7↔v8 cross-version/rebuild,
+the later public strict activation. B2-0 now specifies explicit enrollment,
+durable trusted contributor attribution, compare-and-chain write/predecessor
+tokens, a manifest-selected current-token participant, bounded correction, and
+persistent revisioned quiesce/resume/abort-drain/rebuild with bounded terminal
+management receipts. B1's genuine v7↔v8
+cross-version/rebuild,
 complete 24-cell graph-level B1 suite, qualified local cost/PK-index/RSS, and
 configured RustFS cost gates now pass; the measured uncompacted-manifest term remains
 explicitly non-flat. That makes the private B1 boundary green, not public. The
 missing combined enrollment receipt and cross-process admission seal still gate
 broader topology, not B1 inside the existing single-live-writer-process
 boundary.
+
+The 2026-07-19 B2-0 reclamation audit adds a separate stock-RC.1 no-go. Generic
+`cleanup_old_versions` can reclaim ordinary dataset versions but does not walk
+or delete `_mem_wal`; the runtime guard
+`cleanup_old_versions_does_not_reclaim_mem_wal_objects` pins that ownership
+boundary. RC.1 also has no post-success epoch recheck after a WAL atomic PUT.
+`mem_wal_deleted_fence_slot_allows_stale_writer_success_on_pinned_lance`
+decodes and deletes the successor's empty epoch-2 WAL fence sentinel and proves
+the stale writer can still complete the put and receive watcher success even
+though an explicit check returns `PeerClaimedEpoch`. These guards forbid raw
+MemWAL deletion in OmniGraph; they do not implement reclamation.
+
+RFC-026 §4.5 therefore requires a Lance-owned opaque inspect/plan/execute
+primitive with exact base/shard/history and whole-cut/cursor witnesses, durable
+attempt/receipt lost-result recovery, manifest-version plus epoch advancement
+before deletion, conservative orphan/unknown classification, bounded
+shard/reclaim-history checkpointing, and the post-success writer-epoch check.
+Every patched epoch claim first persists its attempt, writes an empty successor
+sentinel, and only then CASes the manifest that names it. Ordinary open,
+quiesce, resume, and checkpoint claims preserve the prior replay cursor and
+classify its complete tail; only a proved no-data-tail whole-cut reclaim may
+advance that cursor to its new sentinel. Pending attempts block another claim.
+Exact inventory also requires strong HEAD/GET/LIST visibility after PUT/DELETE
+plus incomplete-multipart accounting/abort, or Lance-owned durable complete
+accounting. Versioned/soft-delete/Object-Lock namespaces are refused unless
+every retained version/delete marker/locked byte is counted and eligible
+versions can be permanently removed. Its bounded bootstrap/checkpoint format
+creates a genesis body and pointer before a new details type URL or system-index
+kind that stock RC.1 must reject, not an ignored protobuf field or latest-
+version hint. One bootstrap-selected reserve-first ledger serializes generation
+and control reservations per physical binding before any WAL/upload effect,
+reconstructs cold, and settles only from exact inventory; cached checks cannot
+double-reserve across shards. Lance must source and enforce the maximum
+physical-growth reservation, durable materialization-attempt limit, bounded
+claim/reclaim/checkpoint history, and emergency control headroom before
+admission; local/RustFS measurement validates those bounds but does not create
+them. OmniGraph will author that patch, open it upstream, and pin its exact
+reviewed fork commit without waiting for a release. Public B2 remains inactive
+until the positive local/RustFS crash and bound-validation matrix passes. WAL-
+prefix reclamation is limited to a quiescent whole cut because RC.1 does not
+persist a per-generation WAL range.
+
+That Lance-owned ledger bounds only one physical `_mem_wal` binding. It does not
+bound the graph's base/token datasets or shared `__manifest` history. B2-0
+therefore separately specifies a manifest-authoritative graph-global
+`GraphHistoryBudget`, checked by every manifest publisher. Each operation
+reserves the exact publication and source-bounded physical-growth envelope
+before effect, holds the global gate through effect/CAS/finalization, persists
+pending recovery charges, and settles them exactly once;
+dynamic per-stream closure reserves cannot be borrowed by ordinary work or by
+another stream. This OmniGraph authority is specified but inactive together
+with schema v9/config-v3/state-v2/recovery-v12 and requires its own bootstrap,
+crash, refusal, every-writer, and local/RustFS physical-bound evidence.
 
 The no-roll profile uses fixed portable capacities (`8,193` rows/batches and
 1-GiB byte/unflushed thresholds), not architecture-dependent `usize::MAX`
