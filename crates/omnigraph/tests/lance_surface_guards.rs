@@ -25,22 +25,23 @@
 
 use std::collections::HashMap;
 use std::fmt;
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 
-use async_trait::async_trait;
 use arrow_array::{Int32Array, RecordBatch, RecordBatchIterator, StringArray};
 use arrow_schema::{DataType, Field, Schema};
+use async_trait::async_trait;
+use futures::TryStreamExt;
 use futures::stream::BoxStream;
 use lance::Dataset;
 use lance::dataset::builder::DatasetBuilder;
 use lance::dataset::cleanup::{CleanupPolicy, cleanup_old_versions};
-use lance::dataset::mem_wal::{
-    BatchDurableWatcher, DatasetMemWalExt, InitializeMemWalBuilder, ShardManifestStore,
-    LsmScanner, ShardSnapshot, ShardWriter, ShardWriterConfig, WriteResult,
-};
 use lance::dataset::mem_wal::scanner::InMemoryMemTables;
 use lance::dataset::mem_wal::write::{BatchStore, StoredBatch};
+use lance::dataset::mem_wal::{
+    BatchDurableWatcher, DatasetMemWalExt, InitializeMemWalBuilder, LsmScanner, ShardManifestStore,
+    ShardSnapshot, ShardWriter, ShardWriterConfig, WalTailer, WriteResult,
+};
 use lance::dataset::optimize::{CompactionOptions, compact_files};
 use lance::dataset::refs::BranchIdentifier;
 use lance::dataset::transaction::{Operation, Transaction};
@@ -54,6 +55,7 @@ use lance::dataset::{
 use lance::datatypes::LANCE_UNENFORCED_PRIMARY_KEY;
 use lance::index::DatasetIndexExt;
 use lance::session::Session;
+use lance_core::error::FenceReason;
 use lance_core::{
     ROW_ADDR, ROW_CREATED_AT_VERSION, ROW_ID, ROW_LAST_UPDATED_AT_VERSION, ROW_OFFSET,
     is_system_column,
@@ -72,7 +74,8 @@ use lance_table::system_index::mem_wal::{
 use object_store::path::Path;
 use object_store::{
     CopyOptions, GetOptions, GetResult, ListResult, MultipartUpload, ObjectMeta, ObjectStore,
-    PutMultipartOptions, PutOptions, PutPayload, PutResult, Result as ObjectStoreResult,
+    ObjectStoreExt, PutMultipartOptions, PutOptions, PutPayload, PutResult,
+    Result as ObjectStoreResult,
 };
 use omnigraph_compiler::schema::parser::parse_schema;
 
@@ -287,6 +290,26 @@ fn pk_full_row(dataset: &Dataset, id: &str, value: i32) -> RecordBatch {
         ],
     )
     .unwrap()
+}
+
+/// Append one row using `fresh_pk_dataset`'s three-column PK schema. Its nullable
+/// `note` column distinguishes this from the two-column `append_guard_row`, while
+/// V2_2 and stable row IDs preserve the production-table write shape.
+async fn append_pk_guard_row(dataset: &mut Dataset, id: &str, value: i32) {
+    let batch = pk_full_row(dataset, id, value);
+    let schema = batch.schema();
+    dataset
+        .append(
+            RecordBatchIterator::new(vec![Ok(batch)], schema),
+            Some(WriteParams {
+                mode: WriteMode::Append,
+                enable_stable_row_ids: true,
+                data_storage_version: Some(LanceFileVersion::V2_2),
+                ..Default::default()
+            }),
+        )
+        .await
+        .unwrap();
 }
 
 async fn stage_pk_merge(
@@ -1281,6 +1304,205 @@ async fn mem_wal_watcher_watermark_is_not_generation_scoped_on_pinned_lance() {
     barrier.release();
     second_watcher.wait().await.unwrap();
     writer.abort().await.unwrap();
+}
+
+/// RC.1's ordinary dataset cleanup does not own `_mem_wal`.  Newer base-table
+/// versions therefore are not, by themselves, a reclamation primitive for the
+/// WAL, flushed generation, and shard-manifest state in this fixture. B2 counts
+/// the complete namespace—including separately classified orphans—toward its
+/// enforced retained-storage admission watermark and waits for a Lance-owned
+/// inspect/plan/execute API instead of routing these objects through generic
+/// version cleanup.
+#[tokio::test]
+async fn cleanup_old_versions_does_not_reclaim_mem_wal_objects() {
+    let dir = tempfile::tempdir().unwrap();
+    let uri = dir.path().join("memwal-generic-cleanup.lance");
+    let mut dataset = fresh_pk_dataset(uri.to_str().unwrap()).await;
+    dataset
+        .initialize_mem_wal()
+        .unsharded()
+        .execute()
+        .await
+        .unwrap();
+
+    let shard_id = ShardId::new_v4();
+    let writer = dataset
+        .mem_wal_writer(
+            shard_id,
+            ShardWriterConfig::new(shard_id)
+                .with_shard_spec_id(1)
+                .with_durable_write(true),
+        )
+        .await
+        .unwrap();
+    let (_, watcher) = writer
+        .put_no_wait(vec![pk_full_row(&dataset, "memwal-retained", 7)])
+        .await
+        .unwrap();
+    watcher
+        .expect("durable MemWAL writer must return a watcher")
+        .wait()
+        .await
+        .unwrap();
+    writer.force_seal_active().await.unwrap();
+    writer.wait_for_flush_drain().await.unwrap();
+    writer.abort().await.unwrap();
+
+    let object_store = dataset.object_store(None).await.unwrap();
+    let mem_wal_root = dataset.branch_location().path.join("_mem_wal");
+    // Generic cleanup owns none of this state. Compare bytes as well as paths so
+    // an unexpected rewrite fails just as loudly as object creation or deletion.
+    let inventory = || async {
+        let objects = object_store
+            .inner
+            .list(Some(&mem_wal_root))
+            .try_collect::<Vec<_>>()
+            .await
+            .unwrap();
+        let mut objects_with_bytes = Vec::with_capacity(objects.len());
+        for object in objects {
+            let bytes = object_store
+                .inner
+                .get(&object.location)
+                .await
+                .unwrap()
+                .bytes()
+                .await
+                .unwrap();
+            objects_with_bytes.push((object.location.to_string(), bytes.to_vec()));
+        }
+        let mut objects = objects_with_bytes;
+        objects.sort();
+        objects
+    };
+    let before = inventory().await;
+    assert!(
+        before.iter().any(|(path, _)| path.contains("/wal/")),
+        "fixture must contain durable WAL state"
+    );
+    assert!(
+        before.iter().any(|(path, _)| path.contains("_gen_")),
+        "fixture must contain a flushed generation"
+    );
+    assert!(
+        before.iter().any(|(path, _)| path.contains("/manifest/")),
+        "fixture must contain shard-manifest state"
+    );
+
+    append_pk_guard_row(&mut dataset, "cleanup-v3", 30).await;
+    append_pk_guard_row(&mut dataset, "cleanup-v4", 40).await;
+    let current = dataset.version().version;
+    let removed = cleanup_old_versions(
+        &dataset,
+        CleanupPolicy {
+            before_version: Some(current),
+            ..Default::default()
+        },
+    )
+    .await
+    .unwrap();
+    assert!(
+        removed.old_versions > 0,
+        "control must actually remove ordinary Lance versions"
+    );
+    assert_eq!(
+        inventory().await,
+        before,
+        "generic cleanup created, deleted, or rewrote MemWAL state; re-audit RFC-026 reclamation"
+    );
+}
+
+/// Lance's MemWAL specification warns that deleting WAL files can weaken
+/// epoch fencing.  Pinned RC.1 checks the shard epoch after a PUT collision or
+/// error, but not after a successful PUT.  If GC removes the successor's empty
+/// WAL fence sentinel, the stale predecessor can therefore recreate that slot
+/// and receive a successful durability watcher even though a fresh fence check
+/// rejects it.
+///
+/// This is deliberately a production-neutral negative guard: only the test
+/// deletes a WAL object.  When the Lance-owned post-success fence check lands,
+/// invert this assertion and make the patched failure the positive guard.
+#[tokio::test]
+async fn mem_wal_deleted_fence_slot_allows_stale_writer_success_on_pinned_lance() {
+    let dir = tempfile::tempdir().unwrap();
+    let uri = dir.path().join("memwal-deleted-fence-slot.lance");
+    let mut dataset = fresh_pk_dataset(uri.to_str().unwrap()).await;
+    dataset
+        .initialize_mem_wal()
+        .unsharded()
+        .execute()
+        .await
+        .unwrap();
+
+    let shard_id = ShardId::new_v4();
+    let config = || {
+        ShardWriterConfig::new(shard_id)
+            .with_shard_spec_id(1)
+            .with_durable_write(true)
+    };
+    let stale = dataset.mem_wal_writer(shard_id, config()).await.unwrap();
+    assert_eq!(stale.epoch(), 1);
+    let successor = dataset.mem_wal_writer(shard_id, config()).await.unwrap();
+    assert_eq!(successor.epoch(), 2);
+
+    let object_store = dataset.object_store(None).await.unwrap();
+    let wal_root = dataset
+        .branch_location()
+        .path
+        .join("_mem_wal")
+        .join(shard_id.as_hyphenated().to_string())
+        .join("wal");
+    let sentinel_objects = object_store
+        .inner
+        .list(Some(&wal_root))
+        .try_collect::<Vec<_>>()
+        .await
+        .unwrap();
+    assert_eq!(
+        sentinel_objects.len(),
+        1,
+        "epoch-2 claim must leave exactly one data-less fence sentinel"
+    );
+    let tailer = WalTailer::new(
+        object_store.clone(),
+        dataset.branch_location().path.clone(),
+        shard_id,
+    );
+    let sentinel_position = tailer.first_position().await.unwrap();
+    let sentinel = tailer
+        .read_entry(sentinel_position)
+        .await
+        .unwrap()
+        .expect("the listed successor fence sentinel must decode");
+    assert_eq!(sentinel.writer_epoch, successor.epoch());
+    assert!(
+        sentinel.batches.is_empty(),
+        "the deleted WAL object must be the successor's empty fence sentinel"
+    );
+    object_store
+        .inner
+        .delete(&sentinel_objects[0].location)
+        .await
+        .unwrap();
+
+    let (_, watcher) = stale
+        .put_no_wait(vec![pk_full_row(&dataset, "stale-after-gc", 9)])
+        .await
+        .unwrap();
+    watcher
+        .expect("durable MemWAL writer must return a watcher")
+        .wait()
+        .await
+        .expect("pinned RC.1 demonstrates the unsafe post-delete success gap");
+    let error = stale.check_fenced().await.unwrap_err();
+    assert_eq!(
+        error.fence_reason(),
+        Some(FenceReason::PeerClaimedEpoch),
+        "the stale predecessor must be rejected specifically because its peer claimed epoch 2"
+    );
+
+    stale.abort().await.unwrap();
+    successor.abort().await.unwrap();
 }
 
 // --- Guard 3: checkout_version + restore async chain -----------------------

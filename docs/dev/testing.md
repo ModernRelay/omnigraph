@@ -25,7 +25,7 @@ The engine's `tests/` is the principal coverage surface; most graph-shaped behav
 | `writes.rs` | Direct-publish writes: cancellation, RFC-022 non-strict full-attempt reprepare from fresh branch authority, strict stale-write conflicts, multi-statement atomicity, MR-794 staged-write rewire (D₂ rejection, insert+update coalesce, multi-append coalesce, partial-failure recovery, load RI/cardinality recovery); RFC-023 pins the inclusive 8,192-row keyed input ceiling, the same exact/+1 boundary on streamed mutation-update matches, no-effect state for both refusals, and oversized stored-Blob rejection before payload read. Crate-internal pending-scan cells pin inclusive/+1 32 MiB accounting plus pending-key shadow-before-charge. The lance#7444 row-id-overlap regression (`filtered_read_after_merge_update_and_delete_keeps_row_ids_consistent` — merge-load → same-key merge-load → delete → keyed point lookup, green only under the vendored lance-table patch — plus its append-only control) |
 | `src/table_store/staged_tests.rs` | Crate-internal staged primitives. RFC-023 pins one exact target preflight for general StrictInsert, durable v1 mint/commit/reopen/history persistence, exact-`id` filter emission, typed `KeyConflict`, and missing/wrong PK refusal. `all_new_upsert_certifies_insert_absence_and_persists_it_in_history` proves an all-new completed Upsert receives the optional certificate, a mixed/update Upsert does not, unrelated transaction properties survive, and UUID rebinding does not erase it. Proven-insert cells show the opaque path performs zero strict preflights; stages with `InsertBuilder` but commits the full pure-insert `Update` shape (exact parent and `id` filter, `RewriteRows`, no updates/removals, full nested schema preorder, physical rows); persists/re-admits its own output for proof composition; leaves new fragments outside old index coverage; and fails same-key races loudly in proven/proven and proven/general orders. The in-source `exec/merge.rs` certificate unit table rejects missing/unknown properties, wrong parent/filter/full-preorder/mode/offsets, rewrite/removal shapes, missing `physical_rows`, and Append. Source-interval cells pin exact selection, lazy retained-parent splitting, coalescing, and pinned Lance's approximate raw-emission boundary while every normalized/writer chunk remains hard-capped. Generic `stage_append`/`stage_merge_insert` remain primitive tests only. The file also owns index staging and `commit_staged{,_exact}` |
 | `forbidden_apis.rs` | Defense-in-depth syntax-tree/source guard over the whole engine. The primary boundary is Rust visibility: raw storage/coordinator/handle-cache modules are crate-private; public `Snapshot::open` returns `SnapshotTable`; and `SnapshotScanner` executes reads without exposing Lance's raw scanner or physical plan. The guard pins those visibility/return-type boundaries, classifies public async inherent `Omnigraph` methods plus loader conveniences, classifies every crate-visible async method on `GraphCoordinator` / `ManifestCoordinator`, and exact-counts registered method/UFCS durable-call shapes including recovery. RFC-023 rejects production graph call sites of generic `stage_append{,_stream}` and `proven_insert_capability_has_one_production_mint_site` pins `ProvenInsertChunk::from_verified_history` to the complete-history classifier in `exec/merge.rs`, preventing the no-preflight capability from becoming a reusable bypass. At the RFC-026 Phase-A checkpoint the guard registered only the exact v10 enrollment gateway and feature-gated test seam, counted its sidecar/index/shard durability primitives, and kept every row-put/ack/fold surface absent; the Phase-B1 owner below now exact-counts only the approved crate-private put/fold durable-call sites while retaining the absence of public schema, SDK, HTTP, CLI, and OpenAPI side doors. It also counts selected raw `SnapshotHandle` / Dataset shapes, rejects renamed-owner/macro/include/path-lookalike forms, skips structurally test-only code, and pins retired escape hatches absent. This is intentionally not a Rust macro-expander or general alias analysis; `// forbidden-api-allow: <reason>` exempts reviewed inline-Lance lines only |
-| `lance_surface_guards.rs` | Pins the Lance API surfaces omnigraph depends on (named runtime + compile-only guards; see [lance.md](lance.md)) — the first smoke check on any Lance version bump. `cached_and_zero_cache_sessions_share_store_registry_not_metadata_cache` proves a cached data Session and zero-cache control Session reuse one live `ObjectStoreRegistry` client while their metadata caches remain isolated. `_compile_uncommitted_full_table_vector_index_shape` pins the public `IndexMetadata` shape suitable for `Operation::CreateIndex`; `compact_files_succeeds_on_blob_columns` pins blob-v2 compaction; Guard 9 pins clone-only branch reclaim semantics. RFC-023's `unenforced_pk_filter_shape_is_route_dependent` explicitly forces v2 versus indexed routes and pins the `Some(populated)` / `Some(empty)` / `None` key-filter shapes; `unenforced_pk_conflict_matrix_is_directional` pins the directional filtered/unfiltered and filtered/Append matrix. RFC-024's compile guard pins the public `BranchIdentifier` + current table version + current `Transaction.uuid` + `ManifestLocation.e_tag` current-HEAD witness; the local/shared-`Session` guard proves unchanged-reopen stability, ordinary-commit movement, and same-version ABA, while RustFS covers object-store ABA. RFC-025 adds exact main/named-branch tag-target, sparse cleanup pin/unpin, and branch-tree-deletion guards. RFC-026 pins doc-hidden `has_successor_version`, initializer/readback/shard-writer/durability/fencing, flush/drain, replay watermark, scanner, and merged-generation shapes; runtime Gate E0 classification belongs to `memwal_enrollment_gate.rs`, while v7 Phase-A and v8 B1 publication/recovery belong to the manifest/failpoint suites. The RC.1 compiler guard pins the five surveyed public Lance virtual system-column constants to early `.pg` rejection. These guards prove substrate shapes/tokens; they do not by themselves prove heads/checkpoint activation or the v8 publisher |
+| `lance_surface_guards.rs` | Pins the Lance API surfaces omnigraph depends on (named runtime + compile-only guards; see [lance.md](lance.md)) — the first smoke check on any Lance version bump. `cached_and_zero_cache_sessions_share_store_registry_not_metadata_cache` proves a cached data Session and zero-cache control Session reuse one live `ObjectStoreRegistry` client while their metadata caches remain isolated. `_compile_uncommitted_full_table_vector_index_shape` pins the public `IndexMetadata` shape suitable for `Operation::CreateIndex`; `compact_files_succeeds_on_blob_columns` pins blob-v2 compaction; Guard 9 pins clone-only branch reclaim semantics. RFC-023's `unenforced_pk_filter_shape_is_route_dependent` explicitly forces v2 versus indexed routes and pins the `Some(populated)` / `Some(empty)` / `None` key-filter shapes; `unenforced_pk_conflict_matrix_is_directional` pins the directional filtered/unfiltered and filtered/Append matrix. RFC-024's compile guard pins the public `BranchIdentifier` + current table version + current `Transaction.uuid` + `ManifestLocation.e_tag` current-HEAD witness; the local/shared-`Session` guard proves unchanged-reopen stability, ordinary-commit movement, and same-version ABA, while RustFS covers object-store ABA. RFC-025 adds exact main/named-branch tag-target, sparse cleanup pin/unpin, and branch-tree-deletion guards. RFC-026 pins doc-hidden `has_successor_version`, initializer/readback/shard-writer/durability/fencing, flush/drain, replay watermark, scanner, and merged-generation shapes; runtime Gate E0 classification belongs to `memwal_enrollment_gate.rs`, while v7 Phase-A and v8 B1 publication/recovery belong to the manifest/failpoint suites. B2-0 adds `cleanup_old_versions_does_not_reclaim_mem_wal_objects` and `mem_wal_deleted_fence_slot_allows_stale_writer_success_on_pinned_lance`: the first proves generic cleanup leaves the present MemWAL fixture unchanged and the second proves deleting the successor's empty fence sentinel is unsafe. The pinned source audit, not those two tests alone, establishes that stock RC.1 exposes no owned MemWAL reclamation API. The RC.1 compiler guard pins the five surveyed public Lance virtual system-column constants to early `.pg` rejection. These guards prove substrate shapes/tokens and negative ownership boundaries; they do not by themselves prove heads/checkpoint activation, the v8 publisher, or a safe reclamation implementation |
 | `memwal_enrollment_gate.rs` | RFC-026's green production-neutral Gate E0 harness, isolated from the production manifest and graph writer. Fourteen substantive local cells plus one explicit unconfigured-S3 skip cover exact no-effect / `N + 1` index / pre-minted empty-shard classification, buried-effect refusal, marker survival, strict inventory/error handling, and the broad fail-closed matrix. The rejected first instrument used `checkout_latest` plus `IOTracker`, which missed local `read_dir`. The accepted exact-version classifier pins doc-hidden `has_successor_version`; its `AttemptTracker` records failed/`NotFound` attempts before forwarding and proves the identical complete six-attempt shape at baseline versions 8/80: four successful manifest HEADs, one `NotFound` manifest HEAD, one successful manifest GET, zero lists. A Unix execute-only `_versions` tripwire proves exact probing works when latest enumeration fails and an unreadable exact HEAD errors. The configured RustFS exact cell passes non-vacuously with the same zero-list shape and owns the positive lost-result/index/empty-shard/reopen sequence plus foreign shard, malformed/loose root, durable WAL, persisted cursor, and corrupt-manifest negatives. S3 ABA remains in `lance_surface_guards.rs`; CI rejects skipped E0/ABA cells. This file never mutates production manifest/schema state or deletes ambiguous artifacts; Phase A consumes its classifier through the private adapter |
 | `memwal_stream_cost.rs` | Feature-gated RFC-026 B1 decision instrument. It separately measures warm already-claimed durability acknowledgement at compacted graph-history endpoints, cold claim/reopen/replay against retained WAL depth, one selected generation's fold scan, retained already-merged shard metadata, and the shared uncompacted graph-manifest fold/publisher term. It also pins both one-batch and maximally fragmented legal-generation no-auto-roll estimates and records a paired one-batch whole-process peak-RSS delta. The exact local and configured-RustFS evidence is recorded in “RFC-026 Phase B1 coverage ownership” below; debug timings are not a product latency claim. |
 | `durable_head_lookup_cost.rs` | RFC-024 Gate A decision instrument, isolated from the production manifest schema/publisher. At fixed catalog width 10 it runs the full absent/reconciled/one-uncovered/eight-uncovered/reconciled-after-tail matrix over compacted and uncompacted histories, with cold-open and warm-repeat measurements on local FS and bucket-gated S3/RustFS. Default depths are 20/80; the ignored decision-scale cell runs 10/100/1,000. Correct exact heads, flat indexed `rows_scanned`/range work, an index-absent growing negative control, and observable bounded tails all pass; after the eight-fragment tail, `optimize_indices` returns coverage to zero uncovered and representative `rows_scanned`/range work from 27→10 / 17→10. The test deliberately pins the no-go: uncompacted RustFS cold object reads/bytes and compacted byte terms grow, while RC.1 also crosses a bounded one-operation boundary by 1,000 commits, so RFC-024 remains research-blocked. `rows_scanned` is an RC.1 debug proxy, not a universal decoded-row counter. Object-store wrapper bytes and Lance execution-summary bytes are separate fixture-owned metrics and are not additive |
@@ -60,6 +60,11 @@ The engine's `tests/` is the principal coverage surface; most graph-shaped behav
 | `failpoint_names_guard.rs` | Source-walk guard (same defense-in-depth shape as `forbidden_apis.rs`): every failpoint call site across engine + cluster (`maybe_fail`, `ScopedFailPoint::new`/`with_callback`, `Rendezvous::park_first`) must reference a compile-checked `failpoints::names` const, never a bare string literal — a typo'd literal compiles but silently never fires |
 | `recovery.rs` | Open-time recovery sweep — identity-bearing schema-v9 envelopes for Mutation/Load exact transaction identity, BranchMerge exact chains/ref-only effects + complete delta, SchemaApply exact overwrite/create ownership + schema promotion, EnsureIndices exact mixed-index transactions/authority/lineage/delta/first-touch identity, and Optimize's bounded maintenance payload, plus RFC-026's dedicated schema-v10 roll-forward-only StreamEnrollment envelope and schema-v11 StreamFold envelope binding the exact config-v2 profile, shard cut, merged generation, Lance transaction, and fixed lineage. Explicit refusal replaces alias inference for identity-less input; restartable compensation, fixed logical/rollback IDs, branch-token comparison, fresh under-gate reread/reparse, all-or-nothing roll-forward/rollback/refusal, recovery audit, and read-only guards remain pinned. RFC-023 additionally asserts that restoring a feature-branch sidecar leaves the selected feature ref with exact-`id` PK metadata |
 | `composite_flow.rs` | Compositional/narrative end-to-end stories — multi-step flows that compose mechanics covered by other test files. Catches integration regressions where individual operations all pass their unit tests but their composition breaks (sequential merges, post-merge main writes, time-travel through merge DAG, reopen consistency over multi-merge histories, post-optimize and post-cleanup strict writes). |
+
+RFC-026 reclamation qualification: the two B2-0 runtime guards do not prove
+that every possible safe RC.1 API is absent. The source audit establishes that
+surface fact; the tests prove the narrower generic-cleanup non-ownership and
+deleted-successor-sentinel fencing hazard.
 
 ## Fixtures
 
@@ -255,14 +260,89 @@ cargo test -p omnigraph-engine --features failpoints --test memwal_stream_cost
 cargo test -p omnigraph-engine --features failpoints --test failpoints stream_fold
 ```
 
-B1 does not add parser/server/CLI tests because it has no public surface. B2
+B1 does not add parser/server/CLI tests because it has no public surface. B2-0
+now specifies the missing contracts without activating them. B2 implementation
 must extend the existing compiler, server/OpenAPI, CLI parity, Cedar, shutdown,
-audit, retention/GC, and genuine rebuild suites together with persistent
-status/quiesce/resume/abort-drain, strict correction, and retained-storage-stop
-controls; those tests are a B2 gate, not incidental B1 scope. The lifecycle
+audit, retention/GC, and genuine rebuild suites together with explicit
+enrollment, persistent revisioned status/quiesce/resume/abort-drain, bounded
+terminal management receipts, strict correction, the enforced retained-storage
+admission watermark, and graph-global manifest-history admission controls;
+those tests are a B2 gate, not incidental B1 scope. The lifecycle
 matrix includes `quiesce -> create named branch -> resume`: bounded resume must
 recheck branch topology under the closed gates and remain `SEALED`, while a
 compatible main-only resume advances the epoch and opens.
+
+### RFC-026 Phase B2-0 coverage ownership (specified, inactive)
+
+B2-0 adds evidence at the boundary where the design depends on Lance, while
+leaving all production stream surfaces absent. The two checked-in RC.1 guards
+live in `lance_surface_guards.rs` because they characterize substrate behavior:
+
+- `cleanup_old_versions_does_not_reclaim_mem_wal_objects` creates ordinary
+  reclaimable table history plus a durable MemWAL entry, runs Lance's generic
+  cleanup, and proves ordinary versions are removed while every object name and
+  byte in that present `_mem_wal` fixture is unchanged. It does not contain or
+  classify an orphan fixture; and
+- `mem_wal_deleted_fence_slot_allows_stale_writer_success_on_pinned_lance`
+  decodes and deletes the successor's exact empty epoch-2 WAL fence sentinel,
+  then proves the stale writer can still report watcher success even though its
+  explicit epoch check returns typed `PeerClaimedEpoch`. This is a negative
+  regression for the required post-success epoch check, not permission for
+  OmniGraph to delete the sentinel.
+
+Run them with:
+
+```bash
+cargo test -p omnigraph-engine --test lance_surface_guards cleanup_old_versions_does_not_reclaim_mem_wal_objects -- --exact
+cargo test -p omnigraph-engine --test lance_surface_guards mem_wal_deleted_fence_slot_allows_stale_writer_success_on_pinned_lance -- --exact
+```
+
+The Lance patch must turn the second guard into a typed fence/unknown outcome
+and add local plus object-store inspect/plan/execute coverage for stale plans,
+whole-cut/cursor pruning, partial deletion, durable attempt/receipt replay,
+lost results, authoritative-checkpoint-plus-successor-chain orphan
+classification, unknown retention, strong HEAD/GET/LIST-after-PUT/DELETE and
+multipart-accounting refusal or Lance-owned complete accounting, and bounded
+history checkpointing. Cold-open/quiesce/resume/checkpoint claims also crash at
+attempt/sentinel/manifest boundaries: ordinary sentinel-first claims must
+preserve the replay cursor and classify the complete tail, while only a proved
+whole-cut reclaim may advance it to the new sentinel. Cross-version tests pin
+genesis body/pointer/details publication, a new fail-closed MemWAL details kind,
+checkpoint-epoch `ReceiptExpired`/`ClaimReceiptExpired`, and no fallback to a
+latest hint. OmniGraph's implementation then extends the existing
+`memwal_stream.rs`, recovery, failpoint, forbidden-API, cross-version,
+server/OpenAPI, CLI-parity, and Cedar owners; it does not create a parallel
+streaming test silo. Lance must expose and enforce a source-derived maximum
+physical object/byte growth reservation (or equivalent quota), bounded durable
+materialization attempts, exact multipart abort/accounting, and reserved
+control headroom before the hard admission watermark is real. The future matrix
+also pins one reserve-first ledger per physical binding across concurrent
+shards, reserve/effect/settlement/reclaim crashes, cold reconstruction, exact
+`observed + unmaterialized remainder` arithmetic, bounded terminal/control/body-
+orphan history, and emergency reclaim/quiesce/checkpoint progress at the full
+row-admission watermark. Versioned, soft-delete, and Object-Lock storage is
+refused unless every retained version/delete marker/locked byte is exactly
+accounted and eligible versions are permanently removed. A separate
+local/RustFS matrix validates that bound across schemas, fragmentation, crashes,
+and retries; measurement alone does not establish it. Until all of that is
+green, schema v9/config-v3/state-v2/recovery-v12 and every public B2 route
+remain inactive. A separate finite-lifetime matrix initializes and validates the
+manifest-authoritative graph-global `GraphHistoryBudget`, then charges every
+manifest-writer class and its pending recovery sidecars through reserve, effect,
+lost publication acknowledgement, exact settlement, and effect-free release.
+It covers source-bounded physical-growth accounting, cap-too-small/bootstrap and
+missing/mismatched-authority refusal, ordinary `GraphRebuildRequired` wire/error
+mapping, and two simultaneously blocked streams whose dynamic closure reserves
+cannot be spent by ordinary work or by each other. At the aggregate floor, each
+stream can still consume its own worst-case block/correction/abort-drain/
+requiesce path and reach `SEALED` rebuild. Lifecycle tests also pin monotonic
+revision CAS, complete terminal management-receipt replay after later movement,
+same-ID/different-digest conflict, stale-revision refusal, and receipt count/byte
+closure reserves. Concurrency coverage pins sorted relevant stream admission →
+graph history → schema → main → stream token → tables, the history gate held
+from sidecar arm through effect/CAS/finalization, a two-publisher fresh-revision
+restart, plus release-all/root-restart after late global discovery. The `_mem_wal` watermark is never
+asserted to bound whole-root history.
 
 RFC-023's Mutation/Load effect classifier is pinned here, not by ordinary unit tests:
 `rfc023_effect_free_conflict_is_typed_or_fully_reprepared` proves that a strict

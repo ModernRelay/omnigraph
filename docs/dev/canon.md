@@ -3,7 +3,7 @@
 **Audience:** maintainers, contributors, and coding agents — internal
 **Type:** narrative reference ("the book"), read top-to-bottom
 **Status:** living document
-**Surveyed:** OmniGraph 0.8.1 development (`main`), with the RFC-026 Phase A foundation and private Phase B1 core present; Lance 9.0.0-rc.1 (git rev `cec0b7df`); internal manifest schema v8
+**Surveyed:** OmniGraph 0.8.1 development (`main`), with the RFC-026 Phase A foundation and private Phase B1 core present and Phase B2-0 specified; Lance 9.0.0-rc.1 (git rev `cec0b7df`); internal manifest schema v8
 
 ---
 
@@ -513,12 +513,17 @@ witness-update adapter existed. Native branch create/delete was the narrow
 exception: it did not advance a table HEAD, so it could proceed at `SEALED`;
 it still refused `OPEN` or `DRAINING`. Schema v8 preserves those exclusions
 and adds only private B1's exact one-generation fold as a guarded HEAD/witness
-transition. RFC-026 B2 must add minimum explicit persistent
-status/quiesce/resume/abort-drain/rebuild, durable contributor attribution,
-bounded reclamation, correction, and same-key `AckUnknown` sequencing before
-any public row surface; Phase D owns future automatic operation-scoped drain
-and atomic witness advancement/rebind. Resume rechecks the bounded profile's
-no-named-branch topology; an incompatible branch operation stays `SEALED`.
+transition. RFC-026 B2-0 now specifies the next contract: compare-and-chain
+write/predecessor tokens, trusted hidden row attribution, a manifest-selected
+current-token participant, durable `OPEN -> DRAINING -> SEALED -> OPEN`,
+bounded `REPLACE`/`WITHDRAW` correction, and Lance-owned reclamation with an
+enforced storage admission watermark. None is implemented. Schema
+v9/config-v3/state-v2/recovery-v12
+and every public row surface stay inactive until their crash, storage, and
+cross-version evidence passes. Phase D owns future automatic operation-scoped
+drain and atomic witness advancement/rebind. Resume rechecks the bounded
+profile's no-named-branch topology; an incompatible branch operation stays
+`SEALED`.
 
 ---
 
@@ -730,6 +735,12 @@ Phase-A foundation and adds config-v2 private one-generation admission plus
 recovery-v11 fold. V6→v7 and v7→v8 each require export/init/load rebuilds; both
 genuine old/new-binary refusal/rebuild strands are green.
 
+B2-0 assigns the next strict strand—schema v9, stream-config v3, state protocol
+v2, and recovery-v12—but does not activate it. V9 is where trusted stream-row
+metadata and the manifest-selected current-token dataset would enter the
+format. It must refuse/rebuild against v8 in both directions; no serde default
+or in-place adoption may manufacture token or contributor evidence.
+
 ---
 
 ## The query engine
@@ -924,7 +935,9 @@ on the proposer.)
   parallel log of data. RFC-026 Phase A already consumes Lance's MemWAL
   initializer for recoverable empty enrollment; private Phase B1 now consumes
   its bounded data/ack/replay/fold path rather than building one. Public B2
-  remains inactive — **(draft RFC-026)**.
+  remains inactive. B2-0 requires the missing reclamation operation to live in
+  Lance and forbids OmniGraph from deleting raw `_mem_wal` paths — **(draft
+  RFC-026)**.
 - **Mixed constructive/destructive single mutations (D₂).** Keeps in-query
   read-your-writes unambiguous and each table at one commit per query; the
   alternative buys an in-query delete-view machine in the hot path.
@@ -989,15 +1002,48 @@ physical rows/vectors without external embedding or unspecified derivation.
 RFC-026 remains Draft: there is no production enrollment, row put/ack/fold,
 drain/resume, or fresh-read surface.
 
+**Specified, inactive contract:** RFC-026 Phase B2-0 defines explicit
+enrollment, compare-and-chain tokens, trusted visible-winner/current-withdrawal
+attribution, persistent lifecycle/correction with monotonic revisions and
+bounded terminal management receipts, and an enforced retained-storage
+admission watermark backed by Lance-owned reclamation. Two checked-in RC.1
+guards prove generic cleanup does not reclaim
+`_mem_wal` and deleting the successor's empty WAL fence sentinel can let a
+stale writer report WAL success. Those are no-go evidence, not a collector.
+The next dependency is Lance-owned durable inspect/plan/execute plus
+attempt/receipt recovery, bounded history checkpointing, an enforced physical
+growth reservation, bounded materialization attempts/control headroom, and the
+post-success epoch patch. Its claims are sentinel-first and manifest-named;
+ordinary claims preserve the replay cursor, while only proved whole-cut reclaim
+advances it. Enrollment creates the genesis bootstrap before a new MemWAL
+details kind that stock RC.1 rejects. A per-binding reserve-first ledger owns
+the physical budget; versioned/soft-delete/Object-Lock stores are refused unless
+all retained bytes are exactly accountable and eligible versions removable.
+OmniGraph will pin the patch at an exact reviewed fork commit without waiting
+for release.
+
+That ledger bounds `_mem_wal`, not base/token or shared manifest history. B2-0
+therefore specifies a separate manifest-authoritative, graph-global
+`GraphHistoryBudget`. Every manifest writer participates in its reserve-first
+publication and source-bounded physical-growth envelope; pending recovery
+charges remain durable. Initial B2 globally serializes this gate from final
+reserve/sidecar arm through physical effects, manifest CAS, and charge
+finalization. Dynamic per-stream closure reserves cannot be spent
+by ordinary work or by another stream. Reaching the shared floor returns
+`GraphRebuildRequired` before effect while correction, quiesce, and `SEALED`
+export/rebuild remain funded. This keeps B2 a finite-lifetime root profile;
+indefinite in-place maintenance remains later work.
+
 **Roadmap / research:** durable table heads /
 heads format **(RFC-024, research-blocked after Gate A rejected the first
 physical access shape)**; checkpoint-pinned retention **(RFC-025,
 research-blocked after Gate 0 rejected the current compacted registry-access
 shape)**;
 public MemWAL row admission and later lifecycle/read phases **(RFC-026, draft;
-private one-generation Phase B1 implemented; public strict Phase B2 only after
-attribution, reclamation, correction, same-key retry sequencing, and persistent
-operational escape)**;
+private one-generation Phase B1 implemented; B2-0 contracts specified; public
+strict Phase B2 only after the Lance patch plus token/attribution,
+reclamation/enforced-watermark, correction, lifecycle, cross-version, and product-parity
+evidence)**;
 lineage-based merge deltas
 **(RFC-027, research-blocked)**; background reconciler; planner
 statistics/cost model; policy pushdown; ingest-time embeddings; per-query
@@ -1015,7 +1061,7 @@ resource budgets.
 | **R4: Manifest authority access grows with commit count.** Current-state resolution folds history; a selective index does not by itself bound the complete physical read. | Medium | `optimize` compacts internal tables (keeps periodically-optimized shipped paths flat where separately cost-gated). RFC-024 Gate A rejected durable heads because representative RustFS latest-manifest reads/bytes grow despite flat exact-BTREE row/range work. RFC-025 Gate 0 independently rejected checkpoint-registry activation: at local 10→1,000 on RC.1, uncompacted reconciled work and the eight-fragment tail stay flat, but compacted list/cleanup scan bytes grow 17,012→38,000 cold and 12,336→15,064 warm; exact-show bytes and operation counts also grow. Both RFCs are research-blocked; v8 retains the journal fold and internal-table *cleanup* remains deferred behind the resurrection watermark. |
 | **R5: Schema identity corruption or alias/identity drift.** Internal schema v5 introduced stable IDs/incarnation as durable authority; v6, v7, and v8 preserve them. | Medium | Open/init validate the SchemaIR domain and exact bidirectional IR↔manifest identity/path/alias contract; every active recovery envelope carries the identity pair; zero, duplicate, missing, or mismatched identity fails closed. |
 | **R6: Merge cost at divergence** — full-width classification and history-growing manifest folds. | Medium | Coherent coordinator scans plus retained probe handles reduced the pre-slice measured depth-5/depth-80 baseline from 59/651 manifest reads to 40/410 and cap the common fast-forward route at three internal opens and three scans, but the uncompacted-history slope remains. `merge_cost.rs` keeps both facts visible; O(delta) merge is blocked on a real deletion-delta source **(RFC-027)**; fragment adoption is **(draft RFC-0001)**. |
-| **R7: No public streaming row path** — production writes are still capped by the `graph_head` CAS rate; high-frequency small writes remain wasteful outside the private evidence seam. | Medium | MemWAL is the strategic substrate. Phase A makes its opaque initializer + separate shard effect recoverable for one main-only/unsharded/single-live-writer-process empty enrollment, durably records lifecycle authority, and excludes competing local effects. Private B1 now implements and evidence-qualifies one root-scoped, no-rollover generation capped at 8,192 rows/32 MiB: it holds admission from before epoch claim, routes replay/unmerged residue fold-only through the pinned public watermark bridge, proves the drained generation independently, then seals/retires, performs a recovery-v11 strict fold, and reopens at a higher epoch. Every post-invocation ambiguity remains `AckUnknown`; exact already-normalized physical rows/vectors are folded without external embedding or unspecified derivation. The local cost matrix, configured-RustFS warm-ack cell, genuine v7↔v8 run, and 24/24 graph-level suite are green, but the RFC is still Draft and the seam is private. Public B2 additionally requires attribution, bounded reclamation/orphan cleanup, correction, same-key retry sequencing, and persistent status/quiesce/resume/abort-drain/rebuild. A public exact enrollment receipt plus reversible admission seal gates only broader overlapping-process topology. |
+| **R7: No public streaming row path** — production writes are still capped by the `graph_head` CAS rate; high-frequency small writes remain wasteful outside the private evidence seam. | Medium | MemWAL is the strategic substrate. Phase A makes its opaque initializer + separate shard effect recoverable for one main-only/unsharded/single-live-writer-process empty enrollment, durably records lifecycle authority, and excludes competing local effects. Private B1 implements and evidence-qualifies one root-scoped, no-rollover generation capped at 8,192 rows/32 MiB, watcher-only acknowledgement, conservative replay, and one recovery-v11 fold; its local/RustFS, cross-version, and 24/24 graph-level gates are green. B2-0 now specifies attribution, compare-and-chain sequencing, current-token authority, correction, persistent lifecycle, and reclamation/enforced watermark. Stock RC.1 generic cleanup and raw successor-fence-sentinel deletion are proven no-gos, so the first implementation dependency is the reviewed Lance durable inspect/plan/execute, reclaim recovery/history checkpoint, enforced growth reservation, and post-success-fence patch, pinned without waiting for release. Public B2 remains closed until that and the private v9 crash/storage/cross-version matrices pass. A public exact enrollment receipt plus reversible admission seal gates only broader overlapping-process topology. |
 | **R8: Some operations lack enforced memory/time budgets.** | Medium | Known gap, narrowed and accepted for RFC-023. Its direct-substrate instrument rejected the first whole-delta fenced adopt (~447 MB peak at 100K × 256 versus ~74 MB Append), and the first corrected production 10K series failed at 30.0× / 108,625,920 bytes overhead; both negative results remain evidence. Mutation/Load now refuses a keyed table above 8,192 rows / 32 MiB before arm, while BranchMerge uses a recovery-enrolled chain with the same per-chunk bounds and a 1,024-transaction ceiling. The inductive certificate route removes the general diff, temporary delta, target preflight, and target join without weakening that chain. Final five-pair production medians passed at 31/8 ms (3.875×) for 10K and 136/35 ms (~3.886×) for 100K; maximum signed paired RSS overheads were 24,297,472 and 32,604,160 bytes. Inclusive row/transaction ceilings, byte refusal (including materialized blobs), operation-wide validation retention, exact source/target incarnation revalidation, second-generation certificate composition, and both between-chunk recovery directions are pinned; other operations still need explicit bounds. |
 | **R9: Local-FS conditional-write emulation** (`write_text_if_match` check-then-act gap). | Low | All current callers sit behind the cluster lock protocol; S3 uses true conditional puts; close before admitting any lock-free caller. |
 | **R10: Doc/spec drift as the system grows** — this document included. | Low | Maintenance contract (same-PR doc updates, `check-agents-md.sh` link CI, "don't lie" stale markers); this canon defers to area docs by construction. |
@@ -1046,7 +1092,9 @@ Live design questions, each owned by an RFC or a known gap — not a wishlist:
 4. **Which capability owns the next rebuild boundary after v8?** RFC-028
    activated stable identity in v5; RFC-023 assigned exact-`id` fencing to v6;
    RFC-026 Phase A assigned lifecycle/enrollment authority to v7, and private
-   Phase B1 assigned the data-bearing config-v2/recovery-v11 core to v8.
+   Phase B1 assigned the data-bearing config-v2/recovery-v11 core to v8. B2-0
+   assigns token/lifecycle/correction to schema v9/config-v3/state-v2/
+   recovery-v12, but that strand is not active.
    RFC-024's heads, RFC-025's retention, and later RFC-026 phases remain
    independently reviewable. Any later format activation requires its own
    export/init/load rebuild unless capabilities deliberately co-release after
@@ -1079,7 +1127,7 @@ The plan of record is the RFC-022…028 family (all under
 | [0023 — Key-conflict fencing](../rfcs/0023-key-conflict-fencing.md) | Substrate-native keyed-write fencing via Lance's unenforced-PK filter; fleet/format activation barrier | **Implemented** (2026-07-15) |
 | [0024 — Durable table heads](../rfcs/0024-durable-table-heads.md) | Materialized head-row research; the first exact-BTREE candidate bounded scan work but failed the full latest-manifest/object-byte cost gate | **Research blocked** |
 | [0025 — Checkpoint-pinned retention](../rfcs/0025-checkpoint-retention.md) | Named checkpoints as authoritative retention roots, materialized as Lance tags; current in-manifest registry lookup rejected by Gate 0 | **Research-blocked** |
-| [0026 — MemWAL streaming ingest](../rfcs/0026-memwal-streaming-ingest.md) | Durability-first streaming writes: one-generation private watcher acknowledgement, then graph-atomic fold; public activation has separate attribution/reclamation/correction/sequencing/operator gates | **Draft; Phase A foundation and private Phase B1 core implemented/evidence-green; public B2 inactive** |
+| [0026 — MemWAL streaming ingest](../rfcs/0026-memwal-streaming-ingest.md) | Durability-first streaming writes: one-generation private watcher acknowledgement, then graph-atomic fold; B2-0 specifies compare-and-chain tokens, attribution, lifecycle/correction, and Lance-owned reclamation/enforced admission watermark | **Draft; Phase A/B1 implemented and evidence-green; B2-0 specified; public B2 inactive** |
 | [0027 — Lineage merge deltas](../rfcs/0027-lineage-merge-deltas.md) | O(delta) merge classification from row-version lineage | Research-blocked |
 
 Deliberately split, not one mega-format: identity, key fencing, head rows,
