@@ -1,7 +1,7 @@
 use super::*;
 
 use super::query::literal_to_sql;
-use crate::storage_layer::PendingScanBudget;
+use crate::storage_layer::{KEYED_WRITE_MAX_BYTES, PendingScanBudget};
 
 // ─── Mutation helpers ────────────────────────────────────────────────────────
 
@@ -813,89 +813,361 @@ impl Omnigraph {
             Err(e) => Err(e),
             Ok(total) if staging.is_empty() => Ok(total),
             Ok(total) => {
-                self.validate_staged_mutation(&staging, &txn).await?;
-                let staged = staging.stage_all(self, requested.as_deref()).await?;
-                crate::failpoints::maybe_fail(
-                    crate::failpoints::names::MUTATION_POST_STAGE_PRE_EFFECT_GATE,
-                )?;
-                let lineage_intent = self
-                    .new_lineage_intent_for_branch(requested.as_deref(), actor_id)
+                self.publish_staged_mutation(staging, &txn, requested.as_deref(), actor_id)
                     .await?;
-                // `_queue_guards` holds the root-shared schema gate, branch
-                // effect gate, and sorted table gates acquired by `commit_all`.
-                // They remain held through manifest publication, covering the
-                // complete same-process sidecar/effect lifetime. They are a
-                // local serialization aid; the exact publisher precondition and
-                // durable v3 recovery plan remain the correctness authorities.
-                let super::staging::CommittedMutation {
-                    updates,
-                    expected_versions,
-                    sidecar_handle,
-                    guards: _queue_guards,
-                } = staged
-                    .commit_all(
-                        self,
-                        requested.as_deref(),
-                        crate::db::manifest::SidecarKind::Mutation,
-                        actor_id,
-                        &txn,
-                        &lineage_intent,
-                    )
-                    .await?;
-                // Failpoint for the confirmed-effects → publisher boundary:
-                // table HEADs have advanced but graph visibility has not. The
-                // v3 sidecar already contains exact transaction identities,
-                // immutable manifest delta, and fixed lineage/rollback outcomes.
-                // Any failure from here is `RecoveryRequired`; synchronous heal
-                // or a read-write open converges the recorded outcome. See
-                // `tests/failpoints.rs::recovery_rolls_forward_after_finalize_publisher_failure`.
-                crate::failpoints::maybe_fail(
-                    crate::failpoints::names::MUTATION_POST_FINALIZE_PRE_PUBLISHER,
-                )?;
-                let publish_result = self
-                    .commit_updates_on_branch_with_expected(
-                        requested.as_deref(),
-                        &updates,
-                        &expected_versions,
-                        actor_id,
-                        &txn,
-                        lineage_intent,
-                    )
-                    .await;
-                if let Err(err) = publish_result {
-                    // A sidecar exists iff at least one table effect was
-                    // committed. Lineage-only / zero-row mutations have no
-                    // physical residual to recover, so preserve their original
-                    // publish error (notably ReadSetChanged) and let the normal
-                    // retry/409 path handle it.
-                    return match sidecar_handle.as_ref() {
-                        Some(handle) => Err(OmniError::recovery_required(
-                            handle.operation_id.clone(),
-                            err.to_string(),
-                        )),
-                        None => Err(err),
-                    };
-                }
-                if let Some(handle) = sidecar_handle {
-                    // Best-effort cleanup: the manifest publish already
-                    // succeeded, so the user's mutation is durable. A failed
-                    // delete leaves a fixed, idempotent v3 outcome for the next
-                    // synchronous heal or read-write open to audit and remove.
-                    // Failing the user here would report an error for a write
-                    // that already landed.
-                    if let Err(err) =
-                        crate::db::manifest::delete_sidecar(&handle, self.storage_adapter()).await
-                    {
-                        tracing::warn!(
-                            error = %err,
-                            operation_id = handle.operation_id.as_str(),
-                            "recovery sidecar cleanup failed; the next open's recovery sweep will resolve it"
-                        );
-                    }
-                }
                 Ok(total)
             }
         }
+    }
+
+    /// Shared Mutation-v9 publish tail: end-of-query validation, exact
+    /// per-table staging, lineage intent, recovery-armed table commits, the
+    /// single manifest publication, `RecoveryRequired` wrapping, and
+    /// best-effort sidecar cleanup. One body serves both `mutate_one_attempt`
+    /// and the blob-upload writer so the orchestration cannot drift and every
+    /// durable call keeps its single registered site in this file
+    /// (`forbidden_apis` exact-count contract).
+    async fn publish_staged_mutation(
+        &self,
+        staging: MutationStaging,
+        txn: &crate::db::WriteTxn,
+        requested: Option<&str>,
+        actor_id: Option<&str>,
+    ) -> Result<()> {
+        self.validate_staged_mutation(&staging, txn).await?;
+        let staged = staging.stage_all(self, requested).await?;
+        crate::failpoints::maybe_fail(
+            crate::failpoints::names::MUTATION_POST_STAGE_PRE_EFFECT_GATE,
+        )?;
+        let lineage_intent = self
+            .new_lineage_intent_for_branch(requested, actor_id)
+            .await?;
+        // `_queue_guards` holds the root-shared schema gate, branch
+        // effect gate, and sorted table gates acquired by `commit_all`.
+        // They remain held through manifest publication, covering the
+        // complete same-process sidecar/effect lifetime. They are a
+        // local serialization aid; the exact publisher precondition and
+        // durable v3 recovery plan remain the correctness authorities.
+        let super::staging::CommittedMutation {
+            updates,
+            expected_versions,
+            sidecar_handle,
+            guards: _queue_guards,
+        } = staged
+            .commit_all(
+                self,
+                requested,
+                crate::db::manifest::SidecarKind::Mutation,
+                actor_id,
+                txn,
+                &lineage_intent,
+            )
+            .await?;
+        // Failpoint for the confirmed-effects → publisher boundary:
+        // table HEADs have advanced but graph visibility has not. The
+        // v3 sidecar already contains exact transaction identities,
+        // immutable manifest delta, and fixed lineage/rollback outcomes.
+        // Any failure from here is `RecoveryRequired`; synchronous heal
+        // or a read-write open converges the recorded outcome. See
+        // `tests/failpoints.rs::recovery_rolls_forward_after_finalize_publisher_failure`.
+        crate::failpoints::maybe_fail(
+            crate::failpoints::names::MUTATION_POST_FINALIZE_PRE_PUBLISHER,
+        )?;
+        let publish_result = self
+            .commit_updates_on_branch_with_expected(
+                requested,
+                &updates,
+                &expected_versions,
+                actor_id,
+                txn,
+                lineage_intent,
+            )
+            .await;
+        if let Err(err) = publish_result {
+            // A sidecar exists iff at least one table effect was
+            // committed. Lineage-only / zero-row mutations have no
+            // physical residual to recover, so preserve their original
+            // publish error (notably ReadSetChanged) and let the normal
+            // retry/409 path handle it.
+            return match sidecar_handle.as_ref() {
+                Some(handle) => Err(OmniError::recovery_required(
+                    handle.operation_id.clone(),
+                    err.to_string(),
+                )),
+                None => Err(err),
+            };
+        }
+        if let Some(handle) = sidecar_handle {
+            // Best-effort cleanup: the manifest publish already
+            // succeeded, so the user's mutation is durable. A failed
+            // delete leaves a fixed, idempotent v3 outcome for the next
+            // synchronous heal or read-write open to audit and remove.
+            // Failing the user here would report an error for a write
+            // that already landed.
+            if let Err(err) =
+                crate::db::manifest::delete_sidecar(&handle, self.storage_adapter()).await
+            {
+                tracing::warn!(
+                    error = %err,
+                    operation_id = handle.operation_id.as_str(),
+                    "recovery sidecar cleanup failed; the next open's recovery sweep will resolve it"
+                );
+            }
+        }
+        Ok(())
+    }
+
+    /// Replace one existing node row's Blob cell with raw bytes.
+    ///
+    /// Update-only: a missing row is a typed not-found, never an implicit
+    /// insert. See [`Self::write_blob_at_as`] for the actor-carrying variant
+    /// and the full contract.
+    pub async fn write_blob_at(
+        &self,
+        branch: &str,
+        type_name: &str,
+        id: &str,
+        property: &str,
+        bytes: Vec<u8>,
+        precondition: Option<crate::db::BlobPrecondition>,
+    ) -> Result<crate::db::BlobWriteOutcome> {
+        self.write_blob_at_as(branch, type_name, id, property, bytes, precondition, None)
+            .await
+    }
+
+    /// [`Self::write_blob_at`] with an explicit actor for policy enforcement
+    /// and lineage attribution.
+    ///
+    /// The write composes the Mutation-v9 protocol exactly — one pinned
+    /// write authority, one staged keyed upsert of the full row, one
+    /// recovery-armed commit, one manifest publication — so it is
+    /// indistinguishable from a one-row mutation to recovery and to the
+    /// commit graph. The payload replaces only `property`; every other cell
+    /// of the row is carried through by the same committed-cell
+    /// materialization an update uses (an external reference on ANOTHER blob
+    /// column is inlined, the documented update behavior, and charged
+    /// against the 32 MiB batch budget — the effective max payload is
+    /// therefore 32 MiB minus the row's other materialized content).
+    ///
+    /// `precondition` compares opaque strong validator tokens against the
+    /// cell's current state under the SAME pinned base the write prepares
+    /// from; a reprepare re-derives it, so the check is atomic by
+    /// construction. A mismatch returns
+    /// [`crate::db::BlobWriteOutcome::PreconditionFailed`] with nothing
+    /// staged. [`crate::db::BlobPrecondition::AnyExisting`] requires the
+    /// target ROW to exist (a null cell still accepts — attaching first
+    /// content to an existing row is the primary use).
+    ///
+    /// Node types only, mirroring `read_blob_at` (edge blob cells are an
+    /// explicit known gap on both surfaces).
+    #[allow(clippy::too_many_arguments)]
+    pub async fn write_blob_at_as(
+        &self,
+        branch: &str,
+        type_name: &str,
+        id: &str,
+        property: &str,
+        bytes: Vec<u8>,
+        precondition: Option<crate::db::BlobPrecondition>,
+        actor_id: Option<&str>,
+    ) -> Result<crate::db::BlobWriteOutcome> {
+        self.enforce(
+            omnigraph_policy::PolicyAction::Change,
+            &omnigraph_policy::ResourceScope::Branch(branch.to_string()),
+            actor_id,
+        )?;
+        const MAX_PRE_EFFECT_REPREPARES: usize = 32;
+        for attempt in 0..=MAX_PRE_EFFECT_REPREPARES {
+            match self
+                .write_blob_one_attempt(branch, type_name, id, property, &bytes, &precondition, actor_id)
+                .await
+            {
+                // Unlike a .gq update (whose replay would be a semantic
+                // rebase of a stale read-modify-write plan), a blob PUT is a
+                // declarative full-cell replacement: its entire read set —
+                // the row scan and the precondition evaluation — is
+                // re-derived per attempt, so replay after a pre-effect
+                // authority change is a fresh execution. This is what makes
+                // last-writer-wins absorb unrelated-write conflicts AND
+                // keeps a supplied precondition evaluated against the fresh
+                // base on every attempt.
+                Err(err)
+                    if err.is_read_set_changed() && attempt < MAX_PRE_EFFECT_REPREPARES =>
+                {
+                    tracing::debug!(
+                        attempt = attempt + 1,
+                        branch,
+                        "prepared blob write authority changed before effects; repreparing"
+                    );
+                    self.refresh().await?;
+                }
+                result => return result,
+            }
+        }
+        unreachable!("bounded blob write retry loop always returns")
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    async fn write_blob_one_attempt(
+        &self,
+        branch: &str,
+        type_name: &str,
+        id: &str,
+        property: &str,
+        bytes: &[u8],
+        precondition: &Option<crate::db::BlobPrecondition>,
+        actor_id: Option<&str>,
+    ) -> Result<crate::db::BlobWriteOutcome> {
+        let requested = Self::normalize_branch_name(branch)?;
+        if let Some(name) = requested.as_deref() {
+            crate::db::ensure_public_branch_ref(name, "write_blob")?;
+        }
+        if bytes.len() as u64 > KEYED_WRITE_MAX_BYTES {
+            return Err(OmniError::resource_limit(
+                format!("blob payload bytes for {type_name}.{property}"),
+                KEYED_WRITE_MAX_BYTES,
+                bytes.len() as u64,
+            ));
+        }
+        self.heal_pending_recovery_sidecars_for_write(&[requested.as_deref()])
+            .await?;
+        let txn = self.open_write_txn(requested.as_deref()).await?;
+        let node_type = txn.catalog.node_types.get(type_name).ok_or_else(|| {
+            OmniError::manifest_not_found(format!("unknown node type '{}'", type_name))
+        })?;
+        if !node_type.blob_properties.contains(property) {
+            return Err(OmniError::manifest(format!(
+                "property '{}' on type '{}' is not a Blob",
+                property, type_name
+            )));
+        }
+        let schema = node_type.arrow_schema.clone();
+        let table_key = format!("node:{}", type_name);
+
+        // Evaluate a supplied precondition against the SAME pinned base this
+        // attempt prepares from (txn.base), so a reprepare re-evaluates it.
+        if let Some(precondition) = precondition {
+            let entry = txn.base.entry(&table_key).ok_or_else(|| {
+                OmniError::manifest_not_found(format!(
+                    "no table for type '{}' in this snapshot",
+                    type_name
+                ))
+            })?;
+            let handle = self
+                .storage()
+                .open_snapshot_at_table(&txn.base, &table_key)
+                .await?;
+            let row_id = self
+                .storage()
+                .first_row_id_for_id(&handle, id)
+                .await?
+                .ok_or_else(|| {
+                    OmniError::manifest_not_found(format!(
+                        "no {} with id '{}' found",
+                        type_name, id
+                    ))
+                })?;
+            let current_tag = crate::db::BlobVersionTag {
+                stable_table_id: entry.identity.stable_table_id,
+                table_incarnation_id: entry.identity.table_incarnation_id,
+                table_version: entry.table_version,
+                row_id,
+            };
+            let current_etag = crate::db::blob_etag(&current_tag, property);
+            let matches = match precondition {
+                crate::db::BlobPrecondition::AnyExisting => true,
+                crate::db::BlobPrecondition::Tags(tags) => {
+                    tags.iter().any(|tag| tag == &current_etag)
+                }
+            };
+            if !matches {
+                return Ok(crate::db::BlobWriteOutcome::PreconditionFailed { current_etag });
+            }
+        }
+
+        let mut staging = MutationStaging::default();
+        let (handle, _full_path, _table_branch) = open_table_for_mutation(
+            self,
+            &mut staging,
+            requested.as_deref(),
+            &table_key,
+            crate::db::MutationOpKind::Update,
+            Some(&txn),
+        )
+        .await?;
+        let ds = handle.expect("strict Update op always opens its dataset");
+
+        // Single-row committed scan with every OTHER blob column
+        // materialized to the logical schema; the target cell is null-filled
+        // (its old payload would only be discarded) and swapped below.
+        let pred_sql = format!("id = '{}'", id.replace('\'', "''"));
+        let (pending_rows, pending_bytes) = staging.pending_resource_usage(&table_key)?;
+        let scan_budget = PendingScanBudget::new(&table_key, pending_rows, pending_bytes);
+        let batches = self
+            .storage()
+            .scan_with_pending_materialized_blobs_skipping(
+                &ds,
+                &[],
+                None,
+                Some(&pred_sql),
+                Some("id"),
+                scan_budget,
+                Some(property),
+            )
+            .await?;
+        if batches.is_empty() || batches.iter().all(|b| b.num_rows() == 0) {
+            return Err(OmniError::manifest_not_found(format!(
+                "no {} with id '{}' found",
+                type_name, id
+            )));
+        }
+        let matched = concat_match_batches_to_schema(&schema, batches)?;
+        if matched.num_rows() != 1 {
+            return Err(OmniError::manifest_internal(format!(
+                "exact-id scan for {}.'{}' matched {} rows; ids are unique by contract",
+                type_name,
+                id,
+                matched.num_rows()
+            )));
+        }
+
+        // Swap ONLY the target column for the uploaded payload.
+        let mut builder = BlobArrayBuilder::new(1);
+        builder
+            .push_bytes(bytes.to_vec())
+            .map_err(|e| OmniError::Lance(e.to_string()))?;
+        let uploaded = builder.finish().map_err(|e| OmniError::Lance(e.to_string()))?;
+        let column_index = matched.schema().index_of(property).map_err(|e| {
+            OmniError::manifest_internal(format!(
+                "blob column '{}' missing from matched batch: {}",
+                property, e
+            ))
+        })?;
+        let mut columns = matched.columns().to_vec();
+        columns[column_index] = uploaded;
+        let updated = arrow_array::RecordBatch::try_new(matched.schema(), columns)
+            .map_err(|e| OmniError::Lance(e.to_string()))?;
+
+        let size = bytes.len() as u64;
+        staging.append_batch(&table_key, updated.schema(), PendingMode::Upsert, updated)?;
+        self.publish_staged_mutation(staging, &txn, requested.as_deref(), actor_id)
+            .await?;
+
+        // The committed validator: RewriteRows moved the row into new
+        // fragments with a fresh stable row id at a new table version, so
+        // re-derive the tag exactly the way a follow-up read does.
+        let committed = self
+            .read_blob_at(
+                crate::db::ReadTarget::branch(requested.as_deref().unwrap_or("main")),
+                type_name,
+                id,
+                property,
+            )
+            .await?;
+        Ok(crate::db::BlobWriteOutcome::Written {
+            etag: crate::db::blob_etag(&committed.version_tag, property),
+            size,
+        })
     }
 
     /// Lower + validate a named mutation query into its IR.

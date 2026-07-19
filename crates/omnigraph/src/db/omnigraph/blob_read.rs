@@ -34,6 +34,61 @@ pub struct BlobVersionTag {
     pub row_id: u64,
 }
 
+/// Strong validator string for one blob cell: an opaque digest of the
+/// identity tuple `(stable_table_id, incarnation_id, table_version, row_id,
+/// property)`. The stable-identity pair (not the mutable `table_key`) makes
+/// the tag rename-stable and drop/re-add ABA-safe (invariant 8). Lives in
+/// the engine so [`Omnigraph::write_blob_at`] can evaluate preconditions
+/// against its pinned write base; `omnigraph-api-types` re-exports it for
+/// the HTTP/CLI boundary.
+pub fn blob_etag(tag: &BlobVersionTag, property: &str) -> String {
+    use sha2::{Digest, Sha256};
+    let mut hasher = Sha256::new();
+    hasher.update(tag.stable_table_id.to_le_bytes());
+    hasher.update(tag.table_incarnation_id.to_le_bytes());
+    hasher.update(tag.table_version.to_le_bytes());
+    hasher.update(tag.row_id.to_le_bytes());
+    hasher.update(property.as_bytes());
+    let digest = hasher.finalize();
+    let mut out = String::with_capacity(34);
+    out.push('"');
+    for byte in &digest[..16] {
+        out.push_str(&format!("{byte:02x}"));
+    }
+    out.push('"');
+    out
+}
+
+/// Transport-neutral precondition for a blob write. The engine compares
+/// opaque strong validator tokens only — RFC 9110 `If-Match` header parsing
+/// (lists, `*`, weak-tag rejection) belongs to the HTTP/CLI boundary
+/// (invariant 11).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum BlobPrecondition {
+    /// `If-Match: *` — succeed as long as the cell currently exists.
+    AnyExisting,
+    /// Succeed iff the cell's current validator equals one of these opaque
+    /// strong tokens (each in the exact quoted form the read side serves).
+    Tags(Vec<String>),
+}
+
+/// Outcome of [`Omnigraph::write_blob_at`].
+///
+/// `PreconditionFailed` is an Ok VARIANT, not an error: a stale validator is
+/// an expected, well-formed answer (HTTP 412), not a fault — and the closed
+/// `OmniError` taxonomy stays untouched. Ignoring the variant and treating
+/// any `Ok` as success is a correctness bug; hence `#[must_use]`.
+#[must_use]
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum BlobWriteOutcome {
+    /// The cell was replaced and the graph commit published. `etag` is the
+    /// validator a follow-up read of the committed head serves.
+    Written { etag: String, size: u64 },
+    /// The supplied precondition did not match the cell's current validator;
+    /// nothing was staged or published.
+    PreconditionFailed { current_etag: String },
+}
+
 /// How one blob cell's content is reachable.
 pub enum BlobContent {
     /// Internal storage (inline / packed / dedicated): bytes stream through

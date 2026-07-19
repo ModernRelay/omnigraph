@@ -521,6 +521,21 @@ pub trait TableStorage: sealed::Sealed + Send + Sync + Debug {
         budget: PendingScanBudget,
     ) -> Result<Vec<RecordBatch>>;
 
+    /// [`Self::scan_with_pending_materialized_blobs`] with one blob column
+    /// null-filled instead of materialized — the blob-upload writer replaces
+    /// that exact cell, so its old payload is neither read nor charged.
+    #[allow(clippy::too_many_arguments)]
+    async fn scan_with_pending_materialized_blobs_skipping(
+        &self,
+        snapshot: &SnapshotHandle,
+        pending: &[RecordBatch],
+        pending_schema: Option<SchemaRef>,
+        filter: Option<&str>,
+        key_column: Option<&str>,
+        budget: PendingScanBudget,
+        skip_blob_column: Option<&str>,
+    ) -> Result<Vec<RecordBatch>>;
+
     async fn first_row_id_for_filter(
         &self,
         snapshot: &SnapshotHandle,
@@ -949,7 +964,30 @@ impl TableStorage for TableStore {
         key_column: Option<&str>,
         budget: PendingScanBudget,
     ) -> Result<Vec<RecordBatch>> {
-        TableStore::scan_with_pending_materialized_blobs(
+        TableStorage::scan_with_pending_materialized_blobs_skipping(
+            self,
+            snapshot,
+            pending,
+            pending_schema,
+            filter,
+            key_column,
+            budget,
+            None,
+        )
+        .await
+    }
+
+    async fn scan_with_pending_materialized_blobs_skipping(
+        &self,
+        snapshot: &SnapshotHandle,
+        pending: &[RecordBatch],
+        pending_schema: Option<SchemaRef>,
+        filter: Option<&str>,
+        key_column: Option<&str>,
+        budget: PendingScanBudget,
+        skip_blob_column: Option<&str>,
+    ) -> Result<Vec<RecordBatch>> {
+        TableStore::scan_with_pending_materialized_blobs_skipping(
             self,
             snapshot.dataset(),
             pending,
@@ -957,6 +995,7 @@ impl TableStorage for TableStore {
             filter,
             key_column,
             budget,
+            skip_blob_column,
         )
         .await
     }

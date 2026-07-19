@@ -683,7 +683,7 @@ impl TableStore {
             .copied()
             .collect::<Vec<_>>();
 
-        Self::materialize_blob_batch_with_row_ids(ds, batch, &row_ids, max_blob_bytes).await
+        Self::materialize_blob_batch_with_row_ids(ds, batch, &row_ids, max_blob_bytes, None).await
     }
 
     /// Rebuild the blob columns in `batch` using explicit stable row ids.
@@ -699,6 +699,7 @@ impl TableStore {
         batch: RecordBatch,
         row_ids: &[u64],
         max_blob_bytes: Option<u64>,
+        skip_blob_column: Option<&str>,
     ) -> Result<RecordBatch> {
         if batch.num_rows() != row_ids.len() {
             return Err(OmniError::Lance(format!(
@@ -718,6 +719,20 @@ impl TableStore {
                 OmniError::Lance(format!("batch missing column '{}'", field.name()))
             })?;
             if lance_field.is_blob() {
+                // A caller replacing this exact cell provides its own payload:
+                // reading the old content would only be discarded, and charging
+                // it against the byte budget would make near-cap cells
+                // un-overwritable. Null-fill and let the caller swap it.
+                if skip_blob_column == Some(field.name().as_str()) {
+                    let mut builder = BlobArrayBuilder::new(batch.num_rows());
+                    for _ in 0..batch.num_rows() {
+                        builder
+                            .push_null()
+                            .map_err(|e| OmniError::Lance(e.to_string()))?;
+                    }
+                    columns.push(builder.finish().map_err(|e| OmniError::Lance(e.to_string()))?);
+                    continue;
+                }
                 let descriptions =
                     column
                         .as_any()
@@ -1973,6 +1988,7 @@ impl TableStore {
                             descriptors,
                             &[row_id],
                             Some(KEYED_WRITE_MAX_BYTES),
+                            None,
                         )
                         .await
                         .map_err(|error| {
@@ -2717,6 +2733,33 @@ impl TableStore {
         key_column: Option<&str>,
         budget: PendingScanBudget,
     ) -> Result<Vec<RecordBatch>> {
+        self.scan_with_pending_materialized_blobs_skipping(
+            committed_ds,
+            pending_batches,
+            pending_schema,
+            filter,
+            key_column,
+            budget,
+            None,
+        )
+        .await
+    }
+
+    /// [`Self::scan_with_pending_materialized_blobs`] with one blob column
+    /// left null-filled instead of materialized — the blob-upload write path
+    /// replaces that exact cell, so its old payload is neither read nor
+    /// charged against the scan's byte budget.
+    #[allow(clippy::too_many_arguments)]
+    pub async fn scan_with_pending_materialized_blobs_skipping(
+        &self,
+        committed_ds: &Dataset,
+        pending_batches: &[RecordBatch],
+        pending_schema: Option<SchemaRef>,
+        filter: Option<&str>,
+        key_column: Option<&str>,
+        budget: PendingScanBudget,
+        skip_blob_column: Option<&str>,
+    ) -> Result<Vec<RecordBatch>> {
         let blob_columns = committed_ds
             .schema()
             .fields
@@ -2831,6 +2874,7 @@ impl TableStore {
                 descriptors,
                 &row_ids,
                 Some(payload_budget),
+                skip_blob_column,
             )
             .await
             {

@@ -41,7 +41,10 @@ mod schema_apply;
 mod stream_enrollment;
 mod table_ops;
 
-pub use blob_read::{BlobContent, BlobRead, BlobReader, BlobVersionTag};
+pub use blob_read::{
+    BlobContent, BlobPrecondition, BlobRead, BlobReader, BlobVersionTag, BlobWriteOutcome,
+    blob_etag,
+};
 pub use optimize::{CleanupPolicyOptions, SkipReason, TableCleanupStats, TableOptimizeStats};
 pub use repair::{
     RepairAction, RepairClassification, RepairOptions, RepairStats, TableRepairStats,

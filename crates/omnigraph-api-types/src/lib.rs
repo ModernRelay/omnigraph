@@ -802,19 +802,30 @@ pub struct GraphListResponse {
 /// the server's `/blob` responses and the CLI's embedded `blob stat` so
 /// both arms derive the identical validator from one definition.
 pub fn blob_etag(tag: &omnigraph::db::BlobVersionTag, property: &str) -> String {
-    use sha2::{Digest, Sha256};
-    let mut hasher = Sha256::new();
-    hasher.update(tag.stable_table_id.to_le_bytes());
-    hasher.update(tag.table_incarnation_id.to_le_bytes());
-    hasher.update(tag.table_version.to_le_bytes());
-    hasher.update(tag.row_id.to_le_bytes());
-    hasher.update(property.as_bytes());
-    let digest = hasher.finalize();
-    let mut out = String::with_capacity(34);
-    out.push('"');
-    for byte in &digest[..16] {
-        out.push_str(&format!("{byte:02x}"));
+    omnigraph::db::blob_etag(tag, property)
+}
+
+/// RFC 9110 `If-Match` header -> the engine's transport-neutral
+/// [`omnigraph::db::BlobPrecondition`]. Shared by the server's `PUT /blob`
+/// handler and the CLI's embedded `blob put` arm so both boundaries parse
+/// the wire form identically (the engine itself compares opaque tokens
+/// only). `*` is `AnyExisting`; otherwise a comma-separated entity-tag
+/// list. If-Match requires STRONG comparison (RFC 9110 §13.1.1), so a weak
+/// `W/"..."` tag never matches and is dropped here — a header of only weak
+/// tags yields `Tags(vec![])`, which matches nothing (412). Splitting on
+/// commas is exact for the hex tags this server mints; an exotic quoted
+/// comma only costs a spurious 412, never a wrong success.
+pub fn parse_if_match(header: &str) -> omnigraph::db::BlobPrecondition {
+    let header = header.trim();
+    if header == "*" {
+        return omnigraph::db::BlobPrecondition::AnyExisting;
     }
-    out.push('"');
-    out
+    omnigraph::db::BlobPrecondition::Tags(
+        header
+            .split(',')
+            .map(str::trim)
+            .filter(|tag| !tag.is_empty() && !tag.starts_with("W/"))
+            .map(str::to_string)
+            .collect(),
+    )
 }

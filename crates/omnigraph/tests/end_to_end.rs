@@ -2235,3 +2235,216 @@ async fn full_flow_optimize_then_query_update_and_reopen() {
         "Alice's post-optimize age update must persist across reopen"
     );
 }
+
+// ─── Blob upload (`write_blob_at`) ───────────────────────────────────────────
+
+async fn blob_upload_graph() -> (tempfile::TempDir, Omnigraph) {
+    let dir = tempfile::tempdir().unwrap();
+    let uri = dir.path().to_str().unwrap();
+    let mut db = Omnigraph::init(uri, BLOB_SCHEMA).await.unwrap();
+    load_jsonl(
+        &mut db,
+        r#"{"type": "Document", "data": {"title": "readme", "content": "base64:SGVsbG8gV29ybGQ="}}"#,
+        LoadMode::Overwrite,
+    )
+    .await
+    .unwrap();
+    (dir, db)
+}
+
+#[tokio::test]
+async fn write_blob_at_replaces_cell_and_round_trips() {
+    use omnigraph::db::BlobWriteOutcome;
+    let (_dir, db) = blob_upload_graph().await;
+
+    let outcome = db
+        .write_blob_at("main", "Document", "readme", "content", b"NewBytes!".to_vec(), None)
+        .await
+        .unwrap();
+    let BlobWriteOutcome::Written { etag, size } = outcome else {
+        panic!("unconditional write must land: {outcome:?}");
+    };
+    assert_eq!(size, b"NewBytes!".len() as u64);
+    assert_eq!(
+        read_blob_bytes(&db, "Document", "readme", "content").await,
+        b"NewBytes!"
+    );
+    // The returned validator is exactly what a follow-up read serves.
+    let read = db
+        .read_blob_at("main", "Document", "readme", "content")
+        .await
+        .unwrap();
+    assert_eq!(etag, omnigraph::db::blob_etag(&read.version_tag, "content"));
+}
+
+#[tokio::test]
+async fn write_blob_at_missing_row_is_not_found() {
+    let (_dir, db) = blob_upload_graph().await;
+    let err = db
+        .write_blob_at("main", "Document", "absent", "content", b"x".to_vec(), None)
+        .await
+        .map(|_| ())
+        .unwrap_err();
+    assert!(
+        err.to_string().contains("no Document with id 'absent'"),
+        "update-only write must 404 a missing row: {err}"
+    );
+}
+
+#[tokio::test]
+async fn write_blob_at_non_blob_property_is_typed() {
+    let (_dir, db) = blob_upload_graph().await;
+    let err = db
+        .write_blob_at("main", "Document", "readme", "title", b"x".to_vec(), None)
+        .await
+        .map(|_| ())
+        .unwrap_err();
+    assert!(err.to_string().contains("is not a Blob"), "{err}");
+}
+
+#[tokio::test]
+async fn write_blob_at_oversize_is_refused_pre_effect() {
+    let (_dir, db) = blob_upload_graph().await;
+    let before = db
+        .snapshot_of(omnigraph::db::ReadTarget::branch("main"))
+        .await
+        .unwrap()
+        .version();
+    let oversize = vec![0_u8; (32 * 1024 * 1024) + 1];
+    let err = db
+        .write_blob_at("main", "Document", "readme", "content", oversize, None)
+        .await
+        .map(|_| ())
+        .unwrap_err();
+    assert!(
+        matches!(err, omnigraph::error::OmniError::ResourceLimitExceeded { .. }),
+        "oversize payload must be a typed resource refusal: {err:?}"
+    );
+    let after = db
+        .snapshot_of(omnigraph::db::ReadTarget::branch("main"))
+        .await
+        .unwrap()
+        .version();
+    assert_eq!(before, after, "refusal must precede any durable effect");
+}
+
+#[tokio::test]
+async fn write_blob_at_if_match_flow() {
+    use omnigraph::db::{BlobPrecondition, BlobWriteOutcome, blob_etag};
+    let (_dir, db) = blob_upload_graph().await;
+
+    let current = db
+        .read_blob_at("main", "Document", "readme", "content")
+        .await
+        .unwrap();
+    let fresh_tag = blob_etag(&current.version_tag, "content");
+
+    // Matching strong tag → the write lands.
+    let outcome = db
+        .write_blob_at(
+            "main",
+            "Document",
+            "readme",
+            "content",
+            b"v2".to_vec(),
+            Some(BlobPrecondition::Tags(vec![fresh_tag.clone()])),
+        )
+        .await
+        .unwrap();
+    let BlobWriteOutcome::Written { etag: v2_etag, .. } = outcome else {
+        panic!("fresh If-Match must succeed: {outcome:?}");
+    };
+    assert_ne!(v2_etag, fresh_tag, "a landed write mints a new validator");
+
+    // The now-stale tag → PreconditionFailed carrying the current validator,
+    // and the cell is untouched.
+    let outcome = db
+        .write_blob_at(
+            "main",
+            "Document",
+            "readme",
+            "content",
+            b"v3-should-not-land".to_vec(),
+            Some(BlobPrecondition::Tags(vec![fresh_tag])),
+        )
+        .await
+        .unwrap();
+    let BlobWriteOutcome::PreconditionFailed { current_etag } = outcome else {
+        panic!("stale If-Match must fail the precondition: {outcome:?}");
+    };
+    assert_eq!(current_etag, v2_etag);
+    assert_eq!(read_blob_bytes(&db, "Document", "readme", "content").await, b"v2");
+
+    // `*` requires only that the row exists.
+    let outcome = db
+        .write_blob_at(
+            "main",
+            "Document",
+            "readme",
+            "content",
+            b"v3".to_vec(),
+            Some(BlobPrecondition::AnyExisting),
+        )
+        .await
+        .unwrap();
+    assert!(matches!(outcome, BlobWriteOutcome::Written { .. }));
+    assert_eq!(read_blob_bytes(&db, "Document", "readme", "content").await, b"v3");
+}
+
+#[tokio::test]
+async fn write_blob_at_replaces_external_reference_cell() {
+    let dir = tempfile::tempdir().unwrap();
+    let uri = dir.path().to_str().unwrap();
+    let blob_dir = tempfile::tempdir().unwrap();
+    let blob_path = blob_dir.path().join("external.bin");
+    std::fs::write(&blob_path, b"external-bytes").unwrap();
+    let mut db = Omnigraph::init(uri, BLOB_SCHEMA).await.unwrap();
+    let seed = format!(
+        r#"{{"type": "Document", "data": {{"title": "ext", "content": "file://{}"}}}}"#,
+        blob_path.display()
+    );
+    load_jsonl(&mut db, &seed, LoadMode::Overwrite).await.unwrap();
+    // The upload provides its own payload — the old external object is
+    // irrelevant, so delete it to prove nothing resolves it.
+    std::fs::remove_file(&blob_path).unwrap();
+
+    let outcome = db
+        .write_blob_at("main", "Document", "ext", "content", b"now inline".to_vec(), None)
+        .await
+        .unwrap();
+    assert!(matches!(outcome, omnigraph::db::BlobWriteOutcome::Written { .. }));
+    assert_eq!(read_blob_bytes(&db, "Document", "ext", "content").await, b"now inline");
+}
+
+#[tokio::test]
+async fn write_blob_at_carries_other_blob_columns() {
+    const TWO_BLOB_SCHEMA: &str = r#"
+node Asset {
+    name: String @key
+    content: Blob?
+    thumb: Blob?
+}
+"#;
+    let dir = tempfile::tempdir().unwrap();
+    let uri = dir.path().to_str().unwrap();
+    let mut db = Omnigraph::init(uri, TWO_BLOB_SCHEMA).await.unwrap();
+    load_jsonl(
+        &mut db,
+        r#"{"type": "Asset", "data": {"name": "a1", "content": "base64:Ym9keQ==", "thumb": "base64:dGh1bWI="}}"#,
+        LoadMode::Overwrite,
+    )
+    .await
+    .unwrap();
+
+    let outcome = db
+        .write_blob_at("main", "Asset", "a1", "content", b"replaced".to_vec(), None)
+        .await
+        .unwrap();
+    assert!(matches!(outcome, omnigraph::db::BlobWriteOutcome::Written { .. }));
+    assert_eq!(read_blob_bytes(&db, "Asset", "a1", "content").await, b"replaced");
+    assert_eq!(
+        read_blob_bytes(&db, "Asset", "a1", "thumb").await,
+        b"thumb",
+        "the untouched blob column must be carried through unchanged"
+    );
+}
