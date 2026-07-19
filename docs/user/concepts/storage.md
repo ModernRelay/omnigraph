@@ -44,7 +44,7 @@ The on-disk shape of `__manifest` is reconciled with the binary via a single ver
 - The stamp is read with no object-store writes, so the check is safe under a read-only open. Operators can see a graph's stamp with `omnigraph snapshot` and the binary's served version with `omnigraph version` (the `internal-schema` line).
 
 The stamp values below are historical; this binary serves only the current one
-(`v7`). An earlier-stamped graph is rebuilt via export/import, not migrated in
+(`v8`). An earlier-stamped graph is rebuilt via export/import, not migrated in
 place.
 
 | Stamp | Shape |
@@ -55,7 +55,8 @@ place.
 | v4 | Graph lineage folded into `__manifest` as `graph_commit` / `graph_head` rows (RFC-013 Phase 7); the `_graph_commits.lance` / `_graph_commit_actors.lance` tables retired. |
 | v5 | RFC-028 SchemaIR v2 plus graph-domain stable schema IDs; manifest table rows, OCC, recovery ownership, and physical paths keyed by stable table ID + incarnation. |
 | v6 | Preserves v5 identity and activates RFC-023: every graph node/edge dataset has exact non-null physical `id` as Lance's unenforced PK, and every production strict insert/upsert uses the exact-`id` filter-bearing adapter. |
-| v7 | Preserves v5/v6 identity and keyed-write contracts, and adds RFC-026 identity-keyed `stream_state` authority: physical enrollment binding, mutable current-HEAD witness, lifecycle, and per-shard epoch floor. Phase A can recover one exact empty private enrollment; no production row-streaming API is active. **The only version this binary serves.** |
+| v7 | Preserves v5/v6 identity and keyed-write contracts, and adds RFC-026 identity-keyed `stream_state` authority: physical enrollment binding, mutable current-HEAD witness, lifecycle, and per-shard epoch floor. Phase A can recover one exact empty private enrollment; no production row-streaming API is active. |
+| v8 | Preserves the v5/v6/v7 contracts and activates RFC-026 stream-config v2 plus recovery-v11 for the private B1 row/fold core: one no-roll generation, watcher-only durable acknowledgement, and one exact fold whose manifest publish advances the table pointer, lifecycle witness, and graph lineage together. Public row streaming remains inactive. **The only version this binary serves.** |
 
 ## On-disk layout
 

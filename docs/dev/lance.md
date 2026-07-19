@@ -171,7 +171,7 @@ for schemas that avoid the newly reserved names documented below. RC.1 requires
 Rust 1.91 or newer; OmniGraph continues to track stable Rust and this audit ran
 on Rust 1.95.
 
-#### Post-audit implementation note: 2026-07-18
+#### Post-audit implementation notes: 2026-07-18–19
 
 RFC-026 Gate E0 subsequently passed and Phase A activated OmniGraph internal
 schema v7. V7 adds only the bounded streaming foundation: exact recovery-v10
@@ -180,6 +180,20 @@ writer exclusion, current-HEAD witness validation, partial-format refusal, and
 strict v6↔v7 rebuild. The private adapter can establish one empty unsharded
 epoch-1 enrollment on main; no production caller can put or acknowledge a row,
 fold a generation, or operate drain/resume.
+
+On 2026-07-19, Phase B1 added the private data-bearing core and moved the
+current format to internal schema v8, stream-config v2, and recovery-v11
+`StreamFold`. One feature-gated, doc-hidden engine seam can admit one exact
+already-normalized physical batch, acknowledge only after that put's durability
+watcher succeeds, prevent rollover, and retire the writer before any
+successor-generation put. Empty reopen may admit; replayed active rows or one
+flushed-unmerged generation are fold-only. One strict fold consumes the exact
+generation, passes supplied physical vector columns through unchanged, performs
+no external embedding call or unspecified fold-derived-field materialization,
+and makes the achieved table pointer, lifecycle witness, and lineage
+graph-visible only at one `__manifest` CAS. This is private implementation and
+evidence machinery, not public activation: RFC-026 remains Draft, with no
+schema/SDK/HTTP/CLI/OpenAPI caller or operator drain/resume surface.
 
 The Phase-B1 source audit also narrows the RC.1 row contract. `put_no_wait`
 returns a `WriteResult` plus an optional `BatchDurableWatcher`; the watcher's
@@ -219,25 +233,32 @@ original task and abort completion retained, the registry retired, and
 admission closed. The caller never cancels `shutdown_all`, retries abort, or
 claims quiescence while the taken handler join may still be active.
 
-The safe B1 profile is deliberately bounded: one root-scoped serialized
-worker owns one generation whose complete input is capped at 8,192 rows/32 MiB;
-its explicit writer configuration prevents automatic rollover; it owns
+The implemented private B1 profile is deliberately bounded: one root-scoped
+serialized worker owns one generation whose complete input is capped at 8,192
+rows/32 MiB. Its explicit writer configuration prevents automatic rollover; it
+owns
 `put_no_wait` and the watcher, seals/drains, retires without writing into the
 replacement MemTable, folds one keyed transaction through recovery schema v11,
-then reopens at a higher epoch. Cold claim/replay and warm final-check/put hold
-the shared admission lease from before epoch claim until durability or
-quiesced retirement, preventing a claimant from crossing a drain's captured
-floor. Replay preserves possible residue but cannot resolve which caller
-attempt produced it. Configuration identity binds only
+then reopens at a higher epoch. The fold consumes already-normalized physical
+rows, including caller-supplied vector columns; it does not call an external
+embedding provider or invent unspecified fold-derived fields. Cold claim/replay
+and warm final-check/put hold the shared admission lease from before epoch claim
+until durability or quiesced retirement, preventing a claimant from crossing a
+drain's captured floor. Replay preserves possible residue but cannot resolve
+which caller attempt produced it. Configuration identity binds only
 correctness/topology/no-rollover fields; explicit runtime policy and injected
-Session/store capabilities remain separate. Planned B1 activates graph schema
+Session/store capabilities remain separate. Private B1 activates graph schema
 v8 and stream-config v2 rather than adopting v7/config-v1 in place. Phase B2 is
 the later public strict activation and additionally waits for durable
 contributor attribution, bounded reclamation, strict correction, a same-key
 `AckUnknown` sequencing/idempotency contract, and persistent
-quiesce/resume/abort-drain/rebuild. The missing combined enrollment receipt and
-cross-process admission seal still gate broader topology, not B1 inside the
-existing single-live-writer-process boundary.
+quiesce/resume/abort-drain/rebuild. B1's genuine v7↔v8 cross-version/rebuild,
+complete 24-cell graph-level B1 suite, qualified local cost/PK-index/RSS, and
+configured RustFS cost gates now pass; the measured uncompacted-manifest term remains
+explicitly non-flat. That makes the private B1 boundary green, not public. The
+missing combined enrollment receipt and cross-process admission seal still gate
+broader topology, not B1 inside the existing single-live-writer-process
+boundary.
 
 The no-roll profile uses fixed portable capacities (`8,193` rows/batches and
 1-GiB byte/unflushed thresholds), not architecture-dependent `usize::MAX`
@@ -296,7 +317,8 @@ Behavior-affecting findings in this audit:
 
   MemWAL stays the strategic substrate and RFC-026 stays draft. Its
   production-neutral Gate E0 passed for the bounded profile. The post-audit
-  note above records the subsequently implemented Phase A boundary. The first
+  note above records the subsequently implemented Phase A foundation and
+  private B1 boundary. The first
   history-cost result was rejected: local
   `checkout_latest` may discover the tip through filesystem `read_dir`, which
   bypasses `IOTracker`, so the observed tracked GET count omitted part of the
@@ -322,7 +344,8 @@ Behavior-affecting findings in this audit:
   remain load-bearing; only `Ok(false)` means absence, while errors, overflow,
   or detached boundaries fail closed. The RC.1 audit itself introduced no
   private API, raw object emulation, production schema, or stream
-  acknowledgement; the post-audit note records the later Phase A format work.
+  acknowledgement; the post-audit notes record the later Phase A and private
+  B1 format work.
   The exact
   upstream receipt/seal remains the preferred simplification and the gate for
   broader topology.
@@ -490,7 +513,7 @@ Behavior-affecting findings in this audit:
   This result blocks the in-manifest BTREE access shape, not checkpoint rows as
   logical authority or Lance tags as physical pins. RFC-025 is
   research-blocked and no retention format ships. Schema v6 was production
-  truth when the gate ran; current schema v7 likewise carries no retention
+  truth when the gate ran; current schema v8 likewise carries no retention
   state. A successor needs a history-flat current-authority lookup
   or revised evidence-backed operational contract without adding a second
   authority dataset.

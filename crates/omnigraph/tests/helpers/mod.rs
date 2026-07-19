@@ -18,12 +18,7 @@ use omnigraph_compiler::result::{MutationResult, QueryResult};
 
 /// Read one internal blob's full payload from `main`, panicking on an
 /// external reference — the shape most blob tests want.
-pub async fn read_blob_bytes(
-    db: &Omnigraph,
-    type_name: &str,
-    id: &str,
-    property: &str,
-) -> Vec<u8> {
+pub async fn read_blob_bytes(db: &Omnigraph, type_name: &str, id: &str, property: &str) -> Vec<u8> {
     use omnigraph::db::BlobContent;
     let blob = db
         .read_blob_at("main", type_name, id, property)

@@ -1,10 +1,10 @@
-//! RFC-026 Phase-A bounded stream enrollment orchestration.
+//! RFC-026 bounded stream enrollment orchestration.
 //!
 //! This module intentionally exposes no production SDK/API surface. It joins
 //! the exact MemWAL adapter, recovery-v10 sidecar, manifest-v7 lifecycle row,
 //! and process-local admission lease so the crash path and success path share
-//! one roll-forward implementation. Row admission, acknowledgement, and fold
-//! are later phases.
+//! one roll-forward implementation. Internal schema v8 enrolls directly into
+//! the exact config-v2 profile consumed by the private Phase-B1 worker.
 
 use lance_index::mem_wal::ShardId;
 
@@ -17,17 +17,17 @@ use crate::db::write_queue::StreamAdmissionKey;
 use crate::error::{OmniError, Result};
 use crate::table_store::mem_wal::{
     MemWalEnrollmentPlan, capture_pre_enrollment_head, initialize_index_from_exact_no_effect,
-    validate_phase_a_lifecycle_physical_state, validate_phase_a_stream_absent,
+    validate_b1_lifecycle_physical_state, validate_phase_a_stream_absent,
 };
 
 use super::Omnigraph;
 
 impl Omnigraph {
-    /// Validate the complete internal-v7 stream capability before a handle is
+    /// Validate the complete internal-v8 stream capability before a handle is
     /// served. Recovery has already consumed every parseable enrollment intent
     /// on read-write open; therefore a MemWAL index without a lifecycle row is
     /// uncovered partial format, while every lifecycle must match its exact
-    /// current table witness and bounded empty-shard profile.
+    /// current table witness and bounded config-v2 generation topology.
     pub(super) async fn validate_stream_format_consistency(&self) -> Result<()> {
         let snapshot = self.coordinator.read().await.snapshot();
         let has_active_stream = snapshot.stream_lifecycles().any(|(_, lifecycle)| {
@@ -40,7 +40,7 @@ impl Omnigraph {
             let branches = self.coordinator.read().await.branch_list().await?;
             if branches.iter().any(|branch| branch != "main") {
                 return Err(OmniError::manifest_internal(
-                    "internal-v7 OPEN/DRAINING stream lifecycle cannot coexist with named graph branches",
+                    "internal-v8 OPEN/DRAINING stream lifecycle cannot coexist with named graph branches",
                 ));
             }
         }
@@ -68,11 +68,14 @@ impl Omnigraph {
                     // the current physical ref, so latest must still equal the
                     // durable exact witness before the format is accepted.
                     let head = self.storage().open_dataset_head(&full_path, None).await?;
-                    validate_phase_a_lifecycle_physical_state(head.dataset(), lifecycle).await
+                    validate_b1_lifecycle_physical_state(head.dataset(), lifecycle)
+                        .await
+                        .map(|_| ())
+                        .map_err(|error| error.to_string())
                 }
                 None => {
                     match validate_phase_a_stream_absent(table.dataset()).await {
-                        Err(error) => Err(error),
+                        Err(error) => Err(error.to_string()),
                         Ok(()) => {
                             // The manifest-selected version can still be N while an
                             // uncovered initializer effect sits at the attached HEAD
@@ -89,7 +92,9 @@ impl Omnigraph {
                             if head.version() == table.dataset().version().version {
                                 Ok(())
                             } else {
-                                validate_phase_a_stream_absent(head.dataset()).await
+                                validate_phase_a_stream_absent(head.dataset())
+                                    .await
+                                    .map_err(|error| error.to_string())
                             }
                         }
                     }
@@ -97,7 +102,7 @@ impl Omnigraph {
             };
             validation.map_err(|error| {
                 OmniError::manifest_internal(format!(
-                    "internal-v7 stream format consistency failed for '{}' ({}): {error}",
+                    "internal-v8 stream format consistency failed for '{}' ({}): {error}",
                     entry.table_key, entry.identity
                 ))
             })?;
@@ -105,11 +110,11 @@ impl Omnigraph {
         Ok(())
     }
 
-    /// Enroll one existing main-branch table into the bounded Phase-A physical
-    /// profile. Kept crate-private until the public stream contract (including
-    /// durable row acknowledgement) is implemented.
-    #[allow(dead_code)] // Phase B will supply the first production caller.
-    pub(crate) async fn enroll_stream_table_phase_a(
+    /// Enroll one existing main-branch table into the bounded config-v2
+    /// physical profile. Kept crate-private until Phase B2 supplies the public
+    /// stream contract.
+    #[allow(dead_code)]
+    pub(crate) async fn enroll_stream_table_b1(
         &self,
         table_key: &str,
         actor_id: Option<&str>,
@@ -336,6 +341,6 @@ impl Omnigraph {
     #[cfg(feature = "failpoints")]
     #[doc(hidden)]
     pub async fn failpoint_enroll_stream_table_for_test(&self, table_key: &str) -> Result<()> {
-        self.enroll_stream_table_phase_a(table_key, None).await
+        self.enroll_stream_table_b1(table_key, None).await
     }
 }

@@ -90,6 +90,29 @@ where
     QUERY_IO_PROBES.scope(probes, fut).await
 }
 
+/// Spawn an engine-owned background task without dropping the caller's
+/// observation-only I/O probes.
+///
+/// Tokio task locals are intentionally not inherited by `tokio::spawn`.  Most
+/// engine work is request-owned, but a few correctness-sensitive paths detach
+/// physical work so cancellation cannot abandon it.  Those owners use this
+/// helper so cost tests still observe datasets opened inside the detached
+/// task.  Production never installs probes, making the `None` arm a plain
+/// spawn with no storage wrapper or behavioral change.
+pub(crate) fn spawn_with_query_io_probes<F>(fut: F) -> tokio::task::JoinHandle<F::Output>
+where
+    F: std::future::Future + Send + 'static,
+    F::Output: Send + 'static,
+{
+    let probes = QUERY_IO_PROBES.try_with(Clone::clone).ok();
+    tokio::spawn(async move {
+        match probes {
+            Some(probes) => QUERY_IO_PROBES.scope(probes, fut).await,
+            None => fut.await,
+        }
+    })
+}
+
 fn current<R>(f: impl FnOnce(&QueryIoProbes) -> R) -> Option<R> {
     QUERY_IO_PROBES.try_with(f).ok()
 }

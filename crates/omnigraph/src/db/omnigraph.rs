@@ -39,6 +39,7 @@ mod optimize;
 mod repair;
 mod schema_apply;
 mod stream_enrollment;
+mod stream_ingest;
 mod table_ops;
 
 pub use blob_read::{BlobContent, BlobRead, BlobReader, BlobVersionTag};
@@ -216,6 +217,12 @@ pub struct Omnigraph {
     /// paths, and both live/open-time recovery). Sharing across independently
     /// opened handles is required because Restore/ref deletion is destructive.
     write_queue: Arc<crate::db::write_queue::WriteQueueManager>,
+    /// Root-scoped RFC-026 Phase-B1 MemWAL workers. Independently opened
+    /// handles for the same canonical graph root must singleflight the exact
+    /// physical binding; a handle-local registry would permit two epoch claims
+    /// and two durability domains for one shard.
+    #[allow(dead_code)]
+    stream_workers: Arc<crate::table_store::mem_wal::MemWalWorkerRegistry>,
     /// Handle-local mutex held across the swap → operate → restore window
     /// in `branch_merge_impl`. Two concurrent merges through the same handle
     /// with distinct targets
@@ -303,6 +310,34 @@ pub struct InitOptions {
     pub force: bool,
 }
 
+/// Conservative bounds for the private RFC-026 Phase-B1 evidence surface.
+/// There is no production caller in B1; the checked-in stream cost/RSS suite
+/// owns these values and Phase B2 must re-qualify them before exposing public
+/// admission. Keeping the limits explicit here prevents independently opened
+/// handles from silently selecting different resource contracts.
+fn private_b1_worker_limits() -> crate::table_store::mem_wal::B1WorkerLimits {
+    crate::table_store::mem_wal::B1WorkerLimits {
+        // The B1 evidence qualifies one resident writer. Its widest legal
+        // generation added roughly 126 MiB of whole-process peak RSS (Arrow +
+        // mandatory PK/runtime/allocator), so admitting four residents here
+        // would be an unmeasured throughput choice. B2 may raise this only with
+        // a multi-resident RSS cell.
+        max_resident_writers_root: 1,
+        max_resident_writers_per_table: 1,
+        max_reserved_arrow_bytes: 32 * 1024 * 1024,
+        // Every queued input is charged against the same aggregate Arrow
+        // reservation synchronously, before detachment or cold claim. This
+        // count therefore bounds scheduling/control overhead; it cannot admit
+        // 32 independent 32-MiB buffers.
+        max_inflight_calls: 32,
+        max_pending_generations: 4,
+        put_deadline: std::time::Duration::from_secs(30),
+        seal_deadline: std::time::Duration::from_secs(60),
+        abort_deadline: std::time::Duration::from_secs(60),
+        idle_timeout: std::time::Duration::from_secs(60),
+    }
+}
+
 impl Omnigraph {
     /// Create a new graph at `uri` from schema source.
     ///
@@ -336,6 +371,11 @@ impl Omnigraph {
         let write_queue_identity = write_queue_root_identity(&root)?;
         let write_queue =
             crate::db::write_queue::WriteQueueManager::for_root(&write_queue_identity);
+        let stream_workers = crate::table_store::mem_wal::MemWalWorkerRegistry::for_root(
+            &write_queue_identity,
+            private_b1_worker_limits(),
+        )
+        .map_err(|error| OmniError::manifest_internal(error.to_string()))?;
 
         // Preflight before parse or write. Strict init refuses any schema
         // artifact; force may recover orphan schema files but still refuses an
@@ -461,6 +501,7 @@ impl Omnigraph {
                 schema_identity_domain,
             })),
             write_queue,
+            stream_workers,
             merge_exclusive: Arc::new(tokio::sync::Mutex::new(())),
             policy: None,
             embedding: Arc::new(tokio::sync::OnceCell::new()),
@@ -514,6 +555,11 @@ impl Omnigraph {
         let write_queue_identity = write_queue_root_identity(&root)?;
         let write_queue =
             crate::db::write_queue::WriteQueueManager::for_root(&write_queue_identity);
+        let stream_workers = crate::table_store::mem_wal::MemWalWorkerRegistry::for_root(
+            &write_queue_identity,
+            private_b1_worker_limits(),
+        )
+        .map_err(|error| OmniError::manifest_internal(error.to_string()))?;
         // Refuse a `__manifest` this binary cannot serve before the coordinator
         // reads any branch state — newer than CURRENT (an old binary must not
         // silently misread a newer graph) or below MIN_SUPPORTED (an older
@@ -645,6 +691,7 @@ impl Omnigraph {
                 schema_identity_domain,
             })),
             write_queue,
+            stream_workers,
             merge_exclusive: Arc::new(tokio::sync::Mutex::new(())),
             policy: None,
             embedding: Arc::new(tokio::sync::OnceCell::new()),
@@ -4152,7 +4199,7 @@ edge WorksAt: Person -> Company
         let dir = tempfile::tempdir().unwrap();
         let uri = dir.path().to_str().unwrap();
         let db = Omnigraph::init(uri, TEST_SCHEMA).await.unwrap();
-        db.enroll_stream_table_phase_a("node:Person", None)
+        db.enroll_stream_table_b1("node:Person", None)
             .await
             .unwrap();
 
@@ -4201,7 +4248,7 @@ edge WorksAt: Person -> Company
         let dir = tempfile::tempdir().unwrap();
         let uri = dir.path().to_str().unwrap();
         let db = Arc::new(Omnigraph::init(uri, TEST_SCHEMA).await.unwrap());
-        db.enroll_stream_table_phase_a("node:Person", None)
+        db.enroll_stream_table_b1("node:Person", None)
             .await
             .unwrap();
 

@@ -1,14 +1,20 @@
-//! Narrow RFC-026 Phase-A adapter for recoverable MemWAL enrollment.
+//! Narrow RFC-026 adapters for bounded MemWAL enrollment and private Phase B1.
 //!
-//! This module deliberately stops before row admission.  It can capture an
-//! exact main-branch witness, initialize the singleton unsharded MemWAL index,
-//! provision one pre-minted empty shard, and classify those two effects after a
-//! lost result.  It never calls `put`, acknowledges data, folds generations,
-//! mutates raw MemWAL objects, or publishes graph visibility.
+//! The parent module captures the exact main-branch witness, initializes the
+//! singleton unsharded MemWAL index, provisions one pre-minted empty shard, and
+//! classifies those enrollment effects after a lost result. The private
+//! [`worker`] submodule owns B1's one-generation admission, watcher, replay,
+//! seal/drain, and quiesced retirement mechanics. Graph authority, recovery-v11
+//! fold ownership, and the sole `__manifest` visibility publication remain in
+//! `db::omnigraph::stream_ingest`; no production streaming API is exposed.
 //!
 //! The caller must hold RFC-026's exclusive base-HEAD and cleanup/GC gates from
 //! the final pre-effect check through classification and manifest publication.
 //! Those gates are what make an absent immediate successor proof meaningful.
+
+mod worker;
+
+pub(crate) use worker::*;
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt::Display;
@@ -22,16 +28,10 @@ use lance_index::mem_wal::{
 };
 use object_store::{ObjectMeta, path::Path};
 use serde::{Deserialize, Serialize};
-use sha2::{Digest, Sha256};
 use thiserror::Error;
 
-use crate::db::manifest::{CurrentHeadWitness, STREAM_CONFIG_VERSION, StreamLifecycleEntry};
+use crate::db::manifest::CurrentHeadWitness;
 
-const ENROLLMENT_ID_KEY: &str = "omnigraph.enrollment_id";
-const CONFIG_VERSION_KEY: &str = "omnigraph.stream_config_version";
-const DURABLE_WRITE_KEY: &str = "durable_write";
-const MAX_WAL_BUFFER_SIZE_KEY: &str = "max_wal_buffer_size";
-const WAL_BUFFER_BYTES: usize = 1_048_576;
 const UNSHARDED_SPEC_ID: u32 = 1;
 const SHARD_MANIFEST_SCAN_BATCH_SIZE: usize = 2;
 /// A valid fresh shard has two objects (manifest v1 plus its optional hint).
@@ -135,31 +135,11 @@ impl MemWalEnrollmentPlan {
     /// bounded profile.  Enrollment and shard identities are deliberately not
     /// included: they are carried separately in the physical binding.
     pub(crate) fn stream_config_hash(&self) -> String {
-        let canonical = canonical_stream_config();
-        let digest = Sha256::digest(canonical.as_bytes());
-        let hex = digest
-            .iter()
-            .map(|byte| format!("{byte:02x}"))
-            .collect::<String>();
-        format!("sha256:{hex}")
+        stream_config_v2_hash()
     }
 
     fn expected_writer_defaults(&self) -> BTreeMap<String, String> {
-        BTreeMap::from([
-            (
-                ENROLLMENT_ID_KEY.to_string(),
-                self.enrollment_id.to_string(),
-            ),
-            (
-                CONFIG_VERSION_KEY.to_string(),
-                STREAM_CONFIG_VERSION.to_string(),
-            ),
-            (DURABLE_WRITE_KEY.to_string(), "true".to_string()),
-            (
-                MAX_WAL_BUFFER_SIZE_KEY.to_string(),
-                WAL_BUFFER_BYTES.to_string(),
-            ),
-        ])
+        expected_b1_writer_defaults(self.enrollment_id)
     }
 
     /// RC.1 persists defaults but does not apply them to caller-created writer
@@ -170,47 +150,9 @@ impl MemWalEnrollmentPlan {
         details: &MemWalIndexDetails,
     ) -> Result<ShardWriterConfig, MemWalEnrollmentError> {
         validate_fresh_unsharded_details(details, self)?;
-        let durable_write = details
-            .writer_config_defaults
-            .get(DURABLE_WRITE_KEY)
-            .ok_or_else(|| MemWalEnrollmentError::physical("durable_write default is absent"))?
-            .parse::<bool>()
-            .map_err(|error| {
-                MemWalEnrollmentError::physical(format!(
-                    "durable_write default is not boolean: {error}"
-                ))
-            })?;
-        let max_wal_buffer_size = details
-            .writer_config_defaults
-            .get(MAX_WAL_BUFFER_SIZE_KEY)
-            .ok_or_else(|| {
-                MemWalEnrollmentError::physical("max_wal_buffer_size default is absent")
-            })?
-            .parse::<usize>()
-            .map_err(|error| {
-                MemWalEnrollmentError::physical(format!(
-                    "max_wal_buffer_size default is not an integer: {error}"
-                ))
-            })?;
-        Ok(ShardWriterConfig::new(self.shard_id)
-            .with_shard_spec_id(UNSHARDED_SPEC_ID)
-            .with_durable_write(durable_write)
-            .with_max_wal_buffer_size(max_wal_buffer_size))
+        reconstruct_b1_writer_config(details, self.enrollment_id, self.shard_id)
+            .map_err(|error| MemWalEnrollmentError::physical(error.to_string()))
     }
-}
-
-fn canonical_stream_config() -> String {
-    format!(
-        "omnigraph.stream_config_version={STREAM_CONFIG_VERSION}\n\
-         sharding=unsharded\n\
-         num_shards=1\n\
-         shard_spec_id=1\n\
-         shard_field_id=bucket\n\
-         shard_result_type=int32\n\
-         maintained_indexes=\n\
-         durable_write=true\n\
-         max_wal_buffer_size={WAL_BUFFER_BYTES}\n"
-    )
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -457,88 +399,6 @@ pub(crate) async fn provision_shard_from_exact_index_only(
             "shard claim did not produce the exact empty-shard state: {state:?}"
         ))),
     }
-}
-
-/// Validate one manifest-authorized Phase-A enrollment against exact public
-/// Lance state. Because Phase A has no append/fold path, its accepted physical
-/// shape remains the initializer's N+1 transaction plus the original empty
-/// epoch-1 shard. Later phases must replace this validator when they add
-/// generations or advance the base-table witness.
-pub(crate) async fn validate_phase_a_lifecycle_physical_state(
-    dataset: &Dataset,
-    lifecycle: &StreamLifecycleEntry,
-) -> Result<(), MemWalEnrollmentError> {
-    require_bounded_profile_table(dataset)?;
-    lifecycle.validate().map_err(|error| {
-        MemWalEnrollmentError::physical(format!("invalid durable lifecycle authority: {error}"))
-    })?;
-    if dataset.version().version != lifecycle.current_head_witness.table_version {
-        return Err(MemWalEnrollmentError::authority(format!(
-            "manifest lifecycle selects table version {}, opened exact version {}",
-            lifecycle.current_head_witness.table_version,
-            dataset.version().version
-        )));
-    }
-    let observed = capture_current_head_witness(dataset).await?;
-    if observed != lifecycle.current_head_witness {
-        return Err(MemWalEnrollmentError::authority(format!(
-            "current table witness differs from durable lifecycle: expected={:?}, actual={observed:?}",
-            lifecycle.current_head_witness
-        )));
-    }
-    let enrollment_id = ShardId::parse_str(&lifecycle.binding.enrollment_id).map_err(|error| {
-        MemWalEnrollmentError::physical(format!("invalid bound enrollment UUID: {error}"))
-    })?;
-    let shard_id = lifecycle
-        .binding
-        .shard_ids
-        .first()
-        .ok_or_else(|| MemWalEnrollmentError::physical("bound shard namespace is empty"))
-        .and_then(|value| {
-            ShardId::parse_str(value).map_err(|error| {
-                MemWalEnrollmentError::physical(format!("invalid bound shard UUID: {error}"))
-            })
-        })?;
-    let plan = MemWalEnrollmentPlan::new(enrollment_id, shard_id)?;
-    if lifecycle.binding.stream_config_version != STREAM_CONFIG_VERSION
-        || lifecycle.binding.stream_config_hash != plan.stream_config_hash()
-    {
-        return Err(MemWalEnrollmentError::physical(
-            "durable lifecycle config does not match the bounded adapter profile",
-        ));
-    }
-    let predecessor_version = observed
-        .table_version
-        .checked_sub(1)
-        .filter(|version| *version > 0)
-        .ok_or_else(|| {
-            MemWalEnrollmentError::authority(
-                "enrollment witness has no attached predecessor version",
-            )
-        })?;
-    let predecessor = dataset
-        .checkout_version(predecessor_version)
-        .await
-        .map_err(|error| MemWalEnrollmentError::lance("enrollment predecessor open", error))?;
-    let before = capture_current_head_witness(&predecessor).await?;
-    let MemWalEnrollmentState::ExactIndexAndExpectedEmptyShard {
-        receipt,
-        shard_manifest,
-    } = classify_enrollment(&predecessor, &before, &plan).await?
-    else {
-        return Err(MemWalEnrollmentError::physical(
-            "durable lifecycle does not resolve to the exact index-plus-empty-shard state",
-        ));
-    };
-    if receipt.head != lifecycle.current_head_witness
-        || lifecycle.epoch_floor_by_shard
-            != BTreeMap::from([(shard_id.to_string(), shard_manifest.writer_epoch)])
-    {
-        return Err(MemWalEnrollmentError::physical(
-            "durable lifecycle witness or epoch floor differs from exact physical state",
-        ));
-    }
-    Ok(())
 }
 
 /// Fail closed when a table with no lifecycle authority already carries the
@@ -1190,7 +1050,7 @@ mod tests {
         let plan = plan();
         assert_eq!(
             plan.stream_config_hash(),
-            "sha256:e355c3f5594ec45003c8158d7c476501901107abacfe3f1b01e543f6d7314d9e"
+            "sha256:1885f9b7d28ffc12266e75e3d6d0448c3289dee152674aadb8cca2be865d8e9d"
         );
         let mut details = MemWalIndexDetails {
             num_shards: 1,
@@ -1212,7 +1072,9 @@ mod tests {
         assert_eq!(config.shard_id, plan.shard_id);
         assert_eq!(config.shard_spec_id, UNSHARDED_SPEC_ID);
         assert!(config.durable_write);
-        assert_eq!(config.max_wal_buffer_size, WAL_BUFFER_BYTES);
+        assert_eq!(config.max_wal_buffer_size, 10 * 1024 * 1024);
+        assert_eq!(config.max_memtable_rows, 8_193);
+        assert_eq!(config.max_memtable_batches, 8_193);
 
         details
             .writer_config_defaults

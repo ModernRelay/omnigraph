@@ -90,7 +90,7 @@ as durable disposition history after closure, so RFC backlinks stay valid.
 
 | Area | Read |
 |---|---|
-| RFC-022–028 split architecture review — RFC-022/023/028 implemented; RFC-024/025/027 research-blocked; RFC-026 Phase A implemented with private B1 next; dependency corrections and acceptance evidence remain tracked | [rfc-022-027-architecture-review.md](rfc-022-027-architecture-review.md) |
+| RFC-022–028 split architecture review — RFC-022/023/028 implemented; RFC-024/025/027 research-blocked; RFC-026 Phase A and private B1 implemented/evidence-green while public B2 remains inactive; dependency corrections and acceptance evidence remain tracked | [rfc-022-027-architecture-review.md](rfc-022-027-architecture-review.md) |
 
 ## Active Implementation Plans
 

@@ -8,6 +8,7 @@ use datafusion::physical_plan::{SendableRecordBatchStream, stream::RecordBatchSt
 use futures::TryStreamExt;
 use lance::Dataset;
 use lance::blob::BlobArrayBuilder;
+use lance::dataset::mem_wal::DatasetMemWalExt;
 use lance::dataset::scanner::{ColumnOrdering, DatasetRecordBatchStream, Scanner};
 use lance::dataset::transaction::{Operation, Transaction, TransactionBuilder, UpdateMode};
 use lance::dataset::write::merge_insert::inserted_rows::{KeyExistenceFilterBuilder, KeyValue};
@@ -22,6 +23,7 @@ use lance::datatypes::Schema as LanceSchema;
 use lance::index::DatasetIndexExt;
 use lance::index::scalar::IndexDetails;
 use lance_file::version::LanceFileVersion;
+use lance_index::mem_wal::{MergedGeneration, ShardId};
 use lance_index::scalar::{InvertedIndexParams, ScalarIndexParams};
 use lance_index::{IndexType, is_system_index};
 use lance_linalg::distance::MetricType;
@@ -29,7 +31,7 @@ use lance_select::mask::RowAddrTreeMap;
 use lance_table::format::{Fragment, IndexMetadata, RowIdMeta};
 use lance_table::rowids::{RowIdSequence, write_row_ids};
 use serde::{Deserialize, Serialize};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
 use crate::db::manifest::TableVersionMetadata;
@@ -1491,6 +1493,165 @@ impl TableStore {
             staged.set_strict_source_ids(source_ids);
         }
         Ok(staged)
+    }
+
+    /// Stage one RFC-026 fresh-generation fold without advancing Lance HEAD.
+    ///
+    /// This deliberately does not reuse the generic keyed-write gateway. The
+    /// fold is always one exact-`id` upsert, and its one `MergedGeneration`
+    /// marker must travel in the same uncommitted Lance `Update` as every
+    /// accepted row. The caller still owns stream binding, generation-snapshot
+    /// provenance, recovery arm, and graph publication.
+    pub async fn stage_stream_fold(
+        &self,
+        ds: Dataset,
+        table_key: &str,
+        batches: Vec<RecordBatch>,
+        shard_id: ShardId,
+        generation: u64,
+    ) -> Result<StagedWrite> {
+        const CONTEXT: &str = "stage_stream_fold";
+
+        if shard_id.is_nil() {
+            return Err(OmniError::manifest_internal(
+                "stage_stream_fold requires a non-nil MemWAL shard identity",
+            ));
+        }
+        if generation == 0 {
+            return Err(OmniError::manifest_internal(
+                "stage_stream_fold requires a positive MemWAL generation",
+            ));
+        }
+
+        let id_field_id = exact_id_primary_key_field_id(&ds, CONTEXT)?;
+        let mem_wal = ds
+            .mem_wal_index_details()
+            .await
+            .map_err(|error| OmniError::Lance(error.to_string()))?
+            .ok_or_else(|| {
+                OmniError::manifest_internal(
+                    "stage_stream_fold requires an already-enrolled MemWAL index",
+                )
+            })?;
+        if let Some(existing) = mem_wal
+            .merged_generations
+            .iter()
+            .find(|merged| merged.shard_id == shard_id)
+            && existing.generation >= generation
+        {
+            return Err(OmniError::manifest_internal(format!(
+                "stage_stream_fold generation {generation} for shard {shard_id} is not fresh; \
+                 base table already records generation {}",
+                existing.generation
+            )));
+        }
+
+        let mut total_rows = 0_u64;
+        let mut input_bytes = 0_u64;
+        let mut source_ids = HashSet::new();
+        for batch in &batches {
+            total_rows = total_rows
+                .checked_add(u64::try_from(batch.num_rows()).map_err(|_| {
+                    OmniError::manifest_internal("stream fold row count exceeds u64")
+                })?)
+                .ok_or_else(|| OmniError::manifest_internal("stream fold row count overflow"))?;
+            if total_rows > KEYED_WRITE_MAX_ROWS as u64 {
+                return Err(OmniError::resource_limit(
+                    format!("stream fold rows for {table_key}"),
+                    KEYED_WRITE_MAX_ROWS as u64,
+                    total_rows,
+                ));
+            }
+            input_bytes = input_bytes
+                .checked_add(u64::try_from(batch.get_array_memory_size()).map_err(|_| {
+                    OmniError::manifest_internal("stream fold input bytes exceed u64")
+                })?)
+                .ok_or_else(|| OmniError::manifest_internal("stream fold input byte overflow"))?;
+            if input_bytes > KEYED_WRITE_MAX_BYTES {
+                return Err(OmniError::resource_limit(
+                    format!("stream fold bytes for {table_key}"),
+                    KEYED_WRITE_MAX_BYTES,
+                    input_bytes,
+                ));
+            }
+            for id in validate_keyed_write_batch_ids(batch, table_key, CONTEXT)? {
+                if !source_ids.insert(id.clone()) {
+                    return Err(OmniError::key_conflict(table_key, id));
+                }
+            }
+        }
+        if total_rows == 0 {
+            return Err(OmniError::manifest_internal(
+                "stage_stream_fold called without fresh rows",
+            ));
+        }
+
+        let mut materialized_bytes = 0_u64;
+        let mut source_schema: Option<SchemaRef> = None;
+        let mut prepared = Vec::with_capacity(batches.len());
+        for batch in batches {
+            let expected_rows = batch.num_rows();
+            let batch = self.prepare_keyed_write_batch(table_key, batch).await?;
+            if batch.num_rows() != expected_rows {
+                return Err(OmniError::manifest_internal(
+                    "stage_stream_fold blob preparation changed the source row count",
+                ));
+            }
+            if let Some(expected) = &source_schema {
+                if expected.as_ref() != batch.schema().as_ref() {
+                    return Err(OmniError::manifest_internal(
+                        "stage_stream_fold received prepared batches with different schemas",
+                    ));
+                }
+            } else {
+                source_schema = Some(batch.schema());
+            }
+            materialized_bytes = materialized_bytes
+                .checked_add(u64::try_from(batch.get_array_memory_size()).map_err(|_| {
+                    OmniError::manifest_internal("stream fold materialized bytes exceed u64")
+                })?)
+                .ok_or_else(|| {
+                    OmniError::manifest_internal("stream fold materialized byte overflow")
+                })?;
+            if materialized_bytes > KEYED_WRITE_MAX_BYTES {
+                return Err(OmniError::resource_limit(
+                    format!("stream fold bytes for {table_key}"),
+                    KEYED_WRITE_MAX_BYTES,
+                    materialized_bytes,
+                ));
+            }
+            prepared.push(batch);
+        }
+
+        let source_schema = source_schema.ok_or_else(|| {
+            OmniError::manifest_internal("stage_stream_fold has rows but no source schema")
+        })?;
+        let reader = arrow_array::RecordBatchIterator::new(
+            prepared.into_iter().map(Ok).collect::<Vec<_>>(),
+            source_schema,
+        );
+        let stream = lance_datafusion::utils::reader_to_stream(Box::new(reader));
+        let marker = MergedGeneration::new(shard_id, generation);
+        let mut builder = MergeInsertBuilder::try_new(Arc::new(ds), vec!["id".to_string()])
+            .map_err(|error| OmniError::Lance(error.to_string()))?;
+        builder
+            .when_matched(WhenMatched::UpdateAll)
+            .when_not_matched(WhenNotMatched::InsertAll)
+            .use_index(false)
+            .conflict_retries(0)
+            .source_dedupe_behavior(SourceDedupeBehavior::FirstSeen)
+            .mark_generations_as_merged(vec![marker.clone()]);
+        let uncommitted = builder
+            .try_build()
+            .map_err(|error| OmniError::Lance(error.to_string()))?
+            .execute_uncommitted(stream)
+            .await
+            .map_err(|error| OmniError::Lance(error.to_string()))?;
+
+        validate_exact_id_filter(&uncommitted, id_field_id, CONTEXT)?;
+        validate_stream_fold_result(&uncommitted, &marker, total_rows)?;
+        crate::instrumentation::record_stage_merge_insert(total_rows);
+        staged_keyed_merge_result(uncommitted, CONTEXT)
     }
 
     /// Stage the narrow RFC-023 pure-insert fast path.
@@ -3881,6 +4042,50 @@ fn validate_strict_insert_merge_stats(
     if !merge_stats_prove_pure_insert(stats, expected_rows) {
         return Err(OmniError::manifest_internal(format!(
             "{context}: strict insert merge stats were inserted={}, updated={}, deleted={}, skipped={}, attempts={}; expected inserted={expected_rows}, updated=0, deleted=0, skipped=0, attempts=1",
+            stats.num_inserted_rows,
+            stats.num_updated_rows,
+            stats.num_deleted_rows,
+            stats.num_skipped_duplicates,
+            stats.num_attempts,
+        )));
+    }
+    Ok(())
+}
+
+/// Fail closed unless Lance staged every fold row once and embedded exactly
+/// the selected fresh-generation cut in that same transaction.
+fn validate_stream_fold_result(
+    uncommitted: &UncommittedMergeInsert,
+    expected_marker: &MergedGeneration,
+    expected_rows: u64,
+) -> Result<()> {
+    let Operation::Update {
+        merged_generations, ..
+    } = &uncommitted.transaction.operation
+    else {
+        return Err(OmniError::manifest_internal(
+            "stage_stream_fold did not produce a Lance Update transaction",
+        ));
+    };
+    if merged_generations.as_slice() != std::slice::from_ref(expected_marker) {
+        return Err(OmniError::manifest_internal(format!(
+            "stage_stream_fold transaction carried merged generations {merged_generations:?}; \
+             expected exactly {expected_marker:?}"
+        )));
+    }
+
+    let stats = &uncommitted.stats;
+    let affected_rows = stats
+        .num_inserted_rows
+        .checked_add(stats.num_updated_rows)
+        .ok_or_else(|| OmniError::manifest_internal("stream fold affected-row count overflow"))?;
+    if affected_rows != expected_rows
+        || stats.num_deleted_rows != 0
+        || stats.num_skipped_duplicates != 0
+        || stats.num_attempts != 1
+    {
+        return Err(OmniError::manifest_internal(format!(
+            "stage_stream_fold merge stats were inserted={}, updated={}, deleted={}, skipped={}, attempts={}; expected inserted+updated={expected_rows}, deleted=0, skipped=0, attempts=1",
             stats.num_inserted_rows,
             stats.num_updated_rows,
             stats.num_deleted_rows,

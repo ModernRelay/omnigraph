@@ -195,6 +195,54 @@ pub mod names {
     /// the table pointer and OPEN lifecycle land in one manifest CAS.
     pub const STREAM_ENROLLMENT_POST_SHARD_PRE_MANIFEST: &str =
         "stream_enrollment.post_shard_pre_manifest";
+    /// B1 completed every row-effect-free check and reservation but has not
+    /// invoked `ShardWriter::put_no_wait` yet.
+    pub const STREAM_B1_BEFORE_PUT_INVOKE: &str = "stream_b1.before_put_invoke";
+    /// A charged same-key waiter owns shared fold admission immediately before
+    /// it waits for the current input corridor owner to transfer its charge.
+    pub const STREAM_B1_AFTER_SHARED_BEFORE_QUEUE_WAIT: &str =
+        "stream_b1.after_shared_before_queue_wait";
+    /// A put owns its exact Arrow charge, shared admission, and the same-key
+    /// input queue, but has not begun warm validation or a cold writer claim.
+    /// Tests park a cold replay opener here so already-charged waiters exist
+    /// when replay accounting is installed.
+    pub const STREAM_B1_AFTER_INPUT_QUEUE_BEFORE_PREPARE: &str =
+        "stream_b1.after_input_queue_before_prepare";
+    /// A cold put classified the claimed writer, including exact replay
+    /// accounting, before its final graph-authority recheck. Failure here must
+    /// retain the opened disposition through owned retirement.
+    pub const STREAM_B1_AFTER_COLD_CLASSIFY_BEFORE_FINAL_AUTHORITY: &str =
+        "stream_b1.after_cold_classify_before_final_authority";
+    /// `put_no_wait` was invoked, so every later outcome is acknowledgement-
+    /// ambiguous even if the durability watcher has not yet been obtained.
+    pub const STREAM_B1_AFTER_PUT_INVOKE_BEFORE_WATCHER: &str =
+        "stream_b1.after_put_invoke_before_watcher";
+    pub const STREAM_B1_BEFORE_WATCHER_WAIT: &str = "stream_b1.before_watcher_wait";
+    pub const STREAM_B1_AFTER_WATCHER_SUCCESS: &str = "stream_b1.after_watcher_success";
+    /// The fold worker owns exclusive admission and is about to replace the
+    /// one active MemTable with a frozen generation.
+    pub const STREAM_B1_BEFORE_FORCE_SEAL: &str = "stream_b1.before_force_seal";
+    pub const STREAM_B1_AFTER_FORCE_SEAL: &str = "stream_b1.after_force_seal";
+    /// Lance reported the frozen queue drained, before the independent shard-
+    /// manifest and in-memory-ref proof required by RFC-026.
+    pub const STREAM_B1_AFTER_FLUSH_DRAIN_BEFORE_PROOF: &str =
+        "stream_b1.after_flush_drain_before_proof";
+    pub const STREAM_B1_AFTER_POST_DRAIN_PROOF: &str = "stream_b1.after_post_drain_proof";
+    pub const STREAM_B1_BEFORE_ABORT: &str = "stream_b1.before_abort";
+    /// Test-only rendezvous proving the original abort future remains owned by
+    /// the retired registry entry and is never replaced by a second abort.
+    pub const STREAM_B1_ABORT_STALL: &str = "stream_b1.abort_stall";
+    /// A retained abort settled, the registry slot/counters were released,
+    /// and the admission lease was dropped. This is a test-only quiescence
+    /// witness for deterministic replay-open races.
+    pub const STREAM_B1_AFTER_RETIREMENT_RELEASE: &str = "stream_b1.after_retirement_release";
+    /// The immutable generation cut is proven and the worker retired, before
+    /// the schema-v11 recovery intent is armed.
+    pub const STREAM_FOLD_POST_DRAIN_PRE_SIDECAR: &str = "stream_fold.post_drain_pre_sidecar";
+    /// The exact Lance Update (rows plus merged-generation marker) committed,
+    /// before its achieved identity and output are durably confirmed.
+    pub const STREAM_FOLD_POST_TABLE_COMMIT_PRE_CONFIRM: &str =
+        "stream_fold.post_table_commit_pre_confirm";
     /// Reload owns the schema gate and is about to read/publish one contract view.
     pub const SCHEMA_RELOAD_BEFORE_CONTRACT_READ: &str = "schema_reload.before_contract_read";
     /// Injects a retryable `RowLevelCasContention` from `load_publish_state` so a

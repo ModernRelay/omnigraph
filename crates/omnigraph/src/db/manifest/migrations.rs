@@ -65,10 +65,12 @@ use crate::error::{OmniError, Result};
 /// - v7 — RFC-026 adds identity-keyed `stream_state` authority rows carrying
 ///   the physical enrollment, mutable current-HEAD witness, lifecycle, and
 ///   per-shard epoch floor.
+/// - v8 — RFC-026 Phase B1 activates data-bearing MemWAL state with the exact
+///   persisted config-v2 writer profile and recovery-v11 `StreamFold` intents.
 ///
-/// v1–v6 graphs are not served by this binary (see `MIN_SUPPORTED`); the history
+/// v1–v7 graphs are not served by this binary (see `MIN_SUPPORTED`); the history
 /// is kept for provenance and to document what each stamp value meant.
-pub(crate) const INTERNAL_MANIFEST_SCHEMA_VERSION: u32 = 7;
+pub(crate) const INTERNAL_MANIFEST_SCHEMA_VERSION: u32 = 8;
 
 /// The oldest on-disk internal-schema stamp this binary will open. With no
 /// in-place migration, this equals `INTERNAL_MANIFEST_SCHEMA_VERSION`: a graph
@@ -87,7 +89,7 @@ pub(crate) const MIN_SUPPORTED_INTERNAL_SCHEMA_VERSION: u32 = INTERNAL_MANIFEST_
 /// stamped each version (verify with
 /// `git show vX.Y.Z:crates/omnigraph/src/db/manifest/migrations.rs`):
 /// v1 ≤ 0.3.1, v2 0.4.1–0.6.1, v3 0.6.2–0.7.2, v4 0.8.x, v5 0.9.x,
-/// v6 0.10.x, v7 0.11.x.
+/// v6 0.10.x, v7 0.11.x, v8 0.12.x.
 pub(crate) fn release_for_internal_schema_version(stamp: u32) -> &'static str {
     match stamp {
         1 => "0.3.1 or earlier",
@@ -97,7 +99,8 @@ pub(crate) fn release_for_internal_schema_version(stamp: u32) -> &'static str {
         5 => "0.9.x",
         6 => "0.10.x",
         7 => "0.11.x",
-        // Unreachable today (1–7 are mapped; > CURRENT is caught by the ceiling
+        8 => "0.12.x",
+        // Unreachable today (1–8 are mapped; > CURRENT is caught by the ceiling
         // guard before this is consulted). Worded to read naturally after
         // "created by omnigraph " if a future bump ever leaves a gap.
         _ => "an unrecognized older release",
@@ -177,12 +180,12 @@ mod tests {
     use super::*;
 
     /// The guard accepts exactly the single served version and refuses anything
-    /// below the floor or above the ceiling. With `MIN == CURRENT == 7` the live
-    /// range is exactly `[7, 7]`.
+    /// below the floor or above the ceiling. With `MIN == CURRENT == 8` the live
+    /// range is exactly `[8, 8]`.
     #[test]
     fn unsupported_guard_accepts_exactly_the_supported_range() {
-        assert_eq!(INTERNAL_MANIFEST_SCHEMA_VERSION, 7);
-        assert_eq!(MIN_SUPPORTED_INTERNAL_SCHEMA_VERSION, 7);
+        assert_eq!(INTERNAL_MANIFEST_SCHEMA_VERSION, 8);
+        assert_eq!(MIN_SUPPORTED_INTERNAL_SCHEMA_VERSION, 8);
         for stamp in MIN_SUPPORTED_INTERNAL_SCHEMA_VERSION..=INTERNAL_MANIFEST_SCHEMA_VERSION {
             assert!(
                 refuse_if_stamp_unsupported(stamp).is_ok(),
@@ -211,6 +214,7 @@ mod tests {
         assert_eq!(release_for_internal_schema_version(5), "0.9.x");
         assert_eq!(release_for_internal_schema_version(6), "0.10.x");
         assert_eq!(release_for_internal_schema_version(7), "0.11.x");
+        assert_eq!(release_for_internal_schema_version(8), "0.12.x");
         assert_eq!(
             release_for_internal_schema_version(99),
             "an unrecognized older release"

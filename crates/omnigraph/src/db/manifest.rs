@@ -54,15 +54,17 @@ pub(crate) use recovery::{
     HealPendingOutcome, MAX_BRANCH_MERGE_DATA_TRANSACTIONS, RecoveryAuthorityToken,
     RecoveryBranchMergeEffect, RecoveryBranchMergeEffectKind, RecoveryLineageIntent,
     RecoveryManifestDelta, RecoveryMode, RecoverySchemaApplyEffect, RecoverySchemaApplyEffectKind,
-    RecoverySidecar, RecoverySidecarHandle, RecoveryTableUpdateSlot, SidecarKind, SidecarTablePin,
-    SidecarTableRegistration, SidecarTableRename, SidecarTombstone,
-    complete_stream_enrollment_sidecar_v10, confirm_branch_merge_sidecar_v9,
+    RecoverySidecar, RecoverySidecarHandle, RecoveryStreamFoldCut, RecoveryTableUpdateSlot,
+    SidecarKind, SidecarTablePin, SidecarTableRegistration,
+    SidecarTableRename, SidecarTombstone, complete_stream_enrollment_sidecar_v10,
+    complete_stream_fold_sidecar_v11, confirm_branch_merge_sidecar_v9,
     confirm_ensure_indices_sidecar_v9, confirm_occ_sidecar_v9, confirm_schema_apply_sidecar_v9,
     delete_sidecar, ensure_read_only_schema_coherent, finalize_effect_free_occ_sidecar,
+    finalize_effect_free_stream_fold_sidecar_v11,
     heal_pending_sidecars_roll_forward, list_sidecars, new_branch_merge_sidecar_v9,
     new_ensure_indices_sidecar_v9, new_occ_sidecar_v9, new_optimize_sidecar_v9,
-    new_schema_apply_sidecar_v9, new_stream_enrollment_sidecar_v10, recover_manifest_drift,
-    schema_apply_serial_queue_key, write_sidecar,
+    new_schema_apply_sidecar_v9, new_stream_enrollment_sidecar_v10, new_stream_fold_sidecar_v11,
+    recover_manifest_drift, schema_apply_serial_queue_key, write_sidecar,
 };
 pub use state::SubTableEntry;
 #[cfg(test)]

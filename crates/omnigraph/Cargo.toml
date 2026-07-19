@@ -64,7 +64,7 @@ lance-io = { git = "https://github.com/lance-format/lance", rev = "cec0b7dffe2d8
 serial_test = "3"
 proptest = "1"
 syn = { version = "2", features = ["full", "visit"] }
-# benches/scenarios.rs only: wait4/rusage peak-RSS + setrlimit memory caps.
+# benches/scenarios.rs + memwal_stream_cost.rs: wait4/rusage peak-RSS; benchmark memory caps.
 libc = "0.2"
 
 [[bench]]
