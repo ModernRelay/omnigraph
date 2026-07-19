@@ -925,6 +925,124 @@ pub(crate) async fn server_blob_get(
     Ok((status, response_headers, body).into_response())
 }
 
+#[utoipa::path(
+    put,
+    path = "/blob",
+    tag = "data",
+    operation_id = "putBlob",
+    params(BlobQuery),
+    request_body(
+        content = Vec<u8>,
+        description = "Raw blob payload bytes (no base64, no JSON envelope). \
+                       Maximum 32 MiB minus the row's other materialized \
+                       content.",
+        content_type = "application/octet-stream"
+    ),
+    responses(
+        (status = 200, description = "Payload stored; `ETag` carries the committed cell's validator", body = BlobPutOutput),
+        (status = 400, description = "Property is not a Blob, snapshot addressing on a write, or payload over the batch budget", body = ErrorOutput),
+        (status = 401, description = "Unauthorized", body = ErrorOutput),
+        (status = 403, description = "Forbidden", body = ErrorOutput),
+        (status = 404, description = "Unknown type or id — the upload is update-only and never creates a row", body = ErrorOutput),
+        (status = 412, description = "`If-Match` did not match the cell's current validator; `ETag` carries it"),
+        (status = 413, description = "Request body exceeds the 32 MiB ingest limit"),
+        (status = 429, description = "Per-actor workload admission rejected the request; `Retry-After` is set", body = ErrorOutput),
+    ),
+    security(("bearer_token" = [])),
+)]
+/// Replace one row's Blob property with the raw request body.
+///
+/// Update-only: the row must exist (404 otherwise) — create it with
+/// `/load` or `/mutate` first, then attach the payload. `branch` defaults
+/// to `main`; snapshot addressing is read-only and rejected here. An
+/// optional `If-Match` (strong comparison, entity-tag list or `*`) makes
+/// the write conditional on the cell's current validator; without it the
+/// PUT is last-writer-wins. The ETag is table-version-granular, so ANY
+/// write to the same table invalidates held validators — a stale
+/// `If-Match` after an unrelated same-table write is intended
+/// strong-validator behavior. A row whose OTHER blob columns hold
+/// external references has them inlined by this write (the documented
+/// update behavior) and charged against the 32 MiB batch budget.
+pub(crate) async fn server_blob_put(
+    State(state): State<AppState>,
+    Extension(handle): Extension<Arc<GraphHandle>>,
+    actor: Option<Extension<ResolvedActor>>,
+    headers: HeaderMap,
+    Query(query): Query<BlobQuery>,
+    body: Bytes,
+) -> std::result::Result<Response, ApiError> {
+    if query.snapshot.is_some() {
+        return Err(ApiError::bad_request(
+            "blob upload targets a branch; snapshot addressing is read-only",
+        ));
+    }
+    let branch = query.branch.clone().unwrap_or_else(|| "main".to_string());
+    let actor = actor.as_ref().map(|Extension(actor)| actor);
+    authorize_request(
+        actor,
+        handle.policy.as_deref(),
+        PolicyRequest {
+            action: PolicyAction::Change,
+            branch: Some(branch.clone()),
+            target_branch: None,
+        },
+    )?;
+    let actor_arc = actor
+        .map(|actor| Arc::clone(&actor.actor_id))
+        .unwrap_or_else(|| Arc::<str>::from("anonymous"));
+    let _admission = state
+        .workload
+        .try_admit(&actor_arc, body.len() as u64)
+        .map_err(ApiError::from_workload_reject)?;
+    // RFC 9110 If-Match parsing happens HERE, at the transport boundary; the
+    // engine receives only the typed, transport-neutral precondition.
+    let precondition = headers
+        .get(IF_MATCH)
+        .and_then(|value| value.to_str().ok())
+        .map(parse_if_match);
+    let actor_id = actor.map(|actor| actor.actor_id.as_ref());
+    let outcome = handle
+        .engine
+        .write_blob_at_as(
+            &branch,
+            &query.type_name,
+            &query.id,
+            &query.prop,
+            body.to_vec(),
+            precondition,
+            actor_id,
+        )
+        .await
+        .map_err(ApiError::from_omni)?;
+    match outcome {
+        omnigraph::db::BlobWriteOutcome::Written { etag, size } => {
+            let payload = BlobPutOutput {
+                type_name: query.type_name,
+                id: query.id,
+                prop: query.prop,
+                branch,
+                size,
+                etag: etag.clone(),
+                actor_id: actor_id.map(str::to_string),
+            };
+            Ok((
+                StatusCode::OK,
+                [(ETAG, HeaderValue::from_str(&etag).expect("hex etag"))],
+                Json(payload),
+            )
+                .into_response())
+        }
+        omnigraph::db::BlobWriteOutcome::PreconditionFailed { current_etag } => Ok((
+            StatusCode::PRECONDITION_FAILED,
+            [(
+                ETAG,
+                HeaderValue::from_str(&current_etag).expect("hex etag"),
+            )],
+        )
+            .into_response()),
+    }
+}
+
 /// Shared implementation behind `POST /mutate` (canonical) and
 /// `POST /change` (deprecated alias). Returns the bare `ChangeOutput`;
 /// each route handler wraps it (the alias also attaches Deprecation

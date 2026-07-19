@@ -26,7 +26,8 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 use api::{
-    BlobQuery, BranchCreateOutput, BranchCreateRequest, BranchDeleteOutput, BranchListOutput, blob_etag,
+    BlobPutOutput, BlobQuery, BranchCreateOutput, BranchCreateRequest, BranchDeleteOutput,
+    BranchListOutput, blob_etag, parse_if_match,
     BranchMergeOutput, BranchMergeRequest, ChangeOutput, ChangeRequest, CommitListOutput,
     CommitListQuery, ErrorCode, ErrorOutput, ExportRequest, GraphInfo, GraphListResponse,
     HealthOutput, IngestOutput, IngestRequest, InvokeStoredQueryRequest, InvokeStoredQueryResponse,
@@ -40,7 +41,7 @@ use axum::extract::DefaultBodyLimit;
 use axum::extract::{Extension, OriginalUri, Path, Query, Request, State};
 use axum::http::header::{
     ACCEPT_RANGES, AUTHORIZATION, CONTENT_LENGTH, CONTENT_RANGE, CONTENT_TYPE, ETAG, HeaderName,
-    HeaderValue, IF_NONE_MATCH, IF_RANGE, LOCATION, RANGE,
+    HeaderValue, IF_MATCH, IF_NONE_MATCH, IF_RANGE, LOCATION, RANGE,
 };
 use axum::http::{HeaderMap, Method, StatusCode};
 use axum::middleware::{self, Next};
@@ -99,6 +100,7 @@ fn hash_bearer_token(token: &str) -> BearerTokenHash {
         handlers::server_query,
         handlers::server_export,
         handlers::server_blob_get,
+        handlers::server_blob_put,
         #[allow(deprecated)] handlers::server_change,
         handlers::server_mutate,
         handlers::server_list_queries,
@@ -1115,7 +1117,15 @@ pub fn build_app(state: AppState) -> Router {
     //      `{graph_id}` in the URI path).
     let per_graph_protected = Router::new()
         .route("/snapshot", get(server_snapshot))
-        .route("/blob", get(server_blob_get))
+        .route(
+            "/blob",
+            get(server_blob_get)
+                .put(server_blob_put)
+                // Raw payload bytes on PUT: the same 32 MiB ceiling the JSON
+                // load routes carry, but with zero base64/envelope overhead.
+                // GET/HEAD carry no body, so the raised limit is inert there.
+                .layer(DefaultBodyLimit::max(INGEST_REQUEST_BODY_LIMIT_BYTES)),
+        )
         .route("/export", post(server_export))
         // /read and /change are kept indefinitely for back-compat;
         // their handlers carry #[deprecated] so the OpenAPI operation is

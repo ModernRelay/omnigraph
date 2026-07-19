@@ -569,6 +569,23 @@ pub struct BlobQuery {
     pub snapshot: Option<String>,
 }
 
+/// Response body for `PUT /blob` (raw-bytes blob upload). Also printed
+/// verbatim by the CLI's `blob put` so both arms emit the identical object.
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+pub struct BlobPutOutput {
+    #[serde(rename = "type")]
+    pub type_name: String,
+    pub id: String,
+    pub prop: String,
+    pub branch: String,
+    /// Stored payload size in bytes.
+    pub size: u64,
+    /// Strong quoted validator of the committed cell — identical to what a
+    /// follow-up `GET /blob` serves.
+    pub etag: String,
+    pub actor_id: Option<String>,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
 pub struct HealthOutput {
     pub status: String,

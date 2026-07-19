@@ -2091,3 +2091,158 @@ async fn blob_route_rejects_branch_and_snapshot() {
         error.error
     );
 }
+
+async fn blob_put(
+    app: &axum::Router,
+    uri: &str,
+    body: Vec<u8>,
+    extra: &[(&str, &str)],
+) -> axum::response::Response {
+    let mut builder = Request::builder().uri(g(uri)).method(Method::PUT);
+    for (name, value) in extra {
+        builder = builder.header(*name, *value);
+    }
+    app.clone()
+        .oneshot(builder.body(Body::from(body)).unwrap())
+        .await
+        .unwrap()
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn blob_route_put_round_trips_raw_bytes() {
+    let (_temp, app) = blob_app().await;
+    let response = blob_put(
+        &app,
+        "/blob?type=Document&id=readme&prop=content",
+        b"uploaded raw".to_vec(),
+        &[],
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::OK);
+    let header_etag = response
+        .headers()
+        .get("etag")
+        .unwrap()
+        .to_str()
+        .unwrap()
+        .to_string();
+    let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+    let payload: Value = serde_json::from_slice(&body).unwrap();
+    assert_eq!(payload["type"], "Document");
+    assert_eq!(payload["id"], "readme");
+    assert_eq!(payload["prop"], "content");
+    assert_eq!(payload["branch"], "main");
+    assert_eq!(payload["size"], b"uploaded raw".len() as u64);
+    assert_eq!(payload["etag"].as_str().unwrap(), header_etag);
+
+    // A follow-up GET serves the uploaded bytes under the SAME validator.
+    let get = blob_get(&app, "/blob?type=Document&id=readme&prop=content", &[]).await;
+    assert_eq!(get.status(), StatusCode::OK);
+    assert_eq!(get.headers().get("etag").unwrap().to_str().unwrap(), header_etag);
+    let bytes = to_bytes(get.into_body(), usize::MAX).await.unwrap();
+    assert_eq!(&bytes[..], b"uploaded raw");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn blob_route_put_is_update_only() {
+    let (_temp, app) = blob_app().await;
+    let response = blob_put(
+        &app,
+        "/blob?type=Document&id=absent&prop=content",
+        b"x".to_vec(),
+        &[],
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::NOT_FOUND);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn blob_route_put_if_match_flow() {
+    let (_temp, app) = blob_app().await;
+    let head = blob_get(&app, "/blob?type=Document&id=readme&prop=content", &[]).await;
+    let fresh = head
+        .headers()
+        .get("etag")
+        .unwrap()
+        .to_str()
+        .unwrap()
+        .to_string();
+
+    // Fresh validator (inside a list, per RFC 9110) → the write lands.
+    let listed = format!("\"stale\", {fresh}");
+    let response = blob_put(
+        &app,
+        "/blob?type=Document&id=readme&prop=content",
+        b"v2".to_vec(),
+        &[("if-match", listed.as_str())],
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::OK);
+    let v2_etag = response
+        .headers()
+        .get("etag")
+        .unwrap()
+        .to_str()
+        .unwrap()
+        .to_string();
+    assert_ne!(v2_etag, fresh);
+
+    // The now-stale validator → 412 carrying the current one; cell untouched.
+    let response = blob_put(
+        &app,
+        "/blob?type=Document&id=readme&prop=content",
+        b"must not land".to_vec(),
+        &[("if-match", fresh.as_str())],
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::PRECONDITION_FAILED);
+    assert_eq!(
+        response.headers().get("etag").unwrap().to_str().unwrap(),
+        v2_etag,
+        "412 must report the current validator"
+    );
+    let get = blob_get(&app, "/blob?type=Document&id=readme&prop=content", &[]).await;
+    let bytes = to_bytes(get.into_body(), usize::MAX).await.unwrap();
+    assert_eq!(&bytes[..], b"v2");
+
+    // `*` succeeds against an existing row.
+    let response = blob_put(
+        &app,
+        "/blob?type=Document&id=readme&prop=content",
+        b"v3".to_vec(),
+        &[("if-match", "*")],
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::OK);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn blob_route_put_rejects_snapshot_addressing() {
+    let (_temp, app) = blob_app().await;
+    let response = blob_put(
+        &app,
+        "/blob?type=Document&id=readme&prop=content&snapshot=someid",
+        b"x".to_vec(),
+        &[],
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn blob_route_put_oversize_body_is_rejected() {
+    let (_temp, app) = blob_app().await;
+    let oversize = vec![0_u8; 32 * 1024 * 1024 + 1];
+    let response = blob_put(
+        &app,
+        "/blob?type=Document&id=readme&prop=content",
+        oversize,
+        &[],
+    )
+    .await;
+    assert_eq!(
+        response.status(),
+        StatusCode::PAYLOAD_TOO_LARGE,
+        "the ingest body limit must reject before the engine sees the payload"
+    );
+}

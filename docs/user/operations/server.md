@@ -53,6 +53,7 @@ graph id from the cluster's applied revision:
 | GET | `/openapi.json` | none | — (strips security if auth disabled; emits the nested cluster paths with `cluster_` operation-id prefix) |
 | GET | `/graphs/{id}/snapshot?branch=` | bearer + `read` | snapshot of branch |
 | GET/HEAD | `/graphs/{id}/blob?type=&id=&prop=[&branch=\|&snapshot=]` | bearer + `read` | stream one row's Blob property (see "Blob content" below) |
+| PUT | `/graphs/{id}/blob?type=&id=&prop=[&branch=]` | bearer + `change` | upload raw bytes into one existing row's Blob cell (see "Blob upload" below) |
 | POST | `/graphs/{id}/query` | bearer + `read` | inline read query (canonical; clean field names `query`/`name`; mutations → 400) |
 | POST | `/graphs/{id}/read` | bearer + `read` | **deprecated** alias of `/query` (legacy field names `query_source`/`query_name`, byte-stable response; carries `Deprecation: true` + `Link: <query>; rel="successor-version"`) |
 | POST | `/graphs/{id}/export` | bearer + `export` | NDJSON stream |
@@ -183,8 +184,9 @@ omitting both reads `main` — the same target semantics as `/read`. Contract:
   `302 Found` with the stored absolute URI in `Location` for both `GET` and
   `HEAD`. The server never resolves, proxies, or validates the external
   location at read time — the reference itself is the answer. External blob
-  *sizes* are recorded once at load time (the load fails loudly if the
-  referenced object is unreadable at ingest).
+  sizes are unknown by design (the descriptor records none; recording them
+  would perturb the table's blob schema), but the load still fails loudly if
+  the referenced object is unreadable at ingest.
 - **`Content-Type`** is sniffed from at most the first 512 bytes (`HEAD` and
   `GET` sniff identically, so their headers agree) and falls back to
   `application/octet-stream`. Lance stores no media type; treat the sniff as
@@ -192,6 +194,37 @@ omitting both reads `main` — the same target semantics as `/read`. Contract:
 - **Errors**: unknown type, unknown id, and a null blob cell are `404`; a
   non-Blob property is `400`. Read-only and not admission-gated, like every
   read endpoint.
+
+### Blob upload (`PUT /graphs/{id}/blob`)
+
+`PUT /graphs/{id}/blob?type=<NodeType>&id=<key>&prop=<blob property>[&branch=<branch>]`
+with the **raw payload bytes as the request body** (no base64, no JSON
+envelope) replaces that one cell as a single atomic graph commit through the
+same write path as `/mutate`. Requires bearer + `change`; admission-gated
+like every write endpoint (`429` + `Retry-After`). Contract:
+
+- **Update-only.** The row must exist — a missing type or id is `404`, never
+  an implicit insert. Create the row (metadata) with `/load` or `/mutate`
+  first, then attach the payload. `branch` defaults to `main`; `snapshot`
+  addressing is read-only and rejected with `400`.
+- **Response**: `200` with an `ETag` header carrying the committed cell's
+  validator (identical to what a follow-up `GET` serves) and a JSON body
+  `{type, id, prop, branch, size, etag, actor_id}`.
+- **Conditional writes**: an optional `If-Match` header (entity-tag list or
+  `*`, strong comparison — a weak `W/` tag never matches) makes the write
+  conditional on the cell's current validator; a mismatch answers `412` with
+  the current validator in `ETag` and nothing written. Without `If-Match`
+  the PUT is last-writer-wins. The ETag is **table-version-granular**: any
+  write to the same table invalidates every held validator, so a stale
+  `If-Match` after an unrelated same-table write is intended
+  strong-validator behavior, not a bug. `If-Match: *` requires only that
+  the target row exists (a currently-null cell accepts — attaching first
+  content is the primary use).
+- **Limits**: the request body is capped at 32 MiB; the effective maximum
+  payload is 32 MiB minus the row's other materialized content, refused with
+  a typed error. A row whose OTHER blob columns hold external references has
+  them inlined by this write (the same documented behavior as any update)
+  and charged against that budget.
 
 ## Error model
 

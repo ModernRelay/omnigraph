@@ -205,6 +205,165 @@
             "bearer_token": []
           }
         ]
+      },
+      "put": {
+        "tags": [
+          "data"
+        ],
+        "summary": "Replace one row's Blob property with the raw request body.",
+        "description": "Update-only: the row must exist (404 otherwise) — create it with\n`/load` or `/mutate` first, then attach the payload. `branch` defaults\nto `main`; snapshot addressing is read-only and rejected here. An\noptional `If-Match` (strong comparison, entity-tag list or `*`) makes\nthe write conditional on the cell's current validator; without it the\nPUT is last-writer-wins. The ETag is table-version-granular, so ANY\nwrite to the same table invalidates held validators — a stale\n`If-Match` after an unrelated same-table write is intended\nstrong-validator behavior. A row whose OTHER blob columns hold\nexternal references has them inlined by this write (the documented\nupdate behavior) and charged against the 32 MiB batch budget.",
+        "operationId": "cluster_putBlob",
+        "parameters": [
+          {
+            "name": "graph_id",
+            "in": "path",
+            "description": "Graph id to route the request to.",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "type",
+            "in": "query",
+            "description": "Node type name.",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "id",
+            "in": "query",
+            "description": "Logical row id (the `@key` value).",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "prop",
+            "in": "query",
+            "description": "Blob property name.",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "branch",
+            "in": "query",
+            "description": "Branch to read from. Mutually exclusive with `snapshot`. Defaults to `main`.",
+            "required": false,
+            "schema": {
+              "type": [
+                "string",
+                "null"
+              ]
+            }
+          },
+          {
+            "name": "snapshot",
+            "in": "query",
+            "description": "Snapshot id to read from. Mutually exclusive with `branch`.",
+            "required": false,
+            "schema": {
+              "type": [
+                "string",
+                "null"
+              ]
+            }
+          }
+        ],
+        "requestBody": {
+          "description": "Raw blob payload bytes (no base64, no JSON envelope). Maximum 32 MiB minus the row's other materialized content.",
+          "content": {
+            "application/octet-stream": {
+              "schema": {
+                "type": "array",
+                "items": {
+                  "type": "integer",
+                  "format": "int32",
+                  "minimum": 0
+                }
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "description": "Payload stored; `ETag` carries the committed cell's validator",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/BlobPutOutput"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Property is not a Blob, snapshot addressing on a write, or payload over the batch budget",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorOutput"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Unauthorized",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorOutput"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "Forbidden",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorOutput"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "Unknown type or id — the upload is update-only and never creates a row",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorOutput"
+                }
+              }
+            }
+          },
+          "412": {
+            "description": "`If-Match` did not match the cell's current validator; `ETag` carries it"
+          },
+          "413": {
+            "description": "Request body exceeds the 32 MiB ingest limit"
+          },
+          "429": {
+            "description": "Per-actor workload admission rejected the request; `Retry-After` is set",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorOutput"
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "bearer_token": []
+          }
+        ]
       }
     },
     "/graphs/{graph_id}/branches": {
@@ -1898,6 +2057,48 @@
   },
   "components": {
     "schemas": {
+      "BlobPutOutput": {
+        "type": "object",
+        "description": "Response body for `PUT /blob` (raw-bytes blob upload). Also printed\nverbatim by the CLI's `blob put` so both arms emit the identical object.",
+        "required": [
+          "type",
+          "id",
+          "prop",
+          "branch",
+          "size",
+          "etag"
+        ],
+        "properties": {
+          "actor_id": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "branch": {
+            "type": "string"
+          },
+          "etag": {
+            "type": "string",
+            "description": "Strong quoted validator of the committed cell — identical to what a\nfollow-up `GET /blob` serves."
+          },
+          "id": {
+            "type": "string"
+          },
+          "prop": {
+            "type": "string"
+          },
+          "size": {
+            "type": "integer",
+            "format": "int64",
+            "description": "Stored payload size in bytes.",
+            "minimum": 0
+          },
+          "type": {
+            "type": "string"
+          }
+        }
+      },
       "BranchCreateOutput": {
         "type": "object",
         "required": [
