@@ -152,6 +152,7 @@ pub(crate) fn command_label(cmd: &Command) -> &'static str {
         Command::Branch { .. } => "branch",
         Command::Blob { command } => match command {
             BlobCommand::Get { .. } => "blob get",
+            BlobCommand::Put { .. } => "blob put",
             BlobCommand::Stat { .. } => "blob stat",
         },
         Command::Schema { command } => match command {

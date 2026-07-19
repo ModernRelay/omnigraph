@@ -714,6 +714,47 @@ async fn main() -> Result<()> {
                     }
                 }
             }
+            BlobCommand::Put {
+                type_name,
+                id,
+                prop,
+                uri,
+                branch,
+                file,
+                if_match,
+                json,
+            } => {
+                let client = client::GraphClient::resolve_with_policy(
+                    cli.server.as_deref(),
+                    cli.graph.as_deref(),
+                    uri,
+                    cli.as_actor.as_deref(),
+                    cli.profile.as_deref(),
+                    cli.store.as_deref(),
+                )
+                .await?;
+                let branch = resolve_branch(branch, None, "main");
+                let bytes = match &file {
+                    Some(path) => std::fs::read(path)?,
+                    None => {
+                        let mut buffer = Vec::new();
+                        std::io::Read::read_to_end(&mut std::io::stdin().lock(), &mut buffer)?;
+                        buffer
+                    }
+                };
+                let output = client
+                    .blob_put(&branch, &type_name, &id, &prop, bytes, if_match.as_deref())
+                    .await?;
+                if json {
+                    print_json(&output)?;
+                } else {
+                    println!(
+                        "uploaded {} bytes to {} {} {} on {}",
+                        output.size, output.type_name, output.id, output.prop, output.branch
+                    );
+                    println!("etag: {}", output.etag);
+                }
+            }
             BlobCommand::Stat {
                 type_name,
                 id,

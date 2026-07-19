@@ -27,7 +27,7 @@ use color_eyre::Result;
 use color_eyre::eyre::bail;
 use omnigraph::db::{BlobContent, Omnigraph, ReadTarget};
 use omnigraph_api_types::{
-    BranchCreateOutput, BranchCreateRequest, BranchDeleteOutput, BranchListOutput,
+    BlobPutOutput, BranchCreateOutput, BranchCreateRequest, BranchDeleteOutput, BranchListOutput,
     BranchMergeOutput, BranchMergeRequest, ChangeOutput, CommitListOutput, CommitOutput,
     ErrorOutput, ExportRequest, GraphListResponse, IngestOutput, IngestRequest,
     InvokeStoredQueryRequest, ReadOutput,
@@ -122,6 +122,15 @@ fn blob_target_param(target: &ReadTarget) -> (&'static str, String) {
         ReadTarget::Branch(branch) => ("branch", branch.clone()),
         ReadTarget::Snapshot(snapshot) => ("snapshot", snapshot.as_str().to_string()),
     }
+}
+
+/// The one typed stale-precondition error BOTH blob-put arms return, so the
+/// remote 412 and the embedded typed outcome are indistinguishable at the
+/// CLI surface (pinned by the parity matrix).
+fn blob_precondition_error(current_etag: &str) -> color_eyre::Report {
+    color_eyre::eyre::eyre!(
+        "blob precondition failed: If-Match did not match the cell's current validator {current_etag}"
+    )
 }
 
 /// The `Location` of a `302` blob answer. A redirect without a location is
@@ -1045,6 +1054,93 @@ impl GraphClient {
                         ..base()
                     },
                 })
+            }
+        }
+    }
+
+    /// `blob put` — upload raw payload bytes into one existing row's Blob
+    /// cell. Update-only; an optional `--if-match` validator (raw RFC 9110
+    /// header form, parsed HERE at the boundary) makes the write conditional.
+    /// Both arms surface a stale precondition through the SAME typed error
+    /// text carrying the current validator, so exit codes and messages hold
+    /// parity (remote derives it from the 412's ETag header, embedded from
+    /// the engine's typed outcome).
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) async fn blob_put(
+        &self,
+        branch: &str,
+        type_name: &str,
+        id: &str,
+        prop: &str,
+        bytes: Vec<u8>,
+        if_match: Option<&str>,
+    ) -> Result<BlobPutOutput> {
+        match self {
+            GraphClient::Remote {
+                http,
+                base_url,
+                token,
+            } => {
+                let url = remote_url(
+                    base_url,
+                    &["blob"],
+                    &[
+                        ("type", type_name),
+                        ("id", id),
+                        ("prop", prop),
+                        ("branch", branch),
+                    ],
+                )?;
+                let mut request = apply_bearer_token(http.request(Method::PUT, url), token.as_deref())
+                    .body(bytes);
+                if let Some(validator) = if_match {
+                    request = request.header(reqwest::header::IF_MATCH, validator);
+                }
+                let response = request.send().await?;
+                let status = response.status();
+                if status == reqwest::StatusCode::PRECONDITION_FAILED {
+                    let current = response
+                        .headers()
+                        .get(reqwest::header::ETAG)
+                        .and_then(|value| value.to_str().ok())
+                        .unwrap_or("<unknown>")
+                        .to_string();
+                    return Err(blob_precondition_error(&current));
+                }
+                if !status.is_success() {
+                    let text = response.text().await?;
+                    if let Ok(error) = serde_json::from_str::<ErrorOutput>(&text) {
+                        bail!(error.error);
+                    }
+                    bail!("server returned {}: {}", status, text);
+                }
+                Ok(response.json::<BlobPutOutput>().await?)
+            }
+            GraphClient::Embedded { uri, actor } => {
+                let db = Self::open_embedded(uri).await?;
+                let actor = actor.as_deref();
+                let precondition = if_match.map(omnigraph_api_types::parse_if_match);
+                let size_hint = bytes.len() as u64;
+                let outcome = db
+                    .write_blob_at_as(branch, type_name, id, prop, bytes, precondition, actor)
+                    .await?;
+                match outcome {
+                    omnigraph::db::BlobWriteOutcome::Written { etag, size } => {
+                        debug_assert_eq!(size, size_hint);
+                        Ok(BlobPutOutput {
+                            type_name: type_name.to_string(),
+                            id: id.to_string(),
+                            prop: prop.to_string(),
+                            branch: branch.to_string(),
+                            size,
+                            etag,
+                            actor_id: actor.map(String::from),
+                        })
+                    }
+                    omnigraph::db::BlobWriteOutcome::PreconditionFailed { current_etag } => {
+                        Err(blob_precondition_error(&current_etag))
+                    }
+                }
             }
         }
     }

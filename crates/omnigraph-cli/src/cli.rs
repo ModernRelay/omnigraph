@@ -15,7 +15,7 @@ pub(crate) const DEFAULT_BEARER_TOKEN_ENV: &str = "OMNIGRAPH_BEARER_TOKEN";
 #[command(after_help = "\
 COMMANDS BY CAPABILITY:\n  \
 any — run against a graph, served (--server / --profile) or embedded (--store / a \
-URI): query, mutate, load, branch, blob get/stat, snapshot, export, commit, schema show/apply.\n  \
+URI): query, mutate, load, branch, blob get/put/stat, snapshot, export, commit, schema show/apply.\n  \
 served — require a server: graphs.\n  \
 direct — direct storage access; reject --server (init, optimize, repair, cleanup, \
 schema plan, lint).\n  \
@@ -513,6 +513,31 @@ pub(crate) enum BlobCommand {
         /// Number of bytes to read (from --offset, default 0)
         #[arg(long)]
         length: Option<u64>,
+    },
+    /// Upload raw bytes into one existing row's Blob property
+    Put {
+        /// Node type name
+        #[arg(value_name = "TYPE")]
+        type_name: String,
+        /// Logical row id (the @key value)
+        id: String,
+        /// Blob property name
+        prop: String,
+        /// Graph URI
+        #[arg(long)]
+        uri: Option<String>,
+        /// Branch to write to (defaults to main)
+        #[arg(long)]
+        branch: Option<String>,
+        /// Read the payload from PATH instead of stdin
+        #[arg(long, value_name = "PATH")]
+        file: Option<PathBuf>,
+        /// Conditional write: entity-tag list or `*` (RFC 9110 If-Match,
+        /// strong comparison); a stale validator fails with the current one
+        #[arg(long, value_name = "ETAG")]
+        if_match: Option<String>,
+        #[arg(long)]
+        json: bool,
     },
     /// Show one blob cell's metadata (kind, size, etag, external uri)
     Stat {

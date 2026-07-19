@@ -2561,3 +2561,89 @@ fn blob_branch_and_snapshot_conflict() {
         "clap must reject the exclusive pair: {stderr}"
     );
 }
+
+#[test]
+fn blob_put_uploads_file_and_round_trips() {
+    let (temp, graph, _) = blob_graph();
+    let payload_path = temp.path().join("payload.bin");
+    fs::write(&payload_path, b"uploaded via file").unwrap();
+
+    let output = output_success(
+        blob_args(&mut cli(), "put", "readme", &graph)
+            .arg("--file")
+            .arg(&payload_path)
+            .arg("--json"),
+    );
+    let payload = parse_stdout_json(&output);
+    assert_eq!(payload["type"], "Document");
+    assert_eq!(payload["id"], "readme");
+    assert_eq!(payload["prop"], "content");
+    assert_eq!(payload["branch"], "main");
+    assert_eq!(payload["size"], b"uploaded via file".len() as u64);
+    let put_etag = payload["etag"].as_str().unwrap().to_string();
+
+    let get = output_success(blob_args(&mut cli(), "get", "readme", &graph));
+    assert_eq!(&get.stdout[..], b"uploaded via file");
+    // The stat validator equals the one the put reported.
+    let stat = output_success(blob_args(&mut cli(), "stat", "readme", &graph).arg("--json"));
+    assert_eq!(parse_stdout_json(&stat)["etag"].as_str().unwrap(), put_etag);
+}
+
+#[test]
+fn blob_put_uploads_from_stdin() {
+    let (_temp, graph, _) = blob_graph();
+    let output = output_success(
+        blob_args(&mut cli(), "put", "readme", &graph).write_stdin("streamed from stdin"),
+    );
+    assert!(String::from_utf8_lossy(&output.stdout).contains("uploaded 19 bytes"));
+    let get = output_success(blob_args(&mut cli(), "get", "readme", &graph));
+    assert_eq!(&get.stdout[..], b"streamed from stdin");
+}
+
+#[test]
+fn blob_put_is_update_only() {
+    let (_temp, graph, _) = blob_graph();
+    let output = output_failure(blob_args(&mut cli(), "put", "absent", &graph).write_stdin("x"));
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("no Document with id 'absent'"),
+        "update-only put must fail a missing row: {stderr}"
+    );
+}
+
+#[test]
+fn blob_put_if_match_mismatch_fails_with_current_validator() {
+    let (_temp, graph, _) = blob_graph();
+    let stat = output_success(blob_args(&mut cli(), "stat", "readme", &graph).arg("--json"));
+    let fresh = parse_stdout_json(&stat)["etag"].as_str().unwrap().to_string();
+
+    // Fresh validator lands.
+    output_success(
+        blob_args(&mut cli(), "put", "readme", &graph)
+            .arg("--if-match")
+            .arg(&fresh)
+            .write_stdin("v2"),
+    );
+
+    // The now-stale validator fails, naming the current one.
+    let current = parse_stdout_json(&output_success(
+        blob_args(&mut cli(), "stat", "readme", &graph).arg("--json"),
+    ))["etag"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    let output = output_failure(
+        blob_args(&mut cli(), "put", "readme", &graph)
+            .arg("--if-match")
+            .arg(&fresh)
+            .write_stdin("must not land"),
+    );
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains("blob precondition failed"), "{stderr}");
+    assert!(
+        stderr.contains(&current),
+        "the error must carry the current validator: {stderr}"
+    );
+    let get = output_success(blob_args(&mut cli(), "get", "readme", &graph));
+    assert_eq!(&get.stdout[..], b"v2", "a failed precondition must write nothing");
+}
