@@ -292,6 +292,9 @@ fn pk_full_row(dataset: &Dataset, id: &str, value: i32) -> RecordBatch {
     .unwrap()
 }
 
+/// Append one row using `fresh_pk_dataset`'s three-column PK schema. Its nullable
+/// `note` column distinguishes this from the two-column `append_guard_row`, while
+/// V2_2 and stable row IDs preserve the production-table write shape.
 async fn append_pk_guard_row(dataset: &mut Dataset, id: &str, value: i32) {
     let batch = pk_full_row(dataset, id, value);
     let schema = batch.schema();
@@ -1347,6 +1350,8 @@ async fn cleanup_old_versions_does_not_reclaim_mem_wal_objects() {
 
     let object_store = dataset.object_store(None).await.unwrap();
     let mem_wal_root = dataset.branch_location().path.join("_mem_wal");
+    // Generic cleanup owns none of this state. Compare bytes as well as paths so
+    // an unexpected rewrite fails just as loudly as object creation or deletion.
     let inventory = || async {
         let objects = object_store
             .inner
@@ -1403,7 +1408,7 @@ async fn cleanup_old_versions_does_not_reclaim_mem_wal_objects() {
     assert_eq!(
         inventory().await,
         before,
-        "generic cleanup unexpectedly changed the MemWAL namespace; re-audit RFC-026 reclamation"
+        "generic cleanup created, deleted, or rewrote MemWAL state; re-audit RFC-026 reclamation"
     );
 }
 
