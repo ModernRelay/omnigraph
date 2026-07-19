@@ -1,24 +1,30 @@
 # WAL Thinking
 
-Working notes, updated 2026-07-18. Plain-language grounding for the WAL/streaming
+Working notes, updated 2026-07-19. Plain-language grounding for the WAL/streaming
 discussion ([RFC-018](docs/rfcs/0018-ingest-wal.md) →
 [RFC-026](docs/rfcs/0026-memwal-streaming-ingest.md)). Three parts: the
 contract difference between an interactive graph commit and durable stream
 admission, the expected performance shape and evidence still required, and the
 build inventory.
 
-Current boundary: RFC-026 Phase A is built, but streaming is not. Internal
-schema v7 can recover and publish one exact empty main-only MemWAL enrollment,
-persists its lifecycle authority, excludes ordinary local table/schema/
-maintenance/repair/recovery effects for any lifecycle row, and refuses partial
-format state. Native branch controls alone may proceed at `SEALED`, because
-they do not move table HEAD. The enrollment method
-is crate-private and exists only behind a feature-gated fault-injection seam.
-There is still no `@stream`, public enrollment, WAL row put, durability
-acknowledgement, fold, drain/resume operation, or fresh read.
-Phase B1 is the next private proof slice; Phase B2 is the later public strict
-surface. B1 is planned as internal schema v8, stream-config v2, and
-recovery-v11 `StreamFold`; v7/config-v1 is not adopted in place.
+Current boundary: RFC-026 Phase A and the evidence-green Phase-B1 private core
+are built, but public streaming is not. Current internal schema v8 preserves
+Phase A's historical v7 foundation: exact empty main-only MemWAL enrollment recovery,
+identity-keyed lifecycle authority, exclusion of ordinary local table/schema/
+maintenance/repair/recovery effects for a lifecycle-bound table, and
+partial-format refusal. Native branch controls alone may proceed at `SEALED`,
+because they do not move table HEAD.
+
+V8 adds stream-config v2 and recovery-v11 `StreamFold`. One feature-gated,
+doc-hidden engine seam can privately admit an already-normalized physical
+batch, acknowledge only its successful Lance durability watcher, route replay
+or one flushed-unmerged generation fold-only, and publish one exact fold at the
+`__manifest` CAS. It prevents MemTable rollover and retires the writer before a
+successor generation can put. This is implementation/evidence machinery, not a
+product surface. There is still no `@stream`, public enrollment or row
+admission, SDK/HTTP/CLI/OpenAPI route, operator drain/resume workflow, or fresh
+read. RFC-026 remains Draft; Phase B2 is the later public strict activation,
+and v7/config-v1 is never adopted in place.
 
 ---
 
@@ -76,8 +82,9 @@ to that floor.
 
 ### Stream admission — durable before graph-visible
 
-This is the Phase B1 private target contract, not an executable path in the
-current binary.
+The crate-private core is always compiled, but this contract is executable only
+through the feature-gated Phase-B1 engine seam. It is evidence in the current
+binary, not a production or public caller path.
 
 One admitted call—possibly containing several rows—follows a different
 contract:
@@ -85,10 +92,14 @@ contract:
 ```text
 one submitted stream batch:
 
-  1. validate shape, types, required/default fields, enum/range/check rules,
-     reserved fields, and stream mode
-  2. route it to the active owner of the table's MemWAL shard
-  3. normalize it into exactly one bounded Lance WAL batch and submit one put
+  1. validate the already-normalized physical shape, types, required/default
+     fields, enum/range/check rules, reserved fields, stream mode, and exact
+     post-tombstone size preflight
+  2. resolve recovery/authority and route it to the active owner of the table's
+     MemWAL shard
+  3. recompute and reserve the exact stored representation, inject required
+     internal `_tombstone=false`, and submit exactly one bounded Lance WAL
+     batch/put
   4. wait for that put's durability watcher and acknowledge the caller
 
   after acknowledgement:
@@ -99,8 +110,15 @@ one submitted stream batch:
   ✗ no graph commit/time-travel point exists yet
 ```
 
-The acknowledgement says only that the submitted batch crossed Lance's
-durability watcher. The watcher returns success/failure, not a durable WAL row
+Resource accounting is intentionally two-pass. Cheap raw bounds reject an
+obviously over-cap batch, and raw-fit input receives exact post-tombstone
+validation before recovery I/O. After the recovery/authority prelude, that
+exact charge is recomputed and reserved before the caller can wait in the
+same-key queue, acquire shared admission, detach, or cold-claim a writer.
+
+The acknowledgement says only that the submitted batch crossed its Lance
+durability watcher. That successful watcher is the only acknowledgement
+authority. The watcher returns success/failure, not a durable WAL row
 coordinate. Lance's returned batch positions are active-MemTable positions
 that reset after rollover, and its next-WAL-position statistic is a mutable
 hint, so neither may appear as a receipt. If invocation may have had an effect
@@ -126,8 +144,9 @@ horizontal writer scaling comes later from deterministic key-based sharding.
 
 ### Fold — deferred graph publication, paid once per batch
 
-This is also future work. Phase A establishes the binding, recovery, and
-exclusion preconditions a fold must consume; it does not merge a generation.
+The strict one-generation fold is implemented privately in B1. Phase A
+established the binding, recovery, and exclusion preconditions it consumes;
+Phase B2 still owns the public fold and operator lifecycle.
 
 B1 deliberately chooses a smaller contract: one writer owns exactly one
 generation whose total admitted input is at most 8,192 rows and 32 MiB. It
@@ -138,16 +157,19 @@ or one already-flushed unmerged generation are fold-only. Pinned RC.1 does not
 mark replayed BatchStore entries WAL-flushed, so the exclusive fold path first
 marks the exact authoritatively replayed prefix durable through the public
 BatchStore watermark before sealing; otherwise replay/reseal can multiply WAL
-entries across crashes. Broader trigger policy may later use rows, bytes, maximum lag,
-resource pressure, or an operator request. The full target fold is:
+entries across crashes. Broader trigger policy may later use rows, bytes,
+maximum lag, resource pressure, or an operator request. The full target fold is:
 
 ```text
 a fold:
 
   capture one exact stream binding and generation cut
     → run graph-dependent checks
-       (referential integrity, cardinality, cross-version uniqueness,
-        embeddings, and other base-dependent work)
+       (referential integrity, cardinality, cross-version uniqueness, and
+        other base-dependent validation)
+      B1 consumes already-normalized physical rows; supplied physical vector
+      columns pass through unchanged, with no external embedding call or
+      unspecified fold-derived-field materialization
     → B1/B2 strict mode: stop and mark the shard blocked on a permanent failure
       Phase-C dead_letter mode: stage a typed reject in _ingest_rejects
     → stage accepted rows with Lance merge-insert and merged_generations
@@ -275,11 +297,16 @@ complete end-to-end call count:
 - those counters overlap and do not identify sequential critical-path hops, so
   they cannot be added into a truthful “12 calls per write” result.
 
-See [`write_cost.rs`](crates/omnigraph/tests/write_cost.rs). There is currently
-no matched RC.1 RustFS/S3 benchmark of one-row interactive latency, sustained
-branch throughput, or the not-yet-built streaming path. RFC-018's historical
-single-digit language and upstream prototype results are not measurements of
-the current OmniGraph path.
+See [`write_cost.rs`](crates/omnigraph/tests/write_cost.rs) and
+[`memwal_stream_cost.rs`](crates/omnigraph/tests/memwal_stream_cost.rs). B1 now
+has accepted component evidence locally and on configured RustFS: warm
+already-claimed acknowledgement is flat at the measured compacted-history
+endpoints, while cold replay, retained generation metadata, selected-generation
+scan, widest-generation RSS, and the known non-flat uncompacted-manifest fold
+term are reported separately. There is still no matched end-to-end comparison
+of one-row interactive latency, sustained branch throughput, and a public
+streaming workload. RFC-018's historical single-digit language and upstream
+prototype results are not measurements of that product comparison.
 
 Consequently, the following are hypotheses rather than results:
 
@@ -292,7 +319,9 @@ Consequently, the following are hypotheses rather than results:
 
 ### Required benchmark before quoting a multiplier
 
-Run a matched RC.1 RustFS/S3 instrument after the admission adapter exists:
+The private B1 admission component instrument is already accepted locally and
+on configured RustFS. It does not supply the missing matched product comparison.
+Before quoting a multiplier, build and accept a separate end-to-end comparison:
 
 1. fix schema, row shape, row bytes, table count, and index configuration;
 2. compare interactive one-row requests, existing `load` batching, and stream
@@ -321,7 +350,7 @@ The honest summary today is:
 
 ## 3. Inventory: Lance substrate vs OmniGraph integration
 
-### Lance primitives we plan to consume
+### Lance primitives we consume or plan to consume
 
 These are real substrate capabilities, not a turnkey graph-streaming product:
 
@@ -342,9 +371,11 @@ These are real substrate capabilities, not a turnkey graph-streaming product:
 OmniGraph already has reusable chassis: the manifest publisher, generic
 recovery-sidecar framework, graph lineage, stable table identity, keyed write
 adapter, and validation components. “Reusable” does not mean “unchanged”:
-Phase A added stream lifecycle authority and enrollment recovery; later phases
-still need row admission, fold read sets, reject/audit participants,
-durable authenticated-contributor attribution, fresh cuts, and cleanup
+Phase A added stream lifecycle authority and enrollment recovery. Private B1
+now adds one bounded admission worker, watcher-only acknowledgement, replay and
+flushed-generation classification, and one recovery-owned fold. Later phases
+still need the public caller, reject/audit participants, durable authenticated
+contributor attribution, persistent operator lifecycle, fresh cuts, and cleanup
 coordination.
 
 ### What Phase A added
@@ -373,23 +404,23 @@ This deliberately stops before the first data entry. `DRAINING` and `SEALED`
 are representable so the authority shape is fixed, but no drain or resume
 workflow is implemented.
 
-### What OmniGraph must build
+### What OmniGraph has built and must still build
 
 | Responsibility | Required contract |
 |---|---|
-| **Format capability and refusal** | **Phase A complete:** v7 stamp, strict v6↔v7 refusal, export/init/load rebuild, exact lifecycle validation, and uncovered-partial-format refusal. |
-| **`@stream` intent and enrollment** | **Foundation only:** Phase A binds stable table/incarnation identity, location/main ref, never-reused enrollment ID, one empty shard, fixed configuration, and the mutable current-HEAD witness under recovery. B1 remains private. B2 adds parser/SchemaApply intent and production first use; rebind remains later. |
+| **Format capability and refusal** | **Phase A historical foundation:** v7 stamp, strict v6↔v7 refusal, export/init/load rebuild, exact lifecycle validation, and uncovered-partial-format refusal. **Private B1 current format:** schema v8, stream-config v2, and recovery-v11 `StreamFold`; genuine v7↔v8 old/new-binary refusal and rebuild evidence remains an acceptance gate. |
+| **`@stream` intent and enrollment** | **Foundation only:** Phase A binds stable table/incarnation identity, location/main ref, never-reused enrollment ID, one empty shard, fixed configuration, and the mutable current-HEAD witness under recovery. B1 is implemented but remains private. B2 adds parser/SchemaApply intent and production first use; rebind remains later. |
 | **Public surface** | **Phase B2:** `POST /graphs/{graph_id}/streams/{type_name}/ingest`, minimum status/fold/quiesce/resume/abort-drain/rebuild controls, `omnigraph stream …` commands, Cedar, and OpenAPI parity. Existing `/ingest` remains the deprecated load alias. |
-| **Writer registry and routing** | **Phase B1:** one root-scoped, cross-handle singleflight registry keyed by exact table identity, enrollment, and shard; one serialized owner per initial `(table, main)`; one no-rollover generation capped in total at 8,192 rows / 32 MiB. Claim/replay starts under the shared admission lease. Empty reopen may admit; non-empty replay and one flushed-unmerged generation are fold-only. The exclusive fold validates replayed rows and uses the pinned public BatchStore watermark bridge before reseal. Retirement stops puts before public `abort`; `close` is not durability evidence. Numeric registry capacity, global inflight bytes, idle eviction, and durability deadlines require checked-in RSS/latency evidence rather than guessed defaults. |
-| **Durability batching** | **Phase B1:** one admitted call becomes one non-empty normalized `RecordBatch` and one Lance put. The worker owns final check, invocation, and watcher. Anything ambiguous after invocation is typed `AckUnknown`; replay preserves possible residue but never resolves that attempt. There is no hidden group-commit policy until an instrument justifies one. |
-| **Pre-ack validation** | Run every rule that needs no graph/base-table read before WAL persistence. |
-| **Fold adapter** | **Phase B1:** capture one exact stream binding and post-drain shard snapshot, independently prove empty frozen refs plus the exact authoritative generation/cursor (RC.1's drain waiter alone is insufficient), run deferred checks, require the materialized LWW output to fit 8,192 rows / 32 MiB, stage one merge-insert with `merged_generations`, and publish through recovery schema v11 plus RFC-022. Seal/drain/abort stay background-owned across caller deadlines; recognized unreferenced generation subtrees are retained orphans until proved GC. |
+| **Writer registry and routing** | **Phase B1 implemented privately:** one root-scoped, cross-handle registry owns the full binding and reuses the common table-identity plus resolved-physical-ref admission key; one serialized owner serves the initial `(table, main)` profile. One no-rollover generation is capped in total at 8,192 rows / 32 MiB. Puts use exact charge → shared admission → same-key input queue → worker-mode inspection. Claim/replay starts under the shared admission lease. Empty reopen may admit; non-empty replay and one flushed-unmerged generation are fold-only, with exact accounting and the refusal marker installed before the opener releases its queue. Already-charged callers can overlap recovered replay transiently; the ledger records that over-cap overlap while refusing new charge. The exclusive fold validates replayed rows and uses the pinned public BatchStore watermark bridge before reseal. A cold fold reserves the full generation/resident/pending envelope before its owned opener and retains it with exclusive authority across the original seal deadline. Retirement stops puts before public `abort`; `close` is not durability evidence. The private evidence limits are fixed at one resident writer per root/table, a nominal 32-MiB root Arrow admission budget, 32 in-flight calls, four pending generations, 30-second put, 60-second seal/abort, and 60-second idle eviction. They are not public defaults: B2 must requalify public/configurable or multi-resident limits with matched RSS/latency evidence. |
+| **Durability batching** | **Phase B1 implemented privately:** one admitted call is one non-empty, already-normalized physical `RecordBatch` and one Lance put. The worker owns the final check, invocation, and watcher; only watcher success acknowledges. Anything ambiguous after invocation is typed `AckUnknown`; replay preserves possible residue but never resolves that attempt. Automatic rollover is disabled and the writer retires before a successor-generation put. There is no hidden group-commit policy until an instrument justifies one. |
+| **Pre-ack validation** | **Phase B1 implemented privately:** apply every rule that needs no graph/base-table read before WAL persistence. The private seam consumes physical vectors supplied in the normalized batch; it neither calls an external embedding provider nor invents unspecified fold-derived fields. |
+| **Fold adapter** | **Phase B1 implemented privately:** capture one exact stream binding and post-drain shard snapshot, independently prove empty frozen refs plus the exact authoritative generation/cursor (RC.1's drain waiter alone is insufficient), run base-dependent validation, require the LWW output to fit 8,192 rows / 32 MiB, stage one merge-insert with `merged_generations`, and publish the exact table/lifecycle/lineage outcome through recovery schema v11 plus one `__manifest` CAS. Already-normalized physical vectors pass through unchanged. Seal/drain/abort stay background-owned across caller deadlines; recognized unreferenced generation subtrees are retained orphans until proved GC. |
 | **Strict and dead-letter disposition** | **B1/B2:** strict only; a permanent deferred-validation failure leaves durable unmerged input and blocks progress loudly. B1 has no correction lane. **Phase C:** dead letters only after restart-stable reject identity and retention are defined. |
 | **Policy, lineage, and audit** | B1 records only fixed mechanism lineage and has no public caller. B2 must durably preserve authenticated contributor attribution before public admission. Phase C consumes that evidence for rejects. |
 | **Quiescence and rebind** | B2 must provide persistent minimum status/fold/quiesce/resume/abort-drain/rebuild plus a bounded correction path before public activation. Resume rechecks the bounded no-named-branch topology; an incompatible branch operation leaves the stream `SEALED`. `SEALED` permits export/rebuild, not in-place maintenance. Phase D integrates automatic operation drain and physical rebind. |
 | **Fresh reads** *(later)* | Explicit committed/fresh IR mode, exact base-plus-MemWAL cut, merged-generation exclusion, retention guards, and documented lack of cross-table atomicity. |
 | **Cleanup** | B1 performs no WAL/generation GC. B2 production activation requires bounded reclamation plus a hard retained-storage stop. Later graph-aware GC remains integrated with visibility, recovery, time travel, indexes, fresh-read guards, and fencing safety. |
-| **Evidence and operations** | Surface guards, enrollment/fold failpoints, race/crash matrix, cost budgets, metrics, status, API tests, and CLI parity. Cost separates warm ack, retained-WAL replay, selected-generation data scan, accumulated retained shard-generation metadata, and graph-manifest publication history. |
+| **Evidence and operations** | **B1 green privately:** surface guards, genuine v7↔v8 refusal/rebuild, all 24 cells in the graph-level B1 behavior/crash/race suite, qualified local cost/PK-index/RSS evidence, and configured-RustFS cost evidence pass. The instrument keeps warm ack, retained-WAL replay, selected-generation data scan, accumulated retained shard-generation metadata, whole-process RSS, and the non-flat graph-manifest publication-history term separate. B2 still adds public metrics, status, API tests, CLI parity, and operator evidence. |
 
 The table intentionally omits “small/medium” estimates. Atomic rejection,
 quiescence, fresh-read retention, and GC are correctness protocols; size them
@@ -422,9 +453,9 @@ covering both:
 An upstream exact receipt and public admission lifecycle would simplify this
 substantially. We should propose that change, but its review and release timing
 is not a prerequisite for the bounded-profile decision. Gate E0 passed; the
-upstream shape still gates overlapping-process topology, while bounded
-Phase A is complete and row activation now depends first on B1's private
-proofs, then B2's product and operational gates.
+upstream shape still gates overlapping-process topology. Bounded Phase A and
+the private, evidence-green B1 core are now implemented; B2's product and
+operational gates remain before public row activation.
 
 ### Gate E0: a no-wait decision, not activation
 
@@ -506,20 +537,24 @@ successor, flush/drain, and merged-generation surfaces; CI rejects skipped E0
 and ABA cells.
 
 E0 itself added no `@stream`, lifecycle rows, a sidecar schema, public APIs,
-WAL acknowledgements, or a format stamp. Phase A has since consumed that proof:
-internal schema v7, the v10 enrollment intent, lifecycle authority, writer
-exclusion, and refusal/rebuild are implemented. This still is not stream
-release. The exact upstream receipt/seal remains the preferred simplification
-and the broader-topology gate.
+WAL acknowledgements, or a format stamp. Phase A subsequently consumed that
+proof in historical schema v7: the v10 enrollment intent, lifecycle authority,
+writer exclusion, and refusal/rebuild. Private B1 now consumes that foundation
+in current schema v8/config-v2 with private admission machinery and the
+recovery-v11 `StreamFold` envelope.
+This still is not stream release. The exact upstream receipt/seal remains the
+preferred simplification and the broader-topology gate.
 
 That Phase A work is not the Optimize proof copied to a new
 writer kind. Optimize is content-preserving maintenance and grants no future
 durability authority. Enrollment is the precondition for future
 acknowledgements, so Phase A separately proves initialization, shard claim,
 fixed binding publication, admission exclusion, restart, and foreign-state
-refusal. Phase B1 must now prove first put, durability/lost-response semantics,
-replay, and strict folding privately before B2 exposes a single row
-acknowledgement.
+refusal. Private B1 now implements first put, durability/lost-response
+semantics, replay/fold-only reopening, and strict folding. Its genuine
+cross-version/rebuild, the 24-cell graph-level B1 suite, local cost/RSS, and
+configured-RustFS cost gates are green. B2's separate product and operational gates must close before
+it may expose a single row acknowledgement.
 
 ### Bottom line
 
@@ -533,15 +568,18 @@ cleanup integration.
 The plan is:
 
 1. retain Gate E0's green exact-version classifier as the RC.1 substrate gate;
-2. keep Phase A's v7 enrollment recovery, all-lifecycle effect exclusion,
+2. keep Phase A's historical v7 enrollment recovery, all-lifecycle effect
+   exclusion,
    narrow `SEALED` native-branch exception, lifecycle state, admission lease,
-   and refusal/rebuild gates as the fixed foundation;
-3. implement Phase B1 as a root-scoped, single-generation worker: prevent
-   rollover, hard-cap the complete generation, retire/reopen between
+   and refusal/rebuild gates as the foundation preserved by current v8;
+3. retain the implemented private B1 root-scoped, single-generation worker:
+   prevent rollover, hard-cap the complete generation, retire/reopen between
    generations, hold admission from before epoch claim, preserve ambiguous
    attempts through replay, route non-empty replay fold-only through the pinned
    BatchStore watermark bridge, prove drain from refs plus authoritative
-   manifest state, and fold through one recovery-v11 keyed transaction;
+   manifest state, and fold through one recovery-v11 keyed transaction and one
+   exact manifest publication; keep its now-green cross-version, crash, and
+   cost/RSS instruments as regression gates;
 4. activate Phase B2 only after durable contributor attribution, bounded
    reclamation, strict correction, same-key retry sequencing, and persistent
    status/quiesce/resume/abort-drain/rebuild are accepted and implemented;
@@ -552,6 +590,8 @@ The plan is:
    lands, and use the latter to simplify enrollment and broaden topology.
 
 We tested the narrower support contract instead of waiting on the upstream
-calendar, and Phase A now implements it. RFC-026 remains draft: v7 stream
-format/lifecycle foundations are active, but no production enrollment,
-acknowledgement, fold, or public stream path exists.
+calendar. Phase A's v7 foundation and private B1's current v8/config-v2/v11
+worker/fold core are implemented and evidence-green. RFC-026 remains Draft: private tests can put,
+receive watcher-only durability acknowledgement, replay/fold-only, and publish
+one fold, but no production enrollment, acknowledgement, fold, operator, or
+public stream path exists.

@@ -466,6 +466,24 @@ pub async fn cost_harness<F: Future>(body: F) -> F::Output {
         .await
 }
 
+/// Run a body with persistent raw Lance trackers for the data-table and graph-
+/// manifest stores. This is the shared wiring seam for instruments that need
+/// request-path attribution beyond [`IoCounts`] (for example MemWAL WAL,
+/// generation-data, and PK-sidecar terms). The caller owns tracker resets and
+/// classification; probe construction remains centralized here.
+pub async fn with_raw_io_trackers<F: Future>(
+    table: &IOTracker,
+    manifest: &IOTracker,
+    body: F,
+) -> F::Output {
+    let probes = QueryIoProbes {
+        table_wrapper: Some(Arc::new(table.clone()) as Arc<dyn WrappingObjectStore>),
+        manifest_wrapper: Some(Arc::new(manifest.clone()) as Arc<dyn WrappingObjectStore>),
+        ..Default::default()
+    };
+    with_query_io_probes(probes, body).await
+}
+
 /// The tracker handles backing one measurement; read once into [`IoCounts`]. Data,
 /// probe, and open counters are fresh per op; the `__manifest` tracker is the ambient
 /// ground-truth one when inside `cost_harness`, else fresh.

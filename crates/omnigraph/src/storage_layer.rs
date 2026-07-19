@@ -52,6 +52,7 @@ use lance::Dataset;
 use lance::dataset::scanner::{ColumnOrdering, DatasetRecordBatchStream};
 #[cfg(test)]
 use lance::dataset::{WhenMatched, WhenNotMatched};
+use lance_index::mem_wal::ShardId;
 
 use crate::db::{Snapshot, SubTableEntry};
 use crate::error::{OmniError, Result};
@@ -610,6 +611,20 @@ pub trait TableStorage: sealed::Sealed + Send + Sync + Debug {
         semantics: KeyedWriteSemantics,
     ) -> Result<StagedHandle>;
 
+    /// Stage one RFC-026 fold as an exact-`id` upsert whose Lance `Update`
+    /// transaction also carries the one fresh MemWAL generation consumed by
+    /// the rows. This is a distinct sealed gateway: ordinary keyed writes
+    /// cannot attach merge progress, and this adapter cannot select another
+    /// write mode.
+    async fn stage_stream_fold(
+        &self,
+        snapshot: SnapshotHandle,
+        table_key: &str,
+        batches: Vec<RecordBatch>,
+        shard_id: ShardId,
+        generation: u64,
+    ) -> Result<StagedHandle>;
+
     /// Stage a provenance-proven strict insert without re-running Lance's
     /// target merge join or exact target-membership preflight. The caller's
     /// complete durable absence proof and final target-incarnation/baseline
@@ -1061,6 +1076,20 @@ impl TableStorage for TableStore {
     ) -> Result<StagedHandle> {
         let ds = Arc::try_unwrap(snapshot.into_arc()).unwrap_or_else(|arc| (*arc).clone());
         TableStore::stage_keyed_write(self, ds, table_key, batch, semantics)
+            .await
+            .map(StagedHandle::new)
+    }
+
+    async fn stage_stream_fold(
+        &self,
+        snapshot: SnapshotHandle,
+        table_key: &str,
+        batches: Vec<RecordBatch>,
+        shard_id: ShardId,
+        generation: u64,
+    ) -> Result<StagedHandle> {
+        let ds = Arc::try_unwrap(snapshot.into_arc()).unwrap_or_else(|arc| (*arc).clone());
+        TableStore::stage_stream_fold(self, ds, table_key, batches, shard_id, generation)
             .await
             .map(StagedHandle::new)
     }

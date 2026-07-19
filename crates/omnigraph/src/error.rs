@@ -133,11 +133,41 @@ pub enum OmniError {
         limit: u64,
         actual: u64,
     },
-    /// A durable recovery intent overlaps this write. Its physical effects may
-    /// already have landed, or it may still be armed before its first effect;
-    /// either way the sidecar named by `operation_id` must be resolved before
-    /// the caller retries. Treating this as ordinary OCC would let a writer
-    /// advance around unresolved commit ownership.
+    /// RFC-026 rejected a stream append before invoking Lance because the one
+    /// active generation is at its hard whole-generation ceiling. The caller
+    /// must fold the durable generation before retrying; no row from this call
+    /// reached MemWAL.
+    #[error(
+        "stream fold required for table '{table_key}': active generation has {rows} rows and {bytes} bytes"
+    )]
+    FoldRequired {
+        table_key: String,
+        rows: u64,
+        bytes: u64,
+    },
+    /// RFC-026 invoked Lance's MemWAL append but could not prove the outcome of
+    /// its durability watcher. The attempt may be durable and is intentionally
+    /// never translated into a row-effect-free retry. Stable caller ordinals
+    /// identify the ambiguous invocation without pretending that RC.1 exposes
+    /// an attributable WAL coordinate.
+    #[error(
+        "stream acknowledgement unknown for table {stable_table_id:016x}:{table_incarnation_id:016x}, shard {shard_id}, ordinals {caller_ordinal_start}..={caller_ordinal_end}: {reason}"
+    )]
+    AckUnknown {
+        stable_table_id: u64,
+        table_incarnation_id: u64,
+        enrollment_id: String,
+        shard_id: String,
+        caller_ordinal_start: u64,
+        caller_ordinal_end: u64,
+        reason: String,
+    },
+    /// A durable recovery intent or retained pre-sidecar physical owner
+    /// overlaps this write. Its effects may already have landed, or it may
+    /// still be armed/in flight before a classifiable effect; either way the
+    /// owner named by `operation_id` must settle and be resolved before the
+    /// caller retries. Treating this as ordinary OCC would let a writer advance
+    /// around unresolved commit ownership.
     #[error("recovery required for operation {operation_id}: {reason}")]
     RecoveryRequired {
         operation_id: String,

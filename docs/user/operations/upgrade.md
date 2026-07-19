@@ -17,9 +17,9 @@ message that **names the release line that wrote it** and the exact commands —
 so you can fetch the right old binary without guessing:
 
 ```
-__manifest is stamped at internal schema v6, but this omnigraph reads only v7.
-This graph was created by omnigraph 0.10.x. Rebuild it: with an omnigraph
-0.10.x binary run `omnigraph export <graph> > graph.jsonl`, then with this
+__manifest is stamped at internal schema v7, but this omnigraph reads only v8.
+This graph was created by omnigraph 0.11.x. Rebuild it: with an omnigraph
+0.11.x binary run `omnigraph export <graph> > graph.jsonl`, then with this
 binary run `omnigraph init --schema <schema.pg> <new-graph>` and `omnigraph load
 --mode overwrite --data graph.jsonl <new-graph>`. (Data, vectors, and blobs are
 preserved; commit history and branches are not.) See docs/user/operations/upgrade.md.
@@ -38,7 +38,8 @@ from that line (the latest is safest):
 | internal schema v4 | omnigraph 0.8.x | the latest 0.8.x (e.g. 0.8.1) |
 | internal schema v5 | omnigraph 0.9.x | the latest 0.9.x |
 | internal schema v6 | omnigraph 0.10.x | the latest 0.10.x |
-| internal schema v7 | omnigraph 0.11.x | — current format; no rebuild needed |
+| internal schema v7 | omnigraph 0.11.x | the latest 0.11.x |
+| internal schema v8 | omnigraph 0.12.x | — current format; no rebuild needed |
 
 You can also check versions before you hit a refusal:
 
@@ -613,3 +614,19 @@ rows; it does not copy MemWAL indexes, shard manifests, lifecycle rows, recovery
 sidecars, or epochs. The new v7 root therefore starts with no physical stream
 enrollment. Keep the old root intact until row, vector, blob, policy, and
 application-integrity verification passes and the fleet cutover is complete.
+
+## Migrating to internal schema v8
+
+Internal schema v8 activates RFC-026 Phase B1's private data-bearing MemWAL
+core: exact persisted stream-config v2, one hard-bounded generation, durable
+watcher acknowledgement, conservative restart/replay, explicit seal/drain,
+and schema-v11 `StreamFold` recovery through the unified write path. It still
+does **not** expose public stream schema, SDK, HTTP, CLI, or operator controls;
+those remain Phase B2 gates.
+
+Move a v7 graph to v8 with the ordinary recipe at the top of this page: export
+with the latest 0.11.x binary, initialize a different root with the 0.12.x
+binary, load the export, and verify the v8 stamp and logical data. V7's
+config-v1 enrollment is never reinterpreted as data-bearing config-v2 state.
+The rebuild copies manifest-visible rows only, not MemWAL indexes, shard state,
+recovery intents, or epochs, so the new root starts unenrolled.

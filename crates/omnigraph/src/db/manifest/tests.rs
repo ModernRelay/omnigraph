@@ -1918,7 +1918,7 @@ async fn test_init_stamps_internal_schema_version() {
     ManifestCoordinator::init(uri, &catalog).await.unwrap();
 
     let ds = open_manifest_dataset(uri, None).await.unwrap();
-    assert_eq!(super::migrations::INTERNAL_MANIFEST_SCHEMA_VERSION, 7);
+    assert_eq!(super::migrations::INTERNAL_MANIFEST_SCHEMA_VERSION, 8);
     assert_eq!(
         super::migrations::read_stamp(&ds),
         super::migrations::INTERNAL_MANIFEST_SCHEMA_VERSION,
@@ -2052,7 +2052,7 @@ async fn future_stamp_is_refused_in_both_open_modes() {
 }
 
 // A graph stamped below CURRENT (the strand floor: `MIN_SUPPORTED == CURRENT`,
-// so anything older than v7) is refused on open in BOTH modes, with the
+// so anything older than v8) is refused on open in BOTH modes, with the
 // rebuild-via-export/import hint — there is no in-place migration. This is the
 // floor twin of `future_stamp_is_refused_in_both_open_modes` (the ceiling). The
 // open path (`Omnigraph::open` read-write and `Omnigraph::open_read_only`) routes
@@ -2070,11 +2070,11 @@ async fn sub_current_graph_is_refused_on_open_with_rebuild_hint() {
         .await
         .unwrap();
 
-    // Rewind main's stamp to v6 — the immediately preceding strict strand,
-    // which this v7-only binary cannot open (`MIN_SUPPORTED == CURRENT == 7`).
+    // Rewind main's stamp to v7 — the immediately preceding strict strand,
+    // which this v8-only binary cannot open (`MIN_SUPPORTED == CURRENT == 8`).
     {
         let mut ds = open_manifest_dataset(uri, None).await.unwrap();
-        super::migrations::set_stamp_for_test(&mut ds, 6)
+        super::migrations::set_stamp_for_test(&mut ds, 7)
             .await
             .unwrap();
     }

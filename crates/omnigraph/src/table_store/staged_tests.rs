@@ -31,9 +31,11 @@ use arrow_array::{Array, Int32Array, RecordBatch, StringArray, StructArray, UInt
 use arrow_schema::{DataType, Field, Schema};
 use futures::TryStreamExt;
 use lance::Dataset;
+use lance::dataset::mem_wal::DatasetMemWalExt;
 use lance::dataset::transaction::Operation;
 use lance::dataset::{DeleteBuilder, WhenMatched, WhenNotMatched};
 use lance::datatypes::LANCE_UNENFORCED_PRIMARY_KEY;
+use lance_index::mem_wal::{MergedGeneration, ShardId};
 use lance_table::format::Fragment;
 
 /// A standalone Lance `Session` per test store (this binary is primitive-level
@@ -411,6 +413,158 @@ async fn keyed_upsert_forces_filter_route_and_preserves_conflict_metadata() {
     let batches = store.scan_batches(&committed).await.unwrap();
     assert_eq!(collect_ids(&batches), vec!["alice", "bob"]);
     assert_eq!(collect_age_for_id(&batches, "alice"), Some(31));
+}
+
+#[tokio::test]
+async fn stream_fold_commits_rows_and_generation_marker_in_one_exact_transaction() {
+    let dir = tempfile::tempdir().unwrap();
+    let uri = format!("{}/people.lance", dir.path().to_str().unwrap());
+    let store = TableStore::new(dir.path().to_str().unwrap(), test_session());
+    let mut base = TableStore::write_dataset(&uri, person_pk_batch(&[("alice", Some(30))]))
+        .await
+        .unwrap();
+    base.initialize_mem_wal()
+        .unsharded()
+        .execute()
+        .await
+        .unwrap();
+    let base_version = base.version().version;
+    let shard_id = ShardId::new_v4();
+    let expected_marker = MergedGeneration::new(shard_id, 1);
+
+    let staged = store
+        .stage_stream_fold(
+            base.clone(),
+            "Person",
+            vec![
+                person_pk_batch(&[("alice", Some(31))]),
+                person_pk_batch(&[("bob", Some(25))]),
+            ],
+            shard_id,
+            1,
+        )
+        .await
+        .unwrap();
+    let planned = staged.transaction_identity();
+    assert_eq!(planned.read_version, base_version);
+    match &staged.transaction.operation {
+        Operation::Update {
+            merged_generations,
+            inserted_rows_filter: Some(_),
+            ..
+        } => assert_eq!(merged_generations, std::slice::from_ref(&expected_marker)),
+        other => panic!("stream fold lost its exact Update shape: {other:?}"),
+    }
+
+    // Staging may create unreferenced fragment files, but neither half of the
+    // logical fold is visible until the one Lance transaction commits.
+    let before_commit = Dataset::open(&uri).await.unwrap();
+    assert_eq!(before_commit.version().version, base_version);
+    assert_eq!(
+        collect_ids(&store.scan_batches(&before_commit).await.unwrap()),
+        vec!["alice"]
+    );
+    assert!(
+        before_commit
+            .mem_wal_index_details()
+            .await
+            .unwrap()
+            .unwrap()
+            .merged_generations
+            .is_empty()
+    );
+
+    let (committed, observed) = store
+        .commit_staged_exact(Arc::new(base), staged)
+        .await
+        .unwrap();
+    assert_eq!(observed, planned);
+    assert_eq!(committed.version().version, planned.read_version + 1);
+    let persisted_transaction = committed.read_transaction().await.unwrap().unwrap();
+    assert_eq!(persisted_transaction.uuid, planned.uuid);
+    match &persisted_transaction.operation {
+        Operation::Update {
+            merged_generations,
+            inserted_rows_filter: Some(_),
+            ..
+        } => assert_eq!(merged_generations, std::slice::from_ref(&expected_marker)),
+        other => panic!("committed stream fold lost its Update/marker shape: {other:?}"),
+    }
+    assert_eq!(
+        committed
+            .mem_wal_index_details()
+            .await
+            .unwrap()
+            .unwrap()
+            .merged_generations,
+        vec![expected_marker]
+    );
+    let rows = store.scan_batches(&committed).await.unwrap();
+    assert_eq!(collect_ids(&rows), vec!["alice", "bob"]);
+    assert_eq!(collect_age_for_id(&rows, "alice"), Some(31));
+    assert_eq!(collect_age_for_id(&rows, "bob"), Some(25));
+}
+
+#[tokio::test]
+async fn stream_fold_exact_commit_does_not_retry_a_same_key_conflict() {
+    let dir = tempfile::tempdir().unwrap();
+    let uri = format!("{}/people.lance", dir.path().to_str().unwrap());
+    let store = TableStore::new(dir.path().to_str().unwrap(), test_session());
+    let mut base = TableStore::write_dataset(&uri, person_pk_batch(&[("alice", Some(30))]))
+        .await
+        .unwrap();
+    base.initialize_mem_wal()
+        .unsharded()
+        .execute()
+        .await
+        .unwrap();
+    let shard_id = ShardId::new_v4();
+    let winner = store
+        .stage_stream_fold(
+            base.clone(),
+            "Person",
+            vec![person_pk_batch(&[("alice", Some(31))])],
+            shard_id,
+            1,
+        )
+        .await
+        .unwrap();
+    let loser = store
+        .stage_stream_fold(
+            base.clone(),
+            "Person",
+            vec![person_pk_batch(&[("alice", Some(32))])],
+            shard_id,
+            1,
+        )
+        .await
+        .unwrap();
+
+    store
+        .commit_staged_exact(Arc::new(base.clone()), winner)
+        .await
+        .unwrap();
+    let error = store
+        .commit_staged_exact(Arc::new(base), loser)
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(error, OmniError::RetryableCommitConflict(_)),
+        "same-key fold loser must fail without transparent retry, got {error:?}"
+    );
+
+    let committed = Dataset::open(&uri).await.unwrap();
+    let rows = store.scan_batches(&committed).await.unwrap();
+    assert_eq!(collect_age_for_id(&rows, "alice"), Some(31));
+    assert_eq!(
+        committed
+            .mem_wal_index_details()
+            .await
+            .unwrap()
+            .unwrap()
+            .merged_generations,
+        vec![MergedGeneration::new(shard_id, 1)]
+    );
 }
 
 #[tokio::test]

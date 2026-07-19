@@ -1,7 +1,9 @@
 //! Durable RFC-026 stream lifecycle authority.
 //!
-//! This module defines only the v7 manifest representation. It does not admit
-//! rows to MemWAL, claim a writer, or expose a public streaming surface.
+//! Internal schema v8 preserves the v7 lifecycle-row representation while
+//! requiring the data-bearing RFC-026 config-v2 physical profile. Public
+//! streaming remains inactive; Phase B1 is reachable only through private test
+//! seams.
 
 use std::collections::BTreeMap;
 
@@ -15,7 +17,7 @@ use super::layout::stream_state_object_id;
 use super::{TableIdentity, TableRegistration};
 
 const STREAM_STATE_PROTOCOL_VERSION: u32 = 1;
-pub(crate) const STREAM_CONFIG_VERSION: u32 = 1;
+pub(crate) const STREAM_CONFIG_VERSION: u32 = 2;
 
 /// Stable physical enrollment binding for the bounded RFC-026 profile.
 ///
@@ -28,10 +30,10 @@ pub(crate) struct StreamPhysicalBinding {
     pub(crate) table_incarnation_id: u64,
     pub(crate) table_location: String,
     /// Main is represented canonically as `None`. Named refs are not supported
-    /// by the v7 bounded profile.
+    /// by the v8 bounded profile.
     pub(crate) table_branch: Option<String>,
     pub(crate) enrollment_id: String,
-    /// Sorted, unique UUID namespace. V7 Phase A permits exactly one shard.
+    /// Sorted, unique UUID namespace. V8 Phase B1 permits exactly one shard.
     pub(crate) shard_ids: Vec<String>,
     pub(crate) stream_config_version: u32,
     pub(crate) stream_config_hash: String,
@@ -56,7 +58,7 @@ impl StreamPhysicalBinding {
         }
         if self.table_branch.is_some() {
             return Err(OmniError::manifest_internal(
-                "internal schema v7 stream bindings support only canonical main (table_branch = null)",
+                "internal schema v8 stream bindings support only canonical main (table_branch = null)",
             ));
         }
         let enrollment_id = validate_uuid("enrollment_id", &self.enrollment_id)?;
@@ -67,7 +69,7 @@ impl StreamPhysicalBinding {
         }
         if self.shard_ids.len() != 1 {
             return Err(OmniError::manifest_internal(format!(
-                "internal schema v7 requires exactly one stream shard, got {}",
+                "internal schema v8 requires exactly one stream shard, got {}",
                 self.shard_ids.len()
             )));
         }
@@ -129,7 +131,7 @@ impl CurrentHeadWitness {
     fn validate(&self) -> Result<()> {
         if self.branch_identifier != BranchIdentifier::main() {
             return Err(OmniError::manifest_internal(
-                "internal schema v7 stream HEAD witness must name the main branch",
+                "internal schema v8 stream HEAD witness must name the main branch",
             ));
         }
         if self.table_version == 0 {
