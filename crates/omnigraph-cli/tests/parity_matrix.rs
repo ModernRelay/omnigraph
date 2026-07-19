@@ -476,3 +476,118 @@ fn parity_blob_get_offset_beyond_size() {
         );
     }
 }
+
+// ---- blob put rows ----
+
+#[test]
+fn parity_blob_put() {
+    let (p, _) = blob_parity();
+    let payload = p._temp.path().join("upload.bin");
+    std::fs::write(&payload, b"parity upload payload").unwrap();
+    let (l, r) = p.run(&[
+        "blob",
+        "put",
+        "Document",
+        "readme",
+        "content",
+        "--file",
+        payload.to_str().unwrap(),
+        "--json",
+    ]);
+    // Scrubbed-JSON equality; etag and size are NOT in the volatile
+    // allowlist, so the identity-derived validator must match exactly across
+    // arms (both start from the byte-mirrored graph and apply the identical
+    // operation).
+    assert_parity("blob put", &l, &r);
+    let (l_get, r_get) = p.run(&["blob", "get", "Document", "readme", "content"]);
+    assert_blob_get_parity(
+        "blob get after put",
+        b"parity upload payload",
+        &l_get,
+        &r_get,
+    );
+}
+
+#[test]
+fn parity_blob_put_if_match_stale() {
+    let (p, _) = blob_parity();
+    let payload = p._temp.path().join("upload.bin");
+    std::fs::write(&payload, b"must not land").unwrap();
+    // A well-formed strong validator that matches nothing on either arm.
+    let (l, r) = p.run(&[
+        "blob",
+        "put",
+        "Document",
+        "readme",
+        "content",
+        "--file",
+        payload.to_str().unwrap(),
+        "--if-match",
+        "\"00000000000000000000000000000000\"",
+    ]);
+    assert_eq!(
+        l.status.code(),
+        r.status.code(),
+        "blob put stale if-match: exit codes diverge\nlocal {l:?}\nremote {r:?}"
+    );
+    assert!(!l.status.success(), "a stale validator must fail: {l:?}");
+    for (arm, output) in [("local", &l), ("remote", &r)] {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(
+            stderr.contains("blob precondition failed"),
+            "{arm} arm must surface the shared typed precondition error: {stderr}"
+        );
+    }
+    // Nothing landed on either arm.
+    let (l_get, r_get) = p.run(&["blob", "get", "Document", "readme", "content"]);
+    assert_blob_get_parity(
+        "blob get after refused put",
+        b"Hello World",
+        &l_get,
+        &r_get,
+    );
+}
+
+#[test]
+fn parity_blob_put_missing_row() {
+    let (p, _) = blob_parity();
+    let payload = p._temp.path().join("upload.bin");
+    std::fs::write(&payload, b"x").unwrap();
+    let (l, r) = p.run(&[
+        "blob",
+        "put",
+        "Document",
+        "no-such-row",
+        "content",
+        "--file",
+        payload.to_str().unwrap(),
+    ]);
+    assert_eq!(
+        l.status.code(),
+        r.status.code(),
+        "blob put missing row: exit codes diverge\nlocal {l:?}\nremote {r:?}"
+    );
+    assert!(!l.status.success(), "update-only put must fail: {l:?}");
+}
+
+#[test]
+fn parity_blob_put_oversize() {
+    let (p, _) = blob_parity();
+    let payload = p._temp.path().join("oversize.bin");
+    std::fs::write(&payload, vec![0_u8; 32 * 1024 * 1024 + 1]).unwrap();
+    let (l, r) = p.run(&[
+        "blob",
+        "put",
+        "Document",
+        "readme",
+        "content",
+        "--file",
+        payload.to_str().unwrap(),
+    ]);
+    assert_eq!(
+        l.status.code(),
+        r.status.code(),
+        "blob put oversize: exit codes diverge\nlocal {l:?}\nremote {r:?}"
+    );
+    assert!(!l.status.success(), "an oversize payload must refuse: {l:?}");
+}
