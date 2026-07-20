@@ -78,15 +78,7 @@ async fn require_graph_for_multi_graph_server(
     let (Some(server), None) = (scope.server.as_deref(), scope.graph.as_deref()) else {
         return Ok(());
     };
-    let Some(base) = resolve_server_flag(Some(server), None)? else {
-        return Ok(());
-    };
-    let token = resolve_remote_bearer_token(Some(&base))?;
-    let probe = GraphClient::Remote {
-        http: build_http_client()?,
-        base_url: base,
-        token,
-    };
+    let probe = GraphClient::registry_client(server)?;
     if let Ok(resp) = probe.list_graphs().await {
         if !resp.graphs.is_empty() {
             let ids: Vec<&str> = resp.graphs.iter().map(|g| g.graph_id.as_str()).collect();
@@ -116,6 +108,22 @@ fn reject_positional_remote(via_server: bool, uri: &str) -> Result<()> {
 }
 
 impl GraphClient {
+    /// The single owner of registry (`GET /graphs`) addressing: the bare base
+    /// URL of `server` (a config name or literal URL) — never `/graphs/<id>`
+    /// — with the keyed bearer-token chain. Synchronous: pure config
+    /// resolution, no I/O. Used by the RFC-011 D7 multi-graph probe and the
+    /// `graphs list` registry factory.
+    fn registry_client(server: &str) -> Result<Self> {
+        let base = resolve_server_flag(Some(server), None)?
+            .expect("server name is present");
+        let token = resolve_remote_bearer_token(Some(&base))?;
+        Ok(GraphClient::Remote {
+            http: build_http_client()?,
+            base_url: base,
+            token,
+        })
+    }
+
     /// Resolve the addressing (positional URI / `--target` / `--server`)
     /// and credential once, then pick the variant by URI scheme — the
     /// single branch point that replaces every per-command `is_remote`
