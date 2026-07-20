@@ -1125,18 +1125,14 @@ async fn main() -> Result<()> {
             }
         },
         Command::Graphs { command } => match command {
-            GraphsCommand::List {
-                uri,
-                json,
-            } => {
-                let client = client::GraphClient::resolve(
+            GraphsCommand::List { json } => {
+                // Registry scope (RFC-011): the bare server base URL, resolved
+                // synchronously — the async D7 require-graph probe cannot run
+                // here, and no `/graphs/<id>` is ever appended.
+                let client = client::GraphClient::resolve_registry(
                     cli.server.as_deref(),
-                    cli.graph.as_deref(),
-                    uri,
                     cli.profile.as_deref(),
-                    cli.store.as_deref(),
-                )
-                .await?;
+                )?;
                 let payload = client.list_graphs().await?;
                 if json {
                     print_json(&payload)?;

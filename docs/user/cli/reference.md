@@ -27,6 +27,7 @@ Top-level command families and subcommands. Graph-targeting commands accept a po
 | `embed` | offline JSONL embedding pipeline |
 | `policy validate \| test \| explain` | Cedar tooling against a cluster's applied policies (`--cluster <dir>`; `--graph <id>` picks a graph's bundle when several apply). `test` takes `--tests <file>`; `explain` takes `--actor`/`--action`/`--branch`/`--target-branch` |
 | `queries list \| validate` | inspect a cluster's applied stored-query registry (`--cluster <dir\|uri>`; `--graph <id>` to scope one graph). `list` prints each query's kind (read/mutation), name, typed params, and `[mcp: …]` exposure; a query's `@description`/`@instruction` are shown as indented `description:` / `instruction:` lines when declared (omitted otherwise). `--json` emits `{name, mcp_expose, tool_name, mutation, params}` plus `description`/`instruction` **only when present** — matching the HTTP `GET /queries` catalog ([server.md](../operations/server.md)). `validate` type-checks the registry and exits non-zero on a broken query |
+| `graphs list` | enumerate the graphs a multi-graph server serves (`GET /graphs`). Registry scope: addresses the bare server URL via `--server <name\|url>` / `--profile <name>` only — `--graph`/`--store`/`--as` are rejected, and a scope's `default_graph` is ignored |
 | `profile list \| show [<name>]` | read-only inspection of `~/.omnigraph/config.yaml` profiles. `list` shows each profile's binding (server/cluster/store) + default graph and marks the `$OMNIGRAPH_PROFILE`-active one; JSON keeps `binding` and adds `scope_kind`, `target`, `valid`, and `error`; `show` resolves one profile's scope (endpoint + default graph), defaulting to the active profile, else the flat operator defaults |
 | `version` / `-v` | print `omnigraph 0.7.x` |
 
@@ -125,7 +126,9 @@ sticky "current" mode. Inspect what is defined with `omnigraph profile list` and
     `GET /graphs` lists the graphs and you must pass `--graph <id>` (the CLI
     lists the candidates if you omit it). It falls back to the bare URL only
     when `/graphs` is unavailable: policy-gated, unreachable, or a
-    non-`omnigraph` endpoint.
+    non-`omnigraph` endpoint. `graphs list` itself is exempt — it *is* the
+    enumeration, so it always addresses the bare server URL (a scope's
+    `default_graph` is ignored there).
 
 `--target`, `--cluster-graph`, and the positional-`http(s)://`→remote dispatch
 have been **removed** (`--graph` is now the one graph selector across server and
