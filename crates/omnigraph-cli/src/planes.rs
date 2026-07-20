@@ -12,7 +12,7 @@
 use color_eyre::Result;
 use color_eyre::eyre::bail;
 
-use crate::cli::{Cli, Command, GraphsCommand, QueriesCommand, SchemaCommand};
+use crate::cli::{Cli, ClusterCommand, Command, GraphsCommand, QueriesCommand, SchemaCommand};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum Plane {
@@ -156,12 +156,32 @@ fn flag_applies(flag: ScopeFlag, capability: Capability, cmd: &Command) -> bool 
             Direct | Control => cluster_ok,
             Served | Local => false,
         },
-        ScopeFlag::Store => matches!(capability, Any | Direct),
+        // `direct` refines per command: the maintenance verbs (optimize/
+        // repair/cleanup/schema plan/lint) resolve their target through
+        // `resolve_maintenance_uri`, which consumes --store; `init` addresses
+        // its target with a required positional URI and never reads it.
+        ScopeFlag::Store => match capability {
+            Any => true,
+            Direct => !matches!(cmd, Command::Init { .. }),
+            Served | Control | Local => false,
+        },
         // The actor rides direct-engine (`any` via --store) and cluster
         // writes; served writes resolve the actor from the bearer token
         // (rejected downstream with its own message), and `direct`
-        // maintenance verbs record no actor.
-        ScopeFlag::As => matches!(capability, Any | Control),
+        // maintenance verbs record no actor. `control` refines per command:
+        // only `cluster apply`/`cluster approve` attribute an actor — the
+        // read-only control verbs (status/plan/validate, policy, queries)
+        // never read it.
+        ScopeFlag::As => match capability {
+            Any => true,
+            Control => matches!(
+                cmd,
+                Command::Cluster {
+                    command: ClusterCommand::Apply { .. } | ClusterCommand::Approve { .. },
+                }
+            ),
+            Served | Direct | Local => false,
+        },
         // A profile is a scope-default bundle; rejecting the flag while the
         // $OMNIGRAPH_PROFILE env stays honored would be inconsistent.
         ScopeFlag::Profile => true,
@@ -388,13 +408,21 @@ mod tests {
             (parse(&["omnigraph", "query", "q"]), [true, false, true, true, true, true]),
             (parse(&["omnigraph", "graphs", "list"]), [true, false, false, false, false, true]),
             (parse(&["omnigraph", "optimize", "g.omni"]), [false, true, true, true, false, true]),
+            // `init` addresses its target positionally — --store is rejected,
+            // not silently ignored (unlike the other direct verbs).
             (
                 parse(&["omnigraph", "init", "--schema", "s.pg", "g.omni"]),
-                [false, false, false, true, false, true],
+                [false, false, false, false, false, true],
             ),
-            (parse(&["omnigraph", "queries", "list"]), [false, true, true, false, true, true]),
+            // Read-only control verbs never read the actor; only
+            // `cluster apply`/`approve` do.
+            (parse(&["omnigraph", "queries", "list"]), [false, true, true, false, false, true]),
             (
                 parse(&["omnigraph", "cluster", "status", "--config", "."]),
+                [false, false, false, false, false, true],
+            ),
+            (
+                parse(&["omnigraph", "cluster", "apply", "--config", "."]),
                 [false, false, false, false, true, true],
             ),
             (parse(&["omnigraph", "version"]), [false, false, false, false, false, true]),
