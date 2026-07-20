@@ -2625,12 +2625,23 @@ impl Omnigraph {
             )));
         }
 
+        // Dependency detection reads ONLY each surviving branch's manifest
+        // `table_branch` entries, so take the manifest-only snapshot. A full
+        // `snapshot_of` resolve would additionally load the commit-lineage
+        // projection and re-read + re-validate the schema contract PER BRANCH —
+        // O(branches x history) I/O that made deletion time out on large
+        // graphs — and its per-foreign-branch schema validation could wedge
+        // deletion of an unrelated branch behind another branch's schema
+        // drift. This operation's own schema was already validated under the
+        // schema gate above.
         for other_branch in branches
             .iter()
             .filter(|candidate| candidate.as_str() != branch)
         {
             let snapshot = self
-                .snapshot_of(ReadTarget::branch(other_branch.as_str()))
+                .fresh_snapshot_for_branch_unchecked(
+                    Self::normalize_branch_name(other_branch)?.as_deref(),
+                )
                 .await?;
             if snapshot
                 .entries()
