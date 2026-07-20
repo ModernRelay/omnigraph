@@ -1420,8 +1420,12 @@ async fn cleanup_old_versions_does_not_reclaim_mem_wal_objects() {
 /// rejects it.
 ///
 /// This is deliberately a production-neutral negative guard: only the test
-/// deletes a WAL object.  When the Lance-owned post-success fence check lands,
-/// invert this assertion and make the patched failure the positive guard.
+/// deletes a WAL object. OmniGraph's private B1 worker contains the gap by
+/// rechecking `ShardWriter::check_fenced` after watcher success and before its
+/// own acknowledgement, but stock Lance still permits the raw stale write.
+/// Keep this assertion negative until the Lance-owned append path itself gains
+/// the post-success check; it remains one reason OmniGraph must not delete raw
+/// `_mem_wal` objects.
 #[tokio::test]
 async fn mem_wal_deleted_fence_slot_allows_stale_writer_success_on_pinned_lance() {
     let dir = tempfile::tempdir().unwrap();

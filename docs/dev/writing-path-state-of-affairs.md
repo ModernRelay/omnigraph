@@ -1,7 +1,7 @@
 # Write Path: State of Affairs
 
 **Type:** living architecture and execution summary
-**Status:** current as of 2026-07-19
+**Status:** current as of 2026-07-20
 **Surveyed:** OmniGraph 0.8.1 development, internal manifest schema v8,
 Lance 9.0.0-rc.1 at `cec0b7df`
 **Scope:** the direct-publish graph write path, its RFC-022–028 family,
@@ -15,11 +15,15 @@ evidence gates. Gate E0 first proved the bounded public Lance state classifier;
 Phase A activated internal schema v7 with recoverable empty enrollment, durable
 identity-keyed lifecycle authority, process-local admission/exclusion, and
 strict format refusal/rebuild. Internal schema v8 now preserves that foundation
-and adds stream-config v2, a root-scoped one-generation worker, watcher-backed
-durable acknowledgement, exact replay/seal/retirement, and recovery-v11
-`StreamFold`. The private B1 evidence is green: the local cost matrix,
-configured-RustFS warm-ack cell, genuine v7↔v8 binary refusal/rebuild run, and
-24/24 graph-level suite all pass. B2-0 specifies explicit enrollment,
+and adds stream-config v2, a root-scoped one-generation worker,
+watcher-backed durability followed by a same-writer post-durability epoch
+check before clean acknowledgement, exact replay/seal/retirement, and
+recovery-v11 `StreamFold`. The private B1 evidence is green at that bounded
+correctness boundary: the graph-level suite now includes post-watcher epoch
+loss as `AckUnknown` plus retirement. The 2026-07-20 post-containment local
+warm-ack probe remains history-flat at 9 table reads / 219 bytes; configured
+RustFS retains only its 2026-07-19 pre-containment baseline and must be rerun
+before a current object-store ack-cost claim. B2-0 specifies explicit enrollment,
 compare-and-chain tokens, trusted row attribution, manifest-selected current-
 token state, persistent lifecycle revisions with bounded management receipts,
 strict correction, Lance-owned reclamation with an enforced storage admission
@@ -74,8 +78,9 @@ strategic and Draft. Its production-neutral Gate E0, Phase A foundation, and
 private Phase B1 core are complete at their bounded evidence gates. Internal
 schema v7 introduced exact main-only empty MemWAL enrollment and local
 lifecycle exclusion; schema v8/config-v2 adds one private no-rollover
-generation behind a root-scoped worker, watcher-backed acknowledgement,
-conservative replay, exact seal/retirement, and one recovery-v11 strict fold.
+generation behind a root-scoped worker, watcher-backed durability followed by
+a same-writer post-durability epoch check before acknowledgement, conservative
+replay, exact seal/retirement, and one recovery-v11 strict fold.
 It admits and folds only exact already-normalized physical rows—including
 already-normalized vector values—and neither calls an external embedding
 provider nor invents unspecified derived fields. Native branch controls alone
@@ -86,7 +91,9 @@ explicit-enrollment, attribution, reclamation/orphan cleanup, correction,
 same-key retry sequencing, persistent lifecycle/management-receipt, and graph-
 global manifest-history designs. Phase B2 is the later implementation and
 public activation; its first dependency is the reviewed Lance reclamation and
-post-success-fence patch, not product endpoints.
+Lance-owned post-success-fence patch, not product endpoints. B1's adapter
+recheck contains a stale epoch from becoming a clean OmniGraph acknowledgement;
+it is not the substrate retention/fencing primitive B2 requires.
 
 The largest remaining correctness boundary is topology: destructive recovery
 is serialized across every handle in one process, but not against a live writer
@@ -182,7 +189,7 @@ These operations do not create a side door around the protocol:
 | Validation | Value, enum, uniqueness, edge-RI, and cardinality use one catalog-derived, delta-scoped evaluator across mutation, load, and merge. Committed non-key uniqueness probes are batched by constraint group and bounded chunks. |
 | Recovery | Same-process handles share ordered queues for the same canonical local root or identical normalized opaque remote/custom URI. Stream-admission domains are acquired outside schema → branch → table gates. Mutation/load, SchemaApply, BranchMerge, EnsureIndices, StreamFold, and `refresh` heal roll-forward-only; Optimize, Repair, and Cleanup refuse pending recovery, while branch controls use specialized barriers. Read-write open performs the quiesced full sweep, including exact v10 enrollment and v11 fold completion; read-only open never repairs and refuses unresolved stream recovery. A resolved intent is audited internally with the original actor when present; no-effect cleanup need not create graph lineage. |
 | RFC-026 Phase A (v7 foundation) | Internal schema v7 introduced identity-keyed lifecycle rows and exact empty main/unsharded enrollment. At that Phase-A-only boundary, any lifecycle row—including `SEALED`—rejected base-table, schema, maintenance, repair-adoption, and recovery effects under a process-local admission lease because no drain/fold witness-update adapter existed. Native branch create/delete alone could proceed at `SEALED` because it did not move table HEAD; `OPEN`/`DRAINING` refused it. Enrollment and open-time validation rejected named-branch overlap and any uncovered lifecycle/MemWAL mismatch. Schema v8 preserves these foundation guarantees. |
-| RFC-026 Phase B1 (private core) | Internal schema v8/config-v2 adds one root-scoped, cross-handle serialized worker and a hard-bounded 8,192-row/32-MiB no-roll generation. Watcher success is the only durable acknowledgement; post-invocation ambiguity is `AckUnknown`. Reopen/replay is conservative, exact drain proof precedes quiesced abort, and recovery-v11 folds one already-normalized generation then atomically refreshes the table pointer and `OPEN` lifecycle witness. The local cost matrix, configured-RustFS warm-ack cell, genuine v7↔v8 run, and 24/24 graph-level suite are green. The RFC remains Draft and the seam remains private. |
+| RFC-026 Phase B1 (private core) | Internal schema v8/config-v2 adds one root-scoped, cross-handle serialized worker and a hard-bounded 8,192-row/32-MiB no-roll generation. Watcher success proves durability; a clean `DurableBatchAck` additionally requires the same `ShardWriter::check_fenced()` to succeed immediately afterward. Fence loss, epoch-read failure, owner-task failure, or deadline ambiguity is post-invocation `AckUnknown` plus worker retirement. Reopen/replay is conservative, exact drain proof precedes quiesced abort, and recovery-v11 folds one already-normalized generation then atomically refreshes the table pointer and `OPEN` lifecycle witness. The genuine v7↔v8 run and graph-level suite, including the post-watcher epoch-loss cell, are green. Post-containment local ack work remains history-flat at 9 reads / 219 bytes; the configured-RustFS rerun is pending. The RFC remains Draft and the seam remains private. |
 | Lance access | One process-wide `ObjectStoreRegistry` reuses clients. Each `Omnigraph` handle owns its cached data-table `Session`; one process-wide zero-cache control `Session` opens mutable tips. Only the object-store registry is shared between the data and control sessions. This is “cache the past, never the present,” not one global cached session. |
 | Maintenance | EnsureIndices stages exact missing-index transactions. Optimize coordinates graph-wide compaction/index work under one bounded recovery envelope. Periodic optimize compacts `__manifest`, but unmaintained history-dependent paths are not globally flat. |
 
@@ -206,7 +213,7 @@ retry rules, recovery classification, and the full owned limits.
 | [023 — Key-conflict fencing](../rfcs/0023-key-conflict-fencing.md) | **Implemented** | Internal schema v6 introduced exact-`id` PK metadata, closed keyed routing, typed conflicts, bounded replay, rebuild/refusal, and accepted performance evidence; v8 preserves that contract. |
 | [024 — Durable table heads](../rfcs/0024-durable-table-heads.md) | **Research-blocked** | The first in-manifest BTREE candidate has a specified logical contract and flat indexed row/range work, but fails the complete physical-I/O gate. No head rows or heads format are active. |
 | [025 — Checkpoint retention](../rfcs/0025-checkpoint-retention.md) | **Research-blocked** | Lance tag/pin semantics pass, but the proposed in-manifest registry access shape is not history-flat after compaction. No checkpoint rows, `ogcp_` production tags, API, or cleanup integration are active. |
-| [026 — MemWAL streaming ingest](../rfcs/0026-memwal-streaming-ingest.md) | **Draft; Phase A/B1 implemented and evidence-green; B2-0 specified; public inactive** | Schema v8 preserves v7/recovery-v10 enrollment and adds config-v2 one-generation admission plus recovery-v11 strict fold. The local cost matrix, configured-RustFS warm-ack cell, genuine v7↔v8 refusal/rebuild, and 24/24 graph-level suite are green. B2-0 specifies explicit enrollment, v9 token/attribution, state-v2 lifecycle revisions/management receipts and correction, Lance-owned reclamation, and a graph-global reserve-first manifest-history budget; its two stock-RC.1 guards are checked in. None of that activates schema v9 or a production enrollment, `@stream`, put/ack/fold, drain/resume, or fresh-read surface. |
+| [026 — MemWAL streaming ingest](../rfcs/0026-memwal-streaming-ingest.md) | **Draft; Phase A/B1 implemented and evidence-green; B2-0 specified; public inactive** | Schema v8 preserves v7/recovery-v10 enrollment and adds config-v2 one-generation admission plus recovery-v11 strict fold. Private B1 now admits a clean acknowledgement only after watcher success and a same-writer post-durability epoch check; its graph-level suite covers epoch loss in that window. B2-0 specifies explicit enrollment, v9 token/attribution, state-v2 lifecycle revisions/management receipts and correction, Lance-owned reclamation, and a graph-global reserve-first manifest-history budget; its two stock-RC.1 guards are checked in. The adapter containment neither activates schema v9 nor supplies raw MemWAL GC, a Lance-owned fence, or a production enrollment, `@stream`, put/ack/fold, drain/resume, or fresh-read surface. |
 | [027 — Lineage merge deltas](../rfcs/0027-lineage-merge-deltas.md) | **Research-blocked** | The desired O(delta) classifier and fallback contract are specified. Selective live-row and deletion-delta discovery are not yet bounded, so `OrderedTableCursor` remains the correctness path. |
 | [028 — Stable schema identity](../rfcs/0028-stable-schema-identity.md) | **Implemented** | Rename-stable IDs, table incarnation, identity-derived paths, schema/recovery integration, and strict rebuild activation were introduced in v5 and remain active in v8. |
 
@@ -218,7 +225,7 @@ retry rules, recovery classification, and the full owned limits.
 | History-flat authority | RFC-024/025 show flat BTREE rows/ranges/pages can coexist with history-growing manifest discovery or compacted bytes. No heads/checkpoint format is active; mutable tip caches and a second authority remain rejected. | A new Lance-native access shape—or revised measured operational contract—passes the original cold/warm, compacted/uncompacted, local/object-store gate. |
 | Internal history GC | Safe live-writer cleanup needs a durable resurrection/retention boundary; otherwise a stalled writer can recreate a collected version. | An evidence-backed cleanup watermark/fence before automated `__manifest` version GC. |
 | MemWAL delivery | RC.1 initializes the system index and claims shards as separate effects without a caller-minted combined receipt or cross-process seal. Phase A recovers that gap exactly for main-only, one-shard, one-live-writer-process empty enrollment. At the row boundary, the durability watermark is writer-wide while batch positions reset after MemTable rollover, `put_no_wait` may mutate before returning `Err`, replay leaves its fresh BatchStore WAL watermark unset, and `wait_for_flush_drain` can lose a completed failure before a late waiter snapshots it. Neither batch positions nor WAL statistics are durable receipts. | Private B1 closes exactly that bounded row case. B2-0 closes the remaining logical design with compare-and-chain tokens, trusted hidden row metadata, a manifest-selected current-token participant, protocol-v2 lifecycle, and bounded correction. Implement and prove those contracts privately before adding a public caller. A public receipt/seal or accepted distributed fence remains the exit for overlapping processes and failover. |
-| MemWAL reclamation | Stock RC.1 exposes evidence-level raw listing and manifest reads, not a complete classified inventory or safe MemWAL delete/GC primitive. Generic `cleanup_old_versions` leaves `_mem_wal` unchanged. Worse, deleting the successor's empty WAL fence sentinel can let a stale writer complete a WAL PUT and report watcher success because RC.1 has no post-success epoch check. Raw path deletion in OmniGraph is therefore forbidden. | Author Lance-owned durable inspect/plan/execute plus attempt/receipt recovery, post-success fence check, and bounded history checkpoint; open it upstream and pin the exact reviewed fork commit without waiting for a release. Then prove whole-cut/cursor eligibility, strong PUT/DELETE inventory plus multipart accounting/abort or durable accounting, stale plans, prune CAS, partial delete/lost result, orphan/unknown retention, and a source-derived enforced physical-growth reservation on local/RustFS before public admission. Separately prove graph-global manifest-history bootstrap/accounting across every writer and independent per-stream closure reserves. |
+| MemWAL reclamation | Stock RC.1 exposes evidence-level raw listing and manifest reads, not a complete classified inventory or safe MemWAL delete/GC primitive. Generic `cleanup_old_versions` leaves `_mem_wal` unchanged. Worse, deleting the successor's empty WAL fence sentinel can let a stale writer complete a WAL PUT and report watcher success because RC.1 has no post-success epoch check. Private B1 now prevents that stale epoch from becoming a clean OmniGraph acknowledgement by checking the same writer after watcher success and returning `AckUnknown` plus retirement on fence/read ambiguity. Raw path deletion in OmniGraph remains forbidden: the adapter check does not retract durable bytes or protect raw Lance callers. | Author Lance-owned durable inspect/plan/execute plus attempt/receipt recovery, Lance-owned post-success fence check, and bounded history checkpoint; open it upstream and pin the exact reviewed fork commit without waiting for a release. Then prove whole-cut/cursor eligibility, strong PUT/DELETE inventory plus multipart accounting/abort or durable accounting, stale plans, prune CAS, partial delete/lost result, orphan/unknown retention, and a source-derived enforced physical-growth reservation on local/RustFS before public admission. Separately prove graph-global manifest-history bootstrap/accounting across every writer and independent per-stream closure reserves. |
 | O(delta) merge | A version-column predicate is still O(rows) without a selective source, and deleted rows have no live version columns. Full ID differencing remains correct. | Bounded live-row and deletion/change discovery, exact shadow agreement, and a table-size-flat one-row-delete gate. |
 | Optimize provenance | Compaction/reindex has no stable caller-minted transaction covering the complete effect. Optimize therefore uses bounded, not exact, provenance. | Both an upstream maintenance transaction API and distributed recovery fencing. |
 | Remaining bounds/operations | Some long-running operations lack complete memory/time budgets; rollback waits for quiesced read-write open; recovery audit has no public query. | Incremental, independently owned hardening without widening format or topology. |
@@ -234,11 +241,13 @@ must publish atomically with the table pointer. Other writer/control/
 maintenance paths touching the table refuse pre-effect or drain first. Gate E0
 proved the classifier and witness model with complete direct-probe and
 object-store evidence; Phase A established the reversible support restriction.
-Private B1 now consumes it for one bounded generation, watcher-only durable
-acknowledgement, replay, and strict folding without pretending the
-process-local lease is a distributed fence, inventing a durable WAL offset, or
-reusing a watcher across rollover. Its green evidence authorizes only this
-private bounded core, not the public B2 product or a broader topology.
+Private B1 now consumes it for one bounded generation, watcher-backed
+durability plus the same-writer post-durability epoch check, replay, and strict
+folding without pretending the process-local lease is a distributed fence,
+inventing a durable WAL offset, or reusing a watcher across rollover. Fence
+loss or uncertainty after durability is `AckUnknown`, never a clean ack. Its
+green evidence authorizes only this private bounded core, not raw MemWAL
+reclamation, the public B2 product, or a broader topology.
 
 The full known-gap ledger, including adjacent local-CAS and unsupported
 multi-version-topology details, remains in
@@ -252,8 +261,8 @@ write-path redesign.
 | RC.1 finding | Planning effect |
 |---|---|
 | Lance surfaces consumed by RFC-022/023—transactions, branches, key filters, staged indexes, compaction, and shared sessions—remain compatible; separately surveyed tag/cleanup behavior is also unchanged | Keep the current architecture. PR #364 passed 22 surface guards and 129 runnable failpoint tests; the Gate-0 follow-up adds the 23rd guard plus checkpoint cost evidence. No format redesign is needed. |
-| Derived MemWAL datasets inherit the base store parameters and `Session`; `put_no_wait` returns an optional watcher whose completion is `Result<()>`, not a durable row coordinate. RC.1's watcher watermark spans the writer while active-MemTable batch positions reset on rollover; `put_no_wait` can also mutate before a later scheduling error. Replay leaves the fresh BatchStore watermark unset, and a late `wait_for_flush_drain` can miss a completed failure. | Shared-session propagation removes one integration concern, but the watcher is safe only inside B1's proved single-generation lifecycle. B1 acknowledges only watcher success, treats every post-invocation error as `AckUnknown`, prevents rollover, uses the pinned public replay-watermark bridge before fold-only reseal, proves the generation from refs plus authoritative manifest state, and retires/reopens before another generation. It does not create an exact combined enrollment receipt or cross-process seal. MemWAL is strategic, not experimental. |
-| Generic cleanup ignores `_mem_wal`, and RC.1 does not recheck the writer epoch after a successful WAL PUT | Do not write an OmniGraph-side collector. B2-0 requires Lance-owned durable reclamation, post-success fencing, bounded reclaim-history checkpointing, and an enforceable growth reservation. We will author and pin that reviewed patch ourselves rather than make upstream merge/release timing the calendar; public admission remains closed until its local/RustFS crash and bound-validation evidence pass. |
+| Derived MemWAL datasets inherit the base store parameters and `Session`; `put_no_wait` returns an optional watcher whose completion is `Result<()>`, not a durable row coordinate. RC.1's watcher watermark spans the writer while active-MemTable batch positions reset on rollover; `put_no_wait` can also mutate before a later scheduling error. Replay leaves the fresh BatchStore watermark unset, and a late `wait_for_flush_drain` can miss a completed failure. | Shared-session propagation removes one integration concern, but the watcher is safe only inside B1's proved single-generation lifecycle. B1 treats watcher success as necessary durability evidence, then requires the same writer's `check_fenced()` to succeed before clean acknowledgement. Every post-invocation error or ambiguity is `AckUnknown`; rollover remains prevented, the public replay-watermark bridge handles fold-only reseal, generation proof comes from refs plus authoritative manifest state, and the writer retires/reopens before another generation. This does not create an exact combined enrollment receipt or cross-process seal. MemWAL is strategic, not experimental. |
+| Generic cleanup ignores `_mem_wal`, and RC.1 does not recheck the writer epoch after a successful WAL PUT | B1 now contains the clean-ack stale-epoch result for its own private caller by rechecking after watcher success and retiring on any fence/read ambiguity. Still do not write an OmniGraph-side collector: that check neither retracts a durable WAL effect nor protects raw Lance callers or reclamation. B2-0 requires Lance-owned durable reclamation, post-success fencing, bounded reclaim-history checkpointing, and an enforceable growth reservation. We will author and pin that reviewed patch ourselves rather than make upstream merge/release timing the calendar; public admission remains closed until its local/RustFS crash and bound-validation evidence pass. |
 | Experimental, opt-in `DataOverlay` was added | Do not adopt it now. OmniGraph does not enable feature flag 64 or emit the operation; unknown foreign overlay effects remain fail-closed. DataOverlay's experimental status says nothing about MemWAL's status. |
 | RC.1 expands Lance write rejection from the three row-address names to all five surveyed virtual system-column names | OmniGraph now rejects `_rowid`, `_rowaddr`, `_rowoffset`, `_row_created_at_version`, and `_row_last_updated_at_version` during parsing and accepted-IR validation. A beta.21 development graph using a newly reserved row-version name must be exported with beta.21, renamed, and rebuilt. |
 | A genuine ordinary-schema beta.21 V2_2 graph forward-opened, queried, and merge-wrote under RC.1 | No general storage-format migration. The reserved-name exception is explicit rather than hidden behind a format bump. |
@@ -272,15 +281,19 @@ or slightly lower incremental RSS. That is not a roadmap signal.
 ### Now
 
 1. **Keep the accepted private B1 boundary narrow and green.** Preserve the
-   schema-v8/config-v2/recovery-v11 format guards, the 24-cell graph-level B1
-   behavior/crash/race suite, genuine v7↔v8 refusal/rebuild, and qualified local plus
-   configured-RustFS cost evidence. Treat those results as acceptance of one
-   main-only, one-shard, one-live-writer-process generation—not as permission
-   to expose a product API or claim general streaming throughput.
+   schema-v8/config-v2/recovery-v11 format guards, watcher-success plus
+   post-durability epoch-check acknowledgement boundary, complete graph-level
+   B1 behavior/crash/race suite, genuine v7↔v8 refusal/rebuild, and the
+   post-containment local cost evidence. Rerun the configured-RustFS cell before
+   replacing its 2026-07-19 pre-containment baseline. Treat those results as
+   acceptance of one main-only, one-shard, one-live-writer-process
+   generation—not as permission to expose a product API or claim general
+   streaming throughput.
 2. **Implement the B2-0 substrate dependency first.** Author the Lance-owned
    durable opaque inspect/plan/execute reclamation primitive, attempt/receipt
    recovery, sentinel-first manifest-named epoch claims, genesis/bootstrap plus
-   bounded claim/reclaim history checkpoint, and post-success epoch check; open
+   bounded claim/reclaim history checkpoint, and Lance-owned post-success epoch
+   check; open
    the upstream PR and pin the exact reviewed fork commit without waiting for
    its release. Add complete local/RustFS whole-cut, lost-result, fail-closed
    stock-RC.1 format refusal, strong PUT/DELETE inventory plus multipart
@@ -409,10 +422,13 @@ with the same zero-list shape and the declared positive plus listing-dependent
 negative matrix; separate surface guards own S3 ABA and the doc-hidden Lance
 surfaces. Phase A subsequently used that proof to activate v7 lifecycle,
 recovery, exclusion, and refusal/rebuild. No acknowledgement or fold activation
-followed from either gate alone. Private B1 passed its separate gate: the 24/24
-graph-level admission/fold/crash suite, genuine v7↔v8 old/new-binary
-refusal/rebuild, local cost matrix, and configured-RustFS warm-ack cell are
-green. That evidence activates only the schema-v8 private core;
+followed from either gate alone. Private B1 passed its separate gate: the
+complete graph-level admission/fold/crash suite now includes post-watcher epoch
+loss as `AckUnknown` plus retirement, and the genuine v7↔v8 old/new-binary
+refusal/rebuild remains green. The post-containment local warm-ack result stays
+flat at 9 reads / 219 bytes; configured RustFS retains only its 2026-07-19
+pre-containment baseline and requires rerun before a current object-store
+ack-cost claim. That evidence activates only the schema-v8 private core;
 the RFC remains Draft and every public B2 surface remains inactive. B2-0's two
 additional guards prove why stock RC.1 generic cleanup and raw successor
 fence-sentinel deletion cannot be the reclamation implementation; they are a

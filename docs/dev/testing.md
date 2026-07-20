@@ -132,9 +132,12 @@ The implemented coverage keeps the boundaries split as follows:
   same-key queue → mode lock order and its historical three-party deadlock,
   immediate fold-only replay accounting while already-charged callers drain,
   effect-free
-  `FoldRequired`, watcher-only acknowledgement, every post-invocation error as
-  typed `AckUnknown`, cardinality-only same-payload retry without attempt
-  reconciliation, and the adversarial `X(unknown) -> Y(durable) -> retry X`
+  `FoldRequired`, watcher-backed durability followed by the same writer's
+  post-durability `check_fenced()` before clean acknowledgement, post-watcher
+  epoch loss as typed `AckUnknown` plus worker retirement, every other
+  post-invocation error as typed `AckUnknown`, cardinality-only same-payload
+  retry without attempt reconciliation, and the adversarial
+  `X(unknown) -> Y(durable) -> retry X`
   stale-overwrite shape that keeps public B2 gated on sequencing/idempotency.
   A lost-ack retry crosses the mandatory fold boundary when durable replay
   residue exists; it is not charged to the retired generation. This file also
@@ -151,9 +154,14 @@ The implemented coverage keeps the boundaries split as follows:
   streaming/generation tags.
   An adversarial rollover cell delays generation `N + 1`'s WAL PUT and pins the
   RC.1 false-ack bug; adapter tests prove B1 retires before that path. Another
-  guard pins the replay watermark at exact `len - 1` only with zero frozen refs
-  and no possible put, and proves reseal writes no extra WAL entry, performs no
-  second PK-index insertion, and stamps the exact replay cursor. Repeated
+  graph-level cell parks immediately after watcher success, claims a successor
+  epoch through a test-only foreign writer, and proves the predecessor returns
+  `AckUnknown`, retires, and leaves its durable row replayable instead of
+  returning a clean acknowledgement. This closes the adapter outcome only; the
+  deleted-sentinel negative guard and Lance-owned reclamation gate remain.
+  Another guard pins the replay watermark at exact `len - 1` only with zero
+  frozen refs and no possible put, and proves reseal writes no extra WAL entry,
+  performs no second PK-index insertion, and stamps the exact replay cursor. Repeated
   pre-shard-manifest failures/crashes must not increase replayed batch or row
   count. A fast failed-flush cell starts `wait_for_flush_drain` after the
   handler removed its watcher and proves B1 still refuses without empty frozen
@@ -186,18 +194,23 @@ The implemented coverage keeps the boundaries split as follows:
 - a focused feature-gated `memwal_stream_cost.rs` instrument owns warm
   steady-state ack object-store work across graph-history endpoints. It records
   cold claim/reopen/replay separately against retained WAL depth, includes the
-  watcher's WAL-plus-in-memory-index completion cost, reports fold data-scan
-  work versus the one selected generation, sweeps accumulated already-merged
-  generation metadata retained in the shard manifest, and retains the
-  publisher's known graph-manifest-history term. Record local and configured RustFS evidence
-  before making a latency or group-commit claim.
+  watcher's WAL-plus-in-memory-index completion cost and the post-durability
+  epoch probe, reports fold data-scan work versus the one selected generation,
+  sweeps accumulated already-merged generation metadata retained in the shard
+  manifest, and retains the publisher's known graph-manifest-history term.
+  Record local and configured RustFS evidence before making a latency or
+  group-commit claim.
 
-Local evidence recorded on 2026-07-19 by the feature-gated debug integration
-binary on arm64 macOS is deliberately term-separated. A warm already-claimed
-ack at compacted graph-history depths 8/80 stayed at 6 table reads / 146 bytes,
-2 table writes / 1,096 bytes, 9 graph-manifest reads, and 21 adapter operations
-(2.46/2.69 ms); nonzero WAL writes and zero generation or graph-manifest writes
-prove the detached watcher was measured. Cold claim/replay at retained WAL
+Post-containment local evidence recorded on 2026-07-20 by the feature-gated
+debug integration binary is deliberately term-separated. A warm
+already-claimed clean ack at compacted graph-history depths 8/80 stayed flat at
+9 table reads / 219 bytes, 2 table writes / 1,096 bytes, 2 tracked WAL writes,
+9 graph-manifest reads, and 21 adapter operations. The 2026-07-19
+pre-containment baseline was 6 table reads / 146 bytes, so the explicit epoch
+probe adds 3 reads / 73 bytes while remaining flat in graph-history depth.
+Nonzero WAL writes and zero generation or graph-manifest writes prove the
+detached watcher was measured. The remaining term-separated evidence was
+recorded on 2026-07-19: cold claim/replay at retained WAL
 depths 1/8/32 used 5/19/67 WAL reads and 3,303/19,218/73,878 aggregate table-read
 bytes (4.87/5.01/13.55 ms). Selected folds of 1/4,096 rows read the one fresh
 generation and left 601/41,885 bytes of physical generation data; the observed
@@ -227,17 +240,19 @@ admission → same-key queue → mode before detached ownership or cold claim an
 transfers into the generation without double-counting. Cold replay is the
 narrow honest-overlap exception: its exact accounting can temporarily push the
 ledger above the nominal cap while previously charged callers drain, but the
-fold-only marker refuses all new charges. The 24th graph-level cell proves an oversized first
-batch never reaches the put invocation. B2 must measure concurrent residents
+fold-only marker refuses all new charges. The oversized-first-batch cell proves
+the put invocation is never reached. B2 must measure concurrent residents
 before raising either bound.
-A configured RustFS run also passed:
+The configured RustFS figures below are the 2026-07-19 **pre-containment**
+baseline because the post-containment run had no configured RustFS environment:
 at compacted history 8/80, warm ack stayed at 9 table reads / 146 bytes, 1 WAL
 write / 1,096 bytes, 12 graph-manifest reads, and 21 adapter operations
 (38.426/49.253 ms). Local uses two tracked writes for its temp-write + atomic
 rename while the object-store arm uses one conditional write. The required
-local+RustFS object-store evidence is therefore present; these debug timings
-still are not a product latency or group-commit claim, and B2 must re-qualify
-any higher resident-writer/resource limit before exposing public admission.
+post-containment RustFS cell must be rerun before making a current object-store
+ack-cost claim. These debug timings still are not a product latency or group-
+commit claim, and B2 must re-qualify any higher resident-writer/resource limit
+before exposing public admission.
 
 Format tests own genuine unenrolled-v7 ↔ v8/config-v2 refusal/rebuild. The v7
 binary exposes no production enrollment route, so this proves the real format
@@ -298,7 +313,8 @@ cargo test -p omnigraph-engine --test lance_surface_guards mem_wal_deleted_fence
 ```
 
 The Lance patch must turn the second guard into a typed fence/unknown outcome
-and add local plus object-store inspect/plan/execute coverage for stale plans,
+for raw Lance callers and reclamation; B1's wrapper check is not a substitute.
+It must also add local plus object-store inspect/plan/execute coverage for stale plans,
 whole-cut/cursor pruning, partial deletion, durable attempt/receipt replay,
 lost results, authoritative-checkpoint-plus-successor-chain orphan
 classification, unknown retention, strong HEAD/GET/LIST-after-PUT/DELETE and

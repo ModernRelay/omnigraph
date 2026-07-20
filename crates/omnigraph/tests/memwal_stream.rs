@@ -14,6 +14,8 @@ use std::time::Duration;
 use arrow_array::{Array, ArrayRef, Int32Array, RecordBatch, StringArray};
 use arrow_schema::{DataType, Field, Schema};
 use fail::FailScenario;
+use lance::Dataset;
+use lance::dataset::mem_wal::{DatasetMemWalExt, ShardWriterConfig};
 use omnigraph::db::{Omnigraph, ReadTarget};
 use omnigraph::error::OmniError;
 use omnigraph::failpoints::{ScopedFailPoint, names};
@@ -1159,15 +1161,103 @@ async fn abort_stall_keeps_original_retirement_and_admission_until_exact_abort_s
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 #[serial]
+async fn post_watcher_epoch_loss_is_ack_unknown_not_a_clean_ack() {
+    let _scenario = FailScenario::setup();
+    let (_dir, db) = init_enrolled().await;
+    let batch = physical_batch(&db, &[("fenced-after-durable".to_string(), 18)]).await;
+    let after_watcher =
+        helpers::failpoint::Rendezvous::park_first(names::STREAM_B1_AFTER_WATCHER_SUCCESS);
+
+    let put_db = Arc::clone(&db);
+    let put = tokio::spawn(async move {
+        put_db
+            .failpoint_stream_b1_for_test(TABLE, Some(batch), 23)
+            .await
+    });
+    after_watcher.wait_until_reached().await;
+
+    // The first writer has received watcher success but has not crossed
+    // OmniGraph's post-durability fence check. Claim the same physical shard
+    // directly through Lance so the old writer loses its epoch in that exact
+    // window. This is intentionally a test-only foreign-writer injector.
+    let snapshot = db.snapshot_of(ReadTarget::branch("main")).await.unwrap();
+    let entry = snapshot.entry(TABLE).unwrap();
+    let table_uri = format!(
+        "{}/{}",
+        db.uri().trim_end_matches('/'),
+        entry.table_path.trim_start_matches('/')
+    );
+    let dataset = Dataset::open(&table_uri).await.unwrap();
+    let shard_ids = dataset.list_mem_wal_latest_shard_ids().await.unwrap();
+    assert_eq!(
+        shard_ids.len(),
+        1,
+        "B1's unsharded topology must expose exactly one claimed shard"
+    );
+    let shard_id = shard_ids[0];
+    let successor = dataset
+        .mem_wal_writer(
+            shard_id,
+            ShardWriterConfig::new(shard_id)
+                .with_shard_spec_id(1)
+                .with_durable_write(true),
+        )
+        .await
+        .expect("the foreign successor must durably claim the next writer epoch");
+    assert!(
+        successor.epoch() > 1,
+        "the foreign writer must claim a successor epoch, got {}",
+        successor.epoch()
+    );
+
+    after_watcher.release();
+    let error = tokio::time::timeout(Duration::from_secs(20), put)
+        .await
+        .expect("the fenced put did not settle after release")
+        .unwrap()
+        .expect_err("epoch loss after watcher success must never return a clean acknowledgement");
+    match error {
+        OmniError::AckUnknown {
+            caller_ordinal_start,
+            caller_ordinal_end,
+            reason,
+            ..
+        } => {
+            assert_eq!((caller_ordinal_start, caller_ordinal_end), (23, 23));
+            assert!(
+                reason.contains("post-durability writer fence check failed")
+                    && reason.contains("peer claimed epoch"),
+                "AckUnknown must retain the exact post-watcher epoch-loss cause: {reason}"
+            );
+        }
+        other => panic!("post-watcher epoch loss must be AckUnknown, got {other:?}"),
+    }
+    assert!(
+        visible_rows(&db).await.is_empty(),
+        "watcher success alone must not make the row graph-visible"
+    );
+
+    successor
+        .abort()
+        .await
+        .expect("the test-only successor must retire cleanly");
+    db.failpoint_stream_b1_for_test(TABLE, None, 0)
+        .await
+        .expect("the ambiguous durable row must remain replayable and fold exactly once");
+    assert_eq!(
+        visible_rows(&db).await,
+        vec![("fenced-after-durable".to_string(), 18)]
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[serial]
 async fn cancelling_request_after_invocation_does_not_cancel_durable_worker_ownership() {
     let _scenario = FailScenario::setup();
     let (_dir, db) = init_enrolled().await;
     let batch = physical_batch(&db, &[("cancelled-caller".to_string(), 17)]).await;
-    let rendezvous = helpers::failpoint::Rendezvous::park_first(
-        names::STREAM_B1_AFTER_PUT_INVOKE_BEFORE_WATCHER,
-    );
-    let _unknown_after_durable =
-        ScopedFailPoint::new(names::STREAM_B1_AFTER_WATCHER_SUCCESS, "return");
+    let after_watcher =
+        helpers::failpoint::Rendezvous::park_first(names::STREAM_B1_AFTER_WATCHER_SUCCESS);
 
     let put_db = Arc::clone(&db);
     let put = tokio::spawn(async move {
@@ -1175,18 +1265,25 @@ async fn cancelling_request_after_invocation_does_not_cancel_durable_worker_owne
             .failpoint_stream_b1_for_test(TABLE, Some(batch), 12)
             .await
     });
-    rendezvous.wait_until_reached().await;
+    after_watcher.wait_until_reached().await;
     put.abort();
     assert!(put.await.unwrap_err().is_cancelled());
-    rendezvous.release();
 
-    tokio::time::timeout(
-        Duration::from_secs(20),
-        db.failpoint_stream_b1_for_test(TABLE, None, 0),
-    )
-    .await
-    .expect("fold must wait for the detached watcher/retirement owner, not hang")
-    .expect("watcher-success residue must reopen fold-only and publish once");
+    let fold_db = Arc::clone(&db);
+    let mut fold =
+        tokio::spawn(async move { fold_db.failpoint_stream_b1_for_test(TABLE, None, 0).await });
+    let early = tokio::time::timeout(Duration::from_millis(200), &mut fold).await;
+    assert!(
+        early.is_err(),
+        "exclusive fold must remain blocked while the detached owner still holds the post-watcher fence boundary"
+    );
+
+    after_watcher.release();
+    tokio::time::timeout(Duration::from_secs(20), fold)
+        .await
+        .expect("fold must wait for the detached fence/ack owner, not hang")
+        .unwrap()
+        .expect("watcher-success residue must reopen fold-only and publish once");
     assert_eq!(
         visible_rows(&db).await,
         vec![("cancelled-caller".to_string(), 17)]

@@ -3,9 +3,10 @@
 //! The parent module captures the exact main-branch witness, initializes the
 //! singleton unsharded MemWAL index, provisions one pre-minted empty shard, and
 //! classifies those enrollment effects after a lost result. The private
-//! [`worker`] submodule owns B1's one-generation admission, watcher, replay,
-//! seal/drain, and quiesced retirement mechanics. Graph authority, recovery-v11
-//! fold ownership, and the sole `__manifest` visibility publication remain in
+//! [`worker`] submodule owns B1's one-generation admission, watcher,
+//! post-durability successor-epoch check, replay, seal/drain, and quiesced
+//! retirement mechanics. Graph authority, recovery-v11 fold ownership, and the
+//! sole `__manifest` visibility publication remain in
 //! `db::omnigraph::stream_ingest`; no production streaming API is exposed.
 //!
 //! The caller must hold RFC-026's exclusive base-HEAD and cleanup/GC gates from
