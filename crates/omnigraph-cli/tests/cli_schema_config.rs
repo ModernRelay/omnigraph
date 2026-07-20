@@ -551,6 +551,36 @@ fn graphs_subcommand_help_lists_list_only() {
 }
 
 #[test]
+fn init_with_store_flag_errors_instead_of_ignoring_it() {
+    // `init` takes its target as a required positional URI and never reads
+    // `--store`; passing both must be a loud guard error, not a silently
+    // ignored second address (PR #377 review follow-up).
+    let temp = tempdir().unwrap();
+    let graph = graph_path(temp.path());
+    let schema = fixture("test.pg");
+    let output = output_failure(
+        cli()
+            .arg("init")
+            .arg("--schema")
+            .arg(&schema)
+            .arg("--store")
+            .arg("file:///elsewhere/graph.omni")
+            .arg(&graph),
+    );
+    let stderr = String::from_utf8_lossy(&output.stderr).into_owned();
+    assert!(
+        stderr.contains("`init` is a direct (storage-native) command")
+            && stderr.contains("--store")
+            && stderr.contains("does not apply"),
+        "expected the addressing-guard store rejection on init; got:\n{stderr}"
+    );
+    assert!(
+        !graph.exists(),
+        "init must not run when the addressing is rejected"
+    );
+}
+
+#[test]
 fn graphs_list_rejects_store_scope() {
     // `graphs list` is a served-registry command: it enumerates a server's
     // graphs, so a `--store` (local) address can never apply. The addressing
