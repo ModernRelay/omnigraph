@@ -12,7 +12,7 @@
 use color_eyre::Result;
 use color_eyre::eyre::bail;
 
-use crate::cli::{Cli, Command, QueriesCommand, SchemaCommand};
+use crate::cli::{Cli, Command, GraphsCommand, QueriesCommand, SchemaCommand};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum Plane {
@@ -71,10 +71,100 @@ impl Capability {
         }
     }
 
-    /// `--server`/`--graph` are served-graph addressing: they apply only to the
-    /// capabilities that reach a graph through a server.
-    fn accepts_server_addressing(self) -> bool {
-        matches!(self, Capability::Any | Capability::Served)
+}
+
+/// The global scope-addressing flags, exhaustively. Adding a flag forces a
+/// row in `flag_applies` and in the guard's reporting — the same
+/// can't-silently-drift construction as the exhaustive `command_plane` match.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ScopeFlag {
+    Server,
+    Cluster,
+    Graph,
+    Store,
+    As,
+    Profile,
+}
+
+impl ScopeFlag {
+    /// Guard evaluation order: first offending flag wins, preserving the
+    /// pre-matrix reporting precedence server → cluster → graph.
+    pub(crate) const ALL: [ScopeFlag; 6] = [
+        ScopeFlag::Server,
+        ScopeFlag::Cluster,
+        ScopeFlag::Graph,
+        ScopeFlag::Store,
+        ScopeFlag::As,
+        ScopeFlag::Profile,
+    ];
+
+    fn flag_name(self) -> &'static str {
+        match self {
+            ScopeFlag::Server => "--server",
+            ScopeFlag::Cluster => "--cluster",
+            ScopeFlag::Graph => "--graph",
+            ScopeFlag::Store => "--store",
+            ScopeFlag::As => "--as",
+            ScopeFlag::Profile => "--profile",
+        }
+    }
+
+    /// What the flag means, for the wrong-address error ("{clause} and does
+    /// not apply"). `Profile` is never rejected (it is a scope default that
+    /// applies everywhere), so its clause is unreachable in practice.
+    fn rejection_clause(self) -> &'static str {
+        match self {
+            ScopeFlag::Server => "--server addresses a served graph",
+            ScopeFlag::Cluster => "--cluster addresses a cluster-scoped command",
+            ScopeFlag::Graph => "--graph selects a graph within a server or cluster scope",
+            ScopeFlag::Store => "--store addresses a single graph's storage directly",
+            ScopeFlag::As => "--as sets the actor for a direct-engine or cluster write",
+            ScopeFlag::Profile => "--profile selects a scope bundle",
+        }
+    }
+
+    fn is_set(self, cli: &Cli) -> bool {
+        match self {
+            ScopeFlag::Server => cli.server.is_some(),
+            ScopeFlag::Cluster => cli.cluster.is_some(),
+            ScopeFlag::Graph => cli.graph.is_some(),
+            ScopeFlag::Store => cli.store.is_some(),
+            ScopeFlag::As => cli.as_actor.is_some(),
+            ScopeFlag::Profile => cli.profile.is_some(),
+        }
+    }
+}
+
+/// Which scope flags a verb can consume: one declarative matrix keyed by
+/// capability, plus the one per-command refinement (`accepts_cluster_addressing`
+/// — cluster addressing is per-command, not per-capability: optimize/repair/
+/// cleanup/lint accept it while the equally-`direct` init/schema-plan do not).
+fn flag_applies(flag: ScopeFlag, capability: Capability, cmd: &Command) -> bool {
+    use Capability::*;
+    let cluster_ok = accepts_cluster_addressing(cmd);
+    match flag {
+        // Served-graph addressing; `served` is the registry scope (the bare
+        // server), which still needs a server to talk to.
+        ScopeFlag::Server => matches!(capability, Any | Served),
+        ScopeFlag::Cluster => cluster_ok,
+        // The one graph selector across scopes: a served graph (`any`), or a
+        // cluster graph on the verbs that take cluster addressing. `served`
+        // rejects it — `graphs list` IS the enumeration, and a selected graph
+        // would corrupt the registry URL.
+        ScopeFlag::Graph => match capability {
+            Any => true,
+            Direct | Control => cluster_ok,
+            Served | Local => false,
+        },
+        ScopeFlag::Store => matches!(capability, Any | Direct),
+        // The actor rides direct-engine (`any` via --store) and cluster
+        // writes; served writes resolve the actor from the bearer token
+        // (rejected downstream with its own message), and `direct`
+        // maintenance verbs record no actor.
+        ScopeFlag::As => matches!(capability, Any | Control),
+        // A profile is a scope-default bundle; rejecting the flag while the
+        // $OMNIGRAPH_PROFILE env stays honored would be inconsistent.
+        ScopeFlag::Profile => true,
     }
 }
 
@@ -170,7 +260,9 @@ pub(crate) fn command_label(cmd: &Command) -> &'static str {
         Command::Repair { .. } => "repair",
         Command::Cleanup { .. } => "cleanup",
         Command::Cluster { .. } => "cluster",
-        Command::Graphs { .. } => "graphs",
+        Command::Graphs { command } => match command {
+            GraphsCommand::List { .. } => "graphs list",
+        },
     }
 }
 
@@ -210,25 +302,20 @@ pub(crate) fn accepts_cluster_addressing(cmd: &Command) -> bool {
 /// RFC-010 Slice 1, generalized for RFC-011 cluster addressing.
 pub(crate) fn guard_addressing(cli: &Cli) -> Result<()> {
     if let Command::Alias { .. } = &cli.command {
-        let mut flags = Vec::new();
-        if cli.server.is_some() {
-            flags.push("--server");
-        }
-        if cli.graph.is_some() {
-            flags.push("--graph");
-        }
-        if cli.store.is_some() {
-            flags.push("--store");
-        }
-        if cli.cluster.is_some() {
-            flags.push("--cluster");
-        }
-        if cli.profile.is_some() {
-            flags.push("--profile");
-        }
-        if cli.as_actor.is_some() {
-            flags.push("--as");
-        }
+        // The binding owns all addressing. The listing keeps its historical
+        // flag order (error text is observable contract).
+        let flags: Vec<&str> = [
+            ScopeFlag::Server,
+            ScopeFlag::Graph,
+            ScopeFlag::Store,
+            ScopeFlag::Cluster,
+            ScopeFlag::Profile,
+            ScopeFlag::As,
+        ]
+        .into_iter()
+        .filter(|flag| flag.is_set(cli))
+        .map(ScopeFlag::flag_name)
+        .collect();
         if !flags.is_empty() {
             bail!(
                 "`alias` uses the server, graph, and stored query declared in \
@@ -238,43 +325,25 @@ pub(crate) fn guard_addressing(cli: &Cli) -> Result<()> {
             );
         }
     }
-    if cli.server.is_none() && cli.cluster.is_none() && cli.graph.is_none() {
-        return Ok(());
-    }
     let capability = command_capability(&cli.command);
     let label = command_label(&cli.command);
-    let cluster_ok = accepts_cluster_addressing(&cli.command);
-
-    if cli.server.is_some() && !capability.accepts_server_addressing() {
-        bail!(
-            "`{label}` is a {} command; --server addresses a served graph and does not apply.{}",
-            capability.describe(),
-            remediation(capability, &cli.command),
-        );
-    }
-    if cli.cluster.is_some() && !cluster_ok {
-        bail!(
-            "`{label}` is a {} command; --cluster addresses a cluster-scoped command \
-             and does not apply.{}",
-            capability.describe(),
-            remediation(capability, &cli.command),
-        );
-    }
-    if cli.graph.is_some() && !(capability.accepts_server_addressing() || cluster_ok) {
-        bail!(
-            "`{label}` is a {} command; --graph selects a graph within a server or cluster \
-             scope and does not apply.{}",
-            capability.describe(),
-            remediation(capability, &cli.command),
-        );
+    for flag in ScopeFlag::ALL {
+        if flag.is_set(cli) && !flag_applies(flag, capability, &cli.command) {
+            bail!(
+                "`{label}` is a {} command; {} and does not apply.{}",
+                capability.describe(),
+                flag.rejection_clause(),
+                remediation(capability, &cli.command),
+            );
+        }
     }
     Ok(())
 }
 
 /// The "what to do instead" tail for a wrong-address error, by capability.
 /// Includes its own leading space when non-empty so the caller appends it
-/// directly — an empty tail (the served-addressing capabilities, which only
-/// reach this fn for a misplaced `--cluster`/`--graph`) leaves no trailing space.
+/// directly — an empty tail (`any`, which only reaches this fn for a
+/// misplaced `--cluster`) leaves no trailing space.
 fn remediation(capability: Capability, cmd: &Command) -> &'static str {
     match capability {
         Capability::Direct => match cmd {
@@ -294,7 +363,8 @@ fn remediation(capability: Capability, cmd: &Command) -> &'static str {
             _ => " It operates on a cluster.",
         },
         Capability::Local => " It does not address a graph.",
-        Capability::Any | Capability::Served => "",
+        Capability::Served => " Address the server with --server <name|url> or --profile <name>.",
+        Capability::Any => "",
     }
 }
 
@@ -305,16 +375,41 @@ mod tests {
     use super::*;
 
     #[test]
-    fn server_addressing_allowed_exactly_on_any_and_served() {
-        // The behavior-preservation contract: `--server`/`--graph` apply to the
-        // served-graph capabilities (`any`, `served`) and nothing else. This is
-        // the old "Data plane only" allow set, re-expressed — graphs (the one
-        // Data→Served verb) was already allowed.
-        assert!(Capability::Any.accepts_server_addressing());
-        assert!(Capability::Served.accepts_server_addressing());
-        assert!(!Capability::Direct.accepts_server_addressing());
-        assert!(!Capability::Control.accepts_server_addressing());
-        assert!(!Capability::Local.accepts_server_addressing());
+    fn scope_flag_matrix_matches_capabilities() {
+        // The full flag × capability contract in one place. Rows cover every
+        // capability, both cluster_ok refinements of `direct` (optimize vs
+        // init) and of `control` (queries vs cluster). `served` is the
+        // registry scope: server addressing only — --graph/--store/--as are
+        // rejected (--graph used to corrupt the registry URL to
+        // /graphs/<id>/graphs).
+        let parse = |args: &[&str]| Cli::try_parse_from(args).unwrap().command;
+        // (command, [server, cluster, graph, store, as, profile])
+        let rows = [
+            (parse(&["omnigraph", "query", "q"]), [true, false, true, true, true, true]),
+            (parse(&["omnigraph", "graphs", "list"]), [true, false, false, false, false, true]),
+            (parse(&["omnigraph", "optimize", "g.omni"]), [false, true, true, true, false, true]),
+            (
+                parse(&["omnigraph", "init", "--schema", "s.pg", "g.omni"]),
+                [false, false, false, true, false, true],
+            ),
+            (parse(&["omnigraph", "queries", "list"]), [false, true, true, false, true, true]),
+            (
+                parse(&["omnigraph", "cluster", "status", "--config", "."]),
+                [false, false, false, false, true, true],
+            ),
+            (parse(&["omnigraph", "version"]), [false, false, false, false, false, true]),
+        ];
+        for (cmd, expected) in &rows {
+            let capability = command_capability(cmd);
+            for (flag, want) in ScopeFlag::ALL.into_iter().zip(*expected) {
+                assert_eq!(
+                    flag_applies(flag, capability, cmd),
+                    want,
+                    "{flag:?} on `{}` ({capability:?})",
+                    command_label(cmd),
+                );
+            }
+        }
     }
 
     #[test]
