@@ -124,6 +124,48 @@ impl GraphClient {
         })
     }
 
+    /// Served-REGISTRY factory (RFC-011): resolve a server scope (`--server`
+    /// / `--profile` / `defaults.server`) to the bare server base URL for
+    /// `graphs list`. Synchronous by design: the RFC-011 D7 multi-graph probe
+    /// (`require_graph_for_multi_graph_server`) is async, so it structurally
+    /// cannot run on this path — `graphs list` IS the enumeration the probe
+    /// performs. There is no graph selection and no `/graphs/<id>` append; a
+    /// scope's `default_graph` is deliberately ignored (rejecting a config
+    /// default would make `graphs list` unusable in any profile that sets
+    /// one, and the registry is server-scoped either way). An explicit
+    /// `--graph` never reaches here — the addressing guard rejects it.
+    pub(crate) fn resolve_registry(
+        server: Option<&str>,
+        profile: Option<&str>,
+    ) -> Result<Self> {
+        let scope = crate::scope::resolve_scope(
+            &crate::operator::load_operator_config()?,
+            crate::planes::Capability::Served,
+            crate::scope::ScopeFlags {
+                profile,
+                store: None,
+                server,
+                cluster: None,
+                graph: None,
+                uri: None,
+            },
+        )?;
+        let Some(server) = scope.server.as_deref() else {
+            bail!(
+                "`graphs list` needs a server scope — pass --server <name|url> or \
+                 --profile <name>, or set `defaults.server` in ~/.omnigraph/config.yaml"
+            );
+        };
+        let client = Self::registry_client(server)?;
+        if !is_remote_uri(client.uri()) {
+            bail!(
+                "a server scope resolves to an http(s):// URL; `{}` is not one",
+                client.uri()
+            );
+        }
+        Ok(client)
+    }
+
     /// Resolve the addressing (positional URI / `--target` / `--server`)
     /// and credential once, then pick the variant by URI scheme — the
     /// single branch point that replaces every per-command `is_remote`
@@ -821,11 +863,11 @@ impl GraphClient {
         }
     }
 
-    /// `graphs list` — enumerate the graphs a remote multi-graph server
-    /// serves (`GET /graphs`). Remote-only by design: there is no local
-    /// enumeration endpoint, so the Embedded arm fails loudly. Routing it
-    /// through the enum still buys the shared `resolve()` addressing/token
-    /// preamble.
+    /// `graphs list` — enumerate the graphs a multi-graph server serves
+    /// (`GET /graphs`). Reached only through registry-addressed clients
+    /// (`resolve_registry` / the D7 probe's `registry_client`), which always
+    /// build the Remote variant — the Embedded arm is unreachable by
+    /// construction and kept as a defensive internal-invariant bail.
     pub(crate) async fn list_graphs(&self) -> Result<GraphListResponse> {
         match self {
             GraphClient::Remote {
@@ -843,10 +885,29 @@ impl GraphClient {
                 .await
             }
             GraphClient::Embedded { .. } => bail!(
-                "`omnigraph graphs list` requires a remote multi-graph server \
-                 (--server <url>). To enumerate the graphs in a cluster, run \
-                 `omnigraph cluster status --config <dir>`."
+                "internal error: `graphs list` reached an embedded client — registry \
+                 addressing always resolves a server"
             ),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn resolve_registry_is_sync_and_yields_the_bare_base_url() {
+        // Structural proof the RFC-011 D7 multi-graph probe cannot fire on the
+        // graphs-list path: resolve_registry is synchronous (called here with
+        // no tokio runtime), while the probe is async and performs GET
+        // /graphs. Also pins the URL-corruption fix: the bare base URL with
+        // the trailing slash trimmed and no `/graphs/<id>` segment. A literal
+        // `://` --server value bypasses the operator server registry, so a
+        // developer's real config cannot change the outcome.
+        let client =
+            GraphClient::resolve_registry(Some("http://server.invalid:9/"), None).unwrap();
+        assert_eq!(client.uri(), "http://server.invalid:9");
+        assert!(client.is_remote());
     }
 }

@@ -16,7 +16,7 @@ pub(crate) const DEFAULT_BEARER_TOKEN_ENV: &str = "OMNIGRAPH_BEARER_TOKEN";
 COMMANDS BY CAPABILITY:\n  \
 any — run against a graph, served (--server / --profile) or embedded (--store / a \
 URI): query, mutate, load, branch, snapshot, export, commit, schema show/apply.\n  \
-served — require a server: graphs.\n  \
+served — require a server (registry scope, --server/--profile only): graphs.\n  \
 direct — direct storage access; reject --server (init, optimize, repair, cleanup, \
 schema plan, lint).\n  \
 control — manage or inspect a cluster (cluster via --config; policy & queries via \
@@ -463,17 +463,15 @@ pub(crate) enum ClusterCommand {
 
 /// Operations on the graph registry of a multi-graph server (MR-668).
 ///
-/// All operations target a remote multi-graph server URL (http:// or
-/// https://). Local-URI invocations return a clear error. To add or
-/// remove graphs, operators edit `omnigraph.yaml` directly and restart
-/// the server — runtime mutation is not exposed in v0.6.0.
+/// Registry scope (RFC-011): these address the server itself, not a graph
+/// within it — `--server <name|url>` / `--profile <name>` apply, while
+/// `--graph`, `--store`, and `--as` are rejected by the addressing guard.
+/// To add or remove graphs, operators run `cluster apply` and restart the
+/// server — runtime mutation is not exposed.
 #[derive(Debug, Subcommand)]
 pub(crate) enum GraphsCommand {
     /// List every graph registered with the multi-graph server.
     List {
-        /// Remote server URL (e.g. `https://server.example.com`).
-        #[arg(long)]
-        uri: Option<String>,
         #[arg(long)]
         json: bool,
     },
