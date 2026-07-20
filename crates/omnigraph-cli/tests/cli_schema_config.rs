@@ -599,6 +599,82 @@ fn graphs_list_rejects_graph_selector() {
     );
 }
 
+/// Operator home for the graphs-list registry-resolution tests: a store-bound
+/// and a cluster-bound profile, neither of which can carry a served-registry
+/// command.
+fn registry_profile_home() -> tempfile::TempDir {
+    let home = tempfile::tempdir().unwrap();
+    std::fs::write(
+        home.path().join("config.yaml"),
+        "servers:\n  prod:\n    url: https://graph.example.com\n\
+         clusters:\n  brain:\n    root: s3://acme/clusters/brain\n\
+         profiles:\n\
+         \x20 localdev:\n    store: file:///data/dev.omni\n\
+         \x20 brain-admin:\n    cluster: brain\n",
+    )
+    .unwrap();
+    home
+}
+
+#[test]
+fn graphs_list_without_scope_needs_server() {
+    // No addressing and no operator defaults: the served-registry resolver
+    // asks for a server scope — not the graph-shaped "no graph addressed"
+    // advice, which points at flags graphs list cannot consume.
+    let output = output_failure(cli().arg("graphs").arg("list"));
+    let stderr = String::from_utf8_lossy(&output.stderr).into_owned();
+    assert!(
+        stderr.contains("`graphs list` needs a server scope")
+            && stderr.contains("--server <name|url> or --profile <name>"),
+        "expected the needs-a-server-scope error in stderr; got:\n{stderr}"
+    );
+}
+
+#[test]
+fn graphs_list_rejects_store_bound_profile() {
+    // A store-bound profile resolves a single graph's storage; the registry
+    // is server-scoped, so resolution fails with scope-shaped advice instead
+    // of the late embedded-arm engine-limitation message.
+    let home = registry_profile_home();
+    let output = output_failure(
+        cli()
+            .env("OMNIGRAPH_HOME", home.path())
+            .arg("graphs")
+            .arg("list")
+            .arg("--profile")
+            .arg("localdev"),
+    );
+    let stderr = String::from_utf8_lossy(&output.stderr).into_owned();
+    assert!(
+        stderr.contains("requires a server")
+            && stderr.contains("profile 'localdev' resolves a store scope"),
+        "expected the served store-scope rejection in stderr; got:\n{stderr}"
+    );
+}
+
+#[test]
+fn graphs_list_rejects_cluster_bound_profile() {
+    // A cluster-bound profile is control-plane addressing; the rejection
+    // points at `cluster status` for cluster-graph enumeration instead of the
+    // misleading graph-data-command error.
+    let home = registry_profile_home();
+    let output = output_failure(
+        cli()
+            .env("OMNIGRAPH_HOME", home.path())
+            .arg("graphs")
+            .arg("list")
+            .arg("--profile")
+            .arg("brain-admin"),
+    );
+    let stderr = String::from_utf8_lossy(&output.stderr).into_owned();
+    assert!(
+        stderr.contains("requires a server")
+            && stderr.contains("profile 'brain-admin' resolves a cluster scope")
+            && stderr.contains("cluster status"),
+        "expected the served cluster-scope rejection in stderr; got:\n{stderr}"
+    );
+}
+
 #[test]
 fn graphs_list_rejects_as_actor() {
     // The registry read carries no actor; `--as` is for direct-engine and
