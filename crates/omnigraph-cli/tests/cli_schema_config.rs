@@ -551,9 +551,11 @@ fn graphs_subcommand_help_lists_list_only() {
 }
 
 #[test]
-fn graphs_list_against_local_uri_errors_with_remote_only_message() {
-    // RFC-011: `graphs list` is served-only; a `--store` (local) address has no
-    // enumeration endpoint, so it fails loudly pointing at a server / cluster.
+fn graphs_list_rejects_store_scope() {
+    // `graphs list` is a served-registry command: it enumerates a server's
+    // graphs, so a `--store` (local) address can never apply. The addressing
+    // guard rejects it up front instead of failing late in the client with an
+    // engine-limitation message.
     let output = output_failure(
         cli()
             .arg("graphs")
@@ -563,7 +565,51 @@ fn graphs_list_against_local_uri_errors_with_remote_only_message() {
     );
     let stderr = String::from_utf8_lossy(&output.stderr).into_owned();
     assert!(
-        stderr.contains("remote multi-graph server"),
-        "expected a remote-server rejection in stderr; got:\n{stderr}"
+        stderr.contains("`graphs list` is a served command")
+            && stderr.contains(
+                "--store addresses a single graph's storage directly and does not apply"
+            )
+            && stderr.contains("Address the server with --server <name|url> or --profile <name>."),
+        "expected the addressing-guard store rejection in stderr; got:\n{stderr}"
+    );
+}
+
+#[test]
+fn graphs_list_rejects_graph_selector() {
+    // `graphs list` IS the enumeration — selecting a graph is meaningless, and
+    // historically `--graph` corrupted the URL to `/graphs/<id>/graphs` (404).
+    // The guard rejects it before any network I/O.
+    let output = output_failure(
+        cli()
+            .arg("graphs")
+            .arg("list")
+            .arg("--server")
+            .arg("http://127.0.0.1:9")
+            .arg("--graph")
+            .arg("atlas"),
+    );
+    let stderr = String::from_utf8_lossy(&output.stderr).into_owned();
+    assert!(
+        stderr.contains("`graphs list` is a served command")
+            && stderr.contains(
+                "--graph selects a graph within a server or cluster scope and does not apply"
+            )
+            && stderr.contains("Address the server with --server <name|url> or --profile <name>."),
+        "expected the addressing-guard graph rejection in stderr; got:\n{stderr}"
+    );
+}
+
+#[test]
+fn graphs_list_rejects_as_actor() {
+    // The registry read carries no actor; `--as` is for direct-engine and
+    // cluster writes. Rejected loudly instead of silently ignored.
+    let output = output_failure(cli().arg("graphs").arg("list").arg("--as").arg("act-op"));
+    let stderr = String::from_utf8_lossy(&output.stderr).into_owned();
+    assert!(
+        stderr.contains("`graphs list` is a served command")
+            && stderr.contains(
+                "--as sets the actor for a direct-engine or cluster write and does not apply"
+            ),
+        "expected the addressing-guard --as rejection in stderr; got:\n{stderr}"
     );
 }

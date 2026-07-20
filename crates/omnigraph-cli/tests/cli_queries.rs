@@ -115,6 +115,28 @@ fn alias_rejects_global_scope_flags_that_the_binding_owns() {
 }
 
 #[test]
+fn queries_list_with_store_flag_errors() {
+    // `queries list` reads a cluster's applied state; a single-graph `--store`
+    // address can never apply. Rejected loudly at the addressing guard (was:
+    // silently ignored, then failed later asking for a cluster).
+    let output = output_failure(
+        cli()
+            .arg("--store")
+            .arg("file:///tmp/graph.omni")
+            .arg("queries")
+            .arg("list"),
+    );
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("`queries list` is a cluster control command")
+            && stderr.contains(
+                "--store addresses a single graph's storage directly and does not apply"
+            ),
+        "expected the addressing-guard store rejection; got: {stderr}"
+    );
+}
+
+#[test]
 fn queries_and_policy_wrong_server_scope_points_at_cluster_scope() {
     let output = output_failure(cli().arg("--server").arg("prod").arg("queries").arg("list"));
     let stderr = String::from_utf8_lossy(&output.stderr);
