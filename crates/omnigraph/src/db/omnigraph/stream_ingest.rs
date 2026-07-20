@@ -62,7 +62,7 @@ struct StreamAuthorityCapture {
 impl Omnigraph {
     /// Admit one already-normalized, non-empty physical batch into the private
     /// B1 MemWAL profile and acknowledge only after Lance's durability watcher
-    /// succeeds.
+    /// succeeds and the same worker observes no successor shard epoch.
     ///
     /// The `Arc` receiver is intentional.  The worker owns a detached task so
     /// dropping the requesting future cannot abandon an invoked put, its

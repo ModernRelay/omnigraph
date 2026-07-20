@@ -145,11 +145,12 @@ pub enum OmniError {
         rows: u64,
         bytes: u64,
     },
-    /// RFC-026 invoked Lance's MemWAL append but could not prove the outcome of
-    /// its durability watcher. The attempt may be durable and is intentionally
-    /// never translated into a row-effect-free retry. Stable caller ordinals
-    /// identify the ambiguous invocation without pretending that RC.1 exposes
-    /// an attributable WAL coordinate.
+    /// RFC-026 invoked Lance's MemWAL append but could not prove the complete
+    /// acknowledgement boundary: watcher durability plus no observed successor
+    /// writer epoch. The attempt may be durable and is intentionally never
+    /// translated into a row-effect-free retry. Stable caller ordinals identify
+    /// the ambiguous invocation without pretending that RC.1 exposes an
+    /// attributable WAL coordinate.
     #[error(
         "stream acknowledgement unknown for table {stable_table_id:016x}:{table_incarnation_id:016x}, shard {shard_id}, ordinals {caller_ordinal_start}..={caller_ordinal_end}: {reason}"
     )]

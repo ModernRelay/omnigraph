@@ -5,8 +5,9 @@
 //! This module is deliberately below graph orchestration.  The caller owns the
 //! recovery barrier and durable lifecycle checks; this module owns the parts
 //! which must not escape the serialized worker: exact generation accounting,
-//! `put_no_wait` plus its watcher, replay classification, the RC.1 replay
-//! watermark bridge, seal/drain proof, and quiesced retirement.
+//! `put_no_wait` plus its watcher and post-durability epoch check, replay
+//! classification, the RC.1 replay watermark bridge, seal/drain proof, and
+//! quiesced retirement.
 
 use std::collections::{BTreeMap, HashMap};
 use std::fmt::Display;
@@ -2830,6 +2831,58 @@ impl MemWalWorkerRegistry {
             self.retain_shared_retirement(slot, worker, authority).await;
             return Err(unknown);
         }
+
+        // RC.1 checks shard-epoch fencing after a WAL PUT collision or error,
+        // but not after a successful PUT.  The durability watcher therefore
+        // proves persistence, not that no successor writer has claimed the
+        // shard at the acknowledgement boundary.  Recheck through Lance's
+        // public surface before returning a clean ack.  `check_fenced` treats a
+        // missing manifest as unfenced, which is safe only under B1's separate
+        // prohibition on raw `_mem_wal` deletion.  Any failure is
+        // post-invocation: the row may be durable, so retire the worker and
+        // report AckUnknown rather than presenting an effect-free fence or
+        // retry signal.
+        let fence_writer = Arc::clone(&worker.writer);
+        let mut fence_task = tokio::spawn(async move { fence_writer.check_fenced().await });
+        match tokio::time::timeout_at(deadline, &mut fence_task).await {
+            Ok(Ok(Ok(()))) => {}
+            Ok(Ok(Err(error))) => {
+                *mode = WorkerMode::Retiring;
+                drop(mode);
+                let unknown = worker.ack_unknown(
+                    caller_ordinals,
+                    format!("post-durability writer fence check failed: {error}"),
+                );
+                self.retain_shared_retirement(slot, worker, authority).await;
+                return Err(unknown);
+            }
+            Ok(Err(error)) => {
+                *mode = WorkerMode::Retiring;
+                drop(mode);
+                let unknown = worker.ack_unknown(
+                    caller_ordinals,
+                    format!("post-durability writer fence owner task failed: {error}"),
+                );
+                self.retain_shared_retirement(slot, worker, authority).await;
+                return Err(unknown);
+            }
+            Err(_) => {
+                *mode = WorkerMode::Retiring;
+                drop(mode);
+                let unknown = worker.ack_unknown(
+                    caller_ordinals,
+                    format!(
+                        "post-durability writer fence check did not settle within the {} ms invocation deadline",
+                        invocation_deadline.as_millis()
+                    ),
+                );
+                self.retain_shared_after_settle(slot, worker, authority, async move {
+                    let _ = fence_task.await;
+                });
+                return Err(unknown);
+            }
+        }
+
         *mode = WorkerMode::Admit(reserved);
         *worker
             .last_used
@@ -4333,10 +4386,12 @@ mod tests {
         let implementation = source.split("#[cfg(test)]").next().unwrap();
         assert!(implementation.contains("timeout_at(deadline, &mut invoked)"));
         assert!(implementation.contains("timeout_at(deadline, &mut watcher_task)"));
+        assert!(implementation.contains("timeout_at(deadline, &mut fence_task)"));
         assert!(implementation.contains("timeout_at(deadline, &mut physical_cut)"));
         assert!(implementation.contains("timeout_at(deadline, &mut open_task)"));
         assert!(!implementation.contains("timeout_at(deadline, worker.writer.put_no_wait"));
         assert!(!implementation.contains("timeout_at(deadline, watcher.wait()"));
+        assert!(!implementation.contains("timeout_at(deadline, worker.writer.check_fenced()"));
         assert!(!implementation.contains("timeout_at(deadline, physical_cut).await"));
         assert!(!implementation.contains("timeout_at(deadline, opener())"));
         assert!(implementation.contains("if let Ok(Ok((_, Some(mut watcher)))) = invoked.await"));
