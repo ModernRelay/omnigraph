@@ -66,10 +66,13 @@ async fn main() -> Result<()> {
         Cli::from_arg_matches(&matches)?
     };
     let http_client = build_http_client()?;
-    // RFC-010 Slice 1: reject data-plane addressing flags (--server/--graph) on
-    // a verb that doesn't live on the data plane, from one declared table —
-    // before any per-command dispatch.
+    // RFC-010 Slice 1: reject scope-addressing flags a verb can't consume,
+    // from one declared flag × capability matrix — before any per-command
+    // dispatch.
     planes::guard_addressing(&cli)?;
+    // The verb's declared capability, threaded into scope resolution so the
+    // resolver and the guard share one classification (planes.rs).
+    let capability = planes::command_capability(&cli.command);
     match cli.command {
         Command::Login { name, token, json } => {
             let token = match token {
@@ -257,6 +260,7 @@ async fn main() -> Result<()> {
             json,
         } => {
             let client = client::GraphClient::resolve_with_policy(
+                capability,
                 cli.server.as_deref(),
                 cli.graph.as_deref(),
                 uri,
@@ -293,6 +297,7 @@ async fn main() -> Result<()> {
                  use `omnigraph load --from <base> --mode <mode>` (ingest defaults: --from main --mode merge)"
             );
             let client = client::GraphClient::resolve_with_policy(
+                capability,
                 cli.server.as_deref(),
                 cli.graph.as_deref(),
                 uri,
@@ -321,6 +326,7 @@ async fn main() -> Result<()> {
                 json,
             } => {
                 let client = client::GraphClient::resolve_with_policy(
+                    capability,
                     cli.server.as_deref(),
                     cli.graph.as_deref(),
                     uri,
@@ -343,6 +349,7 @@ async fn main() -> Result<()> {
                 json,
             } => {
                 let client = client::GraphClient::resolve(
+                    capability,
                     cli.server.as_deref(),
                     cli.graph.as_deref(),
                     uri,
@@ -365,6 +372,7 @@ async fn main() -> Result<()> {
                 json,
             } => {
                 let client = client::GraphClient::resolve_with_policy(
+                    capability,
                     cli.server.as_deref(),
                     cli.graph.as_deref(),
                     uri,
@@ -390,6 +398,7 @@ async fn main() -> Result<()> {
                 json,
             } => {
                 let client = client::GraphClient::resolve_with_policy(
+                    capability,
                     cli.server.as_deref(),
                     cli.graph.as_deref(),
                     uri,
@@ -445,6 +454,7 @@ async fn main() -> Result<()> {
                 json,
             } => {
                 let client = client::GraphClient::resolve(
+                    capability,
                     cli.server.as_deref(),
                     cli.graph.as_deref(),
                     uri,
@@ -465,6 +475,7 @@ async fn main() -> Result<()> {
                 json,
             } => {
                 let client = client::GraphClient::resolve(
+                    capability,
                     cli.server.as_deref(),
                     cli.graph.as_deref(),
                     uri,
@@ -523,6 +534,7 @@ async fn main() -> Result<()> {
                 allow_data_loss,
             } => {
                 let client = client::GraphClient::resolve_with_policy(
+                    capability,
                     cli.server.as_deref(),
                     cli.graph.as_deref(),
                     uri,
@@ -570,6 +582,7 @@ async fn main() -> Result<()> {
                 json,
             } => {
                 let client = client::GraphClient::resolve(
+                    capability,
                     cli.server.as_deref(),
                     cli.graph.as_deref(),
                     uri,
@@ -631,6 +644,7 @@ async fn main() -> Result<()> {
             json,
         } => {
             let client = client::GraphClient::resolve(
+                capability,
                 cli.server.as_deref(),
                 cli.graph.as_deref(),
                 uri,
@@ -659,6 +673,7 @@ async fn main() -> Result<()> {
             table_keys,
         } => {
             let client = client::GraphClient::resolve(
+                capability,
                 cli.server.as_deref(),
                 cli.graph.as_deref(),
                 uri,
@@ -688,6 +703,7 @@ async fn main() -> Result<()> {
             json,
         } => {
             let client = client::GraphClient::resolve(
+                capability,
                 cli.server.as_deref(),
                 cli.graph.as_deref(),
                 None,
@@ -733,6 +749,7 @@ async fn main() -> Result<()> {
             json,
         } => {
             let client = client::GraphClient::resolve_with_policy(
+                capability,
                 cli.server.as_deref(),
                 cli.graph.as_deref(),
                 None,
