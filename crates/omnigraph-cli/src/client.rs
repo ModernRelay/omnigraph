@@ -173,6 +173,7 @@ impl GraphClient {
     /// path, not the policy-bearing `resolve_cli_graph`). Used by reads
     /// and `query` (which opens without policy, like the reads).
     pub(crate) async fn resolve(
+        capability: crate::planes::Capability,
         server: Option<&str>,
         graph: Option<&str>,
         uri: Option<String>,
@@ -181,10 +182,14 @@ impl GraphClient {
     ) -> Result<Self> {
         // RFC-011: a scope (profile / --store / operator defaults) may stand in
         // for omitted addressing. The explicit branch passes server/graph/uri
-        // straight through, so existing invocations are unchanged.
+        // straight through, so existing invocations are unchanged. The caller
+        // threads its verb's declared capability (planes::command_capability)
+        // so scope resolution and the addressing guard share one
+        // classification; every current caller is a data-plane (`Any`) verb —
+        // registry-scoped `graphs list` uses `resolve_registry` instead.
         let scope = crate::scope::resolve_scope(
             &crate::operator::load_operator_config()?,
-            crate::planes::Capability::Any,
+            capability,
             crate::scope::ScopeFlags { profile, store, server, cluster: None, graph, uri },
         )?;
         require_graph_for_multi_graph_server(&scope).await?;
@@ -216,6 +221,7 @@ impl GraphClient {
     /// resolution order matches the write arms exactly: server flag →
     /// bearer token → graph.
     pub(crate) async fn resolve_with_policy(
+        capability: crate::planes::Capability,
         server: Option<&str>,
         graph: Option<&str>,
         uri: Option<String>,
@@ -224,10 +230,11 @@ impl GraphClient {
         store: Option<&str>,
     ) -> Result<Self> {
         // RFC-011 scope translation (see `resolve`); explicit addressing passes
-        // through unchanged.
+        // through unchanged, and the caller threads its verb's declared
+        // capability.
         let scope = crate::scope::resolve_scope(
             &crate::operator::load_operator_config()?,
-            crate::planes::Capability::Any,
+            capability,
             crate::scope::ScopeFlags { profile, store, server, cluster: None, graph, uri },
         )?;
         require_graph_for_multi_graph_server(&scope).await?;
