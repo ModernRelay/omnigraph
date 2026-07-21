@@ -110,8 +110,7 @@ impl ScopeFlag {
     }
 
     /// What the flag means, for the wrong-address error ("{clause} and does
-    /// not apply"). `Profile` is never rejected (it is a scope default that
-    /// applies everywhere), so its clause is unreachable in practice.
+    /// not apply").
     fn rejection_clause(self) -> &'static str {
         match self {
             ScopeFlag::Server => "--server addresses a served graph",
@@ -182,9 +181,21 @@ fn flag_applies(flag: ScopeFlag, capability: Capability, cmd: &Command) -> bool 
             ),
             Served | Direct | Local => false,
         },
-        // A profile is a scope-default bundle; rejecting the flag while the
-        // $OMNIGRAPH_PROFILE env stays honored would be inconsistent.
-        ScopeFlag::Profile => true,
+        // A profile is consumed wherever scope resolution runs: the data/
+        // served resolvers, the maintenance-URI resolver, and the policy/
+        // queries cluster-scope resolver. `init` (positional target only),
+        // the `cluster` family (`--config`), and local verbs never resolve a
+        // scope, so an explicit --profile there would be silently discarded —
+        // including any store binding it carries. The ambient
+        // $OMNIGRAPH_PROFILE default remains ignored by those verbs (config
+        // default vs explicit intent — the same rule as `default_graph` on
+        // the registry path).
+        ScopeFlag::Profile => match capability {
+            Any | Served => true,
+            Direct => !matches!(cmd, Command::Init { .. }),
+            Control => !matches!(cmd, Command::Cluster { .. }),
+            Local => false,
+        },
     }
 }
 
@@ -408,24 +419,26 @@ mod tests {
             (parse(&["omnigraph", "query", "q"]), [true, false, true, true, true, true]),
             (parse(&["omnigraph", "graphs", "list"]), [true, false, false, false, false, true]),
             (parse(&["omnigraph", "optimize", "g.omni"]), [false, true, true, true, false, true]),
-            // `init` addresses its target positionally — --store is rejected,
-            // not silently ignored (unlike the other direct verbs).
+            // `init` addresses its target positionally and never resolves a
+            // scope — --store and --profile are rejected, not silently
+            // ignored (unlike the other direct verbs).
             (
                 parse(&["omnigraph", "init", "--schema", "s.pg", "g.omni"]),
-                [false, false, false, false, false, true],
+                [false, false, false, false, false, false],
             ),
             // Read-only control verbs never read the actor; only
-            // `cluster apply`/`approve` do.
+            // `cluster apply`/`approve` do. The `cluster` family addresses
+            // its config with --config and never resolves a profile scope.
             (parse(&["omnigraph", "queries", "list"]), [false, true, true, false, false, true]),
             (
                 parse(&["omnigraph", "cluster", "status", "--config", "."]),
-                [false, false, false, false, false, true],
+                [false, false, false, false, false, false],
             ),
             (
                 parse(&["omnigraph", "cluster", "apply", "--config", "."]),
-                [false, false, false, false, true, true],
+                [false, false, false, false, true, false],
             ),
-            (parse(&["omnigraph", "version"]), [false, false, false, false, false, true]),
+            (parse(&["omnigraph", "version"]), [false, false, false, false, false, false]),
         ];
         for (cmd, expected) in &rows {
             let capability = command_capability(cmd);
