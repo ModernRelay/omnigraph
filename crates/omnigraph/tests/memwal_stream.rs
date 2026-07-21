@@ -7,19 +7,35 @@
 
 mod helpers;
 
+use std::collections::BTreeSet;
+use std::fmt;
 use std::sync::Arc;
+use std::sync::Mutex;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Duration;
 
 use arrow_array::{Array, ArrayRef, Int32Array, RecordBatch, StringArray};
 use arrow_schema::{DataType, Field, Schema};
+use async_trait::async_trait;
 use fail::FailScenario;
+use futures::StreamExt;
+use futures::stream::BoxStream;
 use lance::Dataset;
 use lance::dataset::mem_wal::{DatasetMemWalExt, ShardWriterConfig};
+use lance::io::WrappingObjectStore;
+use object_store::path::Path as ObjectPath;
+use object_store::{
+    CopyOptions, GetOptions, GetResult, ListResult, MultipartUpload, ObjectMeta, ObjectStore,
+    PutMultipartOptions, PutOptions, PutPayload, PutResult, Result as ObjectStoreResult,
+    UploadPart,
+};
 use omnigraph::db::{Omnigraph, ReadTarget};
 use omnigraph::error::OmniError;
 use omnigraph::failpoints::{ScopedFailPoint, names};
+use omnigraph::instrumentation::{QueryIoProbes, with_query_io_probes};
 use serial_test::serial;
+
+use helpers::memwal::CurrentMemWalInventory;
 
 const STREAM_SCHEMA: &str = "node Person { score: I32 }\n";
 const TWO_TABLE_STREAM_SCHEMA: &str = r#"
@@ -44,6 +60,411 @@ query insert_company($score: I32) {
     insert Company { score: $score }
 }
 "#;
+
+const PROVIDER_FAILURE_MESSAGE: &str = "injected RFC-026 provider exhaustion";
+const PROVIDER_PUT_TIMEOUT: Duration = Duration::from_secs(45);
+const PROVIDER_FOLD_TIMEOUT: Duration = Duration::from_secs(90);
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ProviderFailureTarget {
+    PartialGeneration,
+    ShardManifest,
+    WalEntry,
+}
+
+impl ProviderFailureTarget {
+    fn matches(self, location: &ObjectPath) -> bool {
+        let path = location.to_string();
+        let is_mem_wal = path.split('/').any(|part| part == "_mem_wal");
+        if !is_mem_wal {
+            return false;
+        }
+        match self {
+            Self::PartialGeneration => {
+                generation_root_in_path(&path).is_some() && path.ends_with("/bloom_filter.bin")
+            }
+            Self::ShardManifest => {
+                path.contains("/manifest/") && !path.ends_with("version_hint.json")
+            }
+            Self::WalEntry => path.contains("/wal/") && path.contains(".arrow"),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ProviderAccessKind {
+    Put,
+    MultipartStart,
+    MultipartPart,
+    MultipartComplete,
+    MultipartAbort,
+    Get,
+    Delete,
+    List,
+    ListResult,
+    ListWithOffset,
+    ListWithDelimiter,
+    CopyFrom,
+    CopyTo,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ProviderAccess {
+    kind: ProviderAccessKind,
+    path: String,
+}
+
+#[derive(Debug, Default)]
+struct ProviderFailureState {
+    active: Option<ProviderFailureTarget>,
+    failed: Vec<(ProviderFailureTarget, String)>,
+    accesses: Vec<ProviderAccess>,
+    successful_generation_writes: usize,
+}
+
+/// Fails real object-store writes made by Lance's detached MemWAL workers.
+///
+/// `QueryIoProbes` installs this on the table handle before the worker is
+/// opened, and OmniGraph propagates that task-local wrapper into detached put
+/// and fold owners. This therefore exercises the provider boundary rather than
+/// translating an OmniGraph failpoint into a provider-shaped error.
+#[derive(Debug, Clone, Default)]
+struct ProviderWriteFailure(Arc<Mutex<ProviderFailureState>>);
+
+impl ProviderWriteFailure {
+    fn arm(&self, target: ProviderFailureTarget) {
+        let mut state = self.0.lock().unwrap();
+        state.active = Some(target);
+        state.successful_generation_writes = 0;
+    }
+
+    fn disarm(&self) {
+        self.0.lock().unwrap().active = None;
+    }
+
+    fn failed_paths(&self, target: ProviderFailureTarget) -> Vec<String> {
+        self.0
+            .lock()
+            .unwrap()
+            .failed
+            .iter()
+            .filter(|(actual, _)| *actual == target)
+            .map(|(_, path)| path.clone())
+            .collect()
+    }
+
+    fn access_checkpoint(&self) -> usize {
+        self.0.lock().unwrap().accesses.len()
+    }
+
+    fn accesses_since(&self, checkpoint: usize) -> Vec<ProviderAccess> {
+        self.0.lock().unwrap().accesses[checkpoint..].to_vec()
+    }
+
+    fn successful_generation_writes(&self) -> usize {
+        self.0.lock().unwrap().successful_generation_writes
+    }
+
+    fn record(&self, kind: ProviderAccessKind, location: &ObjectPath) {
+        self.0.lock().unwrap().accesses.push(ProviderAccess {
+            kind,
+            path: location.to_string(),
+        });
+    }
+
+    fn record_successful_write(&self, location: &ObjectPath) {
+        if generation_root_in_path(&location.to_string()).is_some() {
+            self.0.lock().unwrap().successful_generation_writes += 1;
+        }
+    }
+
+    fn record_write_and_maybe_fail(
+        &self,
+        kind: ProviderAccessKind,
+        location: &ObjectPath,
+    ) -> Option<object_store::Error> {
+        let mut state = self.0.lock().unwrap();
+        state.accesses.push(ProviderAccess {
+            kind,
+            path: location.to_string(),
+        });
+        let target = state.active?;
+        if !target.matches(location) {
+            return None;
+        }
+        state.failed.push((target, location.to_string()));
+        Some(object_store::Error::Generic {
+            store: "rfc026-provider-failure",
+            source: Box::new(std::io::Error::other(PROVIDER_FAILURE_MESSAGE)),
+        })
+    }
+
+    fn assert_no_access_under_roots_since(
+        &self,
+        checkpoint: usize,
+        roots: &BTreeSet<String>,
+        boundary: &str,
+    ) {
+        let offending = self
+            .accesses_since(checkpoint)
+            .into_iter()
+            .filter(|access| {
+                roots
+                    .iter()
+                    .any(|root| path_is_at_or_under(&access.path, root))
+            })
+            .collect::<Vec<_>>();
+        assert!(
+            offending.is_empty(),
+            "{boundary} must not descend into, read, write, copy, or delete at/below retained unreferenced roots {roots:?}; observed {offending:?}"
+        );
+    }
+}
+
+impl WrappingObjectStore for ProviderWriteFailure {
+    fn wrap(&self, _store_prefix: &str, target: Arc<dyn ObjectStore>) -> Arc<dyn ObjectStore> {
+        Arc::new(ProviderFailingStore {
+            target,
+            failure: self.clone(),
+        })
+    }
+}
+
+#[derive(Debug)]
+struct ProviderFailingStore {
+    target: Arc<dyn ObjectStore>,
+    failure: ProviderWriteFailure,
+}
+
+impl fmt::Display for ProviderFailingStore {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "ProviderFailingStore({})", self.target)
+    }
+}
+
+#[derive(Debug)]
+struct ProviderTrackedMultipart {
+    target: Box<dyn MultipartUpload>,
+    failure: ProviderWriteFailure,
+    location: ObjectPath,
+}
+
+#[async_trait]
+impl MultipartUpload for ProviderTrackedMultipart {
+    fn put_part(&mut self, data: PutPayload) -> UploadPart {
+        self.failure
+            .record(ProviderAccessKind::MultipartPart, &self.location);
+        self.target.put_part(data)
+    }
+
+    async fn complete(&mut self) -> ObjectStoreResult<PutResult> {
+        self.failure
+            .record(ProviderAccessKind::MultipartComplete, &self.location);
+        let result = self.target.complete().await;
+        if result.is_ok() {
+            self.failure.record_successful_write(&self.location);
+        }
+        result
+    }
+
+    async fn abort(&mut self) -> ObjectStoreResult<()> {
+        self.failure
+            .record(ProviderAccessKind::MultipartAbort, &self.location);
+        self.target.abort().await
+    }
+}
+
+#[async_trait]
+impl ObjectStore for ProviderFailingStore {
+    async fn put_opts(
+        &self,
+        location: &ObjectPath,
+        payload: PutPayload,
+        opts: PutOptions,
+    ) -> ObjectStoreResult<PutResult> {
+        if let Some(error) = self
+            .failure
+            .record_write_and_maybe_fail(ProviderAccessKind::Put, location)
+        {
+            return Err(error);
+        }
+        let result = self.target.put_opts(location, payload, opts).await;
+        if result.is_ok() {
+            self.failure.record_successful_write(location);
+        }
+        result
+    }
+
+    async fn put_multipart_opts(
+        &self,
+        location: &ObjectPath,
+        opts: PutMultipartOptions,
+    ) -> ObjectStoreResult<Box<dyn MultipartUpload>> {
+        if let Some(error) = self
+            .failure
+            .record_write_and_maybe_fail(ProviderAccessKind::MultipartStart, location)
+        {
+            return Err(error);
+        }
+        let target = self.target.put_multipart_opts(location, opts).await?;
+        Ok(Box::new(ProviderTrackedMultipart {
+            target,
+            failure: self.failure.clone(),
+            location: location.clone(),
+        }))
+    }
+
+    async fn get_opts(
+        &self,
+        location: &ObjectPath,
+        options: GetOptions,
+    ) -> ObjectStoreResult<GetResult> {
+        self.failure.record(ProviderAccessKind::Get, location);
+        self.target.get_opts(location, options).await
+    }
+
+    fn delete_stream(
+        &self,
+        locations: BoxStream<'static, ObjectStoreResult<ObjectPath>>,
+    ) -> BoxStream<'static, ObjectStoreResult<ObjectPath>> {
+        let failure = self.failure.clone();
+        self.target.delete_stream(
+            locations
+                .map(move |location| {
+                    if let Ok(location) = &location {
+                        failure.record(ProviderAccessKind::Delete, location);
+                    }
+                    location
+                })
+                .boxed(),
+        )
+    }
+
+    fn list(
+        &self,
+        prefix: Option<&ObjectPath>,
+    ) -> BoxStream<'static, ObjectStoreResult<ObjectMeta>> {
+        self.failure.record(
+            ProviderAccessKind::List,
+            &prefix.cloned().unwrap_or_default(),
+        );
+        let failure = self.failure.clone();
+        self.target
+            .list(prefix)
+            .map(move |result| {
+                if let Ok(metadata) = &result {
+                    failure.record(ProviderAccessKind::ListResult, &metadata.location);
+                }
+                result
+            })
+            .boxed()
+    }
+
+    fn list_with_offset(
+        &self,
+        prefix: Option<&ObjectPath>,
+        offset: &ObjectPath,
+    ) -> BoxStream<'static, ObjectStoreResult<ObjectMeta>> {
+        self.failure.record(
+            ProviderAccessKind::ListWithOffset,
+            &prefix.cloned().unwrap_or_default(),
+        );
+        self.failure
+            .record(ProviderAccessKind::ListWithOffset, offset);
+        let failure = self.failure.clone();
+        self.target
+            .list_with_offset(prefix, offset)
+            .map(move |result| {
+                if let Ok(metadata) = &result {
+                    failure.record(ProviderAccessKind::ListResult, &metadata.location);
+                }
+                result
+            })
+            .boxed()
+    }
+
+    async fn list_with_delimiter(
+        &self,
+        prefix: Option<&ObjectPath>,
+    ) -> ObjectStoreResult<ListResult> {
+        self.failure.record(
+            ProviderAccessKind::ListWithDelimiter,
+            &prefix.cloned().unwrap_or_default(),
+        );
+        let result = self.target.list_with_delimiter(prefix).await?;
+        for metadata in &result.objects {
+            self.failure
+                .record(ProviderAccessKind::ListResult, &metadata.location);
+        }
+        Ok(result)
+    }
+
+    async fn copy_opts(
+        &self,
+        from: &ObjectPath,
+        to: &ObjectPath,
+        options: CopyOptions,
+    ) -> ObjectStoreResult<()> {
+        self.failure.record(ProviderAccessKind::CopyFrom, from);
+        if let Some(error) = self
+            .failure
+            .record_write_and_maybe_fail(ProviderAccessKind::CopyTo, to)
+        {
+            return Err(error);
+        }
+        let result = self.target.copy_opts(from, to, options).await;
+        if result.is_ok() {
+            self.failure.record_successful_write(to);
+        }
+        result
+    }
+}
+
+async fn mem_wal_inventory(uri: &str) -> CurrentMemWalInventory {
+    let inventory = helpers::memwal::current_mem_wal_inventory(uri).await;
+    assert!(
+        inventory.unknown_paths().is_empty(),
+        "provider-failure inventory must fail closed on unknown paths: {:?}",
+        inventory.unknown_paths()
+    );
+    inventory
+}
+
+fn generation_root_in_path(path: &str) -> Option<String> {
+    let parts = path.split('/').collect::<Vec<_>>();
+    let index = parts
+        .iter()
+        .position(|part| helpers::memwal::is_generation_root(part))?;
+    Some(parts[..=index].join("/"))
+}
+
+fn path_is_at_or_under(path: &str, root: &str) -> bool {
+    path == root
+        || path
+            .strip_prefix(root)
+            .is_some_and(|suffix| suffix.starts_with('/'))
+}
+
+fn assert_inventory_retained(
+    before: &CurrentMemWalInventory,
+    after: &CurrentMemWalInventory,
+    boundary: &str,
+) {
+    before.assert_path_class_size_retained_by(after);
+    assert!(
+        before.generation_roots.is_subset(&after.generation_roots),
+        "{boundary} must retain every previously listed generation root"
+    );
+}
+
+async fn enroll_stream_at(uri: &str) {
+    let db = Omnigraph::init(uri, STREAM_SCHEMA)
+        .await
+        .expect("provider-failure fixture must initialize");
+    db.failpoint_enroll_stream_table_for_test(TABLE)
+        .await
+        .expect("provider-failure fixture must enroll its one stream table");
+}
 
 async fn init_enrolled() -> (tempfile::TempDir, Arc<Omnigraph>) {
     init_enrolled_with_schema(STREAM_SCHEMA).await
@@ -1523,4 +1944,392 @@ async fn ack_unknown_retry_can_overwrite_a_newer_same_key_without_reconciling_th
         vec![("same-key".to_string(), 1)],
         "retrying ambiguous X after durable Y demonstrates the documented overwrite hazard; it does not prove X was reconciled"
     );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[serial]
+async fn provider_write_failures_preserve_acknowledged_rows_and_type_outcomes_local() {
+    let _scenario = FailScenario::setup();
+    let dir = tempfile::tempdir().unwrap();
+    let uri = dir.path().to_str().unwrap().to_string();
+    enroll_stream_at(&uri).await;
+
+    let failure = ProviderWriteFailure::default();
+    let probes = QueryIoProbes {
+        table_wrapper: Some(Arc::new(failure.clone())),
+        ..Default::default()
+    };
+    with_query_io_probes(probes, async {
+        let db = Arc::new(
+            Omnigraph::open(&uri)
+                .await
+                .expect("the enrolled fixture must reopen under the provider wrapper"),
+        );
+        let version_before = db
+            .snapshot_of(ReadTarget::branch("main"))
+            .await
+            .unwrap()
+            .version();
+
+        // A cold writer must first durably claim its epoch in the shard
+        // manifest. Failing that provider write happens before put_no_wait, so
+        // this refusal must remain effect-free and must not become AckUnknown.
+        failure.arm(ProviderFailureTarget::ShardManifest);
+        let rejected = physical_batch(&db, &[("claim-refused".to_string(), 1)]).await;
+        let error = tokio::time::timeout(
+            PROVIDER_PUT_TIMEOUT,
+            db.failpoint_stream_b1_for_test(TABLE, Some(rejected), 0),
+        )
+        .await
+        .expect("the failed cold claim must settle")
+        .expect_err("provider exhaustion must refuse the cold claim");
+        failure.disarm();
+        assert!(matches!(error, OmniError::Lance(_)), "{error:?}");
+        assert!(
+            !matches!(error, OmniError::AckUnknown { .. }),
+            "a failed pre-invocation claim cannot be acknowledgement-ambiguous"
+        );
+        assert!(
+            error.to_string().contains(PROVIDER_FAILURE_MESSAGE),
+            "the typed substrate error must retain its provider cause: {error:?}"
+        );
+        assert!(
+            !failure
+                .failed_paths(ProviderFailureTarget::ShardManifest)
+                .is_empty(),
+            "the wrapper must have reached the detached cold-claim manifest write"
+        );
+        assert!(visible_rows(&db).await.is_empty());
+        assert_eq!(
+            db.snapshot_of(ReadTarget::branch("main"))
+                .await
+                .unwrap()
+                .version(),
+            version_before,
+            "provider refusal before put invocation cannot advance graph visibility"
+        );
+
+        // Establish one clean durability acknowledgement, then fail the next
+        // real WAL write. Lance has already accepted the second invocation into
+        // its asynchronous writer machinery, so OmniGraph must return
+        // AckUnknown while preserving the first durable row for replay.
+        let acknowledged = physical_batch(&db, &[("acknowledged".to_string(), 2)]).await;
+        db.failpoint_stream_b1_for_test(TABLE, Some(acknowledged), 1)
+            .await
+            .expect("the first row must cross the complete durability boundary");
+
+        failure.arm(ProviderFailureTarget::WalEntry);
+        let ambiguous = physical_batch(&db, &[("wal-refused".to_string(), 3)]).await;
+        let error = tokio::time::timeout(
+            PROVIDER_PUT_TIMEOUT,
+            db.failpoint_stream_b1_for_test(TABLE, Some(ambiguous), 2),
+        )
+        .await
+        .expect("the failed WAL persistence retries must settle")
+        .expect_err("a failed post-invocation WAL write cannot acknowledge cleanly");
+        failure.disarm();
+        assert!(matches!(error, OmniError::AckUnknown { .. }), "{error:?}");
+        assert!(
+            error.to_string().contains(PROVIDER_FAILURE_MESSAGE),
+            "AckUnknown must retain the provider failure cause: {error:?}"
+        );
+        assert!(
+            !failure
+                .failed_paths(ProviderFailureTarget::WalEntry)
+                .is_empty(),
+            "the wrapper must have reached the detached WAL persistence task"
+        );
+        assert!(
+            visible_rows(&db).await.is_empty(),
+            "neither a clean WAL ack nor a failed WAL invocation is graph publication"
+        );
+
+        tokio::time::timeout(
+            PROVIDER_FOLD_TIMEOUT,
+            db.failpoint_stream_b1_for_test(TABLE, None, 0),
+        )
+        .await
+        .expect("provider recovery fold must settle")
+        .expect("the earlier durable WAL row must remain replayable");
+        assert_eq!(
+            visible_rows(&db).await,
+            vec![("acknowledged".to_string(), 2)],
+            "provider exhaustion must neither lose a prior clean ack nor invent durability for the failed WAL write"
+        );
+        assert_eq!(
+            db.snapshot_of(ReadTarget::branch("main"))
+                .await
+                .unwrap()
+                .version(),
+            version_before + 1,
+            "only the recovery fold's manifest CAS may make the acknowledged row visible"
+        );
+    })
+    .await;
+}
+
+async fn provider_generation_failure_retains_unreferenced_generation_at(
+    uri: &str,
+    target: ProviderFailureTarget,
+) {
+    enroll_stream_at(uri).await;
+    let failure = ProviderWriteFailure::default();
+    let probes = QueryIoProbes {
+        table_wrapper: Some(Arc::new(failure.clone())),
+        ..Default::default()
+    };
+
+    with_query_io_probes(probes, async {
+        let db = Arc::new(
+            Omnigraph::open(uri)
+                .await
+                .expect("the enrolled fixture must reopen under the provider wrapper"),
+        );
+        let version_before = db
+            .snapshot_of(ReadTarget::branch("main"))
+            .await
+            .unwrap()
+            .version();
+        let row = physical_batch(&db, &[("retained-after-failure".to_string(), 41)]).await;
+        db.failpoint_stream_b1_for_test(TABLE, Some(row), 0)
+            .await
+            .expect("the row must be durably acknowledged before the fold failure");
+        let before_failure = mem_wal_inventory(uri).await;
+        assert!(
+            before_failure.generation_roots.is_empty(),
+            "the fixture must begin with WAL only and no flushed generation"
+        );
+
+        // The complete-output cell fails the shard-manifest publication after
+        // every generation object exists. The partial-output cell fails the
+        // later bloom write after the generation's Lance data objects exist but
+        // before the MemWAL generation envelope is complete. Neither path has
+        // shard-manifest authority for its randomized root.
+        failure.arm(target);
+        let error = tokio::time::timeout(
+            PROVIDER_FOLD_TIMEOUT,
+            db.failpoint_stream_b1_for_test(TABLE, None, 0),
+        )
+        .await
+        .expect("the failed generation publication must settle")
+        .expect_err("a provider failure after the physical cut must block the fold");
+        failure.disarm();
+        match error {
+            OmniError::RecoveryRequired {
+                operation_id,
+                reason,
+            } => {
+                assert!(operation_id.starts_with("stream-cut:"), "{operation_id}");
+                assert!(reason.contains(PROVIDER_FAILURE_MESSAGE), "{reason}");
+            }
+            other => panic!("post-cut provider failure must require recovery: {other:?}"),
+        }
+        assert!(
+            !failure.failed_paths(target).is_empty(),
+            "the wrapper must reach the selected provider failure after generation output"
+        );
+        if target == ProviderFailureTarget::PartialGeneration {
+            assert!(
+                failure.successful_generation_writes() > 0,
+                "partial-generation injection must follow at least one successful generation object write"
+            );
+            assert!(
+                failure
+                    .failed_paths(target)
+                    .iter()
+                    .all(|path| path.ends_with("/bloom_filter.bin")),
+                "the partial-generation cell must fail the deterministic post-data bloom boundary"
+            );
+        }
+        assert!(visible_rows(&db).await.is_empty());
+        assert_eq!(
+            db.snapshot_of(ReadTarget::branch("main"))
+                .await
+                .unwrap()
+                .version(),
+            version_before,
+            "a flushed generation is not graph-visible without the graph manifest CAS"
+        );
+
+        let after_failure = mem_wal_inventory(uri).await;
+        assert_inventory_retained(
+            &before_failure,
+            &after_failure,
+            "failed generation publication",
+        );
+        let failed_roots = after_failure.generation_roots.clone();
+        assert!(
+            !failed_roots.is_empty(),
+            "generation output must exist before its injected shard-manifest failure"
+        );
+        let referenced_after_failure = after_failure.referenced_generation_roots.clone();
+        assert!(
+            failed_roots.is_disjoint(&referenced_after_failure),
+            "a provider-refused generation publication must not authorize its randomized output: failed={failed_roots:?}, referenced={referenced_after_failure:?}"
+        );
+        if target == ProviderFailureTarget::PartialGeneration {
+            for root in &failed_roots {
+                assert!(
+                    !after_failure
+                        .objects
+                        .contains_key(&format!("{root}/bloom_filter.bin")),
+                    "the failed bloom write must leave a physically incomplete generation envelope"
+                );
+                assert!(
+                    !after_failure
+                        .objects
+                        .keys()
+                        .any(|path| path_is_at_or_under(path, &format!("{root}/_pk_index"))),
+                    "failure before the PK sidecar must leave a physically incomplete generation envelope"
+                );
+            }
+        }
+        // From this point the orphan roots are completely identified. The
+        // independent inventory reads above intentionally bypass this engine
+        // wrapper; every subsequent engine access remains in this log.
+        let orphan_access_checkpoint = failure.access_checkpoint();
+
+        // The retained WAL/cut owns progress. A new row cannot open a side
+        // generation around it; recovery must fold the exact durable prefix.
+        let blocked = physical_batch(&db, &[("must-not-pass-recovery".to_string(), 42)]).await;
+        let blocked_error = tokio::time::timeout(
+            PROVIDER_PUT_TIMEOUT,
+            db.failpoint_stream_b1_for_test(TABLE, Some(blocked), 1),
+        )
+            .await
+            .expect("fold-only admission refusal must settle")
+            .expect_err("unresolved retained state must block fresh admission");
+        assert!(
+            matches!(blocked_error, OmniError::FoldRequired { .. }),
+            "retained provider residue must reopen fold-only: {blocked_error:?}"
+        );
+        failure.assert_no_access_under_roots_since(
+            orphan_access_checkpoint,
+            &failed_roots,
+            "blocked admission",
+        );
+
+        tokio::time::timeout(
+            PROVIDER_FOLD_TIMEOUT,
+            db.failpoint_stream_b1_for_test(TABLE, None, 0),
+        )
+        .await
+        .expect("the recovery fold must settle after provider service resumes")
+        .expect("the retained WAL prefix must fold through a fresh generation");
+        assert_eq!(
+            visible_rows(&db).await,
+            vec![("retained-after-failure".to_string(), 41)],
+            "the unreferenced residue must be inert while the authoritative retry publishes exactly once"
+        );
+
+        let after_retry = mem_wal_inventory(uri).await;
+        assert_inventory_retained(
+            &after_failure,
+            &after_retry,
+            "successful recovery retry",
+        );
+        let retry_roots = after_retry.generation_roots.clone();
+        let fresh_retry_roots = retry_roots
+            .difference(&failed_roots)
+            .cloned()
+            .collect::<BTreeSet<_>>();
+        assert_eq!(
+            fresh_retry_roots.len(),
+            1,
+            "one recovery retry must materialize exactly one fresh randomized generation: failed={failed_roots:?}, retry={retry_roots:?}"
+        );
+        let referenced_after_retry = after_retry.referenced_generation_roots.clone();
+        assert!(
+            failed_roots.is_disjoint(&referenced_after_retry),
+            "recovery must not retroactively adopt provider-refused output"
+        );
+        assert!(
+            fresh_retry_roots.is_subset(&referenced_after_retry),
+            "the exact fresh retry root must become shard-manifest-authoritative: fresh={fresh_retry_roots:?}, referenced={referenced_after_retry:?}"
+        );
+        failure.assert_no_access_under_roots_since(
+            orphan_access_checkpoint,
+            &failed_roots,
+            "authoritative recovery retry",
+        );
+        drop(db);
+
+        let reopened = Arc::new(
+            Omnigraph::open(uri)
+                .await
+                .expect("the recovered graph must survive a cold reopen"),
+        );
+        assert_eq!(
+            visible_rows(&reopened).await,
+            vec![("retained-after-failure".to_string(), 41)],
+            "cold recovery must ignore retained unreferenced output and preserve one visible row"
+        );
+        let after_reopen = mem_wal_inventory(uri).await;
+        assert_inventory_retained(&after_failure, &after_reopen, "cold graph reopen");
+        assert!(
+            failed_roots.is_subset(&after_reopen.generation_roots),
+            "retain-all permits no raw `_mem_wal` deletion during reopen"
+        );
+        let referenced_after_reopen = after_reopen.referenced_generation_roots.clone();
+        assert!(
+            failed_roots.is_disjoint(&referenced_after_reopen),
+            "cold reopen must keep every provider-refused root non-authoritative"
+        );
+        failure.assert_no_access_under_roots_since(
+            orphan_access_checkpoint,
+            &failed_roots,
+            "recovery plus cold reopen",
+        );
+    })
+    .await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[serial]
+async fn provider_shard_manifest_failure_retains_unreferenced_generation_local() {
+    let _scenario = FailScenario::setup();
+    let dir = tempfile::tempdir().unwrap();
+    provider_generation_failure_retains_unreferenced_generation_at(
+        dir.path().to_str().unwrap(),
+        ProviderFailureTarget::ShardManifest,
+    )
+    .await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[serial]
+async fn provider_partial_generation_failure_retains_inert_unreferenced_residue_local() {
+    let _scenario = FailScenario::setup();
+    let dir = tempfile::tempdir().unwrap();
+    provider_generation_failure_retains_unreferenced_generation_at(
+        dir.path().to_str().unwrap(),
+        ProviderFailureTarget::PartialGeneration,
+    )
+    .await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[serial]
+async fn s3_provider_shard_manifest_failure_retains_unreferenced_generation() {
+    let _scenario = FailScenario::setup();
+    let Some(uri) = helpers::s3_test_graph_uri("memwal-b2a-provider") else {
+        eprintln!("SKIP s3_provider_shard_manifest_failure_retains_unreferenced_generation");
+        return;
+    };
+
+    provider_generation_failure_retains_unreferenced_generation_at(
+        &uri,
+        ProviderFailureTarget::ShardManifest,
+    )
+    .await;
+
+    // This destroys the test's unique isolated graph root after all retention
+    // assertions. It is fixture teardown, not a production MemWAL GC path.
+    let (store, root) = lance_io::object_store::ObjectStore::from_uri(&uri)
+        .await
+        .expect("configured S3/RustFS fixture must resolve for cleanup");
+    store
+        .remove_dir_all(root)
+        .await
+        .expect("configured S3/RustFS fixture cleanup must succeed");
 }

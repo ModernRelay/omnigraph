@@ -7,8 +7,8 @@ contract difference between an interactive graph commit and durable stream
 admission, the expected performance shape and evidence still required, and the
 build inventory.
 
-Current boundary: RFC-026 Phase A and the Phase-B1 private core are built, but
-public streaming is not. Gate R0 found and the follow-up fixed the one known
+Current boundary: RFC-026 Phase A, the Phase-B1 private core, and the private
+B2a unbounded retain-all gate are built, but public streaming is not. Gate R0 found and the follow-up fixed the one known
 all-shape closure failure: a legal high-entropy near-cap generation is durably
 acknowledged, materialized, folded, and published without lowering the
 8,192-row/32-MiB admission cap. The fold now charges logical Arrow slices and
@@ -33,12 +33,21 @@ product surface. There is still no `@stream`, public enrollment or row
 admission, SDK/HTTP/CLI/OpenAPI route, operator drain/resume workflow, or fresh
 read. RFC-026 remains Draft.
 
-RFC-026 now selects **unbounded retain-all on stock Lance** as the first storage
-profile. OmniGraph deletes no `_mem_wal` object and advertises no file-count or
-retained-byte limit. RC.1's missing durable materialization-attempt receipt and
-complete physical-output envelope therefore remain useful facts, but no longer
-block activation: the selected contract deliberately accepts monotonic storage
-and loud provider-capacity exhaustion. Managed reclamation and the Lance patch
+RFC-026 selects **unbounded retain-all on stock Lance** as the first storage
+profile, and its private B2a gate is implemented. OmniGraph deletes no canonical
+durable `_mem_wal` object and advertises no file-count or retained-byte limit.
+Lance may remove only a losing manifest-CAS temporary staging object. Complete
+and partial orphan generation output remains non-authoritative and untouched
+below its root through retry/reopen, though parent discovery may observe the
+prefix. Local/configured-RustFS provider failures pin the typed outcomes. The
+1/8/32/128 retained-history instrument keeps warm acknowledgement, replay,
+fold, visibility, table, graph-manifest, adapter, object, and RSS terms separate;
+it shows growing combined retained-history work without creating a quota or
+SLO. RC.1's missing durable materialization-attempt receipt and
+complete physical-output envelope therefore remain useful facts, but did not
+block the private B2a gate: the selected contract deliberately accepts
+monotonic storage and loud provider-capacity exhaustion. Public activation
+still waits on B2-common. Managed reclamation and the Lance patch
 are deferred optimizations. Common compare-and-chain token, trusted
 attribution, persistent lifecycle/correction, authorization, and product-
 parity contracts remain specified and inactive.
@@ -211,13 +220,15 @@ publication and recovery chassis. It reuses that chassis, but it adds stream
 binding and generation authority, fold-time validation, merge progress, and
 reject/audit atomicity.
 
-The selected retain-all profile never deletes folded MemWAL data. WAL entries,
+The selected retain-all profile never deletes canonical durable MemWAL data. WAL entries,
 flushed generations, random failed-attempt subtrees, and fence sentinels remain
 in the root even after the exact fold is graph-visible and recovery is settled.
 That is deliberate: generic table-version cleanup leaves `_mem_wal` untouched,
 and deleting the successor's empty WAL fence sentinel can let a stale writer
 report a later WAL PUT as durable because RC.1 lacks a post-success epoch
-check. OmniGraph therefore never deletes raw MemWAL paths.
+check. OmniGraph therefore never deletes a canonical durable MemWAL object.
+Lance's removal of a losing `.binpb.tmp.<uuid>` manifest-CAS staging object is
+allowed because it never became shard authority or retained history.
 
 A Lance-owned inspect/plan/execute protocol can add managed reclamation later.
 Its attempt receipts, inventory, fencing, and accounting are no longer the next
@@ -245,8 +256,8 @@ activation slice because the first profile promises no retained-storage bound.
    block a strict fold or be atomically dead-lettered when that mode is
    configured. The acknowledgement cannot be withdrawn.
 3. **More lifecycle machinery.** Enrollment, owner routing, backpressure,
-   drain/seal/resume, replay, fold health, and cleanup become operator-visible
-   responsibilities.
+   drain/seal/resume, replay, fold health, retained-capacity provisioning, and
+   retention diagnostics become operator-visible responsibilities.
 4. **Write and monotonic storage amplification.** Data may exist in a WAL
    entry, a flushed Lance generation, the base dataset, and maintained indexes.
    Under retain-all, those MemWAL copies are not reclaimed in place.
@@ -396,7 +407,7 @@ These are real substrate capabilities, not a turnkey graph-streaming product:
 | **`merged_generations`** | Merge progress updated atomically with a base-table merge. It supplies the marker needed for idempotent per-table folding; RFC-022 still owns graph publication and partial-effect recovery. |
 | **WAL replay** | Durable entries are replayed to reconstruct the MemTable under the next valid claimant. The guarantee depends on respecting fencing, lifecycle, compatibility, and safe GC. |
 | **LSM merging reads** | A scanner over the base table, selected flushed generations not yet safely replaceable by the base read plan, and optionally same-process active/frozen MemTables. OmniGraph must build and retain a coherent graph-level fresh-read cut. It does not query raw WAL files as a normal read source. |
-| **Retention behavior** | Upstream describes when generations may be obsolete and warns that deleting WAL files can weaken fencing. The selected profile does not turn eligibility into deletion: generic cleanup ignores `_mem_wal`, OmniGraph never deletes raw paths, and retained storage grows monotonically. A later managed profile may consume a Lance-owned opaque reclamation primitive. |
+| **Retention behavior** | Upstream describes when generations may be obsolete and warns that deleting WAL files can weaken fencing. Private B2a implements the selected profile without turning eligibility into deletion: generic cleanup ignores `_mem_wal`, OmniGraph never deletes a canonical durable object, and retained storage grows monotonically. Lance may remove only a losing manifest-CAS `.binpb.tmp.<uuid>` staging object, which never became authority. A later managed profile may consume a Lance-owned opaque reclamation primitive. |
 | **Staged merge-insert** | `execute_uncommitted` plus atomic `merged_generations` fits the RFC-022 staged shape. There is no one-call MemWAL fold API. |
 | **Shared sessions/store parameters in RC.1** | Writer-created generations and base-backed scanner paths reuse the base dataset's access context; fresh-only construction still receives that context from its caller. OmniGraph owns long-lived writer/session lifecycle and scanner integration. |
 | **Key-based sharding** *(later)* | Horizontal scale when every occurrence of one key deterministically maps to one shard. |
@@ -405,10 +416,12 @@ OmniGraph already has reusable chassis: the manifest publisher, generic
 recovery-sidecar framework, graph lineage, stable table identity, keyed write
 adapter, and validation components. “Reusable” does not mean “unchanged”:
 Phase A added stream lifecycle authority and enrollment recovery. Private B1
-now adds one nominally bounded admission worker, watcher success plus the same
+adds one nominally bounded admission worker, watcher success plus the same
 writer's post-durability epoch check, replay and flushed-generation
 classification, and one recovery-owned fold. The all-shape closure repair is
-implemented. Later phases still need the common token/attribution, persistent
+implemented. Private B2a adds the no-delete structural guard, provider-failure/
+orphan matrix, and retained-history instrument over that core. The next phase
+still needs the B2-common token/attribution, persistent
 operator lifecycle/correction, authorization, and product contracts; then the
 public caller, reject participants, and fresh cuts. Managed cleanup is optional
 future work rather than an activation prerequisite.
@@ -450,13 +463,14 @@ workflow is implemented.
 | **Durability batching** | **Phase B1 implemented privately:** one admitted call is one non-empty, already-normalized physical `RecordBatch` and one Lance put. The worker owns the final check, invocation, watcher, and post-durability epoch check; only watcher success followed by same-writer `check_fenced()` success acknowledges. Anything ambiguous after invocation is typed `AckUnknown`; replay preserves possible residue but never resolves that attempt. Automatic rollover is disabled and the writer retires before a successor-generation put. There is no hidden group-commit policy until an instrument justifies one. |
 | **Pre-ack validation** | **Phase B1 implemented privately:** apply every rule that needs no graph/base-table read before WAL persistence. The private seam consumes physical vectors supplied in the normalized batch; it neither calls an external embedding provider nor invents unspecified fold-derived fields. |
 | **Fold adapter** | **Phase B1 implemented privately and closure-green:** capture one exact stream binding and post-drain shard snapshot, independently prove empty frozen refs plus the exact authoritative generation/cursor (RC.1's drain waiter alone is insufficient), run base-dependent validation, require the LWW output to fit 8,192 rows / 32 MiB, stage one merge-insert with `merged_generations`, and publish the exact table/lifecycle/lineage outcome through recovery schema v11 plus one `__manifest` CAS. Scanner slices are charged by logical size and rebuilt densely before retention. Already-normalized physical vectors pass through unchanged. Seal/drain/abort stay background-owned across caller deadlines; recognized unreferenced generation subtrees are retained forever under the selected profile. |
+| **Retain-all storage gate** | **Private B2a implemented:** structural guards forbid a production reclamation/adoption side door; injected local/configured-RustFS provider failures keep complete/partial orphan output retained, non-authoritative, and untouched below its root through retry/reopen; and the 1/8/32/128 instrument keeps acknowledgement, replay, fold, visibility, table, graph-manifest, adapter, object, and RSS terms separate. Canonical durable delete requests and older-root IO remain zero. Lance losing manifest-CAS temp staging is allowed; LIST/timing/RSS results are advisory. |
 | **Strict and dead-letter disposition** | **B1/common B2:** strict only; a permanent deferred-validation failure leaves durable unmerged input and blocks progress loudly. B1 has no correction lane. The common B2 inventory specifies bounded `REPLACE`/`WITHDRAW` correction over the immutable blocked cut, without a second generation or silent drop. **Phase C:** dead letters only after restart-stable reject identity and retention are defined. |
 | **Policy, lineage, and audit** | B1 records only fixed mechanism lineage and has no public caller. The common B2 inventory stores trusted contributor/write metadata with the row, publishes current token state with the base version, and commits a fixed winner summary; it promises durable attribution for visible winners/current withdrawals, not unbounded audit retention for every superseded acknowledgement. Phase C consumes that evidence for rejects. |
-| **Quiescence and rebind** | The common B2 inventory specifies durable `OPEN -> DRAINING -> SEALED -> OPEN`, strictly monotonic lifecycle revisions, bounded complete terminal management receipts, authoritative status, roll-forward-only resume/abort-drain recovery, rebuild preflight, and bounded correction. Retain-all is selected, but these lifecycle contracts still must be implemented and proved before public activation. Resume rechecks the bounded no-named-branch topology; an incompatible branch operation leaves the stream `SEALED`. `SEALED` permits export/rebuild, not in-place maintenance. Phase D integrates automatic operation drain and physical rebind. |
+| **Quiescence and rebind** | The common B2 inventory specifies durable `OPEN -> DRAINING -> SEALED -> OPEN`, strictly monotonic lifecycle revisions, bounded complete terminal management receipts, authoritative status, roll-forward-only resume/abort-drain recovery, rebuild preflight, and bounded correction. Private B2a implements retain-all, but these lifecycle contracts still must be implemented and proved before public activation. Resume rechecks the narrow main-only/no-named-branch topology; an incompatible branch operation leaves the stream `SEALED`. `SEALED` permits export/rebuild, not in-place maintenance. Phase D integrates automatic operation drain and physical rebind. |
 | **Fresh reads** *(later)* | Explicit committed/fresh IR mode, exact base-plus-MemWAL cut, merged-generation exclusion, retention guards, and documented lack of cross-table atomicity. |
-| **Retention profile** | **Unbounded retain-all is selected:** no OmniGraph MemWAL GC, no file-count or retained-byte admission limit, and monotonic storage for the root. Provider exhaustion is an accepted loud operational risk. RC.1's missing durable attempt receipt and complete output envelope remain documented but do not block a contract that promises neither limit. **Managed reclamation** retains the Lance-owned durable inspect/plan/execute design as an optional later optimization. OmniGraph never deletes raw `_mem_wal` paths. |
+| **Retention profile** | **Private B2a implements unbounded retain-all:** no OmniGraph MemWAL GC, no file-count or retained-byte admission limit, and monotonic canonical durable storage for the root. Complete/partial orphan roots remain non-authoritative and untouched below their roots through retry/reopen; parent discovery may observe a prefix. Lance may remove only a losing manifest-CAS temporary staging object. Provider exhaustion is an accepted loud operational risk. RC.1's missing durable attempt receipt and complete output envelope remain documented but do not block a contract that promises neither limit. **Managed reclamation** retains the Lance-owned durable inspect/plan/execute design as an optional later optimization. |
 | **Graph-manifest lifetime** | Retain-all also places no finite-lifetime bound on base/token or shared `__manifest` history. `GraphHistoryBudget` is not part of the first profile. If a later product promises a hard whole-root bound, it must earn a separate RFC and physical-growth evidence across every manifest publisher. |
-| **Evidence and operations** | **B1 closure green:** surface guards, genuine v7↔v8 refusal/rebuild, the graph-level behavior/crash/race cells, and qualified cost/PK-index/RSS evidence pass. The legal high-entropy near-cap cell now acknowledges, materializes, folds, publishes exactly once, and retains every listed path. The full-fold RSS delta measured 284,934,144 bytes (~272 MiB); the 384-MiB check is a CI remeasurement tripwire for one exclusive fold, not a runtime allocator limit. The revision-pinned source audit and current-object sweeps remain useful descriptions of monotonic storage, not a rejected-gate disposition. Two guards continue to prove why generic cleanup and raw fence deletion are unsafe. Public metrics/status, API tests, CLI parity, and operator evidence remain absent by design. |
+| **Evidence and operations** | **B1 closure and private B2a gate green:** surface guards, genuine v7↔v8 refusal/rebuild, graph-level behavior/crash/race cells, and qualified cost/PK-index/RSS evidence pass. The legal high-entropy near-cap cell acknowledges, materializes, folds, publishes exactly once, and retains every listed path. The full-fold RSS delta measured 284,934,144 bytes (~272 MiB); the 384-MiB check is a CI remeasurement tripwire for one exclusive fold, not a runtime allocator limit. B2a adds structural no-delete checks, typed local/configured-RustFS provider failures, inert complete/partial orphan evidence, and a 1/8/32/128 retained-history instrument. Older roots receive zero IO and canonical durable deletes remain zero; warm-ack operations stay flat while authority/history bytes and combined fold work grow. LIST totals, timing, and RSS are advisory. Two guards continue to prove why generic cleanup and raw fence deletion are unsafe. Public metrics/status, API tests, CLI parity, and operator evidence remain absent by design. |
 
 The table intentionally omits “small/medium” estimates. Atomic rejection,
 quiescence, fresh-read retention, and any future GC are correctness protocols;
@@ -489,9 +503,10 @@ covering both:
 An upstream exact receipt and public admission lifecycle would simplify this
 substantially. We may propose that change, but its review and release timing
 is not a prerequisite for retain-all. Gate E0 passed; the
-upstream shape still gates overlapping-process topology. Bounded Phase A and
-the private B1 core are implemented, and the Gate R0 closure gap is repaired.
-The common product and operational gates remain before public row activation.
+upstream shape still gates overlapping-process topology. Narrow Phase A and
+the private B1 core are implemented, the Gate R0 closure gap is repaired, and
+the private B2a retain-all gate is implemented. The common product and
+operational gates remain before public row activation.
 
 ### The RC.1 reclamation gap, stated precisely (B2b)
 
@@ -619,7 +634,8 @@ remain green. Gate R0's legal high-entropy near-cap failure is now repaired and
 the closure cell publishes successfully. The missing stock-RC.1 attempt receipt
 and complete-output envelope remain factual limits on any future bounded-
 storage claim, but do not block the selected unbounded retain-all profile. The
-common token, attribution, lifecycle/correction, authorization, and product
+private B2a structural/provider/history gate is implemented; the B2-common
+token, attribution, lifecycle/correction, authorization, and product
 contracts must still close before any public row acknowledgement.
 
 ### Bottom line
@@ -641,10 +657,11 @@ The plan is:
 3. retain the repaired logical-slice/dense fold and its local/configured-RustFS
    near-cap closure plus full-fold RSS remeasurement instruments as regression
    gates; do not silently shrink the 8,192-row/32-MiB admission cap;
-4. implement the selected unbounded retain-all profile: delete no MemWAL path,
-   add no file/byte admission limit, expose observed growth only as advisory,
-   and surface provider-capacity failure loudly through recovery;
-5. retain the common B2 compare-and-chain token, trusted attribution,
+4. preserve the implemented private B2a unbounded retain-all gate: delete no
+   canonical durable MemWAL object, add no file/byte admission limit, keep
+   complete/partial orphan roots inert, expose observed growth only as
+   advisory, and surface provider-capacity failure loudly through recovery;
+5. implement the B2-common compare-and-chain token, trusted attribution,
    manifest-selected token participant, protocol-v2 lifecycle, and bounded
    `REPLACE`/`WITHDRAW` correction as the implementation contract;
 6. keep B2b Lance-owned reclamation and a whole-root finite-lifetime budget as
@@ -666,8 +683,8 @@ calendar. Phase A's v7 foundation and private B1's current v8/config-v2/v11
 worker/fold core are implemented, and the widest admitted high-entropy shape
 now closes. RFC-026 remains Draft because the public token, attribution,
 lifecycle/correction, authorization, and product surfaces are not implemented.
-The selected first storage posture is unbounded retain-all: no OmniGraph
-MemWAL GC and no file/byte limit. Two negative RC.1 reclamation guards remain
+The selected first storage posture is the implemented private B2a unbounded
+retain-all gate: no OmniGraph MemWAL GC and no file/byte limit. Two negative RC.1 reclamation guards remain
 checked in as rationale for that no-deletion rule. No schema-v9 contract,
 production enrollment, acknowledgement, fold, operator, or public stream path
 exists.

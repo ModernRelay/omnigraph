@@ -1273,6 +1273,223 @@ fn call_inventory(ast: &syn::File) -> CallInventory {
     inventory
 }
 
+/// Raw MemWAL storage is retained indefinitely in RFC-026's selected B2a
+/// profile.  These are the only production functions allowed to spell the
+/// physical `_mem_wal` directory: both perform bounded, read-only validation.
+/// A new owner is therefore an architectural change, not an incidental helper.
+const RAW_MEM_WAL_PATH_OWNERS: &[(&str, &str, usize)] = &[
+    ("table_store/mem_wal.rs", "raw_mem_wal_inventory", 2),
+    (
+        "table_store/mem_wal/worker.rs",
+        "validate_b1_lifecycle_physical_state",
+        1,
+    ),
+];
+
+/// Generic graph maintenance must reason from manifest/lifecycle authority,
+/// not inspect or reinterpret retained MemWAL objects.  StreamEnrollment and
+/// StreamFold recovery are intentionally absent: their exact classifiers must
+/// read MemWAL state, while the raw-path and no-reclamation guards below keep
+/// those classifiers non-destructive.
+const RETAIN_ALL_MAINTENANCE_FILES: &[&str] = &[
+    "db/omnigraph/optimize.rs",
+    "db/omnigraph/repair.rs",
+    "db/omnigraph/schema_apply.rs",
+    "db/omnigraph/table_ops.rs",
+];
+
+const RETAIN_ALL_OMNIGRAPH_METHODS: &[&str] = &[
+    "cleanup",
+    "cleanup_deleted_branch_tables",
+    "optimize",
+    "repair",
+];
+
+fn normalized_symbol(value: &str) -> String {
+    value
+        .chars()
+        .filter(char::is_ascii_alphanumeric)
+        .flat_map(char::to_lowercase)
+        .collect()
+}
+
+fn mentions_mem_wal(value: &str) -> bool {
+    normalized_symbol(value).contains("memwal") || value.contains("_mem_wal")
+}
+
+fn is_reclamation_verb(value: &str) -> bool {
+    let normalized = normalized_symbol(value);
+    [
+        "adopt",
+        "cleanup",
+        "compact",
+        "delete",
+        "drop",
+        "garbagecollect",
+        "prune",
+        "purge",
+        "reclaim",
+        "reclassify",
+        "remove",
+        "trim",
+        "vacuum",
+    ]
+    .iter()
+    .any(|verb| normalized.contains(verb))
+        || normalized == "gc"
+        || normalized.ends_with("gc")
+}
+
+fn is_mem_wal_reclamation_symbol(value: &str) -> bool {
+    mentions_mem_wal(value) && is_reclamation_verb(value)
+}
+
+fn raw_mem_wal_marker_count(value: &str) -> usize {
+    value.matches("_mem_wal").count()
+}
+
+#[derive(Default)]
+struct RetainAllMemWalInventory {
+    function_stack: Vec<String>,
+    raw_path_owners: BTreeMap<String, usize>,
+    mem_wal_uses: Vec<(String, String)>,
+    reclamation_symbols: Vec<(String, String)>,
+}
+
+impl RetainAllMemWalInventory {
+    fn owner(&self) -> String {
+        self.function_stack
+            .last()
+            .cloned()
+            .unwrap_or_else(|| "<module>".to_string())
+    }
+
+    fn record_raw_path(&mut self, count: usize) {
+        if count > 0 {
+            *self.raw_path_owners.entry(self.owner()).or_default() += count;
+        }
+    }
+
+    fn record_reclamation_symbol(&mut self, symbol: impl Into<String>) {
+        self.reclamation_symbols.push((self.owner(), symbol.into()));
+    }
+}
+
+impl<'ast> Visit<'ast> for RetainAllMemWalInventory {
+    fn visit_item_mod(&mut self, node: &'ast syn::ItemMod) {
+        if cfg_requires_test(&node.attrs) {
+            return;
+        }
+        visit::visit_item_mod(self, node);
+    }
+
+    fn visit_item_impl(&mut self, node: &'ast syn::ItemImpl) {
+        if cfg_requires_test(&node.attrs) {
+            return;
+        }
+        visit::visit_item_impl(self, node);
+    }
+
+    fn visit_item_const(&mut self, node: &'ast syn::ItemConst) {
+        if cfg_requires_test(&node.attrs) {
+            return;
+        }
+        visit::visit_item_const(self, node);
+    }
+
+    fn visit_item_static(&mut self, node: &'ast syn::ItemStatic) {
+        if cfg_requires_test(&node.attrs) {
+            return;
+        }
+        visit::visit_item_static(self, node);
+    }
+
+    fn visit_item_macro(&mut self, node: &'ast syn::ItemMacro) {
+        if cfg_requires_test(&node.attrs) {
+            return;
+        }
+        visit::visit_item_macro(self, node);
+    }
+
+    fn visit_item_fn(&mut self, node: &'ast syn::ItemFn) {
+        if cfg_requires_test(&node.attrs) {
+            return;
+        }
+        let function = node.sig.ident.to_string();
+        if is_mem_wal_reclamation_symbol(&function) {
+            self.record_reclamation_symbol(format!("function `{function}`"));
+        }
+        self.function_stack.push(function);
+        visit::visit_item_fn(self, node);
+        self.function_stack.pop();
+    }
+
+    fn visit_impl_item_fn(&mut self, node: &'ast syn::ImplItemFn) {
+        if cfg_requires_test(&node.attrs) {
+            return;
+        }
+        let function = node.sig.ident.to_string();
+        if is_mem_wal_reclamation_symbol(&function) {
+            self.record_reclamation_symbol(format!("method `{function}`"));
+        }
+        self.function_stack.push(function);
+        visit::visit_impl_item_fn(self, node);
+        self.function_stack.pop();
+    }
+
+    fn visit_ident(&mut self, node: &'ast syn::Ident) {
+        let identifier = node.to_string();
+        if mentions_mem_wal(&identifier) {
+            self.mem_wal_uses.push((self.owner(), identifier.clone()));
+        }
+        if is_mem_wal_reclamation_symbol(&identifier) {
+            self.record_reclamation_symbol(format!("identifier `{identifier}`"));
+        }
+        visit::visit_ident(self, node);
+    }
+
+    fn visit_path(&mut self, node: &'ast syn::Path) {
+        let path = node
+            .segments
+            .iter()
+            .map(|segment| segment.ident.to_string())
+            .collect::<Vec<_>>()
+            .join("::");
+        if is_mem_wal_reclamation_symbol(&path) {
+            self.record_reclamation_symbol(format!("path `{path}`"));
+        }
+        visit::visit_path(self, node);
+    }
+
+    fn visit_lit(&mut self, node: &'ast syn::Lit) {
+        if let syn::Lit::Str(value) = node {
+            let value = value.value();
+            self.record_raw_path(raw_mem_wal_marker_count(&value));
+            if mentions_mem_wal(&value) {
+                self.mem_wal_uses
+                    .push((self.owner(), "literal `_mem_wal`".to_string()));
+            }
+        }
+        visit::visit_lit(self, node);
+    }
+
+    fn visit_macro(&mut self, node: &'ast syn::Macro) {
+        let tokens = node.tokens.to_string();
+        self.record_raw_path(raw_mem_wal_marker_count(&tokens));
+        if mentions_mem_wal(&tokens) {
+            self.mem_wal_uses
+                .push((self.owner(), "macro token `_mem_wal`".to_string()));
+        }
+        visit::visit_macro(self, node);
+    }
+}
+
+fn retain_all_mem_wal_inventory(ast: &syn::File) -> RetainAllMemWalInventory {
+    let mut inventory = RetainAllMemWalInventory::default();
+    inventory.visit_file(ast);
+    inventory
+}
+
 fn protocol_scan_files(src: &Path) -> Vec<PathBuf> {
     walk_rust_files(src)
         .into_iter()
@@ -1754,6 +1971,177 @@ fn graph_visible_write_chokepoints_are_registered() {
          allow-list is insufficient because a second caller in an approved file is \
          still a new writer:\n  {}",
         violations.join("\n  ")
+    );
+}
+
+/// RFC-026 B2a deliberately retains every raw MemWAL object.  Generic graph
+/// maintenance may block on stream lifecycle authority, and exact stream
+/// recovery may classify its own bound effects, but neither is permission to
+/// reinterpret, adopt, or delete `_mem_wal` storage.
+#[test]
+fn retain_all_mem_wal_has_no_production_reclamation_or_adoption_route() {
+    let src = engine_src_root();
+    let expected_raw_owners = RAW_MEM_WAL_PATH_OWNERS
+        .iter()
+        .map(|(file, function, count)| (((*file).to_string(), (*function).to_string()), *count))
+        .collect::<BTreeMap<_, _>>();
+    let mut observed_raw_owners = BTreeMap::new();
+    let mut reclamation_symbols = Vec::new();
+    let mut maintenance_mem_wal_uses = Vec::new();
+    let mut mem_wal_destructive_calls = Vec::new();
+
+    for file in protocol_scan_files(&src) {
+        let relative = relative_to_src(&src, &file);
+        let contents = std::fs::read_to_string(&file)
+            .unwrap_or_else(|error| panic!("failed to read {}: {error}", file.display()));
+        let ast = parse_rust_source(&contents, &relative);
+        let inventory = retain_all_mem_wal_inventory(&ast);
+        let calls = call_inventory(&ast);
+
+        for (function, count) in inventory.raw_path_owners {
+            observed_raw_owners.insert((relative.clone(), function), count);
+        }
+        reclamation_symbols.extend(
+            inventory
+                .reclamation_symbols
+                .into_iter()
+                .map(|(function, symbol)| format!("{relative}::{function}: {symbol}")),
+        );
+
+        if RETAIN_ALL_MAINTENANCE_FILES.contains(&relative.as_str()) {
+            maintenance_mem_wal_uses.extend(
+                inventory
+                    .mem_wal_uses
+                    .iter()
+                    .map(|(function, usage)| format!("{relative}::{function}: {usage}")),
+            );
+        }
+        if relative == "db/omnigraph.rs" {
+            maintenance_mem_wal_uses.extend(
+                inventory
+                    .mem_wal_uses
+                    .iter()
+                    .filter(|(function, _)| {
+                        RETAIN_ALL_OMNIGRAPH_METHODS.contains(&function.as_str())
+                    })
+                    .map(|(function, usage)| format!("{relative}::{function}: {usage}")),
+            );
+        }
+        if matches!(
+            relative.as_str(),
+            "table_store/mem_wal.rs" | "table_store/mem_wal/worker.rs"
+        ) {
+            for primitive in [
+                "cleanup",
+                "cleanup_old_versions",
+                "compact",
+                "delete",
+                "delete_prefix",
+                "garbage_collect",
+                "prune",
+                "purge",
+                "reclaim",
+                "remove_dir",
+                "remove_dir_all",
+                "remove_file",
+                "trim",
+                "vacuum",
+            ] {
+                if let Some(count) = calls.counts.get(primitive) {
+                    mem_wal_destructive_calls
+                        .push(format!("{relative}: `{primitive}` called {count} time(s)"));
+                }
+            }
+        }
+    }
+
+    assert_eq!(
+        observed_raw_owners, expected_raw_owners,
+        "raw `_mem_wal` path access must remain confined to the exact bounded read-only inventory and passive lifecycle validators"
+    );
+    assert!(
+        reclamation_symbols.is_empty(),
+        "retain-all forbids any production MemWAL reclamation/adoption/reclassification route:\n  {}",
+        reclamation_symbols.join("\n  ")
+    );
+    assert!(
+        maintenance_mem_wal_uses.is_empty(),
+        "cleanup/repair/schema maintenance must derive exclusions from manifest lifecycle authority and never inspect or reinterpret MemWAL objects:\n  {}",
+        maintenance_mem_wal_uses.join("\n  ")
+    );
+    assert!(
+        mem_wal_destructive_calls.is_empty(),
+        "the private MemWAL adapter may validate, acknowledge, and fold, but retain-all forbids destructive/reclamation primitives:\n  {}",
+        mem_wal_destructive_calls.join("\n  ")
+    );
+
+    let mem_wal_source = std::fs::read_to_string(src.join("table_store/mem_wal.rs"))
+        .expect("read MemWAL adapter source");
+    let mem_wal_ast = parse_rust_source(&mem_wal_source, "table_store/mem_wal.rs");
+    for helper in ["raw_mem_wal_inventory", "classify_raw_inventory"] {
+        let visibility = mem_wal_ast.items.iter().find_map(|item| match item {
+            Item::Fn(function) if function.sig.ident == helper => Some(&function.vis),
+            _ => None,
+        });
+        assert!(
+            matches!(visibility, Some(Visibility::Inherited)),
+            "raw MemWAL helper `{helper}` must remain module-private so maintenance/recovery cannot turn inventory into an adoption or deletion API"
+        );
+    }
+}
+
+#[test]
+fn retain_all_mem_wal_scanner_rejects_production_delete_but_skips_test_fixture() {
+    let fixture_only = parse_rust_source(
+        r#"
+        #[cfg(test)]
+        mod tests {
+            fn destructive_fixture(storage: &Storage) {
+                let mem_wal_root = "_mem_wal";
+                storage.delete_prefix(mem_wal_root);
+            }
+        }
+
+        #[cfg(test)]
+        const TEST_MEM_WAL_ROOT: &str = "_mem_wal";
+
+        #[cfg(test)]
+        static TEST_MEM_WAL_PATH: &str = "_mem_wal";
+
+        #[cfg(test)]
+        macro_rules! reclaim_mem_wal_fixture {
+            () => {
+                let mem_wal_root = "_mem_wal";
+                mem_wal::reclaim(mem_wal_root);
+            };
+        }
+        "#,
+        "retain-all cfg(test) self-test",
+    );
+    let fixture_inventory = retain_all_mem_wal_inventory(&fixture_only);
+    assert!(fixture_inventory.raw_path_owners.is_empty());
+    assert!(fixture_inventory.reclamation_symbols.is_empty());
+
+    let production = parse_rust_source(
+        r#"
+        fn destructive_production(storage: &Storage) {
+            let mem_wal_root = "_mem_wal";
+            storage.delete_prefix(mem_wal_root);
+            mem_wal::reclaim();
+        }
+        "#,
+        "retain-all production self-test",
+    );
+    let production_inventory = retain_all_mem_wal_inventory(&production);
+    assert_eq!(
+        production_inventory.raw_path_owners,
+        BTreeMap::from([("destructive_production".to_string(), 1)])
+    );
+    assert!(
+        production_inventory
+            .reclamation_symbols
+            .iter()
+            .any(|(_, symbol)| symbol.contains("mem_wal::reclaim"))
     );
 }
 

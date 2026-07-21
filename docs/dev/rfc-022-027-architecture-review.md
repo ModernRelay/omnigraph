@@ -2,8 +2,8 @@
 
 **Status:** RFC-022, RFC-023, and RFC-028 implemented; RFC-024, RFC-025, and
 RFC-027 research-blocked; RFC-026 Phase A implemented, private B1's legal
-near-cap closure repaired and green, unbounded retain-all selected for B2a,
-B2b/common contracts inactive, and no public stream surface exists
+near-cap closure repaired and green, private B2a unbounded retain-all gate
+implemented, B2b/common contracts inactive, and no public stream surface exists
 **Date:** 2026-07-11
 **Last updated:** 2026-07-21
 **Audience:** RFC authors, engine/storage maintainers, and release reviewers
@@ -47,10 +47,16 @@ bounded retain-all claim on stock RC.1. Random generation roots have no
 MemWAL-persisted/enforced durable cross-open materialization-attempt
 cap/receipt; RC.1 exposes no admission-grade reserve-first complete
 physical-output envelope; and current LIST cannot prove all provider-retained
-or billed bytes. The selected B2a profile deliberately makes none of those
-finite-storage claims: retain every `_mem_wal` object, perform no raw WAL GC,
-impose no retained-byte, object-count, file-count, or history quota, and surface
-provider exhaustion loudly. The missing materialization-attempt receipt and
+or billed bytes. The implemented private B2a gate deliberately makes none of
+those finite-storage claims: retain every canonical durable `_mem_wal` object,
+perform no raw WAL GC, impose no retained-byte, object-count, file-count, or
+history quota, and surface provider exhaustion loudly. Lance may remove only a
+losing manifest-CAS temporary staging object. Complete and partial orphan output
+remains non-authoritative and untouched below its root through retry/reopen;
+parent shard discovery may observe its prefix. Local/configured-RustFS provider
+cells and a 1/8/32/128 retained-history instrument pin that boundary. Warm-ack
+operation shape stays flat while serialized authority and combined history work
+grow; LIST bytes, timings, and RSS remain advisory. The missing materialization-attempt receipt and
 complete envelope therefore do not block B2a. No test-only attempt ledger or
 `GraphHistoryBudget` is on its immediate path. B2b remains optional future
 Lance-owned managed reclamation. Common explicit enrollment,
@@ -485,8 +491,12 @@ and [§11–13](../rfcs/0026-memwal-streaming-ingest.md#11-format-activation-and
 **Status:** Format separation is specified. Gate R0's legal near-cap closure
 failure was repaired on 2026-07-21 with logical-slice accounting and dense
 scanner-output copies; the closure and RSS cells are green. The selected B2a
-profile is unbounded retain-all with no raw `_mem_wal` GC and no retained-byte,
-object-count, file-count, or history quota. Gate R0's historical no-go applies
+profile's private gate is implemented as unbounded retain-all with no canonical
+durable `_mem_wal` deletion and no retained-byte, object-count, file-count, or
+history quota. Structural guards, typed local/configured-RustFS provider
+failures, complete/partial inert orphan evidence, and the 1/8/32/128 advisory
+history instrument pin that boundary. Lance losing manifest-CAS temp staging is
+not retained authority. Gate R0's historical no-go applies
 only to claiming a finite storage bound on stock RC.1. Public activation remains
 closed on the common contracts below, not on the missing materialization-attempt
 receipt or physical-output envelope. RC.1 also lacks the ideal caller-owned
@@ -523,7 +533,9 @@ empty-enrollment contract: implemented v8 is the first data-bearing stream
 format, uses stream-config v2 and recovery schema v11, refuses v7/config-v1,
 and carries genuine v7↔v8 rebuild/refusal evidence.
 
-B2 is a third strict strand, not an in-place reinterpretation of v8. The common
+B2 is a third strict strand, not an in-place reinterpretation of v8. Private
+B2a adds no schema change; it closes the stock-v8 storage/correctness gate for
+the selected retain-all profile. The common
 B2 inventory assigns internal schema v9, stream-config v3, stream-state
 protocol v2, and recovery-v12 to trusted hidden row metadata, the
 manifest-selected current-token participant, persistent revisioned
@@ -961,7 +973,8 @@ managed-reclamation route; implementation-blocking only if that profile is
 pursued. Gate R0's 2026-07-20 result remains a historical no-go for a finite or
 otherwise bounded retain-all claim on stock RC.1. It does not reject the
 selected unbounded B2a profile, whose legal near-cap B1 closure was repaired on
-2026-07-21. Neither result reopens the MemWAL substrate choice or activates a
+2026-07-21 and whose private no-delete/provider-failure/history-cost gate is now
+implemented. Neither result reopens the MemWAL substrate choice or activates a
 public surface.
 
 Two production-neutral guards pin the current RC.1 boundary:
@@ -993,15 +1006,19 @@ output. The retained one/four/eight-fold current-object census and
 referenced-cut retry prove useful invariants but cannot establish provider
 versions, incomplete multipart, or billed bytes.
 
-The selected B2a profile accepts that limitation explicitly. It retains all raw
-`_mem_wal` state, performs no OmniGraph WAL deletion, sets no retained-byte,
+The implemented private B2a profile accepts that limitation explicitly. It
+retains every canonical durable `_mem_wal` object, performs no OmniGraph WAL deletion, sets no retained-byte,
 object-count, file-count, or history quota, and treats provider exhaustion as a
 loud failure that may stop admission, fold, or recovery progress without
 weakening acknowledgement durability or manifest-only visibility. Because it
 makes no finite-storage claim, B2a does not need a test-only materialization
 attempt ledger, a complete reserve-first physical-output envelope, or a
 `GraphHistoryBudget`. Any later production state still binds to the existing
-manifest/recovery authority.
+manifest/recovery authority. Complete and partial unreferenced generation output
+remains non-authoritative and untouched below its root through retry/reopen;
+parent discovery may observe the prefix, and Lance may remove only a losing
+manifest-CAS temporary staging object. The checked-in provider matrix and
+1/8/32/128 advisory instrument pin that exact boundary.
 
 **Optional future B2b disposition:** if managed reclamation is pursued, author
 the capability inside Lance as an opaque inspect/plan/execute operation with
@@ -1223,10 +1240,12 @@ The review does not require all RFCs to land together. A safe order is:
    schema-v8/config-v2 put/watcher/post-fence/replay/recovery-v11 evidence and
    its repaired legal near-cap closure: logical-slice accounting plus dense
    scanner-output copies now fold and publish the 8,192-row high-entropy cell,
-   with the isolated fold RSS delta below the remeasurement tripwire. Proceed
-   with the selected unbounded B2a retain-all profile: never delete raw
-   `_mem_wal` state, impose no retained-byte/object/file/history quota, and
-   surface provider exhaustion loudly. Do not add a materialization-attempt
+   with the isolated fold RSS delta below the remeasurement tripwire. Preserve
+   the implemented private B2a unbounded retain-all gate: never delete a
+   canonical durable `_mem_wal` object, keep complete/partial orphan subtrees
+   inert through retry/reopen, impose no retained-byte/object/file/history
+   quota, surface provider exhaustion loudly, and retain the local/RustFS
+   provider plus 1/8/32/128 advisory evidence. Do not add a materialization-attempt
    ledger, reserve-first complete physical-output envelope, storage watermark,
    or `GraphHistoryBudget` to that immediate path. Implement and prove the
    common explicit-enrollment, compare-and-chain-token, trusted-attribution,
