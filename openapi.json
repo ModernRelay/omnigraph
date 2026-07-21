@@ -15,7 +15,7 @@
         "tags": [
           "management"
         ],
-        "summary": "List every graph currently registered with this server (MR-668).",
+        "summary": "List every graph currently registered with this server.",
         "description": "Multi-graph mode only. In single mode, the route returns 405 — there's\nno registry to enumerate. Cedar-gated by the server-level policy via\nthe `graph_list` action against `Omnigraph::Server::\"root\"`.\n\nOrder: alphabetical by `graph_id` (server-sorted so clients see\ndeterministic output across requests).",
         "operationId": "listGraphs",
         "responses": {
@@ -2323,7 +2323,7 @@
               "boolean",
               "null"
             ],
-            "description": "The kind the caller expects (RFC-011 Decision 3): `Some(false)` for\n`omnigraph query <name>`, `Some(true)` for `omnigraph mutate <name>`.\nWhen set and it disagrees with the stored query's actual kind, the\nserver rejects the call (400) so the verb asserts the kind. `None`\n(the default) skips the check — preserving older clients and aliases."
+            "description": "The kind the caller expects: `Some(false)` for\n`omnigraph query <name>`, `Some(true)` for `omnigraph mutate <name>`.\nWhen set and it disagrees with the stored query's actual kind, the\nserver rejects the call (400) so the verb asserts the kind. `None`\n(the default) skips the check — preserving older clients and aliases."
           },
           "params": {
             "description": "JSON object whose keys match the stored query's declared parameters."
@@ -2655,7 +2655,7 @@
       },
       "ReadSetConflictOutput": {
         "type": "object",
-        "description": "Structured authority mismatch for an RFC-022 prepared write. Values are\nstrings because members include optional graph commit ids and future\nauthority tokens, not only numeric table versions.",
+        "description": "Structured authority mismatch for a prepared write. Values are\nstrings because members include optional graph commit ids and future\nauthority tokens, not only numeric table versions.",
         "required": [
           "member"
         ],
