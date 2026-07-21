@@ -66,6 +66,17 @@ start with install, then follow the section that matches your task.
 | Understand graph layout and URI support | [concepts/storage.md](concepts/storage.md) |
 | Look up constants and tunables | [reference/constants.md](reference/constants.md) |
 
+## Guides
+
+Task-oriented walkthroughs that compose the building blocks above:
+
+| Guide | Read |
+|---|---|
+| All guides | [guides/index.md](guides/index.md) |
+| Hybrid search end to end | [guides/hybrid-search.md](guides/hybrid-search.md) |
+| Run a cluster on S3 | [guides/cluster-on-s3.md](guides/cluster-on-s3.md) |
+| Branch-based review workflow | [guides/review-workflow.md](guides/review-workflow.md) |
+
 ## Releases
 
 Release notes live in [releases/](../releases/). Use them for user-visible
