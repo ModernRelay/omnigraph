@@ -211,7 +211,9 @@ jobs:
         # omnigraph/failpoints, so each line rebuilds only its crate.
         run: |
           cargo test --locked -p omnigraph-engine --features failpoints --test failpoints
+          set +e
           output=$(cargo test --locked -p omnigraph-engine --features failpoints --test memwal_stream_cost gate_r0_ -- --nocapture 2>&1); status=$?
+          set -e
           echo "$output"
           [ "$status" -eq 0 ] || exit "$status"
           echo "$output" | grep -Eq "test result: ok\. [1-9][0-9]* passed" \
@@ -244,7 +246,9 @@ jobs:
           # This is a remeasurement tripwire for the current single-exclusive-
           # fold shape, not a runtime allocator limit. Keep it outside the
           # gate_r0_ filter because the subprocess owner has a stable older name.
+          set +e
           output=$(cargo test --locked -p omnigraph-engine --features failpoints --test memwal_stream_cost widest_legal_generation_records_no_roll_estimates_and_peak_rss -- --exact --nocapture 2>&1); status=$?
+          set -e
           echo "$output"
           [ "$status" -eq 0 ] || exit "$status"
           echo "$output" | grep -Eq "test result: ok\. 1 passed" \
