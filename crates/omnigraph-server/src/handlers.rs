@@ -40,7 +40,7 @@ pub(crate) async fn server_health() -> Json<HealthOutput> {
     ),
     security(("bearer_token" = [])),
 )]
-/// List every graph currently registered with this server (MR-668).
+/// List every graph currently registered with this server.
 ///
 /// Multi-graph mode only. In single mode, the route returns 405 — there's
 /// no registry to enumerate. Cedar-gated by the server-level policy via

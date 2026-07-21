@@ -344,7 +344,7 @@ pub struct InvokeStoredQueryRequest {
     /// mutation). Mutually exclusive with `branch`.
     #[serde(default)]
     pub snapshot: Option<String>,
-    /// The kind the caller expects (RFC-011 Decision 3): `Some(false)` for
+    /// The kind the caller expects: `Some(false)` for
     /// `omnigraph query <name>`, `Some(true)` for `omnigraph mutate <name>`.
     /// When set and it disagrees with the stored query's actual kind, the
     /// server rejects the call (400) so the verb asserts the kind. `None`
@@ -593,7 +593,7 @@ pub struct ManifestConflictOutput {
     pub actual: u64,
 }
 
-/// Structured authority mismatch for an RFC-022 prepared write. Values are
+/// Structured authority mismatch for a prepared write. Values are
 /// strings because members include optional graph commit ids and future
 /// authority tokens, not only numeric table versions.
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
