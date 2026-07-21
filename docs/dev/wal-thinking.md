@@ -1,8 +1,8 @@
 # WAL Thinking
 
 Working notes, updated 2026-07-21. Plain-language grounding for the WAL/streaming
-discussion ([RFC-018](docs/rfcs/0018-ingest-wal.md) →
-[RFC-026](docs/rfcs/0026-memwal-streaming-ingest.md)). Three parts: the
+discussion ([RFC-018](../rfcs/0018-ingest-wal.md) →
+[RFC-026](../rfcs/0026-memwal-streaming-ingest.md)). Three parts: the
 contract difference between an interactive graph commit and durable stream
 admission, the expected performance shape and evidence still required, and the
 build inventory.
@@ -327,8 +327,8 @@ complete end-to-end call count:
 - those counters overlap and do not identify sequential critical-path hops, so
   they cannot be added into a truthful “12 calls per write” result.
 
-See [`write_cost.rs`](crates/omnigraph/tests/write_cost.rs) and
-[`memwal_stream_cost.rs`](crates/omnigraph/tests/memwal_stream_cost.rs). B1 has
+See [`write_cost.rs`](../../crates/omnigraph/tests/write_cost.rs) and
+[`memwal_stream_cost.rs`](../../crates/omnigraph/tests/memwal_stream_cost.rs). B1 has
 accepted component evidence for its measured fixture set: the current
 post-containment warm already-claimed acknowledgement result is local, while
 the configured-RustFS figures are a 2026-07-19 pre-containment baseline that
