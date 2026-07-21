@@ -581,6 +581,38 @@ fn init_with_store_flag_errors_instead_of_ignoring_it() {
 }
 
 #[test]
+fn init_with_profile_flag_errors_instead_of_ignoring_it() {
+    // `init` never resolves a scope, so an explicit `--profile` (which may
+    // carry a store binding) would be silently discarded — the same
+    // two-address ambiguity as `init --store` (PR #377 review follow-up).
+    // The ambient $OMNIGRAPH_PROFILE default remains ignored, matching the
+    // explicit-flag-vs-config-default rule on the registry path.
+    let temp = tempdir().unwrap();
+    let graph = graph_path(temp.path());
+    let schema = fixture("test.pg");
+    let output = output_failure(
+        cli()
+            .arg("init")
+            .arg("--schema")
+            .arg(&schema)
+            .arg("--profile")
+            .arg("localdev")
+            .arg(&graph),
+    );
+    let stderr = String::from_utf8_lossy(&output.stderr).into_owned();
+    assert!(
+        stderr.contains("`init` is a direct (storage-native) command")
+            && stderr.contains("--profile")
+            && stderr.contains("does not apply"),
+        "expected the addressing-guard profile rejection on init; got:\n{stderr}"
+    );
+    assert!(
+        !graph.exists(),
+        "init must not run when the addressing is rejected"
+    );
+}
+
+#[test]
 fn graphs_list_rejects_store_scope() {
     // `graphs list` is a served-registry command: it enumerates a server's
     // graphs, so a `--store` (local) address can never apply. The addressing
