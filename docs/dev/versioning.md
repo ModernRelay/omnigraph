@@ -47,9 +47,10 @@ filter-bearing adapter.
 Internal schema **v8 is the currently served format** and maps to OmniGraph
 **0.12.x**. It preserves the v5 identity, v6 key-fencing, and v7 stream-
 lifecycle contracts, then activates RFC-026 Phase B1's private data-bearing
-MemWAL core: exact stream-config v2, one bounded generation, watcher-only
-durability acknowledgement, conservative replay, explicit seal/drain, and a
-dedicated schema-v11 `StreamFold` recovery envelope. The fold publishes its
+MemWAL core: exact stream-config v2, one admission-bounded no-roll generation,
+watcher success plus the same writer's post-durability epoch check before clean
+acknowledgement, conservative replay, explicit seal/drain, and a dedicated
+schema-v11 `StreamFold` recovery envelope. The fold publishes its
 base-table pointer, lifecycle HEAD witness, and fixed lineage in one manifest
 CAS; no MemWAL state is graph-visible merely because it is durable.
 
@@ -57,6 +58,13 @@ This remains an internal storage/recovery capability, not a public streaming
 feature. V8 has no `@stream`, production SDK/HTTP/CLI surface, persistent
 quiesce/resume controls, correction lane, or fresh-read surface. Its private
 integration seam exists only under the feature-gated crash/evidence suite.
+Gate R0 originally found that one legal high-entropy near-cap generation could
+acknowledge and materialize but then exceed the fold's 32-MiB closure charge.
+The private implementation now charges scanner output by logical slice and
+copies each emission into dense owned arrays; that exact 8,192-row shape folds
+and publishes successfully. This repair does not create a new format: no
+schema v9 or product surface is activated by the selected unbounded retain-all
+profile or the optional later B2b managed-reclamation profile.
 
 A v7/0.11.x graph is not reinterpreted or migrated in place: config-v1 never
 becomes data-bearing config-v2 state. Export it with the v7 binary, initialize a

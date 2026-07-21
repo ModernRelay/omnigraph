@@ -316,11 +316,13 @@ pub struct InitOptions {
 /// handles from silently selecting different resource contracts.
 fn private_b1_worker_limits() -> crate::table_store::mem_wal::B1WorkerLimits {
     crate::table_store::mem_wal::B1WorkerLimits {
-        // The B1 evidence qualifies one resident writer. Its widest legal
-        // generation added roughly 126 MiB of whole-process peak RSS (Arrow +
-        // mandatory PK/runtime/allocator), so admitting four residents here
-        // would be an unmeasured throughput choice. B2 may raise this only with
-        // a multi-resident RSS cell.
+        // The B1 evidence qualifies one resident writer and one exclusive
+        // fold. The widest legal admission added roughly 126 MiB of
+        // whole-process peak RSS; its full high-entropy fold added roughly
+        // 272 MiB over a small-fold baseline and carries a 384-MiB
+        // remeasurement tripwire. Admitting more residents would therefore be
+        // an unmeasured throughput choice. A later phase may raise this only
+        // with a multi-resident RSS cell.
         max_resident_writers_root: 1,
         max_resident_writers_per_table: 1,
         max_reserved_arrow_bytes: 32 * 1024 * 1024,

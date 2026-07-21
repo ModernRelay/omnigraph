@@ -171,7 +171,7 @@ for schemas that avoid the newly reserved names documented below. RC.1 requires
 Rust 1.91 or newer; OmniGraph continues to track stable Rust and this audit ran
 on Rust 1.95.
 
-#### Post-audit implementation notes: 2026-07-18–19
+#### Post-audit implementation notes: 2026-07-18–20
 
 RFC-026 Gate E0 subsequently passed and Phase A activated OmniGraph internal
 schema v7. V7 adds only the bounded streaming foundation: exact recovery-v10
@@ -227,7 +227,9 @@ manifest. And RC.1 writes the randomized generation dataset and sidecars before
 that manifest CAS, so a crash may leave a complete or partial unreferenced
 `{hash}_gen_N/` subtree. B1 treats only that recognized subtree shape as
 retained derived orphan output—never adopted, scanned, or deleted—and leaves
-reclamation to B2's proved GC contract. Seal/drain/abort are background-owned
+it in place under the selected unbounded retain-all profile. A later B2b
+managed profile would need a separately proved Lance-owned GC contract.
+Seal/drain/abort are background-owned
 with deadline-bounded caller waits: an error or stalled handler keeps the
 original task and abort completion retained, the registry retired, and
 admission closed. The caller never cancels `shutdown_all`, retries abort, or
@@ -248,21 +250,23 @@ drain's captured floor. Replay preserves possible residue but cannot resolve
 which caller attempt produced it. Configuration identity binds only
 correctness/topology/no-rollover fields; explicit runtime policy and injected
 Session/store capabilities remain separate. Private B1 activates graph schema
-v8 and stream-config v2 rather than adopting v7/config-v1 in place. Phase B2 is
-the later public strict activation. B2-0 now specifies explicit enrollment,
-durable trusted contributor attribution, compare-and-chain write/predecessor
-tokens, a manifest-selected current-token participant, bounded correction, and
-persistent revisioned quiesce/resume/abort-drain/rebuild with bounded terminal
-management receipts. B1's genuine v7↔v8
-cross-version/rebuild,
-complete 24-cell graph-level B1 suite, qualified local cost/PK-index/RSS, and
-configured RustFS cost gates now pass; the measured uncompacted-manifest term remains
-explicitly non-flat. That makes the private B1 boundary green, not public. The
-missing combined enrollment receipt and cross-process admission seal still gate
-broader topology, not B1 inside the existing single-live-writer-process
-boundary.
+v8 and stream-config v2 rather than adopting v7/config-v1 in place. The selected
+next profile is B2a **unbounded retain-all**: OmniGraph deletes no raw
+`_mem_wal` path, imposes no retained-byte/object/file/history quota, and accepts
+loud provider exhaustion. Explicit enrollment, trusted attribution,
+compare-and-chain tokens, manifest-selected current-token authority, bounded
+correction, revisioned lifecycle/management receipts, authorization, and
+product parity remain common contracts. A graph-history budget is not one of
+them for this unbounded profile. Gate R0's legal high-entropy near-cap shape
+originally retained sparse scanner backing buffers and failed the fold charge;
+logical-slice accounting plus dense owned copies now make that exact shape
+acknowledge, materialize, fold, and publish. A reference isolated run measured
+a 284,934,144-byte fold RSS delta, below the 384-MiB CI remeasurement tripwire.
+The missing combined enrollment receipt and cross-process admission seal still
+gate broader topology, not the existing private single-live-writer-process
+seam or unbounded retention.
 
-The 2026-07-19 B2-0 reclamation audit adds a separate stock-RC.1 no-go. Generic
+The 2026-07-19 B2b reclamation audit adds a separate stock-RC.1 no-go. Generic
 `cleanup_old_versions` can reclaim ordinary dataset versions but does not walk
 or delete `_mem_wal`; the runtime guard
 `cleanup_old_versions_does_not_reclaim_mem_wal_objects` pins that ownership
@@ -273,7 +277,9 @@ the stale writer can still complete the put and receive watcher success even
 though an explicit check returns `PeerClaimedEpoch`. These guards forbid raw
 MemWAL deletion in OmniGraph; they do not implement reclamation.
 
-RFC-026 §4.5 therefore requires a Lance-owned opaque inspect/plan/execute
+If bounded managed reclamation is later scheduled, RFC-026 §4.5.2 requires B2b
+to use a Lance-owned opaque
+inspect/plan/execute
 primitive with exact base/shard/history and whole-cut/cursor witnesses, durable
 attempt/receipt lost-result recovery, manifest-version plus epoch advancement
 before deletion, conservative orphan/unknown classification, bounded
@@ -297,23 +303,80 @@ double-reserve across shards. Lance must source and enforce the maximum
 physical-growth reservation, durable materialization-attempt limit, bounded
 claim/reclaim/checkpoint history, and emergency control headroom before
 admission; local/RustFS measurement validates those bounds but does not create
-them. OmniGraph will author that patch, open it upstream, and pin its exact
-reviewed fork commit without waiting for a release. Public B2 remains inactive
-until the positive local/RustFS crash and bound-validation matrix passes. WAL-
-prefix reclamation is limited to a quiescent whole cut because RC.1 does not
-persist a per-generation WAL range.
+them. An upstream proposal remains useful for a future bounded profile, but it
+is not on the unbounded retain-all activation path. WAL-prefix reclamation is
+limited to a quiescent whole cut because RC.1 does not persist a per-generation
+WAL range.
 
-That Lance-owned ledger bounds only one physical `_mem_wal` binding. It does not
-bound the graph's base/token datasets or shared `__manifest` history. B2-0
-therefore separately specifies a manifest-authoritative graph-global
-`GraphHistoryBudget`, checked by every manifest publisher. Each operation
-reserves the exact publication and source-bounded physical-growth envelope
-before effect, holds the global gate through effect/CAS/finalization, persists
-pending recovery charges, and settles them exactly once;
-dynamic per-stream closure reserves cannot be borrowed by ordinary work or by
-another stream. This OmniGraph authority is specified but inactive together
-with schema v9/config-v3/state-v2/recovery-v12 and requires its own bootstrap,
-crash, refusal, every-writer, and local/RustFS physical-bound evidence.
+That optional Lance-owned ledger would bound only one physical `_mem_wal`
+binding; it would not bound the graph's base/token datasets or shared
+`__manifest` history. A future product that promises a finite whole-root bound
+would therefore need a separate RFC for a manifest-authoritative graph-global
+`GraphHistoryBudget`, including bootstrap, crash, refusal, every-writer, and
+local/RustFS physical-bound evidence. The selected retain-all profile makes no
+such promise and carries no such authority.
+
+#### Gate R0 source audit: 2026-07-20 bounded-retention result and 2026-07-21 disposition
+
+Gate R0 returned **no-go** for a B2a contract that promised finite retained
+storage on stock RC.1. The result is tied to exact revision
+`cec0b7dffe2d85c7e66dbe9d1f3891c297903a1d`; the checked-in decision test fails
+when the lockfile pin moves so the audit cannot silently outlive its source.
+On 2026-07-21 the RFC selected unbounded retain-all instead. The same source
+facts remain true, but they no longer block a profile with no storage ceiling,
+no raw-path deletion, and loud provider exhaustion.
+
+The materialization ordering is decisive. `MemTableFlusher::flush` checks the
+epoch, chooses a fresh eight-hex random generation directory, writes the Lance
+generation dataset, optional deletion state, Bloom filter, and mandatory PK
+sidecar, and only then calls the shard-manifest CAS
+(`mem_wal/memtable/flush.rs:223–280`; path construction is
+`mem_wal/util.rs:181–209`). Each `?` may leave a partial or complete
+unreferenced subtree. One background message invokes the flusher once and does
+not transparently retry the failed message (`mem_wal/write.rs:2658–2716`), but
+that is not a lifetime bound: reopen claims another epoch, reconstructs the
+MemTable at unchanged `manifest.current_generation`, replays WAL, and the next
+flush chooses another random path (`write.rs:1365–1403`, `1474–1517`). Durable
+`ShardManifest` state has no attempt ID, counter, reservation, inventory, or
+receipt (`lance-table/src/system_index/mem_wal.rs:177–205`).
+
+One clean unindexed B1 attempt includes generation data, a transaction,
+generation manifest, optional deletion vector, Bloom object, and the PK-BTree
+`page_data.lance` plus `page_lookup.lance`; Blob schemas may add packed or
+dedicated sidecars. Shard-manifest versions/hints, WAL entries, and one
+successor fence sentinel per reopen sit outside that randomized subtree.
+`FlushResult` returns generation/path/rows/covered WAL position, not a physical
+inventory or byte receipt. The data writer sets `max_rows_per_file =
+usize::MAX`; its byte target is soft and checked after a group is written.
+Uploads above 5 MiB may use multipart, whose abort-on-drop is best effort and
+cannot run after process death; local writes likewise use adjacent randomized
+temporary files. Provider and multipart retry settings are not represented in
+MemWAL authority.
+
+The production-neutral current-object census confirms success-path structure
+without overclaiming provider state. Locally, one/four/eight successful folds
+retain approximately 37.4 / 150.6 / 302.3 thousand currently listed immutable
+bytes and exactly the same number of referenced generation roots; every earlier
+listed path retains the same class and size. Generated metadata makes the exact
+byte totals vary slightly, so monotonic currently listed growth is the stable
+assertion.
+A retry after the referenced cut reuses that exact root. Before the closure
+repair, the deterministic high-entropy near-cap cell recorded 33,174,630 listed
+immutable bytes after acknowledgement and about 65.1 million after generation
+materialization, while sparse scanner arrays retained roughly 252.8 million
+bytes of backing allocation and tripped the 33,554,432-byte logical charge.
+Fold now charges the scanner's logical slices and densifies each emission before
+retaining it; the same 8,192-row shape folds and publishes. Ordinary LIST still
+cannot see incomplete multipart uploads, superseded provider versions, delete
+markers, local staging residue, or billed bytes. These measurements validate
+facts; they do not supply a finite storage envelope, and unbounded retain-all
+does not claim one.
+
+The selected profile does not add a test-only materialization-attempt ledger or
+a pre-attempt storage reservation: those would exist only to enforce a bound the
+profile deliberately does not promise. They become relevant again if a later
+RFC proposes bounded retention. No schema v9 or public surface is authorized by
+the source audit or closure repair alone.
 
 The no-roll profile uses fixed portable capacities (`8,193` rows/batches and
 1-GiB byte/unflushed thresholds), not architecture-dependent `usize::MAX`
