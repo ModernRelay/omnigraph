@@ -10,22 +10,33 @@ owner: OmniGraph maintainers
 
 # RFC-026 — MemWAL streaming ingest
 
-**Status:** Draft / Phase A foundation and Phase B1 private core evidence-green;
-Phase B2-0 contracts specified below; public streaming inactive
+**Status:** Draft / Phase A foundation and the private Phase B1 row/fold core
+implemented; the first production profile is unbounded retain-all with no
+MemWAL GC; public streaming inactive
 **Date:** 2026-07-10
 **Gate E0 evaluated:** 2026-07-18
 **Phase A foundation completed:** 2026-07-18
-**Phase B1 private core green:** 2026-07-19 (internal schema v8, stream-config
-v2, recovery-v11, one feature-gated engine seam, and all private B1 acceptance
-gates in §12.3 passed)
+**Historical Phase B1 subset acceptance:** 2026-07-19 (internal schema v8,
+stream-config v2, recovery-v11, one feature-gated engine seam, and the then-
+declared §12.3 shape set passed; Gate R0 later superseded the blanket all-shape
+claim)
 **Phase B1 acknowledgement-fence containment:** 2026-07-20 (after watcher
 success, private B1 requires the same `ShardWriter` to pass
 `check_fenced()` before a clean acknowledgement; fence loss or an unreadable
 or unsettled check is `AckUnknown` plus worker retirement)
-**Phase B2-0 contract closure:** 2026-07-19 (§4.1–§4.6 specifies the
-admission/token, attribution, revision-fenced lifecycle, correction,
-reclamation, and graph-global closure-budget contracts; it activates no schema
-or product surface)
+**Phase B1 near-cap closure repaired:** 2026-07-21 (fresh scanner batches are
+densified before retention; the legal high-entropy 32-MiB generation now folds
+and publishes exactly once; see §0.2 and §12.3)
+**Phase B2 contract inventory:** 2026-07-19 (§4.1–§4.6 specified the common
+admission/token, attribution, revision-fenced lifecycle, correction, retention,
+and graph-global closure-budget contracts; the 2026-07-21 amendment removes
+physical-storage quotas, aggregate receipt caps, and `GraphHistoryBudget` from
+the selected retain-all profile; it activates no schema or product surface)
+**Gate R0 evaluated:** 2026-07-20 — historical **no-go** for a *bounded*
+retain-all profile on stock RC.1; its storage findings are accepted limitations
+of the selected unbounded profile and its fold blocker is now closed (§0.2)
+**Retention decision:** 2026-07-21 — select unbounded retain-all/no-GC for the
+first profile; managed reclamation remains deferred (§4.5)
 **Author track:** Maintainer design series
 **Depends on:** [RFC-022](0022-unified-write-path.md)'s unified write and
 generic recovery-sidecar protocol, plus
@@ -112,16 +123,113 @@ refusal/rebuild. It still exposes no production enrollment entry point and
 cannot append or acknowledge a row. RFC-026 therefore remains draft and public
 streaming remains inactive until the later gates close.
 
-The implementation remains deliberately split. **Phase B1 is now implemented
-privately** for one bounded generation, from admission through crash replay and
-one strict RFC-022 fold. It is reachable only through one feature-gated,
-doc-hidden engine test seam and is not a product surface. **Phase B2 remains
-inactive.** B2-0 now specifies its missing contracts in §4.1–§4.6, while B2
-implementation still owns schema intent, production first use,
-SDK/HTTP/CLI/OpenAPI/Cedar parity, minimum durable contributor attribution and
-reclamation, and the operator escape/correction path plus an explicit same-key
-`AckUnknown` retry contract. B1's implementation and evidence ledger is green
-in §12.3; that does not admit a public caller.
+The implementation remains deliberately split. **Phase B1 is implemented
+privately** for one admission-bounded, no-roll generation, from admission
+through crash replay and one strict RFC-022 fold. The 2026-07-21 dense-scan
+repair closes the legal near-cap row shape that Gate R0 exposed. The core is
+reachable only through one feature-gated, doc-hidden engine test seam and is
+not a product surface. The first production profile is now **B2a unbounded
+retain-all**: stock Lance owns the WAL, OmniGraph never deletes or reclaims a
+MemWAL object, and physical storage is allowed to grow monotonically without a
+file, object, or byte quota. **B2b** remains the deferred managed-reclamation
+profile using a Lance-owned primitive. The token, trusted-attribution,
+recovery, lifecycle, correction, and product-parity contracts in §4.1–§4.4 and
+§4.6 still apply. `GraphHistoryBudget`, physical-storage admission, and
+aggregate receipt-capacity reservations do not. No schema intent, production
+first use, SDK/HTTP/CLI/OpenAPI/Cedar surface, durable contributor attribution,
+correction path, or public same-key `AckUnknown` retry contract is implemented.
+
+### 0.2 Gate R0: historical bounded-retention result and current disposition
+
+**Gate R0 asked one question:** under the existing main-only, unsharded,
+one-live-writer-process boundary and the pinned stock Lance surface, could
+OmniGraph place a finite, source-derived upper bound on every retained
+`_mem_wal` effect while deleting nothing, and reserve enough of that bound
+before acknowledgement for the admitted generation to fold, be corrected if
+necessary, quiesce, and reach `SEALED`?
+
+Gate R0 is production-neutral. It adds no manifest authority row, recovery kind,
+format stamp, `@stream` syntax, production enrollment or row caller,
+SDK/HTTP/CLI/OpenAPI/Cedar surface, and performs no `_mem_wal` deletion. Its
+checked-in decision instrument inventories current listed objects by WAL,
+shard-manifest, generation-data, generation-manifest/transaction/deletion,
+PK-sidecar, Bloom, and user-index class. Unknown paths fail closed; all listed
+immutable paths must retain the same path, class, and listed size between
+retain-all checkpoints. This is current-object evidence only: ordinary listing
+cannot prove content identity, incomplete
+multipart uploads, superseded provider versions, delete markers, local staged
+temporary files, or billed storage.
+
+**Historical Gate R0 result (2026-07-20): no-go for bounded retain-all on stock
+Lance RC.1.** Three findings were recorded:
+
+1. A flush chooses a fresh randomized generation directory, writes the
+   generation dataset, optional deletion state, Bloom filter, and mandatory PK
+   sidecar, and only then attempts the shard-manifest CAS. A crash or error can
+   retain an unreferenced partial/complete subtree. Reopen reconstructs the same
+   logical generation from WAL and may choose another random directory. Stock
+   Lance persists or enforces no attempt ID, attempt counter, reservation, or
+   receipt that bounds materialization across cold opens. Individual process or
+   provider retries may be configured, but they are not represented in MemWAL
+   authority and repeated reopen can accumulate additional attempts.
+2. RC.1 exposes no admission-grade, reserve-first conservative
+   physical-output estimator or complete post-attempt storage receipt. The
+   32-MiB Arrow admission cap is not a source-derived bound for
+   data/Blob/transaction/manifest/deletion/PK/Bloom objects, local staging
+   residue, or multipart/provider residue. Measurements can validate a formula;
+   they cannot create one.
+3. The deterministic high-entropy near-cap cell acknowledged a legal
+   33,228,232-byte post-tombstone Arrow generation and retains 33,174,630
+   currently listed immutable bytes after acknowledgement. Materialization
+   raised the listed retained total to about 65.1 million bytes. The old fold
+   retained sparse `LsmScanner` slices whose variable-width arrays still owned
+   their much larger backing buffers, so its logical-byte check charged roughly
+   252.8 million bytes against the 33,554,432-byte generation limit and refused
+   closure.
+
+The success-only sweep remains useful but does not override those blockers:
+one/four/eight referenced generation roots retain approximately 37.4 / 150.6 /
+302.3 thousand currently listed immutable bytes locally, every earlier listed
+path retains its class and size, and a
+retry after the referenced cut reuses the exact generation root. Configured
+RustFS Gate-R0 growth evidence and the actual 8,192-one-row decision-scale run
+were not needed for the 2026-07-20 decision, and no numeric result from either
+is claimed here. The configured RustFS cell is now wired as a post-merge/tag
+regression signal.
+
+The 2026-07-21 amendment changes the disposition, not those measurements. The
+first two findings remain true, but they are limitations only of a
+finite-storage promise. B2a now makes no such promise: it has no MemWAL GC, no
+file/object/byte ceiling, no retained-storage admission watermark, no
+source-derived physical-output envelope, and no requirement that stock Lance
+return a materialization-attempt receipt. Referenced generations, WAL, fence
+sentinels, and unreferenced partial or complete materialization subtrees are
+retained indefinitely. They are never adopted from path shape or listing, and
+ordinary `cleanup` never treats them as reclaimable. Operators must provision
+the backing store accordingly. Provider exhaustion remains an explicit
+storage failure handled by the existing pre-/post-invocation and recovery
+rules; it is never permission to acknowledge, discard, or fabricate success.
+
+The third finding is fixed. `scan_fresh_generation` now validates the streamed
+logical row/byte totals and then takes every selected row into dense owned Arrow
+arrays before retaining the batch. Dropping the sparse scanner batch releases
+its oversized backing buffers before the next slice. The same deterministic
+33,228,232-byte generation now folds all 8,192 rows, advances the base table
+once, and becomes graph-visible at exactly one `__manifest` publication. One
+isolated widest-fold reference run measured a whole-process peak-RSS delta of
+284,934,144 bytes (about 272 MiB / 285 MB) over the small-fold baseline; a
+384-MiB delta tripwire requires remeasurement before the admission or compaction
+shape is widened. This is measured process memory, not a physical-storage
+quota. The 8,192-row and 32-MiB logical generation limits, one-resident-writer
+topology, exclusive-fold ownership, typed failures, and recovery barriers all
+remain.
+
+This decision and repair authorize no internal schema
+v9/config-v3/state-v2/recovery-v12 state, public stream contract, production
+caller, or deletion. They only remove bounded physical retention from the
+critical path and make the already-private B1 generation close for the widest
+admitted shape. Public activation still requires the correctness and product
+gates in §12.6.
 
 ## 1. Scope and non-goals
 
@@ -396,14 +504,18 @@ exact incarnation and returns `StreamNotEnrolled` before body admission on
 
 ## 4. Future public activation
 
-This section is the Phase-B2 wire contract, not part of the Phase-B1 private
-engine slice. Public activation remains blocked until the strict core is green,
-durable contributor attribution and bounded reclamation exist, and a
-persistent quiesce/rebuild/correction escape prevents an `OPEN` enrollment
-from permanently excluding work. B2's escape is quiesce plus export/rebuild
-into a different root. In-place SchemaApply and maintenance on an enrolled
-table stay refused until Phase D supplies automatic drain, witness update, and
-rebind.
+This section contains the future-public contract, not part of the Phase-B1
+private engine slice. **B2a unbounded retain-all** is the selected first
+profile: it deletes no MemWAL object and performs no physical-storage admission
+or accounting. **B2b** is the deferred managed-reclamation profile through the
+Lance-owned protocol in §4.5.2. Token safety, trusted attribution, recovery,
+revision-fenced lifecycle, correction, and a persistent quiesce/rebuild escape
+remain common correctness contracts. B2a retains individually bounded protocol
+records indefinitely and paginates their inspection; it has no aggregate
+receipt-count/byte cap, `GraphHistoryBudget`, retained-storage quota, or
+closure-capacity reservation. In-place SchemaApply and maintenance on an
+enrolled table stay refused until Phase D supplies automatic drain, witness
+update, and rebind.
 
 ### 4.1 Durable row identity and same-key retry safety
 
@@ -647,9 +759,12 @@ protocol v2. `DRAINING` is a durable operation, not an in-memory observation.
 Every state-v2 row carries a strictly monotonic `lifecycle_revision`; every
 successful publication of that row increments it exactly once, including a
 publication that changes only a witness, retention summary, or last-fold
-summary. The row also retains the immutable enrollment receipt and a bounded
-set of management receipts described below. The complete manifest row
-additionally carries:
+summary. The row also retains the immutable enrollment receipt and append-only
+management and effectful-claim receipt histories described below. Each receipt
+has a source-bounded canonical representation, but B2a does not cap the
+aggregate count or bytes and never evicts one. The complete manifest row
+additionally carries
+`current_claim_receipt_id?` and:
 
 ```text
 DrainDescriptor {
@@ -682,6 +797,50 @@ StrictBlock {
     correction_revision,
 }
 
+ClaimReceipt {
+    claim_id,
+    recovery_operation_id,
+    claim_kind,
+    profile: RETAIN_ALL | MANAGED_RECLAMATION,
+    claim_operation_digest,
+    attempt_count,
+    attempt_effect_chain: ordered [ClaimAttemptEffect],
+    attempt_effect_chain_digest,
+    terminal_attempt_id,
+    terminal_pre_shard_manifest_version,
+    achieved_shard_manifest_version,
+    achieved_writer_epoch,
+    sentinel_position,
+    sentinel_digest,
+    replay_cursor,
+    terminal_effect_digest,
+    terminal_classification:
+        STOCK_MANIFEST_PLUS_SENTINEL |
+        PATCHED_SENTINEL_PLUS_NAMING_MANIFEST,
+}
+
+ClaimAttemptEffect {
+    ordinal,
+    attempt_id,
+    attempt_plan_digest,
+    bound_prestate_digest,
+    storage_envelope_digest?,           // B2b only
+    planned_sentinel_position,
+    planned_sentinel_digest,
+    achieved_shard_manifest_version?,
+    achieved_writer_epoch?,
+    observed_sentinel_position?,
+    observed_sentinel_digest?,
+    attempt_terminal_effect_digest,
+    classification:
+        NO_EFFECT |
+        ABORTED_NO_EFFECT |
+        STOCK_MANIFEST_ONLY |
+        STOCK_MANIFEST_PLUS_SENTINEL |
+        PATCHED_SENTINEL_ONLY |
+        PATCHED_SENTINEL_PLUS_NAMING_MANIFEST,
+}
+
 SealedProof {
     drain_id,
     shard_manifest_version,
@@ -690,6 +849,8 @@ SealedProof {
     current_generation,
     base_merged_generation,
     base_current_head_witness,
+    current_claim_receipt_id,
+    claim_receipt_set_digest,
     verified_empty_digest,
 }
 
@@ -720,8 +881,9 @@ operation ID, the expected
 explicit fold uses `fold_operation_id`; resume/abort-drain uses `resume_id`;
 correction uses `correction_id`. The idempotency occurrence is `(stream
 incarnation, operation kind, operation ID)`; the expected revision is part of
-its canonical request digest. Before checking the expected revision, the engine checks the bounded persisted
-`ManagementReceipt` set: same occurrence and canonical request digest returns
+its canonical request digest. Before checking the expected revision, the engine
+checks persisted `ManagementReceipt` history: same occurrence and canonical
+request digest returns
 the recorded result, while the same occurrence with another digest is
 `StreamIdempotencyConflict`. With no receipt, a revision or addressed-authority
 mismatch is effect-free `StreamLifecycleChanged`; it never retargets the call.
@@ -738,28 +900,48 @@ exact declared-schema identity/configuration witness plus
 `enrollment_request_id`, and its separate immutable `EnrollmentReceipt` supplies
 the same lost-result guarantee.
 
-Stream-config v3 hard-bounds management-receipt count and bytes and reserves
-enough slots/bytes for the complete worst-case closure path. Receipts remain for
-the stream incarnation; they are not silently evicted. Non-closure management
-stops before consuming the closure reserve, and a full stream can still reach
-`SEALED` for rebuild. Before enrollment publishes `OPEN`, before each generation
-is admitted, and before resume republishes `OPEN`, the engine proves and
-reserves the full remaining management-receipt count/byte envelope for that
-generation's fold/block/correction/abort/requiesce/seal path. A current fold is
-part of that reserve, not an optional later allocation. Status reports receipt
-used/reserved/limit values. A new root/stream incarnation makes an old request a
-binding mismatch. Thus a delayed retry from an earlier drain/resume cycle can
-only return its receipt or a stale-revision error; it can never begin a later
-cycle. This bounded receipt set and its worst-case serialized growth are charged
-by the graph-global history budget in §4.5.
+Each management receipt remains individually bounded by its versioned schema,
+the row/memory limits of the transaction that stores it, and bounded response
+pagination. B2a retains those receipts for the stream incarnation without an
+aggregate capacity preflight or eviction. A new root/stream incarnation makes
+an old request a binding mismatch. Thus a delayed retry from an earlier
+drain/resume cycle can only return its receipt or a stale-revision error; it can
+never begin a later cycle. History growth is an accepted storage cost, not an
+admission signal.
+
+A claim sidecar may be removed without a receipt only after exact no-effect
+classification. Once a claim creates a manifest/sentinel authority effect, the
+sidecar remains until the same lifecycle CAS that adopts the achieved epoch
+also persists its complete `ClaimReceipt` and makes
+`current_claim_receipt_id` name it. The same claim ID with another
+`claim_operation_digest` conflicts; after terminal publication, another
+`terminal_effect_digest` conflicts. `claim_operation_digest` is immutable
+across recovery attempts and is canonical over the logical lifecycle
+operation, claim kind/profile, binding, invariant initial authority, and
+contract versions. Each caller-visible claim invocation has a fresh
+`attempt_id` and an `attempt_plan_digest` over its authenticated authority
+prestate/tail, permitted intermediates, and planned sentinel. B2b additionally
+binds its storage envelope. Reusing an attempt ID with another plan or terminal
+effect digest conflicts.
+
+`attempt_effect_chain` is the complete ordered sequence of caller-visible
+claim invocations and exact authority classifications for that one management
+operation. The operation's execution retries remain bounded and typed; B2a
+does not impose a lifetime count/byte cap on the retained receipt history. A
+stock-Lance claim or materialization still returns no substrate receipt. The
+OmniGraph receipt records only the manifest/sentinel facts required to recover
+the lifecycle transition; it is not a physical-object inventory and does not
+claim to enumerate randomized generation materialization attempts. B2a retains
+every such receipt indefinitely. B2b may compact older receipts only through
+the authoritative checkpoint protocol in §4.5.2.
 
 `SEALED` is immutable with respect to shard retention state. A new ordinary
-claim, reclaim, or checkpoint is refused while sealed; the only epoch movement
-from that state is the recovery-covered `StreamResume`, which consumes the old
-proof and publishes `OPEN`. Rebuild reads the unchanged proof. Retention work
-must finish while `OPEN` or `DRAINING`, and quiesce resolves every pending
-claim/reclaim/checkpoint plus its lifecycle publication before constructing the
-final proof.
+claim or profile-specific retention operation is refused while sealed; the only
+epoch movement from that state is the recovery-covered `StreamResume`, which
+consumes the old proof and publishes `OPEN`. Rebuild reads the unchanged proof.
+Retention work must finish while `OPEN` or `DRAINING`, and quiesce resolves
+every pending claim plus any B2b reservation/reclaim/checkpoint and its
+lifecycle publication before constructing the final proof.
 
 For every `DRAINING` row,
 `drain.expected_current_head_witness == current_head_witness` is an invariant.
@@ -782,38 +964,60 @@ Quiesce requires a caller-minted non-nil `drain_id` and expected lifecycle
 revision, acquires the common stream-admission lease exclusively, runs the
 recovery barrier, waits for every watcher/retirement owner, and CASes
 `OPEN -> DRAINING` before a new physical drain effect. The durable descriptor
-is the restart plan. Under it the worker claims a higher epoch, classifies and
-folds each exact cut through recovery-v12 `StreamFold` drain mode, independently
-proves no active/frozen/replay tail plus shard/base merge agreement, then CASes
+is the restart plan. Under it the worker advances the epoch through the
+selected retention profile's claim hook, classifies and folds each exact cut
+through recovery-v12 `StreamFold` drain mode, independently proves no
+active/frozen/replay tail plus shard/base merge agreement, then CASes
 `DRAINING -> SEALED` with the exact proof. It never holds a table queue while
 waiting for a fold that needs that queue. The management-receipt rules above
 make the exact operation retry-safe and reject a stale request instead of
 retargeting it. Restart continues `DRAINING` and never auto-opens it.
 
-Every B2 epoch advance—cold open, quiesce, resume/abort, reclaim, and
-checkpoint—uses one patched Lance claim envelope. Lance first persists a
-claim-attempt record, conditionally writes the decoded-empty successor sentinel,
-then CASes a shard manifest that names the sentinel position/digest and advances
-the epoch. It durably terminals the attempt with the exact sentinel/manifest
-receipt before returning success. Ordinary claims, including checkpoint claims,
-bind the complete authenticated WAL/sentinel tail and conditionally create their
-sentinel at checked `max_authenticated_position + 1`; unknown tail, collision,
-or overflow refuses. They
-preserve the prior
-`replay_after_wal_entry_position`. They must replay/classify every object after
-that cursor and may advance it only through the existing flush/coverage proof;
-they never skip data-bearing WAL merely because the later sentinel is empty.
-The sole claim-time cursor exception is §4.5's reclamation successor: only after
-its quiescent whole-cut proof establishes no data-bearing tail may its manifest
-advance the cursor to the new sentinel. Only the exact manifest-named claim may
-proceed to replay, and no new put is admitted until that classifier permits it.
-A crash before the CAS is same-attempt recovery state; a foreign object or
-movement fails closed. This replaces RC.1's manifest-before-sentinel gap for B2
-and gives every claim recoverable sentinel authority. The open/admission barrier
-resolves or refuses pending claim attempts before another claim.
-Claim IDs, terminal receipts, retry horizons, and checkpoint compaction follow
-§4.5; they are counted durable substrate state rather than an unbounded audit
-log.
+Every B2 epoch advance—cold open, quiesce, and resume/abort—uses a
+profile-neutral claim contract. Before writer open, existing manifest/recovery
+authority must durably bind the claim operation, exact authoritative prestate,
+complete authenticated WAL/sentinel tail, every permitted authority
+intermediate, and exact terminal classification. B2b additionally binds its
+physical-growth envelope. Unknown authoritative tail, collision, overflow, a
+foreign effect, or ambiguous authority movement fails closed.
+Claims preserve the prior `replay_after_wal_entry_position`, replay/classify
+every object after it, and may advance it only through the existing
+flush/coverage proof. The open/admission barrier resolves or refuses every
+pending claim before another claim or put.
+If recovery must invoke a higher-epoch claim, it first appends that invocation's
+fresh `attempt_id`, `attempt_plan_digest`, exact authority prestate, and
+permitted effect states to the durable sidecar, and only then calls Lance. The
+immutable `claim_operation_digest` does not change. Invocation retries obey a
+bounded runtime policy; exhaustion returns typed `RecoveryRequired` and keeps
+the sidecar. Finalization projects the complete classified sequence into the
+individually bounded `ClaimReceipt`. B2a neither reserves nor meters physical
+storage for those invocations.
+
+The two retention profiles supply that hook differently. The selected B2a
+retain-all implementation may consume stock RC.1's manifest-first,
+sentinel-second claim only when an existing RFC-022 recovery sidecar, armed
+before invocation, can classify and finish the exact no-effect, manifest-only,
+manifest-plus-sentinel terminal, and lost-result authority states under the
+single-live-writer boundary. The sidecar—not the stock shard manifest—binds the
+planned successor sentinel position/digest. An unclassifiable authority gap is
+`RecoveryRequired`; it is never papered over by path inference. Unreferenced
+randomized generation output is not shard authority: B2a retains it forever
+and never adopts it, but does not require an attempt receipt or storage charge
+for it.
+
+B2b instead uses the patched Lance claim-attempt/terminal-receipt envelope in
+§4.5.2: Lance conditionally creates the successor sentinel at checked
+`max_authenticated_position + 1`, then names it in the exact shard manifest
+that advances the epoch. Only that manifest-named claim may replay. B2b's sole
+cursor exception is the reclamation successor: only after a quiescent whole-cut
+proof establishes no data-bearing tail may its manifest advance the cursor to
+the new sentinel. Claim IDs and individually bounded terminal receipts are common durable
+state. For B2a, the OmniGraph graph-manifest-authoritative `ClaimReceipt` is the
+durable projection of the already exactly classified RFC-022 sidecar proof for
+stock RC.1's manifest-first/sentinel-second effects; only then may the sidecar
+be finalized. For B2b it projects and binds the patched Lance terminal receipt
+and manifest-named sentinel. Reclaim/checkpoint IDs, retry horizons, and history
+compaction are B2b-only.
 
 Drain mode is not the implemented B1 `OPEN` fold with a relaxed check. Its
 sidecar binds the complete expected `DRAINING` row and `drain_id`; publication
@@ -833,11 +1037,14 @@ configuration, base witness, graph-branch topology, fixed actor/operation, an
 `OPEN` template, management receipt, and minimum next epoch floor. The exact
 achieved epoch is unknowable before the writer claim. After claiming, the
 adapter durably records `EffectsConfirmed` with the exact sentinel/epoch,
-sentinel-naming shard manifest/replay cursor, replay disposition, and final
-`OPEN` row; only that row may publish. Recovery
+profile-specific `ClaimReceipt`, achieved shard manifest/replay cursor, replay
+disposition, and final `OPEN` row; only that row may publish. B2b's achieved
+manifest names the sentinel directly; B2a's stock manifest does not, so its
+persisted receipt carries the sidecar's already-classified binding. Recovery
 never compensates an epoch or fence sentinel: while admission remains closed it
-may claim a still-higher epoch, then records a new exact confirmation before
-publication. An already-visible byte-identical `OPEN` row finalizes the
+may follow the pre-authorized rule above to claim a still-higher epoch, then
+records a new exact confirmation before publication. An already-visible
+byte-identical `OPEN` row finalizes the
 sidecar; a divergent `OPEN` row, binding, witness, topology, or uncovered
 residue fails closed.
 
@@ -861,40 +1068,47 @@ continue to the sealed proof. This rule is identical in §8 and the B2 gates.
 Minimum status is one authoritative manifest row plus a bounded cut-consistent
 physical observation. In the supported B2 profile it takes stream admission
 exclusively, read-only lists/classifies relevant recovery intents, settles every
-writer/watcher/flush/retirement/reclaim owner to the status deadline, reads
-lifecycle/token authority plus the shard witness, performs exact inventory,
-and rereads those authorities before release. It never resolves recovery.
+writer/watcher/flush/retirement owner plus every selected-profile claim owner to
+the status deadline, reads lifecycle/token authority plus the authoritative
+shard witness, and rereads those authorities before release. It never resolves
+recovery.
 Movement returns typed `StatusChanged`; failure to settle returns typed
 `StatusBusy`. It reports lifecycle/binding/configuration,
 `lifecycle_revision`, authoritative and observed epoch, drain ID/goal/phase,
-pending generation
-rows/bytes, replay and merge cut, retained WAL/generation/orphan/unknown bytes,
-strict block token/code/revision, correction and management receipt
-spare/use/reserve/limits, the persisted `LastFoldSummary`, graph-global manifest
-history used/pending/per-stream reserve/aggregate reserve/limits/source-bound
-version, relevant recovery operation, and exact rebuild-readiness reasons.
+pending generation rows/bytes, replay and merge cut, strict block
+token/code/revision, persisted receipt-history counts and pagination cursors,
+the persisted `LastFoldSummary`, relevant recovery operation, and exact
+rebuild-readiness reasons.
 Mutable WAL cursor statistics are labeled hints and
 never used as receipts. A listing error, overflow, or unknown classification is
-an explicit status error; the read-only status call does not mutate lifecycle.
-Every later admission independently requires its own under-gate token-spare,
-management-receipt closure, graph-history, and storage-meter/inventory preflight and refuses before
-`put_no_wait` when any proof is unavailable.
+an explicit diagnostic error only when the caller requested advisory retained-
+object detail; it is not an admission or lifecycle-authority failure. Advisory
+retained bytes are labeled as current-listing observations, never quota or
+billing truth. The read-only status call does not mutate lifecycle. Every later
+admission independently reruns the recovery, lifecycle, token, row, memory, and
+backpressure gates; there is no B2a storage-meter or receipt-capacity preflight.
 
 Rebuild preflight requires `SEALED` and re-runs under closed admission plus
 schema/branch/table gates. The sealed proof must still match the exact
-base/shard state; no relevant sidecar, active/frozen/replayable tail, unmerged
-generation, unattributed winner, unresolved token, or uncovered inventory may
-remain. Export/cutover re-runs the proof. A prior status response is never an
+base/shard state; no relevant sidecar, active/frozen/replayable authoritative
+tail, unmerged generation, unattributed winner, or unresolved token may remain.
+Unreferenced retained materialization output is inert and does not block the
+proof. Export/cutover re-runs the proof. A prior status response is never an
 authority token.
 
 `verified_empty_digest` is domain-separated over the exact binding,
-configuration, stream incarnation, base witness, ordered shard-manifest/
-generation inventory, replay/merge cursors, retained/unknown classes, and every
-decoded empty WAL fence sentinel. A sentinel may remain beyond the authoritative
+configuration, stream incarnation, base witness, ordered authoritative shard-
+manifest/referenced-generation state, replay/merge cursors, and every decoded
+empty WAL fence sentinel. It excludes advisory listings, unreferenced retained
+objects, and storage-byte estimates. A sentinel may remain beyond the authoritative
 replay cursor only when its exact position/digest/epoch is authenticated by the
-retention checkpoint plus retained claim/manifest successor chain. Exactly one
-sentinel for the achieved current epoch must remain, be decodable, and be named
-by the latest shard manifest. Older authenticated sentinels from the same
+selected profile's durable chain: B2a uses its OmniGraph
+graph-manifest-authoritative `ClaimReceipt` set plus the stock manifest
+sequence, while B2b uses its
+retention checkpoint plus retained claim/manifest successor sequence. Exactly
+one sentinel for the achieved current epoch must remain, be decodable, and be
+named by `current_claim_receipt_id`; B2b additionally requires the latest shard
+manifest to name it. Older authenticated sentinels from the same
 shard/enrollment and an epoch no greater than that floor are harmless fence
 history and remain included in the digest until reclamation removes them. A
 data-bearing entry beyond the cursor, malformed or unauthenticated sentinel,
@@ -963,32 +1177,17 @@ correction_id)` with plan digest, actor, fixed graph commit/result, and final
 lifecycle/token digest. A retry checks that receipt before declaring the block
 stale: exact ID/digest returns the recorded result, while the same ID with a
 different digest is `StreamIdempotencyConflict`. Receipts are rare operator
-records, not per-ack admission history. Stream-config v3 contains hard
-`max_correction_receipts`, `max_correction_receipt_bytes`, and source-derived
-`max_single_correction_receipt_bytes` values. Before the first WAL effect of
-each one-live-generation admission, the engine checks under stream admission
-and the token gate that persisted receipt usage plus one slot and the full
-single-receipt byte bound still fit. That spare cannot be consumed by another
-operation while the generation is live: correction requires its exact blocked
-generation and admission is closed. Cold replay reconstructs the same spare
-from the persisted generation plus current receipt usage. If it cannot be
-proved, new admission returns typed `CorrectionReceiptCapacityExceeded` before
-`put_no_wait`, while fold/quiesce/rebuild remain available.
-
-Under the token gate, a correction transfers that generation's spare to the
-exact canonical receipt before sidecar arm. The source-derived per-receipt
-maximum must cover every legal canonical receipt; exceeding it is a fail-closed
-format/invariant violation that the activation matrix proves unreachable, never
-an ordinary post-admission capacity outcome. A successful fold releases the
-unused logical spare before another generation may admit.
-The already-reserved blocked generation therefore always has room for one
-terminal correction even when the retained-receipt totals then reach their
-caps. Receipts are retained for the stream incarnation. Once no generation or
-block remains, full totals stop new admission and a quiesce can still reach
-`SEALED` for export/rebuild into a new root/new stream incarnation. Status
-reports used, reserved, and limit values. Public defaults require storage
-evidence before activation; an unspecified, advisory, or admission-only check
-without the terminal spare is invalid.
+records, not per-ack admission history. Their canonical schema and the bounded
+correction operation impose a source-derived maximum on each individual
+receipt, and the token-table transaction that stores one remains subject to the
+ordinary row/memory limits. B2a retains every receipt for the stream
+incarnation, indexes it for exact idempotency lookup, and paginates history; it
+does not reserve a slot, enforce aggregate receipt count/bytes, or stop row
+admission because history has grown. A correction arms its exact receipt and
+token effects in recovery before either can become manifest authority. If the
+backing store cannot persist that bounded record, the operation follows normal
+typed storage/recovery semantics and admission remains closed around the
+blocked cut; no row is silently discarded.
 
 Correction targets only keys whose LWW winner is in that blocked cut; adding a
 new key is out of B2. It supports two explicit actions:
@@ -1027,7 +1226,7 @@ applies one bounded keyed-upsert batch with at most one image per resulting
 then publishes at most 8,192 resulting `PRESENT | WITHDRAWN` current-token rows
 in deterministic chunks and the one `CorrectionReceipt` row in a final separate
 transaction on that same dataset. Each transaction independently obeys the
-sealed 8,192-row/32-MiB bound; the receipt transaction also obeys the stricter
+sealed 8,192-row/32-MiB bound; the receipt transaction also obeys the
 source-derived single-receipt byte bound. Stream-config v3 fixes a source-
 derived `max_correction_token_transactions`, and admission proves that the
 worst-case token projection for the complete legal generation plus the receipt
@@ -1055,7 +1254,42 @@ plain `stream resume` continues to accept only `SEALED`. The fold/correction CAS
 never opens admission itself. Skip-invalid, implicit drop, whole-generation
 discard, base-row delete, and direct `DRAINING -> OPEN` CAS are forbidden.
 
-### 4.5 Reclamation decision: own the missing Lance primitive
+### 4.5 Retention profiles
+
+#### 4.5.1 B2a unbounded retain-all/no-GC profile (selected)
+
+B2a deletes no MemWAL object after fold, optimize, cleanup, restart,
+correction, quiesce, or `SEALED`. Referenced generations, WAL files, historical
+fence sentinels, and unreferenced partial or complete randomized
+materialization subtrees all remain in the source root indefinitely. The
+profile intentionally has no MemWAL file/object/byte limit, retained-storage
+ledger, quota, admission watermark, physical-output estimator, storage
+reservation, or materialization-attempt receipt requirement. It does not
+promise bounded disk/object-store usage or indefinite service under finite
+provider capacity.
+
+This changes only the physical-retention contract. Row and memory admission
+remain bounded at one no-roll generation of at most 8,192 rows and 32 MiB of
+logical Arrow data; worker count, queues, deadlines, execution retries, and
+fold/correction transaction shapes remain explicitly bounded. Every
+acknowledgement still requires watcher durability plus the same-writer fence
+check. Every authority-changing effect still uses the existing manifest and
+recovery protocols, and unresolved authority ambiguity still blocks progress.
+No path, listing result, timestamp, or compatible-looking object may establish
+ownership. Unreferenced physical residue is simply inert: it is retained,
+never scanned as a generation, never adopted, and never deleted.
+
+Gate R0's first two findings in §0.2 therefore become accepted operational
+limitations rather than activation blockers. Its third finding is closed by
+the dense-scanner compaction repair. Current-object inventory remains useful as
+an advisory regression instrument, but it is not correctness authority,
+provider billing truth, or admission input. A store-capacity failure before a
+put is a typed storage refusal; after invocation it follows the existing
+`AckUnknown`/recovery classification. Neither case permits data loss or false
+acknowledgement. Export/rebuild into another root remains an operator tool, not
+a capacity promise or mandatory automatic lifecycle.
+
+#### 4.5.2 B2b managed reclamation: own the missing Lance primitive
 
 The RC.1 audit produces an explicit no-go for physical reclamation through the
 stock public surface:
@@ -1076,7 +1310,7 @@ stock public surface:
   though an explicit fence check returns `PeerClaimedEpoch`; and
 - `FlushedGeneration` carries generation/path but no per-generation WAL range.
   Only the shard-wide replay cursor exists, so a WAL prefix is reclaimable only
-  at B2's quiescent whole-cut boundary. `wal_entry_position_last_seen` is never
+  at B2b's quiescent whole-cut boundary. `wal_entry_position_last_seen` is never
   substituted.
 
 Private B1 contains the clean-acknowledgement face of that RC.1 gap at the
@@ -1088,15 +1322,13 @@ post-invocation `AckUnknown`, and the worker retires while its possible durable
 residue remains replayable. This containment is deliberately narrower than the
 required Lance change. It does not erase stale WAL bytes, make a deleted fence
 sentinel safe, protect raw Lance MemWAL callers, provide cross-process
-seal/failover, or authorize any `_mem_wal` deletion or public B2 surface.
+seal/failover, or authorize any `_mem_wal` deletion or public B2b surface.
 
 OmniGraph therefore does not raw-delete `_mem_wal` objects, route them through
-`delete_unverified`, compact shard-manifest history, or wait passively for an
-upstream release. The next substrate slice authors a narrow Lance patch,
-proposes it upstream, and may pin OmniGraph immediately to the exact reviewed
-commit while upstream review proceeds. Deletion stays inside Lance; when the
-change is released upstream, the pin returns to the canonical revision rather
-than preserving a product fork.
+`delete_unverified`, or compact shard-manifest history. B2b requires the narrow
+Lance-owned primitive below; an upstream proposal remains useful, but its
+calendar does not block the separate OmniGraph-only successor evidence gate for
+B2a. No temporary B2a work may impersonate reclamation or delete a path.
 
 Stock RC.1 exposes only evidence-level raw object listing plus manifest reads,
 not the owned classified inventory below. The required public Lance shape is
@@ -1177,7 +1409,7 @@ from the attempt/successor/receipt plus fresh inventory, never optimistic
 process memory. Attempt and receipt records remain counted and retained through
 the supported idempotency/recovery horizon.
 
-Pending reclaim attempts are part of the mandatory B2 open/admission barrier,
+Pending reclaim attempts are part of the mandatory B2b open/admission barrier,
 not optional maintenance metadata. Before any stream open, status, put, fold,
 quiesce, resume, correction, rebuild preflight, or later reclaim may claim a
 writer or touch shard state, it classifies the exact attempt set. Mutating
@@ -1193,8 +1425,9 @@ complete expected lifecycle row, exact Lance attempt/plan, and fixed post-
 receipt shard epoch/manifest/cursor/inventory outcome before the first physical
 effect. After Lance terminals the receipt, the operation records
 `EffectsConfirmed` and conditionally publishes the exact epoch floor, shard
-witness, retained-byte classes, lifecycle revision, and graph-history charge
-while preserving the lifecycle state and any drain identity/goal. A crash in between is roll-
+witness, retained-byte classes, and lifecycle revision while preserving the
+lifecycle state and any drain identity/goal. A separately accepted bounded-root
+amendment may add its own graph-history charge; base B2b does not imply one. A crash in between is roll-
 forward-only and blocks another writer or final sealed proof. Quiesce constructs
 `SealedProof` only after every such sidecar and substrate attempt is settled, so
 the proof cannot be invalidated by later retention work.
@@ -1244,13 +1477,13 @@ new checkpoint epoch expires every old reclaim and ordinary-claim ID: retry
 returns typed `ReceiptExpired` or `ClaimReceiptExpired`, respectively, and the
 same UUID in the new epoch is a different identity.
 
-There is no absent-pointer bootstrap mode. B2 enrollment or sealed rebuild asks
+There is no absent-pointer bootstrap mode. B2b enrollment or sealed rebuild asks
 the patched Lance initializer to create an immutable genesis checkpoint body
 with empty claim/reclaim summaries and conditionally install its bootstrap
-pointer **before** committing the B2 MemWAL details/index kind. The enrollment
+pointer **before** committing the B2b MemWAL details/index kind. The enrollment
 recovery envelope binds the genesis body, pointer, details commit, empty shard,
 and final lifecycle publication; a crash before graph publication either
-completes that exact prefix or refuses foreign/malformed residue. The first B2
+completes that exact prefix or refuses foreign/malformed residue. The first B2b
 reader therefore always starts from an authoritative body, while a body/pointer
 left before the details commit is classified enrollment-owned state rather than
 silently adopted.
@@ -1263,8 +1496,9 @@ shard state. Checkpoint activation never strands an already-open old reader on
 the legacy kind. Genuine patched↔RC.1 and graph-v8↔v9 tests pin genesis
 body/pointer/details publication, every later checkpoint crash boundary, ID
 expiry, and refusal to fall back to `version_hint`. If the bootstrap, complete
-summary, ID expiry, or bounded compaction cannot be proved, public B2 remains
-inactive; periodic rebuild is not a substitute for an unbounded or
+summary, ID expiry, or bounded compaction cannot be proved, public activation
+under B2b remains inactive; periodic rebuild is not a substitute for an
+unbounded or
 unrecoverable MemWAL namespace. Even after that namespace is bounded, the
 separate whole-root lifetime limit below still applies.
 
@@ -1312,22 +1546,22 @@ not reconstruct them from paths.
 
 Exact orphan/unknown accounting additionally requires a backend capability that
 guarantees HEAD/GET and LIST visibility after successful PUT **and** DELETE for
-the `_mem_wal` namespace. If that capability is absent, public streaming is
-refused unless the Lance patch provides its own durable complete object
+the `_mem_wal` namespace. If that capability is absent, public activation under
+B2b is refused unless the Lance patch provides its own durable complete object
 accounting that does not depend on a possibly stale listing. That accounting
 includes incomplete multipart uploads, which ordinary object LIST does not
 return. Current-key visibility is still insufficient on a versioned,
 soft-delete, or Object-Lock/retention-enabled namespace: noncurrent versions,
 delete markers, retained locked objects, and incomplete uploads may continue to
-consume billed storage after the current key disappears. The initial public B2
+consume billed storage after the current key disappears. The initial public B2b
 profile refuses those configurations unless the patched backend can enumerate
 and byte-account every retained version/marker/lock, permanently delete each
 eligible version, and keep ineligible retained bytes charged until verified
 removal or expiry. A successful best-effort current-object list is evidence for
 the negative RC.1 guards, not a production completeness or cost proof.
 
-Public activation also requires a hard **admission watermark**, not a maximum
-observed in a benchmark and relabeled as a guarantee. Exact cold inventory
+Public activation under B2b also requires a hard **admission watermark**, not a
+maximum observed in a benchmark and relabeled as a guarantee. Exact cold inventory
 counts every object/byte under `_mem_wal`: WAL, referenced generations and
 PK/Bloom sidecars, recognized orphans, shard-manifest history/checkpoints,
 ordinary claim and reclaim attempt/receipt records, and malformed/unknown
@@ -1392,7 +1626,7 @@ durable upload identity and charged byte/object allowance. Same-plan recovery
 must complete or explicitly abort it before another materialization attempt;
 the retained-state inspector must list/account for it through the backend's
 multipart API even though ordinary LIST cannot. A backend without exact
-multipart accounting/abort semantics cannot enable public streaming. The
+multipart accounting/abort semantics cannot enable B2b. The
 local/RustFS/S3-compatible matrix repeatedly crashes before multipart complete
 and proves retained charged bytes plus attempts remain within the envelope.
 
@@ -1418,116 +1652,40 @@ binding ledger but from the non-admission pool. Row admission stops with typed
 `ControlHeadroomExceeded` before it consumes the emergency floor; same-ID
 recovery, status, fold/correction, quiesce, reclaim, checkpoint, and sealed
 rebuild stay available. If Lance cannot prove these history/orphan limits, the
-reserve-first ledger, or forward-progress headroom, B2 must stop before public
+reserve-first ledger, or forward-progress headroom, B2b must stop before public
 activation rather than discover at runtime that a full WAL cannot be reclaimed.
 
 Local and RustFS measurements across row/byte caps, wide schemas, blobs,
 PK/Bloom output, fragmented batches, crashes, and retries validate the
 estimator/quota and catch regressions; they do not create the bound. Arrow or
 RSS bytes are not disk bytes. A patch that can only report measured growth, or
-that cannot checkpoint its own history, does not satisfy B2.
+that cannot checkpoint its own history, does not satisfy B2b.
 
-The per-binding watermark bounds only the physical MemWAL namespace. It does
-not bound logical base/token data or their Lance version histories. The shared
-`__manifest` history is a separate graph-global finite resource: another stream
-or an ordinary graph writer can grow it, so a per-stream publication counter
-cannot guarantee that every enrolled stream still has an escape.
+#### 4.5.3 Deferred bounded-storage accounting (not a B2a gate)
 
-Internal schema v9 therefore adds one manifest-authoritative singleton
-`GraphHistoryBudget` for the root. It carries the root/history epoch, every
-manifest publication charged since rebuild, a conservative source-derived
-physical-growth charge, hard publication/byte limits, the sum of each enrolled
-stream's remaining closure obligation, the last finalized budget revision, and
-the last finalized budget operation/delta digest.
-Each state-v2 stream row carries its own remaining closure reservation; the
-singleton aggregate and the set of stream rows must agree in the same CAS.
-There is no in-memory or side-dataset budget authority.
+The earlier B2-0 design proposed a graph-global `GraphHistoryBudget`, physical-
+growth reservations for every manifest publisher, per-stream closure reserves,
+and hard aggregate receipt/storage caps. That design answered a different
+product promise: continue operating indefinitely inside a finite, enforced
+storage envelope. The selected unbounded retain-all profile makes no such
+promise, so none of those mechanisms is part of B2a's schema, gate order,
+admission path, recovery payload, error surface, or activation criteria.
 
-Every publisher of `__manifest` participates—not only stream code. Mutation,
-Load, SchemaApply, BranchMerge, branch controls, EnsureIndices, Optimize,
-Repair, Cleanup, recovery, enrollment, fold/correction/lifecycle/retention, and
-future writers all acquire the graph-history gate and charge the exact logical
-publication plus its conservative physical-growth maximum. The complete crash-
-safe authority is the committed singleton **plus** globally relevant standard
-RFC-022 recovery sidecars. Under the history gate, a writer that may need a
-later manifest CAS writes its sidecar with the exact pending budget charge
-before its first data effect. The charge binds the history epoch, expected
-budget revision, estimator/limits version, operation identity, exact singleton
-delta, per-stream reserve delta if any, and conservative object/byte envelope;
-same operation with another digest conflicts. This does not require or pretend
-there was an extra budget-only manifest CAS. Every publisher's root recovery
-barrier sums or resolves those pending charges exactly once. Final manifest
-publication applies the bound delta and records its operation/digest in the
-singleton; a lost CAS result classifies that exact marker and never charges it
-twice. Effect-free finalization removes the pending charge. A normal publication
-is admitted only when its charge leaves
-the aggregate closure floor untouched. A closure publication may consume only
-the named stream's reservation, atomically reducing that stream and the
-singleton aggregate; it cannot borrow another stream's reserve.
+This is not permission to make process memory or individual operations
+unbounded. B2a keeps the row, logical-Arrow-byte, worker, queue, deadline,
+transaction-chain, response-page, and retry bounds specified elsewhere. It
+also keeps every correctness obligation: durable acknowledgement, exact
+recovery ownership for authority effects, one manifest visibility point,
+compare-and-chain tokens, trusted attribution, revision-fenced lifecycle, and
+strict correction. Only cumulative physical storage and append-only protocol
+history are deliberately unmetered.
 
-The initial B2 profile holds the graph-history gate from that final
-reserve/sidecar arm through every owned physical effect, the manifest CAS, and
-budget-charge finalization. There is therefore at most one live expected budget
-revision; another publisher waits and then restarts its final validation from
-the new singleton, while crash recovery resolves the sole pending charge before
-releasing the gate. This deliberately serializes graph publication. A future
-concurrent-reservation protocol needs a separate accepted composition proof; B2
-does not let multiple pending deltas speculate from one revision.
-
-The byte charge is a physical retained-storage claim, so it includes every
-Lance object a `__manifest` attempt can create: data fragments, version/
-transaction manifests, maintained-index objects, multipart uploads, standard
-recovery-sidecar overhead, and failed-CAS/materialization residue. The manifest
-adapter obtains a source-derived maximum before materialization, fixes the
-Lance transaction/output identity and a hard maximum attempt count in the
-sidecar, and either reuses deterministic output or retains the full next-attempt
-allowance. Even a manifest-only metadata writer must persist this minimal
-standard reservation sidecar before Lance can materialize its CAS attempt,
-unless Lance itself supplies an equivalent durable attempt/receipt consumed by
-the same barrier. Cold open inventories and classifies the complete manifest namespace
-plus pending multipart state; unknown or unreserved output closes all writers.
-Settlement moves only observed materialized bytes from reserved to retained,
-without double counting, and releases bytes only after an exact Lance-owned
-cleanup/rebuild receipt plus fresh inventory. A successful-publication counter
-without this reserve-first materialization envelope is depth evidence, not byte
-headroom, and does not activate B2.
-
-Enrollment reserves the complete worst-case closure path for the new stream.
-Before a stream admits a generation, resumes to `OPEN`, or begins non-emergency
-management, it must replenish and prove that stream's full remaining obligation:
-fold or strict block, one terminal correction, abort-drain when the goal is
-`OPEN_AFTER_FOLD`, a second quiesce/claim, and final `SEALED` publication,
-including the required management receipts and pending recovery charges. The
-aggregate is dynamic across **all** enrolled streams, so two blocked tables at
-the floor each retain their own correction and seal path. Closing one cannot
-consume the other's reserve. The worst-case number/bytes are derived from the
-fixed state machine and source-level maximum manifest-row/transaction growth;
-configuration cannot lower them.
-
-A successful `SEALED` publication releases that stream's unused closure
-reservation in the same CAS. Any transition back to `OPEN` must first reserve
-the full applicable OPEN obligation; if it cannot, it remains closed and
-returns `GraphRebuildRequired`. A successful fold may leave an idle stream
-`OPEN` with only its shorter no-generation closure reserve, but no next
-generation is admitted until the full generation envelope is replenished.
-
-When an ordinary charge would cross that shared floor, new work returns typed
-`GraphRebuildRequired` before effect. Status reports graph-global used,
-pending, per-stream reserved, aggregate reserved, limit, and source-bound
-version. Operators close every enrolled stream and export/rebuild into a fresh
-root. In-place SchemaApply, Optimize, and Cleanup on an enrolled table remain
-refused until a later accepted drain/maintenance strand. Indefinite in-place
-service requires Phase D or another accepted manifest-retention design; B2 does
-not market a bounded MemWAL as a whole-graph storage bound. Public B2 remains
-closed until this graph-global charge and its physical-growth upper bound are
-implemented and evidence-green; an advisory counter or per-stream-only reserve
-does not satisfy the escape invariant.
-
-These contracts close the design question without pretending RC.1 can already
-execute it. B2 implementation and every public surface remain closed until the
-reviewed Lance primitive, post-success fence fix, enforced admission watermark,
-bounded MemWAL history checkpoint, graph-global manifest-history budget, and
-crash matrix are pinned and green.
+If OmniGraph later promises bounded retained storage, automatic reclamation,
+or indefinite in-place operation under a configured quota, that feature needs
+a new accepted amendment and evidence at that boundary. B2b's Lance-owned
+reclamation/accounting work in §4.5.2 is the current research direction; it is
+not a prerequisite for B2a and cannot be smuggled into B2a through raw deletes
+or an advisory counter.
 
 ### 4.6 Public surface after the gates close
 
@@ -1569,8 +1727,6 @@ new admission attempt. Exact JSON `status` values are `durable`,
 `stream_input_too_large`, `stream_binding_changed`,
 `stream_lifecycle_changed`, `stream_authority_changed`,
 `stream_sequence_conflict`, `stream_idempotency_conflict`, `stream_fold_required`,
-`retained_storage_limit_exceeded`, `control_headroom_exceeded`,
-`correction_receipt_capacity_exceeded`, `graph_rebuild_required`,
 `stream_backpressure`, `recovery_required`, and `stream_retry_required`;
 CamelCase names below denote the corresponding engine error/disposition types.
 An unresolved recovery found by the request-level barrier before any body line
@@ -1609,15 +1765,11 @@ binding. OpenAPI makes presence variant-specific rather than nullable-by-habit.
   corresponding typed error, with no fabricated attempt. Lifecycle change
   covers `OPEN -> DRAINING/SEALED` between request runs; authority change covers
   an exhausted pre-invocation reprepare after schema/main/token movement;
-- `stream_fold_required`, `retained_storage_limit_exceeded`,
-  `control_headroom_exceeded`, `correction_receipt_capacity_exceeded`, and
-  `graph_rebuild_required` are effect-free admission refusals. They carry the
-  exact relevant usage/limit snapshot and no attempt; `stream_fold_required`
-  means the next legal row/run fits an empty generation but not the bounded
-  resident generation and must be folded before retry, while
-  `graph_rebuild_required` means the shared root publication budget has reached
-  the aggregate reserved closure floor. The management/rebuild escape in
-  §4.3–§4.5 remains available for every capacity result;
+- `stream_fold_required` is an effect-free admission refusal with no attempt.
+  It means the next legal row/run fits an empty generation but not the bounded
+  resident generation and must be folded before retry. B2a defines no retained-
+  storage, control-headroom, aggregate-receipt-capacity, or graph-history-budget
+  refusal;
 - `stream_backpressure` is an effect-free admission/queue deadline reached
   before `put_no_wait`; it carries retry guidance but no durability claim or
   attempt;
@@ -1744,28 +1896,14 @@ enroll, block inspection, correct, and rebuild-preflight use the separate
 `stream_manage` action. Status is authorized like other graph operational
 metadata. The same engine gates apply to embedded and remote CLI use.
 
-`GraphRebuildRequired` is graph-wide, so it is part of the ordinary writer
-contract too. The engine/SDK error carries history epoch and budget revision,
-used and pending publication/byte charges, a bounded per-stream reservation
-summary for streams relevant to this operation (empty when none, truncated only
-with an explicit summary digest/count), aggregate closure reserve, hard limits,
-source-bound version, and the explicit
-`quiesce_all_and_rebuild` action; it never suggests retrying ordinary work in
-the same root. A streaming request that already emitted rows uses the per-line
-`graph_rebuild_required` variant above. Any other HTTP write refuses before its
-first durable effect with HTTP 409 and structured `graph_rebuild_required`;
-CLI JSON prints the same payload and human output explains that reserved
-quiesce/correction/`SEALED` operations remain available. SDK, server, CLI, and
-OpenAPI parity tests pin both request-level and partial-NDJSON forms.
-
 Phase B2 initially exposes only strict compare-and-chain upsert. Public activation requires the
 minimum `status`, explicit `fold`, persistent `quiesce`, `resume`/abort-drain,
 rebuild preflight, a bounded strict-correction workflow, durable
 authenticated-contributor attribution, a same-key `AckUnknown`
-sequencing/idempotency contract, and a proved WAL/generation reclamation rule.
+sequencing/idempotency contract, and one proved physical-retention profile.
 Minimum status includes lifecycle and
 binding/revision, current epoch, pending generations/bytes, last fold error,
-receipt and graph-history budgets, and whether strict fold is blocked. It never
+receipt-history pagination, and whether strict fold is blocked. It never
 claims to resolve one caller's `AckUnknown`.
 Dead-letter row identity and operation, richer status, and configurable policy
 remain Phase C. Automatic operation-scoped drain, SchemaApply/branch
@@ -1784,12 +1922,15 @@ acknowledgement. B1 does not call an external embedding provider or synthesize
 unspecified fold-derived fields. Any future derivation step requires its own
 contract and evidence and must complete before the one bounded table effect.
 
-B2 adds one mandatory substrate prelude before any writer claim: under stream
-admission it classifies the complete Lance reclaim-attempt set from §4.5.
-Mutating entry points finish the sole exact pending plan or refuse, while
-read-only status reports it; patched Lance independently refuses
-`mem_wal_writer` when an attempt remains pending. No token check, same-key queue,
-or final pre-put gate can bypass that prelude after restart.
+B2 adds one mandatory recovery prelude before any writer claim: under stream
+admission it resolves or refuses every pending claim/recovery operation relevant
+to the binding. B2a has no reservation or physical-inventory prelude. B2b must
+additionally resolve the Lance claim/reclaim/checkpoint attempts from §4.5.2.
+Mutating entry points finish the sole exact pending authority plan or refuse,
+while read-only status reports it. Under B2b, patched Lance also refuses
+`mem_wal_writer` while a substrate attempt remains pending. No token check,
+same-key queue, or final pre-put gate can bypass this recovery prelude after
+restart.
 
 Phase B1 admits exactly one non-empty normalized `RecordBatch` per Lance
 `put_no_wait`. Each call and the **entire active generation**, including any
@@ -2150,9 +2291,10 @@ inventory classifies an unreferenced recognized `{hash}_gen_N/` subtree under
 the bound shard—complete or partial—as derived orphan output: it is never
 adopted as a generation, never scanned or folded, and never deleted by B1. It
 does not make the durable WAL residue unrecoverable. Any loose object outside
-that recognized generation-output subtree shape still fails closed. B2's
-accepted reclamation protocol must prove when these orphans can be removed and
-count them toward its enforced retained-storage admission watermark.
+that recognized generation-output subtree shape still fails closed. B2a keeps
+these orphans inertly and unmetered for the root's lifetime. Only a future B2b
+Lance-owned reclamation protocol may account for them and prove when they can
+be removed.
 
 The fold excludes generations already covered by the base table's exact
 `merged_generations` and requires exactly one remaining B1 generation. It
@@ -2212,9 +2354,9 @@ generation into multiple base-table keyed transactions.
 
 Because `_stream_tokens.lance` is one graph-global physical participant, B2
 adds one root-shared stream-token gate. The universal order for a manifest
-publisher is `sorted relevant stream admission -> graph history -> schema ->
-main branch -> stream token -> sorted graph tables`; a writer with no relevant
-stream admission starts at graph history, and no caller acquires a newly
+publisher is `sorted relevant stream admission -> schema -> main branch ->
+stream token -> sorted graph tables`; a writer with no relevant stream
+admission starts at schema, and no caller acquires a newly
 discovered stream lease after that gate. Every fold or
 correction captures the token dataset's exact manifest-selected version,
 transaction UUID, and e_tag in its `ReadSet`; it never opens raw token HEAD as
@@ -2227,7 +2369,7 @@ EnsureIndices, Optimize, Repair, Cleanup, recovery, and future writers all
 resolve or refuse it before base capture even when its graph table is disjoint.
 Quiesce and rebuild preflight use the same barrier. If final relisting discovers
 a late global sidecar, stream lifecycle, or required admission lease, the caller
-releases every admission/history/schema/branch/token/table gate and restarts
+releases every admission/schema/branch/token/table gate and restarts
 from the root barrier; it never recovers a
 disjoint global sidecar while retaining one caller table's gate. This prevents
 an unmanifested token HEAD from being buried by an ordinary graph commit.
@@ -2259,9 +2401,10 @@ MemWAL generation GC can start only after the exact fold and token outcome are
 graph-visible, its sidecar is resolved, index catchup permits reclamation, and
 no `FreshReadCut` or retained-version guard references the generation.
 Data-HEAD merge progress alone is never permission to delete the only
-fresh-tier copy. B1 deliberately performs no GC; B2 consumes only the
-Lance-owned inspect/plan/execute primitive and enforced admission watermark
-specified in §4.5.
+fresh-tier copy. B1 deliberately performs no GC. B2a likewise deletes nothing
+and retains the residue indefinitely without metering it; B2b consumes only the Lance-owned
+inspect/plan/execute primitive and enforced admission watermark specified in
+§4.5.2.
 
 Concurrent folders reload `merged_generations`: a generation already committed
 is skipped; otherwise the fold is replanned from current state. The explicit
@@ -2499,16 +2642,17 @@ those limits wherever the tier is exposed.
 Phase B1 keeps observability internal and does not create a public status
 contract. The private implementation exposes test seams at its durability,
 replay, fencing, resource, cut, fold, visibility, and recovery boundaries. The
-accepted local cost/RSS and configured-RustFS cost evidence in §12.3 supports
-the bounded private profile; it is not a public latency SLO, group-commit
-multiplier, or claim that every metadata term is history-flat.
+2026-07-21 dense-scan repair and near-cap/RSS cell in §12.3 re-prove closure for
+the widest admitted shape. That evidence is not a public latency SLO,
+group-commit multiplier, current object-store result, physical-storage bound,
+or claim that retained metadata work is history-flat.
 
 B2's minimum status surface is the authority-plus-observation contract in
 §4.3. It includes the exact lifecycle/binding, active epoch, drain operation,
-pending generation/row/byte totals, retained/unknown bytes, merged progress,
-last fold outcome, strict block, correction/management-receipt spares,
-lifecycle revision, graph-global history used/pending/per-stream and aggregate
-closure reserves, relevant recovery, and rebuild readiness.
+pending generation/row/byte totals, merged progress, last fold outcome, strict
+block, receipt-history pagination, lifecycle revision, relevant recovery, and
+rebuild readiness. Optional retained-object counts/bytes are advisory current-
+listing diagnostics, not admission or provider-billing truth.
 Richer index-catchup, age, and reject detail may follow in Phase C. Lance's
 `wal_entry_position_last_seen` and next-position statistics are explicitly
 labeled hints; neither is presented as a durable per-row receipt or a way to
@@ -2518,11 +2662,11 @@ Before B2 activation, internal metrics must cover ack latency,
 durability-wait batching, fenced writers, replayed entries, fold
 rows/bytes/generations, fold retries, lag, reject counts, and sidecar recovery.
 They also cover compare-and-chain conflicts/idempotent hits, token-table
-effects, correction outcomes, retained object/byte classes, reclaim
-attempt/receipt outcomes, reservation/control-ledger state, admission-watermark
-refusals, and finite-lifetime rebuild-required refusals.
-Defaults for every byte/count/time bound must be documented, and configuration
-changes are observable behavior.
+effects, correction outcomes, retained object/byte diagnostics, and selected-
+profile claim outcomes. B2b additionally covers its reservation ledger,
+admission watermark, reclaim/checkpoint attempts, and receipts. Defaults for
+every active row/memory/count/time bound must be documented, and configuration
+changes are observable behavior. B2a has no storage-limit default to report.
 
 The accepted acknowledgement-cost instrument scopes a warm, already-claimed
 writer in steady state and includes both WAL append and synchronous in-memory
@@ -2571,36 +2715,18 @@ now passes (§12.3). V8 remains a private-core format with no public B2 caller.
 B2 is a third strict strand: internal schema v9, stream-state protocol v2,
 stream-config v3, and recovery-v12. V9 adds the reserved nullable stream-row
 metadata to stream-capable physical schemas and initializes the
-manifest-selected `_stream_tokens.lance` authority. Root initialization also
-creates the singleton `GraphHistoryBudget` at history epoch zero with the exact
-source-bound version, baseline retained manifest inventory, zero pending
-charges, and closure reserves for every enrollment published in that same
-initial outcome. The genesis publication is self-accounting: before any Lance
-materialization, the initializer writes a deterministic bootstrap attempt with
-the precomputed conservative maximum for its own sidecar, fragments,
-manifest/version/index objects, multipart state, and bounded retries. Configured
-limits must fit that maximum plus the initial closure aggregate or init refuses
-without opening the root. The genesis row records publication one and charges
-the **full conservative bootstrap maximum** as retained use; it never attempts
-to observe and settle its own publication downward inside that same CAS. Only a
-later exact cleanup/rebuild receipt may reduce the charge. Crash/lost-result
-recovery either proves that exact singleton/transaction or keeps the root
-unopened. No other v9 manifest
-publication may precede that authority. A
-compatible open validates singleton uniqueness, internal-schema/config/source-
-bound versions, committed counter/inventory, unresolved sidecar charges, and
-the exact sum of all per-stream closure reservations before any writer runs;
-missing, duplicate, or mismatched budget state is uncovered format corruption,
-not a default. V8 rows, lifecycle payloads,
-and private acknowledgements are never reinterpreted or assigned contributor/
-token evidence with serde defaults. The implementation must prove genuine
-v8↔v9 refusal plus export/init/load rebuild before any production caller exists.
-Graph-history publication/byte limits and their estimator version are root-init/
-export-rebuild choices in B2; they cannot be lowered or reinterpreted in place.
-A later dynamic configuration change requires its own accepted recovery-covered
-design that re-proves every committed/pending charge and closure reservation.
-These version assignments are part of the B2 contract; this design amendment
-does not activate them in code or change the currently served v8 format.
+manifest-selected `_stream_tokens.lance` authority. It does **not** add a
+`GraphHistoryBudget`, storage-meter singleton, aggregate receipt cap, or
+physical-retention quota. Root initialization and first enrollment still use
+the normal recovery-covered publication protocol for their actual authority
+effects; unreferenced physical residue remains retained and inert.
+
+V8 rows, lifecycle payloads, and private acknowledgements are never
+reinterpreted or assigned contributor/token evidence with serde defaults. The
+implementation must prove genuine v8↔v9 refusal plus export/init/load rebuild
+before any production caller exists. These version assignments are part of the
+future B2 contract; this design amendment does not activate them in code or
+change the currently served v8 format.
 
 Old binaries refuse a stream-capable graph before reading or writing any table.
 A stream-capable binary refuses an older graph before running recovery. On a
@@ -2787,8 +2913,11 @@ The Phase-B1 implementation landed on 2026-07-19. It is reachable only through
 one `#[doc(hidden)]`, feature-gated engine seam; there is no schema syntax,
 ordinary SDK method, HTTP/CLI/OpenAPI route, or production first-use caller.
 This section distinguishes implemented behavior from checked evidence and
-the accepted private boundary. All Phase-B1 acceptance gates passed on
-2026-07-19. “Green” does not mean public activation, and the RFC remains draft.
+the then-accepted private boundary. All then-declared Phase-B1 gates passed on
+2026-07-19. Gate R0 then exposed one legal near-cap closure failure; the
+2026-07-21 dense-scan repair and remeasurement close that failure and requalify
+the one-generation B1 boundary. “Green” never meant public activation, and the
+RFC remains draft.
 
 **Implemented private core**
 
@@ -2846,7 +2975,10 @@ the accepted private boundary. All Phase-B1 acceptance gates passed on
   base-dependent validation, and stages one exact-ID upsert with
   `MergedGeneration` in the same Lance transaction. It folds already-normalized
   physical rows—including physical vector columns—and performs no external
-  embedding call or unspecified fold-derived-field materialization. One
+  embedding call or unspecified fold-derived-field materialization. Scanner
+  output is row/byte checked and copied into dense owned Arrow arrays before it
+  is retained, so sparse variable-width slices cannot charge or pin their full
+  backing buffers through the fold. One
   manifest CAS publishes the achieved table pointer, next lifecycle witness,
   and fixed lineage; default reads remain old until that CAS.
 - Resource reservations cover queued input, the resident generation, and the
@@ -2859,7 +2991,9 @@ the accepted private boundary. All Phase-B1 acceptance gates passed on
   budget is a B2 requalification, not an implied default. A failed or stalled
   abort retains the original registry retirement and admission authority. B1
   performs no generation GC and admits no correction generation beside
-  strict-blocked input.
+  strict-blocked input. The isolated fold RSS measurement and its 384-MiB
+  remeasurement tripwire are evidence for this one exclusive fold, not a
+  runtime allocator limit or storage quota.
 
 **Checked evidence**
 
@@ -2932,8 +3066,13 @@ the accepted private boundary. All Phase-B1 acceptance gates passed on
   from 74,334,208 to 206,471,168 bytes (+132,136,960), explicitly including
   Arrow, PK-index, runtime, and allocator overhead. That result qualifies one
   resident writer with one 32-MiB aggregate Arrow reservation. Queued batches
-  share that reservation rather than accumulating outside it; B2 must measure
-  concurrent residents before raising either limit.
+  share that reservation rather than accumulating outside it. The repaired
+  high-entropy widest fold publishes all 8,192 rows and measures an isolated
+  whole-process peak-RSS delta of 284,934,144 bytes (about 272 MiB / 285 MB)
+  over the small-fold baseline. CI uses 384 MiB only as a remeasurement
+  tripwire for that one exclusive fold. It is not enforced allocator admission,
+  and concurrent residents must be measured before either concurrency or the
+  logical generation limit changes.
 
 **Evidence qualification**
 
@@ -2959,33 +3098,97 @@ the accepted private boundary. All Phase-B1 acceptance gates passed on
   retract a WAL effect, make raw sentinel deletion safe, fence raw Lance
   callers, or provide a reclamation receipt, cross-process seal, or failover
   protocol. The Lance-owned post-success fence and retention patch therefore
-  remains a public-B2 gate.
+  remain B2b managed-reclamation and broader-topology gates. They do not block
+  public activation of the no-delete, single-live-writer-process B2a profile,
+  which retains the wrapper's post-watcher fence check.
 
-**Phase B1 acceptance disposition — green 2026-07-19**
+**Phase B1 disposition — accepted 2026-07-19, closure gap found 2026-07-20 and
+repaired 2026-07-21**
 
-The genuine cross-version/rebuild gate and complete graph-level B1 suite pass.
+The genuine cross-version/rebuild gate and the then-declared graph-level B1
+suite passed.
 The post-watcher epoch-loss cell closes the clean-ack stale-epoch case at the
 adapter boundary, and the post-containment local cost cell remains history-
 flat. The configured-RustFS pass is still pre-containment and awaits rerun, so
-it supports no current object-store ack-cost claim. B1 remains accepted at its
-private main-only, unsharded, one-live-writer-process, one-resident-writer,
-one-generation correctness boundary.
+it supports no current object-store ack-cost claim. This evidence, together
+with the dense-scan closure/RSS cell above, covers the private main-only,
+unsharded, one-live-writer-process, one-resident-writer and one-exclusive-fold
+fixture set.
 
 The evidence does not claim history-flat uncompacted manifest work, a public
 latency SLO, group commit, Lance-internal failure injection, or the unavailable
 forged pre-claim/pre-put stream-sidecar cell.
 
-Phase B2 remains inactive despite B1 being green. §4.1–§4.6 now specify its
-attribution, token, reclamation/enforced-admission-watermark, correction, and
-persistent operator contracts. None is implemented by this amendment.
+Gate R0 correctly found that the old scanner retained sparse backing buffers.
+The dense copy releases those buffers and restores the intended logical
+32-MiB closure check; the near-cap cell now closes. This amendment changes no
+product surface. The future contracts in §4.1–§4.6 remain unimplemented.
 
-### 12.4 Phase B2 — public strict activation gates
+### 12.4 Gate R0 — historical bounded-retention no-go; closure repaired
 
-Phase B2 implementation may begin from the contracts in §4.1–§4.6, but public
-activation waits until every implementation/evidence item below is green. The
-design does not waive the persistent escape requirement: a user must never be
-left with a table that ordinary writers refuse but cannot be corrected,
-quiesced, or rebuilt.
+The checked-in `memwal_stream_cost.rs` Gate-R0 cells:
+
+- pin the result to surveyed Lance revision
+  `cec0b7dffe2d85c7e66dbe9d1f3891c297903a1d`;
+- strictly inventory every currently listed MemWAL object into a known class,
+  compare the set with the latest shard-manifest generation references, and
+  prove every earlier listed immutable path retains the same class and size;
+- sweep one/four/eight success-only folds and preserve their cumulative
+  current-object growth;
+- prove a retry after the referenced cut reuses the same generation root; and
+- use deterministic high-entropy data for the legal near-cap physical-output
+  cell instead of a compression-friendly repeated value.
+
+The 2026-07-20 result remains historical evidence that stock RC.1 cannot support
+a *bounded* retain-all promise: ordinary listing is not provider billing or
+incomplete-multipart inventory, and Lance supplies neither a durable cross-open
+materialization-attempt receipt/cap nor a source-derived physical-output
+envelope. Those findings must be revisited before any future storage bound is
+claimed. They are not blockers for unbounded B2a.
+
+The high-entropy cell now expects successful closure, complete row visibility,
+one base-table effect, one `__manifest` visibility point, and no remaining
+recovery sidecar. It retains the historical acknowledgement/materialization
+byte observations and the invariant that every earlier listed immutable path
+keeps the same path/class/size. The local RSS child's recorded reference run
+measured a 284,934,144-byte fold delta and enforces a 384-MiB CI
+**remeasurement** tripwire
+for one exclusive fold. That tripwire is not a runtime hard allocator limit.
+Configured RustFS remains a post-merge/tag regression signal and is not used to
+invent a storage bound.
+
+### 12.5 Phase B2a — unbounded retain-all/no-GC implementation gate
+
+B2a is the selected next profile. Its implementation gate is deliberately
+narrow:
+
+- retain every `_mem_wal` object and make every OmniGraph cleanup/repair path
+  structurally incapable of deleting or reclassifying it;
+- preserve the existing 8,192-row/32-MiB logical generation limit, one resident
+  writer, one exclusive fold, bounded queues/deadlines/retries, and dense near-
+  cap closure evidence;
+- resolve or refuse every relevant manifest/recovery authority operation before
+  claim, put, fold, correction, quiesce, or resume; never infer ownership from
+  listings or path shape;
+- prove cold replay, fold-only retry, strict-block retention, and every existing
+  acknowledgement/fold crash boundary while unreferenced materialization
+  residue remains inert and untouched; and
+- expose retained-object measurements only as advisory diagnostics, with no
+  file/object/byte limit, quota, reservation, aggregate receipt cap,
+  `GraphHistoryBudget`, or materialization-attempt receipt requirement.
+
+This slice adds no schema v9, production caller, SDK/HTTP/CLI/OpenAPI/Cedar
+surface, or lifecycle/correction implementation. Those remain §12.6 work.
+
+### 12.6 Common public and B2b managed-reclamation activation gates
+
+The common public contracts in §4.1–§4.4 and §4.6 proceed only after the private
+§12.5 B2a gate passes. This section owns those common gates and B2b's optional
+managed-reclamation gates. B2a does not need any B2b-only bullet. Public
+activation waits for every common implementation/evidence item to be green.
+The design does not waive the
+persistent escape requirement: a user must never be left with a table that
+ordinary writers refuse but cannot be corrected, quiesced, or rebuilt.
 
 - `@stream(mode="upsert", on_reject="strict")`, production first use, SDK,
   HTTP, CLI, Cedar, and OpenAPI all route through the same private B1 core. The
@@ -2994,12 +3197,13 @@ quiesced, or rebuilt.
   type requiring `@embed` or any external/provider-derived field; caller-
   supplied physical vectors round-trip without provider invocation.
 - Explicit enrollment tests cover `UNENROLLED` status, request-ID same/different
-  intent, every genesis/body/pointer/details/shard/lifecycle crash boundary,
+  intent, every selected-profile bootstrap/shard/lifecycle crash boundary,
   lost result after sidecar deletion through the persisted request-ID/intent
   receipt, `already_enrolled`, `stream_manage` authorization with Cedar/
   embedded/remote parity, first returned stream incarnation, and
   request-level `StreamNotEnrolled` before ingest body admission. Ingest never
-  creates physical enrollment implicitly.
+  creates physical enrollment implicitly. B2b additionally covers every
+  genesis body/pointer/new-details crash boundary.
 - The public acknowledgement is status-only and caller-ordered. It maps the
   private durable batch result back to each caller ordinal and reports the
   stream incarnation, write ID, and current binding, not a WAL position,
@@ -3008,10 +3212,10 @@ quiesced, or rebuilt.
   its candidate unconfirmed, while invalid/conflict/not-invoked outcomes mint
   neither. Every exact response variant in §4.6, including `invalid`,
   `stream_input_too_large`, lifecycle/authority/recovery blockers, and
-  `stream_retry_required`, has a schema. The B2 adapter owns contiguous
+  `stream_retry_required`, has a schema. The public adapter owns contiguous
   physical-run boundaries around invalid lines and token dispositions plus its
-  bounded reorder buffer. Tests cross a partially full generation, retained-
-  storage/control/correction/management-receipt spare and graph-history limits,
+  bounded reorder buffer. Tests cross a partially full generation, row/logical-
+  memory and queue/deadline limits,
   an intrinsically oversized row on an empty generation, authority/lifecycle
   movement or `RecoveryRequired` between runs, and a pre-invocation queue
   deadline after earlier lines are already durable; the
@@ -3023,8 +3227,8 @@ quiesced, or rebuilt.
 - Internal schema v9/config-v3/state-v2/recovery-v12 provisions the hidden row
   metadata and manifest-selected token dataset. Every base/token effect is one
   recovery-covered publication. The graph-global token participant follows
-  canonical `sorted relevant stream admission -> graph history -> schema ->
-  main branch -> stream token -> sorted graph tables` gate order; folds capture
+  canonical `sorted relevant stream admission -> schema -> main branch ->
+  stream token -> sorted graph tables` gate order; folds capture
   its exact manifest-selected
   witness in the read set and never use raw token-table HEAD. If either the base
   or token participant has an effect or ambiguous outcome, recovery owns both;
@@ -3044,9 +3248,9 @@ quiesced, or rebuilt.
 - Minimum operator controls expose authoritative status, explicit fold, plus
   persistent quiesce, resume/abort-drain, correction, and rebuild preflight.
   Status takes an exclusive cut, settles owners without mutating recovery, and
-  includes exact lifecycle/binding/revision, epoch, pending generations/bytes,
-  correction and management receipt usage/reserves/limits, graph-history
-  budget, last fold summary, and strict-blocked state. Every mutating call after
+  includes exact lifecycle/binding/revision, epoch, advisory pending
+  generations/bytes, paginated correction and management/claim receipt
+  summaries, last fold summary, and strict-blocked state. Every mutating call after
   enrollment carries an operation ID and expected revision; same-ID/same-digest
   returns the complete bounded terminal receipt, same-ID/different-digest
   conflicts, and a stale revision never retargets. Quiesce requires a caller
@@ -3059,33 +3263,25 @@ quiesced, or rebuilt.
   or strict block remains. Correction clears a matching block but preserves
   `DRAINING` and the original drain goal; it is never itself a reopen. Tests
   delay a quiesce/resume retry across a later cycle and prove receipt/stale-
-  revision handling. They drive the graph-global budget to its closure floor,
-  prove new ordinary work returns `GraphRebuildRequired`, hold two streams
-  strict-blocked simultaneously, then close one while preserving the other's
-  independent block/correction/abort-drain/requiesce/`SEALED` reserve. The
-  cap-minus-full-closure case also reserves every required management receipt
-  and both sequential claim envelopes/terminal records.
-  The WAL watermark is never reported as a whole-graph history bound.
-- Graph-history tests force every manifest writer through the universal gate,
-  verify late sidecar/lifecycle discovery releases all gates and restarts, and
-  exercise exact used/pending/finalized accounting. The reserve-first physical
-  envelope crashes before/after fragment, multipart, failed CAS, manifest/index
-  output, publication, and cleanup receipt; bounded retries cannot create
-  uncharged orphans, cold inventory reconstructs every charge, unknown output
-  closes writers, and two racing publishers prove the globally serialized gate
-  lifetime, fresh-revision restart, and absence of reverse-order deadlock. Two
-  simultaneous stream closure reservations cannot be spent by ordinary commits
-  or by each other.
+  revision handling. They hold two streams strict-blocked simultaneously, then
+  close one while preserving the other's independent block/correction/
+  abort-drain/requiesce/`SEALED` authority. The WAL watermark is never reported
+  as a whole-graph history bound.
+- **Future bounded-root profile only:** a separately accepted
+  `GraphHistoryBudget` amendment must force every manifest writer through one
+  reserve-first gate, account for complete physical effects and recovery, and
+  prove crash-safe settlement and independent stream closure reserves. None of
+  those tests gates unbounded retain-all.
 - Every public batch durably records its authenticated contributor before rows
   can become unattributable, and the fold audit consumes that evidence. A
-  current `WITHDRAWN` token remains durable even when the graph row is absent.
-  The reviewed Lance inspect/plan/execute patch, durable attempt/receipt,
+  current `WITHDRAWN` token remains durable even when the graph row is absent;
+  neither attribution nor sequencing is inferred from MemTable positions,
+  mutable WAL statistics, age, raw path shape, or benchmark maxima.
+- **B2b only:** the reviewed Lance inspect/plan/execute patch, durable attempt/receipt,
   post-success WAL fence check, bounded history checkpoint, and enforced
   retained-byte/object admission watermark bound growth. Exact inventory
   requires strong HEAD/GET/LIST visibility after PUT/DELETE plus exact multipart
-  accounting/abort, or Lance-owned durable accounting. Neither contract is
-  inferred from MemTable positions, mutable WAL statistics, age, raw path
-  shape, or benchmark maxima.
+  accounting/abort, or Lance-owned durable accounting.
 - Admission cancellation and server shutdown cannot abandon an in-flight
   durability waiter. A background-owned admission task reaches a durable
   outcome or typed `AckUnknown`. Status/replay preserves possible residue but
@@ -3107,10 +3303,8 @@ quiesced, or rebuilt.
   planning bound,
   engine-derived canonical plan digest plus actor binding, same/different
   correction-ID replay, stale block token, unknown key, exact row/byte and
-  receipt-count/receipt-byte cap/+1, admission at cap-minus-one with one full
-  terminal-receipt spare, cold-replay reconstruction of that spare, a blocked
-  correction consuming the final reserved slot/bytes at the exact cap, and
-  no-generation-at-full-cap quiesce through `SEALED` rebuild. They also cover
+  response-page bounds, cold-replay reconstruction of terminal receipts, and
+  no-generation quiesce through `SEALED` rebuild. They also cover
   8,192 distinct corrected current-token rows plus the separately bounded one-
   row receipt transaction, depth-8,192 replacement to exact maximum 8,193,
   concurrent fold/resume, and
@@ -3118,21 +3312,26 @@ quiesced, or rebuilt.
   skip-invalid path, or graph delete is admitted.
 - Quiesce tests cover crashes before/after `OPEN -> DRAINING`, epoch claim,
   seal/drain, each fold, equal descriptor/top-level witness advancement,
-  historical and reclaim-successor fence sentinels, strict-block summary,
+  historical and selected-profile-authenticated current fence sentinels,
+  strict-block summary,
   engine-minted failure-drain identity/actor before and after its conditional
   CAS, empty proof, and `SEALED` publication. Status covers concurrent
-  put/flush/reclaim exclusion. Resume and abort-drain cover
+  put/flush/selected-profile retention exclusion. Resume and abort-drain cover
   arm/claim/confirm/CAS/finalize,
   caller operation-ID/expected-revision retry, same-ID/different-intent,
   delayed retry after a later drain/resume cycle, named-branch refusal, strict-
-  block refusal, reopen, and lost replies. Cold open, quiesce, resume/abort, and checkpoint also crash at
-  claim-attempt/sentinel/manifest boundaries and prove that their ordinary
-  sentinel-first claims preserve the prior replay cursor and classify its full
-  tail before admitting a put. Only the whole-cut reclaim case may advance that
-  cursor to its new sentinel. Quiesce settles and publishes every retention
-  sidecar before the final proof; reclaim/checkpoint refuse while `SEALED`, and
-  resume consumes rather than mutates the old proof. `SEALED` never auto-opens.
-- Reclamation tests cover stock-cleanup non-ownership, the stale-writer deleted
+  block refusal, reopen, and lost replies. Every selected-profile claim crashes
+  at its declared authority/effect boundaries and proves exact classification
+  before admitting a put. Under B2b, cold open, quiesce, resume/abort, and
+  checkpoint additionally cover reclaim-successor sentinels and crash at
+  patched claim-attempt/sentinel/manifest
+  boundaries and prove that their ordinary sentinel-first claims preserve the
+  prior replay cursor and classify its full tail; only the whole-cut reclaim
+  case may advance that cursor to its new sentinel. Quiesce settles and
+  publishes every retention sidecar before the final proof; B2b
+  reclaim/checkpoint refuse while `SEALED`, and resume consumes rather than
+  mutates the old proof. `SEALED` never auto-opens.
+- **B2b only:** reclamation tests cover stock-cleanup non-ownership, the stale-writer deleted
   successor-sentinel slot, exact local/RustFS inventory, HEAD/GET/LIST and
   multipart capability refusal or durable accounting, and explicit refusal of
   versioned/soft-delete/Object-Lock storage unless every retained version,
@@ -3169,19 +3368,16 @@ quiesced, or rebuilt.
   lifecycle, including `SEALED`, until Phase D defines a token-aware direct-
   write/witness/rebind transition.
 - Genuine cross-version tests prove old-binary/new-format and
-  new-binary/old-format refusal. They prove stock RC.1 rejects B2's new MemWAL
-  details type URL/system-index kind rather than ignoring a field or falling
-  back to a latest-version hint. V9 root-init/open tests prove the singleton
-  graph-history budget is established before any other v9 publication, its
-  baseline inventory/source-bound version and aggregate stream reserves match,
-  its bootstrap publication self-charges under a precomputed maximum, and
-  cap-too-small, every bootstrap crash/lost-result boundary, changed estimator/
-  limits, and missing/duplicate/mismatched state refuse rather than defaulting.
+  new-binary/old-format refusal. Under B2b, they prove stock RC.1 rejects the
+  patched new MemWAL details type URL/system-index kind rather than ignoring a
+  field or falling back to a latest-version hint. A future bounded-root
+  amendment must separately own `GraphHistoryBudget` bootstrap, mismatch,
+  crash, and cap-too-small refusal tests; those are not v9/B2a activation gates.
   Rebuild tests prove acknowledged rows survive
   only after quiesce/fold, and fail closed when an acknowledged row remains
   unfolded.
 
-### 12.5 Later expansion gates
+### 12.7 Later expansion gates
 
 - Phase C defines restart-stable reject-row identity, using B2's durable
   contributor attribution, before adding atomic dead letters, reject
@@ -3206,9 +3402,11 @@ quiesced, or rebuilt.
 |---|---|---|
 | E0 | production-neutral public-surface enrollment/witness classifier; no schema, API, sidecar, or format activation | **Passed 2026-07-18:** 14 substantive local cells, complete six-attempt zero-list 8/80 cost shape, Unix no-list/error tripwire, and one non-vacuous configured RustFS positive-plus-negative cell (§12.1) |
 | A | bounded main/unsharded/single-live-writer enrollment adapter, all-lifecycle effect exclusion with only the `SEALED` native-branch exception, lifecycle/admission lease, then graph-format capability/refusal and strict rebuild | **Implemented 2026-07-18 (§12.2):** internal schema v7, recovery-v10 enrollment, durable lifecycle CAS, process-local exclusion, crash/partial-format refusal, and genuine v6↔v7 strand evidence; no public enrollment or row path |
-| B1 | **Implemented privately 2026-07-19; acknowledgement containment added 2026-07-20:** internal schema v8/config-v2, root-scoped one-generation admission worker, durability-watcher success followed by a same-writer post-durability epoch check, conservative active-state reopen/replay, the pinned RC.1 replay-watermark bridge, and one explicit strict RFC-022 fold; no production caller | **Green privately at the bounded correctness boundary (§12.3):** genuine v7↔v8 binary refusal/rebuild and the graph-level B1 behavior/crash/race suite, including post-watcher epoch loss, pass. The post-containment local ack probe remains history-flat at 9 reads / 219 bytes; configured-RustFS retains only the 2026-07-19 pre-containment baseline and must be rerun before a current object-store ack-cost claim. The non-flat uncompacted-manifest term is retained explicitly; upstream-internal flush/channel failure and forged pre-claim/pre-put stream-sidecar injection remain unclaimed seam limitations, not public guarantees |
-| B2-0 | contract closure for compare-and-chain tokens, trusted row attribution, manifest-selected current-token state, revision-fenced protocol-v2 lifecycle/management receipts, bounded `REPLACE`/`WITHDRAW` correction, Lance-owned reclamation, enforced retained-storage admission, and graph-global manifest-history/closure reservations; no product surface | **Specified 2026-07-19 (§4.1–§4.6):** two stock-RC.1 negative/ownership guards are checked in. Implementation remains inactive; the owned Lance durable inspect/plan/execute, Lance-owned post-success-fence check, bounded MemWAL checkpoint, strong-inventory proof, enforceable MemWAL growth reservation, and reserve-first graph-manifest materialization envelope are next. B1's adapter recheck does not satisfy those substrate/retention gates |
-| B2 | public strict activation across schema v9/config-v3/recovery-v12, SDK, HTTP, CLI, Cedar, and OpenAPI, with the B2-0 contracts implemented | B1 green; reviewed Lance patch pinned; token/attribution/correction/revision-fenced lifecycle/reclamation and graph-history crash matrices; local and RustFS enforced-bound validation; genuine v8↔v9 refusal/rebuild; API compatibility; cancellation/shutdown ownership; public parity |
+| B1 | **Implemented privately 2026-07-19; acknowledgement containment added 2026-07-20; widest-shape closure repaired 2026-07-21:** internal schema v8/config-v2, root-scoped one-generation admission worker, durability-watcher success followed by a same-writer post-durability epoch check, conservative active-state reopen/replay, the pinned RC.1 replay-watermark bridge, and one explicit strict RFC-022 fold; no production caller | The graph-level behavior/crash/race suite and genuine v7↔v8 refusal/rebuild remain green. Fold now charges logical slices and copies each scanner emission into dense owned arrays. The legal 8,192-row high-entropy near-cap generation folds and publishes exactly once without changing the 32-MiB admission cap; its isolated fold RSS delta is guarded by the 384-MiB remeasurement tripwire (§12.4) |
+| R0 | production-neutral retained-growth/source audit; current-object census; referenced-cut retry; legal high-entropy near-cap materialize/fold cell; no schema, public caller, or deletion | **Historical bounded-retention no-go 2026-07-20; disposition amended 2026-07-21 (§0.2/§12.4):** RC.1 still exposes neither a complete reserve-first physical envelope/receipt nor a durable cross-open randomized-attempt cap. Those facts prohibit a finite storage promise but do not block selected unbounded retain-all. The formerly red widest cell is now green locally and on the configured-RustFS CI path; current-object observations remain advisory retention evidence, not provider billing/accounting |
+| B2a | selected unbounded retain-all/no-GC profile on stock Lance | **Selected 2026-07-21; implementation gate remains (§12.5):** no OmniGraph byte/object/file/history quota, no raw `_mem_wal` deletion, and loud provider exhaustion. Keep row/memory/deadline/retry/ambiguity bounds and prove no-delete, recovery, correction, lifecycle, token, attribution, authorization, and product parity before activation. No schema v9 or product surface is active yet |
+| B2b | candidate managed-reclamation retention profile | Inactive. Requires the Lance-owned durable inspect/plan/execute + receipt, post-success fencing, bounded checkpoint/inventory/accounting, local/RustFS enforced-bound validation, and the profile-specific crash matrix (§4.5.2/§12.6). Passing it alone activates no product surface |
+| B2-common | explicit enrollment, compare-and-chain token/attribution, revision-fenced lifecycle/correction, schema v9/config-v3/recovery-v12, SDK, HTTP, CLI, Cedar, and OpenAPI | Inactive. Public activation requires the common crash/no-delete/provider-failure/cross-version, authorization, cancellation/shutdown, API-compatibility, and product-parity gates in §12.6. `GraphHistoryBudget` belongs only to a future bounded/managed profile, not selected retain-all |
 | C | restart-stable reject-row identity, atomic dead letter, richer status, and evidence-backed configurable bounds | reject crash matrix; reject-retention proof; backpressure and RSS/latency evidence |
 | D | automatic operation drain, schema/branch/upgrade integration, and rematerialization rebind | two-coordinator race, old/new physical-binding crash matrix, and format-transition suite |
 | E | fresh cuts and maintained-index reads; cross-process `Fresh` ships only if the substrate generation-retention guard exists (§9), otherwise same-process only | cut consistency; merged-generation exclusion |
