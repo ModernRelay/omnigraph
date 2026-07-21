@@ -6,9 +6,9 @@ retain-all activation dependency
 **Surveyed substrate:** Lance 9.0.0-rc.1 at
 `cec0b7dffe2d85c7e66dbe9d1f3891c297903a1d`
 
-**Related:** [RFC-026](docs/rfcs/0026-memwal-streaming-ingest.md),
-[write-path state of affairs](docs/dev/writing-path-state-of-affairs.md), and
-[WAL thinking](WAL-thinking.md)
+**Related:** [RFC-026](../rfcs/0026-memwal-streaming-ingest.md),
+[write-path state of affairs](writing-path-state-of-affairs.md), and
+[WAL thinking](wal-thinking.md)
 
 ## Decision in one paragraph
 

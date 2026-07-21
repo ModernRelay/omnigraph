@@ -7,10 +7,10 @@
 **Surveyed substrate:** OmniGraph's pinned Lance 9.0.0-rc.1 plus the public
 LanceDB MemWAL integration on Lance 9.1.0-beta.4
 
-**Related:** [RFC-026](docs/rfcs/0026-memwal-streaming-ingest.md),
-[WAL thinking](WAL-thinking.md),
+**Related:** [RFC-026](../rfcs/0026-memwal-streaming-ingest.md),
+[WAL thinking](wal-thinking.md),
 [Lance MemWAL PR](lance-memwal-pr.md), and
-[architectural invariants](docs/dev/invariants.md)
+[architectural invariants](invariants.md)
 
 ## Executive summary
 
@@ -582,10 +582,10 @@ future improvements, not blockers for this profile.
 
 ## References
 
-- [RFC-026: MemWAL streaming ingest](docs/rfcs/0026-memwal-streaming-ingest.md)
-- [WAL thinking](WAL-thinking.md)
+- [RFC-026: MemWAL streaming ingest](../rfcs/0026-memwal-streaming-ingest.md)
+- [WAL thinking](wal-thinking.md)
 - [Lance MemWAL PR proposal](lance-memwal-pr.md)
-- [OmniGraph write-path state of affairs](docs/dev/writing-path-state-of-affairs.md)
+- [OmniGraph write-path state of affairs](writing-path-state-of-affairs.md)
 - [Lance MemWAL format](https://lance.org/format/table/mem_wal/)
 - [LanceDB MemWAL write integration](https://github.com/lancedb/lancedb/blob/8450683b2aba033b12d8fe4c6e1601cc4b733b91/rust/lancedb/src/table/merge/lsm.rs)
 - [LanceDB proposed LSM read path, PR #3489](https://github.com/lancedb/lancedb/pull/3489)

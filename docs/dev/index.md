@@ -29,6 +29,7 @@ roadmap). The per-area docs below remain the mechanical authority.
 | On-disk layout, manifest schema, URI behavior | [storage.md](../user/concepts/storage.md) |
 | Direct-publish writes, D2, staged writes, recovery sidecars | [writes.md](writes.md) |
 | Write-path state of affairs — shipped RFCs, current boundaries, blockers, upstream alignment, and next gates | [writing-path-state-of-affairs.md](writing-path-state-of-affairs.md) |
+| RFC-026 supporting analysis — WAL mental model, retention options, and the deferred managed-reclamation proposal | [wal-thinking.md](wal-thinking.md), [wal-options.md](wal-options.md), [lance-memwal-pr.md](lance-memwal-pr.md) |
 | Query execution, mutation execution, loader flow | [execution.md](execution.md) |
 | Index lifecycle and graph topology indexes | [indexes.md](../user/search/indexes.md) |
 | Branch and commit internals | [branches-commits.md](../user/branching/index.md) |
