@@ -171,7 +171,7 @@ for schemas that avoid the newly reserved names documented below. RC.1 requires
 Rust 1.91 or newer; OmniGraph continues to track stable Rust and this audit ran
 on Rust 1.95.
 
-#### Post-audit implementation notes: 2026-07-18–20
+#### Post-audit implementation notes: 2026-07-18–21
 
 RFC-026 Gate E0 subsequently passed and Phase A activated OmniGraph internal
 schema v7. V7 adds only the bounded streaming foundation: exact recovery-v10
@@ -226,8 +226,11 @@ requires empty frozen refs and the exact generation/cursor in the latest shard
 manifest. And RC.1 writes the randomized generation dataset and sidecars before
 that manifest CAS, so a crash may leave a complete or partial unreferenced
 `{hash}_gen_N/` subtree. B1 treats only that recognized subtree shape as
-retained derived orphan output—never adopted, scanned, or deleted—and leaves
-it in place under the selected unbounded retain-all profile. A later B2b
+retained derived orphan output. Private B2a proves complete and partial
+unreferenced output remains non-authoritative and is never descended into,
+read, mutated, adopted, or deleted through retry/reopen. Parent shard discovery
+may still observe the common prefix. The subtree remains in place under the
+selected unbounded retain-all profile. A later B2b
 managed profile would need a separately proved Lance-owned GC contract.
 Seal/drain/abort are background-owned
 with deadline-bounded caller waits: an error or stalled handler keeps the
@@ -250,10 +253,17 @@ drain's captured floor. Replay preserves possible residue but cannot resolve
 which caller attempt produced it. Configuration identity binds only
 correctness/topology/no-rollover fields; explicit runtime policy and injected
 Session/store capabilities remain separate. Private B1 activates graph schema
-v8 and stream-config v2 rather than adopting v7/config-v1 in place. The selected
-next profile is B2a **unbounded retain-all**: OmniGraph deletes no raw
-`_mem_wal` path, imposes no retained-byte/object/file/history quota, and accepts
-loud provider exhaustion. Explicit enrollment, trusted attribution,
+v8 and stream-config v2 rather than adopting v7/config-v1 in place. The private
+B2a **unbounded retain-all** gate is implemented: OmniGraph deletes no canonical
+durable `_mem_wal` object, imposes no retained-byte/object/file/history quota,
+and accepts loud provider exhaustion. Lance may remove only its losing shard-
+manifest-CAS `.binpb.tmp.<uuid>` staging object, which never became authority.
+The provider matrix pins typed local/configured-RustFS failure and inert orphan
+behavior. The 1/8/32/128 local/RustFS instrument keeps warm acknowledgement,
+cold replay, fold, visibility, table, graph-manifest, adapter, advisory object,
+and RSS terms separate. Warm-ack operation shape is flat while serialized
+authority and combined retained-history work grow; timings, LIST totals, and
+RSS are diagnostics, not quotas or SLOs. Explicit enrollment, trusted attribution,
 compare-and-chain tokens, manifest-selected current-token authority, bounded
 correction, revisioned lifecycle/management receipts, authorization, and
 product parity remain common contracts. A graph-history budget is not one of
@@ -377,6 +387,16 @@ a pre-attempt storage reservation: those would exist only to enforce a bound the
 profile deliberately does not promise. They become relevant again if a later
 RFC proposes bounded retention. No schema v9 or public surface is authorized by
 the source audit or closure repair alone.
+
+Private B2a closes the narrower stock-RC.1 storage/correctness gate. A shared
+fail-closed classifier validates canonical current MemWAL paths and decoded
+authority. Injected local and configured-RustFS failures prove effect-free claim
+errors, post-invocation acknowledgement ambiguity, complete post-cut orphan
+output, and partial post-data orphan output remain typed and recoverable without
+subtree adoption or deletion. The 1/8/32/128 local/RustFS sweep shows the warm-
+ack operation shape is flat but serialized authority bytes and combined
+retained-history work grow. Those observations are intentionally advisory;
+they neither revise the unbounded contract nor claim an isolated MemWAL slope.
 
 The no-roll profile uses fixed portable capacities (`8,193` rows/batches and
 1-GiB byte/unflushed thresholds), not architecture-dependent `usize::MAX`

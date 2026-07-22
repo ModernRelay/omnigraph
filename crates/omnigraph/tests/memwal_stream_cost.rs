@@ -7,6 +7,11 @@
 //! metadata, and the shared graph-manifest publisher are different costs with
 //! different scaling variables.  Combining them into one latency number would
 //! hide exactly the regressions this instrument exists to expose.
+//!
+//! B2a's retained-history sweep keeps wall-clock numbers diagnostic.  The
+//! real private B1 path grows retained shard metadata and the folded base table
+//! together, so the sweep reports each observable term but does not attribute a
+//! slope to retained objects alone or turn local timings into a product claim.
 
 mod helpers;
 
@@ -19,12 +24,11 @@ use arrow_array::{ArrayRef, BooleanArray, Int32Array, RecordBatch, StringArray};
 use arrow_schema::{DataType, Field, Schema};
 use fail::FailScenario;
 use futures::TryStreamExt;
+use lance::dataset::mem_wal::schema_with_tombstone;
 use lance::dataset::mem_wal::write::StoredBatch;
-use lance::dataset::mem_wal::{ShardManifestStore, schema_with_tombstone};
 use lance_core::utils::bloomfilter::sbbf::Sbbf;
 use lance_index::mem_wal::{FlushedGeneration, ShardId, ShardManifest, ShardStatus};
 use lance_io::utils::tracking_store::{IOTracker, IoStats};
-use object_store::path::Path as ObjectPath;
 use omnigraph::db::{Omnigraph, ReadTarget};
 use omnigraph::error::OmniError;
 use omnigraph::failpoints::{ScopedFailPoint, names};
@@ -33,6 +37,7 @@ use omnigraph::storage::storage_for_uri;
 use serial_test::serial;
 
 use helpers::cost::with_raw_io_trackers;
+use helpers::memwal::{CurrentMemWalInventory, MemWalObjectKind};
 
 const STREAM_SCHEMA: &str = r#"
 node Person { score: I32 }
@@ -57,175 +62,11 @@ const NO_AUTO_ROLL_BATCHES: usize = 8_193;
 const RSS_CHILD_ENV: &str = "OMNIGRAPH_MEMWAL_COST_CHILD";
 const SURVEYED_LANCE_REV: &str = "cec0b7dffe2d85c7e66dbe9d1f3891c297903a1d";
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
-enum MemWalObjectKind {
-    Wal,
-    ShardManifestVersion,
-    ShardManifestHint,
-    GenerationData,
-    GenerationManifest,
-    GenerationTransaction,
-    GenerationDeletion,
-    GenerationPkSidecar,
-    GenerationBloom,
-    GenerationUserIndex,
-    Unknown,
-}
-
-#[derive(Debug, Clone, Default)]
-struct CurrentMemWalInventory {
-    objects: BTreeMap<String, (MemWalObjectKind, u64)>,
-    generation_roots: BTreeSet<String>,
-    referenced_generation_roots: BTreeSet<String>,
-}
-
-impl CurrentMemWalInventory {
-    fn object_count(&self, kind: MemWalObjectKind) -> usize {
-        self.objects
-            .values()
-            .filter(|(candidate, _)| *candidate == kind)
-            .count()
-    }
-
-    fn bytes(&self, kind: MemWalObjectKind) -> u64 {
-        self.objects
-            .values()
-            .filter(|(candidate, _)| *candidate == kind)
-            .map(|(_, bytes)| *bytes)
-            .sum()
-    }
-
-    fn immutable_object_bytes(&self) -> u64 {
-        self.objects
-            .values()
-            .filter(|(kind, _)| *kind != MemWalObjectKind::ShardManifestHint)
-            .map(|(_, bytes)| *bytes)
-            .sum()
-    }
-
-    fn unknown_paths(&self) -> Vec<&str> {
-        self.objects
-            .iter()
-            .filter_map(|(path, (kind, _))| {
-                (*kind == MemWalObjectKind::Unknown).then_some(path.as_str())
-            })
-            .collect()
-    }
-
-    fn generation_subtree_objects(&self) -> BTreeMap<String, (MemWalObjectKind, u64)> {
-        self.objects
-            .iter()
-            .filter(|(_, (kind, _))| {
-                matches!(
-                    kind,
-                    MemWalObjectKind::GenerationData
-                        | MemWalObjectKind::GenerationManifest
-                        | MemWalObjectKind::GenerationTransaction
-                        | MemWalObjectKind::GenerationDeletion
-                        | MemWalObjectKind::GenerationPkSidecar
-                        | MemWalObjectKind::GenerationBloom
-                        | MemWalObjectKind::GenerationUserIndex
-                )
-            })
-            .map(|(path, value)| (path.clone(), *value))
-            .collect()
-    }
-
-    fn assert_path_class_size_retained_by(&self, later: &Self) {
-        for (path, (kind, bytes)) in &self.objects {
-            if *kind == MemWalObjectKind::ShardManifestHint {
-                continue;
-            }
-            assert_eq!(
-                later.objects.get(path),
-                Some(&(*kind, *bytes)),
-                "retain-all evidence lost or changed the class/size of listed object {path}"
-            );
-        }
-    }
-}
-
-fn is_generation_root(component: &str) -> bool {
-    let Some((hash, generation)) = component.split_once("_gen_") else {
-        return false;
-    };
-    let Ok(generation_number) = generation.parse::<u64>() else {
-        return false;
-    };
-    hash.len() == 8
-        && hash
-            .bytes()
-            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
-        && generation_number > 0
-        && generation_number.to_string() == generation
-}
-
-fn parse_positive_bit_reversed_filename(filename: &str, extension: &str) -> Option<u64> {
-    let Some(stem) = filename.strip_suffix(&format!(".{extension}")) else {
-        return None;
-    };
-    if stem.len() != 64 || !stem.bytes().all(|byte| matches!(byte, b'0' | b'1')) {
-        return None;
-    }
-    let reversed = u64::from_str_radix(stem, 2).ok()?;
-    let value = reversed.reverse_bits();
-    (value > 0).then_some(value)
-}
-
-fn parse_canonical_shard_id(value: &str) -> Option<ShardId> {
-    let shard_id = ShardId::parse_str(value).ok()?;
-    (shard_id.as_hyphenated().to_string() == value).then_some(shard_id)
-}
-
-fn join_object_path(base: &str, suffix: &str) -> String {
-    if base.is_empty() {
-        suffix.to_string()
-    } else {
-        format!("{base}/{suffix}")
-    }
-}
-
 fn classify_mem_wal_object(
     components: &[&str],
     mem_wal_index: usize,
 ) -> (MemWalObjectKind, Option<String>) {
-    let tail = &components[mem_wal_index + 1..];
-    if tail.len() < 3 || parse_canonical_shard_id(tail[0]).is_none() {
-        return (MemWalObjectKind::Unknown, None);
-    }
-
-    match tail[1] {
-        "wal"
-            if tail.len() == 3
-                && parse_positive_bit_reversed_filename(tail[2], "arrow").is_some() =>
-        {
-            (MemWalObjectKind::Wal, None)
-        }
-        "manifest" if tail.len() == 3 && tail[2] == "version_hint.json" => {
-            (MemWalObjectKind::ShardManifestHint, None)
-        }
-        "manifest"
-            if tail.len() == 3
-                && parse_positive_bit_reversed_filename(tail[2], "binpb").is_some() =>
-        {
-            (MemWalObjectKind::ShardManifestVersion, None)
-        }
-        generation if is_generation_root(generation) => {
-            let root = components[..mem_wal_index + 3].join("/");
-            let kind = match tail.get(2).copied() {
-                Some("bloom_filter.bin") if tail.len() == 3 => MemWalObjectKind::GenerationBloom,
-                Some("data") if tail.len() >= 4 => MemWalObjectKind::GenerationData,
-                Some("_versions") if tail.len() >= 4 => MemWalObjectKind::GenerationManifest,
-                Some("_transactions") if tail.len() >= 4 => MemWalObjectKind::GenerationTransaction,
-                Some("_deletions") if tail.len() >= 4 => MemWalObjectKind::GenerationDeletion,
-                Some("_pk_index") if tail.len() >= 4 => MemWalObjectKind::GenerationPkSidecar,
-                Some("_indices") if tail.len() >= 4 => MemWalObjectKind::GenerationUserIndex,
-                _ => MemWalObjectKind::Unknown,
-            };
-            (kind, Some(root))
-        }
-        _ => (MemWalObjectKind::Unknown, None),
-    }
+    helpers::memwal::classify_mem_wal_object(components, mem_wal_index)
 }
 
 fn validated_referenced_generation_roots(
@@ -235,165 +76,17 @@ fn validated_referenced_generation_roots(
     listed_generation_roots: &BTreeSet<String>,
     listed_manifest_versions: &BTreeSet<u64>,
 ) -> BTreeSet<String> {
-    assert_eq!(
-        manifest.shard_id, directory_shard_id,
-        "Gate R0 must fail closed when decoded shard authority disagrees with its directory"
-    );
-    assert!(
-        manifest.version > 0,
-        "Gate R0 must fail closed on a zero shard-manifest version"
-    );
-    let latest_listed_version = listed_manifest_versions
-        .last()
-        .copied()
-        .expect("Gate R0 must fail closed when a shard has no listed manifest version");
-    assert_eq!(
-        latest_listed_version, manifest.version,
-        "Gate R0 must fail closed when the latest shard-manifest filename disagrees with its body"
-    );
-    let expected_manifest_version_count = usize::try_from(manifest.version)
-        .expect("Gate R0 must fail closed when shard-manifest authority exceeds usize");
-    assert_eq!(
-        listed_manifest_versions.len(),
-        expected_manifest_version_count,
-        "Gate R0 must fail closed on a gapped or noncanonical shard-manifest version chain"
-    );
-    assert!(
-        manifest.current_generation > 0,
-        "Gate R0 must fail closed on zero next-generation allocation authority"
-    );
-
-    let shard_prefix = join_object_path(
+    helpers::memwal::validated_referenced_generation_roots(
         table_base,
-        &format!("_mem_wal/{}", directory_shard_id.as_hyphenated()),
-    );
-    let mut generations = BTreeSet::new();
-    let mut paths = BTreeSet::new();
-    let mut roots = BTreeSet::new();
-    for flushed in &manifest.flushed_generations {
-        assert!(
-            flushed.generation > 0 && generations.insert(flushed.generation),
-            "Gate R0 must fail closed on a zero or duplicate flushed generation"
-        );
-        assert!(
-            paths.insert(flushed.path.clone()),
-            "Gate R0 must fail closed on a duplicate flushed-generation path"
-        );
-        assert!(
-            is_generation_root(&flushed.path),
-            "Gate R0 must fail closed on a noncanonical flushed-generation path"
-        );
-        let (_, path_generation) = flushed
-            .path
-            .split_once("_gen_")
-            .expect("validated generation root must contain _gen_");
-        assert_eq!(
-            path_generation.parse::<u64>().unwrap(),
-            flushed.generation,
-            "Gate R0 must fail closed when generation authority disagrees with its path"
-        );
-        assert!(
-            manifest.current_generation > flushed.generation,
-            "Gate R0 must fail closed when next-generation allocation authority has not advanced past a flushed generation"
-        );
-        let root = join_object_path(&shard_prefix, &flushed.path);
-        assert!(
-            listed_generation_roots.contains(&root),
-            "Gate R0 must fail closed when shard authority references a missing listed generation"
-        );
-        assert!(
-            roots.insert(root),
-            "Gate R0 must fail closed on duplicate generation authority"
-        );
-    }
-    roots
+        directory_shard_id,
+        manifest,
+        listed_generation_roots,
+        listed_manifest_versions,
+    )
 }
 
-/// Strict current-object inventory for the part of retained storage that stock
-/// Lance exposes through ordinary LIST. This deliberately does not pretend to
-/// see incomplete multipart uploads, superseded provider versions, delete
-/// markers, local staged temp files, or billed storage.
 async fn current_mem_wal_inventory(uri: &str) -> CurrentMemWalInventory {
-    let (store, root_path) = lance_io::object_store::ObjectStore::from_uri(uri)
-        .await
-        .expect("Gate R0 fixture URI must resolve");
-    let listed = store
-        .inner
-        .list(Some(&root_path))
-        .try_collect::<Vec<_>>()
-        .await
-        .expect("Gate R0 inventory must fail closed on a listing error");
-
-    let mut inventory = CurrentMemWalInventory::default();
-    let mut shards = BTreeSet::new();
-    let mut manifest_versions = BTreeMap::<(String, ShardId), BTreeSet<u64>>::new();
-    for metadata in listed {
-        let path = metadata.location.as_ref().to_string();
-        let components = path.split('/').collect::<Vec<_>>();
-        let Some(mem_wal_index) = components
-            .iter()
-            .position(|component| *component == "_mem_wal")
-        else {
-            continue;
-        };
-        let (kind, generation_root) = classify_mem_wal_object(&components, mem_wal_index);
-        if let Some(root) = generation_root {
-            inventory.generation_roots.insert(root);
-        }
-        let bytes = u64::try_from(metadata.size).expect("object size must fit u64");
-        assert!(
-            inventory
-                .objects
-                .insert(path.clone(), (kind, bytes))
-                .is_none(),
-            "object listing returned duplicate path {path}"
-        );
-
-        let tail = &components[mem_wal_index + 1..];
-        if let Some(shard) = tail
-            .first()
-            .and_then(|value| parse_canonical_shard_id(value))
-        {
-            let table_base = components[..mem_wal_index].join("/");
-            shards.insert((table_base.clone(), shard));
-            if kind == MemWalObjectKind::ShardManifestVersion {
-                let version = parse_positive_bit_reversed_filename(tail[2], "binpb")
-                    .expect("classified shard-manifest version must decode");
-                assert!(
-                    manifest_versions
-                        .entry((table_base, shard))
-                        .or_default()
-                        .insert(version),
-                    "object listing returned duplicate decoded shard-manifest version"
-                );
-            }
-        }
-    }
-
-    for (table_base, shard_id) in shards {
-        let table_path =
-            ObjectPath::parse(&table_base).expect("listed table base must remain a valid path");
-        let manifest_store = ShardManifestStore::new(Arc::clone(&store), &table_path, shard_id, 2);
-        let manifest = manifest_store
-            .read_latest()
-            .await
-            .expect("Gate R0 must fail closed on an unreadable shard manifest")
-            .expect("Gate R0 must fail closed when a listed shard has no latest manifest");
-        let listed_manifest_versions = manifest_versions
-            .get(&(table_base.clone(), shard_id))
-            .expect("Gate R0 must fail closed when a shard has no listed manifest version");
-        inventory
-            .referenced_generation_roots
-            .extend(validated_referenced_generation_roots(
-                &table_base,
-                shard_id,
-                &manifest,
-                &inventory.generation_roots,
-                listed_manifest_versions,
-            ));
-    }
-
-    inventory
+    helpers::memwal::current_mem_wal_inventory(uri).await
 }
 
 async fn current_recovery_sidecars(uri: &str) -> Vec<String> {
@@ -430,6 +123,41 @@ struct PathIo {
     generation_data_writes: u64,
     pk_sidecar_reads: u64,
     pk_sidecar_writes: u64,
+    memwal_atomic_temp_delete_requests: u64,
+    memwal_canonical_delete_requests: u64,
+}
+
+fn is_lance_atomic_memwal_temp_path(path: &str) -> bool {
+    fn canonical_lower_uuid(value: &str) -> bool {
+        value.len() == 36
+            && value.bytes().enumerate().all(|(index, byte)| match index {
+                8 | 13 | 18 | 23 => byte == b'-',
+                _ => byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte),
+            })
+    }
+
+    let components = path.split('/').collect::<Vec<_>>();
+    let Some(mem_wal) = components
+        .iter()
+        .position(|component| *component == "_mem_wal")
+    else {
+        return false;
+    };
+    let tail = &components[mem_wal + 1..];
+    if tail.len() != 3 || tail[1] != "manifest" {
+        return false;
+    }
+    let Ok(shard) = ShardId::parse_str(tail[0]) else {
+        return false;
+    };
+    if shard.as_hyphenated().to_string() != tail[0] {
+        return false;
+    }
+    let Some((manifest_name, temporary_id)) = tail[2].split_once(".tmp.") else {
+        return false;
+    };
+    helpers::memwal::parse_positive_bit_reversed_filename(manifest_name, "binpb").is_some()
+        && canonical_lower_uuid(temporary_id)
 }
 
 impl PathIo {
@@ -485,6 +213,47 @@ impl PathIo {
             }
             if write && pk_sidecar {
                 out.pk_sidecar_writes += 1;
+            }
+            if request.method == "delete" && memwal {
+                if is_lance_atomic_memwal_temp_path(path) {
+                    out.memwal_atomic_temp_delete_requests += 1;
+                } else {
+                    out.memwal_canonical_delete_requests += 1;
+                }
+            }
+        }
+        out
+    }
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+struct RetainedRootIo {
+    reads: u64,
+    writes: u64,
+    deletes: u64,
+}
+
+fn path_is_under_any_root(path: &str, roots: &BTreeSet<String>) -> bool {
+    roots.iter().any(|root| {
+        path == root
+            || path
+                .strip_prefix(root)
+                .is_some_and(|suffix| suffix.starts_with('/'))
+    })
+}
+
+impl RetainedRootIo {
+    fn from_stats(stats: &IoStats, roots: &BTreeSet<String>) -> Self {
+        let mut out = Self::default();
+        for request in &stats.requests {
+            let path = request.path.as_ref();
+            if !path_is_under_any_root(path, roots) {
+                continue;
+            }
+            match request.method {
+                "delete" => out.deletes += 1,
+                "put_opts" | "put_part" | "copy" | "rename" => out.writes += 1,
+                _ => out.reads += 1,
             }
         }
         out
@@ -576,6 +345,39 @@ struct RetainedMetadataSample {
     cold_elapsed_us: u128,
     table: PathIo,
     inventory: CurrentMemWalInventory,
+}
+
+#[derive(Debug)]
+struct RetentionTermSample {
+    elapsed_us: u128,
+    table: PathIo,
+    manifest: PathIo,
+    adapter: AdapterIo,
+    retained_root_io: RetainedRootIo,
+}
+
+#[derive(Debug)]
+struct RetentionDepthSample {
+    retained_generations_before: u64,
+    retained_generations_after: u64,
+    before: CurrentMemWalInventory,
+    after_ack: CurrentMemWalInventory,
+    after_replay: CurrentMemWalInventory,
+    after_fold: CurrentMemWalInventory,
+    warm_ack: RetentionTermSample,
+    cold_reopen_replay: RetentionTermSample,
+    fold: RetentionTermSample,
+    visibility_probe: RetentionTermSample,
+    manifest_version_before: u64,
+    manifest_version_after_ack: u64,
+    manifest_version_after_replay: u64,
+    manifest_version_after_fold: u64,
+    table_version_before: u64,
+    table_version_after_ack: u64,
+    table_version_after_replay: u64,
+    table_version_after_fold: u64,
+    visible_rows_after_fold: usize,
+    whole_process_peak_rss_bytes: Option<u64>,
 }
 
 #[derive(Debug)]
@@ -1069,6 +871,495 @@ fn generation_data_file_bytes(root: &Path) -> u64 {
     total
 }
 
+fn retention_term_sample(
+    started: Instant,
+    table_tracker: &IOTracker,
+    manifest_tracker: &IOTracker,
+    adapter_counts: &StorageReadCounts,
+    adapter_before: AdapterIo,
+    retained_roots: &BTreeSet<String>,
+) -> RetentionTermSample {
+    let elapsed_us = started.elapsed().as_micros();
+    let table_stats = table_tracker.incremental_stats();
+    let manifest_stats = manifest_tracker.incremental_stats();
+    RetentionTermSample {
+        elapsed_us,
+        table: PathIo::from_stats(&table_stats),
+        manifest: PathIo::from_stats(&manifest_stats),
+        adapter: AdapterIo::snapshot(adapter_counts).since(adapter_before),
+        retained_root_io: RetainedRootIo::from_stats(&table_stats, retained_roots),
+    }
+}
+
+fn reset_retention_term_trackers(
+    table_tracker: &IOTracker,
+    manifest_tracker: &IOTracker,
+    adapter_counts: &StorageReadCounts,
+) -> AdapterIo {
+    let _ = table_tracker.incremental_stats();
+    let _ = manifest_tracker.incremental_stats();
+    AdapterIo::snapshot(adapter_counts)
+}
+
+#[cfg(unix)]
+fn current_process_peak_rss_bytes() -> Option<u64> {
+    let mut rusage: libc::rusage = unsafe { std::mem::zeroed() };
+    let result = unsafe { libc::getrusage(libc::RUSAGE_SELF, &mut rusage) };
+    assert_eq!(result, 0, "getrusage(RUSAGE_SELF) failed");
+    Some(normalized_peak_rss_bytes(&rusage))
+}
+
+#[cfg(not(unix))]
+fn current_process_peak_rss_bytes() -> Option<u64> {
+    None
+}
+
+async fn retained_history_scaling_samples_at(
+    uri: &str,
+    depths: &[u64],
+) -> Vec<RetentionDepthSample> {
+    assert!(!depths.is_empty());
+    assert!(
+        depths
+            .windows(2)
+            .all(|pair| pair[0] > 0 && pair[0] < pair[1])
+            && depths.last().copied().unwrap() > 0,
+        "retained-history sweep depths must be positive and strictly increasing"
+    );
+
+    init_enrolled(uri, STREAM_SCHEMA).await;
+    let table_tracker = IOTracker::default();
+    let manifest_tracker = IOTracker::default();
+
+    with_raw_io_trackers(&table_tracker, &manifest_tracker, async {
+        let (adapter, adapter_counts) = CountingStorageAdapter::new(storage_for_uri(uri).unwrap());
+        let mut db = Arc::new(
+            Omnigraph::open_with_storage(uri, Arc::clone(&adapter))
+                .await
+                .unwrap(),
+        );
+        let schema = table_schema(&db).await;
+        let mut retained_generations = 0u64;
+        let mut visible_rows = 0usize;
+        let mut ordinal = 0u64;
+        let mut samples = Vec::new();
+
+        for &depth in depths {
+            while retained_generations < depth {
+                let batch = score_batch(
+                    Arc::clone(&schema),
+                    &format!("retention-fill-{retained_generations}"),
+                    1,
+                );
+                db.failpoint_stream_b1_for_test(TABLE, Some(batch), ordinal)
+                    .await
+                    .unwrap();
+                ordinal += 1;
+                db.failpoint_stream_b1_for_test(TABLE, None, 0)
+                    .await
+                    .unwrap();
+                retained_generations += 1;
+                visible_rows += 1;
+            }
+
+            let before = current_mem_wal_inventory(uri).await;
+            assert_eq!(
+                before.generation_roots.len(),
+                usize::try_from(depth).unwrap(),
+                "fixture must reach the requested retained-generation depth exactly"
+            );
+            let retained_roots = before.generation_roots.clone();
+            let before_snapshot = db.snapshot_of(ReadTarget::branch("main")).await.unwrap();
+            let manifest_version_before = before_snapshot.version();
+            let table_version_before = before_snapshot.entry(TABLE).unwrap().table_version;
+
+            // Establish one resident writer, then measure only the second put.
+            // This keeps warm acknowledgement separate from cold claim/replay.
+            let warmup = score_batch(Arc::clone(&schema), &format!("retention-{depth}-warmup"), 1);
+            db.failpoint_stream_b1_for_test(TABLE, Some(warmup), ordinal)
+                .await
+                .unwrap();
+            ordinal += 1;
+            let adapter_before =
+                reset_retention_term_trackers(&table_tracker, &manifest_tracker, &adapter_counts);
+            let started = Instant::now();
+            let measured = score_batch(
+                Arc::clone(&schema),
+                &format!("retention-{depth}-measured"),
+                1,
+            );
+            db.failpoint_stream_b1_for_test(TABLE, Some(measured), ordinal)
+                .await
+                .unwrap();
+            ordinal += 1;
+            let warm_ack = retention_term_sample(
+                started,
+                &table_tracker,
+                &manifest_tracker,
+                &adapter_counts,
+                adapter_before,
+                &retained_roots,
+            );
+            let after_ack = current_mem_wal_inventory(uri).await;
+            let after_ack_snapshot = db.snapshot_of(ReadTarget::branch("main")).await.unwrap();
+            let manifest_version_after_ack = after_ack_snapshot.version();
+            let table_version_after_ack = after_ack_snapshot.entry(TABLE).unwrap().table_version;
+
+            // Add one definitely durable but acknowledgement-ambiguous entry to
+            // retire the resident writer.  The measured cold interval then
+            // includes graph reopen, shard claim, and authoritative WAL replay,
+            // while stopping before generation materialization.
+            let ambiguous = score_batch(
+                Arc::clone(&schema),
+                &format!("retention-{depth}-ambiguous"),
+                1,
+            );
+            let ambiguous_retired = helpers::failpoint::Rendezvous::park_first(
+                names::STREAM_B1_AFTER_RETIREMENT_RELEASE,
+            );
+            let error = {
+                let _after_durable =
+                    ScopedFailPoint::new(names::STREAM_B1_AFTER_WATCHER_SUCCESS, "return");
+                db.failpoint_stream_b1_for_test(TABLE, Some(ambiguous), ordinal)
+                    .await
+                    .expect_err("the injected post-durability boundary must retire the writer")
+            };
+            assert!(matches!(error, OmniError::AckUnknown { .. }), "{error:?}");
+            ordinal += 1;
+            ambiguous_retired.wait_until_reached().await;
+            ambiguous_retired.release();
+            drop(db);
+
+            let adapter_before =
+                reset_retention_term_trackers(&table_tracker, &manifest_tracker, &adapter_counts);
+            let started = Instant::now();
+            let replay_before_abort =
+                helpers::failpoint::Rendezvous::park_first(names::STREAM_B1_BEFORE_ABORT);
+            let replay_retired = helpers::failpoint::Rendezvous::park_first(
+                names::STREAM_B1_AFTER_RETIREMENT_RELEASE,
+            );
+            db = Arc::new(
+                Omnigraph::open_with_storage(uri, Arc::clone(&adapter))
+                    .await
+                    .unwrap(),
+            );
+            let error = {
+                let _before_seal =
+                    ScopedFailPoint::new(names::STREAM_B1_BEFORE_FORCE_SEAL, "return");
+                db.failpoint_stream_b1_for_test(TABLE, None, 0)
+                    .await
+                    .expect_err("cold replay measurement must stop before generation output")
+            };
+            assert!(
+                error
+                    .to_string()
+                    .contains(names::STREAM_B1_BEFORE_FORCE_SEAL),
+                "{error:?}"
+            );
+            replay_before_abort.wait_until_reached().await;
+            let cold_reopen_replay = retention_term_sample(
+                started,
+                &table_tracker,
+                &manifest_tracker,
+                &adapter_counts,
+                adapter_before,
+                &retained_roots,
+            );
+            replay_before_abort.release();
+            replay_retired.wait_until_reached().await;
+            replay_retired.release();
+            let after_replay = current_mem_wal_inventory(uri).await;
+            let after_replay_snapshot = db.snapshot_of(ReadTarget::branch("main")).await.unwrap();
+            let manifest_version_after_replay = after_replay_snapshot.version();
+            let table_version_after_replay =
+                after_replay_snapshot.entry(TABLE).unwrap().table_version;
+
+            let adapter_before =
+                reset_retention_term_trackers(&table_tracker, &manifest_tracker, &adapter_counts);
+            let started = Instant::now();
+            db.failpoint_stream_b1_for_test(TABLE, None, 0)
+                .await
+                .expect("the replayed generation must fold and publish");
+            let fold = retention_term_sample(
+                started,
+                &table_tracker,
+                &manifest_tracker,
+                &adapter_counts,
+                adapter_before,
+                &retained_roots,
+            );
+
+            let adapter_before =
+                reset_retention_term_trackers(&table_tracker, &manifest_tracker, &adapter_counts);
+            let started = Instant::now();
+            let after_fold_snapshot = db.snapshot_of(ReadTarget::branch("main")).await.unwrap();
+            let visibility_probe = retention_term_sample(
+                started,
+                &table_tracker,
+                &manifest_tracker,
+                &adapter_counts,
+                adapter_before,
+                &retained_roots,
+            );
+            let manifest_version_after_fold = after_fold_snapshot.version();
+            let table_version_after_fold = after_fold_snapshot.entry(TABLE).unwrap().table_version;
+            let after_fold = current_mem_wal_inventory(uri).await;
+            assert!(
+                current_recovery_sidecars(uri).await.is_empty(),
+                "successful retained-history fold must retire its recovery sidecar"
+            );
+
+            retained_generations += 1;
+            visible_rows += 3;
+            let visible_rows_after_fold = helpers::count_rows(&db, TABLE).await;
+            samples.push(RetentionDepthSample {
+                retained_generations_before: depth,
+                retained_generations_after: retained_generations,
+                before,
+                after_ack,
+                after_replay,
+                after_fold,
+                warm_ack,
+                cold_reopen_replay,
+                fold,
+                visibility_probe,
+                manifest_version_before,
+                manifest_version_after_ack,
+                manifest_version_after_replay,
+                manifest_version_after_fold,
+                table_version_before,
+                table_version_after_ack,
+                table_version_after_replay,
+                table_version_after_fold,
+                visible_rows_after_fold,
+                whole_process_peak_rss_bytes: current_process_peak_rss_bytes(),
+            });
+            assert_eq!(visible_rows_after_fold, visible_rows);
+        }
+        samples
+    })
+    .await
+}
+
+async fn retained_history_scaling_samples_local(depths: &[u64]) -> Vec<RetentionDepthSample> {
+    let dir = tempfile::tempdir().unwrap();
+    retained_history_scaling_samples_at(dir.path().to_str().unwrap(), depths).await
+}
+
+fn assert_retained_history_scaling_sample(sample: &RetentionDepthSample) {
+    let before_depth = usize::try_from(sample.retained_generations_before).unwrap();
+    let after_depth = usize::try_from(sample.retained_generations_after).unwrap();
+    assert_eq!(after_depth, before_depth + 1);
+    for inventory in [
+        &sample.before,
+        &sample.after_ack,
+        &sample.after_replay,
+        &sample.after_fold,
+    ] {
+        assert!(
+            inventory.unknown_paths().is_empty(),
+            "retained-history census missed paths: {:?}",
+            inventory.unknown_paths()
+        );
+        assert_eq!(
+            inventory.generation_roots, inventory.referenced_generation_roots,
+            "success-only retained-history sweep must not adopt or invent orphan roots"
+        );
+    }
+    assert_eq!(sample.before.generation_roots.len(), before_depth);
+    assert_eq!(sample.after_ack.generation_roots.len(), before_depth);
+    assert_eq!(sample.after_replay.generation_roots.len(), before_depth);
+    assert_eq!(sample.after_fold.generation_roots.len(), after_depth);
+    sample
+        .before
+        .assert_path_class_size_retained_by(&sample.after_ack);
+    sample
+        .after_ack
+        .assert_path_class_size_retained_by(&sample.after_replay);
+    sample
+        .after_replay
+        .assert_path_class_size_retained_by(&sample.after_fold);
+    assert!(
+        sample.after_fold.immutable_object_bytes() > sample.before.immutable_object_bytes(),
+        "one additional retained generation must increase advisory current-listed bytes"
+    );
+
+    for (name, term) in [
+        ("warm ack", &sample.warm_ack),
+        ("cold reopen/replay", &sample.cold_reopen_replay),
+        ("fold", &sample.fold),
+        ("visibility probe", &sample.visibility_probe),
+    ] {
+        assert_eq!(
+            term.retained_root_io,
+            RetainedRootIo::default(),
+            "{name} touched an older retained generation root: {term:#?}"
+        );
+        assert_eq!(
+            term.table.memwal_canonical_delete_requests, 0,
+            "{name} requested deletion of a canonical MemWAL object: {term:#?}"
+        );
+    }
+    assert!(sample.warm_ack.table.wal_writes > 0, "{sample:#?}");
+    assert_eq!(sample.warm_ack.table.generation_writes, 0, "{sample:#?}");
+    assert_eq!(sample.warm_ack.manifest.total_writes, 0, "{sample:#?}");
+    assert!(sample.cold_reopen_replay.table.wal_reads > 0, "{sample:#?}");
+    assert_eq!(
+        sample.cold_reopen_replay.table.generation_writes, 0,
+        "{sample:#?}"
+    );
+    assert!(sample.fold.table.generation_reads > 0, "{sample:#?}");
+    assert!(sample.fold.table.generation_writes > 0, "{sample:#?}");
+    assert!(sample.fold.manifest.total_writes > 0, "{sample:#?}");
+    assert_eq!(sample.visibility_probe.table.total_writes, 0, "{sample:#?}");
+    assert_eq!(
+        sample.visibility_probe.manifest.total_writes, 0,
+        "{sample:#?}"
+    );
+
+    assert_eq!(
+        sample.manifest_version_after_ack, sample.manifest_version_before,
+        "acknowledgement must remain graph-invisible"
+    );
+    assert_eq!(
+        sample.manifest_version_after_replay, sample.manifest_version_before,
+        "cold replay must remain graph-invisible"
+    );
+    assert_eq!(
+        sample.manifest_version_after_fold,
+        sample.manifest_version_before + 1,
+        "one fold must have exactly one graph visibility point"
+    );
+    assert_eq!(
+        sample.table_version_after_ack, sample.table_version_before,
+        "acknowledgement must not advance the base table"
+    );
+    assert_eq!(
+        sample.table_version_after_replay, sample.table_version_before,
+        "cold replay must not advance the base table"
+    );
+    assert_eq!(
+        sample.table_version_after_fold,
+        sample.table_version_before + 1,
+        "one fold must commit exactly one Lance table effect"
+    );
+}
+
+fn print_retained_history_scaling_sample(sample: &RetentionDepthSample, scale: &str) {
+    let print_term = |name: &str, term: &RetentionTermSample| {
+        eprintln!(
+            "B2a retained-history {scale} depth={} term={name} elapsed_us={} table_reads={} table_read_bytes={} table_writes={} table_written_bytes={} graph_manifest_reads={} graph_manifest_read_bytes={} graph_manifest_writes={} graph_manifest_written_bytes={} adapter_ops={} retained_root_reads={} retained_root_writes={} retained_root_deletes={} memwal_atomic_temp_delete_requests={} memwal_canonical_delete_requests={}",
+            sample.retained_generations_before,
+            term.elapsed_us,
+            term.table.total_reads,
+            term.table.total_read_bytes,
+            term.table.total_writes,
+            term.table.total_written_bytes,
+            term.manifest.total_reads,
+            term.manifest.total_read_bytes,
+            term.manifest.total_writes,
+            term.manifest.total_written_bytes,
+            term.adapter.operations(),
+            term.retained_root_io.reads,
+            term.retained_root_io.writes,
+            term.retained_root_io.deletes,
+            term.table.memwal_atomic_temp_delete_requests,
+            term.table.memwal_canonical_delete_requests,
+        );
+    };
+    print_term("warm_ack", &sample.warm_ack);
+    print_term("cold_reopen_replay", &sample.cold_reopen_replay);
+    print_term("fold", &sample.fold);
+    print_term("visibility_probe", &sample.visibility_probe);
+    eprintln!(
+        "B2a retained-history {scale} depth={} advisory_current_listed_before_objects={} advisory_current_listed_before_immutable_bytes={} advisory_current_listed_after_ack_objects={} advisory_current_listed_after_ack_immutable_bytes={} advisory_current_listed_after_replay_objects={} advisory_current_listed_after_replay_immutable_bytes={} advisory_current_listed_after_fold_objects={} advisory_current_listed_after_fold_immutable_bytes={} retained_roots_before={} retained_roots_after={} visible_rows={} whole_process_peak_rss_bytes={:?}",
+        sample.retained_generations_before,
+        sample.before.objects.len(),
+        sample.before.immutable_object_bytes(),
+        sample.after_ack.objects.len(),
+        sample.after_ack.immutable_object_bytes(),
+        sample.after_replay.objects.len(),
+        sample.after_replay.immutable_object_bytes(),
+        sample.after_fold.objects.len(),
+        sample.after_fold.immutable_object_bytes(),
+        sample.before.generation_roots.len(),
+        sample.after_fold.generation_roots.len(),
+        sample.visible_rows_after_fold,
+        sample.whole_process_peak_rss_bytes,
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[serial]
+async fn b2a_retained_history_small_depth_keeps_terms_and_old_roots_separate() {
+    let _scenario = FailScenario::setup();
+    let samples = retained_history_scaling_samples_local(&[1, 8]).await;
+    for sample in &samples {
+        print_retained_history_scaling_sample(sample, "ci");
+        assert_retained_history_scaling_sample(sample);
+    }
+
+    let shallow = &samples[0];
+    let deep = &samples[1];
+    assert_eq!(
+        deep.warm_ack.table.total_reads, shallow.warm_ack.table.total_reads,
+        "warm acknowledgement read-operation count must not scale with retained history"
+    );
+    assert_eq!(
+        deep.warm_ack.table.total_writes, shallow.warm_ack.table.total_writes,
+        "warm acknowledgement write-operation count must not scale with retained history"
+    );
+    assert_eq!(
+        deep.cold_reopen_replay.table.wal_reads, shallow.cold_reopen_replay.table.wal_reads,
+        "the fixed three-entry replay tail must keep one deterministic WAL-read shape"
+    );
+    assert!(
+        deep.cold_reopen_replay.table.shard_manifest_reads
+            <= shallow.cold_reopen_replay.table.shard_manifest_reads + 2,
+        "cold shard-authority read-operation count grew with retained history: {samples:#?}"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[serial]
+#[ignore = "on-demand RFC-026 B2a retain-all decision-scale instrument"]
+async fn b2a_retained_history_decision_scale_sweeps_to_128_generations() {
+    let _scenario = FailScenario::setup();
+    let samples = retained_history_scaling_samples_local(&[1, 8, 32, 128]).await;
+    for sample in &samples {
+        print_retained_history_scaling_sample(sample, "decision");
+        assert_retained_history_scaling_sample(sample);
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[serial]
+#[ignore = "on-demand RFC-026 B2a configured-object-store decision-scale instrument"]
+async fn b2a_retained_history_decision_scale_sweeps_to_128_generations_on_configured_rustfs() {
+    let _scenario = FailScenario::setup();
+    let Some(uri) = helpers::s3_test_graph_uri("memwal-b2a-retained-history") else {
+        eprintln!(
+            "SKIP b2a_retained_history_decision_scale_sweeps_to_128_generations_on_configured_rustfs"
+        );
+        return;
+    };
+    let samples = retained_history_scaling_samples_at(&uri, &[1, 8, 32, 128]).await;
+    for sample in &samples {
+        print_retained_history_scaling_sample(sample, "rustfs-decision");
+        assert_retained_history_scaling_sample(sample);
+    }
+
+    // This destroys the benchmark's unique isolated graph root only after all
+    // retention assertions. It is fixture teardown, not production MemWAL GC.
+    let (store, root) = lance_io::object_store::ObjectStore::from_uri(&uri)
+        .await
+        .expect("configured S3/RustFS benchmark URI must resolve for cleanup");
+    store
+        .remove_dir_all(root)
+        .await
+        .expect("configured S3/RustFS benchmark fixture cleanup must succeed");
+}
+
 #[tokio::test]
 #[serial]
 async fn gate_r0_retain_all_current_object_growth_is_swept_explicitly() {
@@ -1291,6 +1582,30 @@ fn gate_r0_current_inventory_path_classifier_is_canonical_and_fail_closed() {
             "malformed path must fail closed: {path}"
         );
     }
+
+    let retained_root = format!("table/_mem_wal/{shard}/abcdef12_gen_1");
+    let retained_roots = BTreeSet::from([retained_root.clone()]);
+    assert!(path_is_under_any_root(&retained_root, &retained_roots));
+    assert!(path_is_under_any_root(
+        &format!("{retained_root}/data/file.lance"),
+        &retained_roots
+    ));
+    assert!(!path_is_under_any_root(
+        &format!("{retained_root}-other/data/file.lance"),
+        &retained_roots
+    ));
+    assert!(is_lance_atomic_memwal_temp_path(&format!(
+        "table/_mem_wal/{shard}/manifest/{bits}.binpb.tmp.01234567-89ab-cdef-0123-456789abcdef"
+    )));
+    assert!(!is_lance_atomic_memwal_temp_path(&format!(
+        "table/_mem_wal/{shard}/manifest/{bits}.binpb"
+    )));
+    assert!(!is_lance_atomic_memwal_temp_path(&format!(
+        "table/_mem_wal/{shard}/wal/{bits}.arrow.tmp.01234567-89ab-cdef-0123-456789abcdef"
+    )));
+    assert!(!is_lance_atomic_memwal_temp_path(&format!(
+        "table/_mem_wal/{shard}/manifest/{bits}.binpb.tmp.NOT-A-UUID"
+    )));
 }
 
 #[test]

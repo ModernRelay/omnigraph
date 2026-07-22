@@ -1084,15 +1084,116 @@ fn collect_durable_use_renames(tree: &syn::UseTree, hits: &mut Vec<String>) {
     }
 }
 
+fn collect_retain_all_delete_use_renames(tree: &syn::UseTree, hits: &mut Vec<String>) {
+    let tracked = retain_all_tracked_delete_names(RETAIN_ALL_DELETE_CALLS);
+    match tree {
+        syn::UseTree::Rename(rename) if tracked.contains(&rename.ident.to_string()) => {
+            hits.push(format!(
+                "delete gateway `{}` renamed to `{}`",
+                rename.ident, rename.rename
+            ));
+        }
+        syn::UseTree::Path(path) => {
+            collect_retain_all_delete_use_renames(&path.tree, hits);
+        }
+        syn::UseTree::Group(group) => {
+            for item in &group.items {
+                collect_retain_all_delete_use_renames(item, hits);
+            }
+        }
+        _ => {}
+    }
+}
+
+fn expression_shape(expression: &Expr) -> String {
+    match expression {
+        Expr::Path(path) => path
+            .path
+            .segments
+            .iter()
+            .map(|segment| segment.ident.to_string())
+            .collect::<Vec<_>>()
+            .join("::"),
+        Expr::Reference(reference) => format!(
+            "&{}{}",
+            if reference.mutability.is_some() {
+                "mut "
+            } else {
+                ""
+            },
+            expression_shape(&reference.expr)
+        ),
+        Expr::Field(field) => {
+            let member = match &field.member {
+                syn::Member::Named(identifier) => identifier.to_string(),
+                syn::Member::Unnamed(index) => index.index.to_string(),
+            };
+            format!("{}.{}", expression_shape(&field.base), member)
+        }
+        Expr::Call(call) => format!("{}(..)", expression_shape(&call.func)),
+        Expr::MethodCall(call) => {
+            format!("{}.{}(..)", expression_shape(&call.receiver), call.method)
+        }
+        Expr::Paren(paren) => expression_shape(&paren.expr),
+        Expr::Group(group) => expression_shape(&group.expr),
+        Expr::Await(await_expression) => {
+            format!("{}.await", expression_shape(&await_expression.base))
+        }
+        Expr::Index(index) => format!("{}[..]", expression_shape(&index.expr)),
+        Expr::Lit(_) => "<literal>".to_string(),
+        Expr::Macro(_) => "<macro>".to_string(),
+        _ => "<complex>".to_string(),
+    }
+}
+
+fn argument_shape(arguments: &Punctuated<Expr, Token![,]>) -> String {
+    arguments
+        .iter()
+        .map(expression_shape)
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
+fn call_shape(target: &Expr, arguments: &Punctuated<Expr, Token![,]>) -> String {
+    format!(
+        "{} => {}",
+        expression_shape(target),
+        argument_shape(arguments)
+    )
+}
+
+fn impl_owner(ty: &Type) -> String {
+    type_final_ident(ty)
+        .map(|identifier| identifier.to_string())
+        .unwrap_or_else(|| "<impl>".to_string())
+}
+
 #[derive(Default)]
 struct CallInventory {
     counts: BTreeMap<String, usize>,
+    impl_stack: Vec<String>,
+    function_stack: Vec<String>,
+    call_shapes_by_function: BTreeMap<(String, String, String), usize>,
     macro_hits: Vec<String>,
+    retain_all_hidden_route_hits: Vec<String>,
 }
 
 impl CallInventory {
     fn record(&mut self, key: impl Into<String>) {
-        *self.counts.entry(key.into()).or_default() += 1;
+        let key = key.into();
+        *self.counts.entry(key).or_default() += 1;
+    }
+
+    fn record_shape(&mut self, key: impl Into<String>, shape: String) {
+        let function = self
+            .function_stack
+            .last()
+            .cloned()
+            .unwrap_or_else(|| "<module>".to_string());
+        *self
+            .call_shapes_by_function
+            .entry((function, key.into(), shape))
+            .or_default() += 1;
     }
 }
 
@@ -1108,21 +1209,32 @@ impl<'ast> Visit<'ast> for CallInventory {
         if cfg_requires_test(&node.attrs) {
             return;
         }
+        self.function_stack.push(node.sig.ident.to_string());
         visit::visit_item_fn(self, node);
+        self.function_stack.pop();
     }
 
     fn visit_item_impl(&mut self, node: &'ast syn::ItemImpl) {
         if cfg_requires_test(&node.attrs) {
             return;
         }
+        self.impl_stack.push(impl_owner(&node.self_ty));
         visit::visit_item_impl(self, node);
+        self.impl_stack.pop();
     }
 
     fn visit_impl_item_fn(&mut self, node: &'ast syn::ImplItemFn) {
         if cfg_requires_test(&node.attrs) {
             return;
         }
+        let function = self
+            .impl_stack
+            .last()
+            .map(|owner| format!("{owner}::{}", node.sig.ident))
+            .unwrap_or_else(|| node.sig.ident.to_string());
+        self.function_stack.push(function);
         visit::visit_impl_item_fn(self, node);
+        self.function_stack.pop();
     }
 
     fn visit_item_macro(&mut self, node: &'ast syn::ItemMacro) {
@@ -1134,6 +1246,7 @@ impl<'ast> Visit<'ast> for CallInventory {
 
     fn visit_item_use(&mut self, node: &'ast syn::ItemUse) {
         collect_durable_use_renames(&node.tree, &mut self.macro_hits);
+        collect_retain_all_delete_use_renames(&node.tree, &mut self.retain_all_hidden_route_hits);
         visit::visit_item_use(self, node);
     }
 
@@ -1153,6 +1266,14 @@ impl<'ast> Visit<'ast> for CallInventory {
     fn visit_expr_method_call(&mut self, node: &'ast syn::ExprMethodCall) {
         let method = node.method.to_string();
         self.record(method.clone());
+        self.record_shape(
+            method.clone(),
+            format!(
+                "{} => {}",
+                expression_shape(&node.receiver),
+                argument_shape(&node.args)
+            ),
+        );
         if method == "append" && node.args.len() == 2 {
             self.record(".raw_dataset_append(");
         }
@@ -1170,6 +1291,7 @@ impl<'ast> Visit<'ast> for CallInventory {
     fn visit_expr_call(&mut self, node: &'ast syn::ExprCall) {
         if let Some(identifier) = final_path_ident(&node.func) {
             self.record(identifier.clone());
+            self.record_shape(identifier.clone(), call_shape(&node.func, &node.args));
             if identifier == "append" && node.args.len() == 3 {
                 self.record(".raw_dataset_append(");
             }
@@ -1203,6 +1325,12 @@ impl<'ast> Visit<'ast> for CallInventory {
             .last()
             .map(|segment| segment.ident.to_string())
             .unwrap_or_else(|| "macro".into());
+        for gateway in retain_all_tracked_delete_names(RETAIN_ALL_DELETE_CALLS) {
+            if tokens.contains(&format!("{gateway} (")) {
+                self.retain_all_hidden_route_hits
+                    .push(format!("{macro_name}! may hide delete gateway `{gateway}`"));
+            }
+        }
         if macro_name == "include" {
             self.macro_hits
                 .push("include! can hide unparsed durable calls".into());
@@ -1273,11 +1401,337 @@ fn call_inventory(ast: &syn::File) -> CallInventory {
     inventory
 }
 
+/// Raw MemWAL storage is retained indefinitely in RFC-026's selected B2a
+/// profile.  These are the only production functions allowed to spell the
+/// physical `_mem_wal` directory: both perform bounded, read-only validation.
+/// A new owner is therefore an architectural change, not an incidental helper.
+const RAW_MEM_WAL_PATH_OWNERS: &[(&str, &str, usize)] = &[
+    ("table_store/mem_wal.rs", "raw_mem_wal_inventory", 2),
+    (
+        "table_store/mem_wal/worker.rs",
+        "validate_b1_lifecycle_physical_state",
+        1,
+    ),
+];
+
+/// Generic graph maintenance must reason from manifest/lifecycle authority,
+/// not inspect or reinterpret retained MemWAL objects.  StreamEnrollment and
+/// StreamFold recovery are intentionally absent: their exact classifiers must
+/// read MemWAL state, while the raw-path and no-reclamation guards below keep
+/// those classifiers non-destructive.
+const RETAIN_ALL_MAINTENANCE_FILES: &[&str] = &[
+    "db/omnigraph/optimize.rs",
+    "db/omnigraph/repair.rs",
+    "db/omnigraph/schema_apply.rs",
+    "db/omnigraph/table_ops.rs",
+];
+
+const RETAIN_ALL_OMNIGRAPH_METHODS: &[&str] = &[
+    "cleanup",
+    "cleanup_deleted_branch_tables",
+    "optimize",
+    "repair",
+];
+
+/// Raw object/prefix erasure is the only delegated route this B2a guard owns.
+/// Lance version GC and branch-tree lifecycle remain covered by their existing
+/// protocol registries and behavioral guards.
+const RETAIN_ALL_RAW_DELETE_PRIMITIVES: &[&str] = &[
+    "delete",
+    "delete_prefix",
+    "remove_dir",
+    "remove_dir_all",
+    "remove_file",
+];
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RetainAllDeleteScope {
+    /// Accepts a caller-provided object/prefix. Registering the gateway also
+    /// enrolls its terminal function name so every caller edge is inventoried.
+    GenericGateway,
+    /// Deletes one protocol-derived schema, sidecar, staging, or lock object.
+    ExactControlObject,
+    /// Deletes an unregistered first-touch table root only after exact recovery
+    /// ownership and competing-sidecar proof.
+    FirstTouchRollback,
+    /// Destroys the entire graph after the governed cluster approval protocol.
+    WholeGraphDestroy,
+}
+
+type RetainAllDeleteCallsite = (
+    &'static str,
+    &'static str,
+    &'static str,
+    &'static str,
+    usize,
+    RetainAllDeleteScope,
+);
+
+#[rustfmt::skip]
+const RETAIN_ALL_DELETE_CALLS: &[RetainAllDeleteCallsite] = &[
+    ("storage.rs", "ObjectStorageAdapter::delete", "delete", "self.store => &location", 1, RetainAllDeleteScope::GenericGateway),
+    ("storage.rs", "ObjectStorageAdapter::delete_prefix", "delete", "self.store => &location", 1, RetainAllDeleteScope::GenericGateway),
+    ("storage.rs", "ObjectStorageAdapter::delete_prefix", "remove_dir_all", "tokio::fs::remove_dir_all => &path", 1, RetainAllDeleteScope::GenericGateway),
+    ("instrumentation.rs", "CountingStorageAdapter::delete", "delete", "self.inner => uri", 1, RetainAllDeleteScope::GenericGateway),
+    ("instrumentation.rs", "CountingStorageAdapter::delete_prefix", "delete_prefix", "self.inner => prefix_uri", 1, RetainAllDeleteScope::GenericGateway),
+    ("db/omnigraph.rs", "best_effort_cleanup_init_artifacts", "delete", "storage => &uri", 1, RetainAllDeleteScope::ExactControlObject),
+    ("db/schema_state.rs", "cleanup_staging_files", "delete", "storage => &schema_source_staging_uri(..)", 1, RetainAllDeleteScope::ExactControlObject),
+    ("db/schema_state.rs", "cleanup_staging_files", "delete", "storage => &schema_ir_staging_uri(..)", 1, RetainAllDeleteScope::ExactControlObject),
+    ("db/schema_state.rs", "cleanup_staging_files", "delete", "storage => &schema_state_staging_uri(..)", 1, RetainAllDeleteScope::ExactControlObject),
+    ("db/manifest/recovery.rs", "delete_sidecar", "delete", "storage => &handle.sidecar_uri", 1, RetainAllDeleteScope::ExactControlObject),
+    ("db/manifest/recovery.rs", "delete_sidecar_by_operation_id", "delete", "storage => &sidecar_uri(..)", 1, RetainAllDeleteScope::ExactControlObject),
+    ("db/manifest/recovery.rs", "roll_back_schema_apply_v7", "delete_prefix", "storage => &pin.table_path", 2, RetainAllDeleteScope::FirstTouchRollback),
+    ("omnigraph-cluster/store.rs", "StateLockGuard::drop", "remove_file", "std::fs::remove_file => path", 1, RetainAllDeleteScope::ExactControlObject),
+    ("omnigraph-cluster/store.rs", "StateLockGuard::drop", "delete", "adapter => &uri", 2, RetainAllDeleteScope::ExactControlObject),
+    ("omnigraph-cluster/store.rs", "ClusterStore::force_unlock", "delete", "self.adapter => &lock_uri", 1, RetainAllDeleteScope::ExactControlObject),
+    ("omnigraph-cluster/store.rs", "ClusterStore::try_delete_object", "delete", "self.adapter => uri", 1, RetainAllDeleteScope::GenericGateway),
+    ("omnigraph-cluster/store.rs", "ClusterStore::delete_object", "try_delete_object", "self => uri", 1, RetainAllDeleteScope::GenericGateway),
+    ("omnigraph-cluster/store.rs", "ClusterStore::delete_graph_root", "delete_prefix", "self.adapter => graph_uri", 1, RetainAllDeleteScope::GenericGateway),
+    ("omnigraph-cluster/lib.rs", "apply_config_dir_with_options", "delete_graph_root", "backend => &graph_uri", 1, RetainAllDeleteScope::WholeGraphDestroy),
+    ("omnigraph-cluster/lib.rs", "apply_config_dir_with_options", "delete_object", "backend => &sidecar_path", 1, RetainAllDeleteScope::ExactControlObject),
+    ("omnigraph-cluster/lib.rs", "apply_config_dir_with_options", "delete_object", "backend => sidecar_uri", 1, RetainAllDeleteScope::ExactControlObject),
+    ("omnigraph-cluster/lib.rs", "apply_config_dir_with_options", "try_delete_object", "backend => &sidecar_path", 1, RetainAllDeleteScope::ExactControlObject),
+    ("omnigraph-cluster/lib.rs", "sync_config_dir", "delete_object", "backend => sidecar_uri", 1, RetainAllDeleteScope::ExactControlObject),
+];
+
+fn retain_all_tracked_delete_names(callsites: &[RetainAllDeleteCallsite]) -> BTreeSet<String> {
+    RETAIN_ALL_RAW_DELETE_PRIMITIVES
+        .iter()
+        .map(|primitive| (*primitive).to_string())
+        .chain(
+            callsites
+                .iter()
+                .filter(|callsite| callsite.5 == RetainAllDeleteScope::GenericGateway)
+                .map(|callsite| {
+                    callsite
+                        .1
+                        .rsplit("::")
+                        .next()
+                        .expect("qualified function owner")
+                        .to_string()
+                }),
+        )
+        .collect()
+}
+
+fn normalized_symbol(value: &str) -> String {
+    value
+        .chars()
+        .filter(char::is_ascii_alphanumeric)
+        .flat_map(char::to_lowercase)
+        .collect()
+}
+
+fn mentions_mem_wal(value: &str) -> bool {
+    normalized_symbol(value).contains("memwal") || value.contains("_mem_wal")
+}
+
+fn is_reclamation_verb(value: &str) -> bool {
+    let normalized = normalized_symbol(value);
+    [
+        "adopt",
+        "cleanup",
+        "compact",
+        "delete",
+        "drop",
+        "garbagecollect",
+        "prune",
+        "purge",
+        "reclaim",
+        "reclassify",
+        "remove",
+        "trim",
+        "vacuum",
+    ]
+    .iter()
+    .any(|verb| normalized.contains(verb))
+        || normalized == "gc"
+        || normalized.ends_with("gc")
+}
+
+fn is_mem_wal_reclamation_symbol(value: &str) -> bool {
+    mentions_mem_wal(value) && is_reclamation_verb(value)
+}
+
+fn raw_mem_wal_marker_count(value: &str) -> usize {
+    value.matches("_mem_wal").count()
+}
+
+#[derive(Default)]
+struct RetainAllMemWalInventory {
+    function_stack: Vec<String>,
+    raw_path_owners: BTreeMap<String, usize>,
+    mem_wal_uses: Vec<(String, String)>,
+    reclamation_symbols: Vec<(String, String)>,
+}
+
+impl RetainAllMemWalInventory {
+    fn owner(&self) -> String {
+        self.function_stack
+            .last()
+            .cloned()
+            .unwrap_or_else(|| "<module>".to_string())
+    }
+
+    fn record_raw_path(&mut self, count: usize) {
+        if count > 0 {
+            *self.raw_path_owners.entry(self.owner()).or_default() += count;
+        }
+    }
+
+    fn record_reclamation_symbol(&mut self, symbol: impl Into<String>) {
+        self.reclamation_symbols.push((self.owner(), symbol.into()));
+    }
+}
+
+impl<'ast> Visit<'ast> for RetainAllMemWalInventory {
+    fn visit_item_mod(&mut self, node: &'ast syn::ItemMod) {
+        if cfg_requires_test(&node.attrs) {
+            return;
+        }
+        visit::visit_item_mod(self, node);
+    }
+
+    fn visit_item_impl(&mut self, node: &'ast syn::ItemImpl) {
+        if cfg_requires_test(&node.attrs) {
+            return;
+        }
+        visit::visit_item_impl(self, node);
+    }
+
+    fn visit_item_const(&mut self, node: &'ast syn::ItemConst) {
+        if cfg_requires_test(&node.attrs) {
+            return;
+        }
+        visit::visit_item_const(self, node);
+    }
+
+    fn visit_item_static(&mut self, node: &'ast syn::ItemStatic) {
+        if cfg_requires_test(&node.attrs) {
+            return;
+        }
+        visit::visit_item_static(self, node);
+    }
+
+    fn visit_item_macro(&mut self, node: &'ast syn::ItemMacro) {
+        if cfg_requires_test(&node.attrs) {
+            return;
+        }
+        visit::visit_item_macro(self, node);
+    }
+
+    fn visit_item_fn(&mut self, node: &'ast syn::ItemFn) {
+        if cfg_requires_test(&node.attrs) {
+            return;
+        }
+        let function = node.sig.ident.to_string();
+        if is_mem_wal_reclamation_symbol(&function) {
+            self.record_reclamation_symbol(format!("function `{function}`"));
+        }
+        self.function_stack.push(function);
+        visit::visit_item_fn(self, node);
+        self.function_stack.pop();
+    }
+
+    fn visit_impl_item_fn(&mut self, node: &'ast syn::ImplItemFn) {
+        if cfg_requires_test(&node.attrs) {
+            return;
+        }
+        let function = node.sig.ident.to_string();
+        if is_mem_wal_reclamation_symbol(&function) {
+            self.record_reclamation_symbol(format!("method `{function}`"));
+        }
+        self.function_stack.push(function);
+        visit::visit_impl_item_fn(self, node);
+        self.function_stack.pop();
+    }
+
+    fn visit_ident(&mut self, node: &'ast syn::Ident) {
+        let identifier = node.to_string();
+        if mentions_mem_wal(&identifier) {
+            self.mem_wal_uses.push((self.owner(), identifier.clone()));
+        }
+        if is_mem_wal_reclamation_symbol(&identifier) {
+            self.record_reclamation_symbol(format!("identifier `{identifier}`"));
+        }
+        visit::visit_ident(self, node);
+    }
+
+    fn visit_path(&mut self, node: &'ast syn::Path) {
+        let path = node
+            .segments
+            .iter()
+            .map(|segment| segment.ident.to_string())
+            .collect::<Vec<_>>()
+            .join("::");
+        if is_mem_wal_reclamation_symbol(&path) {
+            self.record_reclamation_symbol(format!("path `{path}`"));
+        }
+        visit::visit_path(self, node);
+    }
+
+    fn visit_lit(&mut self, node: &'ast syn::Lit) {
+        if let syn::Lit::Str(value) = node {
+            let value = value.value();
+            self.record_raw_path(raw_mem_wal_marker_count(&value));
+            if mentions_mem_wal(&value) {
+                self.mem_wal_uses
+                    .push((self.owner(), "literal `_mem_wal`".to_string()));
+            }
+        }
+        visit::visit_lit(self, node);
+    }
+
+    fn visit_macro(&mut self, node: &'ast syn::Macro) {
+        let tokens = node.tokens.to_string();
+        self.record_raw_path(raw_mem_wal_marker_count(&tokens));
+        if mentions_mem_wal(&tokens) {
+            self.mem_wal_uses
+                .push((self.owner(), "macro token `_mem_wal`".to_string()));
+        }
+        visit::visit_macro(self, node);
+    }
+}
+
+fn retain_all_mem_wal_inventory(ast: &syn::File) -> RetainAllMemWalInventory {
+    let mut inventory = RetainAllMemWalInventory::default();
+    inventory.visit_file(ast);
+    inventory
+}
+
 fn protocol_scan_files(src: &Path) -> Vec<PathBuf> {
     walk_rust_files(src)
         .into_iter()
         .filter(|file| !is_protocol_scan_excluded(src, file))
         .collect()
+}
+
+fn retain_all_production_files(engine_src: &Path) -> Vec<(String, PathBuf)> {
+    let mut files = protocol_scan_files(engine_src)
+        .into_iter()
+        .map(|path| (relative_to_src(engine_src, &path), path))
+        .collect::<Vec<_>>();
+
+    // The cluster layer is the only sibling crate that owns a recursive graph
+    // root deletion. Scan it as part of the same retain-all boundary, while
+    // excluding its out-of-line `#[cfg(test)] mod tests` source (the attribute
+    // lives in lib.rs and is not visible when tests.rs is parsed alone).
+    let cluster_src = engine_src
+        .parent()
+        .and_then(Path::parent)
+        .expect("engine crate lives below the workspace crates directory")
+        .join("omnigraph-cluster/src");
+    for path in walk_rust_files(&cluster_src) {
+        if path.file_name().and_then(|name| name.to_str()) == Some("tests.rs") {
+            continue;
+        }
+        files.push((
+            format!("omnigraph-cluster/{}", relative_to_src(&cluster_src, &path)),
+            path,
+        ));
+    }
+    files.sort_by(|left, right| left.0.cmp(&right.0));
+    files
 }
 
 fn is_omnigraph_type(ty: &Type) -> bool {
@@ -1754,6 +2208,321 @@ fn graph_visible_write_chokepoints_are_registered() {
          allow-list is insufficient because a second caller in an approved file is \
          still a new writer:\n  {}",
         violations.join("\n  ")
+    );
+}
+
+/// RFC-026 B2a deliberately retains every raw MemWAL object.  Generic graph
+/// maintenance may block on stream lifecycle authority, and exact stream
+/// recovery may classify its own bound effects, but neither is permission to
+/// reinterpret, adopt, or delete `_mem_wal` storage.
+#[test]
+fn retain_all_mem_wal_has_no_production_reclamation_or_adoption_route() {
+    let src = engine_src_root();
+    let expected_raw_owners = RAW_MEM_WAL_PATH_OWNERS
+        .iter()
+        .map(|(file, function, count)| (((*file).to_string(), (*function).to_string()), *count))
+        .collect::<BTreeMap<_, _>>();
+    let tracked_delete_names = retain_all_tracked_delete_names(RETAIN_ALL_DELETE_CALLS);
+    let expected_delete_calls = RETAIN_ALL_DELETE_CALLS
+        .iter()
+        .map(|callsite| {
+            (
+                (
+                    callsite.0.to_string(),
+                    callsite.1.to_string(),
+                    callsite.2.to_string(),
+                    callsite.3.to_string(),
+                ),
+                callsite.4,
+            )
+        })
+        .collect::<BTreeMap<_, _>>();
+    assert_eq!(
+        expected_delete_calls.len(),
+        RETAIN_ALL_DELETE_CALLS.len(),
+        "retain-all delete callsite keys must be unique"
+    );
+    let mut observed_raw_owners = BTreeMap::new();
+    let mut observed_delete_calls = BTreeMap::new();
+    let mut reclamation_symbols = Vec::new();
+    let mut maintenance_mem_wal_uses = Vec::new();
+    let mut hidden_delete_routes = Vec::new();
+    let mut mem_wal_destructive_calls = Vec::new();
+
+    for (relative, file) in retain_all_production_files(&src) {
+        let contents = std::fs::read_to_string(&file)
+            .unwrap_or_else(|error| panic!("failed to read {}: {error}", file.display()));
+        let ast = parse_rust_source(&contents, &relative);
+        let inventory = retain_all_mem_wal_inventory(&ast);
+        let calls = call_inventory(&ast);
+
+        for (function, count) in inventory.raw_path_owners {
+            observed_raw_owners.insert((relative.clone(), function), count);
+        }
+        reclamation_symbols.extend(
+            inventory
+                .reclamation_symbols
+                .into_iter()
+                .map(|(function, symbol)| format!("{relative}::{function}: {symbol}")),
+        );
+        hidden_delete_routes.extend(
+            calls
+                .retain_all_hidden_route_hits
+                .iter()
+                .map(|hit| format!("{relative}: {hit}")),
+        );
+        for ((function, primitive, arguments), count) in &calls.call_shapes_by_function {
+            if tracked_delete_names.contains(primitive) {
+                *observed_delete_calls
+                    .entry((
+                        relative.clone(),
+                        function.clone(),
+                        primitive.clone(),
+                        arguments.clone(),
+                    ))
+                    .or_default() += *count;
+            }
+        }
+
+        if matches!(
+            relative.as_str(),
+            "table_store/mem_wal.rs" | "table_store/mem_wal/worker.rs"
+        ) {
+            for primitive in [
+                "cleanup",
+                "cleanup_old_versions",
+                "compact",
+                "delete",
+                "delete_prefix",
+                "garbage_collect",
+                "prune",
+                "purge",
+                "reclaim",
+                "remove_dir",
+                "remove_dir_all",
+                "remove_file",
+                "trim",
+                "vacuum",
+            ] {
+                if let Some(count) = calls.counts.get(primitive) {
+                    mem_wal_destructive_calls
+                        .push(format!("{relative}: `{primitive}` called {count} time(s)"));
+                }
+            }
+        }
+
+        if RETAIN_ALL_MAINTENANCE_FILES.contains(&relative.as_str()) {
+            maintenance_mem_wal_uses.extend(
+                inventory
+                    .mem_wal_uses
+                    .iter()
+                    .map(|(function, usage)| format!("{relative}::{function}: {usage}")),
+            );
+        }
+        if relative == "db/omnigraph.rs" {
+            maintenance_mem_wal_uses.extend(
+                inventory
+                    .mem_wal_uses
+                    .iter()
+                    .filter(|(function, _)| {
+                        RETAIN_ALL_OMNIGRAPH_METHODS.contains(&function.as_str())
+                    })
+                    .map(|(function, usage)| format!("{relative}::{function}: {usage}")),
+            );
+        }
+    }
+
+    assert_eq!(
+        observed_raw_owners, expected_raw_owners,
+        "raw `_mem_wal` path access must remain confined to the exact bounded read-only inventory and passive lifecycle validators"
+    );
+    assert!(
+        reclamation_symbols.is_empty(),
+        "retain-all forbids any production MemWAL reclamation/adoption/reclassification route:\n  {}",
+        reclamation_symbols.join("\n  ")
+    );
+    assert!(
+        maintenance_mem_wal_uses.is_empty(),
+        "cleanup/repair/schema maintenance must derive exclusions from manifest lifecycle authority and never inspect or reinterpret MemWAL objects:\n  {}",
+        maintenance_mem_wal_uses.join("\n  ")
+    );
+    assert!(
+        hidden_delete_routes.is_empty(),
+        "retain-all delete routes may not hide behind aliases or macro tokens:\n  {}",
+        hidden_delete_routes.join("\n  ")
+    );
+    assert_eq!(
+        observed_delete_calls, expected_delete_calls,
+        "retain-all raw-delete route inventory drifted. Runtime-built paths and ancestor-prefix deletes are unsafe even when no symbol spells `_mem_wal`; every sink and caller-provided-path gateway requires an owner/receiver/argument disposition"
+    );
+    assert!(
+        mem_wal_destructive_calls.is_empty(),
+        "the private MemWAL adapter may validate, acknowledge, and fold, but retain-all forbids destructive/reclamation primitives:\n  {}",
+        mem_wal_destructive_calls.join("\n  ")
+    );
+
+    let mem_wal_source = std::fs::read_to_string(src.join("table_store/mem_wal.rs"))
+        .expect("read MemWAL adapter source");
+    let mem_wal_ast = parse_rust_source(&mem_wal_source, "table_store/mem_wal.rs");
+    for helper in ["raw_mem_wal_inventory", "classify_raw_inventory"] {
+        let visibility = mem_wal_ast.items.iter().find_map(|item| match item {
+            Item::Fn(function) if function.sig.ident == helper => Some(&function.vis),
+            _ => None,
+        });
+        assert!(
+            matches!(visibility, Some(Visibility::Inherited)),
+            "raw MemWAL helper `{helper}` must remain module-private so maintenance/recovery cannot turn inventory into an adoption or deletion API"
+        );
+    }
+}
+
+#[test]
+fn retain_all_mem_wal_scanner_rejects_production_delete_but_skips_test_fixture() {
+    let fixture_only = parse_rust_source(
+        r#"
+        #[cfg(test)]
+        mod tests {
+            fn destructive_fixture(storage: &Storage) {
+                let mem_wal_root = "_mem_wal";
+                storage.delete_prefix(mem_wal_root);
+            }
+        }
+
+        #[cfg(test)]
+        const TEST_MEM_WAL_ROOT: &str = "_mem_wal";
+
+        #[cfg(test)]
+        static TEST_MEM_WAL_PATH: &str = "_mem_wal";
+
+        #[cfg(test)]
+        macro_rules! reclaim_mem_wal_fixture {
+            () => {
+                let mem_wal_root = "_mem_wal";
+                mem_wal::reclaim(mem_wal_root);
+            };
+        }
+        "#,
+        "retain-all cfg(test) self-test",
+    );
+    let fixture_inventory = retain_all_mem_wal_inventory(&fixture_only);
+    assert!(fixture_inventory.raw_path_owners.is_empty());
+    assert!(fixture_inventory.reclamation_symbols.is_empty());
+
+    let production = parse_rust_source(
+        r#"
+        fn destructive_production(storage: &Storage) {
+            let mem_wal_root = "_mem_wal";
+            storage.delete_prefix(mem_wal_root);
+            mem_wal::reclaim();
+        }
+        "#,
+        "retain-all production self-test",
+    );
+    let production_inventory = retain_all_mem_wal_inventory(&production);
+    assert_eq!(
+        production_inventory.raw_path_owners,
+        BTreeMap::from([("destructive_production".to_string(), 1)])
+    );
+    assert!(
+        production_inventory
+            .reclamation_symbols
+            .iter()
+            .any(|(_, symbol)| symbol.contains("mem_wal::reclaim"))
+    );
+}
+
+#[test]
+fn retain_all_delete_scanner_catches_opaque_delegated_and_hidden_routes() {
+    let ast = parse_rust_source(
+        r#"
+        use tokio::fs::remove_dir_all as erase_tree;
+
+        macro_rules! hidden_delete {
+            ($storage:expr, $path:expr) => { $storage.delete_prefix($path) };
+        }
+
+        fn direct_maintenance(storage: &Storage, table_root: &str) {
+            storage.delete_prefix(table_root);
+        }
+
+        fn remove_tree(storage: &Storage, path: &str) {
+            storage.delete_prefix(path);
+        }
+
+        fn delegated_maintenance(storage: &Storage, runtime_path: &str) {
+            remove_tree(storage, runtime_path);
+        }
+
+        #[cfg(test)]
+        mod fixtures {
+            fn teardown(storage: &Storage, root: &str) {
+                storage.delete_prefix(root);
+            }
+        }
+        "#,
+        "retain-all opaque destructive-route self-test",
+    );
+    let inventory = call_inventory(&ast);
+    const SYNTHETIC_GATEWAYS: &[RetainAllDeleteCallsite] = &[(
+        "synthetic.rs",
+        "remove_tree",
+        "delete_prefix",
+        "storage => path",
+        1,
+        RetainAllDeleteScope::GenericGateway,
+    )];
+    let tracked = retain_all_tracked_delete_names(SYNTHETIC_GATEWAYS);
+    let observed = inventory
+        .call_shapes_by_function
+        .iter()
+        .filter(|((_, primitive, _), _)| tracked.contains(primitive))
+        .map(|(key, count)| (key.clone(), *count))
+        .collect::<BTreeMap<_, _>>();
+
+    // Neither route needs to spell `_mem_wal`: a table/root prefix is already
+    // ancestor-dangerous. Classifying `remove_tree` as a generic gateway also
+    // causes the production filter to inventory its caller edge.
+    assert_eq!(
+        observed.get(&(
+            "direct_maintenance".to_string(),
+            "delete_prefix".to_string(),
+            "storage => table_root".to_string(),
+        )),
+        Some(&1)
+    );
+    assert_eq!(
+        observed.get(&(
+            "remove_tree".to_string(),
+            "delete_prefix".to_string(),
+            "storage => path".to_string(),
+        )),
+        Some(&1)
+    );
+    assert_eq!(
+        observed.get(&(
+            "delegated_maintenance".to_string(),
+            "remove_tree".to_string(),
+            "remove_tree => storage, runtime_path".to_string(),
+        )),
+        Some(&1)
+    );
+    assert!(
+        inventory
+            .call_shapes_by_function
+            .keys()
+            .all(|(function, _, _)| function != "teardown")
+    );
+    assert!(
+        inventory
+            .retain_all_hidden_route_hits
+            .iter()
+            .any(|hit| hit.contains("remove_dir_all") && hit.contains("erase_tree"))
+    );
+    assert!(
+        inventory
+            .retain_all_hidden_route_hits
+            .iter()
+            .any(|hit| hit.contains("delete_prefix"))
     );
 }
 

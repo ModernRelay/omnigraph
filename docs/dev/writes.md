@@ -543,7 +543,7 @@ Empty-table overwrite is
 represented as a valid zero-fragment Lance `Overwrite` transaction, not as
 truncate-then-append.
 
-### RFC-026 private stream foundation and B1 core
+### RFC-026 private stream foundation, B1 core, and B2a retain-all gate
 
 Internal schema v8 activates the deliberately bounded, data-bearing MemWAL
 format. Phase A's enrollment foundation and Phase B1's one-generation row/fold
@@ -652,11 +652,19 @@ subprocess measurement recorded a 284,934,144-byte isolated fold RSS delta
 the measured implementation shape; changing the admission or fold strategy
 requires remeasurement.
 
-The selected next profile is **unbounded retain-all**. It accepts that
+The private B2a gate now implements **unbounded retain-all**. It accepts that
 stock-RC.1 materialization uses randomized generation roots and that a crash or
 cold replay can leave more physical objects. OmniGraph adds no retained-byte,
 object-count, file-count, or history quota, no quota-enforcement attempt ledger,
-and no raw `_mem_wal` deletion. Current-object LIST evidence remains a useful
+and never deletes a canonical durable `_mem_wal` object. Lance may remove only
+its losing shard-manifest-CAS `.binpb.tmp.<uuid>` staging object; that object
+never became shard authority or retained history. Complete and partial
+unreferenced generation output remains non-authoritative. Parent shard discovery
+may list its common prefix, but admission, retry, and cold reopen never descend
+into, read, mutate, adopt, or delete the subtree. A shared strict classifier and
+local/configured-RustFS provider-failure cells pin those rules and the typed
+effect-free `Lance`, post-invocation `AckUnknown`, and post-cut
+`RecoveryRequired` outcomes. Current-object LIST evidence remains a useful
 retention/path-shape check but does not claim coverage of incomplete multipart
 uploads, provider versions/delete markers, local staging, or billed bytes.
 Provider exhaustion is surfaced as a storage failure and can halt admission,
@@ -666,8 +674,13 @@ Arrow admission envelope, deadlines, retry counts, and ambiguity outcomes
 remain bounded.
 RC.1's missing cross-open materialization receipt and complete physical-output
 envelope are therefore not blockers for this profile. They remain relevant to
-the future B2b managed-reclamation design. This decision activates no format or
-product state.
+the future B2b managed-reclamation design. The checked-in 1/8/32/128 local and
+configured-RustFS instrument separates warm acknowledgement, cold replay, fold,
+visibility, table, graph-manifest, adapter, advisory object, and whole-process
+RSS terms. Warm acknowledgement retains a flat operation shape while serialized
+authority and combined retained-history work grow; the observations are not a
+quota, latency SLO, provider bill, or isolated WAL slope. B2a activates no new
+format or product state.
 
 RFC-026's common B2 inventory specifies—but does not implement—the next product
 contract.
@@ -840,8 +853,8 @@ identity, incarnation, path, and Lance version.
 > reader of `recovery.rs`, `failpoints.rs`, or this document only
 > encounters phase letters in the per-writer context.
 
-RFC-026's named “Phase A foundation” and “Phase B1 private core” are roadmap
-slices, not steps in that four-phase convention. Recovery-v10
+RFC-026's named “Phase A foundation”, “Phase B1 private core”, and “B2a
+retain-all gate” are RFC slice names, not steps in that four-phase convention. Recovery-v10
 `StreamEnrollment` uses a dedicated exact initializer classifier: no effect
 retires, index-only provisions the fixed empty shard, and
 index-plus-empty-shard publishes pointer + lifecycle. Recovery-v11 `StreamFold`
