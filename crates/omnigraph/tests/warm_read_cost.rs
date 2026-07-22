@@ -293,9 +293,10 @@ async fn cold_other_branch_resolution_uses_one_coherent_manifest_open() {
 
 /// Native branch controls must take one post-gate operation-local coordinator
 /// capture, not refresh the handle-local coordinator before and after table
-/// gates. Delete additionally opens the native main ref once for its exact
-/// BranchIdentifier-fenced classifier, but performs no second manifest row
-/// scan.
+/// gates. Delete additionally takes one fresh manifest-only dependency
+/// snapshot for each surviving branch and opens the native main ref once for
+/// its exact BranchIdentifier-fenced classifier. The fixture below has one
+/// survivor (`main`).
 #[tokio::test]
 async fn native_branch_controls_use_one_post_gate_manifest_capture() {
     cost_harness(async {
@@ -315,9 +316,9 @@ async fn native_branch_controls_use_one_post_gate_manifest_capture() {
         deleted.unwrap();
         assert_eq!(
             (delete_io.internal_open_count, delete_io.manifest_scan_count),
-            (2, 1),
-            "branch delete needs one coherent target capture plus one native-ref opener, \
-             without a second row scan"
+            (3, 2),
+            "branch delete needs one coherent target capture, one fresh manifest-only \
+             snapshot for surviving main, and one native-ref opener"
         );
 
         db.branch_create("feature").await.unwrap();
