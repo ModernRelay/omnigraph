@@ -182,7 +182,7 @@ epoch-1 enrollment on main; no production caller can put or acknowledge a row,
 fold a generation, or operate drain/resume.
 
 On 2026-07-19, Phase B1 added the private data-bearing core and moved the
-current format to internal schema v8, stream-config v2, and recovery-v11
+then-current format to internal schema v8, stream-config v2, and recovery-v11
 `StreamFold`. One feature-gated, doc-hidden engine seam can admit one exact
 already-normalized physical batch, acknowledge only after that put's durability
 watcher succeeds, prevent rollover, and retire the writer before any
@@ -194,6 +194,15 @@ and makes the achieved table pointer, lifecycle witness, and lineage
 graph-visible only at one `__manifest` CAS. This is private implementation and
 evidence machinery, not public activation: RFC-026 remains Draft, with no
 schema/SDK/HTTP/CLI/OpenAPI caller or operator drain/resume surface.
+
+On 2026-07-22, the private common-B2 slice moved the current format to internal
+schema v9, stream-config v3, lifecycle state v2, and recovery-v12. It adds the
+grammar-impossible `__omnigraph_stream_v1$` trusted base-row field and one
+manifest-selected `_stream_tokens.lance` participant, with compare-and-chain
+attribution and exact base-plus-token recovery. V8 crosses this boundary only
+through export/init/load; the pinned genuine-v8 cell also proves that a v8 user
+property named `__omnigraph_stream_v1` remains ordinary data. This still does
+not activate a production SDK/HTTP/CLI streaming surface.
 
 The Phase-B1 source audit also narrows the RC.1 row contract. `put_no_wait`
 returns a `WriteResult` plus an optional `BatchDurableWatcher`; the watcher's
@@ -651,7 +660,7 @@ Behavior-affecting findings in this audit:
   This result blocks the in-manifest BTREE access shape, not checkpoint rows as
   logical authority or Lance tags as physical pins. RFC-025 is
   research-blocked and no retention format ships. Schema v6 was production
-  truth when the gate ran; current schema v8 likewise carries no retention
+  truth when the gate ran; current schema v9 likewise carries no retention
   state. A successor needs a history-flat current-authority lookup
   or revised evidence-backed operational contract without adding a second
   authority dataset.

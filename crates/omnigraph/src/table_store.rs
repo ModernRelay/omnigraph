@@ -4568,6 +4568,46 @@ fn staged_keyed_merge_result(
     ))
 }
 
+/// Validate and package one protocol-internal exact-`id` upsert staged through
+/// Lance's filter-bearing MergeInsert path.
+///
+/// RFC-026's `_stream_tokens.lance` adapter shares the same substrate proof as
+/// graph keyed writes but remains a separate graph-global participant. Keeping
+/// this narrow bridge here lets that adapter preserve Lance's affected-row
+/// metadata without exposing `StagedWrite` internals or inventing another
+/// commit path.
+pub(crate) fn staged_exact_id_upsert_result(
+    dataset: &Dataset,
+    uncommitted: UncommittedMergeInsert,
+    expected_rows: u64,
+    context: &'static str,
+) -> Result<StagedWrite> {
+    let id_field_id = exact_id_primary_key_field_id(dataset, context)?;
+    validate_exact_id_filter(&uncommitted, id_field_id, context)?;
+    let stats = &uncommitted.stats;
+    let affected_rows = stats
+        .num_inserted_rows
+        .checked_add(stats.num_updated_rows)
+        .ok_or_else(|| {
+            OmniError::manifest_internal(format!("{context}: affected-row count overflow"))
+        })?;
+    if affected_rows != expected_rows
+        || stats.num_deleted_rows != 0
+        || stats.num_skipped_duplicates != 0
+        || stats.num_attempts != 1
+    {
+        return Err(OmniError::manifest_internal(format!(
+            "{context}: merge stats were inserted={}, updated={}, deleted={}, skipped={}, attempts={}; expected inserted+updated={expected_rows}, deleted=0, skipped=0, attempts=1",
+            stats.num_inserted_rows,
+            stats.num_updated_rows,
+            stats.num_deleted_rows,
+            stats.num_skipped_duplicates,
+            stats.num_attempts,
+        )));
+    }
+    staged_keyed_merge_result(uncommitted, context)
+}
+
 /// Precondition guard for `stage_merge_insert`.
 /// Both opt into `SourceDedupeBehavior::FirstSeen` to suppress the Lance
 /// `processed_row_ids` bug (MR-957). FirstSeen would *also* silently

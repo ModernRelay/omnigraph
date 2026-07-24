@@ -1040,7 +1040,7 @@ fn test_parse_error_diagnostic_has_span() {
 }
 
 #[test]
-fn test_reject_lance_virtual_system_column_property_names() {
+fn test_reject_storage_system_column_property_names() {
     const RESERVED: [&str; 5] = [
         "_rowid",
         "_rowaddr",
@@ -1063,6 +1063,13 @@ fn test_reject_lance_virtual_system_column_property_names() {
         }
     }
 
-    parse_schema("node N { _row_id: String _rowid2: String _ROWID: String }")
-        .expect("only the five exact, case-sensitive Lance names are reserved");
+    parse_schema(
+        "node N { _row_id: String _rowid2: String _ROWID: String __omnigraph_stream_v1: String __omnigraph_stream_v2: String }",
+    )
+    .expect("grammar-valid historical names remain ordinary user properties");
+
+    assert!(
+        parse_schema("node N { __omnigraph_stream_v1$: String }").is_err(),
+        "the protocol-private v9 field must remain outside the .pg identifier grammar"
+    );
 }

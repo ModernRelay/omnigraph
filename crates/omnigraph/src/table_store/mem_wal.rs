@@ -1,12 +1,14 @@
-//! Narrow RFC-026 adapters for bounded MemWAL enrollment and private Phase B1.
+//! Narrow RFC-026 adapters for bounded MemWAL enrollment and the private
+//! B1/common-B2 core.
 //!
 //! The parent module captures the exact main-branch witness, initializes the
 //! singleton unsharded MemWAL index, provisions one pre-minted empty shard, and
 //! classifies those enrollment effects after a lost result. The private
 //! [`worker`] submodule owns B1's one-generation admission, watcher,
 //! post-durability successor-epoch check, replay, seal/drain, and quiesced
-//! retirement mechanics. Graph authority, recovery-v11 fold ownership, and the
-//! sole `__manifest` visibility publication remain in
+//! retirement mechanics. Current schema v9 adds common-B2 token/attribution;
+//! graph authority, recovery-v12 base-plus-token fold ownership, and the sole
+//! `__manifest` visibility publication remain in
 //! `db::omnigraph::stream_ingest`; no production streaming API is exposed.
 //!
 //! The caller must hold RFC-026's exclusive base-HEAD and cleanup/GC gates from
@@ -136,7 +138,7 @@ impl MemWalEnrollmentPlan {
     /// bounded profile.  Enrollment and shard identities are deliberately not
     /// included: they are carried separately in the physical binding.
     pub(crate) fn stream_config_hash(&self) -> String {
-        stream_config_v2_hash()
+        stream_config_v3_hash()
     }
 
     fn expected_writer_defaults(&self) -> BTreeMap<String, String> {
@@ -1051,7 +1053,7 @@ mod tests {
         let plan = plan();
         assert_eq!(
             plan.stream_config_hash(),
-            "sha256:1885f9b7d28ffc12266e75e3d6d0448c3289dee152674aadb8cca2be865d8e9d"
+            "sha256:5cc5116580e888cbf1b39e8f6be9c514a9a4b8eb6b8da804d05e40678d24f51a"
         );
         let mut details = MemWalIndexDetails {
             num_shards: 1,

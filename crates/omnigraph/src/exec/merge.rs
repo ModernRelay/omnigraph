@@ -3131,6 +3131,7 @@ impl Omnigraph {
             _stream_admission,
             _schema_guard,
             _branch_guards,
+            _stream_token_guard,
             source_txn,
             target_txn,
             source_commits,
@@ -3144,6 +3145,7 @@ impl Omnigraph {
             let branches = write_queue
                 .acquire_branches(&[source_branch.clone(), target_branch.clone()])
                 .await;
+            let token = write_queue.acquire_stream_token().await;
 
             self.ensure_no_pending_recovery_sidecars_under_gates(
                 &relevant_branches,
@@ -3168,6 +3170,7 @@ impl Omnigraph {
                     admission,
                     schema,
                     branches,
+                    token,
                     source_txn,
                     target_txn,
                     source_commits,

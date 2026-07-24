@@ -3,6 +3,8 @@
 | Name | Value | Area |
 |---|---|---|
 | `MANIFEST_DIR` | `__manifest` | manifest layout |
+| Stream-token authority dataset | `_stream_tokens.lance` | RFC-026 graph-global current-token participant; only the exact witness selected by `__manifest` is authoritative |
+| Trusted stream metadata column | `__omnigraph_stream_v1$` | private nullable v9 base-row attribution; trailing `$` is outside the `.pg` identifier grammar and public reflection/export omit it |
 | Commit graph dirs (retired) | `_graph_commits.lance` / `_graph_commit_actors.lance` | retired in Phase B; lineage lives in `__manifest` (`graph_commit` / `graph_head` rows) since RFC-013 Phase 7. A graph this binary creates has neither. |
 | Recovery audit dir | `_graph_commit_recoveries.lance` | internal exact record of completed crash-recovery actions; no public CLI query yet |
 | BranchMerge logical data-transaction ceiling | `MAX_BRANCH_MERGE_DATA_TRANSACTIONS = 1024` | maximum strict-insert/upsert/delete transactions one table may arm in a `protocol_v4` chain; a larger plan fails before sidecar arm |
@@ -10,12 +12,15 @@
 | Run branch prefix (legacy, removed) | `__run__` | pre-v0.4.0 Run state machine; no longer a reserved name. A graph still carrying `__run__*` branches is sub-v4 and refused on open (rebuild via export/import). |
 | Schema apply lock | `__schema_apply_lock__` | schema apply |
 | Manifest publisher retry budget | `PUBLISHER_RETRY_BUDGET = 5` | manifest publish |
-| Internal manifest schema version | `INTERNAL_MANIFEST_SCHEMA_VERSION = 8` | strict RFC-026 B1 strand; preserves v5 identity, v6 keyed fencing, and v7 stream-lifecycle authority while activating stream-config v2 plus recovery-v11 for the private data-bearing core. V7 and older graphs require export/init/load rebuild |
+| Internal manifest schema version | `INTERNAL_MANIFEST_SCHEMA_VERSION = 9` | strict RFC-026 common-B2 strand; preserves v5 identity, v6 keyed fencing, v7 stream-lifecycle authority, and v8's bounded B1 worker while activating stream-config v3, lifecycle state v2, manifest-selected token authority, trusted attribution, and recovery-v12. V8 and older graphs require export/init/load rebuild |
 | Keyed-write row ceiling | `KEYED_WRITE_MAX_ROWS = 8192` | one Mutation/Load keyed table or one BranchMerge chunk; inclusive |
 | Keyed-write Arrow-memory ceiling | `KEYED_WRITE_MAX_BYTES = 33,554,432` (32 MiB) | accumulated Mutation/Load keyed input (including pending state plus a streamed mutation-update match set) or one BranchMerge row/upsert/delete-filter chunk; a single larger row is refused before sidecar arm. Stored update Blobs and keyed external-URI ranges/object sizes are charged before payload reads. The complete retained BranchMerge delete plan and the operation-wide projected scalar validation delta are separately capped at the same value; ordered merge and validation scans explicitly apply it as Lance's per-batch decoded-byte ceiling. Overwrite retains external-reference semantics |
 | Private RFC-026 B1 generation ceiling | `8,192 rows`, `8,192 batches`, `33,554,432` Arrow bytes | one no-roll MemWAL generation; the private seam refuses the next put before exceeding any bound |
 | Private RFC-026 B1 resident-writer ceiling | `1` per graph root and table | evidence-qualified process-local worker admission; not a public throughput contract. B2 must requalify any higher multi-resident limit with an RSS cell |
 | Private RFC-026 B1 aggregate Arrow reservation | `33,554,432` bytes (32 MiB) per graph root | cheap raw caller row/byte bounds reject obviously over-cap input before recovery I/O; raw-fit input then receives exact post-tombstone validation at that same pre-recovery boundary. After any recovery/authority prelude, the exact charge is recomputed and reserved against the aggregate before any same-key queue wait, shared admission, detached ownership, or cold claim; the permit transfers into the resident generation and remains charged through fold publication. Distinct from whole-process RSS |
+| Private RFC-026 B2 canonical-payload ceiling | `B2_MAX_CANONICAL_PAYLOAD_BYTES = 67,108,864` (64 MiB) per normalized row | bounded deterministic token-digest input; not a public request-body limit |
+| Private RFC-026 B2 token-projection ceiling | `B2_MAX_TOKEN_PROJECTION_ARROW_BYTES = 33,554,432` (32 MiB) | exact winning token projection and cumulative exact-authority lookup retention |
+| Private RFC-026 B2 recovery-JSON ceiling | `B2_MAX_TOKEN_RECOVERY_JSON_BYTES = 33,554,432` (32 MiB) | bounded token rows embedded in one recovery-v12 sidecar |
 | Maintenance concurrency | `OMNIGRAPH_MAINTENANCE_CONCURRENCY=8` | optimize/cleanup |
 | Graph index cache size | `8` (LRU) | runtime cache |
 | Expand indexed-path frontier ceiling | `OMNIGRAPH_EXPAND_INDEXED_MAX_FRONTIER=1024` | traversal |

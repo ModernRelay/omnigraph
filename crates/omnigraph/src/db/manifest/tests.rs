@@ -1,7 +1,7 @@
 use std::collections::{BTreeMap, HashMap};
 use std::sync::Arc;
 
-use arrow_array::{Int32Array, RecordBatch, RecordBatchIterator, StringArray, UInt64Array};
+use arrow_array::{Array, Int32Array, RecordBatch, RecordBatchIterator, StringArray, UInt64Array};
 use arrow_schema::{DataType, Field, Schema};
 use async_trait::async_trait;
 use futures::TryStreamExt;
@@ -21,6 +21,7 @@ use super::publisher::{
     PublishPrecondition,
 };
 use super::state::read_publish_scan;
+use super::stream_token::{STREAM_FOLD_ACTOR, StreamFoldAttributionSummary};
 use super::*;
 use omnigraph_compiler::schema::parser::parse_schema;
 use omnigraph_compiler::{
@@ -120,6 +121,41 @@ fn table_identity_rejects_zero_and_drives_paths_and_object_ids() {
     );
 }
 
+#[test]
+fn manifest_graph_table_schema_adds_exact_hidden_metadata_and_rejects_lookalikes() {
+    let catalog = build_test_catalog();
+    let input = &catalog.node_types["Person"].arrow_schema;
+    assert!(
+        input
+            .field_with_name(crate::db::STREAM_METADATA_COLUMN)
+            .is_err()
+    );
+
+    let physical = super::graph::keyed_graph_table_schema(input).unwrap();
+    let hidden = physical
+        .field_with_name(crate::db::STREAM_METADATA_COLUMN)
+        .unwrap();
+    assert_eq!(
+        hidden,
+        &super::stream_token::trusted_stream_metadata_field()
+    );
+    assert!(hidden.is_nullable());
+
+    let mut supplied = input.fields().iter().cloned().collect::<Vec<_>>();
+    supplied.push(Arc::new(Field::new(
+        crate::db::STREAM_METADATA_COLUMN,
+        DataType::Utf8,
+        true,
+    )));
+    let supplied = Arc::new(Schema::new_with_metadata(supplied, input.metadata.clone()));
+    let error = super::graph::keyed_graph_table_schema(&supplied).unwrap_err();
+    assert!(
+        error
+            .to_string()
+            .contains("non-canonical reserved physical field")
+    );
+}
+
 #[tokio::test]
 async fn historical_alias_binding_keeps_same_name_node_and_edge_identities_distinct() {
     let dir = tempfile::tempdir().unwrap();
@@ -159,6 +195,105 @@ async fn test_init_creates_manifest_and_sub_tables() {
         assert_eq!(entry.row_count, 0);
         assert!(entry.table_branch.is_none());
     }
+}
+
+#[tokio::test]
+async fn init_materializes_one_exact_manifest_selected_stream_token_dataset() {
+    let dir = tempfile::tempdir().unwrap();
+    let uri = dir.path().to_str().unwrap();
+    let catalog = build_test_catalog();
+
+    let mc = ManifestCoordinator::init(uri, &catalog).await.unwrap();
+    let snapshot = mc.snapshot();
+    let authority = snapshot.stream_token_authority();
+    assert_eq!(authority.location, token_store::STREAM_TOKEN_DATASET_PATH);
+    assert_eq!(
+        authority.schema_version,
+        token_store::STREAM_TOKEN_AUTHORITY_SCHEMA_VERSION
+    );
+    assert_eq!(
+        authority.schema_hash,
+        token_store::stream_token_schema_hash()
+    );
+    assert_eq!(
+        authority.current_head_witness.branch_identifier,
+        BranchIdentifier::main()
+    );
+
+    let token_dataset = snapshot.open_stream_token_authority().await.unwrap();
+    assert_eq!(
+        token_dataset.version().version,
+        authority.current_head_witness.table_version
+    );
+    assert_eq!(token_dataset.count_rows(None).await.unwrap(), 0);
+    let actual_schema: Schema = token_dataset.schema().into();
+    assert_eq!(&actual_schema, token_store::stream_token_schema().as_ref());
+    assert_eq!(
+        actual_schema
+            .field_with_name("id")
+            .unwrap()
+            .metadata()
+            .get(lance::datatypes::LANCE_UNENFORCED_PRIMARY_KEY)
+            .map(String::as_str),
+        Some("true")
+    );
+
+    let manifest = open_manifest_dataset(uri, None).await.unwrap();
+    let batches: Vec<RecordBatch> = manifest
+        .scan()
+        .try_into_stream()
+        .await
+        .unwrap()
+        .try_collect()
+        .await
+        .unwrap();
+    let mut authority_rows = 0;
+    for batch in batches {
+        let object_types = super::state::string_column(&batch, "object_type").unwrap();
+        let stable_ids = batch
+            .column_by_name("stable_table_id")
+            .unwrap()
+            .as_any()
+            .downcast_ref::<UInt64Array>()
+            .unwrap();
+        let incarnation_ids = batch
+            .column_by_name("table_incarnation_id")
+            .unwrap()
+            .as_any()
+            .downcast_ref::<UInt64Array>()
+            .unwrap();
+        for row in 0..batch.num_rows() {
+            if object_types.value(row) == OBJECT_TYPE_STREAM_TOKEN_AUTHORITY {
+                authority_rows += 1;
+                assert!(stable_ids.is_null(row));
+                assert!(incarnation_ids.is_null(row));
+            }
+        }
+    }
+    assert_eq!(authority_rows, 1);
+}
+
+#[test]
+fn stream_token_internal_primary_key_is_canonical_and_collision_free() {
+    let identity = TableIdentity::new(7, 9).unwrap();
+    assert_eq!(
+        token_store::stream_token_row_id(identity, "a:b").unwrap(),
+        "stream-token-v1:0000000000000007:0000000000000009:a:b"
+    );
+    assert_ne!(
+        token_store::stream_token_row_id(identity, "a:b").unwrap(),
+        token_store::stream_token_row_id(identity, "a3a62").unwrap()
+    );
+    assert!(
+        token_store::stream_token_row_id(
+            TableIdentity {
+                stable_table_id: 0,
+                table_incarnation_id: 1,
+            },
+            "id"
+        )
+        .is_err()
+    );
 }
 
 #[tokio::test]
@@ -1249,7 +1384,8 @@ impl ManifestBatchPublisher for RecordingPublisher {
                 ManifestChange::RegisterTable(_)
                 | ManifestChange::RenameTable(_)
                 | ManifestChange::Tombstone(_)
-                | ManifestChange::SetStreamLifecycle { .. } => None,
+                | ManifestChange::SetStreamLifecycle { .. }
+                | ManifestChange::SetStreamTokenAuthority { .. } => None,
             })
             .collect();
         self.requests.lock().await.extend_from_slice(&requests);
@@ -1433,34 +1569,147 @@ async fn append_person_and_make_update(
     }
 }
 
+#[tokio::test]
+async fn table_and_stream_token_pointers_publish_in_one_manifest_cas() {
+    let dir = tempfile::tempdir().unwrap();
+    let uri = dir.path().to_str().unwrap();
+    let catalog = build_test_catalog();
+    let mut mc = ManifestCoordinator::init(uri, &catalog).await.unwrap();
+    let before = mc.snapshot();
+    let person = before.entry("node:Person").unwrap().clone();
+    let expected_token = before.stream_token_authority().clone();
+
+    // Move only the physical token HEAD. Until the manifest row changes, the
+    // old snapshot must continue opening the exact selected version.
+    let mut token_dataset = before.open_stream_token_authority().await.unwrap();
+    token_dataset
+        .update_config([("omnigraph.test.token_effect", Some("1"))])
+        .await
+        .unwrap();
+    let next_token = token_store::stream_token_authority_entry_for_dataset(&token_dataset)
+        .await
+        .unwrap();
+    assert!(
+        next_token.current_head_witness.table_version
+            > expected_token.current_head_witness.table_version
+    );
+    assert_eq!(
+        before
+            .open_stream_token_authority()
+            .await
+            .unwrap()
+            .version()
+            .version,
+        expected_token.current_head_witness.table_version
+    );
+
+    let table_update = append_person_and_make_update(uri, &person, "TokenAtomic").await;
+    let manifest_before = mc.version();
+    mc.commit_changes(&[
+        ManifestChange::Update(table_update.clone()),
+        ManifestChange::SetStreamTokenAuthority {
+            expected: expected_token.clone(),
+            next: next_token.clone(),
+        },
+    ])
+    .await
+    .unwrap();
+
+    assert_eq!(mc.version(), manifest_before + 1);
+    let after = mc.snapshot();
+    assert_eq!(
+        after.entry("node:Person").unwrap().table_version,
+        table_update.table_version
+    );
+    assert_eq!(after.stream_token_authority(), &next_token);
+    assert_eq!(
+        after
+            .open_stream_token_authority()
+            .await
+            .unwrap()
+            .version()
+            .version,
+        next_token.current_head_witness.table_version
+    );
+
+    let stale = mc
+        .commit_changes(&[ManifestChange::SetStreamTokenAuthority {
+            expected: expected_token,
+            next: next_token.clone(),
+        }])
+        .await
+        .unwrap_err();
+    assert!(matches!(
+        stale,
+        OmniError::Manifest(ManifestError {
+            details: Some(ManifestConflictDetails::ReadSetChanged { .. }),
+            ..
+        })
+    ));
+
+    let reopened = ManifestCoordinator::open(uri).await.unwrap().snapshot();
+    assert_eq!(reopened.stream_token_authority(), &next_token);
+    assert_eq!(
+        reopened.entry("node:Person").unwrap().table_version,
+        table_update.table_version
+    );
+}
+
 fn stream_lifecycle_for_person(
     person_entry: &SubTableEntry,
     table_version: u64,
     lifecycle: StreamLifecycle,
 ) -> StreamLifecycleEntry {
     let shard_id = "22222222-2222-4222-8222-222222222222".to_string();
-    StreamLifecycleEntry {
-        identity: person_entry.identity,
-        diagnostic_table_key: person_entry.table_key.clone(),
-        lifecycle,
-        binding: StreamPhysicalBinding {
-            stable_table_id: person_entry.identity.stable_table_id,
-            table_incarnation_id: person_entry.identity.table_incarnation_id,
-            table_location: person_entry.table_path.clone(),
-            table_branch: None,
-            enrollment_id: "11111111-1111-4111-8111-111111111111".to_string(),
-            shard_ids: vec![shard_id.clone()],
-            stream_config_version: STREAM_CONFIG_VERSION,
-            stream_config_hash: format!("sha256:{}", "a".repeat(64)),
-        },
-        current_head_witness: CurrentHeadWitness {
-            branch_identifier: BranchIdentifier::main(),
-            table_version,
-            transaction_uuid: "33333333-3333-4333-8333-333333333333".to_string(),
-            manifest_e_tag: None,
-        },
-        epoch_floor_by_shard: BTreeMap::from([(shard_id, 1)]),
+    let binding = StreamPhysicalBinding {
+        stable_table_id: person_entry.identity.stable_table_id,
+        table_incarnation_id: person_entry.identity.table_incarnation_id,
+        table_location: person_entry.table_path.clone(),
+        table_branch: None,
+        enrollment_id: "11111111-1111-4111-8111-111111111111".to_string(),
+        shard_ids: vec![shard_id.clone()],
+        stream_config_version: STREAM_CONFIG_VERSION,
+        stream_config_hash: format!("sha256:{}", "a".repeat(64)),
+    };
+    let head = CurrentHeadWitness {
+        branch_identifier: BranchIdentifier::main(),
+        table_version,
+        transaction_uuid: "33333333-3333-4333-8333-333333333333".to_string(),
+        manifest_e_tag: None,
+    };
+    let mut entry = StreamLifecycleEntry::new_open_enrollment(
+        person_entry.identity,
+        person_entry.table_key.clone(),
+        binding.clone(),
+        head.clone(),
+        BTreeMap::from([(shard_id.clone(), 1)]),
+        stream::EnrollmentReceipt::new(
+            "44444444-4444-4444-8444-444444444444".to_string(),
+            format!("sha256:{}", "b".repeat(64)),
+            "55555555-5555-4555-8555-555555555555".to_string(),
+            binding.clone(),
+        )
+        .unwrap(),
+    )
+    .unwrap();
+    if lifecycle == StreamLifecycle::Draining {
+        entry.lifecycle = StreamLifecycle::Draining;
+        entry.lifecycle_revision = 2;
+        entry.drain = Some(stream::DrainDescriptor {
+            drain_id: "66666666-6666-4666-8666-666666666666".to_string(),
+            operation_expected_revision: 1,
+            operation_request_digest: format!("sha256:{}", "c".repeat(64)),
+            goal: stream::DrainGoal::OpenAfterFold,
+            initiating_actor: "actor:test".to_string(),
+            initiated_at: 1,
+            expected_binding: binding,
+            expected_current_head_witness: head,
+            target_epoch_floor_by_shard: BTreeMap::from([(shard_id, 1)]),
+            guarded_operation: None,
+        });
     }
+    entry.validate().unwrap();
+    entry
 }
 
 #[tokio::test]
@@ -1595,8 +1844,7 @@ async fn stream_lifecycle_and_table_pointer_publish_in_one_manifest_cas() {
         }) if lifecycle == "DRAINING" && operation == "schema apply"
     ));
 
-    let mut sealed = draining;
-    sealed.lifecycle = StreamLifecycle::Sealed;
+    let sealed = super::stream::test_sealed_lifecycle_from(&draining).unwrap();
     let expected_draining = reopened
         .snapshot()
         .stream_lifecycle(person_entry.identity)
@@ -1918,7 +2166,7 @@ async fn test_init_stamps_internal_schema_version() {
     ManifestCoordinator::init(uri, &catalog).await.unwrap();
 
     let ds = open_manifest_dataset(uri, None).await.unwrap();
-    assert_eq!(super::migrations::INTERNAL_MANIFEST_SCHEMA_VERSION, 8);
+    assert_eq!(super::migrations::INTERNAL_MANIFEST_SCHEMA_VERSION, 9);
     assert_eq!(
         super::migrations::read_stamp(&ds),
         super::migrations::INTERNAL_MANIFEST_SCHEMA_VERSION,
@@ -2199,6 +2447,109 @@ fn lineage_now_micros() -> i64 {
         .as_micros() as i64
 }
 
+#[tokio::test]
+async fn graph_commit_metadata_round_trips_optional_stream_fold_attribution() {
+    let dir = tempfile::tempdir().unwrap();
+    let uri = dir.path().to_str().unwrap();
+    let catalog = build_test_catalog();
+    let _coordinator = ManifestCoordinator::init(uri, &catalog).await.unwrap();
+    let publisher = GraphNamespacePublisher::new(uri, None);
+    let empty = HashMap::new();
+
+    let ordinary = LineageIntent {
+        graph_commit_id: ulid::Ulid::new().to_string(),
+        branch: None,
+        actor_id: Some("act-alice".to_string()),
+        merged_parent_commit_id: None,
+        created_at: lineage_now_micros(),
+        stream_fold_attribution: None,
+    };
+    publisher
+        .publish(&[], &empty, Some(&ordinary))
+        .await
+        .unwrap();
+
+    let summary = StreamFoldAttributionSummary {
+        visible_contributor_count: 2,
+        visible_write_count: 3,
+        winning_attribution_digest: format!("sha256:{}", "ab".repeat(32)),
+    };
+    let historical_fold = LineageIntent {
+        graph_commit_id: ulid::Ulid::new().to_string(),
+        branch: None,
+        actor_id: Some(STREAM_FOLD_ACTOR.to_string()),
+        merged_parent_commit_id: None,
+        created_at: lineage_now_micros(),
+        stream_fold_attribution: None,
+    };
+    publisher
+        .publish(&[], &empty, Some(&historical_fold))
+        .await
+        .expect("pre-commitment v11 folds with the fixed actor remain readable");
+
+    let wrong_actor = LineageIntent {
+        graph_commit_id: ulid::Ulid::new().to_string(),
+        branch: None,
+        actor_id: Some("act-not-system".to_string()),
+        merged_parent_commit_id: None,
+        created_at: lineage_now_micros(),
+        stream_fold_attribution: Some(summary.clone()),
+    };
+    let error = publisher
+        .publish(&[], &empty, Some(&wrong_actor))
+        .await
+        .expect_err("ordinary actors must not publish a stream-fold commitment");
+    assert!(error.to_string().contains(STREAM_FOLD_ACTOR));
+
+    let fold = LineageIntent {
+        graph_commit_id: ulid::Ulid::new().to_string(),
+        branch: None,
+        actor_id: Some(STREAM_FOLD_ACTOR.to_string()),
+        merged_parent_commit_id: None,
+        created_at: lineage_now_micros(),
+        stream_fold_attribution: Some(summary.clone()),
+    };
+    publisher.publish(&[], &empty, Some(&fold)).await.unwrap();
+
+    let dataset = open_manifest_dataset(uri, None).await.unwrap();
+    let (rows, _) = read_graph_lineage(&dataset).await.unwrap();
+    assert_eq!(
+        rows.iter()
+            .find(|row| row.graph_commit_id == ordinary.graph_commit_id)
+            .unwrap()
+            .stream_fold_attribution
+            .as_ref(),
+        None
+    );
+    assert_eq!(
+        rows.iter()
+            .find(|row| row.graph_commit_id == historical_fold.graph_commit_id)
+            .unwrap()
+            .stream_fold_attribution
+            .as_ref(),
+        None
+    );
+    assert_eq!(
+        rows.iter()
+            .find(|row| row.graph_commit_id == fold.graph_commit_id)
+            .unwrap()
+            .stream_fold_attribution
+            .as_ref(),
+        Some(&summary)
+    );
+    assert!(
+        rows.iter()
+            .filter(|row| row.graph_commit_id != fold.graph_commit_id)
+            .all(|row| row.stream_fold_attribution.is_none()),
+        "genesis and every ordinary commit must keep attribution logically null"
+    );
+    assert!(
+        rows.iter()
+            .all(|row| row.graph_commit_id != wrong_actor.graph_commit_id),
+        "rejected attribution intents must not leave immutable graph_commit rows"
+    );
+}
+
 /// Race two lineage-only publishes against the same exact named-branch head.
 /// Returns after proving exactly one committed and the loser surfaced a typed
 /// read-set change. `establish_head=false` exercises the load-bearing absent-row
@@ -2221,6 +2572,7 @@ async fn assert_exact_named_head_race(establish_head: bool) {
             actor_id: None,
             merged_parent_commit_id: None,
             created_at: lineage_now_micros(),
+            stream_fold_attribution: None,
         };
         publisher
             .publish(&[], &empty, Some(&intent))
@@ -2250,6 +2602,7 @@ async fn assert_exact_named_head_race(establish_head: bool) {
         actor_id: Some("act-a".to_string()),
         merged_parent_commit_id: None,
         created_at: lineage_now_micros(),
+        stream_fold_attribution: None,
     };
     let intent_b = LineageIntent {
         graph_commit_id: ulid::Ulid::new().to_string(),
@@ -2257,6 +2610,7 @@ async fn assert_exact_named_head_race(establish_head: bool) {
         actor_id: Some("act-b".to_string()),
         merged_parent_commit_id: None,
         created_at: lineage_now_micros(),
+        stream_fold_attribution: None,
     };
     let publisher_a = GraphNamespacePublisher::new(uri, Some("feature"));
     let publisher_b = GraphNamespacePublisher::new(uri, Some("feature"));
@@ -2523,6 +2877,7 @@ async fn concurrent_disjoint_writes_share_head_and_form_linear_chain() {
         actor_id: Some("act-a".to_string()),
         merged_parent_commit_id: None,
         created_at: lineage_now_micros(),
+        stream_fold_attribution: None,
     };
     let intent_b = LineageIntent {
         graph_commit_id: ulid::Ulid::new().to_string(),
@@ -2530,6 +2885,7 @@ async fn concurrent_disjoint_writes_share_head_and_form_linear_chain() {
         actor_id: Some("act-b".to_string()),
         merged_parent_commit_id: None,
         created_at: lineage_now_micros(),
+        stream_fold_attribution: None,
     };
     // Empty expected-versions: the two writers are disjoint, so neither asserts a
     // version on the other's table; contention is purely the shared head row.
@@ -2609,6 +2965,7 @@ async fn concurrent_disjoint_writes_form_linear_chain_on_s3() {
         actor_id: Some("act-a".to_string()),
         merged_parent_commit_id: None,
         created_at: lineage_now_micros(),
+        stream_fold_attribution: None,
     };
     let intent_b = LineageIntent {
         graph_commit_id: ulid::Ulid::new().to_string(),
@@ -2616,6 +2973,7 @@ async fn concurrent_disjoint_writes_form_linear_chain_on_s3() {
         actor_id: Some("act-b".to_string()),
         merged_parent_commit_id: None,
         created_at: lineage_now_micros(),
+        stream_fold_attribution: None,
     };
     let empty = HashMap::new();
     let (res_a, res_b) = tokio::join!(
@@ -2705,6 +3063,7 @@ async fn n_concurrent_disjoint_writers_converge_to_one_linear_chain() {
                     actor_id: None,
                     merged_parent_commit_id: None,
                     created_at: lineage_now_micros(),
+                    stream_fold_attribution: None,
                 };
                 let publisher = GraphNamespacePublisher::new(&uri, None);
                 match publisher.publish(&changes, &empty, Some(&intent)).await {

@@ -22,7 +22,9 @@ use futures::StreamExt;
 use futures::stream::BoxStream;
 use lance::Dataset;
 use lance::dataset::mem_wal::{DatasetMemWalExt, ShardWriterConfig};
+use lance::index::DatasetIndexExt;
 use lance::io::WrappingObjectStore;
+use lance_index::mem_wal::MEM_WAL_INDEX_NAME;
 use object_store::path::Path as ObjectPath;
 use object_store::{
     CopyOptions, GetOptions, GetResult, ListResult, MultipartUpload, ObjectMeta, ObjectStore,
@@ -483,6 +485,39 @@ async fn init_enrolled_with_schema(schema: &str) -> (tempfile::TempDir, Arc<Omni
     (dir, db)
 }
 
+#[tokio::test]
+#[serial]
+async fn public_snapshot_hides_the_memwal_system_index() {
+    let (dir, db) = init_enrolled().await;
+    let snapshot = db.snapshot_of(ReadTarget::branch("main")).await.unwrap();
+    let entry = snapshot.entry(TABLE).unwrap();
+    let table_uri = format!(
+        "{}/{}",
+        dir.path().to_str().unwrap().trim_end_matches('/'),
+        entry.table_path.trim_start_matches('/')
+    );
+    let raw = Dataset::open(&table_uri).await.unwrap();
+    assert!(
+        raw.load_indices()
+            .await
+            .unwrap()
+            .iter()
+            .any(|index| index.name == MEM_WAL_INDEX_NAME),
+        "the enrolled physical table must actually carry Lance's MemWAL system index"
+    );
+
+    let public = snapshot.open(TABLE).await.unwrap();
+    assert!(
+        public
+            .load_indices()
+            .await
+            .unwrap()
+            .iter()
+            .all(|index| index.name != MEM_WAL_INDEX_NAME),
+        "public index reflection must omit the private MemWAL system index"
+    );
+}
+
 async fn physical_batch(db: &Omnigraph, rows: &[(String, i32)]) -> RecordBatch {
     let snapshot = db.snapshot_of(ReadTarget::branch("main")).await.unwrap();
     let table = snapshot.open(TABLE).await.unwrap();
@@ -503,6 +538,32 @@ async fn physical_batch(db: &Omnigraph, rows: &[(String, i32)]) -> RecordBatch {
         rows.iter().map(|(_, score)| *score),
     )) as ArrayRef;
     RecordBatch::try_new(schema, vec![ids, scores]).unwrap()
+}
+
+/// Exercise one private B2 compare-and-chain occurrence without exposing its
+/// protocol types through the integration-test boundary.
+#[allow(clippy::too_many_arguments)]
+async fn b2_put_score(
+    db: &Arc<Omnigraph>,
+    stream_incarnation_id: &str,
+    logical_id: &str,
+    score: i32,
+    caller_ordinal: u64,
+    write_id: &str,
+    predecessor_token: Option<&str>,
+    contributor_id: &str,
+) -> Result<String, OmniError> {
+    let batch = physical_batch(db, &[(logical_id.to_string(), score)]).await;
+    db.failpoint_stream_b2_for_test(
+        TABLE,
+        batch,
+        caller_ordinal,
+        stream_incarnation_id,
+        write_id,
+        predecessor_token,
+        contributor_id,
+    )
+    .await
 }
 
 async fn physical_payload_batch(db: &Omnigraph, id: &str, payload_bytes: usize) -> RecordBatch {
@@ -899,7 +960,7 @@ async fn post_invocation_failure_is_ack_unknown_and_replay_is_fold_only() {
 
 #[tokio::test]
 #[serial]
-async fn crash_after_table_effect_keeps_old_visibility_then_open_rolls_forward() {
+async fn crash_after_base_effect_repairs_token_effect_then_open_rolls_forward() {
     let _scenario = FailScenario::setup();
     let (dir, db) = init_enrolled().await;
     let batch = physical_batch(&db, &[("recover".to_string(), 33)]).await;
@@ -908,11 +969,13 @@ async fn crash_after_table_effect_keeps_old_visibility_then_open_rolls_forward()
         .unwrap();
 
     let error = {
-        let _failpoint =
-            ScopedFailPoint::new(names::STREAM_FOLD_POST_TABLE_COMMIT_PRE_CONFIRM, "return");
+        let _failpoint = ScopedFailPoint::new(
+            names::STREAM_FOLD_POST_BASE_COMMIT_PRE_TOKEN_COMMIT,
+            "return",
+        );
         db.failpoint_stream_b1_for_test(TABLE, None, 0)
             .await
-            .expect_err("the exact table effect must retain recovery-v11 ownership")
+            .expect_err("the exact base-only effect must retain recovery-v12 ownership")
     };
     assert!(
         matches!(error, OmniError::RecoveryRequired { .. }),
@@ -930,6 +993,44 @@ async fn crash_after_table_effect_keeps_old_visibility_then_open_rolls_forward()
     assert_eq!(
         visible_rows(&reopened).await,
         vec![("recover".to_string(), 33)]
+    );
+}
+
+#[tokio::test]
+#[serial]
+async fn crash_after_both_effects_reconstructs_confirmation_then_open_rolls_forward() {
+    let _scenario = FailScenario::setup();
+    let (dir, db) = init_enrolled().await;
+    let batch = physical_batch(&db, &[("recover-both".to_string(), 34)]).await;
+    db.failpoint_stream_b1_for_test(TABLE, Some(batch), 0)
+        .await
+        .unwrap();
+
+    let error = {
+        let _failpoint = ScopedFailPoint::new(
+            names::STREAM_FOLD_POST_TOKEN_COMMIT_PRE_CONFIRM,
+            "return",
+        );
+        db.failpoint_stream_b1_for_test(TABLE, None, 0)
+            .await
+            .expect_err("both exact effects without confirmation must retain recovery-v12 ownership")
+    };
+    assert!(
+        matches!(error, OmniError::RecoveryRequired { .. }),
+        "{error:?}"
+    );
+    assert!(
+        visible_rows(&db).await.is_empty(),
+        "neither exact Lance effect is graph-visible before the manifest CAS"
+    );
+    drop(db);
+
+    let reopened = Omnigraph::open(dir.path().to_str().unwrap())
+        .await
+        .expect("open-time recovery must reconstruct confirmation and roll forward");
+    assert_eq!(
+        visible_rows(&reopened).await,
+        vec![("recover-both".to_string(), 34)]
     );
 }
 
@@ -1903,46 +2004,377 @@ async fn strict_fold_validation_failure_keeps_manifest_old_and_stream_fold_only(
 
 #[tokio::test]
 #[serial]
-async fn ack_unknown_retry_can_overwrite_a_newer_same_key_without_reconciling_the_attempt() {
+async fn b2_happy_fold_exact_retry_and_typed_conflicts_are_effect_free() {
     let _scenario = FailScenario::setup();
     let (_dir, db) = init_enrolled().await;
-
-    let first_x = physical_batch(&db, &[("same-key".to_string(), 1)]).await;
-    let unknown = {
-        let _after_durable = ScopedFailPoint::new(names::STREAM_B1_AFTER_WATCHER_SUCCESS, "return");
-        db.failpoint_stream_b1_for_test(TABLE, Some(first_x), 7)
-            .await
-            .expect_err("even watcher-success is caller-ambiguous after acknowledgement loss")
-    };
-    assert!(
-        matches!(unknown, OmniError::AckUnknown { .. }),
-        "{unknown:?}"
-    );
-    db.failpoint_stream_b1_for_test(TABLE, None, 0)
+    let incarnation = db
+        .failpoint_stream_incarnation_for_test(TABLE)
         .await
         .unwrap();
+    let first_write = "11111111-1111-4111-8111-111111111111";
+    let token = b2_put_score(
+        &db,
+        &incarnation,
+        "same-key",
+        1,
+        7,
+        first_write,
+        None,
+        "agent:a",
+    )
+    .await
+    .expect("one B2 occurrence must cross the complete durability boundary");
+    assert!(visible_rows(&db).await.is_empty());
+    db.failpoint_stream_b1_for_test(TABLE, None, 0)
+        .await
+        .expect("the attributed occurrence must fold through recovery-v12");
     assert_eq!(visible_rows(&db).await, vec![("same-key".to_string(), 1)]);
+    let manifest_after_fold = db
+        .snapshot_of(ReadTarget::branch("main"))
+        .await
+        .unwrap()
+        .version();
 
-    let newer_y = physical_batch(&db, &[("same-key".to_string(), 2)]).await;
-    db.failpoint_stream_b1_for_test(TABLE, Some(newer_y), 8)
+    // Every outcome below is decided from durable token/base authority. If
+    // any path reaches Lance, the failpoint turns the mistake into a loud test
+    // failure instead of letting an accidental second WAL put pass unnoticed.
+    let _must_not_invoke_put = ScopedFailPoint::new(names::STREAM_B1_BEFORE_PUT_INVOKE, "return");
+
+    let retry = b2_put_score(
+        &db,
+        &incarnation,
+        "same-key",
+        1,
+        7,
+        first_write,
+        None,
+        "agent:a",
+    )
+    .await
+    .expect("an exact durable retry must be idempotent without a second put");
+    assert_eq!(retry, token);
+
+    let binding_error = b2_put_score(
+        &db,
+        "22222222-2222-4222-8222-222222222222",
+        "binding-conflict",
+        2,
+        8,
+        "33333333-3333-4333-8333-333333333333",
+        None,
+        "agent:a",
+    )
+    .await
+    .expect_err("a stale stream incarnation must fail before WAL invocation");
+    match binding_error {
+        OmniError::StreamBindingChanged {
+            current_stream_incarnation_id,
+            ..
+        } => assert_eq!(current_stream_incarnation_id, incarnation),
+        other => panic!("expected StreamBindingChanged, got {other:?}"),
+    }
+
+    let sequence_error = b2_put_score(
+        &db,
+        &incarnation,
+        "same-key",
+        2,
+        8,
+        "44444444-4444-4444-8444-444444444444",
+        None,
+        "agent:a",
+    )
+    .await
+    .expect_err("a missing predecessor must fail before WAL invocation");
+    match sequence_error {
+        OmniError::StreamSequenceConflict {
+            logical_id,
+            current_token,
+            ..
+        } => {
+            assert_eq!(logical_id, "same-key");
+            assert_eq!(current_token.as_deref(), Some(token.as_str()));
+        }
+        other => panic!("expected StreamSequenceConflict, got {other:?}"),
+    }
+
+    let idempotency_error = b2_put_score(
+        &db,
+        &incarnation,
+        "same-key",
+        99,
+        7,
+        first_write,
+        None,
+        "agent:a",
+    )
+    .await
+    .expect_err("reusing one occurrence for another payload must fail before WAL invocation");
+    match idempotency_error {
+        OmniError::StreamIdempotencyConflict {
+            logical_id,
+            current_token,
+            ..
+        } => {
+            assert_eq!(logical_id, "same-key");
+            assert_eq!(current_token, token);
+        }
+        other => panic!("expected StreamIdempotencyConflict, got {other:?}"),
+    }
+
+    assert_eq!(visible_rows(&db).await, vec![("same-key".to_string(), 1)]);
+    assert_eq!(
+        db.snapshot_of(ReadTarget::branch("main"))
+            .await
+            .unwrap()
+            .version(),
+        manifest_after_fold,
+        "exact retries and typed conflicts must be graph-effect-free"
+    );
+}
+
+#[tokio::test]
+#[serial]
+async fn b2_same_generation_chain_folds_only_the_latest_value() {
+    let _scenario = FailScenario::setup();
+    let (_dir, db) = init_enrolled().await;
+    let incarnation = db
+        .failpoint_stream_incarnation_for_test(TABLE)
         .await
         .unwrap();
+
+    let first = b2_put_score(
+        &db,
+        &incarnation,
+        "chained",
+        10,
+        20,
+        "55555555-5555-4555-8555-555555555555",
+        None,
+        "agent:a",
+    )
+    .await
+    .unwrap();
+    let second = b2_put_score(
+        &db,
+        &incarnation,
+        "chained",
+        20,
+        21,
+        "66666666-6666-4666-8666-666666666666",
+        Some(&first),
+        "agent:b",
+    )
+    .await
+    .expect("the next occurrence may chain from the confirmed in-generation token");
+    assert_ne!(first, second);
+    assert!(visible_rows(&db).await.is_empty());
+
     db.failpoint_stream_b1_for_test(TABLE, None, 0)
         .await
-        .unwrap();
-    assert_eq!(visible_rows(&db).await, vec![("same-key".to_string(), 2)]);
+        .expect("one fold must publish the latest chained winner and token together");
+    assert_eq!(visible_rows(&db).await, vec![("chained".to_string(), 20)]);
+}
 
-    let retry_x = physical_batch(&db, &[("same-key".to_string(), 1)]).await;
-    db.failpoint_stream_b1_for_test(TABLE, Some(retry_x), 7)
+#[tokio::test]
+#[serial]
+async fn b2_ack_unknown_retry_cannot_overwrite_a_later_winner() {
+    let _scenario = FailScenario::setup();
+    let (_dir, db) = init_enrolled().await;
+    let incarnation = db
+        .failpoint_stream_incarnation_for_test(TABLE)
         .await
-        .expect("B1 has no attribution/idempotency proof that can reject this retry");
+        .unwrap();
+    let x_write = "99999999-9999-4999-8999-999999999991";
+    let y_write = "99999999-9999-4999-8999-999999999992";
+    let retired =
+        helpers::failpoint::Rendezvous::park_first(names::STREAM_B1_AFTER_RETIREMENT_RELEASE);
+
+    let error = {
+        let _after_invoke =
+            ScopedFailPoint::new(names::STREAM_B1_AFTER_PUT_INVOKE_BEFORE_WATCHER, "return");
+        b2_put_score(
+            &db,
+            &incarnation,
+            "ambiguous-chain",
+            10,
+            40,
+            x_write,
+            None,
+            "agent:x",
+        )
+        .await
+        .expect_err("post-invocation failure must be AckUnknown")
+    };
+    let candidate_x = match error {
+        OmniError::AckUnknown {
+            admission_attempt_id,
+            logical_write_ids,
+            unconfirmed_candidate_token,
+            ..
+        } => {
+            let attempt = admission_attempt_id.expect("B2 ambiguity carries its attempt id");
+            assert_eq!(attempt.len(), 36, "attempt id must be canonical UUID text");
+            assert_eq!(
+                attempt
+                    .bytes()
+                    .enumerate()
+                    .filter_map(|(index, byte)| (byte == b'-').then_some(index))
+                    .collect::<Vec<_>>(),
+                [8, 13, 18, 23],
+                "attempt id must be canonical UUID text"
+            );
+            assert_eq!(logical_write_ids, vec![x_write.to_string()]);
+            unconfirmed_candidate_token.expect("B2 ambiguity carries its candidate token")
+        }
+        other => panic!("expected AckUnknown, got {other:?}"),
+    };
+    assert!(visible_rows(&db).await.is_empty());
+
+    // Let the detached watcher/abort owner settle before cold replay opens the
+    // exact durable prefix. The candidate above remains correlation only until
+    // this fold publishes both base and token authority.
+    retired.wait_until_reached().await;
+    retired.release();
     db.failpoint_stream_b1_for_test(TABLE, None, 0)
         .await
-        .unwrap();
+        .expect("the ambiguous X occurrence must replay and fold exactly once");
+
+    {
+        let _must_not_put =
+            ScopedFailPoint::new(names::STREAM_B1_BEFORE_PUT_INVOKE, "return");
+        let exact_x = b2_put_score(
+            &db,
+            &incarnation,
+            "ambiguous-chain",
+            10,
+            40,
+            x_write,
+            None,
+            "agent:x",
+        )
+        .await
+        .expect("the exact retry becomes provably durable after fold");
+        assert_eq!(exact_x, candidate_x);
+    }
+
+    let token_y = b2_put_score(
+        &db,
+        &incarnation,
+        "ambiguous-chain",
+        20,
+        41,
+        y_write,
+        Some(&candidate_x),
+        "agent:y",
+    )
+    .await
+    .expect("Y must compare-and-chain from X's now-durable token");
+    db.failpoint_stream_b1_for_test(TABLE, None, 0)
+        .await
+        .expect("Y must fold and become the current winner");
+
+    let stale_x = {
+        let _must_not_put =
+            ScopedFailPoint::new(names::STREAM_B1_BEFORE_PUT_INVOKE, "return");
+        b2_put_score(
+            &db,
+            &incarnation,
+            "ambiguous-chain",
+            10,
+            40,
+            x_write,
+            None,
+            "agent:x",
+        )
+        .await
+        .expect_err("an old exact occurrence cannot displace a later winner")
+    };
+    match stale_x {
+        OmniError::StreamSequenceConflict {
+            current_token, ..
+        } => assert_eq!(current_token.as_deref(), Some(token_y.as_str())),
+        other => panic!("stale X must be a StreamSequenceConflict, got {other:?}"),
+    }
     assert_eq!(
         visible_rows(&db).await,
-        vec![("same-key".to_string(), 1)],
-        "retrying ambiguous X after durable Y demonstrates the documented overwrite hazard; it does not prove X was reconciled"
+        vec![("ambiguous-chain".to_string(), 20)],
+        "the ambiguous retry must never overwrite Y"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[serial]
+async fn b2_revalidates_authority_after_waiting_for_shared_admission() {
+    let _scenario = FailScenario::setup();
+    let (_dir, db) = init_enrolled().await;
+    let incarnation = db
+        .failpoint_stream_incarnation_for_test(TABLE)
+        .await
+        .unwrap();
+    let rendezvous =
+        helpers::failpoint::Rendezvous::park_first(names::STREAM_B2_AFTER_PROVISIONAL_AUTHORITY);
+
+    // X captures an empty token/base authority, then parks before it owns
+    // shared admission or the same-key queue.
+    let stale_db = Arc::clone(&db);
+    let stale_incarnation = incarnation.clone();
+    let stale = tokio::spawn(async move {
+        b2_put_score(
+            &stale_db,
+            &stale_incarnation,
+            "raced",
+            1,
+            30,
+            "77777777-7777-4777-8777-777777777777",
+            None,
+            "agent:x",
+        )
+        .await
+    });
+    rendezvous.wait_until_reached().await;
+
+    // Y is the only live owner. It durably appends and folds while X remains
+    // outside the admission domain, changing both base and token authority.
+    let winner = b2_put_score(
+        &db,
+        &incarnation,
+        "raced",
+        2,
+        31,
+        "88888888-8888-4888-8888-888888888888",
+        None,
+        "agent:y",
+    )
+    .await
+    .expect("the second arrival must pass the park-first rendezvous");
+    db.failpoint_stream_b1_for_test(TABLE, None, 0)
+        .await
+        .expect("Y must publish before X acquires shared admission");
+
+    let must_not_put = ScopedFailPoint::new(names::STREAM_B1_BEFORE_PUT_INVOKE, "return");
+    rendezvous.release();
+    let stale_error = tokio::time::timeout(Duration::from_secs(20), stale)
+        .await
+        .expect("stale X did not resume after rendezvous release")
+        .unwrap()
+        .expect_err("X must classify against Y's final authority, not its provisional snapshot");
+    drop(must_not_put);
+    match stale_error {
+        OmniError::StreamSequenceConflict {
+            logical_id,
+            current_token,
+            ..
+        } => {
+            assert_eq!(logical_id, "raced");
+            assert_eq!(current_token.as_deref(), Some(winner.as_str()));
+        }
+        other => panic!("stale X must return StreamSequenceConflict, got {other:?}"),
+    }
+    assert_eq!(
+        visible_rows(&db).await,
+        vec![("raced".to_string(), 2)],
+        "the stale provisional capture must neither overwrite nor re-append Y"
     );
 }
 

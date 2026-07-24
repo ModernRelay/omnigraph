@@ -198,12 +198,28 @@ fn full_manifest_object_store_path(
     table_path: &str,
     manifest_path: &str,
 ) -> Result<String> {
-    if manifest_path.contains("://") {
-        return object_store_path_from_uri(manifest_path);
+    // Lance may spell the same local object-store root through different
+    // filesystem aliases across a commit handle and a later reopen (notably
+    // `/var` versus `/private/var` on macOS). Once the canonical graph-relative
+    // table path is present, discard that unstable raw prefix and rebuild the
+    // object path from the graph root plus the suffix below the dataset.
+    if let Some((_, suffix)) = manifest_path.rsplit_once(table_path) {
+        let dataset_uri = join_uri(root_uri, table_path);
+        let dataset_path = object_store_path_from_uri(&dataset_uri)?;
+        let suffix = suffix.trim_start_matches('/');
+        return if suffix.is_empty() {
+            Ok(dataset_path)
+        } else {
+            Ok(format!(
+                "{}/{}",
+                dataset_path.trim_end_matches('/'),
+                suffix
+            ))
+        };
     }
 
-    if manifest_path.contains(table_path) {
-        return Ok(manifest_path.to_string());
+    if manifest_path.contains("://") {
+        return object_store_path_from_uri(manifest_path);
     }
 
     let dataset_uri = join_uri(root_uri, table_path);
