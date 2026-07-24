@@ -24,7 +24,9 @@
 //!
 //! The admission lease is the **outermost** process-local gate. A caller that
 //! composes it with existing gates acquires admission key(s) first, then keeps
-//! the established schema -> branch -> sorted-table order. This prevents an
+//! the established schema -> branch -> token-authority -> sorted-table order.
+//! The token-authority gate is graph-global because every B2 fold advances the
+//! same manifest-selected `_stream_tokens.lance` participant. This prevents an
 //! append (which needs only a shared admission lease) from deadlocking with a
 //! drain or enrollment that also needs the existing gates. These locks are
 //! neither durable lifecycle authority nor distributed fencing. Callers must
@@ -121,6 +123,15 @@ pub(crate) struct WriteQueueManager {
     /// publication; explicit authority/physical exceptions follow their own
     /// registered ordering contracts.
     branch_queues: Mutex<HashMap<Option<String>, Arc<AsyncMutex<()>>>>,
+    /// Graph-global RFC-026 sequencing-participant gate.
+    ///
+    /// This is intentionally a singleton per root rather than a synthetic
+    /// table queue: `_stream_tokens.lance` is graph protocol authority, not a
+    /// user table and not a member of the stable table-identity domain. A B2
+    /// fold acquires it after the main-branch gate and before any graph-table
+    /// gate, then holds it through exact participant confirmation and the one
+    /// manifest visibility CAS.
+    stream_token_gate: Arc<AsyncMutex<()>>,
     /// RFC-026 final-check-through-effect admission domains.
     ///
     /// Tokio's fair, write-preferring `RwLock` lets ordinary writers/appends
@@ -256,6 +267,17 @@ impl WriteQueueManager {
     pub(crate) async fn acquire_branch(&self, branch: Option<&str>) -> OwnedMutexGuard<()> {
         let key = branch.map(str::to_string);
         self.branch_slot(&key).lock_owned().await
+    }
+
+    /// Acquire the graph-global RFC-026 token-participant gate.
+    ///
+    /// Callers compose this only in the canonical order: sorted relevant
+    /// stream admission -> schema -> main branch -> token -> sorted graph
+    /// tables. The mutex is process-local contention control; the exact
+    /// manifest-selected token witness and recovery-v12 remain durable
+    /// authority.
+    pub(crate) async fn acquire_stream_token(&self) -> OwnedMutexGuard<()> {
+        Arc::clone(&self.stream_token_gate).lock_owned().await
     }
 
     /// Acquire several graph-branch control gates in one deterministic order.
@@ -508,6 +530,36 @@ mod tests {
             .expect("renamed lifetime did not acquire after release")
             .expect("renamed admission task exited before acquisition");
         renamed_task.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn separately_opened_handles_share_one_graph_token_gate() {
+        let root = format!("memory://stream-token-gate/{}", ulid::Ulid::new());
+        let first = WriteQueueManager::for_root(&root);
+        let second = WriteQueueManager::for_root(&root);
+
+        let held = first.acquire_stream_token().await;
+        let (started_tx, started_rx) = oneshot::channel();
+        let (acquired_tx, mut acquired_rx) = oneshot::channel();
+        let task = tokio::spawn(async move {
+            started_tx.send(()).unwrap();
+            let _guard = second.acquire_stream_token().await;
+            acquired_tx.send(()).unwrap();
+        });
+        started_rx.await.unwrap();
+        assert!(
+            timeout(Duration::from_millis(50), &mut acquired_rx)
+                .await
+                .is_err(),
+            "the token participant must serialize across independently opened handles"
+        );
+
+        drop(held);
+        timeout(Duration::from_secs(2), &mut acquired_rx)
+            .await
+            .expect("token gate did not acquire after release")
+            .expect("token gate task exited before acquisition");
+        task.await.unwrap();
     }
 
     #[tokio::test]

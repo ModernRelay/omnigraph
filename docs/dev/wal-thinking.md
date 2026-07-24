@@ -1,28 +1,29 @@
 # WAL Thinking
 
-Working notes, updated 2026-07-21. Plain-language grounding for the WAL/streaming
+Working notes, updated 2026-07-22. Plain-language grounding for the WAL/streaming
 discussion ([RFC-018](../rfcs/0018-ingest-wal.md) →
 [RFC-026](../rfcs/0026-memwal-streaming-ingest.md)). Three parts: the
 contract difference between an interactive graph commit and durable stream
 admission, the expected performance shape and evidence still required, and the
 build inventory.
 
-Current boundary: RFC-026 Phase A, the Phase-B1 private core, and the private
-B2a unbounded retain-all gate are built, but public streaming is not. Gate R0 found and the follow-up fixed the one known
+Current boundary: RFC-026 Phase A, the Phase-B1 private core, private B2a
+retain-all, and the first common-B2 compare-and-chain row/fold core are built,
+but public streaming is not. Gate R0 found and the follow-up fixed the one known
 all-shape closure failure: a legal high-entropy near-cap generation is durably
 acknowledged, materialized, folded, and published without lowering the
 8,192-row/32-MiB admission cap. The fold now charges logical Arrow slices and
 densifies selected rows before retaining them. The measured full-fold RSS delta
 was 284,934,144 bytes (about 272 MiB); CI carries a 384-MiB remeasurement
 tripwire for one exclusive fold, not a runtime allocator limit. Current
-internal schema v8 preserves
+internal schema v9 preserves
 Phase A's historical v7 foundation: exact empty main-only MemWAL enrollment recovery,
 identity-keyed lifecycle authority, exclusion of ordinary local table/schema/
 maintenance/repair/recovery effects for a lifecycle-bound table, and
 partial-format refusal. Native branch controls alone may proceed at `SEALED`,
 because they do not move table HEAD.
 
-V8 adds stream-config v2 and recovery-v11 `StreamFold`. One feature-gated,
+V8 added stream-config v2 and recovery-v11 `StreamFold`. One feature-gated,
 doc-hidden engine seam can privately admit an already-normalized physical
 batch, acknowledge only after its Lance durability watcher and the same
 writer's post-durability epoch check both succeed, route replay or one
@@ -31,7 +32,11 @@ flushed-unmerged generation fold-only, and publish one exact fold at the
 successor generation can put. This is implementation/evidence machinery, not a
 product surface. There is still no `@stream`, public enrollment or row
 admission, SDK/HTTP/CLI/OpenAPI route, operator drain/resume workflow, or fresh
-read. RFC-026 remains Draft.
+read. V9 adds config-v3/state-v2, the grammar-impossible trusted attribution
+field, manifest-selected token authority, compare-and-chain admission, and
+recovery-v12's exact base-plus-token publication. These remain crate-private;
+management correction/lifecycle operations and every product surface are still
+inactive. RFC-026 remains Draft.
 
 RFC-026 selects **unbounded retain-all on stock Lance** as the first storage
 profile, and its private B2a gate is implemented. OmniGraph deletes no canonical
@@ -153,10 +158,10 @@ but the watcher outcome is lost, OmniGraph returns typed `AckUnknown`; replay
 preserves possible durable residue but cannot attribute it to that caller
 attempt. The attempt remains ambiguous and OmniGraph must never claim “not
 durable.” Cancellation cannot abandon the worker once invocation starts.
-The current private B1 seam has only cardinality-level same-key retry behavior:
-ambiguous `X(id)`, then durable `Y(id)`, then retry `X(id)` can make stale `X`
-newest again. The common B2 contract inventory closes that public-contract hole with an explicit
-compare-and-chain token. A caller-stable `write_id` plus the opaque
+The current private B2 seam closes B1's cardinality-only same-key retry hole
+with an explicit compare-and-chain token: ambiguous `X(id)`, later durable
+`Y(id)`, then retry `X(id)` cannot silently restore stale `X`. A caller-stable
+`write_id` plus the opaque
 `predecessor_token` returned by the server derives one stable successor token;
 the predecessor must equal the complete current token before Lance is called.
 An exact current retry is `already_durable`; a retry behind newer `Y` is
@@ -456,7 +461,7 @@ workflow is implemented.
 
 | Responsibility | Required contract |
 |---|---|
-| **Format capability and refusal** | **Phase A historical foundation:** v7 stamp, strict v6↔v7 refusal, export/init/load rebuild, exact lifecycle validation, and uncovered-partial-format refusal. **Private B1 current format:** schema v8, stream-config v2, and recovery-v11 `StreamFold`; genuine v7↔v8 old/new-binary refusal and rebuild evidence remains green, and the widest legal fold now closes. **Specified common B2 format:** schema v9, config-v3, state-v2, and recovery-v12 add hidden token/attribution/lifecycle state; they remain inactive until their genuine v8↔v9 refusal/rebuild evidence passes. Retain-all requires no storage-budget format. |
+| **Format capability and refusal** | **Phase A historical foundation:** v7 stamp and enrollment authority. **Private B1 historical core:** schema v8, config-v2, recovery-v11, and the bounded one-generation worker/fold. **Private common B2 current format:** schema v9, config-v3, state-v2, grammar-impossible trusted attribution, manifest-selected token authority, and recovery-v12's base-plus-token publication. Genuine v8↔v9 refusal/rebuild includes the former-name user-property collision. Retain-all requires no storage-budget format. |
 | **`@stream` intent and enrollment** | **Foundation only:** Phase A binds stable table/incarnation identity, location/main ref, never-reused enrollment ID, one empty shard, fixed configuration, and the mutable current-HEAD witness under recovery. B1 is implemented but remains private. B2 makes `@stream` declaration leave the type `UNENROLLED`; an explicit request-idempotent enroll operation creates the logical stream incarnation and physical binding. Rebind remains later. |
 | **Public surface** | **Phase B2, after private evidence:** explicit enroll, `POST /graphs/{graph_id}/streams/{type_name}/ingest`, minimum status/block-inspection/fold/quiesce/resume/abort-drain/correct/rebuild-preflight controls, `omnigraph stream …` commands, Cedar, and OpenAPI parity. Every mutating management call after enrollment compares a lifecycle revision and durably returns its bounded terminal receipt. Existing `/ingest` remains the deprecated load alias. |
 | **Writer registry and routing** | **Phase B1 implemented privately:** one root-scoped, cross-handle registry owns the full binding and reuses the common table-identity plus resolved-physical-ref admission key; one serialized owner serves the initial `(table, main)` profile. One no-rollover generation has an 8,192-row / 32-MiB admission cap. Puts use exact charge → shared admission → same-key input queue → worker-mode inspection. Claim/replay starts under the shared admission lease. Empty reopen may admit; non-empty replay and one flushed-unmerged generation are fold-only, with exact accounting and the refusal marker installed before the opener releases its queue. Already-charged callers can overlap recovered replay transiently; the ledger records that overlap while refusing new charge. The exclusive fold validates replayed rows and uses the pinned public BatchStore watermark bridge before reseal. A cold fold reserves the full generation/resident/pending envelope before its owned opener and retains exclusive authority across the original seal deadline. Retirement stops puts before public `abort`; `close` is not durability evidence. Fold scanning now charges logical slices and densifies selected rows, so the near-cap closure cell succeeds. These are not public defaults. |
@@ -617,8 +622,9 @@ E0 itself added no `@stream`, lifecycle rows, a sidecar schema, public APIs,
 WAL acknowledgements, or a format stamp. Phase A subsequently consumed that
 proof in historical schema v7: the v10 enrollment intent, lifecycle authority,
 writer exclusion, and refusal/rebuild. Private B1 now consumes that foundation
-in current schema v8/config-v2 with private admission machinery and the
-recovery-v11 `StreamFold` envelope.
+in historical schema v8/config-v2 with private admission machinery and the
+recovery-v11 `StreamFold` envelope. Current v9/config-v3/state-v2/recovery-v12
+adds private compare-and-chain token authority and trusted attribution.
 This still is not stream release. The exact upstream receipt/seal remains the
 preferred simplification and the broader-topology gate.
 
@@ -653,7 +659,7 @@ The plan is:
 2. keep Phase A's historical v7 enrollment recovery, all-lifecycle effect
    exclusion,
    narrow `SEALED` native-branch exception, lifecycle state, admission lease,
-   and refusal/rebuild gates as the foundation preserved by current v8;
+   and refusal/rebuild gates as the foundation preserved by current v9;
 3. retain the repaired logical-slice/dense fold and its local/configured-RustFS
    near-cap closure plus full-fold RSS remeasurement instruments as regression
    gates; do not silently shrink the 8,192-row/32-MiB admission cap;
@@ -661,15 +667,15 @@ The plan is:
    canonical durable MemWAL object, add no file/byte admission limit, keep
    complete/partial orphan roots inert, expose observed growth only as
    advisory, and surface provider-capacity failure loudly through recovery;
-5. implement the B2-common compare-and-chain token, trusted attribution,
-   manifest-selected token participant, protocol-v2 lifecycle, and bounded
-   `REPLACE`/`WITHDRAW` correction as the implementation contract;
+5. preserve the implemented B2-common compare-and-chain token, trusted
+   attribution, manifest-selected token participant, same-generation overlay,
+   exact authority bounds, and recovery-v12 crash matrix;
 6. keep B2b Lance-owned reclamation and a whole-root finite-lifetime budget as
    optional future profiles, activated only by a new measured need and their
    own RFC/evidence; do not block retain-all on either;
-7. implement schema v9/config-v3/state-v2/recovery-v12 privately for the token,
-   attribution, lifecycle, and correction contracts, and keep every product
-   surface absent until those cross-version and crash matrices are green;
+7. implement the remaining protocol-v2 lifecycle controls and bounded
+   `REPLACE`/`WITHDRAW` correction privately, and keep every product surface
+   absent until their cross-version and crash matrices are green;
 8. add schema/SDK/HTTP/CLI/Cedar/OpenAPI surfaces only after that private core
    passes; then activate Phase B2;
 9. design and measure any later group-commit policy before claiming a
@@ -679,12 +685,12 @@ The plan is:
    lands, and use the latter to simplify enrollment and broaden topology.
 
 We tested the narrower support contract instead of waiting on the upstream
-calendar. Phase A's v7 foundation and private B1's current v8/config-v2/v11
-worker/fold core are implemented, and the widest admitted high-entropy shape
-now closes. RFC-026 remains Draft because the public token, attribution,
-lifecycle/correction, authorization, and product surfaces are not implemented.
+calendar. Phase A's v7 foundation, B1's historical v8/config-v2/v11 worker/fold
+core, and v9's first private common-B2 token/attribution/recovery-v12 slice are
+implemented, and the widest admitted high-entropy shape now closes. RFC-026
+remains Draft because lifecycle/correction, authorization, and product surfaces
+are not implemented.
 The selected first storage posture is the implemented private B2a unbounded
 retain-all gate: no OmniGraph MemWAL GC and no file/byte limit. Two negative RC.1 reclamation guards remain
-checked in as rationale for that no-deletion rule. No schema-v9 contract,
-production enrollment, acknowledgement, fold, operator, or public stream path
-exists.
+checked in as rationale for that no-deletion rule. No production enrollment,
+operator control, or public stream path exists.

@@ -19,6 +19,7 @@ use super::state::{
     GraphLineageRow, ManifestState, SubTableEntry, entries_to_batch, graph_lineage_row_parts,
     manifest_schema, read_manifest_state, read_manifest_state_and_lineage,
 };
+use super::token_store::initialize_stream_token_authority;
 use super::{TableIdentity, table_path_for_identity};
 
 /// The manifest version the init `Dataset::write` produces (Lance datasets start
@@ -34,6 +35,7 @@ pub(super) async fn init_manifest_graph(
     control_session: &Arc<lance::session::Session>,
 ) -> Result<(Dataset, ManifestState, Vec<GraphLineageRow>)> {
     let root = root_uri.trim_end_matches('/');
+    let stream_token_authority = initialize_stream_token_authority(root, control_session).await?;
     let (entries, version_metadata) = build_initial_entries(root, catalog, control_session).await?;
 
     // Genesis graph commit: parentless, actorless, minted once and folded into
@@ -47,10 +49,16 @@ pub(super) async fn init_manifest_graph(
         merged_parent_commit_id: None,
         actor_id: None,
         created_at: crate::db::now_micros()?,
+        stream_fold_attribution: None,
     };
     let genesis_lineage = graph_lineage_row_parts(&genesis, None)?;
 
-    let manifest_batch = entries_to_batch(&entries, &version_metadata, &genesis_lineage)?;
+    let manifest_batch = entries_to_batch(
+        &entries,
+        &version_metadata,
+        &genesis_lineage,
+        &stream_token_authority,
+    )?;
     let schema = manifest_schema();
     let reader = RecordBatchIterator::new(vec![Ok(manifest_batch)], schema);
     let params = WriteParams {
@@ -225,9 +233,33 @@ async fn create_empty_dataset(
         .map_err(|e| OmniError::Lance(e.to_string()))
 }
 
-fn keyed_graph_table_schema(schema: &SchemaRef) -> Result<SchemaRef> {
+pub(super) fn keyed_graph_table_schema(schema: &SchemaRef) -> Result<SchemaRef> {
+    // Engine catalogs have already crossed `fixup_physical_schemas` and carry
+    // the exact internal field. Manifest-level tests and older call sites may
+    // still supply the logical schema. Accept those two representations only:
+    // a caller-defined lookalike must never be interpreted as trusted metadata.
+    let mut has_stream_metadata = false;
+    for field in schema
+        .fields()
+        .iter()
+        .filter(|field| field.name() == crate::db::STREAM_METADATA_COLUMN)
+    {
+        if has_stream_metadata {
+            return Err(OmniError::manifest_internal(format!(
+                "graph table schema supplies reserved physical field '{}' more than once",
+                crate::db::STREAM_METADATA_COLUMN
+            )));
+        }
+        super::stream_token::validate_trusted_stream_metadata_field(field).map_err(|error| {
+            OmniError::manifest_internal(format!(
+                "graph table schema supplies a non-canonical reserved physical field '{}': {error}",
+                crate::db::STREAM_METADATA_COLUMN
+            ))
+        })?;
+        has_stream_metadata = true;
+    }
     let mut id_count = 0;
-    let fields = schema
+    let mut fields = schema
         .fields()
         .iter()
         .map(|field| {
@@ -258,6 +290,13 @@ fn keyed_graph_table_schema(schema: &SchemaRef) -> Result<SchemaRef> {
         return Err(OmniError::manifest_internal(
             "graph table initialization requires a non-null `id` field",
         ));
+    }
+
+    // Internal schema v9 provisions the exact nullable trusted-attribution
+    // envelope on every graph table from creation. Pre-stream/direct rows use
+    // a null top-level struct; no caller-supplied lookalike is interpreted.
+    if !has_stream_metadata {
+        fields.push(super::stream_token::trusted_stream_metadata_field());
     }
 
     Ok(std::sync::Arc::new(Schema::new_with_metadata(

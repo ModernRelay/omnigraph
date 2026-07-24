@@ -202,6 +202,12 @@ pub mod names {
     /// it waits for the current input corridor owner to transfer its charge.
     pub const STREAM_B1_AFTER_SHARED_BEFORE_QUEUE_WAIT: &str =
         "stream_b1.after_shared_before_queue_wait";
+    /// B2 has captured provisional stream authority but has not acquired the
+    /// shared admission lease. Tests publish a fold in this gap to prove that
+    /// token lookup and every effect-free classification use the later gated
+    /// authority capture rather than this stale snapshot.
+    pub const STREAM_B2_AFTER_PROVISIONAL_AUTHORITY: &str =
+        "stream_b2.after_provisional_authority";
     /// A put owns its exact Arrow charge, shared admission, and the same-key
     /// input queue, but has not begun warm validation or a cold writer claim.
     /// Tests park a cold replay opener here so already-charged waiters exist
@@ -237,12 +243,18 @@ pub mod names {
     /// witness for deterministic replay-open races.
     pub const STREAM_B1_AFTER_RETIREMENT_RELEASE: &str = "stream_b1.after_retirement_release";
     /// The immutable generation cut is proven and the worker retired, before
-    /// the schema-v11 recovery intent is armed.
+    /// the schema-v12 recovery intent is armed.
     pub const STREAM_FOLD_POST_DRAIN_PRE_SIDECAR: &str = "stream_fold.post_drain_pre_sidecar";
-    /// The exact Lance Update (rows plus merged-generation marker) committed,
-    /// before its achieved identity and output are durably confirmed.
-    pub const STREAM_FOLD_POST_TABLE_COMMIT_PRE_CONFIRM: &str =
-        "stream_fold.post_table_commit_pre_confirm";
+    /// Schema-v12: the exact base-table fold committed, while the separate
+    /// `_stream_tokens.lance` participant is still at its manifest-selected
+    /// prior witness. Recovery must classify this partial cell as sticky.
+    pub const STREAM_FOLD_POST_BASE_COMMIT_PRE_TOKEN_COMMIT: &str =
+        "stream_fold.post_base_commit_pre_token_commit";
+    /// Schema-v12: both exact Lance participants committed, while the Armed
+    /// sidecar has not yet been rewritten with their achieved witnesses.
+    /// Recovery may reconstruct the exact/exact confirmation and roll forward.
+    pub const STREAM_FOLD_POST_TOKEN_COMMIT_PRE_CONFIRM: &str =
+        "stream_fold.post_token_commit_pre_confirm";
     /// Reload owns the schema gate and is about to read/publish one contract view.
     pub const SCHEMA_RELOAD_BEFORE_CONTRACT_READ: &str = "schema_reload.before_contract_read";
     /// Injects a retryable `RowLevelCasContention` from `load_publish_state` so a

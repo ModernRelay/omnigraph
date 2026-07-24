@@ -918,13 +918,16 @@ async fn acquire_mutation_commit_guards(
     // avoids an admission <-> table-queue inversion between those shapes.
     let stream_admission = write_queue.acquire_stream_shared_many(admission_keys).await;
 
-    // Preserve RFC-022's established order inside the admission window:
-    // schema -> branch -> sorted physical table queues.
+    // Preserve RFC-022's established order inside the admission window, with
+    // RFC-026's graph-global sequencing participant between graph authority
+    // and physical table effects:
+    // schema -> branch -> stream token -> sorted physical table queues.
     let schema_guard = write_queue
         .acquire(&crate::db::manifest::schema_apply_serial_queue_key())
         .await;
     let branch_guard = write_queue.acquire_branch(branch).await;
-    let mut write_queues = vec![schema_guard, branch_guard];
+    let token_guard = write_queue.acquire_stream_token().await;
+    let mut write_queues = vec![schema_guard, branch_guard, token_guard];
     write_queues.extend(write_queue.acquire_many(table_queue_keys).await);
 
     MutationCommitGuards {
@@ -1084,7 +1087,7 @@ impl StagedMutation {
             crate::db::manifest::list_sidecars(db.root_uri(), db.storage_adapter()).await?;
         if let Some(owner) = pending_sidecars.iter().find(|sidecar| {
             let sidecar_branch = sidecar.branch.as_deref().filter(|name| *name != "main");
-            sidecar.writer_kind == SidecarKind::SchemaApply || sidecar_branch == enrolled_branch
+            sidecar.writer_kind.is_graph_global_barrier() || sidecar_branch == enrolled_branch
         }) {
             return Err(OmniError::recovery_required(
                 owner.operation_id.clone(),

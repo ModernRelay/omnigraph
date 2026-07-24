@@ -273,6 +273,7 @@ pub(super) async fn ensure_indices_for_branch(
         .write_queue()
         .acquire_branch(active_branch.as_deref())
         .await;
+    let _stream_token_guard = db.write_queue().acquire_stream_token().await;
     let _queue_guards = db.write_queue().acquire_many(&queue_keys).await;
 
     db.ensure_no_pending_recovery_sidecars_under_gates(

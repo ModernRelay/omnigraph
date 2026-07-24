@@ -159,6 +159,7 @@ pub async fn repair_all_tables(db: &Omnigraph, options: RepairOptions) -> Result
     db.ensure_schema_apply_not_locked("repair").await?;
     let catalog = db.load_accepted_catalog_with_schema_gate_held().await?;
     let _main_branch_guard = db.write_queue().acquire_branch(None).await;
+    let _stream_token_guard = db.write_queue().acquire_stream_token().await;
 
     let table_keys = optimize::all_table_keys(&catalog);
     let queue_keys = table_keys

@@ -825,7 +825,14 @@ fn build_node_batch(
     // U64 range), not an independent rendering of its input JSON token.
     let mut property_columns: Vec<ArrayRef> = Vec::with_capacity(schema.fields().len() - 1);
     for field in schema.fields().iter().skip(1) {
-        if node_type.blob_properties.contains(field.name()) {
+        if field.name() == crate::db::STREAM_METADATA_COLUMN {
+            property_columns.push(
+                crate::db::manifest::stream_token::build_trusted_stream_metadata_array(
+                    &vec![None; rows.len()],
+                )
+                .map_err(|error| OmniError::manifest_internal(error.to_string()))?,
+            );
+        } else if node_type.blob_properties.contains(field.name()) {
             let col = build_blob_column(field.name(), field.is_nullable(), rows)?;
             property_columns.push(col);
         } else {
@@ -978,7 +985,14 @@ fn build_edge_batch(
     // Build edge property columns (skip id, src, dst at indices 0-2)
     let data_values: Vec<JsonValue> = rows.iter().map(|(_, _, data)| data.clone()).collect();
     for field in schema.fields().iter().skip(3) {
-        if edge_type.blob_properties.contains(field.name()) {
+        if field.name() == crate::db::STREAM_METADATA_COLUMN {
+            columns.push(
+                crate::db::manifest::stream_token::build_trusted_stream_metadata_array(
+                    &vec![None; rows.len()],
+                )
+                .map_err(|error| OmniError::manifest_internal(error.to_string()))?,
+            );
+        } else if edge_type.blob_properties.contains(field.name()) {
             let col = build_blob_column(field.name(), field.is_nullable(), &data_values)?;
             columns.push(col);
         } else {

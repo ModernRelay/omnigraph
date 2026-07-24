@@ -33,6 +33,10 @@ mod recovery;
 mod state;
 #[path = "manifest/stream.rs"]
 pub(crate) mod stream;
+#[path = "manifest/stream_token.rs"]
+pub(crate) mod stream_token;
+#[path = "manifest/token_store.rs"]
+pub(crate) mod token_store;
 
 use graph::{
     init_manifest_graph, open_manifest_graph, open_manifest_graph_with_lineage, snapshot_state_at,
@@ -54,17 +58,19 @@ pub(crate) use recovery::{
     HealPendingOutcome, MAX_BRANCH_MERGE_DATA_TRANSACTIONS, RecoveryAuthorityToken,
     RecoveryBranchMergeEffect, RecoveryBranchMergeEffectKind, RecoveryLineageIntent,
     RecoveryManifestDelta, RecoveryMode, RecoverySchemaApplyEffect, RecoverySchemaApplyEffectKind,
-    RecoverySidecar, RecoverySidecarHandle, RecoveryStreamFoldCut, RecoveryTableUpdateSlot,
-    SidecarKind, SidecarTablePin, SidecarTableRegistration,
-    SidecarTableRename, SidecarTombstone, complete_stream_enrollment_sidecar_v10,
-    complete_stream_fold_sidecar_v11, confirm_branch_merge_sidecar_v9,
+    RecoverySidecar, RecoverySidecarHandle,
+    RecoveryStreamFoldCut, RecoveryTableUpdateSlot, SidecarKind, SidecarTablePin,
+    SidecarTableRegistration, SidecarTableRename, SidecarTombstone,
+    complete_stream_enrollment_sidecar_v10, complete_stream_fold_sidecar_v12,
+    confirm_branch_merge_sidecar_v9,
     confirm_ensure_indices_sidecar_v9, confirm_occ_sidecar_v9, confirm_schema_apply_sidecar_v9,
-    delete_sidecar, ensure_read_only_schema_coherent, finalize_effect_free_occ_sidecar,
-    finalize_effect_free_stream_fold_sidecar_v11,
-    heal_pending_sidecars_roll_forward, list_sidecars, new_branch_merge_sidecar_v9,
-    new_ensure_indices_sidecar_v9, new_occ_sidecar_v9, new_optimize_sidecar_v9,
-    new_schema_apply_sidecar_v9, new_stream_enrollment_sidecar_v10, new_stream_fold_sidecar_v11,
-    recover_manifest_drift, schema_apply_serial_queue_key, write_sidecar,
+    confirm_stream_fold_sidecar_v12, delete_sidecar, ensure_read_only_schema_coherent,
+    finalize_effect_free_occ_sidecar, finalize_effect_free_stream_fold_sidecar_v12,
+    heal_pending_sidecars_roll_forward,
+    list_sidecars, new_branch_merge_sidecar_v9, new_ensure_indices_sidecar_v9, new_occ_sidecar_v9,
+    new_optimize_sidecar_v9, new_schema_apply_sidecar_v9, new_stream_enrollment_sidecar_v10,
+    new_stream_fold_sidecar_v12, recover_manifest_drift,
+    schema_apply_serial_queue_key, write_sidecar,
 };
 pub use state::SubTableEntry;
 #[cfg(test)]
@@ -72,9 +78,10 @@ use state::string_column;
 pub(crate) use state::{GraphLineageRow, read_graph_lineage};
 use state::{ManifestState, read_manifest_state};
 pub(crate) use stream::{
-    CurrentHeadWitness, STREAM_CONFIG_VERSION, StreamLifecycle, StreamLifecycleEntry,
-    StreamPhysicalBinding,
+    CurrentHeadWitness, EnrollmentReceipt, STREAM_CONFIG_VERSION, StreamLifecycle,
+    StreamLifecycleEntry, StreamPhysicalBinding, stream_enrollment_intent_digest_v1,
 };
+pub(crate) use token_store::{StreamTokenAuthorityEntry, open_stream_token_authority_at};
 
 /// The internal-schema (storage-format) version this binary writes and reads.
 /// A graph's on-disk per-branch stamp is read via [`internal_schema_stamp_at`];
@@ -94,6 +101,7 @@ const OBJECT_TYPE_GRAPH_COMMIT: &str = "graph_commit";
 /// `object_id` is `graph_head:<branch>` (`graph_head:main` for the main branch).
 const OBJECT_TYPE_GRAPH_HEAD: &str = "graph_head";
 const OBJECT_TYPE_STREAM_STATE: &str = "stream_state";
+const OBJECT_TYPE_STREAM_TOKEN_AUTHORITY: &str = "stream_token_authority";
 const TABLE_VERSION_MANAGEMENT_KEY: &str = "table_version_management";
 
 /// Stable head-key segment for the main branch in `graph_head:<branch>` rows.
@@ -156,6 +164,9 @@ pub struct Snapshot {
     /// table identity. `table_key` inside each value is diagnostic and is never
     /// used to select the authority row.
     stream_lifecycles: HashMap<TableIdentity, StreamLifecycleEntry>,
+    /// Exact graph-global sequencing participant selected by this manifest
+    /// snapshot. Its raw Lance HEAD is never authority.
+    stream_token_authority: StreamTokenAuthorityEntry,
     /// Per-graph read caches (shared `Session` + held-handle cache), injected by
     /// `Omnigraph::resolved_target` for live Branch reads so table opens reuse
     /// handles (0 IO on a warm repeat) and one `Session`. `None` for write-prelude
@@ -173,6 +184,11 @@ pub struct Snapshot {
 #[derive(Debug, Clone)]
 pub struct SnapshotTable {
     dataset: Dataset,
+    /// Public reflection view. The physical dataset additionally carries the
+    /// reserved RFC-026 attribution struct; keeping a separately owned schema
+    /// prevents a caller from recovering that protocol column through
+    /// `SnapshotTable::schema`.
+    public_schema: LanceSchema,
 }
 
 /// Read-only scan builder for a [`SnapshotTable`].
@@ -183,19 +199,116 @@ pub struct SnapshotTable {
 /// writable handle and bypass graph publication.
 pub struct SnapshotScanner {
     scanner: Scanner,
+    physical_schema: arrow_schema::SchemaRef,
+    public_projection: Vec<String>,
+    forbidden_protocol_column: Option<String>,
+}
+
+fn is_protocol_column_path(reference: &str) -> bool {
+    reference.split('.').any(|segment| {
+        segment
+            .trim_matches(|character| matches!(character, '`' | '"' | '[' | ']'))
+            .eq_ignore_ascii_case(crate::db::STREAM_METADATA_COLUMN)
+    })
+}
+
+fn ensure_expr_omits_protocol_column(filter: &Expr) -> Result<()> {
+    if filter.column_refs().iter().any(|column| {
+        column
+            .name
+            .eq_ignore_ascii_case(crate::db::STREAM_METADATA_COLUMN)
+    }) {
+        return Err(OmniError::manifest(format!(
+            "column '{}' is reserved for OmniGraph storage protocol metadata",
+            crate::db::STREAM_METADATA_COLUMN
+        )));
+    }
+    Ok(())
+}
+
+fn filter_text_references_protocol_column(filter: &str) -> bool {
+    let bytes = filter.as_bytes();
+    let needle = crate::db::STREAM_METADATA_COLUMN.as_bytes();
+    let is_identifier_byte = |byte: u8| byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'$');
+    let mut index = 0;
+    let mut in_string_literal = false;
+    while index < bytes.len() {
+        if bytes[index] == b'\'' {
+            if in_string_literal && bytes.get(index + 1) == Some(&b'\'') {
+                index += 2;
+                continue;
+            }
+            in_string_literal = !in_string_literal;
+            index += 1;
+            continue;
+        }
+        if !in_string_literal && index + needle.len() <= bytes.len() {
+            let candidate = &bytes[index..index + needle.len()];
+            let left_boundary = index == 0 || !is_identifier_byte(bytes[index - 1]);
+            let right_boundary = index + needle.len() == bytes.len()
+                || !is_identifier_byte(bytes[index + needle.len()]);
+            if left_boundary
+                && right_boundary
+                && candidate.eq_ignore_ascii_case(needle)
+            {
+                return true;
+            }
+        }
+        index += 1;
+    }
+    false
+}
+
+fn parse_public_filter(schema: arrow_schema::SchemaRef, filter: &str) -> Result<Expr> {
+    // The protocol field is deliberately outside the public schema grammar.
+    // Reject its literal spelling before SQL parsing as well: some parser
+    // paths treat `$` as placeholder syntax instead of a column reference.
+    if filter_text_references_protocol_column(filter) {
+        return Err(OmniError::manifest(format!(
+            "column '{}' is reserved for OmniGraph storage protocol metadata",
+            crate::db::STREAM_METADATA_COLUMN
+        )));
+    }
+    let expression = lance_datafusion::planner::Planner::new(schema)
+        .parse_filter(filter)
+        .map_err(|error| OmniError::Lance(error.to_string()))?;
+    ensure_expr_omits_protocol_column(&expression)?;
+    Ok(expression)
 }
 
 impl SnapshotScanner {
     /// Select the output columns.
     pub fn project<T: AsRef<str>>(&mut self, columns: &[T]) -> Result<&mut Self> {
+        if columns
+            .iter()
+            .any(|column| is_protocol_column_path(column.as_ref()))
+        {
+            return Err(OmniError::manifest(format!(
+                "column '{}' is reserved for OmniGraph storage protocol metadata",
+                crate::db::STREAM_METADATA_COLUMN
+            )));
+        }
+        // Lance expands `*` against the scanner's physical schema. Expand it
+        // here against the already-sealed public schema so callers cannot
+        // recover protocol metadata through wildcard projection.
+        let mut public_columns = Vec::with_capacity(columns.len());
+        for column in columns {
+            let column = column.as_ref();
+            if column.trim() == "*" {
+                public_columns.extend(self.public_projection.iter().cloned());
+            } else {
+                public_columns.push(column.to_string());
+            }
+        }
         self.scanner
-            .project(columns)
+            .project(&public_columns)
             .map_err(|error| OmniError::Lance(error.to_string()))?;
         Ok(self)
     }
 
     /// Apply a SQL filter expression.
     pub fn filter(&mut self, filter: &str) -> Result<&mut Self> {
+        parse_public_filter(Arc::clone(&self.physical_schema), filter)?;
         self.scanner
             .filter(filter)
             .map_err(|error| OmniError::Lance(error.to_string()))?;
@@ -204,6 +317,10 @@ impl SnapshotScanner {
 
     /// Apply a structured DataFusion filter expression.
     pub fn filter_expr(&mut self, filter: Expr) -> &mut Self {
+        if ensure_expr_omits_protocol_column(&filter).is_err() {
+            self.forbidden_protocol_column = Some(crate::db::STREAM_METADATA_COLUMN.to_string());
+            return self;
+        }
         self.scanner.filter_expr(filter);
         self
     }
@@ -254,6 +371,11 @@ impl SnapshotScanner {
 
     /// Execute the configured read without exposing its physical plan.
     pub async fn try_into_stream(&self) -> Result<DatasetRecordBatchStream> {
+        if let Some(column) = &self.forbidden_protocol_column {
+            return Err(OmniError::manifest(format!(
+                "column '{column}' is reserved for OmniGraph storage protocol metadata"
+            )));
+        }
         self.scanner
             .try_into_stream()
             .await
@@ -263,18 +385,44 @@ impl SnapshotScanner {
 
 impl SnapshotTable {
     fn new(dataset: Dataset) -> Self {
-        Self { dataset }
+        let mut public_schema = dataset.schema().clone();
+        public_schema
+            .fields
+            .retain(|field| field.name != crate::db::STREAM_METADATA_COLUMN);
+        Self {
+            dataset,
+            public_schema,
+        }
     }
 
     /// Build a read-only scanner over this pinned table version.
     pub fn scan(&self) -> SnapshotScanner {
+        let mut scanner = self.dataset.scan();
+        let public_projection = self
+            .public_schema
+            .fields
+            .iter()
+            .map(|field| field.name.clone())
+            .collect::<Vec<_>>();
+        scanner
+            .project(&public_projection)
+            .expect("manifest-validated public fields must project from their physical dataset");
         SnapshotScanner {
-            scanner: self.dataset.scan(),
+            scanner,
+            physical_schema: Arc::new(arrow_schema::Schema::from(self.dataset.schema())),
+            public_projection,
+            forbidden_protocol_column: None,
         }
     }
 
     /// Count rows in this pinned table version, optionally with a filter.
     pub async fn count_rows(&self, filter: Option<String>) -> Result<usize> {
+        if let Some(filter) = filter.as_deref() {
+            parse_public_filter(
+                Arc::new(arrow_schema::Schema::from(self.dataset.schema())),
+                filter,
+            )?;
+        }
         self.dataset
             .count_rows(filter)
             .await
@@ -283,7 +431,7 @@ impl SnapshotTable {
 
     /// Lance schema of this pinned table version.
     pub fn schema(&self) -> &LanceSchema {
-        self.dataset.schema()
+        &self.public_schema
     }
 
     /// Lance manifest version of this pinned table.
@@ -291,16 +439,27 @@ impl SnapshotTable {
         self.dataset.version().version
     }
 
-    /// Read-only physical index metadata for this pinned table version.
+    /// Read-only user-index metadata for this pinned table version. Lance's
+    /// MemWAL system index is part of OmniGraph's private write protocol and
+    /// is deliberately absent from SDK reflection.
     pub async fn load_indices(&self) -> Result<Arc<Vec<IndexMetadata>>> {
-        self.dataset
+        let indices = self
+            .dataset
             .load_indices()
             .await
-            .map_err(|error| OmniError::Lance(error.to_string()))
+            .map_err(|error| OmniError::Lance(error.to_string()))?;
+        Ok(Arc::new(
+            indices
+                .iter()
+                .filter(|index| index.name != lance_index::mem_wal::MEM_WAL_INDEX_NAME)
+                .cloned()
+                .collect(),
+        ))
     }
 
     /// Whether `column` has complete usable BTREE coverage.
     pub async fn index_coverage(&self, column: &str) -> Result<crate::IndexCoverage> {
+        self.ensure_public_column(column)?;
         crate::table_store::TableStore::key_column_index_coverage(&self.dataset, column).await
     }
 
@@ -311,17 +470,30 @@ impl SnapshotTable {
 
     /// Whether this table has a user BTREE index on `column`.
     pub async fn has_btree_index(&self, column: &str) -> Result<bool> {
+        self.ensure_public_column(column)?;
         crate::table_store::TableStore::has_btree_index_on(&self.dataset, column).await
     }
 
     /// Whether this table has a user full-text index on `column`.
     pub async fn has_fts_index(&self, column: &str) -> Result<bool> {
+        self.ensure_public_column(column)?;
         crate::table_store::TableStore::has_fts_index_on(&self.dataset, column).await
     }
 
     /// Whether this table has a user vector index on `column`.
     pub async fn has_vector_index(&self, column: &str) -> Result<bool> {
+        self.ensure_public_column(column)?;
         crate::table_store::TableStore::has_vector_index_on(&self.dataset, column).await
+    }
+
+    fn ensure_public_column(&self, column: &str) -> Result<()> {
+        if is_protocol_column_path(column) {
+            return Err(OmniError::manifest(format!(
+                "column '{}' is reserved for OmniGraph storage protocol metadata",
+                crate::db::STREAM_METADATA_COLUMN
+            )));
+        }
+        Ok(())
     }
 }
 
@@ -458,6 +630,21 @@ impl Snapshot {
         &self,
     ) -> impl Iterator<Item = (&TableIdentity, &StreamLifecycleEntry)> {
         self.stream_lifecycles.iter()
+    }
+
+    /// Exact durable pointer to the graph-global RFC-026 token participant.
+    pub(crate) fn stream_token_authority(&self) -> &StreamTokenAuthorityEntry {
+        &self.stream_token_authority
+    }
+
+    /// Open `_stream_tokens.lance` only at the exact manifest-selected witness.
+    pub(crate) async fn open_stream_token_authority(&self) -> Result<Dataset> {
+        let session = self
+            .read_caches
+            .as_ref()
+            .map(|caches| Arc::clone(&caches.session))
+            .unwrap_or_else(crate::lance_access::control_session);
+        open_stream_token_authority_at(&self.root_uri, &self.stream_token_authority, &session).await
     }
 
     /// Refuse any physical table/schema effect that would bypass RFC-026
@@ -700,6 +887,13 @@ pub(crate) enum ManifestChange {
         expected: Option<StreamLifecycleEntry>,
         next: StreamLifecycleEntry,
     },
+    /// Advance the one graph-global stream-token participant pointer under an
+    /// exact manifest-row CAS. Genesis always provisions the row, so there is
+    /// no absent-pointer/bootstrap publish mode.
+    SetStreamTokenAuthority {
+        expected: StreamTokenAuthorityEntry,
+        next: StreamTokenAuthorityEntry,
+    },
 }
 
 /// One table-version authority assertion supplied to a publish attempt.
@@ -845,6 +1039,7 @@ impl ManifestCoordinator {
                 .map(|entry| (entry.table_key.clone(), entry))
                 .collect(),
             stream_lifecycles: state.stream_lifecycles,
+            stream_token_authority: state.stream_token_authority,
             read_caches: None,
         }
     }

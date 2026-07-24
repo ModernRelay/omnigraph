@@ -3,9 +3,11 @@
 **Status:** RFC-022, RFC-023, and RFC-028 implemented; RFC-024, RFC-025, and
 RFC-027 research-blocked; RFC-026 Phase A implemented, private B1's legal
 near-cap closure repaired and green, private B2a unbounded retain-all gate
-implemented, B2b/common contracts inactive, and no public stream surface exists
+implemented, the private common-B2 compare-and-chain/token-fold core
+implemented, B2b optional, and public streaming plus lifecycle
+management/correction/status inactive
 **Date:** 2026-07-11
-**Last updated:** 2026-07-21
+**Last updated:** 2026-07-22
 **Audience:** RFC authors, engine/storage maintainers, and release reviewers
 **Reviewed against:** OmniGraph 0.8.1; Lance 9.0.0-beta.15 at
 `f24e42c11a742581365e1cbe17c906ea2dac1bc6`; full Lance transaction,
@@ -59,9 +61,13 @@ operation shape stays flat while serialized authority and combined history work
 grow; LIST bytes, timings, and RSS remain advisory. The missing materialization-attempt receipt and
 complete envelope therefore do not block B2a. No test-only attempt ledger or
 `GraphHistoryBudget` is on its immediate path. B2b remains optional future
-Lance-owned managed reclamation. Common explicit enrollment,
-compare-and-chain tokens, trusted attribution, revisioned lifecycle and
-management receipts, correction, authorization, and product parity remain
+Lance-owned managed reclamation. The private common-B2 core subsequently
+activated internal schema v9, stream-config v3, lifecycle state-v2, trusted
+hidden row attribution, canonical payload/token digests, the
+manifest-selected graph-global `_stream_tokens.lance` authority, and
+recovery-v12 exact base-plus-token fold publication. Genuine v8↔v9
+refusal/rebuild evidence is green. Explicit production enrollment, lifecycle
+management, correction/status, authorization, and product parity remain
 specified, required, and inactive. Two RC.1 surface guards prove generic cleanup
 non-ownership and the stale-writer hazard created by deleting the successor's
 empty WAL fence sentinel; neither is an implementation of reclamation.
@@ -74,7 +80,7 @@ audit and RFC-025.
 **RFC-023 substrate evidence revalidated against:** the same beta.21 revision;
 filter-shape and conflict-order probes are recorded in RFC-023 §2. Internal
 schema v6 introduced that evidence through exact-`id` fenced production
-routing, and current v8 preserves it. Its final insertion-absence certificate/no-target-preflight route and
+routing, and current v9 preserves it. Its final insertion-absence certificate/no-target-preflight route and
 predeclared 10K/100K production series now satisfy the remaining implementation
 and acceptance gates.
 **RFC-026 substrate contract revalidated against:** RC.1 at the current revision;
@@ -95,7 +101,7 @@ so the candidate and format are research-blocked rather than accepted.
 RFC-025 Gate 0 was measured on 2026-07-17: Lance tag semantics pass, but the
 current in-manifest checkpoint-registry BTREE shape has history-sensitive
 compacted scan bytes and crosses another scan-operation boundary at 1,000
-commits. RFC-025 is therefore also research-blocked; current internal schema v8
+commits. RFC-025 is therefore also research-blocked; current internal schema v9
 still contains no retention state. The bucket-gated S3/RustFS cost cell is checked in but was
 not run for that decision.
 
@@ -497,17 +503,20 @@ history quota. Structural guards, typed local/configured-RustFS provider
 failures, complete/partial inert orphan evidence, and the 1/8/32/128 advisory
 history instrument pin that boundary. Lance losing manifest-CAS temp staging is
 not retained authority. Gate R0's historical no-go applies
-only to claiming a finite storage bound on stock RC.1. Public activation remains
-closed on the common contracts below, not on the missing materialization-attempt
-receipt or physical-output envelope. RC.1 also lacks the ideal caller-owned
+only to claiming a finite storage bound on stock RC.1. The private common-B2
+compare-and-chain/token-fold core is implemented in schema v9. Public
+activation remains closed on the explicit enrollment, lifecycle-control,
+authorization, and product contracts below, not on the missing
+materialization-attempt receipt or physical-output envelope. RC.1 also lacks the ideal caller-owned
 enrollment receipt and cross-process shard-admission seal, but those remain
 broader-topology gates rather than dependencies of the implemented private
 single-live-writer-process profile. Gate E0's exact-classification and ABA
 cells passed using known-version probes and strict object-store classification.
 Phase A then activated a main-only, unsharded, single-live-writer-process empty
 enrollment foundation in internal schema v7. Private B1 activated the bounded
-data-bearing schema-v8/config-v2 core. RFC-026 remains draft and public row
-streaming remains inactive.
+data-bearing schema-v8/config-v2 core. The private common-B2 slice activated
+schema v9/config-v3/state-v2 and recovery-v12 for exact base-plus-token fold
+publication. RFC-026 remains draft and public row streaming remains inactive.
 
 Enrollment creates persistent MemWAL metadata and `stream_state` changes the
 correctness preconditions for schema, branch, maintenance, and data operations.
@@ -535,13 +544,14 @@ and carries genuine v7↔v8 rebuild/refusal evidence.
 
 B2 is a third strict strand, not an in-place reinterpretation of v8. Private
 B2a adds no schema change; it closes the stock-v8 storage/correctness gate for
-the selected retain-all profile. The common
-B2 inventory assigns internal schema v9, stream-config v3, stream-state
-protocol v2, and recovery-v12 to trusted hidden row metadata, the
-manifest-selected current-token participant, persistent revisioned
-lifecycle/correction, bounded terminal management receipts, and their
-multi-participant recovery. Those versions are specified but inactive; genuine
-v8↔v9 refusal/rebuild remains an implementation gate. The selected unbounded
+the selected retain-all profile. The implemented private common-B2 core assigns
+internal schema v9, stream-config v3, stream-state protocol v2, and
+recovery-v12 to trusted hidden row metadata, canonical payload/token digests,
+the manifest-selected current-token participant, and exact base-plus-token fold
+publication. Genuine v8↔v9 refusal/rebuild evidence is green. Explicit
+production enrollment, persistent lifecycle management/correction/status and
+its bounded terminal receipts, authorization, and product parity remain
+inactive. The selected unbounded
 B2a profile adds no storage watermark or `GraphHistoryBudget`; those mechanisms
 would belong only to a separately justified future bounded/managed profile.
 
@@ -584,17 +594,20 @@ reopen only after publication. `AckUnknown` preserves possible residue through
 replay but remains permanently caller-ambiguous. Fold now charges each scanner
 logical slice against the generation cap and takes each emission into dense
 owned arrays before retaining it; the legal 8,192-row high-entropy near-cap
-cell folds and publishes successfully. B2 later owns public strict activation.
-The common B2 inventory specifies explicit enrollment, durable trusted
-contributor attribution, compare-and-chain tokens, a manifest-selected
-current-token participant, bounded `REPLACE`/`WITHDRAW` correction, persistent
+cell folds and publishes successfully. The current private B2 core adds durable
+trusted contributor attribution, compare-and-chain tokens, a manifest-selected
+current-token participant, and exact joint recovery/publication of the base and
+token effects. Public strict activation remains a later B2 gate. The remaining
+common B2 inventory specifies explicit production enrollment, bounded
+`REPLACE`/`WITHDRAW` correction, persistent
 revisioned status/quiesce/resume/abort-drain/rebuild with bounded management
 receipts, authorization, and SDK/CLI/HTTP/OpenAPI product parity. B2a selects
 unbounded retain-all and loud provider exhaustion with no raw WAL deletion or
 storage/history quota. B2b managed reclamation is an optional future
 Lance-owned route, not an activation dependency for B2a. The common
-implementation plus its crash, cross-version, authorization, and product
-evidence remain gates. A `SEALED` B2 stream permits export/rebuild; in-place
+private token/attribution/fold implementation and its crash and cross-version
+evidence are present; enrollment/control, authorization, and product evidence
+remain gates. A `SEALED` B2 stream permits export/rebuild; in-place
 maintenance still waits for Phase D.
 
 The private single-live-writer-process candidate makes that support restriction
@@ -1103,7 +1116,7 @@ protected by symmetry in either case.
 > scalar-indexed/default-v1 path still emits `None`, keyed Append remains
 > reachable in today's engine, and beta.21 still permits unfiltered Update or
 > Append to land second after a filtered Update. Internal schema v6 introduced
-> the routing closure, and current v8 preserves it: every production
+> the routing closure, and current v9 preserves it: every production
 > insertion-bearing graph path uses
 > the exact-`id`, forced-v2 keyed adapter, generic Append is test-only, and the
 > adapter verifies the emitted field-ID filter. Upstream symmetry is therefore
@@ -1229,7 +1242,7 @@ The review does not require all RFCs to land together. A safe order is:
 4. RFC-024's independent physical lookup evaluation completed on 2026-07-15:
    the exact BTREE's scan work is flat, but uncompacted RustFS cold object
    reads/bytes and compacted byte terms grow, so the format is research-blocked
-   and current production remains on internal schema v8 without table heads;
+   and current production remains on internal schema v9 without table heads;
 5. keep RFC-025 research-blocked after its 2026-07-17 Gate 0 no-go; reconsider
    only after a history-flat current-authority lookup shape or revised
    evidence-backed operational contract passes the full physical-I/O boundary,
@@ -1247,10 +1260,13 @@ The review does not require all RFCs to land together. A safe order is:
    quota, surface provider exhaustion loudly, and retain the local/RustFS
    provider plus 1/8/32/128 advisory evidence. Do not add a materialization-attempt
    ledger, reserve-first complete physical-output envelope, storage watermark,
-   or `GraphHistoryBudget` to that immediate path. Implement and prove the
-   common explicit-enrollment, compare-and-chain-token, trusted-attribution,
-   revisioned-lifecycle/management-receipt, correction, authorization, and
-   SDK/CLI/HTTP/OpenAPI parity contracts before exposing B2. Keep B2b
+   or `GraphHistoryBudget` to that immediate path. Preserve the implemented
+   private schema-v9/config-v3/state-v2/recovery-v12 compare-and-chain/token-fold
+   core, including hidden trusted attribution, the manifest-selected
+   `_stream_tokens.lance` participant, exact joint publication, and genuine
+   v8↔v9 refusal/rebuild evidence. Implement and prove explicit production
+   enrollment, revisioned lifecycle management and receipts, correction/status,
+   authorization, and SDK/CLI/HTTP/OpenAPI parity before exposing B2. Keep B2b
    Lance-owned managed reclamation as an optional future route with its own
    evidence and format amendment. Retain the public exact enrollment receipt
    and cross-process admission seal as the gate for broader topology;

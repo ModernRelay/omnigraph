@@ -189,7 +189,7 @@ pub(super) async fn preview_schema_apply(
     let planned = plan_schema_for_apply(db, desired_schema_source, options).await?;
     Ok(SchemaApplyPreview {
         plan: planned.plan,
-        catalog: planned.desired_catalog,
+        catalog: super::public_catalog_view(&planned.desired_catalog)?,
     })
 }
 
@@ -712,6 +712,7 @@ where
     // therefore cover only the concrete table effects; acquiring the schema key
     // again would deadlock because these queues are intentionally non-reentrant.
     let _main_branch_guard = db.write_queue().acquire_branch(None).await;
+    let _stream_token_guard = db.write_queue().acquire_stream_token().await;
     let _schema_apply_queue_guards = db
         .write_queue()
         .acquire_many(&schema_apply_queue_keys)

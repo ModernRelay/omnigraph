@@ -1,17 +1,18 @@
 //! RFC-026 bounded stream enrollment orchestration.
 //!
 //! This module intentionally exposes no production SDK/API surface. It joins
-//! the exact MemWAL adapter, recovery-v10 sidecar, manifest-v7 lifecycle row,
+//! the exact MemWAL adapter, enrollment recovery sidecar, manifest lifecycle row,
 //! and process-local admission lease so the crash path and success path share
-//! one roll-forward implementation. Internal schema v8 enrolls directly into
-//! the exact config-v2 profile consumed by the private Phase-B1 worker.
+//! one roll-forward implementation. Internal schema v9 fixes the complete
+//! config-v3/state-v2 enrollment receipt before the recovery intent is armed.
 
 use lance_index::mem_wal::ShardId;
 
 use crate::db::manifest::{
-    RecoveryAuthorityToken, RecoveryLineageIntent, STREAM_CONFIG_VERSION, SidecarTablePin,
-    StreamLifecycle, StreamPhysicalBinding, complete_stream_enrollment_sidecar_v10,
-    new_stream_enrollment_sidecar_v10, write_sidecar,
+    EnrollmentReceipt, RecoveryAuthorityToken, RecoveryLineageIntent, STREAM_CONFIG_VERSION,
+    SidecarTablePin, StreamLifecycle, StreamPhysicalBinding,
+    complete_stream_enrollment_sidecar_v10, new_stream_enrollment_sidecar_v10,
+    stream_enrollment_intent_digest_v1, write_sidecar,
 };
 use crate::db::write_queue::StreamAdmissionKey;
 use crate::error::{OmniError, Result};
@@ -23,13 +24,21 @@ use crate::table_store::mem_wal::{
 use super::Omnigraph;
 
 impl Omnigraph {
-    /// Validate the complete internal-v8 stream capability before a handle is
+    /// Validate the complete internal-v9 stream capability before a handle is
     /// served. Recovery has already consumed every parseable enrollment intent
     /// on read-write open; therefore a MemWAL index without a lifecycle row is
     /// uncovered partial format, while every lifecycle must match its exact
-    /// current table witness and bounded config-v2 generation topology.
+    /// current table witness and bounded config-v3 generation topology.
     pub(super) async fn validate_stream_format_consistency(&self) -> Result<()> {
         let snapshot = self.coordinator.read().await.snapshot();
+        snapshot
+            .open_stream_token_authority()
+            .await
+            .map_err(|error| {
+                OmniError::manifest_internal(format!(
+                    "internal-v9 stream-token authority consistency failed: {error}"
+                ))
+            })?;
         let has_active_stream = snapshot.stream_lifecycles().any(|(_, lifecycle)| {
             matches!(
                 lifecycle.lifecycle,
@@ -40,12 +49,22 @@ impl Omnigraph {
             let branches = self.coordinator.read().await.branch_list().await?;
             if branches.iter().any(|branch| branch != "main") {
                 return Err(OmniError::manifest_internal(
-                    "internal-v8 OPEN/DRAINING stream lifecycle cannot coexist with named graph branches",
+                    "internal-v9 OPEN/DRAINING stream lifecycle cannot coexist with named graph branches",
                 ));
             }
         }
         for entry in snapshot.entries() {
             let table = self.storage().open_snapshot_at_entry(entry).await?;
+            let physical_schema = arrow_schema::Schema::from(table.dataset().schema());
+            crate::db::manifest::stream_token::validate_trusted_stream_metadata_schema(
+                &physical_schema,
+            )
+            .map_err(|error| {
+                OmniError::manifest_internal(format!(
+                    "internal-v9 stream format consistency failed for '{}' ({}): {error}",
+                    entry.table_key, entry.identity
+                ))
+            })?;
             let full_path = format!(
                 "{}/{}",
                 self.root_uri().trim_end_matches('/'),
@@ -102,7 +121,7 @@ impl Omnigraph {
             };
             validation.map_err(|error| {
                 OmniError::manifest_internal(format!(
-                    "internal-v8 stream format consistency failed for '{}' ({}): {error}",
+                    "internal-v9 stream format consistency failed for '{}' ({}): {error}",
                     entry.table_key, entry.identity
                 ))
             })?;
@@ -110,7 +129,7 @@ impl Omnigraph {
         Ok(())
     }
 
-    /// Enroll one existing main-branch table into the bounded config-v2
+    /// Enroll one existing main-branch table into the bounded config-v3
     /// physical profile. Kept crate-private until Phase B2 supplies the public
     /// stream contract.
     #[allow(dead_code)]
@@ -153,6 +172,16 @@ impl Omnigraph {
             .map_err(|error| OmniError::manifest_conflict(error.to_string()))?;
         let enrollment_plan = MemWalEnrollmentPlan::new(ShardId::new_v4(), ShardId::new_v4())
             .map_err(|error| OmniError::manifest_internal(error.to_string()))?;
+        // The public B2 API will accept the request ID from its caller.  This
+        // still-private seam mints that id on the caller's behalf, but fixes it
+        // together with a separate logical incarnation before sidecar arm.
+        let enrollment_request_id =
+            mint_distinct_stream_uuid(&[enrollment_plan.enrollment_id, enrollment_plan.shard_id]);
+        let stream_incarnation_id = mint_distinct_stream_uuid(&[
+            enrollment_plan.enrollment_id,
+            enrollment_plan.shard_id,
+            enrollment_request_id,
+        ]);
         let binding = StreamPhysicalBinding {
             stable_table_id: prepared_entry.identity.stable_table_id,
             table_incarnation_id: prepared_entry.identity.table_incarnation_id,
@@ -174,6 +203,7 @@ impl Omnigraph {
         let schema_gate_key = crate::db::manifest::schema_apply_serial_queue_key();
         let _schema_guard = write_queue.acquire(&schema_gate_key).await;
         let _branch_guard = write_queue.acquire_branch(None).await;
+        let _stream_token_guard = write_queue.acquire_stream_token().await;
         let _table_guards = write_queue
             .acquire_many(&[(prepared_entry.table_key.clone(), None)])
             .await;
@@ -247,6 +277,22 @@ impl Omnigraph {
             ));
         }
 
+        let enrollment_intent_digest = stream_enrollment_intent_digest_v1(
+            live_entry.identity,
+            &live_entry.table_path,
+            &txn.authority.schema_identity_domain,
+            &txn.authority.schema_ir_hash,
+            txn.authority.schema_identity_version,
+            &final_head,
+            &binding.stream_config_hash,
+        )?;
+        let enrollment_receipt = EnrollmentReceipt::new(
+            enrollment_request_id.to_string(),
+            enrollment_intent_digest,
+            stream_incarnation_id.to_string(),
+            binding.clone(),
+        )?;
+
         let authority = RecoveryAuthorityToken {
             branch_identifier: txn.authority.branch_identifier.clone(),
             graph_head: txn.authority.graph_head.clone(),
@@ -280,6 +326,7 @@ impl Omnigraph {
             final_head,
             enrollment_plan,
             binding.clone(),
+            enrollment_receipt,
         )?;
         write_sidecar(self.root_uri(), self.storage_adapter(), &sidecar).await?;
         crate::failpoints::maybe_fail(
@@ -342,5 +389,14 @@ impl Omnigraph {
     #[doc(hidden)]
     pub async fn failpoint_enroll_stream_table_for_test(&self, table_key: &str) -> Result<()> {
         self.enroll_stream_table_b1(table_key, None).await
+    }
+}
+
+fn mint_distinct_stream_uuid(excluded: &[ShardId]) -> ShardId {
+    loop {
+        let candidate = ShardId::new_v4();
+        if !excluded.contains(&candidate) {
+            return candidate;
+        }
     }
 }
