@@ -225,7 +225,7 @@ same pre-arm resource error above 32 MiB without reading payload bytes.
 Overwrite does accept `WriteParams` and preserves the external reference.
 
 `Append` is a user-facing mode name, not the selected Lance operation. On the
-current v8 format it preserves the v6 strict-insert contract and routes through
+current v9 format it preserves the v6 strict-insert contract and routes through
 filtered merge-insert with
 `WhenMatched::Fail`; bare Lance `Append` is unreachable from production graph
 writes. Use `Merge` when an existing `id` should be updated. This distinction is

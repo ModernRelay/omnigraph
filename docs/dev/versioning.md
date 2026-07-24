@@ -44,32 +44,31 @@ declares exactly non-null physical `id` as Lance's unenforced primary key from
 creation, and production strict insert/upsert routes use the exact-`id`
 filter-bearing adapter.
 
-Internal schema **v8 is the currently served format** and maps to OmniGraph
-**0.12.x**. It preserves the v5 identity, v6 key-fencing, and v7 stream-
-lifecycle contracts, then activates RFC-026 Phase B1's private data-bearing
-MemWAL core: exact stream-config v2, one admission-bounded no-roll generation,
-watcher success plus the same writer's post-durability epoch check before clean
-acknowledgement, conservative replay, explicit seal/drain, and a dedicated
-schema-v11 `StreamFold` recovery envelope. The fold publishes its
-base-table pointer, lifecycle HEAD witness, and fixed lineage in one manifest
-CAS; no MemWAL state is graph-visible merely because it is durable.
+Internal schema **v9 is the currently served format** and maps to OmniGraph
+**0.13.x**. It preserves v8's private data-bearing MemWAL core, then activates
+RFC-026's common B2 storage/recovery contract: stream-config v3, lifecycle
+state v2, the grammar-impossible trusted base-row field
+`__omnigraph_stream_v1$`, one manifest-selected `_stream_tokens.lance`
+authority, compare-and-chain token attribution, and recovery-v12's exact base
+plus token participants. One manifest CAS still owns graph visibility. The
+selected B2a profile retains every canonical MemWAL object indefinitely; it
+does not claim a retained-storage bound or online GC.
 
-This remains an internal storage/recovery capability, not a public streaming
-feature. V8 has no `@stream`, production SDK/HTTP/CLI surface, persistent
-quiesce/resume controls, correction lane, or fresh-read surface. Its private
-integration seam exists only under the feature-gated crash/evidence suite.
-Gate R0 originally found that one legal high-entropy near-cap generation could
-acknowledge and materialize but then exceed the fold's 32-MiB closure charge.
-The private implementation now charges scanner output by logical slice and
-copies each emission into dense owned arrays; that exact 8,192-row shape folds
-and publishes successfully. This repair does not create a new format: no
-schema v9 or product surface is activated by the selected unbounded retain-all
-profile or the optional later B2b managed-reclamation profile.
+This remains a private storage/recovery capability, not a public streaming
+feature. V9 has no `@stream`, production SDK/HTTP/CLI surface, persistent
+quiesce/resume controls, correction lane, or fresh-read surface. Its test seam
+is feature-gated and doc-hidden. Row count, logical dense-slice bytes,
+canonical payloads, token projections, recovery JSON, and exact-authority
+lookup retention are bounded; the measured near-cap fold RSS remains evidence,
+not a runtime allocator promise.
 
-A v7/0.11.x graph is not reinterpreted or migrated in place: config-v1 never
-becomes data-bearing config-v2 state. Export it with the v7 binary, initialize a
-different v8 root, and load through the v8 writer. Because
-`MIN_SUPPORTED == CURRENT == 8`, v8 refuses v7 and a v7 binary refuses v8.
+A v8/0.12.x graph is not reinterpreted or migrated in place: config-v2 and
+recovery-v11 never become config-v3/state-v2/recovery-v12 authority. Export it
+with the v8 binary, initialize a different v9 root, and load through the v9
+writer. The physical field's trailing `$` is outside the `.pg` identifier
+grammar, so a genuine v8 user property named `__omnigraph_stream_v1` remains
+ordinary user data and round-trips unchanged. Because
+`MIN_SUPPORTED == CURRENT == 9`, v9 refuses v8 and a v8 binary refuses v9.
 
 There is no in-place migration dispatcher. The single source file
 `db/manifest/migrations.rs` holds only the version constant, the stamp read/write,
@@ -107,11 +106,11 @@ independently and a hard gate there would force lockstep redeploys for every fie
 addition. So that axis is additive — old and new coexist — and the OpenAPI-drift test
 is the guard that a change stayed additive rather than breaking the shape.
 RFC-023 follows that rule: `ErrorOutput.key_conflict` is optional, and its
-`key` member remains optional on the wire for additive compatibility. The v8
+`key` member remains optional on the wire for additive compatibility. The v9
 engine returns `KeyConflict` only after a fresh exact-ID probe identifies an
 attempted key; Lance's broader retryable conflict class is not serialized as a
 key conflict without that evidence. `ErrorOutput.resource_limit` is likewise
-optional and additive; v8 servers use it with HTTP 413 for pre-arm keyed-write
+optional and additive; v9 servers use it with HTTP 413 for pre-arm keyed-write
 ceilings.
 
 ## When you change each axis

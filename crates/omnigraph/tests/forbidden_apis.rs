@@ -140,6 +140,7 @@ const ALLOW_LIST_FILES: &[&str] = &[
     "db/manifest/namespace.rs",    // Opens manifest datasets through the shared namespace.
     "db/manifest/publisher.rs",    // Lowest row-level manifest publish gateway.
     "db/manifest/recovery.rs",     // Recovery executor; exactly inventoried below.
+    "db/manifest/token_store.rs",  // Graph-global stream-token participant gateway.
     "db/manifest/tests.rs",        // Out-of-line tests for the trusted gateways.
     "instrumentation.rs",          // The instrumented dataset opener.
 ];
@@ -203,7 +204,8 @@ const MERGE_V9: WriteProtocol = WriteProtocol::Exact("BranchMerge v9");
 const INDICES_V9: WriteProtocol = WriteProtocol::Exact("EnsureIndices v9");
 const OPTIMIZE_V9: WriteProtocol = WriteProtocol::Bounded("Optimize v9");
 const STREAM_ENROLLMENT_V10: WriteProtocol = WriteProtocol::Exact("StreamEnrollment v10");
-const STREAM_FOLD_V11: WriteProtocol = WriteProtocol::Exact("StreamFold v11 / private B1");
+const STREAM_FOLD_V12: WriteProtocol =
+    WriteProtocol::Exact("StreamFold v12 / private B2 common core");
 
 #[derive(Debug, Clone, Copy)]
 struct WriteSurface {
@@ -232,7 +234,7 @@ write_surfaces! {
     "db/omnigraph.rs" => INDICES_V9 => ["ensure_indices", "ensure_indices_on"],
     "db/omnigraph.rs" => WriteProtocol::TestOnly => ["failpoint_publish_table_head_without_index_rebuild_for_test"],
     "db/omnigraph/stream_enrollment.rs" => WriteProtocol::TestOnly => ["failpoint_enroll_stream_table_for_test"],
-    "db/omnigraph/stream_ingest.rs" => WriteProtocol::TestOnly => ["failpoint_stream_b1_for_test"],
+    "db/omnigraph/stream_ingest.rs" => WriteProtocol::TestOnly => ["failpoint_stream_b1_for_test", "failpoint_stream_b2_for_test"],
     "db/omnigraph.rs" => OPTIMIZE_V9 => ["optimize"],
     "db/omnigraph.rs" => WriteProtocol::ManifestAdoption => ["repair"],
     "db/omnigraph.rs" => WriteProtocol::PhysicalOnly => ["cleanup"],
@@ -246,6 +248,7 @@ write_surfaces! {
 // cannot evade discovery.
 const READ_ONLY_SURFACES: &[(&str, &str)] = &[
     ("db/omnigraph.rs", "open_read_only"),
+    ("db/omnigraph/stream_ingest.rs", "failpoint_stream_incarnation_for_test"),
     ("db/omnigraph.rs", "plan_schema"),
     ("db/omnigraph.rs", "plan_schema_with_options"),
     ("db/omnigraph.rs", "preview_schema_apply_with_options"),
@@ -641,21 +644,29 @@ durable_calls! {
     ("db/omnigraph/table_ops.rs", "write_sidecar(", 1, INDICES_V9),
     ("db/omnigraph/optimize.rs", "write_sidecar(", 1, OPTIMIZE_V9),
     ("db/omnigraph/stream_enrollment.rs", "write_sidecar(", 1, STREAM_ENROLLMENT_V10),
-    ("db/omnigraph/stream_ingest.rs", "write_sidecar(", 1, STREAM_FOLD_V11),
+    ("db/omnigraph/stream_ingest.rs", "write_sidecar(", 1, STREAM_FOLD_V12),
+    ("db/manifest/token_store.rs", "Dataset::write(", 1, WriteProtocol::Bootstrap),
+    ("db/manifest/token_store.rs", "MergeInsertBuilder::try_new(", 1, STREAM_FOLD_V12),
+    ("db/manifest/token_store.rs", ".execute_uncommitted(", 1, STREAM_FOLD_V12),
+    ("db/omnigraph/stream_ingest.rs", "stage_stream_token_upsert(", 1, STREAM_FOLD_V12),
+    ("db/manifest/recovery.rs", "stage_stream_token_upsert(", 1, WriteProtocol::RecoveryExecutor),
     ("exec/staging.rs", ".commit_staged_exact(", 1, WriteProtocol::Exact("Mutation/Load v9")),
     ("exec/merge.rs", ".commit_staged_exact(", 1, MERGE_V9),
     ("db/omnigraph/schema_apply.rs", ".commit_staged_create_exact(", 1, SCHEMA_V9),
     ("db/omnigraph/schema_apply.rs", ".commit_staged_exact(", 1, SCHEMA_V9),
     ("db/omnigraph/table_ops.rs", ".commit_staged_exact(", 1, INDICES_V9),
-    ("db/omnigraph/stream_ingest.rs", ".commit_staged_exact(", 1, STREAM_FOLD_V11),
+    ("db/omnigraph/stream_ingest.rs", ".commit_staged_exact(", 2, STREAM_FOLD_V12),
+    ("db/manifest/recovery.rs", ".commit_staged_exact(", 1, WriteProtocol::RecoveryExecutor),
     ("db/omnigraph/table_ops.rs", ".commit_staged(", 1, WriteProtocol::Composed("shared merge/Optimize index tail")),
     ("db/omnigraph/table_ops.rs", ".fork_branch_from_state(", 1, WriteProtocol::Composed("adapter-owned first-touch data ref")),
     ("exec/staging.rs", "confirm_occ_sidecar_v9(", 1, WriteProtocol::Exact("Mutation/Load v9")),
     ("exec/merge.rs", "confirm_branch_merge_sidecar_v9(", 1, MERGE_V9),
     ("db/omnigraph/schema_apply.rs", "confirm_schema_apply_sidecar_v9(", 1, SCHEMA_V9),
     ("db/omnigraph/table_ops.rs", "confirm_ensure_indices_sidecar_v9(", 1, INDICES_V9),
-    ("db/omnigraph/stream_ingest.rs", "complete_stream_fold_sidecar_v11(", 1, STREAM_FOLD_V11),
-    ("db/omnigraph/stream_ingest.rs", "finalize_effect_free_stream_fold_sidecar_v11(", 1, STREAM_FOLD_V11),
+    ("db/omnigraph/stream_ingest.rs", "confirm_stream_fold_sidecar_v12(", 1, STREAM_FOLD_V12),
+    ("db/manifest/recovery.rs", "confirm_stream_fold_sidecar_v12(", 1, WriteProtocol::RecoveryExecutor),
+    ("db/omnigraph/stream_ingest.rs", "complete_stream_fold_sidecar_v12(", 2, STREAM_FOLD_V12),
+    ("db/omnigraph/stream_ingest.rs", "finalize_effect_free_stream_fold_sidecar_v12(", 1, STREAM_FOLD_V12),
     ("exec/mutation.rs", "delete_sidecar(", 1, MUTATION_V9),
     ("loader/mod.rs", "delete_sidecar(", 1, LOAD_V9),
     ("exec/merge.rs", "delete_sidecar(", 1, MERGE_V9),
@@ -678,7 +689,7 @@ durable_calls! {
     ("db/omnigraph.rs", ".write_text_if_absent(", 1, WriteProtocol::Bootstrap),
     ("db/omnigraph.rs", ".write_text(", 1, WriteProtocol::Bootstrap),
     ("db/schema_state.rs", ".write_text(", 2, WriteProtocol::Composed("schema state publication")),
-    ("db/manifest/recovery.rs", ".write_text(", 7, WriteProtocol::RecoveryExecutor),
+    ("db/manifest/recovery.rs", ".write_text(", 8, WriteProtocol::RecoveryExecutor),
     ("db/omnigraph/schema_apply.rs", ".write_text(", 1, SCHEMA_V9),
     ("db/omnigraph.rs", ".delete(", 1, WriteProtocol::Bootstrap),
     ("db/schema_state.rs", ".delete(", 3, WriteProtocol::Composed("schema staging cleanup")),
@@ -714,11 +725,11 @@ durable_calls! {
     ("db/manifest/recovery.rs", ".publish_with_precondition(", 1, WriteProtocol::RecoveryExecutor),
     ("db/manifest/recovery.rs", ".publish(", 1, WriteProtocol::RecoveryExecutor),
     ("db/manifest/recovery.rs", ".restore(", 1, WriteProtocol::RecoveryExecutor),
-    ("db/manifest/recovery.rs", ".append(RecoveryAuditRecord", 9, WriteProtocol::RecoveryExecutor),
-    ("db/manifest/recovery.rs", "publish_recovery_commit(", 10, WriteProtocol::RecoveryExecutor),
+    ("db/manifest/recovery.rs", ".append(RecoveryAuditRecord", 10, WriteProtocol::RecoveryExecutor),
+    ("db/manifest/recovery.rs", "publish_recovery_commit(", 11, WriteProtocol::RecoveryExecutor),
     ("db/manifest/recovery.rs", "restore_table_to_version(", 3, WriteProtocol::RecoveryExecutor),
-    ("db/manifest/recovery.rs", "record_audit(", 11, WriteProtocol::RecoveryExecutor),
-    ("db/manifest/recovery.rs", "delete_sidecar_by_operation_id(", 22, WriteProtocol::RecoveryExecutor),
+    ("db/manifest/recovery.rs", "record_audit(", 12, WriteProtocol::RecoveryExecutor),
+    ("db/manifest/recovery.rs", "delete_sidecar_by_operation_id(", 24, WriteProtocol::RecoveryExecutor),
     ("db/manifest/recovery.rs", "delete_sidecar(", 3, WriteProtocol::RecoveryExecutor),
     ("db/recovery_audit.rs", ".raw_dataset_append(", 1, WriteProtocol::RecoveryExecutor),
     ("db/recovery_audit.rs", "Dataset::write(", 1, WriteProtocol::RecoveryExecutor),
@@ -734,18 +745,19 @@ durable_calls! {
     ("db/omnigraph/repair.rs", ".dataset()", 1, WriteProtocol::ManifestAdoption),
     ("db/omnigraph/optimize.rs", ".dataset()", 5, WriteProtocol::Composed("Optimize v9 planning + physical cleanup")),
     ("db/omnigraph/optimize.rs", ".into_dataset()", 2, OPTIMIZE_V9),
-    ("db/omnigraph/stream_enrollment.rs", ".dataset()", 6, WriteProtocol::ReadOnlyAccess),
+    ("db/omnigraph/stream_enrollment.rs", ".dataset()", 7, WriteProtocol::ReadOnlyAccess),
     ("db/omnigraph/stream_enrollment.rs", ".into_dataset()", 1, STREAM_ENROLLMENT_V10),
-    ("db/omnigraph/stream_ingest.rs", ".dataset()", 10, STREAM_FOLD_V11),
-    ("db/omnigraph/stream_ingest.rs", ".mem_wal_writer(", 2, STREAM_FOLD_V11),
-    ("db/omnigraph/stream_ingest.rs", ".put(", 1, STREAM_FOLD_V11),
+    ("db/omnigraph/stream_ingest.rs", ".dataset()", 16, STREAM_FOLD_V12),
+    ("db/omnigraph/stream_ingest.rs", ".mem_wal_writer(", 2, STREAM_FOLD_V12),
+    ("db/omnigraph/stream_ingest.rs", ".put(", 1, STREAM_FOLD_V12),
     ("table_store/mem_wal.rs", ".initialize_mem_wal()", 1, STREAM_ENROLLMENT_V10),
     ("table_store/mem_wal.rs", ".mem_wal_writer(", 1, STREAM_ENROLLMENT_V10),
-    ("table_store/mem_wal/worker.rs", ".put_no_wait(", 1, STREAM_FOLD_V11),
-    ("table_store/mem_wal/worker.rs", ".abort()", 2, STREAM_FOLD_V11),
-    ("table_store/mem_wal/worker.rs", ".force_seal_active()", 1, STREAM_FOLD_V11),
-    ("table_store/mem_wal/worker.rs", ".wait_for_flush_drain()", 1, STREAM_FOLD_V11),
+    ("table_store/mem_wal/worker.rs", ".put_no_wait(", 1, STREAM_FOLD_V12),
+    ("table_store/mem_wal/worker.rs", ".abort()", 2, STREAM_FOLD_V12),
+    ("table_store/mem_wal/worker.rs", ".force_seal_active()", 1, STREAM_FOLD_V12),
+    ("table_store/mem_wal/worker.rs", ".wait_for_flush_drain()", 1, STREAM_FOLD_V12),
     ("db/omnigraph/optimize.rs", "SnapshotHandle::new(", 1, OPTIMIZE_V9),
+    ("db/omnigraph/stream_ingest.rs", "SnapshotHandle::new(", 1, STREAM_FOLD_V12),
     ("exec/merge.rs", "SnapshotHandle::new(", 5, MERGE_V9),
 }
 
@@ -757,6 +769,10 @@ const DURABLE_PRIMITIVES: &[&str] = &[
     "confirm_ensure_indices_sidecar_v9(",
     "complete_stream_fold_sidecar_v11(",
     "finalize_effect_free_stream_fold_sidecar_v11(",
+    "confirm_stream_fold_sidecar_v12(",
+    "complete_stream_fold_sidecar_v12(",
+    "finalize_effect_free_stream_fold_sidecar_v12(",
+    "stage_stream_token_upsert(",
     "delete_sidecar(",
     ".commit_staged_create_exact(",
     ".commit_staged_exact(",

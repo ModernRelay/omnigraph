@@ -49,6 +49,15 @@ async fn plan_schema_reports_supported_additive_change() {
             ..
         } if type_name == "Person" && property_name == "nickname"
     )));
+
+    let preview = db
+        .preview_schema_apply_with_options(&desired, omnigraph::db::SchemaApplyOptions::default())
+        .await
+        .unwrap();
+    assert!(preview.catalog.node_types.values().all(|node| node
+        .arrow_schema
+        .field_with_name("__omnigraph_stream_v1$")
+        .is_err()));
 }
 
 #[tokio::test]
@@ -149,6 +158,25 @@ async fn long_lived_handle_uses_the_schema_catalog_bound_to_its_write_token() {
         )
     );
     schema_owner.apply_schema(&desired).await.unwrap();
+    assert!(
+        schema_owner.catalog().node_types.values().all(|node| node
+            .arrow_schema
+            .field_with_name("__omnigraph_stream_v1$")
+            .is_err()),
+        "schema publication must keep protocol metadata out of the owner's public catalog"
+    );
+    let reopened_after_apply = Omnigraph::open(uri).await.unwrap();
+    assert!(
+        reopened_after_apply
+            .catalog()
+            .node_types
+            .values()
+            .all(|node| node
+                .arrow_schema
+                .field_with_name("__omnigraph_stream_v1$")
+                .is_err()),
+        "reopen must reconstruct the same sealed public catalog after schema apply"
+    );
     // The same apply exercises both physical schema shapes: Person is rebuilt
     // through a staged overwrite for the added property, while Project is a
     // newly created table incarnation. Neither may drop the immutable v6 PK.

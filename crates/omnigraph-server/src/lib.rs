@@ -901,6 +901,9 @@ impl ApiError {
             // fields: a fold request is a retryable logical conflict, while an
             // invoked-but-unconfirmed append is unavailable/ambiguous.
             err @ OmniError::FoldRequired { .. } => Self::conflict(err.to_string()),
+            err @ (OmniError::StreamBindingChanged { .. }
+            | OmniError::StreamSequenceConflict { .. }
+            | OmniError::StreamIdempotencyConflict { .. }) => Self::conflict(err.to_string()),
             err @ OmniError::AckUnknown { .. } => Self::internal(err.to_string()),
             OmniError::RecoveryRequired {
                 operation_id,

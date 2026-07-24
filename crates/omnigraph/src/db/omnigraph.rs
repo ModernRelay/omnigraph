@@ -161,7 +161,11 @@ pub(crate) struct WriteTxn {
 /// combine an old source with a new identity-bearing catalog (or vice versa).
 #[derive(Debug)]
 struct HandleSchemaView {
+    /// Physical engine catalog, including storage-only fields and metadata.
     catalog: Arc<Catalog>,
+    /// Public reflection view derived atomically from `catalog`; it differs
+    /// only by omitting protocol-private fields.
+    public_catalog: Arc<Catalog>,
     source: Arc<String>,
     schema_ir_hash: String,
     schema_identity_domain: String,
@@ -326,6 +330,13 @@ fn private_b1_worker_limits() -> crate::table_store::mem_wal::B1WorkerLimits {
         max_resident_writers_root: 1,
         max_resident_writers_per_table: 1,
         max_reserved_arrow_bytes: 32 * 1024 * 1024,
+        // A B2 caller reserves the full worst-case preprocessing envelope
+        // before blob materialization or canonical encoding. Keeping one such
+        // envelopes root-wide is the minimum qualified concurrency contract:
+        // one stale provisional caller may wait while another becomes the
+        // winner whose authority it must later observe.
+        max_b2_preprocessing_bytes:
+            crate::table_store::mem_wal::B2_MAX_PREPROCESSING_BYTES_ROOT,
         // Every queued input is charged against the same aggregate Arrow
         // reservation synchronously, before detachment or cold claim. This
         // count therefore bounds scheduling/control overhead; it cannot admit
@@ -418,6 +429,7 @@ impl Omnigraph {
         let schema_identity_domain = schema_ir.schema_identity_domain.as_str().to_string();
         let mut catalog = build_catalog_from_ir(&schema_ir)?;
         fixup_physical_schemas(&mut catalog)?;
+        let public_catalog = public_catalog_view(&catalog)?;
 
         // Establish an atomic ownership claim on `_schema.pg` before
         // writing the remaining init artifacts. A check-then-write preflight
@@ -497,6 +509,7 @@ impl Omnigraph {
             }),
             schema_view: Arc::new(ArcSwap::from_pointee(HandleSchemaView {
                 catalog: Arc::new(catalog),
+                public_catalog: Arc::new(public_catalog),
                 source: Arc::new(schema_source.to_string()),
                 schema_ir_hash: accepted_schema_ir_hash,
                 schema_identity_domain,
@@ -668,6 +681,7 @@ impl Omnigraph {
         let schema_identity_domain = accepted_ir.schema_identity_domain.as_str().to_string();
         let mut catalog = build_catalog_from_ir(&accepted_ir)?;
         fixup_physical_schemas(&mut catalog)?;
+        let public_catalog = public_catalog_view(&catalog)?;
 
         let session = lance_access.data_session();
         let db = Self {
@@ -687,6 +701,7 @@ impl Omnigraph {
             }),
             schema_view: Arc::new(ArcSwap::from_pointee(HandleSchemaView {
                 catalog: Arc::new(catalog),
+                public_catalog: Arc::new(public_catalog),
                 source: Arc::new(schema_source),
                 schema_ir_hash: accepted_state.schema_ir_hash,
                 schema_identity_domain,
@@ -712,7 +727,7 @@ impl Omnigraph {
     /// catalog pointer; callers can hold the returned `Arc` across awaits
     /// without blocking concurrent `apply_schema`.
     pub fn catalog(&self) -> Arc<Catalog> {
-        Arc::clone(&self.schema_view.load().catalog)
+        Arc::clone(&self.schema_view.load().public_catalog)
     }
 
     /// Returns an `Arc<String>` snapshot of the schema source.
@@ -744,8 +759,10 @@ impl Omnigraph {
                     .to_string(),
             ));
         }
+        let public_catalog = public_catalog_view(&catalog)?;
         self.schema_view.store(Arc::new(HandleSchemaView {
             catalog: Arc::new(catalog),
+            public_catalog: Arc::new(public_catalog),
             source: Arc::new(schema_source),
             schema_ir_hash,
             schema_identity_domain: accepted_ir.schema_identity_domain.as_str().to_string(),
@@ -1760,8 +1777,9 @@ impl Omnigraph {
 
     /// RFC-022 synchronous write/control recovery barrier. Run the live-safe
     /// healer, then reject any guarded unresolved intent on a relevant graph branch. A
-    /// SchemaApply intent is graph-global because it changes the accepted schema
-    /// identity used by every branch.
+    /// SchemaApply is graph-global because it changes accepted schema identity;
+    /// StreamFold is graph-global because recovery-v12 owns an unpublished
+    /// `_stream_tokens.lance` HEAD shared by every table and branch.
     ///
     /// `relevant_branches` must use the engine convention (`None` = main), but
     /// this helper defensively folds `Some("main")` as well so load's explicit
@@ -1772,7 +1790,7 @@ impl Omnigraph {
     ) -> Result<()> {
         let outcome = self.heal_pending_recovery_sidecars_outcome().await?;
         let blocking = outcome.unresolved.iter().find(|intent| {
-            intent.writer_kind == crate::db::manifest::SidecarKind::SchemaApply
+            intent.writer_kind.is_graph_global_barrier()
                 || relevant_branches
                     .iter()
                     .any(|branch| branch.filter(|name| *name != "main") == intent.branch.as_deref())
@@ -1804,15 +1822,16 @@ impl Omnigraph {
     /// sidecar's table effects are unreachable and the recovery sweep records an
     /// orphan-discard audit. Safety comes from branch_delete subsequently taking
     /// schema -> target branch -> every accepted-catalog table gate before the
-    /// ref mutation, which waits out any live in-process owner. SchemaApply
-    /// remains graph-global and bounded main StreamEnrollment can establish the
-    /// topology-closing lifecycle authority, so both still block deletion.
+    /// ref mutation, which waits out any live in-process owner. Graph-global
+    /// recovery and bounded main StreamEnrollment can establish authority that
+    /// deletion must not bypass, so both still block deletion.
     async fn heal_pending_recovery_sidecars_for_branch_delete(&self, branch: &str) -> Result<()> {
         let outcome = self.heal_pending_recovery_sidecars_outcome().await?;
         if let Some(intent) = outcome.unresolved.iter().find(|intent| {
             matches!(
                 intent.writer_kind,
                 crate::db::manifest::SidecarKind::SchemaApply
+                    | crate::db::manifest::SidecarKind::StreamFold
                     | crate::db::manifest::SidecarKind::StreamEnrollment
             )
         }) {
@@ -1845,7 +1864,7 @@ impl Omnigraph {
             crate::db::manifest::list_sidecars(&self.root_uri, self.storage.as_ref()).await?;
         let blocking = sidecars.iter().find(|sidecar| {
             let sidecar_branch = sidecar.branch.as_deref().filter(|branch| *branch != "main");
-            sidecar.writer_kind == crate::db::manifest::SidecarKind::SchemaApply
+            sidecar.writer_kind.is_graph_global_barrier()
                 || relevant_branches
                     .iter()
                     .any(|branch| branch.filter(|name| *name != "main") == sidecar_branch)
@@ -2791,6 +2810,7 @@ impl Omnigraph {
             .acquire(&crate::db::manifest::schema_apply_serial_queue_key())
             .await;
         let _branch_guards = self.write_queue().acquire_branches(&control_branches).await;
+        let _stream_token_guard = self.write_queue().acquire_stream_token().await;
         self.ensure_schema_apply_not_locked("branch_create").await?;
         let control_catalog = self.build_accepted_catalog_with_schema_gate_held().await?;
         let table_queue_keys =
@@ -2892,6 +2912,7 @@ impl Omnigraph {
             .acquire(&crate::db::manifest::schema_apply_serial_queue_key())
             .await;
         let _branch_guards = self.write_queue().acquire_branches(&control_branches).await;
+        let _stream_token_guard = self.write_queue().acquire_stream_token().await;
         self.ensure_schema_apply_not_locked("branch_create_from")
             .await?;
         let control_catalog = self.build_accepted_catalog_with_schema_gate_held().await?;
@@ -2978,6 +2999,7 @@ impl Omnigraph {
             .acquire(&crate::db::manifest::schema_apply_serial_queue_key())
             .await;
         let _branch_guards = self.write_queue().acquire_branches(&control_branches).await;
+        let _stream_token_guard = self.write_queue().acquire_stream_token().await;
         self.ensure_schema_apply_not_locked("branch_delete").await?;
         let control_catalog = self.build_accepted_catalog_with_schema_gate_held().await?;
         let table_queue_keys =
@@ -3333,7 +3355,8 @@ fn blob_description_is_null(descriptions: &StructArray, row: usize) -> Result<bo
 /// it can create, overwrite, or rebuild a physical graph table:
 ///
 /// - `ScalarType::Blob`'s `LargeBinary` placeholder becomes a blob-v2 field;
-/// - exactly the injected, non-null top-level `id` field is the Lance PK; and
+/// - exactly the injected, non-null top-level `id` field is the Lance PK;
+/// - the internal-v9 nullable trusted-stream struct is appended once; and
 /// - schema metadata and unrelated field metadata survive the reconstruction.
 ///
 /// RFC-023 makes this part of internal format v6. Older physical images are
@@ -3357,13 +3380,65 @@ fn fixup_physical_schemas(catalog: &mut Catalog) -> Result<()> {
     Ok(())
 }
 
+/// Derive the warm public reflection catalog from one validated physical
+/// catalog. Keeping both views in the same `HandleSchemaView` publication
+/// preserves cheap `catalog()` snapshots without letting storage-protocol
+/// columns become SDK schema.
+fn public_catalog_view(physical: &Catalog) -> Result<Catalog> {
+    fn strip(schema: &Arc<Schema>, table_key: &str) -> Result<Arc<Schema>> {
+        let mut hidden_count = 0;
+        let fields = schema
+            .fields()
+            .iter()
+            .filter_map(|field| {
+                if field.name() == crate::db::STREAM_METADATA_COLUMN {
+                    hidden_count += 1;
+                    None
+                } else {
+                    Some(field.as_ref().clone())
+                }
+            })
+            .collect::<Vec<_>>();
+        if hidden_count != 1 {
+            return Err(OmniError::manifest_internal(format!(
+                "physical catalog for '{table_key}' must contain exactly one reserved field '{}'; found {hidden_count}",
+                crate::db::STREAM_METADATA_COLUMN
+            )));
+        }
+        Ok(Arc::new(Schema::new_with_metadata(
+            fields,
+            schema.metadata().clone(),
+        )))
+    }
+
+    let mut public = physical.clone();
+    for (name, node_type) in &mut public.node_types {
+        node_type.arrow_schema = strip(&node_type.arrow_schema, &format!("node:{name}"))?;
+    }
+    for (name, edge_type) in &mut public.edge_types {
+        edge_type.arrow_schema = strip(&edge_type.arrow_schema, &format!("edge:{name}"))?;
+    }
+    Ok(public)
+}
+
 fn physical_table_schema(
     schema: &Arc<Schema>,
     blob_properties: &HashSet<String>,
     table_key: &str,
 ) -> Result<Arc<Schema>> {
     let mut id_count = 0;
-    let fields = schema
+    if schema
+        .fields()
+        .iter()
+        .any(|field| field.name() == crate::db::STREAM_METADATA_COLUMN)
+    {
+        return Err(OmniError::manifest_internal(format!(
+            "logical schema for '{table_key}' illegally supplies reserved field '{}'",
+            crate::db::STREAM_METADATA_COLUMN
+        )));
+    }
+
+    let mut fields = schema
         .fields()
         .iter()
         .map(|field| {
@@ -3409,6 +3484,8 @@ fn physical_table_schema(
             "physical schema for '{table_key}' has a nullable `id` field"
         )));
     }
+
+    fields.push(crate::db::manifest::stream_token::trusted_stream_metadata_field());
 
     Ok(Arc::new(Schema::new_with_metadata(
         fields,
@@ -3548,12 +3625,196 @@ fn schema_for_table_key(catalog: &Catalog, table_key: &str) -> Result<Arc<Schema
 fn record_batch_row_to_json(batch: &RecordBatch, row: usize) -> Result<serde_json::Value> {
     let mut obj = serde_json::Map::new();
     for (i, field) in batch.schema().fields().iter().enumerate() {
+        if field.name() == crate::db::STREAM_METADATA_COLUMN {
+            continue;
+        }
         obj.insert(
             field.name().clone(),
             json_value_from_array(batch.column(i).as_ref(), row)?,
         );
     }
     Ok(serde_json::Value::Object(obj))
+}
+
+/// Canonical stream-payload encoding v1.
+///
+/// This deliberately writes object members in Arrow schema order instead of
+/// passing through `serde_json::Map`.  The latter changes iteration order when
+/// serde_json's `preserve_order` feature is unified into the workspace, which
+/// would make the same logical row derive a different durable stream token.
+/// The accepted schema hash already binds field types, so this encoding needs
+/// only a deterministic, lossless JSON representation of the normalized row.
+pub(super) fn canonical_stream_payload_v1(batch: &RecordBatch, row: usize) -> Result<Vec<u8>> {
+    canonical_stream_payload_v1_with_limit(
+        batch,
+        row,
+        crate::table_store::mem_wal::B2_MAX_CANONICAL_PAYLOAD_BYTES,
+    )
+}
+
+fn canonical_stream_payload_v1_with_limit(
+    batch: &RecordBatch,
+    row: usize,
+    byte_limit: u64,
+) -> Result<Vec<u8>> {
+    if row >= batch.num_rows() {
+        return Err(OmniError::manifest_internal(format!(
+            "canonical stream payload row {row} is outside a {}-row batch",
+            batch.num_rows()
+        )));
+    }
+    let limit = usize::try_from(byte_limit)
+    .map_err(|_| OmniError::manifest_internal("canonical stream payload cap exceeds usize"))?;
+    let mut writer = BoundedCanonicalWriter::new(limit);
+    let encoded = (|| -> Result<()> {
+        use std::io::Write as _;
+
+        writer.write_all(b"{").map_err(canonical_writer_error)?;
+        let mut first = true;
+        for (index, field) in batch.schema().fields().iter().enumerate() {
+            if field.name() == crate::db::STREAM_METADATA_COLUMN {
+                continue;
+            }
+            if !first {
+                writer.write_all(b",").map_err(canonical_writer_error)?;
+            }
+            first = false;
+            serde_json::to_writer(&mut writer, field.name())
+                .map_err(canonical_json_error)?;
+            writer.write_all(b":").map_err(canonical_writer_error)?;
+            write_canonical_json_from_array(&mut writer, batch.column(index).as_ref(), row)?;
+        }
+        writer.write_all(b"}").map_err(canonical_writer_error)?;
+        Ok(())
+    })();
+    if writer.exceeded {
+        return Err(OmniError::resource_limit(
+            "stream_canonical_payload_bytes",
+            byte_limit,
+            u64::try_from(writer.attempted).unwrap_or(u64::MAX),
+        ));
+    }
+    encoded?;
+    Ok(writer.bytes)
+}
+
+struct BoundedCanonicalWriter {
+    bytes: Vec<u8>,
+    limit: usize,
+    attempted: usize,
+    exceeded: bool,
+}
+
+impl BoundedCanonicalWriter {
+    fn new(limit: usize) -> Self {
+        Self {
+            bytes: Vec::new(),
+            limit,
+            attempted: 0,
+            exceeded: false,
+        }
+    }
+}
+
+impl std::io::Write for BoundedCanonicalWriter {
+    fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+        self.attempted = self.bytes.len().saturating_add(bytes.len());
+        if self.attempted > self.limit {
+            self.exceeded = true;
+            return Err(std::io::Error::other(
+                "canonical stream payload exceeds its configured byte cap",
+            ));
+        }
+        self.bytes.extend_from_slice(bytes);
+        Ok(bytes.len())
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
+fn canonical_writer_error(error: std::io::Error) -> OmniError {
+    OmniError::manifest_internal(format!("failed to encode canonical stream payload: {error}"))
+}
+
+fn canonical_json_error(error: serde_json::Error) -> OmniError {
+    OmniError::manifest_internal(format!("failed to encode canonical stream payload: {error}"))
+}
+
+fn write_canonical_json_from_array(
+    writer: &mut BoundedCanonicalWriter,
+    array: &dyn Array,
+    row: usize,
+) -> Result<()> {
+    use std::io::Write as _;
+
+    if array.is_null(row) {
+        writer.write_all(b"null").map_err(canonical_writer_error)?;
+        return Ok(());
+    }
+    match array.data_type() {
+        DataType::List(_) => {
+            let list = array
+                .as_any()
+                .downcast_ref::<ListArray>()
+                .ok_or_else(|| OmniError::Lance("expected ListArray".to_string()))?;
+            write_canonical_json_list(writer, list.value(row).as_ref())
+        }
+        DataType::LargeList(_) => {
+            let list = array
+                .as_any()
+                .downcast_ref::<LargeListArray>()
+                .ok_or_else(|| OmniError::Lance("expected LargeListArray".to_string()))?;
+            write_canonical_json_list(writer, list.value(row).as_ref())
+        }
+        DataType::FixedSizeList(_, _) => {
+            let list = array
+                .as_any()
+                .downcast_ref::<FixedSizeListArray>()
+                .ok_or_else(|| OmniError::Lance("expected FixedSizeListArray".to_string()))?;
+            write_canonical_json_list(writer, list.value(row).as_ref())
+        }
+        DataType::Struct(fields) => {
+            let values = array
+                .as_any()
+                .downcast_ref::<StructArray>()
+                .ok_or_else(|| OmniError::Lance("expected StructArray".to_string()))?;
+            writer.write_all(b"{").map_err(canonical_writer_error)?;
+            for (index, field) in fields.iter().enumerate() {
+                if index != 0 {
+                    writer.write_all(b",").map_err(canonical_writer_error)?;
+                }
+                serde_json::to_writer(&mut *writer, field.name())
+                    .map_err(canonical_json_error)?;
+                writer.write_all(b":").map_err(canonical_writer_error)?;
+                write_canonical_json_from_array(writer, values.column(index).as_ref(), row)?;
+            }
+            writer.write_all(b"}").map_err(canonical_writer_error)?;
+            Ok(())
+        }
+        _ => {
+            let value = json_value_from_array(array, row)?;
+            serde_json::to_writer(writer, &value).map_err(canonical_json_error)
+        }
+    }
+}
+
+fn write_canonical_json_list(
+    writer: &mut BoundedCanonicalWriter,
+    values: &dyn Array,
+) -> Result<()> {
+    use std::io::Write as _;
+
+    writer.write_all(b"[").map_err(canonical_writer_error)?;
+    for index in 0..values.len() {
+        if index != 0 {
+            writer.write_all(b",").map_err(canonical_writer_error)?;
+        }
+        write_canonical_json_from_array(writer, values, index)?;
+    }
+    writer.write_all(b"]").map_err(canonical_writer_error)?;
+    Ok(())
 }
 
 fn json_value_from_array(array: &dyn Array, row: usize) -> Result<serde_json::Value> {
@@ -3728,6 +3989,7 @@ fn json_value_from_array(array: &dyn Array, row: usize) -> Result<serde_json::Va
 #[cfg(test)]
 mod tests {
     use super::*;
+    use arrow_array::types::Int32Type;
     use crate::db::manifest::ManifestCoordinator;
     use async_trait::async_trait;
     use serde_json::Value;
@@ -3748,6 +4010,80 @@ edge Knows: Person -> Person {
 }
 edge WorksAt: Person -> Company
 "#;
+
+    #[test]
+    fn canonical_stream_payload_v1_has_schema_ordered_known_answer() {
+        let nested_fields = vec![
+            Arc::new(Field::new("z_child", DataType::Utf8, false)),
+            Arc::new(Field::new("a_child", DataType::Int32, false)),
+        ];
+        let nested = StructArray::from(vec![
+            (
+                Arc::clone(&nested_fields[0]),
+                Arc::new(StringArray::from(vec!["nested"])) as Arc<dyn Array>,
+            ),
+            (
+                Arc::clone(&nested_fields[1]),
+                Arc::new(Int32Array::from(vec![9])) as Arc<dyn Array>,
+            ),
+        ]);
+        let list = ListArray::from_iter_primitive::<Int32Type, _, _>(vec![Some(vec![
+            Some(1),
+            None,
+            Some(3),
+        ])]);
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("z", DataType::Utf8, false),
+            Field::new("nil", DataType::Int32, true),
+            Field::new("integer", DataType::Int64, false),
+            Field::new("float", DataType::Float64, false),
+            Field::new("date", DataType::Date32, false),
+            Field::new("binary", DataType::Binary, false),
+            Field::new("list", list.data_type().clone(), false),
+            Field::new("struct", DataType::Struct(nested_fields.into()), false),
+        ]));
+        let batch = RecordBatch::try_new(
+            schema,
+            vec![
+                Arc::new(StringArray::from(vec!["a\n\"b"])),
+                Arc::new(Int32Array::from(vec![None])),
+                Arc::new(Int64Array::from(vec![-4])),
+                Arc::new(Float64Array::from(vec![1.5])),
+                Arc::new(Date32Array::from(vec![7])),
+                Arc::new(BinaryArray::from_vec(vec![b"\x00\xff".as_slice()])),
+                Arc::new(list),
+                Arc::new(nested),
+            ],
+        )
+        .unwrap();
+
+        let encoded = canonical_stream_payload_v1(&batch, 0).unwrap();
+        assert_eq!(
+            String::from_utf8(encoded).unwrap(),
+            r#"{"z":"a\n\"b","nil":null,"integer":-4,"float":1.5,"date":7,"binary":"AP8=","list":[1,null,3],"struct":{"z_child":"nested","a_child":9}}"#
+        );
+    }
+
+    #[test]
+    fn canonical_stream_payload_v1_fails_with_typed_bound_before_retaining_excess() {
+        let batch = RecordBatch::try_new(
+            Arc::new(Schema::new(vec![Field::new("id", DataType::Utf8, false)])),
+            vec![Arc::new(StringArray::from(vec!["payload"]))],
+        )
+        .unwrap();
+        let error = canonical_stream_payload_v1_with_limit(&batch, 0, 8).unwrap_err();
+        assert!(
+            matches!(
+                error,
+                OmniError::ResourceLimitExceeded {
+                    ref resource,
+                    limit: 8,
+                    actual,
+                } if resource == "stream_canonical_payload_bytes" && actual > 8
+            ),
+            "{error:?}"
+        );
+    }
 
     #[derive(Debug)]
     struct RecordingStorageAdapter {
@@ -4360,8 +4696,7 @@ edge WorksAt: Person -> Company
             .stream_lifecycle(manifest.snapshot().entry("node:Person").unwrap().identity)
             .cloned()
             .unwrap();
-        let mut sealed = current.clone();
-        sealed.lifecycle = crate::db::manifest::StreamLifecycle::Sealed;
+        let sealed = crate::db::manifest::stream::test_sealed_lifecycle_from(&current).unwrap();
         manifest
             .commit_changes(&[ManifestChange::SetStreamLifecycle {
                 expected: Some(current),

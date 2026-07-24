@@ -107,10 +107,106 @@ async fn init_creates_graph() {
 
     assert_eq!(db.catalog().node_types.len(), 2);
     assert_eq!(db.catalog().edge_types.len(), 2);
+    assert!(
+        db.catalog().node_types.values().all(|node| node
+            .arrow_schema
+            .field_with_name("__omnigraph_stream_v1$")
+            .is_err()),
+        "public catalog reflection must omit protocol-private stream metadata"
+    );
     assert_eq!(
         db.catalog().node_types["Person"].key_property(),
         Some("name")
     );
+    let person = snap.open("node:Person").await.unwrap();
+    assert!(person.schema().field("__omnigraph_stream_v1$").is_none());
+    assert!(
+        person
+            .load_indices()
+            .await
+            .unwrap()
+            .iter()
+            .all(|index| index.name != "__lance_mem_wal"),
+        "public index reflection must omit Lance's private MemWAL system index"
+    );
+    let private_filter = person
+        .count_rows(Some(r#""__OMNIGRAPH_STREAM_V1$" IS NULL"#.to_string()))
+        .await
+        .unwrap_err();
+    assert!(
+        private_filter
+            .to_string()
+            .contains("reserved for OmniGraph storage protocol metadata"),
+        "{private_filter:?}"
+    );
+    assert_eq!(
+        person
+            .count_rows(Some(
+                "name = '__omnigraph_stream_v1$'".to_string(),
+            ))
+            .await
+            .unwrap(),
+        0,
+        "the private spelling remains legal as ordinary user data"
+    );
+    let mut literal_filter = person.scan();
+    literal_filter
+        .filter("name = '__omnigraph_stream_v1$'")
+        .unwrap();
+    literal_filter.try_into_stream().await.unwrap();
+    let mut private_projection = person.scan();
+    let private_projection = match private_projection.project(&["__OMNIGRAPH_STREAM_V1$"]) {
+        Ok(_) => panic!("public projection must reject protocol-private stream metadata"),
+        Err(error) => error,
+    };
+    assert!(
+        private_projection
+            .to_string()
+            .contains("reserved for OmniGraph storage protocol metadata"),
+        "{private_projection:?}"
+    );
+    let mut structured_private_filter = person.scan();
+    structured_private_filter
+        .filter_expr(datafusion::prelude::col("__omnigraph_stream_v1$").is_null());
+    let structured_private_filter = match structured_private_filter.try_into_stream().await {
+        Ok(_) => panic!("structured filters must not expose protocol-private stream metadata"),
+        Err(error) => error,
+    };
+    assert!(
+        structured_private_filter
+            .to_string()
+            .contains("reserved for OmniGraph storage protocol metadata"),
+        "{structured_private_filter:?}"
+    );
+}
+
+#[tokio::test]
+async fn public_snapshot_wildcard_omits_protocol_metadata() {
+    let dir = tempfile::tempdir().unwrap();
+    let uri = dir.path().to_str().unwrap();
+    let mut db = Omnigraph::init(uri, TEST_SCHEMA).await.unwrap();
+    omnigraph::loader::load_jsonl(
+        &mut db,
+        r#"{"type":"Person","data":{"name":"Alice","age":30}}"#,
+        omnigraph::loader::LoadMode::Merge,
+    )
+    .await
+    .unwrap();
+
+    let snapshot = snapshot_main(&db).await.unwrap();
+    let person = snapshot.open("node:Person").await.unwrap();
+    let mut scanner = person.scan();
+    scanner.project(&["*"]).unwrap();
+    let batches: Vec<arrow_array::RecordBatch> = futures::TryStreamExt::try_collect(
+        scanner.try_into_stream().await.unwrap(),
+    )
+    .await
+    .unwrap();
+    assert_eq!(batches.iter().map(|batch| batch.num_rows()).sum::<usize>(), 1);
+    assert!(batches.iter().all(|batch| batch
+        .schema()
+        .field_with_name("__omnigraph_stream_v1$")
+        .is_err()));
 }
 
 #[tokio::test]
@@ -148,6 +244,26 @@ async fn open_reads_existing_graph() {
             .schema_identity_domain
             .as_str(),
         identity_domain.as_str()
+    );
+}
+
+#[tokio::test]
+async fn open_refuses_a_missing_manifest_selected_stream_token_dataset() {
+    let dir = tempfile::tempdir().unwrap();
+    let uri = dir.path().to_str().unwrap();
+    let db = Omnigraph::init(uri, TEST_SCHEMA).await.unwrap();
+    drop(db);
+
+    fs::remove_dir_all(dir.path().join("_stream_tokens.lance")).unwrap();
+    let error = match Omnigraph::open(uri).await {
+        Ok(_) => panic!("v9 open must validate its manifest-selected token authority"),
+        Err(error) => error,
+    };
+    assert!(
+        error
+            .to_string()
+            .contains("stream-token authority consistency failed"),
+        "{error:?}"
     );
 }
 

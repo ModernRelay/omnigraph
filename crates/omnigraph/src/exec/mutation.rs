@@ -353,6 +353,11 @@ fn build_insert_batch(
     for field in schema.fields() {
         if field.name() == "id" {
             columns.push(Arc::new(StringArray::from(vec![id])));
+        } else if field.name() == crate::db::STREAM_METADATA_COLUMN {
+            columns.push(
+                crate::db::manifest::stream_token::build_trusted_stream_metadata_array(&[None])
+                    .map_err(|error| OmniError::manifest_internal(error.to_string()))?,
+            );
         } else if blob_properties.contains(field.name()) {
             if let Some(Literal::String(uri)) = assignments.get(field.name()) {
                 columns.push(build_blob_array_from_value(uri)?);
