@@ -122,6 +122,15 @@ fn parity_commit_list() {
 }
 
 #[test]
+fn parity_commit_list_branch() {
+    // Exercises the `--branch` fork: the remote arm sends `?branch=` while the
+    // embedded arm passes the branch straight to the engine.
+    let p = parity();
+    let (l, r) = p.run(&["commit", "list", "--branch", "main", "--json"]);
+    assert_parity("commit list --branch", &l, &r);
+}
+
+#[test]
 fn parity_mutate() {
     let p = parity();
     let (l, r) = p.run(&[
