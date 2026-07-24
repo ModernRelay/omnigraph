@@ -13,6 +13,16 @@ pub struct GraphCommit {
     pub created_at: i64,
 }
 
+impl GraphCommit {
+    /// The one total order on graph lineage. Every ordered view of commits —
+    /// the projection's sorted listing, head selection, and any future keyset
+    /// pagination cursor — derives from this key; no other comparator may
+    /// define commit order.
+    pub fn lineage_key(&self) -> (u64, i64, &str) {
+        (self.manifest_version, self.created_at, &self.graph_commit_id)
+    }
+}
+
 /// A pure projection of the graph lineage that lives in `__manifest`
 /// (`graph_commit` + `graph_head` rows, RFC-013 Phase 7). It opens NO Lance
 /// dataset (Phase B retired `_graph_commits.lance` / `_graph_commit_actors.lance`):
@@ -131,13 +141,23 @@ impl CommitGraph {
 
     pub async fn load_commits(&self) -> Result<Vec<GraphCommit>> {
         let mut commits = self.commit_by_id.values().cloned().collect::<Vec<_>>();
-        commits.sort_by(|a, b| {
-            a.manifest_version
-                .cmp(&b.manifest_version)
-                .then_with(|| a.created_at.cmp(&b.created_at))
-                .then_with(|| a.graph_commit_id.cmp(&b.graph_commit_id))
-        });
+        commits.sort_by(|a, b| a.lineage_key().cmp(&b.lineage_key()));
         Ok(commits)
+    }
+
+    /// The maximal commit (by [`GraphCommit::lineage_key`]) satisfying `pred`.
+    /// Callers wanting "the latest X" use this instead of consuming
+    /// `load_commits` positionally, so no caller couples to iteration
+    /// direction.
+    pub(crate) fn latest_commit_matching(
+        &self,
+        pred: impl Fn(&GraphCommit) -> bool,
+    ) -> Option<GraphCommit> {
+        self.commit_by_id
+            .values()
+            .filter(|commit| pred(commit))
+            .max_by(|a, b| a.lineage_key().cmp(&b.lineage_key()))
+            .cloned()
     }
 
     pub fn get_commit(&self, commit_id: &str) -> Option<GraphCommit> {
@@ -245,7 +265,8 @@ async fn load_commit_cache_for_branch(
 /// Build the in-memory commit cache from the `__manifest` graph-lineage
 /// projection (RFC-013 step 4). The lineage rows carry the actor inline, so no
 /// separate actor-table read is needed. Head selection (`should_replace_head`)
-/// matches the order `load_commits` reports.
+/// is the [`GraphCommit::lineage_key`] maximum — the same total order every
+/// ordered lineage view derives from.
 async fn load_commit_cache_from_manifest(
     root_uri: &str,
     branch: Option<&str>,
@@ -279,14 +300,7 @@ fn build_commit_cache(
 }
 
 fn should_replace_head(current: Option<&GraphCommit>, candidate: &GraphCommit) -> bool {
-    current.is_none_or(|existing| {
-        candidate
-            .manifest_version
-            .cmp(&existing.manifest_version)
-            .then_with(|| candidate.created_at.cmp(&existing.created_at))
-            .then_with(|| candidate.graph_commit_id.cmp(&existing.graph_commit_id))
-            .is_gt()
-    })
+    current.is_none_or(|existing| candidate.lineage_key() > existing.lineage_key())
 }
 
 fn ancestor_distances(
