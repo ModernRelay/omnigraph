@@ -433,6 +433,52 @@ async fn policy_uses_resolved_branch_for_snapshot_reads() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
+async fn policy_authorizes_omitted_commit_list_branch_as_main() {
+    // `GET /commits` without `branch` is documented and implemented as
+    // main's history, so the policy gate must see `branch = main` — the
+    // same normalization `server_snapshot` performs. Under a read grant
+    // scoped to protected branches (main protected), the omitted form
+    // must behave exactly like the explicit `?branch=main` form.
+    let temp = init_loaded_graph().await;
+    let graph = graph_path(temp.path());
+    let policy_path = temp.path().join("policy.yaml");
+    fs::write(&policy_path, POLICY_PROTECTED_READ_YAML).unwrap();
+    let state = AppState::open_with_bearer_tokens_and_policy(
+        graph.to_string_lossy().to_string(),
+        vec![("act-bruno".to_string(), "team-token".to_string())],
+        Some(&policy_path),
+    )
+    .await
+    .unwrap();
+    let app = build_app(state);
+
+    let (explicit_status, explicit_body) = json_response(
+        &app,
+        Request::builder()
+            .uri(g("/commits?branch=main"))
+            .method(Method::GET)
+            .header("authorization", "Bearer team-token")
+            .body(Body::empty())
+            .unwrap(),
+    )
+    .await;
+    assert_eq!(explicit_status, StatusCode::OK);
+
+    let (omitted_status, omitted_body) = json_response(
+        &app,
+        Request::builder()
+            .uri(g("/commits"))
+            .method(Method::GET)
+            .header("authorization", "Bearer team-token")
+            .body(Body::empty())
+            .unwrap(),
+    )
+    .await;
+    assert_eq!(omitted_status, StatusCode::OK);
+    assert_eq!(omitted_body, explicit_body);
+}
+
+#[tokio::test(flavor = "multi_thread")]
 async fn policy_blocks_change_on_protected_main_but_allows_unprotected_branch() {
     let temp = init_loaded_graph().await;
     let graph = graph_path(temp.path());
