@@ -608,7 +608,7 @@ async fn authenticated_change_stamps_actor_on_commits() {
     let head = commits_body["commits"]
         .as_array()
         .unwrap()
-        .last()
+        .first()
         .expect("head commit should exist");
     assert_eq!(head["actor_id"], "act-andrew");
 }
@@ -690,7 +690,7 @@ async fn authenticated_branch_merge_stamps_merge_actor_on_head_commit() {
     let head = commit_body["commits"]
         .as_array()
         .unwrap()
-        .last()
+        .first()
         .expect("head commit should exist");
     assert_eq!(head["actor_id"], "act-ragnor");
 }
