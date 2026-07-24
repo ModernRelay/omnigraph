@@ -21,6 +21,15 @@ use crate::error::{OmniError, Result};
 
 pub(crate) const SCHEMA_APPLY_LOCK_BRANCH: &str = "__schema_apply_lock__";
 
+/// Physical-only RFC-026 trusted row metadata. The compiler reserves this
+/// exact name; logical reads, reflection, export, and user index selection must
+/// never expose it. A different wire shape requires a differently versioned
+/// name rather than permissive reinterpretation.
+/// Grammar-impossible physical protocol field. The trailing `$` prevents any
+/// historical or future `.pg` property from colliding with this v9-only row
+/// envelope while remaining a valid Arrow/Lance field name.
+pub(crate) const STREAM_METADATA_COLUMN: &str = "__omnigraph_stream_v1$";
+
 /// Mutation kind, threaded through the early table-version checks so the
 /// engine can apply an op-kind-aware staging policy. This check is not the
 /// RFC-022 publish authority: enrolled mutation/load attempts additionally

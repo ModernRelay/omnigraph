@@ -531,6 +531,7 @@ impl GraphCoordinator {
             actor_id: actor_id.map(str::to_string),
             merged_parent_commit_id,
             created_at: crate::db::now_micros()?,
+            stream_fold_attribution: None,
         })
     }
 

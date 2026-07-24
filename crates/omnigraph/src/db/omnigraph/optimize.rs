@@ -256,6 +256,7 @@ pub async fn optimize_all_tables(db: &Omnigraph) -> Result<Vec<TableOptimizeStat
     // Retain main through the final physical-only __manifest compaction so a
     // new main recovery intent cannot arm before raw manifest movement ends.
     let _main_branch_guard = db.write_queue().acquire_branch(None).await;
+    let _stream_token_guard = db.write_queue().acquire_stream_token().await;
 
     let table_keys = all_table_keys(&catalog);
     let queue_keys = table_keys
@@ -803,7 +804,7 @@ fn optimize_recovery_required(
 async fn ensure_no_pending_recovery_for_optimize_under_main_gate(db: &Omnigraph) -> Result<()> {
     let sidecars = crate::db::manifest::list_sidecars(db.root_uri(), db.storage_adapter()).await?;
     let blocking = sidecars.iter().find(|sidecar| {
-        sidecar.writer_kind == crate::db::manifest::SidecarKind::SchemaApply
+        sidecar.writer_kind.is_graph_global_barrier()
             || sidecar
                 .branch
                 .as_deref()
@@ -1107,6 +1108,7 @@ pub async fn cleanup_all_tables(
     graph_branches.sort();
     graph_branches.dedup();
     let _cleanup_branch_guards = db.write_queue().acquire_branches(&graph_branches).await;
+    let _cleanup_stream_token_guard = db.write_queue().acquire_stream_token().await;
     let gc_queue_keys = db.table_queue_keys_for_branches(&graph_branches, &cleanup_catalog);
     let _cleanup_table_guards = db.write_queue().acquire_many(&gc_queue_keys).await;
 

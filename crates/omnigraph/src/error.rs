@@ -145,6 +145,38 @@ pub enum OmniError {
         rows: u64,
         bytes: u64,
     },
+    /// RFC-026 compare-and-chain request names a stream incarnation which is
+    /// no longer current. This is proven before Lance is invoked.
+    #[error(
+        "stream binding changed for table {stable_table_id:016x}:{table_incarnation_id:016x}: current stream incarnation is {current_stream_incarnation_id}"
+    )]
+    StreamBindingChanged {
+        stable_table_id: u64,
+        table_incarnation_id: u64,
+        current_stream_incarnation_id: String,
+    },
+    /// RFC-026 compare-and-chain predecessor differs from the complete current
+    /// token. `None` means this key has no current stream token.
+    #[error(
+        "stream sequence conflict for table {stable_table_id:016x}:{table_incarnation_id:016x}, key '{logical_id}' (current token: {current_token:?})"
+    )]
+    StreamSequenceConflict {
+        stable_table_id: u64,
+        table_incarnation_id: u64,
+        logical_id: String,
+        current_token: Option<String>,
+    },
+    /// The same occurrence key was reused with a different trusted actor or
+    /// normalized payload. It can never be reinterpreted as a new change.
+    #[error(
+        "stream idempotency conflict for table {stable_table_id:016x}:{table_incarnation_id:016x}, key '{logical_id}' (current token: {current_token})"
+    )]
+    StreamIdempotencyConflict {
+        stable_table_id: u64,
+        table_incarnation_id: u64,
+        logical_id: String,
+        current_token: String,
+    },
     /// RFC-026 invoked Lance's MemWAL append but could not prove the complete
     /// acknowledgement boundary: watcher durability plus no observed successor
     /// writer epoch. The attempt may be durable and is intentionally never
@@ -161,6 +193,14 @@ pub enum OmniError {
         shard_id: String,
         caller_ordinal_start: u64,
         caller_ordinal_end: u64,
+        /// B2-only server-minted physical invocation identity. B1's private
+        /// substrate seam leaves this absent.
+        admission_attempt_id: Option<String>,
+        /// B2 logical idempotency labels covered by this physical invocation.
+        logical_write_ids: Vec<String>,
+        /// Deterministic but explicitly unconfirmed candidate returned only as
+        /// retry correlation; it is never valid predecessor authority.
+        unconfirmed_candidate_token: Option<String>,
         reason: String,
     },
     /// A durable recovery intent or retained pre-sidecar physical owner

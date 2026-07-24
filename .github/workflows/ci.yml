@@ -192,6 +192,40 @@ jobs:
           workspaces: |
             . -> target
 
+      - name: Build genuine final-v8 CLI for the v8↔v9 format fence
+        if: needs.classify_changes.outputs.run_full_ci == 'true'
+        env:
+          # Last merged schema-v8 commit before RFC-026 Phase B2 activates v9.
+          # Keep this immutable: HEAD^ stops being v8 after the first v9 merge.
+          FINAL_INTERNAL_V8_COMMIT: 725793af83394235bf4b848b6c2c4454ac1f95e1
+        run: |
+          set -euo pipefail
+          v8_source="$RUNNER_TEMP/omnigraph-final-v8"
+          v8_bin="$RUNNER_TEMP/omnigraph-final-v8-bin"
+          git fetch --no-tags --depth=1 origin "$FINAL_INTERNAL_V8_COMMIT"
+          git worktree add --detach "$v8_source" "$FINAL_INTERNAL_V8_COMMIT"
+          cargo build --locked \
+            --manifest-path "$v8_source/Cargo.toml" \
+            --package omnigraph-cli \
+            --bin omnigraph \
+            --target-dir "$GITHUB_WORKSPACE/target"
+          cp "$GITHUB_WORKSPACE/target/debug/omnigraph" "$v8_bin"
+          test -x "$v8_bin"
+          # The old and current workspaces intentionally share the expensive
+          # third-party dependency cache. Their path packages have the same
+          # names/versions, so remove only those local artifacts before Cargo
+          # builds the current workspace; otherwise it can reuse a v8 engine
+          # object behind the v9 test binary.
+          cargo clean --target-dir "$GITHUB_WORKSPACE/target" \
+            --package omnigraph-compiler \
+            --package omnigraph-policy \
+            --package omnigraph-engine \
+            --package omnigraph-api-types \
+            --package omnigraph-cluster \
+            --package omnigraph-server \
+            --package omnigraph-cli
+          echo "OMNIGRAPH_V8_BIN=$v8_bin" >> "$GITHUB_ENV"
+
       - name: Run workspace tests
         if: needs.classify_changes.outputs.run_full_ci == 'true'
         # On same-repo PRs, regenerate openapi.json as part of the drift test

@@ -7,11 +7,17 @@ use crate::error::{OmniError, Result};
 use crate::storage::{StorageKind, join_uri, storage_kind_for_uri};
 
 use super::TableIdentity;
+use super::token_store::STREAM_TOKEN_DATASET_PATH;
 
 const MANIFEST_DIR: &str = "__manifest";
 
 pub(crate) fn manifest_uri(root: &str) -> String {
     format!("{}/{}", root.trim_end_matches('/'), MANIFEST_DIR)
+}
+
+/// Physical location of the graph-global RFC-026 token participant.
+pub(super) fn stream_token_uri(root_uri: &str) -> String {
+    table_uri_for_path(root_uri, STREAM_TOKEN_DATASET_PATH, None)
 }
 
 #[cfg(test)]
@@ -80,6 +86,14 @@ pub(super) fn stream_state_object_id(identity: TableIdentity) -> String {
         "stream_state:{:016x}:{:016x}",
         identity.stable_table_id, identity.table_incarnation_id
     )
+}
+
+/// Fixed graph-global authority row for `_stream_tokens.lance`.
+///
+/// It deliberately carries no fake/zero table identity: the token participant
+/// is graph protocol state, not a user table lifetime.
+pub(super) const fn stream_token_authority_object_id() -> &'static str {
+    "stream_token_authority"
 }
 
 pub(super) fn table_id_to_key(request_id: Option<&Vec<String>>) -> lance_namespace::Result<String> {

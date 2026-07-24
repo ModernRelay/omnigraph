@@ -32,8 +32,8 @@ use crate::error::{OmniError, Result};
 #[cfg(test)]
 use super::SubTableUpdate;
 use super::layout::{
-    open_manifest_dataset_with_session, stream_state_object_id, table_object_id,
-    tombstone_object_id, version_object_id,
+    open_manifest_dataset_with_session, stream_state_object_id, stream_token_authority_object_id,
+    table_object_id, tombstone_object_id, version_object_id,
 };
 use super::metadata::{TableVersionMetadata, parse_namespace_version_request};
 use super::migrations::{read_stamp, refuse_if_stamp_unsupported};
@@ -42,11 +42,12 @@ use super::state::{
     graph_head_object_id, graph_lineage_row_parts, head_lineage_row, manifest_rows_batch,
     manifest_schema, read_manifest_state, read_publish_scan,
 };
+use super::stream_token::StreamFoldAttributionSummary;
 use super::{
     ExpectedTableVersions, MAIN_BRANCH_HEAD_KEY, ManifestChange, OBJECT_TYPE_STREAM_STATE,
-    OBJECT_TYPE_TABLE, OBJECT_TYPE_TABLE_TOMBSTONE, OBJECT_TYPE_TABLE_VERSION,
-    StreamLifecycleEntry, SubTableEntry, TableIdentity, TableRegistration, TableRename,
-    TableTombstone,
+    OBJECT_TYPE_STREAM_TOKEN_AUTHORITY, OBJECT_TYPE_TABLE, OBJECT_TYPE_TABLE_TOMBSTONE,
+    OBJECT_TYPE_TABLE_VERSION, StreamLifecycleEntry, StreamTokenAuthorityEntry, SubTableEntry,
+    TableIdentity, TableRegistration, TableRename, TableTombstone,
 };
 
 /// Bound on the publisher-level retry loop that wraps Lance's row-level CAS
@@ -75,6 +76,10 @@ pub(crate) struct LineageIntent {
     pub merged_parent_commit_id: Option<String>,
     /// Commit timestamp (microseconds since the UNIX epoch).
     pub created_at: i64,
+    /// Fixed RFC-026 winner commitment for a system stream fold. Every other
+    /// writer leaves this absent.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub stream_fold_attribution: Option<StreamFoldAttributionSummary>,
 }
 
 /// The exact mutable graph-head authority a prepared write observed. A missing
@@ -204,6 +209,7 @@ struct LoadedPublishState {
     lineage_rows: Vec<GraphLineageRow>,
     graph_heads: HashMap<String, String>,
     stream_lifecycles: HashMap<TableIdentity, StreamLifecycleEntry>,
+    stream_token_authority: StreamTokenAuthorityEntry,
 }
 
 impl GraphNamespacePublisher {
@@ -270,6 +276,7 @@ impl GraphNamespacePublisher {
             lineage_rows: scan.lineage_rows,
             graph_heads: scan.graph_heads,
             stream_lifecycles: scan.stream_lifecycles,
+            stream_token_authority: scan.stream_token_authority,
         })
     }
 
@@ -279,12 +286,14 @@ impl GraphNamespacePublisher {
         existing_versions: &HashMap<(TableIdentity, u64), SubTableEntry>,
         existing_tombstones: &HashMap<(TableIdentity, u64), ()>,
         existing_stream_lifecycles: &HashMap<TableIdentity, StreamLifecycleEntry>,
+        existing_stream_token_authority: &StreamTokenAuthorityEntry,
     ) -> Result<Vec<PendingVersionRow>> {
         let mut request_versions = HashMap::<(TableIdentity, u64), ()>::new();
         let mut binding_changes = HashMap::<TableIdentity, ()>::new();
         let mut known_tables = known_tables.clone();
         let mut rows = Vec::with_capacity(changes.len());
         let mut lifecycle_changes = HashMap::<TableIdentity, ()>::new();
+        let mut token_authority_changed = false;
         let mut max_tombstones = HashMap::<TableIdentity, u64>::new();
         for (identity, version) in existing_tombstones.keys() {
             max_tombstones
@@ -462,7 +471,8 @@ impl GraphNamespacePublisher {
                 }
                 ManifestChange::Update(_)
                 | ManifestChange::Tombstone(_)
-                | ManifestChange::SetStreamLifecycle { .. } => {}
+                | ManifestChange::SetStreamLifecycle { .. }
+                | ManifestChange::SetStreamTokenAuthority { .. } => {}
             }
         }
 
@@ -674,6 +684,46 @@ impl GraphNamespacePublisher {
                         row_count: None,
                     });
                 }
+                ManifestChange::SetStreamTokenAuthority { expected, next } => {
+                    expected.validate()?;
+                    next.validate()?;
+                    if existing_stream_token_authority != expected {
+                        return Err(OmniError::manifest_read_set_changed(
+                            stream_token_authority_object_id(),
+                            Some(expected.to_metadata_json()?),
+                            Some(existing_stream_token_authority.to_metadata_json()?),
+                        ));
+                    }
+                    if token_authority_changed {
+                        return Err(OmniError::manifest(
+                            "manifest batch changes stream-token authority more than once",
+                        ));
+                    }
+                    token_authority_changed = true;
+                    if next == existing_stream_token_authority {
+                        continue;
+                    }
+                    if next.current_head_witness.table_version
+                        <= expected.current_head_witness.table_version
+                    {
+                        return Err(OmniError::manifest(format!(
+                            "stream-token authority must advance monotonically from version {} to a newer exact version, got {}",
+                            expected.current_head_witness.table_version,
+                            next.current_head_witness.table_version
+                        )));
+                    }
+                    rows.push(PendingVersionRow {
+                        object_id: stream_token_authority_object_id().to_string(),
+                        object_type: OBJECT_TYPE_STREAM_TOKEN_AUTHORITY.to_string(),
+                        location: Some(next.location.clone()),
+                        metadata: Some(next.to_metadata_json()?),
+                        table_key: String::new(),
+                        identity: None,
+                        table_version: Some(next.current_head_witness.table_version),
+                        table_branch: None,
+                        row_count: None,
+                    });
+                }
             }
         }
 
@@ -716,6 +766,7 @@ impl GraphNamespacePublisher {
             merged_parent_commit_id: intent.merged_parent_commit_id.clone(),
             actor_id: intent.actor_id.clone(),
             created_at: intent.created_at,
+            stream_fold_attribution: intent.stream_fold_attribution.clone(),
         };
         let parts = graph_lineage_row_parts(&commit, intent.branch.as_deref())?;
         Ok((
@@ -844,11 +895,13 @@ impl GraphNamespacePublisher {
         rows: &[PendingVersionRow],
         registered_tables: &HashMap<TableIdentity, TableRegistration>,
         existing_stream_lifecycles: &HashMap<TableIdentity, StreamLifecycleEntry>,
+        existing_stream_token_authority: &StreamTokenAuthorityEntry,
     ) -> Result<(
         HashMap<TableIdentity, TableRegistration>,
         Vec<SubTableEntry>,
         Vec<(TableIdentity, u64)>,
         HashMap<TableIdentity, StreamLifecycleEntry>,
+        StreamTokenAuthorityEntry,
     )> {
         let mut registrations = registered_tables.clone();
         for row in rows {
@@ -892,6 +945,7 @@ impl GraphNamespacePublisher {
             .map(|(identity, version)| (*identity, *version))
             .collect();
         let mut stream_lifecycles = existing_stream_lifecycles.clone();
+        let mut stream_token_authority = existing_stream_token_authority.clone();
 
         for row in rows {
             match row.object_type.as_str() {
@@ -969,6 +1023,20 @@ impl GraphNamespacePublisher {
                     )?;
                     stream_lifecycles.insert(identity, lifecycle);
                 }
+                OBJECT_TYPE_STREAM_TOKEN_AUTHORITY => {
+                    let metadata = row.metadata.as_deref().ok_or_else(|| {
+                        OmniError::manifest_internal(
+                            "post-publish fold: stream_token_authority row missing metadata",
+                        )
+                    })?;
+                    stream_token_authority = StreamTokenAuthorityEntry::from_manifest_row(
+                        &row.object_id,
+                        row.location.as_deref(),
+                        row.table_version,
+                        row.table_branch.as_deref(),
+                        metadata,
+                    )?;
+                }
                 _ => {}
             }
         }
@@ -978,6 +1046,7 @@ impl GraphNamespacePublisher {
             version_map.into_values().collect(),
             tombstones,
             stream_lifecycles,
+            stream_token_authority,
         ))
     }
 
@@ -1243,6 +1312,7 @@ impl ManifestBatchPublisher for GraphNamespacePublisher {
                 lineage_rows,
                 graph_heads,
                 stream_lifecycles,
+                stream_token_authority,
             } = loaded;
 
             // Exact logical authority is checked on EVERY attempt from this
@@ -1269,6 +1339,7 @@ impl ManifestBatchPublisher for GraphNamespacePublisher {
                 &existing_versions,
                 &existing_tombstones,
                 &stream_lifecycles,
+                &stream_token_authority,
             )?;
 
             // Fold the graph commit into the SAME batch so table-version rows
@@ -1303,6 +1374,7 @@ impl ManifestBatchPublisher for GraphNamespacePublisher {
                         .map(|(identity, version)| (*identity, *version)),
                     graph_heads,
                     stream_lifecycles,
+                    stream_token_authority,
                 )?;
                 return Ok(PublishOutcome {
                     dataset,
@@ -1314,14 +1386,20 @@ impl ManifestBatchPublisher for GraphNamespacePublisher {
             // Build the post-publish fold inputs from the pre-publish state ∪ the
             // rows we are about to commit, BEFORE `rows` is moved into merge_rows
             // (RFC-013 PR2 #1b). Recomputed per attempt from freshly-loaded state.
-            let (fold_registrations, fold_entries, fold_tombstones, fold_stream_lifecycles) =
-                Self::fold_inputs(
-                    &existing_versions,
-                    &existing_tombstones,
-                    &rows,
-                    &known_tables,
-                    &stream_lifecycles,
-                )?;
+            let (
+                fold_registrations,
+                fold_entries,
+                fold_tombstones,
+                fold_stream_lifecycles,
+                fold_stream_token_authority,
+            ) = Self::fold_inputs(
+                &existing_versions,
+                &existing_tombstones,
+                &rows,
+                &known_tables,
+                &stream_lifecycles,
+                &stream_token_authority,
+            )?;
             let mut fold_graph_heads = graph_heads;
             if let Some(intent) = lineage {
                 fold_graph_heads.insert(
@@ -1344,6 +1422,7 @@ impl ManifestBatchPublisher for GraphNamespacePublisher {
                 fold_tombstones,
                 fold_graph_heads,
                 fold_stream_lifecycles,
+                fold_stream_token_authority,
             )?;
 
             match self.merge_rows(dataset, rows).await {

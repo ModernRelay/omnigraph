@@ -32,6 +32,11 @@ use sha2::{Digest, Sha256};
 use thiserror::Error;
 use tokio::sync::{OwnedRwLockReadGuard, OwnedRwLockWriteGuard, watch};
 
+use crate::db::manifest::stream_token::{
+    STREAM_PAYLOAD_DIGEST_VERSION, STREAM_PAYLOAD_ENCODING_VERSION,
+    STREAM_TOKEN_DERIVATION_VERSION, STREAM_TOKEN_WIRE_VERSION, StreamTokenAuthorityRow,
+    TrustedStreamRowMetadata,
+};
 use crate::db::manifest::{
     STREAM_CONFIG_VERSION, StreamLifecycleEntry, StreamPhysicalBinding, TableIdentity,
 };
@@ -69,6 +74,26 @@ const ENABLE_MEMTABLE_KEY: &str = "enable_memtable";
 pub(crate) const B1_MAX_GENERATION_ROWS: u64 = 8_192;
 pub(crate) const B1_MAX_GENERATION_ARROW_BYTES: u64 = 32 * 1024 * 1024;
 pub(crate) const B1_MAX_GENERATION_BATCHES: usize = 8_192;
+/// Maximum deterministic payload bytes hashed for one normalized B2 row.
+/// This is intentionally larger than the Arrow generation cap because JSON
+/// escaping/base64 can expand an otherwise legal physical value.
+pub(crate) const B2_MAX_CANONICAL_PAYLOAD_BYTES: u64 = 64 * 1024 * 1024;
+/// Conservative root reservation held while one B2 row is normalized and
+/// canonically encoded: the caller Arrow batch, a possible fully materialized
+/// replacement batch, and the maximum canonical payload can coexist briefly.
+pub(crate) const B2_PREPROCESSING_RESERVATION_BYTES: u64 =
+    2 * B1_MAX_GENERATION_ARROW_BYTES + B2_MAX_CANONICAL_PAYLOAD_BYTES;
+/// The private profile preserves the minimum two-caller overlap needed to
+/// revalidate a provisional authority capture while keeping preprocessing
+/// memory finite root-wide.
+pub(crate) const B2_MAX_PREPROCESSING_CALLS_ROOT: u64 = 2;
+pub(crate) const B2_MAX_PREPROCESSING_BYTES_ROOT: u64 =
+    B2_MAX_PREPROCESSING_CALLS_ROOT * B2_PREPROCESSING_RESERVATION_BYTES;
+/// Maximum Arrow memory occupied by the exact current-token winner projection
+/// for one generation.
+pub(crate) const B2_MAX_TOKEN_PROJECTION_ARROW_BYTES: u64 = 32 * 1024 * 1024;
+/// Maximum canonical JSON bytes occupied by recovery-v12's planned token rows.
+pub(crate) const B2_MAX_TOKEN_RECOVERY_JSON_BYTES: u64 = 32 * 1024 * 1024;
 
 const B1_WAL_BUFFER_BYTES: usize = 10 * 1024 * 1024;
 const B1_WAL_FLUSH_INTERVAL: Duration = Duration::from_millis(100);
@@ -112,6 +137,7 @@ pub(crate) struct B1WorkerLimits {
     pub(crate) max_resident_writers_root: usize,
     pub(crate) max_resident_writers_per_table: usize,
     pub(crate) max_reserved_arrow_bytes: u64,
+    pub(crate) max_b2_preprocessing_bytes: u64,
     pub(crate) max_inflight_calls: usize,
     pub(crate) max_pending_generations: usize,
     pub(crate) put_deadline: Duration,
@@ -144,6 +170,11 @@ impl B1WorkerLimits {
         if self.max_reserved_arrow_bytes < B1_MAX_GENERATION_ARROW_BYTES {
             return Err(MemWalWorkerError::config(format!(
                 "aggregate Arrow reservation must fit at least one legal generation ({B1_MAX_GENERATION_ARROW_BYTES} bytes)"
+            )));
+        }
+        if self.max_b2_preprocessing_bytes < B2_PREPROCESSING_RESERVATION_BYTES {
+            return Err(MemWalWorkerError::config(format!(
+                "B2 preprocessing reservation must fit one legal row's bounded scratch ({B2_PREPROCESSING_RESERVATION_BYTES} bytes)"
             )));
         }
         for (field, duration) in [
@@ -277,6 +308,39 @@ pub(crate) struct DurableBatchAck {
     pub(crate) row_count: u64,
 }
 
+/// Watcher-confirmed same-generation sequencing state for one logical key.
+///
+/// This is deliberately a warm projection, never restart authority.  It is
+/// installed only after the durability watcher and the same writer's final
+/// epoch check both succeed, and it disappears with the resident worker.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct ConfirmedStreamTokenOverlayRow {
+    pub(crate) authority: StreamTokenAuthorityRow,
+    pub(crate) metadata: TrustedStreamRowMetadata,
+}
+
+impl ConfirmedStreamTokenOverlayRow {
+    pub(crate) fn validate(&self, identity: TableIdentity, logical_id: &str) -> OmniResult<()> {
+        self.authority
+            .validate()
+            .map_err(|error| OmniError::manifest_internal(error.to_string()))?;
+        self.metadata
+            .validate_for(identity, logical_id)
+            .map_err(|error| OmniError::manifest_internal(error.to_string()))?;
+        if self.authority.identity != identity
+            || self.authority.logical_id != logical_id
+            || !self.metadata.agrees_with_authority(&self.authority)
+        {
+            return Err(OmniError::manifest_internal(format!(
+                "confirmed stream-token overlay for '{logical_id}' disagrees with its table identity or trusted metadata"
+            )));
+        }
+        Ok(())
+    }
+}
+
+pub(crate) type ConfirmedStreamTokenOverlay = BTreeMap<String, ConfirmedStreamTokenOverlayRow>;
+
 /// Opaque proof that the background-owned append task owns the shared
 /// admission lease after completing the caller's fresh authority check.
 pub(crate) struct CheckedStreamAuthority {
@@ -338,9 +402,9 @@ pub(super) fn expected_b1_writer_defaults(enrollment_id: ShardId) -> BTreeMap<St
     ])
 }
 
-fn canonical_b1_stream_config() -> String {
+fn canonical_b1_stream_config_v2() -> String {
     format!(
-        "omnigraph.stream_config_version={STREAM_CONFIG_VERSION}\n\
+        "omnigraph.stream_config_version=2\n\
          sharding=unsharded\n\
          num_shards=1\n\
          shard_spec_id={UNSHARDED_SPEC_ID}\n\
@@ -359,8 +423,43 @@ fn canonical_b1_stream_config() -> String {
     )
 }
 
+/// Historical config-v2 digest used only to parse/refuse recovery-v11 files.
+/// Active enrollment and fold code always emits config v3.
 pub(crate) fn stream_config_v2_hash() -> String {
-    let digest = Sha256::digest(canonical_b1_stream_config().as_bytes());
+    let digest = Sha256::digest(canonical_b1_stream_config_v2().as_bytes());
+    format!("sha256:{digest:x}")
+}
+
+fn canonical_b2_stream_config() -> String {
+    format!(
+        "omnigraph.stream_config_version={STREAM_CONFIG_VERSION}\n\
+         sharding=unsharded\n\
+         num_shards=1\n\
+         shard_spec_id={UNSHARDED_SPEC_ID}\n\
+         shard_field_id=bucket\n\
+         shard_result_type=int32\n\
+         maintained_indexes=\n\
+         durable_write=true\n\
+         max_wal_buffer_size={B1_WAL_BUFFER_BYTES}\n\
+         max_wal_flush_interval_ms={}\n\
+         max_memtable_size={B1_MEMTABLE_BYTES}\n\
+         max_memtable_rows={B1_MEMTABLE_ROWS}\n\
+         max_memtable_batches={B1_MEMTABLE_BATCHES}\n\
+         max_unflushed_memtable_bytes={B1_MEMTABLE_BYTES}\n\
+         enable_memtable=true\n\
+         stream_token_derivation_version={STREAM_TOKEN_DERIVATION_VERSION}\n\
+         stream_token_wire={STREAM_TOKEN_WIRE_VERSION}\n\
+         payload_digest_version={STREAM_PAYLOAD_DIGEST_VERSION}\n\
+         payload_encoding_version={STREAM_PAYLOAD_ENCODING_VERSION}\n\
+         max_canonical_payload_bytes={B2_MAX_CANONICAL_PAYLOAD_BYTES}\n\
+         max_token_projection_arrow_bytes={B2_MAX_TOKEN_PROJECTION_ARROW_BYTES}\n\
+         max_token_recovery_json_bytes={B2_MAX_TOKEN_RECOVERY_JSON_BYTES}\n",
+        B1_WAL_FLUSH_INTERVAL.as_millis(),
+    )
+}
+
+pub(crate) fn stream_config_v3_hash() -> String {
+    let digest = Sha256::digest(canonical_b2_stream_config().as_bytes());
     format!("sha256:{digest:x}")
 }
 
@@ -405,7 +504,7 @@ fn validate_b1_topology(
     let expected = expected_b1_writer_defaults(enrollment_id);
     if actual != expected {
         return Err(MemWalWorkerError::config(format!(
-            "persisted config-v2 defaults differ: expected={expected:?}, actual={actual:?}"
+            "persisted config-v3 defaults differ: expected={expected:?}, actual={actual:?}"
         )));
     }
     Ok(())
@@ -432,10 +531,10 @@ fn validate_bound_merge_progress(
     Ok(())
 }
 
-/// Validate that durable graph binding identity and Lance's persisted config-v2
+/// Validate that durable graph binding identity and Lance's persisted config-v3
 /// describe exactly the same physical enrollment.  The enrollment UUID is
 /// never inferred from the replaceable MemWAL index UUID.
-pub(crate) fn validate_stream_config_v2_binding(
+pub(crate) fn validate_stream_config_v3_binding(
     details: &MemWalIndexDetails,
     binding: &StreamPhysicalBinding,
 ) -> Result<(ShardId, ShardId), MemWalWorkerError> {
@@ -445,11 +544,11 @@ pub(crate) fn validate_stream_config_v2_binding(
             binding.stream_config_version
         )));
     }
-    if binding.stream_config_hash != stream_config_v2_hash() {
+    if binding.stream_config_hash != stream_config_v3_hash() {
         return Err(MemWalWorkerError::config(format!(
             "binding config hash is {}, expected {}",
             binding.stream_config_hash,
-            stream_config_v2_hash()
+            stream_config_v3_hash()
         )));
     }
     if binding.table_branch.is_some() || binding.shard_ids.len() != 1 {
@@ -591,7 +690,7 @@ fn exact_unmerged_generations(
     Ok((merged, unmerged))
 }
 
-/// Passive read/open-time validation for a data-bearing config-v2 lifecycle.
+/// Passive read/open-time validation for a data-bearing config-v3 lifecycle.
 ///
 /// Unlike [`classify_active_state`], this never calls `mem_wal_writer` and
 /// therefore never claims an epoch. It validates only durable/public state;
@@ -625,7 +724,7 @@ pub(crate) async fn validate_b1_lifecycle_physical_state(
         .await
         .map_err(|error| MemWalWorkerError::lance("passive config read", error))?
         .ok_or_else(|| MemWalWorkerError::state("lifecycle-bound table has no MemWAL index"))?;
-    let (_, shard_id) = validate_stream_config_v2_binding(&details, &lifecycle.binding)?;
+    let (_, shard_id) = validate_stream_config_v3_binding(&details, &lifecycle.binding)?;
     let shard_ids = dataset
         .list_mem_wal_latest_shard_ids()
         .await
@@ -792,12 +891,36 @@ impl GenerationAccounting {
 fn account_batch(batch: &RecordBatch) -> Result<GenerationAccounting, MemWalWorkerError> {
     let rows = u64::try_from(batch.num_rows())
         .map_err(|_| MemWalWorkerError::state("batch row count does not fit u64"))?;
-    let arrow_bytes = u64::try_from(batch.get_array_memory_size())
-        .map_err(|_| MemWalWorkerError::state("batch Arrow memory size does not fit u64"))?;
+    let arrow_bytes = b1_logical_batch_bytes(batch)?;
     Ok(GenerationAccounting {
         rows,
         arrow_bytes,
         batches: 1,
+    })
+}
+
+/// Stable logical Arrow bytes for one normalized generation batch.
+///
+/// Lance replay/scanner arrays may be slices whose backing buffers have much
+/// larger capacities than the selected rows. Charging `get_array_memory_size`
+/// would therefore make the same durable generation legal before a restart
+/// and corrupt after it. The RFC-026 limit is the memory needed by dense buffers
+/// for the selected slice; allocator/RSS amplification is measured separately.
+pub(crate) fn b1_logical_batch_bytes(
+    batch: &RecordBatch,
+) -> Result<u64, MemWalWorkerError> {
+    batch.columns().iter().try_fold(0_u64, |total, column| {
+        let bytes = column
+            .to_data()
+            .get_slice_memory_size()
+            .map_err(|error| MemWalWorkerError::state(format!(
+                "logical Arrow slice accounting failed: {error}"
+            )))?;
+        total
+            .checked_add(u64::try_from(bytes).map_err(|_| {
+                MemWalWorkerError::state("logical Arrow slice size does not fit u64")
+            })?)
+            .ok_or_else(|| MemWalWorkerError::state("logical Arrow slice size overflow"))
     })
 }
 
@@ -1310,6 +1433,9 @@ struct MemWalWorker {
     table_key: String,
     writer: Arc<ShardWriter>,
     mode: tokio::sync::Mutex<WorkerMode>,
+    /// Warm watcher-confirmed projection for the one live generation.  Cold
+    /// replay/fold-only workers always start empty and never reconstruct it.
+    confirmed_token_overlay: Mutex<ConfirmedStreamTokenOverlay>,
     usage: Mutex<WorkerUsage>,
     last_used: Mutex<std::time::Instant>,
     idle_task_armed: AtomicBool,
@@ -1358,6 +1484,7 @@ impl MemWalWorker {
             table_key,
             writer: opened.claimed.writer,
             mode: tokio::sync::Mutex::new(mode),
+            confirmed_token_overlay: Mutex::new(BTreeMap::new()),
             usage: Mutex::new(usage),
             last_used: Mutex::new(std::time::Instant::now()),
             idle_task_armed: AtomicBool::new(false),
@@ -1376,6 +1503,7 @@ impl MemWalWorker {
             table_key,
             writer: claimed.writer,
             mode: tokio::sync::Mutex::new(WorkerMode::Retiring),
+            confirmed_token_overlay: Mutex::new(BTreeMap::new()),
             usage: Mutex::new(WorkerUsage {
                 resident: true,
                 accounting: GenerationAccounting {
@@ -1399,6 +1527,9 @@ impl MemWalWorker {
             shard_id: self.key.shard_id.to_string(),
             caller_ordinal_start: ordinals.start,
             caller_ordinal_end: ordinals.end,
+            admission_attempt_id: None,
+            logical_write_ids: Vec::new(),
+            unconfirmed_candidate_token: None,
             reason: reason.into(),
         }
     }
@@ -1469,6 +1600,9 @@ struct RegistryUsage {
     resident_writers_root: usize,
     resident_writers_by_table: HashMap<TableIdentity, usize>,
     reserved_arrow_bytes: u64,
+    /// Conservative scratch reservation held before a B2 row can materialize
+    /// external blobs or allocate its canonical payload.
+    b2_preprocessing_bytes: u64,
     /// Exact resident plus queued generation accounting by physical worker
     /// key. This is the decomposition of `reserved_arrow_bytes`, not a second
     /// lifecycle source of truth; it exists so same-key cap crossings retain
@@ -1554,6 +1688,37 @@ struct InFlightPermit {
     registry: Arc<MemWalWorkerRegistry>,
 }
 
+/// Root-scoped ownership for B2 preprocessing scratch. It is acquired before
+/// blob materialization or canonical encoding and retains the ordinary
+/// inflight slot until that ownership transfers into [`QueuedBatchPermit`].
+pub(crate) struct B2PreprocessingPermit {
+    registry: Arc<MemWalWorkerRegistry>,
+    bytes: u64,
+    inflight: Option<InFlightPermit>,
+}
+
+impl B2PreprocessingPermit {
+    fn take_inflight(&mut self) -> InFlightPermit {
+        self.inflight
+            .take()
+            .expect("B2 preprocessing inflight permit transfers exactly once")
+    }
+}
+
+impl Drop for B2PreprocessingPermit {
+    fn drop(&mut self) {
+        let mut usage = self
+            .registry
+            .usage
+            .lock()
+            .expect("MemWAL registry usage poisoned");
+        usage.b2_preprocessing_bytes = usage
+            .b2_preprocessing_bytes
+            .checked_sub(self.bytes)
+            .expect("B2 preprocessing reservation accounting underflow");
+    }
+}
+
 impl Drop for InFlightPermit {
     fn drop(&mut self) {
         let mut usage = self
@@ -1587,6 +1752,80 @@ impl QueuedBatchPermit {
         self.inflight
             .take()
             .expect("queued batch inflight permit transfers exactly once")
+    }
+
+    /// Replace the preliminary logical-batch charge with the exact stored
+    /// batch after trusted stream metadata has been classified and appended.
+    ///
+    /// The preliminary charge is acquired before shared admission and the
+    /// same-key queue, so caller-owned row buffers are never unaccounted. This
+    /// adjustment is immediate/non-waiting and happens while that queue
+    /// position is held, before worker-mode inspection or any Lance call.
+    pub(crate) fn reprice_for_exact_batch(
+        &mut self,
+        table_key: &str,
+        batch: &RecordBatch,
+    ) -> OmniResult<()> {
+        if self.transferred {
+            return Err(OmniError::manifest_internal(
+                "cannot reprice a stream batch after its charge transferred to a worker",
+            ));
+        }
+        let exact =
+            b1_input_accounting(batch).map_err(|error| OmniError::Lance(error.to_string()))?;
+        let mut usage = self
+            .registry
+            .usage
+            .lock()
+            .expect("MemWAL registry usage poisoned");
+        let current = usage
+            .reserved_by_key
+            .get(&self.key)
+            .copied()
+            .ok_or_else(|| {
+                OmniError::manifest_internal(
+                    "queued stream charge disappeared before exact repricing",
+                )
+            })?;
+        let without_preliminary = current
+            .checked_sub(self.charge)
+            .map_err(|error| OmniError::manifest_internal(error.to_string()))?;
+        let projected = without_preliminary
+            .checked_add(exact)
+            .map_err(|error| OmniError::Lance(error.to_string()))?;
+        if !projected.fits() {
+            return Err(OmniError::FoldRequired {
+                table_key: table_key.to_string(),
+                rows: projected.rows,
+                bytes: projected.arrow_bytes,
+            });
+        }
+        let root_without_preliminary = usage
+            .reserved_arrow_bytes
+            .checked_sub(self.charge.arrow_bytes)
+            .ok_or_else(|| {
+                OmniError::manifest_internal("root stream charge underflow during exact repricing")
+            })?;
+        let root_projected = root_without_preliminary
+            .checked_add(exact.arrow_bytes)
+            .ok_or_else(|| {
+                MemWalWorkerRegistry::resource_error(
+                    "stream_reserved_arrow_bytes",
+                    self.registry.limits.max_reserved_arrow_bytes,
+                    u64::MAX,
+                )
+            })?;
+        if root_projected > self.registry.limits.max_reserved_arrow_bytes {
+            return Err(MemWalWorkerRegistry::resource_error(
+                "stream_reserved_arrow_bytes",
+                self.registry.limits.max_reserved_arrow_bytes,
+                root_projected,
+            ));
+        }
+        usage.reserved_arrow_bytes = root_projected;
+        usage.reserved_by_key.insert(self.key, projected);
+        self.charge = exact;
+        Ok(())
     }
 
     fn transfer_to_worker(
@@ -1725,6 +1964,44 @@ impl MemWalWorkerRegistry {
         })
     }
 
+    /// Reserve the complete worst-case scratch envelope before B2 can resolve
+    /// blobs or allocate canonical payload bytes. The ordinary inflight slot
+    /// moves from this permit into the queued/worker corridor; scratch remains
+    /// reserved until canonical hashing is complete.
+    pub(crate) fn reserve_b2_preprocessing(
+        self: &Arc<Self>,
+    ) -> OmniResult<B2PreprocessingPermit> {
+        let inflight = self
+            .reserve_inflight_core()
+            .map_err(Self::worker_error_to_omni)?;
+        let bytes = B2_PREPROCESSING_RESERVATION_BYTES;
+        let mut usage = self.usage.lock().expect("MemWAL registry usage poisoned");
+        let actual = usage
+            .b2_preprocessing_bytes
+            .checked_add(bytes)
+            .ok_or_else(|| {
+                Self::resource_error(
+                    "stream_b2_preprocessing_bytes",
+                    self.limits.max_b2_preprocessing_bytes,
+                    u64::MAX,
+                )
+            })?;
+        if actual > self.limits.max_b2_preprocessing_bytes {
+            return Err(Self::resource_error(
+                "stream_b2_preprocessing_bytes",
+                self.limits.max_b2_preprocessing_bytes,
+                actual,
+            ));
+        }
+        usage.b2_preprocessing_bytes = actual;
+        drop(usage);
+        Ok(B2PreprocessingPermit {
+            registry: Arc::clone(self),
+            bytes,
+            inflight: Some(inflight),
+        })
+    }
+
     fn ensure_input_projection_fits(
         table_key: &str,
         mode: &WorkerMode,
@@ -1848,6 +2125,59 @@ impl MemWalWorkerRegistry {
         let inflight = self
             .reserve_inflight_core()
             .map_err(Self::worker_error_to_omni)?;
+        self.reserve_put_input_with_inflight(
+            key,
+            table_key,
+            batch,
+            acquire_authority,
+            inflight,
+        )
+        .await
+    }
+
+    /// B2 sibling of [`Self::reserve_put_input`]. Preprocessing already owns
+    /// the inflight slot, so this transfers it without opening an unbounded
+    /// interval between scratch allocation and root accounting.
+    pub(crate) async fn reserve_b2_put_input<F, Fut>(
+        self: &Arc<Self>,
+        key: StreamWorkerKey,
+        table_key: &str,
+        batch: &RecordBatch,
+        preprocessing: &mut B2PreprocessingPermit,
+        acquire_authority: F,
+    ) -> OmniResult<(QueuedBatchPermit, CheckedStreamAuthority)>
+    where
+        F: FnOnce() -> Fut + Send,
+        Fut: Future<Output = CheckedStreamAuthority> + Send,
+    {
+        if !Arc::ptr_eq(self, &preprocessing.registry) {
+            return Err(OmniError::manifest_internal(
+                "B2 preprocessing permit belongs to another root registry",
+            ));
+        }
+        let inflight = preprocessing.take_inflight();
+        self.reserve_put_input_with_inflight(
+            key,
+            table_key,
+            batch,
+            acquire_authority,
+            inflight,
+        )
+        .await
+    }
+
+    async fn reserve_put_input_with_inflight<F, Fut>(
+        self: &Arc<Self>,
+        key: StreamWorkerKey,
+        table_key: &str,
+        batch: &RecordBatch,
+        acquire_authority: F,
+        inflight: InFlightPermit,
+    ) -> OmniResult<(QueuedBatchPermit, CheckedStreamAuthority)>
+    where
+        F: FnOnce() -> Fut + Send,
+        Fut: Future<Output = CheckedStreamAuthority> + Send,
+    {
         let charge =
             b1_input_accounting(batch).map_err(|error| OmniError::Lance(error.to_string()))?;
         if !charge.fits() {
@@ -1869,6 +2199,159 @@ impl MemWalWorkerRegistry {
             Self::ensure_input_projection_fits(table_key, &mode, charge)?;
         }
         Ok((queued, authority))
+    }
+
+    /// Read one watcher-confirmed token while the caller owns this key's input-
+    /// queue position. A vacant worker means an empty live
+    /// generation.  Replayed/flushed state is fold-only and therefore cannot
+    /// be treated as a reconstructed sequencing overlay.
+    pub(crate) async fn confirmed_token_for_key(
+        self: &Arc<Self>,
+        queued: &QueuedBatchPermit,
+        table_key: &str,
+        logical_id: &str,
+    ) -> OmniResult<Option<ConfirmedStreamTokenOverlayRow>> {
+        if !Arc::ptr_eq(self, &queued.registry) {
+            return Err(OmniError::manifest_internal(
+                "stream token overlay permit belongs to another root registry",
+            ));
+        }
+        let slot = self.slot(queued.key);
+        let worker = {
+            let state = slot.state.lock().await;
+            match &*state {
+                RegistrySlotState::Vacant => return Ok(None),
+                RegistrySlotState::Active(worker) => Arc::clone(worker),
+                RegistrySlotState::Opening(_) => {
+                    return Err(OmniError::manifest_internal(
+                        "stream token overlay observed an opener despite owning the same-key input queue",
+                    ));
+                }
+                RegistrySlotState::Retiring(_) => {
+                    return Err(OmniError::Lance(
+                        MemWalWorkerError::Retiring {
+                            key: queued.key,
+                            reason: "original abort completion has not settled".to_string(),
+                        }
+                        .to_string(),
+                    ));
+                }
+            }
+        };
+        let mode = worker.mode.lock().await;
+        match &*mode {
+            WorkerMode::Admit(_) => {}
+            WorkerMode::FoldReplay(replay) => {
+                return Err(OmniError::FoldRequired {
+                    table_key: table_key.to_string(),
+                    rows: replay.accounting.rows,
+                    bytes: replay.accounting.arrow_bytes,
+                });
+            }
+            WorkerMode::FoldFlushed(_) => {
+                return Err(OmniError::FoldRequired {
+                    table_key: table_key.to_string(),
+                    rows: 0,
+                    bytes: 0,
+                });
+            }
+            WorkerMode::Retiring => {
+                return Err(OmniError::Lance(
+                    MemWalWorkerError::Retiring {
+                        key: queued.key,
+                        reason: "token overlay is unavailable while the worker retires".to_string(),
+                    }
+                    .to_string(),
+                ));
+            }
+        }
+        let current = worker
+            .confirmed_token_overlay
+            .lock()
+            .expect("MemWAL token overlay poisoned")
+            .get(logical_id)
+            .cloned();
+        Ok(current)
+    }
+
+    /// Return the exact current-generation token winners after applying one
+    /// queued update set. The caller owns the same-key input queue, so this
+    /// projection cannot race a watcher-confirmed overlay installation. It is
+    /// used to enforce recovery-v12/token-table byte bounds before Lance is
+    /// invoked and an acknowledgement can become possible.
+    pub(crate) async fn projected_token_authority_rows(
+        self: &Arc<Self>,
+        queued: &QueuedBatchPermit,
+        table_key: &str,
+        updates: &ConfirmedStreamTokenOverlay,
+    ) -> OmniResult<Vec<StreamTokenAuthorityRow>> {
+        if !Arc::ptr_eq(self, &queued.registry) {
+            return Err(OmniError::manifest_internal(
+                "stream token projection permit belongs to another root registry",
+            ));
+        }
+        for (logical_id, update) in updates {
+            update.validate(queued.key.identity, logical_id)?;
+        }
+        let slot = self.slot(queued.key);
+        let worker = {
+            let state = slot.state.lock().await;
+            match &*state {
+                RegistrySlotState::Vacant => None,
+                RegistrySlotState::Active(worker) => Some(Arc::clone(worker)),
+                RegistrySlotState::Opening(_) => {
+                    return Err(OmniError::manifest_internal(
+                        "stream token projection observed an opener despite owning the same-key input queue",
+                    ));
+                }
+                RegistrySlotState::Retiring(_) => {
+                    return Err(OmniError::Lance(
+                        MemWalWorkerError::Retiring {
+                            key: queued.key,
+                            reason: "original abort completion has not settled".to_string(),
+                        }
+                        .to_string(),
+                    ));
+                }
+            }
+        };
+        let mut projected = ConfirmedStreamTokenOverlay::new();
+        if let Some(worker) = worker {
+            let mode = worker.mode.lock().await;
+            match &*mode {
+                WorkerMode::Admit(_) => {}
+                WorkerMode::FoldReplay(replay) => {
+                    return Err(OmniError::FoldRequired {
+                        table_key: table_key.to_string(),
+                        rows: replay.accounting.rows,
+                        bytes: replay.accounting.arrow_bytes,
+                    });
+                }
+                WorkerMode::FoldFlushed(_) => {
+                    return Err(OmniError::FoldRequired {
+                        table_key: table_key.to_string(),
+                        rows: 0,
+                        bytes: 0,
+                    });
+                }
+                WorkerMode::Retiring => {
+                    return Err(OmniError::Lance(format!(
+                        "MemWAL worker {} is retiring",
+                        queued.key
+                    )));
+                }
+            }
+            projected = worker
+                .confirmed_token_overlay
+                .lock()
+                .expect("MemWAL token overlay poisoned")
+                .clone();
+        }
+        projected.extend(updates.clone());
+        Ok(projected
+            .into_values()
+            .map(|row| row.authority)
+            .collect())
     }
 
     fn release_queued_charge(&self, key: StreamWorkerKey, charge: GenerationAccounting) {
@@ -2336,6 +2819,7 @@ impl MemWalWorkerRegistry {
         table_key: String,
         batch: RecordBatch,
         caller_ordinals: CallerOrdinalRange,
+        confirmed_token_updates: ConfirmedStreamTokenOverlay,
         mut queued: QueuedBatchPermit,
         prepare: PreparePut,
         idle_authority: IdleAuthorityCheck,
@@ -2358,6 +2842,7 @@ impl MemWalWorkerRegistry {
                     table_key,
                     batch,
                     caller_ordinals,
+                    confirmed_token_updates,
                     queued,
                     prepare,
                     idle_authority,
@@ -2375,6 +2860,7 @@ impl MemWalWorkerRegistry {
         table_key: String,
         batch: RecordBatch,
         caller_ordinals: CallerOrdinalRange,
+        confirmed_token_updates: ConfirmedStreamTokenOverlay,
         queued: QueuedBatchPermit,
         prepare: PreparePut,
         idle_authority: IdleAuthorityCheck,
@@ -2604,8 +3090,16 @@ impl MemWalWorkerRegistry {
         };
 
         self.ensure_idle_task(&slot, &worker, idle_authority);
-        self.invoke_put(&slot, &worker, batch, caller_ordinals, authority, queued)
-            .await
+        self.invoke_put(
+            &slot,
+            &worker,
+            batch,
+            caller_ordinals,
+            confirmed_token_updates,
+            authority,
+            queued,
+        )
+        .await
     }
 
     async fn invoke_put(
@@ -2614,6 +3108,7 @@ impl MemWalWorkerRegistry {
         worker: &Arc<MemWalWorker>,
         batch: RecordBatch,
         caller_ordinals: CallerOrdinalRange,
+        confirmed_token_updates: ConfirmedStreamTokenOverlay,
         authority: CheckedStreamAuthority,
         queued: QueuedBatchPermit,
     ) -> OmniResult<DurableBatchAck> {
@@ -2635,6 +3130,9 @@ impl MemWalWorkerRegistry {
                 "caller ordinal range {:?} does not match {row_count} batch rows",
                 caller_ordinals.as_range()
             )));
+        }
+        for (logical_id, update) in &confirmed_token_updates {
+            update.validate(worker.key.identity, logical_id)?;
         }
         let charge = queued.charge();
         let mut mode = worker.mode.lock().await;
@@ -2883,6 +3381,13 @@ impl MemWalWorkerRegistry {
             }
         }
 
+        {
+            let mut overlay = worker
+                .confirmed_token_overlay
+                .lock()
+                .expect("MemWAL token overlay poisoned");
+            overlay.extend(confirmed_token_updates);
+        }
         *mode = WorkerMode::Admit(reserved);
         *worker
             .last_used
@@ -3869,6 +4374,7 @@ mod tests {
             max_resident_writers_root: 4,
             max_resident_writers_per_table: 1,
             max_reserved_arrow_bytes: 4 * B1_MAX_GENERATION_ARROW_BYTES,
+            max_b2_preprocessing_bytes: B2_MAX_PREPROCESSING_BYTES_ROOT,
             max_inflight_calls: 2,
             max_pending_generations: 4,
             put_deadline: Duration::from_secs(1),
@@ -3929,7 +4435,7 @@ mod tests {
     }
 
     #[test]
-    fn accounting_charges_exact_post_tombstone_arrow_memory() {
+    fn accounting_charges_exact_post_tombstone_logical_slice_memory() {
         let batch = batch(3);
         let charged = post_tombstone_accounting(&batch).unwrap();
         let schema = schema_with_tombstone(batch.schema().as_ref());
@@ -3940,7 +4446,7 @@ mod tests {
         assert_eq!(charged.batches, 1);
         assert_eq!(
             charged.arrow_bytes,
-            u64::try_from(stored.get_array_memory_size()).unwrap()
+            b1_logical_batch_bytes(&stored).unwrap()
         );
     }
 
@@ -4001,6 +4507,45 @@ mod tests {
             })
         ));
         registry.release_resident_reservation(identity);
+    }
+
+    #[test]
+    fn b2_preprocessing_is_root_bounded_before_payload_allocation() {
+        let root = format!("memory://b2-preprocessing/{}", ShardId::new_v4());
+        let mut preprocessing_limits = limits();
+        preprocessing_limits.max_inflight_calls = 3;
+        let registry = MemWalWorkerRegistry::for_root(&root, preprocessing_limits).unwrap();
+        let first = registry.reserve_b2_preprocessing().unwrap();
+        let second = registry.reserve_b2_preprocessing().unwrap();
+        let error = match registry.reserve_b2_preprocessing() {
+            Ok(_) => panic!("a third worst-case B2 envelope must exceed the root bound"),
+            Err(error) => error,
+        };
+        assert!(matches!(
+            error,
+            OmniError::ResourceLimitExceeded {
+                ref resource,
+                limit,
+                actual,
+            } if resource == "stream_b2_preprocessing_bytes"
+                && limit == B2_MAX_PREPROCESSING_BYTES_ROOT
+                && actual == 3 * B2_PREPROCESSING_RESERVATION_BYTES
+        ));
+        {
+            let usage = registry.usage.lock().unwrap();
+            assert_eq!(
+                usage.b2_preprocessing_bytes,
+                B2_MAX_PREPROCESSING_BYTES_ROOT
+            );
+            // The failed third reservation releases the inflight slot it
+            // acquired before discovering root scratch pressure.
+            assert_eq!(usage.inflight_calls, 2);
+        }
+        drop(first);
+        drop(second);
+        let usage = registry.usage.lock().unwrap();
+        assert_eq!(usage.b2_preprocessing_bytes, 0);
+        assert_eq!(usage.inflight_calls, 0);
     }
 
     #[test]
@@ -4097,6 +4642,7 @@ mod tests {
             resident_writers_root: 1,
             resident_writers_by_table: HashMap::from([(identity, 1)]),
             reserved_arrow_bytes: 1_024,
+            b2_preprocessing_bytes: 0,
             reserved_by_key: HashMap::from([(key, initial)]),
             fold_required_by_key: HashMap::new(),
             inflight_calls: 1,
