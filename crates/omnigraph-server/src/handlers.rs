@@ -1710,18 +1710,22 @@ pub(crate) async fn server_commit_list(
     actor: Option<Extension<ResolvedActor>>,
     Query(query): Query<CommitListQuery>,
 ) -> std::result::Result<Json<CommitListOutput>, ApiError> {
+    // An omitted `branch` means main's history, so the policy gate must
+    // see `main` — not `has_branch == false`, which a branch-scoped read
+    // grant can never match.
+    let branch = query.branch.unwrap_or_else(|| "main".to_string());
     authorize_request(
         actor.as_ref().map(|Extension(actor)| actor),
         handle.policy.as_deref(),
         PolicyRequest {
             action: PolicyAction::Read,
-            branch: query.branch.clone(),
+            branch: Some(branch.clone()),
             target_branch: None,
         },
     )?;
     let commits = {
         let db = &handle.engine;
-        db.list_commits(query.branch.as_deref())
+        db.list_commits(Some(branch.as_str()))
             .await
             .map_err(ApiError::from_omni)?
     };
