@@ -570,8 +570,8 @@
         "tags": [
           "commits"
         ],
-        "summary": "List commits.",
-        "description": "Filter by `branch` to get the commits on a single branch (most recent\nfirst); omit to list across all branches. Read-only.",
+        "summary": "List commits, most recent first.",
+        "description": "`branch` selects which history to list: a named branch returns the history\nreachable from that branch's head (the main commits inherited up to the\nfork plus the branch-authored commits); omitting it returns `main`'s\nhistory. There is no cross-branch listing. Ordering is part of the\ncontract — newest first by (manifest version, created-at, commit id) — and\na future `cursor`/`limit` pagination will be keyset-based on that same\norder. Read-only.",
         "operationId": "cluster_listCommits",
         "parameters": [
           {

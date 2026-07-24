@@ -3022,6 +3022,19 @@ impl Omnigraph {
             .await
     }
 
+    /// List the branch's reachable graph lineage, **most recent first** (by
+    /// [`GraphCommit::lineage_key`] — the same total order head selection and
+    /// any future keyset pagination cursor derive from).
+    ///
+    /// `branch: None` (or `"main"`) lists main's lineage projection. A named
+    /// branch lists the history reachable from that branch's head: the main
+    /// commits inherited up to the fork plus the branch-authored commits.
+    /// There is no cross-branch listing.
+    ///
+    /// This is the one public door for commit listings — the CLI's embedded
+    /// arm, the HTTP server, and SDK consumers all call it — so the newest-
+    /// first presentation contract lives here, not per transport. The internal
+    /// projection (`CommitGraph::load_commits`) stays ascending.
     pub async fn list_commits(&self, branch: Option<&str>) -> Result<Vec<GraphCommit>> {
         self.ensure_schema_state_valid().await?;
         let branch = match branch {
@@ -3029,7 +3042,9 @@ impl Omnigraph {
             None => None,
         };
         let coordinator = self.open_coordinator_for_branch(branch.as_deref()).await?;
-        coordinator.list_commits().await
+        let mut commits = coordinator.list_commits().await?;
+        commits.reverse();
+        Ok(commits)
     }
 
     /// Open a sub-table for mutation with version-drift guard.

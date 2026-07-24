@@ -2358,7 +2358,7 @@ edge WorksAt: Person -> Company
             .await
             .unwrap()
             .into_iter()
-            .last()
+            .next()
             .unwrap();
         assert_eq!(head.actor_id.as_deref(), Some("act-andrew"));
     }

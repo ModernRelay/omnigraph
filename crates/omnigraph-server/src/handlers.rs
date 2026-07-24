@@ -1696,10 +1696,15 @@ async fn delete_merged_source_branch(
     ),
     security(("bearer_token" = [])),
 )]
-/// List commits.
+/// List commits, most recent first.
 ///
-/// Filter by `branch` to get the commits on a single branch (most recent
-/// first); omit to list across all branches. Read-only.
+/// `branch` selects which history to list: a named branch returns the history
+/// reachable from that branch's head (the main commits inherited up to the
+/// fork plus the branch-authored commits); omitting it returns `main`'s
+/// history. There is no cross-branch listing. Ordering is part of the
+/// contract — newest first by (manifest version, created-at, commit id) — and
+/// a future `cursor`/`limit` pagination will be keyset-based on that same
+/// order. Read-only.
 pub(crate) async fn server_commit_list(
     Extension(handle): Extension<Arc<GraphHandle>>,
     actor: Option<Extension<ResolvedActor>>,
