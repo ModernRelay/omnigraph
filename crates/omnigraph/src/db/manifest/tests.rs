@@ -2398,9 +2398,11 @@ async fn sub_current_graph_is_refused_then_rebuilt_via_export_import() {
         "the refusal must nudge the operator to `omnigraph export`, got: {err}",
     );
     assert!(
-        msg.contains("0.10.x"),
-        "the refusal must name the release that wrote this stamp (v6 → 0.10.x) so the \
-         operator knows which binary to use, got: {err}",
+        msg.contains("0.9.0-dev"),
+        "the refusal must name the build that wrote this stamp so the operator knows \
+         which binary to use. v6 never shipped in a release — it existed only in \
+         source builds during 0.9.0 development — so the refusal names `0.9.0-dev`, \
+         got: {err}",
     );
 
     // Rebuild with this binary: fresh init + load the export.
