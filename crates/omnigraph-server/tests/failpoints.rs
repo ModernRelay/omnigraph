@@ -18,6 +18,7 @@ use std::time::{Duration, Instant};
 use axum::body::Body;
 use axum::http::{Method, Request, StatusCode};
 use failpoint::Rendezvous;
+use omnigraph_server::build_app;
 use serde_json::json;
 use serial_test::serial;
 use support::*;
@@ -150,5 +151,102 @@ async fn mutation_dropped_mid_protocol_completes_and_leaves_no_residual() {
         response.status(),
         StatusCode::OK,
         "follow-up mutation must admit and succeed after the disconnected write completed",
+    );
+}
+
+/// RFC-029 W2(b): a write surfacing `RecoveryRequired` (an unresolved
+/// rollback-class recovery residual) triggers a supervised in-process reopen
+/// whose Full sweep resolves the residual — the graph heals on the next
+/// writes WITHOUT a process restart. This is the HTTP twin of
+/// `rfc029_probe.rs` phases 2–3.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[serial]
+async fn recovery_required_write_triggers_supervised_reopen_and_heals() {
+    use omnigraph::failpoints::ScopedFailPoint;
+
+    // Multi-mode boot through open_multi_graph_state so the retained
+    // startup configs (the supervision loop's reopen source) are populated.
+    let temp = init_loaded_graph().await;
+    let graph = graph_path(temp.path());
+    let cfg = omnigraph_server::GraphStartupConfig {
+        graph_id: "default".to_string(),
+        uri: graph.to_string_lossy().to_string(),
+        policy: None,
+        embedding: None,
+        queries: stored_query_registry(&[]),
+    };
+    let state = omnigraph_server::open_multi_graph_state(
+        vec![cfg],
+        Vec::new(),
+        None,
+        temp.path().join("cluster.yaml"),
+        false,
+    )
+    .await
+    .unwrap();
+    let _supervision =
+        state.spawn_supervision(omnigraph_server::SupervisorConfig::fast_for_tests());
+    let app = build_app(state);
+
+    // Manufacture the Armed residual through HTTP: the confirmation write
+    // fails (the failpoint's documented storage-crash model), leaving the
+    // sidecar armed with a committed table effect.
+    {
+        let _fp = ScopedFailPoint::new(
+            omnigraph::failpoints::names::RECOVERY_SIDECAR_CONFIRM,
+            "return",
+        );
+        let response = app
+            .clone()
+            .oneshot(mutate_request("insert_person", json!({"name": "Mallory", "age": 41})))
+            .await
+            .unwrap();
+        assert!(
+            !response.status().is_success(),
+            "a failed confirmation write must fail the mutation",
+        );
+    }
+    assert!(
+        !recovery_dir_entries(&graph).is_empty(),
+        "the Armed sidecar must remain on disk after the confirm failure",
+    );
+
+    // The wedge: the next write returns 503 recovery_required — and, via the
+    // shielded-write chokepoint, arms the supervised reopen (trigger B).
+    let response = app
+        .clone()
+        .oneshot(mutate_request("insert_person", json!({"name": "Frank", "age": 33})))
+        .await
+        .unwrap();
+    assert_eq!(
+        response.status(),
+        StatusCode::SERVICE_UNAVAILABLE,
+        "a write must surface RecoveryRequired while the residual is unresolved",
+    );
+
+    // Convergence: bounded poll of the same write until it succeeds. Red
+    // with the drain-only skeleton (503 forever); green once the supervision
+    // loop re-drives the open, whose Full sweep resolves the residual.
+    let deadline = Instant::now() + Duration::from_secs(15);
+    loop {
+        let response = app
+            .clone()
+            .oneshot(mutate_request("insert_person", json!({"name": "Frank", "age": 33})))
+            .await
+            .unwrap();
+        if response.status() == StatusCode::OK {
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "RecoveryRequired never healed without a restart (RFC-029 W2(b)); \
+             last status: {}",
+            response.status(),
+        );
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    assert!(
+        recovery_dir_entries(&graph).is_empty(),
+        "the supervised reopen's Full sweep must have resolved the residual",
     );
 }

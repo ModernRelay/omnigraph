@@ -614,6 +614,126 @@ rules:
     assert_eq!(status, StatusCode::NOT_FOUND, "{body}");
 }
 
+/// RFC-029 W3: quarantine is a CONVERGING state, not a terminal one. A graph
+/// whose boot open failed must reach `serving` without a process restart
+/// once the fault clears — the supervision loop re-drives the full
+/// `open_single_graph` with capped backoff and RCU-publishes the healed
+/// handle. The "transient fault clears" model is deterministic: the graph
+/// root simply does not exist at boot and is initialized while the server
+/// runs.
+#[tokio::test(flavor = "multi_thread")]
+async fn boot_quarantined_graph_converges_to_serving_without_restart() {
+    let temp = tempfile::tempdir().unwrap();
+    let schema = "\nnode Person {\n  name: String @key\n}\n";
+    let good_uri = temp.path().join("good.omni");
+    Omnigraph::init(good_uri.to_string_lossy().as_ref(), schema)
+        .await
+        .unwrap();
+    let bad_uri = temp.path().join("late.omni");
+    let server_policy = omnigraph_server::PolicySource::Inline(
+        r#"
+version: 1
+kind: server
+groups:
+  admins: [act-admin]
+rules:
+  - id: admins-list-graphs
+    allow:
+      actors: { group: admins }
+      actions: [graph_list]
+"#
+        .to_string(),
+    );
+    let graphs = vec![
+        omnigraph_server::GraphStartupConfig {
+            graph_id: "late".to_string(),
+            uri: bad_uri.to_string_lossy().to_string(),
+            policy: None,
+            embedding: None,
+            queries: stored_query_registry(&[]),
+        },
+        omnigraph_server::GraphStartupConfig {
+            graph_id: "good".to_string(),
+            uri: good_uri.to_string_lossy().to_string(),
+            policy: None,
+            embedding: None,
+            queries: stored_query_registry(&[]),
+        },
+    ];
+    let state = omnigraph_server::open_multi_graph_state(
+        graphs,
+        vec![("act-admin".to_string(), "admin-token".to_string())],
+        Some(&server_policy),
+        temp.path().join("cluster.yaml"),
+        false,
+    )
+    .await
+    .unwrap();
+    let _supervision =
+        state.spawn_supervision(omnigraph_server::SupervisorConfig::fast_for_tests());
+    let app = build_app(state);
+
+    // Quarantined and visible while the root is missing.
+    let (status, body) = json_response(
+        &app,
+        Request::builder()
+            .uri("/graphs")
+            .header("authorization", "Bearer admin-token")
+            .body(Body::empty())
+            .unwrap(),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(
+        body["graphs"][1]["status"].as_str(),
+        Some("quarantined"),
+        "late graph must boot quarantined: {body}"
+    );
+
+    // The fault clears: the graph root appears while the server runs.
+    Omnigraph::init(bad_uri.to_string_lossy().as_ref(), schema)
+        .await
+        .unwrap();
+
+    // Convergence: bounded poll of GET /graphs until `late` serves. Red
+    // without the supervision loop (the drain-only skeleton never reopens),
+    // green once the loop re-drives the open and publishes the handle.
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    loop {
+        let (status, body) = json_response(
+            &app,
+            Request::builder()
+                .uri("/graphs")
+                .header("authorization", "Bearer admin-token")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        if body["graphs"][1]["status"].as_str() == Some("serving") {
+            break;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "quarantined graph never converged to serving without a restart \
+             (RFC-029 W3); last listing: {body}"
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+    }
+
+    // And it actually serves.
+    let (status, body) = json_response(
+        &app,
+        Request::builder()
+            .uri("/graphs/late/queries")
+            .header("authorization", "Bearer admin-token")
+            .body(Body::empty())
+            .unwrap(),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "healed graph must serve: {body}");
+}
+
 #[tokio::test(flavor = "multi_thread")]
 #[serial]
 async fn cluster_boot_injects_embedding_provider_config() {
