@@ -683,14 +683,28 @@ pub(crate) async fn server_export(
 /// unwind through the handler. Cancellation of the join cannot occur:
 /// nothing aborts the spawned handle, and the requester dropping the join
 /// future leaves the task running — that is the point.
-pub(crate) async fn shielded_write<T, F>(work: F) -> std::result::Result<T, ApiError>
+pub(crate) async fn shielded_write<T, F>(
+    state: &AppState,
+    key: &GraphKey,
+    work: F,
+) -> std::result::Result<T, ApiError>
 where
     T: Send + 'static,
     F: std::future::Future<Output = std::result::Result<T, ApiError>> + Send + 'static,
 {
-    tokio::spawn(work)
+    let result = tokio::spawn(work)
         .await
-        .map_err(|join_err| ApiError::internal(format!("write protocol task failed: {join_err}")))?
+        .map_err(|join_err| ApiError::internal(format!("write protocol task failed: {join_err}")))?;
+    // RFC-029 W2(b) trigger B: an unresolved rollback-class recovery
+    // residual wedges this graph's writes until a read-write open runs the
+    // Full sweep. Every shielded writer funnels through here, so this one
+    // chokepoint arms the supervised reopen for all of them.
+    if let Err(err) = &result
+        && err.recovery_required.is_some()
+    {
+        state.request_reopen(key);
+    }
+    result
 }
 
 /// Shared implementation behind `POST /mutate` (canonical) and
@@ -748,7 +762,7 @@ pub(crate) async fn run_mutate(
         let query = query.to_string();
         let selected_name = selected_name.clone();
         let actor_id: Option<String> = actor_id.map(str::to_string);
-        shielded_write(async move {
+        shielded_write(&state, &handle.key.clone(), async move {
             let _admission = admission;
             handle
                 .engine
@@ -1249,7 +1263,7 @@ pub(crate) async fn server_schema_apply(
         let schema_source = request.schema_source;
         let allow_data_loss = request.allow_data_loss;
         let actor_id: Option<String> = actor_id.map(str::to_string);
-        shielded_write(async move {
+        shielded_write(&state, &handle.key.clone(), async move {
             let _admission = admission;
             let registry = handle.queries.as_deref();
             let label = handle.key.graph_id.as_str().to_string();
@@ -1353,7 +1367,7 @@ async fn run_ingest(
         let from = from.clone();
         let data = request.data;
         let actor_id: Option<String> = actor_id.map(str::to_string);
-        shielded_write(async move {
+        shielded_write(&state, &handle.key.clone(), async move {
             let _admission = admission;
             handle
                 .engine
@@ -1556,7 +1570,7 @@ pub(crate) async fn server_branch_create(
         let actor_id: Option<String> = actor
             .as_ref()
             .map(|Extension(a)| a.actor_id.as_ref().to_string());
-        shielded_write(async move {
+        shielded_write(&state, &handle.key.clone(), async move {
             let _admission = admission;
             handle
                 .engine
@@ -1642,7 +1656,7 @@ pub(crate) async fn server_branch_delete(
         let handle = Arc::clone(&handle);
         let branch = branch.clone();
         let actor_id: Option<String> = actor_id.map(str::to_string);
-        shielded_write(async move {
+        shielded_write(&state, &handle.key.clone(), async move {
             let _admission = admission;
             handle
                 .engine
@@ -1723,7 +1737,7 @@ pub(crate) async fn server_branch_merge(
         let source = request.source.clone();
         let target = target.clone();
         let actor_id: Option<String> = actor_id.map(str::to_string);
-        shielded_write(async move {
+        shielded_write(&state, &handle.key.clone(), async move {
             let _admission = admission;
             handle
                 .engine
@@ -1734,8 +1748,13 @@ pub(crate) async fn server_branch_merge(
         .await?
     };
     let (branch_deleted, branch_delete_error) = if request.delete_branch {
-        match delete_merged_source_branch(&handle, actor.as_ref().map(|Extension(a)| a), &request.source)
-            .await
+        match delete_merged_source_branch(
+            &state,
+            &handle,
+            actor.as_ref().map(|Extension(a)| a),
+            &request.source,
+        )
+        .await
         {
             Ok(()) => (Some(true), None),
             Err(message) => (Some(false), Some(message)),
@@ -1759,6 +1778,7 @@ pub(crate) async fn server_branch_merge(
 /// operational error — into a message instead of an error status: the merge is
 /// already durable, so the request must not report failure for it.
 async fn delete_merged_source_branch(
+    state: &AppState,
     handle: &Arc<GraphHandle>,
     actor: Option<&ResolvedActor>,
     source: &str,
@@ -1779,10 +1799,11 @@ async fn delete_merged_source_branch(
     // Its own armed protocol (delete after the already-durable merge), so it
     // gets its own cancellation shield; failures stay stringly-reported per
     // this helper's contract.
+    let key = handle.key.clone();
     let handle = Arc::clone(handle);
     let source_task = source.to_string();
     let actor_id: Option<String> = actor.map(|actor| actor.actor_id.as_ref().to_string());
-    shielded_write(async move {
+    shielded_write(state, &key, async move {
         handle
             .engine
             .branch_delete_as(&source_task, actor_id.as_deref())

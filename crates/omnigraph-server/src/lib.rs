@@ -10,6 +10,7 @@ pub mod identity;
 pub mod policy;
 pub mod queries;
 pub mod registry;
+pub mod supervisor;
 pub mod workload;
 
 pub use graph_id::GraphId;
@@ -17,6 +18,7 @@ pub use identity::{AuthSource, GraphKey, ResolvedActor, Scope, TenantId};
 pub use registry::{
     GraphHandle, GraphRegistry, InsertError, QuarantineInfo, RegistryLookup, RegistrySnapshot,
 };
+pub use supervisor::SupervisorConfig;
 
 use crate::queries::{QueryRegistry, check, format_check_breakages};
 
@@ -266,6 +268,10 @@ pub struct AppState {
     /// Per-actor admission control. Process-wide (not per-graph) —
     /// see MR-668 decision Q6.
     workload: Arc<workload::WorkloadController>,
+    /// RFC-029 supervision notify channel. Set once by `spawn_supervision`;
+    /// `request_reopen` sends on it (and silently drops when supervision is
+    /// not running — single mode, or tests that don't spawn it).
+    supervisor_tx: Arc<std::sync::OnceLock<tokio::sync::mpsc::UnboundedSender<GraphKey>>>,
     bearer_tokens: Arc<[(BearerTokenHash, Arc<str>)]>,
     /// Server-level Cedar policy. Used by management endpoints (`GET
     /// /graphs`) which act on the registry resource, not on a per-graph
@@ -550,6 +556,7 @@ impl AppState {
                 startup_configs: Arc::new(HashMap::new()),
             },
             workload,
+            supervisor_tx: Arc::new(std::sync::OnceLock::new()),
             bearer_tokens,
             server_policy: None,
         }
@@ -602,6 +609,7 @@ impl AppState {
                 startup_configs,
             },
             workload: Arc::new(workload),
+            supervisor_tx: Arc::new(std::sync::OnceLock::new()),
             bearer_tokens,
             server_policy: server_policy.map(Arc::new),
         })
@@ -612,6 +620,39 @@ impl AppState {
     /// `server_graphs_list` reads the registry through it.
     pub fn routing(&self) -> &GraphRouting {
         &self.routing
+    }
+
+    /// Start the RFC-029 supervision loop (W3 boot retry + W2(b) supervised
+    /// reopen) for this state's registry. Idempotent: a second call warns
+    /// and returns a completed no-op handle. `serve()` calls this with
+    /// production pacing; in-process tests call it directly with
+    /// `SupervisorConfig::fast_for_tests()` since they never run `serve()`.
+    pub fn spawn_supervision(
+        &self,
+        config: supervisor::SupervisorConfig,
+    ) -> tokio::task::JoinHandle<()> {
+        let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+        if self.supervisor_tx.set(tx).is_err() {
+            warn!("graph supervision already running; ignoring second spawn");
+            return tokio::spawn(async {});
+        }
+        let supervisor = supervisor::GraphSupervisor {
+            registry: Arc::clone(&self.routing.registry),
+            configs: Arc::clone(&self.routing.startup_configs),
+            config,
+            rx,
+        };
+        tokio::spawn(supervisor.run())
+    }
+
+    /// RFC-029 W2(b) trigger B: a shielded write surfaced `RecoveryRequired`
+    /// for this graph — ask the supervision loop to re-drive the open (whose
+    /// Full sweep resolves the residual). Silently drops when supervision is
+    /// not running; the documented reopen-or-restart remedy still applies.
+    pub(crate) fn request_reopen(&self, key: &GraphKey) {
+        if let Some(tx) = self.supervisor_tx.get() {
+            let _ = tx.send(key.clone());
+        }
     }
 
     fn requires_bearer_auth(&self) -> bool {
