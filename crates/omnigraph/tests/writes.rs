@@ -308,19 +308,29 @@ async fn stale_non_strict_insert_reprepares_from_live_branch_state() {
 }
 
 /// The cancellation hole that motivated removing the Run state machine: dropping a mutation future
-/// mid-flight must not leave any graph-level state behind. With the run
-/// state machine gone, only orphaned Lance fragments can remain — and those
-/// are reclaimed by `omnigraph cleanup`.
+/// mid-flight must not leave any graph-level *staging* state behind (no
+/// `__run__*` branches, no `_graph_runs.lance`).
+///
+/// Scope note (RFC-029): "no graph-level state" is narrower than it sounds.
+/// Under the RFC-022 protocol a drop after the recovery sidecar is armed CAN
+/// leave that sidecar plus a committed-but-unpublished table effect on disk —
+/// recovery-covered residue, resolved by the write-entry heal or the next
+/// read-write open. This test cannot observe that residue: its final
+/// `Omnigraph::open` runs the Full recovery sweep before any assertion runs.
+/// The residue lifecycle is pinned by `rfc029_probe.rs`, and the HTTP
+/// boundary shields cancellation entirely (`omnigraph-server`'s
+/// `tests/failpoints.rs`), so an SDK caller dropping an engine future
+/// mid-protocol is the only remaining cancellation source (RFC-029 W1
+/// Stage 2 territory).
 ///
 /// The test deliberately does NOT assert that the manifest version is
 /// unchanged: `handle.abort()` is racing the spawned task, and on a fast
 /// machine the mutation may complete before cancellation. That is acceptable
-/// — what matters for cancel safety is that no `__run__*` staging branches
-/// are ever created, that `_graph_runs.lance` is never written, and that
-/// any partial state on disk is reachable through the regular manifest /
-/// commit graph pipes (so `omnigraph cleanup` can reclaim it). Asserting
-/// version equality would just be a flake on hosts where the abort lands
-/// late.
+/// — what matters here is that no `__run__*` staging branches are ever
+/// created, that `_graph_runs.lance` is never written, and that any partial
+/// state on disk is reachable through the regular manifest / commit graph /
+/// recovery pipes. Asserting version equality would just be a flake on hosts
+/// where the abort lands late.
 #[tokio::test]
 async fn cancelled_mutation_future_leaves_no_state() {
     let dir = tempfile::tempdir().unwrap();

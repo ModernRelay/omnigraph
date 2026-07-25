@@ -228,6 +228,25 @@ and `/schema/apply`. Read-only endpoints (`/snapshot`, `/query`, `/read`,
 `/export`, `/branches` GET, `/commits`, `/schema` GET) are not
 admission-gated.
 
+## Client disconnects during writes (RFC-029)
+
+Once a write handler passes authorization and admission, the engine's commit
+protocol runs on a server-owned task, detached from the request connection.
+A client that times out or disconnects mid-request does **not** abort the
+write: the server runs the protocol to its own terminal state — publish, or a
+compensated failure — exactly as if the client had stayed connected. Two
+consequences for clients:
+
+- **A disconnect makes the outcome unknown to you, not failed.** Verify by
+  reading the affected rows before retrying. A retried strict insert is safe
+  by construction: it succeeds or returns `key_conflict` — and a
+  `key_conflict` right after an ambiguous disconnect usually means the first
+  attempt landed.
+- **The admission slot is held until the protocol completes**, not until the
+  connection closes. A disconnecting actor cannot free its own in-flight
+  budget early by hanging up; slots release when the abandoned write
+  finishes.
+
 ## Body limits
 
 - Default: 1 MB
