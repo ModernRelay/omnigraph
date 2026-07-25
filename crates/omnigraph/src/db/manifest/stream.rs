@@ -1626,6 +1626,43 @@ mod tests {
     }
 
     #[test]
+    fn draining_row_naming_a_foreign_shard_is_typed_refusal_not_panic() {
+        // A corrupt or foreign DRAINING row whose drain descriptor names a
+        // shard absent from the entry's own binding must fail closed with a
+        // typed error.  `DrainDescriptor::validate` runs before the caller
+        // proves `drain.expected_binding == entry.binding`, so the epoch-floor
+        // comparison cannot assume the two maps share keys.
+        let mut foreign_shard_drain = entry();
+        foreign_shard_drain.lifecycle = StreamLifecycle::Draining;
+        foreign_shard_drain.lifecycle_revision = INITIAL_LIFECYCLE_REVISION + 1;
+
+        let foreign_shard = "99999999-9999-4999-8999-999999999999".to_string();
+        let mut expected_binding = foreign_shard_drain.binding.clone();
+        expected_binding.shard_ids = vec![foreign_shard.clone()];
+
+        foreign_shard_drain.drain = Some(DrainDescriptor {
+            drain_id: "66666666-6666-4666-8666-666666666666".to_string(),
+            operation_expected_revision: INITIAL_LIFECYCLE_REVISION,
+            operation_request_digest: format!("sha256:{}", "c".repeat(64)),
+            goal: DrainGoal::Sealed,
+            initiating_actor: "act-operator".to_string(),
+            initiated_at: 1,
+            expected_binding,
+            expected_current_head_witness: foreign_shard_drain.current_head_witness.clone(),
+            target_epoch_floor_by_shard: BTreeMap::from([(foreign_shard, 1)]),
+            guarded_operation: None,
+        });
+
+        let error = foreign_shard_drain
+            .validate()
+            .expect_err("a drain naming a shard outside the current binding must be refused");
+        assert!(
+            error.to_string().contains("absent from the current shard binding"),
+            "expected the typed foreign-shard refusal, got: {error}"
+        );
+    }
+
+    #[test]
     fn enrollment_intent_digest_is_stable_and_binds_authority() {
         let entry = entry();
         let digest = stream_enrollment_intent_digest_v1(
