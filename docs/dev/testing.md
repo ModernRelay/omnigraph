@@ -183,9 +183,14 @@ The implemented coverage keeps the boundaries split as follows:
   transaction rather than a separate manifest participant;
 - existing `failpoints.rs` owns post-invocation/lost-watcher ambiguity and
   crash orchestration before sidecar arm (pre-/mid-generation output and
-  post-shard-manifest publication) and around every `StreamFold` boundary: arm, table effect,
+  post-shard-manifest publication) and around every `StreamFold` boundary: arm,
+  armed-before-any-effect, table effect,
   achieved-effect confirmation, manifest publication, and sidecar
-  finalization. An unreferenced recognized randomized generation subtree,
+  finalization. The armed-before-any-effect cell
+  (`crash_after_arm_before_any_effect_retires_the_intent_effect_free`) pins the
+  `EffectFree` arm: recovery retires the durable intent without advancing the
+  base-table pointer or publishing, and the acknowledged generation still folds
+  exactly once afterwards. An unreferenced recognized randomized generation subtree,
   complete or partial, remains a retained derived orphan and is never
   adopted/deleted in B1; any other loose state fails closed. Unresolved
   no-effect and effected fold intents both block

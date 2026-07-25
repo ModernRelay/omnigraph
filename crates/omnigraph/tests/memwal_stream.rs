@@ -1085,6 +1085,89 @@ async fn fold_sidecar_arm_failure_leaves_no_table_effect_and_retries_the_exact_c
 
 #[tokio::test]
 #[serial]
+async fn crash_after_arm_before_any_effect_retires_the_intent_effect_free() {
+    // The armed-but-no-effect boundary: the recovery-v12 intent is durable
+    // while both exact Lance participants are untouched.  Recovery must take
+    // the `EffectFree` arm — retire the intent and publish nothing — rather
+    // than roll a phantom outcome forward.  The acknowledged generation stays
+    // durable and folds exactly once afterwards.
+    let _scenario = FailScenario::setup();
+    let (dir, db) = init_enrolled().await;
+    let table_version_before = db
+        .snapshot_of(ReadTarget::branch("main"))
+        .await
+        .unwrap()
+        .entry(TABLE)
+        .unwrap()
+        .table_version;
+    let batch = physical_batch(&db, &[("effect-free".to_string(), 36)]).await;
+    db.failpoint_stream_b1_for_test(TABLE, Some(batch), 0)
+        .await
+        .unwrap();
+
+    let error = {
+        let _failpoint =
+            ScopedFailPoint::new(names::STREAM_FOLD_POST_SIDECAR_PRE_BASE_COMMIT, "return");
+        db.failpoint_stream_b1_for_test(TABLE, None, 0)
+            .await
+            .expect_err("an armed intent must retain recovery ownership")
+    };
+    assert!(
+        matches!(error, OmniError::RecoveryRequired { .. }),
+        "{error:?}"
+    );
+    assert!(
+        error
+            .to_string()
+            .contains("stopped after arming its recovery intent"),
+        "the refusal must come from the armed-pre-effect boundary, got: {error:?}"
+    );
+    assert_eq!(
+        helpers::recovery::sidecar_operation_ids(dir.path()).len(),
+        1,
+        "the armed intent must survive for open-time classification"
+    );
+    assert!(visible_rows(&db).await.is_empty());
+    drop(db);
+
+    let reopened = Arc::new(
+        Omnigraph::open(dir.path().to_str().unwrap())
+            .await
+            .expect("open-time recovery must retire an effect-free intent"),
+    );
+    assert!(
+        helpers::recovery::sidecar_operation_ids(dir.path()).is_empty(),
+        "effect-free classification must retire the intent"
+    );
+    assert_eq!(
+        reopened
+            .snapshot_of(ReadTarget::branch("main"))
+            .await
+            .unwrap()
+            .entry(TABLE)
+            .unwrap()
+            .table_version,
+        table_version_before,
+        "an effect-free retirement must not advance the base-table pointer"
+    );
+    assert!(
+        visible_rows(&reopened).await.is_empty(),
+        "no participant committed, so nothing may become graph-visible"
+    );
+
+    reopened
+        .failpoint_stream_b1_for_test(TABLE, None, 0)
+        .await
+        .expect("the durable generation must remain fold-only and retryable");
+    assert_eq!(
+        visible_rows(&reopened).await,
+        vec![("effect-free".to_string(), 36)],
+        "the acknowledged row must fold exactly once after the effect-free retirement"
+    );
+}
+
+#[tokio::test]
+#[serial]
 async fn fold_confirmation_failure_reconstructs_exact_n_plus_one_on_reopen() {
     let _scenario = FailScenario::setup();
     let (dir, db) = init_enrolled().await;
