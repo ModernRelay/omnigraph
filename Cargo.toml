@@ -31,21 +31,23 @@ datafusion-common = "54"
 datafusion-expr = "54"
 datafusion-functions-aggregate = "54"
 
-# Lance 9.0.0-rc.1 (tag v9.0.0-rc.1 -> rev cec0b7df): the 9.x release
-# candidates are git-tags only. rev-pinned for reproducibility.
-# Carries lance#7480 (rowid overlap, closes #7444 -> vendor pin retired) and
-# lance#7320 (BTREE segment-merge, closes #7230). See docs/dev/lance.md.
-lance = { git = "https://github.com/lance-format/lance", rev = "cec0b7dffe2d85c7e66dbe9d1f3891c297903a1d", default-features = false, features = ["aws"] }
-lance-core = { git = "https://github.com/lance-format/lance", rev = "cec0b7dffe2d85c7e66dbe9d1f3891c297903a1d" }
+# Lance 9.0.0 (crates.io). The 9.x prereleases were git-tags only, so this
+# workspace rev-pinned `v9.0.0-rc.1` (cec0b7df) until the stable release
+# landed on 2026-07-24; registry versions retire that git pin and restore
+# ordinary publishability. Carries lance#7480 (rowid overlap, closes #7444 ->
+# vendor pin retired) and lance#7320 (BTREE segment-merge, closes #7230).
+# See docs/dev/lance.md.
+lance = { version = "9.0.0", default-features = false, features = ["aws"] }
+lance-core = "9.0.0"
 # RowAddrTreeMap moved from lance-core::utils::mask to the new lance-select crate in 9.x.
-lance-select = { git = "https://github.com/lance-format/lance", rev = "cec0b7dffe2d85c7e66dbe9d1f3891c297903a1d" }
-lance-datafusion = { git = "https://github.com/lance-format/lance", rev = "cec0b7dffe2d85c7e66dbe9d1f3891c297903a1d" }
-lance-file = { git = "https://github.com/lance-format/lance", rev = "cec0b7dffe2d85c7e66dbe9d1f3891c297903a1d" }
-lance-index = { git = "https://github.com/lance-format/lance", rev = "cec0b7dffe2d85c7e66dbe9d1f3891c297903a1d" }
-lance-linalg = { git = "https://github.com/lance-format/lance", rev = "cec0b7dffe2d85c7e66dbe9d1f3891c297903a1d" }
-lance-namespace = { git = "https://github.com/lance-format/lance", rev = "cec0b7dffe2d85c7e66dbe9d1f3891c297903a1d" }
-lance-namespace-impls = { git = "https://github.com/lance-format/lance", rev = "cec0b7dffe2d85c7e66dbe9d1f3891c297903a1d" }
-lance-table = { git = "https://github.com/lance-format/lance", rev = "cec0b7dffe2d85c7e66dbe9d1f3891c297903a1d" }
+lance-select = "9.0.0"
+lance-datafusion = "9.0.0"
+lance-file = "9.0.0"
+lance-index = "9.0.0"
+lance-linalg = "9.0.0"
+lance-namespace = "9.0.0"
+lance-namespace-impls = "9.0.0"
+lance-table = "9.0.0"
 
 ulid = "1"
 futures = "0.3"
