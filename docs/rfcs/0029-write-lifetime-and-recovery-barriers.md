@@ -56,17 +56,27 @@ Three coordinated, independently landable changes:
   for the result", never "abandoned the protocol". Staged: the server boundary
   first (the established spawn-and-clone idiom), then engine-level `'static`
   write execution as the durable close for embedded SDK callers.
-- **W2 — Full recovery at the write-entry barrier.** The write-entry heal
-  escalates rollback-class residuals to `RecoveryMode::Full` under *exclusive*
-  admission plus the existing schema → branch → table gates. The property
-  restore actually requires is exclusive authority over the affected tables;
-  process start was only ever a proxy for it. `RecoveryRequired` becomes a
-  transient condition resolved by the next write, not an operator event.
+- **W2 — Residual resolution without process restart.** Two implementations,
+  staged. **W2(b), first:** a supervised in-process reopen — on
+  `RecoveryRequired`, the server rebuilds the graph handle via
+  `open_single_graph` and swaps it into the registry; the read-write open's
+  Full sweep runs under the *same root-scoped write queue* live handles
+  share, so it serializes correctly against live traffic and resolves the
+  residual using only existing, failpoint-tested machinery. Zero engine
+  changes, no stated rule relaxed. **W2(a), end state:** the write-entry heal
+  escalates rollback-class residuals to `RecoveryMode::Full` under
+  *exclusive* admission plus the existing schema → branch → table gates,
+  avoiding W2(b)'s per-heal cache teardown and covering embedded SDK callers.
+  Either way, the property restore actually requires is exclusive authority
+  over the affected tables; process start was only ever a proxy for it.
+  `RecoveryRequired` becomes a transient condition, not an operator event.
 - **W3 — Boot supervision.** A graph whose open fails enters an observable
   `quarantined` registry state with a capped-backoff re-open loop, instead of
   silently dropping out of the handle set until redeploy. The engine's
   fail-closed recovery classification is untouched; the retry unit is the
-  whole (idempotent) open.
+  whole (idempotent) open. W3 and W2(b) are one server mechanism — a
+  supervised reopen triggered by boot failure or by `RecoveryRequired` — not
+  two.
 
 Together they establish one new standing rule, proposed for
 [invariants.md](../dev/invariants.md):
@@ -198,6 +208,25 @@ Embedded SDK callers can still drop futures (timeout combinators, select
 loops). The durable close moves the shield into the engine so the property
 holds for every consumer.
 
+**This is not a new pattern — it is the engine's newest-writer standard.**
+The RFC-026 B1 stream-fold writer already detaches its *entire* protocol:
+`stream_fold_phase_b1(self: &Arc<Self>, …)` clones the Arc, owns its inputs,
+and spawns, with the doc comment "The entire operation is detached, not
+merely the Lance seal. This keeps the exclusive admission token alive from
+the cut through recovery arm, the exact base-table effect, and the one
+manifest visibility CAS **even if the requesting task is cancelled**"
+(`db/omnigraph/stream_ingest.rs`). It spawns through
+`instrumentation::spawn_with_query_io_probes`, an existing crate-private
+helper written for exactly this ("a few correctness-sensitive paths detach
+physical work so cancellation cannot abandon it") that also re-scopes the
+observation task-locals `tokio::spawn` would otherwise drop — so the cost
+harness keeps seeing datasets opened inside the detached task, and
+production (which never installs probes) gets a plain spawn. Stage 2 is
+therefore precisely scoped: bring the five established writers (Mutation,
+Load, SchemaApply, BranchMerge, EnsureIndices — and Optimize) up to the
+cancellation-ownership standard the B1 writer already set, using the same
+`Arc<Self>`-receiver shape and the same spawn helper.
+
 Validated constraint: `Omnigraph` is not `Clone`, and `commit_all` takes
 borrowed `&WriteTxn` / `&LineageIntent`, so this is a real restructure, not a
 wrapper. The struct is already Arc-shaped where it matters — `coordinator:
@@ -285,7 +314,37 @@ Process start was a proxy for exclusivity. The root-scoped
 `WriteQueueManager` provides the real thing, so the barrier moves from
 "restart" to "next write's gate acquisition".
 
-### 4.3 Contract changes
+### 4.3 W2(b) — supervised in-process reopen (lands first)
+
+Investigation of the open path showed the restart barrier is already softer
+than "process restart": a read-write `Omnigraph::open` in the *same process*
+runs the Full sweep (`db/omnigraph.rs:628-651`), under exclusive recovery
+admission (`:602-604`) and the same root-scoped `WriteQueueManager` that
+every live handle for that root shares — `recover_manifest_drift` takes the
+queue as a parameter and acquires the shared total-order gates per sidecar.
+The open path's own comment states the design intent this RFC operationalizes:
+"only rollback-eligible sidecars wait for this open-time sweep."
+
+W2(b) therefore needs no engine change at all: when a request surfaces
+`RecoveryRequired`, the server's supervision loop (the same one W3 adds for
+boot) rebuilds the graph handle via `open_single_graph` and swaps it into
+the registry. Engine-instance survival across registry swaps is already
+documented and relied upon (`registry.rs:14-19`): in-flight requests on the
+old handle finish on their own Arc clone; new requests get the healed
+handle. The behavior probe (§7) pins this end to end: a leaked `Armed`
+sidecar wedges the live handle with `RecoveryRequired`, an in-process open
+clears `__recovery/`, and the previously wedged handle writes again — no
+restart.
+
+Costs, honestly stated: the reopened handle starts with cold read caches and
+re-validates stored queries/policy for that graph (bounded, one-time,
+per-residual — and residuals are crash-class-rare once W1 lands); and W2(b)
+covers server deployments only. Embedded SDK callers keep the documented
+"reopen read-write" remedy until W2(a). Those costs are why W2(a) remains
+the end state rather than being dropped; W2(b) is why W2(a) is no longer
+urgent.
+
+### 4.4 Contract changes
 
 `RecoveryRequired` (HTTP 503) becomes transient: the *next* write to the
 affected tables resolves the residual instead of every write failing until
@@ -303,6 +362,12 @@ behavior change and is documented as such in the release notes.
 The engine keeps deciding once and failing closed; the server gains the
 supervision loop it currently lacks. Division of labor:
 
+- **One mechanism with W2(b).** The supervision loop is shared: it is armed
+  by a failed boot open (W3) or by a served graph surfacing
+  `RecoveryRequired` (W2(b)); in both cases the action is the same
+  supervised `open_single_graph` + registry swap. `open_single_graph` is a
+  pure function of its (clonable) `GraphStartupConfig`, so re-driving it is
+  mechanically safe.
 - **Registry state.** A graph whose open fails enters
   `Quarantined { since, attempts, last_error, retry_at }` in the registry
   instead of vanishing from the handle set. (The registry's documented `Gone`
@@ -364,15 +429,30 @@ Deny-list brushes, and why each is not a violation:
   lifetime change and the disconnect-surviving mutation are called out as
   contract changes with docs and release notes (§4.3, §8).
 
-One stated rule is relaxed under this RFC's review: the recovery-mode doc
-comment's "restore … for the next ReadWrite open" becomes "restore under
-exclusive gate acquisition (write-entry heal or open)". This is the
-invariant-review artifact for that relaxation.
+One stated rule is relaxed under this RFC's review — by W2(a) only: the
+recovery-mode doc comment's "restore … for the next ReadWrite open" becomes
+"restore under exclusive gate acquisition (write-entry heal or open)". W2(b)
+relaxes nothing — it *is* a ReadWrite open, exercised in-process, which the
+recovery design already supports (the sweep takes the shared root-scoped
+queue precisely so it can serialize against live handles). This RFC is the
+invariant-review artifact for the W2(a) relaxation when it lands.
 
 ## 7. Evidence plan
 
 Per the repo's test-first rule, each change lands as a red test commit
 followed by the fix commit.
+
+**Baseline pin (already checked in):** `tests/rfc029_probe.rs` — a
+feature-gated failpoint test that pins the *current* three-phase lifecycle
+this RFC changes, at the engine boundary: parking a mutation at the
+sidecar-confirmation write and dropping its future leaks the `Armed` sidecar
+(Bug 1); a subsequent write on the still-live handle returns
+`RecoveryRequired` (Bug 2); an in-process read-write open clears
+`__recovery/` and the wedged handle writes again (the W2(b) mechanism).
+After W1 lands, the first cell inverts by design — cancellation can no
+longer create the residual — and the probe's Bug-1/Bug-2 phases are
+superseded by the W1 red test below (the reopen-heals phase remains valid
+permanently).
 
 **W1 (red first):**
 - New failpoint cell: rendezvous-park the mutation protocol *post-arm,
@@ -467,23 +547,32 @@ together.
 
 ## 11. Rollout
 
-Three independent PR series, in leverage order, each red-test-first with docs:
+Independent PR series, in leverage order, each red-test-first with docs:
 
 1. **PR-1 (W1 Stage 1):** server-boundary shield + the two W1 tests + stale
    comment fix. Smallest change, kills the incident's trigger.
-2. **PR-2 (W2):** exclusive-admission escalation + `Full` at the heal +
-   expectation flips + errors.md/invariants.md updates.
-3. **PR-3 (W3):** registry quarantine state + supervision loop + `GET
-   /graphs` status + OpenAPI regen + server.md.
-4. **PR-4 (W1 Stage 2):** engine `'static` write execution (`Arc<Self>`
-   receivers or inner-handle split, per review), `forbidden_apis.rs` registry
-   update, SDK-level cancellation test.
+2. **PR-2 (W3 + W2(b)):** the unified supervision mechanism — registry
+   quarantine state, the supervised `open_single_graph` + registry-swap loop,
+   its two triggers (boot failure, `RecoveryRequired`), `GET /graphs` status
+   + OpenAPI regen + server.md/errors.md updates. Zero engine changes.
+3. **PR-3 (W1 Stage 2):** engine `'static` write execution via the
+   established `Arc<Self>`-receiver + `spawn_with_query_io_probes` pattern
+   (§3.3), `forbidden_apis.rs` registry update, SDK-level cancellation test.
+4. **PR-4 (W2(a), optional end state):** exclusive-admission escalation +
+   `Full` at the write-entry heal + expectation flips + the invariants.md
+   relaxation. Motivated by W2(b)'s cache-teardown cost and by embedded
+   callers; scheduled on evidence that either matters in practice.
 
 ## 12. Unresolved questions
 
-- **W1 Stage 2 shape:** `Arc<Self>` receivers vs an `Arc<OmnigraphInner>`
-  split. The split is the cleaner long-run shape but touches every field
-  access; receivers are surgical but bifurcate the public API surface.
+- **W1 Stage 2 shape — narrowed by precedent:** the B1 stream-fold writer
+  already uses `self: &Arc<Self>` receivers with
+  `spawn_with_query_io_probes` (§3.3), so the remaining question is only
+  whether the *public* SDK entry points adopt the same receiver shape or an
+  `Arc<OmnigraphInner>` split keeps them `&self`.
+- **Whether W2(a) ships at all,** given W2(b) + W1 close the incident class:
+  the remaining motivations are per-heal cache teardown (rare once W1 lands)
+  and embedded SDK callers (who hold the reopen remedy themselves).
 - **Backoff policy for W3** (initial/cap/jitter) and whether attempts should
   be capped at all, or retry indefinitely at the cap interval.
 - **Whether the shielded task needs its own deadline** beyond Lance's
