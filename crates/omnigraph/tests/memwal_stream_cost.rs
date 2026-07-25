@@ -60,7 +60,16 @@ const NO_AUTO_ROLL_ROWS: usize = 8_193;
 const NO_AUTO_ROLL_BATCHES: usize = 8_193;
 
 const RSS_CHILD_ENV: &str = "OMNIGRAPH_MEMWAL_COST_CHILD";
-const SURVEYED_LANCE_REV: &str = "cec0b7dffe2d85c7e66dbe9d1f3891c297903a1d";
+/// The exact Lance release Gate R0's source audit was performed against.
+/// Through the 9.0.0-rc.1 era this was a git rev (`cec0b7df`); the 9.0.0
+/// stable bump moved every Lance crate to the crates.io registry, so the
+/// tripwire now pins the released version instead. Its purpose is unchanged:
+/// the audit must not silently outlive the source it surveyed.
+const SURVEYED_LANCE_VERSION: &str = "9.0.0";
+/// Two members of the Lance repository family are versioned against Arrow
+/// rather than Lance, so they carry their own surveyed version.
+const SURVEYED_LANCE_ARROW_VERSION: &str = "58.0.0";
+const SURVEYED_LANCE_ARROW_PACKAGES: [&str; 2] = ["lance-arrow-scalar", "lance-arrow-stats"];
 
 fn classify_mem_wal_object(
     components: &[&str],
@@ -1729,9 +1738,7 @@ async fn gate_r0_current_inventory_refuses_listed_shard_without_manifest() {
 
 #[test]
 fn gate_r0_source_audit_revision_tripwire_matches_surveyed_lance() {
-    let expected_source = format!(
-        "git+https://github.com/lance-format/lance?rev={SURVEYED_LANCE_REV}#{SURVEYED_LANCE_REV}"
-    );
+    let expected_source = "registry+https://github.com/rust-lang/crates.io-index";
     let expected_lance_repository_packages = BTreeSet::from([
         "fsst",
         "lance",
@@ -1772,13 +1779,28 @@ fn gate_r0_source_audit_revision_tripwire_matches_surveyed_lance() {
         let Some(source) = value("source") else {
             continue;
         };
-        if source.starts_with("git+https://github.com/lance-format/lance?") {
-            assert_eq!(
-                source, expected_source,
-                "Lance-repository package {name} moved or became mixed; Gate R0's source audit must be rerun"
-            );
-            observed.entry(name).or_default().push(source);
+        if !expected_lance_repository_packages.contains(name) {
+            continue;
         }
+        assert!(
+            !source.starts_with("git+"),
+            "Lance-repository package {name} is pinned to a git source again; Gate R0's source audit must be rerun against it"
+        );
+        assert_eq!(
+            source, expected_source,
+            "Lance-repository package {name} left the crates.io registry; Gate R0's source audit must be rerun"
+        );
+        let version = value("version").expect("every locked package declares a version");
+        let expected_version = if SURVEYED_LANCE_ARROW_PACKAGES.contains(&name) {
+            SURVEYED_LANCE_ARROW_VERSION
+        } else {
+            SURVEYED_LANCE_VERSION
+        };
+        assert_eq!(
+            version, expected_version,
+            "audited Lance-repository package {name} moved off the surveyed version; Gate R0's source audit must be rerun"
+        );
+        observed.entry(name).or_default().push(version);
     }
     assert_eq!(
         observed.keys().copied().collect::<BTreeSet<_>>(),
@@ -1786,9 +1808,14 @@ fn gate_r0_source_audit_revision_tripwire_matches_surveyed_lance() {
         "the exact audited Lance-repository package family changed; Gate R0's source audit must be rerun"
     );
     for package in &expected_lance_repository_packages {
+        let expected_version = if SURVEYED_LANCE_ARROW_PACKAGES.contains(package) {
+            SURVEYED_LANCE_ARROW_VERSION
+        } else {
+            SURVEYED_LANCE_VERSION
+        };
         assert_eq!(
             observed.get(package).map(Vec::as_slice),
-            Some([expected_source.as_str()].as_slice()),
+            Some([expected_version].as_slice()),
             "audited Lance-repository package {package} moved, disappeared, or became mixed; Gate R0's source audit must be rerun"
         );
     }
@@ -1804,9 +1831,13 @@ fn gate_r0_source_audit_revision_tripwire_matches_surveyed_lance() {
             "Gate R0 must find exactly one direct source declaration for {package}"
         );
         assert!(
-            lines[0].contains("git = \"https://github.com/lance-format/lance\"")
-                && lines[0].contains(&format!("rev = \"{SURVEYED_LANCE_REV}\"")),
-            "direct Lance manifest pin moved without rerunning Gate R0: {}",
+            !lines[0].contains("git = "),
+            "direct Lance manifest pin returned to a git source without rerunning Gate R0: {}",
+            lines[0]
+        );
+        assert!(
+            lines[0].contains(&format!("\"{SURVEYED_LANCE_VERSION}\"")),
+            "direct Lance manifest pin moved off the surveyed version without rerunning Gate R0: {}",
             lines[0]
         );
     };
