@@ -277,7 +277,10 @@ pub(crate) async fn resolve_graph_handle(
     let key = GraphKey::cluster(graph_id.clone());
     let handle = match registry.get(&key) {
         RegistryLookup::Ready(handle) => handle,
-        RegistryLookup::Gone => {
+        // Temporary: quarantined graphs answer 404 like Gone until the
+        // RFC-029 W3 lookup-semantics commit flips this arm to 503 behind
+        // its red test (nothing populates quarantine state yet).
+        RegistryLookup::Quarantined(_) | RegistryLookup::Gone => {
             return Err(ApiError::not_found(format!("graph '{graph_id}' not found")));
         }
     };
