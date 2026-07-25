@@ -1357,6 +1357,10 @@ pub async fn serve(config: ServerConfig) -> Result<()> {
         }
     };
 
+    // RFC-029 W3/W2(b): start the supervision loop before serving. Its task
+    // exits on its own when the state (and with it the notify sender) drops
+    // at shutdown; graphs quarantined at boot begin converging immediately.
+    let _supervision = state.spawn_supervision(supervisor::SupervisorConfig::production());
     let listener = TcpListener::bind(&bind).await?;
     axum::serve(listener, build_app(state))
         .with_graceful_shutdown(shutdown_signal())
