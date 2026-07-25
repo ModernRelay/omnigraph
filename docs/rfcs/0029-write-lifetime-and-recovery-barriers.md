@@ -163,6 +163,21 @@ sidecar before the assertions run, and its doc comment ("only orphaned Lance
 fragments can remain") predates the RFC-022 sidecar protocol. That comment is
 corrected as part of this work.
 
+**Empirical nuance (probe-observed): the leaked residual's class is a
+storage-backend-dependent race.** Which state the sidecar lands in depends on
+where the drop's first pending yield falls relative to the confirmation
+write — and on whether that write survives the drop. On local FS, storage
+puts run on `spawn_blocking`, and an already-spawned blocking write completes
+even after the awaiting future is dropped; the probe observed exactly this:
+a mutation cancelled *at* the confirmation failpoint still produced a
+durably-confirmed sidecar, which the next write's roll-forward-only heal
+resolved in-process (write succeeded, no wedge). On a network object store
+the in-flight PUT dies with the future, so the same cancellation leaves the
+`Armed` class that wedges — consistent with the field incident occurring on
+S3. The design consequence: cancellation's outcome today is a
+backend-dependent roulette between "self-heals on next write" and "wedged
+until a reopen barrier". W1 does not tune the roulette; it removes it.
+
 ### 3.2 Stage 1 — server-boundary shield
 
 The server already documents and uses the exact idiom needed:
@@ -442,17 +457,21 @@ invariant-review artifact for the W2(a) relaxation when it lands.
 Per the repo's test-first rule, each change lands as a red test commit
 followed by the fix commit.
 
-**Baseline pin (already checked in):** `tests/rfc029_probe.rs` — a
-feature-gated failpoint test that pins the *current* three-phase lifecycle
-this RFC changes, at the engine boundary: parking a mutation at the
-sidecar-confirmation write and dropping its future leaks the `Armed` sidecar
-(Bug 1); a subsequent write on the still-live handle returns
-`RecoveryRequired` (Bug 2); an in-process read-write open clears
-`__recovery/` and the wedged handle writes again (the W2(b) mechanism).
-After W1 lands, the first cell inverts by design — cancellation can no
-longer create the residual — and the probe's Bug-1/Bug-2 phases are
-superseded by the W1 red test below (the reopen-heals phase remains valid
-permanently).
+**Baseline pin (checked in, green):** `tests/rfc029_probe.rs` — a
+feature-gated failpoint test pinning the *current* lifecycle this RFC
+changes, at the engine boundary, in three deterministic phases: (1)
+cancelling a mutation future parked at the sidecar-confirmation failpoint
+leaks the recovery sidecar — the residual's *class* being the
+backend-dependent race documented in §3.1, phase 1 asserts only the leak;
+(2) a failed confirmation write (the failpoint's documented storage-crash
+model) deterministically manufactures the `Armed` class, and a subsequent
+write on the still-live handle returns `RecoveryRequired` with the
+documented "reopen the graph read-write" guidance; (3) an in-process
+read-write open clears `__recovery/` and the previously wedged handle
+writes again without a process restart — the W2(b) mechanism, proven
+end to end. After W1 lands, phase 1 inverts by design — cancellation can no
+longer create the residual — and is superseded by the W1 red test below;
+phases 2–3 remain valid permanently (crash-class residuals survive W1).
 
 **W1 (red first):**
 - New failpoint cell: rendezvous-park the mutation protocol *post-arm,
