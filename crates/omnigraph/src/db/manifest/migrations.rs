@@ -92,19 +92,28 @@ pub(crate) const MIN_SUPPORTED_INTERNAL_SCHEMA_VERSION: u32 = INTERNAL_MANIFEST_
 /// see `docs/user/operations/upgrade.md`). Ranges are the release tags that
 /// stamped each version (verify with
 /// `git show vX.Y.Z:crates/omnigraph/src/db/manifest/migrations.rs`):
-/// v1 ≤ 0.3.1, v2 0.4.1–0.6.1, v3 0.6.2–0.7.2, v4 0.8.x, v5 0.9.x,
-/// v6 0.10.x, v7 0.11.x, v8 0.12.x, v9 0.13.x.
+/// v1 ≤ 0.3.1, v2 0.4.1–0.6.1, v3 0.6.2–0.7.2, v4 0.8.x, v5–v8 unreleased,
+/// v9 0.9.x.
+///
+/// v5 through v8 never reached a published release: the format advanced five
+/// times (RFC-028 identity, RFC-023 key fencing, and the three RFC-026 stream
+/// slices) inside the single 0.8.1 → 0.9.0 development window, so the only
+/// graphs carrying those stamps came from source builds off `main`. An earlier
+/// revision of this table optimistically assigned each of them its own release
+/// line (0.9.x–0.12.x); those releases do not exist and naming them here would
+/// send an operator hunting for a binary that was never published.
 pub(crate) fn release_for_internal_schema_version(stamp: u32) -> &'static str {
     match stamp {
         1 => "0.3.1 or earlier",
         2 => "0.4.1 to 0.6.1",
         3 => "0.6.2 to 0.7.2",
         4 => "0.8.x",
-        5 => "0.9.x",
-        6 => "0.10.x",
-        7 => "0.11.x",
-        8 => "0.12.x",
-        9 => "0.13.x",
+        // Reads in both message slots ("created by omnigraph X" and "with an
+        // omnigraph X binary"). No such binary was ever published, so
+        // upgrade.md explains that these graphs must be exported with the
+        // source commit that stamped them.
+        5..=8 => "0.9.0-dev",
+        9 => "0.9.x",
         // Unreachable today (1–9 are mapped; > CURRENT is caught by the ceiling
         // guard before this is consulted). Worded to read naturally after
         // "created by omnigraph " if a future bump ever leaves a gap.
@@ -216,11 +225,12 @@ mod tests {
     fn release_names_the_writing_line_for_each_stamp() {
         assert_eq!(release_for_internal_schema_version(3), "0.6.2 to 0.7.2");
         assert_eq!(release_for_internal_schema_version(4), "0.8.x");
-        assert_eq!(release_for_internal_schema_version(5), "0.9.x");
-        assert_eq!(release_for_internal_schema_version(6), "0.10.x");
-        assert_eq!(release_for_internal_schema_version(7), "0.11.x");
-        assert_eq!(release_for_internal_schema_version(8), "0.12.x");
-        assert_eq!(release_for_internal_schema_version(9), "0.13.x");
+        // v5-v8 advanced and were superseded entirely within the 0.8.1 -> 0.9.0
+        // development window, so no published release stamped them.
+        for unreleased in 5..=8 {
+            assert_eq!(release_for_internal_schema_version(unreleased), "0.9.0-dev");
+        }
+        assert_eq!(release_for_internal_schema_version(9), "0.9.x");
         assert_eq!(
             release_for_internal_schema_version(99),
             "an unrecognized older release"
@@ -231,7 +241,13 @@ mod tests {
         assert!(err.contains("omnigraph export"), "got: {err}");
 
         let v6_err = refuse_if_stamp_unsupported(6).unwrap_err().to_string();
-        assert!(v6_err.contains("0.10.x"), "got: {v6_err}");
+        assert!(v6_err.contains("0.9.0-dev"), "got: {v6_err}");
         assert!(v6_err.contains("omnigraph export"), "got: {v6_err}");
+        // The embedded release must read naturally in both slots of the
+        // rebuild instruction, not just the "created by" clause.
+        assert!(
+            v6_err.contains("with an omnigraph 0.9.0-dev binary"),
+            "got: {v6_err}"
+        );
     }
 }
