@@ -88,8 +88,9 @@ jobs:
               .github/workflows/ci.yml|Cargo.toml|Cargo.lock|crates/*/Cargo.toml) run_rustfs_ci=true ;;
               crates/omnigraph/src/storage.rs) run_rustfs_ci=true ;;
               crates/omnigraph/src/db/manifest.rs|crates/omnigraph/src/db/manifest/*) run_rustfs_ci=true ;;
-              crates/omnigraph/tests/s3_storage.rs|crates/omnigraph/tests/write_cost_s3.rs|crates/omnigraph/tests/lance_surface_guards.rs|crates/omnigraph/tests/memwal_enrollment_gate.rs|crates/omnigraph/tests/helpers/*) run_rustfs_ci=true ;;
-              crates/omnigraph/src/table_store.rs|crates/omnigraph/src/instrumentation.rs) run_rustfs_ci=true ;;
+              crates/omnigraph/src/db/omnigraph.rs|crates/omnigraph/src/db/omnigraph/stream_enrollment.rs|crates/omnigraph/src/db/omnigraph/stream_ingest.rs) run_rustfs_ci=true ;;
+              crates/omnigraph/tests/s3_storage.rs|crates/omnigraph/tests/write_cost_s3.rs|crates/omnigraph/tests/lance_surface_guards.rs|crates/omnigraph/tests/memwal_enrollment_gate.rs|crates/omnigraph/tests/memwal_stream.rs|crates/omnigraph/tests/memwal_stream_cost.rs|crates/omnigraph/tests/failpoints.rs|crates/omnigraph/tests/helpers/*) run_rustfs_ci=true ;;
+              crates/omnigraph/src/table_store.rs|crates/omnigraph/src/table_store/mem_wal.rs|crates/omnigraph/src/table_store/mem_wal/*|crates/omnigraph/src/instrumentation.rs) run_rustfs_ci=true ;;
               crates/omnigraph/src/runtime_cache.rs|crates/omnigraph/src/graph_index/*) run_rustfs_ci=true ;;
               crates/omnigraph-cluster/src/store.rs|crates/omnigraph-cluster/src/serve.rs) run_rustfs_ci=true ;;
               crates/omnigraph-cluster/tests/s3_cluster.rs) run_rustfs_ci=true ;;
@@ -211,6 +212,65 @@ jobs:
         # omnigraph/failpoints, so each line rebuilds only its crate.
         run: |
           cargo test --locked -p omnigraph-engine --features failpoints --test failpoints
+          cargo test --locked -p omnigraph-engine --features failpoints --test memwal_stream
+          set +e
+          output=$(cargo test --locked -p omnigraph-engine --features failpoints --test memwal_stream_cost gate_r0_ -- --nocapture 2>&1); status=$?
+          set -e
+          echo "$output"
+          [ "$status" -eq 0 ] || exit "$status"
+          echo "$output" | grep -Eq "test result: ok\. [1-9][0-9]* passed" \
+            || { echo "::error::Gate R0 filter matched no tests — vacuous pass"; exit 1; }
+          echo "$output" | grep -Fq "Gate R0 widest local:" \
+            || { echo "::error::Gate R0 local closure cell did not produce evidence"; exit 1; }
+          for test_name in \
+            gate_r0_current_inventory_path_classifier_is_canonical_and_fail_closed \
+            gate_r0_source_audit_revision_tripwire_matches_surveyed_lance \
+            gate_r0_retain_all_current_object_growth_is_swept_explicitly \
+            gate_r0_referenced_cut_retry_reuses_the_same_generation_root_local \
+            gate_r0_widest_generation_closes_and_records_retain_all_growth_local
+          do
+            echo "$output" | grep -Eq "test ${test_name} \.\.\. ok" \
+              || { echo "::error::required positive Gate R0 cell '${test_name}' did not execute normally"; exit 1; }
+          done
+          for test_name in \
+            gate_r0_current_inventory_refuses_manifest_for_another_shard \
+            gate_r0_current_inventory_refuses_duplicate_generation_authority \
+            gate_r0_current_inventory_refuses_zero_current_generation \
+            gate_r0_current_inventory_refuses_non_advanced_current_generation \
+            gate_r0_current_inventory_refuses_manifest_filename_body_version_mismatch \
+            gate_r0_current_inventory_refuses_gapped_manifest_version_chain \
+            gate_r0_current_inventory_refuses_listed_shard_without_manifest
+          do
+            echo "$output" | grep -Eq "test ${test_name} - should panic \.\.\. ok" \
+              || { echo "::error::required negative Gate R0 cell '${test_name}' did not execute as should-panic"; exit 1; }
+          done
+
+          set +e
+          output=$(cargo test --locked -p omnigraph-engine --features failpoints --test memwal_stream_cost b2a_ -- --nocapture 2>&1); status=$?
+          set -e
+          echo "$output"
+          [ "$status" -eq 0 ] || exit "$status"
+          echo "$output" | grep -Eq "test result: ok\. 1 passed; 0 failed; 2 ignored" \
+            || { echo "::error::B2a retained-history filter matched the wrong test set"; exit 1; }
+          echo "$output" | grep -Eq "test b2a_retained_history_small_depth_keeps_terms_and_old_roots_separate \.\.\. ok" \
+            || { echo "::error::required B2a retained-history regression cell did not execute normally"; exit 1; }
+          echo "$output" | grep -Fq "B2a retained-history ci depth=" \
+            || { echo "::error::B2a retained-history regression cell produced no evidence"; exit 1; }
+
+          # This is a remeasurement tripwire for the current single-exclusive-
+          # fold shape, not a runtime allocator limit. Keep it outside the
+          # gate_r0_ filter because the subprocess owner has a stable older name.
+          set +e
+          output=$(cargo test --locked -p omnigraph-engine --features failpoints --test memwal_stream_cost widest_legal_generation_records_no_roll_estimates_and_peak_rss -- --exact --nocapture 2>&1); status=$?
+          set -e
+          echo "$output"
+          [ "$status" -eq 0 ] || exit "$status"
+          echo "$output" | grep -Eq "test result: ok\. 1 passed" \
+            || { echo "::error::Gate R0 RSS filter matched no tests — vacuous pass"; exit 1; }
+          echo "$output" | grep -Eq "test widest_legal_generation_records_no_roll_estimates_and_peak_rss \.\.\. ok" \
+            || { echo "::error::Gate R0 RSS remeasurement cell did not execute normally"; exit 1; }
+          echo "$output" | grep -Fq "fold_delta_remeasure_bytes=402653184" \
+            || { echo "::error::Gate R0 RSS evidence line or 384-MiB tripwire changed"; exit 1; }
           cargo test --locked -p omnigraph-cluster --features failpoints --test failpoints
 
       - name: Commit regenerated openapi.json to PR branch
@@ -466,11 +526,37 @@ jobs:
         # grep guards against the filter going vacuous (cargo passes
         # with 0 tests matched) if those tests are ever renamed.
         run: |
+          set +e
           output=$(cargo test --locked -p omnigraph-engine --features failpoints --test failpoints s3_ -- --nocapture 2>&1); status=$?
+          set -e
           echo "$output"
           [ "$status" -eq 0 ] || exit "$status"
           echo "$output" | grep -Eq "test result: ok\. [1-9][0-9]* passed" \
             || { echo "::error::filter 's3_' matched no tests — vacuous pass"; exit 1; }
+
+          set +e
+          output=$(cargo test --locked -p omnigraph-engine --features failpoints --test memwal_stream s3_provider_shard_manifest_failure_retains_unreferenced_generation -- --exact --nocapture 2>&1); status=$?
+          set -e
+          echo "$output"
+          [ "$status" -eq 0 ] || exit "$status"
+          echo "$output" | grep -Fq "SKIP s3_provider_shard_manifest_failure_retains_unreferenced_generation" \
+            && { echo "::error::RustFS B2a provider-failure cell skipped — vacuous pass"; exit 1; }
+          echo "$output" | grep -Eq "test result: ok\. 1 passed" \
+            || { echo "::error::RustFS B2a provider-failure filter matched no test — vacuous pass"; exit 1; }
+          echo "$output" | grep -Eq "test s3_provider_shard_manifest_failure_retains_unreferenced_generation \.\.\. ok" \
+            || { echo "::error::RustFS B2a provider-failure cell did not execute normally"; exit 1; }
+
+          set +e
+          output=$(cargo test --locked -p omnigraph-engine --features failpoints --test memwal_stream_cost gate_r0_widest_generation_closes_and_records_retain_all_growth_on_configured_rustfs -- --exact --nocapture 2>&1); status=$?
+          set -e
+          echo "$output"
+          [ "$status" -eq 0 ] || exit "$status"
+          echo "$output" | grep -Eq "test result: ok\. 1 passed" \
+            || { echo "::error::RustFS Gate R0 filter matched no tests — vacuous pass"; exit 1; }
+          echo "$output" | grep -Eq "test gate_r0_widest_generation_closes_and_records_retain_all_growth_on_configured_rustfs \.\.\. ok" \
+            || { echo "::error::RustFS Gate R0 cell did not execute with positive-test polarity"; exit 1; }
+          echo "$output" | grep -Fq "Gate R0 widest rustfs:" \
+            || { echo "::error::RustFS Gate R0 test skipped instead of measuring configured storage"; exit 1; }
 
       - name: Dump RustFS logs on failure
         if: failure()

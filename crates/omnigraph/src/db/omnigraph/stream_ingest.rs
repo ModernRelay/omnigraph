@@ -9,8 +9,9 @@
 
 use std::sync::Arc;
 
-use arrow_array::{Array, RecordBatch};
+use arrow_array::{Array, RecordBatch, UInt32Array};
 use arrow_schema::Schema as ArrowSchema;
+use arrow_select::take::take;
 use futures::TryStreamExt;
 use lance::dataset::mem_wal::scanner::LsmScanner;
 use lance::dataset::mem_wal::{DatasetMemWalExt, ShardWriter};
@@ -1032,14 +1033,73 @@ async fn scan_fresh_generation(
         .await
         .map_err(|error| OmniError::Lance(error.to_string()))?;
     let mut batches = Vec::new();
+    let mut rows = 0_u64;
+    let mut logical_bytes = 0_u64;
     while let Some(batch) = stream
         .try_next()
         .await
         .map_err(|error| OmniError::Lance(error.to_string()))?
     {
-        batches.push(batch);
+        if batch.num_rows() == 0 {
+            continue;
+        }
+        rows = rows
+            .checked_add(
+                u64::try_from(batch.num_rows()).map_err(|_| {
+                    OmniError::manifest_internal("stream fold row count exceeds u64")
+                })?,
+            )
+            .ok_or_else(|| OmniError::manifest_internal("stream fold row count overflow"))?;
+        if rows > B1_MAX_GENERATION_ROWS {
+            return Err(OmniError::resource_limit(
+                format!("stream fold rows for {}", capture.entry.table_key),
+                B1_MAX_GENERATION_ROWS,
+                rows,
+            ));
+        }
+        for column in batch.columns() {
+            let bytes = column
+                .to_data()
+                .get_slice_memory_size()
+                .map_err(|error| OmniError::Lance(error.to_string()))?;
+            logical_bytes = logical_bytes
+                .checked_add(u64::try_from(bytes).map_err(|_| {
+                    OmniError::manifest_internal("stream fold logical bytes exceed u64")
+                })?)
+                .ok_or_else(|| {
+                    OmniError::manifest_internal("stream fold logical byte count overflow")
+                })?;
+        }
+        if logical_bytes > B1_MAX_GENERATION_ARROW_BYTES {
+            return Err(OmniError::resource_limit(
+                format!("stream fold bytes for {}", capture.entry.table_key),
+                B1_MAX_GENERATION_ARROW_BYTES,
+                logical_bytes,
+            ));
+        }
+
+        // LsmScanner may emit slices whose Utf8 and other variable-width
+        // arrays retain sparse backing buffers much larger than the selected
+        // rows. A no-op concat preserves those buffers. Taking every selected
+        // row rebuilds dense owned arrays, after which dropping `batch`
+        // releases the scanner representation before the next slice arrives.
+        let row_count = u32::try_from(batch.num_rows())
+            .map_err(|_| OmniError::manifest_internal("stream fold batch row count exceeds u32"))?;
+        let indices = UInt32Array::from_iter_values(0..row_count);
+        let columns = batch
+            .columns()
+            .iter()
+            .map(|column| {
+                take(column.as_ref(), &indices, None)
+                    .map_err(|error| OmniError::Lance(error.to_string()))
+            })
+            .collect::<Result<Vec<_>>>()?;
+        batches.push(
+            RecordBatch::try_new(batch.schema(), columns)
+                .map_err(|error| OmniError::Lance(error.to_string()))?,
+        );
     }
-    if batches.iter().all(|batch| batch.num_rows() == 0) {
+    if rows == 0 {
         return Err(OmniError::manifest_internal(
             "stream fold fresh-only scan returned no live rows",
         ));

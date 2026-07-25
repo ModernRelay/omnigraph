@@ -34,12 +34,7 @@ async fn projected_commits(root: &str, branch: Option<&str>) -> Vec<GraphCommit>
         None => CommitGraph::open(root).await.unwrap(),
     };
     let mut commits = graph.load_commits().await.unwrap();
-    commits.sort_by(|a, b| {
-        a.manifest_version
-            .cmp(&b.manifest_version)
-            .then_with(|| a.created_at.cmp(&b.created_at))
-            .then_with(|| a.graph_commit_id.cmp(&b.graph_commit_id))
-    });
+    commits.sort_by(|a, b| a.lineage_key().cmp(&b.lineage_key()));
     commits
 }
 
@@ -238,6 +233,36 @@ async fn graph_lineage_lives_only_in_manifest() {
         resolved_feature_snapshot.version(),
         "without intervening physical-only maintenance, feature's resolved snapshot and head \
          lineage must come from one manifest version"
+    );
+
+    // ── public listing contract: newest-first, one total order ───────────────
+    // `Omnigraph::list_commits` is the single public door (embedded CLI, HTTP
+    // server, SDK all funnel through it); its contract is most-recent-first by
+    // `GraphCommit::lineage_key`. The internal projection (`load_commits`,
+    // asserted above) stays ascending — this block pins the public flip.
+    let listed_main = main.list_commits(None).await.unwrap();
+    assert_eq!(
+        listed_main.first().map(|c| c.graph_commit_id.as_str()),
+        Some(merge_commit.graph_commit_id.as_str()),
+        "public main listing must start at the branch head (newest first)"
+    );
+    assert!(
+        listed_main
+            .last()
+            .is_some_and(|c| c.parent_commit_id.is_none()),
+        "public main listing must end at the parentless genesis commit"
+    );
+    assert!(
+        listed_main
+            .windows(2)
+            .all(|pair| pair[0].lineage_key() > pair[1].lineage_key()),
+        "public listing must be strictly descending by lineage_key"
+    );
+    let listed_feature = main.list_commits(Some("feature")).await.unwrap();
+    assert_eq!(
+        listed_feature.first().map(|c| c.graph_commit_id.as_str()),
+        Some(feature_head.as_str()),
+        "public feature listing must start at the feature head (newest first)"
     );
 
     // ── actors surface inline from the manifest metadata ─────────────────────

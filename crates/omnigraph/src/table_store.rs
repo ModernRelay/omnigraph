@@ -4619,8 +4619,7 @@ fn check_batch_unique_by_keys(
         if !seen.insert(v) {
             return Err(OmniError::manifest(format!(
                 "{}: duplicate source row for key '{}' (column '{}'); \
-                 callers must hand in a batch unique by `key_columns` \
-                 — see MR-957",
+                 callers must hand in a batch unique by `key_columns`",
                 context, v, key_col_name
             )));
         }
@@ -4656,8 +4655,8 @@ mod tests {
             "unexpected error: {msg}"
         );
         assert!(
-            msg.contains("MR-957"),
-            "error should reference MR-957: {msg}"
+            msg.contains("unique by `key_columns`"),
+            "error should state the unique-batch precondition: {msg}"
         );
     }
 

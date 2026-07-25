@@ -29,6 +29,7 @@ roadmap). The per-area docs below remain the mechanical authority.
 | On-disk layout, manifest schema, URI behavior | [storage.md](../user/concepts/storage.md) |
 | Direct-publish writes, D2, staged writes, recovery sidecars | [writes.md](writes.md) |
 | Write-path state of affairs — shipped RFCs, current boundaries, blockers, upstream alignment, and next gates | [writing-path-state-of-affairs.md](writing-path-state-of-affairs.md) |
+| RFC-026 supporting analysis — WAL mental model, retention options, and the deferred managed-reclamation proposal | [wal-thinking.md](wal-thinking.md), [wal-options.md](wal-options.md), [lance-memwal-pr.md](lance-memwal-pr.md) |
 | Query execution, mutation execution, loader flow | [execution.md](execution.md) |
 | Index lifecycle and graph topology indexes | [indexes.md](../user/search/indexes.md) |
 | Branch and commit internals | [branches-commits.md](../user/branching/index.md) |
@@ -90,7 +91,7 @@ as durable disposition history after closure, so RFC backlinks stay valid.
 
 | Area | Read |
 |---|---|
-| RFC-022–028 split architecture review — RFC-022/023/028 implemented; RFC-024/025/027 research-blocked; RFC-026 Phase A and private B1 implemented/evidence-green, B2-0 specified, and public B2 inactive; dependency corrections and acceptance evidence remain tracked | [rfc-022-027-architecture-review.md](rfc-022-027-architecture-review.md) |
+| RFC-022–028 split architecture review — RFC-022/023/028 implemented; RFC-024/025/027 research-blocked; RFC-026 Phase A/B1 private core and private B2a unbounded retain-all gate implemented with widest-shape closure green, while common public/B2b contracts remain inactive; dependency corrections and acceptance evidence remain tracked | [rfc-022-027-architecture-review.md](rfc-022-027-architecture-review.md) |
 
 ## Active Implementation Plans
 

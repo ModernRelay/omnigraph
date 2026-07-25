@@ -164,7 +164,7 @@ async fn ingest_creates_branch_returns_metadata_and_stamps_actor() {
         .await
         .unwrap()
         .into_iter()
-        .last()
+        .next()
         .unwrap();
     assert_eq!(head.actor_id.as_deref(), Some("act-andrew"));
 }

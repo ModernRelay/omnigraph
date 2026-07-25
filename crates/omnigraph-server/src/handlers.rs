@@ -40,7 +40,7 @@ pub(crate) async fn server_health() -> Json<HealthOutput> {
     ),
     security(("bearer_token" = [])),
 )]
-/// List every graph currently registered with this server (MR-668).
+/// List every graph currently registered with this server.
 ///
 /// Multi-graph mode only. In single mode, the route returns 405 — there's
 /// no registry to enumerate. Cedar-gated by the server-level policy via
@@ -1696,27 +1696,36 @@ async fn delete_merged_source_branch(
     ),
     security(("bearer_token" = [])),
 )]
-/// List commits.
+/// List commits, most recent first.
 ///
-/// Filter by `branch` to get the commits on a single branch (most recent
-/// first); omit to list across all branches. Read-only.
+/// `branch` selects which history to list: a named branch returns the history
+/// reachable from that branch's head (the main commits inherited up to the
+/// fork plus the branch-authored commits); omitting it returns `main`'s
+/// history. There is no cross-branch listing. Ordering is part of the
+/// contract — newest first by (manifest version, created-at, commit id) — and
+/// a future `cursor`/`limit` pagination will be keyset-based on that same
+/// order. Read-only.
 pub(crate) async fn server_commit_list(
     Extension(handle): Extension<Arc<GraphHandle>>,
     actor: Option<Extension<ResolvedActor>>,
     Query(query): Query<CommitListQuery>,
 ) -> std::result::Result<Json<CommitListOutput>, ApiError> {
+    // An omitted `branch` means main's history, so the policy gate must
+    // see `main` — not `has_branch == false`, which a branch-scoped read
+    // grant can never match.
+    let branch = query.branch.unwrap_or_else(|| "main".to_string());
     authorize_request(
         actor.as_ref().map(|Extension(actor)| actor),
         handle.policy.as_deref(),
         PolicyRequest {
             action: PolicyAction::Read,
-            branch: query.branch.clone(),
+            branch: Some(branch.clone()),
             target_branch: None,
         },
     )?;
     let commits = {
         let db = &handle.engine;
-        db.list_commits(query.branch.as_deref())
+        db.list_commits(Some(branch.as_str()))
             .await
             .map_err(ApiError::from_omni)?
     };

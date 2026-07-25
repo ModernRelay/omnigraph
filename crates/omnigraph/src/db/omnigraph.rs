@@ -316,11 +316,13 @@ pub struct InitOptions {
 /// handles from silently selecting different resource contracts.
 fn private_b1_worker_limits() -> crate::table_store::mem_wal::B1WorkerLimits {
     crate::table_store::mem_wal::B1WorkerLimits {
-        // The B1 evidence qualifies one resident writer. Its widest legal
-        // generation added roughly 126 MiB of whole-process peak RSS (Arrow +
-        // mandatory PK/runtime/allocator), so admitting four residents here
-        // would be an unmeasured throughput choice. B2 may raise this only with
-        // a multi-resident RSS cell.
+        // The B1 evidence qualifies one resident writer and one exclusive
+        // fold. The widest legal admission added roughly 126 MiB of
+        // whole-process peak RSS; its full high-entropy fold added roughly
+        // 272 MiB over a small-fold baseline and carries a 384-MiB
+        // remeasurement tripwire. Admitting more residents would therefore be
+        // an unmeasured throughput choice. A later phase may raise this only
+        // with a multi-resident RSS cell.
         max_resident_writers_root: 1,
         max_resident_writers_per_table: 1,
         max_reserved_arrow_bytes: 32 * 1024 * 1024,
@@ -2625,12 +2627,23 @@ impl Omnigraph {
             )));
         }
 
+        // Dependency detection reads ONLY each surviving branch's manifest
+        // `table_branch` entries, so take the manifest-only snapshot. A full
+        // `snapshot_of` resolve would additionally load the commit-lineage
+        // projection and re-read + re-validate the schema contract PER BRANCH —
+        // O(branches x history) I/O that made deletion time out on large
+        // graphs — and its per-foreign-branch schema validation could wedge
+        // deletion of an unrelated branch behind another branch's schema
+        // drift. This operation's own schema was already validated under the
+        // schema gate above.
         for other_branch in branches
             .iter()
             .filter(|candidate| candidate.as_str() != branch)
         {
             let snapshot = self
-                .snapshot_of(ReadTarget::branch(other_branch.as_str()))
+                .fresh_snapshot_for_branch_unchecked(
+                    Self::normalize_branch_name(other_branch)?.as_deref(),
+                )
                 .await?;
             if snapshot
                 .entries()
@@ -3009,6 +3022,19 @@ impl Omnigraph {
             .await
     }
 
+    /// List the branch's reachable graph lineage, **most recent first** (by
+    /// [`GraphCommit::lineage_key`] — the same total order head selection and
+    /// any future keyset pagination cursor derive from).
+    ///
+    /// `branch: None` (or `"main"`) lists main's lineage projection. A named
+    /// branch lists the history reachable from that branch's head: the main
+    /// commits inherited up to the fork plus the branch-authored commits.
+    /// There is no cross-branch listing.
+    ///
+    /// This is the one public door for commit listings — the CLI's embedded
+    /// arm, the HTTP server, and SDK consumers all call it — so the newest-
+    /// first presentation contract lives here, not per transport. The internal
+    /// projection (`CommitGraph::load_commits`) stays ascending.
     pub async fn list_commits(&self, branch: Option<&str>) -> Result<Vec<GraphCommit>> {
         self.ensure_schema_state_valid().await?;
         let branch = match branch {
@@ -3016,7 +3042,9 @@ impl Omnigraph {
             None => None,
         };
         let coordinator = self.open_coordinator_for_branch(branch.as_deref()).await?;
-        coordinator.list_commits().await
+        let mut commits = coordinator.list_commits().await?;
+        commits.reverse();
+        Ok(commits)
     }
 
     /// Open a sub-table for mutation with version-drift guard.

@@ -133,7 +133,7 @@ async fn optimize_after_load_then_again_is_idempotent() {
 
     let commits_before = db.list_commits(None).await.unwrap();
     let head_before = commits_before
-        .last()
+        .first()
         .expect("loaded graph has a lineage head")
         .graph_commit_id
         .clone();
@@ -165,7 +165,7 @@ async fn optimize_after_load_then_again_is_idempotent() {
         "steady-state Optimize must not manufacture graph lineage"
     );
     assert_eq!(
-        commits_after.last().unwrap().graph_commit_id,
+        commits_after.first().unwrap().graph_commit_id,
         head_before,
         "steady-state Optimize must preserve the graph head"
     );
@@ -517,7 +517,7 @@ node Tag {\n    slug: String @key\n}\n";
 
     let commits_before = db.list_commits(None).await.unwrap();
     let head_before = commits_before
-        .last()
+        .first()
         .expect("seeded graph has a lineage head")
         .graph_commit_id
         .clone();
@@ -558,7 +558,7 @@ node Tag {\n    slug: String @key\n}\n";
         "one graph-wide Optimize must publish one lineage commit even when two tables move"
     );
     assert_eq!(
-        commits_after.last().unwrap().parent_commit_id.as_deref(),
+        commits_after.first().unwrap().parent_commit_id.as_deref(),
         Some(head_before.as_str()),
         "the graph-wide Optimize commit must extend the prior head"
     );

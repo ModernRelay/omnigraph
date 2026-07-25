@@ -191,6 +191,14 @@ fn scope_from_binding(
                      for ad-hoc direct access"
                 );
             }
+            if capability == Capability::Served {
+                bail!(
+                    "this command requires a server, but {source} resolves a cluster \
+                     scope; address the server with --server <name|url> or --profile \
+                     <name> (to enumerate a cluster's graphs: `omnigraph cluster status \
+                     --config <dir>`)"
+                );
+            }
             // A cluster value is a config name (resolved against `clusters:`)
             // or a literal root: an `s3://`/`file://` URI or a local cluster
             // directory. Only a configured name is rewritten; anything else is
@@ -212,6 +220,12 @@ fn scope_from_binding(
             })
         }
         ScopeBinding::Store(uri) => {
+            if capability == Capability::Served {
+                bail!(
+                    "this command requires a server, but {source} resolves a store scope; \
+                     address the server with --server <name|url> or --profile <name>"
+                );
+            }
             if graph.is_some() {
                 bail!(
                     "--graph does not apply to a store scope ({source}): a store is already \
@@ -502,6 +516,71 @@ mod tests {
         .unwrap_err()
         .to_string();
         assert!(err.contains("not valid for graph data commands"), "{err}");
+    }
+
+    #[test]
+    fn store_scope_on_served_verb_errors() {
+        // The served registry (`graphs list`) is server-scoped: a store-bound
+        // profile fails with scope-shaped advice, not a late embedded-arm error.
+        let op = cfg("profiles:\n  localdev:\n    store: file:///data/dev.omni\n");
+        let err = resolve_scope(
+            &op,
+            Capability::Served,
+            ScopeFlags {
+                profile: Some("localdev"),
+                ..flags()
+            },
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(
+            err.contains("requires a server") && err.contains("resolves a store scope"),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn cluster_scope_on_served_verb_points_at_cluster_status() {
+        let op = cfg(
+            "clusters:\n  brain:\n    root: s3://acme/brain\nprofiles:\n  admin:\n    cluster: brain\n",
+        );
+        let err = resolve_scope(
+            &op,
+            Capability::Served,
+            ScopeFlags {
+                profile: Some("admin"),
+                ..flags()
+            },
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(
+            err.contains("requires a server")
+                && err.contains("resolves a cluster scope")
+                && err.contains("cluster status"),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn server_scope_on_served_verb_resolves_with_default_graph_carried() {
+        // A served-registry caller resolves the server binding like any served
+        // verb; the profile's default_graph rides along in the scope (the
+        // registry factory deliberately ignores it — pinned in client.rs).
+        let op = cfg(
+            "servers:\n  prod:\n    url: https://x\nprofiles:\n  staging:\n    server: prod\n    default_graph: kb\n",
+        );
+        let scope = resolve_scope(
+            &op,
+            Capability::Served,
+            ScopeFlags {
+                profile: Some("staging"),
+                ..flags()
+            },
+        )
+        .unwrap();
+        assert_eq!(scope.server.as_deref(), Some("prod"));
+        assert_eq!(scope.graph.as_deref(), Some("kb"));
     }
 
     #[test]

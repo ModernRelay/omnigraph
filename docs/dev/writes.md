@@ -543,7 +543,7 @@ Empty-table overwrite is
 represented as a valid zero-fragment Lance `Overwrite` transaction, not as
 truncate-then-append.
 
-### RFC-026 private stream foundation and B1 core
+### RFC-026 private stream foundation, B1 core, and B2a retain-all gate
 
 Internal schema v8 activates the deliberately bounded, data-bearing MemWAL
 format. Phase A's enrollment foundation and Phase B1's one-generation row/fold
@@ -618,9 +618,14 @@ Phase B1 adds the private row path:
   claimed-writer retirement. Any ownership-transfer ambiguity fails closed.
 
 The strict fold scans only the selected fresh generation with
-`LsmScanner::without_base_table`, validates the already-normalized rows against
-one captured graph snapshot, and stages an exact-`id` upsert plus exactly one
-`MergedGeneration` marker in the same Lance `Update`. It then arms a
+`LsmScanner::without_base_table`. It charges each scanner batch by the logical
+memory of its selected slices against the same 8,192-row/32-MiB generation
+limit, then uses an Arrow take of every selected row to build dense owned arrays
+before retaining that batch. This avoids carrying a small logical slice through
+the fold with the scanner's much larger sparse parent buffers. The fold
+validates those already-normalized rows against one captured graph snapshot and
+stages an exact-`id` upsert plus exactly one `MergedGeneration` marker in the
+same Lance `Update`. It then arms a
 recovery-v11 `StreamFold` sidecar containing the physical cut, pre-minted
 transaction identity, fixed lineage, and complete pointer/lifecycle outcome.
 Under admission → schema → main → table gates, the final barrier re-lists all
@@ -637,7 +642,48 @@ query-visible only after fold. The support boundary remains main-only,
 unsharded, one resident stream worker, and one live writer process; the
 admission lease is not a distributed fence.
 
-RFC-026 Phase B2-0 now specifies—but does not implement—the next contract.
+Gate R0's closure defect is now repaired. The deterministic legal high-entropy
+near-cap cell acknowledges without moving either manifest or base-table
+version, materializes one generation, then folds 8,192 rows and publishes one
+table version through one `__manifest` visibility CAS. The dense scanner-batch
+copy keeps the accepted shape inside its logical 32-MiB limit. A separate
+subprocess measurement recorded a 284,934,144-byte isolated fold RSS delta
+(about 272 MiB), below the 384-MiB remeasurement tripwire. That tripwire guards
+the measured implementation shape; changing the admission or fold strategy
+requires remeasurement.
+
+The private B2a gate now implements **unbounded retain-all**. It accepts that
+stock-RC.1 materialization uses randomized generation roots and that a crash or
+cold replay can leave more physical objects. OmniGraph adds no retained-byte,
+object-count, file-count, or history quota, no quota-enforcement attempt ledger,
+and never deletes a canonical durable `_mem_wal` object. Lance may remove only
+its losing shard-manifest-CAS `.binpb.tmp.<uuid>` staging object; that object
+never became shard authority or retained history. Complete and partial
+unreferenced generation output remains non-authoritative. Parent shard discovery
+may list its common prefix, but admission, retry, and cold reopen never descend
+into, read, mutate, adopt, or delete the subtree. A shared strict classifier and
+local/configured-RustFS provider-failure cells pin those rules and the typed
+effect-free `Lance`, post-invocation `AckUnknown`, and post-cut
+`RecoveryRequired` outcomes. Current-object LIST evidence remains a useful
+retention/path-shape check but does not claim coverage of incomplete multipart
+uploads, provider versions/delete markers, local staging, or billed bytes.
+Provider exhaustion is surfaced as a storage failure and can halt admission,
+fold, or recovery progress; it never becomes silent loss, an early
+acknowledgement, or an alternate publication path. The 8,192-row/32-MiB logical
+Arrow admission envelope, deadlines, retry counts, and ambiguity outcomes
+remain bounded.
+RC.1's missing cross-open materialization receipt and complete physical-output
+envelope are therefore not blockers for this profile. They remain relevant to
+the future B2b managed-reclamation design. The checked-in 1/8/32/128 local and
+configured-RustFS instrument separates warm acknowledgement, cold replay, fold,
+visibility, table, graph-manifest, adapter, advisory object, and whole-process
+RSS terms. Warm acknowledgement retains a flat operation shape while serialized
+authority and combined retained-history work grow; the observations are not a
+quota, latency SLO, provider bill, or isolated WAL slope. B2a activates no new
+format or product state.
+
+RFC-026's common B2 inventory specifies—but does not implement—the next product
+contract.
 `@stream` declares eligibility but explicit, request-idempotent enrollment
 creates the stream incarnation and physical binding. A caller-stable `write_id`
 and exact predecessor then form an
@@ -648,13 +694,13 @@ sequencing authority and publishes atomically with the base pointer under the
 shared stream-token gate/recovery envelope. Because that participant is
 graph-global, every token-moving sidecar blocks every manifest/main writer,
 including table-disjoint writers. A final-barrier late discovery releases all
-admission, graph-history, schema, branch, token, and table gates and restarts from the root
+admission, schema, branch, token, and table gates and restarts from the root
 barrier; it never recovers while retaining a leaf gate. Durable
 `OPEN -> DRAINING -> SEALED -> OPEN` state carries a monotonic lifecycle
 revision. Every external mutating management call compares that revision and
 records a bounded, complete terminal receipt; roll-forward-only resume/abort and
-bounded `REPLACE`/`WITHDRAW` correction use recovery-v12. Public activation
-also requires Lance-owned durable reclamation with whole-cut proof,
+bounded `REPLACE`/`WITHDRAW` correction use recovery-v12. The B2b
+managed-reclamation profile requires Lance-owned durable reclamation with whole-cut proof,
 attempt/receipt recovery, bounded history checkpointing, strong PUT/DELETE
 inventory plus multipart accounting/abort or durable accounting, a post-success
 epoch check, and a source-derived enforced
@@ -674,23 +720,30 @@ deletable. Measurements validate those bounds; they do not create them. Generic
 Lance cleanup does not reclaim `_mem_wal`, and OmniGraph must never delete its
 raw paths. Internal
 schema v9/config-v3/state-v2/recovery-v12 and every public policy/wire surface
-remain inactive until their crash, storage, cross-version, authorization, and
-parity evidence passes. The physical watermark is per binding and does not
-bound base/token or shared manifest history. B2-0 therefore specifies a separate
+remain inactive until the common crash, no-delete/provider-failure,
+cross-version, authorization, and parity evidence passes. The selected
+unbounded retain-all profile has no physical watermark and no graph-history
+quota. If a future B2b bounded/managed profile is pursued, its physical
+watermark is per binding and does not bound base/token or shared manifest
+history; that profile therefore also needs a separate
 manifest-authoritative, graph-global `GraphHistoryBudget`. Every manifest
-publisher—stream and ordinary—takes the graph-history gate, reserves the exact
+publisher—stream and ordinary—would take the graph-history gate, reserve the exact
 logical publication plus a source-bounded physical-growth envelope before
-effect, and settles pending recovery charges exactly once. Initial B2 holds that
+effect, and settle pending recovery charges exactly once. Initial B2b would hold that
 gate continuously from final reserve/sidecar arm through physical effects,
 manifest CAS, and charge finalization, so only one expected budget revision is
-live. Dynamic per-stream
+live. Its dynamic per-stream
 closure reserves cannot be consumed by ordinary commits or by another stream;
 at the shared floor ordinary work returns `GraphRebuildRequired`, while the
 named stream retains correction, quiesce, and `SEALED` export/rebuild headroom.
-The universal B2 gate order is sorted relevant stream admission → graph history
-→ schema → main branch → stream token → sorted graph tables; late global
+That future bounded profile's gate order is sorted relevant stream admission →
+graph history → schema → main branch → stream token → sorted graph
+tables. The selected unbounded profile omits the graph-history gate: sorted
+relevant stream admission → schema → main branch → stream token → sorted
+graph tables. Late global
 authority discovery releases the complete suffix and restarts at the root
-barrier. A writer with no relevant stream still begins at graph history.
+barrier. A writer with no relevant stream does not acquire a nonexistent
+storage/history budget.
 Indefinite in-place maintenance remains a later accepted strand.
 
 ### Open-time recovery sweep
@@ -800,8 +853,8 @@ identity, incarnation, path, and Lance version.
 > reader of `recovery.rs`, `failpoints.rs`, or this document only
 > encounters phase letters in the per-writer context.
 
-RFC-026's named “Phase A foundation” and “Phase B1 private core” are roadmap
-slices, not steps in that four-phase convention. Recovery-v10
+RFC-026's named “Phase A foundation”, “Phase B1 private core”, and “B2a
+retain-all gate” are RFC slice names, not steps in that four-phase convention. Recovery-v10
 `StreamEnrollment` uses a dedicated exact initializer classifier: no effect
 retires, index-only provisions the fixed empty shard, and
 index-plus-empty-shard publishes pointer + lifecycle. Recovery-v11 `StreamFold`

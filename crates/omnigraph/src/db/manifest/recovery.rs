@@ -7728,10 +7728,7 @@ async fn converge_or_defer_roll_forward(
         None => crate::db::commit_graph::CommitGraph::open(root_uri).await?,
     };
     let converged_commit_id = match cache
-        .load_commits()
-        .await?
-        .into_iter()
-        .rfind(|c| c.actor_id.as_deref() == Some(RECOVERY_ACTOR))
+        .latest_commit_matching(|c| c.actor_id.as_deref() == Some(RECOVERY_ACTOR))
     {
         Some(recovery_commit) => recovery_commit.graph_commit_id,
         // No recovery commit visible — unexpected on this path (the winner just

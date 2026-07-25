@@ -48,7 +48,10 @@ Each graph commit carries a ULID id, the manifest branch and version it publishe
 
 - Every successful publish (load / change / merge / schema apply) appends one commit.
 - Merge commits have two parents; linear commits have one.
-- Inspect history with `commit list` and `commit show`.
+- Inspect history with `commit list` and `commit show`. Listings are newest
+  first. `--branch <name>` shows the history reachable from that branch's head
+  (the main commits inherited up to the fork plus the branch's own commits);
+  omitting it shows `main`.
 
 ## L2 — Snapshots & time travel
 
