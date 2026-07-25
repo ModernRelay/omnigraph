@@ -1207,6 +1207,19 @@ impl Omnigraph {
             )?;
             let handle = write_sidecar(self.root_uri(), self.storage_adapter(), &sidecar).await?;
 
+            // The armed-but-no-effect cell: the intent is durable while both
+            // exact Lance participants are still untouched.  Recovery must
+            // retire it effect-free rather than publish or adopt anything.
+            crate::failpoints::maybe_fail(
+                crate::failpoints::names::STREAM_FOLD_POST_SIDECAR_PRE_BASE_COMMIT,
+            )
+            .map_err(|error| {
+                OmniError::recovery_required(
+                    handle.operation_id.clone(),
+                    format!("stream fold stopped after arming its recovery intent: {error}"),
+                )
+            })?;
+
             let base_outcome = match self.storage().commit_staged_exact(final_head, staged).await {
                 Ok(outcome) => outcome,
                 Err(error) => {

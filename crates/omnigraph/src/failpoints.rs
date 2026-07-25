@@ -245,6 +245,11 @@ pub mod names {
     /// The immutable generation cut is proven and the worker retired, before
     /// the schema-v12 recovery intent is armed.
     pub const STREAM_FOLD_POST_DRAIN_PRE_SIDECAR: &str = "stream_fold.post_drain_pre_sidecar";
+    /// Schema-v12: the recovery intent is durably armed, but neither exact
+    /// Lance participant has been invoked. Recovery must classify this cell
+    /// as `EffectFree` and retire the intent without publishing.
+    pub const STREAM_FOLD_POST_SIDECAR_PRE_BASE_COMMIT: &str =
+        "stream_fold.post_sidecar_pre_base_commit";
     /// Schema-v12: the exact base-table fold committed, while the separate
     /// `_stream_tokens.lance` participant is still at its manifest-selected
     /// prior witness. Recovery must classify this partial cell as sticky.
