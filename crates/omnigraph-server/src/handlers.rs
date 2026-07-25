@@ -77,8 +77,29 @@ pub(crate) async fn server_graphs_list(
         .map(|handle| GraphInfo {
             graph_id: handle.key.graph_id.as_str().to_string(),
             uri: handle.uri.clone(),
+            status: GraphStatus::Serving,
+            quarantine: None,
         })
         .collect();
+    // RFC-029 W3: quarantined graphs are configured state and must be
+    // visible, not silently absent. Timestamps flatten to Unix seconds.
+    let unix_secs = |t: std::time::SystemTime| {
+        t.duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0)
+    };
+    let snapshot = registry.snapshot_ref();
+    graphs.extend(snapshot.quarantined.iter().map(|(key, info)| GraphInfo {
+        graph_id: key.graph_id.as_str().to_string(),
+        uri: info.uri.clone(),
+        status: GraphStatus::Quarantined,
+        quarantine: Some(GraphQuarantineInfo {
+            since_unix_secs: unix_secs(info.since),
+            attempts: info.attempts,
+            last_error: info.last_error.clone(),
+            retry_at_unix_secs: unix_secs(info.retry_at),
+        }),
+    }));
     graphs.sort_by(|a, b| a.graph_id.cmp(&b.graph_id));
     Ok(Json(GraphListResponse { graphs }))
 }
@@ -277,10 +298,16 @@ pub(crate) async fn resolve_graph_handle(
     let key = GraphKey::cluster(graph_id.clone());
     let handle = match registry.get(&key) {
         RegistryLookup::Ready(handle) => handle,
-        // Temporary: quarantined graphs answer 404 like Gone until the
-        // RFC-029 W3 lookup-semantics commit flips this arm to 503 behind
-        // its red test (nothing populates quarantine state yet).
-        RegistryLookup::Quarantined(_) | RegistryLookup::Gone => {
+        // RFC-029 W3: configured-but-healing is "retry later", not "no such
+        // resource" — the supervision loop is re-driving the open.
+        RegistryLookup::Quarantined(info) => {
+            return Err(ApiError::service_unavailable(format!(
+                "graph '{graph_id}' is quarantined (last open error: {}); the server is \
+                 retrying — retry later",
+                info.last_error
+            )));
+        }
+        RegistryLookup::Gone => {
             return Err(ApiError::not_found(format!("graph '{graph_id}' not found")));
         }
     };

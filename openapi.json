@@ -2153,7 +2153,7 @@
       },
       "GraphInfo": {
         "type": "object",
-        "description": "One entry in the response from `GET /graphs`. Cluster operators\nconsume this list to discover which graphs the server is currently\nserving. The shape is intentionally minimal — `graph_id` and `uri`\nare the only fields a routing client needs.",
+        "description": "One entry in the response from `GET /graphs`. Cluster operators\nconsume this list to discover which graphs the server is currently\nserving — including graphs that are configured but quarantined\n(RFC-029 W3), so an unhealthy graph is visible instead of silently\nabsent.",
         "required": [
           "graph_id",
           "uri"
@@ -2161,6 +2161,21 @@
         "properties": {
           "graph_id": {
             "type": "string"
+          },
+          "quarantine": {
+            "oneOf": [
+              {
+                "type": "null"
+              },
+              {
+                "$ref": "#/components/schemas/GraphQuarantineInfo",
+                "description": "Present only when `status` is `quarantined`."
+              }
+            ]
+          },
+          "status": {
+            "$ref": "#/components/schemas/GraphStatus",
+            "description": "Additive (RFC-029): absent in older responses, so deserialization\ndefaults to `serving` for wire compatibility."
           },
           "uri": {
             "type": "string"
@@ -2181,6 +2196,48 @@
             }
           }
         }
+      },
+      "GraphQuarantineInfo": {
+        "type": "object",
+        "description": "Quarantine detail on a [`GraphInfo`] whose `status` is `quarantined`\n(RFC-029 W3). Timestamps are seconds since the Unix epoch.",
+        "required": [
+          "since_unix_secs",
+          "attempts",
+          "last_error",
+          "retry_at_unix_secs"
+        ],
+        "properties": {
+          "attempts": {
+            "type": "integer",
+            "format": "int32",
+            "description": "Open attempts so far (the failed boot open counts as the first).",
+            "minimum": 0
+          },
+          "last_error": {
+            "type": "string",
+            "description": "The most recent open error, verbatim."
+          },
+          "retry_at_unix_secs": {
+            "type": "integer",
+            "format": "int64",
+            "description": "When the supervision loop will retry, Unix seconds.",
+            "minimum": 0
+          },
+          "since_unix_secs": {
+            "type": "integer",
+            "format": "int64",
+            "description": "When the graph entered quarantine (this boot), Unix seconds.",
+            "minimum": 0
+          }
+        }
+      },
+      "GraphStatus": {
+        "type": "string",
+        "description": "Serving state of a configured graph (RFC-029 W3).",
+        "enum": [
+          "serving",
+          "quarantined"
+        ]
       },
       "HealthOutput": {
         "type": "object",
