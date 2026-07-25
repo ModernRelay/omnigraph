@@ -539,6 +539,11 @@ rules:
     assert_eq!(ready, vec!["good"]);
     let app = build_app(state);
 
+    // RFC-029 W3: a failed boot open quarantines the graph as OBSERVABLE,
+    // CONFIGURED state — not silent absence. `GET /graphs` lists both graphs
+    // with a status discriminator and quarantine detail; routes under the
+    // quarantined graph answer 503 (retry later), while a never-configured id
+    // stays 404 (no such resource).
     let (status, body) = json_response(
         &app,
         Request::builder()
@@ -549,20 +554,58 @@ rules:
     )
     .await;
     assert_eq!(status, StatusCode::OK, "{body}");
+    let graphs_json = body["graphs"].as_array().unwrap();
     assert_eq!(
-        body["graphs"]
-            .as_array()
-            .unwrap()
+        graphs_json
             .iter()
             .map(|graph| graph["graph_id"].as_str().unwrap())
             .collect::<Vec<_>>(),
-        vec!["good"]
+        vec!["broken", "good"],
+        "GET /graphs must list quarantined graphs alongside serving ones: {body}"
+    );
+    assert_eq!(
+        graphs_json[1]["status"].as_str(),
+        Some("serving"),
+        "healthy graph must report status=serving: {body}"
+    );
+    assert_eq!(
+        graphs_json[0]["status"].as_str(),
+        Some("quarantined"),
+        "failed-open graph must report status=quarantined: {body}"
+    );
+    let quarantine = &graphs_json[0]["quarantine"];
+    assert!(
+        quarantine["last_error"]
+            .as_str()
+            .is_some_and(|err| !err.is_empty()),
+        "quarantine detail must carry the open error: {body}"
+    );
+    assert!(
+        quarantine["attempts"].as_u64().is_some_and(|n| n >= 1),
+        "quarantine detail must count the failed boot open: {body}"
     );
 
     let (status, body) = json_response(
         &app,
         Request::builder()
             .uri("/graphs/broken/queries")
+            .header("authorization", "Bearer admin-token")
+            .body(Body::empty())
+            .unwrap(),
+    )
+    .await;
+    assert_eq!(
+        status,
+        StatusCode::SERVICE_UNAVAILABLE,
+        "a quarantined graph is configured-but-healing: 503, not 404: {body}"
+    );
+
+    // A graph id that was never configured remains a plain 404 — pins the
+    // Quarantined-vs-Gone distinction.
+    let (status, body) = json_response(
+        &app,
+        Request::builder()
+            .uri("/graphs/never-configured/queries")
             .header("authorization", "Bearer admin-token")
             .body(Body::empty())
             .unwrap(),
