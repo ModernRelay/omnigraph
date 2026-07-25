@@ -26,8 +26,21 @@ state, invalid/unattributable recovery sidecars, unreadable shared catalog
 payloads, cluster policy errors, or zero healthy graphs. Graph-attributed
 pending recovery sidecars and graph-specific startup failures quarantine
 that graph instead; the server logs startup diagnostics and serves the
-remaining healthy graphs. `GET /graphs` enumerates ready/served graphs only,
-so quarantined graphs are absent and their routes return 404.
+remaining healthy graphs.
+
+Quarantine is a **converging, observable state** (RFC-029): the server's
+supervision loop retries the full graph open with capped exponential backoff
+(5 s initial, ×2, 10 min cap, ±10 % jitter), so a graph that failed on a
+transient fault returns to service without a restart. Meanwhile `GET /graphs`
+lists the quarantined graph with `status: "quarantined"` and a `quarantine`
+detail object (`since_unix_secs`, `attempts`, `last_error`,
+`retry_at_unix_secs`); healthy graphs report `status: "serving"`. Routes
+under a quarantined graph answer **503** ("retrying — retry later"), while a
+graph id that was never configured stays 404. The same supervision loop also
+heals a served graph that surfaces `recovery_required` on a write: the
+server reopens the graph in-process (running the engine's full recovery
+sweep) and swaps the healed handle in — in-flight requests on the old handle
+finish unaffected.
 
 Operators who want the original all-or-nothing boot contract can pass
 `--require-all-graphs` or set `OMNIGRAPH_REQUIRE_ALL_GRAPHS=1`. In that mode,

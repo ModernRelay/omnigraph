@@ -36,7 +36,7 @@
   recovery arm and has no durable effect.
   HTTP returns **413** with `resource_limit.{resource,limit,actual}`.
   Reshape the input; it is not partial success.
-- `RecoveryRequired { operation_id, reason }` — an overlapping durable recovery intent remains unresolved. Its physical effects may already have landed, or it may still be armed before the first effect. HTTP returns **503** with `recovery_required.operation_id`. Resolve the sidecar through a read-write reopen/server restart before retrying; this is intentionally not an ordinary OCC retry.
+- `RecoveryRequired { operation_id, reason }` — an overlapping durable recovery intent remains unresolved. Its physical effects may already have landed, or it may still be armed before the first effect. HTTP returns **503** with `recovery_required.operation_id`. This is intentionally not an ordinary OCC retry: the residual is resolved by a read-write reopen's recovery sweep. Against the HTTP server this now happens **automatically** (RFC-029: the write that surfaced the 503 arms a supervised in-process reopen) — back off on a seconds scale and retry, and escalate only if the 503 persists. Embedded SDK callers resolve it themselves with a read-write `Omnigraph::open` (or process restart).
 
 For RFC-023 Mutation/Load keyed writes, `KeyConflict` is returned only after
 the writer proves that none of its planned table effects landed, finalizes the
