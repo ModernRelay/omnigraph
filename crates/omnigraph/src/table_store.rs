@@ -2726,22 +2726,21 @@ impl TableStore {
     /// surface twice — once via the original committed fragment, once via
     /// the rewrite in `new_fragments`.
     ///
-    /// **Filter contract is incomplete on staged fragments.** When `filter`
-    /// is `Some(...)`, Lance pushes the predicate to per-fragment scans
-    /// with stats-based pruning. Uncommitted fragments produced by
-    /// `write_fragments_internal` lack the per-column statistics that
-    /// committed fragments carry; Lance's optimizer drops them from the
-    /// filtered scan even when their data would match. Staged-fragment
-    /// rows are silently absent from the result. `scanner.use_stats(false)`
-    /// does not fix this in lance 6.0.1. Callers needing correct filtered
-    /// reads against staged data should use a different strategy — the
-    /// engine's `MutationStaging` accumulator unions in-memory pending
-    /// batches with the committed scan via DataFusion `MemTable` (see
-    /// `scan_with_pending`).
+    /// **Filtered staged reads were incomplete before Lance 9.0.0.** Through
+    /// 9.0.0-rc.1, a `Some(filter)` scan pushed the predicate to per-fragment
+    /// scans with stats-based pruning, and uncommitted fragments produced by
+    /// `write_fragments_internal` lack the per-column statistics committed
+    /// fragments carry — so Lance's optimizer dropped them from the filtered
+    /// scan even when their data matched, and `scanner.use_stats(false)` did
+    /// not bypass it. Lance 9.0.0 closed that gap: matching staged rows are
+    /// now returned. `staged_tests::scan_with_staged_with_filter_returns_
+    /// matching_staged_rows` pins the current behavior.
     ///
-    /// This method remains on the surface for primitive-level testing
-    /// (basic stage + scan correctness without filters works) and for
-    /// callers that don't need filter pushdown.
+    /// Production never depended on either side of this. The engine's
+    /// `MutationStaging` accumulator unions in-memory pending batches with
+    /// the committed scan via DataFusion `MemTable` for read-your-writes
+    /// (see `scan_with_pending`), and no production caller passes a filter
+    /// here. This method remains on the surface for primitive-level testing.
     pub async fn scan_with_staged(
         &self,
         ds: &Dataset,
