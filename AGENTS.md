@@ -18,7 +18,7 @@ Tools that support `@`-imports (Claude Code) auto-include all three files via th
 
 **Version surveyed:** 0.8.1
 **Workspace crates:** `omnigraph-compiler`, `omnigraph` (engine), `omnigraph-policy`, `omnigraph-api-types` (shared HTTP wire DTOs), `omnigraph-cluster`, `omnigraph-cli`, `omnigraph-server`
-**Storage substrate:** Lance 9.x (columnar, versioned, branchable; 9.0.0-rc.1 git-rev pin until 9.0.0 stable)
+**Storage substrate:** Lance 9.0.0 (columnar, versioned, branchable; crates.io release — the 9.x git-rev pin era ended 2026-07-25)
 **License:** MIT
 **Toolchain:** Rust stable, edition 2024
 

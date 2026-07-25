@@ -2099,9 +2099,12 @@ keeps it retired and admission closed and returns typed `RecoveryRequired`; B1
 never issues a second abort or reopens beside a possibly active handler. A
 process restart reclassifies the durable state before admission. The
 caller-quiesce precondition is
-structurally guarded. Lance `ShardWriter::close` intentionally ignores final
-WAL/frozen-flush completion errors, so `close() == Ok(())` is not durability
-evidence and B1 never uses it for retirement. The private implementation has
+structurally guarded. B1 never uses `ShardWriter::close` for retirement and
+never treats `close() == Ok(())` as durability evidence. That posture is
+independent of the upstream contract, which tightened at the Lance 9.0.0 bump:
+through 9.0.0-rc.1 `close` discarded final WAL/frozen-flush completion errors
+and returned a false `Ok(())`, while 9.0.0 (upstream #7769) propagates them.
+The stricter contract can only surface failures B1 already fails closed on. The private implementation has
 explicit resident-writer, reservation, eviction, and durability-deadline
 values, but their promotion as product defaults remains gated on the checked-in
 RSS/latency/backpressure evidence in §12.3. Lance's soft

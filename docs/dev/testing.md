@@ -117,7 +117,9 @@ The implemented coverage keeps the boundaries split as follows:
   Two-handle claim/eviction races prove one owner and no eviction past an
   in-flight waiter. Retirement closes the worker to puts before public
   `ShardWriter::abort`, and no test treats `ShardWriter::close` as durability
-  evidence. One background-owned abort completion is retained in the retired
+  evidence — a posture that holds regardless of upstream's contract, which
+  tightened in Lance 9.0.0 (#7769) to propagate final flush failures instead of
+  returning a false `Ok(())`. One background-owned abort completion is retained in the retired
   entry; a caller deadline never cancels that future, retries abort, or permits
   reopen. A stalled-handler/deadline/second-retirement test pins that exact
   RC.1 `shutdown_all` hazard. A claim-vs-drain
