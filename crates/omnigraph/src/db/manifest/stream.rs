@@ -716,12 +716,19 @@ impl DrainDescriptor {
             "drain target",
         )?;
         for (shard_id, target_epoch) in &self.target_epoch_floor_by_shard {
-            if target_epoch
-                < entry
-                    .epoch_floor_by_shard
-                    .get(shard_id)
-                    .expect("both maps exactly match the binding")
-            {
+            // The loop is keyed by the drain's own `expected_binding`, while
+            // `entry.epoch_floor_by_shard` is keyed by the entry's `binding`.
+            // The caller proves those bindings equal only *after* this
+            // method returns, so a corrupt or foreign DRAINING row naming a
+            // shard absent from the entry's binding must fail closed here
+            // rather than panic — that state is exactly what this validator
+            // exists to classify.
+            let current_epoch = entry.epoch_floor_by_shard.get(shard_id).ok_or_else(|| {
+                OmniError::manifest_internal(format!(
+                    "stream drain target names shard {shard_id}, which is absent from the current shard binding"
+                ))
+            })?;
+            if target_epoch < current_epoch {
                 return Err(OmniError::manifest_internal(
                     "stream drain target epoch cannot move behind current shard authority",
                 ));
