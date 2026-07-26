@@ -538,8 +538,11 @@ fn current_v9_refuses_and_rebuilds_genuine_v5_and_v5_refuses_v9() {
     let refusal = output_failure(cli().arg("snapshot").arg(&v5_graph));
     let stderr = String::from_utf8_lossy(&refusal.stderr);
     assert!(
-        stderr.contains("0.9.x"),
-        "v5 refusal must name the release line that wrote internal schema v5, got: {stderr}",
+        stderr.contains("0.9.0-dev"),
+        "v5 refusal must name the build that wrote internal schema v5. No published \
+         release ever stamped it — it existed only in source builds inside the \
+         0.8.1 -> 0.9.0 development window — so the refusal names `0.9.0-dev`, \
+         got: {stderr}",
     );
     assert!(
         stderr.contains("export"),
@@ -681,8 +684,11 @@ fn current_v9_refuses_and_rebuilds_genuine_v6_and_v6_refuses_v9() {
     let refusal = output_failure(cli().arg("snapshot").arg(&v6_graph));
     let stderr = String::from_utf8_lossy(&refusal.stderr);
     assert!(
-        stderr.contains("0.10.x"),
-        "v6 refusal must name the release line that wrote internal schema v6, got: {stderr}",
+        stderr.contains("0.9.0-dev"),
+        "v6 refusal must name the build that wrote internal schema v6. No published \
+         release ever stamped it — it existed only in source builds inside the \
+         0.8.1 -> 0.9.0 development window — so the refusal names `0.9.0-dev`, \
+         got: {stderr}",
     );
     assert!(
         stderr.contains("export"),
@@ -771,8 +777,11 @@ fn current_v9_refuses_and_rebuilds_genuine_v7_and_v7_refuses_v9() {
     let refusal = output_failure(cli().arg("snapshot").arg(&v7_graph));
     let stderr = String::from_utf8_lossy(&refusal.stderr);
     assert!(
-        stderr.contains("0.11.x"),
-        "v7 refusal must name the release line that wrote internal schema v7, got: {stderr}",
+        stderr.contains("0.9.0-dev"),
+        "v7 refusal must name the build that wrote internal schema v7. No published \
+         release ever stamped it — it existed only in source builds inside the \
+         0.8.1 -> 0.9.0 development window — so the refusal names `0.9.0-dev`, \
+         got: {stderr}",
     );
     assert!(
         stderr.contains("export"),
@@ -888,8 +897,11 @@ fn current_v9_refuses_and_rebuilds_genuine_v8_and_v8_refuses_v9() {
     let refusal = output_failure(cli().arg("snapshot").arg(&v8_graph));
     let stderr = String::from_utf8_lossy(&refusal.stderr);
     assert!(
-        stderr.contains("0.12.x"),
-        "v8 refusal must name the release line that wrote internal schema v8, got: {stderr}",
+        stderr.contains("0.9.0-dev"),
+        "v8 refusal must name the build that wrote internal schema v8. No published \
+         release ever stamped it — it existed only in source builds inside the \
+         0.8.1 -> 0.9.0 development window — so the refusal names `0.9.0-dev`, \
+         got: {stderr}",
     );
     assert!(
         stderr.contains("export"),
