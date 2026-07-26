@@ -159,14 +159,21 @@ fn queries_list_with_as_flag_errors() {
 }
 
 #[test]
-fn queries_and_policy_wrong_server_scope_points_at_cluster_scope() {
+fn queries_list_with_server_scope_resolves_the_server() {
+    // `queries list` is dual-scope: the served arm addresses a graph's
+    // catalog (`GET /graphs/{id}/queries`), so `--server <name>` must resolve
+    // the server (here: an unknown config name errors as such) rather than
+    // being rejected as a wrong-scope flag.
     let output = output_failure(cli().arg("--server").arg("prod").arg("queries").arg("list"));
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert!(
-        stderr.contains("pass --cluster <dir|uri>") && !stderr.contains("pass --config <dir>"),
-        "queries should point at --cluster, not --config; got: {stderr}"
+        stderr.contains("unknown server 'prod'"),
+        "queries list --server must resolve the server scope; got: {stderr}"
     );
+}
 
+#[test]
+fn policy_wrong_server_scope_points_at_cluster_scope() {
     let output = output_failure(
         cli()
             .arg("--server")
@@ -273,6 +280,13 @@ fn queries_list_prints_registered_query() {
         stdout.contains("$name: String"),
         "list should show typed params; stdout:\n{stdout}"
     );
+    // The serving bridge exposes every cluster stored query in the MCP
+    // catalog (the server's §D5 bridge); the CLI cluster arm must reflect
+    // that truth instead of hardcoding the exposure off.
+    assert!(
+        stdout.contains("[mcp: find_person]"),
+        "cluster arm must mark MCP exposure like the served catalog; stdout:\n{stdout}"
+    );
 }
 
 #[test]
@@ -324,6 +338,10 @@ fn queries_list_surfaces_description_and_instruction() {
     assert_eq!(
         entry["instruction"],
         "Use for exact lookups; prefer search for fuzzy matches."
+    );
+    assert_eq!(
+        entry["mcp_expose"], true,
+        "cluster queries are served in the MCP catalog; the CLI must say so"
     );
 }
 
