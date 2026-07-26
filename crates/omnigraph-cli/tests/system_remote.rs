@@ -1195,3 +1195,96 @@ fn graphs_list_against_multi_graph_server() {
 
     drop(server);
 }
+
+// ─── served queries list end-to-end ────────────────────────────────────────
+
+/// Multi-graph server + CLI `omnigraph queries list --server` end-to-end (the
+/// served arm reading `GET /graphs/{id}/queries`).
+///
+/// Steps:
+///   1. Build a converged cluster serving graph `alpha` with one stored query
+///      and the server-scoped `graph_list` policy (so the multi-graph guard's
+///      probe is authorized in step 3).
+///   2. Spawn the server with `--cluster` + a bearer-token map.
+///   3. `queries list --server <url>` with NO `--graph` errors and lists the
+///      candidate graphs (the catalog route is per-graph).
+///   4. `queries list --server <url> --graph alpha --json` returns the served
+///      catalog: typed params, mcp_expose, mutation kind.
+///
+/// Ignored by default — spawning servers needs loopback socket
+/// permissions some sandboxes lack.
+#[test]
+#[ignore = "requires loopback socket permissions in sandboxed runners"]
+fn queries_list_against_served_graph() {
+    let cfg_dir = tempfile::tempdir().unwrap();
+    let dir = cfg_dir.path();
+    fs::copy(fixture("test.pg"), dir.join("alpha.pg")).unwrap();
+    fs::write(
+        dir.join("find_person.gq"),
+        "query find_person($name: String) { match { $p: Person { name: $name } } return { $p.age } }",
+    )
+    .unwrap();
+    fs::write(dir.join("server.policy.yaml"), GRAPH_LIST_SERVER_POLICY_YAML).unwrap();
+    fs::write(
+        dir.join("cluster.yaml"),
+        "version: 1\nmetadata:\n  name: sys\nstate:\n  backend: cluster\n  lock: true\ngraphs:\n  alpha:\n    schema: ./alpha.pg\n    queries:\n      find_person:\n        file: ./find_person.gq\npolicies:\n  server:\n    file: ./server.policy.yaml\n    applies_to: [cluster]\n",
+    )
+    .unwrap();
+    output_success(cli().arg("cluster").arg("import").arg("--config").arg(dir));
+    output_success(cli().arg("cluster").arg("apply").arg("--config").arg(dir));
+
+    let server = spawn_server_with_cluster_env(
+        dir,
+        &[(
+            "OMNIGRAPH_SERVER_BEARER_TOKENS_JSON",
+            r#"{"act-admin":"admin-token"}"#,
+        )],
+    );
+
+    // No --graph: the catalog route is per-graph, so the multi-graph guard
+    // errors listing the candidates.
+    let no_graph = cli()
+        .env("OMNIGRAPH_BEARER_TOKEN", "admin-token")
+        .arg("queries")
+        .arg("list")
+        .arg("--server")
+        .arg(&server.base_url)
+        .output()
+        .unwrap();
+    assert!(
+        !no_graph.status.success(),
+        "served queries list without --graph must error"
+    );
+    let stderr = String::from_utf8_lossy(&no_graph.stderr);
+    assert!(
+        stderr.contains("alpha") && stderr.contains("--graph <id>"),
+        "expected a candidate-listing error naming alpha; got: {stderr}"
+    );
+
+    // With --graph: the served catalog, in the shared listing shape.
+    let payload = parse_stdout_json(&output_success(
+        cli()
+            .env("OMNIGRAPH_BEARER_TOKEN", "admin-token")
+            .arg("queries")
+            .arg("list")
+            .arg("--server")
+            .arg(&server.base_url)
+            .arg("--graph")
+            .arg("alpha")
+            .arg("--json"),
+    ));
+    let entry = payload["queries"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|q| q["name"] == "find_person")
+        .expect("served catalog must list find_person");
+    assert_eq!(entry["mutation"], false);
+    assert_eq!(entry["mcp_expose"], true);
+    let params = entry["params"].as_array().unwrap();
+    assert_eq!(params[0]["name"], "name");
+    assert_eq!(params[0]["type"], "String");
+    assert_eq!(params[0]["nullable"], false);
+
+    drop(server);
+}

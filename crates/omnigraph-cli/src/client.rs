@@ -30,7 +30,7 @@ use omnigraph_api_types::{
     BranchCreateOutput, BranchCreateRequest, BranchDeleteOutput, BranchListOutput,
     BranchMergeOutput, BranchMergeRequest, ChangeOutput, CommitListOutput, CommitOutput,
     ErrorOutput, ExportRequest, GraphListResponse, IngestOutput, IngestRequest,
-    InvokeStoredQueryRequest, ReadOutput,
+    InvokeStoredQueryRequest, QueriesCatalogOutput, ReadOutput,
     ReadRequest, SchemaApplyOutput, SchemaApplyRequest, SchemaOutput, SnapshotOutput, commit_output,
     ingest_output, read_output, schema_apply_output, snapshot_payload,
 };
@@ -894,6 +894,35 @@ impl GraphClient {
             GraphClient::Embedded { .. } => bail!(
                 "internal error: `graphs list` reached an embedded client — registry \
                  addressing always resolves a server"
+            ),
+        }
+    }
+
+    /// `queries list --server` — fetch a served graph's stored-query catalog
+    /// (`GET /queries`). The catalog is server-owned, so like `invoke_named`
+    /// there is nothing to enumerate on an embedded store; the dispatch fork
+    /// only routes server scopes here, making the Embedded arm a defensive
+    /// internal-invariant bail.
+    pub(crate) async fn list_queries(&self) -> Result<QueriesCatalogOutput> {
+        match self {
+            GraphClient::Remote {
+                http,
+                base_url,
+                token,
+            } => {
+                remote_json(
+                    http,
+                    Method::GET,
+                    remote_url(base_url, &["queries"], &[])?,
+                    None,
+                    token.as_deref(),
+                )
+                .await
+            }
+            GraphClient::Embedded { .. } => bail!(
+                "internal error: `queries list` reached an embedded client — the \
+                 served arm only resolves server scopes (the stored-query catalog \
+                 is server-owned; use --cluster <dir|uri> for applied state)"
             ),
         }
     }

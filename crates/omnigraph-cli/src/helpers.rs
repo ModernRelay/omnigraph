@@ -780,7 +780,11 @@ fn registry_from_serving_queries(
         .map(|q| omnigraph_server::queries::RegistrySpec {
             name: q.name.clone(),
             source: q.source.clone(),
-            expose: false,
+            // Mirror the server's serving bridge (settings.rs): the cluster
+            // registry has no expose flag, and a cluster-booted server lists
+            // every stored query in the MCP catalog — so the CLI reports the
+            // exposure the server actually serves.
+            expose: true,
             tool_name: None,
         })
         .collect();
@@ -928,8 +932,15 @@ pub(crate) async fn execute_queries_list(
             .collect(),
     };
 
+    render_queries_list(&output, json)
+}
+
+/// Render a stored-query listing — shared by the cluster arm
+/// (`execute_queries_list`) and the served arm (`GET /queries` via
+/// `GraphClient::list_queries`), so the two surfaces cannot drift.
+pub(crate) fn render_queries_list(output: &QueriesListOutput, json: bool) -> Result<()> {
     if json {
-        print_json(&output)?;
+        print_json(output)?;
     } else if output.queries.is_empty() {
         println!("(no stored queries registered)");
     } else {
@@ -963,6 +974,107 @@ pub(crate) async fn execute_queries_list(
         }
     }
     Ok(())
+}
+
+/// Whether `queries list` addresses a served graph: an explicit `--server`,
+/// or a profile / operator default that resolves to a server binding. A
+/// cluster binding, store binding, `--cluster`, or no scope at all takes the
+/// cluster arm (which owns the no-scope error). One `resolve_scope` probe is
+/// the authority so the fork can never disagree with real resolution.
+pub(crate) fn queries_list_targets_server(
+    server: Option<&str>,
+    profile: Option<&str>,
+) -> Result<bool> {
+    if server.is_some() {
+        return Ok(true);
+    }
+    let scope = scope::resolve_scope(
+        &operator::load_operator_config()?,
+        planes::Capability::Control,
+        scope::ScopeFlags {
+            profile,
+            store: None,
+            server: None,
+            cluster: None,
+            graph: None,
+            uri: None,
+        },
+    )?;
+    Ok(scope.server.is_some())
+}
+
+/// Map the served stored-query catalog (`GET /queries`) into the CLI listing
+/// shape. Everything the endpoint returns is MCP-exposed (the server filters),
+/// so `mcp_expose` is `true` by construction; `tool_name` collapses to `None`
+/// when it equals the query name, matching the cluster arm's JSON. Param
+/// types are synthesized from the wire `ParamKind` — the wire is
+/// width-lossy (I32/U32 both arrive as `int`), a documented divergence from
+/// the cluster arm's exact GQ spellings.
+pub(crate) fn queries_list_output_from_catalog(
+    catalog: omnigraph_api_types::QueriesCatalogOutput,
+) -> QueriesListOutput {
+    QueriesListOutput {
+        queries: catalog
+            .queries
+            .into_iter()
+            .map(|q| {
+                let tool_name = if q.tool_name == q.name {
+                    None
+                } else {
+                    Some(q.tool_name)
+                };
+                QueriesListItem {
+                    mcp_expose: true,
+                    tool_name,
+                    mutation: q.mutation,
+                    description: q.description,
+                    instruction: q.instruction,
+                    params: q
+                        .params
+                        .iter()
+                        .map(|p| QueriesParam {
+                            name: p.name.clone(),
+                            type_name: param_display_name(p),
+                            nullable: p.nullable,
+                        })
+                        .collect(),
+                    name: q.name,
+                }
+            })
+            .collect(),
+    }
+}
+
+/// Display name for a wire param descriptor, in the schema language's
+/// spelling. Exhaustive over `ParamKind` so a new kind is a compile error
+/// here until it gets a spelling.
+fn param_display_name(p: &omnigraph_api_types::ParamDescriptor) -> String {
+    use omnigraph_api_types::ParamKind;
+    fn kind_name(kind: &ParamKind) -> &'static str {
+        match kind {
+            ParamKind::String => "String",
+            ParamKind::Bool => "Bool",
+            ParamKind::Int => "Int",
+            ParamKind::BigInt => "BigInt",
+            ParamKind::Float => "Float",
+            ParamKind::Date => "Date",
+            ParamKind::DateTime => "DateTime",
+            ParamKind::Blob => "Blob",
+            ParamKind::Vector => "Vector",
+            ParamKind::List => "List",
+        }
+    }
+    match &p.kind {
+        ParamKind::Vector => match p.vector_dim {
+            Some(dim) => format!("Vector({dim})"),
+            None => "Vector".to_string(),
+        },
+        ParamKind::List => match &p.item_kind {
+            Some(item) => format!("[{}]", kind_name(item)),
+            None => "List".to_string(),
+        },
+        kind => kind_name(kind).to_string(),
+    }
 }
 
 pub(crate) fn legacy_change_request_body(
@@ -1155,5 +1267,82 @@ mod tests {
             url,
             "http://host/graphs/p9-os/snapshot?branch=feature%26x%3D1"
         );
+    }
+
+    #[test]
+    fn param_display_names_cover_every_wire_kind() {
+        use omnigraph_api_types::{ParamDescriptor, ParamKind};
+        let p = |kind: ParamKind, item_kind: Option<ParamKind>, vector_dim: Option<u32>| {
+            ParamDescriptor {
+                name: "p".to_string(),
+                kind,
+                item_kind,
+                vector_dim,
+                nullable: false,
+            }
+        };
+        // Scalars keep the schema language's spelling (width-lossy by wire
+        // design: I32/U32 both arrive as Int, etc.).
+        assert_eq!(param_display_name(&p(ParamKind::String, None, None)), "String");
+        assert_eq!(param_display_name(&p(ParamKind::Bool, None, None)), "Bool");
+        assert_eq!(param_display_name(&p(ParamKind::Int, None, None)), "Int");
+        assert_eq!(param_display_name(&p(ParamKind::BigInt, None, None)), "BigInt");
+        assert_eq!(param_display_name(&p(ParamKind::Float, None, None)), "Float");
+        assert_eq!(param_display_name(&p(ParamKind::Date, None, None)), "Date");
+        assert_eq!(param_display_name(&p(ParamKind::DateTime, None, None)), "DateTime");
+        assert_eq!(param_display_name(&p(ParamKind::Blob, None, None)), "Blob");
+        assert_eq!(
+            param_display_name(&p(ParamKind::Vector, None, Some(768))),
+            "Vector(768)"
+        );
+        assert_eq!(param_display_name(&p(ParamKind::Vector, None, None)), "Vector");
+        assert_eq!(
+            param_display_name(&p(ParamKind::List, Some(ParamKind::String), None)),
+            "[String]"
+        );
+        assert_eq!(param_display_name(&p(ParamKind::List, None, None)), "List");
+    }
+
+    #[test]
+    fn catalog_mapping_marks_exposure_and_collapses_default_tool_name() {
+        use omnigraph_api_types::{ParamDescriptor, ParamKind, QueriesCatalogOutput, QueryCatalogEntry};
+        let catalog = QueriesCatalogOutput {
+            queries: vec![
+                QueryCatalogEntry {
+                    name: "find_person".to_string(),
+                    tool_name: "find_person".to_string(),
+                    description: Some("d".to_string()),
+                    instruction: None,
+                    mutation: false,
+                    params: vec![ParamDescriptor {
+                        name: "name".to_string(),
+                        kind: ParamKind::String,
+                        item_kind: None,
+                        vector_dim: None,
+                        nullable: true,
+                    }],
+                },
+                QueryCatalogEntry {
+                    name: "add_person".to_string(),
+                    tool_name: "people_add".to_string(),
+                    description: None,
+                    instruction: None,
+                    mutation: true,
+                    params: vec![],
+                },
+            ],
+        };
+        let output = queries_list_output_from_catalog(catalog);
+        let find = &output.queries[0];
+        // Everything the endpoint returns passed the server's expose filter.
+        assert!(find.mcp_expose);
+        // A tool_name equal to the query name is the wire's filled-in default;
+        // collapse it to None so --json matches the cluster arm.
+        assert_eq!(find.tool_name, None);
+        assert_eq!(find.params[0].type_name, "String");
+        assert!(find.params[0].nullable);
+        let add = &output.queries[1];
+        assert!(add.mutation);
+        assert_eq!(add.tool_name.as_deref(), Some("people_add"));
     }
 }

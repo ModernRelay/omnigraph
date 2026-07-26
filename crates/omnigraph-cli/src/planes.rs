@@ -143,8 +143,22 @@ fn flag_applies(flag: ScopeFlag, capability: Capability, cmd: &Command) -> bool 
     let cluster_ok = accepts_cluster_addressing(cmd);
     match flag {
         // Served-graph addressing; `served` is the registry scope (the bare
-        // server), which still needs a server to talk to.
-        ScopeFlag::Server => matches!(capability, Any | Served),
+        // server), which still needs a server to talk to. `control` refines
+        // per command: `queries list` is dual-scope — it reads a cluster's
+        // applied registry OR a served graph's catalog (`GET /queries`), the
+        // listing twin of the already-served by-name invocation. `queries
+        // validate` stays cluster-only (it type-checks query source against
+        // the schema; the wire catalog carries neither).
+        ScopeFlag::Server => match capability {
+            Any | Served => true,
+            Control => matches!(
+                cmd,
+                Command::Queries {
+                    command: QueriesCommand::List { .. },
+                }
+            ),
+            Direct | Local => false,
+        },
         ScopeFlag::Cluster => cluster_ok,
         // The one graph selector across scopes: a served graph (`any`), or a
         // cluster graph on the verbs that take cluster addressing. `served`
@@ -388,6 +402,12 @@ fn remediation(capability: Capability, cmd: &Command) -> &'static str {
             Command::Cluster { .. } => {
                 " It operates on a cluster config directory (pass --config <dir>)."
             }
+            Command::Queries {
+                command: QueriesCommand::List { .. },
+            } => {
+                " It operates on a cluster (--cluster <dir|uri>) or a served graph \
+                 (--server <name|url> --graph <id>)."
+            }
             Command::Policy { .. } | Command::Queries { .. } => {
                 " It operates on a cluster (pass --cluster <dir|uri>, or select a cluster profile)."
             }
@@ -429,7 +449,13 @@ mod tests {
             // Read-only control verbs never read the actor; only
             // `cluster apply`/`approve` do. The `cluster` family addresses
             // its config with --config and never resolves a profile scope.
-            (parse(&["omnigraph", "queries", "list"]), [false, true, true, false, false, true]),
+            // `queries list` is dual-scope (cluster OR served graph);
+            // `queries validate` stays cluster-only.
+            (parse(&["omnigraph", "queries", "list"]), [true, true, true, false, false, true]),
+            (
+                parse(&["omnigraph", "queries", "validate"]),
+                [false, true, true, false, false, true],
+            ),
             (
                 parse(&["omnigraph", "cluster", "status", "--config", "."]),
                 [false, false, false, false, false, false],

@@ -626,18 +626,41 @@ async fn main() -> Result<()> {
             let output = execute_query_lint(graph_uri, schema.as_ref(), &query).await?;
             finish_query_lint(&output, json)?;
         }
-        Command::Queries { command } => {
-            let cluster =
-                require_cluster_scope(cli.cluster.as_deref(), cli.profile.as_deref(), "queries")?;
-            match command {
-                QueriesCommand::Validate { json } => {
-                    execute_queries_validate(&cluster, cli.graph.as_deref(), json).await?;
-                }
-                QueriesCommand::List { json } => {
+        Command::Queries { command } => match command {
+            QueriesCommand::Validate { json } => {
+                let cluster = require_cluster_scope(
+                    cli.cluster.as_deref(),
+                    cli.profile.as_deref(),
+                    "queries",
+                )?;
+                execute_queries_validate(&cluster, cli.graph.as_deref(), json).await?;
+            }
+            QueriesCommand::List { json } => {
+                // Dual-scope: a server scope lists a served graph's catalog
+                // (`GET /queries` — the listing twin of by-name invocation);
+                // any other scope reads a cluster's applied state as before.
+                if queries_list_targets_server(cli.server.as_deref(), cli.profile.as_deref())? {
+                    let client = client::GraphClient::resolve(
+                        capability,
+                        cli.server.as_deref(),
+                        cli.graph.as_deref(),
+                        None,
+                        cli.profile.as_deref(),
+                        None,
+                    )
+                    .await?;
+                    let payload = client.list_queries().await?;
+                    render_queries_list(&queries_list_output_from_catalog(payload), json)?;
+                } else {
+                    let cluster = require_cluster_scope(
+                        cli.cluster.as_deref(),
+                        cli.profile.as_deref(),
+                        "queries",
+                    )?;
                     execute_queries_list(&cluster, cli.graph.as_deref(), json).await?;
                 }
             }
-        }
+        },
         Command::Snapshot {
             uri,
             branch,

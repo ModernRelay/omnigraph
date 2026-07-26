@@ -88,6 +88,7 @@ List the graph's stored queries as a typed tool catalog — enough for a client 
 - **Read-gated** (works in default-deny mode). The catalog is **graph-wide** (branch-independent; `read` is authorized against `main`).
 - **Every stored query in the applied registry is listed.** Cluster-served graphs have no per-query expose flag today — every query in the cluster `queries:` registry appears in the catalog. (Per-query exposure may become a Cedar-policy decision in a later release; see [cluster-config](../clusters/config.md).)
 - **Not Cedar-filtered per query (yet).** A caller with `read` but not `invoke_query` can *list* a query they can't *invoke* (which would 404). Closing that gap is future per-query authorization; for now the catalog is a discovery surface and `invoke_query` remains the invocation gate.
+- **CLI**: `omnigraph queries list --server <name|url> --graph <id>` reads this catalog (the listing twin of by-name invocation); see the [CLI reference](../cli/reference.md).
 
 ### Stored-query invocation (`POST /queries/{name}`)
 

@@ -20,7 +20,7 @@ served — require a server (registry scope, --server/--profile only): graphs.\n
 direct — direct storage access; reject --server (init, optimize, repair, cleanup, \
 schema plan, lint).\n  \
 control — manage or inspect a cluster (cluster via --config; policy & queries via \
---cluster).\n  \
+--cluster; queries list also reads a served graph via --server --graph).\n  \
 local — no explicit graph scope; local config & tooling: alias, embed, login, logout, profile, version.\n\
 See the 'Command capabilities' section of the CLI reference for which flags apply where.")]
 pub(crate) struct Cli {
