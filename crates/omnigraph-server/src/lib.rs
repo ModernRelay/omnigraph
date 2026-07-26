@@ -1465,7 +1465,13 @@ pub async fn open_multi_graph_state(
             failed
         );
     }
-    if handles.is_empty() {
+    // RFC-030 W3: zero SERVING graphs is a valid lenient-mode boot state as
+    // long as quarantine entries exist for supervision to converge — aborting
+    // here would re-create the incident's offline-until-redeploy failure for
+    // single-graph deployments with a transient open fault. Zero configured
+    // graphs (and settings-time config-class quarantine, which supervision
+    // cannot heal) remain fail-fast upstream.
+    if handles.is_empty() && quarantined.is_empty() {
         bail!(
             "no healthy graphs opened from multi-graph startup config ({} configured, {} failed)",
             configured_graphs,
