@@ -209,6 +209,65 @@ fn parity_load() {
     assert_parity("load", &l, &r);
 }
 
+/// RFC-029 change feed. Both tiers plus the bounded/paged form, because the
+/// embedded arm builds the DTOs itself while the remote arm gets them from the
+/// server — the two default/clamp/parse sites are exactly what drifts.
+#[test]
+fn parity_diff() {
+    let p = parity();
+    let (l, r) = p.run(&["branch", "create", "--from", "main", "diffed", "--json"]);
+    assert_parity("branch create (diff setup)", &l, &r);
+
+    // Empty delta: main -> a fresh fork of main.
+    let (l, r) = p.run(&["diff", "--from", "main", "--to", "diffed", "--summary", "--json"]);
+    assert_parity("diff --summary (no delta)", &l, &r);
+    let (l, r) = p.run(&["diff", "--from", "main", "--to", "diffed", "--json"]);
+    assert_parity("diff (no delta)", &l, &r);
+
+    // Non-empty delta, so the row tier is not vacuously equal.
+    let data = p.local.parent().unwrap().join("diff-rows.jsonl");
+    std::fs::write(
+        &data,
+        "{\"type\":\"Person\",\"data\":{\"name\":\"Diffed\",\"age\":7}}\n",
+    )
+    .unwrap();
+    let (l, r) = p.run(&[
+        "load",
+        "--branch",
+        "diffed",
+        "--mode",
+        "merge",
+        "--data",
+        data.to_str().unwrap(),
+        "--json",
+    ]);
+    assert_parity("load onto diff branch", &l, &r);
+
+    let (l, r) = p.run(&["diff", "--from", "main", "--to", "diffed", "--summary", "--json"]);
+    assert_parity("diff --summary", &l, &r);
+    let (l, r) = p.run(&["diff", "--from", "main", "--to", "diffed", "--json"]);
+    assert_parity("diff", &l, &r);
+    // Explicit limit: exercises the clamp/default site on both arms.
+    let (l, r) = p.run(&[
+        "diff", "--from", "main", "--to", "diffed", "--limit", "1", "--json",
+    ]);
+    assert_parity("diff --limit", &l, &r);
+    // Filters parse on both arms through separate code paths.
+    let (l, r) = p.run(&[
+        "diff", "--from", "main", "--to", "diffed", "--kinds", "node", "--ops", "insert", "--json",
+    ]);
+    assert_parity("diff --kinds --ops", &l, &r);
+    // A rejected filter value must fail the same way on both arms.
+    let (l, r) = p.run(&[
+        "diff", "--from", "main", "--to", "diffed", "--ops", "upsert", "--json",
+    ]);
+    assert_eq!(
+        (l.status.success(), r.status.success()),
+        (false, false),
+        "an unknown --ops value must fail on both arms\nlocal {l:?}\nremote {r:?}"
+    );
+}
+
 #[test]
 fn parity_export() {
     let p = parity();

@@ -230,6 +230,7 @@ pub(crate) fn command_plane(cmd: &Command) -> Plane {
         | Command::Snapshot { .. }
         | Command::Export { .. }
         | Command::Commit { .. }
+        | Command::Diff { .. }
         | Command::Graphs { .. } => Plane::Data,
         Command::Schema {
             command: SchemaCommand::Show { .. } | SchemaCommand::Apply { .. },
@@ -283,6 +284,7 @@ pub(crate) fn command_label(cmd: &Command) -> &'static str {
         Command::Snapshot { .. } => "snapshot",
         Command::Export { .. } => "export",
         Command::Commit { .. } => "commit",
+        Command::Diff { .. } => "diff",
         Command::Query { .. } => "query",
         Command::Mutate { .. } => "mutate",
         Command::Alias { .. } => "alias",

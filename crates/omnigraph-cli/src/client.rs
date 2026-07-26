@@ -24,14 +24,16 @@
 use std::io::Write;
 
 use color_eyre::Result;
-use color_eyre::eyre::bail;
+use color_eyre::eyre::{bail, eyre};
+use omnigraph::changes::{ChangeFilter, ChangeOp, EntityKind};
 use omnigraph::db::{Omnigraph, ReadTarget};
 use omnigraph_api_types::{
     BranchCreateOutput, BranchCreateRequest, BranchDeleteOutput, BranchListOutput,
     BranchMergeOutput, BranchMergeRequest, ChangeOutput, CommitListOutput, CommitOutput,
-    ErrorOutput, ExportRequest, GraphListResponse, IngestOutput, IngestRequest,
-    InvokeStoredQueryRequest, ReadOutput,
-    ReadRequest, SchemaApplyOutput, SchemaApplyRequest, SchemaOutput, SnapshotOutput, commit_output,
+    DiffOutput, DiffSummaryOutput, ErrorOutput, ExportRequest, GraphListResponse, IngestOutput,
+    IngestRequest, InvokeStoredQueryRequest, ReadOutput,
+    ReadRequest, SchemaApplyOutput, SchemaApplyRequest, SchemaOutput, SnapshotOutput,
+    change_stats_output, commit_output, decode_change_cursor, diff_output,
     ingest_output, read_output, schema_apply_output, snapshot_payload,
 };
 use omnigraph_compiler::catalog::Catalog;
@@ -46,6 +48,123 @@ use crate::helpers::{
     resolve_server_flag, select_named_query,
 };
 use crate::output::{LoadOutput, load_output_from_result, load_output_from_tables};
+
+/// Default page size for `omnigraph diff`, matching the server's default so
+/// the embedded and remote arms agree (RFC-009 parity).
+pub(crate) const DIFF_CLI_DEFAULT_LIMIT: usize = 100;
+
+/// One diff request, shared by both arms so the embedded path cannot drift
+/// from what the remote path sends over the wire.
+pub(crate) struct DiffSpec<'a> {
+    pub from: &'a str,
+    pub to: &'a str,
+    pub from_is_snapshot: bool,
+    pub to_is_snapshot: bool,
+    pub types: Option<&'a str>,
+    pub kinds: Option<&'a str>,
+    pub ops: Option<&'a str>,
+    pub limit: Option<usize>,
+    pub cursor: Option<&'a str>,
+}
+
+impl DiffSpec<'_> {
+    fn from_target(&self) -> ReadTarget {
+        diff_target(self.from, self.from_is_snapshot)
+    }
+
+    fn to_target(&self) -> ReadTarget {
+        diff_target(self.to, self.to_is_snapshot)
+    }
+
+    /// Query parameters common to both diff endpoints. `limit`/`cursor` are
+    /// row-tier only and appended by the caller.
+    fn query_params(&self) -> Vec<(&'static str, String)> {
+        let mut params: Vec<(&'static str, String)> = Vec::new();
+        params.push((
+            if self.from_is_snapshot {
+                "from_snapshot"
+            } else {
+                "from"
+            },
+            self.from.to_string(),
+        ));
+        params.push((
+            if self.to_is_snapshot {
+                "to_snapshot"
+            } else {
+                "to"
+            },
+            self.to.to_string(),
+        ));
+        for (name, value) in [
+            ("types", self.types),
+            ("kinds", self.kinds),
+            ("ops", self.ops),
+        ] {
+            if let Some(value) = value {
+                params.push((name, value.to_string()));
+            }
+        }
+        params
+    }
+
+    /// Build the engine filter for the embedded arm. Parsing mirrors the
+    /// server's so an invalid value is rejected the same way on both arms.
+    fn filter(&self) -> Result<ChangeFilter> {
+        Ok(ChangeFilter {
+            kinds: parse_csv(self.kinds)
+                .map(|items| {
+                    items
+                        .iter()
+                        .map(|item| match item.to_ascii_lowercase().as_str() {
+                            "node" => Ok(EntityKind::Node),
+                            "edge" => Ok(EntityKind::Edge),
+                            other => Err(eyre!(
+                                "unknown kind '{other}'; expected `node` or `edge`"
+                            )),
+                        })
+                        .collect::<Result<Vec<_>>>()
+                })
+                .transpose()?,
+            type_names: parse_csv(self.types),
+            ops: parse_csv(self.ops)
+                .map(|items| {
+                    items
+                        .iter()
+                        .map(|item| match item.to_ascii_lowercase().as_str() {
+                            "insert" => Ok(ChangeOp::Insert),
+                            "update" => Ok(ChangeOp::Update),
+                            "delete" => Ok(ChangeOp::Delete),
+                            other => Err(eyre!(
+                                "unknown op '{other}'; expected `insert`, `update`, or `delete`"
+                            )),
+                        })
+                        .collect::<Result<Vec<_>>>()
+                })
+                .transpose()?,
+            limit: None,
+            after: None,
+        })
+    }
+}
+
+fn diff_target(value: &str, is_snapshot: bool) -> ReadTarget {
+    if is_snapshot {
+        ReadTarget::snapshot(omnigraph::db::SnapshotId::new(value.to_string()))
+    } else {
+        ReadTarget::branch(value.to_string())
+    }
+}
+
+fn parse_csv(raw: Option<&str>) -> Option<Vec<String>> {
+    let items: Vec<String> = raw?
+        .split(',')
+        .map(str::trim)
+        .filter(|item| !item.is_empty())
+        .map(str::to_string)
+        .collect();
+    if items.is_empty() { None } else { Some(items) }
+}
 
 pub(crate) enum GraphClient {
     /// Local engine at `uri`. Reads (`resolve()`) leave `actor` empty;
@@ -390,6 +509,78 @@ impl GraphClient {
                     .map(commit_output)
                     .collect::<Vec<_>>();
                 Ok(CommitListOutput { commits })
+            }
+        }
+    }
+
+    /// Whole-diff totals (RFC-029 cheap tier).
+    pub(crate) async fn diff_summary(&self, spec: &DiffSpec<'_>) -> Result<DiffSummaryOutput> {
+        match self {
+            GraphClient::Remote {
+                http,
+                base_url,
+                token,
+            } => {
+                let params = spec.query_params();
+                let pairs: Vec<(&str, &str)> =
+                    params.iter().map(|(k, v)| (*k, v.as_str())).collect();
+                let url = remote_url(base_url, &["diff", "summary"], &pairs)?;
+                remote_json(http, Method::GET, url, None, token.as_deref()).await
+            }
+            GraphClient::Embedded { uri, .. } => {
+                let db = Omnigraph::open(uri).await?;
+                let summary = db
+                    .diff_summary_between(spec.from_target(), spec.to_target(), &spec.filter()?)
+                    .await?;
+                Ok(DiffSummaryOutput {
+                    from: spec.from.to_string(),
+                    to: spec.to.to_string(),
+                    from_version: summary.from_version,
+                    to_version: summary.to_version,
+                    stats: change_stats_output(&summary.stats),
+                })
+            }
+        }
+    }
+
+    /// One bounded page of changes (RFC-029 row tier).
+    pub(crate) async fn diff(&self, spec: &DiffSpec<'_>) -> Result<DiffOutput> {
+        match self {
+            GraphClient::Remote {
+                http,
+                base_url,
+                token,
+            } => {
+                let mut params = spec.query_params();
+                if let Some(limit) = spec.limit {
+                    params.push(("limit", limit.to_string()));
+                }
+                if let Some(cursor) = spec.cursor {
+                    params.push(("cursor", cursor.to_string()));
+                }
+                let pairs: Vec<(&str, &str)> =
+                    params.iter().map(|(k, v)| (*k, v.as_str())).collect();
+                let url = remote_url(base_url, &["diff"], &pairs)?;
+                remote_json(http, Method::GET, url, None, token.as_deref()).await
+            }
+            GraphClient::Embedded { uri, .. } => {
+                let db = Omnigraph::open(uri).await?;
+                let mut filter = spec.filter()?;
+                filter.limit = Some(spec.limit.unwrap_or(DIFF_CLI_DEFAULT_LIMIT));
+                filter.after = match spec.cursor {
+                    Some(token) => Some(decode_change_cursor(token).ok_or_else(|| {
+                        eyre!("malformed --cursor; pass back the next_cursor value verbatim")
+                    })?),
+                    None => None,
+                };
+                let change_set = db
+                    .diff_between(spec.from_target(), spec.to_target(), &filter)
+                    .await?;
+                Ok(diff_output(
+                    spec.from.to_string(),
+                    spec.to.to_string(),
+                    &change_set,
+                ))
             }
         }
     }

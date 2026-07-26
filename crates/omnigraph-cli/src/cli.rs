@@ -225,6 +225,50 @@ pub(crate) enum Command {
         #[command(subcommand)]
         command: CommitCommand,
     },
+    /// Show what changed between two branches or snapshots.
+    ///
+    /// Reports per-type counts with `--summary`, or a bounded page of
+    /// individual changes (id + operation, plus endpoints for edges).
+    /// Property values are not included — read those with `omnigraph query`.
+    ///
+    /// `--from` and `--to` are required: an unbounded whole-graph diff is not
+    /// an exposed operation.
+    Diff {
+        /// Graph URI
+        uri: Option<String>,
+        /// Branch to diff from. Use `--from-snapshot` for a snapshot/commit id.
+        #[arg(long)]
+        from: Option<String>,
+        /// Branch to diff to. Use `--to-snapshot` for a snapshot/commit id.
+        #[arg(long)]
+        to: Option<String>,
+        /// Snapshot or commit id to diff from. Exclusive with `--from`.
+        #[arg(long = "from-snapshot", conflicts_with = "from")]
+        from_snapshot: Option<String>,
+        /// Snapshot or commit id to diff to. Exclusive with `--to`.
+        #[arg(long = "to-snapshot", conflicts_with = "to")]
+        to_snapshot: Option<String>,
+        /// Restrict to these type names (comma-separated).
+        #[arg(long)]
+        types: Option<String>,
+        /// Restrict to `node` and/or `edge` (comma-separated).
+        #[arg(long)]
+        kinds: Option<String>,
+        /// Restrict to `insert`, `update`, and/or `delete` (comma-separated).
+        #[arg(long)]
+        ops: Option<String>,
+        /// Maximum changes to return. Defaults to 100.
+        #[arg(long)]
+        limit: Option<usize>,
+        /// Resume token from a previous run's `next_cursor`.
+        #[arg(long)]
+        cursor: Option<String>,
+        /// Report per-type counts only, without the change list.
+        #[arg(long)]
+        summary: bool,
+        #[arg(long)]
+        json: bool,
+    },
     /// Schema planning operations
     Schema {
         #[command(subcommand)]

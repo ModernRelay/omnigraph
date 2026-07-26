@@ -19,8 +19,8 @@ use omnigraph_compiler::{
     json_params_to_param_map, lint_query_file,
 };
 use omnigraph_api_types::{
-    ChangeOutput, CommitOutput, ErrorOutput, IngestOutput, ReadOutput, SchemaApplyOutput,
-    SnapshotTableOutput,
+    ChangeOutput, CommitOutput, DiffOutput, DiffSummaryOutput, ErrorOutput, IngestOutput,
+    ReadOutput, SchemaApplyOutput, SnapshotTableOutput,
 };
 use omnigraph_server::queries::{QueryRegistry, check};
 use omnigraph_server::{
@@ -447,6 +447,69 @@ async fn main() -> Result<()> {
                 }
             }
         },
+        Command::Diff {
+            uri,
+            from,
+            to,
+            from_snapshot,
+            to_snapshot,
+            types,
+            kinds,
+            ops,
+            limit,
+            cursor,
+            summary,
+            json,
+        } => {
+            // Required, and clap cannot express "exactly one of these two"
+            // across four flags, so validate here.
+            let (from_value, from_is_snapshot) = match (&from, &from_snapshot) {
+                (Some(branch), None) => (branch.clone(), false),
+                (None, Some(snapshot)) => (snapshot.clone(), true),
+                _ => bail!("exactly one of --from or --from-snapshot is required"),
+            };
+            let (to_value, to_is_snapshot) = match (&to, &to_snapshot) {
+                (Some(branch), None) => (branch.clone(), false),
+                (None, Some(snapshot)) => (snapshot.clone(), true),
+                _ => bail!("exactly one of --to or --to-snapshot is required"),
+            };
+
+            let client = client::GraphClient::resolve(
+                capability,
+                cli.server.as_deref(),
+                cli.graph.as_deref(),
+                uri,
+                cli.profile.as_deref(),
+                cli.store.as_deref(),
+            )
+            .await?;
+            let spec = client::DiffSpec {
+                from: &from_value,
+                to: &to_value,
+                from_is_snapshot,
+                to_is_snapshot,
+                types: types.as_deref(),
+                kinds: kinds.as_deref(),
+                ops: ops.as_deref(),
+                limit,
+                cursor: cursor.as_deref(),
+            };
+            if summary {
+                let payload = client.diff_summary(&spec).await?;
+                if json {
+                    print_json(&payload)?;
+                } else {
+                    print_diff_summary_human(&payload);
+                }
+            } else {
+                let payload = client.diff(&spec).await?;
+                if json {
+                    print_json(&payload)?;
+                } else {
+                    print_diff_human(&payload);
+                }
+            }
+        }
         Command::Commit { command } => match command {
             CommitCommand::List {
                 uri,

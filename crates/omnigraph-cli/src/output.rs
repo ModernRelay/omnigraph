@@ -1051,3 +1051,50 @@ mod tests {
         );
     }
 }
+
+/// Human form of the RFC-029 summary tier: counts first, then which types
+/// were touched — the "contents at a glance" a branch review starts from.
+pub(crate) fn print_diff_summary_human(summary: &DiffSummaryOutput) {
+    println!(
+        "{} (v{}) -> {} (v{})",
+        summary.from, summary.from_version, summary.to, summary.to_version
+    );
+    println!(
+        "{} inserted, {} updated, {} deleted",
+        summary.stats.inserts, summary.stats.updates, summary.stats.deletes
+    );
+    if !summary.stats.types_affected.is_empty() {
+        println!("types: {}", summary.stats.types_affected.join(", "));
+    }
+}
+
+/// Human form of the row tier. One line per change, prefixed by a
+/// git-diff-like op sigil so a long list stays scannable.
+pub(crate) fn print_diff_human(diff: &DiffOutput) {
+    println!(
+        "{} (v{}) -> {} (v{})",
+        diff.from, diff.from_version, diff.to, diff.to_version
+    );
+    for change in &diff.changes {
+        let sigil = match change.op.as_str() {
+            "insert" => '+',
+            "delete" => '-',
+            _ => '~',
+        };
+        let endpoints = match (&change.src, &change.dst) {
+            (Some(src), Some(dst)) => format!(" {} -> {}", src, dst),
+            _ => String::new(),
+        };
+        println!(
+            "{} {} {}{}",
+            sigil, change.type_name, change.id, endpoints
+        );
+    }
+    println!(
+        "{} inserted, {} updated, {} deleted (this page)",
+        diff.stats.inserts, diff.stats.updates, diff.stats.deletes
+    );
+    if let Some(cursor) = &diff.next_cursor {
+        println!("more changes follow; resume with --cursor {}", cursor);
+    }
+}
