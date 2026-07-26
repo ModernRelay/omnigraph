@@ -115,9 +115,20 @@ impl GraphSupervisor {
                         // server shutdown.
                         None => return,
                         Some(key) => {
-                            // Dedup: an already-pending graph keeps its
-                            // schedule; a fresh trigger-B request retries
-                            // immediately.
+                            // Dedup: a fresh trigger-B request retries
+                            // immediately; an already-pending graph keeps
+                            // its backoff schedule. Deliberate, not an
+                            // oversight: the schedule is attempt-driven
+                            // evidence about the OPEN path, and a new
+                            // `RecoveryRequired` notification carries no
+                            // evidence that path recovered — it only proves
+                            // demand. Resetting on demand would let
+                            // sustained 503 traffic collapse exponential
+                            // backoff into a tight open loop exactly when
+                            // the backend is struggling. Pending state only
+                            // exists while an episode is unresolved
+                            // (success removes it), so the worst-case added
+                            // wait is one max_backoff interval.
                             pending.entry(key).or_insert(RetryState {
                                 attempts: 0,
                                 next_at: Instant::now(),
