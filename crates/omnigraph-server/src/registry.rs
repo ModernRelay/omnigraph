@@ -289,7 +289,12 @@ impl GraphRegistry {
         let _guard = self.mutate.lock().await;
         let current = self.snapshot.load();
         let (canonical_uri, handle) = canonicalize_handle_uri(handle)?;
-        if current.graphs.contains_key(&handle.key) {
+        // A quarantined key is CONFIGURED — add-only insert rejects it like
+        // any registered key (publish is the heal path that may replace it).
+        // Without this guard an insert could put one key in both maps,
+        // tripping the snapshot's disjointness invariant.
+        if current.graphs.contains_key(&handle.key) || current.quarantined.contains_key(&handle.key)
+        {
             return Err(InsertError::DuplicateKey(handle.key.clone()));
         }
         for existing in current.graphs.values() {
@@ -790,6 +795,25 @@ mod tests {
         match registry.get(&ghost) {
             RegistryLookup::Quarantined(info) => assert_eq!(info.attempts, 3),
             _ => panic!("non-serving key must surface Quarantined"),
+        }
+    }
+
+    /// Test-only `insert` is add-only over CONFIGURED keys: a quarantined
+    /// key is configured, so insert rejects it (publish is the heal path) —
+    /// one key can never sit in both snapshot maps.
+    #[tokio::test]
+    async fn insert_rejects_quarantined_key() {
+        let dir = TempDir::new().unwrap();
+        let handle = build_handle("alpha", dir.path()).await;
+        let key = handle.key.clone();
+        let registry = GraphRegistry::from_boot(
+            Vec::new(),
+            vec![(key, quarantine_info("file:///nowhere/alpha", false))],
+        )
+        .unwrap();
+        match registry.insert(handle).await {
+            Err(InsertError::DuplicateKey(_)) => {}
+            other => panic!("expected DuplicateKey for a quarantined key, got {other:?}"),
         }
     }
 
