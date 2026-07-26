@@ -619,6 +619,112 @@ rules:
 /// once the fault clears — the supervision loop re-drives the full
 /// `open_single_graph` with capped backoff and RCU-publishes the healed
 /// handle. The "transient fault clears" model is deterministic: the graph
+/// RFC-030 review fix (all-quarantined boot): the incident's own topology —
+/// a single-graph deployment whose only graph fails its boot open on a
+/// transient fault — must still boot in lenient mode, serve the quarantine
+/// state observably, and converge once the fault clears. Zero SERVING graphs
+/// with at least one quarantined entry is a valid, converging boot state;
+/// only zero-configured (and settings-time config-class quarantine, which
+/// supervision cannot heal) remain fail-fast.
+#[tokio::test(flavor = "multi_thread")]
+async fn all_quarantined_lenient_boot_serves_and_converges() {
+    let temp = tempfile::tempdir().unwrap();
+    let schema = "\nnode Person {\n  name: String @key\n}\n";
+    let bad_uri = temp.path().join("solo.omni");
+    let server_policy = omnigraph_server::PolicySource::Inline(
+        r#"
+version: 1
+kind: server
+groups:
+  admins: [act-admin]
+rules:
+  - id: admins-list-graphs
+    allow:
+      actors: { group: admins }
+      actions: [graph_list]
+"#
+        .to_string(),
+    );
+    let graphs = vec![omnigraph_server::GraphStartupConfig {
+        graph_id: "solo".to_string(),
+        uri: bad_uri.to_string_lossy().to_string(),
+        policy: None,
+        embedding: None,
+        queries: stored_query_registry(&[]),
+    }];
+    let state = omnigraph_server::open_multi_graph_state(
+        graphs,
+        vec![("act-admin".to_string(), "admin-token".to_string())],
+        Some(&server_policy),
+        temp.path().join("cluster.yaml"),
+        false,
+    )
+    .await
+    .expect(
+        "lenient boot with every graph quarantined must serve so supervision \
+         can converge (RFC-030 W3) — aborting here re-creates the incident's \
+         offline-until-redeploy failure for single-graph deployments",
+    );
+    let _supervision =
+        state.spawn_supervision(omnigraph_server::SupervisorConfig::fast_for_tests());
+    let app = build_app(state);
+
+    // Observable while nothing serves: the one graph is quarantined and its
+    // routes answer 503.
+    let (status, body) = json_response(
+        &app,
+        Request::builder()
+            .uri("/graphs")
+            .header("authorization", "Bearer admin-token")
+            .body(Body::empty())
+            .unwrap(),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(
+        body["graphs"][0]["status"].as_str(),
+        Some("quarantined"),
+        "the solo graph must boot quarantined: {body}"
+    );
+    let (status, body) = json_response(
+        &app,
+        Request::builder()
+            .uri("/graphs/solo/queries")
+            .header("authorization", "Bearer admin-token")
+            .body(Body::empty())
+            .unwrap(),
+    )
+    .await;
+    assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE, "{body}");
+
+    // The fault clears; supervision converges without a restart.
+    Omnigraph::init(bad_uri.to_string_lossy().as_ref(), schema)
+        .await
+        .unwrap();
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    loop {
+        let (status, body) = json_response(
+            &app,
+            Request::builder()
+                .uri("/graphs")
+                .header("authorization", "Bearer admin-token")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        if body["graphs"][0]["status"].as_str() == Some("serving") {
+            break;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "all-quarantined boot never converged to serving (RFC-030 W3); \
+             last listing: {body}"
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+    }
+}
+
 /// root simply does not exist at boot and is initialized while the server
 /// runs.
 #[tokio::test(flavor = "multi_thread")]
