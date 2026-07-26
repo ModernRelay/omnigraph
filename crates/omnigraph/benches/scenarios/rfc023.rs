@@ -66,9 +66,50 @@ pub(super) fn validate_args(args: &Args) -> Result<(), String> {
                 );
             }
         }
+        "general-merge-updates" => {
+            rfc023_limits::derive_chunk_plan(args.dims, "base", args.rows)?;
+            if args.delta_rows == 0 {
+                return Err("--delta-rows must be greater than zero".to_string());
+            }
+            // The branch's updates and main's divergence must address disjoint
+            // key ranges, or the merge reports a row conflict instead of
+            // measuring the general reconciliation route.
+            if args
+                .delta_rows
+                .saturating_add(GENERAL_MERGE_TARGET_DELTA_ROWS)
+                > args.rows
+            {
+                return Err(format!(
+                    "--delta-rows {} plus the {GENERAL_MERGE_TARGET_DELTA_ROWS}-row target \
+                     divergence must fit inside --rows {}",
+                    args.delta_rows, args.rows
+                ));
+            }
+            rfc023_limits::derive_chunk_plan(args.dims, "base", args.delta_rows)?;
+            if args.child {
+                let phase = args
+                    .phase
+                    .as_deref()
+                    .ok_or_else(|| "phased merge child is missing --phase".to_string())?;
+                if !matches!(phase, "setup" | "operation" | "verify") {
+                    return Err(format!("unknown phased merge child phase '{phase}'"));
+                }
+                if args.fixture_root.as_deref().is_none_or(str::is_empty) {
+                    return Err("phased merge child is missing --fixture-root".to_string());
+                }
+            } else if args.phase.is_some() || args.fixture_root.is_some() {
+                return Err(
+                    "--phase/--fixture-root are internal to phased merge children".to_string(),
+                );
+            }
+        }
         _ => {
             if args.phase.is_some() || args.fixture_root.is_some() {
-                return Err("--phase/--fixture-root require fenced-adopt-all-new".to_string());
+                return Err(
+                    "--phase/--fixture-root require fenced-adopt-all-new or \
+                     general-merge-updates"
+                        .to_string(),
+                );
             }
         }
     }
@@ -1354,5 +1395,342 @@ pub(super) async fn fenced_adopt_verify(args: &Args) -> serde_json::Value {
         "physical_source_content": physical_source_content,
         "manifest_main_content": manifest_main_content,
         "manifest_source_content": manifest_source_content,
+    })
+}
+
+// ---------------------------------------------------------------------------
+// general-merge-updates: the route the proven adopt path does NOT cover
+// ---------------------------------------------------------------------------
+//
+// `fenced-adopt-all-new` measures the proven insert-only shortcut, where the
+// merge never compares against the target at all. This scenario measures the
+// other road: a source branch that MODIFIES already-committed rows carries no
+// insert-absence certificate, so reconciliation falls back to the general
+// ordered diff, which streams the base, source, AND target cursors and stages
+// the delta through Lance's target merge join.
+//
+// The fixture deliberately holds the branch delta small (`--delta-rows`, 50 by
+// default) while `--rows` grows. If merge cost were proportional to the change
+// set, every column here would be flat in `--rows`. Issue #384 reports that it
+// is not — a ~50-row branch exhausts the memory pool against a large target —
+// so this scenario exists to turn that report into a curve.
+//
+// Main is also advanced after the branch forks, on a disjoint key range, so the
+// merge is genuinely diverged and takes the three-way route rather than the
+// two-way fast-forward diff. That matches the reported production shape, where
+// other writers land on main while a branch is open.
+
+/// Rows rewritten on `main` after the branch forks, to force divergence.
+/// Small and fixed: this is the "someone else wrote to main" trigger, not a
+/// variable under study.
+const GENERAL_MERGE_TARGET_DELTA_ROWS: usize = 8;
+
+const GENERAL_MERGE_SOURCE_BRANCH: &str = "update-source";
+
+/// Rows per fixture `load()` call, sized against the loader's ACTUAL keyed
+/// byte accounting rather than the shared benchmark estimator.
+///
+/// `derive_chunk_plan` models a vector row as `dims * 4` — the Arrow value
+/// buffer. The loader's `account_keyed_json_row` instead charges a JSON array
+/// as `(dims + 1) * 4` offset bytes PLUS `dims * 4` value bytes, so the real
+/// per-row charge is ~`dims * 8`. At dims=256 the 8,192-row cap binds first and
+/// the difference is invisible, which is why `fenced-adopt-all-new` never saw
+/// it. At dims=1024 the derived batch lands ~2x over the 32 MiB ceiling, and
+/// because the budget accumulates across a whole `load()` call it always
+/// crosses at the same row index regardless of the requested chunk width.
+///
+/// This scenario sweeps vector width deliberately, so it models the real
+/// charge locally instead of widening the shared estimator — that estimator's
+/// exact plan is load-bearing for `fenced-adopt-all-new`'s recorded evidence,
+/// and re-planning it would invalidate those runs. Chunk count is a fixture
+/// detail here; only the merge is measured.
+fn general_merge_batch_rows(dims: usize) -> usize {
+    // (dims + 1) * 4 offsets + dims * 4 values, plus generous room for the
+    // slug string, its offset, and per-row bookkeeping.
+    let per_row = (dims as u64)
+        .saturating_mul(8)
+        .saturating_add(128)
+        .max(1);
+    // Spend only 90% of the ceiling so a future accounting tweak does not put
+    // the fixture back on the cliff.
+    let by_bytes = rfc023_limits::KEYED_WRITE_MAX_BYTES
+        .saturating_mul(9)
+        .saturating_div(10)
+        .saturating_div(per_row);
+    usize::try_from(by_bytes)
+        .unwrap_or(rfc023_limits::KEYED_WRITE_MAX_ROWS)
+        .min(rfc023_limits::KEYED_WRITE_MAX_ROWS)
+        .max(1)
+}
+
+fn general_merge_fixture_root(args: &Args) -> &std::path::Path {
+    std::path::Path::new(
+        args.fixture_root
+            .as_deref()
+            .expect("validated general-merge fixture root"),
+    )
+}
+
+/// Phase 1: build the persisted fixture. Exits before the measured child runs,
+/// so none of this allocation can raise the operation high-water mark.
+pub(super) async fn general_merge_setup(args: &Args) -> serde_json::Value {
+    // Shape validation only — the fixture's chunk width comes from
+    // `general_merge_batch_rows`, which models the loader's real byte charge.
+    rfc023_limits::derive_chunk_plan(args.dims, "base", args.rows)
+        .expect("validated general-merge target chunk plan");
+    let batch_rows = general_merge_batch_rows(args.dims);
+    let root = general_merge_fixture_root(args);
+    assert!(
+        std::fs::read_dir(root)
+            .expect("read empty general-merge fixture root")
+            .next()
+            .is_none(),
+        "general-merge setup root must start empty"
+    );
+    let uri = root.to_str().expect("UTF-8 benchmark fixture root");
+
+    let init_start = Instant::now();
+    let db = Omnigraph::init(uri, &graph_schema(args.dims))
+        .await
+        .expect("initialize general-merge benchmark graph");
+    let init_ms = init_start.elapsed().as_millis() as u64;
+
+    // The committed target image.
+    let target_vectors = vector_json_patterns(args.dims, args.seed);
+    let (target_load_ms, max_target_json_chunk_bytes) = load_graph_rows(
+        &db,
+        "main",
+        "base",
+        args.rows,
+        batch_rows,
+        &target_vectors,
+        LoadMode::Overwrite,
+    )
+    .await;
+
+    let branch_start = Instant::now();
+    db.branch_create(GENERAL_MERGE_SOURCE_BRANCH)
+        .await
+        .expect("create general-merge source branch");
+    let branch_create_ms = branch_start.elapsed().as_millis() as u64;
+
+    // The branch delta: SAME keys, DIFFERENT embeddings. Upsert, so the row
+    // count never moves — every changed row must be reconciled against the
+    // target rather than adopted.
+    let source_vectors = vector_json_patterns(args.dims, args.seed ^ 0x0230_0384);
+    let source_start = Instant::now();
+    let mut cursor = 0;
+    let mut max_source_json_chunk_bytes = 0_u64;
+    while cursor < args.delta_rows {
+        let end = cursor
+            .saturating_add(batch_rows)
+            .min(args.delta_rows);
+        let jsonl = graph_jsonl_chunk("base", cursor, end, &source_vectors);
+        max_source_json_chunk_bytes = max_source_json_chunk_bytes.max(jsonl.len() as u64);
+        db.load(GENERAL_MERGE_SOURCE_BRANCH, &jsonl, LoadMode::Merge)
+            .await
+            .unwrap_or_else(|error| panic!("update source rows {cursor}..{end}: {error}"));
+        cursor = end;
+    }
+    let source_load_ms = source_start.elapsed().as_millis() as u64;
+
+    // Advance main on a disjoint key range so the merge is genuinely diverged.
+    let target_divergence_start = args.rows - GENERAL_MERGE_TARGET_DELTA_ROWS;
+    let diverge_vectors = vector_json_patterns(args.dims, args.seed ^ 0x0230_0385);
+    let diverge_start = Instant::now();
+    let diverge_jsonl = graph_jsonl_chunk(
+        "base",
+        target_divergence_start,
+        args.rows,
+        &diverge_vectors,
+    );
+    db.load("main", &diverge_jsonl, LoadMode::Merge)
+        .await
+        .expect("advance main after the branch forked");
+    let target_diverge_ms = diverge_start.elapsed().as_millis() as u64;
+
+    let verify_start = Instant::now();
+    let main_snapshot = db
+        .snapshot_of(ReadTarget::branch("main"))
+        .await
+        .expect("capture prepared main snapshot");
+    let main_table = main_snapshot
+        .open("node:Chunk")
+        .await
+        .expect("open prepared main table");
+    let setup_main_rows = main_table
+        .count_rows(None)
+        .await
+        .expect("count prepared main rows");
+    assert_eq!(
+        setup_main_rows, args.rows,
+        "upsert-only divergence must not change the main row count"
+    );
+    let setup_main_table_version = main_table.version();
+
+    let source_snapshot = db
+        .snapshot_of(ReadTarget::branch(GENERAL_MERGE_SOURCE_BRANCH))
+        .await
+        .expect("capture prepared source snapshot");
+    let source_table = source_snapshot
+        .open("node:Chunk")
+        .await
+        .expect("open prepared source table");
+    let setup_source_rows = source_table
+        .count_rows(None)
+        .await
+        .expect("count prepared source rows");
+    assert_eq!(
+        setup_source_rows, args.rows,
+        "upsert-only branch delta must not change the source row count"
+    );
+    let setup_source_table_version = source_table.version();
+    let setup_verify_ms = verify_start.elapsed().as_millis() as u64;
+
+    let setup_fingerprint = format!(
+        "general-merge-updates-v1:rows={}:delta={}:target_delta={}:dims={}:seed={}:\
+         main-v{}-rows{}:source-v{}-rows{}",
+        args.rows,
+        args.delta_rows,
+        GENERAL_MERGE_TARGET_DELTA_ROWS,
+        args.dims,
+        args.seed,
+        setup_main_table_version,
+        setup_main_rows,
+        setup_source_table_version,
+        setup_source_rows,
+    );
+
+    serde_json::json!({
+        "rows": args.rows,
+        "dims": args.dims,
+        "delta_rows": args.delta_rows,
+        "target_delta_rows": GENERAL_MERGE_TARGET_DELTA_ROWS,
+        "setup_fingerprint": setup_fingerprint,
+        "setup_main_rows": setup_main_rows,
+        "setup_source_rows": setup_source_rows,
+        "setup_main_table_version": setup_main_table_version,
+        "setup_source_table_version": setup_source_table_version,
+        "fixture_batch_rows": batch_rows,
+        "max_target_json_chunk_bytes": max_target_json_chunk_bytes,
+        "max_source_json_chunk_bytes": max_source_json_chunk_bytes,
+        "init_ms": init_ms,
+        "target_load_ms": target_load_ms,
+        "branch_create_ms": branch_create_ms,
+        "source_load_ms": source_load_ms,
+        "target_diverge_ms": target_diverge_ms,
+        "setup_verify_ms": setup_verify_ms,
+    })
+}
+
+/// Phase 2: the measured child. Opens the fixture and runs exactly one
+/// production `branch_merge`, then records wall time plus this process's peak
+/// RSS. The parent's `wait4` peak for this child is the memory number.
+pub(super) async fn general_merge_operation(args: &Args) -> serde_json::Value {
+    let root = general_merge_fixture_root(args);
+    let uri = root.to_str().expect("UTF-8 benchmark fixture root");
+    let open_start = Instant::now();
+    let db = Omnigraph::open(uri)
+        .await
+        .expect("fresh-open general-merge fixture");
+    let operation_open_ms = open_start.elapsed().as_millis() as u64;
+    let operation_pre_peak_rss_bytes = super::current_process_peak_rss_bytes();
+
+    let probes = MergeWriteProbes::default();
+    let operation_start = Instant::now();
+    let outcome = with_merge_write_probes(
+        probes.clone(),
+        db.branch_merge(GENERAL_MERGE_SOURCE_BRANCH, "main"),
+    )
+    .await
+    .expect("run production branch merge");
+    let operation_elapsed = operation_start.elapsed();
+    let operation_wall_ms = operation_elapsed.as_millis() as u64;
+    let operation_wall_us = u64::try_from(operation_elapsed.as_micros()).unwrap_or(u64::MAX);
+    let operation_post_peak_rss_bytes = super::current_process_peak_rss_bytes();
+    let operation_hwm_increase_bytes = operation_post_peak_rss_bytes
+        .checked_sub(operation_pre_peak_rss_bytes)
+        .filter(|increase| *increase > 0);
+
+    // Structural assertions: keep the run honest about which road it took.
+    assert_eq!(
+        outcome,
+        MergeOutcome::Merged,
+        "a diverged target must produce a three-way merge, not a fast-forward"
+    );
+    let ordered_cursor_scan_calls = probes.ordered_cursor_scan_calls();
+    assert!(
+        ordered_cursor_scan_calls > 0,
+        "general-merge scenario did not enter the ordered diff — it took a shortcut path \
+         and is not measuring the route issue #384 reports"
+    );
+    assert_eq!(
+        probes.strict_insert_preflight_calls(),
+        0,
+        "an update-only delta must not preflight strict inserts"
+    );
+
+    serde_json::json!({
+        "routing": "production-omnigraph-branch-merge-general-ordered-diff",
+        "measurement_boundary": "operation_wall_ms starts after the common fresh Omnigraph::open and covers Omnigraph::branch_merge; no post-op scan",
+        "production_path": true,
+        "baseline": false,
+        "operation_open_ms": operation_open_ms,
+        "operation_wall_ms": operation_wall_ms,
+        "operation_wall_us": operation_wall_us,
+        "operation_pre_peak_rss_bytes": operation_pre_peak_rss_bytes,
+        "operation_post_peak_rss_bytes": operation_post_peak_rss_bytes,
+        "operation_hwm_censored": operation_hwm_increase_bytes.is_none(),
+        "operation_hwm_increase_bytes": operation_hwm_increase_bytes,
+        "merge_outcome": "merged",
+        "probe_ordered_cursor_scan_calls": ordered_cursor_scan_calls,
+        "probe_ordered_cursor_batch_rows": probes.ordered_cursor_batch_rows(),
+        "probe_ordered_cursor_batch_bytes": probes.ordered_cursor_batch_bytes(),
+        "probe_stage_merge_insert_calls": probes.stage_merge_insert_calls(),
+        "probe_stage_merge_insert_rows": probes.stage_merge_insert_rows(),
+        "probe_stage_fenced_insert_calls": probes.stage_fenced_insert_calls(),
+        "probe_stage_fenced_insert_rows": probes.stage_fenced_insert_rows(),
+        "probe_stage_append_calls": probes.stage_append_calls(),
+        "probe_stage_append_rows": probes.stage_append_rows(),
+        "probe_scan_staged_combined_calls": probes.scan_staged_combined_calls(),
+        "probe_strict_insert_preflight_calls": probes.strict_insert_preflight_calls(),
+        "probe_validation_scan_batches": probes.validation_scan_batches(),
+        "probe_validation_scan_projected_bytes": probes.validation_scan_projected_bytes(),
+        "probe_stage_vector_index_calls": probes.stage_vector_index_calls(),
+        "probe_phase_us": merge_phase_metrics(&probes),
+    })
+}
+
+/// Phase 3: unmeasured correctness check. The merged main must still hold
+/// exactly `--rows` rows, and both deltas must be visible.
+pub(super) async fn general_merge_verify(args: &Args) -> serde_json::Value {
+    let root = general_merge_fixture_root(args);
+    let uri = root.to_str().expect("UTF-8 benchmark fixture root");
+    let verify_start = Instant::now();
+    let db = Omnigraph::open(uri)
+        .await
+        .expect("reopen merged general-merge fixture");
+    let snapshot = db
+        .snapshot_of(ReadTarget::branch("main"))
+        .await
+        .expect("capture merged main snapshot");
+    let table = snapshot
+        .open("node:Chunk")
+        .await
+        .expect("open merged main table");
+    let final_rows = table
+        .count_rows(None)
+        .await
+        .expect("count merged main rows");
+    assert_eq!(
+        final_rows, args.rows,
+        "an upsert-only merge must not change the target row count"
+    );
+    let verify_wall_ms = verify_start.elapsed().as_millis() as u64;
+
+    serde_json::json!({
+        "verify_wall_ms": verify_wall_ms,
+        "final_rows": final_rows,
+        "verify_main_table_version": table.version(),
     })
 }

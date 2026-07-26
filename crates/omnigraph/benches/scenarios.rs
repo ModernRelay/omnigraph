@@ -80,6 +80,11 @@ struct Args {
     selectivity: f64,
     /// ANN k (the query's `limit`) for nearest-prefilter.
     k: usize,
+    /// How many already-committed rows the source branch MODIFIES, for
+    /// `general-merge-updates`. This is the branch delta; `--rows` is the
+    /// target size. Holding this small while `--rows` grows is the whole
+    /// point of that scenario: it separates delta cost from target cost.
+    delta_rows: usize,
     memory_cap_mb: Option<u64>,
     /// Results-log override; see `results_path`.
     out: Option<String>,
@@ -110,6 +115,7 @@ impl Args {
             runs: 1,
             selectivity: 0.05,
             k: 10,
+            delta_rows: 50,
             memory_cap_mb: None,
             out: None,
             baseline: false,
@@ -133,6 +139,9 @@ impl Args {
                     args.selectivity = take("--selectivity").parse().expect("--selectivity")
                 }
                 "--k" => args.k = take("--k").parse().expect("--k"),
+                "--delta-rows" => {
+                    args.delta_rows = take("--delta-rows").parse().expect("--delta-rows")
+                }
                 "--out" => args.out = Some(take("--out")),
                 "--memory-cap-mb" => {
                     args.memory_cap_mb = Some(take("--memory-cap-mb").parse().expect("cap"))
@@ -163,6 +172,8 @@ impl Args {
             self.selectivity.to_string(),
             "--k".into(),
             self.k.to_string(),
+            "--delta-rows".into(),
+            self.delta_rows.to_string(),
             "--child".into(),
         ];
         if self.baseline {
@@ -199,8 +210,9 @@ fn main() {
     if args.scenario.is_empty() {
         eprintln!(
             "usage: --scenario <merge-all-changed|nearest-prefilter|fenced-small-upsert|\
-             fenced-adopt-all-new> [--rows N] [--dims D] \
-             [--seed S] [--runs K] [--selectivity F] [--k K] [--memory-cap-mb M]"
+             fenced-adopt-all-new|general-merge-updates> [--rows N] [--dims D] \
+             [--seed S] [--runs K] [--selectivity F] [--k K] [--delta-rows N] \
+             [--memory-cap-mb M]"
         );
         // `cargo bench` with no args must exit 0 so the target stays inert in
         // any blanket `cargo bench` invocation.
@@ -216,7 +228,10 @@ fn main() {
     }
     let mut aggregate_exit_status = 0_i64;
     for run in 0..args.runs {
-        let record = if args.scenario == "fenced-adopt-all-new" {
+        let record = if matches!(
+            args.scenario.as_str(),
+            "fenced-adopt-all-new" | "general-merge-updates"
+        ) {
             run_phased_adopt_once(&args, run)
         } else {
             run_once(&args, run)
@@ -579,6 +594,7 @@ fn run_phased_adopt_once(args: &Args, run: usize) -> serde_json::Value {
             "seed": args.seed,
             "selectivity": args.selectivity,
             "k": args.k,
+            "delta_rows": args.delta_rows,
             "memory_cap_mb": args.memory_cap_mb,
             "baseline": args.baseline,
         },
@@ -701,6 +717,15 @@ fn run_child(args: &Args) {
             }
             ("fenced-adopt-all-new", Some("verify")) => {
                 rfc023_scenarios::fenced_adopt_verify(args).await
+            }
+            ("general-merge-updates", Some("setup")) => {
+                rfc023_scenarios::general_merge_setup(args).await
+            }
+            ("general-merge-updates", Some("operation")) => {
+                rfc023_scenarios::general_merge_operation(args).await
+            }
+            ("general-merge-updates", Some("verify")) => {
+                rfc023_scenarios::general_merge_verify(args).await
             }
             ("merge-all-changed", None) => merge_all_changed(args).await,
             ("nearest-prefilter", None) => nearest_prefilter(args).await,
