@@ -365,7 +365,7 @@ them explicit.
   needs a cross-process serialization primitive (for example, a lease-based use
   of the schema-apply lock branch). Design and test that fence before promoting
   multi-process write topologies.
-  Within one process, RFC-029 narrows the operational cost of this boundary:
+  Within one process, RFC-030 narrows the operational cost of this boundary:
   the write-entry heal remains roll-forward-only, but the HTTP server now
   shields armed writes from caller cancellation and, on `RecoveryRequired`,
   performs a supervised in-process reopen whose Full sweep resolves

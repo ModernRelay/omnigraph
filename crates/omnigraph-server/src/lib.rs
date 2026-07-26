@@ -250,7 +250,7 @@ pub struct GraphRouting {
     pub registry: Arc<GraphRegistry>,
     pub config_path: Option<PathBuf>,
     /// Clones of every configured graph's startup config, keyed for the
-    /// RFC-029 supervision loop (W3 boot retry + W2(b) reopen) — healthy
+    /// RFC-030 supervision loop (W3 boot retry + W2(b) reopen) — healthy
     /// graphs included, since a supervised reopen needs the config too.
     /// Empty in single mode (no supervision surface there).
     pub startup_configs: Arc<HashMap<GraphKey, GraphStartupConfig>>,
@@ -268,7 +268,7 @@ pub struct AppState {
     /// Per-actor admission control. Process-wide (not per-graph) —
     /// see MR-668 decision Q6.
     workload: Arc<workload::WorkloadController>,
-    /// RFC-029 supervision notify channel. Set once by `spawn_supervision`;
+    /// RFC-030 supervision notify channel. Set once by `spawn_supervision`;
     /// `request_reopen` sends on it (and silently drops when supervision is
     /// not running — single mode, or tests that don't spawn it).
     supervisor_tx: Arc<std::sync::OnceLock<tokio::sync::mpsc::UnboundedSender<GraphKey>>>,
@@ -586,7 +586,7 @@ impl AppState {
         )
     }
 
-    /// Multi-mode constructor carrying RFC-029 boot supervision state:
+    /// Multi-mode constructor carrying RFC-030 boot supervision state:
     /// quarantine entries for graphs whose open failed, and the retained
     /// startup configs the supervision loop reopens from. `new_multi`
     /// delegates here with empty supervision state.
@@ -622,7 +622,7 @@ impl AppState {
         &self.routing
     }
 
-    /// Start the RFC-029 supervision loop (W3 boot retry + W2(b) supervised
+    /// Start the RFC-030 supervision loop (W3 boot retry + W2(b) supervised
     /// reopen) for this state's registry. Idempotent: a second call warns
     /// and returns a completed no-op handle. `serve()` calls this with
     /// production pacing; in-process tests call it directly with
@@ -645,7 +645,7 @@ impl AppState {
         tokio::spawn(supervisor.run())
     }
 
-    /// RFC-029 W2(b) trigger B: a shielded write surfaced `RecoveryRequired`
+    /// RFC-030 W2(b) trigger B: a shielded write surfaced `RecoveryRequired`
     /// for this graph — ask the supervision loop to re-drive the open (whose
     /// Full sweep resolves the residual). Silently drops when supervision is
     /// not running; the documented reopen-or-restart remedy still applies.
@@ -768,7 +768,7 @@ impl ApiError {
     }
 
     /// 503 without a closed `ErrorCode` — mirrors the recovery-required
-    /// 503 shape (RFC-029 W3: quarantined graphs are configured-but-healing,
+    /// 503 shape (RFC-030 W3: quarantined graphs are configured-but-healing,
     /// "retry later", not "no such resource").
     pub fn service_unavailable(message: impl Into<String>) -> Self {
         Self {
@@ -1357,7 +1357,7 @@ pub async fn serve(config: ServerConfig) -> Result<()> {
         }
     };
 
-    // RFC-029 W3/W2(b): start the supervision loop before serving. Its task
+    // RFC-030 W3/W2(b): start the supervision loop before serving. Its task
     // exits on its own when the state (and with it the notify sender) drops
     // at shutdown; graphs quarantined at boot begin converging immediately.
     let _supervision = state.spawn_supervision(supervisor::SupervisorConfig::production());
@@ -1408,7 +1408,7 @@ pub async fn open_multi_graph_state(
     };
 
     let configured_graphs = graphs.len();
-    // Retain every config for the RFC-029 supervision loop (healthy graphs
+    // Retain every config for the RFC-030 supervision loop (healthy graphs
     // included: a supervised reopen after RecoveryRequired needs them too).
     // A config whose graph id cannot form a key is unquarantinable; its open
     // fails below and it keeps the historical warn-and-drop behavior.

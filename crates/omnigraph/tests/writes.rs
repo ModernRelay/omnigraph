@@ -311,16 +311,16 @@ async fn stale_non_strict_insert_reprepares_from_live_branch_state() {
 /// mid-flight must not leave any graph-level *staging* state behind (no
 /// `__run__*` branches, no `_graph_runs.lance`).
 ///
-/// Scope note (RFC-029): "no graph-level state" is narrower than it sounds.
+/// Scope note (RFC-030): "no graph-level state" is narrower than it sounds.
 /// Under the RFC-022 protocol a drop after the recovery sidecar is armed CAN
 /// leave that sidecar plus a committed-but-unpublished table effect on disk —
 /// recovery-covered residue, resolved by the write-entry heal or the next
 /// read-write open. This test cannot observe that residue: its final
 /// `Omnigraph::open` runs the Full recovery sweep before any assertion runs.
-/// The residue lifecycle is pinned by `rfc029_probe.rs`, and the HTTP
+/// The residue lifecycle is pinned by `rfc030_probe.rs`, and the HTTP
 /// boundary shields cancellation entirely (`omnigraph-server`'s
 /// `tests/failpoints.rs`), so an SDK caller dropping an engine future
-/// mid-protocol is the only remaining cancellation source (RFC-029 W1
+/// mid-protocol is the only remaining cancellation source (RFC-030 W1
 /// Stage 2 territory).
 ///
 /// The test deliberately does NOT assert that the manifest version is

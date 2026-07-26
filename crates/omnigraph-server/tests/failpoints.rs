@@ -1,4 +1,4 @@
-//! Feature-gated fault-injection tests at the HTTP boundary (RFC-029).
+//! Feature-gated fault-injection tests at the HTTP boundary (RFC-030).
 //!
 //! Enabled with `--features failpoints` (a passthrough to the engine's
 //! failpoint registry; the server defines no hooks of its own). Every test is
@@ -53,7 +53,7 @@ fn recovery_dir_entries(graph: &std::path::Path) -> Vec<String> {
     }
 }
 
-/// RFC-029 W1 Stage 1: a mutation whose request future is dropped mid-protocol
+/// RFC-030 W1 Stage 1: a mutation whose request future is dropped mid-protocol
 /// (the client disconnected) must still run to its own terminal state — the
 /// commit protocol publishes and deletes its recovery sidecar with NO further
 /// request and NO graph reopen.
@@ -73,7 +73,7 @@ fn recovery_dir_entries(graph: &std::path::Path) -> Vec<String> {
 /// heal and a reopen would run the Full sweep, either of which resolves the
 /// residual and would mask an unshielded server (the exact blind spot of the
 /// engine's older cancellation test — see
-/// `crates/omnigraph/tests/rfc029_probe.rs`).
+/// `crates/omnigraph/tests/rfc030_probe.rs`).
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 #[serial]
 async fn mutation_dropped_mid_protocol_completes_and_leaves_no_residual() {
@@ -114,7 +114,7 @@ async fn mutation_dropped_mid_protocol_completes_and_leaves_no_residual() {
             Instant::now() < deadline,
             "dropped mutation abandoned its armed protocol: __recovery/ still \
              holds {residue:?} after the deadline with no further requests — \
-             the write was not shielded from caller cancellation (RFC-029 W1)",
+             the write was not shielded from caller cancellation (RFC-030 W1)",
         );
         tokio::time::sleep(Duration::from_millis(25)).await;
     }
@@ -154,11 +154,11 @@ async fn mutation_dropped_mid_protocol_completes_and_leaves_no_residual() {
     );
 }
 
-/// RFC-029 W2(b): a write surfacing `RecoveryRequired` (an unresolved
+/// RFC-030 W2(b): a write surfacing `RecoveryRequired` (an unresolved
 /// rollback-class recovery residual) triggers a supervised in-process reopen
 /// whose Full sweep resolves the residual — the graph heals on the next
 /// writes WITHOUT a process restart. This is the HTTP twin of
-/// `rfc029_probe.rs` phases 2–3.
+/// `rfc030_probe.rs` phases 2–3.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 #[serial]
 async fn recovery_required_write_triggers_supervised_reopen_and_heals() {
@@ -239,7 +239,7 @@ async fn recovery_required_write_triggers_supervised_reopen_and_heals() {
         }
         assert!(
             Instant::now() < deadline,
-            "RecoveryRequired never healed without a restart (RFC-029 W2(b)); \
+            "RecoveryRequired never healed without a restart (RFC-030 W2(b)); \
              last status: {}",
             response.status(),
         );

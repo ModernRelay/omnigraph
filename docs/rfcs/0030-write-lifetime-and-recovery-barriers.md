@@ -1,6 +1,6 @@
 ---
 type: spec
-title: "RFC-029 — Write-protocol lifetime ownership and recovery resolution barriers"
+title: "RFC-030 — Write-protocol lifetime ownership and recovery resolution barriers"
 description: Shields armed write protocols from caller cancellation, resolves rollback-class recovery residuals at the write-entry gate instead of process restart, and turns server-boot quarantine into an observable, converging state.
 status: draft
 tags: [eng, rfc, writes, recovery, cancellation, server, availability, omnigraph]
@@ -8,7 +8,7 @@ timestamp: 2026-07-20
 owner: OmniGraph maintainers
 ---
 
-# RFC-029: Write-protocol lifetime ownership and recovery resolution barriers
+# RFC-030: Write-protocol lifetime ownership and recovery resolution barriers
 
 **Status:** Draft
 **Date:** 2026-07-20
@@ -457,7 +457,7 @@ invariant-review artifact for the W2(a) relaxation when it lands.
 Per the repo's test-first rule, each change lands as a red test commit
 followed by the fix commit.
 
-**Baseline pin (checked in, green):** `tests/rfc029_probe.rs` — a
+**Baseline pin (checked in, green):** `tests/rfc030_probe.rs` — a
 feature-gated failpoint test pinning the *current* lifecycle this RFC
 changes, at the engine boundary, in three deterministic phases: (1)
 cancelling a mutation future parked at the sidecar-confirmation failpoint

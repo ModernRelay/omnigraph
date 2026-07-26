@@ -34,7 +34,7 @@ fn manifest_dir() -> PathBuf {
 
 /// Production call sites live under each crate's `src`; test call sites live
 /// in the failpoint integration binaries (engine, cluster, and — since
-/// RFC-029 — the server's HTTP-boundary suite). This guard file is
+/// RFC-030 — the server's HTTP-boundary suite). This guard file is
 /// deliberately not in the set (it names the patterns as literals itself).
 fn files_to_scan() -> Vec<PathBuf> {
     let engine = manifest_dir();

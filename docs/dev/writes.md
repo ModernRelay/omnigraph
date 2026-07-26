@@ -1266,14 +1266,14 @@ drift to reconcile.
 The cancellation case (future drop mid-mutation) inherits the same
 guarantee **during op execution**: the in-memory accumulator evaporates
 with the dropped task and no Lance write was ever issued. A drop
-*after* the commit phase begins is a different animal (RFC-029): the
+*after* the commit phase begins is a different animal (RFC-030): the
 recovery sidecar is armed before the first durable effect, so a future
 dropped between arm and sidecar delete leaves recovery-covered residue —
 a sidecar plus possibly a committed-but-unpublished table effect —
 resolved by the write-entry heal (roll-forward-eligible residue) or the
 next read-write open's Full sweep (rollback-class residue). The residue
-lifecycle is pinned by `tests/rfc029_probe.rs`. The HTTP server shields
-its write handlers from caller cancellation entirely (RFC-029 W1
+lifecycle is pinned by `tests/rfc030_probe.rs`. The HTTP server shields
+its write handlers from caller cancellation entirely (RFC-030 W1
 Stage 1: the protocol runs on a server-owned task and completes
 regardless of client fate — `omnigraph-server/src/handlers.rs::
 shielded_write`), so post-arm cancellation is reachable only by an

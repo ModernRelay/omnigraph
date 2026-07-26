@@ -30,7 +30,7 @@ use crate::identity::GraphKey;
 use crate::policy::PolicyEngine;
 use crate::queries::QueryRegistry;
 
-/// Supervision state for a configured graph whose open failed (RFC-029 W3).
+/// Supervision state for a configured graph whose open failed (RFC-030 W3).
 ///
 /// A quarantined graph is *configured but not serving*: its startup config is
 /// retained, the supervision loop retries the full `open_single_graph` with
@@ -53,7 +53,7 @@ pub struct QuarantineInfo {
     /// Folded into [`RegistrySnapshot::any_per_graph_policy`] so bearer auth
     /// stays required while the policy-bearing graph is quarantined — today
     /// such a graph silently vanishes from the registry, so this is strictly
-    /// safer than the pre-RFC-029 behavior.
+    /// safer than the pre-RFC-030 behavior.
     pub policy_configured: bool,
 }
 
@@ -91,7 +91,7 @@ pub struct GraphHandle {
 pub struct RegistrySnapshot {
     pub graphs: HashMap<GraphKey, Arc<GraphHandle>>,
     /// Configured graphs whose open failed and are under supervision
-    /// (RFC-029 W3). Disjoint from `graphs` by construction: the writer
+    /// (RFC-030 W3). Disjoint from `graphs` by construction: the writer
     /// methods maintain "a key is never in both maps" under the `mutate`
     /// mutex, and [`RegistrySnapshot::with_quarantined`] debug-asserts it.
     pub quarantined: HashMap<GraphKey, QuarantineInfo>,
@@ -114,7 +114,7 @@ impl RegistrySnapshot {
         Self::with_quarantined(graphs, HashMap::new())
     }
 
-    /// Build a snapshot carrying quarantine entries (RFC-029 W3).
+    /// Build a snapshot carrying quarantine entries (RFC-030 W3).
     pub fn with_quarantined(
         graphs: HashMap<GraphKey, Arc<GraphHandle>>,
         quarantined: HashMap<GraphKey, QuarantineInfo>,
@@ -144,7 +144,7 @@ pub enum RegistryLookup {
     /// Graph is open and ready to serve.
     Ready(Arc<GraphHandle>),
     /// Graph is configured but not serving: its open failed and the
-    /// supervision loop is retrying (RFC-029 W3). Handlers respond 503 —
+    /// supervision loop is retrying (RFC-030 W3). Handlers respond 503 —
     /// "retry later", not "no such resource".
     Quarantined(QuarantineInfo),
     /// Graph is not in the registry (never existed, or was unregistered in a
@@ -172,7 +172,7 @@ pub struct GraphRegistry {
     snapshot: ArcSwap<RegistrySnapshot>,
     /// Serializes runtime mutations (`publish`, `set_quarantined`, and the
     /// test-only `insert`) so read-modify-write cycles over the `ArcSwap`
-    /// snapshot are atomic. Ungated from `#[cfg(test)]` by RFC-029 W3/W2(b):
+    /// snapshot are atomic. Ungated from `#[cfg(test)]` by RFC-030 W3/W2(b):
     /// the supervision loop is the anticipated production consumer the
     /// original gate's doc comment named.
     mutate: Mutex<()>,
@@ -194,7 +194,7 @@ impl GraphRegistry {
     }
 
     /// Boot-time constructor carrying both healthy handles and quarantined
-    /// entries (RFC-029 W3). Rejects duplicate `GraphKey`s and duplicate
+    /// entries (RFC-030 W3). Rejects duplicate `GraphKey`s and duplicate
     /// URIs among the handles; quarantined keys must be disjoint from the
     /// serving keys (the boot loop guarantees it — a graph either opened or
     /// it didn't).
@@ -237,7 +237,7 @@ impl GraphRegistry {
     }
 
     /// Lock-free read. Returns `Ready` if the graph is serving,
-    /// `Quarantined` if it is configured-but-healing (RFC-029 W3), and
+    /// `Quarantined` if it is configured-but-healing (RFC-030 W3), and
     /// `Gone` otherwise.
     pub fn get(&self, key: &GraphKey) -> RegistryLookup {
         let snapshot = self.snapshot.load();
@@ -276,7 +276,7 @@ impl GraphRegistry {
     /// **Test-only surface.** No production code reaches this — startup
     /// uses `from_boot`, and production runtime mutation goes through
     /// [`GraphRegistry::publish`] (replace-allowed) /
-    /// [`GraphRegistry::set_quarantined`], the RFC-029 consumers that
+    /// [`GraphRegistry::set_quarantined`], the RFC-030 consumers that
     /// ungated the `mutate` mutex. `insert` stays test-only because its
     /// add-only duplicate-key semantics exist to pin the mutex
     /// linearization contract, not to serve traffic.
@@ -311,7 +311,7 @@ impl GraphRegistry {
         Ok(())
     }
 
-    /// RCU publish (RFC-029 W3/W2(b)): install `handle` for its key, clearing
+    /// RCU publish (RFC-030 W3/W2(b)): install `handle` for its key, clearing
     /// any quarantine entry and replacing any prior serving handle. Same-key
     /// replacement is the supervised-reopen swap — in-flight requests on the
     /// old handle finish on their own `Arc` clone (the engine-survival
@@ -346,7 +346,7 @@ impl GraphRegistry {
     }
 
     /// Record a new or updated quarantine entry for a key with no serving
-    /// handle (RFC-029 W3). **No-op if the key is currently serving**: a
+    /// handle (RFC-030 W3). **No-op if the key is currently serving**: a
     /// failed supervised reopen of a still-healthy graph must not take it
     /// down — the old handle keeps serving and the retry reschedules.
     pub async fn set_quarantined(&self, key: GraphKey, info: QuarantineInfo) {
@@ -710,7 +710,7 @@ mod tests {
         }
     }
 
-    /// RFC-029 W3/W2(b): `publish` installs a handle, clears its quarantine
+    /// RFC-030 W3/W2(b): `publish` installs a handle, clears its quarantine
     /// entry, and replaces a prior serving handle for the same key (the
     /// supervised-reopen swap `insert` deliberately refuses).
     #[tokio::test]
@@ -761,7 +761,7 @@ mod tests {
         }
     }
 
-    /// RFC-029 W3: a failed supervised reopen of a still-serving graph must
+    /// RFC-030 W3: a failed supervised reopen of a still-serving graph must
     /// not take it down — `set_quarantined` is a no-op while the key serves.
     #[tokio::test]
     async fn set_quarantined_is_noop_while_key_is_serving() {
@@ -793,7 +793,7 @@ mod tests {
         }
     }
 
-    /// RFC-029 W3 auth-flap closure: a quarantined graph whose config
+    /// RFC-030 W3 auth-flap closure: a quarantined graph whose config
     /// declares a per-graph policy keeps `any_per_graph_policy` true, so
     /// bearer auth stays required while it heals.
     #[tokio::test]

@@ -761,7 +761,7 @@ pub fn read_target_output(target: &ReadTarget) -> ReadTargetOutput {
 
 // ─── MR-668 — management endpoint shapes ──────────────────────────────────
 
-/// Serving state of a configured graph (RFC-029 W3).
+/// Serving state of a configured graph (RFC-030 W3).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize, ToSchema)]
 #[serde(rename_all = "snake_case")]
 pub enum GraphStatus {
@@ -775,7 +775,7 @@ pub enum GraphStatus {
 }
 
 /// Quarantine detail on a [`GraphInfo`] whose `status` is `quarantined`
-/// (RFC-029 W3). Timestamps are seconds since the Unix epoch.
+/// (RFC-030 W3). Timestamps are seconds since the Unix epoch.
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
 pub struct GraphQuarantineInfo {
     /// When the graph entered quarantine (this boot), Unix seconds.
@@ -791,13 +791,13 @@ pub struct GraphQuarantineInfo {
 /// One entry in the response from `GET /graphs`. Cluster operators
 /// consume this list to discover which graphs the server is currently
 /// serving — including graphs that are configured but quarantined
-/// (RFC-029 W3), so an unhealthy graph is visible instead of silently
+/// (RFC-030 W3), so an unhealthy graph is visible instead of silently
 /// absent.
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
 pub struct GraphInfo {
     pub graph_id: String,
     pub uri: String,
-    /// Additive (RFC-029): absent in older responses, so deserialization
+    /// Additive (RFC-030): absent in older responses, so deserialization
     /// defaults to `serving` for wire compatibility.
     #[serde(default)]
     pub status: GraphStatus,

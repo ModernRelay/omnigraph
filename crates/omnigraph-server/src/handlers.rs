@@ -81,7 +81,7 @@ pub(crate) async fn server_graphs_list(
             quarantine: None,
         })
         .collect();
-    // RFC-029 W3: quarantined graphs are configured state and must be
+    // RFC-030 W3: quarantined graphs are configured state and must be
     // visible, not silently absent. Timestamps flatten to Unix seconds.
     let unix_secs = |t: std::time::SystemTime| {
         t.duration_since(std::time::UNIX_EPOCH)
@@ -298,7 +298,7 @@ pub(crate) async fn resolve_graph_handle(
     let key = GraphKey::cluster(graph_id.clone());
     let handle = match registry.get(&key) {
         RegistryLookup::Ready(handle) => handle,
-        // RFC-029 W3: configured-but-healing is "retry later", not "no such
+        // RFC-030 W3: configured-but-healing is "retry later", not "no such
         // resource" — the supervision loop is re-driving the open.
         RegistryLookup::Quarantined(info) => {
             return Err(ApiError::service_unavailable(format!(
@@ -673,7 +673,7 @@ pub(crate) async fn server_export(
         .into_response())
 }
 
-/// RFC-029 W1 Stage 1: run an armed write protocol on a detached task so
+/// RFC-030 W1 Stage 1: run an armed write protocol on a detached task so
 /// dropping the request future (client disconnect) cannot abandon the
 /// protocol mid-flight. The caller still awaits the result — the HTTP
 /// contract is unchanged; only abandonment semantics change. The admission
@@ -695,7 +695,7 @@ where
     let result = tokio::spawn(work)
         .await
         .map_err(|join_err| ApiError::internal(format!("write protocol task failed: {join_err}")))?;
-    // RFC-029 W2(b) trigger B: an unresolved rollback-class recovery
+    // RFC-030 W2(b) trigger B: an unresolved rollback-class recovery
     // residual wedges this graph's writes until a read-write open runs the
     // Full sweep. Every shielded writer funnels through here, so this one
     // chokepoint arms the supervised reopen for all of them.

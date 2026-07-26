@@ -1,4 +1,4 @@
-//! RFC-029 unified graph supervision (W3 boot retry + W2(b) supervised
+//! RFC-030 unified graph supervision (W3 boot retry + W2(b) supervised
 //! reopen).
 //!
 //! One server-owned task with per-graph retry state, fed by two triggers:
@@ -75,7 +75,7 @@ pub(crate) struct GraphSupervisor {
 }
 
 impl GraphSupervisor {
-    /// The RFC-029 supervision loop. Seeds retry state from the registry's
+    /// The RFC-030 supervision loop. Seeds retry state from the registry's
     /// boot-time quarantine entries (trigger A), then selects over reopen
     /// notifications (trigger B — retried immediately, deduped while
     /// pending) and the earliest scheduled retry. A due graph gets one full

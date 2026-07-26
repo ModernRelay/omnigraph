@@ -28,7 +28,7 @@ pending recovery sidecars and graph-specific startup failures quarantine
 that graph instead; the server logs startup diagnostics and serves the
 remaining healthy graphs.
 
-Quarantine is a **converging, observable state** (RFC-029): the server's
+Quarantine is a **converging, observable state** (RFC-030): the server's
 supervision loop retries the full graph open with capped exponential backoff
 (5 s initial, ×2, 10 min cap, ±10 % jitter), so a graph that failed on a
 transient fault returns to service without a restart. Meanwhile `GET /graphs`
@@ -241,7 +241,7 @@ and `/schema/apply`. Read-only endpoints (`/snapshot`, `/query`, `/read`,
 `/export`, `/branches` GET, `/commits`, `/schema` GET) are not
 admission-gated.
 
-## Client disconnects during writes (RFC-029)
+## Client disconnects during writes (RFC-030)
 
 Once a write handler passes authorization and admission, the engine's commit
 protocol runs on a server-owned task, detached from the request connection.

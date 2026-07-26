@@ -1,4 +1,4 @@
-//! RFC-029 behavior probe: pins the current cancellation-residual lifecycle
+//! RFC-030 behavior probe: pins the current cancellation-residual lifecycle
 //! at the engine boundary.
 //!
 //! Three deterministic phases, each pinning one claim the RFC's design rests
@@ -6,7 +6,7 @@
 //!
 //! 1. **Bug 1 (torn-by-cancellation):** dropping a mutation future parked at
 //!    the sidecar-confirmation failpoint leaves its recovery sidecar on disk —
-//!    no drop guard compensates. (Empirical nuance, recorded in RFC-029: the
+//!    no drop guard compensates. (Empirical nuance, recorded in RFC-030: the
 //!    residual's *class* is backend-dependent. On local FS the in-flight
 //!    confirmation write runs on `spawn_blocking` and completes even after the
 //!    future is dropped, so the leaked sidecar usually lands
@@ -48,7 +48,7 @@ fn recovery_dir_entries(uri: &str) -> Vec<String> {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 #[serial]
-async fn rfc029_cancellation_leaks_sidecar_armed_residual_wedges_and_reopen_heals() {
+async fn rfc030_cancellation_leaks_sidecar_armed_residual_wedges_and_reopen_heals() {
     let dir = tempfile::tempdir().unwrap();
     let uri = dir.path().to_string_lossy().into_owned();
 

@@ -539,7 +539,7 @@ rules:
     assert_eq!(ready, vec!["good"]);
     let app = build_app(state);
 
-    // RFC-029 W3: a failed boot open quarantines the graph as OBSERVABLE,
+    // RFC-030 W3: a failed boot open quarantines the graph as OBSERVABLE,
     // CONFIGURED state — not silent absence. `GET /graphs` lists both graphs
     // with a status discriminator and quarantine detail; routes under the
     // quarantined graph answer 503 (retry later), while a never-configured id
@@ -614,7 +614,7 @@ rules:
     assert_eq!(status, StatusCode::NOT_FOUND, "{body}");
 }
 
-/// RFC-029 W3: quarantine is a CONVERGING state, not a terminal one. A graph
+/// RFC-030 W3: quarantine is a CONVERGING state, not a terminal one. A graph
 /// whose boot open failed must reach `serving` without a process restart
 /// once the fault clears — the supervision loop re-drives the full
 /// `open_single_graph` with capped backoff and RCU-publishes the healed
@@ -716,7 +716,7 @@ rules:
         assert!(
             std::time::Instant::now() < deadline,
             "quarantined graph never converged to serving without a restart \
-             (RFC-029 W3); last listing: {body}"
+             (RFC-030 W3); last listing: {body}"
         );
         tokio::time::sleep(std::time::Duration::from_millis(25)).await;
     }
