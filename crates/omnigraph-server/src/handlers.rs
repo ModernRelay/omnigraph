@@ -692,19 +692,26 @@ where
     T: Send + 'static,
     F: std::future::Future<Output = std::result::Result<T, ApiError>> + Send + 'static,
 {
-    let result = tokio::spawn(work)
-        .await
-        .map_err(|join_err| ApiError::internal(format!("write protocol task failed: {join_err}")))?;
-    // RFC-030 W2(b) trigger B: an unresolved rollback-class recovery
-    // residual wedges this graph's writes until a read-write open runs the
-    // Full sweep. Every shielded writer funnels through here, so this one
-    // chokepoint arms the supervised reopen for all of them.
-    if let Err(err) = &result
-        && err.recovery_required.is_some()
-    {
-        state.request_reopen(key);
-    }
-    result
+    // RFC-030 effect-envelope shielding: the trigger-B notification lives
+    // INSIDE the spawned task, so it is owned by the protocol and survives
+    // caller cancellation — a disconnected client's write that surfaces
+    // RecoveryRequired still arms the supervised reopen. (An unresolved
+    // rollback-class residual wedges this graph's writes until a read-write
+    // open runs the Full sweep; every shielded writer funnels through this
+    // one chokepoint.) The handler-side await below is pure observation.
+    let state = state.clone();
+    let key = key.clone();
+    tokio::spawn(async move {
+        let result = work.await;
+        if let Err(err) = &result
+            && err.recovery_required.is_some()
+        {
+            state.request_reopen(&key);
+        }
+        result
+    })
+    .await
+    .map_err(|join_err| ApiError::internal(format!("write protocol task failed: {join_err}")))?
 }
 
 /// Shared implementation behind `POST /mutate` (canonical) and
@@ -1732,35 +1739,41 @@ pub(crate) async fn server_branch_merge(
         .workload
         .try_admit(&actor_arc, 256)
         .map_err(ApiError::from_workload_reject)?;
-    let outcome = {
+    // RFC-030 effect-envelope shielding: `merge` and the optional
+    // `delete_branch` follow-up are ONE composite operation from the
+    // client's perspective, so ONE shielded task owns the admission guard
+    // and both protocols. A disconnect can no longer split the composite
+    // (merge landing, deletion silently skipped), and the admission slot
+    // spans both protocols as it did before the shield.
+    let (outcome, branch_deleted, branch_delete_error) = {
         let handle = Arc::clone(&handle);
         let source = request.source.clone();
         let target = target.clone();
-        let actor_id: Option<String> = actor_id.map(str::to_string);
+        let actor_owned: Option<ResolvedActor> =
+            actor.as_ref().map(|Extension(actor)| actor.clone());
+        let delete_branch = request.delete_branch;
         shielded_write(&state, &handle.key.clone(), async move {
             let _admission = admission;
-            handle
+            let outcome = handle
                 .engine
-                .branch_merge_as(&source, &target, actor_id.as_deref())
+                .branch_merge_as(
+                    &source,
+                    &target,
+                    actor_owned.as_ref().map(|actor| actor.actor_id.as_ref()),
+                )
                 .await
-                .map_err(ApiError::from_omni)
+                .map_err(ApiError::from_omni)?;
+            let (branch_deleted, branch_delete_error) = if delete_branch {
+                match delete_merged_source_branch(&handle, actor_owned.as_ref(), &source).await {
+                    Ok(()) => (Some(true), None),
+                    Err(message) => (Some(false), Some(message)),
+                }
+            } else {
+                (None, None)
+            };
+            Ok((outcome, branch_deleted, branch_delete_error))
         })
         .await?
-    };
-    let (branch_deleted, branch_delete_error) = if request.delete_branch {
-        match delete_merged_source_branch(
-            &state,
-            &handle,
-            actor.as_ref().map(|Extension(a)| a),
-            &request.source,
-        )
-        .await
-        {
-            Ok(()) => (Some(true), None),
-            Err(message) => (Some(false), Some(message)),
-        }
-    } else {
-        (None, None)
     };
     Ok(Json(BranchMergeOutput {
         source: request.source,
@@ -1778,7 +1791,6 @@ pub(crate) async fn server_branch_merge(
 /// operational error — into a message instead of an error status: the merge is
 /// already durable, so the request must not report failure for it.
 async fn delete_merged_source_branch(
-    state: &AppState,
     handle: &Arc<GraphHandle>,
     actor: Option<&ResolvedActor>,
     source: &str,
@@ -1796,23 +1808,16 @@ async fn delete_merged_source_branch(
         Ok(Authz::Denied(message)) => return Err(message),
         Err(err) => return Err(err.message),
     }
-    // Its own armed protocol (delete after the already-durable merge), so it
-    // gets its own cancellation shield; failures stay stringly-reported per
-    // this helper's contract.
-    let key = handle.key.clone();
-    let handle = Arc::clone(handle);
-    let source_task = source.to_string();
-    let actor_id: Option<String> = actor.map(|actor| actor.actor_id.as_ref().to_string());
-    shielded_write(state, &key, async move {
-        handle
-            .engine
-            .branch_delete_as(&source_task, actor_id.as_deref())
-            .await
-            .map_err(ApiError::from_omni)
-    })
-    .await
-    .map(|_| ())
-    .map_err(|err| err.message)
+    // Runs inside the merge's shielded composite task (RFC-030), so it is
+    // already detached from the request future and covered by the merge's
+    // admission guard; no inner spawn needed. Failures stay
+    // stringly-reported per this helper's contract.
+    let actor_id = actor.map(|actor| actor.actor_id.as_ref());
+    handle
+        .engine
+        .branch_delete_as(source, actor_id)
+        .await
+        .map_err(|err| err.to_string())
 }
 
 #[utoipa::path(
