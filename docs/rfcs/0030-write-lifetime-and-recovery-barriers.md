@@ -189,12 +189,26 @@ Stage 1 applies the same spawn-and-clone shape to every `_as` writer handler
 maintenance):
 
 ```rust
+let admission = state.workload.try_admit(&actor_arc, est_bytes)?;
 let engine = Arc::clone(&handle.engine);
 let task = tokio::spawn(async move {
+    let _admission = admission;   // released at protocol completion
     engine.mutate_as(&branch, &query, &name, &params, actor_id.as_deref()).await
+    // ...and the RecoveryRequired → request_reopen notification fires
+    // HERE, inside the task, before the result is returned.
 });
 let result = task.await /* JoinError → 500 */ ?;
 ```
+
+**The shielded unit is the request's effect envelope, not the engine call.**
+Everything that must survive client fate lives inside the spawned task: the
+admission guard, every armed protocol the request implies (a merge with
+`delete_branch: true` is ONE composite task covering both the merge and the
+follow-up delete), and post-outcome obligations such as the supervised-reopen
+notification. Anything left in the handler is, by construction, cancellable —
+the review-fix tranche closed exactly the three gaps that violated this rule
+(handler-side delete, handler-side notify, admission released at first-protocol
+completion).
 
 Semantics:
 
@@ -478,8 +492,10 @@ phases 2–3 remain valid permanently (crash-class residuals survive W1).
   pre-confirmation*; drop the caller future; release; assert the operation
   reaches a terminal state and `__recovery/` is empty **without any reopen**
   (listing sidecars directly — the existing cancellation test is blind here
-  because its `Omnigraph::open` sweeps first). Red today; green under the
-  shield.
+  because its `Omnigraph::open` sweeps first). **Stage-2 scope (PR-3):** this
+  engine-boundary cell can only turn green under the engine-level shield;
+  PR-1 lands the server-boundary cell below, and `rfc030_probe.rs` phase 1
+  remains the engine baseline pin until then.
 - Server-level test: spawned-server mutation with the client connection
   dropped mid-flight (failpoint-parked); assert the mutation publishes and a
   follow-up read observes it.
@@ -599,6 +615,18 @@ Independent PR series, in leverage order, each red-test-first with docs:
   cancel the protocol — at most it can alert).
 - **Whether quarantine should also surface via a health/readiness endpoint**
   for orchestrators that never call `GET /graphs`.
+- **Generation fencing for supervised publishes:** today `startup_configs`
+  are boot-frozen and runtime add/remove does not exist (RFC-011: `cluster
+  apply` + restart), so a supervised reopen can never publish from stale
+  configuration. When the registry's deferred runtime DELETE/reconfigure
+  lands, the supervisor's opens must carry a config-generation token and
+  `publish` must CAS against it, so an in-flight reopen from a removed or
+  reconfigured graph cannot resurrect an obsolete handle or URI.
+- **Settings-time quarantine visibility:** graphs quarantined at
+  settings-build time (stored-query parse or embedding-provider config
+  failures — config-class, unfixable by retry, correctly fail-fast) never
+  reach the registry and are invisible to `GET /graphs`. Surfacing them with
+  a distinct status is natural follow-up work now the status field exists.
 - **Interaction with the future distributed fence:** when cross-process
   recovery fencing lands, the W2 exclusivity argument should be restated in
   terms of the fence rather than the process-local queue; flagged so the

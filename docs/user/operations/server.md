@@ -1,6 +1,9 @@
 # HTTP Server (`omnigraph-server`)
 
-Axum 0.8 + tokio + utoipa-generated OpenAPI. **Cluster-only boot**: the server always boots from a cluster (`--cluster <dir | s3://…>`) and serves N graphs (N ≥ 1) under cluster routes. There is no longer a single-graph flat-route mode, no positional `<URI>` boot, no `--target`, and no `omnigraph.yaml`-`graphs:`-map boot. All HTTP is nested under `/graphs/{graph_id}/...`; `/healthz` and the management `/graphs` enumeration stay flat.
+Axum 0.8 + tokio + utoipa-generated OpenAPI. **Cluster-only boot**: the server always boots from a cluster (`--cluster <dir | s3://…>`) and serves N configured graphs (N ≥ 1) under cluster routes. In default
+(lenient) mode the *serving* subset may transiently be smaller — even empty —
+while open-quarantined graphs converge under supervision; strict
+`--require-all-graphs` keeps serving = configured. There is no longer a single-graph flat-route mode, no positional `<URI>` boot, no `--target`, and no `omnigraph.yaml`-`graphs:`-map boot. All HTTP is nested under `/graphs/{graph_id}/...`; `/healthz` and the management `/graphs` enumeration stay flat.
 
 ## Boot
 
@@ -259,6 +262,18 @@ consequences for clients:
   connection closes. A disconnecting actor cannot free its own in-flight
   budget early by hanging up; slots release when the abandoned write
   finishes.
+- **Composite requests complete as a unit.** A merge with
+  `delete_branch: true` runs the merge and the follow-up source-branch
+  deletion in one server-owned task under one admission slot — a disconnect
+  cannot land the merge and silently skip the requested deletion.
+
+Two quarantine classes exist and behave differently: **open-class**
+quarantine (a graph whose open failed, possibly transiently) is supervised —
+visible in `GET /graphs`, routes answer 503, converges with capped backoff.
+**Config-class** quarantine (stored-query parse or embedding-provider config
+failures at settings time) is deterministic and unfixable by retry, so it
+remains fail-fast: those graphs are skipped (or abort the boot when every
+graph is config-broken) and need `cluster apply` + restart.
 
 ## Body limits
 

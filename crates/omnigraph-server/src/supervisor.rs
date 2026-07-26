@@ -15,8 +15,12 @@
 //! notification storms for the same graph and guarantees at most one
 //! in-flight open per root (two concurrent read-write opens of one root
 //! would run redundant Full sweeps). Shutdown is free: the only sender
-//! lives in `AppState`; when the state drops, `recv()` yields `None` and
-//! the loop exits.
+//! lives in `AppState`; when the last state clone drops, `recv()` yields
+//! `None` and the loop exits. Because each in-flight shielded write holds
+//! an `AppState` clone (for the in-task reopen notification), the loop may
+//! outlive `serve()` by up to one write's duration — consistent with those
+//! writes themselves being detached, and bounded by the engine's commit
+//! timeout.
 
 use std::collections::HashMap;
 use std::sync::Arc;
