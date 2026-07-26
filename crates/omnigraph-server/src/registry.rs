@@ -194,10 +194,12 @@ impl GraphRegistry {
     }
 
     /// Boot-time constructor carrying both healthy handles and quarantined
-    /// entries (RFC-030 W3). Rejects duplicate `GraphKey`s and duplicate
-    /// URIs among the handles; quarantined keys must be disjoint from the
-    /// serving keys (the boot loop guarantees it — a graph either opened or
-    /// it didn't).
+    /// entries (RFC-030 W3). Rejects duplicate `GraphKey`s among the
+    /// handles and duplicate canonical URIs across the whole configured set
+    /// — serving and quarantined alike, so an invalid config fails boot the
+    /// same way regardless of which opens succeeded. Quarantined keys must
+    /// be disjoint from the serving keys (the boot loop guarantees it — a
+    /// graph either opened or it didn't).
     pub fn from_boot(
         handles: Vec<Arc<GraphHandle>>,
         quarantined: Vec<(GraphKey, QuarantineInfo)>,
@@ -215,10 +217,29 @@ impl GraphRegistry {
             seen_uris.insert(canonical_uri, handle.key.clone());
             graphs.insert(handle.key.clone(), handle);
         }
-        let quarantined: HashMap<GraphKey, QuarantineInfo> = quarantined
-            .into_iter()
-            .filter(|(key, _)| !graphs.contains_key(key))
-            .collect();
+        let mut quarantined_map: HashMap<GraphKey, QuarantineInfo> =
+            HashMap::with_capacity(quarantined.len());
+        for (key, info) in quarantined {
+            if graphs.contains_key(&key) {
+                continue;
+            }
+            // The "distinct canonical URIs across configured graphs"
+            // invariant must not depend on which opens succeeded: when both
+            // colliding graphs open, the handle loop above already fails
+            // boot, and a half-open collision would otherwise boot into an
+            // endless supervised-retry loop (the reopen succeeds but
+            // `publish` forever returns `DuplicateUri`). A URI that cannot
+            // be normalized is skipped: its reopen fails at normalization
+            // too, so it can never reach `publish`.
+            if let Ok(canonical_uri) = normalize_root_uri(&info.uri) {
+                if seen_uris.contains_key(&canonical_uri) {
+                    return Err(InsertError::DuplicateUri(info.uri.clone()));
+                }
+                seen_uris.insert(canonical_uri, key.clone());
+            }
+            quarantined_map.insert(key, info);
+        }
+        let quarantined = quarantined_map;
         Ok(Self {
             snapshot: ArcSwap::from_pointee(RegistrySnapshot::with_quarantined(
                 graphs,
