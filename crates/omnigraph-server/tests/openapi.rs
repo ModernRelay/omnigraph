@@ -183,6 +183,8 @@ const EXPECTED_PATHS: &[&str] = &[
     "/graphs/{graph_id}/branches/merge",
     "/graphs/{graph_id}/commits",
     "/graphs/{graph_id}/commits/{commit_id}",
+    "/graphs/{graph_id}/diff",
+    "/graphs/{graph_id}/diff/summary",
 ];
 
 #[test]
@@ -802,6 +804,8 @@ fn protected_endpoints_reference_bearer_token_security() {
         ("/graphs/{graph_id}/branches/merge", "post"),
         ("/graphs/{graph_id}/commits", "get"),
         ("/graphs/{graph_id}/commits/{commit_id}", "get"),
+        ("/graphs/{graph_id}/diff", "get"),
+        ("/graphs/{graph_id}/diff/summary", "get"),
     ];
 
     for (path, method) in protected_paths {
@@ -1254,6 +1258,8 @@ const EXPECTED_CLUSTER_PATHS: &[&str] = &[
     "/graphs/{graph_id}/branches/merge",
     "/graphs/{graph_id}/commits",
     "/graphs/{graph_id}/commits/{commit_id}",
+    "/graphs/{graph_id}/diff",
+    "/graphs/{graph_id}/diff/summary",
 ];
 
 async fn app_for_multi_mode(graph_ids: &[&str]) -> (Vec<tempfile::TempDir>, Router) {

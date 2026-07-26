@@ -1908,7 +1908,12 @@ async fn diff_route_pages_with_cursor_without_duplicates() {
 }
 
 /// A diff discloses content from both sides, so read access to one side must
-/// not be enough. The policy grants `read` on `main` only.
+/// not be enough.
+///
+/// Branch scoping is by protected class (`PolicyBranchScope` is
+/// `Any`/`Protected`/`Unprotected`), not by branch name, so the fixture grants
+/// `read` on protected branches only and declares `main` protected. `secret` is
+/// then unprotected and outside the grant.
 #[tokio::test]
 async fn diff_route_requires_read_on_both_sides() {
     let temp = init_loaded_graph().await;
@@ -1931,11 +1936,11 @@ groups:
   readers: ["default"]
 protected_branches: [main]
 rules:
-  - id: readers-read-main-only
+  - id: readers-read-protected-only
     allow:
       actors: { group: readers }
       actions: [read]
-      branch_scope: { equals: main }
+      branch_scope: protected
 "#,
     )
     .unwrap();

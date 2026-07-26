@@ -711,6 +711,360 @@
         ]
       }
     },
+    "/graphs/{graph_id}/diff": {
+      "get": {
+        "tags": [
+          "changes"
+        ],
+        "summary": "One bounded page of changes between two read targets.",
+        "description": "Changes are totally ordered by `(table_key, id)` and carry identity, op,\nand (for edges) endpoints — not property values; read those with a query.\n`limit` defaults to 100 and is clamped to 1000. When `next_cursor` is\npresent, pass it back as `cursor` for the next page. `stats` describes the\nreturned page; call `GET /diff/summary` for whole-diff totals. Read-only.",
+        "operationId": "cluster_getDiff",
+        "parameters": [
+          {
+            "name": "graph_id",
+            "in": "path",
+            "description": "Graph id to route the request to.",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "from",
+            "in": "query",
+            "description": "Branch to diff from. Mutually exclusive with `from_snapshot`; exactly\none of the two is required.",
+            "required": false,
+            "schema": {
+              "type": [
+                "string",
+                "null"
+              ]
+            }
+          },
+          {
+            "name": "to",
+            "in": "query",
+            "description": "Branch to diff to. Mutually exclusive with `to_snapshot`; exactly one\nof the two is required.",
+            "required": false,
+            "schema": {
+              "type": [
+                "string",
+                "null"
+              ]
+            }
+          },
+          {
+            "name": "from_snapshot",
+            "in": "query",
+            "description": "Snapshot or commit id to diff from. Mutually exclusive with `from`.",
+            "required": false,
+            "schema": {
+              "type": [
+                "string",
+                "null"
+              ]
+            }
+          },
+          {
+            "name": "to_snapshot",
+            "in": "query",
+            "description": "Snapshot or commit id to diff to. Mutually exclusive with `to`.",
+            "required": false,
+            "schema": {
+              "type": [
+                "string",
+                "null"
+              ]
+            }
+          },
+          {
+            "name": "types",
+            "in": "query",
+            "description": "Restrict to these type names (repeatable, or comma-separated).",
+            "required": false,
+            "schema": {
+              "type": [
+                "string",
+                "null"
+              ]
+            }
+          },
+          {
+            "name": "kinds",
+            "in": "query",
+            "description": "Restrict to `node` and/or `edge`.",
+            "required": false,
+            "schema": {
+              "type": [
+                "string",
+                "null"
+              ]
+            }
+          },
+          {
+            "name": "ops",
+            "in": "query",
+            "description": "Restrict to `insert`, `update`, and/or `delete`.",
+            "required": false,
+            "schema": {
+              "type": [
+                "string",
+                "null"
+              ]
+            }
+          },
+          {
+            "name": "limit",
+            "in": "query",
+            "description": "Maximum changes to return. Clamped to the server ceiling; the row\nendpoint applies a default when omitted.",
+            "required": false,
+            "schema": {
+              "type": [
+                "integer",
+                "null"
+              ],
+              "minimum": 0
+            }
+          },
+          {
+            "name": "cursor",
+            "in": "query",
+            "description": "Opaque resume token from a previous response's `next_cursor`.",
+            "required": false,
+            "schema": {
+              "type": [
+                "string",
+                "null"
+              ]
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "One page of changes",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/DiffOutput"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Bad request",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorOutput"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Unauthorized",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorOutput"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "Forbidden",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorOutput"
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "bearer_token": []
+          }
+        ]
+      }
+    },
+    "/graphs/{graph_id}/diff/summary": {
+      "get": {
+        "tags": [
+          "changes"
+        ],
+        "summary": "Totals for what changed between two read targets.",
+        "description": "The cheap tier of the change feed: per-op counts and the affected type\nnames, without the row list. Use `GET /diff` to page the rows. `limit` and\n`cursor` are ignored here — totals are whole-diff by definition. Read-only.",
+        "operationId": "cluster_getDiffSummary",
+        "parameters": [
+          {
+            "name": "graph_id",
+            "in": "path",
+            "description": "Graph id to route the request to.",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "from",
+            "in": "query",
+            "description": "Branch to diff from. Mutually exclusive with `from_snapshot`; exactly\none of the two is required.",
+            "required": false,
+            "schema": {
+              "type": [
+                "string",
+                "null"
+              ]
+            }
+          },
+          {
+            "name": "to",
+            "in": "query",
+            "description": "Branch to diff to. Mutually exclusive with `to_snapshot`; exactly one\nof the two is required.",
+            "required": false,
+            "schema": {
+              "type": [
+                "string",
+                "null"
+              ]
+            }
+          },
+          {
+            "name": "from_snapshot",
+            "in": "query",
+            "description": "Snapshot or commit id to diff from. Mutually exclusive with `from`.",
+            "required": false,
+            "schema": {
+              "type": [
+                "string",
+                "null"
+              ]
+            }
+          },
+          {
+            "name": "to_snapshot",
+            "in": "query",
+            "description": "Snapshot or commit id to diff to. Mutually exclusive with `to`.",
+            "required": false,
+            "schema": {
+              "type": [
+                "string",
+                "null"
+              ]
+            }
+          },
+          {
+            "name": "types",
+            "in": "query",
+            "description": "Restrict to these type names (repeatable, or comma-separated).",
+            "required": false,
+            "schema": {
+              "type": [
+                "string",
+                "null"
+              ]
+            }
+          },
+          {
+            "name": "kinds",
+            "in": "query",
+            "description": "Restrict to `node` and/or `edge`.",
+            "required": false,
+            "schema": {
+              "type": [
+                "string",
+                "null"
+              ]
+            }
+          },
+          {
+            "name": "ops",
+            "in": "query",
+            "description": "Restrict to `insert`, `update`, and/or `delete`.",
+            "required": false,
+            "schema": {
+              "type": [
+                "string",
+                "null"
+              ]
+            }
+          },
+          {
+            "name": "limit",
+            "in": "query",
+            "description": "Maximum changes to return. Clamped to the server ceiling; the row\nendpoint applies a default when omitted.",
+            "required": false,
+            "schema": {
+              "type": [
+                "integer",
+                "null"
+              ],
+              "minimum": 0
+            }
+          },
+          {
+            "name": "cursor",
+            "in": "query",
+            "description": "Opaque resume token from a previous response's `next_cursor`.",
+            "required": false,
+            "schema": {
+              "type": [
+                "string",
+                "null"
+              ]
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Whole-diff totals",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/DiffSummaryOutput"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Bad request",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorOutput"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Unauthorized",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorOutput"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "Forbidden",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorOutput"
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "bearer_token": []
+          }
+        ]
+      }
+    },
     "/graphs/{graph_id}/export": {
       "post": {
         "tags": [
@@ -1968,6 +2322,35 @@
           }
         }
       },
+      "ChangeStatsOutput": {
+        "type": "object",
+        "required": [
+          "inserts",
+          "updates",
+          "deletes",
+          "types_affected"
+        ],
+        "properties": {
+          "deletes": {
+            "type": "integer",
+            "minimum": 0
+          },
+          "inserts": {
+            "type": "integer",
+            "minimum": 0
+          },
+          "types_affected": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            }
+          },
+          "updates": {
+            "type": "integer",
+            "minimum": 0
+          }
+        }
+      },
       "CommitListOutput": {
         "type": "object",
         "required": [
@@ -2027,6 +2410,139 @@
               "string",
               "null"
             ]
+          }
+        }
+      },
+      "DiffOutput": {
+        "type": "object",
+        "description": "Row tier: one bounded page of changes, ordered by `(table_key, id)`.",
+        "required": [
+          "from",
+          "to",
+          "from_version",
+          "to_version",
+          "changes",
+          "stats"
+        ],
+        "properties": {
+          "branch": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "changes": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/EntityChangeOutput"
+            }
+          },
+          "from": {
+            "type": "string"
+          },
+          "from_version": {
+            "type": "integer",
+            "format": "int64",
+            "minimum": 0
+          },
+          "next_cursor": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "Opaque resume token. Present only when more changes follow; pass it\nback as `cursor` to continue. Absent means the list is exhausted."
+          },
+          "stats": {
+            "$ref": "#/components/schemas/ChangeStatsOutput",
+            "description": "Statistics for **this page**, not the whole diff. Call the summary\nendpoint for totals — see RFC-029 §3.1."
+          },
+          "to": {
+            "type": "string"
+          },
+          "to_version": {
+            "type": "integer",
+            "format": "int64",
+            "minimum": 0
+          }
+        }
+      },
+      "DiffSummaryOutput": {
+        "type": "object",
+        "description": "Cheap tier: whole-diff totals, no row list.",
+        "required": [
+          "from",
+          "to",
+          "from_version",
+          "to_version",
+          "stats"
+        ],
+        "properties": {
+          "from": {
+            "type": "string"
+          },
+          "from_version": {
+            "type": "integer",
+            "format": "int64",
+            "minimum": 0
+          },
+          "stats": {
+            "$ref": "#/components/schemas/ChangeStatsOutput"
+          },
+          "to": {
+            "type": "string"
+          },
+          "to_version": {
+            "type": "integer",
+            "format": "int64",
+            "minimum": 0
+          }
+        }
+      },
+      "EntityChangeOutput": {
+        "type": "object",
+        "description": "One changed entity. Carries identity, disposition, and (for edges)\nendpoints — deliberately **not** property values. Read those on demand\nwith a query or `entity_at`; see RFC-029 §3.1.",
+        "required": [
+          "table_key",
+          "kind",
+          "type_name",
+          "id",
+          "op",
+          "manifest_version"
+        ],
+        "properties": {
+          "dst": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "id": {
+            "type": "string"
+          },
+          "kind": {
+            "type": "string",
+            "description": "`node` or `edge`."
+          },
+          "manifest_version": {
+            "type": "integer",
+            "format": "int64",
+            "minimum": 0
+          },
+          "op": {
+            "type": "string",
+            "description": "`insert`, `update`, or `delete`."
+          },
+          "src": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "table_key": {
+            "type": "string"
+          },
+          "type_name": {
+            "type": "string"
           }
         }
       },
