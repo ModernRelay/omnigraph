@@ -3,6 +3,9 @@
 //! and one engine-result -> DTO mapping per verb. Plain serde/utoipa
 //! types; no transport, no server internals.
 
+use omnigraph::changes::{
+    ChangeCursor, ChangeOp, ChangeSet, ChangeStats, EntityChange, EntityKind,
+};
 use omnigraph::db::{GraphCommit, MergeOutcome, ReadTarget, SchemaApplyResult, Snapshot};
 use omnigraph::error::{MergeConflict, MergeConflictKind};
 use omnigraph::loader::{LoadMode, LoadResult};
@@ -257,6 +260,64 @@ pub struct CommitOutput {
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
 pub struct CommitListOutput {
     pub commits: Vec<CommitOutput>,
+}
+
+// ─── Change feed / diff (RFC-029) ──────────────────────────────────────────
+
+/// One changed entity. Carries identity, disposition, and (for edges)
+/// endpoints — deliberately **not** property values. Read those on demand
+/// with a query or `entity_at`; see RFC-029 §3.1.
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+pub struct EntityChangeOutput {
+    pub table_key: String,
+    /// `node` or `edge`.
+    pub kind: String,
+    pub type_name: String,
+    pub id: String,
+    /// `insert`, `update`, or `delete`.
+    pub op: String,
+    pub manifest_version: u64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub src: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub dst: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+pub struct ChangeStatsOutput {
+    pub inserts: usize,
+    pub updates: usize,
+    pub deletes: usize,
+    pub types_affected: Vec<String>,
+}
+
+/// Cheap tier: whole-diff totals, no row list.
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+pub struct DiffSummaryOutput {
+    pub from: String,
+    pub to: String,
+    pub from_version: u64,
+    pub to_version: u64,
+    pub stats: ChangeStatsOutput,
+}
+
+/// Row tier: one bounded page of changes, ordered by `(table_key, id)`.
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+pub struct DiffOutput {
+    pub from: String,
+    pub to: String,
+    pub from_version: u64,
+    pub to_version: u64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub branch: Option<String>,
+    pub changes: Vec<EntityChangeOutput>,
+    /// Statistics for **this page**, not the whole diff. Call the summary
+    /// endpoint for totals — see RFC-029 §3.1.
+    pub stats: ChangeStatsOutput,
+    /// Opaque resume token. Present only when more changes follow; pass it
+    /// back as `cursor` to continue. Absent means the list is exhausted.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub next_cursor: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
@@ -553,6 +614,35 @@ pub struct CommitListQuery {
     pub branch: Option<String>,
 }
 
+/// Query parameters for the diff endpoints.
+///
+/// `from` and `to` are **required**: an unbounded whole-graph diff is not an
+/// exposed operation (RFC-029 §3.2).
+#[derive(Debug, Clone, Deserialize, IntoParams)]
+pub struct DiffQuery {
+    /// Branch to diff from. Mutually exclusive with `from_snapshot`; exactly
+    /// one of the two is required.
+    pub from: Option<String>,
+    /// Branch to diff to. Mutually exclusive with `to_snapshot`; exactly one
+    /// of the two is required.
+    pub to: Option<String>,
+    /// Snapshot or commit id to diff from. Mutually exclusive with `from`.
+    pub from_snapshot: Option<String>,
+    /// Snapshot or commit id to diff to. Mutually exclusive with `to`.
+    pub to_snapshot: Option<String>,
+    /// Restrict to these type names (repeatable, or comma-separated).
+    pub types: Option<String>,
+    /// Restrict to `node` and/or `edge`.
+    pub kinds: Option<String>,
+    /// Restrict to `insert`, `update`, and/or `delete`.
+    pub ops: Option<String>,
+    /// Maximum changes to return. Clamped to the server ceiling; the row
+    /// endpoint applies a default when omitted.
+    pub limit: Option<usize>,
+    /// Opaque resume token from a previous response's `next_cursor`.
+    pub cursor: Option<String>,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
 pub struct HealthOutput {
     pub status: String,
@@ -706,6 +796,85 @@ pub fn commit_output(commit: &GraphCommit) -> CommitOutput {
     }
 }
 
+// ─── Change feed / diff mappings (RFC-029) ─────────────────────────────────
+
+fn change_op_name(op: ChangeOp) -> &'static str {
+    match op {
+        ChangeOp::Insert => "insert",
+        ChangeOp::Update => "update",
+        ChangeOp::Delete => "delete",
+    }
+}
+
+fn entity_kind_name(kind: EntityKind) -> &'static str {
+    match kind {
+        EntityKind::Node => "node",
+        EntityKind::Edge => "edge",
+    }
+}
+
+/// Encode a keyset cursor as one opaque token.
+///
+/// Opaque rather than two exposed parameters so clients cannot hand-build a
+/// position and the encoding stays changeable. base64 because a `table_key`
+/// or `id` may contain any byte, including whatever separator we pick.
+pub fn encode_change_cursor(cursor: &ChangeCursor) -> String {
+    use base64::Engine as _;
+    let mut raw = Vec::new();
+    raw.extend_from_slice(cursor.table_key.as_bytes());
+    raw.push(0x1f);
+    raw.extend_from_slice(cursor.id.as_bytes());
+    base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(raw)
+}
+
+/// Decode a cursor token. `None` for any malformed token, so a caller can
+/// reject it as a bad request rather than silently paging from the start.
+pub fn decode_change_cursor(token: &str) -> Option<ChangeCursor> {
+    use base64::Engine as _;
+    let raw = base64::engine::general_purpose::URL_SAFE_NO_PAD
+        .decode(token.as_bytes())
+        .ok()?;
+    let split = raw.iter().position(|b| *b == 0x1f)?;
+    let table_key = std::str::from_utf8(&raw[..split]).ok()?.to_string();
+    let id = std::str::from_utf8(&raw[split + 1..]).ok()?.to_string();
+    Some(ChangeCursor { table_key, id })
+}
+
+pub fn change_stats_output(stats: &ChangeStats) -> ChangeStatsOutput {
+    ChangeStatsOutput {
+        inserts: stats.inserts,
+        updates: stats.updates,
+        deletes: stats.deletes,
+        types_affected: stats.types_affected.clone(),
+    }
+}
+
+pub fn entity_change_output(change: &EntityChange) -> EntityChangeOutput {
+    EntityChangeOutput {
+        table_key: change.table_key.clone(),
+        kind: entity_kind_name(change.kind).to_string(),
+        type_name: change.type_name.clone(),
+        id: change.id.clone(),
+        op: change_op_name(change.op).to_string(),
+        manifest_version: change.manifest_version,
+        src: change.endpoints.as_ref().map(|e| e.src.clone()),
+        dst: change.endpoints.as_ref().map(|e| e.dst.clone()),
+    }
+}
+
+pub fn diff_output(from: String, to: String, change_set: &ChangeSet) -> DiffOutput {
+    DiffOutput {
+        from,
+        to,
+        from_version: change_set.from_version,
+        to_version: change_set.to_version,
+        branch: change_set.branch.clone(),
+        changes: change_set.changes.iter().map(entity_change_output).collect(),
+        stats: change_stats_output(&change_set.stats),
+        next_cursor: change_set.next_cursor.as_ref().map(encode_change_cursor),
+    }
+}
+
 pub fn read_output(query_name: String, target: &ReadTarget, result: QueryResult) -> ReadOutput {
     let columns = result
         .schema()
@@ -777,4 +946,46 @@ pub struct GraphInfo {
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
 pub struct GraphListResponse {
     pub graphs: Vec<GraphInfo>,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The cursor is opaque on the wire but must round-trip exactly, including
+    /// the separator byte it uses internally and non-ASCII ids.
+    #[test]
+    fn change_cursor_round_trips_including_awkward_keys() {
+        let cases = [
+            ("node:Person", "alice"),
+            // Contains the internal separator — the reason this is length-free
+            // base64 of a split rather than a naive join/split on a char.
+            ("node:Person", "a\x1fb"),
+            ("edge:KNOWS", "ünïcode-ið"),
+            ("node:A", ""),
+            ("", "id-only"),
+        ];
+        for (table_key, id) in cases {
+            let cursor = ChangeCursor {
+                table_key: table_key.to_string(),
+                id: id.to_string(),
+            };
+            let token = encode_change_cursor(&cursor);
+            let decoded = decode_change_cursor(&token)
+                .unwrap_or_else(|| panic!("failed to decode token for {table_key:?}/{id:?}"));
+            assert_eq!(decoded, cursor, "round trip lost data for {table_key:?}/{id:?}");
+        }
+    }
+
+    /// A malformed token is rejected rather than silently treated as "start
+    /// from the beginning", which would make a client's paging loop repeat.
+    #[test]
+    fn malformed_change_cursor_is_rejected() {
+        assert!(decode_change_cursor("!!!not-base64!!!").is_none());
+        // Valid base64, but no separator byte.
+        use base64::Engine as _;
+        let no_separator =
+            base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(b"no-separator-here");
+        assert!(decode_change_cursor(&no_separator).is_none());
+    }
 }
