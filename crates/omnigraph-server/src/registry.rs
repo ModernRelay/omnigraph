@@ -817,6 +817,43 @@ mod tests {
         }
     }
 
+    /// RFC-030 review: the "distinct canonical URIs across configured
+    /// graphs" invariant must not depend on which opens succeed at boot.
+    /// When both colliding graphs open, the handle check already fails
+    /// boot; a half-open collision must fail the same way — otherwise the
+    /// quarantined side boots into an endless supervised-retry loop (its
+    /// reopen succeeds but `publish` forever returns `DuplicateUri`).
+    #[tokio::test]
+    async fn from_boot_rejects_uri_collisions_involving_quarantined_entries() {
+        // Serving handle and quarantined entry on the same canonical URI.
+        let dir = TempDir::new().unwrap();
+        let handle = build_handle("alpha", dir.path()).await;
+        let uri = handle.uri.clone();
+        let beta = GraphKey::cluster(GraphId::try_from("beta").unwrap());
+        match GraphRegistry::from_boot(
+            vec![handle],
+            vec![(beta.clone(), quarantine_info(&uri, false))],
+        ) {
+            Err(InsertError::DuplicateUri(_)) => {}
+            Err(other) => panic!("expected DuplicateUri, got {other:?}"),
+            Ok(_) => panic!("expected DuplicateUri for serving/quarantined collision, got Ok"),
+        }
+
+        // Two quarantined entries on the same canonical URI.
+        let gamma = GraphKey::cluster(GraphId::try_from("gamma").unwrap());
+        match GraphRegistry::from_boot(
+            Vec::new(),
+            vec![
+                (beta, quarantine_info("file:///nowhere/shared", false)),
+                (gamma, quarantine_info("file:///nowhere/shared", false)),
+            ],
+        ) {
+            Err(InsertError::DuplicateUri(_)) => {}
+            Err(other) => panic!("expected DuplicateUri, got {other:?}"),
+            Ok(_) => panic!("expected DuplicateUri for quarantined/quarantined collision, got Ok"),
+        }
+    }
+
     /// RFC-030 W3 auth-flap closure: a quarantined graph whose config
     /// declares a per-graph policy keeps `any_per_graph_policy` true, so
     /// bearer auth stays required while it heals.
