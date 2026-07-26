@@ -10,11 +10,15 @@ pub mod identity;
 pub mod policy;
 pub mod queries;
 pub mod registry;
+pub mod supervisor;
 pub mod workload;
 
 pub use graph_id::GraphId;
 pub use identity::{AuthSource, GraphKey, ResolvedActor, Scope, TenantId};
-pub use registry::{GraphHandle, GraphRegistry, InsertError, RegistryLookup, RegistrySnapshot};
+pub use registry::{
+    GraphHandle, GraphRegistry, InsertError, QuarantineInfo, RegistryLookup, RegistrySnapshot,
+};
+pub use supervisor::SupervisorConfig;
 
 use crate::queries::{QueryRegistry, check, format_check_breakages};
 
@@ -29,6 +33,7 @@ use api::{
     BranchCreateOutput, BranchCreateRequest, BranchDeleteOutput, BranchListOutput,
     BranchMergeOutput, BranchMergeRequest, ChangeOutput, ChangeRequest, CommitListOutput,
     CommitListQuery, ErrorCode, ErrorOutput, ExportRequest, GraphInfo, GraphListResponse,
+    GraphQuarantineInfo, GraphStatus,
     HealthOutput, IngestOutput, IngestRequest, InvokeStoredQueryRequest, InvokeStoredQueryResponse,
     QueriesCatalogOutput, QueryRequest, ReadOutput, ReadRequest, SchemaApplyOutput,
     SchemaApplyRequest, SchemaOutput, SnapshotQuery, ingest_output, schema_apply_output,
@@ -244,6 +249,11 @@ pub struct GraphStartupConfig {
 pub struct GraphRouting {
     pub registry: Arc<GraphRegistry>,
     pub config_path: Option<PathBuf>,
+    /// Clones of every configured graph's startup config, keyed for the
+    /// RFC-030 supervision loop (W3 boot retry + W2(b) reopen) — healthy
+    /// graphs included, since a supervised reopen needs the config too.
+    /// Empty in single mode (no supervision surface there).
+    pub startup_configs: Arc<HashMap<GraphKey, GraphStartupConfig>>,
 }
 
 #[derive(Clone)]
@@ -258,6 +268,10 @@ pub struct AppState {
     /// Per-actor admission control. Process-wide (not per-graph) —
     /// see MR-668 decision Q6.
     workload: Arc<workload::WorkloadController>,
+    /// RFC-030 supervision notify channel. Set once by `spawn_supervision`;
+    /// `request_reopen` sends on it (and silently drops when supervision is
+    /// not running — single mode, or tests that don't spawn it).
+    supervisor_tx: Arc<std::sync::OnceLock<tokio::sync::mpsc::UnboundedSender<GraphKey>>>,
     bearer_tokens: Arc<[(BearerTokenHash, Arc<str>)]>,
     /// Server-level Cedar policy. Used by management endpoints (`GET
     /// /graphs`) which act on the registry resource, not on a per-graph
@@ -539,8 +553,10 @@ impl AppState {
             routing: GraphRouting {
                 registry,
                 config_path: None,
+                startup_configs: Arc::new(HashMap::new()),
             },
             workload,
+            supervisor_tx: Arc::new(std::sync::OnceLock::new()),
             bearer_tokens,
             server_policy: None,
         }
@@ -559,14 +575,41 @@ impl AppState {
         workload: workload::WorkloadController,
         config_path: Option<PathBuf>,
     ) -> std::result::Result<Self, InsertError> {
+        Self::new_multi_with_boot(
+            handles,
+            Vec::new(),
+            Arc::new(HashMap::new()),
+            bearer_tokens,
+            server_policy,
+            workload,
+            config_path,
+        )
+    }
+
+    /// Multi-mode constructor carrying RFC-030 boot supervision state:
+    /// quarantine entries for graphs whose open failed, and the retained
+    /// startup configs the supervision loop reopens from. `new_multi`
+    /// delegates here with empty supervision state.
+    #[allow(clippy::too_many_arguments)]
+    pub fn new_multi_with_boot(
+        handles: Vec<Arc<GraphHandle>>,
+        quarantined: Vec<(GraphKey, QuarantineInfo)>,
+        startup_configs: Arc<HashMap<GraphKey, GraphStartupConfig>>,
+        bearer_tokens: Vec<(String, String)>,
+        server_policy: Option<PolicyEngine>,
+        workload: workload::WorkloadController,
+        config_path: Option<PathBuf>,
+    ) -> std::result::Result<Self, InsertError> {
         let bearer_tokens = hash_bearer_tokens(bearer_tokens);
-        let registry = Arc::new(GraphRegistry::from_handles(handles)?);
+        let registry = Arc::new(GraphRegistry::from_boot(handles, quarantined)?);
         Ok(Self {
             routing: GraphRouting {
                 registry,
                 config_path,
+                startup_configs,
             },
             workload: Arc::new(workload),
+            supervisor_tx: Arc::new(std::sync::OnceLock::new()),
             bearer_tokens,
             server_policy: server_policy.map(Arc::new),
         })
@@ -577,6 +620,39 @@ impl AppState {
     /// `server_graphs_list` reads the registry through it.
     pub fn routing(&self) -> &GraphRouting {
         &self.routing
+    }
+
+    /// Start the RFC-030 supervision loop (W3 boot retry + W2(b) supervised
+    /// reopen) for this state's registry. Idempotent: a second call warns
+    /// and returns a completed no-op handle. `serve()` calls this with
+    /// production pacing; in-process tests call it directly with
+    /// `SupervisorConfig::fast_for_tests()` since they never run `serve()`.
+    pub fn spawn_supervision(
+        &self,
+        config: supervisor::SupervisorConfig,
+    ) -> tokio::task::JoinHandle<()> {
+        let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+        if self.supervisor_tx.set(tx).is_err() {
+            warn!("graph supervision already running; ignoring second spawn");
+            return tokio::spawn(async {});
+        }
+        let supervisor = supervisor::GraphSupervisor {
+            registry: Arc::clone(&self.routing.registry),
+            configs: Arc::clone(&self.routing.startup_configs),
+            config,
+            rx,
+        };
+        tokio::spawn(supervisor.run())
+    }
+
+    /// RFC-030 W2(b) trigger B: a shielded write surfaced `RecoveryRequired`
+    /// for this graph — ask the supervision loop to re-drive the open (whose
+    /// Full sweep resolves the residual). Silently drops when supervision is
+    /// not running; the documented reopen-or-restart remedy still applies.
+    pub(crate) fn request_reopen(&self, key: &GraphKey) {
+        if let Some(tx) = self.supervisor_tx.get() {
+            let _ = tx.send(key.clone());
+        }
     }
 
     fn requires_bearer_auth(&self) -> bool {
@@ -681,6 +757,23 @@ impl ApiError {
         Self {
             status: StatusCode::METHOD_NOT_ALLOWED,
             code: Some(ErrorCode::MethodNotAllowed),
+            message: message.into(),
+            merge_conflicts: Vec::new(),
+            manifest_conflict: None,
+            read_set_conflict: None,
+            key_conflict: None,
+            resource_limit: None,
+            recovery_required: None,
+        }
+    }
+
+    /// 503 without a closed `ErrorCode` — mirrors the recovery-required
+    /// 503 shape (RFC-030 W3: quarantined graphs are configured-but-healing,
+    /// "retry later", not "no such resource").
+    pub fn service_unavailable(message: impl Into<String>) -> Self {
+        Self {
+            status: StatusCode::SERVICE_UNAVAILABLE,
+            code: None,
             message: message.into(),
             merge_conflicts: Vec::new(),
             manifest_conflict: None,
@@ -1267,6 +1360,10 @@ pub async fn serve(config: ServerConfig) -> Result<()> {
         }
     };
 
+    // RFC-030 W3/W2(b): start the supervision loop before serving. Its task
+    // exits on its own when the state (and with it the notify sender) drops
+    // at shutdown; graphs quarantined at boot begin converging immediately.
+    let _supervision = state.spawn_supervision(supervisor::SupervisorConfig::production());
     let listener = TcpListener::bind(&bind).await?;
     axum::serve(listener, build_app(state))
         .with_graceful_shutdown(shutdown_signal())
@@ -1314,26 +1411,53 @@ pub async fn open_multi_graph_state(
     };
 
     let configured_graphs = graphs.len();
+    // Retain every config for the RFC-030 supervision loop (healthy graphs
+    // included: a supervised reopen after RecoveryRequired needs them too).
+    // A config whose graph id cannot form a key is unquarantinable; its open
+    // fails below and it keeps the historical warn-and-drop behavior.
+    let mut startup_configs: HashMap<GraphKey, GraphStartupConfig> = HashMap::new();
+    for cfg in &graphs {
+        if let Ok(graph_id) = GraphId::try_from(cfg.graph_id.clone()) {
+            startup_configs.insert(GraphKey::cluster(graph_id), cfg.clone());
+        }
+    }
     let results = futures::stream::iter(graphs.into_iter())
         .map(|cfg| async move {
-            let graph_id = cfg.graph_id.clone();
-            open_single_graph(cfg).await.map_err(|err| (graph_id, err))
+            match open_single_graph(cfg.clone()).await {
+                Ok(handle) => Ok(handle),
+                Err(err) => Err((cfg, err)),
+            }
         })
         .buffer_unordered(4)
         .collect::<Vec<_>>()
         .await;
     let mut handles = Vec::new();
+    let mut quarantined: Vec<(GraphKey, QuarantineInfo)> = Vec::new();
     let mut failed = 0usize;
     for result in results {
         match result {
             Ok(handle) => handles.push(handle),
-            Err((graph_id, err)) => {
+            Err((cfg, err)) => {
                 failed += 1;
                 warn!(
-                    graph_id = %graph_id,
+                    graph_id = %cfg.graph_id,
                     error = %err,
                     "graph quarantined during startup"
                 );
+                if let Ok(graph_id) = GraphId::try_from(cfg.graph_id.clone()) {
+                    let now = std::time::SystemTime::now();
+                    quarantined.push((
+                        GraphKey::cluster(graph_id),
+                        QuarantineInfo {
+                            uri: cfg.uri.clone(),
+                            since: now,
+                            attempts: 1,
+                            last_error: err.to_string(),
+                            retry_at: now,
+                            policy_configured: cfg.policy.is_some(),
+                        },
+                    ));
+                }
             }
         }
     }
@@ -1344,7 +1468,13 @@ pub async fn open_multi_graph_state(
             failed
         );
     }
-    if handles.is_empty() {
+    // RFC-030 W3: zero SERVING graphs is a valid lenient-mode boot state as
+    // long as quarantine entries exist for supervision to converge — aborting
+    // here would re-create the incident's offline-until-redeploy failure for
+    // single-graph deployments with a transient open fault. Zero configured
+    // graphs (and settings-time config-class quarantine, which supervision
+    // cannot heal) remain fail-fast upstream.
+    if handles.is_empty() && quarantined.is_empty() {
         bail!(
             "no healthy graphs opened from multi-graph startup config ({} configured, {} failed)",
             configured_graphs,
@@ -1353,8 +1483,16 @@ pub async fn open_multi_graph_state(
     }
 
     let workload = workload::WorkloadController::from_env();
-    let state = AppState::new_multi(handles, tokens, server_policy, workload, Some(config_path))
-        .map_err(|err| color_eyre::eyre::eyre!("multi-graph registry: {err}"))?;
+    let state = AppState::new_multi_with_boot(
+        handles,
+        quarantined,
+        Arc::new(startup_configs),
+        tokens,
+        server_policy,
+        workload,
+        Some(config_path),
+    )
+    .map_err(|err| color_eyre::eyre::eyre!("multi-graph registry: {err}"))?;
     Ok(state)
 }
 

@@ -761,14 +761,49 @@ pub fn read_target_output(target: &ReadTarget) -> ReadTargetOutput {
 
 // ─── MR-668 — management endpoint shapes ──────────────────────────────────
 
+/// Serving state of a configured graph (RFC-030 W3).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize, ToSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum GraphStatus {
+    /// Open and answering requests.
+    #[default]
+    Serving,
+    /// Configured but not serving: the open failed and the server's
+    /// supervision loop is retrying with capped backoff. Routes under the
+    /// graph answer 503 meanwhile.
+    Quarantined,
+}
+
+/// Quarantine detail on a [`GraphInfo`] whose `status` is `quarantined`
+/// (RFC-030 W3). Timestamps are seconds since the Unix epoch.
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+pub struct GraphQuarantineInfo {
+    /// When the graph entered quarantine (this boot), Unix seconds.
+    pub since_unix_secs: u64,
+    /// Open attempts so far (the failed boot open counts as the first).
+    pub attempts: u32,
+    /// The most recent open error, verbatim.
+    pub last_error: String,
+    /// When the supervision loop will retry, Unix seconds.
+    pub retry_at_unix_secs: u64,
+}
+
 /// One entry in the response from `GET /graphs`. Cluster operators
 /// consume this list to discover which graphs the server is currently
-/// serving. The shape is intentionally minimal — `graph_id` and `uri`
-/// are the only fields a routing client needs.
+/// serving — including graphs that are configured but quarantined
+/// (RFC-030 W3), so an unhealthy graph is visible instead of silently
+/// absent.
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
 pub struct GraphInfo {
     pub graph_id: String,
     pub uri: String,
+    /// Additive (RFC-030): absent in older responses, so deserialization
+    /// defaults to `serving` for wire compatibility.
+    #[serde(default)]
+    pub status: GraphStatus,
+    /// Present only when `status` is `quarantined`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub quarantine: Option<GraphQuarantineInfo>,
 }
 
 /// Response from `GET /graphs`. Lists every graph registered with the

@@ -17,6 +17,12 @@ default = []
 # Enables the AWS Secrets Manager bearer-token source. Off by default — on-prem
 # and local-dev builds don't pay the AWS SDK compile cost.
 aws = ["dep:aws-config", "dep:aws-sdk-secretsmanager"]
+# Test-only fault injection: exposes the engine's failpoint registry
+# (`omnigraph::failpoints::{names, ScopedFailPoint}`) to this crate's
+# feature-gated integration tests (`tests/failpoints.rs`). The server defines
+# no failpoint hooks of its own, so unlike omnigraph-cluster there is no
+# `dep:fail` here. Never enabled in production builds.
+failpoints = ["omnigraph/failpoints"]
 
 [dependencies]
 omnigraph = { package = "omnigraph-engine", path = "../omnigraph", version = "0.9.0" }

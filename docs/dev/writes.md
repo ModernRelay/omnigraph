@@ -1326,8 +1326,21 @@ on the staged tables, so the next mutation proceeds normally with no
 drift to reconcile.
 
 The cancellation case (future drop mid-mutation) inherits the same
-guarantee — the in-memory accumulator evaporates with the dropped task
-and no Lance write was ever issued.
+guarantee **during op execution**: the in-memory accumulator evaporates
+with the dropped task and no Lance write was ever issued. A drop
+*after* the commit phase begins is a different animal (RFC-030): the
+recovery sidecar is armed before the first durable effect, so a future
+dropped between arm and sidecar delete leaves recovery-covered residue —
+a sidecar plus possibly a committed-but-unpublished table effect —
+resolved by the write-entry heal (roll-forward-eligible residue) or the
+next read-write open's Full sweep (rollback-class residue). The residue
+lifecycle is pinned by `tests/rfc030_probe.rs`. The HTTP server shields
+its write handlers from caller cancellation entirely (RFC-030 W1
+Stage 1: the protocol runs on a server-owned task and completes
+regardless of client fate — `omnigraph-server/src/handlers.rs::
+shielded_write`), so post-arm cancellation is reachable only by an
+embedded SDK caller dropping an engine future mid-protocol (W1 Stage 2
+closes that).
 
 Delete-touching mutations now inherit the same guarantee (MR-A). Deletes
 accumulate as predicates and stage via `stage_delete` at end-of-query, so a

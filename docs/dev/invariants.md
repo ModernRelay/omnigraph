@@ -389,6 +389,12 @@ them explicit.
   needs a cross-process serialization primitive (for example, a lease-based use
   of the schema-apply lock branch). Design and test that fence before promoting
   multi-process write topologies.
+  Within one process, RFC-030 narrows the operational cost of this boundary:
+  the write-entry heal remains roll-forward-only, but the HTTP server now
+  shields armed writes from caller cancellation and, on `RecoveryRequired`,
+  performs a supervised in-process reopen whose Full sweep resolves
+  rollback-class residuals without a process restart (a reopen IS the
+  documented resolution barrier — no recovery rule is relaxed).
 - **Fork ownership is durable, but Lance ref deletion is not conditional:** a
   first-touch Mutation/Load or BranchMerge table never creates its target ref
   before recovery ownership is durable. Under schema → branch → table gates it

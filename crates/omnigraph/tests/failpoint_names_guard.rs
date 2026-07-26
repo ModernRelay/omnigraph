@@ -33,16 +33,20 @@ fn manifest_dir() -> PathBuf {
 }
 
 /// Production call sites live under each crate's `src`; test call sites live
-/// in the two failpoint integration binaries. This guard file is deliberately
-/// not in the set (it names the patterns as literals itself).
+/// in the failpoint integration binaries (engine, cluster, and — since
+/// RFC-030 — the server's HTTP-boundary suite). This guard file is
+/// deliberately not in the set (it names the patterns as literals itself).
 fn files_to_scan() -> Vec<PathBuf> {
     let engine = manifest_dir();
     let cluster = engine.join("../omnigraph-cluster");
+    let server = engine.join("../omnigraph-server");
     let mut out = Vec::new();
     collect_rs(&engine.join("src"), &mut out);
     collect_rs(&cluster.join("src"), &mut out);
+    collect_rs(&server.join("src"), &mut out);
     out.push(engine.join("tests/failpoints.rs"));
     out.push(cluster.join("tests/failpoints.rs"));
+    out.push(server.join("tests/failpoints.rs"));
     out
 }
 

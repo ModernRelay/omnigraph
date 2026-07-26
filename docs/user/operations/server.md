@@ -1,6 +1,9 @@
 # HTTP Server (`omnigraph-server`)
 
-Axum 0.8 + tokio + utoipa-generated OpenAPI. **Cluster-only boot**: the server always boots from a cluster (`--cluster <dir | s3://…>`) and serves N graphs (N ≥ 1) under cluster routes. There is no longer a single-graph flat-route mode, no positional `<URI>` boot, no `--target`, and no `omnigraph.yaml`-`graphs:`-map boot. All HTTP is nested under `/graphs/{graph_id}/...`; `/healthz` and the management `/graphs` enumeration stay flat.
+Axum 0.8 + tokio + utoipa-generated OpenAPI. **Cluster-only boot**: the server always boots from a cluster (`--cluster <dir | s3://…>`) and serves N configured graphs (N ≥ 1) under cluster routes. In default
+(lenient) mode the *serving* subset may transiently be smaller — even empty —
+while open-quarantined graphs converge under supervision; strict
+`--require-all-graphs` keeps serving = configured. There is no longer a single-graph flat-route mode, no positional `<URI>` boot, no `--target`, and no `omnigraph.yaml`-`graphs:`-map boot. All HTTP is nested under `/graphs/{graph_id}/...`; `/healthz` and the management `/graphs` enumeration stay flat.
 
 ## Boot
 
@@ -26,8 +29,21 @@ state, invalid/unattributable recovery sidecars, unreadable shared catalog
 payloads, cluster policy errors, or zero healthy graphs. Graph-attributed
 pending recovery sidecars and graph-specific startup failures quarantine
 that graph instead; the server logs startup diagnostics and serves the
-remaining healthy graphs. `GET /graphs` enumerates ready/served graphs only,
-so quarantined graphs are absent and their routes return 404.
+remaining healthy graphs.
+
+Quarantine is a **converging, observable state** (RFC-030): the server's
+supervision loop retries the full graph open with capped exponential backoff
+(5 s initial, ×2, 10 min cap, ±10 % jitter), so a graph that failed on a
+transient fault returns to service without a restart. Meanwhile `GET /graphs`
+lists the quarantined graph with `status: "quarantined"` and a `quarantine`
+detail object (`since_unix_secs`, `attempts`, `last_error`,
+`retry_at_unix_secs`); healthy graphs report `status: "serving"`. Routes
+under a quarantined graph answer **503** ("retrying — retry later"), while a
+graph id that was never configured stays 404. The same supervision loop also
+heals a served graph that surfaces `recovery_required` on a write: the
+server reopens the graph in-process (running the engine's full recovery
+sweep) and swaps the healed handle in — in-flight requests on the old handle
+finish unaffected.
 
 Operators who want the original all-or-nothing boot contract can pass
 `--require-all-graphs` or set `OMNIGRAPH_REQUIRE_ALL_GRAPHS=1`. In that mode,
@@ -227,6 +243,37 @@ deprecated alias `/change`), `/load` (and its deprecated alias `/ingest`),
 and `/schema/apply`. Read-only endpoints (`/snapshot`, `/query`, `/read`,
 `/export`, `/branches` GET, `/commits`, `/schema` GET) are not
 admission-gated.
+
+## Client disconnects during writes (RFC-030)
+
+Once a write handler passes authorization and admission, the engine's commit
+protocol runs on a server-owned task, detached from the request connection.
+A client that times out or disconnects mid-request does **not** abort the
+write: the server runs the protocol to its own terminal state — publish, or a
+compensated failure — exactly as if the client had stayed connected. Two
+consequences for clients:
+
+- **A disconnect makes the outcome unknown to you, not failed.** Verify by
+  reading the affected rows before retrying. A retried strict insert is safe
+  by construction: it succeeds or returns `key_conflict` — and a
+  `key_conflict` right after an ambiguous disconnect usually means the first
+  attempt landed.
+- **The admission slot is held until the protocol completes**, not until the
+  connection closes. A disconnecting actor cannot free its own in-flight
+  budget early by hanging up; slots release when the abandoned write
+  finishes.
+- **Composite requests complete as a unit.** A merge with
+  `delete_branch: true` runs the merge and the follow-up source-branch
+  deletion in one server-owned task under one admission slot — a disconnect
+  cannot land the merge and silently skip the requested deletion.
+
+Two quarantine classes exist and behave differently: **open-class**
+quarantine (a graph whose open failed, possibly transiently) is supervised —
+visible in `GET /graphs`, routes answer 503, converges with capped backoff.
+**Config-class** quarantine (stored-query parse or embedding-provider config
+failures at settings time) is deterministic and unfixable by retry, so it
+remains fail-fast: those graphs are skipped (or abort the boot when every
+graph is config-broken) and need `cluster apply` + restart.
 
 ## Body limits
 

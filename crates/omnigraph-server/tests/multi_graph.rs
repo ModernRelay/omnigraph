@@ -539,6 +539,11 @@ rules:
     assert_eq!(ready, vec!["good"]);
     let app = build_app(state);
 
+    // RFC-030 W3: a failed boot open quarantines the graph as OBSERVABLE,
+    // CONFIGURED state — not silent absence. `GET /graphs` lists both graphs
+    // with a status discriminator and quarantine detail; routes under the
+    // quarantined graph answer 503 (retry later), while a never-configured id
+    // stays 404 (no such resource).
     let (status, body) = json_response(
         &app,
         Request::builder()
@@ -549,14 +554,35 @@ rules:
     )
     .await;
     assert_eq!(status, StatusCode::OK, "{body}");
+    let graphs_json = body["graphs"].as_array().unwrap();
     assert_eq!(
-        body["graphs"]
-            .as_array()
-            .unwrap()
+        graphs_json
             .iter()
             .map(|graph| graph["graph_id"].as_str().unwrap())
             .collect::<Vec<_>>(),
-        vec!["good"]
+        vec!["broken", "good"],
+        "GET /graphs must list quarantined graphs alongside serving ones: {body}"
+    );
+    assert_eq!(
+        graphs_json[1]["status"].as_str(),
+        Some("serving"),
+        "healthy graph must report status=serving: {body}"
+    );
+    assert_eq!(
+        graphs_json[0]["status"].as_str(),
+        Some("quarantined"),
+        "failed-open graph must report status=quarantined: {body}"
+    );
+    let quarantine = &graphs_json[0]["quarantine"];
+    assert!(
+        quarantine["last_error"]
+            .as_str()
+            .is_some_and(|err| !err.is_empty()),
+        "quarantine detail must carry the open error: {body}"
+    );
+    assert!(
+        quarantine["attempts"].as_u64().is_some_and(|n| n >= 1),
+        "quarantine detail must count the failed boot open: {body}"
     );
 
     let (status, body) = json_response(
@@ -568,7 +594,250 @@ rules:
             .unwrap(),
     )
     .await;
+    assert_eq!(
+        status,
+        StatusCode::SERVICE_UNAVAILABLE,
+        "a quarantined graph is configured-but-healing: 503, not 404: {body}"
+    );
+
+    // A graph id that was never configured remains a plain 404 — pins the
+    // Quarantined-vs-Gone distinction.
+    let (status, body) = json_response(
+        &app,
+        Request::builder()
+            .uri("/graphs/never-configured/queries")
+            .header("authorization", "Bearer admin-token")
+            .body(Body::empty())
+            .unwrap(),
+    )
+    .await;
     assert_eq!(status, StatusCode::NOT_FOUND, "{body}");
+}
+
+/// RFC-030 W3: quarantine is a CONVERGING state, not a terminal one. A graph
+/// whose boot open failed must reach `serving` without a process restart
+/// once the fault clears — the supervision loop re-drives the full
+/// `open_single_graph` with capped backoff and RCU-publishes the healed
+/// handle. The "transient fault clears" model is deterministic: the graph
+/// RFC-030 review fix (all-quarantined boot): the incident's own topology —
+/// a single-graph deployment whose only graph fails its boot open on a
+/// transient fault — must still boot in lenient mode, serve the quarantine
+/// state observably, and converge once the fault clears. Zero SERVING graphs
+/// with at least one quarantined entry is a valid, converging boot state;
+/// only zero-configured (and settings-time config-class quarantine, which
+/// supervision cannot heal) remain fail-fast.
+#[tokio::test(flavor = "multi_thread")]
+async fn all_quarantined_lenient_boot_serves_and_converges() {
+    let temp = tempfile::tempdir().unwrap();
+    let schema = "\nnode Person {\n  name: String @key\n}\n";
+    let bad_uri = temp.path().join("solo.omni");
+    let server_policy = omnigraph_server::PolicySource::Inline(
+        r#"
+version: 1
+kind: server
+groups:
+  admins: [act-admin]
+rules:
+  - id: admins-list-graphs
+    allow:
+      actors: { group: admins }
+      actions: [graph_list]
+"#
+        .to_string(),
+    );
+    let graphs = vec![omnigraph_server::GraphStartupConfig {
+        graph_id: "solo".to_string(),
+        uri: bad_uri.to_string_lossy().to_string(),
+        policy: None,
+        embedding: None,
+        queries: stored_query_registry(&[]),
+    }];
+    let state = omnigraph_server::open_multi_graph_state(
+        graphs,
+        vec![("act-admin".to_string(), "admin-token".to_string())],
+        Some(&server_policy),
+        temp.path().join("cluster.yaml"),
+        false,
+    )
+    .await
+    .expect(
+        "lenient boot with every graph quarantined must serve so supervision \
+         can converge (RFC-030 W3) — aborting here re-creates the incident's \
+         offline-until-redeploy failure for single-graph deployments",
+    );
+    let _supervision =
+        state.spawn_supervision(omnigraph_server::SupervisorConfig::fast_for_tests());
+    let app = build_app(state);
+
+    // Observable while nothing serves: the one graph is quarantined and its
+    // routes answer 503.
+    let (status, body) = json_response(
+        &app,
+        Request::builder()
+            .uri("/graphs")
+            .header("authorization", "Bearer admin-token")
+            .body(Body::empty())
+            .unwrap(),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(
+        body["graphs"][0]["status"].as_str(),
+        Some("quarantined"),
+        "the solo graph must boot quarantined: {body}"
+    );
+    let (status, body) = json_response(
+        &app,
+        Request::builder()
+            .uri("/graphs/solo/queries")
+            .header("authorization", "Bearer admin-token")
+            .body(Body::empty())
+            .unwrap(),
+    )
+    .await;
+    assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE, "{body}");
+
+    // The fault clears; supervision converges without a restart.
+    Omnigraph::init(bad_uri.to_string_lossy().as_ref(), schema)
+        .await
+        .unwrap();
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    loop {
+        let (status, body) = json_response(
+            &app,
+            Request::builder()
+                .uri("/graphs")
+                .header("authorization", "Bearer admin-token")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        if body["graphs"][0]["status"].as_str() == Some("serving") {
+            break;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "all-quarantined boot never converged to serving (RFC-030 W3); \
+             last listing: {body}"
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+    }
+}
+
+/// root simply does not exist at boot and is initialized while the server
+/// runs.
+#[tokio::test(flavor = "multi_thread")]
+async fn boot_quarantined_graph_converges_to_serving_without_restart() {
+    let temp = tempfile::tempdir().unwrap();
+    let schema = "\nnode Person {\n  name: String @key\n}\n";
+    let good_uri = temp.path().join("good.omni");
+    Omnigraph::init(good_uri.to_string_lossy().as_ref(), schema)
+        .await
+        .unwrap();
+    let bad_uri = temp.path().join("late.omni");
+    let server_policy = omnigraph_server::PolicySource::Inline(
+        r#"
+version: 1
+kind: server
+groups:
+  admins: [act-admin]
+rules:
+  - id: admins-list-graphs
+    allow:
+      actors: { group: admins }
+      actions: [graph_list]
+"#
+        .to_string(),
+    );
+    let graphs = vec![
+        omnigraph_server::GraphStartupConfig {
+            graph_id: "late".to_string(),
+            uri: bad_uri.to_string_lossy().to_string(),
+            policy: None,
+            embedding: None,
+            queries: stored_query_registry(&[]),
+        },
+        omnigraph_server::GraphStartupConfig {
+            graph_id: "good".to_string(),
+            uri: good_uri.to_string_lossy().to_string(),
+            policy: None,
+            embedding: None,
+            queries: stored_query_registry(&[]),
+        },
+    ];
+    let state = omnigraph_server::open_multi_graph_state(
+        graphs,
+        vec![("act-admin".to_string(), "admin-token".to_string())],
+        Some(&server_policy),
+        temp.path().join("cluster.yaml"),
+        false,
+    )
+    .await
+    .unwrap();
+    let _supervision =
+        state.spawn_supervision(omnigraph_server::SupervisorConfig::fast_for_tests());
+    let app = build_app(state);
+
+    // Quarantined and visible while the root is missing.
+    let (status, body) = json_response(
+        &app,
+        Request::builder()
+            .uri("/graphs")
+            .header("authorization", "Bearer admin-token")
+            .body(Body::empty())
+            .unwrap(),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(
+        body["graphs"][1]["status"].as_str(),
+        Some("quarantined"),
+        "late graph must boot quarantined: {body}"
+    );
+
+    // The fault clears: the graph root appears while the server runs.
+    Omnigraph::init(bad_uri.to_string_lossy().as_ref(), schema)
+        .await
+        .unwrap();
+
+    // Convergence: bounded poll of GET /graphs until `late` serves. Red
+    // without the supervision loop (the drain-only skeleton never reopens),
+    // green once the loop re-drives the open and publishes the handle.
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    loop {
+        let (status, body) = json_response(
+            &app,
+            Request::builder()
+                .uri("/graphs")
+                .header("authorization", "Bearer admin-token")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        if body["graphs"][1]["status"].as_str() == Some("serving") {
+            break;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "quarantined graph never converged to serving without a restart \
+             (RFC-030 W3); last listing: {body}"
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+    }
+
+    // And it actually serves.
+    let (status, body) = json_response(
+        &app,
+        Request::builder()
+            .uri("/graphs/late/queries")
+            .header("authorization", "Bearer admin-token")
+            .body(Body::empty())
+            .unwrap(),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "healed graph must serve: {body}");
 }
 
 #[tokio::test(flavor = "multi_thread")]

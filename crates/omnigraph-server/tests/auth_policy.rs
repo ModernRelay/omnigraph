@@ -827,7 +827,9 @@ async fn engine_layer_policy_fires_via_direct_arc_omnigraph_from_new_single() {
     );
     let handle = match state.routing().registry.get(&key) {
         omnigraph_server::RegistryLookup::Ready(handle) => handle,
-        omnigraph_server::RegistryLookup::Gone => panic!("default graph must be registered"),
+        omnigraph_server::RegistryLookup::Quarantined(_) | omnigraph_server::RegistryLookup::Gone => {
+            panic!("default graph must be registered and serving")
+        }
     };
     let engine = Arc::clone(&handle.engine);
 

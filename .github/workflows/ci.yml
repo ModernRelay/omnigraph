@@ -306,6 +306,7 @@ jobs:
           echo "$output" | grep -Fq "fold_delta_remeasure_bytes=402653184" \
             || { echo "::error::Gate R0 RSS evidence line or 384-MiB tripwire changed"; exit 1; }
           cargo test --locked -p omnigraph-cluster --features failpoints --test failpoints
+          cargo test --locked -p omnigraph-server --features failpoints --test failpoints
 
       - name: Commit regenerated openapi.json to PR branch
         if: |
