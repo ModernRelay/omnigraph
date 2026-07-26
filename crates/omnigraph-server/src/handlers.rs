@@ -1785,6 +1785,231 @@ pub(crate) async fn server_commit_show(
     Ok(Json(api::commit_output(&commit)))
 }
 
+// ─── Change feed / diff (RFC-029) ──────────────────────────────────────────
+
+/// Server ceiling on a single diff page. A caller asking for more is clamped
+/// rather than refused, so a client cannot turn the endpoint into an unbounded
+/// materialization (RFC-029 §2.1).
+const DIFF_MAX_LIMIT: usize = 1_000;
+/// Applied when `limit` is omitted, so the row endpoint is never unbounded.
+const DIFF_DEFAULT_LIMIT: usize = 100;
+
+/// One side of a diff, resolved from the mutually-exclusive branch/snapshot
+/// pair. Returns the target plus the label echoed back on the response.
+fn diff_side(
+    side: &str,
+    branch: Option<String>,
+    snapshot: Option<String>,
+) -> std::result::Result<(ReadTarget, String), ApiError> {
+    match (branch, snapshot) {
+        (Some(_), Some(_)) => Err(ApiError::bad_request(format!(
+            "`{side}` and `{side}_snapshot` are mutually exclusive"
+        ))),
+        (None, None) => Err(ApiError::bad_request(format!(
+            "one of `{side}` or `{side}_snapshot` is required"
+        ))),
+        (Some(branch), None) => Ok((ReadTarget::branch(branch.clone()), branch)),
+        (None, Some(snapshot)) => Ok((
+            ReadTarget::snapshot(omnigraph::db::SnapshotId::new(snapshot.clone())),
+            snapshot,
+        )),
+    }
+}
+
+/// Split a repeatable/comma-separated query value into its items.
+fn diff_csv(raw: Option<&String>) -> Option<Vec<String>> {
+    let raw = raw?;
+    let items: Vec<String> = raw
+        .split(',')
+        .map(str::trim)
+        .filter(|item| !item.is_empty())
+        .map(str::to_string)
+        .collect();
+    if items.is_empty() { None } else { Some(items) }
+}
+
+fn diff_kinds(raw: Option<&String>) -> std::result::Result<Option<Vec<EntityKind>>, ApiError> {
+    let Some(items) = diff_csv(raw) else {
+        return Ok(None);
+    };
+    items
+        .iter()
+        .map(|item| match item.to_ascii_lowercase().as_str() {
+            "node" => Ok(EntityKind::Node),
+            "edge" => Ok(EntityKind::Edge),
+            other => Err(ApiError::bad_request(format!(
+                "unknown kind '{other}'; expected `node` or `edge`"
+            ))),
+        })
+        .collect::<std::result::Result<Vec<_>, _>>()
+        .map(Some)
+}
+
+fn diff_ops(raw: Option<&String>) -> std::result::Result<Option<Vec<ChangeOp>>, ApiError> {
+    let Some(items) = diff_csv(raw) else {
+        return Ok(None);
+    };
+    items
+        .iter()
+        .map(|item| match item.to_ascii_lowercase().as_str() {
+            "insert" => Ok(ChangeOp::Insert),
+            "update" => Ok(ChangeOp::Update),
+            "delete" => Ok(ChangeOp::Delete),
+            other => Err(ApiError::bad_request(format!(
+                "unknown op '{other}'; expected `insert`, `update`, or `delete`"
+            ))),
+        })
+        .collect::<std::result::Result<Vec<_>, _>>()
+        .map(Some)
+}
+
+/// Gate a diff on read access to **both** sides.
+///
+/// Two independent `Read` checks rather than one `branch`/`target_branch`
+/// request: `PolicyAction::uses_target_branch_scope()` does not admit `Read`,
+/// so a `target_branch` rule on `read` is rejected by policy `validate()`.
+/// Two checks also express the actual requirement — a diff discloses content
+/// from both sides, so a grant on one must not suffice.
+fn authorize_diff(
+    actor: Option<&ResolvedActor>,
+    policy: Option<&PolicyEngine>,
+    from_label: &str,
+    to_label: &str,
+) -> std::result::Result<(), ApiError> {
+    for branch in [from_label, to_label] {
+        authorize_request(
+            actor,
+            policy,
+            PolicyRequest {
+                action: PolicyAction::Read,
+                branch: Some(branch.to_string()),
+                target_branch: None,
+            },
+        )?;
+    }
+    Ok(())
+}
+
+fn diff_filter(query: &DiffQuery) -> std::result::Result<ChangeFilter, ApiError> {
+    Ok(ChangeFilter {
+        kinds: diff_kinds(query.kinds.as_ref())?,
+        type_names: diff_csv(query.types.as_ref()),
+        ops: diff_ops(query.ops.as_ref())?,
+        limit: None,
+        after: None,
+    })
+}
+
+#[utoipa::path(
+    get,
+    path = "/diff/summary",
+    tag = "changes",
+    operation_id = "getDiffSummary",
+    params(DiffQuery),
+    responses(
+        (status = 200, description = "Whole-diff totals", body = DiffSummaryOutput),
+        (status = 400, description = "Bad request", body = ErrorOutput),
+        (status = 401, description = "Unauthorized", body = ErrorOutput),
+        (status = 403, description = "Forbidden", body = ErrorOutput),
+    ),
+    security(("bearer_token" = [])),
+)]
+/// Totals for what changed between two read targets.
+///
+/// The cheap tier of the change feed: per-op counts and the affected type
+/// names, without the row list. Use `GET /diff` to page the rows. `limit` and
+/// `cursor` are ignored here — totals are whole-diff by definition. Read-only.
+pub(crate) async fn server_diff_summary(
+    Extension(handle): Extension<Arc<GraphHandle>>,
+    actor: Option<Extension<ResolvedActor>>,
+    Query(query): Query<DiffQuery>,
+) -> std::result::Result<Json<DiffSummaryOutput>, ApiError> {
+    let (from_target, from_label) = diff_side("from", query.from.clone(), query.from_snapshot.clone())?;
+    let (to_target, to_label) = diff_side("to", query.to.clone(), query.to_snapshot.clone())?;
+    authorize_diff(
+        actor.as_ref().map(|Extension(actor)| actor),
+        handle.policy.as_deref(),
+        &from_label,
+        &to_label,
+    )?;
+
+    let filter = diff_filter(&query)?;
+    let summary = {
+        let db = &handle.engine;
+        db.diff_summary_between(from_target, to_target, &filter)
+            .await
+            .map_err(ApiError::from_omni)?
+    };
+    Ok(Json(DiffSummaryOutput {
+        from: from_label,
+        to: to_label,
+        from_version: summary.from_version,
+        to_version: summary.to_version,
+        stats: api::change_stats_output(&summary.stats),
+    }))
+}
+
+#[utoipa::path(
+    get,
+    path = "/diff",
+    tag = "changes",
+    operation_id = "getDiff",
+    params(DiffQuery),
+    responses(
+        (status = 200, description = "One page of changes", body = DiffOutput),
+        (status = 400, description = "Bad request", body = ErrorOutput),
+        (status = 401, description = "Unauthorized", body = ErrorOutput),
+        (status = 403, description = "Forbidden", body = ErrorOutput),
+    ),
+    security(("bearer_token" = [])),
+)]
+/// One bounded page of changes between two read targets.
+///
+/// Changes are totally ordered by `(table_key, id)` and carry identity, op,
+/// and (for edges) endpoints — not property values; read those with a query.
+/// `limit` defaults to 100 and is clamped to 1000. When `next_cursor` is
+/// present, pass it back as `cursor` for the next page. `stats` describes the
+/// returned page; call `GET /diff/summary` for whole-diff totals. Read-only.
+pub(crate) async fn server_diff(
+    Extension(handle): Extension<Arc<GraphHandle>>,
+    actor: Option<Extension<ResolvedActor>>,
+    Query(query): Query<DiffQuery>,
+) -> std::result::Result<Json<DiffOutput>, ApiError> {
+    let (from_target, from_label) = diff_side("from", query.from.clone(), query.from_snapshot.clone())?;
+    let (to_target, to_label) = diff_side("to", query.to.clone(), query.to_snapshot.clone())?;
+    authorize_diff(
+        actor.as_ref().map(|Extension(actor)| actor),
+        handle.policy.as_deref(),
+        &from_label,
+        &to_label,
+    )?;
+
+    let after = match query.cursor.as_deref() {
+        Some(token) => Some(api::decode_change_cursor(token).ok_or_else(|| {
+            ApiError::bad_request("malformed `cursor`; pass back the `next_cursor` value verbatim")
+        })?),
+        None => None,
+    };
+    let filter = ChangeFilter {
+        limit: Some(
+            query
+                .limit
+                .unwrap_or(DIFF_DEFAULT_LIMIT)
+                .min(DIFF_MAX_LIMIT),
+        ),
+        after,
+        ..diff_filter(&query)?
+    };
+
+    let change_set = {
+        let db = &handle.engine;
+        db.diff_between(from_target, to_target, &filter)
+            .await
+            .map_err(ApiError::from_omni)?
+    };
+    Ok(Json(api::diff_output(from_label, to_label, &change_set)))
+}
+
 pub(crate) fn read_target_from_request(branch: Option<String>, snapshot: Option<String>) -> ReadTarget {
     if let Some(snapshot) = snapshot {
         ReadTarget::snapshot(omnigraph::db::SnapshotId::new(snapshot))

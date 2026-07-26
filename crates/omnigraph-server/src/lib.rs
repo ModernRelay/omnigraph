@@ -27,8 +27,9 @@ use std::sync::Arc;
 
 use api::{
     BranchCreateOutput, BranchCreateRequest, BranchDeleteOutput, BranchListOutput,
-    BranchMergeOutput, BranchMergeRequest, ChangeOutput, ChangeRequest, CommitListOutput,
-    CommitListQuery, ErrorCode, ErrorOutput, ExportRequest, GraphInfo, GraphListResponse,
+    BranchMergeOutput, BranchMergeRequest, ChangeOutput, ChangeRequest, ChangeStatsOutput,
+    CommitListOutput, CommitListQuery, DiffOutput, DiffQuery, DiffSummaryOutput,
+    EntityChangeOutput, ErrorCode, ErrorOutput, ExportRequest, GraphInfo, GraphListResponse,
     HealthOutput, IngestOutput, IngestRequest, InvokeStoredQueryRequest, InvokeStoredQueryResponse,
     QueriesCatalogOutput, QueryRequest, ReadOutput, ReadRequest, SchemaApplyOutput,
     SchemaApplyRequest, SchemaOutput, SnapshotQuery, ingest_output, schema_apply_output,
@@ -46,6 +47,7 @@ use axum::routing::{delete, get, post};
 use axum::{Json, Router};
 use color_eyre::eyre::{Result, WrapErr, bail, eyre};
 use futures::stream;
+use omnigraph::changes::{ChangeFilter, ChangeOp, EntityKind};
 use omnigraph::db::{Omnigraph, ReadTarget};
 use omnigraph::error::{ManifestConflictDetails, ManifestErrorKind, OmniError};
 use omnigraph::storage::normalize_root_uri;
@@ -111,6 +113,8 @@ fn hash_bearer_token(token: &str) -> BearerTokenHash {
         handlers::server_branch_merge,
         handlers::server_commit_list,
         handlers::server_commit_show,
+        handlers::server_diff_summary,
+        handlers::server_diff,
     ),
     modifiers(&SecurityAddon),
 )]
@@ -1169,6 +1173,13 @@ pub fn build_app(state: AppState) -> Router {
         .route("/branches/merge", post(server_branch_merge))
         .route("/commits", get(server_commit_list))
         .route("/commits/{commit_id}", get(server_commit_show))
+        // RFC-029 change feed. Deliberately NOT `/changes`: `POST /change`
+        // above is the deprecated alias for `mutate`, and a near-identical
+        // path meaning "diff" instead of "write" would be actively
+        // misleading. `/diff/summary` is registered before `/diff` so the
+        // more specific path is not shadowed.
+        .route("/diff/summary", get(server_diff_summary))
+        .route("/diff", get(server_diff))
         .route_layer(middleware::from_fn_with_state(
             state.clone(),
             resolve_graph_handle,

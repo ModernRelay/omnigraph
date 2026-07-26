@@ -4,6 +4,7 @@
 use std::fs;
 use std::sync::Arc;
 
+use axum::Router;
 use axum::body::{Body, to_bytes};
 use axum::http::{Method, Request, StatusCode};
 use omnigraph::db::{Omnigraph, ReadTarget};
@@ -1749,6 +1750,263 @@ async fn ingest_per_actor_admission_cap_returns_429() {
             "429 response must include a Retry-After header; idx {} headers were: {:?}",
             i,
             results[*i].1,
+        );
+    }
+}
+
+// ─── RFC-029 change feed ───────────────────────────────────────────────────
+
+/// Fork `feature` off main and add one row, so there is a known cross-branch
+/// delta to diff.
+async fn app_with_feature_delta() -> (tempfile::TempDir, Router) {
+    let temp = init_loaded_graph().await;
+    let graph = graph_path(temp.path());
+    {
+        let db = Omnigraph::open(graph.to_string_lossy().as_ref())
+            .await
+            .unwrap();
+        db.branch_create_from(ReadTarget::branch("main"), "feature")
+            .await
+            .unwrap();
+        db.load(
+            "feature",
+            r#"{"type":"Person","data":{"name":"Zara","age":31}}"#,
+            LoadMode::Append,
+        )
+        .await
+        .unwrap();
+    }
+    let state = AppState::open(graph.to_string_lossy().to_string())
+        .await
+        .unwrap();
+    (temp, build_app(state))
+}
+
+#[tokio::test]
+async fn diff_summary_route_reports_totals_without_rows() {
+    let (_temp, app) = app_with_feature_delta().await;
+
+    let (status, body) = json_response(
+        &app,
+        Request::builder()
+            .uri(g("/diff/summary?from=main&to=feature"))
+            .method(Method::GET)
+            .body(Body::empty())
+            .unwrap(),
+    )
+    .await;
+
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body["from"], "main");
+    assert_eq!(body["to"], "feature");
+    assert_eq!(body["stats"]["inserts"].as_u64().unwrap(), 1);
+    assert_eq!(body["stats"]["updates"].as_u64().unwrap(), 0);
+    assert_eq!(body["stats"]["deletes"].as_u64().unwrap(), 0);
+    assert_eq!(
+        body["stats"]["types_affected"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|v| v.as_str().unwrap())
+            .collect::<Vec<_>>(),
+        vec!["Person"]
+    );
+    // The cheap tier must not carry a row list at all.
+    assert!(
+        body.get("changes").is_none(),
+        "summary must not return rows: {body}"
+    );
+}
+
+#[tokio::test]
+async fn diff_route_returns_identity_rows_not_property_values() {
+    let (_temp, app) = app_with_feature_delta().await;
+
+    let (status, body) = json_response(
+        &app,
+        Request::builder()
+            .uri(g("/diff?from=main&to=feature"))
+            .method(Method::GET)
+            .body(Body::empty())
+            .unwrap(),
+    )
+    .await;
+
+    assert_eq!(status, StatusCode::OK);
+    let changes = body["changes"].as_array().unwrap();
+    assert_eq!(changes.len(), 1);
+    assert_eq!(changes[0]["op"], "insert");
+    assert_eq!(changes[0]["kind"], "node");
+    assert_eq!(changes[0]["type_name"], "Person");
+    // Identity feed, not a value feed — no property payload rides along.
+    assert!(
+        changes[0].get("age").is_none() && changes[0].get("name").is_none(),
+        "diff rows must not carry property values: {}",
+        changes[0]
+    );
+    // Nothing more to page.
+    assert!(body.get("next_cursor").is_none(), "unexpected cursor: {body}");
+}
+
+/// `limit` bounds the page and the cursor walks the rest, over the wire.
+#[tokio::test]
+async fn diff_route_pages_with_cursor_without_duplicates() {
+    let temp = init_loaded_graph().await;
+    let graph = graph_path(temp.path());
+    {
+        let db = Omnigraph::open(graph.to_string_lossy().as_ref())
+            .await
+            .unwrap();
+        db.branch_create_from(ReadTarget::branch("main"), "feature")
+            .await
+            .unwrap();
+        let mut rows = String::new();
+        for i in 0..5 {
+            rows.push_str(&format!(
+                "{{\"type\":\"Person\",\"data\":{{\"name\":\"paged-{i}\",\"age\":{}}}}}\n",
+                20 + i
+            ));
+        }
+        db.load("feature", &rows, LoadMode::Append).await.unwrap();
+    }
+    let state = AppState::open(graph.to_string_lossy().to_string())
+        .await
+        .unwrap();
+    let app = build_app(state);
+
+    let mut seen: Vec<String> = Vec::new();
+    let mut uri = g("/diff?from=main&to=feature&limit=2");
+    for _ in 0..10 {
+        let (status, body) = json_response(
+            &app,
+            Request::builder()
+                .uri(&uri)
+                .method(Method::GET)
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        let page = body["changes"].as_array().unwrap();
+        assert!(page.len() <= 2, "limit not honored: {body}");
+        seen.extend(page.iter().map(|c| c["id"].as_str().unwrap().to_string()));
+        match body["next_cursor"].as_str() {
+            Some(cursor) => {
+                uri = g(&format!(
+                    "/diff?from=main&to=feature&limit=2&cursor={cursor}"
+                ));
+            }
+            None => break,
+        }
+    }
+
+    let mut unique = seen.clone();
+    unique.sort();
+    unique.dedup();
+    assert_eq!(seen.len(), unique.len(), "cursor paging repeated a row: {seen:?}");
+    assert_eq!(seen.len(), 5, "cursor paging lost rows: {seen:?}");
+}
+
+/// A diff discloses content from both sides, so read access to one side must
+/// not be enough. The policy grants `read` on `main` only.
+#[tokio::test]
+async fn diff_route_requires_read_on_both_sides() {
+    let temp = init_loaded_graph().await;
+    let graph = graph_path(temp.path());
+    {
+        let db = Omnigraph::open(graph.to_string_lossy().as_ref())
+            .await
+            .unwrap();
+        db.branch_create_from(ReadTarget::branch("main"), "secret")
+            .await
+            .unwrap();
+    }
+    let token = "difftoken";
+    let policy_path = temp.path().join("policy.yaml");
+    fs::write(
+        &policy_path,
+        r#"
+version: 1
+groups:
+  readers: ["default"]
+protected_branches: [main]
+rules:
+  - id: readers-read-main-only
+    allow:
+      actors: { group: readers }
+      actions: [read]
+      branch_scope: { equals: main }
+"#,
+    )
+    .unwrap();
+    let state = AppState::open_with_bearer_tokens_and_policy(
+        graph.to_string_lossy().to_string(),
+        vec![("default".to_string(), token.to_string())],
+        Some(&policy_path),
+    )
+    .await
+    .unwrap();
+    let app = build_app(state);
+
+    // main -> main is permitted: both sides are `main`.
+    let (ok_status, _) = json_response(
+        &app,
+        get_request(&g("/diff/summary?from=main&to=main"), token),
+    )
+    .await;
+    assert_eq!(ok_status, StatusCode::OK);
+
+    // main -> secret must be refused on the `secret` side.
+    let (denied_status, denied_body) = json_response(
+        &app,
+        get_request(&g("/diff/summary?from=main&to=secret"), token),
+    )
+    .await;
+    assert_eq!(
+        denied_status,
+        StatusCode::FORBIDDEN,
+        "a read grant on one side must not authorize the other: {denied_body}"
+    );
+
+    // ...and symmetrically when the ungranted branch is the `from` side.
+    let (reversed_status, _) = json_response(
+        &app,
+        get_request(&g("/diff/summary?from=secret&to=main"), token),
+    )
+    .await;
+    assert_eq!(reversed_status, StatusCode::FORBIDDEN);
+}
+
+#[tokio::test]
+async fn diff_route_rejects_missing_bounds_and_malformed_cursor() {
+    let (_temp, app) = app_with_feature_delta().await;
+
+    for uri in [
+        // Unbounded whole-graph diff is not an exposed operation.
+        g("/diff"),
+        g("/diff?from=main"),
+        g("/diff?to=feature"),
+        // Mutually exclusive pair.
+        g("/diff?from=main&from_snapshot=abc&to=feature"),
+        // Unparseable filters.
+        g("/diff?from=main&to=feature&kinds=nodes"),
+        g("/diff?from=main&to=feature&ops=upsert"),
+        // Cursor must round-trip verbatim.
+        g("/diff?from=main&to=feature&cursor=!!!"),
+    ] {
+        let (status, body) = json_response(
+            &app,
+            Request::builder()
+                .uri(&uri)
+                .method(Method::GET)
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await;
+        assert_eq!(
+            status,
+            StatusCode::BAD_REQUEST,
+            "expected 400 for {uri}, got {status}: {body}"
         );
     }
 }
