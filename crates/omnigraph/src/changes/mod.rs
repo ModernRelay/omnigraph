@@ -1,11 +1,16 @@
 use std::collections::{HashMap, HashSet};
 
-use arrow_array::{Array, RecordBatch, StringArray, UInt64Array};
+use arrow_array::{
+    Array, BinaryArray, FixedSizeListArray, Float32Array, LargeBinaryArray, RecordBatch,
+    StringArray, UInt64Array,
+};
 use arrow_cast::display::array_value_to_string;
+use arrow_schema::DataType;
 use lance::dataset::scanner::ColumnOrdering;
+use sha2::{Digest, Sha256};
 
 use crate::db::SubTableEntry;
-use crate::db::manifest::Snapshot;
+use crate::db::manifest::{Snapshot, TableIdentity};
 use crate::error::Result;
 use crate::storage_layer::{SnapshotHandle, TableStorage};
 use crate::table_store::TableStore;
@@ -42,11 +47,33 @@ pub struct EntityChange {
     pub endpoints: Option<Endpoints>,
 }
 
+/// Keyset position in a change list, ordered by `(table_key, id)`.
+///
+/// The change list is totally ordered on that pair, so a cursor is an exact
+/// resume point rather than an offset: it cannot skip or repeat rows if the
+/// underlying snapshots are unchanged (and both snapshots are immutable, so
+/// they are).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ChangeCursor {
+    pub table_key: String,
+    pub id: String,
+}
+
 #[derive(Debug, Clone, Default)]
 pub struct ChangeFilter {
     pub kinds: Option<Vec<EntityKind>>,
     pub type_names: Option<Vec<String>>,
     pub ops: Option<Vec<ChangeOp>>,
+    /// Maximum changes to return. `None` is unbounded and is only appropriate
+    /// for embedded callers that can absorb the whole change set; every
+    /// exposed surface (HTTP, CLI) sets this.
+    ///
+    /// The bound stops table processing once satisfied, so a small limit does
+    /// not walk the remaining tables. It does not yet bound work *within* a
+    /// single table — that needs per-table pushdown (RFC-029 §7).
+    pub limit: Option<usize>,
+    /// Resume strictly after this position. Pair with `limit` to page.
+    pub after: Option<ChangeCursor>,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -57,13 +84,34 @@ pub struct ChangeStats {
     pub types_affected: Vec<String>,
 }
 
+/// Whole-diff totals with the versions they were computed over.
+///
+/// The cheap tier's return type — deliberately has no `changes` field, so a
+/// summary caller cannot accidentally depend on a row list being present.
+#[derive(Debug, Clone)]
+pub struct ChangeSummary {
+    pub from_version: u64,
+    pub to_version: u64,
+    pub stats: ChangeStats,
+}
+
 #[derive(Debug, Clone)]
 pub struct ChangeSet {
     pub from_version: u64,
     pub to_version: u64,
     pub branch: Option<String>,
+    /// Totally ordered by `(table_key, id)`.
     pub changes: Vec<EntityChange>,
+    /// Statistics for the **returned page**. When `ChangeFilter::limit` is set
+    /// these are not whole-diff totals — use [`diff_summary_snapshots`] for
+    /// those. This split is deliberate: whole-diff totals cannot be produced
+    /// without walking the whole diff, which is exactly what a bounded page
+    /// exists to avoid.
     pub stats: ChangeStats,
+    /// Set when the page was truncated by `limit`; feed back as
+    /// `ChangeFilter::after` to continue. `None` means the change list is
+    /// exhausted.
+    pub next_cursor: Option<ChangeCursor>,
 }
 
 // ─── Filter helpers ─────────────────────────────────────────────────────────
@@ -104,6 +152,88 @@ impl ChangeFilter {
 
 // ─── Core diff ──────────────────────────────────────────────────────────────
 
+/// Where the walk sends each classified change.
+///
+/// The two tiers share one walk so they cannot drift in what they count, but
+/// only `Rows` retains the change list. `Totals` folds each change into
+/// counters and drops it, which is what lets the summary tier answer
+/// whole-diff questions without an O(changes) allocation.
+enum ChangeSink {
+    Rows(Vec<EntityChange>),
+    Totals {
+        inserts: usize,
+        updates: usize,
+        deletes: usize,
+        types: HashSet<String>,
+    },
+}
+
+impl ChangeSink {
+    fn totals() -> Self {
+        Self::Totals {
+            inserts: 0,
+            updates: 0,
+            deletes: 0,
+            types: HashSet::new(),
+        }
+    }
+
+    fn accept(&mut self, change: EntityChange) {
+        match self {
+            Self::Rows(rows) => rows.push(change),
+            Self::Totals {
+                inserts,
+                updates,
+                deletes,
+                types,
+            } => {
+                match change.op {
+                    ChangeOp::Insert => *inserts += 1,
+                    ChangeOp::Update => *updates += 1,
+                    ChangeOp::Delete => *deletes += 1,
+                }
+                if !types.contains(&change.type_name) {
+                    types.insert(change.type_name);
+                }
+            }
+        }
+    }
+
+    /// Number of changes accepted so far — the quantity `limit` bounds.
+    fn len(&self) -> usize {
+        match self {
+            Self::Rows(rows) => rows.len(),
+            Self::Totals {
+                inserts,
+                updates,
+                deletes,
+                ..
+            } => inserts + updates + deletes,
+        }
+    }
+
+    fn into_stats(self) -> ChangeStats {
+        match self {
+            Self::Rows(rows) => compute_stats(&rows),
+            Self::Totals {
+                inserts,
+                updates,
+                deletes,
+                types,
+            } => {
+                let mut types_affected: Vec<String> = types.into_iter().collect();
+                types_affected.sort();
+                ChangeStats {
+                    inserts,
+                    updates,
+                    deletes,
+                    types_affected,
+                }
+            }
+        }
+    }
+}
+
 /// Net-current diff between two snapshots.
 ///
 /// Uses a three-level algorithm:
@@ -117,6 +247,32 @@ pub(crate) async fn diff_snapshots(
     filter: &ChangeFilter,
     branch: Option<String>,
 ) -> Result<ChangeSet> {
+    let mut sink = ChangeSink::Rows(Vec::new());
+    let next_cursor = walk_changes(table_store, from, to, filter, &mut sink).await?;
+    let ChangeSink::Rows(changes) = sink else {
+        unreachable!("this walk was given the Rows sink")
+    };
+    let stats = compute_stats(&changes);
+    Ok(ChangeSet {
+        from_version: from.version(),
+        to_version: to.version(),
+        branch,
+        changes,
+        stats,
+        next_cursor,
+    })
+}
+
+/// Walk the change list, sending each classified change to `sink`.
+///
+/// Returns the resume cursor when `filter.limit` truncated the walk.
+async fn walk_changes(
+    table_store: &TableStore,
+    from: &Snapshot,
+    to: &Snapshot,
+    filter: &ChangeFilter,
+    sink: &mut ChangeSink,
+) -> Result<Option<ChangeCursor>> {
     let from_by_identity = from
         .entries()
         .map(|entry| (entry.identity, entry))
@@ -125,15 +281,46 @@ pub(crate) async fn diff_snapshots(
         .entries()
         .map(|entry| (entry.identity, entry))
         .collect::<HashMap<_, _>>();
-    let all_identities = from_by_identity
+    // Resolve each identity to the table_key the change list is ordered by,
+    // then walk in that order. This previously iterated a `HashSet`, leaving
+    // table order unspecified — both a deny-list violation ("hash-map
+    // iteration order in result ordering") and incompatible with the keyset
+    // cursor, which needs a total order to resume against.
+    let mut ordered: Vec<(&str, TableIdentity)> = from_by_identity
         .keys()
         .chain(to_by_identity.keys())
         .copied()
-        .collect::<HashSet<_>>();
+        .collect::<HashSet<_>>()
+        .into_iter()
+        .map(|identity| {
+            // Prefer the destination alias for a rename; a removed table has
+            // only its source alias. Logical pairing never depends on either
+            // name — this is presentation and ordering only.
+            let table_key = to_by_identity
+                .get(&identity)
+                .or_else(|| from_by_identity.get(&identity))
+                .expect("identity came from one snapshot")
+                .table_key
+                .as_str();
+            (table_key, identity)
+        })
+        .collect();
+    // Identity breaks ties so a duplicated alias cannot reintroduce
+    // nondeterminism.
+    ordered.sort_by(|a, b| a.0.cmp(b.0).then_with(|| a.1.cmp(&b.1)));
 
-    let mut changes = Vec::new();
+    // Tracks the last accepted position so a truncated walk can report where
+    // to resume; the sink itself does not necessarily retain rows.
+    let mut last_position: Option<ChangeCursor> = None;
+    // Set when a change was found that the page had no room for. That is
+    // strictly stronger than "the page is full": a page filled exactly to the
+    // limit with nothing after it must report no cursor.
+    let mut overflowed = false;
 
-    for identity in all_identities {
+    for (_, identity) in ordered {
+        if overflowed {
+            break;
+        }
         let from_entry = from_by_identity.get(&identity).copied();
         let to_entry = to_by_identity.get(&identity).copied();
         // Prefer the destination alias for a rename; a removed table has only
@@ -149,6 +336,14 @@ pub(crate) async fn diff_snapshots(
         // Skip if both snapshots have identical state for this table
         if same_state(from_entry, to_entry) {
             continue;
+        }
+
+        // Cursor: whole tables before the resume point are skipped without
+        // being opened at all.
+        if let Some(after) = &filter.after {
+            if table_key.as_str() < after.table_key.as_str() {
+                continue;
+            }
         }
 
         let (kind, type_name) = parse_table_key(table_key);
@@ -182,24 +377,70 @@ pub(crate) async fn diff_snapshots(
             .await?
         };
 
+        let mut table_changes = table_changes;
+        // Per-table id order. The cross-branch merge and the added/removed
+        // scans already emit in id order, but the same-lineage path appends
+        // deletes after inserts/updates, so it does not. Sorting here is what
+        // makes `(table_key, id)` a total order over the whole change list.
+        table_changes.sort_by(|a, b| a.id.cmp(&b.id));
+
         for mut c in table_changes {
+            // Resume strictly after the cursor within its own table.
+            if let Some(after) = &filter.after {
+                if table_key.as_str() == after.table_key.as_str() && c.id <= after.id {
+                    continue;
+                }
+            }
+            // A change exists but the page is full: stop without accepting it,
+            // so the sink never holds more than `limit`.
+            if filter.limit.is_some_and(|limit| sink.len() >= limit) {
+                overflowed = true;
+                break;
+            }
             c.table_key = table_key.clone();
             c.kind = kind;
             c.type_name = type_name.to_string();
             if c.manifest_version == 0 {
                 c.manifest_version = to.version();
             }
-            changes.push(c);
+            last_position = Some(ChangeCursor {
+                table_key: c.table_key.clone(),
+                id: c.id.clone(),
+            });
+            sink.accept(c);
         }
     }
 
-    let stats = compute_stats(&changes);
-    Ok(ChangeSet {
+    Ok(if overflowed { last_position } else { None })
+}
+
+/// Whole-diff totals without materializing the change list.
+///
+/// The scan cost is the same as [`diff_snapshots`] — the rows still have to be
+/// classified — but the caller never builds `Vec<EntityChange>`, which is three
+/// `String` clones (`table_key`, `type_name`, `id`) plus an optional
+/// `Endpoints` per change. On a large branch that is the difference between a
+/// summary that fits in memory and one that does not.
+pub(crate) async fn diff_summary_snapshots(
+    table_store: &TableStore,
+    from: &Snapshot,
+    to: &Snapshot,
+    filter: &ChangeFilter,
+) -> Result<ChangeSummary> {
+    // Totals are whole-diff by definition, so page bounds must not apply.
+    let unbounded = ChangeFilter {
+        kinds: filter.kinds.clone(),
+        type_names: filter.type_names.clone(),
+        ops: filter.ops.clone(),
+        limit: None,
+        after: None,
+    };
+    let mut sink = ChangeSink::totals();
+    walk_changes(table_store, from, to, &unbounded, &mut sink).await?;
+    Ok(ChangeSummary {
         from_version: from.version(),
         to_version: to.version(),
-        branch,
-        changes,
-        stats,
+        stats: sink.into_stats(),
     })
 }
 
@@ -410,7 +651,10 @@ async fn diff_table_added(
     }
     let storage: &dyn TableStorage = table_store;
     let ds = storage.open_snapshot_at_entry(to_entry).await?;
-    let rows = scan_all_rows_ordered(storage, &ds, is_edge).await?;
+    // Every row of an added table is unconditionally an insert, so no
+    // signature is needed. This previously scanned every column and built a
+    // full signature that was then discarded.
+    let rows = scan_identity_rows_ordered(storage, &ds, is_edge).await?;
     Ok(rows
         .into_iter()
         .map(|r| entity_change_from_row(&r, ChangeOp::Insert, is_edge))
@@ -428,7 +672,8 @@ async fn diff_table_removed(
     }
     let storage: &dyn TableStorage = table_store;
     let ds = storage.open_snapshot_at_entry(from_entry).await?;
-    let rows = scan_all_rows_ordered(storage, &ds, is_edge).await?;
+    // Same as the added case: every row is unconditionally a delete.
+    let rows = scan_identity_rows_ordered(storage, &ds, is_edge).await?;
     Ok(rows
         .into_iter()
         .map(|r| entity_change_from_row(&r, ChangeOp::Delete, is_edge))
@@ -445,6 +690,31 @@ async fn scan_with_filter(
     filter_sql: &str,
 ) -> Result<Vec<ScannedRow>> {
     let batches = storage.scan(ds, Some(cols), Some(filter_sql), None).await?;
+    Ok(extract_rows(&batches))
+}
+
+/// Scan identity columns only, ordered by id.
+///
+/// For callers that classify every row the same way (a wholly added or wholly
+/// removed table), so no value comparison is required.
+async fn scan_identity_rows_ordered(
+    storage: &dyn TableStorage,
+    ds: &SnapshotHandle,
+    is_edge: bool,
+) -> Result<Vec<ScannedRow>> {
+    let cols: Vec<&str> = if is_edge {
+        vec!["id", "src", "dst"]
+    } else {
+        vec!["id"]
+    };
+    let batches = storage
+        .scan(
+            ds,
+            Some(&cols),
+            None,
+            Some(vec![ColumnOrdering::asc_nulls_last("id".to_string())]),
+        )
+        .await?;
     Ok(extract_rows(&batches))
 }
 
@@ -503,12 +773,23 @@ async fn scan_id_set(
 
 // ─── Row extraction ─────────────────────────────────────────────────────────
 
+/// Fixed-width digest of a row's user-visible column values.
+///
+/// This used to be the stringified columns joined together and retained per
+/// row, so a table with a `Vector(1536)` or a `Blob` column paid the full
+/// rendered width of every cell for every row of *both* snapshots. Comparison
+/// only ever asked "are these two rows equal", so a digest answers the same
+/// question in 16 bytes.
+type RowSignature = [u8; 16];
+
+const EMPTY_SIGNATURE: RowSignature = [0u8; 16];
+
 #[derive(Debug, Clone)]
 struct ScannedRow {
     id: String,
     src: Option<String>,
     dst: Option<String>,
-    signature: String,
+    signature: RowSignature,
     change_version: Option<u64>,
 }
 
@@ -530,7 +811,8 @@ fn extract_rows(batches: &[RecordBatch]) -> Vec<ScannedRow> {
                 id: ids.value(i).to_string(),
                 src: srcs.map(|a| a.value(i).to_string()),
                 dst: dsts.map(|a| a.value(i).to_string()),
-                signature: String::new(),
+                // Callers of this path never compare signatures.
+                signature: EMPTY_SIGNATURE,
                 change_version: batch
                     .column_by_name("_row_last_updated_at_version")
                     .and_then(|c| c.as_any().downcast_ref::<UInt64Array>())
@@ -563,20 +845,39 @@ fn extract_rows_with_signature(batches: &[RecordBatch], is_edge: bool) -> Vec<Sc
             None
         };
         for i in 0..ids.len() {
-            let mut values = Vec::with_capacity(batch.num_columns());
+            let mut hasher = Sha256::new();
             for (field, col) in batch.schema().fields().iter().zip(batch.columns()) {
                 if field.name().starts_with("_row_") {
                     continue;
                 }
-                if let Ok(v) = array_value_to_string(col.as_ref(), i) {
-                    values.push(v);
+                // Field-separated so ("ab","c") and ("a","bc") differ.
+                hasher.update([0x1f]);
+                match col.data_type() {
+                    // Wide binary payloads: hash the raw bytes rather than
+                    // paying `array_value_to_string` to render them. This is
+                    // the allocation the digest exists to avoid.
+                    DataType::FixedSizeList(_, _) | DataType::LargeBinary | DataType::Binary => {
+                        hash_raw_cell(&mut hasher, col.as_ref(), i);
+                    }
+                    // Everything else keeps the exact rendering the previous
+                    // string signature compared, so classification is
+                    // unchanged.
+                    _ => {
+                        if let Ok(v) = array_value_to_string(col.as_ref(), i) {
+                            hasher.update(v.as_bytes());
+                        }
+                    }
                 }
             }
+            let digest = hasher.finalize();
+            let mut signature = EMPTY_SIGNATURE;
+            signature.copy_from_slice(&digest[..16]);
+
             rows.push(ScannedRow {
                 id: ids.value(i).to_string(),
                 src: srcs.map(|a| a.value(i).to_string()),
                 dst: dsts.map(|a| a.value(i).to_string()),
-                signature: values.join("\x1f"),
+                signature,
                 change_version: batch
                     .column_by_name("_row_last_updated_at_version")
                     .and_then(|c| c.as_any().downcast_ref::<UInt64Array>())
@@ -585,6 +886,55 @@ fn extract_rows_with_signature(batches: &[RecordBatch], is_edge: bool) -> Vec<Sc
         }
     }
     rows
+}
+
+/// Hash a wide binary cell without rendering it to a string.
+///
+/// Deliberately goes through the typed accessors rather than the underlying
+/// buffers: `FixedSizeListArray::value` returns a *slice* of the shared child
+/// array, so hashing its raw buffers would ignore the slice offset and make
+/// distinct rows collide. Iterating the typed values respects offset and
+/// length.
+fn hash_raw_cell(hasher: &mut Sha256, col: &dyn Array, i: usize) {
+    if col.is_null(i) {
+        hasher.update([0x00]);
+        return;
+    }
+    match col.data_type() {
+        DataType::LargeBinary => {
+            if let Some(a) = col.as_any().downcast_ref::<LargeBinaryArray>() {
+                hasher.update(a.value(i));
+                return;
+            }
+        }
+        DataType::Binary => {
+            if let Some(a) = col.as_any().downcast_ref::<BinaryArray>() {
+                hasher.update(a.value(i));
+                return;
+            }
+        }
+        DataType::FixedSizeList(_, _) => {
+            if let Some(a) = col.as_any().downcast_ref::<FixedSizeListArray>() {
+                let child = a.value(i);
+                if let Some(floats) = child.as_any().downcast_ref::<Float32Array>() {
+                    for value in floats.iter() {
+                        match value {
+                            Some(v) => hasher.update(v.to_le_bytes()),
+                            None => hasher.update([0xff]),
+                        }
+                    }
+                    return;
+                }
+            }
+        }
+        _ => {}
+    }
+    // Unrecognized shape: fall back to the rendering the previous signature
+    // used, so an unexpected type is still compared rather than silently
+    // treated as unchanged.
+    if let Ok(v) = array_value_to_string(col, i) {
+        hasher.update(v.as_bytes());
+    }
 }
 
 fn entity_change_from_row(row: &ScannedRow, op: ChangeOp, is_edge: bool) -> EntityChange {

@@ -767,3 +767,251 @@ async fn diff_commits_ignores_row_version_only_differences() {
         change_set.changes
     );
 }
+
+// ─── RFC-029: bounded, ordered, tiered change feed ─────────────────────────
+//
+// These cover the three defects RFC-029 records: unbounded materialization,
+// signature retention of every column, and a summary gated behind the full
+// row build. They also pin the deterministic ordering the keyset cursor
+// depends on — `diff_snapshots` previously walked table identities through a
+// `HashSet`, so table order was unspecified (a deny-list violation in its own
+// right: "hash-map iteration order in result ordering").
+
+// Six types, not three: the pre-fix implementation walked identities through a
+// `HashSet`, so a narrow schema had a real chance of coming out sorted by luck
+// and showing a false green. Six makes an accidental sort ~1/720.
+const RFC029_SCHEMA: &str = r#"
+node Alpha   { name: String @key }
+node Beta    { name: String @key }
+node Gamma   { name: String @key }
+node Delta   { name: String @key }
+node Epsilon { name: String @key }
+node Zeta    { name: String @key }
+"#;
+
+const RFC029_TYPES: [&str; 6] = ["Alpha", "Beta", "Gamma", "Delta", "Epsilon", "Zeta"];
+
+/// Load `count` rows into each of the RFC-029 node types.
+async fn load_rfc029_rows(db: &Omnigraph, branch: &str, prefix: &str, count: usize) {
+    let mut rows = String::new();
+    for type_name in RFC029_TYPES {
+        for i in 0..count {
+            rows.push_str(&format!(
+                "{{\"type\":\"{type_name}\",\"data\":{{\"name\":\"{prefix}-{i}\"}}}}\n"
+            ));
+        }
+    }
+    db.load(branch, &rows, LoadMode::Merge).await.unwrap();
+}
+
+/// The change list is ordered by `(table_key, id)`. Keyset pagination is only
+/// correct against a total order, and callers depend on stable output ordering
+/// per Hyrum's Law once it is exposed over HTTP.
+#[tokio::test]
+async fn diff_changes_are_ordered_by_table_key_then_id() {
+    let dir = tempfile::tempdir().unwrap();
+    let uri = dir.path().to_str().unwrap();
+    let db = Omnigraph::init(uri, RFC029_SCHEMA).await.unwrap();
+    let before = snapshot_id(&db, "main").await.unwrap();
+    load_rfc029_rows(&db, "main", "row", 12).await;
+    let after = snapshot_id(&db, "main").await.unwrap();
+
+    let cs = db
+        .diff_between(
+            ReadTarget::Snapshot(before),
+            ReadTarget::Snapshot(after),
+            &ChangeFilter::default(),
+        )
+        .await
+        .unwrap();
+
+    let observed: Vec<(String, String)> = cs
+        .changes
+        .iter()
+        .map(|c| (c.table_key.clone(), c.id.clone()))
+        .collect();
+    let mut expected = observed.clone();
+    expected.sort();
+    assert_eq!(
+        observed, expected,
+        "change list must be totally ordered by (table_key, id)"
+    );
+    assert_eq!(cs.changes.len(), 12 * RFC029_TYPES.len());
+}
+
+/// `limit` bounds the returned page and yields a resumable cursor. The bound
+/// must be enforced while accumulating, not by truncating a fully-built vector
+/// — that is the whole point of the defect RFC-029 §2.1 records.
+#[tokio::test]
+async fn diff_respects_limit_and_returns_a_cursor() {
+    let dir = tempfile::tempdir().unwrap();
+    let uri = dir.path().to_str().unwrap();
+    let db = Omnigraph::init(uri, RFC029_SCHEMA).await.unwrap();
+    let before = snapshot_id(&db, "main").await.unwrap();
+    load_rfc029_rows(&db, "main", "row", 10).await;
+    let after = snapshot_id(&db, "main").await.unwrap();
+
+    let filter = ChangeFilter {
+        limit: Some(7),
+        ..Default::default()
+    };
+    let cs = db
+        .diff_between(
+            ReadTarget::Snapshot(before),
+            ReadTarget::Snapshot(after),
+            &filter,
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(cs.changes.len(), 7, "limit must bound the page");
+    assert!(
+        cs.next_cursor.is_some(),
+        "a truncated page must carry a resume cursor"
+    );
+    // Page-scoped stats: totals come from the summary tier.
+    assert_eq!(cs.stats.inserts, 7);
+}
+
+/// Paging with the cursor covers the full change set exactly once — no
+/// duplicates across page boundaries, no gaps, and a terminal page whose
+/// cursor is `None`.
+#[tokio::test]
+async fn diff_cursor_pages_cover_the_change_set_exactly_once() {
+    let dir = tempfile::tempdir().unwrap();
+    let uri = dir.path().to_str().unwrap();
+    let db = Omnigraph::init(uri, RFC029_SCHEMA).await.unwrap();
+    let before = snapshot_id(&db, "main").await.unwrap();
+    load_rfc029_rows(&db, "main", "row", 10).await;
+    let after = snapshot_id(&db, "main").await.unwrap();
+
+    let unbounded = db
+        .diff_between(
+            ReadTarget::Snapshot(before.clone()),
+            ReadTarget::Snapshot(after.clone()),
+            &ChangeFilter::default(),
+        )
+        .await
+        .unwrap();
+
+    let mut paged: Vec<(String, String)> = Vec::new();
+    let mut cursor = None;
+    let mut pages = 0;
+    loop {
+        let filter = ChangeFilter {
+            limit: Some(4),
+            after: cursor.clone(),
+            ..Default::default()
+        };
+        let page = db
+            .diff_between(
+                ReadTarget::Snapshot(before.clone()),
+                ReadTarget::Snapshot(after.clone()),
+                &filter,
+            )
+            .await
+            .unwrap();
+        paged.extend(
+            page.changes
+                .iter()
+                .map(|c| (c.table_key.clone(), c.id.clone())),
+        );
+        pages += 1;
+        assert!(pages < 50, "paging failed to terminate");
+        match page.next_cursor {
+            Some(next) => cursor = Some(next),
+            None => break,
+        }
+    }
+
+    let expected: Vec<(String, String)> = unbounded
+        .changes
+        .iter()
+        .map(|c| (c.table_key.clone(), c.id.clone()))
+        .collect();
+    assert_eq!(
+        paged, expected,
+        "paged traversal must reproduce the unbounded change list exactly"
+    );
+}
+
+/// The summary tier reports the same totals as a full diff without the caller
+/// materializing the row list.
+#[tokio::test]
+async fn diff_summary_matches_the_full_diff_totals() {
+    let dir = tempfile::tempdir().unwrap();
+    let uri = dir.path().to_str().unwrap();
+    let db = Omnigraph::init(uri, RFC029_SCHEMA).await.unwrap();
+    let before = snapshot_id(&db, "main").await.unwrap();
+    load_rfc029_rows(&db, "main", "row", 5).await;
+    let after = snapshot_id(&db, "main").await.unwrap();
+
+    let full = db
+        .diff_between(
+            ReadTarget::Snapshot(before.clone()),
+            ReadTarget::Snapshot(after.clone()),
+            &ChangeFilter::default(),
+        )
+        .await
+        .unwrap();
+    let summary = db
+        .diff_summary_between(
+            ReadTarget::Snapshot(before),
+            ReadTarget::Snapshot(after),
+            &ChangeFilter::default(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(summary.stats.inserts, full.stats.inserts);
+    assert_eq!(summary.stats.updates, full.stats.updates);
+    assert_eq!(summary.stats.deletes, full.stats.deletes);
+    assert_eq!(summary.stats.types_affected, full.stats.types_affected);
+    assert_eq!(summary.from_version, full.from_version);
+    assert_eq!(summary.to_version, full.to_version);
+    assert_eq!(summary.stats.inserts, 5 * RFC029_TYPES.len());
+}
+
+/// Regression guard for the digest change in RFC-029 §3.3.
+///
+/// The row signature stops retaining every stringified column, but it must not
+/// stop *observing* any column: a row whose only difference is its embedding is
+/// still an `Update`. Dropping vector/blob columns from the signature would be
+/// cheaper and would silently lose this change — that alternative is explicitly
+/// rejected. Cross-branch is the path that compares signatures at all.
+#[tokio::test]
+async fn diff_reports_an_embedding_only_update_across_branches() {
+    let dir = tempfile::tempdir().unwrap();
+    let uri = dir.path().to_str().unwrap();
+    let db = Omnigraph::init(
+        uri,
+        "node Chunk {\n  slug: String @key\n  embedding: Vector(8)\n}\n",
+    )
+    .await
+    .unwrap();
+
+    let base = "{\"type\":\"Chunk\",\"data\":{\"slug\":\"c0\",\"embedding\":[1.0,1.0,1.0,1.0,1.0,1.0,1.0,1.0]}}\n";
+    db.load("main", base, LoadMode::Merge).await.unwrap();
+    db.branch_create("feature").await.unwrap();
+
+    // Same key, same scalars — only the vector differs.
+    let moved = "{\"type\":\"Chunk\",\"data\":{\"slug\":\"c0\",\"embedding\":[9.0,9.0,9.0,9.0,9.0,9.0,9.0,9.0]}}\n";
+    db.load("feature", moved, LoadMode::Merge).await.unwrap();
+
+    let cs = db
+        .diff_between(
+            ReadTarget::branch("main"),
+            ReadTarget::branch("feature"),
+            &ChangeFilter::default(),
+        )
+        .await
+        .unwrap();
+
+    let ops: Vec<ChangeOp> = cs.changes.iter().map(|c| c.op).collect();
+    assert_eq!(
+        ops,
+        vec![ChangeOp::Update],
+        "an embedding-only change must still be reported as an Update: {:?}",
+        change_tuples(&cs)
+    );
+}

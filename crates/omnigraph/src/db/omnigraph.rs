@@ -2243,6 +2243,29 @@ impl Omnigraph {
         .await
     }
 
+    /// Whole-diff totals between two read targets, without materializing the
+    /// change list.
+    ///
+    /// This is the cheap tier of the change feed: a review UI asks for totals
+    /// first and pages rows only on drill-down. Any `limit`/`after` on the
+    /// filter is ignored — totals are whole-diff by definition.
+    pub async fn diff_summary_between(
+        &self,
+        from: impl Into<ReadTarget>,
+        to: impl Into<ReadTarget>,
+        filter: &crate::changes::ChangeFilter,
+    ) -> Result<crate::changes::ChangeSummary> {
+        let from_resolved = self.resolved_target(from).await?;
+        let to_resolved = self.resolved_target(to).await?;
+        crate::changes::diff_summary_snapshots(
+            &self.table_store,
+            &from_resolved.snapshot,
+            &to_resolved.snapshot,
+            filter,
+        )
+        .await
+    }
+
     /// Diff two graph commits. Resolves each commit to `(manifest_branch, manifest_version)`
     /// and creates branch-aware snapshots. Supports cross-branch comparison.
     pub async fn diff_commits(
