@@ -69,6 +69,8 @@ graph id from the cluster's applied revision:
 | POST | `/graphs/{id}/branches/merge` | bearer + `branch_merge` (+ `branch_delete` only when `delete_branch` is set) | merge `source → target`; `delete_branch: true` also deletes the source after the merge lands — a delete refusal is reported via `branch_deleted`/`branch_delete_error` on the 200 response, never as an error |
 | GET | `/graphs/{id}/commits?branch=` | bearer + `read` | list |
 | GET | `/graphs/{id}/commits/{commit_id}` | bearer + `read` | show |
+| GET | `/graphs/{id}/diff/summary?from=&to=` | bearer + `read` on **both** sides | per-op counts + affected types, no row list |
+| GET | `/graphs/{id}/diff?from=&to=&limit=&cursor=` | bearer + `read` on **both** sides | one bounded page of changes, ordered by `(table_key, id)` |
 
 Server-level management endpoints:
 
@@ -225,8 +227,11 @@ Today admission gates every mutating handler: `/mutate` (and its
 deprecated alias `/change`), `/load` (and its deprecated alias `/ingest`),
 `/branches/{create,delete,merge}`,
 and `/schema/apply`. Read-only endpoints (`/snapshot`, `/query`, `/read`,
-`/export`, `/branches` GET, `/commits`, `/schema` GET) are not
-admission-gated.
+`/export`, `/branches` GET, `/commits`, `/diff`, `/diff/summary`,
+`/schema` GET) are not admission-gated. The diff endpoints are instead
+bounded by a mandatory `from`/`to` plus a `limit` that defaults to 100 and
+is clamped to 1000, so a single request cannot ask the server for an
+unbounded change list.
 
 ## Body limits
 
