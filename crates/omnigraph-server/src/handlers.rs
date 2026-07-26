@@ -1752,6 +1752,7 @@ pub(crate) async fn server_branch_merge(
         let actor_owned: Option<ResolvedActor> =
             actor.as_ref().map(|Extension(actor)| actor.clone());
         let delete_branch = request.delete_branch;
+        let state_task = state.clone();
         shielded_write(&state, &handle.key.clone(), async move {
             let _admission = admission;
             let outcome = handle
@@ -1764,7 +1765,9 @@ pub(crate) async fn server_branch_merge(
                 .await
                 .map_err(ApiError::from_omni)?;
             let (branch_deleted, branch_delete_error) = if delete_branch {
-                match delete_merged_source_branch(&handle, actor_owned.as_ref(), &source).await {
+                match delete_merged_source_branch(&state_task, &handle, actor_owned.as_ref(), &source)
+                    .await
+                {
                     Ok(()) => (Some(true), None),
                     Err(message) => (Some(false), Some(message)),
                 }
@@ -1791,6 +1794,7 @@ pub(crate) async fn server_branch_merge(
 /// operational error — into a message instead of an error status: the merge is
 /// already durable, so the request must not report failure for it.
 async fn delete_merged_source_branch(
+    state: &AppState,
     handle: &Arc<GraphHandle>,
     actor: Option<&ResolvedActor>,
     source: &str,
@@ -1810,14 +1814,27 @@ async fn delete_merged_source_branch(
     }
     // Runs inside the merge's shielded composite task (RFC-030), so it is
     // already detached from the request future and covered by the merge's
-    // admission guard; no inner spawn needed. Failures stay
-    // stringly-reported per this helper's contract.
-    let actor_id = actor.map(|actor| actor.actor_id.as_ref());
-    handle
-        .engine
-        .branch_delete_as(source, actor_id)
-        .await
-        .map_err(|err| err.to_string())
+    // admission guard. The engine call still routes through its own
+    // `shielded_write` for one reason: this helper's contract stringifies
+    // failures into `branch_delete_error` on a 200 response, so the
+    // composite completes `Ok` and the OUTER chokepoint can never see a
+    // typed delete error — a delete-phase `RecoveryRequired` must pass the
+    // trigger-B chokepoint BEFORE stringification or the supervised reopen
+    // is never armed for it.
+    let key = handle.key.clone();
+    let handle = Arc::clone(handle);
+    let source_task = source.to_string();
+    let actor_id: Option<String> = actor.map(|actor| actor.actor_id.as_ref().to_string());
+    shielded_write(state, &key, async move {
+        handle
+            .engine
+            .branch_delete_as(&source_task, actor_id.as_deref())
+            .await
+            .map_err(ApiError::from_omni)
+    })
+    .await
+    .map(|_| ())
+    .map_err(|err| err.message)
 }
 
 #[utoipa::path(
