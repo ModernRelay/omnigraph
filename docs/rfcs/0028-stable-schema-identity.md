@@ -466,10 +466,13 @@ are one internal storage-format capability. RFC-028 landed as internal manifest
 schema v5; that release kept `MIN_SUPPORTED == CURRENT == 5` and added the
 identity version to the release/stamp history. V6 preserved this contract and
 added RFC-023 key fencing; v7 preserved both and added RFC-026 identity-keyed
-stream-lifecycle authority. The currently served v8 format preserves the
-v5/v6/v7 contracts and adds RFC-026 stream-config v2 plus recovery-v11 for the
-private B1 row/fold core. None of the later formats reinterprets or backfills
-v5 in place. A v5 graph was never served with a
+stream-lifecycle authority. Historical v8 preserved those contracts and added
+RFC-026 stream-config v2 plus recovery-v11 for the private B1 row/fold core.
+The currently served v9 format preserves those worker mechanics and activates
+stream-config v3, lifecycle state v2, trusted hidden attribution, the
+manifest-selected token participant, and recovery-v12's exact base-plus-token
+fold. None of the later formats reinterprets or backfills v5 in place. A v5
+graph was never served with a
 partial combination such as identity-bearing IR over name-keyed manifest rows.
 
 There is no v1→v2 IR backfill and no new-binary in-place conversion of an old

@@ -2726,22 +2726,21 @@ impl TableStore {
     /// surface twice — once via the original committed fragment, once via
     /// the rewrite in `new_fragments`.
     ///
-    /// **Filter contract is incomplete on staged fragments.** When `filter`
-    /// is `Some(...)`, Lance pushes the predicate to per-fragment scans
-    /// with stats-based pruning. Uncommitted fragments produced by
-    /// `write_fragments_internal` lack the per-column statistics that
-    /// committed fragments carry; Lance's optimizer drops them from the
-    /// filtered scan even when their data would match. Staged-fragment
-    /// rows are silently absent from the result. `scanner.use_stats(false)`
-    /// does not fix this in lance 6.0.1. Callers needing correct filtered
-    /// reads against staged data should use a different strategy — the
-    /// engine's `MutationStaging` accumulator unions in-memory pending
-    /// batches with the committed scan via DataFusion `MemTable` (see
-    /// `scan_with_pending`).
+    /// **Filtered staged reads were incomplete before Lance 9.0.0.** Through
+    /// 9.0.0-rc.1, a `Some(filter)` scan pushed the predicate to per-fragment
+    /// scans with stats-based pruning, and uncommitted fragments produced by
+    /// `write_fragments_internal` lack the per-column statistics committed
+    /// fragments carry — so Lance's optimizer dropped them from the filtered
+    /// scan even when their data matched, and `scanner.use_stats(false)` did
+    /// not bypass it. Lance 9.0.0 closed that gap: matching staged rows are
+    /// now returned. `staged_tests::scan_with_staged_with_filter_returns_
+    /// matching_staged_rows` pins the current behavior.
     ///
-    /// This method remains on the surface for primitive-level testing
-    /// (basic stage + scan correctness without filters works) and for
-    /// callers that don't need filter pushdown.
+    /// Production never depended on either side of this. The engine's
+    /// `MutationStaging` accumulator unions in-memory pending batches with
+    /// the committed scan via DataFusion `MemTable` for read-your-writes
+    /// (see `scan_with_pending`), and no production caller passes a filter
+    /// here. This method remains on the surface for primitive-level testing.
     pub async fn scan_with_staged(
         &self,
         ds: &Dataset,
@@ -4566,6 +4565,46 @@ fn staged_keyed_merge_result(
         new_fragments,
         removed_fragment_ids,
     ))
+}
+
+/// Validate and package one protocol-internal exact-`id` upsert staged through
+/// Lance's filter-bearing MergeInsert path.
+///
+/// RFC-026's `_stream_tokens.lance` adapter shares the same substrate proof as
+/// graph keyed writes but remains a separate graph-global participant. Keeping
+/// this narrow bridge here lets that adapter preserve Lance's affected-row
+/// metadata without exposing `StagedWrite` internals or inventing another
+/// commit path.
+pub(crate) fn staged_exact_id_upsert_result(
+    dataset: &Dataset,
+    uncommitted: UncommittedMergeInsert,
+    expected_rows: u64,
+    context: &'static str,
+) -> Result<StagedWrite> {
+    let id_field_id = exact_id_primary_key_field_id(dataset, context)?;
+    validate_exact_id_filter(&uncommitted, id_field_id, context)?;
+    let stats = &uncommitted.stats;
+    let affected_rows = stats
+        .num_inserted_rows
+        .checked_add(stats.num_updated_rows)
+        .ok_or_else(|| {
+            OmniError::manifest_internal(format!("{context}: affected-row count overflow"))
+        })?;
+    if affected_rows != expected_rows
+        || stats.num_deleted_rows != 0
+        || stats.num_skipped_duplicates != 0
+        || stats.num_attempts != 1
+    {
+        return Err(OmniError::manifest_internal(format!(
+            "{context}: merge stats were inserted={}, updated={}, deleted={}, skipped={}, attempts={}; expected inserted+updated={expected_rows}, deleted=0, skipped=0, attempts=1",
+            stats.num_inserted_rows,
+            stats.num_updated_rows,
+            stats.num_deleted_rows,
+            stats.num_skipped_duplicates,
+            stats.num_attempts,
+        )));
+    }
+    staged_keyed_merge_result(uncommitted, context)
 }
 
 /// Precondition guard for `stage_merge_insert`.

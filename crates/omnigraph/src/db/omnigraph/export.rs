@@ -238,7 +238,13 @@ fn write_export_rows_from_batch<W: Write>(
                 "id".to_string(),
                 json_value_from_named_column(batch, "id", row)?,
             );
-            for field in node_type.arrow_schema.fields().iter().skip(1) {
+            for field in node_type
+                .arrow_schema
+                .fields()
+                .iter()
+                .skip(1)
+                .filter(|field| field.name() != crate::db::STREAM_METADATA_COLUMN)
+            {
                 data.insert(
                     field.name().clone(),
                     export_value_for_field(
@@ -274,7 +280,13 @@ fn write_export_rows_from_batch<W: Write>(
                 "id".to_string(),
                 json_value_from_named_column(batch, "id", row)?,
             );
-            for field in edge_type.arrow_schema.fields().iter().skip(3) {
+            for field in edge_type
+                .arrow_schema
+                .fields()
+                .iter()
+                .skip(3)
+                .filter(|field| field.name() != crate::db::STREAM_METADATA_COLUMN)
+            {
                 data.insert(
                     field.name().clone(),
                     export_value_for_field(

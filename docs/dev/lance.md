@@ -156,7 +156,89 @@ If a future need pulls one of these into scope, add a row to the matching domain
 
 When Lance ships a major release that changes any of the above (file format bump, new index type, transaction semantics change, new branching primitive), refresh this index in the same change as the omnigraph upgrade. Stale Lance pointers are worse than no pointers.
 
-### Last alignment audit: 2026-07-17 (Lance 9.0.0-rc.1; git rev `cec0b7df`)
+### Last alignment audit: 2026-07-25 (Lance 9.0.0 stable; crates.io)
+
+**The git-pin era is over.** Lance 9.0.0 was released on 2026-07-24 and every
+crate OmniGraph depends on is published to crates.io at that version, so the
+workspace moved from the `v9.0.0-rc.1` git rev (`cec0b7df`) to ordinary
+registry version pins. `Cargo.lock` now contains **zero** git sources. This
+restores ordinary publishability: the release gate recorded in
+[versioning.md](versioning.md) — "registry publication resumes when Lance 9.0.0
+ships stable" — is satisfied.
+
+The delta is 35 commits and unusually cheap. It is **not** a storage-format
+event: there is no file-format or minimum-reader-version movement, OmniGraph
+still writes explicit stable V2_2, and every MemWAL format-bearing file
+(`wal.rs`, `batch_store.rs`, `system_index/mem_wal.rs`, `protos/table.proto`,
+`mem_wal/util.rs`) is byte-identical to the rc.1 rev. Dependency floors are
+unchanged (Arrow 58, DataFusion 54, `object_store` 0.13.2, roaring 0.11.4,
+Rust 1.91+); this audit ran on Rust 1.95.
+
+Behavior-affecting findings:
+
+- **`ShardWriter::close` now propagates final flush failures** (#7769). This
+  was the pre-registered re-audit item parked at the rc.1 stanza below; the
+  contract sentence there is now rewritten. **No code change was required** —
+  OmniGraph never treats `close` as durability evidence, and the enrollment
+  adapter already maps its empty-shard close error. The matching lines in
+  [testing.md](testing.md) and RFC-026 were reworded in the same change.
+- **Filtered scans over staged fragments are fixed.** Through rc.1, a
+  `Some(filter)` `scan_with_staged` silently dropped matching *staged* rows
+  because stats-based pruning discarded uncommitted fragments that lack
+  per-column statistics. 9.0.0 returns them. This turned the
+  documented-limitation pin
+  `staged_tests::scan_with_staged_with_filter_silently_drops_staged_rows` red —
+  by design; that test carried an explicit instruction to rewrite it on this
+  exact event. It is now
+  `scan_with_staged_with_filter_returns_matching_staged_rows`, asserting the
+  correct semantics. Production was never affected: no production caller passes
+  a filter, and read-your-writes goes through `MutationStaging`'s in-memory
+  union instead.
+- **`read_transaction_by_version` no longer populates session caches**
+  (#7817), adding one ranged read per inline transaction on the RFC-023
+  certificate-chain path. The `write_cost` / `warm_read_cost` / `merge_cost`
+  budgets were re-run and all pass unchanged.
+- **BM25 corpus statistics changed** (#7699 drops zero-token documents), which
+  can legitimately move score ties. The pinned fused ordering in `search.rs`
+  still holds on this release.
+- **Neither RFC-026 upstream ask landed.** `InitializeMemWalBuilder::execute`
+  is still `-> Result<()>` with an internal commit and no enrollment receipt or
+  reversible shard-admission seal, and `WalAppender::append` still performs no
+  post-success writer epoch recheck. Both negative guards
+  (`mem_wal_deleted_fence_slot_allows_stale_writer_success_on_pinned_lance`,
+  `cleanup_old_versions_does_not_reclaim_mem_wal_objects`) therefore stay green,
+  and OmniGraph's adapter-side containment remains load-bearing.
+- **Gate R0's revision tripwire was rewritten, not retired.** It pinned the
+  exact git rev in `Cargo.lock`; it now pins the released version across the
+  whole Lance package family (with the two Arrow-versioned members carrying
+  their own surveyed version) and additionally refuses any return to a git
+  source. Its purpose is unchanged — the source audit must not silently outlive
+  the source it surveyed — and its underlying RC.1 no-go facts survive because
+  the MemWAL flush ordering and system-index files did not change.
+
+Evidence re-run for this bump: 26 Lance surface guards, `cargo test --workspace
+--locked` (75 suites), 141 failpoints, 35 `memwal_stream` cells, the
+`omnigraph-server --features aws` suite, and the local cost gates. The
+bucket-gated RustFS/S3 cells were not run locally and remain CI's
+responsibility.
+
+**Known gaps carried by choosing 9.0.0 over the v10 beta line** (both fixes
+exist only on v10, which is 96 commits ahead *and* 36 behind 9.0.0 after a
+9.1→10.0 renumber, ships two breaking changes, and renames the MemWAL
+vocabulary OmniGraph's recovery sidecars bind to):
+
+- **#7704** — stable-row-id `filter_deleted_ids` alignment. OmniGraph sets
+  `enable_stable_row_ids: true` everywhere, stages deletes, and calls
+  `optimize_indices`, so this is a live exposure.
+- **#7868** — flat-KNN ordering, which upstream itself labels Critical.
+- **#7965** — blob compaction misclassifying a valid empty blob as NULL, plus
+  a blob-v1 path where one empty blob can zero out neighbouring payloads.
+  `omnigraph optimize` compacts blob-bearing tables, so this is reachable.
+  Note OmniGraph's **own** blob descriptor decoder replicates the same
+  empty-vs-null misclassification independently of Lance; that is tracked as a
+  separate defect to fix on its own merits.
+
+### Prior alignment audit: 2026-07-17 (Lance 9.0.0-rc.1; git rev `cec0b7df`)
 
 The pin advanced from `v9.0.0-beta.21` (`1aec1465`) to
 `v9.0.0-rc.1` (`cec0b7dffe2d85c7e66dbe9d1f3891c297903a1d`) after reviewing
@@ -182,7 +264,7 @@ epoch-1 enrollment on main; no production caller can put or acknowledge a row,
 fold a generation, or operate drain/resume.
 
 On 2026-07-19, Phase B1 added the private data-bearing core and moved the
-current format to internal schema v8, stream-config v2, and recovery-v11
+then-current format to internal schema v8, stream-config v2, and recovery-v11
 `StreamFold`. One feature-gated, doc-hidden engine seam can admit one exact
 already-normalized physical batch, acknowledge only after that put's durability
 watcher succeeds, prevent rollover, and retire the writer before any
@@ -194,6 +276,15 @@ and makes the achieved table pointer, lifecycle witness, and lineage
 graph-visible only at one `__manifest` CAS. This is private implementation and
 evidence machinery, not public activation: RFC-026 remains Draft, with no
 schema/SDK/HTTP/CLI/OpenAPI caller or operator drain/resume surface.
+
+On 2026-07-22, the private common-B2 slice moved the current format to internal
+schema v9, stream-config v3, lifecycle state v2, and recovery-v12. It adds the
+grammar-impossible `__omnigraph_stream_v1$` trusted base-row field and one
+manifest-selected `_stream_tokens.lance` participant, with compare-and-chain
+attribution and exact base-plus-token recovery. V8 crosses this boundary only
+through export/init/load; the pinned genuine-v8 cell also proves that a v8 user
+property named `__omnigraph_stream_v1` remains ordinary data. This still does
+not activate a production SDK/HTTP/CLI streaming surface.
 
 The Phase-B1 source audit also narrows the RC.1 row contract. `put_no_wait`
 returns a `WriteResult` plus an optional `BatchDurableWatcher`; the watcher's
@@ -406,8 +497,15 @@ stored post-tombstone Arrow batch memory, including replayed duplicate batches.
 An empty valid reopen may admit; a non-empty valid replay is routed fold-only.
 `MemTableStats::estimated_size` has different accounting and does not replace
 that contract. Retirement first stops the serialized worker and then uses
-public `ShardWriter::abort`; `close` ignores final completion errors and is not
-durability evidence.
+public `ShardWriter::abort`. **Since 9.0.0, `close` propagates final flush,
+freeze, and task-shutdown failures** (upstream #7769, merged after the rc.1 pin
+and consumed by the 9.0.0 bump); through 9.0.0-rc.1 it discarded those results
+and returned a false `Ok(())`. OmniGraph's posture is unchanged under either
+contract — **close is never durability evidence**: the B1 worker retires via
+`abort`, and the enrollment adapter's two `close` calls are an error-path
+best-effort (result deliberately discarded) and a provably-empty-shard close
+after `check_fenced` whose error was already mapped, so the stricter contract
+can only surface more failures where OmniGraph already fails closed.
 
 Behavior-affecting findings in this audit:
 
@@ -651,7 +749,7 @@ Behavior-affecting findings in this audit:
   This result blocks the in-manifest BTREE access shape, not checkpoint rows as
   logical authority or Lance tags as physical pins. RFC-025 is
   research-blocked and no retention format ships. Schema v6 was production
-  truth when the gate ran; current schema v8 likewise carries no retention
+  truth when the gate ran; current schema v9 likewise carries no retention
   state. A successor needs a history-flat current-authority lookup
   or revised evidence-backed operational contract without adding a second
   authority dataset.

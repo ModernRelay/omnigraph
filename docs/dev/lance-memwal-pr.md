@@ -54,18 +54,19 @@ number of agents continuously submitting small changes.
 
 ### The private MemWAL core exists
 
-RFC-026 Phase A and private Phase B1 are implemented and evidence-green at a
-deliberately narrow boundary:
+RFC-026 Phase A, private Phase B1, and the private common-B2 token/fold slice
+are implemented and evidence-green at a deliberately narrow boundary:
 
 - one main-branch, unsharded MemWAL binding per enrolled table;
 - one live OmniGraph writer process for the graph;
 - one bounded generation of at most 8,192 rows and 32 MiB;
 - acknowledgement only after Lance's durability watcher succeeds;
 - replayed or flushed-but-unmerged state routes to fold only;
-- one strict fold stages a normal RFC-022 table effect and publishes it through
-  `__manifest`; and
-- current internal schema v8, stream-config v2, and recovery-v11 describe this
-  private implementation.
+- one strict fold stages exact base-table and `_stream_tokens.lance`
+  participants and publishes both through `__manifest`; and
+- current internal schema v9, stream-config v3, lifecycle state v2, and
+  recovery-v12 describe this private implementation. Historical v8/config-v2/
+  recovery-v11 state crosses that boundary only through export/init/load.
 
 The core is intentionally reachable only through a feature-gated, doc-hidden
 engine seam. There is no `@stream` schema intent, public enrollment, SDK
@@ -86,7 +87,7 @@ runtime allocator limit.
 
 ### Public streaming is still specified but inactive
 
-RFC-026 Phase B2-0 specifies the remaining public contract:
+RFC-026 Phase B2 specifies the remaining public contract:
 
 - compare-and-chain write tokens for safe same-key retries;
 - trusted durable contributor attribution;
@@ -97,8 +98,12 @@ RFC-026 Phase B2-0 specifies the remaining public contract:
 - explicit acceptance of loud provider-capacity exhaustion rather than a hard
   retained-storage admission promise.
 
-Those contracts are not implemented. Schema v9, stream-config v3, state v2,
-recovery-v12, and all public streaming surfaces remain inactive.
+The private storage/correctness subset is implemented: schema v9, stream-config
+v3, lifecycle state v2, canonical compare-and-chain tokens, trusted hidden row
+attribution, manifest-selected token authority, and recovery-v12's exact
+base-plus-token publication. Explicit production enrollment, lifecycle
+management, correction/status, authorization, SDK/HTTP/CLI/OpenAPI, and every
+other product surface remain inactive.
 
 ## The missing Lance capabilities
 
@@ -236,7 +241,8 @@ no “missing pointer means empty” fallback, and readers never use a best-effo
 latest hint as authority.
 
 The legacy details kind remains available for existing users and for
-OmniGraph's private schema-v8 B1 state. Enabling the new kind is explicit.
+OmniGraph's historical schema-v8 B1 state, whose worker mechanics the current
+v9 format preserves. Enabling the new kind is explicit.
 
 ### 2. Post-success writer fencing
 
@@ -339,13 +345,14 @@ The OmniGraph PR should remain deliberately thin:
 - prove stock RC.1 refuses the new details kind rather than silently ignoring
   it or falling back to a latest hint;
 - preserve structural checks forbidding raw `_mem_wal` deletion in OmniGraph;
-- rerun the complete private B1 behavior, crash, race, cost, and cross-version
-  suites; and
+- rerun the complete private B1/common-B2 behavior, crash, race, cost, and
+  cross-version suites; and
 - update RFC-026 and the write-path state ledger with the exact reviewed Lance
   revision and the boundary that has become green.
 
-OmniGraph schema v8 remains the active format during this slice. The new Lance
-retention kind is qualified but not yet activated by a production stream.
+OmniGraph schema v9 remains the active format during this optional future
+slice. The new Lance retention kind is qualified but is not thereby activated
+by a production stream.
 
 ## Acceptance evidence
 

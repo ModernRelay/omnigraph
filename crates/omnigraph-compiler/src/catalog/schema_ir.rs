@@ -1748,12 +1748,13 @@ edge Relates: Human -> Human @rename_from("Knows") { @unique(src, dst) }
 
     #[test]
     fn validation_rejects_reserved_storage_system_column_names() {
-        const RESERVED: [&str; 5] = [
+        const RESERVED: [&str; 6] = [
             "_rowid",
             "_rowaddr",
             "_rowoffset",
             "_row_created_at_version",
             "_row_last_updated_at_version",
+            "__omnigraph_stream_v1$",
         ];
         let accepted = initialize(
             "interface I { ip: String } node N { np: String } edge E: N -> N { ep: String }",
@@ -1774,6 +1775,11 @@ edge Relates: Human -> Human @rename_from("Knows") { @unique(src, dst) }
                 assert!(error.contains("exported"), "unexpected error: {error}");
             }
         }
+
+        let mut malformed = accepted;
+        malformed.nodes[0].properties[0].name = "__OMNIGRAPH_STREAM_V1$".to_string();
+        let error = validate_schema_ir(&malformed).unwrap_err().to_string();
+        assert!(error.contains("reserved"), "unexpected error: {error}");
     }
 
     #[test]

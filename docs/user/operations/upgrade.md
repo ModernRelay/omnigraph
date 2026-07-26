@@ -17,9 +17,9 @@ message that **names the release line that wrote it** and the exact commands —
 so you can fetch the right old binary without guessing:
 
 ```
-__manifest is stamped at internal schema v7, but this omnigraph reads only v8.
-This graph was created by omnigraph 0.11.x. Rebuild it: with an omnigraph
-0.11.x binary run `omnigraph export <graph> > graph.jsonl`, then with this
+__manifest is stamped at internal schema v4, but this omnigraph reads only v9.
+This graph was created by omnigraph 0.8.x. Rebuild it: with an omnigraph
+0.8.x binary run `omnigraph export <graph> > graph.jsonl`, then with this
 binary run `omnigraph init --schema <schema.pg> <new-graph>` and `omnigraph load
 --mode overwrite --data graph.jsonl <new-graph>`. (Data, vectors, and blobs are
 preserved; commit history and branches are not.) See docs/user/operations/upgrade.md.
@@ -36,10 +36,15 @@ from that line (the latest is safest):
 | internal schema v2 | omnigraph 0.4.1–0.6.1 | the latest 0.6.x (e.g. 0.6.1) |
 | internal schema v3 | omnigraph 0.6.2–0.7.2 | the latest 0.7.x (e.g. 0.7.2) |
 | internal schema v4 | omnigraph 0.8.x | the latest 0.8.x (e.g. 0.8.1) |
-| internal schema v5 | omnigraph 0.9.x | the latest 0.9.x |
-| internal schema v6 | omnigraph 0.10.x | the latest 0.10.x |
-| internal schema v7 | omnigraph 0.11.x | the latest 0.11.x |
-| internal schema v8 | omnigraph 0.12.x | — current format; no rebuild needed |
+| internal schema v5–v8 | no published release (see below) | a source build at the matching commit |
+| internal schema v9 | omnigraph 0.9.x | — current format; no rebuild needed |
+
+**Stamps v5–v8 never shipped.** The storage format advanced five times inside
+the single 0.8.1 → 0.9.0 development window, so the only graphs carrying those
+stamps came from source builds off `main`; no published binary reads them and
+the refusal message names them `0.9.0-dev`. If you have one, export it with a
+build of the commit that created it, then load into a fresh 0.9.x graph. A
+released binary only ever wrote v4 (0.8.x) or v9 (0.9.x).
 
 You can also check versions before you hit a refusal:
 
@@ -109,6 +114,30 @@ complete. Do not use force-init to turn the old root into the new format.
   `append`/`merge` writes copy external payloads instead, as described below.
 - **Server deployments**: take the graph out of the serving set, rebuild it offline
   with the CLI, then point the cluster at the rebuilt graph (`cluster apply`).
+
+## Migrating from internal schema v8 to v9
+
+Internal schema v9 activates RFC-026's private common-B2 storage contract:
+stream-config v3, lifecycle state v2, a manifest-selected
+`_stream_tokens.lance` authority, trusted per-row attribution, and
+recovery-v12's atomic base-plus-token publication. These are physical
+correctness foundations; v9 does not by itself expose a public streaming API.
+
+A v8 graph must use the standard rebuild recipe above. Because v8 never
+shipped in a release, this affects only source builds off `main` during 0.9.0
+development: quiesce every v8 writer, export with a build of the commit that
+created the graph, initialize a **different** root with the 0.9.x binary, load
+the export, and verify the v9 stamp plus row/vector/blob fidelity before
+cutover. Keep the v8 root unchanged through the rollback window. A v9 binary
+refuses v8, and a v8 binary refuses v9.
+
+V9's physical attribution field is named `__omnigraph_stream_v1$`. The trailing
+`$` is deliberately outside the `.pg` property-name grammar, so it cannot
+collide with a user property. In particular, v8 legitimately allowed a user
+property named `__omnigraph_stream_v1` (without `$`); export/init/load preserves
+that property and its values unchanged. Do not rename or delete it as protocol
+metadata. Conversely, v9 export omits only the exact physical `$`-suffixed
+field and never transfers token authority into the rebuilt logical snapshot.
 
 ## Migrating to v0.8.0
 

@@ -2,6 +2,7 @@
 
 mod helpers;
 
+use std::future::Future;
 use std::process::Command;
 use std::sync::Arc;
 
@@ -30,6 +31,28 @@ use helpers::{
 const SCHEMA_V1: &str = "node Person { name: String @key }\n";
 const SCHEMA_V2_ADDED_TYPE: &str =
     "node Person { name: String @key }\nnode Company { name: String @key }\n";
+
+/// Run one composed debug-build recovery scenario outside libtest's 2-MiB
+/// thread. The production operations are independently exercised on ordinary
+/// Tokio stacks; this helper bounds only the large future assembled by a test
+/// that chains several complete recovery cycles in one body.
+fn on_big_stack<F>(body: impl FnOnce() -> F + Send + 'static)
+where
+    F: Future<Output = ()>,
+{
+    std::thread::Builder::new()
+        .stack_size(64 * 1024 * 1024)
+        .spawn(move || {
+            tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .unwrap()
+                .block_on(body());
+        })
+        .unwrap()
+        .join()
+        .unwrap();
+}
 
 fn assert_open_stream_lifecycle_conflict(error: OmniError, operation: &str) {
     let OmniError::Manifest(manifest_error) = error else {
@@ -668,7 +691,8 @@ fn rfc023_external_writer_process() {
 /// an enrolled multi-table writer has committed table 1 and parked before
 /// table 2, where publishing a competing graph commit would be both unnecessary
 /// and semantically wrong for the recovery assertion. The source schema is
-/// restricted to the two-column `name @key` fixture used by that test.
+/// restricted to the `name @key` fixture used by that test; the canonical
+/// hidden attribution column is supplied as physical null metadata.
 async fn commit_raw_fenced_name_row(table_uri: &str, id: &str) {
     let base = Arc::new(Dataset::open(table_uri).await.unwrap());
     let schema = Arc::new(Schema::from(base.schema()));
@@ -678,14 +702,16 @@ async fn commit_raw_fenced_name_row(table_uri: &str, id: &str) {
             .iter()
             .map(|field| field.name().as_str())
             .collect::<Vec<_>>(),
-        vec!["id", "name"],
+        vec!["id", "name", "__omnigraph_stream_v1$"],
         "raw conflict injector is intentionally limited to the name-only fixture"
     );
+    let hidden = arrow_array::new_null_array(schema.field(2).data_type(), 1);
     let batch = RecordBatch::try_new(
         schema.clone(),
         vec![
             Arc::new(StringArray::from(vec![id])),
             Arc::new(StringArray::from(vec![id])),
+            hidden,
         ],
     )
     .unwrap();
@@ -2543,15 +2569,17 @@ async fn rfc023_disjoint_retryable_strict_conflict_reprepares_without_key_confli
             .iter()
             .map(|field| field.name().as_str())
             .collect::<Vec<_>>(),
-        ["id", "name", "score"],
+        ["id", "name", "score", "__omnigraph_stream_v1$"],
         "raw disjoint-conflict injector is schema-specific"
     );
+    let hidden = arrow_array::new_null_array(schema.field(3).data_type(), 1);
     let foreign = RecordBatch::try_new(
         schema,
         vec![
             Arc::new(StringArray::from(vec!["foreign-disjoint"])),
             Arc::new(StringArray::from(vec!["foreign-disjoint"])),
             Arc::new(Int32Array::from(vec![1])),
+            hidden,
         ],
     )
     .unwrap();
@@ -4019,9 +4047,13 @@ async fn recovery_rolls_forward_load_overwrite() {
     );
 }
 
-#[tokio::test]
+#[test]
 #[serial]
-async fn recovery_rolls_forward_ensure_indices_on_feature_branch() {
+fn recovery_rolls_forward_ensure_indices_on_feature_branch() {
+    on_big_stack(recovery_rolls_forward_ensure_indices_on_feature_branch_inner);
+}
+
+async fn recovery_rolls_forward_ensure_indices_on_feature_branch_inner() {
     use lance::index::DatasetIndexExt;
     use omnigraph::loader::{LoadMode, load_jsonl};
 
