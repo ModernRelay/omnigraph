@@ -585,7 +585,7 @@ table; the v4 case also pins reverse refusal by the old binary.
 
 RFC-023 added its then-immediate-predecessor case gated on `OMNIGRAPH_V5_BIN`, built
 from the final internal-v5 commit. It mints a genuine SchemaIR-v2 v5 graph,
-proves v9 refuses it with the 0.9.x rebuild guidance, exports with v5, rebuilds
+proves v9 refuses it with the `0.9.0-dev` rebuild guidance, exports with v5, rebuilds
 under v9, checks row/vector/blob fidelity, exact blob bytes, and exact-`id` PK
 metadata, then proves the v5 binary refuses the v9 root. The same cell injects
 a duplicate logical ID into the v5 export: v9 rejects the load atomically,
@@ -615,8 +615,10 @@ OMNIGRAPH_V7_BIN=/path/to/final-v7/omnigraph \
 ```
 
 RFC-026 Phase B2 adds the immediate-predecessor `OMNIGRAPH_V8_BIN` seam. It
-mints a genuine internal-v8/config-v2 graph, proves v9 refuses it with 0.12.x
-rebuild guidance, exports with v8, rebuilds a distinct v9/config-v3 root, and
+mints a genuine internal-v8/config-v2 graph, proves v9 refuses it with
+`0.9.0-dev` rebuild guidance (no published release ever stamped v5–v8, so the
+refusal names the development window rather than a release line), exports with
+v8, rebuilds a distinct v9/config-v3 root, and
 proves row/vector fidelity plus exact-`id` PK metadata. The v9 re-export must
 not expose the physical `__omnigraph_stream_v1$` attribution column, and the v8
 fixture's ordinary user property `__omnigraph_stream_v1` must retain its value;

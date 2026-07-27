@@ -20,7 +20,8 @@ conflict-resolver and merge-insert sources plus runtime surface probes
 **Evidence status (2026-07-17):** the beta.21 filter shape and directional
 conflict matrix were revalidated unchanged by the RC.1 surface guards. The
 historical performance measurements below remain labeled beta.21. The implementation now activates
-the contract in internal schema v6 (the OmniGraph 0.10.x format): fresh
+the contract in internal schema v6 (a 0.9.0-dev format; no published release
+served it): fresh
 node/edge datasets carry exact-`id` PK metadata from creation, all production
 graph insert/upsert routes use the sealed filter-bearing keyed adapter, bare
 keyed Append is source-guarded out of production, and effect-free conflicts
@@ -571,8 +572,9 @@ compatibility check. A fencing-capable binary keeps
 instructions, and refuses a newer graph with “upgrade omnigraph.” An older
 binary refuses the fencing-capable stamp.
 
-The fencing-compatible format is internal schema **v6**, mapped to OmniGraph
-**0.10.x**. It follows RFC-028's v5 identity format; RFC-024 and later draft
+The fencing-compatible format is internal schema **v6**, a 0.9.0-dev format
+(the planned 0.10.x mapping was superseded when v6–v8 stayed unreleased and
+0.9.0 shipped v9). It follows RFC-028's v5 identity format; RFC-024 and later draft
 capabilities are not included. Each later internal-format change requires its
 own rebuild under the strand policy unless independently accepted capabilities
 deliberately co-release after a combined initialization and recovery review.
@@ -1264,8 +1266,9 @@ correctness cells are recorded in §11.2 and are green.
 5. **Retained support boundary, not a current-topology acceptance gate:**
    cross-process recovery ownership must land before any broadened topology
    claim. V6 destructive recovery remains single-writer-process.
-6. **Satisfied 2026-07-15:** internal schema v6 is the fencing format for
-   OmniGraph 0.10.x, and a genuine final-v5 binary passed v6 refusal,
+6. **Satisfied 2026-07-15:** internal schema v6 is the fencing format (then
+   planned for 0.10.x; ultimately a 0.9.0-dev format), and a genuine final-v5
+   binary passed v6 refusal,
    export/init/load with row/vector/blob fidelity, exact blob bytes, and
    exact-`id` target PKs; duplicate input failed atomically with an empty target
    and unchanged source; v5 also refused the rebuilt v6 root. Branch fork,
