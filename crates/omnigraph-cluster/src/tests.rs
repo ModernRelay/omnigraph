@@ -3688,3 +3688,245 @@ graphs:
             Some(ApplyDisposition::Applied)
         );
     }
+
+    // ---- RFC-026 §4.7 P1: streaming enablement (slice 1) ----
+
+    fn write_streaming_cluster(config_dir: &Path, streaming: Option<bool>) {
+        let streaming_line = match streaming {
+            Some(enabled) => format!("    streaming: {enabled}\n"),
+            None => String::new(),
+        };
+        fs::write(
+            config_dir.join(CLUSTER_CONFIG_FILE),
+            format!(
+                r#"
+version: 1
+metadata:
+  name: test
+state:
+  backend: cluster
+  lock: true
+graphs:
+  knowledge:
+    schema: ./people.pg
+{streaming_line}    queries:
+      find_person:
+        file: ./people.gq
+policies:
+  base:
+    file: ./base.policy.yaml
+    applies_to: [knowledge]
+"#
+            ),
+        )
+        .unwrap();
+    }
+
+    async fn live_streaming_enabled(config_dir: &Path) -> bool {
+        let graph_uri = format!("{}/graphs/knowledge.omni", config_dir.display());
+        let db = Omnigraph::open_read_only(&graph_uri).await.unwrap();
+        db.snapshot_of(omnigraph::db::ReadTarget::branch("main"))
+            .await
+            .unwrap()
+            .streaming_status()
+            .enabled
+    }
+
+    #[test]
+    fn streaming_config_accepts_bool_and_rejects_non_bool() {
+        let dir = fixture();
+        write_streaming_cluster(dir.path(), Some(true));
+        let out = validate_config_dir(dir.path());
+        assert!(out.ok, "{:?}", out.diagnostics);
+        assert!(
+            out.resource_digests.contains_key("streaming.knowledge"),
+            "declared streaming must emit its first-class resource: {:?}",
+            out.resource_digests
+        );
+
+        // Absent = unmanaged: no resource, and (load-bearing for approvals)
+        // the config digest must be byte-identical to a pre-streaming config.
+        write_streaming_cluster(dir.path(), None);
+        let unmanaged = validate_config_dir(dir.path());
+        assert!(unmanaged.ok);
+        assert!(!unmanaged.resource_digests.contains_key("streaming.knowledge"));
+
+        fs::write(
+            dir.path().join(CLUSTER_CONFIG_FILE),
+            r#"
+version: 1
+graphs:
+  knowledge:
+    schema: ./people.pg
+    streaming: "yes"
+"#,
+        )
+        .unwrap();
+        let rejected = validate_config_dir(dir.path());
+        assert!(
+            !rejected.ok,
+            "a non-boolean streaming declaration must be a validation error"
+        );
+    }
+
+    #[test]
+    fn streaming_classifies_first_class_and_drain_pending_blocks() {
+        // The dedicated resource kind parses, and a drain-pending graph
+        // blocks the flip with the §4.7 P1 disposition — the shape later
+        // slices populate from live observation. Delete stays Applied
+        // (unmanage = ledger-row removal, never an engine call).
+        assert_eq!(
+            resource_kind("streaming.knowledge"),
+            ResourceKind::Streaming("knowledge".to_string())
+        );
+        let mut changes = vec![
+            PlanChange {
+                resource: "streaming.knowledge".to_string(),
+                operation: PlanOperation::Update,
+                before_digest: Some("a".to_string()),
+                after_digest: Some("b".to_string()),
+                disposition: None,
+                reason: None,
+                binding_change: false,
+                metadata_change: None,
+                migration: None,
+            },
+            PlanChange {
+                resource: "streaming.other".to_string(),
+                operation: PlanOperation::Delete,
+                before_digest: Some("a".to_string()),
+                after_digest: None,
+                disposition: None,
+                reason: None,
+                binding_change: false,
+                metadata_change: None,
+                migration: None,
+            },
+        ];
+        let drain_pending = BTreeSet::from(["knowledge".to_string(), "other".to_string()]);
+        classify_changes(
+            &mut changes,
+            &[],
+            &BTreeSet::new(),
+            &BTreeSet::new(),
+            &drain_pending,
+        );
+        assert_eq!(changes[0].disposition, Some(ApplyDisposition::Blocked));
+        assert_eq!(changes[0].reason.as_deref(), Some("streaming_drain_pending"));
+        assert_eq!(changes[1].disposition, Some(ApplyDisposition::Applied));
+        assert_eq!(changes[1].reason, None);
+    }
+
+    #[tokio::test]
+    async fn apply_propagates_streaming_flag_and_disable() {
+        let dir = fixture();
+        write_streaming_cluster(dir.path(), Some(true));
+        write_state_resources(dir.path(), &[]);
+
+        // First apply creates the real graph and must land the flag in the
+        // graph's __manifest — the engine-obeyed authority — not just the
+        // ledger. The change classifies Applied, never Derived (the
+        // fake-convergence trap this resource kind exists to avoid).
+        let out = apply_config_dir(dir.path()).await;
+        assert!(out.ok && out.converged, "{out:?}");
+        let streaming_change = out
+            .changes
+            .iter()
+            .find(|change| change.resource == "streaming.knowledge")
+            .expect("streaming change visible in apply");
+        assert_eq!(streaming_change.disposition, Some(ApplyDisposition::Applied));
+        assert!(live_streaming_enabled(dir.path()).await);
+        let state = read_state_json(dir.path());
+        assert_eq!(
+            state["applied_revision"]["resources"]["streaming.knowledge"]["streaming_enabled"],
+            serde_json::json!(true)
+        );
+
+        // Idempotent: a second run sees no changes and calls no engine.
+        let again = apply_config_dir(dir.path()).await;
+        assert!(again.changes.is_empty() && !again.state_written, "{again:?}");
+
+        // Explicit `streaming: false` disables (clean graph → converges now).
+        write_streaming_cluster(dir.path(), Some(false));
+        let out = apply_config_dir(dir.path()).await;
+        assert!(out.ok && out.converged, "{out:?}");
+        assert!(!live_streaming_enabled(dir.path()).await);
+
+        // REMOVING the declaration unmanages: the ledger row goes away and
+        // the graph keeps its current state — removal is never a disable.
+        write_streaming_cluster(dir.path(), Some(true));
+        let out = apply_config_dir(dir.path()).await;
+        assert!(out.ok && out.converged, "{out:?}");
+        assert!(live_streaming_enabled(dir.path()).await);
+        write_streaming_cluster(dir.path(), None);
+        let out = apply_config_dir(dir.path()).await;
+        assert!(out.ok && out.converged, "{out:?}");
+        let state = read_state_json(dir.path());
+        assert!(
+            state["applied_revision"]["resources"]
+                .get("streaming.knowledge")
+                .is_none(),
+            "unmanaged flag must drop its ledger row"
+        );
+        assert!(
+            live_streaming_enabled(dir.path()).await,
+            "unmanaging must not flip the graph"
+        );
+    }
+
+    #[tokio::test]
+    async fn streaming_survives_refresh_and_converges_to_engine_truth() {
+        let dir = fixture();
+        write_streaming_cluster(dir.path(), Some(true));
+        write_state_resources(dir.path(), &[]);
+        let out = apply_config_dir(dir.path()).await;
+        assert!(out.ok && out.converged, "{out:?}");
+
+        // Wipe the streaming row (a crashed apply / pre-streaming ledger).
+        let mut state = read_state_json(dir.path());
+        state["applied_revision"]["resources"]
+            .as_object_mut()
+            .unwrap()
+            .remove("streaming.knowledge");
+        fs::write(
+            dir.path().join(CLUSTER_STATE_FILE),
+            serde_json::to_string_pretty(&state).unwrap(),
+        )
+        .unwrap();
+
+        // Refresh reads the live graph and regains the row from ENGINE truth.
+        let out = refresh_config_dir(dir.path()).await;
+        assert!(out.ok, "{out:?}");
+        let state = read_state_json(dir.path());
+        assert_eq!(
+            state["applied_revision"]["resources"]["streaming.knowledge"]["streaming_enabled"],
+            serde_json::json!(true)
+        );
+
+        // Out-of-band flip (an operator with direct engine access): refresh
+        // converges the ledger to the observed value, and the next plan shows
+        // the drift as an ordinary Update back toward the declared state.
+        let graph_uri = format!("{}/graphs/knowledge.omni", dir.path().display());
+        let db = Omnigraph::open(&graph_uri).await.unwrap();
+        db.set_streaming_enabled_as(false, None).await.unwrap();
+        drop(db);
+        let out = refresh_config_dir(dir.path()).await;
+        assert!(out.ok, "{out:?}");
+        let state = read_state_json(dir.path());
+        assert_eq!(
+            state["applied_revision"]["resources"]["streaming.knowledge"]["streaming_enabled"],
+            serde_json::json!(false)
+        );
+        let plan = plan_config_dir(dir.path()).await;
+        let drift = plan
+            .changes
+            .iter()
+            .find(|change| change.resource == "streaming.knowledge")
+            .expect("observed/declared streaming drift must be a visible plan change");
+        assert_eq!(drift.operation, PlanOperation::Update);
+
+        // And apply re-converges to the declaration.
+        let out = apply_config_dir(dir.path()).await;
+        assert!(out.ok && out.converged, "{out:?}");
+        assert!(live_streaming_enabled(dir.path()).await);
+    }

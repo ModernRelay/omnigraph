@@ -89,6 +89,7 @@ pub(crate) async fn sweep_graph_create_sidecar(
                         applies_to: None,
                         embedding_provider: None,
                         embedding_profile: None,
+                        streaming_enabled: None,
                     },
                 );
                 let query_digests = state_query_digests_for_graph(state, &sidecar.graph_id);
@@ -109,6 +110,7 @@ pub(crate) async fn sweep_graph_create_sidecar(
                         applies_to: None,
                         embedding_provider,
                         embedding_profile: None,
+                        streaming_enabled: None,
                     },
                 );
                 set_resource_status_applied(state, &graph_address);
@@ -233,6 +235,7 @@ pub(crate) async fn sweep_schema_apply_sidecar(
                 applies_to: None,
                 embedding_provider: None,
                 embedding_profile: None,
+                streaming_enabled: None,
             },
         );
         let query_digests = state_query_digests_for_graph(state, &sidecar.graph_id);
@@ -253,6 +256,7 @@ pub(crate) async fn sweep_schema_apply_sidecar(
                 applies_to: None,
                 embedding_provider,
                 embedding_profile: None,
+                streaming_enabled: None,
             },
         );
         set_resource_status_applied(state, &graph_address);

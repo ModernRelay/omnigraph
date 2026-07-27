@@ -350,6 +350,9 @@ pub(crate) struct DesiredGraph {
     pub(crate) id: String,
     pub(crate) schema_digest: String,
     pub(crate) embedding_provider: Option<String>,
+    /// Declared streaming enablement; `None` = unmanaged (no `streaming.<id>`
+    /// resource is emitted and apply never touches the graph's flag).
+    pub(crate) streaming: Option<bool>,
 }
 
 #[derive(Debug)]
@@ -425,6 +428,16 @@ pub(crate) struct GraphConfig {
     /// Optional reference to a top-level `providers.embedding.<name>` profile.
     #[serde(default)]
     pub(crate) embedding_provider: Option<String>,
+    /// RFC-026 §4.7 P1: declare the graph's experimental streaming-enablement
+    /// flag. `cluster apply` propagates it into the graph's `__manifest` (the
+    /// engine-obeyed authority) via `set_streaming_enabled_as`. Absent means
+    /// UNMANAGED — removal of the key never disables; disabling requires an
+    /// explicit `streaming: false` and converges pending-until-drained.
+    /// `skip_serializing_if` is load-bearing: an absent key must serialize
+    /// byte-identically so existing clusters' `desired_config_digest` (and the
+    /// approvals bound to it) do not churn.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) streaming: Option<bool>,
 }
 
 /// A named cluster embedding provider profile (RFC-012 Phase 5). `kind`/`base_url`/
@@ -593,6 +606,12 @@ pub(crate) struct StateResource {
     /// once at boot and injects the resulting engine config into the graph.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) embedding_profile: Option<EmbeddingProviderConfig>,
+    /// `streaming.<id>` resources only: the applied RFC-026 §4.7 enablement
+    /// value, recorded from the live-graph observation so refresh converges
+    /// the ledger to engine truth. Absent on all other resource kinds and on
+    /// pre-streaming ledgers (which must keep parsing unchanged).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) streaming_enabled: Option<bool>,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
