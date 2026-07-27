@@ -113,6 +113,19 @@ fn v8_bin() -> Option<PathBuf> {
     Some(path)
 }
 
+/// Resolve the final internal-v9 binary (the last v9 commit before the
+/// RFC-026 §4.7 P1 stream-profile format activation — the 0.9.x line).
+fn v9_bin() -> Option<PathBuf> {
+    let path = PathBuf::from(std::env::var_os("OMNIGRAPH_V9_BIN")?);
+    assert!(
+        path.exists() && path.is_file(),
+        "OMNIGRAPH_V9_BIN is set but is not a binary file: {} \
+         (unset it to skip, or point it at the omnigraph binary built from the final internal-v9 commit)",
+        path.display(),
+    );
+    Some(path)
+}
+
 /// Run any predecessor binary hermetically (no developer `~/.omnigraph`).
 fn run_old(bin: &Path, args: &[&str]) -> std::process::Output {
     Command::new(bin)
@@ -957,5 +970,103 @@ fn current_v9_refuses_and_rebuilds_genuine_v8_and_v8_refuses_v9() {
             || reverse_stderr.contains("newer")
             || reverse_stderr.contains("expects v8"),
         "unexpected v8→v9 reverse-refusal message: {reverse_stderr}",
+    );
+}
+
+#[test]
+fn current_v10_refuses_and_rebuilds_genuine_v9_and_v9_refuses_v10() {
+    let Some(v9) = v9_bin() else {
+        eprintln!(
+            "skipping immediate-predecessor v9 upgrade test: OMNIGRAPH_V9_BIN is not set to a final internal-v9 binary"
+        );
+        return;
+    };
+
+    let temp = tempdir().unwrap();
+    let schema = fixture("search.pg");
+    let data = fixture("search.jsonl");
+    let v9_graph = temp.path().join("old-v9-config-v3.omni");
+    let v9_uri = v9_graph.to_str().unwrap();
+
+    // Mint the genuine immediate-predecessor image with the final v9 binary —
+    // the real 0.9.x layout, not a v10 manifest whose internal-schema stamp
+    // was edited after creation.
+    assert_ok(
+        "v9 init",
+        &run_old(&v9, &["init", "--schema", schema.to_str().unwrap(), v9_uri]),
+    );
+    assert_ok(
+        "v9 load",
+        &run_old(
+            &v9,
+            &[
+                "load",
+                "--mode",
+                "overwrite",
+                "--data",
+                data.to_str().unwrap(),
+                v9_uri,
+            ],
+        ),
+    );
+    let export = run_old(&v9, &["export", v9_uri]);
+    assert_ok("v9 export", &export);
+    assert!(!export.stdout.is_empty(), "v9 export produced no rows");
+
+    // The current binary must fail before interpreting a v9 graph as if it
+    // carried the required v10 stream_profile singleton — v9 decoders skip
+    // unknown row kinds silently, so the stamp is the only refusal seam.
+    // The named release strings are pinned in-source by
+    // migrations.rs::release_names_the_writing_line_for_each_stamp, so a map
+    // edit breaks locally before it can break only here.
+    let refusal = output_failure(cli().arg("snapshot").arg(&v9_graph));
+    let stderr = String::from_utf8_lossy(&refusal.stderr);
+    assert!(
+        stderr.contains("created by omnigraph 0.9.x"),
+        "v10 refusal must name the published 0.9.x line that wrote internal schema v9, got: {stderr}",
+    );
+    assert!(
+        stderr.contains("with an omnigraph 0.9.x binary"),
+        "v10 refusal must direct the operator to a 0.9.x binary for the export step, got: {stderr}",
+    );
+    assert!(
+        stderr.contains("export"),
+        "v10 refusal must direct the operator to export/import rebuild, got: {stderr}",
+    );
+
+    let jsonl = temp.path().join("v9.jsonl");
+    std::fs::write(&jsonl, &export.stdout).unwrap();
+    let v10_graph = temp.path().join("new-v10-from-v9.omni");
+    output_success(
+        cli()
+            .arg("init")
+            .arg("--schema")
+            .arg(&schema)
+            .arg(&v10_graph),
+    );
+    output_success(
+        cli()
+            .arg("load")
+            .arg("--mode")
+            .arg("overwrite")
+            .arg("--data")
+            .arg(&jsonl)
+            .arg(&v10_graph),
+    );
+    let reexport = output_success(cli().arg("export").arg(&v10_graph));
+    assert_export_fidelity("v9 → v10", &export.stdout, &reexport.stdout);
+    assert_current_graph_tables_use_exact_id_pk(&v10_graph);
+
+    let reverse = run_old(&v9, &["snapshot", v10_graph.to_str().unwrap()]);
+    assert!(
+        !reverse.status.success(),
+        "a v9 binary must refuse a genuine v10 graph",
+    );
+    let reverse_stderr = String::from_utf8_lossy(&reverse.stderr);
+    assert!(
+        reverse_stderr.contains("upgrade omnigraph")
+            || reverse_stderr.contains("newer")
+            || reverse_stderr.contains("expects v9"),
+        "unexpected v9→v10 reverse-refusal message: {reverse_stderr}",
     );
 }

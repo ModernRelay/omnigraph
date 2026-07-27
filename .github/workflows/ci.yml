@@ -226,6 +226,38 @@ jobs:
             --package omnigraph-cli
           echo "OMNIGRAPH_V8_BIN=$v8_bin" >> "$GITHUB_ENV"
 
+      - name: Build genuine final-v9 CLI for the v9↔v10 format fence
+        if: needs.classify_changes.outputs.run_full_ci == 'true'
+        env:
+          # Last v9-writing main commit before RFC-026 §4.7 P1 activates v10.
+          # Keep this immutable: HEAD^ stops being v9 after the first v10 merge.
+          FINAL_INTERNAL_V9_COMMIT: e889a1c72004eb09f2be35b59ab6586d10c709e1
+        run: |
+          set -euo pipefail
+          v9_source="$RUNNER_TEMP/omnigraph-final-v9"
+          v9_bin="$RUNNER_TEMP/omnigraph-final-v9-bin"
+          git fetch --no-tags --depth=1 origin "$FINAL_INTERNAL_V9_COMMIT"
+          git worktree add --detach "$v9_source" "$FINAL_INTERNAL_V9_COMMIT"
+          cargo build --locked \
+            --manifest-path "$v9_source/Cargo.toml" \
+            --package omnigraph-cli \
+            --bin omnigraph \
+            --target-dir "$GITHUB_WORKSPACE/target"
+          cp "$GITHUB_WORKSPACE/target/debug/omnigraph" "$v9_bin"
+          test -x "$v9_bin"
+          # Same shared-cache discipline as the v8 step above: purge only the
+          # local path packages so the current workspace cannot reuse a v9
+          # engine object behind the v10 test binary.
+          cargo clean --target-dir "$GITHUB_WORKSPACE/target" \
+            --package omnigraph-compiler \
+            --package omnigraph-policy \
+            --package omnigraph-engine \
+            --package omnigraph-api-types \
+            --package omnigraph-cluster \
+            --package omnigraph-server \
+            --package omnigraph-cli
+          echo "OMNIGRAPH_V9_BIN=$v9_bin" >> "$GITHUB_ENV"
+
       - name: Run workspace tests
         if: needs.classify_changes.outputs.run_full_ci == 'true'
         # On same-repo PRs, regenerate openapi.json as part of the drift test

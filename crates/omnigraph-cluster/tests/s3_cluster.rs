@@ -55,6 +55,7 @@ storage: {storage_root}
 graphs:
   knowledge:
     schema: people.pg
+    streaming: true
     queries: queries/
 policies:
   intel:

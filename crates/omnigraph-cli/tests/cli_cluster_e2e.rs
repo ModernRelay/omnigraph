@@ -23,7 +23,7 @@ fn cluster_e2e_lifecycle_import_apply_status_refresh_converges() {
 
     let plan = cluster_json(temp.path(), "plan");
     let changes = plan["changes"].as_array().unwrap();
-    assert_eq!(changes.len(), 3, "{plan}");
+    assert_eq!(changes.len(), 4, "{plan}");
     let disposition_of = |resource: &str| {
         changes
             .iter()
@@ -34,10 +34,14 @@ fn cluster_e2e_lifecycle_import_apply_status_refresh_converges() {
     assert_eq!(disposition_of("graph.knowledge"), "derived");
     assert_eq!(disposition_of("query.knowledge.find_person"), "applied");
     assert_eq!(disposition_of("policy.base"), "applied");
+    // The bare-init graph was born with streaming disabled; import recorded
+    // that observed truth, so the declared `streaming: true` is visible drift
+    // toward the declaration — applied (never derived), by design.
+    assert_eq!(disposition_of("streaming.knowledge"), "applied");
 
     let apply = cluster_json(temp.path(), "apply");
     assert_eq!(apply["ok"], true, "{apply}");
-    assert_eq!(apply["applied_count"], 2, "{apply}");
+    assert_eq!(apply["applied_count"], 3, "{apply}");
     assert_eq!(apply["converged"], true, "{apply}");
 
     let status = cluster_json(temp.path(), "status");
@@ -46,6 +50,10 @@ fn cluster_e2e_lifecycle_import_apply_status_refresh_converges() {
         "applied"
     );
     assert_eq!(status["resource_statuses"]["policy.base"]["status"], "applied");
+    assert_eq!(
+        status["resource_statuses"]["streaming.knowledge"]["status"],
+        "applied"
+    );
     assert!(
         status["state_observations"]["applied_config_digest"].is_string(),
         "converged apply must record the applied config digest: {status}"
@@ -58,6 +66,23 @@ fn cluster_e2e_lifecycle_import_apply_status_refresh_converges() {
     assert!(
         replan["changes"].as_array().unwrap().is_empty(),
         "refresh after a converged apply must not re-open the plan: {replan}"
+    );
+    // The flip landed in the GRAPH (the engine-obeyed authority): the
+    // re-observation reports the live value and its match against the
+    // declaration. (Status echoes STORED observations by design — apply owns
+    // statuses, refresh/import own observations — so this is asserted after
+    // the refresh, which is also why the replan above stayed empty: the
+    // refreshed streaming digest equals the declared one.)
+    let observed = cluster_json(temp.path(), "status");
+    assert_eq!(
+        observed["observations"]["graph.knowledge"]["streaming_enabled"],
+        true,
+        "{observed}"
+    );
+    assert_eq!(
+        observed["observations"]["graph.knowledge"]["streaming_matches_desired"],
+        true,
+        "{observed}"
     );
 
     // A query edit round-trips: plan update -> apply -> converged again.

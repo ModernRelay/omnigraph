@@ -589,6 +589,7 @@ state:
 graphs:
   knowledge:
     schema: ./people.pg
+    streaming: true
     queries:
       find_person:
         file: ./people.gq
@@ -630,6 +631,15 @@ pub fn write_cluster_lock(root: &std::path::Path, lock_id: &str, operation: &str
 }
 
 pub fn write_cluster_applyable_state(root: &std::path::Path) -> serde_json::Value {
+    // This helper fabricates a ledger with NO physical graph behind it, so
+    // the config must not manage streaming: the RFC-026 §4.7 flag is the one
+    // non-create per-graph resource whose apply opens the real graph, and a
+    // declared flag over a fabricated ledger would (correctly) fail. Real
+    // graphs get the fixture's `streaming: true` through the apply-create
+    // e2es instead.
+    let config_path = root.join("cluster.yaml");
+    let config = fs::read_to_string(&config_path).unwrap();
+    fs::write(&config_path, config.replace("    streaming: true\n", "")).unwrap();
     let validate = parse_stdout_json(&output_success(
         cli()
             .arg("cluster")

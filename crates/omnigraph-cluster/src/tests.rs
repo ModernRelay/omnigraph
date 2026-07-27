@@ -3930,3 +3930,26 @@ graphs:
         assert!(out.ok && out.converged, "{out:?}");
         assert!(live_streaming_enabled(dir.path()).await);
     }
+
+    #[tokio::test]
+    async fn streaming_applies_over_an_imported_preexisting_graph() {
+        // The CLI lifecycle shape: a graph exists BEFORE the cluster manages
+        // it; import records observed truth (disabled), apply must flip it.
+        let dir = fixture();
+        write_streaming_cluster(dir.path(), Some(true));
+        let graphs_dir = dir.path().join("graphs");
+        fs::create_dir_all(&graphs_dir).unwrap();
+        let graph_uri = graphs_dir.join("knowledge.omni");
+        Omnigraph::init(graph_uri.to_str().unwrap(), SCHEMA)
+            .await
+            .unwrap();
+
+        let import = import_config_dir(dir.path()).await;
+        assert!(import.ok, "{import:?}");
+        let out = apply_config_dir(dir.path()).await;
+        assert!(out.ok && out.converged, "{out:?}");
+        assert!(
+            live_streaming_enabled(dir.path()).await,
+            "import→apply must flip the pre-existing graph: {out:?}"
+        );
+    }
