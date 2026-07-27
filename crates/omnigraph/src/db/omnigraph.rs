@@ -40,9 +40,11 @@ mod repair;
 mod schema_apply;
 mod stream_enrollment;
 mod stream_ingest;
+mod stream_profile;
 mod table_ops;
 
 pub use optimize::{CleanupPolicyOptions, SkipReason, TableCleanupStats, TableOptimizeStats};
+pub use stream_profile::StreamingProfileResult;
 pub use repair::{
     RepairAction, RepairClassification, RepairOptions, RepairStats, TableRepairStats,
 };

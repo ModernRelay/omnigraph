@@ -206,6 +206,12 @@ const OPTIMIZE_V9: WriteProtocol = WriteProtocol::Bounded("Optimize v9");
 const STREAM_ENROLLMENT_V10: WriteProtocol = WriteProtocol::Exact("StreamEnrollment v10");
 const STREAM_FOLD_V12: WriteProtocol =
     WriteProtocol::Exact("StreamFold v12 / private B2 common core");
+/// RFC-026 §4.7 P1: the graph-wide enablement flip — one exact-entry
+/// `SetStreamProfile` manifest CAS with a strict revision advance, no
+/// pre-manifest durable effects, no recovery sidecar (repair-style), one
+/// ordinary lineage commit.
+const STREAM_PROFILE_V1: WriteProtocol =
+    WriteProtocol::Exact("StreamProfile v1 / single-CAS enablement flip");
 
 #[derive(Debug, Clone, Copy)]
 struct WriteSurface {
@@ -237,6 +243,7 @@ write_surfaces! {
     "db/omnigraph/stream_ingest.rs" => WriteProtocol::TestOnly => ["failpoint_stream_b1_for_test", "failpoint_stream_b2_for_test"],
     "db/omnigraph.rs" => OPTIMIZE_V9 => ["optimize"],
     "db/omnigraph.rs" => WriteProtocol::ManifestAdoption => ["repair"],
+    "db/omnigraph/stream_profile.rs" => STREAM_PROFILE_V1 => ["set_streaming_enabled_as"],
     "db/omnigraph.rs" => WriteProtocol::PhysicalOnly => ["cleanup"],
     "db/omnigraph.rs" => WriteProtocol::NativeRefControl => ["branch_create", "branch_create_as", "branch_create_from", "branch_create_from_as", "branch_delete", "branch_delete_as"],
 }
@@ -680,6 +687,7 @@ durable_calls! {
     ("db/omnigraph/table_ops.rs", "commit_updates_on_branch_with_expected(", 1, WriteProtocol::Exact("shared publisher")),
     ("db/omnigraph/table_ops.rs", ".commit_changes_with_intent_and_expected(", 2, WriteProtocol::Exact("shared publisher")),
     ("db/omnigraph/schema_apply.rs", ".commit_changes_with_intent_and_expected(", 1, SCHEMA_V9),
+    ("db/omnigraph/stream_profile.rs", ".commit_changes_with_intent_and_expected(", 1, STREAM_PROFILE_V1),
     ("db/omnigraph/repair.rs", ".commit_updates_with_actor_with_expected(", 1, WriteProtocol::ManifestAdoption),
     ("db/omnigraph/optimize.rs", ".commit_updates_with_actor_with_expected(", 1, OPTIMIZE_V9),
     ("db/graph_coordinator.rs", ".commit_changes_with_intent_and_expected(", 1, WriteProtocol::Exact("publisher gateway")),

@@ -1750,6 +1750,56 @@ async fn stream_profile_genesis_cas_and_revision_rules() {
     assert!(reopened.streaming_status().enabled);
 }
 
+/// RFC-026 §4.7 P1: disabling streaming refuses, typed and effect-free, while
+/// any stream lifecycle is non-terminal — an acknowledged-durable promise must
+/// never be stranded by a flag flip. Injects an `Open` lifecycle row through
+/// the manifest CAS (no production enrollment path exists in this slice).
+#[tokio::test]
+async fn set_streaming_enabled_refuses_disable_while_undrained() {
+    let dir = tempfile::tempdir().unwrap();
+    let uri = dir.path().to_str().unwrap();
+    let db = crate::db::Omnigraph::init(uri, test_schema_source())
+        .await
+        .unwrap();
+
+    let enabled = db.set_streaming_enabled_as(true, None).await.unwrap();
+    assert!(enabled.changed);
+
+    // Inject an OPEN lifecycle for Person through a separate coordinator —
+    // the state a live (private) stream would hold.
+    let mut mc = ManifestCoordinator::open(uri).await.unwrap();
+    let person_entry = mc.snapshot().entry("node:Person").unwrap().clone();
+    let open = stream_lifecycle_for_person(
+        &person_entry,
+        person_entry.table_version,
+        StreamLifecycle::Open,
+    );
+    mc.commit_changes(&[ManifestChange::SetStreamLifecycle {
+        expected: None,
+        next: open,
+    }])
+    .await
+    .unwrap();
+
+    let err = db.set_streaming_enabled_as(false, None).await.unwrap_err();
+    match err {
+        OmniError::StreamingDisablePending { undrained_tables } => {
+            assert_eq!(undrained_tables, vec!["node:Person".to_string()]);
+        }
+        other => panic!("expected StreamingDisablePending, got: {other}"),
+    }
+
+    // Effect-free refusal: the flag is still enabled and the revision did not
+    // move; the public status reports the undrained state.
+    let mc = ManifestCoordinator::open(uri).await.unwrap();
+    let snapshot = mc.snapshot();
+    assert!(snapshot.stream_profile().streaming_enabled);
+    assert_eq!(snapshot.stream_profile().profile_revision, 2);
+    let status = snapshot.streaming_status();
+    assert!(status.enabled);
+    assert!(status.undrained);
+}
+
 fn stream_lifecycle_for_person(
     person_entry: &SubTableEntry,
     table_version: u64,

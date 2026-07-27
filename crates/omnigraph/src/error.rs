@@ -133,6 +133,14 @@ pub enum OmniError {
         limit: u64,
         actual: u64,
     },
+    /// RFC-026 §4.7 P1 refused to disable graph-wide streaming because at
+    /// least one stream lifecycle is non-terminal: disabling would strand
+    /// durable acknowledged-unfolded promises nobody is scheduled to keep.
+    /// Effect-free and typed so `cluster apply` maps it structurally to its
+    /// pending-until-drained disposition. Drain (fold) the named tables'
+    /// streams, then retry.
+    #[error("cannot disable streaming: undrained stream state on {undrained_tables:?}")]
+    StreamingDisablePending { undrained_tables: Vec<String> },
     /// RFC-026 rejected a stream append before invoking Lance because the one
     /// active generation is at its hard whole-generation ceiling. The caller
     /// must fold the durable generation before retrying; no row from this call

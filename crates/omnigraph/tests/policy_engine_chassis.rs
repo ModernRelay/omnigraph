@@ -427,3 +427,52 @@ async fn branch_merge_as_allows_when_policy_permits_actor() {
         .await
         .expect("act-allowed should be able to BranchMerge");
 }
+
+/// RFC-026 §4.7 P1: the streaming-enablement flip is Cedar-gated with the
+/// per-graph `admin` action — an actor with no permit rule is denied, and a
+/// missing actor with a policy installed fails hard rather than silently
+/// skipping enforcement.
+#[tokio::test]
+async fn set_streaming_enabled_as_denies_when_policy_rejects_actor() {
+    let dir = tempfile::tempdir().unwrap();
+    let (db, _engine) = init_with_policy(&dir).await;
+
+    assert_denied(
+        db.set_streaming_enabled_as(true, Some("act-denied")).await,
+        "set_streaming_enabled_as",
+    );
+    match db.set_streaming_enabled_as(true, None).await {
+        Err(OmniError::Policy(_)) => {}
+        other => panic!("missing actor with installed policy must be OmniError::Policy, got: {other:?}"),
+    }
+}
+
+/// The permitted-actor arm: an explicit `admin` rule lets the operator flip
+/// the flag, proving the enforce scope is `(Admin, ResourceScope::Graph)` —
+/// not accidentally branch-scoped.
+#[tokio::test]
+async fn set_streaming_enabled_as_allows_when_policy_permits_actor() {
+    const ADMIN_POLICY_YAML: &str = r#"
+version: 1
+groups:
+  operators: [act-allowed]
+rules:
+  - id: operators-admin
+    allow:
+      actors: { group: operators }
+      actions: [admin]
+"#;
+    let dir = tempfile::tempdir().unwrap();
+    let db = init_and_load(&dir).await;
+    let policy_path = dir.path().join("policy.yaml");
+    fs::write(&policy_path, ADMIN_POLICY_YAML).unwrap();
+    let engine = PolicyEngine::load_graph(&policy_path, dir.path().to_str().unwrap()).unwrap();
+    let db = db.with_policy(Arc::new(engine) as Arc<dyn PolicyChecker>);
+
+    let result = db
+        .set_streaming_enabled_as(true, Some("act-allowed"))
+        .await
+        .expect("permitted operator flips the flag");
+    assert!(result.changed);
+    assert!(result.streaming_enabled);
+}
