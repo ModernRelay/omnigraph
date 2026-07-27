@@ -12,7 +12,8 @@ owner: OmniGraph maintainers
 
 **Status:** Draft / private B2 compare-and-chain/token-fold core and B2a
 unbounded retain-all profile implemented; public streaming and
-lifecycle management/correction/status inactive
+lifecycle management/correction/status inactive; experimental activation
+profile selected 2026-07-27 (§4.7), unimplemented
 **Date:** 2026-07-10
 **Gate E0 evaluated:** 2026-07-18
 **Phase A foundation completed:** 2026-07-18
@@ -48,6 +49,12 @@ authority recapture, recovery-v12 exact base+token fold, durable graph-commit
 attribution, and the genuine v8↔v9 refusal/rebuild gate passed (§11/§12.6);
 explicit production enrollment, lifecycle management, correction/status, and
 all product surfaces remain inactive
+**Experimental activation profile selected:** 2026-07-27 — cluster-only,
+manifest-propagated enablement, lazy graph-wide enrollment, caller-supplied
+vectors, per-key object-form dead letter with fail-closed structural refusal,
+no read-your-writes bridge, dependency-ordered resident fold driver,
+upsert-only (§4.7); a design selection only — nothing is implemented and no
+schema or product surface is activated by it
 **Author track:** Maintainer design series
 **Depends on:** [RFC-022](0022-unified-write-path.md)'s unified write and
 generic recovery-sidecar protocol, plus
@@ -1982,6 +1989,179 @@ Dead-letter row identity and operation, richer status, and configurable policy
 remain Phase C. Automatic operation-scoped drain, SchemaApply/branch
 integration, upgrade orchestration, and physical rebind remain Phase D.
 
+### 4.7 Experimental activation profile (selected 2026-07-27)
+
+This section records the selected parameters for the first public activation
+of the streaming lane as an explicitly experimental, cluster-only feature. It
+narrows §4.6 and amends §7 as stated below; where this profile and an earlier
+section disagree, this profile governs the experimental activation and the
+earlier text continues to describe the full product surface. Selection is a
+design decision only: nothing here is implemented, no schema or surface is
+activated by this section, and implementation must still pass the evidence
+gates listed at the end plus the §13 EXP row.
+
+**Profile boundaries.** Main-only; unsharded; one resident writer; one live
+writer process; unbounded retain-all (§4.5.1); cluster deployments only;
+strict compare-and-chain upsert only. Stream deletes remain Phase F, and this
+profile confirms upsert-only as a deliberate lane boundary rather than an
+interim limitation: high-rate producers emit facts, removal is a decision that
+belongs to operators on the direct lane, and one-directional constructive
+folds keep P6's ordering stable. No fresh reads (Phase E); no automatic
+operation drain (Phase D). While the flag is on, deployments must restrict
+direct-lane content writes to operator actors through cluster Cedar policy;
+the engine enforcement mechanism is unchanged.
+
+#### P1 — Enablement authority (selected: cluster-declared, manifest-propagated)
+
+Streaming is enabled per graph by a declaration in the team-owned
+`cluster.yaml`; `cluster apply` is the only flip mechanism. Apply propagates
+the decision as a durable `__manifest` row through the ordinary publication
+door, so every process that opens the graph — server, direct `--store` CLI,
+embedded — observes and obeys the flag regardless of access path. This is the
+same engine-enforced-everywhere principle as Cedar: a graph-wide safety
+property (the §5/§8 freeze depends on knowing streams may exist) cannot live
+in per-process configuration. Enabling is metadata-only; nothing physical is
+created until the first streamed write (P2). Disabling converges only when no
+table holds acknowledged-unfolded state: `cluster apply` reports the disable
+as pending-until-drained — the same disposition shape as its gated deletes —
+and never strands a durable acknowledgement nobody is scheduled to keep.
+Rejected: a server/boot flag (a per-process opinion of a graph-wide property;
+restarts and second processes disagree silently) and a cluster-state-only
+flag (a direct writer bypassing the serving path would be blind to the
+freeze). Cluster-only scope is accepted deliberately: an embedded graph has
+no operator, no resident fold driver, and no lifecycle owner.
+
+#### P2 — Enrollment (selected: lazy, graph-wide)
+
+With the flag on, every graph table is streamable; no per-table opt-in
+exists. A table's stream is enrolled on its first streamed write through the
+§3 recoverable enrollment adapter; concurrent first writers resolve through
+the existing one-winner lifecycle CAS, with losers re-reading the winner's
+binding and proceeding as ordinary admission. Within this profile the §4.6
+explicit `enroll` endpoint, caller-minted `enrollment_request_id`, and the
+`StreamNotEnrolled` refusal are not exposed; explicit enrollment remains the
+design of record for the non-experimental surface. Rationale: the graph is
+one connected model — per-table opt-in pushes graph-topology knowledge onto
+external producers and reintroduces exactly the friction the lane exists to
+remove.
+
+#### P3 — Embedding-bearing tables (selected: caller-supplied vectors)
+
+A streamed row for a table with `@embed` must carry the vector column; a row
+missing it is the effect-free per-line `invalid` before any attempt.
+Admission validates dimensions; vector-space/model identity is a documented
+producer obligation (RFC-012's recorded provider identity is the eventual
+validation hook). The admission and fold paths make no external calls,
+unchanged from the B1/B2 core. The named future upgrade is server-side
+enrichment *before* the put — an opt-in, availability-coupled slower
+acknowledgement that keeps fold deterministic. Computing embeddings inside
+fold is permanently rejected: fold is the lane's one deterministic,
+replayable mechanism and recovery-v12 proves exact outcomes; an external
+provider call cannot re-run exactly.
+
+#### P4 — Fold-time rejection (selected: per-key dead letter for data conflicts; amends §7 for this profile)
+
+Two failure classes with different dispositions:
+
+- **Data conflicts** — uniqueness, referential-integrity, cardinality, and
+  row-validation failures against the witnessed base. The fold diverts the
+  failing key's chain suffix within the generation to a durable dead-letter
+  object and applies every independent key. Diversion is per key, not per
+  row: §4.1 tokens chain per key, so successors of a diverted occurrence in
+  the same generation are diverted with it. The destination is an NDJSON
+  object under a reserved graph prefix, written before the fold's manifest
+  CAS and referenced from the durable fold-attribution record; an
+  unreferenced dead-letter object from a crashed fold is inert residue like
+  every other pre-publication artifact. The reject identity is the row's
+  compare-and-chain token, which satisfies §7's restart-stable-identity
+  requirement without consuming any WAL statistic. Operator verbs list,
+  export, and replay a dead-letter object; replay is ordinary resubmission
+  through ingest under a fresh predecessor. Diversion is loud: the fold
+  summary, the status surface, and the attribution record count it, and no
+  row is ever silently dropped. This amends §7's no-dead-letter posture for
+  the data-conflict class only, by explicit profile decision, and pulls a
+  bounded object-form subset of Phase C forward; the `_ingest_rejects` Lance
+  participant and the richer Phase-C surface remain future work.
+- **Structural violations** — schema mismatch, binding/witness violations,
+  token-chain integrity failures. The whole fold refuses and fails closed,
+  exactly the existing §7 posture: these indicate a defect or tampering, not
+  bad data, and masking them as dead letters would bury bugs. The §4.4
+  correction workflow is not part of this profile; the experimental recourse
+  for a structurally blocked stream is operator investigation and, at worst,
+  discard-and-rebuild under the experimental license.
+
+Rejected: whole-generation refusal for data conflicts (one conflicting row
+halts the one-generation-at-a-time lane until manual surgery — disqualifying
+for the lane's purpose) and pre-acknowledgement graph-state validation (it
+reintroduces object-store probes into the acknowledgement path and cannot be
+sound anyway, because the base legally moves between acknowledgement and
+fold).
+
+#### P5 — Visibility contract (selected: no read-your-writes bridge)
+
+The documented streaming contract is: **an acknowledgement is a durability
+receipt, not a visibility receipt** — acknowledged rows become graph-visible
+at the next fold or are diverted loudly per P4. The gap is fold cadence
+(policy) plus fold duration (physics), typically seconds, with an explicitly
+unbounded tail (quiesce, structural block, backlog). This profile exposes no
+producer-facing flush/barrier and no fresh reads (Phase E unchanged).
+Fold-on-demand exists internally — drain, disable, and quiesce require it —
+and as the operator `stream fold` verb under `stream_manage`, which is
+lifecycle management, not a producer latency primitive. If experimental usage
+demonstrates need, a producer-facing barrier is a thin later addition over
+the same mechanism, not a redesign.
+
+#### P6 — Fold scheduling (selected: dependency-ordered resident driver)
+
+A resident fold driver (in the serving process for cluster deployments)
+triggers folds on generation-cap, on a max-staleness timer, on the operator
+verb, and on drain for quiesce/disable. Within each cycle it folds node
+tables before edge tables, derived from the accepted catalog's endpoint
+mapping, so an entity and its edges acknowledged in the same window fold
+RI-clean without coordination machinery. Cross-cycle arrival skew remains
+possible and dead-letters as an ordinary P4 data conflict; that backstop is
+part of the contract. Bounded multi-cycle retry ("grace") is deliberately
+deferred until measured dead-letter volume demonstrates need — it adds a
+third row state (acknowledged, not visible, not dead) that must be surfaced
+honestly, and that complexity is not yet earned. Upsert-only (profile
+boundary above) keeps this ordering direction-stable; streamed deletes would
+invert it per operation kind and are exactly why they remain Phase F.
+
+#### Surface retained, trimmed, and non-trimmable
+
+Retained from §4.6: NDJSON `ingest` with its full per-line response union and
+ordering/cancellation rules; minimal `status`; operator `fold`; persistent
+revision-fenced `quiesce` and `resume` (required so structural operations
+remain possible on a streaming graph); and the `stream_ingest` /
+`stream_manage` Cedar split. Trimmed by this profile: explicit `enroll`,
+`correct`, `block show`, `rebuild-preflight`, per-token barriers, richer
+status, and configurable per-stream policy. Non-trimmable regardless of
+experimental status: Cedar enforcement, typed bounded failures, shutdown
+drain semantics, durable attribution, OpenAPI/parity/failpoint/genuine-rebuild
+evidence, and the no-raw-GC boundary. The experimental designation is also an
+explicit Hyrum boundary: the acknowledgement semantics and the P4/P5
+contracts above are the committed surface, while fold cadence, dead-letter
+object layout, and status field shapes are declared unstable and may change
+without a deprecation cycle.
+
+#### Pre-implementation audit and evidence gates
+
+One audit gates implementation start: whether the enablement row and the
+dead-letter attribution reference fit the existing v9 manifest vocabulary or
+constitute new durable state. Under the strand model, new manifest vocabulary
+means internal schema v10 with the standard genuine-binary v9↔v10
+refusal/rebuild cell; the default assumption is a bump until the audit proves
+otherwise. Evidence required before the flag ships, extending the existing
+owners rather than creating a parallel suite: failpoints through the public
+path at acknowledgement and at every fold boundary including dead-letter
+diversion (divert-object-before-CAS crash, orphan inertness, token-idempotent
+replay); the lazy-enrollment first-write race; disable-pending-until-drained
+convergence in `cluster apply`; flag propagation and direct-writer obedience;
+CLI parity and OpenAPI drift; the `forbidden_apis` registry update for the
+new sanctioned public writer; and a warm-acknowledgement latency instrument
+flat in graph history with an acknowledgement-versus-direct-write comparison
+— the measured claim that justifies the lane existing.
+
 ## 5. Ack-path validation and writer lifecycle
 
 Before append, OmniGraph applies checks that need no base-table read: Arrow
@@ -3556,7 +3736,8 @@ ordinary writers refuse but cannot be corrected, quiesced, or rebuilt.
 | B2a | selected unbounded retain-all/no-GC profile on stock Lance | **Private gate implemented 2026-07-21 (§12.5):** no OmniGraph byte/object/file/history quota; zero canonical `_mem_wal` deletion; complete/partial provider residue remains retained, unreferenced, and untouched below its root through retry/reopen; provider failures are loud; local/configured-RustFS history sweeps are advisory. This gate itself activated no schema or product surface; the later private B2-common slice activates v9 |
 | B2b | candidate managed-reclamation retention profile | Inactive. Requires the Lance-owned durable inspect/plan/execute + receipt, post-success fencing, bounded checkpoint/inventory/accounting, local/RustFS enforced-bound validation, and the profile-specific crash matrix (§4.5.2/§12.6). Passing it alone activates no product surface |
 | B2-common | schema v9/config-v3/state-v2, compare-and-chain token/attribution, graph-global token authority, recovery-v12 base+token fold; then explicit enrollment, revision-fenced lifecycle/correction/status, SDK, HTTP, CLI, Cedar, and OpenAPI | **Private row/fold subset implemented 2026-07-22 (§11/§12.6):** canonical digests, hidden attribution, stale-authority revalidation after shared admission, same-generation chains, exact two-participant recovery/publication, durable fold attribution, retain-all, and genuine v8↔v9 refusal/rebuild are green. Explicit production enrollment, lifecycle/correction/status, authorization, cancellation/shutdown, API compatibility, and product parity remain inactive. `GraphHistoryBudget` belongs only to a future bounded/managed profile |
-| C | restart-stable reject-row identity, atomic dead letter, richer status, and evidence-backed configurable bounds | reject crash matrix; reject-retention proof; backpressure and RSS/latency evidence |
+| EXP | experimental cluster-only activation of the §4.7 profile: manifest-propagated enablement via `cluster apply`, lazy graph-wide enrollment, caller-supplied vectors, per-key object-form dead letter with fail-closed structural refusal, no read-your-writes bridge, dependency-ordered resident fold driver, upsert-only | **Selected 2026-07-27 (§4.7); unimplemented.** Gated on the §4.7 pre-implementation format audit (v10 bump by default if new manifest vocabulary) plus its evidence list; ships as experimental under the §4.7 Hyrum boundary |
+| C | restart-stable reject-row identity, atomic dead letter, richer status, and evidence-backed configurable bounds | reject crash matrix; reject-retention proof; backpressure and RSS/latency evidence. The §4.7 profile pulls a bounded object-form dead-letter subset forward using the §4.1 token as reject identity |
 | D | automatic operation drain, schema/branch/upgrade integration, and rematerialization rebind | two-coordinator race, old/new physical-binding crash matrix, and format-transition suite |
 | E | fresh cuts and maintained-index reads; cross-process `Fresh` ships only if the substrate generation-retention guard exists (§9), otherwise same-process only | cut consistency; merged-generation exclusion |
 | F | multi-shard upsert and stream deletes | one-key-one-shard proof; Lance re-audit |
