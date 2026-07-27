@@ -53,8 +53,13 @@ all product surfaces remain inactive
 manifest-propagated enablement, lazy graph-wide enrollment, caller-supplied
 vectors, per-key object-form dead letter with fail-closed structural refusal,
 no read-your-writes bridge, dependency-ordered resident fold driver,
-upsert-only (§4.7); a design selection only — nothing is implemented and no
-schema or product surface is activated by it
+upsert-only (§4.7)
+**§4.7 P1 enablement authority implemented:** 2026-07-28 — internal schema
+v10 (required genesis `stream_profile` singleton + reserved fold-attribution
+dead-letter slot), the Cedar-gated single-CAS `set_streaming_enabled_as`
+flip, cluster-apply-only propagation with refresh convergence and typed
+pending-until-drained refusal, and the genuine v9↔v10 refusal/rebuild fence
+in CI; P2–P6 remain unimplemented and no ingest surface is active
 **Author track:** Maintainer design series
 **Depends on:** [RFC-022](0022-unified-write-path.md)'s unified write and
 generic recovery-sidecar protocol, plus
@@ -1995,10 +2000,21 @@ This section records the selected parameters for the first public activation
 of the streaming lane as an explicitly experimental, cluster-only feature. It
 narrows §4.6 and amends §7 as stated below; where this profile and an earlier
 section disagree, this profile governs the experimental activation and the
-earlier text continues to describe the full product surface. Selection is a
-design decision only: nothing here is implemented, no schema or surface is
-activated by this section, and implementation must still pass the evidence
-gates listed at the end plus the §13 EXP row.
+earlier text continues to describe the full product surface.
+
+**Implementation status (2026-07-28): P1 (enablement authority) is
+implemented as internal schema v10** — the pre-implementation format audit
+resolved to its pre-registered default (v9 decoders skip unknown row kinds
+silently, and the correct shape is a required genesis singleton), so v10 adds
+the graph-global `stream_profile` row and reserves the fold-attribution
+dead-letter slot in the same bump. The flip ships as the Cedar-gated
+(`Admin`) `set_streaming_enabled_as` writer — single exact-entry CAS with a
+strict revision advance, one ordinary lineage commit, no recovery sidecar —
+and `cluster apply` is its sole production caller, with refresh converging
+the ledger to engine truth and disable refusing typed
+(`StreamingDisablePending`) while any lifecycle is non-terminal. The genuine
+v9↔v10 refusal/rebuild fence is pinned in CI (`OMNIGRAPH_V9_BIN`). P2–P6
+remain unimplemented; enabling the flag activates no ingest surface.
 
 **Profile boundaries.** Main-only; unsharded; one resident writer; one live
 writer process; unbounded retain-all (§4.5.1); cluster deployments only;
@@ -3736,7 +3752,7 @@ ordinary writers refuse but cannot be corrected, quiesced, or rebuilt.
 | B2a | selected unbounded retain-all/no-GC profile on stock Lance | **Private gate implemented 2026-07-21 (§12.5):** no OmniGraph byte/object/file/history quota; zero canonical `_mem_wal` deletion; complete/partial provider residue remains retained, unreferenced, and untouched below its root through retry/reopen; provider failures are loud; local/configured-RustFS history sweeps are advisory. This gate itself activated no schema or product surface; the later private B2-common slice activates v9 |
 | B2b | candidate managed-reclamation retention profile | Inactive. Requires the Lance-owned durable inspect/plan/execute + receipt, post-success fencing, bounded checkpoint/inventory/accounting, local/RustFS enforced-bound validation, and the profile-specific crash matrix (§4.5.2/§12.6). Passing it alone activates no product surface |
 | B2-common | schema v9/config-v3/state-v2, compare-and-chain token/attribution, graph-global token authority, recovery-v12 base+token fold; then explicit enrollment, revision-fenced lifecycle/correction/status, SDK, HTTP, CLI, Cedar, and OpenAPI | **Private row/fold subset implemented 2026-07-22 (§11/§12.6):** canonical digests, hidden attribution, stale-authority revalidation after shared admission, same-generation chains, exact two-participant recovery/publication, durable fold attribution, retain-all, and genuine v8↔v9 refusal/rebuild are green. Explicit production enrollment, lifecycle/correction/status, authorization, cancellation/shutdown, API compatibility, and product parity remain inactive. `GraphHistoryBudget` belongs only to a future bounded/managed profile |
-| EXP | experimental cluster-only activation of the §4.7 profile: manifest-propagated enablement via `cluster apply`, lazy graph-wide enrollment, caller-supplied vectors, per-key object-form dead letter with fail-closed structural refusal, no read-your-writes bridge, dependency-ordered resident fold driver, upsert-only | **Selected 2026-07-27 (§4.7); unimplemented.** Gated on the §4.7 pre-implementation format audit (v10 bump by default if new manifest vocabulary) plus its evidence list; ships as experimental under the §4.7 Hyrum boundary |
+| EXP | experimental cluster-only activation of the §4.7 profile: manifest-propagated enablement via `cluster apply`, lazy graph-wide enrollment, caller-supplied vectors, per-key object-form dead letter with fail-closed structural refusal, no read-your-writes bridge, dependency-ordered resident fold driver, upsert-only | **Selected 2026-07-27 (§4.7); P1 enablement authority implemented 2026-07-28 as internal schema v10** (required genesis `stream_profile` singleton + reserved dead-letter slot; Cedar-gated single-CAS flip; cluster-apply-only propagation with refresh convergence and typed pending-until-drained refusal; genuine v9↔v10 fence in CI). P2–P6 remain unimplemented and ship under the §4.7 Hyrum boundary |
 | C | restart-stable reject-row identity, atomic dead letter, richer status, and evidence-backed configurable bounds | reject crash matrix; reject-retention proof; backpressure and RSS/latency evidence. The §4.7 profile pulls a bounded object-form dead-letter subset forward using the §4.1 token as reject identity |
 | D | automatic operation drain, schema/branch/upgrade integration, and rematerialization rebind | two-coordinator race, old/new physical-binding crash matrix, and format-transition suite |
 | E | fresh cuts and maintained-index reads; cross-process `Fresh` ships only if the substrate generation-retention guard exists (§9), otherwise same-process only | cut consistency; merged-generation exclusion |
