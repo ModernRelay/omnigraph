@@ -264,11 +264,12 @@ merge-insert builder has no `WriteParams` hook, while Overwrite does.
 
 This format cannot be obtained by adding metadata to a live v5 root. Lance's
 filtered/unfiltered conflict behavior is directional, so every table image and
-every writer must cross the boundary together. Quiesce writers, export with the
-latest 0.9.x binary, initialize a **different** root with the 0.10.x binary,
-load the export, verify the v6 stamp and data, then cut the whole fleet over.
-The 0.10.x binary refuses the v5 source root, and the 0.9.x binary refuses the
-new v6 root.
+every writer must cross the boundary together. Both v5 and v6 are 0.9.0-dev
+formats with no published binary, so this crossing uses source builds: quiesce
+writers, export with a source build at the final internal-v5 commit,
+initialize a **different** root with a final internal-v6 source build, load
+the export, verify the v6 stamp and data, then cut the whole fleet over. The
+v6 build refuses the v5 source root, and the v5 build refuses the new v6 root.
 
 The v6 load checks the export for duplicate logical IDs before any table effect.
 Older bare-Append workloads could contain a committed collision; do not resolve
@@ -630,12 +631,13 @@ It does **not** expose streaming ingestion. There is no `@stream`, production
 enrollment command or API, WAL row acknowledgement, fold, drain/resume, or
 fresh-read surface in this format slice.
 
-Move a v6 graph to v7 with the ordinary recipe at the top of this page: export
-with the latest 0.10.x binary, initialize a **different** root with the 0.11.x
-binary, load the export, verify the v7 stamp and logical data, and cut the whole
-fleet over together. The 0.11.x binary refuses the v6 source root, and the
-0.10.x binary refuses the new v7 root. Genuine cross-version tests pin both
-directions.
+Move a v6 graph to v7 with the ordinary recipe at the top of this page — both
+are 0.9.0-dev formats, so the crossing uses source builds: export with a final
+internal-v6 source build, initialize a **different** root with a final
+internal-v7 source build, load the export, verify the v7 stamp and logical
+data, and cut the whole fleet over together. The v7 build refuses the v6
+source root, and the v6 build refuses the new v7 root. Genuine cross-version
+tests pin both directions.
 
 V6 has no acknowledged MemWAL rows, so there is no stream backlog to drain
 before this particular rebuild. Export transfers only manifest-visible logical
@@ -653,9 +655,10 @@ and schema-v11 `StreamFold` recovery through the unified write path. It still
 does **not** expose public stream schema, SDK, HTTP, CLI, or operator controls;
 those remain Phase B2 gates.
 
-Move a v7 graph to v8 with the ordinary recipe at the top of this page: export
-with the latest 0.11.x binary, initialize a different root with the 0.12.x
-binary, load the export, and verify the v8 stamp and logical data. V7's
+Move a v7 graph to v8 with the ordinary recipe at the top of this page — both
+are 0.9.0-dev formats, so the crossing uses source builds: export with a final
+internal-v7 source build, initialize a different root with a final internal-v8
+source build, load the export, and verify the v8 stamp and logical data. V7's
 config-v1 enrollment is never reinterpreted as data-bearing config-v2 state.
 The rebuild copies manifest-visible rows only, not MemWAL indexes, shard state,
 recovery intents, or epochs, so the new root starts unenrolled.

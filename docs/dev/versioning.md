@@ -38,14 +38,17 @@ together. A v4 graph cannot be backfilled safely because its logical IDs,
 registration keys, paths, versions, and tombstones are all name-derived; the
 normal strand rebuild mints a fresh domain and table incarnations instead.
 
-Internal schema v6 mapped to OmniGraph 0.10.x. It preserved the v5 identity
+Internal schema v6 was a 0.9.0-dev format: like v5, v7, and v8 it was written
+only by source builds off `main` during 0.9.0 development, and no published
+release serves it. It preserved the v5 identity
 contract and activated RFC-023 key fencing: every graph node/edge dataset
 declares exactly non-null physical `id` as Lance's unenforced primary key from
 creation, and production strict insert/upsert routes use the exact-`id`
 filter-bearing adapter.
 
 Internal schema **v9 is the currently served format** and maps to OmniGraph
-**0.13.x**. It preserves v8's private data-bearing MemWAL core, then activates
+**0.9.x** — the first published release line to serve any of these formats.
+It preserves v8's private data-bearing MemWAL core, then activates
 RFC-026's common B2 storage/recovery contract: stream-config v3, lifecycle
 state v2, the grammar-impossible trusted base-row field
 `__omnigraph_stream_v1$`, one manifest-selected `_stream_tokens.lance`
@@ -62,7 +65,7 @@ canonical payloads, token projections, recovery JSON, and exact-authority
 lookup retention are bounded; the measured near-cap fold RSS remains evidence,
 not a runtime allocator promise.
 
-A v8/0.12.x graph is not reinterpreted or migrated in place: config-v2 and
+A v8 (0.9.0-dev) graph is not reinterpreted or migrated in place: config-v2 and
 recovery-v11 never become config-v3/state-v2/recovery-v12 authority. Export it
 with the v8 binary, initialize a different v9 root, and load through the v9
 writer. The physical field's trailing `$` is outside the `.pg` identifier

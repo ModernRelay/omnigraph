@@ -1277,13 +1277,14 @@ strand model): this binary reads exactly ONE internal-schema version
   policy) and [the upgrade guide](../user/operations/upgrade.md) (the rebuild
   recipe).
 
-V7 maps to the 0.11.x release line. It preserves v5 stable identity and v6
+V7 is a 0.9.0-dev format (no published release serves it). It preserves v5
+stable identity and v6
 exact-`id` key fencing, and adds the RFC-026 Phase A lifecycle/enrollment
 foundation described above. A genuine v6 root moves to v7 only through
 export/init/load into a different root; v7 refuses v6 and a v6 binary refuses
 v7.
 
-V8 maps to the 0.12.x release line. It preserves the v7 foundation and activates
+V8 is likewise a 0.9.0-dev format. It preserves the v7 foundation and activates
 the private RFC-026 B1 stream-config-v2 row/fold core plus recovery-v11. A v7
 root moves to v8 only through export/init/load into a different root; v8 refuses
 v7 and a v7 binary refuses v8. This format capability does not expose a public
