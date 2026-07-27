@@ -53,11 +53,16 @@ pub(super) async fn init_manifest_graph(
     };
     let genesis_lineage = graph_lineage_row_parts(&genesis, None)?;
 
+    // The RFC-026 §4.7 enablement authority is required from genesis:
+    // streaming disabled, revision 1. Pure metadata — no physical file.
+    let stream_profile = super::stream_profile::StreamProfileEntry::genesis();
+
     let manifest_batch = entries_to_batch(
         &entries,
         &version_metadata,
         &genesis_lineage,
         &stream_token_authority,
+        &stream_profile,
     )?;
     let schema = manifest_schema();
     let reader = RecordBatchIterator::new(vec![Ok(manifest_batch)], schema);

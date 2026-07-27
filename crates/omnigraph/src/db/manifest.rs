@@ -33,6 +33,8 @@ mod recovery;
 mod state;
 #[path = "manifest/stream.rs"]
 pub(crate) mod stream;
+#[path = "manifest/stream_profile.rs"]
+pub(crate) mod stream_profile;
 #[path = "manifest/stream_token.rs"]
 pub(crate) mod stream_token;
 #[path = "manifest/token_store.rs"]
@@ -81,6 +83,8 @@ pub(crate) use stream::{
     CurrentHeadWitness, EnrollmentReceipt, STREAM_CONFIG_VERSION, StreamLifecycle,
     StreamLifecycleEntry, StreamPhysicalBinding, stream_enrollment_intent_digest_v1,
 };
+pub(crate) use stream_profile::StreamProfileEntry;
+pub use stream_profile::StreamingStatus;
 pub(crate) use token_store::{StreamTokenAuthorityEntry, open_stream_token_authority_at};
 
 /// The internal-schema (storage-format) version this binary writes and reads.
@@ -102,6 +106,10 @@ const OBJECT_TYPE_GRAPH_COMMIT: &str = "graph_commit";
 const OBJECT_TYPE_GRAPH_HEAD: &str = "graph_head";
 const OBJECT_TYPE_STREAM_STATE: &str = "stream_state";
 const OBJECT_TYPE_STREAM_TOKEN_AUTHORITY: &str = "stream_token_authority";
+/// Graph-global RFC-026 §4.7 stream-profile enablement singleton (v10). One
+/// required row from genesis; moves only through `SetStreamProfile`'s exact
+/// CAS.
+const OBJECT_TYPE_STREAM_PROFILE: &str = "stream_profile";
 const TABLE_VERSION_MANAGEMENT_KEY: &str = "table_version_management";
 
 /// Stable head-key segment for the main branch in `graph_head:<branch>` rows.
@@ -167,6 +175,9 @@ pub struct Snapshot {
     /// Exact graph-global sequencing participant selected by this manifest
     /// snapshot. Its raw Lance HEAD is never authority.
     stream_token_authority: StreamTokenAuthorityEntry,
+    /// Graph-global RFC-026 §4.7 enablement authority (v10). Required from
+    /// genesis; every opener obeys it regardless of access path.
+    stream_profile: StreamProfileEntry,
     /// Per-graph read caches (shared `Session` + held-handle cache), injected by
     /// `Omnigraph::resolved_target` for live Branch reads so table opens reuse
     /// handles (0 IO on a warm repeat) and one `Session`. `None` for write-prelude
@@ -637,6 +648,26 @@ impl Snapshot {
         &self.stream_token_authority
     }
 
+    /// Exact durable RFC-026 §4.7 enablement authority for this snapshot.
+    pub(crate) fn stream_profile(&self) -> &StreamProfileEntry {
+        &self.stream_profile
+    }
+
+    /// The graph's streaming posture, computed from state this snapshot
+    /// already holds (zero extra I/O): whether the experimental streaming
+    /// profile is enabled, and whether any stream lifecycle is non-terminal
+    /// (`undrained` — the condition that makes a disable refuse as
+    /// pending-until-drained).
+    pub fn streaming_status(&self) -> StreamingStatus {
+        StreamingStatus {
+            enabled: self.stream_profile.streaming_enabled,
+            undrained: self
+                .stream_lifecycles
+                .values()
+                .any(|lifecycle| lifecycle.lifecycle != StreamLifecycle::Sealed),
+        }
+    }
+
     /// Open `_stream_tokens.lance` only at the exact manifest-selected witness.
     pub(crate) async fn open_stream_token_authority(&self) -> Result<Dataset> {
         let session = self
@@ -894,6 +925,14 @@ pub(crate) enum ManifestChange {
         expected: StreamTokenAuthorityEntry,
         next: StreamTokenAuthorityEntry,
     },
+    /// Flip the graph-global RFC-026 §4.7 stream-profile enablement row under
+    /// an exact full-entry CAS. Genesis always provisions the row (disabled),
+    /// so there is no absent-row/bootstrap publish mode; `profile_revision`
+    /// must advance strictly.
+    SetStreamProfile {
+        expected: StreamProfileEntry,
+        next: StreamProfileEntry,
+    },
 }
 
 /// One table-version authority assertion supplied to a publish attempt.
@@ -1040,6 +1079,7 @@ impl ManifestCoordinator {
                 .collect(),
             stream_lifecycles: state.stream_lifecycles,
             stream_token_authority: state.stream_token_authority,
+            stream_profile: state.stream_profile,
             read_caches: None,
         }
     }

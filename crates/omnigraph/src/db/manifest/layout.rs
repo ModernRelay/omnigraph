@@ -96,6 +96,15 @@ pub(super) const fn stream_token_authority_object_id() -> &'static str {
     "stream_token_authority"
 }
 
+/// Fixed graph-global RFC-026 §4.7 stream-profile enablement row.
+///
+/// Like the token authority it carries no table identity: the enablement flag
+/// is graph protocol state. No colon-suffixed component — those are reserved
+/// for identity- and branch-keyed row families.
+pub(super) const fn stream_profile_object_id() -> &'static str {
+    "stream_profile"
+}
+
 pub(super) fn table_id_to_key(request_id: Option<&Vec<String>>) -> lance_namespace::Result<String> {
     match request_id {
         Some(request_id) if request_id.len() == 1 && !request_id[0].is_empty() => {

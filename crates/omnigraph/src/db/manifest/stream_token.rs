@@ -967,10 +967,62 @@ pub(crate) struct StreamFoldAttributionSummary {
     pub(crate) visible_contributor_count: u64,
     pub(crate) visible_write_count: u64,
     pub(crate) winning_attribution_digest: String,
+    /// Reserved v10 slot for the RFC-026 §4.7 P4 dead-letter object reference.
+    /// Physically present as an explicit null until the dead-letter slice
+    /// activates it: this summary is `deny_unknown_fields` and compared for
+    /// exact structural equality between the recovery sidecar and the durable
+    /// lineage row, so the slot must exist at the format bump rather than be
+    /// retrofitted through a serde default. It is deliberately excluded from
+    /// the attribution digest preimage, so a null slot leaves
+    /// `stream_fold_attribution_commitment` recomputation stable.
+    #[serde(deserialize_with = "deserialize_present_option")]
+    pub(crate) dead_letter_object: Option<DeadLetterObjectRef>,
+}
+
+/// Frozen wire shape of a fold's dead-letter object reference (RFC-026 §4.7
+/// P4): the graph-relative reserved-prefix location of the NDJSON object
+/// holding the diverted key-chains, its diverted-row count, and the sha256
+/// digest of its exact bytes. Shape is fixed at the v10 bump; no writer can
+/// produce a populated value until the dead-letter slice activates it.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct DeadLetterObjectRef {
+    pub(crate) location: String,
+    pub(crate) diverted_row_count: u64,
+    pub(crate) object_digest: String,
+}
+
+impl DeadLetterObjectRef {
+    pub(crate) fn validate(&self) -> ProtocolResult<()> {
+        if self.location.is_empty() || self.location.starts_with('/') {
+            return Err(StreamTokenProtocolError::invalid(
+                "dead_letter_object.location",
+                "must be a non-empty graph-relative path",
+            ));
+        }
+        if self.diverted_row_count == 0 {
+            return Err(StreamTokenProtocolError::invalid(
+                "dead_letter_object.diverted_row_count",
+                "must be non-zero",
+            ));
+        }
+        decode_sha256("dead_letter_object.object_digest", &self.object_digest)?;
+        Ok(())
+    }
 }
 
 impl StreamFoldAttributionSummary {
     pub(crate) fn validate(&self) -> ProtocolResult<()> {
+        if let Some(reference) = &self.dead_letter_object {
+            // A malformed reference reports its malformation; a well-formed
+            // one is still refused — the slot is reserved until the
+            // dead-letter slice activates it under its own crash matrix.
+            reference.validate()?;
+            return Err(StreamTokenProtocolError::invalid(
+                "dead_letter_object",
+                "is reserved at v10 and must be null until the dead-letter slice activates it",
+            ));
+        }
         if self.visible_contributor_count == 0 {
             return Err(StreamTokenProtocolError::invalid(
                 "visible_contributor_count",
@@ -1079,6 +1131,8 @@ pub(crate) fn stream_fold_attribution_commitment(
         visible_write_count: u64::try_from(winners.len())
             .map_err(|_| StreamTokenProtocolError::invalid("fold_winners", "count exceeds u64"))?,
         winning_attribution_digest: format!("sha256:{:x}", hasher.finalize()),
+        // Reserved at v10; the digest preimage above deliberately excludes it.
+        dead_letter_object: None,
     })
 }
 
@@ -1967,9 +2021,16 @@ mod tests {
             visible_contributor_count: 2,
             visible_write_count: 3,
             winning_attribution_digest: format!("sha256:{}", "ab".repeat(32)),
+            dead_letter_object: None,
         };
         summary.validate().unwrap();
         let encoded = serde_json::to_string(&summary).unwrap();
+        // The reserved v10 dead-letter slot is physically present as an
+        // explicit null on the wire.
+        assert!(
+            encoded.contains("\"dead_letter_object\":null"),
+            "got: {encoded}"
+        );
         assert_eq!(
             serde_json::from_str::<StreamFoldAttributionSummary>(&encoded).unwrap(),
             summary
@@ -1979,7 +2040,18 @@ mod tests {
                 "visible_contributor_count": 2,
                 "visible_write_count": 3,
                 "winning_attribution_digest": format!("sha256:{}", "ab".repeat(32)),
+                "dead_letter_object": null,
                 "unexpected": true
+            }))
+            .is_err()
+        );
+        // An absent slot is refused, not defaulted: a truncated or hand-built
+        // row is never reinterpreted (the house present-option rule).
+        assert!(
+            serde_json::from_value::<StreamFoldAttributionSummary>(serde_json::json!({
+                "visible_contributor_count": 2,
+                "visible_write_count": 3,
+                "winning_attribution_digest": format!("sha256:{}", "ab".repeat(32)),
             }))
             .is_err()
         );
@@ -2001,9 +2073,31 @@ mod tests {
                 winning_attribution_digest: format!("sha256:{}", "AB".repeat(32)),
                 ..summary.clone()
             },
+            // A populated slot — even a well-formed one — is refused while the
+            // slot is reserved.
+            StreamFoldAttributionSummary {
+                dead_letter_object: Some(DeadLetterObjectRef {
+                    location: "__dead_letter/01ARZ.ndjson".to_string(),
+                    diverted_row_count: 1,
+                    object_digest: format!("sha256:{}", "cd".repeat(32)),
+                }),
+                ..summary.clone()
+            },
         ] {
             assert!(invalid.validate().is_err(), "{invalid:?}");
         }
+
+        // A malformed populated slot reports its malformation.
+        let malformed = StreamFoldAttributionSummary {
+            dead_letter_object: Some(DeadLetterObjectRef {
+                location: String::new(),
+                diverted_row_count: 0,
+                object_digest: "nope".to_string(),
+            }),
+            ..summary.clone()
+        };
+        let err = malformed.validate().unwrap_err().to_string();
+        assert!(err.contains("dead_letter_object.location"), "got: {err}");
     }
 
     #[test]
