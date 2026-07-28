@@ -2373,21 +2373,19 @@ fn widest_legal_generation_records_no_roll_estimates_and_peak_rss() {
         let baseline_fold_peak_rss = run_rss_child("baseline-fold");
         let widest_fold_peak_rss = run_rss_child("widest-fold");
         let signed_process_delta = i128::from(widest_peak_rss) - i128::from(baseline_peak_rss);
-        let fold_process_delta = widest_fold_peak_rss.saturating_sub(baseline_fold_peak_rss);
+        let signed_fold_peak_lift =
+            i128::from(widest_fold_peak_rss) - i128::from(baseline_fold_peak_rss);
         eprintln!(
-            "B2 widest legal generation: rows={WIDEST_ROWS} one_batch_payload_bytes_per_row={WIDEST_PAYLOAD_BYTES} one_batch_attributed_post_tombstone_arrow_reservation={arrow_reservation} first_illegal_payload_bytes_per_row={WIDEST_ONE_BYTE_OVER_PAYLOAD_BYTES} first_illegal_attributed_post_tombstone_arrow_reservation={one_byte_over_arrow_reservation} one_batch_batch_store_estimate={batch_store_estimate} rc_pk_bloom_estimate={bloom_estimate} one_batch_rc_roll_trigger_estimate={rc_trigger_estimate} fragmented_batches={WIDEST_ROWS} fragmented_rc_roll_trigger_upper_bound={fragmented_rc_trigger_upper_bound} no_roll_bytes={NO_AUTO_ROLL_BYTES} rss_shape=one_batch baseline_peak_rss={baseline_peak_rss} widest_peak_rss={widest_peak_rss} signed_whole_process_delta={signed_process_delta} baseline_fold_peak_rss={baseline_fold_peak_rss} widest_fold_peak_rss={widest_fold_peak_rss} fold_process_delta={fold_process_delta} fold_delta_remeasure_bytes={FOLD_RSS_DELTA_REMEASURE_BYTES}"
+            "B2 widest legal generation: rows={WIDEST_ROWS} one_batch_payload_bytes_per_row={WIDEST_PAYLOAD_BYTES} one_batch_attributed_post_tombstone_arrow_reservation={arrow_reservation} first_illegal_payload_bytes_per_row={WIDEST_ONE_BYTE_OVER_PAYLOAD_BYTES} first_illegal_attributed_post_tombstone_arrow_reservation={one_byte_over_arrow_reservation} one_batch_batch_store_estimate={batch_store_estimate} rc_pk_bloom_estimate={bloom_estimate} one_batch_rc_roll_trigger_estimate={rc_trigger_estimate} fragmented_batches={WIDEST_ROWS} fragmented_rc_roll_trigger_upper_bound={fragmented_rc_trigger_upper_bound} no_roll_bytes={NO_AUTO_ROLL_BYTES} rss_shape=one_batch baseline_peak_rss={baseline_peak_rss} widest_peak_rss={widest_peak_rss} signed_whole_process_delta={signed_process_delta} baseline_fold_peak_rss={baseline_fold_peak_rss} widest_fold_peak_rss={widest_fold_peak_rss} signed_fold_peak_lift={signed_fold_peak_lift} fold_delta_remeasure_bytes={FOLD_RSS_DELTA_REMEASURE_BYTES}"
         );
+        // `ru_maxrss` is a lifetime high-water mark. Common graph initialization
+        // can dominate both children on a constrained runner, so the paired lift
+        // may be zero or negative even though the widest child completed its
+        // exact writes and fold assertions. Keep this as a one-sided regression
+        // tripwire rather than requiring the workload to establish a new peak.
         assert!(
-            widest_peak_rss > baseline_peak_rss,
-            "the isolated widest generation should have a visible whole-process RSS cost"
-        );
-        assert!(
-            widest_fold_peak_rss > baseline_fold_peak_rss,
-            "the isolated widest fold should have a visible whole-process RSS cost"
-        );
-        assert!(
-            fold_process_delta <= FOLD_RSS_DELTA_REMEASURE_BYTES,
-            "the dense fold path crossed its measured RSS-delta envelope; remeasure before changing the admission or compaction shape"
+            signed_fold_peak_lift <= i128::from(FOLD_RSS_DELTA_REMEASURE_BYTES),
+            "the dense fold path crossed its measured peak-RSS-lift envelope; remeasure before changing the admission or compaction shape"
         );
     }
 

@@ -236,8 +236,8 @@ jobs:
           grep -Fq "B2a retained-history ci depth=" "$test_log" \
             || { echo "::error::B2a retained-history regression cell produced no evidence"; exit 1; }
 
-          # This is a remeasurement tripwire for the current single-exclusive-
-          # fold shape, not a runtime allocator limit.
+          # This is a one-sided peak-lift remeasurement tripwire for the current
+          # single-exclusive-fold shape, not a runtime allocator limit.
           grep -Eq "test widest_legal_generation_records_no_roll_estimates_and_peak_rss \.\.\. ok" "$test_log" \
             || { echo "::error::Gate R0 RSS remeasurement cell did not execute normally"; exit 1; }
           grep -Fq "fold_delta_remeasure_bytes=402653184" "$test_log" \
