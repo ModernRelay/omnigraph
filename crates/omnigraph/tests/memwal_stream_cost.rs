@@ -1152,7 +1152,16 @@ async fn retained_history_scaling_samples_at(
 
 async fn retained_history_scaling_samples_local(depths: &[u64]) -> Vec<RetentionDepthSample> {
     let dir = tempfile::tempdir().unwrap();
-    retained_history_scaling_samples_at(dir.path().to_str().unwrap(), depths).await
+    // Heap-allocate the sweep future. Each depth drives the full enrollment,
+    // acknowledgement, cold-replay, and fold stack; in a debug build those
+    // nested async frames accumulate into the caller's frame and overflow a
+    // default test-thread stack. Same `Box::pin` remedy `helpers::cost::
+    // cost_harness` documents for whole-test-body futures.
+    Box::pin(retained_history_scaling_samples_at(
+        dir.path().to_str().unwrap(),
+        depths,
+    ))
+    .await
 }
 
 fn assert_retained_history_scaling_sample(sample: &RetentionDepthSample) {

@@ -160,6 +160,16 @@ jobs:
       contents: write
     env:
       CARGO_TERM_COLOR: always
+      # Floor for the whole class of debug-build async stack depth, NOT the fix
+      # for any one test. Unoptimized builds keep every nested async frame, so
+      # a deep engine path (init -> write -> publish -> recovery -> Lance) can
+      # approach a default 2 MiB spawned-thread stack. The depth is genuinely
+      # environment-sensitive: the same tree overflowed `write_cost` on this
+      # Linux runner while macOS stayed under, and overflowed a different cell
+      # (`memwal_stream_cost`) on macOS. Individual offenders are still fixed at
+      # the source with `Box::pin` (see `helpers::cost::cost_harness`); this
+      # keeps CI deterministic across runners while that work continues.
+      RUST_MIN_STACK: 16777216
     steps:
       - name: Skip heavy CI for text-only changes
         if: needs.classify_changes.outputs.run_full_ci != 'true'
