@@ -99,6 +99,7 @@ Working documents for in-flight feature work. Removed when the work lands.
 
 | Area | Read |
 |---|---|
+| Firehose path (RFC-026 streaming) — safe slice ordering, exact seams, closed protocol choices, and activation evidence | [firehose-path-specs.md](firehose-path-specs.md) |
 | Schema-lint chassis v1 (MR-694) — `--allow-data-loss`, soft/hard drops | [schema-lint-v1-plan.md](schema-lint-v1-plan.md) |
 | Inline + stored queries, request/response envelope, MCP (MR-656 / MR-976 / MR-969) | [rfc-001-queries-envelope-mcp.md](rfc-001-queries-envelope-mcp.md) |
 | Config & CLI architecture — layered config, client targeting, file naming (MR-973 / MR-974 / MR-981) | [rfc-002-config-cli-architecture.md](rfc-002-config-cli-architecture.md) |
