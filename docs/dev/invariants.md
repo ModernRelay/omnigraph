@@ -279,7 +279,7 @@ them explicit.
   generation limit; fold takes every emitted row into dense owned Arrow arrays and drops the sparse
   parent representation before retaining the batch. The deterministic
   8,192-row high-entropy near-cap generation now folds and publishes exactly
-  once. Its isolated fold RSS delta was 284,934,144 bytes (about 272 MiB), below
+  once. Its isolated fold RSS delta was 286,441,472 bytes (about 273 MiB), below
   the 384-MiB remeasurement tripwire; crossing that tripwire requires
   remeasurement rather than a silent admission change.
 
@@ -323,9 +323,12 @@ them explicit.
   recovery until capacity is restored; it never permits an acknowledgement to
   disappear or a partial effect to become graph-visible. Row and Arrow-memory
   admission, deadlines, retries, and ambiguity handling remain bounded. The
-  local/configured-RustFS 1/8/32/128 instrument keeps these cost terms separate
-  and is advisory; it does not create a quota, latency SLO, or history-flat
-  claim.
+  local/configured-RustFS 1/8/32/128 instrument keeps MemWAL, base-table,
+  token-authority, other table-store, graph-manifest, adapter, and retained-root
+  cost terms separate. Only the MemWAL warm-ack operation counts are asserted
+  flat; aggregate authority lookup is reported honestly and may grow. The
+  evidence is advisory; it does not create a quota, latency SLO, or
+  history-flat claim.
 
   RC.1's missing durable materialization-attempt receipt and reserve-first
   complete-output envelope are consequently not blockers for unbounded

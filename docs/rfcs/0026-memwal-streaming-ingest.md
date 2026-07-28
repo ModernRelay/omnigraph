@@ -213,10 +213,11 @@ Lance RC.1.** Three findings were recorded:
    data/Blob/transaction/manifest/deletion/PK/Bloom objects, local staging
    residue, or multipart/provider residue. Measurements can validate a formula;
    they cannot create one.
-3. The deterministic high-entropy near-cap cell acknowledged a legal
-   33,228,232-byte logical post-tombstone Arrow generation and retains 33,174,630
-   currently listed immutable bytes after acknowledgement. Materialization
-   raised the listed retained total to about 65.1 million bytes. The old fold
+3. The historical pre-B2-attribution deterministic high-entropy near-cap cell
+   acknowledged a legal 33,228,232-byte logical post-tombstone Arrow generation
+   and retained 33,174,630 currently listed immutable bytes after
+   acknowledgement. Materialization raised the listed retained total to about
+   65.1 million bytes. The old fold
    retained sparse `LsmScanner` slices whose variable-width arrays still owned
    their much larger backing buffers, so its logical-byte check charged roughly
    252.8 million bytes against the 33,554,432-byte generation limit and refused
@@ -250,16 +251,15 @@ rules; it is never permission to acknowledge, discard, or fabricate success.
 The third finding is fixed. `scan_fresh_generation` now validates the streamed
 logical row/byte totals and then takes every selected row into dense owned Arrow
 arrays before retaining the batch. Dropping the sparse scanner batch releases
-its oversized backing buffers before the next slice. The same deterministic
-33,228,232-byte generation now folds all 8,192 rows, advances the base table
-once, and becomes graph-visible at exactly one `__manifest` publication. One
-isolated widest-fold reference run measured a whole-process peak-RSS delta of
-284,934,144 bytes (about 272 MiB / 285 MB) over the small-fold baseline; a
-384-MiB delta tripwire requires remeasurement before the admission or compaction
-shape is widened. This is measured process memory, not a physical-storage
-quota. The 8,192-row and 32-MiB logical generation limits, one-resident-writer
-topology, exclusive-fold ownership, typed failures, and recovery barriers all
-remain.
+its oversized backing buffers before the next slice. The historical
+pre-B2-attribution 33,228,232-byte generation then folded all 8,192 rows,
+advanced the base table once, and became graph-visible at exactly one
+`__manifest` publication. The current B2-attributed Gate-R0 fixture and RSS
+evidence are recorded in §12.3 and §12.4. The 384-MiB delta tripwire requires
+remeasurement before the admission or compaction shape is widened. This is
+measured process memory, not a physical-storage quota. The 8,192-row and
+32-MiB logical generation limits, one-resident-writer topology, exclusive-fold
+ownership, typed failures, and recovery barriers all remain.
 
 This decision and repair did not themselves authorize internal schema
 v9/config-v3/state-v2/recovery-v12 state, a public stream contract, a production
@@ -3352,17 +3352,20 @@ RFC remains draft.
   38.426/49.253 ms. Rerun this cell before a current object-store ack-cost
   claim. These are evidence-run observations, not a latency SLO or group-
   commit multiplier.
-- The widest one-batch dense generation reserves 33,228,232 logical Arrow bytes with a
-  33,203,240-byte RC trigger estimate. The worst fragmented 8,192-one-row-batch
-  shape reserves 33,103,872 Arrow bytes with a 29,343,744-byte trigger estimate;
-  both remain below the explicit 1-GiB no-roll threshold and 8,192 remains below
-  the 8,193 row/batch threshold. Isolated one-batch whole-process peak RSS moves
-  from 74,334,208 to 206,471,168 bytes (+132,136,960), explicitly including
-  Arrow, PK-index, runtime, and allocator overhead. That result qualifies one
-  resident writer with one 32-MiB aggregate logical Arrow reservation. Queued batches
+- The current widest one-batch dense generation uses 3,742 payload bytes per
+  row and reserves 33,550,336 B2-attributed logical Arrow bytes, 4,096 below
+  the 32-MiB cap. The exact 3,743-byte-per-row neighbor charges 33,558,528,
+  4,096 above the cap, and is rejected effect-free through the real adapter.
+  The legal RC trigger estimate is 33,583,144 bytes; the conservative worst
+  8,192-one-row-batch trigger upper bound is 33,914,880 bytes. Both remain
+  below the explicit 1-GiB no-roll threshold and 8,192 remains below the 8,193
+  row/batch threshold. Isolated one-batch whole-process peak RSS moves from
+  77,725,696 to 264,683,520 bytes (+186,957,824), explicitly including Arrow,
+  PK-index, runtime, and allocator overhead. That result qualifies one resident
+  writer with one 32-MiB aggregate attributed Arrow reservation. Queued batches
   share that reservation rather than accumulating outside it. The repaired
   high-entropy widest fold publishes all 8,192 rows and measures an isolated
-  whole-process peak-RSS delta of 284,934,144 bytes (about 272 MiB / 285 MB)
+  whole-process peak-RSS delta of 286,441,472 bytes (about 273 MiB / 286 MB)
   over the small-fold baseline. CI uses 384 MiB only as a remeasurement
   tripwire for that one exclusive fold. It is not enforced allocator admission,
   and concurrent residents must be measured before either concurrency or the
@@ -3447,12 +3450,14 @@ materialization-attempt receipt/cap nor a source-derived physical-output
 envelope. Those findings must be revisited before any future storage bound is
 claimed. They are not blockers for unbounded B2a.
 
-The high-entropy cell now expects successful closure, complete row visibility,
-one base-table effect, one `__manifest` visibility point, and no remaining
-recovery sidecar. It retains the historical acknowledgement/materialization
-byte observations and the invariant that every earlier listed immutable path
-keeps the same path/class/size. The local RSS child's recorded reference run
-measured a 284,934,144-byte fold delta and enforces a 384-MiB CI
+The high-entropy cell now proves the exact B2-attributed boundary through the
+real adapter: 3,743 payload bytes per row is rejected effect-free at
+33,558,528 bytes, while 3,742 is admitted at 33,550,336 bytes. It expects
+successful closure, complete row visibility, one base-table effect, one
+`__manifest` visibility point, and no remaining recovery sidecar. It preserves
+the invariant that every earlier listed immutable path keeps the same
+path/class/size. The local RSS child's recorded reference run measured a
+286,441,472-byte fold delta and enforces a 384-MiB CI
 **remeasurement** tripwire
 for one exclusive fold. That tripwire is not a runtime hard allocator limit.
 Configured RustFS remains a post-merge/tag regression signal and is not used to
@@ -3503,14 +3508,19 @@ The checked-in result is:
   or deletes and canonical MemWAL delete requests remain zero. Local
   shard-manifest CAS may delete only validated `.binpb.tmp.<uuid>` staging.
 
-The 1→128 reference sweep keeps warm-ack operation counts flat (local: 9 table
-reads, 2 writes, 21 adapter operations; RustFS: 12, 1, and 21), while bytes read
-from growing shard authority increase from 351 to 16,521. Advisory currently
-listed immutable bytes grow from about 37 KiB to 5.3 MiB. At depth 128 the
-configured-RustFS fold observes 198 table reads and 2,097 graph-manifest-store
-reads; this is the real combined accumulated base-table, graph-manifest, and
-retained-WAL shape, not an isolated WAL slope. Wall times and whole-process RSS
-are printed as diagnostics only and enforce no product threshold.
+The historical pre-B2 1→128 sweep recorded flat aggregate warm-ack operation
+counts (local: 9 table reads, 2 writes, 21 adapter operations; RustFS: 12, 1,
+and 21), while bytes read from growing shard authority increased from 351 to
+16,521. B2's mandatory exact token authority makes that old aggregate
+flatness claim inapplicable. The current local 1→8 CI cell partitions the
+tracked table-store requests: the actual MemWAL warm-ack operation counts
+remain flat at 9 reads and 2 writes, token-authority lookup grows 2→8 reads,
+aggregate tracked reads therefore grow 11→17, adapter operations remain 28→28,
+and every older retained generation root receives zero IO. Base-table and
+token-authority work stay separately visible rather than being attributed to
+MemWAL history.
+Advisory listed bytes, wall times, and whole-process RSS are printed as
+diagnostics only and enforce no product threshold.
 
 This B2a result itself added no schema or product surface. The subsequent
 private B2-common row/fold slice activated schema v9; production callers and

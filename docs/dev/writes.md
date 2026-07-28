@@ -662,8 +662,8 @@ near-cap cell acknowledges without moving either manifest or base-table
 version, materializes one generation, then folds 8,192 rows and publishes one
 table version through one `__manifest` visibility CAS. The dense scanner-batch
 copy keeps the accepted shape inside its logical dense-slice 32-MiB limit. A separate
-subprocess measurement recorded a 284,934,144-byte isolated fold RSS delta
-(about 272 MiB), below the 384-MiB remeasurement tripwire. That tripwire guards
+subprocess measurement recorded a 286,441,472-byte isolated fold RSS delta
+(about 273 MiB), below the 384-MiB remeasurement tripwire. That tripwire guards
 the measured implementation shape; changing the admission or fold strategy
 requires remeasurement.
 
@@ -691,11 +691,13 @@ RC.1's missing cross-open materialization receipt and complete physical-output
 envelope are therefore not blockers for this profile. They remain relevant to
 the future B2b managed-reclamation design. The checked-in 1/8/32/128 local and
 configured-RustFS instrument separates warm acknowledgement, cold replay, fold,
-visibility, table, graph-manifest, adapter, advisory object, and whole-process
-RSS terms. Warm acknowledgement retains a flat operation shape while serialized
-authority and combined retained-history work grow; the observations are not a
-quota, latency SLO, provider bill, or isolated WAL slope. B2a activates no new
-format or product state.
+visibility, MemWAL, base-table, token-authority, other table-store,
+graph-manifest, adapter, advisory object, and whole-process RSS terms. The
+actual MemWAL warm-ack operation counts remain flat while exact token/base
+authority and combined retained-history work are reported separately and may
+grow; the aggregate is not claimed flat. The observations are not a quota,
+latency SLO, provider bill, or isolated WAL slope. B2a activates no new format
+or product state.
 
 The implemented private B2 slice owns the row-sequencing and fold-authority
 part of RFC-026's common contract. A caller-stable `write_id` and exact
