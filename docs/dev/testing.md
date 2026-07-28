@@ -622,9 +622,11 @@ v8, rebuilds a distinct v9/config-v3 root, and
 proves row/vector fidelity plus exact-`id` PK metadata. The v9 re-export must
 not expose the physical `__omnigraph_stream_v1$` attribution column, and the v8
 fixture's ordinary user property `__omnigraph_stream_v1` must retain its value;
-the v8 binary must refuse the v9 root. CI pins and builds the last merged schema-v8
-commit (`725793af83394235bf4b848b6c2c4454ac1f95e1`) before the workspace suite,
-so this immediate boundary runs non-vacuously on full CI. Run it locally with:
+the v8 binary must refuse the v9 root. CI pinned this seam while v9 was
+CURRENT; with v10 CURRENT it became a historical boundary and joined the
+env-gated seams, so it now skips unless `OMNIGRAPH_V8_BIN` points at a build of
+the last merged schema-v8 commit
+(`725793af83394235bf4b848b6c2c4454ac1f95e1`). Run it locally with:
 
 ```bash
 OMNIGRAPH_V8_BIN=/path/to/final-v8/omnigraph \
