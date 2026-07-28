@@ -1385,7 +1385,8 @@ impl ManifestBatchPublisher for RecordingPublisher {
                 | ManifestChange::RenameTable(_)
                 | ManifestChange::Tombstone(_)
                 | ManifestChange::SetStreamLifecycle { .. }
-                | ManifestChange::SetStreamTokenAuthority { .. } => None,
+                | ManifestChange::SetStreamTokenAuthority { .. }
+                | ManifestChange::SetStreamProfile { .. } => None,
             })
             .collect();
         self.requests.lock().await.extend_from_slice(&requests);
@@ -1653,6 +1654,150 @@ async fn table_and_stream_token_pointers_publish_in_one_manifest_cas() {
         reopened.entry("node:Person").unwrap().table_version,
         table_update.table_version
     );
+}
+
+/// RFC-026 §4.7 P1: the required genesis stream-profile singleton, its
+/// exact-entry CAS, strict revision advance, and reopen durability.
+#[tokio::test]
+async fn stream_profile_genesis_cas_and_revision_rules() {
+    let dir = tempfile::tempdir().unwrap();
+    let uri = dir.path().to_str().unwrap();
+    let catalog = build_test_catalog();
+    let mut mc = ManifestCoordinator::init(uri, &catalog).await.unwrap();
+
+    // Genesis: present from manifest version one, disabled, revision 1,
+    // reserved pending-disable slot null; the public status projection agrees.
+    let before = mc.snapshot();
+    let genesis = before.stream_profile().clone();
+    assert_eq!(genesis, StreamProfileEntry::genesis());
+    let status = before.streaming_status();
+    assert!(!status.enabled);
+    assert!(!status.undrained);
+
+    // Enable through the exact-entry CAS with a strict revision advance.
+    let enabled = StreamProfileEntry {
+        streaming_enabled: true,
+        disable_pending_since: None,
+        profile_revision: genesis.profile_revision + 1,
+    };
+    let manifest_before = mc.version();
+    mc.commit_changes(&[ManifestChange::SetStreamProfile {
+        expected: genesis.clone(),
+        next: enabled.clone(),
+    }])
+    .await
+    .unwrap();
+    assert_eq!(mc.version(), manifest_before + 1);
+    let after = mc.snapshot();
+    assert_eq!(after.stream_profile(), &enabled);
+    assert!(after.streaming_status().enabled);
+
+    // A stale expected entry is a typed read-set conflict, not an overwrite.
+    let stale = mc
+        .commit_changes(&[ManifestChange::SetStreamProfile {
+            expected: genesis.clone(),
+            next: StreamProfileEntry {
+                streaming_enabled: false,
+                disable_pending_since: None,
+                profile_revision: genesis.profile_revision + 1,
+            },
+        }])
+        .await
+        .unwrap_err();
+    assert!(matches!(
+        stale,
+        OmniError::Manifest(ManifestError {
+            details: Some(ManifestConflictDetails::ReadSetChanged { .. }),
+            ..
+        })
+    ));
+
+    // A non-advancing revision is refused even with the correct expected
+    // entry: the strict advance is what makes a lost-and-retried flip visible
+    // instead of silently overwriting a concurrent transition.
+    let non_advancing = mc
+        .commit_changes(&[ManifestChange::SetStreamProfile {
+            expected: enabled.clone(),
+            next: StreamProfileEntry {
+                streaming_enabled: false,
+                disable_pending_since: None,
+                profile_revision: enabled.profile_revision,
+            },
+        }])
+        .await
+        .unwrap_err();
+    assert!(
+        non_advancing
+            .to_string()
+            .contains("stream profile revision must advance strictly"),
+        "got: {non_advancing}"
+    );
+
+    // An identical next entry is a no-op publish, not an error and not a new
+    // manifest version.
+    let version_before_noop = mc.version();
+    mc.commit_changes(&[ManifestChange::SetStreamProfile {
+        expected: enabled.clone(),
+        next: enabled.clone(),
+    }])
+    .await
+    .unwrap();
+    assert_eq!(mc.version(), version_before_noop);
+
+    // The flip is durable across a cold reopen.
+    let reopened = ManifestCoordinator::open(uri).await.unwrap().snapshot();
+    assert_eq!(reopened.stream_profile(), &enabled);
+    assert!(reopened.streaming_status().enabled);
+}
+
+/// RFC-026 §4.7 P1: disabling streaming refuses, typed and effect-free, while
+/// any stream lifecycle is non-terminal — an acknowledged-durable promise must
+/// never be stranded by a flag flip. Injects an `Open` lifecycle row through
+/// the manifest CAS (no production enrollment path exists in this slice).
+#[tokio::test]
+async fn set_streaming_enabled_refuses_disable_while_undrained() {
+    let dir = tempfile::tempdir().unwrap();
+    let uri = dir.path().to_str().unwrap();
+    let db = crate::db::Omnigraph::init(uri, test_schema_source())
+        .await
+        .unwrap();
+
+    let enabled = db.set_streaming_enabled_as(true, None).await.unwrap();
+    assert!(enabled.changed);
+
+    // Inject an OPEN lifecycle for Person through a separate coordinator —
+    // the state a live (private) stream would hold.
+    let mut mc = ManifestCoordinator::open(uri).await.unwrap();
+    let person_entry = mc.snapshot().entry("node:Person").unwrap().clone();
+    let open = stream_lifecycle_for_person(
+        &person_entry,
+        person_entry.table_version,
+        StreamLifecycle::Open,
+    );
+    mc.commit_changes(&[ManifestChange::SetStreamLifecycle {
+        expected: None,
+        next: open,
+    }])
+    .await
+    .unwrap();
+
+    let err = db.set_streaming_enabled_as(false, None).await.unwrap_err();
+    match err {
+        OmniError::StreamingDisablePending { undrained_tables } => {
+            assert_eq!(undrained_tables, vec!["node:Person".to_string()]);
+        }
+        other => panic!("expected StreamingDisablePending, got: {other}"),
+    }
+
+    // Effect-free refusal: the flag is still enabled and the revision did not
+    // move; the public status reports the undrained state.
+    let mc = ManifestCoordinator::open(uri).await.unwrap();
+    let snapshot = mc.snapshot();
+    assert!(snapshot.stream_profile().streaming_enabled);
+    assert_eq!(snapshot.stream_profile().profile_revision, 2);
+    let status = snapshot.streaming_status();
+    assert!(status.enabled);
+    assert!(status.undrained);
 }
 
 fn stream_lifecycle_for_person(
@@ -2166,7 +2311,7 @@ async fn test_init_stamps_internal_schema_version() {
     ManifestCoordinator::init(uri, &catalog).await.unwrap();
 
     let ds = open_manifest_dataset(uri, None).await.unwrap();
-    assert_eq!(super::migrations::INTERNAL_MANIFEST_SCHEMA_VERSION, 9);
+    assert_eq!(super::migrations::INTERNAL_MANIFEST_SCHEMA_VERSION, 10);
     assert_eq!(
         super::migrations::read_stamp(&ds),
         super::migrations::INTERNAL_MANIFEST_SCHEMA_VERSION,
@@ -2475,6 +2620,7 @@ async fn graph_commit_metadata_round_trips_optional_stream_fold_attribution() {
         visible_contributor_count: 2,
         visible_write_count: 3,
         winning_attribution_digest: format!("sha256:{}", "ab".repeat(32)),
+        dead_letter_object: None,
     };
     let historical_fold = LineageIntent {
         graph_commit_id: ulid::Ulid::new().to_string(),

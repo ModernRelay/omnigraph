@@ -744,7 +744,7 @@ preserved both contracts and added RFC-026's identity-keyed lifecycle rows plus
 recoverable empty enrollment. Historical v8 added config-v2 private
 one-generation admission plus recovery-v11 fold.
 
-The currently served v9 format preserves those foundations and activates
+V9 preserved those foundations and activated
 stream-config v3, state protocol v2, trusted hidden stream-row metadata, the
 manifest-selected `_stream_tokens.lance` authority, and recovery-v12. The
 genuine final-v8↔v9 CI strand proves refusal in both directions and strict
@@ -753,6 +753,19 @@ vectors, and exact-`id` PK metadata; it deliberately does not export trusted
 hidden stream metadata or token authority. No serde default or in-place
 adoption manufactures token or contributor evidence. Every transition remains
 rebuild-only.
+
+The currently served v10 format preserves the complete v9 contract and adds
+RFC-026 §4.7 P1's enablement authority: one required graph-global
+`stream_profile` singleton (present from genesis with streaming disabled at
+`profile_revision` 1), flipped only through the shared publisher's exact-entry
+CAS with a strict revision advance, and obeyed by every process that opens the
+graph. The same bump reserves the fold-attribution dead-letter slot as an
+explicit null, because that summary is `deny_unknown_fields` and compared for
+exact structural equality between the recovery sidecar and the lineage row.
+The bump exists because v9 decoders silently skip unknown row kinds — only the
+stamp turns "older binary meets streaming-capable graph" into a refusal
+instead of a writer blind to the freeze. V9 crosses by export/init/load
+rebuild, in both directions.
 
 ---
 

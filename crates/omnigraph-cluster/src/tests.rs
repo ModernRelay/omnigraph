@@ -959,13 +959,18 @@ graphs:
     #[tokio::test]
     async fn missing_derived_graph_root_marks_drifted_and_plans_creates() {
         let dir = fixture();
-        let state_dir = dir.path().join(CLUSTER_STATE_DIR);
-        fs::create_dir_all(&state_dir).unwrap();
-        fs::write(
-            state_dir.join("state.json"),
-            r#"{"version":1,"applied_revision":{"resources":{"graph.knowledge":{"digest":"old-graph"},"schema.knowledge":{"digest":"old-schema"}}}}"#,
-        )
-        .unwrap();
+        write_streaming_cluster(dir.path(), Some(true));
+        let streaming_digest = validate_config_dir(dir.path()).resource_digests
+            ["streaming.knowledge"]
+            .clone();
+        write_state_resources(
+            dir.path(),
+            &[
+                ("graph.knowledge", "old-graph"),
+                ("schema.knowledge", "old-schema"),
+                ("streaming.knowledge", streaming_digest.as_str()),
+            ],
+        );
 
         let out = refresh_config_dir(dir.path()).await;
         assert!(out.ok, "{:?}", out.diagnostics);
@@ -974,7 +979,12 @@ graphs:
             ResourceLifecycleStatus::Drifted
         );
         assert!(!out.resource_digests.contains_key("graph.knowledge"));
+        assert!(!out.resource_digests.contains_key("streaming.knowledge"));
         assert_eq!(out.observations["graph.knowledge"]["exists"], false);
+        assert_eq!(
+            out.resource_statuses["streaming.knowledge"].status,
+            ResourceLifecycleStatus::Drifted
+        );
 
         let plan = plan_config_dir(dir.path()).await;
         assert!(plan.ok, "{:?}", plan.diagnostics);
@@ -984,6 +994,17 @@ graphs:
         assert!(plan.changes.iter().any(|change| {
             change.resource == "schema.knowledge" && change.operation == PlanOperation::Create
         }));
+        assert!(plan.changes.iter().any(|change| {
+            change.resource == "streaming.knowledge"
+                && change.operation == PlanOperation::Create
+        }));
+
+        let applied = apply_config_dir(dir.path()).await;
+        assert!(applied.ok && applied.converged, "{applied:?}");
+        assert!(
+            live_streaming_enabled(dir.path()).await,
+            "a recreated graph must receive the managed streaming authority"
+        );
     }
 
     #[tokio::test]
@@ -1566,6 +1587,7 @@ graphs:
         let dir = fixture();
         init_derived_graph(dir.path()).await;
         write_applyable_state(dir.path());
+        write_streaming_cluster(dir.path(), Some(true));
         // Property type changes are unsupported by the engine planner.
         fs::write(
             dir.path().join("people.pg"),
@@ -1592,6 +1614,14 @@ graphs:
             by_resource["schema.knowledge"].reason.as_deref(),
             Some("schema_apply_failed")
         );
+        assert_eq!(
+            by_resource["streaming.knowledge"].disposition,
+            Some(ApplyDisposition::Blocked)
+        );
+        assert_eq!(
+            by_resource["streaming.knowledge"].reason.as_deref(),
+            Some("dependency_not_applied")
+        );
         // The live schema and the ledger are unchanged.
         let state = read_state_json(dir.path());
         let desired = validate_config_dir(dir.path());
@@ -1603,6 +1633,12 @@ graphs:
             .await
             .unwrap();
         assert_eq!(db.schema_source().as_str(), SCHEMA);
+        assert!(!db.snapshot_of("main").await.unwrap().streaming_status().enabled);
+        assert!(
+            state["applied_revision"]["resources"]
+                .get("streaming.knowledge")
+                .is_none()
+        );
         assert!(
             recovery_sidecars(dir.path()).is_empty(),
             "{:?}",
@@ -1623,6 +1659,13 @@ graphs:
             "{:?}",
             recovery_sidecars(dir.path())
         );
+
+        // Once the graph failure is corrected, the unapplied streaming
+        // resource remains in the diff and is retried.
+        fs::write(dir.path().join("people.pg"), SCHEMA).unwrap();
+        let recovered = apply_config_dir(dir.path()).await;
+        assert!(recovered.ok && recovered.converged, "{recovered:?}");
+        assert!(live_streaming_enabled(dir.path()).await);
     }
 
     #[tokio::test]
@@ -1744,6 +1787,7 @@ graphs:
     #[tokio::test]
     async fn apply_create_failure_blocks_dependents_and_keeps_sidecar() {
         let dir = fixture();
+        write_streaming_cluster(dir.path(), Some(true));
         write_state_resources(dir.path(), &[]);
         // Make the init fail its strict preflight: a junk _schema.pg already
         // sits at the derived root (the engine refuses to overwrite it).
@@ -1779,6 +1823,14 @@ graphs:
         assert_eq!(
             by_resource["policy.base"].disposition,
             Some(ApplyDisposition::Blocked)
+        );
+        assert_eq!(
+            by_resource["streaming.knowledge"].disposition,
+            Some(ApplyDisposition::Blocked)
+        );
+        assert_eq!(
+            by_resource["streaming.knowledge"].reason.as_deref(),
+            Some("dependency_not_applied")
         );
         assert!(!out.converged);
         // The sidecar stays for the sweep to classify next run.
@@ -2792,8 +2844,22 @@ graphs:
                 ("graph.old", "3333"),
                 ("schema.old", "4444"),
                 ("query.old.q", "5555"),
+                ("streaming.old", "6666"),
             ],
         );
+        let mut state = read_state_json(config_dir);
+        state["resource_statuses"] = json!({
+            "streaming.old": {
+                "status": "applied",
+                "conditions": [],
+                "message": "stale streaming child"
+            }
+        });
+        fs::write(
+            config_dir.join(CLUSTER_STATE_FILE),
+            serde_json::to_string_pretty(&state).unwrap(),
+        )
+        .unwrap();
         let root = config_dir.join(CLUSTER_GRAPHS_DIR).join("old.omni");
         fs::create_dir_all(&root).unwrap();
         fs::write(root.join("_schema.pg"), "stale").unwrap();
@@ -2825,6 +2891,13 @@ graphs:
         assert!(!resources.contains_key("graph.old"));
         assert!(!resources.contains_key("schema.old"));
         assert!(!resources.contains_key("query.old.q"));
+        assert!(!resources.contains_key("streaming.old"));
+        assert!(
+            !state["resource_statuses"]
+                .as_object()
+                .unwrap()
+                .contains_key("streaming.old")
+        );
         assert_eq!(state["observations"]["graph.old"]["kind"], "tombstone");
         assert_eq!(state["observations"]["graph.old"]["approval_id"], approval_id);
         // Approval consumed in BOTH stores: ledger summary + artifact file.
@@ -2904,7 +2977,9 @@ graphs:
         fs::remove_dir_all(dir.path().join(CLUSTER_GRAPHS_DIR).join("old.omni")).unwrap();
         let sidecar = write_delete_sidecar(dir.path(), "old", Some(&approval_id), "01DROW7B");
 
-        let out = apply_config_dir(dir.path()).await;
+        // Refresh runs the recovery sweep directly, without the ordinary
+        // planned-delete path independently removing child resources first.
+        let out = refresh_config_dir(dir.path()).await;
         assert!(out.ok, "{:?}", out.diagnostics);
         assert!(
             out.diagnostics
@@ -2918,6 +2993,18 @@ graphs:
                 .as_object()
                 .unwrap()
                 .contains_key("graph.old")
+        );
+        assert!(
+            !state["applied_revision"]["resources"]
+                .as_object()
+                .unwrap()
+                .contains_key("streaming.old")
+        );
+        assert!(
+            !state["resource_statuses"]
+                .as_object()
+                .unwrap()
+                .contains_key("streaming.old")
         );
         assert_eq!(state["observations"]["graph.old"]["kind"], "tombstone");
         assert!(state["approval_records"][&approval_id]["consumed_at"].is_string());
@@ -2940,7 +3027,6 @@ graphs:
         )
         .unwrap();
         assert!(artifact["consumed_at"].is_string());
-        assert!(out.converged, "{out:?}");
     }
 
     #[tokio::test]
@@ -3686,5 +3772,301 @@ graphs:
         assert_eq!(
             by_resource["policy.base"].disposition,
             Some(ApplyDisposition::Applied)
+        );
+    }
+
+    // ---- RFC-026 §4.7 P1: streaming enablement (slice 1) ----
+
+    fn write_streaming_cluster(config_dir: &Path, streaming: Option<bool>) {
+        let streaming_line = match streaming {
+            Some(enabled) => format!("    streaming: {enabled}\n"),
+            None => String::new(),
+        };
+        fs::write(
+            config_dir.join(CLUSTER_CONFIG_FILE),
+            format!(
+                r#"
+version: 1
+metadata:
+  name: test
+state:
+  backend: cluster
+  lock: true
+graphs:
+  knowledge:
+    schema: ./people.pg
+{streaming_line}    queries:
+      find_person:
+        file: ./people.gq
+policies:
+  base:
+    file: ./base.policy.yaml
+    applies_to: [knowledge]
+"#
+            ),
+        )
+        .unwrap();
+    }
+
+    async fn live_streaming_enabled(config_dir: &Path) -> bool {
+        let graph_uri = format!("{}/graphs/knowledge.omni", config_dir.display());
+        let db = Omnigraph::open_read_only(&graph_uri).await.unwrap();
+        db.snapshot_of(omnigraph::db::ReadTarget::branch("main"))
+            .await
+            .unwrap()
+            .streaming_status()
+            .enabled
+    }
+
+    #[test]
+    fn streaming_config_accepts_bool_and_rejects_non_bool() {
+        let dir = fixture();
+        write_streaming_cluster(dir.path(), Some(true));
+        let out = validate_config_dir(dir.path());
+        assert!(out.ok, "{:?}", out.diagnostics);
+        assert!(
+            out.resource_digests.contains_key("streaming.knowledge"),
+            "declared streaming must emit its first-class resource: {:?}",
+            out.resource_digests
+        );
+
+        // Absent = unmanaged: no resource, and (load-bearing for approvals)
+        // the config digest must be byte-identical to a pre-streaming config.
+        write_streaming_cluster(dir.path(), None);
+        let unmanaged = validate_config_dir(dir.path());
+        assert!(unmanaged.ok);
+        assert!(!unmanaged.resource_digests.contains_key("streaming.knowledge"));
+
+        fs::write(
+            dir.path().join(CLUSTER_CONFIG_FILE),
+            r#"
+version: 1
+graphs:
+  knowledge:
+    schema: ./people.pg
+    streaming: "yes"
+"#,
+        )
+        .unwrap();
+        let rejected = validate_config_dir(dir.path());
+        assert!(
+            !rejected.ok,
+            "a non-boolean streaming declaration must be a validation error"
+        );
+    }
+
+    #[test]
+    fn streaming_classifies_first_class_and_drain_pending_blocks() {
+        // The dedicated resource kind parses, and a drain-pending graph
+        // blocks the flip with the §4.7 P1 disposition — the shape later
+        // slices populate from live observation. Delete stays Applied
+        // (unmanage = ledger-row removal, never an engine call).
+        assert_eq!(
+            resource_kind("streaming.knowledge"),
+            ResourceKind::Streaming("knowledge".to_string())
+        );
+        let mut changes = vec![
+            PlanChange {
+                resource: "streaming.knowledge".to_string(),
+                operation: PlanOperation::Update,
+                before_digest: Some("a".to_string()),
+                after_digest: Some("b".to_string()),
+                disposition: None,
+                reason: None,
+                binding_change: false,
+                metadata_change: None,
+                migration: None,
+            },
+            PlanChange {
+                resource: "streaming.other".to_string(),
+                operation: PlanOperation::Delete,
+                before_digest: Some("a".to_string()),
+                after_digest: None,
+                disposition: None,
+                reason: None,
+                binding_change: false,
+                metadata_change: None,
+                migration: None,
+            },
+        ];
+        let drain_pending = BTreeSet::from(["knowledge".to_string(), "other".to_string()]);
+        classify_changes(
+            &mut changes,
+            &[],
+            &BTreeSet::new(),
+            &BTreeSet::new(),
+            &drain_pending,
+        );
+        assert_eq!(changes[0].disposition, Some(ApplyDisposition::Blocked));
+        assert_eq!(changes[0].reason.as_deref(), Some("streaming_drain_pending"));
+        assert_eq!(changes[1].disposition, Some(ApplyDisposition::Applied));
+        assert_eq!(changes[1].reason, None);
+    }
+
+    #[tokio::test]
+    async fn apply_propagates_streaming_flag_and_disable() {
+        let dir = fixture();
+        write_streaming_cluster(dir.path(), Some(true));
+        write_state_resources(dir.path(), &[]);
+
+        // First apply creates the real graph and must land the flag in the
+        // graph's __manifest — the engine-obeyed authority — not just the
+        // ledger. The change classifies Applied, never Derived (the
+        // fake-convergence trap this resource kind exists to avoid).
+        let out = apply_config_dir(dir.path()).await;
+        assert!(out.ok && out.converged, "{out:?}");
+        let streaming_change = out
+            .changes
+            .iter()
+            .find(|change| change.resource == "streaming.knowledge")
+            .expect("streaming change visible in apply");
+        assert_eq!(streaming_change.disposition, Some(ApplyDisposition::Applied));
+        assert!(live_streaming_enabled(dir.path()).await);
+        let state = read_state_json(dir.path());
+        assert_eq!(
+            state["applied_revision"]["resources"]["streaming.knowledge"]["streaming_enabled"],
+            serde_json::json!(true)
+        );
+
+        // Idempotent: a second run sees no changes and calls no engine.
+        let again = apply_config_dir(dir.path()).await;
+        assert!(again.changes.is_empty() && !again.state_written, "{again:?}");
+
+        // Explicit `streaming: false` disables (clean graph → converges now).
+        write_streaming_cluster(dir.path(), Some(false));
+        let out = apply_config_dir(dir.path()).await;
+        assert!(out.ok && out.converged, "{out:?}");
+        assert!(!live_streaming_enabled(dir.path()).await);
+
+        // REMOVING the declaration unmanages: the ledger row goes away and
+        // the graph keeps its current state — removal is never a disable.
+        write_streaming_cluster(dir.path(), Some(true));
+        let out = apply_config_dir(dir.path()).await;
+        assert!(out.ok && out.converged, "{out:?}");
+        assert!(live_streaming_enabled(dir.path()).await);
+        write_streaming_cluster(dir.path(), None);
+        let out = apply_config_dir(dir.path()).await;
+        assert!(out.ok && out.converged, "{out:?}");
+        let state = read_state_json(dir.path());
+        assert!(
+            state["applied_revision"]["resources"]
+                .get("streaming.knowledge")
+                .is_none(),
+            "unmanaged flag must drop its ledger row"
+        );
+        assert!(
+            live_streaming_enabled(dir.path()).await,
+            "unmanaging must not flip the graph"
+        );
+    }
+
+    #[tokio::test]
+    async fn streaming_survives_refresh_and_converges_to_engine_truth() {
+        let dir = fixture();
+        write_streaming_cluster(dir.path(), Some(true));
+        write_state_resources(dir.path(), &[]);
+        let out = apply_config_dir(dir.path()).await;
+        assert!(out.ok && out.converged, "{out:?}");
+
+        // Wipe the streaming row (a crashed apply / pre-streaming ledger).
+        let mut state = read_state_json(dir.path());
+        state["applied_revision"]["resources"]
+            .as_object_mut()
+            .unwrap()
+            .remove("streaming.knowledge");
+        state["resource_statuses"]["streaming.knowledge"] = serde_json::json!({
+            "status": "blocked",
+            "conditions": ["stale_streaming_status"],
+            "message": "stale streaming status",
+        });
+        fs::write(
+            dir.path().join(CLUSTER_STATE_FILE),
+            serde_json::to_string_pretty(&state).unwrap(),
+        )
+        .unwrap();
+
+        // Refresh reads the live graph and regains the row from ENGINE truth.
+        let out = refresh_config_dir(dir.path()).await;
+        assert!(out.ok, "{out:?}");
+        assert_eq!(
+            out.resource_statuses["streaming.knowledge"].status,
+            ResourceLifecycleStatus::Applied
+        );
+        assert!(
+            out.resource_statuses["streaming.knowledge"]
+                .conditions
+                .is_empty(),
+            "refresh must clear stale streaming conditions after observing a match"
+        );
+        assert!(
+            out.resource_statuses["streaming.knowledge"]
+                .message
+                .is_none(),
+            "refresh must clear the stale streaming status message"
+        );
+        let state = read_state_json(dir.path());
+        assert_eq!(
+            state["applied_revision"]["resources"]["streaming.knowledge"]["streaming_enabled"],
+            serde_json::json!(true)
+        );
+
+        // Out-of-band flip (an operator with direct engine access): refresh
+        // converges the ledger to the observed value, and the next plan shows
+        // the drift as an ordinary Update back toward the declared state.
+        let graph_uri = format!("{}/graphs/knowledge.omni", dir.path().display());
+        let db = Omnigraph::open(&graph_uri).await.unwrap();
+        db.set_streaming_enabled_as(false, None).await.unwrap();
+        drop(db);
+        let out = refresh_config_dir(dir.path()).await;
+        assert!(out.ok, "{out:?}");
+        let streaming_status = &out.resource_statuses["streaming.knowledge"];
+        assert_eq!(
+            streaming_status.status,
+            ResourceLifecycleStatus::Drifted
+        );
+        assert!(
+            streaming_status
+                .conditions
+                .contains(&"streaming_mismatch".to_string())
+        );
+        let state = read_state_json(dir.path());
+        assert_eq!(
+            state["applied_revision"]["resources"]["streaming.knowledge"]["streaming_enabled"],
+            serde_json::json!(false)
+        );
+        let plan = plan_config_dir(dir.path()).await;
+        let drift = plan
+            .changes
+            .iter()
+            .find(|change| change.resource == "streaming.knowledge")
+            .expect("observed/declared streaming drift must be a visible plan change");
+        assert_eq!(drift.operation, PlanOperation::Update);
+
+        // And apply re-converges to the declaration.
+        let out = apply_config_dir(dir.path()).await;
+        assert!(out.ok && out.converged, "{out:?}");
+        assert!(live_streaming_enabled(dir.path()).await);
+    }
+
+    #[tokio::test]
+    async fn streaming_applies_over_an_imported_preexisting_graph() {
+        // The CLI lifecycle shape: a graph exists BEFORE the cluster manages
+        // it; import records observed truth (disabled), apply must flip it.
+        let dir = fixture();
+        write_streaming_cluster(dir.path(), Some(true));
+        let graphs_dir = dir.path().join("graphs");
+        fs::create_dir_all(&graphs_dir).unwrap();
+        let graph_uri = graphs_dir.join("knowledge.omni");
+        Omnigraph::init(graph_uri.to_str().unwrap(), SCHEMA)
+            .await
+            .unwrap();
+
+        let import = import_config_dir(dir.path()).await;
+        assert!(import.ok, "{import:?}");
+        let out = apply_config_dir(dir.path()).await;
+        assert!(out.ok && out.converged, "{out:?}");
+        assert!(
+            live_streaming_enabled(dir.path()).await,
+            "import→apply must flip the pre-existing graph: {out:?}"
         );
     }

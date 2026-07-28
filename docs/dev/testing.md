@@ -632,10 +632,29 @@ OMNIGRAPH_V8_BIN=/path/to/final-v8/omnigraph \
   current_v9_refuses_and_rebuilds_genuine_v8_and_v8_refuses_v9 -- --exact --nocapture
 ```
 
+RFC-026 §4.7 P1 (the v10 stream-profile format) adds the current
+immediate-predecessor `OMNIGRAPH_V9_BIN` seam. It mints a genuine internal-v9
+graph with the pinned final-v9 binary, proves v10 refuses it naming the
+published `0.9.x` line in both message slots (`created by omnigraph 0.9.x` and
+`with an omnigraph 0.9.x binary` — the exact strings also pinned in-source by
+`migrations.rs::release_names_the_writing_line_for_each_stamp`, so a map edit
+breaks locally before it can break only here), exports with v9, rebuilds a
+distinct v10 root, proves row/vector fidelity plus exact-`id` PK metadata, and
+proves the v9 binary refuses the v10 root. CI pins and builds the last
+v9-writing main commit (`e889a1c72004eb09f2be35b59ab6586d10c709e1`) before the
+workspace suite. Run it locally with:
+
+```bash
+OMNIGRAPH_V9_BIN=/path/to/final-v9/omnigraph \
+  cargo test -p omnigraph-cli --test crossversion_upgrade --locked \
+  current_v10_refuses_and_rebuilds_genuine_v9_and_v9_refuses_v10 -- --exact --nocapture
+```
+
 Older cross-version seams remain gated on absolute old-binary paths and skip
 gracefully when unset because rebuilding every historical source revision in
 default CI would be expensive. A set but invalid path, including
-`OMNIGRAPH_V8_BIN`, fails loudly rather than making the proof vacuous.
+`OMNIGRAPH_V8_BIN` and `OMNIGRAPH_V9_BIN`, fails loudly rather than making the
+proof vacuous.
 
 ## System e2e requirements and suppression
 

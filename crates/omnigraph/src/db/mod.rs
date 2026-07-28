@@ -14,7 +14,8 @@ pub(crate) use omnigraph::{DeferredTableFork, WriteAuthorityToken, WriteTxn};
 pub use omnigraph::{
     CleanupPolicyOptions, InitOptions, MergeOutcome, Omnigraph, OpenMode, PendingIndex,
     RepairAction, RepairClassification, RepairOptions, RepairStats, SchemaApplyOptions,
-    SchemaApplyResult, SkipReason, TableCleanupStats, TableOptimizeStats, TableRepairStats,
+    SchemaApplyResult, SkipReason, StreamingProfileResult, TableCleanupStats, TableOptimizeStats,
+    TableRepairStats,
 };
 
 use crate::error::{OmniError, Result};

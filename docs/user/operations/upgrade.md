@@ -17,7 +17,7 @@ message that **names the release line that wrote it** and the exact commands —
 so you can fetch the right old binary without guessing:
 
 ```
-__manifest is stamped at internal schema v4, but this omnigraph reads only v9.
+__manifest is stamped at internal schema v4, but this omnigraph reads only v10.
 This graph was created by omnigraph 0.8.x. Rebuild it: with an omnigraph
 0.8.x binary run `omnigraph export <graph> > graph.jsonl`, then with this
 binary run `omnigraph init --schema <schema.pg> <new-graph>` and `omnigraph load
@@ -37,14 +37,16 @@ from that line (the latest is safest):
 | internal schema v3 | omnigraph 0.6.2–0.7.2 | the latest 0.7.x (e.g. 0.7.2) |
 | internal schema v4 | omnigraph 0.8.x | the latest 0.8.x (e.g. 0.8.1) |
 | internal schema v5–v8 | no published release (see below) | a source build at the matching commit |
-| internal schema v9 | omnigraph 0.9.x | — current format; no rebuild needed |
+| internal schema v9 | omnigraph 0.9.x | the latest 0.9.x |
+| internal schema v10 | unreleased (0.10.0-dev source builds) | — current format; no rebuild needed |
 
 **Stamps v5–v8 never shipped.** The storage format advanced five times inside
 the single 0.8.1 → 0.9.0 development window, so the only graphs carrying those
 stamps came from source builds off `main`; no published binary reads them and
 the refusal message names them `0.9.0-dev`. If you have one, export it with a
-build of the commit that created it, then load into a fresh 0.9.x graph. A
-released binary only ever wrote v4 (0.8.x) or v9 (0.9.x).
+build of the commit that created it, then load into a fresh current-format
+graph. A released binary only ever wrote v4 (0.8.x) or v9 (0.9.x); v10 is
+written by 0.10.0-dev source builds until the 0.10.0 release ships.
 
 You can also check versions before you hit a refusal:
 
@@ -114,6 +116,30 @@ complete. Do not use force-init to turn the old root into the new format.
   `append`/`merge` writes copy external payloads instead, as described below.
 - **Server deployments**: take the graph out of the serving set, rebuild it offline
   with the CLI, then point the cluster at the rebuilt graph (`cluster apply`).
+
+## Migrating from internal schema v9 to v10
+
+Internal schema v10 adds one piece of durable graph-wide state: the required
+`stream_profile` singleton in `__manifest` — the RFC-026 §4.7 enablement
+authority for the (unimplemented, experimental, cluster-only) streaming
+profile. Every fresh v10 graph carries it from genesis with streaming
+disabled; nothing changes about how the graph behaves until the experimental
+feature ships and an operator enables it through `cluster apply`. The same
+bump reserves a dead-letter slot inside the stream-fold attribution record so
+a later slice cannot need a second format change.
+
+A v9 graph must use the standard rebuild recipe above: quiesce writers, export
+with the latest 0.9.x binary, initialize a **different** root with the v10
+(0.10.0-dev source build) binary, load the export, and verify the v10 stamp
+plus row/vector/blob fidelity before cutover. Keep the v9 root unchanged
+through the rollback window. A v10 binary refuses v9, and a v9 binary refuses
+v10.
+
+Why a full format bump for one flag: the flag is a safety property — every
+process that opens the graph must obey it, and a v9 binary would silently
+*skip* the unknown row and write as if streaming were off. The stamp is the
+only mechanism that turns "older binary" into a refusal instead of silent
+disobedience.
 
 ## Migrating from internal schema v8 to v9
 

@@ -10,12 +10,13 @@ use crate::error::{OmniError, Result};
 
 use super::layout::{stream_state_object_id, table_object_id, version_object_id};
 use super::metadata::TableVersionMetadata;
+use super::stream_profile::StreamProfileEntry;
 use super::stream_token::{STREAM_FOLD_ACTOR, StreamFoldAttributionSummary};
 use super::{
     MAIN_BRANCH_HEAD_KEY, OBJECT_TYPE_GRAPH_COMMIT, OBJECT_TYPE_GRAPH_HEAD,
-    OBJECT_TYPE_STREAM_STATE, OBJECT_TYPE_STREAM_TOKEN_AUTHORITY, OBJECT_TYPE_TABLE,
-    OBJECT_TYPE_TABLE_TOMBSTONE, OBJECT_TYPE_TABLE_VERSION, StreamLifecycleEntry,
-    StreamTokenAuthorityEntry, TableIdentity, TableRegistration,
+    OBJECT_TYPE_STREAM_PROFILE, OBJECT_TYPE_STREAM_STATE, OBJECT_TYPE_STREAM_TOKEN_AUTHORITY,
+    OBJECT_TYPE_TABLE, OBJECT_TYPE_TABLE_TOMBSTONE, OBJECT_TYPE_TABLE_VERSION,
+    StreamLifecycleEntry, StreamTokenAuthorityEntry, TableIdentity, TableRegistration,
 };
 
 #[derive(Debug, Clone)]
@@ -40,6 +41,7 @@ pub(super) struct ManifestState {
     pub(super) graph_heads: HashMap<String, String>,
     pub(super) stream_lifecycles: HashMap<TableIdentity, StreamLifecycleEntry>,
     pub(super) stream_token_authority: StreamTokenAuthorityEntry,
+    pub(super) stream_profile: StreamProfileEntry,
 }
 
 #[derive(Debug, Clone)]
@@ -143,6 +145,7 @@ struct ManifestScan {
     graph_heads: HashMap<String, String>,
     stream_lifecycles: HashMap<TableIdentity, StreamLifecycleEntry>,
     stream_token_authority: Option<StreamTokenAuthorityEntry>,
+    stream_profile: Option<StreamProfileEntry>,
 }
 
 pub(super) fn manifest_schema() -> SchemaRef {
@@ -202,6 +205,7 @@ pub(super) async fn read_manifest_state_and_lineage(
         graph_heads,
         stream_lifecycles,
         stream_token_authority,
+        stream_profile,
     } = read_manifest_scan(dataset, true).await?;
     let state = assemble_manifest_state(
         version,
@@ -213,6 +217,7 @@ pub(super) async fn read_manifest_state_and_lineage(
         graph_heads,
         stream_lifecycles,
         required_stream_token_authority(stream_token_authority)?,
+        required_stream_profile(stream_profile)?,
     )?;
     Ok((state, lineage_rows))
 }
@@ -228,6 +233,7 @@ fn manifest_state_from_scan(version: u64, scan: ManifestScan) -> Result<Manifest
         scan.graph_heads,
         scan.stream_lifecycles,
         required_stream_token_authority(scan.stream_token_authority)?,
+        required_stream_profile(scan.stream_profile)?,
     )
 }
 
@@ -248,6 +254,7 @@ pub(super) fn assemble_manifest_state(
     graph_heads: HashMap<String, String>,
     stream_lifecycles: HashMap<TableIdentity, StreamLifecycleEntry>,
     stream_token_authority: StreamTokenAuthorityEntry,
+    stream_profile: StreamProfileEntry,
 ) -> Result<ManifestState> {
     let mut latest_versions = HashMap::<TableIdentity, SubTableEntry>::new();
     for entry in version_entries {
@@ -332,6 +339,7 @@ pub(super) fn assemble_manifest_state(
         graph_heads,
         stream_lifecycles,
         stream_token_authority,
+        stream_profile,
     })
 }
 
@@ -377,6 +385,7 @@ pub(super) struct PublishScan {
     pub(super) graph_heads: HashMap<String, String>,
     pub(super) stream_lifecycles: HashMap<TableIdentity, StreamLifecycleEntry>,
     pub(super) stream_token_authority: StreamTokenAuthorityEntry,
+    pub(super) stream_profile: StreamProfileEntry,
 }
 
 /// One-scan read of everything the publish path needs. `collect_lineage` is
@@ -396,6 +405,7 @@ pub(super) async fn read_publish_scan(dataset: &Dataset) -> Result<PublishScan> 
         graph_heads: scan.graph_heads,
         stream_lifecycles: scan.stream_lifecycles,
         stream_token_authority: required_stream_token_authority(scan.stream_token_authority)?,
+        stream_profile: required_stream_profile(scan.stream_profile)?,
     })
 }
 
@@ -506,6 +516,7 @@ async fn read_manifest_scan(dataset: &Dataset, collect_lineage: bool) -> Result<
     let mut graph_heads = HashMap::new();
     let mut stream_lifecycles = HashMap::new();
     let mut stream_token_authority = None;
+    let mut stream_profile = None;
 
     for batch in &batches {
         let object_types = string_column(batch, "object_type")?;
@@ -709,6 +720,36 @@ async fn read_manifest_scan(dataset: &Dataset, collect_lineage: bool) -> Result<
                         ));
                     }
                 }
+                OBJECT_TYPE_STREAM_PROFILE => {
+                    require_null_table_identity(
+                        stable_table_ids,
+                        table_incarnation_ids,
+                        row,
+                        OBJECT_TYPE_STREAM_PROFILE,
+                    )?;
+                    if metadata.is_null(row) {
+                        return Err(OmniError::manifest_internal(
+                            "manifest stream_profile row is missing metadata",
+                        ));
+                    }
+                    if !table_key.is_empty() || !row_counts.is_null(row) {
+                        return Err(OmniError::manifest_internal(
+                            "manifest stream_profile row must have an empty table_key and null row_count",
+                        ));
+                    }
+                    let profile = StreamProfileEntry::from_manifest_row(
+                        object_ids.value(row),
+                        (!locations.is_null(row)).then(|| locations.value(row)),
+                        (!versions.is_null(row)).then(|| versions.value(row)),
+                        (!branches.is_null(row)).then(|| branches.value(row)),
+                        metadata.value(row),
+                    )?;
+                    if stream_profile.replace(profile).is_some() {
+                        return Err(OmniError::manifest_internal(
+                            "manifest contains duplicate stream_profile rows",
+                        ));
+                    }
+                }
                 // Commit rows are skipped on the table-state path; unknown future
                 // object types are skipped on every path.
                 _ => {}
@@ -746,6 +787,7 @@ async fn read_manifest_scan(dataset: &Dataset, collect_lineage: bool) -> Result<
         graph_heads,
         stream_lifecycles,
         stream_token_authority,
+        stream_profile,
     })
 }
 
@@ -756,6 +798,12 @@ fn required_stream_token_authority(
         OmniError::manifest_internal(
             "manifest is missing the graph-global stream_token_authority row",
         )
+    })
+}
+
+fn required_stream_profile(profile: Option<StreamProfileEntry>) -> Result<StreamProfileEntry> {
+    profile.ok_or_else(|| {
+        OmniError::manifest_internal("manifest is missing the graph-global stream_profile row")
     })
 }
 
@@ -907,9 +955,11 @@ pub(super) fn entries_to_batch(
     version_metadata: &HashMap<TableIdentity, String>,
     genesis_lineage: &[GraphLineageRowPart],
     stream_token_authority: &StreamTokenAuthorityEntry,
+    stream_profile: &StreamProfileEntry,
 ) -> Result<RecordBatch> {
     stream_token_authority.validate()?;
-    let cap = entries.len() * 2 + genesis_lineage.len() + 1;
+    stream_profile.validate()?;
+    let cap = entries.len() * 2 + genesis_lineage.len() + 2;
     let mut object_ids = Vec::with_capacity(cap);
     let mut object_types = Vec::with_capacity(cap);
     let mut locations = Vec::with_capacity(cap);
@@ -981,6 +1031,19 @@ pub(super) fn entries_to_batch(
     table_versions.push(Some(
         stream_token_authority.current_head_witness.table_version,
     ));
+    table_branches.push(None);
+    row_counts.push(None);
+
+    // The graph-global RFC-026 §4.7 enablement authority also exists from
+    // genesis (disabled). It is pure metadata: no physical participant, so no
+    // location or version witness — only the required singleton row.
+    object_ids.push(stream_profile.object_id().to_string());
+    object_types.push(OBJECT_TYPE_STREAM_PROFILE.to_string());
+    locations.push(None);
+    metadata.push(Some(stream_profile.to_metadata_json()?));
+    table_keys.push(String::new());
+    table_identities.push(None);
+    table_versions.push(None);
     table_branches.push(None);
     row_counts.push(None);
 
@@ -1084,7 +1147,7 @@ pub(super) fn manifest_rows_batch(
                     "manifest {object_type} row at index {row} must not carry table identity"
                 )));
             }
-            OBJECT_TYPE_STREAM_TOKEN_AUTHORITY => {
+            OBJECT_TYPE_STREAM_TOKEN_AUTHORITY | OBJECT_TYPE_STREAM_PROFILE => {
                 if identity.is_some() {
                     return Err(OmniError::manifest_internal(format!(
                         "manifest {object_type} row at index {row} must not carry table identity"
@@ -1105,13 +1168,23 @@ pub(super) fn manifest_rows_batch(
                         "manifest {object_type} row at index {row} must have an empty table_key and null row_count"
                     )));
                 }
-                StreamTokenAuthorityEntry::from_manifest_row(
-                    object_ids.get(row).map(String::as_str).unwrap_or_default(),
-                    locations.get(row).and_then(Option::as_deref),
-                    table_versions.get(row).copied().flatten(),
-                    table_branches.get(row).and_then(Option::as_deref),
-                    metadata,
-                )?;
+                if object_type == OBJECT_TYPE_STREAM_PROFILE {
+                    StreamProfileEntry::from_manifest_row(
+                        object_ids.get(row).map(String::as_str).unwrap_or_default(),
+                        locations.get(row).and_then(Option::as_deref),
+                        table_versions.get(row).copied().flatten(),
+                        table_branches.get(row).and_then(Option::as_deref),
+                        metadata,
+                    )?;
+                } else {
+                    StreamTokenAuthorityEntry::from_manifest_row(
+                        object_ids.get(row).map(String::as_str).unwrap_or_default(),
+                        locations.get(row).and_then(Option::as_deref),
+                        table_versions.get(row).copied().flatten(),
+                        table_branches.get(row).and_then(Option::as_deref),
+                        metadata,
+                    )?;
+                }
             }
             _ => {}
         }

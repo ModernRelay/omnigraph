@@ -344,6 +344,10 @@ async fn read_snapshot_with_store(
                 });
             }
             ResourceKind::Schema(_) => {}
+            // Serving reads the flag from the graph itself (the manifest row
+            // is the engine-obeyed authority); the ledger row is convergence
+            // bookkeeping, not a serving input.
+            ResourceKind::Streaming(_) => {}
             kind @ ResourceKind::Query { .. } => {
                 let ResourceKind::Query { graph, name } = &kind else {
                     unreachable!()

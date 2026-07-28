@@ -118,6 +118,27 @@ only when a `--cluster` server boots, so `cluster validate`, `plan`, and
 require `api_key`. Vector dimensions stay schema-driven by the target
 `Vector(N)` column, not the provider profile.
 
+`graphs.<id>.streaming: true|false` (optional, **experimental**) declares the
+graph's RFC-026 streaming-enablement flag. `cluster apply` is the only flip
+mechanism: apply propagates the declared value into the graph's own durable
+manifest state, which every process that opens the graph obeys — the flag is
+graph state, not server configuration. Semantics are deliberately asymmetric:
+
+- **Absent = unmanaged.** No `streaming.<id>` resource exists and apply never
+  touches the graph's flag. *Removing* the key unmanages it — it never
+  disables a previously enabled graph.
+- **Disabling requires an explicit `streaming: false`** and converges only
+  when the graph holds no undrained stream state; until then the change
+  reports as blocked with `streaming_drain_pending` and a later apply
+  re-converges.
+- `cluster refresh` reads the live value back from the graph, so an
+  out-of-band flip or a crashed apply surfaces as ordinary plan drift toward
+  the declaration.
+
+Enabling the flag activates no ingest surface yet — the streaming lane's
+public endpoints ship in later slices — and the flag itself is part of the
+experimental profile: its shape may change without a deprecation cycle.
+
 `storage:` (optional) is the **storage root URI** for everything the cluster
 stores — the state ledger, lock, content-addressed catalog, recovery
 sidecars, approval artifacts, and the derived graph roots

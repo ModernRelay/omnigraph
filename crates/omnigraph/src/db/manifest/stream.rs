@@ -1277,8 +1277,9 @@ fn hash_bytes(hasher: &mut Sha256, bytes: &[u8]) {
 
 /// `Option<T>` normally treats an absent serde field as `None`. State-v2 needs
 /// every nullable slot to be physically present so a truncated or older row is
-/// never reinterpreted by a default.
-fn deserialize_present_option<'de, D, T>(
+/// never reinterpreted by a default. Shared with the sibling stream-profile
+/// and stream-token payloads, which follow the same house rule.
+pub(super) fn deserialize_present_option<'de, D, T>(
     deserializer: D,
 ) -> std::result::Result<Option<T>, D::Error>
 where

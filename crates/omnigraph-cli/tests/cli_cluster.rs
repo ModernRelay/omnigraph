@@ -42,6 +42,9 @@ fn cluster_validate_json_is_stable() {
     assert_eq!(json["ok"], true);
     assert!(json["resource_digests"]["graph.knowledge"].is_string());
     assert!(json["resource_digests"]["query.knowledge.find_person"].is_string());
+    // The fixture declares `streaming: true`, so the §4.7 P1 first-class
+    // resource is part of the stable validate shape.
+    assert!(json["resource_digests"]["streaming.knowledge"].is_string());
     assert_eq!(json["dependencies"][0]["from"], "policy.base");
     assert_eq!(json["dependencies"][0]["to"], "graph.knowledge");
 }

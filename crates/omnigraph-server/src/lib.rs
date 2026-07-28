@@ -901,6 +901,12 @@ impl ApiError {
             // fields: a fold request is a retryable logical conflict, while an
             // invoked-but-unconfirmed append is unavailable/ambiguous.
             err @ OmniError::FoldRequired { .. } => Self::conflict(err.to_string()),
+            // §4.7 P1: an effect-free pending-until-drained refusal — a
+            // retryable logical conflict, converged by a later cluster apply
+            // once the named streams fold. No HTTP caller can reach it in
+            // this slice (the flip is cluster-apply-only); the mapping exists
+            // so the taxonomy stays total.
+            err @ OmniError::StreamingDisablePending { .. } => Self::conflict(err.to_string()),
             err @ (OmniError::StreamBindingChanged { .. }
             | OmniError::StreamSequenceConflict { .. }
             | OmniError::StreamIdempotencyConflict { .. }) => Self::conflict(err.to_string()),

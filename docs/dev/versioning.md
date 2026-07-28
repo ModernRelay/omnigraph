@@ -46,8 +46,8 @@ declares exactly non-null physical `id` as Lance's unenforced primary key from
 creation, and production strict insert/upsert routes use the exact-`id`
 filter-bearing adapter.
 
-Internal schema **v9 is the currently served format** and maps to OmniGraph
-**0.9.x** — the first published release line to serve any of these formats.
+Internal schema v9 maps to OmniGraph **0.9.x** — the first published release
+line to serve any of these formats.
 It preserves v8's private data-bearing MemWAL core, then activates
 RFC-026's common B2 storage/recovery contract: stream-config v3, lifecycle
 state v2, the grammar-impossible trusted base-row field
@@ -70,8 +70,22 @@ recovery-v11 never become config-v3/state-v2/recovery-v12 authority. Export it
 with the v8 binary, initialize a different v9 root, and load through the v9
 writer. The physical field's trailing `$` is outside the `.pg` identifier
 grammar, so a genuine v8 user property named `__omnigraph_stream_v1` remains
-ordinary user data and round-trips unchanged. Because
-`MIN_SUPPORTED == CURRENT == 9`, v9 refuses v8 and a v8 binary refuses v9.
+ordinary user data and round-trips unchanged.
+
+Internal schema **v10 is the currently served format** (unreleased —
+0.10.0-dev source builds until the 0.10.0 release). It preserves the complete
+v9 contract and adds RFC-026 §4.7 P1's enablement authority: one required
+graph-global `stream_profile` singleton row, present from genesis (disabled,
+revision 1), flipped only through the shared publisher's exact-entry CAS with
+a strict revision advance. The same bump reserves the fold-attribution
+dead-letter slot (`dead_letter_object`, explicit null) because that summary is
+`deny_unknown_fields` and structurally equality-compared between the recovery
+sidecar and the lineage row — it cannot be retrofitted through a serde
+default. The bump is forced by decode semantics, not row volume: v9 decoders
+silently skip unknown row kinds, so only the stamp can make a v9 binary refuse
+a streaming-capable graph instead of writing blind to the freeze. A v9 graph
+crosses by export/init/load rebuild. Because `MIN_SUPPORTED == CURRENT == 10`,
+v10 refuses v9 and a v9 binary refuses v10.
 
 There is no in-place migration dispatcher. The single source file
 `db/manifest/migrations.rs` holds only the version constant, the stamp read/write,

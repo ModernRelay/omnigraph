@@ -192,6 +192,10 @@ pub async fn plan_config_dir(config_dir: impl AsRef<Path>) -> PlanOutput {
         &desired.dependencies,
         &BTreeSet::new(),
         &approved,
+        // Slice 1: no production path can hold undrained stream state, so the
+        // pending-until-drained set is structurally empty; later slices
+        // populate it from the live-graph observation.
+        &BTreeSet::new(),
     );
 
     // Embed real migration steps for schema updates so plan is a data-aware
@@ -411,6 +415,7 @@ pub async fn apply_config_dir_with_options(
         &desired.dependencies,
         &sweep.pending_graphs,
         &approved,
+        &BTreeSet::new(),
     );
 
     // Defensive invariant: nothing the approval gate covers may be executable
@@ -798,6 +803,66 @@ pub async fn apply_config_dir_with_options(
         demote_dependents_of_failed_graphs(&mut changes, &failed_graphs, &desired.dependencies);
     }
 
+    // Streaming-enablement phase (RFC-026 §4.7 P1): after graph create and
+    // schema apply, propagate each applied `streaming.<id>` declaration into
+    // the graph's `__manifest` through the engine's Cedar-gated flip. The
+    // boolean is re-derivable from observation (refresh reads it back from the
+    // live graph), so this phase needs no cluster-side sidecar: a crash here
+    // acknowledges nothing, and the next apply re-converges. A typed
+    // engine-side drain refusal demotes the change to the
+    // pending-until-drained disposition without failing the run.
+    for change in &mut changes {
+        if change.disposition != Some(ApplyDisposition::Applied)
+            || change.operation == PlanOperation::Delete
+        {
+            continue;
+        }
+        let ResourceKind::Streaming(graph_id) = resource_kind(&change.resource) else {
+            continue;
+        };
+        if failed_graphs.contains_key(&graph_id) {
+            continue;
+        }
+        let Some(desired_enabled) = desired
+            .graphs
+            .iter()
+            .find(|graph| graph.id == graph_id)
+            .and_then(|graph| graph.streaming)
+        else {
+            continue;
+        };
+        let graph_uri = backend.graph_root(&graph_id);
+        let flip = async {
+            let db = Omnigraph::open(&graph_uri).await?;
+            db.set_streaming_enabled_as(desired_enabled, options.actor.as_deref())
+                .await
+        }
+        .await;
+        match flip {
+            Ok(_) => {}
+            Err(omnigraph::error::OmniError::StreamingDisablePending { undrained_tables }) => {
+                change.disposition = Some(ApplyDisposition::Blocked);
+                change.reason = Some("streaming_drain_pending".to_string());
+                diagnostics.push(Diagnostic::warning(
+                    "streaming_drain_pending",
+                    change.resource.clone(),
+                    format!(
+                        "disable waits for stream drain on {undrained_tables:?}; re-run apply after the streams fold"
+                    ),
+                ));
+            }
+            Err(err) => {
+                change.disposition = Some(ApplyDisposition::Blocked);
+                change.reason = Some("streaming_apply_failed".to_string());
+                diagnostics.push(Diagnostic::error(
+                    "streaming_apply_failed",
+                    change.resource.clone(),
+                    format!("could not propagate the streaming flag: {err}"),
+                ));
+            }
+        }
+    }
+
     for change in &changes {
         match change.disposition {
             Some(ApplyDisposition::Deferred) => diagnostics.push(Diagnostic::warning(
@@ -1011,6 +1076,17 @@ pub async fn apply_config_dir_with_options(
                                 .embedding_providers
                                 .get(&change.resource)
                                 .cloned(),
+                            // Streaming rows record the value the executor
+                            // just propagated into the graph, so refresh has
+                            // a ledger row to converge against engine truth.
+                            streaming_enabled: match resource_kind(&change.resource) {
+                                ResourceKind::Streaming(graph) => desired
+                                    .graphs
+                                    .iter()
+                                    .find(|candidate| candidate.id == graph)
+                                    .and_then(|candidate| candidate.streaming),
+                                _ => None,
+                            },
                         },
                     );
                     set_resource_status_applied(&mut new_state, &change.resource);
@@ -1787,6 +1863,7 @@ fn recompute_state_graph_digests(state: &mut ClusterState, desired: &DesiredClus
                 applies_to: None,
                 embedding_provider: graph.embedding_provider.clone(),
                 embedding_profile: None,
+                streaming_enabled: None,
             },
         );
     }

@@ -89,6 +89,7 @@ pub(crate) async fn sweep_graph_create_sidecar(
                         applies_to: None,
                         embedding_provider: None,
                         embedding_profile: None,
+                        streaming_enabled: None,
                     },
                 );
                 let query_digests = state_query_digests_for_graph(state, &sidecar.graph_id);
@@ -109,6 +110,7 @@ pub(crate) async fn sweep_graph_create_sidecar(
                         applies_to: None,
                         embedding_provider,
                         embedding_profile: None,
+                        streaming_enabled: None,
                     },
                 );
                 set_resource_status_applied(state, &graph_address);
@@ -233,6 +235,7 @@ pub(crate) async fn sweep_schema_apply_sidecar(
                 applies_to: None,
                 embedding_provider: None,
                 embedding_profile: None,
+                streaming_enabled: None,
             },
         );
         let query_digests = state_query_digests_for_graph(state, &sidecar.graph_id);
@@ -253,6 +256,7 @@ pub(crate) async fn sweep_schema_apply_sidecar(
                 applies_to: None,
                 embedding_provider,
                 embedding_profile: None,
+                streaming_enabled: None,
             },
         );
         set_resource_status_applied(state, &graph_address);
@@ -362,8 +366,8 @@ pub(crate) async fn sweep_graph_delete_sidecar(
     outcome.completed_sidecars.push(path);
 }
 
-/// Remove a graph's subtree (graph, schema, queries) from the ledger and
-/// leave a tombstone observation. Idempotent.
+/// Remove a graph's subtree (graph, schema, streaming, queries) from the
+/// ledger and leave a tombstone observation. Idempotent.
 pub(crate) fn tombstone_graph_subtree(
     state: &mut ClusterState,
     graph_id: &str,
@@ -372,15 +376,18 @@ pub(crate) fn tombstone_graph_subtree(
 ) {
     let graph_addr = graph_address(graph_id);
     let schema_addr = schema_address(graph_id);
+    let streaming_addr = super::config::streaming_address(graph_id);
     let query_prefix = format!("query.{graph_id}.");
     state.applied_revision.resources.remove(&graph_addr);
     state.applied_revision.resources.remove(&schema_addr);
+    state.applied_revision.resources.remove(&streaming_addr);
     state
         .applied_revision
         .resources
         .retain(|address, _| !address.starts_with(&query_prefix));
     state.resource_statuses.remove(&graph_addr);
     state.resource_statuses.remove(&schema_addr);
+    state.resource_statuses.remove(&streaming_addr);
     state
         .resource_statuses
         .retain(|address, _| !address.starts_with(&query_prefix));

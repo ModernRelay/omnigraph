@@ -891,3 +891,119 @@ node Task {
         "rejected init must not persist a schema IR"
     );
 }
+
+/// RFC-026 §4.7 P1 through the public surface: a fresh graph reports
+/// streaming disabled; the Cedar-gated flip is durable, revision-advancing,
+/// version-minting, and idempotent; disable-when-clean converges.
+#[tokio::test]
+async fn streaming_flag_flips_are_durable_idempotent_and_versioned() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut db = init_and_load(&dir).await;
+    db.branch_create("feature").await.unwrap();
+    mutate_branch(
+        &mut db,
+        "feature",
+        MUTATION_QUERIES,
+        "insert_person",
+        &mixed_params(&[("$name", "feature-person")], &[("$age", 22)]),
+    )
+    .await
+    .unwrap();
+    let historical_feature = db.resolve_snapshot("feature").await.unwrap();
+    let branch_reader = Omnigraph::open(dir.path().to_str().unwrap()).await.unwrap();
+    branch_reader.sync_branch("feature").await.unwrap();
+    db.sync_branch("feature").await.unwrap();
+
+    let before = db.snapshot_of(ReadTarget::branch("main")).await.unwrap();
+    let status = before.streaming_status();
+    assert!(!status.enabled, "fresh graphs are born with streaming off");
+    assert!(!status.undrained, "fresh graphs hold no stream state");
+
+    // Enable: one new manifest version, revision advances from genesis 1 → 2.
+    let enabled = db
+        .set_streaming_enabled_as(true, Some("act-ops"))
+        .await
+        .unwrap();
+    assert!(enabled.changed);
+    assert!(enabled.streaming_enabled);
+    assert_eq!(enabled.profile_revision, 2);
+    assert_eq!(enabled.manifest_version, before.version() + 1);
+    assert!(
+        db.snapshot_of(ReadTarget::branch("main"))
+            .await
+            .unwrap()
+            .streaming_status()
+            .enabled
+    );
+    assert!(
+        db.snapshot_of(ReadTarget::branch("feature"))
+            .await
+            .unwrap()
+            .streaming_status()
+            .enabled,
+        "a live named-branch snapshot must project canonical-main profile authority"
+    );
+    assert!(
+        branch_reader
+            .snapshot_of(ReadTarget::branch("feature"))
+            .await
+            .unwrap()
+            .streaming_status()
+            .enabled,
+        "a warm named-branch reader must observe an external main profile flip"
+    );
+    assert!(
+        !db.snapshot_of(ReadTarget::Snapshot(historical_feature.clone()))
+            .await
+            .unwrap()
+            .streaming_status()
+            .enabled,
+        "an explicitly pinned historical snapshot must retain its captured profile"
+    );
+
+    // Idempotent re-enable: no new manifest version, no revision movement.
+    let noop = db
+        .set_streaming_enabled_as(true, Some("act-ops"))
+        .await
+        .unwrap();
+    assert!(!noop.changed);
+    assert_eq!(noop.profile_revision, 2);
+    assert_eq!(noop.manifest_version, enabled.manifest_version);
+
+    // Disable-when-clean converges (no stream state exists to drain).
+    let disabled = db
+        .set_streaming_enabled_as(false, Some("act-ops"))
+        .await
+        .unwrap();
+    assert!(disabled.changed);
+    assert!(!disabled.streaming_enabled);
+    assert_eq!(disabled.profile_revision, 3);
+    assert_eq!(disabled.manifest_version, enabled.manifest_version + 1);
+    assert!(
+        !db.snapshot_of(ReadTarget::branch("feature"))
+            .await
+            .unwrap()
+            .streaming_status()
+            .enabled,
+        "a live named branch must also observe canonical-main disablement"
+    );
+    assert!(
+        !db.snapshot_of(ReadTarget::Snapshot(historical_feature))
+            .await
+            .unwrap()
+            .streaming_status()
+            .enabled,
+        "later profile flips must not rewrite historical snapshot semantics"
+    );
+
+    // Durable across a cold reopen.
+    drop(db);
+    let reopened = Omnigraph::open(dir.path().to_str().unwrap()).await.unwrap();
+    let status = reopened
+        .snapshot_of(ReadTarget::branch("main"))
+        .await
+        .unwrap()
+        .streaming_status();
+    assert!(!status.enabled);
+    assert!(!status.undrained);
+}
