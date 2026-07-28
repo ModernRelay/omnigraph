@@ -351,10 +351,12 @@ and accepts loud provider exhaustion. Lance may remove only its losing shard-
 manifest-CAS `.binpb.tmp.<uuid>` staging object, which never became authority.
 The provider matrix pins typed local/configured-RustFS failure and inert orphan
 behavior. The 1/8/32/128 local/RustFS instrument keeps warm acknowledgement,
-cold replay, fold, visibility, table, graph-manifest, adapter, advisory object,
-and RSS terms separate. Warm-ack operation shape is flat while serialized
-authority and combined retained-history work grow; timings, LIST totals, and
-RSS are diagnostics, not quotas or SLOs. Explicit enrollment, trusted attribution,
+cold replay, fold, visibility, MemWAL, base-table, token-authority, other
+table-store, graph-manifest, adapter, advisory object, and RSS terms separate.
+The MemWAL warm-ack operation counts are flat while exact token/base authority
+and combined retained-history work are separately visible and may grow;
+aggregate table-store reads are not claimed flat. Timings, LIST totals, and RSS are
+diagnostics, not quotas or SLOs. Explicit enrollment, trusted attribution,
 compare-and-chain tokens, manifest-selected current-token authority, bounded
 correction, revisioned lifecycle/management receipts, authorization, and
 product parity remain common contracts. A graph-history budget is not one of
@@ -362,7 +364,7 @@ them for this unbounded profile. Gate R0's legal high-entropy near-cap shape
 originally retained sparse scanner backing buffers and failed the fold charge;
 logical-slice accounting plus dense owned copies now make that exact shape
 acknowledge, materialize, fold, and publish. A reference isolated run measured
-a 284,934,144-byte fold RSS delta, below the 384-MiB CI remeasurement tripwire.
+a 286,441,472-byte fold RSS delta, below the 384-MiB CI remeasurement tripwire.
 The missing combined enrollment receipt and cross-process admission seal still
 gate broader topology, not the existing private single-live-writer-process
 seam or unbounded retention.

@@ -28,7 +28,7 @@ The engine's `tests/` is the principal coverage surface; most graph-shaped behav
 | `lance_surface_guards.rs` | Pins the Lance API surfaces omnigraph depends on (named runtime + compile-only guards; see [lance.md](lance.md)) — the first smoke check on any Lance version bump. `cached_and_zero_cache_sessions_share_store_registry_not_metadata_cache` proves a cached data Session and zero-cache control Session reuse one live `ObjectStoreRegistry` client while their metadata caches remain isolated. `_compile_uncommitted_full_table_vector_index_shape` pins the public `IndexMetadata` shape suitable for `Operation::CreateIndex`; `compact_files_succeeds_on_blob_columns` pins blob-v2 compaction; Guard 9 pins clone-only branch reclaim semantics. RFC-023's `unenforced_pk_filter_shape_is_route_dependent` explicitly forces v2 versus indexed routes and pins the `Some(populated)` / `Some(empty)` / `None` key-filter shapes; `unenforced_pk_conflict_matrix_is_directional` pins the directional filtered/unfiltered and filtered/Append matrix. RFC-024's compile guard pins the public `BranchIdentifier` + current table version + current `Transaction.uuid` + `ManifestLocation.e_tag` current-HEAD witness; the local/shared-`Session` guard proves unchanged-reopen stability, ordinary-commit movement, and same-version ABA, while RustFS covers object-store ABA. RFC-025 adds exact main/named-branch tag-target, sparse cleanup pin/unpin, and branch-tree-deletion guards. RFC-026 pins doc-hidden `has_successor_version`, initializer/readback/shard-writer/durability/fencing, flush/drain, replay watermark, scanner, and merged-generation shapes; runtime Gate E0 classification belongs to `memwal_enrollment_gate.rs`, while v7 Phase-A and v8 B1 publication/recovery belong to the manifest/failpoint suites. B2b adds `cleanup_old_versions_does_not_reclaim_mem_wal_objects` and `mem_wal_deleted_fence_slot_allows_stale_writer_success_on_pinned_lance`: the first proves generic cleanup leaves the present MemWAL fixture unchanged and the second proves deleting the successor's empty fence sentinel is unsafe. The pinned source audit, not those two tests alone, establishes that stock RC.1 exposes no owned MemWAL reclamation API. The RC.1 compiler guard pins the five surveyed public Lance virtual system-column constants to early `.pg` rejection. These guards prove substrate shapes/tokens and negative ownership boundaries; they do not by themselves prove heads/checkpoint activation, the current publisher, or a safe reclamation implementation |
 | `memwal_enrollment_gate.rs` | RFC-026's green production-neutral Gate E0 harness, isolated from the production manifest and graph writer. Fourteen substantive local cells plus one explicit unconfigured-S3 skip cover exact no-effect / `N + 1` index / pre-minted empty-shard classification, buried-effect refusal, marker survival, strict inventory/error handling, and the broad fail-closed matrix. The rejected first instrument used `checkout_latest` plus `IOTracker`, which missed local `read_dir`. The accepted exact-version classifier pins doc-hidden `has_successor_version`; its `AttemptTracker` records failed/`NotFound` attempts before forwarding and proves the identical complete six-attempt shape at baseline versions 8/80: four successful manifest HEADs, one `NotFound` manifest HEAD, one successful manifest GET, zero lists. A Unix execute-only `_versions` tripwire proves exact probing works when latest enumeration fails and an unreadable exact HEAD errors. The configured RustFS exact cell passes non-vacuously with the same zero-list shape and owns the positive lost-result/index/empty-shard/reopen sequence plus foreign shard, malformed/loose root, durable WAL, persisted cursor, and corrupt-manifest negatives. S3 ABA remains in `lance_surface_guards.rs`; CI rejects skipped E0/ABA cells. This file never mutates production manifest/schema state or deletes ambiguous artifacts; Phase A consumes its classifier through the private adapter |
 | `memwal_stream.rs` | Feature-gated RFC-026 private B1 mechanics, implemented private B2-common token/fold behavior, and B2a provider-failure evidence. B1 owns bounded put/ack/replay/fold, authority, cancellation, and manifest-only visibility. B2-common owns compare-and-chain/idempotency conflicts, same-generation overlays, stale-authority recapture after shared admission, exact base+token fold, recovery-v12 crash completion, and durable attribution. B2a injects a recording/failing store at the real Lance table-store boundary and covers effect-free cold-claim failure, post-invocation WAL ambiguity, complete post-cut unreferenced generation output, and partial generation output after the data object. Exact local and configured-RustFS cells prove typed `Lance` / `AckUnknown` / `RecoveryRequired` outcomes, blocked fresh progress, one fresh authoritative retry root, retained non-authoritative residue, and zero access below the orphan root through retry and cold reopen. Parent shard discovery may observe the common prefix; it may not descend into or adopt the subtree. |
-| `memwal_stream_cost.rs` | Feature-gated RFC-026 B1, Gate-R0, and B2a decision instrument. It separately measures warm already-claimed durability acknowledgement, cold replay, selected-generation fold scanning, visibility, retained merged metadata, the uncompacted graph-manifest term, legal no-roll estimates, and paired peak RSS. Gate R0 adds a revision-pinned source-audit tripwire, strict current-object classification/reference census, listed path/class/size retain-all comparisons at one/four/eight folds, referenced-cut retry reuse, and deterministic high-entropy near-cap local/configured-RustFS cells. The near-cap cell proves that an admitted 8,192-row/near-32-MiB generation acknowledges without graph visibility, then folds and publishes exactly once after logical-slice charging plus dense per-scanner-batch take. The isolated fold RSS delta measured 284,934,144 bytes (about 272 MiB), below a 384-MiB remeasurement tripwire; that tripwire is not a runtime allocator limit. B2a adds 1/8/32/128 local and configured-RustFS retained-history sweeps whose terms remain separate: warm ack, cold reopen/replay, fold, visibility, table/graph-manifest/adapter work, advisory current-object bytes, and whole-process peak RSS. Older retained roots must receive zero reads, writes, or deletes. The only allowed delete shape is Lance's losing manifest-CAS `.binpb.tmp.<uuid>` staging; canonical durable MemWAL delete requests remain zero. LIST totals, wall times, and RSS are advisory—not a quota, SLO, isolated WAL slope, or provider billing. A green test proves private closure/retention behavior; it does not activate a public API. |
+| `memwal_stream_cost.rs` | Feature-gated RFC-026 B1, Gate-R0, and B2a decision instrument. It separately measures warm already-claimed durability acknowledgement, cold replay, selected-generation fold scanning, visibility, retained merged metadata, the uncompacted graph-manifest term, legal no-roll estimates, and paired peak RSS. Gate R0 adds a revision-pinned source-audit tripwire, strict current-object classification/reference census, listed path/class/size retain-all comparisons at one/four/eight folds, referenced-cut retry reuse, and deterministic high-entropy near-cap local/configured-RustFS cells. The near-cap cell proves the exact B2-attributed boundary through the real adapter: 3,742 payload bytes per row admits 8,192 rows at 33,550,336 logical bytes, while 3,743 is rejected effect-free at 33,558,528 bytes. The legal generation acknowledges without graph visibility, then folds and publishes exactly once after logical-slice charging plus dense per-scanner-batch take. The reference-environment paired fold peak-RSS lift measured 286,441,472 bytes (about 273 MiB), below a one-sided 384-MiB remeasurement tripwire; common initialization may censor that lifetime high-water lift to zero or a negative value on another runner, and the tripwire is not a runtime allocator limit. B2a adds 1/8/32/128 local and configured-RustFS retained-history sweeps whose terms remain separate: warm ack, cold reopen/replay, fold, visibility, MemWAL/base-table/token-authority/other table-store work, graph-manifest/adapter work, advisory current-object bytes, and whole-process peak RSS. Older retained roots must receive zero reads, writes, or deletes. The only allowed delete shape is Lance's losing manifest-CAS `.binpb.tmp.<uuid>` staging; canonical durable MemWAL delete requests remain zero. LIST totals, wall times, and RSS are advisory—not a quota, SLO, isolated WAL slope, or provider billing. A green test proves private closure/retention behavior; it does not activate a public API. |
 | `durable_head_lookup_cost.rs` | RFC-024 Gate A decision instrument, isolated from the production manifest schema/publisher. At fixed catalog width 10 it runs the full absent/reconciled/one-uncovered/eight-uncovered/reconciled-after-tail matrix over compacted and uncompacted histories, with cold-open and warm-repeat measurements on local FS and bucket-gated S3/RustFS. Default depths are 20/80; the ignored decision-scale cell runs 10/100/1,000. Correct exact heads, flat indexed `rows_scanned`/range work, an index-absent growing negative control, and observable bounded tails all pass; after the eight-fragment tail, `optimize_indices` returns coverage to zero uncovered and representative `rows_scanned`/range work from 27→10 / 17→10. The test deliberately pins the no-go: uncompacted RustFS cold object reads/bytes and compacted byte terms grow, while RC.1 also crosses a bounded one-operation boundary by 1,000 commits, so RFC-024 remains research-blocked. `rows_scanned` is an RC.1 debug proxy, not a universal decoded-row counter. Object-store wrapper bytes and Lance execution-summary bytes are separate fixture-owned metrics and are not additive |
 | `checkpoint_retention_cost.rs` | RFC-025 Gate 0 decision instrument, isolated from the production manifest schema. It models three live checkpoints at catalog width 10 and measures complete list, exact show, and cleanup-root authority reads across absent/reconciled/eight-uncovered index states, compacted/uncompacted layouts, and cold/warm access. It also owns the reference V1 name-normalization matrix. Default local depths 20/80 pass the checked-in **no-go-preservation** assertions; the RC.1 ignored 10/100/1,000 run shows reconciled uncompacted work and the bounded tail flat, but rejects the current format shape after compaction: list/cleanup scan bytes grow 17,012→38,000 cold and 12,336→15,064 warm; show grows 29,348→53,064 and 24,672→30,128; scan operations add one at 1,000. The S3/RustFS cell is bucket-gated and was not run for this decision. The result keeps RFC-025 research-blocked; current v9 adds no checkpoint state |
 | `warm_read_cost.rs` | Cost-budget tests for the warm read/control path (query-latency work), measured at the object-store boundary with Lance `IOTracker` (the LanceDB IO-counted pattern): a warm same-branch read does 0 manifest opens, 1 version probe, validates the schema once (Fix 1 / finding A / Fix 2 at commit-history depth); a cold other-branch resolution derives snapshot state and lineage from one coherent manifest open/scan; native branch create and create-from each use one post-gate open/scan, while delete uses one target capture plus one native-ref opener and only one row scan; stale same-branch reads perform exactly 2 probes and refresh manifest-only; recreated non-main branches with the same Lance version refresh by incarnation; recreated branch-owned table handles are distinguished by table e_tag or refresh-time cache clearing; recreated traversal topology is protected by per-edge-table e_tag in the graph-index cache key or refresh-time cache clearing; a warm *repeat* read does 0 table opens via the held-handle cache and a write re-opens only the changed table at its new version/e_tag (Fix 3/6A). Also the CSR topology-build cost guards: `fresh_branch_traversal_reuses_main_graph_index` (A1 — a lazy-fork branch reuses main's cached CSR index, 0 rebuilds via `graph_build_count`) and `single_edge_query_builds_only_referenced_edge` (A2 — a one-edge query builds only that edge via `graph_edges_built`); both force CSR via the scoped `with_traversal_mode` seam, so they need no `#[serial]`. See "Cost-budget tests" below. |
@@ -230,19 +230,22 @@ shard-manifest payload 52/112/192 bytes and aggregate cold-read work
 3,611/4,458/5,770 bytes.
 The shared fold authority/publisher term remains intentionally non-flat without
 compaction: graph-manifest work at history 8/80 grew from 46 reads / 111,918
-bytes to 334 / 1,112,718 bytes (28.3/59.7 ms). The widest one-batch legal cell
-measured 33,228,232 post-tombstone Arrow bytes; Lance's exact RC.1 roll trigger
-was 33,170,472 BatchStore bytes + 32,768 Bloom bytes = 33,203,240, below the
-1-GiB no-auto-roll threshold. The worst legal fragmentation cell separately
-summed all 8,192 one-row `StoredBatch`s: 33,103,872 Arrow bytes and a
-29,343,744-byte BatchStore-plus-Bloom trigger, with both row and batch counts
-below 8,193. The isolated one-batch RSS pair was 74,334,208 bytes baseline vs
-206,471,168 bytes wide (+132,136,960); that whole-process delta includes Arrow,
+bytes to 334 / 1,112,718 bytes (28.3/59.7 ms). The current widest one-batch cell
+exercises the real B2 attribution path: 3,742 payload bytes per row charges
+33,550,336 logical post-attribution/post-tombstone Arrow bytes, 4,096 below the
+32-MiB cap; 3,743 charges 33,558,528, 4,096 above it, and is refused before any
+table, manifest, recovery, or MemWAL write. The legal `StoredBatch` estimate is
+33,550,376 bytes plus a 32,768-byte Bloom estimate = 33,583,144, below the
+1-GiB no-auto-roll threshold. A conservative 8,192-one-row-batch trigger upper
+bound is 33,914,880 bytes, with both row and batch counts below 8,193. The
+current isolated one-batch RSS pair was 77,725,696 bytes baseline vs
+264,683,520 bytes wide (+186,957,824); that whole-process delta includes Arrow,
 the mandatory PK index, runtime, and allocator overhead and is neither an Arrow
-reservation nor a PK-index-only estimate. B1 therefore admits one resident
-writer with a 32-MiB aggregate Arrow reservation. Cheap raw caller row/byte
-bounds reject obviously over-cap input before recovery I/O; raw-fit input then
-receives exact post-tombstone validation at that same pre-recovery boundary.
+reservation nor a PK-index-only estimate. B2 therefore admits one resident
+writer with a 32-MiB aggregate attributed Arrow reservation. Cheap raw caller
+row/byte bounds reject obviously over-cap input before recovery I/O; raw-fit
+input then receives exact post-attribution/post-tombstone validation at that
+same pre-recovery boundary.
 After any recovery/authority prelude, the exact charge is recomputed and
 reserved against the same aggregate, then every put follows charge → shared
 admission → same-key queue → mode before detached ownership or cold claim and
@@ -316,10 +319,14 @@ WAL while manifest/table versions remain unchanged; fold charges logical
 slices against the 32-MiB cap, takes each scanner emission into dense owned
 arrays, materializes one referenced generation, publishes exactly one manifest
 and table version, verifies all 8,192 rows plus sampled payloads, and retires the
-recovery sidecar. The separate subprocess instrument measured a 284,934,144-byte
-(about 272 MiB) isolated fold RSS delta under one exclusive fold. Its 384-MiB
-threshold is a CI remeasurement tripwire for this implementation shape, not a
-runtime memory reservation or allocator cap.
+recovery sidecar. The separate subprocess instrument measured a 286,441,472-byte
+(about 273 MiB) paired fold peak-RSS lift under one exclusive fold on the
+reference environment. Because `ru_maxrss` is a lifetime high-water mark,
+common graph initialization can dominate both subprocesses on another runner,
+so the paired lift may be zero or negative. The child still proves its exact
+writes, fold, and rows before exiting; the 384-MiB threshold is a one-sided CI
+remeasurement tripwire for this implementation shape, not a runtime memory
+reservation or allocator cap.
 
 Run the production-neutral Gate-R0 cells with:
 
@@ -359,13 +366,18 @@ the subtree. The exact configured-RustFS provider cell is non-vacuous in CI.
 `memwal_stream_cost.rs` owns the separate retained-history instrument. The
 small 1/8 cell runs on every relevant CI change; ignored local and configured-
 RustFS cells sweep 1/8/32/128. It records warm acknowledgement, cold replay,
-fold, visibility, table-store, graph-manifest-store, adapter, advisory object,
-and whole-process RSS terms independently. It asserts zero IO against every
-older retained generation root and zero canonical durable MemWAL deletes. Lance
-may remove a losing shard-manifest-CAS `.binpb.tmp.<uuid>` staging object; the
-classifier accepts only that exact shape because it never became authority.
-The observed LIST bytes, wall time, and RSS are diagnostics, not quotas,
-latency SLOs, provider billing, or an isolated MemWAL history slope.
+fold, visibility, graph-manifest-store, adapter, advisory object, and
+whole-process RSS terms independently, and further partitions table-store
+requests into MemWAL, base-table, `_stream_tokens.lance`, and other paths. The
+current local 1→8 cell keeps the actual warm-ack MemWAL operation counts flat
+at 9 reads and 2 writes while token-authority lookup grows 2→8 reads, so
+aggregate tracked reads honestly grow 11→17 and are not claimed history-flat.
+It asserts zero IO
+against every older retained generation root and zero canonical durable MemWAL
+deletes. Lance may remove a losing shard-manifest-CAS `.binpb.tmp.<uuid>`
+staging object; the classifier accepts only that exact shape because it never
+became authority. The observed LIST bytes, wall time, and RSS are diagnostics,
+not quotas, latency SLOs, provider billing, or an isolated MemWAL history slope.
 
 Run the relevant local/CI B2a cells with:
 
@@ -538,7 +550,13 @@ sidecar arm or graph movement.
 
 ## RustFS / S3 integration
 
-CI runs these S3-backed **correctness** tests against a containerized RustFS server (`.github/workflows/ci.yml` → `rustfs_integration` job, sharded one suite per runner):
+CI runs these S3-backed **correctness** tests against a containerized RustFS
+server (`.github/workflows/ci.yml` → `rustfs_integration` job) in two
+feature-graph shards. The default shard selects its six test binaries in one
+Cargo invocation so dependency features and large test links compile once,
+then checks the captured log for every required S3 cell and explicit skip. The
+failpoints shard runs its three feature-gated cells together. These remain the
+focused local equivalents:
 
 - `cargo test -p omnigraph-engine --test s3_storage` (lifecycle/branching + the e_tag-present CSR topology cache-key reuse test — the path local FS can't reach since its e_tag is `None`)
 - `cargo test -p omnigraph-engine --test lance_surface_guards public_physical_ref_token_rejects_s3_same_version_aba -- --exact` (RFC-024's public current-HEAD witness across unchanged reopen plus main/named same-version ABA; the workflow additionally rejects a zero-test/vacuous match)
@@ -622,9 +640,11 @@ v8, rebuilds a distinct v9/config-v3 root, and
 proves row/vector fidelity plus exact-`id` PK metadata. The v9 re-export must
 not expose the physical `__omnigraph_stream_v1$` attribution column, and the v8
 fixture's ordinary user property `__omnigraph_stream_v1` must retain its value;
-the v8 binary must refuse the v9 root. CI pins and builds the last merged schema-v8
-commit (`725793af83394235bf4b848b6c2c4454ac1f95e1`) before the workspace suite,
-so this immediate boundary runs non-vacuously on full CI. Run it locally with:
+the v8 binary must refuse the v9 root. CI pinned this seam while v9 was
+CURRENT; with v10 CURRENT it became a historical boundary and joined the
+env-gated seams, so it now skips unless `OMNIGRAPH_V8_BIN` points at a build of
+the last merged schema-v8 commit
+(`725793af83394235bf4b848b6c2c4454ac1f95e1`). Run it locally with:
 
 ```bash
 OMNIGRAPH_V8_BIN=/path/to/final-v8/omnigraph \
@@ -640,9 +660,12 @@ published `0.9.x` line in both message slots (`created by omnigraph 0.9.x` and
 `migrations.rs::release_names_the_writing_line_for_each_stamp`, so a map edit
 breaks locally before it can break only here), exports with v9, rebuilds a
 distinct v10 root, proves row/vector fidelity plus exact-`id` PK metadata, and
-proves the v9 binary refuses the v10 root. CI pins and builds the last
-v9-writing main commit (`e889a1c72004eb09f2be35b59ab6586d10c709e1`) before the
-workspace suite. Run it locally with:
+proves the v9 binary refuses the v10 root. CI's parallel
+`V9 ↔ V10 Format Fence` job pins and builds the last v9-writing main commit
+(`e889a1c72004eb09f2be35b59ab6586d10c709e1`) and then runs this exact test
+non-vacuously. Keeping that predecessor build outside the current-tree workspace
+job removes an independent cold compile from the workspace gate's critical
+path. Run it locally with:
 
 ```bash
 OMNIGRAPH_V9_BIN=/path/to/final-v9/omnigraph \
@@ -662,7 +685,7 @@ The CLI system tests (`system_local.rs`) spawn the workspace-built `omnigraph` a
 
 ## OpenAPI drift
 
-`crates/omnigraph-server/tests/openapi.rs` regenerates `openapi.json` and diffs against the checked-in copy. The drift check runs strict on PRs (the auto-commit step lives in the heavy `test` job, which is post-merge-only) — for server/API changes, regenerate locally with `OMNIGRAPH_UPDATE_OPENAPI=1 cargo test -p omnigraph-server --test openapi` and commit the result, or the PR's `test_aws_feature` job fails on drift. See [ci.md](ci.md).
+`crates/omnigraph-server/tests/openapi.rs` regenerates `openapi.json` and diffs against the checked-in copy. CI always runs the drift check strictly and does not auto-commit generated output. For server/API changes, regenerate locally with `OMNIGRAPH_UPDATE_OPENAPI=1 cargo test -p omnigraph-server --test openapi` and commit the result, or the PR's `test_aws_feature` job fails on drift. See [ci.md](ci.md).
 
 ## Examples & benches
 
@@ -828,7 +851,7 @@ Correctness bugs fail loudly in tests; cost-scaling bugs pass every test and deg
 - **Keep decision instruments honest when the answer is no.** RFC-024's `durable_head_lookup_cost.rs` attaches tracking before the cold dataset load through `open_tracked_lance_dataset`, then reports object-store wrapper I/O separately from Lance execution-summary I/O. Its reconciled BTREE row/range curve is flat, but its required RustFS cold-open and compacted-byte curves grow; those red design facts are asserted as the current result rather than erased because some counters pass. Run the default local 20/80 matrix with `cargo test -p omnigraph-engine --test durable_head_lookup_cost local_durable_head_lookup_matrix_is_correct_and_observable -- --exact --nocapture`; run the ignored 10/100/1,000 local matrix with `cargo test -p omnigraph-engine --test durable_head_lookup_cost local_durable_head_lookup_matrix_at_one_thousand_commits -- --ignored --exact --nocapture`. The bucket-gated S3 command is in the RustFS section above and remains on demand.
 - **Apply the same rule to RFC-025.** `checkpoint_retention_cost.rs` keeps live checkpoint count and catalog width fixed while unrelated journal history grows, and counts complete list/show/cleanup-root authority reads. The uncompacted reconciled counters and bounded tail are flat; compacted scan bytes and the 1,000-commit operation boundary are not, so the assertions preserve a no-go. Run the default local matrix with `cargo test -p omnigraph-engine --test checkpoint_retention_cost local_checkpoint_retention_matrix_is_exact_and_records_the_current_no_go -- --exact --nocapture`; run the ignored decision scale with `cargo test -p omnigraph-engine --test checkpoint_retention_cost local_checkpoint_retention_matrix_at_one_thousand_commits -- --ignored --exact --nocapture`. A green test means the known result was reproduced, not that RFC-025 passed Gate 0.
 - **Keep RFC-026 Gate E0 reproducible.** The first `checkout_latest`/`IOTracker` instrument was false-green because local `read_dir` escaped tracking; it is not acceptance evidence. The green harness uses the public but guide-hidden `Dataset::has_successor_version` from freshly ABA-verified exact `N`, probes only `N + 1`, then uses exact `N + 1` to reject buried `N + 2`. `AttemptTracker` records before forwarding, including failed/`NotFound` HEADs, and versions 8/80 must retain the identical four-success-HEAD + one-NotFound-HEAD + one-success-GET shape with zero lists. The Unix execute-only `_versions` tripwire must keep exact probing green while latest enumeration fails, and an unreadable exact HEAD must error. Run the 14-substantive-cell local file with `cargo test -p omnigraph-engine --test memwal_enrollment_gate -- --nocapture`; its fifteenth bucket-gated cell logs an explicit skip when unconfigured. Run the exact configured RustFS command above for its positive plus listing-dependent negative matrix. Green E0 authorized only Phase A; Phase A has now activated v7 foundation state, but E0 never authorizes row admission, acknowledgement, or fold.
-- **Preserve RFC-026 Gate R0's closure and retain-all evidence.** Its current-object census is useful only inside its stated observation boundary; never label LIST totals as provider-retained or billed bytes, and never turn them into a quota claim. The source audit remains pinned to the exact Lance lockfile revision. The high-entropy cell must continue to admit a legal 8,192-row/near-32-MiB generation, keep acknowledgement graph-invisible, close through logical-slice charge plus dense per-scanner-batch take, publish exactly once, and preserve every previously listed immutable path/class/size. Use `cargo test -p omnigraph-engine --features failpoints --test memwal_stream_cost gate_r0_ -- --nocapture`. Also run `widest_legal_generation_records_no_roll_estimates_and_peak_rss` exactly: its observed fold delta was 284,934,144 bytes (about 272 MiB), and 384 MiB is a remeasurement tripwire for the single-exclusive-fold implementation shape, not a runtime hard allocator limit. A green run proves the private evidence only; public product contracts remain inactive.
+- **Preserve RFC-026 Gate R0's closure and retain-all evidence.** Its current-object census is useful only inside its stated observation boundary; never label LIST totals as provider-retained or billed bytes, and never turn them into a quota claim. The source audit remains pinned to the exact Lance lockfile revision. The high-entropy cell must continue to reject 3,743 payload bytes per row effect-free at the exact B2-attributed 33,558,528-byte charge, admit 3,742 at 33,550,336 bytes, keep acknowledgement graph-invisible, close through logical-slice charge plus dense per-scanner-batch take, publish exactly once, and preserve every previously listed immutable path/class/size. Use `cargo test -p omnigraph-engine --features failpoints --test memwal_stream_cost gate_r0_ -- --nocapture`. Also run `widest_legal_generation_records_no_roll_estimates_and_peak_rss` exactly: its reference-environment paired fold peak-RSS lift was 286,441,472 bytes (about 273 MiB), and 384 MiB is a one-sided remeasurement tripwire for the single-exclusive-fold implementation shape, not a runtime hard allocator limit. A zero or negative paired lift is valid when common initialization dominates the lifetime high-water mark; the child separately asserts that the exact workload completed. A green run proves the private evidence only; public product contracts remain inactive.
 - **Preserve RFC-026 B2a's no-delete and provider-failure evidence.** Reuse the shared strict MemWAL classifier; do not weaken it with a second path parser. Complete and partial unreferenced generation roots must stay non-authoritative and receive zero subtree reads, writes, deletes, or adoption through retry/reopen. Parent shard discovery may observe their prefix. Canonical durable MemWAL deletion remains zero; only an exact losing shard-manifest-CAS `.binpb.tmp.<uuid>` staging path is allowed. Run `cargo test -p omnigraph-engine --features failpoints --test memwal_stream provider_` and `cargo test -p omnigraph-engine --features failpoints --test memwal_stream_cost b2a_`. Run the ignored 1/8/32/128 local/RustFS sweeps when the retained-history shape or Lance pin changes. Keep every term separate and describe LIST bytes, wall time, and RSS as advisory diagnostics, never as a quota, SLO, provider bill, or isolated WAL slope.
 - **Count on the handle that does the reads, not just the one a measured op opens.** Lance's IO-counted tests attach the `IOTracker` to the (warm, cached) dataset and read `incremental_stats()` per request — the tracker MUST be on the handle performing the reads, or warm-handle reads escape. A per-op tracker installed at measure time cannot see reads on a long-lived handle opened earlier (the warm coordinator's `__manifest` handle, reused across writes), so such reads were silently undercounted. Wrap a depth-swept body in `cost_harness` so the manifest tracker is installed before the graph opens and `manifest_reads` is **ground truth** (handle-age-irrelevant). The `version_probes` counter is the freshness-probe *call* count; ground truth additionally reveals that a write's probe does ~3 object-store RPCs (a read's probe is a 0-IO cache hit). `manifest_reads_capture_warm_probe` is the guard that this stays true.
 - This is the testing companion to invariant 15 in [docs/dev/invariants.md](invariants.md) (hot-path cost is bounded by work, not history).

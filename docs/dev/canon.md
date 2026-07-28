@@ -1028,7 +1028,7 @@ The cost, genuine v7↔v8 refusal/rebuild, and graph-level suite remain green.
 Gate R0's legal high-entropy near-cap failure is repaired: admission, replay,
 and fold charge the same logical dense-slice Arrow bytes, and fold densifies selected rows, so the batch folds and
 publishes without lowering the 8,192-row/32-MiB logical admission cap. The measured
-one-exclusive-fold RSS delta is 284,934,144 bytes (~272 MiB); the 384-MiB CI
+one-exclusive-fold RSS delta is 286,441,472 bytes (~273 MiB); the 384-MiB CI
 threshold is a remeasurement tripwire, not a runtime allocator limit. B1 is reachable only
 through a feature-gated private engine seam and folds only already-normalized
 physical rows/vectors without external embedding or unspecified derivation.
@@ -1044,10 +1044,12 @@ object. Complete and partial orphan output remains non-authoritative and is not
 descended into, read, mutated, adopted, or deleted through retry/reopen, though
 parent shard discovery may observe its prefix. The local/configured-RustFS
 provider matrix pins typed failure and recovery, while the 1/8/32/128 instrument
-separates acknowledgement, replay, fold, visibility, table, graph-manifest,
-adapter, advisory object, and RSS terms. Warm-ack operation shape stays flat
-while serialized authority and combined retained-history work grow; LIST bytes,
-wall times, and RSS are diagnostics rather than quotas or SLOs. RC.1's missing durable cross-open materialization-attempt
+separates acknowledgement, replay, fold, visibility, MemWAL, base-table,
+token-authority, other table-store, graph-manifest, adapter, advisory object,
+and RSS terms. The MemWAL warm-ack operation counts stay flat while exact
+authority and combined retained-history work are reported separately and may
+grow; aggregate table-store reads are not claimed flat. LIST bytes, wall times, and RSS are
+diagnostics rather than quotas or SLOs. RC.1's missing durable cross-open materialization-attempt
 receipt and complete physical-output envelope remain documented limits on any
 future bounded-storage claim, not blockers for this profile. B2a itself
 activated no schema or product surface.

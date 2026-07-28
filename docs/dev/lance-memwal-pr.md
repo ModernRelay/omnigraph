@@ -81,8 +81,8 @@ decision to build a different storage architecture.
 
 The prior near-cap closure failure is fixed without changing admission: fold
 scanning charges logical Arrow slices and densifies selected rows before
-retention. The measured one-exclusive-fold RSS delta was 284,934,144 bytes
-(about 272 MiB); CI's 384-MiB threshold is a remeasurement tripwire, not a
+retention. The measured one-exclusive-fold RSS delta was 286,441,472 bytes
+(about 273 MiB); CI's 384-MiB threshold is a remeasurement tripwire, not a
 runtime allocator limit.
 
 ### Public streaming is still specified but inactive
