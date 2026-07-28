@@ -407,6 +407,7 @@ jobs:
       OMNIGRAPH_S3_TEST_BUCKET: omnigraph-ci
       OMNIGRAPH_S3_TEST_PREFIX: github-actions
       CARGO_TERM_COLOR: always
+      RUST_MIN_STACK: 16777216
     steps:
       - name: Checkout source
         uses: actions/checkout@v5.0.1
@@ -429,24 +430,6 @@ jobs:
           key: ${{ matrix.shard }}
           workspaces: |
             . -> target
-
-      # Compile every default RustFS integration binary in one Cargo graph.
-      # Separate invocations serialized leaf compilation and large test-binary
-      # links (~22m engine + ~16m server on the cold 2026-07-28 run).
-      - name: Compile RustFS default test graph
-        if: matrix.shard == 'default'
-        run: |
-          cargo test --locked --no-run \
-            -p omnigraph-engine \
-            -p omnigraph-server \
-            -p omnigraph-cluster \
-            -p omnigraph-cli \
-            --test s3_storage \
-            --test lance_surface_guards \
-            --test memwal_enrollment_gate \
-            --test s3 \
-            --test s3_cluster \
-            --test system_local
 
       - name: Start RustFS
         # Pinned to 1.0.0-beta.8 (2026-06-10). beta.4+ refuses "default"
@@ -484,42 +467,52 @@ jobs:
             s3api create-bucket \
             --bucket "${OMNIGRAPH_S3_TEST_BUCKET}" >/dev/null 2>&1 || true
 
-      - name: Run RustFS storage tests
-        if: matrix.shard == 'default'
-        run: cargo test --locked -p omnigraph-engine --test s3_storage -- --nocapture
-
-      - name: Run RustFS physical-ref incarnation guard
-        if: matrix.shard == 'default'
-        run: |
-          set +e
-          output=$(cargo test --locked -p omnigraph-engine --test lance_surface_guards \
-            public_physical_ref_token_rejects_s3_same_version_aba -- --exact --nocapture 2>&1)
-          status=$?
-          set -e
-          echo "$output"
-          [ "$status" -eq 0 ] || exit "$status"
-          echo "$output" | grep -Fq \
-            "SKIP public_physical_ref_token_rejects_s3_same_version_aba" \
-            && { echo "::error::S3 physical-ref guard skipped — vacuous pass"; exit 1; }
-          echo "$output" | grep -Eq "test result: ok\. 1 passed; 0 failed" \
-            || { echo "::error::S3 physical-ref guard matched no test — vacuous pass"; exit 1; }
-
-      - name: Run RustFS MemWAL enrollment gate
+      # Compile and execute the selected default targets in one Cargo resolve.
+      # A superset prebuild followed by narrower commands would still rebuild
+      # workspace crates under different feature fingerprints.
+      - name: Run RustFS default integration graph
         if: matrix.shard == 'default'
         run: |
-          set +e
-          output=$(cargo test --locked -p omnigraph-engine --test memwal_enrollment_gate \
+          set -euo pipefail
+          test_log="$RUNNER_TEMP/rustfs-default.log"
+          cargo test --locked \
+            -p omnigraph-engine \
+            -p omnigraph-server \
+            -p omnigraph-cluster \
+            -p omnigraph-cli \
+            --test s3_storage \
+            --test lance_surface_guards \
+            --test memwal_enrollment_gate \
+            --test s3 \
+            --test s3_cluster \
+            --test system_local \
+            -- --nocapture 2>&1 | tee "$test_log"
+
+          if grep -Eiq \
+            "SKIP (public_physical_ref_token_rejects_s3_same_version_aba|s3_memwal_enrollment_gate_positive_and_listing_negatives)|skipping s3 " \
+            "$test_log"
+          then
+            echo "::error::a configured RustFS test emitted its unconfigured skip"
+            exit 1
+          fi
+
+          for test_name in \
+            s3_compatible_graph_lifecycle_works \
+            s3_branch_change_merge_flow_works \
+            s3_public_load_uses_hidden_run_and_publishes \
+            s3_adapter_conditional_writes_contract \
+            s3_schema_apply_migrates_live_graph \
+            s3_fresh_branch_traversal_reuses_main_graph_index_with_etags \
+            public_physical_ref_token_rejects_s3_same_version_aba \
             s3_memwal_enrollment_gate_positive_and_listing_negatives \
-            -- --exact --nocapture 2>&1)
-          status=$?
-          set -e
-          echo "$output"
-          [ "$status" -eq 0 ] || exit "$status"
-          echo "$output" | grep -Fq \
-            "SKIP s3_memwal_enrollment_gate_positive_and_listing_negatives" \
-            && { echo "::error::S3 MemWAL enrollment gate skipped — vacuous pass"; exit 1; }
-          echo "$output" | grep -Eq "test result: ok\. 1 passed; 0 failed" \
-            || { echo "::error::S3 MemWAL enrollment gate matched no test — vacuous pass"; exit 1; }
+            server_opens_s3_graph_directly_and_serves_snapshot_and_read \
+            server_boots_cluster_from_bare_storage_uri_and_serves_query \
+            s3_cluster_full_lifecycle_import_apply_serve_evolve_delete \
+            local_cli_s3_end_to_end_init_load_read_flow
+          do
+            grep -Eq "test ${test_name} \.\.\. ok" "$test_log" \
+              || { echo "::error::required RustFS cell '${test_name}' did not execute normally"; exit 1; }
+          done
 
       # NOTE: the RFC-013 step-3a data-table opener COST gate (write_cost_s3) used
       # to run here. It is a deterministic IO-count gate, not a correctness test —
@@ -527,22 +520,6 @@ jobs:
       # runner + own cadence, not on the every-merge correctness path. Moved out of
       # CI pending that harness; run it on demand with a bucket set:
       #   OMNIGRAPH_S3_TEST_BUCKET=… cargo test -p omnigraph-engine --test write_cost_s3
-
-      - name: Run RustFS server smoke
-        if: matrix.shard == 'default'
-        # No name filter: every test in the s3 target is bucket-gated, and a
-        # filter matching nothing passes vacuously (which silently ran zero
-        # tests here for a while — the old filter said s3_repo, the test
-        # said s3_graph).
-        run: cargo test --locked -p omnigraph-server --test s3 -- --nocapture
-
-      - name: Run RustFS cluster e2e
-        if: matrix.shard == 'default'
-        run: cargo test --locked -p omnigraph-cluster --test s3_cluster -- --nocapture
-
-      - name: Run RustFS CLI smoke
-        if: matrix.shard == 'default'
-        run: cargo test --locked -p omnigraph-cli --test system_local local_cli_s3_end_to_end_init_load_read_flow -- --nocapture
 
       - name: Run RustFS recovery-sidecar lifecycle
         if: matrix.shard == 'failpoints'
