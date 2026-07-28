@@ -25,7 +25,7 @@ shared-buffer capacity was charged instead of logical slice size. Admission,
 replay, and fold now share `ArrayData::get_slice_memory_size` logical charging,
 and fold rebuilds dense arrays with `take`; that exact shape
 acknowledges, materializes, folds, and publishes. The measured RSS delta for
-one exclusive full fold is 284,934,144 bytes (about 272 MiB). CI's 384-MiB
+one exclusive full fold is 286,441,472 bytes (about 273 MiB). CI's 384-MiB
 threshold is a remeasurement tripwire, not a runtime allocator or hard memory
 limit.
 
@@ -42,11 +42,13 @@ into, read, mutated, adopted, or deleted through retry/reopen; parent discovery
 may still observe its prefix. Local and configured-RustFS provider-failure
 tests pin those rules. The missing receipt/envelope therefore does not block
 this profile. The 1/8/32/128 retained-history instrument keeps acknowledgement,
-replay, fold, visibility, table, graph-manifest, adapter, object, and RSS terms
-separate. It shows flat warm-ack operation shape alongside growing serialized
-authority/combined history work; its timings, RSS, and LIST totals are advisory,
-not quotas or SLOs. Managed reclamation remains optional Lance-owned work for a
-later profile; a `GraphHistoryBudget` is not part of the immediate plan.
+replay, fold, visibility, MemWAL, base-table, token-authority, other table-store,
+graph-manifest, adapter, object, and RSS terms separate. The MemWAL warm-ack
+operation counts are flat while exact authority lookup and combined history
+work are reported separately and may grow; the aggregate is not claimed flat.
+Timings, RSS, and LIST totals are advisory, not quotas or SLOs. Managed
+reclamation remains optional Lance-owned work for a later profile; a
+`GraphHistoryBudget` is not part of the immediate plan.
 
 Internal schema v9 now activates stream-config v3, lifecycle state-v2, trusted
 hidden stream-row metadata, and a manifest-selected graph-global

@@ -41,7 +41,7 @@ within the original closure implementation. B1 now charges the scanner's
 logical slices against the same 32-MiB generation cap and copies every scanner
 emission into dense owned arrays before retaining it. The 8,192-row near-cap
 cell folds and publishes successfully; the reference subprocess run measured a
-284,934,144-byte (about 272 MiB) isolated fold RSS delta, below the 384-MiB
+286,441,472-byte (about 273 MiB) isolated fold RSS delta, below the 384-MiB
 remeasurement tripwire. No production or public caller reaches the row seam.
 
 Gate R0's 2026-07-20 **historical** no-go applies to a finite or otherwise

@@ -45,7 +45,7 @@ and keep the row, memory, recovery, sequencing, lifecycle, and terminal-
 disposition contracts strict. The near-cap fold is now closed without lowering
 the 8,192-row/32-MiB admission cap: fold scanning charges logical slices and
 densifies selected rows before retention. The measured full-fold RSS delta was
-284,934,144 bytes (about 272 MiB), guarded by a 384-MiB remeasurement tripwire.
+286,441,472 bytes (about 273 MiB), guarded by a 384-MiB remeasurement tripwire.
 
 Managed reclamation, a hard retained-storage envelope, whole-root rotation,
 and an upstream Lance patch are deferred optimizations. They can improve the

@@ -466,14 +466,23 @@ async fn keyed_insert_opens_table_at_most_once() {
 async fn manifest_reads_capture_warm_probe() {
     // Fresh-only (no `cost_harness`): the warm coordinator handle was opened outside
     // any meter, so the freshness probe's reads escape `manifest_reads`.
-    let fresh = {
+    //
+    // Heap-allocate this arm. It is the one measurement in this file that does
+    // NOT run inside `cost_harness` (which boxes its body for exactly this
+    // reason), so without the box this test frame carries a full init +
+    // four-write future *plus* the boxed ground-truth arm below. In a debug
+    // build those nested async frames accumulate far enough to overflow a
+    // default test-thread stack — observed on Linux CI while macOS stayed
+    // under the limit.
+    let fresh = Box::pin(async {
         let dir = tempfile::tempdir().unwrap();
         let mut db = local_graph(&dir).await;
         commit_many(&mut db, 3).await; // warm the coordinator
         let io = measure_insert(&mut db, "fresh").await;
         eprintln!("fresh-only warm write: __manifest={}", io.manifest_reads);
         io.manifest_reads
-    };
+    })
+    .await;
 
     // Ground truth (`cost_harness`): the same warm probe is now counted.
     cost_harness(async move {
