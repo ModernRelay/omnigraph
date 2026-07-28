@@ -650,9 +650,12 @@ published `0.9.x` line in both message slots (`created by omnigraph 0.9.x` and
 `migrations.rs::release_names_the_writing_line_for_each_stamp`, so a map edit
 breaks locally before it can break only here), exports with v9, rebuilds a
 distinct v10 root, proves row/vector fidelity plus exact-`id` PK metadata, and
-proves the v9 binary refuses the v10 root. CI pins and builds the last
-v9-writing main commit (`e889a1c72004eb09f2be35b59ab6586d10c709e1`) before the
-workspace suite. Run it locally with:
+proves the v9 binary refuses the v10 root. CI's parallel
+`V9 ↔ V10 Format Fence` job pins and builds the last v9-writing main commit
+(`e889a1c72004eb09f2be35b59ab6586d10c709e1`) and then runs this exact test
+non-vacuously. Keeping that predecessor build outside the current-tree workspace
+job removes an independent cold compile from the workspace gate's critical
+path. Run it locally with:
 
 ```bash
 OMNIGRAPH_V9_BIN=/path/to/final-v9/omnigraph \
@@ -672,7 +675,7 @@ The CLI system tests (`system_local.rs`) spawn the workspace-built `omnigraph` a
 
 ## OpenAPI drift
 
-`crates/omnigraph-server/tests/openapi.rs` regenerates `openapi.json` and diffs against the checked-in copy. The drift check runs strict on PRs (the auto-commit step lives in the heavy `test` job, which is post-merge-only) — for server/API changes, regenerate locally with `OMNIGRAPH_UPDATE_OPENAPI=1 cargo test -p omnigraph-server --test openapi` and commit the result, or the PR's `test_aws_feature` job fails on drift. See [ci.md](ci.md).
+`crates/omnigraph-server/tests/openapi.rs` regenerates `openapi.json` and diffs against the checked-in copy. CI always runs the drift check strictly and does not auto-commit generated output. For server/API changes, regenerate locally with `OMNIGRAPH_UPDATE_OPENAPI=1 cargo test -p omnigraph-server --test openapi` and commit the result, or the PR's `test_aws_feature` job fails on drift. See [ci.md](ci.md).
 
 ## Examples & benches
 

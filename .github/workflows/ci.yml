@@ -80,7 +80,9 @@ jobs:
             esac
 
             if [[ "$EVENT_NAME" != "pull_request" ]]; then
-              run_rustfs_ci=true
+              if [[ "$run_full_ci" == "true" ]]; then
+                run_rustfs_ci=true
+              fi
               continue
             fi
 
@@ -131,40 +133,32 @@ jobs:
   test:
     name: Test Workspace
     needs: classify_changes
-    # PR latency: the full workspace + failpoints build/test is the slowest
-    # gate (~15min warm, up to the 75min ceiling cold) and dominated PR
-    # turnaround. It now runs only on push to `main` (post-merge), on tags,
-    # and on manual `workflow_dispatch` — NOT on pull_request. Trade-off
-    # accepted deliberately: a regression is caught on the `main` run after
-    # merge rather than before it, so `main` can briefly go red. Mitigations:
+    # PR latency: the workspace gate runs only for non-text pushes to `main`
+    # (post-merge), tags, and manual `workflow_dispatch` — NOT on pull_request.
+    # Trade-off accepted deliberately: a regression is caught on the `main`
+    # run after merge rather than before it, so `main` can briefly go red.
+    # Mitigations:
     # (1) `Test Workspace` is removed from required PR checks in
     #     `.github/branch-protection.json` (a required check that never
     #     reports would leave every PR permanently pending);
     # (2) run the full suite locally before merging risky changes
-    #     (`cargo test --workspace --locked`), or trigger this workflow via
-    #     the Actions "Run workflow" button (workflow_dispatch) on your branch;
-    # (3) openapi.json is no longer auto-regenerated on PRs (that step lived
-    #     here) — regenerate it locally for server/API changes
+    #     (`cargo test --workspace --locked --features
+    #     omnigraph-engine/failpoints,omnigraph-cluster/failpoints`), or trigger
+    #     this workflow via the Actions "Run workflow" button on your branch;
+    # (3) openapi.json is not auto-regenerated — regenerate it locally for
+    #     server/API changes
     #     (`OMNIGRAPH_UPDATE_OPENAPI=1 cargo test -p omnigraph-server --test openapi`)
     #     or the strict drift check fails the post-merge `main` run.
-    if: github.event_name != 'pull_request'
+    if: github.event_name != 'pull_request' && needs.classify_changes.outputs.run_full_ci == 'true'
     runs-on: ubuntu-latest
-    # 120, not 75: same self-perpetuation argument as the 45 -> 75 raise on
-    # 2026-06-11, re-triggered by the genuine-predecessor fence build. A cold
-    # run now pays THREE serial full builds on a 2-core runner -- the
-    # predecessor CLI, the workspace suite, and the failpoints-feature suite --
-    # because the fence binary is built from a different source tree and cannot
-    # share the current tree's artifacts. Measured 2026-07-28 across two
-    # dispatched runs: predecessor build 26m, workspace tests 25m, failpoints
-    # 24m and still running = 75m exactly, killed mid-failpoints both times.
-    #
-    # A timed-out run never SAVES its cache, so an undersized budget is
-    # self-perpetuating: every retry starts cold and dies at the same step.
-    # That is the loop this raise breaks -- once one run completes and saves
-    # the cache, warm runs return to ~15 minutes. Headroom, not a target.
-    timeout-minutes: 120
+    # The 2026-07-28 cold diagnostic spent 25m29s on the featureless workspace
+    # graph, then another 23m21s compiling the failpoints graph. Build the
+    # current tree once with the feature superset instead. The genuine v9
+    # binary/fence and RustFS shards are independent parallel jobs below, so
+    # this job has one current-tree compile and a bounded 60-minute ceiling.
+    timeout-minutes: 60
     permissions:
-      contents: write
+      contents: read
     env:
       CARGO_TERM_COLOR: always
       # Floor for the whole class of debug-build async stack depth, NOT the fix
@@ -178,46 +172,116 @@ jobs:
       # keeps CI deterministic across runners while that work continues.
       RUST_MIN_STACK: 16777216
     steps:
-      - name: Skip heavy CI for text-only changes
-        if: needs.classify_changes.outputs.run_full_ci != 'true'
-        run: echo "Text-only change detected; skipping workspace test run."
-
-      # Default checkout: on pull_request this gives us the merge commit
-      # (refs/pull/N/merge), which is what we want to test. For same-repo PRs
-      # the regenerated openapi.json is pushed to the head branch below via a
-      # separate shallow clone.
       - name: Checkout source
-        if: needs.classify_changes.outputs.run_full_ci == 'true'
         uses: actions/checkout@v5.0.1
 
       - name: Install system dependencies
-        if: needs.classify_changes.outputs.run_full_ci == 'true'
         run: |
           sudo apt-get update
           sudo apt-get install -y protobuf-compiler libprotobuf-dev
 
       - name: Install Rust stable
-        if: needs.classify_changes.outputs.run_full_ci == 'true'
         uses: dtolnay/rust-toolchain@stable
         with:
           toolchain: stable
 
       - name: Cache Rust build data
-        if: needs.classify_changes.outputs.run_full_ci == 'true'
         uses: Swatinem/rust-cache@v2
         with:
           workspaces: |
             . -> target
 
-      # The v8↔v9 fence build was retired here when v10 became CURRENT. CI
-      # pins only the IMMEDIATE predecessor (now v9, below); older seams stay
-      # env-gated and skip, per the policy in docs/dev/testing.md -- rebuilding
-      # every historical revision on every run is what that policy exists to
-      # prevent. The v8 test itself is unchanged and still runs on demand with
-      # OMNIGRAPH_V8_BIN set. Concretely: this build cost 26 minutes of a
-      # 75-minute job, and keeping it alongside the v9 build timed the job out.
-      - name: Build genuine final-v9 CLI for the v9↔v10 format fence
-        if: needs.classify_changes.outputs.run_full_ci == 'true'
+      - name: Run workspace and failpoint tests once
+        run: |
+          set -euo pipefail
+          test_log="$RUNNER_TEMP/workspace-tests.log"
+          cargo test --workspace --locked \
+            --features omnigraph-engine/failpoints,omnigraph-cluster/failpoints \
+            -- --nocapture 2>&1 | tee "$test_log"
+
+          grep -Fq "Gate R0 widest local:" "$test_log" \
+            || { echo "::error::Gate R0 local closure cell did not produce evidence"; exit 1; }
+          for test_name in \
+            gate_r0_current_inventory_path_classifier_is_canonical_and_fail_closed \
+            gate_r0_source_audit_revision_tripwire_matches_surveyed_lance \
+            gate_r0_retain_all_current_object_growth_is_swept_explicitly \
+            gate_r0_referenced_cut_retry_reuses_the_same_generation_root_local \
+            gate_r0_widest_generation_closes_and_records_retain_all_growth_local
+          do
+            grep -Eq "test ${test_name} \.\.\. ok" "$test_log" \
+              || { echo "::error::required positive Gate R0 cell '${test_name}' did not execute normally"; exit 1; }
+          done
+          for test_name in \
+            gate_r0_current_inventory_refuses_manifest_for_another_shard \
+            gate_r0_current_inventory_refuses_duplicate_generation_authority \
+            gate_r0_current_inventory_refuses_zero_current_generation \
+            gate_r0_current_inventory_refuses_non_advanced_current_generation \
+            gate_r0_current_inventory_refuses_manifest_filename_body_version_mismatch \
+            gate_r0_current_inventory_refuses_gapped_manifest_version_chain \
+            gate_r0_current_inventory_refuses_listed_shard_without_manifest
+          do
+            grep -Eq "test ${test_name} - should panic \.\.\. ok" "$test_log" \
+              || { echo "::error::required negative Gate R0 cell '${test_name}' did not execute as should-panic"; exit 1; }
+          done
+
+          grep -Eq "test b2a_retained_history_small_depth_keeps_terms_and_old_roots_separate \.\.\. ok" "$test_log" \
+            || { echo "::error::required B2a retained-history regression cell did not execute normally"; exit 1; }
+          for test_name in \
+            b2a_retained_history_decision_scale_sweeps_to_128_generations \
+            b2a_retained_history_decision_scale_sweeps_to_128_generations_on_configured_rustfs
+          do
+            grep -Eq "test ${test_name} \.\.\. ignored" "$test_log" \
+              || { echo "::error::B2a decision-scale cell '${test_name}' did not remain explicitly ignored"; exit 1; }
+          done
+          grep -Fq "B2a retained-history ci depth=" "$test_log" \
+            || { echo "::error::B2a retained-history regression cell produced no evidence"; exit 1; }
+
+          # This is a remeasurement tripwire for the current single-exclusive-
+          # fold shape, not a runtime allocator limit.
+          grep -Eq "test widest_legal_generation_records_no_roll_estimates_and_peak_rss \.\.\. ok" "$test_log" \
+            || { echo "::error::Gate R0 RSS remeasurement cell did not execute normally"; exit 1; }
+          grep -Fq "fold_delta_remeasure_bytes=402653184" "$test_log" \
+            || { echo "::error::Gate R0 RSS evidence line or 384-MiB tripwire changed"; exit 1; }
+
+  v9_v10_format_fence:
+    name: V9 ↔ V10 Format Fence
+    needs: classify_changes
+    if: github.event_name != 'pull_request' && needs.classify_changes.outputs.run_full_ci == 'true'
+    runs-on: ubuntu-latest
+    # This job owns the immutable predecessor build in parallel with the
+    # current-tree workspace job. The 2026-07-28 cold measurement was 25m40s
+    # for v9; exact current-CLI fence compilation reuses the same locked
+    # dependency graph and retains bounded headroom here.
+    timeout-minutes: 60
+    permissions:
+      contents: read
+    env:
+      CARGO_TERM_COLOR: always
+      RUST_MIN_STACK: 16777216
+    steps:
+      - name: Checkout source
+        uses: actions/checkout@v5.0.1
+
+      - name: Install system dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y protobuf-compiler libprotobuf-dev
+
+      - name: Install Rust stable
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: stable
+
+      - name: Cache cross-version build data
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: |
+            . -> target
+          key: crossversion-v9-v10
+
+      # CI pins only the immediate predecessor. Older seams remain env-gated
+      # and on-demand, per docs/dev/testing.md.
+      - name: Build genuine final-v9 CLI
         env:
           # Last v9-writing main commit before RFC-026 §4.7 P1 activates v10.
           # Keep this immutable: HEAD^ stops being v9 after the first v10 merge.
@@ -235,9 +299,6 @@ jobs:
             --target-dir "$GITHUB_WORKSPACE/target"
           cp "$GITHUB_WORKSPACE/target/debug/omnigraph" "$v9_bin"
           test -x "$v9_bin"
-          # Same shared-cache discipline as the v8 step above: purge only the
-          # local path packages so the current workspace cannot reuse a v9
-          # engine object behind the v10 test binary.
           cargo clean --target-dir "$GITHUB_WORKSPACE/target" \
             --package omnigraph-compiler \
             --package omnigraph-policy \
@@ -248,118 +309,21 @@ jobs:
             --package omnigraph-cli
           echo "OMNIGRAPH_V9_BIN=$v9_bin" >> "$GITHUB_ENV"
 
-      - name: Run workspace tests
-        if: needs.classify_changes.outputs.run_full_ci == 'true'
-        # On same-repo PRs, regenerate openapi.json as part of the drift test
-        # so the following step can commit the update. Elsewhere the env var
-        # is empty, leaving the drift test in strict-check mode.
-        env:
-          OMNIGRAPH_UPDATE_OPENAPI: ${{ (github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name == github.repository) && '1' || '' }}
-        run: cargo test --workspace --locked
-
-      - name: Run failpoints feature tests
-        if: needs.classify_changes.outputs.run_full_ci == 'true'
-        # Run after the workspace test so the build cache is warm —
-        # enabling --features failpoints is just an incremental rebuild
-        # of the target crate + the small `fail` crate, not the full
-        # dep tree (lance, datafusion). A separate job with its own
-        # cache key would be a fresh ~20min build on first run; this
-        # is ~30s on a warm cache. The cluster feature does not enable
-        # omnigraph/failpoints, so each line rebuilds only its crate.
+      - name: Run exact v9↔v10 refusal and rebuild fence
         run: |
-          cargo test --locked -p omnigraph-engine --features failpoints --test failpoints
-          cargo test --locked -p omnigraph-engine --features failpoints --test memwal_stream
-          set +e
-          output=$(cargo test --locked -p omnigraph-engine --features failpoints --test memwal_stream_cost gate_r0_ -- --nocapture 2>&1); status=$?
-          set -e
-          echo "$output"
-          [ "$status" -eq 0 ] || exit "$status"
-          echo "$output" | grep -Eq "test result: ok\. [1-9][0-9]* passed" \
-            || { echo "::error::Gate R0 filter matched no tests — vacuous pass"; exit 1; }
-          echo "$output" | grep -Fq "Gate R0 widest local:" \
-            || { echo "::error::Gate R0 local closure cell did not produce evidence"; exit 1; }
-          for test_name in \
-            gate_r0_current_inventory_path_classifier_is_canonical_and_fail_closed \
-            gate_r0_source_audit_revision_tripwire_matches_surveyed_lance \
-            gate_r0_retain_all_current_object_growth_is_swept_explicitly \
-            gate_r0_referenced_cut_retry_reuses_the_same_generation_root_local \
-            gate_r0_widest_generation_closes_and_records_retain_all_growth_local
-          do
-            echo "$output" | grep -Eq "test ${test_name} \.\.\. ok" \
-              || { echo "::error::required positive Gate R0 cell '${test_name}' did not execute normally"; exit 1; }
-          done
-          for test_name in \
-            gate_r0_current_inventory_refuses_manifest_for_another_shard \
-            gate_r0_current_inventory_refuses_duplicate_generation_authority \
-            gate_r0_current_inventory_refuses_zero_current_generation \
-            gate_r0_current_inventory_refuses_non_advanced_current_generation \
-            gate_r0_current_inventory_refuses_manifest_filename_body_version_mismatch \
-            gate_r0_current_inventory_refuses_gapped_manifest_version_chain \
-            gate_r0_current_inventory_refuses_listed_shard_without_manifest
-          do
-            echo "$output" | grep -Eq "test ${test_name} - should panic \.\.\. ok" \
-              || { echo "::error::required negative Gate R0 cell '${test_name}' did not execute as should-panic"; exit 1; }
-          done
-
-          set +e
-          output=$(cargo test --locked -p omnigraph-engine --features failpoints --test memwal_stream_cost b2a_ -- --nocapture 2>&1); status=$?
-          set -e
-          echo "$output"
-          [ "$status" -eq 0 ] || exit "$status"
-          echo "$output" | grep -Eq "test result: ok\. 1 passed; 0 failed; 2 ignored" \
-            || { echo "::error::B2a retained-history filter matched the wrong test set"; exit 1; }
-          echo "$output" | grep -Eq "test b2a_retained_history_small_depth_keeps_terms_and_old_roots_separate \.\.\. ok" \
-            || { echo "::error::required B2a retained-history regression cell did not execute normally"; exit 1; }
-          echo "$output" | grep -Fq "B2a retained-history ci depth=" \
-            || { echo "::error::B2a retained-history regression cell produced no evidence"; exit 1; }
-
-          # This is a remeasurement tripwire for the current single-exclusive-
-          # fold shape, not a runtime allocator limit. Keep it outside the
-          # gate_r0_ filter because the subprocess owner has a stable older name.
-          set +e
-          output=$(cargo test --locked -p omnigraph-engine --features failpoints --test memwal_stream_cost widest_legal_generation_records_no_roll_estimates_and_peak_rss -- --exact --nocapture 2>&1); status=$?
-          set -e
-          echo "$output"
-          [ "$status" -eq 0 ] || exit "$status"
-          echo "$output" | grep -Eq "test result: ok\. 1 passed" \
-            || { echo "::error::Gate R0 RSS filter matched no tests — vacuous pass"; exit 1; }
-          echo "$output" | grep -Eq "test widest_legal_generation_records_no_roll_estimates_and_peak_rss \.\.\. ok" \
-            || { echo "::error::Gate R0 RSS remeasurement cell did not execute normally"; exit 1; }
-          echo "$output" | grep -Fq "fold_delta_remeasure_bytes=402653184" \
-            || { echo "::error::Gate R0 RSS evidence line or 384-MiB tripwire changed"; exit 1; }
-          cargo test --locked -p omnigraph-cluster --features failpoints --test failpoints
-
-      - name: Commit regenerated openapi.json to PR branch
-        if: |
-          needs.classify_changes.outputs.run_full_ci == 'true' &&
-          github.event_name == 'pull_request' &&
-          github.event.pull_request.head.repo.full_name == github.repository
-        env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        run: |
-          # The workspace was checked out at the PR's merge commit so tests
-          # see the merged state. Pushing the regenerated openapi.json back
-          # to the PR branch is done via a separate shallow clone so the
-          # pushed commit contains only the spec change, not the merge state.
-          if git diff --quiet -- openapi.json; then
-            echo "openapi.json is already in sync."
-            exit 0
+          set -euo pipefail
+          test_log="$RUNNER_TEMP/v9-v10-format-fence.log"
+          cargo test --locked -p omnigraph-cli --test crossversion_upgrade \
+            current_v10_refuses_and_rebuilds_genuine_v9_and_v9_refuses_v10 \
+            -- --exact --nocapture 2>&1 | tee "$test_log"
+          if grep -Fq "skipping immediate-predecessor v9 upgrade test" "$test_log"; then
+            echo "::error::v9↔v10 format fence skipped despite a configured predecessor binary"
+            exit 1
           fi
-          tmp=$(mktemp -d)
-          git clone --depth 1 --branch "${{ github.head_ref }}" \
-            "https://x-access-token:${GITHUB_TOKEN}@github.com/${{ github.repository }}.git" \
-            "$tmp"
-          cp openapi.json "$tmp/openapi.json"
-          cd "$tmp"
-          if git diff --quiet -- openapi.json; then
-            echo "openapi.json matches PR branch; nothing to push."
-            exit 0
-          fi
-          git config user.name "github-actions[bot]"
-          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-          git add openapi.json
-          git commit -m "chore: regenerate openapi.json"
-          git push
+          grep -Eq "test current_v10_refuses_and_rebuilds_genuine_v9_and_v9_refuses_v10 \.\.\. ok" "$test_log" \
+            || { echo "::error::exact v9↔v10 format fence did not execute normally"; exit 1; }
+          grep -Eq "test result: ok\. 1 passed; 0 failed" "$test_log" \
+            || { echo "::error::v9↔v10 format fence matched the wrong test set"; exit 1; }
 
   test_aws_feature:
     name: Test omnigraph-server --features aws
@@ -409,9 +373,9 @@ jobs:
 
   rustfs_integration:
     name: RustFS S3 Integration (${{ matrix.shard }})
-    # `needs: test` means this is push-/dispatch-only too: on pull_request the
-    # `test` job is skipped, so this dependent is skipped with it. S3
-    # integration runs post-merge on `main`, alongside the workspace suite.
+    # This remains push-/tag-/dispatch-only, but no longer waits for the
+    # independent workspace job. Starting both cold compile graphs together
+    # removes that dependency from the workflow's critical path.
     #
     # Sharded across parallel runners (one suite per shard). The S3 tests
     # themselves run in seconds — the job's wall-clock is almost entirely the
@@ -425,10 +389,8 @@ jobs:
     # `fail-fast: false` so one shard's failure still lets the others report.
     # The `failpoints` shard is isolated because `--features failpoints`
     # compiles a distinct engine variant that must not serialize behind the rest.
-    needs:
-      - classify_changes
-      - test
-    if: needs.classify_changes.outputs.run_rustfs_ci == 'true'
+    needs: classify_changes
+    if: github.event_name != 'pull_request' && needs.classify_changes.outputs.run_rustfs_ci == 'true'
     runs-on: ubuntu-latest
     timeout-minutes: 50
     strategy:
