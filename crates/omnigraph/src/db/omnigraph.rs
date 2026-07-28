@@ -53,7 +53,10 @@ pub use table_ops::PendingIndex;
 pub(crate) use table_ops::{DeferredTableFork, OpenedForMutation};
 
 use super::commit_graph::GraphCommit;
-use super::manifest::{ManifestChange, Snapshot, TableRegistration, TableTombstone};
+use super::manifest::{
+    CapturedManifestProbe, ManifestChange, ManifestCoordinator, Snapshot, StreamProfileEntry,
+    TableRegistration, TableTombstone,
+};
 use super::schema_state::{
     SCHEMA_SOURCE_FILENAME, load_validated_schema_contract,
     load_validated_schema_contract_for_source, read_accepted_schema_ir, read_schema_state_identity,
@@ -173,6 +176,39 @@ struct HandleSchemaView {
     schema_identity_domain: String,
 }
 
+/// Warm projection of the graph-global stream profile from canonical main.
+///
+/// Lance branches are independent manifest histories, so a named branch's
+/// physical profile row is only the value it inherited at fork time. Live
+/// named-branch reads instead use this main-pinned projection. The retained
+/// manifest probe makes the warm path one cheap freshness check; a full main
+/// manifest scan occurs only after that probe observes movement.
+#[derive(Debug, Clone)]
+struct CanonicalMainStreamProfile {
+    probe: CapturedManifestProbe,
+    profile: StreamProfileEntry,
+}
+
+impl CanonicalMainStreamProfile {
+    fn from_main_coordinator(coordinator: &GraphCoordinator) -> Self {
+        debug_assert!(
+            coordinator.current_branch().is_none(),
+            "canonical stream profile must be captured from main"
+        );
+        Self {
+            probe: coordinator.captured_manifest_probe(),
+            profile: coordinator.snapshot().stream_profile().clone(),
+        }
+    }
+
+    fn from_main_manifest(manifest: &ManifestCoordinator) -> Self {
+        Self {
+            probe: manifest.captured_probe(),
+            profile: manifest.snapshot().stream_profile().clone(),
+        }
+    }
+}
+
 /// Top-level handle to an Omnigraph database.
 ///
 /// An Omnigraph is a Lance-native graph database with git-style branching.
@@ -202,6 +238,13 @@ pub struct Omnigraph {
     /// workloads. Lock acquisition order: always before `runtime_cache`
     /// (when both are needed in one scope).
     coordinator: Arc<tokio::sync::RwLock<GraphCoordinator>>,
+    /// Canonical-main authority used only to project the graph-global stream
+    /// profile into live named-branch snapshots. It is initialized from the
+    /// already-open main coordinator (no second open), refreshed by a cheap
+    /// retained-handle probe, and reseeded when this handle leaves main or
+    /// publishes a profile flip. Historical snapshots never consult it.
+    canonical_main_stream_profile:
+        Arc<tokio::sync::RwLock<CanonicalMainStreamProfile>>,
     table_store: TableStore,
     runtime_cache: RuntimeCache,
     /// Per-graph read caches: one shared Lance `Session` plus the held-`Dataset`
@@ -493,12 +536,17 @@ impl Omnigraph {
             }
         };
 
+        let canonical_main_stream_profile =
+            CanonicalMainStreamProfile::from_main_coordinator(&coordinator);
         let session = lance_access.data_session();
         Ok(Self {
             root_uri: root.clone(),
             storage,
             lance_access,
             coordinator: Arc::new(tokio::sync::RwLock::new(coordinator)),
+            canonical_main_stream_profile: Arc::new(tokio::sync::RwLock::new(
+                canonical_main_stream_profile,
+            )),
             // The graph-scoped data session keeps table metadata/index caches
             // warm across reads, writes, and maintenance. Mutable control
             // metadata uses the context's separate zero-cache session; both
@@ -685,12 +733,17 @@ impl Omnigraph {
         fixup_physical_schemas(&mut catalog)?;
         let public_catalog = public_catalog_view(&catalog)?;
 
+        let canonical_main_stream_profile =
+            CanonicalMainStreamProfile::from_main_coordinator(&coordinator);
         let session = lance_access.data_session();
         let db = Self {
             root_uri: root.clone(),
             storage,
             lance_access,
             coordinator: Arc::new(tokio::sync::RwLock::new(coordinator)),
+            canonical_main_stream_profile: Arc::new(tokio::sync::RwLock::new(
+                canonical_main_stream_profile,
+            )),
             // The graph-scoped data session keeps table metadata/index caches
             // warm across reads, writes, and maintenance. Mutable control
             // metadata uses the context's separate zero-cache session; both
@@ -1046,6 +1099,81 @@ impl Omnigraph {
                 )
                 .await
             }
+        }
+    }
+
+    /// Read the current graph-global stream profile from canonical main.
+    ///
+    /// When this handle is main-bound, its existing coordinator is the warm
+    /// authority. A named-branch-bound handle uses the dedicated main
+    /// projection captured before leaving main. Both paths perform a cheap
+    /// incarnation probe and scan the main manifest only after movement.
+    async fn current_canonical_stream_profile(&self) -> Result<StreamProfileEntry> {
+        {
+            let coordinator = self.coordinator.read().await;
+            if coordinator.current_branch().is_none() {
+                let held = coordinator.manifest_incarnation();
+                if coordinator
+                    .probe_latest_incarnation()
+                    .await?
+                    .matches(&held)
+                {
+                    return Ok(coordinator.snapshot().stream_profile().clone());
+                }
+            }
+        }
+
+        {
+            let mut coordinator = self.coordinator.write().await;
+            if coordinator.current_branch().is_none() {
+                let held = coordinator.manifest_incarnation();
+                let mut refreshed = false;
+                if !coordinator
+                    .probe_latest_incarnation()
+                    .await?
+                    .matches(&held)
+                {
+                    coordinator.refresh_manifest_only().await?;
+                    refreshed = true;
+                }
+                let profile = coordinator.snapshot().stream_profile().clone();
+                drop(coordinator);
+                if refreshed {
+                    self.invalidate_read_caches().await;
+                }
+                return Ok(profile);
+            }
+        }
+
+        {
+            let authority = self.canonical_main_stream_profile.read().await;
+            if authority.probe.is_current().await? {
+                return Ok(authority.profile.clone());
+            }
+        }
+
+        let mut authority = self.canonical_main_stream_profile.write().await;
+        if authority.probe.is_current().await? {
+            return Ok(authority.profile.clone());
+        }
+        let control_session = self.control_session();
+        let manifest =
+            ManifestCoordinator::open_with_session(self.uri(), &control_session).await?;
+        *authority = CanonicalMainStreamProfile::from_main_manifest(&manifest);
+        Ok(authority.profile.clone())
+    }
+
+    /// Install an exact freshly-opened main coordinator after a profile call
+    /// (changed or idempotent). This keeps both a named-bound handle's profile
+    /// projection and a main-bound handle's ordinary coordinator current
+    /// without another scan.
+    async fn install_current_main_stream_profile(&self, coordinator: GraphCoordinator) {
+        let authority = CanonicalMainStreamProfile::from_main_coordinator(&coordinator);
+        *self.canonical_main_stream_profile.write().await = authority;
+
+        let mut active = self.coordinator.write().await;
+        if active.current_branch().is_none() {
+            *active = coordinator;
         }
     }
 
@@ -1644,7 +1772,14 @@ impl Omnigraph {
         let branch = normalize_branch_name(branch)?;
         let next = self.open_coordinator_for_branch(branch.as_deref()).await?;
         validate_schema_ir_against_snapshot(&schema_ir, &next.snapshot())?;
-        *self.coordinator.write().await = next;
+        let mut profile = self.canonical_main_stream_profile.write().await;
+        let mut coordinator = self.coordinator.write().await;
+        if coordinator.current_branch().is_none() {
+            *profile = CanonicalMainStreamProfile::from_main_coordinator(&coordinator);
+        }
+        *coordinator = next;
+        drop(coordinator);
+        drop(profile);
         self.invalidate_read_caches().await;
         Ok(())
     }
@@ -2093,6 +2228,16 @@ impl Omnigraph {
         target: ReadTarget,
     ) -> Result<ResolvedTarget> {
         let mut resolved = self.resolve_target_inner(&target).await?;
+        // The stream profile is graph-global control authority. Native named
+        // branches retain their fork-time copy, so live branch resolution
+        // projects the current canonical-main value. Snapshot-id reads skip
+        // this projection and remain immutable historical views.
+        if matches!(&target, ReadTarget::Branch(_)) && resolved.branch.is_some() {
+            let profile = self.current_canonical_stream_profile().await?;
+            resolved
+                .snapshot
+                .project_canonical_stream_profile(profile);
+        }
         // Attach the read caches (shared Session + held-handle cache) for live
         // Branch reads so table opens reuse handles (0 IO on a warm repeat).
         // Snapshot-id reads are deliberately NOT cached: they pin a historical

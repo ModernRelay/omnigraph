@@ -83,13 +83,12 @@ impl Omnigraph {
             .await?;
         self.ensure_schema_state_valid().await?;
 
-        // Fresh main authority under the gates: the expected profile entry and
-        // the drained check both come from one coherent snapshot.
-        {
-            let mut coordinator = self.coordinator.write().await;
-            coordinator.refresh().await?;
-        }
-        let snapshot = self.coordinator.read().await.snapshot();
+        // Fresh canonical-main authority under the gates: never publish
+        // through the handle-local coordinator, which `sync_branch` may bind
+        // to a named branch. The expected profile, drained check, lineage, and
+        // publish all use this one operation-local main coordinator.
+        let mut main_coordinator = self.open_coordinator_for_branch(None).await?;
+        let snapshot = main_coordinator.snapshot();
         Self::ensure_branch_control_stream_admission_covered(
             "set_streaming_enabled",
             &admission_keys,
@@ -98,12 +97,15 @@ impl Omnigraph {
 
         let expected = snapshot.stream_profile().clone();
         if expected.streaming_enabled == enabled {
-            return Ok(StreamingProfileResult {
+            let result = StreamingProfileResult {
                 changed: false,
                 streaming_enabled: expected.streaming_enabled,
                 profile_revision: expected.profile_revision,
                 manifest_version: snapshot.version(),
-            });
+            };
+            self.install_current_main_stream_profile(main_coordinator)
+                .await;
+            return Ok(result);
         }
 
         if !enabled {
@@ -128,15 +130,8 @@ impl Omnigraph {
         };
         let profile_revision = next.profile_revision;
         let changes = [ManifestChange::SetStreamProfile { expected, next }];
-        let intent = self
-            .coordinator
-            .read()
-            .await
-            .new_lineage_intent(actor, None)?;
-        let published = self
-            .coordinator
-            .write()
-            .await
+        let intent = main_coordinator.new_lineage_intent(actor, None)?;
+        let published = main_coordinator
             .commit_changes_with_intent_and_expected(
                 &changes,
                 &HashMap::new(),
@@ -144,6 +139,8 @@ impl Omnigraph {
                 &PublishPrecondition::Any,
             )
             .await?;
+        self.install_current_main_stream_profile(main_coordinator)
+            .await;
 
         Ok(StreamingProfileResult {
             changed: true,

@@ -318,12 +318,15 @@ pub(crate) async fn observe_declared_graphs(
     for graph in &desired.graphs {
         let graph_address = graph_address(&graph.id);
         let schema_address = schema_address(&graph.id);
+        let streaming_address = streaming_address(&graph.id);
         let graph_uri = backend.graph_root(&graph.id);
         let observed_at = now_rfc3339();
 
         if !backend.graph_root_exists(&graph_uri).await {
             state.applied_revision.resources.remove(&graph_address);
             state.applied_revision.resources.remove(&schema_address);
+            state.applied_revision.resources.remove(&streaming_address);
+            state.resource_statuses.remove(&streaming_address);
             state.observations.insert(
                 graph_address.clone(),
                 graph_observation_json(GraphObservationJson {
@@ -355,6 +358,15 @@ pub(crate) async fn observe_declared_graphs(
                 "graph_missing",
                 "derived graph root is missing",
             );
+            if graph.streaming.is_some() {
+                set_resource_status(
+                    state,
+                    &streaming_address,
+                    ResourceLifecycleStatus::Drifted,
+                    "graph_missing",
+                    "derived graph root is missing",
+                );
+            }
             continue;
         }
 
@@ -380,7 +392,7 @@ pub(crate) async fn observe_declared_graphs(
                 // would disagree with the graph forever.
                 if graph.streaming.is_some() {
                     state.applied_revision.resources.insert(
-                        streaming_address(&graph.id),
+                        streaming_address.clone(),
                         StateResource {
                             digest: streaming_digest(&graph.id, observation.streaming_enabled),
                             applies_to: None,
@@ -449,6 +461,19 @@ pub(crate) async fn observe_declared_graphs(
                         "live schema digest differs from desired schema digest",
                     );
                 }
+                if let Some(desired_enabled) = graph.streaming {
+                    if desired_enabled == observation.streaming_enabled {
+                        set_resource_status_applied(state, &streaming_address);
+                    } else {
+                        set_resource_status(
+                            state,
+                            &streaming_address,
+                            ResourceLifecycleStatus::Drifted,
+                            "streaming_mismatch",
+                            "live streaming enablement differs from desired streaming enablement",
+                        );
+                    }
+                }
             }
             Err(error) => {
                 graph_error_count += 1;
@@ -483,6 +508,15 @@ pub(crate) async fn observe_declared_graphs(
                     "graph_observation_error",
                     error.as_str(),
                 );
+                if graph.streaming.is_some() {
+                    set_resource_status(
+                        state,
+                        &streaming_address,
+                        ResourceLifecycleStatus::Error,
+                        "graph_observation_error",
+                        error.as_str(),
+                    );
+                }
             }
         }
     }

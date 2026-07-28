@@ -898,7 +898,21 @@ node Task {
 #[tokio::test]
 async fn streaming_flag_flips_are_durable_idempotent_and_versioned() {
     let dir = tempfile::tempdir().unwrap();
-    let db = init_and_load(&dir).await;
+    let mut db = init_and_load(&dir).await;
+    db.branch_create("feature").await.unwrap();
+    mutate_branch(
+        &mut db,
+        "feature",
+        MUTATION_QUERIES,
+        "insert_person",
+        &mixed_params(&[("$name", "feature-person")], &[("$age", 22)]),
+    )
+    .await
+    .unwrap();
+    let historical_feature = db.resolve_snapshot("feature").await.unwrap();
+    let branch_reader = Omnigraph::open(dir.path().to_str().unwrap()).await.unwrap();
+    branch_reader.sync_branch("feature").await.unwrap();
+    db.sync_branch("feature").await.unwrap();
 
     let before = db.snapshot_of(ReadTarget::branch("main")).await.unwrap();
     let status = before.streaming_status();
@@ -921,6 +935,31 @@ async fn streaming_flag_flips_are_durable_idempotent_and_versioned() {
             .streaming_status()
             .enabled
     );
+    assert!(
+        db.snapshot_of(ReadTarget::branch("feature"))
+            .await
+            .unwrap()
+            .streaming_status()
+            .enabled,
+        "a live named-branch snapshot must project canonical-main profile authority"
+    );
+    assert!(
+        branch_reader
+            .snapshot_of(ReadTarget::branch("feature"))
+            .await
+            .unwrap()
+            .streaming_status()
+            .enabled,
+        "a warm named-branch reader must observe an external main profile flip"
+    );
+    assert!(
+        !db.snapshot_of(ReadTarget::Snapshot(historical_feature.clone()))
+            .await
+            .unwrap()
+            .streaming_status()
+            .enabled,
+        "an explicitly pinned historical snapshot must retain its captured profile"
+    );
 
     // Idempotent re-enable: no new manifest version, no revision movement.
     let noop = db
@@ -940,6 +979,22 @@ async fn streaming_flag_flips_are_durable_idempotent_and_versioned() {
     assert!(!disabled.streaming_enabled);
     assert_eq!(disabled.profile_revision, 3);
     assert_eq!(disabled.manifest_version, enabled.manifest_version + 1);
+    assert!(
+        !db.snapshot_of(ReadTarget::branch("feature"))
+            .await
+            .unwrap()
+            .streaming_status()
+            .enabled,
+        "a live named branch must also observe canonical-main disablement"
+    );
+    assert!(
+        !db.snapshot_of(ReadTarget::Snapshot(historical_feature))
+            .await
+            .unwrap()
+            .streaming_status()
+            .enabled,
+        "later profile flips must not rewrite historical snapshot semantics"
+    );
 
     // Durable across a cold reopen.
     drop(db);

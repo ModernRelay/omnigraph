@@ -471,7 +471,7 @@ pub(crate) fn demote_dependents_of_failed_graphs(
             ResourceKind::Query { graph, .. } if failed.contains_key(&graph) => {
                 Some("dependency_not_applied")
             }
-            ResourceKind::Policy(_) => {
+            ResourceKind::Policy(_) | ResourceKind::Streaming(_) => {
                 let blocked = dependencies.iter().any(|dep| {
                     dep.from == change.resource
                         && dep

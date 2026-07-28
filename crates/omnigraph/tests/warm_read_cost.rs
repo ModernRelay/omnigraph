@@ -214,7 +214,10 @@ async fn schema_source_drift_is_caught_on_read() {
 async fn warm_branch_read_does_no_manifest_scans() {
     cost_harness(async {
     let dir = tempfile::tempdir().unwrap();
-    let db = init_and_load(&dir).await;
+    let mut db = init_and_load(&dir).await;
+    // The canonical-main profile projection must stay warm and bounded at
+    // realistic history depth; a shallow fixture would hide a cold main scan.
+    commit_many(&mut db, 20).await;
     db.branch_create("feature").await.unwrap();
     // Write to the branch so its tables are branch-owned (under tree/feature).
     db.mutate(
@@ -242,8 +245,8 @@ async fn warm_branch_read_does_no_manifest_scans() {
         "warm branch read must not scan __manifest (branch-owned table opened by location)"
     );
     assert_eq!(
-        io.version_probes, 1,
-        "warm branch read performs exactly one version probe"
+        io.version_probes, 2,
+        "warm branch read probes the branch and canonical-main profile exactly once each"
     );
     })
     .await;
@@ -425,8 +428,8 @@ async fn warm_read_on_recreated_branch_observes_new_incarnation() {
         "recreated branch must re-read the manifest after the incarnation probe"
     );
     assert_eq!(
-        io.version_probes, 2,
-        "stale same-branch read probes once under the read lock and once under the write lock"
+        io.version_probes, 4,
+        "stale branch and canonical-main profiles each probe under read and write locks"
     );
 
     let new_feature_head = reader.resolve_snapshot("feature").await.unwrap();
@@ -546,8 +549,8 @@ async fn recreated_branch_owned_table_handle_uses_table_etag() {
         "recreated branch must refresh the manifest"
     );
     assert_eq!(
-        io.version_probes, 2,
-        "stale same-branch read probes once under each lock"
+        io.version_probes, 3,
+        "stale branch probes under both locks and the current canonical-main profile once"
     );
 
     let stale_old_person = reader
@@ -663,8 +666,8 @@ async fn recreated_branch_traversal_uses_graph_index_incarnation() {
         "recreated branch traversal must refresh the manifest"
     );
     assert_eq!(
-        io.version_probes, 2,
-        "stale same-branch read probes once under each lock"
+        io.version_probes, 3,
+        "stale branch probes under both locks and the current canonical-main profile once"
     );
 
     let stale_old_friends = reader

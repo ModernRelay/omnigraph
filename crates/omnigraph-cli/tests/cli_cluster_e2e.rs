@@ -354,9 +354,14 @@ fn cluster_e2e_graph_root_destruction_drifts_then_apply_recreates_empty_graph() 
             .any(|condition| condition == "graph_missing"),
         "{refresh}"
     );
-    // Graph/schema digests removed; query/policy digests preserved.
+    // Graph/schema/streaming digests removed; query/policy digests preserved.
     assert!(refresh["resource_digests"].get("graph.knowledge").is_none());
     assert!(refresh["resource_digests"].get("schema.knowledge").is_none());
+    assert!(
+        refresh["resource_digests"]
+            .get("streaming.knowledge")
+            .is_none()
+    );
     assert!(
         refresh["resource_digests"]
             .get("query.knowledge.find_person")
@@ -371,9 +376,14 @@ fn cluster_e2e_graph_root_destruction_drifts_then_apply_recreates_empty_graph() 
     // data was already lost; this is declarative convergence, RFC-004 §D1).
     assert_eq!(change_for(&plan, "graph.knowledge")["disposition"], "applied");
     assert_eq!(change_for(&plan, "schema.knowledge")["disposition"], "applied");
+    assert_eq!(
+        change_for(&plan, "streaming.knowledge")["disposition"],
+        "applied"
+    );
     // Converged-then-destroyed: query/policy are already in state at the
-    // desired digests, so they are not changes at all.
-    assert_eq!(plan["changes"].as_array().unwrap().len(), 2, "{plan}");
+    // desired digests, so they are not changes at all. Streaming is
+    // graph-global engine state and must be reapplied to the new graph.
+    assert_eq!(plan["changes"].as_array().unwrap().len(), 3, "{plan}");
 
     let recreate = cluster_json(temp.path(), "apply");
     assert_eq!(recreate["ok"], true, "{recreate}");

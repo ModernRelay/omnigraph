@@ -653,6 +653,17 @@ impl Snapshot {
         &self.stream_profile
     }
 
+    /// Project canonical-main stream-profile authority into a live named-branch
+    /// snapshot.
+    ///
+    /// Native Lance branches retain the profile row they forked with, but the
+    /// profile is graph-global control authority rather than branch content.
+    /// `Omnigraph` calls this only for live `ReadTarget::Branch` resolution;
+    /// explicitly pinned historical snapshots keep their immutable row.
+    pub(crate) fn project_canonical_stream_profile(&mut self, profile: StreamProfileEntry) {
+        self.stream_profile = profile;
+    }
+
     /// The graph's streaming posture, computed from state this snapshot
     /// already holds (zero extra I/O): whether the experimental streaming
     /// profile is enabled, and whether any stream lifecycle is non-terminal
