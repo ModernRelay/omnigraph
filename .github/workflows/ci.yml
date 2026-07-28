@@ -149,13 +149,20 @@ jobs:
     #     or the strict drift check fails the post-merge `main` run.
     if: github.event_name != 'pull_request'
     runs-on: ubuntu-latest
-    # 75, not 45: a cold rust-cache (every Cargo.lock change) costs a full
-    # workspace + failpoints-feature build on a 2-core runner, which now
-    # exceeds 45 minutes on slow runner days. A timed-out run never SAVES
-    # its cache, so an undersized budget self-perpetuates: every retry
-    # starts cold and dies the same way (observed 2026-06-11, four runs).
-    # Warm-cache runs stay ~15 minutes; this is headroom, not a target.
-    timeout-minutes: 75
+    # 120, not 75: same self-perpetuation argument as the 45 -> 75 raise on
+    # 2026-06-11, re-triggered by the genuine-predecessor fence build. A cold
+    # run now pays THREE serial full builds on a 2-core runner -- the
+    # predecessor CLI, the workspace suite, and the failpoints-feature suite --
+    # because the fence binary is built from a different source tree and cannot
+    # share the current tree's artifacts. Measured 2026-07-28 across two
+    # dispatched runs: predecessor build 26m, workspace tests 25m, failpoints
+    # 24m and still running = 75m exactly, killed mid-failpoints both times.
+    #
+    # A timed-out run never SAVES its cache, so an undersized budget is
+    # self-perpetuating: every retry starts cold and dies at the same step.
+    # That is the loop this raise breaks -- once one run completes and saves
+    # the cache, warm runs return to ~15 minutes. Headroom, not a target.
+    timeout-minutes: 120
     permissions:
       contents: write
     env:
