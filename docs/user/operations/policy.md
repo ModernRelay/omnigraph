@@ -24,6 +24,10 @@ Server-scoped action (v0.6.0+; binds to `Omnigraph::Server::"root"`):
 
 Server-scoped actions cannot use `branch_scope` or `target_branch_scope` — they operate on the registry, not on a graph's branches. A rule cannot mix server-scoped and per-graph actions; split into separate rules. (Runtime `graph_create` / `graph_delete` over HTTP are reserved but not shipped; operators add/remove graphs by editing the cluster's `cluster.yaml`, running `omnigraph cluster apply`, and restarting the server.)
 
+Policy YAML and `omnigraph policy explain --action` use `stream_ingest` and
+`stream_manage` as the canonical spellings. The CLI also accepts
+`stream-ingest` and `stream-manage` as aliases.
+
 ## Scope kinds
 
 - `branch_scope` — applied to source branch (`read`, `export`, `change`)

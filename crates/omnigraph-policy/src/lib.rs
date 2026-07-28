@@ -81,6 +81,7 @@ pub enum PolicyAction {
     /// durability without graph visibility, so an operator can grant
     /// high-rate ingestion without granting direct-lane writes (or the
     /// reverse). See RFC-026 §4.6.
+    #[value(name = "stream_ingest", alias = "stream-ingest")]
     StreamIngest,
     /// RFC-026: gates streaming *lifecycle management* — enable/disable,
     /// fold, quiesce, resume, and abort-drain. Per-graph and graph-scoped for
@@ -91,6 +92,7 @@ pub enum PolicyAction {
     /// acknowledged data, or reopen it at a new epoch. Read-only stream
     /// status is authorized like other graph operational metadata, not by
     /// this action.
+    #[value(name = "stream_manage", alias = "stream-manage")]
     StreamManage,
 }
 
@@ -1478,8 +1480,9 @@ rules:
         // Both are per-graph resources, not server-scoped.
         for action in [PolicyAction::StreamIngest, PolicyAction::StreamManage] {
             assert_eq!(action.resource_kind(), PolicyResourceKind::Graph);
-            // Wire name round-trips, so `omnigraph policy explain --action`
-            // and the YAML surface agree.
+            // The stable policy/YAML wire name round-trips through FromStr.
+            // The CLI owns a separate parser test because it derives its
+            // accepted values through clap's ValueEnum implementation.
             assert_eq!(
                 action.as_str().parse::<PolicyAction>().unwrap(),
                 action,

@@ -4,10 +4,11 @@
 RFC-027 research-blocked; RFC-026 Phase A implemented, private B1's legal
 near-cap closure repaired and green, private B2a unbounded retain-all gate
 implemented, the private common-B2 compare-and-chain/token-fold core
-implemented, B2b optional, and public streaming plus lifecycle
-management/correction/status inactive
+implemented, B2b optional, activation P1 plus the Cedar vocabulary and embedded
+manifest-only status implemented, and public row streaming, lifecycle
+mutation/correction, exclusive-cut status, and transport surfaces inactive
 **Date:** 2026-07-11
-**Last updated:** 2026-07-22
+**Last updated:** 2026-07-28
 **Audience:** RFC authors, engine/storage maintainers, and release reviewers
 **Reviewed against:** OmniGraph 0.8.1; Lance 9.0.0-beta.15 at
 `f24e42c11a742581365e1cbe17c906ea2dac1bc6`; full Lance transaction,

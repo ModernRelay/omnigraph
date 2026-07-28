@@ -643,6 +643,21 @@ impl Snapshot {
         self.stream_lifecycles.iter()
     }
 
+    /// Test-only seam for proving that public status resolves the live table
+    /// registration by immutable identity instead of trusting this explicitly
+    /// diagnostic alias.
+    #[cfg(all(test, feature = "failpoints"))]
+    pub(crate) fn set_stream_diagnostic_table_key_for_test(
+        &mut self,
+        identity: TableIdentity,
+        table_key: &str,
+    ) {
+        self.stream_lifecycles
+            .get_mut(&identity)
+            .expect("test snapshot must contain the requested stream lifecycle")
+            .diagnostic_table_key = table_key.to_string();
+    }
+
     /// Exact durable pointer to the graph-global RFC-026 token participant.
     pub(crate) fn stream_token_authority(&self) -> &StreamTokenAuthorityEntry {
         &self.stream_token_authority

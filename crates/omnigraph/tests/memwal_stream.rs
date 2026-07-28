@@ -2850,8 +2850,9 @@ async fn s3_provider_shard_manifest_failure_retains_unreferenced_generation() {
 }
 
 /// RFC-026 §4.6: with a lane actually enrolled, status projects the durable
-/// per-lane authority — including the `lifecycle_revision` that every mutating
-/// management verb passes back as its expected-revision compare token.
+/// logical stream incarnation plus the `lifecycle_revision` that every
+/// mutating management verb passes back as its expected-revision compare
+/// token.
 #[tokio::test]
 #[serial]
 async fn stream_status_reports_the_enrolled_lane_and_its_compare_token() {
@@ -2867,7 +2868,19 @@ async fn stream_status_reports_the_enrolled_lane_and_its_compare_token() {
         lane.lifecycle_revision, 1,
         "enrollment publishes the initial lifecycle revision"
     );
+    let expected_stream_incarnation = db
+        .failpoint_stream_incarnation_for_test(TABLE)
+        .await
+        .unwrap();
+    assert_eq!(
+        lane.stream_incarnation_id, expected_stream_incarnation,
+        "status returns the exact logical incarnation used to fence every stream request"
+    );
     assert!(!lane.enrollment_id.is_empty());
+    assert_ne!(
+        lane.stream_incarnation_id, lane.enrollment_id,
+        "logical stream incarnation and physical enrollment are distinct identities"
+    );
     assert_eq!(
         lane.epoch_floor_by_shard.len(),
         1,

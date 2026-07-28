@@ -428,9 +428,9 @@ async fn branch_merge_as_allows_when_policy_permits_actor() {
         .expect("act-allowed should be able to BranchMerge");
 }
 
-/// RFC-026 §4.7 P1: the streaming-enablement flip is Cedar-gated with the
-/// per-graph `admin` action — an actor with no permit rule is denied, and a
-/// missing actor with a policy installed fails hard rather than silently
+/// RFC-026 §4.7 P1/2a: the streaming-enablement flip is Cedar-gated with the
+/// per-graph `stream_manage` action — an actor with no permit rule is denied,
+/// and a missing actor with a policy installed fails hard rather than silently
 /// skipping enforcement.
 #[tokio::test]
 async fn set_streaming_enabled_as_denies_when_policy_rejects_actor() {
