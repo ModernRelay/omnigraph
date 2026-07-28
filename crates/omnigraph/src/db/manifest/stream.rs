@@ -418,6 +418,17 @@ pub(crate) enum LastFoldOutcome {
     StrictBlocked,
 }
 
+impl LastFoldOutcome {
+    /// The exact durable wire name, so a status projection reports the stored
+    /// value instead of minting a second spelling of it.
+    pub(crate) const fn as_str(self) -> &'static str {
+        match self {
+            Self::Published => "PUBLISHED",
+            Self::StrictBlocked => "STRICT_BLOCKED",
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub(crate) struct LastFoldSummary {

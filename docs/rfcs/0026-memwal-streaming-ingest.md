@@ -60,6 +60,20 @@ dead-letter slot), the Cedar-gated single-CAS `set_streaming_enabled_as`
 flip, cluster-apply-only propagation with refresh convergence and typed
 pending-until-drained refusal, and the genuine v9↔v10 refusal/rebuild fence
 in CI; P2–P6 remain unimplemented and no ingest surface is active
+**Streaming authorization split and read-only status implemented:**
+2026-07-28 — the `stream_ingest` / `stream_manage` Cedar actions of §4.6 are
+registered (both graph-scoped; the main-only profile makes a branch dimension
+meaningless, so both scope qualifiers are rejected at validation), the P1
+enablement flip migrated from the reserved `Admin` action onto
+`stream_manage`, and `Omnigraph::stream_status` projects the durable
+enablement and per-lane authority read-only. Status deliberately ships before
+the management verbs because §4.6 makes it the compare-token source: it
+exposes the `lifecycle_revision` those verbs pass back as their expected
+revision, so they can be written as compare-and-set from the start. This is
+the §4.7 *minimal* status — the authoritative manifest row only; §4.3's
+exclusive-cut physical observation (observed epoch, pending generation
+rows/bytes, `StatusChanged`/`StatusBusy`) arrives with the verbs that need
+it, as an additive observed-physical section
 **Author track:** Maintainer design series
 **Depends on:** [RFC-022](0022-unified-write-path.md)'s unified write and
 generic recovery-sidecar protocol, plus

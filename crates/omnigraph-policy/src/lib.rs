@@ -71,6 +71,27 @@ pub enum PolicyAction {
     /// is double-gated: `invoke_query` to reach the tool, plus `change` for
     /// the write itself.
     InvokeQuery,
+    /// RFC-026: gates admitting rows into a table's streaming lane. Per-graph
+    /// and **graph-scoped**: the experimental streaming profile is main-only,
+    /// so a branch dimension would describe a topology the lane refuses. A
+    /// rule that sets `branch_scope` or `target_branch_scope` on it is
+    /// rejected by `validate()`.
+    ///
+    /// Deliberately separate from `Change`: a stream append acknowledges
+    /// durability without graph visibility, so an operator can grant
+    /// high-rate ingestion without granting direct-lane writes (or the
+    /// reverse). See RFC-026 §4.6.
+    StreamIngest,
+    /// RFC-026: gates streaming *lifecycle management* — enable/disable,
+    /// fold, quiesce, resume, and abort-drain. Per-graph and graph-scoped for
+    /// the same main-only reason as `StreamIngest`.
+    ///
+    /// Split from `StreamIngest` because the blast radii differ in kind:
+    /// ingestion adds rows, while management can seal a lane, drain
+    /// acknowledged data, or reopen it at a new epoch. Read-only stream
+    /// status is authorized like other graph operational metadata, not by
+    /// this action.
+    StreamManage,
 }
 
 impl PolicyAction {
@@ -86,6 +107,8 @@ impl PolicyAction {
             Self::Admin => "admin",
             Self::GraphList => "graph_list",
             Self::InvokeQuery => "invoke_query",
+            Self::StreamIngest => "stream_ingest",
+            Self::StreamManage => "stream_manage",
         }
     }
 
@@ -116,7 +139,9 @@ impl PolicyAction {
             | Self::BranchDelete
             | Self::BranchMerge
             | Self::Admin
-            | Self::InvokeQuery => PolicyResourceKind::Graph,
+            | Self::InvokeQuery
+            | Self::StreamIngest
+            | Self::StreamManage => PolicyResourceKind::Graph,
         }
     }
 }
@@ -173,6 +198,8 @@ impl FromStr for PolicyAction {
             "admin" => Ok(Self::Admin),
             "graph_list" => Ok(Self::GraphList),
             "invoke_query" => Ok(Self::InvokeQuery),
+            "stream_ingest" => Ok(Self::StreamIngest),
+            "stream_manage" => Ok(Self::StreamManage),
             other => bail!("unknown policy action '{other}'"),
         }
     }
@@ -845,6 +872,8 @@ namespace Omnigraph {
     action "branch_merge" appliesTo { principal: Actor, resource: Graph, context: RequestContext };
     action "admin" appliesTo { principal: Actor, resource: Graph, context: RequestContext };
     action "invoke_query" appliesTo { principal: Actor, resource: Graph, context: RequestContext };
+    action "stream_ingest" appliesTo { principal: Actor, resource: Graph, context: RequestContext };
+    action "stream_manage" appliesTo { principal: Actor, resource: Graph, context: RequestContext };
 
     action "graph_list" appliesTo { principal: Actor, resource: Server, context: RequestContext };
 }
@@ -1060,7 +1089,7 @@ rules:
     }
     use super::{
         PolicyAction, PolicyCompiler, PolicyConfig, PolicyEngine, PolicyExpectation, PolicyRequest,
-        PolicyTestCase, PolicyTestConfig,
+        PolicyResourceKind, PolicyTestCase, PolicyTestConfig,
     };
 
     #[test]
@@ -1411,6 +1440,52 @@ rules:
             err.contains("branch_scope") && err.contains("invoke_query"),
             "branch_scope on invoke_query must be rejected: {err}"
         );
+    }
+
+    #[test]
+    fn stream_actions_are_graph_scoped_and_reject_branch_qualifiers() {
+        // RFC-026's experimental streaming profile is main-only, so a branch
+        // dimension on either stream action would describe a topology the
+        // lane refuses. Both qualifiers are rejected at validate().
+        for (action, qualifier) in [
+            ("stream_ingest", "branch_scope: any"),
+            ("stream_ingest", "target_branch_scope: any"),
+            ("stream_manage", "branch_scope: any"),
+            ("stream_manage", "target_branch_scope: any"),
+        ] {
+            let policy: PolicyConfig = serde_yaml::from_str(&format!(
+                r#"
+version: 1
+groups:
+  team: [act-alice]
+rules:
+  - id: team-stream
+    allow:
+      actors: {{ group: team }}
+      actions: [{action}]
+      {qualifier}
+"#
+            ))
+            .unwrap();
+            let err = policy.validate().unwrap_err().to_string();
+            let scope = qualifier.split(':').next().unwrap();
+            assert!(
+                err.contains(scope) && err.contains(action),
+                "{scope} on {action} must be rejected: {err}"
+            );
+        }
+
+        // Both are per-graph resources, not server-scoped.
+        for action in [PolicyAction::StreamIngest, PolicyAction::StreamManage] {
+            assert_eq!(action.resource_kind(), PolicyResourceKind::Graph);
+            // Wire name round-trips, so `omnigraph policy explain --action`
+            // and the YAML surface agree.
+            assert_eq!(
+                action.as_str().parse::<PolicyAction>().unwrap(),
+                action,
+                "wire name must round-trip through FromStr"
+            );
+        }
     }
 
     #[test]

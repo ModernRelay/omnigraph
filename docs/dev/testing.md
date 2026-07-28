@@ -405,8 +405,21 @@ cargo test -p omnigraph-engine --test lifecycle public_snapshot_wildcard_omits_p
 cargo test -p omnigraph-engine --test forbidden_apis
 ```
 
-B1/B2a and the private B2-common slice do not add parser/server/CLI tests because
-they have no public surface. The
+RFC-026 §4.7 P1 and 2a own the first public streaming surfaces, so their
+evidence extends the existing owners rather than opening a new silo:
+`policy_engine_chassis.rs` proves the `stream_manage` gate in both directions
+(including that an `admin`-only policy no longer authorizes the enablement
+flip after the 2a migration); `omnigraph-policy`'s in-source suite proves both
+stream actions are graph-scoped and reject `branch_scope` /
+`target_branch_scope`; `lifecycle.rs` owns read-only `stream_status` against a
+graph with no lanes; and `memwal_stream.rs` owns it against an enrolled lane,
+pinning the `lifecycle_revision` compare token that fold/quiesce/resume pass
+back as their expected revision. `forbidden_apis.rs` classifies
+`stream_status` read-only — the structural claim that status cannot move a
+lifecycle.
+
+The remaining B1/B2a and private B2-common work adds no parser/server/CLI
+tests because it has no public surface. The
 common product contract inventory specifies the missing contracts without
 activating them. Any public implementation
 must extend the existing compiler, server/OpenAPI, CLI parity, Cedar, shutdown,

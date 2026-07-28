@@ -1007,3 +1007,35 @@ async fn streaming_flag_flips_are_durable_idempotent_and_versioned() {
     assert!(!status.enabled);
     assert!(!status.undrained);
 }
+
+/// RFC-026 §4.6/§4.7: read-only stream status projects the durable authority
+/// and exposes the compare tokens that future management verbs (fold,
+/// quiesce, resume) pass back as their expected revisions.
+#[tokio::test]
+async fn stream_status_projects_durable_authority_and_compare_tokens() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = init_and_load(&dir).await;
+
+    // A graph with streaming off and no enrollment reports exactly that —
+    // not an error, and not an empty struct that hides the flag.
+    let status = db.stream_status().await.unwrap();
+    assert!(!status.streaming_enabled);
+    assert_eq!(status.profile_revision, 1, "genesis profile revision");
+    assert!(status.tables.is_empty(), "no lane exists before enrollment");
+    assert!(!status.undrained());
+
+    // The enablement flag is visible immediately, with its own revision
+    // (distinct from any per-lane lifecycle revision).
+    db.set_streaming_enabled_as(true, None).await.unwrap();
+    let status = db.stream_status().await.unwrap();
+    assert!(status.streaming_enabled);
+    assert_eq!(status.profile_revision, 2);
+    assert!(status.tables.is_empty());
+
+    // Status is read-only: observing it neither moves the profile revision
+    // nor mints a graph commit.
+    let commits_before = db.list_commits(None).await.unwrap().len();
+    let repeat = db.stream_status().await.unwrap();
+    assert_eq!(repeat, status, "status is a pure projection");
+    assert_eq!(db.list_commits(None).await.unwrap().len(), commits_before);
+}
