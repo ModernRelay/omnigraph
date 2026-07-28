@@ -377,17 +377,17 @@ jobs:
     # independent workspace job. Starting both cold compile graphs together
     # removes that dependency from the workflow's critical path.
     #
-    # Two parallel feature graphs: the default graph shares one
-    # Lance/DataFusion compile across engine/server/cluster/CLI tests, while the
-    # failpoints graph stays isolated. The previous five-shard layout repeated
-    # the same ~26-29m cold substrate compile five times and maintained five
-    # target caches, pressuring GitHub's repository cache cap without reducing
-    # wall-clock below the slowest compile. `fail-fast: false` lets both graphs
-    # report independently.
+    # Two parallel feature graphs: the default graph compiles every selected
+    # engine/server/cluster/CLI test binary in one Cargo invocation, while the
+    # failpoints graph stays isolated. Presenting the full default DAG together
+    # avoids discovering it as a serial compile/link waterfall. The previous
+    # five-shard layout repeated the same ~26-29m cold substrate compile five
+    # times and maintained five target caches, pressuring GitHub's repository
+    # cache cap. `fail-fast: false` lets both graphs report independently.
     needs: classify_changes
     if: github.event_name != 'pull_request' && needs.classify_changes.outputs.run_rustfs_ci == 'true'
     runs-on: ubuntu-latest
-    timeout-minutes: 50
+    timeout-minutes: 45
     strategy:
       fail-fast: false
       matrix:
@@ -429,6 +429,24 @@ jobs:
           key: ${{ matrix.shard }}
           workspaces: |
             . -> target
+
+      # Compile every default RustFS integration binary in one Cargo graph.
+      # Separate invocations serialized leaf compilation and large test-binary
+      # links (~22m engine + ~16m server on the cold 2026-07-28 run).
+      - name: Compile RustFS default test graph
+        if: matrix.shard == 'default'
+        run: |
+          cargo test --locked --no-run \
+            -p omnigraph-engine \
+            -p omnigraph-server \
+            -p omnigraph-cluster \
+            -p omnigraph-cli \
+            --test s3_storage \
+            --test lance_surface_guards \
+            --test memwal_enrollment_gate \
+            --test s3 \
+            --test s3_cluster \
+            --test system_local
 
       - name: Start RustFS
         # Pinned to 1.0.0-beta.8 (2026-06-10). beta.4+ refuses "default"
