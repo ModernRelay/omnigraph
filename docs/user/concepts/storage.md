@@ -47,7 +47,7 @@ The on-disk shape of `__manifest` is reconciled with the binary via a single ver
 - The stamp is read with no object-store writes, so the check is safe under a read-only open. Operators can see a graph's stamp with `omnigraph snapshot` and the binary's served version with `omnigraph version` (the `internal-schema` line).
 
 The stamp values below are historical; this binary serves only the current one
-(`v9`). An earlier-stamped graph is rebuilt via export/import, not migrated in
+(`v10`). An earlier-stamped graph is rebuilt via export/import, not migrated in
 place.
 
 | Stamp | Shape |
@@ -60,7 +60,8 @@ place.
 | v6 | Preserves v5 identity and activates RFC-023: every graph node/edge dataset has exact non-null physical `id` as Lance's unenforced PK, and every production strict insert/upsert uses the exact-`id` filter-bearing adapter. |
 | v7 | Preserves v5/v6 identity and keyed-write contracts, and adds RFC-026 identity-keyed `stream_state` authority: physical enrollment binding, mutable current-HEAD witness, lifecycle, and per-shard epoch floor. Phase A can recover one exact empty private enrollment; no production row-streaming API is active. |
 | v8 | Preserves the v5/v6/v7 contracts and activates RFC-026 stream-config v2 plus recovery-v11 for the private B1 row/fold core: one no-roll generation, watcher success plus a same-writer post-durability epoch check before clean acknowledgement, and one exact fold whose manifest publish advances the table pointer, lifecycle witness, and graph lineage together. The legal near-cap closure cell is green after logical-slice accounting and dense scanner-batch copies. |
-| v9 | Preserves the bounded B1 worker mechanics and activates RFC-026 stream-config v3, lifecycle state v2, the grammar-impossible trusted-attribution field, manifest-selected `_stream_tokens.lance` authority, compare-and-chain tokens, and recovery-v12's exact base-plus-token fold. The selected B2a profile retains all canonical MemWAL objects and imposes no retained-byte/object/file/history quota. Public enrollment, lifecycle management, correction/status, SDK/HTTP/CLI/OpenAPI, generation GC, and fresh reads remain inactive. **The only version this binary serves.** |
+| v9 | Preserves the bounded B1 worker mechanics and activates RFC-026 stream-config v3, lifecycle state v2, the grammar-impossible trusted-attribution field, manifest-selected `_stream_tokens.lance` authority, compare-and-chain tokens, and recovery-v12's exact base-plus-token fold. The selected B2a profile retains all canonical MemWAL objects and imposes no retained-byte/object/file/history quota. |
+| v10 | Preserves v9 and adds RFC-026 §4.7's required graph-global `stream_profile` enablement singleton plus the reserved fold-attribution dead-letter slot. The graph-scoped `stream_ingest` / `stream_manage` Cedar vocabulary is registered, `stream_manage` gates enablement, and embedded manifest-only status is read-only. Public row admission, explicit enrollment, lifecycle mutation/correction, exclusive-cut physical status, CLI/HTTP/OpenAPI streaming surfaces, generation GC, and fresh reads remain inactive. **The only version this binary serves.** |
 
 ## On-disk layout
 

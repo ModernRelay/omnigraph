@@ -404,6 +404,7 @@ mod tests {
     use clap::Parser;
 
     use super::*;
+    use crate::cli::PolicyCommand;
 
     #[test]
     fn scope_flag_matrix_matches_capabilities() {
@@ -472,6 +473,45 @@ mod tests {
             cap(&["omnigraph", "policy", "validate"]),
             Capability::Control
         );
+    }
+
+    #[test]
+    fn policy_explain_accepts_stream_action_wire_names_and_kebab_aliases() {
+        let parse_action = |spelling: &str| {
+            let command = Cli::try_parse_from([
+                "omnigraph",
+                "policy",
+                "explain",
+                "--actor",
+                "act-operator",
+                "--action",
+                spelling,
+            ])
+            .unwrap()
+            .command;
+            match command {
+                Command::Policy {
+                    command: PolicyCommand::Explain { action, .. },
+                } => action,
+                other => panic!("expected policy explain command, got {other:?}"),
+            }
+        };
+
+        for (canonical, alias, expected) in [
+            (
+                "stream_ingest",
+                "stream-ingest",
+                omnigraph_policy::PolicyAction::StreamIngest,
+            ),
+            (
+                "stream_manage",
+                "stream-manage",
+                omnigraph_policy::PolicyAction::StreamManage,
+            ),
+        ] {
+            assert_eq!(parse_action(canonical), expected);
+            assert_eq!(parse_action(alias), expected);
+        }
     }
 
     #[test]

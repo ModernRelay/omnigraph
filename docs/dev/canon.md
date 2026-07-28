@@ -516,8 +516,9 @@ exact one-generation fold as a guarded HEAD/witness transition. Private B2a
 added no format or transition: it established the unbounded retain-all posture,
 with no canonical durable MemWAL deletion.
 
-Current schema v9/config-v3/state-v2/recovery-v12 implements the private
-compare-and-chain row/fold subset. Canonical payload and token digests plus
+Schema v9/config-v3/state-v2/recovery-v12 implements the private
+compare-and-chain row/fold subset, and current schema v10 adds graph-global
+enablement. Canonical payload and token digests plus
 trusted hidden row metadata bind each admission. A pre-wait authority capture
 is provisional; the adapter recaptures lifecycle/binding/HEAD/token authority
 after shared admission and same-key queue ownership. The manifest-selected
@@ -526,12 +527,14 @@ transactions owned by one v12 intent, and their sole manifest CAS also stores
 the fold-attribution commitment. V11 is historical only. Managed reclamation
 remains a deferred Lance-owned optimization, not an activation gate.
 
-The public/control portion remains inactive: explicit production enrollment,
-durable `OPEN -> DRAINING -> SEALED -> OPEN` operations, bounded
-`REPLACE`/`WITHDRAW` correction, authoritative status, authorization, and every
-public row surface. Phase D owns future automatic operation-scoped drain and
-atomic witness advancement/rebind. Resume must recheck the bounded narrow
-main-only topology; an incompatible branch operation stays `SEALED`.
+The graph-scoped Cedar vocabulary, `stream_manage`-gated enablement, and
+embedded manifest-only read-only status are active. Explicit production
+enrollment, durable `OPEN -> DRAINING -> SEALED -> OPEN` operations, bounded
+`REPLACE`/`WITHDRAW` correction, exclusive-cut physical status, every public
+row surface, and CLI/HTTP/OpenAPI parity remain inactive. Phase D owns future
+automatic operation-scoped drain and atomic witness advancement/rebind. Resume
+must recheck the bounded narrow main-only topology; an incompatible branch
+operation stays `SEALED`.
 
 ---
 
@@ -962,7 +965,9 @@ on the proposer.)
   initializer for recoverable empty enrollment; private Phase B1 now consumes
   its bounded data/ack/replay mechanics rather than building one, and private
   B2 adds durable compare-and-chain/token-fold authority over those primitives.
-  Public B2 remains inactive. The selected profile forbids OmniGraph from deleting raw
+  Public row admission and lifecycle mutation remain inactive; the Cedar
+  vocabulary, enablement flip, and embedded manifest-only status are active.
+  The selected profile forbids OmniGraph from deleting raw
   `_mem_wal` paths and accepts monotonic storage plus loud provider exhaustion;
   a future managed-reclamation profile would require the missing operation to
   live in Lance — **(draft RFC-026)**.
@@ -1054,7 +1059,7 @@ receipt and complete physical-output envelope remain documented limits on any
 future bounded-storage claim, not blockers for this profile. B2a itself
 activated no schema or product surface.
 
-**Implemented private B2 token/fold core; public controls remain inactive:**
+**Implemented private B2 token/fold core; row and lifecycle controls remain inactive:**
 Internal schema v9/config-v3/state-v2 adds canonical payload and token digests,
 trusted hidden row metadata, exact compare-and-chain/idempotency classification,
 same-generation token overlays, and the manifest-selected graph-global
@@ -1066,10 +1071,14 @@ fold attribution. Recovery-v11 is historical only. The genuine v8↔v9 gate
 proves two-way refusal and strict rebuild fidelity while hidden trusted metadata
 remains non-exported.
 
-Explicit production enrollment, persistent lifecycle/correction with monotonic
-revisions and bounded terminal receipts, authoritative status, authorization,
-and product parity remain inactive. The retain-all profile adds no storage
-admission watermark. Managed reclamation remains deferred Lance-owned work.
+The graph-scoped `stream_ingest` / `stream_manage` Cedar vocabulary is
+registered, the v10 enablement writer is gated by `stream_manage`, and embedded
+`Omnigraph::stream_status` projects durable manifest authority read-only.
+Explicit production enrollment, persistent lifecycle mutation/correction with
+monotonic revisions and bounded terminal receipts, exclusive-cut physical
+status, public row admission, and CLI/HTTP/OpenAPI parity remain inactive. The
+retain-all profile adds no storage admission watermark. Managed reclamation
+remains deferred Lance-owned work.
 Two checked-in RC.1
 guards prove generic cleanup does not reclaim
 `_mem_wal` and deleting the successor's empty WAL fence sentinel can let a
@@ -1088,8 +1097,10 @@ shape)**;
 public MemWAL row admission and later lifecycle/read phases **(RFC-026, draft;
 private v9 compare-and-chain/token-fold core and unbounded retain-all profile
 implemented; managed reclamation is optional later work; public strict
-activation still requires explicit enrollment, correction/status, lifecycle,
-authorization, and product-parity evidence)**;
+activation still requires explicit enrollment, lifecycle mutation/correction,
+exclusive-cut physical status, row admission, and transport-parity evidence;
+the Cedar vocabulary, `stream_manage`-gated enablement, and embedded
+manifest-only status are active)**;
 lineage-based merge deltas
 **(RFC-027, research-blocked)**; background reconciler; planner
 statistics/cost model; policy pushdown; ingest-time embeddings; per-query
@@ -1107,7 +1118,7 @@ resource budgets.
 | **R4: Manifest authority access grows with commit count.** Current-state resolution folds history; a selective index does not by itself bound the complete physical read. | Medium | `optimize` compacts internal tables (keeps periodically-optimized shipped paths flat where separately cost-gated). RFC-024 Gate A rejected durable heads because representative RustFS latest-manifest reads/bytes grow despite flat exact-BTREE row/range work. RFC-025 Gate 0 independently rejected checkpoint-registry activation: at local 10→1,000 on RC.1, uncompacted reconciled work and the eight-fragment tail stay flat, but compacted list/cleanup scan bytes grow 17,012→38,000 cold and 12,336→15,064 warm; exact-show bytes and operation counts also grow. Both RFCs are research-blocked; v8 retains the journal fold and internal-table *cleanup* remains deferred behind the resurrection watermark. |
 | **R5: Schema identity corruption or alias/identity drift.** Internal schema v5 introduced stable IDs/incarnation as durable authority; v6, v7, and v8 preserve them. | Medium | Open/init validate the SchemaIR domain and exact bidirectional IR↔manifest identity/path/alias contract; every active recovery envelope carries the identity pair; zero, duplicate, missing, or mismatched identity fails closed. |
 | **R6: Merge cost at divergence** — full-width classification and history-growing manifest folds. | Medium | Coherent coordinator scans plus retained probe handles reduced the pre-slice measured depth-5/depth-80 baseline from 59/651 manifest reads to 40/410 and cap the common fast-forward route at three internal opens and three scans, but the uncompacted-history slope remains. `merge_cost.rs` keeps both facts visible; O(delta) merge is blocked on a real deletion-delta source **(RFC-027)**; fragment adoption is **(draft RFC-0001)**. |
-| **R7: No public streaming row path** — production writes are still capped by the `graph_head` CAS rate; high-frequency small writes remain wasteful outside the private evidence seam. | Medium | MemWAL is the strategic substrate. Phase A makes its opaque initializer + separate shard effect recoverable for one main-only/unsharded/single-live-writer-process empty enrollment. The bounded worker provides watcher-plus-post-fence acknowledgement and conservative replay; its legal high-entropy near-cap shape closes under logical dense-slice accounting, with physical RSS guarded only as a remeasurement tripwire. Private B2a selects unbounded retain-all with no canonical MemWAL deletion or storage quota. Current v9 adds canonical compare-and-chain tokens, trusted attribution, post-admission authority recapture, graph-global token authority, and recovery-v12 exact base+token publication with durable fold attribution; genuine v8↔v9 refusal/rebuild is green. Public activation remains closed on explicit enrollment, lifecycle/correction/status, authorization, and product parity. Managed reclamation and a whole-root history budget are optional later work; a public exact enrollment receipt plus reversible admission seal gates broader overlapping-process topology. |
+| **R7: No public streaming row path** — production writes are still capped by the `graph_head` CAS rate; high-frequency small writes remain wasteful outside the private evidence seam. | Medium | MemWAL is the strategic substrate. Phase A makes its opaque initializer + separate shard effect recoverable for one main-only/unsharded/single-live-writer-process empty enrollment. The bounded worker provides watcher-plus-post-fence acknowledgement and conservative replay; its legal high-entropy near-cap shape closes under logical dense-slice accounting, with physical RSS guarded only as a remeasurement tripwire. Private B2a selects unbounded retain-all with no canonical MemWAL deletion or storage quota. Schema v9 adds canonical compare-and-chain tokens, trusted attribution, post-admission authority recapture, graph-global token authority, and recovery-v12 exact base+token publication with durable fold attribution; genuine v8↔v9 refusal/rebuild is green. V10 adds graph enablement, now gated by the registered `stream_manage` action, and embedded manifest-only status is read-only. Public row activation remains closed on explicit enrollment, lifecycle mutation/correction, exclusive-cut physical status, and CLI/HTTP/OpenAPI parity. Managed reclamation and a whole-root history budget are optional later work; a public exact enrollment receipt plus reversible admission seal gates broader overlapping-process topology. |
 | **R8: Some operations lack enforced memory/time budgets.** | Medium | Known gap, narrowed and accepted for RFC-023. Its direct-substrate instrument rejected the first whole-delta fenced adopt (~447 MB peak at 100K × 256 versus ~74 MB Append), and the first corrected production 10K series failed at 30.0× / 108,625,920 bytes overhead; both negative results remain evidence. Mutation/Load now refuses a keyed table above 8,192 rows / 32 MiB before arm, while BranchMerge uses a recovery-enrolled chain with the same per-chunk bounds and a 1,024-transaction ceiling. The inductive certificate route removes the general diff, temporary delta, target preflight, and target join without weakening that chain. Final five-pair production medians passed at 31/8 ms (3.875×) for 10K and 136/35 ms (~3.886×) for 100K; maximum signed paired RSS overheads were 24,297,472 and 32,604,160 bytes. Inclusive row/transaction ceilings, byte refusal (including materialized blobs), operation-wide validation retention, exact source/target incarnation revalidation, second-generation certificate composition, and both between-chunk recovery directions are pinned; other operations still need explicit bounds. |
 | **R9: Local-FS conditional-write emulation** (`write_text_if_match` check-then-act gap). | Low | All current callers sit behind the cluster lock protocol; S3 uses true conditional puts; close before admitting any lock-free caller. |
 | **R10: Doc/spec drift as the system grows** — this document included. | Low | Maintenance contract (same-PR doc updates, `check-agents-md.sh` link CI, "don't lie" stale markers); this canon defers to area docs by construction. |
@@ -1141,9 +1152,11 @@ Live design questions, each owned by an RFC or a known gap — not a wishlist:
    Phase B1 assigned the data-bearing config-v2/recovery-v11 core to v8. The
    current private B2 row/fold slice assigns config-v3/state-v2, graph-global
    token authority, and recovery-v12 to v9; the genuine v8↔v9 gate is green.
-   Lifecycle management, correction/status, and public surfaces can build on
-   that format only when their own gates pass; another durable shape change
-   would require a later strand.
+   The registered Cedar vocabulary and embedded manifest-only status build on
+   that format without changing it; lifecycle mutation/correction,
+   exclusive-cut physical status, row admission, and transport surfaces still
+   require their own gates. Another durable shape change would require a later
+   strand.
    RFC-024's heads, RFC-025's retention, and later RFC-026 phases remain
    independently reviewable. Any later format activation requires its own
    export/init/load rebuild unless capabilities deliberately co-release after
@@ -1176,7 +1189,7 @@ The plan of record is the RFC-022…028 family (all under
 | [0023 — Key-conflict fencing](../rfcs/0023-key-conflict-fencing.md) | Substrate-native keyed-write fencing via Lance's unenforced-PK filter; fleet/format activation barrier | **Implemented** (2026-07-15) |
 | [0024 — Durable table heads](../rfcs/0024-durable-table-heads.md) | Materialized head-row research; the first exact-BTREE candidate bounded scan work but failed the full latest-manifest/object-byte cost gate | **Research blocked** |
 | [0025 — Checkpoint-pinned retention](../rfcs/0025-checkpoint-retention.md) | Named checkpoints as authoritative retention roots, materialized as Lance tags; current in-manifest registry lookup rejected by Gate 0 | **Research-blocked** |
-| [0026 — MemWAL streaming ingest](../rfcs/0026-memwal-streaming-ingest.md) | Durability-first streaming writes: bounded watcher-plus-post-fence acknowledgement, canonical compare-and-chain tokens and trusted hidden attribution, then recovery-v12 exact base+token graph-atomic fold; legal near-cap closure and genuine v8↔v9 rebuild are green; unbounded retain-all forbids OmniGraph MemWAL deletion; lifecycle/correction/status and product contracts remain inactive | **Draft; private B2 token/fold core and retain-all profile implemented; public inactive** |
+| [0026 — MemWAL streaming ingest](../rfcs/0026-memwal-streaming-ingest.md) | Durability-first streaming writes: bounded watcher-plus-post-fence acknowledgement, canonical compare-and-chain tokens and trusted hidden attribution, then recovery-v12 exact base+token graph-atomic fold; legal near-cap closure and genuine v8↔v9 rebuild are green; unbounded retain-all forbids OmniGraph MemWAL deletion; graph enablement, registered Cedar vocabulary, and embedded manifest-only status are active, while row admission, lifecycle mutation/correction, exclusive-cut status, and transport surfaces remain inactive | **Draft; private B2 token/fold core and retain-all profile implemented; activation P1 plus authorization/status slice implemented; no public row path** |
 | [0027 — Lineage merge deltas](../rfcs/0027-lineage-merge-deltas.md) | O(delta) merge classification from row-version lineage | Research-blocked |
 
 Deliberately split, not one mega-format: identity, key fencing, head rows,

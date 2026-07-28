@@ -428,9 +428,9 @@ async fn branch_merge_as_allows_when_policy_permits_actor() {
         .expect("act-allowed should be able to BranchMerge");
 }
 
-/// RFC-026 §4.7 P1: the streaming-enablement flip is Cedar-gated with the
-/// per-graph `admin` action — an actor with no permit rule is denied, and a
-/// missing actor with a policy installed fails hard rather than silently
+/// RFC-026 §4.7 P1/2a: the streaming-enablement flip is Cedar-gated with the
+/// per-graph `stream_manage` action — an actor with no permit rule is denied,
+/// and a missing actor with a policy installed fails hard rather than silently
 /// skipping enforcement.
 #[tokio::test]
 async fn set_streaming_enabled_as_denies_when_policy_rejects_actor() {
@@ -447,12 +447,26 @@ async fn set_streaming_enabled_as_denies_when_policy_rejects_actor() {
     }
 }
 
-/// The permitted-actor arm: an explicit `admin` rule lets the operator flip
-/// the flag, proving the enforce scope is `(Admin, ResourceScope::Graph)` —
-/// not accidentally branch-scoped.
+/// The permitted-actor arm: an explicit `stream_manage` rule lets the operator
+/// flip the flag, proving the enforce scope is `(StreamManage,
+/// ResourceScope::Graph)` — not accidentally branch-scoped.
+///
+/// The negative half is load-bearing for the P1→2a migration: a policy that
+/// grants only the old `admin` action must NOT reach the flip any more, or the
+/// action split would be cosmetic.
 #[tokio::test]
 async fn set_streaming_enabled_as_allows_when_policy_permits_actor() {
-    const ADMIN_POLICY_YAML: &str = r#"
+    const STREAM_MANAGE_POLICY_YAML: &str = r#"
+version: 1
+groups:
+  operators: [act-allowed]
+rules:
+  - id: operators-stream-manage
+    allow:
+      actors: { group: operators }
+      actions: [stream_manage]
+"#;
+    const ADMIN_ONLY_POLICY_YAML: &str = r#"
 version: 1
 groups:
   operators: [act-allowed]
@@ -465,7 +479,7 @@ rules:
     let dir = tempfile::tempdir().unwrap();
     let db = init_and_load(&dir).await;
     let policy_path = dir.path().join("policy.yaml");
-    fs::write(&policy_path, ADMIN_POLICY_YAML).unwrap();
+    fs::write(&policy_path, STREAM_MANAGE_POLICY_YAML).unwrap();
     let engine = PolicyEngine::load_graph(&policy_path, dir.path().to_str().unwrap()).unwrap();
     let db = db.with_policy(Arc::new(engine) as Arc<dyn PolicyChecker>);
 
@@ -475,4 +489,17 @@ rules:
         .expect("permitted operator flips the flag");
     assert!(result.changed);
     assert!(result.streaming_enabled);
+
+    // Granting only the old `admin` action no longer authorizes the flip.
+    let admin_dir = tempfile::tempdir().unwrap();
+    let admin_db = init_and_load(&admin_dir).await;
+    let admin_policy_path = admin_dir.path().join("policy.yaml");
+    fs::write(&admin_policy_path, ADMIN_ONLY_POLICY_YAML).unwrap();
+    let admin_engine =
+        PolicyEngine::load_graph(&admin_policy_path, admin_dir.path().to_str().unwrap()).unwrap();
+    let admin_db = admin_db.with_policy(Arc::new(admin_engine) as Arc<dyn PolicyChecker>);
+    assert_denied(
+        admin_db.set_streaming_enabled_as(true, Some("act-allowed")).await,
+        "admin-only policy must not authorize a stream_manage flip",
+    );
 }

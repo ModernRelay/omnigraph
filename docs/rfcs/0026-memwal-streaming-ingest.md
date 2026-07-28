@@ -11,9 +11,11 @@ owner: OmniGraph maintainers
 # RFC-026 — MemWAL streaming ingest
 
 **Status:** Draft / private B2 compare-and-chain/token-fold core and B2a
-unbounded retain-all profile implemented; public streaming and
-lifecycle management/correction/status inactive; experimental activation
-profile selected 2026-07-27 (§4.7), unimplemented
+unbounded retain-all profile implemented; experimental activation P1,
+graph-scoped Cedar vocabulary, and embedded manifest-only read-only status
+implemented; public row streaming, explicit enrollment, lifecycle
+mutation/correction, exclusive-cut physical status, and CLI/HTTP/OpenAPI
+streaming surfaces inactive
 **Date:** 2026-07-10
 **Gate E0 evaluated:** 2026-07-18
 **Phase A foundation completed:** 2026-07-18
@@ -47,8 +49,9 @@ v9, stream-config v3, lifecycle state-v2, manifest-selected graph-global
 `_stream_tokens.lance`, canonical payload/token digests, post-admission
 authority recapture, recovery-v12 exact base+token fold, durable graph-commit
 attribution, and the genuine v8↔v9 refusal/rebuild gate passed (§11/§12.6);
-explicit production enrollment, lifecycle management, correction/status, and
-all product surfaces remain inactive
+at that checkpoint explicit production enrollment, lifecycle management,
+correction/status, and all product surfaces remained inactive (the
+authorization/status slice below changed that boundary on 2026-07-28)
 **Experimental activation profile selected:** 2026-07-27 — cluster-only,
 manifest-propagated enablement, lazy graph-wide enrollment, caller-supplied
 vectors, per-key object-form dead letter with fail-closed structural refusal,
@@ -60,6 +63,20 @@ dead-letter slot), the Cedar-gated single-CAS `set_streaming_enabled_as`
 flip, cluster-apply-only propagation with refresh convergence and typed
 pending-until-drained refusal, and the genuine v9↔v10 refusal/rebuild fence
 in CI; P2–P6 remain unimplemented and no ingest surface is active
+**Streaming authorization split and read-only status implemented:**
+2026-07-28 — the `stream_ingest` / `stream_manage` Cedar actions of §4.6 are
+registered (both graph-scoped; the main-only profile makes a branch dimension
+meaningless, so both scope qualifiers are rejected at validation), the P1
+enablement flip migrated from the reserved `Admin` action onto
+`stream_manage`, and `Omnigraph::stream_status` projects the durable
+enablement and per-lane authority read-only. Status deliberately ships before
+the management verbs because §4.6 makes it the compare-token source: it
+exposes the `lifecycle_revision` those verbs pass back as their expected
+revision, so they can be written as compare-and-set from the start. This is
+the §4.7 *minimal* status — the authoritative manifest row only; §4.3's
+exclusive-cut physical observation (observed epoch, pending generation
+rows/bytes, `StatusChanged`/`StatusBusy`) arrives with the verbs that need
+it, as an additive observed-physical section.
 **Author track:** Maintainer design series
 **Depends on:** [RFC-022](0022-unified-write-path.md)'s unified write and
 generic recovery-sidecar protocol, plus
@@ -546,9 +563,12 @@ exact incarnation and returns `StreamNotEnrolled` before body admission on
 This section owns both the implemented private B2 row/fold contract and the
 remaining future-public/control contract. Internal schema v9 now implements the
 §4.1 token/attribution substrate and recovery-v12 fold portion of §4.4. It does
-not expose a production caller. Explicit enrollment, lifecycle management,
-correction, authoritative status, authorization, and product parity remain
-future gates. **B2a unbounded retain-all** is the selected first profile: it
+not expose a production row caller. The graph-scoped `stream_ingest` /
+`stream_manage` Cedar vocabulary and embedded manifest-only read-only status
+are active under §4.7, and `stream_manage` gates the v10 enablement writer.
+Explicit enrollment, lifecycle mutation/correction, exclusive-cut physical
+status, public row admission, and transport parity remain future gates.
+**B2a unbounded retain-all** is the selected first profile: it
 deletes no MemWAL object and performs no physical-storage admission or
 accounting. **B2b** is the deferred managed-reclamation profile through the
 Lance-owned protocol in §4.5.2. B2a retains individually bounded protocol
@@ -1144,8 +1164,14 @@ after residue is graph-visible and the block is cleared, an otherwise eligible
 unguarded drain may abort. A quiesce that keeps `goal = SEALED` may instead
 continue to the sealed proof. This rule is identical in §8 and the B2 gates.
 
-Minimum status is one authoritative manifest row plus a bounded cut-consistent
-physical observation. In the supported B2 profile it takes stream admission
+The full B2 status contract is one authoritative manifest row plus a bounded
+cut-consistent physical observation. The experimental §4.7 slice currently
+exposes only the manifest projection through embedded
+`Omnigraph::stream_status`; it takes no admission lease, reads no physical
+shard witness, and has no CLI/HTTP/OpenAPI surface. The full status below
+arrives additively with the lifecycle verbs that need its cut.
+
+In the supported full B2 profile, status takes stream admission
 exclusively, read-only lists/classifies relevant recovery intents, settles every
 writer/watcher/flush/retirement owner plus every selected-profile claim owner to
 the status deadline, reads lifecycle/token authority plus the authoritative
@@ -1981,12 +2007,13 @@ enroll, block inspection, correct, and rebuild-preflight use the separate
 `stream_manage` action. Status is authorized like other graph operational
 metadata. The same engine gates apply to embedded and remote CLI use.
 
-Phase B2 initially exposes only strict compare-and-chain upsert. Public activation requires the
-minimum `status`, explicit `fold`, persistent `quiesce`, `resume`/abort-drain,
-rebuild preflight, a bounded strict-correction workflow, durable
+Phase B2 initially exposes only strict compare-and-chain upsert. The full
+product surface described in this section requires the full exclusive-cut
+`status`, explicit `fold`, persistent `quiesce`, `resume`/abort-drain, rebuild
+preflight, a bounded strict-correction workflow, durable
 authenticated-contributor attribution, a same-key `AckUnknown`
 sequencing/idempotency contract, and one proved physical-retention profile.
-Minimum status includes lifecycle and
+Full status includes lifecycle and
 binding/revision, current epoch, pending generations/bytes, last fold error,
 receipt-history pagination, and whether strict fold is blocked. It never
 claims to resolve one caller's `AckUnknown`.
@@ -2002,19 +2029,28 @@ narrows §4.6 and amends §7 as stated below; where this profile and an earlier
 section disagree, this profile governs the experimental activation and the
 earlier text continues to describe the full product surface.
 
-**Implementation status (2026-07-28): P1 (enablement authority) is
-implemented as internal schema v10** — the pre-implementation format audit
+**Implementation status (2026-07-28): P1 (enablement authority), the
+authorization split, and embedded manifest-only status are implemented.** The
+pre-implementation format audit
 resolved to its pre-registered default (v9 decoders skip unknown row kinds
 silently, and the correct shape is a required genesis singleton), so v10 adds
 the graph-global `stream_profile` row and reserves the fold-attribution
 dead-letter slot in the same bump. The flip ships as the Cedar-gated
-(`Admin`) `set_streaming_enabled_as` writer — single exact-entry CAS with a
+(`stream_manage`) `set_streaming_enabled_as` writer — single exact-entry CAS with a
 strict revision advance, one ordinary lineage commit, no recovery sidecar —
 and `cluster apply` is its sole production caller, with refresh converging
 the ledger to engine truth and disable refusing typed
 (`StreamingDisablePending`) while any lifecycle is non-terminal. The genuine
-v9↔v10 refusal/rebuild fence is pinned in CI (`OMNIGRAPH_V9_BIN`). P2–P6
-remain unimplemented; enabling the flag activates no ingest surface.
+v9↔v10 refusal/rebuild fence is pinned in CI (`OMNIGRAPH_V9_BIN`).
+`stream_ingest` and `stream_manage` are registered graph-scoped actions; both
+reject branch and target-branch qualifiers. Embedded
+`Omnigraph::stream_status` reads the enablement and per-lane durable authority
+from one canonical-main manifest snapshot, including the lifecycle revision
+future management verbs pass back as their compare token. It is read-only,
+takes no admission lease, resolves no recovery, and deliberately omits
+physical observations. Full exclusive-cut status and all CLI/HTTP/OpenAPI
+streaming surfaces remain inactive. P2–P6 remain unimplemented; enabling the
+flag activates no ingest surface.
 
 **Profile boundaries.** Main-only; unsharded; one resident writer; one live
 writer process; unbounded retain-all (§4.5.1); cluster deployments only;
@@ -2701,8 +2737,10 @@ and publishes the §4.2 winner summary plus current-token evidence. The graph
 commit stores a durable commitment to the visible contributor/write winner set;
 ordinary commits carry no fold summary. Provenance is never inferred from
 MemTable positions or WAL cursor statistics. This row/fold design is active in
-v9; public exposure, lifecycle/correction/status, and restart-stable dead-letter
-row identity remain later gates.
+v9; public row exposure, lifecycle mutation/correction, exclusive-cut physical
+status, CLI/HTTP/OpenAPI parity, and restart-stable dead-letter row identity
+remain later gates. The registered Cedar vocabulary and embedded manifest-only
+status do not widen the private row/fold seam.
 
 ## 7. Fold-time rejection is atomic
 
@@ -2923,7 +2961,9 @@ those limits wherever the tier is exposed.
 
 ## 10. Observability and resource contracts
 
-Phase B1 keeps observability internal and does not create a public status
+Phase B1 keeps row/fold observability internal. The later §4.7 slice exposes
+only durable manifest authority through embedded `Omnigraph::stream_status`;
+it does not expose physical worker state or create a CLI/HTTP/OpenAPI status
 contract. The private implementation exposes test seams at its durability,
 replay, fencing, resource, cut, fold, visibility, and recovery boundaries. The
 2026-07-21 dense-scan repair and near-cap/RSS cell in §12.3 re-prove closure for
@@ -2931,8 +2971,8 @@ the widest admitted shape. That evidence is not a public latency SLO,
 group-commit multiplier, current object-store result, physical-storage bound,
 or claim that retained metadata work is history-flat.
 
-B2's minimum status surface is the authority-plus-observation contract in
-§4.3. It includes the exact lifecycle/binding, active epoch, drain operation,
+B2's full status surface is the authority-plus-observation contract in §4.3.
+It includes the exact lifecycle/binding, active epoch, drain operation,
 pending generation/row/byte totals, merged progress, last fold outcome, strict
 block, receipt-history pagination, lifecycle revision, relevant recovery, and
 rebuild readiness. Optional retained-object counts/bytes are advisory current-
@@ -3398,8 +3438,10 @@ RFC remains draft.
   remain B2b managed-reclamation and broader-topology gates. They did not block
   the completed private no-delete, single-live-writer-process B2a gate, which
   retains the wrapper's post-watcher fence check. The later private v9
-  token/fold slice passed independently; public activation still waits on the
-  remaining lifecycle/correction/status, authorization, and product gates.
+  token/fold slice passed independently; public row activation still waits on
+  the remaining lifecycle/correction, exclusive-cut physical-status, and
+  transport gates. The authorization vocabulary and embedded durable-only
+  status are already active.
 
 **Phase B1 disposition — accepted 2026-07-19, closure gap found 2026-07-20 and
 repaired 2026-07-21**
@@ -3424,7 +3466,9 @@ dense-slice Arrow closure check; physical RSS remains a separate evidence
 tripwire. The near-cap cell now closes. This amendment changed no product
 surface. The subsequent v9 slice implements §4.1's private token/attribution
 and §4.4's base+token fold core. Explicit enrollment, lifecycle management,
-correction/status, and product parity remain inactive; §4.5.1's B2a profile is
+correction, exclusive-cut physical status, public row admission, and transport
+parity remain inactive; the Cedar vocabulary and embedded manifest-only status
+are active. §4.5.1's B2a profile is
 implemented, while §4.5.2's B2b managed-reclamation profile remains optional
 and inactive.
 
@@ -3523,8 +3567,10 @@ Advisory listed bytes, wall times, and whole-process RSS are printed as
 diagnostics only and enforce no product threshold.
 
 This B2a result itself added no schema or product surface. The subsequent
-private B2-common row/fold slice activated schema v9; production callers and
-lifecycle/correction/status remain §12.6 work.
+private B2-common row/fold slice activated schema v9; production row callers,
+lifecycle mutation/correction, exclusive-cut physical status, and transport
+parity remain §12.6 work. The authorization/status slice shipped later under
+§4.7.
 
 ### 12.6 Private B2-common implementation and remaining public/B2b gates
 
@@ -3533,18 +3579,23 @@ implemented core covers schema v9/config-v3/state-v2 format activation,
 canonical payload/token derivation, trusted row attribution, graph-global token
 authority, stale-authority admission revalidation, same-generation chaining,
 recovery-v12 exact base+token folding, durable graph-commit attribution, and
-genuine v8↔v9 refusal/rebuild. Public activation still waits for explicit
-production enrollment, lifecycle/correction/status, authorization,
-cancellation/shutdown, API compatibility, and product parity. This section also
+genuine v8↔v9 refusal/rebuild. Public row activation still waits for explicit
+production enrollment, lifecycle mutation/correction, exclusive-cut physical
+status, cancellation/shutdown, API compatibility, and transport parity. The
+graph-scoped Cedar vocabulary, `stream_manage`-gated enablement, and embedded
+manifest-only status are already active under §4.7. This section also
 owns B2b's optional managed-reclamation gates; B2a does not need any B2b-only
 bullet.
 The design does not waive the
 persistent escape requirement: a user must never be left with a table that
 ordinary writers refuse but cannot be corrected, quiesced, or rebuilt.
 
-- **Inactive product surface:** `@stream(mode="upsert", on_reject="strict")`,
-  production first use, SDK, HTTP, CLI, Cedar, and OpenAPI must all route
-  through the same private core. Existing `/ingest` behavior must remain
+- **Inactive row/control product surface:** `@stream(mode="upsert",
+  on_reject="strict")`, production first use, SDK row/control methods, HTTP,
+  CLI, and OpenAPI must all route through the same private core. The Cedar
+  actions are registered, but `stream_ingest` has no production caller and
+  `stream_manage` currently reaches only the enablement writer. Existing
+  `/ingest` behavior must remain
   compatible, and embedded/remote command parity must be tested.
   Accepted-schema and runtime guards must refuse `@stream` on a type requiring
   `@embed` or any external/provider-derived field; caller-supplied physical
@@ -3598,9 +3649,11 @@ ordinary writers refuse but cannot be corrected, quiesced, or rebuilt.
   protocol digests; uppercase, base64, whitespace, bad prefix, and wrong length
   must refuse pre-effect. Public caller ordering, mixed request shaping,
   cancellation/shutdown, and transport parity retain their gates above.
-- **Inactive operator controls:** minimum controls must expose authoritative status, explicit fold, plus
-  persistent quiesce, resume/abort-drain, correction, and rebuild preflight.
-  Status must take an exclusive cut, settle owners without mutating recovery, and
+- **Inactive operator controls:** minimum controls must expose full
+  exclusive-cut status, explicit fold, plus persistent quiesce,
+  resume/abort-drain, correction, and rebuild preflight. Embedded durable-only
+  status is already active; full status must take an exclusive cut, settle
+  owners without mutating recovery, and
   include exact lifecycle/binding/revision, epoch, advisory pending
   generations/bytes, paginated correction and management/claim receipt
   summaries, last fold summary, and strict-blocked state. Every mutating call after
@@ -3761,8 +3814,8 @@ ordinary writers refuse but cannot be corrected, quiesced, or rebuilt.
 | R0 | production-neutral retained-growth/source audit; current-object census; referenced-cut retry; legal high-entropy near-cap materialize/fold cell; no schema, public caller, or deletion | **Historical bounded-retention no-go 2026-07-20; disposition amended 2026-07-21 (§0.2/§12.4):** RC.1 still exposes neither a complete reserve-first physical envelope/receipt nor a durable cross-open randomized-attempt cap. Those facts prohibit a finite storage promise but do not block selected unbounded retain-all. The formerly red widest cell is now green locally and on the configured-RustFS CI path; current-object observations remain advisory retention evidence, not provider billing/accounting |
 | B2a | selected unbounded retain-all/no-GC profile on stock Lance | **Private gate implemented 2026-07-21 (§12.5):** no OmniGraph byte/object/file/history quota; zero canonical `_mem_wal` deletion; complete/partial provider residue remains retained, unreferenced, and untouched below its root through retry/reopen; provider failures are loud; local/configured-RustFS history sweeps are advisory. This gate itself activated no schema or product surface; the later private B2-common slice activates v9 |
 | B2b | candidate managed-reclamation retention profile | Inactive. Requires the Lance-owned durable inspect/plan/execute + receipt, post-success fencing, bounded checkpoint/inventory/accounting, local/RustFS enforced-bound validation, and the profile-specific crash matrix (§4.5.2/§12.6). Passing it alone activates no product surface |
-| B2-common | schema v9/config-v3/state-v2, compare-and-chain token/attribution, graph-global token authority, recovery-v12 base+token fold; then explicit enrollment, revision-fenced lifecycle/correction/status, SDK, HTTP, CLI, Cedar, and OpenAPI | **Private row/fold subset implemented 2026-07-22 (§11/§12.6):** canonical digests, hidden attribution, stale-authority revalidation after shared admission, same-generation chains, exact two-participant recovery/publication, durable fold attribution, retain-all, and genuine v8↔v9 refusal/rebuild are green. Explicit production enrollment, lifecycle/correction/status, authorization, cancellation/shutdown, API compatibility, and product parity remain inactive. `GraphHistoryBudget` belongs only to a future bounded/managed profile |
-| EXP | experimental cluster-only activation of the §4.7 profile: manifest-propagated enablement via `cluster apply`, lazy graph-wide enrollment, caller-supplied vectors, per-key object-form dead letter with fail-closed structural refusal, no read-your-writes bridge, dependency-ordered resident fold driver, upsert-only | **Selected 2026-07-27 (§4.7); P1 enablement authority implemented 2026-07-28 as internal schema v10** (required genesis `stream_profile` singleton + reserved dead-letter slot; Cedar-gated single-CAS flip; cluster-apply-only propagation with refresh convergence and typed pending-until-drained refusal; genuine v9↔v10 fence in CI). P2–P6 remain unimplemented and ship under the §4.7 Hyrum boundary |
+| B2-common | schema v9/config-v3/state-v2, compare-and-chain token/attribution, graph-global token authority, recovery-v12 base+token fold; then explicit enrollment, revision-fenced lifecycle/correction/full status, SDK row/control methods, HTTP, CLI, and OpenAPI | **Private row/fold subset implemented 2026-07-22 (§11/§12.6):** canonical digests, hidden attribution, stale-authority revalidation after shared admission, same-generation chains, exact two-participant recovery/publication, durable fold attribution, retain-all, and genuine v8↔v9 refusal/rebuild are green. Explicit production enrollment, lifecycle mutation/correction, exclusive-cut physical status, public row admission, cancellation/shutdown, API compatibility, and transport parity remain inactive. The Cedar vocabulary and embedded manifest-only status shipped in the later EXP slice. `GraphHistoryBudget` belongs only to a future bounded/managed profile |
+| EXP | experimental cluster-only activation of the §4.7 profile: manifest-propagated enablement via `cluster apply`, lazy graph-wide enrollment, caller-supplied vectors, per-key object-form dead letter with fail-closed structural refusal, no read-your-writes bridge, dependency-ordered resident fold driver, upsert-only | **Selected 2026-07-27 (§4.7); P1 enablement authority plus the authorization/status slice implemented 2026-07-28** (internal schema v10 required genesis `stream_profile` singleton + reserved dead-letter slot; `stream_manage`-gated single-CAS flip; registered graph-scoped `stream_ingest` / `stream_manage`; embedded manifest-only read-only status; cluster-apply-only propagation with refresh convergence and typed pending-until-drained refusal; genuine v9↔v10 fence in CI). P2–P6, full exclusive-cut status, and CLI/HTTP/OpenAPI streaming surfaces remain unimplemented and ship under the §4.7 Hyrum boundary |
 | C | restart-stable reject-row identity, atomic dead letter, richer status, and evidence-backed configurable bounds | reject crash matrix; reject-retention proof; backpressure and RSS/latency evidence. The §4.7 profile pulls a bounded object-form dead-letter subset forward using the §4.1 token as reject identity |
 | D | automatic operation drain, schema/branch/upgrade integration, and rematerialization rebind | two-coordinator race, old/new physical-binding crash matrix, and format-transition suite |
 | E | fresh cuts and maintained-index reads; cross-process `Fresh` ships only if the substrate generation-retention guard exists (§9), otherwise same-process only | cut consistency; merged-generation exclusion |

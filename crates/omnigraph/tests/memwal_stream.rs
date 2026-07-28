@@ -2848,3 +2848,52 @@ async fn s3_provider_shard_manifest_failure_retains_unreferenced_generation() {
         .await
         .expect("configured S3/RustFS fixture cleanup must succeed");
 }
+
+/// RFC-026 §4.6: with a lane actually enrolled, status projects the durable
+/// logical stream incarnation plus the `lifecycle_revision` that every
+/// mutating management verb passes back as its expected-revision compare
+/// token.
+#[tokio::test]
+#[serial]
+async fn stream_status_reports_the_enrolled_lane_and_its_compare_token() {
+    let _scenario = FailScenario::setup();
+    let (_dir, db) = init_enrolled().await;
+
+    let status = db.stream_status().await.unwrap();
+    assert_eq!(status.tables.len(), 1, "one enrolled lane: {status:?}");
+    let lane = &status.tables[0];
+    assert_eq!(lane.table_key, TABLE);
+    assert_eq!(lane.lifecycle, "OPEN");
+    assert_eq!(
+        lane.lifecycle_revision, 1,
+        "enrollment publishes the initial lifecycle revision"
+    );
+    let expected_stream_incarnation = db
+        .failpoint_stream_incarnation_for_test(TABLE)
+        .await
+        .unwrap();
+    assert_eq!(
+        lane.stream_incarnation_id, expected_stream_incarnation,
+        "status returns the exact logical incarnation used to fence every stream request"
+    );
+    assert!(!lane.enrollment_id.is_empty());
+    assert_ne!(
+        lane.stream_incarnation_id, lane.enrollment_id,
+        "logical stream incarnation and physical enrollment are distinct identities"
+    );
+    assert_eq!(
+        lane.epoch_floor_by_shard.len(),
+        1,
+        "the unsharded profile enrolls exactly one shard"
+    );
+    // Nothing has folded or blocked yet, and the lane is not draining.
+    assert_eq!(lane.drain_id, None);
+    assert_eq!(lane.strict_block_token, None);
+    assert_eq!(lane.last_fold_outcome, None);
+    // An OPEN lane is undrained — the exact condition that makes a disable
+    // refuse as pending-until-drained, and that quiesce will clear.
+    assert!(status.undrained());
+
+    // Status is lifecycle-inert: re-reading it moves nothing.
+    assert_eq!(db.stream_status().await.unwrap(), status);
+}

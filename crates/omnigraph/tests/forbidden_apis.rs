@@ -277,6 +277,10 @@ const READ_ONLY_SURFACES: &[(&str, &str)] = &[
     ("db/omnigraph.rs", "branch_list"),
     ("db/omnigraph.rs", "get_commit"),
     ("db/omnigraph.rs", "list_commits"),
+    // RFC-026 status is a pure projection of one manifest snapshot: no
+    // admission lease, no recovery resolution, no publication. Registering it
+    // read-only is the structural claim that it cannot move a lifecycle.
+    ("db/omnigraph/stream_status.rs", "stream_status"),
     ("exec/query.rs", "query"),
     ("exec/query.rs", "run_query_at"),
 ];

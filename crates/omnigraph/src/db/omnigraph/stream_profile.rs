@@ -54,8 +54,14 @@ impl Omnigraph {
         enabled: bool,
         actor: Option<&str>,
     ) -> Result<StreamingProfileResult> {
+        // Streaming lifecycle management, not general graph administration:
+        // the flag opens or closes a lane, so it belongs with fold, quiesce,
+        // and resume under `stream_manage` (RFC-026 §4.6). P1 shipped on the
+        // reserved `Admin` action because `stream_manage` did not exist yet;
+        // migrating is in-window precisely because §4.7 declares the
+        // experimental profile's authorization surface unstable.
         self.enforce(
-            omnigraph_policy::PolicyAction::Admin,
+            omnigraph_policy::PolicyAction::StreamManage,
             &omnigraph_policy::ResourceScope::Graph,
             actor,
         )?;
