@@ -81,10 +81,15 @@ use crate::error::{OmniError, Result};
 ///   discriminated `DISABLED | ENABLED | DISABLING | RETIRED` authority and
 ///   upgrades `_stream_tokens.lance` to the tagged current-token/control-ledger
 ///   schema. Profile changes use recovery-v13 and immutable management receipts.
+/// - v12 — RFC-026 F2 lifecycle tranche replaces inline lane receipt vectors
+///   with lifecycle-v3 bounded ledger-chain/current pointers and authenticated
+///   incremental WAL-tail authority. Claim/drain effects use recovery-v14;
+///   historical recovery-v10 enrollment and recovery-v12 ordinary fold retain
+///   their exact lifecycle-v2 wire types and are never reinterpreted.
 ///
-/// v1–v10 graphs are not served by this binary (see `MIN_SUPPORTED`); the history
+/// v1–v11 graphs are not served by this binary (see `MIN_SUPPORTED`); the history
 /// is kept for provenance and to document what each stamp value meant.
-pub(crate) const INTERNAL_MANIFEST_SCHEMA_VERSION: u32 = 11;
+pub(crate) const INTERNAL_MANIFEST_SCHEMA_VERSION: u32 = 12;
 
 /// The oldest on-disk internal-schema stamp this binary will open. With no
 /// in-place migration, this equals `INTERNAL_MANIFEST_SCHEMA_VERSION`: a graph
@@ -128,11 +133,11 @@ pub(crate) fn release_for_internal_schema_version(stamp: u32) -> &'static str {
         // The published line whose binaries serve v9 — the string the gated
         // v9↔v10 crossversion fence asserts inside the v10 refusal message.
         9 => "0.9.x",
-        // Unreachable in refusals while CURRENT == 11 (the sub-floor path
-        // consults 1–10 only; the ceiling path never consults the map). It
+        // Unreachable in refusals while CURRENT == 12 (the sub-floor path
+        // consults 1–11 only; the ceiling path never consults the map). It
         // exists for the table's honesty and the next bump; release-prep for
         // 0.10.0 flips it to "0.10.x".
-        10..=11 => "0.10.0-dev",
+        10..=12 => "0.10.0-dev",
         // Worded to read naturally after "created by omnigraph " if a future
         // bump ever leaves a gap.
         _ => "an unrecognized older release",
@@ -212,12 +217,12 @@ mod tests {
     use super::*;
 
     /// The guard accepts exactly the single served version and refuses anything
-    /// below the floor or above the ceiling. With `MIN == CURRENT == 11` the
-    /// live range is exactly `[11, 11]`.
+    /// below the floor or above the ceiling. With `MIN == CURRENT == 12` the
+    /// live range is exactly `[12, 12]`.
     #[test]
     fn unsupported_guard_accepts_exactly_the_supported_range() {
-        assert_eq!(INTERNAL_MANIFEST_SCHEMA_VERSION, 11);
-        assert_eq!(MIN_SUPPORTED_INTERNAL_SCHEMA_VERSION, 11);
+        assert_eq!(INTERNAL_MANIFEST_SCHEMA_VERSION, 12);
+        assert_eq!(MIN_SUPPORTED_INTERNAL_SCHEMA_VERSION, 12);
         for stamp in MIN_SUPPORTED_INTERNAL_SCHEMA_VERSION..=INTERNAL_MANIFEST_SCHEMA_VERSION {
             assert!(
                 refuse_if_stamp_unsupported(stamp).is_ok(),
@@ -251,6 +256,7 @@ mod tests {
         assert_eq!(release_for_internal_schema_version(9), "0.9.x");
         assert_eq!(release_for_internal_schema_version(10), "0.10.0-dev");
         assert_eq!(release_for_internal_schema_version(11), "0.10.0-dev");
+        assert_eq!(release_for_internal_schema_version(12), "0.10.0-dev");
         assert_eq!(
             release_for_internal_schema_version(99),
             "an unrecognized older release"

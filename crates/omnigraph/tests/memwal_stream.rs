@@ -9,6 +9,7 @@ mod helpers;
 
 use std::collections::BTreeSet;
 use std::fmt;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -31,11 +32,17 @@ use object_store::{
     PutMultipartOptions, PutOptions, PutPayload, PutResult, Result as ObjectStoreResult,
     UploadPart,
 };
-use omnigraph::db::{Omnigraph, ReadTarget};
+use omnigraph::db::{Omnigraph, ReadTarget, StreamTableStatus};
 use omnigraph::error::OmniError;
 use omnigraph::failpoints::{ScopedFailPoint, names};
 use omnigraph::instrumentation::{QueryIoProbes, with_query_io_probes};
+use omnigraph_control_authority::{
+    AuthorityOperationClass, OfflineAuthorityRequest, RuntimeBindingRequest, StateLockAcquire,
+    acquire_state_lock, mint_runtime_guard, validate_offline_guard, validate_runtime_binding,
+};
+use omnigraph_storage::storage_handle_for_uri;
 use serial_test::serial;
+use sha2::{Digest, Sha256};
 
 use helpers::memwal::CurrentMemWalInventory;
 
@@ -66,6 +73,9 @@ query insert_company($score: I32) {
 const PROVIDER_FAILURE_MESSAGE: &str = "injected RFC-026 provider exhaustion";
 const PROVIDER_PUT_TIMEOUT: Duration = Duration::from_secs(45);
 const PROVIDER_FOLD_TIMEOUT: Duration = Duration::from_secs(90);
+const STREAM_DECLARATION_REVISION: &str = "memwal-stream-test-declaration-v1";
+const STREAM_DECLARATION_DIGEST: &str =
+    "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum ProviderFailureTarget {
@@ -460,29 +470,233 @@ fn assert_inventory_retained(
 }
 
 async fn enroll_stream_at(uri: &str) {
+    let cluster_uri = uri
+        .strip_suffix("/graphs/knowledge.omni")
+        .expect("stream test graph URI must use the checked cluster graph mapping");
     let db = Omnigraph::init(uri, STREAM_SCHEMA)
         .await
         .expect("provider-failure fixture must initialize");
     db.failpoint_enroll_stream_table_for_test(TABLE)
         .await
         .expect("provider-failure fixture must enroll its one stream table");
+    enable_stream_profile(&db, cluster_uri).await;
 }
 
-async fn init_enrolled() -> (tempfile::TempDir, Arc<Omnigraph>) {
+struct EnrolledGraphDir {
+    _cluster: tempfile::TempDir,
+    graph: PathBuf,
+}
+
+impl EnrolledGraphDir {
+    fn path(&self) -> &Path {
+        &self.graph
+    }
+
+    fn cluster_uri(&self) -> String {
+        format!(
+            "file://{}",
+            self.graph
+                .parent()
+                .and_then(Path::parent)
+                .expect("enrolled graph lives below <cluster>/graphs")
+                .display()
+        )
+    }
+}
+
+async fn write_cluster_state(cluster_uri: &str) -> String {
+    let value = serde_json::json!({
+        "version": 1,
+        "state_revision": 1,
+        "applied_revision": {
+            "config_digest": "memwal-stream-test-config",
+            "resources": {}
+        }
+    });
+    let text = serde_json::to_string_pretty(&value).unwrap();
+    let storage = storage_handle_for_uri(cluster_uri).unwrap();
+    storage
+        .adapter()
+        .write_text(&format!("{cluster_uri}/__cluster/state.json"), &text)
+        .await
+        .unwrap();
+    format!("sha256:{:x}", Sha256::digest(text.as_bytes()))
+}
+
+async fn enable_stream_profile(db: &Omnigraph, cluster_uri: &str) {
+    let cluster_uri = cluster_uri.trim_end_matches('/');
+    let state_cas = write_cluster_state(cluster_uri).await;
+    let storage = storage_handle_for_uri(cluster_uri).unwrap();
+    let lock_uri = format!("{cluster_uri}/__cluster/lock.json");
+    let lock = match acquire_state_lock(&storage, &lock_uri, "apply")
+        .await
+        .unwrap()
+    {
+        StateLockAcquire::Acquired(lock) => lock,
+        StateLockAcquire::Held => panic!("fresh MemWAL test apply lock is already held"),
+    };
+    let guard = validate_offline_guard(
+        &lock,
+        OfflineAuthorityRequest {
+            graph_id: "knowledge",
+            graph_store_uri: db.uri(),
+            expected_state_cas: &state_cas,
+            state_revision: 1,
+            declaration_revision: STREAM_DECLARATION_REVISION,
+            declaration_digest: STREAM_DECLARATION_DIGEST,
+            expected_profile_revision: 1,
+            operation_id: "memwal-stream-test-enable",
+            operation: AuthorityOperationClass::StreamProfileEnable,
+            actor: "operator:memwal-test",
+            confirm_stream_offline: true,
+        },
+    )
+    .await
+    .unwrap();
+    let authority = db.check_cluster_apply_authority(guard).await.unwrap();
+    let result = db.set_streaming_profile_checked(authority).await.unwrap();
+    assert!(result.streaming_enabled);
+}
+
+async fn bind_checked_stream_runtime(
+    db: Arc<Omnigraph>,
+    cluster_uri: &str,
+) -> Arc<Omnigraph> {
+    let status = db.stream_status().await.unwrap();
+    assert_eq!(status.profile_mode, "ENABLED");
+    let value = serde_json::json!({
+        "version": 1,
+        "state_revision": 1,
+        "applied_revision": {
+            "config_digest": "memwal-stream-test-config",
+            "resources": {
+                "graph.knowledge": {
+                    "digest": "memwal-stream-test-graph"
+                },
+                "streaming.knowledge": {
+                    "digest": STREAM_DECLARATION_DIGEST,
+                    "declaration_revision": STREAM_DECLARATION_REVISION,
+                    "streaming_enabled": true,
+                    "profile_mode": "ENABLED",
+                    "profile_revision": status.profile_revision
+                }
+            }
+        }
+    });
+    let text = serde_json::to_string_pretty(&value).unwrap();
+    let cluster_uri = cluster_uri.trim_end_matches('/');
+    let storage = storage_handle_for_uri(cluster_uri).unwrap();
+    storage
+        .adapter()
+        .write_text(&format!("{cluster_uri}/__cluster/state.json"), &text)
+        .await
+        .unwrap();
+    let state_cas = format!("sha256:{:x}", Sha256::digest(text.as_bytes()));
+    let binding = validate_runtime_binding(
+        &storage,
+        cluster_uri,
+        RuntimeBindingRequest {
+            graph_id: "knowledge",
+            graph_store_uri: db.uri(),
+            expected_state_cas: &state_cas,
+            state_revision: 1,
+            declaration_revision: STREAM_DECLARATION_REVISION,
+            declaration_digest: STREAM_DECLARATION_DIGEST,
+            profile_mode: "ENABLED",
+            profile_revision: status.profile_revision,
+        },
+    )
+    .await
+    .unwrap();
+    let guard = mint_runtime_guard(
+        binding,
+        "memwal-stream-test-runtime",
+        "omnigraph:test",
+    )
+    .await
+    .unwrap();
+    let db = match Arc::try_unwrap(db) {
+        Ok(db) => db,
+        Err(_) => panic!("runtime fixture must own the sole engine handle"),
+    };
+    Arc::new(db.with_checked_cluster_stream_runtime(guard).await.unwrap())
+}
+
+async fn init_enrolled() -> (EnrolledGraphDir, Arc<Omnigraph>) {
     init_enrolled_with_schema(STREAM_SCHEMA).await
 }
 
-async fn init_enrolled_with_schema(schema: &str) -> (tempfile::TempDir, Arc<Omnigraph>) {
-    let dir = tempfile::tempdir().unwrap();
+async fn init_enrolled_with_schema(schema: &str) -> (EnrolledGraphDir, Arc<Omnigraph>) {
+    init_enrolled_with_profile(schema, true).await
+}
+
+async fn init_enrolled_disabled() -> (EnrolledGraphDir, Arc<Omnigraph>) {
+    init_enrolled_with_profile(STREAM_SCHEMA, false).await
+}
+
+async fn init_enrolled_served_with_schema(
+    schema: &str,
+) -> (EnrolledGraphDir, Arc<Omnigraph>) {
+    let (dir, db) = init_enrolled_with_schema(schema).await;
+    let cluster_uri = dir.cluster_uri();
+    let db = bind_checked_stream_runtime(db, &cluster_uri).await;
+    (dir, db)
+}
+
+async fn init_enrolled_with_profile(
+    schema: &str,
+    enable_profile: bool,
+) -> (EnrolledGraphDir, Arc<Omnigraph>) {
+    let cluster = tempfile::tempdir().unwrap();
+    let graph = cluster.path().join("graphs/knowledge.omni");
     let db = Arc::new(
-        Omnigraph::init(dir.path().to_str().unwrap(), schema)
+        Omnigraph::init(graph.to_str().unwrap(), schema)
             .await
             .unwrap(),
     );
     db.failpoint_enroll_stream_table_for_test(TABLE)
         .await
         .unwrap();
-    (dir, db)
+    if enable_profile {
+        enable_stream_profile(&db, &format!("file://{}", cluster.path().display())).await;
+    }
+    (
+        EnrolledGraphDir {
+            _cluster: cluster,
+            graph,
+        },
+        db,
+    )
+}
+
+async fn reopen_enrolled(dir: &EnrolledGraphDir) -> Arc<Omnigraph> {
+    Arc::new(
+        Omnigraph::open(dir.path().to_str().unwrap())
+            .await
+            .expect("enrolled graph must reopen"),
+    )
+}
+
+async fn stream_lane(db: &Omnigraph) -> StreamTableStatus {
+    let status = db.stream_status().await.unwrap();
+    assert_eq!(status.tables.len(), 1, "fixture owns exactly one lane");
+    status.tables.into_iter().next().unwrap()
+}
+
+fn epoch_floor(lane: &StreamTableStatus) -> u64 {
+    assert_eq!(
+        lane.epoch_floor_by_shard.len(),
+        1,
+        "fixture uses one unsharded stream"
+    );
+    lane.epoch_floor_by_shard[0].1
+}
+
+fn assert_no_recovery_sidecars(dir: &EnrolledGraphDir) {
+    assert!(
+        helpers::recovery::sidecar_operation_ids(dir.path()).is_empty(),
+        "lifecycle operation must leave no recovery sidecar"
+    );
 }
 
 #[tokio::test]
@@ -668,14 +882,16 @@ async fn admission_rejects_empty_and_non_exact_physical_batches_without_visibili
 
 #[tokio::test]
 #[serial]
-async fn durable_put_is_manifest_invisible_until_one_explicit_fold() {
+async fn durable_put_is_graph_content_invisible_until_one_explicit_fold() {
     let _scenario = FailScenario::setup();
     let (_dir, db) = init_enrolled().await;
-    let version_before = db
+    let table_version_before = db
         .snapshot_of(ReadTarget::branch("main"))
         .await
         .unwrap()
-        .version();
+        .entry(TABLE)
+        .unwrap()
+        .table_version;
 
     let batch = physical_batch(&db, &[("p1".to_string(), 10)]).await;
     db.failpoint_stream_b1_for_test(TABLE, Some(batch), 41)
@@ -686,8 +902,11 @@ async fn durable_put_is_manifest_invisible_until_one_explicit_fold() {
         db.snapshot_of(ReadTarget::branch("main"))
             .await
             .unwrap()
-            .version(),
-        version_before
+            .entry(TABLE)
+            .unwrap()
+            .table_version,
+        table_version_before,
+        "claim receipts may advance operational manifest authority but not graph content"
     );
 
     db.failpoint_stream_b1_for_test(TABLE, None, 0)
@@ -698,9 +917,678 @@ async fn durable_put_is_manifest_invisible_until_one_explicit_fold() {
         db.snapshot_of(ReadTarget::branch("main"))
             .await
             .unwrap()
-            .version(),
-        version_before + 1
+            .entry(TABLE)
+            .unwrap()
+            .table_version,
+        table_version_before + 1
     );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[serial]
+async fn quiesce_accepts_an_empty_successor_after_an_ordinary_published_fold() {
+    let _scenario = FailScenario::setup();
+    let (dir, db) = init_enrolled().await;
+    let row = physical_batch(&db, &[("ordinary-before-quiesce".to_string(), 13)]).await;
+    db.failpoint_stream_b1_for_test(TABLE, Some(row), 0)
+        .await
+        .expect("fixture row must be durably acknowledged");
+    db.failpoint_stream_b1_for_test(TABLE, None, 0)
+        .await
+        .expect("the ordinary fold must publish before quiesce");
+
+    let folded = stream_lane(&db).await;
+    assert_eq!(folded.lifecycle, "OPEN");
+    assert_eq!(folded.last_fold_outcome.as_deref(), Some("PUBLISHED"));
+    let folded_epoch = epoch_floor(&folded);
+    let drain_id = "90909090-9090-4090-8090-909090909090";
+
+    db.failpoint_stream_quiesce_for_test(
+        TABLE,
+        drain_id,
+        folded.lifecycle_revision,
+        "operator:ordinary-fold-quiesce",
+    )
+    .await
+    .expect("the retained published prefix plus one new sentinel proves the successor empty");
+
+    let sealed = stream_lane(&db).await;
+    assert_eq!(sealed.lifecycle, "SEALED");
+    assert_eq!(
+        epoch_floor(&sealed),
+        folded_epoch + 1,
+        "quiesce must need exactly one drain claim after the published fold"
+    );
+    assert_eq!(
+        visible_rows(&db).await,
+        vec![("ordinary-before-quiesce".to_string(), 13)]
+    );
+    assert_no_recovery_sidecars(&dir);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[serial]
+async fn quiesce_persists_a_stable_data_block_for_a_permanent_validation_failure() {
+    let _scenario = FailScenario::setup();
+    let cluster = tempfile::tempdir().unwrap();
+    let graph = cluster.path().join("graphs/knowledge.omni");
+    let db = Arc::new(
+        Omnigraph::init(graph.to_str().unwrap(), UNIQUE_STREAM_SCHEMA)
+            .await
+            .unwrap(),
+    );
+    db.mutate(
+        "main",
+        INSERT_PERSON,
+        "insert_person",
+        &helpers::int_params(&[("$score", 7)]),
+    )
+    .await
+    .expect("seed the committed uniqueness conflict before enrollment");
+    db.failpoint_enroll_stream_table_for_test(TABLE)
+        .await
+        .unwrap();
+    enable_stream_profile(&db, &format!("file://{}", cluster.path().display())).await;
+    let dir = EnrolledGraphDir {
+        _cluster: cluster,
+        graph,
+    };
+
+    let duplicate = physical_batch(&db, &[("drain-blocked".to_string(), 7)]).await;
+    db.failpoint_stream_b1_for_test(TABLE, Some(duplicate), 0)
+        .await
+        .expect("base-dependent uniqueness remains fold-time work");
+    let before = db
+        .snapshot_of(ReadTarget::branch("main"))
+        .await
+        .unwrap();
+    let before_lane = stream_lane(&db).await;
+    let drain_id = "96969696-9696-4696-8696-969696969696";
+    let actor = "operator:strict-data-block";
+
+    let first_error = db
+        .failpoint_stream_quiesce_for_test(
+            TABLE,
+            drain_id,
+            before_lane.lifecycle_revision,
+            actor,
+        )
+        .await
+        .expect_err("a permanent drain validator failure must publish a strict data block");
+    let blocked = stream_lane(&db).await;
+    let block_token = blocked
+        .strict_block_token
+        .clone()
+        .expect("DRAINING validation failure must expose its durable block token");
+    assert!(
+        first_error.to_string().contains(&block_token),
+        "{first_error:?}"
+    );
+    assert_eq!(blocked.lifecycle, "DRAINING");
+    assert_eq!(blocked.drain_id.as_deref(), Some(drain_id));
+    assert_eq!(
+        blocked.last_fold_outcome.as_deref(),
+        Some("STRICT_BLOCKED")
+    );
+    assert_eq!(blocked.last_fold_graph_commit_id, None);
+    assert!(
+        blocked.lifecycle_revision > before_lane.lifecycle_revision,
+        "start, claim, and block publications must advance lifecycle authority"
+    );
+    let after = db
+        .snapshot_of(ReadTarget::branch("main"))
+        .await
+        .unwrap();
+    assert!(
+        after.version() > before.version(),
+        "the strict block is an operational manifest publication"
+    );
+    assert_eq!(
+        after.entry(TABLE).unwrap().table_version,
+        before.entry(TABLE).unwrap().table_version,
+        "strict blocking must not publish the rejected base-table rows"
+    );
+    let visible = visible_rows(&db).await;
+    assert_eq!(visible.len(), 1);
+    assert_eq!(visible[0].1, 7);
+    assert_no_recovery_sidecars(&dir);
+
+    let blocked_version = after.version();
+    let exact_retry_error = db
+        .failpoint_stream_quiesce_for_test(
+            TABLE,
+            drain_id,
+            before_lane.lifecycle_revision,
+            actor,
+        )
+        .await
+        .expect_err("an exact retry must return the selected block");
+    assert_eq!(exact_retry_error.to_string(), first_error.to_string());
+    assert_eq!(stream_lane(&db).await, blocked);
+    assert_eq!(
+        db.snapshot_of(ReadTarget::branch("main"))
+            .await
+            .unwrap()
+            .version(),
+        blocked_version,
+        "an exact blocked retry is lifecycle-inert"
+    );
+
+    drop(db);
+    let reopened = reopen_enrolled(&dir).await;
+    let reopen_error = reopened
+        .failpoint_stream_quiesce_for_test(
+            TABLE,
+            drain_id,
+            before_lane.lifecycle_revision,
+            actor,
+        )
+        .await
+        .expect_err("cold reopen must retain the same selected block");
+    assert_eq!(reopen_error.to_string(), first_error.to_string());
+    assert_eq!(stream_lane(&reopened).await, blocked);
+    assert_eq!(
+        reopened
+            .snapshot_of(ReadTarget::branch("main"))
+            .await
+            .unwrap()
+            .version(),
+        blocked_version,
+        "cold exact retry must not mint another block or claim"
+    );
+    assert_no_recovery_sidecars(&dir);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[serial]
+async fn quiesce_reopens_and_folds_an_acknowledged_post_claim_row_exactly_once() {
+    let _scenario = FailScenario::setup();
+    let (dir, db) = init_enrolled().await;
+    let epoch_before_claim = epoch_floor(&stream_lane(&db).await);
+    let batch = physical_batch(&db, &[("quiesced".to_string(), 17)]).await;
+    db.failpoint_stream_b1_for_test(TABLE, Some(batch), 0)
+        .await
+        .expect("the post-sentinel row must be durable before quiesce");
+    let after_put = stream_lane(&db).await;
+    assert!(
+        epoch_floor(&after_put) > epoch_before_claim,
+        "the cold put must first publish its empty writer claim"
+    );
+    assert!(
+        visible_rows(&db).await.is_empty(),
+        "a durability acknowledgement is not graph publication"
+    );
+    drop(db);
+
+    let reopened = reopen_enrolled(&dir).await;
+    let expected_revision = stream_lane(&reopened).await.lifecycle_revision;
+    let drain_id = "91919191-9191-4191-8191-919191919191";
+
+    reopened
+        .failpoint_stream_quiesce_for_test(
+            TABLE,
+            drain_id,
+            expected_revision,
+            "operator:quiesce-test",
+        )
+        .await
+        .expect("quiesce must preserve, fold, and publish the post-sentinel row");
+
+    let terminal = stream_lane(&reopened).await;
+    assert_eq!(terminal.lifecycle, "SEALED");
+    assert_eq!(terminal.drain_id, None);
+    assert_eq!(terminal.last_fold_outcome.as_deref(), Some("PUBLISHED"));
+    assert_eq!(
+        visible_rows(&reopened).await,
+        vec![("quiesced".to_string(), 17)]
+    );
+    assert_no_recovery_sidecars(&dir);
+
+    reopened
+        .failpoint_stream_quiesce_for_test(
+            TABLE,
+            drain_id,
+            expected_revision,
+            "operator:quiesce-test",
+        )
+        .await
+        .expect("an exact delayed retry must return from its selected terminal receipt");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[serial]
+async fn quiesce_reuses_a_published_drain_fold_after_receipt_arm_reopen() {
+    let _scenario = FailScenario::setup();
+    let (dir, db) = init_enrolled().await;
+    let row = physical_batch(&db, &[("published-drain-fold".to_string(), 19)]).await;
+    db.failpoint_stream_b1_for_test(TABLE, Some(row), 0)
+        .await
+        .expect("fixture row must be durably acknowledged");
+    let initial = stream_lane(&db).await;
+    let drain_id = "a2a2a2a2-a2a2-42a2-82a2-a2a2a2a2a2a2";
+    let actor = "operator:published-drain-fold";
+
+    let error = {
+        let _receipt_arm = ScopedFailPoint::new(
+            names::STREAM_LIFECYCLE_RECEIPT_POST_SIDECAR_PRE_TOKEN_COMMIT,
+            "return",
+        );
+        db.failpoint_stream_quiesce_for_test(TABLE, drain_id, initial.lifecycle_revision, actor)
+            .await
+            .expect_err("quiesce must stop after publishing the drain fold")
+    };
+    assert!(
+        error
+            .to_string()
+            .contains(names::STREAM_LIFECYCLE_RECEIPT_POST_SIDECAR_PRE_TOKEN_COMMIT),
+        "{error:?}"
+    );
+    let folded = stream_lane(&db).await;
+    assert_eq!(folded.lifecycle, "DRAINING");
+    assert_eq!(folded.last_fold_outcome.as_deref(), Some("PUBLISHED"));
+    let folded_epoch = epoch_floor(&folded);
+    assert_eq!(
+        visible_rows(&db).await,
+        vec![("published-drain-fold".to_string(), 19)]
+    );
+    assert_eq!(
+        helpers::recovery::sidecar_operation_ids(dir.path()).len(),
+        1,
+        "the armed lifecycle receipt must remain for recovery"
+    );
+    drop(db);
+
+    let reopened = reopen_enrolled(&dir).await;
+    let recovered = stream_lane(&reopened).await;
+    assert_eq!(recovered.lifecycle, "DRAINING");
+    assert_eq!(epoch_floor(&recovered), folded_epoch);
+    assert_no_recovery_sidecars(&dir);
+
+    reopened
+        .failpoint_stream_quiesce_for_test(TABLE, drain_id, initial.lifecycle_revision, actor)
+        .await
+        .expect("restart must reuse the published drain-fold empty successor");
+    let terminal = stream_lane(&reopened).await;
+    assert_eq!(terminal.lifecycle, "SEALED");
+    assert_eq!(
+        epoch_floor(&terminal),
+        folded_epoch,
+        "published drain-fold continuation must not mint a fresh writer epoch"
+    );
+    assert_eq!(
+        visible_rows(&reopened).await,
+        vec![("published-drain-fold".to_string(), 19)]
+    );
+    assert_no_recovery_sidecars(&dir);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[serial]
+async fn empty_quiesce_is_idempotent_and_refuses_rebound_or_stale_requests() {
+    let _scenario = FailScenario::setup();
+    let (dir, db) = init_enrolled().await;
+    let expected_revision = stream_lane(&db).await.lifecycle_revision;
+    let drain_id = "92929292-9292-4292-8292-929292929292";
+    let actor = "operator:empty-quiesce-test";
+    db.failpoint_stream_quiesce_for_test(TABLE, drain_id, expected_revision, actor)
+        .await
+        .expect("an empty lane must reach SEALED through a receipt-backed fence cut");
+
+    let terminal = stream_lane(&db).await;
+    assert_eq!(terminal.lifecycle, "SEALED");
+    assert_eq!(terminal.last_fold_outcome, None);
+    assert!(visible_rows(&db).await.is_empty());
+    assert_no_recovery_sidecars(&dir);
+
+    let (left, right) = tokio::join!(
+        db.failpoint_stream_quiesce_for_test(TABLE, drain_id, expected_revision, actor),
+        db.failpoint_stream_quiesce_for_test(TABLE, drain_id, expected_revision, actor),
+    );
+    left.expect("first concurrent exact retry must replay the terminal receipt");
+    right.expect("second concurrent exact retry must replay the terminal receipt");
+
+    for (revision, rebound_actor) in [
+        (expected_revision, "operator:replacement"),
+        (expected_revision + 1, actor),
+    ] {
+        let error = db
+            .failpoint_stream_quiesce_for_test(TABLE, drain_id, revision, rebound_actor)
+            .await
+            .expect_err("the same operation ID cannot be rebound");
+        assert!(
+            matches!(error, OmniError::StreamLifecycleIdempotencyConflict { .. }),
+            "{error:?}"
+        );
+    }
+
+    let stale = db
+        .failpoint_stream_quiesce_for_test(
+            TABLE,
+            "93939393-9393-4393-8393-939393939393",
+            expected_revision,
+            actor,
+        )
+        .await
+        .expect_err("a new operation ID may not retarget a stale OPEN revision");
+    assert!(
+        matches!(
+            stale,
+            OmniError::StreamLifecycleChanged {
+                expected_revision: observed,
+                current_revision,
+                ..
+            } if observed == expected_revision && current_revision == terminal.lifecycle_revision
+        ),
+        "{stale:?}"
+    );
+    assert_eq!(stream_lane(&db).await, terminal);
+    assert_no_recovery_sidecars(&dir);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[serial]
+async fn quiesce_continues_the_same_drain_after_crashing_before_its_claim() {
+    let _scenario = FailScenario::setup();
+    let (dir, db) = init_enrolled().await;
+    let initial = stream_lane(&db).await;
+    let drain_id = "94949494-9494-4494-8494-949494949494";
+    let actor = "operator:pre-claim-retry";
+
+    let error = {
+        let _before_claim = ScopedFailPoint::new(names::RECOVERY_SIDECAR_WRITE, "return");
+        db.failpoint_stream_quiesce_for_test(TABLE, drain_id, initial.lifecycle_revision, actor)
+            .await
+            .expect_err("claim-sidecar refusal must interrupt the new drain")
+    };
+    assert!(
+        error.to_string().contains(names::RECOVERY_SIDECAR_WRITE),
+        "{error:?}"
+    );
+    let draining = stream_lane(&db).await;
+    assert_eq!(draining.lifecycle, "DRAINING");
+    assert_eq!(draining.drain_id.as_deref(), Some(drain_id));
+    assert_eq!(draining.lifecycle_revision, initial.lifecycle_revision + 1);
+    assert_eq!(
+        epoch_floor(&draining),
+        epoch_floor(&initial),
+        "failure before the claim sidecar must not move shard authority"
+    );
+    assert_no_recovery_sidecars(&dir);
+
+    db.failpoint_stream_quiesce_for_test(TABLE, drain_id, initial.lifecycle_revision, actor)
+        .await
+        .expect("the exact request must continue its durable DRAINING descriptor");
+    assert_eq!(stream_lane(&db).await.lifecycle, "SEALED");
+    assert!(visible_rows(&db).await.is_empty());
+    assert_no_recovery_sidecars(&dir);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[serial]
+async fn quiesce_replays_an_unsealed_claim_after_reopen() {
+    let _scenario = FailScenario::setup();
+    let (dir, db) = init_enrolled().await;
+    let row = physical_batch(&db, &[("claim-before-seal".to_string(), 21)]).await;
+    db.failpoint_stream_b1_for_test(TABLE, Some(row), 0)
+        .await
+        .expect("fixture row must be durably acknowledged");
+    let initial = stream_lane(&db).await;
+    let drain_id = "95959595-9595-4595-8595-959595959595";
+    let actor = "operator:claim-before-seal";
+    let retired =
+        helpers::failpoint::Rendezvous::park_first(names::STREAM_B1_AFTER_RETIREMENT_RELEASE);
+
+    let error = {
+        let _before_seal = ScopedFailPoint::new(names::STREAM_B1_BEFORE_FORCE_SEAL, "return");
+        db.failpoint_stream_quiesce_for_test(TABLE, drain_id, initial.lifecycle_revision, actor)
+            .await
+            .expect_err("the fresh drain claim must stop before sealing")
+    };
+    assert!(
+        matches!(error, OmniError::RecoveryRequired { .. })
+            && error
+                .to_string()
+                .contains(names::STREAM_B1_BEFORE_FORCE_SEAL),
+        "{error:?}"
+    );
+    retired.wait_until_reached().await;
+    retired.release();
+    let failed = stream_lane(&db).await;
+    assert_eq!(failed.lifecycle, "DRAINING");
+    assert!(
+        epoch_floor(&failed) > epoch_floor(&initial),
+        "the terminal drain claim must be selected before sealing"
+    );
+    assert!(visible_rows(&db).await.is_empty());
+    assert_no_recovery_sidecars(&dir);
+    drop(db);
+
+    let reopened = reopen_enrolled(&dir).await;
+    reopened
+        .failpoint_stream_quiesce_for_test(TABLE, drain_id, initial.lifecycle_revision, actor)
+        .await
+        .expect("restart must make one fresh claim for the unsealed replay");
+    let terminal = stream_lane(&reopened).await;
+    assert_eq!(terminal.lifecycle, "SEALED");
+    assert!(
+        epoch_floor(&terminal) > epoch_floor(&failed),
+        "non-empty unsealed replay requires one successor claim"
+    );
+    assert_eq!(
+        visible_rows(&reopened).await,
+        vec![("claim-before-seal".to_string(), 21)]
+    );
+    assert_no_recovery_sidecars(&dir);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[serial]
+async fn quiesce_reuses_the_exact_flushed_cut_after_reopen() {
+    let _scenario = FailScenario::setup();
+    let (dir, db) = init_enrolled().await;
+    let row = physical_batch(&db, &[("sealed-before-fold".to_string(), 31)]).await;
+    db.failpoint_stream_b1_for_test(TABLE, Some(row), 0)
+        .await
+        .expect("fixture row must be durably acknowledged");
+    let initial = stream_lane(&db).await;
+    let drain_id = "96969696-9696-4696-8696-969696969696";
+    let actor = "operator:sealed-before-fold";
+
+    let error = {
+        let _after_drain =
+            ScopedFailPoint::new(names::STREAM_FOLD_POST_DRAIN_PRE_SIDECAR, "return");
+        db.failpoint_stream_quiesce_for_test(TABLE, drain_id, initial.lifecycle_revision, actor)
+            .await
+            .expect_err("the proven flushed cut must stop before fold-sidecar arm")
+    };
+    assert!(
+        error
+            .to_string()
+            .contains(names::STREAM_FOLD_POST_DRAIN_PRE_SIDECAR),
+        "{error:?}"
+    );
+    let failed = stream_lane(&db).await;
+    assert_eq!(failed.lifecycle, "DRAINING");
+    assert!(epoch_floor(&failed) > epoch_floor(&initial));
+    assert!(visible_rows(&db).await.is_empty());
+    assert_no_recovery_sidecars(&dir);
+    drop(db);
+
+    let reopened = reopen_enrolled(&dir).await;
+    reopened
+        .failpoint_stream_quiesce_for_test(TABLE, drain_id, initial.lifecycle_revision, actor)
+        .await
+        .expect("restart must reuse and publish the exact flushed generation");
+    let terminal = stream_lane(&reopened).await;
+    assert_eq!(terminal.lifecycle, "SEALED");
+    assert_eq!(
+        epoch_floor(&terminal),
+        epoch_floor(&failed),
+        "a proven flushed cut must not mint another writer claim"
+    );
+    assert_eq!(
+        visible_rows(&reopened).await,
+        vec![("sealed-before-fold".to_string(), 31)]
+    );
+    assert_no_recovery_sidecars(&dir);
+}
+
+#[tokio::test]
+#[serial]
+async fn disabled_profile_refuses_fresh_quiesce_without_effect() {
+    let _scenario = FailScenario::setup();
+    let (dir, db) = init_enrolled_disabled().await;
+    let before_status = db.stream_status().await.unwrap();
+    let before_snapshot = db.snapshot_of(ReadTarget::branch("main")).await.unwrap();
+    let expected_revision = before_status.tables[0].lifecycle_revision;
+
+    let error = db
+        .failpoint_stream_quiesce_for_test(
+            TABLE,
+            "97979797-9797-4797-8797-979797979797",
+            expected_revision,
+            "operator:disabled-quiesce",
+        )
+        .await
+        .expect_err("DISABLED profile cannot start a fresh quiesce");
+    assert!(
+        matches!(
+            error,
+            OmniError::StreamingRequiresClusterRuntime { ref mode } if mode == "DISABLED"
+        ),
+        "{error:?}"
+    );
+    assert_eq!(db.stream_status().await.unwrap(), before_status);
+    let after_snapshot = db.snapshot_of(ReadTarget::branch("main")).await.unwrap();
+    assert_eq!(after_snapshot.version(), before_snapshot.version());
+    assert_eq!(
+        after_snapshot.entry(TABLE).unwrap().table_version,
+        before_snapshot.entry(TABLE).unwrap().table_version
+    );
+    assert!(visible_rows(&db).await.is_empty());
+    assert_no_recovery_sidecars(&dir);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[serial]
+async fn quiesce_receipt_recovery_boundaries_reopen_cleanly_and_replay_once() {
+    let _scenario = FailScenario::setup();
+    struct Boundary {
+        name: &'static str,
+        drain_id: &'static str,
+        failpoint: &'static str,
+        action: &'static str,
+        terminal_on_reopen: bool,
+    }
+    let boundaries = [
+        Boundary {
+            name: "armed before token effect",
+            drain_id: "98989898-9898-4898-8898-989898989898",
+            failpoint: names::STREAM_LIFECYCLE_RECEIPT_POST_SIDECAR_PRE_TOKEN_COMMIT,
+            action: "return",
+            terminal_on_reopen: false,
+        },
+        Boundary {
+            name: "token effect before confirmation",
+            drain_id: "99999999-9999-4999-8999-999999999999",
+            failpoint: names::RECOVERY_SIDECAR_CONFIRM,
+            // The stock-manifest checkpoint and terminal empty claim each
+            // confirm before the lifecycle receipt.
+            action: "2*off->return",
+            terminal_on_reopen: true,
+        },
+        Boundary {
+            name: "confirmed receipt before terminal manifest",
+            drain_id: "a0a0a0a0-a0a0-40a0-80a0-a0a0a0a0a0a0",
+            failpoint: names::RECOVERY_BEFORE_ROLL_FORWARD_PUBLISH,
+            // The terminal empty claim publishes before the lifecycle
+            // receipt; the stock-manifest checkpoint uses its own publisher.
+            action: "1*off->return",
+            terminal_on_reopen: true,
+        },
+        Boundary {
+            name: "terminal manifest before audit",
+            drain_id: "a1a1a1a1-a1a1-41a1-81a1-a1a1a1a1a1a1",
+            failpoint: names::RECOVERY_RECORD_AUDIT,
+            // The terminal empty claim audits before the lifecycle receipt;
+            // the stock-manifest checkpoint is not a terminal audit outcome.
+            action: "1*off->return",
+            terminal_on_reopen: true,
+        },
+    ];
+
+    for boundary in boundaries {
+        let (dir, db) = init_enrolled().await;
+        let expected_revision = stream_lane(&db).await.lifecycle_revision;
+        let actor = format!("operator:{}", boundary.name.replace(' ', "-"));
+        let error = {
+            let _cut = ScopedFailPoint::new(boundary.failpoint, boundary.action);
+            db.failpoint_stream_quiesce_for_test(
+                TABLE,
+                boundary.drain_id,
+                expected_revision,
+                &actor,
+            )
+            .await
+            .expect_err(boundary.name)
+        };
+        assert!(
+            error.to_string().contains(boundary.failpoint),
+            "{}: {error:?}",
+            boundary.name
+        );
+        assert_eq!(
+            helpers::recovery::sidecar_operation_ids(dir.path()).len(),
+            1,
+            "{} must retain exactly its lifecycle-receipt sidecar",
+            boundary.name
+        );
+        assert!(
+            visible_rows(&db).await.is_empty(),
+            "{} cannot invent graph content",
+            boundary.name
+        );
+        drop(db);
+
+        let reopened = reopen_enrolled(&dir).await;
+        assert_no_recovery_sidecars(&dir);
+        let after_open = stream_lane(&reopened).await;
+        assert_eq!(
+            after_open.lifecycle,
+            if boundary.terminal_on_reopen {
+                "SEALED"
+            } else {
+                "DRAINING"
+            },
+            "{}",
+            boundary.name
+        );
+
+        reopened
+            .failpoint_stream_quiesce_for_test(TABLE, boundary.drain_id, expected_revision, &actor)
+            .await
+            .unwrap_or_else(|error| panic!("{} did not continue: {error:?}", boundary.name));
+        let terminal = stream_lane(&reopened).await;
+        assert_eq!(terminal.lifecycle, "SEALED", "{}", boundary.name);
+        assert!(visible_rows(&reopened).await.is_empty());
+        assert_no_recovery_sidecars(&dir);
+        let audit = helpers::recovery::recovery_audit_kinds(dir.path()).await;
+
+        reopened
+            .failpoint_stream_quiesce_for_test(TABLE, boundary.drain_id, expected_revision, &actor)
+            .await
+            .unwrap_or_else(|error| {
+                panic!("{} exact terminal replay failed: {error:?}", boundary.name)
+            });
+        assert_eq!(stream_lane(&reopened).await, terminal);
+        assert_eq!(
+            helpers::recovery::recovery_audit_kinds(dir.path()).await,
+            audit,
+            "{} exact replay must not duplicate its audit",
+            boundary.name
+        );
+        assert_no_recovery_sidecars(&dir);
+    }
 }
 
 #[tokio::test]
@@ -1007,13 +1895,13 @@ async fn crash_after_both_effects_reconstructs_confirmation_then_open_rolls_forw
         .unwrap();
 
     let error = {
-        let _failpoint = ScopedFailPoint::new(
-            names::STREAM_FOLD_POST_TOKEN_COMMIT_PRE_CONFIRM,
-            "return",
-        );
+        let _failpoint =
+            ScopedFailPoint::new(names::STREAM_FOLD_POST_TOKEN_COMMIT_PRE_CONFIRM, "return");
         db.failpoint_stream_b1_for_test(TABLE, None, 0)
             .await
-            .expect_err("both exact effects without confirmation must retain recovery-v12 ownership")
+            .expect_err(
+                "both exact effects without confirmation must retain recovery-v12 ownership",
+            )
     };
     assert!(
         matches!(error, OmniError::RecoveryRequired { .. }),
@@ -1086,7 +1974,7 @@ async fn fold_sidecar_arm_failure_leaves_no_table_effect_and_retries_the_exact_c
 #[tokio::test]
 #[serial]
 async fn crash_after_arm_before_any_effect_retires_the_intent_effect_free() {
-    // The armed-but-no-effect boundary: the recovery-v12 intent is durable
+    // The armed-but-no-effect boundary: the recovery-v14 intent is durable
     // while both exact Lance participants are untouched.  Recovery must take
     // the `EffectFree` arm — retire the intent and publish nothing — rather
     // than roll a phantom outcome forward.  The acknowledged generation stays
@@ -1171,7 +2059,6 @@ async fn crash_after_arm_before_any_effect_retires_the_intent_effect_free() {
 async fn fold_confirmation_failure_reconstructs_exact_n_plus_one_on_reopen() {
     let _scenario = FailScenario::setup();
     let (dir, db) = init_enrolled().await;
-    let audit_before = helpers::recovery::recovery_audit_kinds(dir.path()).await;
     let batch = physical_batch(&db, &[("confirm-failure".to_string(), 35)]).await;
     db.failpoint_stream_b1_for_test(TABLE, Some(batch), 0)
         .await
@@ -1192,6 +2079,7 @@ async fn fold_confirmation_failure_reconstructs_exact_n_plus_one_on_reopen() {
         1
     );
     assert!(visible_rows(&db).await.is_empty());
+    let audit_after_failure = helpers::recovery::recovery_audit_kinds(dir.path()).await;
     drop(db);
 
     let reopened = Omnigraph::open(dir.path().to_str().unwrap())
@@ -1203,8 +2091,11 @@ async fn fold_confirmation_failure_reconstructs_exact_n_plus_one_on_reopen() {
     );
     assert!(helpers::recovery::sidecar_operation_ids(dir.path()).is_empty());
     let audit_after = helpers::recovery::recovery_audit_kinds(dir.path()).await;
-    assert_eq!(&audit_after[..audit_before.len()], audit_before.as_slice());
-    assert_eq!(audit_after.len(), audit_before.len() + 1);
+    assert_eq!(
+        &audit_after[..audit_after_failure.len()],
+        audit_after_failure.as_slice()
+    );
+    assert_eq!(audit_after.len(), audit_after_failure.len() + 1);
     assert_eq!(
         audit_after.last().map(String::as_str),
         Some("RolledForward")
@@ -1254,11 +2145,11 @@ async fn confirmed_fold_refuses_before_publish_then_reopen_rolls_forward() {
 async fn fold_audit_failure_after_manifest_publish_converges_exactly_once() {
     let _scenario = FailScenario::setup();
     let (dir, db) = init_enrolled().await;
-    let audit_before = helpers::recovery::recovery_audit_kinds(dir.path()).await;
     let batch = physical_batch(&db, &[("post-publish-audit".to_string(), 37)]).await;
     db.failpoint_stream_b1_for_test(TABLE, Some(batch), 0)
         .await
         .unwrap();
+    let audit_before = helpers::recovery::recovery_audit_kinds(dir.path()).await;
 
     let error = {
         let _audit = ScopedFailPoint::new(names::RECOVERY_RECORD_AUDIT, "return");
@@ -1274,9 +2165,10 @@ async fn fold_audit_failure_after_manifest_publish_converges_exactly_once() {
         helpers::recovery::sidecar_operation_ids(dir.path()).len(),
         1
     );
+    let audit_after_failure = helpers::recovery::recovery_audit_kinds(dir.path()).await;
     assert_eq!(
-        helpers::recovery::recovery_audit_kinds(dir.path()).await,
-        audit_before
+        audit_after_failure, audit_before,
+        "the failed fold audit must leave no partial audit row"
     );
     drop(db);
 
@@ -1289,7 +2181,10 @@ async fn fold_audit_failure_after_manifest_publish_converges_exactly_once() {
     );
     assert!(helpers::recovery::sidecar_operation_ids(dir.path()).is_empty());
     let audit_after = helpers::recovery::recovery_audit_kinds(dir.path()).await;
-    assert_eq!(&audit_after[..audit_before.len()], audit_before.as_slice());
+    assert_eq!(
+        &audit_after[..audit_before.len()],
+        audit_before.as_slice()
+    );
     assert_eq!(audit_after.len(), audit_before.len() + 1);
     assert_eq!(
         audit_after.last().map(String::as_str),
@@ -1311,7 +2206,6 @@ async fn fold_audit_failure_after_manifest_publish_converges_exactly_once() {
 async fn fold_sidecar_delete_failure_keeps_success_and_next_barrier_cleans_up() {
     let _scenario = FailScenario::setup();
     let (dir, db) = init_enrolled().await;
-    let audit_before = helpers::recovery::recovery_audit_kinds(dir.path()).await;
     let batch = physical_batch(&db, &[("cleanup-retry".to_string(), 38)]).await;
     db.failpoint_stream_b1_for_test(TABLE, Some(batch), 0)
         .await
@@ -1331,17 +2225,16 @@ async fn fold_sidecar_delete_failure_keeps_success_and_next_barrier_cleans_up() 
             1
         );
     }
+    let audit_before_cleanup = helpers::recovery::recovery_audit_kinds(dir.path()).await;
 
     db.refresh()
         .await
         .expect("the next recovery barrier must consume the already-visible sidecar");
     assert!(helpers::recovery::sidecar_operation_ids(dir.path()).is_empty());
     let audit_after = helpers::recovery::recovery_audit_kinds(dir.path()).await;
-    assert_eq!(&audit_after[..audit_before.len()], audit_before.as_slice());
-    assert_eq!(audit_after.len(), audit_before.len() + 1);
     assert_eq!(
-        audit_after.last().map(String::as_str),
-        Some("RolledForward")
+        audit_after, audit_before_cleanup,
+        "cleanup retry must not duplicate the already-recorded fold audit"
     );
 }
 
@@ -1375,7 +2268,7 @@ async fn independently_opened_handles_share_one_writer_domain() {
 #[serial]
 async fn ordinary_writer_waits_out_the_fold_exclusive_admission_domain() {
     let _scenario = FailScenario::setup();
-    let (_dir, db) = init_enrolled().await;
+    let (_dir, db) = init_enrolled_served_with_schema(STREAM_SCHEMA).await;
     let batch = physical_batch(&db, &[("streamed".to_string(), 1)]).await;
     db.failpoint_stream_b1_for_test(TABLE, Some(batch), 0)
         .await
@@ -1427,7 +2320,7 @@ async fn ordinary_writer_waits_out_the_fold_exclusive_admission_domain() {
 #[serial]
 async fn fold_refuses_an_unresolved_main_sidecar_on_another_table() {
     let _scenario = FailScenario::setup();
-    let (dir, db) = init_enrolled_with_schema(TWO_TABLE_STREAM_SCHEMA).await;
+    let (dir, db) = init_enrolled_served_with_schema(TWO_TABLE_STREAM_SCHEMA).await;
     let batch = physical_batch(&db, &[("streamed".to_string(), 1)]).await;
     db.failpoint_stream_b1_for_test(TABLE, Some(batch), 0)
         .await
@@ -1841,17 +2734,35 @@ async fn post_watcher_epoch_loss_is_ack_unknown_not_a_clean_ack() {
         visible_rows(&db).await.is_empty(),
         "watcher success alone must not make the row graph-visible"
     );
+    let inventory_before_abort = mem_wal_inventory(db.uri()).await;
 
     successor
         .abort()
         .await
         .expect("the test-only successor must retire cleanly");
-    db.failpoint_stream_b1_for_test(TABLE, None, 0)
+    let fold_error = db
+        .failpoint_stream_b1_for_test(TABLE, None, 0)
         .await
-        .expect("the ambiguous durable row must remain replayable and fold exactly once");
-    assert_eq!(
-        visible_rows(&db).await,
-        vec![("fenced-after-durable".to_string(), 18)]
+        .expect_err("an unledgered foreign epoch must remain fail-closed");
+    assert!(
+        matches!(fold_error, OmniError::RecoveryRequired { .. }),
+        "{fold_error:?}"
+    );
+    assert!(
+        fold_error
+            .to_string()
+            .contains("stream_claim_physical_prestate"),
+        "the refusal must identify the physical epoch/read-set mismatch: {fold_error:?}"
+    );
+    assert!(
+        visible_rows(&db).await.is_empty(),
+        "an unledgered foreign epoch cannot authorize graph publication"
+    );
+    let inventory_after_refusal = mem_wal_inventory(db.uri()).await;
+    assert_inventory_retained(
+        &inventory_before_abort,
+        &inventory_after_refusal,
+        "unledgered foreign-epoch refusal",
     );
 }
 
@@ -2030,9 +2941,10 @@ async fn flushed_unmerged_generation_resumes_fold_only_and_refuses_a_second_gene
 #[serial]
 async fn strict_fold_validation_failure_keeps_manifest_old_and_stream_fold_only() {
     let _scenario = FailScenario::setup();
-    let dir = tempfile::tempdir().unwrap();
+    let cluster = tempfile::tempdir().unwrap();
+    let graph = cluster.path().join("graphs/knowledge.omni");
     let db = Arc::new(
-        Omnigraph::init(dir.path().to_str().unwrap(), UNIQUE_STREAM_SCHEMA)
+        Omnigraph::init(graph.to_str().unwrap(), UNIQUE_STREAM_SCHEMA)
             .await
             .unwrap(),
     );
@@ -2047,28 +2959,34 @@ async fn strict_fold_validation_failure_keeps_manifest_old_and_stream_fold_only(
     db.failpoint_enroll_stream_table_for_test(TABLE)
         .await
         .unwrap();
-    let manifest_before = db
-        .snapshot_of(ReadTarget::branch("main"))
-        .await
-        .unwrap()
-        .version();
+    enable_stream_profile(&db, &format!("file://{}", cluster.path().display())).await;
 
     let duplicate = physical_batch(&db, &[("duplicate-id".to_string(), 7)]).await;
     db.failpoint_stream_b1_for_test(TABLE, Some(duplicate), 0)
         .await
         .expect("base-dependent uniqueness is fold-time work");
+    let snapshot_before_fold = db
+        .snapshot_of(ReadTarget::branch("main"))
+        .await
+        .unwrap();
     let fold_error = db
         .failpoint_stream_b1_for_test(TABLE, None, 0)
         .await
         .expect_err("strict fold must reject a committed uniqueness conflict");
     assert!(fold_error.to_string().contains("unique"), "{fold_error:?}");
+    let snapshot_after_fold = db
+        .snapshot_of(ReadTarget::branch("main"))
+        .await
+        .unwrap();
     assert_eq!(
-        db.snapshot_of(ReadTarget::branch("main"))
-            .await
-            .unwrap()
-            .version(),
-        manifest_before,
-        "validation failure occurs before sidecar, table effect, or manifest CAS"
+        snapshot_after_fold.version(),
+        snapshot_before_fold.version(),
+        "validation failure occurs before any fold manifest CAS"
+    );
+    assert_eq!(
+        snapshot_after_fold.entry(TABLE).unwrap().table_version,
+        snapshot_before_fold.entry(TABLE).unwrap().table_version,
+        "validation failure occurs before any fold base-table effect"
     );
     let visible = visible_rows(&db).await;
     assert_eq!(visible.len(), 1);
@@ -2324,8 +3242,7 @@ async fn b2_ack_unknown_retry_cannot_overwrite_a_later_winner() {
         .expect("the ambiguous X occurrence must replay and fold exactly once");
 
     {
-        let _must_not_put =
-            ScopedFailPoint::new(names::STREAM_B1_BEFORE_PUT_INVOKE, "return");
+        let _must_not_put = ScopedFailPoint::new(names::STREAM_B1_BEFORE_PUT_INVOKE, "return");
         let exact_x = b2_put_score(
             &db,
             &incarnation,
@@ -2358,8 +3275,7 @@ async fn b2_ack_unknown_retry_cannot_overwrite_a_later_winner() {
         .expect("Y must fold and become the current winner");
 
     let stale_x = {
-        let _must_not_put =
-            ScopedFailPoint::new(names::STREAM_B1_BEFORE_PUT_INVOKE, "return");
+        let _must_not_put = ScopedFailPoint::new(names::STREAM_B1_BEFORE_PUT_INVOKE, "return");
         b2_put_score(
             &db,
             &incarnation,
@@ -2374,9 +3290,9 @@ async fn b2_ack_unknown_retry_cannot_overwrite_a_later_winner() {
         .expect_err("an old exact occurrence cannot displace a later winner")
     };
     match stale_x {
-        OmniError::StreamSequenceConflict {
-            current_token, ..
-        } => assert_eq!(current_token.as_deref(), Some(token_y.as_str())),
+        OmniError::StreamSequenceConflict { current_token, .. } => {
+            assert_eq!(current_token.as_deref(), Some(token_y.as_str()))
+        }
         other => panic!("stale X must be a StreamSequenceConflict, got {other:?}"),
     }
     assert_eq!(
@@ -2466,7 +3382,10 @@ async fn b2_revalidates_authority_after_waiting_for_shared_admission() {
 async fn provider_write_failures_preserve_acknowledged_rows_and_type_outcomes_local() {
     let _scenario = FailScenario::setup();
     let dir = tempfile::tempdir().unwrap();
-    let uri = dir.path().to_str().unwrap().to_string();
+    let uri = format!(
+        "{}/graphs/knowledge.omni",
+        dir.path().to_str().unwrap().trim_end_matches('/')
+    );
     enroll_stream_at(&uri).await;
 
     let failure = ProviderWriteFailure::default();
@@ -2480,11 +3399,13 @@ async fn provider_write_failures_preserve_acknowledged_rows_and_type_outcomes_lo
                 .await
                 .expect("the enrolled fixture must reopen under the provider wrapper"),
         );
-        let version_before = db
+        let table_version_before = db
             .snapshot_of(ReadTarget::branch("main"))
             .await
             .unwrap()
-            .version();
+            .entry(TABLE)
+            .unwrap()
+            .table_version;
 
         // A cold writer must first durably claim its epoch in the shard
         // manifest. Failing that provider write happens before put_no_wait, so
@@ -2519,8 +3440,10 @@ async fn provider_write_failures_preserve_acknowledged_rows_and_type_outcomes_lo
             db.snapshot_of(ReadTarget::branch("main"))
                 .await
                 .unwrap()
-                .version(),
-            version_before,
+                .entry(TABLE)
+                .unwrap()
+                .table_version,
+            table_version_before,
             "provider refusal before put invocation cannot advance graph visibility"
         );
 
@@ -2575,18 +3498,25 @@ async fn provider_write_failures_preserve_acknowledged_rows_and_type_outcomes_lo
             db.snapshot_of(ReadTarget::branch("main"))
                 .await
                 .unwrap()
-                .version(),
-            version_before + 1,
-            "only the recovery fold's manifest CAS may make the acknowledged row visible"
+                .entry(TABLE)
+                .unwrap()
+                .table_version,
+            table_version_before + 1,
+            "only the recovery fold may advance the base table and make the acknowledged row visible"
         );
     })
     .await;
 }
 
 async fn provider_generation_failure_retains_unreferenced_generation_at(
-    uri: &str,
+    cluster_uri: &str,
     target: ProviderFailureTarget,
 ) {
+    let uri = format!(
+        "{}/graphs/knowledge.omni",
+        cluster_uri.trim_end_matches('/')
+    );
+    let uri = uri.as_str();
     enroll_stream_at(uri).await;
     let failure = ProviderWriteFailure::default();
     let probes = QueryIoProbes {
@@ -2600,15 +3530,14 @@ async fn provider_generation_failure_retains_unreferenced_generation_at(
                 .await
                 .expect("the enrolled fixture must reopen under the provider wrapper"),
         );
-        let version_before = db
-            .snapshot_of(ReadTarget::branch("main"))
-            .await
-            .unwrap()
-            .version();
         let row = physical_batch(&db, &[("retained-after-failure".to_string(), 41)]).await;
         db.failpoint_stream_b1_for_test(TABLE, Some(row), 0)
             .await
             .expect("the row must be durably acknowledged before the fold failure");
+        let snapshot_before_failure = db
+            .snapshot_of(ReadTarget::branch("main"))
+            .await
+            .unwrap();
         let before_failure = mem_wal_inventory(uri).await;
         assert!(
             before_failure.generation_roots.is_empty(),
@@ -2657,13 +3586,19 @@ async fn provider_generation_failure_retains_unreferenced_generation_at(
             );
         }
         assert!(visible_rows(&db).await.is_empty());
+        let snapshot_after_failure = db
+            .snapshot_of(ReadTarget::branch("main"))
+            .await
+            .unwrap();
         assert_eq!(
-            db.snapshot_of(ReadTarget::branch("main"))
-                .await
-                .unwrap()
-                .version(),
-            version_before,
+            snapshot_after_failure.version(),
+            snapshot_before_failure.version(),
             "a flushed generation is not graph-visible without the graph manifest CAS"
+        );
+        assert_eq!(
+            snapshot_after_failure.entry(TABLE).unwrap().table_version,
+            snapshot_before_failure.entry(TABLE).unwrap().table_version,
+            "provider-refused generation output cannot advance the base-table pointer"
         );
 
         let after_failure = mem_wal_inventory(uri).await;

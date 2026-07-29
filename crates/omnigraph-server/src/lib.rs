@@ -916,7 +916,9 @@ impl ApiError {
             | OmniError::StreamingContentOperationUnsupported { .. }
             | OmniError::StreamingAuthorityMismatch { .. }
             | OmniError::StreamAuthorityRetired) => Self::conflict(err.to_string()),
-            err @ (OmniError::StreamBindingChanged { .. }
+            err @ (OmniError::StreamLifecycleChanged { .. }
+            | OmniError::StreamLifecycleIdempotencyConflict { .. }
+            | OmniError::StreamBindingChanged { .. }
             | OmniError::StreamSequenceConflict { .. }
             | OmniError::StreamIdempotencyConflict { .. }) => Self::conflict(err.to_string()),
             err @ OmniError::AckUnknown { .. } => Self::internal(err.to_string()),
@@ -1076,6 +1078,46 @@ mod api_error_tests {
         assert_eq!(details.limit, 8192);
         assert_eq!(details.actual, 8193);
         assert!(error.recovery_required.is_none());
+    }
+
+    #[tokio::test]
+    async fn lifecycle_management_conflicts_serialize_as_409() {
+        let cases = [
+            (
+                OmniError::StreamLifecycleChanged {
+                    stable_table_id: 41,
+                    table_incarnation_id: 43,
+                    expected_revision: 7,
+                    current_revision: 9,
+                },
+                "stream lifecycle changed for table 0000000000000029:000000000000002b: expected revision 7, current revision 9",
+            ),
+            (
+                OmniError::StreamLifecycleIdempotencyConflict {
+                    stable_table_id: 41,
+                    table_incarnation_id: 43,
+                    operation_kind: "QUIESCE".to_string(),
+                    operation_id: "44444444-4444-4444-8444-444444444444".to_string(),
+                },
+                "stream lifecycle idempotency conflict for table 0000000000000029:000000000000002b, operation QUIESCE '44444444-4444-4444-8444-444444444444'",
+            ),
+        ];
+
+        for (error, expected_message) in cases {
+            let response = ApiError::from_omni(error).into_response();
+            assert_eq!(response.status(), StatusCode::CONFLICT);
+            let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+                .await
+                .unwrap();
+            let error: ErrorOutput = serde_json::from_slice(&body).unwrap();
+            assert_eq!(error.code, Some(ErrorCode::Conflict));
+            assert_eq!(error.error, expected_message);
+            assert!(error.manifest_conflict.is_none());
+            assert!(error.read_set_conflict.is_none());
+            assert!(error.key_conflict.is_none());
+            assert!(error.resource_limit.is_none());
+            assert!(error.recovery_required.is_none());
+        }
     }
 }
 

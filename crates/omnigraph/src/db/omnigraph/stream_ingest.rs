@@ -7,20 +7,23 @@
 //! the graph authority checks around those primitives and the one
 //! `__manifest` publication which makes a folded generation visible.
 
-#[cfg(feature = "failpoints")]
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::BTreeMap;
 use std::sync::Arc;
 
-use arrow_array::{Array, RecordBatch, StringArray, UInt32Array};
+use arrow_array::{Array, BooleanArray, RecordBatch, StringArray, UInt32Array};
 use arrow_schema::Schema as ArrowSchema;
 use arrow_select::take::take;
 use datafusion::prelude::{col, lit};
 use futures::TryStreamExt;
 use lance::dataset::mem_wal::scanner::LsmScanner;
-use lance::dataset::mem_wal::{DatasetMemWalExt, ShardWriter};
+use lance::dataset::mem_wal::{DatasetMemWalExt, ShardManifestStore, ShardWriter, WalTailer};
 use lance_index::mem_wal::{MemWalIndexDetails, MergedGeneration, ShardId, ShardStatus};
 
-use crate::db::manifest::stream::{LastFoldOutcome, LastFoldSummary, StreamGenerationCut};
+use crate::db::manifest::stream::{
+    CLAIM_RECEIPT_TAG, ClaimProfile, DrainGoal, LastFoldOutcome, LastFoldSummary,
+    ManagementReceipt, StreamGenerationCut, stream_graph_identity_digest,
+    stream_quiesce_result_payload,
+};
 use crate::db::manifest::stream_token::{
     AdmissionClassification, AdmissionRequest, PayloadDigest, PayloadDigestInput,
     StreamFoldAttributionSummary, StreamRowOrigin, StreamToken, StreamTokenAuthorityRow,
@@ -29,31 +32,55 @@ use crate::db::manifest::stream_token::{
     stream_fold_attribution_commitment, validate_authority_base_pair,
 };
 use crate::db::manifest::token_store::{
-    add_stream_lookup_retained_bytes, lookup_stream_token_row, open_stream_token_authority_head,
-    stage_stream_token_upsert, stream_token_authority_entry_for_dataset,
-    stream_token_rows_for_keys, validate_stream_token_plan_bounds,
+    LifecycleLedgerRecord, add_stream_lookup_retained_bytes, lookup_lifecycle_ledger_record_by_id,
+    lookup_management_receipt, lookup_stream_token_row, open_stream_token_authority_head,
+    stage_lifecycle_ledger_records, stage_management_receipt, stage_stream_token_upsert,
+    stream_token_authority_entry_for_dataset, stream_token_rows_for_keys,
+    validate_stream_token_plan_bounds,
 };
 use crate::db::manifest::{
-    CurrentHeadWitness, RecoveryAuthorityToken, RecoveryLineageIntent, RecoveryStreamFoldCut,
+    CurrentHeadWitness, ExpectedTableVersions, ManifestChange, RecoveryAuthorityToken,
+    RecoveryLineageIntent, RecoveryProtocolV14, RecoveryStreamClaimContinuationV14,
+    RecoveryStreamClaimOutcomeV14, RecoveryStreamFoldCut, RecoveryStreamLifecycleReceiptKind,
     SidecarTablePin, StreamLifecycle, StreamLifecycleEntry, StreamPhysicalBinding, TableIdentity,
-    complete_stream_fold_sidecar_v12, confirm_stream_fold_sidecar_v12,
-    finalize_effect_free_stream_fold_sidecar_v12, list_sidecars, new_stream_fold_sidecar_v12,
+    TableVersionExpectation, arm_stream_claim_checkpoint_sidecar_v14,
+    arm_stream_claim_terminal_sidecar_v14, classify_effect_free_stream_claim_sidecar_v14,
+    complete_stream_claim_sidecar_v14, complete_stream_fold_sidecar_v14,
+    complete_stream_lifecycle_receipt_sidecar_v14, confirm_stream_claim_sidecar_v14,
+    confirm_stream_fold_sidecar_v14, confirm_stream_lifecycle_receipt_sidecar_v14,
+    finalize_effect_free_stream_fold_sidecar_v14, list_sidecars,
+    lookup_stream_claim_continuation_v14, new_stream_claim_sidecar_v14,
+    new_stream_drain_fold_sidecar_v14, new_stream_fold_v2_sidecar_v14,
+    new_stream_lifecycle_receipt_sidecar_v14, prepared_stream_claim_attempt_v14,
+    rearm_stream_claim_checkpoint_sidecar_v14, receipt_first_rearm_stream_claim_sidecar_v14,
     write_sidecar,
 };
 use crate::db::write_queue::StreamAdmissionKey;
 use crate::error::{OmniError, Result};
-use crate::storage_layer::SnapshotHandle;
+use crate::storage_layer::{SnapshotHandle, StagedHandle};
 use crate::table_store::mem_wal::{
     B1_MAX_GENERATION_ARROW_BYTES, B1_MAX_GENERATION_ROWS, B2_MAX_TOKEN_PROJECTION_ARROW_BYTES,
     CallerOrdinalRange, CheckedExclusiveStreamAuthority, CheckedStreamAuthority,
     ClaimedMemWalWorker, ConfirmedStreamTokenOverlay, ConfirmedStreamTokenOverlayRow,
-    DurableBatchAck, IdleAuthorityCheck, IdleAuthorityFailure, MemWalWorkerError,
-    OpenedMemWalWorker, PreparedPut, PreparedPutFailure, QueuedBatchPermit, SealedGenerationCut,
+    CurrentGenerationProjectionSource, DurableBatchAck, IdleAuthorityCheck, IdleAuthorityFailure,
+    MemWalWorkerError, OpenedMemWalWorker, PassiveB1PhysicalState, PassiveQuiesceDisposition,
+    PreparedPut, PreparedPutFailure, QueuedBatchPermit, QuiesceCut, SealedGenerationCut,
     StreamWorkerKey, WorkerOpenFailure, b1_input_accounting, b1_logical_batch_bytes,
-    capture_current_head_witness, reconstruct_b1_writer_config, validate_stream_config_v3_binding,
+    capture_current_head_witness, reconstruct_b1_writer_config, scan_flushed_generation_projection,
+    validate_b1_lifecycle_physical_state, validate_stream_config_v3_binding,
 };
 use crate::validate::{ChangeSet, CommittedState, TableChange};
 
+use super::stream_lifecycle::{
+    CanonicalDataBlockEvidence, ClaimAttemptEvidence, ClaimAttemptRequest, ClaimOperationRequest,
+    DataBlockEvidenceCollector, EmptyCutEvidence, QuiesceRequest, authenticate_claim_wal_segment,
+    build_claim_adoption_row, build_claim_attempt_effect, build_draining_data_block,
+    build_draining_to_sealed, build_open_to_draining, build_terminal_claim,
+    claim_wal_authentication_plan, claim_wal_key_discovery_plan, collect_claim_wal_segment_keys,
+    current_generation_lww_projection_digest, lifecycle_generation_lww_projection_digest,
+    prepare_claim_attempt, prepare_claim_operation, stream_quiesce_request_digest,
+    stream_quiesce_request_payload_from_draining,
+};
 use super::{Omnigraph, WriteTxn};
 
 const B1_MAX_FOLD_ATTEMPTS: usize = 2;
@@ -73,19 +100,20 @@ pub(crate) struct StreamTokenAdmissionAck {
 /// `head` is opened at the exact physical HEAD proven equal to the lifecycle
 /// witness.  It is safe to use for a later staged effect only while the caller
 /// retains the admission lease and performs the final gated revalidation.
-struct StreamAuthorityCapture {
-    txn: WriteTxn,
-    entry: crate::db::manifest::SubTableEntry,
-    lifecycle: StreamLifecycleEntry,
-    binding: StreamPhysicalBinding,
-    worker_key: StreamWorkerKey,
-    admission_key: StreamAdmissionKey,
-    shard_id: ShardId,
-    enrollment_id: ShardId,
-    epoch_floor: u64,
-    full_path: String,
-    head: SnapshotHandle,
-    details: MemWalIndexDetails,
+#[derive(Clone)]
+pub(super) struct StreamAuthorityCapture {
+    pub(super) txn: WriteTxn,
+    pub(super) entry: crate::db::manifest::SubTableEntry,
+    pub(super) lifecycle: StreamLifecycleEntry,
+    pub(super) binding: StreamPhysicalBinding,
+    pub(super) worker_key: StreamWorkerKey,
+    pub(super) admission_key: StreamAdmissionKey,
+    pub(super) shard_id: ShardId,
+    pub(super) enrollment_id: ShardId,
+    pub(super) epoch_floor: u64,
+    pub(super) full_path: String,
+    pub(super) head: SnapshotHandle,
+    pub(super) details: MemWalIndexDetails,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -94,10 +122,16 @@ struct AttributedFoldPlan {
     summary: StreamFoldAttributionSummary,
 }
 
+#[derive(Debug, Clone)]
+enum FoldLifecycleMode {
+    Open,
+    Draining { drain_id: String },
+}
+
 impl Omnigraph {
     /// Admit one already-normalized, non-empty physical batch through the
     /// feature-gated B1 substrate seam. Synthetic trusted envelopes make these
-    /// older worker/capacity tests exercise the active B2 fold and recovery-v12
+    /// older worker/capacity tests exercise the active lifecycle-v3 fold and recovery-v14
     /// path without exposing an unattributed writer in production.
     ///
     /// The `Arc` receiver is intentional.  The worker owns a detached task so
@@ -110,6 +144,11 @@ impl Omnigraph {
         batch: RecordBatch,
         caller_ordinals: CallerOrdinalRange,
     ) -> Result<DurableBatchAck> {
+        // Profile authority is outermost. Keeping this shared lease through
+        // admission and detached worker completion prevents a concurrent
+        // disable from waiting on our admission lease while a cold claim waits
+        // behind the disable's profile-exclusive lease.
+        let _profile_guard = self.write_queue().acquire_stream_profile_shared().await;
         // Refuse an oversized caller buffer synchronously before recovery IO,
         // authority capture, detached ownership, or a cold epoch claim.
         validate_stream_input_bounds(table_key, &batch)?;
@@ -118,8 +157,6 @@ impl Omnigraph {
             .prepare_keyed_write_batch(table_key, batch)
             .await?;
         validate_stream_input_bounds(table_key, &batch)?;
-        self.heal_pending_recovery_sidecars_for_write(&[None])
-            .await?;
         let provisional = self
             .capture_stream_authority(table_key, "stream put")
             .await?;
@@ -131,7 +168,7 @@ impl Omnigraph {
             .ok_or_else(|| {
                 OmniError::manifest_internal("validated B1 test batch has no exact Utf8 id column")
             })?;
-        let mut logical_ids = BTreeSet::new();
+        let mut logical_ids = std::collections::BTreeSet::new();
         for row in 0..batch.num_rows() {
             if ids.is_null(row) {
                 return Err(OmniError::manifest("stream row id must be non-null"));
@@ -162,10 +199,10 @@ impl Omnigraph {
         // the shared lease, so every read and every effect-free result below is
         // based on a fresh capture made after that lease and the same-key queue
         // are both owned.
-        self.ensure_no_relevant_stream_sidecar(key.identity, "stream put")
-            .await?;
         let prepared = self
             .capture_stream_authority(table_key, "stream put final admission")
+            .await?;
+        self.ensure_no_relevant_stream_sidecar_except_exact_claim(&prepared, "stream put")
             .await?;
         ensure_same_binding(key, &prepared, "stream put final admission authority")?;
         self.validate_stream_logical_admission_batch(&prepared, &batch)?;
@@ -324,6 +361,7 @@ impl Omnigraph {
         envelope: StreamWriteEnvelope,
         contributor_id: TrustedContributorId,
     ) -> Result<StreamTokenAdmissionAck> {
+        let _profile_guard = self.write_queue().acquire_stream_profile_shared().await;
         if batch.num_rows() != 1 {
             return Err(OmniError::manifest(format!(
                 "private B2 admission requires exactly one row, got {}",
@@ -358,8 +396,6 @@ impl Omnigraph {
             .validate()
             .map_err(|error| OmniError::manifest(error.to_string()))?;
 
-        self.heal_pending_recovery_sidecars_for_write(&[None])
-            .await?;
         let provisional = self
             .capture_stream_authority(table_key, "stream token admission")
             .await?;
@@ -388,11 +424,14 @@ impl Omnigraph {
             )
             .await?;
 
-        self.ensure_no_relevant_stream_sidecar(key.identity, "stream token admission")
-            .await?;
         let prepared = self
             .capture_stream_authority(table_key, "stream token final admission")
             .await?;
+        self.ensure_no_relevant_stream_sidecar_except_exact_claim(
+            &prepared,
+            "stream token admission",
+        )
+        .await?;
         ensure_same_binding(key, &prepared, "stream token final admission authority")?;
         self.validate_stream_logical_admission_batch(&prepared, &batch)?;
         let payload_digest = PayloadDigest::derive(&PayloadDigestInput {
@@ -644,7 +683,8 @@ impl Omnigraph {
                         .capture_stream_authority(&table_key, "stream idle eviction")
                         .await?;
                     ensure_same_binding(idle_key, &before, "stream idle eviction authority")?;
-                    validate_claimed_writer(&writer, idle_key, before.epoch_floor).await?;
+                    db.validate_claimed_writer_for_capture(&writer, idle_key, &before)
+                        .await?;
 
                     db.ensure_no_relevant_stream_sidecar(idle_key.identity, "stream idle eviction")
                         .await?;
@@ -652,7 +692,8 @@ impl Omnigraph {
                         .capture_stream_authority(&table_key, "stream idle eviction")
                         .await?;
                     ensure_same_capture(&before, &after, "stream idle eviction final authority")?;
-                    validate_claimed_writer(&writer, idle_key, after.epoch_floor).await
+                    db.validate_claimed_writer_for_capture(&writer, idle_key, &after)
+                        .await
                 }
                 .await;
                 match checked {
@@ -679,7 +720,8 @@ impl Omnigraph {
                                 .await?;
                             ensure_same_binding(key, &before, "stream put final authority")?;
                             db.validate_stream_admission_batch(&before, &admitted_batch)?;
-                            validate_claimed_writer(&writer, key, before.epoch_floor).await?;
+                            db.validate_claimed_writer_for_capture(&writer, key, &before)
+                                .await?;
 
                             db.ensure_no_relevant_stream_sidecar(key.identity, "stream put")
                                 .await?;
@@ -692,7 +734,8 @@ impl Omnigraph {
                                 "stream put final warm authority",
                             )?;
                             db.validate_stream_admission_batch(&after, &admitted_batch)?;
-                            validate_claimed_writer(&writer, key, after.epoch_floor).await
+                            db.validate_claimed_writer_for_capture(&writer, key, &after)
+                                .await
                         }
                         .await;
                         match checked {
@@ -702,11 +745,14 @@ impl Omnigraph {
                     }
                     None => {
                         let before = match async {
-                            db.ensure_no_relevant_stream_sidecar(key.identity, "stream put")
-                                .await?;
                             let before = db
                                 .capture_stream_authority(&prepare_table_key, "stream put")
                                 .await?;
+                            db.ensure_no_relevant_stream_sidecar_except_exact_claim(
+                                &before,
+                                "stream put",
+                            )
+                            .await?;
                             ensure_same_binding(key, &before, "stream put final authority")?;
                             db.validate_stream_admission_batch(&before, &admitted_batch)?;
                             Ok::<_, OmniError>(before)
@@ -718,43 +764,12 @@ impl Omnigraph {
                                 return Err(PreparedPutFailure::cold_unclaimed(error, authority));
                             }
                         };
-                        let config = match reconstruct_b1_writer_config(
-                            &before.details,
-                            before.enrollment_id,
-                            before.shard_id,
-                        )
-                        .map_err(worker_error)
-                        {
-                            Ok(config) => config,
-                            Err(error) => {
-                                return Err(PreparedPutFailure::cold_unclaimed(error, authority));
-                            }
-                        };
-                        let writer = match before
-                            .head
-                            .dataset()
-                            .mem_wal_writer(before.shard_id, config)
-                            .await
-                        {
-                            Ok(writer) => writer,
-                            Err(error) => {
-                                return Err(PreparedPutFailure::cold_unclaimed(
-                                    OmniError::Lance(error.to_string()),
-                                    authority,
-                                ));
-                            }
-                        };
-                        let claimed = ClaimedMemWalWorker::new(writer);
-                        if let Err(error) =
-                            validate_claimed_writer(claimed.writer(), key, before.epoch_floor).await
-                        {
-                            return Err(PreparedPutFailure::cold_claimed(
-                                error, authority, claimed,
-                            ));
-                        }
-                        let opened = match claimed
-                            .classify(&before.details, before.epoch_floor)
-                            .await
+                        let opened = match Box::pin(db.open_stream_writer_with_claim(
+                            &before,
+                            "COLD_PUT",
+                            Some("omnigraph:stream-runtime".to_string()),
+                        ))
+                        .await
                         {
                             Ok(opened) => opened,
                             Err(failure) => {
@@ -782,13 +797,14 @@ impl Omnigraph {
                             let after = db
                                 .capture_stream_authority(&prepare_table_key, "stream put")
                                 .await?;
-                            ensure_same_capture(
+                            ensure_claim_successor_capture(
                                 &before,
                                 &after,
                                 "stream put claim-to-put authority",
                             )?;
                             db.validate_stream_admission_batch(&after, &admitted_batch)?;
-                            validate_claimed_writer(opened.writer(), key, after.epoch_floor).await
+                            db.validate_claimed_writer_for_capture(opened.writer(), key, &after)
+                                .await
                         }
                         .await;
                         match checked {
@@ -833,8 +849,7 @@ impl Omnigraph {
     }
 
     async fn stream_fold_phase_b1_background(self: Arc<Self>, table_key: String) -> Result<()> {
-        self.heal_pending_recovery_sidecars_for_write(&[None])
-            .await?;
+        let _profile_guard = self.write_queue().acquire_stream_profile_shared().await;
         let provisional = self
             .capture_stream_authority(&table_key, "stream fold")
             .await?;
@@ -845,33 +860,23 @@ impl Omnigraph {
             .write_queue()
             .acquire_stream_exclusive(&admission_key)
             .await;
-        self.ensure_no_relevant_stream_sidecar(key.identity, "stream fold")
-            .await?;
         let before_cut = self
             .capture_stream_authority(&table_key, "stream fold")
             .await?;
+        self.ensure_no_relevant_stream_sidecar_except_exact_claim(&before_cut, "stream fold")
+            .await?;
         ensure_same_binding(key, &before_cut, "stream fold pre-cut authority")?;
 
-        let opener_head = before_cut.head.clone();
-        let opener_details = before_cut.details.clone();
-        let opener_enrollment = before_cut.enrollment_id;
-        let opener_shard = before_cut.shard_id;
-        let opener_epoch_floor = before_cut.epoch_floor;
+        let opener_db = Arc::clone(&self);
+        let opener_capture = before_cut.clone();
         let opener = Box::new(move || {
             Box::pin(async move {
-                let config =
-                    reconstruct_b1_writer_config(&opener_details, opener_enrollment, opener_shard)
-                        .map_err(WorkerOpenFailure::unclaimed)?;
-                let writer = opener_head
-                    .dataset()
-                    .mem_wal_writer(opener_shard, config)
-                    .await
-                    .map_err(|error| MemWalWorkerError::Lance {
-                        operation: "writer claim",
-                        message: error.to_string(),
-                    })
-                    .map_err(WorkerOpenFailure::unclaimed)?;
-                OpenedMemWalWorker::classify(writer, &opener_details, opener_epoch_floor).await
+                Box::pin(opener_db.open_stream_writer_with_claim(
+                    &opener_capture,
+                    "OPEN_FOLD",
+                    Some("omnigraph:stream-fold".to_string()),
+                ))
+                .await
             }) as crate::table_store::mem_wal::WorkerOpenFuture
         });
         let cut = self
@@ -884,6 +889,13 @@ impl Omnigraph {
             )
             .await
             .map_err(|error| fold_cut_error(key, error))?;
+        // A cold quiesce opener may have selected one or more recovered/fresh
+        // claims. The fold binds the exact post-claim lifecycle and selected
+        // ClaimReceipt, never the provisional pre-claim capture.
+        let post_claim = self
+            .capture_stream_authority(&table_key, "stream fold post-claim")
+            .await?;
+        ensure_same_binding(key, &post_claim, "stream fold post-claim binding")?;
 
         crate::failpoints::maybe_fail(
             crate::failpoints::names::STREAM_FOLD_POST_DRAIN_PRE_SIDECAR,
@@ -895,7 +907,15 @@ impl Omnigraph {
             // worker's stack. Debug failpoint builds otherwise compose it with
             // the surrounding recovery/barrier future and can exceed the
             // default worker stack in multi-table crash tests.
-            match Box::pin(self.stream_fold_attempt(&table_key, key, &before_cut, &cut)).await {
+            match Box::pin(self.stream_fold_attempt(
+                &table_key,
+                key,
+                &post_claim,
+                &cut,
+                &FoldLifecycleMode::Open,
+            ))
+            .await
+            {
                 Ok(FoldAttempt::Published) => return Ok(()),
                 Ok(FoldAttempt::EffectFree(error)) if attempt + 1 < B1_MAX_FOLD_ATTEMPTS => {
                     last_effect_free_error = Some(error);
@@ -909,29 +929,1184 @@ impl Omnigraph {
         }))
     }
 
+    /// Quiesce one enrolled main-branch lane behind the private lifecycle seam.
+    ///
+    /// The outer task owns one profile-shared guard and one exclusive
+    /// admission lease from the OPEN cutoff through terminal receipt
+    /// publication. Cancellation of the caller cannot reopen admission between
+    /// the physical cut and the durable SEALED proof.
+    pub(crate) async fn stream_quiesce_as(
+        self: &Arc<Self>,
+        table_key: &str,
+        drain_id: &str,
+        expected_lifecycle_revision: u64,
+        actor_id: &str,
+    ) -> Result<()> {
+        let db = Arc::clone(self);
+        let table_key = table_key.to_string();
+        let drain_id = drain_id.to_string();
+        let actor_id = actor_id.to_string();
+        crate::instrumentation::spawn_with_query_io_probes(async move {
+            Box::pin(db.stream_quiesce_background(
+                table_key,
+                drain_id,
+                expected_lifecycle_revision,
+                actor_id,
+            ))
+            .await
+        })
+        .await
+        .map_err(|error| OmniError::Lance(format!("stream quiesce task failed: {error}")))?
+    }
+
+    /// Settle the one terminal receipt sidecar owned by an exact quiesce
+    /// retry before receipt-first classification.
+    ///
+    /// A crash after the immutable ledger effect or terminal manifest CAS can
+    /// leave the selected receipt invisible to a cached snapshot while the
+    /// graph-global sidecar barrier remains armed. Generic recovery cannot run
+    /// from inside this lifecycle operation because it would reacquire the
+    /// admission/profile gates already held by the caller. This deliberately
+    /// narrow continuation recognizes only the same table, operation kind,
+    /// and drain ID and completes it under the normal inner effect gates.
+    async fn complete_exact_quiesce_receipt_sidecar(
+        &self,
+        table_key: &str,
+        identity: TableIdentity,
+        drain_id: &str,
+    ) -> Result<bool> {
+        let write_queue = self.write_queue();
+        let _schema_guard = write_queue
+            .acquire(&crate::db::manifest::schema_apply_serial_queue_key())
+            .await;
+        let _branch_guard = write_queue.acquire_branch(None).await;
+        let _stream_token_guard = write_queue.acquire_stream_token().await;
+        let _table_guards = write_queue
+            .acquire_many(&[(table_key.to_string(), None)])
+            .await;
+
+        let mut exact: Option<crate::db::manifest::RecoverySidecar> = None;
+        for sidecar in list_sidecars(self.root_uri(), self.storage_adapter()).await? {
+            let Some(RecoveryProtocolV14::StreamLifecycleReceipt(protocol)) =
+                sidecar.protocol_v14.as_deref()
+            else {
+                continue;
+            };
+            if protocol.change_kind != RecoveryStreamLifecycleReceiptKind::QuiesceFinalize
+                || protocol.admission_scope.identity != identity
+                || protocol.receipt.planned_receipt.identity != identity
+                || protocol.receipt.planned_receipt.operation_kind != "QUIESCE"
+                || protocol.receipt.planned_receipt.operation_id != drain_id
+            {
+                continue;
+            }
+            if let Some(prior) = exact.as_ref() {
+                return Err(OmniError::recovery_required(
+                    sidecar.operation_id,
+                    format!(
+                        "multiple terminal quiesce receipt sidecars match table identity {identity} and drain '{drain_id}' (also found '{}')",
+                        prior.operation_id
+                    ),
+                ));
+            }
+            exact = Some(sidecar);
+        }
+        let Some(sidecar) = exact else {
+            return Ok(false);
+        };
+
+        // The sidecar may already have published its manifest CAS while this
+        // process still holds the prior cached snapshot. Recovery must classify
+        // against a fresh manifest view so exact post-publish cleanup is
+        // idempotent instead of attempting a second terminal CAS.
+        self.refresh_coordinator_only().await?;
+        let txn = self.open_write_txn(None).await?;
+        complete_stream_lifecycle_receipt_sidecar_v14(
+            self.root_uri(),
+            Arc::clone(&self.storage),
+            &txn.base,
+            &sidecar,
+        )
+        .await?;
+        self.refresh_coordinator_only().await?;
+        Ok(true)
+    }
+
+    async fn stream_quiesce_background(
+        self: Arc<Self>,
+        table_key: String,
+        drain_id: String,
+        expected_lifecycle_revision: u64,
+        actor_id: String,
+    ) -> Result<()> {
+        let _profile_guard = self.write_queue().acquire_stream_profile_shared().await;
+        let mut initial_txn = self.open_write_txn(None).await?;
+        let mut initial_entry = initial_txn.base.entry(&table_key).cloned().ok_or_else(|| {
+            OmniError::manifest_not_found(format!(
+                "stream quiesce cannot resolve unknown table '{table_key}'"
+            ))
+        })?;
+        let mut initial_lifecycle = initial_txn
+            .base
+            .stream_lifecycle(initial_entry.identity)
+            .cloned()
+            .ok_or_else(|| {
+                OmniError::manifest_conflict(format!(
+                    "stream quiesce requires an enrolled stream for '{table_key}'"
+                ))
+            })?;
+        let graph_identity_digest =
+            stream_graph_identity_digest(&initial_txn.authority.schema_identity_domain)?;
+        if self
+            .complete_exact_quiesce_receipt_sidecar(&table_key, initial_entry.identity, &drain_id)
+            .await?
+        {
+            initial_txn = self.open_write_txn(None).await?;
+            initial_entry = initial_txn.base.entry(&table_key).cloned().ok_or_else(|| {
+                OmniError::manifest_not_found(format!(
+                    "stream quiesce lost table '{table_key}' while completing its receipt"
+                ))
+            })?;
+            initial_lifecycle = initial_txn
+                .base
+                .stream_lifecycle(initial_entry.identity)
+                .cloned()
+                .ok_or_else(|| {
+                    OmniError::manifest_internal(
+                        "stream quiesce receipt completion lost its lifecycle row",
+                    )
+                })?;
+        }
+
+        // A selected strict block is already the durable result of this
+        // quiesce occurrence. Validate the immutable request before any token
+        // ledger or MemWAL read, then return the stable token. This keeps a
+        // lost-reply retry self-contained even when the retained physical cut
+        // is temporarily unavailable. The later under-exclusive check remains
+        // necessary for a block published while this caller waits.
+        if initial_lifecycle.lifecycle == StreamLifecycle::Draining {
+            let drain = initial_lifecycle.drain.as_ref().ok_or_else(|| {
+                OmniError::manifest_internal("DRAINING stream has no drain descriptor")
+            })?;
+            if drain.drain_id != drain_id
+                || drain.operation_expected_revision != expected_lifecycle_revision
+                || drain.initiating_actor != actor_id
+                || drain.goal != DrainGoal::Sealed
+            {
+                return Err(OmniError::StreamLifecycleIdempotencyConflict {
+                    stable_table_id: initial_entry.identity.stable_table_id,
+                    table_incarnation_id: initial_entry.identity.table_incarnation_id,
+                    operation_kind: "QUIESCE".to_string(),
+                    operation_id: drain_id,
+                });
+            }
+            stream_quiesce_request_payload_from_draining(
+                &initial_lifecycle,
+                &graph_identity_digest,
+            )?;
+            if let Some(block) = initial_lifecycle.strict_block.as_ref() {
+                return Err(stream_data_block_error(&block.block_token));
+            }
+        }
+
+        // Terminal receipt-first replay precedes lifecycle/revision
+        // classification. A delayed exact retry must return success even after
+        // the lane has moved to SEALED; the operation ID can never be rebound.
+        let selected_token = initial_txn.base.open_stream_token_authority().await?;
+        if let Some(receipt) = lookup_management_receipt(
+            &selected_token,
+            initial_txn.base.stream_token_authority(),
+            &graph_identity_digest,
+            initial_entry.identity,
+            &initial_lifecycle.enrollment_receipt.stream_incarnation_id,
+            "QUIESCE",
+            &drain_id,
+        )
+        .await?
+        {
+            if receipt.from_revision != expected_lifecycle_revision
+                || receipt.actor_id != actor_id
+                || receipt.identity != initial_entry.identity
+                || receipt.operation_kind != "QUIESCE"
+            {
+                return Err(OmniError::StreamLifecycleIdempotencyConflict {
+                    stable_table_id: initial_entry.identity.stable_table_id,
+                    table_incarnation_id: initial_entry.identity.table_incarnation_id,
+                    operation_kind: "QUIESCE".to_string(),
+                    operation_id: drain_id,
+                });
+            }
+            receipt.validate(receipt.to_revision)?;
+            if initial_lifecycle.lifecycle == StreamLifecycle::Sealed
+                && initial_lifecycle
+                    .management_receipt_chain
+                    .head_record_id
+                    .as_deref()
+                    == Some(receipt.record_id.as_str())
+            {
+                return Ok(());
+            }
+            return Err(OmniError::manifest_internal(
+                "selected terminal quiesce receipt is not the current SEALED lifecycle head",
+            ));
+        }
+
+        let provisional = match initial_lifecycle.lifecycle {
+            StreamLifecycle::Open => {
+                if initial_lifecycle.lifecycle_revision != expected_lifecycle_revision {
+                    return Err(OmniError::StreamLifecycleChanged {
+                        stable_table_id: initial_entry.identity.stable_table_id,
+                        table_incarnation_id: initial_entry.identity.table_incarnation_id,
+                        expected_revision: expected_lifecycle_revision,
+                        current_revision: initial_lifecycle.lifecycle_revision,
+                    });
+                }
+                self.capture_stream_authority(&table_key, "stream quiesce")
+                    .await?
+            }
+            StreamLifecycle::Draining => {
+                let drain = initial_lifecycle.drain.as_ref().ok_or_else(|| {
+                    OmniError::manifest_internal("DRAINING stream has no drain descriptor")
+                })?;
+                if drain.drain_id != drain_id
+                    || drain.operation_expected_revision != expected_lifecycle_revision
+                    || drain.initiating_actor != actor_id
+                    || drain.goal != DrainGoal::Sealed
+                {
+                    return Err(OmniError::StreamLifecycleIdempotencyConflict {
+                        stable_table_id: initial_entry.identity.stable_table_id,
+                        table_incarnation_id: initial_entry.identity.table_incarnation_id,
+                        operation_kind: "QUIESCE".to_string(),
+                        operation_id: drain_id,
+                    });
+                }
+                self.capture_draining_stream_authority(
+                    &table_key,
+                    "stream quiesce continuation",
+                    &drain_id,
+                )
+                .await?
+            }
+            StreamLifecycle::Sealed => {
+                return Err(OmniError::StreamLifecycleChanged {
+                    stable_table_id: initial_entry.identity.stable_table_id,
+                    table_incarnation_id: initial_entry.identity.table_incarnation_id,
+                    expected_revision: expected_lifecycle_revision,
+                    current_revision: initial_lifecycle.lifecycle_revision,
+                });
+            }
+        };
+        let expected_request_digest = match provisional.lifecycle.lifecycle {
+            StreamLifecycle::Open => {
+                let target_epoch_floor_by_shard = provisional
+                    .lifecycle
+                    .epoch_floor_by_shard
+                    .iter()
+                    .map(|(shard, epoch)| {
+                        epoch
+                            .checked_add(1)
+                            .map(|next| (shard.clone(), next))
+                            .ok_or_else(|| {
+                                OmniError::manifest_internal("stream drain epoch target overflow")
+                            })
+                    })
+                    .collect::<Result<BTreeMap<_, _>>>()?;
+                stream_quiesce_request_digest(
+                    &provisional.lifecycle,
+                    &QuiesceRequest {
+                        graph_identity_digest: graph_identity_digest.clone(),
+                        drain_id: drain_id.clone(),
+                        expected_lifecycle_revision,
+                        goal: DrainGoal::Sealed,
+                        initiating_actor: actor_id.clone(),
+                        initiated_at: crate::db::now_micros()?,
+                        target_epoch_floor_by_shard,
+                        seal_override: None,
+                    },
+                )?
+            }
+            StreamLifecycle::Draining => provisional
+                .lifecycle
+                .drain
+                .as_ref()
+                .ok_or_else(|| {
+                    OmniError::manifest_internal("DRAINING stream has no drain descriptor")
+                })?
+                .operation_request_digest
+                .clone(),
+            StreamLifecycle::Sealed => unreachable!("SEALED provisional authority was refused"),
+        };
+        let key = provisional.worker_key;
+        let exclusive = self
+            .write_queue()
+            .acquire_stream_exclusive(&provisional.admission_key)
+            .await;
+        let exclusive_authority =
+            CheckedExclusiveStreamAuthority::from_exclusive_admission(exclusive);
+
+        if self
+            .complete_exact_quiesce_receipt_sidecar(&table_key, key.identity, &drain_id)
+            .await?
+        {
+            let settled = self.open_write_txn(None).await?;
+            let settled_lifecycle = settled
+                .base
+                .stream_lifecycle(key.identity)
+                .cloned()
+                .ok_or_else(|| {
+                    OmniError::manifest_internal(
+                        "quiesce receipt completion lost its lifecycle row",
+                    )
+                })?;
+            let selected = settled.base.open_stream_token_authority().await?;
+            if let Some(receipt) = lookup_management_receipt(
+                &selected,
+                settled.base.stream_token_authority(),
+                &graph_identity_digest,
+                key.identity,
+                &settled_lifecycle.enrollment_receipt.stream_incarnation_id,
+                "QUIESCE",
+                &drain_id,
+            )
+            .await?
+                && receipt.from_revision == expected_lifecycle_revision
+                && receipt.actor_id == actor_id
+                && settled_lifecycle.lifecycle == StreamLifecycle::Sealed
+                && settled_lifecycle
+                    .management_receipt_chain
+                    .head_record_id
+                    .as_deref()
+                    == Some(receipt.record_id.as_str())
+            {
+                return Ok(());
+            }
+        }
+
+        let current = self.open_write_txn(None).await?;
+        let current_lifecycle = current
+            .base
+            .stream_lifecycle(key.identity)
+            .cloned()
+            .ok_or_else(|| {
+                OmniError::manifest_read_set_changed(
+                    format!("stream_quiesce_lifecycle:{table_key}"),
+                    Some(format!("{:?}", provisional.lifecycle)),
+                    None,
+                )
+            })?;
+        let current_token = current.base.open_stream_token_authority().await?;
+        if let Some(receipt) = lookup_management_receipt(
+            &current_token,
+            current.base.stream_token_authority(),
+            &graph_identity_digest,
+            key.identity,
+            &current_lifecycle.enrollment_receipt.stream_incarnation_id,
+            "QUIESCE",
+            &drain_id,
+        )
+        .await?
+        {
+            if receipt.from_revision == expected_lifecycle_revision
+                && receipt.actor_id == actor_id
+                && current_lifecycle.lifecycle == StreamLifecycle::Sealed
+                && current_lifecycle
+                    .management_receipt_chain
+                    .head_record_id
+                    .as_deref()
+                    == Some(receipt.record_id.as_str())
+            {
+                return Ok(());
+            }
+            return Err(OmniError::StreamLifecycleIdempotencyConflict {
+                stable_table_id: key.identity.stable_table_id,
+                table_incarnation_id: key.identity.table_incarnation_id,
+                operation_kind: "QUIESCE".to_string(),
+                operation_id: drain_id,
+            });
+        }
+        if current_lifecycle.lifecycle == StreamLifecycle::Open {
+            if current_lifecycle.lifecycle_revision != expected_lifecycle_revision {
+                return Err(OmniError::StreamLifecycleChanged {
+                    stable_table_id: key.identity.stable_table_id,
+                    table_incarnation_id: key.identity.table_incarnation_id,
+                    expected_revision: expected_lifecycle_revision,
+                    current_revision: current_lifecycle.lifecycle_revision,
+                });
+            }
+            let target_epoch_floor_by_shard = current_lifecycle
+                .epoch_floor_by_shard
+                .iter()
+                .map(|(shard, epoch)| {
+                    epoch
+                        .checked_add(1)
+                        .map(|next| (shard.clone(), next))
+                        .ok_or_else(|| {
+                            OmniError::manifest_internal("stream drain epoch target overflow")
+                        })
+                })
+                .collect::<Result<BTreeMap<_, _>>>()?;
+            let request = QuiesceRequest {
+                graph_identity_digest: graph_identity_digest.clone(),
+                drain_id: drain_id.clone(),
+                expected_lifecycle_revision,
+                goal: DrainGoal::Sealed,
+                initiating_actor: actor_id.clone(),
+                initiated_at: crate::db::now_micros()?,
+                target_epoch_floor_by_shard,
+                seal_override: None,
+            };
+            let started = build_open_to_draining(&current_lifecycle, request)?;
+            if started.request_digest != expected_request_digest {
+                return Err(OmniError::StreamLifecycleIdempotencyConflict {
+                    stable_table_id: key.identity.stable_table_id,
+                    table_incarnation_id: key.identity.table_incarnation_id,
+                    operation_kind: "QUIESCE".to_string(),
+                    operation_id: drain_id,
+                });
+            }
+
+            let write_queue = self.write_queue();
+            let _schema_guard = write_queue
+                .acquire(&crate::db::manifest::schema_apply_serial_queue_key())
+                .await;
+            let _branch_guard = write_queue.acquire_branch(None).await;
+            let _stream_token_guard = write_queue.acquire_stream_token().await;
+            let _table_guards = write_queue.acquire_many(&[(table_key.clone(), None)]).await;
+            self.ensure_no_pending_recovery_sidecars_under_gates(&[None], "stream quiesce start")
+                .await?;
+            let live = self.revalidate_write_txn(&current).await?;
+            let live_entry = live.entry(&table_key).ok_or_else(|| {
+                OmniError::manifest_read_set_changed(
+                    format!("stream_quiesce_table:{table_key}"),
+                    Some(key.identity.to_string()),
+                    None,
+                )
+            })?;
+            if live.stream_lifecycle(key.identity) != Some(&current_lifecycle) {
+                return Err(OmniError::StreamLifecycleChanged {
+                    stable_table_id: key.identity.stable_table_id,
+                    table_incarnation_id: key.identity.table_incarnation_id,
+                    expected_revision: expected_lifecycle_revision,
+                    current_revision: live
+                        .stream_lifecycle(key.identity)
+                        .map_or(0, |lifecycle| lifecycle.lifecycle_revision),
+                });
+            }
+            let mut expected_versions = ExpectedTableVersions::new();
+            expected_versions.insert(
+                key.identity,
+                TableVersionExpectation {
+                    table_key: live_entry.table_key.clone(),
+                    table_version: live_entry.table_version,
+                },
+            );
+            let mut coordinator = self.open_coordinator_for_branch(None).await?;
+            if coordinator.snapshot().version() != live.version()
+                || coordinator.snapshot().stream_lifecycle(key.identity) != Some(&current_lifecycle)
+            {
+                return Err(OmniError::manifest_read_set_changed(
+                    format!("stream_quiesce_start:{table_key}"),
+                    Some(live.version().to_string()),
+                    Some(coordinator.snapshot().version().to_string()),
+                ));
+            }
+            coordinator
+                .commit_operational_changes_with_expected(
+                    &[ManifestChange::SetStreamLifecycle {
+                        expected: Some(current_lifecycle),
+                        next: started.lifecycle,
+                    }],
+                    &expected_versions,
+                )
+                .await?;
+            drop(_table_guards);
+            drop(_stream_token_guard);
+            drop(_branch_guard);
+            drop(_schema_guard);
+            self.refresh_coordinator_only().await?;
+        } else if current_lifecycle.lifecycle == StreamLifecycle::Draining {
+            let drain = current_lifecycle.drain.as_ref().ok_or_else(|| {
+                OmniError::manifest_internal("DRAINING stream has no drain descriptor")
+            })?;
+            if drain.operation_request_digest != expected_request_digest
+                || drain.drain_id != drain_id
+                || drain.operation_expected_revision != expected_lifecycle_revision
+                || drain.initiating_actor != actor_id
+                || drain.goal != DrainGoal::Sealed
+            {
+                return Err(OmniError::StreamLifecycleIdempotencyConflict {
+                    stable_table_id: key.identity.stable_table_id,
+                    table_incarnation_id: key.identity.table_incarnation_id,
+                    operation_kind: "QUIESCE".to_string(),
+                    operation_id: drain_id,
+                });
+            }
+            // Recompute the immutable request commitment after exclusive
+            // admission. The separate mutable target may have advanced with
+            // prior claims, but the requested target remains the exact
+            // original digest preimage.
+            stream_quiesce_request_payload_from_draining(
+                &current_lifecycle,
+                &graph_identity_digest,
+            )?;
+            if let Some(block) = current_lifecycle.strict_block.as_ref() {
+                return Err(stream_data_block_error(&block.block_token));
+            }
+        } else {
+            // A terminal exact retry can only reach SEALED through the
+            // receipt-first branches above. Reaching it without the immutable
+            // receipt is an authority change, not a DRAINING descriptor error.
+            return Err(OmniError::StreamLifecycleChanged {
+                stable_table_id: key.identity.stable_table_id,
+                table_incarnation_id: key.identity.table_incarnation_id,
+                expected_revision: expected_lifecycle_revision,
+                current_revision: current_lifecycle.lifecycle_revision,
+            });
+        }
+
+        let draining = self
+            .capture_draining_stream_authority(&table_key, "stream quiesce cut", &drain_id)
+            .await?;
+        ensure_same_binding(key, &draining, "stream quiesce binding")?;
+        self.ensure_no_relevant_stream_sidecar_except_exact_claim(&draining, "stream quiesce cut")
+            .await?;
+
+        let opener_db = Arc::clone(&self);
+        let opener_capture = draining.clone();
+        let opener_actor = actor_id.clone();
+        let opener = move || {
+            let opener_db = Arc::clone(&opener_db);
+            let opener_capture = opener_capture.clone();
+            let opener_actor = opener_actor.clone();
+            Box::pin(async move {
+                Box::pin(opener_db.open_stream_writer_with_claim(
+                    &opener_capture,
+                    "QUIESCE",
+                    Some(opener_actor),
+                ))
+                .await
+            }) as crate::table_store::mem_wal::WorkerOpenFuture
+        };
+
+        let selected_claim = draining.lifecycle.current_claim_receipt_id.as_deref();
+        let cut = if selected_claim.is_some() {
+            let receipt = self
+                .selected_claim_receipt(&draining.txn.base, &draining.lifecycle)
+                .await?;
+            if receipt.lifecycle_operation_id.as_deref() == Some(drain_id.as_str()) {
+                match self
+                    .stream_workers
+                    .passive_quiesce_cut(
+                        key,
+                        exclusive_authority,
+                        draining.head.dataset().clone(),
+                        draining.lifecycle.clone(),
+                        receipt,
+                    )
+                    .await
+                    .map_err(|error| fold_cut_error(key, error))?
+                {
+                    PassiveQuiesceDisposition::Reusable(cut) => cut,
+                    PassiveQuiesceDisposition::FreshClaimRequired(authority) => self
+                        .stream_workers
+                        .quiesce_cut(key, table_key.clone(), authority, Box::new(opener))
+                        .await
+                        .map_err(|error| fold_cut_error(key, error))?,
+                }
+            } else {
+                self.stream_workers
+                    .quiesce_cut(
+                        key,
+                        table_key.clone(),
+                        exclusive_authority,
+                        Box::new(opener),
+                    )
+                    .await
+                    .map_err(|error| fold_cut_error(key, error))?
+            }
+        } else {
+            self.stream_workers
+                .quiesce_cut(
+                    key,
+                    table_key.clone(),
+                    exclusive_authority,
+                    Box::new(opener),
+                )
+                .await
+                .map_err(|error| fold_cut_error(key, error))?
+        };
+
+        let post_claim = self
+            .capture_draining_stream_authority(&table_key, "stream quiesce post-claim", &drain_id)
+            .await?;
+        ensure_same_binding(key, &post_claim, "stream quiesce post-claim binding")?;
+        if let QuiesceCut::Generation(generation) = &cut {
+            crate::failpoints::maybe_fail(
+                crate::failpoints::names::STREAM_FOLD_POST_DRAIN_PRE_SIDECAR,
+            )?;
+            let mode = FoldLifecycleMode::Draining {
+                drain_id: drain_id.clone(),
+            };
+            let mut last_effect_free_error = None;
+            for attempt in 0..B1_MAX_FOLD_ATTEMPTS {
+                match Box::pin(self.stream_fold_attempt(
+                    &table_key,
+                    key,
+                    &post_claim,
+                    generation,
+                    &mode,
+                ))
+                .await?
+                {
+                    FoldAttempt::Published => {
+                        last_effect_free_error = None;
+                        break;
+                    }
+                    FoldAttempt::EffectFree(error) if attempt + 1 < B1_MAX_FOLD_ATTEMPTS => {
+                        last_effect_free_error = Some(error);
+                    }
+                    FoldAttempt::EffectFree(error) => return Err(error),
+                }
+            }
+            if let Some(error) = last_effect_free_error {
+                return Err(error);
+            }
+        }
+
+        // Keep `cut` alive through terminal ledger + lifecycle publication: it
+        // owns the same exclusive admission lease acquired before DRAINING.
+        self.finalize_stream_quiesce(
+            &table_key,
+            key,
+            &drain_id,
+            expected_lifecycle_revision,
+            &actor_id,
+            &graph_identity_digest,
+        )
+        .await?;
+        drop(cut);
+        Ok(())
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    async fn finalize_stream_quiesce(
+        &self,
+        table_key: &str,
+        key: StreamWorkerKey,
+        drain_id: &str,
+        expected_lifecycle_revision: u64,
+        actor_id: &str,
+        graph_identity_digest: &str,
+    ) -> Result<()> {
+        let write_queue = self.write_queue();
+        let _schema_guard = write_queue
+            .acquire(&crate::db::manifest::schema_apply_serial_queue_key())
+            .await;
+        let _branch_guard = write_queue.acquire_branch(None).await;
+        let _stream_token_guard = write_queue.acquire_stream_token().await;
+        let _table_guards = write_queue
+            .acquire_many(&[(table_key.to_string(), None)])
+            .await;
+        self.ensure_no_pending_recovery_sidecars_under_gates(&[None], "stream quiesce finalize")
+            .await?;
+
+        let capture = self
+            .capture_draining_stream_authority(table_key, "stream quiesce finalize", drain_id)
+            .await?;
+        ensure_same_binding(key, &capture, "stream quiesce terminal binding")?;
+        let draining = capture.lifecycle.clone();
+        let drain = draining.drain.as_ref().ok_or_else(|| {
+            OmniError::manifest_internal("terminal stream quiesce has no drain descriptor")
+        })?;
+        if drain.operation_expected_revision != expected_lifecycle_revision
+            || drain.initiating_actor != actor_id
+            || drain.goal != DrainGoal::Sealed
+        {
+            return Err(OmniError::StreamLifecycleIdempotencyConflict {
+                stable_table_id: key.identity.stable_table_id,
+                table_incarnation_id: key.identity.table_incarnation_id,
+                operation_kind: "QUIESCE".to_string(),
+                operation_id: drain_id.to_string(),
+            });
+        }
+        let current_claim_receipt = self
+            .selected_claim_receipt(&capture.txn.base, &draining)
+            .await?;
+        let physical = validate_b1_lifecycle_physical_state(capture.head.dataset(), &draining)
+            .await
+            .map_err(worker_error)?;
+        let (
+            shard_manifest_version,
+            current_generation,
+            replay_after_wal_entry_position,
+            writer_epoch,
+        ) = match physical {
+            PassiveB1PhysicalState::AdmitOrReplay {
+                shard_manifest_version,
+                current_generation,
+                replay_after_wal_entry_position,
+                writer_epoch,
+            } => (
+                shard_manifest_version,
+                current_generation,
+                replay_after_wal_entry_position,
+                writer_epoch,
+            ),
+            PassiveB1PhysicalState::FoldOnlyFlushed(flushed) => {
+                return Err(OmniError::recovery_required(
+                    format!("stream-drain:{drain_id}"),
+                    format!("terminal quiesce still has an unmerged generation: {flushed:?}"),
+                ));
+            }
+        };
+        let details = capture
+            .head
+            .dataset()
+            .mem_wal_index_details()
+            .await
+            .map_err(|error| OmniError::Lance(error.to_string()))?
+            .ok_or_else(|| {
+                OmniError::manifest_internal("terminal quiesce lost its MemWAL index")
+            })?;
+        let base_merged_generation =
+            exact_merged_generation(&details, key.shard_id)?.map_or(0, |merged| merged.generation);
+        let evidence = EmptyCutEvidence {
+            shard_manifest_version,
+            writer_epoch,
+            replay_cursor: replay_after_wal_entry_position,
+            current_generation,
+            base_merged_generation,
+        };
+
+        let request_payload =
+            stream_quiesce_request_payload_from_draining(&draining, graph_identity_digest)?;
+        let next_revision = draining
+            .lifecycle_revision
+            .checked_add(1)
+            .ok_or_else(|| OmniError::manifest_internal("stream lifecycle revision overflow"))?;
+        let result_payload = stream_quiesce_result_payload(next_revision)?;
+        let receipt = ManagementReceipt::new(
+            graph_identity_digest.to_string(),
+            key.identity,
+            draining.enrollment_receipt.stream_incarnation_id.clone(),
+            draining.binding_scope_id.clone(),
+            &draining.management_receipt_chain,
+            drain_id.to_string(),
+            "QUIESCE",
+            expected_lifecycle_revision,
+            next_revision,
+            actor_id.to_string(),
+            request_payload,
+            result_payload,
+            crate::db::now_micros()?,
+        )?;
+        let next_lifecycle =
+            build_draining_to_sealed(&draining, &receipt, &current_claim_receipt, evidence)?;
+
+        let token_dataset = capture.txn.base.open_stream_token_authority().await?;
+        let staged = stage_management_receipt(
+            token_dataset,
+            capture.txn.base.stream_token_authority(),
+            &receipt,
+        )
+        .await?;
+        let planned_transaction = staged.transaction_identity();
+        let token_head = SnapshotHandle::new(
+            open_stream_token_authority_head(
+                self.root_uri(),
+                capture.txn.base.stream_token_authority(),
+                &crate::lance_access::control_session(),
+            )
+            .await?,
+        );
+        let staged = StagedHandle::new(staged);
+        let authority = RecoveryAuthorityToken {
+            branch_identifier: capture.txn.authority.branch_identifier.clone(),
+            graph_head: capture.txn.authority.graph_head.clone(),
+            schema_identity_domain: capture.txn.authority.schema_identity_domain.clone(),
+            schema_ir_hash: capture.txn.authority.schema_ir_hash.clone(),
+            schema_identity_version: capture.txn.authority.schema_identity_version,
+        };
+        let mut sidecar = new_stream_lifecycle_receipt_sidecar_v14(
+            actor_id.to_string(),
+            authority,
+            capture.txn.base.version(),
+            RecoveryStreamLifecycleReceiptKind::QuiesceFinalize,
+            capture.txn.base.stream_profile().clone(),
+            draining,
+            Some(current_claim_receipt),
+            next_lifecycle.clone(),
+            capture.txn.base.stream_token_authority().clone(),
+            receipt.clone(),
+            planned_transaction,
+        )?;
+        let handle = write_sidecar(self.root_uri(), self.storage_adapter(), &sidecar).await?;
+        crate::failpoints::maybe_fail(
+            crate::failpoints::names::STREAM_LIFECYCLE_RECEIPT_POST_SIDECAR_PRE_TOKEN_COMMIT,
+        )?;
+        let outcome = match self.storage().commit_staged_exact(token_head, staged).await {
+            Ok(outcome) => outcome,
+            Err(error) => {
+                let recovered = complete_stream_lifecycle_receipt_sidecar_v14(
+                    self.root_uri(),
+                    Arc::clone(&self.storage),
+                    &capture.txn.base,
+                    &sidecar,
+                )
+                .await;
+                match recovered {
+                    Ok(()) => {
+                        self.refresh_coordinator_only().await?;
+                        let terminal = self.open_write_txn(None).await?;
+                        if terminal.base.stream_lifecycle(key.identity) == Some(&next_lifecycle) {
+                            let selected = terminal.base.open_stream_token_authority().await?;
+                            let selected_receipt = lookup_management_receipt(
+                                &selected,
+                                terminal.base.stream_token_authority(),
+                                graph_identity_digest,
+                                key.identity,
+                                &next_lifecycle.enrollment_receipt.stream_incarnation_id,
+                                "QUIESCE",
+                                drain_id,
+                            )
+                            .await?;
+                            if selected_receipt.as_ref() == Some(&receipt) {
+                                return Ok(());
+                            }
+                        }
+                        // Recovery proved the staged token transaction
+                        // effect-free and retired its intent. That is a safe
+                        // retry outcome, not a successful quiesce.
+                        return Err(error);
+                    }
+                    Err(recovery_error) => {
+                        return Err(OmniError::recovery_required(
+                            handle.operation_id,
+                            format!(
+                                "quiesce receipt commit failed ({error}) and exact recovery did not complete: {recovery_error}"
+                            ),
+                        ));
+                    }
+                }
+            }
+        };
+        if !outcome.is_exact() {
+            return Err(OmniError::recovery_required(
+                handle.operation_id,
+                "quiesce receipt participant committed a non-exact transaction",
+            ));
+        }
+        let next_token_authority =
+            stream_token_authority_entry_for_dataset(outcome.snapshot().dataset())
+                .await
+                .map_err(|error| {
+                    OmniError::recovery_required(handle.operation_id.clone(), error.to_string())
+                })?;
+        confirm_stream_lifecycle_receipt_sidecar_v14(
+            self.root_uri(),
+            self.storage_adapter(),
+            &mut sidecar,
+            outcome.committed_transaction().clone(),
+            next_token_authority.current_head_witness.clone(),
+            next_token_authority,
+        )
+        .await
+        .map_err(|error| {
+            OmniError::recovery_required(
+                handle.operation_id.clone(),
+                format!("quiesce receipt confirmation requires recovery: {error}"),
+            )
+        })?;
+        complete_stream_lifecycle_receipt_sidecar_v14(
+            self.root_uri(),
+            Arc::clone(&self.storage),
+            &capture.txn.base,
+            &sidecar,
+        )
+        .await
+        .map_err(|error| {
+            OmniError::recovery_required(
+                handle.operation_id,
+                format!("quiesce receipt publication requires recovery: {error}"),
+            )
+        })?;
+        self.refresh_coordinator_only().await?;
+        let terminal = self.open_write_txn(None).await?;
+        if terminal.base.stream_lifecycle(key.identity) != Some(&next_lifecycle) {
+            return Err(OmniError::manifest_internal(
+                "completed quiesce receipt did not install its exact SEALED lifecycle",
+            ));
+        }
+        Ok(())
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    async fn publish_stream_data_block(
+        &self,
+        table_key: &str,
+        key: StreamWorkerKey,
+        prepared: &StreamAuthorityCapture,
+        cut: &SealedGenerationCut,
+        drain_id: &str,
+        changeset: &ChangeSet,
+        attribution: &AttributedFoldPlan,
+        planned_evidence: CanonicalDataBlockEvidence,
+    ) -> Result<String> {
+        let generation_cut = StreamGenerationCut {
+            shard_id: key.shard_id.to_string(),
+            writer_epoch: cut.writer_epoch,
+            shard_manifest_version: cut.shard_manifest_version,
+            replay_after_wal_entry_position: cut.replay_after_wal_entry_position,
+            generation: cut.generation,
+            generation_path: cut.path.clone(),
+        };
+        let winner_tokens = attribution
+            .token_rows
+            .iter()
+            .map(|row| (row.logical_id.clone(), row.current_token.to_string()))
+            .collect::<BTreeMap<_, _>>();
+        let batches = changeset
+            .get(table_key)
+            .ok_or_else(|| OmniError::manifest_internal("stream data block lost its table change"))?
+            .changed
+            .as_slice();
+        let (input_rows, input_bytes) = fold_output_size(batches)?;
+        let recorded_at = crate::db::now_micros()?;
+        let planned = build_draining_data_block(
+            &prepared.lifecycle,
+            generation_cut.clone(),
+            planned_evidence.clone(),
+            input_rows,
+            input_bytes,
+            recorded_at,
+        )?;
+        if planned.drain.as_ref().map(|drain| drain.drain_id.as_str()) != Some(drain_id) {
+            return Err(OmniError::manifest_internal(
+                "stream data block differs from the active drain",
+            ));
+        }
+
+        let write_queue = self.write_queue();
+        let _schema_guard = write_queue
+            .acquire(&crate::db::manifest::schema_apply_serial_queue_key())
+            .await;
+        let _branch_guard = write_queue.acquire_branch(None).await;
+        let _stream_token_guard = write_queue.acquire_stream_token().await;
+        let _table_guards = write_queue
+            .acquire_many(&[(table_key.to_string(), None)])
+            .await;
+        self.ensure_no_pending_recovery_sidecars_under_gates(&[None], "stream strict data block")
+            .await?;
+        self.ensure_no_relevant_stream_sidecar(key.identity, "stream strict data block")
+            .await?;
+
+        let live = self.revalidate_write_txn(&prepared.txn).await?;
+        let live_entry = live.entry(table_key).cloned().ok_or_else(|| {
+            OmniError::manifest_read_set_changed(
+                format!("stream_data_block_table:{table_key}"),
+                Some(prepared.entry.identity.to_string()),
+                None,
+            )
+        })?;
+        let live_lifecycle = live
+            .stream_lifecycle(key.identity)
+            .cloned()
+            .ok_or_else(|| {
+                OmniError::manifest_read_set_changed(
+                    format!("stream_data_block_lifecycle:{table_key}"),
+                    Some(format!("{:?}", prepared.lifecycle)),
+                    None,
+                )
+            })?;
+        ensure_live_stream_prestate(prepared, &live_entry, &live_lifecycle)?;
+
+        let final_head = self
+            .storage()
+            .open_dataset_head(&prepared.full_path, None)
+            .await?;
+        self.ensure_existing_effect_baseline(
+            table_key,
+            None,
+            prepared.entry.table_version,
+            &final_head,
+        )
+        .await?;
+        let final_witness = capture_current_head_witness(final_head.dataset())
+            .await
+            .map_err(|error| OmniError::Lance(error.to_string()))?;
+        if final_witness != prepared.lifecycle.current_head_witness {
+            return Err(OmniError::manifest_read_set_changed(
+                format!("stream_data_block_head:{table_key}"),
+                Some(format!("{:?}", prepared.lifecycle.current_head_witness)),
+                Some(format!("{final_witness:?}")),
+            ));
+        }
+        match validate_b1_lifecycle_physical_state(final_head.dataset(), &live_lifecycle)
+            .await
+            .map_err(worker_error)?
+        {
+            PassiveB1PhysicalState::FoldOnlyFlushed(flushed)
+                if flushed.shard_manifest_version >= cut.shard_manifest_version
+                    && flushed.writer_epoch == cut.writer_epoch
+                    && flushed.generation == cut.generation
+                    && flushed.path == cut.path
+                    && flushed.replay_after_wal_entry_position
+                        == cut.replay_after_wal_entry_position => {}
+            observed => {
+                return Err(OmniError::recovery_required(
+                    format!("stream-data-block:{drain_id}"),
+                    format!(
+                        "strict-block publication lost its exact authenticated generation cut: expected=key={},writer_epoch={},shard_manifest_version={},generation={},path={},replay_cursor={}, observed={observed:?}",
+                        cut.key,
+                        cut.writer_epoch,
+                        cut.shard_manifest_version,
+                        cut.generation,
+                        cut.path,
+                        cut.replay_after_wal_entry_position,
+                    ),
+                ));
+            }
+        }
+
+        let committed = CommittedState::write(&live, self, None);
+        let constraints = crate::validate::constraints_for(&prepared.txn.catalog);
+        let mut collector = DataBlockEvidenceCollector::new(table_key, &winner_tokens);
+        crate::validate::evaluate_with_sink(
+            &constraints,
+            changeset,
+            &committed,
+            &prepared.txn.catalog,
+            |violation| collector.push(&violation),
+        )
+        .await?;
+        let Some(exact_evidence) = collector.finish()? else {
+            return Err(OmniError::manifest_read_set_changed(
+                format!("stream_data_block_validation:{table_key}"),
+                Some("permanent validator violation".to_string()),
+                Some("no violation".to_string()),
+            ));
+        };
+        if exact_evidence != planned_evidence {
+            return Err(OmniError::manifest_read_set_changed(
+                format!("stream_data_block_evidence:{table_key}"),
+                Some("prepared canonical violation evidence".to_string()),
+                Some("changed canonical violation evidence".to_string()),
+            ));
+        }
+        let exact = build_draining_data_block(
+            &live_lifecycle,
+            generation_cut,
+            exact_evidence,
+            input_rows,
+            input_bytes,
+            recorded_at,
+        )?;
+        if exact != planned {
+            return Err(OmniError::manifest_read_set_changed(
+                format!("stream_data_block_evidence:{table_key}"),
+                Some("prepared canonical violation evidence".to_string()),
+                Some("changed canonical violation evidence".to_string()),
+            ));
+        }
+
+        let mut expected_versions = ExpectedTableVersions::new();
+        expected_versions.insert(
+            key.identity,
+            TableVersionExpectation {
+                table_key: live_entry.table_key.clone(),
+                table_version: live_entry.table_version,
+            },
+        );
+        let mut coordinator = self.open_coordinator_for_branch(None).await?;
+        if coordinator.snapshot().version() != live.version()
+            || coordinator.snapshot().stream_lifecycle(key.identity) != Some(&live_lifecycle)
+        {
+            return Err(OmniError::manifest_read_set_changed(
+                format!("stream_data_block_publish:{table_key}"),
+                Some(live.version().to_string()),
+                Some(coordinator.snapshot().version().to_string()),
+            ));
+        }
+        coordinator
+            .commit_operational_changes_with_expected(
+                &[ManifestChange::SetStreamLifecycle {
+                    expected: Some(live_lifecycle),
+                    next: exact.clone(),
+                }],
+                &expected_versions,
+            )
+            .await?;
+        self.refresh_coordinator_only().await?;
+        let selected = self.open_write_txn(None).await?;
+        if selected.base.stream_lifecycle(key.identity) != Some(&exact) {
+            return Err(OmniError::manifest_internal(
+                "strict-block publication did not select its exact lifecycle row",
+            ));
+        }
+        Ok(exact
+            .strict_block
+            .as_ref()
+            .expect("strict-block builder installs one block")
+            .block_token
+            .clone())
+    }
+
     async fn stream_fold_attempt(
         &self,
         table_key: &str,
         key: StreamWorkerKey,
-        before_cut: &StreamAuthorityCapture,
+        post_claim: &StreamAuthorityCapture,
         cut: &SealedGenerationCut,
+        mode: &FoldLifecycleMode,
     ) -> Result<FoldAttempt> {
-        self.ensure_no_relevant_stream_sidecar(key.identity, "stream fold")
+        let operation = match mode {
+            FoldLifecycleMode::Open => "stream fold",
+            FoldLifecycleMode::Draining { .. } => "stream drain fold",
+        };
+        self.ensure_no_relevant_stream_sidecar(key.identity, operation)
             .await?;
-        let prepared = self
-            .capture_stream_authority(table_key, "stream fold")
-            .await?;
-        ensure_same_capture(before_cut, &prepared, "stream fold post-drain authority")?;
-        if cut.key != key || cut.writer_epoch <= prepared.epoch_floor {
+        let prepared = match mode {
+            FoldLifecycleMode::Open => self.capture_stream_authority(table_key, operation).await?,
+            FoldLifecycleMode::Draining { drain_id } => {
+                self.capture_draining_stream_authority(table_key, operation, drain_id)
+                    .await?
+            }
+        };
+        ensure_same_capture(post_claim, &prepared, "stream fold post-drain authority")?;
+        if cut.key != key || cut.writer_epoch != prepared.epoch_floor {
             return Err(OmniError::manifest_read_set_changed(
                 format!("stream_fold_cut:{table_key}"),
-                Some(format!("{key}:epoch>{}", prepared.epoch_floor)),
+                Some(format!("{key}:epoch={}", prepared.epoch_floor)),
                 Some(format!("{}:epoch={}", cut.key, cut.writer_epoch)),
             ));
         }
 
         let batches = scan_fresh_generation(&prepared, cut).await?;
         validate_fold_output_bounds(table_key, &batches)?;
+        let recomputed_drain_lww = match mode {
+            FoldLifecycleMode::Open => None,
+            FoldLifecycleMode::Draining { .. } => {
+                let stored_batches = batches
+                    .iter()
+                    .map(|batch| {
+                        let mut columns = batch.columns().to_vec();
+                        columns.push(Arc::new(BooleanArray::from(vec![false; batch.num_rows()]))
+                            as arrow_array::ArrayRef);
+                        RecordBatch::try_new(
+                            lance::dataset::mem_wal::schema_with_tombstone(batch.schema().as_ref()),
+                            columns,
+                        )
+                        .map_err(|error| OmniError::Lance(error.to_string()))
+                    })
+                    .collect::<Result<Vec<_>>>()?;
+                Some(lifecycle_generation_lww_projection_digest(
+                    &prepared.lifecycle,
+                    &prepared.txn.authority.schema_ir_hash,
+                    Arc::new(ArrowSchema::from(prepared.head.dataset().schema())),
+                    &stored_batches,
+                )?)
+            }
+        };
         let attribution = plan_fold_attribution(
             &prepared.txn.base,
             key.identity,
@@ -940,6 +2115,11 @@ impl Omnigraph {
             &batches,
         )
         .await?;
+        // A strict validator terminal returns before token staging, so it must
+        // independently prove that the complete winner projection still fits
+        // the same bounded authority envelope enforced by admission and the
+        // successful-fold path.
+        validate_generation_token_plan(table_key, &attribution.token_rows)?;
         let mut changeset = ChangeSet::new();
         changeset.insert(
             table_key.to_string(),
@@ -950,7 +2130,59 @@ impl Omnigraph {
             },
         );
         let committed = CommittedState::write(&prepared.txn.base, self, None);
-        crate::validate::validate_changeset(&changeset, &committed, &prepared.txn.catalog).await?;
+        let constraints = crate::validate::constraints_for(&prepared.txn.catalog);
+        match mode {
+            FoldLifecycleMode::Open => {
+                let mut first_violation = None;
+                crate::validate::evaluate_with_sink(
+                    &constraints,
+                    &changeset,
+                    &committed,
+                    &prepared.txn.catalog,
+                    |violation| {
+                        if first_violation.is_none() {
+                            first_violation = Some(violation);
+                        }
+                        Ok(())
+                    },
+                )
+                .await?;
+                if let Some(violation) = first_violation {
+                    return Err(violation.into_omni_error());
+                }
+            }
+            FoldLifecycleMode::Draining { drain_id } => {
+                let winner_tokens = attribution
+                    .token_rows
+                    .iter()
+                    .map(|row| (row.logical_id.clone(), row.current_token.to_string()))
+                    .collect::<BTreeMap<_, _>>();
+                let mut collector = DataBlockEvidenceCollector::new(table_key, &winner_tokens);
+                crate::validate::evaluate_with_sink(
+                    &constraints,
+                    &changeset,
+                    &committed,
+                    &prepared.txn.catalog,
+                    |violation| collector.push(&violation),
+                )
+                .await?;
+                if let Some(evidence) = collector.finish()? {
+                    let block_token = self
+                        .publish_stream_data_block(
+                            table_key,
+                            key,
+                            &prepared,
+                            cut,
+                            drain_id,
+                            &changeset,
+                            &attribution,
+                            evidence,
+                        )
+                        .await?;
+                    return Err(stream_data_block_error(&block_token));
+                }
+            }
+        }
 
         // Staging may materialize URI-backed blobs.  Its own post-materialized
         // bound is the final 32-MiB proof; no HEAD moves here.
@@ -1026,6 +2258,7 @@ impl Omnigraph {
                 Some(format!("{:?}", live.stream_token_authority())),
             ));
         }
+        let current_claim_receipt = self.selected_claim_receipt(&live, &live_lifecycle).await?;
         let revalidated = plan_fold_attribution(
             &live,
             key.identity,
@@ -1131,12 +2364,19 @@ impl Omnigraph {
                 .await?,
             );
             let mut next_lifecycle = prepared.lifecycle.clone();
-            next_lifecycle.current_head_witness = CurrentHeadWitness {
+            let next_head_witness = CurrentHeadWitness {
                 branch_identifier: lance::dataset::refs::BranchIdentifier::main(),
                 table_version: post_commit_pin,
                 transaction_uuid: planned_transaction.uuid.clone(),
                 manifest_e_tag: None,
             };
+            next_lifecycle.current_head_witness = next_head_witness.clone();
+            if let Some(drain) = next_lifecycle.drain.as_mut() {
+                // The active descriptor duplicates the mutable current HEAD
+                // for restart. Its immutable operation-request payload keeps
+                // the original pre-fold witness byte-for-byte.
+                drain.expected_current_head_witness = next_head_witness;
+            }
             next_lifecycle
                 .epoch_floor_by_shard
                 .insert(key.shard_id.to_string(), cut.writer_epoch);
@@ -1148,7 +2388,10 @@ impl Omnigraph {
                 })?;
             let (fold_rows, fold_bytes) = fold_output_size(&batches)?;
             next_lifecycle.last_fold_summary = Some(LastFoldSummary {
-                operation_id: "pending-stream-fold-operation".to_string(),
+                operation_id: match mode {
+                    FoldLifecycleMode::Open => "pending-stream-fold-operation".to_string(),
+                    FoldLifecycleMode::Draining { drain_id } => drain_id.clone(),
+                },
                 graph_commit_id: Some(lineage.graph_commit_id.clone()),
                 exact_generation_cut: StreamGenerationCut {
                     shard_id: key.shard_id.to_string(),
@@ -1165,22 +2408,50 @@ impl Omnigraph {
                 visible_bytes: fold_bytes,
                 recorded_at: lineage.created_at,
             });
-            let mut sidecar = new_stream_fold_sidecar_v12(
-                Some("omnigraph:stream-fold".to_string()),
-                pin,
-                authority,
-                recovery_lineage,
-                prepared.binding.clone(),
-                prepared.lifecycle.clone(),
-                next_lifecycle,
-                prior_merged,
-                generation_cut,
-                planned_transaction,
-                prepared.txn.base.stream_token_authority().clone(),
-                token_planned_transaction,
-                attribution.token_rows.clone(),
-                attribution.summary.clone(),
-            )?;
+            let mut sidecar = match mode {
+                FoldLifecycleMode::Open => new_stream_fold_v2_sidecar_v14(
+                    pin,
+                    authority,
+                    recovery_lineage,
+                    live.version(),
+                    live.stream_profile().clone(),
+                    prepared.lifecycle.clone(),
+                    current_claim_receipt,
+                    next_lifecycle,
+                    prior_merged,
+                    generation_cut,
+                    planned_transaction,
+                    prepared.txn.base.stream_token_authority().clone(),
+                    token_planned_transaction,
+                    attribution.token_rows.clone(),
+                    attribution.summary.clone(),
+                )?,
+                FoldLifecycleMode::Draining { drain_id } => {
+                    new_stream_drain_fold_sidecar_v14(
+                        pin,
+                        authority,
+                        recovery_lineage,
+                        live.version(),
+                        live.stream_profile().clone(),
+                        prepared.lifecycle.clone(),
+                        drain_id.clone(),
+                        current_claim_receipt,
+                        recomputed_drain_lww.clone().ok_or_else(|| {
+                            OmniError::manifest_internal(
+                                "drain fold omitted its recomputed LWW projection",
+                            )
+                        })?,
+                        next_lifecycle,
+                        prior_merged,
+                        generation_cut,
+                        planned_transaction,
+                        prepared.txn.base.stream_token_authority().clone(),
+                        token_planned_transaction,
+                        attribution.token_rows.clone(),
+                        attribution.summary.clone(),
+                    )?
+                }
+            };
             let handle = write_sidecar(self.root_uri(), self.storage_adapter(), &sidecar).await?;
 
             // The armed-but-no-effect cell: the intent is durable while both
@@ -1200,7 +2471,7 @@ impl Omnigraph {
                 Ok(outcome) => outcome,
                 Err(error) => {
                     if error.is_retryable_commit_conflict() {
-                        let effect_free = finalize_effect_free_stream_fold_sidecar_v12(
+                        let effect_free = finalize_effect_free_stream_fold_sidecar_v14(
                             self.root_uri(),
                             &self.storage,
                             &live,
@@ -1269,7 +2540,7 @@ impl Omnigraph {
             {
                 Ok(outcome) => outcome,
                 Err(error) => {
-                    let recovered = complete_stream_fold_sidecar_v12(
+                    let recovered = complete_stream_fold_sidecar_v14(
                         self.root_uri(),
                         Arc::clone(&self.storage),
                         &live,
@@ -1323,7 +2594,7 @@ impl Omnigraph {
                 OmniError::recovery_required(handle.operation_id.clone(), error.to_string())
             })?;
             let achieved_token_head = next_token_authority.current_head_witness.clone();
-            confirm_stream_fold_sidecar_v12(
+            confirm_stream_fold_sidecar_v14(
                 self.root_uri(),
                 self.storage_adapter(),
                 &mut sidecar,
@@ -1349,7 +2620,7 @@ impl Omnigraph {
                     format!("stream fold confirmation requires recovery: {error}"),
                 )
             })?;
-            complete_stream_fold_sidecar_v12(
+            complete_stream_fold_sidecar_v14(
                 self.root_uri(),
                 Arc::clone(&self.storage),
                 &live,
@@ -1368,10 +2639,901 @@ impl Omnigraph {
         .await
     }
 
+    /// The sole cold MemWAL writer opener.
+    ///
+    /// Every epoch claim is armed before Lance is invoked and remains
+    /// recovery-owned until its immutable attempt/terminal ledger records and
+    /// lifecycle authority are selected together. Callers must already hold
+    /// the lane's shared or exclusive admission authority.
+    pub(super) async fn open_stream_writer_with_claim(
+        &self,
+        capture: &StreamAuthorityCapture,
+        claim_kind: &str,
+        actor_id: Option<String>,
+    ) -> std::result::Result<OpenedMemWalWorker, WorkerOpenFailure> {
+        // Admission (and the caller-owned profile-shared lease) are already
+        // outermost. Hold the complete graph-write inner order from the final
+        // recapture through sidecar arm, physical classification, ledger
+        // effect, and manifest selection. In particular, the graph-global
+        // token gate prevents an unrelated lane from invalidating a prepared
+        // claim transaction after the physical epoch fence happened.
+        let write_queue = self.write_queue();
+        let _schema_guard = write_queue
+            .acquire(&crate::db::manifest::schema_apply_serial_queue_key())
+            .await;
+        let _branch_guard = write_queue.acquire_branch(None).await;
+        let _stream_token_guard = write_queue.acquire_stream_token().await;
+        let _table_guards = write_queue
+            .acquire_many(&[(capture.entry.table_key.clone(), None)])
+            .await;
+        let gated_capture = self
+            .recapture_stream_claim_lane(capture, "stream claim gated recapture")
+            .await
+            .map_err(|error| WorkerOpenFailure::unclaimed(claim_open_worker_error(error)))?;
+        ensure_same_capture(capture, &gated_capture, "stream claim gated authority")
+            .map_err(|error| WorkerOpenFailure::unclaimed(claim_open_worker_error(error)))?;
+        self.ensure_no_relevant_stream_sidecar_except_exact_claim(&gated_capture, "stream claim")
+            .await
+            .map_err(|error| WorkerOpenFailure::unclaimed(claim_open_worker_error(error)))?;
+        let capture = &gated_capture;
+        let graph_identity_digest =
+            stream_graph_identity_digest(&capture.txn.authority.schema_identity_domain)
+                .map_err(|error| WorkerOpenFailure::unclaimed(claim_open_worker_error(error)))?;
+        let tailer = claim_wal_tailer(capture)
+            .await
+            .map_err(|error| WorkerOpenFailure::unclaimed(claim_open_worker_error(error)))?;
+        let pending = self
+            .exact_pending_stream_claim(capture, &graph_identity_digest)
+            .await
+            .map_err(|error| WorkerOpenFailure::unclaimed(claim_open_worker_error(error)))?;
+        let (
+            mut physical,
+            operation,
+            mut attempt,
+            mut prior_attempt_chain,
+            mut snapshot,
+            mut sidecar,
+            mut invoke_attempt,
+        ) = if let Some((pending_sidecar, pending_attempt)) = pending {
+            let outcome = complete_stream_claim_sidecar_v14(
+                self.root_uri(),
+                Arc::clone(&self.storage),
+                &capture.txn.base,
+                &pending_sidecar,
+            )
+            .await
+            .map_err(|error| WorkerOpenFailure::unclaimed(claim_open_worker_error(error)))?;
+            match outcome {
+                RecoveryStreamClaimOutcomeV14::AttemptPending {
+                    prior_attempt_chain,
+                    ..
+                } => (
+                    read_claim_physical_prestate_after_attempt(capture)
+                        .await
+                        .map_err(|error| {
+                            WorkerOpenFailure::unclaimed(claim_open_worker_error(error))
+                        })?,
+                    pending_attempt.operation.clone(),
+                    pending_attempt,
+                    prior_attempt_chain,
+                    capture.txn.base.clone(),
+                    pending_sidecar,
+                    false,
+                ),
+                RecoveryStreamClaimOutcomeV14::CheckpointVisible { .. } => {
+                    self.refresh_coordinator_only().await.map_err(|error| {
+                        WorkerOpenFailure::unclaimed(claim_open_worker_error(error))
+                    })?;
+                    let checkpoint_snapshot = self.coordinator.read().await.snapshot();
+                    let physical = read_claim_physical_prestate_after_attempt(capture)
+                        .await
+                        .map_err(|error| {
+                            WorkerOpenFailure::unclaimed(claim_open_worker_error(error))
+                        })?;
+                    let next_attempt =
+                        prepare_next_claim_attempt(&pending_attempt.operation, &tailer, physical)
+                            .await
+                            .map_err(|error| {
+                                WorkerOpenFailure::unclaimed(claim_open_worker_error(error))
+                            })?;
+                    receipt_first_rearm_stream_claim_sidecar_v14(
+                        self.root_uri(),
+                        Arc::clone(&self.storage),
+                        &checkpoint_snapshot,
+                        &graph_identity_digest,
+                        capture.entry.identity,
+                        &capture.lifecycle.binding_scope_id,
+                        &pending_attempt.operation.claim_id,
+                        &pending_attempt.operation.recovery_operation_id,
+                        &next_attempt,
+                    )
+                    .await
+                    .map_err(|error| {
+                        WorkerOpenFailure::unclaimed(claim_open_worker_error(error))
+                    })?;
+                    let refreshed = self
+                        .recapture_stream_claim_lane(
+                            capture,
+                            "stream claim checkpoint continuation",
+                        )
+                        .await
+                        .map_err(|error| {
+                            WorkerOpenFailure::unclaimed(claim_open_worker_error(error))
+                        })?;
+                    drop(_table_guards);
+                    drop(_stream_token_guard);
+                    drop(_branch_guard);
+                    drop(_schema_guard);
+                    return Box::pin(
+                        self.open_stream_writer_with_claim(&refreshed, claim_kind, actor_id),
+                    )
+                    .await;
+                }
+                RecoveryStreamClaimOutcomeV14::EffectFree
+                | RecoveryStreamClaimOutcomeV14::TerminalVisible { .. } => {
+                    self.refresh_coordinator_only().await.map_err(|error| {
+                        WorkerOpenFailure::unclaimed(claim_open_worker_error(error))
+                    })?;
+                    let refreshed = self
+                        .recapture_stream_claim_lane(capture, "stream claim terminal continuation")
+                        .await
+                        .map_err(|error| {
+                            WorkerOpenFailure::unclaimed(claim_open_worker_error(error))
+                        })?;
+                    drop(_table_guards);
+                    drop(_stream_token_guard);
+                    drop(_branch_guard);
+                    drop(_schema_guard);
+                    return Box::pin(
+                        self.open_stream_writer_with_claim(&refreshed, claim_kind, actor_id),
+                    )
+                    .await;
+                }
+            }
+        } else {
+            let physical = read_claim_physical_prestate(capture)
+                .await
+                .map_err(|error| WorkerOpenFailure::unclaimed(claim_open_worker_error(error)))?;
+            let claim_id = ShardId::new_v4().to_string();
+            let operation = prepare_claim_operation(
+                &capture.lifecycle,
+                ClaimOperationRequest {
+                    graph_identity_digest: graph_identity_digest.clone(),
+                    claim_id: claim_id.clone(),
+                    lifecycle_operation_id: capture
+                        .lifecycle
+                        .drain
+                        .as_ref()
+                        .map(|drain| drain.drain_id.clone()),
+                    recovery_operation_id: claim_id,
+                    claim_kind: claim_kind.to_string(),
+                    profile: ClaimProfile::RetainAll,
+                    shard_id: capture.shard_id.to_string(),
+                    initial_shard_manifest_version: physical.shard_manifest_version,
+                    initial_writer_epoch: physical.writer_epoch,
+                    initial_replay_cursor: physical.replay_cursor,
+                    initial_current_generation: physical.current_generation,
+                    initial_base_merged_generation: physical.base_merged_generation,
+                    claim_contract_version: 1,
+                },
+            )
+            .map_err(|error| WorkerOpenFailure::unclaimed(claim_open_worker_error(error)))?;
+            let attempt = prepare_next_claim_attempt(&operation, &tailer, physical)
+                .await
+                .map_err(|error| WorkerOpenFailure::unclaimed(claim_open_worker_error(error)))?;
+            let prior_attempt_chain = crate::db::manifest::stream::claim_attempt_chain_genesis();
+            let authority = RecoveryAuthorityToken {
+                branch_identifier: capture.txn.authority.branch_identifier.clone(),
+                graph_head: capture.txn.authority.graph_head.clone(),
+                schema_identity_domain: capture.txn.authority.schema_identity_domain.clone(),
+                schema_ir_hash: capture.txn.authority.schema_ir_hash.clone(),
+                schema_identity_version: capture.txn.authority.schema_identity_version,
+            };
+            let snapshot = capture.txn.base.clone();
+            let sidecar = new_stream_claim_sidecar_v14(
+                actor_id.clone(),
+                authority,
+                snapshot.version(),
+                snapshot.stream_profile().clone(),
+                capture.lifecycle.clone(),
+                snapshot.stream_token_authority().clone(),
+                prior_attempt_chain.clone(),
+                &attempt,
+            )
+            .map_err(|error| WorkerOpenFailure::unclaimed(claim_open_worker_error(error)))?;
+            write_sidecar(self.root_uri(), self.storage_adapter(), &sidecar)
+                .await
+                .map_err(|error| WorkerOpenFailure::unclaimed(claim_open_worker_error(error)))?;
+            (
+                physical,
+                operation,
+                attempt,
+                prior_attempt_chain,
+                snapshot,
+                sidecar,
+                true,
+            )
+        };
+
+        loop {
+            let raw_writer = if invoke_attempt {
+                let config = reconstruct_b1_writer_config(
+                    &capture.details,
+                    capture.enrollment_id,
+                    capture.shard_id,
+                )
+                .map_err(WorkerOpenFailure::unclaimed)?;
+                Some(
+                    capture
+                        .head
+                        .dataset()
+                        .mem_wal_writer(capture.shard_id, config)
+                        .await,
+                )
+            } else {
+                None
+            };
+            let (evidence, achieved) = observe_claim_attempt(capture, &tailer, &attempt)
+                .await
+                .map_err(|error| WorkerOpenFailure::unclaimed(claim_open_worker_error(error)))?;
+            let effect = build_claim_attempt_effect(&prior_attempt_chain, &attempt, evidence)
+                .map_err(|error| WorkerOpenFailure::unclaimed(claim_open_worker_error(error)))?;
+
+            if matches!(
+                evidence,
+                ClaimAttemptEvidence::NoEffect | ClaimAttemptEvidence::AbortedNoEffect
+            ) {
+                classify_effect_free_stream_claim_sidecar_v14(
+                    self.root_uri(),
+                    self.storage_adapter(),
+                    &mut sidecar,
+                    effect,
+                )
+                .await
+                .map_err(|error| WorkerOpenFailure::unclaimed(claim_open_worker_error(error)))?;
+                complete_stream_claim_sidecar_v14(
+                    self.root_uri(),
+                    Arc::clone(&self.storage),
+                    &snapshot,
+                    &sidecar,
+                )
+                .await
+                .map_err(|error| WorkerOpenFailure::unclaimed(claim_open_worker_error(error)))?;
+                if let Some(raw_writer) = raw_writer {
+                    let error = raw_writer
+                        .err()
+                        .map(|error| MemWalWorkerError::Lance {
+                            operation: "writer claim",
+                            message: error.to_string(),
+                        })
+                        .unwrap_or_else(|| MemWalWorkerError::InvalidState {
+                            reason:
+                                "Lance reported writer-claim success without its exact manifest effect"
+                                    .to_string(),
+                        });
+                    return Err(WorkerOpenFailure::unclaimed(error));
+                }
+                self.refresh_coordinator_only().await.map_err(|error| {
+                    WorkerOpenFailure::unclaimed(claim_open_worker_error(error))
+                })?;
+                let refreshed = self
+                    .recapture_stream_claim_lane(capture, "effect-free claim continuation")
+                    .await
+                    .map_err(|error| {
+                        WorkerOpenFailure::unclaimed(claim_open_worker_error(error))
+                    })?;
+                drop(_table_guards);
+                drop(_stream_token_guard);
+                drop(_branch_guard);
+                drop(_schema_guard);
+                return Box::pin(
+                    self.open_stream_writer_with_claim(&refreshed, claim_kind, actor_id),
+                )
+                .await;
+            }
+
+            if matches!(evidence, ClaimAttemptEvidence::StockManifestOnly { .. }) {
+                let records = [LifecycleLedgerRecord::ClaimAttemptEffect(effect.clone())];
+                let outcome = self
+                    .commit_stream_claim_ledger(&snapshot, &mut sidecar, &records, effect, None)
+                    .await
+                    .map_err(|error| {
+                        WorkerOpenFailure::unclaimed(claim_open_worker_error(error))
+                    })?;
+                let RecoveryStreamClaimOutcomeV14::CheckpointVisible {
+                    prior_attempt_chain: next_chain,
+                    ..
+                } = outcome
+                else {
+                    return Err(WorkerOpenFailure::unclaimed(
+                        MemWalWorkerError::InvalidState {
+                            reason:
+                                "manifest-only claim did not publish its exact attempt checkpoint"
+                                    .to_string(),
+                        },
+                    ));
+                };
+                self.refresh_coordinator_only().await.map_err(|error| {
+                    WorkerOpenFailure::unclaimed(claim_open_worker_error(error))
+                })?;
+                snapshot = self.coordinator.read().await.snapshot();
+                // The checkpoint deliberately advanced the physical writer
+                // epoch while the manifest-selected lifecycle still names the
+                // pre-claim floor.  Only the first attempt may require exact
+                // equality with that floor; continuation binds the achieved
+                // checkpoint through the durable attempt chain instead.
+                physical = read_claim_physical_prestate_after_attempt(capture)
+                    .await
+                    .map_err(|error| {
+                        WorkerOpenFailure::unclaimed(claim_open_worker_error(error))
+                    })?;
+                attempt = prepare_next_claim_attempt(&operation, &tailer, physical)
+                    .await
+                    .map_err(|error| {
+                        WorkerOpenFailure::unclaimed(claim_open_worker_error(error))
+                    })?;
+                sidecar = list_sidecars(self.root_uri(), self.storage_adapter())
+                    .await
+                    .map_err(|error| WorkerOpenFailure::unclaimed(claim_open_worker_error(error)))?
+                    .into_iter()
+                    .find(|candidate| candidate.operation_id == sidecar.operation_id)
+                    .ok_or_else(|| {
+                        WorkerOpenFailure::unclaimed(MemWalWorkerError::InvalidState {
+                            reason:
+                                "checkpointed claim sidecar disappeared before its next attempt"
+                                    .to_string(),
+                        })
+                    })?;
+                rearm_stream_claim_checkpoint_sidecar_v14(
+                    self.root_uri(),
+                    self.storage_adapter(),
+                    &snapshot,
+                    &mut sidecar,
+                    &attempt,
+                )
+                .await
+                .map_err(|error| WorkerOpenFailure::unclaimed(claim_open_worker_error(error)))?;
+                prior_attempt_chain = next_chain;
+                invoke_attempt = true;
+                continue;
+            }
+
+            let Some(raw_writer) = raw_writer else {
+                let projection = recovered_current_generation_projection_source(
+                    capture, &tailer, &attempt, &achieved,
+                )
+                .await
+                .map_err(|error| WorkerOpenFailure::unclaimed(claim_open_worker_error(error)))?;
+                Box::pin(self.publish_terminal_stream_claim(
+                    capture,
+                    &snapshot,
+                    &tailer,
+                    &attempt,
+                    &effect,
+                    &achieved,
+                    projection,
+                    &mut sidecar,
+                ))
+                .await
+                .map_err(|error| WorkerOpenFailure::unclaimed(claim_open_worker_error(error)))?;
+                self.refresh_coordinator_only().await.map_err(|error| {
+                    WorkerOpenFailure::unclaimed(claim_open_worker_error(error))
+                })?;
+                let refreshed = self
+                    .recapture_stream_claim_lane(capture, "terminal claim continuation")
+                    .await
+                    .map_err(|error| {
+                        WorkerOpenFailure::unclaimed(claim_open_worker_error(error))
+                    })?;
+                drop(_table_guards);
+                drop(_stream_token_guard);
+                drop(_branch_guard);
+                drop(_schema_guard);
+                return Box::pin(
+                    self.open_stream_writer_with_claim(&refreshed, claim_kind, actor_id),
+                )
+                .await;
+            };
+            let writer = raw_writer.map_err(|error| {
+                WorkerOpenFailure::unclaimed(MemWalWorkerError::Lance {
+                    operation: "writer claim",
+                    message: format!(
+                        "{error}; exact terminal physical claim remains recovery-owned by {}",
+                        sidecar.operation_id
+                    ),
+                })
+            })?;
+            let mut opened = ClaimedMemWalWorker::new(writer)
+                .classify(
+                    capture.head.dataset(),
+                    &capture.full_path,
+                    &capture.details,
+                    operation.initial_writer_epoch,
+                )
+                .await?;
+            let projection = match opened.current_generation_projection_source() {
+                Ok(projection) => projection,
+                Err(error) => {
+                    return Err(WorkerOpenFailure::claimed(error, opened.into_claimed()));
+                }
+            };
+            let terminal_result = Box::pin(self.publish_terminal_stream_claim(
+                capture,
+                &snapshot,
+                &tailer,
+                &attempt,
+                &effect,
+                &achieved,
+                projection,
+                &mut sidecar,
+            ))
+            .await;
+            if let Err(error) = terminal_result {
+                return Err(WorkerOpenFailure::claimed(
+                    claim_open_worker_error(error),
+                    opened.into_claimed(),
+                ));
+            }
+            return Ok(opened);
+        }
+    }
+
+    async fn publish_terminal_stream_claim(
+        &self,
+        capture: &StreamAuthorityCapture,
+        snapshot: &crate::db::manifest::Snapshot,
+        tailer: &WalTailer,
+        attempt: &super::stream_lifecycle::PreparedClaimAttempt,
+        effect: &crate::db::manifest::stream::ClaimAttemptEffect,
+        achieved: &ClaimPhysicalPrestate,
+        projection: CurrentGenerationProjectionSource,
+        sidecar: &mut crate::db::manifest::RecoverySidecar,
+    ) -> Result<()> {
+        let key_plan = claim_wal_key_discovery_plan(
+            attempt,
+            effect,
+            Arc::new(ArrowSchema::from(capture.head.dataset().schema())),
+        )?;
+        let keys = collect_claim_wal_segment_keys(tailer, &key_plan).await?;
+        let token_dataset = snapshot.open_stream_token_authority().await?;
+        let token_rows = if keys.is_empty() {
+            BTreeMap::new()
+        } else {
+            stream_token_rows_for_keys(
+                &token_dataset,
+                snapshot.stream_token_authority(),
+                capture.entry.identity,
+                &keys,
+            )
+            .await?
+        };
+        let base_rows = if keys.is_empty() {
+            BTreeMap::new()
+        } else {
+            lookup_base_stream_metadata_for_keys(
+                capture.head.dataset(),
+                capture.entry.identity,
+                &keys,
+            )
+            .await?
+        };
+        let mut prior_token_by_key = BTreeMap::new();
+        for logical_id in &keys {
+            validate_authority_base_pair(
+                capture.entry.identity,
+                logical_id,
+                token_rows.get(logical_id),
+                base_rows.get(logical_id),
+            )
+            .map_err(|error| OmniError::manifest_internal(error.to_string()))?;
+            prior_token_by_key.insert(
+                logical_id.clone(),
+                token_rows.get(logical_id).map(|row| row.current_token),
+            );
+        }
+        let schema = Arc::new(ArrowSchema::from(capture.head.dataset().schema()));
+        let auth_plan = claim_wal_authentication_plan(
+            attempt,
+            effect,
+            capture.txn.authority.schema_ir_hash.clone(),
+            Arc::clone(&schema),
+            prior_token_by_key,
+        )?;
+        let segment = authenticate_claim_wal_segment(tailer, &auth_plan).await?;
+        let full_lww = match projection {
+            CurrentGenerationProjectionSource::Empty => current_generation_lww_projection_digest(
+                &attempt.operation,
+                &capture.txn.authority.schema_ir_hash,
+                Arc::clone(&schema),
+                &[],
+            )?,
+            CurrentGenerationProjectionSource::Replay(batches) => {
+                current_generation_lww_projection_digest(
+                    &attempt.operation,
+                    &capture.txn.authority.schema_ir_hash,
+                    Arc::clone(&schema),
+                    &batches,
+                )?
+            }
+            CurrentGenerationProjectionSource::PreservePrior => {
+                if segment.row_count != 0 {
+                    return Err(OmniError::manifest_internal(
+                        "a non-empty authenticated claim suffix cannot preserve the prior full-generation LWW projection",
+                    ));
+                }
+                capture
+                    .lifecycle
+                    .authenticated_wal_tail
+                    .lww_projection_digest
+                    .clone()
+            }
+        };
+        let attempt_chain = effect.next_attempt_chain_ref()?;
+        let current_lifecycle = snapshot
+            .stream_lifecycle(capture.entry.identity)
+            .ok_or_else(|| {
+                OmniError::manifest_internal(
+                    "terminal claim lost its manifest-selected lifecycle lane",
+                )
+            })?;
+        let built = build_terminal_claim(
+            &current_lifecycle.claim_receipt_chain,
+            attempt,
+            effect,
+            &attempt_chain,
+            &segment,
+            &full_lww,
+            achieved.replay_cursor,
+            crate::db::now_micros()?,
+        )?;
+        let next_lifecycle = build_claim_adoption_row(current_lifecycle, &built)?;
+        let records = [
+            LifecycleLedgerRecord::ClaimAttemptEffect(effect.clone()),
+            LifecycleLedgerRecord::ClaimReceipt(built.receipt.clone()),
+        ];
+        let outcome = self
+            .commit_stream_claim_ledger(
+                snapshot,
+                sidecar,
+                &records,
+                effect.clone(),
+                Some((built.receipt, next_lifecycle.clone())),
+            )
+            .await?;
+        match outcome {
+            RecoveryStreamClaimOutcomeV14::TerminalVisible { lifecycle, .. }
+                if lifecycle == next_lifecycle =>
+            {
+                self.refresh_coordinator_only().await?;
+                Ok(())
+            }
+            _ => Err(OmniError::manifest_internal(
+                "terminal claim did not publish its exact lifecycle authority",
+            )),
+        }
+    }
+
+    async fn commit_stream_claim_ledger(
+        &self,
+        snapshot: &crate::db::manifest::Snapshot,
+        sidecar: &mut crate::db::manifest::RecoverySidecar,
+        records: &[LifecycleLedgerRecord],
+        effect: crate::db::manifest::stream::ClaimAttemptEffect,
+        terminal: Option<(
+            crate::db::manifest::stream::ClaimReceipt,
+            StreamLifecycleEntry,
+        )>,
+    ) -> Result<RecoveryStreamClaimOutcomeV14> {
+        let selected = snapshot.open_stream_token_authority().await?;
+        let staged =
+            stage_lifecycle_ledger_records(selected, snapshot.stream_token_authority(), records)
+                .await?;
+        let planned_transaction = staged.transaction_identity();
+        let token_head = SnapshotHandle::new(
+            open_stream_token_authority_head(
+                self.root_uri(),
+                snapshot.stream_token_authority(),
+                &self.control_session(),
+            )
+            .await?,
+        );
+        let staged = StagedHandle::new(staged);
+        match terminal {
+            Some((receipt, next_lifecycle)) => {
+                arm_stream_claim_terminal_sidecar_v14(
+                    self.root_uri(),
+                    self.storage_adapter(),
+                    sidecar,
+                    effect,
+                    receipt,
+                    next_lifecycle,
+                    planned_transaction,
+                )
+                .await?;
+            }
+            None => {
+                arm_stream_claim_checkpoint_sidecar_v14(
+                    self.root_uri(),
+                    self.storage_adapter(),
+                    sidecar,
+                    effect,
+                    planned_transaction,
+                )
+                .await?;
+            }
+        }
+        if let Ok(outcome) = self.storage().commit_staged_exact(token_head, staged).await {
+            if !outcome.is_exact() {
+                return Err(OmniError::recovery_required(
+                    sidecar.operation_id.clone(),
+                    "claim ledger participant committed a non-exact transaction",
+                ));
+            }
+            let next_authority =
+                stream_token_authority_entry_for_dataset(outcome.snapshot().dataset()).await?;
+            confirm_stream_claim_sidecar_v14(
+                self.root_uri(),
+                self.storage_adapter(),
+                sidecar,
+                outcome.committed_transaction().clone(),
+                next_authority.current_head_witness.clone(),
+                next_authority,
+            )
+            .await?;
+        }
+        // Recovery's manifest publisher enters Lance's synchronous DataFusion
+        // planning recursion during its first poll. Keep the admission/profile
+        // and inner write guards in this parent while polling that deep stack
+        // from a fresh engine-owned task; merely boxing this future does not
+        // reset Tokio's worker stack.
+        let root_uri = self.root_uri().to_string();
+        let storage = Arc::clone(&self.storage);
+        let snapshot = snapshot.clone();
+        let sidecar = sidecar.clone();
+        crate::instrumentation::spawn_with_query_io_probes(async move {
+            complete_stream_claim_sidecar_v14(&root_uri, storage, &snapshot, &sidecar).await
+        })
+        .await
+        .map_err(|error| {
+            OmniError::Lance(format!(
+                "stream claim recovery owner task failed before returning its exact outcome: {error}"
+            ))
+        })?
+    }
+
+    /// Discover the sole pending claim for this exact lifecycle lane and run
+    /// the receipt-first lookup before the caller is allowed to mint a new
+    /// claim occurrence.
+    async fn exact_pending_stream_claim(
+        &self,
+        capture: &StreamAuthorityCapture,
+        graph_identity_digest: &str,
+    ) -> Result<
+        Option<(
+            crate::db::manifest::RecoverySidecar,
+            super::stream_lifecycle::PreparedClaimAttempt,
+        )>,
+    > {
+        let expected_lifecycle_operation_id = capture
+            .lifecycle
+            .drain
+            .as_ref()
+            .map(|drain| drain.drain_id.as_str());
+        let mut exact = None;
+        for sidecar in list_sidecars(self.root_uri(), self.storage_adapter()).await? {
+            let Some(RecoveryProtocolV14::StreamClaim(protocol)) = sidecar.protocol_v14.as_deref()
+            else {
+                continue;
+            };
+            if protocol.admission_scope.identity != capture.entry.identity
+                || protocol.admission_scope.binding_scope_id != capture.lifecycle.binding_scope_id
+                || protocol.operation.lifecycle_operation_id.as_deref()
+                    != expected_lifecycle_operation_id
+            {
+                continue;
+            }
+            let recovery_operation_id = protocol.operation.recovery_operation_id.clone();
+            if exact.is_some() {
+                return Err(OmniError::recovery_required(
+                    recovery_operation_id,
+                    "multiple pending StreamClaim sidecars own one lifecycle lane",
+                ));
+            }
+            exact = Some(sidecar);
+        }
+        let Some(sidecar) = exact else {
+            return Ok(None);
+        };
+        let (claim_id, recovery_operation_id) = match sidecar.protocol_v14.as_deref() {
+            Some(RecoveryProtocolV14::StreamClaim(protocol)) => (
+                protocol.operation.claim_id.clone(),
+                protocol.operation.recovery_operation_id.clone(),
+            ),
+            _ => unreachable!("filtered exact StreamClaim sidecar"),
+        };
+        let continuation = lookup_stream_claim_continuation_v14(
+            self.root_uri(),
+            &self.storage,
+            &capture.txn.base,
+            graph_identity_digest,
+            capture.entry.identity,
+            &capture.lifecycle.binding_scope_id,
+            &claim_id,
+            &recovery_operation_id,
+        )
+        .await?
+        .ok_or_else(|| {
+            OmniError::recovery_required(
+                recovery_operation_id,
+                "exact pending StreamClaim disappeared during receipt-first lookup",
+            )
+        })?;
+        let attempt = match continuation {
+            RecoveryStreamClaimContinuationV14::Pending { attempt, .. } => attempt,
+            RecoveryStreamClaimContinuationV14::TerminalVisible { .. } => {
+                prepared_stream_claim_attempt_v14(&sidecar)?
+            }
+        };
+        Ok(Some((sidecar, attempt)))
+    }
+
+    async fn selected_claim_receipt(
+        &self,
+        snapshot: &crate::db::manifest::Snapshot,
+        lifecycle: &StreamLifecycleEntry,
+    ) -> Result<crate::db::manifest::stream::ClaimReceipt> {
+        let record_id = lifecycle
+            .current_claim_receipt_id
+            .as_deref()
+            .ok_or_else(|| {
+                OmniError::manifest_internal(
+                    "stream fold/quiesce requires a selected current ClaimReceipt",
+                )
+            })?;
+        let dataset = snapshot.open_stream_token_authority().await?;
+        let record = lookup_lifecycle_ledger_record_by_id(
+            &dataset,
+            snapshot.stream_token_authority(),
+            CLAIM_RECEIPT_TAG,
+            record_id,
+        )
+        .await?
+        .ok_or_else(|| {
+            OmniError::manifest_internal(
+                "manifest-selected current ClaimReceipt is absent from selected token authority",
+            )
+        })?;
+        let LifecycleLedgerRecord::ClaimReceipt(receipt) = record else {
+            return Err(OmniError::manifest_internal(
+                "current ClaimReceipt ID decoded another lifecycle-ledger family",
+            ));
+        };
+        if receipt.record_id != record_id
+            || lifecycle.claim_receipt_chain.head_record_id.as_deref() != Some(record_id)
+        {
+            return Err(OmniError::manifest_internal(
+                "current ClaimReceipt does not equal the selected claim-chain head",
+            ));
+        }
+        Ok(receipt)
+    }
+
+    async fn recapture_stream_claim_lane(
+        &self,
+        prior: &StreamAuthorityCapture,
+        operation: &str,
+    ) -> Result<StreamAuthorityCapture> {
+        match prior.lifecycle.lifecycle {
+            StreamLifecycle::Open => {
+                self.capture_stream_authority(&prior.entry.table_key, operation)
+                    .await
+            }
+            StreamLifecycle::Draining => {
+                let drain_id = prior
+                    .lifecycle
+                    .drain
+                    .as_ref()
+                    .ok_or_else(|| {
+                        OmniError::manifest_internal(
+                            "DRAINING claim continuation lost its drain descriptor",
+                        )
+                    })?
+                    .drain_id
+                    .clone();
+                self.capture_draining_stream_authority(&prior.entry.table_key, operation, &drain_id)
+                    .await
+            }
+            StreamLifecycle::Sealed => Err(OmniError::manifest_internal(
+                "SEALED stream cannot continue a writer claim",
+            )),
+        }
+    }
+
+    async fn validate_claimed_writer_for_capture(
+        &self,
+        writer: &ShardWriter,
+        key: StreamWorkerKey,
+        capture: &StreamAuthorityCapture,
+    ) -> Result<()> {
+        let manifest = writer
+            .manifest()
+            .await
+            .map_err(|error| OmniError::Lance(error.to_string()))?
+            .ok_or_else(|| OmniError::manifest_internal("claimed stream shard has no manifest"))?;
+        if writer.shard_id() != key.shard_id
+            || manifest.shard_id != key.shard_id
+            || manifest.status != ShardStatus::Active
+            || manifest.writer_epoch != writer.epoch()
+            || writer.epoch() != capture.epoch_floor
+            || capture.lifecycle.current_claim_receipt_id.is_none()
+        {
+            return Err(OmniError::manifest_read_set_changed(
+                format!("stream_writer_epoch:{}", key.identity),
+                Some(format!(
+                    "{}:epoch={}:ACTIVE:selected-claim",
+                    key.shard_id, capture.epoch_floor
+                )),
+                Some(format!(
+                    "writer_shard={}:writer_epoch={}:manifest={manifest:?}:claim={:?}",
+                    writer.shard_id(),
+                    writer.epoch(),
+                    capture.lifecycle.current_claim_receipt_id
+                )),
+            ));
+        }
+        let token_dataset = capture.txn.base.open_stream_token_authority().await?;
+        let graph_identity_digest =
+            stream_graph_identity_digest(&capture.txn.authority.schema_identity_domain)?;
+        super::stream_enrollment::validate_selected_lifecycle_ledger_authority(
+            &token_dataset,
+            capture.txn.base.stream_token_authority(),
+            &graph_identity_digest,
+            &capture.lifecycle,
+        )
+        .await
+    }
+
     async fn capture_stream_authority(
         &self,
         table_key: &str,
         operation: &str,
+    ) -> Result<StreamAuthorityCapture> {
+        self.capture_stream_authority_for_lifecycle(
+            table_key,
+            operation,
+            StreamLifecycle::Open,
+            None,
+        )
+        .await
+    }
+
+    /// Capture the exact DRAINING lane named by one durable drain descriptor.
+    ///
+    /// This is deliberately separate from ordinary OPEN admission. Drain-mode
+    /// claim/fold orchestration must bind the complete DRAINING row and its
+    /// operation ID; accepting "OPEN or DRAINING" here would let an ordinary
+    /// fold silently weaken the lifecycle contract.
+    pub(super) async fn capture_draining_stream_authority(
+        &self,
+        table_key: &str,
+        operation: &str,
+        drain_id: &str,
+    ) -> Result<StreamAuthorityCapture> {
+        self.capture_stream_authority_for_lifecycle(
+            table_key,
+            operation,
+            StreamLifecycle::Draining,
+            Some(drain_id),
+        )
+        .await
+    }
+
+    async fn capture_stream_authority_for_lifecycle(
+        &self,
+        table_key: &str,
+        operation: &str,
+        expected_lifecycle: StreamLifecycle,
+        expected_drain_id: Option<&str>,
     ) -> Result<StreamAuthorityCapture> {
         let txn = self.open_write_txn(None).await?;
         let entry = txn.base.entry(table_key).cloned().ok_or_else(|| {
@@ -1393,7 +3555,24 @@ impl Omnigraph {
                     "{operation} requires an enrolled stream for '{table_key}'"
                 ))
             })?;
-        if lifecycle.lifecycle != StreamLifecycle::Open {
+        let profile_mode = txn.base.stream_profile().mode();
+        let profile_authorized = match expected_lifecycle {
+            StreamLifecycle::Open => {
+                profile_mode == crate::db::manifest::StreamProfileMode::Enabled
+            }
+            StreamLifecycle::Draining => matches!(
+                profile_mode,
+                crate::db::manifest::StreamProfileMode::Enabled
+                    | crate::db::manifest::StreamProfileMode::Disabling
+            ),
+            StreamLifecycle::Sealed => false,
+        };
+        if !profile_authorized {
+            return Err(OmniError::StreamingRequiresClusterRuntime {
+                mode: profile_mode.as_str().to_string(),
+            });
+        }
+        if lifecycle.lifecycle != expected_lifecycle {
             return Err(OmniError::manifest_stream_lifecycle_conflict(
                 entry.identity.stable_table_id,
                 entry.identity.table_incarnation_id,
@@ -1401,6 +3580,27 @@ impl Omnigraph {
                 lifecycle.lifecycle.as_str(),
                 operation,
             ));
+        }
+        match (
+            expected_lifecycle,
+            lifecycle.drain.as_ref(),
+            expected_drain_id,
+        ) {
+            (StreamLifecycle::Open, None, None) => {}
+            (StreamLifecycle::Draining, Some(drain), Some(expected))
+                if drain.drain_id == expected => {}
+            (StreamLifecycle::Draining, Some(_), Some(_)) => {
+                return Err(OmniError::manifest_read_set_changed(
+                    format!("{operation}:stream_drain:{table_key}"),
+                    expected_drain_id.map(str::to_string),
+                    lifecycle.drain.as_ref().map(|drain| drain.drain_id.clone()),
+                ));
+            }
+            _ => {
+                return Err(OmniError::manifest_internal(format!(
+                    "{operation} requested an incoherent lifecycle/drain capture for '{table_key}'"
+                )));
+            }
         }
         if lifecycle.identity != entry.identity
             || lifecycle.binding.table_location != entry.table_path
@@ -1590,6 +3790,59 @@ impl Omnigraph {
         Ok(())
     }
 
+    /// Refuse every overlapping recovery owner except the one exact
+    /// lifecycle-v3 claim continuation for this already-admitted lane.
+    ///
+    /// Cold writer open is itself the only component capable of classifying
+    /// and continuing an `AttemptArmed` claim. Applying the generic barrier
+    /// here would make that recovery owner permanently self-blocking. The
+    /// exception is intentionally narrow: same immutable table identity,
+    /// binding scope, and active lifecycle operation (none for OPEN, exact
+    /// drain ID for DRAINING), with at most one matching sidecar.
+    async fn ensure_no_relevant_stream_sidecar_except_exact_claim(
+        &self,
+        capture: &StreamAuthorityCapture,
+        operation: &str,
+    ) -> Result<()> {
+        let expected_lifecycle_operation_id = capture
+            .lifecycle
+            .drain
+            .as_ref()
+            .map(|drain| drain.drain_id.as_str());
+        let sidecars = list_sidecars(self.root_uri(), self.storage_adapter()).await?;
+        let mut exact_claim = None;
+        for sidecar in &sidecars {
+            let relevant = sidecar.writer_kind.is_graph_global_barrier()
+                || sidecar
+                    .tables
+                    .iter()
+                    .any(|pin| pin.identity == capture.entry.identity);
+            if !relevant {
+                continue;
+            }
+            let is_exact_claim = matches!(
+                sidecar.protocol_v14.as_deref(),
+                Some(RecoveryProtocolV14::StreamClaim(protocol))
+                    if protocol.admission_scope.identity == capture.entry.identity
+                        && protocol.admission_scope.binding_scope_id
+                            == capture.lifecycle.binding_scope_id
+                        && protocol.operation.lifecycle_operation_id.as_deref()
+                            == expected_lifecycle_operation_id
+            );
+            if is_exact_claim && exact_claim.replace(sidecar.operation_id.as_str()).is_none() {
+                continue;
+            }
+            return Err(OmniError::recovery_required(
+                sidecar.operation_id.clone(),
+                format!(
+                    "pending {:?} recovery operation overlaps table identity {} and blocks {operation}",
+                    sidecar.writer_kind, capture.entry.identity
+                ),
+            ));
+        }
+        Ok(())
+    }
+
     /// One feature-gated graph integration seam.  `Some(batch)` performs a put
     /// beginning at `caller_ordinal_start`; `None` performs the explicit fold.
     /// It intentionally returns no WAL/generation coordinate or durability
@@ -1617,12 +3870,27 @@ impl Omnigraph {
                     })?;
                 let ordinals =
                     CallerOrdinalRange::new(caller_ordinal_start, end).map_err(worker_error)?;
-                self.stream_put_phase_b1(table_key, batch, ordinals)
+                Box::pin(self.stream_put_phase_b1(table_key, batch, ordinals))
                     .await
                     .map(|_| ())
             }
-            None => self.stream_fold_phase_b1(table_key).await,
+            None => Box::pin(self.stream_fold_phase_b1(table_key)).await,
         }
+    }
+
+    /// Feature-gated lifecycle seam for exact `OPEN -> DRAINING -> SEALED`
+    /// integration and crash/restart tests.
+    #[cfg(feature = "failpoints")]
+    #[doc(hidden)]
+    pub async fn failpoint_stream_quiesce_for_test(
+        self: &Arc<Self>,
+        table_key: &str,
+        drain_id: &str,
+        expected_lifecycle_revision: u64,
+        actor_id: &str,
+    ) -> Result<()> {
+        Box::pin(self.stream_quiesce_as(table_key, drain_id, expected_lifecycle_revision, actor_id))
+            .await
     }
 
     /// Feature-gated proof seam for one private B2 compare-and-chain row.
@@ -1813,8 +4081,304 @@ async fn lookup_base_stream_metadata_for_keys(
     Ok(selected)
 }
 
+#[derive(Debug, Clone, Copy)]
+struct ClaimPhysicalPrestate {
+    shard_manifest_version: u64,
+    writer_epoch: u64,
+    replay_cursor: u64,
+    current_generation: u64,
+    base_merged_generation: u64,
+}
+
+async fn read_claim_physical_prestate(
+    capture: &StreamAuthorityCapture,
+) -> Result<ClaimPhysicalPrestate> {
+    let observed = read_claim_physical_prestate_after_attempt(capture).await?;
+    if observed.writer_epoch != capture.epoch_floor {
+        return Err(OmniError::manifest_read_set_changed(
+            format!("stream_claim_physical_prestate:{}", capture.entry.table_key),
+            Some(format!(
+                "{}:epoch={}:ACTIVE",
+                capture.shard_id, capture.epoch_floor
+            )),
+            Some(format!("{observed:?}")),
+        ));
+    }
+    Ok(observed)
+}
+
+async fn read_claim_physical_prestate_after_attempt(
+    capture: &StreamAuthorityCapture,
+) -> Result<ClaimPhysicalPrestate> {
+    let object_store = capture
+        .head
+        .dataset()
+        .object_store(None)
+        .await
+        .map_err(|error| OmniError::Lance(error.to_string()))?;
+    let manifest = ShardManifestStore::new(
+        object_store,
+        &capture.head.dataset().branch_location().path,
+        capture.shard_id,
+        2,
+    )
+    .read_latest()
+    .await
+    .map_err(|error| OmniError::Lance(error.to_string()))?
+    .ok_or_else(|| OmniError::manifest_internal("stream claim shard has no manifest"))?;
+    let merged = capture
+        .details
+        .merged_generations
+        .iter()
+        .filter(|merged| merged.shard_id == capture.shard_id)
+        .map(|merged| merged.generation)
+        .collect::<Vec<_>>();
+    let base_merged_generation = match merged.as_slice() {
+        [] => 0,
+        [generation] => *generation,
+        _ => {
+            return Err(OmniError::manifest_internal(
+                "stream claim observed multiple merged cursors for its one bound shard",
+            ));
+        }
+    };
+    if capture
+        .details
+        .merged_generations
+        .iter()
+        .any(|merged| merged.shard_id != capture.shard_id)
+        || manifest.shard_id != capture.shard_id
+        || manifest.status != ShardStatus::Active
+        || manifest.current_generation < base_merged_generation
+    {
+        return Err(OmniError::manifest_internal(format!(
+            "stream claim physical prestate violates its bound shard topology: {manifest:?}"
+        )));
+    }
+    Ok(ClaimPhysicalPrestate {
+        shard_manifest_version: manifest.version,
+        writer_epoch: manifest.writer_epoch,
+        replay_cursor: manifest.replay_after_wal_entry_position,
+        current_generation: manifest.current_generation,
+        base_merged_generation,
+    })
+}
+
+async fn claim_wal_tailer(capture: &StreamAuthorityCapture) -> Result<WalTailer> {
+    let object_store = capture
+        .head
+        .dataset()
+        .object_store(None)
+        .await
+        .map_err(|error| OmniError::Lance(error.to_string()))?;
+    Ok(WalTailer::new(
+        object_store,
+        capture.head.dataset().branch_location().path.clone(),
+        capture.shard_id,
+    ))
+}
+
+/// Rebuild the complete bounded active-generation projection after a process
+/// died with an `AttemptArmed` claim. Lance's retain-all profile keeps every
+/// canonical WAL object, and the claim operation fixed the exact replay cursor
+/// before its first physical invocation. Reading that closed cursor range
+/// recovers the same logical replay batches a live `mem_wal_writer` returned;
+/// empty fence entries add no memory and data rows remain bounded by the
+/// one-generation row/Arrow limits enforced by the projection validator.
+async fn recovered_current_generation_projection_source(
+    capture: &StreamAuthorityCapture,
+    tailer: &WalTailer,
+    attempt: &super::stream_lifecycle::PreparedClaimAttempt,
+    achieved: &ClaimPhysicalPrestate,
+) -> Result<CurrentGenerationProjectionSource> {
+    let physical = validate_b1_lifecycle_physical_state(capture.head.dataset(), &capture.lifecycle)
+        .await
+        .map_err(|error| OmniError::manifest_internal(error.to_string()))?;
+    match physical {
+        PassiveB1PhysicalState::FoldOnlyFlushed(flushed) => {
+            if flushed.shard_manifest_version != achieved.shard_manifest_version
+                || flushed.writer_epoch != achieved.writer_epoch
+                || flushed.replay_after_wal_entry_position != achieved.replay_cursor
+                || achieved.replay_cursor != attempt.planned_sentinel_position
+            {
+                return Err(OmniError::recovery_required(
+                    attempt.operation.recovery_operation_id.clone(),
+                    format!(
+                        "flushed current-generation authority differs from the exact recovered claim outcome: flushed={flushed:?}, achieved={achieved:?}"
+                    ),
+                ));
+            }
+            let batches = scan_flushed_generation_projection(
+                capture.head.dataset(),
+                &capture.full_path,
+                capture.shard_id,
+                &flushed,
+            )
+            .await
+            .map_err(|error| OmniError::manifest_internal(error.to_string()))?;
+            return Ok(if batches.is_empty() {
+                CurrentGenerationProjectionSource::Empty
+            } else {
+                CurrentGenerationProjectionSource::Replay(batches)
+            });
+        }
+        PassiveB1PhysicalState::AdmitOrReplay {
+            shard_manifest_version,
+            replay_after_wal_entry_position,
+            writer_epoch,
+            ..
+        } if shard_manifest_version == achieved.shard_manifest_version
+            && replay_after_wal_entry_position == achieved.replay_cursor
+            && writer_epoch == achieved.writer_epoch
+            && achieved.replay_cursor == attempt.planned_sentinel_position => {}
+        passive => {
+            return Err(OmniError::recovery_required(
+                attempt.operation.recovery_operation_id.clone(),
+                format!(
+                    "active-generation authority differs from the exact recovered claim outcome: passive={passive:?}, achieved={achieved:?}"
+                ),
+            ));
+        }
+    }
+
+    let first = attempt
+        .operation
+        .initial_replay_cursor
+        .checked_add(1)
+        .ok_or_else(|| OmniError::manifest_internal("stream replay cursor overflow"))?;
+    let mut batches = Vec::new();
+    for position in first..=attempt.planned_sentinel_position {
+        let entry = tailer
+            .read_entry(position)
+            .await
+            .map_err(|error| OmniError::Lance(error.to_string()))?
+            .ok_or_else(|| {
+                OmniError::recovery_required(
+                    attempt.operation.recovery_operation_id.clone(),
+                    format!(
+                        "retained WAL has a gap at position {position} while rebuilding the current generation"
+                    ),
+                )
+            })?;
+        if entry.shard_id.to_string() != attempt.operation.shard_id
+            || entry.entry_position != position
+        {
+            return Err(OmniError::recovery_required(
+                attempt.operation.recovery_operation_id.clone(),
+                format!("retained WAL entry {position} belongs to another shard or position"),
+            ));
+        }
+        batches.extend(entry.batches);
+    }
+    Ok(if batches.is_empty() {
+        CurrentGenerationProjectionSource::Empty
+    } else {
+        CurrentGenerationProjectionSource::Replay(batches)
+    })
+}
+
+async fn prepare_next_claim_attempt(
+    operation: &super::stream_lifecycle::PreparedClaimOperation,
+    tailer: &WalTailer,
+    prestate: ClaimPhysicalPrestate,
+) -> Result<super::stream_lifecycle::PreparedClaimAttempt> {
+    let planned_sentinel_position = tailer
+        .next_position()
+        .await
+        .map_err(|error| OmniError::Lance(error.to_string()))?;
+    let planned_writer_epoch = prestate
+        .writer_epoch
+        .checked_add(1)
+        .ok_or_else(|| OmniError::manifest_internal("stream writer epoch overflow"))?;
+    prepare_claim_attempt(
+        operation,
+        ClaimAttemptRequest {
+            attempt_id: ShardId::new_v4().to_string(),
+            pre_shard_manifest_version: prestate.shard_manifest_version,
+            pre_writer_epoch: prestate.writer_epoch,
+            pre_replay_cursor: prestate.replay_cursor,
+            planned_sentinel_position,
+            planned_writer_epoch,
+            storage_envelope_digest: None,
+        },
+    )
+}
+
+async fn observe_claim_attempt(
+    capture: &StreamAuthorityCapture,
+    tailer: &WalTailer,
+    attempt: &super::stream_lifecycle::PreparedClaimAttempt,
+) -> Result<(ClaimAttemptEvidence, ClaimPhysicalPrestate)> {
+    let achieved = read_claim_physical_prestate_after_attempt(capture).await?;
+    let sentinel = tailer
+        .read_entry(attempt.planned_sentinel_position)
+        .await
+        .map_err(|error| OmniError::Lance(error.to_string()))?;
+    if achieved.shard_manifest_version == attempt.pre_shard_manifest_version
+        && achieved.writer_epoch == attempt.pre_writer_epoch
+        && achieved.replay_cursor == attempt.pre_replay_cursor
+        && sentinel.is_none()
+    {
+        return Ok((ClaimAttemptEvidence::NoEffect, achieved));
+    }
+    if achieved.shard_manifest_version <= attempt.pre_shard_manifest_version
+        || achieved.writer_epoch != attempt.planned_writer_epoch
+    {
+        return Err(OmniError::recovery_required(
+            attempt.operation.recovery_operation_id.clone(),
+            format!(
+                "stream claim physical outcome differs from its exact plan: achieved={achieved:?}"
+            ),
+        ));
+    }
+    match sentinel {
+        None => Ok((
+            ClaimAttemptEvidence::StockManifestOnly {
+                achieved_shard_manifest_version: achieved.shard_manifest_version,
+                achieved_writer_epoch: achieved.writer_epoch,
+            },
+            achieved,
+        )),
+        Some(entry)
+            if entry.shard_id == capture.shard_id
+                && entry.entry_position == attempt.planned_sentinel_position
+                && entry.writer_epoch == attempt.planned_writer_epoch
+                && entry.batches.is_empty() =>
+        {
+            Ok((
+                ClaimAttemptEvidence::StockManifestPlusSentinel {
+                    achieved_shard_manifest_version: achieved.shard_manifest_version,
+                    achieved_writer_epoch: achieved.writer_epoch,
+                },
+                achieved,
+            ))
+        }
+        Some(entry) => Err(OmniError::recovery_required(
+            attempt.operation.recovery_operation_id.clone(),
+            format!(
+                "stream claim planned sentinel is foreign or data-bearing: position={}, epoch={}, batches={}",
+                entry.entry_position,
+                entry.writer_epoch,
+                entry.batches.len()
+            ),
+        )),
+    }
+}
+
+fn claim_open_worker_error(error: OmniError) -> MemWalWorkerError {
+    MemWalWorkerError::InvalidState {
+        reason: error.to_string(),
+    }
+}
+
 fn worker_error(error: MemWalWorkerError) -> OmniError {
     OmniError::Lance(error.to_string())
+}
+
+fn stream_data_block_error(block_token: &str) -> OmniError {
+    OmniError::manifest(format!(
+        "stream fold is strict-blocked; correction requires block token {block_token}"
+    ))
 }
 
 fn validate_stream_input_bounds(table_key: &str, batch: &RecordBatch) -> Result<()> {
@@ -1976,6 +4540,48 @@ fn ensure_same_capture(
         && expected.lifecycle == actual.lifecycle
         && expected.txn.authority == actual.txn.authority;
     if same {
+        return Ok(());
+    }
+    Err(OmniError::manifest_read_set_changed(
+        member.to_string(),
+        Some(format!(
+            "{}:{}:v{}:{:?}",
+            expected.worker_key,
+            expected.entry.table_path,
+            expected.entry.table_version,
+            expected.lifecycle
+        )),
+        Some(format!(
+            "{}:{}:v{}:{:?}",
+            actual.worker_key,
+            actual.entry.table_path,
+            actual.entry.table_version,
+            actual.lifecycle
+        )),
+    ))
+}
+
+fn ensure_claim_successor_capture(
+    expected: &StreamAuthorityCapture,
+    actual: &StreamAuthorityCapture,
+    member: &str,
+) -> Result<()> {
+    let same_lane = expected.worker_key == actual.worker_key
+        && expected.entry.identity == actual.entry.identity
+        && expected.entry.table_key == actual.entry.table_key
+        && expected.entry.table_path == actual.entry.table_path
+        && expected.entry.table_branch == actual.entry.table_branch
+        && expected.entry.table_version == actual.entry.table_version
+        && expected.entry.row_count == actual.entry.row_count
+        && expected.binding == actual.binding
+        && expected.txn.authority == actual.txn.authority
+        && actual
+            .lifecycle
+            .validate_successor_of(&expected.lifecycle)
+            .is_ok()
+        && actual.lifecycle.current_claim_receipt_id.is_some()
+        && actual.epoch_floor > expected.epoch_floor;
+    if same_lane {
         return Ok(());
     }
     Err(OmniError::manifest_read_set_changed(

@@ -1929,35 +1929,73 @@ fn stream_lifecycle_for_person(
         transaction_uuid: "33333333-3333-4333-8333-333333333333".to_string(),
         manifest_e_tag: None,
     };
+    let enrollment_receipt = stream::EnrollmentReceipt::new(
+        "44444444-4444-4444-8444-444444444444".to_string(),
+        format!("sha256:{}", "b".repeat(64)),
+        "55555555-5555-4555-8555-555555555555".to_string(),
+        binding.clone(),
+    )
+    .unwrap();
+    let binding_scope_id = "77777777-7777-4777-8777-777777777777";
+    let binding_receipt = stream::BindingReceipt::new(
+        stream::stream_graph_identity_digest("manifest-test-domain").unwrap(),
+        person_entry.identity,
+        &stream::binding_receipt_chain_genesis(),
+        binding_scope_id,
+        enrollment_receipt.stream_incarnation_id.clone(),
+        binding.clone(),
+        "INITIAL_ENROLLMENT",
+        1,
+    )
+    .unwrap();
     let mut entry = StreamLifecycleEntry::new_open_enrollment(
         person_entry.identity,
         person_entry.table_key.clone(),
         binding.clone(),
+        binding_scope_id.to_string(),
         head.clone(),
         BTreeMap::from([(shard_id.clone(), 1)]),
-        stream::EnrollmentReceipt::new(
-            "44444444-4444-4444-8444-444444444444".to_string(),
-            format!("sha256:{}", "b".repeat(64)),
-            "55555555-5555-4555-8555-555555555555".to_string(),
-            binding.clone(),
-        )
-        .unwrap(),
+        enrollment_receipt,
+        binding_receipt.record_id.clone(),
+        binding_receipt.next_chain_ref().unwrap(),
     )
     .unwrap();
     if lifecycle == StreamLifecycle::Draining {
         entry.lifecycle = StreamLifecycle::Draining;
         entry.lifecycle_revision = 2;
+        let drain_id = "66666666-6666-4666-8666-666666666666".to_string();
+        let operation_request_payload = stream::QuiesceRequestPayload {
+            protocol_version: stream::QUIESCE_REQUEST_PROTOCOL_VERSION,
+            graph_identity_digest: format!("sha256:{}", "b".repeat(64)),
+            identity: entry.identity,
+            stream_incarnation_id: entry
+                .enrollment_receipt
+                .stream_incarnation_id
+                .clone(),
+            binding_scope_id: entry.binding_scope_id.clone(),
+            enrollment_id: binding.enrollment_id.clone(),
+            drain_id: drain_id.clone(),
+            expected_lifecycle_revision: 1,
+            goal: stream::DrainGoal::OpenAfterFold,
+            physical_binding_digest: stream::stream_physical_binding_digest(&binding).unwrap(),
+            expected_current_head_witness: head.clone(),
+            target_epoch_floor_by_shard: BTreeMap::from([(shard_id.clone(), 1)]),
+            seal_override: None,
+        };
+        let operation_request_digest = operation_request_payload.request_digest().unwrap();
         entry.drain = Some(stream::DrainDescriptor {
-            drain_id: "66666666-6666-4666-8666-666666666666".to_string(),
+            drain_id,
             operation_expected_revision: 1,
-            operation_request_digest: format!("sha256:{}", "c".repeat(64)),
+            operation_request_digest,
             goal: stream::DrainGoal::OpenAfterFold,
             initiating_actor: "actor:test".to_string(),
             initiated_at: 1,
             expected_binding: binding,
             expected_current_head_witness: head,
+            operation_request_payload,
             target_epoch_floor_by_shard: BTreeMap::from([(shard_id, 1)]),
             guarded_operation: None,
+            seal_override: None,
         });
     }
     entry.validate().unwrap();

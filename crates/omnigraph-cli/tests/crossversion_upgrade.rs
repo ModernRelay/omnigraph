@@ -23,9 +23,10 @@
 //! v8 ↔ v9 fence, strict rebuild, non-exposure of v9's trusted physical stream
 //! metadata, and preservation of a genuine v8 user property whose old
 //! grammar-valid name motivated v9's grammar-impossible physical field. The v9
-//! case uses `OMNIGRAPH_V9_BIN` for the v9 ↔ v10 fence. The current
-//! immediate-predecessor case uses `OMNIGRAPH_V10_BIN` to prove the genuine
-//! v10 ↔ v11 fence and strict rebuild.
+//! case uses `OMNIGRAPH_V9_BIN` for the v9 ↔ v10 fence. The historical v10
+//! case uses `OMNIGRAPH_V10_BIN` for the v10 ↔ v11 fence. The current
+//! immediate-predecessor case uses `OMNIGRAPH_V11_BIN` to prove the genuine
+//! v11 ↔ v12 fence and strict rebuild.
 
 mod support;
 
@@ -137,6 +138,19 @@ fn v10_bin() -> Option<PathBuf> {
         path.exists() && path.is_file(),
         "OMNIGRAPH_V10_BIN is set but is not a binary file: {} \
          (unset it to skip, or point it at the omnigraph binary built from the final internal-v10 commit)",
+        path.display(),
+    );
+    Some(path)
+}
+
+/// Resolve the final internal-v11 binary (the last v11 commit before the
+/// lifecycle-v3 ledger-chain / recovery-v14 format activation).
+fn v11_bin() -> Option<PathBuf> {
+    let path = PathBuf::from(std::env::var_os("OMNIGRAPH_V11_BIN")?);
+    assert!(
+        path.exists() && path.is_file(),
+        "OMNIGRAPH_V11_BIN is set but is not a binary file: {} \
+         (unset it to skip, or point it at the omnigraph binary built from the final internal-v11 commit)",
         path.display(),
     );
     Some(path)
@@ -1194,5 +1208,114 @@ fn current_v11_refuses_and_rebuilds_genuine_v10_and_v10_refuses_v11() {
             || reverse_stderr.contains("newer")
             || reverse_stderr.contains("expects v10"),
         "unexpected v10→v11 reverse-refusal message: {reverse_stderr}",
+    );
+}
+
+#[test]
+fn current_v12_refuses_and_rebuilds_genuine_v11_and_v11_refuses_v12() {
+    let Some(v11) = v11_bin() else {
+        eprintln!(
+            "skipping immediate-predecessor v11 upgrade test: OMNIGRAPH_V11_BIN is not set to a final internal-v11 binary"
+        );
+        return;
+    };
+
+    let temp = tempdir().unwrap();
+    let v11_graph = temp.path().join("old-v11-profile-v2.omni");
+    let (schema, data) = write_vector_blob_fixture(temp.path(), "v11-vector-blob");
+    let v11_uri = v11_graph.to_str().unwrap();
+
+    // Mint the genuine immediate-predecessor image with the immutable final-v11
+    // binary. The snapshot assertion prevents a current-shaped graph with a
+    // rewound stamp from standing in for real predecessor evidence.
+    assert_ok(
+        "v11 init",
+        &run_old(
+            &v11,
+            &["init", "--schema", schema.to_str().unwrap(), v11_uri],
+        ),
+    );
+    assert_ok(
+        "v11 load",
+        &run_old(
+            &v11,
+            &[
+                "load",
+                "--mode",
+                "overwrite",
+                "--data",
+                data.to_str().unwrap(),
+                v11_uri,
+            ],
+        ),
+    );
+    let v11_snapshot = run_old(&v11, &["snapshot", v11_uri, "--json"]);
+    assert_ok("v11 snapshot", &v11_snapshot);
+    let v11_snapshot: serde_json::Value =
+        serde_json::from_slice(&v11_snapshot.stdout).expect("valid v11 snapshot JSON");
+    assert_eq!(
+        v11_snapshot["internal_schema_version"], 11,
+        "the predecessor binary must mint a genuine internal-schema-v11 graph",
+    );
+
+    // This clean, disabled fixture has no private stream authority to transfer,
+    // so ordinary export is the supported source side of the strict rebuild.
+    let export = run_old(&v11, &["export", v11_uri]);
+    assert_ok("v11 export", &export);
+    assert!(!export.stdout.is_empty(), "v11 export produced no rows");
+    let jsonl = temp.path().join("v11.jsonl");
+    std::fs::write(&jsonl, &export.stdout).unwrap();
+
+    // V12 must refuse before interpreting v11 lifecycle-v2/profile authority
+    // as lifecycle-v3 ledger-chain state. Pin both operator-guidance slots.
+    let refusal = output_failure(cli().arg("snapshot").arg(&v11_graph));
+    let stderr = String::from_utf8_lossy(&refusal.stderr);
+    assert!(
+        stderr.contains("created by omnigraph 0.10.0-dev"),
+        "v12 refusal must name the source-build line that wrote internal schema v11, got: {stderr}",
+    );
+    assert!(
+        stderr.contains("with an omnigraph 0.10.0-dev binary"),
+        "v12 refusal must direct the operator to the matching v11 source build for export, got: {stderr}",
+    );
+    assert!(
+        stderr.contains("export"),
+        "v12 refusal must direct the operator to export/import rebuild, got: {stderr}",
+    );
+
+    let v12_graph = temp.path().join("new-v12-lifecycle-v3-from-v11.omni");
+    output_success(
+        cli()
+            .arg("init")
+            .arg("--schema")
+            .arg(&schema)
+            .arg(&v12_graph),
+    );
+    output_success(
+        cli()
+            .arg("load")
+            .arg("--mode")
+            .arg("overwrite")
+            .arg("--data")
+            .arg(&jsonl)
+            .arg(&v12_graph),
+    );
+    let reexport = output_success(cli().arg("export").arg(&v12_graph));
+    assert_export_fidelity("v11 → v12", &export.stdout, &reexport.stdout);
+    assert_exported_blob_fidelity("v11 → v12", &export.stdout, &reexport.stdout);
+    assert_current_graph_tables_use_exact_id_pk(&v12_graph);
+    assert_current_blob_bytes(&v12_graph, &[0, 1, 2, 3, 255]);
+
+    let reverse = run_old(&v11, &["snapshot", v12_graph.to_str().unwrap()]);
+    assert!(
+        !reverse.status.success(),
+        "a v11 binary must refuse a genuine v12 graph",
+    );
+    let reverse_stderr = String::from_utf8_lossy(&reverse.stderr);
+    assert!(
+        reverse_stderr.contains("upgrade omnigraph")
+            || reverse_stderr.contains("newer")
+            || reverse_stderr.contains("expects v11"),
+        "unexpected v11→v12 reverse-refusal message: {reverse_stderr}",
     );
 }

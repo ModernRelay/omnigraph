@@ -40,17 +40,33 @@ pub(crate) struct ReceiptChainRef {
 
 impl ReceiptChainRef {
     pub(crate) fn genesis() -> Self {
+        Self::genesis_with_domain(RECEIPT_CHAIN_GENESIS_DOMAIN)
+    }
+
+    /// Construct the canonical empty commitment for another receipt family.
+    ///
+    /// The wire shape is shared across the profile and lane-scoped ledgers,
+    /// while each family supplies its own domain so an empty chain cannot be
+    /// transplanted between authorities.
+    pub(crate) fn genesis_with_domain(domain: &[u8]) -> Self {
         Self {
             head_record_id: None,
             record_count: 0,
-            chain_digest: sha256(RECEIPT_CHAIN_GENESIS_DOMAIN),
+            chain_digest: sha256(domain),
         }
     }
 
     pub(crate) fn validate(&self) -> Result<()> {
+        self.validate_with_domain(RECEIPT_CHAIN_GENESIS_DOMAIN)
+    }
+
+    /// Validate this fixed-size reference against one receipt family's exact
+    /// genesis commitment. Non-empty chains still carry a deterministic
+    /// SHA-256 head and cumulative digest, independent of the family.
+    pub(crate) fn validate_with_domain(&self, genesis_domain: &[u8]) -> Result<()> {
         validate_sha256("profile receipt-chain digest", &self.chain_digest)?;
         match (self.record_count, self.head_record_id.as_deref()) {
-            (0, None) if self.chain_digest == sha256(RECEIPT_CHAIN_GENESIS_DOMAIN) => Ok(()),
+            (0, None) if self.chain_digest == sha256(genesis_domain) => Ok(()),
             (0, _) => Err(profile_error(
                 "an empty profile receipt chain must use the canonical genesis commitment",
             )),

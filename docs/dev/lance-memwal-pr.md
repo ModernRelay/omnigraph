@@ -64,18 +64,22 @@ are implemented and evidence-green at a deliberately narrow boundary:
 - replayed or flushed-but-unmerged state routes to fold only;
 - one strict fold stages exact base-table and `_stream_tokens.lance`
   participants and publishes both through `__manifest`; and
-- current internal schema v11 preserves stream-config v3, lifecycle state v2,
-  and recovery-v12 for this private implementation and adds checked profile-v2
-  authority plus recovery-v13 `StreamProfileChange`. Historical
-  v8/config-v2/recovery-v11 state crosses that boundary only through
+- current internal schema v12 preserves the v9 row/token contract, adds
+  lifecycle-v3 fixed-size ledger heads, and activates recovery-v14 hidden
+  enrollment, writer-claim, ordinary/drain-fold, and terminal management
+  authority. V11's checked profile-v2 and recovery-v13
+  `StreamProfileChange` remain intact. Historical v8/config-v2/recovery-v11
+  and v9 lifecycle-v2/recovery-v12 state cross that boundary only through
   export/init/load.
 
 The core is intentionally reachable only through a feature-gated, doc-hidden
 engine seam. Checked profile control exists, including restart-stable
 `DISABLING`, but there is no `@stream` schema intent, public enrollment, SDK
 ingest method, HTTP route, CLI ingest command, OpenAPI surface, or enrolled-lane
-drain/resume workflow. Those lifecycle effects require another strict format
-strand. An acknowledgement means that the submitted batch is durable and
+operator workflow. The hidden v12 core does implement recovery-covered
+empty/non-empty `OPEN → DRAINING → SEALED`; resume/abort and the production
+control/transport activation remain fail-closed. An acknowledgement means that
+the submitted batch is durable and
 replayable; it does not mean that the graph already exposes the rows.
 
 MemWAL is the strategic streaming substrate. OmniGraph is not designing a
@@ -102,12 +106,15 @@ RFC-026 Phase B2 specifies the remaining public contract:
 - explicit acceptance of loud provider-capacity exhaustion rather than a hard
   retained-storage admission promise.
 
-The private storage/correctness subset is implemented: schema v9, stream-config
-v3, lifecycle state v2, canonical compare-and-chain tokens, trusted hidden row
-attribution, manifest-selected token authority, and recovery-v12's exact
-base-plus-token publication. Explicit production enrollment, lifecycle
-management, correction/status, authorization, SDK/HTTP/CLI/OpenAPI, and every
-other product surface remain inactive.
+The private storage/correctness subset is implemented through current schema
+v12: v9 supplied stream-config v3, lifecycle state v2, canonical
+compare-and-chain tokens, trusted hidden row attribution, manifest-selected
+token authority, and recovery-v12's exact base-plus-token publication; v12
+adds lifecycle-v3 and recovery-v14 hidden enrollment, claims, ordinary/drain
+folds, and restartable empty/non-empty quiescence. Supported production
+enrollment/quiesce, resume/abort, correction/retirement, exclusive-cut
+physical status, SDK/HTTP/CLI/OpenAPI, and every other product surface remain
+inactive.
 
 ## The missing Lance capabilities
 
@@ -354,7 +361,7 @@ The OmniGraph PR should remain deliberately thin:
 - update RFC-026 and the write-path state ledger with the exact reviewed Lance
   revision and the boundary that has become green.
 
-OmniGraph schema v9 remains the active format during this optional future
+OmniGraph schema v12 remains the active format during this optional future
 slice. The new Lance retention kind is qualified but is not thereby activated
 by a production stream.
 
@@ -395,15 +402,18 @@ Required local and configured-RustFS evidence includes:
 This slice creates safe retention authority. It does not by itself activate
 public streaming.
 
-The following remain separate work:
+The following stay outside this optional Lance slice, whether already
+implemented privately in OmniGraph or still future product work:
 
 - a Lance-owned reserve-first physical-growth ledger, bounded
   materialization-attempt count, and emergency control headroom;
 - OmniGraph's graph-global `GraphHistoryBudget` across every manifest writer;
-- schema v9, stream-config v3, state v2, and recovery-v12 activation;
-- compare-and-chain token state and trusted contributor attribution;
-- persistent revisioned quiesce/resume/abort-drain and strict correction;
-- SDK, HTTP, CLI, Cedar, OpenAPI, and shutdown/cancellation product parity;
+- the implemented schema-v9/config-v3/state-v2/recovery-v12 token core;
+- the implemented compare-and-chain state and trusted contributor attribution;
+- the implemented hidden v12/v14 revisioned quiesce core, plus future
+  resume/abort-drain and strict correction;
+- SDK, HTTP, CLI, OpenAPI, and shutdown/cancellation product parity (the Cedar
+  vocabulary is already registered);
 - automatic SchemaApply, Optimize, Repair, Cleanup, or branch integration;
 - multi-shard routing, fresh reads, or overlapping-process failover; and
 - arbitrary per-generation WAL-prefix reclamation.

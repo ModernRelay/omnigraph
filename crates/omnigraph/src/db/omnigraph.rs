@@ -40,6 +40,7 @@ mod repair;
 mod schema_apply;
 mod stream_enrollment;
 mod stream_ingest;
+pub(crate) mod stream_lifecycle;
 mod stream_profile;
 mod stream_status;
 mod table_ops;
@@ -659,12 +660,25 @@ impl Omnigraph {
                 .await?
                 .into_iter()
                 .flat_map(|sidecar| {
-                    sidecar.tables.into_iter().map(|pin| {
-                        crate::db::write_queue::StreamAdmissionKey::for_resolved_ref(
-                            pin.identity,
-                            pin.table_branch.as_deref(),
-                        )
-                    })
+                    if let Some(scope) = sidecar.stream_admission_scope() {
+                        vec![
+                            crate::db::write_queue::StreamAdmissionKey::for_resolved_ref(
+                                scope.identity,
+                                scope.table_branch.as_deref(),
+                            ),
+                        ]
+                    } else {
+                        sidecar
+                            .tables
+                            .into_iter()
+                            .map(|pin| {
+                                crate::db::write_queue::StreamAdmissionKey::for_resolved_ref(
+                                    pin.identity,
+                                    pin.table_branch.as_deref(),
+                                )
+                            })
+                            .collect()
+                    }
                 })
                 .collect::<Vec<_>>()
         } else {

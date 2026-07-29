@@ -59,21 +59,35 @@ pub(crate) use recovery::MAX_EFFECT_IDENTITY_SCAN_VERSIONS;
 pub(crate) use recovery::{
     HealPendingOutcome, MAX_BRANCH_MERGE_DATA_TRANSACTIONS, RecoveryAuthorityToken,
     RecoveryBranchMergeEffect, RecoveryBranchMergeEffectKind, RecoveryLineageIntent,
-    RecoveryManifestDelta, RecoveryMode, RecoverySchemaApplyEffect, RecoverySchemaApplyEffectKind,
-    RecoverySidecar, RecoverySidecarHandle, RecoveryStreamProfileChangeKind,
-    RecoveryStreamFoldCut, RecoveryTableUpdateSlot, SidecarKind, SidecarTablePin,
+    RecoveryManifestDelta, RecoveryMode, RecoveryProtocolV14, RecoverySchemaApplyEffect,
+    RecoverySchemaApplyEffectKind, RecoverySidecar, RecoverySidecarHandle,
+    RecoveryStreamAdmissionScope, RecoveryStreamClaimAttemptV14,
+    RecoveryStreamClaimContinuationV14, RecoveryStreamClaimLedgerEffectV14,
+    RecoveryStreamClaimOperationV14, RecoveryStreamClaimOutcomeV14, RecoveryStreamClaimPhaseV14,
+    RecoveryStreamClaimTerminalV14, RecoveryStreamClaimV14, RecoveryStreamDrainFoldAuthorityV14,
+    RecoveryStreamFoldCut, RecoveryStreamFoldV14, RecoveryStreamLifecycleReceiptKind,
+    RecoveryStreamLifecycleReceiptV14, RecoveryStreamProfileChangeKind,
+    RecoveryStreamProtocolV14Scaffold, RecoveryTableUpdateSlot, SidecarKind, SidecarTablePin,
     SidecarTableRegistration, SidecarTableRename, SidecarTombstone,
-    complete_stream_enrollment_sidecar_v10, complete_stream_fold_sidecar_v12,
-    complete_stream_profile_change_sidecar_v13,
-    confirm_branch_merge_sidecar_v9,
-    confirm_ensure_indices_sidecar_v9, confirm_occ_sidecar_v9, confirm_schema_apply_sidecar_v9,
-    confirm_stream_fold_sidecar_v12, confirm_stream_profile_change_sidecar_v13, delete_sidecar,
-    ensure_read_only_schema_coherent,
-    finalize_effect_free_occ_sidecar, finalize_effect_free_stream_fold_sidecar_v12,
-    heal_pending_sidecars_roll_forward,
-    list_sidecars, new_branch_merge_sidecar_v9, new_ensure_indices_sidecar_v9, new_occ_sidecar_v9,
-    new_optimize_sidecar_v9, new_schema_apply_sidecar_v9, new_stream_enrollment_sidecar_v10,
-    new_stream_fold_sidecar_v12, new_stream_profile_change_sidecar_v13, recover_manifest_drift,
+    arm_stream_claim_checkpoint_sidecar_v14, arm_stream_claim_terminal_sidecar_v14,
+    classify_effect_free_stream_claim_sidecar_v14, complete_stream_claim_sidecar_v14,
+    complete_stream_enrollment_sidecar_v10, complete_stream_enrollment_sidecar_v14,
+    complete_stream_fold_sidecar_v12, complete_stream_fold_sidecar_v14,
+    complete_stream_lifecycle_receipt_sidecar_v14, complete_stream_profile_change_sidecar_v13,
+    confirm_branch_merge_sidecar_v9, confirm_ensure_indices_sidecar_v9, confirm_occ_sidecar_v9,
+    confirm_schema_apply_sidecar_v9, confirm_stream_claim_sidecar_v14,
+    confirm_stream_fold_sidecar_v12, confirm_stream_fold_sidecar_v14,
+    confirm_stream_lifecycle_receipt_sidecar_v14, confirm_stream_profile_change_sidecar_v13,
+    delete_sidecar, ensure_read_only_schema_coherent, finalize_effect_free_occ_sidecar,
+    finalize_effect_free_stream_fold_sidecar_v12, finalize_effect_free_stream_fold_sidecar_v14,
+    heal_pending_sidecars_roll_forward, list_sidecars, lookup_stream_claim_continuation_v14,
+    new_branch_merge_sidecar_v9, new_ensure_indices_sidecar_v9, new_occ_sidecar_v9,
+    new_optimize_sidecar_v9, new_schema_apply_sidecar_v9, new_stream_claim_sidecar_v14,
+    new_stream_drain_fold_sidecar_v14, new_stream_enrollment_sidecar_v10,
+    new_stream_enrollment_sidecar_v14, new_stream_fold_sidecar_v12, new_stream_fold_v2_sidecar_v14,
+    new_stream_lifecycle_receipt_sidecar_v14, new_stream_profile_change_sidecar_v13,
+    prepared_stream_claim_attempt_v14, rearm_stream_claim_checkpoint_sidecar_v14,
+    receipt_first_rearm_stream_claim_sidecar_v14, recover_manifest_drift,
     schema_apply_serial_queue_key, write_sidecar,
 };
 pub use state::SubTableEntry;
@@ -85,16 +99,18 @@ pub(crate) use stream::{
     CurrentHeadWitness, EnrollmentReceipt, STREAM_CONFIG_VERSION, StreamLifecycle,
     StreamLifecycleEntry, StreamPhysicalBinding, stream_enrollment_intent_digest_v1,
 };
+pub use stream_profile::StreamingStatus;
 pub(crate) use stream_profile::{
     DisablePlan, FoldContinuation, FoldDelegation, ProfileManagementReceipt,
     ProfileManagementResult, StreamProfileEntry, StreamProfileMode, StreamProfileState,
-    stream_profile_cluster_root_digest,
-    stream_profile_graph_identity_digest, stream_profile_management_request_digest,
+    stream_profile_cluster_root_digest, stream_profile_graph_identity_digest,
+    stream_profile_management_request_digest,
 };
-pub use stream_profile::StreamingStatus;
 pub(crate) use token_store::{
-    StreamTokenAuthorityEntry, lookup_profile_management_receipt,
-    open_stream_token_authority_at, open_stream_token_authority_head,
+    LifecycleLedgerRecord, StreamTokenAuthorityEntry, lookup_claim_receipt,
+    lookup_lifecycle_ledger_record_by_id, lookup_management_receipt,
+    lookup_profile_management_receipt, open_stream_token_authority_at,
+    open_stream_token_authority_head, stage_lifecycle_ledger_records, stage_management_receipt,
     stage_profile_management_receipt, stream_token_authority_entry_for_dataset,
 };
 
@@ -269,10 +285,7 @@ fn filter_text_references_protocol_column(filter: &str) -> bool {
             let left_boundary = index == 0 || !is_identifier_byte(bytes[index - 1]);
             let right_boundary = index + needle.len() == bytes.len()
                 || !is_identifier_byte(bytes[index + needle.len()]);
-            if left_boundary
-                && right_boundary
-                && candidate.eq_ignore_ascii_case(needle)
-            {
+            if left_boundary && right_boundary && candidate.eq_ignore_ascii_case(needle) {
                 return true;
             }
         }
