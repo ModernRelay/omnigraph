@@ -4048,8 +4048,73 @@ fn canonical_json_digest(domain: &[u8], field: &str, value: &serde_json::Value) 
             "stream {field} must be a JSON object"
         )));
     }
-    let bytes = bounded_json_bytes(field, value)?;
+    let mut bytes = Vec::new();
+    write_canonical_json(field, value, &mut bytes)?;
     Ok(hash_fields(domain, &[&bytes]))
+}
+
+/// Encode the receipt JSON contract independently of `serde_json::Map`'s
+/// backing container: object keys sort by their UTF-8 bytes, arrays retain
+/// order, and scalar spellings remain serde_json's stable JSON spellings.
+fn write_canonical_json(
+    field: &str,
+    value: &serde_json::Value,
+    bytes: &mut Vec<u8>,
+) -> Result<()> {
+    match value {
+        serde_json::Value::Null => bytes.extend_from_slice(b"null"),
+        serde_json::Value::Bool(value) => {
+            bytes.extend_from_slice(if *value { b"true" } else { b"false" })
+        }
+        serde_json::Value::Number(value) => {
+            serde_json::to_writer(&mut *bytes, value).map_err(|error| {
+                OmniError::manifest_internal(format!(
+                    "failed to encode stream {field}: {error}"
+                ))
+            })?;
+        }
+        serde_json::Value::String(value) => {
+            serde_json::to_writer(&mut *bytes, value).map_err(|error| {
+                OmniError::manifest_internal(format!(
+                    "failed to encode stream {field}: {error}"
+                ))
+            })?;
+        }
+        serde_json::Value::Array(values) => {
+            bytes.push(b'[');
+            for (index, value) in values.iter().enumerate() {
+                if index != 0 {
+                    bytes.push(b',');
+                }
+                write_canonical_json(field, value, bytes)?;
+            }
+            bytes.push(b']');
+        }
+        serde_json::Value::Object(values) => {
+            bytes.push(b'{');
+            let mut entries = values.iter().collect::<Vec<_>>();
+            entries.sort_unstable_by(|(left, _), (right, _)| left.as_bytes().cmp(right.as_bytes()));
+            for (index, (key, value)) in entries.into_iter().enumerate() {
+                if index != 0 {
+                    bytes.push(b',');
+                }
+                serde_json::to_writer(&mut *bytes, key).map_err(|error| {
+                    OmniError::manifest_internal(format!(
+                        "failed to encode stream {field}: {error}"
+                    ))
+                })?;
+                bytes.push(b':');
+                write_canonical_json(field, value, bytes)?;
+            }
+            bytes.push(b'}');
+        }
+    }
+    if bytes.len() > MAX_RECEIPT_JSON_BYTES {
+        return Err(OmniError::manifest_internal(format!(
+            "stream {field} exceeds the {MAX_RECEIPT_JSON_BYTES}-byte receipt bound"
+        )));
+    }
+    Ok(())
 }
 
 /// `Option<T>` normally treats an absent serde field as `None`. State-v2 needs
@@ -4799,6 +4864,55 @@ mod tests {
         )
         .unwrap();
         management.validate(3).unwrap();
+
+        let mut nested_forward = serde_json::Map::new();
+        nested_forward.insert("zeta".to_string(), serde_json::json!(2));
+        nested_forward.insert("alpha".to_string(), serde_json::json!(1));
+        let mut request_forward = serde_json::Map::new();
+        request_forward.insert(
+            "outer_z".to_string(),
+            serde_json::Value::Object(nested_forward),
+        );
+        request_forward.insert(
+            "outer_a".to_string(),
+            serde_json::json!([{"zeta": false, "alpha": true}]),
+        );
+
+        let mut nested_reverse = serde_json::Map::new();
+        nested_reverse.insert("alpha".to_string(), serde_json::json!(1));
+        nested_reverse.insert("zeta".to_string(), serde_json::json!(2));
+        let mut array_object_reverse = serde_json::Map::new();
+        array_object_reverse.insert("alpha".to_string(), serde_json::json!(true));
+        array_object_reverse.insert("zeta".to_string(), serde_json::json!(false));
+        let mut request_reverse = serde_json::Map::new();
+        request_reverse.insert(
+            "outer_a".to_string(),
+            serde_json::json!([serde_json::Value::Object(array_object_reverse)]),
+        );
+        request_reverse.insert(
+            "outer_z".to_string(),
+            serde_json::Value::Object(nested_reverse),
+        );
+
+        let forward_digest =
+            ManagementReceipt::request_digest_for(&serde_json::Value::Object(request_forward))
+                .unwrap();
+        let reverse_digest =
+            ManagementReceipt::request_digest_for(&serde_json::Value::Object(request_reverse))
+                .unwrap();
+        assert_eq!(
+            forward_digest, reverse_digest,
+            "receipt digests must not depend on serde_json map insertion order"
+        );
+        assert_eq!(
+            forward_digest,
+            hash_fields(
+                MANAGEMENT_REQUEST_DOMAIN,
+                &[br#"{"outer_a":[{"alpha":true,"zeta":false}],"outer_z":{"alpha":1,"zeta":2}}"#],
+            ),
+            "receipt digests must commit to the explicitly key-sorted encoding"
+        );
+
         let mut tampered = management.clone();
         tampered.result_payload["revision"] = serde_json::json!(4);
         assert!(tampered.validate(4).is_err());

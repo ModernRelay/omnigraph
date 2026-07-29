@@ -2456,7 +2456,7 @@ async fn test_init_stamps_internal_schema_version() {
     ManifestCoordinator::init(uri, &catalog).await.unwrap();
 
     let ds = open_manifest_dataset(uri, None).await.unwrap();
-    assert_eq!(super::migrations::INTERNAL_MANIFEST_SCHEMA_VERSION, 11);
+    assert_eq!(super::migrations::INTERNAL_MANIFEST_SCHEMA_VERSION, 12);
     assert_eq!(
         super::migrations::read_stamp(&ds),
         super::migrations::INTERNAL_MANIFEST_SCHEMA_VERSION,

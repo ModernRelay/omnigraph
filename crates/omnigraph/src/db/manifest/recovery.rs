@@ -310,12 +310,16 @@ async fn publish_recovery_commit(
 pub(crate) const RECOVERY_DIR_NAME: &str = "__recovery";
 
 /// Max sidecar JSON shape/semantics version this binary writes and understands.
-/// The reader accepts every version `<= ` this and refuses only versions ABOVE
+/// The parser accepts every version `<= ` this and refuses only versions ABOVE
 /// it (an older binary cannot guess semantics a newer writer baked in — see
-/// [`SidecarSchemaError`] and [`parse_sidecar`]). Bump this whenever a change
-/// alters how an existing field is *interpreted* (not merely adds an optional
-/// one), and add a fixed `*_SCHEMA_VERSION` floor like the one below so older
-/// generations keep their original semantics.
+/// [`SidecarSchemaError`] and [`parse_sidecar`]). Parsing preserves each
+/// generation's wire meaning; it does not promise that every historical
+/// generation remains executable under a later graph format. The recovery
+/// dispatcher explicitly refuses a historical protocol when the current
+/// manifest authority cannot safely represent its outcome. Bump this whenever
+/// a change alters how an existing field is *interpreted* (not merely adds an
+/// optional one), and add a fixed `*_SCHEMA_VERSION` floor like the one below
+/// so older generations keep their original wire semantics.
 ///
 /// v1 → v2: Phase-B confirmation. A `BranchMerge` sidecar at v2 carries
 /// `confirmed_version` and is classified strictly (unconfirmed ⇒ partial ⇒ roll
@@ -370,10 +374,10 @@ pub(crate) const RECOVERY_DIR_NAME: &str = "__recovery";
 ///
 /// v9 → v10: RFC-026 bounded MemWAL enrollment. Schema v10 is reserved for
 /// one main-branch table, an exact pre-enrollment HEAD witness, a pre-minted
-/// enrollment/shard namespace, and one fixed lifecycle binding. Recovery is
-/// roll-forward-only: it may complete the exact index-only gap and publish the
-/// exact empty enrollment, but it never restores the base table or deletes
-/// MemWAL objects.
+/// enrollment/shard namespace, and one fixed lifecycle binding. In the
+/// lifecycle-v1 graph format that emitted it, recovery was roll-forward-only:
+/// it could complete the exact index-only gap and publish the exact empty
+/// enrollment, but never restored the base table or deleted MemWAL objects.
 ///
 /// v10 → v11: RFC-026 bounded MemWAL fold. Schema v11 was reserved for one
 /// exact, roll-forward-only base-table transaction that atomically applies one
@@ -391,9 +395,9 @@ pub(crate) const RECOVERY_DIR_NAME: &str = "__recovery";
 /// complete prior lifecycle, and a digest/count summary of the winning trusted
 /// attribution. EffectsConfirmed binds both achieved HEAD witnesses, the
 /// exact base-table manifest update, the next token-table authority pointer,
-/// and the complete next lifecycle. Recovery may publish only exact/exact or
-/// discard exact-no-effect/no-effect; either partial or any foreign movement
-/// remains `RecoveryRequired`.
+/// and the complete next lifecycle. In lifecycle-v2, recovery could publish
+/// only exact/exact or discard exact-no-effect/no-effect; either partial or any
+/// foreign movement remained `RecoveryRequired`.
 ///
 /// v12 → v13: RFC-026 F2 profile management. The minimal first v11 slice
 /// reserves only `StreamProfileChange`: one immutable receipt transaction plus
@@ -404,7 +408,10 @@ pub(crate) const RECOVERY_DIR_NAME: &str = "__recovery";
 /// discriminator reserves every family in the lifecycle strand, while this
 /// slice activates only `StreamLifecycleReceipt`: one immutable management
 /// receipt plus the exact prior→next lifecycle publication. Historical v10,
-/// v12, and v13 payload fields and meanings remain unchanged.
+/// v11, v12, and v13 payload fields and wire meanings remain unchanged.
+/// Lifecycle-v3 cannot synthesize v10's binding-ledger authority, v11's
+/// token/state-v2 authority, or v12's lifecycle-v2 outcome, so those three
+/// generations decode and then fail closed; v13 remains executable.
 pub(crate) const SIDECAR_SCHEMA_VERSION: u32 = 14;
 
 /// The only recovery generation emitted by the manifest-v5 write paths.
@@ -2179,10 +2186,10 @@ pub(crate) fn parse_sidecar(sidecar_uri: &str, body: &str) -> Result<RecoverySid
             sidecar_uri, err
         ))
     })?;
-    // Accept every version we were built to understand (`<= max`); refuse only
-    // versions NEWER than us. Interpreting older generations with their original
-    // semantics (rather than refusing them) is what avoids billing operators to
-    // drain pre-upgrade sidecars; classification then dispatches by version.
+    // Accept every wire version we were built to understand (`<= max`); refuse
+    // only versions NEWER than us. Shape admission is not a recoverability
+    // promise: version-specific dispatch may still refuse a historical protocol
+    // when the current graph format cannot represent its authority or outcome.
     if peek.schema_version > SIDECAR_SCHEMA_VERSION {
         return Err(SidecarSchemaError {
             sidecar_uri: sidecar_uri.to_string(),
@@ -2449,6 +2456,7 @@ fn validate_mutation_load_shape(sidecar_uri: &str, sidecar: &RecoverySidecar) ->
         || sidecar.protocol_v8.is_some()
         || sidecar.protocol_v10.is_some()
         || sidecar.protocol_v11.is_some()
+        || sidecar.protocol_v12.is_some()
         || sidecar.ensure_indices_rollback_v6.is_some()
         || sidecar.merge_source_commit_id.is_some()
         || sidecar.schema_apply_manifest_published
@@ -7355,231 +7363,6 @@ enum StreamEnrollmentCleanup {
     BestEffortAfterVisible,
 }
 
-/// Recover one bounded RFC-026 enrollment intent.
-///
-/// This adapter deliberately has no rollback branch. The only destructive
-/// action available here is deleting a sidecar after exact classification has
-/// proved that neither enrollment effect exists. Once the singleton index is
-/// present, recovery either completes the pre-minted empty shard and publishes
-/// the fixed lifecycle outcome, or retains the sidecar and fails closed.
-async fn process_stream_enrollment_sidecar_v10(
-    root_uri: &str,
-    storage: &std::sync::Arc<dyn StorageAdapter>,
-    snapshot: &Snapshot,
-    sidecar: &RecoverySidecar,
-    cleanup_policy: StreamEnrollmentCleanup,
-) -> Result<bool> {
-    let protocol = sidecar.protocol_v10.as_ref().ok_or_else(|| {
-        OmniError::manifest_internal("schema-v10 StreamEnrollment is missing protocol_v10")
-    })?;
-    let pin = sidecar.tables.first().ok_or_else(|| {
-        OmniError::manifest_internal("schema-v10 StreamEnrollment has no table pin")
-    })?;
-    let manifest_entry = snapshot_entry_for_pin(snapshot, pin)
-        .map_err(|error| stream_enrollment_effect_error(sidecar, error))?
-        .ok_or_else(|| {
-            OmniError::recovery_required(
-                sidecar.operation_id.clone(),
-                format!(
-                    "stream enrollment table identity {} is no longer live in the manifest",
-                    pin.identity
-                ),
-            )
-        })?;
-    if manifest_entry.table_path != protocol.intended_binding.table_location
-        || manifest_entry.table_branch.is_some()
-    {
-        return Err(OmniError::recovery_required(
-            sidecar.operation_id.clone(),
-            format!(
-                "stream enrollment manifest authority changed for identity {}: expected path '{}' on main, found path '{}' ref {:?} version {}",
-                pin.identity,
-                protocol.intended_binding.table_location,
-                manifest_entry.table_path,
-                manifest_entry.table_branch,
-                manifest_entry.table_version,
-            ),
-        ));
-    }
-
-    let anchor = crate::instrumentation::open_dataset(
-        &pin.table_path,
-        crate::instrumentation::VersionResolution::At(pin.expected_version),
-        None,
-        crate::instrumentation::table_wrapper(),
-    )
-    .await
-    .map_err(|error| stream_enrollment_effect_error(sidecar, error))?;
-    let mut state =
-        classify_enrollment(&anchor, &protocol.baseline_head, &protocol.enrollment_plan)
-            .await
-            .map_err(|error| {
-                OmniError::recovery_required(sidecar.operation_id.clone(), error.to_string())
-            })?;
-
-    if matches!(state, MemWalEnrollmentState::ExactNoEffect) {
-        if snapshot.stream_lifecycle(pin.identity).is_some()
-            || manifest_entry.table_version != pin.expected_version
-        {
-            return Err(OmniError::recovery_required(
-                sidecar.operation_id.clone(),
-                "manifest contains stream lifecycle authority but the exact enrollment effects are absent",
-            ));
-        }
-        delete_sidecar_by_operation_id(root_uri, storage.as_ref(), &sidecar.operation_id).await?;
-        return Ok(true);
-    }
-
-    // Publication may have succeeded before audit/sidecar cleanup. In that
-    // state the live graph head is intentionally the fixed lineage id rather
-    // than the pre-effect authority, so recognize the exact visible outcome
-    // before comparing against arm-time authority.
-    if let MemWalEnrollmentState::ExactIndexAndExpectedEmptyShard {
-        receipt,
-        shard_manifest,
-    } = &state
-    {
-        let lifecycle = stream_enrollment_lifecycle(sidecar, receipt, shard_manifest)
-            .map_err(|error| stream_enrollment_effect_error(sidecar, error))?;
-        if stream_enrollment_original_visible(root_uri, sidecar, &lifecycle)
-            .await
-            .map_err(|error| stream_enrollment_effect_error(sidecar, error))?
-        {
-            return finalize_visible_stream_enrollment(
-                root_uri,
-                storage.as_ref(),
-                sidecar,
-                cleanup_policy,
-            )
-            .await
-            .map_err(|error| stream_enrollment_effect_error(sidecar, error));
-        }
-    }
-
-    let live_authority = read_live_recovery_authority(root_uri, storage, None)
-        .await
-        .map_err(|error| stream_enrollment_effect_error(sidecar, error))?;
-    if live_authority != protocol.authority {
-        return Err(OmniError::recovery_required(
-            sidecar.operation_id.clone(),
-            "stream enrollment graph/schema authority changed after recovery was armed",
-        ));
-    }
-
-    if matches!(state, MemWalEnrollmentState::ExactIndexOnly(_)) {
-        provision_shard_from_exact_index_only(
-            &anchor,
-            &protocol.baseline_head,
-            &protocol.enrollment_plan,
-        )
-        .await
-        .map_err(|error| {
-            OmniError::recovery_required(sidecar.operation_id.clone(), error.to_string())
-        })?;
-        state = classify_enrollment(&anchor, &protocol.baseline_head, &protocol.enrollment_plan)
-            .await
-            .map_err(|error| {
-                OmniError::recovery_required(sidecar.operation_id.clone(), error.to_string())
-            })?;
-    }
-
-    let MemWalEnrollmentState::ExactIndexAndExpectedEmptyShard {
-        receipt,
-        shard_manifest,
-    } = state
-    else {
-        return Err(OmniError::recovery_required(
-            sidecar.operation_id.clone(),
-            "stream enrollment did not converge to the exact index-plus-empty-shard state",
-        ));
-    };
-    let lifecycle = stream_enrollment_lifecycle(sidecar, &receipt, &shard_manifest)
-        .map_err(|error| stream_enrollment_effect_error(sidecar, error))?;
-
-    if stream_enrollment_original_visible(root_uri, sidecar, &lifecycle)
-        .await
-        .map_err(|error| stream_enrollment_effect_error(sidecar, error))?
-    {
-        return finalize_visible_stream_enrollment(
-            root_uri,
-            storage.as_ref(),
-            sidecar,
-            cleanup_policy,
-        )
-        .await
-        .map_err(|error| stream_enrollment_effect_error(sidecar, error));
-    }
-    if snapshot.stream_lifecycle(pin.identity).is_some()
-        || manifest_entry.table_version != pin.expected_version
-    {
-        return Err(OmniError::recovery_required(
-            sidecar.operation_id.clone(),
-            "a different stream lifecycle row is already visible for the enrollment identity",
-        ));
-    }
-    crate::failpoints::maybe_fail(
-        crate::failpoints::names::STREAM_ENROLLMENT_POST_SHARD_PRE_MANIFEST,
-    )
-    .map_err(|error| stream_enrollment_effect_error(sidecar, error))?;
-
-    let successor = anchor
-        .checkout_version(receipt.head.table_version)
-        .await
-        .map_err(|error| {
-            stream_enrollment_effect_error(sidecar, OmniError::Lance(error.to_string()))
-        })?;
-    let version_metadata =
-        super::TableVersionMetadata::from_dataset(root_uri, &manifest_entry.table_path, &successor)
-            .map_err(|error| stream_enrollment_effect_error(sidecar, error))?;
-    let updates = vec![
-        ManifestChange::Update(SubTableUpdate {
-            identity: pin.identity,
-            table_key: pin.table_key.clone(),
-            table_version: receipt.head.table_version,
-            table_branch: None,
-            row_count: manifest_entry.row_count,
-            version_metadata,
-        }),
-        ManifestChange::SetStreamLifecycle {
-            expected: None,
-            next: lifecycle,
-        },
-    ];
-    let expected = HashMap::from([(
-        pin.identity,
-        TableVersionExpectation {
-            table_key: pin.table_key.clone(),
-            table_version: pin.expected_version,
-        },
-    )]);
-    let (_, graph_commit_id) = publish_recovery_commit(
-        root_uri,
-        sidecar,
-        RecoveryKind::RolledForward,
-        &updates,
-        &expected,
-    )
-    .await
-    .map_err(|error| stream_enrollment_effect_error(sidecar, error))?;
-    record_audit(
-        root_uri,
-        sidecar,
-        graph_commit_id,
-        RecoveryKind::RolledForward,
-        vec![TableOutcome {
-            table_key: pin.table_key.clone(),
-            from_version: pin.expected_version,
-            to_version: receipt.head.table_version,
-        }],
-    )
-    .await
-    .map_err(|error| stream_enrollment_effect_error(sidecar, error))?;
-    cleanup_visible_stream_enrollment_sidecar(root_uri, storage.as_ref(), sidecar, cleanup_policy)
-        .await
-        .map_err(|error| stream_enrollment_effect_error(sidecar, error))?;
-    Ok(true)
-}
-
 async fn cleanup_visible_stream_enrollment_sidecar(
     root_uri: &str,
     storage: &dyn StorageAdapter,
@@ -7604,133 +7387,6 @@ async fn cleanup_visible_stream_enrollment_sidecar(
             }
         },
     }
-}
-
-/// Once exact classification observes either enrollment effect, every failure
-/// is an unresolved durable operation. Preserve an already-typed recovery
-/// error and convert lower-level I/O, failpoint, audit, or publication errors
-/// so callers never mistake partial format state for an ordinary retry.
-fn stream_enrollment_effect_error(sidecar: &RecoverySidecar, error: OmniError) -> OmniError {
-    match error {
-        OmniError::RecoveryRequired { .. } => error,
-        other => OmniError::recovery_required(
-            sidecar.operation_id.clone(),
-            format!(
-                "stream enrollment completion failed while a durable effect may exist: {other}"
-            ),
-        ),
-    }
-}
-
-/// Writer-side entry into the same exact recovery adapter used on reopen.
-/// Callers retain exclusive stream admission and the normal write gates while
-/// this completes; exposing one implementation prevents the success path and
-/// crash path from learning different enrollment semantics.
-#[allow(dead_code)] // Reached by the intentionally dormant Phase-A orchestrator.
-pub(crate) async fn complete_stream_enrollment_sidecar_v10(
-    _root_uri: &str,
-    _storage: std::sync::Arc<dyn StorageAdapter>,
-    _snapshot: &Snapshot,
-    sidecar: &RecoverySidecar,
-) -> Result<()> {
-    Err(OmniError::recovery_required(
-        sidecar.operation_id.clone(),
-        "historical schema-v10 StreamEnrollment cannot be completed under lifecycle-v3",
-    ))
-}
-
-fn stream_enrollment_lifecycle(
-    sidecar: &RecoverySidecar,
-    _receipt: &crate::table_store::mem_wal::MemWalEnrollmentReceipt,
-    _shard_manifest: &lance_index::mem_wal::ShardManifest,
-) -> Result<super::StreamLifecycleEntry> {
-    Err(OmniError::recovery_required(
-        sidecar.operation_id.clone(),
-        "historical schema-v10 StreamEnrollment cannot synthesize lifecycle-v3 binding/ledger authority; rebuild or recover it with the matching historical binary",
-    ))
-}
-
-async fn stream_enrollment_original_visible(
-    root_uri: &str,
-    sidecar: &RecoverySidecar,
-    expected_lifecycle: &super::StreamLifecycleEntry,
-) -> Result<bool> {
-    let protocol = sidecar
-        .protocol_v10
-        .as_ref()
-        .expect("validated StreamEnrollment protocol");
-    let pin = &sidecar.tables[0];
-    let (commits, _) = ManifestCoordinator::read_graph_lineage_at(root_uri, None).await?;
-    let Some(commit) = commits
-        .iter()
-        .find(|commit| commit.graph_commit_id == protocol.lineage.graph_commit_id)
-    else {
-        return Ok(false);
-    };
-    if commit.manifest_branch.is_some()
-        || commit.parent_commit_id.as_ref() != protocol.authority.graph_head.as_ref()
-        || commit.merged_parent_commit_id.is_some()
-        || commit.actor_id != protocol.lineage.actor_id
-        || commit.created_at != protocol.lineage.created_at
-    {
-        return Err(OmniError::manifest_internal(format!(
-            "StreamEnrollment sidecar '{}' found fixed commit '{}' with mismatched lineage",
-            sidecar.operation_id, protocol.lineage.graph_commit_id
-        )));
-    }
-    let committed =
-        ManifestCoordinator::snapshot_at(root_uri, None, commit.manifest_version).await?;
-    let entry_matches = snapshot_entry_by_identity(&committed, pin.identity).is_some_and(|entry| {
-        entry.table_key == pin.table_key
-            && entry.table_path == protocol.intended_binding.table_location
-            && entry.table_version == expected_lifecycle.current_head_witness.table_version
-            && entry.table_branch.is_none()
-    });
-    if !entry_matches || committed.stream_lifecycle(pin.identity) != Some(expected_lifecycle) {
-        return Err(OmniError::manifest_internal(format!(
-            "StreamEnrollment sidecar '{}' found fixed commit '{}' but its table/lifecycle outcome differs",
-            sidecar.operation_id, protocol.lineage.graph_commit_id
-        )));
-    }
-    Ok(true)
-}
-
-async fn finalize_visible_stream_enrollment(
-    root_uri: &str,
-    storage: &dyn StorageAdapter,
-    sidecar: &RecoverySidecar,
-    cleanup_policy: StreamEnrollmentCleanup,
-) -> Result<bool> {
-    let protocol = sidecar
-        .protocol_v10
-        .as_ref()
-        .expect("validated StreamEnrollment protocol");
-    let pin = &sidecar.tables[0];
-    let mut audit = RecoveryAudit::open(root_uri).await?;
-    let already_recorded = audit.list().await?.iter().any(|record| {
-        record.operation_id == sidecar.operation_id
-            && record.recovery_kind == RecoveryKind::RolledForward
-    });
-    if !already_recorded {
-        crate::failpoints::maybe_fail(crate::failpoints::names::RECOVERY_RECORD_AUDIT)?;
-        audit
-            .append(RecoveryAuditRecord {
-                graph_commit_id: protocol.lineage.graph_commit_id.clone(),
-                recovery_kind: RecoveryKind::RolledForward,
-                recovery_for_actor: sidecar.actor_id.clone(),
-                operation_id: sidecar.operation_id.clone(),
-                sidecar_writer_kind: format!("{:?}", sidecar.writer_kind),
-                per_table_outcomes: vec![TableOutcome {
-                    table_key: pin.table_key.clone(),
-                    from_version: pin.expected_version,
-                    to_version: pin.post_commit_pin,
-                }],
-                created_at: crate::db::now_micros()?,
-            })
-            .await?;
-    }
-    cleanup_visible_stream_enrollment_sidecar(root_uri, storage, sidecar, cleanup_policy).await?;
-    Ok(true)
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -16587,43 +16243,6 @@ fn new_unvalidated_sidecar(
     }
 }
 
-/// Arm one exact roll-forward-only RFC-026 bounded enrollment intent.
-///
-/// The caller has already captured the exact main-branch baseline and holds
-/// exclusive stream admission plus the ordinary schema/branch/table gates.
-/// This constructor fixes the only physical successor and lifecycle binding
-/// recovery may publish; no later confirmation rewrite is needed because the
-/// N+1 transaction witness is read back from Lance's exact public state.
-#[allow(dead_code)] // Reached by the intentionally dormant Phase-A orchestrator.
-pub(crate) fn new_stream_enrollment_sidecar_v10(
-    actor_id: Option<String>,
-    table: SidecarTablePin,
-    authority: RecoveryAuthorityToken,
-    lineage: RecoveryLineageIntent,
-    baseline_head: super::CurrentHeadWitness,
-    enrollment_plan: MemWalEnrollmentPlan,
-    intended_binding: super::StreamPhysicalBinding,
-    enrollment_receipt: super::EnrollmentReceipt,
-) -> Result<RecoverySidecar> {
-    let mut sidecar = new_unvalidated_sidecar(
-        STREAM_ENROLLMENT_SIDECAR_SCHEMA_VERSION,
-        SidecarKind::StreamEnrollment,
-        None,
-        actor_id,
-        vec![table],
-    );
-    sidecar.protocol_v10 = Some(RecoveryProtocolV10 {
-        authority,
-        lineage,
-        baseline_head,
-        enrollment_plan,
-        intended_binding,
-        enrollment_receipt,
-    });
-    validate_sidecar_shape("<new-stream-enrollment-sidecar-v10>", &sidecar)?;
-    Ok(sidecar)
-}
-
 /// Arm one exact roll-forward-only RFC-026 one-generation fold.
 ///
 /// The caller holds exclusive stream admission plus the ordinary
@@ -19887,6 +19506,83 @@ mod tests {
         .unwrap()
     }
 
+    fn stream_enrollment_sidecar_v10() -> RecoverySidecar {
+        let identity = test_identity("node:Person");
+        let table_key = "node:Person";
+        let table_location =
+            crate::db::manifest::table_path_for_identity(table_key, identity).unwrap();
+        let enrollment_plan = MemWalEnrollmentPlan::new(
+            ShardId::parse_str("11111111-1111-4111-8111-111111111111").unwrap(),
+            ShardId::parse_str("22222222-2222-4222-8222-222222222222").unwrap(),
+        )
+        .unwrap();
+        let baseline_head = crate::db::manifest::CurrentHeadWitness {
+            branch_identifier: lance::dataset::refs::BranchIdentifier::main(),
+            table_version: 5,
+            transaction_uuid: "33333333-3333-4333-8333-333333333333".to_string(),
+            manifest_e_tag: Some("prior-etag".to_string()),
+        };
+        let authority = RecoveryAuthorityToken {
+            branch_identifier: lance::dataset::refs::BranchIdentifier::main(),
+            graph_head: Some("01H000000000000000000000E0".to_string()),
+            schema_identity_domain: "domain-a".to_string(),
+            schema_ir_hash: "schema-hash".to_string(),
+            schema_identity_version: 1,
+        };
+        let intended_binding = crate::db::manifest::StreamPhysicalBinding {
+            stable_table_id: identity.stable_table_id,
+            table_incarnation_id: identity.table_incarnation_id,
+            table_location: table_location.clone(),
+            table_branch: None,
+            enrollment_id: enrollment_plan.enrollment_id.to_string(),
+            shard_ids: vec![enrollment_plan.shard_id.to_string()],
+            stream_config_version: crate::db::manifest::STREAM_CONFIG_VERSION,
+            stream_config_hash: enrollment_plan.stream_config_hash(),
+        };
+        let enrollment_intent_digest =
+            crate::db::manifest::stream_enrollment_intent_digest_v1(
+                identity,
+                &table_location,
+                &authority.schema_identity_domain,
+                &authority.schema_ir_hash,
+                authority.schema_identity_version,
+                &baseline_head,
+                &intended_binding.stream_config_hash,
+            )
+            .unwrap();
+        let enrollment_receipt = crate::db::manifest::EnrollmentReceipt::new(
+            "44444444-4444-4444-8444-444444444444".to_string(),
+            enrollment_intent_digest,
+            "55555555-5555-4555-8555-555555555555".to_string(),
+            intended_binding.clone(),
+        )
+        .unwrap();
+        let actor_id = Some("act-operator".to_string());
+        let mut sidecar = new_unvalidated_sidecar(
+            STREAM_ENROLLMENT_SIDECAR_SCHEMA_VERSION,
+            SidecarKind::StreamEnrollment,
+            None,
+            actor_id.clone(),
+            vec![make_pin(table_key, &table_location, 5, 6)],
+        );
+        sidecar.protocol_v10 = Some(RecoveryProtocolV10 {
+            authority,
+            lineage: RecoveryLineageIntent {
+                graph_commit_id: "01H000000000000000000000E1".to_string(),
+                branch: None,
+                actor_id,
+                merged_parent_commit_id: None,
+                created_at: 456,
+            },
+            baseline_head,
+            enrollment_plan,
+            intended_binding,
+            enrollment_receipt,
+        });
+        validate_sidecar_shape("<stream-enrollment-v10-fixture>", &sidecar).unwrap();
+        sidecar
+    }
+
     fn stream_fold_sidecar() -> RecoverySidecar {
         let identity = test_identity("node:Person");
         let table_location =
@@ -20853,29 +20549,21 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn recovery_v14_decodes_reserved_discriminators_but_processes_them_fail_closed() {
-        let active = stream_lifecycle_receipt_sidecar_v14();
-        let protocol = stream_lifecycle_receipt_protocol(&active);
-        let mut reserved = new_unvalidated_sidecar(
-            STREAM_LIFECYCLE_SIDECAR_SCHEMA_VERSION,
-            SidecarKind::StreamResume,
-            None,
-            Some("act-operator".to_string()),
-            Vec::new(),
-        );
-        reserved.protocol_v14 = Some(Box::new(RecoveryProtocolV14::StreamResume(
-            RecoveryStreamProtocolV14Scaffold {
-                authority: protocol.authority.clone(),
-                admission_scope: protocol.admission_scope.clone(),
-                operation_id: reserved.operation_id.clone(),
-            },
-        )));
-        let body = serde_json::to_string(&reserved).unwrap();
-        let parsed = parse_sidecar("<reserved-v14>", &body).unwrap();
-        assert_eq!(parsed.writer_kind, SidecarKind::StreamResume);
-
-        let unknown = body.replace("\"StreamResume\"", "\"StreamUnknown\"");
-        assert!(parse_sidecar("<unknown-v14>", &unknown).is_err());
+    async fn historical_stream_sidecar_process_refusals_are_exact() {
+        let cases = [
+            (
+                stream_enrollment_sidecar_v10(),
+                "historical schema-v10 StreamEnrollment cannot be recovered under lifecycle-v3 because it lacks immutable binding-ledger authority; rebuild or use the matching historical binary",
+            ),
+            (
+                stream_fold_sidecar(),
+                "historical schema-v11 StreamFold cannot be recovered under internal schema v9 because it lacks the token participant and complete state-v2 lifecycle authority",
+            ),
+            (
+                stream_fold_sidecar_v12(),
+                "historical schema-v12 StreamFold cannot be recovered under lifecycle-v3 because its lifecycle-v2 authority cannot be synthesized; rebuild or use the matching historical binary",
+            ),
+        ];
 
         let dir = tempfile::tempdir().unwrap();
         let root = dir.path().to_str().unwrap();
@@ -20885,18 +20573,121 @@ mod tests {
         let snapshot = db.snapshot().await;
         drop(db);
         let storage: Arc<dyn StorageAdapter> = Arc::new(ObjectStorageAdapter::local());
-        let error = process_sidecar(
-            root,
-            &storage,
-            &snapshot,
-            &parsed,
-            RecoveryMode::Full,
-            SchemaStateRecovery::Noop,
-        )
-        .await
-        .unwrap_err();
-        assert!(error.to_string().contains("reserved"));
-        assert!(error.to_string().contains("inactive"));
+
+        for (sidecar, expected_reason) in cases {
+            let body = serde_json::to_string(&sidecar).unwrap();
+            let parsed = parse_sidecar("<historical-stream-refusal>", &body)
+                .expect("historical refusal fixture must remain shape-valid");
+            let expected_operation_id = parsed.operation_id.clone();
+            let error = process_sidecar(
+                root,
+                &storage,
+                &snapshot,
+                &parsed,
+                RecoveryMode::Full,
+                SchemaStateRecovery::Noop,
+            )
+            .await
+            .expect_err("historical stream protocols must remain explicitly unrecoverable");
+            match error {
+                OmniError::RecoveryRequired {
+                    operation_id,
+                    reason,
+                } => {
+                    assert_eq!(operation_id, expected_operation_id);
+                    assert_eq!(reason, expected_reason);
+                }
+                other => panic!("unexpected historical-stream refusal: {other}"),
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn recovery_v14_decodes_reserved_discriminators_but_processes_them_fail_closed() {
+        let active = stream_lifecycle_receipt_sidecar_v14();
+        let protocol = stream_lifecycle_receipt_protocol(&active);
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().to_str().unwrap();
+        let db = crate::db::Omnigraph::init(root, "node Person { name: String @key }\n")
+            .await
+            .unwrap();
+        let snapshot = db.snapshot().await;
+        drop(db);
+        let storage: Arc<dyn StorageAdapter> = Arc::new(ObjectStorageAdapter::local());
+
+        let reserved_kinds = [
+            SidecarKind::StreamResume,
+            SidecarKind::StreamCorrection,
+            SidecarKind::StreamAuthorityRetirement,
+            SidecarKind::StreamTokenLedgerIndexMaintenance,
+            SidecarKind::StreamSealedMaintenance,
+            SidecarKind::StreamRebind,
+        ];
+        for writer_kind in reserved_kinds {
+            let mut reserved = new_unvalidated_sidecar(
+                STREAM_LIFECYCLE_SIDECAR_SCHEMA_VERSION,
+                writer_kind,
+                None,
+                Some("act-operator".to_string()),
+                Vec::new(),
+            );
+            let scaffold = RecoveryStreamProtocolV14Scaffold {
+                authority: protocol.authority.clone(),
+                admission_scope: protocol.admission_scope.clone(),
+                operation_id: reserved.operation_id.clone(),
+            };
+            let reserved_protocol = match writer_kind {
+                SidecarKind::StreamResume => RecoveryProtocolV14::StreamResume(scaffold),
+                SidecarKind::StreamCorrection => RecoveryProtocolV14::StreamCorrection(scaffold),
+                SidecarKind::StreamAuthorityRetirement => {
+                    RecoveryProtocolV14::StreamAuthorityRetirement(scaffold)
+                }
+                SidecarKind::StreamTokenLedgerIndexMaintenance => {
+                    RecoveryProtocolV14::StreamTokenLedgerIndexMaintenance(scaffold)
+                }
+                SidecarKind::StreamSealedMaintenance => {
+                    RecoveryProtocolV14::StreamSealedMaintenance(scaffold)
+                }
+                SidecarKind::StreamRebind => RecoveryProtocolV14::StreamRebind(scaffold),
+                _ => unreachable!("reserved-kind list must contain only inactive v14 protocols"),
+            };
+            reserved.protocol_v14 = Some(Box::new(reserved_protocol));
+            let body = serde_json::to_string(&reserved).unwrap();
+            let parsed = parse_sidecar("<reserved-v14>", &body).unwrap();
+            assert_eq!(parsed.writer_kind, writer_kind);
+
+            if writer_kind == SidecarKind::StreamResume {
+                let unknown = body.replace("\"StreamResume\"", "\"StreamUnknown\"");
+                assert!(parse_sidecar("<unknown-v14>", &unknown).is_err());
+            }
+
+            let expected_operation_id = parsed.operation_id.clone();
+            let error = process_sidecar(
+                root,
+                &storage,
+                &snapshot,
+                &parsed,
+                RecoveryMode::Full,
+                SchemaStateRecovery::Noop,
+            )
+            .await
+            .expect_err("reserved v14 protocols must process fail-closed");
+            match error {
+                OmniError::RecoveryRequired {
+                    operation_id,
+                    reason,
+                } => {
+                    assert_eq!(operation_id, expected_operation_id);
+                    assert_eq!(
+                        reason,
+                        format!(
+                            "recovery-v14 discriminator {writer_kind:?} is reserved but its exact processor is inactive"
+                        )
+                    );
+                }
+                other => panic!("unexpected reserved-v14 refusal: {other}"),
+            }
+        }
     }
 
     #[tokio::test]
@@ -22203,9 +21994,9 @@ mod tests {
 
     #[test]
     fn parse_sidecar_refuses_mutation_with_multiple_writer_protocols() {
-        let mut sidecar = occ_sidecar();
-        let protocol_v3 = sidecar.protocol_v3.as_ref().unwrap();
-        sidecar.protocol_v7 = Some(RecoveryProtocolV7 {
+        let mut schema_apply_payload = occ_sidecar();
+        let protocol_v3 = schema_apply_payload.protocol_v3.as_ref().unwrap();
+        schema_apply_payload.protocol_v7 = Some(RecoveryProtocolV7 {
             authority: protocol_v3.authority.clone(),
             lineage: protocol_v3.lineage.clone(),
             rollback_graph_commit_id: "01H000000000000000000000BC".to_string(),
@@ -22222,10 +22013,24 @@ mod tests {
         });
 
         let error = parse_sidecar(
-            "memory://graph/__recovery/multi-protocol.json",
-            &serde_json::to_string(&sidecar).unwrap(),
+            "memory://graph/__recovery/multi-protocol-v7.json",
+            &serde_json::to_string(&schema_apply_payload).unwrap(),
         )
         .expect_err("a v9 Mutation must not dispatch through a foreign payload");
+        assert!(
+            error
+                .to_string()
+                .contains("must carry only the protocol_v3 writer payload"),
+            "unexpected malformed-sidecar error: {error}"
+        );
+
+        let mut stream_fold_payload = occ_sidecar();
+        stream_fold_payload.protocol_v12 = stream_fold_sidecar_v12().protocol_v12;
+        let error = parse_sidecar(
+            "memory://graph/__recovery/multi-protocol-v12.json",
+            &serde_json::to_string(&stream_fold_payload).unwrap(),
+        )
+        .expect_err("a v9 Mutation must not smuggle recovery-v12 attribution");
         assert!(
             error
                 .to_string()

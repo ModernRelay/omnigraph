@@ -2222,7 +2222,7 @@ impl Omnigraph {
             .acquire_many(&[(table_key.to_string(), None)])
             .await;
 
-        // The entry healer ran before preparation, but another main-branch
+        // The pre-preparation recovery barrier ran, but another main-branch
         // writer may have armed recovery while this fold was scanning and
         // staging.  Re-list under the complete graph-write gate envelope so an
         // unresolved effect on a different table cannot be bypassed by this
@@ -2856,28 +2856,41 @@ impl Omnigraph {
         };
 
         loop {
-            let raw_writer = if invoke_attempt {
+            let (claim_was_invoked, mut claimed_writer, mut writer_claim_error) = if invoke_attempt
+            {
                 let config = reconstruct_b1_writer_config(
                     &capture.details,
                     capture.enrollment_id,
                     capture.shard_id,
                 )
                 .map_err(WorkerOpenFailure::unclaimed)?;
-                Some(
-                    capture
-                        .head
-                        .dataset()
-                        .mem_wal_writer(capture.shard_id, config)
-                        .await,
-                )
+                match capture
+                    .head
+                    .dataset()
+                    .mem_wal_writer(capture.shard_id, config)
+                    .await
+                {
+                    Ok(writer) => (true, Some(ClaimedMemWalWorker::new(writer)), None),
+                    Err(error) => (true, None, Some(error)),
+                }
             } else {
-                None
+                (false, None, None)
             };
             let (evidence, achieved) = observe_claim_attempt(capture, &tailer, &attempt)
                 .await
-                .map_err(|error| WorkerOpenFailure::unclaimed(claim_open_worker_error(error)))?;
+                .map_err(|error| {
+                    worker_open_failure_preserving_claim(
+                        claim_open_worker_error(error),
+                        &mut claimed_writer,
+                    )
+                })?;
             let effect = build_claim_attempt_effect(&prior_attempt_chain, &attempt, evidence)
-                .map_err(|error| WorkerOpenFailure::unclaimed(claim_open_worker_error(error)))?;
+                .map_err(|error| {
+                    worker_open_failure_preserving_claim(
+                        claim_open_worker_error(error),
+                        &mut claimed_writer,
+                    )
+                })?;
 
             if matches!(
                 evidence,
@@ -2890,7 +2903,12 @@ impl Omnigraph {
                     effect,
                 )
                 .await
-                .map_err(|error| WorkerOpenFailure::unclaimed(claim_open_worker_error(error)))?;
+                .map_err(|error| {
+                    worker_open_failure_preserving_claim(
+                        claim_open_worker_error(error),
+                        &mut claimed_writer,
+                    )
+                })?;
                 complete_stream_claim_sidecar_v14(
                     self.root_uri(),
                     Arc::clone(&self.storage),
@@ -2898,20 +2916,27 @@ impl Omnigraph {
                     &sidecar,
                 )
                 .await
-                .map_err(|error| WorkerOpenFailure::unclaimed(claim_open_worker_error(error)))?;
-                if let Some(raw_writer) = raw_writer {
-                    let error = raw_writer
-                        .err()
-                        .map(|error| MemWalWorkerError::Lance {
-                            operation: "writer claim",
-                            message: error.to_string(),
-                        })
-                        .unwrap_or_else(|| MemWalWorkerError::InvalidState {
+                .map_err(|error| {
+                    worker_open_failure_preserving_claim(
+                        claim_open_worker_error(error),
+                        &mut claimed_writer,
+                    )
+                })?;
+                if let Some(claimed) = claimed_writer.take() {
+                    return Err(WorkerOpenFailure::claimed(
+                        MemWalWorkerError::InvalidState {
                             reason:
                                 "Lance reported writer-claim success without its exact manifest effect"
                                     .to_string(),
-                        });
-                    return Err(WorkerOpenFailure::unclaimed(error));
+                        },
+                        claimed,
+                    ));
+                }
+                if let Some(error) = writer_claim_error.take() {
+                    return Err(WorkerOpenFailure::unclaimed(MemWalWorkerError::Lance {
+                        operation: "writer claim",
+                        message: error.to_string(),
+                    }));
                 }
                 self.refresh_coordinator_only().await.map_err(|error| {
                     WorkerOpenFailure::unclaimed(claim_open_worker_error(error))
@@ -2938,21 +2963,35 @@ impl Omnigraph {
                     .commit_stream_claim_ledger(&snapshot, &mut sidecar, &records, effect, None)
                     .await
                     .map_err(|error| {
-                        WorkerOpenFailure::unclaimed(claim_open_worker_error(error))
+                        worker_open_failure_preserving_claim(
+                            claim_open_worker_error(error),
+                            &mut claimed_writer,
+                        )
                     })?;
                 let RecoveryStreamClaimOutcomeV14::CheckpointVisible {
                     prior_attempt_chain: next_chain,
                     ..
                 } = outcome
                 else {
-                    return Err(WorkerOpenFailure::unclaimed(
+                    return Err(worker_open_failure_preserving_claim(
                         MemWalWorkerError::InvalidState {
                             reason:
                                 "manifest-only claim did not publish its exact attempt checkpoint"
                                     .to_string(),
                         },
+                        &mut claimed_writer,
                     ));
                 };
+                if let Some(claimed) = claimed_writer.take() {
+                    return Err(WorkerOpenFailure::claimed(
+                        MemWalWorkerError::InvalidState {
+                            reason:
+                                "Lance reported writer-claim success but only its stock manifest effect was observable"
+                                    .to_string(),
+                        },
+                        claimed,
+                    ));
+                }
                 self.refresh_coordinator_only().await.map_err(|error| {
                     WorkerOpenFailure::unclaimed(claim_open_worker_error(error))
                 })?;
@@ -2998,7 +3037,7 @@ impl Omnigraph {
                 continue;
             }
 
-            let Some(raw_writer) = raw_writer else {
+            if !claim_was_invoked {
                 let projection = recovered_current_generation_projection_source(
                     capture, &tailer, &attempt, &achieved,
                 )
@@ -3033,17 +3072,24 @@ impl Omnigraph {
                     self.open_stream_writer_with_claim(&refreshed, claim_kind, actor_id),
                 )
                 .await;
-            };
-            let writer = raw_writer.map_err(|error| {
-                WorkerOpenFailure::unclaimed(MemWalWorkerError::Lance {
+            }
+            if let Some(error) = writer_claim_error.take() {
+                return Err(WorkerOpenFailure::unclaimed(MemWalWorkerError::Lance {
                     operation: "writer claim",
                     message: format!(
                         "{error}; exact terminal physical claim remains recovery-owned by {}",
                         sidecar.operation_id
                     ),
+                }));
+            }
+            let claimed = claimed_writer.take().ok_or_else(|| {
+                WorkerOpenFailure::unclaimed(MemWalWorkerError::InvalidState {
+                    reason:
+                        "writer claim invocation returned neither a claimed writer nor an error"
+                            .to_string(),
                 })
             })?;
-            let mut opened = ClaimedMemWalWorker::new(writer)
+            let mut opened = claimed
                 .classify(
                     capture.head.dataset(),
                     &capture.full_path,
@@ -4371,14 +4417,24 @@ fn claim_open_worker_error(error: OmniError) -> MemWalWorkerError {
     }
 }
 
+fn worker_open_failure_preserving_claim(
+    error: MemWalWorkerError,
+    claimed: &mut Option<ClaimedMemWalWorker>,
+) -> WorkerOpenFailure {
+    match claimed.take() {
+        Some(claimed) => WorkerOpenFailure::claimed(error, claimed),
+        None => WorkerOpenFailure::unclaimed(error),
+    }
+}
+
 fn worker_error(error: MemWalWorkerError) -> OmniError {
     OmniError::Lance(error.to_string())
 }
 
 fn stream_data_block_error(block_token: &str) -> OmniError {
-    OmniError::manifest(format!(
-        "stream fold is strict-blocked; correction requires block token {block_token}"
-    ))
+    OmniError::StreamDataBlocked {
+        block_token: block_token.to_string(),
+    }
 }
 
 fn validate_stream_input_bounds(table_key: &str, batch: &RecordBatch) -> Result<()> {
@@ -4631,35 +4687,6 @@ fn ensure_live_stream_prestate(
             live_entry.identity, live_entry.table_path, live_entry.table_version
         )),
     ))
-}
-
-async fn validate_claimed_writer(
-    writer: &ShardWriter,
-    key: StreamWorkerKey,
-    epoch_floor: u64,
-) -> Result<()> {
-    let manifest = writer
-        .manifest()
-        .await
-        .map_err(|error| OmniError::Lance(error.to_string()))?
-        .ok_or_else(|| OmniError::manifest_internal("claimed stream shard has no manifest"))?;
-    if writer.shard_id() != key.shard_id
-        || manifest.shard_id != key.shard_id
-        || manifest.status != ShardStatus::Active
-        || manifest.writer_epoch != writer.epoch()
-        || writer.epoch() <= epoch_floor
-    {
-        return Err(OmniError::manifest_read_set_changed(
-            format!("stream_writer_epoch:{}", key.identity),
-            Some(format!("{}:epoch>{epoch_floor}:ACTIVE", key.shard_id)),
-            Some(format!(
-                "writer_shard={}:writer_epoch={}:manifest={manifest:?}",
-                writer.shard_id(),
-                writer.epoch()
-            )),
-        ));
-    }
-    Ok(())
 }
 
 async fn scan_fresh_generation(
@@ -4946,5 +4973,24 @@ fn exact_merged_generation(
         _ => Err(OmniError::manifest_internal(format!(
             "stream fold found duplicate merged-generation cursors for shard {shard_id}"
         ))),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn data_block_error_preserves_typed_correction_token() {
+        let error = stream_data_block_error("block-token");
+
+        assert!(matches!(
+            &error,
+            OmniError::StreamDataBlocked { block_token } if block_token == "block-token"
+        ));
+        assert_eq!(
+            error.to_string(),
+            "stream fold is strict-blocked; correction requires block token block-token"
+        );
     }
 }

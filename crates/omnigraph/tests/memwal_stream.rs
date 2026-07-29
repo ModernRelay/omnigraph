@@ -36,6 +36,7 @@ use omnigraph::db::{Omnigraph, ReadTarget, StreamTableStatus};
 use omnigraph::error::OmniError;
 use omnigraph::failpoints::{ScopedFailPoint, names};
 use omnigraph::instrumentation::{QueryIoProbes, with_query_io_probes};
+use omnigraph::loader::{LoadMode, load_jsonl};
 use omnigraph_control_authority::{
     AuthorityOperationClass, OfflineAuthorityRequest, RuntimeBindingRequest, StateLockAcquire,
     acquire_state_lock, mint_runtime_guard, validate_offline_guard, validate_runtime_binding,
@@ -44,7 +45,7 @@ use omnigraph_storage::storage_handle_for_uri;
 use serial_test::serial;
 use sha2::{Digest, Sha256};
 
-use helpers::memwal::CurrentMemWalInventory;
+use helpers::memwal::{CurrentMemWalInventory, MemWalObjectKind};
 
 const STREAM_SCHEMA: &str = "node Person { score: I32 }\n";
 const TWO_TABLE_STREAM_SCHEMA: &str = r#"
@@ -57,8 +58,19 @@ node Person {
     @unique(score)
 }
 "#;
+const MIN_CARD_STREAM_SCHEMA: &str = r#"
+node Person { name: String @key }
+edge Knows: Person -> Person @card(2..)
+"#;
+const RANGE_STREAM_SCHEMA: &str = r#"
+node Person {
+    score: I32
+    @range(score, 0..10)
+}
+"#;
 const PAYLOAD_STREAM_SCHEMA: &str = "node Person { payload: String }\n";
 const TABLE: &str = "node:Person";
+const MIN_CARD_EDGE_TABLE: &str = "edge:Knows";
 const INSERT_PERSON: &str = r#"
 query insert_person($score: I32) {
     insert Person { score: $score }
@@ -699,6 +711,13 @@ fn assert_no_recovery_sidecars(dir: &EnrolledGraphDir) {
     );
 }
 
+fn stream_data_block_token(error: &OmniError) -> &str {
+    match error {
+        OmniError::StreamDataBlocked { block_token } => block_token,
+        other => panic!("expected typed stream DataBlock error, got {other:?}"),
+    }
+}
+
 #[tokio::test]
 #[serial]
 async fn public_snapshot_hides_the_memwal_system_index() {
@@ -752,6 +771,36 @@ async fn physical_batch(db: &Omnigraph, rows: &[(String, i32)]) -> RecordBatch {
         rows.iter().map(|(_, score)| *score),
     )) as ArrayRef;
     RecordBatch::try_new(schema, vec![ids, scores]).unwrap()
+}
+
+async fn physical_edge_batch(db: &Omnigraph, rows: &[(String, String, String)]) -> RecordBatch {
+    let snapshot = db.snapshot_of(ReadTarget::branch("main")).await.unwrap();
+    let table = snapshot.open(MIN_CARD_EDGE_TABLE).await.unwrap();
+    let schema = Arc::new(Schema::from(table.schema()));
+    assert_eq!(
+        schema
+            .fields()
+            .iter()
+            .map(|field| field.name().as_str())
+            .collect::<Vec<_>>(),
+        ["id", "src", "dst"],
+        "edge fixture must expose the exact normalized physical schema"
+    );
+    RecordBatch::try_new(
+        schema,
+        vec![
+            Arc::new(StringArray::from_iter_values(
+                rows.iter().map(|(id, _, _)| id.as_str()),
+            )) as ArrayRef,
+            Arc::new(StringArray::from_iter_values(
+                rows.iter().map(|(_, src, _)| src.as_str()),
+            )) as ArrayRef,
+            Arc::new(StringArray::from_iter_values(
+                rows.iter().map(|(_, _, dst)| dst.as_str()),
+            )) as ArrayRef,
+        ],
+    )
+    .unwrap()
 }
 
 /// Exercise one private B2 compare-and-chain occurrence without exposing its
@@ -878,6 +927,56 @@ async fn admission_rejects_empty_and_non_exact_physical_batches_without_visibili
         .await
         .unwrap();
     assert_eq!(visible_rows(&db).await, vec![("valid".to_string(), 3)]);
+}
+
+#[tokio::test]
+#[serial]
+async fn admission_rejects_value_violation_before_wal_or_manifest_effect() {
+    let _scenario = FailScenario::setup();
+    let (_dir, db) = init_enrolled_with_schema(RANGE_STREAM_SCHEMA).await;
+    let version_before = db
+        .snapshot_of(ReadTarget::branch("main"))
+        .await
+        .unwrap()
+        .version();
+    let inventory_before = mem_wal_inventory(db.uri()).await;
+    let wal_before = inventory_before.object_count(MemWalObjectKind::Wal);
+    let invalid = physical_batch(&db, &[("out-of-range".to_string(), 11)]).await;
+
+    let error = db
+        .failpoint_stream_b1_for_test(TABLE, Some(invalid), 0)
+        .await
+        .expect_err("row-local value validation must reject before retained admission");
+    assert!(error.to_string().contains("@range"), "{error:?}");
+
+    let inventory_after = mem_wal_inventory(db.uri()).await;
+    assert_eq!(
+        inventory_after.object_count(MemWalObjectKind::Wal),
+        wal_before,
+        "a value violation must not append a WAL object"
+    );
+    assert_eq!(
+        inventory_after.objects, inventory_before.objects,
+        "a value violation must leave every listed MemWAL object path, class, and size unchanged, including shard-manifest hints"
+    );
+    assert_eq!(
+        inventory_after.generation_roots, inventory_before.generation_roots,
+        "a value violation must not create or remove a listed MemWAL generation"
+    );
+    assert_eq!(
+        inventory_after.referenced_generation_roots,
+        inventory_before.referenced_generation_roots,
+        "a value violation must leave shard-manifest generation authority unchanged"
+    );
+    assert_eq!(
+        db.snapshot_of(ReadTarget::branch("main"))
+            .await
+            .unwrap()
+            .version(),
+        version_before,
+        "a value violation must not publish manifest authority"
+    );
+    assert!(visible_rows(&db).await.is_empty());
 }
 
 #[tokio::test]
@@ -1020,10 +1119,7 @@ async fn quiesce_persists_a_stable_data_block_for_a_permanent_validation_failure
         .strict_block_token
         .clone()
         .expect("DRAINING validation failure must expose its durable block token");
-    assert!(
-        first_error.to_string().contains(&block_token),
-        "{first_error:?}"
-    );
+    assert_eq!(stream_data_block_token(&first_error), block_token);
     assert_eq!(blocked.lifecycle, "DRAINING");
     assert_eq!(blocked.drain_id.as_deref(), Some(drain_id));
     assert_eq!(
@@ -1063,6 +1159,7 @@ async fn quiesce_persists_a_stable_data_block_for_a_permanent_validation_failure
         )
         .await
         .expect_err("an exact retry must return the selected block");
+    assert_eq!(stream_data_block_token(&exact_retry_error), block_token);
     assert_eq!(exact_retry_error.to_string(), first_error.to_string());
     assert_eq!(stream_lane(&db).await, blocked);
     assert_eq!(
@@ -1085,6 +1182,7 @@ async fn quiesce_persists_a_stable_data_block_for_a_permanent_validation_failure
         )
         .await
         .expect_err("cold reopen must retain the same selected block");
+    assert_eq!(stream_data_block_token(&reopen_error), block_token);
     assert_eq!(reopen_error.to_string(), first_error.to_string());
     assert_eq!(stream_lane(&reopened).await, blocked);
     assert_eq!(
@@ -1095,6 +1193,135 @@ async fn quiesce_persists_a_stable_data_block_for_a_permanent_validation_failure
             .version(),
         blocked_version,
         "cold exact retry must not mint another block or claim"
+    );
+    assert_no_recovery_sidecars(&dir);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[serial]
+async fn quiesce_persists_a_stable_data_block_for_fresh_source_min_cardinality() {
+    let _scenario = FailScenario::setup();
+    let cluster = tempfile::tempdir().unwrap();
+    let graph = cluster.path().join("graphs/knowledge.omni");
+    let db = Arc::new(
+        Omnigraph::init(graph.to_str().unwrap(), MIN_CARD_STREAM_SCHEMA)
+            .await
+            .unwrap(),
+    );
+    load_jsonl(
+        &db,
+        r#"{"type":"Person","data":{"name":"Alice"}}
+{"type":"Person","data":{"name":"Bob"}}"#,
+        LoadMode::Overwrite,
+    )
+    .await
+    .expect("seed valid endpoints before enrolling the edge table");
+    db.failpoint_enroll_stream_table_for_test(MIN_CARD_EDGE_TABLE)
+        .await
+        .unwrap();
+    enable_stream_profile(&db, &format!("file://{}", cluster.path().display())).await;
+    let dir = EnrolledGraphDir {
+        _cluster: cluster,
+        graph,
+    };
+
+    let edge = physical_edge_batch(
+        &db,
+        &[("edge-1".to_string(), "Alice".to_string(), "Bob".to_string())],
+    )
+    .await;
+    db.failpoint_stream_b1_for_test(MIN_CARD_EDGE_TABLE, Some(edge), 0)
+        .await
+        .expect("row-local admission must retain the graph-valid edge");
+    let before = db.snapshot_of(ReadTarget::branch("main")).await.unwrap();
+    let before_lane = stream_lane(&db).await;
+    let drain_id = "97979797-9797-4797-8797-979797979797";
+    let actor = "operator:min-card-data-block";
+
+    let first_error = db
+        .failpoint_stream_quiesce_for_test(
+            MIN_CARD_EDGE_TABLE,
+            drain_id,
+            before_lane.lifecycle_revision,
+            actor,
+        )
+        .await
+        .expect_err("the under-min fresh source must publish a strict DataBlock");
+    let blocked = stream_lane(&db).await;
+    let block_token = blocked
+        .strict_block_token
+        .clone()
+        .expect("minimum-cardinality evidence must select the streamed edge");
+    assert_eq!(stream_data_block_token(&first_error), block_token);
+    assert_eq!(blocked.lifecycle, "DRAINING");
+    assert_eq!(blocked.drain_id.as_deref(), Some(drain_id));
+    assert_eq!(blocked.last_fold_outcome.as_deref(), Some("STRICT_BLOCKED"));
+    let after = db.snapshot_of(ReadTarget::branch("main")).await.unwrap();
+    assert!(
+        after.version() > before.version(),
+        "the DataBlock must be durable manifest state"
+    );
+    assert_eq!(
+        after.entry(MIN_CARD_EDGE_TABLE).unwrap().table_version,
+        before.entry(MIN_CARD_EDGE_TABLE).unwrap().table_version,
+        "the under-min edge must remain outside the visible base table"
+    );
+    assert!(
+        helpers::read_table(&db, MIN_CARD_EDGE_TABLE)
+            .await
+            .is_empty()
+    );
+    assert_no_recovery_sidecars(&dir);
+
+    let blocked_version = after.version();
+    let exact_retry_error = db
+        .failpoint_stream_quiesce_for_test(
+            MIN_CARD_EDGE_TABLE,
+            drain_id,
+            before_lane.lifecycle_revision,
+            actor,
+        )
+        .await
+        .expect_err("an exact retry must return the selected block");
+    assert_eq!(stream_data_block_token(&exact_retry_error), block_token);
+    assert_eq!(exact_retry_error.to_string(), first_error.to_string());
+    assert_eq!(stream_lane(&db).await, blocked);
+    assert_eq!(
+        db.snapshot_of(ReadTarget::branch("main"))
+            .await
+            .unwrap()
+            .version(),
+        blocked_version,
+        "an exact blocked retry must be lifecycle-inert"
+    );
+
+    drop(db);
+    let reopened = reopen_enrolled(&dir).await;
+    let reopen_error = reopened
+        .failpoint_stream_quiesce_for_test(
+            MIN_CARD_EDGE_TABLE,
+            drain_id,
+            before_lane.lifecycle_revision,
+            actor,
+        )
+        .await
+        .expect_err("cold reopen must retain the same selected block");
+    assert_eq!(stream_data_block_token(&reopen_error), block_token);
+    assert_eq!(reopen_error.to_string(), first_error.to_string());
+    assert_eq!(stream_lane(&reopened).await, blocked);
+    assert_eq!(
+        reopened
+            .snapshot_of(ReadTarget::branch("main"))
+            .await
+            .unwrap()
+            .version(),
+        blocked_version,
+        "cold exact retry must not mint another block or claim"
+    );
+    assert!(
+        helpers::read_table(&reopened, MIN_CARD_EDGE_TABLE)
+            .await
+            .is_empty()
     );
     assert_no_recovery_sidecars(&dir);
 }

@@ -3386,6 +3386,29 @@ mod tests {
     }
 
     #[test]
+    fn data_block_correction_view_rejects_violation_without_evidence() {
+        let tokens = BTreeMap::new();
+        let violation = unique_violation(Vec::new());
+        let mut collector = DataBlockEvidenceCollector::new("node:Person", &tokens);
+
+        let error = collector
+            .push(&violation)
+            .expect_err("an empty correction set cannot mint a repairable DataBlock");
+        assert_eq!(
+            error.to_string(),
+            "validator UNIQUE_VIOLATION has no structured stream-correction evidence"
+        );
+        assert!(
+            !collector.saw_violation && collector.offending_keys.is_empty(),
+            "rejected evidence must not leave a partial correction view"
+        );
+        assert!(
+            collector.finish().unwrap().is_none(),
+            "rejected empty evidence must not produce a DataBlock"
+        );
+    }
+
+    #[test]
     fn data_block_correction_view_count_overflow_is_key_compact_and_replace_only() {
         let tokens = BTreeMap::from([
             ("key-a".to_string(), "token-a".to_string()),

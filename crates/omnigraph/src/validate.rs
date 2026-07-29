@@ -1164,15 +1164,26 @@ where
             }
         }
         if count < card.min {
-            let mut correction_keys = moved_from
+            // A minimum violation can be repaired by withdrawing/replacing
+            // either a delta edge currently landing on this source or a delta
+            // edge that moved away from it. Keep both identities: the former
+            // covers a fresh under-min source, while the latter can restore the
+            // manifest-visible source it vacated.
+            let mut correction_keys = delta_by_id
                 .iter()
-                .filter(|(id, old_src)| {
-                    old_src == src
-                        && delta_by_id
-                            .get(id)
-                            .is_some_and(|current_src| current_src != src)
-                })
+                .filter(|(_, candidate_src)| *candidate_src == src)
                 .map(|(id, _)| id.clone())
+                .chain(
+                    moved_from
+                        .iter()
+                        .filter(|(id, old_src)| {
+                            old_src == src
+                                && delta_by_id
+                                    .get(id)
+                                    .is_some_and(|current_src| current_src != src)
+                        })
+                        .map(|(id, _)| id.clone()),
+                )
                 .collect::<Vec<_>>();
             correction_keys.sort();
             correction_keys.dedup();
@@ -1571,6 +1582,61 @@ mod tests {
             minimum.corrections[0].allowed_actions,
             ["REPLACE", "WITHDRAW"],
             "withdrawing a blocked move restores its manifest-visible source"
+        );
+    }
+
+    #[tokio::test]
+    async fn min_cardinality_violation_names_fresh_delta_edge() {
+        const MIN_CARD_SCHEMA: &str = r#"
+node Person { name: String @key }
+edge Knows: Person -> Person @card(2..)
+"#;
+        let catalog = catalog(MIN_CARD_SCHEMA);
+        let edge_type = catalog.edge_types.get("Knows").unwrap();
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Utf8, false),
+            Field::new("src", DataType::Utf8, false),
+        ]));
+        let batch = RecordBatch::try_new(
+            schema,
+            vec![
+                Arc::new(StringArray::from(vec!["edge-1"])) as _,
+                Arc::new(StringArray::from(vec!["alice"])) as _,
+            ],
+        )
+        .unwrap();
+        let mut change = TableChange::default();
+        change.added.push(batch);
+        let mut changeset = ChangeSet::new();
+        changeset.insert("edge:Knows".to_string(), change);
+        let committed = CommittedState {
+            committed: None,
+            overwritten: HashSet::new(),
+            live: None,
+        };
+        let mut violations = Vec::new();
+
+        evaluate_cardinality(
+            "edge:Knows",
+            edge_type,
+            changeset.get("edge:Knows").unwrap(),
+            &changeset,
+            &committed,
+            &mut |violation| {
+                violations.push(violation);
+                Ok(())
+            },
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(violations.len(), 1);
+        assert_eq!(violations[0].kind, MergeConflictKind::CardinalityViolation);
+        assert_eq!(violations[0].corrections.len(), 1);
+        assert_eq!(violations[0].corrections[0].logical_key, "edge-1");
+        assert_eq!(
+            violations[0].corrections[0].allowed_actions,
+            ["REPLACE", "WITHDRAW"]
         );
     }
 

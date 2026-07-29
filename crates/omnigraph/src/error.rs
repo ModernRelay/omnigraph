@@ -213,6 +213,12 @@ pub enum OmniError {
         rows: u64,
         bytes: u64,
     },
+    /// Strict validation rejected a durable stream generation and retained
+    /// canonical evidence for correction. The token is machine-readable so
+    /// callers never have to recover correction authority by parsing the
+    /// display string.
+    #[error("stream fold is strict-blocked; correction requires block token {block_token}")]
+    StreamDataBlocked { block_token: String },
     /// RFC-026 compare-and-chain request names a stream incarnation which is
     /// no longer current. This is proven before Lance is invoked.
     #[error(

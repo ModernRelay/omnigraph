@@ -682,6 +682,13 @@ post-claim/pre-seal state may claim a higher epoch while retaining the exact
 full-generation projection; a post-seal state reuses the exact receipt-bound
 flushed cut and never invalidates it with another claim.
 
+Under lifecycle-v3, a decoded `SEALED` lifecycle row is deliberately only a
+weak standalone witness: it records terminal disposition, but does not by
+itself authorize reuse of the durable cut. Operation paths that rely on
+`SEALED` re-prove the manifest-selected lifecycle ledger, physical binding,
+selected claim receipt, and receipt-bound cut before publishing or reusing that
+authority.
+
 B1 performs no fresh-tier reads and no generation GC. Acknowledged rows become
 query-visible only after fold. The support boundary remains main-only,
 unsharded, one resident stream worker, and one live writer process; the

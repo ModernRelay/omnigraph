@@ -900,11 +900,14 @@ impl ApiError {
                     actual,
                 },
             ),
-            // Phase B1 has no public stream route. Keep the exhaustive engine
-            // translation conservative until B2 defines structured wire
-            // fields: a fold request is a retryable logical conflict, while an
-            // invoked-but-unconfirmed append is unavailable/ambiguous.
-            err @ OmniError::FoldRequired { .. } => Self::conflict(err.to_string()),
+            // There is no public stream row route yet. Keep the exhaustive
+            // engine translation conservative until that surface defines
+            // structured wire fields: fold-required and strict-blocked are
+            // retryable logical conflicts, while an invoked-but-unconfirmed
+            // append is unavailable/ambiguous.
+            err @ (OmniError::FoldRequired { .. } | OmniError::StreamDataBlocked { .. }) => {
+                Self::conflict(err.to_string())
+            }
             // §4.7 P1: an effect-free pending-until-drained refusal — a
             // retryable logical conflict, converged by a later cluster apply
             // once the named streams fold. No HTTP caller can reach it in
@@ -1081,7 +1084,7 @@ mod api_error_tests {
     }
 
     #[tokio::test]
-    async fn lifecycle_management_conflicts_serialize_as_409() {
+    async fn stream_management_conflicts_serialize_as_409() {
         let cases = [
             (
                 OmniError::StreamLifecycleChanged {
@@ -1100,6 +1103,12 @@ mod api_error_tests {
                     operation_id: "44444444-4444-4444-8444-444444444444".to_string(),
                 },
                 "stream lifecycle idempotency conflict for table 0000000000000029:000000000000002b, operation QUIESCE '44444444-4444-4444-8444-444444444444'",
+            ),
+            (
+                OmniError::StreamDataBlocked {
+                    block_token: "sha256:block-token".to_string(),
+                },
+                "stream fold is strict-blocked; correction requires block token sha256:block-token",
             ),
         ];
 

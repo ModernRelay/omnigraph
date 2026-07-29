@@ -2259,6 +2259,9 @@ mod tests {
         .unwrap();
         let claim_id = "77777777-7777-4777-8777-777777777777";
         let attempt_id = "88888888-8888-4888-8888-888888888888";
+        let tail_prior_position = 0;
+        let tail_position = 10;
+        let tail_segment_entry_count = tail_position - tail_prior_position;
         let sentinel_digest = format!("sha256:{}", "4".repeat(64));
         let terminal_effect_digest = format!("sha256:{}", "5".repeat(64));
         let attempt = ClaimAttemptEffect::new(
@@ -2275,11 +2278,11 @@ mod tests {
                 attempt_plan_digest: format!("sha256:{}", "6".repeat(64)),
                 bound_prestate_digest: format!("sha256:{}", "7".repeat(64)),
                 storage_envelope_digest: None,
-                planned_sentinel_position: 10,
+                planned_sentinel_position: tail_position,
                 planned_sentinel_digest: sentinel_digest.clone(),
                 achieved_shard_manifest_version: Some(2),
                 achieved_writer_epoch: Some(2),
-                observed_sentinel_position: Some(10),
+                observed_sentinel_position: Some(tail_position),
                 observed_sentinel_digest: Some(sentinel_digest.clone()),
                 attempt_terminal_effect_digest: terminal_effect_digest.clone(),
                 classification: ClaimAttemptClassification::StockManifestPlusSentinel,
@@ -2301,9 +2304,9 @@ mod tests {
             stream_incarnation_id,
             &stream_configuration_digest,
             &physical_binding_digest,
-            0,
-            10,
-            1,
+            tail_prior_position,
+            tail_position,
+            tail_segment_entry_count,
             &tail_segment_digest,
             &prior_tail.chain_digest,
             1,
@@ -2335,13 +2338,13 @@ mod tests {
                 terminal_pre_shard_manifest_version: 1,
                 achieved_shard_manifest_version: 2,
                 achieved_writer_epoch: 2,
-                sentinel_position: 10,
+                sentinel_position: tail_position,
                 sentinel_digest,
                 replay_cursor: 0,
-                authenticated_tail_prior_position: 0,
-                authenticated_tail_position: 10,
+                authenticated_tail_prior_position: tail_prior_position,
+                authenticated_tail_position: tail_position,
                 authenticated_tail_published_prefix_position: 0,
-                authenticated_tail_segment_entry_count: 1,
+                authenticated_tail_segment_entry_count: tail_segment_entry_count,
                 authenticated_tail_segment_digest: tail_segment_digest.clone(),
                 authenticated_tail_segment_lww_projection_digest: format!(
                     "sha256:{}",
