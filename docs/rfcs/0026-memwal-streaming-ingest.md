@@ -86,12 +86,16 @@ the one local/S3 control-object implementation and
 `omnigraph-control-authority` owns the unchanged persisted cluster lock below
 the engine/cluster split; the nine-crate DAG and crates.io publish order
 compile without a cycle. Stable 15-minute `Firehose PR smoke` and 60-minute
-`Firehose dependency rebuild` jobs also exist as always-reporting shadow
-contexts. They are not required yet: activation still needs the exact-path p95
-evidence and a non-expiring immutable key→digest binding. No incomplete
-checked capability constructor is public or consumed, the ambient v10 profile
-writer remains unchanged, and all F2 format/authority behavior remains
-unimplemented.
+`Firehose dependency rebuild` jobs are defined as shadow contexts, but the
+dependency rebuild's cold branch temporarily reports `shadow-disabled` without
+setup or compilation after its first exact cold run exposed three serial Cargo
+graphs and reached the 55-minute command cap. It is not evidence and is not
+required; re-enabling it first requires an isolated single-graph harness that
+meets the cold bound. Activation still needs the
+exact-path p95 evidence and a non-expiring immutable key→digest binding. No
+incomplete checked capability constructor is public or consumed, the ambient
+v10 profile writer remains unchanged, and all F2 format/authority behavior
+remains unimplemented.
 **Author track:** Maintainer design series
 **Depends on:** [RFC-022](0022-unified-write-path.md)'s unified write and
 generic recovery-sidecar protocol, plus

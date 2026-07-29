@@ -211,6 +211,9 @@ grep -Fq 'crates/omnigraph-storage/*' "$repo_root/.github/workflows/ci.yml"
 grep -Fq 'crates/omnigraph-control-authority/*' "$repo_root/.github/workflows/ci.yml"
 grep -Fq "cancel-in-progress: \${{ github.event_name == 'pull_request' }}" \
     "$repo_root/.github/workflows/ci.yml"
+grep -Fq "echo \"enabled=false\" >> \"\$GITHUB_OUTPUT\"" \
+    "$repo_root/.github/workflows/ci.yml"
+grep -Fq 'mode="shadow-disabled"' "$repo_root/.github/workflows/ci.yml"
 
 # `download-artifact` treats `artifact-ids` as a multi-artifact selection even
 # when one ID is supplied; without merge-multiple it inserts an artifact-name

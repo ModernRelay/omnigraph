@@ -591,6 +591,15 @@ jobs:
         if: needs.firehose_pr_smoke.outputs.mode == 'docs-only'
         run: echo "Proven docs-only change; dependency rebuild is an explicit no-op."
 
+      - name: Select cold shadow policy
+        id: cold_policy
+        run: |
+          # Temporarily disabled: the first exact changed-key run spent 29m25s
+          # on a workspace-wide no-run build, 20m59s recompiling the focused
+          # engine graph, then hit the 3,300-second cap in a third graph.
+          echo "enabled=false" >> "$GITHUB_OUTPUT"
+          echo "::notice::Cold firehose rebuild is shadow-disabled pending an isolated single-graph harness."
+
       - name: Download current-run verified evidence
         if: needs.firehose_pr_smoke.outputs.mode == 'verified'
         uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
@@ -618,24 +627,27 @@ jobs:
 
       - name: Checkout source for cold exception
         if: >-
-          needs.firehose_pr_smoke.outputs.mode == 'delegated-changed' ||
-          needs.firehose_pr_smoke.outputs.mode == 'delegated-missing'
+          steps.cold_policy.outputs.enabled == 'true' &&
+          (needs.firehose_pr_smoke.outputs.mode == 'delegated-changed' ||
+          needs.firehose_pr_smoke.outputs.mode == 'delegated-missing')
         uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5.0.1
         with:
           fetch-depth: 0
 
       - name: Install system dependencies for cold exception
         if: >-
-          needs.firehose_pr_smoke.outputs.mode == 'delegated-changed' ||
-          needs.firehose_pr_smoke.outputs.mode == 'delegated-missing'
+          steps.cold_policy.outputs.enabled == 'true' &&
+          (needs.firehose_pr_smoke.outputs.mode == 'delegated-changed' ||
+          needs.firehose_pr_smoke.outputs.mode == 'delegated-missing')
         run: |
           sudo apt-get update
           sudo apt-get install -y protobuf-compiler libprotobuf-dev zstd
 
       - name: Install Rust stable for cold exception
         if: >-
-          needs.firehose_pr_smoke.outputs.mode == 'delegated-changed' ||
-          needs.firehose_pr_smoke.outputs.mode == 'delegated-missing'
+          steps.cold_policy.outputs.enabled == 'true' &&
+          (needs.firehose_pr_smoke.outputs.mode == 'delegated-changed' ||
+          needs.firehose_pr_smoke.outputs.mode == 'delegated-missing')
         uses: dtolnay/rust-toolchain@4cda84d5c5c54efe2404f9d843567869ab1699d4 # stable
         with:
           toolchain: stable
@@ -643,8 +655,9 @@ jobs:
       - name: Derive cold dependency key
         id: cold_key
         if: >-
-          needs.firehose_pr_smoke.outputs.mode == 'delegated-changed' ||
-          needs.firehose_pr_smoke.outputs.mode == 'delegated-missing'
+          steps.cold_policy.outputs.enabled == 'true' &&
+          (needs.firehose_pr_smoke.outputs.mode == 'delegated-changed' ||
+          needs.firehose_pr_smoke.outputs.mode == 'delegated-missing')
         run: |
           set -euo pipefail
           packages="$(dpkg-query -W -f='${Package}=${Version}\n' \
@@ -692,6 +705,7 @@ jobs:
         env:
           SMOKE_MODE: ${{ needs.firehose_pr_smoke.outputs.mode }}
           SMOKE_KEY: ${{ needs.firehose_pr_smoke.outputs.key }}
+          COLD_ENABLED: ${{ steps.cold_policy.outputs.enabled }}
           COLD_KEY: ${{ steps.cold_key.outputs.key }}
           MAIN_KEY: ${{ needs.test.outputs.firehose_key }}
         run: |
@@ -712,10 +726,15 @@ jobs:
               [[ -n "$key" ]]
               ;;
             delegated-changed|delegated-missing)
-              mode="rebuilt"
-              key="$COLD_KEY"
-              [[ -n "$key" ]]
-              test -s "$RUNNER_TEMP/firehose-rebuild-evidence.json"
+              if [[ "$COLD_ENABLED" == "true" ]]; then
+                mode="rebuilt"
+                key="$COLD_KEY"
+                [[ -n "$key" ]]
+                test -s "$RUNNER_TEMP/firehose-rebuild-evidence.json"
+              else
+                mode="shadow-disabled"
+                key=""
+              fi
               ;;
             *)
               exit 1
