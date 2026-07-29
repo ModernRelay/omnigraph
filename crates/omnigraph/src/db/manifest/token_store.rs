@@ -19,14 +19,18 @@ use lance::dataset::refs::BranchIdentifier;
 use lance::dataset::write::merge_insert::SourceDedupeBehavior;
 use lance::dataset::{MergeInsertBuilder, WhenMatched, WhenNotMatched, WriteMode, WriteParams};
 use lance::datatypes::LANCE_UNENFORCED_PRIMARY_KEY;
+use lance::index::DatasetIndexExt;
 use lance_file::version::LanceFileVersion;
+use lance_index::IndexType;
 use lance_index::mem_wal::ShardId;
+use lance_index::scalar::ScalarIndexParams;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
 use crate::error::{OmniError, Result};
 
 use super::layout::{stream_token_authority_object_id, stream_token_uri};
+use super::stream_profile::{PROFILE_MANAGEMENT_RECEIPT_TAG, ProfileManagementReceipt};
 use super::stream_token::{
     PayloadDigest, StreamRowOrigin, StreamTerminalCorrection, StreamToken, StreamTokenAuthorityRow,
     StreamTokenDisposition, TrustedContributorId,
@@ -34,35 +38,39 @@ use super::stream_token::{
 use super::{CurrentHeadWitness, TableIdentity};
 
 pub(crate) const STREAM_TOKEN_DATASET_PATH: &str = "_stream_tokens.lance";
-pub(crate) const STREAM_TOKEN_AUTHORITY_SCHEMA_VERSION: u32 = 1;
+pub(crate) const STREAM_TOKEN_AUTHORITY_SCHEMA_VERSION: u32 = 2;
 const STREAM_TOKEN_AUTHORITY_PROTOCOL_VERSION: u32 = 1;
+pub(crate) const CURRENT_TOKEN_RECORD_TAG: &str = "CURRENT_TOKEN_V1";
 
 /// Canonical schema descriptor hashed into the manifest authority row.
 ///
 /// Keep this in the same order and nullability as [`stream_token_schema`].  A
 /// physical schema change requires a new descriptor, schema version, and graph
 /// format strand; it must never be accepted through permissive field matching.
-const STREAM_TOKEN_SCHEMA_DESCRIPTOR_V1: &str = concat!(
-    "omnigraph.stream-token-authority.schema.v1\n",
+const STREAM_TOKEN_SCHEMA_DESCRIPTOR_V2: &str = concat!(
+    "omnigraph.stream-token-authority.schema.v2\n",
     "id:utf8:required:unenforced-primary-key\n",
-    "stable_table_id:uint64:required\n",
-    "table_incarnation_id:uint64:required\n",
-    "logical_id:utf8:required\n",
-    "origin_enrollment_id:utf8:required\n",
-    "stream_incarnation_id:utf8:required\n",
-    "current_token:utf8:required\n",
-    "write_id:utf8:required\n",
+    "record_tag:utf8:required\n",
+    "record_lookup_key:utf8:required\n",
+    "stable_table_id:uint64:nullable\n",
+    "table_incarnation_id:uint64:nullable\n",
+    "logical_id:utf8:nullable\n",
+    "origin_enrollment_id:utf8:nullable\n",
+    "stream_incarnation_id:utf8:nullable\n",
+    "current_token:utf8:nullable\n",
+    "write_id:utf8:nullable\n",
     "predecessor_token:utf8:nullable\n",
-    "disposition:utf8:required\n",
-    "contributor_id:utf8:required\n",
-    "payload_digest:utf8:required\n",
-    "origin_kind:utf8:required\n",
-    "origin_id:utf8:required\n",
-    "origin_ordinal:uint64:required\n",
+    "disposition:utf8:nullable\n",
+    "contributor_id:utf8:nullable\n",
+    "payload_digest:utf8:nullable\n",
+    "origin_kind:utf8:nullable\n",
+    "origin_id:utf8:nullable\n",
+    "origin_ordinal:uint64:nullable\n",
     "fold_base_token:utf8:nullable\n",
-    "chain_depth:uint32:required\n",
+    "chain_depth:uint32:nullable\n",
     "terminal_correction_actor:utf8:nullable\n",
     "terminal_correction_operation_id:utf8:nullable\n",
+    "record_payload_json:utf8:nullable\n",
 );
 
 /// The single graph-global token-table pointer materialized in `__manifest`.
@@ -188,29 +196,32 @@ pub(crate) fn stream_token_schema() -> SchemaRef {
             .collect();
     Arc::new(Schema::new(vec![
         Field::new("id", DataType::Utf8, false).with_metadata(primary_key_metadata),
-        Field::new("stable_table_id", DataType::UInt64, false),
-        Field::new("table_incarnation_id", DataType::UInt64, false),
-        Field::new("logical_id", DataType::Utf8, false),
-        Field::new("origin_enrollment_id", DataType::Utf8, false),
-        Field::new("stream_incarnation_id", DataType::Utf8, false),
-        Field::new("current_token", DataType::Utf8, false),
-        Field::new("write_id", DataType::Utf8, false),
+        Field::new("record_tag", DataType::Utf8, false),
+        Field::new("record_lookup_key", DataType::Utf8, false),
+        Field::new("stable_table_id", DataType::UInt64, true),
+        Field::new("table_incarnation_id", DataType::UInt64, true),
+        Field::new("logical_id", DataType::Utf8, true),
+        Field::new("origin_enrollment_id", DataType::Utf8, true),
+        Field::new("stream_incarnation_id", DataType::Utf8, true),
+        Field::new("current_token", DataType::Utf8, true),
+        Field::new("write_id", DataType::Utf8, true),
         Field::new("predecessor_token", DataType::Utf8, true),
-        Field::new("disposition", DataType::Utf8, false),
-        Field::new("contributor_id", DataType::Utf8, false),
-        Field::new("payload_digest", DataType::Utf8, false),
-        Field::new("origin_kind", DataType::Utf8, false),
-        Field::new("origin_id", DataType::Utf8, false),
-        Field::new("origin_ordinal", DataType::UInt64, false),
+        Field::new("disposition", DataType::Utf8, true),
+        Field::new("contributor_id", DataType::Utf8, true),
+        Field::new("payload_digest", DataType::Utf8, true),
+        Field::new("origin_kind", DataType::Utf8, true),
+        Field::new("origin_id", DataType::Utf8, true),
+        Field::new("origin_ordinal", DataType::UInt64, true),
         Field::new("fold_base_token", DataType::Utf8, true),
-        Field::new("chain_depth", DataType::UInt32, false),
+        Field::new("chain_depth", DataType::UInt32, true),
         Field::new("terminal_correction_actor", DataType::Utf8, true),
         Field::new("terminal_correction_operation_id", DataType::Utf8, true),
+        Field::new("record_payload_json", DataType::Utf8, true),
     ]))
 }
 
 pub(crate) fn stream_token_schema_hash() -> String {
-    let digest = Sha256::digest(STREAM_TOKEN_SCHEMA_DESCRIPTOR_V1.as_bytes());
+    let digest = Sha256::digest(STREAM_TOKEN_SCHEMA_DESCRIPTOR_V2.as_bytes());
     format!("sha256:{digest:x}")
 }
 
@@ -238,6 +249,8 @@ pub(crate) fn stream_token_rows_to_batch(rows: &[StreamTokenAuthorityRow]) -> Re
     }
 
     let mut ids = Vec::with_capacity(rows.len());
+    let mut record_tags = Vec::with_capacity(rows.len());
+    let mut record_lookup_keys = Vec::with_capacity(rows.len());
     let mut stable_table_ids = Vec::with_capacity(rows.len());
     let mut table_incarnation_ids = Vec::with_capacity(rows.len());
     let mut logical_ids = Vec::with_capacity(rows.len());
@@ -256,6 +269,7 @@ pub(crate) fn stream_token_rows_to_batch(rows: &[StreamTokenAuthorityRow]) -> Re
     let mut chain_depths = Vec::with_capacity(rows.len());
     let mut terminal_actors = Vec::with_capacity(rows.len());
     let mut terminal_operation_ids = Vec::with_capacity(rows.len());
+    let mut record_payloads = Vec::with_capacity(rows.len());
     let mut seen = std::collections::HashSet::with_capacity(rows.len());
 
     for row in rows {
@@ -289,6 +303,8 @@ pub(crate) fn stream_token_rows_to_batch(rows: &[StreamTokenAuthorityRow]) -> Re
             .unwrap_or((None, None));
 
         ids.push(id);
+        record_tags.push(CURRENT_TOKEN_RECORD_TAG);
+        record_lookup_keys.push(stream_token_row_id(row.identity, &row.logical_id)?);
         stable_table_ids.push(row.identity.stable_table_id);
         table_incarnation_ids.push(row.identity.table_incarnation_id);
         logical_ids.push(row.logical_id.clone());
@@ -310,12 +326,15 @@ pub(crate) fn stream_token_rows_to_batch(rows: &[StreamTokenAuthorityRow]) -> Re
         chain_depths.push(row.chain_depth);
         terminal_actors.push(terminal_actor);
         terminal_operation_ids.push(terminal_operation_id);
+        record_payloads.push(None::<String>);
     }
 
     RecordBatch::try_new(
         stream_token_schema(),
         vec![
             Arc::new(StringArray::from(ids)),
+            Arc::new(StringArray::from(record_tags)),
+            Arc::new(StringArray::from(record_lookup_keys)),
             Arc::new(UInt64Array::from(stable_table_ids)),
             Arc::new(UInt64Array::from(table_incarnation_ids)),
             Arc::new(StringArray::from(logical_ids)),
@@ -334,6 +353,7 @@ pub(crate) fn stream_token_rows_to_batch(rows: &[StreamTokenAuthorityRow]) -> Re
             Arc::new(UInt32Array::from(chain_depths)),
             Arc::new(StringArray::from(terminal_actors)),
             Arc::new(StringArray::from(terminal_operation_ids)),
+            Arc::new(StringArray::from(record_payloads)),
         ],
     )
     .map_err(|error| {
@@ -346,9 +366,7 @@ pub(crate) fn stream_token_rows_to_batch(rows: &[StreamTokenAuthorityRow]) -> Re
 /// Enforce the config-v3 bounds for the exact winner projection which can
 /// enter recovery-v12. This runs before acknowledgement for every projected
 /// warm generation and again at the staging/recovery boundary.
-pub(crate) fn validate_stream_token_plan_bounds(
-    rows: &[StreamTokenAuthorityRow],
-) -> Result<()> {
+pub(crate) fn validate_stream_token_plan_bounds(rows: &[StreamTokenAuthorityRow]) -> Result<()> {
     validate_stream_token_plan_bounds_with_limits(
         rows,
         crate::table_store::mem_wal::B2_MAX_TOKEN_PROJECTION_ARROW_BYTES,
@@ -389,7 +407,7 @@ fn validate_stream_token_plan_bounds_with_limits(
     }
 
     let json_limit_usize = usize::try_from(json_limit)
-    .map_err(|_| OmniError::manifest_internal("stream-token JSON cap exceeds usize"))?;
+        .map_err(|_| OmniError::manifest_internal("stream-token JSON cap exceeds usize"))?;
     let mut writer = BoundedCountWriter::new(json_limit_usize);
     let result = serde_json::to_writer(&mut writer, rows);
     if writer.exceeded {
@@ -449,10 +467,12 @@ pub(crate) fn stream_token_rows_from_batch(
 ) -> Result<Vec<StreamTokenAuthorityRow>> {
     if batch.schema().as_ref() != stream_token_schema().as_ref() {
         return Err(OmniError::manifest_internal(
-            "stream-token scan returned a non-v1 physical schema",
+            "stream-token scan returned a non-v2 physical schema",
         ));
     }
     let ids = required_string_array(batch, "id")?;
+    let record_tags = required_string_array(batch, "record_tag")?;
+    let record_lookup_keys = required_string_array(batch, "record_lookup_key")?;
     let stable_table_ids = required_u64_array(batch, "stable_table_id")?;
     let table_incarnation_ids = required_u64_array(batch, "table_incarnation_id")?;
     let logical_ids = required_string_array(batch, "logical_id")?;
@@ -471,11 +491,25 @@ pub(crate) fn stream_token_rows_from_batch(
     let chain_depths = required_u32_array(batch, "chain_depth")?;
     let terminal_actors = required_string_array(batch, "terminal_correction_actor")?;
     let terminal_operation_ids = required_string_array(batch, "terminal_correction_operation_id")?;
+    let record_payloads = required_string_array(batch, "record_payload_json")?;
 
     let mut rows = Vec::with_capacity(batch.num_rows());
     let mut seen = std::collections::HashSet::with_capacity(batch.num_rows());
     for index in 0..batch.num_rows() {
         require_non_null(ids, index, "id")?;
+        require_non_null(record_tags, index, "record_tag")?;
+        require_non_null(record_lookup_keys, index, "record_lookup_key")?;
+        if record_tags.value(index) != CURRENT_TOKEN_RECORD_TAG {
+            return Err(OmniError::manifest_internal(format!(
+                "current-token decoder received trusted record tag '{}'",
+                record_tags.value(index)
+            )));
+        }
+        if !record_payloads.is_null(index) {
+            return Err(OmniError::manifest_internal(
+                "current-token row must not carry a control-ledger payload",
+            ));
+        }
         require_non_null(stable_table_ids, index, "stable_table_id")?;
         require_non_null(table_incarnation_ids, index, "table_incarnation_id")?;
         require_non_null(logical_ids, index, "logical_id")?;
@@ -490,7 +524,6 @@ pub(crate) fn stream_token_rows_from_batch(
         require_non_null(origin_ids, index, "origin_id")?;
         require_non_null(origin_ordinals, index, "origin_ordinal")?;
         require_non_null(chain_depths, index, "chain_depth")?;
-
         let identity = TableIdentity::new(
             stable_table_ids.value(index),
             table_incarnation_ids.value(index),
@@ -501,6 +534,13 @@ pub(crate) fn stream_token_rows_from_batch(
             return Err(OmniError::manifest_internal(format!(
                 "stream-token row id '{}' does not match canonical key '{}'",
                 ids.value(index),
+                expected_id
+            )));
+        }
+        if record_lookup_keys.value(index) != expected_id {
+            return Err(OmniError::manifest_internal(format!(
+                "stream-token row lookup key '{}' does not match canonical key '{}'",
+                record_lookup_keys.value(index),
                 expected_id
             )));
         }
@@ -585,11 +625,13 @@ pub(crate) async fn lookup_stream_token_row(
     validate_exact_dataset(dataset, authority).await?;
     let id = stream_token_row_id(identity, logical_id)?;
     let mut scanner = dataset.scan();
-    scanner.filter_expr(col("id").eq(lit(id)));
-    scanner.batch_size(2);
-    scanner.batch_size_bytes(
-        crate::table_store::mem_wal::B2_MAX_TOKEN_PROJECTION_ARROW_BYTES,
+    scanner.filter_expr(
+        col("record_tag")
+            .eq(lit(CURRENT_TOKEN_RECORD_TAG))
+            .and(col("record_lookup_key").eq(lit(id))),
     );
+    scanner.batch_size(2);
+    scanner.batch_size_bytes(crate::table_store::mem_wal::B2_MAX_TOKEN_PROJECTION_ARROW_BYTES);
     scanner
         .limit(Some(2), None)
         .map_err(|error| OmniError::Lance(error.to_string()))?;
@@ -617,9 +659,7 @@ pub(crate) async fn lookup_stream_token_row(
             let retained_bytes = row
                 .lookup_retained_bytes()
                 .map_err(|error| OmniError::manifest_internal(error.to_string()))?;
-            if retained_bytes
-                > crate::table_store::mem_wal::B2_MAX_TOKEN_PROJECTION_ARROW_BYTES
-            {
+            if retained_bytes > crate::table_store::mem_wal::B2_MAX_TOKEN_PROJECTION_ARROW_BYTES {
                 return Err(OmniError::resource_limit(
                     "stream_token_lookup_retained_bytes",
                     crate::table_store::mem_wal::B2_MAX_TOKEN_PROJECTION_ARROW_BYTES,
@@ -655,8 +695,7 @@ pub(crate) async fn stream_token_rows_for_keys(
 ) -> Result<BTreeMap<String, StreamTokenAuthorityRow>> {
     validate_exact_dataset(dataset, authority).await?;
     if logical_ids.is_empty()
-        || logical_ids.len()
-            > crate::table_store::mem_wal::B1_MAX_GENERATION_ROWS as usize
+        || logical_ids.len() > crate::table_store::mem_wal::B1_MAX_GENERATION_ROWS as usize
     {
         return Err(OmniError::manifest_internal(format!(
             "stream-token fold lookup requires 1..={} exact keys, got {}",
@@ -669,16 +708,20 @@ pub(crate) async fn stream_token_rows_for_keys(
         .map(|logical_id| stream_token_row_id(identity, logical_id))
         .collect::<Result<Vec<_>>>()?;
     let mut scanner = dataset.scan();
-    scanner.filter_expr(col("id").in_list(exact_ids.into_iter().map(lit).collect(), false));
-    scanner.batch_size(logical_ids.len().saturating_add(1));
-    scanner.batch_size_bytes(
-        crate::table_store::mem_wal::B2_MAX_TOKEN_PROJECTION_ARROW_BYTES,
+    scanner.filter_expr(
+        col("record_tag")
+            .eq(lit(CURRENT_TOKEN_RECORD_TAG))
+            .and(col("record_lookup_key").in_list(exact_ids.into_iter().map(lit).collect(), false)),
     );
+    scanner.batch_size(logical_ids.len().saturating_add(1));
+    scanner.batch_size_bytes(crate::table_store::mem_wal::B2_MAX_TOKEN_PROJECTION_ARROW_BYTES);
     scanner
         .limit(
-            Some(i64::try_from(logical_ids.len().saturating_add(1)).map_err(|_| {
-                OmniError::manifest_internal("stream-token lookup row limit exceeds i64")
-            })?),
+            Some(
+                i64::try_from(logical_ids.len().saturating_add(1)).map_err(|_| {
+                    OmniError::manifest_internal("stream-token lookup row limit exceeds i64")
+                })?,
+            ),
             None,
         )
         .map_err(|error| OmniError::Lance(error.to_string()))?;
@@ -733,6 +776,241 @@ pub(crate) async fn stream_token_rows_for_keys(
         }
     }
     Ok(selected)
+}
+
+const MAX_PROFILE_MANAGEMENT_RECEIPT_JSON_BYTES: usize = 64 * 1024;
+
+/// Encode one immutable profile-management ledger row using the tagged v2
+/// union schema. Every current-token column is structurally null.
+pub(crate) fn profile_management_receipt_to_batch(
+    receipt: &ProfileManagementReceipt,
+) -> Result<RecordBatch> {
+    receipt.validate()?;
+    let payload = serde_json::to_string(receipt).map_err(|error| {
+        OmniError::manifest_internal(format!(
+            "failed to encode profile-management receipt: {error}"
+        ))
+    })?;
+    if payload.len() > MAX_PROFILE_MANAGEMENT_RECEIPT_JSON_BYTES {
+        return Err(OmniError::resource_limit(
+            "stream_profile_receipt_json_bytes",
+            MAX_PROFILE_MANAGEMENT_RECEIPT_JSON_BYTES as u64,
+            payload.len() as u64,
+        ));
+    }
+    let null_string = || Arc::new(StringArray::from(vec![None::<String>]));
+    RecordBatch::try_new(
+        stream_token_schema(),
+        vec![
+            Arc::new(StringArray::from(vec![receipt.record_id.clone()])),
+            Arc::new(StringArray::from(vec![PROFILE_MANAGEMENT_RECEIPT_TAG])),
+            Arc::new(StringArray::from(vec![receipt.record_lookup_key.clone()])),
+            Arc::new(UInt64Array::from(vec![None::<u64>])),
+            Arc::new(UInt64Array::from(vec![None::<u64>])),
+            null_string(),
+            null_string(),
+            null_string(),
+            null_string(),
+            null_string(),
+            null_string(),
+            null_string(),
+            null_string(),
+            null_string(),
+            null_string(),
+            null_string(),
+            Arc::new(UInt64Array::from(vec![None::<u64>])),
+            null_string(),
+            Arc::new(UInt32Array::from(vec![None::<u32>])),
+            null_string(),
+            null_string(),
+            Arc::new(StringArray::from(vec![Some(payload)])),
+        ],
+    )
+    .map_err(|error| {
+        OmniError::manifest_internal(format!(
+            "failed to build profile-management receipt batch: {error}"
+        ))
+    })
+}
+
+/// Decode tagged profile-management rows. Passing a current-token row or any
+/// mixed-population row is a hard protocol error.
+pub(crate) fn profile_management_receipts_from_batch(
+    batch: &RecordBatch,
+) -> Result<Vec<ProfileManagementReceipt>> {
+    if batch.schema().as_ref() != stream_token_schema().as_ref() {
+        return Err(OmniError::manifest_internal(
+            "profile-management receipt scan returned a non-v2 physical schema",
+        ));
+    }
+    let ids = required_string_array(batch, "id")?;
+    let tags = required_string_array(batch, "record_tag")?;
+    let lookup_keys = required_string_array(batch, "record_lookup_key")?;
+    let payloads = required_string_array(batch, "record_payload_json")?;
+    let token_columns = [
+        "stable_table_id",
+        "table_incarnation_id",
+        "logical_id",
+        "origin_enrollment_id",
+        "stream_incarnation_id",
+        "current_token",
+        "write_id",
+        "predecessor_token",
+        "disposition",
+        "contributor_id",
+        "payload_digest",
+        "origin_kind",
+        "origin_id",
+        "origin_ordinal",
+        "fold_base_token",
+        "chain_depth",
+        "terminal_correction_actor",
+        "terminal_correction_operation_id",
+    ];
+    let mut receipts = Vec::with_capacity(batch.num_rows());
+    for index in 0..batch.num_rows() {
+        require_non_null(ids, index, "id")?;
+        require_non_null(tags, index, "record_tag")?;
+        require_non_null(lookup_keys, index, "record_lookup_key")?;
+        require_non_null(payloads, index, "record_payload_json")?;
+        if tags.value(index) != PROFILE_MANAGEMENT_RECEIPT_TAG {
+            return Err(OmniError::manifest_internal(format!(
+                "profile-management decoder received trusted record tag '{}'",
+                tags.value(index)
+            )));
+        }
+        for name in token_columns {
+            let column = batch.column_by_name(name).ok_or_else(|| {
+                OmniError::manifest_internal(format!(
+                    "profile-management receipt batch is missing '{name}'"
+                ))
+            })?;
+            if !column.is_null(index) {
+                return Err(OmniError::manifest_internal(format!(
+                    "profile-management receipt has non-null current-token column '{name}'"
+                )));
+            }
+        }
+        let payload = payloads.value(index);
+        if payload.len() > MAX_PROFILE_MANAGEMENT_RECEIPT_JSON_BYTES {
+            return Err(OmniError::resource_limit(
+                "stream_profile_receipt_json_bytes",
+                MAX_PROFILE_MANAGEMENT_RECEIPT_JSON_BYTES as u64,
+                payload.len() as u64,
+            ));
+        }
+        let receipt: ProfileManagementReceipt = serde_json::from_str(payload).map_err(|error| {
+            OmniError::manifest_internal(format!(
+                "failed to decode profile-management receipt: {error}"
+            ))
+        })?;
+        receipt.validate()?;
+        if ids.value(index) != receipt.record_id
+            || lookup_keys.value(index) != receipt.record_lookup_key
+            || tags.value(index) != receipt.record_tag
+        {
+            return Err(OmniError::manifest_internal(
+                "profile-management receipt physical envelope differs from its canonical payload",
+            ));
+        }
+        receipts.push(receipt);
+    }
+    Ok(receipts)
+}
+
+/// Receipt-first operation lookup. Callers invoke this before comparing the
+/// current profile revision so a delayed exact retry returns its original
+/// bounded result rather than targeting a later profile cycle.
+pub(crate) async fn lookup_profile_management_receipt(
+    dataset: &Dataset,
+    authority: &StreamTokenAuthorityEntry,
+    graph_identity_digest: &str,
+    operation_id: &str,
+) -> Result<Option<ProfileManagementReceipt>> {
+    validate_exact_dataset(dataset, authority).await?;
+    let lookup_key = ProfileManagementReceipt::lookup_key_for(graph_identity_digest, operation_id)?;
+    let mut scanner = dataset.scan();
+    scanner.filter_expr(
+        col("record_tag")
+            .eq(lit(PROFILE_MANAGEMENT_RECEIPT_TAG))
+            .and(col("record_lookup_key").eq(lit(lookup_key))),
+    );
+    scanner.batch_size(2);
+    scanner.batch_size_bytes(MAX_PROFILE_MANAGEMENT_RECEIPT_JSON_BYTES as u64);
+    scanner
+        .limit(Some(2), None)
+        .map_err(|error| OmniError::Lance(error.to_string()))?;
+    let mut stream = scanner
+        .try_into_stream()
+        .await
+        .map_err(|error| OmniError::Lance(error.to_string()))?;
+    let mut selected = None;
+    while let Some(batch) = stream
+        .try_next()
+        .await
+        .map_err(|error| OmniError::Lance(error.to_string()))?
+    {
+        for receipt in profile_management_receipts_from_batch(&batch)? {
+            if selected.replace(receipt).is_some() {
+                return Err(OmniError::manifest_internal(
+                    "stream-token ledger contains duplicate profile-management operation rows",
+                ));
+            }
+        }
+    }
+    if selected.as_ref().is_some_and(|receipt| {
+        receipt.graph_identity_digest != graph_identity_digest
+            || receipt.operation_id != operation_id
+    }) {
+        return Err(OmniError::manifest_internal(
+            "profile-management lookup returned a row for another operation scope",
+        ));
+    }
+    Ok(selected)
+}
+
+/// Stage one immutable receipt insertion without advancing Lance HEAD.
+///
+/// `WhenMatched::Fail` is load-bearing: an operation id can never be rebound to
+/// another request/result. Exact retries perform [`lookup_profile_management_receipt`]
+/// before staging.
+pub(crate) async fn stage_profile_management_receipt(
+    dataset: Dataset,
+    authority: &StreamTokenAuthorityEntry,
+    receipt: &ProfileManagementReceipt,
+) -> Result<crate::table_store::StagedWrite> {
+    validate_exact_dataset(&dataset, authority).await?;
+    let batch = profile_management_receipt_to_batch(receipt)?;
+    let schema = batch.schema();
+    let reader = RecordBatchIterator::new(vec![Ok(batch)], schema);
+    let stream = lance_datafusion::utils::reader_to_stream(Box::new(reader));
+    let mut builder =
+        MergeInsertBuilder::try_new(Arc::new(dataset.clone()), vec!["id".to_string()])
+            .map_err(|error| OmniError::Lance(error.to_string()))?;
+    builder
+        .when_matched(WhenMatched::Fail)
+        .when_not_matched(WhenNotMatched::InsertAll)
+        .use_index(false)
+        .conflict_retries(0)
+        .source_dedupe_behavior(SourceDedupeBehavior::FirstSeen);
+    let uncommitted = builder
+        .try_build()
+        .map_err(|error| OmniError::Lance(error.to_string()))?
+        .execute_uncommitted(stream)
+        .await
+        .map_err(|error| OmniError::Lance(error.to_string()))?;
+    if uncommitted.transaction.read_version != authority.current_head_witness.table_version {
+        return Err(OmniError::manifest_internal(format!(
+            "profile-management staged transaction read version {} does not match manifest-selected version {}",
+            uncommitted.transaction.read_version, authority.current_head_witness.table_version
+        )));
+    }
+    crate::table_store::staged_exact_id_upsert_result(
+        &dataset,
+        uncommitted,
+        1,
+        "stage_profile_management_receipt",
+    )
 }
 
 /// Stage one exact-`id` current-token upsert without advancing Lance HEAD.
@@ -851,7 +1129,17 @@ pub(super) async fn initialize_stream_token_authority(
         session: Some(Arc::clone(control_session)),
         ..Default::default()
     };
-    let dataset = Dataset::write(reader, &stream_token_uri(root_uri), Some(params))
+    let mut dataset = Dataset::write(reader, &stream_token_uri(root_uri), Some(params))
+        .await
+        .map_err(|error| OmniError::Lance(error.to_string()))?;
+    dataset
+        .create_index(
+            &["record_lookup_key"],
+            IndexType::BTree,
+            Some("stream_control_record_lookup_v1".to_string()),
+            &ScalarIndexParams::default(),
+            true,
+        )
         .await
         .map_err(|error| OmniError::Lance(error.to_string()))?;
     stream_token_authority_entry_for_dataset(&dataset).await
@@ -866,7 +1154,7 @@ pub(crate) async fn stream_token_authority_entry_for_dataset(
     let actual_schema: Schema = dataset.schema().into();
     if &actual_schema != stream_token_schema().as_ref() {
         return Err(OmniError::manifest_internal(
-            "cannot publish a stream-token dataset with a non-v1 schema",
+            "cannot publish a stream-token dataset with a non-v2 schema",
         ));
     }
     let entry = StreamTokenAuthorityEntry {
@@ -934,7 +1222,7 @@ async fn validate_exact_dataset(
     let actual_schema: Schema = dataset.schema().into();
     if &actual_schema != stream_token_schema().as_ref() {
         return Err(OmniError::manifest_internal(
-            "manifest-selected stream-token dataset has a schema different from its v1 authority",
+            "manifest-selected stream-token dataset has a schema different from its v2 authority",
         ));
     }
     let actual = capture_exact_head_witness(dataset).await?;
@@ -1027,6 +1315,10 @@ fn validate_head_witness(witness: &CurrentHeadWitness) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::db::manifest::stream_profile::{
+        FoldDelegation, ProfileManagementResult, ReceiptChainRef, StreamProfileMode,
+        StreamProfileState, stream_profile_management_request_digest,
+    };
     use crate::db::manifest::stream_token::{
         PayloadDigest, StreamRowOrigin, StreamTokenInput, TrustedContributorId,
     };
@@ -1072,22 +1364,95 @@ mod tests {
         authority_row_for("person:17", "actor:alice")
     }
 
+    fn profile_receipt(operation_id: &str) -> ProfileManagementReceipt {
+        let prior_chain = ReceiptChainRef::genesis();
+        let delegation = FoldDelegation::issue(
+            "11111111-1111-4111-8111-111111111111",
+            format!("sha256:{}", "a".repeat(64)),
+            "config-1",
+            format!("sha256:{}", "b".repeat(64)),
+            2,
+            "operator:alice",
+            1_700_000_000_000_000,
+        )
+        .unwrap();
+        let result = ProfileManagementResult::new(
+            2,
+            2,
+            StreamProfileState::Enabled {
+                active_fold_delegation: delegation,
+            },
+            0,
+            format!("sha256:{}", "c".repeat(64)),
+        )
+        .unwrap();
+        let graph_identity_digest = format!("sha256:{}", "d".repeat(64));
+        let declaration_digest = format!("sha256:{}", "b".repeat(64));
+        let request_digest = stream_profile_management_request_digest(
+            &graph_identity_digest,
+            operation_id,
+            "config-1",
+            &declaration_digest,
+            1,
+            StreamProfileMode::Enabled,
+        )
+        .unwrap();
+        ProfileManagementReceipt::new(
+            graph_identity_digest,
+            &prior_chain,
+            operation_id,
+            request_digest,
+            "config-1",
+            declaration_digest,
+            "operator:alice",
+            1,
+            result,
+            1_700_000_000_000_001,
+        )
+        .unwrap()
+    }
+
     #[test]
     fn token_authority_row_batch_round_trips_exactly() {
         let row = authority_row();
         let batch = stream_token_rows_to_batch(std::slice::from_ref(&row)).unwrap();
         assert_eq!(stream_token_rows_from_batch(&batch).unwrap(), vec![row]);
+        assert_eq!(
+            required_string_array(&batch, "record_tag")
+                .unwrap()
+                .value(0),
+            CURRENT_TOKEN_RECORD_TAG
+        );
+        assert!(
+            required_string_array(&batch, "record_payload_json")
+                .unwrap()
+                .is_null(0)
+        );
+    }
+
+    #[test]
+    fn profile_receipt_batch_is_disjoint_and_round_trips_exactly() {
+        let receipt = profile_receipt("profile-operation-1");
+        let batch = profile_management_receipt_to_batch(&receipt).unwrap();
+        assert_eq!(
+            profile_management_receipts_from_batch(&batch).unwrap(),
+            vec![receipt]
+        );
+        let error = stream_token_rows_from_batch(&batch).unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("current-token decoder received trusted record tag"),
+            "{error}"
+        );
     }
 
     #[test]
     fn token_plan_bounds_fail_loudly_for_arrow_and_recovery_json() {
         let row = authority_row();
-        let arrow_error = validate_stream_token_plan_bounds_with_limits(
-            std::slice::from_ref(&row),
-            1,
-            u64::MAX,
-        )
-        .unwrap_err();
+        let arrow_error =
+            validate_stream_token_plan_bounds_with_limits(std::slice::from_ref(&row), 1, u64::MAX)
+                .unwrap_err();
         assert!(
             matches!(
                 arrow_error,
@@ -1100,12 +1465,9 @@ mod tests {
             "{arrow_error:?}"
         );
 
-        let json_error = validate_stream_token_plan_bounds_with_limits(
-            std::slice::from_ref(&row),
-            u64::MAX,
-            1,
-        )
-        .unwrap_err();
+        let json_error =
+            validate_stream_token_plan_bounds_with_limits(std::slice::from_ref(&row), u64::MAX, 1)
+                .unwrap_err();
         assert!(
             matches!(
                 json_error,
@@ -1198,6 +1560,68 @@ mod tests {
                 .await
                 .unwrap(),
             Some(row)
+        );
+    }
+
+    #[tokio::test]
+    async fn staged_profile_receipt_is_immutable_and_receipt_first_lookup_is_exact() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().to_str().unwrap();
+        let session = crate::lance_access::control_session();
+        let authority = initialize_stream_token_authority(root, &session)
+            .await
+            .unwrap();
+        let dataset = open_stream_token_authority_at(root, &authority, &session)
+            .await
+            .unwrap();
+        assert!(
+            dataset
+                .load_indices()
+                .await
+                .unwrap()
+                .iter()
+                .any(|index| index.name == "stream_control_record_lookup_v1"),
+            "v2 initializes the scalar receipt lookup index before manifest selection"
+        );
+        let receipt = profile_receipt("profile-operation-1");
+        assert!(
+            lookup_profile_management_receipt(
+                &dataset,
+                &authority,
+                &receipt.graph_identity_digest,
+                &receipt.operation_id,
+            )
+            .await
+            .unwrap()
+            .is_none()
+        );
+        let staged = stage_profile_management_receipt(dataset.clone(), &authority, &receipt)
+            .await
+            .unwrap();
+        assert_eq!(dataset.count_rows(None).await.unwrap(), 0);
+        let store = crate::table_store::TableStore::new(root, Arc::clone(&session));
+        let (achieved, _) = store
+            .commit_staged_exact(Arc::new(dataset), staged)
+            .await
+            .unwrap();
+        let next = stream_token_authority_entry_for_dataset(&achieved)
+            .await
+            .unwrap();
+        assert_eq!(
+            lookup_profile_management_receipt(
+                &achieved,
+                &next,
+                &receipt.graph_identity_digest,
+                &receipt.operation_id,
+            )
+            .await
+            .unwrap(),
+            Some(receipt.clone())
+        );
+        let duplicate = stage_profile_management_receipt(achieved, &next, &receipt).await;
+        assert!(
+            duplicate.is_err(),
+            "WhenMatched::Fail must make immutable receipt rebinding impossible"
         );
     }
 }

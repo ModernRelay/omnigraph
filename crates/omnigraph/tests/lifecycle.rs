@@ -3,6 +3,7 @@ mod helpers;
 use std::fs;
 
 use omnigraph::db::{InitOptions, Omnigraph, ReadTarget};
+use omnigraph::error::OmniError;
 use omnigraph_compiler::schema::parser::parse_schema;
 use omnigraph_compiler::{
     SchemaIR, SchemaIdentityDomain, compile_schema_shape, resolve_schema_ir, schema_ir_hash,
@@ -892,11 +893,13 @@ node Task {
     );
 }
 
-/// RFC-026 §4.7 P1 through the public surface: a fresh graph reports
-/// streaming disabled; the Cedar-gated flip is durable, revision-advancing,
-/// version-minting, and idempotent; disable-when-clean converges.
+/// The embedded/direct-store surface cannot forge cluster ownership.
+///
+/// Profile transitions are owned by checked cluster apply. The retired
+/// ambient boolean API must refuse both targets without moving any live or
+/// historical branch view.
 #[tokio::test]
-async fn streaming_flag_flips_are_durable_idempotent_and_versioned() {
+async fn ambient_streaming_flip_requires_cluster_control_plane() {
     let dir = tempfile::tempdir().unwrap();
     let mut db = init_and_load(&dir).await;
     db.branch_create("feature").await.unwrap();
@@ -919,73 +922,43 @@ async fn streaming_flag_flips_are_durable_idempotent_and_versioned() {
     assert!(!status.enabled, "fresh graphs are born with streaming off");
     assert!(!status.undrained, "fresh graphs hold no stream state");
 
-    // Enable: one new manifest version, revision advances from genesis 1 → 2.
-    let enabled = db
-        .set_streaming_enabled_as(true, Some("act-ops"))
-        .await
-        .unwrap();
-    assert!(enabled.changed);
-    assert!(enabled.streaming_enabled);
-    assert_eq!(enabled.profile_revision, 2);
-    assert_eq!(enabled.manifest_version, before.version() + 1);
-    assert!(
+    for enabled in [true, false] {
+        assert!(matches!(
+            db.set_streaming_enabled_as(enabled, Some("act-ops")).await,
+            Err(OmniError::StreamingRequiresClusterControlPlane)
+        ));
+    }
+    assert_eq!(
         db.snapshot_of(ReadTarget::branch("main"))
+            .await
+            .unwrap()
+            .version(),
+        before.version(),
+        "an ambient request must be effect-free"
+    );
+    assert!(
+        !db.snapshot_of(ReadTarget::branch("main"))
             .await
             .unwrap()
             .streaming_status()
             .enabled
     );
     assert!(
-        db.snapshot_of(ReadTarget::branch("feature"))
-            .await
-            .unwrap()
-            .streaming_status()
-            .enabled,
-        "a live named-branch snapshot must project canonical-main profile authority"
-    );
-    assert!(
-        branch_reader
-            .snapshot_of(ReadTarget::branch("feature"))
-            .await
-            .unwrap()
-            .streaming_status()
-            .enabled,
-        "a warm named-branch reader must observe an external main profile flip"
-    );
-    assert!(
-        !db.snapshot_of(ReadTarget::Snapshot(historical_feature.clone()))
-            .await
-            .unwrap()
-            .streaming_status()
-            .enabled,
-        "an explicitly pinned historical snapshot must retain its captured profile"
-    );
-
-    // Idempotent re-enable: no new manifest version, no revision movement.
-    let noop = db
-        .set_streaming_enabled_as(true, Some("act-ops"))
-        .await
-        .unwrap();
-    assert!(!noop.changed);
-    assert_eq!(noop.profile_revision, 2);
-    assert_eq!(noop.manifest_version, enabled.manifest_version);
-
-    // Disable-when-clean converges (no stream state exists to drain).
-    let disabled = db
-        .set_streaming_enabled_as(false, Some("act-ops"))
-        .await
-        .unwrap();
-    assert!(disabled.changed);
-    assert!(!disabled.streaming_enabled);
-    assert_eq!(disabled.profile_revision, 3);
-    assert_eq!(disabled.manifest_version, enabled.manifest_version + 1);
-    assert!(
         !db.snapshot_of(ReadTarget::branch("feature"))
             .await
             .unwrap()
             .streaming_status()
             .enabled,
-        "a live named branch must also observe canonical-main disablement"
+        "a named-branch view must remain disabled"
+    );
+    assert!(
+        !branch_reader
+            .snapshot_of(ReadTarget::branch("feature"))
+            .await
+            .unwrap()
+            .streaming_status()
+            .enabled,
+        "a warm named-branch reader must remain disabled"
     );
     assert!(
         !db.snapshot_of(ReadTarget::Snapshot(historical_feature))
@@ -993,10 +966,9 @@ async fn streaming_flag_flips_are_durable_idempotent_and_versioned() {
             .unwrap()
             .streaming_status()
             .enabled,
-        "later profile flips must not rewrite historical snapshot semantics"
+        "a pinned historical view must remain disabled"
     );
 
-    // Durable across a cold reopen.
     drop(db);
     let reopened = Omnigraph::open(dir.path().to_str().unwrap()).await.unwrap();
     let status = reopened
@@ -1008,9 +980,8 @@ async fn streaming_flag_flips_are_durable_idempotent_and_versioned() {
     assert!(!status.undrained);
 }
 
-/// RFC-026 §4.6/§4.7: read-only stream status projects the durable authority
-/// and exposes the compare tokens that future management verbs (fold,
-/// quiesce, resume) pass back as their expected revisions.
+/// RFC-026 §4.6/§4.7: read-only stream status projects the exact durable mode
+/// and compare tokens without acquiring control-plane authority.
 #[tokio::test]
 async fn stream_status_projects_durable_authority_and_compare_tokens() {
     let dir = tempfile::tempdir().unwrap();
@@ -1019,18 +990,11 @@ async fn stream_status_projects_durable_authority_and_compare_tokens() {
     // A graph with streaming off and no enrollment reports exactly that —
     // not an error, and not an empty struct that hides the flag.
     let status = db.stream_status().await.unwrap();
+    assert_eq!(status.profile_mode, "DISABLED");
     assert!(!status.streaming_enabled);
     assert_eq!(status.profile_revision, 1, "genesis profile revision");
     assert!(status.tables.is_empty(), "no lane exists before enrollment");
     assert!(!status.undrained());
-
-    // The enablement flag is visible immediately, with its own revision
-    // (distinct from any per-lane lifecycle revision).
-    db.set_streaming_enabled_as(true, None).await.unwrap();
-    let status = db.stream_status().await.unwrap();
-    assert!(status.streaming_enabled);
-    assert_eq!(status.profile_revision, 2);
-    assert!(status.tables.is_empty());
 
     // Status is read-only: observing it neither moves the profile revision
     // nor mints a graph commit.

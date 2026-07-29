@@ -298,8 +298,10 @@ impl GraphNamespacePublisher {
         let mut known_tables = known_tables.clone();
         let mut rows = Vec::with_capacity(changes.len());
         let mut lifecycle_changes = HashMap::<TableIdentity, ()>::new();
-        let mut token_authority_changed = false;
+        let mut token_authority_change_seen = false;
+        let mut token_authority_advanced = false;
         let mut stream_profile_changed = false;
+        let mut stream_profile_receipt_chain_advanced = false;
         let mut max_tombstones = HashMap::<TableIdentity, u64>::new();
         for (identity, version) in existing_tombstones.keys() {
             max_tombstones
@@ -701,12 +703,12 @@ impl GraphNamespacePublisher {
                             Some(existing_stream_token_authority.to_metadata_json()?),
                         ));
                     }
-                    if token_authority_changed {
+                    if token_authority_change_seen {
                         return Err(OmniError::manifest(
                             "manifest batch changes stream-token authority more than once",
                         ));
                     }
-                    token_authority_changed = true;
+                    token_authority_change_seen = true;
                     if next == existing_stream_token_authority {
                         continue;
                     }
@@ -719,6 +721,7 @@ impl GraphNamespacePublisher {
                             next.current_head_witness.table_version
                         )));
                     }
+                    token_authority_advanced = true;
                     rows.push(PendingVersionRow {
                         object_id: stream_token_authority_object_id().to_string(),
                         object_type: OBJECT_TYPE_STREAM_TOKEN_AUTHORITY.to_string(),
@@ -750,12 +753,9 @@ impl GraphNamespacePublisher {
                     if next == existing_stream_profile {
                         continue;
                     }
-                    if next.profile_revision <= expected.profile_revision {
-                        return Err(OmniError::manifest(format!(
-                            "stream profile revision must advance strictly from {}, got {}",
-                            expected.profile_revision, next.profile_revision
-                        )));
-                    }
+                    next.validate_transition_from(expected)?;
+                    stream_profile_receipt_chain_advanced =
+                        next.profile_receipt_chain != expected.profile_receipt_chain;
                     rows.push(PendingVersionRow {
                         object_id: next.object_id().to_string(),
                         object_type: OBJECT_TYPE_STREAM_PROFILE.to_string(),
@@ -769,6 +769,11 @@ impl GraphNamespacePublisher {
                     });
                 }
             }
+        }
+        if stream_profile_receipt_chain_advanced && !token_authority_advanced {
+            return Err(OmniError::manifest(
+                "a receipt-bearing stream-profile transition must advance stream-token authority in the same manifest batch",
+            ));
         }
 
         Ok(rows)

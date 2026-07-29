@@ -17,8 +17,9 @@ use std::env;
 use std::fs;
 
 use omnigraph_cluster::{
-    apply_config_dir, import_config_dir, read_serving_snapshot,
-    read_serving_snapshot_from_storage, status_config_dir, validate_config_dir,
+    ApplyOptions, apply_config_dir, apply_config_dir_with_options, import_config_dir,
+    read_serving_snapshot, read_serving_snapshot_from_storage, status_config_dir,
+    validate_config_dir,
 };
 use ulid::Ulid;
 
@@ -95,7 +96,14 @@ async fn s3_cluster_full_lifecycle_import_apply_serve_evolve_delete() {
         status.state_observations
     );
 
-    let apply = apply_config_dir(dir.path()).await;
+    let apply = apply_config_dir_with_options(
+        dir.path(),
+        ApplyOptions {
+            actor: Some("e2e-operator".to_string()),
+            confirm_stream_offline: true,
+        },
+    )
+    .await;
     assert!(apply.ok && apply.converged, "{:?}", apply.diagnostics);
 
     // Nothing stored locally: the config dir holds only declared sources.

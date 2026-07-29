@@ -77,10 +77,14 @@ use crate::error::{OmniError, Result};
 ///   boundary by export/init/load rebuild: v9 decoders silently skip unknown
 ///   row kinds, so only the stamp can make an older binary refuse a
 ///   streaming-capable graph instead of writing blind to the flag.
+/// - v11 — RFC-026 §4.7 F2 replaces the boolean stream-profile payload with
+///   discriminated `DISABLED | ENABLED | DISABLING | RETIRED` authority and
+///   upgrades `_stream_tokens.lance` to the tagged current-token/control-ledger
+///   schema. Profile changes use recovery-v13 and immutable management receipts.
 ///
-/// v1–v9 graphs are not served by this binary (see `MIN_SUPPORTED`); the history
+/// v1–v10 graphs are not served by this binary (see `MIN_SUPPORTED`); the history
 /// is kept for provenance and to document what each stamp value meant.
-pub(crate) const INTERNAL_MANIFEST_SCHEMA_VERSION: u32 = 10;
+pub(crate) const INTERNAL_MANIFEST_SCHEMA_VERSION: u32 = 11;
 
 /// The oldest on-disk internal-schema stamp this binary will open. With no
 /// in-place migration, this equals `INTERNAL_MANIFEST_SCHEMA_VERSION`: a graph
@@ -99,7 +103,7 @@ pub(crate) const MIN_SUPPORTED_INTERNAL_SCHEMA_VERSION: u32 = INTERNAL_MANIFEST_
 /// stamped each version (verify with
 /// `git show vX.Y.Z:crates/omnigraph/src/db/manifest/migrations.rs`):
 /// v1 ≤ 0.3.1, v2 0.4.1–0.6.1, v3 0.6.2–0.7.2, v4 0.8.x, v5–v8 unreleased,
-/// v9 0.9.x, v10 unreleased (0.10.0-dev pending the 0.10.0 release).
+/// v9 0.9.x, v10–v11 unreleased (0.10.0-dev pending the 0.10.0 release).
 ///
 /// v5 through v8 never reached a published release: the format advanced five
 /// times (RFC-028 identity, RFC-023 key fencing, and the three RFC-026 stream
@@ -124,11 +128,11 @@ pub(crate) fn release_for_internal_schema_version(stamp: u32) -> &'static str {
         // The published line whose binaries serve v9 — the string the gated
         // v9↔v10 crossversion fence asserts inside the v10 refusal message.
         9 => "0.9.x",
-        // Unreachable in refusals while CURRENT == 10 (the sub-floor path
-        // consults 1–9 only; the ceiling path never consults the map). It
+        // Unreachable in refusals while CURRENT == 11 (the sub-floor path
+        // consults 1–10 only; the ceiling path never consults the map). It
         // exists for the table's honesty and the next bump; release-prep for
         // 0.10.0 flips it to "0.10.x".
-        10 => "0.10.0-dev",
+        10..=11 => "0.10.0-dev",
         // Worded to read naturally after "created by omnigraph " if a future
         // bump ever leaves a gap.
         _ => "an unrecognized older release",
@@ -208,12 +212,12 @@ mod tests {
     use super::*;
 
     /// The guard accepts exactly the single served version and refuses anything
-    /// below the floor or above the ceiling. With `MIN == CURRENT == 10` the
-    /// live range is exactly `[10, 10]`.
+    /// below the floor or above the ceiling. With `MIN == CURRENT == 11` the
+    /// live range is exactly `[11, 11]`.
     #[test]
     fn unsupported_guard_accepts_exactly_the_supported_range() {
-        assert_eq!(INTERNAL_MANIFEST_SCHEMA_VERSION, 10);
-        assert_eq!(MIN_SUPPORTED_INTERNAL_SCHEMA_VERSION, 10);
+        assert_eq!(INTERNAL_MANIFEST_SCHEMA_VERSION, 11);
+        assert_eq!(MIN_SUPPORTED_INTERNAL_SCHEMA_VERSION, 11);
         for stamp in MIN_SUPPORTED_INTERNAL_SCHEMA_VERSION..=INTERNAL_MANIFEST_SCHEMA_VERSION {
             assert!(
                 refuse_if_stamp_unsupported(stamp).is_ok(),
@@ -246,6 +250,7 @@ mod tests {
         }
         assert_eq!(release_for_internal_schema_version(9), "0.9.x");
         assert_eq!(release_for_internal_schema_version(10), "0.10.0-dev");
+        assert_eq!(release_for_internal_schema_version(11), "0.10.0-dev");
         assert_eq!(
             release_for_internal_schema_version(99),
             "an unrecognized older release"
@@ -270,11 +275,28 @@ mod tests {
         // map edit that changes them must break HERE, locally and unskippably,
         // not only in the env-gated CI cell (the #387 failure class).
         let v9_err = refuse_if_stamp_unsupported(9).unwrap_err().to_string();
-        assert!(v9_err.contains("created by omnigraph 0.9.x"), "got: {v9_err}");
+        assert!(
+            v9_err.contains("created by omnigraph 0.9.x"),
+            "got: {v9_err}"
+        );
         assert!(
             v9_err.contains("with an omnigraph 0.9.x binary"),
             "got: {v9_err}"
         );
         assert!(v9_err.contains("omnigraph export"), "got: {v9_err}");
+
+        // The v10 refusal strings are also asserted by the genuine-binary
+        // v10↔v11 seam (`OMNIGRAPH_V10_BIN`). Keep a local, unskippable guard
+        // so release-map drift fails before reaching the historical-binary job.
+        let v10_err = refuse_if_stamp_unsupported(10).unwrap_err().to_string();
+        assert!(
+            v10_err.contains("created by omnigraph 0.10.0-dev"),
+            "got: {v10_err}"
+        );
+        assert!(
+            v10_err.contains("with an omnigraph 0.10.0-dev binary"),
+            "got: {v10_err}"
+        );
+        assert!(v10_err.contains("omnigraph export"), "got: {v10_err}");
     }
 }

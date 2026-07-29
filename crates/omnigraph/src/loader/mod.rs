@@ -84,6 +84,36 @@ pub async fn load_jsonl_file(db: &Omnigraph, path: &str, mode: LoadMode) -> Resu
 }
 
 impl Omnigraph {
+    fn normalize_load_scope(
+        branch: &str,
+        base: Option<&str>,
+    ) -> Result<(Option<String>, Option<String>)> {
+        crate::db::ensure_public_branch_ref(branch, "load")?;
+        // Branch convention: `None` represents `main`. A requested base keeps
+        // the explicit "main" spelling because it is also returned in the DTO.
+        let requested = Self::normalize_branch_name(branch)?;
+        let base_branch = match base {
+            Some(base) => {
+                Some(Self::normalize_branch_name(base)?.unwrap_or_else(|| "main".to_string()))
+            }
+            None => None,
+        };
+        Ok((requested, base_branch))
+    }
+
+    async fn heal_load_scope_before_profile_gate(
+        &self,
+        requested: Option<&str>,
+        base_branch: Option<&str>,
+    ) -> Result<()> {
+        let mut recovery_branches = vec![requested];
+        if let Some(base) = base_branch {
+            recovery_branches.push(Some(base));
+        }
+        self.heal_pending_recovery_sidecars_for_write(&recovery_branches)
+            .await
+    }
+
     #[deprecated(
         note = "use `load_as` with an explicit `base` instead; the ingest family will be removed in a future release"
     )]
@@ -116,16 +146,7 @@ impl Omnigraph {
         let result = self
             .load_as(branch, Some(from.unwrap_or("main")), data, mode, actor_id)
             .await?;
-        Ok(IngestResult {
-            branch: result.branch.clone(),
-            base_branch: result
-                .base_branch
-                .clone()
-                .unwrap_or_else(|| "main".to_string()),
-            branch_created: result.branch_created,
-            mode,
-            tables: result.to_ingest_tables(),
-        })
+        Ok(result.into_ingest_result(mode))
     }
 
     #[deprecated(
@@ -153,9 +174,10 @@ impl Omnigraph {
         mode: LoadMode,
         actor_id: Option<&str>,
     ) -> Result<IngestResult> {
-        let data = std::fs::read_to_string(path).map_err(OmniError::Io)?;
-        #[allow(deprecated)]
-        self.ingest_as(branch, from, &data, mode, actor_id).await
+        let result = self
+            .load_file_as(branch, Some(from.unwrap_or("main")), path, mode, actor_id)
+            .await?;
+        Ok(result.into_ingest_result(mode))
     }
 
     pub async fn load(&self, branch: &str, data: &str, mode: LoadMode) -> Result<LoadResult> {
@@ -188,40 +210,33 @@ impl Omnigraph {
             &omnigraph_policy::ResourceScope::Branch(branch.to_string()),
             actor_id,
         )?;
-        // Reject internal `__run__*` / system-prefixed branches at the
-        // public write boundary. Direct-publish paths assert this
-        // explicitly so a caller can't write to legacy or system
-        // staging branches by passing the prefix verbatim.
-        crate::db::ensure_public_branch_ref(branch, "load")?;
-        // Branch convention: `None` represents `main`. Re-normalizing to
-        // `Some("main")` here would route the publisher commit through a
-        // separate coordinator (the cross-branch path in
-        // `commit_prepared_updates_on_branch_with_expected`) and leave
-        // `self.coordinator` with a stale manifest snapshot.
-        let requested = Self::normalize_branch_name(branch)?;
-        let base_branch = match base {
-            Some(base) => {
-                Some(Self::normalize_branch_name(base)?.unwrap_or_else(|| "main".to_string()))
-            }
-            None => None,
-        };
+        let (requested, base_branch) = Self::normalize_load_scope(branch, base)?;
+        // Recovery-v13 takes the profile gate exclusively. Complete the broad
+        // write-entry heal before acquiring a shared profile window.
+        self.heal_load_scope_before_profile_gate(requested.as_deref(), base_branch.as_deref())
+            .await?;
+        // Root-shared, graph-global admission for the future stream-profile
+        // preflight. Revalidate durable authority after acquisition and keep
+        // this guard across implicit branch creation, every load attempt,
+        // physical effects, and publication.
+        let _stream_profile_guard = self.write_queue().acquire_stream_profile_shared().await;
+        self.ensure_streaming_content_write_authorized().await?;
+        self.load_as_inner(requested, base_branch, data, mode, actor_id)
+            .await
+    }
+
+    async fn load_as_inner(
+        &self,
+        requested: Option<String>,
+        base_branch: Option<String>,
+        data: &str,
+        mode: LoadMode,
+        actor_id: Option<&str>,
+    ) -> Result<LoadResult> {
         // Schema/catalog authority is captured once via the `WriteTxn` (plus its
         // cheap trailing identity-marker fence); the only second full validation
         // is the required pre-effect recheck under gates. Per-table resolution
         // performs no additional contract reads.
-        //
-        // Stage A precedes both an implicit target-branch fork and data staging.
-        // The target branch and an explicit base are read/write authority for the
-        // operation, so an unresolved intent on either closes the barrier. The
-        // helper folds `Some("main")` to main's canonical `None` identity.
-        let mut recovery_branches = vec![requested.as_deref()];
-        if base.is_some() {
-            // `base_branch` retains `Some("main")` for the result DTO; the
-            // barrier helper canonicalizes it to main's `None` identity.
-            recovery_branches.push(base_branch.as_deref());
-        }
-        self.heal_pending_recovery_sidecars_for_write(&recovery_branches)
-            .await?;
         // Fork-if-missing only when a base branch was explicitly given.
         // `requested == None` is `main`, which always exists.
         let mut branch_created = false;
@@ -234,7 +249,7 @@ impl Omnigraph {
                 // bypass BranchCreate enforcement when policy is installed —
                 // the footgun guard catches that case too, but threading is
                 // the correct fix.
-                self.branch_create_from_as(
+                self.branch_create_from_as_after_recovery_barrier(
                     crate::db::ReadTarget::branch(base_name),
                     target,
                     actor_id,
@@ -259,9 +274,10 @@ impl Omnigraph {
         self.load_file_as(branch, None, path, mode, None).await
     }
 
-    /// Read a file into memory and delegate to `load_as`. Used by the
-    /// CLI's `omnigraph load` so file-path-based writes flow through
-    /// the same engine-layer policy gate as in-memory `load_as` calls.
+    /// Read a file into memory and run the same inner load as `load_as`.
+    /// Used by the CLI's `omnigraph load` so file-path-based writes flow
+    /// through the same engine-layer policy gate and hold one graph-profile
+    /// guard from before file I/O through publication.
     pub async fn load_file_as(
         &self,
         branch: &str,
@@ -270,8 +286,19 @@ impl Omnigraph {
         mode: LoadMode,
         actor_id: Option<&str>,
     ) -> Result<LoadResult> {
+        self.enforce(
+            omnigraph_policy::PolicyAction::Change,
+            &omnigraph_policy::ResourceScope::Branch(branch.to_string()),
+            actor_id,
+        )?;
+        let (requested, base_branch) = Self::normalize_load_scope(branch, base)?;
+        self.heal_load_scope_before_profile_gate(requested.as_deref(), base_branch.as_deref())
+            .await?;
+        let _stream_profile_guard = self.write_queue().acquire_stream_profile_shared().await;
+        self.ensure_streaming_content_write_authorized().await?;
         let data = std::fs::read_to_string(path).map_err(OmniError::Io)?;
-        self.load_as(branch, base, &data, mode, actor_id).await
+        self.load_as_inner(requested, base_branch, &data, mode, actor_id)
+            .await
     }
 
     async fn load_direct_on_branch(
@@ -296,6 +323,17 @@ impl LoadMode {
 }
 
 impl LoadResult {
+    fn into_ingest_result(self, mode: LoadMode) -> IngestResult {
+        let tables = self.to_ingest_tables();
+        IngestResult {
+            branch: self.branch,
+            base_branch: self.base_branch.unwrap_or_else(|| "main".to_string()),
+            branch_created: self.branch_created,
+            mode,
+            tables,
+        }
+    }
+
     pub fn to_ingest_tables(&self) -> Vec<IngestTableResult> {
         let mut tables = self
             .nodes_loaded
@@ -345,7 +383,7 @@ async fn load_jsonl_data(
                     branch = branch.unwrap_or("main"),
                     "prepared load authority changed before effects; repreparing"
                 );
-                db.refresh().await?;
+                db.refresh_pre_effect_write_attempt().await?;
             }
             result => return result,
         }
@@ -2235,7 +2273,7 @@ edge WorksAt: Person -> Company
     async fn test_ingest_creates_branch_and_reports_tables() {
         let dir = tempfile::tempdir().unwrap();
         let uri = dir.path().to_str().unwrap();
-        let mut db = Omnigraph::init(uri, TEST_SCHEMA).await.unwrap();
+        let db = Omnigraph::init(uri, TEST_SCHEMA).await.unwrap();
 
         let result = db
             .ingest("feature", Some("main"), TEST_DATA, LoadMode::Overwrite)
@@ -2355,7 +2393,7 @@ edge WorksAt: Person -> Company
     async fn test_ingest_as_stamps_actor_on_branch_head_commit() {
         let dir = tempfile::tempdir().unwrap();
         let uri = dir.path().to_str().unwrap();
-        let mut db = Omnigraph::init(uri, TEST_SCHEMA).await.unwrap();
+        let db = Omnigraph::init(uri, TEST_SCHEMA).await.unwrap();
 
         db.ingest_as(
             "feature",

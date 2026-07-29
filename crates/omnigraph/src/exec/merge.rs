@@ -3117,6 +3117,14 @@ impl Omnigraph {
         self.heal_pending_recovery_sidecars_for_write(&relevant_branches)
             .await?;
         let write_queue = self.write_queue();
+        // Profile recovery may need this gate exclusively, so healing must
+        // finish first. From this point through every table effect and the
+        // graph-manifest publish, a profile transition cannot race the merge.
+        // BranchMerge has no token-aware sequencing contract, so even the
+        // served runtime cannot authorize it while ENABLED. Per-table
+        // lifecycle fencing below remains an additional defense.
+        let _profile_gate = write_queue.acquire_stream_profile_shared().await;
+        self.ensure_streaming_branch_merge_allowed().await?;
         let mut admission_keys = branch_merge_warm_stream_admission_keys(
             self.catalog().as_ref(),
             target_branch.as_deref(),

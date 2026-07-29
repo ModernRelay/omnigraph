@@ -5,10 +5,12 @@ RFC-027 research-blocked; RFC-026 Phase A implemented, private B1's legal
 near-cap closure repaired and green, private B2a unbounded retain-all gate
 implemented, the private common-B2 compare-and-chain/token-fold core
 implemented, B2b optional, activation P1 plus the Cedar vocabulary and embedded
-manifest-only status implemented, and public row streaming, lifecycle
-mutation/correction, exclusive-cut status, and transport surfaces inactive
+manifest-only status plus bounded v11/profile-v2 and recovery-v13
+profile-authority implemented, and public row streaming, production enrollment,
+enrolled-lane claim/drain, correction/retirement, exclusive-cut status, and
+transport surfaces inactive
 **Date:** 2026-07-11
-**Last updated:** 2026-07-28
+**Last updated:** 2026-07-29
 **Audience:** RFC authors, engine/storage maintainers, and release reviewers
 **Reviewed against:** OmniGraph 0.8.1; Lance 9.0.0-beta.15 at
 `f24e42c11a742581365e1cbe17c906ea2dac1bc6`; full Lance transaction,
@@ -67,9 +69,15 @@ activated internal schema v9, stream-config v3, lifecycle state-v2, trusted
 hidden row attribution, canonical payload/token digests, the
 manifest-selected graph-global `_stream_tokens.lance` authority, and
 recovery-v12 exact base-plus-token fold publication. Genuine v8↔v9
-refusal/rebuild evidence is green. Explicit production enrollment, lifecycle
-management, correction/status, authorization, and product parity remain
-specified, required, and inactive. Two RC.1 surface guards prove generic cleanup
+refusal/rebuild evidence is green. V10 added graph-profile enablement. The
+bounded v11/profile-v2 tranche now adds checked stopped/offline and runtime
+ownership, resumable `DISABLING`, fail-closed `RETIRED`, and exact
+recovery-v13 `StreamProfileChange`; the ordinary private fold stays
+byte-for-byte recovery-v12. Explicit production enrollment, enrolled-lane
+claim/drain, correction/retirement, full status, and product parity remain
+specified, required, and inactive. Their complete lifecycle family requires
+another strict format/recovery strand because it was not pre-registered under
+v11/v13. Two RC.1 surface guards prove generic cleanup
 non-ownership and the stale-writer hazard created by deleting the successor's
 empty WAL fence sentinel; neither is an implementation of reclamation.
 The local RFC-024/025 decision instruments were rerun: both remain
@@ -81,7 +89,7 @@ audit and RFC-025.
 **RFC-023 substrate evidence revalidated against:** the same beta.21 revision;
 filter-shape and conflict-order probes are recorded in RFC-023 §2. Internal
 schema v6 introduced that evidence through exact-`id` fenced production
-routing, and current v9 preserves it. Its final insertion-absence certificate/no-target-preflight route and
+routing, and current v11 preserves it. Its final insertion-absence certificate/no-target-preflight route and
 predeclared 10K/100K production series now satisfy the remaining implementation
 and acceptance gates.
 **RFC-026 substrate contract revalidated against:** RC.1 at the current revision;
@@ -102,7 +110,7 @@ so the candidate and format are research-blocked rather than accepted.
 RFC-025 Gate 0 was measured on 2026-07-17: Lance tag semantics pass, but the
 current in-manifest checkpoint-registry BTREE shape has history-sensitive
 compacted scan bytes and crosses another scan-operation boundary at 1,000
-commits. RFC-025 is therefore also research-blocked; current internal schema v9
+commits. RFC-025 is therefore also research-blocked; current internal schema v11
 still contains no retention state. The bucket-gated S3/RustFS cost cell is checked in but was
 not run for that decision.
 
@@ -517,7 +525,10 @@ Phase A then activated a main-only, unsharded, single-live-writer-process empty
 enrollment foundation in internal schema v7. Private B1 activated the bounded
 data-bearing schema-v8/config-v2 core. The private common-B2 slice activated
 schema v9/config-v3/state-v2 and recovery-v12 for exact base-plus-token fold
-publication. RFC-026 remains draft and public row streaming remains inactive.
+publication. The bounded v11/profile-v2 + recovery-v13 profile-authority
+tranche adds opaque checked control/runtime ownership and restart-stable
+`DISABLING` without changing the v12 fold. RFC-026 remains draft and public row
+streaming remains inactive.
 
 Enrollment creates persistent MemWAL metadata and `stream_state` changes the
 correctness preconditions for schema, branch, maintenance, and data operations.
@@ -550,9 +561,11 @@ internal schema v9, stream-config v3, stream-state protocol v2, and
 recovery-v12 to trusted hidden row metadata, canonical payload/token digests,
 the manifest-selected current-token participant, and exact base-plus-token fold
 publication. Genuine v8↔v9 refusal/rebuild evidence is green. Explicit
-production enrollment, persistent lifecycle management/correction/status and
-its bounded terminal receipts, authorization, and product parity remain
-inactive. The selected unbounded
+production enrollment, enrolled-lane lifecycle management/correction/status and
+its bounded terminal receipts, and product parity remain inactive. Internal
+schema v11/profile-v2 and recovery-v13 now own only checked profile changes and
+their exact receipt; the complete lifecycle family requires another strict
+strand. The selected unbounded
 B2a profile adds no storage watermark or `GraphHistoryBudget`; those mechanisms
 would belong only to a separately justified future bounded/managed profile.
 
@@ -1117,7 +1130,7 @@ protected by symmetry in either case.
 > scalar-indexed/default-v1 path still emits `None`, keyed Append remains
 > reachable in today's engine, and beta.21 still permits unfiltered Update or
 > Append to land second after a filtered Update. Internal schema v6 introduced
-> the routing closure, and current v9 preserves it: every production
+> the routing closure, and current v11 preserves it: every production
 > insertion-bearing graph path uses
 > the exact-`id`, forced-v2 keyed adapter, generic Append is test-only, and the
 > adapter verifies the emitted field-ID filter. Upstream symmetry is therefore
@@ -1243,7 +1256,7 @@ The review does not require all RFCs to land together. A safe order is:
 4. RFC-024's independent physical lookup evaluation completed on 2026-07-15:
    the exact BTREE's scan work is flat, but uncompacted RustFS cold object
    reads/bytes and compacted byte terms grow, so the format is research-blocked
-   and current production remains on internal schema v9 without table heads;
+   and current production remains on internal schema v11 without table heads;
 5. keep RFC-025 research-blocked after its 2026-07-17 Gate 0 no-go; reconsider
    only after a history-flat current-authority lookup shape or revised
    evidence-backed operational contract passes the full physical-I/O boundary,
@@ -1265,9 +1278,14 @@ The review does not require all RFCs to land together. A safe order is:
    private schema-v9/config-v3/state-v2/recovery-v12 compare-and-chain/token-fold
    core, including hidden trusted attribution, the manifest-selected
    `_stream_tokens.lance` participant, exact joint publication, and genuine
-   v8↔v9 refusal/rebuild evidence. Implement and prove explicit production
-   enrollment, revisioned lifecycle management and receipts, correction/status,
-   authorization, and SDK/CLI/HTTP/OpenAPI parity before exposing B2. Keep B2b
+   v8↔v9 refusal/rebuild evidence. Preserve the bounded
+   v11/profile-v2/recovery-v13 profile-authority tranche: opaque checked
+   stopped/offline and runtime owners, resumable `DISABLING`, fail-closed
+   `RETIRED`, exact `ProfileManagementReceipt`, and unchanged recovery-v12
+   ordinary fold. Select another strict graph/recovery strand before
+   implementing explicit production enrollment, enrolled-lane claim/drain,
+   correction/retirement, and maintenance; then prove SDK/CLI/HTTP/OpenAPI
+   parity before exposing B2. Keep B2b
    Lance-owned managed reclamation as an optional future route with its own
    evidence and format amendment. Retain the public exact enrollment receipt
    and cross-process admission seal as the gate for broader topology;

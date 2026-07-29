@@ -1656,8 +1656,9 @@ async fn table_and_stream_token_pointers_publish_in_one_manifest_cas() {
     );
 }
 
-/// RFC-026 §4.7 P1: the required genesis stream-profile singleton, its
-/// exact-entry CAS, strict revision advance, and reopen durability.
+/// RFC-026 §4.7 F2: terminal profile authority cannot move without its selected
+/// receipt participant, while the receipt-free admission cutoff remains a
+/// standalone exact-entry CAS.
 #[tokio::test]
 async fn stream_profile_genesis_cas_and_revision_rules() {
     let dir = tempfile::tempdir().unwrap();
@@ -1665,42 +1666,165 @@ async fn stream_profile_genesis_cas_and_revision_rules() {
     let catalog = build_test_catalog();
     let mut mc = ManifestCoordinator::init(uri, &catalog).await.unwrap();
 
-    // Genesis: present from manifest version one, disabled, revision 1,
-    // reserved pending-disable slot null; the public status projection agrees.
+    // Genesis: present from manifest version one, disabled, revision 1, with
+    // the canonical empty receipt-chain commitment.
     let before = mc.snapshot();
     let genesis = before.stream_profile().clone();
     assert_eq!(genesis, StreamProfileEntry::genesis());
     let status = before.streaming_status();
     assert!(!status.enabled);
     assert!(!status.undrained);
+    assert_eq!(status.profile_revision, 1);
+    assert_eq!(status.profile_mode, "DISABLED");
 
-    // Enable through the exact-entry CAS with a strict revision advance.
-    let enabled = StreamProfileEntry {
-        streaming_enabled: true,
-        disable_pending_since: None,
-        profile_revision: genesis.profile_revision + 1,
-    };
+    let graph_identity_digest = format!("sha256:{}", "a".repeat(64));
+    let declaration_digest = format!("sha256:{}", "b".repeat(64));
+    let active_delegation = FoldDelegation::issue(
+        "11111111-1111-4111-8111-111111111111",
+        format!("sha256:{}", "c".repeat(64)),
+        "config-1",
+        declaration_digest.clone(),
+        2,
+        "operator:alice",
+        1_700_000_000_000_000,
+    )
+    .unwrap();
+    let request_digest = stream_profile_management_request_digest(
+        &graph_identity_digest,
+        "enable-profile-test",
+        "config-1",
+        &declaration_digest,
+        genesis.profile_revision,
+        StreamProfileMode::Enabled,
+    )
+    .unwrap();
+    let result = ProfileManagementResult::new(
+        mc.version() + 1,
+        2,
+        StreamProfileState::Enabled {
+            active_fold_delegation: active_delegation.clone(),
+        },
+        0,
+        format!("sha256:{}", "d".repeat(64)),
+    )
+    .unwrap();
+    let receipt = ProfileManagementReceipt::new(
+        &graph_identity_digest,
+        &genesis.profile_receipt_chain,
+        "enable-profile-test",
+        request_digest,
+        "config-1",
+        &declaration_digest,
+        "operator:alice",
+        genesis.profile_revision,
+        result,
+        1_700_000_000_000_001,
+    )
+    .unwrap();
+    let enabled = StreamProfileEntry::enabled_from(
+        &genesis,
+        receipt.next_chain_ref().unwrap(),
+        active_delegation.clone(),
+    )
+    .unwrap();
+
+    // A terminal transition cannot publish its receipt-chain commitment
+    // without selecting the exact receipt-bearing token-ledger HEAD.
+    let unpaired = mc
+        .commit_changes(&[ManifestChange::SetStreamProfile {
+            expected: genesis.clone(),
+            next: enabled.clone(),
+        }])
+        .await
+        .unwrap_err();
+    assert!(
+        unpaired
+            .to_string()
+            .contains("must advance stream-token authority in the same manifest batch"),
+        "got: {unpaired}"
+    );
+    assert_eq!(mc.version(), before.version());
+    assert_eq!(mc.snapshot().stream_profile(), &genesis);
+
+    let expected_token = mc.snapshot().stream_token_authority().clone();
+    let token_dataset = mc.snapshot().open_stream_token_authority().await.unwrap();
+    let staged = token_store::stage_profile_management_receipt(
+        token_dataset.clone(),
+        &expected_token,
+        &receipt,
+    )
+    .await
+    .unwrap();
+    let store = crate::table_store::TableStore::new(uri, crate::lance_access::control_session());
+    let (achieved, _) = store
+        .commit_staged_exact(Arc::new(token_dataset), staged)
+        .await
+        .unwrap();
+    let next_token = token_store::stream_token_authority_entry_for_dataset(&achieved)
+        .await
+        .unwrap();
+
+    // Terminal profile authority and its immutable receipt participant become
+    // authoritative in one manifest CAS.
     let manifest_before = mc.version();
-    mc.commit_changes(&[ManifestChange::SetStreamProfile {
-        expected: genesis.clone(),
-        next: enabled.clone(),
-    }])
+    mc.commit_changes(&[
+        ManifestChange::SetStreamTokenAuthority {
+            expected: expected_token,
+            next: next_token.clone(),
+        },
+        ManifestChange::SetStreamProfile {
+            expected: genesis.clone(),
+            next: enabled.clone(),
+        },
+    ])
     .await
     .unwrap();
     assert_eq!(mc.version(), manifest_before + 1);
     let after = mc.snapshot();
     assert_eq!(after.stream_profile(), &enabled);
+    assert_eq!(after.stream_token_authority(), &next_token);
     assert!(after.streaming_status().enabled);
+
+    // ENABLED -> DISABLING closes admission before terminal drain work and is
+    // intentionally the only receipt-chain-preserving standalone profile CAS.
+    let disabling_revision = enabled.profile_revision + 1;
+    let disabling_declaration_digest = format!("sha256:{}", "e".repeat(64));
+    let disable_request_digest = stream_profile_management_request_digest(
+        &graph_identity_digest,
+        "disable-profile-test",
+        "config-2",
+        &disabling_declaration_digest,
+        disabling_revision,
+        StreamProfileMode::Disabled,
+    )
+    .unwrap();
+    let disabling = StreamProfileEntry::disabling_from(
+        &enabled,
+        DisablePlan::new(
+            "disable-profile-test",
+            disable_request_digest,
+            "config-2",
+            disabling_declaration_digest,
+            "operator:alice",
+            FoldContinuation::derive(&active_delegation, disabling_revision).unwrap(),
+        )
+        .unwrap(),
+    )
+    .unwrap();
+    let manifest_before_disabling = mc.version();
+    mc.commit_changes(&[ManifestChange::SetStreamProfile {
+        expected: enabled.clone(),
+        next: disabling.clone(),
+    }])
+    .await
+    .unwrap();
+    assert_eq!(mc.version(), manifest_before_disabling + 1);
 
     // A stale expected entry is a typed read-set conflict, not an overwrite.
     let stale = mc
         .commit_changes(&[ManifestChange::SetStreamProfile {
             expected: genesis.clone(),
-            next: StreamProfileEntry {
-                streaming_enabled: false,
-                disable_pending_since: None,
-                profile_revision: genesis.profile_revision + 1,
-            },
+            next: enabled.clone(),
         }])
         .await
         .unwrap_err();
@@ -1717,11 +1841,11 @@ async fn stream_profile_genesis_cas_and_revision_rules() {
     // instead of silently overwriting a concurrent transition.
     let non_advancing = mc
         .commit_changes(&[ManifestChange::SetStreamProfile {
-            expected: enabled.clone(),
+            expected: disabling.clone(),
             next: StreamProfileEntry {
-                streaming_enabled: false,
-                disable_pending_since: None,
-                profile_revision: enabled.profile_revision,
+                profile_revision: disabling.profile_revision,
+                profile_receipt_chain: disabling.profile_receipt_chain.clone(),
+                state: StreamProfileState::Disabled,
             },
         }])
         .await
@@ -1729,7 +1853,7 @@ async fn stream_profile_genesis_cas_and_revision_rules() {
     assert!(
         non_advancing
             .to_string()
-            .contains("stream profile revision must advance strictly"),
+            .contains("stream profile transition must advance revision exactly once"),
         "got: {non_advancing}"
     );
 
@@ -1737,8 +1861,8 @@ async fn stream_profile_genesis_cas_and_revision_rules() {
     // manifest version.
     let version_before_noop = mc.version();
     mc.commit_changes(&[ManifestChange::SetStreamProfile {
-        expected: enabled.clone(),
-        next: enabled.clone(),
+        expected: disabling.clone(),
+        next: disabling.clone(),
     }])
     .await
     .unwrap();
@@ -1746,58 +1870,41 @@ async fn stream_profile_genesis_cas_and_revision_rules() {
 
     // The flip is durable across a cold reopen.
     let reopened = ManifestCoordinator::open(uri).await.unwrap().snapshot();
-    assert_eq!(reopened.stream_profile(), &enabled);
-    assert!(reopened.streaming_status().enabled);
+    assert_eq!(reopened.stream_profile(), &disabling);
+    assert_eq!(reopened.stream_token_authority(), &next_token);
+    assert!(!reopened.streaming_status().enabled);
+    assert!(!reopened.streaming_status().undrained);
+    assert_eq!(reopened.streaming_status().profile_mode, "DISABLING");
 }
 
-/// RFC-026 §4.7 P1: disabling streaming refuses, typed and effect-free, while
-/// any stream lifecycle is non-terminal — an acknowledged-durable promise must
-/// never be stranded by a flag flip. Injects an `Open` lifecycle row through
-/// the manifest CAS (no production enrollment path exists in this slice).
+/// RFC-026 §4.7 P1: the ambient graph API cannot mint profile authority.
+///
+/// Profile transitions are cluster-control-plane operations in F2, so the old
+/// embedded/direct writer must refuse before changing either the singleton or
+/// its receipt chain.
 #[tokio::test]
-async fn set_streaming_enabled_refuses_disable_while_undrained() {
+async fn ambient_stream_profile_writer_refuses_without_cluster_control_plane() {
     let dir = tempfile::tempdir().unwrap();
     let uri = dir.path().to_str().unwrap();
     let db = crate::db::Omnigraph::init(uri, test_schema_source())
         .await
         .unwrap();
 
-    let enabled = db.set_streaming_enabled_as(true, None).await.unwrap();
-    assert!(enabled.changed);
+    let err = db.set_streaming_enabled_as(true, None).await.unwrap_err();
+    assert!(matches!(
+        err,
+        OmniError::StreamingRequiresClusterControlPlane
+    ));
 
-    // Inject an OPEN lifecycle for Person through a separate coordinator —
-    // the state a live (private) stream would hold.
-    let mut mc = ManifestCoordinator::open(uri).await.unwrap();
-    let person_entry = mc.snapshot().entry("node:Person").unwrap().clone();
-    let open = stream_lifecycle_for_person(
-        &person_entry,
-        person_entry.table_version,
-        StreamLifecycle::Open,
-    );
-    mc.commit_changes(&[ManifestChange::SetStreamLifecycle {
-        expected: None,
-        next: open,
-    }])
-    .await
-    .unwrap();
-
-    let err = db.set_streaming_enabled_as(false, None).await.unwrap_err();
-    match err {
-        OmniError::StreamingDisablePending { undrained_tables } => {
-            assert_eq!(undrained_tables, vec!["node:Person".to_string()]);
-        }
-        other => panic!("expected StreamingDisablePending, got: {other}"),
-    }
-
-    // Effect-free refusal: the flag is still enabled and the revision did not
-    // move; the public status reports the undrained state.
-    let mc = ManifestCoordinator::open(uri).await.unwrap();
-    let snapshot = mc.snapshot();
-    assert!(snapshot.stream_profile().streaming_enabled);
-    assert_eq!(snapshot.stream_profile().profile_revision, 2);
+    // Effect-free refusal: a cold reopen observes the exact genesis singleton
+    // and canonical empty receipt-chain commitment.
+    let snapshot = ManifestCoordinator::open(uri).await.unwrap().snapshot();
+    assert_eq!(snapshot.stream_profile(), &StreamProfileEntry::genesis());
     let status = snapshot.streaming_status();
-    assert!(status.enabled);
-    assert!(status.undrained);
+    assert!(!status.enabled);
+    assert!(!status.undrained);
+    assert_eq!(status.profile_revision, 1);
+    assert_eq!(status.profile_mode, "DISABLED");
 }
 
 fn stream_lifecycle_for_person(
@@ -2311,7 +2418,7 @@ async fn test_init_stamps_internal_schema_version() {
     ManifestCoordinator::init(uri, &catalog).await.unwrap();
 
     let ds = open_manifest_dataset(uri, None).await.unwrap();
-    assert_eq!(super::migrations::INTERNAL_MANIFEST_SCHEMA_VERSION, 10);
+    assert_eq!(super::migrations::INTERNAL_MANIFEST_SCHEMA_VERSION, 11);
     assert_eq!(
         super::migrations::read_stamp(&ds),
         super::migrations::INTERNAL_MANIFEST_SCHEMA_VERSION,

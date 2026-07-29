@@ -319,6 +319,10 @@ pub(crate) async fn observe_declared_graphs(
         let graph_address = graph_address(&graph.id);
         let schema_address = schema_address(&graph.id);
         let streaming_address = streaming_address(&graph.id);
+        let had_streaming_resource = state
+            .applied_revision
+            .resources
+            .contains_key(&streaming_address);
         let graph_uri = backend.graph_root(&graph.id);
         let observed_at = now_rfc3339();
 
@@ -340,6 +344,8 @@ pub(crate) async fn observe_declared_graphs(
                     schema_matches_desired: Some(false),
                     streaming_enabled: None,
                     streaming_undrained: None,
+                    streaming_profile_mode: None,
+                    streaming_profile_revision: None,
                     streaming_matches_desired: graph.streaming.map(|_| false),
                     error: Some("derived graph root is missing"),
                 }),
@@ -381,24 +387,44 @@ pub(crate) async fn observe_declared_graphs(
                         embedding_provider: None,
                         embedding_profile: None,
                         streaming_enabled: None,
+                        declaration_revision: None,
+                        profile_mode: None,
+                        profile_revision: None,
                     },
                 );
                 // Converge the streaming ledger row to ENGINE truth whenever
-                // the flag is managed (declared in cluster.yaml). The digest
-                // encodes the observed value, so a desired/observed mismatch
-                // surfaces as an ordinary plan Update and the next apply
-                // re-flips — the schema-convergence pattern, without which a
-                // crashed apply or refresh would drop the row and the ledger
-                // would disagree with the graph forever.
-                if graph.streaming.is_some() {
+                // the profile is managed, was managed, or is still live in a
+                // non-terminal mode. The last case is the crash-gap guard: an
+                // ENABLED/DISABLING manifest remains authoritative even when
+                // state.json never recorded (or later lost) its control row.
+                // Refresh must recreate that row so an absent declaration
+                // cannot silently abandon the only route to a safe disable.
+                let streaming_profile_is_active = !matches!(
+                    observation.streaming_profile_mode.as_str(),
+                    "DISABLED" | "RETIRED"
+                );
+                if graph.streaming.is_some()
+                    || had_streaming_resource
+                    || streaming_profile_is_active
+                {
+                    let observed_digest = observed_streaming_digest(
+                        &graph.id,
+                        &observation.streaming_profile_mode,
+                    );
                     state.applied_revision.resources.insert(
                         streaming_address.clone(),
                         StateResource {
-                            digest: streaming_digest(&graph.id, observation.streaming_enabled),
+                            declaration_revision: Some(streaming_declaration_revision(
+                                &graph.id,
+                                &observed_digest,
+                            )),
+                            digest: observed_digest,
                             applies_to: None,
                             embedding_provider: None,
                             embedding_profile: None,
                             streaming_enabled: Some(observation.streaming_enabled),
+                            profile_mode: Some(observation.streaming_profile_mode.clone()),
+                            profile_revision: Some(observation.streaming_profile_revision),
                         },
                     );
                 }
@@ -421,6 +447,9 @@ pub(crate) async fn observe_declared_graphs(
                         embedding_provider,
                         embedding_profile: None,
                         streaming_enabled: None,
+                        declaration_revision: None,
+                        profile_mode: None,
+                        profile_revision: None,
                     },
                 );
                 state.observations.insert(
@@ -436,9 +465,20 @@ pub(crate) async fn observe_declared_graphs(
                         schema_matches_desired: Some(schema_matches),
                         streaming_enabled: Some(observation.streaming_enabled),
                         streaming_undrained: Some(observation.streaming_undrained),
+                        streaming_profile_mode: Some(
+                            observation.streaming_profile_mode.as_str(),
+                        ),
+                        streaming_profile_revision: Some(
+                            observation.streaming_profile_revision,
+                        ),
                         streaming_matches_desired: graph
                             .streaming
-                            .map(|desired| desired == observation.streaming_enabled),
+                            .map(|desired| {
+                                streaming_mode_matches_desired(
+                                    &observation.streaming_profile_mode,
+                                    desired,
+                                )
+                            }),
                         error: None,
                     }),
                 );
@@ -462,7 +502,10 @@ pub(crate) async fn observe_declared_graphs(
                     );
                 }
                 if let Some(desired_enabled) = graph.streaming {
-                    if desired_enabled == observation.streaming_enabled {
+                    if streaming_mode_matches_desired(
+                        &observation.streaming_profile_mode,
+                        desired_enabled,
+                    ) {
                         set_resource_status_applied(state, &streaming_address);
                     } else {
                         set_resource_status(
@@ -473,6 +516,14 @@ pub(crate) async fn observe_declared_graphs(
                             "live streaming enablement differs from desired streaming enablement",
                         );
                     }
+                } else if streaming_profile_is_active {
+                    set_resource_status(
+                        state,
+                        &streaming_address,
+                        ResourceLifecycleStatus::Drifted,
+                        "streaming_profile_must_disable_first",
+                        "live streaming profile is active without a managed declaration; add `streaming: false` and apply before unmanaging it",
+                    );
                 }
             }
             Err(error) => {
@@ -490,6 +541,8 @@ pub(crate) async fn observe_declared_graphs(
                         schema_matches_desired: None,
                         streaming_enabled: None,
                         streaming_undrained: None,
+                        streaming_profile_mode: None,
+                        streaming_profile_revision: None,
                         streaming_matches_desired: None,
                         error: Some(error.as_str()),
                     }),
@@ -550,6 +603,8 @@ pub(crate) struct LiveGraphObservation {
     /// permanently disagreeing with the graph.
     streaming_enabled: bool,
     streaming_undrained: bool,
+    streaming_profile_mode: String,
+    streaming_profile_revision: u64,
 }
 
 pub(crate) async fn observe_live_graph(graph_uri: &str) -> Result<LiveGraphObservation, String> {
@@ -567,6 +622,8 @@ pub(crate) async fn observe_live_graph(graph_uri: &str) -> Result<LiveGraphObser
         schema_digest: sha256_hex(schema_source.as_bytes()),
         streaming_enabled: streaming.enabled,
         streaming_undrained: streaming.undrained,
+        streaming_profile_mode: streaming.profile_mode.to_string(),
+        streaming_profile_revision: streaming.profile_revision,
     })
 }
 
@@ -581,6 +638,8 @@ pub(crate) struct GraphObservationJson<'a> {
     schema_matches_desired: Option<bool>,
     streaming_enabled: Option<bool>,
     streaming_undrained: Option<bool>,
+    streaming_profile_mode: Option<&'a str>,
+    streaming_profile_revision: Option<u64>,
     streaming_matches_desired: Option<bool>,
     error: Option<&'a str>,
 }
@@ -598,6 +657,8 @@ pub(crate) fn graph_observation_json(observation: GraphObservationJson<'_>) -> s
         "schema_matches_desired": observation.schema_matches_desired,
         "streaming_enabled": observation.streaming_enabled,
         "streaming_undrained": observation.streaming_undrained,
+        "streaming_profile_mode": observation.streaming_profile_mode,
+        "streaming_profile_revision": observation.streaming_profile_revision,
         "streaming_matches_desired": observation.streaming_matches_desired,
         "error": observation.error,
     })
@@ -1117,7 +1178,53 @@ pub(crate) fn streaming_address(graph_id: &str) -> String {
 }
 
 pub(crate) fn streaming_digest(graph_id: &str, enabled: bool) -> String {
-    sha256_hex(format!("streaming\0{graph_id}\0{enabled}").as_bytes())
+    format!(
+        "sha256:{}",
+        sha256_hex(format!("streaming\0{graph_id}\0{enabled}").as_bytes())
+    )
+}
+
+/// Stable resource-local revision for one exact streaming declaration.
+///
+/// The global config digest advances for unrelated schemas, policies, and
+/// graphs. Binding runtime delegation to that global digest would invalidate
+/// an otherwise unchanged enabled graph without any supported renewal
+/// transition. This domain-separated revision changes only with this graph's
+/// declaration digest and can therefore be reconstructed by refresh.
+pub(crate) fn streaming_declaration_revision(
+    graph_id: &str,
+    declaration_digest: &str,
+) -> String {
+    sha256_hex(
+        format!(
+            "omnigraph.cluster.streaming-declaration-revision.v1\0{graph_id}\0{declaration_digest}"
+        )
+        .as_bytes(),
+    )
+}
+
+pub(crate) fn observed_streaming_digest(graph_id: &str, profile_mode: &str) -> String {
+    match profile_mode {
+        "ENABLED" => streaming_digest(graph_id, true),
+        "DISABLED" => streaming_digest(graph_id, false),
+        // Intermediate/terminal exceptional modes must never collide with a
+        // desired boolean digest. `DISABLING` therefore remains a visible
+        // Update until checked offline apply finishes its durable plan.
+        other => format!(
+            "sha256:{}",
+            sha256_hex(format!("streaming-mode\0{graph_id}\0{other}").as_bytes())
+        ),
+    }
+}
+
+pub(crate) fn streaming_mode_matches_desired(
+    profile_mode: &str,
+    desired_enabled: bool,
+) -> bool {
+    matches!(
+        (profile_mode, desired_enabled),
+        ("ENABLED", true) | ("DISABLED", false)
+    )
 }
 
 pub(crate) fn resolve_config_path(config_dir: &Path, path: &Path) -> PathBuf {

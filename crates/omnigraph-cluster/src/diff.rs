@@ -489,3 +489,54 @@ pub(crate) fn demote_dependents_of_failed_graphs(
         }
     }
 }
+
+/// Keep the policy authority that can resume an incomplete stream-profile
+/// reconciliation selected in the applied state.
+///
+/// Profile changes execute before the cluster state CAS. If one is blocked,
+/// publishing a policy update/removal bound to that graph could replace the
+/// currently-authorizing policy with the very desired policy that denied the
+/// transition. The next apply would then enforce the new denial as the current
+/// policy and could never resume the disable. Freeze both currently and
+/// desired-bound policy changes until the profile transition succeeds.
+pub(crate) fn demote_policies_for_blocked_stream_profiles(
+    changes: &mut [PlanChange],
+    blocked_graphs: &BTreeSet<String>,
+    state: &ClusterState,
+    dependencies: &[Dependency],
+) {
+    if blocked_graphs.is_empty() {
+        return;
+    }
+
+    for change in changes.iter_mut() {
+        if change.disposition != Some(ApplyDisposition::Applied)
+            || !matches!(resource_kind(&change.resource), ResourceKind::Policy(_))
+        {
+            continue;
+        }
+        let currently_bound = state
+            .applied_revision
+            .resources
+            .get(&change.resource)
+            .and_then(|resource| resource.applies_to.as_deref())
+            .is_some_and(|bindings| {
+                blocked_graphs.iter().any(|graph| {
+                    bindings
+                        .iter()
+                        .any(|binding| binding == &graph_address(graph))
+                })
+            });
+        let desired_bound = dependencies.iter().any(|dependency| {
+            dependency.from == change.resource
+                && dependency
+                    .to
+                    .strip_prefix("graph.")
+                    .is_some_and(|graph| blocked_graphs.contains(graph))
+        });
+        if currently_bound || desired_bound {
+            change.disposition = Some(ApplyDisposition::Blocked);
+            change.reason = Some("streaming_profile_not_applied".to_string());
+        }
+    }
+}

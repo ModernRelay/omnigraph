@@ -64,14 +64,18 @@ are implemented and evidence-green at a deliberately narrow boundary:
 - replayed or flushed-but-unmerged state routes to fold only;
 - one strict fold stages exact base-table and `_stream_tokens.lance`
   participants and publishes both through `__manifest`; and
-- current internal schema v9, stream-config v3, lifecycle state v2, and
-  recovery-v12 describe this private implementation. Historical v8/config-v2/
-  recovery-v11 state crosses that boundary only through export/init/load.
+- current internal schema v11 preserves stream-config v3, lifecycle state v2,
+  and recovery-v12 for this private implementation and adds checked profile-v2
+  authority plus recovery-v13 `StreamProfileChange`. Historical
+  v8/config-v2/recovery-v11 state crosses that boundary only through
+  export/init/load.
 
 The core is intentionally reachable only through a feature-gated, doc-hidden
-engine seam. There is no `@stream` schema intent, public enrollment, SDK
-method, HTTP route, CLI command, OpenAPI surface, or operator drain/resume
-workflow. An acknowledgement means that the submitted batch is durable and
+engine seam. Checked profile control exists, including restart-stable
+`DISABLING`, but there is no `@stream` schema intent, public enrollment, SDK
+ingest method, HTTP route, CLI ingest command, OpenAPI surface, or enrolled-lane
+drain/resume workflow. Those lifecycle effects require another strict format
+strand. An acknowledgement means that the submitted batch is durable and
 replayable; it does not mean that the graph already exposes the rows.
 
 MemWAL is the strategic streaming substrate. OmniGraph is not designing a

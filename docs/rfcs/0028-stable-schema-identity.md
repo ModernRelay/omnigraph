@@ -468,10 +468,18 @@ identity version to the release/stamp history. V6 preserved this contract and
 added RFC-023 key fencing; v7 preserved both and added RFC-026 identity-keyed
 stream-lifecycle authority. Historical v8 preserved those contracts and added
 RFC-026 stream-config v2 plus recovery-v11 for the private B1 row/fold core.
-The currently served v9 format preserves those worker mechanics and activates
-stream-config v3, lifecycle state v2, trusted hidden attribution, the
-manifest-selected token participant, and recovery-v12's exact base-plus-token
-fold. None of the later formats reinterprets or backfills v5 in place. A v5
+V9 preserves those worker mechanics and activates stream-config v3, lifecycle
+state v2, trusted hidden attribution, the manifest-selected token participant,
+and recovery-v12's exact base-plus-token fold. V10 adds the required
+disabled-from-genesis profile singleton and reserved dead-letter slot. The
+currently served v11 format replaces the profile boolean with protocol-v2
+checked authority and adds recovery-v13 `StreamProfileChange`, while preserving
+the ordinary private recovery-v12 fold byte-for-byte. Its `DISABLING` state is
+explicit and restart/resume-owned; public ingress/enrollment, enrolled-lane
+claim/drain, correction, and retirement remain inactive. Those lifecycle
+effects require another strict graph/recovery strand because they were not
+pre-registered under v11/v13. None of the later formats reinterprets or
+backfills v5 in place. A v5
 graph was never served with a
 partial combination such as identity-bearing IR over name-keyed manifest rows.
 

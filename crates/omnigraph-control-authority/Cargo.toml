@@ -12,6 +12,7 @@ documentation = "https://docs.rs/omnigraph-control-authority"
 omnigraph-storage = { path = "../omnigraph-storage", version = "0.9.0" }
 serde = { workspace = true }
 serde_json = { workspace = true }
+sha2 = { workspace = true }
 thiserror = { workspace = true }
 time = { workspace = true }
 tokio = { workspace = true }

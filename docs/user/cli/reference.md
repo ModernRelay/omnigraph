@@ -185,6 +185,8 @@ operator server falls back to `OMNIGRAPH_BEARER_TOKEN` alone.
 omnigraph cluster validate --config company-brain
 omnigraph cluster plan     --config company-brain --json
 omnigraph cluster apply    --config company-brain --json
+# When a graphs.<id>.streaming declaration changes (writers must be stopped):
+omnigraph cluster apply    --config company-brain --as <actor> --confirm-stream-offline
 omnigraph cluster approve  graph.<id> --config company-brain --as <actor>
 omnigraph cluster status   --config company-brain --json
 omnigraph cluster refresh  --config company-brain --json
@@ -205,6 +207,17 @@ approved graph deletes; it requires an existing `state.json` (run `import`
 first). Applied state does not serve traffic until an `omnigraph-server
 --cluster <dir>` restart picks up the new revision. Standalone schema deletes
 remain unsupported and are reported as `deferred` with a warning. `cluster
+apply --confirm-stream-offline` is additionally required when a streaming
+profile changes. It attests that every writer-capable process for the affected
+graph is stopped; profile changes also require the state lock and an
+authenticated `--as` actor. The flag is not a distributed lease. Enabling the
+experimental profile disables embedded/direct Mutation/Load/delete, does not
+yet add a public firehose endpoint, and should be followed by a server restart
+so served writes carry the checked runtime authority. Branch merge remains
+unavailable while that profile is `ENABLED` or `DISABLING`, even through the
+served runtime. A disable can finish only when there are no lanes or all
+existing lanes are already `SEALED`; it does not drain a non-`SEALED` lane or
+de-enroll an existing `SEALED` lane. `cluster
 status` reads state only and reports any existing lock metadata. `force-unlock`
 removes a lock only when the supplied id exactly matches the lock file.
 `refresh` requires an existing `state.json`; `import` creates one only when it

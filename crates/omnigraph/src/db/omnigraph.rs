@@ -45,12 +45,15 @@ mod stream_status;
 mod table_ops;
 
 pub use optimize::{CleanupPolicyOptions, SkipReason, TableCleanupStats, TableOptimizeStats};
-pub use stream_profile::StreamingProfileResult;
-pub use stream_status::{StreamStatus, StreamTableStatus};
 pub use repair::{
     RepairAction, RepairClassification, RepairOptions, RepairStats, TableRepairStats,
 };
 pub use schema_apply::SchemaApplyOptions;
+#[doc(hidden)]
+pub use stream_profile::{
+    CheckedClusterApplyAuthority, CheckedClusterStreamRuntimeAuthority, StreamingProfileResult,
+};
+pub use stream_status::{StreamStatus, StreamTableStatus};
 pub use table_ops::PendingIndex;
 pub(crate) use table_ops::{DeferredTableFork, OpenedForMutation};
 
@@ -245,8 +248,7 @@ pub struct Omnigraph {
     /// already-open main coordinator (no second open), refreshed by a cheap
     /// retained-handle probe, and reseeded when this handle leaves main or
     /// publishes a profile flip. Historical snapshots never consult it.
-    canonical_main_stream_profile:
-        Arc<tokio::sync::RwLock<CanonicalMainStreamProfile>>,
+    canonical_main_stream_profile: Arc<tokio::sync::RwLock<CanonicalMainStreamProfile>>,
     table_store: TableStore,
     runtime_cache: RuntimeCache,
     /// Per-graph read caches: one shared Lance `Session` plus the held-`Dataset`
@@ -273,6 +275,10 @@ pub struct Omnigraph {
     /// and two durability domains for one shard.
     #[allow(dead_code)]
     stream_workers: Arc<crate::table_store::mem_wal::MemWalWorkerRegistry>,
+    /// Non-cloneable checked authority retained for the lifetime of the sole
+    /// cluster-served writer handle. Ambient embedded/direct handles leave
+    /// this unset and therefore fail closed while the profile is enabled.
+    stream_runtime_authority: Option<CheckedClusterStreamRuntimeAuthority>,
     /// Handle-local mutex held across the swap → operate → restore window
     /// in `branch_merge_impl`. Two concurrent merges through the same handle
     /// with distinct targets
@@ -382,8 +388,7 @@ fn private_b1_worker_limits() -> crate::table_store::mem_wal::B1WorkerLimits {
         // envelopes root-wide is the minimum qualified concurrency contract:
         // one stale provisional caller may wait while another becomes the
         // winner whose authority it must later observe.
-        max_b2_preprocessing_bytes:
-            crate::table_store::mem_wal::B2_MAX_PREPROCESSING_BYTES_ROOT,
+        max_b2_preprocessing_bytes: crate::table_store::mem_wal::B2_MAX_PREPROCESSING_BYTES_ROOT,
         // Every queued input is charged against the same aggregate Arrow
         // reservation synchronously, before detachment or cold claim. This
         // count therefore bounds scheduling/control overhead; it cannot admit
@@ -568,6 +573,7 @@ impl Omnigraph {
             })),
             write_queue,
             stream_workers,
+            stream_runtime_authority: None,
             merge_exclusive: Arc::new(tokio::sync::Mutex::new(())),
             policy: None,
             embedding: Arc::new(tokio::sync::OnceCell::new()),
@@ -765,6 +771,7 @@ impl Omnigraph {
             })),
             write_queue,
             stream_workers,
+            stream_runtime_authority: None,
             merge_exclusive: Arc::new(tokio::sync::Mutex::new(())),
             policy: None,
             embedding: Arc::new(tokio::sync::OnceCell::new()),
@@ -1115,11 +1122,7 @@ impl Omnigraph {
             let coordinator = self.coordinator.read().await;
             if coordinator.current_branch().is_none() {
                 let held = coordinator.manifest_incarnation();
-                if coordinator
-                    .probe_latest_incarnation()
-                    .await?
-                    .matches(&held)
-                {
+                if coordinator.probe_latest_incarnation().await?.matches(&held) {
                     return Ok(coordinator.snapshot().stream_profile().clone());
                 }
             }
@@ -1130,11 +1133,7 @@ impl Omnigraph {
             if coordinator.current_branch().is_none() {
                 let held = coordinator.manifest_incarnation();
                 let mut refreshed = false;
-                if !coordinator
-                    .probe_latest_incarnation()
-                    .await?
-                    .matches(&held)
-                {
+                if !coordinator.probe_latest_incarnation().await?.matches(&held) {
                     coordinator.refresh_manifest_only().await?;
                     refreshed = true;
                 }
@@ -1159,8 +1158,7 @@ impl Omnigraph {
             return Ok(authority.profile.clone());
         }
         let control_session = self.control_session();
-        let manifest =
-            ManifestCoordinator::open_with_session(self.uri(), &control_session).await?;
+        let manifest = ManifestCoordinator::open_with_session(self.uri(), &control_session).await?;
         *authority = CanonicalMainStreamProfile::from_main_manifest(&manifest);
         Ok(authority.profile.clone())
     }
@@ -1972,6 +1970,7 @@ impl Omnigraph {
                 crate::db::manifest::SidecarKind::SchemaApply
                     | crate::db::manifest::SidecarKind::StreamFold
                     | crate::db::manifest::SidecarKind::StreamEnrollment
+                    | crate::db::manifest::SidecarKind::StreamProfileChange
             )
         }) {
             return Err(OmniError::recovery_required(
@@ -2106,6 +2105,7 @@ impl Omnigraph {
                 sidecar.writer_kind,
                 crate::db::manifest::SidecarKind::SchemaApply
                     | crate::db::manifest::SidecarKind::StreamEnrollment
+                    | crate::db::manifest::SidecarKind::StreamProfileChange
             )
         }) {
             return Err(OmniError::recovery_required(
@@ -2150,6 +2150,11 @@ impl Omnigraph {
             .write_queue
             .acquire(&crate::db::manifest::schema_apply_serial_queue_key())
             .await;
+        self.reload_schema_if_source_changed_with_schema_gate_held()
+            .await
+    }
+
+    async fn reload_schema_if_source_changed_with_schema_gate_held(&self) -> Result<()> {
         crate::failpoints::maybe_fail(
             crate::failpoints::names::SCHEMA_RELOAD_BEFORE_CONTRACT_READ,
         )?;
@@ -2182,6 +2187,28 @@ impl Omnigraph {
         };
         drop(current);
         self.store_schema_view(catalog, schema_source, &accepted_ir)?;
+        Ok(())
+    }
+
+    /// Refresh a pre-effect Mutation/Load attempt while its outer shared
+    /// stream-profile window remains held.
+    ///
+    /// The ordinary write-entry healer already ran before that window was
+    /// acquired. Calling [`Self::refresh`] here would run recovery again and
+    /// attempt a nested profile-gate acquisition. Tokio's fair `RwLock` can
+    /// then block that nested read behind a queued profile writer while the
+    /// same operation still owns the earlier read guard. Refresh only the
+    /// coherent manifest/schema view; the next attempt re-lists pending
+    /// sidecars under its normal final gates and refuses any new residue.
+    pub(crate) async fn refresh_pre_effect_write_attempt(&self) -> Result<()> {
+        let _schema_guard = self
+            .write_queue
+            .acquire(&crate::db::manifest::schema_apply_serial_queue_key())
+            .await;
+        self.coordinator.write().await.refresh().await?;
+        self.reload_schema_if_source_changed_with_schema_gate_held()
+            .await?;
+        self.invalidate_read_caches().await;
         Ok(())
     }
 
@@ -2236,9 +2263,7 @@ impl Omnigraph {
         // this projection and remain immutable historical views.
         if matches!(&target, ReadTarget::Branch(_)) && resolved.branch.is_some() {
             let profile = self.current_canonical_stream_profile().await?;
-            resolved
-                .snapshot
-                .project_canonical_stream_profile(profile);
+            resolved.snapshot.project_canonical_stream_profile(profile);
         }
         // Attach the read caches (shared Session + held-handle cache) for live
         // Branch reads so table opens reuse handles (0 IO on a warm repeat).
@@ -2675,9 +2700,7 @@ impl Omnigraph {
     /// a named physical ref from the logical source branch. A lazy descendant
     /// may still resolve to any live ancestor ref, and named-ref enrollment or
     /// drain is outside the Phase-A support boundary.
-    fn branch_control_stream_admission_keys(
-        catalog: &Catalog,
-    ) -> Result<Vec<StreamAdmissionKey>> {
+    fn branch_control_stream_admission_keys(catalog: &Catalog) -> Result<Vec<StreamAdmissionKey>> {
         let schema_ir = catalog.bound_schema_ir().ok_or_else(|| {
             OmniError::manifest_internal(
                 "native branch control requires an identity-bound catalog for stream admission",
@@ -2695,10 +2718,8 @@ impl Omnigraph {
                     .map(|edge| (edge.type_id.get(), edge.table_incarnation_id.get())),
             )
         {
-            let identity = super::manifest::TableIdentity::new(
-                stable_table_id,
-                table_incarnation_id,
-            )?;
+            let identity =
+                super::manifest::TableIdentity::new(stable_table_id, table_incarnation_id)?;
             keys.insert(StreamAdmissionKey::for_resolved_ref(identity, None));
         }
         Ok(keys.into_iter().collect())
@@ -2946,9 +2967,7 @@ impl Omnigraph {
         crate::failpoints::maybe_fail(
             crate::failpoints::names::BRANCH_CONTROL_POST_RECOVERY_BARRIER,
         )?;
-        let admission_keys = self
-            .capture_branch_control_stream_admission_keys()
-            .await?;
+        let admission_keys = self.capture_branch_control_stream_admission_keys().await?;
         let _stream_admission_guards = self
             .write_queue()
             .acquire_stream_shared_many(&admission_keys)
@@ -3006,6 +3025,34 @@ impl Omnigraph {
         name: &str,
         actor: Option<&str>,
     ) -> Result<()> {
+        self.branch_create_from_as_with_recovery_barrier(from, name, actor, true)
+            .await
+    }
+
+    /// Loader-only branch-create composition after its broad recovery barrier
+    /// and shared stream-profile admission are already held.
+    ///
+    /// Re-running the healer from that position could re-enter the profile
+    /// `RwLock` behind a queued exclusive transition and deadlock. The native
+    /// control still performs its normal final sidecar re-list under schema,
+    /// branch, token, and table gates before creating the ref.
+    pub(crate) async fn branch_create_from_as_after_recovery_barrier(
+        &self,
+        from: impl Into<ReadTarget>,
+        name: &str,
+        actor: Option<&str>,
+    ) -> Result<()> {
+        self.branch_create_from_as_with_recovery_barrier(from, name, actor, false)
+            .await
+    }
+
+    async fn branch_create_from_as_with_recovery_barrier(
+        &self,
+        from: impl Into<ReadTarget>,
+        name: &str,
+        actor: Option<&str>,
+        heal_recovery: bool,
+    ) -> Result<()> {
         let target = from.into();
         let source_branch = match &target {
             ReadTarget::Branch(b) => b.clone(),
@@ -3019,7 +3066,8 @@ impl Omnigraph {
             },
             actor,
         )?;
-        self.branch_create_from_impl(target, name, false).await
+        self.branch_create_from_impl(target, name, false, heal_recovery)
+            .await
     }
 
     async fn branch_create_from_impl(
@@ -3027,6 +3075,7 @@ impl Omnigraph {
         from: impl Into<ReadTarget>,
         name: &str,
         allow_internal_refs: bool,
+        heal_recovery: bool,
     ) -> Result<()> {
         let target = from.into();
         let ReadTarget::Branch(branch_name) = target else {
@@ -3043,14 +3092,14 @@ impl Omnigraph {
             .ok_or_else(|| OmniError::manifest("cannot create branch 'main'".to_string()))?;
         self.ensure_schema_state_valid().await?;
         let relevant = [branch.as_deref(), Some(target_branch.as_str()), None];
-        self.heal_pending_recovery_sidecars_for_write(&relevant)
-            .await?;
+        if heal_recovery {
+            self.heal_pending_recovery_sidecars_for_write(&relevant)
+                .await?;
+        }
         crate::failpoints::maybe_fail(
             crate::failpoints::names::BRANCH_CONTROL_POST_RECOVERY_BARRIER,
         )?;
-        let admission_keys = self
-            .capture_branch_control_stream_admission_keys()
-            .await?;
+        let admission_keys = self.capture_branch_control_stream_admission_keys().await?;
         let _stream_admission_guards = self
             .write_queue()
             .acquire_stream_shared_many(&admission_keys)
@@ -3135,9 +3184,7 @@ impl Omnigraph {
         crate::failpoints::maybe_fail(
             crate::failpoints::names::BRANCH_CONTROL_POST_RECOVERY_BARRIER,
         )?;
-        let admission_keys = self
-            .capture_branch_control_stream_admission_keys()
-            .await?;
+        let admission_keys = self.capture_branch_control_stream_admission_keys().await?;
         let _stream_admission_guards = self
             .write_queue()
             .acquire_stream_shared_many(&admission_keys)
@@ -3828,7 +3875,7 @@ fn canonical_stream_payload_v1_with_limit(
         )));
     }
     let limit = usize::try_from(byte_limit)
-    .map_err(|_| OmniError::manifest_internal("canonical stream payload cap exceeds usize"))?;
+        .map_err(|_| OmniError::manifest_internal("canonical stream payload cap exceeds usize"))?;
     let mut writer = BoundedCanonicalWriter::new(limit);
     let encoded = (|| -> Result<()> {
         use std::io::Write as _;
@@ -3843,8 +3890,7 @@ fn canonical_stream_payload_v1_with_limit(
                 writer.write_all(b",").map_err(canonical_writer_error)?;
             }
             first = false;
-            serde_json::to_writer(&mut writer, field.name())
-                .map_err(canonical_json_error)?;
+            serde_json::to_writer(&mut writer, field.name()).map_err(canonical_json_error)?;
             writer.write_all(b":").map_err(canonical_writer_error)?;
             write_canonical_json_from_array(&mut writer, batch.column(index).as_ref(), row)?;
         }
@@ -3899,11 +3945,15 @@ impl std::io::Write for BoundedCanonicalWriter {
 }
 
 fn canonical_writer_error(error: std::io::Error) -> OmniError {
-    OmniError::manifest_internal(format!("failed to encode canonical stream payload: {error}"))
+    OmniError::manifest_internal(format!(
+        "failed to encode canonical stream payload: {error}"
+    ))
 }
 
 fn canonical_json_error(error: serde_json::Error) -> OmniError {
-    OmniError::manifest_internal(format!("failed to encode canonical stream payload: {error}"))
+    OmniError::manifest_internal(format!(
+        "failed to encode canonical stream payload: {error}"
+    ))
 }
 
 fn write_canonical_json_from_array(
@@ -3949,8 +3999,7 @@ fn write_canonical_json_from_array(
                 if index != 0 {
                     writer.write_all(b",").map_err(canonical_writer_error)?;
                 }
-                serde_json::to_writer(&mut *writer, field.name())
-                    .map_err(canonical_json_error)?;
+                serde_json::to_writer(&mut *writer, field.name()).map_err(canonical_json_error)?;
                 writer.write_all(b":").map_err(canonical_writer_error)?;
                 write_canonical_json_from_array(writer, values.column(index).as_ref(), row)?;
             }
@@ -4153,8 +4202,8 @@ fn json_value_from_array(array: &dyn Array, row: usize) -> Result<serde_json::Va
 #[cfg(test)]
 mod tests {
     use super::*;
-    use arrow_array::types::Int32Type;
     use crate::db::manifest::ManifestCoordinator;
+    use arrow_array::types::Int32Type;
     use async_trait::async_trait;
     use serde_json::Value;
     use std::sync::{Arc, Mutex};
@@ -4916,7 +4965,6 @@ edge WorksAt: Person -> Company
         let dir = tempfile::tempdir().unwrap();
         let uri = dir.path().to_str().unwrap();
         let db = Omnigraph::init(uri, TEST_SCHEMA).await.unwrap();
-        let mut db = db;
         db.coordinator
             .write()
             .await
@@ -4957,7 +5005,7 @@ edge WorksAt: Person -> Company
     async fn test_branch_list_hides_schema_apply_lock_branch() {
         let dir = tempfile::tempdir().unwrap();
         let uri = dir.path().to_str().unwrap();
-        let mut db = Omnigraph::init(uri, TEST_SCHEMA).await.unwrap();
+        let db = Omnigraph::init(uri, TEST_SCHEMA).await.unwrap();
         db.coordinator
             .write()
             .await

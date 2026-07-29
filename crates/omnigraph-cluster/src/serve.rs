@@ -2,6 +2,7 @@
 //! boots from (moved verbatim from lib.rs in the modularization).
 
 use super::*;
+use omnigraph_control_authority::{RuntimeBindingRequest, validate_runtime_binding};
 
 /// One graph in a serving snapshot: its id and on-disk root.
 #[derive(Debug, Clone)]
@@ -9,6 +10,11 @@ pub struct ServingGraph {
     pub graph_id: String,
     pub root: PathBuf,
     pub embedding: Option<EmbeddingProviderConfig>,
+    /// Canonical enabled-profile binding validated from the exact applied
+    /// state. This is cloneable evidence, not writer authority; server startup
+    /// must consume it through `mint_runtime_guard`, which rereads state and
+    /// acquires the non-cloneable process registration.
+    pub stream_runtime_authority: Option<RuntimeAuthorityBinding>,
 }
 
 /// One stored query: its graph binding, registry name, and verified source.
@@ -235,7 +241,7 @@ async fn read_snapshot_with_store(
     let mut observations = backend.observations();
     let state = match backend.read_state(&mut observations).await {
         Ok(snapshot) => match snapshot.state {
-            Some(state) => Some(state),
+            Some(state) => Some((state, snapshot.state_cas)),
             None => {
                 diagnostics.push(Diagnostic::error(
                     "cluster_state_missing",
@@ -250,10 +256,11 @@ async fn read_snapshot_with_store(
             None
         }
     };
-    let Some(state) = state else {
+    let Some((state, state_cas)) = state else {
         diagnostics.extend(startup_diagnostics);
         return Err(diagnostics);
     };
+    let state_cas = state_cas.expect("a present cluster state always has a content CAS");
 
     let required_embedding_providers: BTreeSet<String> = state
         .applied_revision
@@ -293,7 +300,7 @@ async fn read_snapshot_with_store(
             ));
             continue;
         }
-        embedding_profiles.insert(address.clone(), profile);
+        embedding_profiles.insert(address.to_owned(), profile);
     }
 
     let mut graphs = Vec::new();
@@ -337,16 +344,133 @@ async fn read_snapshot_with_store(
                     },
                     None => None,
                 };
+                let graph_root = backend.graph_root(&graph_id);
+                let streaming_address = format!("streaming.{graph_id}");
+                let stream_runtime_authority = match state
+                    .applied_revision
+                    .resources
+                    .get(&streaming_address)
+                {
+                    Some(streaming) if streaming.profile_mode.as_deref() == Some("DISABLING") => {
+                        quarantined_graphs.insert(graph_id.clone());
+                        startup_diagnostics.push(Diagnostic::warning(
+                            "stream_profile_disabling",
+                            streaming_address.clone(),
+                            format!(
+                                "graph `{graph_id}` is quarantined because its durable disable plan must be resumed by offline `cluster apply` before server restart"
+                            ),
+                        ));
+                        continue;
+                    }
+                    Some(streaming) if streaming.profile_mode.as_deref() == Some("ENABLED") => {
+                        if streaming.streaming_enabled != Some(true) {
+                            quarantined_graphs.insert(graph_id.clone());
+                            startup_diagnostics.push(Diagnostic::warning(
+                                "stream_runtime_profile_state_inconsistent",
+                                streaming_address.clone(),
+                                format!(
+                                    "graph `{graph_id}` is quarantined because its ENABLED profile metadata disagrees with the compatibility flag; run `cluster refresh` then `cluster apply`"
+                                ),
+                            ));
+                            continue;
+                        }
+                        let Some(profile_revision) = streaming.profile_revision else {
+                            quarantined_graphs.insert(graph_id.clone());
+                            startup_diagnostics.push(Diagnostic::warning(
+                                "stream_runtime_profile_revision_missing",
+                                streaming_address.clone(),
+                                format!(
+                                    "graph `{graph_id}` is quarantined because enabled streaming state has no exact profile revision; run `cluster refresh` then `cluster apply`, and restart"
+                                ),
+                            ));
+                            continue;
+                        };
+                        let Some(declaration_revision) =
+                            streaming.declaration_revision.as_deref()
+                        else {
+                            quarantined_graphs.insert(graph_id.clone());
+                            startup_diagnostics.push(Diagnostic::warning(
+                                "stream_runtime_declaration_revision_missing",
+                                streaming_address.clone(),
+                                format!(
+                                    "graph `{graph_id}` is quarantined because enabled streaming state has no per-stream declaration revision; run `cluster refresh` then `cluster apply`, and restart"
+                                ),
+                            ));
+                            continue;
+                        };
+                        match validate_runtime_binding(
+                            backend.storage_handle(),
+                            backend.root(),
+                            RuntimeBindingRequest {
+                                graph_id: &graph_id,
+                                graph_store_uri: &graph_root,
+                                expected_state_cas: &state_cas,
+                                state_revision: state.state_revision,
+                                declaration_revision,
+                                declaration_digest: &streaming.digest,
+                                profile_mode: "ENABLED",
+                                profile_revision,
+                            },
+                        )
+                        .await
+                        {
+                            Ok(binding) => Some(binding),
+                            Err(err) => {
+                                quarantined_graphs.insert(graph_id.clone());
+                                startup_diagnostics.push(Diagnostic::warning(
+                                    "stream_runtime_authority_invalid",
+                                    streaming_address,
+                                    format!(
+                                        "graph `{graph_id}` is quarantined because its served stream runtime binding could not be validated: {err}; run `cluster refresh` then `cluster apply`, and restart"
+                                    ),
+                                ));
+                                continue;
+                            }
+                        }
+                    }
+                    Some(streaming)
+                        if matches!(
+                            streaming.profile_mode.as_deref(),
+                            Some("DISABLED" | "RETIRED")
+                        ) =>
+                    {
+                        if streaming.streaming_enabled == Some(true) {
+                            quarantined_graphs.insert(graph_id.clone());
+                            startup_diagnostics.push(Diagnostic::warning(
+                                "stream_runtime_profile_state_inconsistent",
+                                streaming_address.clone(),
+                                format!(
+                                    "graph `{graph_id}` is quarantined because terminal profile metadata disagrees with the compatibility flag; run `cluster refresh` then `cluster apply`"
+                                ),
+                            ));
+                            continue;
+                        }
+                        None
+                    }
+                    Some(_) => {
+                        quarantined_graphs.insert(graph_id.clone());
+                        startup_diagnostics.push(Diagnostic::warning(
+                            "stream_runtime_profile_mode_missing",
+                            streaming_address.clone(),
+                            format!(
+                                "graph `{graph_id}` is quarantined because its applied streaming row has missing or unknown profile-mode metadata; run `cluster refresh` then `cluster apply`"
+                            ),
+                        ));
+                        continue;
+                    }
+                    None => None,
+                };
                 graphs.push(ServingGraph {
-                    root: PathBuf::from(backend.graph_root(&graph_id)),
+                    root: PathBuf::from(graph_root),
                     graph_id,
                     embedding,
+                    stream_runtime_authority,
                 });
             }
             ResourceKind::Schema(_) => {}
-            // Serving reads the flag from the graph itself (the manifest row
-            // is the engine-obeyed authority); the ledger row is convergence
-            // bookkeeping, not a serving input.
+            // The row was consumed alongside its graph above to validate the
+            // exact applied-state/profile binding. It is not a standalone
+            // serving object.
             ResourceKind::Streaming(_) => {}
             kind @ ResourceKind::Query { .. } => {
                 let ResourceKind::Query { graph, name } = &kind else {
@@ -412,7 +536,7 @@ async fn read_snapshot_with_store(
             diagnostics.push(Diagnostic::error(
                 "cluster_no_healthy_graphs",
                 CLUSTER_RECOVERIES_DIR,
-                "all applied graphs are quarantined by pending recovery sidecars; run any state-mutating cluster command (e.g. `cluster apply`) to sweep, then retry",
+                "all applied graphs are quarantined by startup safety checks; resolve the graph-specific diagnostics, then retry",
             ));
         } else {
             diagnostics.push(Diagnostic::error(

@@ -407,6 +407,7 @@ async fn schema_crash_before_apply_recovers_via_sweep() {
             dir.path(),
             ApplyOptions {
                 actor: Some("test-actor".to_string()),
+                confirm_stream_offline: false,
             },
         )
         .await;

@@ -141,6 +141,41 @@ pub enum OmniError {
     /// streams, then retry.
     #[error("cannot disable streaming: undrained stream state on {undrained_tables:?}")]
     StreamingDisablePending { undrained_tables: Vec<String> },
+    /// RFC-026 F2: the graph-wide streaming profile is cluster-owned. Cedar
+    /// authorization alone is not the stopped-writer ownership handoff, so an
+    /// embedded/direct caller cannot flip the profile through a raw graph
+    /// handle.
+    #[error(
+        "streaming profile changes require `cluster apply --confirm-stream-offline` while every writer-capable process for the graph is stopped"
+    )]
+    StreamingRequiresClusterControlPlane,
+    /// RFC-026 F2: once the profile is enabled, ordinary graph-content writes
+    /// are accepted only through the one checked cluster serving runtime.
+    /// DISABLING and RETIRED are also fail-closed at this boundary.
+    #[error(
+        "content mutation is unavailable while the streaming profile is {mode}; use the checked cluster serving runtime or disable the profile offline"
+    )]
+    StreamingRequiresClusterRuntime { mode: String },
+    /// A legacy content operation has no token-aware sequencing contract.
+    /// Possessing the sole served-runtime capability prevents split-brain
+    /// writers, but cannot make an operation that bypasses `_stream_tokens`
+    /// safe. Such operations remain closed until their dedicated protocol
+    /// exists.
+    #[error(
+        "{operation} is unavailable while the streaming profile is {mode}; disable streaming offline before retrying"
+    )]
+    StreamingContentOperationUnsupported { operation: String, mode: String },
+    /// A checked cluster capability was minted for a different graph/store,
+    /// declaration, profile revision, actor, or operation class. Keep this
+    /// typed so startup/apply callers can quarantine the graph without parsing
+    /// protocol text.
+    #[error("checked streaming authority does not match current graph authority: {reason}")]
+    StreamingAuthorityMismatch { reason: String },
+    /// RETIRED is an irreversible read/export-only disposition. F2 decodes it
+    /// fail-closed; the later retirement slice owns the sole transition into
+    /// it and no transition out.
+    #[error("stream authority is retired; this graph is read/export-only")]
+    StreamAuthorityRetired,
     /// RFC-026 rejected a stream append before invoking Lance because the one
     /// active generation is at its hard whole-generation ceiling. The caller
     /// must fold the durable generation before retrying; no row from this call

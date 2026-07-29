@@ -22,7 +22,10 @@
 //! immediate-predecessor v8 case uses `OMNIGRAPH_V8_BIN` and proves the genuine
 //! v8 ↔ v9 fence, strict rebuild, non-exposure of v9's trusted physical stream
 //! metadata, and preservation of a genuine v8 user property whose old
-//! grammar-valid name motivated v9's grammar-impossible physical field.
+//! grammar-valid name motivated v9's grammar-impossible physical field. The v9
+//! case uses `OMNIGRAPH_V9_BIN` for the v9 ↔ v10 fence. The current
+//! immediate-predecessor case uses `OMNIGRAPH_V10_BIN` to prove the genuine
+//! v10 ↔ v11 fence and strict rebuild.
 
 mod support;
 
@@ -121,6 +124,19 @@ fn v9_bin() -> Option<PathBuf> {
         path.exists() && path.is_file(),
         "OMNIGRAPH_V9_BIN is set but is not a binary file: {} \
          (unset it to skip, or point it at the omnigraph binary built from the final internal-v9 commit)",
+        path.display(),
+    );
+    Some(path)
+}
+
+/// Resolve the final internal-v10 binary (the last v10 commit before the
+/// protocol-v2 stream-profile / recovery-v13 format activation).
+fn v10_bin() -> Option<PathBuf> {
+    let path = PathBuf::from(std::env::var_os("OMNIGRAPH_V10_BIN")?);
+    assert!(
+        path.exists() && path.is_file(),
+        "OMNIGRAPH_V10_BIN is set but is not a binary file: {} \
+         (unset it to skip, or point it at the omnigraph binary built from the final internal-v10 commit)",
         path.display(),
     );
     Some(path)
@@ -301,6 +317,29 @@ fn assert_current_blob_bytes(graph: &Path, expected: &[u8]) {
             "v5 → current rebuild must preserve exact blob bytes",
         );
     });
+}
+
+fn write_vector_blob_fixture(root: &Path, stem: &str) -> (PathBuf, PathBuf) {
+    let schema = root.join(format!("{stem}.pg"));
+    let data = root.join(format!("{stem}.jsonl"));
+    let search_schema = std::fs::read_to_string(fixture("search.pg")).unwrap();
+    std::fs::write(
+        &schema,
+        format!(
+            "{search_schema}\n\nnode BinaryAsset {{\n    name: String @key\n    payload: Blob\n}}\n"
+        ),
+    )
+    .unwrap();
+    let mut search_data = std::fs::read_to_string(fixture("search.jsonl")).unwrap();
+    if !search_data.ends_with('\n') {
+        search_data.push('\n');
+    }
+    search_data.push_str(
+        r#"{"type":"BinaryAsset","data":{"name":"blob-sentinel","payload":"base64:AAECA/8="}}
+"#,
+    );
+    std::fs::write(&data, search_data).unwrap();
+    (schema, data)
 }
 
 #[test]
@@ -493,25 +532,7 @@ fn current_v9_refuses_and_rebuilds_genuine_v5_and_v5_refuses_v9() {
     // Keep the canonical vector fixture and add one blob-bearing keyed table,
     // so the genuine predecessor run covers all three rebuild payload classes
     // named by RFC-023: rows, vectors, and blobs.
-    let schema = temp.path().join("v5-vector-blob.pg");
-    let data = temp.path().join("v5-vector-blob.jsonl");
-    let search_schema = std::fs::read_to_string(fixture("search.pg")).unwrap();
-    std::fs::write(
-        &schema,
-        format!(
-            "{search_schema}\n\nnode BinaryAsset {{\n    name: String @key\n    payload: Blob\n}}\n"
-        ),
-    )
-    .unwrap();
-    let mut search_data = std::fs::read_to_string(fixture("search.jsonl")).unwrap();
-    if !search_data.ends_with('\n') {
-        search_data.push('\n');
-    }
-    search_data.push_str(
-        r#"{"type":"BinaryAsset","data":{"name":"blob-sentinel","payload":"base64:AAECA/8="}}
-"#,
-    );
-    std::fs::write(&data, search_data).unwrap();
+    let (schema, data) = write_vector_blob_fixture(temp.path(), "v5-vector-blob");
     let v5_uri = v5_graph.to_str().unwrap();
 
     // Mint the predecessor image with the predecessor binary. This exercises
@@ -671,10 +692,7 @@ fn current_v9_refuses_and_rebuilds_genuine_v6_and_v6_refuses_v9() {
     let v6_uri = v6_graph.to_str().unwrap();
     assert_ok(
         "v6 init",
-        &run_old(
-            &v6,
-            &["init", "--schema", schema.to_str().unwrap(), v6_uri],
-        ),
+        &run_old(&v6, &["init", "--schema", schema.to_str().unwrap(), v6_uri]),
     );
     assert_ok(
         "v6 load",
@@ -953,8 +971,7 @@ fn current_v9_refuses_and_rebuilds_genuine_v8_and_v8_refuses_v9() {
         "user-owned-v8-value",
     );
     assert_eq!(
-        rebuilt_legacy["data"]["__omnigraph_stream_v1"],
-        legacy["data"]["__omnigraph_stream_v1"],
+        rebuilt_legacy["data"]["__omnigraph_stream_v1"], legacy["data"]["__omnigraph_stream_v1"],
         "v8's grammar-valid user property must not be mistaken for v9 protocol metadata",
     );
     assert_current_graph_tables_use_exact_id_pk(&v9_graph);
@@ -1068,5 +1085,114 @@ fn current_v10_refuses_and_rebuilds_genuine_v9_and_v9_refuses_v10() {
             || reverse_stderr.contains("newer")
             || reverse_stderr.contains("expects v9"),
         "unexpected v9→v10 reverse-refusal message: {reverse_stderr}",
+    );
+}
+
+#[test]
+fn current_v11_refuses_and_rebuilds_genuine_v10_and_v10_refuses_v11() {
+    let Some(v10) = v10_bin() else {
+        eprintln!(
+            "skipping immediate-predecessor v10 upgrade test: OMNIGRAPH_V10_BIN is not set to a final internal-v10 binary"
+        );
+        return;
+    };
+
+    let temp = tempdir().unwrap();
+    let v10_graph = temp.path().join("old-v10-stream-profile-v1.omni");
+    let (schema, data) = write_vector_blob_fixture(temp.path(), "v10-vector-blob");
+    let v10_uri = v10_graph.to_str().unwrap();
+
+    // Mint the genuine immediate-predecessor image with the final v10 binary.
+    // A JSON snapshot proves this is a real v10 image before the current
+    // binary sees it, rather than a current-shaped graph with a rewound stamp.
+    assert_ok(
+        "v10 init",
+        &run_old(
+            &v10,
+            &["init", "--schema", schema.to_str().unwrap(), v10_uri],
+        ),
+    );
+    assert_ok(
+        "v10 load",
+        &run_old(
+            &v10,
+            &[
+                "load",
+                "--mode",
+                "overwrite",
+                "--data",
+                data.to_str().unwrap(),
+                v10_uri,
+            ],
+        ),
+    );
+    let v10_snapshot = run_old(&v10, &["snapshot", v10_uri, "--json"]);
+    assert_ok("v10 snapshot", &v10_snapshot);
+    let v10_snapshot: serde_json::Value =
+        serde_json::from_slice(&v10_snapshot.stdout).expect("valid v10 snapshot JSON");
+    assert_eq!(
+        v10_snapshot["internal_schema_version"], 10,
+        "the predecessor binary must mint a genuine internal-schema-v10 graph",
+    );
+
+    // V10's production profile remains disabled in this fixture, so its
+    // ordinary export is the supported source side of the strict rebuild.
+    let export = run_old(&v10, &["export", v10_uri]);
+    assert_ok("v10 export", &export);
+    assert!(!export.stdout.is_empty(), "v10 export produced no rows");
+    let jsonl = temp.path().join("v10.jsonl");
+    std::fs::write(&jsonl, &export.stdout).unwrap();
+
+    // V11 must refuse before decoding v10's boolean profile as protocol-v2
+    // state. Pin both release-name slots in the operator rebuild guidance.
+    let refusal = output_failure(cli().arg("snapshot").arg(&v10_graph));
+    let stderr = String::from_utf8_lossy(&refusal.stderr);
+    assert!(
+        stderr.contains("created by omnigraph 0.10.0-dev"),
+        "v11 refusal must name the source-build line that wrote internal schema v10, got: {stderr}",
+    );
+    assert!(
+        stderr.contains("with an omnigraph 0.10.0-dev binary"),
+        "v11 refusal must direct the operator to the matching v10 source build for export, got: {stderr}",
+    );
+    assert!(
+        stderr.contains("export"),
+        "v11 refusal must direct the operator to export/import rebuild, got: {stderr}",
+    );
+
+    let v11_graph = temp.path().join("new-v11-profile-v2-from-v10.omni");
+    output_success(
+        cli()
+            .arg("init")
+            .arg("--schema")
+            .arg(&schema)
+            .arg(&v11_graph),
+    );
+    output_success(
+        cli()
+            .arg("load")
+            .arg("--mode")
+            .arg("overwrite")
+            .arg("--data")
+            .arg(&jsonl)
+            .arg(&v11_graph),
+    );
+    let reexport = output_success(cli().arg("export").arg(&v11_graph));
+    assert_export_fidelity("v10 → v11", &export.stdout, &reexport.stdout);
+    assert_exported_blob_fidelity("v10 → v11", &export.stdout, &reexport.stdout);
+    assert_current_graph_tables_use_exact_id_pk(&v11_graph);
+    assert_current_blob_bytes(&v11_graph, &[0, 1, 2, 3, 255]);
+
+    let reverse = run_old(&v10, &["snapshot", v11_graph.to_str().unwrap()]);
+    assert!(
+        !reverse.status.success(),
+        "a v10 binary must refuse a genuine v11 graph",
+    );
+    let reverse_stderr = String::from_utf8_lossy(&reverse.stderr);
+    assert!(
+        reverse_stderr.contains("upgrade omnigraph")
+            || reverse_stderr.contains("newer")
+            || reverse_stderr.contains("expects v10"),
+        "unexpected v10→v11 reverse-refusal message: {reverse_stderr}",
     );
 }

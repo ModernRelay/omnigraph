@@ -428,34 +428,27 @@ async fn branch_merge_as_allows_when_policy_permits_actor() {
         .expect("act-allowed should be able to BranchMerge");
 }
 
-/// RFC-026 §4.7 P1/2a: the streaming-enablement flip is Cedar-gated with the
-/// per-graph `stream_manage` action — an actor with no permit rule is denied,
-/// and a missing actor with a policy installed fails hard rather than silently
-/// skipping enforcement.
+/// The retired ambient toggle cannot become a control-plane side door.
+///
+/// Caller-selected actors are deliberately ignored at this boundary: both a
+/// denied actor and a missing actor receive the typed control-plane refusal.
 #[tokio::test]
-async fn set_streaming_enabled_as_denies_when_policy_rejects_actor() {
+async fn ambient_streaming_toggle_refuses_before_policy_dispatch() {
     let dir = tempfile::tempdir().unwrap();
     let (db, _engine) = init_with_policy(&dir).await;
 
-    assert_denied(
-        db.set_streaming_enabled_as(true, Some("act-denied")).await,
-        "set_streaming_enabled_as",
-    );
-    match db.set_streaming_enabled_as(true, None).await {
-        Err(OmniError::Policy(_)) => {}
-        other => panic!("missing actor with installed policy must be OmniError::Policy, got: {other:?}"),
+    for actor in [Some("act-denied"), None] {
+        assert!(matches!(
+            db.set_streaming_enabled_as(true, actor).await,
+            Err(OmniError::StreamingRequiresClusterControlPlane)
+        ));
     }
 }
 
-/// The permitted-actor arm: an explicit `stream_manage` rule lets the operator
-/// flip the flag, proving the enforce scope is `(StreamManage,
-/// ResourceScope::Graph)` — not accidentally branch-scoped.
-///
-/// The negative half is load-bearing for the P1→2a migration: a policy that
-/// grants only the old `admin` action must NOT reach the flip any more, or the
-/// action split would be cosmetic.
+/// Even a caller with `stream_manage` cannot use the ambient surface. Cedar is
+/// enforced only after a non-forgeable checked cluster authority is presented.
 #[tokio::test]
-async fn set_streaming_enabled_as_allows_when_policy_permits_actor() {
+async fn ambient_streaming_toggle_refuses_permitted_actor() {
     const STREAM_MANAGE_POLICY_YAML: &str = r#"
 version: 1
 groups:
@@ -466,16 +459,6 @@ rules:
       actors: { group: operators }
       actions: [stream_manage]
 "#;
-    const ADMIN_ONLY_POLICY_YAML: &str = r#"
-version: 1
-groups:
-  operators: [act-allowed]
-rules:
-  - id: operators-admin
-    allow:
-      actors: { group: operators }
-      actions: [admin]
-"#;
     let dir = tempfile::tempdir().unwrap();
     let db = init_and_load(&dir).await;
     let policy_path = dir.path().join("policy.yaml");
@@ -483,23 +466,8 @@ rules:
     let engine = PolicyEngine::load_graph(&policy_path, dir.path().to_str().unwrap()).unwrap();
     let db = db.with_policy(Arc::new(engine) as Arc<dyn PolicyChecker>);
 
-    let result = db
-        .set_streaming_enabled_as(true, Some("act-allowed"))
-        .await
-        .expect("permitted operator flips the flag");
-    assert!(result.changed);
-    assert!(result.streaming_enabled);
-
-    // Granting only the old `admin` action no longer authorizes the flip.
-    let admin_dir = tempfile::tempdir().unwrap();
-    let admin_db = init_and_load(&admin_dir).await;
-    let admin_policy_path = admin_dir.path().join("policy.yaml");
-    fs::write(&admin_policy_path, ADMIN_ONLY_POLICY_YAML).unwrap();
-    let admin_engine =
-        PolicyEngine::load_graph(&admin_policy_path, admin_dir.path().to_str().unwrap()).unwrap();
-    let admin_db = admin_db.with_policy(Arc::new(admin_engine) as Arc<dyn PolicyChecker>);
-    assert_denied(
-        admin_db.set_streaming_enabled_as(true, Some("act-allowed")).await,
-        "admin-only policy must not authorize a stream_manage flip",
-    );
+    assert!(matches!(
+        db.set_streaming_enabled_as(true, Some("act-allowed")).await,
+        Err(OmniError::StreamingRequiresClusterControlPlane)
+    ));
 }
