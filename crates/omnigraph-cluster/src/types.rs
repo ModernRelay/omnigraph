@@ -429,11 +429,12 @@ pub(crate) struct GraphConfig {
     /// Optional reference to a top-level `providers.embedding.<name>` profile.
     #[serde(default)]
     pub(crate) embedding_provider: Option<String>,
-    /// RFC-026 §4.7 P1: declare the graph's experimental streaming-enablement
-    /// flag. `cluster apply` propagates it into the graph's `__manifest` (the
-    /// engine-obeyed authority) via `set_streaming_enabled_as`. Absent means
-    /// UNMANAGED — removal of the key never disables; disabling requires an
-    /// explicit `streaming: false` and converges pending-until-drained.
+    /// RFC-026 F2: declare the graph's experimental stream profile.
+    /// `cluster apply` reconciles it through the checked offline authority
+    /// bound to the held state lock; the ambient engine toggle always refuses.
+    /// Absent means UNMANAGED, but removing the key never disables active
+    /// manifest authority: disabling requires an explicit `streaming: false`
+    /// and converges pending-until-drained.
     /// `skip_serializing_if` is load-bearing: an absent key must serialize
     /// byte-identically so existing clusters' `desired_config_digest` (and the
     /// approvals bound to it) do not churn.
@@ -613,6 +614,24 @@ pub(crate) struct StateResource {
     /// pre-streaming ledgers (which must keep parsing unchanged).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) streaming_enabled: Option<bool>,
+    /// `streaming.<id>` resources only: a domain-separated revision of this
+    /// graph's declaration. It changes when that declaration changes, but not
+    /// when an unrelated cluster resource advances the global config digest.
+    /// The manifest fold delegation and served runtime bind this value.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) declaration_revision: Option<String>,
+    /// Exact v2 profile mode (`DISABLED | ENABLED | DISABLING | RETIRED`).
+    /// Unlike the compatibility boolean, this preserves a durable disable
+    /// continuation and prevents refresh from mistaking it for terminal
+    /// `DISABLED`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) profile_mode: Option<String>,
+    /// `streaming.<id>` resources only: exact manifest profile revision
+    /// observed or published with `streaming_enabled`. Older ledgers parse
+    /// with this absent, but an enabled served runtime refuses to mint
+    /// authority until refresh/apply backfills it from engine truth.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) profile_revision: Option<u64>,
 }
 
 /// Recovery-intent record for a graph-moving apply operation (RFC-004 §D2).

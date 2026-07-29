@@ -19,7 +19,7 @@ authority.
 - No `omnigraph run *` CLI subcommands and no `/runs/*` HTTP endpoints.
 - No `__run__<id>` staging branches; `__run__*` is no longer a reserved
   name. The branch-name guard was removed in MR-770. Historically, the v2→v3
-  in-place migration swept stale `__run__*` entries; the current v9 strand is
+  in-place migration swept stale `__run__*` entries; the current v11 strand is
   strict single-version, so older graphs are refused and rebuilt by
   export/init/load rather than migrated on open. (Inert `_graph_runs.lance`
   bytes in an old export source remain irrelevant to the rebuilt graph.)
@@ -543,17 +543,23 @@ Empty-table overwrite is
 represented as a valid zero-fragment Lance `Overwrite` transaction, not as
 truncate-then-append.
 
-### RFC-026 private stream foundation, B2 core, and retain-all profile
+### RFC-026 private stream foundation, B2 core, retain-all, and profile authority
 
-Internal schema v9 is the current data-bearing MemWAL format. It preserves
+Internal schema v9 introduced the current data-bearing MemWAL shape. It preserves
 Phase A's enrollment foundation and Phase B1's bounded one-generation worker,
 then activates the private B2 compare-and-chain/token-fold slice through
 stream-config v3, lifecycle state-v2, recovery-v12, and the manifest-selected
 graph-global `_stream_tokens.lance` participant. The code is always compiled
 but remains crate-private; only the doc-hidden callable integration-test seam is
-feature-gated. There is no accepted-schema declaration, production enrollment,
-SDK, CLI, HTTP, Cedar, OpenAPI, lifecycle-management, correction, or status
-surface.
+feature-gated. Current internal schema v11 preserves its ordinary
+recovery-v12 fold byte-for-byte and adds checked profile protocol v2 plus exact
+recovery-v13 `StreamProfileChange`. `DISABLING` is explicit/resumable and can
+complete disable when no lifecycle rows exist or every existing lane is
+already `SEALED`; it cannot drain a non-`SEALED` lane. The Cedar vocabulary, manifest-only status,
+and checked stopped/offline and runtime ownership exist; there is no
+accepted-schema declaration, production enrollment, public ingest,
+enrolled-lane claim/drain, correction/retirement, or HTTP/CLI/OpenAPI streaming
+surface. Those lifecycle effects require another strict format/recovery strand.
 
 Phase A still owns physical enrollment:
 
@@ -649,7 +655,7 @@ retire and retry; if the exact base effect landed but the token effect did not,
 recovery may complete only the exact token transaction described by the durable
 plan. A foreign, buried, differently marked, partially ambiguous, or
 authority-mismatched outcome fails closed. Recovery-v11 is historical v8 state
-and is refused under v9 because it has no token participant or complete
+and is refused under the current format because it has no token participant or complete
 state-v2 outcome.
 
 B1 performs no fresh-tier reads and no generation GC. Acknowledged rows become
@@ -763,9 +769,10 @@ retained physical bytes are countable and eligible versions permanently
 deletable. Measurements validate those bounds; they do not create them. Generic
 Lance cleanup does not reclaim `_mem_wal`, and OmniGraph must never delete its
 raw paths. Internal schema v9/config-v3/state-v2/recovery-v12 is active for the
-private row/fold slice; every public policy/wire surface remains inactive until
-its authorization, cancellation, lifecycle/correction/status, compatibility,
-and parity evidence passes. The selected
+private row/fold slice; v11/profile-v2/recovery-v13 adds only checked profile
+authority and its exact receipt. Every public wire surface remains inactive
+until cancellation, enrolled-lane lifecycle/correction/status, compatibility,
+and parity evidence passes in a later strict strand. The selected
 unbounded retain-all profile has no physical watermark and no graph-history
 quota. If a future B2b bounded/managed profile is pursued, its physical
 watermark is per binding and does not bound base/token or shared manifest
@@ -905,7 +912,10 @@ retires, index-only provisions the fixed empty shard, and
 index-plus-empty-shard publishes pointer + lifecycle. Current recovery-v12
 `StreamFold` owns exact base and token transactions and publishes only their
 exact joint pointer/lifecycle/lineage/attribution outcome. Recovery-v11 is the
-historical v8 one-participant fold and is not recoverable under v9. No envelope
+historical v8 one-participant fold and is not recoverable under the current
+format. Recovery-v13 `StreamProfileChange` owns one exact profile-receipt token
+transaction and publishes only its achieved witness plus fixed protocol-v2
+profile; it does not change the v12 fold. No envelope
 grants permission to adopt an ambiguous artifact.
 
 A failure between Phase A and Phase D leaves the sidecar on disk. The
@@ -913,8 +923,8 @@ next `Omnigraph::open` (gated on `OpenMode::ReadWrite`) runs the
 recovery sweep in `crates/omnigraph/src/db/manifest/recovery.rs`:
 
 The established writers emit sidecar schema v9. RFC-026 additionally emits the
-dedicated recovery-v10 `StreamEnrollment` and recovery-v12 `StreamFold`
-envelopes. The JSON field names
+dedicated recovery-v10 `StreamEnrollment`, recovery-v12 `StreamFold`, and
+recovery-v13 `StreamProfileChange` envelopes. The JSON field names
 `protocol_v3`, `protocol_v4`, `protocol_v7`, and `protocol_v8` are retained
 payload-version names for mutation/load, BranchMerge, SchemaApply, and
 EnsureIndices respectively; they do not mean the outer envelope is pre-v9.
@@ -968,8 +978,12 @@ EnsureIndices respectively; they do not mean the outer envelope is pre-v9.
   plan; only exact base plus exact token may publish. Foreign, buried,
   differently marked, partially ambiguous, or authority-mismatched state fails
   closed with the sidecar intact. Historical schema-v11 folds are refused under
-  internal schema v9 because they lack the token participant and complete
+  the current format because they lack the token participant and complete
   state-v2 lifecycle authority.
+  Recovery-v13 `StreamProfileChange` requires the exact old/new profile,
+  pre-minted `ProfileManagementReceipt` transaction, and fixed resulting token
+  witness. Only that exact achieved receipt plus profile may reach the sole
+  manifest CAS; unknown v13 variants fail closed.
   First-touch rollback deletes only the exact owned version-one dataset and only
   while no manifest registration or competing recovery claim owns the path. A
   foreign winner at an unregistered first-touch path is left untouched and is
@@ -1292,26 +1306,39 @@ root moves to v8 only through export/init/load into a different root; v8 refuses
 v7 and a v7 binary refuses v8. This format capability does not expose a public
 streaming API.
 
-V9 is the current development strand. It preserves the bounded B1 worker
+V9 preserves the bounded B1 worker
 mechanics while activating stream-config v3, lifecycle state-v2, hidden trusted
 row metadata, the manifest-selected graph-global `_stream_tokens.lance`
 authority, and recovery-v12's exact base-plus-token fold. Recovery-v11 remains
-historical v8 syntax and is refused under v9. The genuine v8↔v9 CI gate builds
+historical v8 syntax and is refused by later formats. The genuine v8↔v9 CI gate builds
 the final v8 binary, proves refusal in both directions, and rebuilds through
 export/init/load while preserving logical rows, physical vector values, and
 exact-`id` PK metadata. Export deliberately omits v9's trusted hidden stream
 metadata and does not transfer token authority. This remains a private-core
 format, not a public streaming API.
 
+V10 adds the required disabled-from-genesis graph profile singleton and
+reserved-null dead-letter reference. V11 is the current development strand: it
+replaces the v10 boolean with checked profile protocol v2 and adds
+recovery-v13 `StreamProfileChange`, while preserving recovery-v10 enrollment
+and the private ordinary recovery-v12 fold byte-for-byte. `DISABLING` owns an
+exact restart/resume plan and drain-only continuation; `RETIRED` decodes
+fail-closed. Disable can complete with no lifecycle rows or only already-`SEALED`
+lanes, but not with a non-`SEALED` lane. Public ingress/enrollment,
+enrolled-lane claim/drain, correction/retirement, and maintenance integration
+remain inactive and require another strict graph/recovery strand because the
+complete lifecycle family was not pre-registered under v11/v13.
+
 The stamp history (v1 PK-less, v2 unenforced-PK, v3 `__run__*` sweep, v4 lineage
 in `__manifest` with the commit-graph tables retired, v5 stable table identity,
 v6 exact-`id` PK metadata plus fenced keyed routing, v7 identity-keyed stream
 lifecycle authority plus the recoverable empty-enrollment foundation, v8
-stream-config v2 plus the private recovery-v11 row/fold core, and v9
+stream-config v2 plus the private recovery-v11 row/fold core, v9
 stream-config v3/state-v2 plus manifest-selected token authority and
-recovery-v12) is recorded on the `INTERNAL_MANIFEST_SCHEMA_VERSION` doc-comment;
-only v9 is served. An earlier-stamped graph is rebuilt via export/import, not
-migrated in place.
+recovery-v12, v10 graph-profile enablement, and v11 checked profile-v2 plus
+recovery-v13 profile receipts) is recorded on the
+`INTERNAL_MANIFEST_SCHEMA_VERSION` doc-comment; only v11 is served. An
+earlier-stamped graph is rebuilt via export/import, not migrated in place.
 
 ## Mid-query partial failure: closed by MR-794
 

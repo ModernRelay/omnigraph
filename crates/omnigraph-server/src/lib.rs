@@ -216,6 +216,10 @@ pub struct GraphStartupConfig {
     pub graph_id: String,
     pub uri: String,
     pub policy: Option<PolicySource>,
+    /// Cloneable serving-snapshot evidence for an enabled stream profile.
+    /// This is not writer authority; `open_single_graph` rereads canonical
+    /// cluster state and consumes it into a non-cloneable runtime guard.
+    pub stream_runtime_authority: Option<omnigraph_cluster::RuntimeAuthorityBinding>,
     /// Pre-resolved embedding config from an applied cluster provider profile.
     /// Legacy config paths leave this unset and continue to use env resolution.
     pub embedding: Option<omnigraph::embedding::EmbeddingConfig>,
@@ -907,6 +911,11 @@ impl ApiError {
             // this slice (the flip is cluster-apply-only); the mapping exists
             // so the taxonomy stays total.
             err @ OmniError::StreamingDisablePending { .. } => Self::conflict(err.to_string()),
+            err @ (OmniError::StreamingRequiresClusterControlPlane
+            | OmniError::StreamingRequiresClusterRuntime { .. }
+            | OmniError::StreamingContentOperationUnsupported { .. }
+            | OmniError::StreamingAuthorityMismatch { .. }
+            | OmniError::StreamAuthorityRetired) => Self::conflict(err.to_string()),
             err @ (OmniError::StreamBindingChanged { .. }
             | OmniError::StreamSequenceConflict { .. }
             | OmniError::StreamIdempotencyConflict { .. }) => Self::conflict(err.to_string()),
@@ -1375,6 +1384,48 @@ async fn open_single_graph(cfg: GraphStartupConfig) -> Result<Arc<GraphHandle>> 
     let db = Omnigraph::open(&uri)
         .await
         .map_err(|err| color_eyre::eyre::eyre!("open graph '{}' at {}: {err}", graph_id, uri))?;
+    let db = if let Some(binding) = cfg.stream_runtime_authority {
+        let operation_id = format!(
+            "serve:{}:state-{}",
+            graph_id.as_str(),
+            binding.state_revision()
+        );
+        let guard = omnigraph_cluster::mint_runtime_guard(
+            binding,
+            &operation_id,
+            "omnigraph:server",
+        )
+        .await
+        .map_err(|err| {
+            color_eyre::eyre::eyre!(
+                "validate stream runtime authority for graph '{}': {err}",
+                graph_id
+            )
+        })?;
+        db.with_checked_cluster_stream_runtime(guard)
+            .await
+            .map_err(|err| {
+                color_eyre::eyre::eyre!(
+                    "bind stream runtime authority for graph '{}': {err}",
+                    graph_id
+                )
+            })?
+    } else {
+        let status = db.stream_status().await.map_err(|err| {
+            color_eyre::eyre::eyre!(
+                "read stream profile for graph '{}' during startup: {err}",
+                graph_id
+            )
+        })?;
+        if !matches!(status.profile_mode, "DISABLED" | "RETIRED") {
+            return Err(color_eyre::eyre::eyre!(
+                "graph '{}' is {}, but the applied cluster snapshot supplied no matching stream runtime authority; stop serving, reconcile with `cluster apply --confirm-stream-offline`, and restart",
+                graph_id,
+                status.profile_mode
+            ));
+        }
+        db
+    };
     let db = if let Some(embedding) = cfg.embedding {
         db.with_embedding_config(Arc::new(embedding))
     } else {

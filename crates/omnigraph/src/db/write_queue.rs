@@ -14,7 +14,8 @@
 //! remains in-process only; cross-process writers on one graph remain
 //! one-winner-CAS at publish.
 //!
-//! RFC-026 adds a separate admission lease keyed by immutable
+//! RFC-026 adds a graph-global profile-transition gate plus a separate
+//! admission lease keyed by immutable
 //! [`TableIdentity`](crate::db::manifest::TableIdentity) plus the resolved
 //! physical Lance ref (`None` means main). Shared leases are the future
 //! final-check-through-effect window for ordinary base-table writers and
@@ -22,9 +23,11 @@
 //! alias is deliberately not accepted by the key: a rename keeps contending on
 //! the same table lifetime, while drop/re-add gets a different incarnation.
 //!
-//! The admission lease is the **outermost** process-local gate. A caller that
-//! composes it with existing gates acquires admission key(s) first, then keeps
-//! the established schema -> branch -> token-authority -> sorted-table order.
+//! The graph-profile gate is the **outermost** process-local gate. Ordinary
+//! writers hold it shared from profile preflight through completion; a profile
+//! transition holds it exclusively. A caller that composes it with existing
+//! gates acquires graph-profile -> admission key(s), then keeps the established
+//! schema -> branch -> token-authority -> sorted-table order.
 //! The token-authority gate is graph-global because every B2 fold advances the
 //! same manifest-selected `_stream_tokens.lance` participant. This prevents an
 //! append (which needs only a shared admission lease) from deadlocking with a
@@ -132,6 +135,15 @@ pub(crate) struct WriteQueueManager {
     /// gate, then holds it through exact participant confirmation and the one
     /// manifest visibility CAS.
     stream_token_gate: Arc<AsyncMutex<()>>,
+    /// Graph-global RFC-026 profile-transition gate.
+    ///
+    /// Mutation/load and the remaining ordinary writers eventually hold a
+    /// shared guard from their profile-authority preflight through the whole
+    /// operation. A profile transition takes the same gate exclusively before
+    /// changing the manifest profile. The gate is root-shared across
+    /// independently opened handles, but remains process-local contention
+    /// control rather than durable profile authority.
+    stream_profile_gate: Arc<AsyncRwLock<()>>,
     /// RFC-026 final-check-through-effect admission domains.
     ///
     /// Tokio's fair, write-preferring `RwLock` lets ordinary writers/appends
@@ -201,11 +213,30 @@ impl WriteQueueManager {
         fresh
     }
 
+    /// Acquire the graph-global shared profile window for an ordinary writer.
+    ///
+    /// This is the outermost process-local gate. Hold it from the future
+    /// profile-authority preflight through the entire operation, including any
+    /// retry or recovery work.
+    pub(crate) async fn acquire_stream_profile_shared(&self) -> OwnedRwLockReadGuard<()> {
+        Arc::clone(&self.stream_profile_gate).read_owned().await
+    }
+
+    /// Acquire exclusive graph-global admission for a profile transition.
+    ///
+    /// Take this before any table admission, schema, branch, token-authority,
+    /// or table gate, and keep it through the durable profile transition.
+    #[allow(dead_code)] // Scaffolded before the profile-transition writer is wired.
+    pub(crate) async fn acquire_stream_profile_exclusive(&self) -> OwnedRwLockWriteGuard<()> {
+        Arc::clone(&self.stream_profile_gate).write_owned().await
+    }
+
     /// Acquire a shared RFC-026 admission window for one physical table ref.
     ///
     /// Future ordinary writers and MemWAL appends hold this from their final
     /// durable-authority check through physical-effect/durability resolution.
-    /// Acquire this outer gate before schema, branch, or legacy table queues.
+    /// Acquire this after the graph-profile gate and before schema, branch, or
+    /// legacy table queues.
     pub(crate) async fn acquire_stream_shared(
         &self,
         key: &StreamAdmissionKey,
@@ -215,10 +246,10 @@ impl WriteQueueManager {
 
     /// Acquire exclusive RFC-026 admission closure for enrollment or drain.
     ///
-    /// Acquire this outer gate before schema, branch, or legacy table queues,
-    /// then keep it through the lifecycle transition and relevant physical
-    /// effects. It does not replace durable manifest authority or a
-    /// cross-process fence.
+    /// Acquire this after the graph-profile gate and before schema, branch, or
+    /// legacy table queues, then keep it through the lifecycle transition and
+    /// relevant physical effects. It does not replace durable manifest
+    /// authority or a cross-process fence.
     pub(crate) async fn acquire_stream_exclusive(
         &self,
         key: &StreamAdmissionKey,
@@ -272,9 +303,9 @@ impl WriteQueueManager {
     /// Acquire the graph-global RFC-026 token-participant gate.
     ///
     /// Callers compose this only in the canonical order: sorted relevant
-    /// stream admission -> schema -> main branch -> token -> sorted graph
-    /// tables. The mutex is process-local contention control; the exact
-    /// manifest-selected token witness and recovery-v12 remain durable
+    /// graph profile -> stream admission -> schema -> main branch -> token ->
+    /// sorted graph tables. The mutex is process-local contention control; the
+    /// exact manifest-selected token witness and recovery-v12 remain durable
     /// authority.
     pub(crate) async fn acquire_stream_token(&self) -> OwnedMutexGuard<()> {
         Arc::clone(&self.stream_token_gate).lock_owned().await
@@ -530,6 +561,44 @@ mod tests {
             .expect("renamed lifetime did not acquire after release")
             .expect("renamed admission task exited before acquisition");
         renamed_task.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn separately_opened_handles_share_one_graph_profile_gate() {
+        let root = format!("memory://stream-profile-gate/{}", ulid::Ulid::new());
+        let first = WriteQueueManager::for_root(&root);
+        let second = WriteQueueManager::for_root(&root);
+
+        let first_shared = first.acquire_stream_profile_shared().await;
+        let second_shared = timeout(
+            Duration::from_secs(2),
+            second.acquire_stream_profile_shared(),
+        )
+        .await
+        .expect("ordinary writers must be able to share the graph-profile window");
+
+        let (started_tx, started_rx) = oneshot::channel();
+        let (acquired_tx, mut acquired_rx) = oneshot::channel();
+        let transition = tokio::spawn(async move {
+            started_tx.send(()).unwrap();
+            let _guard = second.acquire_stream_profile_exclusive().await;
+            acquired_tx.send(()).unwrap();
+        });
+        started_rx.await.unwrap();
+        assert!(
+            timeout(Duration::from_millis(50), &mut acquired_rx)
+                .await
+                .is_err(),
+            "a profile transition must wait for every admitted ordinary writer"
+        );
+
+        drop(first_shared);
+        drop(second_shared);
+        timeout(Duration::from_secs(2), &mut acquired_rx)
+            .await
+            .expect("profile transition did not acquire after shared writers completed")
+            .expect("profile-transition task exited before acquisition");
+        transition.await.unwrap();
     }
 
     #[tokio::test]

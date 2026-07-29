@@ -231,7 +231,7 @@ fi
 
 publisher_block="$(
     sed -n \
-        '/^  firehose_publish_dependencies:/,/^  v9_v10_format_fence:/p' \
+        '/^  firehose_publish_dependencies:/,/^  v10_v11_format_fence:/p' \
         "$repo_root/.github/workflows/ci.yml"
 )"
 while IFS= read -r job_id; do

@@ -143,6 +143,7 @@ What each change kind does:
 | a policy file | `Update policy.<n>` | same — new blob, ledger update |
 | a policy's `applies_to` | `Update policy.<n> [bindings]` | records the new bindings (the file digest is unchanged; bindings are first-class changes) |
 | a `.pg` schema | `Update schema.<g>` **with the real migration steps embedded** | runs the engine's schema apply on the live graph — soft drops only, sidecar-fenced |
+| `graphs.<g>.streaming` changes | `Create/Update streaming.<g>` | only after writers are stopped: requires `--as <actor> --confirm-stream-offline` and the state lock; publishes graph-owned profile authority |
 | `graphs:` gains an entry | `Create graph.<g>` (+ schema, queries) | initializes the graph at its derived root; dependents apply in the same run |
 | `graphs:` loses an entry | `Delete graph.<g>` — **blocked, `approval_required`** | nothing, until approved (see §4) |
 
@@ -159,6 +160,51 @@ Read the plan before applying when the change is non-trivial — for schema
 updates it embeds the engine's actual migration plan (`add_property`,
 `drop_property [soft]`, `unsupported: …`), so you see data impact before
 anything runs.
+
+### Experimental streaming profile: stop → apply → restart
+
+A streaming-profile change has a stricter process topology than an ordinary
+catalog edit:
+
+```bash
+# 1. Gracefully stop every writer-capable process for the affected graph.
+# 2. Apply while holding the normal state lock and attest the offline handoff.
+omnigraph cluster apply --config company-brain \
+  --as andrew --confirm-stream-offline
+# 3. Restart the cluster server after apply exits.
+```
+
+The confirmation flag is an explicit operator attestation, not a distributed
+lease. `state.lock: false` refuses a profile change, and running this apply
+concurrently with a writer server is unsupported.
+
+The apply actor must pass `stream_manage` under both the currently applied
+graph policy and the desired graph policy. If only one revision binds a
+policy, that policy governs; a simultaneous policy change must be allowed by
+both sides until the state CAS publishes the desired revision. If one side
+would deny the profile transition, split the work: grant first and change the
+profile second, or change the profile first and revoke the grant second. A
+blocked profile transition also blocks current- or desired-bound policy
+changes for that graph, preserving the currently applied policy authority for
+the retry instead of landing a simultaneous revoke.
+
+The retained profile receipt is also bound to the original apply actor. Retry
+a lost result with the same `--as` value. If that identity is unavailable
+after the graph effect landed but the state CAS did not, use `cluster refresh`
+to reconcile the ledger from manifest truth before replanning under another
+actor; a different actor cannot adopt the original receipt directly.
+
+In this release, `streaming: true` is not additive: it makes embedded SDK and
+direct `--store` Mutation/Load/delete fail before input reads or durable
+effects. Existing served mutations work only through the restarted
+cluster-booted server's checked runtime authority. There is no public firehose
+ingress yet. Branch merge remains refused while the profile is `ENABLED` or
+`DISABLING`, including through the checked server runtime. A later explicit
+`streaming: false` offline apply can reach `DISABLED` when there are no lanes
+or every existing lane is already `SEALED`; it cannot drain a non-`SEALED`
+lane in this release. Only the no-lane case restores the direct physical lane.
+Already-`SEALED` enrollments remain fenced, so use the strict export/init/load
+rebuild to return an enrolled graph to that non-streaming lane.
 
 ## 3. Inspect: status, refresh, drift
 

@@ -60,18 +60,20 @@ pub(crate) use recovery::{
     HealPendingOutcome, MAX_BRANCH_MERGE_DATA_TRANSACTIONS, RecoveryAuthorityToken,
     RecoveryBranchMergeEffect, RecoveryBranchMergeEffectKind, RecoveryLineageIntent,
     RecoveryManifestDelta, RecoveryMode, RecoverySchemaApplyEffect, RecoverySchemaApplyEffectKind,
-    RecoverySidecar, RecoverySidecarHandle,
+    RecoverySidecar, RecoverySidecarHandle, RecoveryStreamProfileChangeKind,
     RecoveryStreamFoldCut, RecoveryTableUpdateSlot, SidecarKind, SidecarTablePin,
     SidecarTableRegistration, SidecarTableRename, SidecarTombstone,
     complete_stream_enrollment_sidecar_v10, complete_stream_fold_sidecar_v12,
+    complete_stream_profile_change_sidecar_v13,
     confirm_branch_merge_sidecar_v9,
     confirm_ensure_indices_sidecar_v9, confirm_occ_sidecar_v9, confirm_schema_apply_sidecar_v9,
-    confirm_stream_fold_sidecar_v12, delete_sidecar, ensure_read_only_schema_coherent,
+    confirm_stream_fold_sidecar_v12, confirm_stream_profile_change_sidecar_v13, delete_sidecar,
+    ensure_read_only_schema_coherent,
     finalize_effect_free_occ_sidecar, finalize_effect_free_stream_fold_sidecar_v12,
     heal_pending_sidecars_roll_forward,
     list_sidecars, new_branch_merge_sidecar_v9, new_ensure_indices_sidecar_v9, new_occ_sidecar_v9,
     new_optimize_sidecar_v9, new_schema_apply_sidecar_v9, new_stream_enrollment_sidecar_v10,
-    new_stream_fold_sidecar_v12, recover_manifest_drift,
+    new_stream_fold_sidecar_v12, new_stream_profile_change_sidecar_v13, recover_manifest_drift,
     schema_apply_serial_queue_key, write_sidecar,
 };
 pub use state::SubTableEntry;
@@ -83,9 +85,18 @@ pub(crate) use stream::{
     CurrentHeadWitness, EnrollmentReceipt, STREAM_CONFIG_VERSION, StreamLifecycle,
     StreamLifecycleEntry, StreamPhysicalBinding, stream_enrollment_intent_digest_v1,
 };
-pub(crate) use stream_profile::StreamProfileEntry;
+pub(crate) use stream_profile::{
+    DisablePlan, FoldContinuation, FoldDelegation, ProfileManagementReceipt,
+    ProfileManagementResult, StreamProfileEntry, StreamProfileMode, StreamProfileState,
+    stream_profile_cluster_root_digest,
+    stream_profile_graph_identity_digest, stream_profile_management_request_digest,
+};
 pub use stream_profile::StreamingStatus;
-pub(crate) use token_store::{StreamTokenAuthorityEntry, open_stream_token_authority_at};
+pub(crate) use token_store::{
+    StreamTokenAuthorityEntry, lookup_profile_management_receipt,
+    open_stream_token_authority_at, open_stream_token_authority_head,
+    stage_profile_management_receipt, stream_token_authority_entry_for_dataset,
+};
 
 /// The internal-schema (storage-format) version this binary writes and reads.
 /// A graph's on-disk per-branch stamp is read via [`internal_schema_stamp_at`];
@@ -686,11 +697,13 @@ impl Snapshot {
     /// pending-until-drained).
     pub fn streaming_status(&self) -> StreamingStatus {
         StreamingStatus {
-            enabled: self.stream_profile.streaming_enabled,
+            enabled: self.stream_profile.streaming_enabled(),
             undrained: self
                 .stream_lifecycles
                 .values()
                 .any(|lifecycle| lifecycle.lifecycle != StreamLifecycle::Sealed),
+            profile_revision: self.stream_profile.profile_revision,
+            profile_mode: self.stream_profile.mode().as_str(),
         }
     }
 
@@ -951,10 +964,12 @@ pub(crate) enum ManifestChange {
         expected: StreamTokenAuthorityEntry,
         next: StreamTokenAuthorityEntry,
     },
-    /// Flip the graph-global RFC-026 §4.7 stream-profile enablement row under
-    /// an exact full-entry CAS. Genesis always provisions the row (disabled),
-    /// so there is no absent-row/bootstrap publish mode; `profile_revision`
-    /// must advance strictly.
+    /// Transition the graph-global RFC-026 §4.7 stream-profile row under an
+    /// exact full-entry CAS. Genesis always provisions the row (disabled), so
+    /// there is no absent-row/bootstrap publish mode. Receipt-chain-advancing
+    /// terminal transitions must share one manifest batch with an effective
+    /// [`ManifestChange::SetStreamTokenAuthority`] advance; the admission-closing
+    /// `ENABLED -> DISABLING` transition deliberately preserves the chain.
     SetStreamProfile {
         expected: StreamProfileEntry,
         next: StreamProfileEntry,

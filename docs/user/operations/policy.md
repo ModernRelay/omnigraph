@@ -62,6 +62,16 @@ graph's HTTP request flows through its bound bundle; the management endpoint
 control because `graph_list` is not a `read`-equivalent action. The operator must
 bind a `cluster`-scoped bundle granting `graph_list` to expose `/graphs`.
 
+Streaming-profile apply spans a cluster-state CAS, so `stream_manage` uses a
+fail-closed two-revision rule. The graph policy bound in the currently applied
+revision and the graph policy bound in the desired revision must both allow
+the actor; if only one side has a policy, that one governs. An unchanged
+address-and-digest pair is evaluated once. This prevents either the old or new
+policy from being skipped when a policy edit and profile change share one
+apply. A grant that is needed for the transition must therefore land in a
+policy-only apply first. Conversely, perform the profile transition while both
+revisions still grant `stream_manage`, then revoke it in a later apply.
+
 Example `cluster`-scoped bundle:
 
 ```yaml

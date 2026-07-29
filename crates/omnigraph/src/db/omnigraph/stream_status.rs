@@ -72,7 +72,10 @@ pub struct StreamTableStatus {
 #[derive(Debug, Clone, PartialEq, Eq)]
 #[non_exhaustive]
 pub struct StreamStatus {
-    /// The §4.7 P1 graph-global enablement flag.
+    /// Exact graph-global profile mode: `DISABLED`, `ENABLED`, `DISABLING`, or
+    /// `RETIRED`.
+    pub profile_mode: &'static str,
+    /// Compatibility projection: true only for exact `ENABLED`.
     pub streaming_enabled: bool,
     /// Revision of the enablement row itself (distinct from per-lane
     /// `lifecycle_revision`).
@@ -152,7 +155,8 @@ fn project_stream_status(snapshot: &Snapshot) -> Result<StreamStatus> {
     });
 
     Ok(StreamStatus {
-        streaming_enabled: profile.streaming_enabled,
+        profile_mode: profile.mode().as_str(),
+        streaming_enabled: profile.streaming_enabled(),
         profile_revision: profile.profile_revision,
         tables,
     })

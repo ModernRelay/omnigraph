@@ -206,12 +206,12 @@ const OPTIMIZE_V9: WriteProtocol = WriteProtocol::Bounded("Optimize v9");
 const STREAM_ENROLLMENT_V10: WriteProtocol = WriteProtocol::Exact("StreamEnrollment v10");
 const STREAM_FOLD_V12: WriteProtocol =
     WriteProtocol::Exact("StreamFold v12 / private B2 common core");
-/// RFC-026 §4.7 P1: the graph-wide enablement flip — one exact-entry
-/// `SetStreamProfile` manifest CAS with a strict revision advance, no
-/// pre-manifest durable effects, no recovery sidecar (repair-style), one
-/// ordinary lineage commit.
-const STREAM_PROFILE_V1: WriteProtocol =
-    WriteProtocol::Exact("StreamProfile v1 / single-CAS enablement flip");
+/// RFC-026 checked profile authority: ENABLED/DISABLED terminal transitions
+/// pair one immutable token-ledger receipt with one profile/lineage publish
+/// under recovery-v13. Disable additionally persists the admission-cutoff
+/// `DISABLING` continuation before its terminal receipt.
+const STREAM_PROFILE_V13: WriteProtocol =
+    WriteProtocol::Exact("StreamProfileChange recovery v13");
 
 #[derive(Debug, Clone, Copy)]
 struct WriteSurface {
@@ -243,7 +243,8 @@ write_surfaces! {
     "db/omnigraph/stream_ingest.rs" => WriteProtocol::TestOnly => ["failpoint_stream_b1_for_test", "failpoint_stream_b2_for_test"],
     "db/omnigraph.rs" => OPTIMIZE_V9 => ["optimize"],
     "db/omnigraph.rs" => WriteProtocol::ManifestAdoption => ["repair"],
-    "db/omnigraph/stream_profile.rs" => STREAM_PROFILE_V1 => ["set_streaming_enabled_as"],
+    "db/omnigraph/stream_profile.rs" => WriteProtocol::Composed("control-plane-required refusal") => ["set_streaming_enabled_as"],
+    "db/omnigraph/stream_profile.rs" => STREAM_PROFILE_V13 => ["set_streaming_profile_checked"],
     "db/omnigraph.rs" => WriteProtocol::PhysicalOnly => ["cleanup"],
     "db/omnigraph.rs" => WriteProtocol::NativeRefControl => ["branch_create", "branch_create_as", "branch_create_from", "branch_create_from_as", "branch_delete", "branch_delete_as"],
 }
@@ -255,6 +256,8 @@ write_surfaces! {
 // cannot evade discovery.
 const READ_ONLY_SURFACES: &[(&str, &str)] = &[
     ("db/omnigraph.rs", "open_read_only"),
+    ("db/omnigraph/stream_profile.rs", "check_cluster_apply_authority"),
+    ("db/omnigraph/stream_profile.rs", "with_checked_cluster_stream_runtime"),
     ("db/omnigraph/stream_ingest.rs", "failpoint_stream_incarnation_for_test"),
     ("db/omnigraph.rs", "plan_schema"),
     ("db/omnigraph.rs", "plan_schema_with_options"),
@@ -669,17 +672,22 @@ durable_calls! {
     ("db/omnigraph/optimize.rs", "write_sidecar(", 1, OPTIMIZE_V9),
     ("db/omnigraph/stream_enrollment.rs", "write_sidecar(", 1, STREAM_ENROLLMENT_V10),
     ("db/omnigraph/stream_ingest.rs", "write_sidecar(", 1, STREAM_FOLD_V12),
+    ("db/omnigraph/stream_profile.rs", "write_sidecar(", 1, STREAM_PROFILE_V13),
     ("db/manifest/token_store.rs", "Dataset::write(", 1, WriteProtocol::Bootstrap),
-    ("db/manifest/token_store.rs", "MergeInsertBuilder::try_new(", 1, STREAM_FOLD_V12),
-    ("db/manifest/token_store.rs", ".execute_uncommitted(", 1, STREAM_FOLD_V12),
+    ("db/manifest/token_store.rs", "MergeInsertBuilder::try_new(", 2, WriteProtocol::Composed("StreamFold v12 + StreamProfileChange v13 token-ledger staging")),
+    ("db/manifest/token_store.rs", ".execute_uncommitted(", 2, WriteProtocol::Composed("StreamFold v12 + StreamProfileChange v13 token-ledger staging")),
     ("db/omnigraph/stream_ingest.rs", "stage_stream_token_upsert(", 1, STREAM_FOLD_V12),
     ("db/manifest/recovery.rs", "stage_stream_token_upsert(", 1, WriteProtocol::RecoveryExecutor),
+    ("db/omnigraph/stream_profile.rs", "stage_profile_management_receipt(", 1, STREAM_PROFILE_V13),
     ("exec/staging.rs", ".commit_staged_exact(", 1, WriteProtocol::Exact("Mutation/Load v9")),
     ("exec/merge.rs", ".commit_staged_exact(", 1, MERGE_V9),
     ("db/omnigraph/schema_apply.rs", ".commit_staged_create_exact(", 1, SCHEMA_V9),
     ("db/omnigraph/schema_apply.rs", ".commit_staged_exact(", 1, SCHEMA_V9),
     ("db/omnigraph/table_ops.rs", ".commit_staged_exact(", 1, INDICES_V9),
     ("db/omnigraph/stream_ingest.rs", ".commit_staged_exact(", 2, STREAM_FOLD_V12),
+    ("db/omnigraph/stream_profile.rs", ".commit_staged_exact(", 1, STREAM_PROFILE_V13),
+    ("db/omnigraph/stream_profile.rs", ".dataset()", 1, WriteProtocol::ReadOnlyAccess),
+    ("db/omnigraph/stream_profile.rs", "SnapshotHandle::new(", 1, STREAM_PROFILE_V13),
     ("db/manifest/recovery.rs", ".commit_staged_exact(", 1, WriteProtocol::RecoveryExecutor),
     ("db/omnigraph/table_ops.rs", ".commit_staged(", 1, WriteProtocol::Composed("shared merge/Optimize index tail")),
     ("db/omnigraph/table_ops.rs", ".fork_branch_from_state(", 1, WriteProtocol::Composed("adapter-owned first-touch data ref")),
@@ -691,6 +699,9 @@ durable_calls! {
     ("db/manifest/recovery.rs", "confirm_stream_fold_sidecar_v12(", 1, WriteProtocol::RecoveryExecutor),
     ("db/omnigraph/stream_ingest.rs", "complete_stream_fold_sidecar_v12(", 2, STREAM_FOLD_V12),
     ("db/omnigraph/stream_ingest.rs", "finalize_effect_free_stream_fold_sidecar_v12(", 1, STREAM_FOLD_V12),
+    ("db/omnigraph/stream_profile.rs", "confirm_stream_profile_change_sidecar_v13(", 1, STREAM_PROFILE_V13),
+    ("db/manifest/recovery.rs", "confirm_stream_profile_change_sidecar_v13(", 1, WriteProtocol::RecoveryExecutor),
+    ("db/omnigraph/stream_profile.rs", "complete_stream_profile_change_sidecar_v13(", 2, STREAM_PROFILE_V13),
     ("exec/mutation.rs", "delete_sidecar(", 1, MUTATION_V9),
     ("loader/mod.rs", "delete_sidecar(", 1, LOAD_V9),
     ("exec/merge.rs", "delete_sidecar(", 1, MERGE_V9),
@@ -704,7 +715,7 @@ durable_calls! {
     ("db/omnigraph/table_ops.rs", "commit_updates_on_branch_with_expected(", 1, WriteProtocol::Exact("shared publisher")),
     ("db/omnigraph/table_ops.rs", ".commit_changes_with_intent_and_expected(", 2, WriteProtocol::Exact("shared publisher")),
     ("db/omnigraph/schema_apply.rs", ".commit_changes_with_intent_and_expected(", 1, SCHEMA_V9),
-    ("db/omnigraph/stream_profile.rs", ".commit_changes_with_intent_and_expected(", 1, STREAM_PROFILE_V1),
+    ("db/omnigraph/stream_profile.rs", ".commit_changes_with_intent_and_expected(", 1, STREAM_PROFILE_V13),
     ("db/omnigraph/repair.rs", ".commit_updates_with_actor_with_expected(", 1, WriteProtocol::ManifestAdoption),
     ("db/omnigraph/optimize.rs", ".commit_updates_with_actor_with_expected(", 1, OPTIMIZE_V9),
     ("db/graph_coordinator.rs", ".commit_changes_with_intent_and_expected(", 1, WriteProtocol::Exact("publisher gateway")),
@@ -714,7 +725,7 @@ durable_calls! {
     ("db/omnigraph.rs", ".write_text_if_absent(", 1, WriteProtocol::Bootstrap),
     ("db/omnigraph.rs", ".write_text(", 1, WriteProtocol::Bootstrap),
     ("db/schema_state.rs", ".write_text(", 2, WriteProtocol::Composed("schema state publication")),
-    ("db/manifest/recovery.rs", ".write_text(", 8, WriteProtocol::RecoveryExecutor),
+    ("db/manifest/recovery.rs", ".write_text(", 9, WriteProtocol::RecoveryExecutor),
     ("db/omnigraph/schema_apply.rs", ".write_text(", 1, SCHEMA_V9),
     ("db/omnigraph.rs", ".delete(", 1, WriteProtocol::Bootstrap),
     ("db/schema_state.rs", ".delete(", 3, WriteProtocol::Composed("schema staging cleanup")),
@@ -750,11 +761,11 @@ durable_calls! {
     ("db/manifest/recovery.rs", ".publish_with_precondition(", 1, WriteProtocol::RecoveryExecutor),
     ("db/manifest/recovery.rs", ".publish(", 1, WriteProtocol::RecoveryExecutor),
     ("db/manifest/recovery.rs", ".restore(", 1, WriteProtocol::RecoveryExecutor),
-    ("db/manifest/recovery.rs", ".append(RecoveryAuditRecord", 10, WriteProtocol::RecoveryExecutor),
-    ("db/manifest/recovery.rs", "publish_recovery_commit(", 11, WriteProtocol::RecoveryExecutor),
+    ("db/manifest/recovery.rs", ".append(RecoveryAuditRecord", 11, WriteProtocol::RecoveryExecutor),
+    ("db/manifest/recovery.rs", "publish_recovery_commit(", 12, WriteProtocol::RecoveryExecutor),
     ("db/manifest/recovery.rs", "restore_table_to_version(", 3, WriteProtocol::RecoveryExecutor),
-    ("db/manifest/recovery.rs", "record_audit(", 12, WriteProtocol::RecoveryExecutor),
-    ("db/manifest/recovery.rs", "delete_sidecar_by_operation_id(", 24, WriteProtocol::RecoveryExecutor),
+    ("db/manifest/recovery.rs", "record_audit(", 13, WriteProtocol::RecoveryExecutor),
+    ("db/manifest/recovery.rs", "delete_sidecar_by_operation_id(", 27, WriteProtocol::RecoveryExecutor),
     ("db/manifest/recovery.rs", "delete_sidecar(", 3, WriteProtocol::RecoveryExecutor),
     ("db/recovery_audit.rs", ".raw_dataset_append(", 1, WriteProtocol::RecoveryExecutor),
     ("db/recovery_audit.rs", "Dataset::write(", 1, WriteProtocol::RecoveryExecutor),
@@ -797,7 +808,10 @@ const DURABLE_PRIMITIVES: &[&str] = &[
     "confirm_stream_fold_sidecar_v12(",
     "complete_stream_fold_sidecar_v12(",
     "finalize_effect_free_stream_fold_sidecar_v12(",
+    "confirm_stream_profile_change_sidecar_v13(",
+    "complete_stream_profile_change_sidecar_v13(",
     "stage_stream_token_upsert(",
+    "stage_profile_management_receipt(",
     "delete_sidecar(",
     ".commit_staged_create_exact(",
     ".commit_staged_exact(",
@@ -1534,7 +1548,7 @@ const RETAIN_ALL_DELETE_CALLS: &[RetainAllDeleteCallsite] = &[
     ("db/manifest/recovery.rs", "delete_sidecar_by_operation_id", "delete", "storage => &sidecar_uri(..)", 1, RetainAllDeleteScope::ExactControlObject),
     ("db/manifest/recovery.rs", "roll_back_schema_apply_v7", "delete_prefix", "storage => &pin.table_path", 2, RetainAllDeleteScope::FirstTouchRollback),
     ("omnigraph-control-authority/lib.rs", "StateLockGuard::drop", "remove_file", "std::fs::remove_file => path", 1, RetainAllDeleteScope::ExactControlObject),
-    ("omnigraph-control-authority/lib.rs", "StateLockGuard::drop", "delete", "adapter => &uri", 2, RetainAllDeleteScope::ExactControlObject),
+    ("omnigraph-control-authority/lib.rs", "release_remote_lock_if_owned", "delete", "adapter => uri", 1, RetainAllDeleteScope::ExactControlObject),
     ("omnigraph-cluster/store.rs", "ClusterStore::force_unlock", "delete", "self.adapter => &lock_uri", 1, RetainAllDeleteScope::ExactControlObject),
     ("omnigraph-cluster/store.rs", "ClusterStore::try_delete_object", "delete", "self.adapter => uri", 1, RetainAllDeleteScope::GenericGateway),
     ("omnigraph-cluster/store.rs", "ClusterStore::delete_object", "try_delete_object", "self => uri", 1, RetainAllDeleteScope::GenericGateway),

@@ -10,6 +10,9 @@
     use serde_json::json;
     use tempfile::tempdir;
 
+    use crate::config::{
+        observed_streaming_digest, streaming_digest, streaming_mode_matches_desired,
+    };
     use super::*;
 
     const SCHEMA: &str = r#"
@@ -999,7 +1002,7 @@ graphs:
                 && change.operation == PlanOperation::Create
         }));
 
-        let applied = apply_config_dir(dir.path()).await;
+        let applied = confirmed_streaming_apply(dir.path()).await;
         assert!(applied.ok && applied.converged, "{applied:?}");
         assert!(
             live_streaming_enabled(dir.path()).await,
@@ -1595,7 +1598,7 @@ graphs:
         )
         .unwrap();
 
-        let out = apply_config_dir(dir.path()).await;
+        let out = confirmed_streaming_apply(dir.path()).await;
         assert!(!out.ok);
         assert!(out.diagnostics.iter().any(|diagnostic| {
             diagnostic.code == "schema_apply_failed"
@@ -1646,7 +1649,7 @@ graphs:
         );
         // Second run fails just as loudly and still leaves no sidecar because
         // the engine preview rejects before graph state can move.
-        let second = apply_config_dir(dir.path()).await;
+        let second = confirmed_streaming_apply(dir.path()).await;
         assert!(!second.ok);
         assert!(
             second
@@ -1663,7 +1666,7 @@ graphs:
         // Once the graph failure is corrected, the unapplied streaming
         // resource remains in the diff and is retried.
         fs::write(dir.path().join("people.pg"), SCHEMA).unwrap();
-        let recovered = apply_config_dir(dir.path()).await;
+        let recovered = confirmed_streaming_apply(dir.path()).await;
         assert!(recovered.ok && recovered.converged, "{recovered:?}");
         assert!(live_streaming_enabled(dir.path()).await);
     }
@@ -1795,7 +1798,7 @@ graphs:
         fs::create_dir_all(&root).unwrap();
         fs::write(root.join("_schema.pg"), "junk").unwrap();
 
-        let out = apply_config_dir(dir.path()).await;
+        let out = confirmed_streaming_apply(dir.path()).await;
         assert!(!out.ok);
         assert!(
             out.diagnostics
@@ -2825,7 +2828,7 @@ graphs:
 
     /// Seed: converged knowledge subtree + a stale `old` graph subtree with a
     /// real directory on disk.
-    fn seed_deletable_state(config_dir: &Path) {
+    async fn seed_deletable_state(config_dir: &Path) {
         write_applyable_state(config_dir);
         let state = read_state_json(config_dir);
         let g = state["applied_revision"]["resources"]["graph.knowledge"]["digest"]
@@ -2836,6 +2839,7 @@ graphs:
             .as_str()
             .unwrap()
             .to_string();
+        let old_streaming_digest = streaming_digest("old", false);
         write_state_resources(
             config_dir,
             &[
@@ -2844,10 +2848,18 @@ graphs:
                 ("graph.old", "3333"),
                 ("schema.old", "4444"),
                 ("query.old.q", "5555"),
-                ("streaming.old", "6666"),
+                ("streaming.old", old_streaming_digest.as_str()),
             ],
         );
         let mut state = read_state_json(config_dir);
+        let old_streaming = &mut state["applied_revision"]["resources"]["streaming.old"];
+        old_streaming["streaming_enabled"] = json!(false);
+        old_streaming["declaration_revision"] = json!(streaming_declaration_revision(
+            "old",
+            &old_streaming_digest
+        ));
+        old_streaming["profile_mode"] = json!("DISABLED");
+        old_streaming["profile_revision"] = json!(1);
         state["resource_statuses"] = json!({
             "streaming.old": {
                 "status": "applied",
@@ -2861,14 +2873,16 @@ graphs:
         )
         .unwrap();
         let root = config_dir.join(CLUSTER_GRAPHS_DIR).join("old.omni");
-        fs::create_dir_all(&root).unwrap();
-        fs::write(root.join("_schema.pg"), "stale").unwrap();
+        fs::create_dir_all(root.parent().unwrap()).unwrap();
+        Omnigraph::init(root.to_string_lossy().as_ref(), SCHEMA)
+            .await
+            .unwrap();
     }
 
     #[tokio::test]
     async fn apply_executes_approved_graph_delete() {
         let dir = fixture();
-        seed_deletable_state(dir.path());
+        seed_deletable_state(dir.path()).await;
         let approved = approve_config_dir(dir.path(), "graph.old", "andrew").await;
         assert!(approved.ok, "{:?}", approved.diagnostics);
         let approval_id = approved.approval_id.clone().unwrap();
@@ -2970,7 +2984,7 @@ graphs:
     #[tokio::test]
     async fn sweep_rolls_forward_completed_delete() {
         let dir = fixture();
-        seed_deletable_state(dir.path());
+        seed_deletable_state(dir.path()).await;
         // Approve, then simulate: root removed, state stale, sidecar present.
         let approved = approve_config_dir(dir.path(), "graph.old", "andrew").await;
         let approval_id = approved.approval_id.unwrap();
@@ -3032,7 +3046,7 @@ graphs:
     #[tokio::test]
     async fn sweep_reproposes_incomplete_delete() {
         let dir = fixture();
-        seed_deletable_state(dir.path()); // root present
+        seed_deletable_state(dir.path()).await; // root present
         let approved = approve_config_dir(dir.path(), "graph.old", "andrew").await;
         assert!(approved.ok);
         let sidecar = write_delete_sidecar(dir.path(), "old", approved.approval_id.as_deref(), "01DROW8");
@@ -3778,6 +3792,20 @@ graphs:
     // ---- RFC-026 §4.7 P1: streaming enablement (slice 1) ----
 
     fn write_streaming_cluster(config_dir: &Path, streaming: Option<bool>) {
+        fs::write(
+            config_dir.join("base.policy.yaml"),
+            r#"
+version: 1
+groups:
+  stream_operators: [stream-operator]
+rules:
+  - id: stream-operators-manage
+    allow:
+      actors: { group: stream_operators }
+      actions: [stream_manage]
+"#,
+        )
+        .unwrap();
         let streaming_line = match streaming {
             Some(enabled) => format!("    streaming: {enabled}\n"),
             None => String::new(),
@@ -3806,6 +3834,17 @@ policies:
             ),
         )
         .unwrap();
+    }
+
+    async fn confirmed_streaming_apply(config_dir: &Path) -> ApplyOutput {
+        apply_config_dir_with_options(
+            config_dir,
+            ApplyOptions {
+                actor: Some("stream-operator".to_string()),
+                confirm_stream_offline: true,
+            },
+        )
+        .await
     }
 
     async fn live_streaming_enabled(config_dir: &Path) -> bool {
@@ -3904,6 +3943,79 @@ graphs:
     }
 
     #[tokio::test]
+    async fn streaming_apply_requires_lock_confirmation_and_actor_before_graph_effects() {
+        let dir = fixture();
+        write_streaming_cluster(dir.path(), Some(true));
+        write_state_resources(dir.path(), &[]);
+
+        let unconfirmed = apply_config_dir(dir.path()).await;
+        assert!(!unconfirmed.ok, "{unconfirmed:?}");
+        assert!(unconfirmed.diagnostics.iter().any(|diagnostic| {
+            diagnostic.code == "streaming_offline_confirmation_required"
+        }));
+        assert!(unconfirmed
+            .diagnostics
+            .iter()
+            .any(|diagnostic| diagnostic.code == "streaming_apply_actor_required"));
+        assert!(
+            !dir.path().join("graphs/knowledge.omni").exists(),
+            "profile-authority refusal must precede graph effects"
+        );
+
+        let config = fs::read_to_string(dir.path().join(CLUSTER_CONFIG_FILE)).unwrap();
+        fs::write(
+            dir.path().join(CLUSTER_CONFIG_FILE),
+            config.replace("  lock: true", "  lock: false"),
+        )
+        .unwrap();
+        let unlocked = confirmed_streaming_apply(dir.path()).await;
+        assert!(!unlocked.ok, "{unlocked:?}");
+        assert!(unlocked
+            .diagnostics
+            .iter()
+            .any(|diagnostic| diagnostic.code == "streaming_requires_state_lock"));
+        assert!(
+            !dir.path().join("graphs/knowledge.omni").exists(),
+            "missing-lock refusal must precede graph effects"
+        );
+    }
+
+    #[test]
+    fn streaming_profile_operation_identity_is_stable_and_target_bound() {
+        let state_cas = format!("sha256:{}", "a".repeat(64));
+        let first = stream_profile_operation_id(
+            &state_cas,
+            "config-revision",
+            "declaration-digest",
+            "knowledge",
+            "/cluster/graphs/knowledge.omni",
+            true,
+        );
+        assert_eq!(
+            first,
+            stream_profile_operation_id(
+                &state_cas,
+                "config-revision",
+                "declaration-digest",
+                "knowledge",
+                "/cluster/graphs/knowledge.omni",
+                true,
+            )
+        );
+        assert_ne!(
+            first,
+            stream_profile_operation_id(
+                &state_cas,
+                "config-revision",
+                "declaration-digest",
+                "knowledge",
+                "/cluster/graphs/knowledge.omni",
+                false,
+            )
+        );
+    }
+
+    #[tokio::test]
     async fn apply_propagates_streaming_flag_and_disable() {
         let dir = fixture();
         write_streaming_cluster(dir.path(), Some(true));
@@ -3913,7 +4025,7 @@ graphs:
         // graph's __manifest — the engine-obeyed authority — not just the
         // ledger. The change classifies Applied, never Derived (the
         // fake-convergence trap this resource kind exists to avoid).
-        let out = apply_config_dir(dir.path()).await;
+        let out = confirmed_streaming_apply(dir.path()).await;
         assert!(out.ok && out.converged, "{out:?}");
         let streaming_change = out
             .changes
@@ -3927,25 +4039,129 @@ graphs:
             state["applied_revision"]["resources"]["streaming.knowledge"]["streaming_enabled"],
             serde_json::json!(true)
         );
+        assert_eq!(
+            state["applied_revision"]["resources"]["streaming.knowledge"]["profile_revision"],
+            serde_json::json!(2)
+        );
+        assert_eq!(
+            state["applied_revision"]["resources"]["streaming.knowledge"]["profile_mode"],
+            serde_json::json!("ENABLED")
+        );
+        let declaration_digest = streaming_digest("knowledge", true);
+        let declaration_revision =
+            streaming_declaration_revision("knowledge", &declaration_digest);
+        assert_eq!(
+            state["applied_revision"]["resources"]["streaming.knowledge"]
+                ["declaration_revision"],
+            serde_json::json!(declaration_revision.clone())
+        );
+        let original_config_digest = state["applied_revision"]["config_digest"].clone();
+        let serving = read_serving_snapshot(dir.path()).await.unwrap();
+        let binding = serving.graphs[0]
+            .stream_runtime_authority
+            .as_ref()
+            .expect("enabled served graph carries validated binding evidence");
+        assert_eq!(binding.graph_id(), "knowledge");
+        assert_eq!(binding.profile_revision(), 2);
+        assert_eq!(binding.declaration_revision(), declaration_revision);
 
         // Idempotent: a second run sees no changes and calls no engine.
-        let again = apply_config_dir(dir.path()).await;
+        let again = confirmed_streaming_apply(dir.path()).await;
         assert!(again.changes.is_empty() && !again.state_written, "{again:?}");
+
+        // An unrelated cluster resource may advance the global applied config
+        // without invalidating this graph's unchanged fold delegation.
+        let policy_path = dir.path().join("base.policy.yaml");
+        let current_policy = fs::read_to_string(&policy_path).unwrap();
+        fs::write(
+            policy_path,
+            format!("{current_policy}\n# unrelated policy revision\n"),
+        )
+        .unwrap();
+        let unrelated = confirmed_streaming_apply(dir.path()).await;
+        assert!(unrelated.ok && unrelated.converged, "{unrelated:?}");
+        let state = read_state_json(dir.path());
+        assert_ne!(
+            state["applied_revision"]["config_digest"],
+            original_config_digest
+        );
+        assert_eq!(
+            state["applied_revision"]["resources"]["streaming.knowledge"]
+                ["declaration_revision"],
+            serde_json::json!(declaration_revision.clone())
+        );
+        let serving = read_serving_snapshot(dir.path()).await.unwrap();
+        let binding = serving.graphs[0]
+            .stream_runtime_authority
+            .as_ref()
+            .expect("unrelated apply preserves the enabled runtime binding");
+        assert_eq!(binding.declaration_revision(), declaration_revision);
+        assert_eq!(binding.profile_revision(), 2);
+
+        // A stale cluster row must converge from the engine's no-op result,
+        // including the discriminated mode and declaration binding.
+        let mut state = read_state_json(dir.path());
+        let stale_digest = streaming_digest("knowledge", false);
+        let stale = &mut state["applied_revision"]["resources"]["streaming.knowledge"];
+        stale["digest"] = serde_json::json!(stale_digest.clone());
+        stale["declaration_revision"] = serde_json::json!(
+            streaming_declaration_revision("knowledge", &stale_digest)
+        );
+        stale["streaming_enabled"] = serde_json::json!(false);
+        stale["profile_mode"] = serde_json::json!("DISABLED");
+        fs::write(
+            dir.path().join(CLUSTER_STATE_FILE),
+            serde_json::to_string_pretty(&state).unwrap(),
+        )
+        .unwrap();
+        let reconciled_noop = confirmed_streaming_apply(dir.path()).await;
+        assert!(
+            reconciled_noop.ok && reconciled_noop.converged,
+            "{reconciled_noop:?}"
+        );
+        let state = read_state_json(dir.path());
+        let row = &state["applied_revision"]["resources"]["streaming.knowledge"];
+        assert_eq!(row["streaming_enabled"], serde_json::json!(true));
+        assert_eq!(row["profile_mode"], serde_json::json!("ENABLED"));
+        assert_eq!(
+            row["declaration_revision"],
+            serde_json::json!(declaration_revision.clone())
+        );
+        assert_eq!(row["profile_revision"], serde_json::json!(2));
 
         // Explicit `streaming: false` disables (clean graph → converges now).
         write_streaming_cluster(dir.path(), Some(false));
-        let out = apply_config_dir(dir.path()).await;
+        let out = confirmed_streaming_apply(dir.path()).await;
         assert!(out.ok && out.converged, "{out:?}");
         assert!(!live_streaming_enabled(dir.path()).await);
 
-        // REMOVING the declaration unmanages: the ledger row goes away and
-        // the graph keeps its current state — removal is never a disable.
+        // Removing an active declaration cannot bypass the durable disable.
         write_streaming_cluster(dir.path(), Some(true));
-        let out = apply_config_dir(dir.path()).await;
+        let out = confirmed_streaming_apply(dir.path()).await;
         assert!(out.ok && out.converged, "{out:?}");
         assert!(live_streaming_enabled(dir.path()).await);
         write_streaming_cluster(dir.path(), None);
-        let out = apply_config_dir(dir.path()).await;
+        let blocked = confirmed_streaming_apply(dir.path()).await;
+        let change = blocked
+            .changes
+            .iter()
+            .find(|change| change.resource == "streaming.knowledge")
+            .unwrap();
+        assert_eq!(change.disposition, Some(ApplyDisposition::Blocked));
+        assert_eq!(
+            change.reason.as_deref(),
+            Some("streaming_profile_must_disable_first")
+        );
+        assert!(!blocked.converged);
+        assert!(live_streaming_enabled(dir.path()).await);
+
+        // Explicit false reaches terminal DISABLED; only then may a second
+        // apply remove the declaration as configuration-only unmanagement.
+        write_streaming_cluster(dir.path(), Some(false));
+        let disabled = confirmed_streaming_apply(dir.path()).await;
+        assert!(disabled.ok && disabled.converged, "{disabled:?}");
+        write_streaming_cluster(dir.path(), None);
+        let out = confirmed_streaming_apply(dir.path()).await;
         assert!(out.ok && out.converged, "{out:?}");
         let state = read_state_json(dir.path());
         assert!(
@@ -3955,9 +4171,306 @@ graphs:
             "unmanaged flag must drop its ledger row"
         );
         assert!(
-            live_streaming_enabled(dir.path()).await,
-            "unmanaging must not flip the graph"
+            !live_streaming_enabled(dir.path()).await,
+            "unmanaging after explicit disable must preserve DISABLED"
         );
+    }
+
+    #[tokio::test]
+    async fn streaming_apply_enforces_bound_graph_policy() {
+        let dir = fixture();
+        write_streaming_cluster(dir.path(), Some(true));
+        write_state_resources(dir.path(), &[]);
+        fs::write(
+            dir.path().join("base.policy.yaml"),
+            r#"
+version: 1
+groups:
+  observers: [stream-operator]
+rules:
+  - id: observers-read-only
+    allow:
+      actors: { group: observers }
+      actions: [read]
+"#,
+        )
+        .unwrap();
+
+        let denied = confirmed_streaming_apply(dir.path()).await;
+        let change = denied
+            .changes
+            .iter()
+            .find(|change| change.resource == "streaming.knowledge")
+            .expect("streaming change remains visible");
+        assert_eq!(change.disposition, Some(ApplyDisposition::Blocked));
+        assert_eq!(change.reason.as_deref(), Some("streaming_apply_failed"));
+        assert!(
+            denied.diagnostics.iter().any(|diagnostic| {
+                diagnostic.code == "streaming_apply_failed"
+                    && diagnostic.message.contains("policy denied")
+            }),
+            "{:?}",
+            denied.diagnostics
+        );
+        assert!(
+            !live_streaming_enabled(dir.path()).await,
+            "Cedar refusal must precede the profile receipt and manifest effect"
+        );
+    }
+
+    #[tokio::test]
+    async fn blocked_stream_profile_preserves_policy_authority_for_retry() {
+        let dir = fixture();
+        write_streaming_cluster(dir.path(), Some(true));
+        write_state_resources(dir.path(), &[]);
+        let enabled = confirmed_streaming_apply(dir.path()).await;
+        assert!(enabled.ok && enabled.converged, "{enabled:?}");
+        let allowing_policy_digest = read_state_json(dir.path())["applied_revision"]["resources"]
+            ["policy.base"]["digest"]
+            .as_str()
+            .unwrap()
+            .to_string();
+
+        write_streaming_cluster(dir.path(), Some(false));
+        fs::write(
+            dir.path().join("base.policy.yaml"),
+            r#"
+version: 1
+groups:
+  observers: [stream-operator]
+rules:
+  - id: observers-read-only
+    allow:
+      actors: { group: observers }
+      actions: [read]
+"#,
+        )
+        .unwrap();
+
+        let denied = confirmed_streaming_apply(dir.path()).await;
+        let by_resource: BTreeMap<&str, &PlanChange> = denied
+            .changes
+            .iter()
+            .map(|change| (change.resource.as_str(), change))
+            .collect();
+        assert_eq!(
+            by_resource["streaming.knowledge"].reason.as_deref(),
+            Some("streaming_apply_failed")
+        );
+        assert_eq!(
+            by_resource["policy.base"].disposition,
+            Some(ApplyDisposition::Blocked)
+        );
+        assert_eq!(
+            by_resource["policy.base"].reason.as_deref(),
+            Some("streaming_profile_not_applied")
+        );
+        assert!(
+            live_streaming_enabled(dir.path()).await,
+            "denied disable must leave the live profile enabled"
+        );
+        assert_eq!(
+            read_state_json(dir.path())["applied_revision"]["resources"]["policy.base"]["digest"],
+            json!(allowing_policy_digest),
+            "the state CAS must retain the policy that can authorize a retry"
+        );
+
+        // Restoring the prior desired policy must now make the very next apply
+        // able to finish the pending disable. If the denying policy had landed
+        // in state, old+new conjunction would deny this retry again.
+        write_streaming_cluster(dir.path(), Some(false));
+        let retried = confirmed_streaming_apply(dir.path()).await;
+        assert!(retried.ok && retried.converged, "{retried:?}");
+        assert!(!live_streaming_enabled(dir.path()).await);
+    }
+
+    #[tokio::test]
+    async fn live_profile_blocks_unmanage_when_cluster_state_is_stale_or_missing() {
+        let dir = fixture();
+        write_streaming_cluster(dir.path(), Some(true));
+        write_state_resources(dir.path(), &[]);
+        let enabled = confirmed_streaming_apply(dir.path()).await;
+        assert!(enabled.ok && enabled.converged, "{enabled:?}");
+
+        // Model the engine-commit/state-CAS crash window: the manifest is
+        // ENABLED, while the persisted cluster row still claims DISABLED.
+        let mut state = read_state_json(dir.path());
+        let disabled_digest = streaming_digest("knowledge", false);
+        let streaming = &mut state["applied_revision"]["resources"]["streaming.knowledge"];
+        streaming["digest"] = json!(disabled_digest.clone());
+        streaming["streaming_enabled"] = json!(false);
+        streaming["declaration_revision"] = json!(streaming_declaration_revision(
+            "knowledge",
+            &disabled_digest
+        ));
+        streaming["profile_mode"] = json!("DISABLED");
+        streaming["profile_revision"] = json!(1);
+        fs::write(
+            dir.path().join(CLUSTER_STATE_FILE),
+            serde_json::to_string_pretty(&state).unwrap(),
+        )
+        .unwrap();
+        write_streaming_cluster(dir.path(), None);
+
+        let blocked = confirmed_streaming_apply(dir.path()).await;
+        let change = blocked
+            .changes
+            .iter()
+            .find(|change| change.resource == "streaming.knowledge")
+            .expect("live manifest must preserve a blocked control-plane row");
+        assert_eq!(change.disposition, Some(ApplyDisposition::Blocked));
+        assert_eq!(
+            change.reason.as_deref(),
+            Some("streaming_profile_must_disable_first")
+        );
+        assert!(!blocked.converged, "{blocked:?}");
+        assert!(live_streaming_enabled(dir.path()).await);
+        let state = read_state_json(dir.path());
+        let streaming = &state["applied_revision"]["resources"]["streaming.knowledge"];
+        assert_eq!(streaming["profile_mode"], json!("ENABLED"));
+        assert_eq!(streaming["streaming_enabled"], json!(true));
+        assert_eq!(streaming["profile_revision"], json!(2));
+
+        // Losing the row entirely is equally unsafe. Apply must rediscover
+        // the active profile rather than treating the absent digest as proof
+        // that there is nothing left to manage.
+        let mut state = state;
+        state["applied_revision"]["resources"]
+            .as_object_mut()
+            .unwrap()
+            .remove("streaming.knowledge");
+        state["resource_statuses"]
+            .as_object_mut()
+            .unwrap()
+            .remove("streaming.knowledge");
+        fs::write(
+            dir.path().join(CLUSTER_STATE_FILE),
+            serde_json::to_string_pretty(&state).unwrap(),
+        )
+        .unwrap();
+
+        let blocked = confirmed_streaming_apply(dir.path()).await;
+        assert!(
+            blocked.changes.iter().any(|change| {
+                change.resource == "streaming.knowledge"
+                    && change.disposition == Some(ApplyDisposition::Blocked)
+            }),
+            "{blocked:?}"
+        );
+        let state = read_state_json(dir.path());
+        assert_eq!(
+            state["applied_revision"]["resources"]["streaming.knowledge"]["profile_mode"],
+            json!("ENABLED")
+        );
+    }
+
+    #[tokio::test]
+    async fn live_profile_blocks_approved_graph_delete_when_streaming_row_is_missing() {
+        let dir = fixture();
+        write_streaming_cluster(dir.path(), Some(true));
+        write_state_resources(dir.path(), &[]);
+        let enabled = confirmed_streaming_apply(dir.path()).await;
+        assert!(enabled.ok && enabled.converged, "{enabled:?}");
+
+        let mut state = read_state_json(dir.path());
+        state["applied_revision"]["resources"]
+            .as_object_mut()
+            .unwrap()
+            .remove("streaming.knowledge");
+        state["resource_statuses"]
+            .as_object_mut()
+            .unwrap()
+            .remove("streaming.knowledge");
+        fs::write(
+            dir.path().join(CLUSTER_STATE_FILE),
+            serde_json::to_string_pretty(&state).unwrap(),
+        )
+        .unwrap();
+        fs::write(
+            dir.path().join(CLUSTER_CONFIG_FILE),
+            r#"
+version: 1
+metadata:
+  name: test
+state:
+  backend: cluster
+  lock: true
+graphs: {}
+policies: {}
+"#,
+        )
+        .unwrap();
+
+        let approved = approve_config_dir(dir.path(), "graph.knowledge", "andrew").await;
+        assert!(approved.ok, "{approved:?}");
+        let blocked = apply_config_dir(dir.path()).await;
+        let by_resource: BTreeMap<&str, &PlanChange> = blocked
+            .changes
+            .iter()
+            .map(|change| (change.resource.as_str(), change))
+            .collect();
+        assert_eq!(
+            by_resource["graph.knowledge"].disposition,
+            Some(ApplyDisposition::Blocked)
+        );
+        assert_eq!(
+            by_resource["graph.knowledge"].reason.as_deref(),
+            Some("streaming_profile_must_disable_first")
+        );
+        assert!(
+            dir.path()
+                .join(CLUSTER_GRAPHS_DIR)
+                .join("knowledge.omni")
+                .exists(),
+            "an approval based on stale cluster state must not erase a live active profile"
+        );
+        let state = read_state_json(dir.path());
+        assert_eq!(
+            state["applied_revision"]["resources"]["streaming.knowledge"]["profile_mode"],
+            json!("ENABLED")
+        );
+    }
+
+    #[tokio::test]
+    async fn refresh_recreates_unmanaged_active_profile_metadata_and_surfaces_drift() {
+        let dir = fixture();
+        write_streaming_cluster(dir.path(), Some(true));
+        write_state_resources(dir.path(), &[]);
+        let enabled = confirmed_streaming_apply(dir.path()).await;
+        assert!(enabled.ok && enabled.converged, "{enabled:?}");
+
+        let mut state = read_state_json(dir.path());
+        state["applied_revision"]["resources"]
+            .as_object_mut()
+            .unwrap()
+            .remove("streaming.knowledge");
+        state["resource_statuses"]
+            .as_object_mut()
+            .unwrap()
+            .remove("streaming.knowledge");
+        fs::write(
+            dir.path().join(CLUSTER_STATE_FILE),
+            serde_json::to_string_pretty(&state).unwrap(),
+        )
+        .unwrap();
+        write_streaming_cluster(dir.path(), None);
+
+        let refreshed = refresh_config_dir(dir.path()).await;
+        assert!(refreshed.ok, "{refreshed:?}");
+        assert_eq!(
+            refreshed.resource_statuses["streaming.knowledge"].status,
+            ResourceLifecycleStatus::Drifted
+        );
+        assert!(
+            refreshed.resource_statuses["streaming.knowledge"]
+                .conditions
+                .contains(&"streaming_profile_must_disable_first".to_string())
+        );
+        let state = read_state_json(dir.path());
+        let streaming = &state["applied_revision"]["resources"]["streaming.knowledge"];
+        assert_eq!(streaming["profile_mode"], json!("ENABLED"));
+        assert_eq!(streaming["streaming_enabled"], json!(true));
+        assert_eq!(streaming["profile_revision"], json!(2));
     }
 
     #[tokio::test]
@@ -3965,7 +4478,7 @@ graphs:
         let dir = fixture();
         write_streaming_cluster(dir.path(), Some(true));
         write_state_resources(dir.path(), &[]);
-        let out = apply_config_dir(dir.path()).await;
+        let out = confirmed_streaming_apply(dir.path()).await;
         assert!(out.ok && out.converged, "{out:?}");
 
         // Wipe the streaming row (a crashed apply / pre-streaming ledger).
@@ -4009,14 +4522,41 @@ graphs:
             state["applied_revision"]["resources"]["streaming.knowledge"]["streaming_enabled"],
             serde_json::json!(true)
         );
+        assert_eq!(
+            state["applied_revision"]["resources"]["streaming.knowledge"]["profile_revision"],
+            serde_json::json!(2)
+        );
+        assert_eq!(
+            state["applied_revision"]["resources"]["streaming.knowledge"]["profile_mode"],
+            serde_json::json!("ENABLED")
+        );
+        let enabled_digest = streaming_digest("knowledge", true);
+        assert_eq!(
+            state["applied_revision"]["resources"]["streaming.knowledge"]
+                ["declaration_revision"],
+            serde_json::json!(streaming_declaration_revision(
+                "knowledge",
+                &enabled_digest
+            ))
+        );
 
-        // Out-of-band flip (an operator with direct engine access): refresh
-        // converges the ledger to the observed value, and the next plan shows
-        // the drift as an ordinary Update back toward the declared state.
-        let graph_uri = format!("{}/graphs/knowledge.omni", dir.path().display());
-        let db = Omnigraph::open(&graph_uri).await.unwrap();
-        db.set_streaming_enabled_as(false, None).await.unwrap();
-        drop(db);
+        // Model a stale ledger around a supported offline disable: move
+        // engine truth through cluster apply, then restore a stale enabled
+        // ledger row. Refresh must rederive false from the manifest.
+        write_streaming_cluster(dir.path(), Some(false));
+        let disabled = confirmed_streaming_apply(dir.path()).await;
+        assert!(disabled.ok && disabled.converged, "{disabled:?}");
+        let mut state = read_state_json(dir.path());
+        state["applied_revision"]["resources"]["streaming.knowledge"]["streaming_enabled"] =
+            serde_json::json!(true);
+        state["applied_revision"]["resources"]["streaming.knowledge"]["digest"] =
+            serde_json::json!(streaming_digest("knowledge", true));
+        fs::write(
+            dir.path().join(CLUSTER_STATE_FILE),
+            serde_json::to_string_pretty(&state).unwrap(),
+        )
+        .unwrap();
+        write_streaming_cluster(dir.path(), Some(true));
         let out = refresh_config_dir(dir.path()).await;
         assert!(out.ok, "{out:?}");
         let streaming_status = &out.resource_statuses["streaming.knowledge"];
@@ -4043,9 +4583,96 @@ graphs:
         assert_eq!(drift.operation, PlanOperation::Update);
 
         // And apply re-converges to the declaration.
-        let out = apply_config_dir(dir.path()).await;
+        let out = confirmed_streaming_apply(dir.path()).await;
         assert!(out.ok && out.converged, "{out:?}");
         assert!(live_streaming_enabled(dir.path()).await);
+    }
+
+    #[tokio::test]
+    async fn enabled_streaming_without_exact_profile_revision_is_quarantined() {
+        let dir = fixture();
+        write_streaming_cluster(dir.path(), Some(true));
+        write_state_resources(dir.path(), &[]);
+        let out = confirmed_streaming_apply(dir.path()).await;
+        assert!(out.ok && out.converged, "{out:?}");
+
+        let mut state = read_state_json(dir.path());
+        state["applied_revision"]["resources"]["streaming.knowledge"]
+            .as_object_mut()
+            .unwrap()
+            .remove("profile_revision");
+        fs::write(
+            dir.path().join(CLUSTER_STATE_FILE),
+            serde_json::to_string_pretty(&state).unwrap(),
+        )
+        .unwrap();
+
+        let diagnostics = read_serving_snapshot(dir.path()).await.unwrap_err();
+        assert!(diagnostics.iter().any(|diagnostic| {
+            diagnostic.code == "stream_runtime_profile_revision_missing"
+                && diagnostic.severity == DiagnosticSeverity::Warning
+        }));
+        assert!(diagnostics
+            .iter()
+            .any(|diagnostic| diagnostic.code == "cluster_no_healthy_graphs"));
+
+        state["applied_revision"]["resources"]["streaming.knowledge"]["profile_revision"] =
+            serde_json::json!(2);
+        state["applied_revision"]["resources"]["streaming.knowledge"]
+            .as_object_mut()
+            .unwrap()
+            .remove("declaration_revision");
+        fs::write(
+            dir.path().join(CLUSTER_STATE_FILE),
+            serde_json::to_string_pretty(&state).unwrap(),
+        )
+        .unwrap();
+        let diagnostics = read_serving_snapshot(dir.path()).await.unwrap_err();
+        assert!(diagnostics.iter().any(|diagnostic| {
+            diagnostic.code == "stream_runtime_declaration_revision_missing"
+                && diagnostic.severity == DiagnosticSeverity::Warning
+        }));
+    }
+
+    #[tokio::test]
+    async fn disabling_profile_stays_plannable_and_refuses_normal_server_boot() {
+        let dir = fixture();
+        write_streaming_cluster(dir.path(), Some(true));
+        write_state_resources(dir.path(), &[]);
+        let out = confirmed_streaming_apply(dir.path()).await;
+        assert!(out.ok && out.converged, "{out:?}");
+
+        let mut state = read_state_json(dir.path());
+        let row = &mut state["applied_revision"]["resources"]["streaming.knowledge"];
+        row["streaming_enabled"] = serde_json::json!(false);
+        row["profile_mode"] = serde_json::json!("DISABLING");
+        row["profile_revision"] = serde_json::json!(3);
+        row["digest"] = serde_json::json!("durable-disabling-plan");
+        fs::write(
+            dir.path().join(CLUSTER_STATE_FILE),
+            serde_json::to_string_pretty(&state).unwrap(),
+        )
+        .unwrap();
+        write_streaming_cluster(dir.path(), Some(false));
+
+        let plan = plan_config_dir(dir.path()).await;
+        let continuation = plan
+            .changes
+            .iter()
+            .find(|change| change.resource == "streaming.knowledge")
+            .expect("DISABLING must remain a visible continuation");
+        assert_eq!(continuation.operation, PlanOperation::Update);
+        assert_eq!(continuation.disposition, Some(ApplyDisposition::Applied));
+
+        let diagnostics = read_serving_snapshot(dir.path()).await.unwrap_err();
+        assert!(diagnostics
+            .iter()
+            .any(|diagnostic| diagnostic.code == "stream_profile_disabling"));
+        assert_ne!(
+            observed_streaming_digest("knowledge", "DISABLING"),
+            streaming_digest("knowledge", false)
+        );
+        assert!(!streaming_mode_matches_desired("DISABLING", false));
     }
 
     #[tokio::test]
@@ -4063,7 +4690,7 @@ graphs:
 
         let import = import_config_dir(dir.path()).await;
         assert!(import.ok, "{import:?}");
-        let out = apply_config_dir(dir.path()).await;
+        let out = confirmed_streaming_apply(dir.path()).await;
         assert!(out.ok && out.converged, "{out:?}");
         assert!(
             live_streaming_enabled(dir.path()).await,

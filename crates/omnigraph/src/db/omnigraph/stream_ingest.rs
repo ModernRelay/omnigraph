@@ -20,14 +20,7 @@ use lance::dataset::mem_wal::scanner::LsmScanner;
 use lance::dataset::mem_wal::{DatasetMemWalExt, ShardWriter};
 use lance_index::mem_wal::{MemWalIndexDetails, MergedGeneration, ShardId, ShardStatus};
 
-use crate::db::manifest::{
-    CurrentHeadWitness, RecoveryAuthorityToken, RecoveryLineageIntent, RecoveryStreamFoldCut,
-    SidecarTablePin,
-    StreamLifecycle, StreamLifecycleEntry, StreamPhysicalBinding, TableIdentity,
-    complete_stream_fold_sidecar_v12, confirm_stream_fold_sidecar_v12,
-    finalize_effect_free_stream_fold_sidecar_v12, list_sidecars, new_stream_fold_sidecar_v12,
-    write_sidecar,
-};
+use crate::db::manifest::stream::{LastFoldOutcome, LastFoldSummary, StreamGenerationCut};
 use crate::db::manifest::stream_token::{
     AdmissionClassification, AdmissionRequest, PayloadDigest, PayloadDigestInput,
     StreamFoldAttributionSummary, StreamRowOrigin, StreamToken, StreamTokenAuthorityRow,
@@ -35,27 +28,29 @@ use crate::db::manifest::stream_token::{
     build_trusted_stream_metadata_array, classify_admission, decode_trusted_stream_metadata,
     stream_fold_attribution_commitment, validate_authority_base_pair,
 };
-use crate::db::manifest::stream::{
-    LastFoldOutcome, LastFoldSummary, StreamGenerationCut,
-};
 use crate::db::manifest::token_store::{
     add_stream_lookup_retained_bytes, lookup_stream_token_row, open_stream_token_authority_head,
-    stage_stream_token_upsert, stream_token_authority_entry_for_dataset, stream_token_rows_for_keys,
-    validate_stream_token_plan_bounds,
+    stage_stream_token_upsert, stream_token_authority_entry_for_dataset,
+    stream_token_rows_for_keys, validate_stream_token_plan_bounds,
+};
+use crate::db::manifest::{
+    CurrentHeadWitness, RecoveryAuthorityToken, RecoveryLineageIntent, RecoveryStreamFoldCut,
+    SidecarTablePin, StreamLifecycle, StreamLifecycleEntry, StreamPhysicalBinding, TableIdentity,
+    complete_stream_fold_sidecar_v12, confirm_stream_fold_sidecar_v12,
+    finalize_effect_free_stream_fold_sidecar_v12, list_sidecars, new_stream_fold_sidecar_v12,
+    write_sidecar,
 };
 use crate::db::write_queue::StreamAdmissionKey;
 use crate::error::{OmniError, Result};
 use crate::storage_layer::SnapshotHandle;
 use crate::table_store::mem_wal::{
-    B1_MAX_GENERATION_ARROW_BYTES, B1_MAX_GENERATION_ROWS,
-    B2_MAX_TOKEN_PROJECTION_ARROW_BYTES, CallerOrdinalRange,
-    CheckedExclusiveStreamAuthority, CheckedStreamAuthority, ClaimedMemWalWorker,
-    ConfirmedStreamTokenOverlay, ConfirmedStreamTokenOverlayRow, DurableBatchAck,
-    IdleAuthorityCheck, IdleAuthorityFailure, MemWalWorkerError, OpenedMemWalWorker, PreparedPut,
-    PreparedPutFailure, QueuedBatchPermit, SealedGenerationCut, StreamWorkerKey,
-    WorkerOpenFailure,
-    b1_input_accounting, b1_logical_batch_bytes, capture_current_head_witness,
-    reconstruct_b1_writer_config, validate_stream_config_v3_binding,
+    B1_MAX_GENERATION_ARROW_BYTES, B1_MAX_GENERATION_ROWS, B2_MAX_TOKEN_PROJECTION_ARROW_BYTES,
+    CallerOrdinalRange, CheckedExclusiveStreamAuthority, CheckedStreamAuthority,
+    ClaimedMemWalWorker, ConfirmedStreamTokenOverlay, ConfirmedStreamTokenOverlayRow,
+    DurableBatchAck, IdleAuthorityCheck, IdleAuthorityFailure, MemWalWorkerError,
+    OpenedMemWalWorker, PreparedPut, PreparedPutFailure, QueuedBatchPermit, SealedGenerationCut,
+    StreamWorkerKey, WorkerOpenFailure, b1_input_accounting, b1_logical_batch_bytes,
+    capture_current_head_witness, reconstruct_b1_writer_config, validate_stream_config_v3_binding,
 };
 use crate::validate::{ChangeSet, CommittedState, TableChange};
 
@@ -134,9 +129,7 @@ impl Omnigraph {
             .column_by_name("id")
             .and_then(|array| array.as_any().downcast_ref::<StringArray>())
             .ok_or_else(|| {
-                OmniError::manifest_internal(
-                    "validated B1 test batch has no exact Utf8 id column",
-                )
+                OmniError::manifest_internal("validated B1 test batch has no exact Utf8 id column")
             })?;
         let mut logical_ids = BTreeSet::new();
         for row in 0..batch.num_rows() {
@@ -241,11 +234,7 @@ impl Omnigraph {
                         })?,
                     )
                 } else if let Some(current) = durable_current.get(&logical_id) {
-                    (
-                        Some(current.current_token),
-                        Some(current.current_token),
-                        1,
-                    )
+                    (Some(current.current_token), Some(current.current_token), 1)
                 } else {
                     (None, None, 1)
                 };
@@ -270,12 +259,13 @@ impl Omnigraph {
             let candidate = request
                 .candidate_token()
                 .map_err(|error| OmniError::manifest_internal(error.to_string()))?;
-            let caller_ordinal = caller_ordinals
-                .start
-                .checked_add(u64::try_from(row).map_err(|_| {
-                    OmniError::manifest_internal("B1 test row ordinal exceeds u64")
-                })?)
-                .ok_or_else(|| OmniError::manifest_internal("B1 test ordinal overflow"))?;
+            let caller_ordinal =
+                caller_ordinals
+                    .start
+                    .checked_add(u64::try_from(row).map_err(|_| {
+                        OmniError::manifest_internal("B1 test row ordinal exceeds u64")
+                    })?)
+                    .ok_or_else(|| OmniError::manifest_internal("B1 test ordinal overflow"))?;
             let metadata = TrustedStreamRowMetadata::new_admission(
                 &request,
                 candidate,
@@ -302,11 +292,7 @@ impl Omnigraph {
         }
         let projected_token_rows = self
             .stream_workers
-            .projected_token_authority_rows(
-                &queued,
-                table_key,
-                &confirmed_token_updates,
-            )
+            .projected_token_authority_rows(&queued, table_key, &confirmed_token_updates)
             .await?;
         validate_generation_token_plan(table_key, &projected_token_rows)?;
         let batch = append_trusted_stream_metadata(batch, metadata_rows)?;
@@ -407,11 +393,7 @@ impl Omnigraph {
         let prepared = self
             .capture_stream_authority(table_key, "stream token final admission")
             .await?;
-        ensure_same_binding(
-            key,
-            &prepared,
-            "stream token final admission authority",
-        )?;
+        ensure_same_binding(key, &prepared, "stream token final admission authority")?;
         self.validate_stream_logical_admission_batch(&prepared, &batch)?;
         let payload_digest = PayloadDigest::derive(&PayloadDigestInput {
             identity: prepared.entry.identity,
@@ -541,13 +523,14 @@ impl Omnigraph {
             caller_ordinal,
         )
         .map_err(|error| OmniError::manifest_internal(error.to_string()))?;
-        let authority = crate::db::manifest::stream_token::StreamTokenAuthorityRow::from_present_metadata(
-            request.identity,
-            logical_id.clone(),
-            prepared.binding.enrollment_id.clone(),
-            &metadata,
-        )
-        .map_err(|error| OmniError::manifest_internal(error.to_string()))?;
+        let authority =
+            crate::db::manifest::stream_token::StreamTokenAuthorityRow::from_present_metadata(
+                request.identity,
+                logical_id.clone(),
+                prepared.binding.enrollment_id.clone(),
+                &metadata,
+            )
+            .map_err(|error| OmniError::manifest_internal(error.to_string()))?;
         // A row which cannot fit an otherwise-empty token/recovery projection
         // is terminal for this occurrence; asking the caller to fold would
         // create an endless retry loop.
@@ -578,26 +561,22 @@ impl Omnigraph {
         );
         let projected_token_rows = self
             .stream_workers
-            .projected_token_authority_rows(
-                &queued,
-                table_key,
-                &confirmed_token_updates,
-            )
+            .projected_token_authority_rows(&queued, table_key, &confirmed_token_updates)
             .await?;
         validate_generation_token_plan(table_key, &projected_token_rows)?;
 
         if let Err(error) = self
             .finish_reserved_stream_put(
-            table_key.to_string(),
-            batch,
-            CallerOrdinalRange::new(caller_ordinal, caller_ordinal).map_err(worker_error)?,
-            key,
-            admission_key,
-            queued,
-            put_authority,
-            confirmed_token_updates,
-        )
-        .await
+                table_key.to_string(),
+                batch,
+                CallerOrdinalRange::new(caller_ordinal, caller_ordinal).map_err(worker_error)?,
+                key,
+                admission_key,
+                queued,
+                put_authority,
+                confirmed_token_updates,
+            )
+            .await
         {
             return Err(match error {
                 OmniError::AckUnknown {
@@ -1043,10 +1022,7 @@ impl Omnigraph {
         if live.stream_token_authority() != prepared.txn.base.stream_token_authority() {
             return Err(OmniError::manifest_read_set_changed(
                 "stream_fold_token_authority",
-                Some(format!(
-                    "{:?}",
-                    prepared.txn.base.stream_token_authority()
-                )),
+                Some(format!("{:?}", prepared.txn.base.stream_token_authority())),
                 Some(format!("{:?}", live.stream_token_authority())),
             ));
         }
@@ -1555,10 +1531,8 @@ impl Omnigraph {
             .filter(|field| field.name() != crate::db::STREAM_METADATA_COLUMN)
             .map(|field| field.as_ref().clone())
             .collect::<Vec<_>>();
-        let expected = ArrowSchema::new_with_metadata(
-            expected_fields,
-            expected_physical.metadata().clone(),
-        );
+        let expected =
+            ArrowSchema::new_with_metadata(expected_fields, expected_physical.metadata().clone());
         if batch.schema().as_ref() != &expected {
             return Err(OmniError::manifest(format!(
                 "stream batch schema for '{}' does not exactly match its accepted logical schema",
@@ -1692,17 +1666,11 @@ impl Omnigraph {
     /// Return the exact logical stream incarnation for private protocol tests.
     #[cfg(feature = "failpoints")]
     #[doc(hidden)]
-    pub async fn failpoint_stream_incarnation_for_test(
-        &self,
-        table_key: &str,
-    ) -> Result<String> {
+    pub async fn failpoint_stream_incarnation_for_test(&self, table_key: &str) -> Result<String> {
         let capture = self
             .capture_stream_authority(table_key, "stream incarnation test probe")
             .await?;
-        Ok(capture
-            .lifecycle
-            .enrollment_receipt
-            .stream_incarnation_id)
+        Ok(capture.lifecycle.enrollment_receipt.stream_incarnation_id)
     }
 }
 
@@ -1717,7 +1685,8 @@ async fn lookup_base_stream_metadata(
     logical_id: &str,
 ) -> Result<Option<TrustedStreamRowMetadata>> {
     let logical_ids = std::collections::BTreeSet::from([logical_id.to_string()]);
-    let mut selected = lookup_base_stream_metadata_for_keys(dataset, identity, &logical_ids).await?;
+    let mut selected =
+        lookup_base_stream_metadata_for_keys(dataset, identity, &logical_ids).await?;
     Ok(selected.remove(logical_id))
 }
 
@@ -1741,9 +1710,13 @@ async fn lookup_base_stream_metadata_for_keys(
     scanner.batch_size_bytes(B2_MAX_TOKEN_PROJECTION_ARROW_BYTES);
     scanner
         .limit(
-            Some(i64::try_from(logical_ids.len().saturating_add(1)).map_err(|_| {
-                OmniError::manifest_internal("base stream-metadata lookup row limit exceeds i64")
-            })?),
+            Some(
+                i64::try_from(logical_ids.len().saturating_add(1)).map_err(|_| {
+                    OmniError::manifest_internal(
+                        "base stream-metadata lookup row limit exceeds i64",
+                    )
+                })?,
+            ),
             None,
         )
         .map_err(|error| OmniError::Lance(error.to_string()))?;
@@ -1900,19 +1873,14 @@ fn validate_stream_stored_bounds(table_key: &str, batch: &RecordBatch) -> Result
     Ok(())
 }
 
-fn validate_generation_token_plan(
-    table_key: &str,
-    rows: &[StreamTokenAuthorityRow],
-) -> Result<()> {
+fn validate_generation_token_plan(table_key: &str, rows: &[StreamTokenAuthorityRow]) -> Result<()> {
     match validate_stream_token_plan_bounds(rows) {
         Ok(()) => Ok(()),
-        Err(OmniError::ResourceLimitExceeded { actual, .. }) => {
-            Err(OmniError::FoldRequired {
-                table_key: table_key.to_string(),
-                rows: u64::try_from(rows.len()).unwrap_or(u64::MAX),
-                bytes: actual,
-            })
-        }
+        Err(OmniError::ResourceLimitExceeded { actual, .. }) => Err(OmniError::FoldRequired {
+            table_key: table_key.to_string(),
+            rows: u64::try_from(rows.len()).unwrap_or(u64::MAX),
+            bytes: actual,
+        }),
         Err(error) => Err(error),
     }
 }

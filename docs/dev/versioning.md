@@ -72,20 +72,54 @@ writer. The physical field's trailing `$` is outside the `.pg` identifier
 grammar, so a genuine v8 user property named `__omnigraph_stream_v1` remains
 ordinary user data and round-trips unchanged.
 
-Internal schema **v10 is the currently served format** (unreleased —
-0.10.0-dev source builds until the 0.10.0 release). It preserves the complete
-v9 contract and adds RFC-026 §4.7 P1's enablement authority: one required
-graph-global `stream_profile` singleton row, present from genesis (disabled,
-revision 1), flipped only through the shared publisher's exact-entry CAS with
-a strict revision advance. The same bump reserves the fold-attribution
-dead-letter slot (`dead_letter_object`, explicit null) because that summary is
-`deny_unknown_fields` and structurally equality-compared between the recovery
-sidecar and the lineage row — it cannot be retrofitted through a serde
-default. The bump is forced by decode semantics, not row volume: v9 decoders
-silently skip unknown row kinds, so only the stamp can make a v9 binary refuse
-a streaming-capable graph instead of writing blind to the freeze. A v9 graph
-crosses by export/init/load rebuild. Because `MIN_SUPPORTED == CURRENT == 10`,
-v10 refuses v9 and a v9 binary refuses v10.
+Internal schema v10 was the first 0.10.0-dev streaming-profile format. It
+preserved the complete v9 contract and added RFC-026 §4.7 P1's enablement
+authority: one required graph-global `stream_profile` singleton row, present
+from genesis (disabled, revision 1), flipped through the shared publisher's
+exact-entry CAS with a strict revision advance. The same bump reserved the
+fold-attribution dead-letter slot (`dead_letter_object`, explicit null) because
+that summary is `deny_unknown_fields` and structurally equality-compared
+between the recovery sidecar and the lineage row — it cannot be retrofitted
+through a serde default. The bump was forced by decode semantics, not row
+volume: v9 decoders silently skip unknown row kinds, so only the stamp can make
+a v9 binary refuse a streaming-capable graph instead of writing blind to the
+freeze. A v9 graph crosses by export/init/load rebuild. The genuine v9↔v10
+fence remains historical upgrade evidence.
+
+Internal schema **v11 is the currently served format** (unreleased — current
+0.10.0-dev source builds until the 0.10.0 release). It replaces the v10
+boolean payload with stream-profile protocol v2: a bounded receipt-chain
+reference plus strict `DISABLED`, delegated `ENABLED`, planned `DISABLING`, and
+receipt/cut-bound `RETIRED` states. `DISABLING` carries a drain-only fold
+continuation; `RETIRED` has no outgoing transition and decodes fail-closed.
+Only `cluster apply --confirm-stream-offline`, under the persisted cluster
+state lock and bound to the exact graph, declaration, profile revision,
+operation, and authenticated actor, may change the profile. When enabled,
+ordinary Mutation/Load/delete requires the exact non-forgeable runtime
+authority minted for the cluster-booted server; embedded SDK and direct
+`--store` writers are refused before input reads or durable effects.
+BranchMerge is refused while the profile is `ENABLED` or `DISABLING` even
+through that runtime because no token-aware merge transition exists.
+
+V11 raises the recovery-sidecar ceiling from v12 to v13 for that bounded
+profile-authority tranche. `StreamProfileChange` is the only emitted and
+accepted v13 discriminator. It owns the exact token-ledger
+`ProfileManagementReceipt` transaction; only the terminal manifest CAS that
+selects its achieved token witness and the next profile together makes either
+authoritative. Unknown or later lifecycle variants fail closed. Recovery-v10
+enrollment and recovery-v12 ordinary private fold payloads keep their exact
+meanings, and v13 is not another fold envelope. Checked offline apply can
+complete disable when no lifecycle rows exist or every existing lane is
+already `SEALED`; a non-`SEALED` lane and all `RETIRED` state remain
+fail-closed. There is no public firehose ingress,
+production enrollment, drain, claim, lifecycle-correction, or streaming
+transport surface in this format. Activating the remaining lifecycle families
+requires another strict graph/recovery strand rather than assigning new
+meaning to v11/v13.
+
+A v10 graph crosses by export/init/load rebuild into a different root. Because
+`MIN_SUPPORTED == CURRENT == 11`, v11 refuses v10 and a v10 binary refuses
+v11.
 
 There is no in-place migration dispatcher. The single source file
 `db/manifest/migrations.rs` holds only the version constant, the stamp read/write,

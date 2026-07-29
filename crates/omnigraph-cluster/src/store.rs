@@ -122,6 +122,17 @@ impl ClusterStore {
         &self.display_root
     }
 
+    /// Normalized storage root used by lower control-authority validation.
+    pub(crate) fn root(&self) -> &str {
+        &self.root
+    }
+
+    /// Concrete, non-caller-implementable storage evidence for lower
+    /// control-authority validation.
+    pub(crate) fn storage_handle(&self) -> &StorageHandle {
+        &self.storage
+    }
+
     /// Whether this root holds the cluster state ledger (`__cluster/state.json`)
     /// — i.e. is an actual cluster, not just any directory. Probed via the
     /// adapter (`file://` or `s3://`), failures read as "not a cluster".
