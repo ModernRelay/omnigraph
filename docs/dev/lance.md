@@ -92,7 +92,9 @@ Touching `apply_schema`, the migration planner, additive evolution.
 
 ### Object store / S3
 
-Touching `storage.rs`, S3-compatible backends (RustFS, MinIO), env vars.
+Touching `crates/omnigraph-storage/src/lib.rs`, the engine compatibility facade
+in `crates/omnigraph/src/storage.rs`, S3-compatible backends (RustFS, MinIO),
+or object-store environment variables.
 
 | Topic | URL |
 |---|---|
@@ -1013,7 +1015,7 @@ Not a version bump — a single-fix vendored pin. `[patch.crates-io] lance-table
 
 Migration from Lance 6.0.1 → 7.0.0 landed in this cycle. **Arrow stayed 58, DataFusion stayed 53** (no change) — the only transitive bump is `object_store` 0.12.5 → 0.13.2. 141 upstream commits reviewed (6.0.1 → 7.0.0); no fixes lost (the 6.0.x release-branch backports are all forward-ported into 7.0.0). Behavior-affecting findings:
 
-- **object_store 0.13 moved convenience methods behind a new `ObjectStoreExt` trait** (`get`/`put`/`head`/`rename`/`delete`; `list`/`list_with_delimiter`/`put_opts` stay on the core `ObjectStore` trait). Fix = add `use object_store::ObjectStoreExt;` to `storage.rs` and `db/manifest/namespace.rs`; no call-site changes. Mirrors Lance's own migration in PR #6672. The local-FS `PutMode::Update` gap is unchanged (still unimplemented upstream), so `storage.rs::write_text_if_match`'s local content-token emulation stays.
+- **object_store 0.13 moved convenience methods behind a new `ObjectStoreExt` trait** (`get`/`put`/`head`/`rename`/`delete`; `list`/`list_with_delimiter`/`put_opts` stay on the core `ObjectStore` trait). Fix = add `use object_store::ObjectStoreExt;` to the implementation now at `crates/omnigraph-storage/src/lib.rs` and to `db/manifest/namespace.rs`; no call-site changes. Mirrors Lance's own migration in PR #6672. The local-FS `PutMode::Update` gap is unchanged (still unimplemented upstream), so `omnigraph-storage::ObjectStorageAdapter::write_text_if_match`'s local content-token emulation stays; `crates/omnigraph/src/storage.rs` is the engine compatibility facade.
 - **`roaring` must be pinned to 0.11.4** (`cargo update -p roaring --precise 0.11.4`). Lance 7.0.0's `UpdatedFragmentOffsets` newtype (PR #6650) derives `Eq` over `HashMap<u64, RoaringBitmap>`, which needs `RoaringBitmap: Eq` — added only in roaring 0.11.4 (roaring-rs PR #341). Lance's loose `roaring = "0.11"` constraint otherwise resolves the broken 0.11.3 and **lance itself fails to compile** (`RoaringBitmap: Eq is not satisfied`). roaring is transitive (no direct workspace dep); the pin lives only in `Cargo.lock`.
 - **`_row_created_at_version` for merge-insert INSERT rows now = the commit version** (PR #6774; was a fallback of 1 / dataset-creation version). Flipped `lance_version_columns.rs::lance_merge_insert_new_row_stamps_created_at_version` to assert `== v2`. Production change-detection keys on `_row_last_updated_at_version` + ID-set membership, so classification logic is unaffected (the `changes/mod.rs` rationale comment was corrected).
 - **BTREE range-query bound inclusiveness fixed** (PR #6796, issue #6792): `x <= hi AND x > lo` returned the wrong boundary row on 6.0.1. omnigraph today builds BTREE only on string `@key` columns (`id`/`src`/`dst`) and queries them by equality/IN, not range, so its *current* query patterns almost certainly never hit this bug — but the corrected boundary semantics are a contract we rely on the moment a BTREE-range path appears (BTREE-on-properties via the index-type tickets, or a range-on-key query). Pinned by `lance_surface_guards.rs::btree_range_query_boundary_is_correct` (reproduces #6792's 5-row + BTREE shape).

@@ -239,6 +239,15 @@ pub enum OmniError {
     AlreadyInitialized { uri: String },
 }
 
+impl From<omnigraph_storage::StorageError> for OmniError {
+    fn from(error: omnigraph_storage::StorageError) -> Self {
+        match error {
+            omnigraph_storage::StorageError::Internal(message) => Self::manifest_internal(message),
+            omnigraph_storage::StorageError::Io(error) => Self::Io(error),
+        }
+    }
+}
+
 impl OmniError {
     pub fn key_conflict(table_key: impl Into<String>, key: impl Into<String>) -> Self {
         Self::KeyConflict {

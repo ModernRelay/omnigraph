@@ -11,7 +11,10 @@ on:
 
 concurrency:
   group: ci-${{ github.workflow }}-${{ github.ref }}
-  cancel-in-progress: true
+  # A protected-main run may publish a write-once dependency binding only
+  # after every other owner succeeds. Never cancel it around that final
+  # mutation; PR supersession remains safe and desirable.
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 jobs:
   classify_changes:
@@ -22,9 +25,13 @@ jobs:
     outputs:
       run_full_ci: ${{ steps.filter.outputs.run_full_ci }}
       run_rustfs_ci: ${{ steps.filter.outputs.run_rustfs_ci }}
+      firehose_scope: ${{ steps.firehose.outputs.firehose_scope }}
+      firehose_base_source_key: ${{ steps.firehose.outputs.firehose_base_source_key }}
+      firehose_head_source_key: ${{ steps.firehose.outputs.firehose_head_source_key }}
+      firehose_dependency_inputs_changed: ${{ steps.firehose.outputs.firehose_dependency_inputs_changed }}
     steps:
       - name: Checkout source
-        uses: actions/checkout@v5.0.1
+        uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5.0.1
         with:
           fetch-depth: 0
 
@@ -94,6 +101,7 @@ jobs:
               crates/omnigraph/tests/s3_storage.rs|crates/omnigraph/tests/write_cost_s3.rs|crates/omnigraph/tests/lance_surface_guards.rs|crates/omnigraph/tests/memwal_enrollment_gate.rs|crates/omnigraph/tests/memwal_stream.rs|crates/omnigraph/tests/memwal_stream_cost.rs|crates/omnigraph/tests/failpoints.rs|crates/omnigraph/tests/helpers/*) run_rustfs_ci=true ;;
               crates/omnigraph/src/table_store.rs|crates/omnigraph/src/table_store/mem_wal.rs|crates/omnigraph/src/table_store/mem_wal/*|crates/omnigraph/src/instrumentation.rs) run_rustfs_ci=true ;;
               crates/omnigraph/src/runtime_cache.rs|crates/omnigraph/src/graph_index/*) run_rustfs_ci=true ;;
+              crates/omnigraph-storage/*|crates/omnigraph-control-authority/*) run_rustfs_ci=true ;;
               crates/omnigraph-cluster/src/store.rs|crates/omnigraph-cluster/src/serve.rs) run_rustfs_ci=true ;;
               crates/omnigraph-cluster/tests/s3_cluster.rs) run_rustfs_ci=true ;;
               crates/omnigraph-server/tests/s3.rs|crates/omnigraph-server/tests/support/*) run_rustfs_ci=true ;;
@@ -106,6 +114,51 @@ jobs:
           echo "run_full_ci=$run_full_ci" >> "$GITHUB_OUTPUT"
           echo "run_rustfs_ci=$run_rustfs_ci" >> "$GITHUB_OUTPUT"
 
+      - name: Classify firehose scope and dependency inputs
+        id: firehose
+        env:
+          BEFORE_SHA: ${{ github.event.before }}
+          EVENT_NAME: ${{ github.event_name }}
+          PR_BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          PR_HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+          REF_TYPE: ${{ github.ref_type }}
+        run: |
+          set -euo pipefail
+
+          if [[ "$EVENT_NAME" == "workflow_dispatch" || "$REF_TYPE" == "tag" ]]; then
+            key="$(FIREHOSE_SOURCE_ONLY=1 scripts/ci/firehose-key.sh)"
+            {
+              echo "firehose_scope=source"
+              echo "firehose_base_source_key=$key"
+              echo "firehose_head_source_key=$key"
+              echo "firehose_dependency_inputs_changed=true"
+            } >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          if [[ "$EVENT_NAME" == "pull_request" ]]; then
+            base="$PR_BASE_SHA"
+            head="$PR_HEAD_SHA"
+          else
+            base="$BEFORE_SHA"
+            head="$GITHUB_SHA"
+            if [[ "$base" == "0000000000000000000000000000000000000000" ]]; then
+              base="$(git rev-parse "${head}^" 2>/dev/null || true)"
+            fi
+          fi
+
+          if [[ -z "${base:-}" ]]; then
+            key="$(FIREHOSE_SOURCE_ONLY=1 scripts/ci/firehose-key.sh)"
+            {
+              echo "firehose_scope=source"
+              echo "firehose_base_source_key=$key"
+              echo "firehose_head_source_key=$key"
+              echo "firehose_dependency_inputs_changed=true"
+            } >> "$GITHUB_OUTPUT"
+          else
+            scripts/ci/firehose-classify.sh "$base" "$head" >> "$GITHUB_OUTPUT"
+          fi
+
   check_agents_md:
     name: Check AGENTS.md Links
     runs-on: ubuntu-latest
@@ -113,7 +166,7 @@ jobs:
       contents: read
     steps:
       - name: Checkout source
-        uses: actions/checkout@v5.0.1
+        uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5.0.1
 
       - name: Verify AGENTS.md ↔ docs/ cross-links
         run: bash scripts/check-agents-md.sh
@@ -125,7 +178,7 @@ jobs:
       contents: read
     steps:
       - name: Checkout source
-        uses: actions/checkout@v5.0.1
+        uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5.0.1
 
       - name: Verify omnigraph-server entrypoint arg composition
         run: sh docker/entrypoint_test.sh
@@ -159,6 +212,9 @@ jobs:
     timeout-minutes: 60
     permissions:
       contents: read
+    outputs:
+      firehose_key: ${{ steps.firehose_key.outputs.key }}
+      firehose_target_artifact_id: ${{ steps.firehose_target.outputs.artifact-id }}
     env:
       CARGO_TERM_COLOR: always
       # Floor for the whole class of debug-build async stack depth, NOT the fix
@@ -173,23 +229,43 @@ jobs:
       RUST_MIN_STACK: 16777216
     steps:
       - name: Checkout source
-        uses: actions/checkout@v5.0.1
+        uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5.0.1
 
       - name: Install system dependencies
         run: |
           sudo apt-get update
-          sudo apt-get install -y protobuf-compiler libprotobuf-dev
+          sudo apt-get install -y protobuf-compiler libprotobuf-dev zstd
 
       - name: Install Rust stable
-        uses: dtolnay/rust-toolchain@stable
+        uses: dtolnay/rust-toolchain@4cda84d5c5c54efe2404f9d843567869ab1699d4 # stable
         with:
           toolchain: stable
 
       - name: Cache Rust build data
-        uses: Swatinem/rust-cache@v2
+        uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
         with:
           workspaces: |
             . -> target
+
+      - name: Derive exact firehose dependency key
+        id: firehose_key
+        run: |
+          set -euo pipefail
+          packages="$(dpkg-query -W -f='${Package}=${Version}\n' \
+            protobuf-compiler libprotobuf-dev zstd | LC_ALL=C sort)"
+          runner_image="${ImageOS:-ubuntu}-${ImageVersion:-unknown}"
+          {
+            echo "FIREHOSE_SYSTEM_PACKAGES<<EOF"
+            echo "$packages"
+            echo "EOF"
+            echo "FIREHOSE_RUNNER_IMAGE=$runner_image"
+          } >> "$GITHUB_ENV"
+          key="$(
+            FIREHOSE_SYSTEM_PACKAGES="$packages" \
+            FIREHOSE_RUNNER_IMAGE="$runner_image" \
+              scripts/ci/firehose-key.sh
+          )"
+          echo "key=$key" >> "$GITHUB_OUTPUT"
 
       - name: Run workspace and failpoint tests once
         run: |
@@ -243,6 +319,526 @@ jobs:
           grep -Fq "fold_delta_remeasure_bytes=402653184" "$test_log" \
             || { echo "::error::Gate R0 RSS evidence line or 384-MiB tripwire changed"; exit 1; }
 
+      # The protected-main publisher below reuses this exact target. It does
+      # not run Cargo a second time. `pack` removes workspace crate outputs
+      # before archiving, so the reusable key excludes ordinary source.
+      - name: Pack protected-main firehose dependency target
+        if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+        run: |
+          scripts/ci/firehose-artifact.sh pack \
+            "$RUNNER_TEMP/firehose-deps.tar.zst" \
+            "${{ steps.firehose_key.outputs.key }}"
+
+      - name: Upload current-run firehose target for the publisher
+        id: firehose_target
+        if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: firehose-main-target-${{ github.run_id }}
+          path: |
+            ${{ runner.temp }}/firehose-deps.tar.zst
+            ${{ runner.temp }}/firehose-deps.tar.zst.sha256
+          if-no-files-found: error
+          compression-level: 0
+          retention-days: 1
+
+  firehose_pr_smoke:
+    name: Firehose PR smoke
+    needs: classify_changes
+    if: always()
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    permissions:
+      actions: read
+      attestations: read
+      contents: read
+    outputs:
+      mode: ${{ steps.outcome.outputs.mode }}
+      key: ${{ steps.outcome.outputs.key }}
+      warm_evidence_artifact_id: ${{ steps.warm_evidence.outputs.artifact-id }}
+    env:
+      CARGO_TERM_COLOR: always
+      RUST_MIN_STACK: 16777216
+    steps:
+      - name: Require an authoritative classification
+        env:
+          CLASSIFY_RESULT: ${{ needs.classify_changes.result }}
+          FIREHOSE_SCOPE: ${{ needs.classify_changes.outputs.firehose_scope }}
+        run: |
+          set -euo pipefail
+          if [[ "$CLASSIFY_RESULT" != "success" ]]; then
+            echo "::error::Classify Changes did not succeed"
+            exit 1
+          fi
+          if [[ "$FIREHOSE_SCOPE" != "docs-only" && "$FIREHOSE_SCOPE" != "source" ]]; then
+            echo "::error::missing or invalid firehose classification"
+            exit 1
+          fi
+
+      - name: Explicit docs-only no-op
+        if: needs.classify_changes.outputs.firehose_scope == 'docs-only'
+        run: echo "Proven docs-only change; firehose smoke is an explicit no-op."
+
+      - name: Explain changed-key delegation
+        if: >-
+          github.event_name == 'pull_request' &&
+          needs.classify_changes.outputs.firehose_scope == 'source' &&
+          needs.classify_changes.outputs.firehose_dependency_inputs_changed == 'true'
+        run: |
+          echo "The dependency key changed; Firehose dependency rebuild owns"
+          echo "the sole cold compile and smoke run under its 60-minute cap."
+
+      - name: Checkout source
+        if: >-
+          github.event_name == 'pull_request' &&
+          needs.classify_changes.outputs.firehose_scope == 'source' &&
+          needs.classify_changes.outputs.firehose_dependency_inputs_changed == 'false'
+        uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5.0.1
+
+      - name: Install system dependencies
+        if: >-
+          github.event_name == 'pull_request' &&
+          needs.classify_changes.outputs.firehose_scope == 'source' &&
+          needs.classify_changes.outputs.firehose_dependency_inputs_changed == 'false'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y protobuf-compiler libprotobuf-dev zstd
+
+      - name: Install Rust stable
+        if: >-
+          github.event_name == 'pull_request' &&
+          needs.classify_changes.outputs.firehose_scope == 'source' &&
+          needs.classify_changes.outputs.firehose_dependency_inputs_changed == 'false'
+        uses: dtolnay/rust-toolchain@4cda84d5c5c54efe2404f9d843567869ab1699d4 # stable
+        with:
+          toolchain: stable
+
+      - name: Derive exact PR dependency key
+        id: pr_key
+        if: >-
+          github.event_name == 'pull_request' &&
+          needs.classify_changes.outputs.firehose_scope == 'source' &&
+          needs.classify_changes.outputs.firehose_dependency_inputs_changed == 'false'
+        run: |
+          set -euo pipefail
+          packages="$(dpkg-query -W -f='${Package}=${Version}\n' \
+            protobuf-compiler libprotobuf-dev zstd | LC_ALL=C sort)"
+          runner_image="${ImageOS:-ubuntu}-${ImageVersion:-unknown}"
+          {
+            echo "FIREHOSE_SYSTEM_PACKAGES<<EOF"
+            echo "$packages"
+            echo "EOF"
+            echo "FIREHOSE_RUNNER_IMAGE=$runner_image"
+          } >> "$GITHUB_ENV"
+          key="$(
+            FIREHOSE_SYSTEM_PACKAGES="$packages" \
+            FIREHOSE_RUNNER_IMAGE="$runner_image" \
+              scripts/ci/firehose-key.sh
+          )"
+          echo "key=$key" >> "$GITHUB_OUTPUT"
+
+      - name: Locate protected-main dependency artifact
+        id: lookup
+        if: steps.pr_key.outcome == 'success'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          scripts/ci/firehose-artifact.sh lookup \
+            "${{ steps.pr_key.outputs.key }}" >> "$GITHUB_OUTPUT"
+
+      - name: Download protected-main dependency artifact
+        if: steps.lookup.outputs.found == 'true'
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          artifact-ids: ${{ steps.lookup.outputs.artifact_id }}
+          path: ${{ runner.temp }}/firehose-trusted
+          merge-multiple: true
+          github-token: ${{ github.token }}
+          repository: ${{ github.repository }}
+          run-id: ${{ steps.lookup.outputs.run_id }}
+
+      - name: Verify and restore protected-main dependency artifact
+        if: steps.lookup.outputs.found == 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          scripts/ci/firehose-artifact.sh verify \
+            "$RUNNER_TEMP/firehose-trusted/firehose-deps.tar.zst" \
+            "${{ steps.pr_key.outputs.key }}" \
+            "${{ steps.lookup.outputs.head_sha }}"
+          scripts/ci/firehose-artifact.sh restore \
+            "$RUNNER_TEMP/firehose-trusted/firehose-deps.tar.zst"
+
+      - name: Run bounded firehose smoke
+        id: warm_smoke
+        if: steps.lookup.outputs.found == 'true'
+        run: |
+          set -euo pipefail
+          started_at="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+          start_seconds="$SECONDS"
+          scripts/ci/firehose-smoke.sh
+          elapsed="$((SECONDS - start_seconds))"
+          jq -n \
+            --arg format "omnigraph-firehose-warm-evidence-v1" \
+            --arg run_id "$GITHUB_RUN_ID" \
+            --arg head_sha "$GITHUB_SHA" \
+            --arg key "${{ steps.pr_key.outputs.key }}" \
+            --arg publisher_run_id "${{ steps.lookup.outputs.run_id }}" \
+            --arg publisher_sha "${{ steps.lookup.outputs.head_sha }}" \
+            --arg artifact_id "${{ steps.lookup.outputs.artifact_id }}" \
+            --arg started_at "$started_at" \
+            --argjson elapsed_seconds "$elapsed" \
+            '{
+              format: $format,
+              run_id: $run_id,
+              head_sha: $head_sha,
+              key: $key,
+              publisher_run_id: $publisher_run_id,
+              publisher_sha: $publisher_sha,
+              artifact_id: $artifact_id,
+              started_at: $started_at,
+              elapsed_seconds: $elapsed_seconds,
+              attestation: "verified",
+              smoke: "passed"
+            }' > "$RUNNER_TEMP/firehose-warm-evidence.json"
+
+      - name: Upload current-run warm evidence
+        id: warm_evidence
+        if: steps.warm_smoke.outcome == 'success'
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: firehose-warm-evidence-${{ github.run_id }}
+          path: ${{ runner.temp }}/firehose-warm-evidence.json
+          if-no-files-found: error
+          retention-days: 7
+
+      - name: Record smoke disposition
+        id: outcome
+        env:
+          FIREHOSE_SCOPE: ${{ needs.classify_changes.outputs.firehose_scope }}
+          INPUTS_CHANGED: ${{ needs.classify_changes.outputs.firehose_dependency_inputs_changed }}
+          PR_KEY: ${{ steps.pr_key.outputs.key }}
+          TRUSTED_FOUND: ${{ steps.lookup.outputs.found }}
+          WARM_EVIDENCE_ID: ${{ steps.warm_evidence.outputs.artifact-id }}
+        run: |
+          set -euo pipefail
+          if [[ "$FIREHOSE_SCOPE" == "docs-only" ]]; then
+            mode="docs-only"
+            key=""
+          elif [[ "$GITHUB_EVENT_NAME" != "pull_request" ]]; then
+            mode="main-workspace"
+            key=""
+          elif [[ "$INPUTS_CHANGED" == "true" ]]; then
+            mode="delegated-changed"
+            key=""
+          elif [[ "$TRUSTED_FOUND" != "true" ]]; then
+            mode="delegated-missing"
+            key="$PR_KEY"
+          else
+            mode="verified"
+            key="$PR_KEY"
+            test -s "$RUNNER_TEMP/firehose-warm-evidence.json"
+            test -n "$WARM_EVIDENCE_ID"
+          fi
+          echo "mode=$mode" >> "$GITHUB_OUTPUT"
+          echo "key=$key" >> "$GITHUB_OUTPUT"
+          echo "Firehose smoke disposition: $mode"
+
+  firehose_dependency_rebuild:
+    name: Firehose dependency rebuild
+    needs:
+      - classify_changes
+      - firehose_pr_smoke
+      - test
+    if: always()
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    permissions:
+      actions: read
+      contents: read
+    outputs:
+      mode: ${{ steps.outcome.outputs.mode }}
+      key: ${{ steps.outcome.outputs.key }}
+    env:
+      CARGO_TERM_COLOR: always
+      RUST_MIN_STACK: 16777216
+    steps:
+      - name: Require authoritative upstream results
+        env:
+          CLASSIFY_RESULT: ${{ needs.classify_changes.result }}
+          FIREHOSE_SCOPE: ${{ needs.classify_changes.outputs.firehose_scope }}
+          SMOKE_RESULT: ${{ needs.firehose_pr_smoke.result }}
+          SMOKE_MODE: ${{ needs.firehose_pr_smoke.outputs.mode }}
+          TEST_RESULT: ${{ needs.test.result }}
+        run: |
+          set -euo pipefail
+          [[ "$CLASSIFY_RESULT" == "success" ]]
+          [[ "$SMOKE_RESULT" == "success" ]]
+          case "$SMOKE_MODE" in
+            docs-only|main-workspace|verified|delegated-changed|delegated-missing) ;;
+            *)
+              echo "::error::Firehose PR smoke emitted no valid disposition"
+              exit 1
+              ;;
+          esac
+          if [[ "$GITHUB_EVENT_NAME" == "pull_request" ]]; then
+            [[ "$TEST_RESULT" == "skipped" ]]
+          elif [[ "$FIREHOSE_SCOPE" == "source" ]]; then
+            [[ "$TEST_RESULT" == "success" ]]
+          fi
+
+      - name: Explicit docs-only no-op
+        if: needs.firehose_pr_smoke.outputs.mode == 'docs-only'
+        run: echo "Proven docs-only change; dependency rebuild is an explicit no-op."
+
+      - name: Select cold shadow policy
+        id: cold_policy
+        run: |
+          # Temporarily disabled: the first exact changed-key run spent 29m25s
+          # on a workspace-wide no-run build, 20m59s recompiling the focused
+          # engine graph, then hit the 3,300-second cap in a third graph.
+          echo "enabled=false" >> "$GITHUB_OUTPUT"
+          echo "::notice::Cold firehose rebuild is shadow-disabled pending an isolated single-graph harness."
+
+      - name: Download current-run verified evidence
+        if: needs.firehose_pr_smoke.outputs.mode == 'verified'
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          artifact-ids: ${{ needs.firehose_pr_smoke.outputs.warm_evidence_artifact_id }}
+          path: ${{ runner.temp }}/firehose-warm-evidence
+          merge-multiple: true
+
+      - name: Verify unchanged-key disposition
+        if: needs.firehose_pr_smoke.outputs.mode == 'verified'
+        run: |
+          jq -e \
+            --arg run_id "$GITHUB_RUN_ID" \
+            --arg head_sha "$GITHUB_SHA" \
+            --arg key "${{ needs.firehose_pr_smoke.outputs.key }}" \
+            '.format == "omnigraph-firehose-warm-evidence-v1"
+             and .run_id == $run_id
+             and .head_sha == $head_sha
+             and .key == $key
+             and .attestation == "verified"
+             and .smoke == "passed"
+             and (.elapsed_seconds >= 0 and .elapsed_seconds <= 780)' \
+            "$RUNNER_TEMP/firehose-warm-evidence/firehose-warm-evidence.json" \
+            >/dev/null
+
+      - name: Checkout source for cold exception
+        if: >-
+          steps.cold_policy.outputs.enabled == 'true' &&
+          (needs.firehose_pr_smoke.outputs.mode == 'delegated-changed' ||
+          needs.firehose_pr_smoke.outputs.mode == 'delegated-missing')
+        uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5.0.1
+        with:
+          fetch-depth: 0
+
+      - name: Install system dependencies for cold exception
+        if: >-
+          steps.cold_policy.outputs.enabled == 'true' &&
+          (needs.firehose_pr_smoke.outputs.mode == 'delegated-changed' ||
+          needs.firehose_pr_smoke.outputs.mode == 'delegated-missing')
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y protobuf-compiler libprotobuf-dev zstd
+
+      - name: Install Rust stable for cold exception
+        if: >-
+          steps.cold_policy.outputs.enabled == 'true' &&
+          (needs.firehose_pr_smoke.outputs.mode == 'delegated-changed' ||
+          needs.firehose_pr_smoke.outputs.mode == 'delegated-missing')
+        uses: dtolnay/rust-toolchain@4cda84d5c5c54efe2404f9d843567869ab1699d4 # stable
+        with:
+          toolchain: stable
+
+      - name: Derive cold dependency key
+        id: cold_key
+        if: >-
+          steps.cold_policy.outputs.enabled == 'true' &&
+          (needs.firehose_pr_smoke.outputs.mode == 'delegated-changed' ||
+          needs.firehose_pr_smoke.outputs.mode == 'delegated-missing')
+        run: |
+          set -euo pipefail
+          packages="$(dpkg-query -W -f='${Package}=${Version}\n' \
+            protobuf-compiler libprotobuf-dev zstd | LC_ALL=C sort)"
+          runner_image="${ImageOS:-ubuntu}-${ImageVersion:-unknown}"
+          key="$(
+            FIREHOSE_SYSTEM_PACKAGES="$packages" \
+            FIREHOSE_RUNNER_IMAGE="$runner_image" \
+              scripts/ci/firehose-key.sh
+          )"
+          echo "key=$key" >> "$GITHUB_OUTPUT"
+
+      - name: Cold-build and run the sole smoke owner
+        id: cold_rebuild
+        if: steps.cold_key.outcome == 'success'
+        env:
+          # Leave five minutes of the aggregate job ceiling for checkout,
+          # packages, classification, and evidence recording.
+          FIREHOSE_SMOKE_TIMEOUT_SECONDS: 3300
+        run: |
+          set -euo pipefail
+          started_at="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+          start_seconds="$SECONDS"
+          scripts/ci/firehose-smoke.sh
+          elapsed="$((SECONDS - start_seconds))"
+          jq -n \
+            --arg format "omnigraph-firehose-rebuild-evidence-v1" \
+            --arg run_id "$GITHUB_RUN_ID" \
+            --arg head_sha "$GITHUB_SHA" \
+            --arg key "${{ steps.cold_key.outputs.key }}" \
+            --arg started_at "$started_at" \
+            --argjson elapsed_seconds "$elapsed" \
+            '{
+              format: $format,
+              run_id: $run_id,
+              head_sha: $head_sha,
+              key: $key,
+              started_at: $started_at,
+              elapsed_seconds: $elapsed_seconds,
+              smoke: "passed"
+            }' > "$RUNNER_TEMP/firehose-rebuild-evidence.json"
+
+      - name: Record dependency disposition
+        id: outcome
+        env:
+          SMOKE_MODE: ${{ needs.firehose_pr_smoke.outputs.mode }}
+          SMOKE_KEY: ${{ needs.firehose_pr_smoke.outputs.key }}
+          COLD_ENABLED: ${{ steps.cold_policy.outputs.enabled }}
+          COLD_KEY: ${{ steps.cold_key.outputs.key }}
+          MAIN_KEY: ${{ needs.test.outputs.firehose_key }}
+        run: |
+          set -euo pipefail
+          case "$SMOKE_MODE" in
+            docs-only)
+              mode="docs-only"
+              key=""
+              ;;
+            main-workspace)
+              mode="main-workspace"
+              key="$MAIN_KEY"
+              [[ -n "$key" ]]
+              ;;
+            verified)
+              mode="verified"
+              key="$SMOKE_KEY"
+              [[ -n "$key" ]]
+              ;;
+            delegated-changed|delegated-missing)
+              if [[ "$COLD_ENABLED" == "true" ]]; then
+                mode="rebuilt"
+                key="$COLD_KEY"
+                [[ -n "$key" ]]
+                test -s "$RUNNER_TEMP/firehose-rebuild-evidence.json"
+              else
+                mode="shadow-disabled"
+                key=""
+              fi
+              ;;
+            *)
+              exit 1
+              ;;
+          esac
+          echo "mode=$mode" >> "$GITHUB_OUTPUT"
+          echo "key=$key" >> "$GITHUB_OUTPUT"
+          echo "Firehose dependency disposition: $mode"
+
+  firehose_publish_dependencies:
+    name: Publish protected-main firehose dependencies
+    needs:
+      - classify_changes
+      - check_agents_md
+      - entrypoint_test
+      - test
+      - firehose_pr_smoke
+      - firehose_dependency_rebuild
+      - v9_v10_format_fence
+      - test_aws_feature
+      - rustfs_integration
+    if: >-
+      github.event_name == 'push' &&
+      github.ref == 'refs/heads/main' &&
+      needs.classify_changes.outputs.firehose_scope == 'source' &&
+      needs.check_agents_md.result == 'success' &&
+      needs.entrypoint_test.result == 'success' &&
+      needs.test.result == 'success' &&
+      needs.firehose_pr_smoke.result == 'success' &&
+      needs.firehose_dependency_rebuild.result == 'success' &&
+      needs.v9_v10_format_fence.result == 'success' &&
+      needs.test_aws_feature.result == 'success' &&
+      needs.rustfs_integration.result == 'success'
+    concurrency:
+      group: firehose-dependencies-${{ needs.test.outputs.firehose_key }}
+      cancel-in-progress: false
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    permissions:
+      actions: read
+      artifact-metadata: write
+      attestations: write
+      contents: read
+      id-token: write
+    steps:
+      - name: Checkout publisher workflow and verifier
+        uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5.0.1
+
+      - name: Download the exact target built by Test Workspace
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          artifact-ids: ${{ needs.test.outputs.firehose_target_artifact_id }}
+          path: ${{ runner.temp }}/firehose-main-target
+          merge-multiple: true
+
+      - name: Locate an existing write-once binding
+        id: lookup
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          scripts/ci/firehose-artifact.sh lookup \
+            "${{ needs.test.outputs.firehose_key }}" >> "$GITHUB_OUTPUT"
+
+      - name: Download an existing protected-main artifact
+        if: steps.lookup.outputs.found == 'true'
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          artifact-ids: ${{ steps.lookup.outputs.artifact_id }}
+          path: ${{ runner.temp }}/firehose-existing
+          merge-multiple: true
+          github-token: ${{ github.token }}
+          repository: ${{ github.repository }}
+          run-id: ${{ steps.lookup.outputs.run_id }}
+
+      - name: Verify the existing write-once binding
+        if: steps.lookup.outputs.found == 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          scripts/ci/firehose-artifact.sh verify \
+            "$RUNNER_TEMP/firehose-existing/firehose-deps.tar.zst" \
+            "${{ needs.test.outputs.firehose_key }}" \
+            "${{ steps.lookup.outputs.head_sha }}"
+
+      # Attest before upload. If attestation fails, no durable keyed artifact
+      # is exposed. Upload is the final mutating step in this job.
+      - name: Attest the new dependency archive
+        if: steps.lookup.outputs.found != 'true'
+        uses: actions/attest@f7c74d28b9d84cb8768d0b8ca14a4bac6ef463e6 # v4.2.0
+        with:
+          subject-path: ${{ runner.temp }}/firehose-main-target/firehose-deps.tar.zst
+
+      - name: Publish the immutable keyed dependency artifact
+        if: steps.lookup.outputs.found != 'true'
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: firehose-deps-${{ needs.test.outputs.firehose_key }}
+          path: |
+            ${{ runner.temp }}/firehose-main-target/firehose-deps.tar.zst
+            ${{ runner.temp }}/firehose-main-target/firehose-deps.tar.zst.sha256
+          if-no-files-found: error
+          compression-level: 0
+          retention-days: 90
+
   v9_v10_format_fence:
     name: V9 ↔ V10 Format Fence
     needs: classify_changes
@@ -260,7 +856,7 @@ jobs:
       RUST_MIN_STACK: 16777216
     steps:
       - name: Checkout source
-        uses: actions/checkout@v5.0.1
+        uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5.0.1
 
       - name: Install system dependencies
         run: |
@@ -268,12 +864,12 @@ jobs:
           sudo apt-get install -y protobuf-compiler libprotobuf-dev
 
       - name: Install Rust stable
-        uses: dtolnay/rust-toolchain@stable
+        uses: dtolnay/rust-toolchain@4cda84d5c5c54efe2404f9d843567869ab1699d4 # stable
         with:
           toolchain: stable
 
       - name: Cache cross-version build data
-        uses: Swatinem/rust-cache@v2
+        uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
         with:
           workspaces: |
             . -> target
@@ -341,7 +937,7 @@ jobs:
 
       - name: Checkout source
         if: needs.classify_changes.outputs.run_full_ci == 'true'
-        uses: actions/checkout@v5.0.1
+        uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5.0.1
 
       - name: Install system dependencies
         if: needs.classify_changes.outputs.run_full_ci == 'true'
@@ -351,13 +947,13 @@ jobs:
 
       - name: Install Rust stable
         if: needs.classify_changes.outputs.run_full_ci == 'true'
-        uses: dtolnay/rust-toolchain@stable
+        uses: dtolnay/rust-toolchain@4cda84d5c5c54efe2404f9d843567869ab1699d4 # stable
         with:
           toolchain: stable
 
       - name: Cache Rust build data
         if: needs.classify_changes.outputs.run_full_ci == 'true'
-        uses: Swatinem/rust-cache@v2
+        uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
         with:
           workspaces: |
             . -> target
@@ -410,7 +1006,7 @@ jobs:
       RUST_MIN_STACK: 16777216
     steps:
       - name: Checkout source
-        uses: actions/checkout@v5.0.1
+        uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5.0.1
 
       - name: Install system dependencies
         run: |
@@ -418,12 +1014,12 @@ jobs:
           sudo apt-get install -y protobuf-compiler libprotobuf-dev python3-pip
 
       - name: Install Rust stable
-        uses: dtolnay/rust-toolchain@stable
+        uses: dtolnay/rust-toolchain@4cda84d5c5c54efe2404f9d843567869ab1699d4 # stable
         with:
           toolchain: stable
 
       - name: Cache Rust build data
-        uses: Swatinem/rust-cache@v2
+        uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
         with:
           # One cache per feature graph avoids both feature thrash and the
           # previous five copies of the shared substrate.

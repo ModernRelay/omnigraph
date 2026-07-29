@@ -148,7 +148,7 @@ flowchart TB
     subgraph io[Lance I/O]
         la[LanceAccessContext<br/>shared store registry<br/>split data/control sessions]:::l2
         ts[table_store]:::l2
-        st[storage adapter<br/>storage.rs]:::l2
+        st[control-object storage<br/>omnigraph-storage<br/>+ engine facade]:::l2
     end
 
     eq --> gi
@@ -371,6 +371,11 @@ Throughout the docs, capabilities are split into:
 ## Workspace crates
 
 - `omnigraph-compiler` — schema and query grammars, catalog, IR, lowering, type checker, lint, migration planner, OpenAI-style embedding client.
+- `omnigraph-storage` — the shared local/S3 control-object storage implementation and concrete backend handle used below the engine/cluster split.
+- `omnigraph-control-authority` — persisted cluster-lock ownership below the engine/cluster split; depends only on `omnigraph-storage`. Complete opaque checked apply/runtime/export capabilities belong here once all of their canonical fences land.
 - `omnigraph` (engine, published as `omnigraph-engine` on crates.io since v0.2.2) — the Lance-backed runtime: manifest, commit graph, snapshot, exec (incl. per-query `MutationStaging` accumulator), merge, loader, Gemini embedding client.
+- `omnigraph-policy` — Cedar policy compilation and engine-facing enforcement.
+- `omnigraph-api-types` — shared HTTP wire DTOs used by the server and CLI.
+- `omnigraph-cluster` — cluster config validation, planning, state, and apply.
 - `omnigraph-cli` — the `omnigraph` binary.
 - `omnigraph-server` — the `omnigraph-server` binary (Axum HTTP server).

@@ -14,6 +14,30 @@ This file is the always-on map of the test surface. **Consult it before every ta
 
 The engine's `tests/` is the principal coverage surface; most graph-shaped behavior is exercised there.
 
+## CI control-plane tests
+
+`scripts/ci/test-firehose-ci.sh` owns the firehose classifier, dependency-key,
+smoke-command, archive round-trip, and workflow trust guards. Extend that
+script when changing `.github/workflows/ci.yml` or `scripts/ci/firehose-*.sh`;
+do not create a second CI-policy harness. Its fixture keeps path classification
+honest: documentation below `docs/` may no-op, while source and text fixtures
+under `crates/` must schedule the tier, and only dependency inputs may move the
+source key.
+
+Run:
+
+```bash
+bash scripts/ci/test-firehose-ci.sh
+shellcheck scripts/ci/*.sh
+actionlint .github/workflows/ci.yml
+```
+
+The shell harness cannot prove hosted-runner latency, GitHub attestation
+identity, or artifact retention behavior. Those are measured workflow
+acceptance evidence, with the activation threshold documented in
+[ci.md](ci.md); a local green result must not be used to add the shadow
+contexts to branch protection.
+
 ## Engine integration tests (`crates/omnigraph/tests/`)
 
 | File | Covers |
@@ -78,7 +102,7 @@ deleted-successor-sentinel fencing hazard.
 - **CLI** — `crates/omnigraph-cli/tests/support/mod.rs`: `Command`-style wrapper for invoking `omnigraph`, server-process spawning, fixture resolution, output assertion helpers.
 - **Server** — no shared helpers; server tests call the `Omnigraph` engine API directly and exercise endpoints over the wire.
 
-> Note: the storage adapter has an in-memory backend (`ObjectStorageAdapter::in_memory()`, full contract including true conditional updates) used by the adapter contract tests in `storage.rs`. Those tests also pin the optional single-GET text-read contract: present objects return `Some`, typed `NotFound` returns `None`, and non-absence failures remain loud. It covers only the text-object layer (sidecars, schema staging, cluster state) — **Lance datasets bypass the adapter**, so engine integration tests still use `tempfile::tempdir()`. An in-memory Lance substrate remains an architectural ask — keep it explicit in [docs/dev/invariants.md](invariants.md) under known gaps.
+> Note: the shared storage adapter has an in-memory backend (`ObjectStorageAdapter::in_memory()`, full contract including true conditional updates) used by the adapter contract tests in `crates/omnigraph-storage/src/lib.rs`. Those tests also pin the optional single-GET text-read contract: present objects return `Some`, typed `NotFound` returns `None`, and non-absence failures remain loud. The engine's `crates/omnigraph/src/storage.rs` is a compatibility facade over that implementation. This covers only the text-object layer (sidecars, schema staging, cluster state) — **Lance datasets bypass the adapter**, so engine integration tests still use `tempfile::tempdir()`. An in-memory Lance substrate remains an architectural ask — keep it explicit in [docs/dev/invariants.md](invariants.md) under known gaps.
 
 ## Failpoints (fault injection)
 

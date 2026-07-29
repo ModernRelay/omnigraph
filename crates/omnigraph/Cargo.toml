@@ -18,6 +18,10 @@ failpoints = ["dep:fail", "fail/failpoints"]
 [dependencies]
 omnigraph-compiler = { path = "../omnigraph-compiler", version = "0.9.0" }
 omnigraph-policy = { path = "../omnigraph-policy", version = "0.9.0" }
+omnigraph-storage = { path = "../omnigraph-storage", version = "0.9.0" }
+# Compile-level F2 DAG edge only. Complete checked writer/runtime/export
+# capabilities land in the leaf once all of their canonical fences are known.
+omnigraph-control-authority = { path = "../omnigraph-control-authority", version = "0.9.0" }
 lance = { workspace = true }
 lance-core = { workspace = true }
 lance-select = { workspace = true }

@@ -225,6 +225,8 @@ CLI (omnigraph)        HTTP Server (omnigraph-server: Axum + Cedar + admission)
 
 Workspace crates: `omnigraph-compiler`, `omnigraph` (package name
 `omnigraph-engine` — the directory and package names differ),
+`omnigraph-storage` (shared control-object storage),
+`omnigraph-control-authority` (cycle-free persisted cluster-lock ownership),
 `omnigraph-policy`, `omnigraph-api-types` (shared wire DTOs), `omnigraph-cluster`
 (control plane), `omnigraph-cli`, `omnigraph-server`. Full diagrams and code
 paths: [architecture.md](architecture.md).

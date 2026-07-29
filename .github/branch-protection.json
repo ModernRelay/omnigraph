@@ -1,5 +1,5 @@
 {
-  "_comment": "Branch protection policy for main. Applied via scripts/apply-branch-protection.sh. See docs/dev/branch-protection.md for rationale. CODEOWNERS was removed (2-person team where both maintainers own everything, so code-owner review added friction without value). Review is no longer code-owner-scoped and no approvals are required; the required CI status checks are the gate. Maintainers merge their own PRs once checks pass.",
+  "_comment": "Branch protection policy for main. Applied via scripts/apply-branch-protection.sh. See docs/dev/branch-protection.md for rationale. CODEOWNERS was removed (2-person team where both maintainers own everything, so code-owner review added friction without value). Review is no longer code-owner-scoped and no approvals are required; the required CI status checks are the gate. Maintainers merge their own PRs once checks pass. Firehose PR smoke and Firehose dependency rebuild are deliberately shadow checks until the exact immutable-artifact path records the documented empty-runner and warm p95 evidence and replaces the retention-scoped artifact binding with a durable write-once key-to-digest binding; do not add them here before that activation gate passes.",
   "required_status_checks": {
     "strict": true,
     "contexts": [
